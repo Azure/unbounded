@@ -39,6 +39,15 @@ func RemoveNetworkInterfaces(log *slog.Logger) phases.Task {
 
 func (t *removeNetworkInterfaces) Name() string { return "remove-network-interfaces" }
 
+// CleanupNetwork returns a task that removes network interfaces and policy
+// routing state left by unbounded-net.
+func CleanupNetwork(log *slog.Logger) phases.Task {
+	return phases.Serial(log,
+		RemoveNetworkInterfaces(log),
+		CleanupRoutes(log),
+	)
+}
+
 func (t *removeNetworkInterfaces) Do(ctx context.Context) error {
 	// Remove WireGuard interfaces (wg51820, wg51821, ...).
 	wgIfaces, err := listWireGuardInterfaces(ctx, t.log)
