@@ -1209,6 +1209,63 @@ func TestCleanupOrphanSiteNodeSlicesKeepsSliceForUntranslatedLegacySite(t *testi
 	}
 }
 
+// TestCleanupOrphanSiteNodeSlicesPreservesSliceOnLegacySiteLookupError asserts
+// that if the legacy net-group Site lookup is denied (e.g. the net controller is
+// missing the read grant on net.unbounded-cloud.io/sites), cleanup preserves the
+// slice rather than deleting it. The check is safe-by-default: a lookup error is
+// never read as "the Site is gone".
+func TestCleanupOrphanSiteNodeSlicesPreservesSliceOnLegacySiteLookupError(t *testing.T) {
+	// A translated Site exists so the empty-source guard does not short-circuit.
+	present := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "present", UID: "present-uid"}}
+
+	// This slice references a Site absent from the machina group, so cleanup
+	// consults the legacy group - which is denied below.
+	slice := (&SiteController{}).buildSliceObject(present, "untranslated-0", 0, nil)
+	slice.Object["siteName"] = "untranslated"
+	slice.SetUID("slice-uid")
+	slice.SetResourceVersion("slice-rv")
+
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := store.Add(slice.DeepCopy()); err != nil {
+		t.Fatalf("add slice to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, present),
+		slice.DeepCopy(),
+	)
+	// Deny only the legacy net-group Site GET (the migration-window check).
+	dynamicClient.PrependReactor("get", "sites", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if action.GetResource().Group != legacySiteGVR.Group {
+			return false, nil, nil
+		}
+
+		getAction := action.(clienttesting.GetAction) //nolint:errcheck
+
+		return true, nil, apierrors.NewForbidden(legacySiteGVR.GroupResource(), getAction.GetName(), errors.New("test denial"))
+	})
+
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		sliceInformer: &fakeInformer{store: store},
+	}
+
+	err := sc.cleanupOrphanSiteNodeSlices(context.Background())
+	if err == nil || !apierrors.IsForbidden(err) {
+		t.Fatalf("cleanupOrphanSiteNodeSlices error = %v, want forbidden", err)
+	}
+
+	if _, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), slice.GetName(), metav1.GetOptions{}); err != nil {
+		t.Fatalf("slice was deleted after legacy Site lookup was denied: %v", err)
+	}
+}
+
 func TestSliceMutationFailurePropagatesRedirtiesAndSkipsStatus(t *testing.T) {
 	site := unboundedv1alpha3.Site{
 		TypeMeta: metav1.TypeMeta{APIVersion: unboundedv1alpha3.GroupVersion.String(), Kind: "Site"},

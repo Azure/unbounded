@@ -1030,6 +1030,9 @@ func stageRestrictedSiteControllerIdentity(ctx context.Context, t *testing.T, ku
 			{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get", "list", "watch", "patch", "update"}},
 			{APIGroups: []string{"unbounded-cloud.io"}, Resources: []string{"sites"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
 			{APIGroups: []string{"unbounded-cloud.io"}, Resources: []string{"sites/status"}, Verbs: []string{"get", "patch", "update"}},
+			// Legacy net-group Sites: read-only, for the SiteNodeSlice orphan
+			// cleanup migration-window check (mirrors the production net RBAC).
+			{APIGroups: []string{"net.unbounded-cloud.io"}, Resources: []string{"sites"}, Verbs: []string{"get", "list", "watch"}},
 			{APIGroups: []string{"net.unbounded-cloud.io"}, Resources: []string{"gatewaypools"}, Verbs: []string{"get", "list", "watch"}},
 			{APIGroups: []string{"net.unbounded-cloud.io"}, Resources: []string{"sitenodeslices"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"}},
 		},
