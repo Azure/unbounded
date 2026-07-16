@@ -1724,30 +1724,89 @@ func (r *LegacyReaper) netControllerAvailable(ctx context.Context, target string
 }
 
 // warnOnForeignWorkloads logs a warning and emits an Event when a legacy
-// namespace still holds workloads the reaper did not create, so operators are
-// alerted before the whole-namespace delete removes them too. Deletion still
-// proceeds (the namespace is the migration target); the warning surfaces
-// unexpected residents rather than blocking the migration.
+// namespace still holds resources the migration does not copy, so operators are
+// alerted before the whole-namespace delete removes them too. It surfaces both
+// foreign workloads the reaper did not create and data-bearing resources the
+// migration never copies (PersistentVolumeClaims and deliberately-skipped
+// Secrets). Deletion still proceeds (the namespace is the migration target); the
+// warning surfaces unexpected residents rather than blocking the migration.
 func (r *LegacyReaper) warnOnForeignWorkloads(ctx context.Context, logger logr.Logger, nsName string) error {
 	foreign, err := r.foreignWorkloads(ctx, nsName)
 	if err != nil {
 		return err
 	}
 
+	atRisk, err := r.dataBearingResourcesAtRisk(ctx, nsName)
+	if err != nil {
+		return err
+	}
+
+	foreign = append(foreign, atRisk...)
+
 	if len(foreign) == 0 {
 		return nil
 	}
 
-	logger.Info("legacy namespace still holds non-operator workloads; they will be deleted with the namespace",
-		"namespace", nsName, "workloads", foreign)
+	sort.Strings(foreign)
+
+	logger.Info("legacy namespace still holds resources the migration does not copy; they will be deleted with the namespace",
+		"namespace", nsName, "resources", foreign)
 
 	if r.Recorder != nil {
 		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
 		r.Recorder.Eventf(ns, nil, corev1.EventTypeWarning, "ForeignWorkloadsDeleted", "DeleteLegacyNamespace",
-			"deleting drained legacy namespace %s which still holds non-operator workloads: %v", nsName, foreign)
+			"deleting drained legacy namespace %s which still holds resources the migration does not copy: %v", nsName, foreign)
 	}
 
 	return nil
+}
+
+// dataBearingResourcesAtRisk returns sorted "Kind/name" entries for namespaced
+// resources that the whole-namespace delete will destroy but the migration does
+// NOT copy out, so an operator sees the full blast radius before the namespace
+// is deleted. It surfaces:
+//
+//   - every PersistentVolumeClaim (the reaper never migrates PVCs, and they may
+//     be data-bearing), and
+//   - every Secret the migration deliberately skips (r.SkipSecretNames);
+//     migrateSecrets copies all other non-auto-managed Secrets, so only skipped
+//     ones are lost.
+//
+// It intentionally does not enumerate ConfigMaps by name: the migration copies
+// several ConfigMap sets with dynamic names (machine cloud-init and per-site
+// storage config), so a per-name "not migrated" classification would produce
+// false positives. The warning text notes ConfigMaps generally instead.
+func (r *LegacyReaper) dataBearingResourcesAtRisk(ctx context.Context, nsName string) ([]string, error) {
+	reader := r.liveReader()
+	opts := []client.ListOption{client.InNamespace(nsName)}
+
+	var names []string
+
+	var pvcs corev1.PersistentVolumeClaimList
+	if err := reader.List(ctx, &pvcs, opts...); err != nil {
+		return nil, err
+	}
+
+	for i := range pvcs.Items {
+		names = append(names, "PersistentVolumeClaim/"+pvcs.Items[i].Name)
+	}
+
+	if len(r.SkipSecretNames) > 0 {
+		var secrets corev1.SecretList
+		if err := reader.List(ctx, &secrets, opts...); err != nil {
+			return nil, err
+		}
+
+		for i := range secrets.Items {
+			if _, skipped := r.SkipSecretNames[secrets.Items[i].Name]; skipped {
+				names = append(names, "Secret/"+secrets.Items[i].Name)
+			}
+		}
+	}
+
+	sort.Strings(names)
+
+	return names, nil
 }
 
 // foreignWorkloads returns sorted "Kind/name" entries for every top-level or
