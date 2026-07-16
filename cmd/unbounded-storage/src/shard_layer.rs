@@ -78,10 +78,7 @@ pub struct PreparedShardLayer {
     backing_keepalives: Vec<Arc<dyn Send + Sync>>,
     rpc_shards: Vec<RpcShardPublish>,
     serve_start_txs: Vec<mpsc::Sender<()>>,
-<<<<<<< HEAD
     activation_rx: mpsc::Receiver<crate::ShardActivationReport>,
-=======
->>>>>>> origin/main
     terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
     routes: RouteTableHandle,
 }
@@ -176,10 +173,7 @@ pub fn prepare_shard_layer(
     // (peer registration) after broadcasting the full peer set.
     let (phaseb_tx, phaseb_rx) = mpsc::channel::<crate::PhaseBReport>();
     let (terminal_tx, terminal_rx) = mpsc::channel::<crate::ShardTerminalReport>();
-<<<<<<< HEAD
     let (activation_tx, activation_rx) = mpsc::channel::<crate::ShardActivationReport>();
-=======
->>>>>>> origin/main
     let mut joins = Vec::with_capacity(worker_count);
     let mut control_senders = Vec::with_capacity(worker_count);
     // Per-shard senders for broadcasting the assembled peer set in phase
@@ -209,10 +203,7 @@ pub fn prepare_shard_layer(
         let loaded = loaded.clone();
         let layer_stop = layer_stop.clone();
         let terminal_tx = terminal_tx.clone();
-<<<<<<< HEAD
         let activation_tx = activation_tx.clone();
-=======
->>>>>>> origin/main
         let rt = deps.runtime.clone();
         let handle = rt.spawn_pinned(
             widx,
@@ -233,10 +224,7 @@ pub fn prepare_shard_layer(
                         peer_rx,
                         phaseb_tx,
                         serve_start_rx,
-<<<<<<< HEAD
                         activation_tx,
-=======
->>>>>>> origin/main
                         terminal_tx,
                         layer_stop,
                     );
@@ -251,10 +239,7 @@ pub fn prepare_shard_layer(
     // holds its sender, so this never closes the channel prematurely.
     drop(phaseb_tx);
     drop(terminal_tx);
-<<<<<<< HEAD
     drop(activation_tx);
-=======
->>>>>>> origin/main
 
     // Bounded readiness collection: read exactly one message per spawned
     // thread. Shards that come up park holding their sender, so they
@@ -387,10 +372,7 @@ pub fn prepare_shard_layer(
         rpc_shards,
         serve_start_txs,
         terminal_rx,
-<<<<<<< HEAD
         activation_rx,
-=======
->>>>>>> origin/main
         routes,
     })
 }
@@ -408,10 +390,7 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
         rpc_shards,
         serve_start_txs,
         terminal_rx,
-<<<<<<< HEAD
         activation_rx,
-=======
->>>>>>> origin/main
         routes,
     } = prepared;
 
@@ -445,7 +424,6 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
             ]);
         }
     }
-<<<<<<< HEAD
     let mut activation_errors = Vec::new();
     for _ in 0..serve_start_txs.len() {
         match activation_rx.recv() {
@@ -470,8 +448,6 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
         );
         return Err(activation_errors);
     }
-=======
->>>>>>> origin/main
     drop(serve_start_txs);
 
     Ok(ShardLayer {
@@ -495,10 +471,7 @@ pub fn retire_prepared_shard_layer(prepared: PreparedShardLayer) {
         backing_keepalives,
         rpc_shards: _,
         serve_start_txs,
-<<<<<<< HEAD
         activation_rx: _,
-=======
->>>>>>> origin/main
         terminal_rx,
         routes,
     } = prepared;

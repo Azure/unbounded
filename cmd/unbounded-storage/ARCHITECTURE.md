@@ -178,7 +178,6 @@ shutdown; teardown drains terminal reports and returns a failing process status
 instead of continuing with a missing shard.
 
 Backend and frontend reloads construct replacements before swapping them into
-<<<<<<< HEAD
 their shard-local registries. Network frontends first validate and bind a
 dormant `SO_REUSEPORT` socket, then enter the listening state only during
 activation. A failed preparation therefore leaves the prior resource, binding,
@@ -186,13 +185,9 @@ and stripe geometry live and retryable. Active frontend entries record the
 binding and stripe geometry they realized, so a failed rebuild is detected and
 retried on the next apply. Replacement uses a staged transaction: the complete
 frontend change set is prepared before activation and swaps into the live
-registry only after every listener activates successfully.
-=======
-their shard-local registries. A failed replacement therefore leaves the prior
-resource, binding, and stripe geometry live and retryable. This is a
-per-resource guarantee; route, peer, shard, and disk publication across the
-whole process is not yet one transaction.
->>>>>>> origin/main
+registry only after every listener activates successfully. This is not yet
+a whole-process guarantee; route, peer, shard, and disk publication across
+the whole process is not yet one transaction.
 
 ### Shutdown
 
