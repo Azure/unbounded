@@ -13,6 +13,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	storageconfig "github.com/Azure/unbounded/api/unbounded-storage"
 )
 
 const testRingLabel = "unbounded-cloud.io/storage-ring"
@@ -173,179 +175,51 @@ func TestComputeRingSingleMember(t *testing.T) {
 
 func TestComputeRDMARingMembership(t *testing.T) {
 	nodes := []*corev1.Node{
-		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself`,
-		}),
-		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aa`,
-		}),
-		nodeWithAnnotations("peer-b", "red", "10.0.0.3", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_1?addr=hex%3Ab1&addr=hex%3Ab2`,
-		}),
-		nodeWithAnnotations("no-rdma", "red", "10.0.0.4", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0`,
-		}),
-		nodeWithAnnotations("invalid", "red", "10.0.0.5", map[string]string{
-			storageRdmaHcasAnnotation: `?addr=hex%3Ainvalid`,
-		}),
-		nodeWithAnnotations("other", "blue", "10.0.0.6", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aother`,
-		}),
+		node("self", "red", "10.0.0.1"),
+		node("peer-a", "red", "10.0.0.2"),
+		node("peer-b", "red", "fd00::3"),
+		node("no-ip", "red", ""),
+		node("other", "blue", "10.0.0.6"),
 	}
 
-	ring := computeRDMARing(nodes, "self", testRingLabel)
+	ring := computeRDMARing(nodes, "self", testRingLabel, 9101)
 
 	require.True(t, ring.active)
 	assert.Equal(t, "self", ring.selfName)
 	assert.Empty(t, ring.selfListenAddr)
 	require.Len(t, ring.peers, 3)
 
-	got := map[string]string{}
-	gotAll := map[string][]string{}
-
+	got := map[string]*storageconfig.RdmaPeerConfig{}
 	for _, p := range ring.peers {
-		got[p.GetName()] = p.GetRdma().GetAddr()
-		gotAll[p.GetName()] = p.GetRdma().GetAddrs()
+		got[p.GetName()] = p.GetRdma()
 	}
 
-	assert.Equal(t, "hex:self", got["self"])
-	assert.Equal(t, "hex:a", got["peer-a"])
-	assert.Equal(t, "hex:b1", got["peer-b"])
-	assert.Equal(t, []string{"hex:b1", "hex:b2"}, gotAll["peer-b"])
+	assert.Equal(t, "10.0.0.1:9101", got["self"].GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.2:9101", got["peer-a"].GetDiscoveryAddr())
+	assert.Equal(t, "[fd00::3]:9101", got["peer-b"].GetDiscoveryAddr())
 }
 
-func TestComputeRDMARingRewritesWildcardSocketAddresses(t *testing.T) {
+func TestComputeRDMARingInactiveWithoutSelfInternalIP(t *testing.T) {
 	nodes := []*corev1.Node{
-		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=0.0.0.0%3A40000`,
-		}),
-		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=0.0.0.0%3A50000`,
-		}),
-		nodeWithAnnotations("peer-b", "red", "fd00::3", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=%5B%3A%3A%5D%3A60000`,
-		}),
+		node("self", "red", ""),
+		node("peer-a", "red", "10.0.0.2"),
 	}
 
-	ring := computeRDMARing(nodes, "self", testRingLabel)
-
-	require.True(t, ring.active)
-	require.Len(t, ring.peers, 3)
-
-	got := map[string]string{}
-	gotAll := map[string][]string{}
-
-	for _, p := range ring.peers {
-		got[p.GetName()] = p.GetRdma().GetAddr()
-		gotAll[p.GetName()] = p.GetRdma().GetAddrs()
-	}
-
-	assert.Equal(t, "10.0.0.1:40000", got["self"])
-	assert.Equal(t, "10.0.0.2:50000", got["peer-a"])
-	assert.Equal(t, "[fd00::3]:60000", got["peer-b"])
-	assert.Equal(t, []string{"10.0.0.1:40000"}, gotAll["self"])
-	assert.Equal(t, []string{"10.0.0.2:50000"}, gotAll["peer-a"])
-	assert.Equal(t, []string{"[fd00::3]:60000"}, gotAll["peer-b"])
-}
-
-func TestComputeRDMARingPreservesAllPeerAddresses(t *testing.T) {
-	nodes := []*corev1.Node{
-		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself0,mlx5_1?addr=hex%3Aself1`,
-		}),
-		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aa0,mlx5_1?addr=hex%3Aa1`,
-		}),
-	}
-
-	ring := computeRDMARing(nodes, "self", testRingLabel)
-
-	require.True(t, ring.active)
-	require.Len(t, ring.peers, 2)
-
-	got := map[string][]string{}
-
-	for _, p := range ring.peers {
-		got[p.GetName()] = p.GetRdma().GetAddrs()
-	}
-
-	assert.Equal(t, []string{"hex:self0", "hex:self1"}, got["self"])
-	assert.Equal(t, []string{"hex:a0", "hex:a1"}, got["peer-a"])
-}
-
-func TestComputeRDMARingKeepsNativeAndRoutableSocketAddresses(t *testing.T) {
-	nodes := []*corev1.Node{
-		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself`,
-		}),
-		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=10.0.0.9%3A50000`,
-		}),
-	}
-
-	ring := computeRDMARing(nodes, "self", testRingLabel)
-
-	require.True(t, ring.active)
-	require.Len(t, ring.peers, 2)
-
-	got := map[string]string{}
-
-	for _, p := range ring.peers {
-		got[p.GetName()] = p.GetRdma().GetAddr()
-	}
-
-	assert.Equal(t, "hex:self", got["self"])
-	assert.Equal(t, "10.0.0.9:50000", got["peer-a"])
-}
-
-func TestComputeRDMARingUsesSelfPlaceholderUntilInventoryPublishes(t *testing.T) {
-	nodes := []*corev1.Node{
-		nodeWithAnnotations("self", "red", "10.0.0.1", nil),
-		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aa`,
-		}),
-	}
-
-	ring := computeRDMARing(nodes, "self", testRingLabel)
-
-	require.True(t, ring.active)
-	assert.Equal(t, "self", ring.selfName)
-	require.Len(t, ring.peers, 2)
-
-	got := map[string]string{}
-
-	for _, p := range ring.peers {
-		got[p.GetName()] = p.GetRdma().GetAddr()
-	}
-
-	assert.Equal(t, placeholderRdmaSelfAddr, got["self"])
-	assert.Equal(t, "hex:a", got["peer-a"])
-}
-
-func TestComputeRDMARingInactiveWhenSelfInvalidInventory(t *testing.T) {
-	nodes := []*corev1.Node{
-		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `?addr=hex%3Aself`,
-		}),
-	}
-
-	ring := computeRDMARing(nodes, "self", testRingLabel)
+	ring := computeRDMARing(nodes, "self", testRingLabel, 9101)
 
 	assert.False(t, ring.active)
 }
 
 func TestComputeRDMARingSingleMember(t *testing.T) {
-	nodes := []*corev1.Node{nodeWithAnnotations("self", "red", "", map[string]string{
-		storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself`,
-	})}
+	nodes := []*corev1.Node{node("self", "red", "10.0.0.1")}
 
-	ring := computeRDMARing(nodes, "self", testRingLabel)
+	ring := computeRDMARing(nodes, "self", testRingLabel, 9101)
 
 	require.True(t, ring.active)
 	assert.Equal(t, "self", ring.selfName)
 	require.Len(t, ring.peers, 1)
 	assert.Equal(t, "self", ring.peers[0].GetName())
-	assert.Equal(t, "hex:self", ring.peers[0].GetRdma().GetAddr())
+	assert.Equal(t, "10.0.0.1:9101", ring.peers[0].GetRdma().GetDiscoveryAddr())
 }
 
 func TestNewPeerWatcherDisabledWithoutNodeName(t *testing.T) {
@@ -412,12 +286,8 @@ func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
 
 func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
 	cs := fake.NewSimpleClientset(
-		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aself`,
-		}),
-		nodeWithAnnotations("peer-a", "red", "10.0.0.2", map[string]string{
-			storageRdmaHcasAnnotation: `mlx5_0?addr=hex%3Aa`,
-		}),
+		node("self", "red", "10.0.0.1"),
+		node("peer-a", "red", "10.0.0.2"),
 	)
 
 	w, err := newPeerWatcher(Config{
@@ -434,13 +304,13 @@ func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
 
 	require.NoError(t, w.Start(ctx))
 
-	state := w.snapshotRdma()
+	state := w.snapshotRdma(9101, true)
 	require.True(t, state.ring.active)
 	require.Len(t, state.ring.peers, 2)
 	assert.Equal(t, "peer-a", state.ring.peers[0].GetName())
-	assert.Equal(t, "hex:a", state.ring.peers[0].GetRdma().GetAddr())
+	assert.Equal(t, "10.0.0.2:9101", state.ring.peers[0].GetRdma().GetDiscoveryAddr())
 	assert.Equal(t, "self", state.ring.peers[1].GetName())
-	assert.Equal(t, "hex:self", state.ring.peers[1].GetRdma().GetAddr())
+	assert.Equal(t, "10.0.0.1:9101", state.ring.peers[1].GetRdma().GetDiscoveryAddr())
 }
 
 func TestPeerWatcherSnapshotIncludesSelfAnnotations(t *testing.T) {

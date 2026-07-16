@@ -755,11 +755,12 @@ def write_config(
     kind: str,
     self_name: str,
     peer_name: str,
-    peer_addr: str,
+    peer_discovery_addr: str,
     disk_path: Path,
     origin_addr: str,
     frontend_addr: str,
     fabric_addr: str,
+    discovery_addr: str,
     metrics_addr: str,
     ca_cert_path: Path | None = None,
     insecure_skip_verify: bool = False,
@@ -804,14 +805,14 @@ stripe_size_bytes = {STRIPE_SIZE}
 [[peers]]
 name = "{self_name}"
 
-[peers.config.tcp]
-addr = "{fabric_addr}"
+[peers.config.rdma]
+discovery_addr = "{discovery_addr}"
 
 [[peers]]
 name = "{peer_name}"
 
-[peers.config.tcp]
-addr = "{peer_addr}"
+[peers.config.rdma]
+discovery_addr = "{peer_discovery_addr}"
 
 [[caches]]
 name = "cache"
@@ -842,6 +843,9 @@ memory_total_bytes = {MEMORY_TOTAL_BYTES}
 [startup.fabric.binds.tcp]
 addr = "{fabric_addr}"
 
+[startup.fabric_discovery]
+addr = "{discovery_addr}"
+
 [startup.metrics]
 # Expose the Prometheus exporter on a dedicated control-plane port so the
 # smoke test can scrape /metrics and assert request counters advanced.
@@ -868,9 +872,10 @@ def write_loadgen_config(
     *,
     local_id: int,
     peer_id: int,
-    peer_addr: str,
+    peer_discovery_addr: str,
     disk_path: Path,
     fabric_addr: str,
+    discovery_addr: str,
     metrics_addr: str,
 ) -> None:
     self_name = f"node-{local_id}"
@@ -889,14 +894,14 @@ object_size_bytes = {STRIPE_SIZE}
 [[peers]]
 name = "{self_name}"
 
-[peers.config.tcp]
-addr = "{fabric_addr}"
+[peers.config.rdma]
+discovery_addr = "{discovery_addr}"
 
 [[peers]]
 name = "{peer_name}"
 
-[peers.config.tcp]
-addr = "{peer_addr}"
+[peers.config.rdma]
+discovery_addr = "{peer_discovery_addr}"
 
 [[caches]]
 name = "cache"
@@ -928,6 +933,9 @@ memory_total_bytes = {MEMORY_TOTAL_BYTES}
 
 [startup.fabric.binds.tcp]
 addr = "{fabric_addr}"
+
+[startup.fabric_discovery]
+addr = "{discovery_addr}"
 
 [startup.metrics]
 addr = "{metrics_addr}"
@@ -979,6 +987,15 @@ def fetch(url: str, timeout: int = 30) -> tuple[int, bytes]:
     die(f"GET {url} did not succeed within {timeout}s: {last_err}")
     raise AssertionError("unreachable")
 
+
+def verify_fabric_discovery(discovery_port: int, fabric_addr: str) -> None:
+    discovery_url = f"http://127.0.0.1:{discovery_port}/v1/fabric"
+    status, body = fetch(discovery_url)
+    if status != 200:
+        die(f"GET {discovery_url} returned status {status}, expected 200")
+    candidates = body.decode("utf-8").splitlines()
+    if candidates != [fabric_addr]:
+        die(f"GET {discovery_url} returned {candidates!r}, expected {[fabric_addr]!r}")
 
 def scrape_metric_sum(
     url: str, name: str, timeout: int = 30, labels: dict[str, str] | None = None
@@ -1119,8 +1136,12 @@ def run_scenario(
     nodes: list[_Node] = []
     fab_a, fab_b = free_port(), free_port()
     fe_a, fe_b = free_port(), free_port()
+    disc_a, disc_b = free_port(), free_port()
     met_a, met_b = free_port(), free_port()
-    log(f"Ports: fabric=({fab_a},{fab_b}) frontends=({fe_a},{fe_b}) metrics=({met_a},{met_b})")
+    log(
+        f"Ports: fabric=({fab_a},{fab_b}) discovery=({disc_a},{disc_b}) "
+        f"frontends=({fe_a},{fe_b}) metrics=({met_a},{met_b})"
+    )
 
     log("Writing node configs")
     cfg1 = TMPDIR / f"{name}-node1.toml"
@@ -1130,11 +1151,12 @@ def run_scenario(
         kind=kind,
         self_name="node-a",
         peer_name="node-b",
-        peer_addr=f"127.0.0.1:{fab_b}",
+        peer_discovery_addr=f"127.0.0.1:{disc_b}",
         disk_path=TMPDIR / f"{name}-node1.disk",
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_a}",
         fabric_addr=f"127.0.0.1:{fab_a}",
+        discovery_addr=f"127.0.0.1:{disc_a}",
         metrics_addr=f"127.0.0.1:{met_a}",
         ca_cert_path=ca_cert_path,
         insecure_skip_verify=insecure_skip_verify,
@@ -1146,11 +1168,12 @@ def run_scenario(
         kind=kind,
         self_name="node-b",
         peer_name="node-a",
-        peer_addr=f"127.0.0.1:{fab_a}",
+        peer_discovery_addr=f"127.0.0.1:{disc_a}",
         disk_path=TMPDIR / f"{name}-node2.disk",
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_b}",
         fabric_addr=f"127.0.0.1:{fab_b}",
+        discovery_addr=f"127.0.0.1:{disc_b}",
         metrics_addr=f"127.0.0.1:{met_b}",
         ca_cert_path=ca_cert_path,
         insecure_skip_verify=insecure_skip_verify,
@@ -1165,6 +1188,8 @@ def run_scenario(
 
         wait_port("127.0.0.1", fe_a)
         wait_port("127.0.0.1", fe_b)
+        verify_fabric_discovery(disc_a, f"127.0.0.1:{fab_a}")
+        verify_fabric_discovery(disc_b, f"127.0.0.1:{fab_b}")
         # Give the fabric peers a moment to dial each other before routing.
         log("  Letting fabric peers establish...")
         time.sleep(3)
@@ -1230,8 +1255,9 @@ def run_loadgen_scenario() -> None:
 
     nodes: list[_Node] = []
     fab_a, fab_b = free_port(), free_port()
+    disc_a, disc_b = free_port(), free_port()
     met_a, met_b = free_port(), free_port()
-    log(f"Ports: fabric=({fab_a},{fab_b}) metrics=({met_a},{met_b})")
+    log(f"Ports: fabric=({fab_a},{fab_b}) discovery=({disc_a},{disc_b}) metrics=({met_a},{met_b})")
 
     log("Writing loadgen node configs")
     cfg1 = TMPDIR / "loadgen-node1.toml"
@@ -1240,18 +1266,20 @@ def run_loadgen_scenario() -> None:
         cfg1,
         local_id=1,
         peer_id=2,
-        peer_addr=f"127.0.0.1:{fab_b}",
+        peer_discovery_addr=f"127.0.0.1:{disc_b}",
         disk_path=TMPDIR / "loadgen-node1.disk",
         fabric_addr=f"127.0.0.1:{fab_a}",
+        discovery_addr=f"127.0.0.1:{disc_a}",
         metrics_addr=f"127.0.0.1:{met_a}",
     )
     write_loadgen_config(
         cfg2,
         local_id=2,
         peer_id=1,
-        peer_addr=f"127.0.0.1:{fab_a}",
+        peer_discovery_addr=f"127.0.0.1:{disc_a}",
         disk_path=TMPDIR / "loadgen-node2.disk",
         fabric_addr=f"127.0.0.1:{fab_b}",
+        discovery_addr=f"127.0.0.1:{disc_b}",
         metrics_addr=f"127.0.0.1:{met_b}",
     )
 
@@ -1262,6 +1290,8 @@ def run_loadgen_scenario() -> None:
 
         wait_port("127.0.0.1", met_a)
         wait_port("127.0.0.1", met_b)
+        verify_fabric_discovery(disc_a, f"127.0.0.1:{fab_a}")
+        verify_fabric_discovery(disc_b, f"127.0.0.1:{fab_b}")
         log("  Letting fabric peers establish...")
         time.sleep(3)
 

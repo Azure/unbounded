@@ -427,6 +427,11 @@ impl Fabric {
         }
     }
 
+    /// Resolve a remote listener through this fabric's provider/domain hints.
+    pub fn destination_resolves(&self, address: &crate::fabric::FabricAddress) -> Result<()> {
+        cm::destination_resolves(self.inner.dial_info, address)
+    }
+
     /// Shared completion registry for RPC submissions.
     pub(crate) fn completions(&self) -> &Arc<CompletionRegistry> {
         &self.inner.completions

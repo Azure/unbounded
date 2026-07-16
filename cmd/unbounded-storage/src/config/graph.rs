@@ -300,13 +300,13 @@ mod tests {
         }
     }
 
-    fn rdma_peer(name: &str, addr: &str) -> PeerSpec {
+    fn rdma_peer(name: &str, discovery_addr: &str) -> PeerSpec {
         PeerSpec {
             name: name.to_string(),
             tags: Vec::new(),
             config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
-                addr: addr.to_string(),
-                addrs: Vec::new(),
+                discovery_addr: discovery_addr.to_string(),
+                ..RdmaPeerConfig::default()
             })),
         }
     }

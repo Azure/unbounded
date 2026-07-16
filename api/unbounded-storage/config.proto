@@ -99,15 +99,13 @@ message TcpPeerConfig {
 }
 
 message RdmaPeerConfig {
-  // Default RDMA fabric address. Provider-native addresses are encoded as
-  // "hex:<fi_getname-bytes>"; RDMA-CM socket addresses are accepted when the
-  // provider reports them.
-  string addr = 1;
+  reserved 1, 2;
+  reserved "addr", "addrs";
 
-  // Ordered RDMA fabric addresses for peers that expose multiple fabric units,
-  // such as one endpoint per HCA. The daemon dials the address whose index
-  // matches the local fabric unit index, falling back to addr when absent.
-  repeated string addrs = 2;
+  // Node-reachable HTTP socket used to discover this peer's live libfabric
+  // listeners. The daemon resolves the advertised candidates independently
+  // for each local fabric domain.
+  string discovery_addr = 3;
 }
 
 message CacheSpec {
@@ -121,10 +119,17 @@ message StartupCfg {
   FabricCfg fabric = 2;
   TopologyCfg topology = 3;
   MetricsCfg metrics = 4;
+  FabricDiscoveryCfg fabric_discovery = 5;
 }
 
 message MetricsCfg {
   // Prometheus metrics listen address, such as "0.0.0.0:9100". Empty disables the exporter.
+  string addr = 1;
+}
+
+message FabricDiscoveryCfg {
+  // Dedicated HTTP listen address for publishing live libfabric listeners.
+  // Empty disables discovery serving.
   string addr = 1;
 }
 

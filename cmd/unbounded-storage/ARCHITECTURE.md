@@ -114,6 +114,10 @@ excluded from the live-reload diff.
   `max_inflight` (1024) - the fabric endpoint, thread pools, and in-flight
   cap. `auto_rdma.hcas_per_numa_node` caps automatically selected HCAs per
   NUMA node and defaults to 1 when `auto_rdma` is configured.
+- `[startup.fabric_discovery]` - an optional dedicated HTTP listener address.
+  `GET /v1/fabric` returns the realized libfabric listener addresses as
+  newline-delimited text so other nodes can resolve the best path to this
+  node. Cluster deployments use a common non-zero port on every node.
 - `[startup.topology]` - `serving_cores` (unset/null = auto-fill every usable
   CPU), `nic_workers` (fabric CPUs per active HCA, unset/null defaults to 4),
   and the toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
@@ -149,9 +153,12 @@ excluded from the live-reload diff.
    numeric identity as `NodeId`.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
-9. After every shard reports `Up`, peers are reconciled per shard, the disk
-   supervisor opens disks and publishes channels, and the config watcher takes
-   over for the lifetime of the process.
+9. After every shard reports `Up`, the fabric discovery endpoint starts with
+   the realized listener addresses. A control-plane thread fetches RDMA peer
+   candidates and resolves them independently through each local fabric unit.
+10. Peers are reconciled, the disk supervisor opens disks and publishes
+    channels, and the config watcher takes over for the lifetime of the
+    process.
 
 ### Shard readiness and panic safety
 
@@ -588,16 +595,21 @@ Sections (all optional, each falling back to defaults):
   excluded from the live-reload diff: `[startup.memory]`
   (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`binds`,
   `progress_threads`, `progress_poll_us`, `rpc_worker_threads`,
-  `max_inflight`), and `[startup.topology]` (`serving_cores`, `nic_workers`,
-  `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
-  `allow_inactive_port`, `disable_rdma`).
+   `max_inflight`), `[startup.fabric_discovery]` (`addr`), and
+   `[startup.topology]` (`serving_cores`, `nic_workers`, `use_smt_siblings`,
+   `ignore_isolated`, `include_node_cpu0`, `allow_inactive_port`,
+   `disable_rdma`).
   `startup_to_core_plan_config` inverts the negative plan fields so the
   historical defaults hold. See the CLI section for the per-field
   defaults.
 - `[[peers]]` - `name` (stable peer identity used to derive the internal fabric
   peer id and ring position), `tags` for placement-aware routing, and one
-  transport table (`tcp` with a `SocketAddr`, or `rdma` with a provider-native
-  address encoded as `hex:<fi_getname-bytes>`). The roster includes the local
+  transport table (`tcp` with a direct `SocketAddr`, or `rdma` with the peer's
+  fabric-discovery `SocketAddr`). RDMA discovery returns all remote listener
+  candidates. The caller asks each HCA-pinned libfabric domain which candidates
+  it can reach, then computes a deterministic complete one-to-one matching so
+  remote HCA order is irrelevant. Last-good matches remain active across
+  transient HTTP or route-resolution failures. The roster includes the local
   peer named by `self`; fabric reconciliation excludes that local entry from
   outbound dials.
 - `[[caches]]` - `name` and `source` (a backend component name used for miss
@@ -614,8 +626,8 @@ Sections (all optional, each falling back to defaults):
   one `config` table (`http`, `s3`, or `loadgen`).
 
 The watcher (`notify`-based) emits `ConfigUpdate`s; main's
-`wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa
-drift, via a `last_applied` cache), disks, and - by broadcasting the applied
+`wait_for_shutdown_with_updates` reconciles peers (including changed discovery
+endpoints and tags), disks, and - by broadcasting the applied
 config to every shard - each shard's backend and frontend registries plus the
 routing snapshot. It republishes the channel snapshot each update, logs
 `config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.

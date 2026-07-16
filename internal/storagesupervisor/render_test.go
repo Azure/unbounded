@@ -59,11 +59,11 @@ func tcpPeer(name, addr string) *storageconfig.PeerSpec {
 	}
 }
 
-func rdmaPeer(name, addr string) *storageconfig.PeerSpec {
+func rdmaPeer(name, discoveryAddr string) *storageconfig.PeerSpec {
 	return &storageconfig.PeerSpec{
 		Name: name,
 		Config: &storageconfig.PeerSpec_Rdma{
-			Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
+			Rdma: &storageconfig.RdmaPeerConfig{DiscoveryAddr: discoveryAddr},
 		},
 	}
 }
@@ -412,8 +412,8 @@ backends:
 	assert.Nil(t, cfg.GetStartup().GetFabric().GetTcp())
 	assert.Equal(t, "node-a", cfg.GetSelf())
 	require.Len(t, cfg.GetPeers(), 2)
-	assert.Equal(t, "hex:self", cfg.GetPeers()[0].GetRdma().GetAddr())
-	assert.Equal(t, "hex:peer", cfg.GetPeers()[1].GetRdma().GetAddr())
+	assert.Equal(t, "hex:self", cfg.GetPeers()[0].GetRdma().GetDiscoveryAddr())
+	assert.Equal(t, "hex:peer", cfg.GetPeers()[1].GetRdma().GetDiscoveryAddr())
 }
 
 func TestRenderConfigActiveRingInjectsMeshWithoutDeclaredPeers(t *testing.T) {

@@ -244,6 +244,7 @@ fn main() -> ExitCode {
     // it now while `startup` borrows `config`, before `config` is moved
     // into the controller below. An empty string disables the exporter.
     let metrics_bind = startup.metrics().addr.clone();
+    let discovery_bind = startup.fabric_discovery().addr.clone();
     let backing_kind = if memory.no_hugepages {
         BackingKind::Heap
     } else {
@@ -420,12 +421,41 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let fabric_unit_addresses = layer.fabric_unit_addresses();
     let device_inventory = metrics::DeviceInventoryStatus::new();
-    device_inventory.set_rdma(device_inventory::rdma_annotation(
-        &host,
-        &layer.fabric_unit_addresses(),
-    ));
     device_inventory.set_block(device_inventory::block_annotation(&host));
+
+    let discovery_shutdown = Arc::new(AtomicBool::new(false));
+    let discovery_server = if discovery_bind.is_empty() {
+        None
+    } else {
+        let bind = discovery_bind
+            .parse()
+            .expect("validated fabric discovery address");
+        let candidates = fabric_unit_addresses.into_iter().map(|unit| unit.addr);
+        let server = match unbounded_storage::fabric_discovery::Server::bind(bind, candidates) {
+            Ok(server) => server,
+            Err(error) => {
+                eprintln!("fabric discovery: failed to bind {discovery_bind}: {error}");
+                shard_layer::teardown_shard_layer(layer);
+                return ExitCode::FAILURE;
+            }
+        };
+        let local_addr = server
+            .local_addr()
+            .expect("bound discovery listener address");
+        let shutdown = discovery_shutdown.clone();
+        let thread = thread::Builder::new()
+            .name("fabric-discovery-http".to_string())
+            .spawn(move || {
+                if let Err(error) = server.serve(shutdown) {
+                    eprintln!("fabric discovery server failed: {error}");
+                }
+            })
+            .expect("spawn fabric discovery server");
+        eprintln!("fabric discovery: listening on {local_addr}");
+        Some(thread)
+    };
 
     // Reconcile the startup disk set now that the shards are up, then
     // publish the channel set so shards can reach their disks.
@@ -523,6 +553,11 @@ fn main() -> ExitCode {
         shard_layer::teardown_shard_layer(layer);
     }
     disk_registry.drain();
+
+    discovery_shutdown.store(true, Ordering::Release);
+    if let Some(handle) = discovery_server {
+        let _ = handle.join();
+    }
 
     // The exporter polls `SHUTDOWN` on its accept loop; join it last so a
     // late scrape can still observe the final config versions during

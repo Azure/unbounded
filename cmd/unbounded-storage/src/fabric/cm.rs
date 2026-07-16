@@ -467,8 +467,8 @@ pub(crate) fn connect(
     let qps = qps.max(1);
 
     let dest_addr = encode_connect_addr(dest)?;
-    let active_info = active_info_for_dest(info, dest, &dest_addr)?;
-    let info = active_info.as_ref().map(|g| g.0).unwrap_or(info);
+    let active_info = resolved_info_for_dest(info, dest, &dest_addr)?;
+    let info = active_info.0;
 
     let eq = open_eq(fabric)?;
     let eq_guard = FidGuard(ffi::as_fid_eq(eq));
@@ -535,11 +535,19 @@ fn encode_connect_addr(dest: &FabricAddress) -> Result<Vec<u8>> {
     }
 }
 
-fn active_info_for_dest(
+pub(crate) fn destination_resolves(
+    info: *mut ffi::fi_info,
+    dest: &FabricAddress,
+) -> Result<()> {
+    let dest_addr = encode_connect_addr(dest)?;
+    resolved_info_for_dest(info, dest, &dest_addr).map(|_| ())
+}
+
+fn resolved_info_for_dest(
     info: *mut ffi::fi_info,
     dest: &FabricAddress,
     dest_addr: &[u8],
-) -> Result<Option<FreeInfoGuard>> {
+) -> Result<FreeInfoGuard> {
     let addr = dest_addr.as_ptr() as *const std::ffi::c_void;
     let active = match dest {
         FabricAddress::Socket(_) => unsafe {
@@ -552,7 +560,25 @@ fn active_info_for_dest(
     if active.is_null() {
         return Err(FabricError::Pkg("ub_fi_dupinfo_with_dest_addr", 0));
     }
-    Ok(Some(FreeInfoGuard(active)))
+    let hints = FreeInfoGuard(active);
+    let mut resolved = ptr::null_mut();
+    let rc = unsafe {
+        ffi::fi_getinfo(
+            ffi::requested_version(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            hints.0,
+            &mut resolved,
+        )
+    };
+    check("fi_getinfo(destination)", rc)?;
+    if resolved.is_null() {
+        return Err(FabricError::NotFound(
+            "fi_getinfo(destination) returned no info",
+        ));
+    }
+    Ok(FreeInfoGuard(resolved))
 }
 
 fn encode_socket_addr(dest: &str) -> Result<Vec<u8>> {

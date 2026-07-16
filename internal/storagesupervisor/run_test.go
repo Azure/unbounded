@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/client-go/kubernetes/fake"
 
 	storageconfig "github.com/Azure/unbounded/api/unbounded-storage"
 )
@@ -48,6 +49,35 @@ func TestReconcileBadValueErrors(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
 	require.Error(t, reconcile(Config{SourceDir: src, ConfigPath: dest}, nil))
+}
+
+func TestCurrentRenderStateUsesFabricDiscoveryPortForRdmaPeers(t *testing.T) {
+	src := writeSource(t, `
+startup:
+  fabric_discovery:
+    addr: "0.0.0.0:9101"
+  fabric:
+    auto_rdma: {}
+`)
+	cs := fake.NewSimpleClientset(
+		node("self", "red", "10.0.0.1"),
+		node("peer-a", "red", "10.0.0.2"),
+	)
+	w, err := newPeerWatcher(Config{NodeName: "self", StorageRingLabel: testRingLabel}, cs)
+	require.NoError(t, err)
+
+	defer w.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, w.Start(ctx))
+
+	state := currentRenderState(Config{SourceDir: src}, w)
+	require.True(t, state.ring.active)
+	require.Len(t, state.ring.peers, 2)
+	assert.Equal(t, "10.0.0.2:9101", state.ring.peers[0].GetRdma().GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.1:9101", state.ring.peers[1].GetRdma().GetDiscoveryAddr())
 }
 
 func TestRunRendersInitialAndReRenders(t *testing.T) {
@@ -93,8 +123,36 @@ func TestRunInitialRenderFails(t *testing.T) {
 	src := writeSource(t, "version: \"bad\"")
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
-	err := Run(context.Background(), Config{SourceDir: src, ConfigPath: dest})
+	runner := &recordingRunner{failAt: -1}
+	err := runWithRunner(context.Background(), Config{
+		SourceDir:               src,
+		ConfigPath:              dest,
+		StartServiceAfterRender: true,
+	}, runner)
 	require.Error(t, err)
+	assert.Empty(t, runner.calls)
+}
+
+func TestRunStartsServiceAfterInitialRender(t *testing.T) {
+	src := writeSource(t, "version: 7")
+	dest := filepath.Join(t.TempDir(), "config.binpb")
+	runner := &recordingRunner{failAt: 2, failErr: assert.AnError}
+
+	err := runWithRunner(context.Background(), Config{
+		SourceDir:               src,
+		ConfigPath:              dest,
+		Systemctl:               []string{"systemctl"},
+		ServiceName:             "unbounded-storage",
+		StartServiceAfterRender: true,
+	}, runner)
+	require.ErrorIs(t, err, assert.AnError)
+
+	assert.Equal(t, uint64(7), decodeFile(t, dest).Version)
+	assert.Equal(t, [][]string{
+		{"systemctl", "daemon-reload"},
+		{"systemctl", "enable", "unbounded-storage"},
+		{"systemctl", "restart", "unbounded-storage"},
+	}, runner.calls)
 }
 
 func TestRunMissingSourceDirErrors(t *testing.T) {

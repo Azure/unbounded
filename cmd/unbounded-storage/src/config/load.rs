@@ -45,7 +45,7 @@ pub enum ConfigError {
         peer_name: String,
         addr: String,
     },
-    InvalidNativePeerAddr {
+    InvalidRdmaDiscoveryAddr {
         peer_name: String,
         addr: String,
     },
@@ -104,6 +104,9 @@ pub enum ConfigError {
     InvalidMetricsAddr {
         addr: String,
     },
+    InvalidFabricDiscoveryAddr {
+        addr: String,
+    },
     InvalidBindingGraph(String),
 }
 
@@ -133,10 +136,10 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidTcpAddr { peer_name, addr } => {
                 write!(f, "peer {peer_name:?}: invalid tcp socket address {addr:?}")
             }
-            ConfigError::InvalidNativePeerAddr { peer_name, addr } => {
+            ConfigError::InvalidRdmaDiscoveryAddr { peer_name, addr } => {
                 write!(
                     f,
-                    "peer {peer_name:?}: invalid rdma fabric address {addr:?}"
+                    "peer {peer_name:?}: invalid fabric discovery socket address {addr:?}"
                 )
             }
             ConfigError::EmptyDiskPath => write!(f, "disk path must not be empty"),
@@ -248,6 +251,10 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidMetricsAddr { addr } => {
                 write!(f, "metrics addr {addr:?} is not a valid socket address")
             }
+            ConfigError::InvalidFabricDiscoveryAddr { addr } => write!(
+                f,
+                "fabric discovery addr {addr:?} is not a valid non-zero-port socket address"
+            ),
             ConfigError::InvalidBindingGraph(msg) => write!(f, "invalid binding graph: {msg}"),
         }
     }
@@ -418,6 +425,17 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         });
     }
 
+    let discovery_addr = &cfg.startup().fabric_discovery().addr;
+    if !discovery_addr.is_empty()
+        && discovery_addr
+            .parse::<SocketAddr>()
+            .map_or(true, |addr| addr.port() == 0)
+    {
+        return Err(ConfigError::InvalidFabricDiscoveryAddr {
+            addr: discovery_addr.clone(),
+        });
+    }
+
     Ok(())
 }
 
@@ -509,19 +527,15 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
                 }
             }
             Some(peer_spec::Config::Rdma(cfg)) => {
-                if !is_valid_rdma_peer_address(&cfg.addr) {
-                    return Err(ConfigError::InvalidNativePeerAddr {
+                if cfg
+                    .discovery_addr
+                    .parse::<SocketAddr>()
+                    .map_or(true, |addr| addr.port() == 0)
+                {
+                    return Err(ConfigError::InvalidRdmaDiscoveryAddr {
                         peer_name: p.name.clone(),
-                        addr: cfg.addr.clone(),
+                        addr: cfg.discovery_addr.clone(),
                     });
-                }
-                for addr in &cfg.addrs {
-                    if !is_valid_rdma_peer_address(addr) {
-                        return Err(ConfigError::InvalidNativePeerAddr {
-                            peer_name: p.name.clone(),
-                            addr: addr.clone(),
-                        });
-                    }
                 }
             }
             None => return Err(ConfigError::MissingPeerConfig(p.name.clone())),
@@ -630,21 +644,6 @@ fn validated_disk_path(disk: &super::schema::DiskSpec) -> Result<&str, ConfigErr
     Ok(path)
 }
 
-fn is_valid_native_address(addr: &str) -> bool {
-    let Some(hex) = addr.strip_prefix("hex:") else {
-        return false;
-    };
-    is_valid_even_hex(hex)
-}
-
-fn is_valid_rdma_peer_address(addr: &str) -> bool {
-    is_valid_native_address(addr) || addr.parse::<SocketAddr>().is_ok()
-}
-
-fn is_valid_even_hex(s: &str) -> bool {
-    !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,7 +738,7 @@ addr = "10.0.0.1:9000"
 name = "node-b"
 
 [peers.config.rdma]
-addr = "hex:deadbeef"
+discovery_addr = "10.0.0.2:9101"
 
 [[caches]]
 name = "c"
@@ -921,65 +920,14 @@ addr = "example.com:9000"
     }
 
     #[test]
-    fn accepts_native_peer_addr() {
+    fn accepts_rdma_discovery_addr() {
         let s = format!(
             r#"{}
 [[peers]]
 name = "node-rdma"
 
 [peers.config.rdma]
-addr = "hex:01020304"
-"#,
-            mesh_toml()
-        );
-        let f = write_cfg(&s);
-        let cfg = load(f.path()).expect("load should succeed");
-        let peer = cfg
-            .peers
-            .iter()
-            .find(|peer| peer.name == "node-rdma")
-            .unwrap();
-        match peer.config.as_ref().unwrap() {
-            peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.addr, "hex:01020304"),
-            other => panic!("expected rdma config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn accepts_rdma_socket_peer_addr() {
-        let s = format!(
-            r#"{}
-[[peers]]
-name = "node-rdma"
-
-[peers.config.rdma]
-addr = "10.0.0.2:5000"
-"#,
-            mesh_toml()
-        );
-        let f = write_cfg(&s);
-        let cfg = load(f.path()).expect("load should succeed");
-        let peer = cfg
-            .peers
-            .iter()
-            .find(|peer| peer.name == "node-rdma")
-            .unwrap();
-        match peer.config.as_ref().unwrap() {
-            peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.addr, "10.0.0.2:5000"),
-            other => panic!("expected rdma config, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn accepts_rdma_peer_addr_list() {
-        let s = format!(
-            r#"{}
-[[peers]]
-name = "node-rdma"
-
-[peers.config.rdma]
-addr = "hex:01020304"
-addrs = ["hex:01020304", "10.0.0.2:5000"]
+discovery_addr = "10.0.0.2:9101"
 "#,
             mesh_toml()
         );
@@ -992,29 +940,22 @@ addrs = ["hex:01020304", "10.0.0.2:5000"]
             .unwrap();
         match peer.config.as_ref().unwrap() {
             peer_spec::Config::Rdma(cfg) => {
-                assert_eq!(cfg.addr, "hex:01020304");
-                assert_eq!(cfg.addrs, ["hex:01020304", "10.0.0.2:5000"]);
+                assert_eq!(cfg.discovery_addr, "10.0.0.2:9101")
             }
             other => panic!("expected rdma config, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_invalid_native_peer_addr() {
-        for bad in [
-            "gid:bad",
-            "hex:",
-            "hex:abc",
-            "hex:deadbeefg0",
-            "example.com:9000",
-        ] {
+    fn rejects_invalid_rdma_discovery_addr() {
+        for bad in ["hex:0102", "example.com:9101", "10.0.0.2:0"] {
             let s = format!(
                 r#"{}
 [[peers]]
 name = "node-rdma"
 
 [peers.config.rdma]
-addr = "{bad}"
+discovery_addr = "{bad}"
 "#,
                 mesh_toml()
             );
@@ -1022,33 +963,11 @@ addr = "{bad}"
             assert!(
                 matches!(
                     load(f.path()),
-                    Err(ConfigError::InvalidNativePeerAddr { peer_name, .. }) if peer_name == "node-rdma"
+                    Err(ConfigError::InvalidRdmaDiscoveryAddr { peer_name, .. }) if peer_name == "node-rdma"
                 ),
-                "expected InvalidNativePeerAddr for {bad:?}"
+                "expected InvalidRdmaDiscoveryAddr for {bad:?}"
             );
         }
-    }
-
-    #[test]
-    fn rejects_invalid_rdma_peer_addr_list_entry() {
-        let s = format!(
-            r#"{}
-[[peers]]
-name = "node-rdma"
-
-[peers.config.rdma]
-addr = "hex:01020304"
-addrs = ["hex:01020304", "example.com:5000"]
-"#,
-            mesh_toml()
-        );
-        let f = write_cfg(&s);
-
-        assert!(matches!(
-            load(f.path()),
-            Err(ConfigError::InvalidNativePeerAddr { peer_name, addr })
-                if peer_name == "node-rdma" && addr == "example.com:5000"
-        ));
     }
 
     #[test]
@@ -1594,6 +1513,31 @@ addr = "example.com:9000"
         match load(f.path()) {
             Err(ConfigError::InvalidMetricsAddr { addr }) if addr == "not-an-addr" => {}
             other => panic!("expected InvalidMetricsAddr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_valid_fabric_discovery_addr() {
+        let f = write_cfg("[startup.fabric_discovery]\naddr = \"[::]:9101\"\n");
+        let cfg = load(f.path()).expect("valid discovery addr loads");
+        assert_eq!(cfg.startup().fabric_discovery().addr, "[::]:9101");
+    }
+
+    #[test]
+    fn empty_fabric_discovery_addr_is_allowed() {
+        let f = write_cfg("");
+        let cfg = load(f.path()).expect("absent discovery section loads");
+        assert_eq!(cfg.startup().fabric_discovery().addr, "");
+    }
+
+    #[test]
+    fn rejects_invalid_fabric_discovery_addr() {
+        for bad in ["not-an-addr", "0.0.0.0:0"] {
+            let f = write_cfg(&format!("[startup.fabric_discovery]\naddr = \"{bad}\"\n"));
+            assert!(matches!(
+                load(f.path()),
+                Err(ConfigError::InvalidFabricDiscoveryAddr { addr }) if addr == bad
+            ));
         }
     }
 
