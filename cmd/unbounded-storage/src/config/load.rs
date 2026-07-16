@@ -25,8 +25,61 @@ use std::path::Path;
 
 use prost::Message;
 
-use super::graph::runtime_projection;
+use super::graph::{RuntimeGraph, project_runtime, route_snapshot, validate_binding_graph};
 use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
+use crate::p2p::RouteTableSnapshot;
+
+/// One finalized configuration and every immutable runtime view derived from it.
+pub struct LoadedConfig {
+    config: Config,
+    runtime: RuntimeGraph,
+    routes: RouteTableSnapshot,
+}
+
+impl fmt::Debug for LoadedConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadedConfig")
+            .field("config", &self.config)
+            .field("runtime", &self.runtime)
+            .field("route_cache_ids", &self.routes.cache_ids)
+            .field("has_fingers", &self.routes.fingers.is_some())
+            .finish()
+    }
+}
+
+impl LoadedConfig {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        load(path.as_ref())
+    }
+
+    pub fn from_config(mut config: Config) -> Result<Self, ConfigError> {
+        config.apply_defaults();
+        validate(&config)?;
+        let runtime = project_runtime(&config);
+        let routes = route_snapshot(&runtime);
+        Ok(Self {
+            config,
+            runtime,
+            routes,
+        })
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn runtime(&self) -> &RuntimeGraph {
+        &self.runtime
+    }
+
+    pub fn routes(&self) -> &RouteTableSnapshot {
+        &self.routes
+    }
+
+    pub fn into_config(self) -> Config {
+        self.config
+    }
+}
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -284,22 +337,20 @@ impl From<prost::DecodeError> for ConfigError {
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        load(path.as_ref())
+        LoadedConfig::load(path).map(LoadedConfig::into_config)
     }
 }
 
 /// Loads a config from `path`, decoding raw binary protobuf for a
 /// `.binpb` extension and strict TOML for anything else. Both encodings
 /// share the same defaulting and validation finalization.
-pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let mut cfg = if has_binpb_extension(path) {
+pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
+    let cfg = if has_binpb_extension(path) {
         Config::decode(fs::read(path)?.as_slice())?
     } else {
         toml::from_str(&fs::read_to_string(path)?)?
     };
-    cfg.apply_defaults();
-    validate(&cfg)?;
-    Ok(cfg)
+    LoadedConfig::from_config(cfg)
 }
 
 fn has_binpb_extension(path: &Path) -> bool {
@@ -407,7 +458,7 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
     }
 
-    runtime_projection(cfg).map_err(ConfigError::InvalidBindingGraph)?;
+    validate_binding_graph(cfg).map_err(ConfigError::InvalidBindingGraph)?;
 
     // The metrics exporter addr is optional; when set it must parse as a
     // socket address (an empty value disables the exporter).
@@ -715,6 +766,7 @@ source = "b"
     fn loads_minimal_config() {
         let f = write_cfg("");
         let cfg = load(f.path()).unwrap();
+        let cfg = cfg.config();
         assert!(cfg.peers.is_empty());
         assert!(cfg.caches.is_empty());
     }
@@ -763,12 +815,14 @@ addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
-        assert_eq!(cfg.peers.len(), 2);
-        assert_eq!(cfg.disks.len(), 2);
-        assert_eq!(cfg.self_, "node-a");
-        let projection = runtime_projection(&cfg).unwrap();
-        assert!(!projection.frontends["f"].bypass_cache);
-        assert_eq!(projection.frontends["f"].backend_id, "b");
+        let raw = cfg.config();
+        assert_eq!(raw.peers.len(), 2);
+        assert_eq!(raw.disks.len(), 2);
+        assert_eq!(raw.self_, "node-a");
+        assert!(!cfg.runtime().frontends["f"].bypass_cache);
+        assert_eq!(cfg.runtime().frontends["f"].backend_id, "b");
+        assert!(cfg.routes().cache_ids.contains("c"));
+        assert!(cfg.routes().fingers.is_some());
     }
 
     #[test]
@@ -935,6 +989,7 @@ addr = "hex:01020304"
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
         let peer = cfg
+            .config()
             .peers
             .iter()
             .find(|peer| peer.name == "node-rdma")
@@ -960,6 +1015,7 @@ addr = "10.0.0.2:5000"
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
         let peer = cfg
+            .config()
             .peers
             .iter()
             .find(|peer| peer.name == "node-rdma")
@@ -986,6 +1042,7 @@ addrs = ["hex:01020304", "10.0.0.2:5000"]
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
         let peer = cfg
+            .config()
             .peers
             .iter()
             .find(|peer| peer.name == "node-rdma")
@@ -1078,8 +1135,8 @@ size = 16777216
         );
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.disks[0].kind_name(), "file");
-        assert_eq!(cfg.disks[0].file_size(), Some(16 * 1024 * 1024));
+        assert_eq!(cfg.config().disks[0].kind_name(), "file");
+        assert_eq!(cfg.config().disks[0].file_size(), Some(16 * 1024 * 1024));
     }
 
     #[test]
@@ -1205,8 +1262,8 @@ addr = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.self_, "node-a");
-        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(cfg.config().self_, "node-a");
+        assert_eq!(cfg.config().peers.len(), 1);
     }
 
     #[test]
@@ -1250,8 +1307,8 @@ addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends.len(), 1);
-        assert_eq!(cfg.frontends.len(), 1);
+        assert_eq!(cfg.config().backends.len(), 1);
+        assert_eq!(cfg.config().frontends.len(), 1);
     }
 
     #[test]
@@ -1357,8 +1414,12 @@ name = "synthetic"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("fake backend without url should load");
-        assert_eq!(cfg.backends[0].name, "synthetic");
-        match cfg.backends[0].config.as_ref().expect("backend config set") {
+        assert_eq!(cfg.config().backends[0].name, "synthetic");
+        match cfg.config().backends[0]
+            .config
+            .as_ref()
+            .expect("backend config set")
+        {
             backend_spec::Config::Fake(fake) => {
                 assert_eq!(fake.object_size_bytes, Some(1024 * 1024));
             }
@@ -1499,7 +1560,10 @@ stripe_size_bytes = 8388608
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].stripe_size_bytes(), 8 * 1024 * 1024);
+        assert_eq!(
+            cfg.config().backends[0].stripe_size_bytes(),
+            8 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -1578,14 +1642,14 @@ addr = "example.com:9000"
     fn accepts_valid_metrics_addr() {
         let f = write_cfg("[startup.metrics]\naddr = \"0.0.0.0:9100\"\n");
         let cfg = load(f.path()).expect("valid metrics addr loads");
-        assert_eq!(cfg.startup().metrics().addr, "0.0.0.0:9100");
+        assert_eq!(cfg.config().startup().metrics().addr, "0.0.0.0:9100");
     }
 
     #[test]
     fn empty_metrics_addr_is_allowed() {
         let f = write_cfg("");
         let cfg = load(f.path()).expect("absent metrics section loads");
-        assert_eq!(cfg.startup().metrics().addr, "");
+        assert_eq!(cfg.config().startup().metrics().addr, "");
     }
 
     #[test]
@@ -1648,8 +1712,8 @@ read_bytes = 65536
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("loadgen frontend without addr should load");
-        assert_eq!(cfg.frontends[0].kind_name(), "loadgen");
-        assert_eq!(cfg.frontends[0].addr(), None);
+        assert_eq!(cfg.config().frontends[0].kind_name(), "loadgen");
+        assert_eq!(cfg.config().frontends[0].addr(), None);
     }
 
     #[test]
@@ -1681,7 +1745,7 @@ addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("empty loadgen addrs should not collide");
-        assert_eq!(cfg.frontends.len(), 3);
+        assert_eq!(cfg.config().frontends.len(), 3);
     }
 
     #[test]
@@ -1695,8 +1759,11 @@ url = "https://s3.example.com:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].kind_name(), "s3");
-        assert_eq!(cfg.backends[0].url(), Some("https://s3.example.com:443"));
+        assert_eq!(cfg.config().backends[0].kind_name(), "s3");
+        assert_eq!(
+            cfg.config().backends[0].url(),
+            Some("https://s3.example.com:443")
+        );
     }
 
     #[test]
@@ -1710,7 +1777,7 @@ url = "https://acct.blob.core.windows.net:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].kind_name(), "azure");
+        assert_eq!(cfg.config().backends[0].kind_name(), "azure");
     }
 
     #[test]
@@ -1795,10 +1862,10 @@ addr = "0.0.0.0:9000"
         let cfg: Config = toml::from_str(toml).unwrap();
         let f = write_binpb(&encode_config(&cfg));
         let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.peers.len(), 1);
-        assert_eq!(loaded.peers[0].name, "node-a");
-        assert_eq!(loaded.disks.len(), 1);
-        assert_eq!(loaded.self_, "node-a");
+        assert_eq!(loaded.config().peers.len(), 1);
+        assert_eq!(loaded.config().peers[0].name, "node-a");
+        assert_eq!(loaded.config().disks.len(), 1);
+        assert_eq!(loaded.config().self_, "node-a");
     }
 
     #[test]
@@ -1806,9 +1873,9 @@ addr = "0.0.0.0:9000"
         // The binpb path shares the TOML path's defaulting finalization.
         let f = write_binpb(&encode_config(&Config::default()));
         let loaded = load(f.path()).unwrap();
-        assert!(loaded.peers.is_empty());
+        assert!(loaded.config().peers.is_empty());
         assert_eq!(
-            loaded.startup().fabric().default_listen_addr(),
+            loaded.config().startup().fabric().default_listen_addr(),
             Some("0.0.0.0:0")
         );
     }
@@ -1864,7 +1931,7 @@ addr = "10.0.0.2:9000"
         // documented defaults during load.
         let f = write_cfg("");
         let cfg = load(f.path()).unwrap();
-        let s = cfg.startup();
+        let s = cfg.config().startup();
         assert_eq!(s.memory().memory_total_bytes, Some(128 * 1024 * 1024));
         assert_eq!(s.fabric().default_listen_addr(), Some("0.0.0.0:0"));
         assert_eq!(s.fabric().max_inflight, Some(1024));
@@ -1888,18 +1955,18 @@ disable_rdma = true
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
-        assert!(cfg.startup().memory().no_hugepages);
+        assert!(cfg.config().startup().memory().no_hugepages);
         assert_eq!(
-            cfg.startup().memory().memory_total_bytes,
+            cfg.config().startup().memory().memory_total_bytes,
             Some(64 * 1024 * 1024)
         );
         assert_eq!(
-            cfg.startup().fabric().default_listen_addr(),
+            cfg.config().startup().fabric().default_listen_addr(),
             Some("10.0.0.1:7000")
         );
-        assert!(cfg.startup().topology().disable_rdma);
+        assert!(cfg.config().startup().topology().disable_rdma);
         // Unset siblings still default.
-        assert_eq!(cfg.startup().fabric().progress_threads, Some(2));
+        assert_eq!(cfg.config().startup().fabric().progress_threads, Some(2));
     }
 
     #[test]
@@ -1920,13 +1987,13 @@ disable_rdma = true
         let f = write_binpb(&encode_config(&cfg));
         let loaded = load(f.path()).unwrap();
         assert_eq!(
-            loaded.startup().fabric().default_listen_addr(),
+            loaded.config().startup().fabric().default_listen_addr(),
             Some("10.0.0.2:8000")
         );
-        assert_eq!(loaded.startup().fabric().max_inflight, Some(4096));
-        assert!(loaded.startup().topology().disable_rdma);
+        assert_eq!(loaded.config().startup().fabric().max_inflight, Some(4096));
+        assert!(loaded.config().startup().topology().disable_rdma);
         assert_eq!(
-            loaded.startup().memory().memory_total_bytes,
+            loaded.config().startup().memory().memory_total_bytes,
             Some(128 * 1024 * 1024)
         );
     }

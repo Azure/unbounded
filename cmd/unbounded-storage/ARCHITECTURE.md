@@ -128,8 +128,9 @@ excluded from the live-reload diff.
 
 ### Startup sequence
 
-1. Load and validate config; build `StartupSettings` from the config's
-   `[startup]` section.
+1. Load and validate config into one immutable `LoadedConfig` containing the raw
+   config, owned runtime graph, and route snapshot; build `StartupSettings` from
+   its raw config's `[startup]` section.
 2. `Host::discover()` reads hardware from sysfs.
 3. `CorePlan::for_host(&host, &settings.core_plan_config)` partitions the
    host's usable CPUs into three disjoint, NUMA-local classes: one
@@ -144,26 +145,43 @@ excluded from the live-reload diff.
    i-th worker thread to its assigned core and NUMA node.
 6. A `DiskChannelDirectory` (Arc) is created before shards as the hot-swap
    publication surface for disk channels.
-7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
-   startup-fixed fabric settings come from the config `[startup]` section via
-   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>`) are
-   constructed once and shared across shards. `PeerId` uses the same stable
-   numeric identity as `NodeId`.
+7. One `Arc<LoadedConfig>` shares the raw config, owned runtime graph, and route
+   snapshot across startup consumers and shards. Startup-fixed fabric settings
+   still come from the raw `[startup]` section via `StartupSettings`. `PeerId`
+   uses the same stable numeric identity as `NodeId`.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
-9. After every shard reports `Up`, peers are reconciled per shard, the disk
-   supervisor opens disks and publishes channels, and the config watcher takes
-   over for the lifetime of the process.
+9. After every shard reports `Up`, peers are reconciled per shard and every
+   shard completes phase B while parked. The disk supervisor then opens the
+   initial disks and publishes channels. Only after publication does activation
+   start the recursive RPC servers and release shards into their serve loops;
+   the config watcher then takes over for the lifetime of the process. Disk-open
+   failures retire the prepared layer rather than activating a partial startup
+   configuration.
 
 ### Shard readiness and panic safety
 
-Each shard reports exactly one `ShardReady` message: `Up { descriptor, fabric }`
-(after which it parks while holding its `Sender`), or `Failed(String)`.
-`report_on_panic` wraps shard bring-up in `catch_unwind`/`AssertUnwindSafe` so a
-panicking shard still emits one `Failed` via a dedicated panic channel;
-otherwise main's bounded receive would hang. Main performs a bounded `recv()`
-exactly `joins.len()` times (it does **not** drain to disconnect, because `Up`
-shards never drop their sender).
+Each shard owns a phase-A reporter that emits exactly one `ShardReady` message:
+`Up { worker_idx, publish }` or `Failed(String)`. Its Drop fallback covers an
+early return or panic before the explicit report. Phase B uses the same
+consuming-report/Drop pattern. Main performs a bounded `recv()` exactly
+`joins.len()` times (it does **not** drain to disconnect, because live shards
+retain channel senders). Preparation returns a `PreparedShardLayer` only after
+all phase-B reports succeed. Activation starts RPC and releases the parked
+shards; on failure it sets the layer stop flag, drops the serve gates, joins
+shards in reverse order, and tears down fabric and backing keepalives.
+
+Shard panics are logged and resumed so the native join handle remains failed.
+Once serving starts, a lifetime guard balances the live-shard metric and sends
+a terminal report on abnormal exit. That report also sets process-wide
+shutdown; teardown drains terminal reports and returns a failing process status
+instead of continuing with a missing shard.
+
+Backend and frontend reloads construct replacements before swapping them into
+their shard-local registries. A failed replacement therefore leaves the prior
+resource, binding, and stripe geometry live and retryable. This is a
+per-resource guarantee; route, peer, shard, and disk publication across the
+whole process is not yet one transaction.
 
 ### Shutdown
 
@@ -172,7 +190,7 @@ SIGINT/SIGTERM handler (installed via `libc::sigaction`, relaxed atomic store).
 Every thread polls this flag.
 
 Teardown order is deliberate: join shard threads in reverse (releasing
-`Arc<engine>` references) **first**, then drop the disk channel directory, then
+`Arc<engine>` references) **first**, clear disk channel publications, then
 `disk_registry.drain()`.
 
 ## 5. Shard Bring-up (`run_shard`)
@@ -197,9 +215,10 @@ per-shard `!Send` object graph:
 5. **RPC server.** `FabricGroup`, constructed before the shards, allocates a
    **separate** scratch backing for each fabric unit (`RPC_SCRATCH_PAGES = 8`,
    one scratch page per in-flight serve/forward) and registers it as its own
-   fabric MR. After shard publication, it builds the unit's `RecursiveHandler`
-   and starts the RPC server. Scratch uses a distinct `LiveShardLocalStore`
-   because a `PageRef` resolves through exactly one backing's geometry.
+   fabric MR. After phase B and initial disk publication, activation builds the
+   unit's `RecursiveHandler` and starts the RPC server. Scratch uses a distinct
+   `LiveShardLocalStore` because a `PageRef` resolves through exactly one
+   backing's geometry.
 6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
    frontends keyed by component name. Each spec binds its listener with `SO_REUSEPORT` and
    builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends
@@ -537,6 +556,10 @@ path-sorted for stable hashing; `drain()` clears channels before handles.
 `DiskChannelDirectory` is the Arc'd hot-swap publication surface, and
 `LiveShardLocalStore` is a per-shard view over the live directory that
 re-registers buffers when it observes a swap (`current_or_replay`).
+Every reconcile publishes the realized open subset. A live open failure aborts
+config convergence so the same desired snapshot remains retryable; a startup
+open failure retires the parked shard layer. Same-path drift remains remove then
+add because provisioning and recovery cannot safely run beside the old engine.
 
 **Stripe keys**: `stripe_key` derives the 32-byte content-addressed key;
 `METADATA_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
@@ -571,7 +594,23 @@ registries are all updated without tearing the shard layer down. Backing
 memory, the topology plan, the fabric max in-flight knob, and the local
 `self` peer identity are fixed at startup (mostly sourced from the
 config `[startup]` section, see the CLI section), not reloadable config
-fields.
+fields. Shard apply and page-cache-drain fan-in use one 60-second deadline
+for the complete worker set and report outstanding worker identities. A
+timeout, acknowledgement-channel disconnect, or partial broadcast send failure
+requests process shutdown: already-delivered commands may complete later, so
+retrying against the old controller snapshot would be unsafe.
+Peer availability failures are accepted as desired reconnect intent inside the
+fabric. Errors that reach process-level peer reconciliation are therefore hard
+lifecycle/configuration failures; startup rejects them, while live apply
+requests fail-stop shutdown because remove/add mutations cannot be rolled back.
+All shard transports and fabric RPC handlers share one process-wide
+`RouteTableHandle`. The apply target is its only writer and publishes the new
+snapshot once, after shard acknowledgement, page-cache drain, and disk
+publication succeed. Disk open failures are returned after the realized subset
+is published, leaving the desired config retryable and routing on the prior
+snapshot. This keeps routing on the prior snapshot when an earlier
+apply step reports failure; other resource reconciliation is still not a
+whole-process transaction.
 
 Sections (all optional, each falling back to defaults):
 
@@ -617,11 +656,15 @@ Sections (all optional, each falling back to defaults):
 - `[[frontends]]` - `name`, `source` (a backend or cache component name), and
   one `config` table (`http`, `s3`, or `loadgen`).
 
-The watcher (`notify`-based) emits `ConfigUpdate`s; main's
+After defaults and validation, loading constructs one immutable `LoadedConfig`:
+the raw `Config`, one owned `RuntimeGraph`, and one route snapshot built from
+that graph. The watcher (`notify`-based) emits these loaded snapshots; main's
 `wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa
 drift, via a `last_applied` cache), disks, and - by broadcasting the applied
 config to every shard - each shard's backend and frontend registries plus the
-routing snapshot. It republishes the channel snapshot each update, logs
+routing snapshot. The apply target and shards consume the same loaded graph and
+routes; this is coherent preparation, not whole-process transactionality. It
+republishes the channel snapshot each update, logs
 `config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.
 
 ### 7.12 `tls/` - the shared TLS transport
