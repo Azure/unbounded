@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 // +kubebuilder:object:generate=true
-// +groupName=infrastructure.unbounded-cloud.io
+// +groupName=azure.unbounded-cloud.io
 package v1alpha1
 
 //go:generate controller-gen object:headerFile=../../../../hack/boilerplate.go.txt paths=.
@@ -14,13 +14,12 @@ import (
 )
 
 var (
-	// GroupVersion is the API group and version for provider infrastructure
-	// resources shipped by Unbounded.
-	GroupVersion = schema.GroupVersion{Group: "infrastructure.unbounded-cloud.io", Version: "v1alpha1"}
+	// GroupVersion is the API group and version for Azure provider resources.
+	GroupVersion = schema.GroupVersion{Group: "azure.unbounded-cloud.io", Version: "v1alpha1"}
 
-	// SchemeBuilder registers infrastructure API types.
+	// SchemeBuilder registers Azure provider API types.
 	SchemeBuilder = &runtime.SchemeBuilder{}
 
-	// AddToScheme adds infrastructure API types to a runtime scheme.
+	// AddToScheme adds Azure provider API types to a runtime scheme.
 	AddToScheme = SchemeBuilder.AddToScheme
 )

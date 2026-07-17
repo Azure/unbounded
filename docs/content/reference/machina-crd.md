@@ -115,7 +115,7 @@ MachineOperation authorizes that destructive action.
 The built-in Azure provider uses this companion resource:
 
 ```yaml
-apiVersion: infrastructure.unbounded-cloud.io/v1alpha1
+apiVersion: azure.unbounded-cloud.io/v1alpha1
 kind: AzureMachine
 metadata:
   name: worker-01
