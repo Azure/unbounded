@@ -134,16 +134,6 @@ object from `spec.providerRef`. During migration, Azure falls back to
 `spec.providerID` only when `providerRef` is absent. When both exist,
 `providerRef` is authoritative.
 
-Migrate an existing Azure Machine after installing the `AzureMachine` CRD:
-
-```bash
-kubectl unbounded machine migrate-azure-provider-ref worker-01
-```
-
-The command is idempotent. It creates or validates the `AzureMachine`, sets the
-Unbounded Machine as controller owner, and populates `providerRef`. It retains
-the deprecated `providerID` during the migration window.
-
 Machine operation credentials are selected by the Machine site label. Providers that support OIDC/workload identity use `WorkloadIdentity`; providers or sites that need provider-specific credential material use `ExternalPlugin` with a referenced Secret.
 Custom Go controllers register the operations they support with
 `pkg/machineops.NewProvider` and declare their provider-owned resource with

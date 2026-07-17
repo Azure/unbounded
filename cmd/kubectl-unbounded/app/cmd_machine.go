@@ -18,7 +18,6 @@ func newMachineCommandGroup(rt *machineCommandRuntime) *cobra.Command {
 	cmd.AddCommand(
 		configCommandGroup(),
 		newMachineOperationCommandGroup(rt),
-		newMachineMigrateAzureProviderRefCommand(rt),
 		machineRegisterCommand(),
 		newMachineNodeRebootCommand(rt),
 		newMachineHostRebootCommand(rt),
