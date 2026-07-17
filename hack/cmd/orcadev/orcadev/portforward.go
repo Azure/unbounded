@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // portForwardProbeTimeout bounds the initial TCP probe used to decide
@@ -316,7 +318,7 @@ func spawnPortForward(_ context.Context, g *globalFlags, spec portForwardSpec) (
 
 	namespace := g.namespace
 	if namespace == "" {
-		namespace = defaultNamespace
+		namespace = unbounded.SystemNamespace()
 	}
 
 	args = append(args,

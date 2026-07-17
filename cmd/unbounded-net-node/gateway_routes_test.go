@@ -18,6 +18,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -48,9 +49,9 @@ func toUnstructured(t *testing.T, obj interface{}) *unstructured.Unstructured {
 
 // TestParseSiteSliceAndGatewayPool tests ParseSiteSliceAndGatewayPool.
 func TestParseSiteSliceAndGatewayPool(t *testing.T) {
-	siteSrc := &unboundednetv1alpha1.Site{
+	siteSrc := &unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-		Spec: unboundednetv1alpha1.SiteSpec{
+		Spec: unboundedv1alpha3.SiteSpec{
 			NodeCidrs: []string{"10.0.0.0/16"},
 		},
 	}
@@ -139,9 +140,9 @@ func TestBuildGatewayNodeRoutesForStatus(t *testing.T) {
 			RoutedCidrs: []string{"100.64.0.0/16", ""},
 		},
 	}
-	site := &unboundednetv1alpha1.Site{
+	site := &unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-		Spec: unboundednetv1alpha1.SiteSpec{
+		Spec: unboundedv1alpha3.SiteSpec{
 			NodeCidrs: []string{"10.0.0.0/16"},
 			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
 				{CidrBlocks: []string{"10.244.0.0/16", ""}},

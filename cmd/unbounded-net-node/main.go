@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	configpkg "github.com/Azure/unbounded/internal/net/config"
 	"github.com/Azure/unbounded/internal/net/metrics"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
@@ -122,8 +123,8 @@ type config struct {
 }
 
 var siteGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-cloud.io",
-	Version:  "v1alpha1",
+	Group:    unboundedv1alpha3.GroupVersion.Group,
+	Version:  unboundedv1alpha3.GroupVersion.Version,
 	Resource: "sites",
 }
 

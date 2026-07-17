@@ -1,0 +1,67 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-operator upgrade e2e
+
+# Faithful, real released-version upgrade e2e: installs the last released
+# multi-namespace version and upgrades to the operator model, asserting the
+# reaper migration. All orchestration lives in the standalone driver
+# hack/operator-upgrade-e2e/e2e.py (runnable locally too); this workflow is a
+# thin caller. It is heavy (kind + local registry + several image builds) so it
+# runs on demand and nightly rather than per-PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      old-version:
+        description: Released version to install as the legacy state
+        required: false
+        default: v0.1.19
+  schedule:
+    # Nightly at 07:00 UTC.
+    - cron: "0 7 * * *"
+
+concurrency:
+  group: operator-upgrade-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  KIND_VERSION: v0.29.0
+
+jobs:
+  operator-upgrade-e2e:
+    name: operator upgrade e2e (kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ./kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 ./kind /usr/local/bin/kind
+          rm -f ./kind
+          kind version
+
+      - name: Verify e2e prerequisites
+        run: |
+          set -euo pipefail
+          for bin in kind kubectl docker go make curl python3; do
+            command -v "$bin" >/dev/null 2>&1 || { echo "missing required binary: $bin" >&2; exit 1; }
+          done
+          docker info >/dev/null
+
+      - name: Run operator upgrade e2e
+        run: python3 hack/operator-upgrade-e2e/e2e.py all --workers 5 --old-version "${OLD_VERSION}"
+        env:
+          OLD_VERSION: ${{ github.event.inputs.old-version || 'v0.1.19' }}

@@ -79,7 +79,7 @@ the rollout still completes. Kind installs keep the strict
 ## 3. Verify the install
 
 ```bash
-kubectl --context kind-orca-dev -n unbounded-kube get pods
+kubectl --context kind-orca-dev -n unbounded-system get pods
 # NAME                          READY   STATUS    RESTARTS   AGE
 # azurite-...                   2/2     Running   0          1m   (sidecar = container-ensurer)
 # garage-...                    1/1     Running   0          1m
@@ -280,7 +280,7 @@ Garage startup + the layout/key/bucket bootstrap takes longer than the
 idempotent):
 
 ```bash
-kubectl --context kind-orca-dev -n unbounded-kube logs deploy/garage | tail
+kubectl --context kind-orca-dev -n unbounded-system logs deploy/garage | tail
 ./hack/orca/setup-orca.sh
 ```
 
@@ -290,7 +290,7 @@ self-bootstrap from an in-pod hook). If it is stuck, inspect the
 cluster directly:
 
 ```bash
-kubectl --context kind-orca-dev -n unbounded-kube exec deploy/garage -- \
+kubectl --context kind-orca-dev -n unbounded-system exec deploy/garage -- \
   /garage -c /etc/garage.toml status
 ```
 
@@ -313,7 +313,7 @@ Most common in real-Azure mode when one of `AZURE_STORAGE_ACCOUNT`,
 `AZURE_STORAGE_KEY`, `AZURE_CONTAINER` is empty.
 
 ```bash
-kubectl --context kind-orca-dev -n unbounded-kube logs deploy/orca | head
+kubectl --context kind-orca-dev -n unbounded-system logs deploy/orca | head
 # Fix the env vars, then:
 ./hack/orca/setup-orca.sh
 ```

@@ -177,7 +177,7 @@ ensure_site_gateway_resources() {
 
     echo "==> Ensuring Site '${site_name}' CRD..."
     {
-        echo "apiVersion: net.unbounded-cloud.io/v1alpha1"
+        echo "apiVersion: unbounded-cloud.io/v1alpha3"
         echo "kind: Site"
         echo "metadata:"
         echo "  name: ${site_name}"

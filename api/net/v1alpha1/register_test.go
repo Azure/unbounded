@@ -8,13 +8,12 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // TestResourceAndAddToScheme tests resource and add to scheme.
 func TestResourceAndAddToScheme(t *testing.T) {
-	gr := Resource("sites")
-	if gr.Group != GroupName || gr.Resource != "sites" {
+	gr := Resource("gatewaypools")
+	if gr.Group != GroupName || gr.Resource != "gatewaypools" {
 		t.Fatalf("unexpected group resource: %#v", gr)
 	}
 
@@ -24,7 +23,7 @@ func TestResourceAndAddToScheme(t *testing.T) {
 	}
 
 	objects := []runtime.Object{
-		&Site{}, &SiteList{}, &SiteNodeSlice{}, &SiteNodeSliceList{},
+		&SiteNodeSlice{}, &SiteNodeSliceList{},
 		&GatewayPool{}, &GatewayPoolList{}, &GatewayPoolNode{}, &GatewayPoolNodeList{},
 		&SitePeering{}, &SitePeeringList{},
 		&SiteGatewayPoolAssignment{}, &SiteGatewayPoolAssignmentList{},
@@ -46,78 +45,8 @@ func TestResourceAndAddToScheme(t *testing.T) {
 	}
 }
 
-// TestDeepCopySiteAndLists tests deep copy site and lists.
-func TestDeepCopySiteAndLists(t *testing.T) {
-	enabled := true
-	priority := int32(10)
-	detectMultiplier := int32(3)
-	receive := intstr.FromString("300ms")
-	transmit := intstr.FromInt(400)
-
-	site := &Site{
-		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
-		Spec: SiteSpec{
-			NodeCidrs: []string{"10.0.0.0/16"},
-			PodCidrAssignments: []PodCidrAssignment{
-				{
-					AssignmentEnabled: &enabled,
-					CidrBlocks:        []string{"10.244.0.0/16"},
-					NodeBlockSizes:    &NodeBlockSizes{IPv4: 24, IPv6: 80},
-					NodeRegex:         []string{"^node-"},
-					Priority:          &priority,
-				},
-			},
-			ManageCniPlugin:    &enabled,
-			NonMasqueradeCIDRs: []string{"172.16.0.0/12"},
-			LocalCIDRs:         []string{"10.0.0.0/8"},
-			HealthCheckSettings: &HealthCheckSettings{
-				Enabled:          &enabled,
-				DetectMultiplier: &detectMultiplier,
-				ReceiveInterval:  &receive,
-				TransmitInterval: &transmit,
-			},
-		},
-		Status: SiteStatus{NodeCount: 2, SliceCount: 1},
-	}
-
-	copied := site.DeepCopy()
-	if copied == nil {
-		t.Fatalf("DeepCopy() returned nil")
-	}
-
-	if copied.Name != "site-a" || copied.Spec.PodCidrAssignments[0].NodeBlockSizes.IPv4 != 24 {
-		t.Fatalf("unexpected copied site: %#v", copied)
-	}
-
-	site.Spec.NodeCidrs[0] = "10.99.0.0/16"
-	site.Spec.PodCidrAssignments[0].CidrBlocks[0] = "10.250.0.0/16"
-
-	site.Spec.HealthCheckSettings.DetectMultiplier = ptrInt32(9)
-	if copied.Spec.NodeCidrs[0] != "10.0.0.0/16" {
-		t.Fatalf("expected deep-copied NodeCidrs to be isolated")
-	}
-
-	if copied.Spec.PodCidrAssignments[0].CidrBlocks[0] != "10.244.0.0/16" {
-		t.Fatalf("expected deep-copied assignment CidrBlocks to be isolated")
-	}
-
-	if copied.Spec.HealthCheckSettings.DetectMultiplier == nil || *copied.Spec.HealthCheckSettings.DetectMultiplier != 3 {
-		t.Fatalf("expected deep-copied health check settings to be isolated")
-	}
-
-	if site.DeepCopyObject() == nil {
-		t.Fatalf("expected Site.DeepCopyObject() not nil")
-	}
-
-	siteList := &SiteList{Items: []Site{*site}}
-	if got := siteList.DeepCopy(); got == nil || len(got.Items) != 1 {
-		t.Fatalf("unexpected SiteList deepcopy result: %#v", got)
-	}
-
-	if siteList.DeepCopyObject() == nil {
-		t.Fatalf("expected SiteList.DeepCopyObject() not nil")
-	}
-
+// TestDeepCopySiteNodeSliceAndLists tests deep copy site node slices and lists.
+func TestDeepCopySiteNodeSliceAndLists(t *testing.T) {
 	nodeSlice := &SiteNodeSlice{
 		ObjectMeta: metav1.ObjectMeta{Name: "site-a-0"},
 		SiteName:   "site-a",

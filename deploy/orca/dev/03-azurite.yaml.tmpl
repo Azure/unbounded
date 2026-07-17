@@ -12,7 +12,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: azurite
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: azurite
     app.kubernetes.io/part-of: orca-dev
@@ -37,7 +37,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: azurite
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: azurite
     app.kubernetes.io/part-of: orca-dev

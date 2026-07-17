@@ -15,15 +15,16 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 // SiteInterface has methods to work with Site resources.
 type SiteInterface interface {
-	List(ctx context.Context, opts metav1.ListOptions) (*unboundednetv1alpha1.SiteList, error)
-	Get(ctx context.Context, name string, opts metav1.GetOptions) (*unboundednetv1alpha1.Site, error)
+	List(ctx context.Context, opts metav1.ListOptions) (*unboundedv1alpha3.SiteList, error)
+	Get(ctx context.Context, name string, opts metav1.GetOptions) (*unboundedv1alpha3.Site, error)
 	Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)
-	UpdateStatus(ctx context.Context, site *unboundednetv1alpha1.Site, opts metav1.UpdateOptions) (*unboundednetv1alpha1.Site, error)
+	UpdateStatus(ctx context.Context, site *unboundedv1alpha3.Site, opts metav1.UpdateOptions) (*unboundedv1alpha3.Site, error)
 }
 
 // GatewayPoolInterface has methods to work with GatewayPool resources.
@@ -39,8 +40,8 @@ type siteClient struct {
 }
 
 var siteGVR = schema.GroupVersionResource{
-	Group:    unboundednetv1alpha1.GroupName,
-	Version:  "v1alpha1",
+	Group:    unboundedv1alpha3.GroupVersion.Group,
+	Version:  unboundedv1alpha3.GroupVersion.Version,
 	Resource: "sites",
 }
 
@@ -80,13 +81,13 @@ func NewGatewayPoolClient(config *rest.Config) (GatewayPoolInterface, error) {
 }
 
 // List returns Site resources matching list options.
-func (c *siteClient) List(ctx context.Context, opts metav1.ListOptions) (*unboundednetv1alpha1.SiteList, error) {
+func (c *siteClient) List(ctx context.Context, opts metav1.ListOptions) (*unboundedv1alpha3.SiteList, error) {
 	unstructuredList, err := c.client.List(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	siteList := &unboundednetv1alpha1.SiteList{}
+	siteList := &unboundedv1alpha3.SiteList{}
 
 	data, err := unstructuredList.MarshalJSON()
 	if err != nil {
@@ -101,13 +102,13 @@ func (c *siteClient) List(ctx context.Context, opts metav1.ListOptions) (*unboun
 }
 
 // Get returns a Site resource by name.
-func (c *siteClient) Get(ctx context.Context, name string, opts metav1.GetOptions) (*unboundednetv1alpha1.Site, error) {
+func (c *siteClient) Get(ctx context.Context, name string, opts metav1.GetOptions) (*unboundedv1alpha3.Site, error) {
 	unstructured, err := c.client.Get(ctx, name, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	site := &unboundednetv1alpha1.Site{}
+	site := &unboundedv1alpha3.Site{}
 
 	data, err := unstructured.MarshalJSON()
 	if err != nil {
@@ -127,7 +128,7 @@ func (c *siteClient) Watch(ctx context.Context, opts metav1.ListOptions) (watch.
 }
 
 // UpdateStatus updates only the status subresource for a Site.
-func (c *siteClient) UpdateStatus(ctx context.Context, site *unboundednetv1alpha1.Site, opts metav1.UpdateOptions) (*unboundednetv1alpha1.Site, error) {
+func (c *siteClient) UpdateStatus(ctx context.Context, site *unboundedv1alpha3.Site, opts metav1.UpdateOptions) (*unboundedv1alpha3.Site, error) {
 	// Create a patch for just the status
 	statusPatch := map[string]interface{}{
 		"status": map[string]interface{}{
@@ -146,7 +147,7 @@ func (c *siteClient) UpdateStatus(ctx context.Context, site *unboundednetv1alpha
 		return nil, err
 	}
 
-	updatedSite := &unboundednetv1alpha1.Site{}
+	updatedSite := &unboundedv1alpha3.Site{}
 
 	data, err := unstructured.MarshalJSON()
 	if err != nil {

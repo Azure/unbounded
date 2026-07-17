@@ -137,11 +137,11 @@ func TestNodeEligibilityAndPreferredPoolHelpers(t *testing.T) {
 		t.Fatalf("expected missing wireguard key to be ineligible")
 	}
 
-	if !nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway", SiteLabelKey: "site-a"}, true, "pub"), poolExternalA) {
+	if !nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, true, "pub"), poolExternalA) {
 		t.Fatalf("expected eligible external gateway node")
 	}
 
-	if !nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway", SiteLabelKey: "site-a"}, false, "pub"), poolInternal) {
+	if !nodeEligibleForGatewayPool(makeGatewayNode("n", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, false, "pub"), poolInternal) {
 		t.Fatalf("expected internal gateway pool to allow node without external IP")
 	}
 
@@ -149,7 +149,7 @@ func TestNodeEligibilityAndPreferredPoolHelpers(t *testing.T) {
 		poolsCache: []unboundednetv1alpha1.GatewayPool{*poolExternalA, *poolExternalB},
 	}
 
-	chosen, ok := controller.preferredGatewayPoolForNode(makeGatewayNode("node-a", map[string]string{"role": "gateway", SiteLabelKey: "site-a"}, true, "pub"))
+	chosen, ok := controller.preferredGatewayPoolForNode(makeGatewayNode("node-a", map[string]string{"role": "gateway", canonicalSiteLabelKey: "site-a"}, true, "pub"))
 	if !ok || chosen != "pool-a" {
 		t.Fatalf("expected lexicographically first eligible pool, got ok=%v chosen=%s", ok, chosen)
 	}

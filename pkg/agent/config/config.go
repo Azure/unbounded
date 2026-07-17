@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -55,6 +56,11 @@ type AgentConfig struct {
 	// addition to automatically discovered devices.
 	AdditionalHostDevices []string `json:"AdditionalHostDevices,omitempty"`
 
+	// AdditionalHostMounts lists extra host paths that should be bind-mounted
+	// into the nspawn machine. ReadOnly should be used unless write access is
+	// required.
+	AdditionalHostMounts []AdditionalHostMount `json:"AdditionalHostMounts,omitempty"`
+
 	// OfflineArtifacts points to a complete offline binary artifact source.
 	// When set, it takes precedence over download overrides. Source is rendered
 	// as a strict Go template using the cluster Kubernetes version, then
@@ -67,6 +73,14 @@ type AgentConfig struct {
 // agent installs into the nspawn rootfs.
 type AgentOfflineArtifacts struct {
 	Source string `json:"Source,omitempty"`
+}
+
+// AdditionalHostMount configures a host path bind mount for the nspawn
+// machine. Target defaults to Source when omitted.
+type AdditionalHostMount struct {
+	Source   string `json:"Source"`
+	Target   string `json:"Target,omitempty"`
+	ReadOnly bool   `json:"ReadOnly,omitempty"`
 }
 
 // DeepCopy returns a copy of AgentOfflineArtifacts.
@@ -144,6 +158,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
+	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
 
 	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 
@@ -175,6 +190,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateAdditionalHostDevices(a.AdditionalHostDevices); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateAdditionalHostMounts(a.AdditionalHostMounts); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -222,6 +241,44 @@ func validateAdditionalHostDevice(path string) error {
 
 	if cleaned := filepath.Clean(path); cleaned != path || !strings.HasPrefix(cleaned, "/dev/") {
 		return fmt.Errorf("AdditionalHostDevices entry %q must be a clean absolute path under /dev", path)
+	}
+
+	return nil
+}
+
+// ValidateAdditionalHostMounts checks that configured host bind-mount paths
+// are safe to render into nspawn directives.
+func ValidateAdditionalHostMounts(mounts []AdditionalHostMount) error {
+	var errs []error
+
+	for i, mount := range mounts {
+		if err := validateAdditionalHostMountPath(mount.Source); err != nil {
+			errs = append(errs, fmt.Errorf("AdditionalHostMounts[%d].Source: %w", i, err))
+		}
+
+		if mount.Target != "" {
+			if err := validateAdditionalHostMountPath(mount.Target); err != nil {
+				errs = append(errs, fmt.Errorf("AdditionalHostMounts[%d].Target: %w", i, err))
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateAdditionalHostMountPath(path string) error {
+	if path == "" || !filepath.IsAbs(path) {
+		return fmt.Errorf("%q must be an absolute path", path)
+	}
+
+	if strings.IndexFunc(path, func(r rune) bool {
+		return r == ':' || unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return fmt.Errorf("%q must not contain whitespace, control characters, or ':'", path)
+	}
+
+	if cleaned := filepath.Clean(path); cleaned != path {
+		return fmt.Errorf("%q must be a clean absolute path", path)
 	}
 
 	return nil

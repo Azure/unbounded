@@ -278,7 +278,7 @@ func TestIsProductionMode(t *testing.T) {
 		},
 		{
 			name: "MembersNamespace set is production",
-			mut:  func(c *config.Config) { c.MembersNamespace = "gantry-system" },
+			mut:  func(c *config.Config) { c.MembersNamespace = "unbounded-system" },
 			want: true,
 		},
 	}

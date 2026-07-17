@@ -28,7 +28,7 @@ kubectl apply -f deploy/machina/crd/
 kubectl apply -f deploy/machina/
 ```
 
-This creates the `unbounded-kube` namespace, ServiceAccounts (`metalman-controller`, `metalman-bootstrap`), RBAC roles, and a Deployment.
+This creates the `unbounded-system` namespace, ServiceAccounts (`metalman-controller`, `metalman-bootstrap`), RBAC roles, and a Deployment.
 
 Key `serve-pxe` flags (set via the Deployment):
 
@@ -111,7 +111,7 @@ spec:
       username: admin
       passwordRef:
         name: bmc-passwords
-        namespace: unbounded-kube
+        namespace: unbounded-system
         key: bmc-01
 ```
 
@@ -131,7 +131,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: my-cloud-init
-  namespace: unbounded-kube
+  namespace: unbounded-system
 data:
   user-data: |
     #cloud-config
@@ -161,7 +161,7 @@ spec:
     cloudInit:
       userDataConfigMapRef:
         name: my-cloud-init
-        namespace: unbounded-kube
+        namespace: unbounded-system
 ```
 
 The `key` field defaults to `user-data` but can be overridden to select a different key from the ConfigMap. Both `data` and `binaryData` entries are supported.

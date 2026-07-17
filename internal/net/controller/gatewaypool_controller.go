@@ -467,10 +467,7 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 		}
 
 		// Get site name from node label
-		siteName := ""
-		if node.Labels != nil {
-			siteName = node.Labels[SiteLabelKey]
-		}
+		siteName := NodeSiteLabel(node)
 
 		// Calculate health endpoint IPs from podCIDRs (first IP of each CIDR is the gateway IP)
 		healthEndpoints := getHealthIPsFromPodCIDRs(node.Spec.PodCIDRs)
@@ -867,7 +864,7 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 		"net.unbounded-cloud.io/node":         node.Name,
 	}
 	if siteName != "" {
-		labelsMap["net.unbounded-cloud.io/site"] = siteName
+		labelsMap[canonicalSiteLabelKey] = siteName
 	}
 
 	obj := &unstructured.Unstructured{Object: map[string]interface{}{
@@ -914,9 +911,18 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 
 	existing := existingObj.(*unstructured.Unstructured) //nolint:errcheck
 
+	// Carry the canonical labels forward and actively clear the deprecated site
+	// label key so GatewayPoolNodes created before the rename are migrated.
+	patchLabels := map[string]interface{}{}
+	for k, v := range obj.GetLabels() {
+		patchLabels[k] = v
+	}
+
+	patchLabels[deprecatedSiteLabelKey] = nil
+
 	patch := map[string]interface{}{
 		"metadata": map[string]interface{}{
-			"labels":          obj.GetLabels(),
+			"labels":          patchLabels,
 			"ownerReferences": obj.GetOwnerReferences(),
 		},
 		"spec": obj.Object["spec"],

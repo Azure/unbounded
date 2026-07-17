@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -39,6 +40,11 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	sandboxImage := cfg.CRI.Containerd.SandboxImage
 
 	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
+		return nil, err
+	}
+
+	additionalHostMounts, err := resolveAdditionalHostMounts(cfg.AdditionalHostMounts)
+	if err != nil {
 		return nil, err
 	}
 
@@ -92,18 +98,19 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
 			"override.conf",
 		),
-		HostArch:          runtime.GOARCH,
-		HostKernel:        kernel,
-		Hostname:          hostname,
-		ContainerdVersion: containerdVersion,
-		RunCVersion:       runcVersion,
-		CNIPluginVersion:  cniVersion,
-		KubernetesVersion: cfg.Cluster.Version,
-		Downloads:         downloads,
-		OCIImage:          ociImage,
-		Nvidia:            nvidia,
-		AMD:               amd,
-		HostDevices:       DiscoverHostDevices(cfg.AdditionalHostDevices),
+		HostArch:             runtime.GOARCH,
+		HostKernel:           kernel,
+		Hostname:             hostname,
+		ContainerdVersion:    containerdVersion,
+		RunCVersion:          runcVersion,
+		CNIPluginVersion:     cniVersion,
+		KubernetesVersion:    cfg.Cluster.Version,
+		Downloads:            downloads,
+		OCIImage:             ociImage,
+		Nvidia:               nvidia,
+		AMD:                  amd,
+		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
+		AdditionalHostMounts: additionalHostMounts,
 	}
 
 	nodeStart := &NodeStart{
@@ -326,4 +333,22 @@ func normalizeOSReleaseID(value string) string {
 
 func normalizeOSReleaseValue(value string) string {
 	return strings.Trim(strings.TrimSpace(value), `"'`)
+}
+
+// resolveAdditionalHostMounts validates the supplied mount entries, clones the
+// slice so the caller's config is not mutated, and defaults any empty Target to
+// the corresponding Source.
+func resolveAdditionalHostMounts(mounts []config.AdditionalHostMount) ([]config.AdditionalHostMount, error) {
+	if err := config.ValidateAdditionalHostMounts(mounts); err != nil {
+		return nil, err
+	}
+
+	resolved := slices.Clone(mounts)
+	for i := range resolved {
+		if resolved[i].Target == "" {
+			resolved[i].Target = resolved[i].Source
+		}
+	}
+
+	return resolved, nil
 }

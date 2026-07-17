@@ -56,7 +56,7 @@ edge deployment. Each site is defined by:
   controller hands out per-node slices from these pools.
 
 When a node joins the cluster, the controller matches its internal IP against
-all Site `nodeCidrs` and labels it with `net.unbounded-cloud.io/site=<name>`.
+all Site `nodeCidrs` and labels it with `unbounded-cloud.io/site=<name>`.
 
 ### Gateway Pools
 
@@ -180,12 +180,14 @@ system:
 
 They share the same API group prefix (`unbounded-cloud.io` / `net.unbounded-cloud.io`)
 and are designed to work together. When you run `kubectl unbounded site init`,
-it installs both the machina controller and the unbounded-net CNI plugin.
+it bootstraps `unbounded-operator`, creates Site resources, and lets the
+operator deploy machina and unbounded-net from `Site.spec.components`.
 
 ## Next Steps
 
 - **[Getting Started]({{< relref "guides/getting-started" >}})** -- The
-  quickstart installs unbounded-net as part of site initialization.
+  quickstart bootstraps `unbounded-operator` and requests unbounded-net through
+  the cluster Site.
 - **[Networking Reference]({{< relref "reference/networking" >}})** -- Full
   CRD specifications, configuration flags, routing flows, and operational
   guides.

@@ -617,6 +617,10 @@ jobs:
             file: images/machine-ops-controller/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: unbounded-operator
+            file: images/unbounded-operator/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: orca
             file: images/orca/Containerfile
             platforms: linux/amd64,linux/arm64

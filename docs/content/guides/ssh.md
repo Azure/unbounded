@@ -27,11 +27,11 @@ resulting Node.
 Run `kubectl unbounded site init` to prepare the cluster and create a new site.
 This single command handles:
 
-- Validating that a gateway node exists (label `unbounded-cloud.io/unbounded-net-gateway=true`)
-- Installing the unbounded-net CNI plugin
+- Bootstrapping the Unbounded CRDs and `unbounded-operator`
 - Creating site resources for both the cluster and the new site
+- Recording requested components in `Site.spec.components`
 - Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-cloud.io/site=<name>`)
-- Installing the **machina controller** in the `unbounded-kube` namespace
+- Letting the operator deploy unbounded-net, machina, and optional components
 
 ```bash
 kubectl unbounded site init \
@@ -46,9 +46,12 @@ All five flags above are required. Optional flags:
 
 | Flag | Description |
 |---|---|
-| `--cni-manifests` | Path or HTTPS URL to CNI plugin manifests (uses embedded manifests if omitted) |
-| `--machina-manifests` | Path or HTTPS URL to machina manifests (uses embedded manifests if omitted) |
 | `--kubeconfig` | Path to kubeconfig file |
+| `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
+| `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
+| `--enable-metalman` | Enable the metalman component in the Site spec |
+| `--enable-storage` | Enable the unbounded-storage component in the Site spec |
+| `--skip-install` | Skip operator bootstrap if you already ran `kubectl unbounded install` or applied the operator manifests |
 
 ## Creating Machines
 

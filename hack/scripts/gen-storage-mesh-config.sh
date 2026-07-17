@@ -24,7 +24,7 @@
 #                            (default: ClusterIP of the orca service on the
 #                            --orca-port; the backend speaks plaintext HTTP/1.1)
 #       --orca-namespace NS  namespace of the orca s3 origin service
-#                            (default unbounded-kube)
+#                            (default unbounded-system)
 #       --orca-service NAME  name of the orca s3 origin service (default orca)
 #       --orca-port PORT     port of the orca s3 origin service (default 8443)
 #   -o, --output PATH        write the config to PATH (default
@@ -77,7 +77,7 @@ OPT_OUTPUT="/etc/unbounded-storage/config.toml"
 # Orca S3 origin service the storage backend reads from when --origin is not
 # given. DNS is not configured on the host, so the service's ClusterIP is
 # resolved via the API server and written into the config as a literal IP.
-OPT_ORCA_NAMESPACE="unbounded-kube"
+OPT_ORCA_NAMESPACE="unbounded-system"
 OPT_ORCA_SERVICE="orca"
 OPT_ORCA_PORT="8443"
 

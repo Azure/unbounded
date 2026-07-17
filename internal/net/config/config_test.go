@@ -6,6 +6,8 @@ package config
 import (
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // TestDefaultLeaderElectionConfig tests DefaultLeaderElectionConfig.
@@ -27,7 +29,7 @@ func TestDefaultLeaderElectionConfig(t *testing.T) {
 		t.Fatalf("unexpected retry period: %v", cfg.RetryPeriod)
 	}
 
-	if cfg.ResourceNamespace != "kube-system" {
+	if cfg.ResourceNamespace != unbounded.SystemNamespace() {
 		t.Fatalf("unexpected resource namespace: %s", cfg.ResourceNamespace)
 	}
 

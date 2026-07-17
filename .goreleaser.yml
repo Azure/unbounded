@@ -7,6 +7,8 @@ before:
     # goreleaser fans builds out across goos/goarch concurrently.
     - make machina-manifests VERSION={{ .Tag }}
     - make net-manifests VERSION={{ .Tag }}
+    - make unbounded-storage-supervisor-manifests VERSION={{ .Tag }}
+    - make unbounded-operator-manifests VERSION={{ .Tag }}
 
 builds:
   - id: kubectl-unbounded
@@ -19,7 +21,6 @@ builds:
       - -X github.com/Azure/unbounded/internal/version.Version={{ .Version }}
       - -X github.com/Azure/unbounded/internal/version.GitCommit={{ .ShortCommit }}
       - -X github.com/Azure/unbounded/internal/version.BuildTime={{ .Date }}
-      - -X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=ghcr.io/azure/metalman:v{{ .Version }}
     goos:
       - linux
       - darwin
