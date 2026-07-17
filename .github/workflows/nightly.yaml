@@ -425,8 +425,19 @@ jobs:
             MODE=init
             echo "force_init=true; selecting init mode"
           elif kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1 && ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
-            echo "::error::Old Site CRD sites.net.unbounded-cloud.io is present but sites.unbounded-cloud.io is absent. Apply an explicit Site API migration before deploying this snapshot."
-            exit 1
+            # First upgrade from the pre-redesign (v0.1) split-namespace layout:
+            # the old net-group Site CRD (sites.net.unbounded-cloud.io) exists but
+            # the new sites.unbounded-cloud.io CRD has not been bootstrapped yet.
+            # That CRD is created by the operator itself during the later
+            # 'Bootstrap CRDs and operator' step (kubectl unbounded install), so
+            # its absence here is expected for a first upgrade. Deploy in upgrade
+            # mode: install brings up the operator, whose always-on LegacyReaper
+            # translates the old Site into the new Site and migrates the split
+            # layout into unbounded-system automatically. Do NOT run 'site init'
+            # here; that would create a fresh Site instead of migrating the
+            # existing one.
+            MODE=upgrade
+            echo "Legacy Site CRD present and new Site CRD absent; first v0.1->v0.2 upgrade. Operator migrates automatically. Selecting upgrade mode"
           elif ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
             MODE=init
             echo "Site CRD not present; selecting init mode"
