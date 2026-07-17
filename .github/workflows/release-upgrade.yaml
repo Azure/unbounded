@@ -307,8 +307,19 @@ jobs:
             MODE=init
             echo "force_init=true; selecting init mode"
           elif kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1 && ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
-            echo "::error::Old Site CRD sites.net.unbounded-cloud.io is present but sites.unbounded-cloud.io is absent. Apply an explicit Site API migration before deploying this release."
-            exit 1
+            # First upgrade from the pre-redesign (v0.1) split-namespace layout:
+            # the old net-group Site CRD (sites.net.unbounded-cloud.io) exists but
+            # the new sites.unbounded-cloud.io CRD has not been bootstrapped yet.
+            # That CRD is created by the operator itself during the later
+            # 'Bootstrap CRDs and operator' step (kubectl unbounded install), so
+            # its absence here is expected for a first upgrade. Deploy in upgrade
+            # mode: install brings up the operator, whose always-on LegacyReaper
+            # translates the old Site into the new Site and migrates the split
+            # layout into unbounded-system automatically. Do NOT run 'site init'
+            # here; that would create a fresh Site instead of migrating the
+            # existing one.
+            MODE=upgrade
+            echo "Legacy Site CRD present and new Site CRD absent; first v0.1->v0.2 upgrade. Operator migrates automatically. Selecting upgrade mode"
           elif ! kubectl get crd sites.unbounded-cloud.io >/dev/null 2>&1; then
             MODE=init
             echo "Site CRD not present; selecting init mode"
@@ -383,6 +394,46 @@ jobs:
             wait_exists "$1" "$2"
             kubectl -n "$NS" rollout status "$1/$2" --timeout=5m
           done
+
+      - name: Diagnose failed rollout
+        # Runs only when a prior step failed (e.g. the operator never created a
+        # component workload). The operator is what materializes net/machina/etc.
+        # in unbounded-system, so its logs and the Site status are the ground
+        # truth. Every command is best-effort so diagnostics never mask the real
+        # failure. Explicitly surfaces the applied component images because an
+        # empty/invalid image is silently rejected by the API server, which
+        # presents as a workload that "never gets created".
+        if: failure()
+        run: |
+          set +e
+          NS=unbounded-system
+          echo "::group::Site CRDs"
+          kubectl get crd sites.unbounded-cloud.io sites.net.unbounded-cloud.io 2>&1
+          echo "::endgroup::"
+          echo "::group::Sites (new + legacy)"
+          kubectl get sites.unbounded-cloud.io -o wide 2>&1
+          kubectl get sites.unbounded-cloud.io -o yaml 2>&1
+          kubectl get sites.net.unbounded-cloud.io -A -o wide 2>&1
+          echo "::endgroup::"
+          echo "::group::Workloads in ${NS}"
+          kubectl -n "$NS" get deploy,ds,pods -o wide 2>&1
+          echo "::endgroup::"
+          echo "::group::Applied component images"
+          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller"; do
+            img=$(kubectl -n "$NS" get "$kn" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null)
+            printf '%s image=[%s]\n' "$kn" "$img"
+          done
+          echo "::endgroup::"
+          echo "::group::Operator config"
+          kubectl -n "$NS" get configmap unbounded-operator-config -o yaml 2>&1
+          echo "::endgroup::"
+          echo "::group::Operator logs"
+          kubectl -n "$NS" logs deploy/unbounded-operator --all-containers --tail=300 2>&1
+          echo "::endgroup::"
+          echo "::group::Recent events in ${NS}"
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>&1 | tail -60
+          echo "::endgroup::"
+          exit 0
 
       - name: Summarize deploy
         if: always()
