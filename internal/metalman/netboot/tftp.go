@@ -18,6 +18,10 @@ import (
 	"github.com/pin/tftp/v3"
 )
 
+// tftpAnticipateWindow is the number of DATA blocks the TFTP server streams
+// ahead of client ACKs. 60 is the pin/tftp library maximum.
+const tftpAnticipateWindow = 60
+
 type TFTPServer struct {
 	BindAddr string
 	FileResolver
@@ -32,7 +36,15 @@ func (t *TFTPServer) NeedLeaderElection() bool { return false }
 
 func (t *TFTPServer) Start(ctx context.Context) error {
 	s := tftp.NewServer(t.readHandler, nil)
-	s.SetAnticipate(0)
+	// Enable the sender "anticipate" window so the server streams a burst of
+	// DATA blocks ahead of the client ACKs instead of waiting for each ACK.
+	// Classic lockstep TFTP (one block, one ACK) is unusable over a high-RTT
+	// path such as the playtime WireGuard overlay: a 68MB initrd would need
+	// tens of thousands of serial round trips and times out. Anticipation keeps
+	// the pipe full and is server-side only, so no client or firmware change is
+	// required (standard clients still ACK every block in order). 60 is the
+	// library maximum window.
+	s.SetAnticipate(tftpAnticipateWindow)
 
 	addr := net.JoinHostPort(t.BindAddr, "69")
 

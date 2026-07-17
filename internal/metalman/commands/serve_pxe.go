@@ -43,6 +43,7 @@ func ServePXECmd() *cobra.Command {
 		site                           string
 		cacheDir                       string
 		bindAddress                    string
+		advertiseIP                    string
 		httpPort                       int
 		healthPort                     int
 		dhcpInterface                  string
@@ -55,6 +56,7 @@ func ServePXECmd() *cobra.Command {
 		operationMaxConcurrentMachines int
 		operationMaxAttempts           int32
 		operationPollInterval          time.Duration
+		operationPowerActionTimeout    time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
 	)
@@ -170,19 +172,23 @@ func ServePXECmd() *cobra.Command {
 			clusterCA := attestation.ClusterCAFromConfig(cfg)
 
 			serverIP := net.ParseIP(bindAddress)
+
+			// advertisedIP is the address other hosts (the DHCP/TFTP/HTTP
+			// clients) use to reach this metalman instance. It defaults to the
+			// bind address but can be overridden with --advertise-ip when
+			// metalman binds a loopback address yet is reached over a different
+			// network (for example when a userspace overlay proxy forwards
+			// traffic from an overlay IP to metalman on 127.0.0.1). It is used
+			// as the DHCP ServerIP (next-server) in relay mode and as the
+			// default --serve-url host, without changing the actual bind
+			// address of the sockets.
+			advertisedIP, err := resolveAdvertisedIP(bindAddress, advertiseIP, OutboundIP)
+			if err != nil {
+				return err
+			}
+
 			if serveURL == "" {
-				ip := serverIP
-				if ip.IsUnspecified() {
-					detected, err := OutboundIP()
-					if err != nil {
-						return fmt.Errorf("detecting outbound IP for --serve-url default: %w", err)
-					}
-
-					ip = detected
-					serverIP = detected
-				}
-
-				serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
+				serveURL = fmt.Sprintf("http://%s:%d", advertisedIP, httpPort)
 			}
 
 			defaultNetbootImage = strings.TrimSpace(defaultNetbootImage)
@@ -233,6 +239,7 @@ func ServePXECmd() *cobra.Command {
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
 				PollInterval:          operationPollInterval,
+				PowerActionTimeout:    operationPowerActionTimeout,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
 			}
@@ -241,12 +248,17 @@ func ServePXECmd() *cobra.Command {
 				return fmt.Errorf("--dhcp-interface and --dhcp-auto-interface are mutually exclusive")
 			}
 
-			dhcpServerIP := serverIP
+			dhcpServerIP := advertisedIP
 
 			if dhcpAutoInterface {
-				detected, err := InterfaceForIP(serverIP)
+				interfaceIP, err := resolveDHCPInterfaceIP(serverIP, OutboundIP)
 				if err != nil {
-					return fmt.Errorf("detecting interface for server IP %s: %w", serverIP, err)
+					return err
+				}
+
+				detected, err := InterfaceForIP(interfaceIP)
+				if err != nil {
+					return fmt.Errorf("detecting interface for server IP %s: %w", interfaceIP, err)
 				}
 
 				dhcpInterface = detected
@@ -317,6 +329,7 @@ func ServePXECmd() *cobra.Command {
 			PrintConfig("site", siteDisplay)
 			PrintConfig("leader-election", leID)
 			PrintConfig("serve-url", serveURL)
+			PrintConfig("advertise-ip", advertisedIP.String())
 			PrintConfig("default-netboot-image", defaultNetbootImage)
 			PrintConfig("cache-dir", cacheDir)
 			PrintConfig("dhcp-interface", dhcpInterface)
@@ -341,6 +354,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().StringVar(&site, "site", "", "Site label value to select Machines")
 	cmd.Flags().StringVar(&cacheDir, "cache-dir", DefaultCacheDir(), "Local directory for cached image artifacts")
 	cmd.Flags().StringVar(&bindAddress, "bind-address", "0.0.0.0", "IP address to bind servers")
+	cmd.Flags().StringVar(&advertiseIP, "advertise-ip", "", "IP address clients use to reach this instance (defaults to --bind-address); used as the DHCP next-server and default --serve-url host when metalman binds a different (for example loopback) address")
 	cmd.Flags().IntVar(&httpPort, "http-port", 8880, "Port for the HTTP artifact server")
 	cmd.Flags().IntVar(&healthPort, "health-port", 8081, "Port for the health/readiness probe server")
 	cmd.Flags().StringVar(&dhcpInterface, "dhcp-interface", "", "Network interface for broadcast DHCP (omit for relay/unicast mode)")
@@ -353,10 +367,59 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().IntVar(&operationMaxConcurrentMachines, "operation-max-concurrent-machines", 10, "Maximum target Machines advanced concurrently within one MachineOperation")
 	cmd.Flags().Int32Var(&operationMaxAttempts, "operation-max-attempts", 3, "Maximum Redfish action attempts per target Machine")
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
+	cmd.Flags().DurationVar(&operationPowerActionTimeout, "operation-power-action-timeout", 5*time.Minute, "Timeout for a target Machine to complete a power/boot stage (for example writing the boot image during a repave) before metalman re-issues the power action. Increase for slow netboot environments such as high-latency network overlays.")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
 
 	return cmd
+}
+
+// resolveAdvertisedIP determines the address clients use to reach this metalman
+// instance. advertiseIP takes precedence when set; otherwise the bindAddress is
+// used. An unspecified result (for example 0.0.0.0) is resolved to a concrete
+// address via outbound. This lets metalman bind one address (such as loopback)
+// while advertising another (such as an overlay IP) as the DHCP next-server and
+// default serve-url host.
+func resolveAdvertisedIP(bindAddress, advertiseIP string, outbound func() (net.IP, error)) (net.IP, error) {
+	advertised := net.ParseIP(bindAddress)
+	if strings.TrimSpace(advertiseIP) != "" {
+		advertised = net.ParseIP(strings.TrimSpace(advertiseIP))
+		if advertised == nil {
+			return nil, fmt.Errorf("invalid --advertise-ip %q", advertiseIP)
+		}
+	}
+
+	if advertised == nil {
+		return nil, fmt.Errorf("invalid --bind-address %q", bindAddress)
+	}
+
+	if advertised.IsUnspecified() {
+		detected, err := outbound()
+		if err != nil {
+			return nil, fmt.Errorf("detecting outbound IP for advertised address: %w", err)
+		}
+
+		advertised = detected
+	}
+
+	return advertised, nil
+}
+
+func resolveDHCPInterfaceIP(serverIP net.IP, outbound func() (net.IP, error)) (net.IP, error) {
+	if serverIP == nil {
+		return nil, fmt.Errorf("invalid server IP")
+	}
+
+	if !serverIP.IsUnspecified() {
+		return serverIP, nil
+	}
+
+	detected, err := outbound()
+	if err != nil {
+		return nil, fmt.Errorf("detecting outbound IP for DHCP interface: %w", err)
+	}
+
+	return detected, nil
 }
 
 func parseNamespacedSecretReference(ref string) (*v1alpha3.NamespacedSecretReference, error) {

@@ -57,6 +57,14 @@ NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION)
 PLAYPEN_TAG ?= $(subst /,-,$(VERSION))
 PLAYPEN_IMAGE ?= $(CONTAINER_REGISTRY)/playpen:$(PLAYPEN_TAG)
 
+# Playtime (VXLAN-over-WireGuard overlay demo client; ships its own server-side
+# image whose reference is stamped into the client binary).
+PLAYTIME_BIN=bin/playtime
+PLAYTIME_CMD=./cmd/playtime
+PLAYTIME_TAG ?= $(subst /,-,$(VERSION))
+PLAYTIME_IMAGE ?= $(CONTAINER_REGISTRY)/playtime:$(PLAYTIME_TAG)
+PLAYTIME_LDFLAGS=$(STAMP_LDFLAGS) -X main.DefaultPodImage=$(PLAYTIME_IMAGE)
+
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 
@@ -214,6 +222,7 @@ REACT_DEV ?= false
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
+.PHONY: playtime playtime-build image-playtime-local image-playtime-push
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
@@ -296,6 +305,8 @@ help: ## Show this help
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-playpen-local              Build playpen image"
+	@echo "  image-playtime-local             Build playtime image"
+	@echo "  image-playtime-push              Build and push the playtime image"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
 	@echo "  image-net-controller-push        Build and push unbounded-net-controller image"
 	@echo "  image-net-node-local             Build unbounded-net-node image"
@@ -587,6 +598,13 @@ gantry-build: ## Build the gantry binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(GANTRY_BIN) $(GANTRY_CMD)
 
 gantry: test gantry-build ## Build gantry (implies test)
+
+##@ Playtime (VXLAN-over-WireGuard overlay demo)
+
+playtime-build: ## Build the playtime binary (no lint/test)
+	$(GOBUILD) -ldflags '$(PLAYTIME_LDFLAGS)' -o $(PLAYTIME_BIN) $(PLAYTIME_CMD)
+
+playtime: test playtime-build ## Build playtime (implies test)
 
 unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)
@@ -1054,6 +1072,19 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 
 image-gantry-push: image-gantry-local ## Build and push the gantry container image
 	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
+
+image-playtime-local: ## Build the playtime container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		--build-arg CONTAINER_REGISTRY=$(CONTAINER_REGISTRY) \
+		-t playtime:$(PLAYTIME_TAG) -t $(PLAYTIME_IMAGE) \
+		-f ./images/playtime/Containerfile .
+	$(call trivy-maybe,$(PLAYTIME_IMAGE))
+
+image-playtime-push: image-playtime-local ## Build and push the playtime container image
+	$(CONTAINER_ENGINE) push $(PLAYTIME_IMAGE)
 
 ##@ Orca
 

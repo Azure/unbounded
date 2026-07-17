@@ -1078,6 +1078,71 @@ func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 	require.NotContains(t, body, "eth0")
 }
 
+func TestGrubHTTPDevice(t *testing.T) {
+	cases := []struct {
+		name    string
+		serve   string
+		want    string
+		wantErr bool
+	}{
+		{name: "host and port", serve: "http://10.0.1.1:8080", want: "(http,10.0.1.1:8080)"},
+		{name: "host only", serve: "http://10.0.1.1", want: "(http,10.0.1.1)"},
+		{name: "overlay advertise ip", serve: "http://172.31.99.2:8880", want: "(http,172.31.99.2:8880)"},
+		{name: "path prefix", serve: "http://10.0.1.1:8080/base/", want: "(http,10.0.1.1:8080)/base"},
+		{name: "empty", serve: "", wantErr: true},
+		{name: "no host", serve: "http://", wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := grubHTTPDevice(tc.serve)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestGrubTemplate_LoadsKernelAndInitrdOverHTTP(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	require.NoError(t, err)
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http-boot", Namespace: "default"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				DHCPLeases: []v1alpha3.DHCPLease{{
+					IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0",
+				}},
+			},
+		},
+	}
+
+	data := newTemplateData(
+		node,
+		ClusterInfo{ApiserverURL: "https://k8s.example.com"},
+		"http://172.31.99.2:8880/netboot/",
+		"",
+		"10.0.1.20",
+		true,
+	)
+
+	result, err := renderTemplate(string(grubTmpl), data)
+	require.NoError(t, err)
+
+	body := string(result)
+	// The large kernel and initrd must be fetched over grub's HTTP device (TCP)
+	// rather than lockstep TFTP, which is unusable over high-latency networks.
+	require.Contains(t, body, "linux (http,172.31.99.2:8880)/netboot/vmlinuz")
+	require.Contains(t, body, "initrd (http,172.31.99.2:8880)/netboot/initrd (http,172.31.99.2:8880)/netboot/init.cpio")
+	require.NotContains(t, body, "linux /vmlinuz")
+	require.NotContains(t, body, "initrd /initrd")
+}
+
 func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
 	require.NoError(t, err)

@@ -25,19 +25,25 @@ import (
 type RedfishHandler struct {
 	vm       *VMManager
 	cfg      RedfishConfig
+	guestMAC string
 	dataDir  string
 	sessions map[string]struct{}
 	mu       sync.Mutex
 }
 
-func NewRedfishHandler(vm *VMManager, cfg RedfishConfig, dataDir string) *RedfishHandler {
+func NewRedfishHandler(vm *VMManager, cfg RedfishConfig, guestMAC, dataDir string) *RedfishHandler {
 	return &RedfishHandler{
 		vm:       vm,
 		cfg:      cfg,
+		guestMAC: guestMAC,
 		dataDir:  dataDir,
 		sessions: map[string]struct{}{},
 	}
 }
+
+// nicID is the identifier of the single guest EthernetInterface exposed by the
+// emulator.
+const nicID = "nic0"
 
 func (h *RedfishHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimRight(r.URL.Path, "/")
@@ -85,6 +91,16 @@ func (h *RedfishHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.patchSystem(w, r)
 	case r.Method == http.MethodPost && path == "/redfish/v1/Systems/"+h.cfg.DeviceID+"/Actions/ComputerSystem.Reset":
 		h.reset(w, r)
+	case r.Method == http.MethodGet && path == h.ethernetInterfacesPath():
+		h.getEthernetInterfaces(w)
+	case r.Method == http.MethodGet && path == h.ethernetInterfacePath():
+		h.getEthernetInterface(w)
+	case r.Method == http.MethodPatch && path == h.ethernetInterfacePath():
+		h.patchEthernetInterface(w, r)
+	case r.Method == http.MethodGet && path == h.biosSettingsPath():
+		h.getBIOSSettings(w)
+	case r.Method == http.MethodPatch && path == h.biosSettingsPath():
+		h.patchBIOSSettings(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -165,7 +181,11 @@ func (h *RedfishHandler) getSystem(w http.ResponseWriter) {
 		"Boot": map[string]string{
 			"BootSourceOverrideTarget":  string(boot.Target),
 			"BootSourceOverrideEnabled": string(boot.Enabled),
+			"BootSourceOverrideMode":    string(boot.Mode),
+			// Always present so clients detect standard Redfish HTTP boot support.
+			"HttpBootUri": boot.HTTPBootURI,
 		},
+		"EthernetInterfaces": map[string]string{"@odata.id": h.ethernetInterfacesPath()},
 		"SerialConsole": map[string]any{
 			"ServiceEnabled":        true,
 			"MaxConcurrentSessions": 1,
@@ -276,6 +296,8 @@ func (h *RedfishHandler) patchSystem(w http.ResponseWriter, r *http.Request) {
 		Boot struct {
 			BootSourceOverrideTarget  BootTarget  `json:"BootSourceOverrideTarget"`
 			BootSourceOverrideEnabled BootEnabled `json:"BootSourceOverrideEnabled"`
+			BootSourceOverrideMode    BootMode    `json:"BootSourceOverrideMode"`
+			HTTPBootURI               string      `json:"HttpBootUri"`
 		} `json:"Boot"`
 	}
 
@@ -286,9 +308,94 @@ func (h *RedfishHandler) patchSystem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.vm.SetBootConfig(BootConfig{
-		Target:  body.Boot.BootSourceOverrideTarget,
-		Enabled: body.Boot.BootSourceOverrideEnabled,
+		Target:      body.Boot.BootSourceOverrideTarget,
+		Enabled:     body.Boot.BootSourceOverrideEnabled,
+		Mode:        body.Boot.BootSourceOverrideMode,
+		HTTPBootURI: body.Boot.HTTPBootURI,
 	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *RedfishHandler) ethernetInterfacesPath() string {
+	return "/redfish/v1/Systems/" + h.cfg.DeviceID + "/EthernetInterfaces"
+}
+
+func (h *RedfishHandler) ethernetInterfacePath() string {
+	return h.ethernetInterfacesPath() + "/" + nicID
+}
+
+func (h *RedfishHandler) biosSettingsPath() string {
+	return "/redfish/v1/Systems/" + h.cfg.DeviceID + "/Bios/Settings"
+}
+
+func (h *RedfishHandler) getEthernetInterfaces(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"@odata.id": h.ethernetInterfacesPath(),
+		"Members":   []map[string]string{{"@odata.id": h.ethernetInterfacePath()}},
+	})
+}
+
+func (h *RedfishHandler) getEthernetInterface(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"@odata.id":           h.ethernetInterfacePath(),
+		"Id":                  nicID,
+		"MACAddress":          h.guestMAC,
+		"PermanentMACAddress": h.guestMAC,
+	})
+}
+
+func (h *RedfishHandler) patchEthernetInterface(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		DHCPv4 struct {
+			DHCPEnabled bool `json:"DHCPEnabled"`
+		} `json:"DHCPv4"`
+		IPv4StaticAddresses []struct {
+			Address    string `json:"Address"`
+			SubnetMask string `json:"SubnetMask"`
+			Gateway    string `json:"Gateway"`
+		} `json:"IPv4StaticAddresses"`
+		StaticNameServers []string `json:"StaticNameServers"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+
+		return
+	}
+
+	config := NICStaticConfig{
+		DHCPEnabled: body.DHCPv4.DHCPEnabled,
+		NameServers: body.StaticNameServers,
+	}
+	if len(body.IPv4StaticAddresses) > 0 {
+		config.Address = body.IPv4StaticAddresses[0].Address
+		config.SubnetMask = body.IPv4StaticAddresses[0].SubnetMask
+		config.Gateway = body.IPv4StaticAddresses[0].Gateway
+	}
+
+	h.vm.SetNICStatic(config)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *RedfishHandler) getBIOSSettings(w http.ResponseWriter) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"@odata.id":  h.biosSettingsPath(),
+		"Attributes": h.vm.BIOSAttributes(),
+	})
+}
+
+func (h *RedfishHandler) patchBIOSSettings(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Attributes map[string]string `json:"Attributes"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+
+		return
+	}
+
+	h.vm.SetBIOSAttributes(body.Attributes)
 	w.WriteHeader(http.StatusNoContent)
 }
 

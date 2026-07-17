@@ -377,7 +377,7 @@ func TestRedfishWithMetalmanClient(t *testing.T) {
 	cfg.QEMU.EnableTPM = false
 	fake := &fakeCommander{}
 	vm := NewVMManager(fake, cfg)
-	handler := NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir)
+	handler := NewRedfishHandler(vm, cfg.Redfish, cfg.Guest.MAC, cfg.DataDir)
 	server := httptest.NewTLSServer(handler)
 	t.Cleanup(server.Close)
 
@@ -432,10 +432,107 @@ func TestRedfishWithMetalmanClient(t *testing.T) {
 	}
 }
 
+func TestRedfishHTTPBootWithMetalmanClient(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.QEMU.EnableTPM = false
+	vm := NewVMManager(&fakeCommander{}, cfg)
+	handler := NewRedfishHandler(vm, cfg.Redfish, cfg.Guest.MAC, cfg.DataDir)
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+
+	client, err := metalredfish.Dial(t.Context(), server.URL, tlsServerFingerprint(server), cfg.Redfish.Username, cfg.Redfish.Password, cfg.Redfish.DeviceID)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	t.Cleanup(client.Close)
+
+	// The emulator always advertises HttpBootUri, so the client detects standard
+	// Redfish HTTP boot support.
+	boot, err := client.GetBootConfig(t.Context())
+	if err != nil {
+		t.Fatalf("get boot config: %v", err)
+	}
+
+	if !boot.HasHTTPBootURI {
+		t.Fatal("expected HasHTTPBootURI to be true")
+	}
+
+	staticConfig := metalredfish.StaticIPv4Config{
+		MAC:        cfg.Guest.MAC,
+		Address:    "192.168.200.10",
+		SubnetMask: "255.255.255.0",
+		Gateway:    "192.168.200.1",
+		DNS:        []string{"8.8.8.8"},
+	}
+	if err := client.SetStaticIPv4(t.Context(), staticConfig); err != nil {
+		t.Fatalf("set static IPv4: %v", err)
+	}
+
+	if nic := vm.NICStatic(); !nic.Applied || nic.Address != staticConfig.Address || nic.DHCPEnabled {
+		t.Fatalf("NIC static config not applied as expected: %+v", nic)
+	}
+
+	const bootURL = "http://192.168.200.1/boot/machine-1.efi"
+	if err := client.SetHTTPBootOverride(t.Context(), bootURL); err != nil {
+		t.Fatalf("set HTTP boot override: %v", err)
+	}
+
+	boot, err = client.GetBootConfig(t.Context())
+	if err != nil {
+		t.Fatalf("get boot config after HTTP override: %v", err)
+	}
+
+	if boot.Target != metalredfish.BootTargetUefiHTTP {
+		t.Fatalf("boot target = %s, want %s", boot.Target, metalredfish.BootTargetUefiHTTP)
+	}
+
+	if boot.Enabled != metalredfish.BootContinuous {
+		t.Fatalf("boot enabled = %s, want %s", boot.Enabled, metalredfish.BootContinuous)
+	}
+
+	if boot.Mode != metalredfish.BootModeUEFI {
+		t.Fatalf("boot mode = %s, want %s", boot.Mode, metalredfish.BootModeUEFI)
+	}
+
+	if boot.UefiHTTPSource != bootURL {
+		t.Fatalf("UEFI HTTP source = %q, want %q", boot.UefiHTTPSource, bootURL)
+	}
+
+	// The vendor BIOS settings path must also be accepted.
+	if err := client.SetBIOSStaticIPv4(t.Context(), staticConfig); err != nil {
+		t.Fatalf("set BIOS static IPv4: %v", err)
+	}
+
+	if err := client.SetBIOSHTTPBootURI(t.Context(), bootURL); err != nil {
+		t.Fatalf("set BIOS HTTP boot URI: %v", err)
+	}
+
+	uri, err := client.GetBIOSHTTPBootURI(t.Context())
+	if err != nil {
+		t.Fatalf("get BIOS HTTP boot URI: %v", err)
+	}
+
+	if uri != bootURL {
+		t.Fatalf("BIOS HTTP boot URI = %q, want %q", uri, bootURL)
+	}
+
+	// The BIOS fallback branch issues a one-shot UEFI HTTP boot override.
+	if err := client.SetBootOverride(t.Context(), metalredfish.BootTargetUefiHTTP, metalredfish.BootOnce); err != nil {
+		t.Fatalf("set one-shot UEFI HTTP boot override: %v", err)
+	}
+
+	if boot, err := client.GetBootConfig(t.Context()); err != nil {
+		t.Fatalf("get boot config after one-shot override: %v", err)
+	} else if boot.Enabled != metalredfish.BootOnce {
+		t.Fatalf("boot enabled = %s, want %s", boot.Enabled, metalredfish.BootOnce)
+	}
+}
+
 func TestRedfishSystemAdvertisesSerialConsole(t *testing.T) {
 	cfg := testConfig(t)
 	vm := NewVMManager(&fakeCommander{}, cfg)
-	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir))
+	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.Guest.MAC, cfg.DataDir))
 	t.Cleanup(server.Close)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/redfish/v1/Systems/"+cfg.Redfish.DeviceID, nil)
@@ -513,7 +610,7 @@ func TestRedfishSystemAdvertisesSerialConsole(t *testing.T) {
 func TestRedfishSerialConsoleStreamRequiresAuth(t *testing.T) {
 	cfg := testConfig(t)
 	vm := NewVMManager(&fakeCommander{}, cfg)
-	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir))
+	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.Guest.MAC, cfg.DataDir))
 	t.Cleanup(server.Close)
 
 	resp, err := server.Client().Get(server.URL + "/redfish/v1/Systems/" + cfg.Redfish.DeviceID + "/Oem/Unbounded/SerialConsole/Stream")
@@ -530,7 +627,7 @@ func TestRedfishSerialConsoleStreamRequiresAuth(t *testing.T) {
 func TestRedfishSerialConsoleStreamFollowsSerialLog(t *testing.T) {
 	cfg := testConfig(t)
 	vm := NewVMManager(&fakeCommander{}, cfg)
-	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.DataDir))
+	server := httptest.NewServer(NewRedfishHandler(vm, cfg.Redfish, cfg.Guest.MAC, cfg.DataDir))
 	t.Cleanup(server.Close)
 
 	if err := os.WriteFile(filepath.Join(cfg.DataDir, "serial.log"), nil, 0o600); err != nil {

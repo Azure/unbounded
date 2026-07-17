@@ -14,6 +14,7 @@ machine image, cloud-init, and branch-built agent path runs unchanged.
 from __future__ import annotations
 
 import atexit
+import base64
 import importlib.util
 import json
 import os
@@ -93,6 +94,117 @@ def spawn(args: list[str], name: str) -> subprocess.Popen[Any]:
     return process
 
 
+def check_processes() -> None:
+    for process in PROCS:
+        return_code = process.poll()
+        if return_code is not None and return_code != 0:
+            raise RuntimeError(f"background process {process.args} exited with code {return_code}")
+
+
+def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
+    request = json.dumps({
+        "execute": "guest-exec",
+        "arguments": {
+            "path": "/bin/bash",
+            "arg": ["-c", command],
+            "capture-output": True,
+        },
+    })
+    result = subprocess.run(
+        [*VIRSH, "qemu-agent-command", VM, request],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"guest-exec failed: {result.stderr.strip()}")
+    pid = json.loads(result.stdout)["return"]["pid"]
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() <= deadline:
+        status_request = json.dumps({
+            "execute": "guest-exec-status",
+            "arguments": {"pid": pid},
+        })
+        result = subprocess.run(
+            [*VIRSH, "qemu-agent-command", VM, status_request],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"guest-exec-status failed: {result.stderr.strip()}")
+        status = json.loads(result.stdout)["return"]
+        if status.get("exited"):
+            stdout = base64.b64decode(status.get("out-data", "")).decode("utf-8", errors="replace")
+            stderr = base64.b64decode(status.get("err-data", "")).decode("utf-8", errors="replace")
+            return status.get("exitcode", -1), stdout, stderr
+        time.sleep(0.5)
+
+    raise TimeoutError(f"guest-exec pid {pid} did not exit within {timeout}s")
+
+
+def wait_vm_state(expected: str, timeout: int = 300) -> None:
+    log(f"Waiting for VM state to contain {expected!r}")
+    for _ in range(timeout):
+        check_processes()
+        result = subprocess.run(
+            [*VIRSH, "domstate", VM],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and expected in result.stdout.strip():
+            return
+        time.sleep(1)
+    raise TimeoutError(f"VM {VM!r} did not reach state {expected!r}")
+
+
+def wait_guest_agent(timeout: int = 300) -> None:
+    log("Waiting for QEMU guest agent")
+    for _ in range(timeout):
+        check_processes()
+        try:
+            exit_code, _, _ = guest_exec("true", timeout=10)
+            if exit_code == 0:
+                return
+        except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError):
+            pass
+        time.sleep(1)
+    raise TimeoutError("QEMU guest agent did not become responsive")
+
+
+def configure_kind_control_plane_node_ip(container: str, node_ip: str) -> None:
+    log(f"Configuring {container} kubelet node IP as {node_ip}")
+    script = textwrap.dedent(f"""\
+        set -eu
+        . /var/lib/kubelet/kubeadm-flags.env
+        set -- $KUBELET_KUBEADM_ARGS
+        new_args=""
+        for arg do
+          case "$arg" in
+            --node-ip=*) ;;
+            *) new_args="$new_args $arg" ;;
+          esac
+        done
+        new_args="${{new_args# }}"
+        printf 'KUBELET_KUBEADM_ARGS="%s --node-ip={node_ip}"\n' "$new_args" >/var/lib/kubelet/kubeadm-flags.env
+        systemctl restart kubelet
+    """)
+    run(["docker", "exec", container, "sh", "-c", script])
+
+    for _ in range(120):
+        result = subprocess.run(
+            ["kubectl", "get", "node", container, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            node = json.loads(result.stdout)
+            internal_ips = [
+                address.get("address", "")
+                for address in node.get("status", {}).get("addresses", [])
+                if address.get("type") == "InternalIP"
+            ]
+            if internal_ips == [node_ip]:
+                return
+        time.sleep(1)
+    raise TimeoutError(f"Node {container!r} did not advertise only InternalIP {node_ip}")
+
+
 def cleanup() -> None:
     log("Cleaning up HTTP smoke resources")
     for process in PROCS:
@@ -163,7 +275,7 @@ def setup_network() -> None:
     run(["sudo", "ip", "link", "set", "eth-http", "netns", kind_pid])
     run(["sudo", "nsenter", "-t", kind_pid, "-n", "ip", "addr", "add", f"{KIND_IP}/24", "dev", "eth-http"])
     run(["sudo", "nsenter", "-t", kind_pid, "-n", "ip", "link", "set", "eth-http", "up"])
-    smoke.configure_kind_control_plane_node_ip("kind-control-plane", KIND_IP)
+    configure_kind_control_plane_node_ip("kind-control-plane", KIND_IP)
     patch = json.dumps({"spec": {"template": {"spec": {"containers": [{
         "name": "kindnet-cni",
         "env": [{"name": "CONTROL_PLANE_ENDPOINT", "value": f"{KIND_IP}:6443"}],
@@ -370,7 +482,7 @@ def assert_contract() -> None:
 
 
 def assert_guest_network() -> str:
-    smoke.wait_guest_agent(timeout=600)
+    wait_guest_agent(timeout=600)
     command = f"""
         set -eu
         ip -4 address show | grep -F '{NODE_IP}/24'
@@ -384,7 +496,7 @@ def assert_guest_network() -> str:
           \\( -name '*.lease' -o -name 'lease-*' \\) -size +0c 2>/dev/null)"
         cat /proc/sys/kernel/random/boot_id
     """
-    code, stdout, stderr = smoke.guest_exec(command, timeout=60)
+    code, stdout, stderr = guest_exec(command, timeout=60)
     if code != 0:
         raise AssertionError(f"guest static network assertion failed: {stdout}\n{stderr}")
     return stdout.splitlines()[-1].strip()
@@ -423,14 +535,14 @@ def main() -> None:
     assert_contract()
     first_boot = assert_guest_network()
     log("Rebooting the installed guest and reasserting static networking")
-    code, _, stderr = smoke.guest_exec(
+    code, _, stderr = guest_exec(
         "nohup sh -c 'sleep 1; systemctl reboot' >/dev/null 2>&1 &", timeout=30
     )
     if code != 0:
         raise AssertionError(f"guest reboot failed: {stderr}")
     time.sleep(10)
-    smoke.wait_vm_state("running", timeout=180)
-    smoke.wait_guest_agent(timeout=600)
+    wait_vm_state("running", timeout=180)
+    wait_guest_agent(timeout=600)
     second_boot = assert_guest_network()
     if first_boot == second_boot:
         raise AssertionError("guest boot ID did not change after reboot")

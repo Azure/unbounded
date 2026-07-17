@@ -27,7 +27,9 @@ set default=0
 set timeout=0
 
 menuentry "Unbounded Metal Install" {
-  linux /vmlinuz \
+  insmod efinet
+  insmod http
+  linux {{ grubHTTPDevice .ServeURL }}/vmlinuz \
     unbounded.image_url={{ .ServeURL }}/disk.img.gz \
     unbounded.serve_url={{ .ServeURL }} \
     unbounded.ds_url={{ .ServeURL }}/cloud-init/ \
@@ -46,5 +48,5 @@ menuentry "Unbounded Metal Install" {
     {{- end }}
     console=tty0 console=ttyS0,115200n8 \
     ---
-  initrd /initrd /init.cpio
+  initrd {{ grubHTTPDevice .ServeURL }}/initrd {{ grubHTTPDevice .ServeURL }}/init.cpio
 }

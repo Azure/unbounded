@@ -32,15 +32,23 @@ const (
 type BootTarget string
 
 const (
-	BootTargetPxe BootTarget = "Pxe"
-	BootTargetHdd BootTarget = "Hdd"
+	BootTargetPxe      BootTarget = "Pxe"
+	BootTargetHdd      BootTarget = "Hdd"
+	BootTargetUefiHTTP BootTarget = "UefiHttp"
 )
 
 type BootEnabled string
 
 const (
 	BootContinuous BootEnabled = "Continuous"
+	BootOnce       BootEnabled = "Once"
 	BootDisabled   BootEnabled = "Disabled"
+)
+
+type BootMode string
+
+const (
+	BootModeUEFI BootMode = "UEFI"
 )
 
 type VMManager struct {
@@ -51,11 +59,28 @@ type VMManager struct {
 	qemuProc  Process
 	swtpmProc Process
 	boot      BootConfig
+
+	biosAttributes map[string]string
+	nicStatic      NICStaticConfig
 }
 
 type BootConfig struct {
-	Target  BootTarget
-	Enabled BootEnabled
+	Target      BootTarget
+	Enabled     BootEnabled
+	Mode        BootMode
+	HTTPBootURI string
+}
+
+// NICStaticConfig records the last static IPv4 settings applied to the guest
+// EthernetInterface via Redfish. It is stored for observability and testing;
+// the emulator does not reconfigure the running guest from it.
+type NICStaticConfig struct {
+	DHCPEnabled bool
+	Address     string
+	SubnetMask  string
+	Gateway     string
+	NameServers []string
+	Applied     bool
 }
 
 func NewVMManager(cmd Commander, cfg Config) *VMManager {
@@ -66,6 +91,7 @@ func NewVMManager(cmd Commander, cfg Config) *VMManager {
 			Target:  BootTargetPxe,
 			Enabled: BootContinuous,
 		},
+		biosAttributes: map[string]string{},
 	}
 }
 
@@ -98,6 +124,54 @@ func (m *VMManager) SetBootConfig(config BootConfig) {
 	if config.Enabled != "" {
 		m.boot.Enabled = config.Enabled
 	}
+
+	if config.Mode != "" {
+		m.boot.Mode = config.Mode
+	}
+
+	if config.HTTPBootURI != "" {
+		m.boot.HTTPBootURI = config.HTTPBootURI
+	}
+}
+
+// BIOSAttributes returns a copy of the pending BIOS settings applied via Redfish.
+func (m *VMManager) BIOSAttributes() map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make(map[string]string, len(m.biosAttributes))
+	for k, v := range m.biosAttributes {
+		out[k] = v
+	}
+
+	return out
+}
+
+// SetBIOSAttributes merges the given pending BIOS settings.
+func (m *VMManager) SetBIOSAttributes(attributes map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for k, v := range attributes {
+		m.biosAttributes[k] = v
+	}
+}
+
+// NICStatic returns the last static IPv4 settings applied to the guest NIC.
+func (m *VMManager) NICStatic() NICStaticConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.nicStatic
+}
+
+// SetNICStatic records static IPv4 settings applied to the guest NIC.
+func (m *VMManager) SetNICStatic(config NICStaticConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	config.Applied = true
+	m.nicStatic = config
 }
 
 func (m *VMManager) Reset(ctx context.Context, reset ResetType) error {
@@ -267,6 +341,9 @@ func waitForUnixSocket(ctx context.Context, path string) error {
 }
 
 func (m *VMManager) qemuArgs() []string {
+	// Network boot ("n") covers both PXE and UEFI HTTP boot targets, which are
+	// both network-based. Disk boot ("c") is used when the override is disabled
+	// or explicitly targets the local disk.
 	bootOrder := "n"
 	if m.boot.Enabled == BootDisabled || m.boot.Target == BootTargetHdd {
 		bootOrder = "c"

@@ -1,0 +1,109 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Build stage
+# Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
+# host even when targeting a foreign TARGETPLATFORM. Without this, buildkit
+# would emulate the entire builder under QEMU when producing arm64 images on
+# an amd64 runner, which makes "go build" painfully slow.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.5-trixie AS builder
+
+# Install build dependencies. The base image already provides the Go
+# toolchain at /usr/local/go/bin, so we don't install the apt golang package.
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
+    gcc \
+    git \
+    ca-certificates \
+    && apt-get clean
+
+# Set up Go environment.
+# CGO is disabled because cmd/playtime has no cgo imports; this also keeps
+# cross-compilation simple (no cross C toolchain required).
+ENV CGO_ENABLED=0
+ENV GOPATH=/go
+ENV GOTOOLCHAIN=auto
+ENV PATH=$PATH:/go/bin
+
+# Set working directory
+WORKDIR /src
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the source code
+COPY ../../ .
+
+# TARGETOS/TARGETARCH are populated by buildkit from the requested
+# --platform; threading them into go via GOOS/GOARCH lets the builder run
+# natively on the host while still producing target-arch binaries.
+ARG TARGETOS
+ARG TARGETARCH
+
+# VERSION/GIT_COMMIT/BUILD_TIME are passed in to inject version metadata via ldflags.
+# Empty defaults let the Makefile fall back to its own git/date detection when callers
+# don't supply explicit values; ${VAR:+...} forwards only when the caller set them.
+# CONTAINER_REGISTRY is threaded through so the demo-pod image reference stamped
+# into the binary (main.DefaultPodImage) matches the image being pushed.
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+ARG CONTAINER_REGISTRY=ghcr.io/azure
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make playtime-build VERSION=${VERSION} CONTAINER_REGISTRY=${CONTAINER_REGISTRY} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+
+# Runtime stage
+FROM ubuntu:noble
+
+# Install runtime dependencies. go-iptables execs the iptables binary, so it
+# must be present; iproute2 and iputils-ping aid interactive debugging of the
+# overlay inside the pod. Link/address/neighbour setup itself uses netlink
+# syscalls directly (no iproute2 required). curl is used below to fetch the
+# cloud-hypervisor release binary and its UEFI firmware.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    iptables \
+    iproute2 \
+    iputils-ping \
+    swtpm \
+    swtpm-tools \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# cloud-hypervisor is the KVM VMM for `playtime --vm`. It is not packaged in
+# Ubuntu apt, so fetch a pinned static release binary from GitHub. The diskless
+# guest PXE network-boots via a UEFI firmware (EDK2 CLOUDHV built with the
+# network stack); cloud-hypervisor has no legacy option-ROM netboot path, so the
+# firmware must include UEFI network boot. It is installed at the path
+# cmd/playtime expects (chFirmware in vm.go).
+ARG CLOUD_HYPERVISOR_VERSION=v53.0
+ARG CLOUD_HYPERVISOR_FIRMWARE_URL=https://github.com/cloud-hypervisor/edk2/releases/download/ch-1e1b96f126/CLOUDHV.fd
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) chbin="cloud-hypervisor-static" ;; \
+      arm64) chbin="cloud-hypervisor-static-aarch64" ;; \
+      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/bin/cloud-hypervisor \
+      "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CLOUD_HYPERVISOR_VERSION}/${chbin}"; \
+    chmod +x /usr/bin/cloud-hypervisor; \
+    mkdir -p /usr/share/cloud-hypervisor; \
+    curl -fsSL -o /usr/share/cloud-hypervisor/CLOUDHV.fd "${CLOUD_HYPERVISOR_FIRMWARE_URL}"
+
+# Create unbounded directories
+RUN mkdir -p /unbounded/bin
+
+# Copy the built binary from the builder stage
+COPY --from=builder /src/bin/playtime /unbounded/bin/playtime
+
+# Add unbounded bin to PATH
+ENV PATH="/unbounded/bin:${PATH}"
+
+# Set working directory
+WORKDIR /unbounded
+
+# Default entrypoint
+ENTRYPOINT ["/unbounded/bin/playtime"]

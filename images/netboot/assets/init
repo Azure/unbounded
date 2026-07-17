@@ -275,14 +275,36 @@ fi
 TARGET_DISK=$(readlink -f "$TARGET_DISK" 2>/dev/null || echo "$TARGET_DISK")
 log "target disk: $TARGET_DISK"
 
-log "downloading disk image from $IMAGE_URL"
-retry 120 5 "download disk image" wget -q -O /tmp/disk.img.gz "$IMAGE_URL" \
-    || fatal "failed to download disk image"
-
-log "writing disk image to $TARGET_DISK"
-write_image() { gunzip -c /tmp/disk.img.gz | dd of="$TARGET_DISK" bs=4194304; }
-retry 3 5 "write disk image" write_image || fatal "failed to write disk image"
-rm -f /tmp/disk.img.gz
+log "streaming disk image from $IMAGE_URL to $TARGET_DISK"
+# The cloud-hypervisor virtio-blk backend mishandles flush/preflush writes: the
+# first writeback bio carrying REQ_PREFLUSH (flags 0x104000) to sector 0 returns
+# EIO, corrupting only the GPT and leaving no root partition. Tell the kernel the
+# device has no volatile write cache so it stops emitting REQ_PREFLUSH/REQ_FUA.
+# Also cap the request size to keep writeback bios small (belt and suspenders).
+DEV_NAME=$(basename "$TARGET_DISK")
+if [ -w "/sys/block/$DEV_NAME/queue/write_cache" ]; then
+    log "setting /sys/block/$DEV_NAME/queue/write_cache to write through"
+    echo "write through" > "/sys/block/$DEV_NAME/queue/write_cache" 2>/dev/null || true
+fi
+if [ -w "/sys/block/$DEV_NAME/queue/max_sectors_kb" ]; then
+    log "capping /sys/block/$DEV_NAME/queue/max_sectors_kb to 128"
+    echo 128 > "/sys/block/$DEV_NAME/queue/max_sectors_kb" 2>/dev/null || true
+fi
+# Stream the compressed image straight to disk instead of buffering the whole
+# file in the RAM-backed initrd tmpfs. Buffering fails with ENOSPC on machines
+# whose RAM is smaller than the compressed image; streaming is RAM-independent.
+# The wget-success marker distinguishes a truncated download (busybox dd still
+# exits 0 on short input) from a complete one so a partial transfer retries.
+write_image() {
+    rm -f /tmp/dl.ok
+    set +e
+    { wget -q -O - "$IMAGE_URL" && : >/tmp/dl.ok; } | gunzip -c | dd of="$TARGET_DISK" bs=4194304
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] && [ -f /tmp/dl.ok ]
+}
+retry 10 5 "stream disk image" write_image || fatal "failed to write disk image"
+rm -f /tmp/dl.ok
 sync
 
 retry 5 2 "re-read partition table" blockdev --rereadpt "$TARGET_DISK" \

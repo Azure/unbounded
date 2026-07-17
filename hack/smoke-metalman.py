@@ -2,22 +2,72 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+"""Metalman PXE smoke test driven against a remote playtime VM.
+
+This test provisions a bare-metal Machine end to end (PXE network boot,
+cloud-init, kubelet join, then power operations) WITHOUT running any virtual
+machine on the host executing this script. The guest is a cloud-hypervisor VM
+that lives inside a playtime demo pod on a remote KVM-capable node, reachable
+over a userspace VXLAN-over-WireGuard overlay that `playtime up` establishes.
+
+Two clusters are involved:
+
+  * A local KIND cluster is the metalman control plane. The Machine CR,
+    MachineOperations, and the joined smoke-node Node all live here. It is
+    addressed by an explicit kubectl context (--kind-context, default
+    "kind-kind"). All kubectl / kubectl-unbounded / metalman operations target
+    it.
+
+  * The current kubectl context (--context) is a real cluster that has a
+    KVM-capable node and the unbounded-net gateway mesh. playtime runs its
+    VM-hosting pod there. ONLY playtime talks to this cluster.
+
+Networking is stitched together entirely by playtime's userspace overlay:
+
+  * The overlay client IP (172.31.99.2) is where metalman's DHCP next-server,
+    TFTP server, HTTP serve-url, the OCI registry, the agent download server,
+    and the KIND API server all appear to the guest. playtime --forward rules
+    map guest connections to those overlay ports back to 127.0.0.1 on this
+    host, where the real services bind.
+
+  * metalman runs in DHCP relay mode (empty --dhcp-interface). playtime relays
+    the guest's DHCP to metalman and metalman advertises 172.31.99.2 as the
+    next-server via the new --advertise-ip flag while binding 127.0.0.1.
+
+  * The guest's Redfish BMC is served inside the pod; playtime exposes it at
+    https://127.0.0.1:8443 (localforward), which metalman drives for power and
+    boot control.
+
+Run as a normal user that has passwordless sudo. playtime runs as the invoking
+user (so its Kubernetes client uses the normal kubeconfig / --context); metalman
+runs under sudo because its TFTP server binds the privileged port 69, and
+playtime is granted CAP_NET_BIND_SERVICE (via setcap) so it can bind the
+privileged DHCP relay port 67 without sudo.
+
+The playtime pod image (which must include the guest-disk support this test
+relies on) is pulled by the remote pod, so it must be published to a registry
+the target cluster can pull from. Pass its fully-qualified reference with
+--pod-image.
+"""
+
 from __future__ import annotations
 
+import argparse
 import atexit
-import base64
 import json
 import os
 import signal
 import shutil
-import socket
+import ssl
 import subprocess
 import sys
 import tarfile
 import tempfile
-import textwrap
 import threading
 import time
+import urllib.error
+import urllib.request
+from base64 import b64encode
 from pathlib import Path
 from typing import Any
 
@@ -33,50 +83,117 @@ NODE_LABEL_KEY = "unbounded-cloud.io/smoke-test"
 NODE_LABEL_VALUE = "metalman"
 METALMAN_NAMESPACE = "unbounded-kube"
 METALMAN_CONTROLLER_SA = "metalman-controller"
-VM_NAME = "unbounded-metal-smoke"
-NET_NAME = "unbounded-metal-smoke"
-SUBNET = "192.168.200"
-SERVER_IP = f"{SUBNET}.1"
-NODE_IP = f"{SUBNET}.10"
-KIND_SMOKE_IP = f"{SUBNET}.2"  # IP assigned to the kind container on virbr-smoke
-GATEWAY = SERVER_IP
-DNS_SERVER = "8.8.8.8"
-MAC_ADDRESS = "52:54:00:aa:bb:01"
+
+# Overlay addressing established by `playtime up`. The client end of the overlay
+# (this host) is OVERLAY_CLIENT_IP; every service the guest must reach is
+# advertised there and forwarded back to 127.0.0.1 on this host. OVERLAY_NODE_IP
+# is the static lease the guest receives via metalman's DHCP.
+OVERLAY_CLIENT_IP = "172.31.99.2"
+# The pod (remote) end of the overlay. playtime's in-pod netboot HTTP reverse
+# proxy listens here and forwards to the client IP, so the guest bootloader
+# fetches the large netboot payload over the fast pod<->guest LAN hop while the
+# pod re-originates to the client over the overlay using its real kernel TCP.
+OVERLAY_POD_IP = "172.31.99.1"
+OVERLAY_NODE_IP = "172.31.99.10"
+OVERLAY_MASK = "255.255.255.0"
+# The guest's default gateway is the pod end of the overlay. The pod enables IP
+# forwarding and masquerades overlay-sourced traffic out its uplink, so the guest
+# reaches the internet (for example dl.k8s.io and github.com for Kubernetes, CRI
+# and CNI artifacts) via the pod's server-side NAT. Every in-overlay service the
+# guest needs (172.31.99.2:<port> forwards) is on-link within OVERLAY_MASK, so
+# routing default traffic through the pod does not affect them.
+OVERLAY_GATEWAY = OVERLAY_POD_IP
+# Use the DNS server the host node provides: the in-cluster resolver (kube-dns
+# ClusterIP). Public resolvers such as 8.8.8.8 and the Azure platform DNS
+# (168.63.129.16) are unreachable from node pods, and the cluster resolver
+# returns IPv4 A records for the artifact hosts (dl.k8s.io, github.com). The
+# guest reaches it through the pod: kube-proxy DNATs the ClusterIP in the pod
+# netns PREROUTING for the forwarded, masqueraded guest traffic.
+DNS_SERVER = "10.0.0.10"
+# The guest NIC MAC. Must match playtime's --vm-mac (its default).
+MAC_ADDRESS = "52:54:00:12:34:56"
+
+# playtime's in-pod Redfish server, exposed locally by playtime's localforward.
 REDFISH_PORT = 8443
+REDFISH_URL = f"https://127.0.0.1:{REDFISH_PORT}"
+REDFISH_USERNAME = "admin"
+REDFISH_PASSWORD = "password"
+REDFISH_DEVICE_ID = "1"
+
 HTTP_PORT = 8880
 AGENT_DOWNLOAD_PORT = 8881
+REGISTRY_PORT = 5555
+# metalman TFTP binds this privileged port on the host loopback; playtime's
+# TFTP proxy forwards the guest's overlay requests here.
+TFTP_PORT = 69
+# playtime binds this privileged DHCP relay port on the host loopback; metalman
+# unicasts its DHCP replies to it. metalman itself listens on a separate
+# unprivileged port to avoid a bind conflict (it has no SO_REUSEADDR).
+DHCP_RELAY_PORT = 67
+METALMAN_DHCP_PORT = 6767
+
 CACHE_DIR = TMPDIR / "cache"
 ARTIFACT_DIR = TMPDIR / "artifacts"
-SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
+
+# metalman binds loopback but advertises the pod-side netboot proxy IP to the
+# guest as the serve-url. grub and the installer fetch vmlinuz/initrd/init.cpio/
+# disk.img.gz from the pod proxy (LAN hop), which forwards to the client IP.
+SERVE_URL = f"http://{OVERLAY_POD_IP}:{HTTP_PORT}"
 AGENT_TARBALL = ARTIFACT_DIR / "unbounded-agent-linux-amd64.tar.gz"
-AGENT_DOWNLOAD_URL = f"http://{SERVER_IP}:{AGENT_DOWNLOAD_PORT}/{AGENT_TARBALL.name}"
-REGISTRY_PORT = 5555
+AGENT_DOWNLOAD_URL = f"http://{OVERLAY_CLIENT_IP}:{AGENT_DOWNLOAD_PORT}/{AGENT_TARBALL.name}"
+
 REGISTRY_CONTAINER = "unbounded-smoke-registry"
+# Push targets use localhost so the host Docker daemon (and metalman) reach the
+# registry directly.
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
 NETBOOT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/netboot:smoke"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
-# The agent runs inside a VM on an isolated libvirt network. "localhost" inside
-# the VM resolves to the VM's own loopback, not the host.  Use the host's
-# bridge IP so the VM can reach the registry over the virtual network.
-AGENT_IMAGE_NAME_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
+# The agent runs inside the remote guest. It reaches the registry over the
+# overlay via the client IP, forwarded back to the host registry.
+AGENT_IMAGE_NAME_VM = f"{OVERLAY_CLIENT_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
+
 BINARY = REPO_ROOT / "bin" / "metalman"
 AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
-SERIAL_SOCK = TMPDIR / "console.sock"
-QGA_SOCK = TMPDIR / "qga.sock"
+PLAYTIME = REPO_ROOT / "bin" / "playtime"
+
+# The API server URL the guest uses (kindnet, kube-proxy, and the joining
+# kubelet). The guest reaches the KIND API server over the overlay, forwarded
+# to the KIND API server's loopback port on this host.
+GUEST_APISERVER_URL = f"https://{OVERLAY_CLIENT_IP}:6443"
+
 # The nspawn machine name used by the agent (must match the constant in
 # cmd/agent/internal/goalstates/constants.go - NSpawnMachineKube1).
 NSPAWN_MACHINE = "kube1"
 
-KUBECTL = "kubectl"
-VIRSH = ["virsh", "--connect", "qemu:///system"]
+# kubectl targeting the KIND control-plane cluster. Set in main() once the
+# --kind-context argument is known.
+KUBECTL: list[str] = ["kubectl"]
+# The playtime target context (the real cluster). Set in main().
+REAL_CONTEXT = ""
+# The playtime pod image. Set in main().
+POD_IMAGE = ""
+# The node to pin the playtime pod on. Set in main().
+POD_NODE = ""
+# Host loopback port the KIND API server listens on. Set in main().
+KIND_APISERVER_PORT = 0
+# Path to a standalone kubeconfig scoped to the KIND context. Written in main().
+# kubectl-unbounded has no --context flag, so it is pointed at this file via
+# --kubeconfig to target the KIND control plane.
+KIND_KUBECONFIG: Path | None = None
+
 DEVNULL = subprocess.DEVNULL
+
+# Wall-clock start, used to prefix every log line with elapsed time so slow
+# phases are easy to spot when optimizing the smoke test feedback loop.
+START_TIME = time.monotonic()
 
 _procs: list[subprocess.Popen[Any]] = []
 
 
 def log(msg: str) -> None:
-    print(f"==> {msg}", file=sys.stderr)
+    elapsed = int(time.monotonic() - START_TIME)
+    print(f"==> [{elapsed // 60:d}m{elapsed % 60:02d}s] {msg}", file=sys.stderr)
 
 
 def die(msg: str) -> None:
@@ -129,140 +246,19 @@ def check_procs() -> None:
             die(f"Background process {proc.args} exited with code {ret}")
 
 
-def forward_console(sock_path: Path) -> None:
-    """Connect to the VM serial console and copy output to stderr.
-
-    Runs in a daemon thread.  Re-connects whenever the socket disappears
-    (the VM may be powered off and back on during the test).
-    """
-    while True:
-        # Wait for the socket to appear.
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            conn.connect(str(sock_path))
-        except (FileNotFoundError, ConnectionRefusedError, OSError):
-            conn.close()
-            time.sleep(1)
-            continue
-
-        try:
-            while True:
-                data = conn.recv(4096)
-                if not data:
-                    break
-                sys.stderr.buffer.write(data)
-                sys.stderr.buffer.flush()
-        except OSError:
-            pass
-        finally:
-            conn.close()
-
-        # Socket closed - VM probably rebooted.  Retry.
-        time.sleep(1)
-
-
-def guest_exec(command: str, timeout: int = 30) -> tuple[int, str, str]:
-    """Execute a command inside the VM via the QEMU guest agent.
-
-    Returns (exit_code, stdout, stderr).  Requires the guest agent channel
-    to be configured on the VM and the qemu-guest-agent service running
-    inside the guest.
-    """
-    exec_req = json.dumps({
-        "execute": "guest-exec",
-        "arguments": {
-            "path": "/bin/bash",
-            "arg": ["-c", command],
-            "capture-output": True,
-        },
-    })
-    result = subprocess.run(
-        [*VIRSH, "qemu-agent-command", VM_NAME, exec_req],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"guest-exec failed: {result.stderr.strip()}")
-    pid = json.loads(result.stdout)["return"]["pid"]
-
-    # Poll guest-exec-status until the process exits.
-    deadline = time.monotonic() + timeout
-    while True:
-        status_req = json.dumps({
-            "execute": "guest-exec-status",
-            "arguments": {"pid": pid},
-        })
-        result = subprocess.run(
-            [*VIRSH, "qemu-agent-command", VM_NAME, status_req],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"guest-exec-status failed: {result.stderr.strip()}")
-        status = json.loads(result.stdout)["return"]
-        if status.get("exited"):
-            exit_code = status.get("exitcode", -1)
-            stdout = base64.b64decode(status.get("out-data", "")).decode("utf-8", errors="replace")
-            stderr = base64.b64decode(status.get("err-data", "")).decode("utf-8", errors="replace")
-            return exit_code, stdout, stderr
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"guest-exec pid {pid} did not exit within {timeout}s")
-        time.sleep(0.5)
-
-
 def collect_debug_logs() -> None:
-    """Use the QEMU guest agent to dump kubelet and agent debug information.
+    """Dump Kubernetes-side debug information from the KIND control plane.
 
-    Best-effort: failures are logged but do not abort the test.
+    Best-effort: failures are logged but do not abort the test. There is no
+    in-guest collection because this test has no guest-exec channel; the guest
+    is remote and only reachable over the overlay via Redfish and network boot.
     """
-    log("Collecting debug logs from VM via QEMU guest agent...")
-    commands = [
-        # Network diagnostics - must come first to diagnose download hangs.
-        ("resolv.conf", "cat /etc/resolv.conf"),
-        ("ip addr", "ip -4 addr show"),
-        ("ip route", "ip route show"),
-        ("dns test (dl.k8s.io)", "timeout 5 getent hosts dl.k8s.io || echo 'DNS FAILED'"),
-        ("curl test (dl.k8s.io)", "timeout 10 curl -sS -o /dev/null -w '%{http_code}' https://dl.k8s.io/ || echo 'CURL FAILED'"),
-        ("dns test (github.com)", "timeout 5 getent hosts github.com || echo 'DNS FAILED'"),
-        ("iptables nat", "iptables -t nat -L -n 2>/dev/null || nft list ruleset 2>/dev/null | head -60"),
-        # Agent and service logs.
-        ("systemctl status", "systemctl --no-pager status"),
-        ("unbounded-agent journal", "journalctl --no-pager -n 200 -u cloud-final.service"),
-        ("machinectl list", "machinectl list --no-pager"),
-        ("nspawn machine status", f"machinectl status {NSPAWN_MACHINE} --no-pager"),
-        ("kubelet journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
-            "journalctl --no-pager -n 200 -u kubelet.service"
-        )),
-        ("containerd journal (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
-            "journalctl --no-pager -n 100 -u containerd.service"
-        )),
-        ("kubelet service status (nspawn)", (
-            f"systemd-run --pipe --wait --machine={NSPAWN_MACHINE} "
-            "systemctl --no-pager status kubelet.service"
-        )),
-    ]
-    for label, cmd in commands:
-        log(f"  --- {label} ---")
-        try:
-            exit_code, stdout, stderr = guest_exec(cmd, timeout=30)
-            if stdout:
-                sys.stderr.write(stdout)
-                sys.stderr.flush()
-            if stderr:
-                sys.stderr.write(stderr)
-                sys.stderr.flush()
-        except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError) as e:
-            log(f"  (failed to collect {label}: {e})")
-
-    # Kubernetes-side diagnostics (run from the host via kubectl).
-    # These commands survive the QEMU guest agent dying inside the VM, which
-    # is critical because the in-guest collectors above frequently fail with
-    # "Guest agent is not responding" by the time the test gives up.
+    log("Collecting Kubernetes debug logs from the KIND control plane...")
     k8s_commands = [
-        ("kubectl describe node", [KUBECTL, "describe", "node", NODE_NAME]),
-        ("kubectl get pods -A", [KUBECTL, "get", "pods", "-A", "-o", "wide"]),
+        ("kubectl describe node", [*KUBECTL, "describe", "node", NODE_NAME]),
+        ("kubectl get pods -A", [*KUBECTL, "get", "pods", "-A", "-o", "wide"]),
         ("kubectl get events", [
-            KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp",
+            *KUBECTL, "get", "events", "-A", "--sort-by=.lastTimestamp",
         ]),
     ]
     # Logs from system pods scheduled on the smoke-node kubelet. kindnet and
@@ -276,7 +272,7 @@ def collect_debug_logs() -> None:
     for name, selector in node_pod_labels:
         k8s_commands.append((
             f"kubectl get {name} pods on smoke-node",
-            [KUBECTL, "-n", "kube-system", "get", "pods",
+            [*KUBECTL, "-n", "kube-system", "get", "pods",
              "-l", selector,
              "--field-selector", f"spec.nodeName={NODE_NAME}",
              "-o", "wide"],
@@ -303,7 +299,7 @@ def collect_debug_logs() -> None:
     for name, selector in node_pod_labels:
         try:
             result = subprocess.run(
-                [KUBECTL, "-n", "kube-system", "get", "pods",
+                [*KUBECTL, "-n", "kube-system", "get", "pods",
                  "-l", selector,
                  "--field-selector", f"spec.nodeName={NODE_NAME}",
                  "-o", "jsonpath={.items[*].metadata.name}"],
@@ -316,12 +312,12 @@ def collect_debug_logs() -> None:
         for pod in pod_names:
             for label, cmd in (
                 (f"kubectl describe pod {pod}",
-                 [KUBECTL, "-n", "kube-system", "describe", "pod", pod]),
+                 [*KUBECTL, "-n", "kube-system", "describe", "pod", pod]),
                 (f"kubectl logs {pod}",
-                 [KUBECTL, "-n", "kube-system", "logs", pod,
+                 [*KUBECTL, "-n", "kube-system", "logs", pod,
                   "--all-containers=true", "--tail=200"]),
                 (f"kubectl logs --previous {pod}",
-                 [KUBECTL, "-n", "kube-system", "logs", pod,
+                 [*KUBECTL, "-n", "kube-system", "logs", pod,
                   "--all-containers=true", "--previous", "--tail=200"]),
             ):
                 log(f"  --- {label} ---")
@@ -341,31 +337,25 @@ def collect_debug_logs() -> None:
     log("  --- end debug logs ---")
 
 
-def clean_libvirt() -> None:
-    for cmd in [
-        [*VIRSH, "destroy", VM_NAME],
-        [*VIRSH, "undefine", VM_NAME, "--nvram"],
-        [*VIRSH, "net-destroy", NET_NAME],
-        [*VIRSH, "net-undefine", NET_NAME],
-    ]:
-        run_quiet(cmd)
-    # Remove stale bridge left behind by a previous net-destroy.
-    run_quiet(["sudo", "ip", "link", "delete", "virbr-smoke"])
-    # Remove veth pair used to connect kind container to virbr-smoke.
-    run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
-    # Kill any leftover Redfish fixture from a previous run.
-    run_quiet(["sudo", "pkill", "-f", "metalman-redfish-fixture.py"])
-    # Kill any leftover metalman serve-pxe from a previous run.
-    # Use the binary path to avoid matching this script (smoke-metalman.py).
-    run_quiet(["sudo", "pkill", "-f", "bin/metalman"])
+def lean_teardown() -> None:
+    """Best-effort teardown of host-side resources (no libvirt, no iptables)."""
+    # Ask playtime to delete the pod, overlay, Site, and temporary Node it
+    # created. Terminating the `playtime up` process (below, in cleanup) also
+    # triggers its own cleanup, but `down` is a belt-and-suspenders backstop.
+    if PLAYTIME.exists() and REAL_CONTEXT:
+        run_quiet([str(PLAYTIME), "down", "--context", REAL_CONTEXT], check=False)
+    # Kill any leftover metalman serve-pxe from a previous run. Use the binary
+    # path to avoid matching this script (smoke-metalman.py).
+    run_quiet(["sudo", "pkill", "-f", "bin/metalman"], check=False)
     # Kill any leftover artifact download server from a previous run.
-    run_quiet(["sudo", "pkill", "-f", f"python3 -m http.server {AGENT_DOWNLOAD_PORT}"])
+    run_quiet(["pkill", "-f", f"http.server {AGENT_DOWNLOAD_PORT}"], check=False)
     # Stop and remove leftover local registry container.
-    run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER])
+    run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER], check=False)
     # Delete stale leader-election leases so new processes acquire immediately.
-    run_quiet([KUBECTL, "-n", METALMAN_NAMESPACE, "delete", "lease",
-               f"metalman-{SITE}"])
-    time.sleep(1)
+    run_quiet([*KUBECTL, "-n", METALMAN_NAMESPACE, "delete", "lease",
+               f"metalman-{SITE}"], check=False)
+    # Remove the loopback alias used for proxy source-IP preservation.
+    run_quiet(["sudo", "-n", "ip", "addr", "del", f"{OVERLAY_NODE_IP}/32", "dev", "lo"], check=False)
 
 
 _cleaning_up = False
@@ -384,21 +374,14 @@ def cleanup() -> None:
             pass
     for proc in _procs:
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-    clean_libvirt()
-    # Remove iptables rules that were added for VM ↔ kind connectivity.
-    # Use check=False so these are best-effort (rules may not exist if setup
-    # failed before they were inserted).
-    run_quiet(["sudo", "iptables", "-D", "FORWARD", "-i", "virbr-smoke", "-j", "ACCEPT"], check=False)
-    run_quiet(["sudo", "iptables", "-D", "FORWARD", "-o", "virbr-smoke", "-j", "ACCEPT"], check=False)
-    run_quiet(["sudo", "iptables", "-t", "raw", "-D", "PREROUTING",
-               "-i", "virbr-smoke", "-j", "ACCEPT"], check=False)
+    lean_teardown()
     shutil.rmtree(TMPDIR, ignore_errors=True)
 
 
@@ -408,12 +391,12 @@ def _sigint_handler(sig: int, frame: Any) -> None:
 
 
 def kubectl(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
-    return run([KUBECTL, *args], **kw)
+    return run([*KUBECTL, *args], **kw)
 
 
 def write_service_account_kubeconfig(namespace: str, service_account: str, path: Path) -> None:
     token = run(
-        [KUBECTL, "-n", namespace, "create", "token", service_account, "--duration=2h"],
+        [*KUBECTL, "-n", namespace, "create", "token", service_account, "--duration=2h"],
         capture_output=True,
         text=True,
     ).stdout.strip()
@@ -421,7 +404,7 @@ def write_service_account_kubeconfig(namespace: str, service_account: str, path:
         die(f"Failed to create token for ServiceAccount {namespace}/{service_account}")
 
     raw_config = run(
-        [KUBECTL, "config", "view", "--raw", "--minify", "-o", "json"],
+        [*KUBECTL, "config", "view", "--raw", "--minify", "-o", "json"],
         capture_output=True,
         text=True,
     ).stdout
@@ -452,79 +435,32 @@ def write_service_account_kubeconfig(namespace: str, service_account: str, path:
     os.chmod(path, 0o600)
 
 
-def apiserver_url() -> str:
+def kind_apiserver_port() -> int:
+    """Return the loopback port the KIND API server listens on."""
     result = run(
         [
-            KUBECTL, "config", "view", "--minify",
+            *KUBECTL, "config", "view", "--minify",
             "-o", "jsonpath={.clusters[0].cluster.server}",
         ],
         capture_output=True,
         text=True,
     )
     url = result.stdout.strip()
-
-    # When running against a kind cluster the kubeconfig points at
-    # 127.0.0.1:<nodeport> which is unreachable from the VM.  Rewrite to
-    # KIND_SMOKE_IP which is the kind container's address on virbr-smoke,
-    # the same L2 network the VM is on.  The Docker bridge IP
-    # (172.18.0.x) is NOT routable from the VM because iptables isolation
-    # rules block forwarding between bridges.
     from urllib.parse import urlparse
     parsed = urlparse(url)
-    if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
-        url = f"{parsed.scheme}://{KIND_SMOKE_IP}:6443"
-        log(f"  Rewrote apiserver URL to {url} (kind container on virbr-smoke)")
-
-    return url
-
-
-def configure_kind_control_plane_node_ip(container: str, node_ip: str) -> None:
-    """Make the kind control-plane Node advertise its VM-reachable IP."""
-    log(f"Configuring {container} kubelet node IP as {node_ip}")
-    script = textwrap.dedent(f"""\
-        set -eu
-        . /var/lib/kubelet/kubeadm-flags.env
-        set -- $KUBELET_KUBEADM_ARGS
-        new_args=""
-        for arg do
-          case "$arg" in
-            --node-ip=*) ;;
-            *) new_args="$new_args $arg" ;;
-          esac
-        done
-        new_args="${{new_args# }}"
-        printf 'KUBELET_KUBEADM_ARGS="%s --node-ip={node_ip}"\n' "$new_args" >/var/lib/kubelet/kubeadm-flags.env
-        systemctl restart kubelet
-    """)
-    run(["docker", "exec", container, "sh", "-c", script])
-
-    for elapsed in range(120):
-        result = subprocess.run(
-            [KUBECTL, "get", "node", container, "-o", "json"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            node = json.loads(result.stdout)
-            internal_ips = [
-                address.get("address", "")
-                for address in node.get("status", {}).get("addresses", [])
-                if address.get("type") == "InternalIP"
-            ]
-            if internal_ips == [node_ip]:
-                log(f"  Node '{container}' advertises InternalIP {node_ip}")
-                return
-            if elapsed > 0 and elapsed % 15 == 0:
-                log(f"    ({elapsed}s) InternalIP addresses: {internal_ips}")
-        time.sleep(1)
-
-    die(f"Timed out waiting for Node '{container}' to advertise only InternalIP {node_ip}")
+    if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        die(f"Expected KIND API server on loopback, got {url!r}. "
+            "This test requires a local kind cluster for --kind-context.")
+    port = parsed.port or 6443
+    log(f"  KIND API server loopback port: {port}")
+    return port
 
 
 def configure_kind_kube_proxy_apiserver(api_server: str) -> None:
     """Make newly scheduled kind kube-proxy pods use the VM-reachable API URL."""
     log(f"Configuring kind kube-proxy API server as {api_server}")
     result = run(
-        [KUBECTL, "-n", "kube-system", "get", "configmap", "kube-proxy", "-o", "json"],
+        [*KUBECTL, "-n", "kube-system", "get", "configmap", "kube-proxy", "-o", "json"],
         capture_output=True,
         text=True,
     )
@@ -539,81 +475,80 @@ def configure_kind_kube_proxy_apiserver(api_server: str) -> None:
     lines[index] = f"{indentation}server: {api_server}"
     config_map["data"]["kubeconfig.conf"] = "\n".join(lines) + "\n"
     run(
-        [KUBECTL, "replace", "-f", "-"],
+        [*KUBECTL, "replace", "-f", "-"],
         input=json.dumps(config_map),
         text=True,
     )
 
 
-def _probe_vm_network() -> None:
-    """Run quick network diagnostics inside the VM via guest agent."""
-    log("  Probing VM network (one-time diagnostic)...")
-    for label, cmd in [
-        ("resolv.conf", "cat /etc/resolv.conf"),
-        ("ip route", "ip route show"),
-        ("dns dl.k8s.io", "timeout 5 getent hosts dl.k8s.io 2>&1 || echo 'DNS FAILED'"),
-        ("curl dl.k8s.io", "timeout 10 curl -sSf -o /dev/null -w '%{http_code}' https://dl.k8s.io/ 2>&1 || echo 'CURL FAILED'"),
-    ]:
-        try:
-            _, stdout, stderr = guest_exec(cmd, timeout=15)
-            out = (stdout + stderr).strip()
-            log(f"    [{label}] {out}")
-        except Exception as e:
-            log(f"    [{label}] (failed: {e})")
+def _redfish_opener() -> urllib.request.OpenerDirector:
+    """Return a urllib opener that trusts playtime's self-signed Redfish cert."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
 
 
-def _vm_is_running() -> bool:
-    """Return True if the VM domain is in 'running' state."""
-    result = subprocess.run(
-        [*VIRSH, "domstate", VM_NAME],
-        capture_output=True, text=True,
+def redfish_power_state() -> str | None:
+    """Return the guest PowerState via playtime's forwarded Redfish, or None."""
+    creds = b64encode(f"{REDFISH_USERNAME}:{REDFISH_PASSWORD}".encode()).decode()
+    req = urllib.request.Request(
+        f"{REDFISH_URL}/redfish/v1/Systems/{REDFISH_DEVICE_ID}",
+        headers={"Authorization": f"Basic {creds}"},
     )
-    return result.returncode == 0 and "running" in result.stdout.strip()
+    try:
+        with _redfish_opener().open(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode())
+    except (urllib.error.URLError, ssl.SSLError, json.JSONDecodeError, OSError):
+        return None
+    return body.get("PowerState")
 
 
-def wait_vm_state(expected: str, timeout: int = 300) -> None:
-    """Wait for the libvirt domain state to contain *expected*."""
-    log(f"  Waiting for VM '{VM_NAME}' state to contain {expected!r}...")
-    last_state = ""
+def wait_redfish_power_state(expected: str, timeout: int = 180) -> None:
+    """Wait for the guest Redfish PowerState to reach *expected* (On/Off)."""
+    log(f"  Waiting for guest Redfish PowerState to be {expected!r}...")
+    last_state: str | None = None
     for elapsed in range(timeout):
         check_procs()
-        result = subprocess.run(
-            [*VIRSH, "domstate", VM_NAME],
-            capture_output=True, text=True,
-        )
-        state = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
-        if expected in state:
-            log(f"  VM '{VM_NAME}' state is {state!r}")
+        state = redfish_power_state()
+        if state == expected:
+            log(f"  Guest PowerState is {expected!r}")
             return
         if elapsed > 0 and elapsed % 15 == 0 and state != last_state:
             last_state = state
-            log(f"    ({elapsed}s) VM state={state or 'unknown'}")
+            log(f"    ({elapsed}s) PowerState={state or 'unknown'}")
         time.sleep(1)
-    die(f"Timed out waiting for VM '{VM_NAME}' state to contain {expected!r}")
+    die(f"Timed out waiting for guest Redfish PowerState to be {expected!r}")
 
 
-def wait_guest_agent(timeout: int = 300) -> None:
-    """Wait until the guest OS responds through the QEMU guest agent."""
-    log("  Waiting for QEMU guest agent to respond...")
+def wait_playtime_ready(timeout: int = 300) -> None:
+    """Wait until playtime's forwarded Redfish service root answers."""
+    log("  Waiting for playtime overlay + guest Redfish to become reachable...")
     for elapsed in range(timeout):
         check_procs()
+        req = urllib.request.Request(f"{REDFISH_URL}/redfish/v1/")
         try:
-            exit_code, _, _ = guest_exec("true", timeout=10)
-            if exit_code == 0:
-                log("  QEMU guest agent is responsive")
+            with _redfish_opener().open(req, timeout=10) as resp:
+                if resp.status == 200:
+                    log("  playtime Redfish service root is reachable")
+                    return
+        except (urllib.error.HTTPError,) as e:
+            # Any HTTP response (even 401) proves the forward + server are up.
+            if e.code in (401, 403, 404):
+                log("  playtime Redfish service root is reachable")
                 return
-        except (RuntimeError, TimeoutError, subprocess.TimeoutExpired, OSError):
+        except (urllib.error.URLError, ssl.SSLError, OSError):
             pass
         if elapsed > 0 and elapsed % 15 == 0:
-            log(f"    ({elapsed}s) guest agent not responsive yet")
+            log(f"    ({elapsed}s) playtime not reachable yet")
         time.sleep(1)
-    die("Timed out waiting for QEMU guest agent")
+    die("Timed out waiting for playtime overlay / guest Redfish to be reachable")
 
 
 def machine_status() -> str | None:
     """Return a short summary of Machine conditions, or None."""
     result = subprocess.run(
-        [KUBECTL, "get", f"machines.{API_GROUP}", NODE_NAME,
+        [*KUBECTL, "get", f"machines.{API_GROUP}", NODE_NAME,
          "-o", "jsonpath={.status.conditions[*].type}"],
         capture_output=True, text=True,
     )
@@ -625,11 +560,10 @@ def machine_status() -> str | None:
 def wait_k8s_node(name: str, timeout: int = 1800) -> None:
     log(f"  Waiting for Kubernetes Node '{name}' to appear...")
     last_status: str | None = None
-    net_diag_done = False
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
-            [KUBECTL, "get", "node", name, "-o", "json"],
+            [*KUBECTL, "get", "node", name, "-o", "json"],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -639,20 +573,9 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
                     last_status = status
                 log(f"    ({elapsed}s) Machine conditions: {status or 'none'}")
 
-                # Check if the VM is still alive; bail early if it crashed.
-                if not _vm_is_running():
-                    # Log host disk free space to help diagnose qcow2 growth.
-                    df = subprocess.run(
-                        ["df", "-h", str(TMPDIR)],
-                        capture_output=True, text=True,
-                    )
-                    log(f"    Host disk:\n{df.stdout}")
-                    die(f"VM '{VM_NAME}' is no longer running (crashed or shut down)")
-
-                # Run network diagnostics once after 180s if still stuck.
-                if elapsed >= 180 and not net_diag_done:
-                    net_diag_done = True
-                    _probe_vm_network()
+                # Bail early if the guest is no longer powered on.
+                if redfish_power_state() == "Off":
+                    die(f"Guest '{name}' powered off before joining the cluster")
             time.sleep(1)
             continue
         log(f"  Node '{name}' appeared in cluster")
@@ -662,7 +585,7 @@ def wait_k8s_node(name: str, timeout: int = 1800) -> None:
 
 def get_node_boot_id(name: str) -> str:
     result = subprocess.run(
-        [KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}"],
+        [*KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -678,7 +601,7 @@ def wait_node_boot_id_changed(name: str, previous_boot_id: str, timeout: int = 6
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
-            [KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}"],
+            [*KUBECTL, "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}"],
             capture_output=True, text=True,
         )
         boot_id = result.stdout.strip() if result.returncode == 0 else ""
@@ -691,80 +614,33 @@ def wait_node_boot_id_changed(name: str, previous_boot_id: str, timeout: int = 6
     die(f"Timed out waiting for Node '{name}' boot ID to change")
 
 
-def _restart_crashing_pods(node_name: str, namespace: str, label: str) -> None:
-    """Delete pods matching *label* on *node_name* that are in CrashLoopBackOff.
-
-    This resets the exponential backoff timer so the pod gets a fresh start.
-    Useful when a DaemonSet pod crashes transiently during node initialization
-    (e.g. kindnet racing with network setup on a QEMU VM).
-    """
-    result = subprocess.run(
-        [KUBECTL, "get", "pods", "-n", namespace,
-         "-l", label, "--field-selector", f"spec.nodeName={node_name}",
-         "-o", "json"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return
-
-    pods = json.loads(result.stdout).get("items", [])
-    for pod in pods:
-        pod_name = pod["metadata"]["name"]
-        for cs in pod.get("status", {}).get("containerStatuses", []):
-            if cs.get("ready"):
-                continue
-            waiting = cs.get("state", {}).get("waiting", {})
-            terminated = cs.get("state", {}).get("terminated", {})
-            restart_count = cs.get("restartCount", 0)
-            waiting_reason = waiting.get("reason")
-            terminated_reason = terminated.get("reason")
-            if restart_count >= 2 or waiting_reason == "CrashLoopBackOff":
-                log(f"    Deleting crashing pod {pod_name} "
-                    f"(restarts={restart_count}, waiting={waiting_reason or 'none'}, "
-                    f"terminated={terminated_reason or 'none'}) to reset backoff")
-                subprocess.run(
-                    [KUBECTL, "delete", "pod", "-n", namespace, pod_name,
-                     "--grace-period=0", "--force"],
-                    capture_output=True, text=True,
-                )
-
-
-def assert_node_ready(name: str, timeout: int = 720) -> None:
+def assert_node_ready(name: str, timeout: int = 300) -> None:
     """Assert the Node reaches Ready status within timeout seconds.
 
-    The timeout must be generous enough to survive multiple kindnet
-    CrashLoopBackOff cycles. In CI kindnet can need several fresh pod
-    attempts before it writes the CNI config; 720s accommodates the slow
-    tail without hiding real boot failures.
+    kindnet is excluded from the smoke node and a static CNI conflist is
+    written by the smoke-cni DaemonSet, so the node should report Ready
+    shortly after the writer pod starts (image pull + kubelet CNI re-check).
     """
     log(f"  Waiting for Node '{name}' to become Ready...")
-    pod_restart_interval = 30  # seconds between CrashLoopBackOff resets
-    last_restart_attempt = 0
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
-            [KUBECTL, "get", "node", name, "-o",
+            [*KUBECTL, "get", "node", name, "-o",
              "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
             capture_output=True, text=True,
         )
         if result.returncode == 0 and result.stdout.strip() == "True":
             log(f"  Node '{name}' is Ready")
             return
-        if elapsed > 0 and elapsed % 30 == 0:
+        if elapsed > 0 and elapsed % 15 == 0:
             log(f"    ({elapsed}s) Node not yet Ready")
-        # Periodically reset failing critical DaemonSet pods. Kindnet can fail
-        # transiently during VM network initialization and may sit in Error
-        # before Kubernetes reports CrashLoopBackOff.
-        if elapsed >= 30 and elapsed - last_restart_attempt >= pod_restart_interval:
-            _restart_crashing_pods(name, "kube-system", "app=kindnet")
-            last_restart_attempt = elapsed
         time.sleep(1)
     die(f"Timed out waiting for Node '{name}' to become Ready")
 
 
 def assert_node_label(name: str, key: str, value: str) -> None:
     result = subprocess.run(
-        [KUBECTL, "get", "node", name, "-o", "json"],
+        [*KUBECTL, "get", "node", name, "-o", "json"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -810,10 +686,14 @@ def assert_cloud_init_done(timeout: int = 900) -> None:
     smoke test does not wait for the full node-join timeout.
     """
     log(f"  Waiting for HostReplace MachineOperation CloudInitDone condition for '{NODE_NAME}'...")
+    # Track when each provisioning milestone flips to True so the install phase
+    # can be split into netboot/disk-write vs OS-boot/cloud-init sub-phases when
+    # profiling smoke test latency.
+    milestones_seen: set[str] = set()
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
-            [KUBECTL, "get", f"machineoperations.{API_GROUP}", "-o", "json"],
+            [*KUBECTL, "get", f"machineoperations.{API_GROUP}", "-o", "json"],
             capture_output=True, text=True,
         )
         op_name = ""
@@ -821,6 +701,7 @@ def assert_cloud_init_done(timeout: int = 900) -> None:
         status = ""
         reason = ""
         message = ""
+        conditions: list[dict[str, Any]] = []
         if result.returncode == 0:
             try:
                 op = find_host_replace_operation(json.loads(result.stdout).get("items", []))
@@ -829,7 +710,8 @@ def assert_cloud_init_done(timeout: int = 900) -> None:
                     op_status = op.get("status", {})
                     phase = op_status.get("phase", "")
                     message = op_status.get("message", "")
-                    for c in op_status.get("conditions", []):
+                    conditions = op_status.get("conditions", [])
+                    for c in conditions:
                         if c.get("type") == "CloudInitDone":
                             status = c.get("status", "")
                             reason = c.get("reason", "")
@@ -837,6 +719,14 @@ def assert_cloud_init_done(timeout: int = 900) -> None:
                             break
             except (json.JSONDecodeError, KeyError):
                 pass
+
+        for c in conditions:
+            ctype = c.get("type", "")
+            if ctype in milestones_seen:
+                continue
+            if c.get("status") == "True":
+                milestones_seen.add(ctype)
+                log(f"    milestone {ctype} True/{c.get('reason', '')}")
 
         if phase == "Failed":
             die(f"HostReplace MachineOperation '{op_name}' failed: {message}")
@@ -861,7 +751,7 @@ def wait_machine_operation_complete(name: str, timeout: int = 1800) -> None:
     for elapsed in range(timeout):
         check_procs()
         result = subprocess.run(
-            [KUBECTL, "get", f"machineoperations.{API_GROUP}", name, "-o", "json"],
+            [*KUBECTL, "get", f"machineoperations.{API_GROUP}", name, "-o", "json"],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
@@ -916,7 +806,10 @@ def create_machine_operation(
 
 
 def run_kubectl_unbounded_operation(args: list[str], log_name: str) -> subprocess.Popen[Any]:
-    proc = spawn([str(KUBECTL_UNBOUNDED), "machine", *args], TMPDIR / log_name)
+    proc = spawn(
+        [str(KUBECTL_UNBOUNDED), "--kubeconfig", str(KIND_KUBECONFIG), "machine", *args],
+        TMPDIR / log_name,
+    )
     log(f"  kubectl-unbounded {' '.join(args)} PID={proc.pid}")
     return proc
 
@@ -948,11 +841,11 @@ def run_operation_smoke_suite() -> None:
 
     poweroff = create_machine_operation("smoke-host-poweroff", "HostPowerOff")
     wait_machine_operation_complete(poweroff, timeout=600)
-    wait_vm_state("shut off", timeout=180)
+    wait_redfish_power_state("Off", timeout=180)
 
     poweron = create_machine_operation("smoke-host-poweron", "HostPowerOn")
     wait_machine_operation_complete(poweron, timeout=600)
-    wait_vm_state("running", timeout=180)
+    wait_redfish_power_state("On", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
     boot_id = get_node_boot_id(NODE_NAME)
@@ -964,150 +857,80 @@ def run_operation_smoke_suite() -> None:
         site_selector=SITE,
     )
     wait_machine_operation_complete(reboot, timeout=600)
-    wait_vm_state("running", timeout=180)
+    wait_redfish_power_state("On", timeout=180)
     wait_k8s_node(NODE_NAME, timeout=300)
     wait_node_boot_id_changed(NODE_NAME, boot_id, timeout=600)
 
 
+def parse_args() -> argparse.Namespace:
+    default_context = subprocess.run(
+        ["kubectl", "config", "current-context"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pod-image", required=True,
+        help="fully-qualified playtime pod image reference (must include the "
+             "guest-disk support), pullable by the target cluster",
+    )
+    parser.add_argument(
+        "--pod-node", default="node-1",
+        help="node in the target cluster to pin the playtime pod on "
+             "(must be KVM-capable); default node-1",
+    )
+    parser.add_argument(
+        "--context", default=default_context,
+        help="kubectl context of the real cluster playtime targets "
+             "(default: current context)",
+    )
+    parser.add_argument(
+        "--kind-context", default="kind-kind",
+        help="kubectl context of the local KIND metalman control plane "
+             "(default: kind-kind)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    global KUBECTL, REAL_CONTEXT, POD_IMAGE, POD_NODE, KIND_APISERVER_PORT, KIND_KUBECONFIG
+
+    args = parse_args()
+    if not args.context:
+        die("Could not determine the real cluster context; pass --context")
+    REAL_CONTEXT = args.context
+    POD_IMAGE = args.pod_image
+    POD_NODE = args.pod_node
+    KUBECTL = ["kubectl", "--context", args.kind_context]
+
     signal.signal(signal.SIGINT, _sigint_handler)
     atexit.register(cleanup)
 
-    log("Cleaning up stale libvirt resources")
-    clean_libvirt()
+    log(f"KIND control plane context: {args.kind_context}")
+    log(f"playtime target context:    {REAL_CONTEXT}")
+    log(f"playtime pod image:         {POD_IMAGE}")
+    log(f"playtime pod node:          {POD_NODE}")
 
-    log("Creating libvirt network")
-    net_xml = TMPDIR / "net.xml"
-    net_xml.write_text(textwrap.dedent(f"""\
-        <network>
-          <name>{NET_NAME}</name>
-          <forward mode="nat"/>
-          <bridge name="virbr-smoke"/>
-          <ip address="{SERVER_IP}" netmask="255.255.255.0"/>
-        </network>
-    """))
-    run([*VIRSH, "net-define", str(net_xml)])
-    run([*VIRSH, "net-start", NET_NAME])
+    KIND_APISERVER_PORT = kind_apiserver_port()
 
-    # Allow the VM to reach the kind Docker network (Docker's bridge
-    # isolation rules block cross-bridge traffic by default).
-    log("Adding iptables rules for VM ↔ kind connectivity")
-    run(["sudo", "iptables", "-I", "FORWARD", "-i", "virbr-smoke", "-j", "ACCEPT"])
-    run(["sudo", "iptables", "-I", "FORWARD", "-o", "virbr-smoke", "-j", "ACCEPT"])
-    # Docker may insert a raw PREROUTING DROP rule that blocks non-Docker
-    # traffic to its container IPs.  Insert an ACCEPT before it so the VM
-    # can reach the kind API server.
-    run(["sudo", "iptables", "-t", "raw", "-I", "PREROUTING",
-         "-i", "virbr-smoke", "-j", "ACCEPT"])
-
-    # Connect the kind container directly to virbr-smoke so that the VM
-    # subnet is *directly reachable* from inside the container.  Kindnet
-    # adds routes of the form "10.244.x.0/24 via <nodeIP>"; the kernel
-    # rejects these when the gateway is only reachable via an indirect
-    # route.  A direct L2 link avoids this.
-    log("Attaching kind container to virbr-smoke bridge")
-    kind_pid = run(
-        ["docker", "inspect", "kind-control-plane", "--format", "{{.State.Pid}}"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    kind_ip = run(
-        ["docker", "inspect", "kind-control-plane",
-         "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    # Clean up any leftover veth from a previous run.
-    run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"], check=False)
-    # Create a veth pair: host-side attaches to virbr-smoke, container-side
-    # gets an IP on the VM subnet.
-    run(["sudo", "ip", "link", "add", "veth-kind-smoke", "type", "veth",
-         "peer", "name", "eth-smoke"])
-    run(["sudo", "ip", "link", "set", "veth-kind-smoke", "master", "virbr-smoke"])
-    run(["sudo", "ip", "link", "set", "veth-kind-smoke", "up"])
-    # Move the peer into the kind container's network namespace.
-    run(["sudo", "ip", "link", "set", "eth-smoke", "netns", kind_pid])
-    run(["sudo", "nsenter", "-t", kind_pid, "-n",
-         "ip", "addr", "add", f"{KIND_SMOKE_IP}/24", "dev", "eth-smoke"])
-    run(["sudo", "nsenter", "-t", kind_pid, "-n",
-         "ip", "link", "set", "eth-smoke", "up"])
-    configure_kind_control_plane_node_ip("kind-control-plane", KIND_SMOKE_IP)
-
-    # Kindnet's CONTROL_PLANE_ENDPOINT defaults to "kind-control-plane:6443"
-    # which is unresolvable from the bare-metal VM (it's not in Docker's DNS).
-    # Patch it to use KIND_SMOKE_IP. The API server's TLS cert SANs (set in
-    # kind-smoke-config.yaml) only cover this IP, 127.0.0.1, and localhost.
-    # Using the Docker bridge IP (kind_ip) would cause TLS verification failures.
-    log("Patching kindnet DaemonSet for VM-reachable control plane endpoint")
-    patch = json.dumps({
-        "spec": {"template": {"spec": {"containers": [{
-            "name": "kindnet-cni",
-            "env": [
-                {"name": "CONTROL_PLANE_ENDPOINT", "value": f"{KIND_SMOKE_IP}:6443"},
-            ],
-        }]}}}
-    })
-    kubectl(["-n", "kube-system", "patch", "daemonset", "kindnet",
-             "--type=strategic", "-p", patch])
-    configure_kind_kube_proxy_apiserver(f"https://{KIND_SMOKE_IP}:6443")
-
-    log("Creating UEFI VM (powered off, with TPM)")
-    ovmf_vars = TMPDIR / "OVMF_VARS.fd"
-    shutil.copy2("/usr/share/OVMF/OVMF_VARS_4M.fd", ovmf_vars)
-    disk = str(TMPDIR / "disk.qcow2")
-    run_quiet(["qemu-img", "create", "-f", "qcow2", disk, "20G"], check=True)
-    run_quiet([
-        "virt-install",
-        "--connect", "qemu:///system",
-        "--name", VM_NAME, "--ram", "4096", "--vcpus", "2",
-        "--disk", f"path={disk},format=qcow2,bus=virtio",
-        "--network", f"network={NET_NAME},mac={MAC_ADDRESS}",
-        "--boot", f"uefi,loader=/usr/share/OVMF/OVMF_CODE_4M.fd,nvram={ovmf_vars},hd,network",
-        "--tpm", "backend.type=emulator,backend.version=2.0",
-        "--serial", f"unix,path={SERIAL_SOCK},mode=bind",
-        "--channel", f"unix,path={QGA_SOCK},mode=bind,target.type=virtio,target.name=org.qemu.guest_agent.0",
-        "--os-variant", "generic",
-        "--noautoconsole", "--noreboot", "--import",
-    ], check=True)
-    run_quiet([*VIRSH, "destroy", VM_NAME])
-
-    log("Starting serial console forwarding")
-    console_thread = threading.Thread(
-        target=forward_console, args=(SERIAL_SOCK,), daemon=True,
+    # kubectl-unbounded has no --context flag, so write a standalone kubeconfig
+    # scoped to the KIND context and point it there via --kubeconfig.
+    KIND_KUBECONFIG = TMPDIR / "kind.kubeconfig"
+    KIND_KUBECONFIG.write_text(
+        subprocess.run(
+            ["kubectl", "config", "view", "--minify", "--flatten",
+             "--context", args.kind_context],
+            check=True, capture_output=True, text=True,
+        ).stdout,
+        encoding="utf-8",
     )
-    console_thread.start()
 
-    log("Starting recording Redfish fixture")
-    run_quiet([
-        "openssl", "req", "-x509", "-newkey", "rsa:2048",
-        "-keyout", str(TMPDIR / "redfish.key"),
-        "-out", str(TMPDIR / "redfish.crt"),
-        "-days", "1", "-nodes",
-        "-subj", "/CN=metalman-redfish-fixture",
-        "-addext", "subjectAltName=IP:127.0.0.1",
-    ], check=True)
-    redfish_url = f"https://127.0.0.1:{REDFISH_PORT}"
-    proc = spawn([
-        sys.executable, str(REPO_ROOT / "hack" / "metalman-redfish-fixture.py"),
-        "--domain", VM_NAME, "--mac", MAC_ADDRESS,
-        "--bind", "127.0.0.1", "--port", str(REDFISH_PORT),
-        "--cert", str(TMPDIR / "redfish.crt"),
-        "--key", str(TMPDIR / "redfish.key"),
-        "--record", str(TMPDIR / "redfish.jsonl"),
-        "--username", "", "--password", "smoke",
-        "--manage-boot-order",
-    ], TMPDIR / "redfish.log")
-    log(f"  Redfish fixture PID={proc.pid}")
-    time.sleep(2)
-    check_procs()
+    log("Cleaning up stale host resources")
+    lean_teardown()
 
-    # Start Go builds in the background so they overlap with Kubernetes
-    # setup and Docker image builds.  Both targets share the Go build
-    # cache, so concurrent compilation is safe and efficient.
-    # stdout/stderr are inherited so build output streams to the CI log
-    # in real-time.
-    log("Rendering machina and net manifests")
-    run(["make", "machina-manifests", "net-manifests"], cwd=str(REPO_ROOT))
+    log("Rendering machina manifests")
+    run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
 
-    log("Building metalman, kubectl-unbounded, and unbounded-agent (parallel)")
+    log("Building metalman, kubectl-unbounded, unbounded-agent, and playtime (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
         ("metalman", subprocess.Popen(
             ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
@@ -1121,17 +944,21 @@ def main() -> None:
             ["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"],
             cwd=str(REPO_ROOT),
         )),
+        ("playtime", subprocess.Popen(
+            ["go", "build", "-o", str(PLAYTIME), "./cmd/playtime"],
+            cwd=str(REPO_ROOT),
+        )),
     ]
 
     # Kubernetes setup runs while Go builds are in progress.
-    log("Cleaning up stale Kubernetes resources")
-    run_quiet([KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
-    run_quiet([KUBECTL, "delete", f"machineoperations.{API_GROUP}", "--all"])
-    run_quiet([KUBECTL, "delete", f"machines.{API_GROUP}", NODE_NAME])
-    run_quiet([KUBECTL, "delete", "node", NODE_NAME])
+    log("Cleaning up stale Kubernetes resources (KIND control plane)")
+    run_quiet([*KUBECTL, "-n", NODE_NS, "delete", "secret", "bmc-pass"])
+    run_quiet([*KUBECTL, "delete", f"machineoperations.{API_GROUP}", "--all"])
+    run_quiet([*KUBECTL, "delete", f"machines.{API_GROUP}", NODE_NAME])
+    run_quiet([*KUBECTL, "delete", "node", NODE_NAME])
     # Remove stale CRDs so that a version change (e.g. storedVersions
     # referencing an old API version) does not block the fresh apply.
-    run_quiet([KUBECTL, "delete", "crd", f"machines.{API_GROUP}"])
+    run_quiet([*KUBECTL, "delete", "crd", f"machines.{API_GROUP}"])
 
     log("Applying deploy manifests (CRDs, namespace, RBAC)")
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "01-namespace.yaml")])
@@ -1139,28 +966,28 @@ def main() -> None:
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
 
     log("Creating Kubernetes resources")
+    # playtime's in-pod Redfish requires a non-empty password (its default is
+    # "password"); metalman authenticates with it via this secret.
     kubectl(["-n", NODE_NS, "create", "secret", "generic",
-             "bmc-pass", "--from-literal=password="])
+             "bmc-pass", f"--from-literal=password={REDFISH_PASSWORD}"])
 
     log("Starting local OCI registry")
     run_quiet(["docker", "rm", "-f", REGISTRY_CONTAINER])
     run(["docker", "run", "-d", "--name", REGISTRY_CONTAINER,
-         "-p", f"{REGISTRY_PORT}:5000", "registry:2"])
+         "-p", f"127.0.0.1:{REGISTRY_PORT}:5000", "registry:2"])
     # Wait for the registry to be ready.
     for _ in range(30):
         try:
-            import urllib.request
-            urllib.request.urlopen(f"http://localhost:{REGISTRY_PORT}/v2/")
+            urllib.request.urlopen(f"http://127.0.0.1:{REGISTRY_PORT}/v2/")
             break
         except Exception:
             time.sleep(0.5)
     else:
         die("Local OCI registry did not become ready")
 
-    # Docker images are pre-built
-    # by the GitHub Actions workflow using docker/build-push-action with GHA
-    # layer caching.  They are already loaded into the local Docker daemon
-    # with the correct tags.
+    # Docker images are pre-built by the GitHub Actions workflow using
+    # docker/build-push-action with GHA layer caching. They are already loaded
+    # into the local Docker daemon with the correct tags.
     log("Verifying pre-built OCI images are available")
     for name, tag in [("host-ubuntu2404", IMAGE_NAME),
                       ("netboot", NETBOOT_IMAGE_NAME),
@@ -1186,10 +1013,10 @@ def main() -> None:
     with tarfile.open(AGENT_TARBALL, "w:gz") as tar:
         tar.add(AGENT_BINARY, arcname="unbounded-agent")
 
-    log("Starting agent download server")
+    log("Starting agent download server (loopback)")
     proc = spawn([
         sys.executable, "-m", "http.server", str(AGENT_DOWNLOAD_PORT),
-        "--bind", SERVER_IP, "--directory", str(ARTIFACT_DIR),
+        "--bind", "127.0.0.1", "--directory", str(ARTIFACT_DIR),
     ], TMPDIR / "agent-download.log")
     log(f"  agent download PID={proc.pid}")
     time.sleep(1)
@@ -1200,16 +1027,143 @@ def main() -> None:
     run(["docker", "push", NETBOOT_IMAGE_NAME])
     run(["docker", "push", AGENT_IMAGE_NAME])
 
-    # Reclaim disk space consumed by Docker build cache.  The host-ubuntu2404
-    # build downloads a ~2 GB Ubuntu cloud image and converts it to raw; the
-    # intermediate layers are no longer needed once the images are pushed.
-    # Only prune the build cache (not running container images) to avoid
-    # disturbing the registry container.
+    # Reclaim disk space consumed by Docker build cache.
     log("Pruning Docker build cache to free disk space")
     run_quiet(["docker", "builder", "prune", "-af"], check=False)
 
-    server_url = apiserver_url()
-    log(f"  API server URL: {server_url}")
+    # Assign the guest's overlay lease IP to loopback so playtime's proxies can
+    # bind their egress source to it when dialing metalman on 127.0.0.1. The
+    # kernel then reports the guest IP as the peer to the loopback-bound
+    # metalman, so metalman resolves the Machine by its real DHCP lease.
+    log(f"Assigning {OVERLAY_NODE_IP}/32 to lo for proxy source-IP preservation")
+    run_quiet(["sudo", "-n", "ip", "addr", "add", f"{OVERLAY_NODE_IP}/32", "dev", "lo"], check=False)
+
+    # Grant playtime the capability to bind the privileged DHCP relay port (67)
+    # so it can run as the invoking user (and use the normal kubeconfig for the
+    # real cluster context) without sudo.
+    log("Granting playtime CAP_NET_BIND_SERVICE for the DHCP relay port")
+    run(["sudo", "setcap", "cap_net_bind_service=+ep", str(PLAYTIME)])
+
+    log("Starting playtime overlay (remote guest VM)")
+    playtime_proc = spawn([
+        str(PLAYTIME), "up", "--keep-up",
+        "--context", REAL_CONTEXT,
+        "--pod-node", POD_NODE,
+        "--pod-image", POD_IMAGE,
+        "--vm-disk-size", "20",
+        "--vm-mac", MAC_ADDRESS,
+        # Give the guest several vCPUs so the streaming OS-image install
+        # (wget | gunzip | dd) can run its stages on separate cores. The pod
+        # CPU limit is 4 (requests 0.5), so this bursts without a large request.
+        "--vm-cpus", "4",
+        # Bind playtime's proxy egress to the guest's overlay lease IP so
+        # metalman (bound to 127.0.0.1) sees requests coming from the real
+        # guest IP and resolves the Machine by its real DHCP lease. Requires
+        # OVERLAY_NODE_IP to be assigned to lo on the host (done in main()).
+        "--proxy-source-ip", OVERLAY_NODE_IP,
+        # Run an in-pod HTTP reverse proxy on the pod overlay IP:HTTP_PORT that
+        # forwards to the client IP. The guest fetches vmlinuz/initrd over the
+        # fast pod<->guest LAN hop (grub has a tiny TCP window), and the pod
+        # re-originates to the client over the overlay with kernel TCP.
+        "--netboot-proxy-port", str(HTTP_PORT),
+        # Expose loopback services to the guest over the overlay.
+        "--forward", f"6443:{KIND_APISERVER_PORT}",
+        "--forward", f"{HTTP_PORT}:{HTTP_PORT}",
+        "--forward", f"{AGENT_DOWNLOAD_PORT}:{AGENT_DOWNLOAD_PORT}",
+        "--forward", f"{REGISTRY_PORT}:{REGISTRY_PORT}",
+        # DHCP relay: metalman listens on METALMAN_DHCP_PORT and unicasts its
+        # replies to the giaddr (127.0.0.1) on port 67, which playtime binds.
+        "--dhcp-server", f"127.0.0.1:{METALMAN_DHCP_PORT}",
+        "--dhcp-giaddr", "127.0.0.1",
+        "--dhcp-relay-port", str(DHCP_RELAY_PORT),
+        "--tftp-server", f"127.0.0.1:{TFTP_PORT}",
+    ], TMPDIR / "playtime.log")
+    log(f"  playtime PID={playtime_proc.pid}")
+    wait_playtime_ready(timeout=300)
+
+    # Kindnet's CONTROL_PLANE_ENDPOINT and kube-proxy's API server must be
+    # reachable by the guest kubelet's pods. They reach the KIND API server over
+    # the overlay at the client IP, forwarded to the KIND API server's loopback
+    # port. The API server's TLS cert SANs (kind-smoke-config.yaml) cover this
+    # overlay IP, 127.0.0.1, and localhost.
+    # The smoke node does not need working pod networking: the only pods that
+    # ever land on it are hostNetwork system pods (kube-proxy). The real kindnet
+    # DaemonSet crash-loops for minutes on the freshly joined node while its
+    # in-cluster bootstrap settles, which dominates node-ready latency. Instead,
+    # exclude kindnet from the smoke node (nodeAffinity on the label metalman
+    # applies at join) and drop a static CNI conflist via a tiny hostNetwork
+    # DaemonSet so kubelet reports the node Ready almost immediately. The
+    # reference CNI plugin binaries (ptp, host-local, portmap) are already
+    # present at /opt/cni/bin, installed by the unbounded-agent cni-plugins
+    # artifact. We keep the CONTROL_PLANE_ENDPOINT override for kindnet on the
+    # remaining (control-plane) nodes and repoint kube-proxy at the overlay API.
+    log("Excluding kindnet from the smoke node")
+    patch = json.dumps({
+        "spec": {"template": {"spec": {
+            "affinity": {"nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [{"matchExpressions": [
+                        {"key": NODE_LABEL_KEY, "operator": "DoesNotExist"},
+                    ]}],
+                },
+            }},
+            "containers": [{
+                "name": "kindnet-cni",
+                "env": [
+                    {"name": "CONTROL_PLANE_ENDPOINT", "value": f"{OVERLAY_CLIENT_IP}:6443"},
+                ],
+            }],
+        }}}
+    })
+    kubectl(["-n", "kube-system", "patch", "daemonset", "kindnet",
+             "--type=strategic", "-p", patch])
+    configure_kind_kube_proxy_apiserver(GUEST_APISERVER_URL)
+
+    log("Deploying static CNI writer DaemonSet for the smoke node")
+    cni_conflist = (
+        '{"cniVersion":"0.3.1","name":"smoke","plugins":['
+        '{"type":"ptp","ipMasq":true,"ipam":{"type":"host-local",'
+        '"dataDir":"/run/cni-ipam-state","routes":[{"dst":"0.0.0.0/0"}],'
+        '"ranges":[[{"subnet":"10.244.244.0/24"}]]}},'
+        '{"type":"portmap","capabilities":{"portMappings":true}}]}'
+    )
+    smoke_cni = {
+        "apiVersion": "apps/v1",
+        "kind": "DaemonSet",
+        "metadata": {"name": "smoke-cni", "namespace": "kube-system"},
+        "spec": {
+            "selector": {"matchLabels": {"app": "smoke-cni"}},
+            "template": {
+                "metadata": {"labels": {"app": "smoke-cni"}},
+                "spec": {
+                    "hostNetwork": True,
+                    "nodeSelector": {NODE_LABEL_KEY: NODE_LABEL_VALUE},
+                    "tolerations": [{"operator": "Exists"}],
+                    "terminationGracePeriodSeconds": 1,
+                    "containers": [{
+                        "name": "cni-writer",
+                        "image": "busybox:1.36",
+                        "command": ["/bin/sh", "-c"],
+                        "args": [
+                            "cat > /etc/cni/net.d/10-smoke.conflist <<'EOF'\n"
+                            f"{cni_conflist}\nEOF\n"
+                            "echo wrote-cni-conflist; sleep infinity"
+                        ],
+                        "volumeMounts": [
+                            {"name": "cni-cfg", "mountPath": "/etc/cni/net.d"},
+                        ],
+                    }],
+                    "volumes": [{
+                        "name": "cni-cfg",
+                        "hostPath": {"path": "/etc/cni/net.d", "type": "DirectoryOrCreate"},
+                    }],
+                },
+            },
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(smoke_cni).encode(), stdout=DEVNULL)
+
+    log("Creating Machine resource")
     protonode = {
         "apiVersion": API_VERSION,
         "kind": "Machine",
@@ -1220,19 +1174,28 @@ def main() -> None:
         "spec": {
             "pxe": {
                 "image": IMAGE_NAME,
+                # PXE/TFTP boot. metalman's TFTP server streams DATA blocks ahead
+                # of client ACKs (SetAnticipate window) so large netboot artifacts
+                # (grubx64.efi, vmlinuz, initrd) transfer fast enough over the
+                # high-latency WireGuard overlay instead of timing out lockstep.
+                # The cloud-hypervisor guest's single virtio-blk disk
+                # (--vm-disk-size) appears as /dev/vda.
+                "targetDisk": "/dev/vda",
                 "redfish": {
-                    "url": redfish_url,
-                    "username": "",
-                    "deviceID": VM_NAME,
+                    "url": REDFISH_URL,
+                    "username": REDFISH_USERNAME,
+                    "deviceID": REDFISH_DEVICE_ID,
                     "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
                 },
-                "dhcpLeases": [{
-                    "mac": MAC_ADDRESS,
-                    "ipv4": NODE_IP,
-                    "subnetMask": "255.255.255.0",
-                    "gateway": GATEWAY,
-                    "dns": [DNS_SERVER],
-                }],
+                "dhcpLeases": [
+                    {
+                        "mac": MAC_ADDRESS,
+                        "ipv4": OVERLAY_NODE_IP,
+                        "subnetMask": OVERLAY_MASK,
+                        "gateway": OVERLAY_GATEWAY,
+                        "dns": [DNS_SERVER],
+                    },
+                ],
             },
             "agent": {
                 "image": AGENT_IMAGE_NAME_VM,
@@ -1247,18 +1210,34 @@ def main() -> None:
             stdout=DEVNULL)
     log("  Resources created")
 
-    log("Starting metalman serve-pxe")
+    log("Starting metalman serve-pxe (DHCP relay mode)")
     metalman_kubeconfig = TMPDIR / "metalman-controller.kubeconfig"
     write_service_account_kubeconfig(METALMAN_NAMESPACE, METALMAN_CONTROLLER_SA, metalman_kubeconfig)
-    metalman_env = [f"METALMAN_APISERVER_URL={server_url}"]
-    metalman_env.append(f"KUBECONFIG={metalman_kubeconfig}")
+    # The joining kubelet reaches the API server over the overlay, so metalman
+    # must generate join material pointing at the guest-reachable URL.
+    metalman_env = [
+        f"METALMAN_APISERVER_URL={GUEST_APISERVER_URL}",
+        f"KUBECONFIG={metalman_kubeconfig}",
+    ]
 
+    # metalman runs under sudo because its TFTP server binds the privileged
+    # port 69. It binds loopback but advertises the overlay client IP as the
+    # DHCP next-server and serve-url host so playtime's proxies (which dial
+    # loopback) can reach it while the guest sees an overlay-routable address.
     proc = spawn([
         "sudo", "env", *metalman_env,
-        str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
+        str(BINARY), "serve-pxe", f"--site={SITE}",
+        "--bind-address=127.0.0.1",
+        f"--advertise-ip={OVERLAY_CLIENT_IP}",
         f"--cache-dir={CACHE_DIR}",
-        f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
+        f"--serve-url={SERVE_URL}",
+        f"--dhcp-port={METALMAN_DHCP_PORT}",
         f"--default-netboot-image={NETBOOT_IMAGE_NAME}",
+        # grub loads the kernel/initrd through its own (slow) UEFI network
+        # stack over the high-latency overlay, so the repave boot stage can take
+        # well over the 5m default before the boot image is written. Give it
+        # plenty of headroom so metalman does not power-cycle mid-download.
+        "--operation-power-action-timeout=30m",
         "--leader-elect-lease-duration=60s",
         "--leader-elect-renew-deadline=40s",
         "--leader-elect-retry-period=5s",
@@ -1268,6 +1247,31 @@ def main() -> None:
     time.sleep(2)
     check_procs()
 
+    # HTTP boot repave needs the netboot image metadata synchronously when the
+    # HostReplace operation is processed; unlike PXE mode it fails hard if the
+    # image is not cached yet. Wait for metalman to pull/cache the netboot and
+    # host images before triggering the operation to defeat that cold-cache race.
+    log("Waiting for metalman to cache the netboot + host OCI images...")
+    serve_log = TMPDIR / "serve.log"
+    cache_deadline = time.time() + 300
+    needed = [NETBOOT_IMAGE_NAME, IMAGE_NAME]
+    while True:
+        check_procs()
+        try:
+            served_lines = serve_log.read_text(errors="replace").splitlines()
+        except FileNotFoundError:
+            served_lines = []
+        cached = {
+            ref for ref in needed
+            if any("OCI image cached" in ln and f"image={ref}" in ln for ln in served_lines)
+        }
+        if len(cached) == len(needed):
+            break
+        if time.time() > cache_deadline:
+            die("metalman did not cache the OCI images within 300s")
+        time.sleep(3)
+    log("  OCI images cached")
+
     log("Triggering HostReplace through kubectl-unbounded")
     operation_log = TMPDIR / "kubectl-host-replace.log"
     operation_proc = run_kubectl_unbounded_operation(
@@ -1275,14 +1279,10 @@ def main() -> None:
         operation_log.name,
     )
 
-    # Log free space so we can correlate disk exhaustion with VM failures.
-    df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
-    log(f"  Host disk after image builds:\n{df.stdout.strip()}")
-
     log("Waiting for cloud-init to complete...")
-    assert_cloud_init_done(timeout=900)
+    assert_cloud_init_done(timeout=2400)
 
-    wait_process_success(operation_proc, timeout=900)
+    wait_process_success(operation_proc, timeout=2400)
     assert_log_contains(operation_log, "Condition CloudInitDone: True/Succeeded")
 
     log("Waiting for kubelet to join the cluster...")

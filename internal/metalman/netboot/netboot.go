@@ -391,11 +391,12 @@ func operationRequestsInstall(op *v1alpha3.MachineOperation, machineName string)
 
 var (
 	templateFuncMap = template.FuncMap{
-		"indent":       indentTemplateBlock,
-		"ipAddresses":  ipAddresses,
-		"join":         strings.Join,
-		"subnetPrefix": subnetPrefix,
-		"yamlQuote":    strconv.Quote,
+		"grubHTTPDevice": grubHTTPDevice,
+		"indent":         indentTemplateBlock,
+		"ipAddresses":    ipAddresses,
+		"join":           strings.Join,
+		"subnetPrefix":   subnetPrefix,
+		"yamlQuote":      strconv.Quote,
 	}
 	templatePool = sync.Pool{
 		New: func() any {
@@ -403,6 +404,25 @@ var (
 		},
 	}
 )
+
+// grubHTTPDevice converts a serve URL (for example "http://10.0.0.1:8880/base")
+// into a GRUB HTTP device prefix (for example "(http,10.0.0.1:8880)/base").
+// GRUB uses this to fetch the kernel and initrd over HTTP/TCP instead of GRUB's
+// own TFTP client, which is effectively lockstep (one block per round trip) and
+// cannot transfer large images over high-latency networks within the repave
+// timeout.
+func grubHTTPDevice(serveURL string) (string, error) {
+	u, err := url.Parse(serveURL)
+	if err != nil {
+		return "", fmt.Errorf("parse serve url %q: %w", serveURL, err)
+	}
+
+	if u.Host == "" {
+		return "", fmt.Errorf("serve url %q has no host", serveURL)
+	}
+
+	return fmt.Sprintf("(http,%s)%s", u.Host, strings.TrimRight(u.EscapedPath(), "/")), nil
+}
 
 func ipAddresses(values []string) []string {
 	result := make([]string, 0, len(values))
