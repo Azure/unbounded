@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -43,6 +44,74 @@ func TestNSpawnConfig_RenderedSnapshot(t *testing.T) {
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 	})
+}
+
+func TestNSpawnRenderedScenarios(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]nspawnTemplateData{
+		"cpu-only": nspawnRenderScenarioData(),
+		"nvidia-gb300-rack-full": func() nspawnTemplateData {
+			data := nspawnRenderScenarioData()
+			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
+				"/dev/dri/card0",
+				"/dev/dri/card1",
+				"/dev/dri/card2",
+				"/dev/dri/card3",
+				"/dev/dri/card4",
+				"/dev/dri/renderD128",
+				"/dev/dri/renderD129",
+				"/dev/dri/renderD130",
+				"/dev/dri/renderD131",
+				"/dev/nvidia-modeset",
+				"/dev/nvidia-uvm",
+				"/dev/nvidia-uvm-tools",
+				"/dev/nvidia0",
+				"/dev/nvidia1",
+				"/dev/nvidia2",
+				"/dev/nvidia3",
+				"/dev/nvidiactl",
+				"/dev/nvidia-caps",
+				"/dev/nvidia-caps-imex-channels",
+			})
+			data.NvidiaLibDirMounts = []goalstates.NvidiaLibDirMount{
+				{
+					HostDir:      "/usr/lib/aarch64-linux-gnu",
+					ContainerDir: "/run/host-nvidia/0",
+				},
+				{
+					HostDir:      "/usr/lib/aarch64-linux-gnu/vdpau",
+					ContainerDir: "/run/host-nvidia/1",
+				},
+			}
+			data.NvidiaBinDir = "/usr/bin"
+
+			return data
+		}(),
+		"nvidia-all-helpers": func() nspawnTemplateData {
+			data := nspawnRenderScenarioData()
+			data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{
+				"/dev/nvidia0",
+				"/dev/nvidiactl",
+				"/dev/nvidia-uvm",
+				"/dev/dri/renderD128",
+			})
+			data.NvidiaBinDir = nvidiaHostBinDir(goalstates.NvidiaHost{
+				NvidiaSMIPath:     "/usr/bin/nvidia-smi",
+				NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
+				NvidiaIMEXCtlPath: "/usr/bin/nvidia-imex-ctl",
+			})
+
+			return data
+		}(),
+	}
+
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			requireRenderedGolden(t, name, data)
+		})
+	}
 }
 
 func TestServiceOverride_HostDevicesDeviceAllow(t *testing.T) {
@@ -155,7 +224,7 @@ func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
 
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
-		NvidiaGPUDevicePaths: []string{"/dev/nvidia0"},
+		NvidiaDeviceTargets: nvidiaNSpawnDeviceTargets([]string{"/dev/nvidia0"}),
 		NvidiaLibDirMounts: []goalstates.NvidiaLibDirMount{{
 			HostDir:      "/usr/lib/x86_64-linux-gnu",
 			ContainerDir: "/run/host-nvidia/0",
@@ -164,12 +233,13 @@ func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
 			HostDir:      "/usr/lib/i386-linux-gnu",
 			ContainerDir: "/run/host-nvidia-i386/0",
 		}},
-		NvidiaSMIDir: "/usr/bin",
+		NvidiaBinDir: "/usr/bin",
 	}))
 
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/x86_64-linux-gnu:/run/host-nvidia/0")
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/lib/i386-linux-gnu:/run/host-nvidia-i386/0")
 	require.Contains(t, buf.String(), "BindReadOnly=/usr/bin:/run/host-nvidia-bin")
+	require.NotContains(t, buf.String(), ":/run/nvidia/driver")
 }
 
 func TestNSpawnConfig_AdditionalHostMounts(t *testing.T) {
@@ -190,23 +260,37 @@ func TestNSpawnConfig_AdditionalHostMounts(t *testing.T) {
 func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	t.Parallel()
 
-	const channel = "/dev/nvidia-caps-imex-channels/channel0"
+	const channels = "/dev/nvidia-caps-imex-channels"
 
 	data := nspawnTemplateData{
 		MachineName:                  "kube1",
 		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
-		NvidiaGPUDevicePaths:         []string{channel},
+		NvidiaDeviceTargets:          nvidiaNSpawnDeviceTargets([]string{"/dev/nvidia-caps", channels}),
 	}
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
-	require.Contains(t, nspawnBuf.String(), "Bind="+channel)
+	require.Contains(t, nspawnBuf.String(), "Bind=/dev/nvidia-caps")
+	require.Contains(t, nspawnBuf.String(), "Bind="+channels)
 
 	var overrideBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
-	require.Contains(t, overrideBuf.String(), "DeviceAllow="+channel+" rwm")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps rwm")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-nvidia-caps-imex-channels rwm")
+	require.NotContains(t, overrideBuf.String(), "DeviceAllow=/dev/nvidia-caps rwm")
+	require.NotContains(t, overrideBuf.String(), "DeviceAllow="+channels+" rwm")
+	require.NotContains(t, overrideBuf.String(), "DevicePolicy=")
+}
+
+func TestNvidiaHostBinDirFallsBackToIMEX(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "/usr/bin", nvidiaHostBinDir(goalstates.NvidiaHost{
+		NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
+		NvidiaIMEXCtlPath: "/usr/bin/nvidia-imex-ctl",
+	}))
 }
 
 func TestPathsExcluding(t *testing.T) {
@@ -233,6 +317,40 @@ func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
 	// With no devices the drop-in must not contain any DeviceAllow lines,
 	// which is what keeps the existing golden snapshots unchanged.
 	require.NotContains(t, buf.String(), "DeviceAllow=")
+}
+
+func nspawnRenderScenarioData() nspawnTemplateData {
+	return nspawnTemplateData{
+		MachineName:                  "kube1",
+		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+	}
+}
+
+func requireRenderedGolden(t *testing.T, name string, data nspawnTemplateData) {
+	t.Helper()
+
+	for _, templateName := range []string{"nspawn.conf", "service-override.conf"} {
+		var buf bytes.Buffer
+		require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, templateName, data))
+		requireGolden(t, filepath.Join("testdata", "render", name+"."+templateName+".golden"), buf.String())
+	}
+}
+
+func requireGolden(t *testing.T, path, got string) {
+	t.Helper()
+
+	if os.Getenv("UPDATE_GOLDEN") == "1" {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(got), 0o644))
+
+		return
+	}
+
+	want, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, string(want), got)
 }
 
 func requireRenderedSnapshot(t *testing.T, goldenFile, templateName string, data nspawnTemplateData) string {
