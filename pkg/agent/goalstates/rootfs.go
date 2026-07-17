@@ -3,6 +3,8 @@
 
 package goalstates
 
+import "github.com/Azure/unbounded/pkg/agent/config"
+
 // RootFS defines the goal state of the machine root fs.
 // This goal state produces a rootfs that is ready for running a Kubernetes node
 // via systemd-nspawn from dir points to `.MachineDir`.
@@ -42,4 +44,8 @@ type RootFS struct {
 	// block storage, InfiniBand HCA). Device nodes are discovered at agent
 	// startup. Empty on hosts without any supported devices.
 	HostDevices HostDevices
+
+	// AdditionalHostMounts holds configured non-device host paths to be
+	// bind-mounted into the nspawn container.
+	AdditionalHostMounts []config.AdditionalHostMount
 }
