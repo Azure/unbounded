@@ -1265,6 +1265,11 @@ func metalmanDeployment(site *unboundedv1alpha3.Site, namespace string, cfg Conf
 		args = append(args, "--dhcp-auto-interface")
 	}
 
+	replicas := int32(1)
+	if site.Spec.Components.Metalman.Replicas != nil {
+		replicas = *site.Spec.Components.Metalman.Replicas
+	}
+
 	env := []corev1.EnvVar{{
 		// Metalman resolves its leader-election lease namespace from
 		// POD_NAMESPACE so the lease and its namespace-scoped RBAC stay
@@ -1300,7 +1305,7 @@ func metalmanDeployment(site *unboundedv1alpha3.Site, namespace string, cfg Conf
 			OwnerReferences: []metav1.OwnerReference{siteOwnerReference(site)},
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptrInt32(1),
+			Replicas: &replicas,
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateDeployment{
@@ -1383,8 +1388,4 @@ func toUnstructured(obj client.Object) *unstructured.Unstructured {
 	}
 
 	return &unstructured.Unstructured{Object: objectMap}
-}
-
-func ptrInt32(value int32) *int32 {
-	return &value
 }

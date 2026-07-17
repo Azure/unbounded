@@ -40,6 +40,7 @@ func TestDeepCopySiteAndList(t *testing.T) {
 	enabled := true
 	priority := int32(10)
 	detectMultiplier := int32(3)
+	replicas := int32(3)
 	receive := intstr.FromString("300ms")
 	transmit := intstr.FromInt(400)
 
@@ -72,6 +73,7 @@ func TestDeepCopySiteAndList(t *testing.T) {
 				Metalman: &MetalmanComponentSpec{
 					SiteComponentSpec: SiteComponentSpec{Enabled: &enabled},
 					DHCPAutoInterface: &enabled,
+					Replicas:          &replicas,
 				},
 			},
 		},
@@ -96,6 +98,7 @@ func TestDeepCopySiteAndList(t *testing.T) {
 	site.Spec.NodeCidrs[0] = "10.99.0.0/16"
 	site.Spec.PodCidrAssignments[0].CidrBlocks[0] = "10.250.0.0/16"
 	site.Spec.HealthCheckSettings.DetectMultiplier = ptrInt32(9)
+	site.Spec.Components.Metalman.Replicas = ptrInt32(5)
 	site.Status.Conditions[0].Status = metav1.ConditionFalse
 
 	if copied.Spec.NodeCidrs[0] != "10.0.0.0/16" {
@@ -108,6 +111,10 @@ func TestDeepCopySiteAndList(t *testing.T) {
 
 	if copied.Spec.HealthCheckSettings.DetectMultiplier == nil || *copied.Spec.HealthCheckSettings.DetectMultiplier != 3 {
 		t.Fatalf("expected deep-copied health check settings to be isolated")
+	}
+
+	if copied.Spec.Components.Metalman.Replicas == nil || *copied.Spec.Components.Metalman.Replicas != 3 {
+		t.Fatalf("expected deep-copied Metalman replicas to be isolated")
 	}
 
 	if copied.Status.Conditions[0].Status != metav1.ConditionTrue {
