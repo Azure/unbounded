@@ -509,6 +509,46 @@ jobs:
             kubectl -n "$NS" rollout status "$1/$2" --timeout=5m
           done
 
+      - name: Diagnose failed rollout
+        # Runs only when a prior step failed (e.g. the operator never created a
+        # component workload). The operator is what materializes net/machina/etc.
+        # in unbounded-system, so its logs and the Site status are the ground
+        # truth. Every command is best-effort so diagnostics never mask the real
+        # failure. Explicitly surfaces the applied component images because an
+        # empty/invalid image is silently rejected by the API server, which
+        # presents as a workload that "never gets created".
+        if: failure()
+        run: |
+          set +e
+          NS=unbounded-system
+          echo "::group::Site CRDs"
+          kubectl get crd sites.unbounded-cloud.io sites.net.unbounded-cloud.io 2>&1
+          echo "::endgroup::"
+          echo "::group::Sites (new + legacy)"
+          kubectl get sites.unbounded-cloud.io -o wide 2>&1
+          kubectl get sites.unbounded-cloud.io -o yaml 2>&1
+          kubectl get sites.net.unbounded-cloud.io -A -o wide 2>&1
+          echo "::endgroup::"
+          echo "::group::Workloads in ${NS}"
+          kubectl -n "$NS" get deploy,ds,pods -o wide 2>&1
+          echo "::endgroup::"
+          echo "::group::Applied component images"
+          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller"; do
+            img=$(kubectl -n "$NS" get "$kn" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null)
+            printf '%s image=[%s]\n' "$kn" "$img"
+          done
+          echo "::endgroup::"
+          echo "::group::Operator config"
+          kubectl -n "$NS" get configmap unbounded-operator-config -o yaml 2>&1
+          echo "::endgroup::"
+          echo "::group::Operator logs"
+          kubectl -n "$NS" logs deploy/unbounded-operator --all-containers --tail=300 2>&1
+          echo "::endgroup::"
+          echo "::group::Recent events in ${NS}"
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>&1 | tail -60
+          echo "::endgroup::"
+          exit 0
+
       - name: Summarize deploy
         if: always()
         run: |
