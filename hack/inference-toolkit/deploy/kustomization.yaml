@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: inference-system
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - leaderworkerset.yaml
+  - service.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/name: vllm
+      app.kubernetes.io/instance: qwen3-235b-2x8
+      app.kubernetes.io/part-of: inference-toolkit
+      app.kubernetes.io/managed-by: kustomize
+      app.kubernetes.io/version: v0.25.1
+    includeSelectors: false
+images:
+  - name: docker.io/vllm/vllm-openai
+    newTag: v0.25.1
+    digest: sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089
