@@ -326,6 +326,10 @@ name = "b"
         debounce_loop_with_receiver(path, update_tx, shutdown, |_| {
             events.pop_front().expect("scripted receive result")
         });
+        assert!(
+            events.is_empty(),
+            "the debounce loop should consume the scripted burst completely",
+        );
 
         let updates: Vec<_> = update_rx.iter().collect();
         assert_eq!(updates.len(), 1, "the burst must emit exactly one update");
