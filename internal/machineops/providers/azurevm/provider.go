@@ -16,11 +16,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	azurev1alpha1 "github.com/Azure/unbounded/api/providers/azure/v1alpha1"
 	"github.com/Azure/unbounded/internal/machineops"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
@@ -63,7 +60,6 @@ var azureVMOperations = map[unboundedv1alpha3.OperationKind]azureVMOperation{
 type Provider struct {
 	NewClient         azureVMClientFactory
 	NewClientWithAuth azureVMClientFactoryWithAuth
-	KubeClient        client.Reader
 }
 
 func (p *Provider) Name() string {
@@ -73,11 +69,7 @@ func (p *Provider) Name() string {
 // Registration returns this Azure adapter's MachineOperation lifecycle
 // registration.
 func (p *Provider) Registration() (*publicmachineops.Provider, error) {
-	options := make([]publicmachineops.ProviderOption, 0, len(azureVMOperations)+1)
-
-	options = append(options, publicmachineops.WithProviderMachineKind(
-		azurev1alpha1.GroupVersion.WithKind(azurev1alpha1.AzureMachineKind).GroupKind(),
-	))
+	options := make([]publicmachineops.ProviderOption, 0, len(azureVMOperations))
 
 	for kind := range azureVMOperations {
 		operationOptions := []publicmachineops.OperationOption(nil)
@@ -100,7 +92,7 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 		return machineops.OperationResult{}, fmt.Errorf("unsupported Azure VM operation %q", request.Operation)
 	}
 
-	ref, err := p.resourceRef(ctx, request)
+	ref, err := parseAzureVMProviderID(request.ProviderID)
 	if err != nil {
 		return machineops.OperationResult{}, err
 	}
@@ -114,56 +106,6 @@ func (p *Provider) Execute(ctx context.Context, request machineops.OperationRequ
 	}
 
 	return machineops.OperationResult{}, operation(ctx, client, ref)
-}
-
-func (p *Provider) resourceRef(ctx context.Context, request machineops.OperationRequest) (azureVMResourceRef, error) {
-	if request.ProviderRef == nil {
-		return parseAzureVMProviderID(request.ProviderID)
-	}
-
-	if p.KubeClient == nil {
-		return azureVMResourceRef{}, fmt.Errorf("kubernetes client is required for AzureMachine providerRef")
-	}
-
-	expectedGroupKind := azurev1alpha1.GroupVersion.WithKind(azurev1alpha1.AzureMachineKind).GroupKind()
-	if request.ProviderRef.APIGroup != expectedGroupKind.Group || request.ProviderRef.Kind != expectedGroupKind.Kind {
-		return azureVMResourceRef{}, fmt.Errorf("providerRef must identify %s", expectedGroupKind)
-	}
-
-	var azureMachine azurev1alpha1.AzureMachine
-	if err := p.KubeClient.Get(ctx, client.ObjectKey{Name: request.ProviderRef.Name}, &azureMachine); err != nil {
-		return azureVMResourceRef{}, fmt.Errorf("get AzureMachine %s: %w", request.ProviderRef.Name, err)
-	}
-
-	if azureMachine.UID != request.ProviderRef.UID {
-		return azureVMResourceRef{}, fmt.Errorf("AzureMachine %s UID changed from %s to %s", azureMachine.Name, request.ProviderRef.UID, azureMachine.UID)
-	}
-
-	if azureMachine.Generation != request.ProviderRef.Generation {
-		return azureVMResourceRef{}, fmt.Errorf("AzureMachine %s generation changed from %d to %d", azureMachine.Name, request.ProviderRef.Generation, azureMachine.Generation)
-	}
-
-	if err := validateAzureMachineOwner(&azureMachine, request); err != nil {
-		return azureVMResourceRef{}, err
-	}
-
-	return parseAzureVMProviderID(azureMachine.Spec.ResourceID)
-}
-
-func validateAzureMachineOwner(azureMachine *azurev1alpha1.AzureMachine, request machineops.OperationRequest) error {
-	owner := metav1.GetControllerOf(azureMachine)
-	if owner == nil {
-		return fmt.Errorf("AzureMachine %s must have its Unbounded Machine as controller owner", azureMachine.Name)
-	}
-
-	if owner.APIVersion != unboundedv1alpha3.GroupVersion.String() ||
-		owner.Kind != "Machine" ||
-		owner.Name != request.MachineName ||
-		owner.UID != request.MachineUID {
-		return fmt.Errorf("AzureMachine %s controller owner does not match Machine %s", azureMachine.Name, request.MachineName)
-	}
-
-	return nil
 }
 
 func (p *Provider) client(subscriptionID string, auth *machineops.OperationAuth) (azureVMClient, error) {

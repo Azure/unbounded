@@ -36,10 +36,15 @@ func permanentTargetInputError(err error) error {
 }
 
 func validateProviderReference(machine *unboundedv1alpha3.Machine, provider *publicmachineops.Provider) error {
-	providerRef := machine.Spec.ProviderRef
+	host, err := resolveMachineHost(machine)
+	if err != nil {
+		return err
+	}
+
+	providerRef := host.machineRef
 	if providerRef == nil {
-		if strings.TrimSpace(machine.Spec.ProviderID) == "" {
-			return fmt.Errorf("machine %s must set spec.providerRef or legacy spec.providerID", machine.Name)
+		if strings.TrimSpace(host.providerID) == "" {
+			return fmt.Errorf("machine %s must set a host providerID or machineRef", machine.Name)
 		}
 
 		return nil
@@ -48,12 +53,12 @@ func validateProviderReference(machine *unboundedv1alpha3.Machine, provider *pub
 	if strings.TrimSpace(providerRef.APIGroup) == "" ||
 		strings.TrimSpace(providerRef.Kind) == "" ||
 		strings.TrimSpace(providerRef.Name) == "" {
-		return fmt.Errorf("machine %s spec.providerRef must set apiGroup, kind, and name", machine.Name)
+		return fmt.Errorf("machine %s host machineRef must set apiGroup, kind, and name", machine.Name)
 	}
 
 	expected, ok := provider.ProviderMachineKind()
 	if !ok {
-		return fmt.Errorf("provider %s does not accept spec.providerRef", provider.Name())
+		return fmt.Errorf("provider %s does not accept host.external.machineRef", provider.Name())
 	}
 
 	actual := schema.GroupKind{Group: providerRef.APIGroup, Kind: providerRef.Kind}
@@ -97,8 +102,13 @@ func (r *MachineOperationReconciler) resolveOperationTargetInput(
 ) (*unboundedv1alpha3.MachineOperationTargetInput, error) {
 	input := &unboundedv1alpha3.MachineOperationTargetInput{}
 
-	if machine.Spec.ProviderRef != nil {
-		providerRef, err := r.snapshotProviderMachine(ctx, machine.Spec.ProviderRef)
+	host, err := resolveMachineHost(machine)
+	if err != nil {
+		return nil, permanentTargetInputError(err)
+	}
+
+	if host.machineRef != nil {
+		providerRef, err := r.snapshotProviderMachine(ctx, host.machineRef)
 		if err != nil {
 			return nil, err
 		}

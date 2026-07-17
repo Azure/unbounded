@@ -333,8 +333,8 @@ spec:
                           type: string
                         providerRef:
                           description: |-
-                            ProviderRef identifies the exact provider-owned resource observed when the
-                            operation target was initialized.
+                            ProviderRef identifies the exact provider-owned resource referenced by
+                            host.external.machineRef when the operation target was initialized.
                           properties:
                             apiGroup:
                               description: APIGroup is the API group of the provider-owned

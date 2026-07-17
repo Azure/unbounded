@@ -63,7 +63,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return fmt.Errorf("no node for source IP %s: %w", ip, err)
 	}
 
-	if node.Spec.PXE == nil {
+	if node.Spec.Netboot() == nil {
 		log.Warn("node has no PXE config", "node", node.Name)
 		return fmt.Errorf("node %s has no PXE config", node.Name)
 	}
@@ -113,7 +113,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 }
 
 func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, filename string) {
-	if node == nil || t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), filename) {
+	if node == nil || t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(imageRef, node.Spec.Netboot().TargetArchitecture(), filename) {
 		return
 	}
 

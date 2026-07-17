@@ -45,34 +45,35 @@ SSH connection details. When `ssh` is nil, the machina controller skips the Mach
 | `ssh.bastion.username` | string | No | `"azureuser"` | Bastion SSH username. |
 | `ssh.bastion.privateKeyRef` | *SecretKeySelector | No | Same as `ssh.privateKeyRef` | Bastion SSH key. Falls back to the parent `ssh.privateKeyRef` when omitted. |
 
-### spec.pxe
+### spec.host.netboot
 
-PXE boot configuration consumed by the metalman controller.
+Network boot configuration consumed by the Metalman controller. The released
+top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `pxe` | PXESpec | No | - | PXE boot configuration. |
-| `pxe.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
-| `pxe.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
-| `pxe.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
-| `pxe.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
-| `pxe.dhcpLeases` | []DHCPLease | No | - | Provisioning network settings. They are served as static DHCP leases during PXE boot and used for Redfish firmware, installer, NoCloud, and installed-system static configuration during HTTP boot. |
-| `pxe.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
-| `pxe.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
-| `pxe.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
-| `pxe.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
-| `pxe.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
-| `pxe.targetDisk` | string | No | Installer-selected | Block device the installer writes the machine image to, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. When omitted, the initrd selects a disk automatically. |
-| `pxe.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
-| `pxe.redfish.url` | string | Yes | - | Redfish endpoint URL. |
-| `pxe.redfish.username` | string | Yes | - | Redfish username. |
-| `pxe.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
-| `pxe.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. |
-| `pxe.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for PXE-booted machines. |
-| `pxe.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | - | Reference to a ConfigMap containing custom cloud-init user-data. |
-| `pxe.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
-| `pxe.cloudInit.userDataConfigMapRef.namespace` | string | Yes | - | ConfigMap namespace. |
-| `pxe.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
+| `host.netboot` | PXESpec | No | - | PXE boot configuration. |
+| `host.netboot.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
+| `host.netboot.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
+| `host.netboot.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
+| `host.netboot.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
+| `host.netboot.dhcpLeases` | []DHCPLease | No | - | Provisioning network settings. They are served as static DHCP leases during PXE boot and used for Redfish firmware, installer, NoCloud, and installed-system static configuration during HTTP boot. |
+| `host.netboot.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
+| `host.netboot.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
+| `host.netboot.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
+| `host.netboot.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
+| `host.netboot.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
+| `host.netboot.targetDisk` | string | No | Installer-selected | Block device the installer writes the machine image to, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. When omitted, the initrd selects a disk automatically. |
+| `host.netboot.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
+| `host.netboot.redfish.url` | string | Yes | - | Redfish endpoint URL. |
+| `host.netboot.redfish.username` | string | Yes | - | Redfish username. |
+| `host.netboot.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
+| `host.netboot.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. |
+| `host.netboot.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for PXE-booted machines. |
+| `host.netboot.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | - | Reference to a ConfigMap containing custom cloud-init user-data. |
+| `host.netboot.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
+| `host.netboot.cloudInit.userDataConfigMapRef.namespace` | string | Yes | - | ConfigMap namespace. |
+| `host.netboot.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
 
 ### spec.kubernetes
 
@@ -86,24 +87,21 @@ Kubernetes join configuration.
 | `kubernetes.nodeLabels` | map[string]string | No | - | Labels to apply to the Node (not yet propagated by the machina controller). |
 | `kubernetes.bootstrapTokenRef.name` | string | Yes | - | Name of the bootstrap token Secret in `kube-system`. |
 
-### spec.provider, spec.providerRef, and spec.host
+### spec.host
 
-`provider` selects the external control provider for out-of-band operations.
-Built-in providers are `AzureVM` and `OCIInstance`, and provider-specific
-controllers may use their own non-empty provider names. `providerRef` identifies
-the cluster-scoped, provider-owned Machine resource that contains typed
-provider-specific state. The reference may be populated during migration, then
-is immutable. `providerID` remains available temporarily for providers and
-Machines that have not migrated.
+`host` groups host ownership and the desired host image. New Machines select at
+most one of `netboot`, `azure`, or `external`. This keeps built-in host identity
+on the Machine while preserving `external.machineRef` as an escape hatch for
+providers whose own CRD has meaningful schema, status, or reconciliation.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `provider` | string | For external operations | -- | External control provider, such as `AzureVM`, `OCIInstance`, or a provider-specific value handled by a custom controller. |
-| `providerRef.apiGroup` | string | For ref-based providers | -- | API group of the provider-owned Machine resource. |
-| `providerRef.kind` | string | For ref-based providers | -- | Kind registered by the selected provider. |
-| `providerRef.name` | string | For ref-based providers | -- | Name of the cluster-scoped provider-owned Machine resource. |
-| `providerID` | string | For legacy providers | -- | Deprecated provider-specific resource ID such as `azure:///subscriptions/.../virtualMachines/name` or `oci://ocid1.instance...`. |
 | `host.image` | string | No | Preserve current image | Opaque image identifier interpreted by the selected provider. |
+| `host.netboot` | PXESpec | For new Metalman Machines | -- | Network boot image, DHCP, Redfish, and cloud-init settings owned by Metalman. |
+| `host.azure.resourceID` | string | For Azure VMs | -- | Immutable full Azure Resource Manager VM ID. The provider is inferred as `AzureVM`. |
+| `host.external.provider` | string | For external hosts | -- | Registered provider controller and credential key, such as `OCIInstance`, `ANS`, or a private provider. |
+| `host.external.providerID` | string | Provider-dependent | -- | Opaque provider identity; mutable only to support provider replacement handoff. |
+| `host.external.machineRef` | ProviderMachineReference | Provider-dependent | -- | Optional cluster-scoped provider-owned resource for rich provider state. |
 
 If `spec.host.image` is omitted, a `HostReplace` inherits
 `MachineConfigurationVersion.spec.template.host.image`. If both are omitted,
@@ -112,27 +110,22 @@ in the `MachineOperation` target before provider execution. Updating desired
 image state does not initiate replacement; only an explicit `HostReplace`
 MachineOperation authorizes that destructive action.
 
-The built-in Azure provider uses this companion resource:
+The built-in Azure provider stores its single machine-specific value inline:
 
 ```yaml
-apiVersion: azure.unbounded-cloud.io/v1alpha1
-kind: AzureMachine
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
 metadata:
   name: worker-01
-  ownerReferences:
-  - apiVersion: unbounded-cloud.io/v1alpha3
-    kind: Machine
-    name: worker-01
-    uid: <machine-uid>
-    controller: true
 spec:
-  resourceID: /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Compute/virtualMachines/worker-01
+  host:
+    azure:
+      resourceID: /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Compute/virtualMachines/worker-01
 ```
 
-The corresponding Machine sets `spec.provider: AzureVM` and references this
-object from `spec.providerRef`. During migration, Azure falls back to
-`spec.providerID` only when `providerRef` is absent. When both exist,
-`providerRef` is authoritative.
+The released top-level `spec.pxe`, `spec.provider`, and `spec.providerID` fields
+remain readable as deprecated fallbacks. New host ownership cannot be mixed
+with those legacy fields. Migration tooling is intentionally separate.
 
 Machine operation credentials are selected by the Machine site label. Providers that support OIDC/workload identity use `WorkloadIdentity`; providers or sites that need provider-specific credential material use `ExternalPlugin` with a referenced Secret.
 Custom Go controllers register the operations they support with
@@ -144,10 +137,11 @@ replacement bootstrap, and cleanup behavior. The controller is installed with
 `MachineOperation` status directly. Long-running begin callbacks must be
 idempotent for `OperationRequest.OperationUID` because the controller may call
 them again until their operation handle has been persisted. `OperationRequest`
-contains the exact provider resource UID and generation, resolved host image,
-and observed Machine generation frozen in target status. Legacy providers
-continue to receive the current `Machine.spec.providerID`. Host operations
-targeting the same Machine are serialized.
+contains the exact external machine resource UID and generation, resolved host
+image, and observed Machine generation frozen in target status. Providers
+receive the canonical `host.external.providerID` or Azure resource ID; legacy
+Machines continue to supply `Machine.spec.providerID`. Host operations targeting
+the same Machine are serialized.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -224,14 +218,15 @@ The OCI instance provider handles:
 | `HostReboot` | `RESET` |
 | `HostPowerOff` | `STOP` |
 | `HostPowerOn` | `START` |
-| `HostReplace` | `STOP` old instance, `LaunchInstance` replacement, patch `Machine.spec.providerID`, then terminate old instance |
+| `HostReplace` | `STOP` old instance, `LaunchInstance` replacement, patch `Machine.spec.host.external.providerID`, then terminate old instance |
 
-`HostReplace` for `OCIInstance` creates a replacement instance because OCI launch `user_data` is immutable after instance creation. The controller stops the old instance, launches a new instance in the same availability domain, subnet, shape, and fault domain, requests a public IP for bootstrap egress, patches `Machine.spec.providerID` to the new instance OCID after the replacement reaches `RUNNING`, and then terminates the old instance. The replacement reuses the original `Machine` name as the kubelet node name so it rejoins through the existing Kubernetes `Node` object. Operation completion means the replacement is running, provider ID handoff succeeded, and old-instance cleanup succeeded; it does not wait for the Kubernetes `Node` to become Ready.
+`HostReplace` for `OCIInstance` creates a replacement instance because OCI launch `user_data` is immutable after instance creation. The controller stops the old instance, launches a new instance in the same availability domain, subnet, shape, and fault domain, requests a public IP for bootstrap egress, patches `Machine.spec.host.external.providerID` to the new instance OCID after the replacement reaches `RUNNING`, and then terminates the old instance. The replacement reuses the original `Machine` name as the kubelet node name so it rejoins through the existing Kubernetes `Node` object. Operation completion means the replacement is running, provider ID handoff succeeded, and old-instance cleanup succeeded; it does not wait for the Kubernetes `Node` to become Ready.
 
 The OCI replacement flow copies display name, defined tags, freeform tags, selected agent/availability/shape settings, and primary VNIC subnet/NSG/source-destination-check settings. It adds Unbounded freeform tags for idempotent retry lookup. It does not preserve the exact private IP, boot volume, or attached data volumes; active attached data volumes fail the operation before the old instance is stopped. An omitted host image preserves the source instance image. `spec.parameters.imageID` remains as a temporary compatibility override, while new callers should use the Machine or MachineConfiguration host image. Set `spec.parameters.sshAuthorizedKeys` to append SSH authorized keys to replacement metadata for break-glass debugging.
 
-Metalman handles bare-metal host operations for Machines with `spec.pxe.redfish`
-and no external `spec.provider`/`spec.providerID`. Bare-metal host operations may
+Metalman handles bare-metal host operations for Machines with
+`spec.host.netboot.redfish` (or deprecated `spec.pxe.redfish`) and no external
+host owner. Bare-metal host operations may
 target one Machine with `spec.machineRef` or a site-scoped set of Machines with
 `spec.machineSelector`. Selector-based bare-metal host operations must select a
 single metalman site with `unbounded-cloud.io/site=<site>`.
@@ -359,8 +354,9 @@ kind: Machine
 metadata:
   name: azure-worker-01
 spec:
-  provider: AzureVM
-  providerID: azure:///subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-workers/providers/Microsoft.Compute/virtualMachines/azure-worker-01
+  host:
+    azure:
+      resourceID: /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-workers/providers/Microsoft.Compute/virtualMachines/azure-worker-01
   configurationRef:
     name: azure-workers
 ```
@@ -384,8 +380,10 @@ kind: Machine
 metadata:
   name: oci-worker-01
 spec:
-  provider: OCIInstance
-  providerID: oci://ocid1.instance.oc1...
+  host:
+    external:
+      provider: OCIInstance
+      providerID: oci://ocid1.instance.oc1...
   configurationRef:
     name: oci-workers
 ```
@@ -416,26 +414,27 @@ spec:
     privateKeyRef:
       name: ssh-key
       namespace: unbounded-system
-  pxe:
-    image: ghcr.io/azure/host-ubuntu2404:v1
-    architecture: amd64
-    dhcpLeases:
-    - ipv4: "10.0.0.60"
-      mac: "aa:bb:cc:dd:ee:ff"
-      subnetMask: "255.255.255.0"
-      gateway: "10.0.0.1"
-      dns:
-      - "8.8.8.8"
-    redfish:
-      url: "https://bmc-01.example.com"
-      username: admin
-      passwordRef:
-        name: bmc-password
-        namespace: unbounded-system
-    cloudInit:
-      userDataConfigMapRef:
-        name: my-cloud-init
-        namespace: unbounded-system
+  host:
+    netboot:
+      image: ghcr.io/azure/host-ubuntu2404:v1
+      architecture: amd64
+      dhcpLeases:
+      - ipv4: "10.0.0.60"
+        mac: "aa:bb:cc:dd:ee:ff"
+        subnetMask: "255.255.255.0"
+        gateway: "10.0.0.1"
+        dns:
+        - "8.8.8.8"
+      redfish:
+        url: "https://bmc-01.example.com"
+        username: admin
+        passwordRef:
+          name: bmc-password
+          namespace: unbounded-system
+      cloudInit:
+        userDataConfigMapRef:
+          name: my-cloud-init
+          namespace: unbounded-system
   kubernetes:
     version: v1.34.0
     bootstrapTokenRef:
@@ -447,10 +446,10 @@ spec:
 ## PXE OCI Images
 
 Metalman uses a machine image and a netboot image for PXE repaves. The machine
-image is referenced by `spec.pxe.image` and contains `/disk/disk.img.gz`. The
-netboot image is referenced by `spec.pxe.netbootImage`, or by Metalman's default
+image is referenced by `spec.host.netboot.image` and contains `/disk/disk.img.gz`. The
+netboot image is referenced by `spec.host.netboot.netbootImage`, or by Metalman's default
 when that field is omitted, and contains the reusable PXE boot environment.
-`spec.pxe.architecture` selects the OCI platform manifest to pull for both
+`spec.host.netboot.architecture` selects the OCI platform manifest to pull for both
 images and defaults to `amd64`.
 
 Both images are standard OCI container images built `FROM scratch` with artifacts
@@ -481,7 +480,7 @@ Templates receive the following data object:
 The default netboot template passes `.BootLease.MAC` as `unbounded.boot_mac`.
 The installer initrd uses that MAC address to configure the provisioning
 interface instead of relying on kernel interface names such as `eth0`.
-If `spec.pxe.targetDisk` is set, the template passes it as `unbounded.disk`;
+If `spec.host.netboot.targetDisk` is set, the template passes it as `unbounded.disk`;
 otherwise the installer falls back to automatic disk selection.
 
 ### Building images
@@ -506,10 +505,10 @@ httpBootPath: shimx64.efi
 ```
 
 The `dhcpBootImageName` field specifies the boot filename included in DHCP
-responses (option 67) for `spec.pxe.bootProtocol: PXE`.
+responses (option 67) for `spec.host.netboot.bootProtocol: PXE`.
 
 The `httpBootPath` field specifies the file path, relative to metalman's HTTP
-artifact server, used for `spec.pxe.bootProtocol: HTTP`. If `httpBootPath` is
+artifact server, used for `spec.host.netboot.bootProtocol: HTTP`. If `httpBootPath` is
 omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
 
 ---

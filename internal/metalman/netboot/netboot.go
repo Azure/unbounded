@@ -77,23 +77,23 @@ type FileResolver struct {
 }
 
 func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
-	if node == nil || node.Spec.PXE == nil {
+	if node == nil || node.Spec.Netboot() == nil {
 		return ""
 	}
 
-	if node.Spec.PXE.NetbootImage != "" {
-		return node.Spec.PXE.NetbootImage
+	if node.Spec.Netboot().NetbootImage != "" {
+		return node.Spec.Netboot().NetbootImage
 	}
 
 	if f.DefaultNetbootRef != "" {
 		return f.DefaultNetbootRef
 	}
 
-	return node.Spec.PXE.Image
+	return node.Spec.Netboot().Image
 }
 
 func (f *FileResolver) HTTPBootPath(node *v1alpha3.Machine) (string, error) {
-	if node == nil || node.Spec.PXE == nil {
+	if node == nil || node.Spec.Netboot() == nil {
 		return "", fmt.Errorf("node has no PXE config")
 	}
 
@@ -106,7 +106,7 @@ func (f *FileResolver) HTTPBootPath(node *v1alpha3.Machine) (string, error) {
 		return "", fmt.Errorf("OCI cache is not configured")
 	}
 
-	meta, err := f.Cache.MetadataForRefArchitecture(imageRef, node.Spec.PXE.TargetArchitecture())
+	meta, err := f.Cache.MetadataForRefArchitecture(imageRef, node.Spec.Netboot().TargetArchitecture())
 	if err != nil {
 		return "", err
 	}
@@ -201,8 +201,8 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 	}
 
 	architecture := v1alpha3.DefaultPXEArchitecture
-	if node != nil && node.Spec.PXE != nil {
-		architecture = node.Spec.PXE.TargetArchitecture()
+	if node != nil && node.Spec.Netboot() != nil {
+		architecture = node.Spec.Netboot().TargetArchitecture()
 	}
 
 	diskPath, isTemplate, err := f.Cache.ResolvePathForArchitecture(imageRef, architecture, path)
@@ -268,11 +268,11 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 }
 
 func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v1alpha3.Machine) ([]byte, bool, error) {
-	if node.Spec.PXE == nil || node.Spec.PXE.CloudInit == nil || node.Spec.PXE.CloudInit.UserDataConfigMapRef == nil {
+	if node.Spec.Netboot() == nil || node.Spec.Netboot().CloudInit == nil || node.Spec.Netboot().CloudInit.UserDataConfigMapRef == nil {
 		return nil, false, nil
 	}
 
-	ref := node.Spec.PXE.CloudInit.UserDataConfigMapRef
+	ref := node.Spec.Netboot().CloudInit.UserDataConfigMapRef
 
 	var cm corev1.ConfigMap
 	if err := f.Reader.Get(ctx, client.ObjectKey{
@@ -337,17 +337,17 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 }
 
 func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {
-	if node == nil || node.Spec.PXE == nil || len(node.Spec.PXE.DHCPLeases) == 0 {
+	if node == nil || node.Spec.Netboot() == nil || len(node.Spec.Netboot().DHCPLeases) == 0 {
 		return nil
 	}
 
-	for i := range node.Spec.PXE.DHCPLeases {
-		if node.Spec.PXE.DHCPLeases[i].IPv4 == requestIP {
-			return &node.Spec.PXE.DHCPLeases[i]
+	for i := range node.Spec.Netboot().DHCPLeases {
+		if node.Spec.Netboot().DHCPLeases[i].IPv4 == requestIP {
+			return &node.Spec.Netboot().DHCPLeases[i]
 		}
 	}
 
-	return &node.Spec.PXE.DHCPLeases[0]
+	return &node.Spec.Netboot().DHCPLeases[0]
 }
 
 func (f *FileResolver) installRequested(ctx context.Context, node *v1alpha3.Machine) (bool, error) {

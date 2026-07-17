@@ -238,7 +238,7 @@ func (r *Reconciler) resolveTargets(ctx context.Context, op *v1alpha3.MachineOpe
 			return nil, nil
 		}
 
-		if machine.Spec.Provider != "" || machine.Spec.ProviderID != "" {
+		if isExternalProviderMachine(&machine) {
 			return nil, nil
 		}
 
@@ -590,7 +590,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 }
 
 func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, machine *v1alpha3.Machine) error {
-	if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+	if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
 		bootURL, staticConfig, err := r.httpBootConfig(machine)
 		if err != nil {
 			return err
@@ -625,11 +625,11 @@ func (r *Reconciler) httpBootConfig(machine *v1alpha3.Machine) (string, redfish.
 }
 
 func httpBootStaticNetworkConfig(machine *v1alpha3.Machine) (redfish.StaticIPv4Config, error) {
-	if machine.Spec.PXE == nil || len(machine.Spec.PXE.DHCPLeases) == 0 {
-		return redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot requires at least one static lease in spec.pxe.dhcpLeases")
+	if machine.Spec.Netboot() == nil || len(machine.Spec.Netboot().DHCPLeases) == 0 {
+		return redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot requires at least one static lease in spec.host.netboot.dhcpLeases")
 	}
 
-	lease := machine.Spec.PXE.DHCPLeases[0]
+	lease := machine.Spec.Netboot().DHCPLeases[0]
 	config := redfish.StaticIPv4Config{
 		MAC:        lease.MAC,
 		Address:    lease.IPv4,
@@ -715,7 +715,7 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 		target.LastAttemptAt = nil
 	}
 
-	if machine.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+	if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
 		if _, _, err := r.httpBootConfig(machine); err != nil {
 			if errors.Is(err, netboot.ErrNotYetDownloaded) {
 				target.Message = "waiting for OCI image to become available"
@@ -989,11 +989,11 @@ func (r *Reconciler) addTargetConflictKeys(ctx context.Context, keys map[string]
 func addMachineConflictKeys(keys map[string]struct{}, machine *v1alpha3.Machine) {
 	keys["machine:"+machine.Name] = struct{}{}
 
-	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil || machine.Spec.PXE.Redfish.URL == "" {
+	if machine.Spec.Netboot() == nil || machine.Spec.Netboot().Redfish == nil || machine.Spec.Netboot().Redfish.URL == "" {
 		return
 	}
 
-	keys["redfish:"+normalizeRedfishURL(machine.Spec.PXE.Redfish.URL)] = struct{}{}
+	keys["redfish:"+normalizeRedfishURL(machine.Spec.Netboot().Redfish.URL)] = struct{}{}
 }
 
 func isTerminalTarget(target v1alpha3.MachineOperationTargetStatus) bool {
@@ -1125,7 +1125,15 @@ func (r *Reconciler) ownsMachine(machine *v1alpha3.Machine) bool {
 }
 
 func isBareMetalRedfishMachine(machine *v1alpha3.Machine) bool {
-	return machine.Spec.Provider == "" && machine.Spec.ProviderID == "" && machine.Spec.PXE != nil && machine.Spec.PXE.Redfish != nil
+	return !isExternalProviderMachine(machine) && machine.Spec.Netboot() != nil && machine.Spec.Netboot().Redfish != nil
+}
+
+func isExternalProviderMachine(machine *v1alpha3.Machine) bool {
+	if machine.Spec.Provider != "" || machine.Spec.ProviderID != "" {
+		return true
+	}
+
+	return machine.Spec.Host != nil && (machine.Spec.Host.Azure != nil || machine.Spec.Host.External != nil)
 }
 
 func isHostOperation(operation v1alpha3.OperationKind) bool {

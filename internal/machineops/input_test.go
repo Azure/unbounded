@@ -35,7 +35,7 @@ func TestResolveHostImage(t *testing.T) {
 		Spec: unboundedv1alpha3.MachineConfigurationVersionSpec{
 			Version: version,
 			Template: unboundedv1alpha3.MachineConfigurationTemplate{
-				Host: &unboundedv1alpha3.HostSpec{Image: "configuration-image"},
+				Host: &unboundedv1alpha3.MachineConfigurationHostSpec{Image: "configuration-image"},
 			},
 		},
 	}

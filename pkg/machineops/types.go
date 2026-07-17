@@ -20,13 +20,15 @@ type OperationRequest struct {
 	MachineGeneration int64
 	OperationName     string
 	OperationUID      types.UID
-	ProviderRef       *unboundedv1alpha3.ProviderMachineSnapshot
-	ProviderID        string
-	HostImage         string
-	Operation         unboundedv1alpha3.OperationKind
-	Parameters        map[string]string
-	ReplaceUserData   string
-	Auth              *OperationAuth
+	// ProviderRef snapshots Machine.spec.host.external.machineRef when present.
+	ProviderRef *unboundedv1alpha3.ProviderMachineSnapshot
+	// ProviderID is the current canonical or legacy provider-specific host ID.
+	ProviderID      string
+	HostImage       string
+	Operation       unboundedv1alpha3.OperationKind
+	Parameters      map[string]string
+	ReplaceUserData string
+	Auth            *OperationAuth
 }
 
 // OperationAuth is the provider-facing credential material resolved for an

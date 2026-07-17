@@ -164,8 +164,8 @@ type ProviderOperationStatus struct {
 // one MachineOperation target. It is persisted before provider execution so
 // retries do not silently adopt later desired-state changes.
 type MachineOperationTargetInput struct {
-	// ProviderRef identifies the exact provider-owned resource observed when the
-	// operation target was initialized.
+	// ProviderRef identifies the exact provider-owned resource referenced by
+	// host.external.machineRef when the operation target was initialized.
 	// +optional
 	ProviderRef *ProviderMachineSnapshot `json:"providerRef,omitempty"`
 

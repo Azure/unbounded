@@ -50,8 +50,8 @@ type Provider struct {
 }
 
 // WithProviderMachineKind declares the provider-owned Machine GroupKind
-// accepted by this provider. Providers may continue to handle legacy
-// Machine.spec.providerID values while Machines are migrated to providerRef.
+// accepted through Machine.spec.host.external.machineRef. Providers may also
+// accept host.external.providerID or the deprecated Machine.spec.providerID.
 func WithProviderMachineKind(groupKind schema.GroupKind) ProviderOption {
 	return providerOptionFunc(func(provider *Provider) error {
 		if strings.TrimSpace(groupKind.Group) == "" {
@@ -206,7 +206,8 @@ func WithCleanup(cleanup CleanupFunc) OperationOption {
 	})
 }
 
-// Name returns the external provider name matched against Machine.spec.provider.
+// Name returns the external provider name matched against
+// Machine.spec.host.external.provider or a deprecated Machine.spec.provider.
 func (p *Provider) Name() string {
 	if p == nil {
 		return ""

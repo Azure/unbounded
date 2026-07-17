@@ -90,9 +90,8 @@ spec:
                     description: Host contains provider-neutral desired host settings.
                     properties:
                       image:
-                        description: |-
-                          Image is an opaque provider-interpreted image identifier. If omitted,
-                          HostReplace preserves the host's current image.
+                        description: Image is an opaque provider-interpreted image
+                          identifier.
                         type: string
                     type: object
                   kubernetes:

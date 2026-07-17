@@ -67,7 +67,6 @@ type MachineOperationReconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperationcredentials,verbs=get;list;watch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineconfigurationversions,verbs=get;list
-// +kubebuilder:rbac:groups=azure.unbounded-cloud.io,resources=azuremachines,verbs=get
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=list
 // +kubebuilder:rbac:groups="",resources=configmaps;services;secrets,verbs=get
 // +kubebuilder:rbac:nonResourceURLs=/version,verbs=get
@@ -103,23 +102,28 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, fmt.Errorf("get Machine %s: %w", op.Spec.MachineRef, err)
 	}
 
-	if !r.ownsMachine(&machine) {
+	host, err := resolveMachineHost(&machine)
+	if err != nil {
+		return r.failOperation(ctx, &op, "InvalidHost", err.Error())
+	}
+
+	if !r.ownsMachine(&machine, host.provider) {
 		logger.V(1).Info("operation not owned by this external power controller",
 			"operation", op.Name,
 			"operationKind", op.Spec.OperationKind,
 			"machine", machine.Name,
 			"machineSite", siteNameFromLabels(machine.Labels),
-			"machineProvider", machine.Spec.Provider,
+			"machineProvider", host.provider,
 			"controllerSite", r.SiteName,
 			"controllerProvider", r.ProviderName)
 
 		return ctrl.Result{}, nil
 	}
 
-	providerMatch := r.providerFor(&machine, op.Spec.OperationKind)
+	providerMatch := r.providerFor(host.provider, op.Spec.OperationKind)
 	if !providerMatch.supported() {
 		if providerMatch.provider != nil && isHostOperation(op.Spec.OperationKind) {
-			return r.failOperation(ctx, &op, "UnsupportedOperation", fmt.Sprintf("%s is not supported for %s", op.Spec.OperationKind, machine.Spec.Provider))
+			return r.failOperation(ctx, &op, "UnsupportedOperation", fmt.Sprintf("%s is not supported for %s", op.Spec.OperationKind, host.provider))
 		}
 
 		logger.V(1).Info("operation not handled by external power controller",
@@ -201,7 +205,12 @@ func (r *MachineOperationReconciler) reconcileSupportedOperation(
 		return r.failOperation(ctx, op, "TargetStateMissing", fmt.Sprintf("MachineOperation target %s is missing", machine.Name))
 	}
 
-	operationRequest, err := r.operationRequest(ctx, op, machine, target, machine.Spec.ProviderID, auth, providerMatch.operation.RequiresReplaceUserData())
+	host, err := resolveMachineHost(machine)
+	if err != nil {
+		return r.failOperationTarget(ctx, op, machine.Name, "InvalidHost", err.Error())
+	}
+
+	operationRequest, err := r.operationRequest(ctx, op, machine, target, host.providerID, auth, providerMatch.operation.RequiresReplaceUserData())
 	if err != nil {
 		return r.failOperationTarget(ctx, op, machine.Name, "BootstrapDataFailed", err.Error())
 	}
@@ -287,13 +296,23 @@ func (r *MachineOperationReconciler) applyOperationResult(
 	request OperationRequest,
 	result OperationResult,
 ) error {
-	if result.ProviderID != "" && result.ProviderID != machine.Spec.ProviderID {
+	host, err := resolveMachineHost(machine)
+	if err != nil {
+		return err
+	}
+
+	if result.ProviderID != "" && result.ProviderID != host.providerID {
 		updatedGeneration, err := r.updateMachineProviderID(ctx, machine, result.ProviderID)
 		if err != nil {
 			return err
 		}
 
-		machine.Spec.ProviderID = result.ProviderID
+		if machine.Spec.Host != nil && machine.Spec.Host.External != nil {
+			machine.Spec.Host.External.ProviderID = result.ProviderID
+		} else {
+			machine.Spec.ProviderID = result.ProviderID
+		}
+
 		machine.Generation = updatedGeneration
 	}
 
@@ -314,7 +333,14 @@ func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context
 
 		patch := client.MergeFrom(latest.DeepCopy())
 
-		latest.Spec.ProviderID = providerID
+		if latest.Spec.Host != nil && latest.Spec.Host.External != nil {
+			latest.Spec.Host.External.ProviderID = providerID
+		} else if latest.Spec.Host != nil && latest.Spec.Host.Azure != nil {
+			return fmt.Errorf("patch Machine providerID: Azure resourceID is immutable")
+		} else {
+			latest.Spec.ProviderID = providerID
+		}
+
 		if err := r.Patch(ctx, &latest, patch); err != nil {
 			return fmt.Errorf("patch Machine providerID: %w", err)
 		}
@@ -396,8 +422,8 @@ func shouldReconcileOperationUpdate(oldOperation, newOperation *unboundedv1alpha
 	return becameTerminal && shouldReconcileOperation(newOperation)
 }
 
-func (r *MachineOperationReconciler) providerFor(machine *unboundedv1alpha3.Machine, operation unboundedv1alpha3.OperationKind) providerMatch {
-	if machine.Spec.Provider == "" {
+func (r *MachineOperationReconciler) providerFor(providerName string, operation unboundedv1alpha3.OperationKind) providerMatch {
+	if providerName == "" {
 		return providerMatch{}
 	}
 
@@ -408,7 +434,7 @@ func (r *MachineOperationReconciler) providerFor(machine *unboundedv1alpha3.Mach
 			continue
 		}
 
-		if provider.Name() != machine.Spec.Provider {
+		if provider.Name() != providerName {
 			continue
 		}
 
@@ -425,12 +451,12 @@ func (m providerMatch) supported() bool {
 	return m.provider != nil && m.operation != nil
 }
 
-func (r *MachineOperationReconciler) ownsMachine(machine *unboundedv1alpha3.Machine) bool {
+func (r *MachineOperationReconciler) ownsMachine(machine *unboundedv1alpha3.Machine, providerName string) bool {
 	if r.SiteName != "" && siteNameFromLabels(machine.Labels) != r.SiteName {
 		return false
 	}
 
-	if r.ProviderName != "" && machine.Spec.Provider != r.ProviderName {
+	if r.ProviderName != "" && providerName != r.ProviderName {
 		return false
 	}
 

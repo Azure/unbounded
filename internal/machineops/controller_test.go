@@ -33,6 +33,11 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Generation = 3
+	machine.Spec.Provider = ""
+	machine.Spec.ProviderID = ""
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{Azure: &unboundedv1alpha3.AzureHostSpec{
+		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1",
+	}}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
@@ -71,19 +76,25 @@ func TestMachineOperationReconciler_SnapshotsProviderRefAndHostImage(t *testing.
 	machine := newExternalMachine("machine-1", "ExampleCloud")
 	machine.UID = "machine-uid"
 	machine.Generation = 7
+	machine.Spec.Provider = ""
 	machine.Spec.ProviderID = ""
-	machine.Spec.ProviderRef = &unboundedv1alpha3.ProviderMachineReference{
-		APIGroup: providerGroup,
-		Kind:     providerKind,
-		Name:     "provider-machine-1",
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
+		Image: "image-v2",
+		External: &unboundedv1alpha3.ExternalHostSpec{
+			Provider: "ExampleCloud",
+			MachineRef: &unboundedv1alpha3.ProviderMachineReference{
+				APIGroup: providerGroup,
+				Kind:     providerKind,
+				Name:     "provider-machine-1",
+			},
+		},
 	}
-	machine.Spec.Host = &unboundedv1alpha3.HostSpec{Image: "image-v2"}
 	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{
 		BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"},
 	}
 
 	op := newMachineOperation("op-1", machine.Name, unboundedv1alpha3.OperationHostReplace)
-	credential := newWorkloadIdentityCredential("cred-a", "site-a", machine.Spec.Provider)
+	credential := newWorkloadIdentityCredential("cred-a", "site-a", machine.Spec.Host.External.Provider)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
 		Data: map[string][]byte{
@@ -95,7 +106,7 @@ func TestMachineOperationReconciler_SnapshotsProviderRefAndHostImage(t *testing.
 	providerMachine := &unstructured.Unstructured{}
 	providerMachine.SetAPIVersion(providerGroup + "/v1alpha1")
 	providerMachine.SetKind(providerKind)
-	providerMachine.SetName(machine.Spec.ProviderRef.Name)
+	providerMachine.SetName(machine.Spec.Host.External.MachineRef.Name)
 	providerMachine.SetUID("provider-machine-uid")
 	providerMachine.SetGeneration(4)
 
@@ -110,7 +121,7 @@ func TestMachineOperationReconciler_SnapshotsProviderRefAndHostImage(t *testing.
 
 	groupKind := schema.GroupKind{Group: providerGroup, Kind: providerKind}
 	provider := &recordingProvider{
-		provider:            machine.Spec.Provider,
+		provider:            machine.Spec.Host.External.Provider,
 		providerMachineKind: &groupKind,
 		supported:           map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReplace: true},
 	}
@@ -158,16 +169,23 @@ func TestMachineOperationReconciler_RejectsMismatchedProviderRefKind(t *testing.
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", "ExampleCloud")
-	machine.Spec.ProviderRef = &unboundedv1alpha3.ProviderMachineReference{
-		APIGroup: "infrastructure.other.io",
-		Kind:     "OtherMachine",
-		Name:     "machine-1",
+	machine.Spec.Provider = ""
+	machine.Spec.ProviderID = ""
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
+		External: &unboundedv1alpha3.ExternalHostSpec{
+			Provider: "ExampleCloud",
+			MachineRef: &unboundedv1alpha3.ProviderMachineReference{
+				APIGroup: "infrastructure.other.io",
+				Kind:     "OtherMachine",
+				Name:     "machine-1",
+			},
+		},
 	}
 
 	op := newMachineOperation("op-1", machine.Name, unboundedv1alpha3.OperationHostReboot)
 	groupKind := schema.GroupKind{Group: "infrastructure.example.io", Kind: "ExampleMachine"}
 	provider := &recordingProvider{
-		provider:            machine.Spec.Provider,
+		provider:            machine.Spec.Host.External.Provider,
 		providerMachineKind: &groupKind,
 		supported:           map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true},
 	}
@@ -684,7 +702,12 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Provider = ""
+	machine.Spec.ProviderID = ""
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{
+		Provider:   unboundedv1alpha3.ExternalProviderOCIInstance,
+		ProviderID: "oci://old-instance",
+	}}
 	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	secret := &corev1.Secret{
@@ -723,7 +746,7 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 
 	var updatedMachine unboundedv1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-1"}, &updatedMachine))
-	require.Equal(t, "oci://new-instance", updatedMachine.Spec.ProviderID)
+	require.Equal(t, "oci://new-instance", updatedMachine.Spec.Host.External.ProviderID)
 	require.Equal(t, []string{"HostReplace:machine-1:oci://old-instance"}, provider.calls)
 	require.Equal(t, []string{"HostReplace:machine-1:oci://old-instance"}, provider.cleanupCalls)
 

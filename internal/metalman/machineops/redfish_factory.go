@@ -22,11 +22,11 @@ type RedfishPowerClientFactory struct {
 }
 
 func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1alpha3.Machine) (PowerClient, error) {
-	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil {
+	if machine.Spec.Netboot() == nil || machine.Spec.Netboot().Redfish == nil {
 		return nil, fmt.Errorf("machine %s has no Redfish config", machine.Name)
 	}
 
-	rf := machine.Spec.PXE.Redfish
+	rf := machine.Spec.Netboot().Redfish
 
 	fingerprint := ""
 	if machine.Status.Redfish != nil {

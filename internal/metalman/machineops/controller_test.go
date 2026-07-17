@@ -259,11 +259,15 @@ func TestReconcilerSnapshotsSiteScopedSelectorTargets(t *testing.T) {
 
 	s := testScheme(t)
 	machineA := testBareMetalMachine("machine-a", "rack-a")
+	machineA.Spec.Host = &v1alpha3.HostSpec{Netboot: machineA.Spec.PXE}
+	machineA.Spec.PXE = nil
 	machineB := testBareMetalMachine("machine-b", "rack-a")
 	machineOtherSite := testBareMetalMachine("machine-c", "rack-b")
 	external := testBareMetalMachine("machine-d", "rack-a")
-	external.Spec.Provider = v1alpha3.ExternalProviderAzureVM
-	external.Spec.ProviderID = "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-d"
+	external.Spec.PXE = nil
+	external.Spec.Host = &v1alpha3.HostSpec{Azure: &v1alpha3.AzureHostSpec{
+		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-d",
+	}}
 	op := testOperation("op-selector", v1alpha3.OperationHostPowerOff)
 	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
 
@@ -651,7 +655,7 @@ func TestReconcilerRetriesHTTPHostReplaceWithoutStaticLease(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase)
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Targets[0].Phase)
-	require.Equal(t, "HTTP boot requires at least one static lease in spec.pxe.dhcpLeases", updated.Status.Targets[0].Message)
+	require.Equal(t, "HTTP boot requires at least one static lease in spec.host.netboot.dhcpLeases", updated.Status.Targets[0].Message)
 	require.Empty(t, power.calls)
 }
 

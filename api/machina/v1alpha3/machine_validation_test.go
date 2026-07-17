@@ -25,13 +25,36 @@ func TestMachineProviderOwnershipSchema(t *testing.T) {
 	}
 
 	specSchema := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
-	want := map[string]string{
-		"!has(oldSelf.providerRef) || (has(self.providerRef) && self.providerRef == oldSelf.providerRef)": "providerRef is immutable once set",
-		"!has(self.providerRef) || has(self.provider)":                                                    "provider is required when providerRef is set",
-		"!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)":             "provider is immutable once set",
-	}
+	assertSchemaValidations(t, specSchema, map[string]string{
+		"!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)":                                                                                   "provider is immutable once set",
+		"!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))": "host ownership cannot be combined with legacy pxe, provider, or providerID fields",
+	})
 
-	for _, validation := range specSchema.XValidations {
+	hostSchema := specSchema.Properties["host"]
+	assertSchemaValidations(t, hostSchema, map[string]string{
+		"(has(self.netboot) ? 1 : 0) + (has(self.azure) ? 1 : 0) + (has(self.external) ? 1 : 0) <= 1": "at most one of netboot, azure, or external may be set",
+		"!has(oldSelf.netboot) || has(self.netboot)":                                                  "netboot host ownership is immutable once set",
+		"!has(oldSelf.azure) || has(self.azure)":                                                      "azure host ownership is immutable once set",
+		"!has(oldSelf.external) || has(self.external)":                                                "external host ownership is immutable once set",
+	})
+
+	externalSchema := hostSchema.Properties["external"]
+	assertSchemaValidations(t, externalSchema, map[string]string{
+		"has(self.providerID) || has(self.machineRef)": "providerID or machineRef is required",
+		"has(self.machineRef) == has(oldSelf.machineRef) && (!has(self.machineRef) || self.machineRef == oldSelf.machineRef)": "machineRef is immutable",
+		"self.provider == oldSelf.provider": "provider is immutable",
+	})
+
+	azureSchema := hostSchema.Properties["azure"]
+	assertSchemaValidations(t, azureSchema, map[string]string{
+		"self.resourceID == oldSelf.resourceID": "resourceID is immutable",
+	})
+}
+
+func assertSchemaValidations(t *testing.T, schema apiextensionsv1.JSONSchemaProps, want map[string]string) {
+	t.Helper()
+
+	for _, validation := range schema.XValidations {
 		message, ok := want[validation.Rule]
 		if !ok {
 			continue
@@ -45,6 +68,6 @@ func TestMachineProviderOwnershipSchema(t *testing.T) {
 	}
 
 	for rule := range want {
-		t.Errorf("Machine spec schema is missing validation %q", rule)
+		t.Errorf("schema is missing validation %q", rule)
 	}
 }

@@ -90,7 +90,7 @@ type MachineConfigurationSpec struct {
 type MachineConfigurationTemplate struct {
 	// Host contains provider-neutral desired host settings.
 	// +optional
-	Host *HostSpec `json:"host,omitempty"`
+	Host *MachineConfigurationHostSpec `json:"host,omitempty"`
 
 	// Kubernetes contains Kubernetes-specific configuration such as
 	// the target version, node labels, and taints.
@@ -101,6 +101,14 @@ type MachineConfigurationTemplate struct {
 	// OCI image reference for the nspawn machine).
 	// +optional
 	Agent *MachineConfigurationAgent `json:"agent,omitempty"`
+}
+
+// MachineConfigurationHostSpec contains versioned, provider-neutral host
+// settings. Per-machine host ownership belongs on Machine.spec.host.
+type MachineConfigurationHostSpec struct {
+	// Image is an opaque provider-interpreted image identifier.
+	// +optional
+	Image string `json:"image,omitempty"`
 }
 
 // MachineConfigurationKubernetes holds the Kubernetes-specific fields

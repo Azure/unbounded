@@ -76,7 +76,12 @@ func (r *MachineOperationReconciler) reconcileResumableOperation(
 
 	includeReplaceUserData := target.ProviderOperation == nil && providerMatch.operation.RequiresReplaceUserData()
 
-	request, err := r.operationRequest(ctx, op, machine, target, machine.Spec.ProviderID, auth, includeReplaceUserData)
+	host, err := resolveMachineHost(machine)
+	if err != nil {
+		return r.failOperationTarget(ctx, op, machine.Name, "InvalidHost", err.Error())
+	}
+
+	request, err := r.operationRequest(ctx, op, machine, target, host.providerID, auth, includeReplaceUserData)
 	if err != nil {
 		return r.failOperationTarget(ctx, op, machine.Name, "RequestBuildFailed", err.Error())
 	}
@@ -382,6 +387,11 @@ func (r *MachineOperationReconciler) olderConflictingOperation(
 	op *unboundedv1alpha3.MachineOperation,
 	machine *unboundedv1alpha3.Machine,
 ) (string, error) {
+	host, err := resolveMachineHost(machine)
+	if err != nil {
+		return "", err
+	}
+
 	var operations unboundedv1alpha3.MachineOperationList
 	if err := r.List(ctx, &operations); err != nil {
 		return "", fmt.Errorf("list MachineOperations: %w", err)
@@ -398,7 +408,7 @@ func (r *MachineOperationReconciler) olderConflictingOperation(
 			continue
 		}
 
-		if !r.providerFor(machine, candidate.Spec.OperationKind).supported() {
+		if !r.providerFor(host.provider, candidate.Spec.OperationKind).supported() {
 			continue
 		}
 

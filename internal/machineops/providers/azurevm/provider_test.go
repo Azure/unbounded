@@ -12,13 +12,8 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	azurev1alpha1 "github.com/Azure/unbounded/api/providers/azure/v1alpha1"
 	"github.com/Azure/unbounded/internal/machineops"
 )
 
@@ -151,102 +146,6 @@ func TestProviderExecutePassesAuthToClientFactory(t *testing.T) {
 	require.Equal(t, []string{"start:rg/vm1"}, client.calls)
 }
 
-func TestProviderExecuteUsesAzureMachineProviderRef(t *testing.T) {
-	t.Parallel()
-
-	machineUID := types.UID("machine-uid")
-	controller := true
-	azureMachine := &azurev1alpha1.AzureMachine{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       "azure-machine-1",
-			UID:        "azure-machine-uid",
-			Generation: 3,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: unboundedv1alpha3.GroupVersion.String(),
-				Kind:       "Machine",
-				Name:       "machine-1",
-				UID:        machineUID,
-				Controller: &controller,
-			}},
-		},
-		Spec: azurev1alpha1.AzureMachineSpec{
-			ResourceID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1",
-		},
-	}
-
-	scheme := runtime.NewScheme()
-	require.NoError(t, azurev1alpha1.AddToScheme(scheme))
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(azureMachine).Build()
-	azureClient := &recordingAzureVMClient{}
-	provider := &Provider{
-		KubeClient: kubeClient,
-		NewClient: func(subscriptionID string) (azureVMClient, error) {
-			require.Equal(t, "sub", subscriptionID)
-
-			return azureClient, nil
-		},
-	}
-
-	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
-		MachineName: "machine-1",
-		MachineUID:  machineUID,
-		ProviderRef: &unboundedv1alpha3.ProviderMachineSnapshot{
-			APIGroup:   azurev1alpha1.GroupVersion.Group,
-			Kind:       azurev1alpha1.AzureMachineKind,
-			Name:       azureMachine.Name,
-			UID:        azureMachine.UID,
-			Generation: azureMachine.Generation,
-		},
-		ProviderID: "azure:///subscriptions/wrong/resourceGroups/wrong/providers/Microsoft.Compute/virtualMachines/wrong",
-		Operation:  unboundedv1alpha3.OperationHostPowerOn,
-	})
-
-	require.NoError(t, err)
-	require.Equal(t, []string{"start:rg/vm1"}, azureClient.calls)
-}
-
-func TestProviderExecuteRejectsChangedAzureMachine(t *testing.T) {
-	t.Parallel()
-
-	azureMachine := &azurev1alpha1.AzureMachine{
-		ObjectMeta: metav1.ObjectMeta{Name: "azure-machine-1", UID: "current-uid", Generation: 4},
-		Spec: azurev1alpha1.AzureMachineSpec{
-			ResourceID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1",
-		},
-	}
-	scheme := runtime.NewScheme()
-	require.NoError(t, azurev1alpha1.AddToScheme(scheme))
-	provider := &Provider{KubeClient: fake.NewClientBuilder().WithScheme(scheme).WithObjects(azureMachine).Build()}
-
-	tests := []struct {
-		name       string
-		uid        types.UID
-		generation int64
-		wantErr    string
-	}{
-		{name: "UID changed", uid: "old-uid", generation: azureMachine.Generation, wantErr: "UID changed"},
-		{name: "generation changed", uid: azureMachine.UID, generation: 3, wantErr: "generation changed"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			_, err := provider.Execute(context.Background(), machineops.OperationRequest{
-				ProviderRef: &unboundedv1alpha3.ProviderMachineSnapshot{
-					APIGroup:   azurev1alpha1.GroupVersion.Group,
-					Kind:       azurev1alpha1.AzureMachineKind,
-					Name:       azureMachine.Name,
-					UID:        tt.uid,
-					Generation: tt.generation,
-				},
-				Operation: unboundedv1alpha3.OperationHostPowerOn,
-			})
-			require.ErrorContains(t, err, tt.wantErr)
-		})
-	}
-}
-
 func TestNewAzureVMClientValidatesAuth(t *testing.T) {
 	t.Parallel()
 
@@ -310,8 +209,8 @@ func TestProviderRegistrationDoesNotDeclareHostReplaceReplaySafe(t *testing.T) {
 	require.False(t, operation.ReplaySafe())
 
 	groupKind, ok := provider.ProviderMachineKind()
-	require.True(t, ok)
-	require.Equal(t, azurev1alpha1.GroupVersion.WithKind(azurev1alpha1.AzureMachineKind).GroupKind(), groupKind)
+	require.False(t, ok)
+	require.Empty(t, groupKind)
 }
 
 func TestPrepareReplacementVMChangesHostImage(t *testing.T) {

@@ -364,7 +364,6 @@ func TestRequiredCRDNames(t *testing.T) {
 		"machineconfigurations.unbounded-cloud.io",
 		"machineoperationcredentials.unbounded-cloud.io",
 		"machineconfigurationversions.unbounded-cloud.io",
-		"azuremachines.azure.unbounded-cloud.io",
 		"sitenodeslices.net.unbounded-cloud.io",
 		"gatewaypools.net.unbounded-cloud.io",
 		"gatewaypoolnodes.net.unbounded-cloud.io",
