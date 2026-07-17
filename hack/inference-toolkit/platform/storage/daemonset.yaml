@@ -1,0 +1,207 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: local-cache-preparer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: local-cache-preparer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: local-cache-preparer
+        app.kubernetes.io/component: storage
+    spec:
+      serviceAccountName: local-cache-preparer
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostPID: true
+      nodeSelector:
+        accelerator: nvidia
+        sku: gpu
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: prepare
+          image: docker.io/library/ubuntu:24.04
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -ceu
+            - |
+              nsenter --mount=/host/proc/1/ns/mnt --pid=/host/proc/1/ns/pid -- /bin/bash -seu <<'HOST_SCRIPT'
+              device=/dev/sdb1
+              cache_mount=/mnt/inference-cache
+              containerd_root=/var/lib/containerd
+              persistent_root=$cache_mount/containerd
+              backup_root=/var/lib/containerd.os-disk
+              cache_unit=$(systemd-escape --path --suffix=mount "$cache_mount")
+              containerd_unit=$(systemd-escape --path --suffix=mount "$containerd_root")
+
+              [[ -b "$device" ]] || { echo "$device is not a block device" >&2; exit 1; }
+              [[ "$(blkid -o value -s TYPE "$device")" == ext4 ]] || {
+                echo "$device must contain an existing ext4 filesystem" >&2
+                exit 1
+              }
+              size_bytes=$(blockdev --getsize64 "$device")
+              (( size_bytes >= 2000000000000 )) || {
+                echo "$device is unexpectedly small: $size_bytes bytes" >&2
+                exit 1
+              }
+
+              mkdir -p "$cache_mount"
+              if ! findmnt -nro SOURCE --target "$cache_mount" | grep -Fxq "$device"; then
+                mount -t ext4 -o noatime "$device" "$cache_mount"
+              fi
+
+              cat >"/etc/systemd/system/$cache_unit" <<UNIT
+              [Unit]
+              Description=Inference cache disk
+              Before=containerd.service
+
+              [Mount]
+              What=$device
+              Where=$cache_mount
+              Type=ext4
+              Options=noatime
+
+              [Install]
+              WantedBy=local-fs.target
+              UNIT
+
+              cat >"/etc/systemd/system/$containerd_unit" <<UNIT
+              [Unit]
+              Description=Persistent containerd root
+              Requires=$cache_unit
+              After=$cache_unit
+              Before=containerd.service
+
+              [Mount]
+              What=$persistent_root
+              Where=$containerd_root
+              Type=none
+              Options=bind
+
+              [Install]
+              WantedBy=local-fs.target
+              UNIT
+
+              mkdir -p /etc/systemd/system/containerd.service.d
+              cat >/etc/systemd/system/containerd.service.d/storage.conf <<UNIT
+              [Unit]
+              Requires=$containerd_unit
+              After=$containerd_unit
+
+              [Service]
+              LimitMEMLOCK=infinity
+              UNIT
+
+              systemctl daemon-reload
+              systemctl enable "$cache_unit" "$containerd_unit"
+
+              if [[ "$(systemctl show containerd -p LimitMEMLOCK --value)" != infinity ]]; then
+                cat >/usr/local/sbin/restart-containerd-for-memlock <<'RESTART_SCRIPT'
+              #!/bin/bash
+              set -euo pipefail
+              systemctl restart containerd
+              systemctl is-active --quiet containerd
+              RESTART_SCRIPT
+                chmod 0700 /usr/local/sbin/restart-containerd-for-memlock
+                systemd-run --unit=restart-containerd-for-memlock --collect \
+                  /usr/local/sbin/restart-containerd-for-memlock
+                while systemctl is-active --quiet restart-containerd-for-memlock; do sleep 2; done
+                systemctl is-failed --quiet restart-containerd-for-memlock && {
+                  journalctl -u restart-containerd-for-memlock --no-pager >&2
+                  exit 1
+                }
+              fi
+
+              expected_containerd_source="${device}[/containerd]"
+              if [[ "$(findmnt -nro SOURCE --target "$containerd_root")" != "$expected_containerd_source" ]]; then
+                [[ ! -e "$backup_root" ]] || {
+                  echo "$backup_root already exists but containerd is not using $persistent_root" >&2
+                  exit 1
+                }
+                mkdir -p "$persistent_root"
+                [[ -z "$(find "$persistent_root" -mindepth 1 -print -quit)" ]] || {
+                  echo "$persistent_root must be empty before migration" >&2
+                  exit 1
+                }
+
+                cat >/usr/local/sbin/migrate-containerd-root <<'MIGRATION_SCRIPT'
+              #!/bin/bash
+              set -euo pipefail
+              containerd_root=/var/lib/containerd
+              persistent_root=/mnt/inference-cache/containerd
+              backup_root=/var/lib/containerd.os-disk
+              systemctl stop kubelet
+              systemctl stop containerd
+              cp -a "$containerd_root/." "$persistent_root/"
+              sync "$persistent_root"
+              mv "$containerd_root" "$backup_root"
+              mkdir -p "$containerd_root"
+              systemctl start var-lib-containerd.mount
+              systemctl start containerd
+              systemctl start kubelet
+              MIGRATION_SCRIPT
+                chmod 0700 /usr/local/sbin/migrate-containerd-root
+                systemd-run --unit=migrate-containerd-root --collect /usr/local/sbin/migrate-containerd-root
+                while systemctl is-active --quiet migrate-containerd-root; do sleep 2; done
+                systemctl is-failed --quiet migrate-containerd-root && {
+                  journalctl -u migrate-containerd-root --no-pager >&2
+                  exit 1
+                }
+              fi
+
+              systemctl is-active --quiet containerd
+              systemctl is-active --quiet kubelet
+              [[ "$(systemctl show containerd -p LimitMEMLOCK --value)" == infinity ]]
+              [[ "$(findmnt -nro SOURCE --target "$containerd_root")" == "$expected_containerd_source" ]]
+              mkdir -p "$cache_mount/vllm-cache"
+              chown 2000:0 "$cache_mount/vllm-cache"
+              chmod 0770 "$cache_mount/vllm-cache"
+              HOST_SCRIPT
+
+              touch /tmp/ready
+
+              while mountpoint -q /host-cache; do sleep 30; done
+              exit 1
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ceu
+                - test -f /tmp/ready && mountpoint -q /host-cache
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: cache
+              mountPath: /host-cache
+              mountPropagation: Bidirectional
+            - name: devices
+              mountPath: /dev
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+      volumes:
+        - name: cache
+          hostPath:
+            path: /mnt/inference-cache
+            type: DirectoryOrCreate
+        - name: devices
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory

@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: inference-platform
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - daemonset.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: inference-toolkit
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
+images:
+  - name: docker.io/library/ubuntu
+    newTag: "24.04"
+    digest: sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90

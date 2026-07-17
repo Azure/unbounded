@@ -1,0 +1,102 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guidellm
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: guidellm
+        app.kubernetes.io/component: benchmark
+    spec:
+      serviceAccountName: guidellm
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: vllm
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: guidellm
+          image: ghcr.io/vllm-project/guidellm:v0.7.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+            - --backend
+            - '{"kind":"openai_http","target":"http://vllm-api:8000","model":"qwen","request_format":"/v1/completions","extras":{"body":{"ignore_eos":true}}}'
+            - --profile
+            - kind=concurrent,warmup=0.1,cooldown=0.1
+            - --tokenizer
+            - '{"kind":"huggingface_auto","model":"Qwen/Qwen3-235B-A22B","load_kwargs":{"revision":"8efa61729e24bd65b1d152b5ab5409052aa80e65"}}'
+            - --override
+            - profile.streams
+            - 128,192,256
+            - --constraint
+            - kind=max_duration,seconds=180
+            - --constraint
+            - kind=max_errors,count=10
+            - --data
+            - kind=synthetic_text,prompt_tokens=512,output_tokens=128
+            - --data-loader
+            - kind=pytorch,samples=10000
+            - --seed
+            - kind=static,value=42
+            - --metrics
+            - kind=generative,sample_size=100
+            - --output
+            - kind=json,path=/results/benchmark.json
+            - --output
+            - kind=csv,path=/results/benchmark.csv
+            - --output
+            - kind=html,path=/results/benchmark.html
+            - --disable-console-interactive
+          env:
+            - name: USER
+              value: guidellm
+            - name: HOME
+              value: /tmp
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: huggingface-token
+                  key: token
+                  optional: true
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+              ephemeral-storage: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: guidellm-results
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
