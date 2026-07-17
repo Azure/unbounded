@@ -3,8 +3,6 @@
 
 #![allow(async_fn_in_trait)]
 
-mod null;
-
 pub mod url;
 
 #[cfg(target_os = "linux")]
@@ -37,8 +35,6 @@ mod fake;
 use std::sync::Arc;
 
 use crate::bufferpool::{BulkRef, PageRef, PageStream, Req};
-
-pub use null::NullBackend;
 
 #[cfg(target_os = "linux")]
 pub use http::HttpBackend;

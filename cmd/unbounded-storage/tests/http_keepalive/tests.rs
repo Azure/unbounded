@@ -16,34 +16,55 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Invariant: the model serves exactly the prefix permitted by the
-    /// shared keep-alive policy. A non-reusable request closes the
-    /// connection and prevents later pipelined bytes from being parsed as
-    /// another request.
     #[test]
-    fn invariant_serves_keep_alive_prefix(seed in any::<u64>(), w in workload_strategy()) {
+    fn http_keepalive_invariants(seed in any::<u64>(), w in workload_strategy()) {
         let expected = expected_keep_alive_prefix(&w);
-        let report = run_workload(seed, w).expect("run completed");
-        assert_served_prefix(&report, &expected)?;
-    }
-
-    /// Invariant: every serialized response carries a `Connection` header
-    /// matching the keep-alive decision made for that request.
-    #[test]
-    fn invariant_response_connection_matches_decision(seed in any::<u64>(), w in workload_strategy()) {
         let max_requests_per_connection = w.max_requests_per_connection;
         let report = run_workload(seed, w).expect("run completed");
-        for served in &report.served {
-            let expected = if served.keep_alive { "keep-alive" } else { "close" };
-            prop_assert_eq!(served.response_connection.as_str(), expected);
-            prop_assert_eq!(
-                served.keep_alive,
-                served.wants_keep_alive
-                    && served.bodyless
-                    && served.request_index.saturating_add(1) < max_requests_per_connection
-            );
-        }
+
+        assert_served_prefix(&report, &expected)?;
+        assert_response_connections(&report, max_requests_per_connection)?;
     }
+}
+
+/// The model serves exactly the prefix permitted by the shared keep-alive
+/// policy and stops parsing pipelined bytes after a non-reusable request.
+fn assert_served_prefix(report: &RunReport, expected: &[bool]) -> Result<(), TestCaseError> {
+    prop_assert_eq!(report.served.len(), expected.len());
+    for (idx, (served, keep_alive)) in report.served.iter().zip(expected).enumerate() {
+        prop_assert_eq!(served.request_index, idx);
+        prop_assert_eq!(served.keep_alive, *keep_alive);
+    }
+    if expected.last().copied() == Some(false) {
+        prop_assert_eq!(report.stopped_with, StopReason::ServerClosed);
+    } else {
+        prop_assert_eq!(report.stopped_with, StopReason::ClientClosed);
+    }
+    prop_assert!(report.steps > 0);
+    Ok(())
+}
+
+/// Every serialized response carries the connection header selected by the
+/// same body, version, and request-cap policy that controls reuse.
+fn assert_response_connections(
+    report: &RunReport,
+    max_requests_per_connection: usize,
+) -> Result<(), TestCaseError> {
+    for served in &report.served {
+        let expected = if served.keep_alive {
+            "keep-alive"
+        } else {
+            "close"
+        };
+        prop_assert_eq!(served.response_connection.as_str(), expected);
+        prop_assert_eq!(
+            served.keep_alive,
+            served.wants_keep_alive
+                && served.bodyless
+                && served.request_index.saturating_add(1) < max_requests_per_connection
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -170,19 +191,4 @@ fn regression_delayed_one_byte_chunks_do_not_starve_server() {
     assert!(!report.served[1].keep_alive);
     assert_eq!(report.stopped_with, StopReason::ServerClosed);
     assert!(report.leftover.is_empty());
-}
-
-fn assert_served_prefix(report: &RunReport, expected: &[bool]) -> Result<(), TestCaseError> {
-    prop_assert_eq!(report.served.len(), expected.len());
-    for (idx, (served, keep_alive)) in report.served.iter().zip(expected).enumerate() {
-        prop_assert_eq!(served.request_index, idx);
-        prop_assert_eq!(served.keep_alive, *keep_alive);
-    }
-    if expected.last().copied() == Some(false) {
-        prop_assert_eq!(report.stopped_with, StopReason::ServerClosed);
-    } else {
-        prop_assert_eq!(report.stopped_with, StopReason::ClientClosed);
-    }
-    prop_assert!(report.steps > 0);
-    Ok(())
 }

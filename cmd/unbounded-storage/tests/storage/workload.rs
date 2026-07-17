@@ -30,7 +30,6 @@ use unbounded_storage::storage::{EngineConfig, LocalStorage, StorageEngine};
 
 use crate::framework::executor::{Executor, RunError, yield_once};
 use crate::storage::mocks::{MockSimConfig, SimBlockDevice};
-use crate::storage::oracle::Oracle;
 
 // ---------------------------------------------------------------------------
 // Workload model.
@@ -539,7 +538,6 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     // "open failed; abort".
     let slot: Rc<RefCell<BootstrapStatus>> = Rc::new(RefCell::new(BootstrapStatus::Pending));
 
-    let oracle = Rc::new(Oracle::new());
     let outcomes: Rc<RefCell<Vec<Outcome>>> = Rc::new(RefCell::new(Vec::new()));
     // Tracks the number of client tasks that have not yet
     // completed. The supervisor task closes every engine's
@@ -650,7 +648,6 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
         }
         let slot = slot.clone();
         let outcomes = outcomes.clone();
-        let oracle = oracle.clone();
         let pending_clients = pending_clients.clone();
         let w = w.clone();
         let page_size = w.page_size;
@@ -699,7 +696,6 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
                             offset: 0,
                             len: byte_len as u32,
                         };
-                        oracle.record_write(key, offset, bytes);
                         match local.write_page(&key, offset, page).await {
                             Ok(()) => outcomes.borrow_mut().push(Outcome::WriteOk),
                             Err(e) => outcomes
@@ -943,9 +939,6 @@ pub fn run_workload(seed: u64, w: Workload) -> Result<RunReport, RunError> {
     // Hold `pool_buf` alive until here (it would have been dropped
     // already if we'd let the compiler reorder it).
     drop(pool_buf);
-    // `oracle` and `slot` are dropped naturally at end of scope.
-    let _ = oracle;
-
     Ok(RunReport {
         outcomes,
         steps: exec.last_steps(),
