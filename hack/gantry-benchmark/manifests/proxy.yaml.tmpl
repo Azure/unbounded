@@ -21,7 +21,7 @@ spec:
       containers:
         - name: proxy
           image: {{ .ProxyImage }}
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           ports:
             - name: proxy
               containerPort: 5002
@@ -53,14 +53,18 @@ spec:
             httpGet:
               path: /healthz
               port: proxy
-            initialDelaySeconds: 1
-            periodSeconds: 5
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /healthz
               port: proxy
-            initialDelaySeconds: 5
+            initialDelaySeconds: 10
             periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 10
           resources:
             requests:
               cpu: "4"
