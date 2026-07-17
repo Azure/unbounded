@@ -140,14 +140,14 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node.Spec.PXE == nil {
+	if node.Spec.Netboot() == nil {
 		log.Warn("node has no PXE config", "node", node.Name)
 		http.NotFound(w, r)
 
 		return
 	}
 
-	imageRef := node.Spec.PXE.Image
+	imageRef := node.Spec.Netboot().Image
 	if path != "disk.img.gz" {
 		imageRef = h.NetbootImageRef(node)
 	}
@@ -159,8 +159,8 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP &&
-		h.isHTTPBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), path) {
+	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP &&
+		h.isHTTPBootLoaderDownload(imageRef, node.Spec.Netboot().TargetArchitecture(), path) {
 		installRequested, err := h.installRequested(r.Context(), node)
 		if err != nil {
 			log.Warn("checking active install operation", "node", node.Name, "err", err)
@@ -187,7 +187,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if node.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && isOptionalShimRevocationsFile(path) {
+		if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && isOptionalShimRevocationsFile(path) {
 			serveMissingShimRevocationsFile(w, log, node, path)
 
 			return
@@ -389,8 +389,8 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 	h.recordBootImageWritten(r.Context(), log, node.Name)
 
 	imageName := ""
-	if node.Spec.PXE != nil {
-		imageName = node.Spec.PXE.Image
+	if node.Spec.Netboot() != nil {
+		imageName = node.Spec.Netboot().Image
 	}
 
 	if h.StatusRecorder == nil {
@@ -422,11 +422,11 @@ func (h *HTTPServer) recordBootImageWritten(ctx context.Context, log *slog.Logge
 }
 
 func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, path string) {
-	if h.StatusRecorder == nil || node == nil || node.Spec.PXE == nil || node.Spec.PXE.TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP {
+	if h.StatusRecorder == nil || node == nil || node.Spec.Netboot() == nil || node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP {
 		return
 	}
 
-	if !h.isHTTPBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), path) {
+	if !h.isHTTPBootLoaderDownload(imageRef, node.Spec.Netboot().TargetArchitecture(), path) {
 		return
 	}
 

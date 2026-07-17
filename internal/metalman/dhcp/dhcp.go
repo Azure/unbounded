@@ -136,15 +136,15 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	}
 
 	node := &list.Items[0]
-	if node.Spec.PXE == nil {
+	if node.Spec.Netboot() == nil {
 		return
 	}
 
 	var lease *v1alpha3.DHCPLease
 
-	for i := range node.Spec.PXE.DHCPLeases {
-		if strings.EqualFold(node.Spec.PXE.DHCPLeases[i].MAC, mac) {
-			lease = &node.Spec.PXE.DHCPLeases[i]
+	for i := range node.Spec.Netboot().DHCPLeases {
+		if strings.EqualFold(node.Spec.Netboot().DHCPLeases[i].MAC, mac) {
+			lease = &node.Spec.Netboot().DHCPLeases[i]
 			break
 		}
 	}
@@ -189,18 +189,18 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		}
 	}
 
-	netbootImage := node.Spec.PXE.NetbootImage
+	netbootImage := node.Spec.Netboot().NetbootImage
 	if netbootImage == "" {
 		netbootImage = s.DefaultNetbootRef
 	}
 
 	if netbootImage != "" && s.OCICache != nil {
-		architecture := node.Spec.PXE.TargetArchitecture()
+		architecture := node.Spec.Netboot().TargetArchitecture()
 
 		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
 		if err != nil {
 			log.Warn("OCI image metadata not available", "image", netbootImage, "architecture", architecture, "err", err)
-		} else if node.Spec.PXE.TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+		} else if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
 			if isHTTPClientRequest(m) {
 				bootURL, err := netboot.JoinServeURLPath(s.ServeURL, netboot.HTTPBootPathFromMetadata(meta))
 				if err != nil {

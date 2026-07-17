@@ -30,18 +30,18 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WithEventFilter(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
 				m, ok := e.Object.(*v1alpha3.Machine)
-				return ok && m.Spec.PXE != nil && m.Spec.PXE.Redfish != nil
+				return ok && m.Spec.Netboot() != nil && m.Spec.Netboot().Redfish != nil
 			},
 			UpdateFunc: func(e event.UpdateEvent) bool {
 				m, ok := e.ObjectNew.(*v1alpha3.Machine)
-				return ok && m.Spec.PXE != nil && m.Spec.PXE.Redfish != nil
+				return ok && m.Spec.Netboot() != nil && m.Spec.Netboot().Redfish != nil
 			},
 			DeleteFunc: func(e event.DeleteEvent) bool {
 				return false
 			},
 			GenericFunc: func(e event.GenericEvent) bool {
 				m, ok := e.Object.(*v1alpha3.Machine)
-				return ok && m.Spec.PXE != nil && m.Spec.PXE.Redfish != nil
+				return ok && m.Spec.Netboot() != nil && m.Spec.Netboot().Redfish != nil
 			},
 		}).
 		Complete(r)
@@ -55,11 +55,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil {
+	if machine.Spec.Netboot() == nil || machine.Spec.Netboot().Redfish == nil {
 		return ctrl.Result{}, nil
 	}
 
-	rf := machine.Spec.PXE.Redfish
+	rf := machine.Spec.Netboot().Redfish
 
 	// TOFU: capture TLS cert fingerprint on first connection.
 	fingerprint := ""

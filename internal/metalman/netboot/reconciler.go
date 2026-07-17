@@ -73,28 +73,28 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 		return nil
 	}
 
-	if machine.Spec.PXE == nil {
+	if machine.Spec.Netboot() == nil {
 		return nil
 	}
 
 	refs := []imagePullRequest{
 		{
-			ImageRef:      machine.Spec.PXE.Image,
-			Architecture:  machine.Spec.PXE.TargetArchitecture(),
-			PullSecretRef: machine.Spec.PXE.PullSecretRef,
+			ImageRef:      machine.Spec.Netboot().Image,
+			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
+			PullSecretRef: machine.Spec.Netboot().PullSecretRef,
 		},
 	}
 
-	if machine.Spec.PXE.NetbootImage != "" {
+	if machine.Spec.Netboot().NetbootImage != "" {
 		refs = append(refs, imagePullRequest{
-			ImageRef:      machine.Spec.PXE.NetbootImage,
-			Architecture:  machine.Spec.PXE.TargetArchitecture(),
-			PullSecretRef: machine.Spec.PXE.NetbootPullSecretRef,
+			ImageRef:      machine.Spec.Netboot().NetbootImage,
+			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
+			PullSecretRef: machine.Spec.Netboot().NetbootPullSecretRef,
 		})
 	} else {
 		refs = append(refs, imagePullRequest{
 			ImageRef:      r.DefaultNetbootRef,
-			Architecture:  machine.Spec.PXE.TargetArchitecture(),
+			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
 			PullSecretRef: r.DefaultNetbootPullSecretRef,
 		})
 	}

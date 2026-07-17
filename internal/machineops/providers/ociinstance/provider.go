@@ -17,8 +17,6 @@ import (
 )
 
 const (
-	defaultUbuntuOS         = "Canonical Ubuntu"
-	defaultUbuntuOSVersion  = "24.04"
 	ociMetadataMaxBytes     = 32000
 	replacementPollInterval = 15 * time.Second
 	replacementPollTimeout  = 20 * time.Minute
@@ -51,7 +49,6 @@ type computeClient interface {
 	ListInstances(ctx context.Context, compartmentID, availabilityDomain string) ([]core.Instance, error)
 	LaunchInstance(ctx context.Context, details core.LaunchInstanceDetails, retryToken string) (core.Instance, error)
 	TerminateInstance(ctx context.Context, instanceID, retryToken string) error
-	ListImages(ctx context.Context, compartmentID, shape string) ([]core.Image, error)
 	ListVnicAttachments(ctx context.Context, compartmentID, instanceID string) ([]core.VnicAttachment, error)
 	GetVnic(ctx context.Context, vnicID string) (core.Vnic, error)
 	ListVolumeAttachments(ctx context.Context, compartmentID, instanceID string) ([]core.VolumeAttachment, error)

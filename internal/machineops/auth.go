@@ -65,9 +65,17 @@ func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTa
 		}
 	}
 
+	host, err := resolveMachineHost(machine)
+	if err != nil {
+		return operationAuthTarget{}, &authResolutionFailure{
+			Reason:  authReasonInvalid,
+			Message: err.Error(),
+		}
+	}
+
 	target := operationAuthTarget{
 		SiteName: siteNameFromLabels(machine.Labels),
-		Provider: strings.TrimSpace(machine.Spec.Provider),
+		Provider: host.provider,
 	}
 	if target.SiteName == "" {
 		return operationAuthTarget{}, &authResolutionFailure{
@@ -79,7 +87,7 @@ func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTa
 	if target.Provider == "" {
 		return operationAuthTarget{}, &authResolutionFailure{
 			Reason:  authReasonInvalid,
-			Message: fmt.Sprintf("Machine %s is missing spec.provider", machine.Name),
+			Message: fmt.Sprintf("Machine %s has no external host provider", machine.Name),
 		}
 	}
 
