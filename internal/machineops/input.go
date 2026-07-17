@@ -130,7 +130,12 @@ func (r *MachineOperationReconciler) snapshotProviderMachine(
 
 	mapping, err := r.RESTMapper.RESTMapping(groupKind)
 	if err != nil {
-		return nil, permanentTargetInputError(fmt.Errorf("resolve providerRef kind %s: %w", groupKind, err))
+		mappingErr := fmt.Errorf("resolve providerRef kind %s: %w", groupKind, err)
+		if apimeta.IsNoMatchError(err) {
+			return nil, permanentTargetInputError(mappingErr)
+		}
+
+		return nil, mappingErr
 	}
 
 	if mapping.Scope.Name() != apimeta.RESTScopeNameRoot {

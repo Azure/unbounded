@@ -24,7 +24,6 @@ const (
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=azm
-// +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Resource ID",type="string",JSONPath=".spec.resourceID"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
@@ -33,8 +32,7 @@ type AzureMachine struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   AzureMachineSpec   `json:"spec"`
-	Status AzureMachineStatus `json:"status,omitempty"`
+	Spec AzureMachineSpec `json:"spec"`
 }
 
 // +kubebuilder:object:root=true
@@ -53,18 +51,4 @@ type AzureMachineSpec struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	ResourceID string `json:"resourceID"`
-}
-
-// AzureMachineStatus describes the Azure provider's latest observations.
-type AzureMachineStatus struct {
-	// ObservedGeneration is the AzureMachine generation most recently observed
-	// by the provider controller.
-	// +optional
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-
-	// Conditions represent the latest Azure provider observations.
-	// +optional
-	// +listType=map
-	// +listMapKey=type
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }

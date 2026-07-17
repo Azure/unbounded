@@ -5,14 +5,26 @@ package machineops
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+type errorRESTMapper struct {
+	apimeta.RESTMapper
+	err error
+}
+
+func (m errorRESTMapper) RESTMapping(schema.GroupKind, ...string) (*apimeta.RESTMapping, error) {
+	return nil, m.err
+}
 
 func TestResolveHostImage(t *testing.T) {
 	t.Parallel()
@@ -68,6 +80,52 @@ func TestResolveHostImage(t *testing.T) {
 			got, err := reconciler.resolveHostImage(context.Background(), tt.machine)
 			require.NoError(t, err)
 			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestSnapshotProviderMachineClassifiesRESTMappingErrors(t *testing.T) {
+	t.Parallel()
+
+	groupKind := schema.GroupKind{Group: "infrastructure.example.com", Kind: "ExampleMachine"}
+	providerRef := &unboundedv1alpha3.ProviderMachineReference{
+		APIGroup: groupKind.Group,
+		Kind:     groupKind.Kind,
+		Name:     "machine-1",
+	}
+
+	tests := []struct {
+		name          string
+		mappingErr    error
+		wantPermanent bool
+	}{
+		{
+			name:       "discovery failure is retryable",
+			mappingErr: errors.New("discovery unavailable"),
+		},
+		{
+			name: "unknown kind is permanent",
+			mappingErr: &apimeta.NoKindMatchError{
+				GroupKind:        groupKind,
+				SearchedVersions: []string{"v1alpha1"},
+			},
+			wantPermanent: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			reconciler := &MachineOperationReconciler{
+				RESTMapper: errorRESTMapper{err: tt.mappingErr},
+			}
+
+			_, err := reconciler.snapshotProviderMachine(context.Background(), providerRef)
+			require.ErrorIs(t, err, tt.mappingErr)
+
+			var permanentErr *targetInputError
+			require.Equal(t, tt.wantPermanent, errors.As(err, &permanentErr))
 		})
 	}
 }

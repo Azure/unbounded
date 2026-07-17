@@ -598,6 +598,11 @@ spec:
             - message: providerRef is immutable once set
               rule: '!has(oldSelf.providerRef) || (has(self.providerRef) && self.providerRef
                 == oldSelf.providerRef)'
+            - message: provider is required when providerRef is set
+              rule: '!has(self.providerRef) || has(self.provider)'
+            - message: provider is immutable once set
+              rule: '!has(oldSelf.provider) || (has(self.provider) && self.provider
+                == oldSelf.provider)'
           status:
             description: MachineStatus defines the observed state of a Machine.
             properties:

@@ -111,6 +111,8 @@ const (
 
 // MachineSpec defines the desired state of a Machine.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.providerRef) || (has(self.providerRef) && self.providerRef == oldSelf.providerRef)",message="providerRef is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!has(self.providerRef) || has(self.provider)",message="provider is required when providerRef is set"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)",message="provider is immutable once set"
 type MachineSpec struct {
 	// SSH contains the SSH connection and credential details for the
 	// machine.

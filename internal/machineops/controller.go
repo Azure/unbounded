@@ -66,6 +66,7 @@ type MachineOperationReconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperationcredentials,verbs=get;list;watch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineconfigurationversions,verbs=get;list
 // +kubebuilder:rbac:groups=infrastructure.unbounded-cloud.io,resources=azuremachines,verbs=get
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=list
 // +kubebuilder:rbac:groups="",resources=configmaps;services;secrets,verbs=get
