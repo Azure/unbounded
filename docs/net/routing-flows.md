@@ -432,7 +432,7 @@ results. During nexthop selection:
 The `unroute` CLI displays per-nexthop health state in the HEALTHY column:
 
 ```
-kubectl exec -n unbounded-net <pod> -c node -- unroute
+kubectl exec -n unbounded-system <pod> -c node -- unroute
 ```
 
 Output includes a HEALTHY column showing `Y` (healthy) or `N` (unhealthy) for

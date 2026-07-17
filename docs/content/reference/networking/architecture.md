@@ -52,7 +52,7 @@ rules:
 Manages site membership and SiteNodeSlice objects:
 
 - Matches node internal IPs against Site `nodeCidrs`.
-- Labels matching nodes with `net.unbounded-cloud.io/site=<name>`.
+- Labels matching nodes with `unbounded-cloud.io/site=<name>`.
 - Splits site nodes into **SiteNodeSlice** objects (max 500 nodes per slice to
   avoid etcd object size limits).
 - Slices are named `{site-name}-{index}` with OwnerReferences for automatic

@@ -54,8 +54,9 @@ over SSH. Given a `Machine` custom resource with SSH connection details, it:
 4. Watches for the corresponding `Node` object and transitions the Machine
    through its lifecycle phases.
 
-machina is deployed as a `Deployment` in the `unbounded-kube` namespace and is
-installed automatically by `kubectl unbounded site init`.
+machina is deployed by `unbounded-operator` when it is enabled in
+`Site.spec.components`. `kubectl unbounded site init` bootstraps the operator by
+default.
 
 See the [SSH guide]({{< relref "guides/ssh" >}}) for a hands-on walkthrough
 and the [Architecture reference]({{< relref "reference/architecture" >}}) for
@@ -119,7 +120,7 @@ The system is driven by Kubernetes custom resources:
 | CRD | API Group | Scope | Purpose |
 |-----|-----------|-------|---------|
 | **Machine** | `unbounded-cloud.io` | Cluster | Represents a remote host to be provisioned (SSH, cloud API, or PXE) |
-| **Site** | `net.unbounded-cloud.io` | Cluster | Groups nodes by internal IP range; allocates pod CIDRs |
+| **Site** | `unbounded-cloud.io` | Cluster | Groups nodes by internal IP range, allocates pod CIDRs, and declares enabled components |
 | **GatewayPool** | `net.unbounded-cloud.io` | Cluster | Defines a set of gateway nodes for inter-site routing |
 | **SitePeering** | `net.unbounded-cloud.io` | Cluster | Enables direct node-to-node tunnels between sites |
 
@@ -134,9 +135,9 @@ The flow varies by provisioning path, but all paths share the same final steps:
 
 **SSH path:**
 
-1. **`kubectl unbounded site init`** prepares the cluster: installs
-   unbounded-net, creates Site and GatewayPool resources, generates a bootstrap
-   token, and deploys the machina controller.
+1. **`kubectl unbounded site init`** prepares the cluster: bootstraps
+   `unbounded-operator`, creates Site and GatewayPool resources, records enabled
+   components, and generates a bootstrap token.
 2. **`kubectl unbounded machine register`** creates a `Machine` resource with
    SSH connection details.
 3. **machina** SSHs into the host, runs the install script, and waits for the

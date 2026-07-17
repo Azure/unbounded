@@ -561,6 +561,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes/api/blob/v0.36.2/LICENSE
+  - dependency: k8s.io/apiextensions-apiserver
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.0/LICENSE
   - dependency: k8s.io/apimachinery
     ecosystem: go
     copyright:

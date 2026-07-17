@@ -21,6 +21,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	controllerpkg "github.com/Azure/unbounded/internal/net/controller"
+
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 type failingNodeLister struct{}
@@ -46,8 +48,8 @@ func TestFetchClusterStatusFromCacheAndInformers(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "node-a",
 			Labels: map[string]string{
-				controllerpkg.SiteLabelKey: "site-a",
-				"role":                     "gateway",
+				unboundedv1alpha3.MachineSiteLabelKey: "site-a",
+				"role":                                "gateway",
 			},
 			Annotations: map[string]string{
 				controllerpkg.WireGuardPubKeyAnnotation: "pub-key-a",
@@ -614,8 +616,8 @@ func TestFetchClusterStatusDeletedK8sNodeShowsMissing(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "gateway-a",
 			Labels: map[string]string{
-				controllerpkg.SiteLabelKey: "site-a",
-				"role":                     "gateway",
+				unboundedv1alpha3.MachineSiteLabelKey: "site-a",
+				"role":                                "gateway",
 			},
 			Annotations: map[string]string{
 				controllerpkg.WireGuardPubKeyAnnotation: "pub-key-a",

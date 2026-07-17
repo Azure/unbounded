@@ -20,7 +20,7 @@ webhooks:
     clientConfig:
       service:
         name: unbounded-net-controller
-        namespace: {{ .Namespace }}
+        namespace: {{ default "unbounded-system" .Namespace }}
         path: /mutate-nodes
         port: 9999
     rules:

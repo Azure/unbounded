@@ -44,6 +44,9 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 		NodeCIDRs:       []string{"10.0.0.0/24"},
 		PodCIDRs:        []string{"10.1.0.0/24"},
 		ManageCniPlugin: true,
+		EnableMachina:   true,
+		EnableMetalman:  true,
+		EnableStorage:   true,
 		Manifests:       []string{"site.yaml"},
 	}
 
@@ -55,23 +58,42 @@ func TestEnsureUnboundedSite_DefaultTemplates(t *testing.T) {
 	err := h.ensureUnboundedSite(context.Background(), cfg)
 	require.NoError(t, err)
 
-	// Verify default mode uses net.unbounded-cloud.io apiVersion by
+	// Verify site init renders the promoted global Site API by
 	// rendering the template directly.
 	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
 	require.NoError(t, err)
 
 	appliedYAML = content
-	require.Contains(t, string(appliedYAML), "net.unbounded-cloud.io/v1alpha1")
-	require.NotContains(t, string(appliedYAML), "unbounded.aks.azure.com/v1alpha1")
+	require.Contains(t, string(appliedYAML), "unbounded-cloud.io/v1alpha3")
+	require.NotContains(t, string(appliedYAML), "net.unbounded-cloud.io/v1alpha1")
 }
 
-// TestSiteInitCommand_DefaultCNIManifests verifies the default --cni-manifests
-// value is empty so the embedded manifests are used.
-func TestSiteInitCommand_DefaultCNIManifests(t *testing.T) {
+func TestSiteInitCommand_ComponentFlags(t *testing.T) {
 	cmd := siteInitCommand()
-	f := cmd.Flags().Lookup("cni-manifests")
-	require.NotNil(t, f)
-	require.Equal(t, "", f.DefValue)
+
+	require.Nil(t, cmd.Flags().Lookup("cni-manifests"))
+	require.Nil(t, cmd.Flags().Lookup("machina-manifests"))
+	require.Nil(t, cmd.Flags().Lookup("enable-net"))
+
+	flag := cmd.Flags().Lookup("enable-machina")
+	require.NotNil(t, flag)
+	require.Equal(t, "true", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("enable-metalman")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("enable-storage")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("skip-install")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+
+	flag = cmd.Flags().Lookup("install-timeout")
+	require.NotNil(t, flag)
+	require.Equal(t, defaultInstallTimeout.String(), flag.DefValue)
 }
 
 func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {
@@ -95,6 +117,7 @@ func TestEnsureUnboundedSite_ManageCniPluginFalse(t *testing.T) {
 		NodeCIDRs:       []string{"10.0.0.0/24"},
 		PodCIDRs:        []string{"10.1.0.0/24"},
 		ManageCniPlugin: false,
+		EnableMachina:   true,
 		Manifests:       []string{"site.yaml"},
 	}
 
@@ -135,6 +158,7 @@ func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
 		NodeCIDRs:       []string{"10.0.0.0/24"},
 		PodCIDRs:        []string{"10.1.0.0/24"},
 		ManageCniPlugin: true,
+		EnableMachina:   true,
 		Manifests:       []string{"site.yaml"},
 	}
 
@@ -159,4 +183,109 @@ func TestEnsureUnboundedSite_ManageCniPluginTrue(t *testing.T) {
 	rendered := buf.String()
 	assert.NotContains(t, rendered, "manageCniPlugin")
 	assert.Contains(t, rendered, "name: test-site")
+}
+
+func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
+	cfg := unboundedSiteConfig{
+		SiteName:        "test-site",
+		NodeCIDRs:       []string{"10.0.0.0/24"},
+		PodCIDRs:        []string{"10.1.0.0/24"},
+		ManageCniPlugin: true,
+		EnableMachina:   true,
+		EnableMetalman:  true,
+		EnableStorage:   true,
+	}
+
+	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
+	require.NoError(t, err)
+
+	tmpl, err := template.New("site.yaml").Parse(string(content))
+	require.NoError(t, err)
+
+	var buf strings.Builder
+	require.NoError(t, tmpl.Execute(&buf, cfg))
+
+	rendered := buf.String()
+	assert.Contains(t, rendered, "apiVersion: unbounded-cloud.io/v1alpha3")
+	assert.NotContains(t, rendered, "net:")
+	assert.Contains(t, rendered, "machina:\n      enabled: true")
+	assert.Contains(t, rendered, "metalman:\n      enabled: true")
+	assert.Contains(t, rendered, "storage:\n      enabled: true")
+}
+
+func TestSiteInitComponentOwnership(t *testing.T) {
+	h := &siteInitHandler{
+		name:            "edge",
+		clusterNodeCIDR: "10.0.0.0/24",
+		clusterPodCIDR:  "10.1.0.0/24",
+		nodeCIDR:        "10.2.0.0/24",
+		podCIDR:         "10.3.0.0/24",
+		manageCniPlugin: true,
+		enableMachina:   true,
+		enableMetalman:  true,
+		enableStorage:   true,
+	}
+
+	cluster := h.clusterSiteConfig()
+	assert.True(t, cluster.EnableMachina)
+	assert.False(t, cluster.EnableStorage)
+	assert.False(t, cluster.EnableMetalman)
+
+	remote := h.remoteSiteConfig()
+	assert.False(t, remote.EnableMachina)
+	assert.True(t, remote.EnableStorage)
+	assert.True(t, remote.EnableMetalman)
+}
+
+func TestSiteInitValidateClusterCIDRMessages(t *testing.T) {
+	// A valid baseline handler; each case perturbs exactly one cluster CIDR
+	// field to assert the error message names the correct field (guarding
+	// against the previously swapped node/pod messages).
+	base := func() *siteInitHandler {
+		return &siteInitHandler{
+			name:            "edge",
+			clusterNodeCIDR: "10.0.0.0/24",
+			clusterPodCIDR:  "10.1.0.0/24",
+			nodeCIDR:        "10.2.0.0/24",
+			podCIDR:         "10.3.0.0/24",
+		}
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*siteInitHandler)
+		wantErr string
+	}{
+		{
+			name:    "missing cluster node CIDR",
+			mutate:  func(h *siteInitHandler) { h.clusterNodeCIDR = "" },
+			wantErr: "cluster node CIDR is required",
+		},
+		{
+			name:    "invalid cluster node CIDR",
+			mutate:  func(h *siteInitHandler) { h.clusterNodeCIDR = "not-a-cidr" },
+			wantErr: "cluster node CIDR is invalid",
+		},
+		{
+			name:    "missing cluster pod CIDR",
+			mutate:  func(h *siteInitHandler) { h.clusterPodCIDR = "" },
+			wantErr: "cluster pod CIDR is required",
+		},
+		{
+			name:    "invalid cluster pod CIDR",
+			mutate:  func(h *siteInitHandler) { h.clusterPodCIDR = "not-a-cidr" },
+			wantErr: "cluster pod CIDR is invalid",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := base()
+			tc.mutate(h)
+
+			err := h.validate()
+			require.Error(t, err)
+			require.EqualError(t, err, tc.wantErr)
+		})
+	}
 }

@@ -43,7 +43,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ $controllerName }}
-    namespace: {{ default "unbounded-kube" .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -76,7 +76,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ $controllerName }}
-    namespace: {{ default "unbounded-kube" .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -108,14 +108,14 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ $controllerName }}
-    namespace: {{ default "unbounded-kube" .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ $controllerName }}
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
@@ -135,7 +135,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ $controllerName }}
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: {{ $controllerName }}
     app.kubernetes.io/component: controller
@@ -146,4 +146,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ $controllerName }}
-    namespace: {{ default "unbounded-kube" .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}

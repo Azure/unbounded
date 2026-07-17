@@ -22,6 +22,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 var scheme = runtime.NewScheme()
@@ -128,11 +129,11 @@ func machinaCacheOptions() cache.Options {
 	return cache.Options{
 		ByObject: map[client.Object]cache.ByObject{
 			// Limit Secret caching to bootstrap tokens in kube-system and
-			// Machina-managed secrets in the controller namespace.
+			// Machina-managed secrets in the controller's own namespace.
 			&corev1.Secret{}: {
 				Namespaces: map[string]cache.Config{
-					metav1.NamespaceSystem:       {},
-					SecretNamespaceUnboundedKube: {},
+					metav1.NamespaceSystem:      {},
+					unbounded.SystemNamespace(): {},
 				},
 			},
 		},

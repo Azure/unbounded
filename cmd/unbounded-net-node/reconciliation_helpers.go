@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 )
@@ -30,7 +31,7 @@ func healthCheckLogScope(gvr schema.GroupVersionResource, name string) string {
 	return fmt.Sprintf("%s, Name=%s", gvr.String(), name)
 }
 
-func effectiveSiteHealthCheckSettings(mySiteName string, siteMap map[string]*unboundednetv1alpha1.Site) (bool, healthcheck.HealthCheckSettings) {
+func effectiveSiteHealthCheckSettings(mySiteName string, siteMap map[string]*unboundedv1alpha3.Site) (bool, healthcheck.HealthCheckSettings) {
 	if mySiteName == "" {
 		return true, healthcheck.DefaultSettings()
 	}

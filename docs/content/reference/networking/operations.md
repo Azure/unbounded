@@ -1,7 +1,7 @@
 ---
 title: "Operations"
 weight: 5
-description: "Deployment, monitoring, troubleshooting, and operational procedures for unbounded-net."
+description: "Deployment, monitoring, troubleshooting, and operational procedures for unbounded-system."
 ---
 
 This guide covers deployment, monitoring, troubleshooting, and day-2 operations.
@@ -33,19 +33,19 @@ wg --version
 
 ### Installation Steps
 
-1. **Deploy CRDs**: `kubectl apply -f deploy/machina/crd/`
-2. **Deploy Controller**: `kubectl apply -f deploy/controller/`
-3. **Deploy Node Agent**: `kubectl apply -f deploy/node/`
-4. **Create Sites**: Define Site resources with `nodeCidrs` and
-   `podCidrAssignments`.
-5. **Create GatewayPools**: Define pools with `nodeSelector`.
-6. **Assign Sites to Pools**: Create SiteGatewayPoolAssignment resources.
-7. **Label Gateway Nodes**:
+1. **Bootstrap CRDs and operator**: `kubectl unbounded install`
+2. **Create Sites**: Define Site resources with `nodeCidrs`,
+   `podCidrAssignments`, and `components.net.enabled: true` on the cluster
+   owner Site.
+3. **Create GatewayPools**: Define pools with `nodeSelector`.
+4. **Assign Sites to Pools**: Create SiteGatewayPoolAssignment resources.
+5. **Label Gateway Nodes**:
    `kubectl label node <name> net.unbounded-cloud.io/gateway=true`
-8. **Verify Connectivity**: Test with pod-to-pod ping across sites.
+6. **Verify Connectivity**: Test with pod-to-pod ping across sites.
 
-> **Note:** When using Unbounded, steps 1-7 are handled automatically by
-> `kubectl unbounded site init`. See the
+> **Note:** `kubectl unbounded site init` runs the bootstrap step by default,
+> creates the initial Site and gateway resources, and lets the operator deploy
+> controller and node workloads. See the
 > [Getting Started guide]({{< relref "guides/getting-started" >}}).
 
 ---
@@ -57,7 +57,7 @@ wg --version
 The controller provides a real-time web dashboard:
 
 ```bash
-kubectl -n kube-system port-forward deploy/unbounded-net-controller 9999:9999
+kubectl -n unbounded-system port-forward deploy/unbounded-net-controller 9999:9999
 # Open http://localhost:9999/status
 ```
 
@@ -137,11 +137,11 @@ bpftool map dump name unb_endpts
 
 **Using the `unroute` diagnostic tool** (included in node agent image):
 ```bash
-kubectl -n kube-system exec <node-agent-pod> -- unroute           # dump all
-kubectl -n kube-system exec <node-agent-pod> -- unroute <ip>      # lookup
-kubectl -n kube-system exec <node-agent-pod> -- unroute -4        # v4 only
-kubectl -n kube-system exec <node-agent-pod> -- unroute -6        # v6 only
-kubectl -n kube-system exec <node-agent-pod> -- unroute --raw     # raw key/value hex
+kubectl -n unbounded-system exec <node-agent-pod> -- unroute           # dump all
+kubectl -n unbounded-system exec <node-agent-pod> -- unroute <ip>      # lookup
+kubectl -n unbounded-system exec <node-agent-pod> -- unroute -4        # v4 only
+kubectl -n unbounded-system exec <node-agent-pod> -- unroute -6        # v6 only
+kubectl -n unbounded-system exec <node-agent-pod> -- unroute --raw     # raw key/value hex
 ```
 
 **Via kubectl plugin:**
@@ -154,10 +154,10 @@ kubectl unbounded net node show <name> json    # full status
 
 ### Migrating from Cilium
 
-When unbounded-net becomes the primary CNI on a node that previously ran
+When unbounded-system becomes the primary CNI on a node that previously ran
 Cilium, the safest migration is to rebuild or re-image the node before joining
 it back to the cluster. If the node must be reused in place, run Cilium's
-documented cleanup before starting unbounded-net. Cilium can leave host routes,
+documented cleanup before starting unbounded-system. Cilium can leave host routes,
 links, cgroup socket-LB programs, and service-LB maps that continue to affect
 pod and ClusterIP traffic after the DaemonSet is gone.
 
@@ -191,7 +191,7 @@ Recommended migration flow:
    The link, rule, program, and map checks should return no Cilium state.
 
 6. Remove any remaining Cilium CNI config from `/etc/cni/net.d`.
-7. Deploy unbounded-net and confirm pod routes use `unbounded0`.
+7. Deploy unbounded-system and confirm pod routes use `unbounded0`.
 
 If this cleanup is skipped or incomplete, direct pod IP traffic can still use
 `cilium_host`, and kube-dns ClusterIP traffic can still be rewritten by stale
@@ -227,9 +227,9 @@ ip route show dev wg51821
 
 **Check:**
 ```bash
-kubectl get node <name> -L net.unbounded-cloud.io/site
+kubectl get node <name> -L unbounded-cloud.io/site
 kubectl get sites -o yaml
-kubectl -n kube-system logs -l app=unbounded-net-controller | grep -i alloc
+kubectl -n unbounded-system logs -l app.kubernetes.io/name=unbounded-net-controller | grep -i alloc
 ```
 
 **Common causes:**
@@ -278,7 +278,7 @@ ip route | grep <remote-site-cidr>
 **Check:**
 ```bash
 curl -v http://<gateway-health-ip>:9998/healthz
-kubectl -n kube-system logs <gateway-node-agent-pod>
+kubectl -n unbounded-system logs <gateway-node-agent-pod>
 ```
 
 **Common causes:**
@@ -292,14 +292,14 @@ kubectl -n kube-system logs <gateway-node-agent-pod>
 
 **Check:**
 ```bash
-kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=unbounded-net-controller
-kubectl -n kube-system get endpoints unbounded-net-controller 2>&1
+kubectl -n unbounded-system get endpointslices -l kubernetes.io/service-name=unbounded-net-controller
+kubectl -n unbounded-system get endpoints unbounded-net-controller 2>&1
 ```
 
 **Common causes:**
 - Stale `v1/Endpoints` from a previous controller version. The controller
   cleans these on leader election, but during upgrades it may be needed:
-  `kubectl -n kube-system delete endpoints unbounded-net-controller`
+  `kubectl -n unbounded-system delete endpoints unbounded-net-controller`
 
 > **Note:** The controller Service has **no selector**. The leader manages its
 > own EndpointSlice. Do not add a selector.
@@ -310,7 +310,7 @@ kubectl -n kube-system get endpoints unbounded-net-controller 2>&1
 # Cluster overview
 kubectl get st                                    # Sites
 kubectl get gp                                    # Gateway pools
-kubectl get nodes -L net.unbounded-cloud.io/site   # Node assignments
+kubectl get nodes -L unbounded-cloud.io/site   # Node assignments
 
 # Per-node (eBPF)
 tc filter show dev unbounded0 egress              # BPF program
@@ -325,11 +325,11 @@ ip route show table main | grep -E 'wg|cbr|unbounded'
 cat /etc/cni/net.d/10-unbounded.conflist
 
 # Controller
-kubectl -n kube-system get lease unbounded-net-controller -o yaml
-kubectl -n kube-system logs -l app=unbounded-net-controller --tail=100
+kubectl -n unbounded-system get lease unbounded-net-controller -o yaml
+kubectl -n unbounded-system logs -l app.kubernetes.io/name=unbounded-net-controller --tail=100
 
 # Node agent
-kubectl -n kube-system logs -l app=unbounded-net-node --tail=100
+kubectl -n unbounded-system logs -l app.kubernetes.io/name=unbounded-net-node --tail=100
 ```
 
 ### Debug Logging
@@ -374,8 +374,8 @@ Edit the Site to add CIDR blocks under `podCidrAssignments[].cidrBlocks`.
 ### Rolling Restart
 
 ```bash
-kubectl -n kube-system rollout restart daemonset/unbounded-net-node
-kubectl -n kube-system rollout status daemonset/unbounded-net-node
+kubectl -n unbounded-system rollout restart daemonset/unbounded-net-node
+kubectl -n unbounded-system rollout status daemonset/unbounded-net-node
 ```
 
 ---
@@ -397,10 +397,10 @@ need backup.
 
 ### Recovery
 
-1. Restore CRDs: `kubectl apply -f deploy/machina/crd/`
+1. Bootstrap CRDs and the operator: `kubectl unbounded install`.
 2. Restore resources from backup YAMLs.
-3. Deploy controller and node agent.
-4. Re-apply gateway labels.
+3. Re-apply gateway labels.
+4. Verify the operator reconciles the controller and node agent.
 
 ---
 
@@ -412,12 +412,12 @@ need backup.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-unbounded-net
-  namespace: kube-system
+  name: allow-unbounded-system
+  namespace: unbounded-system
 spec:
   podSelector:
     matchLabels:
-      app: unbounded-net-node
+      app.kubernetes.io/name: unbounded-net-node
   policyTypes: [Ingress, Egress]
   ingress:
     - ports:

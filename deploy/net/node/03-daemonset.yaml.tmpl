@@ -6,7 +6,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: unbounded-net-node
-  namespace: {{ .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-net-node
     app.kubernetes.io/component: node

@@ -5,6 +5,8 @@ package rootfs
 
 import (
 	"bytes"
+	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
@@ -239,6 +242,21 @@ func TestNSpawnConfig_NVIDIADriverRootMounts(t *testing.T) {
 	require.NotContains(t, buf.String(), ":/run/nvidia/driver")
 }
 
+func TestNSpawnConfig_AdditionalHostMounts(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
+		AdditionalHostMounts: []config.AdditionalHostMount{
+			{Source: "/opt/config", Target: "/opt/config", ReadOnly: true},
+			{Source: "/var/lib/data", Target: "/data"},
+		},
+	}))
+
+	require.Contains(t, buf.String(), "BindReadOnly=/opt/config:/opt/config")
+	require.Contains(t, buf.String(), "Bind=/var/lib/data:/data")
+}
+
 func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	t.Parallel()
 
@@ -364,4 +382,71 @@ func requireBPFFSExecStartPreOrder(t *testing.T, out, bpffsPath string) {
 	require.Contains(t, out, mount)
 	require.Less(t, strings.Index(out, "[Service]"), strings.Index(out, mkdir))
 	require.Less(t, strings.Index(out, mkdir), strings.Index(out, mount))
+}
+
+// TestAdditionalHostMounts_ConfigToNSpawn exercises the full AdditionalHostMounts
+// pipeline from a JSON agent config through to the rendered nspawn.conf content.
+// It validates that:
+//   - The AdditionalHostMounts field survives JSON round-trip unmarshalling.
+//   - ValidateAdditionalHostMounts accepts the entries.
+//   - ResolveMachine defaults an omitted Target to the Source path.
+//   - The resolved mounts render to the correct Bind / BindReadOnly directives.
+func TestAdditionalHostMounts_ConfigToNSpawn(t *testing.T) {
+	t.Parallel()
+
+	// Step 1: parse an AgentConfig with AdditionalHostMounts from JSON - the
+	// same format a real operator would supply.
+	const cfgJSON = `{
+		"MachineName": "machine-1",
+		"NodeName": "node-1",
+		"AdditionalHostMounts": [
+			{"Source": "/opt/config", "ReadOnly": true},
+			{"Source": "/var/lib/data", "Target": "/data"}
+		],
+		"Cluster": {"CaCertBase64": "Y2EtYnl0ZXM=", "ClusterDNS": "10.0.0.10"},
+		"Kubelet": {"ApiServer": "https://api.example.com"}
+	}`
+
+	var cfg config.AgentConfig
+	require.NoError(t, json.Unmarshal([]byte(cfgJSON), &cfg))
+
+	// Step 2: validate - both entries must pass path validation.
+	require.NoError(t, config.ValidateAdditionalHostMounts(cfg.AdditionalHostMounts))
+
+	// Step 3: resolve the goal state. ResolveMachine defaults an omitted
+	// Target to the Source value; verify that invariant holds.
+	log := slog.New(slog.DiscardHandler)
+	gs, err := goalstates.ResolveMachine(log, &cfg, "machine-1", nil)
+	require.NoError(t, err)
+
+	require.Len(t, gs.RootFS.AdditionalHostMounts, 2)
+	// First entry: no Target in JSON - must default to Source.
+	require.Equal(t, "/opt/config", gs.RootFS.AdditionalHostMounts[0].Source)
+	require.Equal(t, "/opt/config", gs.RootFS.AdditionalHostMounts[0].Target)
+	require.True(t, gs.RootFS.AdditionalHostMounts[0].ReadOnly)
+	// Second entry: explicit Target must be preserved as-is.
+	require.Equal(t, "/var/lib/data", gs.RootFS.AdditionalHostMounts[1].Source)
+	require.Equal(t, "/data", gs.RootFS.AdditionalHostMounts[1].Target)
+	require.False(t, gs.RootFS.AdditionalHostMounts[1].ReadOnly)
+	// The original config slice must not be mutated by resolution.
+	require.Empty(t, cfg.AdditionalHostMounts[0].Target,
+		"ResolveMachine must not mutate the caller's config slice")
+
+	// Step 4: render the nspawn.conf template with the resolved mounts and
+	// verify that the correct Bind / BindReadOnly directives are emitted.
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "nspawn.conf", nspawnTemplateData{
+		BPFFSMountPath:               goalstates.BPFFSMountPath("machine-1"),
+		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
+		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
+		AdditionalHostMounts:         gs.RootFS.AdditionalHostMounts,
+	}))
+
+	out := buf.String()
+	// Read-only mount must use BindReadOnly with source:target notation.
+	require.Contains(t, out, "BindReadOnly=/opt/config:/opt/config")
+	// Writable mount must use Bind with source:target notation.
+	require.Contains(t, out, "Bind=/var/lib/data:/data")
+	// The writable mount must not appear as a BindReadOnly entry.
+	require.NotContains(t, out, "BindReadOnly=/var/lib/data")
 }

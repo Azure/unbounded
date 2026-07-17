@@ -15,17 +15,38 @@ fi
 kubectl config use-context "kind-${CLUSTER_NAME}"
 kubectl cluster-info
 
-kubectl apply -f deploy/inventory/common/01-namespace.yaml
-sed "s/{{ SSL_MODE }}/disable/" deploy/inventory/common/02-config.yaml | kubectl apply -f -
+NAMESPACE="${INVENTORY_NAMESPACE:-unbounded-system}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RENDER_DIR="$(mktemp -d)"
+trap 'rm -rf "${RENDER_DIR}"' EXIT
+
+# Render the namespace and database ConfigMap (the secret is rendered
+# separately below only when it does not already exist, so we never
+# overwrite a previously generated password).
+go run "${REPO_ROOT}/hack/cmd/render-manifests" \
+  --templates-dir "${REPO_ROOT}/deploy/inventory" \
+  --output-dir "${RENDER_DIR}" \
+  --set Namespace="${NAMESPACE}" \
+  --set SSLMode=disable \
+  --set Password=cGxhY2Vob2xkZXI=
+
+kubectl apply -f "${RENDER_DIR}/common/01-namespace.yaml"
+kubectl apply -f "${RENDER_DIR}/common/02-config.yaml"
 
 # Skip re-creating the pg-creds secret if it already exists.
-if kubectl get secret pg-creds -n inventory-collector &>/dev/null; then
+if kubectl get secret pg-creds -n "${NAMESPACE}" &>/dev/null; then
   echo "Secret 'pg-creds' already exists, skipping creation"
 else
   echo "Creating secret 'pg-creds'..."
   PG_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
   PG_PASSWORD_B64="$(echo -n "${PG_PASSWORD}" | base64)"
-  sed "s/{{ PASSWORD }}/${PG_PASSWORD_B64}/" deploy/inventory/common/03-secret.yaml | sed "s/DB_PASSWORD/POSTGRES_PASSWORD/" | kubectl apply -f -
+  go run "${REPO_ROOT}/hack/cmd/render-manifests" \
+    --templates-dir "${REPO_ROOT}/deploy/inventory" \
+    --output-dir "${RENDER_DIR}" \
+    --set Namespace="${NAMESPACE}" \
+    --set SSLMode=disable \
+    --set Password="${PG_PASSWORD_B64}"
+  kubectl apply -f "${RENDER_DIR}/common/03-secret.yaml"
 fi
 
 echo "Done."

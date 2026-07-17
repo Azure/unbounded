@@ -14,6 +14,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -94,6 +95,7 @@ type nspawnTemplateData struct {
 	ContainerImageArchiveHostDir string
 	HostDevicePaths              []string
 	HostDeviceGroupSpecifiers    []string
+	AdditionalHostMounts         []config.AdditionalHostMount
 	// NvidiaDeviceTargets contains render-ready Bind+DeviceAllow pairs.
 	NvidiaDeviceTargets    []NSpawnDeviceTarget
 	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount
@@ -103,8 +105,8 @@ type nspawnTemplateData struct {
 	AMDSysFSPaths          []string
 }
 
-// TODO: migrate HostDevicePaths/HostDeviceGroupSpecifiers and AMDGPUDevicePaths
-// to structured bind/device-allow targets in a follow-up PR.
+// TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
+// and AMDGPUDevicePaths to structured bind/device-allow targets in a follow-up PR.
 
 // writeNSpawnConfigs renders the nspawn and service-override templates with
 // device and GPU data (when present) and writes them to their configured paths.
@@ -129,6 +131,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		HostDevicePaths:              hostDevicePaths,
 		HostDeviceGroupSpecifiers:    hostDeviceGroupSpecifiers,
+		AdditionalHostMounts:         e.goalState.AdditionalHostMounts,
 		NvidiaDeviceTargets:          nvidiaNSpawnDeviceTargets(e.goalState.Nvidia.GPUDevicePaths),
 		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       e.goalState.Nvidia.I386LibDirMounts,
@@ -145,6 +148,11 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 			"block", len(e.goalState.HostDevices.Block),
 			"infiniband", len(e.goalState.HostDevices.Infiniband),
 			"additional", len(e.goalState.HostDevices.Additional))
+	}
+
+	if len(e.goalState.AdditionalHostMounts) > 0 {
+		e.log.Info("additional host mounts configured",
+			"count", len(e.goalState.AdditionalHostMounts))
 	}
 
 	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
