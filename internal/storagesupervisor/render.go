@@ -36,11 +36,11 @@ type renderState struct {
 // The per-node mesh fields (self and discovered peer set) come from state,
 // computed from the Kubernetes node watch. When the ring is active, this node's
 // peer name is injected and discovered peers are merged with any peers declared
-// in the YAML (discovered peers win on name collision). TCP rings also override
-// startup.fabric.tcp.addr with the node's own routable bind. The default disk
-// set is populated from the self node's storage disk annotations, or from a
-// default file-backed disk when no valid annotation disks are present. Loadgen
-// annotations append synthetic frontends for this node.
+// in the YAML (discovered peers win on name collision). TCP and TLS TCP rings
+// also override the fabric addr with the node's own routable bind. The default
+// disk set is populated from the self node's storage disk annotations, or from
+// a default file-backed disk when no valid annotation disks are present.
+// Loadgen annotations append synthetic frontends for this node.
 func RenderConfig(sourceDir string, state renderState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {
@@ -189,8 +189,15 @@ func applyRing(cfg *storageconfig.Config, ring ringState) {
 			cfg.Startup.Fabric = &storageconfig.FabricCfg{}
 		}
 
-		cfg.Startup.Fabric.Binds = &storageconfig.FabricCfg_Tcp{
-			Tcp: &storageconfig.TcpFabricBinds{Addr: ring.selfListenAddr},
+		if tls := cfg.Startup.Fabric.GetTlsTcp(); tls != nil {
+			resolved := &storageconfig.TlsTcpFabricBinds{}
+			proto.Merge(resolved, tls)
+			resolved.Addr = ring.selfListenAddr
+			cfg.Startup.Fabric.Binds = &storageconfig.FabricCfg_TlsTcp{TlsTcp: resolved}
+		} else {
+			cfg.Startup.Fabric.Binds = &storageconfig.FabricCfg_Tcp{
+				Tcp: &storageconfig.TcpFabricBinds{Addr: ring.selfListenAddr},
+			}
 		}
 	}
 }

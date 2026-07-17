@@ -15,6 +15,7 @@ mod fingers;
 mod handler;
 mod ring;
 mod routing_handle;
+pub mod tcp_rpc;
 mod transport;
 mod types;
 

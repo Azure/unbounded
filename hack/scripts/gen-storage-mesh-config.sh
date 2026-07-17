@@ -4,7 +4,7 @@
 
 # gen-storage-mesh-config.sh -- Generate a test unbounded-storage TOML config
 # for one node of the current Kubernetes cluster, wiring every selected node in
-# as a named TCP peer using each node's InternalIP.
+# as a named authenticated TCP RPC peer using each node's InternalIP.
 #
 # Usage:
 #   hack/scripts/gen-storage-mesh-config.sh [options]
@@ -17,7 +17,13 @@
 #                            user-mode nodes only, excluding net gateways)
 #       --local-node NAME    node this config is for (defaults to the local
 #                            machine's hostname)
-#       --port PORT          fabric / peer TCP port (default 7000)
+#       --port PORT          peer TCP RPC port (default 7000)
+#       --peer-ca-cert PATH  peer CA certificate path (default
+#                            /etc/unbounded-storage/tls/ca.crt)
+#       --peer-cert PATH     local peer certificate path (default
+#                            /etc/unbounded-storage/tls/tls.crt)
+#       --peer-key PATH      local peer private key path (default
+#                            /etc/unbounded-storage/tls/tls.key)
 #       --frontend-port PORT frontend bind port (default 9000)
 #       --metrics-port PORT  Prometheus metrics exporter bind port (default 9100)
 #       --origin HOST:PORT   s3 backend origin endpoint as host:port, no scheme
@@ -38,7 +44,7 @@
 
 set -euo pipefail
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# -- helpers ------------------------------------------------------------------
 
 die() {
 	echo "error: $*" >&2
@@ -58,7 +64,7 @@ require_cmd() {
 	command -v "$1" >/dev/null 2>&1 || die "$1 not found. $2"
 }
 
-# ── argument parsing ──────────────────────────────────────────────────────────
+# -- argument parsing ---------------------------------------------------------
 
 OPT_CONTEXT=""
 # Default to user-mode nodes only, excluding unbounded-net gateway nodes. The
@@ -66,6 +72,9 @@ OPT_CONTEXT=""
 OPT_SELECTOR="kubernetes.azure.com/mode=user,unbounded-cloud.io/unbounded-net-gateway!=true"
 OPT_LOCAL_NODE=""
 OPT_PORT="7000"
+OPT_PEER_CA_CERT="/etc/unbounded-storage/tls/ca.crt"
+OPT_PEER_CERT="/etc/unbounded-storage/tls/tls.crt"
+OPT_PEER_KEY="/etc/unbounded-storage/tls/tls.key"
 OPT_FRONTEND_PORT="9000"
 OPT_METRICS_PORT="9100"
 # Empty means "derive the s3 origin from the orca service ClusterIP" (see the
@@ -97,6 +106,18 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--port)
 		OPT_PORT="$2"
+		shift 2
+		;;
+	--peer-ca-cert)
+		OPT_PEER_CA_CERT="$2"
+		shift 2
+		;;
+	--peer-cert)
+		OPT_PEER_CERT="$2"
+		shift 2
+		;;
+	--peer-key)
+		OPT_PEER_KEY="$2"
 		shift 2
 		;;
 	--frontend-port)
@@ -132,7 +153,7 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-# ── preflight checks ──────────────────────────────────────────────────────────
+# -- preflight checks ---------------------------------------------------------
 
 require_cmd kubectl "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
 
@@ -140,8 +161,11 @@ require_cmd kubectl "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
 [[ "$OPT_FRONTEND_PORT" =~ ^[0-9]+$ ]] || die "--frontend-port must be a number (got '$OPT_FRONTEND_PORT')."
 [[ "$OPT_METRICS_PORT" =~ ^[0-9]+$ ]] || die "--metrics-port must be a number (got '$OPT_METRICS_PORT')."
 [[ "$OPT_ORCA_PORT" =~ ^[0-9]+$ ]] || die "--orca-port must be a number (got '$OPT_ORCA_PORT')."
+[[ -r "$OPT_PEER_CA_CERT" ]] || die "peer CA certificate is not readable: $OPT_PEER_CA_CERT"
+[[ -r "$OPT_PEER_CERT" ]] || die "peer certificate is not readable: $OPT_PEER_CERT"
+[[ -r "$OPT_PEER_KEY" ]] || die "peer private key is not readable: $OPT_PEER_KEY"
 
-# ── kubectl context args ──────────────────────────────────────────────────────
+# -- kubectl context args -----------------------------------------------------
 
 KUBECTL_CTX_ARGS=()
 if [[ -n "$OPT_CONTEXT" ]]; then
@@ -153,7 +177,7 @@ if [[ -n "$OPT_SELECTOR" ]]; then
 	KUBECTL_SEL_ARGS=(-l "$OPT_SELECTOR")
 fi
 
-# ── resolve a working kubeconfig ──────────────────────────────────────────────
+# -- resolve a working kubeconfig --------------------------------------------
 
 # Fall back to the kubelet's kubeconfig when the default one kubectl would use
 # can't reach the API server. This lets the script run on a cluster node that
@@ -183,7 +207,7 @@ if ! api_reachable; then
 	fi
 fi
 
-# ── fetch node name / InternalIP pairs ────────────────────────────────────────
+# -- fetch node name / InternalIP pairs --------------------------------------
 
 # One "<name> <internal-ip>" line per node. Nodes without an InternalIP emit a
 # trailing-space line and are rejected below so a missing address fails loudly
@@ -207,7 +231,7 @@ done <<<"$NODE_LINES"
 
 NODE_COUNT="${#NAMES[@]}"
 
-# ── pick the local node ───────────────────────────────────────────────────────
+# -- pick the local node ------------------------------------------------------
 
 # Default the local node to this machine's hostname when not given explicitly,
 # so the script picks the right peer config for the host it runs on.
@@ -229,7 +253,7 @@ done
 LOCAL_NAME="${NAMES[$LOCAL_IDX]}"
 LOCAL_IP="${IPS[$LOCAL_IDX]}"
 
-# ── resolve the s3 origin endpoint ────────────────────────────────────────────
+# -- resolve the s3 origin endpoint ------------------------------------------
 
 # When --origin is not given, point the s3 backend at the orca service. DNS is
 # not configured on the host, so resolve the service's ClusterIP via the API
@@ -245,7 +269,7 @@ if [[ -z "$OPT_ORIGIN" ]]; then
 	OPT_ORIGIN="${ORCA_CLUSTER_IP}:${OPT_ORCA_PORT}"
 fi
 
-# ── emit the config ───────────────────────────────────────────────────────────
+# -- emit the config ----------------------------------------------------------
 
 # Sample sizing for the file-backed test disk and origin backend stripe.
 DISK_SIZE=$((2 * 1024 * 1024 * 1024)) # 2 GiB
@@ -271,7 +295,7 @@ cat >&3 <<EOF
 #   peer roster: $NODE_COUNT node(s) selected by name
 #
 # Every selected node in the cluster is wired into the peer roster below. The
-# local process identity is selected by self; internal ring and fabric ids are
+# local process identity is selected by self; internal ring and transport ids are
 # derived from peer names. Regenerate the peer config for a different node with
 # --local-node <name>.
 
@@ -285,15 +309,16 @@ url = "$OPT_ORIGIN"
 stripe_size_bytes = $STRIPE_SIZE
 EOF
 
-# Peers: every selected node, including self. Fabric reconcile excludes self.
+# Peers: every selected node, including self. Peer reconcile excludes self.
 for i in "${!NAMES[@]}"; do
 	cat >&3 <<EOF
 
 [[peers]]
 name = "${NAMES[$i]}"
 
-[peers.config.tcp]
+[peers.config.tls_tcp]
 addr = "${IPS[$i]}:$OPT_PORT"
+server_name = "${NAMES[$i]}"
 EOF
 done
 
@@ -318,12 +343,17 @@ source = "cache"
 [frontends.config.http]
 addr = "0.0.0.0:$OPT_FRONTEND_PORT"
 
-[startup.fabric.binds.tcp]
-# Bind the node's own routable IP, not 0.0.0.0. This must be the exact
-# address peers use to reach this node (their [[peers]] TCP addr points here);
-# the libfabric tcp provider uses it both to bind and as its
-# connection-manager identity and does not come up on an INADDR_ANY bind.
+[startup.fabric.binds.tls_tcp]
+# Bind the node's own routable IP. Peer certificates must contain the exact
+# Kubernetes node name in a DNS SAN and chain to the configured CA.
 addr = "$LOCAL_IP:$OPT_PORT"
+ca_cert_path = "$OPT_PEER_CA_CERT"
+cert_path = "$OPT_PEER_CERT"
+key_path = "$OPT_PEER_KEY"
+lanes = 4
+request_timeout_ms = 30000
+socket_buffer_bytes = 16777216
+ring_depth = 4096
 
 [startup.metrics]
 # Prometheus text-format exporter on GET /metrics. Bind 0.0.0.0 so an

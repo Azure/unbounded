@@ -98,6 +98,8 @@ impl FakeBackend {
 
         if origin.is_metadata_entry() {
             self.fill_metadata(dsts)
+        } else if req.fabric_only() {
+            self.fill_zeroes(dsts)
         } else {
             let Some(start_offset) = origin
                 .stripe_idx
@@ -126,6 +128,24 @@ impl FakeBackend {
             ));
         }
         copy_body_into_pages(&self.metadata_body, dsts, self.backing_base, self.page_size)
+    }
+
+    fn fill_zeroes(&self, dsts: &[PageRef]) -> Result<(), Error> {
+        for page in dsts {
+            let page_end = (page.offset as usize)
+                .checked_add(page.len as usize)
+                .ok_or_else(|| Error::from("fake backend: destination range overflow"))?;
+            if page_end > self.page_size {
+                return Err(Error::from("fake backend: destination exceeds page"));
+            }
+            let start = (page.page_idx as usize)
+                .checked_mul(self.page_size)
+                .and_then(|base| base.checked_add(page.offset as usize))
+                .ok_or_else(|| Error::from("fake backend: destination offset overflow"))?;
+            // SAFETY: the pool supplies PageRefs within its live backing.
+            unsafe { std::ptr::write_bytes(self.backing_base.add(start), 0, page.len as usize) };
+        }
+        Ok(())
     }
 }
 
@@ -289,6 +309,27 @@ mod tests {
         let pages = drain(backend.fetch_stream(&req, src, &dsts)).expect("fill");
         assert_eq!(pages.len(), 2, "every destination page must be yielded");
         assert!(crate::storage::synthetic_matches_bytes(object, 0, &buf));
+    }
+
+    #[test]
+    fn fabric_only_data_request_fills_zeroes() {
+        let (mut buf, dsts) = backing(2);
+        let backend = fake_backend(&mut buf, 8192);
+
+        let object_id = crate::storage::synthetic_object_id(7, 11);
+        let origin = OriginRef::new("fake", object_id, 0);
+        let req = StripeReq::new(origin.stripe_key())
+            .with_origin(origin.clone())
+            .with_fabric_only(true);
+        let src = BulkRef {
+            stripe: origin_key(),
+            offset: 0,
+            len: (2 * PAGE_SIZE) as u32,
+        };
+
+        let pages = drain(backend.fetch_stream(&req, src, &dsts)).expect("fill");
+        assert_eq!(pages.len(), 2);
+        assert!(buf.iter().all(|byte| *byte == 0));
     }
 
     #[test]

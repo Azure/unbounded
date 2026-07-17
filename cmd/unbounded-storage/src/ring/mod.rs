@@ -10,6 +10,7 @@
 //! [`StorageRing`].
 
 mod core;
+mod exact;
 mod network;
 mod registry;
 mod storage;

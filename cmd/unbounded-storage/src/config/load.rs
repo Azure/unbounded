@@ -104,6 +104,16 @@ pub enum ConfigError {
         peer_name: String,
         addr: String,
     },
+    InvalidTlsTcpBindAddr(String),
+    ZeroTlsTcpBindPort(String),
+    EmptyTlsTcpCertPath(&'static str),
+    ZeroTlsTcpLanes,
+    ZeroTlsTcpRingDepth,
+    TlsTcpPeerTransportMismatch(String),
+    TlsTcpServerNameMismatch {
+        peer_name: String,
+        server_name: String,
+    },
     InvalidNativePeerAddr {
         peer_name: String,
         addr: String,
@@ -207,6 +217,35 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidTcpAddr { peer_name, addr } => {
                 write!(f, "peer {peer_name:?}: invalid tcp socket address {addr:?}")
             }
+            ConfigError::InvalidTlsTcpBindAddr(addr) => {
+                write!(
+                    f,
+                    "tls_tcp bind addr {addr:?} is not a valid socket address"
+                )
+            }
+            ConfigError::ZeroTlsTcpBindPort(addr) => {
+                write!(f, "tls_tcp bind addr {addr:?} must use a nonzero port")
+            }
+            ConfigError::EmptyTlsTcpCertPath(field) => {
+                write!(f, "tls_tcp bind {field} must not be empty")
+            }
+            ConfigError::ZeroTlsTcpLanes => {
+                write!(f, "tls_tcp bind lanes must be greater than zero")
+            }
+            ConfigError::ZeroTlsTcpRingDepth => {
+                write!(f, "tls_tcp bind ring_depth must be greater than zero")
+            }
+            ConfigError::TlsTcpPeerTransportMismatch(peer_name) => write!(
+                f,
+                "peer {peer_name:?}: config must use tls_tcp when the fabric bind uses tls_tcp"
+            ),
+            ConfigError::TlsTcpServerNameMismatch {
+                peer_name,
+                server_name,
+            } => write!(
+                f,
+                "peer {peer_name:?}: tls_tcp server_name {server_name:?} must match the peer name"
+            ),
             ConfigError::InvalidNativePeerAddr { peer_name, addr } => {
                 write!(
                     f,
@@ -402,6 +441,8 @@ fn has_binpb_extension(path: &Path) -> bool {
 }
 
 fn validate(cfg: &Config) -> Result<(), ConfigError> {
+    validate_tls_tcp_fabric(cfg)?;
+
     let mut seen_backends: HashSet<&str> = HashSet::new();
     for b in &cfg.backends {
         if b.name.is_empty() {
@@ -679,7 +720,28 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
                     }
                 }
             }
+            Some(peer_spec::Config::TlsTcp(peer_cfg)) => {
+                validate_tls_tcp_peer_addr(&p.name, &peer_cfg.addr)?;
+                if matches!(
+                    cfg.startup().fabric().binds,
+                    Some(super::schema::fabric_cfg::Binds::TlsTcp(_))
+                ) && peer_cfg.server_name != p.name
+                {
+                    return Err(ConfigError::TlsTcpServerNameMismatch {
+                        peer_name: p.name.clone(),
+                        server_name: peer_cfg.server_name.clone(),
+                    });
+                }
+            }
             None => return Err(ConfigError::MissingPeerConfig(p.name.clone())),
+        }
+
+        if matches!(
+            cfg.startup().fabric().binds,
+            Some(super::schema::fabric_cfg::Binds::TlsTcp(_))
+        ) && !matches!(p.config, Some(peer_spec::Config::TlsTcp(_)))
+        {
+            return Err(ConfigError::TlsTcpPeerTransportMismatch(p.name.clone()));
         }
     }
     if !self_seen {
@@ -732,6 +794,56 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
                 });
             }
         }
+    }
+
+    Ok(())
+}
+
+fn validate_tls_tcp_peer_addr(peer_name: &str, addr: &str) -> Result<(), ConfigError> {
+    let parsed = addr
+        .parse::<SocketAddr>()
+        .map_err(|_| ConfigError::InvalidTcpAddr {
+            peer_name: peer_name.to_string(),
+            addr: addr.to_string(),
+        })?;
+    if parsed.port() == 0 {
+        return Err(ConfigError::InvalidTcpAddr {
+            peer_name: peer_name.to_string(),
+            addr: addr.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_tls_tcp_fabric(cfg: &Config) -> Result<(), ConfigError> {
+    let Some(super::schema::fabric_cfg::Binds::TlsTcp(tls_tcp)) =
+        cfg.startup().fabric().binds.as_ref()
+    else {
+        return Ok(());
+    };
+
+    let addr = tls_tcp
+        .addr
+        .parse::<SocketAddr>()
+        .map_err(|_| ConfigError::InvalidTlsTcpBindAddr(tls_tcp.addr.clone()))?;
+    if addr.port() == 0 {
+        return Err(ConfigError::ZeroTlsTcpBindPort(tls_tcp.addr.clone()));
+    }
+    for (field, path) in [
+        ("ca_cert_path", tls_tcp.ca_cert_path.as_str()),
+        ("cert_path", tls_tcp.cert_path.as_str()),
+        ("key_path", tls_tcp.key_path.as_str()),
+    ] {
+        if path.is_empty() {
+            return Err(ConfigError::EmptyTlsTcpCertPath(field));
+        }
+    }
+    if tls_tcp.lanes == Some(0) {
+        return Err(ConfigError::ZeroTlsTcpLanes);
+    }
+    if tls_tcp.ring_depth == Some(0) {
+        return Err(ConfigError::ZeroTlsTcpRingDepth);
     }
 
     Ok(())
@@ -2290,5 +2402,189 @@ disable_rdma = true
             loaded.config().startup().memory().memory_total_bytes,
             Some(128 * 1024 * 1024)
         );
+    }
+
+    fn tls_tcp_toml(bind_overrides: &str, peer_overrides: &str) -> String {
+        format!(
+            r#"
+self = "node-a"
+
+[[peers]]
+name = "node-a"
+
+[peers.config.tls_tcp]
+addr = "127.0.0.1:9443"
+{peer_overrides}
+
+[startup.fabric.binds.tls_tcp]
+addr = "0.0.0.0:9443"
+ca_cert_path = "/etc/unbounded-storage/ca.pem"
+cert_path = "/etc/unbounded-storage/node.pem"
+key_path = "/etc/unbounded-storage/node-key.pem"
+{bind_overrides}
+"#
+        )
+    }
+
+    #[test]
+    fn loads_valid_tls_tcp_config() {
+        let f = write_cfg(&tls_tcp_toml(
+            "lanes = 8\nrequest_timeout_ms = 15000\nsocket_buffer_bytes = 8388608\nring_depth = 2048",
+            "server_name = \"node-a\"",
+        ));
+        let cfg = load(f.path()).expect("valid tls_tcp config should load");
+
+        let binds = match cfg.startup().fabric().binds.as_ref() {
+            Some(super::super::schema::fabric_cfg::Binds::TlsTcp(binds)) => binds,
+            other => panic!("expected tls_tcp binds, got {other:?}"),
+        };
+        assert_eq!(binds.lanes, Some(8));
+        assert_eq!(binds.request_timeout_ms, Some(15_000));
+        assert_eq!(binds.socket_buffer_bytes, Some(8 * 1024 * 1024));
+        assert_eq!(binds.ring_depth, Some(2048));
+    }
+
+    #[test]
+    fn tls_tcp_config_round_trips_through_binpb() {
+        let mut cfg: Config = toml::from_str(&tls_tcp_toml("", "")).unwrap();
+        cfg.apply_defaults();
+        let f = write_binpb(&encode_config(&cfg));
+        let loaded = load(f.path()).expect("tls_tcp protobuf config should load");
+
+        assert_eq!(loaded.peers[0].transport_name(), "tls_tcp");
+        let peer = match loaded.peers[0].config.as_ref() {
+            Some(peer_spec::Config::TlsTcp(peer)) => peer,
+            other => panic!("expected tls_tcp peer, got {other:?}"),
+        };
+        assert_eq!(peer.addr, "127.0.0.1:9443");
+        let binds = match loaded.startup().fabric().binds.as_ref() {
+            Some(super::super::schema::fabric_cfg::Binds::TlsTcp(binds)) => binds,
+            other => panic!("expected tls_tcp binds, got {other:?}"),
+        };
+        assert_eq!(binds.lanes, Some(4));
+        assert_eq!(binds.request_timeout_ms, Some(30_000));
+        assert_eq!(binds.socket_buffer_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(binds.ring_depth, Some(4096));
+    }
+
+    #[test]
+    fn rejects_invalid_tls_tcp_addresses_and_zero_bind_port() {
+        for (from, to, expected) in [
+            (
+                "addr = \"0.0.0.0:9443\"",
+                "addr = \"example.com:9443\"",
+                "tls_tcp bind addr",
+            ),
+            (
+                "addr = \"0.0.0.0:9443\"",
+                "addr = \"0.0.0.0:0\"",
+                "nonzero port",
+            ),
+            (
+                "addr = \"127.0.0.1:9443\"",
+                "addr = \"example.com:9443\"",
+                "invalid tcp socket",
+            ),
+        ] {
+            let config = tls_tcp_toml("", "").replace(from, to);
+            let f = write_cfg(&config);
+            let error = load(f.path()).expect_err("invalid tls_tcp address must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_zero_tls_tcp_peer_ports() {
+        let config = tls_tcp_toml("", "")
+            .replace("addr = \"127.0.0.1:9443\"", "addr = \"127.0.0.1:0\"");
+        let f = write_cfg(&config);
+
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::InvalidTcpAddr { peer_name, addr })
+                if peer_name == "node-a" && addr == "127.0.0.1:0"
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_tls_tcp_certificate_paths() {
+        for (field, line) in [
+            (
+                "ca_cert_path",
+                "ca_cert_path = \"/etc/unbounded-storage/ca.pem\"",
+            ),
+            (
+                "cert_path",
+                "cert_path = \"/etc/unbounded-storage/node.pem\"",
+            ),
+            (
+                "key_path",
+                "key_path = \"/etc/unbounded-storage/node-key.pem\"",
+            ),
+        ] {
+            let config = tls_tcp_toml("", "").replace(line, &format!("{field} = \"\""));
+            let f = write_cfg(&config);
+            assert!(
+                matches!(load(f.path()), Err(ConfigError::EmptyTlsTcpCertPath(found)) if found == field),
+                "expected empty {field} to fail"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_zero_tls_tcp_lanes_and_ring_depth() {
+        for (overrides, expected) in [
+            ("lanes = 0", ConfigError::ZeroTlsTcpLanes),
+            ("ring_depth = 0", ConfigError::ZeroTlsTcpRingDepth),
+        ] {
+            let f = write_cfg(&tls_tcp_toml(overrides, ""));
+            let error = load(f.path()).expect_err("zero tls_tcp sizing must fail");
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_tls_tcp_peer_transport_and_server_name_mismatches() {
+        let plaintext_peer = tls_tcp_toml("", "").replace(
+            "[peers.config.tls_tcp]\naddr = \"127.0.0.1:9443\"",
+            "[peers.config.tcp]\naddr = \"127.0.0.1:9443\"",
+        );
+        let f = write_cfg(&plaintext_peer);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::TlsTcpPeerTransportMismatch(name)) if name == "node-a"
+        ));
+
+        let f = write_cfg(&tls_tcp_toml("", "server_name = \"node-b\""));
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::TlsTcpServerNameMismatch { peer_name, server_name })
+                if peer_name == "node-a" && server_name == "node-b"
+        ));
+    }
+
+    #[test]
+    fn legacy_tcp_and_rdma_mesh_still_loads() {
+        let f = write_cfg(
+            r#"
+self = "node-tcp"
+
+[[peers]]
+name = "node-tcp"
+[peers.config.tcp]
+addr = "127.0.0.1:9000"
+
+[[peers]]
+name = "node-rdma"
+[peers.config.rdma]
+addr = "hex:01020304"
+"#,
+        );
+        let cfg = load(f.path()).expect("legacy peer transports should still load");
+        assert_eq!(cfg.peers[0].transport_name(), "tcp");
+        assert_eq!(cfg.peers[1].transport_name(), "rdma");
     }
 }

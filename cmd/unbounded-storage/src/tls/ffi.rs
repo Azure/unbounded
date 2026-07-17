@@ -4,11 +4,10 @@
 //! Hand-written OpenSSL FFI declarations plus narrow shim externs for
 //! macro-only entry points and in-memory PEM loading.
 //!
-//! The surface is deliberately minimal: enough to drive a client TLS
-//! handshake over a caller-owned socket fd and to enable kernel TLS so
-//! the post-handshake data path stays in the kernel (zero-copy
-//! `recv`/`send` straight to/from the registered backing). Rust never
-//! reads OpenSSL struct fields; every object is an opaque pointer.
+//! The surface is deliberately minimal: enough to drive client and server
+//! TLS handshakes over caller-owned socket fds, authenticate certificates,
+//! and enable kernel TLS. Rust never reads OpenSSL struct fields; every
+//! object is an opaque pointer.
 
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
@@ -18,6 +17,7 @@ use std::os::raw::{c_char, c_int, c_long, c_ulong, c_void};
 pub enum SSL_CTX {}
 pub enum SSL {}
 pub enum SSL_METHOD {}
+pub enum X509 {}
 
 // SSL_get_error return codes (openssl/ssl.h).
 pub const SSL_ERROR_SSL: c_int = 1;
@@ -29,6 +29,7 @@ pub const SSL_ERROR_ZERO_RETURN: c_int = 6;
 // SSL_CTX_set_verify modes (openssl/ssl.h).
 pub const SSL_VERIFY_NONE: c_int = 0x00;
 pub const SSL_VERIFY_PEER: c_int = 0x01;
+pub const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: c_int = 0x02;
 
 // X509_V_OK: SSL_get_verify_result success value (openssl/x509_vfy.h).
 pub const X509_V_OK: c_long = 0;
@@ -36,6 +37,7 @@ pub const X509_V_OK: c_long = 0;
 unsafe extern "C" {
     // Exported OpenSSL symbols (real functions, not macros).
     pub fn TLS_client_method() -> *const SSL_METHOD;
+    pub fn TLS_server_method() -> *const SSL_METHOD;
     pub fn SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
     pub fn SSL_CTX_free(ctx: *mut SSL_CTX);
     pub fn SSL_CTX_set_default_verify_paths(ctx: *mut SSL_CTX) -> c_int;
@@ -43,6 +45,12 @@ unsafe extern "C" {
         ctx: *mut SSL_CTX,
         ca_file: *const c_char,
         ca_path: *const c_char,
+    ) -> c_int;
+    pub fn SSL_CTX_use_certificate_chain_file(ctx: *mut SSL_CTX, file: *const c_char) -> c_int;
+    pub fn SSL_CTX_use_PrivateKey_file(
+        ctx: *mut SSL_CTX,
+        file: *const c_char,
+        file_type: c_int,
     ) -> c_int;
     pub fn SSL_CTX_check_private_key(ctx: *mut SSL_CTX) -> c_int;
     pub fn SSL_CTX_set_verify(
@@ -56,9 +64,13 @@ unsafe extern "C" {
     pub fn SSL_set_fd(ssl: *mut SSL, fd: c_int) -> c_int;
     pub fn SSL_set1_host(ssl: *mut SSL, hostname: *const c_char) -> c_int;
     pub fn SSL_set_connect_state(ssl: *mut SSL);
+    pub fn SSL_set_accept_state(ssl: *mut SSL);
     pub fn SSL_connect(ssl: *mut SSL) -> c_int;
+    pub fn SSL_accept(ssl: *mut SSL) -> c_int;
     pub fn SSL_get_error(ssl: *const SSL, ret: c_int) -> c_int;
     pub fn SSL_get_verify_result(ssl: *const SSL) -> c_long;
+
+    pub fn X509_free(cert: *mut X509);
 
     pub fn ERR_get_error() -> c_ulong;
     pub fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: usize);
@@ -67,6 +79,8 @@ unsafe extern "C" {
     // Macro-only entry points exported via src/tls/shim.c.
     pub fn ub_ssl_ctx_set_options(ctx: *mut SSL_CTX, op: c_ulong) -> c_ulong;
     pub fn ub_ssl_ctx_set_min_proto_version(ctx: *mut SSL_CTX, version: c_int) -> c_int;
+    pub fn ub_ssl_ctx_set_max_proto_version(ctx: *mut SSL_CTX, version: c_int) -> c_int;
+    pub fn ub_ssl_ctx_set_num_tickets(ctx: *mut SSL_CTX, tickets: usize) -> c_int;
     pub fn ub_ssl_ctx_load_ca_pem(ctx: *mut SSL_CTX, pem: *const u8, len: usize) -> c_int;
     pub fn ub_ssl_ctx_use_certificate_chain_pem(
         ctx: *mut SSL_CTX,
@@ -75,8 +89,20 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn ub_ssl_ctx_use_private_key_pem(ctx: *mut SSL_CTX, pem: *const u8, len: usize) -> c_int;
     pub fn ub_ssl_set_tlsext_host_name(ssl: *mut SSL, name: *const c_char) -> c_long;
+    pub fn ub_ssl_set_dns_san_only(ssl: *mut SSL);
+    pub fn ub_ssl_get1_peer_certificate(ssl: *mut SSL) -> *mut X509;
+    pub fn ub_x509_check_dns_san(cert: *mut X509, name: *const c_char) -> c_int;
+    pub fn ub_x509_dns_san_count(cert: *mut X509) -> c_int;
+    pub fn ub_x509_dns_san_copy(
+        cert: *mut X509,
+        index: c_int,
+        out: *mut c_char,
+        capacity: usize,
+    ) -> c_int;
     pub fn ub_ssl_ktls_send_enabled(ssl: *mut SSL) -> c_int;
     pub fn ub_ssl_ktls_recv_enabled(ssl: *mut SSL) -> c_int;
     pub fn ub_ssl_op_enable_ktls() -> c_ulong;
+    pub fn ub_ssl_filetype_pem() -> c_int;
     pub fn ub_tls1_2_version() -> c_int;
+    pub fn ub_tls1_3_version() -> c_int;
 }

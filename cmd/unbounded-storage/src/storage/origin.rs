@@ -27,7 +27,10 @@
 //!   so the frontend (which knows the origin) and any peer (which only
 //!   knows the key) agree on routing without coordination.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::bufferpool::{Req, StripeKey};
 
@@ -152,7 +155,7 @@ impl OriginRef {
 /// The type is `Serialize + Deserialize` because the fabric transport
 /// carries requests over the wire, and `Clone` because the pool may
 /// retain a copy while a fetch is in flight.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StripeReq {
     key: StripeKey,
     origin: Option<OriginRef>,
@@ -174,6 +177,10 @@ pub struct StripeReq {
     /// isolate remote RAM/backend + RDMA behavior without falling back to
     /// either node's disk cache.
     skip_local_disk: bool,
+    /// Remaining TCP peer-forwarding budget. `None` seeds a new request with
+    /// the transport default; fabric routing keeps its existing TTL path.
+    #[serde(default)]
+    peer_ttl: Option<u8>,
 }
 
 impl StripeReq {
@@ -187,6 +194,7 @@ impl StripeReq {
             bypass: false,
             fabric_only: false,
             skip_local_disk: false,
+            peer_ttl: None,
         }
     }
 
@@ -225,6 +233,12 @@ impl StripeReq {
         self
     }
 
+    /// Carry the remaining TCP forwarding budget to the next peer fetch.
+    pub fn with_peer_ttl(mut self, peer_ttl: Option<u8>) -> Self {
+        self.peer_ttl = peer_ttl;
+        self
+    }
+
     /// The origin mapping, if one was attached. `None` for requests
     /// that never reach the origin tier.
     pub fn origin(&self) -> Option<&OriginRef> {
@@ -241,6 +255,76 @@ impl StripeReq {
 
     pub fn skip_local_disk(&self) -> bool {
         self.skip_local_disk
+    }
+
+    pub fn peer_ttl(&self) -> Option<u8> {
+        self.peer_ttl
+    }
+}
+
+impl<'de> Deserialize<'de> for StripeReq {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "key",
+            "origin",
+            "cache_id",
+            "fabric_only",
+            "skip_local_disk",
+            "peer_ttl",
+        ];
+        deserializer.deserialize_struct("StripeReq", FIELDS, StripeReqVisitor)
+    }
+}
+
+struct StripeReqVisitor;
+
+impl<'de> Visitor<'de> for StripeReqVisitor {
+    type Value = StripeReq;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a StripeReq sequence")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let key = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+        let origin = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(1, &self))?;
+        let cache_id = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(2, &self))?;
+        let fabric_only = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(3, &self))?;
+        let skip_local_disk = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(4, &self))?;
+        // Bincode structs are positional and report EOF rather than a missing
+        // optional field, so accept an absent trailing TTL from older peers.
+        let peer_ttl = match seq.next_element() {
+            Ok(Some(peer_ttl)) => peer_ttl,
+            Ok(None) => None,
+            Err(error) if error.to_string().contains("unexpected end of file") => None,
+            Err(error) => return Err(error),
+        };
+
+        Ok(StripeReq {
+            key,
+            origin,
+            cache_id,
+            bypass: false,
+            fabric_only,
+            skip_local_disk,
+            peer_ttl,
+        })
     }
 }
 
@@ -292,6 +376,15 @@ fn origin_stripe_key(backend_id: &str, origin_object_id: &str, stripe_idx: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Serialize)]
+    struct LegacyStripeReq {
+        key: StripeKey,
+        origin: Option<OriginRef>,
+        cache_id: Option<String>,
+        fabric_only: bool,
+        skip_local_disk: bool,
+    }
 
     #[test]
     fn stripe_key_is_deterministic() {
@@ -517,6 +610,34 @@ mod tests {
         let bytes = bincode::serialize(&req).unwrap();
         let back: StripeReq = bincode::deserialize(&bytes).unwrap();
         assert!(back.skip_local_disk());
+    }
+
+    #[test]
+    fn stripe_req_peer_ttl_round_trips_through_bincode() {
+        let req = StripeReq::new(StripeKey([3; 32])).with_peer_ttl(Some(11));
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: StripeReq = bincode::deserialize(&bytes).unwrap();
+
+        assert_eq!(back.peer_ttl(), Some(11));
+    }
+
+    #[test]
+    fn legacy_stripe_req_defaults_peer_ttl() {
+        let legacy = LegacyStripeReq {
+            key: StripeKey([4; 32]),
+            origin: None,
+            cache_id: Some("cache-a".to_string()),
+            fabric_only: true,
+            skip_local_disk: true,
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let decoded: StripeReq = bincode::deserialize(&bytes).unwrap();
+
+        assert_eq!(decoded.key(), legacy.key);
+        assert_eq!(decoded.cache_id(), Some("cache-a"));
+        assert!(decoded.fabric_only());
+        assert!(decoded.skip_local_disk());
+        assert_eq!(decoded.peer_ttl(), None);
     }
 
     #[test]

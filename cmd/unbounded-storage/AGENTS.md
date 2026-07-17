@@ -101,10 +101,12 @@ source of truth.
 
 The `fabric` module links against libfabric (the C `shim.c` is compiled
 against its headers by `build.rs` via pkg-config, and the binary loads
-`libfabric.so` at runtime). The fabric uses the native `tcp` RDM
-provider, which only exists in libfabric 2.0+ (the experimental `net`
-provider was merged into `tcp` and removed there). Distro packages are
-usually too old, so the Makefile builds a pinned release from source:
+`libfabric.so` at runtime). Production RDMA uses the libfabric `verbs`
+provider. The custom TLS TCP RPC transport is the non-RDMA data path and
+replaces the former libfabric TCP fallback; do not remove or dilute the
+libfabric verbs/RDMA documentation when changing TCP transport docs.
+Distro packages are usually too old, so the Makefile builds a pinned
+release from source:
 
 - `make libfabric` downloads and installs the pinned `LIBFABRIC_VERSION`
   (see the Makefile default) under `tmp/libfabric/<version>/`. It is a
@@ -114,16 +116,17 @@ usually too old, so the Makefile builds a pinned release from source:
   automatically, so prefer the Makefile targets over raw `cargo`. If you
   must run `cargo` directly, point it at the pinned install yourself.
 
-The in-process fabric FFI tests (`src/fabric/tests.rs` and the inline
-loopback test in `src/fabric/fabric.rs`) require a loopback-capable
-`tcp` provider and pin their source bind to `127.0.0.1`. This is
-deliberate: with a null bind address libfabric selects the first
-routable NIC, so on multi-NIC or containerized dev boxes the paired
-loopback fabrics land on different interfaces (e.g. `eth0` vs a docker
-bridge) and the tcp RDM data path never makes progress, hanging every
-completion-dependent test. Pinning `127.0.0.1:0` keeps both fabrics on
-`lo`. If you hit these timeouts on an older checkout, `FI_TCP_IFACE=lo`
-is the manual override.
+The libfabric TCP provider is retained for FFI tests and internal
+lifecycle coverage, not as the production TCP fallback. The in-process
+fabric FFI tests (`src/fabric/tests.rs` and the inline loopback test in
+`src/fabric/fabric.rs`) require a loopback-capable `tcp` provider and pin
+their source bind to `127.0.0.1`. This is deliberate: with a null bind
+address libfabric selects the first routable NIC, so on multi-NIC or
+containerized dev boxes the paired loopback fabrics land on different
+interfaces (e.g. `eth0` vs a docker bridge) and the TCP data path never
+makes progress, hanging every completion-dependent test. Pinning
+`127.0.0.1:0` keeps both fabrics on `lo`. If you hit these timeouts on an
+older checkout, `FI_TCP_IFACE=lo` is the manual override.
 
 ### OpenSSL dependency
 
@@ -152,6 +155,13 @@ libfabric:
   the bundled libs; the system CLI is built against 3.0.x and segfaults
   if it loads the bundled libs via `LD_LIBRARY_PATH`. `hack/smoke-storage.py`
   picks the bundled CLI automatically for its cert generation.
+
+The custom peer TCP RPC transport also uses this OpenSSL build. It
+requires TLS 1.3 mutual authentication, requires the configured peer
+name to match a DNS SAN in the authenticated certificate, and fails the
+connection unless kTLS is engaged for both TX and RX. OpenSSL performs
+the handshake; shard-local io_uring handles the post-handshake socket
+data path.
 
 ## Testing patterns
 
@@ -305,16 +315,15 @@ iterate on one failing case without re-running the whole suite:
 
 ### 4. End-to-end smoke test (`hack/smoke-storage.py`)
 
-The smoke test is the only test that exercises the real, fully linked
-binary across a process boundary. It brings up two `unbounded-storage`
-processes on loopback, wires them together over the real libfabric `tcp`
-fabric (file-backed disks, HTTP/S3 frontends, stub HTTP origins, and a
-real Garage S3-compatible origin), then
-fetches an object through both frontends so the second fetch is served
-cross-node over a fabric RPC. It is the gate that catches integration
-breakage the in-process Rust tests cannot: FFI/ABI mismatches against
-the installed libfabric, provider negotiation, real socket addressing,
-the lazy-connect retry paths, and S3 SigV4 compatibility with Garage.
+The smoke test exercises the real, fully linked binary across a process
+boundary. Its scenarios run on loopback with file-backed disks, synthetic
+or stub HTTP origins, and a real Garage S3-compatible origin. It covers
+the retained libfabric TCP test path, the OpenSSL/kTLS origin path,
+cross-node RPC fetches, and S3 SigV4 compatibility with Garage. It is an
+integration and correctness gate for FFI/ABI, provider negotiation,
+socket addressing, lazy-connect retry paths, HTTPS kTLS, and authenticated
+S3 `HEAD` and ranged `GET` requests. It is not a custom TLS TCP throughput
+test and must never be cited as performance acceptance.
 
 How to run it:
 
@@ -353,6 +362,15 @@ changes under `cmd/unbounded-storage/**`, `hack/smoke-storage.py`, or the
 `Makefile`. The unit/module/DST tests do not cover the FFI boundary
 against a real provider, so do not treat a green `make unbounded-storage`
 as sufficient for fabric-affecting changes; run the smoke test too.
+
+### 5. Two-host performance acceptance
+
+Use [`PERF.md`](PERF.md) for the custom TLS TCP RPC acceptance run. It is
+a physical two-host test over 100Gb NICs, uses warm 2 MiB memory pages
+and the existing `loadgen` frontend with `remote_only`, `fabric_only`,
+and `skip_local_disk`, and accepts only **useful payload >=95 Gbps
+sustained on 100Gb NIC**. A loopback smoke result is not performance
+evidence.
 
 ### Adding a new subsystem
 

@@ -176,6 +176,21 @@ struct Metrics {
     fabric_pages_written: IntCounter,
     fabric_bytes_written: IntCounter,
 
+    // TCP RPC.
+    tcp_rpc_active_connections: IntGauge,
+    tcp_rpc_requests: IntCounterVec,
+    tcp_rpc_inflight_requests: IntGauge,
+    tcp_rpc_payload_bytes_sent: IntCounter,
+    tcp_rpc_payload_bytes_received: IntCounter,
+    tcp_rpc_pages_sent: IntCounter,
+    tcp_rpc_pages_received: IntCounter,
+    tcp_rpc_connection_errors: IntCounter,
+    tcp_rpc_auth_errors: IntCounter,
+    tcp_rpc_protocol_errors: IntCounter,
+    tcp_rpc_short_sends: IntCounter,
+    tcp_rpc_send_zc_fallbacks: IntCounter,
+    tcp_rpc_lane_waits: IntCounter,
+
     // Backend (origin fetch).
     backend_fetches: IntCounterVec,
     backend_bytes: IntCounterVec,
@@ -357,6 +372,62 @@ impl Metrics {
             "Bytes written to peers via fabric RMA.",
         )?;
 
+        let tcp_rpc_active_connections = IntGauge::new(
+            "unbounded_storage_tcp_rpc_active_connections",
+            "Currently active accepted TCP RPC connections across all shards.",
+        )?;
+        let tcp_rpc_requests = IntCounterVec::new(
+            Opts::new(
+                "unbounded_storage_tcp_rpc_requests_total",
+                "Server-side TCP RPC requests completed, by outcome.",
+            ),
+            &["outcome"],
+        )?;
+        let tcp_rpc_inflight_requests = IntGauge::new(
+            "unbounded_storage_tcp_rpc_inflight_requests",
+            "Currently admitted server-side TCP RPC requests across all shards.",
+        )?;
+        let tcp_rpc_payload_bytes_sent = IntCounter::new(
+            "unbounded_storage_tcp_rpc_payload_bytes_sent_total",
+            "Useful page payload bytes completed by TCP RPC registered-source sends.",
+        )?;
+        let tcp_rpc_payload_bytes_received = IntCounter::new(
+            "unbounded_storage_tcp_rpc_payload_bytes_received_total",
+            "Useful page payload bytes received directly into fixed buffers by TCP RPC.",
+        )?;
+        let tcp_rpc_pages_sent = IntCounter::new(
+            "unbounded_storage_tcp_rpc_pages_sent_total",
+            "Complete page payloads sent from registered pages by TCP RPC.",
+        )?;
+        let tcp_rpc_pages_received = IntCounter::new(
+            "unbounded_storage_tcp_rpc_pages_received_total",
+            "Complete page payloads received directly into fixed buffers by TCP RPC.",
+        )?;
+        let tcp_rpc_connection_errors = IntCounter::new(
+            "unbounded_storage_tcp_rpc_connection_errors_total",
+            "TCP RPC accept, socket setup, connect, and connection I/O errors.",
+        )?;
+        let tcp_rpc_auth_errors = IntCounter::new(
+            "unbounded_storage_tcp_rpc_auth_errors_total",
+            "TCP RPC TLS or application peer authentication failures.",
+        )?;
+        let tcp_rpc_protocol_errors = IntCounter::new(
+            "unbounded_storage_tcp_rpc_protocol_errors_total",
+            "Invalid TCP RPC wire data, framing, or protocol state.",
+        )?;
+        let tcp_rpc_short_sends = IntCounter::new(
+            "unbounded_storage_tcp_rpc_short_sends_total",
+            "TCP RPC registered-source sends shorter than the submitted page payload remainder.",
+        )?;
+        let tcp_rpc_send_zc_fallbacks = IntCounter::new(
+            "unbounded_storage_tcp_rpc_send_zc_fallbacks_total",
+            "TCP RPC pages sent with kTLS-compatible WRITE_FIXED after SEND_ZC was unsupported.",
+        )?;
+        let tcp_rpc_lane_waits = IntCounter::new(
+            "unbounded_storage_tcp_rpc_lane_waits_total",
+            "Client requests that had to wait for a TCP RPC lane.",
+        )?;
+
         let backend_fetches = IntCounterVec::new(
             Opts::new(
                 "unbounded_storage_backend_fetches_total",
@@ -475,6 +546,19 @@ impl Metrics {
             fabric_connections,
             fabric_pages_written,
             fabric_bytes_written,
+            tcp_rpc_active_connections,
+            tcp_rpc_requests,
+            tcp_rpc_inflight_requests,
+            tcp_rpc_payload_bytes_sent,
+            tcp_rpc_payload_bytes_received,
+            tcp_rpc_pages_sent,
+            tcp_rpc_pages_received,
+            tcp_rpc_connection_errors,
+            tcp_rpc_auth_errors,
+            tcp_rpc_protocol_errors,
+            tcp_rpc_short_sends,
+            tcp_rpc_send_zc_fallbacks,
+            tcp_rpc_lane_waits,
             backend_fetches,
             backend_bytes,
             backend_fetch_duration,
@@ -521,6 +605,19 @@ impl Metrics {
             Box::new(self.fabric_connections.clone()),
             Box::new(self.fabric_pages_written.clone()),
             Box::new(self.fabric_bytes_written.clone()),
+            Box::new(self.tcp_rpc_active_connections.clone()),
+            Box::new(self.tcp_rpc_requests.clone()),
+            Box::new(self.tcp_rpc_inflight_requests.clone()),
+            Box::new(self.tcp_rpc_payload_bytes_sent.clone()),
+            Box::new(self.tcp_rpc_payload_bytes_received.clone()),
+            Box::new(self.tcp_rpc_pages_sent.clone()),
+            Box::new(self.tcp_rpc_pages_received.clone()),
+            Box::new(self.tcp_rpc_connection_errors.clone()),
+            Box::new(self.tcp_rpc_auth_errors.clone()),
+            Box::new(self.tcp_rpc_protocol_errors.clone()),
+            Box::new(self.tcp_rpc_short_sends.clone()),
+            Box::new(self.tcp_rpc_send_zc_fallbacks.clone()),
+            Box::new(self.tcp_rpc_lane_waits.clone()),
             Box::new(self.backend_fetches.clone()),
             Box::new(self.backend_bytes.clone()),
             Box::new(self.backend_fetch_duration.clone()),
@@ -704,6 +801,99 @@ pub fn fabric_written(pages: u64, bytes: u64) {
     if let Some(m) = metrics() {
         m.fabric_pages_written.inc_by(pages);
         m.fabric_bytes_written.inc_by(bytes);
+    }
+}
+
+/// Adjust the live accepted TCP RPC connection gauge.
+pub fn tcp_rpc_connections_delta(delta: i64) {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_active_connections.add(delta);
+    }
+}
+
+/// Record one completed server-side TCP RPC request.
+pub fn tcp_rpc_request(outcome: Outcome) {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_requests
+            .with_label_values(&[outcome.as_str()])
+            .inc();
+    }
+}
+
+/// Adjust the live admitted TCP RPC request gauge.
+pub fn tcp_rpc_inflight_delta(delta: i64) {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_inflight_requests.add(delta);
+    }
+}
+
+/// Record a completed TCP RPC page-payload send.
+pub fn tcp_rpc_payload_sent(bytes: u64) {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_payload_bytes_sent.inc_by(bytes);
+    }
+}
+
+/// Record a completed TCP RPC page-payload receive.
+pub fn tcp_rpc_payload_received(bytes: u64) {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_payload_bytes_received.inc_by(bytes);
+    }
+}
+
+/// Record one complete TCP RPC page sent from a registered source.
+pub fn tcp_rpc_page_sent() {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_pages_sent.inc();
+    }
+}
+
+/// Record one complete TCP RPC page received into a fixed buffer.
+pub fn tcp_rpc_page_received() {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_pages_received.inc();
+    }
+}
+
+/// Record a TCP RPC connection setup or I/O failure.
+pub fn tcp_rpc_connection_error() {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_connection_errors.inc();
+    }
+}
+
+/// Record a TCP RPC peer authentication failure.
+pub fn tcp_rpc_auth_error() {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_auth_errors.inc();
+    }
+}
+
+/// Record invalid TCP RPC wire data or protocol state.
+pub fn tcp_rpc_protocol_error() {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_protocol_errors.inc();
+    }
+}
+
+/// Record a registered-source send shorter than its submitted payload remainder.
+pub fn tcp_rpc_short_send() {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_short_sends.inc();
+    }
+}
+
+/// Record a page send that could not use SEND_ZC on this socket.
+pub fn tcp_rpc_send_zc_fallback() {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_send_zc_fallbacks.inc();
+    }
+}
+
+/// Record a client request entering the TCP RPC lane wait queue.
+pub fn tcp_rpc_lane_wait() {
+    if let Some(m) = metrics() {
+        m.tcp_rpc_lane_waits.inc();
     }
 }
 
@@ -954,6 +1144,61 @@ mod tests {
         assert!(text.contains(
             "unbounded_storage_disk_ops_total{disk=\"/dev/x\",op=\"read\",outcome=\"ok\"}"
         ));
+    }
+
+    #[test]
+    fn tcp_rpc_metrics_gather_with_existing_fabric_names() {
+        let m = Metrics::new().unwrap();
+        m.tcp_rpc_active_connections.inc();
+        m.tcp_rpc_requests.with_label_values(&["ok"]).inc();
+        m.tcp_rpc_requests.with_label_values(&["err"]).inc();
+        m.tcp_rpc_inflight_requests.inc();
+        m.tcp_rpc_payload_bytes_sent.inc_by(4096);
+        m.tcp_rpc_payload_bytes_received.inc_by(2048);
+        m.tcp_rpc_pages_sent.inc();
+        m.tcp_rpc_pages_received.inc();
+        m.tcp_rpc_connection_errors.inc();
+        m.tcp_rpc_auth_errors.inc();
+        m.tcp_rpc_protocol_errors.inc();
+        m.tcp_rpc_short_sends.inc();
+        m.tcp_rpc_send_zc_fallbacks.inc();
+        m.tcp_rpc_lane_waits.inc();
+        m.fabric_rpc_served.with_label_values(&["ok"]).inc();
+
+        let families = m.registry.gather();
+        let names: std::collections::BTreeSet<_> =
+            families.iter().map(|family| family.get_name()).collect();
+        for name in [
+            "unbounded_storage_tcp_rpc_active_connections",
+            "unbounded_storage_tcp_rpc_requests_total",
+            "unbounded_storage_tcp_rpc_inflight_requests",
+            "unbounded_storage_tcp_rpc_payload_bytes_sent_total",
+            "unbounded_storage_tcp_rpc_payload_bytes_received_total",
+            "unbounded_storage_tcp_rpc_pages_sent_total",
+            "unbounded_storage_tcp_rpc_pages_received_total",
+            "unbounded_storage_tcp_rpc_connection_errors_total",
+            "unbounded_storage_tcp_rpc_auth_errors_total",
+            "unbounded_storage_tcp_rpc_protocol_errors_total",
+            "unbounded_storage_tcp_rpc_short_sends_total",
+            "unbounded_storage_tcp_rpc_send_zc_fallbacks_total",
+            "unbounded_storage_tcp_rpc_lane_waits_total",
+            "unbounded_storage_fabric_rpc_served_total",
+            "unbounded_storage_fabric_rpc_duration_seconds",
+            "unbounded_storage_fabric_rpc_inflight",
+            "unbounded_storage_fabric_connections",
+            "unbounded_storage_fabric_pages_written_total",
+            "unbounded_storage_fabric_bytes_written_total",
+        ] {
+            assert!(names.contains(name), "missing metric family {name}");
+        }
+
+        let mut text = Vec::new();
+        TextEncoder::new().encode(&families, &mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("unbounded_storage_tcp_rpc_requests_total{outcome=\"ok\"} 1"));
+        assert!(text.contains("unbounded_storage_tcp_rpc_requests_total{outcome=\"err\"} 1"));
+        assert!(text.contains("unbounded_storage_tcp_rpc_payload_bytes_sent_total 4096"));
+        assert!(text.contains("unbounded_storage_tcp_rpc_payload_bytes_received_total 2048"));
     }
 
     #[test]

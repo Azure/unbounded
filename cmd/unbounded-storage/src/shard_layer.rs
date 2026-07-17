@@ -80,6 +80,7 @@ pub struct PreparedShardLayer {
     serve_start_txs: Vec<mpsc::Sender<()>>,
     terminal_rx: mpsc::Receiver<crate::ShardTerminalReport>,
     routes: RouteTableHandle,
+    start_libfabric_rpc: bool,
 }
 
 /// A spawned set of shard threads plus the handles to drive and retire
@@ -148,6 +149,7 @@ pub fn prepare_shard_layer(
     let runtime_peers = config::runtime_peers(runtime);
     let self_peer = local_self_peer(runtime)
         .map_err(|e| vec![format!("unsupported fabric identity config: {e}")])?;
+    let start_libfabric_rpc = settings.fabric.tls_tcp.is_none();
 
     // Bring up the shared fabric endpoints before spawning any shards:
     // each shard registers its data backing against the endpoint it maps
@@ -199,6 +201,7 @@ pub fn prepare_shard_layer(
         let cache_directories = deps.cache_directories.clone();
         let route_handle = routes.clone();
         let loaded = loaded.clone();
+        let fabric_startup = settings.fabric.clone();
         let layer_stop = layer_stop.clone();
         let terminal_tx = terminal_tx.clone();
         let rt = deps.runtime.clone();
@@ -217,6 +220,7 @@ pub fn prepare_shard_layer(
                         cache_directories,
                         route_handle,
                         loaded,
+                        fabric_startup,
                         ctrl_rx,
                         peer_rx,
                         phaseb_tx,
@@ -368,6 +372,7 @@ pub fn prepare_shard_layer(
         serve_start_txs,
         terminal_rx,
         routes,
+        start_libfabric_rpc,
     })
 }
 
@@ -385,20 +390,23 @@ pub fn activate_shard_layer(prepared: PreparedShardLayer) -> Result<ShardLayer, 
         serve_start_txs,
         terminal_rx,
         routes,
+        start_libfabric_rpc,
     } = prepared;
 
-    if let Err(errors) = fabric_group.start_rpc_servers(&rpc_shards) {
-        retire_failed_activation(
-            joins,
-            fabric_group,
-            control,
-            layer_stop,
-            backing_keepalives,
-            serve_start_txs,
-            terminal_rx,
-            routes,
-        );
-        return Err(errors);
+    if start_libfabric_rpc {
+        if let Err(errors) = fabric_group.start_rpc_servers(&rpc_shards) {
+            retire_failed_activation(
+                joins,
+                fabric_group,
+                control,
+                layer_stop,
+                backing_keepalives,
+                serve_start_txs,
+                terminal_rx,
+                routes,
+            );
+            return Err(errors);
+        }
     }
     for tx in &serve_start_txs {
         if tx.send(()).is_err() {
@@ -442,6 +450,7 @@ pub fn retire_prepared_shard_layer(prepared: PreparedShardLayer) {
         serve_start_txs,
         terminal_rx,
         routes,
+        start_libfabric_rpc: _,
     } = prepared;
     retire_failed_activation(
         joins,

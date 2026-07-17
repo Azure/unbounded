@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Client-side TLS for the storage crate, built on OpenSSL 3 with
-//! kernel TLS (kTLS).
+//! TLS for origin and peer connections, built on OpenSSL 3 with kernel
+//! TLS (kTLS).
 //!
 //! This module is the crate's shared, transport-level TLS utility, a
 //! sibling to [`crate::http`]: it owns the OpenSSL FFI surface, the
@@ -20,9 +20,11 @@
 
 mod context;
 mod ffi;
+mod peer;
 mod recv;
 
 pub use context::{TlsConfig, TlsContext};
+pub use peer::{PeerCertificateIdentity, PeerTlsConfig, PeerTlsContext};
 
 /// Drive the optional client handshake for an origin connection.
 pub(crate) use context::maybe_handshake;

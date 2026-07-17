@@ -19,8 +19,8 @@ metadata:
 # its proto3 zero value, which the daemon promotes to the documented default.
 #
 # Per-node sections are supervisor-injected when a storage ring is active:
-# startup.fabric.binds.tcp.addr is overridden per node, self is set to the local
-# Kubernetes node name, and label-discovered peers are merged into peers
+# startup.fabric.tls_tcp.addr is overridden per node, self is set to the
+# local Kubernetes node name, and label-discovered peers are merged into peers
 # (discovered peers win name collisions). Declare caches here when this
 # deployment should participate in P2P caching; the supervisor only supplies the
 # ring roster.
@@ -67,16 +67,25 @@ data:
         # unused; RPC scratch adds 8 pages per fabric unit outside this pool.
         memory_total_bytes: 134217728
       fabric:
-        tcp:
-          # Per-shard TCP fabric listen address (":0" picks a free port).
-          addr: "0.0.0.0:0"
-        # libfabric progress threads per shard.
+        tls_tcp:
+          # The supervisor replaces the host with the node InternalIP while
+          # preserving this fixed port and the credential paths below. Provision
+          # a per-node certificate whose DNS SAN is the Kubernetes node name.
+          addr: "0.0.0.0:7000"
+          ca_cert_path: "/etc/unbounded-storage/tls/ca.crt"
+          cert_path: "/etc/unbounded-storage/tls/tls.crt"
+          key_path: "/etc/unbounded-storage/tls/tls.key"
+          lanes: 4
+          request_timeout_ms: 30000
+          socket_buffer_bytes: 16777216
+          ring_depth: 4096
+        # Legacy libfabric progress threads used by the retained verbs path.
         progress_threads: 2
         # Progress-thread busy-poll budget in microseconds.
         progress_poll_us: 10
-        # Fabric RPC worker threads per shard.
+        # Legacy libfabric RPC worker threads used by the retained verbs path.
         rpc_worker_threads: 4
-        # Max in-flight fabric operations per shard (back-pressure limit).
+        # Max in-flight peer RPC operations per shard (back-pressure limit).
         max_inflight: 1024
       topology:
         # Place shards on SMT sibling CPUs as well as physical cores.
@@ -87,9 +96,8 @@ data:
         include_node_cpu0: false
         # Use HCA ports that are not in the active state.
         allow_inactive_port: false
-        # Disable RDMA and force the libfabric tcp provider.
-        disable_rdma: false
-        # Cap serving shards to fit the default data and RPC scratch budgets.
+        # The tls_tcp bind above automatically suppresses HCA worker planning.
+        # Cap serving shards to fit the default data pool and bound host load.
         serving_cores: 8
         # NIC-worker CPUs to pin per active HCA.
         nic_workers: 4

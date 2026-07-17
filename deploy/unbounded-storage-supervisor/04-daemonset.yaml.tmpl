@@ -83,6 +83,8 @@ spec:
           volumeMounts:
             - name: storage-config
               mountPath: /etc/unbounded-storage
+              # The host directory must contain tls/ca.crt, tls/tls.crt, and
+              # tls/tls.key. The private key should be mode 0600.
             # Startup-tuning defaults projected one file per property. The run
             # supervisor reads these and renders the host config.binpb; it is a
             # separate path from the host config mount above so they never

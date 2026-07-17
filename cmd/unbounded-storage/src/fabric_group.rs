@@ -576,11 +576,13 @@ fn runtime_peer_connections_for_unit(
 ) -> Vec<ConnectionSpec> {
     peers
         .iter()
-        .map(|peer| ConnectionSpec {
-            peer: peer.fabric_peer_id,
-            address: runtime_peer_address_for_unit(&peer.spec, unit_idx),
-            hca_numa: None,
-            tags: peer.spec.tags.clone(),
+        .filter_map(|peer| {
+            runtime_peer_address_for_unit(&peer.spec, unit_idx).map(|address| ConnectionSpec {
+                peer: peer.fabric_peer_id,
+                address,
+                hca_numa: None,
+                tags: peer.spec.tags.clone(),
+            })
         })
         .collect()
 }
@@ -588,15 +590,16 @@ fn runtime_peer_connections_for_unit(
 fn runtime_peer_address_for_unit(
     peer: &config::PeerSpec,
     unit_idx: usize,
-) -> fabric::FabricAddress {
+) -> Option<fabric::FabricAddress> {
     match peer.config.as_ref() {
         Some(config::peer_spec::Config::Tcp(cfg)) => {
-            fabric::FabricAddress::socket(cfg.addr.clone())
+            Some(fabric::FabricAddress::socket(cfg.addr.clone()))
         }
-        Some(config::peer_spec::Config::Rdma(cfg)) => {
-            rdma_fabric_address(cfg.addrs.get(unit_idx).unwrap_or(&cfg.addr))
-        }
-        None => fabric::FabricAddress::native(""),
+        Some(config::peer_spec::Config::Rdma(cfg)) => Some(rdma_fabric_address(
+            cfg.addrs.get(unit_idx).unwrap_or(&cfg.addr),
+        )),
+        Some(config::peer_spec::Config::TlsTcp(_)) => None,
+        None => Some(fabric::FabricAddress::native("")),
     }
 }
 
@@ -615,7 +618,7 @@ mod tests {
 
     use super::*;
 
-    use unbounded_storage::config::{PeerSpec, RdmaPeerConfig, peer_spec};
+    use unbounded_storage::config::{PeerSpec, RdmaPeerConfig, TlsTcpPeerConfig, peer_spec};
     use unbounded_storage::p2p::node_id_from_name;
 
     fn shard(cpu: u32, numa: Option<u16>) -> ServingShard {
@@ -666,6 +669,24 @@ mod tests {
                 config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
                     addr: addr.to_string(),
                     addrs: addrs.into_iter().map(str::to_string).collect(),
+                })),
+            },
+        }
+    }
+
+    fn tls_tcp_runtime_peer(id: u64, addr: &str) -> RuntimePeer {
+        let name = format!("node-{id}");
+        let node_id = node_id_from_name(&name);
+        RuntimePeer {
+            name: name.clone(),
+            node_id,
+            fabric_peer_id: PeerId(node_id.0),
+            spec: PeerSpec {
+                name: name.clone(),
+                tags: Vec::new(),
+                config: Some(peer_spec::Config::TlsTcp(TlsTcpPeerConfig {
+                    addr: addr.to_string(),
+                    server_name: name,
                 })),
             },
         }
@@ -813,6 +834,19 @@ mod tests {
             unit2[0].address,
             fabric::FabricAddress::native("hex:fallback")
         );
+    }
+
+    #[test]
+    fn tls_tcp_peers_are_excluded_from_libfabric_connections() {
+        let peers = [
+            runtime_peer(1, "hex:01"),
+            tls_tcp_runtime_peer(2, "127.0.0.1:9443"),
+        ];
+
+        let connections = runtime_peer_connections(&peers);
+
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].peer, peers[0].fabric_peer_id);
     }
 
     /// Drop-logging stand-in for a `FabricUnit` resource: records its

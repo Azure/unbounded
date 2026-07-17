@@ -5,19 +5,20 @@
 """End-to-end smoke test for the unbounded-storage daemon.
 
 Brings up two `unbounded-storage` processes on loopback, joined into a
-two-node Chord ring over TCP RPC (libfabric), each with a file-backed
-block device and a frontend whose origin backend points at a test origin.
+two-node Chord ring over the custom authenticated TLS TCP RPC, each with a
+file-backed block device and a frontend whose origin backend points at a test
+origin.
 
 The test then fetches an object through *both* frontends and asserts the
-returned body matches the seeded payload. Because the object's
-single stripe is owned by exactly one of the two nodes, the request to the
-non-owning frontend is necessarily routed over the fabric TCP RPC to the
-owning node, whose backend issues the outbound GET to the origin.
+returned body matches the seeded payload. Because the object's stripes
+are distributed across the two nodes, each frontend necessarily routes some
+requests over the authenticated TCP RPC to the owning node, whose backend
+issues the outbound GET to the origin.
 Querying both frontends therefore guarantees the cross-node RPC path is
 exercised without reimplementing the stripe-key hashing here.
 
 This whole two-node scenario is run once per protocol pairing so both
-frontend/backend implementations are covered against the real fabric:
+frontend/backend implementations are covered against the real peer RPC:
 
   - `http`: the plain HTTP frontend backed by the HTTP origin backend
             over a plaintext `http://` origin.
@@ -139,8 +140,22 @@ TLS_CLIENT_KEY = TMPDIR / "client-key.pem"
 # origin resolver lands on the HTTPS stub.
 TLS_ORIGIN_HOST = "localhost"
 
+# A separate trust domain for peer RPC mutual TLS. Each node certificate is
+# valid for both client and server authentication and carries the exact peer
+# name as a DNS SAN.
+PEER_TLS_CA_CERT = TMPDIR / "peer-ca.pem"
+PEER_TLS_CA_KEY = TMPDIR / "peer-ca-key.pem"
+PEER_TLS_CERTS = {
+    "node-a": TMPDIR / "node-a-cert.pem",
+    "node-b": TMPDIR / "node-b-cert.pem",
+}
+PEER_TLS_KEYS = {
+    "node-a": TMPDIR / "node-a-key.pem",
+    "node-b": TMPDIR / "node-b-key.pem",
+}
+
 # The objects requested through the frontends, one per scenario. The S3 path
-# is path-style (`/bucket/key`) because the frontend forwards it verbatim.
+# is path-style (`/bucket/key`) because the S3 frontend forwards it verbatim.
 HTTP_OBJECT_PATH = "/smoke-object"
 S3_OBJECT_PATH = "/smoke-bucket/smoke-object"
 VALID_OBJECTS = frozenset({HTTP_OBJECT_PATH})
@@ -937,8 +952,80 @@ def generate_tls_certs() -> None:
     )
 
 
+def generate_peer_tls_certs() -> None:
+    """Generate a dedicated CA and per-node certificates for peer RPC mTLS."""
+    log("Generating peer TLS CA and mTLS certs for authenticated TCP RPC")
+    run_openssl(
+        [
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(PEER_TLS_CA_KEY),
+            "-out",
+            str(PEER_TLS_CA_CERT),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=smoke-storage-peer-ca",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ],
+        "peer CA generation",
+    )
+    for peer_name in ("node-a", "node-b"):
+        csr_path = TMPDIR / f"{peer_name}.csr"
+        run_openssl(
+            [
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                str(PEER_TLS_KEYS[peer_name]),
+                "-out",
+                str(csr_path),
+                "-nodes",
+                "-subj",
+                f"/CN={peer_name}",
+                "-addext",
+                f"subjectAltName=DNS:{peer_name}",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-addext",
+                "keyUsage=critical,digitalSignature,keyEncipherment",
+                "-addext",
+                "extendedKeyUsage=serverAuth,clientAuth",
+            ],
+            f"{peer_name} CSR generation",
+        )
+        run_openssl(
+            [
+                "x509",
+                "-req",
+                "-in",
+                str(csr_path),
+                "-CA",
+                str(PEER_TLS_CA_CERT),
+                "-CAkey",
+                str(PEER_TLS_CA_KEY),
+                "-CAcreateserial",
+                "-out",
+                str(PEER_TLS_CERTS[peer_name]),
+                "-days",
+                "1",
+                "-copy_extensions",
+                "copy",
+            ],
+            f"{peer_name} cert signing",
+        )
+
+
 def start_origin_tls(port: int) -> http.server.ThreadingHTTPServer:
-    """Start an HTTPS stub origin (TLS 1.2+) requiring a client cert.
+    """Start a TLS 1.3 HTTPS stub origin requiring a client cert.
 
     Identical to `start_origin` but the listening socket is wrapped in a
     server-side TLS context. The server itself uses ordinary userspace TLS;
@@ -952,7 +1039,7 @@ def start_origin_tls(port: int) -> http.server.ThreadingHTTPServer:
     ctx.load_cert_chain(certfile=str(TLS_CERT), keyfile=str(TLS_KEY))
     ctx.load_verify_locations(cafile=str(TLS_CA_CERT))
     ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -973,8 +1060,11 @@ def write_config(
     disk_path: Path,
     origin_addr: str,
     frontend_addr: str,
-    fabric_addr: str,
+    tls_tcp_addr: str,
     metrics_addr: str,
+    peer_ca_cert_path: Path,
+    peer_cert_path: Path,
+    peer_key_path: Path,
     ca_cert: Path | None = None,
     insecure_skip_verify: bool = False,
     client_cert: Path | None = None,
@@ -986,12 +1076,11 @@ def write_config(
     # Backend and frontend implementations are selected by the oneof
     # config table name.
     #
-    # Startup-fixed knobs live in the `[startup]` section of the config:
-    # the fabric bind address, the node-wide hugepage data pool
-    # (memory_total_bytes, leaving the daemon's hugepage default in place), and
-    # forcing the libfabric tcp provider (disable_rdma) even on hosts that
-    # expose an unusable RDMA HCA in sysfs. They only take effect at process
-    # start and are intentionally not part of the dynamic reload path.
+    # Startup-fixed knobs live in the `[startup]` section of the config: the
+    # authenticated TCP RPC bind and credentials, the node-wide hugepage data
+    # pool, and the deterministic two-shard topology used by the harness. They
+    # only take effect at process start and are intentionally not part of the
+    # dynamic reload path.
     # Optional TLS knobs for the origin backend. Only emitted when set so
     # plaintext scenarios keep validating as plaintext (the daemon rejects
     # TLS knobs on an http:// endpoint).
@@ -1028,14 +1117,16 @@ stripe_size_bytes = {STRIPE_SIZE}
 [[peers]]
 name = "{self_name}"
 
-[peers.config.tcp]
-addr = "{fabric_addr}"
+[peers.config.tls_tcp]
+addr = "{tls_tcp_addr}"
+server_name = "{self_name}"
 
 [[peers]]
 name = "{peer_name}"
 
-[peers.config.tcp]
+[peers.config.tls_tcp]
 addr = "{peer_addr}"
+server_name = "{peer_name}"
 
 [[caches]]
 name = "cache"
@@ -1063,8 +1154,15 @@ addr = "{frontend_addr}"
 # reservation.
 memory_total_bytes = {MEMORY_TOTAL_BYTES}
 
-[startup.fabric.binds.tcp]
-addr = "{fabric_addr}"
+[startup.fabric.binds.tls_tcp]
+addr = "{tls_tcp_addr}"
+ca_cert_path = "{peer_ca_cert_path}"
+cert_path = "{peer_cert_path}"
+key_path = "{peer_key_path}"
+lanes = 4
+request_timeout_ms = 30000
+socket_buffer_bytes = 16777216
+ring_depth = 4096
 
 [startup.metrics]
 # Expose the Prometheus exporter on a dedicated control-plane port so the
@@ -1074,14 +1172,10 @@ addr = "{metrics_addr}"
 [startup.topology]
 disable_rdma = true
 # Cap the smoke test at two serving shards so it exercises the shared
-# per-node endpoint with more than one shard. A node advertises one static
-# fabric address to its peers, so it binds exactly one inbound
-# fabric endpoint on that fixed port; `plan_fabric_units` maps every serving
-# shard onto that single shared endpoint (per-node for tcp, per-HCA for
-# verbs). Binding one endpoint per shard instead would make every shard past
-# the first collide on the port (`fi_endpoint` -> EADDRINUSE). The cap is a
-# ceiling, not a floor: a runner with only one usable serving core degrades
-# to a single shard and still passes.
+# per-node endpoint with more than one shard. The custom TCP RPC runtime uses
+# the configured endpoint and credentials for authenticated peer traffic. The
+# cap is a ceiling, not a floor: a runner with only one usable serving core
+# degrades to a single shard and still passes.
 serving_cores = 2
 """
     )
@@ -1097,15 +1191,16 @@ def _toml_multiline_literal(name: str, value: str) -> str:
 def write_loadgen_config(
     path: Path,
     *,
-    local_id: int,
-    peer_id: int,
+    self_name: str,
+    peer_name: str,
     peer_addr: str,
     disk_path: Path,
-    fabric_addr: str,
+    tls_tcp_addr: str,
     metrics_addr: str,
+    peer_ca_cert_path: Path,
+    peer_cert_path: Path,
+    peer_key_path: Path,
 ) -> None:
-    self_name = f"node-{local_id}"
-    peer_name = f"node-{peer_id}"
     path.write_text(
         f"""\
 self = "{self_name}"
@@ -1120,14 +1215,16 @@ object_size_bytes = {STRIPE_SIZE}
 [[peers]]
 name = "{self_name}"
 
-[peers.config.tcp]
-addr = "{fabric_addr}"
+[peers.config.tls_tcp]
+addr = "{tls_tcp_addr}"
+server_name = "{self_name}"
 
 [[peers]]
 name = "{peer_name}"
 
-[peers.config.tcp]
+[peers.config.tls_tcp]
 addr = "{peer_addr}"
+server_name = "{peer_name}"
 
 [[caches]]
 name = "cache"
@@ -1157,8 +1254,15 @@ verify = true
 [startup.memory]
 memory_total_bytes = {MEMORY_TOTAL_BYTES}
 
-[startup.fabric.binds.tcp]
-addr = "{fabric_addr}"
+[startup.fabric.binds.tls_tcp]
+addr = "{tls_tcp_addr}"
+ca_cert_path = "{peer_ca_cert_path}"
+cert_path = "{peer_cert_path}"
+key_path = "{peer_key_path}"
+lanes = 4
+request_timeout_ms = 30000
+socket_buffer_bytes = 16777216
+ring_depth = 4096
 
 [startup.metrics]
 addr = "{metrics_addr}"
@@ -1222,28 +1326,78 @@ def scrape_metric_sum(
     is totaled. When *labels* is set, only series carrying every requested
     `key="value"` label are included. Dies if the endpoint never responds.
     """
+    return scrape_metric_sums(url, {name}, timeout=timeout, labels=labels)[name]
+
+
+def scrape_metric_sums(
+    url: str,
+    names: set[str],
+    timeout: int = 30,
+    labels: dict[str, str] | None = None,
+) -> dict[str, float]:
+    """Scrape and sum each requested Prometheus metric from one endpoint."""
     status, body = fetch(url, timeout)
     if status != 200:
         die(f"GET {url} returned status {status}, expected 200")
-    total = 0.0
+    totals = dict.fromkeys(names, 0.0)
     text = body.decode("utf-8", "replace")
     for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+        sample = parse_prometheus_sample(line)
+        if sample is None:
             continue
-        # "<name>{labels} <value>" or "<name> <value>"
-        head, _, value = line.rpartition(" ")
-        metric, label_text = metric_name_and_labels(head)
-        if metric == name:
-            if labels is not None and not all(
-                f'{k}="{v}"' in label_text for k, v in labels.items()
-            ):
-                continue
-            try:
-                total += float(value)
-            except ValueError:
-                continue
-    return total
+        metric, label_text, value = sample
+        if metric not in totals:
+            continue
+        if labels is not None and not all(
+            f'{key}="{expected}"' in label_text
+            for key, expected in labels.items()
+        ):
+            continue
+        totals[metric] += value
+    return totals
+
+
+def parse_prometheus_sample(line: str) -> tuple[str, str, float] | None:
+    """Parse a Prometheus text sample, including quoted label whitespace."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+
+    in_quotes = False
+    escaped = False
+    brace_depth = 0
+    split_at = None
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if in_quotes and char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if in_quotes:
+            continue
+        if char == "{":
+            brace_depth += 1
+        elif char == "}":
+            brace_depth -= 1
+        elif char.isspace() and brace_depth == 0:
+            split_at = index
+            break
+    if split_at is None or in_quotes or brace_depth != 0:
+        return None
+
+    head = line[:split_at]
+    fields = line[split_at:].split()
+    if not fields:
+        return None
+    metric, label_text = metric_name_and_labels(head)
+    try:
+        return metric, label_text, float(fields[0])
+    except ValueError:
+        return None
 
 
 def metric_name_and_labels(head: str) -> tuple[str, str]:
@@ -1270,6 +1424,43 @@ def wait_metric_at_least(
         time.sleep(1)
     die(f"metric {name} at {url} reached {last}, expected >= {threshold}")
     raise AssertionError("unreachable")
+
+
+def assert_tcp_rpc_activity(urls: tuple[str, str], timeout: int = 60) -> None:
+    """Require aggregate request and useful payload activity across both nodes."""
+    request_metric = "unbounded_storage_tcp_rpc_requests_total"
+    byte_metrics = {
+        "unbounded_storage_tcp_rpc_payload_bytes_sent_total",
+        "unbounded_storage_tcp_rpc_payload_bytes_received_total",
+    }
+    page_metrics = {
+        "unbounded_storage_tcp_rpc_pages_sent_total",
+        "unbounded_storage_tcp_rpc_pages_received_total",
+    }
+    metric_names = {request_metric, *byte_metrics, *page_metrics}
+    deadline = time.monotonic() + timeout
+    requests = payload_bytes = payload_pages = 0.0
+    while time.monotonic() < deadline:
+        totals = dict.fromkeys(metric_names, 0.0)
+        for url in urls:
+            node_totals = scrape_metric_sums(url, metric_names, timeout=5)
+            for name, value in node_totals.items():
+                totals[name] += value
+        requests = totals[request_metric]
+        payload_bytes = sum(totals[name] for name in byte_metrics)
+        payload_pages = sum(totals[name] for name in page_metrics)
+        if requests > 0 and payload_bytes > 0 and payload_pages > 0:
+            log(
+                "  aggregate authenticated TCP RPC activity: "
+                f"requests={requests} payload_bytes={payload_bytes} "
+                f"payload_pages={payload_pages}"
+            )
+            return
+        time.sleep(1)
+    die(
+        "aggregate authenticated TCP RPC metrics did not show meaningful activity: "
+        f"requests={requests} payload_bytes={payload_bytes} payload_pages={payload_pages}"
+    )
 
 
 # ============================================================================
@@ -1349,10 +1540,13 @@ def run_scenario(
     log(f"=== Scenario: {name} ({kind} frontend + {kind} backend) ===")
 
     nodes: list[_Node] = []
-    fab_a, fab_b = free_port(), free_port()
+    rpc_a, rpc_b = free_port(), free_port()
     fe_a, fe_b = free_port(), free_port()
     met_a, met_b = free_port(), free_port()
-    log(f"Ports: fabric=({fab_a},{fab_b}) frontends=({fe_a},{fe_b}) metrics=({met_a},{met_b})")
+    log(
+        f"Ports: peer_rpc=({rpc_a},{rpc_b}) "
+        f"frontends=({fe_a},{fe_b}) metrics=({met_a},{met_b})"
+    )
 
     log("Writing node configs")
     cfg1 = TMPDIR / f"{name}-node1.toml"
@@ -1362,12 +1556,15 @@ def run_scenario(
         kind=kind,
         self_name="node-a",
         peer_name="node-b",
-        peer_addr=f"127.0.0.1:{fab_b}",
+        peer_addr=f"127.0.0.1:{rpc_b}",
         disk_path=TMPDIR / f"{name}-node1.disk",
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_a}",
-        fabric_addr=f"127.0.0.1:{fab_a}",
+        tls_tcp_addr=f"127.0.0.1:{rpc_a}",
         metrics_addr=f"127.0.0.1:{met_a}",
+        peer_ca_cert_path=PEER_TLS_CA_CERT,
+        peer_cert_path=PEER_TLS_CERTS["node-a"],
+        peer_key_path=PEER_TLS_KEYS["node-a"],
         ca_cert=ca_cert,
         insecure_skip_verify=insecure_skip_verify,
         client_cert=client_cert,
@@ -1379,12 +1576,15 @@ def run_scenario(
         kind=kind,
         self_name="node-b",
         peer_name="node-a",
-        peer_addr=f"127.0.0.1:{fab_a}",
+        peer_addr=f"127.0.0.1:{rpc_a}",
         disk_path=TMPDIR / f"{name}-node2.disk",
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_b}",
-        fabric_addr=f"127.0.0.1:{fab_b}",
+        tls_tcp_addr=f"127.0.0.1:{rpc_b}",
         metrics_addr=f"127.0.0.1:{met_b}",
+        peer_ca_cert_path=PEER_TLS_CA_CERT,
+        peer_cert_path=PEER_TLS_CERTS["node-b"],
+        peer_key_path=PEER_TLS_KEYS["node-b"],
         ca_cert=ca_cert,
         insecure_skip_verify=insecure_skip_verify,
         client_cert=client_cert,
@@ -1399,8 +1599,8 @@ def run_scenario(
 
         wait_port("127.0.0.1", fe_a)
         wait_port("127.0.0.1", fe_b)
-        # Give the fabric peers a moment to dial each other before routing.
-        log("  Letting fabric peers establish...")
+        # Give the authenticated TCP RPC peers a moment to establish lanes.
+        log("  Letting authenticated TCP RPC peers establish...")
         time.sleep(3)
 
         if origin is not None:
@@ -1456,6 +1656,13 @@ def run_scenario(
                 )
             log(f"  node {label} reports {metric}={count}")
 
+        assert_tcp_rpc_activity(
+            (
+                f"http://127.0.0.1:{met_a}/metrics",
+                f"http://127.0.0.1:{met_b}/metrics",
+            )
+        )
+
         log(f"  {name} scenario PASSED")
     finally:
         log(f"  Tearing down {name} ring")
@@ -1468,30 +1675,36 @@ def run_loadgen_scenario() -> None:
     log("=== Scenario: loadgen (loadgen frontend + fake backend) ===")
 
     nodes: list[_Node] = []
-    fab_a, fab_b = free_port(), free_port()
+    rpc_a, rpc_b = free_port(), free_port()
     met_a, met_b = free_port(), free_port()
-    log(f"Ports: fabric=({fab_a},{fab_b}) metrics=({met_a},{met_b})")
+    log(f"Ports: peer_rpc=({rpc_a},{rpc_b}) metrics=({met_a},{met_b})")
 
     log("Writing loadgen node configs")
     cfg1 = TMPDIR / "loadgen-node1.toml"
     cfg2 = TMPDIR / "loadgen-node2.toml"
     write_loadgen_config(
         cfg1,
-        local_id=1,
-        peer_id=2,
-        peer_addr=f"127.0.0.1:{fab_b}",
+        self_name="node-a",
+        peer_name="node-b",
+        peer_addr=f"127.0.0.1:{rpc_b}",
         disk_path=TMPDIR / "loadgen-node1.disk",
-        fabric_addr=f"127.0.0.1:{fab_a}",
+        tls_tcp_addr=f"127.0.0.1:{rpc_a}",
         metrics_addr=f"127.0.0.1:{met_a}",
+        peer_ca_cert_path=PEER_TLS_CA_CERT,
+        peer_cert_path=PEER_TLS_CERTS["node-a"],
+        peer_key_path=PEER_TLS_KEYS["node-a"],
     )
     write_loadgen_config(
         cfg2,
-        local_id=2,
-        peer_id=1,
-        peer_addr=f"127.0.0.1:{fab_a}",
+        self_name="node-b",
+        peer_name="node-a",
+        peer_addr=f"127.0.0.1:{rpc_a}",
         disk_path=TMPDIR / "loadgen-node2.disk",
-        fabric_addr=f"127.0.0.1:{fab_b}",
+        tls_tcp_addr=f"127.0.0.1:{rpc_b}",
         metrics_addr=f"127.0.0.1:{met_b}",
+        peer_ca_cert_path=PEER_TLS_CA_CERT,
+        peer_cert_path=PEER_TLS_CERTS["node-b"],
+        peer_key_path=PEER_TLS_KEYS["node-b"],
     )
 
     try:
@@ -1501,7 +1714,7 @@ def run_loadgen_scenario() -> None:
 
         wait_port("127.0.0.1", met_a)
         wait_port("127.0.0.1", met_b)
-        log("  Letting fabric peers establish...")
+        log("  Letting authenticated TCP RPC peers establish...")
         time.sleep(3)
 
         request_metric = "unbounded_storage_frontend_requests_total"
@@ -1545,6 +1758,13 @@ def run_loadgen_scenario() -> None:
                 f"response_bytes={bytes_total} startup_failures={failures}"
             )
 
+        assert_tcp_rpc_activity(
+            (
+                f"http://127.0.0.1:{met_a}/metrics",
+                f"http://127.0.0.1:{met_b}/metrics",
+            )
+        )
+
         log("  loadgen scenario PASSED")
     finally:
         log("  Tearing down loadgen ring")
@@ -1587,6 +1807,7 @@ def main() -> None:
     origin_addr = f"http://127.0.0.1:{origin_port}"
 
     log(f"Working directory: {TMPDIR}")
+    generate_peer_tls_certs()
     log(f"Plaintext stub origin on {origin_addr}")
     log("Starting stub origin HTTP server")
     origin = start_origin(origin_port)

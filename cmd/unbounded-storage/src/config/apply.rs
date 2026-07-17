@@ -26,6 +26,9 @@ fn peer_address(p: &PeerSpec) -> FabricAddress {
     match p.config.as_ref() {
         Some(peer_spec::Config::Tcp(cfg)) => FabricAddress::socket(cfg.addr.clone()),
         Some(peer_spec::Config::Rdma(cfg)) => rdma_address(&cfg.addr),
+        Some(peer_spec::Config::TlsTcp(_)) => {
+            panic!("tls_tcp peers are not libfabric connections")
+        }
         None => FabricAddress::native(""),
     }
 }

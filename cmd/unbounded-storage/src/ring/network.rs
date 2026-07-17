@@ -283,9 +283,9 @@ impl NetworkRing {
         max_len: usize,
     ) -> impl Future<Output = io::Result<Vec<u8>>> + '_ {
         async move {
+            let len = checked_u32_len(max_len)?;
             let buf = Rc::new(RefCell::new(vec![0u8; max_len]));
             let ptr = buf.borrow_mut().as_mut_ptr();
-            let len = max_len as u32;
             let ud = self.core.alloc_user_data();
             let sqe = opcode::Recv::new(types::Fd(fd), ptr, len)
                 .build()
@@ -306,7 +306,6 @@ impl NetworkRing {
 
     /// Receive up to `len` bytes from `fd` into the registered fixed
     /// buffer (`buf_index`) at `page_byte_offset` (`IORING_OP_RECV`).
-    /// `buf_index` must be 0 (the only registered slot).
     pub fn recv_fixed(
         &self,
         fd: RawFd,
@@ -315,9 +314,12 @@ impl NetworkRing {
         len: usize,
     ) -> impl Future<Output = io::Result<usize>> + '_ {
         async move {
-            let ptr = self.fixed_ptr(buf_index, page_byte_offset)?;
+            if buf_index != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            let (ptr, len) = self.fixed_range(buf_index, page_byte_offset, len)?;
             let ud = self.core.alloc_user_data();
-            let sqe = opcode::Recv::new(types::Fd(fd), ptr as *mut u8, len as u32)
+            let sqe = opcode::Recv::new(types::Fd(fd), ptr as *mut u8, len)
                 .build()
                 .user_data(ud);
             // SAFETY: `ptr` points inside the registered backing, kept
@@ -334,7 +336,7 @@ impl NetworkRing {
     pub fn send(&self, fd: RawFd, buf: Vec<u8>) -> impl Future<Output = io::Result<usize>> + '_ {
         async move {
             let ptr = buf.as_ptr();
-            let len = buf.len() as u32;
+            let len = checked_u32_len(buf.len())?;
             let ud = self.core.alloc_user_data();
             let sqe = opcode::Send::new(types::Fd(fd), ptr, len)
                 .build()
@@ -366,9 +368,9 @@ impl NetworkRing {
             if buf_index != 0 {
                 return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
-            let ptr = self.fixed_ptr(buf_index, page_byte_offset)?;
+            let (ptr, len) = self.fixed_range(buf_index, page_byte_offset, len)?;
             let ud = self.core.alloc_user_data();
-            let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
+            let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len)
                 .buf_index(Some(buf_index))
                 .build()
                 .user_data(ud);
@@ -396,9 +398,9 @@ impl NetworkRing {
         on_complete: Box<dyn SendCompletion>,
     ) -> impl Future<Output = io::Result<usize>> + '_ {
         async move {
-            let ptr = self.fixed_ptr(buf_index, page_byte_offset)?;
+            let (ptr, len) = self.fixed_range(buf_index, page_byte_offset, len)?;
             let ud = self.core.alloc_user_data();
-            let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
+            let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len)
                 .buf_index(Some(buf_index))
                 .build()
                 .user_data(ud);
@@ -411,19 +413,14 @@ impl NetworkRing {
         }
     }
 
-    /// Resolve a `(buf_index, offset)` pair to a raw pointer inside a
-    /// registered region. `buf_index` 0 is this shard's own backing;
-    /// indices 1..N are peer shards' backings registered via
-    /// [`Self::register_region_indexed`] for cross-shard zero-copy send.
-    pub(crate) fn fixed_ptr(
+    /// Validate and resolve a complete fixed-buffer operation range.
+    pub(crate) fn fixed_range(
         &self,
         buf_index: u16,
         page_byte_offset: usize,
-    ) -> io::Result<*const u8> {
-        match self.core.registered_base(buf_index) {
-            Some(base) => Ok(unsafe { base.as_ptr().add(page_byte_offset) as *const u8 }),
-            None => Err(io::Error::from_raw_os_error(libc::EINVAL)),
-        }
+        len: usize,
+    ) -> io::Result<(*const u8, u32)> {
+        self.core.registered_range(buf_index, page_byte_offset, len)
     }
 
     /// Count of F_MORE (intermediate SEND_ZC) completions observed.
@@ -544,15 +541,26 @@ impl NetHandle {
         fd: RawFd,
         buf: Vec<u8>,
     ) -> impl Future<Output = io::Result<usize>> + 'static {
+        self.send_with_flags(fd, buf, 0)
+    }
+
+    /// Heap-buffer send with explicit `send(2)` flags.
+    pub(crate) fn send_with_flags(
+        &self,
+        fd: RawFd,
+        buf: Vec<u8>,
+        flags: i32,
+    ) -> impl Future<Output = io::Result<usize>> + 'static {
         let ring = Rc::clone(&self.ring);
         async move {
+            let len = checked_u32_len(buf.len())?;
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.as_ref();
                 let ptr = buf.as_ptr();
-                let len = buf.len() as u32;
                 let ud = r.core.alloc_user_data();
                 let sqe = opcode::Send::new(types::Fd(fd), ptr, len)
+                    .flags(flags)
                     .build()
                     .user_data(ud);
                 // SAFETY: the source pointer addresses `buf`, owned by the
@@ -573,12 +581,12 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<Vec<u8>>> + 'static {
         let ring = Rc::clone(&self.ring);
         async move {
+            let len = checked_u32_len(max_len)?;
             let buf = Rc::new(RefCell::new(vec![0u8; max_len]));
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.as_ref();
                 let ptr = buf.borrow_mut().as_mut_ptr();
-                let len = max_len as u32;
                 let ud = r.core.alloc_user_data();
                 let sqe = opcode::Recv::new(types::Fd(fd), ptr, len)
                     .build()
@@ -615,9 +623,9 @@ impl NetHandle {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.as_ref();
-                let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
+                let (ptr, len) = r.fixed_range(buf_index, page_byte_offset, len)?;
                 let ud = r.core.alloc_user_data();
-                let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
+                let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len)
                     .buf_index(Some(buf_index))
                     .build()
                     .user_data(ud);
@@ -650,9 +658,9 @@ impl NetHandle {
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.as_ref();
-                let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
+                let (ptr, len) = r.fixed_range(buf_index, page_byte_offset, len)?;
                 let ud = r.core.alloc_user_data();
-                let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len as u32)
+                let sqe = opcode::SendZc::new(types::Fd(fd), ptr, len)
                     .buf_index(Some(buf_index))
                     .build()
                     .user_data(ud);
@@ -668,6 +676,37 @@ impl NetHandle {
         }
     }
 
+    /// Registered-source write that holds `on_complete` until its CQE is
+    /// reaped. Unlike SEND_ZC, this is compatible with kTLS, which may retain
+    /// its own references to the registered plaintext pages before completion.
+    pub(crate) fn write_fixed_with_completion(
+        &self,
+        fd: RawFd,
+        buf_index: u16,
+        page_byte_offset: usize,
+        len: usize,
+        on_complete: Box<dyn SendCompletion>,
+    ) -> impl Future<Output = io::Result<usize>> + 'static {
+        let ring = Rc::clone(&self.ring);
+        async move {
+            OwnedSubmitSlot::new(Rc::clone(&ring)).await;
+            let (ud, slot) = {
+                let r = ring.as_ref();
+                let (ptr, len) = r.fixed_range(buf_index, page_byte_offset, len)?;
+                let ud = r.core.alloc_user_data();
+                let sqe = opcode::WriteFixed::new(types::Fd(fd), ptr, len, buf_index)
+                    .build()
+                    .user_data(ud);
+                let slot =
+                    r.core
+                        .submit_now(sqe, false, OpResource::SendCompletion(on_complete))?;
+                (ud, slot)
+            };
+            let res = OwnedNetFut::new(Rc::clone(&ring), ud, slot).await;
+            check_res(res).map(|n| n as usize)
+        }
+    }
+
     /// `'static` counterpart of [`NetworkRing::recv_fixed`].
     pub fn recv_fixed(
         &self,
@@ -676,14 +715,30 @@ impl NetHandle {
         page_byte_offset: usize,
         len: usize,
     ) -> impl Future<Output = io::Result<usize>> + 'static {
+        self.recv_fixed_with_flags(fd, buf_index, page_byte_offset, len, 0)
+    }
+
+    /// Registered-destination receive with explicit `recv(2)` flags.
+    pub(crate) fn recv_fixed_with_flags(
+        &self,
+        fd: RawFd,
+        buf_index: u16,
+        page_byte_offset: usize,
+        len: usize,
+        flags: i32,
+    ) -> impl Future<Output = io::Result<usize>> + 'static {
         let ring = Rc::clone(&self.ring);
         async move {
+            if buf_index != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot) = {
                 let r = ring.as_ref();
-                let ptr = r.fixed_ptr(buf_index, page_byte_offset)?;
+                let (ptr, len) = r.fixed_range(buf_index, page_byte_offset, len)?;
                 let ud = r.core.alloc_user_data();
-                let sqe = opcode::Recv::new(types::Fd(fd), ptr as *mut u8, len as u32)
+                let sqe = opcode::Recv::new(types::Fd(fd), ptr as *mut u8, len)
+                    .flags(flags)
                     .build()
                     .user_data(ud);
                 // SAFETY: `ptr` points inside the registered backing; the
@@ -703,6 +758,10 @@ impl NetHandle {
             check_res(res).map(|n| n as usize)
         }
     }
+}
+
+pub(crate) fn checked_u32_len(len: usize) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
 }
 
 /// `'static` op future for the [`NetHandle`] path. Owns an
@@ -921,6 +980,17 @@ mod tests {
         )
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn heap_lengths_larger_than_u32_are_rejected_before_io() {
+        assert_eq!(
+            checked_u32_len(u32::MAX as usize + 1)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EOVERFLOW)
+        );
+    }
+
     #[test]
     fn send_recv_roundtrip() {
         let ring = match NetworkRing::new(16) {
@@ -1091,6 +1161,83 @@ mod tests {
             more_at_send_ready >= 1,
             "SEND_ZC must record a F_MORE completion before its notification resolves the op",
         );
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    #[test]
+    fn handle_write_fixed_sends_from_nonzero_registered_index() {
+        let ring = match NetworkRing::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("handle_write_fixed: ring unavailable: {e}; skipping");
+                return;
+            }
+        };
+
+        const PAGE: usize = 4096;
+        let mut primary = vec![0u8; PAGE];
+        let primary_backing = crate::memory::Backing {
+            base: primary.as_mut_ptr(),
+            page_size: PAGE,
+            page_count: 1,
+            keepalive: std::sync::Arc::new(()),
+        };
+        if let Err(e) = ring.register_backing(&primary_backing) {
+            eprintln!("handle_write_fixed: register_backing failed: {e}; skipping");
+            return;
+        }
+
+        let payload: &[u8] = b"registered kTLS write bytes";
+        let mut peer = vec![0u8; PAGE];
+        peer[..payload.len()].copy_from_slice(payload);
+        let ring = Rc::new(ring);
+        let handle = NetHandle::new(Rc::clone(&ring));
+        let buf_index = match handle.register_peer_region(peer.as_mut_ptr(), peer.len()) {
+            Ok(index) => index,
+            Err(e) => {
+                eprintln!("handle_write_fixed: register peer failed: {e}; skipping");
+                return;
+            }
+        };
+        assert_ne!(buf_index, 0);
+
+        let Some((a, b)) = tcp_loopback_pair() else {
+            eprintln!("handle_write_fixed: tcp loopback pair failed; skipping");
+            return;
+        };
+        let sent = {
+            let fut =
+                handle.write_fixed_with_completion(a, buf_index, 0, payload.len(), Box::new(()));
+            let mut fut = Box::pin(fut);
+            match block_on_handle(fut.as_mut()) {
+                Ok(n) => n,
+                Err(e) if is_unsupported(&e) => {
+                    eprintln!("handle_write_fixed: WRITE_FIXED unsupported; skipping");
+                    unsafe {
+                        libc::close(a);
+                        libc::close(b);
+                    }
+                    return;
+                }
+                Err(e) => panic!("write_fixed failed: {e}"),
+            }
+        };
+        assert_eq!(sent, payload.len());
+
+        let mut received = vec![0u8; payload.len()];
+        let got = unsafe {
+            libc::read(
+                b,
+                received.as_mut_ptr() as *mut libc::c_void,
+                received.len(),
+            )
+        };
+        assert_eq!(got as usize, payload.len());
+        assert_eq!(received, payload);
 
         unsafe {
             libc::close(a);

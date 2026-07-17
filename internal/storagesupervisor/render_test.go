@@ -68,6 +68,15 @@ func rdmaPeer(name, addr string) *storageconfig.PeerSpec {
 	}
 }
 
+func tlsTCPPeer(name, addr string) *storageconfig.PeerSpec {
+	return &storageconfig.PeerSpec{
+		Name: name,
+		Config: &storageconfig.PeerSpec_TlsTcp{
+			TlsTcp: &storageconfig.TlsTcpPeerConfig{Addr: addr, ServerName: name},
+		},
+	}
+}
+
 func TestRenderConfigFullSchema(t *testing.T) {
 	dir := writeSource(t, `
 version: 7
@@ -459,6 +468,49 @@ backends:
 	require.Len(t, cfg.GetPeers(), 2)
 	assert.Equal(t, "hex:self", cfg.GetPeers()[0].GetRdma().GetAddr())
 	assert.Equal(t, "hex:peer", cfg.GetPeers()[1].GetRdma().GetAddr())
+}
+
+func TestRenderConfigActiveTLSRingPreservesBindCredentials(t *testing.T) {
+	dir := writeSource(t, `
+startup:
+  fabric:
+    tls_tcp:
+      addr: "0.0.0.0:9443"
+      ca_cert_path: /etc/unbounded-storage/tls/ca.crt
+      cert_path: /etc/unbounded-storage/tls/tls.crt
+      key_path: /etc/unbounded-storage/tls/tls.key
+      lanes: 8
+      request_timeout_ms: 12000
+      socket_buffer_bytes: 1048576
+      ring_depth: 512
+`)
+
+	ring := ringState{
+		active:         true,
+		selfName:       "node-a",
+		selfListenAddr: "10.0.0.5:9443",
+		peers: []*storageconfig.PeerSpec{
+			tlsTCPPeer("node-a", "10.0.0.5:9443"),
+			tlsTCPPeer("node-b", "10.0.0.6:9443"),
+		},
+	}
+
+	cfg := decodeWithState(t, dir, renderState{ring: ring})
+	tls := cfg.GetStartup().GetFabric().GetTlsTcp()
+
+	require.NotNil(t, tls)
+	assert.Equal(t, "10.0.0.5:9443", tls.GetAddr())
+	assert.Equal(t, "/etc/unbounded-storage/tls/ca.crt", tls.GetCaCertPath())
+	assert.Equal(t, "/etc/unbounded-storage/tls/tls.crt", tls.GetCertPath())
+	assert.Equal(t, "/etc/unbounded-storage/tls/tls.key", tls.GetKeyPath())
+	assert.Equal(t, uint32(8), tls.GetLanes())
+	assert.Equal(t, uint32(12000), tls.GetRequestTimeoutMs())
+	assert.Equal(t, uint32(1048576), tls.GetSocketBufferBytes())
+	assert.Equal(t, uint32(512), tls.GetRingDepth())
+	assert.Nil(t, cfg.GetStartup().GetFabric().GetTcp())
+	require.Len(t, cfg.GetPeers(), 2)
+	assert.Equal(t, "node-a", cfg.GetPeers()[0].GetTlsTcp().GetServerName())
+	assert.Equal(t, "node-b", cfg.GetPeers()[1].GetTlsTcp().GetServerName())
 }
 
 func TestRenderConfigActiveRingInjectsMeshWithoutDeclaredPeers(t *testing.T) {

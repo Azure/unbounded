@@ -14,9 +14,9 @@ flowchart LR
 
 - **Origin** is the bandwidth-constrained source of truth: an S3 bucket, Azure blob storage, etc.
 - **Regional cache** is a pull-through cache of objects and metadata residing within the cluster's geo.
-- **P2P cache** runs on every node. Nodes share hot data with each
-  other, so popular objects are served from the fleet over RDMA at
-  high aggregate throughput.
+- **P2P cache** runs on every node. Nodes share hot data with each other, so
+  popular objects are served from the fleet over verbs/RDMA or custom TLS TCP
+  RPC at high aggregate throughput.
 
 ## Read path
 
@@ -56,12 +56,20 @@ the name to the same ID without fetching the full object.
 
 ## P2P cache
 
-- **RDMA over the backend fabric.** Peer transfers use RDMA
-  (InfiniBand or RoCE), with TCP fallback where RDMA is unavailable.
+- **RDMA or authenticated TCP over the backend fabric.** Peer transfers use
+  libfabric verbs/RDMA (InfiniBand or RoCE) where available. The non-RDMA path
+  is the custom TLS TCP RPC transport, which replaces the old libfabric TCP
+  fallback. Libfabric remains the verbs/RDMA implementation.
+- **Mandatory peer security.** TCP peers use an OpenSSL TLS 1.3 mutual-auth
+  handshake. The configured peer name must match a DNS SAN, and kTLS TX and RX
+  are required before application traffic starts.
+- **Zero-copy TCP page path.** Each shard owns its io_uring and persistent peer
+  lanes. Page bodies receive directly into fixed buffers; SEND_ZC source pages
+  stay pinned until the final kernel notification.
 - **Local NVMe.** Each node backs its cache with local NVMe.
-- **Bounded neighbors.** Each node maintains RDMA connections to a
-  bounded subset of peers, not a full mesh, so NIC queue-pair (QP)
-  usage stays well under hardware limits.
+- **Bounded neighbors.** Each node maintains peer connections to a bounded
+  subset of peers, not a full mesh. On RDMA this keeps NIC queue-pair (QP) usage
+  well under hardware limits.
 - **Disjoint discovery.** A node can be configured with only its
   direct routing neighbors (the top-level `routing_plan`) instead of the full
   cluster roster. Because the recursive routing math only ever
@@ -70,6 +78,10 @@ the name to the same ID without fetching the full object.
   cluster routes identically to the full-knowledge build. The exact
   algorithm a planner must reproduce is specified in
   `storage-disjoint-routing-parity.md`.
+- **Recursive bounded routing.** Each lane runs one active request. Requests
+  carry a hop TTL, decrement it only when forwarded, and fail rather than recurse
+  past the limit. Cancellation or disconnect tears down the active lane and
+  releases relay state.
 
 ## Data plane APIs
 

@@ -2,7 +2,7 @@
  * Copyright (c) Microsoft Corporation.
  * Licensed under the MIT License.
  *
- * Minimal C shim for the unbounded-storage OpenSSL/kTLS client.
+ * Minimal C shim for the unbounded-storage OpenSSL/kTLS transport.
  *
  * Several OpenSSL entry points the TLS module needs are exposed only as
  * preprocessor macros over `SSL_ctrl`/`SSL_CTX_ctrl` (for example
@@ -13,7 +13,12 @@
  * piece of C the tls module ships; everything else is Rust.
  *
  * The shim also owns PEM object parsing so Rust only passes borrowed byte
- * slices and never handles OpenSSL X509 or EVP_PKEY ownership directly.
+ * slices and never handles OpenSSL X509 or EVP_PKEY ownership directly. It
+ * also hides OpenSSL constants
+ * (`SSL_OP_ENABLE_KTLS`, `SSL_FILETYPE_PEM`, `TLS1_2_VERSION`,
+ * `TLS1_3_VERSION`) behind
+ * plain functions so the Rust side never freezes a numeric value against
+ * a moving header.
  */
 
 #include <limits.h>
@@ -23,6 +28,9 @@
 #include <openssl/ssl.h>
 #include <openssl/x509err.h>
 #include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
+
+#include <string.h>
 
 static BIO *ub_bio_from_bytes(const unsigned char *data, size_t len) {
     if (data == NULL || len == 0 || len > INT_MAX) {
@@ -73,6 +81,16 @@ unsigned long ub_ssl_ctx_set_options(SSL_CTX *ctx, unsigned long op) {
 /* SSL_CTX_set_min_proto_version is a macro over SSL_CTX_ctrl. */
 int ub_ssl_ctx_set_min_proto_version(SSL_CTX *ctx, int version) {
     return (int)SSL_CTX_set_min_proto_version(ctx, version);
+}
+
+/* SSL_CTX_set_max_proto_version is a macro over SSL_CTX_ctrl. */
+int ub_ssl_ctx_set_max_proto_version(SSL_CTX *ctx, int version) {
+    return (int)SSL_CTX_set_max_proto_version(ctx, version);
+}
+
+/* Peer sockets leave OpenSSL after the handshake, so disable TLS 1.3 tickets. */
+int ub_ssl_ctx_set_num_tickets(SSL_CTX *ctx, size_t tickets) {
+    return SSL_CTX_set_num_tickets(ctx, tickets);
 }
 
 int ub_ssl_ctx_load_ca_pem(SSL_CTX *ctx, const unsigned char *pem, size_t len) {
@@ -198,6 +216,82 @@ long ub_ssl_set_tlsext_host_name(SSL *ssl, const char *name) {
     return SSL_set_tlsext_host_name(ssl, name);
 }
 
+/* Peer identities must come from DNS SANs, never a legacy subject CN. */
+void ub_ssl_set_dns_san_only(SSL *ssl) {
+    SSL_set_hostflags(ssl, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
+}
+
+X509 *ub_ssl_get1_peer_certificate(SSL *ssl) {
+    return SSL_get1_peer_certificate(ssl);
+}
+
+int ub_x509_check_dns_san(X509 *cert, const char *name) {
+    return X509_check_host(cert, name, 0, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT,
+                           NULL);
+}
+
+int ub_x509_dns_san_count(X509 *cert) {
+    GENERAL_NAMES *sans;
+    int count = 0;
+    int i;
+
+    sans = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+    if (sans == NULL) {
+        return 0;
+    }
+    for (i = 0; i < sk_GENERAL_NAME_num(sans); i++) {
+        const GENERAL_NAME *name = sk_GENERAL_NAME_value(sans, i);
+        if (name->type == GEN_DNS) {
+            count++;
+        }
+    }
+    GENERAL_NAMES_free(sans);
+    return count;
+}
+
+/*
+ * Copy the indexed DNS SAN. A NULL output reports its byte length. Embedded
+ * NULs are rejected so Rust can safely expose the result as a String.
+ */
+int ub_x509_dns_san_copy(X509 *cert, int index, char *out, size_t capacity) {
+    GENERAL_NAMES *sans;
+    int dns_index = 0;
+    int result = -1;
+    int i;
+
+    if (index < 0) {
+        return -1;
+    }
+    sans = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+    if (sans == NULL) {
+        return -1;
+    }
+    for (i = 0; i < sk_GENERAL_NAME_num(sans); i++) {
+        const GENERAL_NAME *name = sk_GENERAL_NAME_value(sans, i);
+        const unsigned char *data;
+        int len;
+
+        if (name->type != GEN_DNS || dns_index++ != index) {
+            continue;
+        }
+        data = ASN1_STRING_get0_data(name->d.dNSName);
+        len = ASN1_STRING_length(name->d.dNSName);
+        if (len < 0 || memchr(data, '\0', (size_t)len) != NULL) {
+            break;
+        }
+        if (out == NULL) {
+            result = len;
+        } else if (capacity > (size_t)len) {
+            memcpy(out, data, (size_t)len);
+            out[len] = '\0';
+            result = len;
+        }
+        break;
+    }
+    GENERAL_NAMES_free(sans);
+    return result;
+}
+
 /*
  * BIO_get_ktls_send/BIO_get_ktls_recv are macros over BIO_ctrl. They
  * return 1 only when the kernel TLS data path is actually engaged for
@@ -219,4 +313,8 @@ int ub_ssl_ktls_recv_enabled(SSL *ssl) {
 /* Constants that live in headers; surfaced as functions for Rust. */
 unsigned long ub_ssl_op_enable_ktls(void) { return SSL_OP_ENABLE_KTLS; }
 
+int ub_ssl_filetype_pem(void) { return SSL_FILETYPE_PEM; }
+
 int ub_tls1_2_version(void) { return TLS1_2_VERSION; }
+
+int ub_tls1_3_version(void) { return TLS1_3_VERSION; }

@@ -174,11 +174,11 @@ func reconcile(cfg Config, peers *peerWatcher) error {
 }
 
 // currentRenderState resolves the current node annotations and ring state from
-// the node watch. TCP configs use the fixed ConfigMap fabric port; RDMA configs
-// use peer-published HCA inventory annotations. It returns the zero value when
-// node watching is disabled. A source that cannot be loaded yields an inactive
-// ring; the subsequent RenderConfig surfaces the same error in reconcile, which
-// keeps the previously rendered config in place.
+// the node watch. TCP and TLS TCP configs use the fixed ConfigMap fabric port;
+// RDMA configs use peer-published HCA inventory annotations. It returns the zero
+// value when node watching is disabled. A source that cannot be loaded yields an
+// inactive ring; the subsequent RenderConfig surfaces the same error in
+// reconcile, which keeps the previously rendered config in place.
 func currentRenderState(cfg Config, peers *peerWatcher) renderState {
 	if peers == nil {
 		return renderState{}
@@ -192,6 +192,12 @@ func currentRenderState(cfg Config, peers *peerWatcher) renderState {
 	fabric := sc.GetStartup().GetFabric()
 	if fabric.GetRdma() != nil || fabric.GetAutoRdma() != nil {
 		return peers.snapshotRdma()
+	}
+
+	if tls := fabric.GetTlsTcp(); tls != nil {
+		port, ok := parseFabricPort(tls.GetAddr())
+
+		return peers.snapshotTLS(port, ok)
 	}
 
 	port, ok := parseFabricPort(fabric.GetTcp().GetAddr())

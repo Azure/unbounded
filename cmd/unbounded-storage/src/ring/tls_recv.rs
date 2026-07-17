@@ -27,7 +27,9 @@ use std::rc::Rc;
 use io_uring::{opcode, types};
 
 use super::core::{OpResource, RecvMsgState, check_res};
-use super::network::{NetHandle, OwnedNetFut, OwnedSubmitSlot, RecvRecord, TLS_RECORD_TYPE_ALERT};
+use super::network::{
+    NetHandle, OwnedNetFut, OwnedSubmitSlot, RecvRecord, TLS_RECORD_TYPE_ALERT, checked_u32_len,
+};
 
 impl NetHandle {
     /// Wait for readiness on `fd` and return the reported `revents`.
@@ -70,6 +72,7 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<(Vec<u8>, u8)>> + 'static {
         let ring = Rc::clone(self.ring_cell());
         async move {
+            checked_u32_len(max_len)?;
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot, state) = {
                 let r = ring.as_ref();
@@ -113,10 +116,10 @@ impl NetHandle {
     ) -> impl Future<Output = io::Result<RecvRecord>> + 'static {
         let ring = Rc::clone(self.ring_cell());
         async move {
+            let (ptr, _) = ring.fixed_range(0, page_byte_offset, len)?;
             OwnedSubmitSlot::new(Rc::clone(&ring)).await;
             let (ud, slot, state) = {
                 let r = ring.as_ref();
-                let ptr = r.fixed_ptr(0, page_byte_offset)?;
                 let state = RecvMsgState::new(ptr as *mut u8, len);
                 let msg_ptr = state.borrow().msghdr_ptr();
                 let ud = r.core.alloc_user_data();
@@ -143,7 +146,6 @@ impl NetHandle {
             // graceful close_notify from a fatal alert. The op has
             // completed, so the kernel-written bytes are stable.
             let alert_desc = if record_type == TLS_RECORD_TYPE_ALERT && n >= 2 {
-                let ptr = ring.fixed_ptr(0, page_byte_offset)?;
                 // SAFETY: `ptr` addresses the registered page the kernel
                 // just decrypted at least two alert bytes into.
                 Some(unsafe { *ptr.add(1) })

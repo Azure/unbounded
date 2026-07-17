@@ -2,8 +2,8 @@
 
 `unbounded-storage` is the per-host storage daemon for Project
 Unbounded. It owns a set of local block devices, presents them as
-NUMA-pinned shards on top of a fabric (TCP today, RDMA when an HCA is
-present), and reconciles its peer and disk topology in place from a
+NUMA-pinned shards on either custom TLS TCP RPC or libfabric verbs/RDMA,
+and reconciles its peer and disk topology in place from a
 TOML config file. It is the only Rust crate in this repository; the
 crate-local conventions live in
 [`AGENTS.md`](AGENTS.md).
@@ -74,11 +74,10 @@ proto3-native rather than idiomatic TOML:
 
 - Byte-size fields are plain integer byte counts, with no K/M/G
   suffixes.
-- Any field left at its proto3 zero value is treated as "unset" and
-  filled with the documented default after load. Unknown keys are
-  rejected: the TOML loader is strict, so a typo fails loudly at parse
-  time. (The protobuf wire path stays forward-compatible by protobuf's
-  own unknown-field semantics.)
+- Optional scalar fields omitted from the input receive their documented
+  defaults. An explicit zero remains explicit and is accepted or rejected by
+  field validation. Unknown keys are rejected by the strict TOML loader. The
+  protobuf wire path retains protobuf's unknown-field compatibility.
 
 Every section, and the table itself, is optional; omitted values fall
 back to the documented defaults. The config holds both the dynamically
@@ -124,15 +123,17 @@ stripe_size_bytes = 4194304      # optional; must be a power of two.
 name      = "node-a"             # ring/fabric ids are derived from this name.
 tags      = ["region-a", "rack-1"]
 
-[peers.config.tcp]
-addr      = "10.0.0.10:9000"     # advertised local fabric address.
+[peers.config.tls_tcp]
+addr        = "10.0.0.10:9443"   # numeric advertised peer RPC address.
+server_name = "node-a"           # must match a DNS SAN in node-a's certificate.
 
 [[peers]]
 name      = "node-b"
 tags      = ["region-a", "rack-2"]
 
-[peers.config.tcp]
-addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
+[peers.config.tls_tcp]
+addr        = "10.0.0.11:9443"
+server_name = "node-b"           # use the peer name and exact DNS SAN.
 
 # Or, for RDMA peers:
 # [peers.config.rdma]
@@ -171,13 +172,20 @@ memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Node-wide data p
                                  #   RPC scratch adds 8 pages per fabric unit.
 
 [startup.fabric]
-progress_threads    = 2          # libfabric progress threads per fabric unit.
-progress_poll_us    = 10         # progress-thread busy-poll budget (us).
-rpc_worker_threads  = 4          # RPC worker threads per fabric unit.
-max_inflight        = 1024       # max in-flight ops per fabric unit (back-pressure).
+progress_threads    = 2          # libfabric verbs progress threads per fabric unit.
+progress_poll_us    = 10         # libfabric progress-thread busy-poll budget (us).
+rpc_worker_threads  = 4          # libfabric verbs RPC workers per fabric unit.
+max_inflight        = 4096       # shared RPC admission/waiter cap.
 
-[startup.fabric.binds.tcp]
-addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
+[startup.fabric.binds.tls_tcp]
+addr                = "0.0.0.0:9443" # nonzero numeric listen address.
+ca_cert_path        = "/etc/unbounded-storage/pki/ca.pem"
+cert_path           = "/etc/unbounded-storage/pki/node-a.pem"
+key_path            = "/etc/unbounded-storage/pki/node-a-key.pem"
+lanes               = 8          # persistent connections per peer per shard.
+request_timeout_ms  = 30000      # client request deadline.
+socket_buffer_bytes = 16777216   # SO_SNDBUF/SO_RCVBUF request.
+ring_depth          = 4096       # shard-local network io_uring depth.
 
 # Or use automatic RDMA HCA binding:
 # [startup.fabric.binds.auto_rdma]
@@ -190,8 +198,29 @@ use_smt_siblings      = false    # also place shards on SMT sibling CPUs.
 ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.
 include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU 0.
 allow_inactive_port   = false    # use HCA ports not in the active state.
-disable_rdma          = false    # disable RDMA and force the libfabric tcp provider.
+disable_rdma          = false    # topology control; tls_tcp itself reserves no HCA workers.
 ```
+
+### Peer TLS TCP transport
+
+`tls_tcp` replaces the libfabric TCP fallback; libfabric remains the verbs/RDMA
+transport. Peer TCP connections require OpenSSL TLS 1.3 mutual authentication,
+the configured peer name must match a DNS SAN, and kTLS TX and RX must both be
+active. The post-handshake path is shard-local io_uring: page bodies use direct
+fixed receives. Sends try `SEND_ZC`, then switch the connection to registered
+`WRITE_FIXED` if kTLS rejects `MSG_ZEROCOPY`; source pages remain pinned through
+the applicable completion. Each persistent lane runs one active request and is
+rotated after 2,048 requests. `request_timeout_ms` is enforced by the client.
+
+Protocol version 1 uses a 24-byte network-order `UBRP` header and handshake,
+request, page, end, error, and cancel frames. Dropped streams send best-effort
+cancel and close the lane; disconnect fails the active request and the next use
+reconnects. Recursive forwarding starts with TTL 64, decrements on each forward,
+allows a local owner to serve TTL 0, and rejects another forward at TTL 0.
+
+For the practical physical-host throughput gate, including a `loadgen`
+`fabric_only` configuration and metric formulas, see [`PERF.md`](PERF.md).
+The loopback smoke target is not performance acceptance.
 
 ### Origin authentication and TLS
 

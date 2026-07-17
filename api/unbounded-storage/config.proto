@@ -90,6 +90,7 @@ message PeerSpec {
   oneof config {
     TcpPeerConfig tcp = 3;
     RdmaPeerConfig rdma = 4;
+    TlsTcpPeerConfig tls_tcp = 5;
   }
 }
 
@@ -108,6 +109,17 @@ message RdmaPeerConfig {
   // such as one endpoint per HCA. The daemon dials the address whose index
   // matches the local fabric unit index, falling back to addr when absent.
   repeated string addrs = 2;
+}
+
+message TlsTcpPeerConfig {
+  reserved 3;
+  reserved "addrs";
+
+  // Numeric TCP socket address used to connect to this peer.
+  string addr = 1;
+
+  // DNS name required in the peer certificate. Defaults to PeerSpec.name when unset.
+  string server_name = 2;
 }
 
 message CacheSpec {
@@ -141,6 +153,7 @@ message FabricCfg {
     TcpFabricBinds tcp = 1;
     RdmaFabricBinds rdma = 2;
     AutoRdmaFabricBinds auto_rdma = 3;
+    TlsTcpFabricBinds tls_tcp = 8;
   }
 
   // Maximum in-flight fabric operations per shard. Defaults to 1024 when unset.
@@ -158,6 +171,32 @@ message FabricCfg {
 
 message TcpFabricBinds {
   string addr = 1;
+}
+
+message TlsTcpFabricBinds {
+  // Numeric TCP socket address to bind. The port must be nonzero.
+  string addr = 1;
+
+  // PEM CA bundle used to authenticate peer certificates.
+  string ca_cert_path = 2;
+
+  // PEM certificate chain presented to peers.
+  string cert_path = 3;
+
+  // PEM private key corresponding to cert_path.
+  string key_path = 4;
+
+  // Parallel peer TCP connections. Defaults to 4 when unset.
+  optional uint32 lanes = 5;
+
+  // Peer request timeout in milliseconds. Defaults to 30000 when unset.
+  optional uint32 request_timeout_ms = 6;
+
+  // TCP socket send and receive buffer size. Defaults to 16 MiB when unset.
+  optional uint32 socket_buffer_bytes = 7;
+
+  // Per-lane io_uring queue depth. Defaults to 4096 when unset.
+  optional uint32 ring_depth = 8;
 }
 
 message RdmaFabricBinds {

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/client-go/kubernetes/fake"
 
 	storageconfig "github.com/Azure/unbounded/api/unbounded-storage"
 )
@@ -48,6 +49,35 @@ func TestReconcileBadValueErrors(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "config.binpb")
 
 	require.Error(t, reconcile(Config{SourceDir: src, ConfigPath: dest}, nil))
+}
+
+func TestCurrentRenderStateUsesTLSDiscovery(t *testing.T) {
+	src := writeSource(t, `
+startup:
+  fabric:
+    tls_tcp:
+      addr: "0.0.0.0:9443"
+      ca_cert_path: /etc/unbounded-storage/tls/ca.crt
+      cert_path: /etc/unbounded-storage/tls/tls.crt
+      key_path: /etc/unbounded-storage/tls/tls.key
+`)
+
+	w, err := newPeerWatcher(Config{
+		NodeName:         "self",
+		StorageRingLabel: testRingLabel,
+	}, fake.NewSimpleClientset())
+	require.NoError(t, err)
+	require.NoError(t, w.informer.GetStore().Add(node("self", "red", "10.0.0.1")))
+	require.NoError(t, w.informer.GetStore().Add(node("peer-a", "red", "10.0.0.2")))
+
+	state := currentRenderState(Config{SourceDir: src}, w)
+
+	require.True(t, state.ring.active)
+	assert.Equal(t, "10.0.0.1:9443", state.ring.selfListenAddr)
+	require.Len(t, state.ring.peers, 2)
+	assert.Equal(t, "peer-a", state.ring.peers[0].GetTlsTcp().GetServerName())
+	assert.Equal(t, "10.0.0.2:9443", state.ring.peers[0].GetTlsTcp().GetAddr())
+	assert.Nil(t, state.ring.peers[0].GetTcp())
 }
 
 func TestRunRendersInitialAndReRenders(t *testing.T) {

@@ -171,6 +171,29 @@ func TestComputeRingSingleMember(t *testing.T) {
 	assert.Equal(t, "self", ring.peers[0].GetName())
 }
 
+func TestComputeTLSRingMembership(t *testing.T) {
+	nodes := []*corev1.Node{
+		node("self", "red", "10.0.0.1"),
+		node("peer-a", "red", "10.0.0.2"),
+		node("other", "blue", "10.0.0.3"),
+	}
+
+	ring := computeTLSRing(nodes, "self", testRingLabel, 9443)
+
+	require.True(t, ring.active)
+	assert.Equal(t, "self", ring.selfName)
+	assert.Equal(t, "10.0.0.1:9443", ring.selfListenAddr)
+	require.Len(t, ring.peers, 2)
+
+	for _, peer := range ring.peers {
+		assert.Equal(t, peer.GetName(), peer.GetTlsTcp().GetServerName())
+		assert.Nil(t, peer.GetTcp())
+	}
+
+	assert.Equal(t, "10.0.0.2:9443", ring.peers[0].GetTlsTcp().GetAddr())
+	assert.Equal(t, "10.0.0.1:9443", ring.peers[1].GetTlsTcp().GetAddr())
+}
+
 func TestComputeRDMARingMembership(t *testing.T) {
 	nodes := []*corev1.Node{
 		nodeWithAnnotations("self", "red", "10.0.0.1", map[string]string{

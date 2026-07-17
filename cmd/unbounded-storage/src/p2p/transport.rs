@@ -23,6 +23,7 @@
 //!   `ChainFingerRouter` resolves the same peer. The request travels with
 //!   the default `MAX_HOPS` TTL; recursion happens on the server.
 
+use std::any::Any;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,13 +36,15 @@ use crate::backend::Backend;
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, Transport};
 use crate::fabric::Result as FabResult;
 use crate::fabric::{Fabric, FabricTransport, MrHandle};
+use crate::p2p::tcp_rpc::{DEFAULT_TTL, TcpRpcStream, TcpRpcTransport};
 use crate::p2p::{ChainFingerRouter, RouteTableHandle, stripe_to_ring};
+use crate::storage::StripeReq;
 
 /// Transport that selects the first hop per request by finger-table
 /// ownership: the local origin `Backend` when this node owns the
 /// stripe, otherwise the fabric peer path.
 pub struct RoutedTransport<R, B: Backend<Req = R>> {
-    fabric_transport: FabricTransport<R, ChainFingerRouter>,
+    peer_transport: PeerTransport<R>,
     /// Shared, live-reloadable routing surface. The inner
     /// `FabricTransport`'s router shares this same handle, so a
     /// peer-set republish through any clone updates both the
@@ -62,11 +65,24 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
         let router = ChainFingerRouter::new(routes.clone());
         let fabric_transport = FabricTransport::new(fabric, mr, router, page_size)?;
         Ok(Self {
-            fabric_transport,
+            peer_transport: PeerTransport::Fabric(fabric_transport),
             routes,
             backend,
             _marker: PhantomData,
         })
+    }
+
+    pub fn with_tcp(
+        tcp_transport: TcpRpcTransport<R>,
+        routes: RouteTableHandle,
+        backend: B,
+    ) -> Self {
+        Self {
+            peer_transport: PeerTransport::Tcp(tcp_transport),
+            routes,
+            backend,
+            _marker: PhantomData,
+        }
     }
 
     /// Whether the local node owns `req`'s stripe (Chord `next_hop`
@@ -103,9 +119,31 @@ where
             RoutedStream::Backend(self.backend.bulk_get(req, src, dsts))
         } else {
             crate::metrics::bufferpool_miss_source(crate::metrics::MissSource::Peer);
-            RoutedStream::Fabric(self.fabric_transport.bulk_get(req, src, dsts))
+            match &self.peer_transport {
+                PeerTransport::Fabric(transport) => {
+                    RoutedStream::Fabric(transport.bulk_get(req, src, dsts))
+                }
+                PeerTransport::Tcp(transport) => RoutedStream::Tcp(transport.bulk_get_with_ttl(
+                    req,
+                    src,
+                    dsts,
+                    tcp_request_ttl(req),
+                )),
+            }
         }
     }
+}
+
+fn tcp_request_ttl<R: 'static>(req: &R) -> u8 {
+    (req as &dyn Any)
+        .downcast_ref::<StripeReq>()
+        .and_then(StripeReq::peer_ttl)
+        .unwrap_or(DEFAULT_TTL)
+}
+
+enum PeerTransport<R> {
+    Fabric(FabricTransport<R, ChainFingerRouter>),
+    Tcp(TcpRpcTransport<R>),
 }
 
 /// Stream returned by [`RoutedTransport::bulk_get`], wrapping either
@@ -118,6 +156,7 @@ where
     B: Backend + 'a,
 {
     Fabric(<FabricTransport<R, ChainFingerRouter> as Transport<R>>::Stream<'a>),
+    Tcp(TcpRpcStream),
     Backend(B::Stream<'a>),
 }
 
@@ -136,6 +175,7 @@ where
         unsafe {
             match self.get_unchecked_mut() {
                 RoutedStream::Fabric(s) => Pin::new_unchecked(s).poll_next(cx),
+                RoutedStream::Tcp(s) => Pin::new_unchecked(s).poll_next(cx),
                 RoutedStream::Backend(s) => Pin::new_unchecked(s).poll_next(cx),
             }
         }
@@ -156,7 +196,9 @@ mod tests {
     use crate::runtime::noop_waker;
     use serde::{Deserialize, Serialize};
 
-    use super::RoutedStream;
+    use crate::storage::StripeReq;
+
+    use super::{RoutedStream, tcp_request_ttl};
 
     #[derive(Serialize, Deserialize)]
     struct TestReq(StripeKey, bool);
@@ -343,6 +385,17 @@ mod tests {
             }
         }
         assert_eq!(out, dsts.to_vec());
+    }
+
+    #[test]
+    fn tcp_arm_uses_forwarded_ttl_or_default() {
+        let key = StripeKey([9; 32]);
+        assert_eq!(tcp_request_ttl(&StripeReq::new(key)), super::DEFAULT_TTL);
+        assert_eq!(
+            tcp_request_ttl(&StripeReq::new(key).with_peer_ttl(Some(7))),
+            7
+        );
+        assert_eq!(tcp_request_ttl(&TestReq(key, false)), super::DEFAULT_TTL);
     }
 
     /// `RingId` is re-exported for the doc-link above; reference it so

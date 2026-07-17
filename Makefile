@@ -861,14 +861,14 @@ bench: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the bench tool (excluded fro
 TLA_TOOLS_JAR ?= tmp/tla2tools.jar
 TLA_TOOLS_VERSION ?= v1.8.0
 TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
-TLA_TOOLS_SHA256 ?= 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
+TLA_TOOLS_SHA256 ?= 58d44845a37a8d776deaf8cf3a623213b59d311bc0ec287bcdfbe148dd11bb3d
 
 # Root directory holding the TLA+ models.  Each subdirectory contains exactly
 # one <Name>.tla plus a matching <Name>.cfg and is model-checked by a per-model
 # target.  STORAGE_MODEL_DIRS lists the model basenames the aggregate target
 # iterates over.
 STORAGE_MODELS_ROOT := cmd/unbounded-storage/models
-STORAGE_MODEL_DIRS := bufferpool-singleflight chord-routing copy-on-write engine-reclamation fabric-completion
+STORAGE_MODEL_DIRS := bufferpool-singleflight chord-routing copy-on-write engine-reclamation fabric-completion tcp-rpc-lifecycle
 
 $(TLA_TOOLS_JAR):
 	@mkdir -p $(dir $(TLA_TOOLS_JAR))

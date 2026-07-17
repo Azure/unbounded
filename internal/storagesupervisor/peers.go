@@ -165,18 +165,34 @@ func (w *peerWatcher) signal() {
 // unreachable, so emitting peers would be misleading. Node annotations are still
 // returned when the ring is inactive.
 func (w *peerWatcher) snapshot(port int, portOK bool) renderState {
+	return w.snapshotTCP(port, portOK, false)
+}
+
+// snapshotTLS computes render state for TLS TCP fabrics using the same node
+// addresses and ring membership as plain TCP, but emits TLS peer configs.
+func (w *peerWatcher) snapshotTLS(port int, portOK bool) renderState {
+	return w.snapshotTCP(port, portOK, true)
+}
+
+func (w *peerWatcher) snapshotTCP(port int, portOK, tls bool) renderState {
 	objs := w.informer.GetStore().List()
 	nodes := nodesFromInformerObjects(objs)
 
 	state := renderState{annotations: selfAnnotations(nodes, w.selfName)}
+
 	if !portOK || port == 0 {
-		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
+		fabricAddr := "startup.fabric.tcp.addr"
+		if tls {
+			fabricAddr = "startup.fabric.tls_tcp.addr"
+		}
+
+		slog.Warn("storage ring inactive: no fixed fabric port set in "+fabricAddr+"; "+
 			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)
 
 		return state
 	}
 
-	state.ring = computeRing(nodes, w.selfName, w.ringLabel, port)
+	state.ring = computeTCPRing(nodes, w.selfName, w.ringLabel, port, tls)
 
 	return state
 }
@@ -216,6 +232,16 @@ func nodesFromInformerObjects(objs []any) []*corev1.Node {
 // node's becomes a named peer, including this node. A peer with no usable
 // InternalIP is skipped and logged rather than corrupting the set.
 func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) ringState {
+	return computeTCPRing(nodes, selfName, ringLabel, port, false)
+}
+
+// computeTLSRing applies the plain TCP membership rules while emitting TLS TCP
+// peers whose certificate server name is the Kubernetes node name.
+func computeTLSRing(nodes []*corev1.Node, selfName, ringLabel string, port int) ringState {
+	return computeTCPRing(nodes, selfName, ringLabel, port, true)
+}
+
+func computeTCPRing(nodes []*corev1.Node, selfName, ringLabel string, port int, tls bool) ringState {
 	var self *corev1.Node
 
 	for _, n := range nodes {
@@ -271,12 +297,20 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 
 		seen[n.Name] = struct{}{}
 
-		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
-			Name: n.Name,
-			Config: &storageconfig.PeerSpec_Tcp{
-				Tcp: &storageconfig.TcpPeerConfig{Addr: net.JoinHostPort(ip, strconv.Itoa(port))},
-			},
-		})
+		peer := &storageconfig.PeerSpec{Name: n.Name}
+		addr := net.JoinHostPort(ip, strconv.Itoa(port))
+
+		if tls {
+			peer.Config = &storageconfig.PeerSpec_TlsTcp{
+				TlsTcp: &storageconfig.TlsTcpPeerConfig{Addr: addr, ServerName: n.Name},
+			}
+		} else {
+			peer.Config = &storageconfig.PeerSpec_Tcp{
+				Tcp: &storageconfig.TcpPeerConfig{Addr: addr},
+			}
+		}
+
+		ring.peers = append(ring.peers, peer)
 	}
 
 	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Name < ring.peers[j].Name })

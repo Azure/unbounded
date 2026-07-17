@@ -13,8 +13,8 @@ a tiered cache that sits in front of a slow origin. The design (see
 `designs/storage-high-level.md`) has three tiers:
 
 1. **P2P cache** - runs on every node. Content-addressed by checksum, strictly
-   immutable, and shares hot data between peers over RDMA. **This daemon is a
-   P2P cache node.**
+   immutable, and shares hot data between peers over verbs/RDMA or custom TLS
+   TCP RPC. **This daemon is a P2P cache node.**
 2. **Regional cache** - a pull-through tier with bounded mutability (etag
    validated) that absorbs misses from the P2P tier.
 3. **Origin** - the authoritative store (S3, Azure Blob, or POSIX).
@@ -28,7 +28,8 @@ workload -> local client -> P2P cache (local NVMe / peer pull / regional pull-th
 
 A single daemon instance owns one host's NVMe drives and RDMA HCAs, exposes an
 HTTP frontend to local clients, fetches misses from an origin over HTTP, and
-serves/relays stripes to and from peer nodes over a libfabric RDMA fabric.
+serves/relays stripes to and from peer nodes over either libfabric verbs/RDMA
+or the custom TLS TCP RPC transport.
 
 ## 2. Core Design Principles
 
@@ -73,12 +74,13 @@ Synthetic benchmark traffic is generated in-process by configuring a
 Prometheus metrics, alongside the storage, backend, bufferpool, and fabric
 metrics from the service path being exercised.
 
-### libfabric
+### Peer transports
 
-The fabric layer links libfabric and uses connection-managed MSG endpoints
-for both `verbs` and `tcp` providers. The pinned libfabric build provides the
-native `tcp` provider (requires libfabric 2.0+; the experimental `net`
-provider has been merged into `tcp`).
+The RDMA fabric layer links libfabric and uses connection-managed MSG
+endpoints with the `verbs` provider. The custom `tls_tcp` RPC transport replaces
+the former libfabric TCP fallback. Libfabric remains required and supported for
+verbs/RDMA; its TCP provider remains useful for FFI tests and lifecycle coverage
+but is not the production non-RDMA peer path.
 `make libfabric` installs the pinned `LIBFABRIC_VERSION` under
 `tmp/libfabric/<version>/`, and the Makefile exports
 `LIBFABRIC_PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`. The build compiles a small C
@@ -111,11 +113,13 @@ excluded from the live-reload diff.
   at least one page per serving shard, and distributes whole pages evenly
   with any remainder assigned in worker order. Each fabric unit also allocates
   a separate fixed eight-page RPC scratch backing outside this pool.
-- `[startup.fabric]` - one `binds` table (`tcp`, `rdma`, or `auto_rdma`),
+- `[startup.fabric]` - one `binds` table (`tls_tcp`, `rdma`, or `auto_rdma`),
   `progress_threads` (2), `progress_poll_us` (10), `rpc_worker_threads` (4),
   `max_inflight` (1024) - the fabric endpoint, thread pools, and in-flight
-  cap. `auto_rdma.hcas_per_numa_node` caps automatically selected HCAs per
-  NUMA node and defaults to 1 when `auto_rdma` is configured.
+  cap. `tls_tcp` also carries the certificate paths and lane, request-timeout,
+  socket-buffer, and io_uring-depth tuning. `auto_rdma.hcas_per_numa_node` caps
+  automatically selected HCAs per NUMA node and defaults to 1 when `auto_rdma`
+  is configured.
 - `[startup.topology]` - `serving_cores` (unset/null = auto-fill every usable
   CPU), `nic_workers` (fabric CPUs per active HCA, unset/null defaults to 4),
   and the toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
@@ -138,9 +142,8 @@ excluded from the live-reload diff.
    and a `ServingShard` on every remaining CPU (optionally capped by
    `serving_cores`).
 4. **One shard thread is spawned per `ServingShard`.** If the host yields no
-   serving shards, the daemon exits with failure. With no usable HCA the
-   NIC-worker class is simply empty and the shards serve over the
-   loopback/TCP path.
+   serving shards, the daemon exits with failure. `tls_tcp` is shard-local and
+   does not reserve HCA workers; verbs/RDMA uses the planned NIC-worker groups.
 5. A `PinnedRuntime` is built over the planned CPUs so `WorkerIdx(i)` pins the
    i-th worker thread to its assigned core and NUMA node.
 6. A `DiskChannelDirectory` (Arc) is created before shards as the hot-swap
@@ -198,27 +201,30 @@ Teardown order is deliberate: join shard threads in reverse (releasing
 `run_shard` runs on an already-pinned thread and constructs the entire
 per-shard `!Send` object graph:
 
-1. **Fabric.** Pick a provider (`Provider::from_device_name` for the HCA, or
-   `Provider::Tcp` fallback on `lo`); build a `FabricConfig` via
-   `fabric::defaults_for(device_name, runtime, widx)`; `Fabric::new` and resolve
-   `self_address()`.
+1. **Peer transport.** For RDMA, select the libfabric verbs provider for the
+   HCA, build a `FabricConfig`, create `Fabric`, and resolve `self_address()`.
+   For `tls_tcp`, build a shard-local `NetworkRing`, OpenSSL peer TLS context,
+   persistent outbound lane directory, and reuse-port RPC listener. A dormant
+   libfabric TCP unit currently remains for shared MR lifecycle integration;
+   it is not the TCP RPC data path.
 2. **Memory.** Allocate the shard's assigned whole-page share of the node-wide
-   data pool as a NUMA-local `Backing` via `memory::allocate` **on the pinned
-   thread** (mempolicy keeps pages local; the hugepage variant `mbind`s).
+   data pool as a NUMA-local `Backing` via `memory::allocate` **on the
+   pinned thread** (mempolicy keeps pages local; the hugepage variant `mbind`s).
    Register it with the fabric as a memory region (MR), and register it with the
    socket ring as a fixed buffer for zero-copy send/recv.
 3. **Origin backend.** Resolve the origin URL and build an `HttpBackend`
    over the shard socket, carving origin-fetch pages from the backing.
 4. **Transport + blockstore + pool.** Build a `RoutedTransport` (Chord routing +
-   fabric transport + origin backend), a `LiveShardLocalStore` over the disk
+   the selected peer transport + origin backend), a `LiveShardLocalStore` over the disk
    channel directory as the `BlockStore`, then `Pool::new`.
-5. **RPC server.** `FabricGroup`, constructed before the shards, allocates a
-   **separate** scratch backing for each fabric unit (`RPC_SCRATCH_PAGES = 8`,
-   one scratch page per in-flight serve/forward) and registers it as its own
-   fabric MR. After phase B and initial disk publication, activation builds the
-   unit's `RecursiveHandler` and starts the RPC server. Scratch uses a distinct
-   `LiveShardLocalStore` because a `PageRef` resolves through exactly one
-   backing's geometry.
+5. **RPC serving.** For RDMA, `FabricGroup`, constructed before the shards,
+   allocates a separate scratch backing for each fabric unit
+   (`RPC_SCRATCH_PAGES = 8`, one scratch page per in-flight serve/forward) and
+   registers it as its own fabric MR. After phase B and initial disk
+   publication, activation builds the unit's `RecursiveHandler` and starts its
+   RPC server. For `tls_tcp`, each shard serves through its shard-local
+   `FetchService` and fanout table; the dormant libfabric unit's RPC server is
+   not started and its scratch backing is not the TCP RPC data path.
 6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
    frontends keyed by component name. Each spec binds its listener with `SO_REUSEPORT` and
    builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends
@@ -268,9 +274,9 @@ are kept under ~1500 lines and split on concept boundaries.
                           |                    v
                           v             +-------------+
                     +-----------+       |    ring     |
-                    |  fabric   |       | (io_uring)  |
-                    | (libfabric|       +-------------+
-                    |   RDMA)   |
+                    | peer RPC  |       | (io_uring)  |
+                    | (verbs or |       +-------------+
+                    |  tls_tcp) |
                     +-----------+
 ```
 
@@ -312,8 +318,8 @@ it a simple loop to drive work without an async runtime.
   (false), `respect_isolated` (true), `exclude_node_cpu0` (true),
   `require_node_type_ca` (true, currently a no-op), `require_active_port`
   (true), and `disable_rdma` (drop every HCA so no NIC-worker group is placed
-  and serving shards serve over loopback/TCP - the escape hatch for unusable
-  verbs).
+  and serving shards use the configured custom TLS TCP path - the escape hatch
+  for unusable verbs).
 - Key fields consumed by main: `plan.serving_shards` (one shard thread each),
   `plan.nic_workers` (the fabric worker groups), and `plan.storage_cores`,
   which main maps to one `DiskCpuSlot` per NVMe drive.
@@ -399,19 +405,26 @@ between them, and the origin `Backend` is the final fallback.
   - `None` -> own stripe: read the local `BlockStore`, and on a miss fetch from
     the origin `Backend`.
   - `Some` with hops remaining -> forward to the next hop with a decremented
-    TTL; the downstream node RDMA-writes the page into **this** node's scratch,
-    the handler yields it, and the RPC server relays it upstream.
+    TTL; the downstream node transfers the page into **this** node's scratch by
+    verbs/RDMA or direct fixed TCP receive, and the RPC server relays it upstream.
   - `Some` with no hops remaining -> `HopLimitExceeded`.
-  It owns a dedicated scratch `Backing` (its own fabric MR and an extra
-  `BlockStore` buffer); the shared scratch allocator hands out one zeroed
+  It owns a dedicated scratch `Backing` (registered with the active peer
+  transport and exposed as an extra `BlockStore` buffer); the shared scratch
+  allocator hands out one zeroed
   scratch page per in-flight request, reclaimed when the response stream drops.
 - Ring math lives in `ring.rs`: `node_to_ring`, `stripe_to_ring`, `splitmix64`.
 
-### 7.7 `fabric/` - the libfabric RDMA transport
+### 7.7 Peer RPC transports
 
-This is how nodes move pages between each other. It binds directly to libfabric
-and exposes a small RPC server: a peer asks for a stripe, and this node
-RDMA-writes the requested pages straight into the asker's memory.
+Nodes move pages with either libfabric verbs/RDMA or the custom TLS TCP RPC
+transport. Both expose the same bufferpool `Transport` behavior and recursive
+request semantics, but their wire and completion mechanisms are independent.
+
+#### Libfabric verbs/RDMA
+
+The `fabric/` module binds directly to libfabric and exposes a small RPC server:
+a peer asks for a stripe, and this node RDMA-writes requested pages straight
+into the asker's memory. This path remains the supported verbs/RDMA transport.
 
 A thin, direct binding over libfabric (no high-level wrapper crate). It is built
 in phases: types/error/FFI, class lifecycle with one pinned progress thread per
@@ -420,8 +433,9 @@ streaming RPC server plus client `Transport`.
 
 - `Fabric` owns the libfabric objects and progress threads. `MrHandle` is a
   `Copy` value handle; the underlying `fid_mr` is owned by `Fabric`.
-- `Provider` selects the libfabric provider (`from_device_name` or `Tcp`);
-  `defaults_for` builds a `FabricConfig`.
+- `Provider` selects the libfabric provider. Production RDMA resolves an HCA to
+  verbs; `Provider::Tcp` remains for FFI and lifecycle tests. `defaults_for`
+  builds a `FabricConfig`.
 - The completion machinery (`CompletionFuture`, `CompletionInfo`,
   `CompletionRegistry`, `CompletionSlot`) bridges libfabric CQ entries to
   futures.
@@ -435,8 +449,9 @@ streaming RPC server plus client `Transport`.
   submits libfabric writes/sends, and parks on completion futures with a real
   thread waker. Wire framing uses an 8-byte `MsgHeader` prefix with a message
   kind and request id. The client sends a bincode `RequestHeader` plus request
-  body. Verbs uses write-with-immediate to deliver typed page ordinals; the TCP
-  fallback follows each `fi_write` with a framed bincode `PageAck`. A short
+  body. Verbs uses write-with-immediate to deliver typed page ordinals; the
+  retained libfabric TCP test path follows each `fi_write` with a framed bincode
+  `PageAck`. A short
   success sends `RESPONSE_END`; any error sends `ERROR_ACK`.
   `RpcServerHandle::drop` uninstalls the request sink, closes
   the queue, signals shutdown, and joins the workers.
@@ -445,6 +460,51 @@ streaming RPC server plus client `Transport`.
 - The client side (`transport`) provides `FabricTransport`, the `PeerRouter`
   trait, `StaticPeer`, and capacity helpers
   (`ensure_launch_fits_registry`, `required_completion_slots`).
+
+#### Custom TLS TCP RPC
+
+The `p2p/tcp_rpc/` transport is the non-RDMA peer path. It replaces the
+libfabric TCP fallback and is built on each serving shard's own io_uring. TLS
+is mandatory: OpenSSL performs a TLS 1.3-only mutual-authentication handshake,
+the configured peer name must match a DNS SAN in the authenticated certificate,
+and setup fails unless kTLS is active for both TX and RX.
+
+- **Framing and version.** Protocol version 1 starts every frame with a 24-byte
+  network-byte-order header: magic `UBRP`, version, frame kind, flags, metadata
+  length, payload length, and 64-bit request id. Frame kinds are `HANDSHAKE`,
+  `REQUEST`, `PAGE`, `END`, `ERROR`, and `CANCEL`. Handshake metadata binds peer
+  identity, lane index/count, and maximum page size. Request metadata carries
+  stripe, source range, TTL, and destination-page count. Page metadata carries
+  ordinal and logical offset.
+- **Lanes and rotation.** Every shard keeps a bounded, round-robin pool of
+  persistent TCP connections per peer. A lane admits exactly one active request,
+  so responses are ordered and need no stream multiplexing. Waiters are bounded
+  by `max_inflight`. The server retires a persistent connection after 2,048
+  requests. The client discards the lane when it observes that close; a
+  subsequent request reconnects, repeats TLS and the application handshake,
+  and continues on the same logical lane.
+- **Data movement.** Control frames use heap buffers. Page bodies use direct
+  fixed receives into the destination backing through io_uring.
+  The sender first tries io_uring `SEND_ZC`. Linux kTLS rejects its mandatory
+  `MSG_ZEROCOPY` flag, so `EOPNOTSUPP` switches that connection to registered
+  `WRITE_FIXED`; kTLS can then retain plaintext page references internally.
+  Every source page pin remains live through the applicable notification or
+  write CQE, including across short sends.
+- **Cancellation, disconnect, and deadlines.** Dropping a queued request removes
+  its lane waiter. Dropping a sent stream schedules a best-effort `CANCEL` and
+  closes that lane; disconnect or protocol failure fails the active request,
+  discards the connection, and causes a later use to reconnect. Closing the
+  server side drops its fetch stream and releases held page pins. The configured
+  `request_timeout_ms` defaults to 30,000 ms and is enforced by the client.
+- **Recursive forwarding.** The initial request starts with TTL 64. A node that
+  must forward decrements TTL before issuing the downstream request. A local
+  owner may serve TTL 0; a node that would forward TTL 0 returns hop-limit error
+  508. Forwarded pages land in the intermediate node's scratch/fanout backing and
+  are relayed upstream under the same fixed-receive and registered-send lifetime
+  rules.
+
+See [`PERF.md`](PERF.md) for the physical two-host acceptance run. Loopback smoke
+tests validate integration only and cannot establish transport throughput.
 
 ### 7.8 `backend/` and `frontend/` - the HTTP edges
 
@@ -580,14 +640,15 @@ fields with documented defaults use proto3 `optional` presence. `Config::apply_d
 promotes absent/null values to documented defaults while preserving an
 explicit numeric zero. The TOML loader is strict (`deny_unknown_fields`), so a
 typo'd key fails loudly at parse time.
-Protobuf is used here purely as the schema IDL (the prost-generated
-structs replace hand-written ones); the on-disk config format and the only
-load path are TOML, and the config file is the sole configuration interface
-for the foreseeable future. The top-level `version` field is an opaque,
+Protobuf is used as the schema IDL (the prost-generated structs replace
+hand-written ones). The daemon loads strict TOML by default and raw protobuf
+wire data for paths ending in `.binpb`. The config file is the sole
+configuration interface for the foreseeable future. The top-level `version`
+field is an opaque,
 operator-assigned config version: the controller seeds it at startup and
 tracks the latest-known, latest-applied, and startup config versions
-(`ConfigVersionStatus`), plumbed through ready to be published as gauge
-metrics (not yet exposed). The startup config version is pinned to the
+(`ConfigVersionStatus`) and publishes them as gauge metrics. The startup config
+version is pinned to the
 config realized at process start and never advances; it lags the applied
 version whenever a later config changes a `[startup]`-only knob that a
 restart has not yet picked up. On a successful reparse the dynamically
@@ -639,7 +700,9 @@ Sections (all optional, each falling back to defaults):
   excluded from the live-reload diff: `[startup.memory]`
   (`no_hugepages`, `memory_total_bytes`), `[startup.fabric]` (`binds`,
   `progress_threads`, `progress_poll_us`, `rpc_worker_threads`,
-  `max_inflight`), and `[startup.topology]` (`serving_cores`, `nic_workers`,
+  `max_inflight`; a `tls_tcp` bind also has certificate paths, `lanes`,
+  `request_timeout_ms`, `socket_buffer_bytes`, and `ring_depth`), and
+  `[startup.topology]` (`serving_cores`, `nic_workers`,
   `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
   `allow_inactive_port`, `disable_rdma`).
   `startup_to_core_plan_config` inverts the negative plan fields so the
@@ -647,8 +710,10 @@ Sections (all optional, each falling back to defaults):
   defaults.
 - `[[peers]]` - `name` (stable peer identity used to derive the internal fabric
   peer id and ring position), `tags` for placement-aware routing, and one
-  transport table (`tcp` with a `SocketAddr`, or `rdma` with a provider-native
-  address encoded as `hex:<fi_getname-bytes>`). The roster includes the local
+  transport table (`tls_tcp` with a numeric `SocketAddr` and DNS `server_name`,
+  or `rdma` with a provider-native address encoded as
+  `hex:<fi_getname-bytes>`). For `tls_tcp`, use the peer name as `server_name`
+  and issue the certificate with that exact DNS SAN. The roster includes the local
   peer named by `self`; fabric reconciliation excludes that local entry from
   outbound dials.
 - `[[caches]]` - `name` and `source` (a backend component name used for miss
@@ -677,7 +742,8 @@ republishes the channel snapshot each update, logs
 
 ### 7.12 `tls/` - the shared TLS transport
 
-A transport-level TLS utility shared by the origin backends, sibling in spirit
+A transport-level TLS utility shared by origin backends and peer TCP RPC,
+sibling in spirit
 to `http/` (the wire codec): it owns how the daemon speaks TLS, but no storage
 policy. It drives OpenSSL with kernel TLS (kTLS) so a negotiated `https://`
 body lands decrypted directly in the registered backing (zero copy). The module
@@ -703,6 +769,7 @@ material are parsed from memory and are never written to temporary files.
 | Shard loop | Cooperative tick hooks, noop waker | Busy-poll active, sleep 100us idle |
 | Fabric progress | Fixed pool per fabric unit | Pinned across reserved workers, CQs distributed by NUMA |
 | Fabric RPC serve | Fixed worker pool per fabric unit | Bounded job queue, real-waker completion waits |
+| TLS TCP RPC | Shard-local cooperative driver | One io_uring and persistent lane pool per serving shard |
 | Storage engine | One pinned storage core per disk | Reached only via `PageChannel` mpsc |
 | Config watcher | `notify` thread + main loop | Reconciles peers/disks live |
 
@@ -746,11 +813,12 @@ Four complementary layers:
    committed. `tests/dst.rs` declares the area modules. Current DST areas:
    `bufferpool`, `fabric`, `p2p`, `page_channel`, and `storage` (the last with
    `oracle.rs` and `recovery.rs`).
-4. **End-to-end smoke test** - `hack/smoke-storage.py` runs two real binaries on
-    loopback over real libfabric tcp, with file-backed disks, stub HTTP origins,
-    and an ephemeral Garage S3-compatible server. It exercises cross-node
-    fabric RPC fetches, authenticated S3 `HEAD` and ranged `GET` compatibility,
-    and HTTPS kTLS. It needs Docker and `sudo` (to pin io_uring buffers and raise
-    `RLIMIT_MEMLOCK`) and runs in CI (`.github/workflows/smoke-storage.yaml`). Run
-    it after any change to the fabric layer, S3 signing, `shim.c`, the FFI, the
-    `main.rs` wiring, or the libfabric version.
+4. **End-to-end smoke test** - `hack/smoke-storage.py` runs real binaries on
+   loopback with file-backed disks, synthetic or stub HTTP origins, and an
+   ephemeral Garage S3-compatible server. It covers the retained libfabric TCP
+   test path, authenticated S3 `HEAD` and ranged `GET` compatibility, and HTTPS
+   kTLS. It needs Docker and `sudo` (to pin io_uring buffers and raise
+   `RLIMIT_MEMLOCK`) and runs in CI (`.github/workflows/smoke-storage.yaml`).
+   Run it after changes to the fabric layer, S3 signing, `shim.c`, the FFI,
+   `main.rs` wiring, or the libfabric version. It is an integration test, not
+   the physical two-host custom TLS TCP performance acceptance in `PERF.md`.

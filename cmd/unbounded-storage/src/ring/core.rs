@@ -434,11 +434,15 @@ impl RingCore {
         Ok(())
     }
 
-    /// Base pointer of registered region `idx`, if present. Used by
-    /// `NetworkRing::recv_fixed`, whose opcode needs an absolute pointer
-    /// rather than a fixed buf_index.
-    pub(crate) fn registered_base(&self, idx: u16) -> Option<NonNull<u8>> {
-        self.registered.borrow().get(idx as usize).map(|r| r.base)
+    /// Resolve a fixed-buffer operation range after validating its index,
+    /// operation length, offset arithmetic, and region bounds.
+    pub(crate) fn registered_range(
+        &self,
+        idx: u16,
+        offset: usize,
+        len: usize,
+    ) -> io::Result<(*const u8, u32)> {
+        checked_registered_range(&self.registered.borrow(), idx, offset, len)
     }
 
     /// Locate the registered region that fully contains `[ptr, ptr+len)`
@@ -518,12 +522,6 @@ impl RingCore {
                 w.wake();
             }
             return Err(io::Error::from_raw_os_error(libc::ENOMEM));
-        }
-        // Kick the kernel so the op starts even if progress() is not
-        // called for a while.
-        {
-            let ring = self.ring.borrow();
-            let _ = ring.submitter().submit();
         }
         Ok(slot)
     }
@@ -800,6 +798,29 @@ impl RingCore {
     }
 }
 
+fn checked_registered_range(
+    registered: &[RegisteredBuf],
+    idx: u16,
+    offset: usize,
+    len: usize,
+) -> io::Result<(*const u8, u32)> {
+    let reg = registered
+        .get(idx as usize)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    if offset > reg.len || end > reg.len {
+        return Err(io::Error::from_raw_os_error(libc::EFAULT));
+    }
+    let op_len = u32::try_from(len).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+
+    // SAFETY: registration requires the caller to provide a live region
+    // of `reg.len` bytes, and the checks above constrain `offset` to it.
+    let ptr = unsafe { reg.base.as_ptr().add(offset) as *const u8 };
+    Ok((ptr, op_len))
+}
+
 impl Drop for RingCore {
     fn drop(&mut self) {
         // Best-effort: release the kernel-pinned buffer/file tables
@@ -973,6 +994,40 @@ mod tests {
         assert_eq!(check_res(5).unwrap(), 5);
         let e = check_res(-libc::EIO).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn registered_range_checks_index_overflow_and_bounds() {
+        let mut buf = [0u8; 16];
+        let registered = [RegisteredBuf {
+            base: NonNull::new(buf.as_mut_ptr()).unwrap(),
+            len: buf.len(),
+        }];
+
+        let (ptr, len) = checked_registered_range(&registered, 0, 12, 4).unwrap();
+        assert_eq!(ptr, unsafe { buf.as_ptr().add(12) });
+        assert_eq!(len, 4);
+
+        let invalid = checked_registered_range(&registered, 1, 0, 1).unwrap_err();
+        assert_eq!(invalid.raw_os_error(), Some(libc::EINVAL));
+
+        let overflow = checked_registered_range(&registered, 0, usize::MAX, 2).unwrap_err();
+        assert_eq!(overflow.raw_os_error(), Some(libc::EOVERFLOW));
+
+        let out_of_bounds = checked_registered_range(&registered, 0, 13, 4).unwrap_err();
+        assert_eq!(out_of_bounds.raw_os_error(), Some(libc::EFAULT));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn registered_range_rejects_lengths_larger_than_u32() {
+        let mut byte = 0u8;
+        let registered = [RegisteredBuf {
+            base: NonNull::from(&mut byte),
+            len: usize::MAX,
+        }];
+        let err = checked_registered_range(&registered, 0, 0, u32::MAX as usize + 1).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EOVERFLOW));
     }
 
     /// Registering two distinct regions hands back sequential buffer

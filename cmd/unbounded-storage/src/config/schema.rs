@@ -25,6 +25,10 @@ const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HTTP_CONCURRENCY: u32 = 64;
 pub const DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION: u32 = 1024;
 const DEFAULT_FAKE_OBJECT_SIZE_BYTES: u64 = 1024 * 1024;
+const DEFAULT_TLS_TCP_LANES: u32 = 4;
+const DEFAULT_TLS_TCP_REQUEST_TIMEOUT_MS: u32 = 30_000;
+const DEFAULT_TLS_TCP_SOCKET_BUFFER_BYTES: u32 = 16 * 1024 * 1024;
+const DEFAULT_TLS_TCP_RING_DEPTH: u32 = 4096;
 
 impl Config {
     /// Populates every omitted section and optional defaulted field with
@@ -42,6 +46,10 @@ impl Config {
             frontend.apply_defaults();
         }
 
+        for peer in &mut self.peers {
+            peer.apply_defaults();
+        }
+
         let startup = self.startup.get_or_insert_with(StartupCfg::default);
 
         let memory = startup.memory.get_or_insert_with(MemoryCfg::default);
@@ -54,6 +62,16 @@ impl Config {
             }
             Some(fabric_cfg::Binds::AutoRdma(auto)) => {
                 auto.hcas_per_numa_node.get_or_insert(1);
+            }
+            Some(fabric_cfg::Binds::TlsTcp(tls_tcp)) => {
+                tls_tcp.lanes.get_or_insert(DEFAULT_TLS_TCP_LANES);
+                tls_tcp
+                    .request_timeout_ms
+                    .get_or_insert(DEFAULT_TLS_TCP_REQUEST_TIMEOUT_MS);
+                tls_tcp
+                    .socket_buffer_bytes
+                    .get_or_insert(DEFAULT_TLS_TCP_SOCKET_BUFFER_BYTES);
+                tls_tcp.ring_depth.get_or_insert(DEFAULT_TLS_TCP_RING_DEPTH);
             }
             Some(fabric_cfg::Binds::Tcp(_)) | Some(fabric_cfg::Binds::Rdma(_)) => {}
             None => {
@@ -148,10 +166,19 @@ impl BackendSpec {
 }
 
 impl PeerSpec {
+    fn apply_defaults(&mut self) {
+        if let Some(peer_spec::Config::TlsTcp(cfg)) = self.config.as_mut()
+            && cfg.server_name.is_empty()
+        {
+            cfg.server_name.clone_from(&self.name);
+        }
+    }
+
     pub fn transport_name(&self) -> &'static str {
         match self.config {
             Some(peer_spec::Config::Tcp(_)) => "tcp",
             Some(peer_spec::Config::Rdma(_)) => "rdma",
+            Some(peer_spec::Config::TlsTcp(_)) => "tls_tcp",
             None => "missing",
         }
     }
@@ -160,6 +187,7 @@ impl PeerSpec {
         match self.config.as_ref() {
             Some(peer_spec::Config::Tcp(cfg)) => Some(cfg.addr.as_str()),
             Some(peer_spec::Config::Rdma(cfg)) => Some(cfg.addr.as_str()),
+            Some(peer_spec::Config::TlsTcp(cfg)) => Some(cfg.addr.as_str()),
             None => None,
         }
     }
@@ -171,6 +199,7 @@ impl FabricCfg {
             Some(fabric_cfg::Binds::Tcp(cfg)) => Some(cfg.addr.as_str()),
             Some(fabric_cfg::Binds::Rdma(cfg)) => cfg.binds.first().map(|bind| bind.addr.as_str()),
             Some(fabric_cfg::Binds::AutoRdma(_)) => Some("0.0.0.0:0"),
+            Some(fabric_cfg::Binds::TlsTcp(cfg)) => Some(cfg.addr.as_str()),
             None => None,
         }
     }
@@ -178,7 +207,10 @@ impl FabricCfg {
     pub fn auto_hcas_per_numa_node(&self) -> Option<u64> {
         match self.binds.as_ref() {
             Some(fabric_cfg::Binds::AutoRdma(cfg)) => cfg.hcas_per_numa_node,
-            Some(fabric_cfg::Binds::Tcp(_)) | Some(fabric_cfg::Binds::Rdma(_)) | None => None,
+            Some(fabric_cfg::Binds::Tcp(_))
+            | Some(fabric_cfg::Binds::Rdma(_))
+            | Some(fabric_cfg::Binds::TlsTcp(_))
+            | None => None,
         }
     }
 
@@ -188,7 +220,9 @@ impl FabricCfg {
             .into_iter()
             .filter_map(|binds| match binds {
                 fabric_cfg::Binds::Rdma(cfg) => Some(cfg.binds.as_slice()),
-                fabric_cfg::Binds::Tcp(_) | fabric_cfg::Binds::AutoRdma(_) => None,
+                fabric_cfg::Binds::Tcp(_)
+                | fabric_cfg::Binds::AutoRdma(_)
+                | fabric_cfg::Binds::TlsTcp(_) => None,
             })
             .flatten()
             .map(|bind| bind.addr.as_str())
@@ -546,6 +580,49 @@ addr = "127.0.0.1:9000"
                 "row3".to_string(),
                 "rack7".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn tls_tcp_defaults_and_round_trips() {
+        let s = r#"
+self = "node-a"
+
+[[peers]]
+name = "node-a"
+
+[peers.config.tls_tcp]
+addr = "127.0.0.1:9443"
+
+[startup.fabric.binds.tls_tcp]
+addr = "0.0.0.0:9443"
+ca_cert_path = "/etc/unbounded-storage/ca.pem"
+cert_path = "/etc/unbounded-storage/node.pem"
+key_path = "/etc/unbounded-storage/node-key.pem"
+"#;
+        let mut c: Config = toml::from_str(s).unwrap();
+        c.apply_defaults();
+
+        let peer = match c.peers[0].config.as_ref().expect("peer config set") {
+            peer_spec::Config::TlsTcp(peer) => peer,
+            other => panic!("expected tls_tcp peer config, got {other:?}"),
+        };
+        assert_eq!(peer.addr, "127.0.0.1:9443");
+        assert_eq!(peer.server_name, "node-a");
+        assert_eq!(c.peers[0].transport_name(), "tls_tcp");
+        assert_eq!(c.peers[0].wire_addr(), Some("127.0.0.1:9443"));
+
+        let binds = match c.startup().fabric().binds.as_ref() {
+            Some(fabric_cfg::Binds::TlsTcp(binds)) => binds,
+            other => panic!("expected tls_tcp fabric binds, got {other:?}"),
+        };
+        assert_eq!(binds.lanes, Some(4));
+        assert_eq!(binds.request_timeout_ms, Some(30_000));
+        assert_eq!(binds.socket_buffer_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(binds.ring_depth, Some(4096));
+        assert_eq!(
+            c.startup().fabric().default_listen_addr(),
+            Some("0.0.0.0:9443")
         );
     }
 

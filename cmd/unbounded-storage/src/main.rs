@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -27,6 +28,11 @@ use unbounded_storage::fanout::{
 use unbounded_storage::frontend::{
     HttpDriver, HttpFrontend, LoadgenDriver, LoadgenFrontend, S3Driver, S3Frontend,
 };
+use unbounded_storage::p2p::tcp_rpc::{
+    ClientPeerDirectory, ClientPeerDirectoryConfig, MAX_DESTINATION_PAGE_COUNT,
+    MAX_REQUESTS_PER_CONNECTION, PeerDirectory, TcpRpcClientPeer, TcpRpcConfig, TcpRpcDriver,
+    TcpRpcService, TcpRpcTransport,
+};
 use unbounded_storage::p2p::{RouteTableHandle, RoutedTransport};
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
@@ -34,6 +40,7 @@ use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
     CacheDirectorySet, ChainLocalStore, DiskRegistry, DiskReport, UringDiskTarget,
 };
+use unbounded_storage::tls::{PeerTlsConfig, PeerTlsContext};
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
 use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
@@ -89,6 +96,7 @@ pub struct FabricStartup {
     pub progress_poll_us: u32,
     pub rpc_worker_threads: u32,
     pub max_inflight: u32,
+    pub tls_tcp: Option<TlsTcpStartup>,
 }
 
 impl FabricStartup {
@@ -97,6 +105,19 @@ impl FabricStartup {
             .get(unit_idx)
             .map_or(self.listen_addr.as_str(), String::as_str)
     }
+}
+
+/// Startup-fixed settings for the shard-local authenticated TCP RPC path.
+#[derive(Clone, Debug)]
+pub struct TlsTcpStartup {
+    pub bind_addr: String,
+    pub ca_cert_path: String,
+    pub cert_path: String,
+    pub key_path: String,
+    pub lanes: u32,
+    pub request_timeout_ms: u32,
+    pub socket_buffer_bytes: u32,
+    pub ring_depth: u32,
 }
 
 /// Build the [`CorePlanConfig`] from the config file's
@@ -261,7 +282,24 @@ fn main() -> ExitCode {
     // `disable_rdma` escape hatch) so the daemon comes up over the tcp
     // provider instead of failing every shard at bring-up.
     let mut core_plan_config = startup_to_core_plan_config(startup.topology(), fabric_cfg);
-    if should_force_tcp_fallback(
+    let tls_tcp = match fabric_cfg.binds.as_ref() {
+        Some(config::fabric_cfg::Binds::TlsTcp(cfg)) => Some(TlsTcpStartup {
+            bind_addr: cfg.addr.clone(),
+            ca_cert_path: cfg.ca_cert_path.clone(),
+            cert_path: cfg.cert_path.clone(),
+            key_path: cfg.key_path.clone(),
+            lanes: cfg.lanes.unwrap_or(4),
+            request_timeout_ms: cfg.request_timeout_ms.unwrap_or(30_000),
+            socket_buffer_bytes: cfg.socket_buffer_bytes.unwrap_or(16 * 1024 * 1024),
+            ring_depth: cfg.ring_depth.unwrap_or(4096),
+        }),
+        _ => None,
+    };
+    if tls_tcp.is_some() {
+        // The custom transport is shard-local and does not use an HCA.
+        // Keep one dormant libfabric TCP unit for the current MR lifecycle.
+        core_plan_config.disable_rdma = true;
+    } else if should_force_tcp_fallback(
         core_plan_config.disable_rdma,
         host.hcas.len(),
         fabric::provider_available(Provider::Verbs),
@@ -276,10 +314,14 @@ fn main() -> ExitCode {
 
     let settings = Arc::new(StartupSettings {
         fabric: FabricStartup {
-            listen_addr: fabric_cfg
-                .default_listen_addr()
-                .expect("fabric listen address defaulted")
-                .to_string(),
+            listen_addr: if tls_tcp.is_some() {
+                "0.0.0.0:0".to_string()
+            } else {
+                fabric_cfg
+                    .default_listen_addr()
+                    .expect("fabric listen address defaulted")
+                    .to_string()
+            },
             rdma_listen_addrs: fabric_cfg.rdma_listen_addrs().map(str::to_string).collect(),
             progress_threads: fabric_cfg
                 .progress_threads
@@ -291,6 +333,7 @@ fn main() -> ExitCode {
                 .rpc_worker_threads
                 .expect("rpc_worker_threads defaulted"),
             max_inflight: fabric_cfg.max_inflight.expect("max_inflight defaulted"),
+            tls_tcp,
         },
         memory_total_bytes,
         backing_kind,
@@ -567,6 +610,7 @@ fn run_shard(
     cache_directories: Arc<CacheDirectorySet>,
     routes: RouteTableHandle,
     loaded: Arc<LoadedConfig>,
+    fabric_startup: FabricStartup,
     ctrl_rx: mpsc::Receiver<config::ShardCommand>,
     peer_rx: mpsc::Receiver<Arc<Vec<PeerPublish>>>,
     phaseb_tx: mpsc::Sender<PhaseBReport>,
@@ -577,6 +621,8 @@ fn run_shard(
     let frontend_specs = &loaded.config().frontends;
     let frontend_bindings = &loaded.runtime().frontends;
     let backend_specs = &loaded.config().backends;
+    let runtime_peers = &loaded.runtime().mesh.peers;
+    let local_peer_name = loaded.runtime().mesh.self_name.clone().unwrap_or_default();
     let phase_a = PhaseAReporter::new(widx, tx);
     // The fabric endpoint is built and owned by the `FabricGroup` in the
     // shard layer and shared by every shard mapped onto it (one per shard
@@ -614,7 +660,11 @@ fn run_shard(
     // fixed buffer so SEND_ZC / RECV can target bufferpool pages. Must
     // register while `backing` is still owned, before `Pool::new` moves
     // it.
-    let socket = match NetworkRing::new(256) {
+    let ring_depth = fabric_startup
+        .tls_tcp
+        .as_ref()
+        .map_or(256, |settings| settings.ring_depth);
+    let socket = match NetworkRing::new(ring_depth) {
         Ok(s) => Rc::new(s),
         Err(e) => {
             phase_a.report_failed(format!("worker={}: NetworkRing::new: {e}", widx.0,));
@@ -637,6 +687,83 @@ fn run_shard(
     // on their own socket rings so they can `SEND_ZC` from this shard's
     // pinned pages.
     let backing_len = backing.page_size * backing.page_count;
+
+    // Build the custom transport's mTLS and outbound lane directory before
+    // the pool captures its transport.
+    let tcp_runtime = match fabric_startup.tls_tcp.as_ref() {
+        Some(settings) => {
+            let tls = match PeerTlsContext::new(&PeerTlsConfig {
+                cert_path: settings.cert_path.clone(),
+                key_path: settings.key_path.clone(),
+                ca_cert_path: settings.ca_cert_path.clone(),
+            }) {
+                Ok(tls) => Rc::new(tls),
+                Err(e) => {
+                    phase_a.report_failed(format!("worker={}: peer TLS context: {e}", widx.0,));
+                    return;
+                }
+            };
+            let lane_count = match u16::try_from(settings.lanes) {
+                Ok(lanes) if lanes > 0 => lanes,
+                _ => {
+                    phase_a.report_failed(format!(
+                        "worker={}: tls_tcp lanes must fit in u16 and be nonzero",
+                        widx.0,
+                    ));
+                    return;
+                }
+            };
+            let max_page = match u32::try_from(page_size) {
+                Ok(max_page) => max_page,
+                Err(_) => {
+                    phase_a.report_failed(format!(
+                        "worker={}: page size exceeds tls_tcp wire geometry",
+                        widx.0,
+                    ));
+                    return;
+                }
+            };
+            let directory = match ClientPeerDirectory::new(
+                NetHandle::new(socket.clone()),
+                tls.clone(),
+                ClientPeerDirectoryConfig {
+                    local_peer_name: local_peer_name.clone(),
+                    lane_count,
+                    max_waiters_per_peer: fabric_startup.max_inflight as usize,
+                    max_page,
+                    socket_buffer_bytes: settings.socket_buffer_bytes,
+                    request_timeout: Duration::from_millis(settings.request_timeout_ms as u64),
+                },
+            ) {
+                Ok(directory) => directory,
+                Err(e) => {
+                    phase_a.report_failed(format!(
+                        "worker={}: tls_tcp client directory: {e}",
+                        widx.0,
+                    ));
+                    return;
+                }
+            };
+            let applied_peers = match tls_tcp_peer_map(&runtime_peers) {
+                Ok(peers) => peers,
+                Err(e) => {
+                    phase_a.report_failed(format!("worker={}: {e}", widx.0));
+                    return;
+                }
+            };
+            for peer in applied_peers.values() {
+                if let Err(e) = directory.insert(peer.clone()) {
+                    phase_a.report_failed(format!(
+                        "worker={}: seed tls_tcp peer {}: {e}",
+                        widx.0, peer.name,
+                    ));
+                    return;
+                }
+            }
+            Some((tls, directory, applied_peers, lane_count, max_page))
+        }
+        None => None,
+    };
 
     // Shared Drop carrier for this shard's backing allocation, captured
     // before `Pool::new` moves the `Backing`. Published to the layer so
@@ -697,21 +824,47 @@ fn run_shard(
     // the control-drain tick hook below. A `ShardCommand::ApplyConfig`
     // republishes through this single handle so all consumers observe
     // the new finger table atomically without a restart.
-    let transport = match RoutedTransport::with_routes(
-        fabric.clone(),
-        mr,
-        page_size,
-        routes.clone(),
-        transport_registry.clone(),
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            phase_a.report_failed(format!(
-                "worker={}: RoutedTransport::with_routes: {e}",
-                widx.0,
-            ));
-            return;
+    let transport = match tcp_runtime.as_ref() {
+        Some((_, directory, _, _, _)) => {
+            let page_count = match u32::try_from(backing.page_count) {
+                Ok(page_count) => page_count,
+                Err(_) => {
+                    phase_a.report_failed(format!(
+                        "worker={}: backing page count exceeds tls_tcp geometry",
+                        widx.0,
+                    ));
+                    return;
+                }
+            };
+            match TcpRpcTransport::new(directory.clone(), routes.clone(), page_size, page_count) {
+                Ok(tcp) => {
+                    RoutedTransport::with_tcp(tcp, routes.clone(), transport_registry.clone())
+                }
+                Err(e) => {
+                    phase_a.report_failed(format!(
+                        "worker={}: TcpRpcTransport::new: {e}",
+                        widx.0,
+                    ));
+                    return;
+                }
+            }
         }
+        None => match RoutedTransport::with_routes(
+            fabric.clone(),
+            mr,
+            page_size,
+            routes.clone(),
+            transport_registry.clone(),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                phase_a.report_failed(format!(
+                    "worker={}: RoutedTransport::with_routes: {e}",
+                    widx.0,
+                ));
+                return;
+            }
+        },
     };
     // Per-shard view over the live disk channel directory. When the
     // directory is empty (no engines yet), `register_pages` records the
@@ -781,7 +934,7 @@ fn run_shard(
         backing_len,
         fabric_mr: mr,
         numa: shard.numa,
-        fetch_channel,
+        fetch_channel: fetch_channel.clone(),
         backing_keepalive,
     });
     let peers = match peer_rx.recv() {
@@ -845,6 +998,55 @@ fn run_shard(
         shard_loop.add_tick_hook(move || fetch_service.progress());
     }
 
+    // Every custom transport shard binds the configured address with
+    // SO_REUSEPORT and serves through its local fanout and fetch channel.
+    let tcp_peer_directory = tcp_runtime.as_ref().map(|(_, _, peers, _, _)| {
+        PeerDirectory::new(peers.values().map(|peer| peer.name.clone()))
+    });
+    let tcp_driver = match (tcp_runtime.as_ref(), tcp_peer_directory.as_ref()) {
+        (Some((tls, _, _, lane_count, max_page)), Some(peer_directory)) => {
+            let Some(settings) = fabric_startup.tls_tcp.as_ref() else {
+                phaseb_guard.report_failed(format!(
+                    "worker={}: tls_tcp runtime is missing startup settings",
+                    widx.0,
+                ));
+                return;
+            };
+            match build_tcp_rpc_driver(
+                settings,
+                fabric_startup.max_inflight,
+                local_peer_name.clone(),
+                *lane_count,
+                *max_page,
+                NetHandle::new(socket.clone()),
+                tls.clone(),
+                peer_directory.clone(),
+                fanout.clone(),
+                fetch_channel.clone(),
+                routes.clone(),
+                shard_loop.waker(),
+            ) {
+                Ok(driver) => Some(driver),
+                Err(e) => {
+                    phaseb_guard
+                        .report_failed(
+                            format!("worker={}: build tls_tcp RPC driver: {e}", widx.0,),
+                        );
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(mut driver) = tcp_driver {
+        shard_loop.add_tick_hook(move || driver.progress());
+    }
+    if let Some((_, directory, _, _, _)) = tcp_runtime.as_ref() {
+        let directory = directory.clone();
+        shard_loop.add_tick_hook(move || directory.progress());
+    }
+
     // Shard-local registry of running frontend drivers, seeded with every
     // configured frontend. A single permanent tick hook (registered
     // below) drives whichever drivers are live, and the control-drain
@@ -890,6 +1092,14 @@ fn run_shard(
         let pool = pool.clone();
         let geometry = geometry.clone();
         let bindings = frontend_registry.ctx.bindings.clone();
+        let tcp_peer_directory = tcp_peer_directory.clone();
+        let tcp_directory = tcp_runtime
+            .as_ref()
+            .map(|(_, directory, _, _, _)| directory.clone());
+        let mut last_tcp_peers = tcp_runtime
+            .as_ref()
+            .map(|(_, _, peers, _, _)| peers.clone())
+            .unwrap_or_default();
         let mut last_backends: HashMap<String, BackendSpec> = backend_specs
             .iter()
             .map(|b| (b.name.clone(), b.clone()))
@@ -905,6 +1115,37 @@ fn run_shard(
             while let Ok(cmd) = ctrl_rx.try_recv() {
                 match cmd {
                     config::ShardCommand::ApplyConfig(apply) => {
+                        if apply.diff.requires_peer_reconcile()
+                            && let (Some(peer_directory), Some(directory)) =
+                                (tcp_peer_directory.as_ref(), tcp_directory.as_ref())
+                        {
+                            let desired = match tls_tcp_peer_map(&apply.loaded.runtime().mesh.peers) {
+                                Ok(peers) => peers,
+                                Err(e) => {
+                                    let _ = apply.ack.send(config::ShardAck {
+                                        worker: widx,
+                                        result: Err(e),
+                                    });
+                                    did_work = true;
+                                    continue;
+                                }
+                            };
+                            if let Err(e) =
+                                reconcile_tls_tcp_clients(directory, &mut last_tcp_peers, desired)
+                            {
+                                let _ = apply.ack.send(config::ShardAck {
+                                    worker: widx,
+                                    result: Err(format!(
+                                        "tls_tcp outbound peer reconcile failed: {e}"
+                                    )),
+                                });
+                                did_work = true;
+                                continue;
+                            }
+                            peer_directory
+                                .replace(last_tcp_peers.values().map(|peer| peer.name.clone()));
+                        }
+
                         let desired_backends = apply.loaded.config().backends.as_slice();
                         let desired_frontends = apply.loaded.config().frontends.as_slice();
                         let desired_frontend_backends =
@@ -1085,6 +1326,104 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
     } else {
         "non-string panic payload"
     }
+}
+
+fn tls_tcp_peer_map(
+    peers: &[config::RuntimePeer],
+) -> Result<HashMap<unbounded_storage::p2p::NodeId, TcpRpcClientPeer>, String> {
+    let mut desired = HashMap::new();
+    for peer in peers {
+        let Some(config::peer_spec::Config::TlsTcp(peer_config)) = peer.spec.config.as_ref() else {
+            continue;
+        };
+        let address = peer_config.addr.parse::<SocketAddr>().map_err(|e| {
+            format!(
+                "tls_tcp peer {} has invalid address {:?}: {e}",
+                peer.name, peer_config.addr,
+            )
+        })?;
+        if address.port() == 0 {
+            return Err(format!("tls_tcp peer {} has a zero port", peer.name));
+        }
+        if peer.name.is_empty() || peer_config.server_name.is_empty() {
+            return Err("tls_tcp peer and server names must be nonempty".to_string());
+        }
+        let entry = TcpRpcClientPeer {
+            node: peer.node_id,
+            name: peer.name.clone(),
+            server_name: peer_config.server_name.clone(),
+            address,
+        };
+        if desired.insert(peer.node_id, entry).is_some() {
+            return Err(format!(
+                "tls_tcp peers contain duplicate node id {}",
+                peer.node_id.0,
+            ));
+        }
+    }
+    Ok(desired)
+}
+
+fn reconcile_tls_tcp_clients(
+    directory: &ClientPeerDirectory,
+    applied: &mut HashMap<unbounded_storage::p2p::NodeId, TcpRpcClientPeer>,
+    desired: HashMap<unbounded_storage::p2p::NodeId, TcpRpcClientPeer>,
+) -> Result<(), String> {
+    for node in applied.keys().filter(|node| !desired.contains_key(node)) {
+        directory.remove(*node);
+    }
+    for (node, peer) in &desired {
+        if applied.get(node) != Some(peer) {
+            directory
+                .insert(peer.clone())
+                .map_err(|e| format!("peer {}: {e}", peer.name))?;
+        }
+    }
+    *applied = desired;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tcp_rpc_driver(
+    settings: &TlsTcpStartup,
+    max_inflight: u32,
+    local_peer_name: String,
+    lane_count: u16,
+    max_page: u32,
+    handle: NetHandle,
+    tls: Rc<PeerTlsContext>,
+    peers: PeerDirectory,
+    fanout: Rc<FanoutTable>,
+    local_fetch: FetchChannel,
+    routes: RouteTableHandle,
+    waker: Waker,
+) -> Result<TcpRpcDriver, String> {
+    let bind_addr = settings
+        .bind_addr
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("invalid bind address {:?}: {e}", settings.bind_addr))?;
+    let max_inflight = max_inflight as usize;
+    let service = TcpRpcService::new(
+        TcpRpcConfig {
+            bind_addr,
+            local_peer_name,
+            lane_count,
+            max_page,
+            socket_buffer_bytes: settings.socket_buffer_bytes,
+            max_connections: max_inflight.max(lane_count as usize),
+            max_inflight_requests: max_inflight,
+            max_pages_per_request: MAX_DESTINATION_PAGE_COUNT,
+            max_requests_per_connection: MAX_REQUESTS_PER_CONNECTION,
+        },
+        handle,
+        tls,
+        peers,
+        fanout,
+        local_fetch,
+        routes,
+    )
+    .map_err(|e| e.to_string())?;
+    TcpRpcDriver::bind(service, waker).map_err(|e| e.to_string())
 }
 
 fn reconcile_cache_disks(
@@ -2013,6 +2352,32 @@ mod tests {
         // path is allowed to silently fall back to built-in defaults.
         let path = Path::new("/definitely/not/a/real/path/unbounded-storage.toml");
         assert!(load_config(path, true).is_err());
+    }
+
+    #[test]
+    fn tls_tcp_peer_map_uses_scalar_address() {
+        let runtime_peer = |id, addr: &str| config::RuntimePeer {
+            name: format!("node-{id}"),
+            node_id: unbounded_storage::p2p::NodeId(id),
+            fabric_peer_id: unbounded_storage::fabric::PeerId(id),
+            spec: config::PeerSpec {
+                name: format!("node-{id}"),
+                config: Some(config::peer_spec::Config::TlsTcp(
+                    config::TlsTcpPeerConfig {
+                        addr: addr.to_string(),
+                        server_name: format!("node-{id}"),
+                    },
+                )),
+                ..Default::default()
+            },
+        };
+        let peers = [runtime_peer(1, "127.0.0.1:9443")];
+
+        let mapped = tls_tcp_peer_map(&peers).expect("valid peers should map");
+        assert_eq!(
+            mapped[&unbounded_storage::p2p::NodeId(1)].address,
+            "127.0.0.1:9443".parse::<SocketAddr>().unwrap()
+        );
     }
 
     fn backend_spec(id: &str) -> BackendSpec {

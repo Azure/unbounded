@@ -119,38 +119,53 @@ pub trait Transport<R: Req> {
     /// (server handlers, object-range backends) keep using
     /// [`Transport::bulk_get`] directly.
     ///
-    /// Resolves `Ok(())` on the first delivered page, propagates a
-    /// stream error, and surfaces a premature end-of-stream as an
-    /// `Error`.
+    /// Resolves `Ok(())` after one delivered page and clean stream
+    /// termination, propagates a stream error, and rejects zero or
+    /// multiple delivered pages.
     async fn fetch_one(&self, req: &R, src: BulkRef, dst: PageRef) -> Result<(), Error> {
         let dsts = [dst];
         DriveSinglePage {
             stream: self.bulk_get(req, src, &dsts),
+            delivered: false,
         }
         .await
     }
 }
 
-/// Adapter that drives a single-page `bulk_get` stream to its first
-/// delivered page. Used by [`Transport::fetch_one`].
+/// Adapter that drives a single-page `bulk_get` stream through its terminal
+/// response. Used by [`Transport::fetch_one`].
 struct DriveSinglePage<S: PageStream> {
     stream: S,
+    delivered: bool,
 }
 
 impl<S: PageStream> Future for DriveSinglePage<S> {
     type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: standard structural pin projection through the
-        // single `stream` field; we never move out of `self`.
-        let stream = unsafe { self.map_unchecked_mut(|s| &mut s.stream) };
-        match stream.poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Ok(_page))) => Poll::Ready(Ok(())),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(None) => Poll::Ready(Err(Error::from(
-                "transport stream ended without delivering page",
-            ))),
+        // SAFETY: neither field is moved while `self` is pinned.
+        let this = unsafe { self.get_unchecked_mut() };
+        loop {
+            // SAFETY: `stream` remains pinned in `this`.
+            let stream = unsafe { Pin::new_unchecked(&mut this.stream) };
+            match stream.poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(_page))) if !this.delivered => {
+                    this.delivered = true;
+                }
+                Poll::Ready(Some(Ok(_page))) => {
+                    return Poll::Ready(Err(Error::from(
+                        "single-page transport delivered multiple pages",
+                    )));
+                }
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                Poll::Ready(None) if this.delivered => return Poll::Ready(Ok(())),
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(Error::from(
+                        "transport stream ended without delivering page",
+                    )));
+                }
+            }
         }
     }
 }
