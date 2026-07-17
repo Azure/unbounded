@@ -1,0 +1,150 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: acr-origin-proxy
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: acr-origin-proxy
+    app.kubernetes.io/part-of: gantry-benchmark
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: acr-origin-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: acr-origin-proxy
+        app.kubernetes.io/part-of: gantry-benchmark
+        gantry.unbounded-cloud.io/run-id: {{ .RunID }}
+    spec:
+      containers:
+        - name: proxy
+          image: {{ .ProxyImage }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: proxy
+              containerPort: 5002
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: UPSTREAM_REGISTRY
+              value: https://{{ .ACRLoginServer }}
+            - name: BENCHMARK_RUN_ID
+              value: {{ .RunID }}
+            - name: AUTH_MODE
+              value: auto
+            - name: ACR_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: acr-origin-proxy
+                  key: username
+            - name: ACR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: acr-origin-proxy
+                  key: password
+            - name: BENCHMARK_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: acr-origin-proxy
+                  key: control-token
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 10
+          resources:
+            requests:
+              cpu: "4"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: acr-origin-proxy
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: acr-origin-proxy
+    app.kubernetes.io/part-of: gantry-benchmark
+spec:
+  selector:
+    app.kubernetes.io/name: acr-origin-proxy
+  ports:
+    - name: proxy
+      port: 5002
+      targetPort: proxy
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: acr-origin-proxy
+  namespace: {{ .Namespace }}
+  labels:
+    release: {{ .MonitoringLabel }}
+    app.kubernetes.io/part-of: gantry-benchmark
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: acr-origin-proxy
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 10s
+      metricRelabelings:
+        - action: replace
+          targetLabel: gantry_benchmark
+          replacement: "true"
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gantry-benchmark-agent
+  namespace: {{ .Namespace }}
+  labels:
+    release: {{ .MonitoringLabel }}
+    app.kubernetes.io/part-of: gantry-benchmark
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .GantryNamespace }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+  podTargetLabels:
+    - controller-revision-hash
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 10s
+      metricRelabelings:
+        - action: replace
+          targetLabel: gantry_benchmark
+          replacement: "true"
