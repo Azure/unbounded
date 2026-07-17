@@ -19,8 +19,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	infrastructurev1alpha1 "github.com/Azure/unbounded/api/infrastructure/v1alpha1"
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	azurev1alpha1 "github.com/Azure/unbounded/api/providers/azure/v1alpha1"
 	"github.com/Azure/unbounded/internal/machineops"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
@@ -76,7 +76,7 @@ func (p *Provider) Registration() (*publicmachineops.Provider, error) {
 	options := make([]publicmachineops.ProviderOption, 0, len(azureVMOperations)+1)
 
 	options = append(options, publicmachineops.WithProviderMachineKind(
-		infrastructurev1alpha1.GroupVersion.WithKind(infrastructurev1alpha1.AzureMachineKind).GroupKind(),
+		azurev1alpha1.GroupVersion.WithKind(azurev1alpha1.AzureMachineKind).GroupKind(),
 	))
 
 	for kind := range azureVMOperations {
@@ -125,12 +125,12 @@ func (p *Provider) resourceRef(ctx context.Context, request machineops.Operation
 		return azureVMResourceRef{}, fmt.Errorf("kubernetes client is required for AzureMachine providerRef")
 	}
 
-	expectedGroupKind := infrastructurev1alpha1.GroupVersion.WithKind(infrastructurev1alpha1.AzureMachineKind).GroupKind()
+	expectedGroupKind := azurev1alpha1.GroupVersion.WithKind(azurev1alpha1.AzureMachineKind).GroupKind()
 	if request.ProviderRef.APIGroup != expectedGroupKind.Group || request.ProviderRef.Kind != expectedGroupKind.Kind {
 		return azureVMResourceRef{}, fmt.Errorf("providerRef must identify %s", expectedGroupKind)
 	}
 
-	var azureMachine infrastructurev1alpha1.AzureMachine
+	var azureMachine azurev1alpha1.AzureMachine
 	if err := p.KubeClient.Get(ctx, client.ObjectKey{Name: request.ProviderRef.Name}, &azureMachine); err != nil {
 		return azureVMResourceRef{}, fmt.Errorf("get AzureMachine %s: %w", request.ProviderRef.Name, err)
 	}
@@ -150,7 +150,7 @@ func (p *Provider) resourceRef(ctx context.Context, request machineops.Operation
 	return parseAzureVMProviderID(azureMachine.Spec.ResourceID)
 }
 
-func validateAzureMachineOwner(azureMachine *infrastructurev1alpha1.AzureMachine, request machineops.OperationRequest) error {
+func validateAzureMachineOwner(azureMachine *azurev1alpha1.AzureMachine, request machineops.OperationRequest) error {
 	owner := metav1.GetControllerOf(azureMachine)
 	if owner == nil {
 		return fmt.Errorf("AzureMachine %s must have its Unbounded Machine as controller owner", azureMachine.Name)
@@ -346,14 +346,15 @@ func (c *armAzureVMClient) Replace(ctx context.Context, resourceGroupName, vmNam
 		return fmt.Errorf("get VM %s/%s: not found; replacement cannot recover without the original VM model", resourceGroupName, vmName)
 	}
 
-	existing := prepareVMForReplacementDelete(vm.VirtualMachine)
+	source := vm.VirtualMachine
+	deleteOptionPayload := prepareVMForReplacementDelete(source)
 
-	replacement, err := prepareReplacementVM(existing, userData, hostImage, time.Now().Unix())
+	replacement, err := prepareReplacementVM(source, userData, hostImage, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("prepare replacement VM %s/%s: %w", resourceGroupName, vmName, err)
 	}
 
-	updatePoller, err := c.client.BeginCreateOrUpdate(ctx, resourceGroupName, vmName, existing, nil)
+	updatePoller, err := c.client.BeginCreateOrUpdate(ctx, resourceGroupName, vmName, deleteOptionPayload, nil)
 	if err != nil {
 		return fmt.Errorf("update VM %s/%s delete options before replacement: %w", resourceGroupName, vmName, err)
 	}
@@ -385,8 +386,9 @@ func (c *armAzureVMClient) Replace(ctx context.Context, resourceGroupName, vmNam
 
 func prepareVMForReplacementDelete(vm armcompute.VirtualMachine) armcompute.VirtualMachine {
 	// Azure SDK GET responses include read-only fields and child resources that
-	// are invalid in a VM update payload. The nested objects are intentionally
-	// mutated because the next operation immediately sends this model back to ARM.
+	// are invalid in a VM update payload. Clone the nested fields changed below
+	// so preparing the independent replacement payload cannot alter this update.
+	vm = cloneVMForReplacementMutation(vm)
 	vm.ID = nil
 	vm.Name = nil
 	vm.Type = nil
@@ -400,6 +402,10 @@ func prepareVMForReplacementDelete(vm armcompute.VirtualMachine) armcompute.Virt
 
 	if vm.Properties.NetworkProfile != nil {
 		for _, nic := range vm.Properties.NetworkProfile.NetworkInterfaces {
+			if nic == nil {
+				continue
+			}
+
 			if nic.Properties == nil {
 				nic.Properties = &armcompute.NetworkInterfaceReferenceProperties{}
 			}
@@ -422,8 +428,10 @@ func prepareVMForReplacementDelete(vm armcompute.VirtualMachine) armcompute.Virt
 }
 
 func prepareReplacementVM(vm armcompute.VirtualMachine, userData, hostImage string, diskNameSuffix int64) (armcompute.VirtualMachine, error) {
-	// This mutates the captured VM model into a create payload for the replacement
-	// VM while preserving configurable settings from the original resource.
+	// Clone the nested fields changed below so this create payload remains
+	// independent from the pre-delete update payload built from the same source.
+	vm = cloneVMForReplacementMutation(vm)
+
 	imageReference, err := parseAzureImageReference(hostImage)
 	if err != nil {
 		return armcompute.VirtualMachine{}, err
@@ -468,6 +476,10 @@ func prepareReplacementVM(vm armcompute.VirtualMachine, userData, hostImage stri
 			vm.Properties.StorageProfile.OSDisk.CreateOption = to.Ptr(armcompute.DiskCreateOptionTypesFromImage)
 			vm.Properties.StorageProfile.OSDisk.Vhd = nil
 
+			if vm.Properties.StorageProfile.OSDisk.ManagedDisk != nil {
+				vm.Properties.StorageProfile.OSDisk.ManagedDisk.ID = nil
+			}
+
 			vm.Properties.StorageProfile.OSDisk.Name = to.Ptr(fmt.Sprintf("%s-osdisk-%d", vmName, diskNameSuffix))
 			for _, disk := range vm.Properties.StorageProfile.DataDisks {
 				disk.DiskIOPSReadWrite = nil
@@ -478,6 +490,94 @@ func prepareReplacementVM(vm armcompute.VirtualMachine, userData, hostImage stri
 	}
 
 	return vm, nil
+}
+
+func cloneVMForReplacementMutation(vm armcompute.VirtualMachine) armcompute.VirtualMachine {
+	cloned := vm
+
+	if vm.Identity != nil {
+		identity := *vm.Identity
+		cloned.Identity = &identity
+
+		if vm.Identity.UserAssignedIdentities != nil {
+			identity.UserAssignedIdentities = make(
+				map[string]*armcompute.UserAssignedIdentitiesValue,
+				len(vm.Identity.UserAssignedIdentities),
+			)
+			for id, value := range vm.Identity.UserAssignedIdentities {
+				identity.UserAssignedIdentities[id] = value
+			}
+		}
+	}
+
+	if vm.Properties == nil {
+		return cloned
+	}
+
+	properties := *vm.Properties
+	cloned.Properties = &properties
+
+	if vm.Properties.OSProfile != nil {
+		osProfile := *vm.Properties.OSProfile
+		properties.OSProfile = &osProfile
+	}
+
+	if vm.Properties.NetworkProfile != nil {
+		networkProfile := *vm.Properties.NetworkProfile
+		properties.NetworkProfile = &networkProfile
+
+		if vm.Properties.NetworkProfile.NetworkInterfaces != nil {
+			networkProfile.NetworkInterfaces = make(
+				[]*armcompute.NetworkInterfaceReference,
+				len(vm.Properties.NetworkProfile.NetworkInterfaces),
+			)
+			for i, reference := range vm.Properties.NetworkProfile.NetworkInterfaces {
+				if reference == nil {
+					continue
+				}
+
+				clonedReference := *reference
+				networkProfile.NetworkInterfaces[i] = &clonedReference
+
+				if reference.Properties != nil {
+					referenceProperties := *reference.Properties
+					clonedReference.Properties = &referenceProperties
+				}
+			}
+		}
+	}
+
+	if vm.Properties.StorageProfile != nil {
+		storageProfile := *vm.Properties.StorageProfile
+		properties.StorageProfile = &storageProfile
+
+		if vm.Properties.StorageProfile.OSDisk != nil {
+			osDisk := *vm.Properties.StorageProfile.OSDisk
+			storageProfile.OSDisk = &osDisk
+
+			if vm.Properties.StorageProfile.OSDisk.ManagedDisk != nil {
+				managedDisk := *vm.Properties.StorageProfile.OSDisk.ManagedDisk
+				osDisk.ManagedDisk = &managedDisk
+			}
+		}
+
+		if vm.Properties.StorageProfile.DataDisks != nil {
+			storageProfile.DataDisks = make(
+				[]*armcompute.DataDisk,
+				len(vm.Properties.StorageProfile.DataDisks),
+			)
+			for i, dataDisk := range vm.Properties.StorageProfile.DataDisks {
+				if dataDisk == nil {
+					continue
+				}
+
+				clonedDataDisk := *dataDisk
+				storageProfile.DataDisks[i] = &clonedDataDisk
+			}
+		}
+	}
+
+	return cloned
 }
 
 func parseAzureImageReference(hostImage string) (*armcompute.ImageReference, error) {

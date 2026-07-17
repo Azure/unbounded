@@ -17,8 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	infrastructurev1alpha1 "github.com/Azure/unbounded/api/infrastructure/v1alpha1"
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	azurev1alpha1 "github.com/Azure/unbounded/api/providers/azure/v1alpha1"
 	"github.com/Azure/unbounded/internal/machineops"
 )
 
@@ -156,7 +156,7 @@ func TestProviderExecuteUsesAzureMachineProviderRef(t *testing.T) {
 
 	machineUID := types.UID("machine-uid")
 	controller := true
-	azureMachine := &infrastructurev1alpha1.AzureMachine{
+	azureMachine := &azurev1alpha1.AzureMachine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "azure-machine-1",
 			UID:        "azure-machine-uid",
@@ -169,13 +169,13 @@ func TestProviderExecuteUsesAzureMachineProviderRef(t *testing.T) {
 				Controller: &controller,
 			}},
 		},
-		Spec: infrastructurev1alpha1.AzureMachineSpec{
+		Spec: azurev1alpha1.AzureMachineSpec{
 			ResourceID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1",
 		},
 	}
 
 	scheme := runtime.NewScheme()
-	require.NoError(t, infrastructurev1alpha1.AddToScheme(scheme))
+	require.NoError(t, azurev1alpha1.AddToScheme(scheme))
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(azureMachine).Build()
 	azureClient := &recordingAzureVMClient{}
 	provider := &Provider{
@@ -191,8 +191,8 @@ func TestProviderExecuteUsesAzureMachineProviderRef(t *testing.T) {
 		MachineName: "machine-1",
 		MachineUID:  machineUID,
 		ProviderRef: &unboundedv1alpha3.ProviderMachineSnapshot{
-			APIGroup:   infrastructurev1alpha1.GroupVersion.Group,
-			Kind:       infrastructurev1alpha1.AzureMachineKind,
+			APIGroup:   azurev1alpha1.GroupVersion.Group,
+			Kind:       azurev1alpha1.AzureMachineKind,
 			Name:       azureMachine.Name,
 			UID:        azureMachine.UID,
 			Generation: azureMachine.Generation,
@@ -208,14 +208,14 @@ func TestProviderExecuteUsesAzureMachineProviderRef(t *testing.T) {
 func TestProviderExecuteRejectsChangedAzureMachine(t *testing.T) {
 	t.Parallel()
 
-	azureMachine := &infrastructurev1alpha1.AzureMachine{
+	azureMachine := &azurev1alpha1.AzureMachine{
 		ObjectMeta: metav1.ObjectMeta{Name: "azure-machine-1", UID: "current-uid", Generation: 4},
-		Spec: infrastructurev1alpha1.AzureMachineSpec{
+		Spec: azurev1alpha1.AzureMachineSpec{
 			ResourceID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1",
 		},
 	}
 	scheme := runtime.NewScheme()
-	require.NoError(t, infrastructurev1alpha1.AddToScheme(scheme))
+	require.NoError(t, azurev1alpha1.AddToScheme(scheme))
 	provider := &Provider{KubeClient: fake.NewClientBuilder().WithScheme(scheme).WithObjects(azureMachine).Build()}
 
 	tests := []struct {
@@ -234,8 +234,8 @@ func TestProviderExecuteRejectsChangedAzureMachine(t *testing.T) {
 
 			_, err := provider.Execute(context.Background(), machineops.OperationRequest{
 				ProviderRef: &unboundedv1alpha3.ProviderMachineSnapshot{
-					APIGroup:   infrastructurev1alpha1.GroupVersion.Group,
-					Kind:       infrastructurev1alpha1.AzureMachineKind,
+					APIGroup:   azurev1alpha1.GroupVersion.Group,
+					Kind:       azurev1alpha1.AzureMachineKind,
 					Name:       azureMachine.Name,
 					UID:        tt.uid,
 					Generation: tt.generation,
@@ -311,7 +311,7 @@ func TestProviderRegistrationDoesNotDeclareHostReplaceReplaySafe(t *testing.T) {
 
 	groupKind, ok := provider.ProviderMachineKind()
 	require.True(t, ok)
-	require.Equal(t, infrastructurev1alpha1.GroupVersion.WithKind(infrastructurev1alpha1.AzureMachineKind).GroupKind(), groupKind)
+	require.Equal(t, azurev1alpha1.GroupVersion.WithKind(azurev1alpha1.AzureMachineKind).GroupKind(), groupKind)
 }
 
 func TestPrepareReplacementVMChangesHostImage(t *testing.T) {
@@ -371,8 +371,11 @@ func TestPrepareReplacementVM(t *testing.T) {
 			ProvisioningState: toPtr("Succeeded"),
 			OSProfile:         &armcompute.OSProfile{RequireGuestProvisionSignal: toPtr(true)},
 			StorageProfile: &armcompute.StorageProfile{OSDisk: &armcompute.OSDisk{
-				Name:        toPtr("old-osdisk"),
-				ManagedDisk: &armcompute.ManagedDiskParameters{},
+				Name: toPtr("old-osdisk"),
+				ManagedDisk: &armcompute.ManagedDiskParameters{
+					ID:                 toPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/old-osdisk"),
+					StorageAccountType: toPtr(armcompute.StorageAccountTypesPremiumLRS),
+				},
 			}},
 		},
 	}
@@ -391,7 +394,10 @@ func TestPrepareReplacementVM(t *testing.T) {
 	require.Nil(t, replacement.Properties.OSProfile.RequireGuestProvisionSignal)
 	require.Equal(t, armcompute.DiskCreateOptionTypesFromImage, *replacement.Properties.StorageProfile.OSDisk.CreateOption)
 	require.NotNil(t, replacement.Properties.StorageProfile.OSDisk.ManagedDisk)
+	require.Nil(t, replacement.Properties.StorageProfile.OSDisk.ManagedDisk.ID)
+	require.Equal(t, armcompute.StorageAccountTypesPremiumLRS, *replacement.Properties.StorageProfile.OSDisk.ManagedDisk.StorageAccountType)
 	require.Equal(t, "vm1-osdisk-123", *replacement.Properties.StorageProfile.OSDisk.Name)
+	require.NotNil(t, vm.Properties.StorageProfile.OSDisk.ManagedDisk.ID)
 }
 
 func TestValidateAzureCustomData(t *testing.T) {
@@ -420,6 +426,24 @@ func TestPrepareVMForReplacementDelete(t *testing.T) {
 	require.Equal(t, armcompute.DeleteOptionsDetach, *updated.Properties.NetworkProfile.NetworkInterfaces[0].Properties.DeleteOption)
 	require.Equal(t, armcompute.DiskDeleteOptionTypesDelete, *updated.Properties.StorageProfile.OSDisk.DeleteOption)
 	require.Equal(t, armcompute.DiskDeleteOptionTypesDetach, *updated.Properties.StorageProfile.DataDisks[0].DeleteOption)
+}
+
+func TestPreparingReplacementDoesNotMutateDeleteOptionPayload(t *testing.T) {
+	t.Parallel()
+
+	source := armcompute.VirtualMachine{
+		Name: toPtr("vm1"),
+		Properties: &armcompute.VirtualMachineProperties{
+			StorageProfile: &armcompute.StorageProfile{
+				OSDisk: &armcompute.OSDisk{Name: toPtr("existing-osdisk")},
+			},
+		},
+	}
+
+	deleteOptionPayload := prepareVMForReplacementDelete(source)
+	_, err := prepareReplacementVM(source, "#cloud-config\n", "", 123)
+	require.NoError(t, err)
+	require.Equal(t, "existing-osdisk", *deleteOptionPayload.Properties.StorageProfile.OSDisk.Name)
 }
 
 type recordingAzureVMClient struct {

@@ -27,7 +27,7 @@ const (
 // +kubebuilder:printcolumn:name="Resource ID",type="string",JSONPath=".spec.resourceID"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
-// AzureMachine contains the Azure-specific state for one Unbounded Machine.
+// AzureMachine contains the Azure provider state for one Unbounded Machine.
 type AzureMachine struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

@@ -24,8 +24,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	infrastructurev1alpha1 "github.com/Azure/unbounded/api/infrastructure/v1alpha1"
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	azurev1alpha1 "github.com/Azure/unbounded/api/providers/azure/v1alpha1"
 	"github.com/Azure/unbounded/internal/machineops/providers/azurevm"
 	"github.com/Azure/unbounded/internal/machineops/providers/ociinstance"
 	"github.com/Azure/unbounded/internal/unbounded"
@@ -224,8 +224,8 @@ func safeNamePart(value string) string {
 func runtimeScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(infrastructurev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(unboundedv1alpha3.AddToScheme(scheme))
+	utilruntime.Must(azurev1alpha1.AddToScheme(scheme))
 
 	return scheme
 }
