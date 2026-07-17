@@ -33,6 +33,22 @@ const (
 // applyDiskOverlay injects per-node storage disks when the config does not
 // declare disks explicitly. Explicit config disks are authoritative.
 func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) error {
+	if discovery := cfg.GetDiskDiscovery(); discovery != nil {
+		fallback := discovery.GetFallback()
+		if fallback == nil || fallback.Size == nil {
+			if size, ok := validStorageFileSize(annotations[storageFileSizeAnnotation]); ok {
+				if fallback == nil {
+					fallback = &storageconfig.FileDiskConfig{}
+					discovery.Fallback = fallback
+				}
+
+				fallback.Size = proto.Uint64(size)
+			}
+		}
+
+		return nil
+	}
+
 	if len(cfg.GetDisks()) > 0 {
 		return nil
 	}
@@ -307,8 +323,8 @@ func fallbackFileDisk(rawSize string) *storageconfig.DiskSpec {
 	size := defaultStorageFileDiskSize
 
 	if strings.TrimSpace(rawSize) != "" {
-		parsed, err := strconv.ParseUint(strings.TrimSpace(rawSize), 10, 64)
-		if err != nil || parsed == 0 || parsed%defaultStorageDiskPageSize != 0 {
+		parsed, ok := validStorageFileSize(rawSize)
+		if !ok {
 			slog.Warn("using default storage file disk size because annotation is invalid",
 				"annotation", storageFileSizeAnnotation, "value", rawSize, "default", defaultStorageFileDiskSize)
 		} else {
@@ -324,6 +340,15 @@ func fallbackFileDisk(rawSize string) *storageconfig.DiskSpec {
 			},
 		},
 	}
+}
+
+func validStorageFileSize(raw string) (uint64, bool) {
+	parsed, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	if err != nil || parsed == 0 || parsed%defaultStorageDiskPageSize != 0 {
+		return 0, false
+	}
+
+	return parsed, true
 }
 
 func declaredDiskPaths(cfg *storageconfig.Config) map[string]struct{} {

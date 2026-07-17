@@ -25,6 +25,8 @@ const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HTTP_CONCURRENCY: u32 = 64;
 pub const DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION: u32 = 1024;
 const DEFAULT_FAKE_OBJECT_SIZE_BYTES: u64 = 1024 * 1024;
+pub const DEFAULT_DISCOVERY_FALLBACK_PATH: &str = "/var/lib/unbounded-storage/cache.disk";
+pub const DEFAULT_DISCOVERY_FALLBACK_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 impl Config {
     /// Populates every omitted section and optional defaulted field with
@@ -33,6 +35,18 @@ impl Config {
     /// decoding a protobuf message) before the config is consumed.
     pub fn apply_defaults(&mut self) {
         self.fingers_per_node.get_or_insert(100);
+
+        if let Some(discovery) = &mut self.disk_discovery {
+            let fallback = discovery
+                .fallback
+                .get_or_insert_with(FileDiskConfig::default);
+            if fallback.path.is_empty() {
+                fallback.path = DEFAULT_DISCOVERY_FALLBACK_PATH.to_string();
+            }
+            fallback
+                .size
+                .get_or_insert(DEFAULT_DISCOVERY_FALLBACK_SIZE_BYTES);
+        }
 
         for backend in &mut self.backends {
             backend.apply_defaults();

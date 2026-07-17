@@ -183,7 +183,7 @@ mod uring_tests {
     /// [`CoreLocalDevice`] plus the install guard.
     fn open_installed(path: &Path, page_size: usize) -> (CoreLocalDevice, Installed) {
         let OpenDisk { device, ring, file } =
-            UringDevice::open(path, StorageRingConfig::test_local(), false, page_size)
+            UringDevice::open(path, StorageRingConfig::test_local(), false, false, page_size)
                 .expect("open uring device");
         let ring = Rc::new(ring);
         let ring_install = install_current_storage_ring(ring.clone());

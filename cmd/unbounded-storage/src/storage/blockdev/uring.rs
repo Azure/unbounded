@@ -62,10 +62,25 @@ impl UringDevice {
         path: &Path,
         ring_cfg: StorageRingConfig,
         o_direct: bool,
+        exclusive: bool,
         page_size: usize,
     ) -> Result<OpenDisk, OpenError> {
         let ring = StorageRing::new(ring_cfg).map_err(OpenError::Ring)?;
-        let file = open_file(path, o_direct).map_err(OpenError::OpenFile)?;
+        let file = open_file(path, o_direct && !exclusive, exclusive).map_err(OpenError::OpenFile)?;
+        if exclusive {
+            match crate::storage::discovery::probe_fd(file.as_raw_fd()) {
+                Ok(crate::storage::discovery::ProbeResult::Empty) => {}
+                Ok(result) => {
+                    return Err(OpenError::UnsafeDevice(format!(
+                        "libblkid found {result:?} after exclusive open"
+                    )));
+                }
+                Err(e) => return Err(OpenError::UnsafeDevice(e)),
+            }
+            if o_direct {
+                enable_direct_io(&file).map_err(OpenError::OpenFile)?;
+            }
+        }
         let capacity_pages = file_capacity_pages(&file, page_size).map_err(OpenError::Capacity)?;
         let file_index = ring
             .register_file(file.as_raw_fd())
@@ -98,6 +113,7 @@ pub struct OpenDisk {
 pub enum OpenError {
     Ring(Error),
     OpenFile(Error),
+    UnsafeDevice(String),
     Capacity(Error),
     RegisterFile(Error),
 }
@@ -107,16 +123,17 @@ impl std::fmt::Display for OpenError {
         match self {
             OpenError::Ring(e) => write!(f, "storage ring: {e}"),
             OpenError::OpenFile(e) => write!(f, "open disk: {e}"),
+            OpenError::UnsafeDevice(e) => write!(f, "unsafe discovered disk: {e}"),
             OpenError::Capacity(e) => write!(f, "disk capacity: {e}"),
             OpenError::RegisterFile(e) => write!(f, "register file: {e}"),
         }
     }
 }
 
-fn open_file(path: &Path, o_direct: bool) -> Result<File, Error> {
+fn open_file(path: &Path, o_direct: bool, exclusive: bool) -> Result<File, Error> {
     let cpath =
         CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Io(libc::EINVAL))?;
-    let flags = open_flags(o_direct);
+    let flags = open_flags(o_direct, exclusive);
     // SAFETY: cpath is null-terminated and outlives the call.
     let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
     if fd < 0 {
@@ -130,12 +147,36 @@ fn open_file(path: &Path, o_direct: bool) -> Result<File, Error> {
     Ok(unsafe { File::from_raw_fd(fd as RawFd) })
 }
 
-fn open_flags(o_direct: bool) -> libc::c_int {
+fn open_flags(o_direct: bool, exclusive: bool) -> libc::c_int {
     let mut flags = libc::O_RDWR | libc::O_CLOEXEC;
     if o_direct {
         flags |= libc::O_DIRECT;
     }
+    if exclusive {
+        flags |= libc::O_EXCL;
+    }
     flags
+}
+
+fn enable_direct_io(file: &File) -> Result<(), Error> {
+    // SAFETY: file owns a valid descriptor for both fcntl calls.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(Error::Io(
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
+    }
+    // SAFETY: O_DIRECT is a valid file status flag on Linux block devices.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_DIRECT) } < 0 {
+        return Err(Error::Io(
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
+    }
+    Ok(())
 }
 
 /// Create `path` if absent and size it to exactly `size_bytes`.
@@ -268,7 +309,7 @@ mod tests {
         let len = std::fs::metadata(&path.0).unwrap().len();
         assert_eq!(len, (16 * PAGE) as u64);
 
-        let file = open_file(&path.0, false).expect("open");
+        let file = open_file(&path.0, false, false).expect("open");
         let pages = file_capacity_pages(&file, PAGE).expect("capacity");
         assert_eq!(pages, 16);
     }
@@ -293,7 +334,8 @@ mod tests {
 
     #[test]
     fn open_flags_include_o_direct_when_requested() {
-        assert_eq!(open_flags(false) & libc::O_DIRECT, 0);
-        assert_eq!(open_flags(true) & libc::O_DIRECT, libc::O_DIRECT);
+        assert_eq!(open_flags(false, false) & libc::O_DIRECT, 0);
+        assert_eq!(open_flags(true, false) & libc::O_DIRECT, libc::O_DIRECT);
+        assert_eq!(open_flags(false, true) & libc::O_EXCL, libc::O_EXCL);
     }
 }

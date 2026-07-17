@@ -719,6 +719,69 @@ disks:
 	assert.Equal(t, uint64(1073741824), disk.GetFile().GetSize())
 }
 
+func TestRenderConfigDiskDiscoverySuppressesLegacyDiskInjection(t *testing.T) {
+	dir := writeSource(t, `
+disk_discovery: {}
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{allocatedDisksAnnotation: "/dev/nvme1n1"},
+	})
+
+	assert.Empty(t, cfg.GetDisks())
+	require.NotNil(t, cfg.GetDiskDiscovery())
+	assert.Nil(t, cfg.GetDiskDiscovery().GetFallback())
+}
+
+func TestRenderConfigDiskDiscoveryUsesAnnotatedFallbackSizeWhenUnset(t *testing.T) {
+	dir := writeSource(t, `
+disk_discovery: {}
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{storageFileSizeAnnotation: "4294967296"},
+	})
+
+	assert.Empty(t, cfg.GetDisks())
+	require.NotNil(t, cfg.GetDiskDiscovery().GetFallback())
+	assert.Equal(t, uint64(4294967296), cfg.GetDiskDiscovery().GetFallback().GetSize())
+}
+
+func TestRenderConfigDiskDiscoveryPreservesExplicitFallbackSize(t *testing.T) {
+	dir := writeSource(t, `
+disk_discovery:
+  fallback:
+    path: /custom/cache.disk
+    size: 8589934592
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{storageFileSizeAnnotation: "4294967296"},
+	})
+
+	fallback := cfg.GetDiskDiscovery().GetFallback()
+	require.NotNil(t, fallback)
+	assert.Equal(t, "/custom/cache.disk", fallback.GetPath())
+	assert.Equal(t, uint64(8589934592), fallback.GetSize())
+}
+
+func TestRenderConfigDiskDiscoveryIgnoresInvalidFallbackSizeAnnotation(t *testing.T) {
+	for _, size := range []string{"big", "0", "4097"} {
+		t.Run(size, func(t *testing.T) {
+			dir := writeSource(t, `
+disk_discovery: {}
+`)
+
+			cfg := decodeWithState(t, dir, renderState{
+				annotations: map[string]string{storageFileSizeAnnotation: size},
+			})
+
+			assert.Empty(t, cfg.GetDisks())
+			assert.Nil(t, cfg.GetDiskDiscovery().GetFallback())
+		})
+	}
+}
+
 func TestRenderConfigCachesUntouched(t *testing.T) {
 	dir := writeSource(t, `
 backends:

@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libfabric-dev liburing-dev \
+            build-essential pkg-config libfabric-dev liburing-dev libblkid-dev \
             libibverbs-dev librdmacm-dev
 
       - name: Set up Rust toolchain

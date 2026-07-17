@@ -49,7 +49,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ca-certificates curl liburing-dev \
+            build-essential pkg-config ca-certificates curl liburing-dev libblkid-dev \
             libibverbs-dev librdmacm-dev
 
       - name: Cache pinned libfabric
@@ -105,7 +105,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config liburing-dev \
+            build-essential pkg-config liburing-dev libblkid-dev \
             libibverbs-dev librdmacm-dev
 
       - name: Set up Rust toolchain

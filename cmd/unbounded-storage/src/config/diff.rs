@@ -39,6 +39,7 @@
 //! sufficient work. All section types are prost-generated and derive
 //! [`PartialEq`], so each comparison is a structural value comparison.
 
+use crate::config::LoadedConfig;
 use crate::config::schema::Config;
 
 /// Per-section change flags between an old and a new [`Config`].
@@ -68,6 +69,12 @@ pub struct ConfigDiff {
 }
 
 impl ConfigDiff {
+    pub fn between_loaded(old: &LoadedConfig, new: &LoadedConfig) -> Self {
+        let mut diff = Self::between(old.config(), new.config());
+        diff.disks_changed = old.runtime().disks != new.runtime().disks;
+        diff
+    }
+
     /// Compute the per-section diff between `old` and `new`.
     ///
     /// Both configs are expected to be post-`apply_defaults` (as every
@@ -241,6 +248,33 @@ mod tests {
         assert!(d.disks_changed);
         assert!(d.any());
         assert!(!d.requires_routing_reload());
+    }
+
+    #[test]
+    fn resolved_discovery_target_change_is_detected() {
+        let config = base();
+        let old = LoadedConfig::from_config(config.clone())
+            .unwrap()
+            .with_runtime_disks(vec![crate::config::RuntimeDisk::discovered(DiskSpec {
+                config: Some(disk_spec::Config::Block(BlockDiskConfig {
+                    numa: None,
+                    path: "/dev/nvme0n1".to_string(),
+                })),
+                ..Default::default()
+            })]);
+        let new = LoadedConfig::from_config(config)
+            .unwrap()
+            .with_runtime_disks(vec![crate::config::RuntimeDisk::discovered(DiskSpec {
+                config: Some(disk_spec::Config::Block(BlockDiskConfig {
+                    numa: None,
+                    path: "/dev/nvme1n1".to_string(),
+                })),
+                ..Default::default()
+            })]);
+
+        let diff = ConfigDiff::between_loaded(&old, &new);
+        assert!(diff.disks_changed);
+        assert!(!diff.requires_routing_reload());
     }
 
     #[test]

@@ -55,6 +55,10 @@ fn main() {
     }
     tls_build.warnings(true).compile("unbounded_tls_shim");
 
+    pkg_config::Config::new()
+        .probe("blkid")
+        .expect("pkg-config could not locate `blkid` (install libblkid-dev)");
+
     generate_config_schema();
 
     println!("cargo:rerun-if-changed=src/fabric/shim.c");
@@ -101,6 +105,7 @@ fn generate_config_schema() {
         "TcpPeerConfig",
         "RdmaPeerConfig",
         "DiskSpec",
+        "DiskDiscovery",
         "BlockDiskConfig",
         "FileDiskConfig",
         "CacheSpec",

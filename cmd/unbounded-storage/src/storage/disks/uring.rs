@@ -55,6 +55,7 @@ use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::config::RuntimeDisk;
 use crate::config::schema::DiskSpec;
 use crate::ring::{StorageRingConfig, install_current_storage_ring};
 use crate::runtime::{PinnedRuntime, WorkerSpec, noop_waker};
@@ -78,6 +79,7 @@ pub struct UringDiskTarget {
 struct DiskOpenMode {
     ring_cfg: StorageRingConfig,
     o_direct: bool,
+    exclusive: bool,
 }
 
 impl UringDiskTarget {
@@ -108,9 +110,10 @@ impl DiskTarget for UringDiskTarget {
 
     fn open(
         &self,
-        spec: &DiskSpec,
+        disk: &RuntimeDisk,
         pin: Option<DiskCpuSlot>,
     ) -> Result<(UringDiskHandle, PageChannel), DiskError> {
+        let spec = &disk.spec;
         let disk_path = spec.path().expect("disk path is validated at config load");
         let engine_cfg = engine_config_from(spec);
         // The device page size must equal the engine's LBA unit. The
@@ -122,7 +125,8 @@ impl DiskTarget for UringDiskTarget {
         // against a 4 KiB btree page): using the cache page size here makes
         // every 4 KiB btree/meta I/O fail EINVAL and skews all byte offsets.
         let page_size = device_page_size(&engine_cfg);
-        let open_mode = disk_open_mode(spec);
+        let mut open_mode = disk_open_mode(spec);
+        open_mode.exclusive = disk.exclusive;
 
         // A file-backed disk still uses O_DIRECT so the daemon bypasses
         // the host page cache, but regular files do not support the
@@ -203,7 +207,13 @@ fn run_storage_core(
         // Held for the storage core's lifetime: the ring addresses this
         // fd by its registered Fixed index, so it must outlive the ring.
         file: _disk_file,
-    } = match UringDevice::open(&path, open_mode.ring_cfg, open_mode.o_direct, page_size) {
+    } = match UringDevice::open(
+        &path,
+        open_mode.ring_cfg,
+        open_mode.o_direct,
+        open_mode.exclusive,
+        page_size,
+    ) {
         Ok(d) => d,
         Err(e) => {
             let _ = ready_tx.send(Err(e.to_string()));
@@ -416,6 +426,7 @@ fn disk_open_mode(spec: &DiskSpec) -> DiskOpenMode {
     DiskOpenMode {
         ring_cfg,
         o_direct: true,
+        exclusive: false,
     }
 }
 

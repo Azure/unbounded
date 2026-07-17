@@ -167,15 +167,16 @@ OPENSSL_STAMP := $(OPENSSL_PREFIX)/.installed
 OPENSSL_URL ?= https://github.com/openssl/openssl/releases/download/openssl-$(OPENSSL_VERSION)/openssl-$(OPENSSL_VERSION).tar.gz
 
 # Environment prefix that points cargo's build.rs (pkg-config) and the
-# resulting binaries at the pinned libfabric and OpenSSL.
+# resulting binaries at the pinned libfabric and OpenSSL. libblkid is
+# provided by the build host's system package.
 CARGO_FABRIC_ENV = LIBFABRIC_PKG_CONFIG_PATH=$(LIBFABRIC_PKG_CONFIG_PATH) \
 	OPENSSL_PKG_CONFIG_PATH=$(OPENSSL_PKG_CONFIG_PATH) \
 	LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}
 
 # Release tarball packaging for unbounded-storage. ARCH defaults to the
 # host (normalized to Go-style names) and can be overridden for CI matrix
-# builds. The tarball bundles the binary plus the pinned libfabric shared
-# objects under a single top-level directory.
+# builds. The tarball bundles the binary plus its libfabric, OpenSSL, and
+# libblkid shared objects under a single top-level directory.
 STORAGE_TARBALL_ARCH ?= $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 STORAGE_DIST_DIR ?= dist
 STORAGE_TARBALL_STEM := unbounded-storage-linux-$(STORAGE_TARBALL_ARCH)
@@ -320,7 +321,7 @@ help: ## Show this help
 	@echo "  unbounded-storage | unbounded-storage-build  Build unbounded-storage (with/without test)"
 	@echo "  UNBOUNDED_STORAGE_PROFILING=1     Set on any build/push to compile in the SIGUSR1 CPU profiler"
 	@echo "  unbounded-storage-smoke          Run the end-to-end smoke test (uses sudo)"
-	@echo "  unbounded-storage-tarball        Package unbounded-storage + libfabric into a release tarball"
+	@echo "  unbounded-storage-tarball        Package unbounded-storage + native libraries into a release tarball"
 	@echo "  unbounded-storage-push           Push the unbounded-storage release tarball to Azure blob storage"
 	@echo "  unbounded-storage-test           Run cargo tests for unbounded-storage"
 	@echo "  unbounded-storage-check          Run cargo check for unbounded-storage"
@@ -747,7 +748,7 @@ unbounded-storage-smoke: unbounded-storage-build ## Run the end-to-end smoke tes
 		"LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		python3 hack/smoke-storage.py
 
-unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage + libfabric/OpenSSL into a release tarball ($(STORAGE_TARBALL))
+unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage + native libraries into a release tarball ($(STORAGE_TARBALL))
 	@echo "Assembling $(STORAGE_TARBALL)"
 	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)
 	@mkdir -p $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib
@@ -799,6 +800,21 @@ unbounded-storage-tarball: unbounded-storage-build ## Package unbounded-storage 
 		exit 1; \
 	fi; \
 	echo "  bundled libssl/libcrypto from $(OPENSSL_PREFIX)"
+	@libdir=$(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/lib; \
+	bin=$(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)/bin/unbounded-storage; \
+	blkid_path="$$(LD_LIBRARY_PATH=$(LIBFABRIC_PREFIX)/lib:$(OPENSSL_PREFIX)/lib \
+		ldd "$$bin" | while read -r soname arrow path rest; do \
+			case "$$soname" in libblkid.so.*) [ "$$arrow" = "=>" ] && echo "$$path"; break;; esac; \
+		done)"; \
+	if [ -z "$$blkid_path" ] || [ ! -f "$$blkid_path" ]; then \
+		echo "error: could not resolve libblkid.so from the unbounded-storage binary." >&2; \
+		exit 1; \
+	fi; \
+	blkid_soname="$$(basename "$$(readlink -f "$$blkid_path")")"; \
+	cp -L "$$blkid_path" "$$libdir/$$blkid_soname"; \
+	ln -sf "$$blkid_soname" "$$libdir/libblkid.so.1"; \
+	chmod 0644 "$$libdir/$$blkid_soname"; \
+	echo "  bundled libblkid.so.1"
 	tar -czf $(STORAGE_TARBALL) -C $(STORAGE_DIST_DIR) $(STORAGE_TARBALL_STEM)
 	cd $(STORAGE_DIST_DIR) && sha256sum $(STORAGE_TARBALL_STEM).tar.gz > $(STORAGE_TARBALL_STEM).tar.gz.sha256
 	@rm -rf $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM)

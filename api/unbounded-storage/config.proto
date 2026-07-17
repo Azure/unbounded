@@ -39,6 +39,11 @@ message Config {
   // finger selection uses weighted rendezvous while successor/predecessor
   // selection remains purely ring-nearest for routing correctness.
   optional TopologyWeighting topology_weighting = 11;
+
+  // Opt-in automatic allocation of completely unused whole block devices.
+  // Mutually exclusive with disks. An empty deny list considers every safe
+  // device; when none are eligible, fallback is used.
+  optional DiskDiscovery disk_discovery = 12;
 }
 
 // A precomputed routing table for a single node, produced by a
@@ -258,6 +263,16 @@ message FileDiskConfig {
 
   // Backing-file path; paths must be unique across all disks.
   string path = 2;
+}
+
+message DiskDiscovery {
+  // Exact /dev paths to exclude. Symlinks are resolved and matched by block
+  // device identity, so aliases of the same device are equivalent.
+  repeated string deny_paths = 1;
+
+  // File-backed disk used while no eligible block device exists. Defaults to
+  // /var/lib/unbounded-storage/cache.disk with a 2 GiB capacity.
+  FileDiskConfig fallback = 2;
 }
 
 message BackendSpec {

@@ -358,10 +358,11 @@ impl<T: ConfigApplyTarget> ConfigController<T> {
         // latest-known version advances even if the apply fails below.
         self.versions.record_known(new.config().version);
 
-        let diff = ConfigDiff::between(self.current.config(), new.config());
+        let diff = ConfigDiff::between_loaded(&self.current, &new);
 
         if !diff.any() {
             self.versions.record_applied(new.config().version);
+            self.current = new;
             return Ok(ApplyOutcome {
                 tier: ApplyTier::NoChange,
                 diff,
@@ -874,6 +875,23 @@ mod tests {
         // The startup version is pinned to the config realized at
         // construction and must not move when dynamic config advances.
         assert_eq!(ctrl.config_versions().startup(), 1);
+    }
+
+    #[test]
+    fn apply_no_change_retains_new_raw_policy() {
+        let base = loaded_with_peer(1);
+        let runtime = base.runtime().disks.clone();
+        let mut ctrl = ConfigController::new(RecordingTarget::default(), base);
+
+        let mut next = config_with_peer(2);
+        next.disk_discovery = Some(crate::config::DiskDiscovery::default());
+        let next = LoadedConfig::from_config(next)
+            .unwrap()
+            .with_runtime_disks(runtime);
+        let out = ctrl.apply(Arc::new(next)).unwrap();
+
+        assert_eq!(out.tier, ApplyTier::NoChange);
+        assert!(ctrl.current().config().disk_discovery.is_some());
     }
 
     #[test]

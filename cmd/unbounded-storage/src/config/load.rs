@@ -25,7 +25,7 @@ use std::path::Path;
 
 use prost::Message;
 
-use super::graph::{RuntimeGraph, project_runtime, route_snapshot, validate_binding_graph};
+use super::graph::{RuntimeDisk, RuntimeGraph, project_runtime, route_snapshot, validate_binding_graph};
 use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
 use crate::p2p::RouteTableSnapshot;
 
@@ -74,6 +74,11 @@ impl LoadedConfig {
 
     pub fn routes(&self) -> &RouteTableSnapshot {
         &self.routes
+    }
+
+    pub fn with_runtime_disks(mut self, disks: Vec<RuntimeDisk>) -> Self {
+        self.runtime.disks = disks;
+        self
     }
 
     pub fn into_config(self) -> Config {
@@ -154,6 +159,7 @@ pub enum ConfigError {
     ZeroFrontendMaxRequestsPerConnection(String),
     MissingPeerConfig(String),
     MissingDiskConfig,
+    InvalidDiskDiscovery(String),
     InvalidMetricsAddr {
         addr: String,
     },
@@ -298,6 +304,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "peer {peer_name:?}: config must set one peer transport")
             }
             ConfigError::MissingDiskConfig => write!(f, "disk config must set one disk type"),
+            ConfigError::InvalidDiskDiscovery(msg) => {
+                write!(f, "invalid disk discovery config: {msg}")
+            }
             ConfigError::InvalidMetricsAddr { addr } => {
                 write!(f, "metrics addr {addr:?} is not a valid socket address")
             }
@@ -419,6 +428,16 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if !seen_caches.insert(cache.name.as_str()) {
             return Err(ConfigError::DuplicateCacheName(cache.name.clone()));
         }
+    }
+
+    if cfg.disk_discovery.is_some() && !cfg.disks.is_empty() {
+        return Err(ConfigError::InvalidDiskDiscovery(
+            "disk_discovery and disks are mutually exclusive".to_string(),
+        ));
+    }
+
+    if let Some(discovery) = &cfg.disk_discovery {
+        validate_disk_discovery(discovery)?;
     }
 
     let mut seen_disk_paths: HashSet<&str> = HashSet::new();
@@ -671,6 +690,43 @@ fn validate_disks(disks: &[super::schema::DiskSpec]) -> Result<(), ConfigError> 
     Ok(())
 }
 
+fn validate_disk_discovery(
+    discovery: &super::schema::DiskDiscovery,
+) -> Result<(), ConfigError> {
+    let mut deny_paths = HashSet::new();
+    for path in &discovery.deny_paths {
+        let path = Path::new(path);
+        if !path.is_absolute() || !path.starts_with("/dev") {
+            return Err(ConfigError::InvalidDiskDiscovery(format!(
+                "deny path {:?} must be an absolute path under /dev",
+                path.display()
+            )));
+        }
+        if !deny_paths.insert(path) {
+            return Err(ConfigError::InvalidDiskDiscovery(format!(
+                "duplicate deny path {:?}",
+                path.display()
+            )));
+        }
+    }
+
+    let fallback = discovery.fallback.as_ref().ok_or_else(|| {
+        ConfigError::InvalidDiskDiscovery("fallback was not populated by defaults".to_string())
+    })?;
+    let path = Path::new(&fallback.path);
+    if !path.is_absolute() || path.starts_with("/dev") {
+        return Err(ConfigError::InvalidDiskDiscovery(format!(
+            "fallback path {:?} must be absolute and outside /dev",
+            path.display()
+        )));
+    }
+    let disk = super::schema::DiskSpec {
+        config: Some(disk_spec::Config::File(fallback.clone())),
+        ..Default::default()
+    };
+    validate_disks(&[disk])
+}
+
 fn validated_disk_path(disk: &super::schema::DiskSpec) -> Result<&str, ConfigError> {
     let Some(path) = disk.path() else {
         return Err(ConfigError::MissingDiskConfig);
@@ -872,6 +928,62 @@ path = "/dev/nvme0n1"
         match load(f.path()) {
             Err(ConfigError::DuplicateDiskPath(_)) => {}
             other => panic!("expected DuplicateDiskPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loads_disk_discovery_with_defaults() {
+        let f = write_cfg(
+            r#"
+[disk_discovery]
+deny_paths = ["/dev/sda", "/dev/disk/by-id/cache"]
+"#,
+        );
+        let loaded = load(f.path()).expect("discovery config should load");
+        let discovery = loaded.config().disk_discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.deny_paths,
+            ["/dev/sda", "/dev/disk/by-id/cache"]
+        );
+        let fallback = discovery.fallback.as_ref().unwrap();
+        assert_eq!(
+            fallback.path,
+            crate::config::schema::DEFAULT_DISCOVERY_FALLBACK_PATH
+        );
+        assert_eq!(
+            fallback.size,
+            Some(crate::config::schema::DEFAULT_DISCOVERY_FALLBACK_SIZE_BYTES)
+        );
+    }
+
+    #[test]
+    fn rejects_discovery_with_explicit_disks() {
+        let f = write_cfg(
+            r#"
+[disk_discovery]
+
+[[disks]]
+[disks.config.block]
+path = "/dev/nvme0n1"
+"#,
+        );
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::InvalidDiskDiscovery(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_discovery_paths_and_fallback_sizes() {
+        for config in [
+            "[disk_discovery]\ndeny_paths = [\"/tmp/sda\"]\n",
+            "[disk_discovery]\ndeny_paths = [\"/dev/sda\", \"/dev/sda\"]\n",
+            "[disk_discovery.fallback]\npath = \"/dev/cache.disk\"\nsize = 4096\n",
+            "[disk_discovery.fallback]\npath = \"relative.disk\"\nsize = 4096\n",
+            "[disk_discovery.fallback]\npath = \"/tmp/cache.disk\"\nsize = 4097\n",
+        ] {
+            let f = write_cfg(config);
+            assert!(load(f.path()).is_err(), "accepted {config:?}");
         }
     }
 

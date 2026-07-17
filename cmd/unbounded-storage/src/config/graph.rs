@@ -47,8 +47,30 @@ pub struct RuntimePeer {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeDisk {
+    pub spec: DiskSpec,
+    pub exclusive: bool,
+}
+
+impl RuntimeDisk {
+    pub fn explicit(spec: DiskSpec) -> Self {
+        Self {
+            spec,
+            exclusive: false,
+        }
+    }
+
+    pub fn discovered(spec: DiskSpec) -> Self {
+        Self {
+            spec,
+            exclusive: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeGraph {
-    pub disks: Vec<DiskSpec>,
+    pub disks: Vec<RuntimeDisk>,
     pub caches: HashMap<String, RuntimeCache>,
     pub mesh: RuntimeMesh,
     pub frontends: HashMap<String, ResolvedFrontendBinding>,
@@ -198,7 +220,12 @@ pub(crate) fn project_runtime(config: &Config) -> RuntimeGraph {
         .collect();
 
     RuntimeGraph {
-        disks: config.disks.clone(),
+        disks: config
+            .disks
+            .iter()
+            .cloned()
+            .map(RuntimeDisk::explicit)
+            .collect(),
         caches,
         mesh: RuntimeMesh {
             fingers_per_node: config.fingers_per_node.unwrap_or(100).max(1),
@@ -287,7 +314,7 @@ pub(crate) fn route_snapshot(graph: &RuntimeGraph) -> RouteTableSnapshot {
     }
 }
 
-pub fn runtime_disks(graph: &RuntimeGraph) -> Vec<DiskSpec> {
+pub fn runtime_disks(graph: &RuntimeGraph) -> Vec<RuntimeDisk> {
     graph.disks.clone()
 }
 

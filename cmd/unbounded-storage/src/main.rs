@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::task::Waker;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use clap::Parser;
 
@@ -34,6 +35,7 @@ use unbounded_storage::storage::StripeReq;
 use unbounded_storage::storage::disks::{
     CacheDirectorySet, ChainLocalStore, DiskRegistry, DiskReport, UringDiskTarget,
 };
+use unbounded_storage::storage::discovery::{DeviceWatcher, DiskScanner, resolve_loaded};
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
 use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
@@ -45,6 +47,7 @@ mod shard_layer;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/unbounded-storage/config.toml";
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+const DISCOVERY_RESCAN: Duration = Duration::from_secs(5);
 
 /// Stripe granularity used to build an inert origin backend on shards
 /// that have no configured backend. Such a backend is never exercised
@@ -226,6 +229,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let disk_scanner = DiskScanner::default();
+    let (loaded, discovery_error) = resolve_loaded(loaded, &disk_scanner, None);
+    if let Some(e) = discovery_error {
+        eprintln!("disk discovery: initial scan failed; using fallback: {e}");
+    }
 
     // Startup-fixed settings come from the config file's `[startup]`
     // section, not the dynamically reloaded sections. They size the
@@ -492,13 +500,37 @@ fn main() -> ExitCode {
     // controller until shutdown. Every apply is in place; an apply error
     // is logged and the process keeps serving on the last-good config.
     let mut exit_code = ExitCode::SUCCESS;
+    let device_watch = DeviceWatcher::new();
+    let (_device_watcher, device_rx) = match device_watch {
+        Ok((watcher, rx)) => (Some(watcher), Some(rx)),
+        Err(e) => {
+            eprintln!("disk discovery: /dev watch unavailable; periodic scans continue: {e}");
+            (None, None)
+        }
+    };
+    let mut next_discovery_scan = Instant::now() + DISCOVERY_RESCAN;
     match config::ConfigWatcher::new(config_path.clone()) {
         Ok((_watcher, update_rx)) => {
             while !SHUTDOWN.load(Ordering::Acquire) {
                 match update_rx.recv_timeout(SHUTDOWN_POLL) {
                     Ok(update) => {
                         let version = update.loaded.config().version;
-                        match controller.apply(update.loaded.clone()) {
+                        let retained = controller
+                            .current()
+                            .config()
+                            .disk_discovery
+                            .is_some()
+                            .then(|| controller.current().runtime().disks.as_slice());
+                        let (loaded, error) = resolve_loaded(
+                            Arc::try_unwrap(update.loaded)
+                                .unwrap_or_else(|loaded| LoadedConfig::from_config(loaded.config().clone()).expect("validated watched config")),
+                            &disk_scanner,
+                            retained,
+                        );
+                        if let Some(e) = error {
+                            eprintln!("disk discovery: config reload scan failed; retaining last good targets: {e}");
+                        }
+                        match controller.apply(Arc::new(loaded)) {
                             Ok(outcome) => eprintln!(
                                 "config: applied gen={} version={} tier={:?}",
                                 update.generation, version, outcome.tier
@@ -511,12 +543,32 @@ fn main() -> ExitCode {
                             }
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         if shutdown_on_watcher_error(mpsc::RecvTimeoutError::Disconnected) {
                             SHUTDOWN.store(true, Ordering::Relaxed);
                         }
                         break;
+                    }
+                }
+
+                let device_event = device_rx
+                    .as_ref()
+                    .is_some_and(|rx| rx.try_iter().count() > 0);
+                if controller.current().config().disk_discovery.is_some()
+                    && (device_event || Instant::now() >= next_discovery_scan)
+                {
+                    next_discovery_scan = Instant::now() + DISCOVERY_RESCAN;
+                    let retained = controller.current().runtime().disks.clone();
+                    let raw = controller.current().config().clone();
+                    let loaded = LoadedConfig::from_config(raw).expect("current config is valid");
+                    let (loaded, error) = resolve_loaded(loaded, &disk_scanner, Some(&retained));
+                    if let Some(e) = error {
+                        eprintln!("disk discovery: rescan failed; retaining last good targets: {e}");
+                        continue;
+                    }
+                    if let Err(e) = controller.apply(Arc::new(loaded)) {
+                        eprintln!("disk discovery: target reconciliation failed: {e}");
                     }
                 }
             }

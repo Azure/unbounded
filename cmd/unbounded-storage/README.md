@@ -155,6 +155,21 @@ numa        = 0                  # optional u16; biases the open onto a CPU on t
 # path = "/var/lib/unbounded-storage/disk0.img"
 # size = 1073741824              # required bytes for file-backed disks.
 
+# Or replace all [[disks]] entries with automatic discovery:
+# [disk_discovery]
+# deny_paths = ["/dev/disk/by-id/example"] # optional exact device identities.
+#
+# [disk_discovery.fallback]
+# path = "/var/lib/unbounded-storage/cache.disk"
+# size = 2147483648
+#
+# Discovery continuously selects only completely unused whole block devices.
+# Mounted, swap, partitioned, held, read-only, removable, virtual, and
+# signature-bearing devices are excluded. Discovered devices are opened with
+# O_EXCL and re-probed before use. If none are safe, the file fallback is used;
+# its parent directory must exist. Hotplug changes rehash cached stripes and are
+# not data preserving.
+
 [[frontends]]
 name = "http"
 source = "cache"                # backend or cache component name.

@@ -18,7 +18,8 @@ use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
     DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, LoadedConfig,
-    PeerSpec, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec, runtime_disks,
+    PeerSpec, RuntimeDisk, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec,
+    runtime_disks,
 };
 use unbounded_storage::runtime::ShardLoop;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
@@ -301,7 +302,7 @@ impl DiskTarget for RegistryTarget {
 
     fn open(
         &self,
-        _spec: &DiskSpec,
+        _disk: &RuntimeDisk,
         _pin: Option<DiskCpuSlot>,
     ) -> Result<(Self::Handle, PageChannel), DiskError> {
         let (channel, _rx) = PageChannel::new();

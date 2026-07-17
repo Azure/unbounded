@@ -560,6 +560,15 @@ Every reconcile publishes the realized open subset. A live open failure aborts
 config convergence so the same desired snapshot remains retryable; a startup
 open failure retires the parked shard layer. Same-path drift remains remove then
 add because provisioning and recovery cannot safely run beside the old engine.
+Automatic discovery adds runtime provenance to each projected disk. Discovered
+block devices are opened with `O_EXCL` and probed again with libblkid after the
+exclusive open but before engine recovery or writes. Explicitly configured disks
+retain the historical open behavior. A non-recursive `/dev` watch and a
+five-second safety rescan feed changed resolved target sets through the same
+config controller and registry reconciliation path. Global scan failures retain
+the last-good discovered set; an empty successful scan selects the configured
+file fallback. Changing the disk count changes stripe hashing and is therefore
+cache-destructive churn, not a data-preserving rebalance.
 
 **Stripe keys**: `stripe_key` derives the 32-byte content-addressed key;
 `METADATA_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
@@ -653,6 +662,13 @@ Sections (all optional, each falling back to defaults):
   `path` and required `size`), `queue_depth` (optional), `page_size_bytes`, and
   `skip_recovery_scan` (fields that disk reconcile treats as drift, see 7.10).
   Disk paths must be unique across the shared set.
+- `[disk_discovery]` - mutually exclusive with `[[disks]]`. An empty policy
+  considers every completely unused whole block device; `deny_paths` excludes
+  exact block identities after symlink resolution. The scanner rejects mounted,
+  swap, partitioned, held/slaved, read-only, removable, virtual, zero-sized, and
+  libblkid signature-bearing devices. `[disk_discovery.fallback]` supplies the
+  file path and size used when no device is eligible, defaulting to
+  `/var/lib/unbounded-storage/cache.disk` and 2 GiB.
 - `[[frontends]]` - `name`, `source` (a backend or cache component name), and
   one `config` table (`http`, `s3`, or `loadgen`).
 
@@ -693,7 +709,7 @@ required (kTLS receive on TLS 1.3).
 | Fabric progress | Fixed pool per fabric unit | Pinned across reserved workers, CQs distributed by NUMA |
 | Fabric RPC serve | Fixed worker pool per fabric unit | Bounded job queue, real-waker completion waits |
 | Storage engine | One pinned storage core per disk | Reached only via `PageChannel` mpsc |
-| Config watcher | `notify` thread + main loop | Reconciles peers/disks live |
+| Config/device watchers | `notify` threads + main loop | Reconciles config and safe discovered disks live; periodic scan covers mount/swap state |
 
 Cross-thread hand-offs are explicit: shard-to-disk via `PageChannel`, peer pulls
 via fabric RPC, and shard readiness/shutdown via channels and the `SHUTDOWN`

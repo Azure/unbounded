@@ -39,8 +39,9 @@ type renderState struct {
 // in the YAML (discovered peers win on name collision). TCP rings also override
 // startup.fabric.tcp.addr with the node's own routable bind. The default disk
 // set is populated from the self node's storage disk annotations, or from a
-// default file-backed disk when no valid annotation disks are present. Loadgen
-// annotations append synthetic frontends for this node.
+// default file-backed disk when no valid annotation disks are present. An
+// explicit disk_discovery policy suppresses that legacy overlay and is resolved
+// by the daemon. Loadgen annotations append synthetic frontends for this node.
 func RenderConfig(sourceDir string, state renderState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {

@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::schema::DiskSpec;
+use crate::config::RuntimeDisk;
 use crate::storage::PageChannel;
 use crate::topology::DiskCpuSlot;
 
@@ -59,7 +59,7 @@ pub trait DiskTarget: Send + Sync + 'static {
     /// CPU and NUMA node); implementations may ignore it.
     fn open(
         &self,
-        spec: &DiskSpec,
+        disk: &RuntimeDisk,
         pin: Option<DiskCpuSlot>,
     ) -> Result<(Self::Handle, PageChannel), DiskError>;
 }
@@ -106,7 +106,7 @@ pub struct DiskRegistry<T: DiskTarget> {
 
 struct OpenDiskEntry<H> {
     channel: PageChannel,
-    spec: DiskSpec,
+    disk: RuntimeDisk,
     placement: Option<DiskCpuSlot>,
     handle: H,
 }
@@ -142,12 +142,12 @@ impl<T: DiskTarget> DiskRegistry<T> {
     /// Partial failures during opens are reported after all desired paths
     /// have been attempted. Callers publish the realized open subset before
     /// deciding whether the desired configuration converged.
-    pub fn reconcile(&mut self, desired: &[DiskSpec]) -> DiskReport {
+    pub fn reconcile(&mut self, desired: &[RuntimeDisk]) -> DiskReport {
         let mut report = DiskReport::default();
 
-        let mut desired_paths: HashMap<&Path, &DiskSpec> = HashMap::new();
-        for spec in desired {
-            desired_paths.insert(Path::new(disk_path(spec)), spec);
+        let mut desired_paths: HashMap<&Path, &RuntimeDisk> = HashMap::new();
+        for disk in desired {
+            desired_paths.insert(Path::new(disk_path(disk)), disk);
         }
 
         let to_remove: Vec<PathBuf> = self
@@ -155,7 +155,7 @@ impl<T: DiskTarget> DiskRegistry<T> {
             .keys()
             .filter(|p| match desired_paths.get(p.as_path()) {
                 None => true,
-                Some(spec) => specs_drifted(self.entries.get(*p).map(|entry| &entry.spec), spec),
+                Some(disk) => disks_drifted(self.entries.get(*p).map(|entry| &entry.disk), disk),
             })
             .cloned()
             .collect();
@@ -181,20 +181,20 @@ impl<T: DiskTarget> DiskRegistry<T> {
             .collect();
         let assignment = assign_disk_cpus(desired, &self.disk_slots, &open_placements);
 
-        for spec in desired {
-            let path = disk_path(spec);
+        for disk in desired {
+            let path = disk_path(disk);
             if let Some(entry) = self.entries.get_mut(Path::new(path)) {
-                entry.spec = spec.clone();
+                entry.disk = disk.clone();
                 continue;
             }
             let pin = assignment.get(Path::new(path)).copied().flatten();
-            match self.target.open(spec, pin) {
+            match self.target.open(disk, pin) {
                 Ok((handle, channel)) => {
                     self.entries.insert(
                         PathBuf::from(path),
                         OpenDiskEntry {
                             channel,
-                            spec: spec.clone(),
+                            disk: disk.clone(),
                             placement: pin,
                             handle,
                         },
@@ -227,7 +227,7 @@ impl<T: DiskTarget> DiskRegistry<T> {
                     path.clone(),
                     entry.channel.clone(),
                     numa,
-                    !entry.spec.disable_page_cache,
+                    !entry.disk.spec.disable_page_cache,
                 )
             })
             .collect();
@@ -278,11 +278,11 @@ impl<T: DiskTarget> DiskRegistry<T> {
 /// freshly-opened disk off any CPU another open disk still holds, so
 /// the assignment stays disjoint and idempotent across churn.
 fn assign_disk_cpus(
-    desired: &[DiskSpec],
+    desired: &[RuntimeDisk],
     slots: &[DiskCpuSlot],
     open: &HashMap<PathBuf, Option<DiskCpuSlot>>,
 ) -> HashMap<PathBuf, Option<DiskCpuSlot>> {
-    let mut sorted: Vec<&DiskSpec> = desired.iter().collect();
+    let mut sorted: Vec<&RuntimeDisk> = desired.iter().collect();
     sorted.sort_by(|a, b| disk_path(a).cmp(disk_path(b)));
 
     let mut used = vec![false; slots.len()];
@@ -292,8 +292,8 @@ fn assign_disk_cpus(
     // anything new. Their pin is physically fixed for the lifetime of
     // the handle, so the fresh assignment must treat those slots as
     // reserved and echo the survivor's existing slot.
-    for spec in &sorted {
-        let path = disk_path(spec);
+    for disk in &sorted {
+        let path = disk_path(disk);
         if let Some(held) = open.get(Path::new(path)) {
             if let Some(slot) = held {
                 if let Some(i) = slots.iter().position(|s| s == slot) {
@@ -305,15 +305,15 @@ fn assign_disk_cpus(
     }
 
     // Hand the remaining free slots to the not-yet-open disks.
-    for spec in sorted {
-        let path = disk_path(spec);
+    for disk in sorted {
+        let path = disk_path(disk);
         if out.contains_key(Path::new(path)) {
             continue;
         }
         let local = slots
             .iter()
             .enumerate()
-            .find(|(i, s)| !used[*i] && s.numa == spec.numa().map(|n| n as u16));
+            .find(|(i, s)| !used[*i] && s.numa == disk.spec.numa().map(|n| n as u16));
         let pick = local.or_else(|| slots.iter().enumerate().find(|(i, _)| !used[*i]));
         match pick {
             Some((i, slot)) => {
@@ -329,24 +329,27 @@ fn assign_disk_cpus(
     out
 }
 
-fn specs_drifted(prev: Option<&DiskSpec>, next: &DiskSpec) -> bool {
+fn disks_drifted(prev: Option<&RuntimeDisk>, next: &RuntimeDisk) -> bool {
     match prev {
         None => false,
         Some(p) => {
-            p.config != next.config
-                || p.queue_depth != next.queue_depth
-                || p.page_size_bytes != next.page_size_bytes
-                || p.skip_recovery_scan != next.skip_recovery_scan
-                || p.force_format != next.force_format
-                || p.bypass_admission != next.bypass_admission
-                || p.bypass_index_read != next.bypass_index_read
-                || p.bypass_checksum != next.bypass_checksum
+            p.exclusive != next.exclusive
+                || p.spec.config != next.spec.config
+                || p.spec.queue_depth != next.spec.queue_depth
+                || p.spec.page_size_bytes != next.spec.page_size_bytes
+                || p.spec.skip_recovery_scan != next.spec.skip_recovery_scan
+                || p.spec.force_format != next.spec.force_format
+                || p.spec.bypass_admission != next.spec.bypass_admission
+                || p.spec.bypass_index_read != next.spec.bypass_index_read
+                || p.spec.bypass_checksum != next.spec.bypass_checksum
         }
     }
 }
 
-fn disk_path(spec: &DiskSpec) -> &str {
-    spec.path().expect("disk path is validated at config load")
+fn disk_path(disk: &RuntimeDisk) -> &str {
+    disk.spec
+        .path()
+        .expect("disk path is validated at config load")
 }
 
 #[cfg(test)]
@@ -402,12 +405,12 @@ mod tests {
 
         fn open(
             &self,
-            spec: &DiskSpec,
+            disk: &RuntimeDisk,
             _pin: Option<DiskCpuSlot>,
         ) -> Result<(MockHandle, PageChannel), DiskError> {
             let mut s = self.state.lock().unwrap();
             s.open_calls += 1;
-            let path = disk_path(spec);
+            let path = disk_path(disk);
             if s.fail_on.contains(Path::new(path)) {
                 return Err(DiskError::Open("injected".into()));
             }
@@ -423,8 +426,8 @@ mod tests {
         }
     }
 
-    fn spec(path: &str, qd: Option<u32>) -> DiskSpec {
-        DiskSpec {
+    fn spec(path: &str, qd: Option<u32>) -> RuntimeDisk {
+        RuntimeDisk::explicit(crate::config::schema::DiskSpec {
             queue_depth: qd,
             page_size_bytes: None,
             skip_recovery_scan: false,
@@ -437,11 +440,11 @@ mod tests {
                 numa: None,
                 path: path.to_string(),
             })),
-        }
+        })
     }
 
-    fn set_numa(spec: &mut DiskSpec, numa: u32) {
-        let Some(disk_spec::Config::Block(cfg)) = spec.config.as_mut() else {
+    fn set_numa(disk: &mut RuntimeDisk, numa: u32) {
+        let Some(disk_spec::Config::Block(cfg)) = disk.spec.config.as_mut() else {
             panic!("expected block disk config")
         };
         cfg.numa = Some(numa);
@@ -498,13 +501,13 @@ mod tests {
         let calls_after_first = state.lock().unwrap().open_calls;
 
         let mut next = spec("/a", None);
-        next.disable_page_cache = true;
+        next.spec.disable_page_cache = true;
         let report = reg.reconcile(&[next]);
 
         assert_eq!(report.added, 0);
         assert_eq!(report.removed, 0);
         assert_eq!(state.lock().unwrap().open_calls, calls_after_first);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.disable_page_cache);
+        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.disable_page_cache);
         assert!(!reg.channels_snapshot()[0].3);
     }
 
@@ -516,7 +519,7 @@ mod tests {
         let report = reg.reconcile(&[spec("/a", Some(32))]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.queue_depth, Some(32));
+        assert_eq!(reg.entries[&PathBuf::from("/a")].disk.spec.queue_depth, Some(32));
     }
 
     #[test]
@@ -567,7 +570,7 @@ mod tests {
         let retried = reg.reconcile(&desired);
         assert_eq!(retried.added, 1);
         assert!(retried.failures.is_empty());
-        assert_eq!(reg.entries[&PathBuf::from("/a")].spec, desired[0]);
+        assert_eq!(reg.entries[&PathBuf::from("/a")].disk, desired[0]);
     }
 
     #[test]
@@ -587,7 +590,7 @@ mod tests {
         let retried = reg.reconcile(&desired);
         assert_eq!(retried.added, 1);
         assert!(retried.failures.is_empty());
-        assert_eq!(reg.entries[&PathBuf::from("/a")].spec.queue_depth, Some(32));
+        assert_eq!(reg.entries[&PathBuf::from("/a")].disk.spec.queue_depth, Some(32));
     }
 
     /// Records the per-disk `(path, cpu_hint)` decisions so tests can
@@ -600,13 +603,13 @@ mod tests {
         type Handle = RecorderHandle;
         fn open(
             &self,
-            spec: &DiskSpec,
+            disk: &RuntimeDisk,
             pin: Option<DiskCpuSlot>,
         ) -> Result<(RecorderHandle, PageChannel), DiskError> {
             self.hints
                 .lock()
                 .unwrap()
-                .push((PathBuf::from(disk_path(spec)), pin.map(|s| s.cpu as usize)));
+                .push((PathBuf::from(disk_path(disk)), pin.map(|s| s.cpu as usize)));
             Ok((RecorderHandle, dummy_channel()))
         }
     }
@@ -777,12 +780,12 @@ mod tests {
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
-        next.page_size_bytes = Some(4096);
+        next.spec.page_size_bytes = Some(4096);
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
         assert_eq!(
-            reg.entries[&PathBuf::from("/a")].spec.page_size_bytes,
+            reg.entries[&PathBuf::from("/a")].disk.spec.page_size_bytes,
             Some(4096)
         );
     }
@@ -792,7 +795,7 @@ mod tests {
     /// `prev == None` contract (a first-time open never reports drift).
     #[test]
     fn size_drift_is_detected() {
-        let file_spec = |size: u64| DiskSpec {
+        let file_spec = |size: u64| RuntimeDisk::explicit(crate::config::schema::DiskSpec {
             queue_depth: None,
             page_size_bytes: None,
             skip_recovery_scan: false,
@@ -805,16 +808,16 @@ mod tests {
                 size: Some(size),
                 path: "/a".to_string(),
             })),
-        };
+        });
         let a = file_spec(64 * 4096);
         let b = file_spec(128 * 4096);
 
         // Differ only in size -> drifted.
-        assert!(specs_drifted(Some(&a), &b));
+        assert!(disks_drifted(Some(&a), &b));
         // Identical -> not drifted.
-        assert!(!specs_drifted(Some(&a), &a.clone()));
+        assert!(!disks_drifted(Some(&a), &a.clone()));
         // No previous applied spec -> never drifted.
-        assert!(!specs_drifted(None, &a));
+        assert!(!disks_drifted(None, &a));
     }
 
     #[test]
@@ -823,11 +826,11 @@ mod tests {
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
-        next.skip_recovery_scan = true;
+        next.spec.skip_recovery_scan = true;
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.skip_recovery_scan);
+        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.skip_recovery_scan);
     }
 
     #[test]
@@ -836,11 +839,11 @@ mod tests {
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
-        next.force_format = true;
+        next.spec.force_format = true;
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.force_format);
+        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.force_format);
     }
 
     #[test]
@@ -849,11 +852,11 @@ mod tests {
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
-        next.bypass_admission = true;
+        next.spec.bypass_admission = true;
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_admission);
+        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.bypass_admission);
     }
 
     #[test]
@@ -862,11 +865,11 @@ mod tests {
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
-        next.bypass_index_read = true;
+        next.spec.bypass_index_read = true;
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_index_read);
+        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.bypass_index_read);
     }
 
     #[test]
@@ -875,11 +878,11 @@ mod tests {
         let mut reg = DiskRegistry::new(target, vec![]);
         reg.reconcile(&[spec("/a", None)]);
         let mut next = spec("/a", None);
-        next.bypass_checksum = true;
+        next.spec.bypass_checksum = true;
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].spec.bypass_checksum);
+        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.bypass_checksum);
     }
 
     #[test]
