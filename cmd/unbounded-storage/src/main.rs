@@ -1636,11 +1636,7 @@ fn load_config(path: &Path, explicit: bool) -> Result<LoadedConfig, String> {
     match LoadedConfig::load(path) {
         Ok(c) => {
             if path.extension().and_then(|e| e.to_str()) == Some("binpb") {
-                eprintln!(
-                    "config: loaded {} (binpb):\n{:#?}",
-                    path.display(),
-                    c.config()
-                );
+                eprintln!("config: loaded {} (binpb)", path.display());
             }
             Ok(c)
         }
@@ -2027,10 +2023,10 @@ mod tests {
                     url: "https://example.com".to_string(),
                     stripe_size_bytes: Some(4 * 1024 * 1024),
                     http_concurrency: Some(64),
-                    ca_cert_path: None,
+                    ca_cert: None,
                     insecure_skip_verify: false,
-                    client_cert_path: None,
-                    client_key_path: None,
+                    client_cert: None,
+                    client_key: None,
                 },
             )),
         }

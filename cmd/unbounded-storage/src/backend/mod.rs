@@ -26,6 +26,9 @@ mod registry;
 mod s3;
 
 #[cfg(target_os = "linux")]
+mod s3_sigv4;
+
+#[cfg(target_os = "linux")]
 mod azure;
 
 #[cfg(target_os = "linux")]
@@ -51,6 +54,9 @@ pub use registry::{BackendRegistry, RegistryFetchStream};
 
 #[cfg(target_os = "linux")]
 pub use s3::S3Backend;
+
+#[cfg(target_os = "linux")]
+pub(crate) use s3_sigv4::S3Auth;
 
 #[cfg(target_os = "linux")]
 pub use azure::AzureBackend;

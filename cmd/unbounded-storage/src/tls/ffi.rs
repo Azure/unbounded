@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Hand-written OpenSSL FFI declarations plus shim externs for the
-//! macro-only entry points compiled in `src/tls/shim.c`.
+//! Hand-written OpenSSL FFI declarations plus narrow shim externs for
+//! macro-only entry points and in-memory PEM loading.
 //!
 //! The surface is deliberately minimal: enough to drive a client TLS
 //! handshake over a caller-owned socket fd and to enable kernel TLS so
@@ -44,16 +44,6 @@ unsafe extern "C" {
         ca_file: *const c_char,
         ca_path: *const c_char,
     ) -> c_int;
-    pub fn SSL_CTX_use_certificate_file(
-        ctx: *mut SSL_CTX,
-        file: *const c_char,
-        file_type: c_int,
-    ) -> c_int;
-    pub fn SSL_CTX_use_PrivateKey_file(
-        ctx: *mut SSL_CTX,
-        file: *const c_char,
-        file_type: c_int,
-    ) -> c_int;
     pub fn SSL_CTX_check_private_key(ctx: *mut SSL_CTX) -> c_int;
     pub fn SSL_CTX_set_verify(
         ctx: *mut SSL_CTX,
@@ -77,10 +67,16 @@ unsafe extern "C" {
     // Macro-only entry points exported via src/tls/shim.c.
     pub fn ub_ssl_ctx_set_options(ctx: *mut SSL_CTX, op: c_ulong) -> c_ulong;
     pub fn ub_ssl_ctx_set_min_proto_version(ctx: *mut SSL_CTX, version: c_int) -> c_int;
+    pub fn ub_ssl_ctx_load_ca_pem(ctx: *mut SSL_CTX, pem: *const u8, len: usize) -> c_int;
+    pub fn ub_ssl_ctx_use_certificate_chain_pem(
+        ctx: *mut SSL_CTX,
+        pem: *const u8,
+        len: usize,
+    ) -> c_int;
+    pub fn ub_ssl_ctx_use_private_key_pem(ctx: *mut SSL_CTX, pem: *const u8, len: usize) -> c_int;
     pub fn ub_ssl_set_tlsext_host_name(ssl: *mut SSL, name: *const c_char) -> c_long;
     pub fn ub_ssl_ktls_send_enabled(ssl: *mut SSL) -> c_int;
     pub fn ub_ssl_ktls_recv_enabled(ssl: *mut SSL) -> c_int;
     pub fn ub_ssl_op_enable_ktls() -> c_ulong;
-    pub fn ub_ssl_filetype_pem() -> c_int;
     pub fn ub_tls1_2_version() -> c_int;
 }

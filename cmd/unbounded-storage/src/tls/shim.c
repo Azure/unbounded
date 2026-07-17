@@ -12,15 +12,58 @@
  * symbols, so Rust FFI cannot call them directly. This shim is the only
  * piece of C the tls module ships; everything else is Rust.
  *
- * The shim also hides a couple of OpenSSL constants
- * (`SSL_OP_ENABLE_KTLS`, `SSL_FILETYPE_PEM`, `TLS1_2_VERSION`) behind
- * plain functions so the Rust side never freezes a numeric value against
- * a moving header.
+ * The shim also owns PEM object parsing so Rust only passes borrowed byte
+ * slices and never handles OpenSSL X509 or EVP_PKEY ownership directly.
  */
 
+#include <limits.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
+#include <openssl/x509err.h>
+#include <openssl/x509_vfy.h>
+
+static BIO *ub_bio_from_bytes(const unsigned char *data, size_t len) {
+    if (data == NULL || len == 0 || len > INT_MAX) {
+        return NULL;
+    }
+    return BIO_new_mem_buf(data, (int)len);
+}
+
+static int ub_bio_remaining_is_whitespace(BIO *bio, long position) {
+    unsigned char buffer[256];
+    int count;
+    int i;
+
+    if (position < 0 || BIO_seek(bio, position) < 0) {
+        return 0;
+    }
+    while ((count = BIO_read(bio, buffer, sizeof(buffer))) > 0) {
+        for (i = 0; i < count; i++) {
+            if (buffer[i] != ' ' && buffer[i] != '\t' &&
+                buffer[i] != '\r' && buffer[i] != '\n') {
+                return 0;
+            }
+        }
+    }
+    return count == 0;
+}
+
+static int ub_pem_finished(BIO *bio, long position, unsigned long error,
+                           int parsed) {
+    return parsed > 0 && ERR_GET_LIB(error) == ERR_LIB_PEM &&
+           ERR_GET_REASON(error) == PEM_R_NO_START_LINE &&
+           ub_bio_remaining_is_whitespace(bio, position);
+}
+
+static int ub_no_password(char *buf, int size, int rwflag, void *userdata) {
+    (void)buf;
+    (void)size;
+    (void)rwflag;
+    (void)userdata;
+    return 0;
+}
 
 /* SSL_CTX_set_options is a macro over SSL_CTX_ctrl. */
 unsigned long ub_ssl_ctx_set_options(SSL_CTX *ctx, unsigned long op) {
@@ -30,6 +73,124 @@ unsigned long ub_ssl_ctx_set_options(SSL_CTX *ctx, unsigned long op) {
 /* SSL_CTX_set_min_proto_version is a macro over SSL_CTX_ctrl. */
 int ub_ssl_ctx_set_min_proto_version(SSL_CTX *ctx, int version) {
     return (int)SSL_CTX_set_min_proto_version(ctx, version);
+}
+
+int ub_ssl_ctx_load_ca_pem(SSL_CTX *ctx, const unsigned char *pem, size_t len) {
+    BIO *bio = NULL;
+    X509_STORE *store;
+    X509 *cert = NULL;
+    long position;
+    int parsed = 0;
+    int ok = 0;
+
+    ERR_clear_error();
+    if (ctx == NULL || (bio = ub_bio_from_bytes(pem, len)) == NULL) {
+        goto out;
+    }
+    store = SSL_CTX_get_cert_store(ctx);
+    if (store == NULL) {
+        goto out;
+    }
+
+    for (;;) {
+        position = BIO_tell(bio);
+        cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        if (cert == NULL) {
+            break;
+        }
+        if (X509_STORE_add_cert(store, cert) != 1) {
+            unsigned long error = ERR_peek_last_error();
+            if (ERR_GET_LIB(error) != ERR_LIB_X509 ||
+                ERR_GET_REASON(error) != X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+                goto out;
+            }
+            ERR_clear_error();
+        }
+        X509_free(cert);
+        cert = NULL;
+        parsed++;
+    }
+
+    if (ub_pem_finished(bio, position, ERR_peek_last_error(), parsed)) {
+        ERR_clear_error();
+        ok = 1;
+    }
+
+out:
+    X509_free(cert);
+    BIO_free(bio);
+    return ok;
+}
+
+int ub_ssl_ctx_use_certificate_chain_pem(SSL_CTX *ctx,
+                                         const unsigned char *pem,
+                                         size_t len) {
+    BIO *bio = NULL;
+    X509 *cert = NULL;
+    long position;
+    int parsed = 0;
+    int ok = 0;
+
+    ERR_clear_error();
+    if (ctx == NULL || (bio = ub_bio_from_bytes(pem, len)) == NULL) {
+        goto out;
+    }
+
+    cert = PEM_read_bio_X509_AUX(bio, NULL, NULL, NULL);
+    if (cert == NULL || SSL_CTX_use_certificate(ctx, cert) != 1 ||
+        SSL_CTX_clear_chain_certs(ctx) != 1) {
+        goto out;
+    }
+    X509_free(cert);
+    cert = NULL;
+    parsed = 1;
+
+    for (;;) {
+        position = BIO_tell(bio);
+        cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        if (cert == NULL) {
+            break;
+        }
+        if (SSL_CTX_add1_chain_cert(ctx, cert) != 1) {
+            goto out;
+        }
+        X509_free(cert);
+        cert = NULL;
+        parsed++;
+    }
+
+    if (ub_pem_finished(bio, position, ERR_peek_last_error(), parsed)) {
+        ERR_clear_error();
+        ok = 1;
+    }
+
+out:
+    X509_free(cert);
+    BIO_free(bio);
+    return ok;
+}
+
+int ub_ssl_ctx_use_private_key_pem(SSL_CTX *ctx,
+                                   const unsigned char *pem,
+                                   size_t len) {
+    BIO *bio = NULL;
+    EVP_PKEY *key = NULL;
+    int ok = 0;
+
+    ERR_clear_error();
+    if (ctx == NULL || (bio = ub_bio_from_bytes(pem, len)) == NULL) {
+        goto out;
+    }
+    key = PEM_read_bio_PrivateKey(bio, NULL, ub_no_password, NULL);
+    if (key != NULL && SSL_CTX_use_PrivateKey(ctx, key) == 1 &&
+        ub_bio_remaining_is_whitespace(bio, BIO_tell(bio))) {
+        ok = 1;
+    }
+
+out:
+    EVP_PKEY_free(key);
+    BIO_free(bio);
+    return ok;
 }
 
 /* SSL_set_tlsext_host_name is a macro over SSL_ctrl; sets the SNI name. */
@@ -57,7 +218,5 @@ int ub_ssl_ktls_recv_enabled(SSL *ssl) {
 
 /* Constants that live in headers; surfaced as functions for Rust. */
 unsigned long ub_ssl_op_enable_ktls(void) { return SSL_OP_ENABLE_KTLS; }
-
-int ub_ssl_filetype_pem(void) { return SSL_FILETYPE_PEM; }
 
 int ub_tls1_2_version(void) { return TLS1_2_VERSION; }

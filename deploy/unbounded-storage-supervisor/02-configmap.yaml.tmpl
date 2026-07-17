@@ -37,6 +37,11 @@ metadata:
 # entries like /dev/sdb?name=sdb&size_bytes=1234; discovery does not allocate
 # disks. The shared disk set is available to every cache; the supervisor does not
 # invent caches, backends, or frontends.
+#
+# Backend ca_cert, client_cert, and client_key fields contain literal PEM, not
+# filesystem paths. Static S3 access_key_id, secret_access_key, and session_token
+# values are also stored directly in this ConfigMap and in the rendered host
+# config. Restrict access to both when origin credentials are configured.
 data:
   config.yaml: |
     # Operator-assigned config version (opaque counter; 0 means unversioned).

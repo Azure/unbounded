@@ -950,10 +950,10 @@ fn backend_specs(generation: usize, count: u8) -> Vec<BackendSpec> {
                 url: format!("https://origin-{generation}-{i}.example.com"),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
-                ca_cert_path: None,
+                ca_cert: None,
                 insecure_skip_verify: false,
-                client_cert_path: None,
-                client_key_path: None,
+                client_cert: None,
+                client_key: None,
             })),
         })
         .collect()

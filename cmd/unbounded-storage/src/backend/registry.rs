@@ -35,7 +35,7 @@ use crate::tls::{TlsConfig, TlsContext};
 
 use super::url::parse_endpoint;
 use super::{
-    AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginStream, S3Backend,
+    AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginStream, S3Auth, S3Backend,
 };
 
 /// The build context a registry needs to (re)construct an
@@ -113,10 +113,10 @@ impl BuildCtx {
             Some(backend_spec::Config::Http(cfg)) => {
                 let endpoint = build_origin_endpoint(
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
                 let origin = HttpBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Http(HttpBackend::new(
@@ -135,13 +135,14 @@ impl BuildCtx {
             Some(backend_spec::Config::S3(cfg)) => {
                 let endpoint = build_origin_endpoint(
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
+                let auth = build_s3_auth(cfg)?;
                 let origin = S3Backend::resolve_origin(&endpoint.authority)?;
-                Ok(OriginBackend::S3(S3Backend::new(
+                Ok(OriginBackend::S3(S3Backend::new_with_auth(
                     self.handle.clone(),
                     origin,
                     endpoint.host,
@@ -152,15 +153,16 @@ impl BuildCtx {
                     self.page_size,
                     self.backing_base,
                     cfg.http_concurrency.expect("http_concurrency defaulted") as usize,
+                    auth,
                 )))
             }
             Some(backend_spec::Config::Azure(cfg)) => {
                 let endpoint = build_origin_endpoint(
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
                 let origin = AzureBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Azure(AzureBackend::new(
@@ -200,20 +202,20 @@ struct OriginEndpoint {
 
 fn build_origin_endpoint(
     url: &str,
-    ca_cert_path: &Option<String>,
+    ca_cert: &Option<String>,
     insecure_skip_verify: bool,
-    client_cert_path: &Option<String>,
-    client_key_path: &Option<String>,
+    client_cert: &Option<String>,
+    client_key: &Option<String>,
 ) -> io::Result<OriginEndpoint> {
     let url = parse_endpoint(url)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let authority = url.authority();
     let tls = if url.scheme.is_tls() {
         let cfg = TlsConfig {
-            ca_cert_path: ca_cert_path.clone(),
+            ca_cert: ca_cert.clone(),
             insecure_skip_verify,
-            client_cert_path: client_cert_path.clone(),
-            client_key_path: client_key_path.clone(),
+            client_cert: client_cert.clone(),
+            client_key: client_key.clone(),
         };
         let ctx = TlsContext::new(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
         Some(Rc::new(ctx))
@@ -227,6 +229,26 @@ fn build_origin_endpoint(
         sni_host: url.host,
         tls,
     })
+}
+
+fn build_s3_auth(cfg: &crate::config::S3BackendConfig) -> io::Result<Option<S3Auth>> {
+    match (
+        cfg.access_key_id.as_deref(),
+        cfg.secret_access_key.as_deref(),
+        cfg.region.as_deref(),
+    ) {
+        (None, None, None) if cfg.session_token.is_none() => Ok(None),
+        (Some(access_key_id), Some(secret_access_key), Some(region)) => Ok(Some(S3Auth::new(
+            access_key_id,
+            secret_access_key,
+            region,
+            cfg.session_token.clone(),
+        ))),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 authentication requires region, access_key_id, and secret_access_key",
+        )),
+    }
 }
 
 impl Backend for BackendRegistry {
@@ -333,10 +355,10 @@ mod tests {
                 url: url.to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
-                ca_cert_path: None,
+                ca_cert: None,
                 insecure_skip_verify: false,
-                client_cert_path: None,
-                client_key_path: None,
+                client_cert: None,
+                client_key: None,
             })),
         }
     }
