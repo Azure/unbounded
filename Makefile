@@ -55,7 +55,16 @@ AGENT_CMD=./cmd/agent
 
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
-MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION_TAG)
+# Fall back to the default even when the variable is set to an empty string, not
+# just when unset. GNU make's `?=` treats a set-but-empty environment variable as
+# already defined; a Docker `ARG MACHINA_IMAGE=` exported into the operator image
+# build as "" therefore defeated `?=` and blanked the image baked into the
+# operator's embedded machina manifests. `override` also neutralizes an empty
+# value passed on the command line; `=` keeps CONTAINER_REGISTRY/VERSION_TAG
+# expansion deferred (VERSION_TAG is defined later in this file).
+ifeq ($(strip $(MACHINA_IMAGE)),)
+override MACHINA_IMAGE = $(CONTAINER_REGISTRY)/machina:$(VERSION_TAG)
+endif
 
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
@@ -214,8 +223,14 @@ KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS)
 
 # --- Net (unbounded-net) configuration -------------------------------------
 # Container images for the net controller and node agent.
-NET_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION_TAG)
-NET_NODE_IMAGE       ?= $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION_TAG)
+# See the MACHINA_IMAGE note above: default when empty-or-unset so an empty
+# Docker ARG cannot blank the images baked into the embedded net manifests.
+ifeq ($(strip $(NET_CONTROLLER_IMAGE)),)
+override NET_CONTROLLER_IMAGE = $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION_TAG)
+endif
+ifeq ($(strip $(NET_NODE_IMAGE)),)
+override NET_NODE_IMAGE = $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION_TAG)
+endif
 
 # CNI plugins version baked into the net-node image. Keep in sync with the
 # defaults in images/net-{node,controller}/Dockerfile and the workflow envs.
@@ -593,6 +608,9 @@ metalman-build: ## Build the metalman binary (no lint/test)
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
 unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build the unbounded-operator binary (no lint/test)
+	@for v in MACHINA_IMAGE=$(MACHINA_IMAGE) NET_CONTROLLER_IMAGE=$(NET_CONTROLLER_IMAGE) NET_NODE_IMAGE=$(NET_NODE_IMAGE); do \
+	  case "$$v" in *=) echo "error: $${v%=} is empty; the operator's embedded net/machina manifests would bake an empty image:" >&2; exit 1;; esac; \
+	done
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
