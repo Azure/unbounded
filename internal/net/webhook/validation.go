@@ -337,7 +337,7 @@ func validateNamesList(names []string, field string) error {
 	return nil
 }
 
-func validateSiteSpec(site unboundednetv1alpha1.Site) error {
+func validateSiteSpec(site unboundedv1alpha3.Site) error {
 	for _, cidr := range site.Spec.NodeCidrs {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("invalid spec.nodeCidrs CIDR %q: %w", cidr, err)
@@ -534,7 +534,7 @@ func resolveMaskSizes(blockSizes *unboundednetv1alpha1.NodeBlockSizes, ipv4Pools
 	return ipv4Mask, ipv6Mask
 }
 
-func validateNodeCIDRsNoOverlap(sites []unboundednetv1alpha1.Site) error {
+func validateNodeCIDRsNoOverlap(sites []unboundedv1alpha3.Site) error {
 	entries, err := collectNodeCIDRs(sites)
 	if err != nil {
 		return err
@@ -543,7 +543,7 @@ func validateNodeCIDRsNoOverlap(sites []unboundednetv1alpha1.Site) error {
 	return validateCIDROverlap(entries, true, "nodeCIDR")
 }
 
-func validatePodCIDRsNoOverlap(sites []unboundednetv1alpha1.Site) error {
+func validatePodCIDRsNoOverlap(sites []unboundedv1alpha3.Site) error {
 	entries, err := collectPodCIDRs(sites)
 	if err != nil {
 		return err
@@ -559,7 +559,7 @@ type cidrEntry struct {
 	cidrStr  string
 }
 
-func collectNodeCIDRs(sites []unboundednetv1alpha1.Site) ([]cidrEntry, error) {
+func collectNodeCIDRs(sites []unboundedv1alpha3.Site) ([]cidrEntry, error) {
 	var entries []cidrEntry
 
 	for _, site := range sites {
@@ -581,7 +581,7 @@ func collectNodeCIDRs(sites []unboundednetv1alpha1.Site) ([]cidrEntry, error) {
 	return entries, nil
 }
 
-func collectPodCIDRs(sites []unboundednetv1alpha1.Site) ([]cidrEntry, error) {
+func collectPodCIDRs(sites []unboundedv1alpha3.Site) ([]cidrEntry, error) {
 	var entries []cidrEntry
 
 	for _, site := range sites {
@@ -649,9 +649,9 @@ func assignmentEnabled(enabled *bool) bool {
 	return *enabled
 }
 
-func decodeSiteFromRequest(req *admissionv1.AdmissionRequest) (unboundednetv1alpha1.Site, error) {
+func decodeSiteFromRequest(req *admissionv1.AdmissionRequest) (unboundedv1alpha3.Site, error) {
 	var (
-		site unboundednetv1alpha1.Site
+		site unboundedv1alpha3.Site
 		raw  []byte
 	)
 
@@ -760,12 +760,12 @@ func decodeGatewayPoolPeeringFromRequest(req *admissionv1.AdmissionRequest) (unb
 	return peering, nil
 }
 
-func mergeSiteList(existing []unboundednetv1alpha1.Site, site unboundednetv1alpha1.Site, op admissionv1.Operation) []unboundednetv1alpha1.Site {
+func mergeSiteList(existing []unboundedv1alpha3.Site, site unboundedv1alpha3.Site, op admissionv1.Operation) []unboundedv1alpha3.Site {
 	if op == admissionv1.Delete {
 		return existing
 	}
 
-	merged := make([]unboundednetv1alpha1.Site, 0, len(existing)+1)
+	merged := make([]unboundedv1alpha3.Site, 0, len(existing)+1)
 	found := false
 
 	for _, item := range existing {
@@ -786,7 +786,7 @@ func mergeSiteList(existing []unboundednetv1alpha1.Site, site unboundednetv1alph
 	return merged
 }
 
-func validateSiteLabelsUnique(sites []unboundednetv1alpha1.Site) error {
+func validateSiteLabelsUnique(sites []unboundedv1alpha3.Site) error {
 	seen := make(map[string]string, len(sites))
 
 	for _, site := range sites {
@@ -840,7 +840,7 @@ func cidrsOverlap(a, b string) bool {
 
 // validateIntraSiteCIDROverlap checks for overlapping CIDRs within a single
 // site's NonMasqueradeCIDRs and LocalCIDRs fields.
-func validateIntraSiteCIDROverlap(site unboundednetv1alpha1.Site) error {
+func validateIntraSiteCIDROverlap(site unboundedv1alpha3.Site) error {
 	// Check within NonMasqueradeCIDRs
 	for i := 0; i < len(site.Spec.NonMasqueradeCIDRs); i++ {
 		for j := i + 1; j < len(site.Spec.NonMasqueradeCIDRs); j++ {

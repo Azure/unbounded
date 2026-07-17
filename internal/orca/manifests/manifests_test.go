@@ -146,7 +146,7 @@ func TestIntegrationGarageManifestsRender(t *testing.T) {
 // hack/orca/integration Garage manifest.
 func integrationGarageData() map[string]string {
 	return map[string]string{
-		"Namespace":          "unbounded-kube",
+		"Namespace":          "unbounded-system",
 		"CachestoreRegion":   "us-east-1",
 		"GarageStorage":      "100Gi",
 		"GarageStorageClass": "managed-csi",

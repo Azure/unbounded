@@ -75,9 +75,9 @@ chmod +x aks-quickstart.sh
     --remote-pod-cidr 10.245.0.0/16
 ```
 
-> **This takes about 8 minutes.** The script creates an AKS cluster, adds a
-> gateway node pool, and runs `kubectl unbounded site init` to install the
-> networking stack.
+> The script creates an AKS cluster, adds a gateway node pool, and runs
+> `kubectl unbounded site init` to bootstrap the operator and request the
+> networking stack through the cluster Site.
 
 | Flag | Description |
 |------|-------------|
@@ -168,11 +168,11 @@ Deploy a test pod on the remote node and verify cross-site connectivity:
 ```bash
 # Run a pod on the remote node
 kubectl run test-remote --image=busybox --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"remote"}}}' \
+    --overrides='{"spec":{"nodeSelector":{"unbounded-cloud.io/site":"remote"}}}' \
     -- sleep 3600
 
 # Get a cluster node's internal IP
-CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-cloud.io/site=cluster' \
+CLUSTER_NODE_IP=$(kubectl get nodes -l 'unbounded-cloud.io/site=cluster' \
     -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
 # Ping a cluster node from the remote pod (cross-site, over WireGuard)
@@ -180,7 +180,7 @@ kubectl exec test-remote -- ping -c 3 "$CLUSTER_NODE_IP"
 
 # Run a pod on a cluster node and curl it from the remote pod
 kubectl run test-cluster --image=nginx --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"cluster"}}}'
+    --overrides='{"spec":{"nodeSelector":{"unbounded-cloud.io/site":"cluster"}}}'
 kubectl wait --for=condition=ready pod/test-cluster --timeout=60s
 CLUSTER_POD_IP=$(kubectl get pod test-cluster -o jsonpath='{.status.podIP}')
 kubectl exec test-remote -- wget -qO- "http://$CLUSTER_POD_IP"

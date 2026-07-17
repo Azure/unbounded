@@ -25,6 +25,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
@@ -47,8 +48,8 @@ var gatewayPoolPeeringGVR = schema.GroupVersionResource{
 }
 
 var siteGVRPeering = schema.GroupVersionResource{
-	Group:    "net.unbounded-cloud.io",
-	Version:  "v1alpha1",
+	Group:    unboundedv1alpha3.GroupVersion.Group,
+	Version:  unboundedv1alpha3.GroupVersion.Version,
 	Resource: "sites",
 }
 
@@ -329,7 +330,7 @@ func (pc *PeeringAggregationController) syncPool(ctx context.Context, poolName s
 		return err
 	}
 
-	siteMap := make(map[string]*unboundednetv1alpha1.Site, len(sites))
+	siteMap := make(map[string]*unboundedv1alpha3.Site, len(sites))
 	for i := range sites {
 		site := &sites[i]
 		siteMap[site.Name] = site
@@ -494,7 +495,7 @@ func (pc *PeeringAggregationController) syncPool(ctx context.Context, poolName s
 // reconcileSitePeeringStatuses computes and patches the status for each
 // SitePeering. peeredSiteCount is the number of referenced sites that
 // actually exist, totalNodeCount is the sum of those sites' nodeCount.
-func (pc *PeeringAggregationController) reconcileSitePeeringStatuses(ctx context.Context, peerings []unboundednetv1alpha1.SitePeering, siteMap map[string]*unboundednetv1alpha1.Site) error {
+func (pc *PeeringAggregationController) reconcileSitePeeringStatuses(ctx context.Context, peerings []unboundednetv1alpha1.SitePeering, siteMap map[string]*unboundedv1alpha3.Site) error {
 	for _, peering := range peerings {
 		peeredSiteCount := 0
 		totalNodeCount := 0
@@ -542,7 +543,7 @@ func (pc *PeeringAggregationController) reconcileSitePeeringStatuses(ctx context
 	return nil
 }
 
-func computeReachableRoutes(startPool string, pools map[string]*unboundednetv1alpha1.GatewayPool, sites map[string]*unboundednetv1alpha1.Site, connectedSites, adjacency map[string]map[string]struct{}) []unboundednetv1alpha1.GatewayPoolRoute {
+func computeReachableRoutes(startPool string, pools map[string]*unboundednetv1alpha1.GatewayPool, sites map[string]*unboundedv1alpha3.Site, connectedSites, adjacency map[string]map[string]struct{}) []unboundednetv1alpha1.GatewayPoolRoute {
 	_, routes := computeReachable(startPool, pools, sites, connectedSites, adjacency)
 	return routes
 }
@@ -559,7 +560,7 @@ type routeInfo struct {
 	origin      unboundednetv1alpha1.GatewayPoolRouteOrigin
 }
 
-func computeReachable(startPool string, pools map[string]*unboundednetv1alpha1.GatewayPool, sites map[string]*unboundednetv1alpha1.Site, connectedSites, adjacency map[string]map[string]struct{}) (reachableSiteSets, []unboundednetv1alpha1.GatewayPoolRoute) {
+func computeReachable(startPool string, pools map[string]*unboundednetv1alpha1.GatewayPool, sites map[string]*unboundedv1alpha3.Site, connectedSites, adjacency map[string]map[string]struct{}) (reachableSiteSets, []unboundednetv1alpha1.GatewayPoolRoute) {
 	connected := setToSortedSlice(connectedSites[startPool])
 
 	minDepth := map[string]int{startPool: 1}
@@ -768,10 +769,10 @@ func (pc *PeeringAggregationController) listGatewayPoolPeerings() ([]unboundedne
 	return peerings, nil
 }
 
-func (pc *PeeringAggregationController) listSites() ([]unboundednetv1alpha1.Site, error) {
+func (pc *PeeringAggregationController) listSites() ([]unboundedv1alpha3.Site, error) {
 	items := pc.siteInformer.GetStore().List()
 
-	sites := make([]unboundednetv1alpha1.Site, 0, len(items))
+	sites := make([]unboundedv1alpha3.Site, 0, len(items))
 	for _, item := range items {
 		unstr, ok := item.(*unstructured.Unstructured)
 		if !ok {
@@ -854,13 +855,13 @@ func parseGatewayPoolPeeringObj(obj *unstructured.Unstructured) (*unboundednetv1
 	return &peering, nil
 }
 
-func parseSiteAggregation(obj *unstructured.Unstructured) (*unboundednetv1alpha1.Site, error) {
+func parseSiteAggregation(obj *unstructured.Unstructured) (*unboundedv1alpha3.Site, error) {
 	data, err := obj.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
 
-	var site unboundednetv1alpha1.Site
+	var site unboundedv1alpha3.Site
 	if err := json.Unmarshal(data, &site); err != nil {
 		return nil, err
 	}

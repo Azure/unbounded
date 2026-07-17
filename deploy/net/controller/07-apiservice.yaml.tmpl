@@ -17,5 +17,5 @@ spec:
   insecureSkipTLSVerify: false
   service:
     name: unbounded-net-controller
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
     port: 9999

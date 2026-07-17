@@ -42,7 +42,7 @@ unbounded-net-kube-proxy-<site>
 Each DaemonSet is scheduled only to nodes with both labels:
 
 ```text
-net.unbounded-cloud.io/site=<site>
+unbounded-cloud.io/site=<site>
 net.unbounded-cloud.io/kube-proxy=managed
 ```
 

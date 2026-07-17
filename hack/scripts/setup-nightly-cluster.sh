@@ -23,7 +23,7 @@
 #      ub<site>01, e.g. ubnightly01) + container, and reads its key.
 #   5. Configures the unbounded-nightly GitHub Environment via
 #      hack/scripts/setup-deploy-environment.sh.
-#   6. Creates the unbounded-kube namespace and the orca-credentials Secret
+#   6. Creates the unbounded-system namespace and the orca-credentials Secret
 #      on the cluster (hack/orca/create-credentials-secret.sh).
 #   7. Triggers the nightly workflow (force_init=true) and watches it to
 #      completion.
@@ -431,17 +431,17 @@ configure_environment() {
 }
 
 # ---------------------------------------------------------------------------
-# Create the unbounded-kube namespace + orca-credentials Secret on cluster.
+# Create the unbounded-system namespace + orca-credentials Secret on cluster.
 # ---------------------------------------------------------------------------
 ensure_secret() {
-  log "Ensuring unbounded-kube namespace and orca-credentials Secret"
-  KCTL get namespace unbounded-kube >/dev/null 2>&1 || KCTL create namespace unbounded-kube
+  log "Ensuring unbounded-system namespace and orca-credentials Secret"
+  KCTL get namespace unbounded-system >/dev/null 2>&1 || KCTL create namespace unbounded-system
 
   # Leave an existing Secret untouched. create-credentials-secret.sh generates
   # fresh Garage S3 keys on every invocation; regenerating them on a re-run
   # after Garage already granted the bucket to the previous key strands Orca's
   # key (Garage 403). To rotate keys, delete the Secret first.
-  if KCTL -n unbounded-kube get secret orca-credentials >/dev/null 2>&1; then
+  if KCTL -n unbounded-system get secret orca-credentials >/dev/null 2>&1; then
     info "orca-credentials Secret already exists; leaving its keys unchanged"
     return 0
   fi
@@ -508,10 +508,10 @@ trigger_deploy() {
 # ---------------------------------------------------------------------------
 verify() {
   log "Cluster state"
-  KCTL -n unbounded-net  rollout status deploy/unbounded-net-controller --timeout=60s 2>/dev/null || true
-  KCTL -n unbounded-net  rollout status ds/unbounded-net-node           --timeout=60s 2>/dev/null || true
-  KCTL -n unbounded-kube rollout status deploy/machina-controller       --timeout=60s 2>/dev/null || true
-  KCTL -n unbounded-kube get deploy orca garage 2>/dev/null || true
+  KCTL -n unbounded-system  rollout status deploy/unbounded-net-controller --timeout=60s 2>/dev/null || true
+  KCTL -n unbounded-system  rollout status ds/unbounded-net-node           --timeout=60s 2>/dev/null || true
+  KCTL -n unbounded-system rollout status deploy/machina-controller       --timeout=60s 2>/dev/null || true
+  KCTL -n unbounded-system get deploy orca garage 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------

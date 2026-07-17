@@ -28,7 +28,7 @@
 # Usage: deploy-integration.sh [flags]
 #
 #   --context CTX          kubectl context to target (default: current)
-#   --namespace NS         namespace to install into (default: unbounded-kube)
+#   --namespace NS         namespace to install into (default: unbounded-system)
 #   --image IMG            orca container image (required, e.g.
 #                          ghcr.io/azure/orca:v0.1.14)
 #   --azure-account NAME   Azure storage account name (required)
@@ -46,7 +46,7 @@
 set -euo pipefail
 
 CONTEXT=""
-NAMESPACE="unbounded-kube"
+NAMESPACE="unbounded-system"
 ORCA_IMAGE=""
 AZURE_ACCOUNT=""
 AZURE_CONTAINER=""

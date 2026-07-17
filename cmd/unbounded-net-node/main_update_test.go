@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
@@ -39,9 +40,9 @@ func TestUpdateWireGuardFromSlices_GatewayMeshPeersUseOnlyDirectConnectedSites(t
 	myPubKey := "pub-self"
 
 	siteInformer := newInformerWithObjects(
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-direct"}}),
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-transitive"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-direct"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-transitive"}}),
 	)
 
 	sliceInformer := newInformerWithObjects(
@@ -152,9 +153,9 @@ func TestUpdateWireGuardFromSlices_ExternalGatewayIncludesAssignedNonDirectSites
 	myPubKey := "pub-self"
 
 	siteInformer := newInformerWithObjects(
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-direct"}}),
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-remote-assigned"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-direct"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-remote-assigned"}}),
 	)
 
 	sliceInformer := newInformerWithObjects(
@@ -257,9 +258,9 @@ func TestUpdateWireGuardFromSlices_NonGatewayMeshPeersUseOnlyPeeredSites(t *test
 	myPubKey := "pub-self"
 
 	siteInformer := newInformerWithObjects(
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site3"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site3"}}),
 	)
 
 	sliceInformer := newInformerWithObjects(
@@ -343,7 +344,7 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseSkipsPodCIDRRoutesForSame
 		myPubKey := "pub-self"
 
 		siteInformer := newInformerWithObjects(
-			toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
+			toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
 		)
 		sliceInformer := newInformerWithObjects(
 			toUnstructured(t, &unboundednetv1alpha1.SiteNodeSlice{
@@ -421,7 +422,7 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseSkipsPodCIDRRoutesForSame
 		myPubKey := "pub-gw-self"
 
 		siteInformer := newInformerWithObjects(
-			toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
+			toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
 		)
 		sliceInformer := newInformerWithObjects(
 			toUnstructured(t, &unboundednetv1alpha1.SiteNodeSlice{
@@ -519,8 +520,8 @@ func TestUpdateWireGuardFromSlices_ManageCniPluginFalseKeepsRemotePeeredMeshPeer
 	myPubKey := "pub-self"
 
 	siteInformer := newInformerWithObjects(
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
-		toUnstructured(t, &unboundednetv1alpha1.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site1"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site2"}}),
 	)
 	sliceInformer := newInformerWithObjects(
 		toUnstructured(t, &unboundednetv1alpha1.SiteNodeSlice{

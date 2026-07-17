@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/spf13/pflag"
+
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 func TestValidatePreset(t *testing.T) {
@@ -186,8 +188,8 @@ func TestDefaultPresetMatchesDevDefaults(t *testing.T) {
 		t.Errorf("default preset = %q want %q", g.preset, PresetDev)
 	}
 
-	if g.namespace != defaultNamespace {
-		t.Errorf("default namespace = %q want %q", g.namespace, defaultNamespace)
+	if g.namespace != unbounded.SystemNamespace() {
+		t.Errorf("default namespace = %q want %q", g.namespace, unbounded.SystemNamespace())
 	}
 
 	// Cross-check a few high-value preset fields so a future

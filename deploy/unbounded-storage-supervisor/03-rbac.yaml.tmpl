@@ -12,7 +12,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: unbounded-storage-supervisor
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-storage-supervisor
     app.kubernetes.io/component: storage
@@ -45,4 +45,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-storage-supervisor
-    namespace: {{ default "unbounded-kube" .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}

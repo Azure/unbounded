@@ -1,0 +1,80 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-operator reaper e2e
+
+on:
+  pull_request:
+    paths:
+      - internal/operator/**
+      - internal/net/controller/**
+      - cmd/unbounded-operator/**
+      - deploy/unbounded-operator/**
+      - deploy/machina/crd/**
+      - deploy/net/crd/**
+      - e2e/operator/**
+      - go.mod
+      - go.sum
+      - .github/workflows/operator-e2e-kind.yaml
+  push:
+    branches: [main]
+    paths:
+      - internal/operator/**
+      - internal/net/controller/**
+      - cmd/unbounded-operator/**
+      - deploy/unbounded-operator/**
+      - deploy/machina/crd/**
+      - deploy/net/crd/**
+      - e2e/operator/**
+      - go.mod
+      - go.sum
+      - .github/workflows/operator-e2e-kind.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: operator-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to match the kind release validated locally. Bump alongside the
+  # kindest/node image kind selects by default for this version.
+  KIND_VERSION: v0.29.0
+
+jobs:
+  operator-reaper-e2e:
+    name: operator reaper e2e (kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ./kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 ./kind /usr/local/bin/kind
+          rm -f ./kind
+          kind version
+
+      # Fail fast if the runner is missing tooling, so the suite (which would
+      # otherwise t.Skip on absent binaries) cannot silently pass without
+      # exercising the reaper.
+      - name: Verify e2e prerequisites
+        run: |
+          set -euo pipefail
+          for bin in kind kubectl docker; do
+            command -v "$bin" >/dev/null 2>&1 || { echo "missing required binary: $bin" >&2; exit 1; }
+          done
+          docker info >/dev/null
+
+      - name: Run operator reaper e2e
+        run: go test -tags=e2e -count=1 -timeout=900s -v ./e2e/operator/...
