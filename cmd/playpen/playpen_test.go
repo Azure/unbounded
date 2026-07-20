@@ -40,7 +40,7 @@ func TestWGAddressInvalid(t *testing.T) {
 func TestServerArgs(t *testing.T) {
 	cfg := DefaultConfig()
 
-	args, err := serverArgs(cfg, "jordan-playtime-abc12")
+	args, err := serverArgs(cfg, "jordan-playpen-abc12")
 	if err != nil {
 		t.Fatalf("serverArgs: %v", err)
 	}
@@ -53,10 +53,10 @@ func TestServerArgs(t *testing.T) {
 
 	for _, want := range []string{
 		"--namespace jordan-testing",
-		"--self-node-name jordan-playtime-abc12",
+		"--self-node-name jordan-playpen-abc12",
 		"--vni 42",
 		"--vxlan-port 4789",
-		"--vxlan-interface pt-vx0",
+		"--vxlan-interface pp-vx0",
 		"--overlay-remote-ip 172.31.99.1",
 		"--overlay-prefix 24",
 		"--overlay-mtu 1230",
@@ -73,7 +73,7 @@ func TestServerArgsInvalidPodCIDR(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.NodePodCIDR = "not-a-cidr"
 
-	if _, err := serverArgs(cfg, "jordan-playtime-abc12"); err == nil {
+	if _, err := serverArgs(cfg, "jordan-playpen-abc12"); err == nil {
 		t.Fatal("expected error for invalid node pod cidr")
 	}
 }
@@ -550,7 +550,7 @@ func TestServerArgsVM(t *testing.T) {
 	t.Run("vm and redfish flags always present", func(t *testing.T) {
 		cfg := DefaultConfig()
 
-		args, err := serverArgs(cfg, "jordan-playtime-abc12")
+		args, err := serverArgs(cfg, "jordan-playpen-abc12")
 		if err != nil {
 			t.Fatalf("serverArgs: %v", err)
 		}
@@ -562,8 +562,8 @@ func TestServerArgsVM(t *testing.T) {
 			"--vm-cpus 1",
 			"--vm-mac 52:54:00:12:34:56",
 			"--vm-disk-size 20",
-			"--bridge-interface pt-br0",
-			"--tap-interface pt-tap0",
+			"--bridge-interface pp-br0",
+			"--tap-interface pp-tap0",
 			"--redfish-port 8443",
 			"--redfish-username admin",
 			"--redfish-password password",
@@ -600,8 +600,8 @@ func TestVMConfig(t *testing.T) {
 		t.Errorf("firmware = %q, want %q", vc.Payload.Firmware, chFirmware)
 	}
 
-	if len(vc.Net) != 1 || vc.Net[0].Tap != "pt-tap0" || vc.Net[0].Mac != "52:54:00:12:34:56" {
-		t.Errorf("net = %+v, want single tap pt-tap0 mac 52:54:00:12:34:56", vc.Net)
+	if len(vc.Net) != 1 || vc.Net[0].Tap != "pp-tap0" || vc.Net[0].Mac != "52:54:00:12:34:56" {
+		t.Errorf("net = %+v, want single tap pp-tap0 mac 52:54:00:12:34:56", vc.Net)
 	}
 
 	if vc.Serial.Mode != "File" || vc.Serial.File != "/tmp/serial.log" {
@@ -873,8 +873,8 @@ func TestKVMNodeLabel(t *testing.T) {
 			t.Fatalf("kvmNodeLabel: %v", err)
 		}
 
-		if key != "playtime.unbounded-cloud.io/kvm" || value != "true" {
-			t.Fatalf("kvmNodeLabel() = %q=%q, want playtime.unbounded-cloud.io/kvm=true", key, value)
+		if key != "playpen.unbounded-cloud.io/kvm" || value != "true" {
+			t.Fatalf("kvmNodeLabel() = %q=%q, want playpen.unbounded-cloud.io/kvm=true", key, value)
 		}
 	})
 
@@ -928,7 +928,7 @@ func TestPodNodeSelector(t *testing.T) {
 			t.Fatalf("podNodeSelector() missing arch: %v", sel)
 		}
 
-		if sel["playtime.unbounded-cloud.io/kvm"] != "true" {
+		if sel["playpen.unbounded-cloud.io/kvm"] != "true" {
 			t.Fatalf("podNodeSelector() missing kvm label: %v", sel)
 		}
 	})

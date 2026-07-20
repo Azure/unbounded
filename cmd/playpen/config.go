@@ -13,10 +13,10 @@ import (
 	"time"
 )
 
-// Config holds all tunable settings for the playtime client.
+// Config holds all tunable settings for the playpen client.
 //
 // The defaults describe a VXLAN overlay whose underlay rides the unbounded-net
-// WireGuard mesh: the local box bootstraps its own dedicated "playtime" site
+// WireGuard mesh: the local box bootstraps its own dedicated "playpen" site
 // (assigned to a gateway pool), joins the mesh as a temporary node in that site,
 // peers with the pool's external gateways, and reaches a self-configuring demo
 // pod running on some other site. The client MUST live in a different site than
@@ -43,7 +43,7 @@ type Config struct {
 	NodeInternalIP string
 	NodePodCIDR    string
 
-	// Dedicated site bootstrap. playtime creates a Site named NodeSite (if it
+	// Dedicated site bootstrap. playpen creates a Site named NodeSite (if it
 	// does not already exist) plus a SiteGatewayPoolAssignment binding it to
 	// GatewayPools, so the temporary node has a home site that is distinct from
 	// wherever the demo pod runs. SiteNodeCIDR must contain NodeInternalIP and
@@ -188,8 +188,8 @@ func DefaultConfig() Config {
 
 		TTL: 1 * time.Hour,
 
-		NodeName:       "jordan-playtime",
-		NodeSite:       "playtime",
+		NodeName:       "jordan-playpen",
+		NodeSite:       "playpen",
 		NodeInternalIP: "10.242.0.1",
 		NodePodCIDR:    "100.123.0.0/24",
 
@@ -197,7 +197,7 @@ func DefaultConfig() Config {
 		SitePodCIDR:  "100.123.0.0/16",
 		GatewayPools: []string{"gw-main"},
 
-		WGInterfaceBase:  "pt-wg",
+		WGInterfaceBase:  "pp-wg",
 		WGListenPortBase: 51900,
 		GatewayEndpoints: []string{"20.104.49.219:51820", "20.151.222.173:51820"},
 		GatewayPubKeys: []string{
@@ -206,9 +206,9 @@ func DefaultConfig() Config {
 		},
 		RouteCIDRs: []string{"100.125.0.0/16", "100.124.0.0/16", "10.224.0.0/12"},
 		Keepalive:  15,
-		StateDir:   "/tmp/playtime",
+		StateDir:   "/tmp/playpen",
 
-		VXLANInterface:  "pt-vx0",
+		VXLANInterface:  "pp-vx0",
 		VNI:             42,
 		VXLANPort:       4789,
 		OverlayLocalIP:  "172.31.99.2",
@@ -218,7 +218,7 @@ func DefaultConfig() Config {
 
 		NetbootProxyPort: 0,
 
-		PodName:  "playtime-server",
+		PodName:  "playpen-server",
 		PodNode:  "",
 		PodImage: DefaultPodImage,
 
@@ -228,8 +228,8 @@ func DefaultConfig() Config {
 		VMMemoryMiB:     512,
 		VMCPUs:          1,
 		VMMAC:           "52:54:00:12:34:56",
-		BridgeInterface: "pt-br0",
-		TapInterface:    "pt-tap0",
+		BridgeInterface: "pp-br0",
+		TapInterface:    "pp-tap0",
 		VMDiskSizeGiB:   20,
 		VMDiskPath:      defaultVMDiskPath,
 
@@ -242,18 +242,18 @@ func DefaultConfig() Config {
 }
 
 // ArchLabelKey is the standard Kubernetes node label carrying a node's CPU
-// architecture (amd64/arm64). playtime selects the demo pod's host by it.
+// architecture (amd64/arm64). playpen selects the demo pod's host by it.
 const ArchLabelKey = "kubernetes.io/arch"
 
 // DefaultKVMNodeLabel is the default node label a node must carry to be treated
 // as KVM-capable in VM mode. There is no standard cluster-wide KVM signal, so
-// operators label KVM-capable nodes with this and playtime selects on it.
-const DefaultKVMNodeLabel = "playtime.unbounded-cloud.io/kvm=true"
+// operators label KVM-capable nodes with this and playpen selects on it.
+const DefaultKVMNodeLabel = "playpen.unbounded-cloud.io/kvm=true"
 
 // defaultVMDiskPath is the in-pod path of the guest's backing disk image when
 // VMDiskPath is not overridden. It lives under the VM state dir alongside the
 // cloud-hypervisor API socket and serial log.
-const defaultVMDiskPath = "/tmp/playtime-vm/disk.img"
+const defaultVMDiskPath = "/tmp/playpen-vm/disk.img"
 
 // diskPath returns the in-pod path of the guest's backing disk image, falling
 // back to defaultVMDiskPath when VMDiskPath is unset.
@@ -331,24 +331,24 @@ func (c Config) podNodeSelector() (map[string]string, error) {
 	return selector, nil
 }
 
-// TempNodeLabelKey marks Node objects created by playtime so they are easy to
+// TempNodeLabelKey marks Node objects created by playpen so they are easy to
 // find and clean up. Its value is the run's namespace, which also scopes the
 // reaper so one developer's pod only reaps its own namespace's stale runs.
-const TempNodeLabelKey = "playtime.unbounded-cloud.io/temp"
+const TempNodeLabelKey = "playpen.unbounded-cloud.io/temp"
 
 // ReaperServiceAccountName is the fixed name of the shared ServiceAccount the
 // in-pod reaper runs as. It lives in the run namespace and is shared by every
 // run in that namespace; it is created if missing and never reaped.
-const ReaperServiceAccountName = "playtime-reaper"
+const ReaperServiceAccountName = "playpen-reaper"
 
 // ExpiresAtAnnotation records the RFC3339 instant after which a run is
 // considered orphaned and may be reaped. It is stamped on the Node anchor and
 // is the single source of truth for the reaper.
-const ExpiresAtAnnotation = "playtime.unbounded-cloud.io/expires-at"
+const ExpiresAtAnnotation = "playpen.unbounded-cloud.io/expires-at"
 
 // TTLAnnotation records the human-readable TTL the run was created with (for
 // debugging; the reaper only consults ExpiresAtAnnotation).
-const TTLAnnotation = "playtime.unbounded-cloud.io/ttl"
+const TTLAnnotation = "playpen.unbounded-cloud.io/ttl"
 
 // WireGuardPubKeyAnnotation is the annotation unbounded-net reads to learn a
 // node's WireGuard public key.
@@ -380,7 +380,7 @@ type gateway struct {
 
 // gateways expands the parallel endpoint/pubkey lists into per-interface
 // gateway descriptors. Interface names and listen ports are derived from the
-// configured bases (e.g. pt-wg0/51900, pt-wg1/51901). The number of gateways is
+// configured bases (e.g. pp-wg0/51900, pp-wg1/51901). The number of gateways is
 // the shorter of the two lists to avoid index panics on mismatched flags.
 func (c Config) gateways() []gateway {
 	n := len(c.GatewayEndpoints)
@@ -429,12 +429,12 @@ func (c Config) clientUnderlayIP() (string, error) {
 
 // privKeyPath returns the path to the WireGuard private key file.
 func (c Config) privKeyPath() string {
-	return c.StateDir + "/pt.priv"
+	return c.StateDir + "/pp.priv"
 }
 
 // pubKeyPath returns the path to the WireGuard public key file.
 func (c Config) pubKeyPath() string {
-	return c.StateDir + "/pt.pub"
+	return c.StateDir + "/pp.pub"
 }
 
 // lastRunPath returns the path to the file recording the Node name of the most

@@ -8,14 +8,14 @@ on:
     paths:
       - cmd/agent/**
       - cmd/metalman/**
-      - cmd/playtime/**
+      - cmd/playpen/**
       - internal/metalman/**
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
-      - images/playtime/**
+      - images/playpen/**
       - hack/metalman-redfish-fixture.py
       - hack/smoke-metalman-http.py
       - hack/smoke-metalman.py
@@ -25,14 +25,14 @@ on:
     paths:
       - cmd/agent/**
       - cmd/metalman/**
-      - cmd/playtime/**
+      - cmd/playpen/**
       - internal/metalman/**
       - api/machina/v1alpha3/**
       - deploy/machina/crd/**
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
-      - images/playtime/**
+      - images/playpen/**
       - hack/metalman-redfish-fixture.py
       - hack/smoke-metalman-http.py
       - hack/smoke-metalman.py
@@ -100,7 +100,7 @@ jobs:
         with:
           driver-opts: network=host
 
-      - name: Write playtime target kubeconfig
+      - name: Write playpen target kubeconfig
         env:
           KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
         run: |
@@ -110,16 +110,16 @@ jobs:
             exit 1
           fi
           umask 077
-          target_kubeconfig="$RUNNER_TEMP/playtime-target.kubeconfig"
+          target_kubeconfig="$RUNNER_TEMP/playpen-target.kubeconfig"
           printf '%s' "$KUBECONFIG_CONTENT" > "$target_kubeconfig"
-          echo "PLAYTIME_KUBECONFIG=$target_kubeconfig" >> "$GITHUB_ENV"
-          echo "PLAYTIME_CONTEXT=$(KUBECONFIG="$target_kubeconfig" kubectl config current-context)" >> "$GITHUB_ENV"
+          echo "PLAYPEN_KUBECONFIG=$target_kubeconfig" >> "$GITHUB_ENV"
+          echo "PLAYPEN_CONTEXT=$(KUBECONFIG="$target_kubeconfig" kubectl config current-context)" >> "$GITHUB_ENV"
 
-      - name: Resolve playtime image
+      - name: Resolve playpen image
         env:
           CONTAINER_REGISTRY: ghcr.io/${{ github.repository_owner }}
         run: |
-          echo "PLAYTIME_IMAGE=${CONTAINER_REGISTRY,,}/playtime:smoke-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
+          echo "PLAYPEN_IMAGE=${CONTAINER_REGISTRY,,}/playpen:smoke-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
 
       - name: Log in to ghcr.io
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
@@ -128,16 +128,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push playtime image
+      - name: Build and push playpen image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          file: images/playtime/Containerfile
+          file: images/playpen/Containerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ env.PLAYTIME_IMAGE }}
-          cache-from: type=gha,scope=playtime
-          cache-to: type=gha,mode=max,scope=playtime
+          tags: ${{ env.PLAYPEN_IMAGE }}
+          cache-from: type=gha,scope=playpen
+          cache-to: type=gha,mode=max,scope=playpen
           provenance: false
 
       - name: Build host-ubuntu2404 image
@@ -187,14 +187,14 @@ jobs:
         run: |
           set -euo pipefail
           kind_kubeconfig="${KUBECONFIG:-$HOME/.kube/config}"
-          KUBECONFIG="$PLAYTIME_KUBECONFIG:$kind_kubeconfig" \
+          KUBECONFIG="$PLAYPEN_KUBECONFIG:$kind_kubeconfig" \
             kubectl config view --flatten > "$RUNNER_TEMP/smoke.kubeconfig"
           sudo mkdir -p /root/.kube
           sudo install -m 600 "$RUNNER_TEMP/smoke.kubeconfig" /root/.kube/config
           sudo -E env "PATH=$PATH" KUBECONFIG=/root/.kube/config \
             python3 hack/smoke-metalman.py \
-              --context "$PLAYTIME_CONTEXT" \
-              --pod-image "$PLAYTIME_IMAGE"
+              --context "$PLAYPEN_CONTEXT" \
+              --pod-image "$PLAYPEN_IMAGE"
 
   layered-http-smoke:
     runs-on: ubuntu-24.04

@@ -2,9 +2,9 @@
 # Licensed under the MIT License.
 #
 # Kind cluster configuration for the smoke-metalman tests.
-# The PXE smoke drives the guest over a playtime VXLAN-over-WireGuard overlay
+# The PXE smoke drives the guest over a playpen VXLAN-over-WireGuard overlay
 # whose client end is 172.31.99.2.  The guest's kubelet, kindnet, and kube-proxy
-# reach the kind API server at 172.31.99.2:6443 (playtime forwards it back to
+# reach the kind API server at 172.31.99.2:6443 (playpen forwards it back to
 # the API server's loopback port on the host).  Include that overlay IP as an
 # extra certSAN so those clients can verify the API server TLS certificate.
 # The layered HTTP smoke reaches the same API server over its local libvirt

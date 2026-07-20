@@ -32,15 +32,15 @@ import (
 const activeDeadlineGrace = 2 * time.Minute
 
 // DefaultPodImage is the container image used for the demo pod. It ships the
-// playtime binary itself, whose hidden `server` subcommand configures the
+// playpen binary itself, whose hidden `server` subcommand configures the
 // pod-side VXLAN overlay. The value is overridden at build time via
 // `-X main.DefaultPodImage=...` so a released client points at the matching
 // pushed image.
-var DefaultPodImage = "ghcr.io/azure/playtime:dev"
+var DefaultPodImage = "ghcr.io/azure/playpen:dev"
 
-// playtimeScheme registers the API types playtime touches: core/RBAC types via
+// playpenScheme registers the API types playpen touches: core/RBAC types via
 // the client-go scheme plus the unbounded net types used for slice membership.
-func playtimeScheme() *runtime.Scheme {
+func playpenScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(netv1alpha1.AddToScheme(scheme))
@@ -63,7 +63,7 @@ func newClient(cfg Config) (client.Client, error) {
 		return nil, fmt.Errorf("load kubeconfig (context %q): %w", cfg.KubeContext, err)
 	}
 
-	c, err := client.New(restCfg, client.Options{Scheme: playtimeScheme()})
+	c, err := client.New(restCfg, client.Options{Scheme: playpenScheme()})
 	if err != nil {
 		return nil, fmt.Errorf("create kubernetes client: %w", err)
 	}
@@ -79,7 +79,7 @@ func newInClusterClient() (client.Client, error) {
 		return nil, fmt.Errorf("load in-cluster config: %w", err)
 	}
 
-	c, err := client.New(restCfg, client.Options{Scheme: playtimeScheme()})
+	c, err := client.New(restCfg, client.Options{Scheme: playpenScheme()})
 	if err != nil {
 		return nil, fmt.Errorf("create in-cluster client: %w", err)
 	}
@@ -277,18 +277,18 @@ func cleanupRun(c client.Client, nodeName string) {
 	fmt.Printf("deleted run %q\n", nodeName)
 }
 
-// listRuns returns the playtime Node anchors scoped to the given namespace (the
+// listRuns returns the playpen Node anchors scoped to the given namespace (the
 // value of the temp label), i.e. the runs owned by this user/namespace.
 func listRuns(ctx context.Context, c client.Client, namespace string) ([]corev1.Node, error) {
 	list := &corev1.NodeList{}
 	if err := c.List(ctx, list, client.MatchingLabels{TempNodeLabelKey: namespace}); err != nil {
-		return nil, fmt.Errorf("list playtime nodes: %w", err)
+		return nil, fmt.Errorf("list playpen nodes: %w", err)
 	}
 
 	return list.Items, nil
 }
 
-// deleteAllRuns deletes every playtime run in the namespace scope.
+// deleteAllRuns deletes every playpen run in the namespace scope.
 func deleteAllRuns(ctx context.Context, c client.Client, namespace string) ([]string, error) {
 	nodes, err := listRuns(ctx, c, namespace)
 	if err != nil {
@@ -308,7 +308,7 @@ func deleteAllRuns(ctx context.Context, c client.Client, namespace string) ([]st
 	return deleted, nil
 }
 
-// reapExpired deletes every playtime run in the namespace scope whose expiry has
+// reapExpired deletes every playpen run in the namespace scope whose expiry has
 // passed, cascading to each run's owned resources. It returns the names of the
 // Node anchors it deleted so callers (notably the in-pod reaper) can detect when
 // they have reaped themselves.
@@ -335,7 +335,7 @@ func reapExpired(ctx context.Context, c client.Client, namespace string, now tim
 	return reaped, nil
 }
 
-// deleteSharedResources deletes the resources playtime shares across every run
+// deleteSharedResources deletes the resources playpen shares across every run
 // in a namespace scope and otherwise (on purpose) never cleans up: the reaper
 // ClusterRoleBinding, ClusterRole, and ServiceAccount, the bootstrapped Site and
 // SiteGatewayPoolAssignment, and finally the shared namespace itself. Callers are
@@ -479,7 +479,7 @@ func ensureDemoPod(ctx context.Context, c client.Client, cfg Config, node *corev
 		Name:            "server",
 		Image:           cfg.PodImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"playtime"},
+		Command:         []string{"playpen"},
 		Args:            args,
 		SecurityContext: &corev1.SecurityContext{Privileged: &privileged},
 		// Request only a small CPU share so the pod schedules easily, but allow
@@ -503,8 +503,7 @@ func ensureDemoPod(ctx context.Context, c client.Client, cfg Config, node *corev
 
 	// The guest runs under cloud-hypervisor (KVM). Although the pod is
 	// Privileged (which grants access to the host /dev), mounting the char
-	// devices explicitly makes the KVM/tun requirement clear and matches the
-	// playpen runner pattern.
+	// devices explicitly makes the KVM/tun requirement clear.
 	charDevice := corev1.HostPathCharDev
 	volumes = append(volumes,
 		corev1.Volume{
@@ -531,7 +530,7 @@ func ensureDemoPod(ctx context.Context, c client.Client, cfg Config, node *corev
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName:    cfg.PodName + "-",
 			Namespace:       cfg.Namespace,
-			Labels:          map[string]string{TempNodeLabelKey: cfg.Namespace, "app": "playtime-server"},
+			Labels:          map[string]string{TempNodeLabelKey: cfg.Namespace, "app": "playpen-server"},
 			OwnerReferences: []metav1.OwnerReference{nodeOwnerRef(node)},
 		},
 		Spec: corev1.PodSpec{
@@ -565,7 +564,7 @@ func ensureDemoPod(ctx context.Context, c client.Client, cfg Config, node *corev
 	return "", "", fmt.Errorf("pod %q did not become ready with an IP", pod.Name)
 }
 
-// serverArgs builds the argument vector passed to the `playtime server`
+// serverArgs builds the argument vector passed to the `playpen server`
 // subcommand running inside the demo pod. The pod configures its own VXLAN
 // overlay endpoint from these flags (see server.go) and runs the in-pod reaper
 // scoped to its namespace, deleting its own Node anchor (selfNodeName) once the

@@ -37,7 +37,7 @@ var swtpmBinary = "swtpm"
 
 // vmStateDir holds the cloud-hypervisor API socket, serial log, backing disk,
 // and swtpm state/socket for the pod's guest.
-const vmStateDir = "/tmp/playtime-vm"
+const vmStateDir = "/tmp/playpen-vm"
 
 // tpmSocketPath is the swtpm control socket cloud-hypervisor connects to for the
 // guest's emulated TPM.

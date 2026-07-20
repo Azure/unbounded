@@ -9,14 +9,14 @@ import (
 	"time"
 )
 
-// runDown deletes the cluster resources created by playtime. There is no local
+// runDown deletes the cluster resources created by playpen. There is no local
 // teardown: the userspace dataplane lives only inside the `up` process and is
 // gone once that process exits.
 //
 // Deleting a run's Node anchor cascades to its Pod, ServiceAccount, ClusterRole,
 // and ClusterRoleBinding via owner references. The shared namespace is never
 // deleted. By default runDown targets the most recent run (recorded by `up`);
-// with all set it deletes every playtime run in this namespace scope. Either
+// with all set it deletes every playpen run in this namespace scope. Either
 // way it also reaps any expired runs.
 func runDown(ctx context.Context, cfg Config, all bool) error {
 	c, err := newClient(cfg)
@@ -31,9 +31,9 @@ func runDown(ctx context.Context, cfg Config, all bool) error {
 		}
 
 		if len(deleted) == 0 {
-			fmt.Printf("no playtime runs found in namespace scope %q\n", cfg.Namespace)
+			fmt.Printf("no playpen runs found in namespace scope %q\n", cfg.Namespace)
 		} else {
-			fmt.Printf("deleted %d playtime run(s): %v\n", len(deleted), deleted)
+			fmt.Printf("deleted %d playpen run(s): %v\n", len(deleted), deleted)
 		}
 
 		return nil
@@ -43,7 +43,7 @@ func runDown(ctx context.Context, cfg Config, all bool) error {
 	if reaped, err := reapExpired(ctx, c, cfg.Namespace, time.Now()); err != nil {
 		fmt.Printf("warning: reaping stale runs: %v\n", err)
 	} else if len(reaped) > 0 {
-		fmt.Printf("reaped %d expired playtime run(s): %v\n", len(reaped), reaped)
+		fmt.Printf("reaped %d expired playpen run(s): %v\n", len(reaped), reaped)
 	}
 
 	nodeName, err := readLastRun(cfg)
@@ -52,7 +52,7 @@ func runDown(ctx context.Context, cfg Config, all bool) error {
 	}
 
 	if nodeName == "" {
-		fmt.Printf("no recorded run to delete; use --all to delete every playtime run in namespace scope %q\n", cfg.Namespace)
+		fmt.Printf("no recorded run to delete; use --all to delete every playpen run in namespace scope %q\n", cfg.Namespace)
 		return nil
 	}
 

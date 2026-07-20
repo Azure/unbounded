@@ -469,7 +469,7 @@ func (o *overlay) ping(ctx context.Context, count int, timeout time.Duration) (i
 			Body: &xicmp.Echo{
 				ID:   ident,
 				Seq:  seq,
-				Data: []byte("playtime-overlay"),
+				Data: []byte("playpen-overlay"),
 			},
 		}
 

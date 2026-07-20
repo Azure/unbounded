@@ -28,10 +28,10 @@ var serverUplink = "eth0"
 var serverSelfNodeName string
 
 // serverReapInterval controls how often the in-pod reaper scans for expired
-// playtime runs.
+// playpen runs.
 var serverReapInterval = time.Minute
 
-// newServerCommand builds the hidden `playtime server` subcommand that runs
+// newServerCommand builds the hidden `playpen server` subcommand that runs
 // inside the demo pod. It configures the pod's side of the VXLAN overlay
 // entirely through netlink and go-iptables (no shell, no iproute2/bridge/sysctl
 // invocations) and then blocks until interrupted.
@@ -53,7 +53,7 @@ func newServerCommand(cfg *Config) *cobra.Command {
 	cmd.Flags().StringVar(&serverSelfNodeName, "self-node-name", serverSelfNodeName,
 		"name of this run's Node anchor; the in-pod reaper deletes it (and cascades) once the TTL expires")
 	cmd.Flags().DurationVar(&serverReapInterval, "reap-interval", serverReapInterval,
-		"how often the in-pod reaper scans for expired playtime runs")
+		"how often the in-pod reaper scans for expired playpen runs")
 
 	return cmd
 }
@@ -79,7 +79,7 @@ func runServer(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	fmt.Printf("playtime-server ready: overlay %s/%d on %s (vni %d) local underlay %s; flood to %s; internet NAT via %s\n",
+	fmt.Printf("playpen-server ready: overlay %s/%d on %s (vni %d) local underlay %s; flood to %s; internet NAT via %s\n",
 		cfg.OverlayRemoteIP, cfg.OverlayPrefix, cfg.VXLANInterface, cfg.VNI, podIP, clientUnderlay, serverUplink)
 
 	// Block until interrupted so the pod (RestartPolicy Never) stays running
@@ -93,7 +93,7 @@ func runServer(ctx context.Context, cfg Config) error {
 	defer cancel()
 
 	// The in-pod reaper cleans up previous stale runs on startup and then, on a
-	// ticker, deletes any playtime run in this namespace whose TTL has expired.
+	// ticker, deletes any playpen run in this namespace whose TTL has expired.
 	// When it deletes this run's own Node anchor it cancels runCtx so the pod
 	// shuts down cleanly (stopping the VM and unwinding the overlay) ahead of
 	// the kubelet's activeDeadlineSeconds backstop.
@@ -107,7 +107,7 @@ func runServer(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	fmt.Printf("guest VM provisioned (powered off): single NIC (mac %s) bridged to %s via %s on the overlay (cloud-hypervisor); serial log at /tmp/playtime-vm/serial.log\n",
+	fmt.Printf("guest VM provisioned (powered off): single NIC (mac %s) bridged to %s via %s on the overlay (cloud-hypervisor); serial log at /tmp/playpen-vm/serial.log\n",
 		cfg.VMMAC, cfg.BridgeInterface, cfg.TapInterface)
 
 	defer func() {
@@ -146,7 +146,7 @@ func runServer(ctx context.Context, cfg Config) error {
 
 // runReaper runs the in-pod garbage collector. It builds a client from the
 // pod's ServiceAccount and, immediately and then every interval, deletes every
-// expired playtime run in the pod's namespace scope (cascading to each run's
+// expired playpen run in the pod's namespace scope (cascading to each run's
 // Pod, ServiceAccount, ClusterRole, and ClusterRoleBinding). Deleting the run
 // whose Node anchor is selfNodeName triggers cancel so this pod shuts down.
 func runReaper(ctx context.Context, cfg Config, selfNodeName string, interval time.Duration, cancel context.CancelFunc) {
@@ -164,7 +164,7 @@ func runReaper(ctx context.Context, cfg Config, selfNodeName string, interval ti
 		}
 
 		for _, name := range reaped {
-			fmt.Printf("in-pod reaper: reaped expired playtime run %q\n", name)
+			fmt.Printf("in-pod reaper: reaped expired playpen run %q\n", name)
 
 			if name == selfNodeName {
 				fmt.Printf("in-pod reaper: own run expired, shutting down\n")

@@ -76,7 +76,7 @@ func TestIsExpired(t *testing.T) {
 func TestNodeOwnerRef(t *testing.T) {
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "jordan-playtime-abc12",
+			Name: "jordan-playpen-abc12",
 			UID:  types.UID("uid-1234"),
 		},
 	}
@@ -105,7 +105,7 @@ func TestWriteReadLastRun(t *testing.T) {
 		t.Fatalf("readLastRun (missing) = %q, want empty", got)
 	}
 
-	if err := writeLastRun(cfg, "jordan-playtime-abc12"); err != nil {
+	if err := writeLastRun(cfg, "jordan-playpen-abc12"); err != nil {
 		t.Fatalf("writeLastRun: %v", err)
 	}
 
@@ -114,14 +114,14 @@ func TestWriteReadLastRun(t *testing.T) {
 		t.Fatalf("readLastRun: %v", err)
 	}
 
-	if want := "jordan-playtime-abc12"; got != want {
+	if want := "jordan-playpen-abc12"; got != want {
 		t.Fatalf("readLastRun = %q, want %q", got, want)
 	}
 }
 
-func fakePlaytimeClient(objs ...client.Object) client.Client {
+func fakePlaypenClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
-		WithScheme(playtimeScheme()).
+		WithScheme(playpenScheme()).
 		WithObjects(objs...).
 		Build()
 }
@@ -129,7 +129,7 @@ func fakePlaytimeClient(objs ...client.Object) client.Client {
 func TestEnsureSite(t *testing.T) {
 	ctx := context.Background()
 	cfg := DefaultConfig()
-	c := fakePlaytimeClient()
+	c := fakePlaypenClient()
 
 	// First call creates the site and its gateway pool assignment; a second
 	// call is a no-op (idempotent, shared across runs).
@@ -168,7 +168,7 @@ func TestEnsureSite(t *testing.T) {
 	}
 }
 
-func playtimeNode(name, namespace, expiresAt string) *corev1.Node {
+func playpenNode(name, namespace, expiresAt string) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -201,9 +201,9 @@ func nodeExists(t *testing.T, c client.Client, name string) bool {
 
 func TestListRunsScopedByNamespace(t *testing.T) {
 	now := time.Now()
-	mine := playtimeNode("mine", "jordan-testing", now.Format(time.RFC3339))
-	other := playtimeNode("other", "someone-else", now.Format(time.RFC3339))
-	c := fakePlaytimeClient(mine, other)
+	mine := playpenNode("mine", "jordan-testing", now.Format(time.RFC3339))
+	other := playpenNode("other", "someone-else", now.Format(time.RFC3339))
+	c := fakePlaypenClient(mine, other)
 
 	runs, err := listRuns(context.Background(), c, "jordan-testing")
 	if err != nil {
@@ -220,11 +220,11 @@ func TestReapExpired(t *testing.T) {
 	past := now.Add(-time.Hour).UTC().Format(time.RFC3339)
 	future := now.Add(time.Hour).UTC().Format(time.RFC3339)
 
-	expired := playtimeNode("expired", "jordan-testing", past)
-	fresh := playtimeNode("fresh", "jordan-testing", future)
-	noExpiry := playtimeNode("no-expiry", "jordan-testing", "")
-	foreign := playtimeNode("foreign", "someone-else", past)
-	c := fakePlaytimeClient(expired, fresh, noExpiry, foreign)
+	expired := playpenNode("expired", "jordan-testing", past)
+	fresh := playpenNode("fresh", "jordan-testing", future)
+	noExpiry := playpenNode("no-expiry", "jordan-testing", "")
+	foreign := playpenNode("foreign", "someone-else", past)
+	c := fakePlaypenClient(expired, fresh, noExpiry, foreign)
 
 	reaped, err := reapExpired(context.Background(), c, "jordan-testing", now)
 	if err != nil {
@@ -255,7 +255,7 @@ func TestReapExpired(t *testing.T) {
 func TestReapExpiredNoneExpired(t *testing.T) {
 	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
 	future := now.Add(time.Hour).UTC().Format(time.RFC3339)
-	c := fakePlaytimeClient(playtimeNode("fresh", "jordan-testing", future))
+	c := fakePlaypenClient(playpenNode("fresh", "jordan-testing", future))
 
 	reaped, err := reapExpired(context.Background(), c, "jordan-testing", now)
 	if err != nil {
@@ -269,7 +269,7 @@ func TestReapExpiredNoneExpired(t *testing.T) {
 
 func TestDeleteNode(t *testing.T) {
 	now := time.Now()
-	c := fakePlaytimeClient(playtimeNode("mine", "jordan-testing", now.Format(time.RFC3339)))
+	c := fakePlaypenClient(playpenNode("mine", "jordan-testing", now.Format(time.RFC3339)))
 
 	if err := deleteNode(context.Background(), c, "mine"); err != nil {
 		t.Fatalf("deleteNode: %v", err)
@@ -287,10 +287,10 @@ func TestDeleteNode(t *testing.T) {
 
 func TestDeleteAllRuns(t *testing.T) {
 	now := time.Now().Format(time.RFC3339)
-	a := playtimeNode("a", "jordan-testing", now)
-	b := playtimeNode("b", "jordan-testing", now)
-	foreign := playtimeNode("foreign", "someone-else", now)
-	c := fakePlaytimeClient(a, b, foreign)
+	a := playpenNode("a", "jordan-testing", now)
+	b := playpenNode("b", "jordan-testing", now)
+	foreign := playpenNode("foreign", "someone-else", now)
+	c := fakePlaypenClient(a, b, foreign)
 
 	deleted, err := deleteAllRuns(context.Background(), c, "jordan-testing")
 	if err != nil {
@@ -313,7 +313,7 @@ func TestDeleteAllRuns(t *testing.T) {
 func TestEnsureSharedRBACIdempotent(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Namespace = "jordan-testing"
-	c := fakePlaytimeClient()
+	c := fakePlaypenClient()
 	ctx := context.Background()
 
 	saName, err := ensureSharedRBAC(ctx, c, cfg)

@@ -20,7 +20,7 @@ func TestDeleteSharedResources(t *testing.T) {
 	ctx := context.Background()
 	cfg := DefaultConfig()
 	cfg.Namespace = "jordan-testing"
-	c := fakePlaytimeClient()
+	c := fakePlaypenClient()
 
 	// Provision every shared object up would create if missing.
 	if err := ensureNamespace(ctx, c, cfg); err != nil {
@@ -66,7 +66,7 @@ func TestDeleteSharedResourcesIdempotent(t *testing.T) {
 	ctx := context.Background()
 	cfg := DefaultConfig()
 	cfg.Namespace = "jordan-testing"
-	c := fakePlaytimeClient()
+	c := fakePlaypenClient()
 
 	// Nothing provisioned: deleting missing shared objects is not an error and
 	// reports nothing deleted.
@@ -90,7 +90,7 @@ func TestDeleteSharedResourcesLeavesForeignScope(t *testing.T) {
 	other.Namespace = "someone-else"
 	other.NodeSite = "someone-else-site"
 
-	c := fakePlaytimeClient()
+	c := fakePlaypenClient()
 
 	for _, cfg := range []Config{mine, other} {
 		if err := ensureNamespace(ctx, c, cfg); err != nil {

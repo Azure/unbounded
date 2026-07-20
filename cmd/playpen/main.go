@@ -26,12 +26,12 @@ func main() {
 	keepUp := false
 
 	root := &cobra.Command{
-		Use:     "playtime",
+		Use:     "playpen",
 		Short:   "Ride a VXLAN overlay over the unbounded-net WireGuard mesh",
 		Version: version.Version + " (commit: " + version.GitCommit + ")",
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.SetVersionTemplate("playtime {{.Version}}\n")
+	root.SetVersionTemplate("playpen {{.Version}}\n")
 
 	bindGlobalFlags(root, &cfg)
 
@@ -50,17 +50,17 @@ func main() {
 
 	downCmd := &cobra.Command{
 		Use:   "down",
-		Short: "Delete the cluster resources created by playtime",
+		Short: "Delete the cluster resources created by playpen",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runDown(cmd.Context(), cfg, downAll)
 		},
 	}
-	downCmd.Flags().BoolVar(&downAll, "all", false, "delete every playtime run in the namespace scope (not just the most recent)")
+	downCmd.Flags().BoolVar(&downAll, "all", false, "delete every playpen run in the namespace scope (not just the most recent)")
 
 	cleanupCmd := &cobra.Command{
 		Use:   "cleanup",
-		Short: "Delete the shared resources playtime otherwise never cleans up",
-		Long: "Deletes every playtime run in the namespace scope and then the shared, " +
+		Short: "Delete the shared resources playpen otherwise never cleans up",
+		Long: "Deletes every playpen run in the namespace scope and then the shared, " +
 			"unowned resources that up creates if missing and reuses across runs: the " +
 			"reaper RBAC (ClusterRoleBinding, ClusterRole, ServiceAccount), the " +
 			"bootstrapped Site and SiteGatewayPoolAssignment, and the shared namespace. " +

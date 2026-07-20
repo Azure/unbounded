@@ -2,13 +2,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Metalman PXE smoke test driven against a remote playtime VM.
+"""Metalman PXE smoke test driven against a remote playpen VM.
 
 This test provisions a bare-metal Machine end to end (PXE network boot,
 cloud-init, kubelet join, then power operations) WITHOUT running any virtual
 machine on the host executing this script. The guest is a cloud-hypervisor VM
-that lives inside a playtime demo pod on a remote KVM-capable node, reachable
-over a userspace VXLAN-over-WireGuard overlay that `playtime up` establishes.
+that lives inside a playpen demo pod on a remote KVM-capable node, reachable
+over a userspace VXLAN-over-WireGuard overlay that `playpen up` establishes.
 
 Two clusters are involved:
 
@@ -19,32 +19,32 @@ Two clusters are involved:
     it.
 
   * The current kubectl context (--context) is a real cluster that has a
-    KVM-capable node and the unbounded-net gateway mesh. playtime runs its
-    VM-hosting pod there. ONLY playtime talks to this cluster.
+    KVM-capable node and the unbounded-net gateway mesh. playpen runs its
+    VM-hosting pod there. ONLY playpen talks to this cluster.
 
-Networking is stitched together entirely by playtime's userspace overlay:
+Networking is stitched together entirely by playpen's userspace overlay:
 
   * The overlay client IP (172.31.99.2) is where metalman's DHCP next-server,
     TFTP server, HTTP serve-url, the OCI registry, the agent download server,
-    and the KIND API server all appear to the guest. playtime --forward rules
+    and the KIND API server all appear to the guest. playpen --forward rules
     map guest connections to those overlay ports back to 127.0.0.1 on this
     host, where the real services bind.
 
-  * metalman runs in DHCP relay mode (empty --dhcp-interface). playtime relays
+  * metalman runs in DHCP relay mode (empty --dhcp-interface). playpen relays
     the guest's DHCP to metalman and metalman advertises 172.31.99.2 as the
     next-server via the new --advertise-ip flag while binding 127.0.0.1.
 
-  * The guest's Redfish BMC is served inside the pod; playtime exposes it at
+  * The guest's Redfish BMC is served inside the pod; playpen exposes it at
     https://127.0.0.1:8443 (localforward), which metalman drives for power and
     boot control.
 
-Run as a normal user that has passwordless sudo. playtime runs as the invoking
+Run as a normal user that has passwordless sudo. playpen runs as the invoking
 user (so its Kubernetes client uses the normal kubeconfig / --context); metalman
 runs under sudo because its TFTP server binds the privileged port 69, and
-playtime is granted CAP_NET_BIND_SERVICE (via setcap) so it can bind the
+playpen is granted CAP_NET_BIND_SERVICE (via setcap) so it can bind the
 privileged DHCP relay port 67 without sudo.
 
-The playtime pod image (which must include the guest-disk support this test
+The playpen pod image (which must include the guest-disk support this test
 relies on) is pulled by the remote pod, so it must be published to a registry
 the target cluster can pull from. Pass its fully-qualified reference with
 --pod-image.
@@ -84,12 +84,12 @@ NODE_LABEL_VALUE = "metalman"
 METALMAN_NAMESPACE = "unbounded-kube"
 METALMAN_CONTROLLER_SA = "metalman-controller"
 
-# Overlay addressing established by `playtime up`. The client end of the overlay
+# Overlay addressing established by `playpen up`. The client end of the overlay
 # (this host) is OVERLAY_CLIENT_IP; every service the guest must reach is
 # advertised there and forwarded back to 127.0.0.1 on this host. OVERLAY_NODE_IP
 # is the static lease the guest receives via metalman's DHCP.
 OVERLAY_CLIENT_IP = "172.31.99.2"
-# The pod (remote) end of the overlay. playtime's in-pod netboot HTTP reverse
+# The pod (remote) end of the overlay. playpen's in-pod netboot HTTP reverse
 # proxy listens here and forwards to the client IP, so the guest bootloader
 # fetches the large netboot payload over the fast pod<->guest LAN hop while the
 # pod re-originates to the client over the overlay using its real kernel TCP.
@@ -110,10 +110,10 @@ OVERLAY_GATEWAY = OVERLAY_POD_IP
 # guest reaches it through the pod: kube-proxy DNATs the ClusterIP in the pod
 # netns PREROUTING for the forwarded, masqueraded guest traffic.
 DNS_SERVER = "10.0.0.10"
-# The guest NIC MAC. Must match playtime's --vm-mac (its default).
+# The guest NIC MAC. Must match playpen's --vm-mac (its default).
 MAC_ADDRESS = "52:54:00:12:34:56"
 
-# playtime's in-pod Redfish server, exposed locally by playtime's localforward.
+# playpen's in-pod Redfish server, exposed locally by playpen's localforward.
 REDFISH_PORT = 8443
 REDFISH_URL = f"https://127.0.0.1:{REDFISH_PORT}"
 REDFISH_USERNAME = "admin"
@@ -123,10 +123,10 @@ REDFISH_DEVICE_ID = "1"
 HTTP_PORT = 8880
 AGENT_DOWNLOAD_PORT = 8881
 REGISTRY_PORT = 5555
-# metalman TFTP binds this privileged port on the host loopback; playtime's
+# metalman TFTP binds this privileged port on the host loopback; playpen's
 # TFTP proxy forwards the guest's overlay requests here.
 TFTP_PORT = 69
-# playtime binds this privileged DHCP relay port on the host loopback; metalman
+# playpen binds this privileged DHCP relay port on the host loopback; metalman
 # unicasts its DHCP replies to it. metalman itself listens on a separate
 # unprivileged port to avoid a bind conflict (it has no SO_REUSEADDR).
 DHCP_RELAY_PORT = 67
@@ -155,7 +155,7 @@ AGENT_IMAGE_NAME_VM = f"{OVERLAY_CLIENT_IP}:{REGISTRY_PORT}/unbounded/agent-ubun
 BINARY = REPO_ROOT / "bin" / "metalman"
 AGENT_BINARY = REPO_ROOT / "bin" / "unbounded-agent"
 KUBECTL_UNBOUNDED = REPO_ROOT / "bin" / "kubectl-unbounded"
-PLAYTIME = REPO_ROOT / "bin" / "playtime"
+PLAYPEN = REPO_ROOT / "bin" / "playpen"
 
 # The API server URL the guest uses (kindnet, kube-proxy, and the joining
 # kubelet). The guest reaches the KIND API server over the overlay, forwarded
@@ -169,11 +169,11 @@ NSPAWN_MACHINE = "kube1"
 # kubectl targeting the KIND control-plane cluster. Set in main() once the
 # --kind-context argument is known.
 KUBECTL: list[str] = ["kubectl"]
-# The playtime target context (the real cluster). Set in main().
+# The playpen target context (the real cluster). Set in main().
 REAL_CONTEXT = ""
-# The playtime pod image. Set in main().
+# The playpen pod image. Set in main().
 POD_IMAGE = ""
-# The node to pin the playtime pod on. Set in main().
+# The node to pin the playpen pod on. Set in main().
 POD_NODE = ""
 # Host loopback port the KIND API server listens on. Set in main().
 KIND_APISERVER_PORT = 0
@@ -339,11 +339,11 @@ def collect_debug_logs() -> None:
 
 def lean_teardown() -> None:
     """Best-effort teardown of host-side resources (no libvirt, no iptables)."""
-    # Ask playtime to delete the pod, overlay, Site, and temporary Node it
-    # created. Terminating the `playtime up` process (below, in cleanup) also
+    # Ask playpen to delete the pod, overlay, Site, and temporary Node it
+    # created. Terminating the `playpen up` process (below, in cleanup) also
     # triggers its own cleanup, but `down` is a belt-and-suspenders backstop.
-    if PLAYTIME.exists() and REAL_CONTEXT:
-        run_quiet([str(PLAYTIME), "down", "--context", REAL_CONTEXT], check=False)
+    if PLAYPEN.exists() and REAL_CONTEXT:
+        run_quiet([str(PLAYPEN), "down", "--context", REAL_CONTEXT], check=False)
     # Kill any leftover metalman serve-pxe from a previous run. Use the binary
     # path to avoid matching this script (smoke-metalman.py).
     run_quiet(["sudo", "pkill", "-f", "bin/metalman"], check=False)
@@ -482,7 +482,7 @@ def configure_kind_kube_proxy_apiserver(api_server: str) -> None:
 
 
 def _redfish_opener() -> urllib.request.OpenerDirector:
-    """Return a urllib opener that trusts playtime's self-signed Redfish cert."""
+    """Return a urllib opener that trusts playpen's self-signed Redfish cert."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -490,7 +490,7 @@ def _redfish_opener() -> urllib.request.OpenerDirector:
 
 
 def redfish_power_state() -> str | None:
-    """Return the guest PowerState via playtime's forwarded Redfish, or None."""
+    """Return the guest PowerState via playpen's forwarded Redfish, or None."""
     creds = b64encode(f"{REDFISH_USERNAME}:{REDFISH_PASSWORD}".encode()).decode()
     req = urllib.request.Request(
         f"{REDFISH_URL}/redfish/v1/Systems/{REDFISH_DEVICE_ID}",
@@ -521,28 +521,28 @@ def wait_redfish_power_state(expected: str, timeout: int = 180) -> None:
     die(f"Timed out waiting for guest Redfish PowerState to be {expected!r}")
 
 
-def wait_playtime_ready(timeout: int = 300) -> None:
-    """Wait until playtime's forwarded Redfish service root answers."""
-    log("  Waiting for playtime overlay + guest Redfish to become reachable...")
+def wait_playpen_ready(timeout: int = 300) -> None:
+    """Wait until playpen's forwarded Redfish service root answers."""
+    log("  Waiting for playpen overlay + guest Redfish to become reachable...")
     for elapsed in range(timeout):
         check_procs()
         req = urllib.request.Request(f"{REDFISH_URL}/redfish/v1/")
         try:
             with _redfish_opener().open(req, timeout=10) as resp:
                 if resp.status == 200:
-                    log("  playtime Redfish service root is reachable")
+                    log("  playpen Redfish service root is reachable")
                     return
         except (urllib.error.HTTPError,) as e:
             # Any HTTP response (even 401) proves the forward + server are up.
             if e.code in (401, 403, 404):
-                log("  playtime Redfish service root is reachable")
+                log("  playpen Redfish service root is reachable")
                 return
         except (urllib.error.URLError, ssl.SSLError, OSError):
             pass
         if elapsed > 0 and elapsed % 15 == 0:
-            log(f"    ({elapsed}s) playtime not reachable yet")
+            log(f"    ({elapsed}s) playpen not reachable yet")
         time.sleep(1)
-    die("Timed out waiting for playtime overlay / guest Redfish to be reachable")
+    die("Timed out waiting for playpen overlay / guest Redfish to be reachable")
 
 
 def machine_status() -> str | None:
@@ -870,17 +870,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--pod-image", required=True,
-        help="fully-qualified playtime pod image reference (must include the "
+        help="fully-qualified playpen pod image reference (must include the "
              "guest-disk support), pullable by the target cluster",
     )
     parser.add_argument(
         "--pod-node", default="node-1",
-        help="node in the target cluster to pin the playtime pod on "
+        help="node in the target cluster to pin the playpen pod on "
              "(must be KVM-capable); default node-1",
     )
     parser.add_argument(
         "--context", default=default_context,
-        help="kubectl context of the real cluster playtime targets "
+        help="kubectl context of the real cluster playpen targets "
              "(default: current context)",
     )
     parser.add_argument(
@@ -906,9 +906,9 @@ def main() -> None:
     atexit.register(cleanup)
 
     log(f"KIND control plane context: {args.kind_context}")
-    log(f"playtime target context:    {REAL_CONTEXT}")
-    log(f"playtime pod image:         {POD_IMAGE}")
-    log(f"playtime pod node:          {POD_NODE}")
+    log(f"playpen target context:    {REAL_CONTEXT}")
+    log(f"playpen pod image:         {POD_IMAGE}")
+    log(f"playpen pod node:          {POD_NODE}")
 
     KIND_APISERVER_PORT = kind_apiserver_port()
 
@@ -930,7 +930,7 @@ def main() -> None:
     log("Rendering machina manifests")
     run(["make", "machina-manifests"], cwd=str(REPO_ROOT))
 
-    log("Building metalman, kubectl-unbounded, unbounded-agent, and playtime (parallel)")
+    log("Building metalman, kubectl-unbounded, unbounded-agent, and playpen (parallel)")
     go_builds: list[tuple[str, subprocess.Popen[Any]]] = [
         ("metalman", subprocess.Popen(
             ["go", "build", "-o", str(BINARY), "./cmd/metalman"],
@@ -944,8 +944,8 @@ def main() -> None:
             ["go", "build", "-o", str(KUBECTL_UNBOUNDED), "./cmd/kubectl-unbounded"],
             cwd=str(REPO_ROOT),
         )),
-        ("playtime", subprocess.Popen(
-            ["go", "build", "-o", str(PLAYTIME), "./cmd/playtime"],
+        ("playpen", subprocess.Popen(
+            ["go", "build", "-o", str(PLAYPEN), "./cmd/playpen"],
             cwd=str(REPO_ROOT),
         )),
     ]
@@ -966,7 +966,7 @@ def main() -> None:
     kubectl(["apply", "--server-side", "--force-conflicts", "-f", str(REPO_ROOT / "deploy" / "machina" / "rendered" / "06-metalman-rbac.yaml")])
 
     log("Creating Kubernetes resources")
-    # playtime's in-pod Redfish requires a non-empty password (its default is
+    # playpen's in-pod Redfish requires a non-empty password (its default is
     # "password"); metalman authenticates with it via this secret.
     kubectl(["-n", NODE_NS, "create", "secret", "generic",
              "bmc-pass", f"--from-literal=password={REDFISH_PASSWORD}"])
@@ -1031,22 +1031,22 @@ def main() -> None:
     log("Pruning Docker build cache to free disk space")
     run_quiet(["docker", "builder", "prune", "-af"], check=False)
 
-    # Assign the guest's overlay lease IP to loopback so playtime's proxies can
+    # Assign the guest's overlay lease IP to loopback so playpen's proxies can
     # bind their egress source to it when dialing metalman on 127.0.0.1. The
     # kernel then reports the guest IP as the peer to the loopback-bound
     # metalman, so metalman resolves the Machine by its real DHCP lease.
     log(f"Assigning {OVERLAY_NODE_IP}/32 to lo for proxy source-IP preservation")
     run_quiet(["sudo", "-n", "ip", "addr", "add", f"{OVERLAY_NODE_IP}/32", "dev", "lo"], check=False)
 
-    # Grant playtime the capability to bind the privileged DHCP relay port (67)
+    # Grant playpen the capability to bind the privileged DHCP relay port (67)
     # so it can run as the invoking user (and use the normal kubeconfig for the
     # real cluster context) without sudo.
-    log("Granting playtime CAP_NET_BIND_SERVICE for the DHCP relay port")
-    run(["sudo", "setcap", "cap_net_bind_service=+ep", str(PLAYTIME)])
+    log("Granting playpen CAP_NET_BIND_SERVICE for the DHCP relay port")
+    run(["sudo", "setcap", "cap_net_bind_service=+ep", str(PLAYPEN)])
 
-    log("Starting playtime overlay (remote guest VM)")
-    playtime_proc = spawn([
-        str(PLAYTIME), "up", "--keep-up",
+    log("Starting playpen overlay (remote guest VM)")
+    playpen_proc = spawn([
+        str(PLAYPEN), "up", "--keep-up",
         "--context", REAL_CONTEXT,
         "--pod-node", POD_NODE,
         "--pod-image", POD_IMAGE,
@@ -1056,7 +1056,7 @@ def main() -> None:
         # (wget | gunzip | dd) can run its stages on separate cores. The pod
         # CPU limit is 4 (requests 0.5), so this bursts without a large request.
         "--vm-cpus", "4",
-        # Bind playtime's proxy egress to the guest's overlay lease IP so
+        # Bind playpen's proxy egress to the guest's overlay lease IP so
         # metalman (bound to 127.0.0.1) sees requests coming from the real
         # guest IP and resolves the Machine by its real DHCP lease. Requires
         # OVERLAY_NODE_IP to be assigned to lo on the host (done in main()).
@@ -1072,14 +1072,14 @@ def main() -> None:
         "--forward", f"{AGENT_DOWNLOAD_PORT}:{AGENT_DOWNLOAD_PORT}",
         "--forward", f"{REGISTRY_PORT}:{REGISTRY_PORT}",
         # DHCP relay: metalman listens on METALMAN_DHCP_PORT and unicasts its
-        # replies to the giaddr (127.0.0.1) on port 67, which playtime binds.
+        # replies to the giaddr (127.0.0.1) on port 67, which playpen binds.
         "--dhcp-server", f"127.0.0.1:{METALMAN_DHCP_PORT}",
         "--dhcp-giaddr", "127.0.0.1",
         "--dhcp-relay-port", str(DHCP_RELAY_PORT),
         "--tftp-server", f"127.0.0.1:{TFTP_PORT}",
-    ], TMPDIR / "playtime.log")
-    log(f"  playtime PID={playtime_proc.pid}")
-    wait_playtime_ready(timeout=300)
+    ], TMPDIR / "playpen.log")
+    log(f"  playpen PID={playpen_proc.pid}")
+    wait_playpen_ready(timeout=300)
 
     # Kindnet's CONTROL_PLANE_ENDPOINT and kube-proxy's API server must be
     # reachable by the guest kubelet's pods. They reach the KIND API server over
@@ -1222,7 +1222,7 @@ def main() -> None:
 
     # metalman runs under sudo because its TFTP server binds the privileged
     # port 69. It binds loopback but advertises the overlay client IP as the
-    # DHCP next-server and serve-url host so playtime's proxies (which dial
+    # DHCP next-server and serve-url host so playpen's proxies (which dial
     # loopback) can reach it while the guest sees an overlay-routable address.
     proc = spawn([
         "sudo", "env", *metalman_env,

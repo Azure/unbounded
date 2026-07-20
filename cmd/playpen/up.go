@@ -78,7 +78,7 @@ func runUp(ctx context.Context, cfg Config, pingCount int, keepUp bool) error {
 	if reaped, err := reapExpired(ctx, c, cfg.Namespace, time.Now()); err != nil {
 		fmt.Printf("warning: reaping stale runs: %v\n", err)
 	} else if len(reaped) > 0 {
-		fmt.Printf("reaped %d expired playtime run(s): %v\n", len(reaped), reaped)
+		fmt.Printf("reaped %d expired playpen run(s): %v\n", len(reaped), reaped)
 	}
 
 	// The temporary node registers into a dedicated site, so that site (and its

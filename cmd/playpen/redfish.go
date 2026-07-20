@@ -136,7 +136,7 @@ func (s *redfishServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.authenticated(r) {
-		w.Header().Set("WWW-Authenticate", "Basic realm=\"playtime\"")
+		w.Header().Set("WWW-Authenticate", "Basic realm=\"playpen\"")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 
 		return
@@ -206,7 +206,7 @@ func (s *redfishServer) getSystem(w http.ResponseWriter, r *http.Request) {
 		"@odata.id":   systemPath,
 		"@odata.type": "#ComputerSystem.v1_20_0.ComputerSystem",
 		"Id":          s.deviceID,
-		"Name":        "playtime guest",
+		"Name":        "playpen guest",
 		"PowerState":  state,
 		"Boot":        bootJSON,
 		"EthernetInterfaces": map[string]any{
@@ -218,7 +218,7 @@ func (s *redfishServer) getSystem(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// patchSystem applies a Redfish boot source override PATCH. playtime records the
+// patchSystem applies a Redfish boot source override PATCH. playpen records the
 // override so metalman's SetBootOverride/SetHTTPBootOverride/DisableBootOverride
 // succeed and are reflected back by a subsequent GET (GetBootConfig). When the
 // override selects UefiHttp with an HttpBootUri, the client-side boot reader
@@ -323,7 +323,7 @@ func (s *redfishServer) getEthernetInterface(w http.ResponseWriter, _ *http.Requ
 		"@odata.id":           "/redfish/v1/Systems/" + s.deviceID + "/EthernetInterfaces/" + redfishNICID,
 		"@odata.type":         "#EthernetInterface.v1_9_0.EthernetInterface",
 		"Id":                  redfishNICID,
-		"Name":                "playtime guest NIC",
+		"Name":                "playpen guest NIC",
 		"MACAddress":          s.mac,
 		"PermanentMACAddress": s.mac,
 		"DHCPv4":              map[string]any{"DHCPEnabled": nic.dhcpEnabled},
@@ -393,7 +393,7 @@ func (s *redfishServer) getBIOSSettings(w http.ResponseWriter, _ *http.Request) 
 
 // patchBIOSSettings merges metalman's vendor BIOS attribute PATCH (UrlBootFile,
 // static IPv4 attributes) into the pending settings. These are the best-effort
-// vendor fallback metalman also writes; playtime records them for fidelity and
+// vendor fallback metalman also writes; playpen records them for fidelity and
 // so a subsequent GetBIOSHTTPBootURI reflects the value.
 func (s *redfishServer) patchBIOSSettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -584,7 +584,7 @@ func selfSignedCert(overlayIP string) (tls.Certificate, string, error) {
 
 	tmpl := x509.Certificate{
 		SerialNumber:          big.NewInt(notBefore.UnixNano()),
-		Subject:               pkix.Name{CommonName: "playtime-redfish"},
+		Subject:               pkix.Name{CommonName: "playpen-redfish"},
 		NotBefore:             notBefore,
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,

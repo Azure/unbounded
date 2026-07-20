@@ -1,6 +1,0 @@
-# kind cluster topology for the playpen e2e suite.
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-name: playpen-e2e
-nodes:
-  - role: control-plane

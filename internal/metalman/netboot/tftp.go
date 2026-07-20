@@ -39,7 +39,7 @@ func (t *TFTPServer) Start(ctx context.Context) error {
 	// Enable the sender "anticipate" window so the server streams a burst of
 	// DATA blocks ahead of the client ACKs instead of waiting for each ACK.
 	// Classic lockstep TFTP (one block, one ACK) is unusable over a high-RTT
-	// path such as the playtime WireGuard overlay: a 68MB initrd would need
+	// path such as the playpen WireGuard overlay: a 68MB initrd would need
 	// tens of thousands of serial round trips and times out. Anticipation keeps
 	// the pipe full and is server-side only, so no client or firmware change is
 	// required (standard clients still ACK every block in order). 60 is the
