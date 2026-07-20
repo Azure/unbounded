@@ -158,9 +158,12 @@ const (
 	DefaultAzureLinux3OCIImage       = "ghcr.io/azure/agent-azlinux3:v20260619"
 	DefaultAzureLinux3NvidiaOCIImage = "ghcr.io/azure/agent-azlinux3-nvidia:v20260626"
 
-	SystemdUnitContainerd   = "containerd.service"
-	ContainerdConfigPath    = "/etc/containerd/config.toml"
-	ContainerdConfDropInDir = "/etc/containerd/conf.d"
+	SystemdUnitContainerd      = "containerd.service"
+	ContainerdConfigPath       = "/etc/containerd/config.toml"
+	ContainerdConfDropInDir    = "/etc/containerd/conf.d"
+	ContainerdCertsDir         = "/etc/containerd/certs.d"
+	ContainerdDefaultHostsDir  = ContainerdCertsDir + "/_default"
+	ContainerdDefaultHostsPath = ContainerdDefaultHostsDir + "/hosts.toml"
 
 	SystemdUnitKubelet             = "kubelet.service"
 	KubeletKubeconfigPath          = "/var/lib/kubelet/kubeconfig"
