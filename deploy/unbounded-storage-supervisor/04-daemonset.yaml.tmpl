@@ -27,6 +27,8 @@ spec:
       # The supervisor installs and supervises a host-level daemon, so it needs
       # broad host access.
       hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       # The run container watches Nodes to discover storage-ring peers; bind
       # the supervisor ServiceAccount that carries the nodes list/watch grant.
       serviceAccountName: unbounded-storage-supervisor
@@ -53,6 +55,10 @@ spec:
             # PID 1 target and a privileged container).
             - name: SYSTEMCTL
               value: "nsenter -t 1 -m -u -i -n -p systemctl"
+            # The run container starts the service after rendering the startup
+            # config, so the daemon never starts against stale or empty config.
+            - name: NO_ENABLE
+              value: "1"
           volumeMounts:
             - name: storage-prefix
               mountPath: /opt/unbounded-storage
@@ -78,8 +84,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: STORAGE_DEVICE_INVENTORY_URL
-              value: "http://127.0.0.1:9100/inventory"
+            - name: STORAGE_BLOCK_INVENTORY_URL
+              value: "http://127.0.0.1:9100/inventory/block"
+            - name: SYSTEMCTL
+              value: "nsenter -t 1 -m -u -i -n -p systemctl"
+            - name: START_SERVICE_AFTER_RENDER
+              value: "1"
           volumeMounts:
             - name: storage-config
               mountPath: /etc/unbounded-storage

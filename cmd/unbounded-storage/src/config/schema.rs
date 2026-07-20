@@ -89,6 +89,9 @@ impl Config {
         // zero value) is the intended "disabled" default and is left as
         // is. Materialize the section so the accessor never panics.
         startup.metrics.get_or_insert_with(MetricsCfg::default);
+        startup
+            .fabric_discovery
+            .get_or_insert_with(FabricDiscoveryCfg::default);
     }
 
     /// Startup-fixed settings section. Panics if called before
@@ -173,7 +176,7 @@ impl PeerSpec {
     pub fn wire_addr(&self) -> Option<&str> {
         match self.config.as_ref() {
             Some(peer_spec::Config::Tcp(cfg)) => Some(cfg.addr.as_str()),
-            Some(peer_spec::Config::Rdma(cfg)) => Some(cfg.addr.as_str()),
+            Some(peer_spec::Config::Rdma(cfg)) => Some(cfg.discovery_addr.as_str()),
             None => None,
         }
     }
@@ -307,6 +310,13 @@ impl StartupCfg {
     /// Metrics section. Valid after [`Config::apply_defaults`].
     pub fn metrics(&self) -> &MetricsCfg {
         self.metrics.as_ref().expect("metrics section populated")
+    }
+
+    /// Fabric discovery section. Valid after [`Config::apply_defaults`].
+    pub fn fabric_discovery(&self) -> &FabricDiscoveryCfg {
+        self.fabric_discovery
+            .as_ref()
+            .expect("fabric discovery section populated")
     }
 }
 

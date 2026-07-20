@@ -136,7 +136,7 @@ addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
 
 # Or, for RDMA peers:
 # [peers.config.rdma]
-# addr     = "hex:deadbeef"      # provider-native libfabric address bytes.
+# discovery_addr = "10.0.0.1:9101" # peer's fabric discovery HTTP endpoint.
 
 [[caches]]
 name = "cache"
@@ -197,6 +197,13 @@ addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
 # Or use automatic RDMA HCA binding:
 # [startup.fabric.binds.auto_rdma]
 # hcas_per_numa_node = 1        # max HCAs used per NUMA node.
+
+# Required when RDMA peers discover this node. The endpoint advertises every
+# realized libfabric listener address. Each caller resolves those candidates
+# through its HCA-pinned libfabric domains and selects a complete one-to-one
+# local-HCA-to-remote-listener matching.
+# [startup.fabric_discovery]
+# addr = "0.0.0.0:9101"
 
 [startup.topology]
 # serving_cores       = 12       # optional serving-shard cap; omit to use every usable CPU.

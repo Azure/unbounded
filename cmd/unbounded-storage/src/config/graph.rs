@@ -406,13 +406,13 @@ mod tests {
         }
     }
 
-    fn rdma_peer(name: &str, addr: &str) -> PeerSpec {
+    fn rdma_peer(name: &str, discovery_addr: &str) -> PeerSpec {
         PeerSpec {
             name: name.to_string(),
             tags: Vec::new(),
             config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
-                addr: addr.to_string(),
-                addrs: Vec::new(),
+                discovery_addr: discovery_addr.to_string(),
+                ..RdmaPeerConfig::default()
             })),
         }
     }
@@ -437,8 +437,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
         cfg.self_ = "node-a".to_string();
-        cfg.peers.push(rdma_peer("node-a", "hex:00"));
-        cfg.peers.push(rdma_peer("node-b", "hex:01"));
+        cfg.peers.push(rdma_peer("node-a", "127.0.0.1:9101"));
+        cfg.peers.push(rdma_peer("node-b", "127.0.0.2:9101"));
 
         let graph = runtime_projection(&cfg).unwrap();
         let peers = &graph.mesh.peers;
@@ -509,8 +509,8 @@ mod tests {
     fn runtime_projection_rejects_duplicate_rdma_peer_names() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.peers.push(rdma_peer("node-a", "hex:00"));
-        cfg.peers.push(rdma_peer("node-a", "hex:01"));
+        cfg.peers.push(rdma_peer("node-a", "127.0.0.1:9101"));
+        cfg.peers.push(rdma_peer("node-a", "127.0.0.2:9101"));
 
         let err = runtime_projection(&cfg).unwrap_err();
         assert!(err.contains("peer \"node-a\" is duplicated"), "{err}");

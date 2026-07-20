@@ -29,14 +29,6 @@ import (
 // leaving the peer set stale.
 const nodeInformerResync = 30 * time.Second
 
-// placeholderRdmaSelfAddr is only used before a node's daemon has published
-// live RDMA inventory. Config validation requires each peer to carry a valid
-// address, while the daemon needs self set on the first render because peer
-// identity is startup-fixed. This native address is never dialed: runtime
-// projection removes the self peer from the remote peer set, and a later render
-// replaces it with the daemon's real inventory address.
-const placeholderRdmaSelfAddr = "hex:00"
-
 // ringState is a pure snapshot of the storage ring this node belongs to,
 // computed from the watched Node set and the fabric port. It is the seam
 // between the Kubernetes node watch (peerWatcher) and the pure renderer
@@ -181,18 +173,24 @@ func (w *peerWatcher) snapshot(port int, portOK bool) renderState {
 	return state
 }
 
-// snapshotRdma computes render state for RDMA fabrics. Local bind addresses are
-// owned by the daemon's auto-RDMA/explicit-RDMA startup config, so unlike TCP
-// this does not override startup.fabric; it only injects self and peer RDMA
-// addresses published by other supervisors.
-func (w *peerWatcher) snapshotRdma() renderState {
+// snapshotRdma computes render state for RDMA fabrics. Local fabric listeners
+// are owned by the daemon's startup config; peers use the dedicated HTTP
+// discovery port and each node's InternalIP.
+func (w *peerWatcher) snapshotRdma(port int, portOK bool) renderState {
 	objs := w.informer.GetStore().List()
 	nodes := nodesFromInformerObjects(objs)
 
-	return renderState{
-		annotations: selfAnnotations(nodes, w.selfName),
-		ring:        computeRDMARing(nodes, w.selfName, w.ringLabel),
+	state := renderState{annotations: selfAnnotations(nodes, w.selfName)}
+	if !portOK || port == 0 {
+		slog.Warn("storage ring inactive: no fixed fabric discovery port set in startup.fabric_discovery.addr; "+
+			"set a non-zero port (e.g. 0.0.0.0:9101) to enable RDMA peering", "node", w.selfName)
+
+		return state
 	}
+
+	state.ring = computeRDMARing(nodes, w.selfName, w.ringLabel, port)
+
+	return state
 }
 
 func nodesFromInformerObjects(objs []any) []*corev1.Node {
@@ -285,10 +283,8 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 }
 
 // computeRDMARing mirrors computeRing's label-membership rules, but peers are
-// dialed through their published RDMA HCA inventory annotation. The daemon
-// config currently models one RDMA address per peer name, so discovery chooses
-// the first address from each peer's full HCA inventory.
-func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState {
+// resolved through the daemon's HTTP fabric-discovery endpoint.
+func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string, port int) ringState {
 	var self *corev1.Node
 
 	for _, n := range nodes {
@@ -310,6 +306,12 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 		return ringState{}
 	}
 
+	if internalIP(self) == "" {
+		slog.Warn("storage ring inactive: this node has no InternalIP", "node", selfName)
+
+		return ringState{}
+	}
+
 	ring := ringState{
 		active:   true,
 		selfName: selfName,
@@ -325,63 +327,18 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 			continue
 		}
 
-		addrs, err := rdmaInventoryAddrs(n.Annotations[storageRdmaHcasAnnotation])
-		if err != nil {
-			if n.Name == selfName {
-				slog.Warn("storage ring inactive: this node has invalid rdma inventory", "node", selfName, "ring", ringValue, "error", err)
-
-				return ringState{}
-			}
-
-			slog.Warn("skipping storage ring peer with invalid rdma inventory", "peer", n.Name, "ring", ringValue, "error", err)
+		ip := internalIP(n)
+		if ip == "" {
+			slog.Warn("skipping storage ring peer with no InternalIP", "peer", n.Name, "ring", ringValue)
 
 			continue
-		}
-
-		addr := ""
-		if len(addrs) > 0 {
-			addr = addrs[0]
-		}
-
-		if addr == "" {
-			if n.Name != selfName {
-				slog.Warn("skipping storage ring peer with no rdma address", "peer", n.Name, "ring", ringValue)
-
-				continue
-			}
-
-			// The daemon's local peer identity is startup-fixed, but RDMA
-			// inventory is only available after the daemon has started. Emit a
-			// valid placeholder for self so the first render locks in the peer
-			// name; later renders replace it with the daemon-published address.
-			addr = placeholderRdmaSelfAddr
-		}
-
-		addr, ok = rdmaPeerDialAddr(addr, n)
-		if !ok {
-			if n.Name == selfName {
-				slog.Warn("storage ring inactive: this node has wildcard rdma address but no InternalIP", "node", selfName, "ring", ringValue)
-
-				return ringState{}
-			}
-
-			slog.Warn("skipping storage ring peer with wildcard rdma address but no InternalIP", "peer", n.Name, "ring", ringValue)
-
-			continue
-		}
-
-		if len(addrs) == 0 {
-			addrs = []string{addr}
-		} else {
-			addrs = rewriteRdmaPeerDialAddrs(addrs, n)
-			addrs[0] = addr
 		}
 
 		seen[n.Name] = struct{}{}
 		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
 			Name: n.Name,
 			Config: &storageconfig.PeerSpec_Rdma{
-				Rdma: &storageconfig.RdmaPeerConfig{Addr: addr, Addrs: addrs},
+				Rdma: &storageconfig.RdmaPeerConfig{DiscoveryAddr: net.JoinHostPort(ip, strconv.Itoa(port))},
 			},
 		})
 	}
@@ -389,40 +346,6 @@ func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string) ringState
 	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Name < ring.peers[j].Name })
 
 	return ring
-}
-
-func rewriteRdmaPeerDialAddrs(addrs []string, node *corev1.Node) []string {
-	rewritten := make([]string, 0, len(addrs))
-	for _, addr := range addrs {
-		if addr == "" {
-			continue
-		}
-
-		if dialAddr, ok := rdmaPeerDialAddr(addr, node); ok {
-			rewritten = append(rewritten, dialAddr)
-		}
-	}
-
-	return rewritten
-}
-
-func rdmaPeerDialAddr(addr string, node *corev1.Node) (string, bool) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr, true
-	}
-
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsUnspecified() {
-		return addr, true
-	}
-
-	internal := internalIP(node)
-	if internal == "" {
-		return "", false
-	}
-
-	return net.JoinHostPort(internal, port), true
 }
 
 func selfAnnotations(nodes []*corev1.Node, selfName string) map[string]string {

@@ -32,10 +32,10 @@ use unbounded_storage::p2p::{RouteTableHandle, RoutedTransport};
 use unbounded_storage::ring::{NetHandle, NetworkRing};
 use unbounded_storage::runtime::{PinnedRuntime, ShardLoop, WorkerIdx, WorkerSpec};
 use unbounded_storage::storage::StripeReq;
+use unbounded_storage::storage::discovery::{DeviceWatcher, DiskScanner, resolve_loaded};
 use unbounded_storage::storage::disks::{
     CacheDirectorySet, ChainLocalStore, DiskRegistry, DiskReport, UringDiskTarget,
 };
-use unbounded_storage::storage::discovery::{DeviceWatcher, DiskScanner, resolve_loaded};
 use unbounded_storage::topology::{CorePlan, CorePlanConfig, DiskCpuSlot, Host, ServingShard};
 
 use unbounded_storage::memory::{BackingKind, BackingRequest, allocate};
@@ -248,6 +248,7 @@ fn main() -> ExitCode {
     // it now while `startup` borrows `config`, before `config` is moved
     // into the controller below. An empty string disables the exporter.
     let metrics_bind = startup.metrics().addr.clone();
+    let discovery_bind = startup.fabric_discovery().addr.clone();
     let backing_kind = if memory.no_hugepages {
         BackingKind::Heap
     } else {
@@ -448,12 +449,43 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let fabric_unit_addresses = layer.fabric_unit_addresses();
     let device_inventory = metrics::DeviceInventoryStatus::new();
-    device_inventory.set_rdma(device_inventory::rdma_annotation(
-        &host,
-        &layer.fabric_unit_addresses(),
-    ));
     device_inventory.set_block(device_inventory::block_annotation(&host));
+
+    let discovery_shutdown = Arc::new(AtomicBool::new(false));
+    let discovery_server = if discovery_bind.is_empty() {
+        None
+    } else {
+        let bind = discovery_bind
+            .parse()
+            .expect("validated fabric discovery address");
+        let candidates = fabric_unit_addresses.into_iter().map(|unit| unit.addr);
+        let server = match unbounded_storage::fabric_discovery::Server::bind(bind, candidates) {
+            Ok(server) => server,
+            Err(error) => {
+                eprintln!("fabric discovery: failed to bind {discovery_bind}: {error}");
+                shard_layer::teardown_shard_layer(layer);
+                clear_cache_disk_publications(&cache_directories);
+                disk_registry.drain();
+                return ExitCode::FAILURE;
+            }
+        };
+        let local_addr = server
+            .local_addr()
+            .expect("bound discovery listener address");
+        let shutdown = discovery_shutdown.clone();
+        let thread = thread::Builder::new()
+            .name("fabric-discovery-http".to_string())
+            .spawn(move || {
+                if let Err(error) = server.serve(shutdown) {
+                    eprintln!("fabric discovery server failed: {error}");
+                }
+            })
+            .expect("spawn fabric discovery server");
+        eprintln!("fabric discovery: listening on {local_addr}");
+        Some(thread)
+    };
 
     // The config controller is the single funnel for live changes. It
     // owns the running shard layer and disk supervisor (via the apply
@@ -522,13 +554,17 @@ fn main() -> ExitCode {
                             .is_some()
                             .then(|| controller.current().runtime().disks.as_slice());
                         let (loaded, error) = resolve_loaded(
-                            Arc::try_unwrap(update.loaded)
-                                .unwrap_or_else(|loaded| LoadedConfig::from_config(loaded.config().clone()).expect("validated watched config")),
+                            Arc::try_unwrap(update.loaded).unwrap_or_else(|loaded| {
+                                LoadedConfig::from_config(loaded.config().clone())
+                                    .expect("validated watched config")
+                            }),
                             &disk_scanner,
                             retained,
                         );
                         if let Some(e) = error {
-                            eprintln!("disk discovery: config reload scan failed; retaining last good targets: {e}");
+                            eprintln!(
+                                "disk discovery: config reload scan failed; retaining last good targets: {e}"
+                            );
                         }
                         match controller.apply(Arc::new(loaded)) {
                             Ok(outcome) => eprintln!(
@@ -564,7 +600,9 @@ fn main() -> ExitCode {
                     let loaded = LoadedConfig::from_config(raw).expect("current config is valid");
                     let (loaded, error) = resolve_loaded(loaded, &disk_scanner, Some(&retained));
                     if let Some(e) = error {
-                        eprintln!("disk discovery: rescan failed; retaining last good targets: {e}");
+                        eprintln!(
+                            "disk discovery: rescan failed; retaining last good targets: {e}"
+                        );
                         continue;
                     }
                     if let Err(e) = controller.apply(Arc::new(loaded)) {
@@ -593,6 +631,11 @@ fn main() -> ExitCode {
     }
     clear_cache_disk_publications(&cache_directories);
     disk_registry.drain();
+
+    discovery_shutdown.store(true, Ordering::Release);
+    if let Some(handle) = discovery_server {
+        let _ = handle.join();
+    }
 
     // The exporter polls `SHUTDOWN` on its accept loop; join it last so a
     // late scrape can still observe the final config versions during
@@ -1171,7 +1214,6 @@ fn reconcile_cache_disks(
 fn clear_cache_disk_publications(cache_directories: &CacheDirectorySet) {
     cache_directories.reconcile(std::iter::empty::<String>());
 }
-
 
 /// Validate and log the configured backends.
 ///

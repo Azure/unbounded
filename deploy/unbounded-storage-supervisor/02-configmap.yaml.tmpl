@@ -73,6 +73,9 @@ data:
     #       weight: -0.5
 
     startup:
+      fabric_discovery:
+        # Node-reachable HTTP endpoint for publishing live libfabric listeners.
+        addr: "0.0.0.0:9101"
       memory:
         # Allocate per-shard backing from the heap instead of 2 MiB hugepages.
         no_hugepages: false

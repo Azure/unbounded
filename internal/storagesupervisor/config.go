@@ -95,9 +95,9 @@ type Config struct {
 	// means in-cluster service-account discovery. This is the developer/test
 	// path; in production the run container relies on the in-cluster config.
 	Kubeconfig string
-	// DeviceInventoryURL, when set, is the daemon inventory base URL whose
-	// /rdma and /block paths are published onto this Node for discovery.
-	DeviceInventoryURL string
+	// BlockInventoryURL, when set, is the daemon block inventory URL whose
+	// response is published onto this Node for discovery.
+	BlockInventoryURL string
 	// StorageArgs are extra arguments appended to the daemon ExecStart line.
 	StorageArgs string
 	// Arch is the normalized target architecture ("amd64" or "arm64").
@@ -112,6 +112,9 @@ type Config struct {
 	NoHugepages bool
 	// NoEnable, when true, installs the unit but does not enable/start it.
 	NoEnable bool
+	// StartServiceAfterRender makes the run supervisor enable and restart the
+	// daemon after its first successful config render.
+	StartServiceAfterRender bool
 
 	// Source is the raw source selector: empty (release), an http(s) URL, or a
 	// filesystem path.
@@ -150,7 +153,7 @@ func LoadConfig() (Config, error) {
 	cfg.NodeName = os.Getenv("NODE_NAME")
 	cfg.StorageRingLabel = envOr("STORAGE_RING_LABEL", defaultStorageRingLabel)
 	cfg.Kubeconfig = os.Getenv("KUBECONFIG")
-	cfg.DeviceInventoryURL = os.Getenv("STORAGE_DEVICE_INVENTORY_URL")
+	cfg.BlockInventoryURL = os.Getenv("STORAGE_BLOCK_INVENTORY_URL")
 
 	// SOURCE takes precedence; LOCAL_TARBALL is honored for backward
 	// compatibility with the shell installer when SOURCE is unset.
@@ -163,6 +166,7 @@ func LoadConfig() (Config, error) {
 
 	cfg.NoEnable = os.Getenv("NO_ENABLE") == "1"
 	cfg.NoHugepages = os.Getenv("NO_HUGEPAGES") == "1"
+	cfg.StartServiceAfterRender = os.Getenv("START_SERVICE_AFTER_RENDER") == "1"
 
 	if len(cfg.Systemctl) == 0 {
 		return Config{}, fmt.Errorf("SYSTEMCTL must not be empty")

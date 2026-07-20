@@ -59,11 +59,11 @@ func tcpPeer(name, addr string) *storageconfig.PeerSpec {
 	}
 }
 
-func rdmaPeer(name, addr string) *storageconfig.PeerSpec {
+func rdmaPeer(name, discoveryAddr string) *storageconfig.PeerSpec {
 	return &storageconfig.PeerSpec{
 		Name: name,
 		Config: &storageconfig.PeerSpec_Rdma{
-			Rdma: &storageconfig.RdmaPeerConfig{Addr: addr},
+			Rdma: &storageconfig.RdmaPeerConfig{DiscoveryAddr: discoveryAddr},
 		},
 	}
 }
@@ -400,8 +400,8 @@ backends:
 		active:   true,
 		selfName: "node-a",
 		peers: []*storageconfig.PeerSpec{
-			rdmaPeer("node-a", "hex:self"),
-			rdmaPeer("node-b", "hex:peer"),
+			rdmaPeer("node-a", "10.0.0.1:9101"),
+			rdmaPeer("node-b", "10.0.0.2:9101"),
 		},
 	}
 
@@ -412,8 +412,8 @@ backends:
 	assert.Nil(t, cfg.GetStartup().GetFabric().GetTcp())
 	assert.Equal(t, "node-a", cfg.GetSelf())
 	require.Len(t, cfg.GetPeers(), 2)
-	assert.Equal(t, "hex:self", cfg.GetPeers()[0].GetRdma().GetAddr())
-	assert.Equal(t, "hex:peer", cfg.GetPeers()[1].GetRdma().GetAddr())
+	assert.Equal(t, "10.0.0.1:9101", cfg.GetPeers()[0].GetRdma().GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.2:9101", cfg.GetPeers()[1].GetRdma().GetDiscoveryAddr())
 }
 
 func TestRenderConfigActiveRingInjectsMeshWithoutDeclaredPeers(t *testing.T) {

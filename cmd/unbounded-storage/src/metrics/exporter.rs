@@ -18,7 +18,6 @@
 //! and replies `Connection: close`. Routes:
 //!   * `GET /metrics` -> the text exposition format
 //!   * `GET /` or `GET /health` -> `200 OK`
-//!   * `GET /inventory/rdma` -> RDMA HCA discovery annotation value
 //!   * `GET /inventory/block` -> block-device discovery annotation value
 //!   * anything else -> `404`
 //!   * non-GET -> `405`
@@ -63,7 +62,6 @@ impl std::error::Error for ExporterError {}
 
 #[derive(Clone, Default)]
 pub struct DeviceInventoryStatus {
-    rdma: Arc<RwLock<Option<Vec<u8>>>>,
     block: Arc<RwLock<Option<Vec<u8>>>>,
 }
 
@@ -72,19 +70,8 @@ impl DeviceInventoryStatus {
         Self::default()
     }
 
-    pub fn set_rdma(&self, body: Vec<u8>) {
-        *self.rdma.write().expect("rdma inventory lock poisoned") = Some(body);
-    }
-
     pub fn set_block(&self, body: Vec<u8>) {
         *self.block.write().expect("block inventory lock poisoned") = Some(body);
-    }
-
-    fn rdma_body(&self) -> Option<Vec<u8>> {
-        self.rdma
-            .read()
-            .expect("rdma inventory lock poisoned")
-            .clone()
     }
 
     fn block_body(&self) -> Option<Vec<u8>> {
@@ -194,19 +181,6 @@ fn handle_conn(
             let body = super::render(versions);
             let _ = write_response(&mut stream, 200, super::TEXT_CONTENT_TYPE, &body);
         }
-        "/inventory/rdma" => match device_inventory.rdma_body() {
-            Some(body) => {
-                let _ = write_response(&mut stream, 200, "text/plain; charset=utf-8", &body);
-            }
-            None => {
-                let _ = write_response(
-                    &mut stream,
-                    503,
-                    "text/plain; charset=utf-8",
-                    b"rdma inventory not ready\n",
-                );
-            }
-        },
         "/inventory/block" => match device_inventory.block_body() {
             Some(body) => {
                 let _ = write_response(&mut stream, 200, "text/plain; charset=utf-8", &body);
@@ -320,7 +294,6 @@ mod tests {
         let shutdown: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let versions = ConfigVersionStatus::new(9);
         let inventory = DeviceInventoryStatus::new();
-        inventory.set_rdma(b"mlx5_0?addr=hex%3A01".to_vec());
         inventory.set_block(b"/dev/sdb?name=sdb&size_bytes=4096".to_vec());
         let inventory_for_thread = inventory.clone();
         let t = std::thread::spawn(move || run(listener, versions, inventory_for_thread, shutdown));
@@ -332,11 +305,6 @@ mod tests {
 
         let (head, _) = get(addr, "/health");
         assert!(head.contains("200 OK"));
-
-        let (head, body) = get(addr, "/inventory/rdma");
-        assert!(head.contains("200 OK"));
-        assert!(head.contains("text/plain; charset=utf-8"));
-        assert_eq!(body, b"mlx5_0?addr=hex%3A01");
 
         let (head, body) = get(addr, "/inventory/block");
         assert!(head.contains("200 OK"));
@@ -362,10 +330,6 @@ mod tests {
         let t = std::thread::spawn(move || {
             run(listener, versions, DeviceInventoryStatus::new(), shutdown)
         });
-
-        let (head, body) = get(addr, "/inventory/rdma");
-        assert!(head.contains("503 Service Unavailable"), "head: {head}");
-        assert_eq!(body, b"rdma inventory not ready\n");
 
         let (head, body) = get(addr, "/inventory/block");
         assert!(head.contains("503 Service Unavailable"), "head: {head}");

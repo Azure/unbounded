@@ -51,3 +51,37 @@ func TestEmbeddedManifestsHaveNoLatestImageTags(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbeddedStorageSupervisorUsesDaemonFabricDiscovery(t *testing.T) {
+	config, err := fs.ReadFile(storagemanifests.Manifests, "02-configmap.yaml")
+	if err != nil {
+		t.Fatalf("read storage ConfigMap: %v", err)
+	}
+
+	configBody := string(config)
+	if !strings.Contains(configBody, "fabric_discovery:") || !strings.Contains(configBody, `addr: "0.0.0.0:9101"`) {
+		t.Error("storage ConfigMap does not configure the daemon fabric-discovery listener")
+	}
+
+	daemonSet, err := fs.ReadFile(storagemanifests.Manifests, "04-daemonset.yaml")
+	if err != nil {
+		t.Fatalf("read storage DaemonSet: %v", err)
+	}
+
+	body := string(daemonSet)
+	for _, required := range []string{
+		"hostNetwork: true",
+		"dnsPolicy: ClusterFirstWithHostNet",
+		"name: STORAGE_BLOCK_INVENTORY_URL",
+		"name: START_SERVICE_AFTER_RENDER",
+		"name: NO_ENABLE",
+	} {
+		if !strings.Contains(body, required) {
+			t.Errorf("storage DaemonSet is missing %q", required)
+		}
+	}
+
+	if strings.Contains(body, "STORAGE_DEVICE_INVENTORY_URL") {
+		t.Error("storage DaemonSet still configures supervisor-driven RDMA inventory discovery")
+	}
+}

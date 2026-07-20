@@ -27,10 +27,14 @@ const nodeSyncTimeout = 30 * time.Second
 // under cfg.SourceDir plus the per-node peer set (discovered from the
 // Kubernetes node watch) into the daemon's binary protobuf config at
 // cfg.ConfigPath, then watches both the source directory and cluster nodes and
-// re-renders on change. The daemon owns reacting to the rewritten file (it has
-// its own watcher and manages its own restarts), so this loop is render-only.
+// re-renders on change. When configured, it starts the host service after the
+// initial config has been rendered; later changes are handled by the daemon.
 // It blocks until ctx is cancelled.
 func Run(ctx context.Context, cfg Config) error {
+	return runWithRunner(ctx, cfg, execRunner{})
+}
+
+func runWithRunner(ctx context.Context, cfg Config, runner CommandRunner) error {
 	watcher, err := newPeerWatcher(cfg, nil)
 	if err != nil {
 		return fmt.Errorf("init peer watcher: %w", err)
@@ -50,7 +54,6 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		slog.Info("watching nodes for storage ring peers", "node", cfg.NodeName, "label", cfg.StorageRingLabel)
-		startDeviceInventoryPublisher(ctx, cfg, watcher.clientset, watcher.signal)
 	}
 
 	slog.Info("rendering initial config", "source", cfg.SourceDir, "dest", cfg.ConfigPath)
@@ -71,6 +74,16 @@ func Run(ctx context.Context, cfg Config) error {
 	// atomically swapping a `..data` symlink, so per-file watches miss updates.
 	if err := fsWatcher.Add(cfg.SourceDir); err != nil {
 		return fmt.Errorf("watch config source %q: %w", cfg.SourceDir, err)
+	}
+
+	if cfg.StartServiceAfterRender {
+		if err := reloadAndStart(ctx, cfg, runner); err != nil {
+			return fmt.Errorf("start service after initial config render: %w", err)
+		}
+	}
+
+	if watcher != nil {
+		startBlockInventoryPublisher(ctx, cfg, watcher.clientset, watcher.signal)
 	}
 
 	slog.Info("watching config source for changes", "source", cfg.SourceDir)
@@ -175,7 +188,7 @@ func reconcile(cfg Config, peers *peerWatcher) error {
 
 // currentRenderState resolves the current node annotations and ring state from
 // the node watch. TCP configs use the fixed ConfigMap fabric port; RDMA configs
-// use peer-published HCA inventory annotations. It returns the zero value when
+// use the fixed HTTP fabric-discovery port. It returns the zero value when
 // node watching is disabled. A source that cannot be loaded yields an inactive
 // ring; the subsequent RenderConfig surfaces the same error in reconcile, which
 // keeps the previously rendered config in place.
@@ -191,7 +204,9 @@ func currentRenderState(cfg Config, peers *peerWatcher) renderState {
 
 	fabric := sc.GetStartup().GetFabric()
 	if fabric.GetRdma() != nil || fabric.GetAutoRdma() != nil {
-		return peers.snapshotRdma()
+		port, ok := parseFabricPort(sc.GetStartup().GetFabricDiscovery().GetAddr())
+
+		return peers.snapshotRdma(port, ok)
 	}
 
 	port, ok := parseFabricPort(fabric.GetTcp().GetAddr())
