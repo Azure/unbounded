@@ -29,7 +29,7 @@
 //! metadata I/O without caching every leaf entry in memory.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::mem::size_of;
 use std::pin::Pin;
@@ -65,6 +65,20 @@ pub struct InternalNodeCache {
     root: Option<Arc<CachedInternalNode>>,
 }
 
+/// Cached internal pages that must be read back before replacing a
+/// fallback meta generation.
+#[derive(Clone, Default)]
+pub struct InternalDelta {
+    nodes: BTreeMap<Lba, Arc<CachedInternalNode>>,
+}
+
+pub struct RecoveredTree {
+    pub internal_cache: Arc<InternalNodeCache>,
+    pub internals: InternalDelta,
+    pub pages: Vec<Lba>,
+    pub entries: BTreeMap<PageKey, LeafEntry>,
+}
+
 struct CachedInternalNode {
     keys: Box<[PageKey]>,
     children: Box<[CachedChild]>,
@@ -85,6 +99,30 @@ struct NodeRef {
 impl InternalNodeCache {
     pub fn bytes(&self) -> usize {
         self.root.as_ref().map_or(0, |root| root.bytes)
+    }
+}
+
+impl InternalDelta {
+    pub fn difference(&self, other: &Self) -> Self {
+        Self {
+            nodes: self
+                .nodes
+                .iter()
+                .filter(|(lba, _)| !other.nodes.contains_key(lba))
+                .map(|(&lba, node)| (lba, node.clone()))
+                .collect(),
+        }
+    }
+
+    fn retain_without(&mut self, retired: &[Lba]) {
+        for lba in retired {
+            self.nodes.remove(lba);
+        }
+    }
+
+    fn extend(&mut self, other: &Self) {
+        self.nodes
+            .extend(other.nodes.iter().map(|(&lba, node)| (lba, node.clone())));
     }
 }
 
@@ -114,13 +152,32 @@ pub async fn build_internal_cache<B: BlockDevice>(
     scratch: &Rc<ScratchPool>,
     root_lba: Lba,
 ) -> Result<Arc<InternalNodeCache>, Error> {
+    Ok(recover_tree(device, scratch, root_lba)
+        .await?
+        .internal_cache)
+}
+
+/// Decode one complete tree into the immutable internal cache and the
+/// recovery artifacts used to restore allocator and mutator state.
+pub async fn recover_tree<B: BlockDevice>(
+    device: &B,
+    scratch: &Rc<ScratchPool>,
+    root_lba: Lba,
+) -> Result<RecoveredTree, Error> {
     if !root_lba.is_valid() {
-        return Ok(Arc::new(InternalNodeCache::default()));
+        return Ok(RecoveredTree {
+            internal_cache: Arc::new(InternalNodeCache::default()),
+            internals: InternalDelta::default(),
+            pages: Vec::new(),
+            entries: BTreeMap::new(),
+        });
     }
 
     let mut nodes = HashMap::new();
     let mut stack = vec![root_lba];
     let mut seen = HashSet::new();
+    let mut pages = Vec::new();
+    let mut entries = BTreeMap::new();
     let mut buf = scratch.acquire().await;
 
     while let Some(node_lba) = stack.pop() {
@@ -128,6 +185,7 @@ pub async fn build_internal_cache<B: BlockDevice>(
             return Err(Error::Corrupt);
         }
         device.read(node_lba, buf.as_mut_slice()).await?;
+        pages.push(node_lba);
 
         match page::decode(buf.as_mut_slice()) {
             Decoded::Internal { keys, children, .. }
@@ -138,38 +196,48 @@ pub async fn build_internal_cache<B: BlockDevice>(
                 }
                 nodes.insert(node_lba, (keys, children));
             }
-            Decoded::Leaf { .. } => {}
+            Decoded::Leaf {
+                entries: leaf_entries,
+                ..
+            } => {
+                entries.extend(leaf_entries);
+            }
             Decoded::Internal { .. } | Decoded::Empty | Decoded::Meta { .. } => {
                 return Err(Error::Corrupt);
             }
         }
     }
 
-    let root = materialize_cache(root_lba, &nodes);
-    Ok(Arc::new(InternalNodeCache { root }))
+    let mut internals = BTreeMap::new();
+    let root = materialize_cache(root_lba, &nodes, &mut internals);
+    Ok(RecoveredTree {
+        internal_cache: Arc::new(InternalNodeCache { root }),
+        internals: InternalDelta { nodes: internals },
+        pages,
+        entries,
+    })
 }
 
-/// Validate that every cached internal node matches its on-disk page.
-pub async fn validate_internal_cache<B: BlockDevice>(
+/// Build the candidate-minus-fallback validation set after one path-copy.
+pub fn candidate_validation_delta(
+    parent: &InternalDelta,
+    retired: &[Lba],
+    new: &InternalDelta,
+) -> InternalDelta {
+    let mut candidate = parent.clone();
+    candidate.retain_without(retired);
+    candidate.extend(new);
+    candidate
+}
+
+/// Validate that every internal page in `delta` matches its cached node.
+pub async fn validate_internal_delta<B: BlockDevice>(
     device: &B,
     scratch: &Rc<ScratchPool>,
-    root_lba: Lba,
-    cache: &InternalNodeCache,
+    delta: &InternalDelta,
 ) -> Result<(), Error> {
-    let Some(root) = cache.root.clone() else {
-        return Ok(());
-    };
-
-    let mut stack = vec![(root_lba, root)];
     let mut buf = scratch.acquire().await;
-    let mut visited = 0u64;
-
-    while let Some((node_lba, cached)) = stack.pop() {
-        visited += 1;
-        if visited > MAX_TRAVERSAL_NODES {
-            return Err(Error::Corrupt);
-        }
-
+    for (&node_lba, cached) in &delta.nodes {
         device.read(node_lba, buf.as_mut_slice()).await?;
         let Decoded::Internal { keys, children, .. } = page::decode(buf.as_mut_slice()) else {
             return Err(Error::Corrupt);
@@ -183,12 +251,6 @@ pub async fn validate_internal_cache<B: BlockDevice>(
         {
             return Err(Error::Corrupt);
         }
-
-        for child in cached.children.iter() {
-            if let Some(internal) = &child.internal {
-                stack.push((child.lba, internal.clone()));
-            }
-        }
     }
 
     Ok(())
@@ -197,17 +259,20 @@ pub async fn validate_internal_cache<B: BlockDevice>(
 fn materialize_cache(
     lba: Lba,
     nodes: &HashMap<Lba, (Vec<PageKey>, Vec<Lba>)>,
+    internals: &mut BTreeMap<Lba, Arc<CachedInternalNode>>,
 ) -> Option<Arc<CachedInternalNode>> {
     let (keys, child_lbas) = nodes.get(&lba)?;
     let mut children = Vec::with_capacity(child_lbas.len());
     for &child_lba in child_lbas {
-        let internal = materialize_cache(child_lba, nodes);
+        let internal = materialize_cache(child_lba, nodes, internals);
         children.push(CachedChild {
             lba: child_lba,
             internal,
         });
     }
-    Some(CachedInternalNode::new(keys.clone(), children))
+    let node = CachedInternalNode::new(keys.clone(), children);
+    internals.insert(lba, node.clone());
+    Some(node)
 }
 
 /// Walk the tree rooted at `root_lba` for `key`, using cached
@@ -265,82 +330,6 @@ pub async fn lookup<B: BlockDevice>(
         }
     }
     Ok(None)
-}
-
-/// Walk every reachable leaf entry in the tree under `root_lba`.
-/// Used during restart to rebuild the in-memory mirror; callers
-/// hand in a visitor that records each `(key, value)`.
-pub async fn for_each_leaf<B: BlockDevice>(
-    device: &B,
-    scratch: &Rc<ScratchPool>,
-    root_lba: Lba,
-    mut visit: impl FnMut(PageKey, LeafEntry, Lba),
-) -> Result<(), Error> {
-    walk_tree(device, scratch, root_lba, |node, decoded| {
-        if let Decoded::Leaf { entries, .. } = decoded {
-            for (k, v) in entries {
-                visit(k, v, node);
-            }
-        }
-    })
-    .await
-}
-
-/// Collect every non-meta LBA reachable from `root_lba`. Used
-/// after open to seed the snapshot's "owned pages" list.
-pub async fn collect_pages<B: BlockDevice>(
-    device: &B,
-    scratch: &Rc<ScratchPool>,
-    root_lba: Lba,
-) -> Result<Vec<Lba>, Error> {
-    let mut out = Vec::new();
-    walk_tree(device, scratch, root_lba, |node, decoded| match decoded {
-        Decoded::Leaf { .. } | Decoded::Internal { .. } => out.push(node),
-        _ => {}
-    })
-    .await?;
-    Ok(out)
-}
-
-/// DFS the on-disk tree from `root_lba`, invoking `visitor(node,
-/// decoded)` for every page that reads back. Unreadable pages are
-/// skipped (silent-miss policy); structural cycles are bounded by
-/// [`MAX_TRAVERSAL_NODES`] and surfaced as `Error::Corrupt`.
-/// Internal-node children are enqueued for descent regardless of
-/// what the visitor does, so callers do not need to recurse.
-async fn walk_tree<B, F>(
-    device: &B,
-    scratch: &Rc<ScratchPool>,
-    root_lba: Lba,
-    mut visitor: F,
-) -> Result<(), Error>
-where
-    B: BlockDevice,
-    F: FnMut(Lba, Decoded),
-{
-    if !root_lba.is_valid() {
-        return Ok(());
-    }
-    let mut stack = vec![root_lba];
-    let mut buf = scratch.acquire().await;
-    let mut visited = 0u64;
-    while let Some(node) = stack.pop() {
-        visited += 1;
-        if visited > MAX_TRAVERSAL_NODES {
-            return Err(Error::Corrupt);
-        }
-        if device.read(node, buf.as_mut_slice()).await.is_err() {
-            continue;
-        }
-        let decoded = page::decode(buf.as_mut_slice());
-        if let Decoded::Internal { ref children, .. } = decoded {
-            for &c in children {
-                stack.push(c);
-            }
-        }
-        visitor(node, decoded);
-    }
-    Ok(())
 }
 
 /// Bulk-load `sorted_entries` into a fresh tree under `device`.
@@ -448,6 +437,8 @@ pub struct PathCopyResult {
     pub new_root: Lba,
     pub new_pages: Vec<Lba>,
     pub retired_pages: Vec<Lba>,
+    pub new_internals: InternalDelta,
+    pub retired_internals: Vec<Lba>,
     pub internal_cache: Arc<InternalNodeCache>,
 }
 
@@ -478,6 +469,8 @@ pub async fn apply_path_copy<B: BlockDevice>(
         txn_id,
         new_pages: RefCell::new(Vec::new()),
         retired_pages: RefCell::new(Vec::new()),
+        new_internals: RefCell::new(BTreeMap::new()),
+        retired_internals: RefCell::new(Vec::new()),
         leaf_cap: max_leaf_entries(ps),
         internal_cap: max_internal_keys(ps),
         page_size: ps,
@@ -490,6 +483,10 @@ pub async fn apply_path_copy<B: BlockDevice>(
             new_root: root.child.lba,
             new_pages: ctx.new_pages.into_inner(),
             retired_pages: ctx.retired_pages.into_inner(),
+            new_internals: InternalDelta {
+                nodes: ctx.new_internals.into_inner(),
+            },
+            retired_internals: ctx.retired_internals.into_inner(),
             internal_cache: Arc::new(InternalNodeCache {
                 root: root.child.internal,
             }),
@@ -566,6 +563,8 @@ struct PathCopyCtx<'a, B: BlockDevice> {
     txn_id: u64,
     new_pages: RefCell<Vec<Lba>>,
     retired_pages: RefCell<Vec<Lba>>,
+    new_internals: RefCell<BTreeMap<Lba, Arc<CachedInternalNode>>>,
+    retired_internals: RefCell<Vec<Lba>>,
     leaf_cap: usize,
     internal_cap: usize,
     page_size: usize,
@@ -593,6 +592,7 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
         Box::pin(async move {
             if let Some(node) = cached {
                 self.retired_pages.borrow_mut().push(node_lba);
+                self.retired_internals.borrow_mut().push(node_lba);
                 return self.recurse_internal(&node, ops).await;
             }
 
@@ -613,6 +613,7 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
                         return Err(Error::Corrupt);
                     }
                     self.retired_pages.borrow_mut().push(node_lba);
+                    self.retired_internals.borrow_mut().push(node_lba);
                     let node = CachedInternalNode::new(
                         keys,
                         children
@@ -766,6 +767,9 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
                 keys.clone(),
                 chunk.iter().map(|node| node.child.clone()).collect(),
             );
+            self.new_internals
+                .borrow_mut()
+                .insert(lba, internal.clone());
             out.push(NodeRef {
                 key: chunk[0].key,
                 child: CachedChild {

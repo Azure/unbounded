@@ -9,8 +9,9 @@
 //! two slots, then swap the in-memory active pointer; this means
 //! the previously-current slot is still valid in case the new
 //! write tears (and is then rejected at restart by its bad
-//! checksum). On open we choose the slot with the highest valid
-//! `txn_id`.
+//! checksum). On open we return both valid slots in descending
+//! transaction order so tree recovery can fall back if the newest
+//! meta points to damaged structural pages.
 
 use std::rc::Rc;
 
@@ -47,14 +48,12 @@ pub struct MetaState {
     pub hwm: u64,
 }
 
-/// Read both meta slots. Returns the higher-valid-txn slot;
-/// `Ok(None)` if neither slot decodes (fresh disk or
-/// double-torn-write). The page-size of the device is used to
-/// know how many bytes to load.
-pub async fn load_meta<B: BlockDevice>(
+/// Read both meta slots and return every checksum-valid candidate in
+/// descending transaction order.
+pub async fn load_meta_candidates<B: BlockDevice>(
     device: &B,
     scratch: &Rc<ScratchPool>,
-) -> Result<Option<MetaState>, Error> {
+) -> Result<Vec<MetaState>, Error> {
     let mut buf_a = scratch.acquire().await;
     let mut buf_b = scratch.acquire().await;
     // We tolerate I/O errors here: the design wants us to treat a
@@ -69,12 +68,9 @@ pub async fn load_meta<B: BlockDevice>(
     };
     let a_meta = as_meta(a, MetaSlot::A);
     let b_meta = as_meta(b, MetaSlot::B);
-    Ok(match (a_meta, b_meta) {
-        (None, None) => None,
-        (Some(m), None) => Some(m),
-        (None, Some(m)) => Some(m),
-        (Some(ma), Some(mb)) => Some(if ma.txn_id >= mb.txn_id { ma } else { mb }),
-    })
+    let mut candidates: Vec<_> = [a_meta, b_meta].into_iter().flatten().collect();
+    candidates.sort_by_key(|state| std::cmp::Reverse(state.txn_id));
+    Ok(candidates)
 }
 
 fn as_meta(d: Decoded, slot: MetaSlot) -> Option<MetaState> {

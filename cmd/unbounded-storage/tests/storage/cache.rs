@@ -140,6 +140,22 @@ fn deep_cache_failure_is_atomic_and_reopens_exactly() {
             );
             expected.insert(key(37), replacement);
             assert_exact(&index, &expected).await;
+
+            let second_replacement = entry(20_000);
+            let reads_before_second = device.reads();
+            index
+                .apply_batch(vec![Mutation::Insert {
+                    key: key(38),
+                    value: second_replacement,
+                }])
+                .await
+                .unwrap();
+            assert_eq!(
+                device.reads() - reads_before_second,
+                3,
+                "steady-state commit reads one leaf and its two new internals",
+            );
+            expected.insert(key(38), second_replacement);
             drop(index);
 
             let reopened = open(
@@ -200,6 +216,16 @@ fn reopen_rejects_an_incomplete_internal_cache() {
                 .await
                 .unwrap();
 
+            // Keep the populated tree as the fallback generation while the
+            // newest generation rewrites the rightmost path.
+            index
+                .apply_batch(vec![Mutation::Insert {
+                    key: key(ENTRIES - 1),
+                    value: entry(20_000),
+                }])
+                .await
+                .unwrap();
+
             let branches = internal_children(&device, index.current_root());
             assert!(branches.len() >= 2, "test requires a two-level tree");
             let omitted_branch = *branches.last().unwrap();
@@ -207,8 +233,9 @@ fn reopen_rejects_an_incomplete_internal_cache() {
             drop(index);
 
             // Cache construction is the first tree walk after the two meta
-            // reads. A one-shot branch fault must reject that meta generation
-            // and use the leaf-scan rebuild, not publish a partial cache.
+            // reads. A one-shot branch fault must reject the newest generation
+            // and recover the complete older generation, not publish a partial
+            // cache.
             device.fail_next_read(omitted_branch);
             let reopened = open(
                 device.clone(),
@@ -219,20 +246,13 @@ fn reopen_rejects_an_incomplete_internal_cache() {
             assert_eq!(device.io_errors(), 1);
             assert_exact(&reopened, &expected).await;
 
-            // The rebuilt snapshot has a complete cache, so corruption in an
-            // untouched branch is still detected before either meta changes.
-            let rebuilt_branches = internal_children(&device, reopened.current_root());
-            let corrupt_branch = *rebuilt_branches.last().unwrap();
-            device.poke(corrupt_branch, &vec![0xff; PAGE_SIZE]);
-            let txn_before = reopened.current_txn();
-            let commit = reopened
+            reopened
                 .apply_batch(vec![Mutation::Insert {
                     key: key(0),
                     value: entry(10_000),
                 }])
-                .await;
-            assert!(commit.is_err());
-            assert_eq!(reopened.current_txn(), txn_before);
+                .await
+                .unwrap();
             *result.borrow_mut() = Some(());
         }));
     }

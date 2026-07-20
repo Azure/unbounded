@@ -252,10 +252,9 @@ fn corrupted_cached_internal_page_does_not_replace_fallback_meta() {
     dev.peek(META_SLOT_B, &mut meta_after);
     assert_eq!(meta_after, meta_b_before);
 
-    // The failed candidate must not consume either meta generation. Older
-    // snapshots may already have released their structural pages, so the
-    // durable guarantee here is slot preservation rather than reopening an
-    // arbitrarily old root after separately corrupting the active root.
+    // The failed candidate must not consume either retained meta generation.
+    // Their structural pages remain pinned until a later successful meta
+    // rotation supersedes them.
 }
 
 #[test]
@@ -435,37 +434,43 @@ fn double_corrupted_meta_triggers_lba_scan_rebuild() {
 
 #[test]
 fn snapshot_drop_frees_old_pages() {
-    // Catches a regression where dropping the prior `RootSnapshot`
-    // fails to hand its pages back to the allocator: without the
-    // baseline + monotonicity bounds, an empty Drop impl (or a
-    // committed write that never allocated) would still satisfy
-    // a bare `used_after_first == used_after_second` check.
     let (dev, alloc) = fresh(128);
-    let used_before_any = alloc.used_pages();
     let idx = block_on(open_btree(dev, alloc.clone())).unwrap();
+    let bootstrap_root = idx.current_root();
+
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(1),
         value: entry(11),
     }]))
     .unwrap();
-    let used_after_first = alloc.used_pages();
+    let first_root = idx.current_root();
     assert!(
-        used_after_first > used_before_any,
-        "first commit must allocate pages (before={used_before_any}, after={used_after_first})",
+        alloc.is_in_use(bootstrap_root).unwrap(),
+        "the previous durable root must remain pinned as the fallback",
     );
+
     block_on(idx.apply_batch(vec![Mutation::Insert {
         key: key(2),
         value: entry(22),
     }]))
     .unwrap();
-    // After the second commit the new snapshot is the only
-    // strong ref (no `Guard`s outstanding) so the old snapshot's
-    // pages have been freed. With one entry the tree is a single
-    // leaf, so total usage must not grow past the first commit.
-    let used_after_second = alloc.used_pages();
     assert!(
-        used_after_second <= used_after_first,
-        "second commit must not grow allocator (after_first={used_after_first}, after_second={used_after_second})",
+        !alloc.is_in_use(bootstrap_root).unwrap(),
+        "replacing the fallback must release its unique root",
+    );
+    assert!(
+        alloc.is_in_use(first_root).unwrap(),
+        "the newly retained fallback must remain pinned",
+    );
+
+    block_on(idx.apply_batch(vec![Mutation::Insert {
+        key: key(3),
+        value: entry(33),
+    }]))
+    .unwrap();
+    assert!(
+        !alloc.is_in_use(first_root).unwrap(),
+        "a fallback root must become reclaimable after the next rotation",
     );
 }
 

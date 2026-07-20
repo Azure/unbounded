@@ -4,12 +4,14 @@
 
   The production B+tree publishes an immutable (root LBA, cache root) pair.
   A path-copy commit rewrites one branch and the root, while preserving the
-  untouched branch's disk LBA and Arc cache identity. Before publishing the
-  candidate root, every reachable internal page is read and checksum
-  validated from disk. A validation failure leaves the published snapshot
-  unchanged. Old reader snapshots may retain the previous pair, so retired
-  metadata cannot be reused until every older snapshot and in-progress
-  commit drops it.
+  untouched branch's disk LBA and Arc cache identity. Both durable meta
+  generations retain their structural pages. Before replacing the older
+  generation, the implementation validates candidate internal pages absent
+  from that fallback. If no older generation exists, pages shared with the
+  current generation are already protected and only the candidate delta is
+  validated. A validation failure leaves both durable generations unchanged.
+  Reader snapshots may retain still older pairs, so retired metadata cannot
+  be reused until every durable generation, reader, and commit drops it.
 
   Recovery publishes a snapshot only after decoding every reachable page, so
   every reachable internal has a cache node. This bounded model has two
@@ -48,6 +50,7 @@ CBranch(gen, lba, side) ==
    side |-> side, left |-> NONE, right |-> NONE]
 
 SnapshotType == [txn : 1..(MaxTxn + 1), root : Meta, cache : CacheNode]
+MaybeSnapshot == SnapshotType \cup {NONE}
 DiskNodeType ==
   [kind : {"root", "branch"}, gen : 1..(MaxTxn + 1),
    side : Side \cup {NONE}, left : Meta \cup {NONE}, right : Meta \cup {NONE}]
@@ -62,13 +65,15 @@ AttemptType ==
    cacheBranch : CacheNode, oldRoot : Meta, oldBranch : Meta]
 FailureType ==
   [kind : {"write", "validation"}, published : SnapshotType,
-   candidate : SnapshotType, root : Meta, branch : Meta]
+   fallback : MaybeSnapshot, candidate : SnapshotType,
+   delta : SUBSET Meta, root : Meta, branch : Meta]
+PublicationType == [candidate : SnapshotType, delta : SUBSET Meta]
 
 VARIABLES
-  disk, valid, cacheHeap, published, readers, attempt,
+  disk, valid, cacheHeap, published, fallback, publishedDelta, readers, attempt,
   pending, inUse, free, failureWitness, publicationWitness
 
-vars == <<disk, valid, cacheHeap, published, readers, attempt,
+vars == <<disk, valid, cacheHeap, published, fallback, publishedDelta, readers, attempt,
           pending, inUse, free, failureWitness, publicationWitness>>
 
 InitialDisk ==
@@ -91,6 +96,8 @@ Init ==
   /\ valid = {OldRoot, OldLeft, OldRight}
   /\ cacheHeap = InitialCache
   /\ published = [txn |-> 1, root |-> OldRoot, cache |-> OldCacheRoot]
+  /\ fallback = NONE
+  /\ publishedDelta = {}
   /\ readers = [r \in Reader |-> NONE]
   /\ attempt = NONE
   /\ pending = {}
@@ -101,6 +108,7 @@ Init ==
 
 LiveSnapshots ==
   {published}
+    \cup (IF fallback = NONE THEN {} ELSE {fallback})
     \cup {readers[r] : r \in {q \in Reader : readers[q] /= NONE}}
     \cup (IF attempt = NONE THEN {} ELSE {attempt.parent})
 
@@ -132,12 +140,21 @@ Reachable(s) == {s.root} \cup {BranchLba(s, side) : side \in Side}
 Candidate ==
   [txn |-> attempt.txn, root |-> attempt.root, cache |-> attempt.cacheRoot]
 
-CandidateValid == Reachable(Candidate) \subseteq valid
+ValidationBase == IF fallback = NONE THEN published ELSE fallback
+
+IdealCandidateDelta == Reachable(Candidate) \ Reachable(ValidationBase)
+
+CandidateDelta ==
+  (publishedDelta \ {attempt.oldRoot, attempt.oldBranch})
+    \cup {attempt.root, attempt.branch}
+
+CandidateValid == CandidateDelta \subseteq valid
 
 SafeToFree(p) == \A s \in LiveSnapshots : s.txn >= p.retire
 
 BeginCommit(side) ==
   /\ attempt = NONE
+  /\ publishedDelta /= NONE
   /\ published.txn < MaxTxn
   /\ Cardinality(free) >= 2
   /\ \E newRoot, newBranch \in free :
@@ -166,10 +183,10 @@ BeginCommit(side) ==
                      root |-> newRoot, branch |-> newBranch,
                      cacheRoot |-> cacheRoot, cacheBranch |-> cacheBranch,
                      oldRoot |-> published.root, oldBranch |-> oldBranch]
-                /\ inUse' = inUse \cup {newRoot, newBranch}
-                /\ free' = free \ {newRoot, newBranch}
-                /\ valid' = valid \cup {newRoot, newBranch}
-                /\ UNCHANGED <<published, readers, pending>>
+                 /\ inUse' = inUse \cup {newRoot, newBranch}
+                 /\ free' = free \ {newRoot, newBranch}
+                 /\ valid' = valid \cup {newRoot, newBranch}
+                 /\ UNCHANGED <<published, fallback, publishedDelta, readers, pending>>
                 /\ failureWitness' = NONE
                 /\ publicationWitness' = NONE
 
@@ -178,13 +195,15 @@ Publish ==
   /\ CandidateValid
   /\ published' =
         [txn |-> attempt.txn, root |-> attempt.root, cache |-> attempt.cacheRoot]
+  /\ fallback' = published
+  /\ publishedDelta' = {attempt.root, attempt.branch}
   /\ pending' = pending \cup
        {[page |-> attempt.oldRoot, retire |-> attempt.txn],
         [page |-> attempt.oldBranch, retire |-> attempt.txn]}
   /\ attempt' = NONE
   /\ UNCHANGED <<disk, valid, cacheHeap, readers, inUse, free>>
   /\ failureWitness' = NONE
-  /\ publicationWitness' = published'
+  /\ publicationWitness' = [candidate |-> published', delta |-> CandidateDelta]
 
 FailCommit(kind) ==
   /\ attempt /= NONE
@@ -192,11 +211,12 @@ FailCommit(kind) ==
   /\ inUse' = inUse \ {attempt.root, attempt.branch}
   /\ free' = free \cup {attempt.root, attempt.branch}
   /\ failureWitness' =
-       [kind |-> kind, published |-> published,
-        candidate |-> Candidate,
+       [kind |-> kind, published |-> published, fallback |-> fallback,
+        candidate |-> Candidate, delta |-> CandidateDelta,
         root |-> attempt.root, branch |-> attempt.branch]
   /\ attempt' = NONE
-  /\ UNCHANGED <<disk, valid, cacheHeap, published, readers, pending>>
+  /\ UNCHANGED <<disk, valid, cacheHeap, published, fallback, publishedDelta,
+                  readers, pending>>
   /\ publicationWitness' = NONE
 
 CorruptUntouchedBranch ==
@@ -205,21 +225,23 @@ CorruptUntouchedBranch ==
          page == BranchLba(attempt.parent, other)
       IN /\ page \in valid
          /\ valid' = valid \ {page}
-  /\ UNCHANGED <<disk, cacheHeap, published, readers, attempt,
+  /\ UNCHANGED <<disk, cacheHeap, published, fallback, publishedDelta, readers, attempt,
                   pending, inUse, free, failureWitness>>
   /\ publicationWitness' = NONE
 
 Acquire(r) ==
   /\ readers[r] = NONE
   /\ readers' = [readers EXCEPT ![r] = published]
-  /\ UNCHANGED <<disk, valid, cacheHeap, published, attempt, pending, inUse, free>>
+  /\ UNCHANGED <<disk, valid, cacheHeap, published, fallback, publishedDelta,
+                  attempt, pending, inUse, free>>
   /\ failureWitness' = NONE
   /\ publicationWitness' = NONE
 
 Release(r) ==
   /\ readers[r] /= NONE
   /\ readers' = [readers EXCEPT ![r] = NONE]
-  /\ UNCHANGED <<disk, valid, cacheHeap, published, attempt, pending, inUse, free>>
+  /\ UNCHANGED <<disk, valid, cacheHeap, published, fallback, publishedDelta,
+                  attempt, pending, inUse, free>>
   /\ failureWitness' = NONE
   /\ publicationWitness' = NONE
 
@@ -229,9 +251,26 @@ Reclaim ==
        /\ pending' = pending \ {p}
        /\ inUse' = inUse \ {p.page}
        /\ free' = free \cup {p.page}
-       /\ UNCHANGED <<disk, valid, cacheHeap, published, readers, attempt>>
+       /\ UNCHANGED <<disk, valid, cacheHeap, published, fallback, publishedDelta,
+                       readers, attempt>>
        /\ failureWitness' = NONE
        /\ publicationWitness' = NONE
+
+Crash ==
+  /\ attempt = NONE
+  /\ publishedDelta /= NONE
+  /\ publishedDelta' = NONE
+  /\ UNCHANGED <<disk, valid, cacheHeap, published, fallback, readers,
+                  attempt, pending, inUse, free, failureWitness,
+                  publicationWitness>>
+
+Recover ==
+  /\ attempt = NONE
+  /\ publishedDelta = NONE
+  /\ publishedDelta' = Reachable(published) \ Reachable(ValidationBase)
+  /\ UNCHANGED <<disk, valid, cacheHeap, published, fallback, readers,
+                  attempt, pending, inUse, free, failureWitness,
+                  publicationWitness>>
 
 Next ==
   \/ \E side \in Side : BeginCommit(side)
@@ -241,6 +280,8 @@ Next ==
   \/ \E r \in Reader : Acquire(r)
   \/ \E r \in Reader : Release(r)
   \/ Reclaim
+  \/ Crash
+  \/ Recover
 
 Spec == Init /\ [][Next]_vars
 
@@ -249,13 +290,15 @@ TypeOK ==
   /\ valid \subseteq Meta
   /\ cacheHeap \in [CacheNode -> CacheNodeType \cup {NONE}]
   /\ published \in SnapshotType
+  /\ fallback \in MaybeSnapshot
+  /\ publishedDelta \in (SUBSET Meta) \cup {NONE}
   /\ readers \in [Reader -> SnapshotType \cup {NONE}]
   /\ attempt \in AttemptType \cup {NONE}
   /\ pending \subseteq PendingType
   /\ inUse \subseteq Meta
   /\ free \subseteq Meta
   /\ failureWitness \in FailureType \cup {NONE}
-  /\ publicationWitness \in SnapshotType \cup {NONE}
+  /\ publicationWitness \in PublicationType \cup {NONE}
 
 SnapshotRootCacheCoherent == \A s \in LiveSnapshots : SnapshotCoherent(s)
 
@@ -273,6 +316,9 @@ CachedLookupMatchesSnapshotView ==
 
 LiveMetadataNeverFree ==
   \A s \in LiveSnapshots : Reachable(s) \subseteq inUse
+
+FallbackMetadataNeverFree ==
+  fallback /= NONE => Reachable(fallback) \subseteq inUse
 
 NoRetiredPageReachableFromNewRoot ==
   \A p \in pending : p.page \notin Reachable(published)
@@ -293,18 +339,29 @@ UntouchedSubtreeShared ==
 FailedCommitIsolation ==
   failureWitness /= NONE =>
     /\ published = failureWitness.published
+    /\ fallback = failureWitness.fallback
     /\ failureWitness.root \in free
     /\ failureWitness.branch \in free
     /\ failureWitness.root \notin inUse
     /\ failureWitness.branch \notin inUse
 
-PublishedCandidateWasValidated ==
-  publicationWitness /= NONE => Reachable(publicationWitness) \subseteq valid
+PublishedDeltaWasValidated ==
+  publicationWitness /= NONE =>
+    /\ publicationWitness.candidate = published
+    /\ publicationWitness.delta \subseteq valid
 
-ValidationFailurePreservesPublished ==
+PublishedDeltaCoherent ==
+  publishedDelta /= NONE =>
+    publishedDelta = Reachable(published) \ Reachable(ValidationBase)
+
+CandidateDeltaMatchesReachability ==
+  attempt /= NONE => CandidateDelta = IdealCandidateDelta
+
+ValidationFailurePreservesDurableGenerations ==
   failureWitness /= NONE /\ failureWitness.kind = "validation" =>
-    /\ ~(Reachable(failureWitness.candidate) \subseteq valid)
+    /\ ~(failureWitness.delta \subseteq valid)
     /\ published = failureWitness.published
+    /\ fallback = failureWitness.fallback
 
 CacheNodesImmutable ==
   [][\A c \in CacheNode :

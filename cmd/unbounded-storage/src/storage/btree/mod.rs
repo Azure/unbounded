@@ -27,9 +27,10 @@
 //!    allocated pages (owned by the new snapshot) and the
 //!    retired pages (owned by some earlier snapshot up until
 //!    this commit).
-//! 3. Write the new meta page into the *inactive* slot, then update
-//!    the committed in-memory mirror.
-//! 4. Record the retired pages and this txn as alive, then
+//! 3. Read back the candidate internal pages not protected by the
+//!    fallback meta, then write the new meta into that slot.
+//! 4. Record the retired pages and this txn as alive, retain the
+//!    parent as the new fallback generation, then
 //!    [`arc_swap::ArcSwap::store`] the new [`RootSnapshot`].
 //!    Once the previous snapshot's last [`arc_swap::Guard`]
 //!    drops, its `Drop` impl recomputes the
@@ -69,14 +70,10 @@ pub enum Mutation {
     Delete { key: PageKey },
 }
 
-/// Immutable view of one transaction id's tree. Snapshots are
-/// shared via `ArcSwap`. The on-disk pages a snapshot reaches
-/// are *not* listed here: every page is either still reachable
-/// from some later snapshot (in which case it stays live) or it
-/// was retired by a later commit (in which case that commit
-/// recorded it in [`PendingFree`] under its own `txn_id`). The
-/// snapshot's `Drop` simply removes itself from the alive set
-/// and flushes any retired bundles that are now safe to free.
+/// Immutable view of one transaction id's tree. The current and
+/// fallback meta generations both retain snapshots; reader guards may
+/// retain older ones. `internal_delta` contains the current generation's
+/// internal pages that are absent from its fallback generation.
 pub struct RootSnapshot {
     pub root_lba: Lba,
     pub txn_id: u64,
@@ -84,6 +81,7 @@ pub struct RootSnapshot {
     pending: Rc<RefCell<PendingFree>>,
     allocator: Arc<Allocator>,
     internal_cache: Arc<cow::InternalNodeCache>,
+    internal_delta: cow::InternalDelta,
 }
 
 impl RootSnapshot {
@@ -94,6 +92,7 @@ impl RootSnapshot {
         pending: Rc<RefCell<PendingFree>>,
         allocator: Arc<Allocator>,
         internal_cache: Arc<cow::InternalNodeCache>,
+        internal_delta: cow::InternalDelta,
     ) -> Arc<Self> {
         Arc::new(Self {
             root_lba,
@@ -102,6 +101,7 @@ impl RootSnapshot {
             pending,
             allocator,
             internal_cache,
+            internal_delta,
         })
     }
 
@@ -193,6 +193,7 @@ pub struct BTreeIndex<B: BlockDevice> {
     allocator: Arc<Allocator>,
     scratch: Rc<ScratchPool>,
     root: ArcSwap<RootSnapshot>,
+    fallback: RefCell<Option<Arc<RootSnapshot>>>,
     mutator: RefCell<MutatorState>,
     active_meta: Cell<meta::MetaSlot>,
     alive: Rc<RefCell<AliveTracker>>,
@@ -233,19 +234,18 @@ impl<B: BlockDevice> BTreeIndex<B> {
             .await;
         }
 
-        let loaded = meta::load_meta(&*device, &scratch).await?;
-        if let Some(state) = loaded {
-            // Seed allocator HWM from persisted meta so future
-            // commits keep monotonicity even if tree walk visits a
-            // subset of the live frontier.
+        let loaded = meta::load_meta_candidates(&*device, &scratch).await?;
+        for state in &loaded {
             allocator.observe_high_water(state.hwm);
+        }
+        if !loaded.is_empty() {
             if let Some(idx) =
-                Self::open_from_meta(&device, &allocator, &scratch, btree_page_bytes, state).await?
+                Self::open_from_meta(&device, &allocator, &scratch, btree_page_bytes, &loaded)
+                    .await?
             {
                 return Ok(idx);
             }
-            // Meta said something but the tree underneath is
-            // gone; fall through to rebuild.
+            // Neither valid meta has a complete tree; fall through to rebuild.
         } else if skip_recovery_scan_if_no_meta {
             // Fresh disk path used by storage tooling: skip the
             // full-capacity LBA-order leaf scan and treat the
@@ -267,7 +267,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
 
         // Try LBA-scan rebuild.
         if let Some(rebuilt) =
-            rebuild::scan_for_leaves(&*device, &scratch, loaded.as_ref().map(|s| s.hwm)).await?
+            rebuild::scan_for_leaves(&*device, &scratch, loaded.iter().map(|s| s.hwm).max()).await?
         {
             return Self::bootstrap_from_entries(
                 device,
@@ -297,36 +297,34 @@ impl<B: BlockDevice> BTreeIndex<B> {
         allocator: &Arc<Allocator>,
         scratch: &Rc<ScratchPool>,
         btree_page_bytes: usize,
-        state: meta::MetaState,
+        states: &[meta::MetaState],
     ) -> Result<Option<Self>, Error> {
-        // A recovered snapshot is accepted only when every reachable page can
-        // be decoded. This makes `None` cache children unambiguously leaves;
-        // an unreadable or mixed-depth internal subtree cannot disappear from
-        // validation and path-copy routing.
-        let internal_cache =
-            match cow::build_internal_cache(&**device, scratch, state.root_lba).await {
-                Ok(cache) => cache,
-                Err(_) => return Ok(None),
-            };
-
-        // `collect_pages` doubles as the "is the recovered root
-        // structurally readable?" check: an empty list means
-        // every page failed to read and we should fall through to
-        // the LBA-scan rebuild path. We also use it to mark every
-        // structural page in-use so the allocator bitmap matches
-        // disk; we deliberately don't carry the list onto the
-        // snapshot - retired pages are tracked per-commit via
-        // path-copy, not per-snapshot.
-        let pages = cow::collect_pages(&**device, scratch, state.root_lba).await?;
-        if pages.is_empty() {
+        let mut recovered = Vec::new();
+        for &state in states {
+            if recovered.first().is_some_and(
+                |(newer, _): &(meta::MetaState, cow::RecoveredTree)| newer.txn_id == state.txn_id,
+            ) {
+                continue;
+            }
+            if let Ok(tree) = cow::recover_tree(&**device, scratch, state.root_lba).await {
+                recovered.push((state, tree));
+            }
+        }
+        if recovered.is_empty() {
             return Ok(None);
         }
-        for &lba in &pages {
+
+        let (state, tree) = recovered.remove(0);
+        let fallback = recovered.into_iter().next();
+        for &lba in tree
+            .pages
+            .iter()
+            .chain(fallback.iter().flat_map(|(_, tree)| tree.pages.iter()))
+        {
             let _ = allocator.mark_in_use(lba);
         }
 
-        let mut entries: BTreeMap<PageKey, LeafEntry> = BTreeMap::new();
-        cow::for_each_leaf(&**device, scratch, state.root_lba, |k, v, _| {
+        for v in tree.entries.values() {
             // Mark the entire contiguous data-page run referenced
             // by this leaf entry as in use. The entry covers
             // `byte_len / btree_page_bytes` device pages starting
@@ -334,17 +332,43 @@ impl<B: BlockDevice> BTreeIndex<B> {
             // hand out an LBA inside the run via
             // `allocator.alloc()` / `alloc_contig()` and the next
             // write would overwrite live data. The structural
-            // btree pages above are already marked via
-            // `collect_pages`.
+            // btree pages above are already marked from the
+            // recovered tree artifact.
             let n = leaf_run_pages(v.byte_len, btree_page_bytes);
             let _ = allocator.mark_range_in_use(v.lba, n);
-            entries.insert(k, v);
-        })
-        .await?;
+        }
 
         let alive = Rc::new(RefCell::new(AliveTracker::default()));
         let pending = Rc::new(RefCell::new(PendingFree::default()));
         alive.borrow_mut().alive.insert(state.txn_id);
+
+        let (fallback_snapshot, internal_delta) =
+            if let Some((fallback_state, fallback_tree)) = fallback {
+                alive.borrow_mut().alive.insert(fallback_state.txn_id);
+                let current_pages: BTreeSet<_> = tree.pages.iter().copied().collect();
+                pending.borrow_mut().push(
+                    state.txn_id,
+                    fallback_tree
+                        .pages
+                        .iter()
+                        .copied()
+                        .filter(|page| !current_pages.contains(page))
+                        .collect(),
+                );
+                let delta = tree.internals.difference(&fallback_tree.internals);
+                let snapshot = RootSnapshot::new(
+                    fallback_state.root_lba,
+                    fallback_state.txn_id,
+                    alive.clone(),
+                    pending.clone(),
+                    allocator.clone(),
+                    fallback_tree.internal_cache,
+                    cow::InternalDelta::default(),
+                );
+                (Some(snapshot), delta)
+            } else {
+                (None, cow::InternalDelta::default())
+            };
 
         let snapshot = RootSnapshot::new(
             state.root_lba,
@@ -352,7 +376,8 @@ impl<B: BlockDevice> BTreeIndex<B> {
             alive.clone(),
             pending.clone(),
             allocator.clone(),
-            internal_cache,
+            tree.internal_cache,
+            internal_delta,
         );
 
         Ok(Some(Self {
@@ -360,8 +385,9 @@ impl<B: BlockDevice> BTreeIndex<B> {
             allocator: allocator.clone(),
             scratch: scratch.clone(),
             root: ArcSwap::new(snapshot),
+            fallback: RefCell::new(fallback_snapshot),
             mutator: RefCell::new(MutatorState {
-                entries,
+                entries: tree.entries,
                 next_txn_id: state.txn_id + 1,
             }),
             active_meta: Cell::new(state.active),
@@ -422,6 +448,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             pending.clone(),
             allocator.clone(),
             internal_cache,
+            cow::InternalDelta::default(),
         );
 
         Ok(Self {
@@ -429,6 +456,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             allocator,
             scratch,
             root: ArcSwap::new(snapshot),
+            fallback: RefCell::new(None),
             mutator: RefCell::new(MutatorState {
                 entries,
                 next_txn_id: txn_id + 1,
@@ -507,18 +535,15 @@ impl<B: BlockDevice> BTreeIndex<B> {
         )
         .await?;
 
-        // The path-copy cache is authoritative for routing, but disk remains
-        // the recovery source of truth. Validate every internal page reachable
-        // from the candidate root before replacing the fallback meta slot.
-        // Validate against result.internal_cache so the checked topology is
-        // exactly the immutable snapshot that will be published.
-        if let Err(e) = cow::validate_internal_cache(
-            &*self.device,
-            &self.scratch,
-            result.new_root,
-            &result.internal_cache,
-        )
-        .await
+        // Only pages absent from the fallback generation can make replacing
+        // that fallback lose the last structurally valid copy.
+        let validation_delta = cow::candidate_validation_delta(
+            &parent.internal_delta,
+            &result.retired_internals,
+            &result.new_internals,
+        );
+        if let Err(e) =
+            cow::validate_internal_delta(&*self.device, &self.scratch, &validation_delta).await
         {
             cow::free_all(&self.allocator, &result.new_pages);
             return Err(e);
@@ -586,7 +611,9 @@ impl<B: BlockDevice> BTreeIndex<B> {
             self.pending.clone(),
             self.allocator.clone(),
             result.internal_cache,
+            result.new_internals,
         );
+        self.fallback.replace(Some(parent));
         self.root.store(snapshot);
         Ok(())
     }
