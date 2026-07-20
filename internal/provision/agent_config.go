@@ -17,6 +17,7 @@ type (
 	AgentConfig           = config.AgentConfig
 	AgentClusterConfig    = config.AgentClusterConfig
 	AgentKubeletConfig    = config.AgentKubeletConfig
+	GantryConfig          = config.GantryConfig
 	KubeletAuthInfo       = config.KubeletAuthInfo
 	CRIConfig             = config.CRIConfig
 	ContainerdConfig      = config.ContainerdConfig

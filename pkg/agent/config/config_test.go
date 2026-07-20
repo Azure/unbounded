@@ -96,6 +96,7 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 			Target:   "/etc/config",
 			ReadOnly: true,
 		}},
+		Gantry: &GantryConfig{Disabled: true},
 	}
 
 	data, err := json.Marshal(cfg)
@@ -113,6 +114,8 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 		Target:   "/etc/config",
 		ReadOnly: true,
 	}}, decoded.AdditionalHostMounts)
+	require.NotNil(t, decoded.Gantry)
+	assert.True(t, decoded.Gantry.Disabled)
 }
 
 func TestIsSystemdDeviceGroupSpecifier(t *testing.T) {
@@ -334,6 +337,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 		AdditionalHostMounts: []AdditionalHostMount{{
 			Source: "/opt/config",
 		}},
+		Gantry: &GantryConfig{Disabled: true},
 	}
 
 	copy := original.DeepCopy()
@@ -344,11 +348,13 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	copy.Kubelet.RegisterWithTaints[0] = "dedicated=prod:NoSchedule"
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
 	copy.AdditionalHostMounts[0].Source = "/opt/other"
+	copy.Gantry.Disabled = false
 
 	require.Equal(t, "test", original.Kubelet.Labels["env"])
 	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
 	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0])
 	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
+	require.True(t, original.Gantry.Disabled)
 }
 
 func TestAgentConfig_DeepCopyNil(t *testing.T) {

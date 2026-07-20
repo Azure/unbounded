@@ -160,7 +160,15 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if gantryDisabled(applied) != gantryDisabled(desired) {
+		return true
+	}
+
 	return false
+}
+
+func gantryDisabled(cfg *provision.AgentConfig) bool {
+	return cfg.Gantry != nil && cfg.Gantry.Disabled
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
