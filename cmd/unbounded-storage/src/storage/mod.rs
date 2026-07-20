@@ -16,9 +16,9 @@
 
 pub mod admission;
 pub mod blockdev;
-pub mod disks;
 #[cfg(target_os = "linux")]
 pub mod discovery;
+pub mod disks;
 pub mod types;
 
 mod alloc;

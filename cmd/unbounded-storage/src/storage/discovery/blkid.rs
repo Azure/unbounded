@@ -13,12 +13,7 @@ enum BlkidProbe {}
 unsafe extern "C" {
     fn blkid_new_probe_from_filename(filename: *const c_char) -> *mut BlkidProbe;
     fn blkid_new_probe() -> *mut BlkidProbe;
-    fn blkid_probe_set_device(
-        probe: *mut BlkidProbe,
-        fd: c_int,
-        offset: i64,
-        size: i64,
-    ) -> c_int;
+    fn blkid_probe_set_device(probe: *mut BlkidProbe, fd: c_int, offset: i64, size: i64) -> c_int;
     fn blkid_do_safeprobe(probe: *mut BlkidProbe) -> c_int;
     fn blkid_free_probe(probe: *mut BlkidProbe);
 }

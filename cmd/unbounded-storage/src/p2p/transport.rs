@@ -34,7 +34,7 @@ use serde::de::DeserializeOwned;
 use crate::backend::Backend;
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream, Req, Transport};
 use crate::fabric::Result as FabResult;
-use crate::fabric::{Fabric, FabricTransport, MrHandle};
+use crate::fabric::{Fabric, FabricTransport, MrHandle, PeerPathSelection};
 use crate::p2p::{ChainFingerRouter, RouteTableHandle, stripe_to_ring};
 
 /// Transport that selects the first hop per request by finger-table
@@ -61,6 +61,23 @@ impl<R, B: Backend<Req = R>> RoutedTransport<R, B> {
     ) -> FabResult<Self> {
         let router = ChainFingerRouter::new(routes.clone());
         let fabric_transport = FabricTransport::new(fabric, mr, router, page_size)?;
+        Ok(Self {
+            fabric_transport,
+            routes,
+            backend,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn with_selected_routes(
+        units: Vec<(Arc<Fabric>, MrHandle)>,
+        selection: PeerPathSelection,
+        page_size: usize,
+        routes: RouteTableHandle,
+        backend: B,
+    ) -> FabResult<Self> {
+        let router = ChainFingerRouter::new(routes.clone());
+        let fabric_transport = FabricTransport::new_selected(units, selection, router, page_size)?;
         Ok(Self {
             fabric_transport,
             routes,

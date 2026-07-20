@@ -30,21 +30,15 @@ import (
 const nodeInformerResync = 30 * time.Second
 
 // ringState is a pure snapshot of the storage ring this node belongs to,
-// computed from the watched Node set and the fabric port. It is the seam
+// computed from the watched Node set and the discovery port. It is the seam
 // between the Kubernetes node watch (peerWatcher) and the pure renderer
 // (RenderConfig): the watcher produces it, the renderer consumes it.
 type ringState struct {
 	// active is true when this node participates in a ring and the resulting
-	// peers/fabric addr should be injected into the rendered config. When false
-	// the renderer leaves the per-node sections untouched and passes the
-	// ConfigMap's fabric addr through verbatim.
+	// peers should be injected into the rendered config.
 	active bool
 	// selfName is this node's stable peer name, written to self.
 	selfName string
-	// selfListenAddr is this node's own routable fabric bind, "<internalIP>:
-	// <port>", overriding the ConfigMap's fabric addr so the tcp provider
-	// binds an address peers can actually dial.
-	selfListenAddr string
 	// peers is the ring roster as daemon PeerSpecs, including self, sorted by name.
 	peers []*storageconfig.PeerSpec
 }
@@ -152,43 +146,21 @@ func (w *peerWatcher) signal() {
 }
 
 // snapshot computes the current render state from the informer's node store and
-// the fabric port. A zero or unparseable port yields an inactive ring: without a
-// fixed port the daemon's fabric addr stays ephemeral and peer addresses are
-// unreachable, so emitting peers would be misleading. Node annotations are still
-// returned when the ring is inactive.
+// fabric discovery port. A zero or unparseable port yields an inactive ring.
+// Node annotations are still returned when the ring is inactive.
 func (w *peerWatcher) snapshot(port int, portOK bool) renderState {
 	objs := w.informer.GetStore().List()
 	nodes := nodesFromInformerObjects(objs)
 
 	state := renderState{annotations: selfAnnotations(nodes, w.selfName)}
 	if !portOK || port == 0 {
-		slog.Warn("storage ring inactive: no fixed fabric port set in startup.fabric.tcp.addr; "+
-			"set a non-zero port (e.g. 0.0.0.0:9000) to enable peering", "node", w.selfName)
+		slog.Warn("storage ring inactive: no fixed fabric discovery port set in startup.fabric_discovery.addr; "+
+			"set a non-zero port (e.g. 0.0.0.0:9101) to enable peering", "node", w.selfName)
 
 		return state
 	}
 
 	state.ring = computeRing(nodes, w.selfName, w.ringLabel, port)
-
-	return state
-}
-
-// snapshotRdma computes render state for RDMA fabrics. Local fabric listeners
-// are owned by the daemon's startup config; peers use the dedicated HTTP
-// discovery port and each node's InternalIP.
-func (w *peerWatcher) snapshotRdma(port int, portOK bool) renderState {
-	objs := w.informer.GetStore().List()
-	nodes := nodesFromInformerObjects(objs)
-
-	state := renderState{annotations: selfAnnotations(nodes, w.selfName)}
-	if !portOK || port == 0 {
-		slog.Warn("storage ring inactive: no fixed fabric discovery port set in startup.fabric_discovery.addr; "+
-			"set a non-zero port (e.g. 0.0.0.0:9101) to enable RDMA peering", "node", w.selfName)
-
-		return state
-	}
-
-	state.ring = computeRDMARing(nodes, w.selfName, w.ringLabel, port)
 
 	return state
 }
@@ -206,7 +178,7 @@ func nodesFromInformerObjects(objs []any) []*corev1.Node {
 }
 
 // computeRing is the pure core of peer discovery: given the ring-labelled
-// nodes, this node's name, the ring label key, and the shared fabric port, it
+// nodes, this node's name, the ring label key, and the shared discovery port, it
 // produces the ringState to inject into the config. It is separated from the
 // informer plumbing so the membership logic is unit-testable.
 //
@@ -243,11 +215,7 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 		return ringState{}
 	}
 
-	ring := ringState{
-		active:         true,
-		selfName:       selfName,
-		selfListenAddr: net.JoinHostPort(selfIP, strconv.Itoa(port)),
-	}
+	ring := ringState{active: true, selfName: selfName}
 
 	seen := map[string]struct{}{}
 
@@ -270,76 +238,8 @@ func computeRing(nodes []*corev1.Node, selfName, ringLabel string, port int) rin
 		seen[n.Name] = struct{}{}
 
 		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
-			Name: n.Name,
-			Config: &storageconfig.PeerSpec_Tcp{
-				Tcp: &storageconfig.TcpPeerConfig{Addr: net.JoinHostPort(ip, strconv.Itoa(port))},
-			},
-		})
-	}
-
-	sort.Slice(ring.peers, func(i, j int) bool { return ring.peers[i].Name < ring.peers[j].Name })
-
-	return ring
-}
-
-// computeRDMARing mirrors computeRing's label-membership rules, but peers are
-// resolved through the daemon's HTTP fabric-discovery endpoint.
-func computeRDMARing(nodes []*corev1.Node, selfName, ringLabel string, port int) ringState {
-	var self *corev1.Node
-
-	for _, n := range nodes {
-		if n.Name == selfName {
-			self = n
-
-			break
-		}
-	}
-
-	if self == nil {
-		slog.Warn("storage ring inactive: this node not found among watched nodes", "node", selfName)
-
-		return ringState{}
-	}
-
-	ringValue, ok := self.Labels[ringLabel]
-	if !ok || ringValue == "" {
-		return ringState{}
-	}
-
-	if internalIP(self) == "" {
-		slog.Warn("storage ring inactive: this node has no InternalIP", "node", selfName)
-
-		return ringState{}
-	}
-
-	ring := ringState{
-		active:   true,
-		selfName: selfName,
-	}
-	seen := map[string]struct{}{}
-
-	for _, n := range nodes {
-		if n.Labels[ringLabel] != ringValue {
-			continue
-		}
-
-		if _, dup := seen[n.Name]; dup {
-			continue
-		}
-
-		ip := internalIP(n)
-		if ip == "" {
-			slog.Warn("skipping storage ring peer with no InternalIP", "peer", n.Name, "ring", ringValue)
-
-			continue
-		}
-
-		seen[n.Name] = struct{}{}
-		ring.peers = append(ring.peers, &storageconfig.PeerSpec{
-			Name: n.Name,
-			Config: &storageconfig.PeerSpec_Rdma{
-				Rdma: &storageconfig.RdmaPeerConfig{DiscoveryAddr: net.JoinHostPort(ip, strconv.Itoa(port))},
-			},
+			Name:          n.Name,
+			DiscoveryAddr: net.JoinHostPort(ip, strconv.Itoa(port)),
 		})
 	}
 
@@ -382,7 +282,7 @@ func internalIP(node *corev1.Node) string {
 	return ""
 }
 
-// parseFabricPort extracts the port from a "host:port" fabric address. It
+// parseFabricPort extracts the port from a "host:port" discovery address. It
 // returns ok=false when the address is empty, malformed, or has no numeric
 // port, which the caller treats as "no fixed port" (ring inactive).
 func parseFabricPort(addr string) (int, bool) {

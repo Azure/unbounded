@@ -18,8 +18,7 @@ use unbounded_storage::bufferpool::{Error, StripeKey};
 use unbounded_storage::config::{
     ApplyError, BackendSpec, CacheSpec, Config, ConfigApplyTarget, ConfigController, ConfigDiff,
     DiskSpec, FileDiskConfig, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, LoadedConfig,
-    PeerSpec, RuntimeDisk, TcpPeerConfig, backend_spec, disk_spec, frontend_spec, peer_spec,
-    runtime_disks,
+    PeerSpec, RuntimeDisk, backend_spec, disk_spec, frontend_spec, runtime_disks,
 };
 use unbounded_storage::runtime::ShardLoop;
 use unbounded_storage::storage::blockdev::MockDeviceConfig;
@@ -977,9 +976,7 @@ fn peer_spec_for(idx: u8) -> PeerSpec {
     PeerSpec {
         name: format!("node-{idx}"),
         tags: vec![format!("rack-{}", idx % 2)],
-        config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
-            addr: format!("127.0.0.1:{}", 9000 + idx as u16),
-        })),
+        discovery_addr: format!("127.0.0.1:{}", 9100 + idx as u16),
     }
 }
 
@@ -987,9 +984,7 @@ fn self_peer_spec() -> PeerSpec {
     PeerSpec {
         name: "node-self".to_string(),
         tags: vec!["rack-self".to_string()],
-        config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
-            addr: "127.0.0.1:8999".to_string(),
-        })),
+        discovery_addr: "127.0.0.1:9099".to_string(),
     }
 }
 

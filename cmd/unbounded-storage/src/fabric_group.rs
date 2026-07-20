@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use unbounded_storage::config::{self, BackendSpec, RuntimePeer};
 use unbounded_storage::fabric::{
-    self, ConnectionSpec, Fabric, MrHandle, PeerId, Provider, RpcServerHandle,
+    self, ConnectionSpec, Fabric, FabricError, MrHandle, PeerId, PeerPathSelection, Provider,
+    RpcServerHandle,
 };
 use unbounded_storage::fanout::FetchChannel;
 use unbounded_storage::memory::{Backing, BackingKind, BackingRequest, HUGEPAGE_2MB, allocate};
@@ -64,17 +65,16 @@ pub struct FabricUnitSpec {
     /// Serving-shard indices that share this endpoint.
     pub shards_assigned: Vec<usize>,
     /// Forward-looking memory-region count used only for the domain
-    /// capacity check (one data backing per assigned shard plus the one
-    /// shared scratch region).
+    /// capacity check (every shard backing plus one scratch backing per
+    /// fabric unit, because forwarding may choose a different egress unit).
     pub expected_mr: usize,
 }
 
-/// The full plan: the set of fabric units to construct and, for each
-/// serving-shard index, the unit it maps onto.
+/// The full plan: the always-present TCP unit followed by zero or more
+/// RDMA units. Every unit serves every shard.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FabricPlan {
     pub units: Vec<FabricUnitSpec>,
-    pub shard_to_unit: Vec<usize>,
 }
 
 /// Fabric address published by a live unit after libfabric bind/listen
@@ -91,27 +91,26 @@ pub struct FabricUnitAddress {
 /// Decide how serving shards map onto fabric endpoints. This function is
 /// THE tcp/verbs seam (see the module docs).
 ///
-/// `shard_devices` is all-`None` (tcp fallback) or all-`Some` (verbs),
-/// per `assign_shard_devices`:
-/// - tcp: a single `lo` endpoint shared by every serving shard, pinned to
-///   worker 0. Peers reach a node through one static process peer addr,
-///   so a node must expose exactly one inbound
-///   fabric endpoint on that fixed port; binding one endpoint per shard
-///   would make every shard past the first collide on the port
-///   (`fi_endpoint` -> EADDRINUSE) once `serving_cores > 1`.
-/// - verbs: one endpoint per distinct HCA device, using all workers in
-///   the matching nic-worker group and shared by every assigned shard.
+/// TCP is universal. Each distinct selected HCA adds one verbs endpoint;
+/// every endpoint registers and serves every shard backing.
 pub fn plan_fabric_units(
     serving_shards: &[ServingShard],
     shard_devices: &[Option<String>],
     nic_workers: &[NicWorkerGroup],
     hca_dev_names: &[String],
 ) -> FabricPlan {
-    if shard_devices.iter().all(|d| d.is_none()) {
-        plan_tcp_units(serving_shards)
-    } else {
-        plan_verbs_units(serving_shards, shard_devices, nic_workers, hca_dev_names)
+    let mut plan = plan_tcp_units(serving_shards);
+    let rdma = plan_verbs_units(serving_shards, shard_devices, nic_workers, hca_dev_names);
+    for mut unit in rdma.units {
+        unit.unit_idx = plan.units.len();
+        plan.units.push(unit);
     }
+    let expected_mr = serving_shards.len() + plan.units.len();
+    for unit in &mut plan.units {
+        unit.expected_mr = expected_mr;
+        unit.shards_assigned = (0..serving_shards.len()).collect();
+    }
+    plan
 }
 
 /// tcp fallback: a single `lo` endpoint shared by every serving shard,
@@ -138,12 +137,7 @@ fn plan_tcp_units(serving_shards: &[ServingShard]) -> FabricPlan {
         // One data backing per assigned shard plus the one shared scratch.
         expected_mr: serving_shards.len() + 1,
     }];
-    let shard_to_unit = vec![0usize; serving_shards.len()];
-
-    FabricPlan {
-        units,
-        shard_to_unit,
-    }
+    FabricPlan { units }
 }
 
 /// verbs: group serving shards by their assigned HCA device (in
@@ -157,13 +151,12 @@ fn plan_verbs_units(
 ) -> FabricPlan {
     let serving_count = serving_shards.len();
     let mut units: Vec<FabricUnitSpec> = Vec::new();
-    let mut shard_to_unit = vec![0usize; shard_devices.len()];
     let mut device_to_unit: HashMap<String, usize> = HashMap::new();
 
     for (i, dev) in shard_devices.iter().enumerate() {
-        // Defensive: a stray `None` in an otherwise-verbs plan degrades
-        // that shard to loopback rather than panicking.
-        let device = dev.clone().unwrap_or_else(|| "lo".to_string());
+        let Some(device) = dev.clone() else {
+            continue;
+        };
         let unit_idx = *device_to_unit.entry(device.clone()).or_insert_with(|| {
             let idx = units.len();
             let (worker_indices, numa) =
@@ -180,17 +173,9 @@ fn plan_verbs_units(
             idx
         });
         units[unit_idx].shards_assigned.push(i);
-        shard_to_unit[i] = unit_idx;
     }
 
-    for unit in &mut units {
-        unit.expected_mr = unit.shards_assigned.len() + 1;
-    }
-
-    FabricPlan {
-        units,
-        shard_to_unit,
-    }
+    FabricPlan { units }
 }
 
 /// Worker indices (and NUMA) available to a verbs endpoint on `device`.
@@ -230,7 +215,7 @@ fn verbs_workers_for_device(
 pub struct RpcShardPublish {
     pub shard_index: usize,
     pub fetch_channel: FetchChannel,
-    pub mr: MrHandle,
+    pub mrs: Vec<MrHandle>,
     pub numa: Option<u16>,
 }
 
@@ -264,6 +249,7 @@ struct FabricUnit<
     routes: Rt,
     fabric: F,
     scratch_mr: MrHandle,
+    scratch_mrs: Vec<MrHandle>,
     page_size: usize,
     shards_assigned: Vec<usize>,
     cache_directories: Arc<CacheDirectorySet>,
@@ -284,7 +270,8 @@ struct FabricUnit<
 pub struct FabricGroup {
     discovery: DiscoveryCoordinator,
     units: Vec<FabricUnit>,
-    shard_to_unit: Vec<usize>,
+    selection: PeerPathSelection,
+    _scratch_keepalives: Vec<Arc<dyn Send + Sync>>,
 }
 
 impl FabricGroup {
@@ -328,15 +315,43 @@ impl FabricGroup {
             return Err(errors);
         }
 
+        let scratch_keepalives = units
+            .iter()
+            .filter_map(|unit| unit.scratch.as_ref().map(Backing::keepalive))
+            .collect();
+        for source in 0..units.len() {
+            let scratch = units[source]
+                .scratch
+                .as_ref()
+                .expect("new unit retains scratch");
+            let mut mrs = Vec::with_capacity(units.len());
+            for (target_idx, target) in units.iter().enumerate() {
+                if source == target_idx {
+                    mrs.push(units[source].scratch_mr);
+                } else {
+                    mrs.push(target.fabric.register_backing(scratch, None).map_err(|e| {
+                        vec![format!(
+                            "register unit {source} scratch across fabric domains: {e}"
+                        )]
+                    })?);
+                }
+            }
+            units[source].scratch_mrs = mrs;
+        }
+        let selection = PeerPathSelection::default();
         let discovery = DiscoveryCoordinator::spawn(
             units.iter().map(|unit| unit.fabric.clone()).collect(),
+            units.iter().map(|unit| unit.rdma).collect(),
+            selection.clone(),
             peers.to_vec(),
+            self_peer,
         );
 
         Ok(Self {
             discovery,
             units,
-            shard_to_unit: plan.shard_to_unit.clone(),
+            selection,
+            _scratch_keepalives: scratch_keepalives,
         })
     }
 
@@ -344,9 +359,12 @@ impl FabricGroup {
     /// builds its client transport on. The unit retains ownership; the
     /// returned clone keeps the domain alive only until teardown drops
     /// the unit.
-    pub fn fabric_for_shard(&self, shard: usize) -> Arc<Fabric> {
-        let unit = self.shard_to_unit[shard];
-        self.units[unit].fabric.clone()
+    pub fn fabrics(&self) -> Vec<Arc<Fabric>> {
+        self.units.iter().map(|unit| unit.fabric.clone()).collect()
+    }
+
+    pub fn selection(&self) -> PeerPathSelection {
+        self.selection.clone()
     }
 
     /// Live local addresses for every fabric unit in deterministic unit order.
@@ -365,7 +383,8 @@ impl FabricGroup {
     /// bufferpool MRs/fetch channels the owner path sources from.
     pub fn start_rpc_servers(&mut self, shards: &[RpcShardPublish]) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        for unit in &mut self.units {
+        let fabrics: Vec<Arc<Fabric>> = self.units.iter().map(|unit| unit.fabric.clone()).collect();
+        for (current_unit, unit) in self.units.iter_mut().enumerate() {
             if unit.rpc_server.is_some() {
                 continue;
             }
@@ -373,11 +392,10 @@ impl FabricGroup {
             let worker = unit.worker_idx.0;
             let owner_entries: Vec<OwnerShardSource> = shards
                 .iter()
-                .filter(|shard| unit.shards_assigned.contains(&shard.shard_index))
                 .map(|shard| OwnerShardSource {
                     shard_index: shard.shard_index,
                     channel: shard.fetch_channel.clone(),
-                    mr: shard.mr,
+                    mr: shard.mrs[current_unit],
                     numa: shard.numa,
                 })
                 .collect();
@@ -390,12 +408,17 @@ impl FabricGroup {
                 errors.push(format!("worker={worker}: rpc scratch already consumed"));
                 continue;
             };
-            let handler = match RecursiveHandler::with_routes(
+            let forward_units = fabrics
+                .iter()
+                .enumerate()
+                .map(|(egress, fabric)| (fabric.clone(), unit.scratch_mrs[egress]))
+                .collect();
+            let handler = match RecursiveHandler::with_selected_routes(
                 scratch,
                 RPC_SCRATCH_PAGES,
                 unit.routes.clone(),
-                unit.fabric.clone(),
-                unit.scratch_mr,
+                forward_units,
+                self.selection.clone(),
                 unit.page_size,
                 owners,
             ) {
@@ -427,8 +450,8 @@ impl FabricGroup {
     /// Re-drive every endpoint's fabric connection table toward `peers`.
     /// Connections live at the fabric/address-vector level, so this runs
     /// once per endpoint rather than once per shard.
-    pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) {
-        self.discovery.update(peers.to_vec());
+    pub fn reconcile_peers(&mut self, peers: &[RuntimePeer]) -> Result<(), String> {
+        self.discovery.update(peers.to_vec())
     }
 
     /// RPC owner reads are served through shard bufferpools, whose
@@ -461,11 +484,15 @@ fn build_unit(
     cfg.worker_indices = spec.worker_indices.clone();
     cfg.provider = spec.provider;
     cfg.listen = true;
-    cfg.listen_addr = Some(
+    cfg.listen_addr = Some(if spec.provider == Provider::Tcp {
+        fabric_startup.listen_addr.clone()
+    } else {
         fabric_startup
-            .listen_addr_for_unit(spec.unit_idx)
-            .to_string(),
-    );
+            .rdma_listen_addrs
+            .get(spec.unit_idx.saturating_sub(1))
+            .cloned()
+            .unwrap_or_else(|| "0.0.0.0:0".to_string())
+    });
     cfg.max_inflight = fabric_startup.max_inflight as usize;
     cfg.rpc_worker_threads = fabric_startup.rpc_worker_threads as usize;
     cfg.progress_threads = fabric_startup.progress_threads as u8;
@@ -517,6 +544,7 @@ fn build_unit(
         routes: routes.clone(),
         fabric,
         scratch_mr,
+        scratch_mrs: Vec::new(),
         page_size,
         shards_assigned: spec.shards_assigned.clone(),
         cache_directories: cache_directories.clone(),
@@ -528,19 +556,35 @@ fn build_unit(
 }
 
 struct DiscoveryCoordinator {
-    updates: mpsc::Sender<Vec<RuntimePeer>>,
+    updates: mpsc::Sender<DiscoveryUpdate>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl DiscoveryCoordinator {
-    fn spawn(fabrics: Vec<Arc<Fabric>>, peers: Vec<RuntimePeer>) -> Self {
+    fn spawn(
+        fabrics: Vec<Arc<Fabric>>,
+        rdma_units: Vec<bool>,
+        selection: PeerPathSelection,
+        peers: Vec<RuntimePeer>,
+        self_peer: PeerId,
+    ) -> Self {
         let (updates, receiver) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
         let thread = std::thread::Builder::new()
             .name("fabric-discovery".to_string())
-            .spawn(move || run_discovery(fabrics, peers, receiver, thread_shutdown))
+            .spawn(move || {
+                run_discovery(
+                    fabrics,
+                    rdma_units,
+                    selection,
+                    peers,
+                    self_peer,
+                    receiver,
+                    thread_shutdown,
+                )
+            })
             .expect("spawn fabric discovery thread");
         Self {
             updates,
@@ -549,9 +593,20 @@ impl DiscoveryCoordinator {
         }
     }
 
-    fn update(&self, peers: Vec<RuntimePeer>) {
-        let _ = self.updates.send(peers);
+    fn update(&self, peers: Vec<RuntimePeer>) -> Result<(), String> {
+        let (ack, result) = mpsc::channel();
+        self.updates
+            .send(DiscoveryUpdate { peers, ack })
+            .map_err(|_| "fabric discovery coordinator stopped".to_string())?;
+        result.recv().map_err(|_| {
+            "fabric discovery coordinator stopped before applying update".to_string()
+        })?
     }
+}
+
+struct DiscoveryUpdate {
+    peers: Vec<RuntimePeer>,
+    ack: mpsc::Sender<Result<(), String>>,
 }
 
 impl Drop for DiscoveryCoordinator {
@@ -571,86 +626,150 @@ struct CachedPeer {
 
 fn run_discovery(
     fabrics: Vec<Arc<Fabric>>,
+    rdma_units: Vec<bool>,
+    selection: PeerPathSelection,
     mut peers: Vec<RuntimePeer>,
-    updates: mpsc::Receiver<Vec<RuntimePeer>>,
+    self_peer: PeerId,
+    updates: mpsc::Receiver<DiscoveryUpdate>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut cache: HashMap<PeerId, CachedPeer> = HashMap::new();
     let mut applied = vec![HashMap::new(); fabrics.len()];
+    let mut pending_acks = Vec::new();
 
     while !shutdown.load(Ordering::Acquire) {
         while let Ok(update) = updates.try_recv() {
-            peers = update;
+            peers = update.peers;
+            pending_acks.push(update.ack);
         }
-        let live: std::collections::HashSet<PeerId> =
-            peers.iter().map(|peer| peer.fabric_peer_id).collect();
+        let live: std::collections::HashSet<PeerId> = peers
+            .iter()
+            .filter(|peer| peer.fabric_peer_id != self_peer)
+            .map(|peer| peer.fabric_peer_id)
+            .collect();
         cache.retain(|peer, _| live.contains(peer));
+        selection.retain(|peer| live.contains(&peer));
+
+        let connected: Vec<std::collections::HashSet<PeerId>> = fabrics
+            .iter()
+            .map(|fabric| fabric.list_connections().into_iter().collect())
+            .collect();
 
         for peer in &peers {
+            if peer.fabric_peer_id == self_peer {
+                continue;
+            }
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
 
-            let Some(config::peer_spec::Config::Rdma(rdma)) = peer.spec.config.as_ref() else {
+            if !local_is_path_authority(self_peer, peer.fabric_peer_id) {
+                cache.remove(&peer.fabric_peer_id);
+                match unique_inbound_unit(&connected, peer.fabric_peer_id) {
+                    Some(unit) => selection.set(peer.fabric_peer_id, unit),
+                    None => {
+                        selection.remove(peer.fabric_peer_id);
+                        let count = connected
+                            .iter()
+                            .filter(|unit| unit.contains(&peer.fabric_peer_id))
+                            .count();
+                        if count > 1 {
+                            eprintln!(
+                                "fabric discovery unavailable: peer={} inbound_connections={count}",
+                                peer.name
+                            );
+                        }
+                    }
+                }
                 continue;
-            };
-            if rdma.discovery_addr.is_empty() {
+            }
+
+            if peer.spec.discovery_addr.is_empty() {
                 continue;
             }
             if cache.get(&peer.fabric_peer_id).is_some_and(|cached| {
-                cached.endpoint == rdma.discovery_addr
+                cached.endpoint == peer.spec.discovery_addr
                     && cached.refreshed.elapsed() < DISCOVERY_REFRESH
+                    && selection.selected(peer.fabric_peer_id).is_some_and(|unit| {
+                        connected
+                            .get(unit)
+                            .is_some_and(|peers| peers.contains(&peer.fabric_peer_id))
+                    })
             }) {
                 continue;
             }
-            match resolve_discovered_peer(&fabrics, &rdma.discovery_addr) {
-                Ok(addresses) => {
+            match resolve_discovered_peer(
+                &fabrics,
+                &rdma_units,
+                &peer.spec.discovery_addr,
+                peer.fabric_peer_id,
+            ) {
+                Ok((unit, address)) => {
                     cache.insert(
                         peer.fabric_peer_id,
                         CachedPeer {
-                            endpoint: rdma.discovery_addr.clone(),
+                            endpoint: peer.spec.discovery_addr.clone(),
                             refreshed: Instant::now(),
-                            addresses,
+                            addresses: vec![address],
                         },
                     );
+                    selection.set(peer.fabric_peer_id, unit);
                 }
                 Err(error) => eprintln!(
                     "fabric discovery failed: peer={} endpoint={} err={error}",
-                    peer.name, rdma.discovery_addr
+                    peer.name, peer.spec.discovery_addr
                 ),
             }
         }
 
         for (unit_idx, fabric) in fabrics.iter().enumerate() {
             let mut desired = Vec::new();
+            let mut dial_desired = Vec::new();
+            let mut inbound_only = std::collections::HashSet::new();
             for peer in &peers {
-                match peer.spec.config.as_ref() {
-                    Some(config::peer_spec::Config::Tcp(tcp)) => desired.push(ConnectionSpec {
-                        peer: peer.fabric_peer_id,
-                        address: fabric::FabricAddress::socket(tcp.addr.clone()),
-                        hca_numa: None,
-                        tags: peer.spec.tags.clone(),
-                    }),
-                    Some(config::peer_spec::Config::Rdma(_)) => {
-                        let discovered = cache
+                if peer.fabric_peer_id == self_peer {
+                    continue;
+                }
+                if selection.selected(peer.fabric_peer_id) == Some(unit_idx) {
+                    if local_is_path_authority(self_peer, peer.fabric_peer_id) {
+                        if let Some(address) = cache
                             .get(&peer.fabric_peer_id)
-                            .map(|cached| cached.addresses.as_slice());
-                        if let Some(address) =
-                            discovered.and_then(|addresses| addresses.get(unit_idx))
+                            .and_then(|cached| cached.addresses.first())
                         {
-                            desired.push(ConnectionSpec {
+                            let spec = ConnectionSpec {
                                 peer: peer.fabric_peer_id,
                                 address: address.clone(),
                                 hca_numa: None,
                                 tags: peer.spec.tags.clone(),
-                            });
+                            };
+                            desired.push(spec.clone());
+                            dial_desired.push(spec);
                         }
+                    } else if connected
+                        .get(unit_idx)
+                        .is_some_and(|unit| unit.contains(&peer.fabric_peer_id))
+                    {
+                        inbound_only.insert(peer.fabric_peer_id);
+                        // The address is not used for dialing. This logical
+                        // intent only prevents reconciliation from removing
+                        // the lower peer's authoritative inbound connection.
+                        desired.push(ConnectionSpec {
+                            peer: peer.fabric_peer_id,
+                            address: fabric::FabricAddress::socket(
+                                peer.spec.discovery_addr.clone(),
+                            ),
+                            hca_numa: None,
+                            tags: peer.spec.tags.clone(),
+                        });
                     }
-                    None => {}
                 }
             }
-            let report = config::reconcile::reconcile_connections(
+            let target = DiscoveryReconcileTarget {
                 fabric,
+                inbound_only: &inbound_only,
+            };
+            let report = config::reconcile::reconcile_connections(
+                &target,
                 &desired,
                 Some(&applied[unit_idx]),
             );
@@ -658,31 +777,110 @@ fn run_discovery(
             for (peer, error) in report.failures {
                 eprintln!("fabric peer reconcile failed: peer={} err={error}", peer.0);
             }
-            fabric.set_desired_peers(desired);
+            fabric.set_desired_peers(dial_desired);
+        }
+
+        for ack in pending_acks.drain(..) {
+            let _ = ack.send(Ok(()));
         }
 
         match updates.recv_timeout(DISCOVERY_RETRY) {
-            Ok(update) => peers = update,
+            Ok(update) => {
+                peers = update.peers;
+                pending_acks.push(update.ack);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 }
 
+struct DiscoveryReconcileTarget<'a> {
+    fabric: &'a Arc<Fabric>,
+    inbound_only: &'a std::collections::HashSet<PeerId>,
+}
+
+impl config::reconcile::PeerReconcileTarget for DiscoveryReconcileTarget<'_> {
+    fn list(&self) -> Vec<PeerId> {
+        self.fabric.list_connections()
+    }
+
+    fn add(&self, spec: ConnectionSpec) -> Result<(), FabricError> {
+        if self.inbound_only.contains(&spec.peer) {
+            Ok(())
+        } else {
+            self.fabric.add_connection(spec)
+        }
+    }
+
+    fn remove(&self, peer: PeerId) -> Result<(), FabricError> {
+        self.fabric.remove_connection(peer)
+    }
+}
+
+fn local_is_path_authority(self_peer: PeerId, remote_peer: PeerId) -> bool {
+    self_peer.0 < remote_peer.0
+}
+
+fn unique_inbound_unit(
+    connected: &[std::collections::HashSet<PeerId>],
+    peer: PeerId,
+) -> Option<usize> {
+    let mut units = connected
+        .iter()
+        .enumerate()
+        .filter_map(|(unit, peers)| peers.contains(&peer).then_some(unit));
+    let selected = units.next()?;
+    units.next().is_none().then_some(selected)
+}
+
 fn resolve_discovered_peer(
     fabrics: &[Arc<Fabric>],
+    rdma_units: &[bool],
     discovery_addr: &str,
-) -> Result<Vec<fabric::FabricAddress>, String> {
+    expected_peer: PeerId,
+) -> Result<(usize, fabric::FabricAddress), String> {
     let endpoint: SocketAddr = discovery_addr
         .parse()
         .map_err(|_| "invalid discovery socket address".to_string())?;
-    let candidates =
+    let manifest =
         unbounded_storage::fabric_discovery::fetch(endpoint).map_err(|error| error.to_string())?;
-    let candidates: Vec<fabric::FabricAddress> = candidates
-        .iter()
-        .map(|candidate| candidate_address(candidate, endpoint))
-        .collect::<Result<_, _>>()?;
-    complete_matching(fabrics, &candidates)
+    if manifest.peer_id != expected_peer.0 {
+        return Err(format!(
+            "fabric discovery peer identity mismatch: expected {}, got {}",
+            expected_peer.0, manifest.peer_id
+        ));
+    }
+    select_peer_path(fabrics, rdma_units, &manifest.listeners, endpoint)
+}
+
+fn select_peer_path(
+    fabrics: &[Arc<Fabric>],
+    rdma_units: &[bool],
+    listeners: &[unbounded_storage::fabric_discovery::Listener],
+    endpoint: SocketAddr,
+) -> Result<(usize, fabric::FabricAddress), String> {
+    for want_rdma in [true, false] {
+        for (unit, fabric) in fabrics.iter().enumerate() {
+            if rdma_units.get(unit).copied() != Some(want_rdma) {
+                continue;
+            }
+            for listener in listeners {
+                let listener_rdma =
+                    listener.transport == unbounded_storage::fabric_discovery::Transport::Rdma;
+                if listener_rdma != want_rdma {
+                    continue;
+                }
+                let Ok(address) = candidate_address(&listener.address, endpoint) else {
+                    continue;
+                };
+                if fabric.destination_resolves(&address).is_ok() {
+                    return Ok((unit, address));
+                }
+            }
+        }
+    }
+    Err("no compatible fabric listener".to_string())
 }
 
 fn candidate_address(addr: &str, endpoint: SocketAddr) -> Result<fabric::FabricAddress, String> {
@@ -708,84 +906,10 @@ fn valid_native_address(addr: &str) -> bool {
     !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn complete_matching(
-    fabrics: &[Arc<Fabric>],
-    candidates: &[fabric::FabricAddress],
-) -> Result<Vec<fabric::FabricAddress>, String> {
-    let compatible: Vec<Vec<bool>> = fabrics
-        .iter()
-        .map(|fabric| {
-            candidates
-                .iter()
-                .map(|candidate| fabric.destination_resolves(candidate).is_ok())
-                .collect()
-        })
-        .collect();
-    let indices = maximum_matching(&compatible)
-        .ok_or_else(|| "no complete local-fabric to remote-listener matching".to_string())?;
-    Ok(indices
-        .into_iter()
-        .map(|candidate| candidates[candidate].clone())
-        .collect())
-}
-
-fn maximum_matching(compatible: &[Vec<bool>]) -> Option<Vec<usize>> {
-    if compatible.is_empty() {
-        return Some(Vec::new());
-    }
-    let candidates = compatible.first()?.len();
-    if candidates < compatible.len() || compatible.iter().any(|row| row.len() != candidates) {
-        return None;
-    }
-
-    let mut candidate_owner = vec![None; candidates];
-    for local in 0..compatible.len() {
-        let mut seen = vec![false; candidates];
-        if !augment(local, compatible, &mut seen, &mut candidate_owner) {
-            return None;
-        }
-    }
-    let mut result = vec![usize::MAX; compatible.len()];
-    for (candidate, local) in candidate_owner.into_iter().enumerate() {
-        if let Some(local) = local {
-            result[local] = candidate;
-        }
-    }
-    result
-        .iter()
-        .all(|candidate| *candidate != usize::MAX)
-        .then_some(result)
-}
-
-fn augment(
-    local: usize,
-    compatible: &[Vec<bool>],
-    seen: &mut [bool],
-    candidate_owner: &mut [Option<usize>],
-) -> bool {
-    for candidate in 0..candidate_owner.len() {
-        if !compatible[local][candidate] || seen[candidate] {
-            continue;
-        }
-        seen[candidate] = true;
-        if candidate_owner[candidate].is_none()
-            || augment(
-                candidate_owner[candidate].expect("owner checked"),
-                compatible,
-                seen,
-                candidate_owner,
-            )
-        {
-            candidate_owner[candidate] = Some(local);
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::rc::Rc;
 
     use super::*;
@@ -817,7 +941,6 @@ mod tests {
         // All serving shards share one inbound endpoint on the fixed
         // listen port; one unit per shard would collide (EADDRINUSE).
         assert_eq!(plan.units.len(), 1);
-        assert_eq!(plan.shard_to_unit, vec![0, 0, 0]);
 
         let unit = &plan.units[0];
         assert_eq!(unit.device_name, "lo");
@@ -834,7 +957,6 @@ mod tests {
         let plan = plan_fabric_units(&[], &[], &[], &[]);
 
         assert!(plan.units.is_empty());
-        assert!(plan.shard_to_unit.is_empty());
     }
 
     #[test]
@@ -859,24 +981,27 @@ mod tests {
 
         let plan = plan_fabric_units(&shards, &devices, &nic_workers, &hca_dev_names);
 
-        assert_eq!(plan.units.len(), 2);
-        assert_eq!(plan.shard_to_unit, vec![0, 1, 0, 1]);
+        assert_eq!(plan.units.len(), 3);
 
-        let u0 = &plan.units[0];
+        let tcp = &plan.units[0];
+        assert_eq!(tcp.provider, Provider::Tcp);
+        assert_eq!(tcp.shards_assigned, vec![0, 1, 2, 3]);
+
+        let u0 = &plan.units[1];
         assert_eq!(u0.device_name, "mlx5_0");
         assert_eq!(u0.provider, Provider::Verbs);
         assert_eq!(u0.worker_indices, vec![WorkerIdx(4), WorkerIdx(5)]);
         assert_eq!(u0.numa, Some(0));
-        assert_eq!(u0.shards_assigned, vec![0, 2]);
-        assert_eq!(u0.expected_mr, 3); // 2 shards + 1 scratch
+        assert_eq!(u0.shards_assigned, vec![0, 1, 2, 3]);
+        assert_eq!(u0.expected_mr, 7); // 4 shard MRs + 3 scratch MRs
 
-        let u1 = &plan.units[1];
+        let u1 = &plan.units[2];
         assert_eq!(u1.device_name, "mlx5_1");
         assert_eq!(u1.provider, Provider::Verbs);
         assert_eq!(u1.worker_indices, vec![WorkerIdx(6)]);
         assert_eq!(u1.numa, Some(1));
-        assert_eq!(u1.shards_assigned, vec![1, 3]);
-        assert_eq!(u1.expected_mr, 3);
+        assert_eq!(u1.shards_assigned, vec![0, 1, 2, 3]);
+        assert_eq!(u1.expected_mr, 7);
     }
 
     #[test]
@@ -888,29 +1013,13 @@ mod tests {
 
         let plan = plan_fabric_units(&shards, &devices, &nic_workers, &hca_dev_names);
 
-        assert_eq!(plan.units.len(), 1);
-        assert_eq!(plan.shard_to_unit, vec![0, 0]);
+        assert_eq!(plan.units.len(), 2);
         assert_eq!(
-            plan.units[0].worker_indices,
+            plan.units[1].worker_indices,
             vec![WorkerIdx(2), WorkerIdx(3), WorkerIdx(4), WorkerIdx(5)]
         );
-        assert_eq!(plan.units[0].shards_assigned, vec![0, 1]);
-        assert_eq!(plan.units[0].expected_mr, 3); // 2 shards + 1 scratch
-    }
-
-    #[test]
-    fn matching_finds_complete_assignment_that_greedy_misses() {
-        let compatible = vec![vec![true, true], vec![true, false]];
-        assert_eq!(maximum_matching(&compatible), Some(vec![1, 0]));
-    }
-
-    #[test]
-    fn matching_requires_every_local_fabric() {
-        assert_eq!(maximum_matching(&[vec![true], vec![true]]), None);
-        assert_eq!(
-            maximum_matching(&[vec![false, true], vec![false, false]]),
-            None
-        );
+        assert_eq!(plan.units[1].shards_assigned, vec![0, 1]);
+        assert_eq!(plan.units[1].expected_mr, 4); // 2 shard MRs + 2 scratch MRs
     }
 
     #[test]
@@ -922,6 +1031,29 @@ mod tests {
         assert!(candidate_address("hex:0102", "192.0.2.4:9101".parse().unwrap()).is_ok());
         assert!(candidate_address("hex:no", "192.0.2.4:9101".parse().unwrap()).is_err());
         assert!(candidate_address("192.0.2.4:0", "192.0.2.4:9101".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn lower_peer_alone_is_path_authority() {
+        assert!(local_is_path_authority(PeerId(4), PeerId(9)));
+        assert!(!local_is_path_authority(PeerId(9), PeerId(4)));
+    }
+
+    #[test]
+    fn follower_requires_exactly_one_inbound_unit() {
+        let peer = PeerId(4);
+        assert_eq!(
+            unique_inbound_unit(&[HashSet::new(), HashSet::from([peer])], peer),
+            Some(1)
+        );
+        assert_eq!(
+            unique_inbound_unit(&[HashSet::new(), HashSet::new()], peer),
+            None
+        );
+        assert_eq!(
+            unique_inbound_unit(&[HashSet::from([peer]), HashSet::from([peer])], peer),
+            None
+        );
     }
 
     /// Drop-logging stand-in for a `FabricUnit` resource: records its
@@ -971,6 +1103,7 @@ mod tests {
                 remote_base: 0,
                 len: 0,
             },
+            scratch_mrs: Vec::new(),
             page_size: 4096,
             shards_assigned: Vec::new(),
             cache_directories: CacheDirectorySet::new(),

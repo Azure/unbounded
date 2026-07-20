@@ -13,8 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
-
-	storageconfig "github.com/Azure/unbounded/api/unbounded-storage"
 )
 
 const testRingLabel = "unbounded-cloud.io/storage-ring"
@@ -79,23 +77,22 @@ func TestComputeRingMembership(t *testing.T) {
 		node("loner", "", "10.0.0.5"),
 	}
 
-	ring := computeRing(nodes, "self", testRingLabel, 9000)
+	ring := computeRing(nodes, "self", testRingLabel, 9101)
 
 	require.True(t, ring.active)
 	assert.Equal(t, "self", ring.selfName)
-	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
 
 	require.Len(t, ring.peers, 3)
 	// Peers are sorted by name; verify all red peers are present with their
 	// InternalIP:port sockets, including self.
 	got := map[string]string{}
 	for _, p := range ring.peers {
-		got[p.GetName()] = p.GetTcp().GetAddr()
+		got[p.GetName()] = p.GetDiscoveryAddr()
 	}
 
-	assert.Equal(t, "10.0.0.1:9000", got["self"])
-	assert.Equal(t, "10.0.0.2:9000", got["peer-a"])
-	assert.Equal(t, "10.0.0.3:9000", got["peer-b"])
+	assert.Equal(t, "10.0.0.1:9101", got["self"])
+	assert.Equal(t, "10.0.0.2:9101", got["peer-a"])
+	assert.Equal(t, "10.0.0.3:9101", got["peer-b"])
 }
 
 func TestComputeRingPeersSortedByName(t *testing.T) {
@@ -134,7 +131,7 @@ func TestComputeRingSelfMissing(t *testing.T) {
 }
 
 func TestComputeRingSelfNoInternalIP(t *testing.T) {
-	// self has no InternalIP: cannot form a routable fabric addr, inactive.
+	// self has no InternalIP: cannot form a routable discovery endpoint, inactive.
 	nodes := []*corev1.Node{
 		node("self", "red", ""),
 		node("peer-a", "red", "10.0.0.2"),
@@ -161,16 +158,15 @@ func TestComputeRingSkipsPeerWithoutInternalIP(t *testing.T) {
 }
 
 func TestComputeRingSingleMember(t *testing.T) {
-	// A lone ring member still activates so its fabric addr is made routable,
-	// with self in the peer roster.
+	// A lone ring member still activates with self in the peer roster.
 	nodes := []*corev1.Node{node("self", "red", "10.0.0.1")}
 
 	ring := computeRing(nodes, "self", testRingLabel, 9000)
 
 	require.True(t, ring.active)
-	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
 	require.Len(t, ring.peers, 1)
 	assert.Equal(t, "self", ring.peers[0].GetName())
+	assert.Equal(t, "10.0.0.1:9000", ring.peers[0].GetDiscoveryAddr())
 }
 
 func TestComputeRDMARingMembership(t *testing.T) {
@@ -182,21 +178,20 @@ func TestComputeRDMARingMembership(t *testing.T) {
 		node("other", "blue", "10.0.0.6"),
 	}
 
-	ring := computeRDMARing(nodes, "self", testRingLabel, 9101)
+	ring := computeRing(nodes, "self", testRingLabel, 9101)
 
 	require.True(t, ring.active)
 	assert.Equal(t, "self", ring.selfName)
-	assert.Empty(t, ring.selfListenAddr)
 	require.Len(t, ring.peers, 3)
 
-	got := map[string]*storageconfig.RdmaPeerConfig{}
+	got := map[string]string{}
 	for _, p := range ring.peers {
-		got[p.GetName()] = p.GetRdma()
+		got[p.GetName()] = p.GetDiscoveryAddr()
 	}
 
-	assert.Equal(t, "10.0.0.1:9101", got["self"].GetDiscoveryAddr())
-	assert.Equal(t, "10.0.0.2:9101", got["peer-a"].GetDiscoveryAddr())
-	assert.Equal(t, "[fd00::3]:9101", got["peer-b"].GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.1:9101", got["self"])
+	assert.Equal(t, "10.0.0.2:9101", got["peer-a"])
+	assert.Equal(t, "[fd00::3]:9101", got["peer-b"])
 }
 
 func TestComputeRDMARingInactiveWithoutSelfInternalIP(t *testing.T) {
@@ -205,7 +200,7 @@ func TestComputeRDMARingInactiveWithoutSelfInternalIP(t *testing.T) {
 		node("peer-a", "red", "10.0.0.2"),
 	}
 
-	ring := computeRDMARing(nodes, "self", testRingLabel, 9101)
+	ring := computeRing(nodes, "self", testRingLabel, 9101)
 
 	assert.False(t, ring.active)
 }
@@ -213,13 +208,13 @@ func TestComputeRDMARingInactiveWithoutSelfInternalIP(t *testing.T) {
 func TestComputeRDMARingSingleMember(t *testing.T) {
 	nodes := []*corev1.Node{node("self", "red", "10.0.0.1")}
 
-	ring := computeRDMARing(nodes, "self", testRingLabel, 9101)
+	ring := computeRing(nodes, "self", testRingLabel, 9101)
 
 	require.True(t, ring.active)
 	assert.Equal(t, "self", ring.selfName)
 	require.Len(t, ring.peers, 1)
 	assert.Equal(t, "self", ring.peers[0].GetName())
-	assert.Equal(t, "10.0.0.1:9101", ring.peers[0].GetRdma().GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.1:9101", ring.peers[0].GetDiscoveryAddr())
 }
 
 func TestNewPeerWatcherDisabledWithoutNodeName(t *testing.T) {
@@ -272,16 +267,15 @@ func TestPeerWatcherSnapshotFromInformer(t *testing.T) {
 
 	require.NoError(t, w.Start(ctx))
 
-	state := w.snapshot(9000, true)
+	state := w.snapshot(9101, true)
 	ring := state.ring
 
 	require.True(t, ring.active)
-	assert.Equal(t, "10.0.0.1:9000", ring.selfListenAddr)
 	require.Len(t, ring.peers, 2)
 	assert.Equal(t, "peer-a", ring.peers[0].GetName())
-	assert.Equal(t, "10.0.0.2:9000", ring.peers[0].GetTcp().GetAddr())
+	assert.Equal(t, "10.0.0.2:9101", ring.peers[0].GetDiscoveryAddr())
 	assert.Equal(t, "self", ring.peers[1].GetName())
-	assert.Equal(t, "10.0.0.1:9000", ring.peers[1].GetTcp().GetAddr())
+	assert.Equal(t, "10.0.0.1:9101", ring.peers[1].GetDiscoveryAddr())
 }
 
 func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
@@ -304,13 +298,13 @@ func TestPeerWatcherSnapshotRdmaFromInformer(t *testing.T) {
 
 	require.NoError(t, w.Start(ctx))
 
-	state := w.snapshotRdma(9101, true)
+	state := w.snapshot(9101, true)
 	require.True(t, state.ring.active)
 	require.Len(t, state.ring.peers, 2)
 	assert.Equal(t, "peer-a", state.ring.peers[0].GetName())
-	assert.Equal(t, "10.0.0.2:9101", state.ring.peers[0].GetRdma().GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.2:9101", state.ring.peers[0].GetDiscoveryAddr())
 	assert.Equal(t, "self", state.ring.peers[1].GetName())
-	assert.Equal(t, "10.0.0.1:9101", state.ring.peers[1].GetRdma().GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.1:9101", state.ring.peers[1].GetDiscoveryAddr())
 }
 
 func TestPeerWatcherSnapshotIncludesSelfAnnotations(t *testing.T) {

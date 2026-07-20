@@ -507,7 +507,12 @@ mod tests {
         assert_eq!(report.added, 0);
         assert_eq!(report.removed, 0);
         assert_eq!(state.lock().unwrap().open_calls, calls_after_first);
-        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.disable_page_cache);
+        assert!(
+            reg.entries[&PathBuf::from("/a")]
+                .disk
+                .spec
+                .disable_page_cache
+        );
         assert!(!reg.channels_snapshot()[0].3);
     }
 
@@ -519,7 +524,10 @@ mod tests {
         let report = reg.reconcile(&[spec("/a", Some(32))]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert_eq!(reg.entries[&PathBuf::from("/a")].disk.spec.queue_depth, Some(32));
+        assert_eq!(
+            reg.entries[&PathBuf::from("/a")].disk.spec.queue_depth,
+            Some(32)
+        );
     }
 
     #[test]
@@ -590,7 +598,10 @@ mod tests {
         let retried = reg.reconcile(&desired);
         assert_eq!(retried.added, 1);
         assert!(retried.failures.is_empty());
-        assert_eq!(reg.entries[&PathBuf::from("/a")].disk.spec.queue_depth, Some(32));
+        assert_eq!(
+            reg.entries[&PathBuf::from("/a")].disk.spec.queue_depth,
+            Some(32)
+        );
     }
 
     /// Records the per-disk `(path, cpu_hint)` decisions so tests can
@@ -795,20 +806,22 @@ mod tests {
     /// `prev == None` contract (a first-time open never reports drift).
     #[test]
     fn size_drift_is_detected() {
-        let file_spec = |size: u64| RuntimeDisk::explicit(crate::config::schema::DiskSpec {
-            queue_depth: None,
-            page_size_bytes: None,
-            skip_recovery_scan: false,
-            force_format: false,
-            bypass_admission: false,
-            bypass_index_read: false,
-            bypass_checksum: false,
-            disable_page_cache: false,
-            config: Some(disk_spec::Config::File(FileDiskConfig {
-                size: Some(size),
-                path: "/a".to_string(),
-            })),
-        });
+        let file_spec = |size: u64| {
+            RuntimeDisk::explicit(crate::config::schema::DiskSpec {
+                queue_depth: None,
+                page_size_bytes: None,
+                skip_recovery_scan: false,
+                force_format: false,
+                bypass_admission: false,
+                bypass_index_read: false,
+                bypass_checksum: false,
+                disable_page_cache: false,
+                config: Some(disk_spec::Config::File(FileDiskConfig {
+                    size: Some(size),
+                    path: "/a".to_string(),
+                })),
+            })
+        };
         let a = file_spec(64 * 4096);
         let b = file_spec(128 * 4096);
 
@@ -830,7 +843,12 @@ mod tests {
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.skip_recovery_scan);
+        assert!(
+            reg.entries[&PathBuf::from("/a")]
+                .disk
+                .spec
+                .skip_recovery_scan
+        );
     }
 
     #[test]
@@ -869,7 +887,12 @@ mod tests {
         let report = reg.reconcile(&[next]);
         assert_eq!(report.added, 1);
         assert_eq!(report.removed, 1);
-        assert!(reg.entries[&PathBuf::from("/a")].disk.spec.bypass_index_read);
+        assert!(
+            reg.entries[&PathBuf::from("/a")]
+                .disk
+                .spec
+                .bypass_index_read
+        );
     }
 
     #[test]

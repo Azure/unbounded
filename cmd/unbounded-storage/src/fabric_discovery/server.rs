@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use super::{MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PATH};
+use super::{MAX_REQUEST_BYTES, Manifest, PATH};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
@@ -21,34 +21,11 @@ pub struct Server {
 }
 
 impl Server {
-    /// Bind a discovery server and prepare a deterministically sorted response.
-    pub fn bind(
-        addr: SocketAddr,
-        candidates: impl IntoIterator<Item = String>,
-    ) -> io::Result<Self> {
-        let mut candidates: Vec<String> = candidates.into_iter().collect();
-        if candidates
-            .iter()
-            .any(|candidate| candidate.is_empty() || candidate.contains(['\r', '\n']))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "fabric discovery candidates must be non-empty single lines",
-            ));
-        }
-        candidates.sort_unstable();
-
-        let mut body = candidates.join("\n").into_bytes();
-        if !body.is_empty() {
-            body.push(b'\n');
-        }
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "fabric discovery response exceeds 256 KiB",
-            ));
-        }
-
+    /// Bind a discovery server and serialize its immutable process manifest.
+    pub fn bind(addr: SocketAddr, manifest: Manifest) -> io::Result<Self> {
+        let body = manifest
+            .to_json()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         Ok(Self { listener, body })
@@ -154,7 +131,7 @@ fn invalid_request() -> io::Error {
 
 fn write_response(stream: &mut TcpStream, status: &str, body: &[u8]) -> io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
@@ -166,13 +143,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bind_rejects_multiline_candidates() {
-        let error = Server::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            ["node-a:1\nnode-b:2".to_owned()],
-        )
-        .err()
-        .unwrap();
+    fn bind_rejects_invalid_manifests() {
+        let error = Server::bind("127.0.0.1:0".parse().unwrap(), Manifest::new(1, 0, vec![]))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error = Server::bind("127.0.0.1:0".parse().unwrap(), Manifest::new(0, 1, vec![]))
+            .err()
+            .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

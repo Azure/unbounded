@@ -24,7 +24,9 @@ use serde::de::DeserializeOwned;
 
 use crate::bufferpool::{BulkRef, Error as PoolError, PageRef, PageStream, Req, StripeKey};
 use crate::fabric::scratch::ScratchBacking;
-use crate::fabric::{Fabric, FabricPage, FabricTransport, Handler, HandlerStream, MrHandle};
+use crate::fabric::{
+    Fabric, FabricPage, FabricTransport, Handler, HandlerStream, MrHandle, PeerPathSelection,
+};
 use crate::fanout::{FetchChannel, FetchEvent, FetchStream};
 use crate::memory::Backing;
 use crate::p2p::{ChainFingerRouter, FingerTable, RingId, RouteTableHandle, stripe_to_ring};
@@ -186,6 +188,26 @@ impl RecursiveHandler {
         let scratch = Arc::new(ScratchBacking::new(scratch, scratch_pages));
         let router = ChainFingerRouter::new(routes.clone());
         let forward = FabricTransport::new(fabric, scratch_mr, router, page_size)?;
+        Ok(Self {
+            scratch,
+            routes,
+            forward,
+            owners,
+        })
+    }
+
+    pub fn with_selected_routes(
+        scratch: Backing,
+        scratch_pages: u32,
+        routes: RouteTableHandle,
+        units: Vec<(Arc<Fabric>, MrHandle)>,
+        selection: PeerPathSelection,
+        page_size: usize,
+        owners: OwnerShardTable,
+    ) -> crate::fabric::Result<Self> {
+        let scratch = Arc::new(ScratchBacking::new(scratch, scratch_pages));
+        let router = ChainFingerRouter::new(routes.clone());
+        let forward = FabricTransport::new_selected(units, selection, router, page_size)?;
         Ok(Self {
             scratch,
             routes,

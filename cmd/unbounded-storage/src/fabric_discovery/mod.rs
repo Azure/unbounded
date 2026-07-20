@@ -5,9 +5,11 @@
 
 mod client;
 mod server;
+mod types;
 
 pub use client::fetch;
 pub use server::Server;
+pub use types::{Listener, MANIFEST_VERSION, Manifest, Transport};
 
 const PATH: &str = "/v1/fabric";
 const MAX_REQUEST_BYTES: usize = 8 * 1024;

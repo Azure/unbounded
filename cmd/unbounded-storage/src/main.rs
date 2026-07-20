@@ -21,7 +21,7 @@ use unbounded_storage::bufferpool::{Pool, PoolConfig};
 use unbounded_storage::config::{
     self, BackendSpec, Config, FrontendSpec, LoadedConfig, ResolvedFrontendBinding, frontend_spec,
 };
-use unbounded_storage::fabric::{self, Fabric, MrHandle, Provider};
+use unbounded_storage::fabric::{self, Fabric, MrHandle, PeerPathSelection, Provider};
 use unbounded_storage::fanout::{
     FanoutPeer, FanoutTable, FetchChannel, FetchService, NumaShardTable,
 };
@@ -110,8 +110,8 @@ impl FabricStartup {
 /// provider. Returns true only when RDMA is not already disabled, at
 /// least one HCA was discovered, and the verbs provider is unavailable.
 /// Pure so it can be unit-tested without touching libfabric or sysfs.
-fn should_force_tcp_fallback(disable_rdma: bool, hca_count: usize, verbs_available: bool) -> bool {
-    !disable_rdma && hca_count > 0 && !verbs_available
+fn should_omit_auto_rdma(auto_rdma: bool, hca_count: usize, verbs_available: bool) -> bool {
+    auto_rdma && hca_count > 0 && !verbs_available
 }
 
 fn startup_to_core_plan_config(
@@ -125,16 +125,20 @@ fn startup_to_core_plan_config(
             .map(|n| n as usize)
             .unwrap_or(defaults.nic_workers),
         serving_cores: topology.serving_cores.map(|n| n as usize),
-        hcas_per_numa: fabric
-            .auto_hcas_per_numa_node()
-            .map(|n| n as usize)
-            .unwrap_or(defaults.hcas_per_numa),
+        hcas_per_numa: if fabric.has_explicit_rdma() {
+            usize::MAX
+        } else {
+            fabric
+                .auto_hcas_per_numa_node()
+                .map(|n| n as usize)
+                .unwrap_or(defaults.hcas_per_numa)
+        },
         use_smt_siblings: topology.use_smt_siblings,
         respect_isolated: !topology.ignore_isolated,
         exclude_node_cpu0: !topology.include_node_cpu0,
         require_node_type_ca: defaults.require_node_type_ca,
         require_active_port: !topology.allow_inactive_port,
-        disable_rdma: topology.disable_rdma,
+        disable_rdma: topology.disable_rdma || fabric.rdma_selection.is_none(),
     }
 }
 
@@ -266,18 +270,22 @@ fn main() -> ExitCode {
     // datapath with no working user-space verbs stack. Binding a shard
     // to `verbs` there fails the very first `fi_getinfo` with
     // `-FI_ENODATA` and crash-loops the daemon. When that shape is
-    // detected, force the tcp fallback (the same path as the
-    // `disable_rdma` escape hatch) so the daemon comes up over the tcp
-    // provider instead of failing every shard at bring-up.
+    // detected, automatic RDMA is omitted. Explicit RDMA remains strict
+    // and fails startup rather than silently changing the configured path.
     let mut core_plan_config = startup_to_core_plan_config(startup.topology(), fabric_cfg);
-    if should_force_tcp_fallback(
-        core_plan_config.disable_rdma,
-        host.hcas.len(),
-        fabric::provider_available(Provider::Verbs),
-    ) {
+    let verbs_available = fabric::provider_available(Provider::Verbs);
+    if fabric_cfg.has_explicit_rdma()
+        && (core_plan_config.disable_rdma || host.hcas.is_empty() || !verbs_available)
+    {
+        eprintln!(
+            "fabric: explicit RDMA requires enabled RDMA, at least one usable HCA, and the libfabric verbs provider"
+        );
+        return ExitCode::FAILURE;
+    }
+    if should_omit_auto_rdma(fabric_cfg.has_auto_rdma(), host.hcas.len(), verbs_available) {
         eprintln!(
             "fabric: {} RDMA HCA(s) discovered but the libfabric verbs provider is \
-             unavailable; forcing the tcp provider fallback",
+             unavailable; omitting automatically selected RDMA fabrics",
             host.hcas.len(),
         );
         core_plan_config.disable_rdma = true;
@@ -378,6 +386,20 @@ fn main() -> ExitCode {
         &core_plan.nic_workers,
         &hca_dev_names,
     );
+    if fabric_cfg.has_explicit_rdma() {
+        let planned = fabric_plan
+            .units
+            .iter()
+            .filter(|unit| unit.provider == Provider::Verbs)
+            .count();
+        let configured = settings.fabric.rdma_listen_addrs.len();
+        if planned != configured {
+            eprintln!(
+                "fabric: explicit RDMA bind count {configured} does not match selected HCA count {planned}"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
 
     let workers: Vec<(ServingShard, Option<String>)> = core_plan
         .serving_shards
@@ -417,6 +439,7 @@ fn main() -> ExitCode {
     // Prepare the initial shard layer through phase B. The shards remain
     // parked and RPC serving stays off until initial disks are published.
     let loaded = Arc::new(loaded);
+    let discovery_peer_id = loaded.runtime().mesh.self_peer_id.0;
     let prepared = match shard_layer::prepare_shard_layer(loaded.clone(), &deps) {
         Ok(prepared) => prepared,
         Err(errs) => {
@@ -460,8 +483,33 @@ fn main() -> ExitCode {
         let bind = discovery_bind
             .parse()
             .expect("validated fabric discovery address");
-        let candidates = fabric_unit_addresses.into_iter().map(|unit| unit.addr);
-        let server = match unbounded_storage::fabric_discovery::Server::bind(bind, candidates) {
+        let listeners = fabric_unit_addresses
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, unit)| unbounded_storage::fabric_discovery::Listener {
+                    id: format!("fabric-{index}"),
+                    transport: if unit.rdma {
+                        unbounded_storage::fabric_discovery::Transport::Rdma
+                    } else {
+                        unbounded_storage::fabric_discovery::Transport::Tcp
+                    },
+                    address: unit.addr,
+                },
+            )
+            .collect();
+        let process_incarnation = loop {
+            let incarnation = rand::random::<u64>();
+            if incarnation != 0 {
+                break incarnation;
+            }
+        };
+        let manifest = unbounded_storage::fabric_discovery::Manifest::new(
+            discovery_peer_id,
+            process_incarnation,
+            listeners,
+        );
+        let server = match unbounded_storage::fabric_discovery::Server::bind(bind, manifest) {
             Ok(server) => server,
             Err(error) => {
                 eprintln!("fabric discovery: failed to bind {discovery_bind}: {error}");
@@ -655,7 +703,8 @@ fn main() -> ExitCode {
 fn run_shard(
     widx: WorkerIdx,
     shard: ServingShard,
-    fabric: Arc<Fabric>,
+    fabrics: Vec<Arc<Fabric>>,
+    peer_paths: PeerPathSelection,
     tx: mpsc::Sender<ShardReady>,
     backing_kind: BackingKind,
     bytes_per_shard: usize,
@@ -696,13 +745,16 @@ fn run_shard(
         }
     };
     let page_size = backing.page_size;
-    let mr = match fabric.register_backing(&backing, shard.numa) {
-        Ok(mr) => mr,
-        Err(e) => {
-            phase_a.report_failed(format!("worker={}: register_backing: {e}", widx.0,));
-            return;
+    let mut mrs = Vec::with_capacity(fabrics.len());
+    for fabric in &fabrics {
+        match fabric.register_backing(&backing, None) {
+            Ok(mr) => mrs.push(mr),
+            Err(e) => {
+                phase_a.report_failed(format!("worker={}: register_backing: {e}", widx.0,));
+                return;
+            }
         }
-    };
+    }
 
     // Per-shard io_uring socket ring. Created on the pinned shard
     // thread (the ring is !Send) and given the same backing as a single
@@ -792,9 +844,10 @@ fn run_shard(
     // the control-drain tick hook below. A `ShardCommand::ApplyConfig`
     // republishes through this single handle so all consumers observe
     // the new finger table atomically without a restart.
-    let transport = match RoutedTransport::with_routes(
-        fabric.clone(),
-        mr,
+    let transport_units = fabrics.iter().cloned().zip(mrs.iter().copied()).collect();
+    let transport = match RoutedTransport::with_selected_routes(
+        transport_units,
+        peer_paths,
         page_size,
         routes.clone(),
         transport_registry.clone(),
@@ -874,7 +927,7 @@ fn run_shard(
     phase_a.report_up(ShardPublish {
         backing_base: backing_base as usize,
         backing_len,
-        fabric_mr: mr,
+        fabric_mrs: mrs,
         numa: shard.numa,
         fetch_channel,
         backing_keepalive,
@@ -1559,7 +1612,7 @@ struct ShardPublish {
     /// Fabric memory region for this shard's pool backing. Shared RPC
     /// workers use it to source owner responses directly from pinned
     /// bufferpool pages.
-    fabric_mr: MrHandle,
+    fabric_mrs: Vec<MrHandle>,
     /// NUMA node this shard's cores and backing are pinned to (`None`
     /// when unpinned). Forwarded into [`PeerPublish`] so every shard can
     /// build its NUMA -> serving-shard table for NUMA-local fetch
@@ -1831,7 +1884,7 @@ mod tests {
 
     fn auto_rdma_fabric(hcas_per_numa_node: Option<u64>) -> config::FabricCfg {
         config::FabricCfg {
-            binds: Some(config::fabric_cfg::Binds::AutoRdma(
+            rdma_selection: Some(config::fabric_cfg::RdmaSelection::AutoRdma(
                 config::AutoRdmaFabricBinds { hcas_per_numa_node },
             )),
             ..Default::default()
@@ -1853,7 +1906,7 @@ mod tests {
         assert!(cc.respect_isolated);
         assert!(cc.exclude_node_cpu0);
         assert!(cc.require_active_port);
-        assert!(!cc.disable_rdma);
+        assert!(cc.disable_rdma);
         // Fields with no knob retain CorePlanConfig defaults.
         assert_eq!(cc.require_node_type_ca, d.require_node_type_ca);
     }
@@ -2002,33 +2055,26 @@ mod tests {
     }
 
     #[test]
-    fn force_tcp_fallback_when_hca_present_but_verbs_unavailable() {
-        // The crash-loop case: sysfs surfaced an HCA but libfabric has
-        // no usable verbs provider. Force the fallback.
-        assert!(should_force_tcp_fallback(false, 1, false));
-        assert!(should_force_tcp_fallback(false, 4, false));
+    fn omit_auto_rdma_when_hca_present_but_verbs_unavailable() {
+        assert!(should_omit_auto_rdma(true, 1, false));
+        assert!(should_omit_auto_rdma(true, 4, false));
     }
 
     #[test]
-    fn no_force_tcp_fallback_when_verbs_available() {
-        // Real RDMA hardware with a working verbs provider: keep RDMA.
-        assert!(!should_force_tcp_fallback(false, 2, true));
+    fn keep_auto_rdma_when_verbs_available() {
+        assert!(!should_omit_auto_rdma(true, 2, true));
     }
 
     #[test]
-    fn no_force_tcp_fallback_without_hcas() {
-        // No HCA discovered: planning already takes the tcp_fallback
-        // path, so there is nothing to override regardless of the probe.
-        assert!(!should_force_tcp_fallback(false, 0, false));
-        assert!(!should_force_tcp_fallback(false, 0, true));
+    fn no_auto_rdma_override_without_hcas() {
+        assert!(!should_omit_auto_rdma(true, 0, false));
+        assert!(!should_omit_auto_rdma(true, 0, true));
     }
 
     #[test]
-    fn no_force_tcp_fallback_when_already_disabled() {
-        // Operator already set disable_rdma: do not log a redundant
-        // override.
-        assert!(!should_force_tcp_fallback(true, 1, false));
-        assert!(!should_force_tcp_fallback(true, 3, true));
+    fn explicit_or_absent_rdma_never_uses_auto_override() {
+        assert!(!should_omit_auto_rdma(false, 1, false));
+        assert!(!should_omit_auto_rdma(false, 3, true));
     }
 
     #[test]

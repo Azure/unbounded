@@ -36,8 +36,7 @@ type renderState struct {
 // The per-node mesh fields (self and discovered peer set) come from state,
 // computed from the Kubernetes node watch. When the ring is active, this node's
 // peer name is injected and discovered peers are merged with any peers declared
-// in the YAML (discovered peers win on name collision). TCP rings also override
-// startup.fabric.tcp.addr with the node's own routable bind. The default disk
+// in the YAML (discovered peers win on name collision). The default disk
 // set is populated from the self node's storage disk annotations, or from a
 // default file-backed disk when no valid annotation disks are present. An
 // explicit disk_discovery policy suppresses that legacy overlay and is resolved
@@ -172,28 +171,13 @@ func collectComponentNames[T any](components map[string]string, kind string, spe
 
 // applyRing overlays the per-node ring state onto a Config parsed from the
 // ConfigMap YAML. It injects this node's self peer name, merges the discovered
-// peer set with any declared peers, and rebinds the TCP fabric address to the
-// node's own routable address when the ring includes a TCP selfListenAddr.
+// peer set with any declared peers.
 func applyRing(cfg *storageconfig.Config, ring ringState) {
 	// Preserve YAML-declared routing knobs (fingers_per_node, routing_plan,
 	// topology_weighting); only stamp in the locally computed self name and peer
 	// roster.
 	cfg.Self = ring.selfName
 	cfg.Peers = mergePeers(cfg.Peers, ring.peers)
-
-	if ring.selfListenAddr != "" {
-		if cfg.Startup == nil {
-			cfg.Startup = &storageconfig.StartupCfg{}
-		}
-
-		if cfg.Startup.Fabric == nil {
-			cfg.Startup.Fabric = &storageconfig.FabricCfg{}
-		}
-
-		cfg.Startup.Fabric.Binds = &storageconfig.FabricCfg_Tcp{
-			Tcp: &storageconfig.TcpFabricBinds{Addr: ring.selfListenAddr},
-		}
-	}
 }
 
 // mergePeers combines the label-discovered peer set with any peers declared in

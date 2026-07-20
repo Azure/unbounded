@@ -66,7 +66,8 @@ impl UringDevice {
         page_size: usize,
     ) -> Result<OpenDisk, OpenError> {
         let ring = StorageRing::new(ring_cfg).map_err(OpenError::Ring)?;
-        let file = open_file(path, o_direct && !exclusive, exclusive).map_err(OpenError::OpenFile)?;
+        let file =
+            open_file(path, o_direct && !exclusive, exclusive).map_err(OpenError::OpenFile)?;
         if exclusive {
             match crate::storage::discovery::probe_fd(file.as_raw_fd()) {
                 Ok(crate::storage::discovery::ProbeResult::Empty) => {}

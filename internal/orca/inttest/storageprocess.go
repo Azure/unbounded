@@ -124,10 +124,10 @@ func freeLoopbackPort(t *testing.T) int {
 // "http://host:port" endpoint URL (orca's edge S3 surface). The shape mirrors the
 // config produced by hack/smoke-storage.py write_config: the schema is
 // proto3-native, so byte sizes are plain integer byte counts and
-// backend/frontend/peer/disk implementations are selected by oneof
-// config table names. The startup-fixed knobs (heap backing, fabric
-// bind address, forcing the tcp provider) live in the `[startup.*]` sections.
-func writeStorageConfig(t *testing.T, path, fabricAddr, selfName, peerName, peerAddr, diskPath, orcaEdge, frontendBind string) {
+// backend/frontend/disk implementations are selected by oneof config table
+// names. Peers carry discovery HTTP endpoints; fabric binds and discovery
+// listeners live in the startup-fixed `[startup.*]` sections.
+func writeStorageConfig(t *testing.T, path, fabricAddr, discoveryAddr, selfName, peerName, peerDiscoveryAddr, diskPath, orcaEdge, frontendBind string) {
 	t.Helper()
 
 	cfg := fmt.Sprintf(`self = %q
@@ -141,15 +141,11 @@ stripe_size_bytes = %d
 
 [[peers]]
 name = %q
-
-[peers.config.tcp]
-addr = %q
+discovery_addr = %q
 
 [[peers]]
 name = %q
-
-[peers.config.tcp]
-addr = %q
+discovery_addr = %q
 
 [[caches]]
 name = "cache"
@@ -173,18 +169,21 @@ addr = "%s"
 [startup.memory]
 no_hugepages = true
 
-[startup.fabric.binds.tcp]
+[startup.fabric.tcp]
+addr = "%s"
+
+[startup.fabric_discovery]
 addr = "%s"
 
 [startup.topology]
 disable_rdma = true
 serving_cores = 2
 `, selfName, orcaEdge, storageStripeSize,
-		selfName, fabricAddr,
-		peerName, peerAddr,
+		selfName, discoveryAddr,
+		peerName, peerDiscoveryAddr,
 		storagePageSize, diskPath, storageDiskSize,
 		frontendBind,
-		fabricAddr)
+		fabricAddr, discoveryAddr)
 
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		t.Fatalf("write storage config %s: %v", path, err)
@@ -208,16 +207,19 @@ func startStorageRing(ctx context.Context, t *testing.T, orcaEdge string) *stora
 	dir := t.TempDir()
 
 	fabA, fabB := freeLoopbackPort(t), freeLoopbackPort(t)
+	discA, discB := freeLoopbackPort(t), freeLoopbackPort(t)
 	feA, feB := freeLoopbackPort(t), freeLoopbackPort(t)
 
 	cfg1 := filepath.Join(dir, "node1.toml")
 	cfg2 := filepath.Join(dir, "node2.toml")
 
 	writeStorageConfig(t, cfg1,
-		fmt.Sprintf("127.0.0.1:%d", fabA), "node-a", "node-b", fmt.Sprintf("127.0.0.1:%d", fabB),
+		fmt.Sprintf("127.0.0.1:%d", fabA), fmt.Sprintf("127.0.0.1:%d", discA),
+		"node-a", "node-b", fmt.Sprintf("127.0.0.1:%d", discB),
 		filepath.Join(dir, "node1.disk"), orcaEdge, fmt.Sprintf("127.0.0.1:%d", feA))
 	writeStorageConfig(t, cfg2,
-		fmt.Sprintf("127.0.0.1:%d", fabB), "node-b", "node-a", fmt.Sprintf("127.0.0.1:%d", fabA),
+		fmt.Sprintf("127.0.0.1:%d", fabB), fmt.Sprintf("127.0.0.1:%d", discB),
+		"node-b", "node-a", fmt.Sprintf("127.0.0.1:%d", discA),
 		filepath.Join(dir, "node2.disk"), orcaEdge, fmt.Sprintf("127.0.0.1:%d", feB))
 
 	spawnStorageNode(ctx, t, bin, cfg1, filepath.Join(dir, "node1.log"))

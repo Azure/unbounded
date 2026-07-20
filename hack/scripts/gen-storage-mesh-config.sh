@@ -4,7 +4,7 @@
 
 # gen-storage-mesh-config.sh -- Generate a test unbounded-storage TOML config
 # for one node of the current Kubernetes cluster, wiring every selected node in
-# as a named TCP peer using each node's InternalIP.
+# as a named peer using each node's fabric discovery endpoint.
 #
 # Usage:
 #   hack/scripts/gen-storage-mesh-config.sh [options]
@@ -17,7 +17,8 @@
 #                            user-mode nodes only, excluding net gateways)
 #       --local-node NAME    node this config is for (defaults to the local
 #                            machine's hostname)
-#       --port PORT          fabric / peer TCP port (default 7000)
+#       --port PORT          fabric TCP port (default 7000)
+#       --discovery-port PORT fabric discovery HTTP port (default 7001)
 #       --frontend-port PORT frontend bind port (default 9000)
 #       --metrics-port PORT  Prometheus metrics exporter bind port (default 9100)
 #       --origin HOST:PORT   s3 backend origin endpoint as host:port, no scheme
@@ -66,6 +67,7 @@ OPT_CONTEXT=""
 OPT_SELECTOR="kubernetes.azure.com/mode=user,unbounded-cloud.io/unbounded-net-gateway!=true"
 OPT_LOCAL_NODE=""
 OPT_PORT="7000"
+OPT_DISCOVERY_PORT="7001"
 OPT_FRONTEND_PORT="9000"
 OPT_METRICS_PORT="9100"
 # Empty means "derive the s3 origin from the orca service ClusterIP" (see the
@@ -97,6 +99,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--port)
 		OPT_PORT="$2"
+		shift 2
+		;;
+	--discovery-port)
+		OPT_DISCOVERY_PORT="$2"
 		shift 2
 		;;
 	--frontend-port)
@@ -137,6 +143,7 @@ done
 require_cmd kubectl "Install kubectl: https://kubernetes.io/docs/tasks/tools/"
 
 [[ "$OPT_PORT" =~ ^[0-9]+$ ]] || die "--port must be a number (got '$OPT_PORT')."
+[[ "$OPT_DISCOVERY_PORT" =~ ^[0-9]+$ ]] || die "--discovery-port must be a number (got '$OPT_DISCOVERY_PORT')."
 [[ "$OPT_FRONTEND_PORT" =~ ^[0-9]+$ ]] || die "--frontend-port must be a number (got '$OPT_FRONTEND_PORT')."
 [[ "$OPT_METRICS_PORT" =~ ^[0-9]+$ ]] || die "--metrics-port must be a number (got '$OPT_METRICS_PORT')."
 [[ "$OPT_ORCA_PORT" =~ ^[0-9]+$ ]] || die "--orca-port must be a number (got '$OPT_ORCA_PORT')."
@@ -291,9 +298,7 @@ for i in "${!NAMES[@]}"; do
 
 [[peers]]
 name = "${NAMES[$i]}"
-
-[peers.config.tcp]
-addr = "${IPS[$i]}:$OPT_PORT"
+discovery_addr = "${IPS[$i]}:$OPT_DISCOVERY_PORT"
 EOF
 done
 
@@ -318,12 +323,17 @@ source = "cache"
 [frontends.config.http]
 addr = "0.0.0.0:$OPT_FRONTEND_PORT"
 
-[startup.fabric.binds.tcp]
+[startup.fabric.tcp]
 # Bind the node's own routable IP, not 0.0.0.0. This must be the exact
-# address peers use to reach this node (their [[peers]] TCP addr points here);
-# the libfabric tcp provider uses it both to bind and as its
+# address this node advertises through fabric discovery; the libfabric tcp
+# provider uses it both to bind and as its
 # connection-manager identity and does not come up on an INADDR_ANY bind.
 addr = "$LOCAL_IP:$OPT_PORT"
+
+[startup.fabric_discovery]
+# Every process publishes its typed listener manifest over HTTP. Peers use this
+# control-plane endpoint rather than carrying data-plane addresses directly.
+addr = "0.0.0.0:$OPT_DISCOVERY_PORT"
 
 [startup.metrics]
 # Prometheus text-format exporter on GET /metrics. Bind 0.0.0.0 so an

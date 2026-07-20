@@ -51,12 +51,14 @@ func TestReconcileBadValueErrors(t *testing.T) {
 	require.Error(t, reconcile(Config{SourceDir: src, ConfigPath: dest}, nil))
 }
 
-func TestCurrentRenderStateUsesFabricDiscoveryPortForRdmaPeers(t *testing.T) {
+func TestCurrentRenderStateUsesFabricDiscoveryPortForAllPeers(t *testing.T) {
 	src := writeSource(t, `
 startup:
   fabric_discovery:
     addr: "0.0.0.0:9101"
   fabric:
+    tcp:
+      addr: "0.0.0.0:0"
     auto_rdma: {}
 `)
 	cs := fake.NewSimpleClientset(
@@ -76,8 +78,8 @@ startup:
 	state := currentRenderState(Config{SourceDir: src}, w)
 	require.True(t, state.ring.active)
 	require.Len(t, state.ring.peers, 2)
-	assert.Equal(t, "[fd00::2]:9101", state.ring.peers[0].GetRdma().GetDiscoveryAddr())
-	assert.Equal(t, "10.0.0.1:9101", state.ring.peers[1].GetRdma().GetDiscoveryAddr())
+	assert.Equal(t, "[fd00::2]:9101", state.ring.peers[0].GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.1:9101", state.ring.peers[1].GetDiscoveryAddr())
 }
 
 func TestRunRendersInitialAndReRenders(t *testing.T) {

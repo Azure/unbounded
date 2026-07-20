@@ -611,8 +611,7 @@ pub fn reconcile_backends_and_frontends(
 mod tests {
     use super::*;
     use crate::config::schema::{
-        HttpBackendConfig, HttpFrontendConfig, TcpPeerConfig, backend_spec, frontend_spec,
-        peer_spec,
+        HttpBackendConfig, HttpFrontendConfig, backend_spec, frontend_spec,
     };
     use crate::p2p::node_id_from_name;
     use std::cell::RefCell;
@@ -701,9 +700,7 @@ mod tests {
         PeerSpec {
             name: format!("node-{id}"),
             tags: Vec::new(),
-            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
-                addr: format!("10.0.0.{id}:9000"),
-            })),
+            discovery_addr: format!("10.0.0.{id}:9101"),
         }
     }
 
@@ -711,9 +708,7 @@ mod tests {
         PeerSpec {
             name: format!("node-{id}"),
             tags: Vec::new(),
-            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
-                addr: addr.to_string(),
-            })),
+            discovery_addr: addr.to_string(),
         }
     }
 
@@ -721,9 +716,7 @@ mod tests {
         PeerSpec {
             name: format!("node-{id}"),
             tags: tags.iter().map(|s| s.to_string()).collect(),
-            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
-                addr: format!("10.0.0.{id}:9000"),
-            })),
+            discovery_addr: format!("10.0.0.{id}:9101"),
         }
     }
 
@@ -843,7 +836,7 @@ mod tests {
         // Address/HCA are unchanged.
         assert_eq!(
             r.applied[&peer_key(1)].address,
-            crate::fabric::FabricAddress::socket("10.0.0.1:9000")
+            crate::fabric::FabricAddress::socket("10.0.0.1:9101")
         );
         assert_eq!(r.applied[&peer_key(1)].hca_numa, None);
     }

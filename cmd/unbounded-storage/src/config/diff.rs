@@ -131,8 +131,8 @@ mod tests {
     use super::*;
     use crate::config::schema::{
         BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendSpec, HttpBackendConfig,
-        HttpFrontendConfig, PeerSpec, RoutingPlan, TcpPeerConfig, TopologyPrefixWeight,
-        TopologyWeighting, backend_spec, disk_spec, frontend_spec, peer_spec,
+        HttpFrontendConfig, PeerSpec, RoutingPlan, TopologyPrefixWeight, TopologyWeighting,
+        backend_spec, disk_spec, frontend_spec,
     };
 
     fn base() -> Config {
@@ -157,9 +157,7 @@ mod tests {
         b.peers.push(PeerSpec {
             name: "node-a".to_string(),
             tags: vec![],
-            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
-                addr: "127.0.0.1:9000".to_string(),
-            })),
+            discovery_addr: "127.0.0.1:9101".to_string(),
         });
         let d = ConfigDiff::between(&a, &b);
         assert!(d.peers_changed);

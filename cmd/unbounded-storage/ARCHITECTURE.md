@@ -117,9 +117,10 @@ excluded from the live-reload diff.
   cap. `auto_rdma.hcas_per_numa_node` caps automatically selected HCAs per
   NUMA node and defaults to 1 when `auto_rdma` is configured.
 - `[startup.fabric_discovery]` - an optional dedicated HTTP listener address.
-  `GET /v1/fabric` returns the realized libfabric listener addresses as
-  newline-delimited text so other nodes can resolve the best path to this
-  node. Cluster deployments use a common non-zero port on every node.
+  `GET /v1/fabric` returns a strict versioned JSON manifest containing the
+  stable peer identity, a random per-process incarnation, and typed TCP/RDMA
+  listeners with stable IDs and realized libfabric addresses. Cluster
+  deployments use a common non-zero port on every node.
 - `[startup.topology]` - `serving_cores` (unset/null = auto-fill every usable
   CPU), `nic_workers` (fabric CPUs per active HCA, unset/null defaults to 4),
   and the toggles `use_smt_siblings`, `ignore_isolated`, `include_node_cpu0`,
@@ -657,8 +658,9 @@ Sections (all optional, each falling back to defaults):
 - `[[peers]]` - `name` (stable peer identity used to derive the internal fabric
   peer id and ring position), `tags` for placement-aware routing, and one
   transport table (`tcp` with a direct `SocketAddr`, or `rdma` with the peer's
-  fabric-discovery `SocketAddr`). RDMA discovery returns all remote listener
-  candidates. The caller asks each HCA-pinned libfabric domain which candidates
+  fabric-discovery `SocketAddr`). RDMA discovery returns all typed remote
+  listeners. The caller verifies the published peer identity, then asks each
+  HCA-pinned libfabric domain which listener addresses
   it can reach, then computes a deterministic complete one-to-one matching so
   remote HCA order is irrelevant. Last-good matches remain active across
   transient HTTP or route-resolution failures. The roster includes the local

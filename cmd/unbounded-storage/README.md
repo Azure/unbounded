@@ -123,20 +123,12 @@ stripe_size_bytes = 4194304      # optional; must be a power of two.
 [[peers]]                        # include self plus remote peers.
 name      = "node-a"             # ring/fabric ids are derived from this name.
 tags      = ["region-a", "rack-1"]
-
-[peers.config.tcp]
-addr      = "10.0.0.10:9000"     # advertised local fabric address.
+discovery_addr = "10.0.0.10:9101" # fabric discovery HTTP endpoint.
 
 [[peers]]
 name      = "node-b"
 tags      = ["region-a", "rack-2"]
-
-[peers.config.tcp]
-addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
-
-# Or, for RDMA peers:
-# [peers.config.rdma]
-# discovery_addr = "10.0.0.1:9101" # peer's fabric discovery HTTP endpoint.
+discovery_addr = "10.0.0.1:9101" # transport-neutral discovery endpoint.
 
 [[caches]]
 name = "cache"
@@ -191,14 +183,19 @@ progress_poll_us    = 10         # progress-thread busy-poll budget (us).
 rpc_worker_threads  = 4          # RPC worker threads per fabric unit.
 max_inflight        = 1024       # max in-flight ops per fabric unit (back-pressure).
 
-[startup.fabric.binds.tcp]
+[startup.fabric.tcp]
 addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
 
-# Or use automatic RDMA HCA binding:
-# [startup.fabric.binds.auto_rdma]
+# Optionally add automatic RDMA HCA binding alongside TCP:
+# [startup.fabric.auto_rdma]
 # hcas_per_numa_node = 1        # max HCAs used per NUMA node.
 
-# Required when RDMA peers discover this node. The endpoint advertises every
+# Or add explicit RDMA listeners alongside TCP:
+# [startup.fabric.rdma]
+# [[startup.fabric.rdma.binds]]
+# addr = "hex:01020304"          # provider-native fi_getname bytes.
+
+# Required for peers to discover this node. The endpoint advertises every
 # realized libfabric listener address. Each caller resolves those candidates
 # through its HCA-pinned libfabric domains and selects a complete one-to-one
 # local-HCA-to-remote-listener matching.

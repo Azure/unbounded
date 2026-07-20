@@ -41,10 +41,10 @@
 //! `Box<[u8]>` freed by the send completion handler. The
 //! provider-required local descriptor is satisfied with `desc=NULL`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll, Waker};
 
 use serde::Serialize;
@@ -82,11 +82,79 @@ impl<R> PeerRouter<R> for StaticPeer {
 /// Client-side fabric transport. Carries the MR the server will
 /// `fi_write` destination pages into.
 pub struct FabricTransport<R, P> {
-    fabric: Arc<Fabric>,
-    mr: MrHandle,
+    paths: FabricPaths,
     router: P,
     page_size: usize,
     _marker: PhantomData<fn() -> R>,
+}
+
+#[derive(Clone)]
+struct FabricPath {
+    fabric: Arc<Fabric>,
+    mr: MrHandle,
+}
+
+/// Process-wide selected fabric unit for each peer. Discovery publishes one
+/// unit and transports never retry another unit after that choice.
+#[derive(Clone, Default)]
+pub struct PeerPathSelection {
+    selected: Arc<RwLock<HashMap<PeerId, usize>>>,
+}
+
+impl PeerPathSelection {
+    pub fn set(&self, peer: PeerId, unit: usize) {
+        self.selected
+            .write()
+            .expect("peer path selection poisoned")
+            .insert(peer, unit);
+    }
+
+    pub fn retain(&self, mut keep: impl FnMut(PeerId) -> bool) {
+        self.selected
+            .write()
+            .expect("peer path selection poisoned")
+            .retain(|peer, _| keep(*peer));
+    }
+
+    pub fn remove(&self, peer: PeerId) {
+        self.selected
+            .write()
+            .expect("peer path selection poisoned")
+            .remove(&peer);
+    }
+
+    pub fn selected(&self, peer: PeerId) -> Option<usize> {
+        self.selected
+            .read()
+            .expect("peer path selection poisoned")
+            .get(&peer)
+            .copied()
+    }
+}
+
+enum FabricPaths {
+    Fixed(FabricPath),
+    Selected {
+        units: Arc<Vec<FabricPath>>,
+        selection: PeerPathSelection,
+    },
+}
+
+impl FabricPaths {
+    fn resolve(&self, peer: PeerId) -> FabResult<FabricPath> {
+        match self {
+            Self::Fixed(path) => Ok(path.clone()),
+            Self::Selected { units, selection } => {
+                let unit = selection
+                    .selected(peer)
+                    .ok_or(FabricError::NotFound("peer fabric path"))?;
+                units
+                    .get(unit)
+                    .cloned()
+                    .ok_or(FabricError::BadConfig("selected fabric unit out of range"))
+            }
+        }
+    }
 }
 
 impl<R, P> FabricTransport<R, P> {
@@ -107,8 +175,39 @@ impl<R, P> FabricTransport<R, P> {
             ));
         }
         Ok(Self {
-            fabric,
-            mr,
+            paths: FabricPaths::Fixed(FabricPath { fabric, mr }),
+            router,
+            page_size,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Build a transport that dispatches each peer through its discovery-
+    /// selected unit and the destination MR registered in that same domain.
+    pub fn new_selected(
+        units: Vec<(Arc<Fabric>, MrHandle)>,
+        selection: PeerPathSelection,
+        router: P,
+        page_size: usize,
+    ) -> FabResult<Self> {
+        if page_size == 0 {
+            return Err(FabricError::BadConfig("page_size must be > 0"));
+        }
+        if units.is_empty() || units.iter().any(|(_, mr)| mr.len % page_size != 0) {
+            return Err(FabricError::BadConfig(
+                "fabric units must be non-empty and each MR must contain whole pages",
+            ));
+        }
+        Ok(Self {
+            paths: FabricPaths::Selected {
+                units: Arc::new(
+                    units
+                        .into_iter()
+                        .map(|(fabric, mr)| FabricPath { fabric, mr })
+                        .collect(),
+                ),
+                selection,
+            },
             router,
             page_size,
             _marker: PhantomData,
@@ -159,7 +258,7 @@ where
         dsts: &'a [PageRef],
         ttl: u32,
     ) -> FabricBulkStream<'a, R> {
-        let dest_mr = match dsts.first() {
+        let dest_offset = match dsts.first() {
             Some(first) => {
                 debug_assert!(
                     dsts.iter()
@@ -168,11 +267,11 @@ where
                     "fabric bulk_get requires physically contiguous dst slots; \
                      the wire protocol addresses pages by ordinal from dest_mr_base",
                 );
-                forward_dest_mr(self.mr, first.page_idx as usize * self.page_size)
+                first.page_idx as usize * self.page_size
             }
-            None => self.mr,
+            None => 0,
         };
-        FabricBulkStream::new_unstarted(self, req, src, dsts, ttl, dest_mr)
+        FabricBulkStream::new_unstarted(self, req, src, dsts, ttl, dest_offset)
     }
 
     /// Forward `req` to the next hop, landing the downstream page(s)
@@ -196,8 +295,7 @@ where
         ttl: u32,
         dest_offset: usize,
     ) -> FabricBulkStream<'a, R> {
-        let dest_mr = forward_dest_mr(self.mr, dest_offset);
-        FabricBulkStream::new_unstarted(self, req, src, dsts, ttl, dest_mr)
+        FabricBulkStream::new_unstarted(self, req, src, dsts, ttl, dest_offset)
     }
 }
 
@@ -276,8 +374,7 @@ enum StreamState<'a> {
     /// Pre-launch state: nothing sent yet. We hold &Transport so the
     /// first poll can drive submission.
     Pending {
-        fabric: Arc<Fabric>,
-        mr: MrHandle,
+        path: FabricPath,
         peer: PeerId,
         request_id: u32,
         src: BulkRef,
@@ -314,7 +411,7 @@ where
         src: BulkRef,
         dsts: &'a [PageRef],
         ttl: u32,
-        mr: MrHandle,
+        dest_offset: usize,
     ) -> Self
     where
         P: PeerRouter<R>,
@@ -324,16 +421,20 @@ where
         // the trait signature stays infallible. The id is drawn from the
         // fabric-wide dispatch allocator so it is unique across every
         // transport sharing this fabric (see `alloc_request_id`).
-        let request_id = transport.fabric.dispatch().alloc_request_id();
         let (peer, req_bytes) = match route_and_serialize(&transport.router, req) {
             Ok(v) => v,
             Err(error) => return Self::failed(error),
         };
+        let mut path = match transport.paths.resolve(peer) {
+            Ok(path) => path,
+            Err(error) => return Self::failed(error),
+        };
+        path.mr = forward_dest_mr(path.mr, dest_offset);
+        let request_id = path.fabric.dispatch().alloc_request_id();
 
         Self {
             state: StreamState::Pending {
-                fabric: transport.fabric.clone(),
-                mr,
+                path,
                 peer,
                 request_id,
                 src,
@@ -371,17 +472,16 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                 StreamState::Pending { .. } => {
                     // Transition Pending -> Active.
                     let prev = std::mem::replace(&mut this.state, StreamState::Done);
-                    let (fabric, mr, peer, request_id, src, req_bytes, dsts, ttl) = match prev {
+                    let (path, peer, request_id, src, req_bytes, dsts, ttl) = match prev {
                         StreamState::Pending {
-                            fabric,
-                            mr,
+                            path,
                             peer,
                             request_id,
                             src,
                             req_bytes,
                             dsts,
                             ttl,
-                        } => (fabric, mr, peer, request_id, src, req_bytes, dsts, ttl),
+                        } => (path, peer, request_id, src, req_bytes, dsts, ttl),
                         _ => unreachable!(),
                     };
                     let mut log = crate::obs::ReqLog::new("fabric.fetch");
@@ -392,12 +492,21 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                         .field("len", src.len)
                         .field("pages", dsts.len())
                         .field("ttl", ttl);
-                    match launch(&fabric, &mr, peer, request_id, src, &req_bytes, dsts, ttl) {
+                    match launch(
+                        &path.fabric,
+                        &path.mr,
+                        peer,
+                        request_id,
+                        src,
+                        &req_bytes,
+                        dsts,
+                        ttl,
+                    ) {
                         Ok((shared, page_handle)) => {
                             this.state = StreamState::Active {
                                 shared,
                                 dsts,
-                                dispatch: Arc::clone(fabric.dispatch()),
+                                dispatch: Arc::clone(path.fabric.dispatch()),
                                 request_id,
                                 page_handle,
                                 acked: vec![false; dsts.len()],
@@ -1266,5 +1375,19 @@ mod tests {
         // wrapping; launch's bounds checks then reject the request.
         let shifted = forward_dest_mr(mr, 0x4000);
         assert_eq!(shifted.len, 0);
+    }
+
+    #[test]
+    fn peer_path_selection_replaces_and_retains_explicitly() {
+        let selection = PeerPathSelection::default();
+        selection.set(PeerId(7), 2);
+        assert_eq!(selection.selected(PeerId(7)), Some(2));
+
+        selection.set(PeerId(7), 1);
+        selection.set(PeerId(8), 0);
+        selection.retain(|peer| peer == PeerId(7));
+
+        assert_eq!(selection.selected(PeerId(7)), Some(1));
+        assert_eq!(selection.selected(PeerId(8)), None);
     }
 }

@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import atexit
 import http.server
+import json
 import os
 import resource
 import shutil
@@ -778,7 +779,7 @@ def write_config(
     # config table name.
     #
     # Startup-fixed knobs live in the `[startup]` section of the config:
-    # the fabric bind address, the node-wide hugepage data pool
+    # the TCP fabric and discovery bind addresses, the node-wide hugepage data pool
     # (memory_total_bytes, leaving the daemon's hugepage default in place), and
     # forcing the libfabric tcp provider (disable_rdma) even on hosts that
     # expose an unusable RDMA HCA in sysfs. They only take effect at process
@@ -809,14 +810,10 @@ stripe_size_bytes = {STRIPE_SIZE}
 
 [[peers]]
 name = "{self_name}"
-
-[peers.config.rdma]
 discovery_addr = "{discovery_addr}"
 
 [[peers]]
 name = "{peer_name}"
-
-[peers.config.rdma]
 discovery_addr = "{peer_discovery_addr}"
 
 [[caches]]
@@ -845,7 +842,7 @@ addr = "{frontend_addr}"
 # reservation.
 memory_total_bytes = {MEMORY_TOTAL_BYTES}
 
-[startup.fabric.binds.tcp]
+[startup.fabric.tcp]
 addr = "{fabric_addr}"
 
 [startup.fabric_discovery]
@@ -898,14 +895,10 @@ object_size_bytes = {STRIPE_SIZE}
 
 [[peers]]
 name = "{self_name}"
-
-[peers.config.rdma]
 discovery_addr = "{discovery_addr}"
 
 [[peers]]
 name = "{peer_name}"
-
-[peers.config.rdma]
 discovery_addr = "{peer_discovery_addr}"
 
 [[caches]]
@@ -936,7 +929,7 @@ verify = true
 [startup.memory]
 memory_total_bytes = {MEMORY_TOTAL_BYTES}
 
-[startup.fabric.binds.tcp]
+[startup.fabric.tcp]
 addr = "{fabric_addr}"
 
 [startup.fabric_discovery]
@@ -998,9 +991,22 @@ def verify_fabric_discovery(discovery_port: int, fabric_addr: str) -> None:
     status, body = fetch(discovery_url)
     if status != 200:
         die(f"GET {discovery_url} returned status {status}, expected 200")
-    candidates = body.decode("utf-8").splitlines()
-    if candidates != [fabric_addr]:
-        die(f"GET {discovery_url} returned {candidates!r}, expected {[fabric_addr]!r}")
+    try:
+        manifest = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        die(f"GET {discovery_url} returned invalid JSON: {e}")
+    if not isinstance(manifest, dict):
+        die(f"GET {discovery_url} returned non-object manifest {manifest!r}")
+    listeners = manifest.get("listeners")
+    expected = [{"id": "fabric-0", "transport": "tcp", "address": fabric_addr}]
+    if (
+        manifest.get("version") != 1
+        or not isinstance(manifest.get("peer_id"), int)
+        or not isinstance(manifest.get("process_incarnation"), int)
+        or manifest["process_incarnation"] == 0
+        or listeners != expected
+    ):
+        die(f"GET {discovery_url} returned unexpected manifest {manifest!r}")
 
 
 def scrape_metric_sum(
@@ -1144,6 +1150,10 @@ def run_scenario(
     fe_a, fe_b = free_port(), free_port()
     disc_a, disc_b = free_port(), free_port()
     met_a, met_b = free_port(), free_port()
+    disk_paths = (
+        TMPDIR / f"{name}-node1.disk",
+        TMPDIR / f"{name}-node2.disk",
+    )
     log(
         f"Ports: fabric=({fab_a},{fab_b}) discovery=({disc_a},{disc_b}) "
         f"frontends=({fe_a},{fe_b}) metrics=({met_a},{met_b})"
@@ -1158,7 +1168,7 @@ def run_scenario(
         self_name="node-a",
         peer_name="node-b",
         peer_discovery_addr=f"127.0.0.1:{disc_b}",
-        disk_path=TMPDIR / f"{name}-node1.disk",
+        disk_path=disk_paths[0],
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_a}",
         fabric_addr=f"127.0.0.1:{fab_a}",
@@ -1175,7 +1185,7 @@ def run_scenario(
         self_name="node-b",
         peer_name="node-a",
         peer_discovery_addr=f"127.0.0.1:{disc_a}",
-        disk_path=TMPDIR / f"{name}-node2.disk",
+        disk_path=disk_paths[1],
         origin_addr=origin_addr,
         frontend_addr=f"127.0.0.1:{fe_b}",
         fabric_addr=f"127.0.0.1:{fab_b}",
@@ -1252,6 +1262,8 @@ def run_scenario(
     finally:
         log(f"  Tearing down {name} ring")
         terminate(nodes)
+        for disk_path in disk_paths:
+            disk_path.unlink(missing_ok=True)
 
 
 def run_loadgen_scenario() -> None:
@@ -1263,6 +1275,10 @@ def run_loadgen_scenario() -> None:
     fab_a, fab_b = free_port(), free_port()
     disc_a, disc_b = free_port(), free_port()
     met_a, met_b = free_port(), free_port()
+    disk_paths = (
+        TMPDIR / "loadgen-node1.disk",
+        TMPDIR / "loadgen-node2.disk",
+    )
     log(
         f"Ports: fabric=({fab_a},{fab_b}) discovery=({disc_a},{disc_b}) "
         f"metrics=({met_a},{met_b})"
@@ -1276,7 +1292,7 @@ def run_loadgen_scenario() -> None:
         local_id=1,
         peer_id=2,
         peer_discovery_addr=f"127.0.0.1:{disc_b}",
-        disk_path=TMPDIR / "loadgen-node1.disk",
+        disk_path=disk_paths[0],
         fabric_addr=f"127.0.0.1:{fab_a}",
         discovery_addr=f"127.0.0.1:{disc_a}",
         metrics_addr=f"127.0.0.1:{met_a}",
@@ -1286,7 +1302,7 @@ def run_loadgen_scenario() -> None:
         local_id=2,
         peer_id=1,
         peer_discovery_addr=f"127.0.0.1:{disc_a}",
-        disk_path=TMPDIR / "loadgen-node2.disk",
+        disk_path=disk_paths[1],
         fabric_addr=f"127.0.0.1:{fab_b}",
         discovery_addr=f"127.0.0.1:{disc_b}",
         metrics_addr=f"127.0.0.1:{met_b}",
@@ -1349,6 +1365,8 @@ def run_loadgen_scenario() -> None:
     finally:
         log("  Tearing down loadgen ring")
         terminate(nodes)
+        for disk_path in disk_paths:
+            disk_path.unlink(missing_ok=True)
 
 
 # ============================================================================

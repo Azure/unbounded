@@ -7,33 +7,46 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use super::{Server, fetch};
+use super::{Listener, Manifest, Server, Transport, fetch};
+
+fn manifest() -> Manifest {
+    Manifest::new(
+        42,
+        9,
+        vec![
+            Listener {
+                id: "fabric-0".to_string(),
+                transport: Transport::Tcp,
+                address: "127.0.0.1:1".to_string(),
+            },
+            Listener {
+                id: "fabric-1".to_string(),
+                transport: Transport::Rdma,
+                address: "hex:0102".to_string(),
+            },
+        ],
+    )
+}
 
 #[test]
-fn server_and_client_exchange_sorted_candidates() {
-    let server = Server::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        ["node-b:2".to_owned(), "node-a:1".to_owned()],
-    )
-    .unwrap();
+fn server_and_client_exchange_typed_manifest() {
+    let mut published = manifest();
+    published.listeners.reverse();
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), published).unwrap();
     let addr = server.local_addr().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
     let join = thread::spawn(move || server.serve(server_shutdown).unwrap());
 
-    assert_eq!(fetch(addr).unwrap(), vec!["node-a:1", "node-b:2"]);
+    assert_eq!(fetch(addr).unwrap(), manifest());
 
     shutdown.store(true, Ordering::Release);
     join.join().unwrap();
 }
 
 #[test]
-fn server_exposes_only_the_discovery_get_endpoint_as_plain_text() {
-    let server = Server::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        ["node-b:2".to_owned(), "node-a:1".to_owned()],
-    )
-    .unwrap();
+fn server_exposes_only_the_discovery_get_endpoint_as_json() {
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), manifest()).unwrap();
     let addr = server.local_addr().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
@@ -41,8 +54,10 @@ fn server_exposes_only_the_discovery_get_endpoint_as_plain_text() {
 
     let response = raw_request(addr, b"GET /v1/fabric HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(response.contains("Content-Type: text/plain\r\n"));
-    assert!(response.ends_with("\r\n\r\nnode-a:1\nnode-b:2\n"));
+    assert!(response.contains("Content-Type: application/json\r\n"));
+    assert!(response.ends_with(
+        "\r\n\r\n{\"version\":1,\"peer_id\":42,\"process_incarnation\":9,\"listeners\":[{\"id\":\"fabric-0\",\"transport\":\"tcp\",\"address\":\"127.0.0.1:1\"},{\"id\":\"fabric-1\",\"transport\":\"rdma\",\"address\":\"hex:0102\"}]}"
+    ));
 
     let response = raw_request(addr, b"GET /other HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));

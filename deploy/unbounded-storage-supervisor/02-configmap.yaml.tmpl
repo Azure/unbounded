@@ -19,8 +19,8 @@ metadata:
 # its proto3 zero value, which the daemon promotes to the documented default.
 #
 # Per-node sections are supervisor-injected when a storage ring is active:
-# startup.fabric.binds.tcp.addr is overridden per node, self is set to the local
-# Kubernetes node name, and label-discovered peers are merged into peers
+# self is set to the local Kubernetes node name, and label-discovered peers use
+# each node's fabric discovery endpoint and are merged into peers
 # (discovered peers win name collisions). Declare caches here when this
 # deployment should participate in P2P caching; the supervisor only supplies the
 # ring roster.
@@ -84,8 +84,16 @@ data:
         memory_total_bytes: 134217728
       fabric:
         tcp:
-          # Per-shard TCP fabric listen address (":0" picks a free port).
+          # TCP is always enabled as the universal fabric fallback. Each shard
+          # publishes its realized listener through fabric_discovery.
           addr: "0.0.0.0:0"
+        # Optionally select RDMA in addition to TCP, either automatically:
+        # auto_rdma:
+        #   hcas_per_numa_node: 1
+        # Or with explicit provider-native addresses:
+        # rdma:
+        #   binds:
+        #     - addr: "hex:..."
         # libfabric progress threads per shard.
         progress_threads: 2
         # Progress-thread busy-poll budget in microseconds.

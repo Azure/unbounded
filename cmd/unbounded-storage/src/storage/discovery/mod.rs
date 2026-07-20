@@ -11,10 +11,10 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use crate::config::LoadedConfig;
-use crate::config::schema::{BlockDiskConfig, DiskDiscovery, DiskSpec, disk_spec};
 use crate::config::RuntimeDisk;
+use crate::config::schema::{BlockDiskConfig, DiskDiscovery, DiskSpec, disk_spec};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 pub use blkid::{ProbeResult, probe_fd};
 
@@ -145,10 +145,12 @@ impl DiskScanner {
     fn swap_identities(&self, contents: &str) -> Result<HashSet<DeviceId>, String> {
         let mut out = HashSet::new();
         for line in contents.lines().skip(1) {
-            let Some(path) = line.split_whitespace().next() else { continue };
+            let Some(path) = line.split_whitespace().next() else {
+                continue;
+            };
             if path.starts_with('/') {
-                let metadata = fs::metadata(path)
-                    .map_err(|e| format!("identify swap path {path}: {e}"))?;
+                let metadata =
+                    fs::metadata(path).map_err(|e| format!("identify swap path {path}: {e}"))?;
                 if metadata.file_type().is_block_device() {
                     let rdev = metadata.rdev();
                     let id = DeviceId {
@@ -174,7 +176,10 @@ pub fn resolve_loaded(
     let active = retained.unwrap_or_default();
     match scanner.scan(&policy, active) {
         Ok(disks) if !disks.is_empty() => (loaded.with_runtime_disks(disks), None),
-        Ok(_) => (loaded.with_runtime_disks(vec![fallback_disk(&policy)]), None),
+        Ok(_) => (
+            loaded.with_runtime_disks(vec![fallback_disk(&policy)]),
+            None,
+        ),
         Err(e) => {
             let disks = retained
                 .filter(|disks| !disks.is_empty())
@@ -204,13 +209,12 @@ pub struct DeviceWatcher {
 impl DeviceWatcher {
     pub fn new() -> Result<(Self, mpsc::Receiver<()>), notify::Error> {
         let (tx, rx) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(
-            move |event: Result<notify::Event, notify::Error>| {
+        let mut watcher =
+            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                 if event.is_ok() {
                     let _ = tx.send(());
                 }
-            },
-        )?;
+            })?;
         watcher.watch(Path::new("/dev"), RecursiveMode::NonRecursive)?;
         Ok((Self { _watcher: watcher }, rx))
     }
@@ -357,8 +361,7 @@ mod tests {
             ..Default::default()
         })];
 
-        let (resolved, error) =
-            resolve_loaded(loaded, &fixture.scanner(), Some(&retained));
+        let (resolved, error) = resolve_loaded(loaded, &fixture.scanner(), Some(&retained));
 
         assert!(error.is_some());
         assert_eq!(resolved.runtime().disks, retained);

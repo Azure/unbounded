@@ -193,7 +193,8 @@ pub fn prepare_shard_layer(
         let phaseb_tx = phaseb_tx.clone();
 
         let shard = *shard;
-        let fabric = fabric_group.fabric_for_shard(i);
+        let fabrics = fabric_group.fabrics();
+        let selection = fabric_group.selection();
         let tx = ready_tx.clone();
         let backing_kind = settings.backing_kind;
         let cache_directories = deps.cache_directories.clone();
@@ -210,7 +211,8 @@ pub fn prepare_shard_layer(
                     crate::run_shard(
                         widx,
                         shard,
-                        fabric,
+                        fabrics,
+                        selection,
                         tx,
                         backing_kind,
                         backing_size,
@@ -296,7 +298,7 @@ pub fn prepare_shard_layer(
                 let crate::ShardPublish {
                     backing_base,
                     backing_len,
-                    fabric_mr,
+                    fabric_mrs,
                     numa,
                     fetch_channel,
                     backing_keepalive,
@@ -305,7 +307,7 @@ pub fn prepare_shard_layer(
                 rpc_shards.push(RpcShardPublish {
                     shard_index,
                     fetch_channel: fetch_channel.clone(),
-                    mr: fabric_mr,
+                    mrs: fabric_mrs,
                     numa,
                 });
                 crate::PeerPublish {
@@ -642,7 +644,10 @@ impl ConfigApplyTarget for ProcessApplyTarget {
             // endpoint here.
             if diff.requires_peer_reconcile() {
                 let runtime_peers = config::runtime_peers(new.runtime());
-                layer.fabric_group.reconcile_peers(&runtime_peers);
+                layer
+                    .fabric_group
+                    .reconcile_peers(&runtime_peers)
+                    .map_err(ApplyError::Target)?;
             }
 
             // The RPC-side backend registries also live on the shared

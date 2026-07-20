@@ -50,21 +50,10 @@ func decodeWithState(t *testing.T, dir string, state renderState) *storageconfig
 	return &cfg
 }
 
-func tcpPeer(name, addr string) *storageconfig.PeerSpec {
+func peer(name, discoveryAddr string) *storageconfig.PeerSpec {
 	return &storageconfig.PeerSpec{
-		Name: name,
-		Config: &storageconfig.PeerSpec_Tcp{
-			Tcp: &storageconfig.TcpPeerConfig{Addr: addr},
-		},
-	}
-}
-
-func rdmaPeer(name, discoveryAddr string) *storageconfig.PeerSpec {
-	return &storageconfig.PeerSpec{
-		Name: name,
-		Config: &storageconfig.PeerSpec_Rdma{
-			Rdma: &storageconfig.RdmaPeerConfig{DiscoveryAddr: discoveryAddr},
-		},
+		Name:          name,
+		DiscoveryAddr: discoveryAddr,
 	}
 }
 
@@ -76,6 +65,8 @@ startup:
     no_hugepages: true
     memory_total_bytes: 134217728
   fabric:
+    tcp:
+      addr: "0.0.0.0:0"
     auto_rdma:
       hcas_per_numa_node: 2
     progress_threads: 3
@@ -100,6 +91,7 @@ startup:
 	assert.True(t, cfg.GetStartup().GetMemory().GetNoHugepages())
 	assert.NotNil(t, cfg.GetStartup().GetMemory().MemoryTotalBytes)
 	assert.Equal(t, uint64(134217728), cfg.GetStartup().GetMemory().GetMemoryTotalBytes())
+	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 	assert.NotNil(t, cfg.GetStartup().GetFabric().GetAutoRdma().HcasPerNumaNode)
 	assert.Equal(t, uint64(2), cfg.GetStartup().GetFabric().GetAutoRdma().GetHcasPerNumaNode())
 	assert.NotNil(t, cfg.GetStartup().GetFabric().ProgressThreads)
@@ -273,9 +265,7 @@ frontends:
 }
 
 func TestRenderConfigActiveRingOverlay(t *testing.T) {
-	// An active ring injects self + peers and overrides the
-	// ConfigMap's fabric addr with this node's own routable bind, while the
-	// rest of the startup settings still come from the source.
+	// An active ring injects self + peers while preserving startup settings.
 	dir := writeSource(t, `
 version: 3
 startup:
@@ -289,13 +279,12 @@ backends:
 `)
 
 	ring := ringState{
-		active:         true,
-		selfName:       "node-a",
-		selfListenAddr: "10.0.0.5:9000",
+		active:   true,
+		selfName: "node-a",
 		peers: []*storageconfig.PeerSpec{
-			tcpPeer("node-a", "10.0.0.5:9000"),
-			tcpPeer("node-b", "10.0.0.6:9000"),
-			tcpPeer("node-c", "10.0.0.7:9000"),
+			peer("node-a", "10.0.0.5:9101"),
+			peer("node-b", "10.0.0.6:9101"),
+			peer("node-c", "10.0.0.7:9101"),
 		},
 	}
 
@@ -309,18 +298,17 @@ backends:
 	assert.Equal(t, uint64(3), cfg.Version)
 	assert.NotNil(t, cfg.GetStartup().GetFabric().MaxInflight)
 	assert.Equal(t, uint32(2048), cfg.GetStartup().GetFabric().GetMaxInflight())
-	// addr is overridden with the node's own routable address.
-	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+	assert.Equal(t, "0.0.0.0:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 
 	assert.Equal(t, "node-a", cfg.GetSelf())
 
 	require.Len(t, cfg.GetPeers(), 3)
 	assert.Equal(t, "node-a", cfg.GetPeers()[0].GetName())
-	assert.Equal(t, "10.0.0.5:9000", cfg.GetPeers()[0].GetTcp().GetAddr())
+	assert.Equal(t, "10.0.0.5:9101", cfg.GetPeers()[0].GetDiscoveryAddr())
 	assert.Equal(t, "node-b", cfg.GetPeers()[1].GetName())
-	assert.Equal(t, "10.0.0.6:9000", cfg.GetPeers()[1].GetTcp().GetAddr())
+	assert.Equal(t, "10.0.0.6:9101", cfg.GetPeers()[1].GetDiscoveryAddr())
 	assert.Equal(t, "node-c", cfg.GetPeers()[2].GetName())
-	assert.Equal(t, "10.0.0.7:9000", cfg.GetPeers()[2].GetTcp().GetAddr())
+	assert.Equal(t, "10.0.0.7:9101", cfg.GetPeers()[2].GetDiscoveryAddr())
 }
 
 func TestRenderConfigActiveRingMergesPeers(t *testing.T) {
@@ -343,18 +331,16 @@ backends:
     fake: {}
 peers:
   - name: node-z
-    tcp:
-      addr: "10.0.0.100:9000"
+    discovery_addr: "10.0.0.100:9101"
 `)
 
 	ring := ringState{
-		active:         true,
-		selfName:       "node-a",
-		selfListenAddr: "10.0.0.5:9000",
+		active:   true,
+		selfName: "node-a",
 		peers: []*storageconfig.PeerSpec{
-			tcpPeer("node-c", "10.0.0.7:9000"),
-			tcpPeer("node-a", "10.0.0.5:9000"),
-			tcpPeer("node-b", "10.0.0.6:9000"),
+			peer("node-c", "10.0.0.7:9101"),
+			peer("node-a", "10.0.0.5:9101"),
+			peer("node-b", "10.0.0.6:9101"),
 		},
 	}
 
@@ -381,13 +367,15 @@ peers:
 	assert.Equal(t, "node-b", cfg.GetPeers()[1].GetName())
 	assert.Equal(t, "node-c", cfg.GetPeers()[2].GetName())
 	assert.Equal(t, "node-z", cfg.GetPeers()[3].GetName())
-	assert.Equal(t, "10.0.0.100:9000", cfg.GetPeers()[3].GetTcp().GetAddr())
+	assert.Equal(t, "10.0.0.100:9101", cfg.GetPeers()[3].GetDiscoveryAddr())
 }
 
-func TestRenderConfigActiveRDMARingPreservesStartupFabric(t *testing.T) {
+func TestRenderConfigActiveRingPreservesStartupFabric(t *testing.T) {
 	dir := writeSource(t, `
 startup:
   fabric:
+    tcp:
+      addr: "0.0.0.0:0"
     auto_rdma:
       hcas_per_numa_node: 2
     max_inflight: 2048
@@ -400,8 +388,8 @@ backends:
 		active:   true,
 		selfName: "node-a",
 		peers: []*storageconfig.PeerSpec{
-			rdmaPeer("node-a", "10.0.0.1:9101"),
-			rdmaPeer("node-b", "10.0.0.2:9101"),
+			peer("node-a", "10.0.0.1:9101"),
+			peer("node-b", "10.0.0.2:9101"),
 		},
 	}
 
@@ -409,11 +397,11 @@ backends:
 
 	assert.NotNil(t, cfg.GetStartup().GetFabric().GetAutoRdma())
 	assert.Equal(t, uint64(2), cfg.GetStartup().GetFabric().GetAutoRdma().GetHcasPerNumaNode())
-	assert.Nil(t, cfg.GetStartup().GetFabric().GetTcp())
+	assert.Equal(t, "0.0.0.0:0", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 	assert.Equal(t, "node-a", cfg.GetSelf())
 	require.Len(t, cfg.GetPeers(), 2)
-	assert.Equal(t, "10.0.0.1:9101", cfg.GetPeers()[0].GetRdma().GetDiscoveryAddr())
-	assert.Equal(t, "10.0.0.2:9101", cfg.GetPeers()[1].GetRdma().GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.1:9101", cfg.GetPeers()[0].GetDiscoveryAddr())
+	assert.Equal(t, "10.0.0.2:9101", cfg.GetPeers()[1].GetDiscoveryAddr())
 }
 
 func TestRenderConfigActiveRingInjectsMeshWithoutDeclaredPeers(t *testing.T) {
@@ -435,12 +423,11 @@ backends:
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
 	ring := ringState{
-		active:         true,
-		selfName:       "node-a",
-		selfListenAddr: "10.0.0.5:9000",
+		active:   true,
+		selfName: "node-a",
 		peers: []*storageconfig.PeerSpec{
-			tcpPeer("node-a", "10.0.0.5:9000"),
-			tcpPeer("node-b", "10.0.0.6:9000"),
+			peer("node-a", "10.0.0.5:9101"),
+			peer("node-b", "10.0.0.6:9101"),
 		},
 	}
 
@@ -455,7 +442,7 @@ backends:
 	require.Len(t, cfg.GetPeers(), 2)
 	assert.Equal(t, "node-a", cfg.GetPeers()[0].GetName())
 	assert.Equal(t, "node-b", cfg.GetPeers()[1].GetName())
-	assert.Equal(t, "10.0.0.5:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
+	assert.Equal(t, "0.0.0.0:9000", cfg.GetStartup().GetFabric().GetTcp().GetAddr())
 	assert.NotContains(t, logs.String(), "discovered storage peers were not injected")
 }
 
@@ -469,19 +456,17 @@ backends:
     fake: {}
 peers:
   - name: node-b
-    tcp:
-      addr: "10.9.9.9:9000"
+    discovery_addr: "10.9.9.9:9101"
   - name: node-z
-    tcp:
-      addr: "10.9.9.42:9000"
+    discovery_addr: "10.9.9.42:9101"
 `)
 
 	ring := ringState{
 		active:   true,
 		selfName: "node-a",
 		peers: []*storageconfig.PeerSpec{
-			tcpPeer("node-a", "10.0.0.5:9000"),
-			tcpPeer("node-b", "10.0.0.6:9000"),
+			peer("node-a", "10.0.0.5:9101"),
+			peer("node-b", "10.0.0.6:9101"),
 		},
 	}
 
@@ -497,7 +482,7 @@ peers:
 	require.Len(t, peers, 3)
 	assert.Equal(t, "node-a", peers[0].GetName())
 	assert.Equal(t, "node-b", peers[1].GetName())
-	assert.Equal(t, "10.0.0.6:9000", peers[1].GetTcp().GetAddr())
+	assert.Equal(t, "10.0.0.6:9101", peers[1].GetDiscoveryAddr())
 	assert.Equal(t, "node-z", peers[2].GetName())
 }
 
@@ -515,8 +500,7 @@ backends:
     fake: {}
 peers:
   - name: manual
-    tcp:
-      addr: "10.0.0.100:9000"
+    discovery_addr: "10.0.0.100:9101"
 `)
 
 	cfg := decode(t, dir)

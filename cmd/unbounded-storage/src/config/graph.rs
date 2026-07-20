@@ -358,8 +358,7 @@ fn by_id<'a, T>(items: &'a [T], id: impl Fn(&'a T) -> &'a str) -> HashMap<&'a st
 mod tests {
     use super::super::schema::{
         BackendSpec, CacheSpec, FrontendSpec, HttpBackendConfig, HttpFrontendConfig, PeerSpec,
-        RdmaPeerConfig, TcpPeerConfig, TopologyPrefixWeight, TopologyWeighting, backend_spec,
-        frontend_spec, peer_spec,
+        TopologyPrefixWeight, TopologyWeighting, backend_spec, frontend_spec,
     };
     use super::*;
 
@@ -396,24 +395,11 @@ mod tests {
         }
     }
 
-    fn tcp_peer(name: &str, addr: &str) -> PeerSpec {
+    fn peer(name: &str, discovery_addr: &str) -> PeerSpec {
         PeerSpec {
             name: name.to_string(),
             tags: Vec::new(),
-            config: Some(peer_spec::Config::Tcp(TcpPeerConfig {
-                addr: addr.to_string(),
-            })),
-        }
-    }
-
-    fn rdma_peer(name: &str, discovery_addr: &str) -> PeerSpec {
-        PeerSpec {
-            name: name.to_string(),
-            tags: Vec::new(),
-            config: Some(peer_spec::Config::Rdma(RdmaPeerConfig {
-                discovery_addr: discovery_addr.to_string(),
-                ..RdmaPeerConfig::default()
-            })),
+            discovery_addr: discovery_addr.to_string(),
         }
     }
 
@@ -433,12 +419,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_projection_accepts_unique_rdma_peer_names() {
+    fn runtime_projection_accepts_unique_peer_names() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
         cfg.self_ = "node-a".to_string();
-        cfg.peers.push(rdma_peer("node-a", "127.0.0.1:9101"));
-        cfg.peers.push(rdma_peer("node-b", "127.0.0.2:9101"));
+        cfg.peers.push(peer("node-a", "127.0.0.1:9101"));
+        cfg.peers.push(peer("node-b", "127.0.0.2:9101"));
 
         let graph = runtime_projection(&cfg).unwrap();
         let peers = &graph.mesh.peers;
@@ -463,7 +449,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
         cfg.self_ = "node-a".to_string();
-        cfg.peers.push(tcp_peer("node-a", "127.0.0.1:1"));
+        cfg.peers.push(peer("node-a", "127.0.0.1:1"));
         cfg.topology_weighting = Some(TopologyWeighting {
             prefix_weights: vec![TopologyPrefixWeight {
                 tag_index: 1,
@@ -487,7 +473,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
         cfg.self_ = "node-a".to_string();
-        cfg.peers.push(tcp_peer("node-b", "127.0.0.1:7"));
+        cfg.peers.push(peer("node-b", "127.0.0.1:7"));
 
         let err = runtime_projection(&cfg).unwrap_err();
 
@@ -498,19 +484,19 @@ mod tests {
     fn runtime_projection_rejects_duplicate_peer_names() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.peers.push(tcp_peer("node-a", "127.0.0.1:1"));
-        cfg.peers.push(tcp_peer("node-a", "127.0.0.1:2"));
+        cfg.peers.push(peer("node-a", "127.0.0.1:1"));
+        cfg.peers.push(peer("node-a", "127.0.0.1:2"));
 
         let err = runtime_projection(&cfg).unwrap_err();
         assert!(err.contains("peer \"node-a\" is duplicated"), "{err}");
     }
 
     #[test]
-    fn runtime_projection_rejects_duplicate_rdma_peer_names() {
+    fn runtime_projection_rejects_duplicate_discovery_peers() {
         let mut cfg = Config::default();
         cfg.backends.push(backend("b"));
-        cfg.peers.push(rdma_peer("node-a", "127.0.0.1:9101"));
-        cfg.peers.push(rdma_peer("node-a", "127.0.0.2:9101"));
+        cfg.peers.push(peer("node-a", "127.0.0.1:9101"));
+        cfg.peers.push(peer("node-a", "127.0.0.2:9101"));
 
         let err = runtime_projection(&cfg).unwrap_err();
         assert!(err.contains("peer \"node-a\" is duplicated"), "{err}");

@@ -102,8 +102,6 @@ fn generate_config_schema() {
         "TopologyWeighting",
         "TopologyPrefixWeight",
         "PeerSpec",
-        "TcpPeerConfig",
-        "RdmaPeerConfig",
         "DiskSpec",
         "DiskDiscovery",
         "BlockDiskConfig",
@@ -133,10 +131,10 @@ fn generate_config_schema() {
         prost.type_attribute(msg, "#[serde(default, deny_unknown_fields)]");
     }
     prost.field_attribute("Config.self", "#[serde(rename = \"self\")]");
+    prost.field_attribute("FabricCfg.rdma_selection", "#[serde(flatten)]");
 
     for oneof in [
-        "PeerSpec.config",
-        "FabricCfg.binds",
+        "FabricCfg.rdma_selection",
         "DiskSpec.config",
         "BackendSpec.config",
         "FrontendSpec.config",

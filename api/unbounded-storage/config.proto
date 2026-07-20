@@ -92,24 +92,9 @@ message PeerSpec {
   // Peer tags used by placement-aware planning.
   repeated string tags = 2;
 
-  oneof config {
-    TcpPeerConfig tcp = 3;
-    RdmaPeerConfig rdma = 4;
-  }
-}
-
-message TcpPeerConfig {
-  // TCP socket address used as this peer's fabric wire address.
-  string addr = 1;
-}
-
-message RdmaPeerConfig {
-  reserved 1, 2;
-  reserved "addr", "addrs";
-
   // Node-reachable HTTP socket used to discover this peer's live libfabric
-  // listeners. The daemon resolves the advertised candidates independently
-  // for each local fabric domain.
+  // listeners. The daemon selects usable candidates for each local fabric
+  // domain without encoding a transport choice in the peer roster.
   string discovery_addr = 3;
 }
 
@@ -147,8 +132,11 @@ message MemoryCfg {
 }
 
 message FabricCfg {
-  oneof binds {
-    TcpFabricBinds tcp = 1;
+  // TCP is always configured as the universal fabric fallback.
+  TcpFabricBinds tcp = 1;
+
+  // RDMA is optional and may use explicit binds or automatic HCA selection.
+  oneof rdma_selection {
     RdmaFabricBinds rdma = 2;
     AutoRdmaFabricBinds auto_rdma = 3;
   }

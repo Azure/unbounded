@@ -829,7 +829,7 @@ mod tests {
                 },
             )),
         });
-        c.peers.push(tcp_peer("node-a", "127.0.0.1:9999"));
+        c.peers.push(peer("node-a", "127.0.0.1:9999"));
         c
     }
 
@@ -837,15 +837,11 @@ mod tests {
         loaded(config_with_peer(version))
     }
 
-    fn tcp_peer(name: &str, addr: &str) -> crate::config::PeerSpec {
+    fn peer(name: &str, discovery_addr: &str) -> crate::config::PeerSpec {
         crate::config::PeerSpec {
             name: name.to_string(),
             tags: Vec::new(),
-            config: Some(crate::config::peer_spec::Config::Tcp(
-                crate::config::TcpPeerConfig {
-                    addr: addr.to_string(),
-                },
-            )),
+            discovery_addr: discovery_addr.to_string(),
         }
     }
 
@@ -900,7 +896,7 @@ mod tests {
         let mut ctrl = ConfigController::new(RecordingTarget::default(), base.clone());
 
         let mut next = config_with_peer(2);
-        next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
+        next.peers.push(peer("node-b", "127.0.0.1:9998"));
 
         let out = ctrl.apply(loaded(next)).unwrap();
         assert_eq!(out.tier, ApplyTier::InPlace);
@@ -955,7 +951,7 @@ mod tests {
         let mut ctrl = ConfigController::new(target, base.clone());
 
         let mut next = config_with_peer(5);
-        next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
+        next.peers.push(peer("node-b", "127.0.0.1:9998"));
         let next = loaded(next);
 
         assert!(ctrl.apply(next.clone()).is_err());
@@ -990,7 +986,7 @@ mod tests {
         );
 
         let mut next = config_with_peer(11);
-        next.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
+        next.peers.push(peer("node-b", "127.0.0.1:9998"));
         ctrl.apply(loaded(next)).unwrap();
 
         assert_eq!(versions.known(), 11);
@@ -1017,7 +1013,7 @@ mod tests {
 
         // A failed apply advances known but neither applied nor startup.
         let mut failing = config_with_peer(7);
-        failing.peers.push(tcp_peer("node-b", "127.0.0.1:9998"));
+        failing.peers.push(peer("node-b", "127.0.0.1:9998"));
         assert!(ctrl.apply(loaded(failing)).is_err());
         assert_eq!(ctrl.config_versions().known(), 7);
         assert_eq!(ctrl.config_versions().applied(), 1);
@@ -1027,7 +1023,7 @@ mod tests {
         // still leaves startup pinned to the config realized at start.
         ctrl.target_mut().fail_in_place = false;
         let mut next = config_with_peer(8);
-        next.peers.push(tcp_peer("node-c", "127.0.0.1:9997"));
+        next.peers.push(peer("node-c", "127.0.0.1:9997"));
         ctrl.apply(loaded(next)).unwrap();
         assert_eq!(ctrl.config_versions().applied(), 8);
         assert_eq!(ctrl.config_versions().startup(), 1);

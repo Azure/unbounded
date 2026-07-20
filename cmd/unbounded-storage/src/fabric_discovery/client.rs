@@ -5,16 +5,13 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use super::{MAX_RESPONSE_BYTES, PATH};
+use super::{MAX_RESPONSE_BYTES, Manifest, PATH};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
-const MAX_CANDIDATES: usize = 1024;
-const MAX_CANDIDATE_BYTES: usize = 4096;
-
-/// Fetch fabric endpoint candidates from a discovery server.
-pub fn fetch(discovery_addr: SocketAddr) -> io::Result<Vec<String>> {
+/// Fetch and validate a fabric discovery manifest.
+pub fn fetch(discovery_addr: SocketAddr) -> io::Result<Manifest> {
     let mut stream = TcpStream::connect_timeout(&discovery_addr, IO_TIMEOUT)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -63,7 +60,7 @@ pub fn fetch(discovery_addr: SocketAddr) -> io::Result<Vec<String>> {
         }
     }
 
-    parse_candidates(body)
+    Manifest::from_json(&body)
 }
 
 fn format_host(addr: SocketAddr) -> String {
@@ -151,37 +148,6 @@ fn read_bounded(stream: &mut TcpStream, bytes: &mut Vec<u8>, limit: usize) -> io
     Ok(read != 0)
 }
 
-fn parse_candidates(bytes: Vec<u8>) -> io::Result<Vec<String>> {
-    let text = String::from_utf8(bytes)
-        .map_err(|_| invalid_data("fabric discovery response is not UTF-8"))?;
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut lines: Vec<&str> = text.split('\n').collect();
-    if lines.last() == Some(&"") {
-        lines.pop();
-    }
-    if lines
-        .iter()
-        .any(|line| line.is_empty() || line.len() > MAX_CANDIDATE_BYTES || line.contains('\r'))
-    {
-        return Err(invalid_data(
-            "fabric discovery response contains an empty or invalid line",
-        ));
-    }
-    if lines.len() > MAX_CANDIDATES {
-        return Err(invalid_data(
-            "fabric discovery response contains too many candidates",
-        ));
-    }
-
-    let mut candidates: Vec<String> = lines.into_iter().map(str::to_owned).collect();
-    candidates.sort_unstable();
-    candidates.dedup();
-    Ok(candidates)
-}
-
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -197,17 +163,5 @@ mod tests {
             "192.0.2.1:8080"
         );
         assert_eq!(format_host("[::1]:8080".parse().unwrap()), "[::1]:8080");
-    }
-
-    #[test]
-    fn candidate_parser_rejects_empty_lines_and_invalid_utf8() {
-        assert!(parse_candidates(b"one\n\ntwo\n".to_vec()).is_err());
-        assert!(parse_candidates(vec![0xff]).is_err());
-        assert_eq!(
-            parse_candidates(b"two\none\ntwo\n".to_vec()).unwrap(),
-            vec!["one", "two"]
-        );
-        assert!(parse_candidates(format!("{}\n", "x".repeat(MAX_CANDIDATE_BYTES + 1)).into_bytes()).is_err());
-        assert!(parse_candidates("x\n".repeat(MAX_CANDIDATES + 1).into_bytes()).is_err());
     }
 }

@@ -28,7 +28,7 @@ use prost::Message;
 use super::graph::{
     RuntimeDisk, RuntimeGraph, project_runtime, route_snapshot, validate_binding_graph,
 };
-use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
+use super::schema::{Config, backend_spec, disk_spec, frontend_spec};
 use crate::p2p::RouteTableSnapshot;
 
 /// One finalized configuration and every immutable runtime view derived from it.
@@ -101,11 +101,7 @@ pub enum ConfigError {
         size: u64,
         page_size: u64,
     },
-    InvalidTcpAddr {
-        peer_name: String,
-        addr: String,
-    },
-    InvalidRdmaDiscoveryAddr {
+    InvalidPeerDiscoveryAddr {
         peer_name: String,
         addr: String,
     },
@@ -159,7 +155,6 @@ pub enum ConfigError {
         addr: String,
     },
     ZeroFrontendMaxRequestsPerConnection(String),
-    MissingPeerConfig(String),
     MissingDiskConfig,
     InvalidDiskDiscovery(String),
     InvalidMetricsAddr {
@@ -194,10 +189,7 @@ impl fmt::Display for ConfigError {
                 f,
                 "disk {path}: file size {size} must be a positive multiple of the page size {page_size}"
             ),
-            ConfigError::InvalidTcpAddr { peer_name, addr } => {
-                write!(f, "peer {peer_name:?}: invalid tcp socket address {addr:?}")
-            }
-            ConfigError::InvalidRdmaDiscoveryAddr { peer_name, addr } => {
+            ConfigError::InvalidPeerDiscoveryAddr { peer_name, addr } => {
                 write!(
                     f,
                     "peer {peer_name:?}: invalid fabric discovery socket address {addr:?}"
@@ -305,9 +297,6 @@ impl fmt::Display for ConfigError {
                 f,
                 "frontend {frontend_name:?}: max_requests_per_connection must be greater than zero"
             ),
-            ConfigError::MissingPeerConfig(peer_name) => {
-                write!(f, "peer {peer_name:?}: config must set one peer transport")
-            }
             ConfigError::MissingDiskConfig => write!(f, "disk config must set one disk type"),
             ConfigError::InvalidDiskDiscovery(msg) => {
                 write!(f, "invalid disk discovery config: {msg}")
@@ -589,28 +578,14 @@ fn validate_mesh(cfg: &Config) -> Result<(), ConfigError> {
         if p.name == cfg.self_ {
             self_seen = true;
         }
-        match p.config.as_ref() {
-            Some(peer_spec::Config::Tcp(cfg)) => {
-                if cfg.addr.parse::<SocketAddr>().is_err() {
-                    return Err(ConfigError::InvalidTcpAddr {
-                        peer_name: p.name.clone(),
-                        addr: cfg.addr.clone(),
-                    });
-                }
-            }
-            Some(peer_spec::Config::Rdma(cfg)) => {
-                if cfg
-                    .discovery_addr
-                    .parse::<SocketAddr>()
-                    .map_or(true, |addr| addr.port() == 0)
-                {
-                    return Err(ConfigError::InvalidRdmaDiscoveryAddr {
-                        peer_name: p.name.clone(),
-                        addr: cfg.discovery_addr.clone(),
-                    });
-                }
-            }
-            None => return Err(ConfigError::MissingPeerConfig(p.name.clone())),
+        if p.discovery_addr
+            .parse::<SocketAddr>()
+            .map_or(true, |addr| addr.port() == 0)
+        {
+            return Err(ConfigError::InvalidPeerDiscoveryAddr {
+                peer_name: p.name.clone(),
+                addr: p.discovery_addr.clone(),
+            });
         }
     }
     if !self_seen {
@@ -798,9 +773,7 @@ name = "b"
 
 [[peers]]
 name = "node-a"
-
-[peers.config.tcp]
-addr = "10.0.0.99:9000"
+discovery_addr = "10.0.0.99:9101"
 "#
     }
 
@@ -838,14 +811,10 @@ name = "b"
 
 [[peers]]
 name = "node-a"
-
-[peers.config.tcp]
-addr = "10.0.0.1:9000"
+discovery_addr = "10.0.0.1:9101"
 
 [[peers]]
 name = "node-b"
-
-[peers.config.rdma]
 discovery_addr = "10.0.0.2:9101"
 
 [[caches]]
@@ -892,15 +861,11 @@ name = "b"
 
 [[peers]]
 name = "node-a"
-
-[peers.config.tcp]
-addr = "10.0.0.1:9000"
+discovery_addr = "10.0.0.1:9101"
 
 [[peers]]
 name = "node-a"
-
-[peers.config.tcp]
-addr = "10.0.0.2:9000"
+discovery_addr = "10.0.0.2:9101"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -984,21 +949,20 @@ path = "/dev/nvme0n1"
     }
 
     #[test]
-    fn rejects_invalid_tcp_addr() {
+    fn rejects_invalid_peer_discovery_addr() {
         let s = format!(
             r#"{}
 [[peers]]
 name = "node-b"
-
-[peers.config.tcp]
-addr = "not-an-addr"
+discovery_addr = "not-an-addr"
 "#,
             mesh_toml()
         );
         let f = write_cfg(&s);
         match load(f.path()) {
-            Err(ConfigError::InvalidTcpAddr { peer_name, .. }) if peer_name == "node-b" => {}
-            other => panic!("expected InvalidTcpAddr, got {other:?}"),
+            Err(ConfigError::InvalidPeerDiscoveryAddr { peer_name, .. })
+                if peer_name == "node-b" => {}
+            other => panic!("expected InvalidPeerDiscoveryAddr, got {other:?}"),
         }
     }
 
@@ -1064,32 +1028,28 @@ weight = 1000000.1
     }
 
     #[test]
-    fn rejects_hostname_for_tcp() {
+    fn rejects_hostname_for_peer_discovery() {
         let s = format!(
             r#"{}
 [[peers]]
 name = "node-b"
-
-[peers.config.tcp]
-addr = "example.com:9000"
+discovery_addr = "example.com:9101"
 "#,
             mesh_toml()
         );
         let f = write_cfg(&s);
         assert!(matches!(
             load(f.path()),
-            Err(ConfigError::InvalidTcpAddr { peer_name, .. }) if peer_name == "node-b"
+            Err(ConfigError::InvalidPeerDiscoveryAddr { peer_name, .. }) if peer_name == "node-b"
         ));
     }
 
     #[test]
-    fn accepts_rdma_discovery_addr() {
+    fn accepts_peer_discovery_addr() {
         let s = format!(
             r#"{}
 [[peers]]
 name = "node-rdma"
-
-[peers.config.rdma]
 discovery_addr = "10.0.0.2:9101"
 "#,
             mesh_toml()
@@ -1102,21 +1062,16 @@ discovery_addr = "10.0.0.2:9101"
             .iter()
             .find(|peer| peer.name == "node-rdma")
             .unwrap();
-        match peer.config.as_ref().unwrap() {
-            peer_spec::Config::Rdma(cfg) => assert_eq!(cfg.discovery_addr, "10.0.0.2:9101"),
-            other => panic!("expected rdma config, got {other:?}"),
-        }
+        assert_eq!(peer.discovery_addr, "10.0.0.2:9101");
     }
 
     #[test]
-    fn rejects_invalid_rdma_discovery_addr() {
+    fn rejects_invalid_or_zero_port_peer_discovery_addr() {
         for bad in ["hex:0102", "example.com:9101", "10.0.0.2:0"] {
             let s = format!(
                 r#"{}
 [[peers]]
 name = "node-rdma"
-
-[peers.config.rdma]
 discovery_addr = "{bad}"
 "#,
                 mesh_toml()
@@ -1125,9 +1080,9 @@ discovery_addr = "{bad}"
             assert!(
                 matches!(
                     load(f.path()),
-                    Err(ConfigError::InvalidRdmaDiscoveryAddr { peer_name, .. }) if peer_name == "node-rdma"
+                    Err(ConfigError::InvalidPeerDiscoveryAddr { peer_name, .. }) if peer_name == "node-rdma"
                 ),
-                "expected InvalidRdmaDiscoveryAddr for {bad:?}"
+                "expected InvalidPeerDiscoveryAddr for {bad:?}"
             );
         }
     }
@@ -1257,9 +1212,7 @@ name = "b"
 
 [[peers]]
 name = "node-a"
-
-[peers.config.tcp]
-addr = "10.0.0.1:9000"
+discovery_addr = "10.0.0.1:9101"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -1280,9 +1233,7 @@ name = "b"
 
 [[peers]]
 name = "node-a"
-
-[peers.config.tcp]
-addr = "10.0.0.1:9000"
+discovery_addr = "10.0.0.1:9101"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
@@ -1302,9 +1253,7 @@ name = "b"
 
 [[peers]]
 name = "node-b"
-
-[peers.config.tcp]
-addr = "10.0.0.1:9000"
+discovery_addr = "10.0.0.1:9101"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -1841,7 +1790,7 @@ fingers_per_nod = 128
     }
 
     #[test]
-    fn rejects_missing_peer_config() {
+    fn rejects_missing_peer_discovery_addr() {
         let s = r#"
 self = "node-a"
 
@@ -1855,8 +1804,9 @@ name = "node-a"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
-            Err(ConfigError::MissingPeerConfig(name)) if name == "node-a" => {}
-            other => panic!("expected MissingPeerConfig, got {other:?}"),
+            Err(ConfigError::InvalidPeerDiscoveryAddr { peer_name, .. })
+                if peer_name == "node-a" => {}
+            other => panic!("expected InvalidPeerDiscoveryAddr, got {other:?}"),
         }
     }
 
@@ -1889,9 +1839,7 @@ name = "b"
 
 [[peers]]
 name = "node-a"
-
-[peers.config.tcp]
-addr = "10.0.0.1:9000"
+discovery_addr = "10.0.0.1:9101"
 
 [[caches]]
 name = "c"
@@ -1944,15 +1892,11 @@ name = "b"
 
 [[peers]]
 name = "node-a"
-
-[peers.config.tcp]
-addr = "10.0.0.1:9000"
+discovery_addr = "10.0.0.1:9101"
 
 [[peers]]
 name = "node-b"
-
-[peers.config.tcp]
-addr = "10.0.0.2:9000"
+discovery_addr = "10.0.0.2:9101"
 "#;
         let mut cfg: Config = toml::from_str(toml).unwrap();
         cfg.peers[1].name = "node-a".to_string();
@@ -1996,7 +1940,7 @@ memory_total_bytes = 67108864
 
 [startup.fabric]
 
-[startup.fabric.binds.tcp]
+[startup.fabric.tcp]
 addr = "10.0.0.1:7000"
 
 [startup.topology]
@@ -2026,7 +1970,7 @@ disable_rdma = true
 [startup.fabric]
 max_inflight = 4096
 
-[startup.fabric.binds.tcp]
+[startup.fabric.tcp]
 addr = "10.0.0.2:8000"
 
 [startup.topology]
