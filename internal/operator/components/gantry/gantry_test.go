@@ -129,7 +129,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		"spec":       map[string]any{"template": map[string]any{"metadata": map[string]any{}}},
 	}}
 
-	if err := applyMutator("gantry-hash")(ds); err != nil {
+	if err := applyMutator("gantry-hash", "node-hash")(ds); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -138,10 +138,26 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		t.Fatalf("pod template annotations = %#v", annotations)
 	}
 
+	nodeDS := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata":   map[string]any{"name": nodeConfigDaemonSetName},
+		"spec":       map[string]any{"template": map[string]any{"metadata": map[string]any{}}},
+	}}
+
+	if err := applyMutator("gantry-hash", "node-hash")(nodeDS); err != nil {
+		t.Fatalf("applyMutator node-config: %v", err)
+	}
+
+	nodeAnnotations, _, _ := unstructured.NestedStringMap(nodeDS.Object, "spec", "template", "metadata", "annotations")
+	if nodeAnnotations[nodeConfigHashAnnotation] != "node-hash" {
+		t.Fatalf("node-config pod template annotations = %#v", nodeAnnotations)
+	}
+
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator("gantry-hash")(config); err != nil || config.Object != nil {
+	if err := applyMutator("gantry-hash", "node-hash")(config); err != nil || config.Object != nil {
 		t.Fatalf("gantry ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
 }
@@ -154,8 +170,12 @@ func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
 
-	// Core install objects are applied; the DaemonSet carries the config hash.
-	for _, want := range []string{"ServiceAccount/gantry", "DaemonSet/gantry", "PriorityClass/gantry-low", "ClusterRole/gantry-agent"} {
+	// Core install objects are applied, including the node-config objects that
+	// wire node containerd through the mirror.
+	for _, want := range []string{
+		"ServiceAccount/gantry", "DaemonSet/gantry", "PriorityClass/gantry-low", "ClusterRole/gantry-agent",
+		"ConfigMap/gantry-containerd-hosts", "DaemonSet/gantry-containerd-config",
+	} {
 		if !applied[want] {
 			t.Fatalf("expected %s to be applied; applied=%#v", want, applied)
 		}

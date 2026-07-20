@@ -33,7 +33,15 @@ const (
 	daemonSetName = "gantry"
 	configName    = "gantry-config"
 
-	configHashAnnotation = "unbounded-cloud.io/gantry-config-hash"
+	// nodeConfigName and nodeConfigDaemonSetName are the operator-managed
+	// containerd node-wiring objects: a ConfigMap carrying the certs.d
+	// hosts.toml and the DaemonSet that installs it into
+	// /etc/containerd/certs.d/_default on every node.
+	nodeConfigName          = "gantry-containerd-hosts"
+	nodeConfigDaemonSetName = "gantry-containerd-config"
+
+	configHashAnnotation     = "unbounded-cloud.io/gantry-config-hash"
+	nodeConfigHashAnnotation = "unbounded-cloud.io/gantry-node-config-hash"
 )
 
 // Component reconciles the gantry cluster singleton.
@@ -91,20 +99,29 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	if err := applyManifests(ctx, env, applyMutator(configHash)); err != nil {
+	// The node-config ConfigMap is operator-owned static content (the certs.d
+	// hosts.toml), applied directly from the embedded manifests. Hash it so a
+	// content change rolls the writer DaemonSet, which otherwise writes once and
+	// sleeps.
+	nodeConfigHash, err := nodeConfigPayloadHash(env)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	if err := applyManifests(ctx, env, applyMutator(configHash, nodeConfigHash)); err != nil {
 		return component.Failed(err)
 	}
 
 	return component.Reconciled()
 }
 
-// SetupWatches reconciles gantry on changes to its config payload and on
-// create/delete/generation changes of its agent DaemonSet.
+// SetupWatches reconciles gantry on changes to its config payloads and on
+// create/delete/generation changes of its agent and node-config DaemonSets.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingletonAndAllSites(),
-		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName))))
+		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, nodeConfigName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName))))
+		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, nodeConfigDaemonSetName))))
 }
 
 // applyManifests applies gantry's top-level manifests. The examples/ subtree in
@@ -148,9 +165,10 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 	return false, nil
 }
 
-// applyMutator skips CRDs and the separately reconciled ConfigMap, and stamps its
-// exact payload hash on the DaemonSet so config changes roll the agents.
-func applyMutator(configHash string) func(*unstructured.Unstructured) error {
+// applyMutator skips CRDs and the separately reconciled gantry-config ConfigMap,
+// and stamps the config payload hashes on the workloads they belong to so a
+// config change rolls the corresponding DaemonSet.
+func applyMutator(configHash, nodeConfigHash string) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		if obj.GetKind() == component.CRDKind {
 			obj.Object = nil
@@ -164,24 +182,46 @@ func applyMutator(configHash string) func(*unstructured.Unstructured) error {
 			return nil
 		}
 
-		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
-			annotations, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
-			if err != nil {
-				return fmt.Errorf("get gantry pod template annotations: %w", err)
-			}
-
-			if annotations == nil {
-				annotations = map[string]string{}
-			}
-
-			annotations[configHashAnnotation] = configHash
-			if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
-				return fmt.Errorf("set gantry config hash annotation: %w", err)
-			}
+		switch {
+		case obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName:
+			return stampConfigHash(obj, configHashAnnotation, configHash)
+		case obj.GetKind() == "DaemonSet" && obj.GetName() == nodeConfigDaemonSetName:
+			return stampConfigHash(obj, nodeConfigHashAnnotation, nodeConfigHash)
+		default:
+			return nil
 		}
-
-		return nil
 	}
+}
+
+// stampConfigHash sets a config-hash annotation on a workload's pod template so a
+// config change rolls it.
+func stampConfigHash(obj *unstructured.Unstructured, annotation, hash string) error {
+	annotations, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+	if err != nil {
+		return fmt.Errorf("get %s pod template annotations: %w", obj.GetName(), err)
+	}
+
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+
+	annotations[annotation] = hash
+	if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
+		return fmt.Errorf("set %s config hash annotation: %w", obj.GetName(), err)
+	}
+
+	return nil
+}
+
+// nodeConfigPayloadHash returns the payload hash of the embedded node-config
+// hosts ConfigMap so the writer DaemonSet can be rolled when it changes.
+func nodeConfigPayloadHash(env *component.Env) (string, error) {
+	cm, err := env.DefaultConfigMap(gantrymanifests.Manifests, nodeConfigName, "gantry node-config")
+	if err != nil {
+		return "", err
+	}
+
+	return component.ConfigMapPayloadHash(cm), nil
 }
 
 // ensureConfig creates the embedded default only when no config exists. An

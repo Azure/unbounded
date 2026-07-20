@@ -12,7 +12,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: gantry-containerd-hosts
-  namespace: gantry-system
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: gantry-containerd-config
     app.kubernetes.io/component: node-config
@@ -27,7 +27,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: gantry-containerd-config
-  namespace: gantry-system
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: gantry-containerd-config
     app.kubernetes.io/component: node-config
