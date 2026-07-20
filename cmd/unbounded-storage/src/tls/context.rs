@@ -92,8 +92,7 @@ impl TlsContext {
             // From here on, free the ctx on any error.
             let guard = CtxGuard { ctx };
 
-            let tls12 = ffi::ub_tls1_2_version();
-            if ffi::ub_ssl_ctx_set_min_proto_version(ctx, tls12) != 1 {
+            if ffi::ub_ssl_ctx_set_min_proto_version(ctx, ffi::ub_tls1_2_version()) != 1 {
                 return Err(ssl_error("SSL_CTX_set_min_proto_version failed"));
             }
 

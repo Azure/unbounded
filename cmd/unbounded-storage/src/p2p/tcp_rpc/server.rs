@@ -169,14 +169,6 @@ impl TcpRpcDriver {
         }
     }
 
-    pub fn connection_count(&self) -> usize {
-        self.connections.len()
-    }
-
-    pub fn is_idle(&self) -> bool {
-        self.connections.is_empty()
-    }
-
     /// Advance accepts and each connection once. This is directly suitable for
     /// a `ShardLoop::add_tick_hook` closure; the ring itself remains a separate
     /// tick hook.

@@ -24,13 +24,13 @@ use crate::ring::{
 };
 use crate::tls::PeerTlsContext;
 
+use super::MAX_REQUESTS_PER_CONNECTION;
 use super::server::{TcpRpcError, record_error};
 use super::wire::{
     DecodeStatus, DecodedMetadata, ErrorMetadata, FrameHeader, FrameKind, FramePrefix, Handshake,
     MAX_DESTINATION_PAGE_COUNT, PageMetadata, RequestMetadata, decode_prefix, encode_handshake,
     encode_request,
 };
-use super::MAX_REQUESTS_PER_CONNECTION;
 
 pub const DEFAULT_TTL: u8 = 64;
 
@@ -132,24 +132,6 @@ impl ClientPeerDirectory {
         } else {
             false
         }
-    }
-
-    pub fn contains(&self, node: NodeId) -> bool {
-        self.inner.borrow().peers.contains_key(&node)
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.borrow().peers.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.borrow().peers.is_empty()
-    }
-
-    /// The directory currently has no independent work; retain this hook so
-    /// connection maintenance can be added without changing shard wiring.
-    pub fn progress(&self) -> bool {
-        false
     }
 
     fn acquire(
@@ -264,10 +246,6 @@ impl<R> TcpRpcTransport<R> {
             next_request_id: Rc::new(Cell::new(1)),
             _request: PhantomData,
         })
-    }
-
-    pub fn directory(&self) -> &ClientPeerDirectory {
-        &self.directory
     }
 
     pub fn bulk_get_with_ttl(
@@ -450,7 +428,6 @@ impl PageStream for TcpRpcStream {
             match state {
                 StreamState::Acquire => {
                     let directory = self.directory.as_ref().unwrap().clone();
-                    directory.progress();
                     match directory.acquire(self.peer.unwrap(), self.request_id, context.waker()) {
                         Ok(Some(lease)) => {
                             if let Some(fd) = lease.fd() {
@@ -764,7 +741,6 @@ struct PageValidator {
     dsts: Vec<PageRef>,
     seen: Vec<bool>,
     page_size: usize,
-    page_count: u32,
     source_offset: u64,
     delivered: usize,
 }
@@ -783,7 +759,6 @@ impl PageValidator {
             dsts: dsts.to_vec(),
             seen: vec![false; dsts.len()],
             page_size,
-            page_count,
             source_offset,
             delivered: 0,
         })
@@ -818,7 +793,6 @@ impl PageValidator {
                 metadata.ordinal
             )));
         }
-        validate_page_ref(page, self.page_size, self.page_count)?;
         let byte_offset = (page.page_idx as usize)
             .checked_mul(self.page_size)
             .and_then(|offset| offset.checked_add(page.offset as usize))

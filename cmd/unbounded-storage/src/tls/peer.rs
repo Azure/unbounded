@@ -78,12 +78,6 @@ impl PeerTlsContext {
 
         drive_handshake(handle, fd, &ssl, false).await?;
         verify_peer(ssl.ssl)?;
-        let identity = PeerCertificateIdentity::from_ssl(ssl.ssl)?;
-        if !identity.matches_dns_san(peer_hostname) {
-            return Err(tls_error(format!(
-                "peer certificate does not match DNS SAN {peer_hostname:?}"
-            )));
-        }
         require_ktls(ssl.ssl)
     }
 

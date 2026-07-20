@@ -1042,10 +1042,6 @@ fn run_shard(
     if let Some(mut driver) = tcp_driver {
         shard_loop.add_tick_hook(move || driver.progress());
     }
-    if let Some((_, directory, _, _, _)) = tcp_runtime.as_ref() {
-        let directory = directory.clone();
-        shard_loop.add_tick_hook(move || directory.progress());
-    }
 
     // Shard-local registry of running frontend drivers, seeded with every
     // configured frontend. A single permanent tick hook (registered
