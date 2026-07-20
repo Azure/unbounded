@@ -77,6 +77,7 @@ pub struct SimBlockDevice {
     inflight: Cell<u32>,
     max_inflight: Cell<u32>,
     read_pause: RefCell<Option<Rc<ReadPause>>>,
+    fail_next_read: Cell<Option<Lba>>,
     fail_write_after: Cell<Option<u64>>,
 }
 
@@ -92,6 +93,7 @@ impl SimBlockDevice {
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
             read_pause: RefCell::new(None),
+            fail_next_read: Cell::new(None),
             fail_write_after: Cell::new(None),
         }
     }
@@ -131,6 +133,11 @@ impl SimBlockDevice {
         let pause = Rc::new(ReadPause::new(lba));
         *self.read_pause.borrow_mut() = Some(pause.clone());
         pause
+    }
+
+    /// Fail the next read of `lba`, then disarm.
+    pub fn fail_next_read(&self, lba: Lba) {
+        self.fail_next_read.set(Some(lba));
     }
 
     /// Fail exactly the `writes`th subsequent write, then disarm.
@@ -218,7 +225,11 @@ impl BlockDevice for SimBlockDevice {
             }
         }
         self.reads.set(self.reads.get() + 1);
-        if fault {
+        let targeted_fault = self.fail_next_read.get() == Some(lba);
+        if targeted_fault {
+            self.fail_next_read.set(None);
+        }
+        if fault || targeted_fault {
             self.io_errors.set(self.io_errors.get() + 1);
             return Err(Error::Io(5));
         }

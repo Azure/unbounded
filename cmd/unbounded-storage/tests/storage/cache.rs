@@ -16,6 +16,9 @@ use crate::storage::mocks::{MockSimConfig, SimBlockDevice};
 
 const PAGE_SIZE: usize = 512;
 const ENTRIES: u32 = 120;
+const HEADER_LEN: usize = 32;
+const INTERNAL_ENTRY_LEN: usize = 44;
+const INTERNAL_CHILD_OFFSET: usize = 36;
 
 fn key(i: u32) -> PageKey {
     let mut hash = [0u8; 32];
@@ -48,6 +51,21 @@ async fn assert_exact(index: &BTreeIndex<SimBlockDevice>, expected: &BTreeMap<Pa
         assert_eq!(index.lookup(&k).await.unwrap(), expected.get(&k).copied());
         assert_eq!(index.lookup_committed_mirror(&k), expected.get(&k).copied());
     }
+}
+
+fn internal_children(device: &SimBlockDevice, lba: Lba) -> Vec<Lba> {
+    let mut page = vec![0u8; PAGE_SIZE];
+    device.peek(lba, &mut page);
+    assert_eq!(page[0], 2, "LBA {} must hold an internal page", lba.0);
+    let count = u16::from_le_bytes([page[2], page[3]]) as usize;
+    (0..count)
+        .map(|i| {
+            let start = HEADER_LEN + i * INTERNAL_ENTRY_LEN + INTERNAL_CHILD_OFFSET;
+            Lba(u64::from_le_bytes(
+                page[start..start + 8].try_into().unwrap(),
+            ))
+        })
+        .collect()
 }
 
 #[test]
@@ -137,6 +155,84 @@ fn deep_cache_failure_is_atomic_and_reopens_exactly() {
                 .unwrap();
             expected.remove(&key(82));
             assert_exact(&reopened, &expected).await;
+            *result.borrow_mut() = Some(());
+        }));
+    }
+
+    exec.run(2_000_000)
+        .expect("executor finished without deadlock or budget exhaustion");
+    assert_eq!(*result.borrow(), Some(()));
+}
+
+#[test]
+fn reopen_rejects_an_incomplete_internal_cache() {
+    let sim_cfg = MockSimConfig::new();
+    let device = Arc::new(SimBlockDevice::new(
+        MockDeviceConfig {
+            page_size: PAGE_SIZE,
+            capacity_pages: 1024,
+            ..Default::default()
+        },
+        sim_cfg,
+    ));
+    let result = Rc::new(std::cell::RefCell::new(None));
+    let mut exec = Executor::new(0x1C_C4_C4E);
+
+    {
+        let device = device.clone();
+        let result = result.clone();
+        exec.spawn(Box::pin(async move {
+            let index = open(
+                device.clone(),
+                Arc::new(Allocator::new(device.capacity_pages())),
+                true,
+            )
+            .await;
+            let expected: BTreeMap<_, _> =
+                (0..ENTRIES).map(|i| (key(i), entry(i as u64))).collect();
+            index
+                .apply_batch(
+                    expected
+                        .iter()
+                        .map(|(&key, &value)| Mutation::Insert { key, value })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+
+            let branches = internal_children(&device, index.current_root());
+            assert!(branches.len() >= 2, "test requires a two-level tree");
+            let omitted_branch = *branches.last().unwrap();
+            assert!(!internal_children(&device, omitted_branch).is_empty());
+            drop(index);
+
+            // Cache construction is the first tree walk after the two meta
+            // reads. A one-shot branch fault must reject that meta generation
+            // and use the leaf-scan rebuild, not publish a partial cache.
+            device.fail_next_read(omitted_branch);
+            let reopened = open(
+                device.clone(),
+                Arc::new(Allocator::new(device.capacity_pages())),
+                false,
+            )
+            .await;
+            assert_eq!(device.io_errors(), 1);
+            assert_exact(&reopened, &expected).await;
+
+            // The rebuilt snapshot has a complete cache, so corruption in an
+            // untouched branch is still detected before either meta changes.
+            let rebuilt_branches = internal_children(&device, reopened.current_root());
+            let corrupt_branch = *rebuilt_branches.last().unwrap();
+            device.poke(corrupt_branch, &vec![0xff; PAGE_SIZE]);
+            let txn_before = reopened.current_txn();
+            let commit = reopened
+                .apply_batch(vec![Mutation::Insert {
+                    key: key(0),
+                    value: entry(10_000),
+                }])
+                .await;
+            assert!(commit.is_err());
+            assert_eq!(reopened.current_txn(), txn_before);
             *result.borrow_mut() = Some(());
         }));
     }

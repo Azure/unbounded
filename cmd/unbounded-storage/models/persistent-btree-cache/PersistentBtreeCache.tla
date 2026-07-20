@@ -11,9 +11,11 @@
   metadata cannot be reused until every older snapshot and in-progress
   commit drops it.
 
-  This bounded model has two internal levels: a root and its left/right
-  internal branches. Leaves and values are abstracted as the branch's
-  generation because terminal-leaf checks remain covered by CowBtreeCrash.
+  Recovery publishes a snapshot only after decoding every reachable page, so
+  every reachable internal has a cache node. This bounded model has two
+  internal levels: a root and its left/right internal branches. Leaves and
+  values are abstracted as the branch's generation because terminal-leaf
+  checks remain covered by CowBtreeCrash.
  ************************************************************************ ***)
 
 EXTENDS Naturals, FiniteSets, TLC
@@ -256,6 +258,11 @@ TypeOK ==
   /\ publicationWitness \in SnapshotType \cup {NONE}
 
 SnapshotRootCacheCoherent == \A s \in LiveSnapshots : SnapshotCoherent(s)
+
+ReachableInternalsCached ==
+  \A s \in LiveSnapshots :
+    /\ cacheHeap[s.cache] /= NONE
+    /\ \A side \in Side : BranchCache(s, side) /= NONE
 
 CachedLookupMatchesSnapshotView ==
   \A s \in LiveSnapshots : \A side \in Side :

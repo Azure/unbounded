@@ -299,6 +299,16 @@ impl<B: BlockDevice> BTreeIndex<B> {
         btree_page_bytes: usize,
         state: meta::MetaState,
     ) -> Result<Option<Self>, Error> {
+        // A recovered snapshot is accepted only when every reachable page can
+        // be decoded. This makes `None` cache children unambiguously leaves;
+        // an unreadable or mixed-depth internal subtree cannot disappear from
+        // validation and path-copy routing.
+        let internal_cache =
+            match cow::build_internal_cache(&**device, scratch, state.root_lba).await {
+                Ok(cache) => cache,
+                Err(_) => return Ok(None),
+            };
+
         // `collect_pages` doubles as the "is the recovered root
         // structurally readable?" check: an empty list means
         // every page failed to read and we should fall through to
@@ -335,9 +345,6 @@ impl<B: BlockDevice> BTreeIndex<B> {
         let alive = Rc::new(RefCell::new(AliveTracker::default()));
         let pending = Rc::new(RefCell::new(PendingFree::default()));
         alive.borrow_mut().alive.insert(state.txn_id);
-
-        let internal_cache =
-            cow::build_internal_cache(&**device, scratch, state.root_lba, false).await?;
 
         let snapshot = RootSnapshot::new(
             state.root_lba,
@@ -406,7 +413,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
         let pending = Rc::new(RefCell::new(PendingFree::default()));
         alive.borrow_mut().alive.insert(txn_id);
 
-        let internal_cache = cow::build_internal_cache(&*device, &scratch, root_lba, true).await?;
+        let internal_cache = cow::build_internal_cache(&*device, &scratch, root_lba).await?;
 
         let snapshot = RootSnapshot::new(
             root_lba,

@@ -29,7 +29,7 @@
 //! metadata I/O without caching every leaf entry in memory.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::mem::size_of;
 use std::pin::Pin;
@@ -107,54 +107,45 @@ impl CachedInternalNode {
 }
 
 /// Build a cache for every internal node reachable from `root_lba`.
-/// The traversal first discovers the tree height by following the
-/// leftmost spine, then reads only levels above the leaves. That keeps
-/// cache construction proportional to internal-node count, not leaf
-/// count.
+/// Every reachable page is decoded so mixed-depth trees and unreadable
+/// subtrees cannot be mistaken for leaves.
 pub async fn build_internal_cache<B: BlockDevice>(
     device: &B,
     scratch: &Rc<ScratchPool>,
     root_lba: Lba,
-    strict: bool,
 ) -> Result<Arc<InternalNodeCache>, Error> {
-    let depth = internal_depth(device, scratch, root_lba, strict).await?;
-    if depth == 0 {
+    if !root_lba.is_valid() {
         return Ok(Arc::new(InternalNodeCache::default()));
     }
 
     let mut nodes = HashMap::new();
-    let mut stack = vec![(root_lba, depth)];
+    let mut stack = vec![root_lba];
+    let mut seen = HashSet::new();
     let mut buf = scratch.acquire().await;
-    let mut visited = 0u64;
 
-    while let Some((node_lba, remaining_depth)) = stack.pop() {
-        visited += 1;
-        if visited > MAX_TRAVERSAL_NODES {
+    while let Some(node_lba) = stack.pop() {
+        if !seen.insert(node_lba) || seen.len() as u64 > MAX_TRAVERSAL_NODES {
             return Err(Error::Corrupt);
         }
-        match device.read(node_lba, buf.as_mut_slice()).await {
-            Ok(()) => {}
-            Err(e) if strict => return Err(e),
-            Err(_) => continue,
-        }
+        device.read(node_lba, buf.as_mut_slice()).await?;
 
         match page::decode(buf.as_mut_slice()) {
-            Decoded::Internal { keys, children, .. } if keys.len() == children.len() => {
-                if remaining_depth > 1 {
-                    for &child in &children {
-                        stack.push((child, remaining_depth - 1));
-                    }
+            Decoded::Internal { keys, children, .. }
+                if !keys.is_empty() && keys.len() == children.len() =>
+            {
+                for &child in &children {
+                    stack.push(child);
                 }
                 nodes.insert(node_lba, (keys, children));
             }
-            Decoded::Internal { .. } | Decoded::Empty | Decoded::Meta { .. } if strict => {
+            Decoded::Leaf { .. } => {}
+            Decoded::Internal { .. } | Decoded::Empty | Decoded::Meta { .. } => {
                 return Err(Error::Corrupt);
             }
-            _ => {}
         }
     }
 
-    let root = materialize_cache(root_lba, depth, &nodes);
+    let root = materialize_cache(root_lba, &nodes);
     Ok(Arc::new(InternalNodeCache { root }))
 }
 
@@ -205,58 +196,18 @@ pub async fn validate_internal_cache<B: BlockDevice>(
 
 fn materialize_cache(
     lba: Lba,
-    depth: usize,
     nodes: &HashMap<Lba, (Vec<PageKey>, Vec<Lba>)>,
 ) -> Option<Arc<CachedInternalNode>> {
     let (keys, child_lbas) = nodes.get(&lba)?;
     let mut children = Vec::with_capacity(child_lbas.len());
     for &child_lba in child_lbas {
-        let internal = if depth > 1 {
-            materialize_cache(child_lba, depth - 1, nodes)
-        } else {
-            None
-        };
+        let internal = materialize_cache(child_lba, nodes);
         children.push(CachedChild {
             lba: child_lba,
             internal,
         });
     }
     Some(CachedInternalNode::new(keys.clone(), children))
-}
-
-async fn internal_depth<B: BlockDevice>(
-    device: &B,
-    scratch: &Rc<ScratchPool>,
-    root_lba: Lba,
-    strict: bool,
-) -> Result<usize, Error> {
-    if !root_lba.is_valid() {
-        return Ok(0);
-    }
-
-    let mut cur = root_lba;
-    let mut depth = 0usize;
-    let mut buf = scratch.acquire().await;
-    for _ in 0..32 {
-        match device.read(cur, buf.as_mut_slice()).await {
-            Ok(()) => {}
-            Err(e) if strict => return Err(e),
-            Err(_) => return Ok(depth),
-        }
-        match page::decode(buf.as_mut_slice()) {
-            Decoded::Internal { children, .. } if !children.is_empty() => {
-                depth += 1;
-                cur = children[0];
-            }
-            Decoded::Leaf { .. } => return Ok(depth),
-            Decoded::Internal { .. } | Decoded::Empty | Decoded::Meta { .. } if strict => {
-                return Err(Error::Corrupt);
-            }
-            _ => return Ok(depth),
-        }
-    }
-
-    Err(Error::Corrupt)
 }
 
 /// Walk the tree rooted at `root_lba` for `key`, using cached
