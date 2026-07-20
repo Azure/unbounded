@@ -160,6 +160,16 @@ func TestOperatorClusterRoleGrantsReaperDeletes(t *testing.T) {
 	}
 }
 
+func TestOperatorClusterRoleAllowsGantryPriorityClass(t *testing.T) {
+	cr := loadOperatorClusterRole(t)
+
+	for _, verb := range []string{"create", "patch", "update"} {
+		if !clusterRoleGrants(cr, "scheduling.k8s.io", "priorityclasses", verb) {
+			t.Fatalf("operator ClusterRole must grant %q on priorityclasses (needed to install the gantry PriorityClass)", verb)
+		}
+	}
+}
+
 func TestOperatorClusterRoleGrantsForeignWorkloadAudit(t *testing.T) {
 	cr := loadOperatorClusterRole(t)
 	resources := []struct {

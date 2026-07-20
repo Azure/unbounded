@@ -123,6 +123,13 @@ func (e *Env) ApplyManifestFS(ctx context.Context, manifests fs.FS, mutate func(
 		return err
 	}
 
+	return e.ApplyManifestFiles(ctx, manifests, files, mutate)
+}
+
+// ApplyManifestFiles applies a specific list of YAML manifest files from the
+// filesystem. Callers use it to apply a curated subset (for example excluding an
+// examples/ subtree that YamlFiles would otherwise include).
+func (e *Env) ApplyManifestFiles(ctx context.Context, manifests fs.FS, files []string, mutate func(*unstructured.Unstructured) error) error {
 	for _, file := range files {
 		data, err := fs.ReadFile(manifests, file)
 		if err != nil {

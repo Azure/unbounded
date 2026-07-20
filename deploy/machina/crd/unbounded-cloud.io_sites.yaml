@@ -37,6 +37,10 @@ spec:
       name: Storage
       priority: 1
       type: boolean
+    - jsonPath: .spec.components.gantry.enabled
+      name: Gantry
+      priority: 1
+      type: boolean
     - jsonPath: .status.nodeCount
       name: Nodes
       type: integer
@@ -77,6 +81,16 @@ spec:
                 description: Components declares optional Unbounded components managed
                   for this site.
                 properties:
+                  gantry:
+                    description: |-
+                      Gantry configures the gantry peer-to-peer OCI distribution agent for this
+                      site. Unlike the other components, gantry defaults to enabled; set
+                      gantry.enabled to false to opt a site out.
+                    properties:
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
+                    type: object
                   machina:
                     description: Machina configures the machina controller for this
                       site.

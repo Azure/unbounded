@@ -150,7 +150,7 @@ spec:
               mountPath: /var/lib/gantry/libp2p
       containers:
         - name: gantry
-          image: ghcr.io/vpatelsj/gantry:latest   # override via make image-gantry-local/push (GANTRY_IMAGE)
+          image: {{ .Image | default "ghcr.io/azure/gantry:dev" }}
           imagePullPolicy: IfNotPresent
           args:
             - agent
