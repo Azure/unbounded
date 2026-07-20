@@ -158,6 +158,51 @@ pub async fn build_internal_cache<B: BlockDevice>(
     Ok(Arc::new(InternalNodeCache { root }))
 }
 
+/// Validate that every cached internal node matches its on-disk page.
+pub async fn validate_internal_cache<B: BlockDevice>(
+    device: &B,
+    scratch: &Rc<ScratchPool>,
+    root_lba: Lba,
+    cache: &InternalNodeCache,
+) -> Result<(), Error> {
+    let Some(root) = cache.root.clone() else {
+        return Ok(());
+    };
+
+    let mut stack = vec![(root_lba, root)];
+    let mut buf = scratch.acquire().await;
+    let mut visited = 0u64;
+
+    while let Some((node_lba, cached)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_TRAVERSAL_NODES {
+            return Err(Error::Corrupt);
+        }
+
+        device.read(node_lba, buf.as_mut_slice()).await?;
+        let Decoded::Internal { keys, children, .. } = page::decode(buf.as_mut_slice()) else {
+            return Err(Error::Corrupt);
+        };
+        if keys.as_slice() != cached.keys.as_ref()
+            || children.len() != cached.children.len()
+            || children
+                .iter()
+                .zip(cached.children.iter())
+                .any(|(lba, child)| *lba != child.lba)
+        {
+            return Err(Error::Corrupt);
+        }
+
+        for child in cached.children.iter() {
+            if let Some(internal) = &child.internal {
+                stack.push((child.lba, internal.clone()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn materialize_cache(
     lba: Lba,
     depth: usize,

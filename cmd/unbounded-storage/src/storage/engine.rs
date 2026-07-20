@@ -1207,7 +1207,7 @@ mod tests {
             assert_eq!(
                 device.reads() - reads_before_overwrite,
                 1,
-                "overwrite should read only the path-copy leaf",
+                "a leaf-root overwrite should read only the path-copy leaf",
             );
             eng_body.close_mutator();
         };

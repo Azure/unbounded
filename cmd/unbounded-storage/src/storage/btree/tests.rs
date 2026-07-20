@@ -146,7 +146,7 @@ fn large_batch_spans_multiple_leaves() {
 }
 
 #[test]
-fn path_copy_reuses_cached_internal_nodes_without_reading_them() {
+fn path_copy_uses_cache_then_validates_candidate_internals() {
     let (dev, alloc) = fresh(512);
     let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
     block_on(
@@ -170,12 +170,92 @@ fn path_copy_reuses_cached_internal_nodes_without_reading_them() {
 
     assert_eq!(
         dev.reads() - reads_before,
-        1,
-        "a one-key path copy should read only its terminal leaf",
+        2,
+        "path-copy reads one leaf, then validates the candidate internal root",
     );
     assert_eq!(block_on(idx.lookup(&key(100))).unwrap(), Some(entry(9000)));
     assert_eq!(block_on(idx.lookup(&key(10))).unwrap(), Some(entry(1010)));
     assert_eq!(block_on(idx.lookup(&key(190))).unwrap(), Some(entry(1190)));
+}
+
+#[test]
+fn corrupted_cached_internal_page_does_not_replace_fallback_meta() {
+    const PAGE_SIZE: usize = 512;
+    const ENTRIES: u32 = 120;
+
+    let dev = Arc::new(MockDevice::new(MockDeviceConfig {
+        page_size: PAGE_SIZE,
+        capacity_pages: 1024,
+        ..Default::default()
+    }));
+    let alloc = Arc::new(Allocator::new(dev.capacity_pages()));
+    let scratch = ScratchPool::new(&*dev, PAGE_SIZE, 16).expect("scratch pool");
+    let idx = block_on(BTreeIndex::open(
+        dev.clone(),
+        alloc,
+        scratch,
+        PAGE_SIZE,
+        false,
+        false,
+    ))
+    .unwrap();
+    block_on(
+        idx.apply_batch(
+            (0..ENTRIES)
+                .map(|i| Mutation::Insert {
+                    key: key(i),
+                    value: entry(400 + i as u64),
+                })
+                .collect(),
+        ),
+    )
+    .unwrap();
+
+    // The 512-byte geometry forces root -> internal branch -> leaf. Corrupt
+    // the right branch, then mutate the left branch so path-copy reuses the
+    // corrupted page through its still-valid cached representation.
+    let mut root_page = vec![0u8; PAGE_SIZE];
+    dev.peek(idx.current_root(), &mut root_page);
+    let right_branch = match page::decode(&mut root_page) {
+        Decoded::Internal { children, .. } => {
+            assert!(children.len() >= 2, "test requires two internal branches");
+            *children.last().unwrap()
+        }
+        other => panic!("expected internal root, got {other:?}"),
+    };
+    let mut branch_page = vec![0u8; PAGE_SIZE];
+    dev.peek(right_branch, &mut branch_page);
+    assert!(matches!(
+        page::decode(&mut branch_page),
+        Decoded::Internal { .. }
+    ));
+    dev.poke(right_branch, &vec![0xFF; PAGE_SIZE]);
+
+    let txn_before = idx.current_txn();
+    let root_before = idx.current_root();
+    let mut meta_a_before = vec![0u8; PAGE_SIZE];
+    let mut meta_b_before = vec![0u8; PAGE_SIZE];
+    dev.peek(META_SLOT_A, &mut meta_a_before);
+    dev.peek(META_SLOT_B, &mut meta_b_before);
+
+    let result = block_on(idx.apply_batch(vec![Mutation::Insert {
+        key: key(0),
+        value: entry(10_000),
+    }]));
+    assert!(matches!(result, Err(crate::storage::types::Error::Corrupt)));
+    assert_eq!(idx.current_txn(), txn_before);
+    assert_eq!(idx.current_root(), root_before);
+
+    let mut meta_after = vec![0u8; PAGE_SIZE];
+    dev.peek(META_SLOT_A, &mut meta_after);
+    assert_eq!(meta_after, meta_a_before);
+    dev.peek(META_SLOT_B, &mut meta_after);
+    assert_eq!(meta_after, meta_b_before);
+
+    // The failed candidate must not consume either meta generation. Older
+    // snapshots may already have released their structural pages, so the
+    // durable guarantee here is slot preservation rather than reopening an
+    // arbitrarily old root after separately corrupting the active root.
 }
 
 #[test]

@@ -500,6 +500,23 @@ impl<B: BlockDevice> BTreeIndex<B> {
         )
         .await?;
 
+        // The path-copy cache is authoritative for routing, but disk remains
+        // the recovery source of truth. Validate every internal page reachable
+        // from the candidate root before replacing the fallback meta slot.
+        // Validate against result.internal_cache so the checked topology is
+        // exactly the immutable snapshot that will be published.
+        if let Err(e) = cow::validate_internal_cache(
+            &*self.device,
+            &self.scratch,
+            result.new_root,
+            &result.internal_cache,
+        )
+        .await
+        {
+            cow::free_all(&self.allocator, &result.new_pages);
+            return Err(e);
+        }
+
         let active = self.active_meta.get();
         // apply_path_copy above has already marked the new pages
         // in use, so high_water() reflects them.

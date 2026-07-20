@@ -4,9 +4,12 @@
 
   The production B+tree publishes an immutable (root LBA, cache root) pair.
   A path-copy commit rewrites one branch and the root, while preserving the
-  untouched branch's disk LBA and Arc cache identity. Old reader snapshots
-  may retain the previous pair, so retired metadata cannot be reused until
-  every older snapshot and in-progress commit drops it.
+  untouched branch's disk LBA and Arc cache identity. Before publishing the
+  candidate root, every reachable internal page is read and checksum
+  validated from disk. A validation failure leaves the published snapshot
+  unchanged. Old reader snapshots may retain the previous pair, so retired
+  metadata cannot be reused until every older snapshot and in-progress
+  commit drops it.
 
   This bounded model has two internal levels: a root and its left/right
   internal branches. Leaves and values are abstracted as the branch's
@@ -55,14 +58,16 @@ AttemptType ==
   [parent : SnapshotType, side : Side, txn : 2..(MaxTxn + 1),
    root : Meta, branch : Meta, cacheRoot : CacheNode,
    cacheBranch : CacheNode, oldRoot : Meta, oldBranch : Meta]
-FailureType == [published : SnapshotType, root : Meta, branch : Meta]
+FailureType ==
+  [kind : {"write", "validation"}, published : SnapshotType,
+   candidate : SnapshotType, root : Meta, branch : Meta]
 
 VARIABLES
-  disk, cacheHeap, published, readers, attempt,
-  pending, inUse, free, failureWitness
+  disk, valid, cacheHeap, published, readers, attempt,
+  pending, inUse, free, failureWitness, publicationWitness
 
-vars == <<disk, cacheHeap, published, readers, attempt,
-          pending, inUse, free, failureWitness>>
+vars == <<disk, valid, cacheHeap, published, readers, attempt,
+          pending, inUse, free, failureWitness, publicationWitness>>
 
 InitialDisk ==
   [m \in Meta |->
@@ -81,6 +86,7 @@ InitialCache ==
 
 Init ==
   /\ disk = InitialDisk
+  /\ valid = {OldRoot, OldLeft, OldRight}
   /\ cacheHeap = InitialCache
   /\ published = [txn |-> 1, root |-> OldRoot, cache |-> OldCacheRoot]
   /\ readers = [r \in Reader |-> NONE]
@@ -89,6 +95,7 @@ Init ==
   /\ inUse = {OldRoot, OldLeft, OldRight}
   /\ free = Meta \ {OldRoot, OldLeft, OldRight}
   /\ failureWitness = NONE
+  /\ publicationWitness = NONE
 
 LiveSnapshots ==
   {published}
@@ -119,6 +126,11 @@ SnapshotCoherent(s) ==
            /\ cacheHeap[c].side = side
 
 Reachable(s) == {s.root} \cup {BranchLba(s, side) : side \in Side}
+
+Candidate ==
+  [txn |-> attempt.txn, root |-> attempt.root, cache |-> attempt.cacheRoot]
+
+CandidateValid == Reachable(Candidate) \subseteq valid
 
 SafeToFree(p) == \A s \in LiveSnapshots : s.txn >= p.retire
 
@@ -152,42 +164,62 @@ BeginCommit(side) ==
                      root |-> newRoot, branch |-> newBranch,
                      cacheRoot |-> cacheRoot, cacheBranch |-> cacheBranch,
                      oldRoot |-> published.root, oldBranch |-> oldBranch]
-               /\ inUse' = inUse \cup {newRoot, newBranch}
-               /\ free' = free \ {newRoot, newBranch}
-               /\ UNCHANGED <<published, readers, pending>>
-               /\ failureWitness' = NONE
+                /\ inUse' = inUse \cup {newRoot, newBranch}
+                /\ free' = free \ {newRoot, newBranch}
+                /\ valid' = valid \cup {newRoot, newBranch}
+                /\ UNCHANGED <<published, readers, pending>>
+                /\ failureWitness' = NONE
+                /\ publicationWitness' = NONE
 
 Publish ==
   /\ attempt /= NONE
+  /\ CandidateValid
   /\ published' =
-       [txn |-> attempt.txn, root |-> attempt.root, cache |-> attempt.cacheRoot]
+        [txn |-> attempt.txn, root |-> attempt.root, cache |-> attempt.cacheRoot]
   /\ pending' = pending \cup
        {[page |-> attempt.oldRoot, retire |-> attempt.txn],
         [page |-> attempt.oldBranch, retire |-> attempt.txn]}
   /\ attempt' = NONE
-  /\ UNCHANGED <<disk, cacheHeap, readers, inUse, free>>
+  /\ UNCHANGED <<disk, valid, cacheHeap, readers, inUse, free>>
   /\ failureWitness' = NONE
+  /\ publicationWitness' = published'
 
-FailCommit ==
+FailCommit(kind) ==
   /\ attempt /= NONE
+  /\ (kind = "write" \/ (kind = "validation" /\ ~CandidateValid))
   /\ inUse' = inUse \ {attempt.root, attempt.branch}
   /\ free' = free \cup {attempt.root, attempt.branch}
   /\ failureWitness' =
-       [published |-> published, root |-> attempt.root, branch |-> attempt.branch]
+       [kind |-> kind, published |-> published,
+        candidate |-> Candidate,
+        root |-> attempt.root, branch |-> attempt.branch]
   /\ attempt' = NONE
-  /\ UNCHANGED <<disk, cacheHeap, published, readers, pending>>
+  /\ UNCHANGED <<disk, valid, cacheHeap, published, readers, pending>>
+  /\ publicationWitness' = NONE
+
+CorruptUntouchedBranch ==
+  /\ attempt /= NONE
+  /\ LET other == IF attempt.side = "left" THEN "right" ELSE "left"
+         page == BranchLba(attempt.parent, other)
+      IN /\ page \in valid
+         /\ valid' = valid \ {page}
+  /\ UNCHANGED <<disk, cacheHeap, published, readers, attempt,
+                  pending, inUse, free, failureWitness>>
+  /\ publicationWitness' = NONE
 
 Acquire(r) ==
   /\ readers[r] = NONE
   /\ readers' = [readers EXCEPT ![r] = published]
-  /\ UNCHANGED <<disk, cacheHeap, published, attempt, pending, inUse, free>>
+  /\ UNCHANGED <<disk, valid, cacheHeap, published, attempt, pending, inUse, free>>
   /\ failureWitness' = NONE
+  /\ publicationWitness' = NONE
 
 Release(r) ==
   /\ readers[r] /= NONE
   /\ readers' = [readers EXCEPT ![r] = NONE]
-  /\ UNCHANGED <<disk, cacheHeap, published, attempt, pending, inUse, free>>
+  /\ UNCHANGED <<disk, valid, cacheHeap, published, attempt, pending, inUse, free>>
   /\ failureWitness' = NONE
+  /\ publicationWitness' = NONE
 
 Reclaim ==
   /\ \E p \in pending :
@@ -195,13 +227,15 @@ Reclaim ==
        /\ pending' = pending \ {p}
        /\ inUse' = inUse \ {p.page}
        /\ free' = free \cup {p.page}
-       /\ UNCHANGED <<disk, cacheHeap, published, readers, attempt>>
+       /\ UNCHANGED <<disk, valid, cacheHeap, published, readers, attempt>>
        /\ failureWitness' = NONE
+       /\ publicationWitness' = NONE
 
 Next ==
   \/ \E side \in Side : BeginCommit(side)
   \/ Publish
-  \/ FailCommit
+  \/ \E kind \in {"write", "validation"} : FailCommit(kind)
+  \/ CorruptUntouchedBranch
   \/ \E r \in Reader : Acquire(r)
   \/ \E r \in Reader : Release(r)
   \/ Reclaim
@@ -210,6 +244,7 @@ Spec == Init /\ [][Next]_vars
 
 TypeOK ==
   /\ disk \in [Meta -> DiskNodeType \cup {NONE}]
+  /\ valid \subseteq Meta
   /\ cacheHeap \in [CacheNode -> CacheNodeType \cup {NONE}]
   /\ published \in SnapshotType
   /\ readers \in [Reader -> SnapshotType \cup {NONE}]
@@ -218,6 +253,7 @@ TypeOK ==
   /\ inUse \subseteq Meta
   /\ free \subseteq Meta
   /\ failureWitness \in FailureType \cup {NONE}
+  /\ publicationWitness \in SnapshotType \cup {NONE}
 
 SnapshotRootCacheCoherent == \A s \in LiveSnapshots : SnapshotCoherent(s)
 
@@ -254,6 +290,14 @@ FailedCommitIsolation ==
     /\ failureWitness.branch \in free
     /\ failureWitness.root \notin inUse
     /\ failureWitness.branch \notin inUse
+
+PublishedCandidateWasValidated ==
+  publicationWitness /= NONE => Reachable(publicationWitness) \subseteq valid
+
+ValidationFailurePreservesPublished ==
+  failureWitness /= NONE /\ failureWitness.kind = "validation" =>
+    /\ ~(Reachable(failureWitness.candidate) \subseteq valid)
+    /\ published = failureWitness.published
 
 CacheNodesImmutable ==
   [][\A c \in CacheNode :

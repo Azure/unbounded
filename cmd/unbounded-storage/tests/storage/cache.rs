@@ -99,8 +99,8 @@ fn deep_cache_failure_is_atomic_and_reopens_exactly() {
             assert!(failed.is_err(), "targeted meta write must fail");
             assert_eq!(
                 device.reads() - reads_before,
-                1,
-                "cache must route both internal levels"
+                4,
+                "path-copy reads one leaf, then validates all candidate internals"
             );
             assert_eq!(index.current_txn(), txn_before);
             assert_eq!(index.current_root(), root_before);
@@ -117,8 +117,8 @@ fn deep_cache_failure_is_atomic_and_reopens_exactly() {
                 .unwrap();
             assert_eq!(
                 device.reads() - reads_before_retry,
-                1,
-                "retry must still route through the unchanged parent cache",
+                4,
+                "retry must route through the cache and validate before publication",
             );
             expected.insert(key(37), replacement);
             assert_exact(&index, &expected).await;
