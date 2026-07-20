@@ -20,15 +20,15 @@
 //!
 //! For each [`BTreeIndex::apply_batch`] call:
 //!
-//! 1. Coalesce the mutation list into a sorted `(key, op)`
-//!    vector and update the in-memory mirror.
+//! 1. Coalesce the mutation list into a sorted `(key, op)` vector.
 //! 2. [`cow::apply_path_copy`] rewrites only the spine pages on
 //!    the touched paths and shares every untouched subtree with
 //!    the previous root. The result reports both the freshly
 //!    allocated pages (owned by the new snapshot) and the
 //!    retired pages (owned by some earlier snapshot up until
 //!    this commit).
-//! 3. Write the new meta page into the *inactive* slot.
+//! 3. Write the new meta page into the *inactive* slot, then update
+//!    the committed in-memory mirror.
 //! 4. Record the retired pages and this txn as alive, then
 //!    [`arc_swap::ArcSwap::store`] the new [`RootSnapshot`].
 //!    Once the previous snapshot's last [`arc_swap::Guard`]
@@ -446,9 +446,10 @@ impl<B: BlockDevice> BTreeIndex<B> {
         .await
     }
 
-    /// Benchmark-only lookup path backed by the committed in-memory
-    /// mirror. This skips the terminal leaf read, so it must not be used
-    /// for production recovery/corruption semantics.
+    /// Look up the mutator's committed in-memory mirror. The single
+    /// mutator uses this authoritative view for prior-value and stale
+    /// eviction checks. Client reads deliberately use [`Self::lookup`]
+    /// so the terminal on-disk leaf remains checksum-validated.
     pub fn lookup_committed_mirror(&self, key: &PageKey) -> Option<LeafEntry> {
         self.mutator.borrow().entries.get(key).copied()
     }
@@ -487,27 +488,17 @@ impl<B: BlockDevice> BTreeIndex<B> {
         // Path-copy consumes the operations, so retain only the bounded
         // batch needed to update the mirror after the durable commit.
         let mirror_ops = sorted_ops.clone();
-        let parent_root = self.root.load().root_lba;
+        let parent = self.root.load_full();
         let result = cow::apply_path_copy(
             &*self.device,
             &self.scratch,
             &self.allocator,
-            parent_root,
+            parent.root_lba,
+            &parent.internal_cache,
             txn_id,
             sorted_ops,
         )
         .await?;
-
-        let internal_cache =
-            match cow::build_internal_cache(&*self.device, &self.scratch, result.new_root, true)
-                .await
-            {
-                Ok(cache) => cache,
-                Err(e) => {
-                    cow::free_all(&self.allocator, &result.new_pages);
-                    return Err(e);
-                }
-            };
 
         let active = self.active_meta.get();
         // apply_path_copy above has already marked the new pages
@@ -570,7 +561,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             self.alive.clone(),
             self.pending.clone(),
             self.allocator.clone(),
-            internal_cache,
+            result.internal_cache,
         );
         self.root.store(snapshot);
         Ok(())

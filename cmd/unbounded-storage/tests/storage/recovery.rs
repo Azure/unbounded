@@ -163,6 +163,23 @@ where
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
         + 'static,
 {
+    run_with_engine_config(seed, device, engine_cfg(), body)
+}
+
+fn run_with_engine_config<R, F>(
+    seed: u64,
+    device: Arc<SimBlockDevice>,
+    cfg: EngineConfig,
+    body: F,
+) -> R
+where
+    R: 'static,
+    F: FnOnce(
+            Arc<unbounded_storage::storage::StorageEngine<SimBlockDevice>>,
+            Rc<RefCell<Option<R>>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+        + 'static,
+{
     use std::cell::Cell;
 
     let slot: Rc<RefCell<Option<R>>> = Rc::new(RefCell::new(None));
@@ -184,7 +201,7 @@ where
         let stage = stage.clone();
         let device = device.clone();
         exec.spawn(Box::pin(async move {
-            let eng = match StorageEngine::open(device, engine_cfg()).await {
+            let eng = match StorageEngine::open(device, cfg).await {
                 Ok(e) => Arc::new(e),
                 Err(_) => {
                     *stage.borrow_mut() = Stage::Failed;
@@ -244,6 +261,75 @@ where
         .expect("body completed; slot Rc must be unique")
         .into_inner()
         .expect("body populated the result slot")
+}
+
+#[test]
+fn completed_overwrite_returns_exact_latest_value() {
+    let device = new_device();
+    let mut pool = Pool::new(3);
+    let pool_base = pool.base() as usize;
+    let first = payload(31, 0, 1);
+    let latest = payload(31, 0, 2);
+    let expected = latest.clone();
+
+    let bytes = run_with_engine::<Vec<u8>, _>(0xE0A7_3A17, device, move |eng, slot| {
+        Box::pin(async move {
+            eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 3))
+                .unwrap();
+            admit_one(&eng, pool_base as *mut u8, 0, stripe(31), 0, &first).await;
+            admit_one(&eng, pool_base as *mut u8, 1, stripe(31), 0, &latest).await;
+
+            let dst = PageRef {
+                page_idx: 2,
+                offset: 0,
+                len: PAGE_SIZE as u32,
+            };
+            assert!(eng.read_page(&stripe(31), 0, dst).await.unwrap());
+            let read = unsafe {
+                std::slice::from_raw_parts((pool_base as *const u8).add(2 * PAGE_SIZE), PAGE_SIZE)
+            }
+            .to_vec();
+            let snapshot = eng.snapshot();
+            assert_eq!(snapshot.resident_pages, 1);
+            assert_eq!(snapshot.btree_entries, 1);
+            *slot.borrow_mut() = Some(read);
+        })
+    });
+
+    assert_eq!(
+        bytes, expected,
+        "completed overwrite returned a stale value"
+    );
+}
+
+#[test]
+fn eviction_uses_committed_mirror_and_removes_exact_victim() {
+    let device = new_device();
+    let mut pool = Pool::new(2);
+    let pool_base = pool.base() as usize;
+    let bytes = payload(32, 0, 1);
+    let mut cfg = engine_cfg();
+    cfg.eviction_watermark = 0.0;
+
+    let snapshot = run_with_engine_config(0xE71C_7100, device, cfg, move |eng, slot| {
+        Box::pin(async move {
+            eng.register_pages(&backing(pool_base as *mut u8, PAGE_SIZE, 2))
+                .unwrap();
+            admit_one(&eng, pool_base as *mut u8, 0, stripe(32), 0, &bytes).await;
+
+            let dst = PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: PAGE_SIZE as u32,
+            };
+            assert!(!eng.read_page(&stripe(32), 0, dst).await.unwrap());
+            *slot.borrow_mut() = Some(eng.snapshot());
+        })
+    });
+
+    assert_eq!(snapshot.evictions, 1);
+    assert_eq!(snapshot.resident_pages, 0);
+    assert_eq!(snapshot.btree_entries, 0);
 }
 
 /// Twice-write a `(key, offset)` so the admission filter promotes

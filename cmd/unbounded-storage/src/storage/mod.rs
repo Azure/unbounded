@@ -35,6 +35,8 @@ mod singleflight;
 mod synthetic;
 
 pub use admission::{AdmissionFilter, AdmitDecision, StripeAdmission};
+pub use alloc::Allocator;
+pub use btree::{BTreeIndex, LeafEntry, Mutation};
 pub use engine::{EngineConfig, StorageEngine};
 pub use local::{LocalStorage, ShardLocalStore, disk_for};
 pub use metadata::ObjectMetadata;

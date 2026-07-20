@@ -77,6 +77,7 @@ pub struct SimBlockDevice {
     inflight: Cell<u32>,
     max_inflight: Cell<u32>,
     read_pause: RefCell<Option<Rc<ReadPause>>>,
+    fail_write_after: Cell<Option<u64>>,
 }
 
 impl SimBlockDevice {
@@ -91,6 +92,7 @@ impl SimBlockDevice {
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
             read_pause: RefCell::new(None),
+            fail_write_after: Cell::new(None),
         }
     }
 
@@ -129,6 +131,25 @@ impl SimBlockDevice {
         let pause = Rc::new(ReadPause::new(lba));
         *self.read_pause.borrow_mut() = Some(pause.clone());
         pause
+    }
+
+    /// Fail exactly the `writes`th subsequent write, then disarm.
+    pub fn fail_write_after(&self, writes: u64) {
+        assert!(writes > 0, "write countdown must be positive");
+        self.fail_write_after.set(Some(writes));
+    }
+
+    fn draw_targeted_write_fault(&self) -> bool {
+        let Some(remaining) = self.fail_write_after.get() else {
+            return false;
+        };
+        if remaining == 1 {
+            self.fail_write_after.set(None);
+            true
+        } else {
+            self.fail_write_after.set(Some(remaining - 1));
+            false
+        }
     }
 }
 
@@ -217,7 +238,9 @@ impl BlockDevice for SimBlockDevice {
 
     async fn write(&self, lba: Lba, src: &[u8]) -> Result<(), Error> {
         let delay = draw_delay(&self.cfg);
-        let fault = draw_fault(&self.cfg);
+        let random_fault = draw_fault(&self.cfg);
+        let targeted_fault = self.draw_targeted_write_fault();
+        let fault = random_fault || targeted_fault;
         let _guard = InflightGuard::enter(self);
         yield_n(delay).await;
         self.writes.set(self.writes.get() + 1);

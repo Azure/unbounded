@@ -868,7 +868,7 @@ TLA_TOOLS_SHA256 ?= 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2
 # target.  STORAGE_MODEL_DIRS lists the model basenames the aggregate target
 # iterates over.
 STORAGE_MODELS_ROOT := cmd/unbounded-storage/models
-STORAGE_MODEL_DIRS := bufferpool-singleflight chord-routing copy-on-write engine-reclamation fabric-completion
+STORAGE_MODEL_DIRS := bufferpool-singleflight chord-routing copy-on-write engine-reclamation fabric-completion persistent-btree-cache
 
 $(TLA_TOOLS_JAR):
 	@mkdir -p $(dir $(TLA_TOOLS_JAR))

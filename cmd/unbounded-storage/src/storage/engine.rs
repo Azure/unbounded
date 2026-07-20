@@ -792,7 +792,11 @@ impl<B: BlockDevice> StorageEngine<B> {
                     let prior = if let Some(prior) = states.get(key) {
                         *prior
                     } else {
-                        let prior = self.btree.lookup(key).await.ok().flatten();
+                        // The single mutator is the only writer of the mirror,
+                        // so it is authoritative for the currently published
+                        // root. Avoid reading the terminal leaf here; path-copy
+                        // will read each touched leaf once when applying the batch.
+                        let prior = self.btree.lookup_committed_mirror(key);
                         states.insert(*key, prior);
                         prior
                     };
@@ -811,7 +815,7 @@ impl<B: BlockDevice> StorageEngine<B> {
                         let current = if let Some(current) = states.get(&victim.key) {
                             *current
                         } else {
-                            let current = self.btree.lookup(&victim.key).await.ok().flatten();
+                            let current = self.btree.lookup_committed_mirror(&victim.key);
                             states.insert(victim.key, current);
                             current
                         };
@@ -1164,6 +1168,47 @@ mod tests {
             let s = eng_body.snapshot();
             assert_eq!(s.admitted, 1);
             assert_eq!(s.rejected_by_filter, 0);
+            eng_body.close_mutator();
+        };
+        block_on_pair(body, mutator.as_mut());
+    }
+
+    #[test]
+    fn mutator_uses_committed_mirror_for_prior_values() {
+        let device = Arc::new(MockDevice::new(MockDeviceConfig {
+            page_size: 4096,
+            capacity_pages: 128,
+            ..Default::default()
+        }));
+        let cfg = EngineConfig {
+            page_size_bytes: 4096,
+            btree_page_bytes: 4096,
+            bypass_admission: true,
+            ..Default::default()
+        };
+        let eng = Arc::new(block_on(StorageEngine::open(device.clone(), cfg)).unwrap());
+        let buf: Box<[u8]> = vec![0u8; 4096 * 4].into_boxed_slice();
+        eng.register_pages(&test_backing(buf.as_ptr() as *mut u8, 4096, 4))
+            .unwrap();
+
+        let eng_body = eng.clone();
+        let mutator = eng.clone().run_mutator();
+        let mut mutator = pin!(mutator);
+        let body = async move {
+            let src = PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            };
+            eng_body.write_page(&stripe(12), 0, src).await.unwrap();
+            let reads_before_overwrite = device.reads();
+            eng_body.write_page(&stripe(12), 0, src).await.unwrap();
+
+            assert_eq!(
+                device.reads() - reads_before_overwrite,
+                1,
+                "overwrite should read only the path-copy leaf",
+            );
             eng_body.close_mutator();
         };
         block_on_pair(body, mutator.as_mut());

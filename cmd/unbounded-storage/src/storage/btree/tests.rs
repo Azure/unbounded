@@ -146,6 +146,39 @@ fn large_batch_spans_multiple_leaves() {
 }
 
 #[test]
+fn path_copy_reuses_cached_internal_nodes_without_reading_them() {
+    let (dev, alloc) = fresh(512);
+    let idx = block_on(open_btree(dev.clone(), alloc)).unwrap();
+    block_on(
+        idx.apply_batch(
+            (0..200u32)
+                .map(|i| Mutation::Insert {
+                    key: key(i),
+                    value: entry(1000 + i as u64),
+                })
+                .collect(),
+        ),
+    )
+    .unwrap();
+
+    let reads_before = dev.reads();
+    block_on(idx.apply_batch(vec![Mutation::Insert {
+        key: key(100),
+        value: entry(9000),
+    }]))
+    .unwrap();
+
+    assert_eq!(
+        dev.reads() - reads_before,
+        1,
+        "a one-key path copy should read only its terminal leaf",
+    );
+    assert_eq!(block_on(idx.lookup(&key(100))).unwrap(), Some(entry(9000)));
+    assert_eq!(block_on(idx.lookup(&key(10))).unwrap(), Some(entry(1010)));
+    assert_eq!(block_on(idx.lookup(&key(190))).unwrap(), Some(entry(1190)));
+}
+
+#[test]
 fn restart_from_meta_restores_entries() {
     let (dev, alloc) = fresh(128);
     {

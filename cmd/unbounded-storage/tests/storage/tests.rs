@@ -142,52 +142,14 @@ proptest! {
     /// - `admitted + rejected_by_filter` cannot exceed the number
     ///   of `write_page` calls in the workload (singleflight
     ///   followers and write-I/O errors contribute the slack).
-    /// - The gap between `resident_pages` and `btree_entries` is
-    ///   bounded even under fault injection. With no faults the
-    ///   counters must agree exactly: a regression that orphans
-    ///   cache entries on overwrite (no `replace-LBA` reclaim in
-    ///   `write_page`) breaks the equality immediately. Under
-    ///   faults two paths can desynchronise them:
-    ///   1. A failed eviction batch. `evict_if_over_watermark`
-    ///      pops up to `EVICT_SWEEP_TARGET` victims from the LRU
-    ///      and then attempts a batched btree delete; if that
-    ///      `apply_batch` fails (surfaced as a `device_io_errors`
-    ///      bump from the btree's underlying writes) the victims
-    ///      are gone from the LRU but still live in the btree, so
-    ///      `btree_entries` exceeds `resident_pages` by up to
-    ///      `EVICT_SWEEP_TARGET` per failure.
-    ///   2. A corrupted btree-internal read of the prior-LBA
-    ///      probe in the mutator's `process_batch`. A flipped
-    ///      byte that makes `btree::lookup` return `Ok(None)`
-    ///      when a prior entry existed causes the engine to skip
-    ///      `retire_range(old)`; the new LBA is admitted to both
-    ///      sides but the old LBA stays in the LRU and `reverse`
-    ///      map even though its btree key was overwritten by the
-    ///      new insert. That orphans one LRU entry per
-    ///      corruption, so `resident_pages` can exceed
-    ///      `btree_entries` by up to `device_corruptions_injected`.
-    ///      A corruption that hits the path-copy descent inside
-    ///      `apply_batch` itself aborts the commit (the engine's
-    ///      `apply_node` surfaces `Decoded::Empty` as
-    ///      `Error::Corrupt` so a subtree is never silently
-    ///      dropped from the new tree), so it doesn't contribute
-    ///      to the gap.
+    /// - `resident_pages` and `btree_entries` agree exactly, including
+    ///   under faults. Failed eviction victims are re-admitted, failed
+    ///   writes unwind both sides, and prior-value checks use the
+    ///   committed mirror, so no fault permits persistent divergence.
     ///   The data-write failure paths in `write_page_from` either
-    ///   rewind both sides or touch neither, so they don't
-    ///   contribute. `pending_free_len` is added as a small
-    ///   additional slack: it tracks LBAs already detached from
-    ///   the LRU whose btree key was replaced by a newer LBA, so
-    ///   on its own it doesn't unbalance the counters, but it
-    ///   gives defensive headroom for transient bookkeeping
-    ///   races without weakening the bound to uselessness.
+    ///   rewind both sides or touch neither, so they don't contribute.
     #[test]
     fn invariant_snapshot_accounting(seed in any::<u64>(), w in workload_strategy()) {
-        // Mirrors the hardcoded sweep target in
-        // `StorageEngine::evict_if_over_watermark`; each failed
-        // eviction batch can orphan at most this many LRU entries
-        // while leaving them resident in the btree.
-        const EVICT_SWEEP_TARGET: i64 = 8;
-
         let mut writes = 0u64;
         let mut reads = 0u64;
         for c in &w.clients {
@@ -211,37 +173,15 @@ proptest! {
             report.admitted, report.rejected_by_filter, writes,
         );
 
-        let resident = report.resident_pages as i64;
-        let btree = report.btree_entries as i64;
-        let diff = (resident - btree).abs();
-        let bound = EVICT_SWEEP_TARGET * report.device_io_errors as i64
-            + report.device_corruptions_injected as i64
-            + report.pending_free_len as i64;
-        prop_assert!(
-            diff <= bound,
-            "|resident_pages ({}) - btree_entries ({})| = {} exceeds bound {} \
-             (device_io_errors={}, device_corruptions_injected={}, pending_free_len={}); \
-             LRU and index diverged beyond what failed evictions and corrupted btree \
-             reads can explain",
-            resident, btree, diff, bound,
+        prop_assert_eq!(
+            report.resident_pages, report.btree_entries,
+            "resident_pages ({}) != btree_entries ({}); LRU and index disagree \
+             (faults_enabled={}, device_io_errors={}, device_corruptions_injected={}, \
+             pending_free_len={})",
+            report.resident_pages, report.btree_entries, faults_enabled,
             report.device_io_errors, report.device_corruptions_injected,
             report.pending_free_len,
         );
-
-        if !faults_enabled {
-            // Strictest sub-assertion: with no fault injection
-            // the bound collapses to zero (no device_io_errors,
-            // pending_free drains opportunistically), so the
-            // counters must agree exactly. Asserted separately so
-            // a regression that breaks the happy path produces a
-            // crisp shrink message instead of a "diff <= 0" form.
-            prop_assert_eq!(
-                report.resident_pages, report.btree_entries,
-                "resident_pages ({}) != btree_entries ({}); LRU and index disagree \
-                 under fault-free config",
-                report.resident_pages, report.btree_entries,
-            );
-        }
     }
 
     /// Invariant: a clean restart preserves correctness.

@@ -9,6 +9,7 @@
 
 #![allow(clippy::arc_with_non_send_sync)]
 
+pub mod cache;
 pub mod mocks;
 pub mod oracle;
 pub mod recovery;

@@ -45,7 +45,7 @@ use crate::storage::types::{Error, Lba, PageKey};
 /// Boxed future yielding one subtree's `(key, child_lba)` entries;
 /// the recursion through internal nodes is unbounded by static
 /// type, so `apply_node` and its joined siblings are erased here.
-type NodeFut<'f> = Pin<Box<dyn Future<Output = Result<Vec<(PageKey, Lba)>, Error>> + 'f>>;
+type NodeFut<'f> = Pin<Box<dyn Future<Output = Result<Vec<NodeRef>, Error>> + 'f>>;
 
 /// Boxed future for one page write, erased so a commit's
 /// independent page writes can be collected and joined.
@@ -57,27 +57,52 @@ type WriteFut<'f> = Pin<Box<dyn Future<Output = Result<(), Error>> + 'f>>;
 /// times fanout.
 const MAX_TRAVERSAL_NODES: u64 = 1 << 24;
 
-/// Immutable decoded cache of internal B+tree nodes reachable from
-/// a published root. Leaf pages are deliberately excluded so lookup
-/// memory scales with the upper levels only.
+/// Immutable decoded cache of the internal B+tree rooted at one snapshot.
+/// Internal subtrees are reference counted so a path-copy commit can share
+/// every untouched branch with its parent snapshot.
 #[derive(Default)]
 pub struct InternalNodeCache {
-    nodes: HashMap<Lba, CachedInternalNode>,
-    bytes: usize,
+    root: Option<Arc<CachedInternalNode>>,
 }
 
 struct CachedInternalNode {
     keys: Box<[PageKey]>,
-    children: Box<[Lba]>,
+    children: Box<[CachedChild]>,
+    bytes: usize,
+}
+
+#[derive(Clone)]
+struct CachedChild {
+    lba: Lba,
+    internal: Option<Arc<CachedInternalNode>>,
+}
+
+struct NodeRef {
+    key: PageKey,
+    child: CachedChild,
 }
 
 impl InternalNodeCache {
     pub fn bytes(&self) -> usize {
-        self.bytes
+        self.root.as_ref().map_or(0, |root| root.bytes)
     }
+}
 
-    fn get(&self, lba: Lba) -> Option<&CachedInternalNode> {
-        self.nodes.get(&lba)
+impl CachedInternalNode {
+    fn new(keys: Vec<PageKey>, children: Vec<CachedChild>) -> Arc<Self> {
+        let bytes = size_of::<Self>()
+            + keys.len() * size_of::<PageKey>()
+            + children.len() * size_of::<CachedChild>()
+            + children
+                .iter()
+                .filter_map(|child| child.internal.as_ref())
+                .map(|child| child.bytes)
+                .sum::<usize>();
+        Arc::new(Self {
+            keys: keys.into_boxed_slice(),
+            children: children.into_boxed_slice(),
+            bytes,
+        })
     }
 }
 
@@ -98,7 +123,6 @@ pub async fn build_internal_cache<B: BlockDevice>(
     }
 
     let mut nodes = HashMap::new();
-    let mut bytes = 0usize;
     let mut stack = vec![(root_lba, depth)];
     let mut buf = scratch.acquire().await;
     let mut visited = 0u64;
@@ -121,16 +145,7 @@ pub async fn build_internal_cache<B: BlockDevice>(
                         stack.push((child, remaining_depth - 1));
                     }
                 }
-                bytes += size_of::<CachedInternalNode>()
-                    + keys.len() * size_of::<PageKey>()
-                    + children.len() * size_of::<Lba>();
-                nodes.insert(
-                    node_lba,
-                    CachedInternalNode {
-                        keys: keys.into_boxed_slice(),
-                        children: children.into_boxed_slice(),
-                    },
-                );
+                nodes.insert(node_lba, (keys, children));
             }
             Decoded::Internal { .. } | Decoded::Empty | Decoded::Meta { .. } if strict => {
                 return Err(Error::Corrupt);
@@ -139,7 +154,29 @@ pub async fn build_internal_cache<B: BlockDevice>(
         }
     }
 
-    Ok(Arc::new(InternalNodeCache { nodes, bytes }))
+    let root = materialize_cache(root_lba, depth, &nodes);
+    Ok(Arc::new(InternalNodeCache { root }))
+}
+
+fn materialize_cache(
+    lba: Lba,
+    depth: usize,
+    nodes: &HashMap<Lba, (Vec<PageKey>, Vec<Lba>)>,
+) -> Option<Arc<CachedInternalNode>> {
+    let (keys, child_lbas) = nodes.get(&lba)?;
+    let mut children = Vec::with_capacity(child_lbas.len());
+    for &child_lba in child_lbas {
+        let internal = if depth > 1 {
+            materialize_cache(child_lba, depth - 1, nodes)
+        } else {
+            None
+        };
+        children.push(CachedChild {
+            lba: child_lba,
+            internal,
+        });
+    }
+    Some(CachedInternalNode::new(keys.clone(), children))
 }
 
 async fn internal_depth<B: BlockDevice>(
@@ -192,15 +229,17 @@ pub async fn lookup<B: BlockDevice>(
         return Ok(None);
     }
     let mut cur = root_lba;
+    let mut cached = internal_cache.root.as_deref();
     let mut buf = scratch.acquire().await;
     for _ in 0..32 {
-        if let Some(node) = internal_cache.get(cur) {
+        if let Some(node) = cached {
             let idx = match node.keys.binary_search(key) {
                 Ok(i) => i,
                 Err(0) => return Ok(None),
                 Err(i) => i - 1,
             };
-            cur = node.children[idx];
+            cur = node.children[idx].lba;
+            cached = node.children[idx].internal.as_deref();
             continue;
         }
 
@@ -413,6 +452,7 @@ pub struct PathCopyResult {
     pub new_root: Lba,
     pub new_pages: Vec<Lba>,
     pub retired_pages: Vec<Lba>,
+    pub internal_cache: Arc<InternalNodeCache>,
 }
 
 /// Apply `sorted_ops` to the tree rooted at `parent_root` using
@@ -430,6 +470,7 @@ pub async fn apply_path_copy<B: BlockDevice>(
     scratch: &Rc<ScratchPool>,
     allocator: &Allocator,
     parent_root: Lba,
+    parent_cache: &InternalNodeCache,
     txn_id: u64,
     sorted_ops: Vec<(PageKey, Option<LeafEntry>)>,
 ) -> Result<PathCopyResult, Error> {
@@ -448,11 +489,14 @@ pub async fn apply_path_copy<B: BlockDevice>(
     debug_assert!(ctx.leaf_cap >= 1);
     debug_assert!(ctx.internal_cap >= 2);
 
-    match apply_path_copy_inner(&ctx, parent_root, sorted_ops).await {
-        Ok(new_root) => Ok(PathCopyResult {
-            new_root,
+    match apply_path_copy_inner(&ctx, parent_root, parent_cache, sorted_ops).await {
+        Ok(root) => Ok(PathCopyResult {
+            new_root: root.child.lba,
             new_pages: ctx.new_pages.into_inner(),
             retired_pages: ctx.retired_pages.into_inner(),
+            internal_cache: Arc::new(InternalNodeCache {
+                root: root.child.internal,
+            }),
         }),
         Err(e) => {
             free_all(ctx.allocator, &ctx.new_pages.borrow());
@@ -464,14 +508,17 @@ pub async fn apply_path_copy<B: BlockDevice>(
 async fn apply_path_copy_inner<B: BlockDevice>(
     ctx: &PathCopyCtx<'_, B>,
     parent_root: Lba,
+    parent_cache: &InternalNodeCache,
     sorted_ops: Vec<(PageKey, Option<LeafEntry>)>,
-) -> Result<Lba, Error> {
+) -> Result<NodeRef, Error> {
     // Walk down from the parent root, rewriting only the spine
     // pages on the touched paths. The recursion returns 0+
     // (smallest_key, lba) entries describing the contents of the
     // *replacement* node: 0 means the subtree collapsed away,
     // 1 means it fit in a single node, >1 means it split.
-    let result = ctx.apply_node(parent_root, sorted_ops).await?;
+    let result = ctx
+        .apply_node(parent_root, parent_cache.root.clone(), sorted_ops)
+        .await?;
 
     if result.is_empty() {
         // The tree is now empty: publish an empty leaf as root so
@@ -480,11 +527,17 @@ async fn apply_path_copy_inner<B: BlockDevice>(
         ctx.new_pages.borrow_mut().push(lba);
         let page = page::encode_empty_leaf(ctx.page_size, ctx.txn_id);
         write_page(ctx.device, ctx.scratch, lba, &page).await?;
-        return Ok(lba);
+        return Ok(NodeRef {
+            key: PageKey::new([0; 32], 0),
+            child: CachedChild {
+                lba,
+                internal: None,
+            },
+        });
     }
 
     if result.len() == 1 {
-        return Ok(result[0].1);
+        return Ok(result.into_iter().next().expect("one root"));
     }
 
     // Multiple top-level children: stack one or more internal
@@ -495,7 +548,7 @@ async fn apply_path_copy_inner<B: BlockDevice>(
     while cur.len() > 1 {
         cur = ctx.build_internal_layer(cur).await?;
     }
-    Ok(cur[0].1)
+    Ok(cur.into_iter().next().expect("one root"))
 }
 
 /// Scratchpad for an in-flight path-copy commit. Tracks the
@@ -535,12 +588,18 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
     fn apply_node<'b>(
         &'b self,
         node_lba: Lba,
+        cached: Option<Arc<CachedInternalNode>>,
         ops: Vec<(PageKey, Option<LeafEntry>)>,
     ) -> NodeFut<'b>
     where
         'a: 'b,
     {
         Box::pin(async move {
+            if let Some(node) = cached {
+                self.retired_pages.borrow_mut().push(node_lba);
+                return self.recurse_internal(&node, ops).await;
+            }
+
             let decoded = {
                 let mut buf = self.scratch.acquire().await;
                 self.device.read(node_lba, buf.as_mut_slice()).await?;
@@ -558,7 +617,17 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
                         return Err(Error::Corrupt);
                     }
                     self.retired_pages.borrow_mut().push(node_lba);
-                    self.recurse_internal(keys, children, ops).await
+                    let node = CachedInternalNode::new(
+                        keys,
+                        children
+                            .into_iter()
+                            .map(|lba| CachedChild {
+                                lba,
+                                internal: None,
+                            })
+                            .collect(),
+                    );
+                    self.recurse_internal(&node, ops).await
                 }
                 // Empty here means the page failed to decode:
                 // checksum mismatch, unknown page type, or a
@@ -585,10 +654,9 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
 
     async fn recurse_internal(
         &self,
-        keys: Vec<PageKey>,
-        children: Vec<Lba>,
+        node: &CachedInternalNode,
         ops: Vec<(PageKey, Option<LeafEntry>)>,
-    ) -> Result<Vec<(PageKey, Lba)>, Error> {
+    ) -> Result<Vec<NodeRef>, Error> {
         // Partition `ops` into per-child buckets. Child `i` owns
         // keys in `[keys[i], keys[i+1])`; the lower bound on
         // child 0 is implicitly -infinity so we don't gate on
@@ -601,13 +669,13 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
         // dependency between them, so their `apply_node` futures
         // are launched together and joined; the per-position
         // results are stitched back in key order afterward.
-        let mut slots: Vec<Option<Vec<(PageKey, Lba)>>> = vec![None; keys.len()];
+        let mut slots: Vec<Option<Vec<NodeRef>>> = (0..node.keys.len()).map(|_| None).collect();
         let mut futs: Vec<NodeFut<'_>> = Vec::new();
         let mut fut_positions: Vec<usize> = Vec::new();
         let mut cursor = 0usize;
-        for i in 0..keys.len() {
-            let end = if i + 1 < keys.len() {
-                let upper = &keys[i + 1];
+        for i in 0..node.keys.len() {
+            let end = if i + 1 < node.keys.len() {
+                let upper = &node.keys[i + 1];
                 let mut e = cursor;
                 while e < ops.len() && &ops[e].0 < upper {
                     e += 1;
@@ -621,10 +689,17 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
                 // page wholesale. The smallest reachable key
                 // hasn't changed, so we can carry `keys[i]`
                 // forward unchanged.
-                slots[i] = Some(vec![(keys[i], children[i])]);
+                slots[i] = Some(vec![NodeRef {
+                    key: node.keys[i],
+                    child: node.children[i].clone(),
+                }]);
             } else {
                 let bucket: Vec<(PageKey, Option<LeafEntry>)> = ops[cursor..end].to_vec();
-                futs.push(self.apply_node(children[i], bucket));
+                futs.push(self.apply_node(
+                    node.children[i].lba,
+                    node.children[i].internal.clone(),
+                    bucket,
+                ));
                 fut_positions.push(i);
             }
             cursor = end;
@@ -639,7 +714,7 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
             slots[pos] = Some(res?);
         }
 
-        let mut new_children: Vec<(PageKey, Lba)> = Vec::new();
+        let mut new_children: Vec<NodeRef> = Vec::new();
         for slot in slots {
             new_children.extend(slot.expect("every slot filled"));
         }
@@ -647,31 +722,30 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
         self.write_internals(new_children).await
     }
 
-    async fn write_leaves(
-        &self,
-        entries: &[(PageKey, LeafEntry)],
-    ) -> Result<Vec<(PageKey, Lba)>, Error> {
+    async fn write_leaves(&self, entries: &[(PageKey, LeafEntry)]) -> Result<Vec<NodeRef>, Error> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let mut out: Vec<(PageKey, Lba)> =
-            Vec::with_capacity(entries.len().div_ceil(self.leaf_cap));
+        let mut out: Vec<NodeRef> = Vec::with_capacity(entries.len().div_ceil(self.leaf_cap));
         let mut pages: Vec<(Lba, Vec<u8>)> = Vec::with_capacity(out.capacity());
         for chunk in entries.chunks(self.leaf_cap) {
             let lba = self.allocator.alloc()?;
             self.new_pages.borrow_mut().push(lba);
             let page = page::encode_leaf(self.page_size, self.txn_id, chunk)?;
-            out.push((chunk[0].0, lba));
+            out.push(NodeRef {
+                key: chunk[0].0,
+                child: CachedChild {
+                    lba,
+                    internal: None,
+                },
+            });
             pages.push((lba, page));
         }
         write_pages_concurrent(self.device, self.scratch, &pages).await?;
         Ok(out)
     }
 
-    async fn write_internals(
-        &self,
-        children: Vec<(PageKey, Lba)>,
-    ) -> Result<Vec<(PageKey, Lba)>, Error> {
+    async fn write_internals(&self, children: Vec<NodeRef>) -> Result<Vec<NodeRef>, Error> {
         // Collapse trivial cases: a removed subtree returns the
         // empty list to its caller; a non-split rewrite returns
         // the single child unchanged so we don't rewrite the
@@ -682,21 +756,27 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
         self.build_internal_layer(children).await
     }
 
-    async fn build_internal_layer(
-        &self,
-        children: Vec<(PageKey, Lba)>,
-    ) -> Result<Vec<(PageKey, Lba)>, Error> {
+    async fn build_internal_layer(&self, children: Vec<NodeRef>) -> Result<Vec<NodeRef>, Error> {
         debug_assert!(!children.is_empty());
-        let mut out: Vec<(PageKey, Lba)> =
-            Vec::with_capacity(children.len().div_ceil(self.internal_cap));
+        let mut out: Vec<NodeRef> = Vec::with_capacity(children.len().div_ceil(self.internal_cap));
         let mut pages: Vec<(Lba, Vec<u8>)> = Vec::with_capacity(out.capacity());
         for chunk in children.chunks(self.internal_cap) {
-            let keys: Vec<PageKey> = chunk.iter().map(|(k, _)| *k).collect();
-            let kids: Vec<Lba> = chunk.iter().map(|(_, l)| *l).collect();
+            let keys: Vec<PageKey> = chunk.iter().map(|node| node.key).collect();
+            let kids: Vec<Lba> = chunk.iter().map(|node| node.child.lba).collect();
             let lba = self.allocator.alloc()?;
             self.new_pages.borrow_mut().push(lba);
             let page = page::encode_internal(self.page_size, self.txn_id, &keys, &kids)?;
-            out.push((chunk[0].0, lba));
+            let internal = CachedInternalNode::new(
+                keys.clone(),
+                chunk.iter().map(|node| node.child.clone()).collect(),
+            );
+            out.push(NodeRef {
+                key: chunk[0].key,
+                child: CachedChild {
+                    lba,
+                    internal: Some(internal),
+                },
+            });
             pages.push((lba, page));
         }
         write_pages_concurrent(self.device, self.scratch, &pages).await?;

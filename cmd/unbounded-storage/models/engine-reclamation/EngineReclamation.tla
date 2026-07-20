@@ -18,9 +18,10 @@
       mark_in_use (alloc/mod.rs:177-189, idempotent). We model it as two
       disjoint sets `inUse` and `free`.
 
-    * The current btree root (src/storage/btree/mod.rs). A map key -> LBA
-      at the current committed txn. We model it as `root` plus a
-      monotonic `cur_txn`.
+    * The current btree root and committed mutator mirror
+      (src/storage/btree/mod.rs). Both are maps key -> LBA and must advance
+      together only after the meta write commits. We model them separately
+      as `root` and `mirror` so equality is proved rather than assumed.
 
     * Live data readers (engine.rs:514-520). Each reader pins the LBA it is
       actively reading via RefcountTable; the model represents a live reader
@@ -73,7 +74,9 @@ ASSUME MaxSnapshots \in Nat
 
 VARIABLES
   root,         \* Key -> LBA \cup {NONE}. The current committed btree
-                \* root mapping at txn `cur_txn`.
+                 \* root mapping at txn `cur_txn`.
+  mirror,       \* The mutator's committed in-memory map. Prior-value and
+                 \* stale-eviction checks read this instead of a leaf.
   cur_txn,      \* Monotonic commit counter. Every Write/Evict produces a
                 \* new commit at cur_txn + 1.
   snapshots,    \* Set of [rid, txn, view]. One PUBLISHED reader per element;
@@ -95,7 +98,7 @@ VARIABLES
                 \* Rebuild; lets RebuildSoundness talk about "right after
                 \* recovery" without a history variable.
 
-vars == <<root, cur_txn, snapshots, registering, pending, inUse, free, wfAlloc, just_rebuilt>>
+vars == <<root, mirror, cur_txn, snapshots, registering, pending, inUse, free, wfAlloc, just_rebuilt>>
 
 (***************************************************************************
   Helpers.
@@ -130,6 +133,7 @@ FreeablePending == { lba \in pending : PinCount(lba) = 0 }
 
 Init ==
   /\ root = [k \in Key |-> NONE]
+  /\ mirror = [k \in Key |-> NONE]
   /\ cur_txn = 1
   /\ snapshots = {}
   /\ registering = {}
@@ -155,23 +159,24 @@ Write(k) ==
   /\ cur_txn <= MaxTxn
   /\ free /= {}
   /\ \E L \in free :
-       LET old    == root[k]
+       LET old    == mirror[k]
            newtxn == cur_txn + 1
-        IN /\ root'    = [root EXCEPT ![k] = L]
-           /\ cur_txn' = newtxn
-           /\ IF old = NONE
-              THEN /\ pending' = pending
-                   /\ inUse' = inUse \cup {L}
-                   /\ free' = free \ {L}
-              ELSE IF PinCount(old) = 0
-                   THEN /\ pending' = pending
-                        /\ inUse' = (inUse \cup {L}) \ {old}
-                        /\ free' = (free \ {L}) \cup {old}
-                   ELSE /\ pending' = pending \cup {old}
-                        /\ inUse' = inUse \cup {L}
-                        /\ free' = free \ {L}
-           /\ UNCHANGED <<snapshots, registering, wfAlloc>>
-           /\ just_rebuilt' = FALSE
+         IN /\ root'    = [root EXCEPT ![k] = L]
+            /\ mirror'  = [mirror EXCEPT ![k] = L]
+            /\ cur_txn' = newtxn
+            /\ (IF old = NONE
+                THEN /\ pending' = pending
+                     /\ inUse' = inUse \cup {L}
+                     /\ free' = free \ {L}
+                ELSE IF PinCount(old) = 0
+                     THEN /\ pending' = pending
+                          /\ inUse' = (inUse \cup {L}) \ {old}
+                          /\ free' = (free \ {L}) \cup {old}
+                     ELSE /\ pending' = pending \cup {old}
+                          /\ inUse' = inUse \cup {L}
+                          /\ free' = free \ {L})
+            /\ UNCHANGED <<snapshots, registering, wfAlloc>>
+            /\ just_rebuilt' = FALSE
 
 (***************************************************************************
   DrainPendingFree: StorageEngine::drain_pending_free (engine.rs:316-329).
@@ -184,7 +189,7 @@ DrainPendingFree ==
   /\ pending' = pending \ FreeablePending
   /\ inUse'   = inUse \ FreeablePending
   /\ free'    = free \cup FreeablePending
-  /\ UNCHANGED <<root, cur_txn, snapshots, registering, wfAlloc>>
+  /\ UNCHANGED <<root, mirror, cur_txn, snapshots, registering, wfAlloc>>
   /\ just_rebuilt' = FALSE
 
 (***************************************************************************
@@ -201,7 +206,7 @@ WriteFailAlloc ==
        /\ inUse'   = inUse \cup {L}
        /\ free'    = free \ {L}
        /\ wfAlloc' = wfAlloc \cup {L}
-       /\ UNCHANGED <<root, cur_txn, snapshots, registering, pending>>
+       /\ UNCHANGED <<root, mirror, cur_txn, snapshots, registering, pending>>
        /\ just_rebuilt' = FALSE
 
 WriteFailFree ==
@@ -210,7 +215,7 @@ WriteFailFree ==
        /\ inUse'   = inUse \ {L}
        /\ free'    = free \cup {L}
        /\ wfAlloc' = wfAlloc \ {L}
-       /\ UNCHANGED <<root, cur_txn, snapshots, registering, pending>>
+       /\ UNCHANGED <<root, mirror, cur_txn, snapshots, registering, pending>>
        /\ just_rebuilt' = FALSE
 
 (***************************************************************************
@@ -222,11 +227,12 @@ WriteFailFree ==
  ***************************************************************************)
 Evict(k) ==
   /\ cur_txn <= MaxTxn
-  /\ root[k] /= NONE
-  /\ PinCount(root[k]) = 0
-  /\ LET old    == root[k]
+  /\ mirror[k] /= NONE
+  /\ PinCount(mirror[k]) = 0
+  /\ LET old    == mirror[k]
          newtxn == cur_txn + 1
      IN /\ root'    = [root EXCEPT ![k] = NONE]
+        /\ mirror'  = [mirror EXCEPT ![k] = NONE]
         /\ inUse'   = inUse \ {old}
         /\ free'    = free \cup {old}
         /\ cur_txn' = newtxn
@@ -244,7 +250,7 @@ AliveRegister ==
   /\ \E rid \in (Reader \ UsedRids) :
        /\ registering' = registering \cup
             { [rid |-> rid, txn |-> cur_txn, view |-> root] }
-       /\ UNCHANGED <<root, cur_txn, snapshots, pending, inUse, free, wfAlloc>>
+       /\ UNCHANGED <<root, mirror, cur_txn, snapshots, pending, inUse, free, wfAlloc>>
        /\ just_rebuilt' = FALSE
 
 (***************************************************************************
@@ -258,7 +264,7 @@ Publish ==
   /\ \E r \in registering :
        /\ registering' = registering \ {r}
        /\ snapshots'   = snapshots \cup {r}
-       /\ UNCHANGED <<root, cur_txn, pending, inUse, free, wfAlloc>>
+       /\ UNCHANGED <<root, mirror, cur_txn, pending, inUse, free, wfAlloc>>
        /\ just_rebuilt' = FALSE
 
 (***************************************************************************
@@ -270,7 +276,7 @@ DropSnapshot ==
   /\ snapshots /= {}
   /\ \E s \in snapshots :
        /\ snapshots' = snapshots \ {s}
-       /\ UNCHANGED <<root, cur_txn, registering, pending, inUse, free, wfAlloc>>
+       /\ UNCHANGED <<root, mirror, cur_txn, registering, pending, inUse, free, wfAlloc>>
        /\ just_rebuilt' = FALSE
 
 (***************************************************************************
@@ -291,6 +297,7 @@ Rebuild ==
     /\ registering'  = {}
     /\ wfAlloc'      = {}
     /\ just_rebuilt' = TRUE
+    /\ mirror'        = root
     /\ UNCHANGED <<root, cur_txn>>
 
 Next ==
@@ -380,6 +387,14 @@ WriteFailIsolation ==
     /\ L \in inUse
     /\ \A k \in Key : root[k] /= L
     /\ L \notin pending
+
+(***************************************************************************
+  COMMITTED MIRROR COHERENCE. process_batch reads prior values and validates
+  stale eviction candidates from the mirror. It is safe exactly because the
+  mirror advances with the published root on successful commits and neither
+  representation advances on failed writes.
+ ************************************************************************ ***)
+CommittedMirrorMatchesRoot == mirror = root
 
 (***************************************************************************
   Bound the txn counter (mirrors CowBtreeCrash's StateConstraint on
