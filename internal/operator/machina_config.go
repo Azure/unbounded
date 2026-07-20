@@ -4,63 +4,24 @@
 package operator
 
 import (
-	"fmt"
-
-	"gopkg.in/yaml.v3"
+	"github.com/Azure/unbounded/internal/operator/components/machina"
+	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
+	"github.com/Azure/unbounded/internal/operator/components/storage"
 )
 
-// setMachinaAPIServerEndpoint updates only the top-level apiServerEndpoint
-// field. Using a YAML node preserves all other migrated or user-managed fields.
+// The legacy reaper (migrate.go) verifies component rollout by comparing the
+// pod-template config-hash annotations the components stamp, and migrates the
+// machina config using the same endpoint-merge logic. These aliases keep that
+// single source of truth in the component packages while the reaper references
+// the historical operator-local names.
+const (
+	netConfigHashAnnotation     = netcomponent.ConfigHashAnnotation
+	machinaConfigHashAnnotation = machina.ConfigHashAnnotation
+	storageConfigHashAnnotation = storage.ConfigHashAnnotation
+)
+
+// setMachinaAPIServerEndpoint forwards to the machina component's endpoint merge
+// so the reaper and the component write machina config identically.
 func setMachinaAPIServerEndpoint(config, endpoint string) (string, error) {
-	if endpoint == "" {
-		return config, nil
-	}
-
-	var document yaml.Node
-	if config == "" {
-		document = yaml.Node{
-			Kind: yaml.DocumentNode,
-			Content: []*yaml.Node{{
-				Kind: yaml.MappingNode,
-				Tag:  "!!map",
-			}},
-		}
-	} else if err := yaml.Unmarshal([]byte(config), &document); err != nil {
-		return "", fmt.Errorf("parse machina config: %w", err)
-	}
-
-	if len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
-		return "", fmt.Errorf("parse machina config: expected a top-level mapping")
-	}
-
-	mapping := document.Content[0]
-	for i := 0; i < len(mapping.Content); i += 2 {
-		if mapping.Content[i].Value != "apiServerEndpoint" {
-			continue
-		}
-
-		mapping.Content[i+1].Kind = yaml.ScalarNode
-		mapping.Content[i+1].Tag = "!!str"
-		mapping.Content[i+1].Value = endpoint
-		mapping.Content[i+1].Style = yaml.DoubleQuotedStyle
-
-		encoded, err := yaml.Marshal(&document)
-		if err != nil {
-			return "", fmt.Errorf("encode machina config: %w", err)
-		}
-
-		return string(encoded), nil
-	}
-
-	mapping.Content = append(mapping.Content,
-		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "apiServerEndpoint"},
-		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: endpoint, Style: yaml.DoubleQuotedStyle},
-	)
-
-	encoded, err := yaml.Marshal(&document)
-	if err != nil {
-		return "", fmt.Errorf("encode machina config: %w", err)
-	}
-
-	return string(encoded), nil
+	return machina.SetAPIServerEndpoint(config, endpoint)
 }

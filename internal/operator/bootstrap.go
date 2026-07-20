@@ -23,13 +23,10 @@ import (
 
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 const (
-	// crdKind is the Kind of a CustomResourceDefinition object in the embedded
-	// manifests.
-	crdKind = "CustomResourceDefinition"
-
 	// crdEstablishedPoll is the poll interval while waiting for CRDs to become
 	// Established.
 	crdEstablishedPoll = time.Second
@@ -173,7 +170,7 @@ func bootstrapCRDs(ctx context.Context, c client.Client, timeout time.Duration) 
 // applyCRDsFromFS applies every CRD found in the given manifest filesystem and
 // returns the names it applied.
 func applyCRDsFromFS(ctx context.Context, logger logr.Logger, c client.Client, manifests fs.FS) ([]string, error) {
-	files, err := yamlFiles(manifests)
+	files, err := component.YamlFiles(manifests)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +195,7 @@ func applyCRDsFromFS(ctx context.Context, logger logr.Logger, c client.Client, m
 				return nil, fmt.Errorf("decode %s: %w", file, err)
 			}
 
-			if obj.Object == nil || obj.GetKind() != crdKind {
+			if obj.Object == nil || obj.GetKind() != component.CRDKind {
 				continue
 			}
 
