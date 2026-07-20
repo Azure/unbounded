@@ -119,6 +119,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
 		Containerd:      ResolveContainerd(sandboxImage),
+		Gantry:          ResolveGantry(cfg.Gantry),
 		Kubelet:         kubelet,
 		Nvidia:          nvidia,
 	}
@@ -127,6 +128,10 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		RootFS:    rootFS,
 		NodeStart: nodeStart,
 	}, nil
+}
+
+func ResolveGantry(cfg *config.GantryConfig) Gantry {
+	return Gantry{Disabled: cfg != nil && cfg.Disabled}
 }
 
 // resolveKubelet builds the kubelet goal state from an agent config.

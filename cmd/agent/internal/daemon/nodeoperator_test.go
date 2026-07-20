@@ -112,6 +112,20 @@ func Test_hasDrift_TaintsChange(t *testing.T) {
 	assert.True(t, hasDrift(applied, desired))
 }
 
+func Test_hasDrift_GantryChange(t *testing.T) {
+	applied := baseConfig()
+	desired := baseConfig()
+	desired.Gantry = &provision.GantryConfig{Disabled: true}
+	assert.True(t, hasDrift(applied, desired))
+}
+
+func Test_hasDrift_GantryExplicitFalseDoesNotDrift(t *testing.T) {
+	applied := baseConfig()
+	applied.Gantry = &provision.GantryConfig{}
+	desired := baseConfig()
+	assert.False(t, hasDrift(applied, desired))
+}
+
 // ---------------------------------------------------------------------------
 // Active machine config serialization
 // ---------------------------------------------------------------------------

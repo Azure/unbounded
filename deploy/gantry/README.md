@@ -64,6 +64,15 @@ make image-gantry-local VERSION=v0.6.0
 
 ## Per-node containerd setup
 
+Nodes provisioned by `unbounded-agent` already have containerd configured to
+read `/etc/containerd/certs.d` and carry the managed default Gantry mirror
+entry in `/etc/containerd/certs.d/_default/hosts.toml`. On those nodes, install
+the Gantry DaemonSet normally; the mirror activates when the pod starts
+listening on `127.0.0.1:5000`.
+
+Use `node-config.yaml` only for standalone installs or non-agent-managed nodes
+that still need the default Gantry mirror entry written onto the node.
+
 For each upstream registry the cluster pulls from, drop a
 `hosts.toml` at:
 

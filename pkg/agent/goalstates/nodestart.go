@@ -18,6 +18,7 @@ type NodeStart struct {
 
 	MachineDir string // e.g. /var/lib/machines/node
 	Containerd Containerd
+	Gantry     Gantry
 	Kubelet    Kubelet
 
 	// Nvidia holds NVIDIA GPU state discovered on the host. After the nspawn
@@ -25,4 +26,8 @@ type NodeStart struct {
 	// symlinks inside the container's library path pointing into the
 	// bind-mounted /run/host-nvidia/ directories.
 	Nvidia NvidiaHost
+}
+
+type Gantry struct {
+	Disabled bool
 }
