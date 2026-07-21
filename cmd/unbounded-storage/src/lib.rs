@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod bufferpool;
 pub mod config;
+pub mod disk_discovery;
 pub mod fabric;
 pub mod fanout;
 pub mod frontend;
