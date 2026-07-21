@@ -42,8 +42,9 @@ serves/relays stripes to and from peer nodes over a libfabric RDMA fabric.
   `!Send`/`!Sync` (`Rc`, `RefCell`, `Cell`, raw pointers) and never cross a
   thread boundary. Cross-core communication is explicit and channel-based.
 - **Topology-driven.** At startup the daemon discovers host hardware (CPUs,
-  NUMA nodes, HCAs, NVMe drives) from sysfs and computes a `Plan` that assigns
-  disjoint CPUs to roles. Everything downstream is sized from that plan.
+  NUMA nodes, HCAs, and safe unused NVMe namespaces) from sysfs and procfs and
+  computes a `Plan` that assigns disjoint CPUs to roles. Everything downstream
+  is sized from that plan.
 - **NUMA locality everywhere.** Memory backings, fabric memory regions, and disk
   engines are all allocated on, and pinned to, the NUMA node of the CPU that
   uses them.
@@ -128,15 +129,19 @@ excluded from the live-reload diff.
 
 ### Startup sequence
 
-1. Load and validate config into one immutable `LoadedConfig` containing the raw
-   config, owned runtime graph, and route snapshot; build `StartupSettings` from
-   its raw config's `[startup]` section.
-2. `Host::discover()` reads hardware from sysfs.
-3. `CorePlan::for_host(&host, &settings.core_plan_config)` partitions the
-   host's usable CPUs into three disjoint, NUMA-local classes: one
-   `StorageCore` per NVMe drive, `nic_workers` `NicWorker`s per active HCA,
-   and a `ServingShard` on every remaining CPU (optionally capped by
-   `serving_cores`).
+1. Load and validate config, then resolve its disk set. A nonempty explicit set
+   is authoritative. Otherwise `disk_discovery` scans for safe unused NVMe
+   namespaces and materializes block `DiskSpec`s; if none remain, it materializes
+   the configured file fallback (20 GiB by default). The resulting immutable
+   `LoadedConfig` contains the resolved raw config, runtime graph, and route
+   snapshot. `StartupSettings` comes from its `[startup]` section.
+2. `Host::discover()` reads CPU, HCA, controller, and inventory hardware from
+   sysfs.
+3. `CorePlan::for_host_with_storage` partitions the host's usable CPUs into
+   three disjoint, NUMA-local classes: one `StorageCore` per initial concrete
+   block disk, `nic_workers` `NicWorker`s per active HCA, and a `ServingShard`
+   on every remaining CPU (optionally capped by `serving_cores`). File disks and
+   block disks added after startup run unpinned.
 4. **One shard thread is spawned per `ServingShard`.** If the host yields no
    serving shards, the daemon exits with failure. With no usable HCA the
    NIC-worker class is simply empty and the shards serve over the
@@ -297,15 +302,16 @@ it a simple loop to drive work without an async runtime.
 
 ### 7.2 `topology/` - hardware discovery and planning
 
-- `Host::discover()` reads CPUs, NUMA nodes, HCAs (`Hca`), NICs (`Nic`), and
-  NVMe drives (`Nvme`) from sysfs.
-- `CorePlan::for_host(&host, &CorePlanConfig)` partitions the host's usable
-  CPUs into three disjoint, NUMA-local classes, scheduled most-constrained
-  first: a `StorageCore` per NVMe drive, then `nic_workers` `NicWorker`s per
-  active HCA (grouped into a `NicWorkerGroup` per HCA), then a `ServingShard`
-  on every remaining CPU. Each CPU is handed out at most once; an exhausted
-  pool oversubscribes rather than panicking. The shared CPU/HCA filtering
-  engine (SMT collapse, isolcpus, cpu0 exclusion, active-port gating) lives in
+- `Host::discover()` reads CPUs, NUMA nodes, HCAs (`Hca`), NICs (`Nic`), NVMe
+  controllers (`Nvme`), and block-device inventory from sysfs. Safe namespace
+  selection is owned separately by `disk_discovery`.
+- `CorePlan::for_host_with_storage` partitions the host's usable CPUs into three
+  disjoint, NUMA-local classes, scheduled most-constrained first: a
+  `StorageCore` per initial block disk, then `nic_workers` `NicWorker`s per
+  active HCA (grouped into a `NicWorkerGroup` per HCA), then a `ServingShard` on
+  every remaining CPU. Each CPU is handed out at most once; an exhausted pool
+  oversubscribes rather than panicking. The shared CPU/HCA filtering engine (SMT
+  collapse, isolcpus, cpu0 exclusion, active-port gating) lives in
   `topology/filters.rs`.
 - `CorePlanConfig` knobs (defaults): `nic_workers` (4 per active HCA),
   `serving_cores` (`None` = claim every remaining CPU), `use_smt_siblings`
@@ -316,7 +322,7 @@ it a simple loop to drive work without an async runtime.
   verbs).
 - Key fields consumed by main: `plan.serving_shards` (one shard thread each),
   `plan.nic_workers` (the fabric worker groups), and `plan.storage_cores`,
-  which main maps to one `DiskCpuSlot` per NVMe drive.
+  which main maps to one `DiskCpuSlot` per initial block disk.
 ### 7.3 `memory/` - NUMA-local backings
 
 - `Backing` is a pinned, NUMA-local memory region carved into fixed-size pages
@@ -660,19 +666,32 @@ Sections (all optional, each falling back to defaults):
   `config` table (`block` with `path` and optional `numa`, or `file` with
   `path` and required `size`), `queue_depth` (optional), `page_size_bytes`, and
   `skip_recovery_scan` (fields that disk reconcile treats as drift, see 7.10).
-  Disk paths must be unique across the shared set.
+  Disk paths must be unique across the shared set. A nonempty explicit set is
+  authoritative and bypasses automatic discovery and its deny list.
+- `[disk_discovery]` - policy used only when `[[disks]]` is empty.
+  `denied_paths` contains exact absolute device paths and filters automatic
+  selection only. A whole NVMe namespace is eligible when it has nonzero
+  capacity, its `/dev` identity matches sysfs, and neither it nor any child
+  partition is mounted, active swap, or has holders. Mount, swap, identity, and
+  holder checks use device major:minor and fail closed; an unmounted partition
+  table alone is allowed. Optional `[disk_discovery.fallback]` reuses the file
+  disk shape and defaults missing fields to
+  `/var/lib/unbounded-storage/cache.disk` and 20 GiB.
 - `[[frontends]]` - `name`, `source` (a backend or cache component name), and
   one `config` table (`http`, `s3`, or `loadgen`).
 
-After defaults and validation, loading constructs one immutable `LoadedConfig`:
-the raw `Config`, one owned `RuntimeGraph`, and one route snapshot built from
-that graph. The watcher (`notify`-based) emits these loaded snapshots; main's
-`wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa
-drift, via a `last_applied` cache), disks, and - by broadcasting the applied
-config to every shard - each shard's backend and frontend registries plus the
-routing snapshot. The apply target and shards consume the same loaded graph and
-routes; this is coherent preparation, not whole-process transactionality. It
-republishes the channel snapshot each update, logs
+After defaults and validation, main resolves disks and rebuilds one immutable
+`LoadedConfig`: the resolved raw `Config`, one owned `RuntimeGraph`, and one
+route snapshot built from that graph. The resolver reuses an automatic result
+while the discovery policy is unchanged. It rescans on a policy change or an
+explicit-to-automatic transition; scan failure keeps the prior live config.
+The watcher (`notify`-based) emits unresolved loaded snapshots; main resolves
+them before `wait_for_shutdown_with_updates` reconciles peers (remove + add on
+address/numa drift, via a `last_applied` cache), disks, and - by broadcasting the
+applied config to every shard - each shard's backend and frontend registries
+plus the routing snapshot. The apply target and shards consume the same loaded
+graph and routes; this is coherent preparation, not whole-process
+transactionality. It republishes the channel snapshot each update, logs
 `config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.
 
 ### 7.12 `tls/` - the shared TLS transport

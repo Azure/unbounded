@@ -25,18 +25,21 @@ metadata:
 # deployment should participate in P2P caching; the supervisor only supplies the
 # ring roster.
 #
-# Disks are declared in disks[]. Explicit disks are preserved. When disks[] is
-# absent or empty, block disks are allocated only from the opt-in
-# storage.unbounded-cloud.io/allocated-disks annotation. Its value is a
-# comma-separated list of item?query entries such as
-# /dev/nvme1n1?queue_depth=256&page_size_bytes=4096&numa=0. When that annotation
-# is absent or has no valid disks, the supervisor uses one file-backed disk at
-# /var/lib/unbounded-storage/cache.disk sized by
-# unbounded-cloud.io/storage-file-size-bytes, defaulting to 2 GiB. The daemon
-# publishes discovered options to storage.unbounded-cloud.io/block-devices as
-# entries like /dev/sdb?name=sdb&size_bytes=1234; discovery does not allocate
-# disks. The shared disk set is available to every cache; the supervisor does not
-# invent caches, backends, or frontends.
+# Disks are declared in disks[]. Explicit disks are authoritative. The existing
+# storage.unbounded-cloud.io/allocated-disks annotation is also preserved as an
+# explicit per-node override; its value is a comma-separated list of item?query
+# entries such as /dev/nvme1n1?queue_depth=256&page_size_bytes=4096&numa=0.
+# Otherwise the daemon automatically selects whole NVMe namespaces that are not
+# mounted, active swap, or held by LVM/RAID/device-mapper (including their child
+# partitions). Exact device paths can be excluded with
+# disk_discovery.denied_paths. If no eligible namespace remains, the daemon uses
+# disk_discovery.fallback, defaulting to /var/lib/unbounded-storage/cache.disk at
+# 20 GiB. The legacy unbounded-cloud.io/storage-file-size-bytes annotation sets
+# the fallback size only when config.yaml did not set it. The daemon also
+# publishes inventory to storage.unbounded-cloud.io/block-devices; inventory is
+# informational and includes devices that are not eligible. The shared disk set
+# is available to every cache; the supervisor does not invent caches, backends,
+# or frontends.
 #
 # Backend ca_cert, client_cert, and client_key fields contain literal PEM, not
 # filesystem paths. Static S3 access_key_id, secret_access_key, and session_token
@@ -46,6 +49,16 @@ data:
   config.yaml: |
     # Operator-assigned config version (opaque counter; 0 means unversioned).
     version: 0
+
+    # Automatic disk policy used only when disks[] and the allocated-disks node
+    # annotation are empty. Denied paths are exact and do not filter explicit
+    # disks. Omit fallback fields for the default path and 20 GiB size.
+    # disk_discovery:
+    #   denied_paths:
+    #     - /dev/nvme0n1
+    #   fallback:
+    #     path: /var/lib/unbounded-storage/cache.disk
+    #     size: 21474836480
 
     # Optional automatic P2P finger weighting. Omit topology_weighting to keep
     # historical hard-locality selection. When set, weight 0.0 is neutral,

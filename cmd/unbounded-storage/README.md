@@ -36,8 +36,8 @@ The built binary is copied to `bin/unbounded-storage`.
 
 ```bash
 # default: read /etc/unbounded-storage/config.toml; if absent, fall
-# back to built-in defaults (a heap-backed, single-shard, no-peer,
-# no-disk run that is mostly useful as a smoke test).
+# back to built-in defaults. Safe unused NVMe namespaces are selected
+# automatically; if none are available, a 20 GiB file disk is used.
 unbounded-storage
 
 # explicit config path; missing or invalid here is fatal
@@ -142,6 +142,8 @@ addr      = "10.0.0.1:9000"      # parsed as SocketAddr.
 name = "cache"
 source = "origin"               # backend used for miss fills.
 
+# Optional explicit disk list. When nonempty it is authoritative and automatic
+# discovery, including denied_paths, does not apply.
 [[disks]]                        # repeat per local device; paths must be unique.
 queue_depth = 32                 # optional u32; per-disk io_uring depth.
 skip_recovery_scan = false       # only for fresh or benchmark disks.
@@ -154,6 +156,19 @@ numa        = 0                  # optional u16; biases the open onto a CPU on t
 # [disks.config.file]
 # path = "/var/lib/unbounded-storage/disk0.img"
 # size = 1073741824              # required bytes for file-backed disks.
+
+# When [[disks]] is absent or empty, whole NVMe namespaces are selected if the
+# namespace and all child partitions are not mounted, active swap, or held by
+# LVM/RAID/device-mapper. Safety state is checked by device major:minor and
+# discovery fails closed when it cannot be established. An unmounted partition
+# table alone does not exclude a namespace.
+[disk_discovery]
+denied_paths = ["/dev/nvme1n1"] # exact paths; automatic selection only.
+
+# Used only when no eligible automatic disks remain. Both fields are optional.
+[disk_discovery.fallback]
+path = "/var/lib/unbounded-storage/cache.disk"
+size = 21474836480               # 20 GiB default.
 
 [[frontends]]
 name = "http"
@@ -192,6 +207,12 @@ include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU
 allow_inactive_port   = false    # use HCA ports not in the active state.
 disable_rdma          = false    # disable RDMA and force the libfabric tcp provider.
 ```
+
+Automatic selections are cached while `disk_discovery` is unchanged. Changing
+that policy, or changing from explicit disks back to automatic mode, rescans the
+host before applying the reload. Explicit disks remain dynamically reloadable.
+CPU slots are planned for the initial block-disk set; block disks introduced by
+a later reload run unpinned until the daemon restarts.
 
 ### Origin authentication and TLS
 
