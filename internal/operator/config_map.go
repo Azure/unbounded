@@ -4,39 +4,18 @@
 package operator
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-const (
-	machinaConfigHashAnnotation = "unbounded-cloud.io/machina-config-hash"
-	netConfigHashAnnotation     = "unbounded-cloud.io/net-config-hash"
-	storageConfigHashAnnotation = "unbounded-cloud.io/storage-config-hash"
-)
+// deprecatedSiteLabelKey is the node site-membership label used by released net
+// controllers before the switch to unbounded-cloud.io/site. It is re-exported
+// for the legacy reaper (see migrate.go).
+const deprecatedSiteLabelKey = component.DeprecatedSiteLabelKey
 
-// configMapPayloadHash hashes the complete ConfigMap payload. JSON provides a
-// deterministic encoding for string-keyed maps, including binary values.
+// configMapPayloadHash forwards to component.ConfigMapPayloadHash for the legacy
+// reaper (see migrate.go).
 func configMapPayloadHash(config *corev1.ConfigMap) string {
-	payload, err := json.Marshal(struct {
-		Data       map[string]string `json:"data"`
-		BinaryData map[string][]byte `json:"binaryData"`
-	}{
-		Data:       config.Data,
-		BinaryData: config.BinaryData,
-	})
-	if err != nil {
-		panic(fmt.Sprintf("encode ConfigMap payload: %v", err))
-	}
-
-	sum := sha256.Sum256(payload)
-
-	return hex.EncodeToString(sum[:])
-}
-
-func configMapPayloadChanged(oldConfig, newConfig *corev1.ConfigMap) bool {
-	return configMapPayloadHash(oldConfig) != configMapPayloadHash(newConfig)
+	return component.ConfigMapPayloadHash(config)
 }

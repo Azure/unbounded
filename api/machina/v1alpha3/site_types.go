@@ -108,6 +108,11 @@ type SiteSpec struct {
 // SiteComponents declares optional components managed by the unbounded operator.
 // Networking (unbounded-net) is not a component: it is a cluster singleton the
 // operator deploys whenever at least one Site exists.
+//
+// Each field corresponds to a component reconciler registered with the operator.
+// To add a new component, add a typed field here and implement
+// component.ClusterComponent or component.SiteComponent in a package under
+// internal/operator/components, then register it in operator.DefaultRegistry.
 type SiteComponents struct {
 	// Machina configures the machina controller for this site.
 	// +optional

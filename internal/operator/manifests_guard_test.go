@@ -11,6 +11,7 @@ import (
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
 	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 // TestEmbeddedManifestsHaveNoLatestImageTags guards that the component manifests
@@ -26,7 +27,7 @@ func TestEmbeddedManifestsHaveNoLatestImageTags(t *testing.T) {
 	}
 
 	for name, manifests := range sets {
-		files, err := yamlFiles(manifests)
+		files, err := component.YamlFiles(manifests)
 		if err != nil {
 			t.Fatalf("%s: list manifests: %v", name, err)
 		}
