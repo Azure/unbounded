@@ -40,7 +40,7 @@ For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded/
 
 ## Key Features
 
-- **Multi-site networking** — Transparent pod-to-pod connectivity across sites using WireGuard, GENEVE, VXLAN, IPIP, or direct routing with an eBPF or netlink dataplane.
+- **Multi-site networking** -- Transparent pod-to-pod connectivity across sites using WireGuard, GENEVE, VXLAN, IPIP, or direct routing through an eBPF dataplane.
 - **SSH-based provisioning** — Join existing Linux machines to the cluster over SSH with a single command.
 - **Cloud API provisioning** — Auto-provision instances from Nebius, CoreWeave, OCI, Azure, AWS, and others via Karpenter in response to unschedulable pods.
 - **Bare-metal PXE boot** — PXE-boot servers with integrated DHCP, TFTP, HTTP, Redfish BMC power management, and TPM 2.0 attestation.

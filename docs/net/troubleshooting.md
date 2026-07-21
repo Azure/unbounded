@@ -80,9 +80,10 @@ Each node agent exposes status on port 9998:
 
 ### Route mismatch
 
-- In eBPF mode, routes should be on unbounded0 (scope global), not on per-peer tunnel interfaces
+- Routes should be on unbounded0 (scope global), not on per-peer tunnel interfaces
 - Check: `ip route show dev unbounded0` -- should show supernet routes
-- Phantom routes on wg*/geneve0/vxlan0 that are "expected but not present" are normal in eBPF mode and should be suppressed by the annotation system
+- Phantom routes on wg*/geneve0/vxlan0 that are "expected but not present" are
+  normal and should be suppressed by the annotation system
 
 ### Migrating a node from Cilium to unbounded-net
 

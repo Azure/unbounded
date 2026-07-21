@@ -6,7 +6,7 @@ This document provides a detailed overview of unbounded-net's architecture, comp
 
 ## System Overview
 
-unbounded-net is designed to provide seamless pod-to-pod networking across multiple Kubernetes sites using encrypted (WireGuard) or unencrypted (GENEVE, VXLAN, IPIP) tunnels. The encapsulation type is selected per link scope and can be set explicitly or resolved automatically based on link characteristics. The data plane supports two modes: **eBPF** (default) and **netlink**. The eBPF dataplane uses a TC egress BPF program and LPM trie maps for tunnel endpoint resolution, while the netlink dataplane uses per-peer tunnel interfaces and kernel routing tables.
+unbounded-net is designed to provide seamless pod-to-pod networking across multiple Kubernetes sites using encrypted (WireGuard) or unencrypted (GENEVE, VXLAN, IPIP) tunnels. The encapsulation type is selected per link scope and can be set explicitly or resolved automatically based on link characteristics. The eBPF dataplane uses a TC egress BPF program and LPM trie maps for tunnel endpoint resolution.
 
 ```mermaid
 graph TB
@@ -22,7 +22,7 @@ graph TB
         CTRL --> GC
     end
 
-    subgraph "Data Plane (eBPF mode)"
+    subgraph "Data Plane"
         subgraph "Node 1"
             NA1[Node Agent]
             UB1[unbounded0<br/>dummy NOARP]
@@ -271,9 +271,9 @@ Routes are programmed directly into the kernel via netlink using nexthop objects
 The node agent supports multiple encapsulation types for tunnel links:
 
 - **WireGuard**: Encrypted tunneling using the WireGuard protocol. Used by default for links that traverse untrusted networks (external/public IPs). Overhead: 80 bytes (IPv6 worst case).
-- **GENEVE**: Unencrypted Generic Network Virtualization Encapsulation. Used by default for links using only internal IPs (same-site, network-peered sites, internal gateway pools). Overhead: 58 bytes. A single `geneve0` interface with FDB entries handles all GENEVE peers for higher throughput on high-bandwidth links.
+- **GENEVE**: Unencrypted Generic Network Virtualization Encapsulation. Used by default for links using only internal IPs (same-site, network-peered sites, internal gateway pools). Overhead: 58 bytes. Uses the shared flow-based `geneve0` interface.
 - **VXLAN**: VXLAN encapsulation using a single external flow-based `vxlan0` interface. Similar overhead to GENEVE (~58 bytes). Useful when the underlying network has better VXLAN hardware offload support.
-- **IPIP**: IP-in-IP tunneling with minimal overhead (20 bytes). Uses per-peer tunnel interfaces. Best for environments where encryption is not needed and minimal encapsulation overhead is desired.
+- **IPIP**: IP-in-IP tunneling with minimal overhead (20 bytes). Uses the shared flow-based `ipip0` interface. Best for environments where encryption is not needed and minimal encapsulation overhead is desired.
 - **None**: Direct routing with no encapsulation. Requires L3 reachability between nodes. Zero overhead but no isolation.
 - **Auto**: System selects based on link characteristics. Links using external IPs resolve to WireGuard; links using only internal IPs resolve to GENEVE (configurable via `--preferred-private-encap` and `--preferred-public-encap` flags).
 
@@ -386,7 +386,7 @@ The node agent reconciles BPF map entries whenever the desired peer state change
 
 #### Shared Tunnel Interfaces
 
-In eBPF mode, tunnel interfaces are shared across all peers of the same type:
+Tunnel interfaces are shared across all peers of the same type:
 
 - **`geneve0`**: Flow-based GENEVE interface. BPF sets the remote endpoint and VNI via `bpf_skb_set_tunnel_key()`.
 - **`vxlan0`**: Flow-based VXLAN interface. Same metadata-driven approach as GENEVE.
@@ -426,7 +426,7 @@ The `unroute` tool (`cmd/unroute/main.go`) is a diagnostic utility for the eBPF 
 
 ## Data Flow
 
-### Pod-to-Pod Communication (Same Site, eBPF mode)
+### Pod-to-Pod Communication (Same Site)
 
 ```mermaid
 sequenceDiagram
@@ -750,7 +750,7 @@ flowchart LR
 | **Link Manager** | Network interfaces | Creates/updates interfaces; removes stale gateway interfaces |
 | **Masquerade Manager** | iptables NAT rules | Compares current vs desired rules; only adds/removes differences |
 | **ECMP Route Manager** | Multi-path routes | Adds/removes gateways from ECMP nexthop groups |
-| **BPF Map Reconciler** | LPM trie entries (eBPF mode) | Iterates existing map entries; deletes stale, upserts changed, keeps matching |
+| **BPF Map Reconciler** | LPM trie entries | Iterates existing map entries; deletes stale, upserts changed, keeps matching |
 
 This approach ensures:
 - No unnecessary interface flapping
@@ -766,7 +766,7 @@ Multiple gateway interfaces enable kernel-level ECMP load balancing via netlink 
 - Nexthop groups provide ECMP across multiple gateway interfaces
 - Kernel automatically distributes traffic per-flow (same flow = same path)
 
-In eBPF dataplane mode, BPF-level ECMP is also available. Each LPM trie entry
+BPF-level ECMP is also available. Each LPM trie entry
 supports up to 4 nexthops per CIDR prefix with **HRW (Highest Random Weight)**
 consistent hashing. HRW selects a nexthop per 5-tuple flow so that when a
 nexthop fails, only flows assigned to that nexthop are rehashed. Each nexthop

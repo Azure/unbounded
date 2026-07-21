@@ -13,10 +13,10 @@ For configuration details, see
 ### Prerequisites
 
 1. **Kubernetes cluster** (1.24+)
-2. **WireGuard** kernel module on all nodes (for encrypted tunnels), or
-   eBPF/TC kernel support (for GENEVE/VXLAN/IPIP tunnels)
-3. Container runtime with CNI support
-4. Network connectivity between sites (UDP ports)
+2. eBPF/TC kernel support on all nodes
+3. **WireGuard** kernel module on nodes that use encrypted tunnels
+4. Container runtime with CNI support
+5. Network connectivity between sites (UDP ports)
 
 ### Verifying WireGuard Support
 
@@ -118,18 +118,18 @@ All pods carry `prometheus.io/*` annotations for automatic discovery.
 
 ### Viewing Tunnel Status
 
-**WireGuard mode:**
+**WireGuard status:**
 ```bash
 wg show all
 ```
 
-**eBPF mode -- verify BPF attachment:**
+**Verify BPF attachment:**
 ```bash
 tc filter show dev unbounded0 egress
 # Expected: bpf filter with "unbounded_encap direct-action"
 ```
 
-**eBPF mode -- dump BPF maps:**
+**Dump BPF maps:**
 ```bash
 bpftool map list | grep unbounded
 bpftool map dump name unb_endpts
@@ -201,7 +201,7 @@ procedure.
 
 ### Interface Verification
 
-**eBPF mode:**
+**Dataplane interfaces:**
 ```bash
 ip link show unbounded0       # Should have NOARP flag
 ip link show geneve0          # Flow-based GENEVE (if active)
@@ -210,7 +210,7 @@ ip link show ipip0            # Shared IPIP (if active)
 ip route show dev unbounded0  # Supernet routes (scope global)
 ```
 
-**WireGuard mode:**
+**WireGuard interfaces:**
 ```bash
 ip link show type wireguard
 ip route show dev wg51820
