@@ -6,6 +6,7 @@ package v1alpha3
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func init() {
@@ -159,6 +160,46 @@ type ProviderOperationStatus struct {
 	ResumeToken string `json:"resumeToken,omitempty"`
 }
 
+// MachineOperationTargetInput is the immutable, controller-resolved input for
+// one MachineOperation target. It is persisted before provider execution so
+// retries do not silently adopt later desired-state changes.
+type MachineOperationTargetInput struct {
+	// ProviderRef identifies the exact provider-owned resource referenced by
+	// host.external.machineRef when the operation target was initialized.
+	// +optional
+	ProviderRef *ProviderMachineSnapshot `json:"providerRef,omitempty"`
+
+	// HostImage is the resolved provider-interpreted host image for HostReplace.
+	// An empty value instructs the provider to preserve the current image.
+	// +optional
+	HostImage string `json:"hostImage,omitempty"`
+}
+
+// ProviderMachineSnapshot identifies the exact provider-owned resource
+// observed when a MachineOperation target was initialized.
+type ProviderMachineSnapshot struct {
+	// APIGroup is the API group of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	APIGroup string `json:"apiGroup"`
+
+	// Kind is the kind of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	Kind string `json:"kind"`
+
+	// Name is the name of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// UID detects deletion and recreation of the provider-owned resource.
+	// +kubebuilder:validation:Required
+	UID types.UID `json:"uid"`
+
+	// Generation records the provider-owned resource generation whose inputs
+	// were observed.
+	// +kubebuilder:validation:Minimum=1
+	Generation int64 `json:"generation"`
+}
+
 // MachineOperationSpec defines the desired state of a MachineOperation.
 type MachineOperationSpec struct {
 	// MachineRef is the name of the Machine CR this operation targets.
@@ -264,6 +305,10 @@ type MachineOperationTargetStatus struct {
 	// ObservedGeneration is the target Machine generation acted on.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Input is the immutable provider input resolved before execution begins.
+	// +optional
+	Input *MachineOperationTargetInput `json:"input,omitempty"`
 
 	// Attempts is the number of external action attempts made for this target.
 	// Polling expected state changes does not increment this field.

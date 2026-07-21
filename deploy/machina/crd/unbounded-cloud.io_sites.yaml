@@ -96,6 +96,13 @@ spec:
                       enabled:
                         description: Enabled controls whether the component is reconciled.
                         type: boolean
+                      replicas:
+                        description: |-
+                          Replicas is the desired number of Metalman replicas. Defaults to 1 when
+                          omitted.
+                        format: int32
+                        minimum: 0
+                        type: integer
                     type: object
                   storage:
                     description: Storage configures the unbounded-storage supervisor

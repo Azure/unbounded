@@ -110,13 +110,16 @@ const (
 )
 
 // MachineSpec defines the desired state of a Machine.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)",message="provider is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))",message="host ownership cannot be combined with legacy pxe, provider, or providerID fields"
 type MachineSpec struct {
 	// SSH contains the SSH connection and credential details for the
 	// machine.
 	// +optional
 	SSH *SSHSpec `json:"ssh,omitempty"`
 
-	// PXE contains PXE boot configuration for the machine.
+	// PXE contains legacy PXE boot configuration for the machine. New callers
+	// should use Host.Netboot.
 	// +optional
 	PXE *PXESpec `json:"pxe,omitempty"`
 
@@ -128,7 +131,8 @@ type MachineSpec struct {
 	// +optional
 	Agent *AgentSpec `json:"agent,omitempty"`
 
-	// Provider identifies the external control provider for this machine.
+	// Provider identifies the legacy external control provider for this machine.
+	// New callers should use Host.External.Provider or Host.Azure.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	Provider string `json:"provider,omitempty"`
@@ -136,8 +140,17 @@ type MachineSpec struct {
 	// ProviderID identifies the underlying infrastructure resource for this
 	// machine, using a Kubernetes-style provider ID such as
 	// azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
+	//
+	// This is a legacy field. New callers should use Host.External.ProviderID,
+	// Host.External.MachineRef, or Host.Azure.ResourceID.
 	// +optional
 	ProviderID string `json:"providerID,omitempty"`
+
+	// Host contains desired host settings and exactly one optional host owner.
+	// New Machines should set one of Netboot, Azure, or External. Image alone
+	// may be used with deprecated ownership fields during migration.
+	// +optional
+	Host *HostSpec `json:"host,omitempty"`
 
 	// ConfigurationRef references a MachineConfiguration (and
 	// optionally a specific version) that defines the configuration
@@ -147,6 +160,95 @@ type MachineSpec struct {
 	// controller.
 	// +optional
 	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
+}
+
+// ProviderMachineReference identifies a cluster-scoped provider-owned Machine
+// resource used by an external host provider. API version is intentionally
+// omitted so providers can evolve served versions without rewriting Machines.
+type ProviderMachineReference struct {
+	// APIGroup is the API group of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	APIGroup string `json:"apiGroup"`
+
+	// Kind is the kind of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Kind string `json:"kind"`
+
+	// Name is the name of the cluster-scoped provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// HostSpec contains desired host settings and its mutually exclusive owner.
+// +kubebuilder:validation:XValidation:rule="(has(self.netboot) ? 1 : 0) + (has(self.azure) ? 1 : 0) + (has(self.external) ? 1 : 0) <= 1",message="at most one of netboot, azure, or external may be set"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.netboot) || has(self.netboot)",message="netboot host ownership is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.azure) || has(self.azure)",message="azure host ownership is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.external) || has(self.external)",message="external host ownership is immutable once set"
+type HostSpec struct {
+	// Image is an opaque provider-interpreted image identifier. If omitted,
+	// HostReplace preserves the host's current image.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Netboot contains the machine-specific network boot configuration owned by
+	// Metalman.
+	// +optional
+	Netboot *PXESpec `json:"netboot,omitempty"`
+
+	// Azure identifies an Azure VM managed by the built-in Azure provider.
+	// +optional
+	Azure *AzureHostSpec `json:"azure,omitempty"`
+
+	// External identifies a host managed by a registered external provider.
+	// +optional
+	External *ExternalHostSpec `json:"external,omitempty"`
+}
+
+// AzureHostSpec identifies one Azure virtual machine.
+// +kubebuilder:validation:XValidation:rule="self.resourceID == oldSelf.resourceID",message="resourceID is immutable"
+type AzureHostSpec struct {
+	// ResourceID is the full Azure Resource Manager ID of the virtual machine.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	ResourceID string `json:"resourceID"`
+}
+
+// ExternalHostSpec identifies a host owned by a registered external provider.
+// +kubebuilder:validation:XValidation:rule="has(self.providerID) || has(self.machineRef)",message="providerID or machineRef is required"
+// +kubebuilder:validation:XValidation:rule="has(self.machineRef) == has(oldSelf.machineRef) && (!has(self.machineRef) || self.machineRef == oldSelf.machineRef)",message="machineRef is immutable"
+// +kubebuilder:validation:XValidation:rule="self.provider == oldSelf.provider",message="provider is immutable"
+type ExternalHostSpec struct {
+	// Provider selects the registered provider controller and its credentials.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Provider string `json:"provider"`
+
+	// ProviderID is an opaque provider-specific host identifier. Providers that
+	// replace the underlying resource may update it after a successful handoff.
+	// +optional
+	ProviderID string `json:"providerID,omitempty"`
+
+	// MachineRef identifies an optional provider-owned resource containing rich
+	// provider-specific state for this Machine.
+	// +optional
+	MachineRef *ProviderMachineReference `json:"machineRef,omitempty"`
+}
+
+// Netboot returns the canonical network boot configuration, falling back to
+// the released spec.pxe field for existing Machines.
+func (s *MachineSpec) Netboot() *PXESpec {
+	if s == nil {
+		return nil
+	}
+
+	if s.Host != nil && s.Host.Netboot != nil {
+		return s.Host.Netboot
+	}
+
+	return s.PXE
 }
 
 // External provider names.
@@ -326,9 +428,9 @@ const (
 	PXEArchitectureAMD64 = "amd64"
 	// PXEArchitectureARM64 is the aarch64 target architecture for PXE boot.
 	PXEArchitectureARM64 = "arm64"
-	// DefaultPXEArchitecture is used when spec.pxe.architecture is omitted.
+	// DefaultPXEArchitecture is used when host.netboot.architecture is omitted.
 	DefaultPXEArchitecture = PXEArchitectureAMD64
-	// DefaultPXEBootProtocol is used when spec.pxe.bootProtocol is omitted.
+	// DefaultPXEBootProtocol is used when host.netboot.bootProtocol is omitted.
 	DefaultPXEBootProtocol = PXEBootProtocolPXE
 )
 

@@ -45,6 +45,7 @@ type AgentConfig struct {
 	Kubelet  AgentKubeletConfig `json:"Kubelet"`
 	CRI      CRIConfig          `json:"CRI"`
 	CNI      CNIConfig          `json:"CNI"`
+	Gantry   *GantryConfig      `json:"Gantry,omitempty"`
 
 	// OCIImage is the fully-qualified OCI image reference (e.g.
 	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
@@ -73,6 +74,14 @@ type AgentConfig struct {
 // agent installs into the nspawn rootfs.
 type AgentOfflineArtifacts struct {
 	Source string `json:"Source,omitempty"`
+}
+
+// GantryConfig holds optional Gantry integration settings.
+type GantryConfig struct {
+	// Disabled skips writing the default containerd hosts.toml that points at
+	// Gantry. This is a breakglass setting for environments that need to own
+	// containerd registry routing independently.
+	Disabled bool `json:"Disabled,omitempty"`
 }
 
 // AdditionalHostMount configures a host path bind mount for the nspawn
@@ -158,7 +167,11 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
+
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
+	if a.Gantry != nil {
+		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
+	}
 
 	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 

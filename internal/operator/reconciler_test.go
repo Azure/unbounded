@@ -877,11 +877,17 @@ func TestMutateMetalmanSupportObject(t *testing.T) {
 func TestMetalmanDeployment(t *testing.T) {
 	enabled := true
 	dhcpAuto := true
+	replicas := int32(3)
 	site := &unboundedv1alpha3.Site{
-		ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "rack-a",
+			UID:    "site-uid",
+			Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "lab-rack-a"},
+		},
 		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
 			SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled},
 			DHCPAutoInterface: &dhcpAuto,
+			Replicas:          &replicas,
 		}}},
 	}
 
@@ -901,6 +907,22 @@ func TestMetalmanDeployment(t *testing.T) {
 
 	if got := container.Args; len(got) != 3 || got[0] != "serve-pxe" || got[1] != "--site=rack-a" || got[2] != "--dhcp-auto-interface" {
 		t.Fatalf("args = %#v", got)
+	}
+
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 3 {
+		t.Fatalf("replicas = %v, want 3", deployment.Spec.Replicas)
+	}
+
+	if got := deployment.Labels[unboundedv1alpha3.MachineSiteLabelKey]; got != "rack-a" {
+		t.Fatalf("deployment site label = %q, want rack-a", got)
+	}
+
+	if got := deployment.Spec.Selector.MatchLabels[unboundedv1alpha3.MachineSiteLabelKey]; got != "rack-a" {
+		t.Fatalf("selector site label = %q, want rack-a", got)
+	}
+
+	if got := deployment.Spec.Template.Labels[unboundedv1alpha3.MachineSiteLabelKey]; got != "rack-a" {
+		t.Fatalf("pod site label = %q, want rack-a", got)
 	}
 
 	// POD_NAMESPACE is sourced from the Downward API so the lease/RBAC stay
@@ -947,6 +969,35 @@ func TestMetalmanDeploymentRespectsNamespace(t *testing.T) {
 	deployment := metalmanDeployment(site, "custom-ns", Config{MetalmanImage: "example/metalman:default"})
 	if deployment.Namespace != "custom-ns" {
 		t.Fatalf("namespace = %q, want custom-ns", deployment.Namespace)
+	}
+
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 1 {
+		t.Fatalf("replicas = %v, want default 1", deployment.Spec.Replicas)
+	}
+
+	if got := deployment.Spec.Template.Spec.Containers[0].Args[1]; got != "--site=rack-a" {
+		t.Fatalf("site argument = %q, want --site=rack-a", got)
+	}
+
+	if got := deployment.Labels[unboundedv1alpha3.MachineSiteLabelKey]; got != "rack-a" {
+		t.Fatalf("deployment site label = %q, want rack-a", got)
+	}
+}
+
+func TestMetalmanDeploymentAllowsZeroReplicas(t *testing.T) {
+	enabled := true
+	replicas := int32(0)
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+			SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled},
+			Replicas:          &replicas,
+		}}},
+	}
+
+	deployment := metalmanDeployment(site, DefaultNamespace, Config{MetalmanImage: "example/metalman:default"})
+	if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 0 {
+		t.Fatalf("replicas = %v, want 0", deployment.Spec.Replicas)
 	}
 }
 

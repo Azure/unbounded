@@ -59,6 +59,7 @@ func AddToManager(mgr ctrl.Manager, providers []*machineops.Provider, options Op
 
 	reconciler := &internalmachineops.MachineOperationReconciler{
 		Client:                      directClient,
+		RESTMapper:                  mgr.GetRESTMapper(),
 		Providers:                   providers,
 		SiteName:                    options.SiteName,
 		ProviderName:                options.ProviderName,

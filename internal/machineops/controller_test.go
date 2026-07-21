@@ -13,7 +13,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,6 +33,11 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Generation = 3
+	machine.Spec.Provider = ""
+	machine.Spec.ProviderID = ""
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{Azure: &unboundedv1alpha3.AzureHostSpec{
+		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1",
+	}}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
 	credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
@@ -53,6 +60,147 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
 	require.NotNil(t, cond)
 	require.Equal(t, metav1.ConditionTrue, cond.Status)
+}
+
+func TestMachineOperationReconciler_SnapshotsProviderRefAndHostImage(t *testing.T) {
+	t.Parallel()
+
+	const (
+		providerGroup = "infrastructure.example.io"
+		providerKind  = "ExampleMachine"
+	)
+
+	s := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(s))
+
+	machine := newExternalMachine("machine-1", "ExampleCloud")
+	machine.UID = "machine-uid"
+	machine.Generation = 7
+	machine.Spec.Provider = ""
+	machine.Spec.ProviderID = ""
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
+		Image: "image-v2",
+		External: &unboundedv1alpha3.ExternalHostSpec{
+			Provider: "ExampleCloud",
+			MachineRef: &unboundedv1alpha3.ProviderMachineReference{
+				APIGroup: providerGroup,
+				Kind:     providerKind,
+				Name:     "provider-machine-1",
+			},
+		},
+	}
+	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{
+		BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"},
+	}
+
+	op := newMachineOperation("op-1", machine.Name, unboundedv1alpha3.OperationHostReplace)
+	credential := newWorkloadIdentityCredential("cred-a", "site-a", machine.Spec.Host.External.Provider)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: "bootstrap-token-test"},
+		Data: map[string][]byte{
+			"token-id":     []byte("abc123"),
+			"token-secret": []byte("secret456"),
+		},
+	}
+
+	providerMachine := &unstructured.Unstructured{}
+	providerMachine.SetAPIVersion(providerGroup + "/v1alpha1")
+	providerMachine.SetKind(providerKind)
+	providerMachine.SetName(machine.Spec.Host.External.MachineRef.Name)
+	providerMachine.SetUID("provider-machine-uid")
+	providerMachine.SetGeneration(4)
+
+	groupVersion := schema.GroupVersion{Group: providerGroup, Version: "v1alpha1"}
+	restMapper := apimeta.NewDefaultRESTMapper([]schema.GroupVersion{groupVersion})
+	restMapper.AddSpecific(
+		groupVersion.WithKind(providerKind),
+		groupVersion.WithResource("examplemachines"),
+		groupVersion.WithResource("examplemachine"),
+		apimeta.RESTScopeRoot,
+	)
+
+	groupKind := schema.GroupKind{Group: providerGroup, Kind: providerKind}
+	provider := &recordingProvider{
+		provider:            machine.Spec.Host.External.Provider,
+		providerMachineKind: &groupKind,
+		supported:           map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReplace: true},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, op, credential, secret, providerMachine).
+		WithStatusSubresource(op).
+		Build()
+	reconciler := &MachineOperationReconciler{
+		Client:      c,
+		RESTMapper:  restMapper,
+		Providers:   []*Provider{newRecordingProviderRegistration(provider)},
+		Now:         fixedOperationNow,
+		ClusterInfo: testClusterInfo(),
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Len(t, provider.requests, 1)
+
+	request := provider.requests[0]
+	require.Empty(t, request.ProviderID)
+	require.Equal(t, machine.UID, request.MachineUID)
+	require.Equal(t, machine.Generation, request.MachineGeneration)
+	require.Equal(t, "image-v2", request.HostImage)
+	require.Equal(t, &unboundedv1alpha3.ProviderMachineSnapshot{
+		APIGroup:   providerGroup,
+		Kind:       providerKind,
+		Name:       providerMachine.GetName(),
+		UID:        providerMachine.GetUID(),
+		Generation: providerMachine.GetGeneration(),
+	}, request.ProviderRef)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Len(t, updated.Status.Targets, 1)
+	require.Equal(t, request.ProviderRef, updated.Status.Targets[0].Input.ProviderRef)
+	require.Equal(t, request.HostImage, updated.Status.Targets[0].Input.HostImage)
+}
+
+func TestMachineOperationReconciler_RejectsMismatchedProviderRefKind(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", "ExampleCloud")
+	machine.Spec.Provider = ""
+	machine.Spec.ProviderID = ""
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
+		External: &unboundedv1alpha3.ExternalHostSpec{
+			Provider: "ExampleCloud",
+			MachineRef: &unboundedv1alpha3.ProviderMachineReference{
+				APIGroup: "infrastructure.other.io",
+				Kind:     "OtherMachine",
+				Name:     "machine-1",
+			},
+		},
+	}
+
+	op := newMachineOperation("op-1", machine.Name, unboundedv1alpha3.OperationHostReboot)
+	groupKind := schema.GroupKind{Group: "infrastructure.example.io", Kind: "ExampleMachine"}
+	provider := &recordingProvider{
+		provider:            machine.Spec.Host.External.Provider,
+		providerMachineKind: &groupKind,
+		supported:           map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
+	require.Contains(t, updated.Status.Message, "not OtherMachine.infrastructure.other.io")
 }
 
 func TestMachineOperationReconciler_SkipsOperationForDifferentSite(t *testing.T) {
@@ -554,7 +702,12 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Provider = ""
+	machine.Spec.ProviderID = ""
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{
+		Provider:   unboundedv1alpha3.ExternalProviderOCIInstance,
+		ProviderID: "oci://old-instance",
+	}}
 	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	secret := &corev1.Secret{
@@ -593,7 +746,7 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 
 	var updatedMachine unboundedv1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-1"}, &updatedMachine))
-	require.Equal(t, "oci://new-instance", updatedMachine.Spec.ProviderID)
+	require.Equal(t, "oci://new-instance", updatedMachine.Spec.Host.External.ProviderID)
 	require.Equal(t, []string{"HostReplace:machine-1:oci://old-instance"}, provider.calls)
 	require.Equal(t, []string{"HostReplace:machine-1:oci://old-instance"}, provider.cleanupCalls)
 
@@ -790,19 +943,23 @@ func TestShouldReconcileOperationUpdateIgnoresNonterminalStatusWrites(t *testing
 }
 
 type recordingProvider struct {
-	provider        string
-	supported       map[unboundedv1alpha3.OperationKind]bool
-	calls           []string
-	cleanupCalls    []string
-	replaceUserData []string
-	authModes       []unboundedv1alpha3.MachineOperationCredentialAuthMode
-	authData        []map[string]string
-	result          OperationResult
-	err             error
-	cleanupErr      error
+	provider            string
+	providerMachineKind *schema.GroupKind
+	supported           map[unboundedv1alpha3.OperationKind]bool
+	calls               []string
+	requests            []OperationRequest
+	cleanupCalls        []string
+	replaceUserData     []string
+	authModes           []unboundedv1alpha3.MachineOperationCredentialAuthMode
+	authData            []map[string]string
+	result              OperationResult
+	err                 error
+	cleanupErr          error
 }
 
 func (p *recordingProvider) Execute(_ context.Context, request OperationRequest) (OperationResult, error) {
+	p.requests = append(p.requests, request)
+
 	p.calls = append(p.calls, fmt.Sprintf("%s:%s:%s", request.Operation, request.MachineName, request.ProviderID))
 	if request.ReplaceUserData != "" {
 		p.replaceUserData = append(p.replaceUserData, request.ReplaceUserData)
@@ -822,7 +979,11 @@ func (p *recordingProvider) Cleanup(_ context.Context, request OperationRequest,
 }
 
 func newRecordingProviderRegistration(provider *recordingProvider) *Provider {
-	options := make([]publicmachineops.ProviderOption, 0, len(provider.supported))
+	options := make([]publicmachineops.ProviderOption, 0, len(provider.supported)+1)
+	if provider.providerMachineKind != nil {
+		options = append(options, publicmachineops.WithProviderMachineKind(*provider.providerMachineKind))
+	}
+
 	for _, kind := range []unboundedv1alpha3.OperationKind{
 		unboundedv1alpha3.OperationNodeReboot,
 		unboundedv1alpha3.OperationHostReboot,

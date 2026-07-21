@@ -15,10 +15,16 @@ import (
 
 // OperationRequest is the generic provider-facing view of a MachineOperation.
 type OperationRequest struct {
-	MachineName     string
-	OperationName   string
-	OperationUID    types.UID
+	MachineName       string
+	MachineUID        types.UID
+	MachineGeneration int64
+	OperationName     string
+	OperationUID      types.UID
+	// ProviderRef snapshots Machine.spec.host.external.machineRef when present.
+	ProviderRef *unboundedv1alpha3.ProviderMachineSnapshot
+	// ProviderID is the current canonical or legacy provider-specific host ID.
 	ProviderID      string
+	HostImage       string
 	Operation       unboundedv1alpha3.OperationKind
 	Parameters      map[string]string
 	ReplaceUserData string

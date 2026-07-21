@@ -148,9 +148,12 @@ at all.
 
 Metalman uses two OCI images when repaving a machine:
 
-- `spec.pxe.image` is the machine image. It contains `/disk/disk.img.gz`, a
+Existing Machines may continue to use the deprecated top-level `spec.pxe`
+shape; Metalman resolves both forms through the same compatibility accessor.
+
+- `spec.host.netboot.image` is the machine image. It contains `/disk/disk.img.gz`, a
   gzip-compressed raw disk image written to the target disk.
-- `spec.pxe.netbootImage` is the reusable PXE boot environment. It contains
+- `spec.host.netboot.netbootImage` is the reusable PXE boot environment. It contains
   bootloaders, kernel, initrd, templates, and metadata. Its cloud-init template
   downloads and installs `unbounded-agent` from the configured release/source.
   If omitted, Metalman uses the release-matched `--default-netboot-image`.
@@ -195,11 +198,11 @@ spec:
 ```
 
 This is enough for the DHCP server to issue a lease and for TFTP/HTTP to serve
-boot artifacts from the default netboot image. Set `spec.pxe.netbootImage` only
+boot artifacts from the default netboot image. Set `spec.host.netboot.netbootImage` only
 when a Machine needs a non-default PXE boot environment. The node must be
 manually PXE-booted (or have PXE as its default boot option).
 
-When `spec.pxe.bootProtocol` is `HTTP`, `dhcpLeases` also supplies the static
+When `spec.host.netboot.bootProtocol` is `HTTP`, `dhcpLeases` also supplies the static
 UEFI HTTP boot client configuration. Metalman uses Redfish to disable DHCPv4 on
 the host EthernetInterface matching the first lease MAC and writes that lease's
 IPv4 address, subnet mask, gateway, and DNS servers before setting the UEFI HTTP
@@ -214,7 +217,7 @@ the installer network without DHCP, and writes matching MAC-based static netplan
 configuration into the installed system before its first boot. It disables
 cloud-init network rendering so fallback DHCP configuration cannot conflict with
 that file. The default netboot image serves the same lease as NoCloud
-`network-config`. If `spec.pxe.targetDisk` is
+`network-config`. If `spec.host.netboot.targetDisk` is
 set, the installer writes the image to that disk; otherwise it falls back to
 automatic disk selection.
 
@@ -264,6 +267,6 @@ kubectl unbounded machine repave node-01
 ```
 
 This creates a `HostReplace` `MachineOperation`. Metalman handles the rest: it
-configures the boot override for the selected `spec.pxe.bootProtocol`, executes
+configures the boot override for the selected `spec.host.netboot.bootProtocol`, executes
 a Redfish force restart, waits for the installer `/pxe/disable` signal, tracks
 first-boot cloud-init on the operation, and completes after the node is back up.

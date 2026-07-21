@@ -92,11 +92,6 @@ func run(ctx context.Context, cfg config) error {
 		return errors.New(errSiteProviderPair)
 	}
 
-	providers, err := configuredProviders(cfg.providerName)
-	if err != nil {
-		return err
-	}
-
 	restConfig := ctrl.GetConfigOrDie()
 	scheme := runtimeScheme()
 
@@ -111,6 +106,11 @@ func run(ctx context.Context, cfg config) error {
 	})
 	if err != nil {
 		return fmt.Errorf("create manager: %w", err)
+	}
+
+	providers, err := configuredProviders(cfg.providerName)
+	if err != nil {
+		return err
 	}
 
 	if err := machineopscontroller.AddToManager(mgr, providers, machineopscontroller.Options{
@@ -142,7 +142,9 @@ func run(ctx context.Context, cfg config) error {
 
 func configuredProviders(providerName string) ([]*machineops.Provider, error) {
 	factories := map[string]func() (*machineops.Provider, error){
-		unboundedv1alpha3.ExternalProviderAzureVM:     func() (*machineops.Provider, error) { return (&azurevm.Provider{}).Registration() },
+		unboundedv1alpha3.ExternalProviderAzureVM: func() (*machineops.Provider, error) {
+			return (&azurevm.Provider{}).Registration()
+		},
 		unboundedv1alpha3.ExternalProviderOCIInstance: func() (*machineops.Provider, error) { return (&ociinstance.Provider{}).Registration() },
 	}
 

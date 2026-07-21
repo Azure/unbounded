@@ -26,7 +26,15 @@ var assets embed.FS
 
 var assetsTemplate = template.Must(template.New("assets").ParseFS(assets, "assets/*"))
 
-const nvidiaRuntimeDropInName = "99-nvidia-runtime.toml"
+const (
+	nvidiaRuntimeDropInName  = "99-nvidia-runtime.toml"
+	gantryHostsManagedMarker = "# Managed by unbounded-agent for Gantry."
+	gantryHostsConfig        = gantryHostsManagedMarker + `
+[host."http://127.0.0.1:5000"]
+  capabilities = ["pull", "resolve"]
+  dial_timeout = "200ms"
+`
+)
 
 type configureContainerd struct {
 	goalState *goalstates.NodeStart
@@ -44,6 +52,12 @@ func (c *configureContainerd) Name() string { return "configure-containerd" }
 func (c *configureContainerd) Do(_ context.Context) error {
 	if err := c.ensureContainerdConfig(); err != nil {
 		return fmt.Errorf("ensure containerd config: %w", err)
+	}
+
+	if !c.goalState.Gantry.Disabled {
+		if err := c.ensureGantryHostsConfig(); err != nil {
+			return fmt.Errorf("ensure Gantry containerd hosts config: %w", err)
+		}
 	}
 
 	if err := c.ensureContainerdServiceUnit(); err != nil {
@@ -76,6 +90,37 @@ func (c *configureContainerd) ensureContainerdConfig() error {
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.ContainerdConfigPath)
 
 	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
+}
+
+func (c *configureContainerd) ensureGantryHostsConfig() error {
+	dest := filepath.Join(c.goalState.MachineDir, goalstates.ContainerdDefaultHostsPath)
+
+	existing, err := os.ReadFile(dest)
+	switch {
+	case err == nil:
+		if !hasGantryHostsManagedMarker(existing) {
+			return fmt.Errorf("refusing to overwrite unmanaged containerd hosts file %s", goalstates.ContainerdDefaultHostsPath)
+		}
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+
+	return utilio.WriteFile(dest, []byte(gantryHostsConfig), 0o644)
+}
+
+func hasGantryHostsManagedMarker(content []byte) bool {
+	for _, line := range bytes.Split(content, []byte{'\n'}) {
+		if string(bytes.TrimSpace(line)) == gantryHostsManagedMarker {
+			return true
+		}
+	}
+
+	return false
 }
 
 // ensureContainerdServiceUnit renders and writes the containerd systemd unit

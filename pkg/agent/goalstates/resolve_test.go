@@ -371,6 +371,25 @@ func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
 	assert.Equal(t, "machine-1", got.NodeStart.KubeMachineName)
 }
 
+func TestResolveMachine_GantryDisabled(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+		Gantry: &config.GantryConfig{Disabled: true},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+
+	assert.True(t, got.NodeStart.Gantry.Disabled)
+}
+
 func TestResolveMachine_AdditionalHostDevices(t *testing.T) {
 	cfg := &config.AgentConfig{
 		MachineName:           "machine-1",

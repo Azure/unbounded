@@ -1,0 +1,302 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm
+  labels:
+    app.kubernetes.io/name: vllm
+    app.kubernetes.io/component: inference
+spec:
+  replicas: 1
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdateConfiguration:
+      maxSurge: 0
+      maxUnavailable: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: vllm
+          app.kubernetes.io/component: leader
+      spec:
+        serviceAccountName: vllm
+        automountServiceAccountToken: false
+        enableServiceLinks: false
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        terminationGracePeriodSeconds: 120
+        nodeSelector:
+          accelerator: nvidia
+          sku: gpu
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: vllm
+                topologyKey: kubernetes.io/hostname
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 2000
+          runAsGroup: 0
+          fsGroup: 0
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+          - name: vllm
+            image: docker.io/vllm/vllm-openai:v0.25.1
+            imagePullPolicy: IfNotPresent
+            command:
+              - /bin/bash
+              - -ceu
+              - ulimit -l unlimited; exec setpriv --reuid=2000 --regid=0 --clear-groups vllm serve "$@"
+              - --
+            args:
+              - Qwen/Qwen3-235B-A22B
+              - --revision
+              - 8efa61729e24bd65b1d152b5ab5409052aa80e65
+              - --tokenizer-revision
+              - 8efa61729e24bd65b1d152b5ab5409052aa80e65
+              - --served-model-name
+              - qwen
+              - --host
+              - 0.0.0.0
+              - --port
+              - "8000"
+              - --tensor-parallel-size
+              - "8"
+              - --pipeline-parallel-size
+              - "2"
+              - --nnodes
+              - $(LWS_GROUP_SIZE)
+              - --node-rank
+              - $(LWS_WORKER_INDEX)
+              - --master-addr
+              - $(LWS_LEADER_ADDRESS)
+              - --distributed-timeout-seconds
+              - "3600"
+              - --dtype
+              - bfloat16
+              - --max-model-len
+              - "32768"
+              - --gpu-memory-utilization
+              - "0.90"
+              - --max-num-seqs
+              - "256"
+              - --max-num-batched-tokens
+              - "8192"
+              - --enable-chunked-prefill
+              - --enable-expert-parallel
+              - --generation-config
+              - vllm
+              - --reasoning-parser
+              - qwen3
+              - --enable-auto-tool-choice
+              - --tool-call-parser
+              - hermes
+              - --disable-access-log-for-endpoints
+              - /health,/metrics
+            env:
+              - name: HF_HOME
+                value: /cache/huggingface
+              - name: VLLM_CACHE_ROOT
+                value: /cache/vllm
+              - name: XDG_CACHE_HOME
+                value: /cache/xdg
+              - name: TMPDIR
+                value: /cache
+              - name: HOME
+                value: /home/vllm
+              - name: NCCL_DEBUG
+                value: WARN
+              - name: GLOO_SOCKET_IFNAME
+                value: eth0
+              - name: NCCL_SOCKET_IFNAME
+                value: eth0
+              - name: NCCL_IB_DISABLE
+                value: "0"
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: huggingface-token
+                    key: token
+                    optional: true
+            ports:
+              - name: http
+                containerPort: 8000
+                protocol: TCP
+            startupProbe:
+              httpGet:
+                path: /health
+                port: http
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 360
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: http
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 3
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: http
+              periodSeconds: 30
+              timeoutSeconds: 10
+              failureThreshold: 6
+            resources:
+              requests:
+                cpu: "88"
+                memory: 760Gi
+                nvidia.com/gpu: "8"
+              limits:
+                nvidia.com/gpu: "8"
+            securityContext:
+              privileged: true
+              runAsNonRoot: false
+              runAsUser: 0
+            volumeMounts:
+              - name: cache
+                mountPath: /cache
+              - name: shm
+                mountPath: /dev/shm
+        volumes:
+          - name: cache
+            hostPath:
+              path: /mnt/inference-cache/vllm-cache
+              type: Directory
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 32Gi
+    workerTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: vllm
+          app.kubernetes.io/component: worker
+      spec:
+        serviceAccountName: vllm
+        automountServiceAccountToken: false
+        enableServiceLinks: false
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        terminationGracePeriodSeconds: 120
+        nodeSelector:
+          accelerator: nvidia
+          sku: gpu
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: vllm
+                topologyKey: kubernetes.io/hostname
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 2000
+          runAsGroup: 0
+          fsGroup: 0
+          seccompProfile:
+            type: RuntimeDefault
+        containers:
+          - name: vllm
+            image: docker.io/vllm/vllm-openai:v0.25.1
+            imagePullPolicy: IfNotPresent
+            command:
+              - /bin/bash
+              - -ceu
+              - ulimit -l unlimited; exec setpriv --reuid=2000 --regid=0 --clear-groups vllm serve "$@"
+              - --
+            args:
+              - Qwen/Qwen3-235B-A22B
+              - --revision
+              - 8efa61729e24bd65b1d152b5ab5409052aa80e65
+              - --tokenizer-revision
+              - 8efa61729e24bd65b1d152b5ab5409052aa80e65
+              - --tensor-parallel-size
+              - "8"
+              - --pipeline-parallel-size
+              - "2"
+              - --nnodes
+              - $(LWS_GROUP_SIZE)
+              - --node-rank
+              - $(LWS_WORKER_INDEX)
+              - --master-addr
+              - $(LWS_LEADER_ADDRESS)
+              - --distributed-timeout-seconds
+              - "3600"
+              - --dtype
+              - bfloat16
+              - --max-model-len
+              - "32768"
+              - --gpu-memory-utilization
+              - "0.90"
+              - --max-num-seqs
+              - "256"
+              - --max-num-batched-tokens
+              - "8192"
+              - --enable-chunked-prefill
+              - --enable-expert-parallel
+              - --headless
+            env:
+              - name: HF_HOME
+                value: /cache/huggingface
+              - name: VLLM_CACHE_ROOT
+                value: /cache/vllm
+              - name: XDG_CACHE_HOME
+                value: /cache/xdg
+              - name: TMPDIR
+                value: /cache
+              - name: HOME
+                value: /home/vllm
+              - name: NCCL_DEBUG
+                value: WARN
+              - name: GLOO_SOCKET_IFNAME
+                value: eth0
+              - name: NCCL_SOCKET_IFNAME
+                value: eth0
+              - name: NCCL_IB_DISABLE
+                value: "0"
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: huggingface-token
+                    key: token
+                    optional: true
+            resources:
+              requests:
+                cpu: "88"
+                memory: 760Gi
+                nvidia.com/gpu: "8"
+              limits:
+                nvidia.com/gpu: "8"
+            securityContext:
+              privileged: true
+              runAsNonRoot: false
+              runAsUser: 0
+            volumeMounts:
+              - name: cache
+                mountPath: /cache
+              - name: shm
+                mountPath: /dev/shm
+        volumes:
+          - name: cache
+            hostPath:
+              path: /mnt/inference-cache/vllm-cache
+              type: Directory
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 32Gi

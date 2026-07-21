@@ -37,7 +37,8 @@ remove the host-resident agent binary and its managed resources.
 
 `machine-ops-controller` owns cloud-provider host operations. It maps
 `HostPowerOff`, `HostPowerOn`, `HostReboot`, and `HostReplace` to provider APIs
-based on `Machine.spec.provider` and `Machine.spec.providerID`.
+based on `Machine.spec.host.azure` or `Machine.spec.host.external`. Deprecated
+top-level provider fields remain readable for existing Machines.
 
 `metalman` owns bare-metal host operations for PXE-managed machines. It uses
 Redfish/BMC control for power state and boot-order changes.

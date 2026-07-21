@@ -1,20 +1,19 @@
 # 300-Node AKS Cluster Playbook
 
-This playbook creates an AKS cluster with 300 nodes or expands an existing
-10-node cluster to 300 nodes. It uses supported AKS node-pool operations and
-checks regional SKU availability, quota, and network capacity before creating
-the large user pool.
+This playbook creates an AKS cluster with 300 nodes in a single system pool, or
+expands an existing system pool to 300 nodes. It uses supported AKS node-pool
+operations and checks regional SKU availability, quota, and network capacity
+before provisioning the pool.
 
 The validated layout is:
 
 | Pool | Mode | Nodes | Default VM size | Purpose |
 |---|---|---:|---|---|
-| `system` | System | 10 | `Standard_D8ds_v6` | Kubernetes system workloads |
-| `worker` | User | 290 | `Standard_D8ds_v6` | Application workloads |
+| `system` | System | 300 | `Standard_D8ds_v6` | All Kubernetes and application workloads |
 
 Each `Standard_D8ds_v6` node has 8 vCPUs and 32 GiB of memory. For an existing
 cluster, the system pool may use a different VM family; calculate quota demand
-for every pool being added or scaled.
+for the pool being scaled.
 
 ## Design constraints
 
@@ -26,11 +25,11 @@ for every pool being added or scaled.
 - Check the quota family reported for the exact VM SKU. Similar names can use
   different quota families. `Standard_D8ds_v6` uses
   `StandardDdsv6Family`.
-- Scale pools through `az aks nodepool add` or `az aks nodepool scale`. Do not
-  modify the AKS-managed VM scale set directly. Direct VMSS changes bypass AKS
+- Scale the system pool through `az aks nodepool scale`. Do not modify the
+  AKS-managed VM scale set directly. Direct VMSS changes bypass AKS
   reconciliation and do not bypass family quota.
 - Treat 300-node clusters as capacity-sensitive. A quota limit does not
-  guarantee that Azure has 290 instances of a SKU available at a particular
+  guarantee that Azure has 300 instances of a SKU available at a particular
   moment.
 
 ## Prerequisites
@@ -43,8 +42,8 @@ The operator needs:
 - Permission to create resource groups and AKS clusters, or to update the
   target AKS cluster and its node pools.
 - At least 2,400 free vCPUs in the selected eight-vCPU VM family for a fresh
-  cluster. Expanding an existing 10-node cluster requires 2,320 free vCPUs for
-  the 290-node worker pool.
+  cluster. Expanding an existing cluster requires 8 free vCPUs per node added to
+  reach 300 (for example, 2,320 vCPUs to grow a 10-node system pool to 300).
 - At least 300 free entries in the regional Virtual Machines quota.
 - A dedicated `KUBECONFIG` path.
 
@@ -54,7 +53,8 @@ the node count but does not provide the same control-plane service level.
 ## Set variables
 
 Set values for the target subscription and cluster. The defaults reproduce the
-validated 10+290 topology without embedding generated resource names.
+validated single-pool 300-node topology without embedding generated resource
+names.
 
 ```bash
 set -euo pipefail
@@ -70,9 +70,7 @@ KUBERNETES_VERSION="${KUBERNETES_VERSION:-1.35}"
 AKS_TIER="${AKS_TIER:-standard}"
 
 SYSTEM_POOL="${SYSTEM_POOL:-system}"
-WORKER_POOL="${WORKER_POOL:-worker}"
-SYSTEM_NODE_COUNT=10
-WORKER_NODE_COUNT=290
+SYSTEM_NODE_COUNT=300
 TARGET_NODE_COUNT=300
 
 NODE_VM_SIZE="${NODE_VM_SIZE:-Standard_D8ds_v6}"
@@ -83,8 +81,8 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/15}"
 SERVICE_CIDR="${SERVICE_CIDR:-10.0.0.0/16}"
 DNS_SERVICE_IP="${DNS_SERVICE_IP:-10.0.0.10}"
 
-if (( SYSTEM_NODE_COUNT + WORKER_NODE_COUNT != TARGET_NODE_COUNT )); then
-  echo "Pool counts do not add up to ${TARGET_NODE_COUNT}" >&2
+if (( SYSTEM_NODE_COUNT != TARGET_NODE_COUNT )); then
+  echo "System pool count must equal ${TARGET_NODE_COUNT}" >&2
   exit 1
 fi
 
@@ -107,7 +105,7 @@ Resolve the quota family and vCPU count from the exact SKU. This avoids
 assuming that similarly named VM sizes consume the same family quota.
 
 For a fresh cluster, the quota check covers all 300 nodes. When expanding an
-existing 10-node cluster, set `QUOTA_NODE_COUNT` to the 290 nodes being added
+existing system pool, set `QUOTA_NODE_COUNT` to the number of nodes being added
 before running this section:
 
 ```bash
@@ -196,7 +194,7 @@ quota or request a quota increase. Do not continue with a direct VMSS scale.
 
 ## Create a new cluster
 
-Create the resource group and the 10-node system pool. Supplying the `/15` pod
+Create the resource group and the 300-node system pool. Supplying the `/15` pod
 CIDR at creation avoids a later network-profile update.
 
 ```bash
@@ -226,8 +224,7 @@ az aks create \
   --only-show-errors
 ```
 
-Load credentials into the dedicated kubeconfig and verify the system pool
-before creating the large worker pool:
+Load credentials into the dedicated kubeconfig and verify the nodes:
 
 ```bash
 az aks get-credentials \
@@ -239,31 +236,24 @@ az aks get-credentials \
 kubectl get nodes -l agentpool="$SYSTEM_POOL"
 ```
 
-## Add the 290-node user pool
-
-Use AKS to create the user pool. Do not run `az vmss create`, `az vmss update`,
-or `az vmss scale` against the node resource group.
+Provisioning 300 nodes in one create can take a while because AKS waits for all
+VMSS instances and nodes. If Azure reports regional capacity pressure, you can
+create the cluster with a smaller `--node-count` and then scale the same system
+pool up to 300:
 
 ```bash
-az aks nodepool add \
+az aks nodepool scale \
   --resource-group "$RESOURCE_GROUP" \
   --cluster-name "$CLUSTER_NAME" \
-  --name "$WORKER_POOL" \
-  --mode User \
-  --node-count "$WORKER_NODE_COUNT" \
-  --node-vm-size "$NODE_VM_SIZE" \
-  --max-pods "$MAX_PODS" \
-  --node-osdisk-size "$OS_DISK_SIZE_GB" \
-  --node-osdisk-type Managed \
+  --name "$SYSTEM_POOL" \
+  --node-count "$TARGET_NODE_COUNT" \
   --only-show-errors
 ```
 
-The command can take a while because AKS waits for the VMSS instances and
-nodes. If Azure reports regional capacity pressure, leave the system pool
-intact and retry later or select another quota-rich SKU. Do not compensate by
-editing the managed VMSS.
+Do not run `az vmss create`, `az vmss update`, or `az vmss scale` against the
+node resource group. Direct VMSS changes bypass AKS reconciliation.
 
-## Expand an existing 10-node cluster
+## Expand an existing cluster
 
 Use this path only when the target cluster already exists. First verify the
 current topology and network profile:
@@ -295,14 +285,25 @@ az aks update \
   --only-show-errors
 ```
 
-Set the quota demand to the number of nodes being added, then re-run the
-commands in [Check SKU and quota](#check-sku-and-quota):
+Set the quota demand to the number of nodes being added to reach 300, then
+re-run the commands in [Check SKU and quota](#check-sku-and-quota). For example,
+to grow a 10-node system pool:
 
 ```bash
-QUOTA_NODE_COUNT="$WORKER_NODE_COUNT"
+QUOTA_NODE_COUNT=$((TARGET_NODE_COUNT - 10))
 ```
 
-Then run the `az aks nodepool add` command from the previous section.
+Then scale the system pool to 300 nodes. Do not run `az vmss create`,
+`az vmss update`, or `az vmss scale` against the node resource group.
+
+```bash
+az aks nodepool scale \
+  --resource-group "$RESOURCE_GROUP" \
+  --cluster-name "$CLUSTER_NAME" \
+  --name "$SYSTEM_POOL" \
+  --node-count "$TARGET_NODE_COUNT" \
+  --only-show-errors
+```
 
 If the existing cluster hosted a node-mutating DaemonSet, clean its host state
 before scaling. Gantry, for example, can write containerd registry mirror files
@@ -310,11 +311,11 @@ under `/etc/containerd/certs.d` and peer state under `/var/lib/gantry`. Deleting
 its namespace removes Kubernetes objects but does not remove those host files.
 Use a narrowly scoped cleanup DaemonSet against the existing nodes, verify the
 owned paths are absent on every node, and delete the cleanup DaemonSet before
-adding the worker pool.
+scaling the system pool.
 
 ## Validate the result
 
-Wait until AKS reports both pools as succeeded:
+Wait until AKS reports the system pool as succeeded:
 
 ```bash
 az aks nodepool list \
@@ -368,22 +369,22 @@ az vmss list \
 
 Expected result:
 
-- The system pool has 10 nodes.
-- The worker pool has 290 nodes.
+- The system pool has 300 nodes.
 - All 300 Kubernetes nodes report `Ready`.
-- Both AKS node pools and both managed VM scale sets report `Succeeded`.
+- The AKS node pool and its managed VM scale set report `Succeeded`.
 
-## Roll back the worker pool
+## Roll back the system pool
 
-If the worker pool must be removed, drain or relocate its workloads and delete
-the pool through AKS:
+A cluster must keep at least one system pool, so scale the pool down rather than
+deleting it. Drain or relocate workloads first, then scale through AKS:
 
 ```bash
-az aks nodepool delete \
+az aks nodepool scale \
   --resource-group "$RESOURCE_GROUP" \
   --cluster-name "$CLUSTER_NAME" \
-  --name "$WORKER_POOL" \
+  --name "$SYSTEM_POOL" \
+  --node-count 10 \
   --only-show-errors
 ```
 
-Do not delete the AKS-managed worker VMSS directly.
+Do not scale the AKS-managed VM scale set directly.

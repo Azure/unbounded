@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: guidellm-results-reader
+spec:
+  serviceAccountName: guidellm
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Always
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    runAsGroup: 1001
+    fsGroup: 1001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: reader
+      image: ghcr.io/vllm-project/guidellm:v0.7.1
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/sh
+        - -ceu
+        - trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 128Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: results
+          mountPath: /results
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: results
+      persistentVolumeClaim:
+        claimName: guidellm-results
+    - name: tmp
+      emptyDir:
+        sizeLimit: 16Mi

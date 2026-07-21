@@ -46,7 +46,7 @@ func runReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds 
 		return err
 	}
 
-	if machine.Spec.PXE == nil || machine.Spec.PXE.Redfish == nil {
+	if machine.Spec.Netboot() == nil || machine.Spec.Netboot().Redfish == nil {
 		return fmt.Errorf("machine %s has no redfish configuration; reboots require BMC access", name)
 	}
 

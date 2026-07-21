@@ -35,7 +35,7 @@ import (
 )
 
 // DefaultNetbootImage is the default netboot OCI image used when a Machine
-// omits spec.pxe.netbootImage. It is set at build time via -ldflags.
+// omits spec.host.netboot.netbootImage. It is set at build time via -ldflags.
 var DefaultNetbootImage = "netboot:latest"
 
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.

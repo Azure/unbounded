@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
@@ -42,8 +44,32 @@ type CleanupFunc func(context.Context, OperationRequest, OperationResult) error
 // Provider is an immutable registration of one provider's supported
 // MachineOperation lifecycle strategies.
 type Provider struct {
-	name       string
-	operations map[unboundedv1alpha3.OperationKind]*Operation
+	name                string
+	providerMachineKind *schema.GroupKind
+	operations          map[unboundedv1alpha3.OperationKind]*Operation
+}
+
+// WithProviderMachineKind declares the provider-owned Machine GroupKind
+// accepted through Machine.spec.host.external.machineRef. Providers may also
+// accept host.external.providerID or the deprecated Machine.spec.providerID.
+func WithProviderMachineKind(groupKind schema.GroupKind) ProviderOption {
+	return providerOptionFunc(func(provider *Provider) error {
+		if strings.TrimSpace(groupKind.Group) == "" {
+			return fmt.Errorf("provider Machine API group is required")
+		}
+
+		if strings.TrimSpace(groupKind.Kind) == "" {
+			return fmt.Errorf("provider Machine kind is required")
+		}
+
+		if provider.providerMachineKind != nil {
+			return fmt.Errorf("provider Machine kind is already registered for provider %q", provider.name)
+		}
+
+		provider.providerMachineKind = &groupKind
+
+		return nil
+	})
 }
 
 // Operation is an immutable lifecycle strategy registered for one operation
@@ -180,13 +206,24 @@ func WithCleanup(cleanup CleanupFunc) OperationOption {
 	})
 }
 
-// Name returns the external provider name matched against Machine.spec.provider.
+// Name returns the external provider name matched against
+// Machine.spec.host.external.provider or a deprecated Machine.spec.provider.
 func (p *Provider) Name() string {
 	if p == nil {
 		return ""
 	}
 
 	return p.name
+}
+
+// ProviderMachineKind returns the provider-owned Machine GroupKind declared by
+// this registration.
+func (p *Provider) ProviderMachineKind() (schema.GroupKind, bool) {
+	if p == nil || p.providerMachineKind == nil {
+		return schema.GroupKind{}, false
+	}
+
+	return *p.providerMachineKind, true
 }
 
 // Operation returns the lifecycle strategy registered for kind.
