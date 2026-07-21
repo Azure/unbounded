@@ -33,7 +33,7 @@ func TestInstallCommandFlags(t *testing.T) {
 		"kubeconfig",
 		"namespace",
 		"operator-image",
-		"metalman-image",
+		"image-registry",
 		"api-server-endpoint",
 		"wait",
 		"timeout",
@@ -47,6 +47,7 @@ func TestInstallCommandFlags(t *testing.T) {
 		"net-node-image",
 		"machina-image",
 		"storage-supervisor-image",
+		"metalman-image",
 		// CRDs are now owned by the operator (BootstrapCRDs); install no longer
 		// applies them, so --skip-crds is gone.
 		"skip-crds",
@@ -172,6 +173,7 @@ func TestMutateOperatorObjectWritesConfigEndpoint(t *testing.T) {
 		namespace: "unbounded-system",
 		operatorConfigData: map[string]string{
 			"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
+			"UNBOUNDED_IMAGE_REGISTRY":        "ghcr.io",
 			"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
 		},
 	}
@@ -263,6 +265,7 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			require.True(t, found)
 			require.Equal(t, map[string]string{
 				"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
+				"UNBOUNDED_IMAGE_REGISTRY":        "ghcr.io",
 				"UNBOUNDED_REAP_LEGACY_RESOURCES": tt.wantReaper,
 			}, data)
 
@@ -363,6 +366,7 @@ func TestMutateOperatorObjectRetargetsNamespace(t *testing.T) {
 		namespace: "custom-system",
 		operatorConfigData: map[string]string{
 			"UNBOUNDED_API_SERVER_ENDPOINT":   "",
+			"UNBOUNDED_IMAGE_REGISTRY":        "ghcr.io",
 			"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
 		},
 	}
@@ -380,7 +384,6 @@ func TestMutateOperatorObjectRetargetsNamespace(t *testing.T) {
 							"--leader-elect=true",
 							"--leader-elect-namespace=unbounded-system",
 							"--namespace=unbounded-system",
-							"--metalman-image=x",
 							"--api-server-endpoint=y",
 						},
 					}},

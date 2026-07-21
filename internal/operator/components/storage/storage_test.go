@@ -60,12 +60,16 @@ func TestMutateObjectScopesDaemonSetToSite(t *testing.T) {
 			"selector": map[string]any{"matchLabels": map[string]any{"app.kubernetes.io/name": daemonSetName}},
 			"template": map[string]any{
 				"metadata": map[string]any{"labels": map[string]any{"app.kubernetes.io/name": daemonSetName}},
-				"spec":     map[string]any{"containers": []any{map[string]any{"name": "run"}}},
+				"spec": map[string]any{
+					"initContainers": []any{map[string]any{"name": "install", "image": "old:init"}},
+					"containers":     []any{map[string]any{"name": "run", "image": "old:run"}},
+				},
 			},
 		},
 	}}
 
-	if err := mutateObject(site, "storage-hash", obj); err != nil {
+	cfg := component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"}
+	if err := mutateObject(site, cfg, "storage-hash", obj); err != nil {
 		t.Fatalf("mutateObject returned error: %v", err)
 	}
 
@@ -104,6 +108,13 @@ func TestMutateObjectScopesDaemonSetToSite(t *testing.T) {
 	}
 
 	assertSiteAffinityMap(t, affinity, "rack-a")
+
+	for _, field := range []string{"initContainers", "containers"} {
+		containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		if got := containers[0].(map[string]any)["image"]; got != "registry.example.com/azure/unbounded-storage-supervisor:v1.2.3" {
+			t.Fatalf("%s image = %q", field, got)
+		}
+	}
 }
 
 func TestDaemonSetPointsAtPerSiteConfig(t *testing.T) {
@@ -127,7 +138,7 @@ func TestDaemonSetPointsAtPerSiteConfig(t *testing.T) {
 		},
 	}}
 
-	if err := mutateObject(site, "storage-hash", obj); err != nil {
+	if err := mutateObject(site, component.Config{}, "storage-hash", obj); err != nil {
 		t.Fatalf("mutateObject returned error: %v", err)
 	}
 

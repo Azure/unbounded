@@ -85,6 +85,7 @@ UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
 UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION_TAG)
 UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
+UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= ghcr.io
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
@@ -609,9 +610,6 @@ metalman-build: ## Build the metalman binary (no lint/test)
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
 unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build the unbounded-operator binary (no lint/test)
-	@for v in MACHINA_IMAGE=$(MACHINA_IMAGE) NET_CONTROLLER_IMAGE=$(NET_CONTROLLER_IMAGE) NET_NODE_IMAGE=$(NET_NODE_IMAGE); do \
-	  case "$$v" in *=) echo "error: $${v%=} is empty; the operator's embedded net/machina manifests would bake an empty image:" >&2; exit 1;; esac; \
-	done
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
@@ -1076,7 +1074,7 @@ unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy
 		--output-dir $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
 		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
-		--set MetalmanImage=$(METALMAN_IMAGE) \
+		--set ImageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
 		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
 		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
@@ -1139,9 +1137,6 @@ image-unbounded-operator-local: ## Build the unbounded-operator container image 
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		--build-arg NET_CONTROLLER_IMAGE=$(NET_CONTROLLER_IMAGE) \
-		--build-arg NET_NODE_IMAGE=$(NET_NODE_IMAGE) \
-		--build-arg MACHINA_IMAGE=$(MACHINA_IMAGE) \
 		-t unbounded-operator:$(VERSION_TAG) -t $(UNBOUNDED_OPERATOR_IMAGE) \
 		-f ./images/unbounded-operator/Containerfile .
 	$(call trivy-maybe,$(UNBOUNDED_OPERATOR_IMAGE))

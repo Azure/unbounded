@@ -36,7 +36,7 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 	data := map[string]string{
 		"Namespace":         "unbounded-system",
 		"OperatorImage":     "operator:test",
-		"MetalmanImage":     "metalman:test",
+		"ImageRegistry":     "registry.example.com/mirror",
 		"APIServerEndpoint": endpoint,
 	}
 	if err := render.Render(templatesDir, outputDir, data); err != nil {
@@ -52,6 +52,9 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 
 	if got := cm.Data["UNBOUNDED_API_SERVER_ENDPOINT"]; got != endpoint {
 		t.Fatalf("configmap UNBOUNDED_API_SERVER_ENDPOINT = %q, want %q", got, endpoint)
+	}
+	if got := cm.Data["UNBOUNDED_IMAGE_REGISTRY"]; got != "registry.example.com/mirror" {
+		t.Fatalf("configmap UNBOUNDED_IMAGE_REGISTRY = %q", got)
 	}
 
 	// The Deployment pod template carries the matching hash annotation.
@@ -146,14 +149,14 @@ func contains(values []string, want string) bool {
 func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 	t.Parallel()
 
-	renderHash := func(endpoint, reapLegacyResources string) string {
+	renderHash := func(endpoint, registry, reapLegacyResources string) string {
 		t.Helper()
 
 		outputDir := t.TempDir()
 		if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
 			"Namespace":           "unbounded-system",
 			"OperatorImage":       "operator:test",
-			"MetalmanImage":       "metalman:test",
+			"ImageRegistry":       registry,
 			"APIServerEndpoint":   endpoint,
 			"ReapLegacyResources": reapLegacyResources,
 		}); err != nil {
@@ -200,13 +203,16 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 		return gotHash
 	}
 
-	baseline := renderHash("https://api.example.test:6443", "true")
-	if got := renderHash("https://other.example.test:6443", "true"); got == baseline {
+	baseline := renderHash("https://api.example.test:6443", "ghcr.io", "true")
+	if got := renderHash("https://other.example.test:6443", "ghcr.io", "true"); got == baseline {
 		t.Fatal("changing UNBOUNDED_API_SERVER_ENDPOINT did not change the rendered config hash")
 	}
 
-	if got := renderHash("https://api.example.test:6443", "false"); got == baseline {
+	if got := renderHash("https://api.example.test:6443", "ghcr.io", "false"); got == baseline {
 		t.Fatal("changing UNBOUNDED_REAP_LEGACY_RESOURCES did not change the rendered config hash")
+	}
+	if got := renderHash("https://api.example.test:6443", "registry.example.com", "true"); got == baseline {
+		t.Fatal("changing UNBOUNDED_IMAGE_REGISTRY did not change the rendered config hash")
 	}
 }
 
@@ -217,7 +223,7 @@ func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {
 	if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
 		"Namespace":     "unbounded-system",
 		"OperatorImage": "operator:test",
-		"MetalmanImage": "metalman:test",
+		"ImageRegistry": "ghcr.io",
 	}); err != nil {
 		t.Fatalf("render.Render: %v", err)
 	}

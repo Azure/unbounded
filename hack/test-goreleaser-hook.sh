@@ -14,8 +14,6 @@ set -euo pipefail
 TAG="v0.0.0-test"
 MANIFEST="deploy/machina/rendered/04-deployment.yaml"
 EXPECTED_IMAGE="ghcr.io/azure/machina:${TAG}"
-NET_MANIFEST="deploy/net/rendered/controller/03-deployment.yaml"
-EXPECTED_NET_IMAGE="ghcr.io/azure/unbounded-net-controller:${TAG}"
 OPERATOR_MANIFEST="deploy/unbounded-operator/rendered/04-deployment.yaml"
 EXPECTED_OPERATOR_IMAGE="ghcr.io/azure/unbounded-operator:${TAG}"
 
@@ -40,15 +38,6 @@ if [[ "$actual" == *"$EXPECTED_IMAGE"* ]]; then
     echo "PASS: machina manifest stamped correctly -> ${EXPECTED_IMAGE}"
 else
     echo "FAIL: expected '${EXPECTED_IMAGE}' but got '${actual}'"
-    exit 1
-fi
-
-echo "=== Checking net manifest ==="
-actual_net=$(grep 'image:' "$NET_MANIFEST" | xargs)
-if [[ "$actual_net" == *"$EXPECTED_NET_IMAGE"* ]]; then
-    echo "PASS: net manifest stamped correctly -> ${EXPECTED_NET_IMAGE}"
-else
-    echo "FAIL: expected '${EXPECTED_NET_IMAGE}' but got '${actual_net}'"
     exit 1
 fi
 
@@ -77,11 +66,10 @@ else
     exit 1
 fi
 
-if grep -qF "$EXPECTED_NET_IMAGE" <(strings "$binary"); then
-    echo "PASS: binary embeds ${EXPECTED_NET_IMAGE}"
+if grep -qF 'UNBOUNDED_IMAGE_REGISTRY' <(strings "$binary"); then
+    echo "PASS: binary embeds the component registry configuration"
 else
-    echo "FAIL: binary does not contain ${EXPECTED_NET_IMAGE}"
-    grep -F 'unbounded-net-controller:' <(strings "$binary") || true
+    echo "FAIL: binary does not contain the component registry configuration"
     exit 1
 fi
 

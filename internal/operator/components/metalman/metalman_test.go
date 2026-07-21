@@ -88,7 +88,7 @@ func TestDeployment(t *testing.T) {
 		}}},
 	}
 
-	d := deployment(site, component.DefaultNamespace, component.Config{MetalmanImage: "example/metalman:default", APIServerEndpoint: "https://api.example:6443"})
+	d := deployment(site, component.DefaultNamespace, component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3", APIServerEndpoint: "https://api.example:6443"})
 	if d.Name != "metalman-controller-rack-a" {
 		t.Fatalf("name = %q", d.Name)
 	}
@@ -98,7 +98,7 @@ func TestDeployment(t *testing.T) {
 	}
 
 	container := d.Spec.Template.Spec.Containers[0]
-	if container.Image != "example/metalman:default" {
+	if container.Image != "registry.example.com/azure/metalman:v1.2.3" {
 		t.Fatalf("image = %q", container.Image)
 	}
 
@@ -163,7 +163,7 @@ func TestDeploymentRespectsNamespaceAndDefaults(t *testing.T) {
 		}}},
 	}
 
-	d := deployment(site, "custom-ns", component.Config{MetalmanImage: "example/metalman:default"})
+	d := deployment(site, "custom-ns", component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"})
 	if d.Namespace != "custom-ns" {
 		t.Fatalf("namespace = %q, want custom-ns", d.Namespace)
 	}
@@ -188,7 +188,7 @@ func TestDeploymentAllowsZeroReplicas(t *testing.T) {
 		}}},
 	}
 
-	d := deployment(site, component.DefaultNamespace, component.Config{MetalmanImage: "example/metalman:default"})
+	d := deployment(site, component.DefaultNamespace, component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"})
 	if d.Spec.Replicas == nil || *d.Spec.Replicas != 0 {
 		t.Fatalf("replicas = %v, want 0", d.Spec.Replicas)
 	}

@@ -62,13 +62,46 @@ var DefaultNamespace = unbounded.SystemNamespace()
 
 // Config carries operator-level settings components read while reconciling.
 type Config struct {
-	// MetalmanImage is the image for the synthesized per-site metalman
-	// Deployment.
-	MetalmanImage string
+	ImageRegistry string
+	ImageTag      string
 
 	// APIServerEndpoint is injected into the machina controller config and
 	// advertised to metalman.
 	APIServerEndpoint string
+}
+
+// Image returns the operator-managed image for repository.
+func (c Config) Image(repository string) string {
+	return strings.TrimRight(c.ImageRegistry, "/") + "/azure/" + repository + ":" + c.ImageTag
+}
+
+// SetPodSpecImages replaces every init and main container image in a workload.
+func SetPodSpecImages(obj *unstructured.Unstructured, image string) error {
+	for _, field := range []string{"initContainers", "containers"} {
+		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		if err != nil {
+			return fmt.Errorf("get %s: %w", field, err)
+		}
+
+		if !found {
+			continue
+		}
+
+		for i := range containers {
+			container, ok := containers[i].(map[string]any)
+			if !ok {
+				return fmt.Errorf("%s[%d] is not an object", field, i)
+			}
+
+			container["image"] = image
+		}
+
+		if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", field); err != nil {
+			return fmt.Errorf("set %s: %w", field, err)
+		}
+	}
+
+	return nil
 }
 
 // Env is the shared execution context handed to every component. It bundles the

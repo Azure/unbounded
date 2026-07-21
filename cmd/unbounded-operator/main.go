@@ -73,7 +73,7 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
-	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", "", "Default metalman image")
+	cmd.Flags().StringVar(&cfg.imageRegistry, "image-registry", envStringDefault("UNBOUNDED_IMAGE_REGISTRY", "ghcr.io"), "Registry for operator-managed component images (defaults to $UNBOUNDED_IMAGE_REGISTRY or ghcr.io)")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info or the KUBERNETES_SERVICE_HOST FQDN (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
 	cmd.CompletionOptions.DisableDefaultCmd = true
@@ -88,9 +88,17 @@ type config struct {
 	leaderElection          bool
 	leaderElectionNamespace string
 	namespace               string
-	metalmanImage           string
+	imageRegistry           string
 	apiServerEndpoint       string
 	reapLegacyResources     bool
+}
+
+func envStringDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+
+	return fallback
 }
 
 // envBoolDefault returns the boolean value of the named environment variable, or
@@ -195,7 +203,8 @@ func run(ctx context.Context, cfg config) error {
 		Namespace: namespace,
 		Registry:  operator.DefaultRegistry(),
 		Config: operator.Config{
-			MetalmanImage:     cfg.metalmanImage,
+			ImageRegistry:     cfg.imageRegistry,
+			ImageTag:          version.Version,
 			APIServerEndpoint: cfg.apiServerEndpoint,
 		},
 	}).SetupWithManager(mgr); err != nil {

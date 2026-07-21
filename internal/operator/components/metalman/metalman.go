@@ -96,7 +96,7 @@ func mutateSupportObject(obj *unstructured.Unstructured) error {
 }
 
 func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Config) *appsv1.Deployment {
-	image := cfg.MetalmanImage
+	image := cfg.Image("metalman")
 	name := DeploymentName(site.Name)
 	labels := map[string]string{
 		"app":                                 "unbounded-pxe",

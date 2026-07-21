@@ -80,7 +80,7 @@ func TestApplyMutatorSkipsMetalmanSupportAndCRD(t *testing.T) {
 			"metadata":   map[string]any{"name": "sites.unbounded-cloud.io"},
 		}},
 	} {
-		if err := applyMutator("hash")(obj); err != nil {
+		if err := applyMutator(component.Config{}, "hash")(obj); err != nil {
 			t.Fatalf("applyMutator: %v", err)
 		}
 
@@ -127,7 +127,7 @@ func TestApplyMutatorSkipsExactlyMetalmanRBAC(t *testing.T) {
 			supportSeen++
 
 			work := obj.DeepCopy()
-			if err := applyMutator("hash")(work); err != nil {
+			if err := applyMutator(component.Config{}, "hash")(work); err != nil {
 				t.Fatalf("applyMutator: %v", err)
 			}
 
@@ -147,11 +147,16 @@ func TestApplyMutatorStampsConfigHash(t *testing.T) {
 		"apiVersion": "apps/v1",
 		"kind":       "Deployment",
 		"metadata":   map[string]any{"name": controllerName},
-		"spec":       map[string]any{"template": map[string]any{"metadata": map[string]any{}}},
+		"spec": map[string]any{"template": map[string]any{
+			"metadata": map[string]any{},
+			"spec":     map[string]any{"containers": []any{map[string]any{"name": "controller", "image": "old:image"}}},
+		}},
 	}}
 
 	const hash = "config-hash"
-	if err := applyMutator(hash)(obj); err != nil {
+
+	cfg := component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"}
+	if err := applyMutator(cfg, hash)(obj); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -159,6 +164,13 @@ func TestApplyMutatorStampsConfigHash(t *testing.T) {
 		"spec", "template", "metadata", "annotations", ConfigHashAnnotation)
 	if err != nil || !found || got != hash {
 		t.Fatalf("config hash = %q found=%t err=%v, want %q", got, found, err, hash)
+	}
+
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	image := containers[0].(map[string]any)["image"].(string)
+
+	if image != "registry.example.com/azure/machina:v1.2.3" {
+		t.Fatalf("image = %q", image)
 	}
 }
 
