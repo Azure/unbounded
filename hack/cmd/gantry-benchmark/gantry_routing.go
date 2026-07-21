@@ -9,62 +9,6 @@ import (
 	"fmt"
 )
 
-type proxyPhase string
-
-const (
-	proxyPhaseSetup      proxyPhase = "setup"
-	proxyPhaseBaseline   proxyPhase = "baseline"
-	proxyPhaseGantryCold proxyPhase = "gantry_cold"
-	proxyPhaseIdle       proxyPhase = "idle"
-)
-
-func (p proxyPhase) valid() bool {
-	switch p {
-	case proxyPhaseSetup, proxyPhaseBaseline, proxyPhaseGantryCold, proxyPhaseIdle:
-		return true
-	default:
-		return false
-	}
-}
-
-func (b *benchmark) patchGantryForBenchmark(ctx context.Context, state *benchmarkState) error {
-	current, err := b.readGantryConfig(ctx)
-	if err != nil {
-		return err
-	}
-
-	currentSHA := gantryConfigSHA(current)
-	if currentSHA != state.OriginalGantryConfigSHA {
-		if state.PatchedGantryConfigSHA != "" && currentSHA == state.PatchedGantryConfigSHA {
-			return nil
-		}
-
-		return fmt.Errorf("gantry ConfigMap changed after enable: current sha256=%s, original sha256=%s", currentSHA, state.OriginalGantryConfigSHA)
-	}
-
-	endpoint := fmt.Sprintf("http://acr-origin-proxy.%s.svc.cluster.local:5002", b.config.Namespace)
-	namespaceAlias := state.ProxyClusterIP + ":5002"
-
-	patched, err := patchGantryRegistry([]byte(current), state.ACRLoginServer, endpoint, namespaceAlias)
-	if err != nil {
-		return err
-	}
-
-	state.PatchedGantryConfigSHA = gantryConfigSHA(string(patched))
-	state.GantryRestored = false
-
-	state.Status = "patching-gantry"
-	if err := b.saveState(ctx, *state); err != nil {
-		return err
-	}
-
-	if err := b.patchGantryConfigMap(ctx, current, string(patched)); err != nil {
-		return err
-	}
-
-	return b.rolloutGantry(ctx)
-}
-
 func (b *benchmark) restoreGantry(ctx context.Context, state *benchmarkState) error {
 	current, err := b.readGantryConfig(ctx)
 	if err != nil {
@@ -136,10 +80,6 @@ func (b *benchmark) patchGantryConfigMap(ctx context.Context, expected, replacem
 	return err
 }
 
-func (b *benchmark) rolloutGantry(ctx context.Context) error {
-	return b.rolloutGantryAndValidate(ctx, b.validateGantry)
-}
-
 func (b *benchmark) rolloutGantryAtCurrentSize(ctx context.Context) error {
 	return b.rolloutGantryAndValidate(ctx, b.validateGantryAtCurrentSize)
 }
@@ -167,23 +107,4 @@ func (b *benchmark) rolloutGantryAndValidate(ctx context.Context, validate func(
 	}
 
 	return validate(ctx)
-}
-
-func (b *benchmark) switchProxyPhase(ctx context.Context, phase proxyPhase) error {
-	if !phase.valid() {
-		return fmt.Errorf("invalid proxy phase %q", phase)
-	}
-
-	if _, err := b.commands.Run(
-		ctx,
-		nil,
-		"kubectl", "-n", b.config.Namespace,
-		"exec", "deployment/acr-origin-proxy", "--",
-		"/usr/local/bin/acr-origin-proxy",
-		"set-phase", string(phase), b.config.RolloutTimeout.String(),
-	); err != nil {
-		return fmt.Errorf("switch proxy phase to %s: %w", phase, err)
-	}
-
-	return nil
 }

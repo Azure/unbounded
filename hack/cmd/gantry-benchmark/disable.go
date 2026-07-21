@@ -73,10 +73,6 @@ func (b *benchmark) disable(ctx context.Context) error {
 		return err
 	}
 
-	if err := b.switchProxyPhase(ctx, proxyPhaseIdle); err != nil {
-		writeAll(b.stderr, fmt.Sprintf("warning: could not switch proxy to idle before restoration: %v\n", err))
-	}
-
 	hostsErr := b.restoreHosts(ctx, state)
 
 	gantryErr := b.restoreGantry(ctx, &state)

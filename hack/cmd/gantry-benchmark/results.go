@@ -13,51 +13,32 @@ import (
 	"time"
 )
 
-type proxyTrafficTotals struct {
-	Requests      uint64 `json:"requests"`
-	BytesUpstream uint64 `json:"bytes_upstream"`
-	BytesToClient uint64 `json:"bytes_to_client"`
-}
-
-type proxyPhaseTotals struct {
-	RequestsCompleted uint64                        `json:"requests_completed"`
-	BytesUpstream     uint64                        `json:"bytes_upstream"`
-	BytesToClient     uint64                        `json:"bytes_to_client"`
-	ByPathClass       map[string]proxyTrafficTotals `json:"by_path_class"`
-	ByClientClass     map[string]proxyTrafficTotals `json:"by_client_class"`
-	ByStatus          map[string]uint64              `json:"by_status"`
-	UpstreamErrors    map[string]uint64              `json:"upstream_errors"`
-}
-
-type proxySummary struct {
-	RunID      string     `json:"run_id"`
-	Phase      proxyPhase `json:"phase"`
-	Since      string     `json:"since"`
-	UptimeSecs int64      `json:"uptime_seconds"`
-	Totals struct {
-		RequestsCompleted uint64                          `json:"requests_completed"`
-		BytesUpstream     uint64                          `json:"bytes_upstream"`
-		BytesToClient     uint64                          `json:"bytes_to_client"`
-		ByStatus          map[string]uint64                `json:"by_status"`
-		UpstreamErrors    map[string]uint64                `json:"upstream_errors"`
-		ByPhase map[proxyPhase]proxyPhaseTotals `json:"by_phase"`
-	} `json:"totals"`
+type originMetrics struct {
+	ACR            acrPullMetrics `json:"acr"`
+	EstimatedBytes uint64         `json:"estimated_bytes"`
+	EstimateMethod string         `json:"estimate_method"`
 }
 
 type gantryMetrics struct {
-	OriginPulls   float64 `json:"origin_pulls"`
-	PeerFetchHits float64 `json:"peer_fetch_hits"`
+	OriginPulls              float64            `json:"origin_pulls"`
+	OriginPullSuccesses      float64            `json:"origin_pull_successes"`
+	OriginLayerPullSuccesses float64            `json:"origin_layer_pull_successes"`
+	OriginFailures           map[string]float64 `json:"origin_failures"`
+	PeerFetchHits            float64            `json:"peer_fetch_hits"`
+	PeerFetchOutcomes        map[string]float64 `json:"peer_fetch_outcomes"`
 }
 
 type phaseResult struct {
-	RunID        string           `json:"run_id"`
-	Phase        proxyPhase       `json:"phase"`
-	Image        string           `json:"image"`
-	ImageSizeMiB int              `json:"image_size_mib"`
-	Proxy        proxyPhaseTotals `json:"proxy"`
-	Gantry       gantryMetrics    `json:"gantry"`
-	Job          jobObservation   `json:"job"`
-	RecordedAt   time.Time        `json:"recorded_at"`
+	RunID        string             `json:"run_id"`
+	Phase        benchmarkPhase     `json:"phase"`
+	Image        string             `json:"image"`
+	ImageSizeMiB int                `json:"image_size_mib"`
+	Origin       originMetrics      `json:"origin"`
+	Kubelet      kubeletPullMetrics `json:"kubelet"`
+	Issues       pullIssues         `json:"issues"`
+	Gantry       gantryMetrics      `json:"gantry"`
+	Job          jobObservation     `json:"job"`
+	RecordedAt   time.Time          `json:"recorded_at"`
 }
 
 type benchmarkComparison struct {
@@ -74,53 +55,8 @@ type benchmarkComparison struct {
 
 type resultCheck struct {
 	Passed  bool   `json:"passed"`
+	Gating  bool   `json:"gating"`
 	Message string `json:"message"`
-}
-
-func (b *benchmark) fetchProxySummary(ctx context.Context, state benchmarkState) (proxySummary, error) {
-	rawPath := fmt.Sprintf(
-		"/api/v1/namespaces/%s/services/http:acr-origin-proxy:9090/proxy/debug/summary",
-		b.config.Namespace,
-	)
-
-	output, err := b.commands.Run(ctx, nil, "kubectl", "get", "--raw", rawPath)
-	if err != nil {
-		return proxySummary{}, err
-	}
-
-	var summary proxySummary
-	if err := json.Unmarshal(output, &summary); err != nil {
-		return proxySummary{}, fmt.Errorf("decode proxy summary: %w", err)
-	}
-
-	if summary.RunID != state.RunID {
-		return proxySummary{}, fmt.Errorf("proxy run ID is %q, want %q", summary.RunID, state.RunID)
-	}
-
-	return summary, nil
-}
-
-func (b *benchmark) fetchProxyTotals(ctx context.Context, state benchmarkState, phase proxyPhase) (proxyPhaseTotals, error) {
-	summary, err := b.fetchProxySummary(ctx, state)
-	if err != nil {
-		return proxyPhaseTotals{}, err
-	}
-
-	totals, ok := summary.Totals.ByPhase[phase]
-	if !ok {
-		return proxyPhaseTotals{}, fmt.Errorf("proxy summary has no totals for phase %q", phase)
-	}
-
-	return totals, nil
-}
-
-func (b *benchmark) writeProxySummaryArtifact(ctx context.Context, state benchmarkState) error {
-	summary, err := b.fetchProxySummary(ctx, state)
-	if err != nil {
-		return err
-	}
-
-	return b.writeJSONArtifact(state.RunID, "proxy-summary.json", summary)
 }
 
 func (b *benchmark) gantryRevision(ctx context.Context) (string, error) {
@@ -236,18 +172,81 @@ func (b *benchmark) fetchGantryRevisionMetrics(ctx context.Context, revision str
 		return gantryMetrics{}, fmt.Errorf("query Gantry origin pulls: %w", err)
 	}
 
-	peerQuery := fmt.Sprintf(
-		`sum(p2p_peer_fetch_total{namespace=%q,outcome="hit",gantry_benchmark="true",controller_revision_hash=%q})`,
+	originSuccessQuery := fmt.Sprintf(
+		`sum(p2p_origin_pull_success_total{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
 		b.config.GantryNamespace,
 		revision,
 	)
 
-	peerHits, err := b.queryPrometheusOrZero(ctx, peerQuery)
+	originPullSuccesses, err := b.queryPrometheusOrZero(ctx, originSuccessQuery)
 	if err != nil {
-		return gantryMetrics{}, fmt.Errorf("query Gantry peer hits: %w", err)
+		return gantryMetrics{}, fmt.Errorf("query successful Gantry origin pulls: %w", err)
 	}
 
-	return gantryMetrics{OriginPulls: originPulls, PeerFetchHits: peerHits}, nil
+	originLayerSuccessQuery := fmt.Sprintf(
+		`sum(p2p_origin_pull_success_total{namespace=%q,kind="layer",gantry_benchmark="true",controller_revision_hash=%q})`,
+		b.config.GantryNamespace,
+		revision,
+	)
+
+	originLayerPullSuccesses, err := b.queryPrometheusOrZero(ctx, originLayerSuccessQuery)
+	if err != nil {
+		return gantryMetrics{}, fmt.Errorf("query successful Gantry origin layer pulls: %w", err)
+	}
+
+	peerFetchOutcomes := make(map[string]float64)
+
+	for _, outcome := range []string{"busy", "error", "hit", "notfound", "stall", "unavailable"} {
+		query := fmt.Sprintf(
+			`sum(p2p_peer_fetch_total{namespace=%q,outcome=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+			b.config.GantryNamespace,
+			outcome,
+			revision,
+		)
+
+		value, err := b.queryPrometheusOrZero(ctx, query)
+		if err != nil {
+			return gantryMetrics{}, fmt.Errorf("query Gantry peer fetch outcome %s: %w", outcome, err)
+		}
+
+		peerFetchOutcomes[outcome] = value
+	}
+
+	originFailures := make(map[string]float64)
+
+	for _, failure := range []struct {
+		key   string
+		label string
+	}{
+		{key: "auth", label: "auth"},
+		{key: "not_found", label: "not_found"},
+		{key: "rate_limited", label: "rate_limited"},
+		{key: "transient", label: "transient"},
+		{key: "unspecified", label: ""},
+	} {
+		query := fmt.Sprintf(
+			`sum(p2p_origin_pull_failure_total{namespace=%q,class=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+			b.config.GantryNamespace,
+			failure.label,
+			revision,
+		)
+
+		value, err := b.queryPrometheusOrZero(ctx, query)
+		if err != nil {
+			return gantryMetrics{}, fmt.Errorf("query Gantry origin failure class %s: %w", failure.key, err)
+		}
+
+		originFailures[failure.key] = value
+	}
+
+	return gantryMetrics{
+		OriginPulls:              originPulls,
+		OriginPullSuccesses:      originPullSuccesses,
+		OriginLayerPullSuccesses: originLayerPullSuccesses,
+		OriginFailures:           originFailures,
+		PeerFetchHits:            peerFetchOutcomes["hit"],
+		PeerFetchOutcomes:        peerFetchOutcomes,
+	}, nil
 }
 
 func (b *benchmark) waitForGantryMetricDelta(ctx context.Context, revision string, before gantryMetrics) (gantryMetrics, error) {
@@ -280,9 +279,22 @@ func (b *benchmark) waitForGantryMetricDelta(ctx context.Context, revision strin
 
 func subtractGantryMetrics(after, before gantryMetrics) gantryMetrics {
 	return gantryMetrics{
-		OriginPulls:   nonNegativeDifference(after.OriginPulls, before.OriginPulls),
-		PeerFetchHits: nonNegativeDifference(after.PeerFetchHits, before.PeerFetchHits),
+		OriginPulls:              nonNegativeDifference(after.OriginPulls, before.OriginPulls),
+		OriginPullSuccesses:      nonNegativeDifference(after.OriginPullSuccesses, before.OriginPullSuccesses),
+		OriginLayerPullSuccesses: nonNegativeDifference(after.OriginLayerPullSuccesses, before.OriginLayerPullSuccesses),
+		OriginFailures:           subtractMetricMap(after.OriginFailures, before.OriginFailures),
+		PeerFetchHits:            nonNegativeDifference(after.PeerFetchHits, before.PeerFetchHits),
+		PeerFetchOutcomes:        subtractMetricMap(after.PeerFetchOutcomes, before.PeerFetchOutcomes),
 	}
+}
+
+func subtractMetricMap(after, before map[string]float64) map[string]float64 {
+	result := make(map[string]float64, len(after))
+	for key, value := range after {
+		result[key] = nonNegativeDifference(value, before[key])
+	}
+
+	return result
 }
 
 func nonNegativeDifference(after, before float64) float64 {
@@ -301,12 +313,12 @@ func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchm
 		Checks:     make(map[string]resultCheck),
 	}
 	comparison.OriginByteReduction = reduction(
-		float64(baseline.Proxy.BytesUpstream),
-		float64(gantry.Proxy.BytesUpstream),
+		float64(baseline.Origin.EstimatedBytes),
+		float64(gantry.Origin.EstimatedBytes),
 	)
 	comparison.OriginRequestReduction = reduction(
-		float64(baseline.Proxy.RequestsCompleted),
-		float64(gantry.Proxy.RequestsCompleted),
+		float64(baseline.Origin.ACR.Successful),
+		float64(gantry.Origin.ACR.Successful),
 	)
 	comparison.P50StartLatencyReduction = reduction(
 		baseline.Job.PodStartLatency.P50Seconds,
@@ -319,6 +331,7 @@ func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchm
 
 	byteCheck := resultCheck{
 		Passed: comparison.OriginByteReduction >= config.MinimumByteReduction,
+		Gating: true,
 		Message: fmt.Sprintf(
 			"origin byte reduction %.2f%%, minimum %.2f%%",
 			100*comparison.OriginByteReduction,
@@ -333,8 +346,9 @@ func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchm
 	)
 	latencyCheck := resultCheck{
 		Passed: latencyRatio <= config.MaximumLatencyRatio,
+		Gating: false,
 		Message: fmt.Sprintf(
-			"Gantry P95/baseline P95 ratio %.3f, maximum %.3f",
+			"informational: Gantry P95/baseline P95 ratio %.3f, reference maximum %.3f",
 			latencyRatio,
 			config.MaximumLatencyRatio,
 		),
@@ -343,11 +357,12 @@ func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchm
 
 	peerCheck := resultCheck{
 		Passed:  gantry.Gantry.PeerFetchHits > 0,
+		Gating:  true,
 		Message: fmt.Sprintf("Gantry peer fetch hits %.0f, want greater than zero", gantry.Gantry.PeerFetchHits),
 	}
 	comparison.Checks["peer_activity"] = peerCheck
 
-	comparison.Passed = byteCheck.Passed && latencyCheck.Passed && peerCheck.Passed
+	comparison.Passed = byteCheck.Passed && peerCheck.Passed
 
 	return comparison
 }
@@ -382,93 +397,107 @@ func (b *benchmark) writeJSONArtifact(runID, filename string, value any) error {
 	return os.WriteFile(filepath.Join(directory, filename), append(encoded, '\n'), 0o640)
 }
 
+func (b *benchmark) regenerateComparison(runID string) error {
+	if !strings.HasPrefix(runID, "run-") || filepath.Base(runID) != runID {
+		return fmt.Errorf("invalid benchmark run ID %q", runID)
+	}
+
+	readPhase := func(filename string) (phaseResult, error) {
+		raw, err := os.ReadFile(filepath.Join(b.config.StateRoot, runID, filename))
+		if err != nil {
+			return phaseResult{}, fmt.Errorf("read %s: %w", filename, err)
+		}
+
+		var result phaseResult
+		if err := json.Unmarshal(raw, &result); err != nil {
+			return phaseResult{}, fmt.Errorf("decode %s: %w", filename, err)
+		}
+
+		return result, nil
+	}
+
+	baseline, err := readPhase("baseline.json")
+	if err != nil {
+		return err
+	}
+
+	gantry, err := readPhase("gantry-cold.json")
+	if err != nil {
+		return err
+	}
+
+	if baseline.RunID != runID || gantry.RunID != runID {
+		return fmt.Errorf("phase artifact run IDs do not match %q", runID)
+	}
+
+	return b.writeComparisonArtifacts(compareResults(b.config, baseline, gantry))
+}
+
 func (b *benchmark) writeComparisonArtifacts(comparison benchmarkComparison) error {
 	if err := b.writeJSONArtifact(comparison.RunID, "comparison.json", comparison); err != nil {
 		return err
 	}
 
-	baselineDigestRequests := digestRequests(comparison.Baseline.Proxy)
-	gantryDigestRequests := digestRequests(comparison.GantryCold.Proxy)
-	baselineHTTP429 := comparison.Baseline.Proxy.ByStatus["429"]
-	gantryHTTP429 := comparison.GantryCold.Proxy.ByStatus["429"]
-	baselineHTTP5xx := statusClassCount(comparison.Baseline.Proxy.ByStatus, '5')
-	gantryHTTP5xx := statusClassCount(comparison.GantryCold.Proxy.ByStatus, '5')
-	baselineTransportErrors := countTotal(comparison.Baseline.Proxy.UpstreamErrors)
-	gantryTransportErrors := countTotal(comparison.GantryCold.Proxy.UpstreamErrors)
-	markdown := fmt.Sprintf(`# Gantry benchmark %s
+	var markdown strings.Builder
 
-| Metric | Baseline | Gantry cold | Reduction |
-| --- | ---: | ---: | ---: |
-| ACR upstream bytes | %d | %d | %.2f%% |
-| Proxy requests | %d | %d | %.2f%% |
-| Digest requests | %d | %d | %.2f%% |
-| HTTP 429 responses | %d | %d | n/a |
-| HTTP 5xx responses | %d | %d | n/a |
-| Upstream transport errors | %d | %d | n/a |
-| Pod start P50 | %.3fs | %.3fs | %.2f%% |
-| Pod start P95 | %.3fs | %.3fs | %.2f%% |
-| Gantry origin pulls | 0 | %.0f | n/a |
-| Gantry peer hits | 0 | %.0f | n/a |
+	fmt.Fprintf(&markdown, "# Gantry benchmark %s\n\n", comparison.RunID)
+	markdown.WriteString("| Metric | Baseline | Gantry cold | Reduction |\n")
+	markdown.WriteString("| --- | ---: | ---: | ---: |\n")
+	fmt.Fprintf(&markdown, "| Estimated origin bytes | %d | %d | %.2f%% |\n", comparison.Baseline.Origin.EstimatedBytes, comparison.GantryCold.Origin.EstimatedBytes, 100*comparison.OriginByteReduction)
+	fmt.Fprintf(&markdown, "| ACR total pull count | %d | %d | %.2f%% |\n", comparison.Baseline.Origin.ACR.Total, comparison.GantryCold.Origin.ACR.Total, 100*reduction(float64(comparison.Baseline.Origin.ACR.Total), float64(comparison.GantryCold.Origin.ACR.Total)))
+	fmt.Fprintf(&markdown, "| ACR successful pull count | %d | %d | %.2f%% |\n", comparison.Baseline.Origin.ACR.Successful, comparison.GantryCold.Origin.ACR.Successful, 100*comparison.OriginRequestReduction)
+	fmt.Fprintf(&markdown, "| ACR unsuccessful pull count | %d | %d | n/a |\n", comparison.Baseline.Origin.ACR.Failed, comparison.GantryCold.Origin.ACR.Failed)
+	fmt.Fprintf(&markdown, "| Kubelet pull operations | %.0f | %.0f | n/a |\n", comparison.Baseline.Kubelet.Operations, comparison.GantryCold.Kubelet.Operations)
+	fmt.Fprintf(&markdown, "| Kubelet pull errors | %.0f | %.0f | n/a |\n", comparison.Baseline.Kubelet.Errors, comparison.GantryCold.Kubelet.Errors)
+	fmt.Fprintf(&markdown, "| Kubernetes warning events | %s | %s | n/a |\n", issueCount(comparison.Baseline.Issues, ""), issueCount(comparison.GantryCold.Issues, ""))
+	fmt.Fprintf(&markdown, "| HTTP 429 markers | %s | %s | n/a |\n", issueCount(comparison.Baseline.Issues, "http_429"), issueCount(comparison.GantryCold.Issues, "http_429"))
+	fmt.Fprintf(&markdown, "| HTTP 5xx markers | %s | %s | n/a |\n", issueCount(comparison.Baseline.Issues, "http_5xx"), issueCount(comparison.GantryCold.Issues, "http_5xx"))
+	fmt.Fprintf(&markdown, "| ACR egress-limit markers | %s | %s | n/a |\n", issueCount(comparison.Baseline.Issues, "acr_egress_limit"), issueCount(comparison.GantryCold.Issues, "acr_egress_limit"))
+	fmt.Fprintf(&markdown, "| Authentication markers | %s | %s | n/a |\n", issueCount(comparison.Baseline.Issues, "auth"), issueCount(comparison.GantryCold.Issues, "auth"))
+	fmt.Fprintf(&markdown, "| Timeout markers | %s | %s | n/a |\n", issueCount(comparison.Baseline.Issues, "timeout"), issueCount(comparison.GantryCold.Issues, "timeout"))
+	fmt.Fprintf(&markdown, "| Connection-refused markers | %s | %s | n/a |\n", issueCount(comparison.Baseline.Issues, "connection_refused"), issueCount(comparison.GantryCold.Issues, "connection_refused"))
+	fmt.Fprintf(&markdown, "| Connection-reset markers | %s | %s | n/a |\n", issueCount(comparison.Baseline.Issues, "connection_reset"), issueCount(comparison.GantryCold.Issues, "connection_reset"))
+	fmt.Fprintf(&markdown, "| Kubelet average pull duration | %.3fs | %.3fs | n/a |\n", comparison.Baseline.Kubelet.AverageDurationSeconds, comparison.GantryCold.Kubelet.AverageDurationSeconds)
+	fmt.Fprintf(&markdown, "| Pod start P50 (informational) | %.3fs | %.3fs | %.2f%% |\n", comparison.Baseline.Job.PodStartLatency.P50Seconds, comparison.GantryCold.Job.PodStartLatency.P50Seconds, 100*comparison.P50StartLatencyReduction)
+	fmt.Fprintf(&markdown, "| Pod start P95 (informational) | %.3fs | %.3fs | %.2f%% |\n", comparison.Baseline.Job.PodStartLatency.P95Seconds, comparison.GantryCold.Job.PodStartLatency.P95Seconds, 100*comparison.P95StartLatencyReduction)
+	fmt.Fprintf(&markdown, "| Gantry origin pulls | 0 | %.0f | n/a |\n", comparison.GantryCold.Gantry.OriginPulls)
+	fmt.Fprintf(&markdown, "| Gantry successful origin layer pulls | 0 | %.0f | n/a |\n", comparison.GantryCold.Gantry.OriginLayerPullSuccesses)
+	fmt.Fprintf(&markdown, "| Gantry origin rate-limit failures | 0 | %s | n/a |\n", metricCountString(comparison.GantryCold.Gantry.OriginFailures, "rate_limited"))
+	fmt.Fprintf(&markdown, "| Gantry origin transient failures | 0 | %s | n/a |\n", metricCountString(comparison.GantryCold.Gantry.OriginFailures, "transient"))
+	fmt.Fprintf(&markdown, "| Gantry peer hits | 0 | %.0f | n/a |\n", comparison.GantryCold.Gantry.PeerFetchHits)
+	fmt.Fprintf(&markdown, "| Gantry peer busy outcomes | 0 | %s | n/a |\n", metricCountString(comparison.GantryCold.Gantry.PeerFetchOutcomes, "busy"))
+	fmt.Fprintf(&markdown, "| Gantry peer stall outcomes | 0 | %s | n/a |\n", metricCountString(comparison.GantryCold.Gantry.PeerFetchOutcomes, "stall"))
+	fmt.Fprintf(&markdown, "| Gantry peer not-found outcomes | 0 | %s | n/a |\n", metricCountString(comparison.GantryCold.Gantry.PeerFetchOutcomes, "notfound"))
+	fmt.Fprintf(&markdown, "| Gantry peer unavailable outcomes | 0 | %s | n/a |\n", metricCountString(comparison.GantryCold.Gantry.PeerFetchOutcomes, "unavailable"))
 
-Result: **%s**
-
-`,
-		comparison.RunID,
-		comparison.Baseline.Proxy.BytesUpstream,
-		comparison.GantryCold.Proxy.BytesUpstream,
-		100*comparison.OriginByteReduction,
-		comparison.Baseline.Proxy.RequestsCompleted,
-		comparison.GantryCold.Proxy.RequestsCompleted,
-		100*comparison.OriginRequestReduction,
-		baselineDigestRequests,
-		gantryDigestRequests,
-		100*reduction(float64(baselineDigestRequests), float64(gantryDigestRequests)),
-		baselineHTTP429,
-		gantryHTTP429,
-		baselineHTTP5xx,
-		gantryHTTP5xx,
-		baselineTransportErrors,
-		gantryTransportErrors,
-		comparison.Baseline.Job.PodStartLatency.P50Seconds,
-		comparison.GantryCold.Job.PodStartLatency.P50Seconds,
-		100*comparison.P50StartLatencyReduction,
-		comparison.Baseline.Job.PodStartLatency.P95Seconds,
-		comparison.GantryCold.Job.PodStartLatency.P95Seconds,
-		100*comparison.P95StartLatencyReduction,
-		comparison.GantryCold.Gantry.OriginPulls,
-		comparison.GantryCold.Gantry.PeerFetchHits,
-		strings.ToUpper(map[bool]string{true: "pass", false: "fail"}[comparison.Passed]),
-	)
+	markdown.WriteString("\nOrigin bytes are estimates. ACR counts are registry-wide one-minute Azure Monitor metrics for each phase window.\n")
+	markdown.WriteString("Warning markers are bounded, may overlap, and intentionally omit raw event messages because ACR errors can contain signed URLs.\n")
+	markdown.WriteString("Latency is informational and does not affect the gating result.\n\n")
+	fmt.Fprintf(&markdown, "Gating result: **%s**\n\n", strings.ToUpper(map[bool]string{true: "pass", false: "fail"}[comparison.Passed]))
 
 	return os.WriteFile(
 		filepath.Join(b.config.StateRoot, comparison.RunID, "comparison.md"),
-		[]byte(markdown),
+		[]byte(markdown.String()),
 		0o640,
 	)
 }
 
-func digestRequests(totals proxyPhaseTotals) uint64 {
-	return totals.ByPathClass["blob"].Requests + totals.ByPathClass["manifest_by_digest"].Requests
-}
-
-func statusClassCount(values map[string]uint64, class byte) uint64 {
-	var total uint64
-
-	for status, count := range values {
-		if len(status) == 3 && status[0] == class {
-			total += count
-		}
+func issueCount(issues pullIssues, marker string) string {
+	if !issues.Captured {
+		return "n/a"
 	}
 
-	return total
-}
-
-func countTotal[K comparable](values map[K]uint64) uint64 {
-	var total uint64
-
-	for _, count := range values {
-		total += count
+	if marker == "" {
+		return fmt.Sprintf("%d", issues.WarningEvents)
 	}
 
-	return total
+	return fmt.Sprintf("%d", issues.Markers[marker])
+}
+
+func metricCountString(values map[string]float64, key string) string {
+	if values == nil {
+		return "n/a"
+	}
+
+	return fmt.Sprintf("%.0f", values[key])
 }

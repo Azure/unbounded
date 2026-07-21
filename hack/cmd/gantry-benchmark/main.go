@@ -55,6 +55,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return benchmark.enable(ctx)
 	case "preflight":
 		return benchmark.preflight(ctx)
+	case "report":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: gantry-benchmark report <run-id>")
+		}
+
+		return benchmark.regenerateComparison(args[1])
 	case "run":
 		return benchmark.runBenchmark(ctx)
 	case "status":
@@ -72,7 +78,8 @@ func printUsage(writer io.Writer) {
 Subcommands:
 	disable    restore the cluster and remove benchmark instrumentation
 	enable     install benchmark instrumentation after safety checks
-	preflight  validate proxy, ACR, monitoring, Gantry, and all 300 nodes
+	preflight  validate ACR metrics, monitoring, Gantry, and all target nodes
+	report     regenerate comparison artifacts for an existing local run
 	run        execute baseline and Gantry cold phases, then restore routing
 	status     print the active benchmark state
 	help       print this help

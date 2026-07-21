@@ -28,27 +28,22 @@ func renderHosts(state benchmarkState, mode hostsMode) (string, error) {
 	switch mode {
 	case hostsModeBaseline:
 		return fmt.Sprintf(`%s
-server = "http://%s:5002"
+server = "https://%s"
 
-[host."http://%s:5002"]
+[host."https://%s"]
   capabilities = ["pull", "resolve"]
-`, marker, state.ProxyClusterIP, state.ProxyClusterIP), nil
+`, marker, state.ACRLoginServer, state.ACRLoginServer), nil
 	case hostsModeGantry:
 		// STRICT mode: local Gantry is the ONLY upstream, with NO `server=`
 		// fall-through. If Gantry returns 5xx (peer exhausted, starting up,
 		// draining) containerd retries against Gantry rather than pulling the
-		// blob straight from the proxy. This is what attributes the cold-phase
-		// origin load to Gantry's pipeline cleanly: every byte the proxy sees
-		// came from Gantry's own origin client (the designated puller), never
-		// from a containerd-direct fall-through that would masquerade as
-		// "origin load" and collapse the measured dedup whenever Gantry is
-		// merely slow. Mirrors the upstream gantry benchmark methodology
+		// blob straight from ACR. This keeps the cold phase on Gantry's
+		// pipeline even when a pull is slow. Mirrors the upstream methodology
 		// (deploy/demo/hosts.toml.gantry-strict.template).
 		//
 		// With no `server=` line containerd derives ns=<registry-host> from the
 		// certs.d directory name, which matches the upstream's `name` in
-		// gantry-config directly (the ns_alias is only needed for the
-		// server=<proxy> shape).
+		// gantry-config directly.
 		return fmt.Sprintf(`%s
 [host."http://127.0.0.1:5000"]
   capabilities = ["pull", "resolve"]

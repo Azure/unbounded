@@ -4,20 +4,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"text/template"
 	"time"
 )
-
-const proxyManifestPath = "hack/gantry-benchmark/manifests/proxy.yaml.tmpl"
 
 func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	if err := b.config.validateEnable(); err != nil {
@@ -37,11 +30,6 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	}
 
 	runID, err := newRunID()
-	if err != nil {
-		return err
-	}
-
-	controlToken, err := randomHex(32)
 	if err != nil {
 		return err
 	}
@@ -105,7 +93,6 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		NodeCount:               b.config.NodeCount,
 		ImagePlatform:           b.config.ImagePlatform,
 		ACRLoginServer:          b.config.ACRLoginServer,
-		ProxyImage:              b.config.ProxyImage,
 		OriginalGantryConfig:    originalConfig,
 		OriginalGantryConfigSHA: gantryConfigSHA(originalConfig),
 		GantryRestored:          true,
@@ -114,66 +101,8 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	secret := map[string]any{
-		"apiVersion": "v1",
-		"kind":       "Secret",
-		"metadata": map[string]any{
-			"name":      "acr-origin-proxy",
-			"namespace": b.config.Namespace,
-		},
-		"type": "Opaque",
-		"stringData": map[string]string{
-			"username":      b.config.ACRUsername,
-			"password":      b.config.ACRPassword,
-			"control-token": controlToken,
-		},
-	}
-	if err := b.applyObject(ctx, secret); err != nil {
+	if err := b.applyObject(ctx, b.gantryPodMonitor()); err != nil {
 		return err
-	}
-
-	manifest, err := b.renderProxyManifest(proxyManifestData{
-		Namespace:       b.config.Namespace,
-		GantryNamespace: b.config.GantryNamespace,
-		MonitoringLabel: b.config.KPSRelease,
-		ProxyImage:      b.config.ProxyImage,
-		ACRLoginServer:  b.config.ACRLoginServer,
-		RunID:           runID,
-	})
-	if err != nil {
-		return err
-	}
-
-	if _, err := b.commands.Run(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
-		return err
-	}
-
-	if _, err := b.commands.Run(
-		ctx,
-		nil,
-		"kubectl",
-		"-n", b.config.Namespace,
-		"rollout", "status", "deployment/acr-origin-proxy",
-		"--timeout", b.config.RolloutTimeout.String(),
-	); err != nil {
-		return err
-	}
-
-	proxyIPOutput, err := b.commands.Run(
-		ctx,
-		nil,
-		"kubectl",
-		"-n", b.config.Namespace,
-		"get", "service", "acr-origin-proxy",
-		"-o", "jsonpath={.spec.clusterIP}",
-	)
-	if err != nil {
-		return err
-	}
-
-	proxyIP := strings.TrimSpace(string(proxyIPOutput))
-	if proxyIP == "" || strings.EqualFold(proxyIP, "None") {
-		return fmt.Errorf("proxy service has no ClusterIP")
 	}
 
 	if err := b.installDashboard(ctx); err != nil {
@@ -181,19 +110,6 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	}
 
 	dashboardInstalled = true
-
-	state.ProxyClusterIP = proxyIP
-
-	// Patch Gantry to route origin pulls through the counting proxy and roll it
-	// out now, at enable time. Restarting Gantry clears each agent's in-memory
-	// DHT routing table, and a 300-node cluster needs several minutes to
-	// re-converge. Doing it here - rather than inside `run`, immediately before
-	// the Gantry-cold phase - means `run` never restarts Gantry: the DHT is
-	// fully warm by the time the cold phase measures peer distribution.
-	// `disable` restores the original Gantry config.
-	if err := b.patchGantryForBenchmark(ctx, &state); err != nil {
-		return err
-	}
 
 	state.Status = "enabled"
 	if err := b.saveState(ctx, state); err != nil {
@@ -271,34 +187,42 @@ func (b *benchmark) applyObject(ctx context.Context, object any) error {
 	return err
 }
 
-type proxyManifestData struct {
-	Namespace       string
-	GantryNamespace string
-	MonitoringLabel string
-	ProxyImage      string
-	ACRLoginServer  string
-	RunID           string
-}
-
-func (b *benchmark) renderProxyManifest(data proxyManifestData) ([]byte, error) {
-	path := filepath.Join(b.config.RepoRoot, proxyManifestPath)
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read proxy manifest template: %w", err)
+func (b *benchmark) gantryPodMonitor() map[string]any {
+	return map[string]any{
+		"apiVersion": "monitoring.coreos.com/v1",
+		"kind":       "PodMonitor",
+		"metadata": map[string]any{
+			"name":      "gantry-benchmark-agent",
+			"namespace": b.config.Namespace,
+			"labels": map[string]string{
+				"release":                   b.config.KPSRelease,
+				"app.kubernetes.io/part-of": "gantry-benchmark",
+			},
+		},
+		"spec": map[string]any{
+			"namespaceSelector": map[string]any{
+				"matchNames": []string{b.config.GantryNamespace},
+			},
+			"selector": map[string]any{
+				"matchLabels": map[string]string{"app.kubernetes.io/name": b.config.GantryDaemonSet},
+			},
+			"podTargetLabels": []string{"controller-revision-hash"},
+			"podMetricsEndpoints": []any{
+				map[string]any{
+					"port":     "metrics",
+					"path":     "/metrics",
+					"interval": "10s",
+					"metricRelabelings": []any{
+						map[string]string{
+							"action":      "replace",
+							"targetLabel": "gantry_benchmark",
+							"replacement": "true",
+						},
+					},
+				},
+			},
+		},
 	}
-
-	tmpl, err := template.New("proxy").Option("missingkey=error").Parse(string(raw))
-	if err != nil {
-		return nil, fmt.Errorf("parse proxy manifest template: %w", err)
-	}
-
-	var rendered bytes.Buffer
-	if err := tmpl.Execute(&rendered, data); err != nil {
-		return nil, fmt.Errorf("render proxy manifest template: %w", err)
-	}
-
-	return rendered.Bytes(), nil
 }
 
 func newRunID() (string, error) {

@@ -11,13 +11,13 @@ import (
 func TestCompareResults(t *testing.T) {
 	config := benchmarkConfig{MinimumByteReduction: 0.90, MaximumLatencyRatio: 1.0}
 	baseline := phaseResult{
-		RunID: "run-1",
-		Proxy: proxyPhaseTotals{BytesUpstream: 300, RequestsCompleted: 100},
-		Job:   jobObservation{PodStartLatency: latencySummary{P50Seconds: 60, P95Seconds: 90}},
+		RunID:  "run-1",
+		Origin: originMetrics{EstimatedBytes: 300, ACR: acrPullMetrics{Successful: 100}},
+		Job:    jobObservation{PodStartLatency: latencySummary{P50Seconds: 60, P95Seconds: 90}},
 	}
 	gantry := phaseResult{
 		RunID:  "run-1",
-		Proxy:  proxyPhaseTotals{BytesUpstream: 15, RequestsCompleted: 20},
+		Origin: originMetrics{EstimatedBytes: 15, ACR: acrPullMetrics{Successful: 20}},
 		Gantry: gantryMetrics{PeerFetchHits: 50},
 		Job:    jobObservation{PodStartLatency: latencySummary{P50Seconds: 10, P95Seconds: 20}},
 	}
@@ -34,43 +34,48 @@ func TestCompareResults(t *testing.T) {
 
 func TestCompareResultsFailsWithoutPeerActivity(t *testing.T) {
 	config := benchmarkConfig{MinimumByteReduction: 0.50, MaximumLatencyRatio: 2.0}
-	baseline := phaseResult{RunID: "run-1", Proxy: proxyPhaseTotals{BytesUpstream: 100}, Job: jobObservation{PodStartLatency: latencySummary{P95Seconds: 10}}}
-	gantry := phaseResult{RunID: "run-1", Proxy: proxyPhaseTotals{BytesUpstream: 10}, Job: jobObservation{PodStartLatency: latencySummary{P95Seconds: 10}}}
+	baseline := phaseResult{RunID: "run-1", Origin: originMetrics{EstimatedBytes: 100}, Job: jobObservation{PodStartLatency: latencySummary{P95Seconds: 10}}}
+	gantry := phaseResult{RunID: "run-1", Origin: originMetrics{EstimatedBytes: 10}, Job: jobObservation{PodStartLatency: latencySummary{P95Seconds: 10}}}
 
 	if comparison := compareResults(config, baseline, gantry); comparison.Passed {
 		t.Fatal("comparison passed without Gantry peer activity")
 	}
 }
 
-func TestFetchProxyTotalsIncludesErrorCounts(t *testing.T) {
-	benchmark := &benchmark{
-		config: benchmarkConfig{Namespace: "gantry-benchmark"},
-		commands: staticPrometheusRunner{output: []byte(`{
-			"run_id":"run-1",
-			"phase":"baseline",
-			"totals":{"by_phase":{"baseline":{
-				"requests_completed":8,
-				"by_status":{"200":3,"429":2,"502":3},
-				"upstream_errors":{"connection_refused":2,"timeout":1}
-			}}}
-		}`)},
+func TestCompareResultsTreatsLatencyAsInformational(t *testing.T) {
+	config := benchmarkConfig{MinimumByteReduction: 0.50, MaximumLatencyRatio: 1.0}
+	baseline := phaseResult{RunID: "run-1", Origin: originMetrics{EstimatedBytes: 100}, Job: jobObservation{PodStartLatency: latencySummary{P95Seconds: 10}}}
+	gantry := phaseResult{
+		RunID:  "run-1",
+		Origin: originMetrics{EstimatedBytes: 10},
+		Gantry: gantryMetrics{PeerFetchHits: 1},
+		Job:    jobObservation{PodStartLatency: latencySummary{P95Seconds: 20}},
 	}
 
-	totals, err := benchmark.fetchProxyTotals(
-		context.Background(),
-		benchmarkState{RunID: "run-1"},
-		proxyPhaseBaseline,
-	)
-	if err != nil {
-		t.Fatalf("fetchProxyTotals: %v", err)
+	comparison := compareResults(config, baseline, gantry)
+	if !comparison.Passed {
+		t.Fatalf("comparison failed on informational latency: %+v", comparison.Checks)
 	}
 
-	if totals.ByStatus["429"] != 2 || totals.ByStatus["502"] != 3 {
-		t.Fatalf("status totals = %+v", totals.ByStatus)
+	latency := comparison.Checks["p95_latency_ratio"]
+	if latency.Passed || latency.Gating {
+		t.Fatalf("latency check = %+v, want failed informational check", latency)
+	}
+}
+
+func TestSubtractGantryMetricsIncludesOutcomeMaps(t *testing.T) {
+	before := gantryMetrics{
+		OriginFailures:    map[string]float64{"rate_limited": 2},
+		PeerFetchOutcomes: map[string]float64{"hit": 10, "busy": 5},
+	}
+	after := gantryMetrics{
+		OriginFailures:    map[string]float64{"rate_limited": 3},
+		PeerFetchOutcomes: map[string]float64{"hit": 15, "busy": 9},
 	}
 
-	if totals.UpstreamErrors["connection_refused"] != 2 || totals.UpstreamErrors["timeout"] != 1 {
-		t.Fatalf("upstream errors = %+v", totals.UpstreamErrors)
+	delta := subtractGantryMetrics(after, before)
+	if delta.OriginFailures["rate_limited"] != 1 || delta.PeerFetchOutcomes["hit"] != 5 || delta.PeerFetchOutcomes["busy"] != 4 {
+		t.Fatalf("delta = %+v", delta)
 	}
 }
 

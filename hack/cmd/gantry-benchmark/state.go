@@ -29,8 +29,6 @@ type benchmarkState struct {
 	NodeCount               int    `json:"node_count"`
 	ImagePlatform           string `json:"image_platform"`
 	ACRLoginServer          string `json:"acr_login_server"`
-	ProxyImage              string `json:"proxy_image"`
-	ProxyClusterIP          string `json:"proxy_cluster_ip"`
 	OriginalGantryConfig    string `json:"original_gantry_config"`
 	OriginalGantryConfigSHA string `json:"original_gantry_config_sha256"`
 	PatchedGantryConfigSHA  string `json:"patched_gantry_config_sha256,omitempty"`
@@ -243,7 +241,6 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 		state.NodeCount <= 0 ||
 		state.ImagePlatform == "" ||
 		state.ACRLoginServer == "" ||
-		state.ProxyImage == "" ||
 		state.OriginalGantryConfig == "" {
 		return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete")
 	}

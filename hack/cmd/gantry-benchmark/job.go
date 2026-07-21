@@ -51,7 +51,7 @@ type podList struct {
 	} `json:"items"`
 }
 
-func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase proxyPhase, image string) (jobObservation, error) {
+func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase benchmarkPhase, image string) (jobObservation, error) {
 	phaseLabel := strings.ReplaceAll(string(phase), "_", "-")
 
 	jobName := "gantry-benchmark-" + phaseLabel + "-" + state.RunID

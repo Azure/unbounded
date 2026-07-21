@@ -33,8 +33,8 @@ func (b *benchmark) loginRegistry(ctx context.Context) error {
 	return nil
 }
 
-func (b *benchmark) buildFreshImage(ctx context.Context, state benchmarkState, phase proxyPhase) (string, error) {
-	if phase != proxyPhaseBaseline && phase != proxyPhaseGantryCold {
+func (b *benchmark) buildFreshImage(ctx context.Context, state benchmarkState, phase benchmarkPhase) (string, error) {
+	if phase != phaseBaseline && phase != phaseGantryCold {
 		return "", fmt.Errorf("cannot build image for phase %q", phase)
 	}
 

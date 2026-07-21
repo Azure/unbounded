@@ -25,7 +25,6 @@ type benchmarkConfig struct {
 	ACRLoginServer       string
 	ACRUsername          string
 	ACRPassword          string
-	ProxyImage           string
 	WorkloadRepository   string
 	ImagePlatform        string
 	ContainerEngine      string
@@ -35,6 +34,7 @@ type benchmarkConfig struct {
 	ImageLayers          int
 	JobTimeout           time.Duration
 	RolloutTimeout       time.Duration
+	MetricsSettleTime    time.Duration
 	MinimumByteReduction float64
 	MaximumLatencyRatio  float64
 	StateRoot            string
@@ -71,6 +71,11 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		return benchmarkConfig{}, err
 	}
 
+	metricsSettleTime, err := envDuration(getenv, "BENCHMARK_METRICS_SETTLE_TIME", 2*time.Minute)
+	if err != nil {
+		return benchmarkConfig{}, err
+	}
+
 	minimumByteReduction, err := envFloat(getenv, "BENCHMARK_MINIMUM_BYTE_REDUCTION", 0.90)
 	if err != nil {
 		return benchmarkConfig{}, err
@@ -93,7 +98,6 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		ACRLoginServer:       getenv("ACR_LOGIN_SERVER"),
 		ACRUsername:          getenv("ACR_USERNAME"),
 		ACRPassword:          getenv("ACR_PASSWORD"),
-		ProxyImage:           getenv("BENCHMARK_PROXY_IMAGE"),
 		WorkloadRepository:   envDefault(getenv, "BENCHMARK_WORKLOAD_REPOSITORY", "gantry-benchmark-pull"),
 		ImagePlatform:        envDefault(getenv, "BENCHMARK_IMAGE_PLATFORM", "linux/amd64"),
 		ContainerEngine:      envDefault(getenv, "CONTAINER_ENGINE", "podman"),
@@ -103,6 +107,7 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		ImageLayers:          imageLayers,
 		JobTimeout:           jobTimeout,
 		RolloutTimeout:       rolloutTimeout,
+		MetricsSettleTime:    metricsSettleTime,
 		MinimumByteReduction: minimumByteReduction,
 		MaximumLatencyRatio:  maximumLatencyRatio,
 		StateRoot:            filepath.Join(repoRoot, "tmp", "gantry-benchmark"),
@@ -132,6 +137,10 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		return benchmarkConfig{}, errors.New("benchmark maximum latency ratio must be greater than zero")
 	}
 
+	if config.MetricsSettleTime < 0 {
+		return benchmarkConfig{}, errors.New("benchmark metrics settle time cannot be negative")
+	}
+
 	return config, nil
 }
 
@@ -139,10 +148,7 @@ func (c benchmarkConfig) validateEnable() error {
 	var missing []string
 
 	for name, value := range map[string]string{
-		"ACR_LOGIN_SERVER":      c.ACRLoginServer,
-		"ACR_USERNAME":          c.ACRUsername,
-		"ACR_PASSWORD":          c.ACRPassword,
-		"BENCHMARK_PROXY_IMAGE": c.ProxyImage,
+		"ACR_LOGIN_SERVER": c.ACRLoginServer,
 	} {
 		if value == "" {
 			missing = append(missing, name)

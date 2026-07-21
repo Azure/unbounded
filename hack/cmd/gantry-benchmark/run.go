@@ -50,14 +50,14 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 
 	writeAll(b.stdout, "building fresh baseline image\n")
 
-	baselineImage, err := b.buildFreshImage(ctx, state, proxyPhaseBaseline)
+	baselineImage, err := b.buildFreshImage(ctx, state, phaseBaseline)
 	if err != nil {
 		return err
 	}
 
 	writeAll(b.stdout, "building fresh Gantry cold image\n")
 
-	gantryImage, err := b.buildFreshImage(ctx, state, proxyPhaseGantryCold)
+	gantryImage, err := b.buildFreshImage(ctx, state, phaseGantryCold)
 	if err != nil {
 		return err
 	}
@@ -66,16 +66,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		cleanupContext, cancel := context.WithTimeout(context.Background(), 3*b.config.RolloutTimeout)
 		defer cancel()
 
-		if summaryErr := b.writeProxySummaryArtifact(cleanupContext, state); summaryErr != nil {
-			writeAll(b.stderr, fmt.Sprintf("warning: save proxy summary during cleanup: %v\n", summaryErr))
-		}
-
-		if phaseErr := b.switchProxyPhase(cleanupContext, proxyPhaseIdle); phaseErr != nil {
-			writeAll(b.stderr, fmt.Sprintf("warning: switch proxy to idle during cleanup: %v\n", phaseErr))
-		}
-
-		// Gantry is patched at enable and restored at disable, so `run` never
-		// restarts Gantry. Only the containerd host routing is restored here.
+		// Only the containerd host routing changes during a run.
 		restoreErr := b.restoreHosts(cleanupContext, state)
 		if restoreErr != nil {
 			state.Status = "restore-failed"
@@ -108,34 +99,47 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if err := b.switchProxyPhase(ctx, proxyPhaseBaseline); err != nil {
+	baselineKubeletBefore, err := b.fetchKubeletPullMetrics(ctx)
+	if err != nil {
 		return err
 	}
 
 	writeAll(b.stdout, fmt.Sprintf("running baseline pull on %d nodes\n", b.config.NodeCount))
 
-	baselineJob, err := b.runPullJob(ctx, state, proxyPhaseBaseline, baselineImage)
+	baselineJob, err := b.runPullJob(ctx, state, phaseBaseline, baselineImage)
 	if err != nil {
 		return err
 	}
 
-	if err := b.switchProxyPhase(ctx, proxyPhaseSetup); err != nil {
+	baselineIssues, err := b.fetchPullIssues(ctx, baselineJob.JobName)
+	if err != nil {
 		return err
 	}
 
-	baselineProxy, err := b.fetchProxyTotals(ctx, state, proxyPhaseBaseline)
+	baselineACR, err := b.waitForACRPullMetrics(ctx, baselineJob.PhaseStartedAt, baselineJob.PhaseFinishedAt)
+	if err != nil {
+		return err
+	}
+
+	baselineKubeletAfter, err := b.fetchKubeletPullMetrics(ctx)
 	if err != nil {
 		return err
 	}
 
 	baselineResult := phaseResult{
 		RunID:        state.RunID,
-		Phase:        proxyPhaseBaseline,
+		Phase:        phaseBaseline,
 		Image:        baselineImage,
 		ImageSizeMiB: b.config.ImageSizeMiB,
-		Proxy:        baselineProxy,
-		Job:          baselineJob,
-		RecordedAt:   time.Now().UTC(),
+		Origin: originMetrics{
+			ACR:            baselineACR,
+			EstimatedBytes: estimatedBaselineBytes(len(baselineJob.Nodes), b.config.ImageSizeMiB),
+			EstimateMethod: "completed nodes multiplied by configured image payload size",
+		},
+		Kubelet:    subtractKubeletPullMetrics(baselineKubeletAfter, baselineKubeletBefore),
+		Issues:     baselineIssues,
+		Job:        baselineJob,
+		RecordedAt: time.Now().UTC(),
 	}
 	if err := b.writeJSONArtifact(state.RunID, "baseline.json", baselineResult); err != nil {
 		return err
@@ -146,9 +150,6 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	// Gantry was already patched and rolled out at enable time, so its DHT has
-	// long since re-converged. Only the containerd host routing changes here;
-	// `run` never restarts Gantry.
 	if err := b.installHosts(ctx, state, hostsModeGantry); err != nil {
 		return err
 	}
@@ -167,18 +168,25 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if err := b.switchProxyPhase(ctx, proxyPhaseGantryCold); err != nil {
+	gantryKubeletBefore, err := b.fetchKubeletPullMetrics(ctx)
+	if err != nil {
 		return err
 	}
 
 	writeAll(b.stdout, fmt.Sprintf("running Gantry cold pull on %d nodes\n", b.config.NodeCount))
 
-	gantryJob, err := b.runPullJob(ctx, state, proxyPhaseGantryCold, gantryImage)
+	gantryJob, err := b.runPullJob(ctx, state, phaseGantryCold, gantryImage)
 	if err != nil {
 		return err
 	}
 
-	if err := b.switchProxyPhase(ctx, proxyPhaseSetup); err != nil {
+	gantryIssues, err := b.fetchPullIssues(ctx, gantryJob.JobName)
+	if err != nil {
+		return err
+	}
+
+	gantryACR, err := b.waitForACRPullMetrics(ctx, gantryJob.PhaseStartedAt, gantryJob.PhaseFinishedAt)
+	if err != nil {
 		return err
 	}
 
@@ -187,20 +195,30 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	gantryProxy, err := b.fetchProxyTotals(ctx, state, proxyPhaseGantryCold)
+	gantryKubeletAfter, err := b.fetchKubeletPullMetrics(ctx)
 	if err != nil {
 		return err
 	}
 
 	gantryResult := phaseResult{
 		RunID:        state.RunID,
-		Phase:        proxyPhaseGantryCold,
+		Phase:        phaseGantryCold,
 		Image:        gantryImage,
 		ImageSizeMiB: b.config.ImageSizeMiB,
-		Proxy:        gantryProxy,
-		Gantry:       phaseMetrics,
-		Job:          gantryJob,
-		RecordedAt:   time.Now().UTC(),
+		Origin: originMetrics{
+			ACR: gantryACR,
+			EstimatedBytes: estimatedGantryOriginBytes(
+				phaseMetrics.OriginLayerPullSuccesses,
+				b.config.ImageSizeMiB,
+				b.config.ImageLayers,
+			),
+			EstimateMethod: "successful Gantry origin layer pulls multiplied by average configured layer size",
+		},
+		Kubelet:    subtractKubeletPullMetrics(gantryKubeletAfter, gantryKubeletBefore),
+		Issues:     gantryIssues,
+		Gantry:     phaseMetrics,
+		Job:        gantryJob,
+		RecordedAt: time.Now().UTC(),
 	}
 	if err := b.writeJSONArtifact(state.RunID, "gantry-cold.json", gantryResult); err != nil {
 		return err
@@ -212,9 +230,9 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	}
 
 	writeAll(b.stdout, fmt.Sprintf(
-		"origin bytes: baseline=%d Gantry=%d reduction=%.2f%%\n",
-		baselineResult.Proxy.BytesUpstream,
-		gantryResult.Proxy.BytesUpstream,
+		"estimated origin bytes: baseline=%d Gantry=%d reduction=%.2f%%\n",
+		baselineResult.Origin.EstimatedBytes,
+		gantryResult.Origin.EstimatedBytes,
 		100*comparison.OriginByteReduction,
 	))
 	writeAll(b.stdout, fmt.Sprintf(
@@ -224,7 +242,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	))
 
 	if !comparison.Passed {
-		return fmt.Errorf("benchmark completed but regression gates failed; see %s", b.config.StateRoot+"/"+state.RunID+"/comparison.json")
+		return fmt.Errorf("benchmark completed but gating checks failed; see %s", b.config.StateRoot+"/"+state.RunID+"/comparison.json")
 	}
 
 	return nil

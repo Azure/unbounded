@@ -6,67 +6,67 @@
     {
       "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
       "id": 100,
-      "title": "Origin comparison",
+      "title": "Native pull telemetry",
       "type": "row"
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "decbytes"}},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
       "gridPos": {"h": 6, "w": 6, "x": 0, "y": 1},
       "id": 1,
       "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
       "targets": [
-        {"expr": "sum by (phase) (origin_bytes_upstream_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}}", "refId": "A"}
+        {"expr": "sum(rate(kubelet_runtime_operations_total{operation_type=\"pull_image\"}[1m]))", "legendFormat": "pulls", "refId": "A"}
       ],
-      "title": "ACR upstream bytes",
+      "title": "Kubelet pull operations/sec",
       "type": "stat"
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "decbytes"}},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
       "gridPos": {"h": 6, "w": 6, "x": 6, "y": 1},
       "id": 2,
       "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
       "targets": [
-        {"expr": "sum by (phase) (origin_bytes_to_client_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}}", "refId": "A"}
+        {"expr": "sum(rate(kubelet_runtime_operations_errors_total{operation_type=\"pull_image\"}[1m]))", "legendFormat": "errors", "refId": "A"}
       ],
-      "title": "Bytes delivered to clients",
+      "title": "Kubelet pull errors/sec",
       "type": "stat"
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "short"}},
+      "fieldConfig": {"defaults": {"unit": "s"}},
       "gridPos": {"h": 6, "w": 6, "x": 12, "y": 1},
       "id": 3,
       "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
       "targets": [
-        {"expr": "sum by (phase,path_class) (origin_requests_completed_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}} {{path_class}}", "refId": "A"}
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(kubelet_image_pull_duration_seconds_bucket[5m])))", "legendFormat": "P95", "refId": "A"}
       ],
-      "title": "Origin requests by phase and path",
+      "title": "Kubelet image pull P95",
       "type": "stat"
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
       "gridPos": {"h": 6, "w": 6, "x": 18, "y": 1},
       "id": 4,
       "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
       "targets": [
-        {"expr": "1 - sum(origin_bytes_upstream_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=\"gantry_cold\",gantry_benchmark=\"true\"}) / sum(origin_bytes_upstream_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=\"baseline\",gantry_benchmark=\"true\"})", "refId": "A"}
+        {"expr": "sum(rate(p2p_origin_pull_success_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "refId": "A"}
       ],
-      "title": "Origin byte reduction",
+      "title": "Gantry origin successes/sec",
       "type": "stat"
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "Bps"}},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7},
       "id": 5,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}},
       "targets": [
-        {"expr": "sum by (phase,path_class) (rate(origin_bytes_upstream_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "{{phase}} {{path_class}}", "refId": "A"}
+        {"expr": "sum by (outcome) (rate(p2p_peer_fetch_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "{{outcome}}", "refId": "A"}
       ],
-      "title": "ACR bytes/sec by phase and path",
+      "title": "Gantry peer fetches/sec",
       "type": "timeseries"
     },
     {
@@ -76,9 +76,9 @@
       "id": 6,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}},
       "targets": [
-        {"expr": "sum by (phase,client_class,path_class) (rate(origin_requests_completed_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "{{phase}} {{client_class}} {{path_class}}", "refId": "A"}
+        {"expr": "sum by (class) (rate(p2p_origin_pull_failure_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "{{class}}", "refId": "A"}
       ],
-      "title": "Origin requests/sec by phase, caller, and path",
+      "title": "Gantry origin failures/sec",
       "type": "timeseries"
     },
     {
@@ -179,28 +179,28 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "description": "HTTP error responses returned by the proxy. Upstream ACR responses pass through unchanged; proxy-generated 502 responses are classified separately in the transport-errors panel.",
+      "description": "Kubelet CRI pull errors across the cluster. Phase totals are persisted in the benchmark artifacts.",
       "fieldConfig": {"defaults": {"unit": "short"}},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
       "id": 10,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}},
       "targets": [
-        {"expr": "sum by (phase,status) (origin_requests_completed_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",status=~\"4..|5..\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}} HTTP {{status}}", "refId": "A"}
+        {"expr": "sum(rate(kubelet_runtime_operations_errors_total{operation_type=\"pull_image\"}[1m]))", "legendFormat": "pull_image", "refId": "A"}
       ],
-      "title": "HTTP errors by status",
+      "title": "Kubelet pull errors",
       "type": "timeseries"
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "description": "Transport failures before ACR returned an HTTP response, classified into bounded reasons such as timeout, connection_refused, connection_reset, dns, and other.",
+      "description": "Gantry origin failures classified as auth, not_found, rate_limited, transient, or unspecified.",
       "fieldConfig": {"defaults": {"unit": "short"}},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
       "id": 11,
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}},
       "targets": [
-        {"expr": "sum by (phase,reason) (origin_upstream_errors_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}} {{reason}}", "refId": "A"}
+        {"expr": "sum by (class) (rate(p2p_origin_pull_failure_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "{{class}}", "refId": "A"}
       ],
-      "title": "Upstream transport errors",
+      "title": "Gantry origin errors",
       "type": "timeseries"
     }
   ],
@@ -210,7 +210,7 @@
   "templating": {
     "list": [
       {"current": {"text": "gantry-benchmark", "value": "gantry-benchmark"}, "hide": 0, "label": "Benchmark namespace", "name": "namespace", "options": [{"selected": true, "text": "gantry-benchmark", "value": "gantry-benchmark"}], "query": "gantry-benchmark", "type": "custom"},
-      {"current": {}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "definition": "label_values(origin_requests_completed_total{namespace=\"$namespace\",gantry_benchmark=\"true\"},run_id)", "includeAll": false, "label": "Run ID", "name": "run_id", "query": {"query": "label_values(origin_requests_completed_total{namespace=\"$namespace\",gantry_benchmark=\"true\"},run_id)", "refId": "PrometheusVariableQueryEditor-VariableQuery"}, "refresh": 1, "sort": 2, "type": "query"},
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "definition": "label_values(kube_pod_labels{namespace=\"$namespace\",label_app_kubernetes_io_name=\"gantry-benchmark-pull\"},label_gantry_unbounded_cloud_io_run_id)", "includeAll": false, "label": "Run ID", "name": "run_id", "query": {"query": "label_values(kube_pod_labels{namespace=\"$namespace\",label_app_kubernetes_io_name=\"gantry-benchmark-pull\"},label_gantry_unbounded_cloud_io_run_id)", "refId": "PrometheusVariableQueryEditor-VariableQuery"}, "refresh": 1, "sort": 2, "type": "query"},
       {"current": {"text": "gantry-system", "value": "gantry-system"}, "hide": 0, "label": "Gantry namespace", "name": "gantry_namespace", "options": [{"selected": true, "text": "gantry-system", "value": "gantry-system"}], "query": "gantry-system", "type": "custom"}
     ]
   },
@@ -218,5 +218,5 @@
   "timezone": "browser",
   "title": "Gantry ACR Benchmark",
   "uid": "gantry-acr-benchmark",
-  "version": 4
+  "version": 5
 }
