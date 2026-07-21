@@ -57,6 +57,41 @@ func TestSetPodSpecImages(t *testing.T) {
 	}
 }
 
+func TestSetNamedContainerImage(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			"initContainers": []any{map[string]any{"name": "install", "image": "keep:init"}},
+			"containers": []any{
+				map[string]any{"name": "run", "image": "old:run"},
+				map[string]any{"name": "sidecar", "image": "keep:sidecar"},
+			},
+		}}},
+	}}
+
+	if err := SetNamedContainerImage(obj, "run", "registry.example.com/azure/component:v1"); err != nil {
+		t.Fatalf("SetNamedContainerImage: %v", err)
+	}
+
+	initContainers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "initContainers")
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+
+	if got := initContainers[0].(map[string]any)["image"]; got != "keep:init" {
+		t.Fatalf("init container image = %q", got)
+	}
+
+	if got := containers[0].(map[string]any)["image"]; got != "registry.example.com/azure/component:v1" {
+		t.Fatalf("named container image = %q", got)
+	}
+
+	if got := containers[1].(map[string]any)["image"]; got != "keep:sidecar" {
+		t.Fatalf("sidecar image = %q", got)
+	}
+
+	if err := SetNamedContainerImage(obj, "missing", "unused"); err == nil || err.Error() != `container "missing" not found` {
+		t.Fatalf("missing container error = %v", err)
+	}
+}
+
 func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 

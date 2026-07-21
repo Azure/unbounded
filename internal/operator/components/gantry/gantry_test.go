@@ -126,7 +126,12 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		"apiVersion": "apps/v1",
 		"kind":       "DaemonSet",
 		"metadata":   map[string]any{"name": daemonSetName},
-		"spec":       map[string]any{"template": map[string]any{"metadata": map[string]any{}}},
+		"spec": map[string]any{"template": map[string]any{
+			"metadata": map[string]any{},
+			"spec": map[string]any{"containers": []any{
+				map[string]any{"name": agentContainerName, "image": "placeholder"},
+			}},
+		}},
 	}}
 
 	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash", "node-hash")(ds); err != nil {
@@ -285,6 +290,10 @@ func TestReconcileRetainedWhenAllSitesOptOut(t *testing.T) {
 		t.Fatalf("Reconcile = %+v, want ready with Disabled", res)
 	}
 
+	if res.Message != "no site enables gantry" {
+		t.Fatalf("disabled message = %q", res.Message)
+	}
+
 	if len(applied) != 0 {
 		t.Fatalf("opted-out reconcile applied objects from nothing: %#v", applied)
 	}
@@ -292,16 +301,30 @@ func TestReconcileRetainedWhenAllSitesOptOut(t *testing.T) {
 
 func TestReconcileRetainsExistingWhenAllSitesOptOut(t *testing.T) {
 	no := false
-	existingDS := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: daemonSetName}}
-	env, applied := reconcilerEnv(t, existingDS)
 
-	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", &no)})
-	if !res.Ready || res.Err != nil {
-		t.Fatalf("Reconcile = %+v, want ready", res)
-	}
+	for _, tc := range []struct {
+		name     string
+		existing client.Object
+	}{
+		{name: "agent config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: configName}}},
+		{name: "agent DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: daemonSetName}}},
+		{name: "node config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: nodeConfigName}}},
+		{name: "node-config DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: nodeConfigDaemonSetName}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, applied := reconcilerEnv(t, tc.existing)
 
-	if !applied["DaemonSet/gantry"] {
-		t.Fatalf("retained gantry install was not reconciled; applied=%#v", applied)
+			res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", &no)})
+			if !res.Ready || res.Err != nil {
+				t.Fatalf("Reconcile = %+v, want ready", res)
+			}
+
+			for _, want := range []string{"DaemonSet/gantry", "DaemonSet/gantry-containerd-config"} {
+				if !applied[want] {
+					t.Fatalf("retained gantry install did not reconcile %s; applied=%#v", want, applied)
+				}
+			}
+		})
 	}
 }
 
@@ -343,10 +366,22 @@ func TestResourcesExist(t *testing.T) {
 		t.Fatalf("resourcesExist on empty cluster = %t, %v", got, err)
 	}
 
-	envWithDS := testEnv(t, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: daemonSetName}})
+	for _, tc := range []struct {
+		name     string
+		existing client.Object
+	}{
+		{name: "agent config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: configName}}},
+		{name: "agent DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: daemonSetName}}},
+		{name: "node config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: nodeConfigName}}},
+		{name: "node-config DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: nodeConfigDaemonSetName}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv(t, tc.existing)
 
-	got, err = resourcesExist(t.Context(), envWithDS)
-	if err != nil || !got {
-		t.Fatalf("resourcesExist with DaemonSet = %t, %v", got, err)
+			got, err := resourcesExist(t.Context(), env)
+			if err != nil || !got {
+				t.Fatalf("resourcesExist = %t, %v", got, err)
+			}
+		})
 	}
 }

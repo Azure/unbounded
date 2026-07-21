@@ -7,9 +7,9 @@
 // components it defaults to enabled: it is deployed unless every Site explicitly
 // opts out via spec.components.gantry.enabled=false.
 //
-// Note: deploying the gantry workload does not by itself route node containerd
-// through the mirror; that requires a per-node containerd hosts.toml under
-// /etc/containerd/certs.d, which is not yet managed by the operator.
+// The component also manages the per-node containerd wiring: a helper DaemonSet
+// writes /etc/containerd/certs.d/_default/hosts.toml so pulls use the node-local
+// gantry agent as their default mirror.
 package gantry
 
 import (
@@ -102,7 +102,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		}
 
 		if !retained {
-			return component.Disabled("no site enables gantry; retained")
+			return component.Disabled("no site enables gantry")
 		}
 	}
 
@@ -165,6 +165,8 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 	}{
 		{name: configName, object: &corev1.ConfigMap{}},
 		{name: daemonSetName, object: &appsv1.DaemonSet{}},
+		{name: nodeConfigName, object: &corev1.ConfigMap{}},
+		{name: nodeConfigDaemonSetName, object: &appsv1.DaemonSet{}},
 	} {
 		key := client.ObjectKey{Namespace: env.Namespace, Name: resource.name}
 		if err := env.Client.Get(ctx, key, resource.object); err == nil {

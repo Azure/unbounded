@@ -110,6 +110,8 @@ func SetPodSpecImages(obj *unstructured.Unstructured, image string) error {
 // mixes an operator-managed image with pinned helper images (for example a
 // component whose pod also runs a busybox init) keeps those helper images.
 func SetNamedContainerImage(obj *unstructured.Unstructured, name, image string) error {
+	foundContainer := false
+
 	for _, field := range []string{"initContainers", "containers"} {
 		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
 		if err != nil {
@@ -131,6 +133,7 @@ func SetNamedContainerImage(obj *unstructured.Unstructured, name, image string) 
 			if container["name"] == name {
 				container["image"] = image
 				changed = true
+				foundContainer = true
 			}
 		}
 
@@ -139,6 +142,10 @@ func SetNamedContainerImage(obj *unstructured.Unstructured, name, image string) 
 				return fmt.Errorf("set %s: %w", field, err)
 			}
 		}
+	}
+
+	if !foundContainer {
+		return fmt.Errorf("container %q not found", name)
 	}
 
 	return nil

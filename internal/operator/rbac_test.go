@@ -168,6 +168,12 @@ func TestOperatorClusterRoleAllowsGantryPriorityClass(t *testing.T) {
 			t.Fatalf("operator ClusterRole must grant %q on priorityclasses (needed to install the gantry PriorityClass)", verb)
 		}
 	}
+
+	for _, verb := range []string{"delete", "deletecollection"} {
+		if clusterRoleGrants(cr, "scheduling.k8s.io", "priorityclasses", verb) {
+			t.Fatalf("operator ClusterRole must not grant %q on priorityclasses", verb)
+		}
+	}
 }
 
 func TestOperatorClusterRoleGrantsForeignWorkloadAudit(t *testing.T) {
