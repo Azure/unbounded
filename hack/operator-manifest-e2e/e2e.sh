@@ -213,10 +213,13 @@ deploy_and_verify() {
     local manifest=$1 images
     log "applying the sed-patched single-file release artifact"
     kubectl_e2e apply -f "${manifest}"
+    kubectl_e2e -n "${NAMESPACE}" rollout status deploy/unbounded-operator --timeout=360s
+    kubectl_e2e wait --for=create \
+        crd/sites.unbounded-cloud.io crd/sitenodeslices.net.unbounded-cloud.io \
+        --timeout=300s
     kubectl_e2e wait --for=condition=Established \
         crd/sites.unbounded-cloud.io crd/sitenodeslices.net.unbounded-cloud.io \
         --timeout=300s
-    kubectl_e2e -n "${NAMESPACE}" rollout status deploy/unbounded-operator --timeout=360s
 
     assert_image deploy/unbounded-operator "${REGISTRY}/azure/unbounded-operator:${VERSION}"
     create_site
