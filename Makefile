@@ -483,13 +483,13 @@ lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Run all tests with race detector
+test: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Run all tests (implies lint)
+test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
@@ -497,13 +497,13 @@ endif
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-build: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build all Go packages
+build: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck for known vulnerabilities
 	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
 	@# available. Theoretical DHT content-censorship attack, not exploitable in
 	@# gantry's private-cluster deployment model. Tracked upstream at
@@ -609,7 +609,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
-unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build the unbounded-operator binary (no lint/test)
+unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
@@ -652,7 +652,8 @@ gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rende
 	$(GOCMD) run ./hack/cmd/render-manifests \
 		--templates-dir $(GANTRY_MANIFEST_TEMPLATES_DIR) \
 		--output-dir $(GANTRY_MANIFEST_RENDERED_DIR) \
-		--set Namespace=$(GANTRY_NAMESPACE)
+		--set Namespace=$(GANTRY_NAMESPACE) \
+		--set Image=$(GANTRY_IMAGE)
 	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
 
 # Inventory render knobs. SSLMode/Password feed the database config and

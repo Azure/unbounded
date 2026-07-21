@@ -22,6 +22,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/gantry"
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
@@ -67,6 +68,7 @@ func DefaultRegistry() *component.Registry {
 		Cluster: []component.ClusterComponent{
 			netcomponent.New(),
 			machina.New(),
+			gantry.New(),
 		},
 		Site: []component.SiteComponent{
 			metalman.New(),

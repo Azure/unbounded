@@ -27,6 +27,7 @@ func init() {
 // +kubebuilder:printcolumn:name="Machina",type=boolean,JSONPath=".spec.components.machina.enabled",priority=1
 // +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled",priority=1
 // +kubebuilder:printcolumn:name="Storage",type=boolean,JSONPath=".spec.components.storage.enabled",priority=1
+// +kubebuilder:printcolumn:name="Gantry",type=boolean,JSONPath=".spec.components.gantry.enabled",priority=1
 // +kubebuilder:printcolumn:name="Nodes",type=integer,JSONPath=".status.nodeCount"
 // +kubebuilder:printcolumn:name="Slices",type=integer,JSONPath=".status.sliceCount"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
@@ -125,6 +126,16 @@ type SiteComponents struct {
 	// Storage configures the unbounded-storage supervisor for this site.
 	// +optional
 	Storage *StorageComponentSpec `json:"storage,omitempty"`
+
+	// Gantry configures the gantry peer-to-peer OCI distribution agent for this
+	// site. Unlike the other components, gantry defaults to enabled; set
+	// gantry.enabled to false to opt a site out. The apiserver defaults an
+	// omitted gantry block to enabled=true so the intent is explicit on read
+	// (for example the Gantry print column) whenever a components block is
+	// present. A site that omits the components block entirely is not defaulted.
+	// +optional
+	// +kubebuilder:default={enabled: true}
+	Gantry *GantryComponentSpec `json:"gantry,omitempty"`
 }
 
 // SiteComponentSpec contains common component configuration. Components install
@@ -161,6 +172,14 @@ type MetalmanComponentSpec struct {
 // unbounded-storage-config-<site>: the operator creates it from the embedded
 // default when absent and preserves/adopts it when present.
 type StorageComponentSpec struct {
+	SiteComponentSpec `json:",inline"`
+}
+
+// GantryComponentSpec configures the gantry peer-to-peer OCI distribution agent
+// for a site. Gantry is a cluster-wide singleton and, unlike the other
+// components, defaults to enabled: it is reconciled unless a site explicitly
+// sets enabled to false.
+type GantryComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
 }
 

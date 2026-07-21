@@ -51,6 +51,11 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.k8s.io"]
+    # The gantry component installs a low-priority PriorityClass (gantry-low)
+    # so its agents are preemptible under cluster pressure.
+    resources: ["priorityclasses"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     # escalate + bind let the operator install the component RBAC (net,
