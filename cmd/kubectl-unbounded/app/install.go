@@ -53,7 +53,7 @@ type installHandler struct {
 	namespace      string
 
 	operatorImage     string
-	metalmanImage     string
+	imageRegistry     string
 	apiServerEndpoint string
 
 	wait    bool
@@ -93,7 +93,7 @@ func addInstallFlags(cmd *cobra.Command, handler *installHandler) {
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.namespace, "namespace", unbounded.SystemNamespace(), "Namespace for unbounded-operator and default components")
 	cmd.Flags().StringVar(&handler.operatorImage, "operator-image", "", "unbounded-operator image override")
-	cmd.Flags().StringVar(&handler.metalmanImage, "metalman-image", "", "metalman image override")
+	cmd.Flags().StringVar(&handler.imageRegistry, "image-registry", "", "Registry for operator-managed component images")
 	cmd.Flags().StringVar(&handler.apiServerEndpoint, "api-server-endpoint", "", "Override the Kubernetes API server endpoint advertised to provisioned machines; by default the operator auto-discovers it from kube-public/cluster-info, or the KUBERNETES_SERVICE_HOST FQDN on clusters (e.g. AKS) that do not publish cluster-info")
 	cmd.Flags().BoolVar(&handler.wait, "wait", true, "Wait for unbounded-operator rollout")
 	cmd.Flags().DurationVar(&handler.timeout, "timeout", defaultInstallTimeout, "Timeout for rollout waits")
@@ -242,7 +242,6 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 		}{
 			{prefix: "--leader-elect-namespace=", value: h.namespace},
 			{prefix: "--namespace=", value: h.namespace},
-			{prefix: "--metalman-image=", value: h.metalmanImage},
 		} {
 			if err := replaceContainerArg(obj, "controller", replacement.prefix, replacement.value); err != nil {
 				return err
@@ -289,6 +288,7 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	// override is preserved across reinstalls (like the reaper flag) rather than
 	// being cleared or replaced with the kubeconfig host.
 	endpoint := ""
+	imageRegistry := "ghcr.io"
 	reapLegacyResources := true
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
@@ -306,6 +306,9 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 		}
 
 		endpoint = data["UNBOUNDED_API_SERVER_ENDPOINT"]
+		if value := data["UNBOUNDED_IMAGE_REGISTRY"]; value != "" {
+			imageRegistry = value
+		}
 
 		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
 			parsed, err := strconv.ParseBool(value)
@@ -320,9 +323,13 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	if h.apiServerEndpoint != "" {
 		endpoint = h.apiServerEndpoint
 	}
+	if h.imageRegistry != "" {
+		imageRegistry = h.imageRegistry
+	}
 
 	h.operatorConfigData = map[string]string{
 		"UNBOUNDED_API_SERVER_ENDPOINT":   endpoint,
+		"UNBOUNDED_IMAGE_REGISTRY":        imageRegistry,
 		"UNBOUNDED_REAP_LEGACY_RESOURCES": strconv.FormatBool(reapLegacyResources),
 	}
 

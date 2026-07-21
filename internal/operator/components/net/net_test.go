@@ -85,6 +85,7 @@ func TestEnsureConfigPreservesExistingPayload(t *testing.T) {
 }
 
 func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
+	cfg := component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"}
 	for _, tc := range []struct{ kind, name string }{
 		{kind: "Deployment", name: controllerName},
 		{kind: "DaemonSet", name: nodeName},
@@ -96,10 +97,14 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 				"metadata":   map[string]any{"name": tc.name},
 				"spec": map[string]any{"template": map[string]any{
 					"metadata": map[string]any{"annotations": map[string]any{"existing": "kept"}},
+					"spec": map[string]any{
+						"initContainers": []any{map[string]any{"name": "init", "image": "old:init"}},
+						"containers":     []any{map[string]any{"name": "main", "image": "old:main"}},
+					},
 				}},
 			}}
 
-			if err := applyMutator("net-hash")(obj); err != nil {
+			if err := applyMutator(cfg, "net-hash")(obj); err != nil {
 				t.Fatalf("applyMutator: %v", err)
 			}
 
@@ -107,13 +112,25 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 			if annotations[ConfigHashAnnotation] != "net-hash" || annotations["existing"] != "kept" {
 				t.Fatalf("pod template annotations = %#v", annotations)
 			}
+
+			wantRepository := "unbounded-net-controller"
+			if tc.name == nodeName {
+				wantRepository = "unbounded-net-node"
+			}
+
+			for _, field := range []string{"initContainers", "containers"} {
+				containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+				if got := containers[0].(map[string]any)["image"]; got != "registry.example.com/azure/"+wantRepository+":v1.2.3" {
+					t.Fatalf("%s image = %q", field, got)
+				}
+			}
 		})
 	}
 
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator("net-hash")(config); err != nil || config.Object != nil {
+	if err := applyMutator(cfg, "net-hash")(config); err != nil || config.Object != nil {
 		t.Fatalf("embedded net ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
 
@@ -121,7 +138,7 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 		"apiVersion": "apiextensions.k8s.io/v1", "kind": component.CRDKind,
 		"metadata": map[string]any{"name": "sites.unbounded-cloud.io"},
 	}}
-	if err := applyMutator("net-hash")(crd); err != nil || crd.Object != nil {
+	if err := applyMutator(cfg, "net-hash")(crd); err != nil || crd.Object != nil {
 		t.Fatalf("CRD was not skipped: err=%v object=%#v", err, crd.Object)
 	}
 }

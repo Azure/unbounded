@@ -28,30 +28,8 @@ ARG TARGETARCH
 ARG VERSION=dev
 ARG GIT_COMMIT=
 ARG BUILD_TIME=
-# Optional overrides for the component images baked into the operator's embedded
-# manifests. They default to empty so release builds keep the Makefile defaults
-# (ghcr.io/azure/<component>:<version>); e2e/dev builds set them to point the
-# operator's applied net/machina workloads at a locally reachable registry.
-ARG NET_CONTROLLER_IMAGE=
-ARG NET_NODE_IMAGE=
-ARG MACHINA_IMAGE=
-ARG STORAGE_SUPERVISOR_IMAGE=
-# Unset any override that was left empty before invoking make. Docker exports
-# these ARGs into the RUN environment as empty strings when they are not
-# overridden, and GNU make treats an environment variable that is set (even to
-# "") as already defined, so the Makefile's `?=` defaults for MACHINA_IMAGE,
-# NET_CONTROLLER_IMAGE, and NET_NODE_IMAGE would NOT apply. That baked an empty
-# `image:` into the operator's embedded net/machina manifests, and the operator
-# then could not create those workloads (the API server rejects a Deployment
-# with an empty container image), so net-controller/machina-controller never
-# came up on upgrade. Unsetting the empties lets the Makefile defaults win while
-# still honoring any real override passed via --build-arg.
-RUN for v in NET_CONTROLLER_IMAGE NET_NODE_IMAGE MACHINA_IMAGE STORAGE_SUPERVISOR_IMAGE; do \
-        eval "val=\${$v-}"; \
-        [ -n "$val" ] || unset "$v"; \
-    done; \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    make unbounded-operator-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}} ${NET_CONTROLLER_IMAGE:+NET_CONTROLLER_IMAGE=${NET_CONTROLLER_IMAGE}} ${NET_NODE_IMAGE:+NET_NODE_IMAGE=${NET_NODE_IMAGE}} ${MACHINA_IMAGE:+MACHINA_IMAGE=${MACHINA_IMAGE}} ${STORAGE_SUPERVISOR_IMAGE:+UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=${STORAGE_SUPERVISOR_IMAGE}}
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    make unbounded-operator-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
 
 FROM ubuntu:noble
 

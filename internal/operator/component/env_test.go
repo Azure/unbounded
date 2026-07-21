@@ -26,6 +26,37 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
+func TestConfigImage(t *testing.T) {
+	cfg := Config{ImageRegistry: "registry.example.com/mirror/", ImageTag: "v1.2.3"}
+	if got := cfg.Image("machina"); got != "registry.example.com/mirror/azure/machina:v1.2.3" {
+		t.Fatalf("Image = %q", got)
+	}
+}
+
+func TestSetPodSpecImages(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			"initContainers": []any{map[string]any{"name": "install", "image": "old:init"}},
+			"containers":     []any{map[string]any{"name": "run", "image": "old:run"}},
+		}}},
+	}}
+
+	if err := SetPodSpecImages(obj, "registry.example.com/azure/component:v1"); err != nil {
+		t.Fatalf("SetPodSpecImages: %v", err)
+	}
+
+	for _, field := range []string{"initContainers", "containers"} {
+		containers, _, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		if err != nil {
+			t.Fatalf("get %s: %v", field, err)
+		}
+
+		if got := containers[0].(map[string]any)["image"]; got != "registry.example.com/azure/component:v1" {
+			t.Fatalf("%s image = %q", field, got)
+		}
+	}
+}
+
 func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 

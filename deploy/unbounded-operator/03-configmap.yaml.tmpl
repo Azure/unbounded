@@ -9,8 +9,8 @@
 # then `kubectl rollout restart deployment/unbounded-operator` to apply changes:
 # env is read once at pod start.
 #
-# Release-baked settings (operator image, component images, metalman image) are
-# NOT here; they are version-matched into the manifests at build time.
+# The registry is configurable here. The operator always combines it with its
+# own compiled version to select matching first-party component images.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,6 +20,8 @@ metadata:
     app.kubernetes.io/name: unbounded-operator
     app.kubernetes.io/component: controller
 data:
+  # Registry prefix for all operator-managed first-party component images.
+  UNBOUNDED_IMAGE_REGISTRY: {{ default "ghcr.io" .ImageRegistry | quote }}
   # External Kubernetes API endpoint advertised to provisioned machines. Remote
   # nodes dial this to join, so it must be reachable from outside the cluster.
   # Leave empty to let the operator auto-discover it: it prefers the standard

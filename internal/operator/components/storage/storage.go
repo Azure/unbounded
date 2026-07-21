@@ -67,7 +67,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboun
 	}
 
 	if err := env.ApplyManifestFS(ctx, storagemanifests.Manifests, func(obj *unstructured.Unstructured) error {
-		return mutateObject(site, configHash, obj)
+		return mutateObject(site, env.Config, configHash, obj)
 	}); err != nil {
 		return component.Failed(err)
 	}
@@ -220,9 +220,13 @@ func defaultConfigMap(site *unboundedv1alpha3.Site, namespace string) (*corev1.C
 // DaemonSet is per-site (name, labels, node affinity, and config mount). The
 // per-site ConfigMap is handled by ensureConfig so existing config data is
 // preserved; the ServiceAccount and RBAC are shared across sites.
-func mutateObject(site *unboundedv1alpha3.Site, configHash string, obj *unstructured.Unstructured) error {
+func mutateObject(site *unboundedv1alpha3.Site, cfg component.Config, configHash string, obj *unstructured.Unstructured) error {
 	switch {
 	case obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName:
+		if err := component.SetPodSpecImages(obj, cfg.Image(daemonSetName)); err != nil {
+			return fmt.Errorf("set storage supervisor images: %w", err)
+		}
+
 		return scopeDaemonSetToSite(site, configHash, obj)
 	case obj.GetKind() == "ConfigMap" && obj.GetName() == configName:
 		obj.Object = nil

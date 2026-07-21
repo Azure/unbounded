@@ -69,13 +69,15 @@ Optional flags:
 | `--wait` | `bool` | `true` | Wait for the operator rollout and CRD establishment |
 | `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
 | `--api-server-endpoint` | `string` | auto-discovered | Override the API server endpoint advertised to provisioned machines; by default the operator discovers it from `kube-public/cluster-info`, or the `KUBERNETES_SERVICE_HOST` FQDN on clusters (e.g. AKS) that do not publish cluster-info |
+| `--image-registry` | `string` | `ghcr.io` | Registry prefix used by the operator for version-matched first-party component images |
 
 > **Breaking change:** the `--skip-crds` flag has been removed. CRDs are now owned
 > and installed by the operator at startup (`operator.BootstrapCRDs`), so there is
 > nothing for `install` to skip. Automation passing `--skip-crds` must drop it.
 
-The image flags (`--operator-image` and `--metalman-image`) override the images
-embedded in the release manifests.
+`--operator-image` overrides the operator image. `--image-registry` configures
+the registry for components; their image tag always matches the operator's
+compiled version.
 
 ---
 

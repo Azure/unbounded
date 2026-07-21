@@ -89,6 +89,41 @@ func TestReapLegacyResourcesConfiguration(t *testing.T) {
 	}
 }
 
+func TestImageRegistryConfiguration(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		args []string
+		want string
+	}{
+		{name: "default", want: "ghcr.io"},
+		{name: "environment", env: "mirror.example.com", want: "mirror.example.com"},
+		{name: "flag overrides environment", env: "mirror.example.com", args: []string{"--image-registry=registry.example.com"}, want: "registry.example.com"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("UNBOUNDED_IMAGE_REGISTRY", tc.env)
+
+			var got config
+			cmd := newCommand(func(_ context.Context, cfg config) error {
+				got = cfg
+
+				return nil
+			})
+			cmd.SetArgs(tc.args)
+
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			if got.imageRegistry != tc.want {
+				t.Fatalf("imageRegistry = %q, want %q", got.imageRegistry, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveAPIServerEndpoint(t *testing.T) {
 	const clusterInfoKubeconfig = `apiVersion: v1
 clusters:
