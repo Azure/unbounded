@@ -742,10 +742,7 @@ jobs:
       - name: Build release manifests
         run: |
           TAG="${{ needs.version.outputs.tag }}"
-          make release-manifests \
-            VERSION="${TAG}" \
-            CONTAINER_REGISTRY="${{ env.REGISTRY }}"
-          make unbounded-operator-release-manifest \
+          make release-manifests unbounded-operator-release-manifest \
             VERSION="${TAG}" \
             CONTAINER_REGISTRY="${{ env.REGISTRY }}"
 
