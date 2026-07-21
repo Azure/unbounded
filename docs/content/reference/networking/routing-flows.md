@@ -1,14 +1,14 @@
 ---
 title: "Routing Flows"
 weight: 4
-description: "Packet-level routing flows for eBPF and netlink dataplanes, and protocol selection."
+description: "Packet-level routing flows for the eBPF dataplane and protocol selection."
 ---
 
-This document describes the detailed packet-level routing flows for both
-dataplane modes. For architecture context, see
+This document describes the detailed packet-level routing flows for the
+eBPF dataplane. For architecture context, see
 [Architecture]({{< relref "reference/networking/architecture" >}}).
 
-## eBPF Dataplane Mode (default)
+## eBPF Dataplane
 
 The eBPF dataplane uses a single TC egress BPF program (`unbounded_encap`)
 attached to the `unbounded0` dummy interface. All overlay traffic is attracted
@@ -121,38 +121,6 @@ cross-interface forwarding on gateway nodes.
 BPF map entries are accumulated in `pendingBPFEntries`, then a single
 `reconcilePendingBPFEntries()` call atomically deletes stale entries and
 upserts desired entries. This prevents partial/inconsistent state.
-
----
-
-## Netlink Dataplane Mode (legacy)
-
-The netlink dataplane creates per-peer tunnel interfaces and uses kernel
-routing tables.
-
-### Intra-Site Mesh (GENEVE)
-
-Each peer gets `gn<decimal_ip>` (uint32 of peer's underlay IPv4). The interface
-has a fixed remote endpoint and VNI; kernel routes for the peer's pod CIDRs
-point to it.
-
-### Per-Peer IPIP
-
-Each peer gets `ip<decimal_ip>`. Minimal overhead (20 bytes), no VNI
-multiplexing, no encryption.
-
-### Shared VXLAN
-
-A single `vxlan0` interface with per-peer routing via lightweight tunnel
-encap metadata:
-```
-ip route add <peer_cidr> encap ip src <local_ip> dst <peer_ip> dev vxlan0
-```
-
-### WireGuard in Netlink Mode
-
-Identical to eBPF mode. Kernel routes point directly to `wg<port>` interfaces.
-
----
 
 ## Protocol Selection
 

@@ -106,7 +106,7 @@ connectivity across sites by:
 - Grouping nodes into **Sites** based on their internal IPs.
 - Routing cross-site traffic through **Gateway** nodes using configurable
   tunnels (WireGuard, GENEVE, VXLAN, IPIP, or direct routing).
-- Running an eBPF or netlink dataplane on each node to program routes.
+- Running an eBPF dataplane on each node to program routes.
 
 See the [Networking concepts]({{< relref "concepts/networking" >}}) for an
 introduction and the

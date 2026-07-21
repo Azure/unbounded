@@ -9,11 +9,10 @@ This guide covers deployment, monitoring, troubleshooting, and operational proce
 ### Prerequisites
 
 1. **Kubernetes cluster** (1.24+)
-2. **Tunnel dataplane** -- one of:
-   - **WireGuard** kernel module on all nodes (encrypted tunnels)
-   - **eBPF** with GENEVE, VXLAN, or IPIP tunnels (requires kernel eBPF/TC support)
-3. **Container runtime** with CNI support
-4. **Network connectivity** between sites (UDP ports)
+2. **eBPF/TC** kernel support on all nodes
+3. **WireGuard** kernel module on nodes that use encrypted tunnels
+4. **Container runtime** with CNI support
+5. **Network connectivity** between sites (UDP ports)
 
 ### Verifying WireGuard Support
 
@@ -415,7 +414,7 @@ graph TD
 
 ### Viewing Tunnel Status
 
-#### WireGuard Mode
+#### WireGuard Status
 
 ```bash
 # On a node, show WireGuard status
@@ -455,9 +454,9 @@ ip route | grep 'wg'
 
 ### eBPF Dataplane Verification
 
-When using the eBPF dataplane (GENEVE, VXLAN, or IPIP tunnels), verification differs
-from WireGuard mode. Traffic is forwarded by a TC eBPF program attached to the
-`unbounded0` dummy interface rather than by per-peer kernel routes.
+Traffic is forwarded by a TC eBPF program attached to the `unbounded0` dummy
+interface. The following checks verify the dataplane independently of the
+selected tunnel protocol.
 
 #### Verifying BPF Program Attachment
 
@@ -525,7 +524,7 @@ The kubectl plugin supports viewing BPF entries for a node:
 # Show BPF map entries for a node
 kubectl unbounded net node show <node-name> bpf
 
-# Show routes for a node (supernet routes on unbounded0 in eBPF mode)
+# Show routes for a node (supernet routes on unbounded0)
 kubectl unbounded net node show <node-name> routes
 
 # Show full status JSON for a node
@@ -534,7 +533,7 @@ kubectl unbounded net node show <node-name> json
 
 ### Interface Verification
 
-#### WireGuard Mode
+#### WireGuard Interfaces
 
 ```bash
 # Check WireGuard interfaces
@@ -542,9 +541,9 @@ ip link show type wireguard
 wg show all
 ```
 
-#### eBPF Mode
+#### Dataplane Interfaces
 
-In eBPF mode, three types of interfaces are used:
+The dataplane uses the following interfaces:
 
 | Interface | Type | Purpose |
 |-----------|------|---------|
@@ -587,9 +586,7 @@ ip link show geneve0 | grep link/ether
 # The BPF program uses the same formula to set the source MAC on encapsulated packets
 ```
 
-### Route Verification (eBPF Mode)
-
-In eBPF mode, routes are configured differently from WireGuard mode:
+### Route Verification
 
 - **Supernet routes** are installed on `unbounded0` with `scope global` (not `scope link`).
   These attract pod traffic to the dummy interface, where the TC eBPF program handles
@@ -604,16 +601,14 @@ ip route show dev unbounded0
 # Expected: broad CIDR prefixes with scope global, e.g.:
 #   100.64.0.0/14 scope global
 
-# Confirm no per-peer routes on tunnel interfaces
-# (Unlike WireGuard mode, geneve0/vxlan0/ipip0 should have no routes)
+# Confirm no per-peer routes on flow-based tunnel interfaces
 ip route show dev geneve0 2>/dev/null
 ip route show dev vxlan0 2>/dev/null
 ip route show dev ipip0 2>/dev/null
 ```
 
-In WireGuard mode, per-peer routes are installed on `wg*` devices instead:
+For links that use WireGuard, inspect the corresponding `wg*` devices:
 ```bash
-# WireGuard mode routes (for comparison)
 ip route show dev wg51820
 ip route show dev wg51821
 ```
@@ -636,7 +631,7 @@ The node agent status server listens on port 9998 (configurable via `--health-po
 # Liveness check
 curl http://<node-agent-pod-ip>:9998/healthz
 
-# Full status JSON (includes BpfEntries when using eBPF dataplane)
+# Full status JSON (includes BpfEntries)
 curl http://<node-agent-pod-ip>:9998/status/json
 
 # Prometheus metrics
@@ -692,16 +687,14 @@ curl -s http://<controller-pod-ip>:9999/status/json | python3 -m json.tool | hea
 ### Unused Device Cleanup
 
 When the tunnel protocol changes for a peer (e.g., from GENEVE to VXLAN, or from
-WireGuard to eBPF), unused tunnel devices are automatically removed by the node agent
+WireGuard to GENEVE), unused tunnel devices are automatically removed by the node agent
 during reconciliation:
 
-- **eBPF mode**: `geneve0`, `vxlan0`, and `ipip0` are each removed if no active peer
+- `geneve0`, `vxlan0`, and `ipip0` are each removed if no active peer
   uses that protocol. For example, if all peers switch from GENEVE to VXLAN, the
   `geneve0` device is deleted.
-- **WireGuard mode**: If no WireGuard peers remain, the `wg*` mesh interface is deleted
+- If no WireGuard peers remain, the `wg*` mesh interface is deleted
   and routes are re-synced.
-- **Legacy cleanup**: Obsolete per-peer tunnel interfaces (e.g., `gn*`, `ip*` prefixed
-  links from older netlink-mode runs) are also removed.
 
 No manual intervention is needed -- the node agent handles cleanup automatically during
 each reconciliation cycle.
@@ -940,13 +933,13 @@ bpftool map list | grep unbounded
 # BPF entry dump (from node agent pod)
 # kubectl -n unbounded-system exec <node-agent-pod> -- unroute
 
-# Interfaces (eBPF mode)
+# Dataplane interfaces
 ip link show unbounded0
 ip link show geneve0 2>/dev/null
 ip link show vxlan0 2>/dev/null
 ip link show ipip0 2>/dev/null
 
-# Routes (eBPF mode -- supernet routes on unbounded0)
+# Dataplane routes (supernet routes on unbounded0)
 ip route show dev unbounded0
 
 # === Per-Node Diagnostics (Common) ===
@@ -959,7 +952,7 @@ ip addr show | grep -E 'wg|cbr|unbounded|geneve|vxlan|ipip'
 # CNI configuration
 cat /etc/cni/net.d/10-unbounded.conflist
 
-# WireGuard keys (WireGuard mode only)
+# WireGuard keys
 ls -la /etc/wireguard/
 
 # === Controller Diagnostics ===
@@ -980,7 +973,7 @@ kubectl unbounded net node list
 # Show node details
 kubectl unbounded net node show <node-name> json
 
-# Show BPF entries for a node (eBPF mode)
+# Show BPF entries for a node
 kubectl unbounded net node show <node-name> bpf
 
 # Show routes for a node
@@ -1246,7 +1239,9 @@ valid.
 
 ### Network Policies
 
-unbounded-system traffic can use WireGuard encryption (default for cross-site links), but internal links may use unencrypted tunneling (GENEVE, VXLAN, IPIP) in both WireGuard and eBPF dataplane modes. You may want additional network policies:
+unbounded-system traffic can use WireGuard encryption (default for cross-site
+links), while internal links may use unencrypted tunneling (GENEVE, VXLAN, or
+IPIP). You may want additional network policies:
 
 ```yaml
 apiVersion: networking.k8s.io/v1

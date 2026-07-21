@@ -39,7 +39,7 @@ the data plane:
 
 - Writes CNI bridge configuration for local pod networking.
 - Manages WireGuard keys and tunnel interfaces.
-- Programs routes using eBPF or netlink.
+- Programs routes through eBPF maps and kernel networking interfaces.
 - Monitors gateway health with UDP probes.
 
 ## Core Concepts
@@ -147,26 +147,16 @@ Choosing `None` on a `SitePeering` with `meshNodes: false` is the standard
 pattern for sites already connected over a dedicated private link. Traffic
 travels at full line rate with no encapsulation overhead.
 
-## Dataplane Modes
+## Dataplane
 
-The node agent supports two dataplanes for programming routes:
-
-### eBPF (default)
-
-The eBPF dataplane attaches a TC egress BPF program to a `unbounded0` dummy
+The node agent uses an eBPF dataplane to program routes. It attaches a TC
+egress BPF program to a `unbounded0` dummy
 interface. It uses LPM (Longest Prefix Match) trie maps for per-destination
 tunnel endpoint resolution. Tunnel interfaces (`geneve0`, `vxlan0`, `ipip0`)
 are shared across all peers using flow-based encapsulation.
 
-**Advantages:** Fewer kernel objects at scale, shared tunnel interfaces,
-efficient map-based lookups.
-
-### Netlink (legacy)
-
-The netlink dataplane creates per-peer tunnel interfaces and programs routes
-using standard kernel routing tables.
-
-**Advantages:** Simpler debugging with standard `ip route` tools.
+This design minimizes kernel objects at scale, shares tunnel interfaces, and
+provides efficient map-based lookups.
 
 ## How It Relates to unbounded-kube
 
