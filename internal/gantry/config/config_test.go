@@ -67,6 +67,19 @@ func TestValidate_MirrorListenAllowNonLoopbackOptIn(t *testing.T) {
 	}
 }
 
+func TestValidate_UnixListeners(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.MirrorListen = "unix:///run/gantry/mirror.sock"
+	c.TransferListen = "unix:///run/gantry/transfer.sock"
+	c.TransferAdvertise = "0.0.0.0:5001"
+	c.MetricsListen = "unix:///run/gantry/ops.sock"
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate Unix listeners: %v", err)
+	}
+}
+
 func TestValidate_DuplicateUpstreamName(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{

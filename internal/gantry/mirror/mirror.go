@@ -49,6 +49,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/listener"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
@@ -2442,10 +2443,10 @@ func writeOriginError(w http.ResponseWriter, err error, logger *slog.Logger) {
 
 func isDigestRef(ref string) bool { return strings.HasPrefix(ref, "sha256:") }
 
-// ListenAndServe runs the mirror on the configured loopback address. The
+// ListenAndServe runs the mirror on the configured TCP or Unix endpoint. The
 // returned function stops the server gracefully.
 func (s *Server) ListenAndServe(addr string) (func(context.Context) error, error) {
-	ln, err := net.Listen("tcp", addr)
+	ln, err := listener.Listen(addr)
 	if err != nil {
 		return nil, fmt.Errorf("mirror: listen %s: %w", addr, err)
 	}

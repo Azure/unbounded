@@ -19,13 +19,13 @@
 #                                  agent no longer maintains its own
 #                                  blob cache; containerd is the
 #                                  source of truth.
-#   - Mirror port (5000) is exposed via a hostPort with
-#     hostIP: 127.0.0.1, so the host-side endpoint is loopback-only;
-#     containerd reaches it through the hosts.toml entry. Inside the
-#     pod the agent binds 0.0.0.0:5000 (configmap.yaml has
-#     mirror_bind_allow_non_loopback: true) because kube-proxy /
-#     portmap DNAT delivers the traffic to <podIP>:5000, not the
-#     pod's loopback. If you apply the optional NetworkPolicy
+#   - The agent's mirror, transfer, and operations HTTP servers bind
+#     Unix sockets under /run/gantry. Dedicated proxy sidecars own the
+#     compatibility TCP listeners required by containerd, peers,
+#     Prometheus, and kubelet. Mirror port 5000 is exposed via a
+#     hostPort with hostIP: 127.0.0.1, so the host-side endpoint is
+#     loopback-only; containerd reaches it through hosts.toml. If you
+#     apply the optional NetworkPolicy
 #     hardening overlay, the operator MUST allow ingress on TCP/5000
 #     from the node CIDR (the overlay's default 127.0.0.1/32
 #     placeholder will drop mirror traffic on most CNIs because
@@ -125,8 +125,9 @@ spec:
             - -c
             - |
               set -eu
-              chown -R 65532:65532 /var/lib/gantry/libp2p
+              chown -R 65532:65532 /var/lib/gantry/libp2p /run/gantry
               chmod 0700 /var/lib/gantry/libp2p
+              chmod 0750 /run/gantry
           securityContext:
             runAsNonRoot: false
             runAsUser: 0
@@ -148,6 +149,8 @@ spec:
           volumeMounts:
             - name: libp2p
               mountPath: /var/lib/gantry/libp2p
+            - name: gantry-sockets
+              mountPath: /run/gantry
       containers:
         - name: gantry
           image: ghcr.io/vpatelsj/gantry:latest   # override via make image-gantry-local/push (GANTRY_IMAGE)
@@ -190,35 +193,9 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
           ports:
-            # mirror (loopback only) - listed here for documentation.
-            - name: mirror
-              containerPort: 5000
-              hostPort: 5000
-              hostIP: 127.0.0.1
-              protocol: TCP
-            - name: transfer
-              containerPort: 5001
-              protocol: TCP
             - name: libp2p-tcp
               containerPort: 4001
               protocol: TCP
-            - name: metrics
-              containerPort: 9095
-              protocol: TCP
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: metrics
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            failureThreshold: 6
-          livenessProbe:
-            httpGet:
-              path: /livez
-              port: metrics
-            initialDelaySeconds: 30
-            periodSeconds: 30
-            failureThreshold: 3
           resources:
             requests:
               cpu: "2"
@@ -244,6 +221,8 @@ spec:
           volumeMounts:
             - name: libp2p
               mountPath: /var/lib/gantry/libp2p
+            - name: gantry-sockets
+              mountPath: /run/gantry
             - name: config
               mountPath: /etc/gantry
               readOnly: true
@@ -279,6 +258,72 @@ spec:
             # keeps the pod permanently 503.
             - name: containerd-socket
               mountPath: /run/containerd/containerd.sock
+        - name: mirror-proxy
+          image: ghcr.io/vpatelsj/gantry:latest
+          imagePullPolicy: IfNotPresent
+          args: ["proxy", "--listen=0.0.0.0:5000", "--upstream=unix:///run/gantry/mirror.sock"]
+          ports:
+            - name: mirror
+              containerPort: 5000
+              hostPort: 5000
+              hostIP: 127.0.0.1
+              protocol: TCP
+          securityContext: &proxy-security-context
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources: &proxy-resources
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts: &proxy-volume-mounts
+            - name: gantry-sockets
+              mountPath: /run/gantry
+        - name: transfer-proxy
+          image: ghcr.io/vpatelsj/gantry:latest
+          imagePullPolicy: IfNotPresent
+          args: ["proxy", "--listen=0.0.0.0:5001", "--upstream=unix:///run/gantry/transfer.sock"]
+          ports:
+            - name: transfer
+              containerPort: 5001
+              protocol: TCP
+          securityContext: *proxy-security-context
+          resources: *proxy-resources
+          volumeMounts: *proxy-volume-mounts
+        - name: ops-proxy
+          image: ghcr.io/vpatelsj/gantry:latest
+          imagePullPolicy: IfNotPresent
+          args: ["proxy", "--listen=0.0.0.0:9095", "--upstream=unix:///run/gantry/ops.sock"]
+          ports:
+            - name: metrics
+              containerPort: 9095
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          securityContext: *proxy-security-context
+          resources: *proxy-resources
+          volumeMounts: *proxy-volume-mounts
       volumes:
         - name: libp2p
           hostPath:
@@ -292,6 +337,8 @@ spec:
             secretName: gantry-registry-credentials
             optional: true
         - name: tmp
+          emptyDir: {}
+        - name: gantry-sockets
           emptyDir: {}
         - name: containerd-socket
           hostPath:

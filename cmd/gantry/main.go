@@ -7,6 +7,7 @@
 //
 //	gantry version print build information and exit
 //	gantry agent run the full agent (mirror + transfer + libp2p + ...)
+//	gantry proxy bridge a TCP endpoint to a Gantry Unix endpoint
 package main
 
 import (
@@ -78,6 +79,8 @@ func run(args []string) error {
 		return nil
 	case "agent":
 		return runAgent(args[1:])
+	case "proxy":
+		return runProxy(args[1:])
 	case "help", "-h", "-help", "--help":
 		return runHelp(args[1:])
 	default:
@@ -92,6 +95,7 @@ func printUsage(w *os.File) {
 
 Subcommands:
   agent      run the Gantry P2P agent
+	proxy      bridge a TCP endpoint to a Gantry Unix endpoint
   version    print build information
   help       print help for the agent subcommand`)
 }
@@ -255,7 +259,7 @@ func runAgent(args []string) error {
 	// endpoint. Computed once at startup since c.TransferListen and
 	// c.PodIP do not change after boot.
 	var noDialableTransferAddr atomic.Bool
-	noDialableTransferAddr.Store(transferAddrFamilyMismatch(c.TransferListen, c.PodIP))
+	noDialableTransferAddr.Store(transferAddrFamilyMismatch(transferAdvertiseEndpoint(c), c.PodIP))
 
 	if noDialableTransferAddr.Load() {
 		// Loud diagnostic so the readiness probe's terse message
@@ -933,7 +937,10 @@ func runAgent(args []string) error {
 
 	// - operations HTTP listener (/metrics + probes). See
 	// agent_readiness.go for the full handler wiring.
-	metricsHTTP, metricsErr := startOpsEndpoint(c.MetricsListen, reg, readyCheck, logger)
+	metricsHTTP, metricsErr, err := startOpsEndpoint(c.MetricsListen, reg, readyCheck, logger)
+	if err != nil {
+		return err
+	}
 
 	// Block until signal or metrics-server crash.
 	select {
@@ -1349,7 +1356,7 @@ func announceSelfAndBootstrap(ctx context.Context, mgr *members.Manager, disco *
 	ann := members.SelfAnnouncement{
 		PeerID:       peerID.String(),
 		P2PAddrs:     multiaddrs,
-		TransferAddr: advertisedTransferAddr(c.TransferListen, c.PodIP),
+		TransferAddr: advertisedTransferAddr(transferAdvertiseEndpoint(c), c.PodIP),
 	}
 
 	// Retry the patch with capped exponential backoff. Loops until
@@ -1763,6 +1770,14 @@ func advertisedTransferAddr(transferListen, podIP string) string {
 	}
 
 	return transferListen
+}
+
+func transferAdvertiseEndpoint(c *config.Config) string {
+	if c.TransferAdvertise != "" {
+		return c.TransferAdvertise
+	}
+
+	return c.TransferListen
 }
 
 // transferAddrFamilyMismatch reports whether the transfer listener is

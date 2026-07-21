@@ -34,7 +34,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,6 +44,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/listener"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 )
 
@@ -439,10 +439,10 @@ func parseSingleRange(h string, size int64) (start, end int64, ok bool) {
 	return s, e, true
 }
 
-// ListenAndServe runs the transfer server with h2c support on addr.
+// ListenAndServe runs the transfer server with h2c support on a TCP or Unix endpoint.
 // Returns a function that gracefully shuts the server down.
 func (s *Server) ListenAndServe(addr string) (func(context.Context) error, error) {
-	ln, err := net.Listen("tcp", addr)
+	ln, err := listener.Listen(addr)
 	if err != nil {
 		return nil, fmt.Errorf("transfer: listen %s: %w", addr, err)
 	}

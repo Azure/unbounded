@@ -16,33 +16,14 @@ metadata:
 data:
   config.yaml: |
     # ---------- Listeners ----------
-    # mirror_listen binds 0.0.0.0:5000 inside the pod because the
-    # DaemonSet exposes the mirror via hostPort with hostIP: 127.0.0.1
-    # (deploy/gantry/daemonset.yaml). kube-proxy / portmap DNATs the host's
-    # 127.0.0.1:5000 to <podIP>:5000 in the pod's network namespace -
-    # a listener on the pod's loopback (127.0.0.1 inside the pod) is
-    # unreachable through that path.
-    #
-    # Exposure note: the hostIP=127.0.0.1 binding on the hostPort is
-    # the ONLY default protection - it constrains host-side reach to
-    # node-local, but the listener inside the pod is still 0.0.0.0
-    # and therefore reachable from any other pod on the cluster
-    # network at <podIP>:5000. Operators who do not want peer pods
-    # to be able to hit the mirror directly SHOULD apply the
-    # optional NetworkPolicy overlay at
-    # deploy/gantry/examples/networkpolicy.yaml (see the
-    # "Production Security" section of docs/content/guides/gantry.md).
-    # That overlay is
-    # recommended for production but not part of the default install
-    # because its allow-list depends on the cluster's node-CIDR
-    # range, which is site-specific.
-    #
-    # mirror_bind_allow_non_loopback is the explicit operator opt-in
-    # required by Config.Validate (§7.5).
-    mirror_listen: "0.0.0.0:5000"
-    mirror_bind_allow_non_loopback: true
-    transfer_listen: "0.0.0.0:5001"
-    metrics_listen: "0.0.0.0:9095"
+    # Gantry owns no HTTP TCP listeners. The DaemonSet's narrowly scoped
+    # proxy sidecars expose only the compatibility ports required by
+    # containerd, peers, Prometheus, and kubelet probes.
+    mirror_listen: "unix:///run/gantry/mirror.sock"
+    mirror_bind_allow_non_loopback: false
+    transfer_listen: "unix:///run/gantry/transfer.sock"
+    transfer_advertise: "0.0.0.0:5001"
+    metrics_listen: "unix:///run/gantry/ops.sock"
 
     # ---------- libp2p ----------
     # IPv4 wildcard listeners. The pods/patch self-announce only

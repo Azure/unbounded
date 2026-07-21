@@ -33,6 +33,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Azure/unbounded/internal/gantry/listener"
 )
 
 // Recognised StorageMode values.
@@ -89,12 +91,13 @@ type Config struct {
 	// Cilium mTLS) above Gantry.
 	TransferListen string `yaml:"transfer_listen"`
 
+	// TransferAdvertise is the routable TCP endpoint published to peers when
+	// TransferListen is a Unix socket behind a proxy. Empty reuses TransferListen.
+	TransferAdvertise string `yaml:"transfer_advertise"`
+
 	// MetricsListen is the Prometheus scrape endpoint and /readyz /livez
-	// kubelet-probe target (the design doc). Default is 0.0.0.0:9095 because both
-	// Prometheus (off-node) and the kubelet (off-pod, node-IP source)
-	// need to reach it - a loopback default would silently break the
-	// DaemonSet's readiness gate. Access control belongs in NetworkPolicy
-	// and pod ports, not in the bind address.
+	// kubelet-probe target (the design doc). The default Unix socket is exposed
+	// to Prometheus and kubelet by the deployment's operations proxy.
 	MetricsListen string `yaml:"metrics_listen"`
 
 	// Libp2pListen is the multiaddr(s) the libp2p host advertises (the design doc).
@@ -433,10 +436,11 @@ type LegacyDeprecatedConfig struct {
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
-		MirrorListen:               "127.0.0.1:5000",
+		MirrorListen:               "unix:///run/gantry/mirror.sock",
 		MirrorBindAllowNonLoopback: false,
-		TransferListen:             "0.0.0.0:5001",
-		MetricsListen:              "0.0.0.0:9095",
+		TransferListen:             "unix:///run/gantry/transfer.sock",
+		TransferAdvertise:          "0.0.0.0:5001",
+		MetricsListen:              "unix:///run/gantry/ops.sock",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
 
@@ -550,6 +554,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
+	setStr("TRANSFER_ADVERTISE", &c.TransferAdvertise)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
 
@@ -609,10 +614,11 @@ func (c *Config) LoadEnv(env func(string) string) error {
 // BindFlags registers command-line flags on fs that overlay c. Call after
 // LoadYAML / LoadEnv but before fs.Parse so flags win.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
-	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
+	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "endpoint for the containerd-facing mirror server (host:port or unix:///path)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
-	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
-	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
+	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "endpoint for the peer-facing transfer server (host:port or unix:///path)")
+	fs.StringVar(&c.TransferAdvertise, "transfer-advertise", c.TransferAdvertise, "routable TCP transfer endpoint published to peers when the server listens on a Unix socket")
+	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "endpoint for the Prometheus and probe server (host:port or unix:///path)")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
@@ -708,24 +714,34 @@ func Load(args []string, env func(string) string, configPath string) (*Config, *
 func (c *Config) Validate() error {
 	var errs []error
 
-	mustAddr := func(field, val string) {
+	mustEndpoint := func(field, val string) {
 		if val == "" {
 			errs = append(errs, fmt.Errorf("%s: required", field))
 			return
 		}
 
-		if _, _, err := net.SplitHostPort(val); err != nil {
+		if _, _, err := listener.Parse(val); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", field, err))
 		}
 	}
-	mustAddr("mirror_listen", c.MirrorListen)
-	mustAddr("transfer_listen", c.TransferListen)
-	mustAddr("metrics_listen", c.MetricsListen)
+	mustEndpoint("mirror_listen", c.MirrorListen)
+	mustEndpoint("transfer_listen", c.TransferListen)
+	mustEndpoint("metrics_listen", c.MetricsListen)
+
+	if c.TransferAdvertise != "" {
+		if _, _, err := net.SplitHostPort(c.TransferAdvertise); err != nil {
+			errs = append(errs, fmt.Errorf("transfer_advertise: %w", err))
+		}
+	}
+
+	if strings.HasPrefix(c.TransferListen, "unix://") && c.TransferAdvertise == "" {
+		errs = append(errs, fmt.Errorf("transfer_advertise: required when transfer_listen is a Unix endpoint"))
+	}
 
 	// MirrorListen MUST be loopback (the design doc, the design doc) unless the operator has
 	// explicitly opted in to a non-loopback bind. See the field comment on
 	// Config.MirrorBindAllowNonLoopback for when that's safe.
-	if !c.MirrorBindAllowNonLoopback {
+	if !c.MirrorBindAllowNonLoopback && !strings.HasPrefix(c.MirrorListen, "unix://") {
 		if host, _, err := net.SplitHostPort(c.MirrorListen); err == nil {
 			ip := net.ParseIP(host)
 			if ip != nil && !ip.IsLoopback() {
