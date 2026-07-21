@@ -446,9 +446,10 @@ impl<B: BlockDevice> BTreeIndex<B> {
         .await
     }
 
-    /// Benchmark-only lookup path backed by the committed in-memory
-    /// mirror. This skips the terminal leaf read, so it must not be used
-    /// for production recovery/corruption semantics.
+    /// Look up an entry in the committed in-memory mirror. Mutation
+    /// bookkeeping may use this because the single mutator owns the mirror.
+    /// Client reads must normally hit the on-disk leaf to preserve corruption
+    /// detection; the engine only bypasses that check in benchmark mode.
     pub fn lookup_committed_mirror(&self, key: &PageKey) -> Option<LeafEntry> {
         self.mutator.borrow().entries.get(key).copied()
     }
@@ -487,7 +488,8 @@ impl<B: BlockDevice> BTreeIndex<B> {
         // Path-copy consumes the operations, so retain only the bounded
         // batch needed to update the mirror after the durable commit.
         let mirror_ops = sorted_ops.clone();
-        let parent_root = self.root.load().root_lba;
+        let parent = self.root.load();
+        let parent_root = parent.root_lba;
         let result = cow::apply_path_copy(
             &*self.device,
             &self.scratch,
@@ -497,17 +499,7 @@ impl<B: BlockDevice> BTreeIndex<B> {
             sorted_ops,
         )
         .await?;
-
-        let internal_cache =
-            match cow::build_internal_cache(&*self.device, &self.scratch, result.new_root, true)
-                .await
-            {
-                Ok(cache) => cache,
-                Err(e) => {
-                    cow::free_all(&self.allocator, &result.new_pages);
-                    return Err(e);
-                }
-            };
+        let internal_cache = cow::update_internal_cache(&parent.internal_cache, &result);
 
         let active = self.active_meta.get();
         // apply_path_copy above has already marked the new pages
@@ -597,8 +589,8 @@ impl<B: BlockDevice> BTreeIndex<B> {
         self.mutator.borrow().entries.len()
     }
 
-    /// Heap footprint of the immutable lookup cache owned by the
-    /// currently published snapshot.
+    /// Estimated decoded-node payload of the immutable lookup cache owned
+    /// by the current snapshot. Map and shared-reference overhead is excluded.
     pub fn lookup_cache_bytes(&self) -> usize {
         self.root.load().lookup_cache_bytes()
     }

@@ -156,22 +156,14 @@ proptest! {
     ///      are gone from the LRU but still live in the btree, so
     ///      `btree_entries` exceeds `resident_pages` by up to
     ///      `EVICT_SWEEP_TARGET` per failure.
-    ///   2. A corrupted btree-internal read of the prior-LBA
-    ///      probe in the mutator's `process_batch`. A flipped
-    ///      byte that makes `btree::lookup` return `Ok(None)`
-    ///      when a prior entry existed causes the engine to skip
-    ///      `retire_range(old)`; the new LBA is admitted to both
-    ///      sides but the old LBA stays in the LRU and `reverse`
-    ///      map even though its btree key was overwritten by the
-    ///      new insert. That orphans one LRU entry per
-    ///      corruption, so `resident_pages` can exceed
-    ///      `btree_entries` by up to `device_corruptions_injected`.
-    ///      A corruption that hits the path-copy descent inside
-    ///      `apply_batch` itself aborts the commit (the engine's
-    ///      `apply_node` surfaces `Decoded::Empty` as
-    ///      `Error::Corrupt` so a subtree is never silently
-    ///      dropped from the new tree), so it doesn't contribute
-    ///      to the gap.
+    ///   2. Corruption during the path-copy descent aborts the
+    ///      whole mutator batch (`apply_node` surfaces
+    ///      `Decoded::Empty` as `Error::Corrupt`) rather than
+    ///      publishing a partial tree. Corruption injection is
+    ///      retained as defensive slack for the failed batch's
+    ///      surrounding eviction bookkeeping. Prior-LBA probes do
+    ///      not contribute: the single mutator now reads those
+    ///      from the exact committed mirror rather than disk.
     ///   The data-write failure paths in `write_page_from` either
     ///   rewind both sides or touch neither, so they don't
     ///   contribute. `pending_free_len` is added as a small
@@ -221,8 +213,7 @@ proptest! {
             diff <= bound,
             "|resident_pages ({}) - btree_entries ({})| = {} exceeds bound {} \
              (device_io_errors={}, device_corruptions_injected={}, pending_free_len={}); \
-             LRU and index diverged beyond what failed evictions and corrupted btree \
-             reads can explain",
+             LRU and index diverged beyond what failed mutator batches can explain",
             resident, btree, diff, bound,
             report.device_io_errors, report.device_corruptions_injected,
             report.pending_free_len,

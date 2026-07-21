@@ -792,7 +792,7 @@ impl<B: BlockDevice> StorageEngine<B> {
                     let prior = if let Some(prior) = states.get(key) {
                         *prior
                     } else {
-                        let prior = self.btree.lookup(key).await.ok().flatten();
+                        let prior = self.btree.lookup_committed_mirror(key);
                         states.insert(*key, prior);
                         prior
                     };
@@ -811,7 +811,7 @@ impl<B: BlockDevice> StorageEngine<B> {
                         let current = if let Some(current) = states.get(&victim.key) {
                             *current
                         } else {
-                            let current = self.btree.lookup(&victim.key).await.ok().flatten();
+                            let current = self.btree.lookup_committed_mirror(&victim.key);
                             states.insert(victim.key, current);
                             current
                         };
@@ -1040,11 +1040,13 @@ mod tests {
             done: overwrite,
         }]));
         let eviction = MutatorReply::new();
+        let reads_before = eng.device.reads();
         block_on(eng.process_batch(vec![MutatorReq::Delete {
             victims: vec![resident(key, 200)],
             done: eviction.clone(),
         }]));
 
+        assert_eq!(eng.device.reads(), reads_before);
         assert_eq!(eng.btree.lookup_committed_mirror(&key), Some(entry(201)));
         assert!(matches!(
             block_on(eviction.wait()),

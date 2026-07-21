@@ -146,6 +146,88 @@ fn large_batch_spans_multiple_leaves() {
 }
 
 #[test]
+fn commit_updates_internal_cache_without_rescanning_tree() {
+    let cfg = MockDeviceConfig {
+        page_size: 512,
+        capacity_pages: 512,
+        ..Default::default()
+    };
+    let dev = Arc::new(MockDevice::new(cfg));
+    let alloc = Arc::new(Allocator::new(512));
+    let scratch = ScratchPool::new(&*dev, 512, 8).expect("scratch pool");
+    let idx = block_on(BTreeIndex::open(
+        dev.clone(),
+        alloc,
+        scratch,
+        512,
+        false,
+        false,
+    ))
+    .unwrap();
+    let reads_before = dev.reads();
+
+    block_on(
+        idx.apply_batch(
+            (0..100u32)
+                .map(|i| Mutation::Insert {
+                    key: key(i),
+                    value: entry(1000 + i as u64),
+                })
+                .collect(),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        dev.reads() - reads_before,
+        1,
+        "path copy should read only the previous single-leaf root",
+    );
+    assert!(idx.lookup_cache_bytes() > 0);
+
+    let reads_before_overwrite = dev.reads();
+    block_on(idx.apply_batch(vec![Mutation::Insert {
+        key: key(5),
+        value: entry(2005),
+    }]))
+    .unwrap();
+    assert_eq!(
+        dev.reads() - reads_before_overwrite,
+        3,
+        "second path copy should read one root, one internal node, and one leaf",
+    );
+
+    let reads_before_lookup = dev.reads();
+    assert_eq!(block_on(idx.lookup(&key(5))).unwrap(), Some(entry(2005)));
+    assert_eq!(block_on(idx.lookup(&key(95))).unwrap(), Some(entry(1095)));
+    assert_eq!(
+        dev.reads() - reads_before_lookup,
+        2,
+        "lookups should read terminal leaves but no replaced or shared internal nodes",
+    );
+
+    let pinned = idx.root.load_full();
+    let pinned_cache_bytes = pinned.lookup_cache_bytes();
+    block_on(
+        idx.apply_batch(
+            (0..100u32)
+                .map(|i| Mutation::Delete { key: key(i) })
+                .collect(),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(idx.live_entries(), 0);
+    assert_eq!(idx.lookup_cache_bytes(), 0);
+    assert!(block_on(idx.lookup(&key(5))).unwrap().is_none());
+    assert_eq!(
+        pinned.lookup_cache_bytes(),
+        pinned_cache_bytes,
+        "the old snapshot must retain its shared internal-node cache",
+    );
+}
+
+#[test]
 fn restart_from_meta_restores_entries() {
     let (dev, alloc) = fresh(128);
     {

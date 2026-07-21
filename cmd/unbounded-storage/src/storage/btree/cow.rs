@@ -59,10 +59,11 @@ const MAX_TRAVERSAL_NODES: u64 = 1 << 24;
 
 /// Immutable decoded cache of internal B+tree nodes reachable from
 /// a published root. Leaf pages are deliberately excluded so lookup
-/// memory scales with the upper levels only.
+/// memory scales with the upper levels only. `bytes` estimates decoded
+/// node payload and excludes map buckets and `Arc` bookkeeping.
 #[derive(Default)]
 pub struct InternalNodeCache {
-    nodes: HashMap<Lba, CachedInternalNode>,
+    nodes: HashMap<Lba, Arc<CachedInternalNode>>,
     bytes: usize,
 }
 
@@ -77,8 +78,14 @@ impl InternalNodeCache {
     }
 
     fn get(&self, lba: Lba) -> Option<&CachedInternalNode> {
-        self.nodes.get(&lba)
+        self.nodes.get(&lba).map(Arc::as_ref)
     }
+}
+
+fn internal_node_bytes(node: &CachedInternalNode) -> usize {
+    size_of::<CachedInternalNode>()
+        + node.keys.len() * size_of::<PageKey>()
+        + node.children.len() * size_of::<Lba>()
 }
 
 /// Build a cache for every internal node reachable from `root_lba`.
@@ -121,16 +128,12 @@ pub async fn build_internal_cache<B: BlockDevice>(
                         stack.push((child, remaining_depth - 1));
                     }
                 }
-                bytes += size_of::<CachedInternalNode>()
-                    + keys.len() * size_of::<PageKey>()
-                    + children.len() * size_of::<Lba>();
-                nodes.insert(
-                    node_lba,
-                    CachedInternalNode {
-                        keys: keys.into_boxed_slice(),
-                        children: children.into_boxed_slice(),
-                    },
-                );
+                let node = Arc::new(CachedInternalNode {
+                    keys: keys.into_boxed_slice(),
+                    children: children.into_boxed_slice(),
+                });
+                bytes += internal_node_bytes(&node);
+                nodes.insert(node_lba, node);
             }
             Decoded::Internal { .. } | Decoded::Empty | Decoded::Meta { .. } if strict => {
                 return Err(Error::Corrupt);
@@ -413,6 +416,33 @@ pub struct PathCopyResult {
     pub new_root: Lba,
     pub new_pages: Vec<Lba>,
     pub retired_pages: Vec<Lba>,
+    new_internal_nodes: HashMap<Lba, Arc<CachedInternalNode>>,
+}
+
+/// Derive the next immutable internal-node cache from the parent cache and
+/// the pages produced by one path-copy commit. Untouched nodes retain their
+/// shared decoded representation; retired nodes are removed and freshly
+/// encoded internal nodes are inserted without reading them back from disk.
+pub fn update_internal_cache(
+    parent: &Arc<InternalNodeCache>,
+    result: &PathCopyResult,
+) -> Arc<InternalNodeCache> {
+    let mut nodes = parent.nodes.clone();
+    let mut bytes = parent.bytes;
+
+    for lba in &result.retired_pages {
+        if let Some(node) = nodes.remove(lba) {
+            bytes -= internal_node_bytes(&node);
+        }
+    }
+    for (&lba, node) in &result.new_internal_nodes {
+        if let Some(replaced) = nodes.insert(lba, node.clone()) {
+            bytes -= internal_node_bytes(&replaced);
+        }
+        bytes += internal_node_bytes(node);
+    }
+
+    Arc::new(InternalNodeCache { nodes, bytes })
 }
 
 /// Apply `sorted_ops` to the tree rooted at `parent_root` using
@@ -441,6 +471,7 @@ pub async fn apply_path_copy<B: BlockDevice>(
         txn_id,
         new_pages: RefCell::new(Vec::new()),
         retired_pages: RefCell::new(Vec::new()),
+        new_internal_nodes: RefCell::new(HashMap::new()),
         leaf_cap: max_leaf_entries(ps),
         internal_cap: max_internal_keys(ps),
         page_size: ps,
@@ -453,6 +484,7 @@ pub async fn apply_path_copy<B: BlockDevice>(
             new_root,
             new_pages: ctx.new_pages.into_inner(),
             retired_pages: ctx.retired_pages.into_inner(),
+            new_internal_nodes: ctx.new_internal_nodes.into_inner(),
         }),
         Err(e) => {
             free_all(ctx.allocator, &ctx.new_pages.borrow());
@@ -517,6 +549,7 @@ struct PathCopyCtx<'a, B: BlockDevice> {
     txn_id: u64,
     new_pages: RefCell<Vec<Lba>>,
     retired_pages: RefCell<Vec<Lba>>,
+    new_internal_nodes: RefCell<HashMap<Lba, Arc<CachedInternalNode>>>,
     leaf_cap: usize,
     internal_cap: usize,
     page_size: usize,
@@ -696,6 +729,13 @@ impl<'a, B: BlockDevice> PathCopyCtx<'a, B> {
             let lba = self.allocator.alloc()?;
             self.new_pages.borrow_mut().push(lba);
             let page = page::encode_internal(self.page_size, self.txn_id, &keys, &kids)?;
+            self.new_internal_nodes.borrow_mut().insert(
+                lba,
+                Arc::new(CachedInternalNode {
+                    keys: keys.into_boxed_slice(),
+                    children: kids.into_boxed_slice(),
+                }),
+            );
             out.push((chunk[0].0, lba));
             pages.push((lba, page));
         }
