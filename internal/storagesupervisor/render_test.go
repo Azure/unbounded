@@ -669,7 +669,7 @@ version: 1
 	assert.Equal(t, "/dev/nvme1n1", disk.GetBlock().GetPath())
 }
 
-func TestRenderConfigAllInvalidAnnotatedDisksFallsBackToFile(t *testing.T) {
+func TestRenderConfigAllInvalidAnnotatedDisksLeavesDiscoveryToDaemon(t *testing.T) {
 	dir := writeSource(t, `
 version: 1
 `)
@@ -681,14 +681,14 @@ version: 1
 		},
 	})
 
-	require.Len(t, cfg.GetDisks(), 1)
-	disk := cfg.GetDisks()[0]
-	require.NotNil(t, disk.GetFile())
-	assert.Equal(t, defaultStorageFileDiskPath, disk.GetFile().GetPath())
-	assert.Equal(t, uint64(4294967296), disk.GetFile().GetSize())
+	assert.Empty(t, cfg.GetDisks())
+	require.NotNil(t, cfg.GetDiskDiscovery())
+	require.NotNil(t, cfg.GetDiskDiscovery().GetFallback())
+	assert.Empty(t, cfg.GetDiskDiscovery().GetFallback().GetPath())
+	assert.Equal(t, uint64(4294967296), cfg.GetDiskDiscovery().GetFallback().GetSize())
 }
 
-func TestRenderConfigBlankAnnotatedDisksFallsBackToFile(t *testing.T) {
+func TestRenderConfigBlankAnnotatedDisksLeavesDiscoveryToDaemon(t *testing.T) {
 	dir := writeSource(t, `
 version: 1
 `)
@@ -700,27 +700,22 @@ version: 1
 		},
 	})
 
-	require.Len(t, cfg.GetDisks(), 1)
-	disk := cfg.GetDisks()[0]
-	assert.Equal(t, defaultStorageFileDiskPath, disk.GetFile().GetPath())
-	assert.Equal(t, uint64(4294967296), disk.GetFile().GetSize())
+	assert.Empty(t, cfg.GetDisks())
+	assert.Equal(t, uint64(4294967296), cfg.GetDiskDiscovery().GetFallback().GetSize())
 }
 
-func TestRenderConfigFallbackFileDiskDefaultSize(t *testing.T) {
+func TestRenderConfigWithoutDiskAnnotationsLeavesDiscoveryToDaemon(t *testing.T) {
 	dir := writeSource(t, `
 version: 1
 `)
 
 	cfg := decode(t, dir)
 
-	require.Len(t, cfg.GetDisks(), 1)
-	disk := cfg.GetDisks()[0]
-	assert.Equal(t, defaultStorageFileDiskPath, disk.GetFile().GetPath())
-	assert.Equal(t, defaultStorageFileDiskSize, disk.GetFile().GetSize())
-	assert.False(t, disk.GetSkipRecoveryScan())
+	assert.Empty(t, cfg.GetDisks())
+	assert.Nil(t, cfg.GetDiskDiscovery())
 }
 
-func TestRenderConfigInvalidFileSizeAnnotationFallsBackToDefault(t *testing.T) {
+func TestRenderConfigInvalidFileSizeAnnotationLeavesDaemonDefaults(t *testing.T) {
 	tests := []struct {
 		name string
 		size string
@@ -740,10 +735,43 @@ version: 1
 				annotations: map[string]string{storageFileSizeAnnotation: tt.size},
 			})
 
-			require.Len(t, cfg.GetDisks(), 1)
-			assert.Equal(t, defaultStorageFileDiskSize, cfg.GetDisks()[0].GetFile().GetSize())
+			assert.Empty(t, cfg.GetDisks())
+			assert.Nil(t, cfg.GetDiskDiscovery())
 		})
 	}
+}
+
+func TestRenderConfigFileSizeAnnotationDoesNotOverrideConfiguredFallback(t *testing.T) {
+	dir := writeSource(t, `
+disk_discovery:
+  fallback:
+    path: /custom/fallback.disk
+    size: 1073741824
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{storageFileSizeAnnotation: "4294967296"},
+	})
+
+	assert.Empty(t, cfg.GetDisks())
+	assert.Equal(t, "/custom/fallback.disk", cfg.GetDiskDiscovery().GetFallback().GetPath())
+	assert.Equal(t, uint64(1073741824), cfg.GetDiskDiscovery().GetFallback().GetSize())
+}
+
+func TestRenderConfigFileSizeAnnotationPreservesConfiguredFallbackPath(t *testing.T) {
+	dir := writeSource(t, `
+disk_discovery:
+  fallback:
+    path: /custom/fallback.disk
+`)
+
+	cfg := decodeWithState(t, dir, renderState{
+		annotations: map[string]string{storageFileSizeAnnotation: "4294967296"},
+	})
+
+	assert.Empty(t, cfg.GetDisks())
+	assert.Equal(t, "/custom/fallback.disk", cfg.GetDiskDiscovery().GetFallback().GetPath())
+	assert.Equal(t, uint64(4294967296), cfg.GetDiskDiscovery().GetFallback().GetSize())
 }
 
 func TestRenderConfigPreservesExplicitConfigMapDisks(t *testing.T) {
@@ -781,7 +809,7 @@ caches:
 	require.Len(t, cfg.GetCaches(), 2)
 	assert.Equal(t, "cache-a", cfg.GetCaches()[0].GetName())
 	assert.Equal(t, "cache-b", cfg.GetCaches()[1].GetName())
-	require.Len(t, cfg.GetDisks(), 1)
+	assert.Empty(t, cfg.GetDisks())
 }
 
 func TestRenderConfigNoCachesInjectsDisks(t *testing.T) {

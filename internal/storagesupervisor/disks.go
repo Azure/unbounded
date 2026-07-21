@@ -16,9 +16,7 @@ import (
 const (
 	allocatedDisksAnnotation   = "storage.unbounded-cloud.io/allocated-disks"
 	storageFileSizeAnnotation  = "unbounded-cloud.io/storage-file-size-bytes"
-	defaultStorageFileDiskPath = "/var/lib/unbounded-storage/cache.disk"
 	defaultStorageFileDiskDir  = "/var/lib/unbounded-storage"
-	defaultStorageFileDiskSize = uint64(2 * 1024 * 1024 * 1024)
 	defaultStorageDiskPageSize = 4096
 	diskOptionQueueDepth       = "queue_depth"
 	diskOptionPageSizeBytes    = "page_size_bytes"
@@ -30,32 +28,51 @@ const (
 	diskOptionNuma             = "numa"
 )
 
-// applyDiskOverlay injects per-node storage disks when the config does not
-// declare disks explicitly. Explicit config disks are authoritative.
+// applyDiskOverlay preserves explicit config and annotation disks. When neither
+// is present, the daemon discovers safe NVMe namespaces itself. The legacy file
+// size annotation only customizes that discovery policy's fallback file.
 func applyDiskOverlay(cfg *storageconfig.Config, annotations map[string]string) error {
 	if len(cfg.GetDisks()) > 0 {
 		return nil
 	}
 
-	existingPaths := declaredDiskPaths(cfg)
+	disks := annotationBlockDisks(annotations[allocatedDisksAnnotation], map[string]struct{}{})
+	if len(disks) > 0 {
+		cfg.Disks = disks
 
-	disks := annotationBlockDisks(annotations[allocatedDisksAnnotation], existingPaths)
-	if len(disks) == 0 {
-		fallback := fallbackFileDisk(annotations[storageFileSizeAnnotation])
-
-		path := fallback.GetFile().GetPath()
-		if _, exists := existingPaths[path]; exists {
-			slog.Warn("skipping fallback storage file disk because path is already declared", "path", path)
-
-			return nil
-		}
-
-		disks = []*storageconfig.DiskSpec{fallback}
+		return nil
 	}
 
-	cfg.Disks = disks
+	applyFallbackSizeOverlay(cfg, annotations[storageFileSizeAnnotation])
 
 	return nil
+}
+
+func applyFallbackSizeOverlay(cfg *storageconfig.Config, rawSize string) {
+	rawSize = strings.TrimSpace(rawSize)
+	if rawSize == "" {
+		return
+	}
+
+	parsed, err := strconv.ParseUint(rawSize, 10, 64)
+	if err != nil || parsed == 0 || parsed%defaultStorageDiskPageSize != 0 {
+		slog.Warn("ignoring invalid storage fallback file size annotation",
+			"annotation", storageFileSizeAnnotation, "value", rawSize)
+
+		return
+	}
+
+	if cfg.DiskDiscovery == nil {
+		cfg.DiskDiscovery = &storageconfig.DiskDiscoveryCfg{}
+	}
+
+	if cfg.DiskDiscovery.Fallback == nil {
+		cfg.DiskDiscovery.Fallback = &storageconfig.FileDiskConfig{}
+	}
+
+	if cfg.DiskDiscovery.Fallback.Size == nil {
+		cfg.DiskDiscovery.Fallback.Size = proto.Uint64(parsed)
+	}
 }
 
 func annotationBlockDisks(raw string, existingPaths map[string]struct{}) []*storageconfig.DiskSpec {
@@ -301,56 +318,4 @@ func parsePositiveUint64Option(path, key, raw string) (uint64, bool) {
 	}
 
 	return v, true
-}
-
-func fallbackFileDisk(rawSize string) *storageconfig.DiskSpec {
-	size := defaultStorageFileDiskSize
-
-	if strings.TrimSpace(rawSize) != "" {
-		parsed, err := strconv.ParseUint(strings.TrimSpace(rawSize), 10, 64)
-		if err != nil || parsed == 0 || parsed%defaultStorageDiskPageSize != 0 {
-			slog.Warn("using default storage file disk size because annotation is invalid",
-				"annotation", storageFileSizeAnnotation, "value", rawSize, "default", defaultStorageFileDiskSize)
-		} else {
-			size = parsed
-		}
-	}
-
-	return &storageconfig.DiskSpec{
-		Config: &storageconfig.DiskSpec_File{
-			File: &storageconfig.FileDiskConfig{
-				Path: defaultStorageFileDiskPath,
-				Size: proto.Uint64(size),
-			},
-		},
-	}
-}
-
-func declaredDiskPaths(cfg *storageconfig.Config) map[string]struct{} {
-	paths := map[string]struct{}{}
-
-	for _, disk := range cfg.GetDisks() {
-		path := diskPath(disk)
-		if path != "" {
-			paths[path] = struct{}{}
-		}
-	}
-
-	return paths
-}
-
-func diskPath(disk *storageconfig.DiskSpec) string {
-	if disk == nil {
-		return ""
-	}
-
-	if block := disk.GetBlock(); block != nil {
-		return block.GetPath()
-	}
-
-	if file := disk.GetFile(); file != nil {
-		return file.GetPath()
-	}
-
-	return ""
 }

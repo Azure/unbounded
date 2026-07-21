@@ -37,10 +37,10 @@ type renderState struct {
 // computed from the Kubernetes node watch. When the ring is active, this node's
 // peer name is injected and discovered peers are merged with any peers declared
 // in the YAML (discovered peers win on name collision). TCP rings also override
-// startup.fabric.tcp.addr with the node's own routable bind. The default disk
-// set is populated from the self node's storage disk annotations, or from a
-// default file-backed disk when no valid annotation disks are present. Loadgen
-// annotations append synthetic frontends for this node.
+// startup.fabric.tcp.addr with the node's own routable bind. Storage disk
+// annotations remain authoritative when present; otherwise an empty disk list
+// reaches the daemon for safe NVMe discovery. Loadgen annotations append
+// synthetic frontends for this node.
 func RenderConfig(sourceDir string, state renderState) ([]byte, error) {
 	cfg, err := loadSourceConfig(sourceDir)
 	if err != nil {
