@@ -13,7 +13,7 @@
 #   2. goreleaser check - validate .goreleaser.yml
 #   3. frontend        - build the React UI into internal/net/html/dist
 #   4. cni-plugins     - download CNI plugin tarballs into resources/
-#   5. release-manifests - render and tar the combined machina+net manifests
+#   5. release-manifests - render release manifests and test the operator YAML
 #   6. goreleaser snapshot - build kube binaries and stamped manifest archive
 #                            (skips publish, sign, sbom, docker)
 #   7. test-goreleaser-hook - assert manifests + binaries are stamped with TAG
@@ -172,6 +172,7 @@ fi
 step "5/8 release-manifests (make release-manifests)"
 make release-manifests
 ls -lh build/unbounded-manifests-*.tar.gz
+bash "$REPO_ROOT/hack/test-operator-manifest.sh"
 
 # 6. goreleaser snapshot
 step "6/8 goreleaser snapshot"
