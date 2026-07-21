@@ -21,16 +21,27 @@ API group: `unbounded-cloud.io/v1alpha3`. CRD: **Machine** (`mach`), cluster-sco
 
 ## Deploy Metalman
 
-Apply the CRDs and controller manifests:
+Metalman is a per-site component managed by the unbounded operator. First install
+the operator (this also installs the CRDs):
 
 ```bash
-kubectl apply -f deploy/machina/crd/
-kubectl apply -f deploy/machina/
+kubectl unbounded install
 ```
 
-This creates the `unbounded-system` namespace, ServiceAccounts (`metalman-controller`, `metalman-bootstrap`), RBAC roles, and a Deployment.
+Then enable metalman on a Site by passing `--enable-metalman` to `site init`, or by
+setting the metalman entry in `Site.spec.components`:
 
-Key `serve-pxe` flags (set via the Deployment):
+```bash
+kubectl unbounded site init --name my-edge-site --enable-metalman
+```
+
+`kubectl unbounded site init` also runs `install` by default, so a fresh site only
+needs the single command above. The operator then reconciles the `unbounded-system`
+namespace, ServiceAccounts (`metalman-controller`, `metalman-bootstrap`), RBAC roles,
+and a metalman Deployment for the Site.
+
+Key `serve-pxe` flags (baked into the operator-managed per-site Deployment; `--site`
+scoping is inherent to the per-site component):
 
 | Flag | Default | Description |
 |------|---------|-------------|

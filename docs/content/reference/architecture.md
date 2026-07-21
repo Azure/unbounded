@@ -182,8 +182,11 @@ For a walkthrough, see the [PXE Provisioning Guide]({{< ref "guides/pxe" >}}).
 
 ## Deployment
 
-All components deploy into the `unbounded-system` namespace. Manifests are plain
-numbered YAML files (no Helm or Kustomize).
+All components deploy into the `unbounded-system` namespace. Installation is driven
+by the unbounded operator (`kubectl unbounded install` bootstraps the CRDs and the
+operator; `site init` reconciles component workloads from `Site.spec.components`).
+The manifests below are plain numbered YAML files (no Helm or Kustomize) that the
+operator renders and applies; they are not meant to be applied by hand.
 
 | Directory | Contents |
 |-----------|----------|
