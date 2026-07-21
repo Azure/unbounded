@@ -162,6 +162,8 @@ impl std::error::Error for DiscoveryError {}
 
 pub trait DeviceProbe {
     fn identity(&self, path: &Path) -> io::Result<Option<DeviceId>>;
+
+    fn backing_identity(&self, path: &Path) -> io::Result<DeviceId>;
 }
 
 pub struct SystemDeviceProbe;
@@ -177,6 +179,14 @@ impl DeviceProbe for SystemDeviceProbe {
             major: libc::major(device) as u32,
             minor: libc::minor(device) as u32,
         }))
+    }
+
+    fn backing_identity(&self, path: &Path) -> io::Result<DeviceId> {
+        let device = fs::metadata(path)?.dev();
+        Ok(DeviceId {
+            major: libc::major(device) as u32,
+            minor: libc::minor(device) as u32,
+        })
     }
 }
 
@@ -318,16 +328,18 @@ fn read_swap_ids(
         let Some(path) = line.split_whitespace().next() else {
             continue;
         };
-        let rooted = match Path::new(path).strip_prefix("/dev") {
-            Ok(relative) => roots.dev.join(relative),
-            Err(_) => continue,
-        };
-        match device_probe.identity(&rooted) {
-            Ok(Some(id)) => {
-                identities.insert(id);
-            }
-            Ok(None) | Err(_) => return Err(DiscoveryError::InvalidSwapDevice(path.to_string())),
+        let swap_path = Path::new(path);
+        let rooted = swap_path
+            .strip_prefix("/dev")
+            .map(|relative| roots.dev.join(relative))
+            .unwrap_or_else(|_| roots.proc.join("root").join(path.trim_start_matches('/')));
+        let id = match device_probe.identity(&rooted) {
+            Ok(Some(id)) => Ok(id),
+            Ok(None) => device_probe.backing_identity(&rooted),
+            Err(error) => Err(error),
         }
+        .map_err(|_| DiscoveryError::InvalidSwapDevice(path.to_string()))?;
+        identities.insert(id);
     }
     Ok(identities)
 }
@@ -498,6 +510,13 @@ mod tests {
         fn identity(&self, path: &Path) -> io::Result<Option<DeviceId>> {
             Ok(self.devices.get(path).copied())
         }
+
+        fn backing_identity(&self, path: &Path) -> io::Result<DeviceId> {
+            self.devices
+                .get(path)
+                .copied()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown backing device"))
+        }
     }
 
     fn id(major: u32, minor: u32) -> DeviceId {
@@ -587,6 +606,39 @@ mod tests {
                 ("/dev/nvme7n1", ExclusionReason::ZeroCapacity),
             ]
         );
+    }
+
+    #[test]
+    fn swap_file_excludes_its_backing_namespace() {
+        let mut fixture = Fixture::new();
+        fixture.add_namespace("nvme0n1", id(259, 0), 8, 0);
+        let swap_file = fixture.root.path().join("proc/root/swapfile");
+        fixture.write("proc/root/swapfile", "");
+        fixture.devices.insert(swap_file, id(259, 0));
+        fixture.write(
+            "proc/swaps",
+            "Filename\tType\tSize\tUsed\tPriority\n/swapfile\tfile\t1024\t0\t-2\n",
+        );
+
+        let report = discover_with(fixture.roots(), &fixture, &[]).expect("discover disks");
+
+        assert!(report.eligible.is_empty());
+        assert_eq!(report.excluded[0].reason, ExclusionReason::Swap);
+    }
+
+    #[test]
+    fn unresolved_swap_file_fails_closed() {
+        let mut fixture = Fixture::new();
+        fixture.add_namespace("nvme0n1", id(259, 0), 8, 0);
+        fixture.write(
+            "proc/swaps",
+            "Filename\tType\tSize\tUsed\tPriority\n/missing.swap\tfile\t1024\t0\t-2\n",
+        );
+
+        assert!(matches!(
+            discover_with(fixture.roots(), &fixture, &[]),
+            Err(DiscoveryError::InvalidSwapDevice(path)) if path == "/missing.swap"
+        ));
     }
 
     #[test]
