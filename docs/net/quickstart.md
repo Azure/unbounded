@@ -137,7 +137,7 @@ node agents are running:
 
 ```bash
 # Operator
-kubectl -n unbounded-kube get deploy unbounded-operator
+kubectl -n unbounded-system get deploy unbounded-operator
 
 # Controller pod
 kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-controller
