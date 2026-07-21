@@ -82,6 +82,7 @@ func SetPodSpecImages(obj *unstructured.Unstructured, image string) error {
 		if err != nil {
 			return fmt.Errorf("get %s: %w", field, err)
 		}
+
 		if !found {
 			continue
 		}
@@ -91,6 +92,7 @@ func SetPodSpecImages(obj *unstructured.Unstructured, image string) error {
 			if !ok {
 				return fmt.Errorf("%s[%d] is not an object", field, i)
 			}
+
 			container["image"] = image
 		}
 

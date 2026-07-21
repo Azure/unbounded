@@ -154,6 +154,7 @@ func TestApplyMutatorStampsConfigHash(t *testing.T) {
 	}}
 
 	const hash = "config-hash"
+
 	cfg := component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"}
 	if err := applyMutator(cfg, hash)(obj); err != nil {
 		t.Fatalf("applyMutator: %v", err)
@@ -167,6 +168,7 @@ func TestApplyMutatorStampsConfigHash(t *testing.T) {
 
 	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
 	image := containers[0].(map[string]any)["image"].(string)
+
 	if image != "registry.example.com/azure/machina:v1.2.3" {
 		t.Fatalf("image = %q", image)
 	}

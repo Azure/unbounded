@@ -106,6 +106,7 @@ func TestImageRegistryConfiguration(t *testing.T) {
 			t.Setenv("UNBOUNDED_IMAGE_REGISTRY", tc.env)
 
 			var got config
+
 			cmd := newCommand(func(_ context.Context, cfg config) error {
 				got = cfg
 

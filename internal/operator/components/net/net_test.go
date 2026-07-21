@@ -86,6 +86,7 @@ func TestEnsureConfigPreservesExistingPayload(t *testing.T) {
 
 func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 	cfg := component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"}
+
 	for _, tc := range []struct{ kind, name string }{
 		{kind: "Deployment", name: controllerName},
 		{kind: "DaemonSet", name: nodeName},

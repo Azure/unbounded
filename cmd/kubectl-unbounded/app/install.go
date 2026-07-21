@@ -323,6 +323,7 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	if h.apiServerEndpoint != "" {
 		endpoint = h.apiServerEndpoint
 	}
+
 	if h.imageRegistry != "" {
 		imageRegistry = h.imageRegistry
 	}
