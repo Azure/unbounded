@@ -42,6 +42,38 @@ func TestCompareResultsFailsWithoutPeerActivity(t *testing.T) {
 	}
 }
 
+func TestFetchProxyTotalsIncludesErrorCounts(t *testing.T) {
+	benchmark := &benchmark{
+		config: benchmarkConfig{Namespace: "gantry-benchmark"},
+		commands: staticPrometheusRunner{output: []byte(`{
+			"run_id":"run-1",
+			"phase":"baseline",
+			"totals":{"by_phase":{"baseline":{
+				"requests_completed":8,
+				"by_status":{"200":3,"429":2,"502":3},
+				"upstream_errors":{"connection_refused":2,"timeout":1}
+			}}}
+		}`)},
+	}
+
+	totals, err := benchmark.fetchProxyTotals(
+		context.Background(),
+		benchmarkState{RunID: "run-1"},
+		proxyPhaseBaseline,
+	)
+	if err != nil {
+		t.Fatalf("fetchProxyTotals: %v", err)
+	}
+
+	if totals.ByStatus["429"] != 2 || totals.ByStatus["502"] != 3 {
+		t.Fatalf("status totals = %+v", totals.ByStatus)
+	}
+
+	if totals.UpstreamErrors["connection_refused"] != 2 || totals.UpstreamErrors["timeout"] != 1 {
+		t.Fatalf("upstream errors = %+v", totals.UpstreamErrors)
+	}
+}
+
 type staticPrometheusRunner struct {
 	output []byte
 }

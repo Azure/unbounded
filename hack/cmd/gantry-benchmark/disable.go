@@ -89,7 +89,7 @@ func (b *benchmark) disable(ctx context.Context) error {
 		return fmt.Errorf("restore benchmark cluster changes: %w", restoreErr)
 	}
 
-	if err := b.validateGantry(ctx); err != nil {
+	if err := b.validateGantryAtCurrentSize(ctx); err != nil {
 		state.Status = "restore-failed"
 
 		validationErr := fmt.Errorf("validate Gantry after restoration: %w", err)

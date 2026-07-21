@@ -170,6 +170,38 @@
       ],
       "title": "Minimum DHT health",
       "type": "gauge"
+    },
+    {
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32},
+      "id": 500,
+      "title": "Origin errors",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "HTTP error responses returned by the proxy. Upstream ACR responses pass through unchanged; proxy-generated 502 responses are classified separately in the transport-errors panel.",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+      "id": 10,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}},
+      "targets": [
+        {"expr": "sum by (phase,status) (origin_requests_completed_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",status=~\"4..|5..\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}} HTTP {{status}}", "refId": "A"}
+      ],
+      "title": "HTTP errors by status",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Transport failures before ACR returned an HTTP response, classified into bounded reasons such as timeout, connection_refused, connection_reset, dns, and other.",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
+      "id": 11,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last"]}},
+      "targets": [
+        {"expr": "sum by (phase,reason) (origin_upstream_errors_total{namespace=\"$namespace\",run_id=\"$run_id\",phase=~\"baseline|gantry_cold\",gantry_benchmark=\"true\"})", "legendFormat": "{{phase}} {{reason}}", "refId": "A"}
+      ],
+      "title": "Upstream transport errors",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -186,5 +218,5 @@
   "timezone": "browser",
   "title": "Gantry ACR Benchmark",
   "uid": "gantry-acr-benchmark",
-  "version": 3
+  "version": 4
 }

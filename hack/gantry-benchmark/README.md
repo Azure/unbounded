@@ -30,10 +30,12 @@ single-platform and digest-pinned.
 | Baseline | containerd -> counting proxy -> ACR |
 | Gantry cold | containerd -> local Gantry -> peer or counting proxy -> ACR |
 
-The proxy is the only measured ACR client in both phases. During the Gantry
-phase, direct containerd fallback also points at the proxy and is reported as
-`client_class="containerd"`. Gantry-origin traffic is reported as
-`client_class="gantry"`.
+The proxy is the only measured ACR origin in both phases. Baseline proxy traffic
+is reported as `client_class="containerd"`. During the Gantry phase, host routing
+is strict to the local Gantry mirror with no direct proxy fall-through; proxy
+traffic should therefore be reported mostly as `client_class="gantry"`.
+Substantial `client_class="containerd"` bytes during the Gantry phase indicate
+the route did not flow through Gantry as intended.
 
 The workload is a Kubernetes Job with 300 completions and 300-way
 parallelism. Required hostname anti-affinity uses the run ID and phase, so the
@@ -69,11 +71,13 @@ make -C hack/gantry-benchmark status
 make -C hack/gantry-benchmark disable
 ```
 
-`run` restores the original Gantry ConfigMap and per-node ACR routing before
-it exits, including when a phase or regression gate fails. It leaves the
-proxy, Prometheus series, Grafana dashboard, Jobs, and structured artifacts
-available for inspection. `disable` verifies restoration again and removes
-the benchmark namespace and dashboard.
+`enable` patches the matching Gantry upstream registry entry to point at the
+counting proxy and rolls the Gantry DaemonSet, so the DHT can reconverge before
+measurement. `run` restores per-node ACR routing before it exits, including when
+a phase or regression gate fails. It leaves the proxy, Prometheus series,
+Grafana dashboard, Jobs, structured artifacts, and Gantry proxy patch available
+for inspection. `disable` restores the original Gantry ConfigMap and removes the
+benchmark namespace and dashboard.
 
 `enable` also creates `gantry-system/gantry-benchmark-lock`. The fixed
 Gantry-namespace lock prevents concurrent runs even when operators choose
@@ -95,6 +99,7 @@ tmp/gantry-benchmark/<run-id>/
   gantry-cold.json
   comparison.json
   comparison.md
+  proxy-summary.json
   state.json
   gantry-config.original.yaml
 ```
@@ -107,6 +112,9 @@ The comparison includes:
 - Pod start and finish P50, P95, and P100 latency.
 - Every node identity used by each phase.
 - Configurable byte-reduction and P95-latency gates.
+- Per-phase HTTP response status counts and classified upstream transport
+  errors. `proxy-summary.json` is captured during cleanup even when a phase
+  times out or another run error prevents a comparison from being written.
 
 A completed benchmark can return nonzero when a regression gate fails. The
 artifacts are still written and cluster routing is still restored.

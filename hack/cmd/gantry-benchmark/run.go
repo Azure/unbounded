@@ -66,6 +66,10 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		cleanupContext, cancel := context.WithTimeout(context.Background(), 3*b.config.RolloutTimeout)
 		defer cancel()
 
+		if summaryErr := b.writeProxySummaryArtifact(cleanupContext, state); summaryErr != nil {
+			writeAll(b.stderr, fmt.Sprintf("warning: save proxy summary during cleanup: %v\n", summaryErr))
+		}
+
 		if phaseErr := b.switchProxyPhase(cleanupContext, proxyPhaseIdle); phaseErr != nil {
 			writeAll(b.stderr, fmt.Sprintf("warning: switch proxy to idle during cleanup: %v\n", phaseErr))
 		}

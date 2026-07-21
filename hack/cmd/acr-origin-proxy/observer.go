@@ -31,21 +31,25 @@ type digestEntry struct {
 }
 
 type phaseTotals struct {
-	RequestsCompleted uint64                        `json:"requests_completed"`
-	BytesUpstream     uint64                        `json:"bytes_upstream"`
-	BytesToClient     uint64                        `json:"bytes_to_client"`
-	ByPathClass       map[pathClass]trafficTotals   `json:"by_path_class"`
-	ByClientClass     map[clientClass]trafficTotals `json:"by_client_class"`
+	RequestsCompleted uint64                              `json:"requests_completed"`
+	BytesUpstream     uint64                              `json:"bytes_upstream"`
+	BytesToClient     uint64                              `json:"bytes_to_client"`
+	ByPathClass       map[pathClass]trafficTotals         `json:"by_path_class"`
+	ByClientClass     map[clientClass]trafficTotals       `json:"by_client_class"`
+	ByStatus          map[string]uint64                    `json:"by_status"`
+	UpstreamErrors    map[upstreamErrorReason]uint64       `json:"upstream_errors"`
 }
 
 type totals struct {
-	RequestsCompleted uint64                         `json:"requests_completed"`
-	BytesUpstream     uint64                         `json:"bytes_upstream"`
-	BytesToClient     uint64                         `json:"bytes_to_client"`
-	ByPathClass       map[pathClass]trafficTotals    `json:"by_path_class"`
-	ByClientClass     map[clientClass]trafficTotals  `json:"by_client_class"`
-	ByPhase           map[benchmarkPhase]phaseTotals `json:"by_phase"`
-	ByDigest          []digestEntry                  `json:"by_digest"`
+	RequestsCompleted uint64                              `json:"requests_completed"`
+	BytesUpstream     uint64                              `json:"bytes_upstream"`
+	BytesToClient     uint64                              `json:"bytes_to_client"`
+	ByPathClass       map[pathClass]trafficTotals         `json:"by_path_class"`
+	ByClientClass     map[clientClass]trafficTotals       `json:"by_client_class"`
+	ByStatus          map[string]uint64                    `json:"by_status"`
+	UpstreamErrors    map[upstreamErrorReason]uint64       `json:"upstream_errors"`
+	ByPhase           map[benchmarkPhase]phaseTotals      `json:"by_phase"`
+	ByDigest          []digestEntry                       `json:"by_digest"`
 }
 
 type summary struct {
@@ -65,6 +69,7 @@ type observer struct {
 	inflight          *prometheus.GaugeVec
 	authRefresh       *prometheus.CounterVec
 	syntheticThrottle *prometheus.CounterVec
+	upstreamErrors    *prometheus.CounterVec
 	controller        *phaseController
 	startedAt         time.Time
 	mu                sync.Mutex
@@ -112,6 +117,10 @@ func newObserver(registry *prometheus.Registry, now time.Time, controller *phase
 			Name: "origin_synthetic_throttle_total",
 			Help: "Synthetic proxy throttles by reason.",
 		}, []string{"reason", "run_id", "phase"}),
+		upstreamErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "origin_upstream_errors_total",
+			Help: "Upstream registry transport errors by bounded reason.",
+		}, []string{"reason", "method", "path_class", "client_class", "run_id", "phase"}),
 		controller:      controller,
 		startedAt:       now,
 		inflightByClass: make(map[pathClass]int),
@@ -119,6 +128,8 @@ func newObserver(registry *prometheus.Registry, now time.Time, controller *phase
 		totals: totals{
 			ByPathClass:   newPathTotals(),
 			ByClientClass: newClientTotals(),
+			ByStatus:      make(map[string]uint64),
+			UpstreamErrors: make(map[upstreamErrorReason]uint64),
 			ByPhase:       make(map[benchmarkPhase]phaseTotals),
 		},
 	}
@@ -132,6 +143,7 @@ func newObserver(registry *prometheus.Registry, now time.Time, controller *phase
 		result.inflight,
 		result.authRefresh,
 		result.syntheticThrottle,
+		result.upstreamErrors,
 	)
 
 	return result
@@ -153,6 +165,15 @@ func newClientTotals() map[clientClass]trafficTotals {
 	}
 
 	return result
+}
+
+func newPhaseTotals() phaseTotals {
+	return phaseTotals{
+		ByPathClass:    newPathTotals(),
+		ByClientClass:  newClientTotals(),
+		ByStatus:       make(map[string]uint64),
+		UpstreamErrors: make(map[upstreamErrorReason]uint64),
+	}
 }
 
 func (o *observer) begin(method string, path pathClass, client clientClass) phaseSnapshot {
@@ -205,18 +226,19 @@ func (o *observer) finish(
 	o.totals.RequestsCompleted++
 	o.totals.BytesUpstream += traffic.BytesUpstream
 	o.totals.BytesToClient += traffic.BytesToClient
+	o.totals.ByStatus[status]++
 	addTraffic(o.totals.ByPathClass, path, traffic)
 	addTraffic(o.totals.ByClientClass, client, traffic)
 
 	phase := o.totals.ByPhase[attribution.Phase]
 	if phase.ByPathClass == nil {
-		phase.ByPathClass = newPathTotals()
-		phase.ByClientClass = newClientTotals()
+		phase = newPhaseTotals()
 	}
 
 	phase.RequestsCompleted++
 	phase.BytesUpstream += traffic.BytesUpstream
 	phase.BytesToClient += traffic.BytesToClient
+	phase.ByStatus[status]++
 	addTraffic(phase.ByPathClass, path, traffic)
 	addTraffic(phase.ByClientClass, client, traffic)
 	o.totals.ByPhase[attribution.Phase] = phase
@@ -273,6 +295,36 @@ func (o *observer) recordSyntheticThrottle(attribution phaseSnapshot, reason str
 	o.syntheticThrottle.WithLabelValues(reason, attribution.RunID, string(attribution.Phase)).Inc()
 }
 
+func (o *observer) recordUpstreamError(
+	attribution phaseSnapshot,
+	method string,
+	path pathClass,
+	client clientClass,
+	reason upstreamErrorReason,
+) {
+	o.upstreamErrors.WithLabelValues(
+		string(reason),
+		method,
+		string(path),
+		string(client),
+		attribution.RunID,
+		string(attribution.Phase),
+	).Inc()
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.totals.UpstreamErrors[reason]++
+
+	phase := o.totals.ByPhase[attribution.Phase]
+	if phase.ByPathClass == nil {
+		phase = newPhaseTotals()
+	}
+
+	phase.UpstreamErrors[reason]++
+	o.totals.ByPhase[attribution.Phase] = phase
+}
+
 func (o *observer) snapshot(now time.Time) summary {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -288,6 +340,8 @@ func (o *observer) snapshot(now time.Time) summary {
 			BytesToClient:     o.totals.BytesToClient,
 			ByPathClass:       cloneTotals(o.totals.ByPathClass),
 			ByClientClass:     cloneTotals(o.totals.ByClientClass),
+			ByStatus:          cloneCounts(o.totals.ByStatus),
+			UpstreamErrors:    cloneCounts(o.totals.UpstreamErrors),
 			ByPhase:           make(map[benchmarkPhase]phaseTotals, len(o.totals.ByPhase)),
 			ByDigest:          make([]digestEntry, 0, len(o.byDigest)),
 		},
@@ -295,6 +349,8 @@ func (o *observer) snapshot(now time.Time) summary {
 	for phase, value := range o.totals.ByPhase {
 		value.ByPathClass = cloneTotals(value.ByPathClass)
 		value.ByClientClass = cloneTotals(value.ByClientClass)
+		value.ByStatus = cloneCounts(value.ByStatus)
+		value.UpstreamErrors = cloneCounts(value.UpstreamErrors)
 		result.Totals.ByPhase[phase] = value
 	}
 
@@ -324,6 +380,15 @@ func (o *observer) snapshot(now time.Time) summary {
 
 func cloneTotals[K comparable](values map[K]trafficTotals) map[K]trafficTotals {
 	result := make(map[K]trafficTotals, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+
+	return result
+}
+
+func cloneCounts[K comparable](values map[K]uint64) map[K]uint64 {
+	result := make(map[K]uint64, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

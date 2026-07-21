@@ -68,8 +68,12 @@ It then creates:
 - The `Gantry ACR Benchmark` Grafana dashboard.
 - A state ConfigMap containing the exact original Gantry configuration but no
   credentials.
+- A patched Gantry ConfigMap whose matching ACR upstream points at the counting
+   proxy, followed by a full Gantry DaemonSet rollout.
 
-No containerd or Gantry routing is changed by `enable`.
+No per-node containerd routing is changed by `enable`. Gantry is patched during
+enable so its DHT can reconverge before the measured run. `disable` restores the
+original Gantry ConfigMap.
 
 ## 4. Run preflight
 
@@ -77,7 +81,8 @@ No containerd or Gantry routing is changed by `enable`.
 make -C hack/gantry-benchmark preflight
 ```
 
-Preflight performs these mandatory checks before routing changes:
+Preflight performs these mandatory checks before per-node containerd routing
+changes:
 
 1. Pulls the proxy image manifest and config blob through the proxy and
    requires successful HTTP responses.
@@ -101,20 +106,24 @@ The command executes one transaction:
 2. Builds and pushes two independent 1024 MiB random-payload images.
 3. Backs up each node's ACR-specific containerd configuration.
 4. Installs baseline routing and runs the 300-pod baseline Job.
-5. Patches only the matching ACR entry in Gantry's ConfigMap, rolls all Gantry
-   pods, installs measured Gantry routing, and runs the Gantry cold Job.
+5. Installs measured Gantry routing and runs the Gantry cold Job. Gantry was
+   already patched and rolled during `enable`; `run` does not restart Gantry.
 6. Writes phase results and the comparison.
 7. Restores every node's prior ACR-specific file or removes the file when it
    was originally absent.
-8. Restores the exact Gantry ConfigMap and verifies the full DaemonSet rollout.
+8. Leaves the benchmark namespace and Gantry proxy patch in place for
+   inspection until `disable` is run.
 
 Phase changes wait up to `BENCHMARK_ROLLOUT_TIMEOUT` for all proxy requests
 attributed to the current phase to drain before counters move to the next
 phase.
 
-Both ACR-specific routing modes are fail-closed through the proxy. The
-Gantry-mode containerd fallback is the proxy, so fallback traffic remains
-measured rather than escaping directly to ACR.
+Baseline routing points containerd directly at the counting proxy. Gantry routing
+is strict to the local Gantry mirror, with no direct proxy or ACR fall-through;
+if Gantry is unavailable, containerd retries or fails against Gantry instead of
+escaping the measured path. The proxy should therefore see Gantry-origin traffic
+during the Gantry phase. Substantial `client_class="containerd"` bytes in that
+phase indicate misrouting and make the comparison invalid.
 
 ## 6. Inspect results
 
@@ -129,6 +138,7 @@ Find the run ID in that output, then inspect:
 ```bash
 jq . tmp/gantry-benchmark/<run-id>/comparison.json
 cat tmp/gantry-benchmark/<run-id>/comparison.md
+jq . tmp/gantry-benchmark/<run-id>/proxy-summary.json
 ```
 
 Open Grafana:
@@ -145,6 +155,7 @@ Select dashboard `Gantry ACR Benchmark` and choose the run ID. Check:
 - Peer hits versus origin pulls.
 - Completed pull pods by phase.
 - Proxy CPU, network, and inflight requests.
+- HTTP errors by status and upstream transport errors by bounded reason.
 
 A saturated single proxy can distort latency even though byte and request
 totals remain valid. Treat sustained proxy CPU limits or a growing inflight
@@ -182,4 +193,4 @@ the reported conflict and rerun `disable`.
 | Node reachability is below 300 | Do not continue. Verify AKS node-to-Service routing and network policy. |
 | Gantry ConfigMap hash conflict | Another operator changed the ConfigMap. Reconcile that change manually; the workflow will not overwrite it. |
 | Node `hosts.toml` ownership conflict | Inspect the named node and ACR-specific directory. Preserve concurrent operator changes; do not remove markers blindly. |
-| Regression gates fail | Inspect the generated comparison and Grafana. Routing is restored even though `run` returns nonzero. |
+| Regression gates fail | Inspect the generated comparison and Grafana. Per-node routing is restored even though `run` returns nonzero; run `disable` when done to restore Gantry and remove instrumentation. |

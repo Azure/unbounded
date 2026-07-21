@@ -25,12 +25,21 @@ type proxyPhaseTotals struct {
 	BytesToClient     uint64                        `json:"bytes_to_client"`
 	ByPathClass       map[string]proxyTrafficTotals `json:"by_path_class"`
 	ByClientClass     map[string]proxyTrafficTotals `json:"by_client_class"`
+	ByStatus          map[string]uint64              `json:"by_status"`
+	UpstreamErrors    map[string]uint64              `json:"upstream_errors"`
 }
 
 type proxySummary struct {
-	RunID  string     `json:"run_id"`
-	Phase  proxyPhase `json:"phase"`
+	RunID      string     `json:"run_id"`
+	Phase      proxyPhase `json:"phase"`
+	Since      string     `json:"since"`
+	UptimeSecs int64      `json:"uptime_seconds"`
 	Totals struct {
+		RequestsCompleted uint64                          `json:"requests_completed"`
+		BytesUpstream     uint64                          `json:"bytes_upstream"`
+		BytesToClient     uint64                          `json:"bytes_to_client"`
+		ByStatus          map[string]uint64                `json:"by_status"`
+		UpstreamErrors    map[string]uint64                `json:"upstream_errors"`
 		ByPhase map[proxyPhase]proxyPhaseTotals `json:"by_phase"`
 	} `json:"totals"`
 }
@@ -68,7 +77,7 @@ type resultCheck struct {
 	Message string `json:"message"`
 }
 
-func (b *benchmark) fetchProxyTotals(ctx context.Context, state benchmarkState, phase proxyPhase) (proxyPhaseTotals, error) {
+func (b *benchmark) fetchProxySummary(ctx context.Context, state benchmarkState) (proxySummary, error) {
 	rawPath := fmt.Sprintf(
 		"/api/v1/namespaces/%s/services/http:acr-origin-proxy:9090/proxy/debug/summary",
 		b.config.Namespace,
@@ -76,16 +85,25 @@ func (b *benchmark) fetchProxyTotals(ctx context.Context, state benchmarkState, 
 
 	output, err := b.commands.Run(ctx, nil, "kubectl", "get", "--raw", rawPath)
 	if err != nil {
-		return proxyPhaseTotals{}, err
+		return proxySummary{}, err
 	}
 
 	var summary proxySummary
 	if err := json.Unmarshal(output, &summary); err != nil {
-		return proxyPhaseTotals{}, fmt.Errorf("decode proxy summary: %w", err)
+		return proxySummary{}, fmt.Errorf("decode proxy summary: %w", err)
 	}
 
 	if summary.RunID != state.RunID {
-		return proxyPhaseTotals{}, fmt.Errorf("proxy run ID is %q, want %q", summary.RunID, state.RunID)
+		return proxySummary{}, fmt.Errorf("proxy run ID is %q, want %q", summary.RunID, state.RunID)
+	}
+
+	return summary, nil
+}
+
+func (b *benchmark) fetchProxyTotals(ctx context.Context, state benchmarkState, phase proxyPhase) (proxyPhaseTotals, error) {
+	summary, err := b.fetchProxySummary(ctx, state)
+	if err != nil {
+		return proxyPhaseTotals{}, err
 	}
 
 	totals, ok := summary.Totals.ByPhase[phase]
@@ -94,6 +112,15 @@ func (b *benchmark) fetchProxyTotals(ctx context.Context, state benchmarkState, 
 	}
 
 	return totals, nil
+}
+
+func (b *benchmark) writeProxySummaryArtifact(ctx context.Context, state benchmarkState) error {
+	summary, err := b.fetchProxySummary(ctx, state)
+	if err != nil {
+		return err
+	}
+
+	return b.writeJSONArtifact(state.RunID, "proxy-summary.json", summary)
 }
 
 func (b *benchmark) gantryRevision(ctx context.Context) (string, error) {
@@ -362,6 +389,12 @@ func (b *benchmark) writeComparisonArtifacts(comparison benchmarkComparison) err
 
 	baselineDigestRequests := digestRequests(comparison.Baseline.Proxy)
 	gantryDigestRequests := digestRequests(comparison.GantryCold.Proxy)
+	baselineHTTP429 := comparison.Baseline.Proxy.ByStatus["429"]
+	gantryHTTP429 := comparison.GantryCold.Proxy.ByStatus["429"]
+	baselineHTTP5xx := statusClassCount(comparison.Baseline.Proxy.ByStatus, '5')
+	gantryHTTP5xx := statusClassCount(comparison.GantryCold.Proxy.ByStatus, '5')
+	baselineTransportErrors := countTotal(comparison.Baseline.Proxy.UpstreamErrors)
+	gantryTransportErrors := countTotal(comparison.GantryCold.Proxy.UpstreamErrors)
 	markdown := fmt.Sprintf(`# Gantry benchmark %s
 
 | Metric | Baseline | Gantry cold | Reduction |
@@ -369,6 +402,9 @@ func (b *benchmark) writeComparisonArtifacts(comparison benchmarkComparison) err
 | ACR upstream bytes | %d | %d | %.2f%% |
 | Proxy requests | %d | %d | %.2f%% |
 | Digest requests | %d | %d | %.2f%% |
+| HTTP 429 responses | %d | %d | n/a |
+| HTTP 5xx responses | %d | %d | n/a |
+| Upstream transport errors | %d | %d | n/a |
 | Pod start P50 | %.3fs | %.3fs | %.2f%% |
 | Pod start P95 | %.3fs | %.3fs | %.2f%% |
 | Gantry origin pulls | 0 | %.0f | n/a |
@@ -387,6 +423,12 @@ Result: **%s**
 		baselineDigestRequests,
 		gantryDigestRequests,
 		100*reduction(float64(baselineDigestRequests), float64(gantryDigestRequests)),
+		baselineHTTP429,
+		gantryHTTP429,
+		baselineHTTP5xx,
+		gantryHTTP5xx,
+		baselineTransportErrors,
+		gantryTransportErrors,
 		comparison.Baseline.Job.PodStartLatency.P50Seconds,
 		comparison.GantryCold.Job.PodStartLatency.P50Seconds,
 		100*comparison.P50StartLatencyReduction,
@@ -407,4 +449,26 @@ Result: **%s**
 
 func digestRequests(totals proxyPhaseTotals) uint64 {
 	return totals.ByPathClass["blob"].Requests + totals.ByPathClass["manifest_by_digest"].Requests
+}
+
+func statusClassCount(values map[string]uint64, class byte) uint64 {
+	var total uint64
+
+	for status, count := range values {
+		if len(status) == 3 && status[0] == class {
+			total += count
+		}
+	}
+
+	return total
+}
+
+func countTotal[K comparable](values map[K]uint64) uint64 {
+	var total uint64
+
+	for _, count := range values {
+		total += count
+	}
+
+	return total
 }

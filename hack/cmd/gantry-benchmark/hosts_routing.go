@@ -343,7 +343,7 @@ exec sleep 2147483647
 		return err
 	}
 
-	if err := b.validateBenchmarkDaemonSet(ctx, name); err != nil {
+	if err := b.validateBenchmarkDaemonSetAtCurrentSize(ctx, name); err != nil {
 		return err
 	}
 
@@ -451,6 +451,28 @@ func nodeDaemonSet(
 }
 
 func (b *benchmark) validateBenchmarkDaemonSet(ctx context.Context, name string) error {
+	daemonSet, err := b.benchmarkDaemonSetStatus(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	return validateBenchmarkDaemonSetStatus(daemonSet, name, b.config.NodeCount)
+}
+
+func (b *benchmark) validateBenchmarkDaemonSetAtCurrentSize(ctx context.Context, name string) error {
+	daemonSet, err := b.benchmarkDaemonSetStatus(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	if daemonSet.Status.DesiredNumberScheduled <= 0 {
+		return fmt.Errorf("daemonset %s has no desired pods", name)
+	}
+
+	return validateBenchmarkDaemonSetStatus(daemonSet, name, daemonSet.Status.DesiredNumberScheduled)
+}
+
+func (b *benchmark) benchmarkDaemonSetStatus(ctx context.Context, name string) (daemonSetStatus, error) {
 	output, err := b.commands.Run(
 		ctx,
 		nil,
@@ -458,16 +480,20 @@ func (b *benchmark) validateBenchmarkDaemonSet(ctx context.Context, name string)
 		"get", "daemonset", name, "-o", "json",
 	)
 	if err != nil {
-		return err
+		return daemonSetStatus{}, err
 	}
 
 	var daemonSet daemonSetStatus
 	if err := json.Unmarshal(output, &daemonSet); err != nil {
-		return fmt.Errorf("decode DaemonSet %s: %w", name, err) //nolint:staticcheck // Kubernetes kind name starts with a capital.
+		return daemonSetStatus{}, fmt.Errorf("decode DaemonSet %s: %w", name, err) //nolint:staticcheck // Kubernetes kind name starts with a capital.
 	}
 
-	if daemonSet.Status.DesiredNumberScheduled != b.config.NodeCount || daemonSet.Status.NumberReady != b.config.NodeCount {
-		return fmt.Errorf("daemonset %s is ready on %d/%d nodes", name, daemonSet.Status.NumberReady, b.config.NodeCount)
+	return daemonSet, nil
+}
+
+func validateBenchmarkDaemonSetStatus(daemonSet daemonSetStatus, name string, expectedCount int) error {
+	if daemonSet.Status.DesiredNumberScheduled != expectedCount || daemonSet.Status.NumberReady != expectedCount {
+		return fmt.Errorf("daemonset %s is ready on %d/%d nodes", name, daemonSet.Status.NumberReady, expectedCount)
 	}
 
 	return nil

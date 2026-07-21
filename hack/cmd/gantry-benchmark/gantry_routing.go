@@ -79,7 +79,7 @@ func (b *benchmark) restoreGantry(ctx context.Context, state *benchmarkState) er
 			return nil
 		}
 
-		if err := b.rolloutGantry(ctx); err != nil {
+		if err := b.rolloutGantryAtCurrentSize(ctx); err != nil {
 			return err
 		}
 
@@ -96,7 +96,7 @@ func (b *benchmark) restoreGantry(ctx context.Context, state *benchmarkState) er
 		return err
 	}
 
-	if err := b.rolloutGantry(ctx); err != nil {
+	if err := b.rolloutGantryAtCurrentSize(ctx); err != nil {
 		return err
 	}
 
@@ -137,6 +137,14 @@ func (b *benchmark) patchGantryConfigMap(ctx context.Context, expected, replacem
 }
 
 func (b *benchmark) rolloutGantry(ctx context.Context) error {
+	return b.rolloutGantryAndValidate(ctx, b.validateGantry)
+}
+
+func (b *benchmark) rolloutGantryAtCurrentSize(ctx context.Context) error {
+	return b.rolloutGantryAndValidate(ctx, b.validateGantryAtCurrentSize)
+}
+
+func (b *benchmark) rolloutGantryAndValidate(ctx context.Context, validate func(context.Context) error) error {
 	if _, err := b.commands.Run(
 		ctx,
 		nil,
@@ -158,7 +166,7 @@ func (b *benchmark) rolloutGantry(ctx context.Context) error {
 		return err
 	}
 
-	return b.validateGantry(ctx)
+	return validate(ctx)
 }
 
 func (b *benchmark) switchProxyPhase(ctx context.Context, phase proxyPhase) error {

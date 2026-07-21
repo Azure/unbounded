@@ -19,8 +19,9 @@ The benchmark compares two fresh image pulls:
 The counting proxy is the measured ACR origin. A valid Gantry-cold run should
 show most large blob bytes coming from `client_class="gantry"`, with peer-hit
 metrics increasing. If large blob bytes mostly come from
-`client_class="containerd"`, the run is not a valid Gantry comparison even if
-the Kubernetes Job completes.
+`client_class="containerd"`, the Gantry-cold route did not flow through Gantry
+as intended and the run is not a valid comparison even if the Kubernetes Job
+completes.
 
 ## Prerequisites
 
@@ -231,8 +232,10 @@ unset ACR_PASSWORD acr_refresh_token
 ## Enable Instrumentation
 
 Enable creates the benchmark namespace, proxy, monitoring objects, state
-ConfigMap, and Gantry-namespace lock. It does not change node routing or Gantry
-routing.
+ConfigMap, and Gantry-namespace lock. It does not change node routing. It does
+patch the matching Gantry upstream registry entry to point at the counting proxy
+and rolls the Gantry DaemonSet during enable, so the DHT can reconverge before
+the measured run. `disable` restores the original Gantry ConfigMap.
 
 ```bash
 BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark enable
@@ -250,7 +253,7 @@ Expected state is `enabled`.
 
 ## Preflight
 
-Run preflight before any routing changes:
+Run preflight before any per-node containerd routing changes:
 
 ```bash
 BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark preflight
@@ -308,11 +311,16 @@ During Gantry cold, expect:
 gantry-benchmark-gantry-cold-<run-id>
 ```
 
+`run` restores the per-node ACR-specific `hosts.toml` routing before it exits,
+including when a phase or regression gate fails. It leaves the benchmark
+namespace, proxy, dashboard, artifacts, and Gantry proxy patch in place for
+inspection until `disable` is run.
+
 ## Validate Gantry Cold Routing
 
 Do not trust pod pull time alone. Validate the actual route.
 
-Confirm Gantry is patched to the proxy during the Gantry phase:
+Confirm Gantry remains patched to the proxy after `enable` and through the run:
 
 ```bash
 kubectl -n gantry-system get configmap gantry-config -o jsonpath='{.data.config\.yaml}' \
@@ -401,9 +409,9 @@ Expected after cleanup:
 
 ## Recovery Notes
 
-If `run` returns nonzero but state is `run-failed-restored`, routing was
-restored. Run `preflight` again before another `run`, or run `disable` for a
-clean start.
+If `run` returns nonzero but state is `run-failed-restored`, per-node routing was
+restored and Gantry remains patched to the proxy for inspection. Run `disable`
+for a clean start before enabling another benchmark.
 
 If state is `restore-failed` or `disabling`, inspect before making changes:
 
