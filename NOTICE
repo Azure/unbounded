@@ -183,21 +183,21 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.29/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.30/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.28/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.29/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.105.0/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.105.1/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
@@ -241,7 +241,7 @@ notices:
       - Copyright 2012-2015 Docker, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/containerd/containerd/blob/v2.3.2/LICENSE
+        link: https://github.com/containerd/containerd/blob/v2.3.3/LICENSE
   - dependency: github.com/containerd/errdefs
     ecosystem: go
     copyright:
@@ -424,9 +424,9 @@ notices:
       - Copyright (c) 2016, 2016, Oracle and/or its affiliates. All rights reserved.
     license:
       - name: UPL-1.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.120.0/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.121.0/LICENSE.txt
       - name: Apache License, Version 2.0
-        link: https://github.com/oracle/oci-go-sdk/blob/v65.120.0/LICENSE.txt
+        link: https://github.com/oracle/oci-go-sdk/blob/v65.121.0/LICENSE.txt
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -535,7 +535,7 @@ notices:
       - Copyright 2014 gRPC authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/grpc/grpc-go/blob/v1.82.0/LICENSE
+        link: https://github.com/grpc/grpc-go/blob/v1.82.1/LICENSE
   - dependency: google.golang.org/protobuf
     ecosystem: go
     copyright:
@@ -616,7 +616,7 @@ notices:
       - Copyright (c) 2017 The Sqlite Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://gitlab.com/cznic/sqlite/-/blob/v1.53.0/LICENSE
+        link: https://gitlab.com/cznic/sqlite/-/blob/v1.54.0/LICENSE
   - dependency: oras.land/oras-go/v2
     ecosystem: go
     copyright:
