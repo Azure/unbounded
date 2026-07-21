@@ -193,6 +193,7 @@ func run(ctx context.Context, cfg config) error {
 		Client:    mgr.GetClient(),
 		Scheme:    scheme,
 		Namespace: namespace,
+		Registry:  operator.DefaultRegistry(),
 		Config: operator.Config{
 			MetalmanImage:     cfg.metalmanImage,
 			APIServerEndpoint: cfg.apiServerEndpoint,

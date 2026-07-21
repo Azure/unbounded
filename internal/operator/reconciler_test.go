@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -68,6 +69,21 @@ func (f fakeSite) Cleanup(context.Context, *component.Env, *unboundedv1alpha3.Si
 	}
 
 	return f.cleanupErr
+}
+
+// statefulCluster is a pointer-receiver ClusterComponent that counts how many
+// times it reconciled, used to prove the driver reuses a single registry
+// instance instead of rebuilding it each pass.
+type statefulCluster struct {
+	runs int
+}
+
+func (c *statefulCluster) Name() string          { return "stateful" }
+func (c *statefulCluster) ConditionType() string { return "StatefulReady" }
+func (c *statefulCluster) Reconcile(context.Context, *component.Env, []unboundedv1alpha3.Site) component.Result {
+	c.runs++
+
+	return component.Reconciled()
 }
 
 func newReconcilerTestScheme(t *testing.T) *runtime.Scheme {
@@ -306,5 +322,135 @@ func TestDefaultRegistryIsValidAndComplete(t *testing.T) {
 		if !seen {
 			t.Fatalf("DefaultRegistry is missing condition %q", condition)
 		}
+	}
+}
+
+func TestReconcileRequeuesAfterSmallestComponentInterval(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+
+	registry := &component.Registry{
+		Cluster: []component.ClusterComponent{
+			fakeCluster{name: "net", condition: "NetReady", result: component.NotReadyAfter("Waiting", "net not ready", 5*time.Minute)},
+			fakeCluster{name: "machina", condition: "MachinaReady", result: component.NotReadyAfter("Waiting", "machina not ready", 30*time.Second)},
+		},
+		Site: []component.SiteComponent{
+			fakeSite{name: "storage", condition: "StorageReady", enabled: true, result: component.Reconciled()},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(site).WithStatusSubresource(site).Build()
+	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
+
+	res, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if res.RequeueAfter != 30*time.Second {
+		t.Fatalf("RequeueAfter = %s, want the smallest positive interval 30s", res.RequeueAfter)
+	}
+}
+
+func TestReconcileSiteLessPassHonorsRequeue(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+
+	registry := &component.Registry{
+		Cluster: []component.ClusterComponent{
+			fakeCluster{name: "net", condition: "NetReady", result: component.NotReadyAfter("Waiting", "net not ready", time.Minute)},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
+
+	// The Site-less pass has no status to publish, but a not-ready cluster
+	// component must still schedule a retry (regression: the old path dropped it).
+	res, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: component.SingletonRequestName}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if res.RequeueAfter != time.Minute {
+		t.Fatalf("RequeueAfter = %s, want 1m on the Site-less pass", res.RequeueAfter)
+	}
+}
+
+func TestReconcilePrunesStaleConditions(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Status: unboundedv1alpha3.SiteStatus{
+			Conditions: []metav1.Condition{{
+				// A condition from a component that has since been removed/renamed.
+				Type:   "LegacyReady",
+				Status: metav1.ConditionTrue,
+				Reason: "Reconciled",
+			}},
+		},
+	}
+
+	registry := &component.Registry{
+		Cluster: []component.ClusterComponent{
+			fakeCluster{name: "net", condition: "NetReady", result: component.Reconciled()},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(site).WithStatusSubresource(site).Build()
+	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got unboundedv1alpha3.Site
+	if err := cl.Get(t.Context(), client.ObjectKeyFromObject(site), &got); err != nil {
+		t.Fatalf("get reconciled Site: %v", err)
+	}
+
+	if apimeta.FindStatusCondition(got.Status.Conditions, "LegacyReady") != nil {
+		t.Fatalf("stale condition LegacyReady was not pruned: %#v", got.Status.Conditions)
+	}
+
+	if apimeta.FindStatusCondition(got.Status.Conditions, "NetReady") == nil {
+		t.Fatalf("current condition NetReady missing after prune: %#v", got.Status.Conditions)
+	}
+}
+
+func TestRegistryMaterializedOnceAndInstanceReused(t *testing.T) {
+	// registry() must materialize r.Registry once and return the same instance,
+	// so watch wiring and every Reconcile share components (not throwaway copies).
+	r := &SiteReconciler{}
+
+	first := r.registry()
+	if r.Registry == nil {
+		t.Fatal("registry() did not materialize r.Registry")
+	}
+
+	if second := r.registry(); second != first {
+		t.Fatal("registry() rebuilt the registry instead of reusing the materialized instance")
+	}
+
+	// A stateful component reused across reconciles retains its state, which is
+	// only possible because the same instance is reused each pass.
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+	stateful := &statefulCluster{}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(site).WithStatusSubresource(site).Build()
+	sr := &SiteReconciler{
+		Client:   cl,
+		Scheme:   scheme,
+		Registry: &component.Registry{Cluster: []component.ClusterComponent{stateful}},
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := sr.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)}); err != nil {
+			t.Fatalf("Reconcile %d: %v", i, err)
+		}
+	}
+
+	if stateful.runs != 2 {
+		t.Fatalf("stateful component runs = %d, want 2 (instance not reused across reconciles)", stateful.runs)
 	}
 }

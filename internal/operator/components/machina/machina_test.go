@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"io/fs"
 	"strings"
 	"testing"
 
@@ -18,12 +20,15 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/metalman"
 )
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -82,6 +87,58 @@ func TestApplyMutatorSkipsMetalmanSupportAndCRD(t *testing.T) {
 		if obj.Object != nil {
 			t.Fatalf("object was not skipped: %#v", obj.Object)
 		}
+	}
+}
+
+// TestApplyMutatorSkipsExactlyMetalmanRBAC guards the cross-component invariant
+// that machina skips every metalman RBAC object metalman owns and applies. Both
+// sides now decide via component.IsRBACObject, so this catches any future drift
+// between them across the real machina manifest set.
+func TestApplyMutatorSkipsExactlyMetalmanRBAC(t *testing.T) {
+	files, err := component.YamlFiles(machinamanifests.Manifests)
+	if err != nil {
+		t.Fatalf("list machina manifests: %v", err)
+	}
+
+	supportSeen := 0
+
+	for _, file := range files {
+		data, err := fs.ReadFile(machinamanifests.Manifests, file)
+		if err != nil {
+			t.Fatalf("read manifest %s: %v", file, err)
+		}
+
+		decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+
+		for {
+			obj := &unstructured.Unstructured{}
+			if err := decoder.Decode(obj); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				t.Fatalf("decode manifest %s: %v", file, err)
+			}
+
+			if obj.Object == nil || !metalman.IsSupportObject(obj) {
+				continue
+			}
+
+			supportSeen++
+
+			work := obj.DeepCopy()
+			if err := applyMutator("hash")(work); err != nil {
+				t.Fatalf("applyMutator: %v", err)
+			}
+
+			if work.Object != nil {
+				t.Fatalf("machina applied metalman RBAC %s/%s that the metalman component owns", obj.GetKind(), obj.GetName())
+			}
+		}
+	}
+
+	if supportSeen == 0 {
+		t.Fatal("no metalman RBAC found in machina manifests; the guard is vacuous")
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -335,24 +336,51 @@ func ToUnstructured(obj client.Object) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: objectMap}
 }
 
-// SiteOwnerReference builds the owner reference used for per-site resources.
-// Using owner references rather than a Site finalizer lets Kubernetes garbage
-// collect per-site workloads if a Site is deleted while the operator is down.
+// IsRBACObject reports whether obj is an RBAC object (ServiceAccount, Role,
+// RoleBinding, ClusterRole, or ClusterRoleBinding) whose name contains
+// nameContains. It single-sources the shared decision of which RBAC objects in a
+// bundled manifest set belong to a given component, so a cluster component that
+// skips another component's RBAC and the per-Site component that applies it
+// cannot drift apart.
+func IsRBACObject(obj *unstructured.Unstructured, nameContains string) bool {
+	switch obj.GetKind() {
+	case "ServiceAccount", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding":
+		return strings.Contains(obj.GetName(), nameContains)
+	default:
+		return false
+	}
+}
+
+// SiteOwnerReference builds the controller owner reference used for per-site
+// resources. Using owner references rather than a Site finalizer lets Kubernetes
+// garbage collect per-site workloads if a Site is deleted while the operator is
+// down.
+//
+// Controller is set so controller-runtime's Owns() watch (which enqueues only
+// via metav1.GetControllerOf) re-reconciles the Site when an owned resource
+// drifts or is deleted. BlockOwnerDeletion is intentionally left unset: setting
+// it triggers the OwnerReferencesPermissionEnforcement admission check for
+// update on sites/finalizers, which the operator ServiceAccount does not hold,
+// and would cause every owned-object apply to be rejected.
 func SiteOwnerReference(site *unboundedv1alpha3.Site) metav1.OwnerReference {
 	return metav1.OwnerReference{
 		APIVersion: unboundedv1alpha3.GroupVersion.String(),
 		Kind:       "Site",
 		Name:       site.Name,
 		UID:        site.UID,
+		Controller: ptr.To(true),
 	}
 }
 
 // UpsertOwnerReference adds or updates owner in refs, returning whether the slice
-// changed.
+// changed. An existing reference to the same owner (matched by UID, Kind, and
+// APIVersion) is rewritten when its Name or Controller flag differs, so a
+// resource adopted before Controller ownership was introduced converges to a
+// controller reference on the next reconcile.
 func UpsertOwnerReference(refs []metav1.OwnerReference, owner metav1.OwnerReference) ([]metav1.OwnerReference, bool) {
 	for i := range refs {
 		if refs[i].UID == owner.UID && refs[i].Kind == owner.Kind && refs[i].APIVersion == owner.APIVersion {
-			if refs[i].Name == owner.Name {
+			if refs[i].Name == owner.Name && controllerEqual(refs[i].Controller, owner.Controller) {
 				return refs, false
 			}
 
@@ -367,6 +395,12 @@ func UpsertOwnerReference(refs []metav1.OwnerReference, owner metav1.OwnerRefere
 	out = append(out, owner)
 
 	return out, true
+}
+
+// controllerEqual compares two owner-reference Controller pointers, treating a
+// nil pointer as false.
+func controllerEqual(a, b *bool) bool {
+	return ptr.Deref(a, false) == ptr.Deref(b, false)
 }
 
 // SiteNodeAffinity matches Nodes carrying either the canonical site label or the

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -93,12 +94,17 @@ func (r *SiteReconciler) env() *component.Env {
 	}
 }
 
+// registry returns the component registry, materializing the default registry
+// once on first use. Materializing (rather than rebuilding DefaultRegistry on
+// every call) means watch wiring and every Reconcile share the same component
+// instances, so a component may safely hold state. SetupWithManager forces this
+// before the manager starts, so concurrent Reconciles only ever read r.Registry.
 func (r *SiteReconciler) registry() *component.Registry {
-	if r.Registry != nil {
-		return r.Registry
+	if r.Registry == nil {
+		r.Registry = DefaultRegistry()
 	}
 
-	return DefaultRegistry()
+	return r.Registry
 }
 
 func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -112,65 +118,119 @@ func (r *SiteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	switch {
 	case apierrors.IsNotFound(err):
 		// A Site was deleted, or a managed singleton event used the synthetic
-		// request. Reconcile the cluster components with no specific Site; there
-		// is no Site status to publish.
-		return ctrl.Result{}, r.reconcileClusters(ctx, env, reg)
+		// request. Run the cluster components with no specific Site; there is no
+		// Site status to publish.
+		return r.runComponents(ctx, logger, env, reg, nil)
 	case err != nil:
 		return ctrl.Result{}, err
 	}
 
+	return r.runComponents(ctx, logger, env, reg, &site)
+}
+
+// runComponents drives the registry for one reconcile pass. Cluster components
+// run on every pass from the full set of Sites; per-Site components run only when
+// site is non-nil. When site is non-nil the component outcomes are published as
+// Site status conditions in registry order (cluster first, then site) so callers
+// can `kubectl wait --for=condition=NetReady`, and conditions left by components
+// no longer in the registry are pruned. The Site-less pass (deletion or a
+// synthetic singleton request) has no Site status to write, so it only surfaces
+// component errors and requeue requests.
+//
+// The pass requeues on any component Err (with controller backoff) or, absent an
+// error, after the smallest positive RequeueAfter across the components.
+func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, env *component.Env, reg *component.Registry, site *unboundedv1alpha3.Site) (ctrl.Result, error) {
 	sites, err := env.ListSites(ctx)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	patch := client.MergeFrom(site.DeepCopy())
+	// Capture the status baseline before any component mutates conditions so the
+	// merge patch carries exactly the condition changes.
+	var patch client.Patch
+	if site != nil {
+		patch = client.MergeFrom(site.DeepCopy())
+	}
 
-	var reconcileErrs []error
+	var (
+		reconcileErrs []error
+		requeueAfter  time.Duration
+	)
 
-	// Cluster singletons run on every Site event; per-Site components run for
-	// this Site. Conditions are published in registry order (cluster then site)
-	// so the status patch is deterministic and callers can
-	// `kubectl wait --for=condition=NetReady`.
-	for _, c := range reg.Cluster {
-		res := c.Reconcile(ctx, env, sites)
-		if err := setComponentResult(logger, &site, c.Name(), c.ConditionType(), res); err != nil {
-			reconcileErrs = append(reconcileErrs, err)
+	record := func(name, conditionType string, res component.Result) {
+		switch {
+		case site != nil:
+			if err := setComponentResult(logger, site, name, conditionType, res); err != nil {
+				reconcileErrs = append(reconcileErrs, err)
+			}
+		case res.Err != nil:
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("%s: %w", name, res.Err))
 		}
+
+		requeueAfter = nextRequeue(requeueAfter, res.RequeueAfter)
+	}
+
+	for _, c := range reg.Cluster {
+		record(c.Name(), c.ConditionType(), c.Reconcile(ctx, env, sites))
+	}
+
+	if site != nil {
+		for _, c := range reg.Site {
+			record(c.Name(), c.ConditionType(), reconcileSiteComponent(ctx, env, c, site))
+		}
+
+		pruneStaleConditions(site, reg)
+
+		if err := r.Status().Patch(ctx, site, patch); err != nil {
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status: %w", err))
+		}
+	}
+
+	return ctrl.Result{RequeueAfter: requeueAfter}, errors.Join(reconcileErrs...)
+}
+
+// nextRequeue returns the smallest positive of the current and candidate
+// requeue-after durations, so the driver retries at the earliest requested time.
+func nextRequeue(current, candidate time.Duration) time.Duration {
+	if candidate <= 0 {
+		return current
+	}
+
+	if current <= 0 || candidate < current {
+		return candidate
+	}
+
+	return current
+}
+
+// pruneStaleConditions removes Site status conditions whose type is not published
+// by any component currently in the registry, so a Site does not carry orphaned
+// conditions after a component is removed or renamed. This is safe because the
+// SiteReconciler is the sole writer of Site.status.conditions; if another
+// controller ever writes Site conditions, this must be scoped to component
+// condition types.
+func pruneStaleConditions(site *unboundedv1alpha3.Site, reg *component.Registry) {
+	current := make(map[string]struct{}, len(reg.Cluster)+len(reg.Site))
+
+	for _, c := range reg.Cluster {
+		current[c.ConditionType()] = struct{}{}
 	}
 
 	for _, c := range reg.Site {
-		res := reconcileSiteComponent(ctx, env, c, &site)
-		if err := setComponentResult(logger, &site, c.Name(), c.ConditionType(), res); err != nil {
-			reconcileErrs = append(reconcileErrs, err)
+		current[c.ConditionType()] = struct{}{}
+	}
+
+	var stale []string
+
+	for i := range site.Status.Conditions {
+		if _, ok := current[site.Status.Conditions[i].Type]; !ok {
+			stale = append(stale, site.Status.Conditions[i].Type)
 		}
 	}
 
-	if err := r.Status().Patch(ctx, &site, patch); err != nil {
-		reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status: %w", err))
+	for _, conditionType := range stale {
+		apimeta.RemoveStatusCondition(&site.Status.Conditions, conditionType)
 	}
-
-	return ctrl.Result{}, errors.Join(reconcileErrs...)
-}
-
-// reconcileClusters reconciles just the cluster components; used for deleted
-// Sites and synthetic singleton requests, where there is no Site status.
-func (r *SiteReconciler) reconcileClusters(ctx context.Context, env *component.Env, reg *component.Registry) error {
-	sites, err := env.ListSites(ctx)
-	if err != nil {
-		return err
-	}
-
-	var errs []error
-
-	for _, c := range reg.Cluster {
-		res := c.Reconcile(ctx, env, sites)
-		if res.Err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", c.Name(), res.Err))
-		}
-	}
-
-	return errors.Join(errs...)
 }
 
 // reconcileSiteComponent reconciles a per-Site component when enabled and tears
@@ -215,6 +275,9 @@ func setComponentResult(logger logr.Logger, site *unboundedv1alpha3.Site, name, 
 }
 
 func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// registry() materializes r.Registry so watch wiring below and every later
+	// Reconcile share the same component instances (see registry). This runs
+	// before the manager starts, so the concurrent Reconciles only read it.
 	reg := r.registry()
 	if err := reg.Validate(); err != nil {
 		return fmt.Errorf("invalid component registry: %w", err)

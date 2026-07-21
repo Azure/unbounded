@@ -9,7 +9,6 @@ package machina
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +20,7 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/metalman"
 )
 
 const (
@@ -125,7 +125,7 @@ func applyMutator(configHash string) func(*unstructured.Unstructured) error {
 		// CRDs are installed once at operator startup, not from the reconcile
 		// loop; the metalman RBAC ships in the machina manifests but is applied
 		// per-site by the metalman component. Skip both here.
-		if obj.GetKind() == component.CRDKind || isMetalmanSupportObject(obj) {
+		if obj.GetKind() == component.CRDKind || metalman.IsSupportObject(obj) {
 			obj.Object = nil
 
 			return nil
@@ -145,18 +145,6 @@ func applyMutator(configHash string) func(*unstructured.Unstructured) error {
 		}
 
 		return nil
-	}
-}
-
-// isMetalmanSupportObject reports whether obj is the metalman RBAC that ships in
-// the machina manifests. It is kept in sync with the metalman component, which
-// owns and applies these objects.
-func isMetalmanSupportObject(obj *unstructured.Unstructured) bool {
-	switch obj.GetKind() {
-	case "ServiceAccount", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding":
-		return strings.Contains(obj.GetName(), "metalman")
-	default:
-		return false
 	}
 }
 

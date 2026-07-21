@@ -16,6 +16,13 @@ import (
 // machina). It reconciles once per pass from the full set of Sites and is never
 // tied to a single Site, so it also runs on the Site-less pass (a Site deletion
 // or a managed singleton-resource event).
+//
+// Reconcile runs on every pass and must be idempotent. A not-ready Result does
+// not by itself schedule a retry: the driver requeues on Result.Err or after
+// Result.RequeueAfter, otherwise the component only re-runs when one of the
+// watches it registers via WatchProvider fires. On the Site-less pass there is
+// no Site status to publish, so a not-ready Result there is meaningful only
+// through its Err or RequeueAfter.
 type ClusterComponent interface {
 	// Name is the stable, unique component identifier (for example "net"). It is
 	// used in logs and must be unique within a Registry.
@@ -37,6 +44,11 @@ type ClusterComponent interface {
 // enable/disable branch: it calls Reconcile when Enabled reports true and
 // Cleanup when it reports false (or the Site is deleted via owner-reference
 // garbage collection).
+//
+// Reconcile runs on every Site event and must be idempotent. To self-heal owned
+// resources on drift or deletion, set a controller owner reference (see
+// Env.SiteOwnerReference) and register Owns via WatchProvider; a not-ready
+// Result requeues only through Result.Err or Result.RequeueAfter.
 type SiteComponent interface {
 	// Name is the stable, unique component identifier (for example "metalman").
 	Name() string

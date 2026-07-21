@@ -6,8 +6,6 @@ package metalman
 
 import (
 	"context"
-	"path/filepath"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -66,37 +64,35 @@ func (Component) Cleanup(ctx context.Context, env *component.Env, site *unbounde
 }
 
 // SetupWatches recreates the per-site Deployment if it is deleted or drifts, via
-// its owner reference to the Site.
-func (Component) SetupWatches(b *builder.Builder, _ *component.Env) {
-	b.Owns(&appsv1.Deployment{})
+// its controller owner reference to the Site. The predicate drops status-only
+// updates so pod-count churn does not re-apply the Deployment.
+func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
+	b.Owns(&appsv1.Deployment{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
 }
 
 // DeploymentName is the per-site metalman Deployment name.
 func DeploymentName(site string) string { return "metalman-controller-" + site }
 
+// SupportObjectNameSubstring identifies the metalman RBAC objects that ship in
+// the machina manifest set. It is exported so the machina component can skip
+// exactly the objects the metalman component owns and applies.
+const SupportObjectNameSubstring = "metalman"
+
+// IsSupportObject reports whether obj is the metalman RBAC that ships in the
+// machina manifests. The machina component skips these; the metalman component
+// applies them.
+func IsSupportObject(obj *unstructured.Unstructured) bool {
+	return component.IsRBACObject(obj, SupportObjectNameSubstring)
+}
+
 // mutateSupportObject keeps only the metalman RBAC objects from the machina
 // manifests (they are already rendered into the operator namespace).
 func mutateSupportObject(obj *unstructured.Unstructured) error {
-	if filepath.Base(obj.GetName()) == ".gitignore" {
-		return nil
-	}
-
-	if !isSupportObject(obj) {
+	if !IsSupportObject(obj) {
 		obj.Object = nil
 	}
 
 	return nil
-}
-
-// isSupportObject reports whether obj is the metalman RBAC that ships in the
-// machina manifests.
-func isSupportObject(obj *unstructured.Unstructured) bool {
-	switch obj.GetKind() {
-	case "ServiceAccount", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding":
-		return strings.Contains(obj.GetName(), "metalman")
-	default:
-		return false
-	}
 }
 
 func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Config) *appsv1.Deployment {

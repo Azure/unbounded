@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,10 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
@@ -94,26 +91,14 @@ func (Component) Cleanup(ctx context.Context, env *component.Env, site *unbounde
 }
 
 // SetupWatches reconciles a Site on changes to its per-site config payload and
-// recreates the per-site DaemonSet if it is deleted or drifts.
+// recreates the per-site DaemonSet if it is deleted or drifts. The DaemonSet
+// predicate drops status-only updates so pod churn does not re-apply it.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
-	namespace := env.Namespace
-
 	b.Watches(&corev1.ConfigMap{},
-		handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []ctrl.Request {
-			site := strings.TrimPrefix(obj.GetName(), configPrefix)
-			if site == obj.GetName() || site == "" {
-				return nil
-			}
-
-			return []ctrl.Request{{NamespacedName: client.ObjectKey{Name: site}}}
-		}),
-		builder.WithPredicates(env.ManagedConfigPredicate(func(obj client.Object) bool {
-			return obj.GetNamespace() == namespace &&
-				strings.HasPrefix(obj.GetName(), configPrefix) &&
-				strings.TrimPrefix(obj.GetName(), configPrefix) != ""
-		})),
+		env.RequestSiteFromConfigName(configPrefix),
+		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceWithPrefix(configPrefix))),
 	)
-	b.Owns(&appsv1.DaemonSet{})
+	b.Owns(&appsv1.DaemonSet{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
 }
 
 // SiteDaemonSetName is the per-site storage supervisor DaemonSet name.

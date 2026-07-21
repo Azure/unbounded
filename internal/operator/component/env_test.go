@@ -10,13 +10,18 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -315,5 +320,177 @@ func TestToUnstructuredRoundTrip(t *testing.T) {
 	// An already-unstructured object is returned as-is.
 	if got := ToUnstructured(u); got != u {
 		t.Fatal("unstructured input was copied")
+	}
+}
+
+func TestSiteOwnerReferenceIsController(t *testing.T) {
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+	ref := SiteOwnerReference(site)
+
+	// Owns() enqueues via metav1.GetControllerOf, so the reference must be a
+	// controller reference or per-site self-heal watches never fire.
+	if ref.Controller == nil || !*ref.Controller {
+		t.Fatalf("SiteOwnerReference is not a controller reference: %#v", ref)
+	}
+
+	// BlockOwnerDeletion must stay unset: setting it requires update on
+	// sites/finalizers, which the operator ServiceAccount does not hold.
+	if ref.BlockOwnerDeletion != nil {
+		t.Fatalf("BlockOwnerDeletion should be unset, got %v", *ref.BlockOwnerDeletion)
+	}
+
+	obj := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:            "metalman-controller-rack-a",
+		OwnerReferences: []metav1.OwnerReference{ref},
+	}}
+	if controller := metav1.GetControllerOf(obj); controller == nil || controller.Name != "rack-a" {
+		t.Fatalf("GetControllerOf did not return the Site owner: %#v", controller)
+	}
+}
+
+func TestUpsertOwnerReferenceConvergesControllerFlag(t *testing.T) {
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+	owner := SiteOwnerReference(site)
+
+	// A reference adopted before controller ownership existed (Controller unset).
+	legacy := owner
+	legacy.Controller = nil
+
+	refs, changed := UpsertOwnerReference([]metav1.OwnerReference{legacy}, owner)
+	if !changed {
+		t.Fatal("upsert did not converge a non-controller reference to a controller reference")
+	}
+
+	if len(refs) != 1 || refs[0].Controller == nil || !*refs[0].Controller {
+		t.Fatalf("owner reference not upgraded to controller: %#v", refs)
+	}
+
+	// Idempotent once converged.
+	if _, again := UpsertOwnerReference(refs, owner); again {
+		t.Fatal("upsert reported a change for an already-controller reference")
+	}
+
+	// A different owner is appended, not replaced.
+	other := SiteOwnerReference(&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-b", UID: "other-uid"}})
+
+	appended, changed := UpsertOwnerReference(refs, other)
+	if !changed || len(appended) != 2 {
+		t.Fatalf("upsert of a distinct owner = (%v, %#v)", changed, appended)
+	}
+}
+
+func TestOwnedWorkloadPredicate(t *testing.T) {
+	env := &Env{Namespace: "target"}
+	pred := env.OwnedWorkloadPredicate()
+
+	workload := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "target", Name: "metalman-controller-rack-a"}}
+
+	if !pred.Create(event.CreateEvent{Object: workload}) {
+		t.Fatal("owned create was filtered")
+	}
+
+	if !pred.Delete(event.DeleteEvent{Object: workload}) {
+		t.Fatal("owned delete was filtered (self-heal on deletion would not fire)")
+	}
+
+	bumped := workload.DeepCopy()
+	bumped.SetGeneration(workload.GetGeneration() + 1)
+
+	if !pred.Update(event.UpdateEvent{ObjectOld: workload, ObjectNew: bumped}) {
+		t.Fatal("spec drift (generation change) was filtered")
+	}
+
+	// A status-only update (same generation, e.g. replica counts) must be
+	// dropped so pod churn does not re-apply the workload.
+	if pred.Update(event.UpdateEvent{ObjectOld: bumped, ObjectNew: bumped.DeepCopy()}) {
+		t.Fatal("status-only update was accepted; Owns would re-apply on pod churn")
+	}
+
+	if pred.Generic(event.GenericEvent{Object: workload}) {
+		t.Fatal("generic event was accepted")
+	}
+}
+
+func TestSiteOwnedResourceEnqueuesViaOwnsHandler(t *testing.T) {
+	scheme := testScheme(t)
+
+	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{unboundedv1alpha3.GroupVersion})
+	mapper.Add(unboundedv1alpha3.GroupVersion.WithKind("Site"), meta.RESTScopeRoot)
+
+	// Mirror controller-runtime's builder.Owns() wiring exactly: enqueue the
+	// owner only for the controller owner reference.
+	h := handler.EnqueueRequestForOwner(scheme, mapper, &unboundedv1alpha3.Site{}, handler.OnlyControllerOwner())
+
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+	owned := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Namespace:       "unbounded-system",
+		Name:            "metalman-controller-rack-a",
+		OwnerReferences: []metav1.OwnerReference{SiteOwnerReference(site)},
+	}}
+
+	newQueue := func() workqueue.TypedRateLimitingInterface[reconcile.Request] {
+		return workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+	}
+
+	created := newQueue()
+	h.Create(t.Context(), event.CreateEvent{Object: owned}, created)
+
+	if created.Len() != 1 {
+		t.Fatalf("controller-owned resource did not enqueue its Site: queue len = %d", created.Len())
+	}
+
+	req, _ := created.Get()
+	if req.Name != "rack-a" || req.Namespace != "" {
+		t.Fatalf("enqueued request = %#v, want cluster-scoped Site rack-a", req)
+	}
+
+	// Deletion must also enqueue so the resource is recreated.
+	deleted := newQueue()
+	h.Delete(t.Context(), event.DeleteEvent{Object: owned}, deleted)
+
+	if deleted.Len() != 1 {
+		t.Fatal("deletion of a controller-owned resource did not enqueue its Site")
+	}
+
+	// A non-controller owner reference (the pre-fix regression) enqueues nothing,
+	// so Owns() would never self-heal.
+	legacy := SiteOwnerReference(site)
+	legacy.Controller = nil
+	nonController := owned.DeepCopy()
+	nonController.OwnerReferences = []metav1.OwnerReference{legacy}
+
+	ignored := newQueue()
+	h.Create(t.Context(), event.CreateEvent{Object: nonController}, ignored)
+
+	if ignored.Len() != 0 {
+		t.Fatal("non-controller owner reference unexpectedly enqueued; guard for the self-heal regression")
+	}
+}
+
+func TestIsRBACObject(t *testing.T) {
+	rbac := func(kind, name string) *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{}
+		obj.SetKind(kind)
+		obj.SetName(name)
+
+		return obj
+	}
+
+	cases := []struct {
+		obj  *unstructured.Unstructured
+		want bool
+	}{
+		{rbac("ServiceAccount", "metalman-controller"), true},
+		{rbac("ClusterRole", "unbounded-metalman"), true},
+		{rbac("RoleBinding", "metalman-lease"), true},
+		{rbac("ServiceAccount", "machina-controller"), false},
+		{rbac("Deployment", "metalman-controller"), false},
+		{rbac("ConfigMap", "metalman-config"), false},
+	}
+
+	for _, tc := range cases {
+		if got := IsRBACObject(tc.obj, "metalman"); got != tc.want {
+			t.Fatalf("IsRBACObject(%s/%s) = %v, want %v", tc.obj.GetKind(), tc.obj.GetName(), got, tc.want)
+		}
 	}
 }

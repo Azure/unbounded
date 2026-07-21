@@ -235,6 +235,12 @@ func assertSiteOwnerRef(t *testing.T, refs []metav1.OwnerReference, siteName, ui
 	if uid != "" && string(ref.UID) != uid {
 		t.Fatalf("ownerRef UID = %q, want %q", ref.UID, uid)
 	}
+
+	// The reference must be a controller reference; Owns() enqueues only via
+	// metav1.GetControllerOf, so a non-controller ref breaks per-site self-heal.
+	if ref.Controller == nil || !*ref.Controller {
+		t.Fatalf("ownerRef is not a controller reference: %#v", ref)
+	}
 }
 
 func assertSiteAffinity(t *testing.T, affinity *corev1.Affinity, siteName string) {
