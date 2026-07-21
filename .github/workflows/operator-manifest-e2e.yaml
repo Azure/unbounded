@@ -1,0 +1,81 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: unbounded-operator mirrored manifest e2e
+
+on:
+  pull_request:
+    paths:
+      - Makefile
+      - cmd/unbounded-operator/**
+      - deploy/machina/**
+      - deploy/net/**
+      - deploy/unbounded-operator/**
+      - images/machina/**
+      - images/net/**
+      - images/unbounded-operator/**
+      - internal/operator/**
+      - hack/operator-manifest-e2e/**
+      - go.mod
+      - go.sum
+      - .github/workflows/operator-manifest-e2e.yaml
+  push:
+    branches: [main]
+    paths:
+      - Makefile
+      - cmd/unbounded-operator/**
+      - deploy/machina/**
+      - deploy/net/**
+      - deploy/unbounded-operator/**
+      - images/machina/**
+      - images/net/**
+      - images/unbounded-operator/**
+      - internal/operator/**
+      - hack/operator-manifest-e2e/**
+      - go.mod
+      - go.sum
+      - .github/workflows/operator-manifest-e2e.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: operator-manifest-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  KIND_VERSION: v0.29.0
+
+jobs:
+  operator-manifest-e2e:
+    name: mirrored operator manifest e2e (kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ./kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 ./kind /usr/local/bin/kind
+          rm -f ./kind
+          kind version
+
+      - name: Verify e2e prerequisites
+        run: |
+          set -euo pipefail
+          for bin in kind kubectl docker go make sed curl grep; do
+            command -v "$bin" >/dev/null 2>&1 || { echo "missing required binary: $bin" >&2; exit 1; }
+          done
+          docker info >/dev/null
+
+      - name: Run mirrored operator manifest e2e
+        run: bash hack/operator-manifest-e2e/e2e.sh
