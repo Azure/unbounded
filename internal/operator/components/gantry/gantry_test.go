@@ -129,7 +129,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		"spec":       map[string]any{"template": map[string]any{"metadata": map[string]any{}}},
 	}}
 
-	if err := applyMutator("gantry-hash", "node-hash")(ds); err != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash", "node-hash")(ds); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -145,7 +145,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		"spec":       map[string]any{"template": map[string]any{"metadata": map[string]any{}}},
 	}}
 
-	if err := applyMutator("gantry-hash", "node-hash")(nodeDS); err != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash", "node-hash")(nodeDS); err != nil {
 		t.Fatalf("applyMutator node-config: %v", err)
 	}
 
@@ -157,9 +157,91 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator("gantry-hash", "node-hash")(config); err != nil || config.Object != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash", "node-hash")(config); err != nil || config.Object != nil {
 		t.Fatalf("gantry ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
+}
+
+// TestApplyMutatorImagesOnlyAgentContainer asserts the operator-derived image is
+// stamped only on the gantry agent's own container, leaving the busybox init
+// container (and, on the node-config DaemonSet, the busybox worker) with their
+// pinned public images.
+func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
+	const derived = "ghcr.io/azure/gantry:v1.2.3"
+
+	agent := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata":   map[string]any{"name": daemonSetName},
+		"spec": map[string]any{"template": map[string]any{
+			"metadata": map[string]any{},
+			"spec": map[string]any{
+				"initContainers": []any{
+					map[string]any{"name": "chown-hostpaths", "image": "mcr.microsoft.com/cbl-mariner/busybox:2.0"},
+				},
+				"containers": []any{
+					map[string]any{"name": agentContainerName, "image": "placeholder"},
+				},
+			},
+		}},
+	}}
+
+	if err := applyMutator(derived, "h", "n")(agent); err != nil {
+		t.Fatalf("applyMutator: %v", err)
+	}
+
+	if initImg := containerImage(t, agent, "initContainers", "chown-hostpaths"); initImg != "mcr.microsoft.com/cbl-mariner/busybox:2.0" {
+		t.Fatalf("busybox init image was rewritten to %q; must stay pinned", initImg)
+	}
+
+	if agentImg := containerImage(t, agent, "containers", agentContainerName); agentImg != derived {
+		t.Fatalf("agent container image = %q, want derived %q", agentImg, derived)
+	}
+
+	// The node-config DaemonSet is entirely busybox and must not be re-imaged.
+	nodeDS := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata":   map[string]any{"name": nodeConfigDaemonSetName},
+		"spec": map[string]any{"template": map[string]any{
+			"metadata": map[string]any{},
+			"spec": map[string]any{
+				"containers": []any{
+					map[string]any{"name": "configure", "image": "mcr.microsoft.com/cbl-mariner/busybox:2.0"},
+				},
+			},
+		}},
+	}}
+
+	if err := applyMutator(derived, "h", "n")(nodeDS); err != nil {
+		t.Fatalf("applyMutator node-config: %v", err)
+	}
+
+	if img := containerImage(t, nodeDS, "containers", "configure"); img != "mcr.microsoft.com/cbl-mariner/busybox:2.0" {
+		t.Fatalf("node-config busybox image was rewritten to %q; must stay pinned", img)
+	}
+}
+
+func containerImage(t *testing.T, obj *unstructured.Unstructured, field, name string) string {
+	t.Helper()
+
+	containers, _, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+	if err != nil {
+		t.Fatalf("get %s: %v", field, err)
+	}
+
+	for _, c := range containers {
+		container, ok := c.(map[string]any)
+		if ok && container["name"] == name {
+			image, _ := container["image"].(string)
+
+			return image
+		}
+	}
+
+	t.Fatalf("container %q not found in %s", name, field)
+
+	return ""
 }
 
 func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {

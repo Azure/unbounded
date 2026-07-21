@@ -129,8 +129,12 @@ type SiteComponents struct {
 
 	// Gantry configures the gantry peer-to-peer OCI distribution agent for this
 	// site. Unlike the other components, gantry defaults to enabled; set
-	// gantry.enabled to false to opt a site out.
+	// gantry.enabled to false to opt a site out. The apiserver defaults an
+	// omitted gantry block to enabled=true so the intent is explicit on read
+	// (for example the Gantry print column) whenever a components block is
+	// present. A site that omits the components block entirely is not defaulted.
 	// +optional
+	// +kubebuilder:default={enabled: true}
 	Gantry *GantryComponentSpec `json:"gantry,omitempty"`
 }
 

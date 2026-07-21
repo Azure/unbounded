@@ -33,6 +33,18 @@ const (
 	daemonSetName = "gantry"
 	configName    = "gantry-config"
 
+	// imageRepository is the operator-managed image repository for the gantry
+	// agent. The operator derives the full reference at reconcile time via
+	// component.Config.Image so gantry is version-matched to the operator like
+	// the other components.
+	imageRepository = "gantry"
+
+	// agentContainerName is the gantry agent's main container. Only this
+	// container carries the operator-managed image; the DaemonSet's busybox
+	// init container (and the busybox node-config DaemonSet) keep their pinned
+	// public images.
+	agentContainerName = "gantry"
+
 	// nodeConfigName and nodeConfigDaemonSetName are the operator-managed
 	// containerd node-wiring objects: a ConfigMap carrying the certs.d
 	// hosts.toml and the DaemonSet that installs it into
@@ -108,7 +120,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	if err := applyManifests(ctx, env, applyMutator(configHash, nodeConfigHash)); err != nil {
+	if err := applyManifests(ctx, env, applyMutator(env.Config.Image(imageRepository), configHash, nodeConfigHash)); err != nil {
 		return component.Failed(err)
 	}
 
@@ -166,9 +178,12 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 }
 
 // applyMutator skips CRDs and the separately reconciled gantry-config ConfigMap,
-// and stamps the config payload hashes on the workloads they belong to so a
-// config change rolls the corresponding DaemonSet.
-func applyMutator(configHash, nodeConfigHash string) func(*unstructured.Unstructured) error {
+// stamps the operator-derived agent image onto the agent DaemonSet, and stamps
+// the config payload hashes on the workloads they belong to so a config change
+// rolls the corresponding DaemonSet. Only the agent's own container is
+// re-imaged; the busybox init and the busybox node-config DaemonSet keep their
+// pinned public images.
+func applyMutator(agentImage, configHash, nodeConfigHash string) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		if obj.GetKind() == component.CRDKind {
 			obj.Object = nil
@@ -184,6 +199,10 @@ func applyMutator(configHash, nodeConfigHash string) func(*unstructured.Unstruct
 
 		switch {
 		case obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName:
+			if err := component.SetNamedContainerImage(obj, agentContainerName, agentImage); err != nil {
+				return fmt.Errorf("set gantry agent image: %w", err)
+			}
+
 			return stampConfigHash(obj, configHashAnnotation, configHash)
 		case obj.GetKind() == "DaemonSet" && obj.GetName() == nodeConfigDaemonSetName:
 			return stampConfigHash(obj, nodeConfigHashAnnotation, nodeConfigHash)

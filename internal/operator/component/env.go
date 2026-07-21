@@ -104,6 +104,46 @@ func SetPodSpecImages(obj *unstructured.Unstructured, image string) error {
 	return nil
 }
 
+// SetNamedContainerImage sets the image of only the container named name in a
+// workload pod template, searching both initContainers and containers. Unlike
+// SetPodSpecImages it leaves every other container untouched, so a workload that
+// mixes an operator-managed image with pinned helper images (for example a
+// component whose pod also runs a busybox init) keeps those helper images.
+func SetNamedContainerImage(obj *unstructured.Unstructured, name, image string) error {
+	for _, field := range []string{"initContainers", "containers"} {
+		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		if err != nil {
+			return fmt.Errorf("get %s: %w", field, err)
+		}
+
+		if !found {
+			continue
+		}
+
+		changed := false
+
+		for i := range containers {
+			container, ok := containers[i].(map[string]any)
+			if !ok {
+				return fmt.Errorf("%s[%d] is not an object", field, i)
+			}
+
+			if container["name"] == name {
+				container["image"] = image
+				changed = true
+			}
+		}
+
+		if changed {
+			if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", field); err != nil {
+				return fmt.Errorf("set %s: %w", field, err)
+			}
+		}
+	}
+
+	return nil
+}
+
 // Env is the shared execution context handed to every component. It bundles the
 // Kubernetes client, scheme, target namespace, and operator Config together with
 // the manifest-apply and helper machinery components use to reconcile.
