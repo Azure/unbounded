@@ -25,6 +25,8 @@ const DEFAULT_STRIPE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HTTP_CONCURRENCY: u32 = 64;
 pub const DEFAULT_HTTP_FRONTEND_MAX_REQUESTS_PER_CONNECTION: u32 = 1024;
 const DEFAULT_FAKE_OBJECT_SIZE_BYTES: u64 = 1024 * 1024;
+pub const DEFAULT_DISK_FALLBACK_PATH: &str = "/var/lib/unbounded-storage/cache.disk";
+pub const DEFAULT_DISK_FALLBACK_SIZE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 impl Config {
     /// Populates every omitted section and optional defaulted field with
@@ -41,6 +43,19 @@ impl Config {
         for frontend in &mut self.frontends {
             frontend.apply_defaults();
         }
+
+        let disk_discovery = self
+            .disk_discovery
+            .get_or_insert_with(DiskDiscoveryCfg::default);
+        let fallback = disk_discovery
+            .fallback
+            .get_or_insert_with(FileDiskConfig::default);
+        if fallback.path.is_empty() {
+            fallback.path = DEFAULT_DISK_FALLBACK_PATH.to_string();
+        }
+        fallback
+            .size
+            .get_or_insert(DEFAULT_DISK_FALLBACK_SIZE_BYTES);
 
         let startup = self.startup.get_or_insert_with(StartupCfg::default);
 
@@ -83,6 +98,13 @@ impl Config {
     /// `Some` once defaults have been applied.
     pub fn startup(&self) -> &StartupCfg {
         self.startup.as_ref().expect("startup section populated")
+    }
+
+    /// Automatic disk discovery policy. Valid after [`Config::apply_defaults`].
+    pub fn disk_discovery(&self) -> &DiskDiscoveryCfg {
+        self.disk_discovery
+            .as_ref()
+            .expect("disk discovery section populated")
     }
 }
 

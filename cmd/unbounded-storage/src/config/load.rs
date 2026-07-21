@@ -93,6 +93,8 @@ pub enum ConfigError {
     },
     Protobuf(prost::DecodeError),
     DuplicateDiskPath(String),
+    DuplicateDeniedDiskPath(String),
+    InvalidDeniedDiskPath(String),
     MissingFileDiskSize(String),
     ZeroFileDiskSize(String),
     FileDiskSizeNotPageMultiple {
@@ -189,6 +191,15 @@ impl fmt::Display for ConfigError {
             ConfigError::Protobuf(e) => write!(f, "protobuf decode error: {e}"),
             ConfigError::DuplicateDiskPath(p) => {
                 write!(f, "duplicate disk path: {p}")
+            }
+            ConfigError::DuplicateDeniedDiskPath(p) => {
+                write!(f, "duplicate denied disk path: {p}")
+            }
+            ConfigError::InvalidDeniedDiskPath(p) => {
+                write!(
+                    f,
+                    "denied disk path must be an absolute path below /dev: {p}"
+                )
             }
             ConfigError::MissingFileDiskSize(p) => {
                 write!(f, "disk {p}: file config requires a `size`")
@@ -474,6 +485,7 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
             return Err(ConfigError::DuplicateDiskPath(path.to_string()));
         }
     }
+    validate_disk_discovery(cfg.disk_discovery())?;
 
     validate_mesh(cfg)?;
 
@@ -747,20 +759,7 @@ fn validate_disks(disks: &[super::schema::DiskSpec]) -> Result<(), ConfigError> 
                     return Err(ConfigError::DuplicateDiskPath(path.to_string()));
                 }
                 let page_size = d.page_size_bytes.unwrap_or(4096);
-                let size = match cfg.size {
-                    Some(s) => s,
-                    None => return Err(ConfigError::MissingFileDiskSize(path.to_string())),
-                };
-                if size == 0 {
-                    return Err(ConfigError::ZeroFileDiskSize(path.to_string()));
-                }
-                if page_size == 0 || size % page_size != 0 {
-                    return Err(ConfigError::FileDiskSizeNotPageMultiple {
-                        path: path.to_string(),
-                        size,
-                        page_size,
-                    });
-                }
+                validate_file_disk(path, cfg.size, page_size)?;
             }
             Some(disk_spec::Config::Block(_)) => {
                 let path = validated_disk_path(d)?;
@@ -770,6 +769,52 @@ fn validate_disks(disks: &[super::schema::DiskSpec]) -> Result<(), ConfigError> 
             }
             None => return Err(ConfigError::MissingDiskConfig),
         }
+    }
+
+    Ok(())
+}
+
+fn validate_disk_discovery(discovery: &super::schema::DiskDiscoveryCfg) -> Result<(), ConfigError> {
+    let mut seen_paths = HashSet::new();
+    for path in &discovery.denied_paths {
+        let parsed = Path::new(path);
+        if !parsed.is_absolute()
+            || !parsed.starts_with("/dev")
+            || parsed == Path::new("/dev")
+            || parsed
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(ConfigError::InvalidDeniedDiskPath(path.clone()));
+        }
+        if !seen_paths.insert(path.as_str()) {
+            return Err(ConfigError::DuplicateDeniedDiskPath(path.clone()));
+        }
+    }
+
+    let fallback = discovery
+        .fallback
+        .as_ref()
+        .expect("disk discovery fallback populated");
+    validate_file_disk(&fallback.path, fallback.size, 4096)
+}
+
+fn validate_file_disk(path: &str, size: Option<u64>, page_size: u64) -> Result<(), ConfigError> {
+    if path.is_empty() {
+        return Err(ConfigError::EmptyDiskPath);
+    }
+    let Some(size) = size else {
+        return Err(ConfigError::MissingFileDiskSize(path.to_string()));
+    };
+    if size == 0 {
+        return Err(ConfigError::ZeroFileDiskSize(path.to_string()));
+    }
+    if page_size == 0 || size % page_size != 0 {
+        return Err(ConfigError::FileDiskSizeNotPageMultiple {
+            path: path.to_string(),
+            size,
+            page_size,
+        });
     }
 
     Ok(())
@@ -886,6 +931,95 @@ url = "https://s3.example.com"
         let cfg = cfg.config();
         assert!(cfg.peers.is_empty());
         assert!(cfg.caches.is_empty());
+        assert_eq!(
+            cfg.disk_discovery().fallback.as_ref().unwrap().path,
+            "/var/lib/unbounded-storage/cache.disk"
+        );
+        assert_eq!(
+            cfg.disk_discovery().fallback.as_ref().unwrap().size,
+            Some(20 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn defaults_partial_disk_discovery_fallback() {
+        let f = write_cfg(
+            r#"
+[disk_discovery]
+denied_paths = ["/dev/nvme1n1"]
+
+[disk_discovery.fallback]
+path = "/var/cache/unbounded-storage.disk"
+"#,
+        );
+        let cfg = load(f.path()).expect("load should succeed");
+        let discovery = cfg.config().disk_discovery();
+        assert_eq!(discovery.denied_paths, ["/dev/nvme1n1"]);
+        assert_eq!(
+            discovery.fallback.as_ref().unwrap().path,
+            "/var/cache/unbounded-storage.disk"
+        );
+        assert_eq!(
+            discovery.fallback.as_ref().unwrap().size,
+            Some(20 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn defaults_partial_disk_discovery_fallback_path() {
+        let f = write_cfg(
+            r#"
+[disk_discovery.fallback]
+size = 1073741824
+"#,
+        );
+        let cfg = load(f.path()).expect("load should succeed");
+        let fallback = cfg.config().disk_discovery().fallback.as_ref().unwrap();
+        assert_eq!(fallback.path, "/var/lib/unbounded-storage/cache.disk");
+        assert_eq!(fallback.size, Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn rejects_relative_denied_disk_path() {
+        let f = write_cfg(
+            r#"
+[disk_discovery]
+denied_paths = ["nvme0n1"]
+"#,
+        );
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::InvalidDeniedDiskPath(path)) if path == "nvme0n1"
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_denied_disk_path() {
+        let f = write_cfg(
+            r#"
+[disk_discovery]
+denied_paths = ["/dev/nvme0n1", "/dev/nvme0n1"]
+"#,
+        );
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::DuplicateDeniedDiskPath(path)) if path == "/dev/nvme0n1"
+        ));
+    }
+
+    #[test]
+    fn validates_disk_discovery_fallback() {
+        let f = write_cfg(
+            r#"
+[disk_discovery.fallback]
+size = 0
+"#,
+        );
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::ZeroFileDiskSize(path))
+                if path == "/var/lib/unbounded-storage/cache.disk"
+        ));
     }
 
     #[test]

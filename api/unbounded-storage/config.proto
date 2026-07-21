@@ -39,6 +39,10 @@ message Config {
   // finger selection uses weighted rendezvous while successor/predecessor
   // selection remains purely ring-nearest for routing correctness.
   optional TopologyWeighting topology_weighting = 11;
+
+  // Controls automatic disk selection when disks is empty. Explicit disks are
+  // authoritative and are not filtered by this policy.
+  optional DiskDiscoveryCfg disk_discovery = 12;
 }
 
 // A precomputed routing table for a single node, produced by a
@@ -436,4 +440,15 @@ message LoadgenFrontendConfig {
   // Peer handlers still use their local NVMe-backed cache, so this keeps the
   // measured path focused on remote NVMe + RDMA instead of requester-side reuse.
   bool skip_local_disk = 11;
+}
+
+message DiskDiscoveryCfg {
+  // Exact /dev paths excluded from automatic disk selection. This deny list
+  // does not apply to explicitly configured disks.
+  repeated string denied_paths = 1;
+
+  // File-backed disk used when automatic discovery finds no eligible devices.
+  // The path defaults to /var/lib/unbounded-storage/cache.disk and the size
+  // defaults to 20 GiB when omitted or partially configured.
+  optional FileDiskConfig fallback = 2;
 }

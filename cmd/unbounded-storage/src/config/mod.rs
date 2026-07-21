@@ -31,10 +31,10 @@ pub use reconcile::{
 };
 pub use schema::{
     AutoRdmaFabricBinds, AzureBackendConfig, BackendSpec, BlockDiskConfig, CacheSpec, Config,
-    DiskSpec, FabricCfg, FakeBackendConfig, FileDiskConfig, FrontendSpec, HttpBackendConfig,
-    HttpFrontendConfig, LoadgenFrontendConfig, MemoryCfg, PeerSpec, RdmaPeerConfig, RoutingPlan,
-    S3BackendConfig, S3FrontendConfig, StartupCfg, TcpFabricBinds, TcpPeerConfig, TopologyCfg,
-    TopologyPrefixWeight, TopologyWeighting, backend_spec, disk_spec, fabric_cfg, frontend_spec,
-    peer_spec,
+    DiskDiscoveryCfg, DiskSpec, FabricCfg, FakeBackendConfig, FileDiskConfig, FrontendSpec,
+    HttpBackendConfig, HttpFrontendConfig, LoadgenFrontendConfig, MemoryCfg, PeerSpec,
+    RdmaPeerConfig, RoutingPlan, S3BackendConfig, S3FrontendConfig, StartupCfg, TcpFabricBinds,
+    TcpPeerConfig, TopologyCfg, TopologyPrefixWeight, TopologyWeighting, backend_spec, disk_spec,
+    fabric_cfg, frontend_spec, peer_spec,
 };
 pub use watch::{ConfigUpdate, ConfigWatcher, WatchError};
