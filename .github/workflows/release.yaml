@@ -24,7 +24,8 @@ name: unbounded release
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
 #     -> netboot-image     (PXE boot artifact image)
 #         -> metalman-image (stamped with the matching default netboot image)
-#     -> component-images  (matrix: machina, machine-ops-controller, orca, gantry, host-ubuntu2404)
+#     -> component-images  (controllers, operator, storage supervisor, orca,
+#                           gantry, and host image)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
 #     -> finalize          (attach extras + krew manifest)
@@ -621,6 +622,10 @@ jobs:
             file: images/unbounded-operator/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: unbounded-storage-supervisor
+            file: images/unbounded-storage-supervisor/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: orca
             file: images/orca/Containerfile
             platforms: linux/amd64,linux/arm64
@@ -745,19 +750,25 @@ jobs:
             VERSION="${TAG}" \
             CONTAINER_REGISTRY="${{ env.REGISTRY }}"
 
-      - name: Sign manifests tarball with cosign (keyless)
+      - name: Sign release manifests with cosign (keyless)
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           ARCHIVE="build/unbounded-manifests-${TAG}.tar.gz"
           cosign sign-blob --yes \
             --bundle="${ARCHIVE}.bundle.json" \
             "${ARCHIVE}"
+          cosign sign-blob --yes \
+            --bundle=build/operator.yaml.bundle.json \
+            build/operator.yaml
 
       - name: Upload manifests artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: manifests-tarball
-          path: build/unbounded-manifests-*
+          path: |
+            build/unbounded-manifests-*
+            build/operator.yaml
+            build/operator.yaml.bundle.json
           retention-days: 1
 
   # ---------------------------------------------------------------------------
@@ -935,6 +946,8 @@ jobs:
           # GoReleaser created.
           gh release upload "${TAG}" \
             dist/unbounded.yaml \
+            dist/operator.yaml \
+            dist/operator.yaml.bundle.json \
             dist/unbounded-manifests-*.tar.gz \
             dist/unbounded-manifests-*.tar.gz.bundle.json \
             dist/unbounded-storage-linux-*.tar.gz \

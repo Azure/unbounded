@@ -14,6 +14,20 @@ central control plane. It adds:
 - **Two provisioning paths**: SSH-based (machina) and PXE-based (metalman).
 - **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}}), separate repo).
 
+The supported installation entry point is the aggregate release manifest:
+
+```bash
+kubectl apply -f https://github.com/Azure/unbounded/releases/latest/download/operator.yaml
+kubectl -n unbounded-system rollout status deployment/unbounded-operator --timeout=5m
+kubectl wait --for=condition=Established crd/sites.unbounded-cloud.io --timeout=5m
+```
+
+Pin `/releases/download/vX.Y.Z/operator.yaml` for repeatable deployments. The
+manifest installs the operator and CRDs only; creating a `Site` remains a
+separate `kubectl unbounded site init --skip-install` operation that requires
+the kubectl plugin. Private registry and mirror manifests should be generated
+with `hack/scripts/generate-operator-manifest.sh` rather than edited by hand.
+
 ![Architecture overview: Control-Plane Cluster with machina and metalman controllers, provisioning Remote Nodes via SSH and Bare-Metal Nodes via PXE, connected through WireGuard Gateway Nodes](../../img/architecture-overview.svg)
 
 ## Components

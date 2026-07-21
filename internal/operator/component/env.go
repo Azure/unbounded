@@ -64,11 +64,123 @@ var DefaultNamespace = unbounded.SystemNamespace()
 type Config struct {
 	// MetalmanImage is the image for the synthesized per-site metalman
 	// Deployment.
-	MetalmanImage string
+	MetalmanImage          string
+	NetbootImage           string
+	MachinaImage           string
+	NetControllerImage     string
+	NetNodeImage           string
+	StorageSupervisorImage string
+	ManagedKubeProxyImage  string
+	StorageVersion         string
+	StorageReleaseBaseURL  string
 
 	// APIServerEndpoint is injected into the machina controller config and
 	// advertised to metalman.
 	APIServerEndpoint string
+}
+
+// SetNamedContainerImage replaces a named container image when image is set.
+func SetNamedContainerImage(obj *unstructured.Unstructured, field, name, image string) error {
+	if image == "" {
+		return nil
+	}
+
+	containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+	if err != nil {
+		return fmt.Errorf("get %s %s: %w", obj.GetName(), field, err)
+	}
+
+	if !found {
+		return fmt.Errorf("%s %s has no %s", obj.GetKind(), obj.GetName(), field)
+	}
+
+	for i := range containers {
+		container, ok := containers[i].(map[string]any)
+		if !ok || container["name"] != name {
+			continue
+		}
+
+		container["image"] = image
+		containers[i] = container
+
+		return unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", field)
+	}
+
+	return fmt.Errorf("%s %s has no %s named %s", obj.GetKind(), obj.GetName(), field, name)
+}
+
+// AppendNamedContainerArg appends an argument to a named regular container.
+func AppendNamedContainerArg(obj *unstructured.Unstructured, name, arg string) error {
+	containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	if err != nil {
+		return fmt.Errorf("get %s containers: %w", obj.GetName(), err)
+	}
+
+	if !found {
+		return fmt.Errorf("%s %s has no containers", obj.GetKind(), obj.GetName())
+	}
+
+	for i := range containers {
+		container, ok := containers[i].(map[string]any)
+		if !ok || container["name"] != name {
+			continue
+		}
+
+		args := []any{}
+		if existing, ok := container["args"].([]any); ok {
+			args = existing
+		}
+
+		container["args"] = append(args, arg)
+		containers[i] = container
+
+		return unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+	}
+
+	return fmt.Errorf("%s %s has no container named %s", obj.GetKind(), obj.GetName(), name)
+}
+
+// SetNamedContainerEnv sets an environment variable on a named container.
+func SetNamedContainerEnv(obj *unstructured.Unstructured, field, name, envName, value string) error {
+	containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+	if err != nil {
+		return fmt.Errorf("get %s %s: %w", obj.GetName(), field, err)
+	}
+
+	if !found {
+		return fmt.Errorf("%s %s has no %s", obj.GetKind(), obj.GetName(), field)
+	}
+
+	for i := range containers {
+		container, ok := containers[i].(map[string]any)
+		if !ok || container["name"] != name {
+			continue
+		}
+
+		env := []any{}
+		if existing, ok := container["env"].([]any); ok {
+			env = existing
+		}
+
+		for j := range env {
+			item, ok := env[j].(map[string]any)
+			if ok && item["name"] == envName {
+				item["value"] = value
+				env[j] = item
+				container["env"] = env
+				containers[i] = container
+
+				return unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", field)
+			}
+		}
+
+		container["env"] = append(env, map[string]any{"name": envName, "value": value})
+		containers[i] = container
+
+		return unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", field)
+	}
+
+	return fmt.Errorf("%s %s has no %s named %s", obj.GetKind(), obj.GetName(), field, name)
 }
 
 // Env is the shared execution context handed to every component. It bundles the

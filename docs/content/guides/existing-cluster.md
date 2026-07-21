@@ -13,7 +13,7 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 
 ## What You'll Do
 
-1. **[Install the prerequisites](#1-install-the-prerequisites)** -- kubectl and the unbounded plugin
+1. **[Install Unbounded](#1-install-unbounded)** -- apply the operator and install the kubectl plugin
 2. **[Prepare gateway nodes](#2-prepare-gateway-nodes)** -- label and open WireGuard ports
 3. **[Initialize a site](#3-initialize-a-site)** -- bootstrap the operator and create site resources
 4. **[Add machines](#4-add-machines)** -- register remote hosts for SSH provisioning
@@ -21,7 +21,7 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 
 ---
 
-## 1. Install the Prerequisites
+## 1. Install Unbounded
 
 > **You'll need:** A Kubernetes cluster with `kubeconfig` access, one or more
 > cluster nodes with UDP 51820-51899 open, and remote machines reachable via SSH.
@@ -32,7 +32,23 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 **Clusters without a CNI** (created with `--network-plugin none`): No extra configuration is needed — unbounded-net will serve as the CNI.
 {{< /callout >}}
 
-Install the kubectl-unbounded plugin:
+Apply the latest release's aggregate operator manifest and wait for it to become
+ready:
+
+```bash
+kubectl apply -f https://github.com/Azure/unbounded/releases/latest/download/operator.yaml
+kubectl -n unbounded-system rollout status deployment/unbounded-operator --timeout=5m
+kubectl wait --for=condition=Established crd/sites.unbounded-cloud.io --timeout=5m
+```
+
+Pin the URL in automation and production environments:
+
+```bash
+kubectl apply -f https://github.com/Azure/unbounded/releases/download/vX.Y.Z/operator.yaml
+```
+
+The manifest installs the operator and all required CRDs. It does not create a
+`Site`; install the kubectl-unbounded plugin to initialize one:
 
 ```bash
 # Linux (amd64)
@@ -87,7 +103,8 @@ kubectl unbounded site init \
     --cluster-node-cidr 10.224.0.0/16 \
     --cluster-pod-cidr 10.244.0.0/16 \
     --node-cidr 192.168.1.0/24 \
-    --pod-cidr 10.245.0.0/16
+    --pod-cidr 10.245.0.0/16 \
+    --skip-install
 ```
 
 | Flag | Description |
@@ -108,7 +125,7 @@ kubectl unbounded site init \
 | `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
 | `--enable-storage` | Enable the unbounded-storage component in the Site spec |
-| `--skip-install` | Skip operator bootstrap if you already ran `kubectl unbounded install` or applied the operator manifests |
+| `--skip-install` | Skip operator bootstrap after applying `operator.yaml` or running `kubectl unbounded install` |
 
 </details>
 

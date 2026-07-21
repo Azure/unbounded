@@ -65,6 +65,9 @@ type Config struct {
 	Repo string
 	// Version is the release tag to install, or "latest".
 	Version string
+	// ReleaseBaseURL, when set, is the URL directory containing the release
+	// archive and checksum. It overrides GitHub URL construction.
+	ReleaseBaseURL string
 	// Prefix is the host-absolute install prefix (e.g. /opt/unbounded-storage).
 	// Releases are staged under Prefix/releases and Prefix/current is the
 	// active symlink. This is always host-absolute; HostRoot is applied
@@ -136,15 +139,16 @@ type Config struct {
 // value is malformed.
 func LoadConfig() (Config, error) {
 	cfg := Config{
-		Repo:        envOr("REPO", defaultRepo),
-		Version:     envOr("VERSION", defaultVersion),
-		Prefix:      envOr("PREFIX", defaultPrefix),
-		ServiceName: envOr("SERVICE_NAME", defaultServiceName),
-		ConfigPath:  envOr("CONFIG_PATH", defaultConfigPath),
-		SourceDir:   envOr("CONFIG_SOURCE_DIR", defaultSourceDir),
-		StorageArgs: os.Getenv("STORAGE_ARGS"),
-		HostRoot:    envOr("HOST_ROOT", defaultHostRoot),
-		Systemctl:   strings.Fields(envOr("SYSTEMCTL", defaultSystemctl)),
+		Repo:           envOr("REPO", defaultRepo),
+		Version:        envOr("VERSION", defaultVersion),
+		ReleaseBaseURL: os.Getenv("RELEASE_BASE_URL"),
+		Prefix:         envOr("PREFIX", defaultPrefix),
+		ServiceName:    envOr("SERVICE_NAME", defaultServiceName),
+		ConfigPath:     envOr("CONFIG_PATH", defaultConfigPath),
+		SourceDir:      envOr("CONFIG_SOURCE_DIR", defaultSourceDir),
+		StorageArgs:    os.Getenv("STORAGE_ARGS"),
+		HostRoot:       envOr("HOST_ROOT", defaultHostRoot),
+		Systemctl:      strings.Fields(envOr("SYSTEMCTL", defaultSystemctl)),
 	}
 
 	cfg.NodeName = os.Getenv("NODE_NAME")

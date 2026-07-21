@@ -73,7 +73,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	if err := env.ApplyManifestFS(ctx, machinamanifests.Manifests, applyMutator(configHash)); err != nil {
+	if err := env.ApplyManifestFS(ctx, machinamanifests.Manifests, applyMutator(configHash, env.Config)); err != nil {
 		return component.Failed(err)
 	}
 
@@ -120,7 +120,7 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 // applyMutator skips CRDs and the metalman RBAC (applied per-site by the
 // metalman component), skips the separately reconciled ConfigMap, and stamps its
 // exact content hash on the Deployment so every config change rolls Machina.
-func applyMutator(configHash string) func(*unstructured.Unstructured) error {
+func applyMutator(configHash string, cfg component.Config) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		// CRDs are installed once at operator startup, not from the reconcile
 		// loop; the metalman RBAC ships in the machina manifests but is applied
@@ -138,6 +138,10 @@ func applyMutator(configHash string) func(*unstructured.Unstructured) error {
 		}
 
 		if obj.GetKind() == "Deployment" && obj.GetName() == controllerName {
+			if err := component.SetNamedContainerImage(obj, "containers", "machina-controller", cfg.MachinaImage); err != nil {
+				return err
+			}
+
 			if err := unstructured.SetNestedField(obj.Object, configHash,
 				"spec", "template", "metadata", "annotations", ConfigHashAnnotation); err != nil {
 				return fmt.Errorf("set machina config hash annotation: %w", err)

@@ -88,7 +88,11 @@ func TestDeployment(t *testing.T) {
 		}}},
 	}
 
-	d := deployment(site, component.DefaultNamespace, component.Config{MetalmanImage: "example/metalman:default", APIServerEndpoint: "https://api.example:6443"})
+	d := deployment(site, component.DefaultNamespace, component.Config{
+		MetalmanImage:     "example/metalman:default",
+		NetbootImage:      "example/netboot:default",
+		APIServerEndpoint: "https://api.example:6443",
+	})
 	if d.Name != "metalman-controller-rack-a" {
 		t.Fatalf("name = %q", d.Name)
 	}
@@ -102,7 +106,8 @@ func TestDeployment(t *testing.T) {
 		t.Fatalf("image = %q", container.Image)
 	}
 
-	if got := container.Args; len(got) != 3 || got[0] != "serve-pxe" || got[1] != "--site=rack-a" || got[2] != "--dhcp-auto-interface" {
+	if got := container.Args; len(got) != 4 || got[0] != "serve-pxe" || got[1] != "--site=rack-a" ||
+		got[2] != "--default-netboot-image=example/netboot:default" || got[3] != "--dhcp-auto-interface" {
 		t.Fatalf("args = %#v", got)
 	}
 
@@ -174,6 +179,10 @@ func TestDeploymentRespectsNamespaceAndDefaults(t *testing.T) {
 
 	if got := findEnv(d.Spec.Template.Spec.Containers[0].Env, "METALMAN_APISERVER_URL"); got != nil {
 		t.Fatalf("METALMAN_APISERVER_URL env = %#v, want unset when APIServerEndpoint is empty", got)
+	}
+
+	if got := d.Spec.Template.Spec.Containers[0].Args; len(got) != 2 {
+		t.Fatalf("args = %#v, want no default-netboot-image argument", got)
 	}
 }
 

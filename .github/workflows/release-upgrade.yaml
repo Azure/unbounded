@@ -175,10 +175,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # Deploy the release to the target cluster.
   #
-  #   MODE=init     -> bootstrap CRDs/operator, then run 'kubectl unbounded site init'.
+  #   MODE=init     -> apply the signed aggregate operator manifest, then run
+  #                    'kubectl unbounded site init --skip-install'.
   #                    Used for the very first bootstrap of a cluster.
-  #   MODE=upgrade  -> server-side apply CRDs/operator from the rendered
-  #                    manifests that were attached to the GitHub Release.
+  #   MODE=upgrade  -> use the plugin install path to preserve its repair
+  #                    behavior for an existing installation.
   #
   # Note: this job downloads assets from the DRAFT GitHub Release (the
   # release soaks as a draft before it is published to end users). Draft
@@ -261,6 +262,8 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'unbounded-manifests-*.tar.gz' \
             --pattern 'unbounded-manifests-*.tar.gz.bundle.json' \
+            --pattern 'operator.yaml' \
+            --pattern 'operator.yaml.bundle.json' \
             --pattern 'kubectl-unbounded-linux-amd64.tar.gz' \
             --dir dist/
           ls -la dist/
@@ -275,6 +278,15 @@ jobs:
             --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG}$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${ARCHIVE}"
+
+      - name: Verify cosign signature on aggregate operator manifest
+        run: |
+          set -euo pipefail
+          cosign verify-blob \
+            --bundle dist/operator.yaml.bundle.json \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG}$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/operator.yaml
 
       - name: Extract manifests
         run: |
@@ -335,7 +347,44 @@ jobs:
       - name: Bootstrap CRDs and operator
         run: |
           set -euo pipefail
-          kubectl unbounded install --timeout=5m
+          if [[ "${MODE}" == "init" ]]; then
+            kubectl apply --server-side -f dist/operator.yaml
+          else
+            # Keep the plugin install path for upgrades: it repairs partial or
+            # drifted operator installations in addition to applying manifests.
+            kubectl unbounded install --timeout=5m
+          fi
+
+      - name: Wait for operator and required CRDs
+        run: |
+          set -euo pipefail
+          kubectl -n unbounded-system rollout status deploy/unbounded-operator --timeout=5m
+
+          crds=(
+            machines.unbounded-cloud.io
+            machineoperations.unbounded-cloud.io
+            sites.unbounded-cloud.io
+            machineconfigurations.unbounded-cloud.io
+            machineoperationcredentials.unbounded-cloud.io
+            machineconfigurationversions.unbounded-cloud.io
+            sitenodeslices.net.unbounded-cloud.io
+            gatewaypools.net.unbounded-cloud.io
+            gatewaypoolnodes.net.unbounded-cloud.io
+            sitegatewaypoolassignments.net.unbounded-cloud.io
+            sitepeerings.net.unbounded-cloud.io
+            gatewaypoolpeerings.net.unbounded-cloud.io
+          )
+          deadline=$((SECONDS + 300))
+          for crd in "${crds[@]}"; do
+            until kubectl get crd "$crd" >/dev/null 2>&1; do
+              if (( SECONDS >= deadline )); then
+                echo "::error::timed out waiting for CRD/$crd to be created"
+                exit 1
+              fi
+              sleep 5
+            done
+            kubectl wait --for=condition=Established "crd/$crd" --timeout=5m
+          done
 
       - name: Run site init (first install)
         if: env.MODE == 'init'

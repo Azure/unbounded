@@ -86,6 +86,8 @@ UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION_T
 UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
+UNBOUNDED_OPERATOR_STORAGE_RELEASE_BASE_URL ?= https://github.com/Azure/unbounded/releases/download/$(VERSION)
+UNBOUNDED_OPERATOR_MANAGED_KUBE_PROXY_IMAGE ?=
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
@@ -1076,6 +1078,14 @@ unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy
 		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
 		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
 		--set MetalmanImage=$(METALMAN_IMAGE) \
+		--set NetbootImage=$(NETBOOT_IMAGE) \
+		--set MachinaImage=$(MACHINA_IMAGE) \
+		--set NetControllerImage=$(NET_CONTROLLER_IMAGE) \
+		--set NetNodeImage=$(NET_NODE_IMAGE) \
+		--set StorageSupervisorImage=$(UNBOUNDED_STORAGE_SUPERVISOR_IMAGE) \
+		--set ManagedKubeProxyImage=$(UNBOUNDED_OPERATOR_MANAGED_KUBE_PROXY_IMAGE) \
+		--set StorageVersion=$(VERSION) \
+		--set StorageReleaseBaseURL=$(UNBOUNDED_OPERATOR_STORAGE_RELEASE_BASE_URL) \
 		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
 		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
@@ -1390,7 +1400,7 @@ net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
 
-release-manifests: machina-manifests machine-ops-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: machina-manifests machine-ops-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests operator-manifest ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
@@ -1406,6 +1416,16 @@ release-manifests: machina-manifests machine-ops-manifests net-manifests unbound
 	@mkdir -p build
 	tar czf "build/$(RELEASE_MANIFESTS_NAME).tar.gz" -C $(RELEASE_MANIFESTS_STAGE_DIR) $(RELEASE_MANIFESTS_NAME)
 	@echo "Release manifests archive: build/$(RELEASE_MANIFESTS_NAME).tar.gz"
+
+operator-manifest: ## Generate the single-file unbounded-operator bootstrap manifest
+	@hack/scripts/generate-operator-manifest.sh \
+		--version "$(VERSION)" \
+		--registry "$(CONTAINER_REGISTRY)" \
+		--namespace "$(UNBOUNDED_OPERATOR_NAMESPACE)" \
+		--api-server-endpoint "$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
+		--storage-release-base-url "$(UNBOUNDED_OPERATOR_STORAGE_RELEASE_BASE_URL)" \
+		--managed-kube-proxy-image "$(UNBOUNDED_OPERATOR_MANAGED_KUBE_PROXY_IMAGE)" \
+		--output build/operator.yaml
 
 ##@ Documentation
 

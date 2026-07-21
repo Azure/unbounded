@@ -99,7 +99,7 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 				}},
 			}}
 
-			if err := applyMutator("net-hash")(obj); err != nil {
+			if err := applyMutator("net-hash", component.Config{})(obj); err != nil {
 				t.Fatalf("applyMutator: %v", err)
 			}
 
@@ -113,7 +113,7 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator("net-hash")(config); err != nil || config.Object != nil {
+	if err := applyMutator("net-hash", component.Config{})(config); err != nil || config.Object != nil {
 		t.Fatalf("embedded net ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
 
@@ -121,9 +121,89 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 		"apiVersion": "apiextensions.k8s.io/v1", "kind": component.CRDKind,
 		"metadata": map[string]any{"name": "sites.unbounded-cloud.io"},
 	}}
-	if err := applyMutator("net-hash")(crd); err != nil || crd.Object != nil {
+	if err := applyMutator("net-hash", component.Config{})(crd); err != nil || crd.Object != nil {
 		t.Fatalf("CRD was not skipped: err=%v object=%#v", err, crd.Object)
 	}
+}
+
+func TestApplyMutatorOverridesRuntimeImages(t *testing.T) {
+	controller := workloadObject("Deployment", controllerName, "containers", "controller")
+	cfg := component.Config{
+		NetControllerImage:    "mirror/net-controller:v1",
+		ManagedKubeProxyImage: "mirror/kube-proxy:v1",
+	}
+	if err := applyMutator("hash", cfg)(controller); err != nil {
+		t.Fatalf("mutate controller: %v", err)
+	}
+
+	assertContainerField(t, controller, "containers", "controller", "image", "mirror/net-controller:v1")
+	assertContainerArg(t, controller, "controller", "--managed-kube-proxy-image=mirror/kube-proxy:v1")
+
+	node := workloadObject("DaemonSet", nodeName, "containers", "node")
+	addContainer(node, "initContainers", "install-cni-plugins")
+	if err := applyMutator("hash", component.Config{NetNodeImage: "mirror/net-node:v1"})(node); err != nil {
+		t.Fatalf("mutate node: %v", err)
+	}
+
+	assertContainerField(t, node, "containers", "node", "image", "mirror/net-node:v1")
+	assertContainerField(t, node, "initContainers", "install-cni-plugins", "image", "mirror/net-node:v1")
+}
+
+func workloadObject(kind, name, field, container string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1", "kind": kind, "metadata": map[string]any{"name": name},
+		"spec": map[string]any{"template": map[string]any{
+			"metadata": map[string]any{}, "spec": map[string]any{},
+		}},
+	}}
+	addContainer(obj, field, container)
+
+	return obj
+}
+
+func addContainer(obj *unstructured.Unstructured, field, name string) {
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+	containers = append(containers, map[string]any{"name": name, "image": "embedded:v0", "args": []any{"--existing"}})
+	_ = unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", field)
+}
+
+func assertContainerField(t *testing.T, obj *unstructured.Unstructured, field, name, key, want string) {
+	t.Helper()
+
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+	for _, raw := range containers {
+		container := raw.(map[string]any)
+		if container["name"] == name {
+			if got := container[key]; got != want {
+				t.Fatalf("%s %s = %v, want %s", name, key, got, want)
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("container %s not found", name)
+}
+
+func assertContainerArg(t *testing.T, obj *unstructured.Unstructured, name, want string) {
+	t.Helper()
+
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	for _, raw := range containers {
+		container := raw.(map[string]any)
+		if container["name"] != name {
+			continue
+		}
+
+		args := container["args"].([]any)
+		if len(args) != 2 || args[0] != "--existing" || args[1] != want {
+			t.Fatalf("%s args = %#v, want existing arg followed by %s", name, args, want)
+		}
+
+		return
+	}
+
+	t.Fatalf("container %s not found", name)
 }
 
 func TestReconcileRetainedWithNoSites(t *testing.T) {

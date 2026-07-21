@@ -214,6 +214,14 @@ func TestReleaseTarballURL(t *testing.T) {
 			cfg:  Config{Repo: "acme/widgets", Version: "v1.2.3", Arch: "arm64"},
 			want: "https://github.com/acme/widgets/releases/download/v1.2.3/unbounded-storage-linux-arm64.tar.gz",
 		},
+		{
+			name: "custom release base",
+			cfg: Config{
+				ReleaseBaseURL: "https://mirror.example/releases/v1.2.3/",
+				Arch:           "amd64",
+			},
+			want: "https://mirror.example/releases/v1.2.3/unbounded-storage-linux-amd64.tar.gz",
+		},
 	}
 
 	for _, tt := range tests {

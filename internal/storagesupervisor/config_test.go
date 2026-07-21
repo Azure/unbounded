@@ -16,7 +16,7 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 
 	for _, name := range []string{
-		"REPO", "VERSION", "PREFIX", "SERVICE_NAME", "CONFIG_PATH",
+		"REPO", "VERSION", "RELEASE_BASE_URL", "PREFIX", "SERVICE_NAME", "CONFIG_PATH",
 		"CONFIG_SOURCE_DIR", "STORAGE_ARGS", "HOST_ROOT", "SYSTEMCTL", "SOURCE", "LOCAL_TARBALL",
 		"NO_ENABLE", "NO_HUGEPAGES", "ARCH", "POOL_BYTES", "HUGEPAGES", "NODE_NAME", "STORAGE_RING_LABEL", "KUBECONFIG",
 		"STORAGE_DEVICE_INVENTORY_URL",
@@ -52,6 +52,7 @@ func TestLoadConfigOverrides(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("REPO", "acme/widgets")
 	t.Setenv("VERSION", "v1.2.3")
+	t.Setenv("RELEASE_BASE_URL", "https://releases.example/v1.2.3")
 	t.Setenv("PREFIX", "/srv/storage")
 	t.Setenv("SERVICE_NAME", "mystorage")
 	t.Setenv("CONFIG_PATH", "/etc/mystorage/cfg.binpb")
@@ -74,6 +75,7 @@ func TestLoadConfigOverrides(t *testing.T) {
 
 	assert.Equal(t, "acme/widgets", cfg.Repo)
 	assert.Equal(t, "v1.2.3", cfg.Version)
+	assert.Equal(t, "https://releases.example/v1.2.3", cfg.ReleaseBaseURL)
 	assert.Equal(t, "/srv/storage", cfg.Prefix)
 	assert.Equal(t, "mystorage", cfg.ServiceName)
 	assert.Equal(t, "/etc/mystorage/cfg.binpb", cfg.ConfigPath)

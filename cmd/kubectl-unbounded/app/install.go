@@ -52,9 +52,17 @@ type installHandler struct {
 	kubeconfigPath string
 	namespace      string
 
-	operatorImage     string
-	metalmanImage     string
-	apiServerEndpoint string
+	operatorImage          string
+	metalmanImage          string
+	netbootImage           string
+	machinaImage           string
+	netControllerImage     string
+	netNodeImage           string
+	storageSupervisorImage string
+	managedKubeProxyImage  string
+	storageVersion         string
+	storageReleaseBaseURL  string
+	apiServerEndpoint      string
 
 	wait    bool
 	timeout time.Duration
@@ -94,6 +102,14 @@ func addInstallFlags(cmd *cobra.Command, handler *installHandler) {
 	cmd.Flags().StringVar(&handler.namespace, "namespace", unbounded.SystemNamespace(), "Namespace for unbounded-operator and default components")
 	cmd.Flags().StringVar(&handler.operatorImage, "operator-image", "", "unbounded-operator image override")
 	cmd.Flags().StringVar(&handler.metalmanImage, "metalman-image", "", "metalman image override")
+	cmd.Flags().StringVar(&handler.netbootImage, "netboot-image", "", "metalman netboot image override")
+	cmd.Flags().StringVar(&handler.machinaImage, "machina-image", "", "machina image override")
+	cmd.Flags().StringVar(&handler.netControllerImage, "net-controller-image", "", "network controller image override")
+	cmd.Flags().StringVar(&handler.netNodeImage, "net-node-image", "", "network node image override")
+	cmd.Flags().StringVar(&handler.storageSupervisorImage, "storage-supervisor-image", "", "storage supervisor image override")
+	cmd.Flags().StringVar(&handler.managedKubeProxyImage, "managed-kube-proxy-image", "", "managed kube-proxy image override")
+	cmd.Flags().StringVar(&handler.storageVersion, "storage-version", "", "storage daemon release version override")
+	cmd.Flags().StringVar(&handler.storageReleaseBaseURL, "storage-release-base-url", "", "storage daemon release base URL override")
 	cmd.Flags().StringVar(&handler.apiServerEndpoint, "api-server-endpoint", "", "Override the Kubernetes API server endpoint advertised to provisioned machines; by default the operator auto-discovers it from kube-public/cluster-info, or the KUBERNETES_SERVICE_HOST FQDN on clusters (e.g. AKS) that do not publish cluster-info")
 	cmd.Flags().BoolVar(&handler.wait, "wait", true, "Wait for unbounded-operator rollout")
 	cmd.Flags().DurationVar(&handler.timeout, "timeout", defaultInstallTimeout, "Timeout for rollout waits")
@@ -242,7 +258,6 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 		}{
 			{prefix: "--leader-elect-namespace=", value: h.namespace},
 			{prefix: "--namespace=", value: h.namespace},
-			{prefix: "--metalman-image=", value: h.metalmanImage},
 		} {
 			if err := replaceContainerArg(obj, "controller", replacement.prefix, replacement.value); err != nil {
 				return err
@@ -290,6 +305,7 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	// being cleared or replaced with the kubeconfig host.
 	endpoint := ""
 	reapLegacyResources := true
+	configData := map[string]string{}
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
 	configMap.SetKind("ConfigMap")
@@ -306,6 +322,7 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 		}
 
 		endpoint = data["UNBOUNDED_API_SERVER_ENDPOINT"]
+		configData = data
 
 		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
 			parsed, err := strconv.ParseBool(value)
@@ -321,9 +338,24 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 		endpoint = h.apiServerEndpoint
 	}
 
-	h.operatorConfigData = map[string]string{
-		"UNBOUNDED_API_SERVER_ENDPOINT":   endpoint,
-		"UNBOUNDED_REAP_LEGACY_RESOURCES": strconv.FormatBool(reapLegacyResources),
+	configData["UNBOUNDED_API_SERVER_ENDPOINT"] = endpoint
+	configData["UNBOUNDED_REAP_LEGACY_RESOURCES"] = strconv.FormatBool(reapLegacyResources)
+	h.operatorConfigData = configData
+
+	for key, value := range map[string]string{
+		"UNBOUNDED_METALMAN_IMAGE":           h.metalmanImage,
+		"UNBOUNDED_NETBOOT_IMAGE":            h.netbootImage,
+		"UNBOUNDED_MACHINA_IMAGE":            h.machinaImage,
+		"UNBOUNDED_NET_CONTROLLER_IMAGE":     h.netControllerImage,
+		"UNBOUNDED_NET_NODE_IMAGE":           h.netNodeImage,
+		"UNBOUNDED_STORAGE_SUPERVISOR_IMAGE": h.storageSupervisorImage,
+		"UNBOUNDED_MANAGED_KUBE_PROXY_IMAGE": h.managedKubeProxyImage,
+		"UNBOUNDED_STORAGE_VERSION":          h.storageVersion,
+		"UNBOUNDED_STORAGE_RELEASE_BASE_URL": h.storageReleaseBaseURL,
+	} {
+		if value != "" {
+			h.operatorConfigData[key] = value
+		}
 	}
 
 	return nil

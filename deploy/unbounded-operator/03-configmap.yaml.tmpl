@@ -9,8 +9,8 @@
 # then `kubectl rollout restart deployment/unbounded-operator` to apply changes:
 # env is read once at pod start.
 #
-# Release-baked settings (operator image, component images, metalman image) are
-# NOT here; they are version-matched into the manifests at build time.
+# Release defaults are kept here so a regenerated manifest can redirect every
+# operator-managed runtime pull without rebuilding the operator image.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,6 +20,15 @@ metadata:
     app.kubernetes.io/name: unbounded-operator
     app.kubernetes.io/component: controller
 data:
+  UNBOUNDED_METALMAN_IMAGE: {{ default "" .MetalmanImage | quote }}
+  UNBOUNDED_NETBOOT_IMAGE: {{ default "" .NetbootImage | quote }}
+  UNBOUNDED_MACHINA_IMAGE: {{ default "" .MachinaImage | quote }}
+  UNBOUNDED_NET_CONTROLLER_IMAGE: {{ default "" .NetControllerImage | quote }}
+  UNBOUNDED_NET_NODE_IMAGE: {{ default "" .NetNodeImage | quote }}
+  UNBOUNDED_STORAGE_SUPERVISOR_IMAGE: {{ default "" .StorageSupervisorImage | quote }}
+  UNBOUNDED_MANAGED_KUBE_PROXY_IMAGE: {{ default "" .ManagedKubeProxyImage | quote }}
+  UNBOUNDED_STORAGE_VERSION: {{ default "" .StorageVersion | quote }}
+  UNBOUNDED_STORAGE_RELEASE_BASE_URL: {{ default "" .StorageReleaseBaseURL | quote }}
   # External Kubernetes API endpoint advertised to provisioned machines. Remote
   # nodes dial this to join, so it must be reachable from outside the cluster.
   # Leave empty to let the operator auto-discover it: it prefers the standard

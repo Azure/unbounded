@@ -13,7 +13,7 @@
 #   2. goreleaser check - validate .goreleaser.yml
 #   3. frontend        - build the React UI into internal/net/html/dist
 #   4. cni-plugins     - download CNI plugin tarballs into resources/
-#   5. release-manifests - render and tar the combined machina+net manifests
+#   5. release-manifests - render the aggregate operator YAML and manifests tarball
 #   6. goreleaser snapshot - build kube binaries and stamped manifest archive
 #                            (skips publish, sign, sbom, docker)
 #   7. test-goreleaser-hook - assert manifests + binaries are stamped with TAG
@@ -172,6 +172,15 @@ fi
 step "5/8 release-manifests (make release-manifests)"
 make release-manifests
 ls -lh build/unbounded-manifests-*.tar.gz
+if [[ ! -s build/operator.yaml ]]; then
+    echo "missing aggregate release manifest: build/operator.yaml" >&2
+    exit 1
+fi
+if ! grep -Fq "ghcr.io/azure/unbounded-operator:${TAG}" build/operator.yaml; then
+    echo "build/operator.yaml is not stamped with ${TAG}" >&2
+    exit 1
+fi
+echo "aggregate operator manifest stamped correctly: build/operator.yaml"
 
 # 6. goreleaser snapshot
 step "6/8 goreleaser snapshot"

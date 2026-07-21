@@ -66,7 +66,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, applyMutator(configHash)); err != nil {
+	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, applyMutator(configHash, env.Config)); err != nil {
 		return component.Failed(err)
 	}
 
@@ -112,7 +112,7 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 
 // applyMutator skips the separately reconciled ConfigMap and stamps its exact
 // payload hash on both net workloads so config changes roll them together.
-func applyMutator(configHash string) func(*unstructured.Unstructured) error {
+func applyMutator(configHash string, cfg component.Config) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		if obj.GetKind() == component.CRDKind {
 			obj.Object = nil
@@ -128,6 +128,26 @@ func applyMutator(configHash string) func(*unstructured.Unstructured) error {
 
 		if (obj.GetKind() == "Deployment" && obj.GetName() == controllerName) ||
 			(obj.GetKind() == "DaemonSet" && obj.GetName() == nodeName) {
+			if obj.GetKind() == "Deployment" {
+				if err := component.SetNamedContainerImage(obj, "containers", "controller", cfg.NetControllerImage); err != nil {
+					return err
+				}
+
+				if cfg.ManagedKubeProxyImage != "" {
+					if err := component.AppendNamedContainerArg(obj, "controller", "--managed-kube-proxy-image="+cfg.ManagedKubeProxyImage); err != nil {
+						return err
+					}
+				}
+			} else {
+				if err := component.SetNamedContainerImage(obj, "initContainers", "install-cni-plugins", cfg.NetNodeImage); err != nil {
+					return err
+				}
+
+				if err := component.SetNamedContainerImage(obj, "containers", "node", cfg.NetNodeImage); err != nil {
+					return err
+				}
+			}
+
 			annotations, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
 			if err != nil {
 				return fmt.Errorf("get net pod template annotations: %w", err)

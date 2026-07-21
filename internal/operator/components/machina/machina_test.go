@@ -80,7 +80,7 @@ func TestApplyMutatorSkipsMetalmanSupportAndCRD(t *testing.T) {
 			"metadata":   map[string]any{"name": "sites.unbounded-cloud.io"},
 		}},
 	} {
-		if err := applyMutator("hash")(obj); err != nil {
+		if err := applyMutator("hash", component.Config{})(obj); err != nil {
 			t.Fatalf("applyMutator: %v", err)
 		}
 
@@ -127,7 +127,7 @@ func TestApplyMutatorSkipsExactlyMetalmanRBAC(t *testing.T) {
 			supportSeen++
 
 			work := obj.DeepCopy()
-			if err := applyMutator("hash")(work); err != nil {
+			if err := applyMutator("hash", component.Config{})(work); err != nil {
 				t.Fatalf("applyMutator: %v", err)
 			}
 
@@ -151,7 +151,7 @@ func TestApplyMutatorStampsConfigHash(t *testing.T) {
 	}}
 
 	const hash = "config-hash"
-	if err := applyMutator(hash)(obj); err != nil {
+	if err := applyMutator(hash, component.Config{})(obj); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -159,6 +159,29 @@ func TestApplyMutatorStampsConfigHash(t *testing.T) {
 		"spec", "template", "metadata", "annotations", ConfigHashAnnotation)
 	if err != nil || !found || got != hash {
 		t.Fatalf("config hash = %q found=%t err=%v, want %q", got, found, err, hash)
+	}
+}
+
+func TestApplyMutatorOverridesImage(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": controllerName},
+		"spec": map[string]any{"template": map[string]any{
+			"metadata": map[string]any{},
+			"spec": map[string]any{"containers": []any{
+				map[string]any{"name": "machina-controller", "image": "embedded:v0"},
+			}},
+		}},
+	}}
+
+	if err := applyMutator("hash", component.Config{MachinaImage: "mirror/machina:v1"})(obj); err != nil {
+		t.Fatalf("applyMutator: %v", err)
+	}
+
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	if got := containers[0].(map[string]any)["image"]; got != "mirror/machina:v1" {
+		t.Fatalf("image = %v, want mirror/machina:v1", got)
 	}
 }
 

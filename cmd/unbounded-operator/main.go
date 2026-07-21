@@ -73,7 +73,15 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
-	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", "", "Default metalman image")
+	cmd.Flags().StringVar(&cfg.metalmanImage, "metalman-image", os.Getenv("UNBOUNDED_METALMAN_IMAGE"), "Default metalman image (defaults to $UNBOUNDED_METALMAN_IMAGE)")
+	cmd.Flags().StringVar(&cfg.netbootImage, "netboot-image", os.Getenv("UNBOUNDED_NETBOOT_IMAGE"), "Default metalman netboot image (defaults to $UNBOUNDED_NETBOOT_IMAGE)")
+	cmd.Flags().StringVar(&cfg.machinaImage, "machina-image", os.Getenv("UNBOUNDED_MACHINA_IMAGE"), "Machina controller image (defaults to $UNBOUNDED_MACHINA_IMAGE)")
+	cmd.Flags().StringVar(&cfg.netControllerImage, "net-controller-image", os.Getenv("UNBOUNDED_NET_CONTROLLER_IMAGE"), "Network controller image (defaults to $UNBOUNDED_NET_CONTROLLER_IMAGE)")
+	cmd.Flags().StringVar(&cfg.netNodeImage, "net-node-image", os.Getenv("UNBOUNDED_NET_NODE_IMAGE"), "Network node image (defaults to $UNBOUNDED_NET_NODE_IMAGE)")
+	cmd.Flags().StringVar(&cfg.storageSupervisorImage, "storage-supervisor-image", os.Getenv("UNBOUNDED_STORAGE_SUPERVISOR_IMAGE"), "Storage supervisor image (defaults to $UNBOUNDED_STORAGE_SUPERVISOR_IMAGE)")
+	cmd.Flags().StringVar(&cfg.managedKubeProxyImage, "managed-kube-proxy-image", os.Getenv("UNBOUNDED_MANAGED_KUBE_PROXY_IMAGE"), "Managed kube-proxy image (defaults to $UNBOUNDED_MANAGED_KUBE_PROXY_IMAGE)")
+	cmd.Flags().StringVar(&cfg.storageVersion, "storage-version", os.Getenv("UNBOUNDED_STORAGE_VERSION"), "Storage daemon release version (defaults to $UNBOUNDED_STORAGE_VERSION)")
+	cmd.Flags().StringVar(&cfg.storageReleaseBaseURL, "storage-release-base-url", os.Getenv("UNBOUNDED_STORAGE_RELEASE_BASE_URL"), "Base URL containing storage daemon release archives (defaults to $UNBOUNDED_STORAGE_RELEASE_BASE_URL)")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info or the KUBERNETES_SERVICE_HOST FQDN (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
 	cmd.CompletionOptions.DisableDefaultCmd = true
@@ -89,6 +97,14 @@ type config struct {
 	leaderElectionNamespace string
 	namespace               string
 	metalmanImage           string
+	netbootImage            string
+	machinaImage            string
+	netControllerImage      string
+	netNodeImage            string
+	storageSupervisorImage  string
+	managedKubeProxyImage   string
+	storageVersion          string
+	storageReleaseBaseURL   string
 	apiServerEndpoint       string
 	reapLegacyResources     bool
 }
@@ -195,8 +211,16 @@ func run(ctx context.Context, cfg config) error {
 		Namespace: namespace,
 		Registry:  operator.DefaultRegistry(),
 		Config: operator.Config{
-			MetalmanImage:     cfg.metalmanImage,
-			APIServerEndpoint: cfg.apiServerEndpoint,
+			MetalmanImage:          cfg.metalmanImage,
+			NetbootImage:           cfg.netbootImage,
+			MachinaImage:           cfg.machinaImage,
+			NetControllerImage:     cfg.netControllerImage,
+			NetNodeImage:           cfg.netNodeImage,
+			StorageSupervisorImage: cfg.storageSupervisorImage,
+			ManagedKubeProxyImage:  cfg.managedKubeProxyImage,
+			StorageVersion:         cfg.storageVersion,
+			StorageReleaseBaseURL:  cfg.storageReleaseBaseURL,
+			APIServerEndpoint:      cfg.apiServerEndpoint,
 		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Site controller: %w", err)

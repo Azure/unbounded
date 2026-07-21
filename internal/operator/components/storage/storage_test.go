@@ -144,6 +144,79 @@ func TestDaemonSetPointsAtPerSiteConfig(t *testing.T) {
 	}
 }
 
+func TestMutateObjectOverridesRuntimeSettings(t *testing.T) {
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1", "kind": "DaemonSet", "metadata": map[string]any{"name": daemonSetName},
+		"spec": map[string]any{
+			"selector": map[string]any{"matchLabels": map[string]any{}},
+			"template": map[string]any{
+				"metadata": map[string]any{"labels": map[string]any{}},
+				"spec": map[string]any{
+					"initContainers": []any{map[string]any{
+						"name": "install", "image": "embedded:v0",
+						"env": []any{map[string]any{"name": "VERSION", "value": "old"}},
+					}},
+					"containers": []any{map[string]any{"name": "run", "image": "embedded:v0"}},
+				},
+			},
+		},
+	}}
+	cfg := component.Config{
+		StorageSupervisorImage: "mirror/storage:v1",
+		StorageVersion:         "v1",
+		StorageReleaseBaseURL:  "https://mirror.example/releases",
+	}
+
+	if err := mutateObjectWithConfig(site, "hash", cfg, obj); err != nil {
+		t.Fatalf("mutateObjectWithConfig: %v", err)
+	}
+
+	assertContainerValue(t, obj, "containers", "run", "image", "mirror/storage:v1")
+	assertContainerValue(t, obj, "initContainers", "install", "image", "mirror/storage:v1")
+	assertContainerEnv(t, obj, "install", "VERSION", "v1")
+	assertContainerEnv(t, obj, "install", "RELEASE_BASE_URL", "https://mirror.example/releases")
+}
+
+func assertContainerValue(t *testing.T, obj *unstructured.Unstructured, field, name, key, want string) {
+	t.Helper()
+
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+	for _, raw := range containers {
+		container := raw.(map[string]any)
+		if container["name"] == name {
+			if got := container[key]; got != want {
+				t.Fatalf("%s %s = %v, want %s", name, key, got, want)
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("container %s not found", name)
+}
+
+func assertContainerEnv(t *testing.T, obj *unstructured.Unstructured, containerName, envName, want string) {
+	t.Helper()
+
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "initContainers")
+	for _, raw := range containers {
+		container := raw.(map[string]any)
+		if container["name"] != containerName {
+			continue
+		}
+
+		for _, rawEnv := range container["env"].([]any) {
+			env := rawEnv.(map[string]any)
+			if env["name"] == envName && env["value"] == want {
+				return
+			}
+		}
+	}
+
+	t.Fatalf("%s env %s = not found, want %s", containerName, envName, want)
+}
+
 func TestEnsureConfigCreatesDefaultWhenAbsent(t *testing.T) {
 	env := testEnv(t)
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}

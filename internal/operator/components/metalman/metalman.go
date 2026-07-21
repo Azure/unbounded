@@ -106,6 +106,10 @@ func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Co
 	}
 
 	args := []string{"serve-pxe", "--site=" + site.Name}
+	if cfg.NetbootImage != "" {
+		args = append(args, "--default-netboot-image="+cfg.NetbootImage)
+	}
+
 	if site.Spec.Components.Metalman.DHCPAutoInterface != nil && *site.Spec.Components.Metalman.DHCPAutoInterface {
 		args = append(args, "--dhcp-auto-interface")
 	}

@@ -67,7 +67,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboun
 	}
 
 	if err := env.ApplyManifestFS(ctx, storagemanifests.Manifests, func(obj *unstructured.Unstructured) error {
-		return mutateObject(site, configHash, obj)
+		return mutateObjectWithConfig(site, configHash, env.Config, obj)
 	}); err != nil {
 		return component.Failed(err)
 	}
@@ -221,9 +221,37 @@ func defaultConfigMap(site *unboundedv1alpha3.Site, namespace string) (*corev1.C
 // per-site ConfigMap is handled by ensureConfig so existing config data is
 // preserved; the ServiceAccount and RBAC are shared across sites.
 func mutateObject(site *unboundedv1alpha3.Site, configHash string, obj *unstructured.Unstructured) error {
+	return mutateObjectWithConfig(site, configHash, component.Config{}, obj)
+}
+
+func mutateObjectWithConfig(site *unboundedv1alpha3.Site, configHash string, cfg component.Config, obj *unstructured.Unstructured) error {
 	switch {
 	case obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName:
-		return scopeDaemonSetToSite(site, configHash, obj)
+		if err := scopeDaemonSetToSite(site, configHash, obj); err != nil {
+			return err
+		}
+
+		if err := component.SetNamedContainerImage(obj, "initContainers", "install", cfg.StorageSupervisorImage); err != nil {
+			return err
+		}
+
+		if err := component.SetNamedContainerImage(obj, "containers", "run", cfg.StorageSupervisorImage); err != nil {
+			return err
+		}
+
+		if cfg.StorageVersion != "" {
+			if err := component.SetNamedContainerEnv(obj, "initContainers", "install", "VERSION", cfg.StorageVersion); err != nil {
+				return err
+			}
+		}
+
+		if cfg.StorageReleaseBaseURL != "" {
+			if err := component.SetNamedContainerEnv(obj, "initContainers", "install", "RELEASE_BASE_URL", cfg.StorageReleaseBaseURL); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	case obj.GetKind() == "ConfigMap" && obj.GetName() == configName:
 		obj.Object = nil
 

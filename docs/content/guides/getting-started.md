@@ -58,6 +58,20 @@ Verify:
 az version && kubectl version --client && kubectl unbounded --help
 ```
 
+The quickstart installs the operator after creating AKS. For a cluster that
+already exists, the direct installation path is:
+
+```bash
+kubectl apply -f https://github.com/Azure/unbounded/releases/latest/download/operator.yaml
+kubectl -n unbounded-system rollout status deployment/unbounded-operator --timeout=5m
+kubectl wait --for=condition=Established crd/sites.unbounded-cloud.io --timeout=5m
+```
+
+For automation, pin
+`https://github.com/Azure/unbounded/releases/download/vX.Y.Z/operator.yaml`.
+The manifest does not create a `Site`; install the plugin and run
+`kubectl unbounded site init --skip-install` separately.
+
 ---
 
 ## 2. Create the Cluster

@@ -34,6 +34,14 @@ func TestInstallCommandFlags(t *testing.T) {
 		"namespace",
 		"operator-image",
 		"metalman-image",
+		"netboot-image",
+		"machina-image",
+		"net-controller-image",
+		"net-node-image",
+		"storage-supervisor-image",
+		"managed-kube-proxy-image",
+		"storage-version",
+		"storage-release-base-url",
 		"api-server-endpoint",
 		"wait",
 		"timeout",
@@ -43,10 +51,6 @@ func TestInstallCommandFlags(t *testing.T) {
 
 	for _, name := range []string{
 		"net-namespace",
-		"net-controller-image",
-		"net-node-image",
-		"machina-image",
-		"storage-supervisor-image",
 		// CRDs are now owned by the operator (BootstrapCRDs); install no longer
 		// applies them, so --skip-crds is gone.
 		"skip-crds",
@@ -261,10 +265,9 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			data, found, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
 			require.NoError(t, err)
 			require.True(t, found)
-			require.Equal(t, map[string]string{
-				"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
-				"UNBOUNDED_REAP_LEGACY_RESOURCES": tt.wantReaper,
-			}, data)
+			require.Equal(t, "https://api.example.test:6443", data["UNBOUNDED_API_SERVER_ENDPOINT"])
+			require.Equal(t, tt.wantReaper, data["UNBOUNDED_REAP_LEGACY_RESOURCES"])
+			require.Equal(t, "ghcr.io/azure/machina:v0.0.0-test", data["UNBOUNDED_MACHINA_IMAGE"])
 
 			gotHash, found, err := unstructured.NestedString(captured.deployment.Object, "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation)
 			require.NoError(t, err)

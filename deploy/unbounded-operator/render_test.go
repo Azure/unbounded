@@ -4,12 +4,18 @@
 package unboundedoperator
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +24,59 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 	"github.com/Azure/unbounded/internal/operator"
 )
+
+func TestGenerateOperatorManifest(t *testing.T) {
+	root := repoRoot(t)
+	output := filepath.Join(t.TempDir(), "operator.yaml")
+	cmd := exec.Command(filepath.Join(root, "hack", "scripts", "generate-operator-manifest.sh"),
+		"--version", "v1.2.3", "--registry", "mirror.example/unbounded",
+		"--managed-kube-proxy-image", "mirror.example/kube-proxy:v1.32.0",
+		"--storage-release-base-url", "https://mirror.example/releases/v1.2.3",
+		"--output", output)
+	cmd.Dir = root
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate manifest: %v\n%s", err, data)
+	}
+
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	for _, want := range []string{
+		"mirror.example/unbounded/unbounded-operator:v1.2.3",
+		"mirror.example/unbounded/unbounded-net-node:v1.2.3",
+		"mirror.example/kube-proxy:v1.32.0",
+		"https://mirror.example/releases/v1.2.3",
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("generated manifest missing %q", want)
+		}
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	var resources []string
+	for {
+		var obj struct {
+			Kind     string `yaml:"kind"`
+			Metadata struct {
+				Name string `yaml:"name"`
+			} `yaml:"metadata"`
+		}
+		if err := decoder.Decode(&obj); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decode generated manifest: %v", err)
+		}
+		if obj.Kind != "" {
+			resources = append(resources, obj.Kind+"/"+obj.Metadata.Name)
+		}
+	}
+	want := []string{"Namespace/unbounded-system", "ServiceAccount/unbounded-operator", "ClusterRole/unbounded-operator", "ClusterRoleBinding/unbounded-operator", "ConfigMap/unbounded-operator-config", "Deployment/unbounded-operator"}
+	if !reflect.DeepEqual(resources, want) {
+		t.Fatalf("resources = %#v, want %#v", resources, want)
+	}
+}
 
 // TestOperatorConfigEndpointAndHashRender asserts the make/GitOps render path
 // (`--set APIServerEndpoint=`) both populates the operator-config ConfigMap

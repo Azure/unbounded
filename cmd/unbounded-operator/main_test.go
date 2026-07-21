@@ -89,6 +89,46 @@ func TestReapLegacyResourcesConfiguration(t *testing.T) {
 	}
 }
 
+func TestRuntimePullConfigurationFromEnvironment(t *testing.T) {
+	values := map[string]string{
+		"UNBOUNDED_METALMAN_IMAGE":           "mirror/metalman:v1",
+		"UNBOUNDED_NETBOOT_IMAGE":            "mirror/netboot:v1",
+		"UNBOUNDED_MACHINA_IMAGE":            "mirror/machina:v1",
+		"UNBOUNDED_NET_CONTROLLER_IMAGE":     "mirror/net-controller:v1",
+		"UNBOUNDED_NET_NODE_IMAGE":           "mirror/net-node:v1",
+		"UNBOUNDED_STORAGE_SUPERVISOR_IMAGE": "mirror/storage-supervisor:v1",
+		"UNBOUNDED_MANAGED_KUBE_PROXY_IMAGE": "mirror/kube-proxy:v1",
+		"UNBOUNDED_STORAGE_VERSION":          "v1",
+		"UNBOUNDED_STORAGE_RELEASE_BASE_URL": "https://mirror.example/v1",
+	}
+	for key, value := range values {
+		t.Setenv(key, value)
+	}
+
+	var got config
+
+	cmd := newCommand(func(_ context.Context, cfg config) error {
+		got = cfg
+
+		return nil
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if got.metalmanImage != values["UNBOUNDED_METALMAN_IMAGE"] ||
+		got.netbootImage != values["UNBOUNDED_NETBOOT_IMAGE"] ||
+		got.machinaImage != values["UNBOUNDED_MACHINA_IMAGE"] ||
+		got.netControllerImage != values["UNBOUNDED_NET_CONTROLLER_IMAGE"] ||
+		got.netNodeImage != values["UNBOUNDED_NET_NODE_IMAGE"] ||
+		got.storageSupervisorImage != values["UNBOUNDED_STORAGE_SUPERVISOR_IMAGE"] ||
+		got.managedKubeProxyImage != values["UNBOUNDED_MANAGED_KUBE_PROXY_IMAGE"] ||
+		got.storageVersion != values["UNBOUNDED_STORAGE_VERSION"] ||
+		got.storageReleaseBaseURL != values["UNBOUNDED_STORAGE_RELEASE_BASE_URL"] {
+		t.Fatalf("runtime pull config not loaded from environment: %#v", got)
+	}
+}
+
 func TestResolveAPIServerEndpoint(t *testing.T) {
 	const clusterInfoKubeconfig = `apiVersion: v1
 clusters:

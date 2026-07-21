@@ -97,6 +97,10 @@ func acquireRemote(ctx context.Context, cfg Config, url, stagingDir string) erro
 // repo, version, and architecture. "latest" uses the latest-release redirect so
 // the URL keeps working across future releases.
 func releaseTarballURL(cfg Config) string {
+	if cfg.ReleaseBaseURL != "" {
+		return strings.TrimRight(cfg.ReleaseBaseURL, "/") + "/" + tarballName(cfg.Arch)
+	}
+
 	var base string
 	if cfg.Version == "latest" {
 		base = fmt.Sprintf("https://github.com/%s/releases/latest/download", cfg.Repo)

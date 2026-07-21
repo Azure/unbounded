@@ -17,6 +17,19 @@ The plugin binary can also be invoked directly as `kubectl-unbounded`.
 
 ## Installation
 
+Install the operator and required CRDs from the latest release first:
+
+```bash
+kubectl apply -f https://github.com/Azure/unbounded/releases/latest/download/operator.yaml
+kubectl -n unbounded-system rollout status deployment/unbounded-operator --timeout=5m
+kubectl wait --for=condition=Established crd/sites.unbounded-cloud.io --timeout=5m
+```
+
+Use a pinned URL such as
+`https://github.com/Azure/unbounded/releases/download/vX.Y.Z/operator.yaml` for
+repeatable deployments. Applying the manifest does not create a `Site`; the
+plugin is still required for `kubectl unbounded site init` and other operations.
+
 Download the plugin binary from the
 [GitHub releases](https://github.com/Azure/unbounded/releases)
 page and place it on your `PATH`. kubectl automatically discovers plugins named
@@ -27,6 +40,12 @@ You can also install via [Krew](https://krew.sigs.k8s.io/):
 ```bash
 kubectl krew install unbounded
 ```
+
+To use a private image registry or release mirror, generate an aggregate
+manifest from a source checkout with
+`hack/scripts/generate-operator-manifest.sh`. Run the script with `--help` for
+the supported image and output options, then mirror the referenced images and
+publish the generated YAML with your release assets.
 
 ## Global Behavior
 

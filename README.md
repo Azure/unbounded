@@ -67,7 +67,29 @@ and joins a remote node to it. Already have a cluster? See the
   <img src="docs/static/img/quickstart-architecture.svg" alt="Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard" width="700">
 </p>
 
-### 1. Install the kubectl plugin
+### 1. Install the operator
+
+Apply the latest signed release manifest:
+
+```bash
+kubectl apply -f https://github.com/Azure/unbounded/releases/latest/download/operator.yaml
+kubectl -n unbounded-system rollout status deployment/unbounded-operator --timeout=5m
+kubectl wait --for=condition=Established crd/sites.unbounded-cloud.io --timeout=5m
+```
+
+Run this against an existing cluster. The AKS quickstart below performs this
+installation after it creates the cluster.
+
+For repeatable automation, pin the release tag instead of using `latest`:
+
+```bash
+kubectl apply -f https://github.com/Azure/unbounded/releases/download/vX.Y.Z/operator.yaml
+```
+
+This installs the operator and its required CRDs, but does not create a `Site`.
+Install the plugin next so you can initialize one.
+
+### 2. Install the kubectl plugin
 
 ```bash
 # Linux amd64
@@ -85,7 +107,7 @@ sudo mv kubectl-unbounded /usr/local/bin/
 
 </details>
 
-### 2. Create the cluster
+### 3. Create the cluster
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/Azure/unbounded/main/hack/scripts/aks-quickstart.sh
@@ -102,7 +124,7 @@ chmod +x aks-quickstart.sh
 > `kubectl unbounded site init` to bootstrap the operator and request the
 > networking stack through the cluster Site.
 
-### 3. Add a remote node
+### 4. Add a remote node
 
 ```bash
 kubectl unbounded machine manual-bootstrap my-node --site remote \
@@ -111,7 +133,7 @@ kubectl unbounded machine manual-bootstrap my-node --site remote \
 
 > Replace `user@<host>` with the SSH user and IP of your remote machine.
 
-### 4. Verify
+### 5. Verify
 
 ```bash
 kubectl get nodes -w
