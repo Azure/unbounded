@@ -212,7 +212,7 @@ jobs:
           path: tmp/tla2tools.jar
           # Key derives from the pinned TLA_TOOLS_VERSION / SHA in the
           # top-level Makefile; bump those to invalidate this cache.
-          key: tla2tools-v1.8.0-237332bd
+          key: tla2tools-v1.8.0-cc4803dc
 
       - name: Run TLC
         run: make unbounded-storage-model-check
