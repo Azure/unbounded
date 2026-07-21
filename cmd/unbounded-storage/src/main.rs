@@ -737,10 +737,10 @@ fn run_shard(
             ) {
                 Ok(directory) => directory,
                 Err(e) => {
-                    phase_a.report_failed(format!(
-                        "worker={}: tls_tcp client directory: {e}",
-                        widx.0,
-                    ));
+                    phase_a
+                        .report_failed(
+                            format!("worker={}: tls_tcp client directory: {e}", widx.0,),
+                        );
                     return;
                 }
             };
@@ -841,10 +841,7 @@ fn run_shard(
                     RoutedTransport::with_tcp(tcp, routes.clone(), transport_registry.clone())
                 }
                 Err(e) => {
-                    phase_a.report_failed(format!(
-                        "worker={}: TcpRpcTransport::new: {e}",
-                        widx.0,
-                    ));
+                    phase_a.report_failed(format!("worker={}: TcpRpcTransport::new: {e}", widx.0,));
                     return;
                 }
             }
@@ -1072,17 +1069,13 @@ fn run_shard(
     // Control-drain tick hook: applies live config changes on this
     // shard's own thread so all `!Send` per-shard state stays
     // thread-local. Each `ShardCommand::ApplyConfig` republishes the
-    // routing surface through this shard's `RouteTableHandle` (observed
-    // atomically by its transport; the fabric RPC handlers are reloaded
-    // separately by the `FabricGroup`), refreshes the stripe geometry,
-    // reconciles the transport origin-backend registry and the frontend
-    // registry toward the new config, applies disk-policy side effects, and then acknowledges
-    // so the coordinator's blocking apply can complete. Everything is
-    // driven from this one thread so the `ArcSwap` publishes are ordered
-    // and the build-from-spec (DNS resolve, listener bind) stays off the
-    // fast path.
+    // stripe geometry, transport origin-backend registry, and frontend
+    // registry toward the new config, then acknowledges so the coordinator's
+    // blocking apply can complete. Route publication remains process-wide and
+    // occurs only after every shard converges. Everything is driven from this
+    // one thread so the `ArcSwap` publishes are ordered and build-from-spec
+    // work (DNS resolve, listener bind) stays off the fast path.
     {
-        let routes = routes.clone();
         let transport_registry = transport_registry.clone();
         let frontend_registry = frontend_registry.clone();
         let pool = pool.clone();
@@ -1115,7 +1108,8 @@ fn run_shard(
                             && let (Some(peer_directory), Some(directory)) =
                                 (tcp_peer_directory.as_ref(), tcp_directory.as_ref())
                         {
-                            let desired = match tls_tcp_peer_map(&apply.loaded.runtime().mesh.peers) {
+                            let desired = match tls_tcp_peer_map(&apply.loaded.runtime().mesh.peers)
+                            {
                                 Ok(peers) => peers,
                                 Err(e) => {
                                     let _ = apply.ack.send(config::ShardAck {
@@ -1454,7 +1448,6 @@ fn reconcile_cache_disks(
 fn clear_cache_disk_publications(cache_directories: &CacheDirectorySet) {
     cache_directories.reconcile(std::iter::empty::<String>());
 }
-
 
 /// Validate and log the configured backends.
 ///

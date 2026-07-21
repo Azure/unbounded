@@ -2434,7 +2434,7 @@ key_path = "/etc/unbounded-storage/node-key.pem"
         ));
         let cfg = load(f.path()).expect("valid tls_tcp config should load");
 
-        let binds = match cfg.startup().fabric().binds.as_ref() {
+        let binds = match cfg.config().startup().fabric().binds.as_ref() {
             Some(super::super::schema::fabric_cfg::Binds::TlsTcp(binds)) => binds,
             other => panic!("expected tls_tcp binds, got {other:?}"),
         };
@@ -2451,13 +2451,13 @@ key_path = "/etc/unbounded-storage/node-key.pem"
         let f = write_binpb(&encode_config(&cfg));
         let loaded = load(f.path()).expect("tls_tcp protobuf config should load");
 
-        assert_eq!(loaded.peers[0].transport_name(), "tls_tcp");
-        let peer = match loaded.peers[0].config.as_ref() {
+        assert_eq!(loaded.config().peers[0].transport_name(), "tls_tcp");
+        let peer = match loaded.config().peers[0].config.as_ref() {
             Some(peer_spec::Config::TlsTcp(peer)) => peer,
             other => panic!("expected tls_tcp peer, got {other:?}"),
         };
         assert_eq!(peer.addr, "127.0.0.1:9443");
-        let binds = match loaded.startup().fabric().binds.as_ref() {
+        let binds = match loaded.config().startup().fabric().binds.as_ref() {
             Some(super::super::schema::fabric_cfg::Binds::TlsTcp(binds)) => binds,
             other => panic!("expected tls_tcp binds, got {other:?}"),
         };
@@ -2495,8 +2495,8 @@ key_path = "/etc/unbounded-storage/node-key.pem"
 
     #[test]
     fn rejects_zero_tls_tcp_peer_ports() {
-        let config = tls_tcp_toml("", "")
-            .replace("addr = \"127.0.0.1:9443\"", "addr = \"127.0.0.1:0\"");
+        let config =
+            tls_tcp_toml("", "").replace("addr = \"127.0.0.1:9443\"", "addr = \"127.0.0.1:0\"");
         let f = write_cfg(&config);
 
         assert!(matches!(
@@ -2584,7 +2584,7 @@ addr = "hex:01020304"
 "#,
         );
         let cfg = load(f.path()).expect("legacy peer transports should still load");
-        assert_eq!(cfg.peers[0].transport_name(), "tcp");
-        assert_eq!(cfg.peers[1].transport_name(), "rdma");
+        assert_eq!(cfg.config().peers[0].transport_name(), "tcp");
+        assert_eq!(cfg.config().peers[1].transport_name(), "rdma");
     }
 }
