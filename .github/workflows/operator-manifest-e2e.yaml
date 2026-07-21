@@ -4,37 +4,6 @@
 name: unbounded-operator mirrored manifest e2e
 
 on:
-  pull_request:
-    paths:
-      - Makefile
-      - cmd/unbounded-operator/**
-      - deploy/machina/**
-      - deploy/net/**
-      - deploy/unbounded-operator/**
-      - images/machina/**
-      - images/net/**
-      - images/unbounded-operator/**
-      - internal/operator/**
-      - hack/operator-manifest-e2e/**
-      - go.mod
-      - go.sum
-      - .github/workflows/operator-manifest-e2e.yaml
-  push:
-    branches: [main]
-    paths:
-      - Makefile
-      - cmd/unbounded-operator/**
-      - deploy/machina/**
-      - deploy/net/**
-      - deploy/unbounded-operator/**
-      - images/machina/**
-      - images/net/**
-      - images/unbounded-operator/**
-      - internal/operator/**
-      - hack/operator-manifest-e2e/**
-      - go.mod
-      - go.sum
-      - .github/workflows/operator-manifest-e2e.yaml
   workflow_dispatch:
 
 concurrency:
