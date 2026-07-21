@@ -124,8 +124,8 @@ mod tests {
     use super::*;
     use crate::config::schema::{
         BackendSpec, BlockDiskConfig, CacheSpec, DiskSpec, FrontendSpec, HttpBackendConfig,
-        HttpFrontendConfig, PeerSpec, RoutingPlan, TcpPeerConfig, TopologyPrefixWeight,
-        TopologyWeighting, backend_spec, disk_spec, frontend_spec, peer_spec,
+        HttpFrontendConfig, PeerSpec, RoutingPlan, S3BackendConfig, TcpPeerConfig,
+        TopologyPrefixWeight, TopologyWeighting, backend_spec, disk_spec, frontend_spec, peer_spec,
     };
 
     fn base() -> Config {
@@ -253,12 +253,43 @@ mod tests {
                 url: "https://example.com".to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
-                ca_cert_path: None,
+                ca_cert: None,
                 insecure_skip_verify: false,
-                client_cert_path: None,
-                client_key_path: None,
+                client_cert: None,
+                client_key: None,
             })),
         });
+        let d = ConfigDiff::between(&a, &b);
+        assert!(d.backends_changed);
+        assert!(d.any());
+        assert!(!d.requires_routing_reload());
+    }
+
+    #[test]
+    fn s3_credential_only_change_is_a_backend_diff() {
+        let mut a = base();
+        a.backends.push(BackendSpec {
+            name: "s3".to_string(),
+            config: Some(backend_spec::Config::S3(S3BackendConfig {
+                url: "https://s3.example.com".to_string(),
+                stripe_size_bytes: Some(4 * 1024 * 1024),
+                http_concurrency: Some(64),
+                ca_cert: None,
+                insecure_skip_verify: false,
+                client_cert: None,
+                client_key: None,
+                region: Some("us-east-1".to_string()),
+                access_key_id: Some("access".to_string()),
+                secret_access_key: Some("secret-a".to_string()),
+                session_token: None,
+            })),
+        });
+        let mut b = a.clone();
+        let Some(backend_spec::Config::S3(cfg)) = b.backends[0].config.as_mut() else {
+            panic!("expected s3 backend config");
+        };
+        cfg.secret_access_key = Some("secret-b".to_string());
+
         let d = ConfigDiff::between(&a, &b);
         assert!(d.backends_changed);
         assert!(d.any());

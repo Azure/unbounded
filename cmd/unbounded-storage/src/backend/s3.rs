@@ -29,6 +29,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 
 use ::http::header::{HOST, RANGE};
 
@@ -39,10 +40,12 @@ use crate::storage::{ObjectMetadata, StripeReq};
 use crate::tls::TlsContext;
 
 use super::Backend;
+use super::S3Auth;
 use super::conn::{
     OriginConnPool, body_response_reusable, head_response_reusable, send_request_read_head,
 };
 use super::limiter::FetchLimiter;
+use super::s3_sigv4::sign_request;
 
 /// Origin backend that fetches stripe byte ranges from an
 /// S3-compatible origin into bufferpool pages. The endpoint scheme
@@ -70,6 +73,7 @@ pub struct S3Backend {
     backing_base: *mut u8,
     limiter: FetchLimiter,
     conns: OriginConnPool,
+    auth: Option<S3Auth>,
 }
 
 impl S3Backend {
@@ -86,6 +90,35 @@ impl S3Backend {
         backing_base: *mut u8,
         http_concurrency: usize,
     ) -> Self {
+        Self::new_with_auth(
+            handle,
+            origin,
+            host,
+            sni_host,
+            tls,
+            backend_id,
+            stripe_size,
+            page_size,
+            backing_base,
+            http_concurrency,
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn new_with_auth(
+        handle: NetHandle,
+        origin: SockAddr,
+        host: String,
+        sni_host: String,
+        tls: Option<Rc<TlsContext>>,
+        backend_id: String,
+        stripe_size: u64,
+        page_size: usize,
+        backing_base: *mut u8,
+        http_concurrency: usize,
+        auth: Option<S3Auth>,
+    ) -> Self {
         Self {
             handle,
             origin,
@@ -98,6 +131,7 @@ impl S3Backend {
             backing_base,
             limiter: FetchLimiter::new(http_concurrency),
             conns: OriginConnPool::new(http_concurrency),
+            auth,
         }
     }
 
@@ -143,6 +177,7 @@ impl S3Backend {
         let sni_host = self.sni_host.clone();
         let tls = self.tls.clone();
         let conns = self.conns.clone();
+        let auth = self.auth.clone();
 
         // A metadata entry is not a byte range of the object; it is a
         // synthetic one-page cache entry whose payload is the object's
@@ -171,6 +206,7 @@ impl S3Backend {
                         page_size,
                         self.limiter.clone(),
                         conns,
+                        auth,
                     ),
                 ),
             ));
@@ -206,6 +242,7 @@ impl S3Backend {
                     backing_base,
                     page_size,
                     self.limiter.clone(),
+                    auth,
                 ),
             ),
         ));
@@ -320,6 +357,7 @@ async fn fetch(
     backing_base: *mut u8,
     page_size: usize,
     limiter: FetchLimiter,
+    auth: Option<S3Auth>,
 ) -> Result<(), Error> {
     let total: u64 = dsts.iter().map(|p| p.len as u64).sum();
     if total != len {
@@ -337,7 +375,14 @@ async fn fetch(
     // Bound concurrent origin work to `http_concurrency`. The permit is
     // held for the whole fetch and returned to the pool on drop.
     let _permit = limiter.acquire().await;
-    let request = format_get_request(&path, &host, start, start + len - 1)?;
+    let request = format_get_request(
+        &path,
+        &host,
+        start,
+        start + len - 1,
+        auth.as_ref(),
+        SystemTime::now(),
+    )?;
     let (conn, head) = send_request_read_head(
         &conns,
         &handle,
@@ -481,6 +526,7 @@ async fn fetch_metadata(
     page_size: usize,
     limiter: FetchLimiter,
     conns: OriginConnPool,
+    auth: Option<S3Auth>,
 ) -> Result<(), Error> {
     let capacity: usize = dsts.iter().map(|p| p.len as usize).sum();
     if capacity < 8 {
@@ -491,7 +537,7 @@ async fn fetch_metadata(
 
     // Bound concurrent origin work to `http_concurrency` (see `fetch`).
     let _permit = limiter.acquire().await;
-    let request = format_head_request(&path, &host)?;
+    let request = format_head_request(&path, &host, auth.as_ref(), SystemTime::now())?;
     const MAX_HEAD: usize = 64 * 1024;
     let (conn, head) = send_request_read_head(
         &conns,
@@ -748,26 +794,40 @@ fn absolute_range(stripe_idx: u64, stripe_size: u64, src_offset: u64, src_len: u
 
 /// Format a ranged HTTP/1.1 GET request against the S3 origin.
 /// `start`/`end` are inclusive byte offsets for the `Range` header.
-fn format_get_request(path: &str, host: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
-    let req = ::http::Request::builder()
+fn format_get_request(
+    path: &str,
+    host: &str,
+    start: u64,
+    end: u64,
+    auth: Option<&S3Auth>,
+    now: SystemTime,
+) -> Result<Vec<u8>, Error> {
+    let mut req = ::http::Request::builder()
         .method(Method::GET)
         .uri(path)
         .header(HOST, host)
         .header(RANGE, format!("bytes={start}-{end}"))
         .body(())
         .map_err(|_| Error::from("s3 backend: failed to build origin GET request"))?;
+    sign_request(&mut req, auth, now).map_err(Error::transport)?;
     Ok(serialize_request(&req))
 }
 
 /// Format an HTTP/1.1 HEAD request against the S3 origin, used by the
 /// length-entry fill path.
-fn format_head_request(path: &str, host: &str) -> Result<Vec<u8>, Error> {
-    let req = ::http::Request::builder()
+fn format_head_request(
+    path: &str,
+    host: &str,
+    auth: Option<&S3Auth>,
+    now: SystemTime,
+) -> Result<Vec<u8>, Error> {
+    let mut req = ::http::Request::builder()
         .method(Method::HEAD)
         .uri(path)
         .header(HOST, host)
         .body(())
         .map_err(|_| Error::from("s3 backend: failed to build origin HEAD request"))?;
+    sign_request(&mut req, auth, now).map_err(Error::transport)?;
     Ok(serialize_request(&req))
 }
 
@@ -807,7 +867,15 @@ mod tests {
 
     #[test]
     fn get_request_has_expected_headers() {
-        let req = format_get_request("/bucket/key", "s3.example.com", 0, 4095).unwrap();
+        let req = format_get_request(
+            "/bucket/key",
+            "s3.example.com",
+            0,
+            4095,
+            None,
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.starts_with("GET /bucket/key HTTP/1.1\r\n"), "got: {s}");
         assert!(s.contains("host: s3.example.com\r\n"), "got: {s}");
@@ -820,7 +888,13 @@ mod tests {
 
     #[test]
     fn head_request_omits_range() {
-        let req = format_head_request("/bucket/key", "s3.example.com").unwrap();
+        let req = format_head_request(
+            "/bucket/key",
+            "s3.example.com",
+            None,
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.starts_with("HEAD /bucket/key HTTP/1.1\r\n"), "got: {s}");
         assert!(s.contains("host: s3.example.com\r\n"), "got: {s}");

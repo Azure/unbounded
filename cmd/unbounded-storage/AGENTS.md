@@ -308,12 +308,13 @@ iterate on one failing case without re-running the whole suite:
 The smoke test is the only test that exercises the real, fully linked
 binary across a process boundary. It brings up two `unbounded-storage`
 processes on loopback, wires them together over the real libfabric `tcp`
-fabric (file-backed disks, HTTP frontends, and a stub origin), then
+fabric (file-backed disks, HTTP/S3 frontends, stub HTTP origins, and a
+real Garage S3-compatible origin), then
 fetches an object through both frontends so the second fetch is served
 cross-node over a fabric RPC. It is the gate that catches integration
 breakage the in-process Rust tests cannot: FFI/ABI mismatches against
 the installed libfabric, provider negotiation, real socket addressing,
-and the lazy-connect retry paths.
+the lazy-connect retry paths, and S3 SigV4 compatibility with Garage.
 
 How to run it:
 
@@ -324,6 +325,9 @@ make unbounded-storage-smoke
 - The target depends on `unbounded-storage-build`, so it builds
   libfabric, OpenSSL, and the release binary first, then runs the
   harness.
+- Docker is required for the ephemeral `dxflrs/garage:v1.0.1` container
+  used by the authenticated S3 scenario. Override the image with
+  `SMOKE_STORAGE_GARAGE_IMAGE` when testing another Garage build.
 - `sudo` is required because the processes pin io_uring buffers and the
   harness raises `RLIMIT_MEMLOCK` (needs `CAP_SYS_RESOURCE`). The target
   runs the harness under `sudo` and re-applies the libfabric and OpenSSL
@@ -333,6 +337,9 @@ make unbounded-storage-smoke
   soname.
 - The `https` scenario exercises TLS 1.3 + kTLS against a stub origin,
   proving the bundled OpenSSL engages kTLS in both directions.
+- The `s3` scenario seeds Garage through its authenticated S3 API, then
+  verifies the storage backend can issue SigV4-signed `HEAD` and ranged
+  `GET` requests and return the complete object through both nodes.
 
 When to run it:
 

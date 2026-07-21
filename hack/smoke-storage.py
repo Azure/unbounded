@@ -6,14 +6,13 @@
 
 Brings up two `unbounded-storage` processes on loopback, joined into a
 two-node Chord ring over TCP RPC (libfabric), each with a file-backed
-block device and a frontend whose origin backend points at one shared
-stub origin served by this test.
+block device and a frontend whose origin backend points at a test origin.
 
 The test then fetches an object through *both* frontends and asserts the
-returned body matches the stub origin's payload. Because the object's
+returned body matches the seeded payload. Because the object's
 single stripe is owned by exactly one of the two nodes, the request to the
 non-owning frontend is necessarily routed over the fabric TCP RPC to the
-owning node, whose backend issues the outbound GET to the stub origin.
+owning node, whose backend issues the outbound GET to the origin.
 Querying both frontends therefore guarantees the cross-node RPC path is
 exercised without reimplementing the stripe-key hashing here.
 
@@ -22,15 +21,15 @@ frontend/backend implementations are covered against the real fabric:
 
   - `http`: the plain HTTP frontend backed by the HTTP origin backend
             over a plaintext `http://` origin.
-  - `s3`:   the native S3 frontend backed by the S3 origin backend
-            (unsigned/public-bucket mode, path-style `/bucket/key`).
+  - `s3`:   the native S3 frontend backed by a real Garage S3-compatible
+            server. Garage enforces SigV4 and serves the seeded object through
+            its production HEAD and ranged GET implementation.
   - `https`: the HTTP frontend backed by the HTTP origin backend over a
             TLS 1.3 `https://` origin that requires client certificate
             authentication. The backend drives an OpenSSL handshake and
             offloads the connection to kernel TLS (kTLS) so record payloads
-            land zero-copy in the page cache; the origin CA is pinned via
-            `ca_cert_path`, and the backend presents `client_cert_path` and
-            `client_key_path` for mTLS.
+            land zero-copy in the page cache; the origin CA and client
+            certificate/key PEM values are supplied inline in the TOML.
   - `loadgen`: the in-process load generator frontend backed by the
             synthetic fake backend, with results verified through the
             daemon's Prometheus metrics endpoint.
@@ -40,7 +39,8 @@ first configured spec wins), so the two kinds cannot share a ring; each
 scenario brings up its own fresh two-node ring on new ports and tears it
 down before the next.
 
-Pure Python 3 standard library; no pytest. Run directly:
+Pure Python 3 standard library; no pytest. Docker is required for the Garage
+container. Run directly:
 
     sudo python3 hack/smoke-storage.py
 
@@ -55,6 +55,8 @@ directly as child processes (the local-development path, unchanged).
 from __future__ import annotations
 
 import atexit
+import hashlib
+import hmac
 import http.server
 import os
 import resource
@@ -87,6 +89,7 @@ USE_SYSTEMD = os.environ.get("SMOKE_STORAGE_SYSTEMD", "0") == "1"
 INSTALL_SCRIPT = REPO_ROOT / "hack" / "scripts" / "install-unbounded-storage.sh"
 STORAGE_PREFIX = os.environ.get("SMOKE_STORAGE_PREFIX", "/opt/unbounded-storage")
 STORAGE_TARBALL = os.environ.get("SMOKE_STORAGE_TARBALL", "")
+GARAGE_IMAGE = os.environ.get("SMOKE_STORAGE_GARAGE_IMAGE", "dxflrs/garage:v1.0.1")
 
 
 def _openssl_bin() -> tuple[str, dict[str, str]]:
@@ -123,8 +126,8 @@ OPENSSL_BIN, OPENSSL_ENV = _openssl_bin()
 # once at startup. The server cert carries `subjectAltName=DNS:localhost`
 # (and IP:127.0.0.1) so the backend, which connects to
 # `https://localhost:<port>`, can verify the presented leaf against the CA
-# pinned as its `ca_cert_path`. The same CA signs the client cert the backend
-# presents for mTLS.
+# pinned inline as `ca_cert`. The same CA signs the client cert the backend
+# presents inline for mTLS.
 TLS_CA_CERT = TMPDIR / "origin-ca.pem"
 TLS_CA_KEY = TMPDIR / "origin-ca-key.pem"
 TLS_CERT = TMPDIR / "origin-cert.pem"
@@ -136,13 +139,19 @@ TLS_CLIENT_KEY = TMPDIR / "client-key.pem"
 # origin resolver lands on the HTTPS stub.
 TLS_ORIGIN_HOST = "localhost"
 
-# The objects served by the stub origin and requested through the
-# frontends, one per scenario. The S3 path is path-style (`/bucket/key`)
-# because the S3 frontend forwards the request path verbatim to the
-# origin as the object id; using a bucket-prefixed key exercises that.
+# The objects requested through the frontends, one per scenario. The S3 path
+# is path-style (`/bucket/key`) because the frontend forwards it verbatim.
 HTTP_OBJECT_PATH = "/smoke-object"
 S3_OBJECT_PATH = "/smoke-bucket/smoke-object"
-VALID_OBJECTS = frozenset({HTTP_OBJECT_PATH, S3_OBJECT_PATH})
+VALID_OBJECTS = frozenset({HTTP_OBJECT_PATH})
+
+# Deterministic Garage-valid credentials for the authenticated S3 smoke. They
+# are imported into an ephemeral loopback-only container and are not secrets.
+S3_REGION = "us-east-1"
+S3_ACCESS_KEY_ID = "GK0123456789abcdef01234567"
+S3_SECRET_ACCESS_KEY = (
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
 
 # A 1 GiB object. Built by tiling a fixed pattern so the body is fully
 # deterministic and verifiable, but cheap to construct. At this size the
@@ -195,6 +204,7 @@ DEVNULL = subprocess.DEVNULL
 
 # Every node brought up across all scenarios, for global teardown/log dump.
 _nodes: list[_Node] = []
+_garage_container: str | None = None
 
 # ============================================================================
 # LOGGING & UTILITIES
@@ -216,6 +226,14 @@ def dump_logs() -> None:
     """Best-effort dump of each node's log on failure."""
     for node in _nodes:
         node.dump_log()
+    if _garage_container is not None:
+        log(f"  --- docker logs {_garage_container} ---")
+        subprocess.run(
+            ["docker", "logs", "--tail", "200", _garage_container],
+            stdout=sys.stderr,
+            stderr=sys.stderr,
+            check=False,
+        )
     log("  --- end logs ---")
 
 
@@ -428,6 +446,7 @@ def cleanup() -> None:
     _cleaning_up = True
     log("Cleaning up...")
     terminate(_nodes)
+    stop_garage()
     restore_hugepages()
     shutil.rmtree(TMPDIR, ignore_errors=True)
 
@@ -549,10 +568,7 @@ class _OriginHandler(http.server.BaseHTTPRequestHandler):
     `HEAD` returns 200 with a Content-Length (the backend issues it to
     fill an object's content-addressed length entry), and ranged `GET`
     returns 206 with a matching Content-Range and body slice (used by the
-    backend on a data-stripe cache miss). Both the HTTP and the S3 origin
-    backends speak this same plaintext HTTP/1.1 shape; the S3 backend in
-    unsigned (public-bucket) mode adds no headers the origin must honor,
-    so one handler serves both scenarios.
+    backend on a data-stripe cache miss).
     """
 
     protocol_version = "HTTP/1.0"  # close per request, matching Connection: close
@@ -612,11 +628,204 @@ class _OriginHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(BODY)
 
 
+def _s3_signing_key(date: str) -> bytes:
+    date_key = hmac.new(
+        f"AWS4{S3_SECRET_ACCESS_KEY}".encode(), date.encode(), hashlib.sha256
+    ).digest()
+    region_key = hmac.new(date_key, S3_REGION.encode(), hashlib.sha256).digest()
+    service_key = hmac.new(region_key, b"s3", hashlib.sha256).digest()
+    return hmac.new(service_key, b"aws4_request", hashlib.sha256).digest()
+
+
+def _signed_s3_headers(method: str, target: str, host: str, payload_hash: str) -> dict[str, str]:
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    scope_date = amz_date[:8]
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_request = (
+        f"{method}\n"
+        f"{target}\n"
+        "\n"
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+        "\n"
+        f"{signed_headers}\n"
+        f"{payload_hash}"
+    )
+    scope = f"{scope_date}/{S3_REGION}/s3/aws4_request"
+    string_to_sign = (
+        f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n"
+        f"{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+    ).encode()
+    signature = hmac.new(_s3_signing_key(scope_date), string_to_sign, hashlib.sha256).hexdigest()
+    return {
+        "Authorization": (
+            "AWS4-HMAC-SHA256 "
+            f"Credential={S3_ACCESS_KEY_ID}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+        "Host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+
+
 def start_origin(port: int) -> http.server.ThreadingHTTPServer:
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), _OriginHandler)
     srv.requests = []  # type: ignore[attr-defined]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
+
+
+def _garage_exec(args: list[str], *, check: bool = True) -> str:
+    if _garage_container is None:
+        raise RuntimeError("Garage container is not running")
+    result = subprocess.run(
+        ["docker", "exec", _garage_container, "/garage", "-c", "/etc/garage.toml", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        die(
+            f"Garage command {' '.join(args)} failed ({result.returncode}): "
+            f"{result.stdout}{result.stderr}"
+        )
+    return result.stdout
+
+
+def start_garage(port: int) -> str:
+    """Start and bootstrap an ephemeral single-node Garage S3 server."""
+    global _garage_container
+
+    if shutil.which("docker") is None:
+        die("docker is required for the Garage-backed S3 smoke scenario")
+    if subprocess.run(
+        ["docker", "info"], stdout=DEVNULL, stderr=DEVNULL, check=False
+    ).returncode != 0:
+        die("docker is not running or accessible")
+
+    config = TMPDIR / "garage.toml"
+    config.write_text(
+        f'''metadata_dir = "/tmp/garage/meta"
+data_dir = "/tmp/garage/data"
+db_engine = "sqlite"
+replication_factor = 1
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[s3_api]
+s3_region = "{S3_REGION}"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "smoke-storage-admin-token"
+'''
+    )
+    name = f"unbounded-storage-smoke-garage-{os.getpid()}"
+    log(f"Starting Garage {GARAGE_IMAGE} on 127.0.0.1:{port}")
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-d",
+            "--name",
+            name,
+            "-p",
+            f"127.0.0.1:{port}:3900",
+            "-v",
+            f"{config}:/etc/garage.toml:ro",
+            GARAGE_IMAGE,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        die(f"failed to start Garage container: {result.stderr}")
+    _garage_container = name
+
+    wait_port("127.0.0.1", port)
+    deadline = time.monotonic() + 30
+    node_id = ""
+    while time.monotonic() < deadline:
+        output = _garage_exec(["node", "id", "-q"], check=False).strip()
+        if output:
+            node_id = output.split("@", 1)[0]
+            break
+        time.sleep(1)
+    if not node_id:
+        die("Garage node did not become ready within 30s")
+
+    _garage_exec(["layout", "assign", node_id, "-z", "dc1", "-c", "2G"])
+    _garage_exec(["layout", "apply", "--version", "1"])
+    _garage_exec(
+        [
+            "key",
+            "import",
+            S3_ACCESS_KEY_ID,
+            S3_SECRET_ACCESS_KEY,
+            "-n",
+            "smoke-storage",
+            "--yes",
+        ]
+    )
+    _garage_exec(["bucket", "create", "smoke-bucket"])
+    _garage_exec(
+        [
+            "bucket",
+            "allow",
+            "--read",
+            "--write",
+            "--owner",
+            "--key",
+            S3_ACCESS_KEY_ID,
+            "smoke-bucket",
+        ]
+    )
+
+    endpoint = f"http://127.0.0.1:{port}"
+    seed_garage(endpoint)
+    return endpoint
+
+
+def seed_garage(endpoint: str) -> None:
+    """Upload the smoke object to Garage through its authenticated S3 API."""
+    host = endpoint.removeprefix("http://")
+    payload_hash = hashlib.sha256(BODY).hexdigest()
+    headers = _signed_s3_headers("PUT", S3_OBJECT_PATH, host, payload_hash)
+    request = urllib.request.Request(
+        f"{endpoint}{S3_OBJECT_PATH}",
+        data=BODY,
+        headers=headers,
+        method="PUT",
+    )
+    log(f"Seeding Garage object {S3_OBJECT_PATH} ({len(BODY)} bytes)")
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            if response.status != 200:
+                die(f"Garage PUT returned status {response.status}, expected 200")
+    except urllib.error.HTTPError as e:
+        die(f"Garage PUT returned status {e.code}: {e.read().decode(errors='replace')}")
+    except (urllib.error.URLError, OSError) as e:
+        die(f"Garage PUT failed: {e}")
+
+
+def stop_garage() -> None:
+    global _garage_container
+    if _garage_container is None:
+        return
+    subprocess.run(
+        ["docker", "rm", "-f", _garage_container],
+        stdout=DEVNULL,
+        stderr=DEVNULL,
+        check=False,
+    )
+    _garage_container = None
 
 
 def run_openssl(args: list[str], description: str) -> None:
@@ -766,10 +975,11 @@ def write_config(
     frontend_addr: str,
     fabric_addr: str,
     metrics_addr: str,
-    ca_cert_path: Path | None = None,
+    ca_cert: Path | None = None,
     insecure_skip_verify: bool = False,
-    client_cert_path: Path | None = None,
-    client_key_path: Path | None = None,
+    client_cert: Path | None = None,
+    client_key: Path | None = None,
+    s3_auth: bool = False,
 ) -> None:
     # The config schema is proto3-native: byte sizes are plain integer
     # byte counts (see api/unbounded-storage/config.proto).
@@ -786,14 +996,22 @@ def write_config(
     # plaintext scenarios keep validating as plaintext (the daemon rejects
     # TLS knobs on an http:// endpoint).
     tls_lines = ""
-    if ca_cert_path is not None:
-        tls_lines += f'ca_cert_path = "{ca_cert_path}"\n'
+    if ca_cert is not None:
+        tls_lines += _toml_multiline_literal("ca_cert", ca_cert.read_text())
     if insecure_skip_verify:
         tls_lines += "insecure_skip_verify = true\n"
-    if client_cert_path is not None:
-        tls_lines += f'client_cert_path = "{client_cert_path}"\n'
-    if client_key_path is not None:
-        tls_lines += f'client_key_path = "{client_key_path}"\n'
+    if client_cert is not None:
+        tls_lines += _toml_multiline_literal("client_cert", client_cert.read_text())
+    if client_key is not None:
+        tls_lines += _toml_multiline_literal("client_key", client_key.read_text())
+    auth_lines = ""
+    if s3_auth:
+        if kind != "s3":
+            raise ValueError("s3_auth requires an s3 backend")
+        auth_lines = f'''region = "{S3_REGION}"
+access_key_id = "{S3_ACCESS_KEY_ID}"
+secret_access_key = "{S3_SECRET_ACCESS_KEY}"
+'''
     path.write_text(
         f"""\
 self = "{self_name}"
@@ -805,6 +1023,7 @@ name = "origin"
 url = "{origin_addr}"
 stripe_size_bytes = {STRIPE_SIZE}
 {tls_lines}
+{auth_lines}
 
 [[peers]]
 name = "{self_name}"
@@ -866,6 +1085,13 @@ disable_rdma = true
 serving_cores = 2
 """
     )
+
+
+def _toml_multiline_literal(name: str, value: str) -> str:
+    """Encode PEM text exactly as a TOML multiline literal string."""
+    if "'''" in value:
+        raise ValueError(f"{name} contains the TOML multiline literal delimiter")
+    return f"{name} = '''{value}'''\n"
 
 
 def write_loadgen_config(
@@ -1099,24 +1325,25 @@ def run_scenario(
     kind: str,
     origin_addr: str,
     object_path: str,
-    origin: Any,
+    origin: Any | None,
     *,
-    ca_cert_path: Path | None = None,
+    ca_cert: Path | None = None,
     insecure_skip_verify: bool = False,
-    client_cert_path: Path | None = None,
-    client_key_path: Path | None = None,
+    client_cert: Path | None = None,
+    client_key: Path | None = None,
+    s3_auth: bool = False,
 ) -> None:
     """Bring up a fresh two-node ring of frontend/backend *kind* and fetch.
 
     Spawns its own two `unbounded-storage` processes on new ports, fetches
-    *object_path* through both frontends (asserting body and a cross-node
-    origin GET), then tears the ring down. *origin* is the shared stub
-    origin; its recorded requests are reset so the GET assertion is scoped
-    to this scenario. *name* labels the scenario and namespaces its temp
+    *object_path* through both frontends, and then tears the ring down.
+    When *origin* is the local HTTP stub, its recorded requests prove the
+    backend path was exercised. A real compatibility origin such as Garage
+    can pass None because returning the seeded body is the assertion. *name*
+    labels the scenario and namespaces its temp
     files (so two scenarios of the same *kind*, e.g. plaintext vs TLS http,
-    do not collide). The TLS path parameters configure the origin backend's
-    certificate verification and optional client certificate for `https://`
-    endpoints.
+    do not collide). The TLS file parameters are read and embedded as inline
+    PEM. *s3_auth* adds deterministic Garage credentials to the backend.
     """
     log("")
     log(f"=== Scenario: {name} ({kind} frontend + {kind} backend) ===")
@@ -1141,10 +1368,11 @@ def run_scenario(
         frontend_addr=f"127.0.0.1:{fe_a}",
         fabric_addr=f"127.0.0.1:{fab_a}",
         metrics_addr=f"127.0.0.1:{met_a}",
-        ca_cert_path=ca_cert_path,
+        ca_cert=ca_cert,
         insecure_skip_verify=insecure_skip_verify,
-        client_cert_path=client_cert_path,
-        client_key_path=client_key_path,
+        client_cert=client_cert,
+        client_key=client_key,
+        s3_auth=s3_auth,
     )
     write_config(
         cfg2,
@@ -1157,10 +1385,11 @@ def run_scenario(
         frontend_addr=f"127.0.0.1:{fe_b}",
         fabric_addr=f"127.0.0.1:{fab_b}",
         metrics_addr=f"127.0.0.1:{met_b}",
-        ca_cert_path=ca_cert_path,
+        ca_cert=ca_cert,
         insecure_skip_verify=insecure_skip_verify,
-        client_cert_path=client_cert_path,
-        client_key_path=client_key_path,
+        client_cert=client_cert,
+        client_key=client_key,
+        s3_auth=s3_auth,
     )
 
     try:
@@ -1174,8 +1403,8 @@ def run_scenario(
         log("  Letting fabric peers establish...")
         time.sleep(3)
 
-        # Scope the origin GET assertion to this scenario's requests.
-        origin.requests = []
+        if origin is not None:
+            origin.requests = []
 
         corrupt: dict[str, set[int]] = {}
         for label, fe_port in (("A", fe_a), ("B", fe_b)):
@@ -1193,15 +1422,20 @@ def run_scenario(
             _report_corruption(corrupt)
             die("body mismatch (see corruption analysis above)")
 
-        # The stub origin must have been hit, proving traffic traversed
-        # frontend -> storage stack -> {kind} backend -> origin.
-        gets = [r for r in origin.requests if r[0] == "GET" and r[1] == object_path]
-        if not gets:
-            die(
-                f"stub origin received no GET for {object_path}; "
-                f"the {kind} backend was not exercised"
-            )
-        log(f"  stub origin served {len(gets)} backend GET(s)")
+        if origin is not None:
+            # The stub origin must have been hit, proving traffic traversed
+            # frontend -> storage stack -> backend -> origin.
+            gets = [
+                r for r in origin.requests if r[0] == "GET" and r[1] == object_path
+            ]
+            if not gets:
+                die(
+                    f"stub origin received no GET for {object_path}; "
+                    f"the {kind} backend was not exercised"
+                )
+            log(f"  stub origin served {len(gets)} backend GET(s)")
+        elif s3_auth:
+            log("  Garage accepted authenticated HEAD and ranged GET requests")
 
         # Scrape each node's Prometheus exporter and assert the frontend
         # request counter advanced. Each frontend served exactly one direct
@@ -1357,7 +1591,7 @@ def main() -> None:
     log("Starting stub origin HTTP server")
     origin = start_origin(origin_port)
 
-    # Second stub origin, TLS-wrapped, for the kTLS scenario. The backend
+    # Second stub origin, TLS-wrapped, for the HTTPS scenario. The backend
     # reaches it as `https://localhost:<port>`; `localhost` resolves to the
     # loopback the server binds and matches the cert SAN.
     generate_tls_certs()
@@ -1372,16 +1606,27 @@ def main() -> None:
     # frontend/backend kinds never share a process (only the first
     # configured frontend is served per process).
     run_scenario("http", "http", origin_addr, HTTP_OBJECT_PATH, origin)
-    run_scenario("s3", "s3", origin_addr, S3_OBJECT_PATH, origin)
+    garage_addr = start_garage(free_port())
+    try:
+        run_scenario(
+            "s3",
+            "s3",
+            garage_addr,
+            S3_OBJECT_PATH,
+            None,
+            s3_auth=True,
+        )
+    finally:
+        stop_garage()
     run_scenario(
         "https",
         "http",
         tls_origin_addr,
         HTTP_OBJECT_PATH,
         tls_origin,
-        ca_cert_path=TLS_CA_CERT,
-        client_cert_path=TLS_CLIENT_CERT,
-        client_key_path=TLS_CLIENT_KEY,
+        ca_cert=TLS_CA_CERT,
+        client_cert=TLS_CLIENT_CERT,
+        client_key=TLS_CLIENT_KEY,
     )
     run_loadgen_scenario()
 

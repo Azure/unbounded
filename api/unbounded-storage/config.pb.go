@@ -1582,15 +1582,15 @@ type HttpBackendConfig struct {
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
-	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
-	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	// Optional inline PEM CA certificate bundle used instead of host trust roots for TLS verification.
+	CaCert *string `protobuf:"bytes,4,opt,name=ca_cert,json=caCert,proto3,oneof" json:"ca_cert,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert.
 	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
-	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
-	// Must be set together with client_key_path.
-	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
-	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
-	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	// Optional inline PEM client certificate chain presented for TLS client authentication.
+	// Must be set together with client_key.
+	ClientCert *string `protobuf:"bytes,6,opt,name=client_cert,json=clientCert,proto3,oneof" json:"client_cert,omitempty"`
+	// Optional inline PEM private key for client_cert. Must be set together with client_cert.
+	ClientKey     *string `protobuf:"bytes,7,opt,name=client_key,json=clientKey,proto3,oneof" json:"client_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1646,9 +1646,9 @@ func (x *HttpBackendConfig) GetHttpConcurrency() uint32 {
 	return 0
 }
 
-func (x *HttpBackendConfig) GetCaCertPath() string {
-	if x != nil && x.CaCertPath != nil {
-		return *x.CaCertPath
+func (x *HttpBackendConfig) GetCaCert() string {
+	if x != nil && x.CaCert != nil {
+		return *x.CaCert
 	}
 	return ""
 }
@@ -1660,16 +1660,16 @@ func (x *HttpBackendConfig) GetInsecureSkipVerify() bool {
 	return false
 }
 
-func (x *HttpBackendConfig) GetClientCertPath() string {
-	if x != nil && x.ClientCertPath != nil {
-		return *x.ClientCertPath
+func (x *HttpBackendConfig) GetClientCert() string {
+	if x != nil && x.ClientCert != nil {
+		return *x.ClientCert
 	}
 	return ""
 }
 
-func (x *HttpBackendConfig) GetClientKeyPath() string {
-	if x != nil && x.ClientKeyPath != nil {
-		return *x.ClientKeyPath
+func (x *HttpBackendConfig) GetClientKey() string {
+	if x != nil && x.ClientKey != nil {
+		return *x.ClientKey
 	}
 	return ""
 }
@@ -1684,15 +1684,23 @@ type S3BackendConfig struct {
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
-	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
-	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	// Optional inline PEM CA certificate bundle used instead of host trust roots for TLS verification.
+	CaCert *string `protobuf:"bytes,4,opt,name=ca_cert,json=caCert,proto3,oneof" json:"ca_cert,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert.
 	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
-	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
-	// Must be set together with client_key_path.
-	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
-	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
-	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	// Optional inline PEM client certificate chain presented for TLS client authentication.
+	// Must be set together with client_key.
+	ClientCert *string `protobuf:"bytes,6,opt,name=client_cert,json=clientCert,proto3,oneof" json:"client_cert,omitempty"`
+	// Optional inline PEM private key for client_cert. Must be set together with client_cert.
+	ClientKey *string `protobuf:"bytes,7,opt,name=client_key,json=clientKey,proto3,oneof" json:"client_key,omitempty"`
+	// AWS region used for Signature Version 4. Required with static credentials.
+	Region *string `protobuf:"bytes,8,opt,name=region,proto3,oneof" json:"region,omitempty"`
+	// Static S3 access key ID. Must be set together with region and secret_access_key.
+	AccessKeyId *string `protobuf:"bytes,9,opt,name=access_key_id,json=accessKeyId,proto3,oneof" json:"access_key_id,omitempty"`
+	// Static S3 secret access key. Must be set together with region and access_key_id.
+	SecretAccessKey *string `protobuf:"bytes,10,opt,name=secret_access_key,json=secretAccessKey,proto3,oneof" json:"secret_access_key,omitempty"`
+	// Optional session token for temporary static credentials.
+	SessionToken  *string `protobuf:"bytes,11,opt,name=session_token,json=sessionToken,proto3,oneof" json:"session_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1748,9 +1756,9 @@ func (x *S3BackendConfig) GetHttpConcurrency() uint32 {
 	return 0
 }
 
-func (x *S3BackendConfig) GetCaCertPath() string {
-	if x != nil && x.CaCertPath != nil {
-		return *x.CaCertPath
+func (x *S3BackendConfig) GetCaCert() string {
+	if x != nil && x.CaCert != nil {
+		return *x.CaCert
 	}
 	return ""
 }
@@ -1762,16 +1770,44 @@ func (x *S3BackendConfig) GetInsecureSkipVerify() bool {
 	return false
 }
 
-func (x *S3BackendConfig) GetClientCertPath() string {
-	if x != nil && x.ClientCertPath != nil {
-		return *x.ClientCertPath
+func (x *S3BackendConfig) GetClientCert() string {
+	if x != nil && x.ClientCert != nil {
+		return *x.ClientCert
 	}
 	return ""
 }
 
-func (x *S3BackendConfig) GetClientKeyPath() string {
-	if x != nil && x.ClientKeyPath != nil {
-		return *x.ClientKeyPath
+func (x *S3BackendConfig) GetClientKey() string {
+	if x != nil && x.ClientKey != nil {
+		return *x.ClientKey
+	}
+	return ""
+}
+
+func (x *S3BackendConfig) GetRegion() string {
+	if x != nil && x.Region != nil {
+		return *x.Region
+	}
+	return ""
+}
+
+func (x *S3BackendConfig) GetAccessKeyId() string {
+	if x != nil && x.AccessKeyId != nil {
+		return *x.AccessKeyId
+	}
+	return ""
+}
+
+func (x *S3BackendConfig) GetSecretAccessKey() string {
+	if x != nil && x.SecretAccessKey != nil {
+		return *x.SecretAccessKey
+	}
+	return ""
+}
+
+func (x *S3BackendConfig) GetSessionToken() string {
+	if x != nil && x.SessionToken != nil {
+		return *x.SessionToken
 	}
 	return ""
 }
@@ -1786,15 +1822,15 @@ type AzureBackendConfig struct {
 	StripeSizeBytes *uint64 `protobuf:"varint,2,opt,name=stripe_size_bytes,json=stripeSizeBytes,proto3,oneof" json:"stripe_size_bytes,omitempty"`
 	// Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
 	HttpConcurrency *uint32 `protobuf:"varint,3,opt,name=http_concurrency,json=httpConcurrency,proto3,oneof" json:"http_concurrency,omitempty"`
-	// Optional CA certificate bundle/path used for TLS verification on `https://` origins.
-	CaCertPath *string `protobuf:"bytes,4,opt,name=ca_cert_path,json=caCertPath,proto3,oneof" json:"ca_cert_path,omitempty"`
-	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+	// Optional inline PEM CA certificate bundle used instead of host trust roots for TLS verification.
+	CaCert *string `protobuf:"bytes,4,opt,name=ca_cert,json=caCert,proto3,oneof" json:"ca_cert,omitempty"`
+	// Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert.
 	InsecureSkipVerify bool `protobuf:"varint,5,opt,name=insecure_skip_verify,json=insecureSkipVerify,proto3" json:"insecure_skip_verify,omitempty"`
-	// Optional PEM client certificate presented for TLS client authentication on `https://` origins.
-	// Must be set together with client_key_path.
-	ClientCertPath *string `protobuf:"bytes,6,opt,name=client_cert_path,json=clientCertPath,proto3,oneof" json:"client_cert_path,omitempty"`
-	// Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
-	ClientKeyPath *string `protobuf:"bytes,7,opt,name=client_key_path,json=clientKeyPath,proto3,oneof" json:"client_key_path,omitempty"`
+	// Optional inline PEM client certificate chain presented for TLS client authentication.
+	// Must be set together with client_key.
+	ClientCert *string `protobuf:"bytes,6,opt,name=client_cert,json=clientCert,proto3,oneof" json:"client_cert,omitempty"`
+	// Optional inline PEM private key for client_cert. Must be set together with client_cert.
+	ClientKey     *string `protobuf:"bytes,7,opt,name=client_key,json=clientKey,proto3,oneof" json:"client_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1850,9 +1886,9 @@ func (x *AzureBackendConfig) GetHttpConcurrency() uint32 {
 	return 0
 }
 
-func (x *AzureBackendConfig) GetCaCertPath() string {
-	if x != nil && x.CaCertPath != nil {
-		return *x.CaCertPath
+func (x *AzureBackendConfig) GetCaCert() string {
+	if x != nil && x.CaCert != nil {
+		return *x.CaCert
 	}
 	return ""
 }
@@ -1864,16 +1900,16 @@ func (x *AzureBackendConfig) GetInsecureSkipVerify() bool {
 	return false
 }
 
-func (x *AzureBackendConfig) GetClientCertPath() string {
-	if x != nil && x.ClientCertPath != nil {
-		return *x.ClientCertPath
+func (x *AzureBackendConfig) GetClientCert() string {
+	if x != nil && x.ClientCert != nil {
+		return *x.ClientCert
 	}
 	return ""
 }
 
-func (x *AzureBackendConfig) GetClientKeyPath() string {
-	if x != nil && x.ClientKeyPath != nil {
-		return *x.ClientKeyPath
+func (x *AzureBackendConfig) GetClientKey() string {
+	if x != nil && x.ClientKey != nil {
+		return *x.ClientKey
 	}
 	return ""
 }
@@ -2413,49 +2449,64 @@ const file_config_proto_rawDesc = "" +
 	"\x02s3\x18\x03 \x01(\v2).unbounded.storage.config.S3BackendConfigH\x00R\x02s3\x12D\n" +
 	"\x05azure\x18\x04 \x01(\v2,.unbounded.storage.config.AzureBackendConfigH\x00R\x05azure\x12A\n" +
 	"\x04fake\x18\x05 \x01(\v2+.unbounded.storage.config.FakeBackendConfigH\x00R\x04fakeB\b\n" +
-	"\x06config\"\xa0\x03\n" +
+	"\x06config\"\xf6\x02\n" +
 	"\x11HttpBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
-	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
-	"caCertPath\x88\x01\x01\x120\n" +
-	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
-	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12\x1c\n" +
+	"\aca_cert\x18\x04 \x01(\tH\x02R\x06caCert\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12$\n" +
+	"\vclient_cert\x18\x06 \x01(\tH\x03R\n" +
+	"clientCert\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"client_key\x18\a \x01(\tH\x04R\tclientKey\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrencyB\x0f\n" +
-	"\r_ca_cert_pathB\x13\n" +
-	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_path\"\x9e\x03\n" +
+	"\x11_http_concurrencyB\n" +
+	"\n" +
+	"\b_ca_certB\x0e\n" +
+	"\f_client_certB\r\n" +
+	"\v_client_key\"\xda\x04\n" +
 	"\x0fS3BackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
-	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
-	"caCertPath\x88\x01\x01\x120\n" +
-	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
-	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12\x1c\n" +
+	"\aca_cert\x18\x04 \x01(\tH\x02R\x06caCert\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12$\n" +
+	"\vclient_cert\x18\x06 \x01(\tH\x03R\n" +
+	"clientCert\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"client_key\x18\a \x01(\tH\x04R\tclientKey\x88\x01\x01\x12\x1b\n" +
+	"\x06region\x18\b \x01(\tH\x05R\x06region\x88\x01\x01\x12'\n" +
+	"\raccess_key_id\x18\t \x01(\tH\x06R\vaccessKeyId\x88\x01\x01\x12/\n" +
+	"\x11secret_access_key\x18\n" +
+	" \x01(\tH\aR\x0fsecretAccessKey\x88\x01\x01\x12(\n" +
+	"\rsession_token\x18\v \x01(\tH\bR\fsessionToken\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrencyB\x0f\n" +
-	"\r_ca_cert_pathB\x13\n" +
-	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_path\"\xa1\x03\n" +
+	"\x11_http_concurrencyB\n" +
+	"\n" +
+	"\b_ca_certB\x0e\n" +
+	"\f_client_certB\r\n" +
+	"\v_client_keyB\t\n" +
+	"\a_regionB\x10\n" +
+	"\x0e_access_key_idB\x14\n" +
+	"\x12_secret_access_keyB\x10\n" +
+	"\x0e_session_token\"\xf7\x02\n" +
 	"\x12AzureBackendConfig\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12/\n" +
 	"\x11stripe_size_bytes\x18\x02 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12.\n" +
-	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12%\n" +
-	"\fca_cert_path\x18\x04 \x01(\tH\x02R\n" +
-	"caCertPath\x88\x01\x01\x120\n" +
-	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12-\n" +
-	"\x10client_cert_path\x18\x06 \x01(\tH\x03R\x0eclientCertPath\x88\x01\x01\x12+\n" +
-	"\x0fclient_key_path\x18\a \x01(\tH\x04R\rclientKeyPath\x88\x01\x01B\x14\n" +
+	"\x10http_concurrency\x18\x03 \x01(\rH\x01R\x0fhttpConcurrency\x88\x01\x01\x12\x1c\n" +
+	"\aca_cert\x18\x04 \x01(\tH\x02R\x06caCert\x88\x01\x01\x120\n" +
+	"\x14insecure_skip_verify\x18\x05 \x01(\bR\x12insecureSkipVerify\x12$\n" +
+	"\vclient_cert\x18\x06 \x01(\tH\x03R\n" +
+	"clientCert\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"client_key\x18\a \x01(\tH\x04R\tclientKey\x88\x01\x01B\x14\n" +
 	"\x12_stripe_size_bytesB\x13\n" +
-	"\x11_http_concurrencyB\x0f\n" +
-	"\r_ca_cert_pathB\x13\n" +
-	"\x11_client_cert_pathB\x12\n" +
-	"\x10_client_key_path\"\xa1\x01\n" +
+	"\x11_http_concurrencyB\n" +
+	"\n" +
+	"\b_ca_certB\x0e\n" +
+	"\f_client_certB\r\n" +
+	"\v_client_key\"\xa1\x01\n" +
 	"\x11FakeBackendConfig\x12/\n" +
 	"\x11stripe_size_bytes\x18\x01 \x01(\x04H\x00R\x0fstripeSizeBytes\x88\x01\x01\x12/\n" +
 	"\x11object_size_bytes\x18\x02 \x01(\x04H\x01R\x0fobjectSizeBytes\x88\x01\x01B\x14\n" +

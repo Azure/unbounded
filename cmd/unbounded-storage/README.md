@@ -105,7 +105,7 @@ fingers_per_node = 100           # routing finger-table fanout per node.
 name = "origin"
 
 [backends.config.http]
-url = "origin.example.com:80"    # host:port resolved for origin fetches.
+url = "http://origin.example.com:80" # authority-only origin URL.
 stripe_size_bytes = 4194304      # optional; must be a power of two.
 
 # Optional. Disjoint discovery: configure this node with ONLY its direct
@@ -191,4 +191,56 @@ ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.
 include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU 0.
 allow_inactive_port   = false    # use HCA ports not in the active state.
 disable_rdma          = false    # disable RDMA and force the libfabric tcp provider.
+```
+
+### Origin authentication and TLS
+
+HTTP, S3, and Azure backend URLs must contain only a scheme and authority, with
+an optional root `/`. User information, non-root paths, queries, and fragments
+are rejected. Object paths come from frontend requests.
+
+S3 backends use anonymous requests when all authentication fields are omitted.
+Set `region`, `access_key_id`, and `secret_access_key` together to sign GET and
+HEAD requests with AWS Signature Version 4. `session_token` is optional:
+
+```toml
+[[backends]]
+name = "origin"
+
+[backends.config.s3]
+url = "https://s3.us-west-2.amazonaws.com"
+region = "us-west-2"
+access_key_id = "example-access-key"
+secret_access_key = "example-secret-key"
+# session_token = "example-session-token"
+```
+
+These static credentials are stored directly in TOML or binary protobuf. When
+the supervisor renders them from YAML, they also reside in its Kubernetes
+ConfigMap. Protect access to those files and objects accordingly.
+
+For every HTTPS origin, certificate and hostname verification use the host CA
+trust by default. `ca_cert` replaces the host roots for that backend with an
+inline PEM bundle. `client_cert` and `client_key` configure mTLS and must be set
+together as inline PEM. `insecure_skip_verify = true` disables certificate and
+hostname verification and cannot be combined with `ca_cert`.
+
+```toml
+[backends.config.s3]
+url = "https://objects.example.com"
+region = "us-east-1"
+access_key_id = "example-access-key"
+secret_access_key = "example-secret-key"
+ca_cert = """-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+"""
+client_cert = """-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+"""
+client_key = """-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----
+"""
 ```

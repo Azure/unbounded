@@ -454,7 +454,11 @@ These are symmetric twins around the buffer pool.
   Stream` resolves a `BulkRef` from the authoritative **origin** into
   destination pages, one page at a time (contrast `Transport`, which pulls from
   a peer). `HttpBackend` (Linux) memcpys origin bytes into pages carved from the
-  backing and holds an `Rc<socket>`. `NullBackend` is the no-op.
+  backing and holds an `Rc<socket>`. `S3Backend` optionally signs bodyless GET
+  and HEAD requests with static AWS Signature Version 4 credentials; it signs
+  the exact request that the shared HTTP serializer writes, including ranged
+  GETs. Omitting every S3 authentication field preserves anonymous access.
+  `NullBackend` is the no-op.
 - Frontend (client side): concrete `HttpFrontend`/`S3Frontend` (Linux), built
   from a `FrontendSpec` via `from_spec`, that bind a listener once per shard with
   `SO_REUSEPORT` (`bind_listener`) and produce a per-shard `HttpDriver`/`S3Driver`.
@@ -617,7 +621,11 @@ Sections (all optional, each falling back to defaults):
 - `version` - top-level opaque `u64` config version (0 = unversioned).
 - `[[backends]]` - `name` and one `config` table: `http`, `s3`, or `azure`
   with a required `url`, or `fake` for synthetic objects. Backend stripe size
-  must be a power of two.
+  must be a power of two. Origin URLs are authority-only. S3 authentication is
+  either fully anonymous or static SigV4 credentials consisting of `region`,
+  `access_key_id`, `secret_access_key`, and an optional `session_token`.
+  Credentials are part of the config itself and credential-only changes replace
+  the live backend.
 - `self`, `fingers_per_node` (100), optional `[routing_plan]` (`fingers`,
   `successor`, `predecessor`), and `[[peers]]` define the process-wide
   transport mesh. `self` selects the local peer by name; internal fabric peer
@@ -682,7 +690,10 @@ ships, exposing OpenSSL macro-only entry points as linkable functions, compiled
 by `build.rs`). Public surface: `TlsConfig`/`TlsContext`, with
 `recv_chunk`/`recv_fixed` re-exported `pub(crate)` for the backends. See the
 OpenSSL dependency note in `AGENTS.md` for why a pinned OpenSSL >= 3.5 is
-required (kTLS receive on TLS 1.3).
+required (kTLS receive on TLS 1.3). Verification uses the local host trust when
+`ca_cert` is absent. An inline PEM `ca_cert` replaces host roots for that
+backend; inline `client_cert` and `client_key` configure mTLS. Trust and client
+material are parsed from memory and are never written to temporary files.
 
 ## 8. Concurrency Model Summary
 
@@ -736,9 +747,10 @@ Four complementary layers:
    `bufferpool`, `fabric`, `p2p`, `page_channel`, and `storage` (the last with
    `oracle.rs` and `recovery.rs`).
 4. **End-to-end smoke test** - `hack/smoke-storage.py` runs two real binaries on
-   loopback over real libfabric tcp, with file-backed disks, HTTP frontends, and
-   a stub origin, exercising a cross-node fabric RPC fetch. It needs `sudo` (to
-   pin io_uring buffers and raise `RLIMIT_MEMLOCK`) and runs in CI
-   (`.github/workflows/smoke-storage.yaml`). Run it after any change to the
-   fabric layer, `shim.c`, the FFI, the `main.rs` wiring, or the libfabric
-   version.
+    loopback over real libfabric tcp, with file-backed disks, stub HTTP origins,
+    and an ephemeral Garage S3-compatible server. It exercises cross-node
+    fabric RPC fetches, authenticated S3 `HEAD` and ranged `GET` compatibility,
+    and HTTPS kTLS. It needs Docker and `sudo` (to pin io_uring buffers and raise
+    `RLIMIT_MEMLOCK`) and runs in CI (`.github/workflows/smoke-storage.yaml`). Run
+    it after any change to the fabric layer, S3 signing, `shim.c`, the FFI, the
+    `main.rs` wiring, or the libfabric version.

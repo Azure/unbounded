@@ -39,8 +39,12 @@ pub struct LoadedConfig {
 impl fmt::Debug for LoadedConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoadedConfig")
-            .field("config", &self.config)
-            .field("runtime", &self.runtime)
+            .field("version", &self.config.version)
+            .field("backend_count", &self.config.backends.len())
+            .field("frontend_count", &self.config.frontends.len())
+            .field("cache_count", &self.config.caches.len())
+            .field("disk_count", &self.config.disks.len())
+            .field("peer_count", &self.config.peers.len())
             .field("route_cache_ids", &self.routes.cache_ids)
             .field("has_fingers", &self.routes.fingers.is_some())
             .finish()
@@ -84,7 +88,9 @@ impl LoadedConfig {
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
-    Toml(toml::de::Error),
+    Toml {
+        span: Option<std::ops::Range<usize>>,
+    },
     Protobuf(prost::DecodeError),
     DuplicateDiskPath(String),
     MissingFileDiskSize(String),
@@ -132,12 +138,24 @@ pub enum ConfigError {
     EmptyBackendUrl(String),
     InvalidBackendUrl {
         backend_name: String,
-        url: String,
         reason: String,
     },
     ConflictingTlsConfig(String),
     IncompleteTlsClientAuth(String),
+    EmptyTlsValue {
+        backend_name: String,
+        field: &'static str,
+    },
     PlaintextTlsConfig(String),
+    MissingS3AuthField {
+        backend_name: String,
+        field: &'static str,
+    },
+    S3SessionTokenWithoutCredentials(String),
+    EmptyS3AuthValue {
+        backend_name: String,
+        field: &'static str,
+    },
     EmptyFrontendAddr(String),
     StripeSizeNotPowerOfTwo {
         backend_name: String,
@@ -164,7 +182,10 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::Io(e) => write!(f, "io error reading config: {e}"),
-            ConfigError::Toml(e) => write!(f, "toml parse error: {e}"),
+            ConfigError::Toml { span: Some(span) } => {
+                write!(f, "toml parse error at bytes {}..{}", span.start, span.end)
+            }
+            ConfigError::Toml { span: None } => write!(f, "toml parse error"),
             ConfigError::Protobuf(e) => write!(f, "protobuf decode error: {e}"),
             ConfigError::DuplicateDiskPath(p) => {
                 write!(f, "duplicate disk path: {p}")
@@ -247,20 +268,44 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::InvalidBackendUrl {
                 backend_name,
-                url,
                 reason,
-            } => write!(f, "backend {backend_name:?}: invalid url {url:?}: {reason}"),
+            } => write!(f, "backend {backend_name:?}: invalid url: {reason}"),
             ConfigError::ConflictingTlsConfig(name) => write!(
                 f,
-                "backend {name:?}: ca_cert_path and insecure_skip_verify are mutually exclusive"
+                "backend {name:?}: ca_cert and insecure_skip_verify are mutually exclusive"
             ),
             ConfigError::IncompleteTlsClientAuth(name) => write!(
                 f,
-                "backend {name:?}: client_cert_path and client_key_path must be set together"
+                "backend {name:?}: client_cert and client_key must be set together"
+            ),
+            ConfigError::EmptyTlsValue {
+                backend_name,
+                field,
+            } => write!(
+                f,
+                "backend {backend_name:?}: TLS field {field} must not be empty or whitespace"
             ),
             ConfigError::PlaintextTlsConfig(name) => {
                 write!(f, "backend {name:?}: TLS settings require an https url")
             }
+            ConfigError::MissingS3AuthField {
+                backend_name,
+                field,
+            } => write!(
+                f,
+                "backend {backend_name:?}: S3 static authentication requires {field}"
+            ),
+            ConfigError::S3SessionTokenWithoutCredentials(name) => write!(
+                f,
+                "backend {name:?}: S3 session_token requires region, access_key_id, and secret_access_key"
+            ),
+            ConfigError::EmptyS3AuthValue {
+                backend_name,
+                field,
+            } => write!(
+                f,
+                "backend {backend_name:?}: S3 authentication field {field} must not be empty or whitespace"
+            ),
             ConfigError::EmptyFrontendAddr(id) => {
                 write!(f, "frontend {id:?}: addr must not be empty")
             }
@@ -310,7 +355,6 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::Io(e) => Some(e),
-            ConfigError::Toml(e) => Some(e),
             ConfigError::Protobuf(e) => Some(e),
             _ => None,
         }
@@ -325,7 +369,7 @@ impl From<io::Error> for ConfigError {
 
 impl From<toml::de::Error> for ConfigError {
     fn from(e: toml::de::Error) -> Self {
-        ConfigError::Toml(e)
+        ConfigError::Toml { span: e.span() }
     }
 }
 
@@ -371,10 +415,10 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 validate_backend_url(
                     &b.name,
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -382,21 +426,22 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 validate_backend_url(
                     &b.name,
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
+                validate_s3_auth(&b.name, cfg)?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
             Some(backend_spec::Config::Azure(cfg)) => {
                 validate_backend_url(
                     &b.name,
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -475,10 +520,10 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
 fn validate_backend_url(
     backend_name: &str,
     url: &str,
-    ca_cert_path: &Option<String>,
+    ca_cert: &Option<String>,
     insecure_skip_verify: bool,
-    client_cert_path: &Option<String>,
-    client_key_path: &Option<String>,
+    client_cert: &Option<String>,
+    client_key: &Option<String>,
 ) -> Result<(), ConfigError> {
     if url.is_empty() {
         return Err(ConfigError::EmptyBackendUrl(backend_name.to_string()));
@@ -486,24 +531,83 @@ fn validate_backend_url(
     let parsed =
         crate::backend::url::parse_endpoint(url).map_err(|e| ConfigError::InvalidBackendUrl {
             backend_name: backend_name.to_string(),
-            url: url.to_string(),
             reason: e.to_string(),
         })?;
-    if ca_cert_path.is_some() && insecure_skip_verify {
+    for (field, value) in [
+        ("ca_cert", ca_cert),
+        ("client_cert", client_cert),
+        ("client_key", client_key),
+    ] {
+        if value.as_deref().is_some_and(|value| value.trim().is_empty()) {
+            return Err(ConfigError::EmptyTlsValue {
+                backend_name: backend_name.to_string(),
+                field,
+            });
+        }
+    }
+    if ca_cert.is_some() && insecure_skip_verify {
         return Err(ConfigError::ConflictingTlsConfig(backend_name.to_string()));
     }
-    if client_cert_path.is_some() != client_key_path.is_some() {
+    if client_cert.is_some() != client_key.is_some() {
         return Err(ConfigError::IncompleteTlsClientAuth(
             backend_name.to_string(),
         ));
     }
     if !parsed.scheme.is_tls()
-        && (ca_cert_path.is_some()
+        && (ca_cert.is_some()
             || insecure_skip_verify
-            || client_cert_path.is_some()
-            || client_key_path.is_some())
+            || client_cert.is_some()
+            || client_key.is_some())
     {
         return Err(ConfigError::PlaintextTlsConfig(backend_name.to_string()));
+    }
+
+    Ok(())
+}
+
+fn validate_s3_auth(
+    backend_name: &str,
+    cfg: &super::schema::S3BackendConfig,
+) -> Result<(), ConfigError> {
+    let credentials_absent = cfg.region.is_none()
+        && cfg.access_key_id.is_none()
+        && cfg.secret_access_key.is_none();
+    if credentials_absent && cfg.session_token.is_none() {
+        return Ok(());
+    }
+    if credentials_absent {
+        return Err(ConfigError::S3SessionTokenWithoutCredentials(
+            backend_name.to_string(),
+        ));
+    }
+
+    for (field, value) in [
+        ("region", &cfg.region),
+        ("access_key_id", &cfg.access_key_id),
+        ("secret_access_key", &cfg.secret_access_key),
+    ] {
+        let Some(value) = value else {
+            return Err(ConfigError::MissingS3AuthField {
+                backend_name: backend_name.to_string(),
+                field,
+            });
+        };
+        if value.trim().is_empty() {
+            return Err(ConfigError::EmptyS3AuthValue {
+                backend_name: backend_name.to_string(),
+                field,
+            });
+        }
+    }
+    if cfg
+        .session_token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(ConfigError::EmptyS3AuthValue {
+            backend_name: backend_name.to_string(),
+            field: "session_token",
+        });
     }
 
     Ok(())
@@ -760,6 +864,19 @@ name = "b"
 name = "c"
 source = "b"
 "#
+    }
+
+    fn s3_toml(auth: &str) -> String {
+        format!(
+            r#"
+[[backends]]
+name = "s3"
+
+[backends.config.s3]
+url = "https://s3.example.com"
+{auth}
+"#
+        )
     }
 
     #[test]
@@ -1205,7 +1322,10 @@ path = "/dev/nvme0n1"
             cache_toml()
         );
         let f = write_cfg(&s);
-        assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::Toml { .. })
+        ));
     }
 
     #[test]
@@ -1219,8 +1339,11 @@ path = "/dev/nvme0n1"
 
     #[test]
     fn toml_error_on_bad_syntax() {
-        let f = write_cfg("this is = not = valid = toml");
-        assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+        const SECRET: &str = "TOML_SECRET_SENTINEL";
+        let f = write_cfg(&format!("secret_access_key = {SECRET:?} trailing"));
+        let error = load(f.path()).unwrap_err();
+        assert!(matches!(error, ConfigError::Toml { .. }));
+        assert!(!error.to_string().contains(SECRET));
     }
 
     #[test]
@@ -1444,6 +1567,37 @@ url = "origin.example.com:443"
     }
 
     #[test]
+    fn invalid_backend_url_error_does_not_expose_url() {
+        const SECRET: &str = "URL_SECRET_SENTINEL";
+        let s = format!(
+            r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://user:{SECRET}@origin.example.com"
+"#
+        );
+        let f = write_cfg(&s);
+        let error = load(f.path()).unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidBackendUrl { .. }));
+        assert!(!error.to_string().contains(SECRET));
+    }
+
+    #[test]
+    fn loaded_config_debug_does_not_expose_credentials() {
+        const SECRET: &str = "CONFIG_SECRET_SENTINEL";
+        let s = s3_toml(&format!(
+            "region = \"us-east-1\"\naccess_key_id = \"access\"\nsecret_access_key = {SECRET:?}"
+        ));
+        let f = write_cfg(&s);
+        let loaded = load(f.path()).unwrap();
+        let debug = format!("{loaded:?}");
+        assert!(!debug.contains(SECRET));
+        assert!(debug.contains("backend_count"));
+    }
+
+    #[test]
     fn rejects_conflicting_tls_config() {
         let s = r#"
 [[backends]]
@@ -1451,13 +1605,42 @@ name = "b"
 
 [backends.config.http]
 url = "https://e"
-ca_cert_path = "/etc/ca.pem"
+ca_cert = "CA PEM"
 insecure_skip_verify = true
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
             Err(ConfigError::ConflictingTlsConfig(name)) if name == "b" => {}
             other => panic!("expected ConflictingTlsConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_whitespace_tls_inline_values() {
+        for (field, value) in [
+            ("ca_cert", "   "),
+            ("client_cert", "\n\t"),
+            ("client_key", "  \n"),
+        ] {
+            let s = format!(
+                r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://e"
+{field} = '''{value}'''
+"#
+            );
+            let f = write_cfg(&s);
+            assert!(
+                matches!(
+                    load(f.path()),
+                    Err(ConfigError::EmptyTlsValue { backend_name, field: actual })
+                        if backend_name == "b" && actual == field
+                ),
+                "expected EmptyTlsValue for {field}"
+            );
         }
     }
 
@@ -1486,7 +1669,7 @@ name = "b"
 
 [backends.config.http]
 url = "https://e"
-client_cert_path = "/etc/client.pem"
+client_cert = "CLIENT CERT PEM"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -1503,7 +1686,7 @@ name = "b"
 
 [backends.config.http]
 url = "https://e"
-client_key_path = "/etc/client-key.pem"
+client_key = "CLIENT KEY PEM"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -1520,8 +1703,8 @@ name = "b"
 
 [backends.config.http]
 url = "http://e"
-client_cert_path = "/etc/client.pem"
-client_key_path = "/etc/client-key.pem"
+client_cert = "CLIENT CERT PEM"
+client_key = "CLIENT KEY PEM"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -1767,6 +1950,114 @@ url = "https://s3.example.com:443"
     }
 
     #[test]
+    fn accepts_s3_static_auth_with_session_token() {
+        let s = s3_toml(
+            r#"region = "us-east-1"
+access_key_id = "access"
+secret_access_key = "secret"
+session_token = "token""#,
+        );
+        let f = write_cfg(&s);
+        let cfg = load(f.path()).expect("authenticated S3 config should load");
+        let Some(backend_spec::Config::S3(s3)) = cfg.config().backends[0].config.as_ref() else {
+            panic!("expected s3 backend config");
+        };
+        assert_eq!(s3.region.as_deref(), Some("us-east-1"));
+        assert_eq!(s3.access_key_id.as_deref(), Some("access"));
+        assert_eq!(s3.secret_access_key.as_deref(), Some("secret"));
+        assert_eq!(s3.session_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn accepts_anonymous_s3_auth() {
+        let s = s3_toml("");
+        let f = write_cfg(&s);
+        let cfg = load(f.path()).expect("anonymous S3 config should load");
+        let Some(backend_spec::Config::S3(s3)) = cfg.config().backends[0].config.as_ref() else {
+            panic!("expected s3 backend config");
+        };
+        assert_eq!(s3.region, None);
+        assert_eq!(s3.access_key_id, None);
+        assert_eq!(s3.secret_access_key, None);
+        assert_eq!(s3.session_token, None);
+    }
+
+    #[test]
+    fn rejects_s3_static_auth_missing_each_required_field() {
+        for (missing, auth) in [
+            (
+                "region",
+                r#"access_key_id = "access"
+secret_access_key = "secret""#,
+            ),
+            (
+                "access_key_id",
+                r#"region = "us-east-1"
+secret_access_key = "secret""#,
+            ),
+            (
+                "secret_access_key",
+                r#"region = "us-east-1"
+access_key_id = "access""#,
+            ),
+        ] {
+            let s = s3_toml(auth);
+            let f = write_cfg(&s);
+            assert!(
+                matches!(
+                    load(f.path()),
+                    Err(ConfigError::MissingS3AuthField { backend_name, field })
+                        if backend_name == "s3" && field == missing
+                ),
+                "expected missing S3 auth field {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_s3_session_token_without_credentials() {
+        let s = s3_toml(r#"session_token = "token""#);
+        let f = write_cfg(&s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::S3SessionTokenWithoutCredentials(name)) if name == "s3"
+        ));
+    }
+
+    #[test]
+    fn rejects_whitespace_s3_auth_values() {
+        for field in [
+            "region",
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+        ] {
+            let mut values = [
+                ("region", "us-east-1"),
+                ("access_key_id", "access"),
+                ("secret_access_key", "secret"),
+                ("session_token", "token"),
+            ];
+            values.iter_mut().find(|(name, _)| *name == field).unwrap().1 = " \t ";
+            let auth = values
+                .iter()
+                .map(|(name, value)| format!("{name} = {value:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let s = s3_toml(&auth);
+            let f = write_cfg(&s);
+            assert!(
+                matches!(
+                    load(f.path()),
+                    Err(ConfigError::EmptyS3AuthValue { backend_name, field: actual })
+                        if backend_name == "s3" && actual == field
+                ),
+                "expected whitespace S3 auth field {field}"
+            );
+        }
+    }
+
+    #[test]
     fn accepts_azure_backend() {
         let s = r#"
 [[backends]]
@@ -1788,7 +2079,10 @@ url = "https://acct.blob.core.windows.net:443"
 fingers_per_nod = 128
 "#;
         let f = write_cfg(s);
-        assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::Toml { .. })
+        ));
     }
 
     #[test]

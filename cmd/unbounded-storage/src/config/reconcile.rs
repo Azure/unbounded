@@ -959,7 +959,7 @@ mod tests {
 
     // ---- backend / frontend reconcile ----
 
-    use crate::config::schema::{BackendSpec, FrontendSpec};
+    use crate::config::schema::{BackendSpec, FrontendSpec, S3BackendConfig};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum SpecOp {
@@ -1050,10 +1050,29 @@ mod tests {
                 url: url.to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
-                ca_cert_path: None,
+                ca_cert: None,
                 insecure_skip_verify: false,
-                client_cert_path: None,
-                client_key_path: None,
+                client_cert: None,
+                client_key: None,
+            })),
+        }
+    }
+
+    fn s3_backend(secret: &str) -> BackendSpec {
+        BackendSpec {
+            name: "s3".to_string(),
+            config: Some(backend_spec::Config::S3(S3BackendConfig {
+                url: "https://s3.example.com".to_string(),
+                stripe_size_bytes: Some(4 * 1024 * 1024),
+                http_concurrency: Some(64),
+                ca_cert: None,
+                insecure_skip_verify: false,
+                client_cert: None,
+                client_key: None,
+                region: Some("us-east-1".to_string()),
+                access_key_id: Some("access".to_string()),
+                secret_access_key: Some(secret.to_string()),
+                session_token: None,
             })),
         }
     }
@@ -1119,6 +1138,21 @@ mod tests {
         assert!(r.failures.is_empty());
         assert_eq!(*t.ops.borrow(), vec![SpecOp::Add("a".into())]);
         assert_eq!(r.applied["a"].url(), Some("new-url"));
+    }
+
+    #[test]
+    fn reconcile_backends_detects_credential_only_change_as_update() {
+        let t = SpecMock::new(&["s3"]);
+        let prev = HashMap::from([("s3".to_string(), s3_backend("secret-a"))]);
+        let desired = vec![s3_backend("secret-b")];
+        let r = reconcile_backends(&t, &desired, Some(&prev));
+        assert_eq!(r.updated, 1);
+        assert!(r.failures.is_empty());
+        assert_eq!(*t.ops.borrow(), vec![SpecOp::Add("s3".into())]);
+        let Some(backend_spec::Config::S3(cfg)) = r.applied["s3"].config.as_ref() else {
+            panic!("expected s3 backend config");
+        };
+        assert_eq!(cfg.secret_access_key.as_deref(), Some("secret-b"));
     }
 
     #[test]
