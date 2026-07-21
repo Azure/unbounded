@@ -177,6 +177,7 @@ func TestOperatorClusterRoleGrantsForeignWorkloadAudit(t *testing.T) {
 		resource string
 	}{
 		{group: "", resource: "pods"},
+		{group: "", resource: "persistentvolumeclaims"},
 		{group: "", resource: "replicationcontrollers"},
 		{group: "apps", resource: "deployments"},
 		{group: "apps", resource: "replicasets"},
