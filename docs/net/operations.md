@@ -47,7 +47,7 @@ kubectl unbounded install
 Verify CRDs and the operator are installed:
 ```bash
 kubectl get crd | grep unbounded
-kubectl -n unbounded-kube get deploy unbounded-operator
+kubectl -n unbounded-system get deploy unbounded-operator
 ```
 
 Expected output:
