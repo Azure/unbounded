@@ -18,7 +18,11 @@ use clap::Parser;
 use unbounded_storage::backend::BackendRegistry;
 use unbounded_storage::bufferpool::{Pool, PoolConfig};
 use unbounded_storage::config::{
-    self, BackendSpec, Config, FrontendSpec, LoadedConfig, ResolvedFrontendBinding, frontend_spec,
+    self, BackendSpec, Config, FrontendSpec, LoadedConfig, ResolvedFrontendBinding, disk_spec,
+    frontend_spec,
+};
+use unbounded_storage::disk_discovery::{
+    DiscoveryError, DiscoveryReport, DiskResolution, DiskResolver, DiskSource,
 };
 use unbounded_storage::fabric::{self, Fabric, MrHandle, Provider};
 use unbounded_storage::fanout::{
@@ -226,6 +230,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let mut disk_resolver = DiskResolver::default();
+    let (loaded, disk_resolution) = match resolve_loaded_config(&loaded, &mut disk_resolver) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("disk discovery error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    log_disk_resolution(&disk_resolution);
 
     // Startup-fixed settings come from the config file's `[startup]`
     // section, not the dynamically reloaded sections. They size the
@@ -297,7 +310,9 @@ fn main() -> ExitCode {
         core_plan_config,
     });
 
-    let core_plan = CorePlan::for_host(&host, &settings.core_plan_config);
+    let storage_numa = block_disk_numa_hints(loaded.config());
+    let core_plan =
+        CorePlan::for_host_with_storage(&host, &settings.core_plan_config, &storage_numa);
 
     let nic_worker_cpus: usize = core_plan
         .nic_workers
@@ -386,15 +401,11 @@ fn main() -> ExitCode {
     };
 
     // Disk supervisor: reconcile projected cache disks onto pinned
-    // storage cores. Each disk runs on its own storage core hosting the
-    // engine and ring, and publishes a `PageChannel` that carries the
-    // page data path cross-core from the shards. CPU pin hints come from
-    // the topology plan's per-drive storage cores: each one already
-    // inherits the drive's NUMA node and is disjoint from the serving
-    // and NIC-worker cores by construction. If the host discovered no
-    // NVMe devices the slot list is empty and disks run unpinned. The
-    // registry is owned by the apply target so live cache disk changes
-    // reconcile through the same funnel as the rest of the config.
+    // storage cores. Initial block disks receive slots using their NUMA
+    // hints; file disks and block disks added by a later reload run
+    // unpinned. The registry is owned by the apply target so live cache
+    // disk changes reconcile through the same funnel as the rest of the
+    // config.
     let disk_slots: Vec<DiskCpuSlot> = core_plan
         .storage_cores
         .iter()
@@ -497,8 +508,22 @@ fn main() -> ExitCode {
             while !SHUTDOWN.load(Ordering::Acquire) {
                 match update_rx.recv_timeout(SHUTDOWN_POLL) {
                     Ok(update) => {
-                        let version = update.loaded.config().version;
-                        match controller.apply(update.loaded.clone()) {
+                        let (loaded, resolution) = match resolve_loaded_config(
+                            update.loaded.as_ref(),
+                            &mut disk_resolver,
+                        ) {
+                            Ok(resolved) => resolved,
+                            Err(e) => {
+                                eprintln!(
+                                    "config: disk resolution gen={} failed; keeping previous: {e}",
+                                    update.generation
+                                );
+                                continue;
+                            }
+                        };
+                        log_disk_resolution(&resolution);
+                        let version = loaded.config().version;
+                        match controller.apply(Arc::new(loaded)) {
                             Ok(outcome) => eprintln!(
                                 "config: applied gen={} version={} tier={:?}",
                                 update.generation, version, outcome.tier
@@ -1659,6 +1684,59 @@ fn load_config(path: &Path, explicit: bool) -> Result<LoadedConfig, String> {
     }
 }
 
+fn resolve_loaded_config(
+    loaded: &LoadedConfig,
+    resolver: &mut DiskResolver,
+) -> Result<(LoadedConfig, DiskResolution), String> {
+    resolve_loaded_config_with(
+        loaded,
+        resolver,
+        unbounded_storage::disk_discovery::discover,
+    )
+}
+
+fn resolve_loaded_config_with(
+    loaded: &LoadedConfig,
+    resolver: &mut DiskResolver,
+    scan: impl FnMut(&[String]) -> Result<DiscoveryReport, DiscoveryError>,
+) -> Result<(LoadedConfig, DiskResolution), String> {
+    let mut config = loaded.config().clone();
+    let resolution = resolver
+        .resolve_with(&mut config, scan)
+        .map_err(|e| e.to_string())?;
+    let loaded = LoadedConfig::from_config(config).map_err(|e| e.to_string())?;
+    Ok((loaded, resolution))
+}
+
+fn block_disk_numa_hints(config: &Config) -> Vec<Option<u16>> {
+    config
+        .disks
+        .iter()
+        .filter_map(|disk| match disk.config.as_ref() {
+            Some(disk_spec::Config::Block(block)) => {
+                Some(block.numa.and_then(|numa| u16::try_from(numa).ok()))
+            }
+            Some(disk_spec::Config::File(_)) | None => None,
+        })
+        .collect()
+}
+
+fn log_disk_resolution(resolution: &DiskResolution) {
+    match resolution.source {
+        DiskSource::Explicit => eprintln!("disk config: using explicit disks"),
+        DiskSource::Automatic => {
+            let count = resolution
+                .report
+                .as_ref()
+                .map_or(0, |report| report.eligible.len());
+            eprintln!("disk config: automatically selected {count} NVMe namespace(s)");
+        }
+        DiskSource::Fallback => {
+            eprintln!("disk config: no eligible NVMe namespaces; using fallback file")
+        }
+    }
+}
+
 /// Block the calling thread until the process-wide [`SHUTDOWN`] latch is
 /// set, polling on [`SHUTDOWN_POLL`]. Used to park the main thread while
 /// the shard threads run.
@@ -2013,6 +2091,30 @@ mod tests {
         // path is allowed to silently fall back to built-in defaults.
         let path = Path::new("/definitely/not/a/real/path/unbounded-storage.toml");
         assert!(load_config(path, true).is_err());
+    }
+
+    #[test]
+    fn loaded_config_is_resolved_before_runtime_projection() {
+        let loaded = LoadedConfig::from_config(Config::default()).unwrap();
+        let mut resolver = unbounded_storage::disk_discovery::DiskResolver::default();
+
+        let (resolved, resolution) = resolve_loaded_config_with(&loaded, &mut resolver, |_| {
+            Ok(unbounded_storage::disk_discovery::DiscoveryReport {
+                eligible: vec![unbounded_storage::disk_discovery::AutoDisk {
+                    path: "/dev/nvme0n1".into(),
+                    numa: Some(3),
+                }],
+                excluded: Vec::new(),
+            })
+        })
+        .expect("resolve loaded config");
+
+        assert_eq!(
+            resolution.source,
+            unbounded_storage::disk_discovery::DiskSource::Automatic
+        );
+        assert_eq!(resolved.config().disks.len(), 1);
+        assert_eq!(config::runtime_disks(resolved.runtime()).len(), 1);
     }
 
     fn backend_spec(id: &str) -> BackendSpec {

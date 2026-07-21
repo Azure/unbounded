@@ -7,8 +7,8 @@
 //! by partitioning the host's usable CPUs into three pinned classes,
 //! scheduled in order of how constrained they are:
 //!
-//! 1. **Storage cores** (most constrained): exactly one CPU per NVMe
-//!    drive, preferring a CPU local to the drive's `(numa, pcie_root)`.
+//! 1. **Storage cores** (most constrained): exactly one CPU per concrete
+//!    block disk, preferring a CPU local to the disk's NUMA node.
 //! 2. **NIC workers**: `nic_workers` CPUs per active HCA, preferring
 //!    CPUs that share the HCA's `(numa, pcie_root)`, round-robin within
 //!    the local pool.
@@ -35,8 +35,9 @@ use std::collections::{BTreeMap, VecDeque};
 use super::Host;
 use super::filters::{self, Filters};
 
-/// A CPU dedicated to one NVMe drive's storage engine and io_uring
-/// ring. `drive` indexes into `host.nvmes`.
+/// A CPU dedicated to one block disk's storage engine and io_uring
+/// ring. `drive` indexes into the concrete block-disk list supplied to
+/// [`CorePlan::for_host_with_storage`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageCore {
     pub cpu: u32,
@@ -77,8 +78,8 @@ pub struct NumaPool {
     pub workers: usize,
 }
 
-/// A CPU slot reserved for a disk storage core: one per disk path (per
-/// NVMe drive), drawn from the plan's [`StorageCore`] allocation. These
+/// A CPU slot reserved for a disk storage core: one per concrete block
+/// disk, drawn from the plan's [`StorageCore`] allocation. These
 /// slots come out of the same disjoint, NUMA-local, SMT-collapsed,
 /// cpu0-excluded allocator that places the serving shards and NIC
 /// workers, so a disk pinned to one of these CPUs never collides with a
@@ -157,20 +158,32 @@ impl CorePlanConfig {
 }
 
 impl CorePlan {
-    /// Build a three-class core plan for `host` under `cfg`. The result
-    /// is deterministic: NVMes and HCAs are consumed in the sorted order
-    /// `Host::discover` produced, and CPUs come out of each per-NUMA
-    /// pool in ascending id order.
+    /// Build a three-class core plan using the NVMe controllers discovered
+    /// on `host`. This compatibility entry point preserves the original
+    /// controller-based behavior; runtime callers with concrete disk paths
+    /// should use [`Self::for_host_with_storage`].
     pub fn for_host(host: &Host, cfg: &CorePlanConfig) -> Self {
+        let storage_numa = host.nvmes.iter().map(|nvme| nvme.numa).collect::<Vec<_>>();
+        Self::for_host_with_storage(host, cfg, &storage_numa)
+    }
+
+    /// Build a plan with one storage core per concrete block disk. File
+    /// disks are omitted by the caller because they do not have device
+    /// locality and can run without a dedicated pinned storage slot.
+    pub fn for_host_with_storage(
+        host: &Host,
+        cfg: &CorePlanConfig,
+        storage_numa: &[Option<u16>],
+    ) -> Self {
         let filters = cfg.filters();
         let kept_hcas = filters::filter_hcas(&host.hcas, &filters);
         let mut alloc = CoreAllocator::new(host, &filters);
 
         // 1. Storage cores first (most constrained): one CPU per drive,
         //    local to the drive's NUMA node when possible.
-        let mut storage_cores = Vec::with_capacity(host.nvmes.len());
-        for (drive, nvme) in host.nvmes.iter().enumerate() {
-            let (cpu, numa) = alloc.take(nvme.numa);
+        let mut storage_cores = Vec::with_capacity(storage_numa.len());
+        for (drive, preferred_numa) in storage_numa.iter().copied().enumerate() {
+            let (cpu, numa) = alloc.take(preferred_numa);
             storage_cores.push(StorageCore { cpu, numa, drive });
         }
 
@@ -562,6 +575,28 @@ mod tests {
         assert_eq!(cpus.len(), 63);
         assert_eq!(set(cpus.clone()).len(), 63, "all classes disjoint");
         assert!(!set(cpus).contains(&0));
+    }
+
+    #[test]
+    fn storage_cores_follow_concrete_block_disks_not_nvme_controllers() {
+        let host = fake_host(
+            vec![
+                (0, (0..8).collect(), vec![]),
+                (1, (8..16).collect(), vec![]),
+            ],
+            vec![],
+            vec![],
+            vec![nvme("nvme0", "0000:02:00.0", Some(0))],
+        );
+
+        let plan = CorePlan::for_host_with_storage(&host, &defaults(), &[Some(1), Some(1), None]);
+
+        assert_eq!(plan.storage_cores.len(), 3);
+        assert_eq!(plan.storage_cores[0].drive, 0);
+        assert_eq!(plan.storage_cores[0].numa, Some(1));
+        assert_eq!(plan.storage_cores[1].drive, 1);
+        assert_eq!(plan.storage_cores[1].numa, Some(1));
+        assert_eq!(plan.storage_cores[2].drive, 2);
     }
 
     #[test]
