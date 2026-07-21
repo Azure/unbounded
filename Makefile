@@ -1394,7 +1394,7 @@ UNBOUNDED_OPERATOR_RELEASE_MANIFEST := build/unbounded-operator-$(VERSION).yaml
 
 unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a versioned, directly applicable operator manifest under build/
 	@mkdir -p build
-	@cat $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/*.yaml > "$(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
+	@cat $$(ls -1 "$(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)"/*.yaml | LC_ALL=C sort) > "$(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
 	@echo "Operator release manifest: $(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
 
 release-manifests: machina-manifests machine-ops-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build stamped combined manifest tarball under build/
