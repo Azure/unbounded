@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -409,6 +410,77 @@ func TestBootstrapEdgeTokenUsesAudienceAndRotatesSecureFile(t *testing.T) {
 	require.NoError(t, credential.Close())
 	_, err = os.Stat(filepath.Dir(path))
 	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestBootstrapWaitsForEdgeListenerAndReportsEarlyExit(t *testing.T) {
+	h := &siteBootstrapNetbootHandler{address: "192.0.2.10", httpPort: 8880, pollInterval: time.Millisecond}
+	process := &fakeBootstrapEdgeProcess{done: make(chan struct{})}
+	attempts := 0
+	dial := func(_ context.Context, address string) error {
+		require.Equal(t, "192.0.2.10:8880", address)
+		attempts++
+		if attempts < 2 {
+			return errors.New("not listening")
+		}
+
+		return nil
+	}
+
+	require.NoError(t, h.waitForEdgeReady(context.Background(), process, dial))
+	require.Equal(t, 2, attempts)
+
+	failed := &fakeBootstrapEdgeProcess{done: make(chan struct{}), err: errors.New("bind: address already in use")}
+	close(failed.done)
+	err := h.waitForEdgeReady(context.Background(), failed, func(context.Context, string) error {
+		return errors.New("not listening")
+	})
+	require.ErrorContains(t, err, "edge exited before becoming ready")
+	require.ErrorContains(t, err, "address already in use")
+}
+
+func TestBootstrapPreflightResolvesMetalmanBeforeClusterMutation(t *testing.T) {
+	explicitPath := filepath.Join(t.TempDir(), "metalman")
+	require.NoError(t, os.WriteFile(explicitPath, []byte("binary"), 0o700))
+	h := &siteBootstrapNetbootHandler{metalmanBinary: explicitPath}
+	lookedUp := ""
+	path, err := h.resolveMetalmanBinary(func(name string) (string, error) {
+		lookedUp = name
+
+		return name, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, explicitPath, path)
+	require.Empty(t, lookedUp)
+
+	h.metalmanBinary = ""
+	path, err = h.resolveMetalmanBinary(func(name string) (string, error) {
+		lookedUp = name
+
+		return "/usr/local/bin/metalman", nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, "metalman", lookedUp)
+	require.Equal(t, "/usr/local/bin/metalman", path)
+
+	_, err = h.resolveMetalmanBinary(func(string) (string, error) {
+		return "", exec.ErrNotFound
+	})
+	require.ErrorContains(t, err, "--metalman-binary")
+}
+
+type fakeBootstrapEdgeProcess struct {
+	done chan struct{}
+	err  error
+}
+
+func (f *fakeBootstrapEdgeProcess) Done() <-chan struct{} {
+	return f.done
+}
+
+func (f *fakeBootstrapEdgeProcess) Err() error { return f.err }
+
+func (f *fakeBootstrapEdgeProcess) Stop(context.Context) error {
+	return nil
 }
 
 type fakeBootstrapPortForwardStarter struct {

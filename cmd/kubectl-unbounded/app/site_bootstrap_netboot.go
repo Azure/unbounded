@@ -5,16 +5,19 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -81,6 +84,58 @@ type bootstrapEdgeToken struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	once   sync.Once
+}
+
+type bootstrapEdgeProcess interface {
+	Done() <-chan struct{}
+	Err() error
+	Stop(ctx context.Context) error
+}
+
+type commandBootstrapEdgeProcess struct {
+	cmd      *exec.Cmd
+	done     chan struct{}
+	stopOnce sync.Once
+	mu       sync.Mutex
+	err      error
+}
+
+func (p *commandBootstrapEdgeProcess) Done() <-chan struct{} {
+	return p.done
+}
+
+func (p *commandBootstrapEdgeProcess) Err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.err
+}
+
+func (p *commandBootstrapEdgeProcess) Stop(ctx context.Context) error {
+	var signalErr error
+	p.stopOnce.Do(func() {
+		signalErr = p.cmd.Process.Signal(syscall.SIGTERM)
+	})
+	if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
+		return fmt.Errorf("stop Metalman edge: %w", signalErr)
+	}
+
+	select {
+	case <-p.done:
+		err := p.Err()
+		if err != nil && !isSignalExit(err) {
+			return fmt.Errorf("wait for Metalman edge: %w", err)
+		}
+
+		return nil
+	case <-ctx.Done():
+		if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("kill Metalman edge: %w", err)
+		}
+		<-p.done
+
+		return ctx.Err()
+	}
 }
 
 func (t *bootstrapEdgeToken) Path() string {
@@ -287,6 +342,89 @@ func (h *siteBootstrapNetbootHandler) edgeArguments(backendURL, tokenFile string
 		"--tftp-enabled",
 		"--tftp-bind-address=" + h.address,
 	}
+}
+
+func (h *siteBootstrapNetbootHandler) resolveMetalmanBinary(lookPath func(string) (string, error)) (string, error) {
+	if h.metalmanBinary != "" {
+		info, err := os.Stat(h.metalmanBinary)
+		if err != nil {
+			return "", fmt.Errorf("Metalman binary %q is not accessible: %w", h.metalmanBinary, err)
+		}
+		if info.IsDir() || info.Mode()&0o111 == 0 {
+			return "", fmt.Errorf("Metalman binary %q is not executable", h.metalmanBinary)
+		}
+
+		return h.metalmanBinary, nil
+	}
+
+	path, err := lookPath("metalman")
+	if err != nil {
+		return "", fmt.Errorf("find metalman executable: %w; install it or set --metalman-binary", err)
+	}
+
+	return path, nil
+}
+
+func (h *siteBootstrapNetbootHandler) waitForEdgeReady(
+	ctx context.Context,
+	process bootstrapEdgeProcess,
+	dial func(context.Context, string) error,
+) error {
+	interval := h.pollInterval
+	if interval <= 0 {
+		interval = defaultBootstrapPollInterval
+	}
+	address := net.JoinHostPort(h.address, strconv.Itoa(h.httpPort))
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		if err := dial(ctx, address); err == nil {
+			return nil
+		}
+
+		select {
+		case <-process.Done():
+			if err := process.Err(); err != nil {
+				return fmt.Errorf("Metalman edge exited before becoming ready: %w", err)
+			}
+
+			return errors.New("Metalman edge exited before becoming ready")
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Metalman edge listener: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func startBootstrapEdgeProcess(binary string, args []string, stdout, stderr io.Writer) (bootstrapEdgeProcess, error) {
+	cmd := exec.Command(binary, args...)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start Metalman edge: %w", err)
+	}
+
+	process := &commandBootstrapEdgeProcess{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		err := cmd.Wait()
+		process.mu.Lock()
+		process.err = err
+		process.mu.Unlock()
+		close(process.done)
+	}()
+
+	return process, nil
+}
+
+func isSignalExit(err error) bool {
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ProcessState == nil {
+		return false
+	}
+	status, ok := exitError.ProcessState.Sys().(syscall.WaitStatus)
+
+	return ok && status.Signaled()
 }
 
 func (h *siteBootstrapNetbootHandler) claimEndpoint(ctx context.Context, identity string) error {
