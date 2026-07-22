@@ -4,9 +4,10 @@
 package nodeagent
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"path/filepath"
-	"time"
 
 	"k8s.io/client-go/rest"
 )
@@ -16,20 +17,6 @@ type ExternalGatewayOptions struct {
 	NodeName   string
 	RuntimeDir string
 	RESTConfig *rest.Config
-}
-
-type config struct {
-	NodeName                      string
-	CNIConfDir                    string
-	WireGuardDir                  string
-	StatusPushEnabled             bool
-	StatusWSEnabled               bool
-	KubeProxyHealthInterval       time.Duration
-	HealthPort                    int
-	RouteTableID                  int
-	RemoveConfigurationOnShutdown bool
-	PreferredPublicEncap          string
-	RESTConfig                    *rest.Config
 }
 
 func externalGatewayConfig(options ExternalGatewayOptions) (*config, error) {
@@ -43,17 +30,35 @@ func externalGatewayConfig(options ExternalGatewayOptions) (*config, error) {
 		return nil, fmt.Errorf("external gateway runtime directory must be absolute")
 	}
 
-	return &config{
-		NodeName:                      options.NodeName,
-		CNIConfDir:                    filepath.Join(options.RuntimeDir, "cni"),
-		WireGuardDir:                  filepath.Join(options.RuntimeDir, "wireguard"),
-		StatusPushEnabled:             false,
-		StatusWSEnabled:               false,
-		KubeProxyHealthInterval:       0,
-		HealthPort:                    0,
-		RouteTableID:                  254,
-		RemoveConfigurationOnShutdown: true,
-		PreferredPublicEncap:          "WireGuard",
-		RESTConfig:                    options.RESTConfig,
-	}, nil
+	cfg := defaultConfig()
+	cfg.NodeName = options.NodeName
+	cfg.CNIConfDir = filepath.Join(options.RuntimeDir, "cni")
+	cfg.WireGuardDir = filepath.Join(options.RuntimeDir, "wireguard")
+	cfg.StatusPushEnabled = false
+	cfg.StatusWSEnabled = false
+	cfg.KubeProxyHealthInterval = 0
+	cfg.HealthPort = 0
+	cfg.RouteTableID = 254
+	cfg.RemoveConfigurationOnShutdown = true
+	cfg.PreferredPublicEncap = "WireGuard"
+	cfg.RESTConfig = options.RESTConfig
+
+	return cfg, nil
+}
+
+// RunExternalGateway runs the normal node dataplane with external-gateway-safe
+// defaults until ctx is cancelled.
+func RunExternalGateway(ctx context.Context, options ExternalGatewayOptions) error {
+	cfg, err := externalGatewayConfig(options)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(cfg.WireGuardDir, 0o700); err != nil {
+		return fmt.Errorf("create WireGuard runtime directory: %w", err)
+	}
+	if err := os.MkdirAll(cfg.CNIConfDir, 0o700); err != nil {
+		return fmt.Errorf("create CNI runtime directory: %w", err)
+	}
+
+	return run(ctx, cfg)
 }
