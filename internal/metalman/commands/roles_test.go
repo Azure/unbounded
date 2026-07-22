@@ -89,7 +89,7 @@ func TestEdgeCommandRequiresOnlyBackendConnection(t *testing.T) {
 	t.Parallel()
 
 	cmd := EdgeCmd()
-	for _, name := range []string{"backend-url", "bind-address", "http-port", "endpoint", "edge-token-file", "dhcp-enabled", "dhcp-interface", "dhcp-server-ip", "dhcp-port", "tftp-enabled", "tftp-bind-address", "tftp-port"} {
+	for _, name := range []string{"backend-url", "bind-address", "http-port", "tls-cert-file", "tls-key-file", "endpoint", "edge-token-file", "dhcp-enabled", "dhcp-interface", "dhcp-server-ip", "dhcp-port", "tftp-enabled", "tftp-bind-address", "tftp-port"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("edge command has no --%s flag", name)
 		}
@@ -99,6 +99,31 @@ func TestEdgeCommandRequiresOnlyBackendConnection(t *testing.T) {
 		if cmd.Flags().Lookup(name) != nil {
 			t.Errorf("edge command unexpectedly has controller flag --%s", name)
 		}
+	}
+}
+
+func TestEdgeTLSRequiresCertificateAndKeyTogether(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		certFile string
+		keyFile  string
+		wantErr  bool
+	}{
+		{name: "plaintext"},
+		{name: "TLS", certFile: "tls.crt", keyFile: "tls.key"},
+		{name: "certificate only", certFile: "tls.crt", wantErr: true},
+		{name: "key only", keyFile: "tls.key", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateEdgeTLSFiles(tt.certFile, tt.keyFile)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateEdgeTLSFiles(%q, %q) error = %v, wantErr %v", tt.certFile, tt.keyFile, err, tt.wantErr)
+			}
+		})
 	}
 }
 

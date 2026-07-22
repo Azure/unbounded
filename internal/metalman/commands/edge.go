@@ -35,6 +35,8 @@ func EdgeCmd() *cobra.Command {
 		backendURL    string
 		bindAddress   string
 		httpPort      int
+		tlsCertFile   string
+		tlsKeyFile    string
 		endpoint      string
 		edgeTokenFile string
 		dhcpEnabled   bool
@@ -52,6 +54,9 @@ func EdgeCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			backend, err := parseEdgeBackendURL(backendURL)
 			if err != nil {
+				return err
+			}
+			if err := validateEdgeTLSFiles(tlsCertFile, tlsKeyFile); err != nil {
 				return err
 			}
 
@@ -106,7 +111,7 @@ func EdgeCmd() *cobra.Command {
 			PrintReady()
 			slog.InfoContext(ctx, "starting Metalman edge", "addr", addr, "backend", backend.String())
 
-			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := serveEdgeHTTP(server, tlsCertFile, tlsKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return fmt.Errorf("serving edge HTTP: %w", err)
 			}
 
@@ -117,6 +122,8 @@ func EdgeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&backendURL, "backend-url", "", "Metalman server base URL")
 	cmd.Flags().StringVar(&bindAddress, "bind-address", "0.0.0.0", "IP address to bind the edge HTTP listener")
 	cmd.Flags().IntVar(&httpPort, "http-port", 8880, "Port for the edge HTTP listener")
+	cmd.Flags().StringVar(&tlsCertFile, "tls-cert-file", "", "TLS certificate file; requires --tls-key-file")
+	cmd.Flags().StringVar(&tlsKeyFile, "tls-key-file", "", "TLS private key file; requires --tls-cert-file")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "NetbootEndpoint served by this edge")
 	cmd.Flags().StringVar(&edgeTokenFile, "edge-token-file", "/var/run/secrets/metalman/token", "Audience-bound ServiceAccount token file")
 	cmd.Flags().BoolVar(&dhcpEnabled, "dhcp-enabled", false, "Enable the DHCP protocol edge")
@@ -130,6 +137,22 @@ func EdgeCmd() *cobra.Command {
 	_ = cmd.MarkFlagRequired("endpoint")
 
 	return cmd
+}
+
+func validateEdgeTLSFiles(certFile, keyFile string) error {
+	if (certFile == "") != (keyFile == "") {
+		return errors.New("--tls-cert-file and --tls-key-file must be set together")
+	}
+
+	return nil
+}
+
+func serveEdgeHTTP(server *http.Server, certFile, keyFile string) error {
+	if certFile != "" {
+		return server.ListenAndServeTLS(certFile, keyFile)
+	}
+
+	return server.ListenAndServe()
 }
 
 func edgeDHCPServerIP(configured, iface string) (net.IP, error) {
