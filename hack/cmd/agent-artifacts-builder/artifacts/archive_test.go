@@ -58,6 +58,18 @@ func TestWriteBundleArchiveRejectsOutputInsideBundle(t *testing.T) {
 	require.ErrorContains(t, err, "must be outside bundle root")
 }
 
+func TestWriteBundleArchiveRejectsSymlink(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	externalPath := filepath.Join(t.TempDir(), "external")
+	require.NoError(t, os.WriteFile(externalPath, []byte("secret"), 0o644))
+	require.NoError(t, os.Symlink(externalPath, filepath.Join(rootDir, "linked-artifact")))
+
+	err := WriteBundleArchive(rootDir, filepath.Join(t.TempDir(), "bundle.tar.gz"))
+	require.ErrorContains(t, err, "is not a regular file")
+}
+
 func readBundleArchive(t *testing.T, archivePath string) map[string]string {
 	t.Helper()
 

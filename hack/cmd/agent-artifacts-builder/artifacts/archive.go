@@ -88,7 +88,7 @@ func writeBundleArchiveEntries(writer *tar.Writer, rootDir string, paths []strin
 	for _, path := range paths {
 		fullPath := filepath.Join(rootDir, filepath.FromSlash(path))
 
-		info, err := os.Stat(fullPath)
+		info, err := os.Lstat(fullPath)
 		if err != nil {
 			return fmt.Errorf("stat bundle archive entry %q: %w", path, err)
 		}

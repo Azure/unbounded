@@ -378,7 +378,7 @@ func parseHTTPSArchiveReference(image string) (archiveURL string, ok bool, err e
 
 	parsed, err := url.Parse(image)
 	if err != nil {
-		return "", true, err
+		return "", true, utilio.RedactHTTPError(err)
 	}
 
 	if parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {

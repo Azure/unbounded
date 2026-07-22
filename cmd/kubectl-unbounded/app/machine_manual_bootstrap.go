@@ -242,7 +242,7 @@ func validateOCIArtifactsSource(source string) error {
 func validateHTTPSArtifactsSource(source string) error {
 	u, err := url.Parse(source)
 	if err != nil {
-		return fmt.Errorf("parse HTTPS URL: %w", err)
+		return errors.New("parse HTTPS URL")
 	}
 
 	if u.Host == "" || strings.Trim(u.Path, "/") == "" {

@@ -182,7 +182,7 @@ func normalizeOfflineSourceRoot(source string) (string, error) {
 	if strings.HasPrefix(source, "https://") {
 		u, err := url.Parse(source)
 		if err != nil {
-			return "", fmt.Errorf("parse HTTPS offline artifact source: %w", err)
+			return "", fmt.Errorf("parse HTTPS offline artifact source: %w", utilio.RedactHTTPError(err))
 		}
 
 		if u.Host == "" || strings.Trim(u.Path, "/") == "" {

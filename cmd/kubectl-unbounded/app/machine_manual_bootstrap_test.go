@@ -240,6 +240,14 @@ func newFakeCluster(t *testing.T, siteName string) *fake.Clientset {
 	)
 }
 
+func TestValidateHTTPSArtifactsSourceRedactsInvalidQuery(t *testing.T) {
+	t.Parallel()
+
+	err := validateHTTPSArtifactsSource("https://artifacts.example.test/%zz?sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
+}
+
 func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	t.Parallel()
 

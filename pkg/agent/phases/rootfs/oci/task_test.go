@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -85,6 +86,19 @@ func TestParseHTTPSArchiveReference(t *testing.T) {
 				t.Fatalf("URL = %q, want %q", gotURL, tt.wantURL)
 			}
 		})
+	}
+}
+
+func TestParseHTTPSArchiveReferenceRedactsInvalidQuery(t *testing.T) {
+	t.Parallel()
+
+	_, _, err := parseHTTPSArchiveReference("https://artifacts.example.test/%zz?sig=secret")
+	if err == nil {
+		t.Fatal("parseHTTPSArchiveReference() error = nil, want parse error")
+	}
+
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("parse error contains signed query secret: %v", err)
 	}
 }
 

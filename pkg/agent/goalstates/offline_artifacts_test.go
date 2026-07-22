@@ -102,6 +102,10 @@ func TestNormalizeOfflineSourceRootHTTPS(t *testing.T) {
 
 	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test")
 	require.ErrorContains(t, err, "must include a host and archive path")
+
+	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test/%zz?sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
 }
 
 func TestContainerImageArchiveSourceKeyRedactsQuery(t *testing.T) {
