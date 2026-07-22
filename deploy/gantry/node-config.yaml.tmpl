@@ -18,7 +18,7 @@ metadata:
     app.kubernetes.io/component: node-config
 data:
   hosts.toml: |
-    # Managed by the Gantry node-config DaemonSet.
+    # Managed by unbounded-agent for Gantry.
     [host."http://127.0.0.1:5000"]
       capabilities = ["pull", "resolve"]
       dial_timeout = "200ms"
@@ -58,11 +58,13 @@ spec:
               target_dir=/host-certs/_default
               target_file="$target_dir/hosts.toml"
               source_file=/config/hosts.toml
-              managed_marker='# Managed by the Gantry node-config DaemonSet.'
+              managed_marker='# Managed by unbounded-agent for Gantry.'
+              legacy_managed_marker='# Managed by the Gantry node-config DaemonSet.'
 
               mkdir -p "$target_dir"
               if [ -e "$target_file" ] && \
-                 ! grep -Fqx "$managed_marker" "$target_file"; then
+                 ! grep -Fqx "$managed_marker" "$target_file" && \
+                 ! grep -Fqx "$legacy_managed_marker" "$target_file"; then
                 echo "refusing to overwrite unmanaged $target_file" >&2
                 exit 1
               fi
