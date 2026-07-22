@@ -42,12 +42,7 @@ func componentsForRole(role metalmanRole) roleComponents {
 		}
 	case metalmanRoleEdge:
 		return roleComponents{
-			ociReconciler: true,
-			dhcp:          true,
-			tftp:          true,
-			http:          true,
-			attestation:   true,
-			statusUpdates: true,
+			http: true,
 		}
 	case metalmanRoleLegacy:
 		return roleComponents{
