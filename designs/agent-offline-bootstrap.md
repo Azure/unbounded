@@ -11,7 +11,7 @@
 
 - Changing Kubernetes image pull behavior for workload images.
 - Supporting authenticated OCI registries for offline artifact bundles.
-- Supporting authenticated HTTPS archive URLs, including URL user info or query-string credentials.
+- Supporting HTTPS authentication mechanisms other than signed query strings, such as URL user info or client certificates.
 - Replacing host OS package management.
 
 ## Bootstrap artifact targets
@@ -437,7 +437,7 @@ The agent treats HTTPS only as the transport for the archive:
 
 The cache directory name includes a short hash of the rendered source URL. A ready cache can be reused by bootstrap, preflight, repave, and upgrade operations. An incomplete cache is removed and rebuilt on the next resolution attempt.
 
-HTTPS archive URLs must include a host and archive path. URL user info, query parameters, and fragments are rejected. The HTTPS endpoint must use a certificate trusted by the host. Archive extraction rejects absolute or parent-traversing paths, duplicate files, links, and entry types other than directories and regular files.
+HTTPS archive URLs must include a host and archive path. Signed query strings, including Azure Blob SAS parameters, are supported and preserved during download. URL user info and fragments are rejected. Query values must be treated as sensitive and redacted from logs, errors, and cache directory prefixes. The HTTPS endpoint must use a certificate trusted by the host. Archive extraction rejects absolute or parent-traversing paths, duplicate files, links, and entry types other than directories and regular files.
 
 ### OCI registry mode
 
@@ -571,7 +571,7 @@ https://artifacts.internal.example.com/agent-ubuntu2404.oci.tar
 
 The HTTPS object may be a plain tar or gzip-compressed tar archive. After download, the archive must extract to an OCI image layout containing `oci-layout`, `index.json`, and `blobs/`. It may contain those files at the archive root or under one containing directory. The archive must contain exactly one tagged image reference, which the agent selects automatically; archives with zero or multiple tagged references are rejected.
 
-The agent probes the HTTPS object during preflight without downloading its full contents. During rootfs provisioning, it downloads and safely extracts the archive into a temporary directory, locates the single OCI layout and image reference, and reuses the same OCI unpack path as `oci-layout://`. The temporary archive contents are removed after provisioning. URL user info, query parameters, and fragments are rejected.
+The agent probes the HTTPS object during preflight without downloading its full contents. During rootfs provisioning, it downloads and safely extracts the archive into a temporary directory, locates the single OCI layout and image reference, and reuses the same OCI unpack path as `oci-layout://`. The temporary archive contents are removed after provisioning. Signed query strings such as Azure Blob SAS parameters are supported and redacted from logs and errors; URL user info and fragments are rejected.
 
 ## Artifact publishing process
 

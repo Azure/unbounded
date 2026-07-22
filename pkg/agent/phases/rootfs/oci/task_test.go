@@ -47,10 +47,10 @@ func TestParseHTTPSArchiveReference(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "query not supported",
-			image:   "https://artifacts.example.test/rootfs.tar?token=value",
+			name:    "SAS query supported",
+			image:   "https://artifacts.example.test/rootfs.tar?sp=r&sig=secret",
+			wantURL: "https://artifacts.example.test/rootfs.tar?sp=r&sig=secret",
 			wantOK:  true,
-			wantErr: true,
 		},
 		{
 			name:    "fragment not supported",

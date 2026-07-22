@@ -77,7 +77,7 @@ func (d *downloadRootFS) Do(ctx context.Context) error {
 
 	if archiveURL, ok, err := parseHTTPSArchiveReference(d.ociImage); ok || err != nil {
 		if err != nil {
-			return fmt.Errorf("parse HTTPS OCI archive reference %q: %w", d.ociImage, err)
+			return fmt.Errorf("parse HTTPS OCI archive reference %q: %w", utilio.RedactURLQuery(d.ociImage), err)
 		}
 
 		return d.downloadArchiveAndUnpack(ctx, archiveURL)
@@ -135,7 +135,7 @@ func (d *downloadRootFS) downloadArchiveAndUnpack(ctx context.Context, archiveUR
 	}
 
 	d.log.Info("downloading HTTPS OCI image archive",
-		slog.String("image", archiveURL),
+		slog.String("image", utilio.RedactURLQuery(archiveURL)),
 		slog.String("dest", d.machineDir))
 
 	if err := source.ExtractTar(ctx, layoutParent); err != nil {
@@ -385,8 +385,8 @@ func parseHTTPSArchiveReference(image string) (archiveURL string, ok bool, err e
 		return "", true, fmt.Errorf("HTTPS OCI archive reference must include a host and archive path")
 	}
 
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", true, fmt.Errorf("HTTPS OCI archive reference must not include user info, query parameters, or a fragment")
+	if parsed.User != nil || parsed.Fragment != "" {
+		return "", true, fmt.Errorf("HTTPS OCI archive reference must not include user info or a fragment")
 	}
 
 	return parsed.String(), true, nil

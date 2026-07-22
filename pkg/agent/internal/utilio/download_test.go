@@ -10,6 +10,15 @@ import (
 	"testing"
 )
 
+func TestRedactURLQuery(t *testing.T) {
+	t.Parallel()
+
+	got := RedactURLQuery("https://artifacts.example.test/archive?sp=r&sig=secret")
+	if got != "https://artifacts.example.test/archive?REDACTED" {
+		t.Fatalf("RedactURLQuery() = %q", got)
+	}
+}
+
 func TestCheckRedirectNoHTTPSDowngrade(t *testing.T) {
 	t.Parallel()
 

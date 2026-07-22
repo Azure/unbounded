@@ -139,7 +139,7 @@ func TestManualBootstrapHandler_Validate(t *testing.T) {
 				siteName:               "dc1",
 				machineName:            "my-node",
 				kubeconfigPath:         kubeconfigPath,
-				offlineArtifactsSource: "https://artifacts.example.com/unbounded/v1.31.2.tar.gz",
+				offlineArtifactsSource: "https://artifacts.example.com/unbounded/v1.31.2.tar.gz?sp=r&sig=test-signature",
 			},
 		},
 		{

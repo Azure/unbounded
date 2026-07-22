@@ -249,8 +249,8 @@ func validateHTTPSArtifactsSource(source string) error {
 		return errors.New("HTTPS URL must include a host and archive path")
 	}
 
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return errors.New("HTTPS URL must not include user info, query parameters, or a fragment")
+	if u.User != nil || u.Fragment != "" {
+		return errors.New("HTTPS URL must not include user info or a fragment")
 	}
 
 	return nil

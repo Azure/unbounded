@@ -50,7 +50,7 @@ type AgentConfig struct {
 	// OCIImage is an OCI registry reference, local OCI layout, or HTTPS URL
 	// to a tarred OCI image layout used to bootstrap the machine rootfs. HTTPS
 	// archives must contain exactly one tagged image reference, which the agent
-	// selects automatically.
+	// selects automatically. HTTPS URLs may contain signed query parameters.
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
 
@@ -68,7 +68,7 @@ type AgentConfig struct {
 	// When set, it takes precedence over download overrides. Source is rendered
 	// as a strict Go template using the cluster Kubernetes version, then
 	// resolved as an absolute filesystem path, file:// URL, HTTPS archive, or
-	// oci:// artifact reference.
+	// oci:// artifact reference. HTTPS URLs may contain signed query parameters.
 	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
 }
 

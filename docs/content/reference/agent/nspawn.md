@@ -81,6 +81,8 @@ https://artifacts.example.com/agent-ubuntu2404.oci.tar
 HTTPS archives may be plain tar or gzip-compressed tar files. They must contain
 an OCI image layout with `oci-layout`, `index.json`, and `blobs/` content, and
 exactly one tagged image reference. The agent selects that reference automatically.
+Signed query strings such as Azure Blob SAS parameters are supported and are
+redacted from logs and errors.
 
 Image sources are maintained in the
 [images/](https://github.com/Azure/unbounded/tree/main/images)

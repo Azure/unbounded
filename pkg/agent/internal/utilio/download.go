@@ -42,6 +42,38 @@ func CheckRedirectNoHTTPSDowngrade(req *http.Request, via []*http.Request) error
 	return nil
 }
 
+// RedactURLQuery removes query parameters from rawURL before it is logged or
+// included in an error message.
+func RedactURLQuery(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "<redacted>"
+	}
+
+	if parsed.RawQuery == "" {
+		return rawURL
+	}
+
+	parsed.RawQuery = "REDACTED"
+
+	return parsed.String()
+}
+
+// RedactHTTPError removes query parameters from URL errors returned by the Go
+// HTTP client while preserving the underlying transport error.
+func RedactHTTPError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+
+	return &url.Error{
+		Op:  urlErr.Op,
+		URL: RedactURLQuery(urlErr.URL),
+		Err: urlErr.Err,
+	}
+}
+
 func newRemoteHTTPProbeTransport() http.RoundTripper {
 	transport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -63,12 +95,12 @@ func downloadFromRemote(ctx context.Context, source string) (io.ReadCloser, erro
 
 	resp, err := remoteHTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to perform HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to perform HTTP request: %w", RedactHTTPError(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", source, resp.StatusCode)
+		return nil, fmt.Errorf("download %q failed with status code %d", RedactURLQuery(source), resp.StatusCode)
 	}
 
 	return resp.Body, nil
@@ -119,7 +151,7 @@ func probeRemoteHTTPObject(ctx context.Context, method, source string) error {
 
 	resp, err := remoteHTTPProbeClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to perform HTTP request: %w", err)
+		return fmt.Errorf("failed to perform HTTP request: %w", RedactHTTPError(err))
 	}
 	defer resp.Body.Close() //nolint:errcheck // body close
 

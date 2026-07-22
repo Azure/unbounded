@@ -32,6 +32,21 @@ func TestSourceOpenHTTPSURL(t *testing.T) {
 	require.Equal(t, "artifact-data", string(got))
 }
 
+func TestSourceOpenHTTPErrorRedactsQuery(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	_, err := openHTTPWithClient(context.Background(), server.Client(), server.URL+"/artifact?sp=r&sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
+	require.NotContains(t, err.Error(), "sig")
+	require.Contains(t, err.Error(), "REDACTED")
+}
+
 func TestSourceOpenFileURL(t *testing.T) {
 	t.Parallel()
 

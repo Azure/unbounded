@@ -22,6 +22,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/internal/ociartifact"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
 // OfflineArtifactManifestFileName is the manifest file name in an offline artifact bundle.
@@ -188,8 +189,8 @@ func normalizeOfflineSourceRoot(source string) (string, error) {
 			return "", errors.New("HTTPS offline artifact source must include a host and archive path")
 		}
 
-		if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return "", errors.New("HTTPS offline artifact source must not include user info, query parameters, or a fragment")
+		if u.User != nil || u.Fragment != "" {
+			return "", errors.New("HTTPS offline artifact source must not include user info or a fragment")
 		}
 
 		u.Path = strings.TrimRight(u.Path, "/")
@@ -527,7 +528,8 @@ func containerImageArchiveHostDir(sourceRoot string) string {
 func containerImageArchiveSourceKey(sourceRoot string) string {
 	var b strings.Builder
 
-	for _, r := range strings.ToLower(sourceRoot) {
+	redactedSource := utilio.RedactURLQuery(sourceRoot)
+	for _, r := range strings.ToLower(redactedSource) {
 		switch {
 		case r >= 'a' && r <= 'z':
 			b.WriteRune(r)

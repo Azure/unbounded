@@ -126,12 +126,12 @@ func openHTTPWithClient(ctx context.Context, client *http.Client, source string)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to perform HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to perform HTTP request: %w", utilio.RedactHTTPError(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", source, resp.StatusCode)
+		return nil, fmt.Errorf("download %q failed with status code %d", utilio.RedactURLQuery(source), resp.StatusCode)
 	}
 
 	return resp.Body, nil
@@ -167,7 +167,7 @@ func (s Source) DownloadWithSHA256Verification(ctx context.Context, expectedHash
 	actualHash := hex.EncodeToString(hasher.Sum(nil))
 	if actualHash != expectedHash {
 		_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
-		return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", s.raw, expectedHash, actualHash)
+		return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", utilio.RedactURLQuery(s.raw), expectedHash, actualHash)
 	}
 
 	return nil

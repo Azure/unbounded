@@ -94,13 +94,22 @@ func TestNormalizeOfflineSourceRootHTTPS(t *testing.T) {
 	require.Equal(t, "https://artifacts.example.test/bootstrap/v1.34.2.tar.gz", got)
 
 	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test/bootstrap#manifest.json")
-	require.ErrorContains(t, err, "must not include user info, query parameters, or a fragment")
+	require.ErrorContains(t, err, "must not include user info or a fragment")
 
-	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test/bootstrap?token=value")
-	require.ErrorContains(t, err, "must not include user info, query parameters, or a fragment")
+	got, err = normalizeOfflineSourceRoot("https://artifacts.example.test/bootstrap?sp=r&sig=secret")
+	require.NoError(t, err)
+	require.Equal(t, "https://artifacts.example.test/bootstrap?sp=r&sig=secret", got)
 
 	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test")
 	require.ErrorContains(t, err, "must include a host and archive path")
+}
+
+func TestContainerImageArchiveSourceKeyRedactsQuery(t *testing.T) {
+	t.Parallel()
+
+	key := containerImageArchiveSourceKey("https://artifacts.example.test/bootstrap?sp=r&sig=secret")
+	require.NotContains(t, key, "secret")
+	require.NotContains(t, key, "sig")
 }
 
 func TestMaterializeOfflineArchive(t *testing.T) {
