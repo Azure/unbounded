@@ -30,6 +30,10 @@ type TFTPBackend interface {
 	Open(ctx context.Context, filename string) (io.ReadCloser, error)
 }
 
+type TFTPBackendStatusRecorder interface {
+	RecordBootLoaderDownloaded(ctx context.Context, filename string) error
+}
+
 type TFTPStatusRecorder interface {
 	RecordBootLoaderDownloaded(ctx context.Context, machineName, filename string) error
 }
@@ -77,6 +81,11 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		defer reader.Close() //nolint:errcheck // Backend stream is no longer needed.
 		if _, err := rf.ReadFrom(reader); err != nil {
 			return fmt.Errorf("transferring backend artifact: %w", err)
+		}
+		if recorder, ok := t.Backend.(TFTPBackendStatusRecorder); ok {
+			if err := recorder.RecordBootLoaderDownloaded(ctx, filename); err != nil {
+				return fmt.Errorf("recording backend transfer: %w", err)
+			}
 		}
 
 		return nil

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	pathpkg "path"
+	"strings"
 )
 
 const maxTFTPArtifactBackendAttempts = 3
@@ -47,6 +48,30 @@ func (b *HTTPArtifactBackend) Open(ctx context.Context, filename string) (io.Rea
 	}
 
 	return reader, nil
+}
+
+func (b *HTTPArtifactBackend) RecordBootLoaderDownloaded(ctx context.Context, filename string) error {
+	parts := strings.Split(strings.TrimPrefix(filename, "/"), "/")
+	if len(parts) < 7 || parts[5] != "artifacts" {
+		return fmt.Errorf("invalid session artifact path %q", filename)
+	}
+
+	requestURL := *b.backendURL
+	requestURL.Path = pathpkg.Join(requestURL.Path, pathpkg.Join(parts[:5]...), "callbacks", "boot-loader-downloaded")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), nil)
+	if err != nil {
+		return fmt.Errorf("creating TFTP milestone request: %w", err)
+	}
+	response, err := b.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("reporting TFTP milestone: %w", err)
+	}
+	defer response.Body.Close() //nolint:errcheck // Response body is not reused.
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("reporting TFTP milestone: backend returned %s", response.Status)
+	}
+
+	return nil
 }
 
 type resumingArtifactReader struct {

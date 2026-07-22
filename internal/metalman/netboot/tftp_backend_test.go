@@ -48,15 +48,37 @@ func TestTFTPServerRejectsLegacySourceIPFilenameWithBackend(t *testing.T) {
 	}
 }
 
+func TestTFTPServerReportsCompletedSessionTransfer(t *testing.T) {
+	t.Parallel()
+
+	backend := &recordingTFTPBackend{data: []byte("firmware")}
+	server := &TFTPServer{Backend: backend}
+	filename := "v1/netboot/sessions/session-1/capability/artifacts/shimx64.efi"
+
+	if err := server.readHandler(filename, &memoryOutgoingTransfer{}); err != nil {
+		t.Fatal(err)
+	}
+	if backend.completed != filename {
+		t.Errorf("completed filename = %q, want %q", backend.completed, filename)
+	}
+}
+
 type recordingTFTPBackend struct {
-	filename string
-	data     []byte
+	filename  string
+	completed string
+	data      []byte
 }
 
 func (b *recordingTFTPBackend) Open(_ context.Context, filename string) (io.ReadCloser, error) {
 	b.filename = filename
 
 	return io.NopCloser(bytes.NewReader(b.data)), nil
+}
+
+func (b *recordingTFTPBackend) RecordBootLoaderDownloaded(_ context.Context, filename string) error {
+	b.completed = filename
+
+	return nil
 }
 
 type memoryOutgoingTransfer struct {
@@ -170,5 +192,28 @@ func TestHTTPArtifactBackendRetriesFailedResumeRequest(t *testing.T) {
 	}
 	if got := requests.Load(); got != 3 {
 		t.Errorf("backend requests = %d, want 3", got)
+	}
+}
+
+func TestHTTPArtifactBackendReportsSessionBootLoaderMilestone(t *testing.T) {
+	t.Parallel()
+
+	var callbackPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbackPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	backend, err := NewHTTPArtifactBackend(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactPath := "v1/netboot/sessions/session/capability/artifacts/shimx64.efi"
+	if err := backend.RecordBootLoaderDownloaded(t.Context(), artifactPath); err != nil {
+		t.Fatal(err)
+	}
+	if want := "/v1/netboot/sessions/session/capability/callbacks/boot-loader-downloaded"; callbackPath != want {
+		t.Errorf("callback path = %q, want %q", callbackPath, want)
 	}
 }
