@@ -255,6 +255,20 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 			}
 
 			if components.machineOps {
+				var sessionHTTPBootURL func(*v1alpha3.NetbootSession) (string, error)
+				if components.sessionManager {
+					capabilityKey, err := os.ReadFile(capabilityKeyFile)
+					if err != nil {
+						return fmt.Errorf("reading capability key: %w", err)
+					}
+					capabilities, err := netboot.NewCapabilitySigner(capabilityKey, capabilityKeyID, nil)
+					if err != nil {
+						return fmt.Errorf("creating capability signer: %w", err)
+					}
+					sessionHTTPBootURL = func(session *v1alpha3.NetbootSession) (string, error) {
+						return netboot.SessionArtifactURL(capabilities, session, session.Spec.Boot.FirmwareArtifact)
+					}
+				}
 				if err := (&metalmachineops.Reconciler{
 					Client:                mgr.GetClient(),
 					APIReader:             mgr.GetAPIReader(),
@@ -262,6 +276,7 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 					PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
 					Sessions:              sessionManager,
 					HTTPBootURL:           resolver.HTTPBootURL,
+					SessionHTTPBootURL:    sessionHTTPBootURL,
 					MaxConcurrentMachines: operationMaxConcurrentMachines,
 					MaxAttempts:           operationMaxAttempts,
 					PollInterval:          operationPollInterval,
@@ -422,7 +437,7 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
-	if components.sessionHTTP {
+	if components.sessionHTTP || components.sessionManager {
 		cmd.Flags().StringVar(&capabilityKeyFile, "capability-key-file", "/var/run/secrets/metalman/capability.key", "File containing the shared capability HMAC key")
 		cmd.Flags().StringVar(&capabilityKeyID, "capability-key-id", "v1", "Identifier for the active capability HMAC key")
 	}

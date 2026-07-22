@@ -23,6 +23,7 @@ type roleComponents struct {
 	attestation    bool
 	statusUpdates  bool
 	sessionHTTP    bool
+	sessionManager bool
 }
 
 func componentsForRole(role metalmanRole) roleComponents {
@@ -33,6 +34,7 @@ func componentsForRole(role metalmanRole) roleComponents {
 			ociReconciler:  true,
 			redfish:        true,
 			machineOps:     true,
+			sessionManager: true,
 		}
 	case metalmanRoleServer:
 		return roleComponents{

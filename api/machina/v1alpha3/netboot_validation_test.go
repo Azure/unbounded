@@ -59,6 +59,14 @@ func TestNetbootSessionSchema(t *testing.T) {
 	assertSchemaValidations(t, spec, map[string]string{
 		"self == oldSelf": "netboot session spec is immutable",
 	})
+	boot := spec.Properties["boot"]
+	firmware, ok := boot.Properties["firmwareArtifact"]
+	if !ok {
+		t.Fatal("session boot snapshot is missing firmwareArtifact")
+	}
+	if firmware.MinLength == nil || *firmware.MinLength != 1 {
+		t.Error("session boot firmwareArtifact must be non-empty")
+	}
 
 	status := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"]
 	for _, field := range []string{"phase", "conditions"} {

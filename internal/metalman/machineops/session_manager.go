@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -85,6 +86,14 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 	if netbootDigest == "" {
 		return nil, fmt.Errorf("%w: netboot image %q for architecture %q", netboot.ErrNotYetDownloaded, netbootRef, architecture)
 	}
+	metadata, err := m.Cache.MetadataForArchitecture(netbootDigest, architecture)
+	if err != nil {
+		return nil, fmt.Errorf("read netboot image metadata: %w", err)
+	}
+	firmwareArtifact := firmwareArtifactForTransport(metadata, netbootSpec.TargetTransport())
+	if firmwareArtifact == "" {
+		return nil, fmt.Errorf("netboot image %q has no firmware artifact for %s", netbootRef, netbootSpec.TargetTransport())
+	}
 
 	now := m.now()
 	session := &v1alpha3.NetbootSession{
@@ -107,6 +116,7 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 				Transport:           netbootSpec.TargetTransport(),
 				ConfigurationSource: targetConfigurationSource(netbootSpec),
 				NetworkMode:         targetNetworkMode(netbootSpec),
+				FirmwareArtifact:    firmwareArtifact,
 				Architecture:        architecture,
 				DHCPLeases:          append([]v1alpha3.DHCPLease(nil), netbootSpec.DHCPLeases...),
 				TargetDisk:          netbootSpec.TargetDisk,
@@ -122,7 +132,7 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 					Digest:        netbootDigest,
 					PullSecretRef: netbootPullSecret.DeepCopy(),
 				},
-				Files: sessionArtifacts(),
+				Files: sessionArtifacts(firmwareArtifact),
 			},
 			ExpiresAt: metav1.NewTime(now.Add(defaultSessionTTL)),
 		},
@@ -221,11 +231,23 @@ func targetNetworkMode(spec *v1alpha3.PXESpec) v1alpha3.NetbootNetworkMode {
 	return spec.NetworkMode
 }
 
-func sessionArtifacts() []v1alpha3.NetbootSessionArtifact {
+func sessionArtifacts(firmwareArtifact string) []v1alpha3.NetbootSessionArtifact {
 	return []v1alpha3.NetbootSessionArtifact{
 		{Name: "disk.img.gz", Source: "MachineImage", Path: "/disk/disk.img.gz"},
 		{Name: "metadata.yaml", Source: "NetbootImage", Path: "/disk/metadata.yaml"},
+		{Name: firmwareArtifact, Source: "NetbootImage", Path: "/disk/" + firmwareArtifact},
 	}
+}
+
+func firmwareArtifactForTransport(metadata *netboot.ImageMetadata, transport v1alpha3.NetbootTransport) string {
+	if metadata == nil {
+		return ""
+	}
+	if transport == v1alpha3.NetbootTransportHTTP {
+		return netboot.HTTPBootPathFromMetadata(metadata)
+	}
+
+	return strings.TrimPrefix(metadata.DHCPBootImageName, "/")
 }
 
 func conditionStatus(ready bool) metav1.ConditionStatus {

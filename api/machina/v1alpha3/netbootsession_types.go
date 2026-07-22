@@ -127,6 +127,10 @@ type NetbootSessionBoot struct {
 	ConfigurationSource NetbootConfigurationSource `json:"configurationSource"`
 	NetworkMode         NetbootNetworkMode         `json:"networkMode"`
 
+	// FirmwareArtifact is the named immutable artifact advertised to firmware.
+	// +kubebuilder:validation:MinLength=1
+	FirmwareArtifact string `json:"firmwareArtifact"`
+
 	// Architecture selects the boot artifact platform.
 	// +kubebuilder:validation:Enum=amd64;arm64
 	Architecture string `json:"architecture"`

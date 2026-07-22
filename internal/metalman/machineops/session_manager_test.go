@@ -4,6 +4,8 @@
 package machineops
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -24,14 +26,18 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 	machine.Generation = 4
 	machine.Spec.PXE.EndpointRef = "rack-a-edge"
 	machine.Spec.PXE.NetbootImage = "ghcr.io/test/netboot:v1"
+	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
 	op := testOperation("replace-session", v1alpha3.OperationHostReplace)
 	op.UID = "operation-uid"
 	op.Generation = 2
 	endpoint := readyTestEndpoint()
 
 	cache := netboot.NewOCICache(t.TempDir())
-	cache.SetDigestForArchitecture(machine.Spec.PXE.Image, v1alpha3.DefaultPXEArchitecture, "sha256:"+stringOf('a', 64))
-	cache.SetDigestForArchitecture(machine.Spec.PXE.NetbootImage, v1alpha3.DefaultPXEArchitecture, "sha256:"+stringOf('b', 64))
+	machineDigest := "sha256:" + stringOf('a', 64)
+	netbootDigest := "sha256:" + stringOf('b', 64)
+	cache.SetDigestForArchitecture(machine.Spec.PXE.Image, v1alpha3.DefaultPXEArchitecture, machineDigest)
+	cache.SetDigestForArchitecture(machine.Spec.PXE.NetbootImage, v1alpha3.DefaultPXEArchitecture, netbootDigest)
+	require.NoError(t, writeSessionMetadata(cache, netbootDigest, "http/bootx64.efi"))
 
 	s := testScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(endpoint).WithStatusSubresource(&v1alpha3.NetbootSession{}).Build()
@@ -49,6 +55,12 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 	require.Equal(t, machine.UID, session.Spec.Machine.UID)
 	require.Equal(t, op.UID, session.Spec.Operation.UID)
 	require.Equal(t, endpoint.Spec.ExternalURL, session.Spec.Endpoint.ExternalURL)
+	require.Equal(t, "http/bootx64.efi", session.Spec.Boot.FirmwareArtifact)
+	require.Contains(t, session.Spec.Artifacts.Files, v1alpha3.NetbootSessionArtifact{
+		Name:   "http/bootx64.efi",
+		Source: "NetbootImage",
+		Path:   "/disk/http/bootx64.efi",
+	})
 	require.True(t, session.Spec.ExpiresAt.Time.Equal(fixedNow().Add(24*time.Hour)))
 
 	machine.Spec.PXE.Image = "ghcr.io/test/changed:v2"
@@ -102,6 +114,7 @@ func TestSessionManagerPromotesExistingSessionWhenEndpointBecomesReady(t *testin
 	cache := netboot.NewOCICache(t.TempDir())
 	cache.SetDigestForArchitecture(machine.Spec.PXE.Image, v1alpha3.DefaultPXEArchitecture, "sha256:"+stringOf('a', 64))
 	cache.SetDigestForArchitecture(machine.Spec.PXE.NetbootImage, v1alpha3.DefaultPXEArchitecture, "sha256:"+stringOf('b', 64))
+	require.NoError(t, writeSessionMetadata(cache, "sha256:"+stringOf('b', 64), "bootx64.efi"))
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(endpoint).WithStatusSubresource(endpoint, &v1alpha3.NetbootSession{}).Build()
 	manager := &KubernetesSessionManager{Client: c, Cache: cache}
 
@@ -115,6 +128,15 @@ func TestSessionManagerPromotesExistingSessionWhenEndpointBecomesReady(t *testin
 	session, err = manager.Ensure(t.Context(), op, machine)
 	require.NoError(t, err)
 	require.Equal(t, v1alpha3.NetbootSessionPhaseReady, session.Status.Phase)
+}
+
+func writeSessionMetadata(cache *netboot.OCICache, digest, httpBootPath string) error {
+	diskDir := cache.DiskDirForArchitecture(digest, v1alpha3.DefaultPXEArchitecture)
+	if err := os.MkdirAll(diskDir, 0o755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(filepath.Join(diskDir, "metadata.yaml"), []byte("dhcpBootImageName: "+httpBootPath+"\nhttpBootPath: "+httpBootPath+"\n"), 0o600)
 }
 
 func readyTestEndpoint() *v1alpha3.NetbootEndpoint {

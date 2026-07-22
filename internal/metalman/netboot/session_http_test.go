@@ -115,6 +115,27 @@ func TestSessionHTTPRecordsAuthenticatedSessionCallback(t *testing.T) {
 	require.Equal(t, metav1.ConditionTrue, recorder.condition.Status)
 }
 
+func TestSessionArtifactURLUsesEndpointAndCapability(t *testing.T) {
+	t.Parallel()
+
+	session := testNetbootSession("session-url", "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+	session.Spec.Endpoint.ExternalURL = "https://boot.example.com/base/"
+	session.Spec.Boot.FirmwareArtifact = "http/bootx64.efi"
+	session.Spec.Artifacts.Files = append(session.Spec.Artifacts.Files, v1alpha3.NetbootSessionArtifact{
+		Name: "http/bootx64.efi", Source: "NetbootImage", Path: "/disk/http/bootx64.efi",
+	})
+	signer, err := NewCapabilitySigner([]byte("01234567890123456789012345678901"), "test-key", func() time.Time {
+		return time.Unix(1_700_000_000, 0)
+	})
+	require.NoError(t, err)
+	capability, err := signer.Sign(session)
+	require.NoError(t, err)
+
+	bootURL, err := SessionArtifactURL(signer, session, session.Spec.Boot.FirmwareArtifact)
+	require.NoError(t, err)
+	require.Equal(t, "https://boot.example.com/base/v1/netboot/sessions/session-url/"+capability+"/artifacts/http/bootx64.efi", bootURL)
+}
+
 type recordingSessionConditionRecorder struct {
 	sessionName string
 	sessionUID  types.UID

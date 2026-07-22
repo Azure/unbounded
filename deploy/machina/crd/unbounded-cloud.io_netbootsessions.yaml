@@ -224,6 +224,11 @@ spec:
                       - subnetMask
                       type: object
                     type: array
+                  firmwareArtifact:
+                    description: FirmwareArtifact is the named immutable artifact
+                      advertised to firmware.
+                    minLength: 1
+                    type: string
                   networkMode:
                     description: NetbootNetworkMode configures the firmware provisioning
                       interface.
@@ -244,6 +249,7 @@ spec:
                 required:
                 - architecture
                 - configurationSource
+                - firmwareArtifact
                 - networkMode
                 - transport
                 type: object

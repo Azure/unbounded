@@ -6,7 +6,9 @@ package netboot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	pathpkg "path"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +31,27 @@ type SessionHTTPServer struct {
 // SessionConditionRecorder persists a milestone for an exact session identity.
 type SessionConditionRecorder interface {
 	RecordCondition(ctx context.Context, sessionName string, sessionUID types.UID, condition metav1.Condition) error
+}
+
+// SessionArtifactURL returns the externally advertised capability URL for one
+// artifact listed by the immutable session.
+func SessionArtifactURL(signer *CapabilitySigner, session *v1alpha3.NetbootSession, artifactName string) (string, error) {
+	if signer == nil || session == nil {
+		return "", errors.New("capability signer and session are required")
+	}
+	if _, ok := sessionArtifact(session, artifactName); !ok {
+		return "", fmt.Errorf("artifact %q is not listed by session %s", artifactName, session.Name)
+	}
+	cleanArtifact := strings.TrimPrefix(artifactName, "/")
+	if cleanArtifact == "" || pathpkg.Clean(cleanArtifact) != cleanArtifact || strings.HasPrefix(artifactName, "/") {
+		return "", fmt.Errorf("invalid artifact name %q", artifactName)
+	}
+	capability, err := signer.Sign(session)
+	if err != nil {
+		return "", err
+	}
+
+	return JoinServeURLPath(session.Spec.Endpoint.ExternalURL, pathpkg.Join("v1/netboot/sessions", session.Name, capability, "artifacts", cleanArtifact))
 }
 
 func (s *SessionHTTPServer) Handler() http.Handler {

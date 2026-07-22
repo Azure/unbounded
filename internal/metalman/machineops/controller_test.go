@@ -416,6 +416,51 @@ func TestReconcilerPersistsReadySessionBeforeHostReplaceSideEffects(t *testing.T
 	require.Equal(t, []string{"machine-session:SetBootOverride:Pxe:Continuous", "machine-session:On"}, power.calls)
 }
 
+func TestReconcilerUsesSessionCapabilityURLForHTTPBoot(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-session-http", "rack-a")
+	machine.UID = "machine-uid"
+	machine.Generation = 3
+	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportTFTP
+	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:ff", IPv4: "192.0.2.99"}}
+	op := testOperation("op-session-http", v1alpha3.OperationHostReplace)
+	op.UID = "operation-uid"
+	op.Generation = 2
+	op.Spec.MachineRef = machine.Name
+	session := &v1alpha3.NetbootSession{
+		ObjectMeta: metav1.ObjectMeta{Name: "netboot-session", UID: "session-uid"},
+		Spec: v1alpha3.NetbootSessionSpec{
+			Endpoint: v1alpha3.NetbootSessionEndpointSnapshot{ExternalURL: "https://boot.example.com"},
+			Boot: v1alpha3.NetbootSessionBoot{
+				Transport:        v1alpha3.NetbootTransportHTTP,
+				FirmwareArtifact: "bootx64.efi",
+				DHCPLeases:       []v1alpha3.DHCPLease{httpBootLease()},
+			},
+		},
+		Status: v1alpha3.NetbootSessionStatus{Phase: v1alpha3.NetbootSessionPhaseReady},
+	}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerOff}}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.Sessions = &recordingSessionManager{session: session}
+	reconciler.SessionHTTPBootURL = func(got *v1alpha3.NetbootSession) (string, error) {
+		require.Equal(t, session, got)
+
+		return "https://boot.example.com/v1/netboot/sessions/netboot-session/capability/artifacts/bootx64.efi", nil
+	}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	_, err = reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+
+	require.Contains(t, power.calls, "machine-session-http:SetHTTPBootOverride:https://boot.example.com/v1/netboot/sessions/netboot-session/capability/artifacts/bootx64.efi")
+}
+
 func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {
 	t.Parallel()
 

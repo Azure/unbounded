@@ -29,6 +29,7 @@ func TestMetalmanRoleComponentsAreIsolated(t *testing.T) {
 				ociReconciler:  true,
 				redfish:        true,
 				machineOps:     true,
+				sessionManager: true,
 			},
 		},
 		{

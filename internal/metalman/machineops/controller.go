@@ -79,6 +79,7 @@ type Reconciler struct {
 	PowerClients          PowerClientFactory
 	Sessions              SessionManager
 	HTTPBootURL           func(*v1alpha3.Machine) (string, error)
+	SessionHTTPBootURL    func(*v1alpha3.NetbootSession) (string, error)
 	MaxConcurrentMachines int
 	MaxAttempts           int32
 	PollInterval          time.Duration
@@ -397,8 +398,10 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	case v1alpha3.OperationHostReboot:
 		return r.advanceReboot(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
+		var session *v1alpha3.NetbootSession
 		if r.Sessions != nil {
-			session, err := r.Sessions.Ensure(ctx, op, &machine)
+			var err error
+			session, err = r.Sessions.Ensure(ctx, op, &machine)
 			if err != nil {
 				if errors.Is(err, netboot.ErrNotYetDownloaded) {
 					target.Message = "waiting for OCI images to resolve to immutable digests"
@@ -431,7 +434,7 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 			}
 		}
 
-		return r.advanceReplace(ctx, op, &machine, target, now)
+		return r.advanceReplace(ctx, op, &machine, session, target, now)
 	default:
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("%s is not handled by metalman", op.Spec.OperationKind), now)
 	}
@@ -607,9 +610,9 @@ func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetSt
 	return targetChange{}, false
 }
 
-func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, session *v1alpha3.NetbootSession, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	if !apimeta.IsStatusConditionTrue(target.Conditions, v1alpha3.MachineOperationConditionBootImageWritten) {
-		return r.waitForRepaveBoot(ctx, machine, target, now)
+		return r.waitForRepaveBoot(ctx, machine, session, target, now)
 	}
 
 	if change, done := cloudInitReplaceStatus(target, now); done {
@@ -633,9 +636,13 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 	return completeTarget(target, "HostReplace completed", now)
 }
 
-func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, machine *v1alpha3.Machine) error {
-	if machine.Spec.Netboot().TargetTransport() == v1alpha3.NetbootTransportHTTP {
-		bootURL, staticConfig, err := r.httpBootConfig(machine)
+func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, machine *v1alpha3.Machine, session *v1alpha3.NetbootSession) error {
+	transport := machine.Spec.Netboot().TargetTransport()
+	if session != nil {
+		transport = session.Spec.Boot.Transport
+	}
+	if transport == v1alpha3.NetbootTransportHTTP {
+		bootURL, staticConfig, err := r.httpBootConfig(machine, session)
 		if err != nil {
 			return err
 		}
@@ -650,17 +657,27 @@ func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, ma
 	return nil
 }
 
-func (r *Reconciler) httpBootConfig(machine *v1alpha3.Machine) (string, redfish.StaticIPv4Config, error) {
-	if r.HTTPBootURL == nil {
-		return "", redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot URL resolver is not configured")
+func (r *Reconciler) httpBootConfig(machine *v1alpha3.Machine, session *v1alpha3.NetbootSession) (string, redfish.StaticIPv4Config, error) {
+	var (
+		bootURL string
+		err     error
+	)
+	if session != nil {
+		if r.SessionHTTPBootURL == nil {
+			return "", redfish.StaticIPv4Config{}, fmt.Errorf("session HTTP boot URL resolver is not configured")
+		}
+		bootURL, err = r.SessionHTTPBootURL(session)
+	} else {
+		if r.HTTPBootURL == nil {
+			return "", redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot URL resolver is not configured")
+		}
+		bootURL, err = r.HTTPBootURL(machine)
 	}
-
-	bootURL, err := r.HTTPBootURL(machine)
 	if err != nil {
 		return "", redfish.StaticIPv4Config{}, err
 	}
 
-	staticConfig, err := httpBootStaticNetworkConfig(machine)
+	staticConfig, err := httpBootStaticNetworkConfig(machine, session)
 	if err != nil {
 		return "", redfish.StaticIPv4Config{}, err
 	}
@@ -668,12 +685,18 @@ func (r *Reconciler) httpBootConfig(machine *v1alpha3.Machine) (string, redfish.
 	return bootURL, staticConfig, nil
 }
 
-func httpBootStaticNetworkConfig(machine *v1alpha3.Machine) (redfish.StaticIPv4Config, error) {
-	if machine.Spec.Netboot() == nil || len(machine.Spec.Netboot().DHCPLeases) == 0 {
+func httpBootStaticNetworkConfig(machine *v1alpha3.Machine, session *v1alpha3.NetbootSession) (redfish.StaticIPv4Config, error) {
+	var leases []v1alpha3.DHCPLease
+	if session != nil {
+		leases = session.Spec.Boot.DHCPLeases
+	} else if machine.Spec.Netboot() != nil {
+		leases = machine.Spec.Netboot().DHCPLeases
+	}
+	if len(leases) == 0 {
 		return redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot requires at least one static lease in spec.host.netboot.dhcpLeases")
 	}
 
-	lease := machine.Spec.Netboot().DHCPLeases[0]
+	lease := leases[0]
 	config := redfish.StaticIPv4Config{
 		MAC:        lease.MAC,
 		Address:    lease.IPv4,
@@ -743,7 +766,7 @@ func setBIOSHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string
 	return pc.SetBootOverride(ctx, redfish.BootTargetUefiHTTP, redfish.BootOnce)
 }
 
-func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
+func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Machine, session *v1alpha3.NetbootSession, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
 	if target.Stage == v1alpha3.OperationStageWaitingRepave && target.LastAttemptAt != nil {
 		if now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
 			target.Message = "waiting for PXE installer to write the boot image"
@@ -759,8 +782,12 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 		target.LastAttemptAt = nil
 	}
 
-	if machine.Spec.Netboot().TargetTransport() == v1alpha3.NetbootTransportHTTP {
-		if _, _, err := r.httpBootConfig(machine); err != nil {
+	transport := machine.Spec.Netboot().TargetTransport()
+	if session != nil {
+		transport = session.Spec.Boot.Transport
+	}
+	if transport == v1alpha3.NetbootTransportHTTP {
+		if _, _, err := r.httpBootConfig(machine, session); err != nil {
 			if errors.Is(err, netboot.ErrNotYetDownloaded) {
 				target.Message = "waiting for OCI image to become available"
 
@@ -801,7 +828,7 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 		return targetChange{target: target}
 	}
 
-	if err := r.configureRepaveBoot(ctx, pc, machine); err != nil {
+	if err := r.configureRepaveBoot(ctx, pc, machine, session); err != nil {
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
