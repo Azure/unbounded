@@ -35,6 +35,15 @@ func ExtractTar(body io.Reader, destDir string) error {
 		return fmt.Errorf("create archive destination %q: %w", destRoot, err)
 	}
 
+	empty, err := IsDirEmpty(destRoot)
+	if err != nil {
+		return fmt.Errorf("check archive destination %q: %w", destRoot, err)
+	}
+
+	if !empty {
+		return fmt.Errorf("archive destination %q must be empty", destRoot)
+	}
+
 	destPrefix := strings.TrimRight(destRoot, string(filepath.Separator)) + string(filepath.Separator)
 	seen := map[string]struct{}{}
 	tarReader := tar.NewReader(archiveReader)

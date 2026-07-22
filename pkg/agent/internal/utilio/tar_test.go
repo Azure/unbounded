@@ -73,6 +73,19 @@ func TestExtractTarRejectsTraversal(t *testing.T) {
 	require.ErrorContains(t, err, "invalid tar entry")
 }
 
+func TestExtractTarRejectsNonEmptyDestinationWithSymlink(t *testing.T) {
+	t.Parallel()
+
+	externalDir := t.TempDir()
+	dest := t.TempDir()
+	require.NoError(t, os.Symlink(externalDir, filepath.Join(dest, "bundle")))
+
+	archive := testTarArchive(t, false, map[string]string{"bundle/passwd": "bad"})
+	err := ExtractTar(bytes.NewReader(archive), dest)
+	require.ErrorContains(t, err, "must be empty")
+	require.NoFileExists(t, filepath.Join(externalDir, "passwd"))
+}
+
 func TestExtractTarRejectsSymlink(t *testing.T) {
 	t.Parallel()
 
