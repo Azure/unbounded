@@ -4,6 +4,7 @@
 package netboot
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -88,6 +89,44 @@ func TestSessionHTTPRejectsInvalidExpiredAndUnlistedCapabilities(t *testing.T) {
 	body, err := io.ReadAll(response.Result().Body)
 	require.NoError(t, err)
 	require.NotContains(t, string(body), capability)
+}
+
+func TestSessionHTTPRecordsAuthenticatedSessionCallback(t *testing.T) {
+	t.Parallel()
+
+	session := testNetbootSession("session-c", "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	client := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(session).Build()
+	signer, err := NewCapabilitySigner([]byte("01234567890123456789012345678901"), "test-key", func() time.Time {
+		return time.Unix(1_700_000_000, 0)
+	})
+	require.NoError(t, err)
+	capability, err := signer.Sign(session)
+	require.NoError(t, err)
+	recorder := &recordingSessionConditionRecorder{}
+	handler := (&SessionHTTPServer{Client: client, Cache: NewOCICache(t.TempDir()), Capabilities: signer, StatusRecorder: recorder}).Handler()
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/netboot/sessions/session-c/"+capability+"/callbacks/boot-image-written", nil))
+
+	require.Equal(t, http.StatusNoContent, response.Code)
+	require.Equal(t, session.Name, recorder.sessionName)
+	require.Equal(t, session.UID, recorder.sessionUID)
+	require.Equal(t, v1alpha3.NetbootSessionConditionBootImageWritten, recorder.condition.Type)
+	require.Equal(t, metav1.ConditionTrue, recorder.condition.Status)
+}
+
+type recordingSessionConditionRecorder struct {
+	sessionName string
+	sessionUID  types.UID
+	condition   metav1.Condition
+}
+
+func (r *recordingSessionConditionRecorder) RecordCondition(_ context.Context, sessionName string, sessionUID types.UID, condition metav1.Condition) error {
+	r.sessionName = sessionName
+	r.sessionUID = sessionUID
+	r.condition = condition
+
+	return nil
 }
 
 func testNetbootSession(name, digest string) *v1alpha3.NetbootSession {

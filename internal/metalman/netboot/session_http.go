@@ -4,11 +4,14 @@
 package netboot
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -17,48 +20,75 @@ import (
 // SessionHTTPServer serves only immutable artifacts authorized by a
 // session-scoped capability.
 type SessionHTTPServer struct {
-	Client       client.Reader
-	Cache        *OCICache
-	Capabilities *CapabilitySigner
+	Client         client.Reader
+	Cache          *OCICache
+	Capabilities   *CapabilitySigner
+	StatusRecorder SessionConditionRecorder
+}
+
+// SessionConditionRecorder persists a milestone for an exact session identity.
+type SessionConditionRecorder interface {
+	RecordCondition(ctx context.Context, sessionName string, sessionUID types.UID, condition metav1.Condition) error
 }
 
 func (s *SessionHTTPServer) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/netboot/sessions/{session}/{capability}/artifacts/{artifact...}", s.handleArtifact)
+	s.RegisterHandlers(mux)
 
 	return mux
 }
 
-func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Request) {
-	if s.Client == nil || s.Cache == nil || s.Capabilities == nil {
-		http.Error(w, "session server unavailable", http.StatusServiceUnavailable)
+// RegisterHandlers adds authenticated session artifact and callback routes.
+func (s *SessionHTTPServer) RegisterHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/netboot/sessions/{session}/{capability}/artifacts/{artifact...}", s.handleArtifact)
+	mux.HandleFunc("POST /v1/netboot/sessions/{session}/{capability}/callbacks/{milestone}", s.handleCallback)
+}
+
+func (s *SessionHTTPServer) handleCallback(w http.ResponseWriter, r *http.Request) {
+	session, ok := s.authorizeSession(w, r)
+	if !ok {
+		return
+	}
+	if s.StatusRecorder == nil {
+		http.Error(w, "session status unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	var session v1alpha3.NetbootSession
-	if err := s.Client.Get(r.Context(), client.ObjectKey{Name: r.PathValue("session")}, &session); err != nil {
-		if apierrors.IsNotFound(err) {
-			http.NotFound(w, r)
-			return
-		}
-		http.Error(w, "loading session", http.StatusServiceUnavailable)
-		return
-	}
-	if err := s.Capabilities.Verify(&session, r.PathValue("capability")); err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	if session.Status.Phase != v1alpha3.NetbootSessionPhaseReady && session.Status.Phase != v1alpha3.NetbootSessionPhaseActive {
-		http.Error(w, "session unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	artifact, ok := sessionArtifact(&session, r.PathValue("artifact"))
+	conditionType, ok := sessionMilestoneCondition(r.PathValue("milestone"))
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	image, ok := sessionArtifactImage(&session, artifact.Source)
+	if err := s.StatusRecorder.RecordCondition(r.Context(), session.Name, session.UID, metav1.Condition{
+		Type:    conditionType,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Succeeded",
+		Message: "provisioning client reported milestone",
+	}); err != nil {
+		http.Error(w, "recording session status", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Request) {
+	if s.Cache == nil {
+		http.Error(w, "session server unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	session, ok := s.authorizeSession(w, r)
+	if !ok {
+		return
+	}
+
+	artifact, ok := sessionArtifact(session, r.PathValue("artifact"))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	image, ok := sessionArtifactImage(session, artifact.Source)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -85,6 +115,48 @@ func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Reques
 	}
 
 	http.ServeFile(w, r, diskPath)
+}
+
+func (s *SessionHTTPServer) authorizeSession(w http.ResponseWriter, r *http.Request) (*v1alpha3.NetbootSession, bool) {
+	if s.Client == nil || s.Capabilities == nil {
+		http.Error(w, "session server unavailable", http.StatusServiceUnavailable)
+		return nil, false
+	}
+
+	var session v1alpha3.NetbootSession
+	if err := s.Client.Get(r.Context(), client.ObjectKey{Name: r.PathValue("session")}, &session); err != nil {
+		if apierrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return nil, false
+		}
+		http.Error(w, "loading session", http.StatusServiceUnavailable)
+		return nil, false
+	}
+	if err := s.Capabilities.Verify(&session, r.PathValue("capability")); err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil, false
+	}
+	if session.Status.Phase != v1alpha3.NetbootSessionPhaseReady && session.Status.Phase != v1alpha3.NetbootSessionPhaseActive {
+		http.Error(w, "session unavailable", http.StatusServiceUnavailable)
+		return nil, false
+	}
+
+	return &session, true
+}
+
+func sessionMilestoneCondition(milestone string) (string, bool) {
+	switch milestone {
+	case "boot-loader-downloaded":
+		return v1alpha3.NetbootSessionConditionBootLoaderDownloaded, true
+	case "boot-image-written":
+		return v1alpha3.NetbootSessionConditionBootImageWritten, true
+	case "cloud-init-done":
+		return v1alpha3.NetbootSessionConditionCloudInitDone, true
+	case "attested":
+		return v1alpha3.NetbootSessionConditionAttested, true
+	default:
+		return "", false
+	}
 }
 
 func sessionArtifact(session *v1alpha3.NetbootSession, name string) (v1alpha3.NetbootSessionArtifact, bool) {

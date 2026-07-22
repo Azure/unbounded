@@ -39,6 +39,7 @@ func TestMetalmanRoleComponentsAreIsolated(t *testing.T) {
 				http:          true,
 				attestation:   true,
 				statusUpdates: true,
+				sessionHTTP:   true,
 			},
 		},
 		{

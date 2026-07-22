@@ -63,6 +63,8 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 		operationPollInterval          time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
+		capabilityKeyFile              string
+		capabilityKeyID                string
 	)
 	components := componentsForRole(role)
 
@@ -326,6 +328,22 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 
 			if components.http {
 				httpMux := http.NewServeMux()
+				if components.sessionHTTP {
+					capabilityKey, err := os.ReadFile(capabilityKeyFile)
+					if err != nil {
+						return fmt.Errorf("reading capability key: %w", err)
+					}
+					capabilities, err := netboot.NewCapabilitySigner(capabilityKey, capabilityKeyID, nil)
+					if err != nil {
+						return fmt.Errorf("creating capability signer: %w", err)
+					}
+					(&netboot.SessionHTTPServer{
+						Client:         mgr.GetClient(),
+						Cache:          ociCache,
+						Capabilities:   capabilities,
+						StatusRecorder: &metalmachineops.SessionStatusRecorder{Client: mgr.GetClient()},
+					}).RegisterHandlers(httpMux)
+				}
 				if components.attestation {
 					attestHandler := &attestation.Handler{
 						Clientset:      clientset,
@@ -404,6 +422,10 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
+	if components.sessionHTTP {
+		cmd.Flags().StringVar(&capabilityKeyFile, "capability-key-file", "/var/run/secrets/metalman/capability.key", "File containing the shared capability HMAC key")
+		cmd.Flags().StringVar(&capabilityKeyID, "capability-key-id", "v1", "Identifier for the active capability HMAC key")
+	}
 
 	return cmd
 }

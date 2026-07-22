@@ -22,6 +22,7 @@ type roleComponents struct {
 	http           bool
 	attestation    bool
 	statusUpdates  bool
+	sessionHTTP    bool
 }
 
 func componentsForRole(role metalmanRole) roleComponents {
@@ -39,6 +40,7 @@ func componentsForRole(role metalmanRole) roleComponents {
 			http:          true,
 			attestation:   true,
 			statusUpdates: true,
+			sessionHTTP:   true,
 		}
 	case metalmanRoleEdge:
 		return roleComponents{

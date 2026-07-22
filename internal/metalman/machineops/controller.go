@@ -608,11 +608,11 @@ func (r *Reconciler) waitForPowerAction(target v1alpha3.MachineOperationTargetSt
 }
 
 func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
-	if !apimeta.IsStatusConditionTrue(op.Status.Conditions, v1alpha3.MachineOperationConditionBootImageWritten) {
+	if !apimeta.IsStatusConditionTrue(target.Conditions, v1alpha3.MachineOperationConditionBootImageWritten) {
 		return r.waitForRepaveBoot(ctx, machine, target, now)
 	}
 
-	if change, done := cloudInitReplaceStatus(op, target, now); done {
+	if change, done := cloudInitReplaceStatus(target, now); done {
 		return change
 	}
 
@@ -817,8 +817,8 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 	return targetChange{target: target}
 }
 
-func cloudInitReplaceStatus(op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
-	cond := apimeta.FindStatusCondition(op.Status.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+func cloudInitReplaceStatus(target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
+	cond := apimeta.FindStatusCondition(target.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
 	if cond != nil {
 		switch cond.Status {
 		case metav1.ConditionTrue:
