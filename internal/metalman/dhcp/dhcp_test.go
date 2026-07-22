@@ -4,6 +4,7 @@
 package dhcp
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -413,6 +414,60 @@ func TestDHCPHandlerHTTPBootClientGetsHTTPBootURL(t *testing.T) {
 	}
 }
 
+func TestDHCPHandlerUsesBackendSessionDecision(t *testing.T) {
+	t.Parallel()
+
+	mac, err := net.ParseMAC("aa:bb:cc:dd:ee:f5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverIP := net.ParseIP("10.0.1.254").To4()
+	provider := &fakeDecisionProvider{decision: &Decision{
+		Lease: v1alpha3.DHCPLease{
+			MAC:        mac.String(),
+			IPv4:       "10.0.1.15",
+			SubnetMask: "255.255.255.0",
+			Gateway:    "10.0.1.1",
+		},
+		Transport: v1alpha3.NetbootTransportHTTP,
+		BootFile:  "https://boot.example/v1/netboot/sessions/session/capability/artifacts/shimx64.efi",
+	}}
+	srv := &Server{
+		Interface:        "eth0",
+		ServerIP:         serverIP,
+		DecisionProvider: provider,
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discover.UpdateOption(dhcpv4.OptClassIdentifier("HTTPClient:Arch:00016:UNDI:003016"))
+
+	conn := &fakePacketConn{}
+	srv.handler(conn, &net.UDPAddr{IP: net.ParseIP("10.0.1.15"), Port: 68}, discover)
+
+	if provider.mac != mac.String() {
+		t.Errorf("provider MAC = %q, want %q", provider.mac, mac.String())
+	}
+	if !provider.httpClient {
+		t.Error("provider did not receive HTTP client identity")
+	}
+	if conn.written == nil {
+		t.Fatal("expected DHCP response, got none")
+	}
+	response, err := dhcpv4.FromBytes(conn.written)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := response.BootFileNameOption(); got != provider.decision.BootFile {
+		t.Errorf("bootfile = %q, want %q", got, provider.decision.BootFile)
+	}
+	if got := response.YourIPAddr.String(); got != provider.decision.Lease.IPv4 {
+		t.Errorf("lease IP = %q, want %q", got, provider.decision.Lease.IPv4)
+	}
+}
+
 func TestDHCPHandlerUnknownMAC(t *testing.T) {
 	mac, _ := net.ParseMAC("ff:ff:ff:ff:ff:ff")
 	serverIP := net.ParseIP("10.0.1.254").To4()
@@ -770,6 +825,19 @@ func newFakeReader(t *testing.T, objs ...runtime.Object) client.Reader {
 type fakePacketConn struct {
 	written []byte
 	dest    net.Addr
+}
+
+type fakeDecisionProvider struct {
+	decision   *Decision
+	mac        string
+	httpClient bool
+}
+
+func (f *fakeDecisionProvider) Decide(_ context.Context, mac string, httpClient bool) (*Decision, error) {
+	f.mac = mac
+	f.httpClient = httpClient
+
+	return f.decision, nil
 }
 
 func (f *fakePacketConn) ReadFrom(b []byte) (int, net.Addr, error) { return 0, nil, nil }

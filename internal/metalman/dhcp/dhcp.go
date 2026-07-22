@@ -25,10 +25,24 @@ type Server struct {
 	Interface         string
 	Port              int
 	Reader            client.Reader
+	DecisionProvider  DecisionProvider
 	ServerIP          net.IP
 	OCICache          *netboot.OCICache
 	ServeURL          string
 	DefaultNetbootRef string
+}
+
+// Decision is the immutable lease and boot information returned by the
+// Metalman server for one ready netboot session.
+type Decision struct {
+	Lease     v1alpha3.DHCPLease        `json:"lease"`
+	Transport v1alpha3.NetbootTransport `json:"transport"`
+	BootFile  string                    `json:"bootFile"`
+}
+
+// DecisionProvider resolves the active ready session for a DHCP client.
+type DecisionProvider interface {
+	Decide(ctx context.Context, mac string, httpClient bool) (*Decision, error)
 }
 
 func (s *Server) NeedLeaderElection() bool {
@@ -125,33 +139,15 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 
 	ctx := context.Background()
 
-	var list v1alpha3.MachineList
-	if err := s.Reader.List(ctx, &list, client.MatchingFields{indexing.IndexNodeByMAC: mac}); err != nil {
-		log.Error("listing Machines by MAC", "err", err)
+	decision, node, err := s.decision(ctx, mac, isHTTPClientRequest(m))
+	if err != nil {
+		log.Error("resolving DHCP decision", "err", err)
 		return
 	}
-
-	if len(list.Items) == 0 {
+	if decision == nil {
 		return
 	}
-
-	node := &list.Items[0]
-	if node.Spec.Netboot() == nil {
-		return
-	}
-
-	var lease *v1alpha3.DHCPLease
-
-	for i := range node.Spec.Netboot().DHCPLeases {
-		if strings.EqualFold(node.Spec.Netboot().DHCPLeases[i].MAC, mac) {
-			lease = &node.Spec.Netboot().DHCPLeases[i]
-			break
-		}
-	}
-
-	if lease == nil {
-		return
-	}
+	lease := &decision.Lease
 
 	clientIP := net.ParseIP(lease.IPv4).To4()
 	if clientIP == nil {
@@ -189,12 +185,28 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		}
 	}
 
-	netbootImage := node.Spec.Netboot().NetbootImage
-	if netbootImage == "" {
-		netbootImage = s.DefaultNetbootRef
-	}
+	if s.DecisionProvider != nil {
+		switch decision.Transport {
+		case v1alpha3.NetbootTransportHTTP:
+			if isHTTPClientRequest(m) && decision.BootFile != "" {
+				resp.UpdateOption(dhcpv4.OptBootFileName(decision.BootFile))
+			}
+		case v1alpha3.NetbootTransportTFTP:
+			if decision.BootFile != "" {
+				resp.UpdateOption(dhcpv4.OptTFTPServerName(s.ServerIP.String()))
+				resp.UpdateOption(dhcpv4.OptBootFileName(decision.BootFile))
+				resp.ServerIPAddr = s.ServerIP
+			}
+		}
+	} else if node != nil {
+		netbootImage := node.Spec.Netboot().NetbootImage
+		if netbootImage == "" {
+			netbootImage = s.DefaultNetbootRef
+		}
 
-	if netbootImage != "" && s.OCICache != nil {
+		if netbootImage == "" || s.OCICache == nil {
+			goto send
+		}
 		architecture := node.Spec.Netboot().TargetArchitecture()
 
 		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
@@ -216,6 +228,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		}
 	}
 
+send:
 	switch m.MessageType() {
 	case dhcpv4.MessageTypeDiscover:
 		resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
@@ -230,11 +243,39 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		dest = peer
 	}
 
-	log.Info("sending DHCP response", "node", node.Name, "ip", lease.IPv4, "response", resp.MessageType().String())
+	log.Info("sending DHCP response", "ip", lease.IPv4, "response", resp.MessageType().String())
 
 	if _, err := conn.WriteTo(resp.ToBytes(), dest); err != nil {
 		log.Error("sending DHCP response", "err", err)
 	}
+}
+
+func (s *Server) decision(ctx context.Context, mac string, httpClient bool) (*Decision, *v1alpha3.Machine, error) {
+	if s.DecisionProvider != nil {
+		decision, err := s.DecisionProvider.Decide(ctx, mac, httpClient)
+		return decision, nil, err
+	}
+	if s.Reader == nil {
+		return nil, nil, errors.New("DHCP decision provider is not configured")
+	}
+
+	var list v1alpha3.MachineList
+	if err := s.Reader.List(ctx, &list, client.MatchingFields{indexing.IndexNodeByMAC: mac}); err != nil {
+		return nil, nil, fmt.Errorf("listing Machines by MAC: %w", err)
+	}
+	if len(list.Items) == 0 || list.Items[0].Spec.Netboot() == nil {
+		return nil, nil, nil
+	}
+
+	node := &list.Items[0]
+	for i := range node.Spec.Netboot().DHCPLeases {
+		lease := &node.Spec.Netboot().DHCPLeases[i]
+		if strings.EqualFold(lease.MAC, mac) {
+			return &Decision{Lease: *lease}, node, nil
+		}
+	}
+
+	return nil, nil, nil
 }
 
 func isHTTPClientRequest(m *dhcpv4.DHCPv4) bool {

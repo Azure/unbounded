@@ -65,6 +65,7 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 		defaultNetbootPullSecret       string
 		capabilityKeyFile              string
 		capabilityKeyID                string
+		edgeServiceAccount             string
 	)
 	components := componentsForRole(role)
 
@@ -357,6 +358,10 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 						Cache:          ociCache,
 						Capabilities:   capabilities,
 						StatusRecorder: &metalmachineops.SessionStatusRecorder{Client: mgr.GetClient()},
+						EdgeAuthenticator: &netboot.TokenReviewEdgeAuthenticator{
+							Client:             clientset.AuthenticationV1(),
+							ServiceAccountName: edgeServiceAccount,
+						},
 					}).RegisterHandlers(httpMux)
 				}
 				if components.attestation {
@@ -440,6 +445,9 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 	if components.sessionHTTP || components.sessionManager {
 		cmd.Flags().StringVar(&capabilityKeyFile, "capability-key-file", "/var/run/secrets/metalman/capability.key", "File containing the shared capability HMAC key")
 		cmd.Flags().StringVar(&capabilityKeyID, "capability-key-id", "v1", "Identifier for the active capability HMAC key")
+	}
+	if components.sessionHTTP {
+		cmd.Flags().StringVar(&edgeServiceAccount, "edge-service-account", "metalman-edge", "ServiceAccount name accepted by internal edge APIs")
 	}
 
 	return cmd

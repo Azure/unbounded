@@ -97,3 +97,7 @@ func (s *CapabilitySigner) signature(payload string) string {
 
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
+
+func (s *CapabilitySigner) IsExpired(session *v1alpha3.NetbootSession) bool {
+	return session == nil || !s.now().Before(session.Spec.ExpiresAt.Time)
+}

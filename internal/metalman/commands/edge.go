@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Azure/unbounded/internal/metalman/dhcp"
 )
 
 const defaultHTTPReadHeaderTimeout = 10 * time.Second
@@ -28,9 +31,15 @@ const maxArtifactBackendAttempts = 3
 // EdgeCmd runs Metalman's provisioning-network protocol edge.
 func EdgeCmd() *cobra.Command {
 	var (
-		backendURL  string
-		bindAddress string
-		httpPort    int
+		backendURL    string
+		bindAddress   string
+		httpPort      int
+		endpoint      string
+		edgeTokenFile string
+		dhcpEnabled   bool
+		dhcpInterface string
+		dhcpServerIP  string
+		dhcpPort      int
 	)
 
 	cmd := &cobra.Command{
@@ -50,6 +59,23 @@ func EdgeCmd() *cobra.Command {
 				Addr:              addr,
 				Handler:           newEdgeProxy(backend),
 				ReadHeaderTimeout: defaultHTTPReadHeaderTimeout,
+			}
+			if dhcpEnabled {
+				decisionProvider, err := dhcp.NewHTTPDecisionProviderFromTokenFile(backend.String(), endpoint, edgeTokenFile, nil)
+				if err != nil {
+					return fmt.Errorf("creating DHCP backend: %w", err)
+				}
+				serverIP, err := edgeDHCPServerIP(dhcpServerIP, dhcpInterface)
+				if err != nil {
+					return err
+				}
+				dhcpServer := &dhcp.Server{Interface: dhcpInterface, Port: dhcpPort, DecisionProvider: decisionProvider, ServerIP: serverIP}
+				go func() {
+					if err := dhcpServer.Start(ctx); err != nil && ctx.Err() == nil {
+						slog.ErrorContext(ctx, "Metalman edge DHCP server failed", "err", err)
+						stop()
+					}
+				}()
 			}
 
 			go func() {
@@ -74,9 +100,37 @@ func EdgeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&backendURL, "backend-url", "", "Metalman server base URL")
 	cmd.Flags().StringVar(&bindAddress, "bind-address", "0.0.0.0", "IP address to bind the edge HTTP listener")
 	cmd.Flags().IntVar(&httpPort, "http-port", 8880, "Port for the edge HTTP listener")
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "NetbootEndpoint served by this edge")
+	cmd.Flags().StringVar(&edgeTokenFile, "edge-token-file", "/var/run/secrets/metalman/token", "Audience-bound ServiceAccount token file")
+	cmd.Flags().BoolVar(&dhcpEnabled, "dhcp-enabled", false, "Enable the DHCP protocol edge")
+	cmd.Flags().StringVar(&dhcpInterface, "dhcp-interface", "", "Provisioning interface for direct DHCP; empty enables relay-only mode")
+	cmd.Flags().StringVar(&dhcpServerIP, "dhcp-server-ip", "", "DHCP server IPv4 address; defaults to the interface or outbound address")
+	cmd.Flags().IntVar(&dhcpPort, "dhcp-port", 67, "DHCP listener port")
 	_ = cmd.MarkFlagRequired("backend-url")
+	_ = cmd.MarkFlagRequired("endpoint")
 
 	return cmd
+}
+
+func edgeDHCPServerIP(configured, iface string) (net.IP, error) {
+	if configured != "" {
+		ip := net.ParseIP(configured).To4()
+		if ip == nil {
+			return nil, errors.New("--dhcp-server-ip must be an IPv4 address")
+		}
+
+		return ip, nil
+	}
+	if iface != "" {
+		return InterfaceIPv4(iface)
+	}
+
+	ip, err := OutboundIP()
+	if err != nil || ip.To4() == nil {
+		return nil, errors.New("detecting DHCP server IPv4 address; set --dhcp-server-ip")
+	}
+
+	return ip.To4(), nil
 }
 
 func parseEdgeBackendURL(value string) (*url.URL, error) {

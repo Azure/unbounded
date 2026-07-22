@@ -5,8 +5,10 @@ package netboot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	pathpkg "path"
 	"strings"
@@ -22,10 +24,16 @@ import (
 // SessionHTTPServer serves only immutable artifacts authorized by a
 // session-scoped capability.
 type SessionHTTPServer struct {
-	Client         client.Reader
-	Cache          *OCICache
-	Capabilities   *CapabilitySigner
-	StatusRecorder SessionConditionRecorder
+	Client            client.Reader
+	Cache             *OCICache
+	Capabilities      *CapabilitySigner
+	StatusRecorder    SessionConditionRecorder
+	EdgeAuthenticator EdgeAuthenticator
+}
+
+// EdgeAuthenticator validates access to internal edge-only routes.
+type EdgeAuthenticator interface {
+	Authenticate(ctx context.Context, request *http.Request) bool
 }
 
 // SessionConditionRecorder persists a milestone for an exact session identity.
@@ -65,6 +73,88 @@ func (s *SessionHTTPServer) Handler() http.Handler {
 func (s *SessionHTTPServer) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/netboot/sessions/{session}/{capability}/artifacts/{artifact...}", s.handleArtifact)
 	mux.HandleFunc("POST /v1/netboot/sessions/{session}/{capability}/callbacks/{milestone}", s.handleCallback)
+	mux.HandleFunc("GET /v1/netboot/endpoints/{endpoint}/dhcp/{mac}", s.handleDHCPDecision)
+}
+
+func (s *SessionHTTPServer) handleDHCPDecision(w http.ResponseWriter, r *http.Request) {
+	if s.Client == nil || s.Capabilities == nil {
+		http.Error(w, "session server unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if s.EdgeAuthenticator != nil && !s.EdgeAuthenticator.Authenticate(r.Context(), r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	endpoint := r.PathValue("endpoint")
+	mac := strings.ToLower(r.PathValue("mac"))
+	var sessions v1alpha3.NetbootSessionList
+	if err := s.Client.List(r.Context(), &sessions); err != nil {
+		http.Error(w, "loading sessions", http.StatusServiceUnavailable)
+		return
+	}
+
+	matches := make([]*v1alpha3.NetbootSession, 0, 1)
+	for i := range sessions.Items {
+		session := &sessions.Items[i]
+		if session.Spec.Endpoint.Name != endpoint || s.Capabilities.IsExpired(session) || (session.Status.Phase != v1alpha3.NetbootSessionPhaseReady && session.Status.Phase != v1alpha3.NetbootSessionPhaseActive) {
+			continue
+		}
+		for _, lease := range session.Spec.Boot.DHCPLeases {
+			if strings.EqualFold(lease.MAC, mac) {
+				matches = append(matches, session)
+				break
+			}
+		}
+	}
+	if len(matches) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if len(matches) != 1 {
+		http.Error(w, "multiple ready sessions match DHCP client", http.StatusConflict)
+		return
+	}
+
+	session := matches[0]
+	var lease *v1alpha3.DHCPLease
+	for i := range session.Spec.Boot.DHCPLeases {
+		if strings.EqualFold(session.Spec.Boot.DHCPLeases[i].MAC, mac) {
+			lease = &session.Spec.Boot.DHCPLeases[i]
+			break
+		}
+	}
+	if lease == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	bootFile := ""
+	if session.Spec.Boot.ConfigurationSource == v1alpha3.NetbootConfigurationSourceDHCP {
+		var err error
+		bootFile, err = SessionArtifactURL(s.Capabilities, session, session.Spec.Boot.FirmwareArtifact)
+		if err != nil {
+			http.Error(w, "building firmware URL", http.StatusServiceUnavailable)
+			return
+		}
+		if session.Spec.Boot.Transport == v1alpha3.NetbootTransportTFTP {
+			capability, err := s.Capabilities.Sign(session)
+			if err != nil {
+				http.Error(w, "building firmware capability", http.StatusServiceUnavailable)
+				return
+			}
+			bootFile = pathpkg.Join("v1/netboot/sessions", session.Name, capability, "artifacts", session.Spec.Boot.FirmwareArtifact)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(struct {
+		Lease     v1alpha3.DHCPLease        `json:"lease"`
+		Transport v1alpha3.NetbootTransport `json:"transport"`
+		BootFile  string                    `json:"bootFile"`
+	}{Lease: *lease, Transport: session.Spec.Boot.Transport, BootFile: bootFile}); err != nil {
+		slog.Warn("encoding DHCP decision", "err", err)
+	}
 }
 
 func (s *SessionHTTPServer) handleCallback(w http.ResponseWriter, r *http.Request) {
