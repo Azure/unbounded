@@ -28,13 +28,15 @@ import (
 )
 
 // TestApplyManifestFSSkipsNamespace asserts the operator apply path never writes
-// a Namespace object: the shared system namespace is owned solely by the
-// operator's namespace bootstrap, so components that ship a Namespace in their
-// manifests (for the standalone kubectl-apply path) must not clobber it.
+// the shared system Namespace object: it is owned solely by the operator's
+// namespace bootstrap, so components that ship it in their manifests (for the
+// standalone kubectl-apply path) must not clobber it. The skip is scoped by
+// name, so any other Namespace object is still applied.
 func TestApplyManifestFSSkipsNamespace(t *testing.T) {
 	manifests := fstest.MapFS{
-		"00-namespace.yaml": {Data: []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: unbounded-system\n")},
-		"10-configmap.yaml": {Data: []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\n  namespace: unbounded-system\n")},
+		"00-namespace.yaml":       {Data: []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: unbounded-system\n")},
+		"05-other-namespace.yaml": {Data: []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: other-ns\n")},
+		"10-configmap.yaml":       {Data: []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\n  namespace: unbounded-system\n")},
 	}
 
 	scheme := runtime.NewScheme()
@@ -65,7 +67,14 @@ func TestApplyManifestFSSkipsNamespace(t *testing.T) {
 	}
 
 	if applied["Namespace/unbounded-system"] {
-		t.Fatal("Namespace object must be skipped by the operator apply path")
+		t.Fatal("shared system Namespace object must be skipped by the operator apply path")
+	}
+
+	// A Namespace that is not the shared system namespace must still be applied:
+	// the skip is scoped by name so a future component that needs a distinct
+	// namespace is not silently dropped.
+	if !applied["Namespace/other-ns"] {
+		t.Fatalf("non-system Namespace object should be applied; applied=%#v", applied)
 	}
 
 	if !applied["ConfigMap/demo"] {

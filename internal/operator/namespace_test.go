@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -73,25 +73,26 @@ func TestBootstrapNamespaceIsIdempotent(t *testing.T) {
 // TestBootstrapNamespacePreservesForeignLabelsAndAnnotations is the core
 // preservation guarantee: labels and annotations placed on the namespace by
 // another actor survive a bootstrap, while the operator reasserts its own keys.
+//
+// The foreign keys are applied under a distinct field manager (not seeded as
+// unowned metadata) so this exercises the real multi-manager server-side-apply
+// path: the operator's ForceOwnership apply must reassert only the keys it
+// declares and leave keys owned by another manager untouched.
 func TestBootstrapNamespacePreservesForeignLabelsAndAnnotations(t *testing.T) {
-	existing := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: unbounded.DefaultSystemNamespace,
-			Labels: map[string]string{
-				"example.com/team": "platform",
-				// A third party deliberately tightened PSA; the operator owns
-				// this key and must reassert privileged (the workloads here
-				// require it).
-				"pod-security.kubernetes.io/enforce": "restricted",
-			},
-			Annotations: map[string]string{
-				"kubectl.kubernetes.io/last-applied-configuration": "{}",
-				"argocd.argoproj.io/tracking-id":                   "unbounded:/Namespace:unbounded-system",
-			},
-		},
+	foreignAnnotations := map[string]string{
+		"kubectl.kubernetes.io/last-applied-configuration": "{}",
+		"argocd.argoproj.io/tracking-id":                   "unbounded:/Namespace:unbounded-system",
 	}
 
-	c := namespaceTestClient(t, existing)
+	c := namespaceTestClient(t)
+
+	// A third party (GitOps tool) owns example.com/team and deliberately
+	// tightened PSA to restricted; the operator owns the PSA key and must
+	// reassert privileged (the workloads here require it).
+	applyAsForeignManager(t, c, "gitops", unbounded.DefaultSystemNamespace, map[string]string{
+		"example.com/team":                   "platform",
+		"pod-security.kubernetes.io/enforce": "restricted",
+	}, foreignAnnotations)
 
 	if err := BootstrapNamespace(context.Background(), c, unbounded.DefaultSystemNamespace); err != nil {
 		t.Fatalf("BootstrapNamespace: %v", err)
@@ -105,7 +106,7 @@ func TestBootstrapNamespacePreservesForeignLabelsAndAnnotations(t *testing.T) {
 	}
 
 	// Every foreign annotation survives untouched.
-	for key, want := range existing.Annotations {
+	for key, want := range foreignAnnotations {
 		if got := ns.Annotations[key]; got != want {
 			t.Fatalf("annotation %q = %q, want %q (annotations must be preserved)", key, got, want)
 		}
@@ -117,6 +118,43 @@ func TestBootstrapNamespacePreservesForeignLabelsAndAnnotations(t *testing.T) {
 			t.Fatalf("operator label %q = %q, want %q (operator is authoritative on its own keys)", key, ns.Labels[key], want)
 		}
 	}
+}
+
+// applyAsForeignManager server-side applies the namespace's labels and
+// annotations under fieldManager, so those keys are genuinely owned by a manager
+// other than the operator. This models an admin, GitOps tool, or policy engine
+// that maintains its own keys on the shared namespace.
+func applyAsForeignManager(t *testing.T, c client.Client, fieldManager, namespace string, labels, annotations map[string]string) {
+	t.Helper()
+
+	meta := map[string]any{"name": namespace}
+	if len(labels) > 0 {
+		meta["labels"] = toAnyMap(labels)
+	}
+
+	if len(annotations) > 0 {
+		meta["annotations"] = toAnyMap(annotations)
+	}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata":   meta,
+	}}
+
+	applyCfg := client.ApplyConfigurationFromUnstructured(obj)
+	if err := c.Apply(context.Background(), applyCfg, client.FieldOwner(fieldManager), client.ForceOwnership); err != nil {
+		t.Fatalf("apply namespace as %q: %v", fieldManager, err)
+	}
+}
+
+func toAnyMap(in map[string]string) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+
+	return out
 }
 
 func TestBootstrapNamespaceRefusesLegacyNamespace(t *testing.T) {
