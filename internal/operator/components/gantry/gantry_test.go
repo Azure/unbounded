@@ -5,6 +5,7 @@ package gantry
 
 import (
 	"context"
+	"io/fs"
 	"strings"
 	"testing"
 
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -119,6 +121,27 @@ func TestEnsureConfigPreservesExistingPayload(t *testing.T) {
 
 	if hash != component.ConfigMapPayloadHash(&got) {
 		t.Fatalf("hash = %q, want exact payload hash", hash)
+	}
+}
+
+func TestNodeConfigUsesAgentMarkerAndAcceptsLegacyMarker(t *testing.T) {
+	manifest, err := fs.ReadFile(gantrymanifests.Manifests, "node-config.yaml")
+	if err != nil {
+		t.Fatalf("read node-config manifest: %v", err)
+	}
+
+	const (
+		agentMarker  = "# Managed by unbounded-agent for Gantry."
+		legacyMarker = "# Managed by the Gantry node-config DaemonSet."
+	)
+
+	content := string(manifest)
+	if strings.Count(content, agentMarker) < 2 {
+		t.Fatalf("node-config manifest does not write and recognize agent marker %q", agentMarker)
+	}
+
+	if !strings.Contains(content, legacyMarker) {
+		t.Fatalf("node-config manifest does not recognize legacy marker %q", legacyMarker)
 	}
 }
 

@@ -24,7 +24,8 @@ name: unbounded release
 #         -> net-images-manifest (multi-arch tag stitch + sign + SBOM attest)
 #     -> netboot-image     (PXE boot artifact image)
 #         -> metalman-image (stamped with the matching default netboot image)
-#     -> component-images  (matrix: machina, machine-ops-controller, orca, gantry, host-ubuntu2404)
+#     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
+#                           orca, gantry, unbounded-storage-supervisor, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
 #     -> finalize          (attach extras + krew manifest)
@@ -629,6 +630,10 @@ jobs:
             file: images/gantry/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          - name: unbounded-storage-supervisor
+            file: images/unbounded-storage-supervisor/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64,linux/arm64
@@ -744,7 +749,9 @@ jobs:
           TAG="${{ needs.version.outputs.tag }}"
           make release-manifests unbounded-operator-release-manifest \
             VERSION="${TAG}" \
-            CONTAINER_REGISTRY="${{ env.REGISTRY }}"
+            CONTAINER_REGISTRY="${{ env.REGISTRY }}" \
+            NET_APISERVER_URL="" \
+            UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT=""
 
       - name: Sign manifests tarball with cosign (keyless)
         run: |

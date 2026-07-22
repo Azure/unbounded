@@ -1316,7 +1316,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local ## Build all container images locally
+images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
 
 ##@ Net Frontend
 
@@ -1388,21 +1388,26 @@ RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
 UNBOUNDED_OPERATOR_RELEASE_MANIFEST := build/unbounded-operator-$(VERSION).yaml
 
+unbounded-operator-release-manifest: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
 unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a versioned, directly applicable operator manifest under build/
 	@mkdir -p build
 	@cat $$(ls -1 "$(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)"/*.yaml | LC_ALL=C sort) > "$(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
 	@echo "Operator release manifest: $(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
 
-release-manifests: machina-manifests machine-ops-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build stamped combined manifest tarball under build/
+release-manifests: NET_APISERVER_URL :=
+release-manifests: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
+release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
+	@cp -R $(GANTRY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry/
 	@cp -R $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor/
 	@cp -R $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator/
 	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
