@@ -40,6 +40,14 @@ func TestSourceKind(t *testing.T) {
 	}
 }
 
+func TestParseRootRedactsInvalidURL(t *testing.T) {
+	t.Parallel()
+
+	_, err := ParseRoot("https://artifacts.example.test/%zz?sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
+}
+
 func TestParseRootResolvesOCIArtifact(t *testing.T) {
 	t.Parallel()
 

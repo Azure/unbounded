@@ -71,6 +71,50 @@ jobs:
           path: bin/agent-artifacts-builder
           retention-days: 1
 
+  publish-rootfs-archives:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download agent artifacts builder
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: agent-artifacts-builder
+          path: bin
+
+      - name: Prepare agent artifacts builder
+        run: chmod +x bin/agent-artifacts-builder
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Export rootfs OCI layout archives
+        run: |
+          mkdir -p dist/rootfs-images
+
+          while IFS= read -r image_ref; do
+            archive_name="${image_ref##*/}"
+            archive_name="${archive_name//:/-}"
+            archive_name="${archive_name//@/-}"
+
+            bin/agent-artifacts-builder archive-oci-image \
+              --source "${image_ref}" \
+              --output "dist/rootfs-images/${archive_name}.oci.tar.gz"
+          done < <(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' hack/cmd/agent-artifacts-builder/rootfs-images.txt)
+
+      - name: Upload rootfs OCI layout archives
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rootfs-oci-layouts
+          path: dist/rootfs-images/
+          retention-days: 7
+
   publish:
     needs: resolve
     name: publish (${{ matrix.group.minor }})

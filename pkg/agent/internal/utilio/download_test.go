@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +26,19 @@ func TestRedactURLQuery(t *testing.T) {
 	got := RedactURLQuery("https://artifacts.example.test/archive?sp=r&sig=secret")
 	if got != "https://artifacts.example.test/archive?REDACTED" {
 		t.Fatalf("RedactURLQuery() = %q", got)
+	}
+}
+
+func TestValidateHTTPDownloadSourceRedactsInvalidURL(t *testing.T) {
+	t.Parallel()
+
+	err := validateHTTPDownloadSource("https://artifacts.example.test/%zz?sig=secret")
+	if err == nil {
+		t.Fatal("validateHTTPDownloadSource() error = nil, want parse error")
+	}
+
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("parse error contains signed query secret: %v", err)
 	}
 }
 

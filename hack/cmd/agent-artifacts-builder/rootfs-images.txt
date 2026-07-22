@@ -1,0 +1,8 @@
+# Rootfs OCI images exported as HTTPS-consumable OCI layout archives by the
+# agent offline artifacts publishing workflow.
+ghcr.io/azure/agent-ubuntu2404:v20260619
+ghcr.io/azure/agent-ubuntu2404-nvidia:v20260619
+ghcr.io/azure/agent-ubuntu2604:v20260619
+ghcr.io/azure/agent-ubuntu2604-nvidia:v20260619
+ghcr.io/azure/agent-azlinux3:v20260619
+ghcr.io/azure/agent-azlinux3-nvidia:v20260626

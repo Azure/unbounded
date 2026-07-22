@@ -11,7 +11,25 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
+
+func TestRootfsImagesMatchAgentDefaults(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile("rootfs-images.txt")
+	require.NoError(t, err)
+
+	require.Equal(t, []string{
+		goalstates.DefaultOCIImage,
+		goalstates.DefaultNvidiaOCIImage,
+		goalstates.DefaultUbuntu2604OCIImage,
+		goalstates.DefaultUbuntu2604NvidiaOCIImage,
+		goalstates.DefaultAzureLinux3OCIImage,
+		goalstates.DefaultAzureLinux3NvidiaOCIImage,
+	}, strings.Fields(stripLineComments(string(data))))
+}
 
 func TestResolvePublishInputsWorkflowDispatchUsesExplicitInputs(t *testing.T) {
 	output := filepath.Join(t.TempDir(), "github-output")

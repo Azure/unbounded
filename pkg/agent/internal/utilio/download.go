@@ -126,7 +126,7 @@ func downloadFromRemote(ctx context.Context, source string) (io.ReadCloser, erro
 func validateHTTPDownloadSource(source string) error {
 	parsed, err := url.Parse(source)
 	if err != nil {
-		return fmt.Errorf("parse download source %q: %w", source, err)
+		return fmt.Errorf("parse download source %q: %w", RedactURLQuery(source), RedactHTTPError(err))
 	}
 
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {

@@ -593,7 +593,7 @@ ghcr.io/azure/agent-azlinux3:v20260619
 ghcr.io/azure/agent-azlinux3-nvidia:v20260626
 ```
 
-Offline operators mirror these images into their target environment by copying them to an internal registry, exporting them as local OCI layout directories, or packaging those layouts as tar archives for HTTPS delivery. An HTTPS rootfs archive should contain the same OCI layout content that filesystem mode consumes, with exactly one tagged image reference. For `agent-*` images, the container image workflow uses `agent-artifacts-builder archive-oci-image` to export the pushed image and uploads the resulting `.oci.tar.gz` archive and adjacent `.sha256` file as GitHub Actions artifacts.
+Offline operators mirror these images into their target environment by copying them to an internal registry, exporting them as local OCI layout directories, or packaging those layouts as tar archives for HTTPS delivery. An HTTPS rootfs archive should contain the same OCI layout content that filesystem mode consumes, with exactly one tagged image reference. The rootfs image references exported with offline artifacts are declared in `hack/cmd/agent-artifacts-builder/rootfs-images.txt`. The agent offline artifacts workflow uses `agent-artifacts-builder archive-oci-image` to pull each declared image and publish an `.oci.tar.gz` archive with an adjacent `.sha256` file. The normal container image publishing workflow remains unchanged.
 
 ### Binary artifact bundle publishing
 
