@@ -55,10 +55,16 @@ type OfflineTemplateData struct {
 	KubernetesVersionNoV string
 }
 
+type offlineArtifactSource struct {
+	root     string
+	artifact artifactsource.Source
+}
+
 // ResolvedOfflineArtifacts is a validated offline artifact source and manifest.
 type ResolvedOfflineArtifacts struct {
 	SourceRoot string
 	Manifest   OfflineArtifactManifest
+	source     artifactsource.Source
 }
 
 // ContainerImageArchiveStaging describes host-side staged container image archives.
@@ -92,20 +98,25 @@ func resolveOfflineArtifacts(ctx context.Context, cfg *config.AgentConfig, offli
 		return nil, err
 	}
 
-	sourceRoot, err := normalizeOfflineSourceRoot(renderedSource)
+	source, err := normalizeOfflineSourceRoot(renderedSource)
 	if err != nil {
 		return nil, err
 	}
 
-	httpsArchive := strings.HasPrefix(sourceRoot, "https://")
+	httpsArchive := source.artifact.Kind() == artifactsource.KindHTTP
 	if httpsArchive {
-		sourceRoot, err = materializeHTTPSOfflineArchive(ctx, sourceRoot)
+		cacheRoot, err := materializeHTTPSOfflineArchive(ctx, source)
 		if err != nil {
 			return nil, err
 		}
+
+		source, err = normalizeOfflineSourceRoot(cacheRoot)
+		if err != nil {
+			return nil, fmt.Errorf("resolve extracted HTTPS offline artifact cache: %w", err)
+		}
 	}
 
-	manifest, err := loadOfflineManifest(sourceRoot)
+	manifest, err := loadOfflineManifest(ctx, source)
 	if err != nil {
 		return nil, err
 	}
@@ -118,17 +129,17 @@ func resolveOfflineArtifacts(ctx context.Context, cfg *config.AgentConfig, offli
 		return nil, err
 	}
 
-	if err := verifyOfflineFiles(sourceRoot, manifest); err != nil {
+	if err := verifyOfflineFiles(ctx, source, manifest); err != nil {
 		return nil, err
 	}
 
 	if httpsArchive {
-		if err := markOfflineArchiveCacheReady(sourceRoot); err != nil {
+		if err := markOfflineArchiveCacheReady(source.root); err != nil {
 			return nil, err
 		}
 	}
 
-	return &ResolvedOfflineArtifacts{SourceRoot: sourceRoot, Manifest: manifest}, nil
+	return &ResolvedOfflineArtifacts{SourceRoot: source.root, Manifest: manifest, source: source.artifact}, nil
 }
 
 // RenderOfflineSource renders an OfflineArtifacts.Source template for the given
@@ -152,84 +163,114 @@ func RenderOfflineSource(sourceTemplate, kubernetesVersion string) (string, erro
 	return out.String(), nil
 }
 
-func normalizeOfflineSourceRoot(source string) (string, error) {
+func normalizeOfflineSourceRoot(source string) (offlineArtifactSource, error) {
 	source = strings.TrimSpace(source)
 	if source == "" {
-		return "", errors.New("offline artifact source is empty")
+		return offlineArtifactSource{}, errors.New("offline artifact source is empty")
 	}
 
-	if strings.HasPrefix(source, "oci://") {
-		u, err := url.Parse(source)
-		if err != nil {
-			return "", fmt.Errorf("parse OCI offline artifact source %q: %w", source, err)
-		}
-
-		if u.Host == "" || strings.Trim(u.Path, "/") == "" {
-			return "", fmt.Errorf("OCI offline artifact source must include registry and repository: %q", source)
-		}
-
-		if u.Fragment != "" {
-			return "", fmt.Errorf("OCI offline artifact source must not include a fragment: %q", source)
-		}
-
-		return strings.TrimRight(source, "/"), nil
+	typedSource, err := artifactsource.ParseRoot(source)
+	if err != nil {
+		return offlineArtifactSource{}, err
 	}
 
-	if strings.HasPrefix(source, "https://") {
-		u, err := url.Parse(source)
-		if err != nil {
-			return "", fmt.Errorf("parse HTTPS offline artifact source: %w", utilio.RedactHTTPError(err))
-		}
-
-		if u.Host == "" || strings.Trim(u.Path, "/") == "" {
-			return "", errors.New("HTTPS offline artifact source must include a host and archive path")
-		}
-
-		if u.User != nil || u.Fragment != "" {
-			return "", errors.New("HTTPS offline artifact source must not include user info or a fragment")
-		}
-
-		u.Path = strings.TrimRight(u.Path, "/")
-		u.RawPath = strings.TrimRight(u.RawPath, "/")
-
-		return u.String(), nil
+	switch typedSource.Kind() {
+	case artifactsource.KindLocal:
+		return normalizeLocalOfflineSource(typedSource)
+	case artifactsource.KindHTTP:
+		return normalizeHTTPSOfflineSource(typedSource)
+	case artifactsource.KindOCI:
+		return normalizeOCIOfflineSource(typedSource)
+	default:
+		return offlineArtifactSource{}, fmt.Errorf("unsupported OfflineArtifacts.Source kind %d", typedSource.Kind())
 	}
-
-	if strings.HasPrefix(source, "file://") {
-		u, err := url.Parse(source)
-		if err != nil {
-			return "", fmt.Errorf("parse file offline artifact source %q: %w", source, err)
-		}
-
-		if u.Host != "" && u.Host != "localhost" {
-			return "", fmt.Errorf("file offline artifact source must not include host %q", u.Host)
-		}
-
-		if u.Path == "" || !filepath.IsAbs(u.Path) {
-			return "", fmt.Errorf("file offline artifact source must use an absolute path: %q", source)
-		}
-
-		return filepath.Clean(u.Path), nil
-	}
-
-	if strings.Contains(source, "://") {
-		return "", fmt.Errorf("unsupported OfflineArtifacts.Source scheme in %q", source)
-	}
-
-	if !filepath.IsAbs(source) {
-		return "", fmt.Errorf("offline artifact source must be an absolute path: %q", source)
-	}
-
-	return filepath.Clean(source), nil
 }
 
-func materializeHTTPSOfflineArchive(ctx context.Context, archiveURL string) (string, error) {
-	source, err := artifactsource.Parse(archiveURL)
-	if err != nil {
-		return "", fmt.Errorf("parse HTTPS offline artifact archive: %w", err)
+func normalizeLocalOfflineSource(typedSource artifactsource.Source) (offlineArtifactSource, error) {
+	localPath, ok := typedSource.LocalPath()
+	if !ok {
+		return offlineArtifactSource{}, fmt.Errorf("offline artifact source %q is not local", typedSource.String())
 	}
 
-	return materializeOfflineArchive(ctx, source, OfflineArtifactArchiveHostDir, archiveURL)
+	return offlineArtifactSource{
+		root:     localPath,
+		artifact: typedSource,
+	}, nil
+}
+
+func normalizeHTTPSOfflineSource(typedSource artifactsource.Source) (offlineArtifactSource, error) {
+	parsed, err := url.Parse(typedSource.String())
+	if err != nil {
+		return offlineArtifactSource{}, fmt.Errorf("parse HTTPS offline artifact source: %w", utilio.RedactHTTPError(err))
+	}
+
+	if parsed.Scheme != "https" {
+		return offlineArtifactSource{}, fmt.Errorf("unsupported OfflineArtifacts.Source scheme %q", parsed.Scheme)
+	}
+
+	if parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {
+		return offlineArtifactSource{}, errors.New("HTTPS offline artifact source must include a host and archive path")
+	}
+
+	if parsed.User != nil || parsed.Fragment != "" {
+		return offlineArtifactSource{}, errors.New("HTTPS offline artifact source must not include user info or a fragment")
+	}
+
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+	root := parsed.String()
+
+	typedSource, err = artifactsource.ParseRoot(root)
+	if err != nil {
+		return offlineArtifactSource{}, fmt.Errorf("parse HTTPS offline artifact archive: %w", err)
+	}
+
+	return offlineArtifactSource{
+		root:     root,
+		artifact: typedSource,
+	}, nil
+}
+
+func normalizeOCIOfflineSource(typedRoot artifactsource.Source) (offlineArtifactSource, error) {
+	parsed, err := url.Parse(typedRoot.String())
+	if err != nil {
+		return offlineArtifactSource{}, fmt.Errorf("parse OCI offline artifact source: %w", err)
+	}
+
+	if parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {
+		return offlineArtifactSource{}, errors.New("OCI offline artifact source must include registry and repository")
+	}
+
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return offlineArtifactSource{}, errors.New("OCI offline artifact source must not include user info, query parameters, or a fragment")
+	}
+
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+	root := parsed.String()
+
+	typedRoot, err = artifactsource.ParseRoot(root)
+	if err != nil {
+		return offlineArtifactSource{}, fmt.Errorf("parse OCI offline artifact root: %w", err)
+	}
+
+	typedSource, err := typedRoot.OCIArtifact(OfflineArtifactManifestFileName)
+	if err != nil {
+		return offlineArtifactSource{}, fmt.Errorf("parse OCI offline artifact manifest source: %w", err)
+	}
+
+	return offlineArtifactSource{
+		root:     root,
+		artifact: typedSource,
+	}, nil
+}
+
+func materializeHTTPSOfflineArchive(ctx context.Context, source offlineArtifactSource) (string, error) {
+	if source.artifact.Kind() != artifactsource.KindHTTP {
+		return "", errors.New("HTTPS offline artifact archive source is required")
+	}
+
+	return materializeOfflineArchive(ctx, source.artifact, OfflineArtifactArchiveHostDir, source.root)
 }
 
 func materializeOfflineArchive(ctx context.Context, source artifactsource.Source, cacheRoot, sourceID string) (string, error) {
@@ -321,31 +362,34 @@ func findOfflineArchiveBundleRoot(extractDir string) (string, error) {
 	return filepath.Dir(manifests[0]), nil
 }
 
-func loadOfflineManifest(sourceRoot string) (OfflineArtifactManifest, error) {
+func loadOfflineManifest(ctx context.Context, source offlineArtifactSource) (OfflineArtifactManifest, error) {
 	var (
 		data []byte
 		err  error
 	)
 
-	if strings.HasPrefix(sourceRoot, "oci://") {
-		data, err = fetchOCIBlobByTitle(context.Background(), sourceRoot, OfflineArtifactManifestFileName)
-	} else {
-		path := filepath.Join(sourceRoot, OfflineArtifactManifestFileName)
+	switch source.artifact.Kind() {
+	case artifactsource.KindOCI:
+		data, err = readArtifactSource(ctx, source.artifact)
+	case artifactsource.KindLocal:
+		path := filepath.Join(source.root, OfflineArtifactManifestFileName)
 		data, err = os.ReadFile(path)
+	default:
+		return OfflineArtifactManifest{}, fmt.Errorf("unsupported resolved offline artifact source kind %d", source.artifact.Kind())
 	}
 
 	if err != nil {
-		return OfflineArtifactManifest{}, fmt.Errorf("read offline artifact manifest from %q: %w", sourceRoot, err)
+		return OfflineArtifactManifest{}, fmt.Errorf("read offline artifact manifest from %q: %w", source.root, err)
 	}
 
 	var manifest OfflineArtifactManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return OfflineArtifactManifest{}, fmt.Errorf("parse offline artifact manifest from %q: %w", sourceRoot, err)
+		return OfflineArtifactManifest{}, fmt.Errorf("parse offline artifact manifest from %q: %w", source.root, err)
 	}
 
 	manifest, err = normalizeOfflineManifest(manifest)
 	if err != nil {
-		return OfflineArtifactManifest{}, fmt.Errorf("validate offline artifact manifest from %q: %w", sourceRoot, err)
+		return OfflineArtifactManifest{}, fmt.Errorf("validate offline artifact manifest from %q: %w", source.root, err)
 	}
 
 	return manifest, nil
@@ -368,16 +412,20 @@ func validateRuntimeVersionConflicts(cfg *config.AgentConfig, manifest OfflineAr
 	return errors.Join(errs...)
 }
 
-func verifyOfflineFiles(sourceRoot string, manifest OfflineArtifactManifest) error {
+func verifyOfflineFiles(ctx context.Context, source offlineArtifactSource, manifest OfflineArtifactManifest) error {
 	paths := offlineArtifactPaths(manifest, runtime.GOARCH)
-	if strings.HasPrefix(sourceRoot, "oci://") {
-		return verifyOCIArtifacts(sourceRoot, paths)
+	if source.artifact.Kind() == artifactsource.KindOCI {
+		return verifyOCIArtifacts(ctx, source.root, paths)
+	}
+
+	if source.artifact.Kind() != artifactsource.KindLocal {
+		return fmt.Errorf("unsupported resolved offline artifact source kind %d", source.artifact.Kind())
 	}
 
 	var errs []error
 
 	for _, path := range paths {
-		fullPath := filepath.Join(sourceRoot, filepath.FromSlash(path))
+		fullPath := filepath.Join(source.root, filepath.FromSlash(path))
 
 		info, err := os.Stat(fullPath)
 		switch {
@@ -414,8 +462,8 @@ func offlineArtifactPaths(manifest OfflineArtifactManifest, arch string) []strin
 	return paths
 }
 
-func verifyOCIArtifacts(sourceRoot string, paths []string) error {
-	manifest, err := ociartifact.FetchManifest(context.Background(), sourceRoot)
+func verifyOCIArtifacts(ctx context.Context, sourceRoot string, paths []string) error {
+	manifest, err := ociartifact.FetchManifest(ctx, sourceRoot)
 	if err != nil {
 		return err
 	}
@@ -458,12 +506,8 @@ func ResolveDownloadOverridesWithOfflineArtifacts(ctx context.Context, cfg *conf
 
 func downloadOverridesFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArtifacts) *DownloadOverrides {
 	manifest := offlineArtifacts.Manifest
-	rootURL := offlineArtifactURLRoot(offlineArtifacts.SourceRoot)
-
-	separator := "/"
-	if strings.HasPrefix(offlineArtifacts.SourceRoot, "oci://") {
-		separator = "#"
-	}
+	rootURL := offlineArtifactURLRoot(offlineArtifacts.SourceRoot, offlineArtifacts.source.Kind())
+	separator := offlineArtifactURLSeparator(offlineArtifacts.source.Kind())
 
 	overrides := &DownloadOverrides{
 		Kubernetes: &DownloadSource{
@@ -496,12 +540,8 @@ func containerImageArchiveURLsFromOfflineArtifacts(offlineArtifacts *ResolvedOff
 		return []string{}
 	}
 
-	rootURL := offlineArtifactURLRoot(offlineArtifacts.SourceRoot)
-
-	separator := "/"
-	if strings.HasPrefix(offlineArtifacts.SourceRoot, "oci://") {
-		separator = "#"
-	}
+	rootURL := offlineArtifactURLRoot(offlineArtifacts.SourceRoot, offlineArtifacts.source.Kind())
+	separator := offlineArtifactURLSeparator(offlineArtifacts.source.Kind())
 
 	urls := make([]string, 0, len(offlineArtifacts.Manifest.ContainerImages))
 	for _, imageTag := range offlineArtifacts.Manifest.ContainerImages {
@@ -546,20 +586,28 @@ func containerImageArchiveSourceKey(sourceRoot string) string {
 	return prefix + "-" + hash
 }
 
-func offlineArtifactURLRoot(sourceRoot string) string {
-	if strings.HasPrefix(sourceRoot, "oci://") {
+func offlineArtifactURLRoot(sourceRoot string, sourceKind artifactsource.Kind) string {
+	if sourceKind == artifactsource.KindOCI {
 		return sourceRoot
 	}
 
 	return fileURL(sourceRoot)
 }
 
+func offlineArtifactURLSeparator(sourceKind artifactsource.Kind) string {
+	if sourceKind == artifactsource.KindOCI {
+		return "#"
+	}
+
+	return "/"
+}
+
 func fileURL(path string) string {
 	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
 }
 
-func fetchOCIBlobByTitle(ctx context.Context, sourceRoot, title string) ([]byte, error) {
-	body, err := ociartifact.Open(ctx, sourceRoot+"#"+title)
+func readArtifactSource(ctx context.Context, source artifactsource.Source) ([]byte, error) {
+	body, err := source.Open(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -567,7 +615,7 @@ func fetchOCIBlobByTitle(ctx context.Context, sourceRoot, title string) ([]byte,
 
 	data, err := io.ReadAll(body)
 	if err != nil {
-		return nil, fmt.Errorf("read OCI blob %q: %w", title, err)
+		return nil, fmt.Errorf("read artifact source: %w", err)
 	}
 
 	return data, nil

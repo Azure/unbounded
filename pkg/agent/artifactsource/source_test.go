@@ -16,6 +16,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSourceKind(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		source string
+		kind   Kind
+	}{
+		{name: "local", source: "/opt/unbounded/artifact", kind: KindLocal},
+		{name: "HTTPS", source: "https://artifacts.example.test/archive.tar.gz", kind: KindHTTP},
+		{name: "OCI", source: "oci://registry.example.test/artifacts:v1#manifest.json", kind: KindOCI},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			source, err := Parse(tt.source)
+			require.NoError(t, err)
+			require.Equal(t, tt.kind, source.Kind())
+		})
+	}
+}
+
+func TestParseRootResolvesOCIArtifact(t *testing.T) {
+	t.Parallel()
+
+	root, err := ParseRoot("oci://registry.example.test/artifacts:v1")
+	require.NoError(t, err)
+	require.Equal(t, KindOCI, root.Kind())
+
+	manifest, err := root.OCIArtifact("manifest.json")
+	require.NoError(t, err)
+	require.Equal(t, "oci://registry.example.test/artifacts:v1#manifest.json", manifest.String())
+}
+
 func TestSourceOpenHTTPSURL(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("artifact-data"))
