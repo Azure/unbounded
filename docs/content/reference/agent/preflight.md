@@ -88,7 +88,7 @@ Text output is intended for humans and follows a kubeadm-style format:
     [OK is-privileged-user]: preflight is running as root (target: host user)
     [WARNING swap-active]: swap is enabled and bootstrap will disable it (target: host swap)
 [preflight] Some fatal errors occurred:
-    [ERROR oci-image-reachable]: rootfs image manifest is not reachable: rootfs-image (target: rootfs image)
+    [ERROR oci-image-reachable]: rootfs image source is not reachable: rootfs-image (target: rootfs image)
 [preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`
 ```
 
@@ -122,7 +122,7 @@ ignored errors, and fatal errors:
       "name": "oci-image-reachable",
       "target": "rootfs image",
       "severity": "error",
-      "message": "rootfs image manifest is not reachable: rootfs-image",
+      "message": "rootfs image source is not reachable: rootfs-image",
       "ignored": false
     }
   ],
@@ -187,14 +187,15 @@ The `nvidia-driver` check can return multiple results with different targets:
 
 | Check | Severity when failing | What it validates |
 |---|---|---|
-| `oci-image-reachable` | Error | The selected rootfs OCI image is configured and its manifest is reachable without pulling image layers. |
+| `oci-image-reachable` | Error | The selected rootfs OCI image is configured and its registry manifest, local layout, or HTTPS layout archive is reachable without pulling image contents. |
 | `kubernetes-artifacts` | Error | Required Kubernetes binary sources are reachable without downloading full artifacts: kubelet, kubectl, and kube-proxy. |
 | `cri-artifacts` | Error | Required CRI artifact sources are reachable without downloading or extracting full artifacts: containerd, runc, and crictl. |
 | `cni-artifacts` | Error | The CNI plugins artifact source is reachable without downloading or extracting the full artifact. |
 | `nspawn-machine-provisioning` | Error or warning | The nspawn machine directory and provisioning paths are usable. Invalid or unreadable paths are fatal. Existing machine directory permissions that are too restrictive are warnings. |
 
 HTTP artifact checks probe each resolved URL without downloading the full
-artifact. OCI image checks resolve the image manifest without pulling layers.
+artifact. OCI registry checks resolve the image manifest without pulling
+layers; HTTPS archive checks probe the archive URL without downloading it.
 
 ## Sensitive Values
 

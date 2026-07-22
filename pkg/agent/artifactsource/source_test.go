@@ -6,6 +6,8 @@ package artifactsource
 import (
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,6 +15,32 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestSourceOpenHTTPSURL(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("artifact-data"))
+	}))
+	defer server.Close()
+
+	originalClient := httpClient
+	httpClient = server.Client()
+
+	t.Cleanup(func() {
+		httpClient = originalClient
+	})
+
+	source, err := Parse(server.URL + "/artifact")
+	require.NoError(t, err)
+
+	body, err := source.Open(context.Background())
+	require.NoError(t, err)
+
+	defer body.Close() //nolint:errcheck // test cleanup
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, "artifact-data", string(got))
+}
 
 func TestSourceOpenFileURL(t *testing.T) {
 	t.Parallel()

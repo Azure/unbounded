@@ -5,16 +5,20 @@ package oci
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/registry/remote"
@@ -22,6 +26,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -29,6 +34,7 @@ import (
 const (
 	ociLayoutScheme    = "oci-layout://"
 	ociImageScheme     = "oci://"
+	httpsImageScheme   = "https://"
 	ociPullMaxAttempts = 5
 	ociPullRetryDelay  = 2 * time.Second
 )
@@ -69,6 +75,14 @@ func (d *downloadRootFS) Do(ctx context.Context) error {
 		return nil
 	}
 
+	if archiveURL, ok, err := parseHTTPSArchiveReference(d.ociImage); ok || err != nil {
+		if err != nil {
+			return fmt.Errorf("parse HTTPS OCI archive reference %q: %w", d.ociImage, err)
+		}
+
+		return d.downloadArchiveAndUnpack(ctx, archiveURL)
+	}
+
 	if layoutDir, tag, ok, err := parseOCILayoutReference(d.ociImage); ok || err != nil {
 		if err != nil {
 			return fmt.Errorf("parse OCI layout reference %q: %w", d.ociImage, err)
@@ -106,6 +120,49 @@ func (d *downloadRootFS) Do(ctx context.Context) error {
 	// Pull the image into a temporary OCI layout store, then use umoci to
 	// unpack the layers into the machine directory.
 	return d.pullAndUnpack(ctx, ref, tag)
+}
+
+func (d *downloadRootFS) downloadArchiveAndUnpack(ctx context.Context, archiveURL string) error {
+	layoutParent, err := os.MkdirTemp("", "unbounded-oci-archive-*")
+	if err != nil {
+		return fmt.Errorf("create OCI archive extraction directory: %w", err)
+	}
+	defer os.RemoveAll(layoutParent) //nolint:errcheck // best effort cleanup
+
+	source, err := artifactsource.Parse(archiveURL)
+	if err != nil {
+		return fmt.Errorf("parse HTTPS OCI archive source: %w", err)
+	}
+
+	d.log.Info("downloading HTTPS OCI image archive",
+		slog.String("image", archiveURL),
+		slog.String("dest", d.machineDir))
+
+	if err := source.ExtractTar(ctx, layoutParent); err != nil {
+		return fmt.Errorf("download and extract HTTPS OCI image archive: %w", err)
+	}
+
+	layoutDir, err := findOCILayoutRoot(layoutParent)
+	if err != nil {
+		return err
+	}
+
+	tag, err := singleOCILayoutReference(layoutDir)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(d.machineDir, 0o755); err != nil {
+		return fmt.Errorf("create machine directory: %w", err)
+	}
+
+	if err := unpackOCILayout(ctx, d.log, d.hostArch, layoutDir, tag, d.machineDir); err != nil {
+		return fmt.Errorf("unpack HTTPS OCI image archive: %w", err)
+	}
+
+	d.log.Info("OCI image extraction complete", slog.String("dest", d.machineDir))
+
+	return nil
 }
 
 // pullAndUnpack pulls the OCI image into a temporary OCI layout directory and
@@ -260,9 +317,26 @@ func maxOCIPullRetryDelay() time.Duration {
 	return delay
 }
 
-// CheckImageReachable validates that an OCI image manifest can be resolved
-// without pulling layers or writing durable state.
+// CheckImageReachable validates that an OCI registry manifest, local layout,
+// or HTTPS OCI layout archive is reachable without pulling image contents.
 func CheckImageReachable(ctx context.Context, image string) error {
+	if archiveURL, ok, err := parseHTTPSArchiveReference(image); ok || err != nil {
+		if err != nil {
+			return fmt.Errorf("parse HTTPS OCI archive reference: %w", err)
+		}
+
+		source, err := artifactsource.Parse(archiveURL)
+		if err != nil {
+			return fmt.Errorf("parse HTTPS OCI archive source: %w", err)
+		}
+
+		if err := source.Probe(ctx); err != nil {
+			return fmt.Errorf("probe HTTPS OCI archive: %w", err)
+		}
+
+		return nil
+	}
+
 	if layoutDir, tag, ok, err := parseOCILayoutReference(image); ok || err != nil {
 		if err != nil {
 			return fmt.Errorf("parse OCI layout reference: %w", err)
@@ -297,6 +371,83 @@ func CheckImageReachable(ctx context.Context, image string) error {
 	return nil
 }
 
+func parseHTTPSArchiveReference(image string) (archiveURL string, ok bool, err error) {
+	if !strings.HasPrefix(image, httpsImageScheme) {
+		return "", false, nil
+	}
+
+	parsed, err := url.Parse(image)
+	if err != nil {
+		return "", true, err
+	}
+
+	if parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {
+		return "", true, fmt.Errorf("HTTPS OCI archive reference must include a host and archive path")
+	}
+
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", true, fmt.Errorf("HTTPS OCI archive reference must not include user info, query parameters, or a fragment")
+	}
+
+	return parsed.String(), true, nil
+}
+
+func findOCILayoutRoot(extractDir string) (string, error) {
+	var layouts []string
+
+	if err := filepath.WalkDir(extractDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !entry.IsDir() && entry.Name() == "oci-layout" {
+			layouts = append(layouts, filepath.Dir(path))
+		}
+
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("inspect HTTPS OCI image archive: %w", err)
+	}
+
+	if len(layouts) == 0 {
+		return "", fmt.Errorf("HTTPS OCI image archive does not contain an OCI layout")
+	}
+
+	if len(layouts) > 1 {
+		return "", fmt.Errorf("HTTPS OCI image archive contains multiple OCI layouts")
+	}
+
+	indexInfo, err := os.Stat(filepath.Join(layouts[0], "index.json"))
+	if err != nil || !indexInfo.Mode().IsRegular() {
+		return "", fmt.Errorf("HTTPS OCI image archive does not contain a regular index.json")
+	}
+
+	return layouts[0], nil
+}
+
+func singleOCILayoutReference(layoutDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(layoutDir, "index.json"))
+	if err != nil {
+		return "", fmt.Errorf("read HTTPS OCI image archive index: %w", err)
+	}
+
+	var index ocispec.Index
+	if err := json.Unmarshal(data, &index); err != nil {
+		return "", fmt.Errorf("parse HTTPS OCI image archive index: %w", err)
+	}
+
+	if len(index.Manifests) != 1 {
+		return "", fmt.Errorf("HTTPS OCI image archive must contain exactly one image reference")
+	}
+
+	reference := index.Manifests[0].Annotations[ocispec.AnnotationRefName]
+	if reference == "" {
+		return "", fmt.Errorf("HTTPS OCI image archive contains an unnamed image reference")
+	}
+
+	return reference, nil
+}
+
 func parseOCILayoutReference(image string) (layoutDir, tag string, ok bool, err error) {
 	if !strings.HasPrefix(image, ociLayoutScheme) {
 		return "", "", false, nil
@@ -326,10 +477,11 @@ func parseOCILayoutReference(image string) (layoutDir, tag string, ok bool, err 
 
 // parseImageReference splits an OCI image reference like
 // "registry.example.com/repo:tag" or "oci://registry.example.com/repo:tag"
-// into the repository reference and tag.
-// If no tag is specified, "latest" is used.
+// into the repository reference and tag. If no tag is specified, "latest" is
+// used.
 func parseImageReference(image string) (ref, tag string, err error) {
 	image = strings.TrimPrefix(image, ociImageScheme)
+
 	if image == "" {
 		return "", "", fmt.Errorf("empty image reference")
 	}

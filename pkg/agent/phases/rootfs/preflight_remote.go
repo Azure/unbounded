@@ -25,8 +25,8 @@ type ociImageReachableChecker struct {
 	rootFS *goalstates.RootFS
 }
 
-// CheckOCIImageReachable validates that the OCI rootfs image manifest can be
-// resolved without pulling layers.
+// CheckOCIImageReachable validates that the OCI rootfs image source is
+// reachable without pulling image contents.
 func CheckOCIImageReachable(_ *slog.Logger, rootFS *goalstates.RootFS) preflight.Checker {
 	return ociImageReachableChecker{rootFS: rootFS}
 }
@@ -39,10 +39,10 @@ func (c ociImageReachableChecker) Check(ctx context.Context) []preflight.Result 
 	}
 
 	if err := oci.CheckImageReachable(ctx, c.rootFS.OCIImage); err != nil {
-		return preflight.ResultsError(checkOCIImageReachableName, "rootfs image", "rootfs image manifest is not reachable")
+		return preflight.ResultsError(checkOCIImageReachableName, "rootfs image", "rootfs image source is not reachable")
 	}
 
-	return preflight.ResultsOK(checkOCIImageReachableName, "rootfs image", "rootfs image manifest is reachable")
+	return preflight.ResultsOK(checkOCIImageReachableName, "rootfs image", "rootfs image source is reachable")
 }
 
 // CheckKubernetesArtifacts validates that Kubernetes binary artifact URLs are

@@ -198,6 +198,17 @@ func ReadExpectedSHA256(ctx context.Context, checksumSource Source) (string, err
 	return hashStr, nil
 }
 
+// ExtractTar extracts a tar or gzip-compressed tar artifact into destDir.
+func (s Source) ExtractTar(ctx context.Context, destDir string) error {
+	body, err := s.Open(ctx)
+	if err != nil {
+		return err
+	}
+	defer body.Close() //nolint:errcheck // best effort close
+
+	return utilio.ExtractTar(body, destDir)
+}
+
 // DecompressTarGz returns an iterator that yields files from a gzip-compressed
 // tar artifact source.
 func (s Source) DecompressTarGz(ctx context.Context) utilio.TarFileSeq {

@@ -47,8 +47,10 @@ type AgentConfig struct {
 	CNI      CNIConfig          `json:"CNI"`
 	Gantry   *GantryConfig      `json:"Gantry,omitempty"`
 
-	// OCIImage is the fully-qualified OCI image reference (e.g.
-	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
+	// OCIImage is an OCI registry reference, local OCI layout, or HTTPS URL
+	// to a tarred OCI image layout used to bootstrap the machine rootfs. HTTPS
+	// archives must contain exactly one tagged image reference, which the agent
+	// selects automatically.
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
 
@@ -65,8 +67,8 @@ type AgentConfig struct {
 	// OfflineArtifacts points to a complete offline binary artifact source.
 	// When set, it takes precedence over download overrides. Source is rendered
 	// as a strict Go template using the cluster Kubernetes version, then
-	// resolved as an absolute filesystem path, file:// URL, or oci:// artifact
-	// reference.
+	// resolved as an absolute filesystem path, file:// URL, HTTPS archive, or
+	// oci:// artifact reference.
 	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
 }
 

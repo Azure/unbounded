@@ -8,6 +8,8 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -16,6 +18,160 @@ import (
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
 )
+
+func TestParseHTTPSArchiveReference(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		image   string
+		wantURL string
+		wantOK  bool
+		wantErr bool
+	}{
+		{
+			name:    "archive auto-selects its image",
+			image:   "https://artifacts.example.test/rootfs.oci.tar.gz",
+			wantURL: "https://artifacts.example.test/rootfs.oci.tar.gz",
+			wantOK:  true,
+		},
+		{
+			name:   "registry reference",
+			image:  "registry.example.test/rootfs:v1",
+			wantOK: false,
+		},
+		{
+			name:    "missing archive path",
+			image:   "https://artifacts.example.test",
+			wantOK:  true,
+			wantErr: true,
+		},
+		{
+			name:    "query not supported",
+			image:   "https://artifacts.example.test/rootfs.tar?token=value",
+			wantOK:  true,
+			wantErr: true,
+		},
+		{
+			name:    "fragment not supported",
+			image:   "https://artifacts.example.test/rootfs.tar#v1",
+			wantOK:  true,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gotURL, gotOK, err := parseHTTPSArchiveReference(tt.image)
+			if gotOK != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", gotOK, tt.wantOK)
+			}
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("err = nil, want error")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+
+			if gotURL != tt.wantURL {
+				t.Fatalf("URL = %q, want %q", gotURL, tt.wantURL)
+			}
+		})
+	}
+}
+
+func TestFindOCILayoutRoot(t *testing.T) {
+	t.Parallel()
+
+	extractDir := t.TempDir()
+	layoutDir := filepath.Join(extractDir, "rootfs")
+
+	if err := os.MkdirAll(layoutDir, 0o755); err != nil {
+		t.Fatalf("create layout: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(layoutDir, "oci-layout"), []byte(`{"imageLayoutVersion":"1.0.0"}`), 0o644); err != nil {
+		t.Fatalf("write oci-layout: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(layoutDir, "index.json"), []byte(`{"schemaVersion":2}`), 0o644); err != nil {
+		t.Fatalf("write index.json: %v", err)
+	}
+
+	got, err := findOCILayoutRoot(extractDir)
+	if err != nil {
+		t.Fatalf("findOCILayoutRoot() error = %v", err)
+	}
+
+	if got != layoutDir {
+		t.Fatalf("layout = %q, want %q", got, layoutDir)
+	}
+}
+
+func TestSingleOCILayoutReference(t *testing.T) {
+	t.Parallel()
+
+	layoutDir := t.TempDir()
+	index := `{
+		"schemaVersion": 2,
+		"manifests": [{
+			"mediaType": "application/vnd.oci.image.manifest.v1+json",
+			"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+			"size": 1,
+			"annotations": {"org.opencontainers.image.ref.name": "v1"}
+		}]
+	}`
+
+	if err := os.WriteFile(filepath.Join(layoutDir, "index.json"), []byte(index), 0o644); err != nil {
+		t.Fatalf("write index.json: %v", err)
+	}
+
+	got, err := singleOCILayoutReference(layoutDir)
+	if err != nil {
+		t.Fatalf("singleOCILayoutReference() error = %v", err)
+	}
+
+	if got != "v1" {
+		t.Fatalf("reference = %q, want v1", got)
+	}
+}
+
+func TestSingleOCILayoutReferenceRejectsMultipleImages(t *testing.T) {
+	t.Parallel()
+
+	layoutDir := t.TempDir()
+	index := `{
+		"schemaVersion": 2,
+		"manifests": [
+			{
+				"mediaType": "application/vnd.oci.image.manifest.v1+json",
+				"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+				"size": 1
+			},
+			{
+				"mediaType": "application/vnd.oci.image.manifest.v1+json",
+				"digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+				"size": 1
+			}
+		]
+	}`
+
+	if err := os.WriteFile(filepath.Join(layoutDir, "index.json"), []byte(index), 0o644); err != nil {
+		t.Fatalf("write index.json: %v", err)
+	}
+
+	if _, err := singleOCILayoutReference(layoutDir); err == nil {
+		t.Fatal("singleOCILayoutReference() error = nil, want multiple image error")
+	}
+}
 
 func TestConfigureOCIPullRetryUsesORASRetryClient(t *testing.T) {
 	repo := &remote.Repository{}

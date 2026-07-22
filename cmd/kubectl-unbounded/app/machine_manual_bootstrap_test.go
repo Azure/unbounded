@@ -134,6 +134,15 @@ func TestManualBootstrapHandler_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "valid: offline artifacts HTTPS source",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "https://artifacts.example.com/unbounded/v1.31.2.tar.gz",
+			},
+		},
+		{
 			name: "valid: offline artifacts OCI source",
 			handler: manualBootstrapHandler{
 				siteName:               "dc1",

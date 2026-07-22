@@ -69,8 +69,18 @@ Azure Linux 3.0. Other unknown host distros fall back to Ubuntu 24.04.
 | [`agent-azlinux3-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-azlinux3-nvidia) | `ghcr.io/azure/agent-azlinux3-nvidia` | Azure Linux 3.0 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-azlinux3-nvidia/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
-field in the agent config can override the full image reference for custom or
-pinned builds.
+field in the agent config can select a registry image, a local OCI layout, or a
+tarred OCI image layout downloaded over HTTPS. For example:
+
+```text
+ghcr.io/azure/agent-ubuntu2404:v20260619
+oci-layout:///opt/unbounded/images/agent-ubuntu2404:v20260619
+https://artifacts.example.com/agent-ubuntu2404.oci.tar
+```
+
+HTTPS archives may be plain tar or gzip-compressed tar files. They must contain
+an OCI image layout with `oci-layout`, `index.json`, and `blobs/` content, and
+exactly one tagged image reference. The agent selects that reference automatically.
 
 Image sources are maintained in the
 [images/](https://github.com/Azure/unbounded/tree/main/images)

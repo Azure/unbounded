@@ -19,12 +19,16 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/internal/ociartifact"
 )
 
 // OfflineArtifactManifestFileName is the manifest file name in an offline artifact bundle.
-const OfflineArtifactManifestFileName = "manifest.json"
+const (
+	OfflineArtifactManifestFileName = "manifest.json"
+	offlineArtifactCacheReadyFile   = ".ready"
+)
 
 var offlineKubernetesBinaries = []string{"kubelet", "kubectl", "kube-proxy"}
 
@@ -92,6 +96,14 @@ func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOffli
 		return nil, err
 	}
 
+	httpsArchive := strings.HasPrefix(sourceRoot, "https://")
+	if httpsArchive {
+		sourceRoot, err = materializeHTTPSOfflineArchive(context.Background(), sourceRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	manifest, err := loadOfflineManifest(sourceRoot)
 	if err != nil {
 		return nil, err
@@ -107,6 +119,12 @@ func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOffli
 
 	if err := verifyOfflineFiles(sourceRoot, manifest); err != nil {
 		return nil, err
+	}
+
+	if httpsArchive {
+		if err := markOfflineArchiveCacheReady(sourceRoot); err != nil {
+			return nil, err
+		}
 	}
 
 	return &ResolvedOfflineArtifacts{SourceRoot: sourceRoot, Manifest: manifest}, nil
@@ -156,6 +174,26 @@ func normalizeOfflineSourceRoot(source string) (string, error) {
 		return strings.TrimRight(source, "/"), nil
 	}
 
+	if strings.HasPrefix(source, "https://") {
+		u, err := url.Parse(source)
+		if err != nil {
+			return "", fmt.Errorf("parse HTTPS offline artifact source: %w", err)
+		}
+
+		if u.Host == "" {
+			return "", errors.New("HTTPS offline artifact source must include a host")
+		}
+
+		if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return "", errors.New("HTTPS offline artifact source must not include user info, query parameters, or a fragment")
+		}
+
+		u.Path = strings.TrimRight(u.Path, "/")
+		u.RawPath = strings.TrimRight(u.RawPath, "/")
+
+		return u.String(), nil
+	}
+
 	if strings.HasPrefix(source, "file://") {
 		u, err := url.Parse(source)
 		if err != nil {
@@ -182,6 +220,104 @@ func normalizeOfflineSourceRoot(source string) (string, error) {
 	}
 
 	return filepath.Clean(source), nil
+}
+
+func materializeHTTPSOfflineArchive(ctx context.Context, archiveURL string) (string, error) {
+	source, err := artifactsource.Parse(archiveURL)
+	if err != nil {
+		return "", fmt.Errorf("parse HTTPS offline artifact archive: %w", err)
+	}
+
+	return materializeOfflineArchive(ctx, source, OfflineArtifactArchiveHostDir, archiveURL)
+}
+
+func materializeOfflineArchive(ctx context.Context, source artifactsource.Source, cacheRoot, sourceID string) (string, error) {
+	cacheDir := filepath.Join(cacheRoot, containerImageArchiveSourceKey(sourceID))
+	if isOfflineArchiveCacheReady(cacheDir) {
+		return cacheDir, nil
+	}
+
+	if err := os.RemoveAll(cacheDir); err != nil {
+		return "", fmt.Errorf("remove incomplete HTTPS offline artifact cache: %w", err)
+	}
+
+	if err := os.MkdirAll(cacheRoot, 0o750); err != nil {
+		return "", fmt.Errorf("create HTTPS offline artifact cache: %w", err)
+	}
+
+	tempDir, err := os.MkdirTemp(cacheRoot, ".extract-")
+	if err != nil {
+		return "", fmt.Errorf("create HTTPS offline artifact extraction directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir) //nolint:errcheck // best effort cleanup
+
+	if err := source.ExtractTar(ctx, tempDir); err != nil {
+		return "", fmt.Errorf("download and extract HTTPS offline artifact archive: %w", err)
+	}
+
+	bundleRoot, err := findOfflineArchiveBundleRoot(tempDir)
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := os.Lstat(filepath.Join(bundleRoot, offlineArtifactCacheReadyFile)); err == nil {
+		return "", fmt.Errorf("HTTPS offline artifact archive contains reserved file %q", offlineArtifactCacheReadyFile)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect HTTPS offline artifact archive cache marker: %w", err)
+	}
+
+	if err := os.Rename(bundleRoot, cacheDir); err != nil {
+		if isOfflineArchiveCacheReady(cacheDir) {
+			return cacheDir, nil
+		}
+
+		return "", fmt.Errorf("install HTTPS offline artifact cache: %w", err)
+	}
+
+	return cacheDir, nil
+}
+
+func isOfflineArchiveCacheReady(cacheDir string) bool {
+	info, err := os.Stat(filepath.Join(cacheDir, offlineArtifactCacheReadyFile))
+
+	return err == nil && info.Mode().IsRegular()
+}
+
+func markOfflineArchiveCacheReady(cacheDir string) error {
+	path := filepath.Join(cacheDir, offlineArtifactCacheReadyFile)
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		return fmt.Errorf("mark HTTPS offline artifact cache ready: %w", err)
+	}
+
+	return nil
+}
+
+func findOfflineArchiveBundleRoot(extractDir string) (string, error) {
+	var manifests []string
+
+	if err := filepath.WalkDir(extractDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !entry.IsDir() && entry.Name() == OfflineArtifactManifestFileName {
+			manifests = append(manifests, path)
+		}
+
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("inspect HTTPS offline artifact archive: %w", err)
+	}
+
+	if len(manifests) == 0 {
+		return "", fmt.Errorf("HTTPS offline artifact archive does not contain %s", OfflineArtifactManifestFileName)
+	}
+
+	if len(manifests) > 1 {
+		return "", fmt.Errorf("HTTPS offline artifact archive contains multiple %s files", OfflineArtifactManifestFileName)
+	}
+
+	return filepath.Dir(manifests[0]), nil
 }
 
 func loadOfflineManifest(sourceRoot string) (OfflineArtifactManifest, error) {

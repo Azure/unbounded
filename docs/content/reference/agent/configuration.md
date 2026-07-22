@@ -50,5 +50,6 @@ for command usage, exit behavior, and the current check list.
 | `Kubelet.BootstrapToken` | Token used for TLS bootstrapping (omit when using TPM attestation). |
 | `Kubelet.Labels` | Key-value labels applied to the Node on registration. |
 | `Kubelet.RegisterWithTaints` | Taints applied to the Node on registration (`key=value:effect`). |
-| `OCIImage` | *(optional)* OCI image reference for the rootfs. Uses the built-in default image when empty. |
+| `OCIImage` | *(optional)* OCI registry reference, `oci-layout://` directory, or HTTPS URL to a tarred OCI image layout. Uses the built-in default image when empty. The agent automatically selects the archive's single tagged image reference. |
+| `OfflineArtifacts.Source` | *(optional)* Complete bootstrap artifact source. Accepts an absolute directory, `file://` directory, `oci://` artifact reference, or HTTPS tar/tar.gz archive. HTTPS archives are downloaded and extracted into the host artifact cache. |
 | `Attest.URL` | *(optional)* Base URL of a metalman serve-pxe instance for TPM attestation. |

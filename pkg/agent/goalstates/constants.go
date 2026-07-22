@@ -106,6 +106,10 @@ const (
 	SandboxImage             = "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
 	KubeProxyImageRepository = "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy"
 
+	// OfflineArtifactArchiveHostDir stores HTTPS offline artifact archives
+	// after download and extraction.
+	OfflineArtifactArchiveHostDir = "/var/lib/unbounded/offline-artifacts"
+
 	// ContainerImageArchiveDir is the path inside the nspawn machine where
 	// staged container image archives are mounted.
 	ContainerImageArchiveDir = "/var/lib/unbounded/container-images"
