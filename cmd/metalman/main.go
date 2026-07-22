@@ -22,7 +22,9 @@ func main() {
 		Use:   "metalman",
 		Short: "Bare metal provisioning for Kubernetes",
 	}
-	root.AddCommand(commands.ServePXECmd())
+	root.AddCommand(commands.ControllerCmd())
+	root.AddCommand(commands.ServerCmd())
+	root.AddCommand(commands.EdgeCmd())
 	root.AddCommand(version.Command())
 
 	root.CompletionOptions.DisableDefaultCmd = true

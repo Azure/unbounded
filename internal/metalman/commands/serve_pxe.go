@@ -38,8 +38,13 @@ import (
 // omits spec.host.netboot.netbootImage. It is set at build time via -ldflags.
 var DefaultNetbootImage = "netboot:latest"
 
-// ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
+// ServePXECmd returns the legacy monolithic command. Production wiring uses
+// ControllerCmd, ServerCmd, and EdgeCmd instead.
 func ServePXECmd() *cobra.Command {
+	return newMetalmanRoleCmd(metalmanRoleLegacy, "Run PXE servers and BMC control loop")
+}
+
+func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 	var (
 		site                           string
 		cacheDir                       string
@@ -59,10 +64,11 @@ func ServePXECmd() *cobra.Command {
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
 	)
+	components := componentsForRole(role)
 
 	cmd := &cobra.Command{
-		Use:   "serve-pxe",
-		Short: "Run PXE servers and BMC control loop",
+		Use:   string(role),
+		Short: short,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := ctrl.SetupSignalHandler()
 			cfg := ctrl.GetConfigOrDie()
@@ -85,7 +91,7 @@ func ServePXECmd() *cobra.Command {
 
 			mgr, err := ctrl.NewManager(cfg, manager.Options{
 				Scheme:                        scheme,
-				LeaderElection:                true,
+				LeaderElection:                components.leaderElection,
 				LeaderElectionID:              leID,
 				LeaderElectionNamespace:       leaderElectionNamespace,
 				LeaseDuration:                 &leaseDuration,
@@ -203,13 +209,15 @@ func ServePXECmd() *cobra.Command {
 
 			ociCache := netboot.NewOCICache(cacheDir)
 
-			if err := (&netboot.OCIReconciler{
-				Client:                      mgr.GetClient(),
-				Cache:                       ociCache,
-				DefaultNetbootRef:           defaultNetbootImage,
-				DefaultNetbootPullSecretRef: defaultNetbootPullSecretRef,
-			}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up OCI reconciler: %w", err)
+			if components.ociReconciler {
+				if err := (&netboot.OCIReconciler{
+					Client:                      mgr.GetClient(),
+					Cache:                       ociCache,
+					DefaultNetbootRef:           defaultNetbootImage,
+					DefaultNetbootPullSecretRef: defaultNetbootPullSecretRef,
+				}).SetupWithManager(mgr); err != nil {
+					return fmt.Errorf("setting up OCI reconciler: %w", err)
+				}
 			}
 
 			redfishPool := redfish.NewPool()
@@ -222,7 +230,10 @@ func ServePXECmd() *cobra.Command {
 				DefaultNetbootPullSecret: defaultNetbootPullSecretRef,
 			}
 
-			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+			var statusQueue *metalmachineops.StatusQueue
+			if components.statusUpdates {
+				statusQueue = &metalmachineops.StatusQueue{Client: mgr.GetClient()}
+			}
 
 			resolver := netboot.FileResolver{
 				Cache:             ociCache,
@@ -235,22 +246,26 @@ func ServePXECmd() *cobra.Command {
 				ProviderLabels:    providerLabels,
 			}
 
-			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool, FileResolver: &resolver}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up Redfish reconciler: %w", err)
+			if components.redfish {
+				if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool, FileResolver: &resolver}).SetupWithManager(mgr); err != nil {
+					return fmt.Errorf("setting up Redfish reconciler: %w", err)
+				}
 			}
 
-			if err := (&metalmachineops.Reconciler{
-				Client:                mgr.GetClient(),
-				APIReader:             mgr.GetAPIReader(),
-				Site:                  site,
-				PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
-				Sessions:              sessionManager,
-				HTTPBootURL:           resolver.HTTPBootURL,
-				MaxConcurrentMachines: operationMaxConcurrentMachines,
-				MaxAttempts:           operationMaxAttempts,
-				PollInterval:          operationPollInterval,
-			}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
+			if components.machineOps {
+				if err := (&metalmachineops.Reconciler{
+					Client:                mgr.GetClient(),
+					APIReader:             mgr.GetAPIReader(),
+					Site:                  site,
+					PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
+					Sessions:              sessionManager,
+					HTTPBootURL:           resolver.HTTPBootURL,
+					MaxConcurrentMachines: operationMaxConcurrentMachines,
+					MaxAttempts:           operationMaxAttempts,
+					PollInterval:          operationPollInterval,
+				}).SetupWithManager(mgr); err != nil {
+					return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
+				}
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {
@@ -277,52 +292,61 @@ func ServePXECmd() *cobra.Command {
 				dhcpServerIP = ifIP
 			}
 
-			dhcpServer := &dhcp.Server{
-				Interface:         dhcpInterface,
-				Port:              dhcpPort,
-				Reader:            mgr.GetClient(),
-				ServerIP:          dhcpServerIP,
-				OCICache:          ociCache,
-				ServeURL:          serveURL,
-				DefaultNetbootRef: defaultNetbootImage,
-			}
-			if err := mgr.Add(dhcpServer); err != nil {
-				return fmt.Errorf("adding DHCP server: %w", err)
-			}
-
-			if err := mgr.Add(statusQueue); err != nil {
-				return fmt.Errorf("adding status queue: %w", err)
+			if components.dhcp {
+				dhcpServer := &dhcp.Server{
+					Interface:         dhcpInterface,
+					Port:              dhcpPort,
+					Reader:            mgr.GetClient(),
+					ServerIP:          dhcpServerIP,
+					OCICache:          ociCache,
+					ServeURL:          serveURL,
+					DefaultNetbootRef: defaultNetbootImage,
+				}
+				if err := mgr.Add(dhcpServer); err != nil {
+					return fmt.Errorf("adding DHCP server: %w", err)
+				}
 			}
 
-			tftpServer := &netboot.TFTPServer{
-				BindAddr:       bindAddress,
-				FileResolver:   resolver,
-				StatusRecorder: statusQueue,
-			}
-			if err := mgr.Add(tftpServer); err != nil {
-				return fmt.Errorf("adding TFTP server: %w", err)
+			if statusQueue != nil {
+				if err := mgr.Add(statusQueue); err != nil {
+					return fmt.Errorf("adding status queue: %w", err)
+				}
 			}
 
-			attestHandler := &attestation.Handler{
-				Clientset:      clientset,
-				ClusterCA:      clusterCA,
-				LookupNodeByIP: resolver.LookupNodeByIP,
-				StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
+			if components.tftp {
+				tftpServer := &netboot.TFTPServer{
+					BindAddr:       bindAddress,
+					FileResolver:   resolver,
+					StatusRecorder: statusQueue,
+				}
+				if err := mgr.Add(tftpServer); err != nil {
+					return fmt.Errorf("adding TFTP server: %w", err)
+				}
 			}
 
-			httpMux := http.NewServeMux()
-			httpMux.HandleFunc("POST /attest", attestHandler.Attest)
+			if components.http {
+				httpMux := http.NewServeMux()
+				if components.attestation {
+					attestHandler := &attestation.Handler{
+						Clientset:      clientset,
+						ClusterCA:      clusterCA,
+						LookupNodeByIP: resolver.LookupNodeByIP,
+						StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
+					}
+					httpMux.HandleFunc("POST /attest", attestHandler.Attest)
+				}
 
-			httpServer := &netboot.HTTPServer{
-				BindAddr:       bindAddress,
-				Port:           httpPort,
-				Client:         mgr.GetClient(),
-				Mux:            httpMux,
-				FileResolver:   resolver,
-				StatusRecorder: statusQueue,
-			}
-			if err := mgr.Add(httpServer); err != nil {
-				return fmt.Errorf("adding HTTP server: %w", err)
+				httpServer := &netboot.HTTPServer{
+					BindAddr:       bindAddress,
+					Port:           httpPort,
+					Client:         mgr.GetClient(),
+					Mux:            httpMux,
+					FileResolver:   resolver,
+					StatusRecorder: statusQueue,
+				}
+				if err := mgr.Add(httpServer); err != nil {
+					return fmt.Errorf("adding HTTP server: %w", err)
+				}
 			}
 
 			siteDisplay := site
@@ -331,7 +355,8 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			PrintConfig("site", siteDisplay)
-			PrintConfig("leader-election", leID)
+			PrintConfig("role", string(role))
+			PrintConfig("leader-election", fmt.Sprintf("%t", components.leaderElection))
 			PrintConfig("serve-url", serveURL)
 			PrintConfig("default-netboot-image", defaultNetbootImage)
 			PrintConfig("cache-dir", cacheDir)
@@ -339,15 +364,23 @@ func ServePXECmd() *cobra.Command {
 			PrintConfig("dhcp-port", fmt.Sprintf("%d", dhcpPort))
 			fmt.Println()
 
-			if dhcpInterface != "" {
-				PrintService("DHCP", fmt.Sprintf("%s:%d", dhcpInterface, dhcpPort))
-			} else {
-				PrintService("DHCP", fmt.Sprintf("0.0.0.0:%d (relay)", dhcpPort))
+			if components.dhcp {
+				if dhcpInterface != "" {
+					PrintService("DHCP", fmt.Sprintf("%s:%d", dhcpInterface, dhcpPort))
+				} else {
+					PrintService("DHCP", fmt.Sprintf("0.0.0.0:%d (relay)", dhcpPort))
+				}
 			}
 
-			PrintService("TFTP", fmt.Sprintf("%s:69", bindAddress))
-			PrintService("HTTP", fmt.Sprintf("%s:%d", bindAddress, httpPort))
-			PrintService("Redfish", "reconciler")
+			if components.tftp {
+				PrintService("TFTP", fmt.Sprintf("%s:69", bindAddress))
+			}
+			if components.http {
+				PrintService("HTTP", fmt.Sprintf("%s:%d", bindAddress, httpPort))
+			}
+			if components.redfish {
+				PrintService("Redfish", "reconciler")
+			}
 			PrintReady()
 
 			return mgr.Start(ctx)
