@@ -210,3 +210,19 @@ func (h *siteBootstrapNetbootHandler) waitForMetalman(ctx context.Context) error
 		}
 	}
 }
+
+func (h *siteBootstrapNetbootHandler) edgeArguments(backendURL, tokenFile string) []string {
+	return []string{
+		"edge",
+		"--backend-url=" + backendURL,
+		"--endpoint=" + h.endpointName,
+		"--bind-address=" + h.address,
+		"--http-port=" + strconv.Itoa(h.httpPort),
+		"--dhcp-enabled",
+		"--dhcp-interface=" + h.interfaceName,
+		"--dhcp-server-ip=" + h.address,
+		"--edge-token-file=" + tokenFile,
+		"--tftp-enabled",
+		"--tftp-bind-address=" + h.address,
+	}
+}

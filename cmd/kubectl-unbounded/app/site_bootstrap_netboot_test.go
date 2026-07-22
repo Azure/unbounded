@@ -189,3 +189,33 @@ func readyDeployment(name string, replicas int32) *appsv1.Deployment {
 		},
 	}
 }
+
+func TestBootstrapNetbootEdgeArgumentsContainOnlyDataPlaneConfiguration(t *testing.T) {
+	h := &siteBootstrapNetbootHandler{
+		endpointName:  "bootstrap-first-node",
+		interfaceName: "eno1",
+		address:       "192.0.2.10",
+		httpPort:      8880,
+	}
+
+	args := h.edgeArguments("http://127.0.0.1:32123", "/run/token")
+	require.Equal(t, []string{
+		"edge",
+		"--backend-url=http://127.0.0.1:32123",
+		"--endpoint=bootstrap-first-node",
+		"--bind-address=192.0.2.10",
+		"--http-port=8880",
+		"--dhcp-enabled",
+		"--dhcp-interface=eno1",
+		"--dhcp-server-ip=192.0.2.10",
+		"--edge-token-file=/run/token",
+		"--tftp-enabled",
+		"--tftp-bind-address=192.0.2.10",
+	}, args)
+
+	for _, arg := range args {
+		require.NotContains(t, arg, "--site")
+		require.NotContains(t, arg, "--cache-dir")
+		require.NotContains(t, arg, "leader-elect")
+	}
+}
