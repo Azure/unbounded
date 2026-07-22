@@ -7,16 +7,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -365,6 +370,45 @@ func TestBootstrapPortForwardClosesWhileWaitingToReconnect(t *testing.T) {
 	case <-time.After(time.Second):
 		require.Fail(t, "port-forward close blocked during reconnect")
 	}
+}
+
+func TestBootstrapEdgeTokenUsesAudienceAndRotatesSecureFile(t *testing.T) {
+	ctx := context.Background()
+	kubeClient := fake.NewSimpleClientset()
+	var mu sync.Mutex
+	requests := 0
+	kubeClient.PrependReactor("create", "serviceaccounts", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		create := action.(clienttesting.CreateAction)
+		request := create.GetObject().(*authenticationv1.TokenRequest)
+		require.Equal(t, []string{"metalman-edge"}, request.Spec.Audiences)
+		require.Equal(t, int64(3600), *request.Spec.ExpirationSeconds)
+
+		mu.Lock()
+		requests++
+		token := fmt.Sprintf("token-%d", requests)
+		mu.Unlock()
+
+		return true, &authenticationv1.TokenRequest{
+			Status: authenticationv1.TokenRequestStatus{Token: token},
+		}, nil
+	})
+
+	credential, err := newBootstrapEdgeToken(ctx, kubeClient, "unbounded-system", t.TempDir(), time.Millisecond)
+	require.NoError(t, err)
+	path := credential.Path()
+	require.Equal(t, "edge-token", filepath.Base(path))
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	require.Eventually(t, func() bool {
+		contents, readErr := os.ReadFile(path)
+		return readErr == nil && string(contents) != "token-1"
+	}, time.Second, time.Millisecond)
+
+	require.NoError(t, credential.Close())
+	_, err = os.Stat(filepath.Dir(path))
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 type fakeBootstrapPortForwardStarter struct {

@@ -10,12 +10,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -71,6 +74,28 @@ type bootstrapPortForward struct {
 	url    string
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+type bootstrapEdgeToken struct {
+	path   string
+	cancel context.CancelFunc
+	done   chan struct{}
+	once   sync.Once
+}
+
+func (t *bootstrapEdgeToken) Path() string {
+	return t.path
+}
+
+func (t *bootstrapEdgeToken) Close() error {
+	var err error
+	t.once.Do(func() {
+		t.cancel()
+		<-t.done
+		err = os.RemoveAll(filepath.Dir(t.path))
+	})
+
+	return err
 }
 
 func (f *bootstrapPortForward) URL() string {
@@ -547,4 +572,88 @@ func newSPDYBootstrapPortForwardStarter(
 			return nil, fmt.Errorf("port-forward to Pod %s timed out", podName)
 		}
 	}
+}
+
+func newBootstrapEdgeToken(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	namespace string,
+	tempRoot string,
+	refreshInterval time.Duration,
+) (*bootstrapEdgeToken, error) {
+	directory, err := os.MkdirTemp(tempRoot, "unbounded-netboot-")
+	if err != nil {
+		return nil, fmt.Errorf("create edge token directory: %w", err)
+	}
+
+	path := filepath.Join(directory, "edge-token")
+	if err := refreshBootstrapEdgeToken(ctx, kubeClient, namespace, path); err != nil {
+		_ = os.RemoveAll(directory)
+
+		return nil, err
+	}
+
+	if refreshInterval <= 0 {
+		refreshInterval = 20 * time.Minute
+	}
+	tokenCtx, cancel := context.WithCancel(ctx)
+	credential := &bootstrapEdgeToken{
+		path:   path,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+
+	go func() {
+		defer close(credential.done)
+
+		ticker := time.NewTicker(refreshInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-tokenCtx.Done():
+				return
+			case <-ticker.C:
+				_ = refreshBootstrapEdgeToken(tokenCtx, kubeClient, namespace, path)
+			}
+		}
+	}()
+
+	return credential, nil
+}
+
+func refreshBootstrapEdgeToken(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	namespace string,
+	path string,
+) error {
+	expirationSeconds := int64(time.Hour / time.Second)
+	response, err := kubeClient.CoreV1().ServiceAccounts(namespace).CreateToken(
+		ctx,
+		"metalman-edge",
+		&authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{
+			Audiences:         []string{"metalman-edge"},
+			ExpirationSeconds: &expirationSeconds,
+		}},
+		metav1.CreateOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("request metalman-edge token: %w", err)
+	}
+	if response.Status.Token == "" {
+		return fmt.Errorf("request metalman-edge token: API returned an empty token")
+	}
+
+	temporaryPath := path + ".new"
+	if err := os.WriteFile(temporaryPath, []byte(response.Status.Token), 0o600); err != nil {
+		return fmt.Errorf("write metalman-edge token: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		_ = os.Remove(temporaryPath)
+
+		return fmt.Errorf("replace metalman-edge token: %w", err)
+	}
+
+	return nil
 }
