@@ -769,7 +769,7 @@ func run(cfg *config) error {
 	}
 
 	// Check if this node's site has manageCniPlugin enabled using the informer cache
-	manageCniPlugin := getManageCniPluginFromCRDs(siteInformer, mySiteName)
+	manageCniPlugin := manageCNIForMembership(siteInformer, mySiteName, isGatewayNode)
 
 	var nodePodCIDRs []string
 	if manageCniPlugin {

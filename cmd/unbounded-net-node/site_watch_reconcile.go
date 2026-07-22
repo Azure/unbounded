@@ -932,6 +932,14 @@ func getManageCniPluginFromCRDs(siteInformer cache.SharedIndexInformer, siteName
 	return true // Site not found, default to true
 }
 
+func manageCNIForMembership(siteInformer cache.SharedIndexInformer, siteName string, isGatewayNode bool) bool {
+	if isGatewayNode && siteName == "" {
+		return false
+	}
+
+	return getManageCniPluginFromCRDs(siteInformer, siteName)
+}
+
 var configureWireGuardFunc = configureWireGuard
 
 // updateWireGuardFromSlices reads Site and SiteNodeSlices from the informer caches and configures WireGuard

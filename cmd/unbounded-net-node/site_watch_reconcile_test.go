@@ -167,3 +167,14 @@ func TestGetManageCniPluginFromCRDs(t *testing.T) {
 		t.Fatalf("expected missing site default to true")
 	}
 }
+
+func TestSiteLessGatewayDisablesCNIManagement(t *testing.T) {
+	siteInformer := newTestInformer()
+
+	if manageCNIForMembership(siteInformer, "", true) {
+		t.Fatal("site-less gateway must not wait for PodCIDRs or write CNI configuration")
+	}
+	if !manageCNIForMembership(siteInformer, "", false) {
+		t.Fatal("ordinary node without resolved membership must retain the default CNI policy")
+	}
+}
