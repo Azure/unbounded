@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 
@@ -54,7 +55,19 @@ type siteBootstrapNetbootHandler struct {
 	routedCIDRs    []string
 	resources      client.Client
 	kubeClient     kubernetes.Interface
+	restConfig     *rest.Config
 	pollInterval   time.Duration
+	dependencies   bootstrapNetbootDependencies
+}
+
+type bootstrapNetbootDependencies struct {
+	resolveBinary    func() (string, error)
+	preflightNetwork func() error
+	localPort        func() (int, error)
+	portForward      func(context.Context, int) (*bootstrapPortForward, error)
+	edgeToken        func(context.Context) (*bootstrapEdgeToken, error)
+	startEdge        func(string, []string) (bootstrapEdgeProcess, error)
+	dialEdge         func(context.Context, string) error
 }
 
 type bootstrapNetbootState struct {
@@ -198,8 +211,202 @@ func siteBootstrapNetbootCommand(handler *siteBootstrapNetbootHandler) *cobra.Co
 	return cmd
 }
 
-func (h *siteBootstrapNetbootHandler) execute(_ context.Context) error {
+func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error) {
+	if h.timeout <= 0 {
+		h.timeout = defaultBootstrapNetbootTimeout
+	}
+	if h.endpointName == "" {
+		h.endpointName = "bootstrap-" + h.machine
+	}
+
+	if err := h.initializeDependencies(); err != nil {
+		return err
+	}
+	binary, err := h.dependencies.resolveBinary()
+	if err != nil {
+		return err
+	}
+	if err := h.dependencies.preflightNetwork(); err != nil {
+		return err
+	}
+	if err := h.initializeClients(); err != nil {
+		return err
+	}
+	h.initializeRuntimeDependencies()
+
+	runCtx, cancel := context.WithTimeout(ctx, h.timeout)
+	defer cancel()
+
+	state, err := h.prepareClusterResources(runCtx)
+	if err != nil {
+		return err
+	}
+	resourcesPrepared := true
+	var (
+		forward *bootstrapPortForward
+		token   *bootstrapEdgeToken
+		process bootstrapEdgeProcess
+	)
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cleanupCancel()
+
+		if resourcesPrepared {
+			retErr = errors.Join(retErr, h.restoreClusterResources(cleanupCtx, state))
+		}
+		if process != nil {
+			retErr = errors.Join(retErr, process.Stop(cleanupCtx))
+		}
+		if forward != nil {
+			retErr = errors.Join(retErr, forward.Close())
+		}
+		if token != nil {
+			retErr = errors.Join(retErr, token.Close())
+		}
+	}()
+
+	if err := h.waitForMetalman(runCtx); err != nil {
+		return err
+	}
+	localPort, err := h.dependencies.localPort()
+	if err != nil {
+		return fmt.Errorf("select local port for Metalman server: %w", err)
+	}
+	forward, err = h.dependencies.portForward(runCtx, localPort)
+	if err != nil {
+		return err
+	}
+	token, err = h.dependencies.edgeToken(runCtx)
+	if err != nil {
+		return err
+	}
+	process, err = h.dependencies.startEdge(binary, h.edgeArguments(forward.URL(), token.Path()))
+	if err != nil {
+		return err
+	}
+	if err := h.waitForEdgeReady(runCtx, process, h.dependencies.dialEdge); err != nil {
+		return err
+	}
+	if err := h.claimEndpoint(runCtx, "kubectl-unbounded/"+h.endpointName); err != nil {
+		return err
+	}
+
+	var machine v1alpha3.Machine
+	if err := h.resources.Get(runCtx, client.ObjectKey{Name: h.machine}, &machine); err != nil {
+		return fmt.Errorf("get designated Machine %s: %w", h.machine, err)
+	}
+
+	return h.waitForNodeReadyAndEdge(runCtx, designatedNodeName(&machine), process)
+}
+
+func (h *siteBootstrapNetbootHandler) initializeDependencies() error {
+	if h.dependencies.resolveBinary == nil {
+		h.dependencies.resolveBinary = func() (string, error) {
+			return h.resolveMetalmanBinary(exec.LookPath)
+		}
+	}
+	if h.dependencies.preflightNetwork == nil {
+		h.dependencies.preflightNetwork = h.validateProvisioningInterface
+	}
+	if h.dependencies.localPort == nil {
+		h.dependencies.localPort = availableLoopbackPort
+	}
+	if h.dependencies.startEdge == nil {
+		h.dependencies.startEdge = func(binary string, args []string) (bootstrapEdgeProcess, error) {
+			return startBootstrapEdgeProcess(binary, args, os.Stdout, os.Stderr)
+		}
+	}
+	if h.dependencies.dialEdge == nil {
+		h.dependencies.dialEdge = dialBootstrapEdge
+	}
+
 	return nil
+}
+
+func (h *siteBootstrapNetbootHandler) initializeClients() error {
+	if h.resources != nil && h.kubeClient != nil && h.restConfig != nil {
+		return nil
+	}
+
+	kubeClient, config, err := kube.ClientAndConfigFromFile(getKubeconfigPath(h.kubeconfigPath))
+	if err != nil {
+		return fmt.Errorf("create Kubernetes client for netboot bootstrap: %w", err)
+	}
+	resources, err := client.New(config, client.Options{Scheme: buildScheme()})
+	if err != nil {
+		return fmt.Errorf("create resource client for netboot bootstrap: %w", err)
+	}
+	h.kubeClient = kubeClient
+	h.resources = resources
+	h.restConfig = config
+
+	return nil
+}
+
+func (h *siteBootstrapNetbootHandler) initializeRuntimeDependencies() {
+	if h.dependencies.portForward == nil {
+		starter := newSPDYBootstrapPortForwardStarter(h.kubeClient, h.restConfig, h.namespace)
+		h.dependencies.portForward = func(ctx context.Context, localPort int) (*bootstrapPortForward, error) {
+			return newBootstrapPortForward(
+				ctx,
+				h.kubeClient,
+				h.namespace,
+				"metalman-server-"+h.site,
+				localPort,
+				8880,
+				starter,
+				h.pollInterval,
+			)
+		}
+	}
+	if h.dependencies.edgeToken == nil {
+		h.dependencies.edgeToken = func(ctx context.Context) (*bootstrapEdgeToken, error) {
+			return newBootstrapEdgeToken(ctx, h.kubeClient, h.namespace, "", 0)
+		}
+	}
+}
+
+func (h *siteBootstrapNetbootHandler) validateProvisioningInterface() error {
+	interfaceInfo, err := net.InterfaceByName(h.interfaceName)
+	if err != nil {
+		return fmt.Errorf("find provisioning interface %s: %w", h.interfaceName, err)
+	}
+	wanted := net.ParseIP(h.address)
+	if wanted == nil || wanted.To4() == nil {
+		return fmt.Errorf("provisioning address %q must be an IPv4 address", h.address)
+	}
+	addresses, err := interfaceInfo.Addrs()
+	if err != nil {
+		return fmt.Errorf("list addresses on provisioning interface %s: %w", h.interfaceName, err)
+	}
+	for _, address := range addresses {
+		ip, _, parseErr := net.ParseCIDR(address.String())
+		if parseErr == nil && ip.Equal(wanted) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("provisioning interface %s does not own address %s", h.interfaceName, h.address)
+}
+
+func availableLoopbackPort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+
+	return listener.Addr().(*net.TCPAddr).Port, nil
+}
+
+func dialBootstrapEdge(ctx context.Context, address string) error {
+	dialer := net.Dialer{}
+	connection, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return err
+	}
+
+	return connection.Close()
 }
 
 func (h *siteBootstrapNetbootHandler) prepareClusterResources(ctx context.Context) (bootstrapNetbootState, error) {
@@ -478,6 +685,31 @@ func (h *siteBootstrapNetbootHandler) waitForNodeReady(ctx context.Context, node
 			return fmt.Errorf("wait for designated Node %s to become Ready: %w", nodeName, ctx.Err())
 		case <-ticker.C:
 		}
+	}
+}
+
+func (h *siteBootstrapNetbootHandler) waitForNodeReadyAndEdge(
+	ctx context.Context,
+	nodeName string,
+	process bootstrapEdgeProcess,
+) error {
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ready := make(chan error, 1)
+	go func() { ready <- h.waitForNodeReady(waitCtx, nodeName) }()
+
+	select {
+	case err := <-ready:
+		return err
+	case <-process.Done():
+		if err := process.Err(); err != nil {
+			return fmt.Errorf("Metalman edge exited before designated Node %s became Ready: %w", nodeName, err)
+		}
+
+		return fmt.Errorf("Metalman edge exited before designated Node %s became Ready", nodeName)
+	case <-ctx.Done():
+		return fmt.Errorf("wait for designated Node %s while Metalman edge is running: %w", nodeName, ctx.Err())
 	}
 }
 

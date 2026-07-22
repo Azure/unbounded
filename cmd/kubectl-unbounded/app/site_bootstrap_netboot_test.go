@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	clienttesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -468,9 +469,159 @@ func TestBootstrapPreflightResolvesMetalmanBeforeClusterMutation(t *testing.T) {
 	require.ErrorContains(t, err, "--metalman-binary")
 }
 
+func TestBootstrapNetbootExecuteCleansUpAfterDesignatedNodeReady(t *testing.T) {
+	ctx := context.Background()
+	site, machine, resources, kubeClient := bootstrapLifecycleFixture(t, true)
+	process := &fakeBootstrapEdgeProcess{done: make(chan struct{})}
+	forward := testBootstrapPortForward(ctx)
+	token := testBootstrapEdgeToken(t, ctx)
+	h := &siteBootstrapNetbootHandler{
+		site: site.Name, machine: machine.Name, interfaceName: "eno1", address: "192.0.2.10",
+		httpPort: 8880, namespace: "unbounded-system", timeout: time.Second,
+		resources: resources, kubeClient: kubeClient, restConfig: &rest.Config{}, pollInterval: time.Millisecond,
+		dependencies: bootstrapNetbootDependencies{
+			resolveBinary:    func() (string, error) { return "/usr/bin/metalman", nil },
+			preflightNetwork: func() error { return nil },
+			localPort:        func() (int, error) { return 32123, nil },
+			portForward:      func(context.Context, int) (*bootstrapPortForward, error) { return forward, nil },
+			edgeToken:        func(context.Context) (*bootstrapEdgeToken, error) { return token, nil },
+			startEdge: func(binary string, args []string) (bootstrapEdgeProcess, error) {
+				require.Equal(t, "/usr/bin/metalman", binary)
+				require.Contains(t, args, "--backend-url=http://127.0.0.1:32123")
+
+				return process, nil
+			},
+			dialEdge: func(context.Context, string) error { return nil },
+		},
+	}
+
+	require.NoError(t, h.execute(ctx))
+	require.True(t, process.stopped)
+	require.Equal(t, "bootstrap-first-node", h.endpointName)
+
+	var gotMachine v1alpha3.Machine
+	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: machine.Name}, &gotMachine))
+	require.Equal(t, "permanent-edge", gotMachine.Spec.Netboot().EndpointRef)
+	var endpoint v1alpha3.NetbootEndpoint
+	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &endpoint))
+	_, err := os.Stat(filepath.Dir(token.Path()))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestBootstrapNetbootExecuteReportsEarlyEdgeExitAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+	site, machine, resources, kubeClient := bootstrapLifecycleFixture(t, false)
+	process := &fakeBootstrapEdgeProcess{done: make(chan struct{}), err: errors.New("bind: address already in use")}
+	close(process.done)
+	h := &siteBootstrapNetbootHandler{
+		site: site.Name, machine: machine.Name, interfaceName: "eno1", address: "192.0.2.10",
+		httpPort: 8880, namespace: "unbounded-system", timeout: time.Second,
+		resources: resources, kubeClient: kubeClient, restConfig: &rest.Config{}, pollInterval: time.Millisecond,
+		dependencies: bootstrapNetbootDependencies{
+			resolveBinary:    func() (string, error) { return "/usr/bin/metalman", nil },
+			preflightNetwork: func() error { return nil },
+			localPort:        func() (int, error) { return 32123, nil },
+			portForward: func(ctx context.Context, _ int) (*bootstrapPortForward, error) {
+				return testBootstrapPortForward(ctx), nil
+			},
+			edgeToken: func(ctx context.Context) (*bootstrapEdgeToken, error) {
+				return testBootstrapEdgeToken(t, ctx), nil
+			},
+			startEdge: func(string, []string) (bootstrapEdgeProcess, error) { return process, nil },
+			dialEdge:  func(context.Context, string) error { return errors.New("not listening") },
+		},
+	}
+
+	err := h.execute(ctx)
+	require.ErrorContains(t, err, "edge exited before becoming ready")
+
+	var gotMachine v1alpha3.Machine
+	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: machine.Name}, &gotMachine))
+	require.Equal(t, "permanent-edge", gotMachine.Spec.Netboot().EndpointRef)
+	var endpoint v1alpha3.NetbootEndpoint
+	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &endpoint))
+}
+
+func TestBootstrapNetbootExecuteRunsPreflightBeforeClusterMutation(t *testing.T) {
+	site, machine, resources, kubeClient := bootstrapLifecycleFixture(t, true)
+	h := &siteBootstrapNetbootHandler{
+		site: site.Name, machine: machine.Name, interfaceName: "eno1", address: "192.0.2.10",
+		httpPort: 8880, namespace: "unbounded-system", timeout: time.Second,
+		resources: resources, kubeClient: kubeClient, restConfig: &rest.Config{},
+		dependencies: bootstrapNetbootDependencies{
+			resolveBinary:    func() (string, error) { return "", errors.New("metalman missing") },
+			preflightNetwork: func() error { require.Fail(t, "network preflight should not follow binary failure"); return nil },
+		},
+	}
+
+	err := h.execute(context.Background())
+	require.ErrorContains(t, err, "metalman missing")
+
+	var gotSite v1alpha3.Site
+	require.NoError(t, resources.Get(context.Background(), client.ObjectKey{Name: site.Name}, &gotSite))
+	require.Nil(t, gotSite.Spec.Components.Metalman)
+}
+
+func bootstrapLifecycleFixture(
+	t *testing.T,
+	nodeReady bool,
+) (*v1alpha3.Site, *v1alpha3.Machine, client.Client, *fake.Clientset) {
+	t.Helper()
+
+	site := &v1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "first-node", Labels: map[string]string{v1alpha3.MachineSiteLabelKey: site.Name},
+		},
+		Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
+			EndpointRef: "permanent-edge",
+		}}},
+	}
+	resources := fakeclient.NewClientBuilder().
+		WithScheme(buildScheme()).
+		WithStatusSubresource(&v1alpha3.NetbootEndpoint{}).
+		WithObjects(site, machine).
+		Build()
+	controller := readyDeployment("metalman-controller-rack-a", 1)
+	server := readyDeployment("metalman-server-rack-a", 2)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}
+	if nodeReady {
+		node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+	}
+
+	return site, machine, resources, fake.NewSimpleClientset(controller, server, node)
+}
+
+func testBootstrapPortForward(ctx context.Context) *bootstrapPortForward {
+	forwardCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		<-forwardCtx.Done()
+		close(done)
+	}()
+
+	return &bootstrapPortForward{url: "http://127.0.0.1:32123", cancel: cancel, done: done}
+}
+
+func testBootstrapEdgeToken(t *testing.T, ctx context.Context) *bootstrapEdgeToken {
+	t.Helper()
+	directory := t.TempDir()
+	path := filepath.Join(directory, "edge-token")
+	require.NoError(t, os.WriteFile(path, []byte("token"), 0o600))
+	tokenCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		<-tokenCtx.Done()
+		close(done)
+	}()
+
+	return &bootstrapEdgeToken{path: path, cancel: cancel, done: done}
+}
+
 type fakeBootstrapEdgeProcess struct {
-	done chan struct{}
-	err  error
+	done    chan struct{}
+	err     error
+	stopped bool
 }
 
 func (f *fakeBootstrapEdgeProcess) Done() <-chan struct{} {
@@ -480,6 +631,8 @@ func (f *fakeBootstrapEdgeProcess) Done() <-chan struct{} {
 func (f *fakeBootstrapEdgeProcess) Err() error { return f.err }
 
 func (f *fakeBootstrapEdgeProcess) Stop(context.Context) error {
+	f.stopped = true
+
 	return nil
 }
 
