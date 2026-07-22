@@ -14,13 +14,17 @@ import (
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 
-const defaultBootstrapNetbootTimeout = 30 * time.Minute
+const (
+	defaultBootstrapNetbootTimeout = 30 * time.Minute
+	defaultBootstrapPollInterval   = time.Second
+)
 
 type siteBootstrapNetbootHandler struct {
 	site           string
@@ -35,6 +39,8 @@ type siteBootstrapNetbootHandler struct {
 	timeout        time.Duration
 	routedCIDRs    []string
 	resources      client.Client
+	kubeClient     kubernetes.Interface
+	pollInterval   time.Duration
 }
 
 type bootstrapNetbootState struct {
@@ -160,4 +166,47 @@ func (h *siteBootstrapNetbootHandler) restoreClusterResources(ctx context.Contex
 	}
 
 	return nil
+}
+
+func (h *siteBootstrapNetbootHandler) metalmanDeploymentsReady(ctx context.Context) (bool, error) {
+	for _, name := range []string{"metalman-controller-" + h.site, "metalman-server-" + h.site} {
+		deployment, err := h.kubeClient.AppsV1().Deployments(h.namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("get Deployment %s/%s: %w", h.namespace, name, err)
+		}
+		if !deploymentRolloutComplete(deployment) {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func (h *siteBootstrapNetbootHandler) waitForMetalman(ctx context.Context) error {
+	interval := h.pollInterval
+	if interval <= 0 {
+		interval = defaultBootstrapPollInterval
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		ready, err := h.metalmanDeploymentsReady(ctx)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Metalman controller and server: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }

@@ -6,9 +6,13 @@ package app
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -125,4 +129,63 @@ func TestBootstrapNetbootEndpointCollisionDoesNotMutateMachine(t *testing.T) {
 	var gotMachine v1alpha3.Machine
 	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: machine.Name}, &gotMachine))
 	require.Equal(t, "permanent-edge", gotMachine.Spec.Netboot().EndpointRef)
+}
+
+func TestBootstrapNetbootMetalmanReadinessRequiresCurrentControllerAndServers(t *testing.T) {
+	controller := readyDeployment("metalman-controller-rack-a", 1)
+	server := readyDeployment("metalman-server-rack-a", 2)
+	server.Status.ObservedGeneration--
+	kubeClient := fake.NewSimpleClientset(controller, server)
+	h := &siteBootstrapNetbootHandler{site: "rack-a", namespace: "unbounded-system", kubeClient: kubeClient}
+
+	ready, err := h.metalmanDeploymentsReady(context.Background())
+	require.NoError(t, err)
+	require.False(t, ready)
+
+	server.Status.ObservedGeneration = server.Generation
+	_, err = kubeClient.AppsV1().Deployments(h.namespace).UpdateStatus(context.Background(), server, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	ready, err = h.metalmanDeploymentsReady(context.Background())
+	require.NoError(t, err)
+	require.True(t, ready)
+}
+
+func TestBootstrapNetbootWaitsUntilMetalmanRolloutCompletes(t *testing.T) {
+	controller := readyDeployment("metalman-controller-rack-a", 1)
+	server := readyDeployment("metalman-server-rack-a", 2)
+	server.Status.AvailableReplicas = 1
+	kubeClient := fake.NewSimpleClientset(controller, server)
+	h := &siteBootstrapNetbootHandler{
+		site: "rack-a", namespace: "unbounded-system", kubeClient: kubeClient,
+		pollInterval: time.Millisecond,
+	}
+
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		server.Status.AvailableReplicas = 2
+		_, _ = kubeClient.AppsV1().Deployments(h.namespace).UpdateStatus(context.Background(), server, metav1.UpdateOptions{})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, h.waitForMetalman(ctx))
+}
+
+func readyDeployment(name string, replicas int32) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "unbounded-system", Generation: 2},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Strategy: appsv1.DeploymentStrategy{RollingUpdate: &appsv1.RollingUpdateDeployment{
+				MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 0},
+			}},
+		},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration: 2,
+			Replicas:           replicas,
+			UpdatedReplicas:    replicas,
+			AvailableReplicas:  replicas,
+		},
+	}
 }
