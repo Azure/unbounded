@@ -8,6 +8,7 @@ import atexit
 import base64
 import json
 import os
+import secrets
 import signal
 import shutil
 import socket
@@ -32,7 +33,7 @@ API_VERSION = f"{API_GROUP}/v1alpha3"
 NODE_LABEL_KEY = "unbounded-cloud.io/smoke-test"
 NODE_LABEL_VALUE = "metalman"
 METALMAN_NAMESPACE = "unbounded-system"
-METALMAN_CONTROLLER_SA = "metalman-controller"
+METALMAN_IMAGE = "unbounded/metalman:smoke"
 VM_NAME = "unbounded-metal-smoke"
 NET_NAME = "unbounded-metal-smoke"
 SUBNET = "192.168.200"
@@ -45,9 +46,7 @@ MAC_ADDRESS = "52:54:00:aa:bb:01"
 REDFISH_PORT = 8443
 HTTP_PORT = 8880
 AGENT_DOWNLOAD_PORT = 8881
-CACHE_DIR = TMPDIR / "cache"
 ARTIFACT_DIR = TMPDIR / "artifacts"
-SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 AGENT_TARBALL = ARTIFACT_DIR / "unbounded-agent-linux-amd64.tar.gz"
 AGENT_DOWNLOAD_URL = f"http://{SERVER_IP}:{AGENT_DOWNLOAD_PORT}/{AGENT_TARBALL.name}"
 REGISTRY_PORT = 5555
@@ -55,6 +54,8 @@ REGISTRY_CONTAINER = "unbounded-smoke-registry"
 IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
 NETBOOT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/netboot:smoke"
 AGENT_IMAGE_NAME = f"localhost:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:smoke"
+IMAGE_NAME_CLUSTER = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/host-ubuntu2404:smoke"
+NETBOOT_IMAGE_NAME_CLUSTER = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/netboot:smoke"
 # The agent runs inside a VM on an isolated libvirt network. "localhost" inside
 # the VM resolves to the VM's own loopback, not the host.  Use the host's
 # bridge IP so the VM can reach the registry over the virtual network.
@@ -355,7 +356,7 @@ def clean_libvirt() -> None:
     run_quiet(["sudo", "ip", "link", "delete", "veth-kind-smoke"])
     # Kill any leftover Redfish fixture from a previous run.
     run_quiet(["sudo", "pkill", "-f", "metalman-redfish-fixture.py"])
-    # Kill any leftover metalman serve-pxe from a previous run.
+    # Kill any leftover local Metalman edge from a previous run.
     # Use the binary path to avoid matching this script (smoke-metalman.py).
     run_quiet(["sudo", "pkill", "-f", "bin/metalman"])
     # Kill any leftover artifact download server from a previous run.
@@ -476,6 +477,181 @@ def apiserver_url() -> str:
         log(f"  Rewrote apiserver URL to {url} (kind container on virbr-smoke)")
 
     return url
+
+
+def deploy_split_metalman(site: str, api_url: str, metalman_image: str,
+                          default_netboot_image: str) -> None:
+    """Deploy the controller/server roles used by the operator into kind."""
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", metalman_image],
+        stdout=DEVNULL, stderr=DEVNULL,
+    )
+    if inspect.returncode != 0:
+        run([
+            "docker", "build", "-t", metalman_image,
+            "-f", str(REPO_ROOT / "images/metalman/Containerfile"), str(REPO_ROOT),
+        ])
+    run(["kind", "load", "docker-image", metalman_image, "--name", "kind"])
+
+    site_resource = {
+        "apiVersion": API_VERSION,
+        "kind": "Site",
+        "metadata": {"name": site},
+        "spec": {
+            "nodeCidrs": ["192.168.200.0/24"],
+            "podCidrAssignments": [{"cidrBlocks": ["10.250.0.0/16"]}],
+            "components": {"metalman": {"enabled": True}},
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(site_resource).encode(), stdout=DEVNULL)
+
+    capability = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": f"metalman-capability-{site}", "namespace": METALMAN_NAMESPACE},
+        "stringData": {"capability.key": secrets.token_hex(32)},
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(capability).encode(), stdout=DEVNULL)
+
+    labels = {
+        "app": "unbounded-metalman",
+        f"{API_GROUP}/site": site,
+    }
+    for role, replicas in (("controller", 1), ("server", 2)):
+        role_labels = {
+            **labels,
+            "app.kubernetes.io/name": f"metalman-{role}",
+            "app.kubernetes.io/component": role,
+        }
+        ports = [{"name": "health", "containerPort": 8081}]
+        if role == "server":
+            ports.append({"name": "http", "containerPort": 8880})
+        args = [
+            role,
+            f"--site={site}",
+            "--cache-dir=/var/cache/metalman",
+            f"--default-netboot-image={default_netboot_image}",
+        ]
+        if role == "controller":
+            args.extend([
+                "--leader-elect-lease-duration=60s",
+                "--leader-elect-renew-deadline=40s",
+                "--leader-elect-retry-period=5s",
+            ])
+        deployment = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": f"metalman-{role}-{site}", "namespace": METALMAN_NAMESPACE},
+            "spec": {
+                "replicas": replicas,
+                "selector": {"matchLabels": role_labels},
+                "template": {
+                    "metadata": {"labels": role_labels},
+                    "spec": {
+                        "serviceAccountName": f"metalman-{role}",
+                        "containers": [{
+                            "name": "metalman",
+                            "image": metalman_image,
+                            "imagePullPolicy": "IfNotPresent",
+                            "args": args,
+                            "env": [
+                                {"name": "POD_NAMESPACE", "value": METALMAN_NAMESPACE},
+                                {"name": "METALMAN_APISERVER_URL", "value": api_url},
+                            ],
+                            "ports": ports,
+                            "volumeMounts": [
+                                {"name": "cache", "mountPath": "/var/cache/metalman"},
+                                {"name": "capability", "mountPath": "/var/run/secrets/metalman", "readOnly": True},
+                            ],
+                        }],
+                        "volumes": [
+                            {"name": "cache", "emptyDir": {}},
+                            {"name": "capability", "secret": {"secretName": f"metalman-capability-{site}"}},
+                        ],
+                    },
+                },
+            },
+        }
+        kubectl(["apply", "-f", "-"], input=json.dumps(deployment).encode(), stdout=DEVNULL)
+
+    service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": f"metalman-server-{site}", "namespace": METALMAN_NAMESPACE},
+        "spec": {
+            "selector": {
+                **labels,
+                "app.kubernetes.io/name": "metalman-server",
+                "app.kubernetes.io/component": "server",
+            },
+            "ports": [{"name": "http", "port": 8880, "targetPort": "http"}],
+        },
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(service).encode(), stdout=DEVNULL)
+    for role in ("controller", "server"):
+        kubectl([
+            "-n", METALMAN_NAMESPACE, "rollout", "status",
+            f"deployment/metalman-{role}-{site}", "--timeout=5m",
+        ])
+
+
+def start_bootstrap_netboot(site: str, machine: str, interface: str, address: str,
+                            http_port: int, log_path: Path) -> subprocess.Popen[Any]:
+    process = spawn([
+        str(KUBECTL_UNBOUNDED), "site", "bootstrap-netboot", site,
+        f"--machine={machine}", f"--interface={interface}", f"--address={address}",
+        f"--http-port={http_port}", f"--metalman-binary={BINARY}", "--timeout=30m",
+    ], log_path)
+    endpoint = f"bootstrap-{machine}"
+    for _ in range(180):
+        result = subprocess.run(
+            [KUBECTL, "get", "netbootendpoint", endpoint, "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            resource = json.loads(result.stdout)
+            ready = any(
+                condition.get("type") == "Ready" and condition.get("status") == "True"
+                for condition in resource.get("status", {}).get("conditions", [])
+            )
+            if ready:
+                return process
+        if process.poll() is not None:
+            die(f"bootstrap-netboot exited before endpoint {endpoint} became Ready")
+        time.sleep(1)
+    die(f"Timed out waiting for bootstrap endpoint {endpoint}")
+
+
+def delete_metalman_server_during_provisioning(site: str) -> None:
+    """Delete one serving replica after a session exists to exercise edge reconnect."""
+    for _ in range(300):
+        result = subprocess.run(
+            [KUBECTL, "get", "netbootsessions", "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and json.loads(result.stdout).get("items"):
+            break
+        time.sleep(1)
+    else:
+        die("Timed out waiting for a NetbootSession before server disruption")
+    pods = json.loads(run(
+        [KUBECTL, "-n", METALMAN_NAMESPACE, "get", "pod",
+         "-l", f"app.kubernetes.io/name=metalman-server,{API_GROUP}/site={site}",
+         "-o", "json"],
+        capture_output=True, text=True,
+    ).stdout).get("items", [])
+    ready_pods = sorted(
+        pod["metadata"]["name"] for pod in pods
+        if not pod["metadata"].get("deletionTimestamp") and any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in pod.get("status", {}).get("conditions", [])
+        )
+    )
+    if not ready_pods:
+        die("No Metalman server pod available for disruption")
+    pod = ready_pods[0]
+    log(f"Deleting Metalman server pod {pod} during provisioning")
+    kubectl(["-n", METALMAN_NAMESPACE, "delete", "pod", pod, "--wait=false"])
 
 
 def configure_kind_control_plane_node_ip(container: str, node_ip: str) -> None:
@@ -829,7 +1005,12 @@ def assert_cloud_init_done(timeout: int = 900) -> None:
                     op_status = op.get("status", {})
                     phase = op_status.get("phase", "")
                     message = op_status.get("message", "")
-                    for c in op_status.get("conditions", []):
+                    target = next(
+                        (item for item in op_status.get("targets", [])
+                         if item.get("machineRef") == NODE_NAME),
+                        {},
+                    )
+                    for c in target.get("conditions", []):
                         if c.get("type") == "CloudInitDone":
                             status = c.get("status", "")
                             reason = c.get("reason", "")
@@ -1082,13 +1263,13 @@ def main() -> None:
         "-out", str(TMPDIR / "redfish.crt"),
         "-days", "1", "-nodes",
         "-subj", "/CN=metalman-redfish-fixture",
-        "-addext", "subjectAltName=IP:127.0.0.1",
+        "-addext", f"subjectAltName=IP:{SERVER_IP}",
     ], check=True)
-    redfish_url = f"https://127.0.0.1:{REDFISH_PORT}"
+    redfish_url = f"https://{SERVER_IP}:{REDFISH_PORT}"
     proc = spawn([
         sys.executable, str(REPO_ROOT / "hack" / "metalman-redfish-fixture.py"),
         "--domain", VM_NAME, "--mac", MAC_ADDRESS,
-        "--bind", "127.0.0.1", "--port", str(REDFISH_PORT),
+        "--bind", SERVER_IP, "--port", str(REDFISH_PORT),
         "--cert", str(TMPDIR / "redfish.crt"),
         "--key", str(TMPDIR / "redfish.key"),
         "--record", str(TMPDIR / "redfish.jsonl"),
@@ -1210,6 +1391,8 @@ def main() -> None:
 
     server_url = apiserver_url()
     log(f"  API server URL: {server_url}")
+    deploy_split_metalman(SITE, server_url, METALMAN_IMAGE, NETBOOT_IMAGE_NAME_CLUSTER)
+
     protonode = {
         "apiVersion": API_VERSION,
         "kind": "Machine",
@@ -1218,21 +1401,28 @@ def main() -> None:
             "labels": {f"{API_GROUP}/site": SITE},
         },
         "spec": {
-            "pxe": {
-                "image": IMAGE_NAME,
-                "redfish": {
-                    "url": redfish_url,
-                    "username": "",
-                    "deviceID": VM_NAME,
-                    "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
+            "host": {
+                "netboot": {
+                    "image": IMAGE_NAME_CLUSTER,
+                    "netbootImage": NETBOOT_IMAGE_NAME_CLUSTER,
+                    "transport": "TFTP",
+                    "configurationSource": "DHCP",
+                    "networkMode": "DHCP",
+                    "endpointRef": "bootstrap-pending",
+                    "redfish": {
+                        "url": redfish_url,
+                        "username": "",
+                        "deviceID": VM_NAME,
+                        "passwordRef": {"name": "bmc-pass", "key": "password", "namespace": NODE_NS},
+                    },
+                    "dhcpLeases": [{
+                        "mac": MAC_ADDRESS,
+                        "ipv4": NODE_IP,
+                        "subnetMask": "255.255.255.0",
+                        "gateway": GATEWAY,
+                        "dns": [DNS_SERVER],
+                    }],
                 },
-                "dhcpLeases": [{
-                    "mac": MAC_ADDRESS,
-                    "ipv4": NODE_IP,
-                    "subnetMask": "255.255.255.0",
-                    "gateway": GATEWAY,
-                    "dns": [DNS_SERVER],
-                }],
             },
             "agent": {
                 "image": AGENT_IMAGE_NAME_VM,
@@ -1247,26 +1437,11 @@ def main() -> None:
             stdout=DEVNULL)
     log("  Resources created")
 
-    log("Starting metalman serve-pxe")
-    metalman_kubeconfig = TMPDIR / "metalman-controller.kubeconfig"
-    write_service_account_kubeconfig(METALMAN_NAMESPACE, METALMAN_CONTROLLER_SA, metalman_kubeconfig)
-    metalman_env = [f"METALMAN_APISERVER_URL={server_url}"]
-    metalman_env.append(f"KUBECONFIG={metalman_kubeconfig}")
-
-    proc = spawn([
-        "sudo", "env", *metalman_env,
-        str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
-        f"--cache-dir={CACHE_DIR}",
-        f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
-        f"--default-netboot-image={NETBOOT_IMAGE_NAME}",
-        "--leader-elect-lease-duration=60s",
-        "--leader-elect-renew-deadline=40s",
-        "--leader-elect-retry-period=5s",
-    ], TMPDIR / "serve.log")
-    log(f"  serve PID={proc.pid}")
-
-    time.sleep(2)
-    check_procs()
+    log("Starting local Metalman edge through kubectl-unbounded")
+    bootstrap_proc = start_bootstrap_netboot(
+        SITE, NODE_NAME, "virbr-smoke", SERVER_IP, HTTP_PORT,
+        TMPDIR / "bootstrap-netboot.log",
+    )
 
     log("Triggering HostReplace through kubectl-unbounded")
     operation_log = TMPDIR / "kubectl-host-replace.log"
@@ -1274,6 +1449,7 @@ def main() -> None:
         ["replace", NODE_NAME, "--force", "--ttl=3600"],
         operation_log.name,
     )
+    delete_metalman_server_during_provisioning(SITE)
 
     # Log free space so we can correlate disk exhaustion with VM failures.
     df = subprocess.run(["df", "-h", str(TMPDIR)], capture_output=True, text=True)
@@ -1289,6 +1465,7 @@ def main() -> None:
     wait_k8s_node(NODE_NAME, timeout=900)
     assert_node_ready(NODE_NAME, timeout=720)
     assert_node_label(NODE_NAME, NODE_LABEL_KEY, NODE_LABEL_VALUE)
+    wait_process_success(bootstrap_proc, timeout=120)
 
     run_operation_smoke_suite()
 

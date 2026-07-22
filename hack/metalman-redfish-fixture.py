@@ -45,7 +45,6 @@ class State:
         self.efi_source = Path(args.efi_source) if args.efi_source else None
         self.efi_active = Path(args.efi_active) if args.efi_active else None
         self.bridge = args.bridge
-        self.cache_dir = Path(args.cache_dir) if args.cache_dir else None
         self.manage_boot_order = args.manage_boot_order
         self.username = args.username
         self.password = args.password
@@ -113,7 +112,7 @@ class State:
         return "On" if result.returncode == 0 and "running" in result.stdout else "Off"
 
     def set_efi_boundary(self, enabled: bool) -> None:
-        if not all((self.efi_source, self.efi_active, self.bridge, self.cache_dir)):
+        if not all((self.efi_source, self.efi_active, self.bridge)):
             raise ValueError("UefiHttp requested without HTTP boundary arguments")
 
         assert self.efi_source is not None
@@ -127,14 +126,8 @@ class State:
             def stage(client_ip: str) -> None:
                 with subprocess.Popen(["mktemp", "-d"], stdout=subprocess.PIPE, text=True) as proc:
                     artifact_dir = Path(proc.communicate()[0].strip())
-                entrypoint = boot_url.rsplit("/", 1)[-1]
-                candidates = list(self.cache_dir.glob(f"oci/*/amd64/disk/{entrypoint}"))
-                if len(candidates) != 1:
-                    raise ValueError(
-                        f"expected one cached HTTP entrypoint {entrypoint}, found {len(candidates)}"
-                    )
-                shutil.copyfile(candidates[0], artifact_dir / "http-entrypoint.efi")
                 for path, url in (
+                    ("http-entrypoint.efi", boot_url),
                     ("grubx64.efi", f"{base_url}/grubx64.efi"),
                     ("vmlinuz", f"{base_url}/vmlinuz"),
                     ("initrd", f"{base_url}/initrd"),
@@ -357,15 +350,14 @@ def main() -> None:
     parser.add_argument("--efi-source")
     parser.add_argument("--efi-active")
     parser.add_argument("--bridge")
-    parser.add_argument("--cache-dir")
     parser.add_argument("--username", default="")
     parser.add_argument("--password", default="")
     parser.add_argument("--manage-boot-order", action="store_true")
     args = parser.parse_args()
 
-    boundary_values = (args.efi_source, args.efi_active, args.bridge, args.cache_dir)
+    boundary_values = (args.efi_source, args.efi_active, args.bridge)
     if any(boundary_values) and not all(boundary_values):
-        parser.error("--efi-source, --efi-active, --bridge, and --cache-dir must be used together")
+        parser.error("--efi-source, --efi-active, and --bridge must be used together")
 
     state = State(args)
     state.record.parent.mkdir(parents=True, exist_ok=True)

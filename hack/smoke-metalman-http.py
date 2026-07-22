@@ -6,9 +6,9 @@
 Stock Noble OVMF and sushy cannot emulate firmware-native DHCP-free UEFI HTTP.
 The VM therefore starts at the post-firmware EFI boundary: after Metalman has
 written standard Redfish static IPv4 and UefiHttp settings, the recording BMC
-fetches the real Metalman boot artifacts with the VM's source IP and exposes
-them on an EFI disk. From shim/GRUB onward the real kernel, installer initrd,
-machine image, cloud-init, and branch-built agent path runs unchanged.
+fetches the session capability URLs and exposes them on an EFI disk. From
+shim/GRUB onward the real kernel, installer initrd, machine image, cloud-init,
+and branch-built agent path runs unchanged.
 """
 
 from __future__ import annotations
@@ -49,13 +49,13 @@ HTTP_PORT = 8882
 AGENT_PORT = 8883
 REDFISH_PORT = 8444
 REGISTRY_PORT = 5556
-DHCP_PORT = 6768
 REGISTRY = "unbounded-http-smoke-registry"
 HOST_IMAGE = "localhost:5556/unbounded/host-ubuntu2404:http-smoke"
 NETBOOT_IMAGE = "localhost:5556/unbounded/netboot:http-smoke"
 AGENT_IMAGE = "localhost:5556/unbounded/agent-ubuntu2404:http-smoke"
+HOST_IMAGE_CLUSTER = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/host-ubuntu2404:http-smoke"
+NETBOOT_IMAGE_CLUSTER = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/netboot:http-smoke"
 AGENT_IMAGE_VM = f"{SERVER_IP}:{REGISTRY_PORT}/unbounded/agent-ubuntu2404:http-smoke"
-SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
 RECORD = TMP / "redfish.jsonl"
 PCAP = TMP / "traffic.pcap"
 VIRSH = ["virsh", "--connect", "qemu:///system"]
@@ -209,7 +209,11 @@ def create_vm() -> tuple[Path, Path]:
 def setup_kubernetes_and_images() -> None:
     log("Building binaries and applying Metalman RBAC/CRDs")
     run(["make", "machina-manifests"], cwd=ROOT)
-    for output, package in (("metalman", "./cmd/metalman"), ("unbounded-agent", "./cmd/agent")):
+    for output, package in (
+        ("metalman", "./cmd/metalman"),
+        ("unbounded-agent", "./cmd/agent"),
+        ("kubectl-unbounded", "./cmd/kubectl-unbounded"),
+    ):
         run(["go", "build", "-o", str(ROOT / "bin" / output), package], cwd=ROOT)
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/rendered/01-namespace.yaml")])
     run(["kubectl", "apply", "--server-side", "--force-conflicts", "-f", str(ROOT / "deploy/machina/crd")])
@@ -263,51 +267,53 @@ def setup_kubernetes_and_images() -> None:
 
 def start_fixture(blank_efi: Path, active_efi: Path) -> None:
     run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-         "-subj", "/CN=metalman-http-fixture", "-addext", "subjectAltName=IP:127.0.0.1",
+         "-subj", "/CN=metalman-http-fixture", "-addext", f"subjectAltName=IP:{SERVER_IP}",
          "-keyout", str(TMP / "redfish.key"), "-out", str(TMP / "redfish.crt")])
     spawn([sys.executable, str(ROOT / "hack/metalman-redfish-fixture.py"),
-           "--domain", VM, "--mac", MAC, "--port", str(REDFISH_PORT),
-            "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
-            "--record", str(RECORD), "--efi-source", str(blank_efi),
-            "--efi-active", str(active_efi), "--bridge", BRIDGE,
-            "--cache-dir", str(TMP / "cache"), "--username", "smoke", "--password", "smoke"],
-          "redfish.log")
+           "--domain", VM, "--mac", MAC, "--bind", SERVER_IP, "--port", str(REDFISH_PORT),
+             "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
+             "--record", str(RECORD), "--efi-source", str(blank_efi),
+             "--efi-active", str(active_efi), "--bridge", BRIDGE,
+             "--username", "smoke", "--password", "smoke"],
+           "redfish.log")
     time.sleep(1)
 
 
 def start_metalman_and_replace() -> None:
-    kubeconfig = TMP / "metalman.kubeconfig"
-    smoke.write_service_account_kubeconfig(smoke.METALMAN_NAMESPACE, "metalman-controller", kubeconfig)
     # The guest cannot resolve Docker's kind-control-plane hostname. Use the
     # control-plane address attached directly to this test's L2 network.
     api_url = f"https://{KIND_IP}:6443"
-    spawn(["sudo", "env", f"PATH={os.environ['PATH']}", f"KUBECONFIG={kubeconfig}",
-           f"METALMAN_APISERVER_URL={api_url}", str(ROOT / "bin/metalman"), "serve-pxe",
-            f"--site={SITE}", f"--bind-address={SERVER_IP}", f"--serve-url={SERVE_URL}",
-            f"--http-port={HTTP_PORT}",
-            f"--dhcp-port={DHCP_PORT}",
-            f"--cache-dir={TMP / 'cache'}", f"--default-netboot-image={NETBOOT_IMAGE}"],
-          "metalman.log")
+    smoke.deploy_split_metalman(
+        SITE, api_url, smoke.METALMAN_IMAGE, NETBOOT_IMAGE_CLUSTER,
+    )
     machine = {
         "apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "Machine",
         "metadata": {"name": NODE, "labels": {"unbounded-cloud.io/site": SITE}},
         "spec": {
-            "pxe": {
-                "image": HOST_IMAGE, "netbootImage": NETBOOT_IMAGE, "bootProtocol": "HTTP",
+            "host": {"netboot": {
+                "image": HOST_IMAGE_CLUSTER,
+                "netbootImage": NETBOOT_IMAGE_CLUSTER,
+                "transport": "HTTP",
+                "configurationSource": "Redfish",
+                "networkMode": "Static",
+                "endpointRef": "bootstrap-pending",
                 "targetDisk": "/dev/vda",
                 "dhcpLeases": [{"mac": MAC, "ipv4": NODE_IP, "subnetMask": "255.255.255.0",
                                 "gateway": SERVER_IP, "dns": ["8.8.8.8"]}],
-                "redfish": {"url": f"https://127.0.0.1:{REDFISH_PORT}", "username": "smoke",
+                "redfish": {"url": f"https://{SERVER_IP}:{REDFISH_PORT}", "username": "smoke",
                              "deviceID": VM, "passwordRef": {"name": "http-bmc-pass",
                              "namespace": "default", "key": "password"}},
                 "cloudInit": {"userDataConfigMapRef": {"name": "http-smoke-user-data",
                                                         "namespace": "default", "key": "user-data"}},
-            },
+            }},
             "agent": {"image": AGENT_IMAGE_VM,
                       "url": f"http://{SERVER_IP}:{AGENT_PORT}/unbounded-agent-linux-amd64.tar.gz"},
         },
     }
     run(["kubectl", "apply", "-f", "-"], input=json.dumps(machine), text=True)
+    bootstrap = smoke.start_bootstrap_netboot(
+        SITE, NODE, BRIDGE, SERVER_IP, HTTP_PORT, TMP / "bootstrap-netboot.log",
+    )
     for _ in range(120):
         fingerprint = subprocess.run(
             ["kubectl", "get", "machine", NODE, "-o", "jsonpath={.status.redfish.certFingerprint}"],
@@ -319,28 +325,11 @@ def start_metalman_and_replace() -> None:
     else:
         raise RuntimeError("Redfish certificate fingerprint was not recorded")
 
-    log("Waiting for host and netboot OCI images to be cached")
-    cache_dir = TMP / "cache" / "oci"
-    metalman_log = TMP / "metalman.log"
-    for _ in range(300):
-        disk_dirs = list(cache_dir.glob("*/amd64/disk"))
-        host_ready = any((path / "disk.img.gz").is_file() for path in disk_dirs)
-        netboot_ready = any((path / "bootx64.efi").is_file() for path in disk_dirs)
-        log_text = metalman_log.read_text(encoding="utf-8") if metalman_log.exists() else ""
-        host_published = any("OCI image cached" in line and f"image={HOST_IMAGE}" in line
-                             for line in log_text.splitlines())
-        netboot_published = any("OCI image cached" in line and f"image={NETBOOT_IMAGE}" in line
-                                for line in log_text.splitlines())
-        if host_ready and netboot_ready and host_published and netboot_published:
-            break
-        time.sleep(1)
-    else:
-        raise RuntimeError("host and netboot OCI images were not cached within 5 minutes")
-
     operation = smoke.create_machine_operation(
         "http-smoke-host-replace", "HostReplace", machine_ref=NODE
     )
     smoke.wait_machine_operation_complete(operation, timeout=1800)
+    smoke.wait_process_success(bootstrap, timeout=120)
 
 
 def fixture_writes() -> list[dict[str, Any]]:
@@ -359,12 +348,15 @@ def assert_contract() -> None:
     boot_patches = [entry["body"].get("Boot", {}) for entry in writes
                     if entry["method"] == "PATCH" and entry["path"] == f"/redfish/v1/Systems/{VM}"]
     if not any(boot.get("BootSourceOverrideTarget") == "UefiHttp"
-                and boot.get("BootSourceOverrideEnabled") == "Continuous"
+                and boot.get("BootSourceOverrideEnabled") == "Once"
                 and boot.get("BootSourceOverrideMode") == "UEFI"
-                and boot.get("HttpBootUri") == f"{SERVE_URL}/bootx64.efi" for boot in boot_patches):
+                and "/v1/netboot/sessions/" in boot.get("HttpBootUri", "")
+                and boot.get("HttpBootUri", "").endswith("/artifacts/bootx64.efi")
+                for boot in boot_patches):
         raise AssertionError(f"standard UefiHttp PATCH not recorded: {boot_patches}")
     firmware_fetches = [entry for entry in writes if entry["method"] == "FIRMWARE_FETCH"]
-    if not any(entry["path"] == f"{SERVE_URL}/bootx64.efi"
+    if not any("/v1/netboot/sessions/" in entry["path"]
+               and entry["path"].endswith("/artifacts/bootx64.efi")
                and entry["body"] == {"source": NODE_IP} for entry in firmware_fetches):
         raise AssertionError(f"state-derived post-power-on firmware fetch not recorded: {firmware_fetches}")
 
