@@ -288,7 +288,7 @@ jobs:
           test "$(jq -r '.release.tag' "${BOM}")" = "${TAG}"
           test "$(jq -r '.release.gitCommit' "${BOM}")" = "$(git rev-parse HEAD)"
 
-          jq -r '.images[] | .reference + "@" + .digest' "${BOM}" | while IFS= read -r image; do
+          jq -r '.images[] | (.reference | sub(":[^/]+$"; "")) + "@" + .digest' "${BOM}" | while IFS= read -r image; do
             cosign verify \
               --certificate-identity-regexp "${IDENTITY}" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
