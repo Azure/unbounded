@@ -64,6 +64,7 @@ func newRootCommand() *cobra.Command {
 
 	flags := cmd.Flags()
 	flags.StringVar(&opts.OutputDir, "output-dir", "", "Directory where the offline artifact filesystem layout is written")
+	flags.StringVar(&opts.ArchivePath, "archive", "", "Optional path for a gzip-compressed tar archive of the offline artifact bundle")
 	flags.StringVar(&opts.OCIRef, "oci-ref", "", "Optional OCI artifact reference to push, with or without oci:// prefix")
 	flags.StringVar(&opts.ManifestPath, "manifest", "", "Path to offline artifact manifest.json declaring artifact versions")
 	flags.StringVar(&opts.KubernetesVersion, "kubernetes-version", "", "Kubernetes version for a default manifest using the agent's pinned runtime versions")
@@ -89,7 +90,7 @@ func newLogger(debug bool, format string) *slog.Logger {
 	}
 
 	return slog.New(logger.NewPrettyFieldHandler(&lvl, logger.PrettyFieldHandlerOptions{
-		AttrOrder: []string{"artifact", "source", "oci_ref", "digest", "staging_dir"},
+		AttrOrder: []string{"artifact", "source", "archive", "oci_ref", "digest", "staging_dir"},
 	}))
 }
 
@@ -108,9 +109,10 @@ func newLogger(debug bool, format string) *slog.Logger {
 //     publishes every patch version inside that group. Each publish job creates
 //     one temporary staging directory so artifacts with the same version, such as
 //     containerd or runc, are downloaded once and materialized into each bundle.
-//  5. Each bundle is validated before push so invalid local content fails the
-//     job before publishing to the registry. Published tags are OCI indexes with
-//     one platform manifest per target architecture.
+//  5. Each bundle is validated before publishing so invalid local content fails
+//     the job before creating the HTTPS archive or pushing to the registry. The
+//     archive is a gzip-compressed filesystem bundle, while the OCI tag is an
+//     index with one platform manifest per target architecture.
 //  6. Each published OCI tag must keep the shape documented in
 //     designs/agent-offline-bootstrap.md:
 //     ghcr.io/<owner>/unbounded/bootstrap-artifacts:<tag-prefix>-k8s-<kubernetes-version>
@@ -152,6 +154,7 @@ func publishVersionGroup(ctx context.Context, log *slog.Logger) error {
 	for _, kubernetesVersion := range versions {
 		ociRef := fmt.Sprintf("%s/bootstrap-artifacts:%s-k8s-%s", registry, tagPrefix, kubernetesVersion)
 		outputDir := filepath.Join("dist", "bootstrap-artifacts", kubernetesVersion)
+		archivePath := filepath.Join("dist", "bootstrap-artifacts", fmt.Sprintf("bootstrap-artifacts-%s-k8s-%s.tar.gz", tagPrefix, kubernetesVersion))
 
 		log.Info("building offline artifact bundle",
 			slog.String("kubernetes_version", kubernetesVersion),
@@ -164,6 +167,7 @@ func publishVersionGroup(ctx context.Context, log *slog.Logger) error {
 			StagingDir:        stagingDir,
 			KubernetesVersion: kubernetesVersion,
 			Architectures:     []string{"amd64", "arm64"},
+			ArchivePath:       archivePath,
 			OCIRef:            ociRef,
 		}); err != nil {
 			return err
@@ -173,7 +177,10 @@ func publishVersionGroup(ctx context.Context, log *slog.Logger) error {
 			return err
 		}
 
-		log.Info("published offline artifact bundle", slog.String("oci_ref", ociRef))
+		log.Info("published offline artifact bundle",
+			slog.String("archive", archivePath),
+			slog.String("oci_ref", ociRef),
+		)
 	}
 
 	return nil

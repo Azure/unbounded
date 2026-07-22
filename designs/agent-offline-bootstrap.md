@@ -619,7 +619,7 @@ OCI bundles should be published as multi-platform OCI indexes under the single K
 
 The OCI representation should use one OCI blob per target artifact, not one tarball layer containing all artifacts. This lets the agent fetch only the artifacts it needs and allows registries to deduplicate unchanged blobs across bundle tags.
 
-For HTTPS archive mode, the publishing process should also package the expanded filesystem bundle as a plain tar or gzip-compressed tar archive. This transport archive contains `manifest.json` and the same component-prefixed paths as filesystem mode. It is intentionally a complete bundle because static HTTPS servers cannot provide OCI title-based blob selection.
+For HTTPS archive mode, `agent-artifacts-builder` should also package the expanded filesystem bundle as a gzip-compressed tar archive and write an adjacent `.sha256` file. The archive contains `manifest.json` and the same component-prefixed paths as filesystem mode. It is intentionally a complete bundle because static HTTPS servers cannot provide OCI title-based blob selection. The version-group publishing flow writes archives named like `bootstrap-artifacts-<tag-prefix>-k8s-<kubernetes-version>.tar.gz` alongside the expanded bundles uploaded by the workflow.
 
 ### Operator mirroring workflow
 

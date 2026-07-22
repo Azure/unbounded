@@ -10,6 +10,47 @@ import (
 	"testing"
 )
 
+func TestCheckRedirectNoHTTPSDowngrade(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		from    string
+		to      string
+		wantErr bool
+	}{
+		{name: "HTTPS to HTTPS", from: "https://source.example.test/archive", to: "https://cdn.example.test/archive"},
+		{name: "HTTP to HTTPS", from: "http://source.example.test/archive", to: "https://cdn.example.test/archive"},
+		{name: "HTTP to HTTP", from: "http://source.example.test/archive", to: "http://cdn.example.test/archive"},
+		{name: "HTTPS to HTTP", from: "https://source.example.test/archive", to: "http://cdn.example.test/archive", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			from, err := http.NewRequest(http.MethodGet, tt.from, http.NoBody)
+			if err != nil {
+				t.Fatalf("create source request: %v", err)
+			}
+
+			to, err := http.NewRequest(http.MethodGet, tt.to, http.NoBody)
+			if err != nil {
+				t.Fatalf("create destination request: %v", err)
+			}
+
+			err = CheckRedirectNoHTTPSDowngrade(to, []*http.Request{from})
+			if tt.wantErr && err == nil {
+				t.Fatal("CheckRedirectNoHTTPSDowngrade() error = nil, want error")
+			}
+
+			if !tt.wantErr && err != nil {
+				t.Fatalf("CheckRedirectNoHTTPSDowngrade() error = %v, want nil", err)
+			}
+		})
+	}
+}
+
 func TestProbeRemoteHTTPObjectFallbackUsesRange(t *testing.T) {
 	t.Parallel()
 

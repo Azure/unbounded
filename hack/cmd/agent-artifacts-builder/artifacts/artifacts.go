@@ -46,6 +46,7 @@ const (
 type Options struct {
 	OutputDir         string
 	StagingDir        string
+	ArchivePath       string
 	OCIRef            string
 	ManifestPath      string
 	Manifest          agentartifacts.Manifest
@@ -110,11 +111,19 @@ func Build(ctx context.Context, log *slog.Logger, opts Options) error {
 		return err
 	}
 
-	if opts.OCIRef != "" {
+	if opts.OCIRef != "" || opts.ArchivePath != "" {
 		if err := ValidateBundle(log, opts.OutputDir); err != nil {
 			return err
 		}
+	}
 
+	if opts.ArchivePath != "" {
+		if err := WriteBundleArchive(opts.OutputDir, opts.ArchivePath); err != nil {
+			return err
+		}
+	}
+
+	if opts.OCIRef != "" {
 		if err := PushOCI(ctx, log, opts.OutputDir, opts.OCIRef); err != nil {
 			return err
 		}

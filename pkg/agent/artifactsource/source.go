@@ -30,7 +30,8 @@ const (
 )
 
 var httpClient = &http.Client{
-	Timeout: 10 * time.Minute,
+	Timeout:       10 * time.Minute,
+	CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
 }
 
 // Source is a parsed artifact source. It can reference an absolute local path,

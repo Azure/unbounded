@@ -21,12 +21,25 @@ import (
 const remoteHTTPProbeTimeout = 10 * time.Second
 
 var remoteHTTPClient = &http.Client{
-	Timeout: 10 * time.Minute, // FIXME: proper configuration
+	Timeout:       10 * time.Minute, // FIXME: proper configuration
+	CheckRedirect: CheckRedirectNoHTTPSDowngrade,
 }
 
 var remoteHTTPProbeClient = &http.Client{
-	Transport: newRemoteHTTPProbeTransport(),
-	Timeout:   remoteHTTPProbeTimeout,
+	Transport:     newRemoteHTTPProbeTransport(),
+	Timeout:       remoteHTTPProbeTimeout,
+	CheckRedirect: CheckRedirectNoHTTPSDowngrade,
+}
+
+// CheckRedirectNoHTTPSDowngrade rejects redirects from an HTTPS source to an
+// insecure destination while allowing redirects that preserve or improve the
+// transport scheme.
+func CheckRedirectNoHTTPSDowngrade(req *http.Request, via []*http.Request) error {
+	if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing redirect from HTTPS to %q", req.URL.Scheme)
+	}
+
+	return nil
 }
 
 func newRemoteHTTPProbeTransport() http.RoundTripper {
