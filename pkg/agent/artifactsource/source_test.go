@@ -55,7 +55,7 @@ func TestParseRootResolvesOCIArtifact(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, KindOCI, root.Kind())
 
-	manifest, err := root.OCIArtifact("manifest.json")
+	manifest, err := root.Artifact("manifest.json")
 	require.NoError(t, err)
 	require.Equal(t, "oci://registry.example.test/artifacts:v1#manifest.json", manifest.String())
 }

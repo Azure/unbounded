@@ -4,9 +4,6 @@
 package goalstates
 
 import (
-	"archive/tar"
-	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"os"
@@ -129,46 +126,7 @@ func TestNormalizeOfflineSourceRootTypes(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, artifactsource.KindOCI, oci.artifact.Kind())
 	require.Equal(t, "oci://registry.example.test/unbounded/bootstrap:v1", oci.root)
-	require.Equal(t, oci.root+"#manifest.json", oci.artifact.String())
-}
-
-func TestContainerImageArchiveSourceKeyIgnoresSignedQuery(t *testing.T) {
-	t.Parallel()
-
-	withoutQuery := containerImageArchiveSourceKey("https://artifacts.example.test/bootstrap")
-	firstSAS := containerImageArchiveSourceKey("https://artifacts.example.test/bootstrap?sp=r&sig=first-secret")
-	rotatedSAS := containerImageArchiveSourceKey("https://artifacts.example.test/bootstrap?sp=r&sig=rotated-secret")
-
-	require.Equal(t, withoutQuery, firstSAS)
-	require.Equal(t, firstSAS, rotatedSAS)
-	require.NotContains(t, firstSAS, "secret")
-	require.NotContains(t, firstSAS, "sig")
-}
-
-func TestMaterializeOfflineArchive(t *testing.T) {
-	t.Parallel()
-
-	archivePath := filepath.Join(t.TempDir(), "offline-artifacts.tar.gz")
-	writeTestTarGz(t, archivePath, map[string]string{
-		"v1.34.2/manifest.json": `{"schemaVersion":1}`,
-		"v1.34.2/runc/v1/runc":  "runc",
-	})
-
-	source, err := artifactsource.Parse(archivePath)
-	require.NoError(t, err)
-
-	cacheRoot := filepath.Join(t.TempDir(), "cache")
-	bundleRoot, err := materializeOfflineArchive(context.Background(), source, cacheRoot, "https://artifacts.example.test/offline.tar.gz")
-	require.NoError(t, err)
-	require.FileExists(t, filepath.Join(bundleRoot, OfflineArtifactManifestFileName))
-	require.FileExists(t, filepath.Join(bundleRoot, "runc", "v1", "runc"))
-	require.NoError(t, markOfflineArchiveCacheReady(bundleRoot))
-
-	require.NoError(t, os.Remove(archivePath))
-
-	cachedRoot, err := materializeOfflineArchive(context.Background(), source, cacheRoot, "https://artifacts.example.test/offline.tar.gz")
-	require.NoError(t, err)
-	require.Equal(t, bundleRoot, cachedRoot)
+	require.Equal(t, oci.root, oci.artifact.String())
 }
 
 func TestResolveOfflineArtifacts(t *testing.T) {
@@ -266,29 +224,6 @@ func TestResolveOfflineArtifactsRequiresExistingFiles(t *testing.T) {
 		&config.AgentOfflineArtifacts{Source: root},
 	)
 	require.ErrorContains(t, err, "required offline artifact")
-}
-
-func writeTestTarGz(t *testing.T, path string, files map[string]string) {
-	t.Helper()
-
-	var buffer bytes.Buffer
-
-	gzipWriter := gzip.NewWriter(&buffer)
-	tarWriter := tar.NewWriter(gzipWriter)
-
-	for name, contents := range files {
-		require.NoError(t, tarWriter.WriteHeader(&tar.Header{
-			Name: name,
-			Mode: 0o644,
-			Size: int64(len(contents)),
-		}))
-		_, err := tarWriter.Write([]byte(contents))
-		require.NoError(t, err)
-	}
-
-	require.NoError(t, tarWriter.Close())
-	require.NoError(t, gzipWriter.Close())
-	require.NoError(t, os.WriteFile(path, buffer.Bytes(), 0o644))
 }
 
 func writeGoalStateOfflineBundle(t *testing.T, manifest OfflineArtifactManifest) string {

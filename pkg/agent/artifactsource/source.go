@@ -127,6 +127,22 @@ func (s Source) LocalPath() (string, bool) {
 	return s.localPath, true
 }
 
+// Artifact resolves a child artifact from a local or OCI bundle root.
+func (s Source) Artifact(path string) (Source, error) {
+	if path == "" || !filepath.IsLocal(filepath.FromSlash(path)) {
+		return Source{}, fmt.Errorf("artifact path must be local: %q", path)
+	}
+
+	switch s.kind {
+	case KindLocal:
+		return Parse(filepath.Join(s.localPath, filepath.FromSlash(path)))
+	case KindOCI:
+		return s.OCIArtifact(filepath.ToSlash(path))
+	default:
+		return Source{}, fmt.Errorf("artifact source kind %d does not support child artifacts", s.kind)
+	}
+}
+
 // OCIArtifact returns an openable OCI blob source selected by title from an OCI
 // bundle root.
 func (s Source) OCIArtifact(title string) (Source, error) {
@@ -150,6 +166,36 @@ func (s Source) OCIArtifact(title string) (Source, error) {
 	parsed.Fragment = strings.TrimPrefix(title, "/")
 
 	return Parse(parsed.String())
+}
+
+// OCIArtifactTitles returns the blob titles in an OCI artifact bundle root.
+func (s Source) OCIArtifactTitles(ctx context.Context) (map[string]struct{}, error) {
+	if s.kind != KindOCI {
+		return nil, fmt.Errorf("artifact source is not an OCI bundle root")
+	}
+
+	parsed, err := url.Parse(s.raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse OCI artifact root: %w", err)
+	}
+
+	if parsed.Fragment != "" {
+		return nil, fmt.Errorf("OCI artifact bundle root must not include a blob title fragment")
+	}
+
+	manifest, err := ociartifact.FetchManifest(ctx, s.raw)
+	if err != nil {
+		return nil, err
+	}
+
+	descriptors := ociartifact.DescriptorsByTitle(manifest)
+
+	titles := make(map[string]struct{}, len(descriptors))
+	for title := range descriptors {
+		titles[title] = struct{}{}
+	}
+
+	return titles, nil
 }
 
 // Open opens the artifact source for streaming.
@@ -192,6 +238,22 @@ func openHTTPWithClient(ctx context.Context, client *http.Client, source string)
 	}
 
 	return resp.Body, nil
+}
+
+// ReadAll reads the complete artifact source.
+func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
+	body, err := s.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close() //nolint:errcheck // best effort close
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return nil, fmt.Errorf("read artifact source: %w", err)
+	}
+
+	return data, nil
 }
 
 // DownloadToLocalFile downloads the artifact source to filename and sets perm.
