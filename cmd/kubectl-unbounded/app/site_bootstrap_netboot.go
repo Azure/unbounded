@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -225,4 +226,88 @@ func (h *siteBootstrapNetbootHandler) edgeArguments(backendURL, tokenFile string
 		"--tftp-enabled",
 		"--tftp-bind-address=" + h.address,
 	}
+}
+
+func (h *siteBootstrapNetbootHandler) claimEndpoint(ctx context.Context, identity string) error {
+	var endpoint v1alpha3.NetbootEndpoint
+	if err := h.resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &endpoint); err != nil {
+		return fmt.Errorf("get NetbootEndpoint %s: %w", h.endpointName, err)
+	}
+
+	now := metav1.Now()
+	endpoint.Status.ObservedGeneration = endpoint.Generation
+	endpoint.Status.Claim = &v1alpha3.NetbootEndpointClaim{
+		HolderIdentity: identity,
+		RenewedAt:      now,
+	}
+	metaSetStatusCondition(&endpoint.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: endpoint.Generation,
+		Reason:             "ExternalEdgeReady",
+		Message:            "administrator bootstrap edge is ready",
+		LastTransitionTime: now,
+	})
+
+	if err := h.resources.Status().Update(ctx, &endpoint); err != nil {
+		return fmt.Errorf("claim NetbootEndpoint %s: %w", h.endpointName, err)
+	}
+
+	return nil
+}
+
+func (h *siteBootstrapNetbootHandler) waitForNodeReady(ctx context.Context, nodeName string) error {
+	interval := h.pollInterval
+	if interval <= 0 {
+		interval = defaultBootstrapPollInterval
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		node, err := h.kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get designated Node %s: %w", nodeName, err)
+		}
+		if err == nil && nodeReady(node) {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for designated Node %s to become Ready: %w", nodeName, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func nodeReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
+}
+
+func designatedNodeName(machine *v1alpha3.Machine) string {
+	if machine.Spec.Kubernetes != nil && machine.Spec.Kubernetes.NodeRef != nil && machine.Spec.Kubernetes.NodeRef.Name != "" {
+		return machine.Spec.Kubernetes.NodeRef.Name
+	}
+
+	return machine.Name
+}
+
+func metaSetStatusCondition(conditions *[]metav1.Condition, condition metav1.Condition) {
+	for i := range *conditions {
+		if (*conditions)[i].Type == condition.Type {
+			(*conditions)[i] = condition
+
+			return
+		}
+	}
+
+	*conditions = append(*conditions, condition)
 }

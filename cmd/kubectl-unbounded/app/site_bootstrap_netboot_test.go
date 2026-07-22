@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
@@ -218,4 +219,66 @@ func TestBootstrapNetbootEdgeArgumentsContainOnlyDataPlaneConfiguration(t *testi
 		require.NotContains(t, arg, "--cache-dir")
 		require.NotContains(t, arg, "leader-elect")
 	}
+}
+
+func TestBootstrapNetbootClaimsEndpointAndWaitsForDesignatedNode(t *testing.T) {
+	ctx := context.Background()
+	endpoint := &v1alpha3.NetbootEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-first-node", Generation: 3},
+		Spec:       v1alpha3.NetbootEndpointSpec{SiteRef: "rack-a"},
+	}
+	resources := fakeclient.NewClientBuilder().WithScheme(buildScheme()).WithStatusSubresource(endpoint).WithObjects(endpoint).Build()
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   "node-1",
+		Labels: map[string]string{v1alpha3.MachineSiteLabelKey: "rack-a"},
+	}}
+	kubeClient := fake.NewSimpleClientset(node)
+	h := &siteBootstrapNetbootHandler{
+		site: "rack-a", endpointName: endpoint.Name, resources: resources, kubeClient: kubeClient,
+		pollInterval: time.Millisecond,
+	}
+
+	require.NoError(t, h.claimEndpoint(ctx, "bootstrap/123"))
+	var claimed v1alpha3.NetbootEndpoint
+	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: endpoint.Name}, &claimed))
+	require.Equal(t, endpoint.Generation, claimed.Status.ObservedGeneration)
+	require.Equal(t, "bootstrap/123", claimed.Status.Claim.HolderIdentity)
+	require.Equal(t, metav1.ConditionTrue, claimed.Status.Conditions[0].Status)
+
+	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	ready := make(chan error, 1)
+	go func() { ready <- h.waitForNodeReady(waitCtx, node.Name) }()
+
+	time.Sleep(5 * time.Millisecond)
+	other := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Labels: map[string]string{v1alpha3.MachineSiteLabelKey: "rack-a"}},
+		Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+	}
+	_, err := kubeClient.CoreV1().Nodes().Create(ctx, other, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	select {
+	case err := <-ready:
+		require.Failf(t, "wait returned for wrong Node", "error: %v", err)
+	case <-time.After(5 * time.Millisecond):
+	}
+
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+	_, err = kubeClient.CoreV1().Nodes().UpdateStatus(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, <-ready)
+}
+
+func TestBootstrapNetbootDesignatedNodeNameUsesMachineNodeRef(t *testing.T) {
+	machine := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-name"},
+		Spec: v1alpha3.MachineSpec{Kubernetes: &v1alpha3.KubernetesSpec{
+			NodeRef: &v1alpha3.LocalObjectReference{Name: "node-name"},
+		}},
+	}
+
+	require.Equal(t, "node-name", designatedNodeName(machine))
+	machine.Spec.Kubernetes.NodeRef = nil
+	require.Equal(t, "machine-name", designatedNodeName(machine))
 }
