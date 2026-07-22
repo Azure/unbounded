@@ -53,6 +53,7 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 	if got := cm.Data["UNBOUNDED_API_SERVER_ENDPOINT"]; got != endpoint {
 		t.Fatalf("configmap UNBOUNDED_API_SERVER_ENDPOINT = %q, want %q", got, endpoint)
 	}
+
 	if got := cm.Data["UNBOUNDED_IMAGE_REGISTRY"]; got != "registry.example.com/mirror" {
 		t.Fatalf("configmap UNBOUNDED_IMAGE_REGISTRY = %q", got)
 	}
@@ -68,6 +69,13 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 					Annotations map[string]string `yaml:"annotations"`
 				} `yaml:"metadata"`
 				Spec struct {
+					HostNetwork bool   `yaml:"hostNetwork"`
+					DNSPolicy   string `yaml:"dnsPolicy"`
+					Tolerations []struct {
+						Key      string `yaml:"key"`
+						Operator string `yaml:"operator"`
+						Effect   string `yaml:"effect"`
+					} `yaml:"tolerations"`
 					Containers []struct {
 						Name         string   `yaml:"name"`
 						Args         []string `yaml:"args"`
@@ -113,6 +121,28 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 	rollingUpdate, found := deploy.Spec.Strategy["rollingUpdate"]
 	if !found || rollingUpdate != nil {
 		t.Fatalf("deployment strategy rollingUpdate = %#v (present: %t), want explicit null", rollingUpdate, found)
+	}
+
+	if !deploy.Spec.Template.Spec.HostNetwork {
+		t.Fatal("deployment pod hostNetwork = false, want true so the operator can install CNI")
+	}
+
+	if got := deploy.Spec.Template.Spec.DNSPolicy; got != "Default" {
+		t.Fatalf("deployment pod dnsPolicy = %q, want Default for pre-CNI API FQDN resolution", got)
+	}
+
+	foundNotReadyToleration := false
+
+	for _, toleration := range deploy.Spec.Template.Spec.Tolerations {
+		if toleration.Key == "node.kubernetes.io/not-ready" && toleration.Operator == "Exists" && toleration.Effect == "NoSchedule" {
+			foundNotReadyToleration = true
+
+			break
+		}
+	}
+
+	if !foundNotReadyToleration {
+		t.Fatalf("deployment pod tolerations = %#v, want node.kubernetes.io/not-ready Exists NoSchedule", deploy.Spec.Template.Spec.Tolerations)
 	}
 
 	for _, container := range deploy.Spec.Template.Spec.Containers {
@@ -211,6 +241,7 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 	if got := renderHash("https://api.example.test:6443", "ghcr.io", "false"); got == baseline {
 		t.Fatal("changing UNBOUNDED_REAP_LEGACY_RESOURCES did not change the rendered config hash")
 	}
+
 	if got := renderHash("https://api.example.test:6443", "registry.example.com", "true"); got == baseline {
 		t.Fatal("changing UNBOUNDED_IMAGE_REGISTRY did not change the rendered config hash")
 	}
