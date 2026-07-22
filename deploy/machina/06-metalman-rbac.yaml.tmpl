@@ -9,6 +9,13 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  name: metalman-server
+  namespace: {{ default "unbounded-system" .Namespace }}
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
   name: metalman-bootstrap
   namespace: {{ default "unbounded-system" .Namespace }}
 
@@ -33,11 +40,37 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # Bootstrap token creation (scoped to metalman-bootstrap SA)
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metalman-server
+  namespace: {{ default "unbounded-system" .Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Bootstrap token creation is scoped to the bootstrap ServiceAccount.
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     resourceNames: ["metalman-bootstrap"]
     verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metalman-server
+  namespace: {{ default "unbounded-system" .Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: metalman-server
+    namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  kind: Role
+  name: metalman-server
+  apiGroup: rbac.authorization.k8s.io
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -48,6 +81,9 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: metalman-controller
+    namespace: {{ default "unbounded-system" .Namespace }}
+  - kind: ServiceAccount
+    name: metalman-server
     namespace: {{ default "unbounded-system" .Namespace }}
 roleRef:
   kind: Role
@@ -76,6 +112,9 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: metalman-controller
+    namespace: {{ default "unbounded-system" .Namespace }}
+  - kind: ServiceAccount
+    name: metalman-server
     namespace: {{ default "unbounded-system" .Namespace }}
 roleRef:
   kind: Role
@@ -152,11 +191,6 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
-  # Authenticate audience-bound edge ServiceAccount tokens.
-  - apiGroups: ["authentication.k8s.io"]
-    resources: ["tokenreviews"]
-    verbs: ["create"]
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -169,6 +203,52 @@ subjects:
 roleRef:
   kind: ClusterRole
   name: metalman-controller
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: metalman-server
+rules:
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machines/status"]
+    verbs: ["get", "update"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineoperations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineoperations/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["netbootendpoints", "netbootsessions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["netbootsessions/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "nodes"]
+    verbs: ["get", "list", "watch"]
+  # Authenticate audience-bound edge ServiceAccount tokens.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metalman-server
+subjects:
+  - kind: ServiceAccount
+    name: metalman-server
+    namespace: {{ default "unbounded-system" .Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: metalman-server
   apiGroup: rbac.authorization.k8s.io
 
 ---

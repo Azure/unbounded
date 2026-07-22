@@ -1,25 +1,29 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package metalman implements the per-Site metalman PXE controller component.
+// Package metalman implements the per-Site Metalman control and serving plane.
 package metalman
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-// Component reconciles the per-Site metalman PXE controller.
+// Component reconciles the per-Site Metalman workloads.
 type Component struct{}
 
 // New returns the metalman per-Site component.
@@ -40,27 +44,44 @@ func (Component) Enabled(site *unboundedv1alpha3.Site) bool {
 	return unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Metalman.SiteComponentSpec)
 }
 
-// Reconcile deploys the per-site metalman PXE controller and its RBAC.
+// Reconcile deploys the per-site Metalman controller and server plane.
 func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) component.Result {
 	if err := env.ApplyManifestFS(ctx, machinamanifests.Manifests, mutateSupportObject); err != nil {
 		return component.Failed(err)
 	}
-
-	if err := env.ApplyObject(ctx, deployment(site, env.Namespace, env.Config)); err != nil {
+	if err := ensureCapabilitySecret(ctx, env, site); err != nil {
 		return component.Failed(err)
+	}
+
+	for _, obj := range []client.Object{
+		controllerDeployment(site, env.Namespace, env.Config),
+		serverDeployment(site, env.Namespace, env.Config),
+		serverService(site, env.Namespace),
+	} {
+		if err := env.ApplyObject(ctx, obj); err != nil {
+			return component.Failed(err)
+		}
 	}
 
 	return component.Reconciled()
 }
 
-// Cleanup removes the per-site metalman Deployment. The shared metalman RBAC is
+// Cleanup removes the per-site Metalman workloads. The shared Metalman RBAC is
 // left in place; it is harmless when unreferenced and may still be used by other
 // sites.
 func (Component) Cleanup(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) error {
-	return env.DeleteIfExists(ctx, &appsv1.Deployment{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
-		ObjectMeta: metav1.ObjectMeta{Name: DeploymentName(site.Name), Namespace: env.Namespace},
-	})
+	for _, obj := range []client.Object{
+		&appsv1.Deployment{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}, ObjectMeta: metav1.ObjectMeta{Name: DeploymentName(site.Name), Namespace: env.Namespace}},
+		&appsv1.Deployment{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}, ObjectMeta: metav1.ObjectMeta{Name: ServerName(site.Name), Namespace: env.Namespace}},
+		&corev1.Service{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"}, ObjectMeta: metav1.ObjectMeta{Name: ServerName(site.Name), Namespace: env.Namespace}},
+		&corev1.Secret{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}, ObjectMeta: metav1.ObjectMeta{Name: CapabilitySecretName(site.Name), Namespace: env.Namespace}},
+	} {
+		if err := env.DeleteIfExists(ctx, obj); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // SetupWatches recreates the per-site Deployment if it is deleted or drifts, via
@@ -68,10 +89,19 @@ func (Component) Cleanup(ctx context.Context, env *component.Env, site *unbounde
 // updates so pod-count churn does not re-apply the Deployment.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Owns(&appsv1.Deployment{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
+	b.Owns(&corev1.Service{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
 }
 
 // DeploymentName is the per-site metalman Deployment name.
 func DeploymentName(site string) string { return "metalman-controller-" + site }
+
+// ServerName is the per-site Metalman server Deployment and Service name.
+func ServerName(site string) string { return "metalman-server-" + site }
+
+// CapabilitySecretName is the per-site capability signing Secret name.
+func CapabilitySecretName(site string) string { return "metalman-capability-" + site }
+
+const capabilitySecretKey = "capability.key"
 
 // SupportObjectNameSubstring identifies the metalman RBAC objects that ship in
 // the machina manifest set. It is exported so the machina component can skip
@@ -95,25 +125,34 @@ func mutateSupportObject(obj *unstructured.Unstructured) error {
 	return nil
 }
 
-func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Config) *appsv1.Deployment {
+func controllerDeployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Config) *appsv1.Deployment {
+	return roleDeployment(site, namespace, cfg, metalmanControllerRole, 1)
+}
+
+func serverDeployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Config) *appsv1.Deployment {
+	return roleDeployment(site, namespace, cfg, metalmanServerRole, 2)
+}
+
+const (
+	metalmanControllerRole = "controller"
+	metalmanServerRole     = "server"
+)
+
+func roleDeployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Config, role string, replicas int32) *appsv1.Deployment {
 	image := cfg.Image("metalman")
 	name := DeploymentName(site.Name)
+	if role == metalmanServerRole {
+		name = ServerName(site.Name)
+	}
+
 	labels := map[string]string{
-		"app":                                 "unbounded-pxe",
-		"app.kubernetes.io/name":              "metalman-controller",
-		"app.kubernetes.io/component":         "metalman",
+		"app":                                 "unbounded-metalman",
+		"app.kubernetes.io/name":              "metalman-" + role,
+		"app.kubernetes.io/component":         role,
 		unboundedv1alpha3.MachineSiteLabelKey: site.Name,
 	}
 
-	args := []string{"serve-pxe", "--site=" + site.Name}
-	if site.Spec.Components.Metalman.DHCPAutoInterface != nil && *site.Spec.Components.Metalman.DHCPAutoInterface {
-		args = append(args, "--dhcp-auto-interface")
-	}
-
-	replicas := int32(1)
-	if site.Spec.Components.Metalman.Replicas != nil {
-		replicas = *site.Spec.Components.Metalman.Replicas
-	}
+	args := []string{role, "--site=" + site.Name, "--cache-dir=/var/cache/metalman"}
 
 	env := []corev1.EnvVar{{
 		// Metalman resolves its leader-election lease namespace from
@@ -135,11 +174,14 @@ func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Co
 		env = append(env, corev1.EnvVar{Name: "METALMAN_APISERVER_URL", Value: cfg.APIServerEndpoint})
 	}
 
-	// metalman is hostNetwork and binds host ports (DHCP/TFTP/HTTP), so a surge
-	// pod cannot start while the old pod holds them on the same node. Terminate
-	// the old pod before creating the new one to avoid a rollout deadlock.
-	maxSurge := intstr.FromInt32(0)
-	maxUnavailable := intstr.FromInt32(1)
+	maxSurge := intstr.FromInt32(1)
+	maxUnavailable := intstr.FromInt32(0)
+	ports := []corev1.ContainerPort{{Name: "health", ContainerPort: 8081, Protocol: corev1.ProtocolTCP}}
+	serviceAccountName := "metalman-controller"
+	if role == metalmanServerRole {
+		serviceAccountName = "metalman-server"
+		ports = append(ports, corev1.ContainerPort{Name: "http", ContainerPort: 8880, Protocol: corev1.ProtocolTCP})
+	}
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -162,35 +204,87 @@ func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Co
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
-					HostNetwork:        true,
-					ServiceAccountName: "metalman-controller",
-					// Match either the canonical or deprecated site label during
-					// the node-label deprecation window. Storage scopes its
-					// DaemonSet the same way.
-					Affinity: component.SiteNodeAffinity(site.Name),
+					ServiceAccountName: serviceAccountName,
 					Containers: []corev1.Container{{
 						Name:            "metalman",
 						Image:           image,
 						ImagePullPolicy: corev1.PullAlways,
 						Args:            args,
 						Env:             env,
-						Ports: []corev1.ContainerPort{
-							{Name: "http", ContainerPort: 8880, Protocol: corev1.ProtocolTCP},
-							{Name: "health", ContainerPort: 8081, Protocol: corev1.ProtocolTCP},
-							{Name: "dhcp", ContainerPort: 67, Protocol: corev1.ProtocolUDP},
-							{Name: "tftp", ContainerPort: 69, Protocol: corev1.ProtocolUDP},
-						},
+						Ports:           ports,
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "tmp", MountPath: "/tmp"},
 							{Name: "cache", MountPath: "/var/cache/metalman"},
+							{Name: "capability-key", MountPath: "/var/run/secrets/metalman", ReadOnly: true},
 						},
 					}},
 					Volumes: []corev1.Volume{
 						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 						{Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: "capability-key", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+							SecretName: CapabilitySecretName(site.Name),
+						}}},
 					},
 				},
 			},
+		},
+	}
+}
+
+func ensureCapabilitySecret(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) error {
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{Namespace: env.Namespace, Name: CapabilitySecretName(site.Name)}
+	if err := env.Client.Get(ctx, key, secret); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get capability Secret: %w", err)
+	}
+
+	capabilityKey := make([]byte, 32)
+	if _, err := rand.Read(capabilityKey); err != nil {
+		return fmt.Errorf("generate capability key: %w", err)
+	}
+
+	secret = &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            key.Name,
+			Namespace:       key.Namespace,
+			OwnerReferences: []metav1.OwnerReference{component.SiteOwnerReference(site)},
+		},
+		Data: map[string][]byte{capabilitySecretKey: capabilityKey},
+	}
+	if err := env.Client.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create capability Secret: %w", err)
+	}
+
+	return nil
+}
+
+func serverService(site *unboundedv1alpha3.Site, namespace string) *corev1.Service {
+	labels := map[string]string{
+		"app":                                 "unbounded-metalman",
+		"app.kubernetes.io/name":              "metalman-server",
+		"app.kubernetes.io/component":         metalmanServerRole,
+		unboundedv1alpha3.MachineSiteLabelKey: site.Name,
+	}
+
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            ServerName(site.Name),
+			Namespace:       namespace,
+			Labels:          labels,
+			OwnerReferences: []metav1.OwnerReference{component.SiteOwnerReference(site)},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{{
+				Name:       "http",
+				Port:       8880,
+				TargetPort: intstr.FromInt32(8880),
+				Protocol:   corev1.ProtocolTCP,
+			}},
 		},
 	}
 }
