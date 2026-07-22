@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ExtractTar extracts a tar or gzip-compressed tar stream into destDir.
@@ -25,10 +26,16 @@ func ExtractTar(body io.Reader, destDir string) error {
 	}
 	defer closeArchive.Close() //nolint:errcheck // best effort close
 
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return fmt.Errorf("create archive destination %q: %w", destDir, err)
+	destRoot, err := filepath.Abs(destDir)
+	if err != nil {
+		return fmt.Errorf("resolve archive destination %q: %w", destDir, err)
 	}
 
+	if err := os.MkdirAll(destRoot, 0o755); err != nil {
+		return fmt.Errorf("create archive destination %q: %w", destRoot, err)
+	}
+
+	destPrefix := strings.TrimRight(destRoot, string(filepath.Separator)) + string(filepath.Separator)
 	seen := map[string]struct{}{}
 	tarReader := tar.NewReader(archiveReader)
 
@@ -52,7 +59,14 @@ func ExtractTar(body io.Reader, destDir string) error {
 			return fmt.Errorf("invalid tar entry %q: %w", header.Name, err)
 		}
 
-		path := filepath.Join(destDir, name)
+		if !filepath.IsLocal(name) {
+			return fmt.Errorf("invalid non-local tar entry %q", header.Name)
+		}
+
+		path := filepath.Join(destRoot, name)
+		if !strings.HasPrefix(path, destPrefix) {
+			return fmt.Errorf("tar entry %q resolves outside destination", header.Name)
+		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:

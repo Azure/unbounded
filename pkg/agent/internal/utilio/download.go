@@ -90,7 +90,7 @@ func downloadFromRemote(ctx context.Context, source string) (io.ReadCloser, erro
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to create HTTP request: %w", RedactHTTPError(err))
 	}
 
 	resp, err := remoteHTTPClient.Do(req)
@@ -137,7 +137,7 @@ func ProbeRemoteHTTPObject(ctx context.Context, source string) error {
 func probeRemoteHTTPObject(ctx context.Context, method, source string) error {
 	req, err := http.NewRequestWithContext(ctx, method, source, http.NoBody)
 	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
+		return fmt.Errorf("failed to create HTTP request: %w", RedactHTTPError(err))
 	}
 
 	if method == http.MethodGet {

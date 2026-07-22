@@ -47,6 +47,15 @@ func TestSourceOpenHTTPErrorRedactsQuery(t *testing.T) {
 	require.Contains(t, err.Error(), "REDACTED")
 }
 
+func TestSourceOpenHTTPRequestErrorRedactsQuery(t *testing.T) {
+	t.Parallel()
+
+	_, err := openHTTPWithClient(context.Background(), http.DefaultClient, "https://artifacts.example.test/%zz?sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
+	require.Contains(t, err.Error(), "redacted")
+}
+
 func TestSourceOpenFileURL(t *testing.T) {
 	t.Parallel()
 
