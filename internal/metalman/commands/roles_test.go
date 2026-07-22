@@ -134,9 +134,11 @@ func TestEdgeProxyPreservesSessionPathAndRange(t *testing.T) {
 		if r.URL.Path != "/v1/netboot/capability/artifact/disk.img.gz" {
 			t.Errorf("backend path = %q", r.URL.Path)
 		}
+
 		if got := r.Header.Get("Range"); got != "bytes=4096-8191" {
 			t.Errorf("backend Range = %q", got)
 		}
+
 		w.Header().Set("Content-Range", "bytes 4096-8191/16384")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("range"))
@@ -150,6 +152,7 @@ func TestEdgeProxyPreservesSessionPathAndRange(t *testing.T) {
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/netboot/capability/artifact/disk.img.gz", nil)
 	request.Header.Set("Range", "bytes=4096-8191")
+
 	response := httptest.NewRecorder()
 
 	newEdgeProxy(backendURL).ServeHTTP(response, request)
@@ -157,13 +160,16 @@ func TestEdgeProxyPreservesSessionPathAndRange(t *testing.T) {
 	if response.Code != http.StatusPartialContent {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusPartialContent)
 	}
+
 	if got := response.Header().Get("Content-Range"); got != "bytes 4096-8191/16384" {
 		t.Errorf("Content-Range = %q", got)
 	}
+
 	body, err := io.ReadAll(response.Result().Body)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := string(body); got != "range" {
 		t.Errorf("body = %q", got)
 	}
@@ -175,18 +181,21 @@ func TestEdgeProxyResumesTruncatedArtifactFromBackendRange(t *testing.T) {
 	const artifact = "immutable-artifact"
 
 	var requests atomic.Int32
+
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch requests.Add(1) {
 		case 1:
 			if got := r.Header.Get("Range"); got != "" {
 				t.Errorf("initial Range = %q, want empty", got)
 			}
+
 			w.Header().Set("Content-Length", "18")
 			_, _ = io.WriteString(w, artifact[:9])
 		case 2:
 			if got := r.Header.Get("Range"); got != "bytes=9-17" {
 				t.Errorf("resume Range = %q, want %q", got, "bytes=9-17")
 			}
+
 			w.Header().Set("Content-Length", "9")
 			w.Header().Set("Content-Range", "bytes 9-17/18")
 			w.WriteHeader(http.StatusPartialContent)
@@ -202,6 +211,7 @@ func TestEdgeProxyResumesTruncatedArtifactFromBackendRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	edge := httptest.NewServer(newEdgeProxy(backendURL))
 	defer edge.Close()
 
@@ -215,9 +225,11 @@ func TestEdgeProxyResumesTruncatedArtifactFromBackendRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := string(body); got != artifact {
 		t.Errorf("body = %q, want %q", got, artifact)
 	}
+
 	if got := requests.Load(); got != 2 {
 		t.Errorf("backend requests = %d, want 2", got)
 	}
@@ -229,6 +241,7 @@ func TestEdgeProxyRetriesFailedArtifactResumeRequest(t *testing.T) {
 	const artifact = "immutable-artifact"
 
 	var requests atomic.Int32
+
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch requests.Add(1) {
 		case 1:
@@ -240,11 +253,13 @@ func TestEdgeProxyRetriesFailedArtifactResumeRequest(t *testing.T) {
 				t.Errorf("hijacking failed resume request: %v", err)
 				return
 			}
+
 			_ = conn.Close()
 		case 3:
 			if got := r.Header.Get("Range"); got != "bytes=9-17" {
 				t.Errorf("resume Range = %q, want %q", got, "bytes=9-17")
 			}
+
 			w.Header().Set("Content-Length", "9")
 			w.Header().Set("Content-Range", "bytes 9-17/18")
 			w.WriteHeader(http.StatusPartialContent)
@@ -260,6 +275,7 @@ func TestEdgeProxyRetriesFailedArtifactResumeRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	edge := httptest.NewServer(newEdgeProxy(backendURL))
 	defer edge.Close()
 
@@ -273,9 +289,11 @@ func TestEdgeProxyRetriesFailedArtifactResumeRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := string(body); got != artifact {
 		t.Errorf("body = %q, want %q", got, artifact)
 	}
+
 	if got := requests.Load(); got != 3 {
 		t.Errorf("backend requests = %d, want 3", got)
 	}

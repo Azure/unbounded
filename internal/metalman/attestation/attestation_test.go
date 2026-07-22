@@ -351,10 +351,12 @@ func TestAttestMachineDoesNotUseRequestSourceIP(t *testing.T) {
 		t.Fatal("session attestation must not resolve a Machine by source IP")
 		return nil, nil
 	}
+
 	body, err := json.Marshal(AttestRequest{EKPub: ekPub, SRKPub: srkPub})
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	request := httptest.NewRequest(http.MethodPost, "/session/attest", bytes.NewReader(body))
 	request.RemoteAddr = "198.51.100.20:12345"
 	response := httptest.NewRecorder()

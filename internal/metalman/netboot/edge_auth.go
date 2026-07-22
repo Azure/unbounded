@@ -26,6 +26,7 @@ func (a *TokenReviewEdgeAuthenticator) Authenticate(ctx context.Context, request
 	if a == nil || a.Client == nil || strings.TrimSpace(a.ServiceAccountName) == "" {
 		return false
 	}
+
 	token, ok := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
 	if !ok || strings.TrimSpace(token) == "" {
 		return false
@@ -42,6 +43,7 @@ func (a *TokenReviewEdgeAuthenticator) Authenticate(ctx context.Context, request
 	if !strings.HasPrefix(review.Status.User.Username, prefix) {
 		return false
 	}
+
 	parts := strings.Split(strings.TrimPrefix(review.Status.User.Username, prefix), ":")
 
 	return len(parts) == 2 && parts[1] == a.ServiceAccountName

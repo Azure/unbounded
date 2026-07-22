@@ -421,6 +421,7 @@ func TestDHCPHandlerUsesBackendSessionDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	serverIP := net.ParseIP("10.0.1.254").To4()
 	provider := &fakeDecisionProvider{decision: &Decision{
 		Lease: v1alpha3.DHCPLease{
@@ -442,6 +443,7 @@ func TestDHCPHandlerUsesBackendSessionDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	discover.UpdateOption(dhcpv4.OptClassIdentifier("HTTPClient:Arch:00016:UNDI:003016"))
 
 	conn := &fakePacketConn{}
@@ -450,19 +452,24 @@ func TestDHCPHandlerUsesBackendSessionDecision(t *testing.T) {
 	if provider.mac != mac.String() {
 		t.Errorf("provider MAC = %q, want %q", provider.mac, mac.String())
 	}
+
 	if !provider.httpClient {
 		t.Error("provider did not receive HTTP client identity")
 	}
+
 	if conn.written == nil {
 		t.Fatal("expected DHCP response, got none")
 	}
+
 	response, err := dhcpv4.FromBytes(conn.written)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := response.BootFileNameOption(); got != provider.decision.BootFile {
 		t.Errorf("bootfile = %q, want %q", got, provider.decision.BootFile)
 	}
+
 	if got := response.YourIPAddr.String(); got != provider.decision.Lease.IPv4 {
 		t.Errorf("lease IP = %q, want %q", got, provider.decision.Lease.IPv4)
 	}

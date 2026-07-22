@@ -20,6 +20,7 @@ func TestTokenReviewEdgeAuthenticatorRequiresAudienceAndServiceAccount(t *testin
 	clientset := fake.NewClientset()
 	clientset.PrependReactor("create", "tokenreviews", func(action clienttesting.Action) (bool, runtime.Object, error) {
 		create := action.(clienttesting.CreateAction)
+
 		review := create.GetObject().(*authenticationv1.TokenReview)
 		if len(review.Spec.Audiences) != 1 || review.Spec.Audiences[0] != EdgeTokenAudience {
 			t.Errorf("audiences = %v", review.Spec.Audiences)

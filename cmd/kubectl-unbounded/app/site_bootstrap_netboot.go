@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -140,9 +141,11 @@ func (p *commandBootstrapEdgeProcess) Err() error {
 
 func (p *commandBootstrapEdgeProcess) Stop(ctx context.Context) error {
 	var signalErr error
+
 	p.stopOnce.Do(func() {
 		signalErr = p.cmd.Process.Signal(syscall.SIGTERM)
 	})
+
 	if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
 		return fmt.Errorf("stop Metalman edge: %w", signalErr)
 	}
@@ -159,6 +162,7 @@ func (p *commandBootstrapEdgeProcess) Stop(ctx context.Context) error {
 		if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			return fmt.Errorf("kill Metalman edge: %w", err)
 		}
+
 		<-p.done
 
 		return ctx.Err()
@@ -176,6 +180,7 @@ func (p *embeddedBootstrapGatewayProcess) Err() error {
 
 func (p *embeddedBootstrapGatewayProcess) Stop(ctx context.Context) error {
 	p.once.Do(p.cancel)
+
 	select {
 	case <-p.done:
 		return p.Err()
@@ -190,6 +195,7 @@ func (t *bootstrapEdgeToken) Path() string {
 
 func (t *bootstrapEdgeToken) Close() error {
 	var err error
+
 	t.once.Do(func() {
 		t.cancel()
 		<-t.done
@@ -238,9 +244,17 @@ func siteBootstrapNetbootCommand(handler *siteBootstrapNetbootHandler) *cobra.Co
 	cmd.Flags().DurationVar(&handler.timeout, "timeout", defaultBootstrapNetbootTimeout, "Maximum time to wait for the designated Node to become Ready")
 	cmd.Flags().StringSliceVar(&handler.routedCIDRs, "routed-cidr", nil, "CIDR routed through an ephemeral external gateway (repeatable)")
 
-	_ = cmd.MarkFlagRequired("machine")
-	_ = cmd.MarkFlagRequired("interface")
-	_ = cmd.MarkFlagRequired("address")
+	if err := cmd.MarkFlagRequired("machine"); err != nil {
+		panic(fmt.Sprintf("mark machine flag required: %v", err))
+	}
+
+	if err := cmd.MarkFlagRequired("interface"); err != nil {
+		panic(fmt.Sprintf("mark interface flag required: %v", err))
+	}
+
+	if err := cmd.MarkFlagRequired("address"); err != nil {
+		panic(fmt.Sprintf("mark address flag required: %v", err))
+	}
 
 	return cmd
 }
@@ -249,9 +263,11 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 	if h.timeout <= 0 {
 		h.timeout = defaultBootstrapNetbootTimeout
 	}
+
 	if h.endpointName == "" {
 		h.endpointName = "bootstrap-" + h.machine
 	}
+
 	if h.gatewayExternalAddress == "" {
 		h.gatewayExternalAddress = h.address
 	}
@@ -259,27 +275,35 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 	if err := h.initializeDependencies(); err != nil {
 		return err
 	}
+
 	binary, err := h.dependencies.resolveBinary()
 	if err != nil {
 		return err
 	}
+
 	if err := h.dependencies.preflightNetwork(); err != nil {
 		return err
 	}
+
 	var gatewayRuntimeDir string
+
 	if len(h.routedCIDRs) > 0 {
 		if err := h.dependencies.preflightGateway(); err != nil {
 			return err
 		}
+
 		gatewayRuntimeDir, err = h.dependencies.gatewayRuntimeDir()
 		if err != nil {
 			return fmt.Errorf("create external gateway runtime directory: %w", err)
 		}
+
 		defer func() { retErr = errors.Join(retErr, os.RemoveAll(gatewayRuntimeDir)) }()
 	}
+
 	if err := h.initializeClients(); err != nil {
 		return err
 	}
+
 	h.initializeRuntimeDependencies()
 
 	runCtx, cancel := context.WithTimeout(ctx, h.timeout)
@@ -289,7 +313,9 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 	if err != nil {
 		return err
 	}
+
 	resourcesPrepared := true
+
 	var (
 		forward         *bootstrapPortForward
 		token           *bootstrapEdgeToken
@@ -297,6 +323,7 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 		gatewayProcess  bootstrapEdgeProcess
 		gatewayPrepared bool
 	)
+
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cleanupCancel()
@@ -304,18 +331,23 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 		if resourcesPrepared {
 			retErr = errors.Join(retErr, h.restoreClusterResources(cleanupCtx, state))
 		}
+
 		if process != nil {
 			retErr = errors.Join(retErr, process.Stop(cleanupCtx))
 		}
+
 		if gatewayProcess != nil {
 			retErr = errors.Join(retErr, gatewayProcess.Stop(cleanupCtx))
 		}
+
 		if forward != nil {
 			retErr = errors.Join(retErr, forward.Close())
 		}
+
 		if token != nil {
 			retErr = errors.Join(retErr, token.Close())
 		}
+
 		if gatewayPrepared {
 			retErr = errors.Join(retErr, h.cleanupGatewayResources(cleanupCtx))
 		}
@@ -325,13 +357,16 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 		if err := h.prepareGatewayResources(runCtx); err != nil {
 			return err
 		}
+
 		gatewayPrepared = true
+
 		gatewayProcess, err = h.dependencies.startGateway(runCtx, nodeagent.ExternalGatewayOptions{
 			NodeName: h.endpointName, RuntimeDir: gatewayRuntimeDir, RESTConfig: h.restConfig,
 		})
 		if err != nil {
 			return fmt.Errorf("start external gateway dataplane: %w", err)
 		}
+
 		if err := h.waitForGatewayReady(runCtx, gatewayProcess); err != nil {
 			return err
 		}
@@ -340,25 +375,31 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 	if err := h.waitForMetalman(runCtx); err != nil {
 		return err
 	}
+
 	localPort, err := h.dependencies.localPort()
 	if err != nil {
 		return fmt.Errorf("select local port for Metalman server: %w", err)
 	}
+
 	forward, err = h.dependencies.portForward(runCtx, localPort)
 	if err != nil {
 		return err
 	}
+
 	token, err = h.dependencies.edgeToken(runCtx)
 	if err != nil {
 		return err
 	}
+
 	process, err = h.dependencies.startEdge(binary, h.edgeArguments(forward.URL(), token.Path()))
 	if err != nil {
 		return err
 	}
+
 	if err := h.waitForEdgeReady(runCtx, process, h.dependencies.dialEdge); err != nil {
 		return err
 	}
+
 	if err := h.claimEndpoint(runCtx, "kubectl-unbounded/"+h.endpointName); err != nil {
 		return err
 	}
@@ -377,28 +418,35 @@ func (h *siteBootstrapNetbootHandler) initializeDependencies() error {
 			return h.resolveMetalmanBinary(exec.LookPath)
 		}
 	}
+
 	if h.dependencies.preflightNetwork == nil {
 		h.dependencies.preflightNetwork = h.validateProvisioningInterface
 	}
+
 	if h.dependencies.localPort == nil {
 		h.dependencies.localPort = availableLoopbackPort
 	}
+
 	if h.dependencies.startEdge == nil {
 		h.dependencies.startEdge = func(binary string, args []string) (bootstrapEdgeProcess, error) {
 			return startBootstrapEdgeProcess(binary, args, os.Stdout, os.Stderr)
 		}
 	}
+
 	if h.dependencies.dialEdge == nil {
 		h.dependencies.dialEdge = dialBootstrapEdge
 	}
+
 	if h.dependencies.preflightGateway == nil {
 		h.dependencies.preflightGateway = h.validateExternalGateway
 	}
+
 	if h.dependencies.gatewayRuntimeDir == nil {
 		h.dependencies.gatewayRuntimeDir = func() (string, error) {
 			return os.MkdirTemp("/run", "unbounded-netboot-")
 		}
 	}
+
 	if h.dependencies.startGateway == nil {
 		h.dependencies.startGateway = startEmbeddedBootstrapGateway
 	}
@@ -415,10 +463,12 @@ func (h *siteBootstrapNetbootHandler) initializeClients() error {
 	if err != nil {
 		return fmt.Errorf("create Kubernetes client for netboot bootstrap: %w", err)
 	}
+
 	resources, err := client.New(config, client.Options{Scheme: buildScheme()})
 	if err != nil {
 		return fmt.Errorf("create resource client for netboot bootstrap: %w", err)
 	}
+
 	h.kubeClient = kubeClient
 	h.resources = resources
 	h.restConfig = config
@@ -442,6 +492,7 @@ func (h *siteBootstrapNetbootHandler) initializeRuntimeDependencies() {
 			)
 		}
 	}
+
 	if h.dependencies.edgeToken == nil {
 		h.dependencies.edgeToken = func(ctx context.Context) (*bootstrapEdgeToken, error) {
 			return newBootstrapEdgeToken(ctx, h.kubeClient, h.namespace, "", 0)
@@ -454,14 +505,17 @@ func (h *siteBootstrapNetbootHandler) validateProvisioningInterface() error {
 	if err != nil {
 		return fmt.Errorf("find provisioning interface %s: %w", h.interfaceName, err)
 	}
+
 	wanted := net.ParseIP(h.address)
 	if wanted == nil || wanted.To4() == nil {
 		return fmt.Errorf("provisioning address %q must be an IPv4 address", h.address)
 	}
+
 	addresses, err := interfaceInfo.Addrs()
 	if err != nil {
 		return fmt.Errorf("list addresses on provisioning interface %s: %w", h.interfaceName, err)
 	}
+
 	for _, address := range addresses {
 		ip, _, parseErr := net.ParseCIDR(address.String())
 		if parseErr == nil && ip.Equal(wanted) {
@@ -476,9 +530,11 @@ func (h *siteBootstrapNetbootHandler) validateExternalGateway() error {
 	if err := h.validateRoutedCIDRs(); err != nil {
 		return err
 	}
+
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("external gateway dataplane requires root privileges")
 	}
+
 	if ip := net.ParseIP(h.gatewayExternalAddress); ip == nil || ip.To4() == nil {
 		return fmt.Errorf("gateway external address %q must be an IPv4 address", h.gatewayExternalAddress)
 	}
@@ -501,13 +557,19 @@ func availableLoopbackPort() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer listener.Close()
+	defer listener.Close() //nolint:errcheck // Best-effort cleanup after reserving the port.
 
-	return listener.Addr().(*net.TCPAddr).Port, nil
+	tcpAddress, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("loopback listener returned address type %T", listener.Addr())
+	}
+
+	return tcpAddress.Port, nil
 }
 
 func dialBootstrapEdge(ctx context.Context, address string) error {
 	dialer := net.Dialer{}
+
 	connection, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return err
@@ -523,9 +585,11 @@ func (h *siteBootstrapNetbootHandler) prepareClusterResources(ctx context.Contex
 	}
 
 	enabled := true
+
 	if site.Spec.Components.Metalman == nil {
 		site.Spec.Components.Metalman = &v1alpha3.MetalmanComponentSpec{}
 	}
+
 	site.Spec.Components.Metalman.Enabled = &enabled
 
 	if err := h.resources.Update(ctx, &site); err != nil {
@@ -538,12 +602,12 @@ func (h *siteBootstrapNetbootHandler) prepareClusterResources(ctx context.Contex
 	}
 
 	if machine.Labels[v1alpha3.MachineSiteLabelKey] != h.site {
-		return bootstrapNetbootState{}, fmt.Errorf("Machine %s does not belong to Site %s", h.machine, h.site)
+		return bootstrapNetbootState{}, fmt.Errorf("machine %s does not belong to Site %s", h.machine, h.site)
 	}
 
 	netboot := machine.Spec.Netboot()
 	if netboot == nil {
-		return bootstrapNetbootState{}, fmt.Errorf("Machine %s has no netboot configuration", h.machine)
+		return bootstrapNetbootState{}, fmt.Errorf("machine %s has no netboot configuration", h.machine)
 	}
 
 	state := bootstrapNetbootState{originalEndpointRef: netboot.EndpointRef}
@@ -570,7 +634,12 @@ func (h *siteBootstrapNetbootHandler) prepareClusterResources(ctx context.Contex
 
 	netboot.EndpointRef = h.endpointName
 	if err := h.resources.Update(ctx, &machine); err != nil {
-		_ = h.resources.Delete(ctx, endpoint)
+		if deleteErr := h.resources.Delete(ctx, endpoint); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+			return bootstrapNetbootState{}, errors.Join(
+				fmt.Errorf("select bootstrap endpoint for Machine %s: %w", h.machine, err),
+				fmt.Errorf("delete NetbootEndpoint %s after Machine update failure: %w", h.endpointName, deleteErr),
+			)
+		}
 
 		return bootstrapNetbootState{}, fmt.Errorf("select bootstrap endpoint for Machine %s: %w", h.machine, err)
 	}
@@ -586,6 +655,7 @@ func (h *siteBootstrapNetbootHandler) restoreClusterResources(ctx context.Contex
 
 	if netboot := machine.Spec.Netboot(); netboot != nil && netboot.EndpointRef == h.endpointName {
 		netboot.EndpointRef = state.originalEndpointRef
+
 		if err := h.resources.Update(ctx, &machine); err != nil {
 			return fmt.Errorf("restore Machine %s endpoint: %w", h.machine, err)
 		}
@@ -607,6 +677,7 @@ func (h *siteBootstrapNetbootHandler) prepareGatewayResources(ctx context.Contex
 	protocol := netv1alpha1.TunnelProtocolWireGuard
 	enabled := true
 	selector := map[string]string{"net.unbounded-cloud.io/bootstrap-gateway": h.endpointName}
+
 	pool := &netv1alpha1.GatewayPool{
 		ObjectMeta: metav1.ObjectMeta{Name: h.endpointName},
 		Spec: netv1alpha1.GatewayPoolSpec{
@@ -619,6 +690,7 @@ func (h *siteBootstrapNetbootHandler) prepareGatewayResources(ctx context.Contex
 	if err := h.resources.Create(ctx, pool); err != nil {
 		return fmt.Errorf("create bootstrap GatewayPool %s: %w", h.endpointName, err)
 	}
+
 	defer func() {
 		if retErr != nil {
 			retErr = errors.Join(retErr, h.cleanupGatewayResources(context.WithoutCancel(ctx)))
@@ -653,10 +725,12 @@ func (h *siteBootstrapNetbootHandler) prepareGatewayResources(ctx context.Contex
 			}},
 		},
 	}
+
 	createdNode, err := h.kubeClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("create bootstrap gateway Node %s: %w", h.endpointName, err)
 	}
+
 	createdNode.Status.Addresses = []corev1.NodeAddress{
 		{Type: corev1.NodeInternalIP, Address: h.address},
 		{Type: corev1.NodeExternalIP, Address: h.gatewayExternalAddress},
@@ -670,10 +744,12 @@ func (h *siteBootstrapNetbootHandler) prepareGatewayResources(ctx context.Contex
 
 func (h *siteBootstrapNetbootHandler) cleanupGatewayResources(ctx context.Context) error {
 	assignment := &netv1alpha1.SiteGatewayPoolAssignment{ObjectMeta: metav1.ObjectMeta{Name: h.endpointName}}
+
 	assignmentErr := h.resources.Delete(ctx, assignment)
 	if apierrors.IsNotFound(assignmentErr) {
 		assignmentErr = nil
 	}
+
 	if assignmentErr != nil {
 		assignmentErr = fmt.Errorf("delete bootstrap SiteGatewayPoolAssignment %s: %w", h.endpointName, assignmentErr)
 	}
@@ -682,15 +758,18 @@ func (h *siteBootstrapNetbootHandler) cleanupGatewayResources(ctx context.Contex
 	if apierrors.IsNotFound(nodeErr) {
 		nodeErr = nil
 	}
+
 	if nodeErr != nil {
 		nodeErr = fmt.Errorf("delete bootstrap gateway Node %s: %w", h.endpointName, nodeErr)
 	}
 
 	pool := &netv1alpha1.GatewayPool{ObjectMeta: metav1.ObjectMeta{Name: h.endpointName}}
+
 	poolErr := h.resources.Delete(ctx, pool)
 	if apierrors.IsNotFound(poolErr) {
 		poolErr = nil
 	}
+
 	if poolErr != nil {
 		poolErr = fmt.Errorf("delete bootstrap GatewayPool %s: %w", h.endpointName, poolErr)
 	}
@@ -704,9 +783,11 @@ func (h *siteBootstrapNetbootHandler) metalmanDeploymentsReady(ctx context.Conte
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
+
 		if err != nil {
 			return false, fmt.Errorf("get Deployment %s/%s: %w", h.namespace, name, err)
 		}
+
 		if !deploymentRolloutComplete(deployment) {
 			return false, nil
 		}
@@ -729,6 +810,7 @@ func (h *siteBootstrapNetbootHandler) waitForMetalman(ctx context.Context) error
 		if err != nil {
 			return err
 		}
+
 		if ready {
 			return nil
 		}
@@ -761,10 +843,11 @@ func (h *siteBootstrapNetbootHandler) resolveMetalmanBinary(lookPath func(string
 	if h.metalmanBinary != "" {
 		info, err := os.Stat(h.metalmanBinary)
 		if err != nil {
-			return "", fmt.Errorf("Metalman binary %q is not accessible: %w", h.metalmanBinary, err)
+			return "", fmt.Errorf("metalman binary %q is not accessible: %w", h.metalmanBinary, err)
 		}
+
 		if info.IsDir() || info.Mode()&0o111 == 0 {
-			return "", fmt.Errorf("Metalman binary %q is not executable", h.metalmanBinary)
+			return "", fmt.Errorf("metalman binary %q is not executable", h.metalmanBinary)
 		}
 
 		return h.metalmanBinary, nil
@@ -787,7 +870,9 @@ func (h *siteBootstrapNetbootHandler) waitForEdgeReady(
 	if interval <= 0 {
 		interval = defaultBootstrapPollInterval
 	}
+
 	address := net.JoinHostPort(h.address, strconv.Itoa(h.httpPort))
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -799,10 +884,10 @@ func (h *siteBootstrapNetbootHandler) waitForEdgeReady(
 		select {
 		case <-process.Done():
 			if err := process.Err(); err != nil {
-				return fmt.Errorf("Metalman edge exited before becoming ready: %w", err)
+				return fmt.Errorf("metalman edge exited before becoming ready: %w", err)
 			}
 
-			return errors.New("Metalman edge exited before becoming ready")
+			return errors.New("metalman edge exited before becoming ready")
 		case <-ctx.Done():
 			return fmt.Errorf("wait for Metalman edge listener: %w", ctx.Err())
 		case <-ticker.C:
@@ -813,14 +898,17 @@ func (h *siteBootstrapNetbootHandler) waitForEdgeReady(
 func startBootstrapEdgeProcess(binary string, args []string, stdout, stderr io.Writer) (bootstrapEdgeProcess, error) {
 	cmd := exec.Command(binary, args...)
 	cmd.Stdout = stdout
+
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start Metalman edge: %w", err)
 	}
 
 	process := &commandBootstrapEdgeProcess{cmd: cmd, done: make(chan struct{})}
+
 	go func() {
 		err := cmd.Wait()
+
 		process.mu.Lock()
 		process.err = err
 		process.mu.Unlock()
@@ -836,8 +924,10 @@ func startEmbeddedBootstrapGateway(
 ) (bootstrapEdgeProcess, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	process := &embeddedBootstrapGatewayProcess{cancel: cancel, done: make(chan struct{})}
+
 	go func() {
 		err := nodeagent.RunExternalGateway(runCtx, options)
+
 		process.mu.Lock()
 		process.err = err
 		process.mu.Unlock()
@@ -852,7 +942,8 @@ func isSignalExit(err error) bool {
 	if !errors.As(err, &exitError) || exitError.ProcessState == nil {
 		return false
 	}
-	status, ok := exitError.ProcessState.Sys().(syscall.WaitStatus)
+
+	status, ok := exitError.Sys().(syscall.WaitStatus)
 
 	return ok && status.Signaled()
 }
@@ -899,6 +990,7 @@ func (h *siteBootstrapNetbootHandler) waitForNodeReady(ctx context.Context, node
 		if err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("get designated Node %s: %w", nodeName, err)
 		}
+
 		if err == nil && nodeReady(node) {
 			return nil
 		}
@@ -908,31 +1000,6 @@ func (h *siteBootstrapNetbootHandler) waitForNodeReady(ctx context.Context, node
 			return fmt.Errorf("wait for designated Node %s to become Ready: %w", nodeName, ctx.Err())
 		case <-ticker.C:
 		}
-	}
-}
-
-func (h *siteBootstrapNetbootHandler) waitForNodeReadyAndEdge(
-	ctx context.Context,
-	nodeName string,
-	process bootstrapEdgeProcess,
-) error {
-	waitCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	ready := make(chan error, 1)
-	go func() { ready <- h.waitForNodeReady(waitCtx, nodeName) }()
-
-	select {
-	case err := <-ready:
-		return err
-	case <-process.Done():
-		if err := process.Err(); err != nil {
-			return fmt.Errorf("Metalman edge exited before designated Node %s became Ready: %w", nodeName, err)
-		}
-
-		return fmt.Errorf("Metalman edge exited before designated Node %s became Ready", nodeName)
-	case <-ctx.Done():
-		return fmt.Errorf("wait for designated Node %s while Metalman edge is running: %w", nodeName, ctx.Err())
 	}
 }
 
@@ -946,17 +1013,19 @@ func (h *siteBootstrapNetbootHandler) waitForNodeReadyAndProcesses(
 	defer cancel()
 
 	ready := make(chan error, 1)
+
 	go func() { ready <- h.waitForNodeReady(waitCtx, nodeName) }()
 
 	var gatewayDone <-chan struct{}
 	if gateway != nil {
 		gatewayDone = gateway.Done()
 	}
+
 	select {
 	case err := <-ready:
 		return err
 	case <-edge.Done():
-		return processExitError("Metalman edge", nodeName, edge.Err())
+		return processExitError("metalman edge", nodeName, edge.Err())
 	case <-gatewayDone:
 		return processExitError("external gateway", nodeName, gateway.Err())
 	case <-ctx.Done():
@@ -977,6 +1046,7 @@ func (h *siteBootstrapNetbootHandler) waitForGatewayReady(ctx context.Context, p
 	if interval <= 0 {
 		interval = defaultBootstrapPollInterval
 	}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -985,9 +1055,11 @@ func (h *siteBootstrapNetbootHandler) waitForGatewayReady(ctx context.Context, p
 		if err != nil {
 			return err
 		}
+
 		if ready {
 			return nil
 		}
+
 		select {
 		case <-process.Done():
 			if err := process.Err(); err != nil {
@@ -1007,6 +1079,7 @@ func (h *siteBootstrapNetbootHandler) gatewayReady(ctx context.Context) (bool, e
 	if err != nil {
 		return false, fmt.Errorf("get bootstrap gateway Node %s: %w", h.endpointName, err)
 	}
+
 	if node.Annotations["net.unbounded-cloud.io/wg-pubkey"] == "" {
 		return false, nil
 	}
@@ -1015,16 +1088,20 @@ func (h *siteBootstrapNetbootHandler) gatewayReady(ctx context.Context) (bool, e
 	if err := h.resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool); err != nil {
 		return false, fmt.Errorf("get bootstrap GatewayPool %s: %w", h.endpointName, err)
 	}
+
 	if pool.Status.NodeCount != 1 || !containsString(pool.Status.ConnectedSites, h.site) {
 		return false, nil
 	}
+
 	matchedNode := false
+
 	for _, poolNode := range pool.Status.Nodes {
 		if poolNode.Name == h.endpointName && poolNode.WireGuardPublicKey != "" {
 			matchedNode = true
 			break
 		}
 	}
+
 	if !matchedNode {
 		return false, nil
 	}
@@ -1096,6 +1173,7 @@ func newBootstrapPortForward(
 	}
 
 	forwardCtx, cancel := context.WithCancel(ctx)
+
 	podName, err := readyDeploymentPod(forwardCtx, kubeClient, namespace, deploymentName, "")
 	if err != nil {
 		cancel()
@@ -1120,6 +1198,7 @@ func newBootstrapPortForward(
 		defer close(forward.done)
 
 		current := attempt
+
 		for {
 			select {
 			case <-forwardCtx.Done():
@@ -1168,6 +1247,7 @@ func readyDeploymentPod(
 	}
 
 	selector := metav1.FormatLabelSelector(deployment.Spec.Selector)
+
 	pods, err := kubeClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return "", fmt.Errorf("list Pods for Deployment %s/%s: %w", namespace, deploymentName, err)
@@ -1175,6 +1255,7 @@ func readyDeploymentPod(
 
 	ready := make([]string, 0, len(pods.Items))
 	excludedReady := false
+
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.DeletionTimestamp == nil && podReady(pod) {
@@ -1183,14 +1264,17 @@ func readyDeploymentPod(
 
 				continue
 			}
+
 			ready = append(ready, pod.Name)
 		}
 	}
+
 	if len(ready) == 0 && excludedReady {
 		ready = append(ready, excludedPod)
 	}
+
 	if len(ready) == 0 {
-		return "", fmt.Errorf("Deployment %s/%s has no Ready Pods", namespace, deploymentName)
+		return "", fmt.Errorf("deployment %s/%s has no Ready Pods", namespace, deploymentName)
 	}
 
 	sort.Strings(ready)
@@ -1239,6 +1323,7 @@ func newSPDYBootstrapPortForwardStarter(
 			Name(podName).
 			SubResource("portforward").
 			URL()
+
 		transport, upgrader, err := spdy.RoundTripperFor(config)
 		if err != nil {
 			return nil, fmt.Errorf("create SPDY transport: %w", err)
@@ -1247,6 +1332,7 @@ func newSPDYBootstrapPortForwardStarter(
 		stop := make(chan struct{})
 		ready := make(chan struct{})
 		dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, targetURL)
+
 		forwarder, err := portforward.NewOnAddresses(
 			dialer,
 			[]string{"127.0.0.1"},
@@ -1261,6 +1347,7 @@ func newSPDYBootstrapPortForwardStarter(
 		}
 
 		attempt := &spdyBootstrapPortForwardAttempt{stop: stop, done: make(chan error, 1)}
+
 		go func() { attempt.done <- forwarder.ForwardPorts() }()
 
 		select {
@@ -1296,7 +1383,9 @@ func newBootstrapEdgeToken(
 
 	path := filepath.Join(directory, "edge-token")
 	if err := refreshBootstrapEdgeToken(ctx, kubeClient, namespace, path); err != nil {
-		_ = os.RemoveAll(directory)
+		if removeErr := os.RemoveAll(directory); removeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("remove edge token directory: %w", removeErr))
+		}
 
 		return nil, err
 	}
@@ -1304,6 +1393,7 @@ func newBootstrapEdgeToken(
 	if refreshInterval <= 0 {
 		refreshInterval = 20 * time.Minute
 	}
+
 	tokenCtx, cancel := context.WithCancel(ctx)
 	credential := &bootstrapEdgeToken{
 		path:   path,
@@ -1322,7 +1412,9 @@ func newBootstrapEdgeToken(
 			case <-tokenCtx.Done():
 				return
 			case <-ticker.C:
-				_ = refreshBootstrapEdgeToken(tokenCtx, kubeClient, namespace, path)
+				if err := refreshBootstrapEdgeToken(tokenCtx, kubeClient, namespace, path); err != nil && tokenCtx.Err() == nil {
+					slog.WarnContext(tokenCtx, "refreshing Metalman edge token failed", "err", err)
+				}
 			}
 		}
 	}()
@@ -1337,6 +1429,7 @@ func refreshBootstrapEdgeToken(
 	path string,
 ) error {
 	expirationSeconds := int64(time.Hour / time.Second)
+
 	response, err := kubeClient.CoreV1().ServiceAccounts(namespace).CreateToken(
 		ctx,
 		"metalman-edge",
@@ -1349,6 +1442,7 @@ func refreshBootstrapEdgeToken(
 	if err != nil {
 		return fmt.Errorf("request metalman-edge token: %w", err)
 	}
+
 	if response.Status.Token == "" {
 		return fmt.Errorf("request metalman-edge token: API returned an empty token")
 	}
@@ -1357,8 +1451,14 @@ func refreshBootstrapEdgeToken(
 	if err := os.WriteFile(temporaryPath, []byte(response.Status.Token), 0o600); err != nil {
 		return fmt.Errorf("write metalman-edge token: %w", err)
 	}
+
 	if err := os.Rename(temporaryPath, path); err != nil {
-		_ = os.Remove(temporaryPath)
+		if removeErr := os.Remove(temporaryPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return errors.Join(
+				fmt.Errorf("replace metalman-edge token: %w", err),
+				fmt.Errorf("remove temporary metalman-edge token: %w", removeErr),
+			)
+		}
 
 		return fmt.Errorf("replace metalman-edge token: %w", err)
 	}

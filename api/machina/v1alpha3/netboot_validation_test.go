@@ -25,6 +25,7 @@ func TestNetbootEndpointSchema(t *testing.T) {
 			t.Errorf("endpoint spec is missing %q", field)
 		}
 	}
+
 	assertSchemaValidations(t, spec, map[string]string{
 		"self.tls.trust != 'Public' || (self.externalURL.startsWith('https://') && self.tls.mode != 'Disabled')": "public endpoints require HTTPS",
 		"self.type == 'ManagedL2' ? has(self.managedL2) : !has(self.managedL2)":                                  "managedL2 configuration must be set only for ManagedL2 endpoints",
@@ -56,23 +57,28 @@ func TestNetbootSessionSchema(t *testing.T) {
 			t.Errorf("session spec is missing %q", field)
 		}
 	}
+
 	assertSchemaValidations(t, spec, map[string]string{
 		"self == oldSelf": "netboot session spec is immutable",
 	})
 	boot := spec.Properties["boot"]
+
 	firmware, ok := boot.Properties["firmwareArtifact"]
 	if !ok {
 		t.Fatal("session boot snapshot is missing firmwareArtifact")
 	}
+
 	if firmware.MinLength == nil || *firmware.MinLength != 1 {
 		t.Error("session boot firmwareArtifact must be non-empty")
 	}
+
 	provisioning := spec.Properties["provisioning"]
 	for _, field := range []string{"cluster", "kubernetes", "agent", "providerLabels", "userData"} {
 		if _, ok := provisioning.Properties[field]; !ok {
 			t.Errorf("session provisioning snapshot is missing %q", field)
 		}
 	}
+
 	artifactSource := spec.Properties["artifacts"].Properties["files"].Items.Schema.Properties["source"]
 	requireEnumValue(t, artifactSource.Enum, "Session")
 
@@ -101,6 +107,7 @@ func TestMachineOperationTargetInputHasNetbootSessionRef(t *testing.T) {
 	t.Parallel()
 
 	crd := readCRD(t, "../../../deploy/machina/crd/unbounded-cloud.io_machineoperations.yaml")
+
 	input := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"].
 		Properties["targets"].Items.Schema.Properties["input"]
 	if _, ok := input.Properties["netbootSessionRef"]; !ok {

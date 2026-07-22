@@ -454,12 +454,15 @@ func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
 	if data.ArtifactBaseURL == "" {
 		data.ArtifactBaseURL = serveURL
 	}
+
 	if data.BootImageWrittenURL == "" {
 		data.BootImageWrittenURL = serveURL + "/pxe/disable"
 	}
+
 	if data.CloudInitURL == "" {
 		data.CloudInitURL = serveURL + "/cloudinit/log"
 	}
+
 	if data.InstallLogURL == "" {
 		data.InstallLogURL = serveURL + "/unbounded-agent/install-log"
 	}

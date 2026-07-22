@@ -83,6 +83,7 @@ func TestRBACSeparatesControllerAndServerIdentities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read Metalman RBAC template: %v", err)
 	}
+
 	manifest := string(data)
 
 	for _, required := range []string{
@@ -98,24 +99,28 @@ func TestRBACSeparatesControllerAndServerIdentities(t *testing.T) {
 	}
 
 	serverNamespaceRole := manifest[strings.Index(manifest, "kind: Role\nmetadata:\n  name: metalman-server"):]
+
 	serverNamespaceRole = serverNamespaceRole[:strings.Index(serverNamespaceRole, "\n---")]
 	if !strings.Contains(serverNamespaceRole, "resources: [\"serviceaccounts/token\"]") {
 		t.Fatalf("metalman-server Role lacks bootstrap-token issuance:\n%s", serverNamespaceRole)
 	}
 
 	serverClusterRole := manifest[strings.Index(manifest, "kind: ClusterRole\nmetadata:\n  name: metalman-server"):]
+
 	serverClusterRole = serverClusterRole[:strings.Index(serverClusterRole, "\n---")]
 	if !strings.Contains(serverClusterRole, "resources: [\"tokenreviews\"]") {
 		t.Fatalf("metalman-server ClusterRole lacks TokenReview permission:\n%s", serverClusterRole)
 	}
 
 	controllerRole := manifest[strings.Index(manifest, "kind: ClusterRole\nmetadata:\n  name: metalman-controller\nrules:"):]
+
 	controllerRole = controllerRole[:strings.Index(controllerRole, "\n---")]
 	if strings.Contains(controllerRole, "resources: [\"tokenreviews\"]") {
 		t.Fatalf("metalman-controller retains server TokenReview permission:\n%s", controllerRole)
 	}
 
 	kubeSystemBinding := manifest[strings.Index(manifest, "kind: RoleBinding\nmetadata:\n  name: metalman-controller\n  namespace: kube-system"):]
+
 	kubeSystemBinding = kubeSystemBinding[:strings.Index(kubeSystemBinding, "\n---")]
 	if !strings.Contains(kubeSystemBinding, "name: metalman-server") {
 		t.Fatalf("kube-system metadata binding excludes metalman-server:\n%s", kubeSystemBinding)
@@ -127,6 +132,7 @@ func TestOperatorRBACCanReconcileNetbootEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read operator RBAC template: %v", err)
 	}
+
 	manifest := string(data)
 	for _, required := range []string{
 		"resources: [\"netbootendpoints\"]",
@@ -162,18 +168,22 @@ func TestReconcileManagedEndpointStatusFromDeploymentAvailability(t *testing.T) 
 	if err := reconcileManagedEndpointStatus(t.Context(), kubeClient, endpoint, deployment); err != nil {
 		t.Fatalf("reconcileManagedEndpointStatus: %v", err)
 	}
+
 	updated := &unboundedv1alpha3.NetbootEndpoint{}
 	if err := kubeClient.Get(t.Context(), client.ObjectKey{Name: endpoint.Name}, updated); err != nil {
 		t.Fatalf("get endpoint: %v", err)
 	}
+
 	if updated.Status.ObservedGeneration != endpoint.Generation {
 		t.Fatalf("observed generation = %d, want %d", updated.Status.ObservedGeneration, endpoint.Generation)
 	}
+
 	ready := findCondition(updated.Status.Conditions, "Ready")
 	if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != "EdgeAvailable" {
 		t.Fatalf("Ready condition = %#v", ready)
 	}
-	if updated.Status.Claim == nil || updated.Status.Claim.HolderIdentity != "edge-pod-1" || updated.Status.Claim.RenewedAt.Time.Unix() != now.Time.Unix() {
+
+	if updated.Status.Claim == nil || updated.Status.Claim.HolderIdentity != "edge-pod-1" || updated.Status.Claim.RenewedAt.Unix() != now.Unix() {
 		t.Fatalf("claim was not preserved: %#v", updated.Status.Claim)
 	}
 
@@ -181,12 +191,15 @@ func TestReconcileManagedEndpointStatusFromDeploymentAvailability(t *testing.T) 
 	if err := kubeClient.Status().Update(t.Context(), deployment); err != nil {
 		t.Fatalf("update Deployment status: %v", err)
 	}
+
 	if err := reconcileManagedEndpointStatus(t.Context(), kubeClient, updated, deployment); err != nil {
 		t.Fatalf("reconcile unavailable endpoint: %v", err)
 	}
+
 	if err := kubeClient.Get(t.Context(), client.ObjectKey{Name: endpoint.Name}, updated); err != nil {
 		t.Fatalf("get unavailable endpoint: %v", err)
 	}
+
 	ready = findCondition(updated.Status.Conditions, "Ready")
 	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "EdgeUnavailable" {
 		t.Fatalf("unavailable Ready condition = %#v", ready)
@@ -208,10 +221,12 @@ func TestReconcileManagedEndpointStatusLeavesExternalClaimUntouched(t *testing.T
 	if err := reconcileManagedEndpointStatus(t.Context(), kubeClient, endpoint, nil); err != nil {
 		t.Fatalf("reconcileManagedEndpointStatus: %v", err)
 	}
+
 	updated := &unboundedv1alpha3.NetbootEndpoint{}
 	if err := kubeClient.Get(t.Context(), client.ObjectKey{Name: endpoint.Name}, updated); err != nil {
 		t.Fatal(err)
 	}
+
 	if updated.Status.ObservedGeneration != 1 || updated.Status.Conditions[0].Reason != "ExternalEdgeReady" {
 		t.Fatalf("external endpoint status changed: %#v", updated.Status)
 	}
@@ -316,16 +331,20 @@ func TestControllerAndServerWorkloadsAreSeparated(t *testing.T) {
 	if controller.Spec.Replicas == nil || *controller.Spec.Replicas != 1 {
 		t.Fatalf("controller replicas = %v, want 1", controller.Spec.Replicas)
 	}
+
 	assertOrdinaryPodNetworking(t, &controller.Spec.Template.Spec)
 
 	controllerContainer := controller.Spec.Template.Spec.Containers[0]
 	if got := controllerContainer.Args; len(got) < 2 || got[0] != "controller" || got[1] != "--site=rack-a" {
 		t.Fatalf("controller args = %#v", got)
 	}
+
 	if controller.Spec.Template.Spec.ServiceAccountName != "metalman-controller" {
 		t.Fatalf("controller service account = %q", controller.Spec.Template.Spec.ServiceAccountName)
 	}
+
 	assertCapabilityKeyMount(t, &controller.Spec.Template.Spec, &controllerContainer, "rack-a")
+
 	for _, port := range controllerContainer.Ports {
 		if port.Name == "http" || port.Name == "dhcp" || port.Name == "tftp" {
 			t.Fatalf("controller exposes data-plane port %#v", port)
@@ -336,27 +355,35 @@ func TestControllerAndServerWorkloadsAreSeparated(t *testing.T) {
 	if server.Spec.Replicas == nil || *server.Spec.Replicas != 2 {
 		t.Fatalf("server replicas = %v, want 2", server.Spec.Replicas)
 	}
+
 	assertOrdinaryPodNetworking(t, &server.Spec.Template.Spec)
 
 	serverContainer := server.Spec.Template.Spec.Containers[0]
 	if got := serverContainer.Args; len(got) < 3 || got[0] != "server" || got[1] != "--site=rack-a" || got[2] != "--cache-dir=/var/cache/metalman" {
 		t.Fatalf("server args = %#v", got)
 	}
+
 	if server.Spec.Template.Spec.ServiceAccountName != "metalman-server" {
 		t.Fatalf("server service account = %q", server.Spec.Template.Spec.ServiceAccountName)
 	}
+
 	assertCapabilityKeyMount(t, &server.Spec.Template.Spec, &serverContainer, "rack-a")
+
 	if !hasContainerPort(serverContainer.Ports, "http", 8880) {
 		t.Fatalf("server ports = %#v, want HTTP 8880", serverContainer.Ports)
 	}
+
 	assertWorkloadHealthAndResources(t, &serverContainer)
+
 	if len(server.Spec.Template.Spec.TopologySpreadConstraints) != 1 {
 		t.Fatalf("server topology spread constraints = %#v", server.Spec.Template.Spec.TopologySpreadConstraints)
 	}
+
 	spread := server.Spec.Template.Spec.TopologySpreadConstraints[0]
 	if spread.TopologyKey != corev1.LabelHostname || spread.MaxSkew != 1 || spread.WhenUnsatisfiable != corev1.ScheduleAnyway {
 		t.Fatalf("server topology spread = %#v", spread)
 	}
+
 	if got := server.Spec.Strategy.RollingUpdate; got == nil || got.MaxUnavailable == nil || got.MaxUnavailable.IntValue() != 0 {
 		t.Fatalf("server maxUnavailable = %#v, want 0", got)
 	}
@@ -365,9 +392,11 @@ func TestControllerAndServerWorkloadsAreSeparated(t *testing.T) {
 	if service.Name != ServerName("rack-a") {
 		t.Fatalf("service name = %q, want %q", service.Name, ServerName("rack-a"))
 	}
+
 	if service.Spec.Selector["app.kubernetes.io/name"] != "metalman-server" || service.Spec.Selector[unboundedv1alpha3.MachineSiteLabelKey] != "rack-a" {
 		t.Fatalf("service selector = %#v", service.Spec.Selector)
 	}
+
 	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 8880 || service.Spec.Ports[0].TargetPort.IntValue() != 8880 {
 		t.Fatalf("service ports = %#v", service.Spec.Ports)
 	}
@@ -376,6 +405,7 @@ func TestControllerAndServerWorkloadsAreSeparated(t *testing.T) {
 	if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntValue() != 1 {
 		t.Fatalf("PDB minAvailable = %#v, want 1", pdb.Spec.MinAvailable)
 	}
+
 	if pdb.Spec.Selector == nil || pdb.Spec.Selector.MatchLabels["app.kubernetes.io/name"] != "metalman-server" {
 		t.Fatalf("PDB selector = %#v", pdb.Spec.Selector)
 	}
@@ -404,20 +434,25 @@ func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("endpointEdgeObjects: %v", err)
 		}
+
 		if deployment == nil || service != nil {
 			t.Fatalf("managed L2 objects = deployment %v, service %v", deployment, service)
 		}
+
 		if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 1 {
 			t.Fatalf("managed L2 replicas = %v, want 1", deployment.Spec.Replicas)
 		}
+
 		pod := &deployment.Spec.Template.Spec
 		if !pod.HostNetwork || pod.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
 			t.Fatalf("managed L2 networking = hostNetwork %v, dnsPolicy %q", pod.HostNetwork, pod.DNSPolicy)
 		}
+
 		if pod.Affinity == nil || pod.Affinity.NodeAffinity == nil ||
 			pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
 			t.Fatalf("managed L2 edge lacks required placement: %#v", pod.Affinity)
 		}
+
 		container := &pod.Containers[0]
 		for _, arg := range []string{
 			"edge",
@@ -432,10 +467,13 @@ func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
 				t.Fatalf("managed L2 args %#v lack %q", container.Args, arg)
 			}
 		}
+
 		if pod.ServiceAccountName != "metalman-edge" {
 			t.Fatalf("managed L2 service account = %q", pod.ServiceAccountName)
 		}
+
 		assertProjectedEdgeToken(t, pod, container)
+
 		if !hasContainerPort(container.Ports, "http", 8880) ||
 			!hasContainerPort(container.Ports, "dhcp", 67) ||
 			!hasContainerPort(container.Ports, "tftp", 69) {
@@ -462,17 +500,22 @@ func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("endpointEdgeObjects: %v", err)
 		}
+
 		if deployment == nil || service == nil {
 			t.Fatalf("HTTP objects = deployment %v, service %v", deployment, service)
 		}
+
 		if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 2 {
 			t.Fatalf("HTTP replicas = %v, want 2", deployment.Spec.Replicas)
 		}
+
 		assertOrdinaryPodNetworking(t, &deployment.Spec.Template.Spec)
+
 		args := deployment.Spec.Template.Spec.Containers[0].Args
 		if containsString(args, "--dhcp-enabled") || containsString(args, "--tftp-enabled") {
 			t.Fatalf("HTTP edge enables L2 protocols: %#v", args)
 		}
+
 		if service.Spec.Type != corev1.ServiceTypeNodePort || service.Spec.Selector[netbootEndpointLabel] != endpoint.Name {
 			t.Fatalf("HTTP edge Service = %#v", service.Spec)
 		}
@@ -501,6 +544,7 @@ func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("endpointEdgeObjects: %v", err)
 		}
+
 		container := &deployment.Spec.Template.Spec.Containers[0]
 		for _, arg := range []string{
 			"--tls-cert-file=/var/run/secrets/metalman-tls/tls.crt",
@@ -510,14 +554,17 @@ func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
 				t.Fatalf("Secret TLS args %#v lack %q", container.Args, arg)
 			}
 		}
+
 		if len(deployment.Spec.Template.Spec.Volumes) != 1 ||
 			deployment.Spec.Template.Spec.Volumes[0].Secret == nil ||
 			deployment.Spec.Template.Spec.Volumes[0].Secret.SecretName != EdgeTLSSecretName(endpoint.Name) {
 			t.Fatalf("Secret TLS volumes = %#v", deployment.Spec.Template.Spec.Volumes)
 		}
+
 		if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].MountPath != "/var/run/secrets/metalman-tls" || !container.VolumeMounts[0].ReadOnly {
 			t.Fatalf("Secret TLS mounts = %#v", container.VolumeMounts)
 		}
+
 		if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Name != "https" || service.Spec.Ports[0].Port != 443 {
 			t.Fatalf("Secret TLS Service ports = %#v", service.Spec.Ports)
 		}
@@ -536,6 +583,7 @@ func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("endpointEdgeObjects: %v", err)
 		}
+
 		if deployment != nil || service != nil {
 			t.Fatalf("external L2 objects = deployment %v, service %v", deployment, service)
 		}
@@ -576,21 +624,27 @@ func TestReconcileEndpointEdgesMirrorsRotatesAndRemovesTLSSecret(t *testing.T) {
 		if err := reconcileEndpointEdges(t.Context(), env, site); err != nil {
 			t.Fatalf("reconcileEndpointEdges: %v", err)
 		}
+
 		mirror := &corev1.Secret{}
+
 		key := client.ObjectKey{Namespace: component.DefaultNamespace, Name: EdgeTLSSecretName(endpoint.Name)}
 		if err := env.Client.Get(t.Context(), key, mirror); err != nil {
 			t.Fatalf("get mirrored TLS Secret: %v", err)
 		}
+
 		if got := string(mirror.Data[corev1.TLSCertKey]); got != wantCert {
 			t.Fatalf("mirrored certificate = %q, want %q", got, wantCert)
 		}
+
 		if got := string(mirror.Data[corev1.TLSPrivateKeyKey]); got != "private-key-v1" {
 			t.Fatalf("mirrored private key = %q", got)
 		}
+
 		deployment := &appsv1.Deployment{}
 		if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: EdgeName(endpoint.Name)}, deployment); err != nil {
 			t.Fatalf("get TLS edge Deployment: %v", err)
 		}
+
 		checksum := deployment.Spec.Template.Annotations[edgeTLSChecksumAnnotation]
 		if checksum == "" {
 			t.Fatal("TLS edge pod template lacks certificate checksum")
@@ -600,10 +654,12 @@ func TestReconcileEndpointEdgesMirrorsRotatesAndRemovesTLSSecret(t *testing.T) {
 	}
 
 	firstChecksum := assertMirror("certificate-v1")
+
 	source.Data[corev1.TLSCertKey] = []byte("certificate-v2")
 	if err := env.Client.Update(t.Context(), source); err != nil {
 		t.Fatalf("update source TLS Secret: %v", err)
 	}
+
 	if secondChecksum := assertMirror("certificate-v2"); secondChecksum == firstChecksum {
 		t.Fatalf("TLS edge checksum did not change after certificate rotation: %q", secondChecksum)
 	}
@@ -611,6 +667,7 @@ func TestReconcileEndpointEdgesMirrorsRotatesAndRemovesTLSSecret(t *testing.T) {
 	if err := env.Client.Get(t.Context(), client.ObjectKey{Name: endpoint.Name}, endpoint); err != nil {
 		t.Fatalf("refresh endpoint: %v", err)
 	}
+
 	endpoint.Spec.TLS = unboundedv1alpha3.NetbootEndpointTLS{
 		Trust: unboundedv1alpha3.NetbootEndpointTrustPublic,
 		Mode:  unboundedv1alpha3.NetbootEndpointTLSExternal,
@@ -618,9 +675,11 @@ func TestReconcileEndpointEdgesMirrorsRotatesAndRemovesTLSSecret(t *testing.T) {
 	if err := env.Client.Update(t.Context(), endpoint); err != nil {
 		t.Fatalf("update endpoint TLS mode: %v", err)
 	}
+
 	if err := reconcileEndpointEdges(t.Context(), env, site); err != nil {
 		t.Fatalf("reconcile external TLS endpoint: %v", err)
 	}
+
 	err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: EdgeTLSSecretName(endpoint.Name)}, &corev1.Secret{})
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("mirrored TLS Secret still exists: %v", err)
@@ -684,6 +743,7 @@ func TestReconcileEndpointEdgesDeletesStaleManagedWorkloads(t *testing.T) {
 	if err := reconcileEndpointEdges(t.Context(), env, site); err != nil {
 		t.Fatalf("reconcileEndpointEdges: %v", err)
 	}
+
 	for _, object := range []client.Object{staleDeployment, staleService} {
 		err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(object), object)
 		if !apierrors.IsNotFound(err) {
@@ -706,10 +766,12 @@ func TestEnsureCapabilitySecretPreservesExistingKey(t *testing.T) {
 	}
 
 	key := client.ObjectKey{Namespace: component.DefaultNamespace, Name: CapabilitySecretName("rack-a")}
+
 	first := &corev1.Secret{}
 	if err := env.Client.Get(t.Context(), key, first); err != nil {
 		t.Fatalf("get first capability Secret: %v", err)
 	}
+
 	if len(first.Data[capabilitySecretKey]) != 32 {
 		t.Fatalf("capability key length = %d, want 32", len(first.Data[capabilitySecretKey]))
 	}
@@ -722,6 +784,7 @@ func TestEnsureCapabilitySecretPreservesExistingKey(t *testing.T) {
 	if err := env.Client.Get(t.Context(), key, second); err != nil {
 		t.Fatalf("get second capability Secret: %v", err)
 	}
+
 	if string(second.Data[capabilitySecretKey]) != string(first.Data[capabilitySecretKey]) {
 		t.Fatal("capability key changed across reconciliation")
 	}
@@ -754,6 +817,7 @@ func TestDeploymentAllowsZeroReplicas(t *testing.T) {
 	// The split roles have fixed availability semantics; the former Site-level
 	// replica knob no longer scales the controller and data plane together.
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+
 	d := serverDeployment(site, component.DefaultNamespace, component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"})
 	if d.Spec.Replicas == nil || *d.Spec.Replicas != 2 {
 		t.Fatalf("server replicas = %v, want 2", d.Spec.Replicas)
@@ -792,6 +856,7 @@ func assertOrdinaryPodNetworking(t *testing.T, podSpec *corev1.PodSpec) {
 	if podSpec.HostNetwork {
 		t.Fatal("pod unexpectedly uses host networking")
 	}
+
 	if podSpec.Affinity != nil && podSpec.Affinity.NodeAffinity != nil &&
 		podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
 		t.Fatalf("pod unexpectedly has required node affinity: %#v", podSpec.Affinity)
@@ -832,9 +897,11 @@ func assertWorkloadHealthAndResources(t *testing.T, container *corev1.Container)
 			t.Fatalf("%s probe = %#v, want HTTP probe on 8081", name, probe)
 		}
 	}
+
 	if container.LivenessProbe.HTTPGet.Path != "/healthz" || container.ReadinessProbe.HTTPGet.Path != "/readyz" {
 		t.Fatalf("probe paths = %q, %q", container.LivenessProbe.HTTPGet.Path, container.ReadinessProbe.HTTPGet.Path)
 	}
+
 	if container.Resources.Requests.Cpu().IsZero() || container.Resources.Requests.Memory().IsZero() ||
 		container.Resources.Limits.Cpu().IsZero() || container.Resources.Limits.Memory().IsZero() {
 		t.Fatalf("resources are incomplete: %#v", container.Resources)
@@ -881,10 +948,12 @@ func assertProjectedEdgeToken(t *testing.T, pod *corev1.PodSpec, container *core
 		if mount.Name != "edge-token" || mount.MountPath != "/var/run/secrets/metalman" || !mount.ReadOnly {
 			continue
 		}
+
 		for _, volume := range pod.Volumes {
 			if volume.Name != mount.Name || volume.Projected == nil || len(volume.Projected.Sources) != 1 {
 				continue
 			}
+
 			token := volume.Projected.Sources[0].ServiceAccountToken
 			if token != nil && token.Audience == "metalman-edge" && token.Path == "token" {
 				return
@@ -893,42 +962,4 @@ func assertProjectedEdgeToken(t *testing.T, pod *corev1.PodSpec, container *core
 	}
 
 	t.Fatalf("missing audience-bound projected edge token: mounts=%#v volumes=%#v", container.VolumeMounts, pod.Volumes)
-}
-
-func assertSiteAffinity(t *testing.T, affinity *corev1.Affinity, siteName string) {
-	t.Helper()
-
-	if affinity == nil || affinity.NodeAffinity == nil || affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
-		t.Fatalf("missing node affinity: %#v", affinity)
-	}
-
-	terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
-	if len(terms) != 2 {
-		t.Fatalf("node selector terms len = %d, want 2: %#v", len(terms), terms)
-	}
-
-	want := map[string]bool{component.SiteLabelKey: false, component.DeprecatedSiteLabelKey: false}
-
-	for _, term := range terms {
-		if len(term.MatchExpressions) != 1 {
-			t.Fatalf("term must have one expression: %#v", term)
-		}
-
-		expr := term.MatchExpressions[0]
-		if expr.Operator != corev1.NodeSelectorOpIn || len(expr.Values) != 1 || expr.Values[0] != siteName {
-			t.Fatalf("unexpected site affinity expression: %#v", expr)
-		}
-
-		if _, ok := want[expr.Key]; !ok {
-			t.Fatalf("unexpected site affinity key %q", expr.Key)
-		}
-
-		want[expr.Key] = true
-	}
-
-	for key, seen := range want {
-		if !seen {
-			t.Fatalf("site affinity missing key %q", key)
-		}
-	}
 }

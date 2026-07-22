@@ -177,12 +177,14 @@ func TestBootstrapNetbootWaitsUntilMetalmanRolloutCompletes(t *testing.T) {
 
 	go func() {
 		time.Sleep(5 * time.Millisecond)
+
 		server.Status.AvailableReplicas = 2
 		_, _ = kubeClient.AppsV1().Deployments(h.namespace).UpdateStatus(context.Background(), server, metav1.UpdateOptions{})
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+
 	require.NoError(t, h.waitForMetalman(ctx))
 }
 
@@ -252,6 +254,7 @@ func TestBootstrapNetbootClaimsEndpointAndWaitsForDesignatedNode(t *testing.T) {
 	}
 
 	require.NoError(t, h.claimEndpoint(ctx, "bootstrap/123"))
+
 	var claimed v1alpha3.NetbootEndpoint
 	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: endpoint.Name}, &claimed))
 	require.Equal(t, endpoint.Generation, claimed.Status.ObservedGeneration)
@@ -260,10 +263,13 @@ func TestBootstrapNetbootClaimsEndpointAndWaitsForDesignatedNode(t *testing.T) {
 
 	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
+
 	ready := make(chan error, 1)
+
 	go func() { ready <- h.waitForNodeReady(waitCtx, node.Name) }()
 
 	time.Sleep(5 * time.Millisecond)
+
 	other := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "other", Labels: map[string]string{v1alpha3.MachineSiteLabelKey: "rack-a"}},
 		Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
@@ -331,6 +337,7 @@ func TestBootstrapPortForwardReconnectsToReadyServerPod(t *testing.T) {
 	require.Equal(t, "server-b", <-starter.started)
 
 	starter.fail("server-b", errors.New("connection lost"))
+
 	select {
 	case podName := <-starter.started:
 		require.Equal(t, "server-c", podName)
@@ -368,7 +375,9 @@ func TestBootstrapPortForwardClosesWhileWaitingToReconnect(t *testing.T) {
 	time.Sleep(time.Millisecond)
 
 	closed := make(chan error, 1)
+
 	go func() { closed <- forward.Close() }()
+
 	select {
 	case err := <-closed:
 		require.NoError(t, err)
@@ -380,8 +389,11 @@ func TestBootstrapPortForwardClosesWhileWaitingToReconnect(t *testing.T) {
 func TestBootstrapEdgeTokenUsesAudienceAndRotatesSecureFile(t *testing.T) {
 	ctx := context.Background()
 	kubeClient := fake.NewSimpleClientset()
+
 	var mu sync.Mutex
+
 	requests := 0
+
 	kubeClient.PrependReactor("create", "serviceaccounts", func(action clienttesting.Action) (bool, runtime.Object, error) {
 		create := action.(clienttesting.CreateAction)
 		request := create.GetObject().(*authenticationv1.TokenRequest)
@@ -400,6 +412,7 @@ func TestBootstrapEdgeTokenUsesAudienceAndRotatesSecureFile(t *testing.T) {
 
 	credential, err := newBootstrapEdgeToken(ctx, kubeClient, "unbounded-system", t.TempDir(), time.Millisecond)
 	require.NoError(t, err)
+
 	path := credential.Path()
 	require.Equal(t, "edge-token", filepath.Base(path))
 
@@ -412,6 +425,7 @@ func TestBootstrapEdgeTokenUsesAudienceAndRotatesSecureFile(t *testing.T) {
 	}, time.Second, time.Millisecond)
 
 	require.NoError(t, credential.Close())
+
 	_, err = os.Stat(filepath.Dir(path))
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
@@ -422,6 +436,7 @@ func TestBootstrapWaitsForEdgeListenerAndReportsEarlyExit(t *testing.T) {
 	attempts := 0
 	dial := func(_ context.Context, address string) error {
 		require.Equal(t, "192.0.2.10:8880", address)
+
 		attempts++
 		if attempts < 2 {
 			return errors.New("not listening")
@@ -505,8 +520,10 @@ func TestBootstrapNetbootExecuteCleansUpAfterDesignatedNodeReady(t *testing.T) {
 	var gotMachine v1alpha3.Machine
 	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: machine.Name}, &gotMachine))
 	require.Equal(t, "permanent-edge", gotMachine.Spec.Netboot().EndpointRef)
+
 	var endpoint v1alpha3.NetbootEndpoint
 	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &endpoint))
+
 	_, err := os.Stat(filepath.Dir(token.Path()))
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
@@ -516,6 +533,7 @@ func TestBootstrapNetbootExecuteReportsEarlyEdgeExitAndRollsBack(t *testing.T) {
 	site, machine, resources, kubeClient := bootstrapLifecycleFixture(t, false)
 	process := &fakeBootstrapEdgeProcess{done: make(chan struct{}), err: errors.New("bind: address already in use")}
 	close(process.done)
+
 	h := &siteBootstrapNetbootHandler{
 		site: site.Name, machine: machine.Name, interfaceName: "eno1", address: "192.0.2.10",
 		httpPort: 8880, namespace: "unbounded-system", timeout: time.Second,
@@ -541,6 +559,7 @@ func TestBootstrapNetbootExecuteReportsEarlyEdgeExitAndRollsBack(t *testing.T) {
 	var gotMachine v1alpha3.Machine
 	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: machine.Name}, &gotMachine))
 	require.Equal(t, "permanent-edge", gotMachine.Spec.Netboot().EndpointRef)
+
 	var endpoint v1alpha3.NetbootEndpoint
 	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &endpoint))
 }
@@ -576,6 +595,7 @@ func TestBootstrapNetbootPreparesAndCleansExternalGatewayResources(t *testing.T)
 	}
 
 	require.NoError(t, h.prepareGatewayResources(ctx))
+
 	var pool netv1alpha1.GatewayPool
 	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool))
 	require.Equal(t, "External", pool.Spec.Type)
@@ -649,6 +669,7 @@ func TestBootstrapNetbootExecuteRunsOptInGatewayUntilNodeReady(t *testing.T) {
 	require.NoError(t, h.execute(ctx))
 	require.True(t, gatewayProcess.stopped)
 	require.True(t, edgeProcess.stopped)
+
 	var pool netv1alpha1.GatewayPool
 	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool))
 	_, err := kubeClient.CoreV1().Nodes().Get(ctx, h.endpointName, metav1.GetOptions{})
@@ -666,9 +687,11 @@ func markBootstrapGatewayReady(
 
 	node, err := kubeClient.CoreV1().Nodes().Get(ctx, h.endpointName, metav1.GetOptions{})
 	require.NoError(t, err)
+
 	if node.Annotations == nil {
 		node.Annotations = map[string]string{}
 	}
+
 	node.Annotations["net.unbounded-cloud.io/wg-pubkey"] = "public-key"
 	_, err = kubeClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 	require.NoError(t, err)
@@ -701,6 +724,7 @@ func TestBootstrapNetbootRejectsInvalidRoutedCIDRBeforeCreatingGateway(t *testin
 
 	err := h.prepareGatewayResources(context.Background())
 	require.ErrorContains(t, err, "invalid routed CIDR")
+
 	var pools netv1alpha1.GatewayPoolList
 	require.NoError(t, resources.List(context.Background(), &pools))
 	require.Empty(t, pools.Items)
@@ -730,6 +754,7 @@ func TestBootstrapNetbootExecuteRejectsInvalidRoutedCIDRBeforeClusterMutation(t 
 	var actualMachine v1alpha3.Machine
 	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: machine.Name}, &actualMachine))
 	require.Equal(t, "permanent-edge", actualMachine.Spec.Netboot().EndpointRef)
+
 	var endpoints v1alpha3.NetbootEndpointList
 	require.NoError(t, resources.List(ctx, &endpoints))
 	require.Empty(t, endpoints.Items)
@@ -757,6 +782,7 @@ func bootstrapLifecycleFixture(
 		Build()
 	controller := readyDeployment("metalman-controller-rack-a", 1)
 	server := readyDeployment("metalman-server-rack-a", 2)
+
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: machine.Name}}
 	if nodeReady {
 		node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
@@ -768,6 +794,7 @@ func bootstrapLifecycleFixture(
 func testBootstrapPortForward(ctx context.Context) *bootstrapPortForward {
 	forwardCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
+
 	go func() {
 		<-forwardCtx.Done()
 		close(done)
@@ -781,8 +808,10 @@ func testBootstrapEdgeToken(t *testing.T, ctx context.Context) *bootstrapEdgeTok
 	directory := t.TempDir()
 	path := filepath.Join(directory, "edge-token")
 	require.NoError(t, os.WriteFile(path, []byte("token"), 0o600))
+
 	tokenCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
+
 	go func() {
 		<-tokenCtx.Done()
 		close(done)
@@ -822,13 +851,16 @@ func (f *fakeBootstrapPortForwardStarter) start(_ context.Context, podName strin
 	}
 
 	attempt := &fakeBootstrapPortForwardAttempt{done: make(chan error, 1)}
+
 	f.mu.Lock()
 	if f.attempts == nil {
 		f.attempts = map[string]*fakeBootstrapPortForwardAttempt{}
 	}
+
 	f.attempts[podName] = attempt
 	f.local = append(f.local, localPort)
 	f.mu.Unlock()
+
 	f.started <- podName
 
 	return attempt, nil
@@ -838,6 +870,7 @@ func (f *fakeBootstrapPortForwardStarter) fail(podName string, err error) {
 	f.mu.Lock()
 	attempt := f.attempts[podName]
 	f.mu.Unlock()
+
 	attempt.done <- err
 }
 

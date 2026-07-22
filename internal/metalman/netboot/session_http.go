@@ -57,13 +57,16 @@ func SessionArtifactURL(signer *CapabilitySigner, session *v1alpha3.NetbootSessi
 	if signer == nil || session == nil {
 		return "", errors.New("capability signer and session are required")
 	}
+
 	if _, ok := sessionArtifact(session, artifactName); !ok {
 		return "", fmt.Errorf("artifact %q is not listed by session %s", artifactName, session.Name)
 	}
+
 	cleanArtifact := strings.TrimPrefix(artifactName, "/")
 	if cleanArtifact == "" || pathpkg.Clean(cleanArtifact) != cleanArtifact || strings.HasPrefix(artifactName, "/") {
 		return "", fmt.Errorf("invalid artifact name %q", artifactName)
 	}
+
 	baseURL, err := SessionBaseURL(signer, session)
 	if err != nil {
 		return "", err
@@ -78,6 +81,7 @@ func SessionBaseURL(signer *CapabilitySigner, session *v1alpha3.NetbootSession) 
 	if signer == nil || session == nil {
 		return "", errors.New("capability signer and session are required")
 	}
+
 	capability, err := signer.Sign(session)
 	if err != nil {
 		return "", err
@@ -107,6 +111,7 @@ func (s *SessionHTTPServer) handleDHCPDecision(w http.ResponseWriter, r *http.Re
 		http.Error(w, "session server unavailable", http.StatusServiceUnavailable)
 		return
 	}
+
 	if s.EdgeAuthenticator != nil && !s.EdgeAuthenticator.Authenticate(r.Context(), r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -114,6 +119,7 @@ func (s *SessionHTTPServer) handleDHCPDecision(w http.ResponseWriter, r *http.Re
 
 	endpoint := r.PathValue("endpoint")
 	mac := strings.ToLower(r.PathValue("mac"))
+
 	var sessions v1alpha3.NetbootSessionList
 	if err := s.Client.List(r.Context(), &sessions); err != nil {
 		http.Error(w, "loading sessions", http.StatusServiceUnavailable)
@@ -121,11 +127,13 @@ func (s *SessionHTTPServer) handleDHCPDecision(w http.ResponseWriter, r *http.Re
 	}
 
 	matches := make([]*v1alpha3.NetbootSession, 0, 1)
+
 	for i := range sessions.Items {
 		session := &sessions.Items[i]
 		if session.Spec.Endpoint.Name != endpoint || s.Capabilities.IsExpired(session) || (session.Status.Phase != v1alpha3.NetbootSessionPhaseReady && session.Status.Phase != v1alpha3.NetbootSessionPhaseActive) {
 			continue
 		}
+
 		for _, lease := range session.Spec.Boot.DHCPLeases {
 			if strings.EqualFold(lease.MAC, mac) {
 				matches = append(matches, session)
@@ -133,47 +141,57 @@ func (s *SessionHTTPServer) handleDHCPDecision(w http.ResponseWriter, r *http.Re
 			}
 		}
 	}
+
 	if len(matches) == 0 {
 		http.NotFound(w, r)
 		return
 	}
+
 	if len(matches) != 1 {
 		http.Error(w, "multiple ready sessions match DHCP client", http.StatusConflict)
 		return
 	}
 
 	session := matches[0]
+
 	var lease *v1alpha3.DHCPLease
+
 	for i := range session.Spec.Boot.DHCPLeases {
 		if strings.EqualFold(session.Spec.Boot.DHCPLeases[i].MAC, mac) {
 			lease = &session.Spec.Boot.DHCPLeases[i]
 			break
 		}
 	}
+
 	if lease == nil {
 		http.NotFound(w, r)
 		return
 	}
 
 	bootFile := ""
+
 	if session.Spec.Boot.ConfigurationSource == v1alpha3.NetbootConfigurationSourceDHCP {
 		var err error
+
 		bootFile, err = SessionArtifactURL(s.Capabilities, session, session.Spec.Boot.FirmwareArtifact)
 		if err != nil {
 			http.Error(w, "building firmware URL", http.StatusServiceUnavailable)
 			return
 		}
+
 		if session.Spec.Boot.Transport == v1alpha3.NetbootTransportTFTP {
 			capability, err := s.Capabilities.Sign(session)
 			if err != nil {
 				http.Error(w, "building firmware capability", http.StatusServiceUnavailable)
 				return
 			}
+
 			bootFile = pathpkg.Join("v1/netboot/sessions", session.Name, capability, "artifacts", session.Spec.Boot.FirmwareArtifact)
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+
 	if err := json.NewEncoder(w).Encode(struct {
 		Lease     v1alpha3.DHCPLease        `json:"lease"`
 		Transport v1alpha3.NetbootTransport `json:"transport"`
@@ -188,6 +206,7 @@ func (s *SessionHTTPServer) handleCallback(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+
 	if s.StatusRecorder == nil {
 		http.Error(w, "session status unavailable", http.StatusServiceUnavailable)
 		return
@@ -204,6 +223,7 @@ func (s *SessionHTTPServer) handleCallback(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
+
 	if err := s.StatusRecorder.RecordCondition(r.Context(), session.Name, session.UID, metav1.Condition{
 		Type:    conditionType,
 		Status:  metav1.ConditionTrue,
@@ -223,11 +243,13 @@ func (s *SessionHTTPServer) handleSessionCloudInit(w http.ResponseWriter, r *htt
 		http.Error(w, "reading cloud-init event", http.StatusBadRequest)
 		return
 	}
+
 	var event cloudInitEvent
 	if err := json.Unmarshal(body, &event); err != nil {
 		http.Error(w, "invalid cloud-init event", http.StatusBadRequest)
 		return
 	}
+
 	condition := buildCloudInitCondition(&event, session.Spec.Machine.Generation)
 	if condition != nil {
 		condition.Type = v1alpha3.NetbootSessionConditionCloudInitDone
@@ -236,6 +258,7 @@ func (s *SessionHTTPServer) handleSessionCloudInit(w http.ResponseWriter, r *htt
 			return
 		}
 	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -244,11 +267,13 @@ func (s *SessionHTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		http.Error(w, "reading install log", http.StatusBadRequest)
 		return
 	}
+
 	slog.Warn("unbounded-agent install log", "session", session.Name, "body", strings.TrimSpace(string(body)))
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -258,6 +283,7 @@ func (s *SessionHTTPServer) handleAttest(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+
 	if s.Attestation == nil || s.StatusRecorder == nil {
 		http.Error(w, "session attestation unavailable", http.StatusServiceUnavailable)
 		return
@@ -269,9 +295,12 @@ func (s *SessionHTTPServer) handleAttest(w http.ResponseWriter, r *http.Request)
 			http.NotFound(w, r)
 			return
 		}
+
 		http.Error(w, "loading Machine", http.StatusServiceUnavailable)
+
 		return
 	}
+
 	if machine.UID != session.Spec.Machine.UID {
 		http.Error(w, "Machine identity changed", http.StatusConflict)
 		return
@@ -279,10 +308,12 @@ func (s *SessionHTTPServer) handleAttest(w http.ResponseWriter, r *http.Request)
 
 	response := newBufferedResponseWriter()
 	s.Attestation.AttestMachine(response, r, &machine)
+
 	if response.status < http.StatusOK || response.status >= http.StatusMultipleChoices {
 		response.writeTo(w)
 		return
 	}
+
 	if err := s.StatusRecorder.RecordCondition(r.Context(), session.Name, session.UID, metav1.Condition{
 		Type:    v1alpha3.NetbootSessionConditionAttested,
 		Status:  metav1.ConditionTrue,
@@ -292,6 +323,7 @@ func (s *SessionHTTPServer) handleAttest(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "recording session status", http.StatusServiceUnavailable)
 		return
 	}
+
 	response.writeTo(w)
 }
 
@@ -311,14 +343,18 @@ func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
+
 	if artifact.Source == "Session" {
 		if artifact.Name != "cloud-init/user-data" {
 			http.NotFound(w, r)
 			return
 		}
+
 		http.ServeContent(w, r, artifact.Name, session.CreationTimestamp.Time, strings.NewReader(session.Spec.Provisioning.UserData))
+
 		return
 	}
+
 	image, ok := sessionArtifactImage(session, artifact.Source)
 	if !ok {
 		http.NotFound(w, r)
@@ -330,24 +366,31 @@ func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
+
 	diskPath, isTemplate, err := s.Cache.ResolveDigestPathForArchitecture(image.Digest, session.Spec.Boot.Architecture, reqPath)
 	if err != nil {
 		if errors.Is(err, ErrNotYetDownloaded) {
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, "artifact unavailable", http.StatusServiceUnavailable)
+
 			return
 		}
+
 		http.NotFound(w, r)
+
 		return
 	}
+
 	if isTemplate {
 		data, err := s.renderSessionTemplate(diskPath, session)
 		if err != nil {
 			http.Error(w, "rendering artifact", http.StatusServiceUnavailable)
 			return
 		}
+
 		http.ServeContent(w, r, artifact.Name, session.CreationTimestamp.Time, bytes.NewReader(data))
 		s.recordFirmwareDownloaded(r.Context(), session, artifact.Name)
+
 		return
 	}
 
@@ -359,6 +402,7 @@ func (s *SessionHTTPServer) recordFirmwareDownloaded(ctx context.Context, sessio
 	if s.StatusRecorder == nil || artifactName != session.Spec.Boot.FirmwareArtifact {
 		return
 	}
+
 	if err := s.StatusRecorder.RecordCondition(ctx, session.Name, session.UID, metav1.Condition{
 		Type:    v1alpha3.NetbootSessionConditionBootLoaderDownloaded,
 		Status:  metav1.ConditionTrue,
@@ -374,10 +418,12 @@ func (s *SessionHTTPServer) renderSessionTemplate(templatePath string, session *
 	if err != nil {
 		return nil, fmt.Errorf("reading template: %w", err)
 	}
+
 	baseURL, err := SessionBaseURL(s.Capabilities, session)
 	if err != nil {
 		return nil, err
 	}
+
 	machine := sessionMachine(session)
 	cluster := session.Spec.Provisioning.Cluster
 	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
@@ -391,23 +437,29 @@ func (s *SessionHTTPServer) renderSessionTemplate(templatePath string, session *
 		ProviderLabels: session.Spec.Provisioning.ProviderLabels,
 		AttestURL:      baseURL,
 	})
+
 	agentConfigJSON, err := json.MarshalIndent(agentConfig, "    ", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshaling agent config: %w", err)
 	}
+
 	data := newTemplateData(machine, ClusterInfo{ApiserverURL: cluster.APIServerURL, CACertBase64: cluster.CACertBase64}, baseURL, string(agentConfigJSON), "", true)
+
 	data.ArtifactBaseURL, err = JoinServeURLPath(baseURL, "artifacts")
 	if err != nil {
 		return nil, err
 	}
+
 	data.BootImageWrittenURL, err = JoinServeURLPath(baseURL, "callbacks/boot-image-written")
 	if err != nil {
 		return nil, err
 	}
+
 	data.CloudInitURL, err = JoinServeURLPath(baseURL, "callbacks/cloud-init")
 	if err != nil {
 		return nil, err
 	}
+
 	data.InstallLogURL, err = JoinServeURLPath(baseURL, "logs/agent-install")
 	if err != nil {
 		return nil, err
@@ -446,13 +498,17 @@ func (s *SessionHTTPServer) authorizeSession(w http.ResponseWriter, r *http.Requ
 			http.NotFound(w, r)
 			return nil, false
 		}
+
 		http.Error(w, "loading session", http.StatusServiceUnavailable)
+
 		return nil, false
 	}
+
 	if err := s.Capabilities.Verify(&session, r.PathValue("capability")); err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
+
 	if session.Status.Phase != v1alpha3.NetbootSessionPhaseReady && session.Status.Phase != v1alpha3.NetbootSessionPhaseActive {
 		http.Error(w, "session unavailable", http.StatusServiceUnavailable)
 		return nil, false
@@ -500,7 +556,9 @@ func (w *bufferedResponseWriter) writeTo(destination http.ResponseWriter) {
 	for key, values := range w.header {
 		destination.Header()[key] = append([]string(nil), values...)
 	}
+
 	destination.WriteHeader(w.status)
+
 	if _, err := destination.Write(w.body.Bytes()); err != nil {
 		slog.Warn("writing buffered attestation response", "err", err)
 	}

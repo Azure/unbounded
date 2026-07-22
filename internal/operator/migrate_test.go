@@ -283,6 +283,7 @@ func TestLegacyMetalmanDetectionIgnoresRemovedDHCPFlag(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newReaper(t, metalmanDeploymentForSiteWithArgs(legacyKubeNamespace, "edge", tt.args...))
+
 			got, err := r.legacyMetalmanExistsForSite(t.Context(), "edge")
 			if err != nil || !got {
 				t.Fatalf("legacyMetalmanExistsForSite = %t, err=%v; want true", got, err)

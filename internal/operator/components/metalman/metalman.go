@@ -57,6 +57,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboun
 	if err := env.ApplyManifestFS(ctx, machinamanifests.Manifests, mutateSupportObject); err != nil {
 		return component.Failed(err)
 	}
+
 	if err := ensureCapabilitySecret(ctx, env, site); err != nil {
 		return component.Failed(err)
 	}
@@ -71,6 +72,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboun
 			return component.Failed(err)
 		}
 	}
+
 	if err := reconcileEndpointEdges(ctx, env, site); err != nil {
 		return component.Failed(err)
 	}
@@ -174,6 +176,7 @@ const (
 
 func roleDeployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Config, role string, replicas int32) *appsv1.Deployment {
 	image := cfg.Image("metalman")
+
 	name := DeploymentName(site.Name)
 	if role == metalmanServerRole {
 		name = ServerName(site.Name)
@@ -211,11 +214,14 @@ func roleDeployment(site *unboundedv1alpha3.Site, namespace string, cfg componen
 	maxSurge := intstr.FromInt32(1)
 	maxUnavailable := intstr.FromInt32(0)
 	ports := []corev1.ContainerPort{{Name: "health", ContainerPort: 8081, Protocol: corev1.ProtocolTCP}}
+
 	serviceAccountName := "metalman-controller"
 	if role == metalmanServerRole {
 		serviceAccountName = "metalman-server"
+
 		ports = append(ports, corev1.ContainerPort{Name: "http", ContainerPort: 8880, Protocol: corev1.ProtocolTCP})
 	}
+
 	probe := func(path string) *corev1.Probe {
 		return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 			Path: path,
@@ -291,6 +297,7 @@ func roleDeployment(site *unboundedv1alpha3.Site, namespace string, cfg componen
 
 func ensureCapabilitySecret(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) error {
 	secret := &corev1.Secret{}
+
 	key := client.ObjectKey{Namespace: env.Namespace, Name: CapabilitySecretName(site.Name)}
 	if err := env.Client.Get(ctx, key, secret); err == nil {
 		return nil
@@ -373,61 +380,76 @@ func reconcileEndpointEdges(ctx context.Context, env *component.Env, site *unbou
 	if err := env.Client.List(ctx, &endpoints); err != nil {
 		return fmt.Errorf("list NetbootEndpoints: %w", err)
 	}
+
 	sort.Slice(endpoints.Items, func(i, j int) bool { return endpoints.Items[i].Name < endpoints.Items[j].Name })
 
 	desiredDeployments := map[string]struct{}{}
 	desiredServices := map[string]struct{}{}
 	desiredTLSSecrets := map[string]struct{}{}
+
 	for i := range endpoints.Items {
 		endpoint := &endpoints.Items[i]
 		if endpoint.Spec.SiteRef != site.Name {
 			continue
 		}
+
 		deployment, service, err := endpointEdgeObjects(endpoint, site, env.Namespace, env.Config)
 		if err != nil {
 			return fmt.Errorf("build edge for NetbootEndpoint %s: %w", endpoint.Name, err)
 		}
+
 		if deployment != nil {
 			if endpoint.Spec.TLS.Mode == unboundedv1alpha3.NetbootEndpointTLSSecret {
 				secret, err := mirroredTLSSecret(ctx, env.Client, endpoint, site, env.Namespace)
 				if err != nil {
 					return fmt.Errorf("mirror TLS Secret for NetbootEndpoint %s: %w", endpoint.Name, err)
 				}
+
 				if err := env.ApplyObject(ctx, secret); err != nil {
 					return err
 				}
+
 				desiredTLSSecrets[secret.Name] = struct{}{}
 				deployment.Spec.Template.Annotations = map[string]string{
 					edgeTLSChecksumAnnotation: tlsSecretChecksum(secret),
 				}
 			}
+
 			if err := env.ApplyObject(ctx, deployment); err != nil {
 				return err
 			}
+
 			liveDeployment := &appsv1.Deployment{}
 			if err := env.Client.Get(ctx, client.ObjectKeyFromObject(deployment), liveDeployment); err != nil {
 				return fmt.Errorf("get managed edge Deployment %s: %w", deployment.Name, err)
 			}
+
 			if err := reconcileManagedEndpointStatus(ctx, env.Client, endpoint, liveDeployment); err != nil {
 				return fmt.Errorf("update NetbootEndpoint %s status: %w", endpoint.Name, err)
 			}
+
 			desiredDeployments[deployment.Name] = struct{}{}
 		}
+
 		if service != nil {
 			if err := env.ApplyObject(ctx, service); err != nil {
 				return err
 			}
+
 			desiredServices[service.Name] = struct{}{}
 		}
 	}
+
 	match := client.MatchingLabels{
 		"app.kubernetes.io/component":         metalmanEdgeRole,
 		unboundedv1alpha3.MachineSiteLabelKey: site.Name,
 	}
+
 	var deployments appsv1.DeploymentList
 	if err := env.Client.List(ctx, &deployments, client.InNamespace(env.Namespace), match); err != nil {
 		return fmt.Errorf("list managed edge Deployments: %w", err)
 	}
+
 	for i := range deployments.Items {
 		if _, ok := desiredDeployments[deployments.Items[i].Name]; !ok {
 			if err := env.DeleteIfExists(ctx, &deployments.Items[i]); err != nil {
@@ -435,10 +457,12 @@ func reconcileEndpointEdges(ctx context.Context, env *component.Env, site *unbou
 			}
 		}
 	}
+
 	var services corev1.ServiceList
 	if err := env.Client.List(ctx, &services, client.InNamespace(env.Namespace), match); err != nil {
 		return fmt.Errorf("list managed edge Services: %w", err)
 	}
+
 	for i := range services.Items {
 		if _, ok := desiredServices[services.Items[i].Name]; !ok {
 			if err := env.DeleteIfExists(ctx, &services.Items[i]); err != nil {
@@ -446,10 +470,12 @@ func reconcileEndpointEdges(ctx context.Context, env *component.Env, site *unbou
 			}
 		}
 	}
+
 	var tlsSecrets corev1.SecretList
 	if err := env.Client.List(ctx, &tlsSecrets, client.InNamespace(env.Namespace), match); err != nil {
 		return fmt.Errorf("list managed edge TLS Secrets: %w", err)
 	}
+
 	for i := range tlsSecrets.Items {
 		if _, ok := desiredTLSSecrets[tlsSecrets.Items[i].Name]; !ok {
 			if err := env.DeleteIfExists(ctx, &tlsSecrets.Items[i]); err != nil {
@@ -470,6 +496,7 @@ func reconcileManagedEndpointStatus(
 	if endpoint.Spec.Type == unboundedv1alpha3.NetbootEndpointTypeExternalL2 {
 		return nil
 	}
+
 	if deployment == nil {
 		return fmt.Errorf("managed endpoint has no Deployment")
 	}
@@ -479,8 +506,10 @@ func reconcileManagedEndpointStatus(
 		if err := kubeClient.Get(ctx, client.ObjectKey{Name: endpoint.Name}, current); err != nil {
 			return err
 		}
+
 		base := current.DeepCopy()
 		current.Status.ObservedGeneration = current.Generation
+
 		condition := metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
@@ -493,6 +522,7 @@ func reconcileManagedEndpointStatus(
 			condition.Reason = "EdgeAvailable"
 			condition.Message = "managed edge Deployment is available"
 		}
+
 		apimeta.SetStatusCondition(&current.Status.Conditions, condition)
 
 		return kubeClient.Status().Patch(ctx, current, client.MergeFrom(base))
@@ -518,12 +548,16 @@ func mirroredTLSSecret(
 	if endpoint.Spec.TLS.SecretRef == nil {
 		return nil, fmt.Errorf("TLS secretRef is required")
 	}
+
 	ref := endpoint.Spec.TLS.SecretRef
+
 	source := &corev1.Secret{}
 	if err := kubeClient.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, source); err != nil {
 		return nil, fmt.Errorf("get source Secret %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
+
 	certificate, certOK := source.Data[corev1.TLSCertKey]
+
 	privateKey, keyOK := source.Data[corev1.TLSPrivateKeyKey]
 	if !certOK || !keyOK {
 		return nil, fmt.Errorf("source Secret %s/%s must contain %s and %s", ref.Namespace, ref.Name, corev1.TLSCertKey, corev1.TLSPrivateKeyKey)
@@ -552,6 +586,7 @@ func requestsForTLSSecret(ctx context.Context, kubeClient client.Client, secret 
 	}
 
 	sites := map[string]struct{}{}
+
 	for i := range endpoints.Items {
 		ref := endpoints.Items[i].Spec.TLS.SecretRef
 		if endpoints.Items[i].Spec.TLS.Mode == unboundedv1alpha3.NetbootEndpointTLSSecret && ref != nil &&
@@ -559,13 +594,16 @@ func requestsForTLSSecret(ctx context.Context, kubeClient client.Client, secret 
 			sites[endpoints.Items[i].Spec.SiteRef] = struct{}{}
 		}
 	}
+
 	names := make([]string, 0, len(sites))
 	for site := range sites {
 		if site != "" {
 			names = append(names, site)
 		}
 	}
+
 	sort.Strings(names)
+
 	requests := make([]ctrl.Request, 0, len(names))
 	for _, site := range names {
 		requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKey{Name: site}})
@@ -583,6 +621,7 @@ func endpointEdgeObjects(
 	if endpoint.Spec.SiteRef != site.Name {
 		return nil, nil, fmt.Errorf("endpoint site %q does not match %q", endpoint.Spec.SiteRef, site.Name)
 	}
+
 	if endpoint.Spec.Type == unboundedv1alpha3.NetbootEndpointTypeExternalL2 {
 		return nil, nil, nil
 	}
@@ -613,7 +652,9 @@ func endpointEdgeObjects(
 		if endpoint.Spec.ManagedL2 == nil {
 			return nil, nil, fmt.Errorf("managedL2 configuration is required")
 		}
+
 		replicas = 1
+
 		args = append(args,
 			"--bind-address="+endpoint.Spec.ManagedL2.Address,
 			"--dhcp-enabled",
@@ -626,10 +667,12 @@ func endpointEdgeObjects(
 			corev1.ContainerPort{Name: "dhcp", ContainerPort: 67, Protocol: corev1.ProtocolUDP},
 			corev1.ContainerPort{Name: "tftp", ContainerPort: 69, Protocol: corev1.ProtocolUDP},
 		)
+
 		affinity, err := requiredNodeAffinity(endpoint.Spec.ManagedL2.NodeSelector)
 		if err != nil {
 			return nil, nil, err
 		}
+
 		podSpec.HostNetwork = true
 		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 		podSpec.Affinity = affinity
@@ -643,6 +686,7 @@ func endpointEdgeObjects(
 	}
 
 	expirationSeconds := int64(3600)
+
 	container := corev1.Container{
 		Name:            "metalman",
 		Image:           cfg.Image("metalman"),
@@ -664,6 +708,7 @@ func endpointEdgeObjects(
 			}}},
 		}}}}
 	}
+
 	if endpoint.Spec.TLS.Mode == unboundedv1alpha3.NetbootEndpointTLSSecret {
 		args = append(args,
 			"--tls-cert-file=/var/run/secrets/metalman-tls/tls.crt",
@@ -677,6 +722,7 @@ func endpointEdgeObjects(
 			Name: "tls", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: EdgeTLSSecretName(endpoint.Name)}},
 		})
 	}
+
 	podSpec.Containers = []corev1.Container{container}
 
 	deployment := &appsv1.Deployment{
@@ -698,15 +744,18 @@ func endpointEdgeObjects(
 	if endpoint.Spec.Type != unboundedv1alpha3.NetbootEndpointTypeHTTP {
 		return deployment, nil, nil
 	}
+
 	serviceType := endpoint.Spec.HTTP.ServiceType
 	if serviceType == "" {
 		serviceType = corev1.ServiceTypeClusterIP
 	}
+
 	servicePort := corev1.ServicePort{Name: "http", Port: 8880, TargetPort: intstr.FromInt32(8880), Protocol: corev1.ProtocolTCP}
 	if endpoint.Spec.TLS.Mode == unboundedv1alpha3.NetbootEndpointTLSSecret {
 		servicePort.Name = "https"
 		servicePort.Port = 443
 	}
+
 	service := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -743,14 +792,18 @@ func endpointEdgeLabels(endpoint *unboundedv1alpha3.NetbootEndpoint, site string
 
 func requiredNodeAffinity(selector metav1.LabelSelector) (*corev1.Affinity, error) {
 	requirements := make([]corev1.NodeSelectorRequirement, 0, len(selector.MatchLabels)+len(selector.MatchExpressions))
+
 	keys := make([]string, 0, len(selector.MatchLabels))
 	for key := range selector.MatchLabels {
 		keys = append(keys, key)
 	}
+
 	sort.Strings(keys)
+
 	for _, key := range keys {
 		requirements = append(requirements, corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{selector.MatchLabels[key]}})
 	}
+
 	for _, expression := range selector.MatchExpressions {
 		operator := corev1.NodeSelectorOperator(expression.Operator)
 		switch operator {
@@ -758,6 +811,7 @@ func requiredNodeAffinity(selector metav1.LabelSelector) (*corev1.Affinity, erro
 		default:
 			return nil, fmt.Errorf("unsupported node selector operator %q", expression.Operator)
 		}
+
 		requirements = append(requirements, corev1.NodeSelectorRequirement{Key: expression.Key, Operator: operator, Values: expression.Values})
 	}
 

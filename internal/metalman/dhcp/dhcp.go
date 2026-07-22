@@ -144,9 +144,11 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		log.Error("resolving DHCP decision", "err", err)
 		return
 	}
+
 	if decision == nil {
 		return
 	}
+
 	lease := &decision.Lease
 
 	clientIP := net.ParseIP(lease.IPv4).To4()
@@ -207,6 +209,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		if netbootImage == "" || s.OCICache == nil {
 			goto send
 		}
+
 		architecture := node.Spec.Netboot().TargetArchitecture()
 
 		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
@@ -255,6 +258,7 @@ func (s *Server) decision(ctx context.Context, mac string, httpClient bool) (*De
 		decision, err := s.DecisionProvider.Decide(ctx, mac, httpClient)
 		return decision, nil, err
 	}
+
 	if s.Reader == nil {
 		return nil, nil, errors.New("DHCP decision provider is not configured")
 	}
@@ -263,6 +267,7 @@ func (s *Server) decision(ctx context.Context, mac string, httpClient bool) (*De
 	if err := s.Reader.List(ctx, &list, client.MatchingFields{indexing.IndexNodeByMAC: mac}); err != nil {
 		return nil, nil, fmt.Errorf("listing Machines by MAC: %w", err)
 	}
+
 	if len(list.Items) == 0 || list.Items[0].Spec.Netboot() == nil {
 		return nil, nil, nil
 	}

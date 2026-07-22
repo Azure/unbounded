@@ -33,24 +33,30 @@ func (r *SessionStatusRecorder) RecordCondition(ctx context.Context, sessionName
 	if err := r.Client.Get(ctx, client.ObjectKey{Name: sessionName}, &session); err != nil {
 		return fmt.Errorf("get NetbootSession %s: %w", sessionName, err)
 	}
+
 	if session.UID != sessionUID {
 		return fmt.Errorf("NetbootSession %s identity changed", sessionName)
 	}
 
 	condition.ObservedGeneration = session.Generation
 	condition.LastTransitionTime = r.now()
+
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latest v1alpha3.NetbootSession
 		if err := r.Client.Get(ctx, client.ObjectKey{Name: sessionName}, &latest); err != nil {
 			return err
 		}
+
 		if latest.UID != sessionUID {
 			return fmt.Errorf("NetbootSession %s identity changed", sessionName)
 		}
+
 		if apimeta.IsStatusConditionTrue(latest.Status.Conditions, condition.Type) {
 			return nil
 		}
+
 		apimeta.SetStatusCondition(&latest.Status.Conditions, condition)
+
 		if latest.Status.Phase == v1alpha3.NetbootSessionPhaseReady {
 			latest.Status.Phase = v1alpha3.NetbootSessionPhaseActive
 		}
@@ -70,8 +76,10 @@ func (r *SessionStatusRecorder) recordTargetCondition(ctx context.Context, sessi
 			if apierrors.IsNotFound(err) {
 				return nil
 			}
+
 			return err
 		}
+
 		if operation.UID != session.Spec.Operation.UID {
 			return fmt.Errorf("MachineOperation %s identity changed", operation.Name)
 		}
@@ -81,9 +89,11 @@ func (r *SessionStatusRecorder) recordTargetCondition(ctx context.Context, sessi
 			if target.Input == nil || target.Input.NetbootSessionRef == nil || target.Input.NetbootSessionRef.Name != session.Name || target.Input.NetbootSessionRef.UID != session.UID {
 				continue
 			}
+
 			if apimeta.IsStatusConditionTrue(target.Conditions, condition.Type) {
 				return nil
 			}
+
 			condition.ObservedGeneration = target.ObservedGeneration
 			apimeta.SetStatusCondition(&target.Conditions, condition)
 

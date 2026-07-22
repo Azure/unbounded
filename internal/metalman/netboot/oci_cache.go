@@ -202,6 +202,7 @@ func (c *OCICache) ResolveDigestPathForArchitecture(digest, architecture, reqPat
 	if digest == "" {
 		return "", false, fmt.Errorf("image digest is required")
 	}
+
 	if !c.IsCachedForArchitecture(digest, architecture) {
 		return "", false, fmt.Errorf("%w: image digest %q for architecture %q is not cached", ErrNotYetDownloaded, digest, normalizeArchitecture(architecture))
 	}

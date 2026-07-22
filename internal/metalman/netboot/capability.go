@@ -37,9 +37,11 @@ func NewCapabilitySigner(key []byte, keyID string, now func() time.Time) (*Capab
 	if len(key) < minimumCapabilityKeySize {
 		return nil, fmt.Errorf("capability HMAC key must be at least %d bytes", minimumCapabilityKeySize)
 	}
+
 	if strings.TrimSpace(keyID) == "" {
 		return nil, errors.New("capability key ID is required")
 	}
+
 	if now == nil {
 		now = time.Now
 	}
@@ -58,12 +60,14 @@ func (s *CapabilitySigner) Sign(session *v1alpha3.NetbootSession) (string, error
 		SessionUID: string(session.UID),
 		Expires:    session.Spec.ExpiresAt.Unix(),
 	}
+
 	payload, err := json.Marshal(claims)
 	if err != nil {
 		return "", fmt.Errorf("marshal capability claims: %w", err)
 	}
 
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
+
 	return encoded + "." + s.signature(encoded), nil
 }
 
@@ -77,13 +81,16 @@ func (s *CapabilitySigner) Verify(session *v1alpha3.NetbootSession, capability s
 	if err != nil {
 		return errors.New("invalid capability")
 	}
+
 	var claims capabilityClaims
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return errors.New("invalid capability")
 	}
+
 	if session == nil || claims.KeyID != s.keyID || claims.Session != session.Name || claims.SessionUID != string(session.UID) || claims.Expires != session.Spec.ExpiresAt.Unix() {
 		return errors.New("invalid capability")
 	}
+
 	if !s.now().Before(time.Unix(claims.Expires, 0)) {
 		return errors.New("expired capability")
 	}

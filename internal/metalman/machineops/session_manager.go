@@ -67,7 +67,7 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 
 	netbootSpec := machine.Spec.Netboot()
 	if netbootSpec == nil {
-		return nil, errors.New("Machine has no netboot configuration")
+		return nil, errors.New("machine has no netboot configuration")
 	}
 
 	var endpoint v1alpha3.NetbootEndpoint
@@ -76,6 +76,7 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 	}
 
 	architecture := netbootSpec.TargetArchitecture()
+
 	machineDigest := m.Cache.DigestForArchitecture(netbootSpec.Image, architecture)
 	if machineDigest == "" {
 		return nil, fmt.Errorf("%w: machine image %q for architecture %q", netboot.ErrNotYetDownloaded, netbootSpec.Image, architecture)
@@ -83,6 +84,7 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 
 	netbootRef := netbootSpec.NetbootImage
 	netbootPullSecret := netbootSpec.NetbootPullSecretRef
+
 	if netbootRef == "" {
 		netbootRef = m.DefaultNetbootRef
 		netbootPullSecret = m.DefaultNetbootPullSecret
@@ -92,24 +94,29 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 	if netbootDigest == "" {
 		return nil, fmt.Errorf("%w: netboot image %q for architecture %q", netboot.ErrNotYetDownloaded, netbootRef, architecture)
 	}
+
 	metadata, err := m.Cache.MetadataForArchitecture(netbootDigest, architecture)
 	if err != nil {
 		return nil, fmt.Errorf("read netboot image metadata: %w", err)
 	}
+
 	firmwareArtifact := firmwareArtifactForTransport(metadata, netbootSpec.TargetTransport())
 	if firmwareArtifact == "" {
 		return nil, fmt.Errorf("netboot image %q has no firmware artifact for %s", netbootRef, netbootSpec.TargetTransport())
 	}
 
 	now := m.now()
+
 	userData, err := m.resolveUserData(ctx, netbootSpec)
 	if err != nil {
 		return nil, err
 	}
+
 	clusterInfo := netboot.ClusterInfo{}
 	if m.Cluster != nil {
 		clusterInfo = m.Cluster.ClusterInfo()
 	}
+
 	session := &v1alpha3.NetbootSession{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -185,6 +192,7 @@ func (m *KubernetesSessionManager) resolveUserData(ctx context.Context, spec *v1
 	}
 
 	ref := spec.CloudInit.UserDataConfigMapRef
+
 	var configMap corev1.ConfigMap
 	if err := m.Client.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &configMap); err != nil {
 		return "", fmt.Errorf("get cloud-init user-data ConfigMap %s/%s: %w", ref.Namespace, ref.Name, err)
@@ -194,9 +202,11 @@ func (m *KubernetesSessionManager) resolveUserData(ctx context.Context, spec *v1
 	if key == "" {
 		key = "user-data"
 	}
+
 	if value, ok := configMap.Data[key]; ok {
 		return value, nil
 	}
+
 	if value, ok := configMap.BinaryData[key]; ok {
 		return string(value), nil
 	}
@@ -221,6 +231,7 @@ func (m *KubernetesSessionManager) refreshEndpointReadinessWithEndpoint(ctx cont
 	now := m.now()
 
 	ready := endpoint.Status.ObservedGeneration == endpoint.Generation && apimeta.IsStatusConditionTrue(endpoint.Status.Conditions, "Ready")
+
 	session.Status.Phase = v1alpha3.NetbootSessionPhasePreparing
 	if ready {
 		session.Status.Phase = v1alpha3.NetbootSessionPhaseReady
@@ -303,11 +314,13 @@ func sessionArtifacts(firmwareArtifact string) []v1alpha3.NetbootSessionArtifact
 	}
 
 	unique := make([]v1alpha3.NetbootSessionArtifact, 0, len(artifacts))
+
 	names := make(map[string]struct{}, len(artifacts))
 	for _, artifact := range artifacts {
 		if _, exists := names[artifact.Name]; exists {
 			continue
 		}
+
 		names[artifact.Name] = struct{}{}
 		unique = append(unique, artifact)
 	}
@@ -319,6 +332,7 @@ func firmwareArtifactForTransport(metadata *netboot.ImageMetadata, transport v1a
 	if metadata == nil {
 		return ""
 	}
+
 	if transport == v1alpha3.NetbootTransportHTTP {
 		return netboot.HTTPBootPathFromMetadata(metadata)
 	}

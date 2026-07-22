@@ -109,6 +109,7 @@ func TestWaitForSiteMembershipImmediate(t *testing.T) {
 func TestWaitForSiteMembershipAcceptsSiteLessGateway(t *testing.T) {
 	sliceInformer := newTestInformer()
 	gatewayPoolInformer := newTestInformer()
+
 	pool := &unboundednetv1alpha1.GatewayPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "external"},
 		Spec:       unboundednetv1alpha1.GatewayPoolSpec{NodeSelector: map[string]string{"external": "true"}},
@@ -124,6 +125,7 @@ func TestWaitForSiteMembershipAcceptsSiteLessGateway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("waitForSiteMembership returned error: %v", err)
 	}
+
 	if got != "" {
 		t.Fatalf("site-less gateway membership = %q, want empty", got)
 	}
@@ -174,6 +176,7 @@ func TestSiteLessGatewayDisablesCNIManagement(t *testing.T) {
 	if manageCNIForMembership(siteInformer, "", true) {
 		t.Fatal("site-less gateway must not wait for PodCIDRs or write CNI configuration")
 	}
+
 	if !manageCNIForMembership(siteInformer, "", false) {
 		t.Fatal("ordinary node without resolved membership must retain the default CNI policy")
 	}

@@ -45,6 +45,7 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 	cache := netboot.NewOCICache(t.TempDir())
 	machineDigest := "sha256:" + stringOf('a', 64)
 	netbootDigest := "sha256:" + stringOf('b', 64)
+
 	cache.SetDigestForArchitecture(machine.Spec.PXE.Image, v1alpha3.DefaultPXEArchitecture, machineDigest)
 	cache.SetDigestForArchitecture(machine.Spec.PXE.NetbootImage, v1alpha3.DefaultPXEArchitecture, netbootDigest)
 	require.NoError(t, writeSessionMetadata(cache, netbootDigest, "http/bootx64.efi"))
@@ -86,6 +87,7 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 		Source: "NetbootImage",
 		Path:   "/disk/http/bootx64.efi",
 	})
+
 	for _, name := range []string{
 		"vmlinuz", "initrd", "init.cpio", "grub/grub.cfg", "grubx64.efi",
 		"cloud-init/meta-data", "cloud-init/user-data", "cloud-init/vendor-data", "cloud-init/network-config",
@@ -100,6 +102,7 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 			return false
 		}, "session artifact list is missing %s", name)
 	}
+
 	require.True(t, session.Spec.ExpiresAt.Time.Equal(fixedNow().Add(24*time.Hour)))
 
 	machine.Spec.PXE.Image = "ghcr.io/test/changed:v2"

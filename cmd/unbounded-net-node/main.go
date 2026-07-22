@@ -18,6 +18,7 @@ func main() {
 
 	cmd := nodeagent.NewCommand()
 	cmd.SetContext(ctx)
+
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
 	}

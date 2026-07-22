@@ -56,6 +56,7 @@ func EdgeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+
 			if err := validateEdgeTLSFiles(tlsCertFile, tlsKeyFile); err != nil {
 				return err
 			}
@@ -64,6 +65,7 @@ func EdgeCmd() *cobra.Command {
 			defer stop()
 
 			addr := fmt.Sprintf("%s:%d", bindAddress, httpPort)
+
 			server := &http.Server{
 				Addr:              addr,
 				Handler:           newEdgeProxy(backend),
@@ -74,11 +76,14 @@ func EdgeCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("creating DHCP backend: %w", err)
 				}
+
 				serverIP, err := edgeDHCPServerIP(dhcpServerIP, dhcpInterface)
 				if err != nil {
 					return err
 				}
+
 				dhcpServer := &dhcp.Server{Interface: dhcpInterface, Port: dhcpPort, DecisionProvider: decisionProvider, ServerIP: serverIP}
+
 				go func() {
 					if err := dhcpServer.Start(ctx); err != nil && ctx.Err() == nil {
 						slog.ErrorContext(ctx, "Metalman edge DHCP server failed", "err", err)
@@ -86,12 +91,15 @@ func EdgeCmd() *cobra.Command {
 					}
 				}()
 			}
+
 			if tftpEnabled {
 				artifactBackend, err := netboot.NewHTTPArtifactBackend(backend.String(), nil)
 				if err != nil {
 					return fmt.Errorf("creating TFTP backend: %w", err)
 				}
+
 				tftpServer := &netboot.TFTPServer{BindAddr: tftpBindAddr, Port: tftpPort, Backend: artifactBackend}
+
 				go func() {
 					if err := tftpServer.Start(ctx); err != nil && ctx.Err() == nil {
 						slog.ErrorContext(ctx, "Metalman edge TFTP server failed", "err", err)
@@ -102,7 +110,10 @@ func EdgeCmd() *cobra.Command {
 
 			go func() {
 				<-ctx.Done()
-				_ = server.Shutdown(context.Background())
+
+				if err := server.Shutdown(context.Background()); err != nil {
+					slog.Warn("shutting down Metalman edge HTTP server failed", "err", err)
+				}
 			}()
 
 			PrintConfig("role", string(metalmanRoleEdge))
@@ -133,8 +144,14 @@ func EdgeCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&tftpEnabled, "tftp-enabled", false, "Enable the TFTP protocol edge")
 	cmd.Flags().StringVar(&tftpBindAddr, "tftp-bind-address", "0.0.0.0", "IP address to bind the TFTP listener")
 	cmd.Flags().IntVar(&tftpPort, "tftp-port", 69, "TFTP listener port")
-	_ = cmd.MarkFlagRequired("backend-url")
-	_ = cmd.MarkFlagRequired("endpoint")
+
+	if err := cmd.MarkFlagRequired("backend-url"); err != nil {
+		panic(fmt.Sprintf("mark backend-url flag required: %v", err))
+	}
+
+	if err := cmd.MarkFlagRequired("endpoint"); err != nil {
+		panic(fmt.Sprintf("mark endpoint flag required: %v", err))
+	}
 
 	return cmd
 }
@@ -164,6 +181,7 @@ func edgeDHCPServerIP(configured, iface string) (net.IP, error) {
 
 		return ip, nil
 	}
+
 	if iface != "" {
 		return InterfaceIPv4(iface)
 	}
@@ -181,9 +199,11 @@ func parseEdgeBackendURL(value string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing --backend-url: %w", err)
 	}
+
 	if backend.Scheme != "http" && backend.Scheme != "https" {
 		return nil, errors.New("--backend-url must use http or https")
 	}
+
 	if backend.Host == "" {
 		return nil, errors.New("--backend-url must include a host")
 	}
@@ -199,12 +219,14 @@ func newEdgeProxy(backend *url.URL) http.Handler {
 	}
 
 	return &edgeProxy{
+		backend:   backend,
 		proxy:     proxy,
 		transport: http.DefaultTransport,
 	}
 }
 
 type edgeProxy struct {
+	backend   *url.URL
 	proxy     *httputil.ReverseProxy
 	transport http.RoundTripper
 }
@@ -220,12 +242,13 @@ func (e *edgeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (e *edgeProxy) serveArtifact(w http.ResponseWriter, r *http.Request) {
 	request := r.Clone(r.Context())
-	e.proxy.Director(request)
+	e.rewriteRequest(request)
 
 	response, err := e.transport.RoundTrip(request)
 	if err != nil {
 		slog.Warn("Metalman edge artifact request failed", "err", err)
 		http.Error(w, "Metalman backend unavailable", http.StatusBadGateway)
+
 		return
 	}
 
@@ -234,21 +257,31 @@ func (e *edgeProxy) serveArtifact(w http.ResponseWriter, r *http.Request) {
 
 	remaining := response.ContentLength
 	if remaining <= 0 || (response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent) {
-		_, _ = io.Copy(w, response.Body)
+		if _, err := io.Copy(w, response.Body); err != nil {
+			slog.Warn("Metalman edge response copy failed", "path", r.URL.Path, "err", err)
+		}
+
 		response.Body.Close() //nolint:errcheck // The response body is no longer needed.
+
 		return
 	}
 
 	start, end, ok := responseByteRange(response)
 	if !ok {
-		_, _ = io.Copy(w, response.Body)
+		if _, err := io.Copy(w, response.Body); err != nil {
+			slog.Warn("Metalman edge response copy failed", "path", r.URL.Path, "err", err)
+		}
+
 		response.Body.Close() //nolint:errcheck // The response body is no longer needed.
+
 		return
 	}
 
 	written, copyErr := io.Copy(w, response.Body)
 	response.Body.Close() //nolint:errcheck // The response body is no longer needed.
+
 	start += written
+
 	remaining -= written
 	if copyErr == nil && remaining == 0 {
 		return
@@ -256,28 +289,35 @@ func (e *edgeProxy) serveArtifact(w http.ResponseWriter, r *http.Request) {
 
 	for attempt := 2; attempt <= maxArtifactBackendAttempts && remaining > 0 && start <= end; attempt++ {
 		request = r.Clone(r.Context())
-		e.proxy.Director(request)
+		e.rewriteRequest(request)
 		request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
 		response, err = e.transport.RoundTrip(request)
 		if err != nil {
 			slog.Warn("Metalman edge artifact resume failed", "path", r.URL.Path, "err", err)
 			continue
 		}
+
 		if response.StatusCode != http.StatusPartialContent || response.ContentLength != remaining {
 			response.Body.Close() //nolint:errcheck // Invalid resume response.
 			slog.Warn("Metalman edge artifact resume returned an invalid range", "path", r.URL.Path, "status", response.StatusCode)
+
 			return
 		}
+
 		resumeStart, resumeEnd, valid := responseByteRange(response)
 		if !valid || resumeStart != start || resumeEnd != end {
 			response.Body.Close() //nolint:errcheck // Invalid resume response.
 			slog.Warn("Metalman edge artifact resume returned mismatched bytes", "path", r.URL.Path)
+
 			return
 		}
 
 		written, copyErr = io.Copy(w, response.Body)
 		response.Body.Close() //nolint:errcheck // The response body is no longer needed.
+
 		start += written
+
 		remaining -= written
 		if copyErr == nil && remaining == 0 {
 			return
@@ -285,6 +325,44 @@ func (e *edgeProxy) serveArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Warn("Metalman edge artifact transfer failed", "path", r.URL.Path, "err", copyErr)
+}
+
+func (e *edgeProxy) rewriteRequest(request *http.Request) {
+	request.URL.Scheme = e.backend.Scheme
+	request.URL.Host = e.backend.Host
+	request.URL.Path, request.URL.RawPath = joinURLPath(e.backend, request.URL)
+	request.Host = e.backend.Host
+
+	if e.backend.RawQuery == "" || request.URL.RawQuery == "" {
+		request.URL.RawQuery = e.backend.RawQuery + request.URL.RawQuery
+	} else {
+		request.URL.RawQuery = e.backend.RawQuery + "&" + request.URL.RawQuery
+	}
+}
+
+func joinURLPath(base, request *url.URL) (string, string) {
+	if base.RawPath == "" && request.RawPath == "" {
+		return singleJoiningSlash(base.Path, request.Path), ""
+	}
+
+	basePath := base.EscapedPath()
+	requestPath := request.EscapedPath()
+
+	return singleJoiningSlash(base.Path, request.Path), singleJoiningSlash(basePath, requestPath)
+}
+
+func singleJoiningSlash(left, right string) string {
+	leftSlash := strings.HasSuffix(left, "/")
+	rightSlash := strings.HasPrefix(right, "/")
+
+	switch {
+	case leftSlash && rightSlash:
+		return left + right[1:]
+	case !leftSlash && !rightSlash:
+		return left + "/" + right
+	default:
+		return left + right
+	}
 }
 
 func responseByteRange(response *http.Response) (int64, int64, bool) {
@@ -296,18 +374,22 @@ func responseByteRange(response *http.Response) (int64, int64, bool) {
 	if !strings.HasPrefix(value, "bytes ") {
 		return 0, 0, false
 	}
+
 	rangeAndSize := strings.SplitN(strings.TrimPrefix(value, "bytes "), "/", 2)
 	if len(rangeAndSize) != 2 {
 		return 0, 0, false
 	}
+
 	bounds := strings.SplitN(rangeAndSize[0], "-", 2)
 	if len(bounds) != 2 {
 		return 0, 0, false
 	}
+
 	start, err := strconv.ParseInt(bounds[0], 10, 64)
 	if err != nil {
 		return 0, 0, false
 	}
+
 	end, err := strconv.ParseInt(bounds[1], 10, 64)
 	if err != nil || start < 0 || end < start || end-start+1 != response.ContentLength {
 		return 0, 0, false

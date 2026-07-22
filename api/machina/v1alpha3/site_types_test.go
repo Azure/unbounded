@@ -23,14 +23,17 @@ func TestMetalmanComponentSchemaExposesOnlyEnablement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read Site CRD: %v", err)
 	}
+
 	var crd apiextensionsv1.CustomResourceDefinition
 	if err := yaml.Unmarshal(data, &crd); err != nil {
 		t.Fatalf("parse Site CRD: %v", err)
 	}
+
 	metalman := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["components"].Properties["metalman"]
 	if _, ok := metalman.Properties["enabled"]; !ok {
 		t.Error("Metalman component schema lacks enabled")
 	}
+
 	for _, field := range []string{"dhcpAutoInterface", "replicas"} {
 		if _, ok := metalman.Properties[field]; ok {
 			t.Errorf("Metalman component schema still exposes %q", field)

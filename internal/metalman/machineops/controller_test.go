@@ -465,6 +465,7 @@ func TestConfigureRepaveBootSupportsIndependentBootAxes(t *testing.T) {
 	t.Parallel()
 
 	const bootURL = "https://boot.example.com/v1/netboot/sessions/session/capability/artifacts/bootx64.efi"
+
 	tests := []struct {
 		name                string
 		transport           v1alpha3.NetbootTransport
@@ -522,6 +523,7 @@ func TestConfigureRepaveBootSupportsIndependentBootAxes(t *testing.T) {
 			power := &recordingPowerClient{}
 			client, err := power.ForMachine(t.Context(), &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine"}})
 			require.NoError(t, err)
+
 			resolved := false
 			reconciler := &Reconciler{SessionHTTPBootURL: func(*v1alpha3.NetbootSession) (string, error) {
 				resolved = true
@@ -1538,10 +1540,12 @@ func markTargetCondition(t *testing.T, c client.Client, opName, machineName, con
 
 	var op v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: opName}, &op))
+
 	for i := range op.Status.Targets {
 		if op.Status.Targets[i].MachineRef != machineName {
 			continue
 		}
+
 		apimeta.SetStatusCondition(&op.Status.Targets[i].Conditions, metav1.Condition{
 			Type:               conditionType,
 			Status:             status,
@@ -1553,6 +1557,7 @@ func markTargetCondition(t *testing.T, c client.Client, opName, machineName, con
 
 		return
 	}
+
 	t.Fatalf("operation %s has no target %s", opName, machineName)
 }
 

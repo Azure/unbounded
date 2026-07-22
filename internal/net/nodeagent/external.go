@@ -23,9 +23,11 @@ func externalGatewayConfig(options ExternalGatewayOptions) (*config, error) {
 	if options.NodeName == "" {
 		return nil, fmt.Errorf("external gateway node name is required")
 	}
+
 	if options.RuntimeDir == "" {
 		return nil, fmt.Errorf("external gateway runtime directory is required")
 	}
+
 	if !filepath.IsAbs(options.RuntimeDir) {
 		return nil, fmt.Errorf("external gateway runtime directory must be absolute")
 	}
@@ -53,9 +55,11 @@ func RunExternalGateway(ctx context.Context, options ExternalGatewayOptions) err
 	if err != nil {
 		return err
 	}
+
 	if err := os.MkdirAll(cfg.WireGuardDir, 0o700); err != nil {
 		return fmt.Errorf("create WireGuard runtime directory: %w", err)
 	}
+
 	if err := os.MkdirAll(cfg.CNIConfDir, 0o700); err != nil {
 		return fmt.Errorf("create CNI runtime directory: %w", err)
 	}

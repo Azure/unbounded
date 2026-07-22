@@ -48,6 +48,7 @@ func (t *TFTPServer) Start(ctx context.Context) error {
 	if port == 0 {
 		port = 69
 	}
+
 	addr := net.JoinHostPort(t.BindAddr, fmt.Sprint(port))
 
 	conn, err := net.ListenPacket("udp", addr)
@@ -69,19 +70,23 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 	ctx := context.Background()
 	ip := rf.(tftp.OutgoingTransfer).RemoteAddr().IP.String() //nolint:errcheck // Type is guaranteed by the tftp library.
 	filename = strings.TrimPrefix(filename, "/")
+
 	log := slog.With("proto", "tftp", "filename", filename, "ip", ip)
 	if t.Backend != nil {
 		if !validSessionArtifactPath(filename) {
 			return fmt.Errorf("invalid session artifact path %q", filename)
 		}
+
 		reader, err := t.Backend.Open(ctx, filename)
 		if err != nil {
 			return fmt.Errorf("opening backend artifact: %w", err)
 		}
 		defer reader.Close() //nolint:errcheck // Backend stream is no longer needed.
+
 		if _, err := rf.ReadFrom(reader); err != nil {
 			return fmt.Errorf("transferring backend artifact: %w", err)
 		}
+
 		if recorder, ok := t.Backend.(TFTPBackendStatusRecorder); ok {
 			if err := recorder.RecordBootLoaderDownloaded(ctx, filename); err != nil {
 				return fmt.Errorf("recording backend transfer: %w", err)

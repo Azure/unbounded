@@ -27,9 +27,11 @@ func TestTFTPServerFetchesTokenizedSessionArtifactFromBackend(t *testing.T) {
 	if err := server.readHandler(filename, transfer); err != nil {
 		t.Fatal(err)
 	}
+
 	if backend.filename != filename {
 		t.Errorf("backend filename = %q, want %q", backend.filename, filename)
 	}
+
 	if got := transfer.String(); got != "firmware" {
 		t.Errorf("transfer = %q", got)
 	}
@@ -39,10 +41,12 @@ func TestTFTPServerRejectsLegacySourceIPFilenameWithBackend(t *testing.T) {
 	t.Parallel()
 
 	backend := &recordingTFTPBackend{data: []byte("firmware")}
+
 	server := &TFTPServer{Backend: backend}
 	if err := server.readHandler("shimx64.efi", &memoryOutgoingTransfer{}); err == nil {
 		t.Fatal("expected legacy filename to be rejected")
 	}
+
 	if backend.filename != "" {
 		t.Errorf("backend filename = %q, want empty", backend.filename)
 	}
@@ -58,6 +62,7 @@ func TestTFTPServerReportsCompletedSessionTransfer(t *testing.T) {
 	if err := server.readHandler(filename, &memoryOutgoingTransfer{}); err != nil {
 		t.Fatal(err)
 	}
+
 	if backend.completed != filename {
 		t.Errorf("completed filename = %q, want %q", backend.completed, filename)
 	}
@@ -105,7 +110,9 @@ func TestHTTPArtifactBackendResumesTruncatedResponse(t *testing.T) {
 	t.Parallel()
 
 	const artifact = "immutable-firmware"
+
 	var requests atomic.Int32
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch requests.Add(1) {
 		case 1:
@@ -115,6 +122,7 @@ func TestHTTPArtifactBackendResumesTruncatedResponse(t *testing.T) {
 			if got := r.Header.Get("Range"); got != "bytes=9-17" {
 				t.Errorf("Range = %q", got)
 			}
+
 			w.Header().Set("Content-Length", "9")
 			w.Header().Set("Content-Range", "bytes 9-17/18")
 			w.WriteHeader(http.StatusPartialContent)
@@ -129,15 +137,18 @@ func TestHTTPArtifactBackendResumesTruncatedResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	reader, err := backend.Open(t.Context(), "v1/netboot/sessions/session/capability/artifacts/shimx64.efi")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reader.Close() //nolint:errcheck // Test cleanup.
+
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := string(data); got != artifact {
 		t.Errorf("artifact = %q, want %q", got, artifact)
 	}
@@ -147,7 +158,9 @@ func TestHTTPArtifactBackendRetriesFailedResumeRequest(t *testing.T) {
 	t.Parallel()
 
 	const artifact = "immutable-firmware"
+
 	var requests atomic.Int32
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch requests.Add(1) {
 		case 1:
@@ -159,11 +172,13 @@ func TestHTTPArtifactBackendRetriesFailedResumeRequest(t *testing.T) {
 				t.Errorf("hijacking failed resume request: %v", err)
 				return
 			}
+
 			_ = conn.Close()
 		case 3:
 			if got := r.Header.Get("Range"); got != "bytes=9-17" {
 				t.Errorf("Range = %q", got)
 			}
+
 			w.Header().Set("Content-Length", "9")
 			w.Header().Set("Content-Range", "bytes 9-17/18")
 			w.WriteHeader(http.StatusPartialContent)
@@ -178,18 +193,22 @@ func TestHTTPArtifactBackendRetriesFailedResumeRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	reader, err := backend.Open(t.Context(), "v1/netboot/sessions/session/capability/artifacts/shimx64.efi")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reader.Close() //nolint:errcheck // Test cleanup.
+
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := string(data); got != artifact {
 		t.Errorf("artifact = %q, want %q", got, artifact)
 	}
+
 	if got := requests.Load(); got != 3 {
 		t.Errorf("backend requests = %d, want 3", got)
 	}
@@ -199,8 +218,10 @@ func TestHTTPArtifactBackendReportsSessionBootLoaderMilestone(t *testing.T) {
 	t.Parallel()
 
 	var callbackPath string
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callbackPath = r.URL.Path
+
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -209,10 +230,12 @@ func TestHTTPArtifactBackendReportsSessionBootLoaderMilestone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	artifactPath := "v1/netboot/sessions/session/capability/artifacts/shimx64.efi"
 	if err := backend.RecordBootLoaderDownloaded(t.Context(), artifactPath); err != nil {
 		t.Fatal(err)
 	}
+
 	if want := "/v1/netboot/sessions/session/capability/callbacks/boot-loader-downloaded"; callbackPath != want {
 		t.Errorf("callback path = %q, want %q", callbackPath, want)
 	}

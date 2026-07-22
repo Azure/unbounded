@@ -26,6 +26,7 @@ func TestSessionHTTPServesImmutableArtifactWithCapabilityAndRange(t *testing.T) 
 	t.Parallel()
 
 	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 	cache := setupOCICache(t, "unused.example/image:latest", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", map[string][]byte{
 		"disk.img.gz": []byte("0123456789"),
 	})
@@ -33,6 +34,7 @@ func TestSessionHTTPServesImmutableArtifactWithCapabilityAndRange(t *testing.T) 
 		"disk.img.gz": []byte("mutable-tag-content"),
 	}))
 	cache.SetDigest("unused.example/image:latest", "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+
 	session := testNetbootSession("session-a", digest)
 	client := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(session).Build()
 	signer, err := NewCapabilitySigner([]byte("01234567890123456789012345678901"), "test-key", func() time.Time {
@@ -45,6 +47,7 @@ func TestSessionHTTPServesImmutableArtifactWithCapabilityAndRange(t *testing.T) 
 	handler := (&SessionHTTPServer{Client: client, Cache: cache, Capabilities: signer}).Handler()
 	request := httptest.NewRequest(http.MethodGet, "/v1/netboot/sessions/session-a/"+capability+"/artifacts/disk.img.gz", nil)
 	request.Header.Set("Range", "bytes=2-5")
+
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
@@ -57,6 +60,7 @@ func TestSessionHTTPRejectsInvalidExpiredAndUnlistedCapabilities(t *testing.T) {
 	t.Parallel()
 
 	const digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 	cache := setupOCICache(t, "unused.example/image:latest", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", map[string][]byte{
 		"disk.img.gz": []byte("disk"),
 		"secret":      []byte("secret"),
@@ -68,6 +72,7 @@ func TestSessionHTTPRejectsInvalidExpiredAndUnlistedCapabilities(t *testing.T) {
 	require.NoError(t, err)
 	capability, err := signer.Sign(session)
 	require.NoError(t, err)
+
 	handler := (&SessionHTTPServer{Client: client, Cache: cache, Capabilities: signer}).Handler()
 
 	for name, test := range map[string]struct {
@@ -105,6 +110,7 @@ func TestSessionHTTPRecordsAuthenticatedSessionCallback(t *testing.T) {
 	require.NoError(t, err)
 	capability, err := signer.Sign(session)
 	require.NoError(t, err)
+
 	recorder := &recordingSessionConditionRecorder{}
 	handler := (&SessionHTTPServer{Client: client, Cache: NewOCICache(t.TempDir()), Capabilities: signer, StatusRecorder: recorder}).Handler()
 
@@ -129,6 +135,7 @@ func TestSessionHTTPRecordsCloudInitCompletionOnlyForFinalSuccess(t *testing.T) 
 	require.NoError(t, err)
 	capability, err := signer.Sign(session)
 	require.NoError(t, err)
+
 	recorder := &recordingSessionConditionsRecorder{}
 	handler := (&SessionHTTPServer{Client: client, Cache: NewOCICache(t.TempDir()), Capabilities: signer, StatusRecorder: recorder}).Handler()
 	path := "/v1/netboot/sessions/session-cloud-init/" + capability + "/callbacks/cloud-init"
@@ -147,6 +154,7 @@ func TestSessionHTTPRecordsCloudInitCompletionOnlyForFinalSuccess(t *testing.T) 
 	require.Equal(t, metav1.ConditionFalse, recorder.conditions[0].Status)
 	require.Equal(t, metav1.ConditionFalse, recorder.conditions[1].Status)
 	require.Equal(t, metav1.ConditionTrue, recorder.conditions[2].Status)
+
 	for _, condition := range recorder.conditions {
 		require.Equal(t, v1alpha3.NetbootSessionConditionCloudInitDone, condition.Type)
 	}
@@ -164,6 +172,7 @@ func TestSessionHTTPAttestsExactSessionMachineAndRecordsMilestone(t *testing.T) 
 	require.NoError(t, err)
 	capability, err := signer.Sign(session)
 	require.NoError(t, err)
+
 	attester := &recordingSessionAttester{}
 	recorder := &recordingSessionConditionRecorder{}
 	handler := (&SessionHTTPServer{
@@ -187,6 +196,7 @@ func TestSessionHTTPRecordsFirmwareDownloadForExactSession(t *testing.T) {
 	t.Parallel()
 
 	const digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
 	cache := setupOCICache(t, "unused.example/netboot:latest", strings.TrimPrefix(digest, "sha256:"), map[string][]byte{
 		"bootx64.efi": []byte("firmware"),
 	})
@@ -202,6 +212,7 @@ func TestSessionHTTPRecordsFirmwareDownloadForExactSession(t *testing.T) {
 	require.NoError(t, err)
 	capability, err := signer.Sign(session)
 	require.NoError(t, err)
+
 	recorder := &recordingSessionConditionRecorder{}
 
 	response := httptest.NewRecorder()
@@ -239,6 +250,7 @@ func TestSessionHTTPRendersBootArtifactsFromImmutableSnapshot(t *testing.T) {
 	t.Parallel()
 
 	const digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
 	cache := NewOCICache(t.TempDir())
 	diskDir := cache.DiskDirForArchitecture(digest, v1alpha3.PXEArchitectureAMD64)
 	require.NoError(t, os.MkdirAll(filepath.Join(diskDir, "grub"), 0o755))
@@ -291,16 +303,20 @@ func TestSessionHTTPRendersCapabilityScopedCallbacks(t *testing.T) {
 	t.Parallel()
 
 	const digest = "sha256:abababababababababababababababababababababababababababababababab"
+
 	cache := NewOCICache(t.TempDir())
 	diskDir := cache.DiskDirForArchitecture(digest, v1alpha3.PXEArchitectureAMD64)
 	require.NoError(t, os.MkdirAll(filepath.Join(diskDir, "cloud-init"), 0o755))
+
 	for _, artifact := range []string{"grub.cfg", "vendor-data"} {
 		source, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", artifact+".tmpl"))
 		require.NoError(t, err)
+
 		destination := filepath.Join(diskDir, artifact+".tmpl")
 		if artifact == "vendor-data" {
 			destination = filepath.Join(diskDir, "cloud-init", artifact+".tmpl")
 		}
+
 		require.NoError(t, os.WriteFile(destination, source, 0o600))
 	}
 
@@ -317,6 +333,7 @@ func TestSessionHTTPRendersCapabilityScopedCallbacks(t *testing.T) {
 	require.NoError(t, err)
 	capability, err := signer.Sign(session)
 	require.NoError(t, err)
+
 	handler := (&SessionHTTPServer{Client: client, Cache: cache, Capabilities: signer}).Handler()
 	capabilityBase := "https://boot.example.com/v1/netboot/sessions/session-callbacks/" + capability
 
@@ -350,6 +367,7 @@ type recordingSessionAttester struct {
 
 func (a *recordingSessionAttester) AttestMachine(w http.ResponseWriter, _ *http.Request, machine *v1alpha3.Machine) {
 	a.machine = machine.DeepCopy()
+
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"credentialBlob":"YQ=="}`))
 }

@@ -399,8 +399,10 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 		return r.advanceReboot(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
 		var session *v1alpha3.NetbootSession
+
 		if r.Sessions != nil {
 			var err error
+
 			session, err = r.Sessions.Ensure(ctx, op, &machine)
 			if err != nil {
 				if errors.Is(err, netboot.ErrNotYetDownloaded) {
@@ -641,11 +643,13 @@ func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, ma
 	transport := netbootSpec.TargetTransport()
 	configurationSource := targetConfigurationSource(netbootSpec)
 	networkMode := targetNetworkMode(netbootSpec)
+
 	if session != nil {
 		transport = session.Spec.Boot.Transport
 		configurationSource = session.Spec.Boot.ConfigurationSource
 		networkMode = session.Spec.Boot.NetworkMode
 	}
+
 	if transport == v1alpha3.NetbootTransportHTTP {
 		if configurationSource == v1alpha3.NetbootConfigurationSourceDHCP {
 			return pc.SetBootOverride(ctx, redfish.BootTargetUefiHTTP, redfish.BootOnce)
@@ -671,17 +675,21 @@ func (r *Reconciler) httpBootConfig(machine *v1alpha3.Machine, session *v1alpha3
 		bootURL string
 		err     error
 	)
+
 	if session != nil {
 		if r.SessionHTTPBootURL == nil {
 			return "", redfish.StaticIPv4Config{}, fmt.Errorf("session HTTP boot URL resolver is not configured")
 		}
+
 		bootURL, err = r.SessionHTTPBootURL(session)
 	} else {
 		if r.HTTPBootURL == nil {
 			return "", redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot URL resolver is not configured")
 		}
+
 		bootURL, err = r.HTTPBootURL(machine)
 	}
+
 	if err != nil {
 		return "", redfish.StaticIPv4Config{}, err
 	}
@@ -704,6 +712,7 @@ func httpBootStaticNetworkConfig(machine *v1alpha3.Machine, session *v1alpha3.Ne
 	} else if machine.Spec.Netboot() != nil {
 		leases = machine.Spec.Netboot().DHCPLeases
 	}
+
 	if len(leases) == 0 {
 		return redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot requires at least one static lease in spec.host.netboot.dhcpLeases")
 	}
@@ -804,6 +813,7 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 	if session != nil {
 		transport = session.Spec.Boot.Transport
 	}
+
 	if transport == v1alpha3.NetbootTransportHTTP {
 		if _, _, err := r.httpBootConfig(machine, session); err != nil {
 			if errors.Is(err, netboot.ErrNotYetDownloaded) {
