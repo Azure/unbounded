@@ -542,18 +542,13 @@ func (r *LegacyReaper) detectComponents(ctx context.Context, siteName string) (m
 		}
 	}
 
-	metalman, dhcpAutoInterface, err := r.legacyMetalmanConfigForSite(ctx, siteName)
+	metalman, err := r.legacyMetalmanExistsForSite(ctx, siteName)
 	if err != nil {
 		return nil, err
 	}
 
 	if metalman {
-		config := map[string]any{"enabled": true}
-		if dhcpAutoInterface != nil {
-			config["dhcpAutoInterface"] = *dhcpAutoInterface
-		}
-
-		components["metalman"] = config
+		components["metalman"] = map[string]any{"enabled": true}
 	}
 
 	return components, nil
@@ -567,28 +562,13 @@ func (r *LegacyReaper) detectComponents(ctx context.Context, siteName string) (m
 // and the operator use) guards against the site label being carried under the
 // deprecated key on older clusters.
 func (r *LegacyReaper) legacyMetalmanExistsForSite(ctx context.Context, siteName string) (bool, error) {
-	found, _, err := r.legacyMetalmanConfigForSite(ctx, siteName)
-
-	return found, err
-}
-
-// legacyMetalmanConfigForSite finds the legacy per-site Metalman Deployment and
-// preserves its --dhcp-auto-interface setting. Malformed or contradictory flag
-// values block translation rather than silently changing DHCP behavior.
-func (r *LegacyReaper) legacyMetalmanConfigForSite(ctx context.Context, siteName string) (bool, *bool, error) {
 	reader := r.liveReader()
-
-	var (
-		dhcpAutoInterface *bool
-		effectiveValue    *bool
-	)
-
 	found := false
 
 	for _, legacyNs := range r.LegacyNamespaces {
 		var list appsv1.DeploymentList
 		if err := reader.List(ctx, &list, client.InNamespace(legacyNs), client.MatchingLabels{"app": "unbounded-pxe"}); err != nil {
-			return false, nil, err
+			return false, err
 		}
 
 		for i := range list.Items {
@@ -600,62 +580,6 @@ func (r *LegacyReaper) legacyMetalmanConfigForSite(ctx context.Context, siteName
 			}
 
 			found = true
-
-			value, err := metalmanDHCPAutoInterface(d)
-			if err != nil {
-				return false, nil, err
-			}
-
-			effective := false
-			if value != nil {
-				effective = *value
-			}
-
-			if effectiveValue != nil && *effectiveValue != effective {
-				return false, nil, fmt.Errorf("legacy Metalman Deployments for Site %s have conflicting --dhcp-auto-interface values", siteName)
-			}
-
-			matchedEffective := effective
-			effectiveValue = &matchedEffective
-
-			if value != nil {
-				dhcpAutoInterface = value
-			}
-		}
-	}
-
-	return found, dhcpAutoInterface, nil
-}
-
-func metalmanDHCPAutoInterface(deploy *appsv1.Deployment) (*bool, error) {
-	var found *bool
-
-	for _, container := range deploy.Spec.Template.Spec.Containers {
-		for _, arg := range container.Args {
-			var value bool
-
-			switch {
-			case arg == "--dhcp-auto-interface":
-				value = true
-			case strings.HasPrefix(arg, "--dhcp-auto-interface="):
-				switch strings.TrimPrefix(arg, "--dhcp-auto-interface=") {
-				case "true":
-					value = true
-				case "false":
-					value = false
-				default:
-					return nil, fmt.Errorf("legacy Metalman Deployment %s/%s has invalid argument %q", deploy.Namespace, deploy.Name, arg)
-				}
-			default:
-				continue
-			}
-
-			if found != nil && *found != value {
-				return nil, fmt.Errorf("legacy Metalman Deployment %s/%s has conflicting --dhcp-auto-interface arguments", deploy.Namespace, deploy.Name)
-			}
-
-			matched := value
-			found = &matched
 		}
 	}
 

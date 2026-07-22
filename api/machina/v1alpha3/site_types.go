@@ -155,16 +155,6 @@ type MachinaComponentSpec struct {
 // MetalmanComponentSpec configures Metalman for a site.
 type MetalmanComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
-
-	// DHCPAutoInterface lets Metalman choose the DHCP interface automatically.
-	// +optional
-	DHCPAutoInterface *bool `json:"dhcpAutoInterface,omitempty"`
-
-	// Replicas is the desired number of Metalman replicas. Defaults to 1 when
-	// omitted.
-	// +kubebuilder:validation:Minimum=0
-	// +optional
-	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 // StorageComponentSpec configures unbounded-storage for a site. Storage daemon

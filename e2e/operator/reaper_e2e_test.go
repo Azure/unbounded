@@ -462,8 +462,8 @@ func assertTranslatedSites(ctx context.Context, t *testing.T, cli client.Client,
 		t.Fatalf("expected metalman enabled on edge site")
 	}
 
-	if !nestedBool(edge, "spec", "components", "metalman", "dhcpAutoInterface") {
-		t.Fatalf("expected Metalman DHCP auto-interface mode preserved")
+	if _, found, err := unstructured.NestedBool(edge.Object, "spec", "components", "metalman", "dhcpAutoInterface"); err != nil || found {
+		t.Fatalf("removed Metalman DHCP auto-interface mode retained: found=%t err=%v", found, err)
 	}
 
 	repair := getMachinaSite(ctx, t, cli, fixture.siteName)

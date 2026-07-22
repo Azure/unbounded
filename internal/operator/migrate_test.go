@@ -230,15 +230,14 @@ func TestTranslateSitesCreatesMachinaSite(t *testing.T) {
 	}
 }
 
-func TestTranslateSitesPreservesMetalmanDHCPAutoInterface(t *testing.T) {
+func TestTranslateSitesDropsLegacyMetalmanDHCPAutoInterface(t *testing.T) {
 	tests := []struct {
 		name string
 		arg  string
-		want bool
 	}{
-		{name: "bare", arg: "--dhcp-auto-interface", want: true},
-		{name: "explicit true", arg: "--dhcp-auto-interface=true", want: true},
-		{name: "explicit false", arg: "--dhcp-auto-interface=false", want: false},
+		{name: "bare", arg: "--dhcp-auto-interface"},
+		{name: "explicit true", arg: "--dhcp-auto-interface=true"},
+		{name: "explicit false", arg: "--dhcp-auto-interface=false"},
 	}
 
 	for _, tt := range tests {
@@ -259,53 +258,34 @@ func TestTranslateSitesPreservesMetalmanDHCPAutoInterface(t *testing.T) {
 				t.Fatalf("get translated Site: %v", err)
 			}
 
-			value, found, err := unstructured.NestedBool(got.Object, "spec", "components", "metalman", "dhcpAutoInterface")
-			if err != nil || !found || value != tt.want {
-				t.Fatalf("dhcpAutoInterface = %t, found=%t, err=%v; want %t", value, found, err, tt.want)
+			_, found, err := unstructured.NestedBool(got.Object, "spec", "components", "metalman", "dhcpAutoInterface")
+			if err != nil || found {
+				t.Fatalf("dhcpAutoInterface found=%t, err=%v; want removed", found, err)
 			}
 		})
 	}
 }
 
-func TestMetalmanDHCPAutoInterface(t *testing.T) {
+func TestLegacyMetalmanDetectionIgnoresRemovedDHCPFlag(t *testing.T) {
 	tests := []struct {
-		name    string
-		args    []string
-		want    *bool
-		wantErr bool
+		name string
+		args []string
 	}{
 		{name: "absent", args: []string{"serve-pxe"}},
-		{name: "bare", args: []string{"--dhcp-auto-interface"}, want: boolPtr(true)},
-		{name: "explicit true", args: []string{"--dhcp-auto-interface=true"}, want: boolPtr(true)},
-		{name: "explicit false", args: []string{"--dhcp-auto-interface=false"}, want: boolPtr(false)},
-		{name: "repeated same value", args: []string{"--dhcp-auto-interface", "--dhcp-auto-interface=true"}, want: boolPtr(true)},
-		{name: "invalid", args: []string{"--dhcp-auto-interface=yes"}, wantErr: true},
-		{name: "conflicting", args: []string{"--dhcp-auto-interface", "--dhcp-auto-interface=false"}, wantErr: true},
+		{name: "bare", args: []string{"--dhcp-auto-interface"}},
+		{name: "explicit true", args: []string{"--dhcp-auto-interface=true"}},
+		{name: "explicit false", args: []string{"--dhcp-auto-interface=false"}},
+		{name: "repeated same value", args: []string{"--dhcp-auto-interface", "--dhcp-auto-interface=true"}},
+		{name: "invalid", args: []string{"--dhcp-auto-interface=yes"}},
+		{name: "conflicting", args: []string{"--dhcp-auto-interface", "--dhcp-auto-interface=false"}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			deploy := metalmanDeploymentForSiteWithArgs(legacyKubeNamespace, "edge", tt.args...)
-
-			got, err := metalmanDHCPAutoInterface(deploy)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("metalmanDHCPAutoInterface error = %v, wantErr %t", err, tt.wantErr)
-			}
-
-			if tt.wantErr {
-				return
-			}
-
-			if got == nil || tt.want == nil {
-				if got != nil || tt.want != nil {
-					t.Fatalf("metalmanDHCPAutoInterface = %v, want %v", got, tt.want)
-				}
-
-				return
-			}
-
-			if *got != *tt.want {
-				t.Fatalf("metalmanDHCPAutoInterface = %t, want %t", *got, *tt.want)
+			r := newReaper(t, metalmanDeploymentForSiteWithArgs(legacyKubeNamespace, "edge", tt.args...))
+			got, err := r.legacyMetalmanExistsForSite(t.Context(), "edge")
+			if err != nil || !got {
+				t.Fatalf("legacyMetalmanExistsForSite = %t, err=%v; want true", got, err)
 			}
 		})
 	}

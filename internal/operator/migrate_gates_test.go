@@ -377,25 +377,25 @@ func TestLegacyMetalmanDetectionHardening(t *testing.T) {
 		}
 	})
 
-	t.Run("conflicting matching Deployments fail closed", func(t *testing.T) {
+	t.Run("conflicting removed arguments do not block detection", func(t *testing.T) {
 		byName := metalmanDeploymentForSiteWithArgs(legacyKubeNamespace, "edge", "--dhcp-auto-interface")
 		byLabel := metalmanDeploymentForSiteWithArgs(legacyNetNamespace, "edge", "--dhcp-auto-interface=false")
 		byLabel.Name = "older-metalman-name"
 		r := newReaper(t, byName, byLabel)
 
-		if _, _, err := r.legacyMetalmanConfigForSite(t.Context(), "edge"); err == nil {
-			t.Fatal("expected conflicting matching Metalman Deployments to fail closed")
+		if got, err := r.legacyMetalmanExistsForSite(t.Context(), "edge"); err != nil || !got {
+			t.Fatalf("legacyMetalmanExistsForSite = %t, err=%v; want true", got, err)
 		}
 	})
 
-	t.Run("absent and enabled arguments conflict", func(t *testing.T) {
+	t.Run("absent and enabled removed arguments do not conflict", func(t *testing.T) {
 		withoutFlag := metalmanDeploymentForSiteWithArgs(legacyKubeNamespace, "edge", "serve-pxe")
 		withFlag := metalmanDeploymentForSiteWithArgs(legacyNetNamespace, "edge", "--dhcp-auto-interface")
 		withFlag.Name = "older-metalman-name"
 		r := newReaper(t, withoutFlag, withFlag)
 
-		if _, _, err := r.legacyMetalmanConfigForSite(t.Context(), "edge"); err == nil {
-			t.Fatal("expected absent and enabled Metalman arguments to conflict")
+		if got, err := r.legacyMetalmanExistsForSite(t.Context(), "edge"); err != nil || !got {
+			t.Fatalf("legacyMetalmanExistsForSite = %t, err=%v; want true", got, err)
 		}
 	})
 }

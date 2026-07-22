@@ -4,14 +4,39 @@
 package v1alpha3
 
 import (
+	"os"
 	"testing"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/yaml"
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
+
+func TestMetalmanComponentSchemaExposesOnlyEnablement(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile("../../../deploy/machina/crd/unbounded-cloud.io_sites.yaml")
+	if err != nil {
+		t.Fatalf("read Site CRD: %v", err)
+	}
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("parse Site CRD: %v", err)
+	}
+	metalman := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["components"].Properties["metalman"]
+	if _, ok := metalman.Properties["enabled"]; !ok {
+		t.Error("Metalman component schema lacks enabled")
+	}
+	for _, field := range []string{"dhcpAutoInterface", "replicas"} {
+		if _, ok := metalman.Properties[field]; ok {
+			t.Errorf("Metalman component schema still exposes %q", field)
+		}
+	}
+}
 
 func TestSiteResourceAndAddToScheme(t *testing.T) {
 	gr := Resource("sites")
@@ -40,7 +65,6 @@ func TestDeepCopySiteAndList(t *testing.T) {
 	enabled := true
 	priority := int32(10)
 	detectMultiplier := int32(3)
-	replicas := int32(3)
 	receive := intstr.FromString("300ms")
 	transmit := intstr.FromInt(400)
 
@@ -72,8 +96,6 @@ func TestDeepCopySiteAndList(t *testing.T) {
 				},
 				Metalman: &MetalmanComponentSpec{
 					SiteComponentSpec: SiteComponentSpec{Enabled: &enabled},
-					DHCPAutoInterface: &enabled,
-					Replicas:          &replicas,
 				},
 			},
 		},
@@ -98,7 +120,6 @@ func TestDeepCopySiteAndList(t *testing.T) {
 	site.Spec.NodeCidrs[0] = "10.99.0.0/16"
 	site.Spec.PodCidrAssignments[0].CidrBlocks[0] = "10.250.0.0/16"
 	site.Spec.HealthCheckSettings.DetectMultiplier = ptrInt32(9)
-	site.Spec.Components.Metalman.Replicas = ptrInt32(5)
 	site.Status.Conditions[0].Status = metav1.ConditionFalse
 
 	if copied.Spec.NodeCidrs[0] != "10.0.0.0/16" {
@@ -111,10 +132,6 @@ func TestDeepCopySiteAndList(t *testing.T) {
 
 	if copied.Spec.HealthCheckSettings.DetectMultiplier == nil || *copied.Spec.HealthCheckSettings.DetectMultiplier != 3 {
 		t.Fatalf("expected deep-copied health check settings to be isolated")
-	}
-
-	if copied.Spec.Components.Metalman.Replicas == nil || *copied.Spec.Components.Metalman.Replicas != 3 {
-		t.Fatalf("expected deep-copied Metalman replicas to be isolated")
 	}
 
 	if copied.Status.Conditions[0].Status != metav1.ConditionTrue {
