@@ -7,6 +7,7 @@ package metalman
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"sort"
 
@@ -106,8 +107,17 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 
 		return []ctrl.Request{{NamespacedName: client.ObjectKey{Name: endpoint.Spec.SiteRef}}}
 	}))
+	b.Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+		secret, ok := obj.(*corev1.Secret)
+		if !ok {
+			return nil
+		}
+
+		return requestsForTLSSecret(ctx, env.Client, secret)
+	}))
 	b.Owns(&appsv1.Deployment{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
 	b.Owns(&corev1.Service{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
+	b.Owns(&corev1.Secret{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
 	b.Owns(&policyv1.PodDisruptionBudget{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
 }
 
@@ -153,10 +163,11 @@ func serverDeployment(site *unboundedv1alpha3.Site, namespace string, cfg compon
 }
 
 const (
-	metalmanControllerRole = "controller"
-	metalmanServerRole     = "server"
-	metalmanEdgeRole       = "edge"
-	netbootEndpointLabel   = "unbounded-cloud.io/netboot-endpoint"
+	metalmanControllerRole    = "controller"
+	metalmanServerRole        = "server"
+	metalmanEdgeRole          = "edge"
+	netbootEndpointLabel      = "unbounded-cloud.io/netboot-endpoint"
+	edgeTLSChecksumAnnotation = "unbounded-cloud.io/tls-checksum"
 )
 
 func roleDeployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Config, role string, replicas int32) *appsv1.Deployment {
@@ -364,6 +375,7 @@ func reconcileEndpointEdges(ctx context.Context, env *component.Env, site *unbou
 
 	desiredDeployments := map[string]struct{}{}
 	desiredServices := map[string]struct{}{}
+	desiredTLSSecrets := map[string]struct{}{}
 	for i := range endpoints.Items {
 		endpoint := &endpoints.Items[i]
 		if endpoint.Spec.SiteRef != site.Name {
@@ -374,6 +386,19 @@ func reconcileEndpointEdges(ctx context.Context, env *component.Env, site *unbou
 			return fmt.Errorf("build edge for NetbootEndpoint %s: %w", endpoint.Name, err)
 		}
 		if deployment != nil {
+			if endpoint.Spec.TLS.Mode == unboundedv1alpha3.NetbootEndpointTLSSecret {
+				secret, err := mirroredTLSSecret(ctx, env.Client, endpoint, site, env.Namespace)
+				if err != nil {
+					return fmt.Errorf("mirror TLS Secret for NetbootEndpoint %s: %w", endpoint.Name, err)
+				}
+				if err := env.ApplyObject(ctx, secret); err != nil {
+					return err
+				}
+				desiredTLSSecrets[secret.Name] = struct{}{}
+				deployment.Spec.Template.Annotations = map[string]string{
+					edgeTLSChecksumAnnotation: tlsSecretChecksum(secret),
+				}
+			}
 			if err := env.ApplyObject(ctx, deployment); err != nil {
 				return err
 			}
@@ -412,8 +437,94 @@ func reconcileEndpointEdges(ctx context.Context, env *component.Env, site *unbou
 			}
 		}
 	}
+	var tlsSecrets corev1.SecretList
+	if err := env.Client.List(ctx, &tlsSecrets, client.InNamespace(env.Namespace), match); err != nil {
+		return fmt.Errorf("list managed edge TLS Secrets: %w", err)
+	}
+	for i := range tlsSecrets.Items {
+		if _, ok := desiredTLSSecrets[tlsSecrets.Items[i].Name]; !ok {
+			if err := env.DeleteIfExists(ctx, &tlsSecrets.Items[i]); err != nil {
+				return err
+			}
+		}
+	}
 
 	return nil
+}
+
+func tlsSecretChecksum(secret *corev1.Secret) string {
+	digest := sha256.New()
+	_, _ = digest.Write(secret.Data[corev1.TLSCertKey])
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(secret.Data[corev1.TLSPrivateKeyKey])
+
+	return fmt.Sprintf("%x", digest.Sum(nil))
+}
+
+func mirroredTLSSecret(
+	ctx context.Context,
+	kubeClient client.Client,
+	endpoint *unboundedv1alpha3.NetbootEndpoint,
+	site *unboundedv1alpha3.Site,
+	namespace string,
+) (*corev1.Secret, error) {
+	if endpoint.Spec.TLS.SecretRef == nil {
+		return nil, fmt.Errorf("TLS secretRef is required")
+	}
+	ref := endpoint.Spec.TLS.SecretRef
+	source := &corev1.Secret{}
+	if err := kubeClient.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, source); err != nil {
+		return nil, fmt.Errorf("get source Secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+	certificate, certOK := source.Data[corev1.TLSCertKey]
+	privateKey, keyOK := source.Data[corev1.TLSPrivateKeyKey]
+	if !certOK || !keyOK {
+		return nil, fmt.Errorf("source Secret %s/%s must contain %s and %s", ref.Namespace, ref.Name, corev1.TLSCertKey, corev1.TLSPrivateKeyKey)
+	}
+
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            EdgeTLSSecretName(endpoint.Name),
+			Namespace:       namespace,
+			Labels:          endpointEdgeLabels(endpoint, site.Name),
+			OwnerReferences: []metav1.OwnerReference{component.SiteOwnerReference(site)},
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       append([]byte(nil), certificate...),
+			corev1.TLSPrivateKeyKey: append([]byte(nil), privateKey...),
+		},
+	}, nil
+}
+
+func requestsForTLSSecret(ctx context.Context, kubeClient client.Client, secret *corev1.Secret) []ctrl.Request {
+	var endpoints unboundedv1alpha3.NetbootEndpointList
+	if err := kubeClient.List(ctx, &endpoints); err != nil {
+		return nil
+	}
+
+	sites := map[string]struct{}{}
+	for i := range endpoints.Items {
+		ref := endpoints.Items[i].Spec.TLS.SecretRef
+		if endpoints.Items[i].Spec.TLS.Mode == unboundedv1alpha3.NetbootEndpointTLSSecret && ref != nil &&
+			ref.Namespace == secret.Namespace && ref.Name == secret.Name {
+			sites[endpoints.Items[i].Spec.SiteRef] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(sites))
+	for site := range sites {
+		if site != "" {
+			names = append(names, site)
+		}
+	}
+	sort.Strings(names)
+	requests := make([]ctrl.Request, 0, len(names))
+	for _, site := range names {
+		requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKey{Name: site}})
+	}
+
+	return requests
 }
 
 func endpointEdgeObjects(
@@ -506,6 +617,19 @@ func endpointEdgeObjects(
 			}}},
 		}}}}
 	}
+	if endpoint.Spec.TLS.Mode == unboundedv1alpha3.NetbootEndpointTLSSecret {
+		args = append(args,
+			"--tls-cert-file=/var/run/secrets/metalman-tls/tls.crt",
+			"--tls-key-file=/var/run/secrets/metalman-tls/tls.key",
+		)
+		container.Args = args
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name: "tls", MountPath: "/var/run/secrets/metalman-tls", ReadOnly: true,
+		})
+		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
+			Name: "tls", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: EdgeTLSSecretName(endpoint.Name)}},
+		})
+	}
 	podSpec.Containers = []corev1.Container{container}
 
 	deployment := &appsv1.Deployment{
@@ -531,6 +655,11 @@ func endpointEdgeObjects(
 	if serviceType == "" {
 		serviceType = corev1.ServiceTypeClusterIP
 	}
+	servicePort := corev1.ServicePort{Name: "http", Port: 8880, TargetPort: intstr.FromInt32(8880), Protocol: corev1.ProtocolTCP}
+	if endpoint.Spec.TLS.Mode == unboundedv1alpha3.NetbootEndpointTLSSecret {
+		servicePort.Name = "https"
+		servicePort.Port = 443
+	}
 	service := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -542,7 +671,7 @@ func endpointEdgeObjects(
 		Spec: corev1.ServiceSpec{
 			Type:     serviceType,
 			Selector: labels,
-			Ports:    []corev1.ServicePort{{Name: "http", Port: 8880, TargetPort: intstr.FromInt32(8880), Protocol: corev1.ProtocolTCP}},
+			Ports:    []corev1.ServicePort{servicePort},
 		},
 	}
 
@@ -551,6 +680,9 @@ func endpointEdgeObjects(
 
 // EdgeName returns the in-cluster workload name for an endpoint.
 func EdgeName(endpoint string) string { return "metalman-edge-" + endpoint }
+
+// EdgeTLSSecretName returns the mirrored serving-certificate Secret name.
+func EdgeTLSSecretName(endpoint string) string { return EdgeName(endpoint) + "-tls" }
 
 func endpointEdgeLabels(endpoint *unboundedv1alpha3.NetbootEndpoint, site string) map[string]string {
 	return map[string]string{

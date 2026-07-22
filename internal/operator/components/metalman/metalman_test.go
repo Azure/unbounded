@@ -383,6 +383,51 @@ func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
 		}
 	})
 
+	t.Run("Secret TLS mounts the mirrored certificate", func(t *testing.T) {
+		endpoint := &unboundedv1alpha3.NetbootEndpoint{
+			ObjectMeta: metav1.ObjectMeta{Name: "public-https"},
+			Spec: unboundedv1alpha3.NetbootEndpointSpec{
+				SiteRef:     site.Name,
+				Type:        unboundedv1alpha3.NetbootEndpointTypeHTTP,
+				ExternalURL: "https://boot.example.com",
+				TLS: unboundedv1alpha3.NetbootEndpointTLS{
+					Trust: unboundedv1alpha3.NetbootEndpointTrustPublic,
+					Mode:  unboundedv1alpha3.NetbootEndpointTLSSecret,
+					SecretRef: &unboundedv1alpha3.NamespacedSecretReference{
+						Namespace: "certificates",
+						Name:      "boot-example-com",
+					},
+				},
+				HTTP: &unboundedv1alpha3.NetbootHTTPEndpointSpec{},
+			},
+		}
+
+		deployment, service, err := endpointEdgeObjects(endpoint, site, component.DefaultNamespace, cfg)
+		if err != nil {
+			t.Fatalf("endpointEdgeObjects: %v", err)
+		}
+		container := &deployment.Spec.Template.Spec.Containers[0]
+		for _, arg := range []string{
+			"--tls-cert-file=/var/run/secrets/metalman-tls/tls.crt",
+			"--tls-key-file=/var/run/secrets/metalman-tls/tls.key",
+		} {
+			if !containsString(container.Args, arg) {
+				t.Fatalf("Secret TLS args %#v lack %q", container.Args, arg)
+			}
+		}
+		if len(deployment.Spec.Template.Spec.Volumes) != 1 ||
+			deployment.Spec.Template.Spec.Volumes[0].Secret == nil ||
+			deployment.Spec.Template.Spec.Volumes[0].Secret.SecretName != EdgeTLSSecretName(endpoint.Name) {
+			t.Fatalf("Secret TLS volumes = %#v", deployment.Spec.Template.Spec.Volumes)
+		}
+		if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].MountPath != "/var/run/secrets/metalman-tls" || !container.VolumeMounts[0].ReadOnly {
+			t.Fatalf("Secret TLS mounts = %#v", container.VolumeMounts)
+		}
+		if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Name != "https" || service.Spec.Ports[0].Port != 443 {
+			t.Fatalf("Secret TLS Service ports = %#v", service.Spec.Ports)
+		}
+	})
+
 	t.Run("external L2 has no in-cluster workload", func(t *testing.T) {
 		endpoint := &unboundedv1alpha3.NetbootEndpoint{
 			ObjectMeta: metav1.ObjectMeta{Name: "admin-laptop"},
@@ -400,6 +445,111 @@ func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
 			t.Fatalf("external L2 objects = deployment %v, service %v", deployment, service)
 		}
 	})
+}
+
+func TestReconcileEndpointEdgesMirrorsRotatesAndRemovesTLSSecret(t *testing.T) {
+	scheme := testScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+	source := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "boot-example-com", Namespace: "certificates"},
+		Type:       corev1.SecretTypeTLS,
+		Data:       map[string][]byte{corev1.TLSCertKey: []byte("certificate-v1"), corev1.TLSPrivateKeyKey: []byte("private-key-v1")},
+	}
+	endpoint := &unboundedv1alpha3.NetbootEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "public-https"},
+		Spec: unboundedv1alpha3.NetbootEndpointSpec{
+			SiteRef:     site.Name,
+			Type:        unboundedv1alpha3.NetbootEndpointTypeHTTP,
+			ExternalURL: "https://boot.example.com",
+			TLS: unboundedv1alpha3.NetbootEndpointTLS{
+				Trust:     unboundedv1alpha3.NetbootEndpointTrustPublic,
+				Mode:      unboundedv1alpha3.NetbootEndpointTLSSecret,
+				SecretRef: &unboundedv1alpha3.NamespacedSecretReference{Namespace: source.Namespace, Name: source.Name},
+			},
+			HTTP: &unboundedv1alpha3.NetbootHTTPEndpointSpec{},
+		},
+	}
+	env := &component.Env{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(source, endpoint).Build(),
+		Scheme: scheme, Namespace: component.DefaultNamespace,
+		Config: component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"},
+	}
+
+	assertMirror := func(wantCert string) string {
+		t.Helper()
+
+		if err := reconcileEndpointEdges(t.Context(), env, site); err != nil {
+			t.Fatalf("reconcileEndpointEdges: %v", err)
+		}
+		mirror := &corev1.Secret{}
+		key := client.ObjectKey{Namespace: component.DefaultNamespace, Name: EdgeTLSSecretName(endpoint.Name)}
+		if err := env.Client.Get(t.Context(), key, mirror); err != nil {
+			t.Fatalf("get mirrored TLS Secret: %v", err)
+		}
+		if got := string(mirror.Data[corev1.TLSCertKey]); got != wantCert {
+			t.Fatalf("mirrored certificate = %q, want %q", got, wantCert)
+		}
+		if got := string(mirror.Data[corev1.TLSPrivateKeyKey]); got != "private-key-v1" {
+			t.Fatalf("mirrored private key = %q", got)
+		}
+		deployment := &appsv1.Deployment{}
+		if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: EdgeName(endpoint.Name)}, deployment); err != nil {
+			t.Fatalf("get TLS edge Deployment: %v", err)
+		}
+		checksum := deployment.Spec.Template.Annotations[edgeTLSChecksumAnnotation]
+		if checksum == "" {
+			t.Fatal("TLS edge pod template lacks certificate checksum")
+		}
+
+		return checksum
+	}
+
+	firstChecksum := assertMirror("certificate-v1")
+	source.Data[corev1.TLSCertKey] = []byte("certificate-v2")
+	if err := env.Client.Update(t.Context(), source); err != nil {
+		t.Fatalf("update source TLS Secret: %v", err)
+	}
+	if secondChecksum := assertMirror("certificate-v2"); secondChecksum == firstChecksum {
+		t.Fatalf("TLS edge checksum did not change after certificate rotation: %q", secondChecksum)
+	}
+
+	endpoint.Spec.TLS = unboundedv1alpha3.NetbootEndpointTLS{
+		Trust: unboundedv1alpha3.NetbootEndpointTrustPublic,
+		Mode:  unboundedv1alpha3.NetbootEndpointTLSExternal,
+	}
+	if err := env.Client.Update(t.Context(), endpoint); err != nil {
+		t.Fatalf("update endpoint TLS mode: %v", err)
+	}
+	if err := reconcileEndpointEdges(t.Context(), env, site); err != nil {
+		t.Fatalf("reconcile external TLS endpoint: %v", err)
+	}
+	err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: EdgeTLSSecretName(endpoint.Name)}, &corev1.Secret{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("mirrored TLS Secret still exists: %v", err)
+	}
+}
+
+func TestTLSSecretChangeEnqueuesReferencingSite(t *testing.T) {
+	scheme := testScheme(t)
+	endpoint := &unboundedv1alpha3.NetbootEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "public-https"},
+		Spec: unboundedv1alpha3.NetbootEndpointSpec{
+			SiteRef: "rack-a",
+			TLS: unboundedv1alpha3.NetbootEndpointTLS{
+				Mode:      unboundedv1alpha3.NetbootEndpointTLSSecret,
+				SecretRef: &unboundedv1alpha3.NamespacedSecretReference{Namespace: "certificates", Name: "boot-example-com"},
+			},
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(endpoint).Build()
+
+	requests := requestsForTLSSecret(t.Context(), kubeClient, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "certificates",
+		Name:      "boot-example-com",
+	}})
+	if len(requests) != 1 || requests[0].Name != "rack-a" {
+		t.Fatalf("requests = %#v, want rack-a", requests)
+	}
 }
 
 func TestReconcileEndpointEdgesDeletesStaleManagedWorkloads(t *testing.T) {
