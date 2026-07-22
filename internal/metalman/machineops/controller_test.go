@@ -461,6 +461,88 @@ func TestReconcilerUsesSessionCapabilityURLForHTTPBoot(t *testing.T) {
 	require.Contains(t, power.calls, "machine-session-http:SetHTTPBootOverride:https://boot.example.com/v1/netboot/sessions/netboot-session/capability/artifacts/bootx64.efi")
 }
 
+func TestConfigureRepaveBootSupportsIndependentBootAxes(t *testing.T) {
+	t.Parallel()
+
+	const bootURL = "https://boot.example.com/v1/netboot/sessions/session/capability/artifacts/bootx64.efi"
+	tests := []struct {
+		name                string
+		transport           v1alpha3.NetbootTransport
+		configurationSource v1alpha3.NetbootConfigurationSource
+		networkMode         v1alpha3.NetbootNetworkMode
+		wantCalls           []string
+		wantURLResolution   bool
+	}{
+		{
+			name:                "TFTP configured by DHCP",
+			transport:           v1alpha3.NetbootTransportTFTP,
+			configurationSource: v1alpha3.NetbootConfigurationSourceDHCP,
+			networkMode:         v1alpha3.NetbootNetworkModeDHCP,
+			wantCalls:           []string{"machine:SetBootOverride:Pxe:Continuous"},
+		},
+		{
+			name:                "HTTP configured by DHCP",
+			transport:           v1alpha3.NetbootTransportHTTP,
+			configurationSource: v1alpha3.NetbootConfigurationSourceDHCP,
+			networkMode:         v1alpha3.NetbootNetworkModeDHCP,
+			wantCalls:           []string{"machine:SetBootOverride:UefiHttp:Once"},
+		},
+		{
+			name:                "HTTP URL configured by Redfish with DHCP networking",
+			transport:           v1alpha3.NetbootTransportHTTP,
+			configurationSource: v1alpha3.NetbootConfigurationSourceRedfish,
+			networkMode:         v1alpha3.NetbootNetworkModeDHCP,
+			wantURLResolution:   true,
+			wantCalls: []string{
+				"machine:GetBootConfig",
+				"machine:SetHTTPBootOverride:" + bootURL,
+				"machine:SetBIOSHTTPBootURI:" + bootURL,
+			},
+		},
+		{
+			name:                "HTTP URL and static network configured by Redfish",
+			transport:           v1alpha3.NetbootTransportHTTP,
+			configurationSource: v1alpha3.NetbootConfigurationSourceRedfish,
+			networkMode:         v1alpha3.NetbootNetworkModeStatic,
+			wantURLResolution:   true,
+			wantCalls: []string{
+				"machine:GetBootConfig",
+				"machine:SetStaticIPv4:aa:bb:cc:dd:ee:01:10.0.0.20:255.255.255.0:10.0.0.1:10.0.0.53",
+				"machine:SetHTTPBootOverride:" + bootURL,
+				"machine:SetBIOSStaticIPv4:10.0.0.20:255.255.255.0:10.0.0.1",
+				"machine:SetBIOSHTTPBootURI:" + bootURL,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			power := &recordingPowerClient{}
+			client, err := power.ForMachine(t.Context(), &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine"}})
+			require.NoError(t, err)
+			resolved := false
+			reconciler := &Reconciler{SessionHTTPBootURL: func(*v1alpha3.NetbootSession) (string, error) {
+				resolved = true
+
+				return bootURL, nil
+			}}
+			session := &v1alpha3.NetbootSession{Spec: v1alpha3.NetbootSessionSpec{Boot: v1alpha3.NetbootSessionBoot{
+				Transport:           tt.transport,
+				ConfigurationSource: tt.configurationSource,
+				NetworkMode:         tt.networkMode,
+				DHCPLeases:          []v1alpha3.DHCPLease{httpBootLease()},
+			}}}
+
+			err = reconciler.configureRepaveBoot(t.Context(), client, testBareMetalMachine("machine", "rack-a"), session)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantURLResolution, resolved)
+			require.Equal(t, tt.wantCalls, power.calls)
+		})
+	}
+}
+
 func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {
 	t.Parallel()
 
@@ -553,6 +635,8 @@ func TestReconcilerFallsBackToBIOSHTTPBootURIForHostReplace(t *testing.T) {
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
+	machine.Spec.PXE.ConfigurationSource = v1alpha3.NetbootConfigurationSourceRedfish
+	machine.Spec.PXE.NetworkMode = v1alpha3.NetbootNetworkModeStatic
 	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
@@ -594,6 +678,8 @@ func TestReconcilerUsesBIOSHTTPBootURIWhenStandardURIAbsent(t *testing.T) {
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
+	machine.Spec.PXE.ConfigurationSource = v1alpha3.NetbootConfigurationSourceRedfish
+	machine.Spec.PXE.NetworkMode = v1alpha3.NetbootNetworkModeStatic
 	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-bios", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
@@ -635,6 +721,8 @@ func TestReconcilerFallsBackToBIOSWhenStaticInterfaceIsReadOnly(t *testing.T) {
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
+	machine.Spec.PXE.ConfigurationSource = v1alpha3.NetbootConfigurationSourceRedfish
+	machine.Spec.PXE.NetworkMode = v1alpha3.NetbootNetworkModeStatic
 	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-read-only-nic", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
@@ -681,7 +769,7 @@ func TestSetHTTPBootOverrideRefreshesStandardAndBIOSURLs(t *testing.T) {
 		DNS:        []string{"10.0.0.53"},
 	}
 
-	require.NoError(t, setHTTPBootOverride(t.Context(), client, "http://10.0.0.10:8880/http/shimx64.efi", staticConfig))
+	require.NoError(t, setHTTPBootOverride(t.Context(), client, "http://10.0.0.10:8880/http/shimx64.efi", staticConfig, true))
 	require.Equal(t, []string{
 		"machine-1:GetBootConfig",
 		"machine-1:SetStaticIPv4:aa:bb:cc:dd:ee:01:10.0.0.20:255.255.255.0:10.0.0.1:10.0.0.53",
@@ -697,12 +785,10 @@ func TestSetHTTPBootOverrideAllowsUnsupportedBIOSURL(t *testing.T) {
 	power := &recordingPowerClient{biosHTTPBootUnsupported: map[string]bool{"machine-1": true}}
 	client := &recordingMachinePowerClient{parent: power, machine: "machine-1"}
 
-	require.NoError(t, setHTTPBootOverride(t.Context(), client, "http://10.0.0.10:8880/http/shimx64.efi", redfish.StaticIPv4Config{}))
+	require.NoError(t, setHTTPBootOverride(t.Context(), client, "http://10.0.0.10:8880/http/shimx64.efi", redfish.StaticIPv4Config{}, false))
 	require.Equal(t, []string{
 		"machine-1:GetBootConfig",
-		"machine-1:SetStaticIPv4:::::",
 		"machine-1:SetHTTPBootOverride:http://10.0.0.10:8880/http/shimx64.efi",
-		"machine-1:SetBIOSStaticIPv4:::",
 		"machine-1:SetBIOSHTTPBootURI:http://10.0.0.10:8880/http/shimx64.efi",
 	}, power.calls)
 }
@@ -713,6 +799,8 @@ func TestReconcilerRetriesHTTPHostReplaceWithoutStaticLease(t *testing.T) {
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
+	machine.Spec.PXE.ConfigurationSource = v1alpha3.NetbootConfigurationSourceRedfish
+	machine.Spec.PXE.NetworkMode = v1alpha3.NetbootNetworkModeStatic
 	op := testOperation("op-replace-http-no-lease", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -746,6 +834,8 @@ func TestReconcilerWaitsForHTTPBootImage(t *testing.T) {
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
 	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
+	machine.Spec.PXE.ConfigurationSource = v1alpha3.NetbootConfigurationSourceRedfish
+	machine.Spec.PXE.NetworkMode = v1alpha3.NetbootNetworkModeStatic
 	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-wait-image", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name

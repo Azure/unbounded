@@ -637,17 +637,26 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 }
 
 func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, machine *v1alpha3.Machine, session *v1alpha3.NetbootSession) error {
-	transport := machine.Spec.Netboot().TargetTransport()
+	netbootSpec := machine.Spec.Netboot()
+	transport := netbootSpec.TargetTransport()
+	configurationSource := targetConfigurationSource(netbootSpec)
+	networkMode := targetNetworkMode(netbootSpec)
 	if session != nil {
 		transport = session.Spec.Boot.Transport
+		configurationSource = session.Spec.Boot.ConfigurationSource
+		networkMode = session.Spec.Boot.NetworkMode
 	}
 	if transport == v1alpha3.NetbootTransportHTTP {
+		if configurationSource == v1alpha3.NetbootConfigurationSourceDHCP {
+			return pc.SetBootOverride(ctx, redfish.BootTargetUefiHTTP, redfish.BootOnce)
+		}
+
 		bootURL, staticConfig, err := r.httpBootConfig(machine, session)
 		if err != nil {
 			return err
 		}
 
-		if err := setHTTPBootOverride(ctx, pc, bootURL, staticConfig); err != nil {
+		if err := setHTTPBootOverride(ctx, pc, bootURL, staticConfig, networkMode == v1alpha3.NetbootNetworkModeStatic); err != nil {
 			return err
 		}
 	} else if err := pc.SetBootOverride(ctx, redfish.BootTargetPxe, redfish.BootContinuous); err != nil {
@@ -677,9 +686,12 @@ func (r *Reconciler) httpBootConfig(machine *v1alpha3.Machine, session *v1alpha3
 		return "", redfish.StaticIPv4Config{}, err
 	}
 
-	staticConfig, err := httpBootStaticNetworkConfig(machine, session)
-	if err != nil {
-		return "", redfish.StaticIPv4Config{}, err
+	staticConfig := redfish.StaticIPv4Config{}
+	if session == nil || session.Spec.Boot.NetworkMode == v1alpha3.NetbootNetworkModeStatic {
+		staticConfig, err = httpBootStaticNetworkConfig(machine, session)
+		if err != nil {
+			return "", redfish.StaticIPv4Config{}, err
+		}
 	}
 
 	return bootURL, staticConfig, nil
@@ -716,22 +728,24 @@ func httpBootStaticNetworkConfig(machine *v1alpha3.Machine, session *v1alpha3.Ne
 	return config, nil
 }
 
-func setHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string, staticConfig redfish.StaticIPv4Config) error {
+func setHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string, staticConfig redfish.StaticIPv4Config, configureStaticNetwork bool) error {
 	config, err := pc.GetBootConfig(ctx)
 	if err != nil {
 		return err
 	}
 
 	if !config.HasHTTPBootURI {
-		return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig)
+		return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig, configureStaticNetwork)
 	}
 
-	if err := pc.SetStaticIPv4(ctx, staticConfig); err != nil {
-		if !errors.Is(err, redfish.ErrUnsupported) {
-			return err
-		}
+	if configureStaticNetwork {
+		if err := pc.SetStaticIPv4(ctx, staticConfig); err != nil {
+			if !errors.Is(err, redfish.ErrUnsupported) {
+				return err
+			}
 
-		return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig)
+			return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig, true)
+		}
 	}
 
 	if err := pc.SetHTTPBootOverride(ctx, bootURL); err != nil {
@@ -739,12 +753,14 @@ func setHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string, st
 			return err
 		}
 
-		return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig)
+		return setBIOSHTTPBootOverride(ctx, pc, bootURL, staticConfig, configureStaticNetwork)
 	}
 
 	// Some BMCs expose both locations but boot from the vendor BIOS setting.
-	if err := pc.SetBIOSStaticIPv4(ctx, staticConfig); err != nil && !errors.Is(err, redfish.ErrUnsupported) {
-		return err
+	if configureStaticNetwork {
+		if err := pc.SetBIOSStaticIPv4(ctx, staticConfig); err != nil && !errors.Is(err, redfish.ErrUnsupported) {
+			return err
+		}
 	}
 
 	if err := pc.SetBIOSHTTPBootURI(ctx, bootURL); err != nil && !errors.Is(err, redfish.ErrUnsupported) {
@@ -754,9 +770,11 @@ func setHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string, st
 	return nil
 }
 
-func setBIOSHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string, staticConfig redfish.StaticIPv4Config) error {
-	if err := pc.SetBIOSStaticIPv4(ctx, staticConfig); err != nil {
-		return err
+func setBIOSHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string, staticConfig redfish.StaticIPv4Config, configureStaticNetwork bool) error {
+	if configureStaticNetwork {
+		if err := pc.SetBIOSStaticIPv4(ctx, staticConfig); err != nil {
+			return err
+		}
 	}
 
 	if err := pc.SetBIOSHTTPBootURI(ctx, bootURL); err != nil {
