@@ -34,7 +34,16 @@ spec:
         # Canonical JSON matches the `kubectl unbounded install` hash.
         unbounded-cloud.io/operator-config-hash: {{ dict "UNBOUNDED_API_SERVER_ENDPOINT" (default "" .APIServerEndpoint) "UNBOUNDED_IMAGE_REGISTRY" (default "ghcr.io" .ImageRegistry) "UNBOUNDED_REAP_LEGACY_RESOURCES" (default "true" .ReapLegacyResources) | toJson | sha256sum | quote }}
     spec:
+      # The operator installs the cluster CNI, so it must be able to reach the
+      # API server before pod networking or cluster DNS is available. Default
+      # DNS uses the node resolver for the AKS API FQDN annotation above.
+      hostNetwork: true
+      dnsPolicy: Default
       serviceAccountName: unbounded-operator
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: controller
           image: {{ .OperatorImage }}
