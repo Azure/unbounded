@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -25,7 +26,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, policyv1.AddToScheme, unboundedv1alpha3.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add to scheme: %v", err)
 		}
@@ -237,6 +238,14 @@ func TestControllerAndServerWorkloadsAreSeparated(t *testing.T) {
 	if !hasContainerPort(serverContainer.Ports, "http", 8880) {
 		t.Fatalf("server ports = %#v, want HTTP 8880", serverContainer.Ports)
 	}
+	assertWorkloadHealthAndResources(t, &serverContainer)
+	if len(server.Spec.Template.Spec.TopologySpreadConstraints) != 1 {
+		t.Fatalf("server topology spread constraints = %#v", server.Spec.Template.Spec.TopologySpreadConstraints)
+	}
+	spread := server.Spec.Template.Spec.TopologySpreadConstraints[0]
+	if spread.TopologyKey != corev1.LabelHostname || spread.MaxSkew != 1 || spread.WhenUnsatisfiable != corev1.ScheduleAnyway {
+		t.Fatalf("server topology spread = %#v", spread)
+	}
 	if got := server.Spec.Strategy.RollingUpdate; got == nil || got.MaxUnavailable == nil || got.MaxUnavailable.IntValue() != 0 {
 		t.Fatalf("server maxUnavailable = %#v, want 0", got)
 	}
@@ -250,6 +259,14 @@ func TestControllerAndServerWorkloadsAreSeparated(t *testing.T) {
 	}
 	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 8880 || service.Spec.Ports[0].TargetPort.IntValue() != 8880 {
 		t.Fatalf("service ports = %#v", service.Spec.Ports)
+	}
+
+	pdb := serverPodDisruptionBudget(site, component.DefaultNamespace)
+	if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntValue() != 1 {
+		t.Fatalf("PDB minAvailable = %#v, want 1", pdb.Spec.MinAvailable)
+	}
+	if pdb.Spec.Selector == nil || pdb.Spec.Selector.MatchLabels["app.kubernetes.io/name"] != "metalman-server" {
+		t.Fatalf("PDB selector = %#v", pdb.Spec.Selector)
 	}
 }
 
@@ -383,6 +400,23 @@ func assertCapabilityKeyMount(t *testing.T, podSpec *corev1.PodSpec, container *
 	}
 
 	t.Fatalf("missing read-only capability key mount: mounts=%#v volumes=%#v", container.VolumeMounts, podSpec.Volumes)
+}
+
+func assertWorkloadHealthAndResources(t *testing.T, container *corev1.Container) {
+	t.Helper()
+
+	for name, probe := range map[string]*corev1.Probe{"liveness": container.LivenessProbe, "readiness": container.ReadinessProbe} {
+		if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Port.IntValue() != 8081 {
+			t.Fatalf("%s probe = %#v, want HTTP probe on 8081", name, probe)
+		}
+	}
+	if container.LivenessProbe.HTTPGet.Path != "/healthz" || container.ReadinessProbe.HTTPGet.Path != "/readyz" {
+		t.Fatalf("probe paths = %q, %q", container.LivenessProbe.HTTPGet.Path, container.ReadinessProbe.HTTPGet.Path)
+	}
+	if container.Resources.Requests.Cpu().IsZero() || container.Resources.Requests.Memory().IsZero() ||
+		container.Resources.Limits.Cpu().IsZero() || container.Resources.Limits.Memory().IsZero() {
+		t.Fatalf("resources are incomplete: %#v", container.Resources)
+	}
 }
 
 func assertSiteOwnerRef(t *testing.T, refs []metav1.OwnerReference, siteName, uid string) {

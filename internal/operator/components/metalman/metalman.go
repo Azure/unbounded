@@ -11,7 +11,9 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -57,6 +59,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboun
 		controllerDeployment(site, env.Namespace, env.Config),
 		serverDeployment(site, env.Namespace, env.Config),
 		serverService(site, env.Namespace),
+		serverPodDisruptionBudget(site, env.Namespace),
 	} {
 		if err := env.ApplyObject(ctx, obj); err != nil {
 			return component.Failed(err)
@@ -75,6 +78,7 @@ func (Component) Cleanup(ctx context.Context, env *component.Env, site *unbounde
 		&appsv1.Deployment{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}, ObjectMeta: metav1.ObjectMeta{Name: ServerName(site.Name), Namespace: env.Namespace}},
 		&corev1.Service{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"}, ObjectMeta: metav1.ObjectMeta{Name: ServerName(site.Name), Namespace: env.Namespace}},
 		&corev1.Secret{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}, ObjectMeta: metav1.ObjectMeta{Name: CapabilitySecretName(site.Name), Namespace: env.Namespace}},
+		&policyv1.PodDisruptionBudget{TypeMeta: metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"}, ObjectMeta: metav1.ObjectMeta{Name: ServerName(site.Name), Namespace: env.Namespace}},
 	} {
 		if err := env.DeleteIfExists(ctx, obj); err != nil {
 			return err
@@ -90,6 +94,7 @@ func (Component) Cleanup(ctx context.Context, env *component.Env, site *unbounde
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Owns(&appsv1.Deployment{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
 	b.Owns(&corev1.Service{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
+	b.Owns(&policyv1.PodDisruptionBudget{}, builder.WithPredicates(env.OwnedWorkloadPredicate()))
 }
 
 // DeploymentName is the per-site metalman Deployment name.
@@ -182,6 +187,12 @@ func roleDeployment(site *unboundedv1alpha3.Site, namespace string, cfg componen
 		serviceAccountName = "metalman-server"
 		ports = append(ports, corev1.ContainerPort{Name: "http", ContainerPort: 8880, Protocol: corev1.ProtocolTCP})
 	}
+	probe := func(path string) *corev1.Probe {
+		return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path: path,
+			Port: intstr.FromInt32(8081),
+		}}}
+	}
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -212,6 +223,18 @@ func roleDeployment(site *unboundedv1alpha3.Site, namespace string, cfg componen
 						Args:            args,
 						Env:             env,
 						Ports:           ports,
+						LivenessProbe:   probe("/healthz"),
+						ReadinessProbe:  probe("/readyz"),
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("100m"),
+								corev1.ResourceMemory: resource.MustParse("128Mi"),
+							},
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("2"),
+								corev1.ResourceMemory: resource.MustParse("2Gi"),
+							},
+						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "tmp", MountPath: "/tmp"},
 							{Name: "cache", MountPath: "/var/cache/metalman"},
@@ -225,6 +248,12 @@ func roleDeployment(site *unboundedv1alpha3.Site, namespace string, cfg componen
 							SecretName: CapabilitySecretName(site.Name),
 						}}},
 					},
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+						MaxSkew:           1,
+						TopologyKey:       corev1.LabelHostname,
+						WhenUnsatisfiable: corev1.ScheduleAnyway,
+						LabelSelector:     &metav1.LabelSelector{MatchLabels: labels},
+					}},
 				},
 			},
 		},
@@ -262,12 +291,7 @@ func ensureCapabilitySecret(ctx context.Context, env *component.Env, site *unbou
 }
 
 func serverService(site *unboundedv1alpha3.Site, namespace string) *corev1.Service {
-	labels := map[string]string{
-		"app":                                 "unbounded-metalman",
-		"app.kubernetes.io/name":              "metalman-server",
-		"app.kubernetes.io/component":         metalmanServerRole,
-		unboundedv1alpha3.MachineSiteLabelKey: site.Name,
-	}
+	labels := serverLabels(site.Name)
 
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
@@ -286,5 +310,31 @@ func serverService(site *unboundedv1alpha3.Site, namespace string) *corev1.Servi
 				Protocol:   corev1.ProtocolTCP,
 			}},
 		},
+	}
+}
+
+func serverPodDisruptionBudget(site *unboundedv1alpha3.Site, namespace string) *policyv1.PodDisruptionBudget {
+	minAvailable := intstr.FromInt32(1)
+
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta: metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            ServerName(site.Name),
+			Namespace:       namespace,
+			OwnerReferences: []metav1.OwnerReference{component.SiteOwnerReference(site)},
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &minAvailable,
+			Selector:     &metav1.LabelSelector{MatchLabels: serverLabels(site.Name)},
+		},
+	}
+}
+
+func serverLabels(site string) map[string]string {
+	return map[string]string{
+		"app":                                 "unbounded-metalman",
+		"app.kubernetes.io/name":              "metalman-server",
+		"app.kubernetes.io/component":         metalmanServerRole,
+		unboundedv1alpha3.MachineSiteLabelKey: site,
 	}
 }
