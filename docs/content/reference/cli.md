@@ -149,6 +149,50 @@ kubectl unbounded site init \
 
 ---
 
+### `kubectl unbounded site bootstrap-netboot`
+
+Run a temporary netboot edge on the administrator machine until one designated
+Site Node becomes Ready. The command leaves controllers in the cluster, enables
+the Site Metalman component, waits for the controller and server rollouts,
+creates an ephemeral ExternalL2 endpoint, and connects the local edge to a
+server pod through a reconnecting port-forward.
+
+```bash
+kubectl unbounded site bootstrap-netboot rack-a \
+  --machine server-01 \
+  --interface eno1 \
+  --address 10.20.0.2
+```
+
+Required flags:
+
+| Flag | Description |
+|------|-------------|
+| `--machine` | Machine whose corresponding Node readiness completes bootstrap |
+| `--interface` | Administrator-machine interface attached to the provisioning L2 |
+| `--address` | IPv4 address on that interface, advertised to netboot clients |
+
+Optional flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--endpoint-name` | `bootstrap-<machine>` | Ephemeral NetbootEndpoint name |
+| `--http-port` | `8880` | Local HTTP artifact port |
+| `--namespace` | `unbounded-system` | Namespace containing Metalman workloads |
+| `--metalman-binary` | `metalman` on PATH | Edge binary to execute |
+| `--timeout` | `30m` | Maximum wait for the designated Node |
+| `--routed-cidr` | none | CIDR routed through an ephemeral external gateway; repeatable |
+| `--gateway-external-address` | `--address` | WireGuard endpoint address reachable by remote peers |
+| `--kubeconfig` | standard lookup | Path to kubeconfig |
+
+The command restores the Machine's previous endpoint and deletes its ephemeral
+resources during cleanup. It intentionally stops after the one designated Node
+is Ready. Using `--routed-cidr` starts the unbounded-net dataplane and requires
+root networking privileges. The gateway provides L3 routing, not DHCP broadcast
+extension.
+
+---
+
 ### `kubectl unbounded machine`
 
 Manage Unbounded machines.

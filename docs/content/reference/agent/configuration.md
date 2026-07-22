@@ -51,4 +51,4 @@ for command usage, exit behavior, and the current check list.
 | `Kubelet.Labels` | Key-value labels applied to the Node on registration. |
 | `Kubelet.RegisterWithTaints` | Taints applied to the Node on registration (`key=value:effect`). |
 | `OCIImage` | *(optional)* OCI image reference for the rootfs. Uses the built-in default image when empty. |
-| `Attest.URL` | *(optional)* Base URL of a metalman serve-pxe instance for TPM attestation. |
+| `Attest.URL` | *(optional)* Capability-scoped Metalman session URL for TPM attestation. |

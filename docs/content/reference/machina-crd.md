@@ -56,7 +56,10 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
 | `host.netboot.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
 | `host.netboot.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
-| `host.netboot.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
+| `host.netboot.transport` | string | No | `TFTP` | Firmware artifact transport. Allowed values: `TFTP`, `HTTP`. |
+| `host.netboot.configurationSource` | string | No | `DHCP` | Source of the firmware boot target. Allowed values: `DHCP`, `Redfish`. |
+| `host.netboot.networkMode` | string | No | `DHCP` | Firmware provisioning network mode. Allowed values: `DHCP`, `Static`. Static requires Redfish. |
+| `host.netboot.endpointRef` | string | Yes | - | Name of the `NetbootEndpoint` serving this Machine. |
 | `host.netboot.dhcpLeases` | []DHCPLease | No | - | Provisioning network settings. They are served as static DHCP leases during PXE boot and used for Redfish firmware, installer, NoCloud, and installed-system static configuration during HTTP boot. |
 | `host.netboot.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
 | `host.netboot.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
@@ -170,6 +173,55 @@ spec:
       name: remote-oci-auth
 ```
 
+## NetbootEndpoint
+
+Cluster-scoped `NetbootEndpoint` resources declare stable client-facing
+netboot addresses. A Machine references one by name through
+`spec.host.netboot.endpointRef`.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `spec.siteRef` | string | Yes | Site whose Machines may use the endpoint. |
+| `spec.type` | string | Yes | `ManagedL2`, `ExternalL2`, or `HTTP`. |
+| `spec.externalURL` | string | Yes | Stable HTTP(S) base URL snapshotted into each session. |
+| `spec.tls.trust` | string | Yes | `TrustedLAN` or `Public`. Public endpoints require HTTPS. |
+| `spec.tls.mode` | string | Yes | `Disabled`, `Secret`, or `External`. |
+| `spec.tls.secretRef` | Secret reference | For Secret mode | Namespaced TLS Secret copied to the managed edge. |
+| `spec.managedL2.nodeSelector` | LabelSelector | For ManagedL2 | Selects nodes attached to the provisioning network. |
+| `spec.managedL2.interface` | string | For ManagedL2 | Host interface used for DHCP and TFTP. |
+| `spec.managedL2.address` | string | For ManagedL2 | Stable edge address on the provisioning network. |
+| `spec.http.serviceType` | string | For HTTP | `ClusterIP`, `NodePort`, or `LoadBalancer`; defaults to `ClusterIP`. |
+
+`ManagedL2` creates a host-network edge. `HTTP` creates replicated HTTP edge
+pods and a Service. `ExternalL2` creates no in-cluster workload; an external
+process claims it through status.
+
+Status records the processed generation, current external claimant and renewal
+time, and conditions. A session becomes Ready only after endpoint
+`status.observedGeneration` matches its generation and `Ready=True`.
+
+## NetbootSession
+
+Cluster-scoped `NetbootSession` is the immutable provisioning contract for one
+MachineOperation target. Metalman creates it automatically; users should not
+edit or reuse sessions.
+
+| Field | Description |
+|-------|-------------|
+| `spec.machine` | Exact Machine name, UID, and generation. |
+| `spec.operation` | Exact MachineOperation name, UID, and generation. |
+| `spec.endpoint` | Endpoint name, UID, and external URL snapshot. |
+| `spec.boot` | Transport, configuration source, network mode, firmware artifact, architecture, leases, and target disk. |
+| `spec.provisioning` | Cluster, Kubernetes, agent, provider-label, and resolved cloud-init inputs used for rendering. |
+| `spec.artifacts` | Machine/netboot OCI references pinned to SHA-256 digests and the allowed public file names. |
+| `spec.expiresAt` | Last time authenticated session requests are accepted. |
+
+Session spec is immutable through CRD validation. Status contains the
+preparation phase, signing-key identifier, endpoint readiness, and exact-target
+milestones such as `BootLoaderDownloaded`, `BootImageWritten`,
+`CloudInitDone`, and `Attested`. The bearer capability itself is never stored
+in Kubernetes.
+
 ## MachineOperation
 
 | Property | Value |
@@ -193,8 +245,8 @@ spec:
 | `status.message` | string | No | Human-readable status message. |
 | `status.startedAt` | time | No | Operation start timestamp. |
 | `status.completedAt` | time | No | Terminal phase timestamp. |
-| `status.targets` | []TargetStatus | No | Per-Machine target status snapshot used by host operation controllers. |
-| `status.conditions` | []Condition | No | Operation conditions. `Completed` tracks terminal state. `BootLoaderDownloaded=True` is latched by metalman when a target first downloads the initial PXE boot loader, usually over TFTP. `BootImageWritten` starts as `Unknown` for metalman `HostReplace`, transitions to `False` when the PXE installer requests `disk.img.gz`, and transitions to `True` when the existing `/pxe/disable` completion signal is received. `CloudInitDone` starts as `Unknown`, transitions to `False` when first-boot cloud-init starts, and transitions to `True` on final cloud-init success or `False` with reason `Failed` and a summarized error when cloud-init reports a failure. |
+| `status.targets` | []TargetStatus | No | Per-Machine target status, immutable input, session reference, attempts, and target-scoped conditions. Metalman records `BootLoaderDownloaded`, `BootImageWritten`, and `CloudInitDone` on the exact target. |
+| `status.conditions` | []Condition | No | Operation-wide conditions such as terminal `Completed`. Provisioning milestones are target-scoped. |
 
 `AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL must point to an `unbounded-agent` release tarball; the agent stages it as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
 
@@ -456,7 +508,7 @@ Both images are standard OCI container images built `FROM scratch` with artifact
 under `/disk/`. This follows the kubevirt containerDisk convention.
 
 Files with a `.tmpl` suffix in the netboot image are Go templates rendered
-per-machine at serve time; other files are served verbatim. A `metadata.yaml`
+from the immutable NetbootSession snapshot; other files are served verbatim. A `metadata.yaml`
 file in the netboot image provides image-level configuration such as
 `dhcpBootImageName` and `httpBootPath`.
 
@@ -470,10 +522,11 @@ Templates receive the following data object:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `.Machine` | *Machine | The Machine CR that initiated the request. |
-| `.BootLease` | *DHCPLease | The DHCP lease matching the request source IP, or the first lease when no match is available. Netboot templates use this to pass the provisioning NIC MAC, static IP, gateway, and DNS to the installer and NoCloud network configuration. |
+| `.Machine` | *Machine | A synthetic Machine built from the immutable session snapshot. |
+| `.BootLease` | *DHCPLease | The snapshotted provisioning lease selected for rendering. |
 | `.ApiserverURL` | string | External Kubernetes API server URL. |
-| `.ServeURL` | string | External metalman HTTP URL. |
+| `.ArtifactBaseURL` | string | Capability-scoped session artifact URL. |
+| `.ServeURL` | string | Capability-scoped session base URL used by callbacks. |
 | `.KubernetesVersion` | string | Resolved Kubernetes version for the machine. |
 | `.ClusterDNS` | string | Cluster DNS service IP. |
 
@@ -505,11 +558,10 @@ httpBootPath: shimx64.efi
 ```
 
 The `dhcpBootImageName` field specifies the boot filename included in DHCP
-responses (option 67) for `spec.host.netboot.bootProtocol: PXE`.
+responses for `transport: TFTP`.
 
-The `httpBootPath` field specifies the file path, relative to metalman's HTTP
-artifact server, used for `spec.host.netboot.bootProtocol: HTTP`. If `httpBootPath` is
-omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
+The `httpBootPath` field specifies the firmware artifact used for
+`transport: HTTP`. Metalman signs a session capability URL for that artifact.
 
 ---
 

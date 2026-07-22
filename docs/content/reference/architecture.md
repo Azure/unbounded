@@ -44,24 +44,27 @@ service host to a public FQDN.
 but the shipped ConfigMap (rendered from `deploy/machina/03-config.yaml.tmpl`) sets it to 50.
 `provisioningTimeout` defaults to 5 minutes.
 
-### metalman -- Bare Metal PXE Controller
+### metalman -- Bare Metal Netboot
 
-Binary `cmd/metalman`, deployed as `metalman-controller` in `unbounded-system`.
+Binary `cmd/metalman`, deployed in separate per-Site roles in
+`unbounded-system`:
 
-Runs three reconcilers and four network servers:
+| Role | Responsibility |
+|------|----------------|
+| `metalman controller` | Leader-elected MachineOperation and Redfish reconciliation, OCI resolution, and immutable NetbootSession creation. |
+| `metalman server` | Replicated, Service-backed artifact serving, callbacks, TPM attestation, and authenticated edge decisions. |
+| `metalman edge` | DHCP/TFTP on a provisioning LAN and HTTP proxying. It has no controller credentials. |
 
-| Reconciler / Server     | Role                                                        |
-|-------------------------|-------------------------------------------------------------|
-| OCIReconciler           | Pulls and caches OCI netboot images from container registries. |
-| Redfish Reconciler      | TOFU TLS cert pinning for BMC Redfish endpoints. |
-| MachineOperation Reconciler | BMC power control, boot override, reboot, and repave operations via Redfish REST. |
-| DHCP server (UDP/67)    | Static IP assignment by MAC address.                        |
-| TFTP server (UDP/69)    | Bootloader delivery.                                        |
-| HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
-| Health server (TCP/8081)| Liveness and readiness probes.                              |
+The operator deploys one controller, two server replicas, a server Service and
+PodDisruptionBudget, and a shared capability-signing Secret. Controller and
+server pods use ordinary pod networking. `NetbootEndpoint` resources determine
+edge placement; only a `ManagedL2` edge uses host networking.
 
-Site-based scoping: the `--site` flag and the `unbounded-cloud.io/site` label
-restrict each instance to a subset of Machines. Leader election is per-site.
+Each HostReplace target receives an immutable `NetbootSession` that pins the
+endpoint, OCI digests, artifact allowlist, rendered inputs, and expiry. HMAC
+capability URLs identify the exact session for HTTP, TFTP, callbacks, and
+attestation. Static HTTP transfers support ranges so an edge can reconnect to a
+different server replica and resume an interrupted download.
 
 ### kubectl-unbounded -- CLI Plugin
 
@@ -71,6 +74,7 @@ Binary `cmd/kubectl-unbounded`. Provides subcommands:
 |--------------------|---------|
 | `install`          | Bootstraps CRDs and `unbounded-operator`; component workloads are reconciled from `Site.spec.components`. |
 | `site init`        | Initializes a new site by bootstrapping Unbounded when needed, creating site resources, and creating the bootstrap token. |
+| `site bootstrap-netboot` | Runs a temporary local netboot edge until one designated first Site Node is Ready. |
 | `machine register`   | Registers a machine to a site, creating a `Machine` CR with auto-discovery of SSH secrets and bootstrap tokens. |
 
 ### inventory -- Hardware Collector
@@ -92,7 +96,7 @@ Represents a host and drives its lifecycle.
 | Spec field            | Description |
 |-----------------------|-------------|
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
-| `spec.pxe`            | PXE config: machine image reference, optional netboot image override, dhcpLeases, redfish settings. |
+| `spec.host.netboot`   | Netboot image, endpoint, independent transport/configuration/network axes, DHCP leases, and Redfish settings. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
 
 Status includes phase, message, conditions, SSH fingerprint, Redfish cert
@@ -103,15 +107,17 @@ fingerprint, and TPM info. The API defines condition type constants including
 
 ### Netboot OCI Images
 
-Metalman uses two OCI images for PXE repaves. `Machine.spec.pxe.image` references
-the machine image containing `/disk/disk.img.gz`. `Machine.spec.pxe.netbootImage`
-optionally references the reusable PXE boot environment; when omitted, Metalman
-uses its configured default `netboot` image. `Machine.spec.pxe.architecture`
+Metalman uses two OCI images for netboot repaves.
+`Machine.spec.host.netboot.image` references the machine image containing
+`/disk/disk.img.gz`. `Machine.spec.host.netboot.netbootImage` optionally
+references the reusable boot environment; when omitted, Metalman uses its
+configured default netboot image. `Machine.spec.host.netboot.architecture`
 selects the OCI platform manifest for both images and defaults to `amd64`.
 
-Netboot images contain all files needed for PXE booting under `/disk/`. Files
-with a `.tmpl` suffix are Go templates rendered per-machine at serve time. A
-`metadata.yaml` provides image-level configuration such as `dhcpBootImageName`.
+Netboot images contain all files needed for network booting under `/disk/`.
+Files with a `.tmpl` suffix are Go templates rendered from the immutable session
+snapshot. A `metadata.yaml` provides image-level configuration such as the TFTP
+or HTTP firmware artifact path.
 
 ### Resource relationships
 
@@ -153,18 +159,19 @@ For a walkthrough, see the [SSH Provisioning Guide]({{< ref "guides/ssh" >}}).
 
 ### PXE Path (metalman)
 
-1. `Machine` CR created with `spec.pxe`.
-2. A `HostReplace` `MachineOperation` requests a repave; metalman sets the PXE or HTTP boot override and force-restarts the host through Redfish.
-3. Host PXE-boots: DHCP (IP + boot filename) -> TFTP (bootloader) -> HTTP
-   (kernel, initrd, configs).
-4. Init script: writes disk image, injects configs, calls `/pxe/disable`,
-   reboots.
-5. Cloud-init: installs containerd, kubelet, tpm2-tools.
-6. TPM attestation: TOFU Endorsement Key pinning,
-   `MakeCredential`/`ActivateCredential` exchange, AES-256-GCM encrypted
-   bootstrap token delivered via `/attest`.
-7. kubelet TLS-bootstraps into the cluster.
-8. Subsequent reboots: GRUB chainloads the local OS (no PXE).
+1. A `Machine` selects a `NetbootEndpoint` through `spec.host.netboot`.
+2. A `HostReplace` operation creates an immutable session and waits for its
+   endpoint and digest-addressed artifacts to become ready.
+3. Metalman configures TFTP or UEFI HTTP boot through DHCP or Redfish, according
+   to the Machine's independent boot axes, and restarts the host.
+4. Firmware and the installer fetch capability-scoped artifacts through an edge.
+5. The installer writes the disk image and posts the exact target's
+   `BootImageWritten` callback before rebooting.
+6. Cloud-init installs the agent and reports target-scoped progress.
+7. TPM attestation uses TOFU Endorsement Key pinning,
+   `MakeCredential`/`ActivateCredential` exchange, and an AES-256-GCM encrypted
+   bootstrap token delivered through the authenticated session route.
+8. kubelet TLS-bootstraps into the cluster; subsequent boots chainload the local OS.
 
 For a walkthrough, see the [PXE Provisioning Guide]({{< ref "guides/pxe" >}}).
 
@@ -177,8 +184,9 @@ For a walkthrough, see the [PXE Provisioning Guide]({{< ref "guides/pxe" >}}).
 | Bootstrap tokens | Standard kubeadm tokens (`token-id` + `token-secret`). SSH path passes as env var; PXE path encrypts via TPM. |
 | TPM attestation | TOFU EK pinning. AES-256-GCM encrypted service-account tokens with 1-hour expiry. |
 | Redfish TLS | TOFU cert fingerprint pinning stored in `status.redfish.certFingerprint`. |
+| Netboot requests | Expiring HMAC capabilities bound to one immutable session; public endpoints require HTTPS. |
 | RBAC | Separate ServiceAccounts, Roles, and ClusterRoles per controller. |
-| Secret access | Via Kubernetes API only; never mounted as volumes. |
+| Secret access | Scoped API reads; capability and TLS keys mount only into roles that need them. |
 
 ## Deployment
 
@@ -195,8 +203,9 @@ applied by hand.
 | `deploy/machina/crd/` | `Machine` CRD definition. |
 | `deploy/machina/` | Namespace, RBAC (machina + metalman), ConfigMap, Deployment, Service. |
 
-Resource defaults for both controllers: 100m CPU / 128Mi memory requests,
-500m CPU / 256Mi memory limits. Both tolerate `CriticalAddonsOnly`.
+Metalman controller and server workloads request 100m CPU and 128Mi memory and
+limit themselves to 2 CPU and 2Gi memory. Server replicas use topology spread,
+readiness/liveness probes, zero-unavailable rollouts, and a PodDisruptionBudget.
 
 Container images are multi-stage builds on Azure Linux 3.0, built with
 `podman`. CRDs are generated with `controller-gen` v0.20.1.

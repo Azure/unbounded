@@ -18,30 +18,30 @@ If your machines already have Linux installed and are reachable via SSH, use the
 
 ## How PXE Boot Works
 
-PXE (Preboot Execution Environment) is a firmware feature that lets a machine
-boot from the network instead of a local disk. metalman acts as the PXE
-infrastructure:
+PXE and UEFI HTTP boot let a machine start from the network instead of a local
+disk. Metalman separates the Kubernetes control plane, replicated artifact
+servers, and network-facing edges:
 
 ![PXE boot flow: Bare-Metal Machine boots via DHCP, TFTP, and HTTP from metalman, then joins the Kubernetes API with a bootstrap token](../../img/bare-metal-pxe-boot.svg)
 
 The boot flow in detail:
 
-1. **DHCP Discovery** -- The machine's PXE firmware broadcasts a DHCP request.
-   metalman responds with an IP address and the location of the bootloader.
+1. **Session creation** -- A HostReplace operation creates an immutable
+   NetbootSession containing the endpoint, resolved OCI digests, boot settings,
+   rendered inputs, and expiry.
 
-2. **TFTP Boot** -- The firmware downloads the bootloader via TFTP.
+2. **Firmware configuration** -- DHCP or Redfish supplies a capability-scoped
+   TFTP path or HTTP URL and, when selected, network configuration.
 
-3. **HTTP Artifacts** -- The bootloader fetches the kernel, initramfs, and
-   configuration files from metalman's HTTP server. These are sourced from
-   the Machine's `spec.pxe.netbootImage`, or from Metalman's default netboot
-   image when that field is omitted.
+3. **Boot artifacts** -- The edge obtains the bootloader, kernel, initramfs, and
+   configuration from replicated servers. Files come from the Machine's
+   `spec.host.netboot.netbootImage`, or Metalman's default netboot image.
 
 4. **Kernel Boot** -- The machine boots into the downloaded kernel and
    initramfs.
 
-5. **Token Retrieval** -- The init process contacts metalman's health endpoint
-   to retrieve a bootstrap token. If TPM 2.0 is available, the token is
-   encrypted to the machine's TPM.
+5. **Token retrieval** -- The agent uses the authenticated session attestation
+   route. If TPM 2.0 is available, the token is encrypted to that machine's TPM.
 
 6. **Cluster Join** -- kubelet uses the bootstrap token to join the Kubernetes
    cluster, just like an SSH-provisioned node.
@@ -51,29 +51,31 @@ The boot flow in detail:
 
 ## Key Concepts
 
-### DHCP Modes
+### Endpoints
 
-metalman supports two DHCP modes depending on your network topology:
+`NetbootEndpoint` declares the stable client-facing address and edge placement:
 
-- **Interface mode** (`--dhcp-interface eth0`) -- metalman listens for
-  broadcast DHCP on a specific NIC. Use this when metalman runs on the same
-  L2 segment as the bare-metal machines.
+- **ManagedL2** -- The operator places a host-network edge on a selected node
+  attached to the provisioning LAN.
+- **HTTP** -- The operator creates replicated HTTP edge pods and a Service.
+  Public endpoints require HTTPS.
+- **ExternalL2** -- An edge outside the cluster owns DHCP/TFTP/private HTTP.
+  The first-node bootstrap command uses this type temporarily.
 
-- **Relay mode** (default, no `--dhcp-interface`) -- metalman listens for
-  unicast DHCP forwarded by a DHCP relay agent. Use this when metalman and
-  the machines are on different subnets.
+DHCP broadcasts require an edge on the target L2 or a local relay. WireGuard is
+L3 only and does not extend the broadcast domain.
 
 ### OCI Images
 
 Metalman uses two OCI images during PXE provisioning:
 
-- The machine image, referenced by `spec.pxe.image`, contains `/disk/disk.img.gz`.
-- The netboot image, referenced by `spec.pxe.netbootImage` or by Metalman's
+- The machine image, referenced by `spec.host.netboot.image`, contains `/disk/disk.img.gz`.
+- The netboot image, referenced by `spec.host.netboot.netbootImage` or by Metalman's
   default, contains the reusable PXE boot environment.
 
 Netboot images are built `FROM scratch` and contain all files needed for PXE
 booting a machine under `/disk/`. Files with a `.tmpl` suffix are Go templates
-rendered per-machine at serve time; other files are served verbatim. A
+rendered from immutable session data; other files are served verbatim. A
 `metadata.yaml` file provides image-level configuration such as
 `dhcpBootImageName`.
 
@@ -83,39 +85,42 @@ rendered per-machine at serve time; other files are served verbatim. A
 | **Templates** | Files with `.tmpl` suffix - rendered from Go templates with per-machine context (e.g., kernel command line) |
 | **Configuration** | `metadata.yaml` - image-level settings such as the DHCP boot filename |
 
-Machine and netboot images are pulled and cached locally by the OCI reconciler.
+Machine and netboot image tags are resolved to digests before the host is
+powered on. Server caches are disposable; the durable session records the exact
+digest and allowlisted files.
 
 ### Machine CRD (PXE Fields)
 
 For PXE-provisioned machines, the `Machine` resource includes:
 
-- **`spec.pxe.image`** -- OCI machine image reference containing `/disk/disk.img.gz`
+- **`spec.host.netboot.image`** -- OCI machine image reference containing `/disk/disk.img.gz`
   (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`).
-- **`spec.pxe.architecture`** -- Optional target CPU architecture for PXE boot
+- **`spec.host.netboot.architecture`** -- Optional target CPU architecture for boot
   artifacts and machine images. Defaults to `amd64`; allowed values are `amd64`
   and `arm64`.
-- **`spec.pxe.netbootImage`** -- Optional OCI netboot image reference containing
+- **`spec.host.netboot.netbootImage`** -- Optional OCI netboot image reference containing
   PXE boot artifacts. When omitted, Metalman uses its configured default
   `netboot` image.
-- **`spec.pxe.dhcpLeases`** -- NIC specifications: MAC address and IP
+- **`spec.host.netboot.endpointRef`** -- Required NetbootEndpoint name.
+- **`spec.host.netboot.transport`**, **`configurationSource`**, and
+  **`networkMode`** -- Independent firmware transport, boot configuration
+  source, and network configuration mode.
+- **`spec.host.netboot.dhcpLeases`** -- NIC specifications: MAC address and IP
   assignment for each interface. During install, the default netboot template
   passes the matching lease MAC to the initrd so it can select the provisioning
   NIC without relying on names such as `eth0`.
-- **`spec.pxe.targetDisk`** -- Optional block device path for the disk that
+- **`spec.host.netboot.targetDisk`** -- Optional block device path for the disk that
   receives the machine image. Set this on hosts with multiple disks; when
   omitted, the installer selects a disk automatically.
-- **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,
+- **`spec.host.netboot.redfish`** -- Optional BMC connection details (endpoint, username,
   password secret) for remote power management.
-- **`spec.pxe.cloudInit`** -- Optional cloud-init customization. References a
+- **`spec.host.netboot.cloudInit`** -- Optional cloud-init customization. References a
   ConfigMap containing user-data that is merged with the vendor-data managed by
   Unbounded.
 
-### Site Isolation
-
-In environments with multiple metalman instances (e.g., different racks or
-sites), the `--site` flag scopes each instance to machines labeled with
-`unbounded-cloud.io/site=<name>`. This prevents one metalman from interfering
-with another's machines.
+Supported combinations are TFTP+DHCP+DHCP, HTTP+DHCP+DHCP,
+HTTP+Redfish+DHCP, and HTTP+Redfish+Static. Invalid combinations are rejected by
+the API.
 
 ### TPM 2.0 Attestation
 
@@ -131,8 +136,9 @@ metalman uses TPM 2.0 for secure bootstrap token delivery:
 3. **AES-256-GCM** -- The actual token payload is encrypted with AES-256-GCM,
    with the key wrapped by the TPM credential.
 
-This ensures that bootstrap tokens cannot be intercepted by other machines on
-the network.
+The attestation request is also bound to an expiring session capability. Public
+HTTP boot endpoints require HTTPS so artifact and callback capabilities are not
+exposed in transit.
 
 ### MachineOperation-Based Operations
 
