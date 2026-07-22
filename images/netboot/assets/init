@@ -121,6 +121,7 @@ done
 
 IMAGE_URL=$(get_param unbounded.image_url) || fatal "unbounded.image_url not set"
 SERVE_URL=$(get_param unbounded.serve_url || true)
+BOOT_IMAGE_WRITTEN_URL=$(get_param unbounded.boot_image_written_url || true)
 TARGET_DISK=$(get_param unbounded.disk || true)
 BOOT_MAC=$(get_param unbounded.boot_mac || true)
 BOOTIF=$(get_param BOOTIF || true)
@@ -416,10 +417,10 @@ if [ -d /sys/firmware/efi ]; then
     done
 fi
 
-if [ -n "$SERVE_URL" ]; then
-    log "disabling PXE boot"
-    retry 5 2 "disable PXE" wget -q -O /dev/null "$SERVE_URL/pxe/disable" \
-        || log "WARNING: failed to disable PXE boot"
+if [ -n "$BOOT_IMAGE_WRITTEN_URL" ]; then
+    log "reporting completed disk installation"
+    retry 5 2 "report completed disk installation" wget -q -O /dev/null --post-data='' "$BOOT_IMAGE_WRITTEN_URL" \
+        || log "WARNING: failed to report completed disk installation"
 fi
 
 log "installation complete, rebooting"

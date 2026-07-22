@@ -16,7 +16,7 @@ ssh_pwauth: false
 reporting:
   unbounded:
     type: webhook
-    endpoint: {{ .ServeURL }}/cloudinit/log
+    endpoint: {{ .CloudInitURL }}
 write_files:
 - path: /etc/unbounded/agent/config.json
   permissions: '0600'
@@ -67,7 +67,7 @@ runcmd:
         else
           echo "could not read ${install_log}: file does not exist"
         fi
-      } | curl -fsS -m 10 -X POST -H "Content-Type: text/plain" --data-binary @- "{{ .ServeURL }}/unbounded-agent/install-log" >/dev/null 2>&1 || true
+      } | curl -fsS -m 10 -X POST -H "Content-Type: text/plain" --data-binary @- "{{ .InstallLogURL }}" >/dev/null 2>&1 || true
       exit "$status"
     }
     trap report_unbounded_failure ERR

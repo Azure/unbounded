@@ -212,8 +212,9 @@ type NetbootSessionArtifact struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// Source selects the OCI image containing this file.
-	// +kubebuilder:validation:Enum=MachineImage;NetbootImage
+	// Source selects the OCI image containing this file, or Session for
+	// content snapshotted directly into the session.
+	// +kubebuilder:validation:Enum=MachineImage;NetbootImage;Session
 	Source string `json:"source"`
 
 	// Path is the absolute path within the unpacked OCI image.

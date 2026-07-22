@@ -4,12 +4,15 @@
 package netboot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	pathpkg "path"
 	"strings"
 
@@ -19,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // SessionHTTPServer serves only immutable artifacts authorized by a
@@ -54,12 +58,26 @@ func SessionArtifactURL(signer *CapabilitySigner, session *v1alpha3.NetbootSessi
 	if cleanArtifact == "" || pathpkg.Clean(cleanArtifact) != cleanArtifact || strings.HasPrefix(artifactName, "/") {
 		return "", fmt.Errorf("invalid artifact name %q", artifactName)
 	}
+	baseURL, err := SessionBaseURL(signer, session)
+	if err != nil {
+		return "", err
+	}
+
+	return JoinServeURLPath(baseURL, pathpkg.Join("artifacts", cleanArtifact))
+}
+
+// SessionBaseURL returns the externally advertised capability root for a
+// session's artifacts and callbacks.
+func SessionBaseURL(signer *CapabilitySigner, session *v1alpha3.NetbootSession) (string, error) {
+	if signer == nil || session == nil {
+		return "", errors.New("capability signer and session are required")
+	}
 	capability, err := signer.Sign(session)
 	if err != nil {
 		return "", err
 	}
 
-	return JoinServeURLPath(session.Spec.Endpoint.ExternalURL, pathpkg.Join("v1/netboot/sessions", session.Name, capability, "artifacts", cleanArtifact))
+	return JoinServeURLPath(session.Spec.Endpoint.ExternalURL, pathpkg.Join("v1/netboot/sessions", session.Name, capability))
 }
 
 func (s *SessionHTTPServer) Handler() http.Handler {
@@ -73,6 +91,7 @@ func (s *SessionHTTPServer) Handler() http.Handler {
 func (s *SessionHTTPServer) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/netboot/sessions/{session}/{capability}/artifacts/{artifact...}", s.handleArtifact)
 	mux.HandleFunc("POST /v1/netboot/sessions/{session}/{capability}/callbacks/{milestone}", s.handleCallback)
+	mux.HandleFunc("POST /v1/netboot/sessions/{session}/{capability}/logs/agent-install", s.handleInstallLog)
 	mux.HandleFunc("GET /v1/netboot/endpoints/{endpoint}/dhcp/{mac}", s.handleDHCPDecision)
 }
 
@@ -167,7 +186,13 @@ func (s *SessionHTTPServer) handleCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	conditionType, ok := sessionMilestoneCondition(r.PathValue("milestone"))
+	milestone := r.PathValue("milestone")
+	if milestone == "cloud-init" {
+		s.handleSessionCloudInit(w, r, session)
+		return
+	}
+
+	conditionType, ok := sessionMilestoneCondition(milestone)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -185,6 +210,42 @@ func (s *SessionHTTPServer) handleCallback(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *SessionHTTPServer) handleSessionCloudInit(w http.ResponseWriter, r *http.Request, session *v1alpha3.NetbootSession) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "reading cloud-init event", http.StatusBadRequest)
+		return
+	}
+	var event cloudInitEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		http.Error(w, "invalid cloud-init event", http.StatusBadRequest)
+		return
+	}
+	condition := buildCloudInitCondition(&event, session.Spec.Machine.Generation)
+	if condition != nil {
+		condition.Type = v1alpha3.NetbootSessionConditionCloudInitDone
+		if err := s.StatusRecorder.RecordCondition(r.Context(), session.Name, session.UID, *condition); err != nil {
+			http.Error(w, "recording session status", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *SessionHTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
+	session, ok := s.authorizeSession(w, r)
+	if !ok {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "reading install log", http.StatusBadRequest)
+		return
+	}
+	slog.Warn("unbounded-agent install log", "session", session.Name, "body", strings.TrimSpace(string(body)))
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	if s.Cache == nil {
 		http.Error(w, "session server unavailable", http.StatusServiceUnavailable)
@@ -199,6 +260,14 @@ func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Reques
 	artifact, ok := sessionArtifact(session, r.PathValue("artifact"))
 	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if artifact.Source == "Session" {
+		if artifact.Name != "cloud-init/user-data" {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeContent(w, r, artifact.Name, session.CreationTimestamp.Time, strings.NewReader(session.Spec.Provisioning.UserData))
 		return
 	}
 	image, ok := sessionArtifactImage(session, artifact.Source)
@@ -223,11 +292,97 @@ func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if isTemplate {
-		http.Error(w, "rendered artifact unavailable", http.StatusServiceUnavailable)
+		data, err := s.renderSessionTemplate(diskPath, session)
+		if err != nil {
+			http.Error(w, "rendering artifact", http.StatusServiceUnavailable)
+			return
+		}
+		http.ServeContent(w, r, artifact.Name, session.CreationTimestamp.Time, bytes.NewReader(data))
+		s.recordFirmwareDownloaded(r.Context(), session, artifact.Name)
 		return
 	}
 
 	http.ServeFile(w, r, diskPath)
+	s.recordFirmwareDownloaded(r.Context(), session, artifact.Name)
+}
+
+func (s *SessionHTTPServer) recordFirmwareDownloaded(ctx context.Context, session *v1alpha3.NetbootSession, artifactName string) {
+	if s.StatusRecorder == nil || artifactName != session.Spec.Boot.FirmwareArtifact {
+		return
+	}
+	if err := s.StatusRecorder.RecordCondition(ctx, session.Name, session.UID, metav1.Condition{
+		Type:    v1alpha3.NetbootSessionConditionBootLoaderDownloaded,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Succeeded",
+		Message: "firmware artifact downloaded",
+	}); err != nil {
+		slog.Warn("recording firmware artifact download", "session", session.Name, "err", err)
+	}
+}
+
+func (s *SessionHTTPServer) renderSessionTemplate(templatePath string, session *v1alpha3.NetbootSession) ([]byte, error) {
+	content, err := os.ReadFile(templatePath)
+	if err != nil {
+		return nil, fmt.Errorf("reading template: %w", err)
+	}
+	baseURL, err := SessionBaseURL(s.Capabilities, session)
+	if err != nil {
+		return nil, err
+	}
+	machine := sessionMachine(session)
+	cluster := session.Spec.Provisioning.Cluster
+	agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+		Machine: machine,
+		Cluster: provision.ClusterEndpoint{
+			APIServer:    cluster.APIServerURL,
+			CACertBase64: cluster.CACertBase64,
+			ClusterDNS:   cluster.DNS,
+			KubeVersion:  cluster.KubernetesVersion,
+		},
+		ProviderLabels: session.Spec.Provisioning.ProviderLabels,
+		AttestURL:      baseURL,
+	})
+	agentConfigJSON, err := json.MarshalIndent(agentConfig, "    ", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshaling agent config: %w", err)
+	}
+	data := newTemplateData(machine, ClusterInfo{ApiserverURL: cluster.APIServerURL, CACertBase64: cluster.CACertBase64}, baseURL, string(agentConfigJSON), "", true)
+	data.ArtifactBaseURL, err = JoinServeURLPath(baseURL, "artifacts")
+	if err != nil {
+		return nil, err
+	}
+	data.BootImageWrittenURL, err = JoinServeURLPath(baseURL, "callbacks/boot-image-written")
+	if err != nil {
+		return nil, err
+	}
+	data.CloudInitURL, err = JoinServeURLPath(baseURL, "callbacks/cloud-init")
+	if err != nil {
+		return nil, err
+	}
+	data.InstallLogURL, err = JoinServeURLPath(baseURL, "logs/agent-install")
+	if err != nil {
+		return nil, err
+	}
+
+	return renderTemplate(string(content), data)
+}
+
+func sessionMachine(session *v1alpha3.NetbootSession) *v1alpha3.Machine {
+	return &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: session.Spec.Machine.Name, UID: session.Spec.Machine.UID, Generation: session.Spec.Machine.Generation},
+		Spec: v1alpha3.MachineSpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
+				Transport:           session.Spec.Boot.Transport,
+				ConfigurationSource: session.Spec.Boot.ConfigurationSource,
+				NetworkMode:         session.Spec.Boot.NetworkMode,
+				Architecture:        session.Spec.Boot.Architecture,
+				DHCPLeases:          append([]v1alpha3.DHCPLease(nil), session.Spec.Boot.DHCPLeases...),
+				TargetDisk:          session.Spec.Boot.TargetDisk,
+			}},
+			Kubernetes: session.Spec.Provisioning.Kubernetes.DeepCopy(),
+			Agent:      session.Spec.Provisioning.Agent.DeepCopy(),
+		},
+	}
 }
 
 func (s *SessionHTTPServer) authorizeSession(w http.ResponseWriter, r *http.Request) (*v1alpha3.NetbootSession, bool) {

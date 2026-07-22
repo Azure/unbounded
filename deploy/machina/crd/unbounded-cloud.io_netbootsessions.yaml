@@ -89,11 +89,13 @@ spec:
                           minimum: 0
                           type: integer
                         source:
-                          description: Source selects the OCI image containing this
-                            file.
+                          description: |-
+                            Source selects the OCI image containing this file, or Session for
+                            content snapshotted directly into the session.
                           enum:
                           - MachineImage
                           - NetbootImage
+                          - Session
                           type: string
                       required:
                       - name

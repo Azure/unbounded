@@ -303,14 +303,18 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 }
 
 type templateData struct {
-	Machine          *v1alpha3.Machine
-	BootLease        *v1alpha3.DHCPLease
-	ApiserverURL     string
-	ServeURL         string
-	AgentConfigJSON  string
-	InstallScript    string
-	InstallEnv       []string
-	InstallRequested bool
+	Machine             *v1alpha3.Machine
+	BootLease           *v1alpha3.DHCPLease
+	ApiserverURL        string
+	ServeURL            string
+	ArtifactBaseURL     string
+	BootImageWrittenURL string
+	CloudInitURL        string
+	InstallLogURL       string
+	AgentConfigJSON     string
+	InstallScript       string
+	InstallEnv          []string
+	InstallRequested    bool
 }
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {
@@ -324,15 +328,21 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		bootLease = selectBootLease(node, requestIP)
 	}
 
+	serveURL = strings.TrimRight(serveURL, "/")
+
 	return templateData{
-		Machine:          node,
-		BootLease:        bootLease,
-		ApiserverURL:     ci.ApiserverURL,
-		ServeURL:         serveURL,
-		AgentConfigJSON:  agentConfigJSON,
-		InstallScript:    provision.UnboundedAgentInstallScript(),
-		InstallEnv:       provision.AgentInstallEnv(agent),
-		InstallRequested: installRequested,
+		Machine:             node,
+		BootLease:           bootLease,
+		ApiserverURL:        ci.ApiserverURL,
+		ServeURL:            serveURL,
+		ArtifactBaseURL:     serveURL,
+		BootImageWrittenURL: serveURL + "/pxe/disable",
+		CloudInitURL:        serveURL + "/cloudinit/log",
+		InstallLogURL:       serveURL + "/unbounded-agent/install-log",
+		AgentConfigJSON:     agentConfigJSON,
+		InstallScript:       provision.UnboundedAgentInstallScript(),
+		InstallEnv:          provision.AgentInstallEnv(agent),
+		InstallRequested:    installRequested,
 	}
 }
 
@@ -440,6 +450,20 @@ func indentTemplateBlock(spaces int, value string) string {
 }
 
 func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
+	serveURL := strings.TrimRight(data.ServeURL, "/")
+	if data.ArtifactBaseURL == "" {
+		data.ArtifactBaseURL = serveURL
+	}
+	if data.BootImageWrittenURL == "" {
+		data.BootImageWrittenURL = serveURL + "/pxe/disable"
+	}
+	if data.CloudInitURL == "" {
+		data.CloudInitURL = serveURL + "/cloudinit/log"
+	}
+	if data.InstallLogURL == "" {
+		data.InstallLogURL = serveURL + "/unbounded-agent/install-log"
+	}
+
 	t, err := template.New("").Funcs(templateFuncMap).Parse(tmplStr)
 	if err != nil {
 		return nil, fmt.Errorf("parsing template: %w", err)

@@ -86,6 +86,20 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 		Source: "NetbootImage",
 		Path:   "/disk/http/bootx64.efi",
 	})
+	for _, name := range []string{
+		"vmlinuz", "initrd", "init.cpio", "grub/grub.cfg", "grubx64.efi",
+		"cloud-init/meta-data", "cloud-init/user-data", "cloud-init/vendor-data", "cloud-init/network-config",
+	} {
+		require.Condition(t, func() bool {
+			for _, artifact := range session.Spec.Artifacts.Files {
+				if artifact.Name == name {
+					return true
+				}
+			}
+
+			return false
+		}, "session artifact list is missing %s", name)
+	}
 	require.True(t, session.Spec.ExpiresAt.Time.Equal(fixedNow().Add(24*time.Hour)))
 
 	machine.Spec.PXE.Image = "ghcr.io/test/changed:v2"

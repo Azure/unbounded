@@ -73,6 +73,8 @@ func TestNetbootSessionSchema(t *testing.T) {
 			t.Errorf("session provisioning snapshot is missing %q", field)
 		}
 	}
+	artifactSource := spec.Properties["artifacts"].Properties["files"].Items.Schema.Properties["source"]
+	requireEnumValue(t, artifactSource.Enum, "Session")
 
 	status := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"]
 	for _, field := range []string{"phase", "conditions"} {
@@ -80,6 +82,19 @@ func TestNetbootSessionSchema(t *testing.T) {
 			t.Errorf("session status is missing %q", field)
 		}
 	}
+}
+
+func requireEnumValue(t *testing.T, values []apiextensionsv1.JSON, want string) {
+	t.Helper()
+
+	for _, value := range values {
+		var got string
+		if err := yaml.Unmarshal(value.Raw, &got); err == nil && got == want {
+			return
+		}
+	}
+
+	t.Errorf("enum does not contain %q", want)
 }
 
 func TestMachineOperationTargetInputHasNetbootSessionRef(t *testing.T) {

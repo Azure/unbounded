@@ -283,11 +283,36 @@ func targetNetworkMode(spec *v1alpha3.PXESpec) v1alpha3.NetbootNetworkMode {
 }
 
 func sessionArtifacts(firmwareArtifact string) []v1alpha3.NetbootSessionArtifact {
-	return []v1alpha3.NetbootSessionArtifact{
+	artifacts := []v1alpha3.NetbootSessionArtifact{
 		{Name: "disk.img.gz", Source: "MachineImage", Path: "/disk/disk.img.gz"},
 		{Name: "metadata.yaml", Source: "NetbootImage", Path: "/disk/metadata.yaml"},
 		{Name: firmwareArtifact, Source: "NetbootImage", Path: "/disk/" + firmwareArtifact},
+		{Name: "vmlinuz", Source: "NetbootImage", Path: "/disk/vmlinuz"},
+		{Name: "initrd", Source: "NetbootImage", Path: "/disk/initrd"},
+		{Name: "init.cpio", Source: "NetbootImage", Path: "/disk/init.cpio"},
+		{Name: "grub/grub.cfg", Source: "NetbootImage", Path: "/disk/grub/grub.cfg"},
+		{Name: "cloud-init/meta-data", Source: "NetbootImage", Path: "/disk/cloud-init/meta-data"},
+		{Name: "cloud-init/user-data", Source: "Session", Path: "/session/cloud-init/user-data"},
+		{Name: "cloud-init/vendor-data", Source: "NetbootImage", Path: "/disk/cloud-init/vendor-data"},
+		{Name: "cloud-init/network-config", Source: "NetbootImage", Path: "/disk/cloud-init/network-config"},
 	}
+	if strings.Contains(firmwareArtifact, "aa64") {
+		artifacts = append(artifacts, v1alpha3.NetbootSessionArtifact{Name: "grubaa64.efi", Source: "NetbootImage", Path: "/disk/grubaa64.efi"})
+	} else {
+		artifacts = append(artifacts, v1alpha3.NetbootSessionArtifact{Name: "grubx64.efi", Source: "NetbootImage", Path: "/disk/grubx64.efi"})
+	}
+
+	unique := make([]v1alpha3.NetbootSessionArtifact, 0, len(artifacts))
+	names := make(map[string]struct{}, len(artifacts))
+	for _, artifact := range artifacts {
+		if _, exists := names[artifact.Name]; exists {
+			continue
+		}
+		names[artifact.Name] = struct{}{}
+		unique = append(unique, artifact)
+	}
+
+	return unique
 }
 
 func firmwareArtifactForTransport(metadata *netboot.ImageMetadata, transport v1alpha3.NetbootTransport) string {
