@@ -114,6 +114,12 @@ func TestRBACSeparatesControllerAndServerIdentities(t *testing.T) {
 	if strings.Contains(controllerRole, "resources: [\"tokenreviews\"]") {
 		t.Fatalf("metalman-controller retains server TokenReview permission:\n%s", controllerRole)
 	}
+
+	kubeSystemBinding := manifest[strings.Index(manifest, "kind: RoleBinding\nmetadata:\n  name: metalman-controller\n  namespace: kube-system"):]
+	kubeSystemBinding = kubeSystemBinding[:strings.Index(kubeSystemBinding, "\n---")]
+	if !strings.Contains(kubeSystemBinding, "name: metalman-server") {
+		t.Fatalf("kube-system metadata binding excludes metalman-server:\n%s", kubeSystemBinding)
+	}
 }
 
 func TestOperatorRBACCanReconcileNetbootEndpoints(t *testing.T) {

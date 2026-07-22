@@ -144,6 +144,9 @@ subjects:
   - kind: ServiceAccount
     name: metalman-controller
     namespace: {{ default "unbounded-system" .Namespace }}
+  - kind: ServiceAccount
+    name: metalman-server
+    namespace: {{ default "unbounded-system" .Namespace }}
 roleRef:
   kind: Role
   name: metalman-controller
