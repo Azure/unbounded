@@ -21,6 +21,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
+	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
@@ -457,6 +458,10 @@ func singleOCILayoutReference(layoutDir string) (string, error) {
 
 	if reference == "" {
 		return "", fmt.Errorf("HTTPS OCI image archive does not contain a tagged image reference")
+	}
+
+	if err := (registry.Reference{Reference: reference}).ValidateReferenceAsTag(); err != nil {
+		return "", fmt.Errorf("HTTPS OCI image archive reference %q is not a valid tag: %w", reference, err)
 	}
 
 	return reference, nil

@@ -205,6 +205,29 @@ func TestSingleOCILayoutReferenceRejectsMultipleImages(t *testing.T) {
 	}
 }
 
+func TestSingleOCILayoutReferenceRejectsInvalidTag(t *testing.T) {
+	t.Parallel()
+
+	layoutDir := t.TempDir()
+	index := `{
+		"schemaVersion": 2,
+		"manifests": [{
+			"mediaType": "application/vnd.oci.image.manifest.v1+json",
+			"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+			"size": 1,
+			"annotations": {"org.opencontainers.image.ref.name": "sha256:invalid"}
+		}]
+	}`
+
+	if err := os.WriteFile(filepath.Join(layoutDir, "index.json"), []byte(index), 0o644); err != nil {
+		t.Fatalf("write index.json: %v", err)
+	}
+
+	if _, err := singleOCILayoutReference(layoutDir); err == nil {
+		t.Fatal("singleOCILayoutReference() error = nil, want invalid tag error")
+	}
+}
+
 func TestConfigureOCIPullRetryUsesORASRetryClient(t *testing.T) {
 	repo := &remote.Repository{}
 	configureOCIPullRetry(repo)
