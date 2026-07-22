@@ -261,7 +261,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 REACT_DEV ?= false
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
-.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests unbounded-operator-release-manifest
+.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
@@ -1387,6 +1387,15 @@ net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
 UNBOUNDED_OPERATOR_RELEASE_MANIFEST := build/unbounded-operator-$(VERSION).yaml
+RELEASE_BOM_OUTPUT ?= build/unbounded-release-bom-$(VERSION).json
+
+release-bom: ## Generate a digest-pinned release bill of materials
+	$(GOCMD) run ./hack/cmd/release-bom \
+		--tag "$(VERSION)" \
+		--commit "$(GIT_COMMIT)" \
+		--registry "$(CONTAINER_REGISTRY)" \
+		--net-cni-version "$(CNI_PLUGINS_VERSION)" \
+		--output "$(RELEASE_BOM_OUTPUT)"
 
 unbounded-operator-release-manifest: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
 unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a versioned, directly applicable operator manifest under build/
