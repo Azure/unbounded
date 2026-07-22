@@ -22,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/internal/metalman/dhcp"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
 )
 
 const defaultHTTPReadHeaderTimeout = 10 * time.Second
@@ -40,6 +41,9 @@ func EdgeCmd() *cobra.Command {
 		dhcpInterface string
 		dhcpServerIP  string
 		dhcpPort      int
+		tftpEnabled   bool
+		tftpBindAddr  string
+		tftpPort      int
 	)
 
 	cmd := &cobra.Command{
@@ -77,6 +81,19 @@ func EdgeCmd() *cobra.Command {
 					}
 				}()
 			}
+			if tftpEnabled {
+				artifactBackend, err := netboot.NewHTTPArtifactBackend(backend.String(), nil)
+				if err != nil {
+					return fmt.Errorf("creating TFTP backend: %w", err)
+				}
+				tftpServer := &netboot.TFTPServer{BindAddr: tftpBindAddr, Port: tftpPort, Backend: artifactBackend}
+				go func() {
+					if err := tftpServer.Start(ctx); err != nil && ctx.Err() == nil {
+						slog.ErrorContext(ctx, "Metalman edge TFTP server failed", "err", err)
+						stop()
+					}
+				}()
+			}
 
 			go func() {
 				<-ctx.Done()
@@ -106,6 +123,9 @@ func EdgeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dhcpInterface, "dhcp-interface", "", "Provisioning interface for direct DHCP; empty enables relay-only mode")
 	cmd.Flags().StringVar(&dhcpServerIP, "dhcp-server-ip", "", "DHCP server IPv4 address; defaults to the interface or outbound address")
 	cmd.Flags().IntVar(&dhcpPort, "dhcp-port", 67, "DHCP listener port")
+	cmd.Flags().BoolVar(&tftpEnabled, "tftp-enabled", false, "Enable the TFTP protocol edge")
+	cmd.Flags().StringVar(&tftpBindAddr, "tftp-bind-address", "0.0.0.0", "IP address to bind the TFTP listener")
+	cmd.Flags().IntVar(&tftpPort, "tftp-port", 69, "TFTP listener port")
 	_ = cmd.MarkFlagRequired("backend-url")
 	_ = cmd.MarkFlagRequired("endpoint")
 

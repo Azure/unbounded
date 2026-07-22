@@ -20,8 +20,14 @@ import (
 
 type TFTPServer struct {
 	BindAddr string
+	Port     int
 	FileResolver
 	StatusRecorder TFTPStatusRecorder
+	Backend        TFTPBackend
+}
+
+type TFTPBackend interface {
+	Open(ctx context.Context, filename string) (io.ReadCloser, error)
 }
 
 type TFTPStatusRecorder interface {
@@ -34,7 +40,11 @@ func (t *TFTPServer) Start(ctx context.Context) error {
 	s := tftp.NewServer(t.readHandler, nil)
 	s.SetAnticipate(0)
 
-	addr := net.JoinHostPort(t.BindAddr, "69")
+	port := t.Port
+	if port == 0 {
+		port = 69
+	}
+	addr := net.JoinHostPort(t.BindAddr, fmt.Sprint(port))
 
 	conn, err := net.ListenPacket("udp", addr)
 	if err != nil {
@@ -56,6 +66,21 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 	ip := rf.(tftp.OutgoingTransfer).RemoteAddr().IP.String() //nolint:errcheck // Type is guaranteed by the tftp library.
 	filename = strings.TrimPrefix(filename, "/")
 	log := slog.With("proto", "tftp", "filename", filename, "ip", ip)
+	if t.Backend != nil {
+		if !validSessionArtifactPath(filename) {
+			return fmt.Errorf("invalid session artifact path %q", filename)
+		}
+		reader, err := t.Backend.Open(ctx, filename)
+		if err != nil {
+			return fmt.Errorf("opening backend artifact: %w", err)
+		}
+		defer reader.Close() //nolint:errcheck // Backend stream is no longer needed.
+		if _, err := rf.ReadFrom(reader); err != nil {
+			return fmt.Errorf("transferring backend artifact: %w", err)
+		}
+
+		return nil
+	}
 
 	node, err := t.LookupNodeByIP(ctx, ip)
 	if err != nil {
@@ -110,6 +135,11 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 	t.recordBootLoaderDownloaded(ctx, log, node, imageRef, filename)
 
 	return nil
+}
+
+func validSessionArtifactPath(filename string) bool {
+	parts := strings.Split(filename, "/")
+	return len(parts) >= 7 && parts[0] == "v1" && parts[1] == "netboot" && parts[2] == "sessions" && parts[3] != "" && parts[4] != "" && parts[5] == "artifacts" && parts[6] != ""
 }
 
 func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, filename string) {

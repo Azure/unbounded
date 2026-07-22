@@ -89,7 +89,7 @@ func TestEdgeCommandRequiresOnlyBackendConnection(t *testing.T) {
 	t.Parallel()
 
 	cmd := EdgeCmd()
-	for _, name := range []string{"backend-url", "bind-address", "http-port", "endpoint", "edge-token-file", "dhcp-enabled", "dhcp-interface", "dhcp-server-ip", "dhcp-port"} {
+	for _, name := range []string{"backend-url", "bind-address", "http-port", "endpoint", "edge-token-file", "dhcp-enabled", "dhcp-interface", "dhcp-server-ip", "dhcp-port", "tftp-enabled", "tftp-bind-address", "tftp-port"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("edge command has no --%s flag", name)
 		}
