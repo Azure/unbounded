@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/fstest"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +26,52 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+// TestApplyManifestFSSkipsNamespace asserts the operator apply path never writes
+// a Namespace object: the shared system namespace is owned solely by the
+// operator's namespace bootstrap, so components that ship a Namespace in their
+// manifests (for the standalone kubectl-apply path) must not clobber it.
+func TestApplyManifestFSSkipsNamespace(t *testing.T) {
+	manifests := fstest.MapFS{
+		"00-namespace.yaml": {Data: []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: unbounded-system\n")},
+		"10-configmap.yaml": {Data: []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\n  namespace: unbounded-system\n")},
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+
+	applied := map[string]bool{}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+			o, ok := obj.(interface {
+				GetKind() string
+				GetName() string
+			})
+			if !ok {
+				t.Fatalf("unexpected apply type %T", obj)
+			}
+
+			applied[o.GetKind()+"/"+o.GetName()] = true
+
+			return nil
+		},
+	}).Build()
+
+	env := &Env{Client: cl, Scheme: scheme, Namespace: BuildDefaultNamespace}
+	if err := env.ApplyManifestFS(context.Background(), manifests, nil); err != nil {
+		t.Fatalf("ApplyManifestFS: %v", err)
+	}
+
+	if applied["Namespace/unbounded-system"] {
+		t.Fatal("Namespace object must be skipped by the operator apply path")
+	}
+
+	if !applied["ConfigMap/demo"] {
+		t.Fatalf("non-Namespace object should be applied; applied=%#v", applied)
+	}
+}
 
 func TestConfigImage(t *testing.T) {
 	cfg := Config{ImageRegistry: "registry.example.com/mirror/", ImageTag: "v1.2.3"}

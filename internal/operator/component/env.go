@@ -36,6 +36,14 @@ const (
 	// them during reconcile.
 	CRDKind = "CustomResourceDefinition"
 
+	// NamespaceKind is the Kind of a Namespace object in the embedded manifests.
+	// The shared system namespace is owned by the operator's namespace bootstrap
+	// (see BootstrapNamespace), which is its single writer, so components skip
+	// any Namespace object during reconcile. The Namespace docs remain in the
+	// per-component templates for the standalone `kubectl apply -f deploy/<x>`
+	// path, exactly like CRDs.
+	NamespaceKind = "Namespace"
+
 	// SiteLabelKey is the canonical node label for site membership
 	// (unbounded-cloud.io/site). Per-site components node-select on it.
 	SiteLabelKey = unboundedv1alpha3.MachineSiteLabelKey
@@ -205,6 +213,13 @@ func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*u
 		}
 
 		if obj.Object == nil {
+			continue
+		}
+
+		// The shared system namespace is owned solely by the operator's
+		// namespace bootstrap. Skipping it here keeps components from
+		// re-applying (and clobbering the labels of) the one namespace object.
+		if obj.GetKind() == NamespaceKind {
 			continue
 		}
 

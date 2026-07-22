@@ -17,11 +17,16 @@ import (
 
 // namespaceTemplate names a component's manifest template directory and the
 // rendered file (relative to that directory) that declares its Namespace
-// resource.
+// resource. operatorManaged marks the components the unbounded-operator
+// reconciles into the shared system namespace; those must ship the canonical
+// label set (SystemNamespaceLabels) so the direct-apply path matches the
+// operator's BootstrapNamespace. Standalone deploy flows (machine-ops, orca,
+// inventory) are name-checked only.
 type namespaceTemplate struct {
-	component    string
-	templatesDir string
-	renderedFile string
+	component       string
+	templatesDir    string
+	renderedFile    string
+	operatorManaged bool
 }
 
 // TestSystemNamespace_MatchesTemplateDefaults is the drift guard between the
@@ -36,14 +41,14 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 	root := repoRoot(t)
 
 	templates := []namespaceTemplate{
-		{"machina", filepath.Join("deploy", "machina"), "01-namespace.yaml"},
-		{"machine-ops", filepath.Join("deploy", "machine-ops"), "00-namespace.yaml"},
-		{"orca", filepath.Join("deploy", "orca"), "01-namespace.yaml"},
-		{"storage-supervisor", filepath.Join("deploy", "unbounded-storage-supervisor"), "01-namespace.yaml"},
-		{"unbounded-operator", filepath.Join("deploy", "unbounded-operator"), "00-namespace.yaml"},
-		{"net", filepath.Join("deploy", "net"), "00-namespace.yaml"},
-		{"gantry", filepath.Join("deploy", "gantry"), "serviceaccount.yaml"},
-		{"inventory", filepath.Join("deploy", "inventory"), filepath.Join("common", "01-namespace.yaml")},
+		{"machina", filepath.Join("deploy", "machina"), "01-namespace.yaml", true},
+		{"machine-ops", filepath.Join("deploy", "machine-ops"), "00-namespace.yaml", false},
+		{"orca", filepath.Join("deploy", "orca"), "01-namespace.yaml", false},
+		{"storage-supervisor", filepath.Join("deploy", "unbounded-storage-supervisor"), "01-namespace.yaml", true},
+		{"unbounded-operator", filepath.Join("deploy", "unbounded-operator"), "00-namespace.yaml", true},
+		{"net", filepath.Join("deploy", "net"), "00-namespace.yaml", true},
+		{"gantry", filepath.Join("deploy", "gantry"), "00-namespace.yaml", true},
+		{"inventory", filepath.Join("deploy", "inventory"), filepath.Join("common", "01-namespace.yaml"), false},
 	}
 
 	for _, tc := range templates {
@@ -62,24 +67,46 @@ func TestSystemNamespace_MatchesTemplateDefaults(t *testing.T) {
 				t.Fatalf("read rendered %s: %v", tc.renderedFile, err)
 			}
 
-			name := namespaceResourceName(t, raw)
+			name, labels := namespaceResource(t, raw)
 			if name != systemNamespace {
 				t.Fatalf("%s template default namespace %q does not match systemNamespace %q; keep the const and the manifest template defaults in sync",
 					tc.component, name, systemNamespace)
+			}
+
+			if !tc.operatorManaged {
+				return
+			}
+
+			// Operator-managed components must ship the canonical labels + PSA
+			// so a direct `kubectl apply` yields the same namespace posture the
+			// operator's BootstrapNamespace maintains.
+			want := SystemNamespaceLabels()
+			for key, wantValue := range want {
+				if labels[key] != wantValue {
+					t.Fatalf("%s namespace label %q = %q, want %q; keep the template labels in sync with SystemNamespaceLabels",
+						tc.component, key, labels[key], wantValue)
+				}
+			}
+
+			for key := range labels {
+				if _, ok := want[key]; !ok {
+					t.Fatalf("%s namespace carries unexpected label %q; the operator-managed namespace must ship exactly SystemNamespaceLabels", tc.component, key)
+				}
 			}
 		})
 	}
 }
 
-// namespaceResourceName extracts metadata.name from the `kind: Namespace`
-// document in a (possibly multi-document) rendered manifest.
-func namespaceResourceName(t *testing.T, manifest []byte) string {
+// namespaceResource extracts metadata.name and metadata.labels from the
+// `kind: Namespace` document in a (possibly multi-document) rendered manifest.
+func namespaceResource(t *testing.T, manifest []byte) (string, map[string]string) {
 	t.Helper()
 
 	type k8sObject struct {
 		Kind     string `json:"kind"`
 		Metadata struct {
-			Name string `json:"name"`
+			Name   string            `json:"name"`
+			Labels map[string]string `json:"labels"`
 		} `json:"metadata"`
 	}
 
@@ -95,13 +122,13 @@ func namespaceResourceName(t *testing.T, manifest []byte) string {
 		}
 
 		if obj.Kind == "Namespace" {
-			return obj.Metadata.Name
+			return obj.Metadata.Name, obj.Metadata.Labels
 		}
 	}
 
 	t.Fatal("no Namespace resource found in rendered manifest")
 
-	return ""
+	return "", nil
 }
 
 // repoRoot walks up from this test file's directory until it finds go.mod.
