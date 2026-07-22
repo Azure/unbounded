@@ -16,6 +16,9 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites/status"]
     verbs: ["get", "patch", "update"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["netbootendpoints"]
+    verbs: ["get", "list", "watch"]
   # Legacy net-group Sites are read during migration and translated into the
   # machina-group Sites above; their finalizers are cleared (update/patch) so the
   # CRD can be deleted once drained.
@@ -44,6 +47,9 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "daemonsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
   - apiGroups: ["apps"]
     resources: ["statefulsets", "replicasets"]

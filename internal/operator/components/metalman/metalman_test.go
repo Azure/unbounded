@@ -116,6 +116,22 @@ func TestRBACSeparatesControllerAndServerIdentities(t *testing.T) {
 	}
 }
 
+func TestOperatorRBACCanReconcileNetbootEndpoints(t *testing.T) {
+	data, err := os.ReadFile("../../../../deploy/unbounded-operator/02-rbac.yaml.tmpl")
+	if err != nil {
+		t.Fatalf("read operator RBAC template: %v", err)
+	}
+	manifest := string(data)
+	for _, required := range []string{
+		"resources: [\"netbootendpoints\"]",
+		"resources: [\"poddisruptionbudgets\"]",
+	} {
+		if !strings.Contains(manifest, required) {
+			t.Fatalf("operator RBAC template missing %q", required)
+		}
+	}
+}
+
 func TestDeployment(t *testing.T) {
 	enabled := true
 	site := &unboundedv1alpha3.Site{
@@ -267,6 +283,164 @@ func TestControllerAndServerWorkloadsAreSeparated(t *testing.T) {
 	}
 	if pdb.Spec.Selector == nil || pdb.Spec.Selector.MatchLabels["app.kubernetes.io/name"] != "metalman-server" {
 		t.Fatalf("PDB selector = %#v", pdb.Spec.Selector)
+	}
+}
+
+func TestEndpointEdgeWorkloadMatrix(t *testing.T) {
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+	cfg := component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"}
+
+	t.Run("managed L2 is the only host-network edge", func(t *testing.T) {
+		endpoint := &unboundedv1alpha3.NetbootEndpoint{
+			ObjectMeta: metav1.ObjectMeta{Name: "rack-a-lan"},
+			Spec: unboundedv1alpha3.NetbootEndpointSpec{
+				SiteRef:     site.Name,
+				Type:        unboundedv1alpha3.NetbootEndpointTypeManagedL2,
+				ExternalURL: "http://192.0.2.10:8880",
+				ManagedL2: &unboundedv1alpha3.NetbootManagedL2Spec{
+					NodeSelector: metav1.LabelSelector{MatchLabels: map[string]string{"provisioning-lan": "rack-a"}},
+					Interface:    "eno2",
+					Address:      "192.0.2.10",
+				},
+			},
+		}
+
+		deployment, service, err := endpointEdgeObjects(endpoint, site, component.DefaultNamespace, cfg)
+		if err != nil {
+			t.Fatalf("endpointEdgeObjects: %v", err)
+		}
+		if deployment == nil || service != nil {
+			t.Fatalf("managed L2 objects = deployment %v, service %v", deployment, service)
+		}
+		if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 1 {
+			t.Fatalf("managed L2 replicas = %v, want 1", deployment.Spec.Replicas)
+		}
+		pod := &deployment.Spec.Template.Spec
+		if !pod.HostNetwork || pod.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+			t.Fatalf("managed L2 networking = hostNetwork %v, dnsPolicy %q", pod.HostNetwork, pod.DNSPolicy)
+		}
+		if pod.Affinity == nil || pod.Affinity.NodeAffinity == nil ||
+			pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+			t.Fatalf("managed L2 edge lacks required placement: %#v", pod.Affinity)
+		}
+		container := &pod.Containers[0]
+		for _, arg := range []string{
+			"edge",
+			"--backend-url=http://metalman-server-rack-a." + component.DefaultNamespace + ".svc:8880",
+			"--endpoint=rack-a-lan",
+			"--dhcp-enabled",
+			"--dhcp-interface=eno2",
+			"--dhcp-server-ip=192.0.2.10",
+			"--tftp-enabled",
+		} {
+			if !containsString(container.Args, arg) {
+				t.Fatalf("managed L2 args %#v lack %q", container.Args, arg)
+			}
+		}
+		if pod.ServiceAccountName != "metalman-edge" {
+			t.Fatalf("managed L2 service account = %q", pod.ServiceAccountName)
+		}
+		assertProjectedEdgeToken(t, pod, container)
+		if !hasContainerPort(container.Ports, "http", 8880) ||
+			!hasContainerPort(container.Ports, "dhcp", 67) ||
+			!hasContainerPort(container.Ports, "tftp", 69) {
+			t.Fatalf("managed L2 ports = %#v", container.Ports)
+		}
+	})
+
+	t.Run("HTTP edge uses ordinary replicated pods and a Service", func(t *testing.T) {
+		endpoint := &unboundedv1alpha3.NetbootEndpoint{
+			ObjectMeta: metav1.ObjectMeta{Name: "public-http"},
+			Spec: unboundedv1alpha3.NetbootEndpointSpec{
+				SiteRef:     site.Name,
+				Type:        unboundedv1alpha3.NetbootEndpointTypeHTTP,
+				ExternalURL: "https://boot.example.com",
+				TLS: unboundedv1alpha3.NetbootEndpointTLS{
+					Trust: unboundedv1alpha3.NetbootEndpointTrustPublic,
+					Mode:  unboundedv1alpha3.NetbootEndpointTLSExternal,
+				},
+				HTTP: &unboundedv1alpha3.NetbootHTTPEndpointSpec{ServiceType: corev1.ServiceTypeNodePort},
+			},
+		}
+
+		deployment, service, err := endpointEdgeObjects(endpoint, site, component.DefaultNamespace, cfg)
+		if err != nil {
+			t.Fatalf("endpointEdgeObjects: %v", err)
+		}
+		if deployment == nil || service == nil {
+			t.Fatalf("HTTP objects = deployment %v, service %v", deployment, service)
+		}
+		if deployment.Spec.Replicas == nil || *deployment.Spec.Replicas != 2 {
+			t.Fatalf("HTTP replicas = %v, want 2", deployment.Spec.Replicas)
+		}
+		assertOrdinaryPodNetworking(t, &deployment.Spec.Template.Spec)
+		args := deployment.Spec.Template.Spec.Containers[0].Args
+		if containsString(args, "--dhcp-enabled") || containsString(args, "--tftp-enabled") {
+			t.Fatalf("HTTP edge enables L2 protocols: %#v", args)
+		}
+		if service.Spec.Type != corev1.ServiceTypeNodePort || service.Spec.Selector[netbootEndpointLabel] != endpoint.Name {
+			t.Fatalf("HTTP edge Service = %#v", service.Spec)
+		}
+	})
+
+	t.Run("external L2 has no in-cluster workload", func(t *testing.T) {
+		endpoint := &unboundedv1alpha3.NetbootEndpoint{
+			ObjectMeta: metav1.ObjectMeta{Name: "admin-laptop"},
+			Spec: unboundedv1alpha3.NetbootEndpointSpec{
+				SiteRef: site.Name,
+				Type:    unboundedv1alpha3.NetbootEndpointTypeExternalL2,
+			},
+		}
+
+		deployment, service, err := endpointEdgeObjects(endpoint, site, component.DefaultNamespace, cfg)
+		if err != nil {
+			t.Fatalf("endpointEdgeObjects: %v", err)
+		}
+		if deployment != nil || service != nil {
+			t.Fatalf("external L2 objects = deployment %v, service %v", deployment, service)
+		}
+	})
+}
+
+func TestReconcileEndpointEdgesDeletesStaleManagedWorkloads(t *testing.T) {
+	scheme := testScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
+	staleLabels := map[string]string{
+		"app.kubernetes.io/component":         metalmanEdgeRole,
+		unboundedv1alpha3.MachineSiteLabelKey: site.Name,
+		netbootEndpointLabel:                  "removed-endpoint",
+	}
+	staleDeployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      EdgeName("removed-endpoint"),
+		Namespace: component.DefaultNamespace,
+		Labels:    staleLabels,
+	}}
+	staleService := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      EdgeName("removed-endpoint"),
+		Namespace: component.DefaultNamespace,
+		Labels:    staleLabels,
+	}}
+	external := &unboundedv1alpha3.NetbootEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "external-endpoint"},
+		Spec: unboundedv1alpha3.NetbootEndpointSpec{
+			SiteRef: site.Name,
+			Type:    unboundedv1alpha3.NetbootEndpointTypeExternalL2,
+		},
+	}
+	env := &component.Env{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(staleDeployment, staleService, external).Build(),
+		Scheme: scheme, Namespace: component.DefaultNamespace,
+		Config: component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"},
+	}
+
+	if err := reconcileEndpointEdges(t.Context(), env, site); err != nil {
+		t.Fatalf("reconcileEndpointEdges: %v", err)
+	}
+	for _, object := range []client.Object{staleDeployment, staleService} {
+		err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(object), object)
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("stale %T still exists: err=%v", object, err)
+		}
 	}
 }
 
@@ -440,6 +614,37 @@ func assertSiteOwnerRef(t *testing.T, refs []metav1.OwnerReference, siteName, ui
 	if ref.Controller == nil || !*ref.Controller {
 		t.Fatalf("ownerRef is not a controller reference: %#v", ref)
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+
+	return false
+}
+
+func assertProjectedEdgeToken(t *testing.T, pod *corev1.PodSpec, container *corev1.Container) {
+	t.Helper()
+
+	for _, mount := range container.VolumeMounts {
+		if mount.Name != "edge-token" || mount.MountPath != "/var/run/secrets/metalman" || !mount.ReadOnly {
+			continue
+		}
+		for _, volume := range pod.Volumes {
+			if volume.Name != mount.Name || volume.Projected == nil || len(volume.Projected.Sources) != 1 {
+				continue
+			}
+			token := volume.Projected.Sources[0].ServiceAccountToken
+			if token != nil && token.Audience == "metalman-edge" && token.Path == "token" {
+				return
+			}
+		}
+	}
+
+	t.Fatalf("missing audience-bound projected edge token: mounts=%#v volumes=%#v", container.VolumeMounts, pod.Volumes)
 }
 
 func assertSiteAffinity(t *testing.T, affinity *corev1.Affinity, siteName string) {
