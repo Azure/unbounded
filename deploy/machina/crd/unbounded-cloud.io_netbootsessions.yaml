@@ -1,0 +1,414 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: netbootsessions.unbounded-cloud.io
+spec:
+  group: unbounded-cloud.io
+  names:
+    kind: NetbootSession
+    listKind: NetbootSessionList
+    plural: netbootsessions
+    shortNames:
+    - nbs
+    singular: netbootsession
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.machine.name
+      name: Machine
+      type: string
+    - jsonPath: .spec.endpoint.name
+      name: Endpoint
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.expiresAt
+      name: Expires
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha3
+    schema:
+      openAPIV3Schema:
+        description: |-
+          NetbootSession is an immutable provisioning contract for one
+          MachineOperation target. Runtime progress is recorded only in status.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: NetbootSessionSpec snapshots all input needed to provision
+              one target.
+            properties:
+              artifacts:
+                description: Artifacts identifies immutable OCI sources and files
+                  for this session.
+                properties:
+                  files:
+                    description: Files lists the named files an edge may request for
+                      this session.
+                    items:
+                      description: NetbootSessionArtifact maps a public artifact name
+                        to an immutable image path.
+                      properties:
+                        name:
+                          description: Name is the stable route name used by edges
+                            and rendered templates.
+                          minLength: 1
+                          type: string
+                        path:
+                          description: Path is the absolute path within the unpacked
+                            OCI image.
+                          pattern: ^/
+                          type: string
+                        size:
+                          description: Size is the expected file size when known.
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        source:
+                          description: Source selects the OCI image containing this
+                            file.
+                          enum:
+                          - MachineImage
+                          - NetbootImage
+                          type: string
+                      required:
+                      - name
+                      - path
+                      - source
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  machineImage:
+                    description: NetbootSessionImage identifies an OCI image resolved
+                      to an immutable digest.
+                    properties:
+                      digest:
+                        description: Digest is the immutable OCI manifest digest.
+                        pattern: ^sha256:[a-f0-9]{64}$
+                        type: string
+                      pullSecretRef:
+                        description: |-
+                          PullSecretRef references registry credentials without copying them into
+                          the session.
+                        properties:
+                          name:
+                            description: Name of the secret.
+                            minLength: 1
+                            type: string
+                          namespace:
+                            description: Namespace of the secret.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                      reference:
+                        description: Reference is the source repository reference
+                          used to resolve the image.
+                        minLength: 1
+                        type: string
+                    required:
+                    - digest
+                    - reference
+                    type: object
+                  netbootImage:
+                    description: NetbootSessionImage identifies an OCI image resolved
+                      to an immutable digest.
+                    properties:
+                      digest:
+                        description: Digest is the immutable OCI manifest digest.
+                        pattern: ^sha256:[a-f0-9]{64}$
+                        type: string
+                      pullSecretRef:
+                        description: |-
+                          PullSecretRef references registry credentials without copying them into
+                          the session.
+                        properties:
+                          name:
+                            description: Name of the secret.
+                            minLength: 1
+                            type: string
+                          namespace:
+                            description: Namespace of the secret.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                      reference:
+                        description: Reference is the source repository reference
+                          used to resolve the image.
+                        minLength: 1
+                        type: string
+                    required:
+                    - digest
+                    - reference
+                    type: object
+                required:
+                - files
+                - machineImage
+                - netbootImage
+                type: object
+              boot:
+                description: Boot snapshots firmware and provisioning network configuration.
+                properties:
+                  architecture:
+                    description: Architecture selects the boot artifact platform.
+                    enum:
+                    - amd64
+                    - arm64
+                    type: string
+                  configurationSource:
+                    description: NetbootConfigurationSource supplies the firmware
+                      boot target.
+                    enum:
+                    - DHCP
+                    - Redfish
+                    type: string
+                  dhcpLeases:
+                    description: DHCPLeases snapshots the target's provisioning network
+                      settings.
+                    items:
+                      description: DHCPLease defines static IPv4 provisioning network
+                        settings.
+                      properties:
+                        dns:
+                          description: DNS is a list of DNS server addresses.
+                          items:
+                            type: string
+                          type: array
+                        gateway:
+                          description: Gateway is the default gateway.
+                          type: string
+                        ipv4:
+                          description: IPv4 is the IP address to assign.
+                          type: string
+                        mac:
+                          description: MAC is the MAC address of the network interface.
+                          type: string
+                        subnetMask:
+                          description: SubnetMask is the subnet mask for the lease.
+                          type: string
+                      required:
+                      - gateway
+                      - ipv4
+                      - mac
+                      - subnetMask
+                      type: object
+                    type: array
+                  networkMode:
+                    description: NetbootNetworkMode configures the firmware provisioning
+                      interface.
+                    enum:
+                    - DHCP
+                    - Static
+                    type: string
+                  targetDisk:
+                    description: TargetDisk is the block device written by the installer.
+                    type: string
+                  transport:
+                    description: NetbootTransport is the protocol firmware uses to
+                      fetch boot artifacts.
+                    enum:
+                    - TFTP
+                    - HTTP
+                    type: string
+                required:
+                - architecture
+                - configurationSource
+                - networkMode
+                - transport
+                type: object
+              endpoint:
+                description: Endpoint snapshots the selected endpoint and advertised
+                  URL.
+                properties:
+                  externalURL:
+                    description: ExternalURL is the immutable base URL advertised
+                      for this session.
+                    pattern: ^https?://
+                    type: string
+                  name:
+                    description: Name is the NetbootEndpoint name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID detects deletion and recreation of the endpoint.
+                    type: string
+                required:
+                - externalURL
+                - name
+                - uid
+                type: object
+              expiresAt:
+                description: ExpiresAt is the last time new requests may use this
+                  session.
+                format: date-time
+                type: string
+              machine:
+                description: Machine identifies the exact Machine revision being provisioned.
+                properties:
+                  generation:
+                    description: Generation records the observed desired-state generation.
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  name:
+                    description: Name is the cluster-scoped object name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID detects deletion and recreation of the object.
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
+              operation:
+                description: Operation identifies the owning MachineOperation.
+                properties:
+                  generation:
+                    description: Generation records the observed desired-state generation.
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  name:
+                    description: Name is the cluster-scoped object name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID detects deletion and recreation of the object.
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
+            required:
+            - artifacts
+            - boot
+            - endpoint
+            - expiresAt
+            - machine
+            - operation
+            type: object
+            x-kubernetes-validations:
+            - message: netboot session spec is immutable
+              rule: self == oldSelf
+          status:
+            description: NetbootSessionStatus reports preparation and target-scoped
+              milestones.
+            properties:
+              capabilityID:
+                description: |-
+                  CapabilityID identifies the signing key and capability generation without
+                  persisting a bearer capability.
+                type: string
+              conditions:
+                description: |-
+                  Conditions contain preparation, endpoint readiness, and target-scoped
+                  provisioning milestones.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              phase:
+                description: Phase is the current durable lifecycle phase.
+                enum:
+                - Pending
+                - Preparing
+                - Ready
+                - Active
+                - Complete
+                - Failed
+                - Expired
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

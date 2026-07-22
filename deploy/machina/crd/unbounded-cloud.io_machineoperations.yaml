@@ -331,6 +331,23 @@ spec:
                             HostImage is the resolved provider-interpreted host image for HostReplace.
                             An empty value instructs the provider to preserve the current image.
                           type: string
+                        netbootSessionRef:
+                          description: |-
+                            NetbootSessionRef identifies the immutable provisioning session assigned
+                            to this HostReplace target.
+                          properties:
+                            name:
+                              description: Name is the NetbootSession name.
+                              minLength: 1
+                              type: string
+                            uid:
+                              description: UID detects deletion and recreation of
+                                the session.
+                              type: string
+                          required:
+                          - name
+                          - uid
+                          type: object
                         providerRef:
                           description: |-
                             ProviderRef identifies the exact provider-owned resource referenced by
