@@ -51,6 +51,29 @@ func TestCheckRedirectNoHTTPSDowngrade(t *testing.T) {
 	}
 }
 
+func TestCheckRedirectNoHTTPSDowngradeRejectsDowngradeAfterUpgrade(t *testing.T) {
+	t.Parallel()
+
+	original, err := http.NewRequest(http.MethodGet, "http://source.example.test/archive", http.NoBody)
+	if err != nil {
+		t.Fatalf("create original request: %v", err)
+	}
+
+	upgraded, err := http.NewRequest(http.MethodGet, "https://cdn.example.test/archive", http.NoBody)
+	if err != nil {
+		t.Fatalf("create upgraded request: %v", err)
+	}
+
+	downgraded, err := http.NewRequest(http.MethodGet, "http://mirror.example.test/archive", http.NoBody)
+	if err != nil {
+		t.Fatalf("create downgraded request: %v", err)
+	}
+
+	if err := CheckRedirectNoHTTPSDowngrade(downgraded, []*http.Request{original, upgraded}); err == nil {
+		t.Fatal("CheckRedirectNoHTTPSDowngrade() error = nil, want downgrade error")
+	}
+}
+
 func TestProbeRemoteHTTPObjectFallbackUsesRange(t *testing.T) {
 	t.Parallel()
 

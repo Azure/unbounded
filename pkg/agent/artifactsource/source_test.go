@@ -22,17 +22,7 @@ func TestSourceOpenHTTPSURL(t *testing.T) {
 	}))
 	defer server.Close()
 
-	originalClient := httpClient
-	httpClient = server.Client()
-
-	t.Cleanup(func() {
-		httpClient = originalClient
-	})
-
-	source, err := Parse(server.URL + "/artifact")
-	require.NoError(t, err)
-
-	body, err := source.Open(context.Background())
+	body, err := openHTTPWithClient(context.Background(), server.Client(), server.URL+"/artifact")
 	require.NoError(t, err)
 
 	defer body.Close() //nolint:errcheck // test cleanup

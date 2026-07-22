@@ -98,6 +98,9 @@ func TestNormalizeOfflineSourceRootHTTPS(t *testing.T) {
 
 	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test/bootstrap?token=value")
 	require.ErrorContains(t, err, "must not include user info, query parameters, or a fragment")
+
+	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test")
+	require.ErrorContains(t, err, "must include a host and archive path")
 }
 
 func TestMaterializeOfflineArchive(t *testing.T) {

@@ -106,6 +106,15 @@ func TestFindOCILayoutRoot(t *testing.T) {
 		t.Fatalf("write index.json: %v", err)
 	}
 
+	blobDir := filepath.Join(layoutDir, "blobs", "sha256")
+	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+		t.Fatalf("create blob dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(blobDir, "oci-layout"), []byte("blob"), 0o644); err != nil {
+		t.Fatalf("write blob: %v", err)
+	}
+
 	got, err := findOCILayoutRoot(extractDir)
 	if err != nil {
 		t.Fatalf("findOCILayoutRoot() error = %v", err)
@@ -122,12 +131,19 @@ func TestSingleOCILayoutReference(t *testing.T) {
 	layoutDir := t.TempDir()
 	index := `{
 		"schemaVersion": 2,
-		"manifests": [{
-			"mediaType": "application/vnd.oci.image.manifest.v1+json",
-			"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-			"size": 1,
-			"annotations": {"org.opencontainers.image.ref.name": "v1"}
-		}]
+		"manifests": [
+			{
+				"mediaType": "application/vnd.oci.image.manifest.v1+json",
+				"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+				"size": 1,
+				"annotations": {"org.opencontainers.image.ref.name": "v1"}
+			},
+			{
+				"mediaType": "application/vnd.oci.image.manifest.v1+json",
+				"digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+				"size": 1
+			}
+		]
 	}`
 
 	if err := os.WriteFile(filepath.Join(layoutDir, "index.json"), []byte(index), 0o644); err != nil {
@@ -154,12 +170,14 @@ func TestSingleOCILayoutReferenceRejectsMultipleImages(t *testing.T) {
 			{
 				"mediaType": "application/vnd.oci.image.manifest.v1+json",
 				"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-				"size": 1
+				"size": 1,
+				"annotations": {"org.opencontainers.image.ref.name": "v1"}
 			},
 			{
 				"mediaType": "application/vnd.oci.image.manifest.v1+json",
 				"digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-				"size": 1
+				"size": 1,
+				"annotations": {"org.opencontainers.image.ref.name": "v2"}
 			}
 		]
 	}`

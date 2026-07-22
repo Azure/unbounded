@@ -115,12 +115,16 @@ func (s Source) Open(ctx context.Context) (io.ReadCloser, error) {
 }
 
 func openHTTP(ctx context.Context, source string) (io.ReadCloser, error) {
+	return openHTTPWithClient(ctx, httpClient, source)
+}
+
+func openHTTPWithClient(ctx context.Context, client *http.Client, source string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to perform HTTP request: %w", err)
 	}

@@ -42,7 +42,8 @@ func ExtractTar(body io.Reader, destDir string) error {
 			return fmt.Errorf("read tar archive: %w", err)
 		}
 
-		if header.Typeflag == tar.TypeDir && (header.Name == "." || header.Name == "./") {
+		if header.Typeflag == tar.TypeXGlobalHeader ||
+			header.Typeflag == tar.TypeDir && (header.Name == "." || header.Name == "./") {
 			continue
 		}
 

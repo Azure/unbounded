@@ -73,6 +73,10 @@ func emptyContainerImageArchiveStaging() *ContainerImageArchiveStaging {
 }
 
 func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOfflineArtifacts) (*ResolvedOfflineArtifacts, error) {
+	return resolveOfflineArtifactsContext(context.Background(), cfg, offline)
+}
+
+func resolveOfflineArtifactsContext(ctx context.Context, cfg *config.AgentConfig, offline *config.AgentOfflineArtifacts) (*ResolvedOfflineArtifacts, error) {
 	if offline == nil || strings.TrimSpace(offline.Source) == "" {
 		return nil, errors.New("OfflineArtifacts.Source is required")
 	}
@@ -98,7 +102,7 @@ func resolveOfflineArtifacts(cfg *config.AgentConfig, offline *config.AgentOffli
 
 	httpsArchive := strings.HasPrefix(sourceRoot, "https://")
 	if httpsArchive {
-		sourceRoot, err = materializeHTTPSOfflineArchive(context.Background(), sourceRoot)
+		sourceRoot, err = materializeHTTPSOfflineArchive(ctx, sourceRoot)
 		if err != nil {
 			return nil, err
 		}
@@ -180,8 +184,8 @@ func normalizeOfflineSourceRoot(source string) (string, error) {
 			return "", fmt.Errorf("parse HTTPS offline artifact source: %w", err)
 		}
 
-		if u.Host == "" {
-			return "", errors.New("HTTPS offline artifact source must include a host")
+		if u.Host == "" || strings.Trim(u.Path, "/") == "" {
+			return "", errors.New("HTTPS offline artifact source must include a host and archive path")
 		}
 
 		if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
@@ -438,11 +442,17 @@ func verifyOCIArtifacts(sourceRoot string, paths []string) error {
 // configured, the input downloads are returned unchanged and staging points at
 // the host-side empty archive directory.
 func ResolveDownloadOverridesWithOfflineArtifacts(cfg *config.AgentConfig, downloads *DownloadOverrides) (*DownloadOverrides, *ContainerImageArchiveStaging, error) {
+	return ResolveDownloadOverridesWithOfflineArtifactsContext(context.Background(), cfg, downloads)
+}
+
+// ResolveDownloadOverridesWithOfflineArtifactsContext resolves offline artifact
+// sources using ctx for archive download and extraction.
+func ResolveDownloadOverridesWithOfflineArtifactsContext(ctx context.Context, cfg *config.AgentConfig, downloads *DownloadOverrides) (*DownloadOverrides, *ContainerImageArchiveStaging, error) {
 	if cfg == nil || cfg.OfflineArtifacts == nil || strings.TrimSpace(cfg.OfflineArtifacts.Source) == "" {
 		return downloads, emptyContainerImageArchiveStaging(), nil
 	}
 
-	resolved, err := resolveOfflineArtifacts(cfg, cfg.OfflineArtifacts)
+	resolved, err := resolveOfflineArtifactsContext(ctx, cfg, cfg.OfflineArtifacts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve bootstrap artifact sources: %w", err)
 	}

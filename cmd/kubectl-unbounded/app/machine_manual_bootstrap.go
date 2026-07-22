@@ -245,8 +245,8 @@ func validateHTTPSArtifactsSource(source string) error {
 		return fmt.Errorf("parse HTTPS URL: %w", err)
 	}
 
-	if u.Host == "" {
-		return errors.New("HTTPS URL must include a host")
+	if u.Host == "" || strings.Trim(u.Path, "/") == "" {
+		return errors.New("HTTPS URL must include a host and archive path")
 	}
 
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {

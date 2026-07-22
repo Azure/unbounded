@@ -41,6 +41,30 @@ func TestExtractTarPlain(t *testing.T) {
 	require.FileExists(t, filepath.Join(dest, "oci-layout"))
 }
 
+func TestExtractTarAcceptsPAXGlobalHeader(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+
+	writer := tar.NewWriter(&buffer)
+
+	require.NoError(t, writer.WriteHeader(&tar.Header{
+		Name:     "pax_global_header",
+		Typeflag: tar.TypeXGlobalHeader,
+		PAXRecords: map[string]string{
+			"comment": "test archive",
+		},
+	}))
+	require.NoError(t, writer.WriteHeader(&tar.Header{Name: "manifest.json", Mode: 0o644, Size: 2}))
+	_, err := writer.Write([]byte("{}"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	dest := t.TempDir()
+	require.NoError(t, ExtractTar(bytes.NewReader(buffer.Bytes()), dest))
+	require.FileExists(t, filepath.Join(dest, "manifest.json"))
+}
+
 func TestExtractTarRejectsTraversal(t *testing.T) {
 	t.Parallel()
 

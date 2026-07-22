@@ -35,7 +35,7 @@ var remoteHTTPProbeClient = &http.Client{
 // insecure destination while allowing redirects that preserve or improve the
 // transport scheme.
 func CheckRedirectNoHTTPSDowngrade(req *http.Request, via []*http.Request) error {
-	if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+	if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
 		return fmt.Errorf("refusing redirect from HTTPS to %q", req.URL.Scheme)
 	}
 

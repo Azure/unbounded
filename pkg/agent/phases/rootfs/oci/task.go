@@ -400,6 +400,10 @@ func findOCILayoutRoot(extractDir string) (string, error) {
 			return err
 		}
 
+		if entry.IsDir() && entry.Name() == "blobs" {
+			return filepath.SkipDir
+		}
+
 		if !entry.IsDir() && entry.Name() == "oci-layout" {
 			layouts = append(layouts, filepath.Dir(path))
 		}
@@ -436,13 +440,23 @@ func singleOCILayoutReference(layoutDir string) (string, error) {
 		return "", fmt.Errorf("parse HTTPS OCI image archive index: %w", err)
 	}
 
-	if len(index.Manifests) != 1 {
-		return "", fmt.Errorf("HTTPS OCI image archive must contain exactly one image reference")
+	var reference string
+
+	for _, descriptor := range index.Manifests {
+		name := descriptor.Annotations[ocispec.AnnotationRefName]
+		if name == "" {
+			continue
+		}
+
+		if reference != "" {
+			return "", fmt.Errorf("HTTPS OCI image archive contains multiple tagged image references")
+		}
+
+		reference = name
 	}
 
-	reference := index.Manifests[0].Annotations[ocispec.AnnotationRefName]
 	if reference == "" {
-		return "", fmt.Errorf("HTTPS OCI image archive contains an unnamed image reference")
+		return "", fmt.Errorf("HTTPS OCI image archive does not contain a tagged image reference")
 	}
 
 	return reference, nil

@@ -4,6 +4,7 @@
 package provision
 
 import (
+	"context"
 	"maps"
 	"strings"
 
@@ -253,7 +254,13 @@ func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
 // converted into the goalstates.DownloadOverrides shape that rootfs phase tasks
 // consume.
 func ResolveDownloadOverridesWithOfflineArtifacts(cfg *UnboundedAgentConfig) (*goalstates.DownloadOverrides, *goalstates.ContainerImageArchiveStaging, error) {
-	return goalstates.ResolveDownloadOverridesWithOfflineArtifacts(&cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
+	return ResolveDownloadOverridesWithOfflineArtifactsContext(context.Background(), cfg)
+}
+
+// ResolveDownloadOverridesWithOfflineArtifactsContext resolves rootfs download
+// overrides using ctx for offline archive download and extraction.
+func ResolveDownloadOverridesWithOfflineArtifactsContext(ctx context.Context, cfg *UnboundedAgentConfig) (*goalstates.DownloadOverrides, *goalstates.ContainerImageArchiveStaging, error) {
+	return goalstates.ResolveDownloadOverridesWithOfflineArtifactsContext(ctx, &cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
 }
 
 // ResolveDownloadOverrides converts the provision AgentDownloads into the
