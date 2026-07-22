@@ -1,0 +1,150 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package machineops
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/netboot"
+)
+
+func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
+	t.Parallel()
+
+	machine := testBareMetalMachine("machine-session", "rack-a")
+	machine.UID = "machine-uid"
+	machine.Generation = 4
+	machine.Spec.PXE.EndpointRef = "rack-a-edge"
+	machine.Spec.PXE.NetbootImage = "ghcr.io/test/netboot:v1"
+	op := testOperation("replace-session", v1alpha3.OperationHostReplace)
+	op.UID = "operation-uid"
+	op.Generation = 2
+	endpoint := readyTestEndpoint()
+
+	cache := netboot.NewOCICache(t.TempDir())
+	cache.SetDigestForArchitecture(machine.Spec.PXE.Image, v1alpha3.DefaultPXEArchitecture, "sha256:"+stringOf('a', 64))
+	cache.SetDigestForArchitecture(machine.Spec.PXE.NetbootImage, v1alpha3.DefaultPXEArchitecture, "sha256:"+stringOf('b', 64))
+
+	s := testScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(endpoint).WithStatusSubresource(&v1alpha3.NetbootSession{}).Build()
+	manager := &KubernetesSessionManager{
+		Client: c,
+		Cache:  cache,
+		Now:    func() metav1.Time { return fixedNow() },
+	}
+
+	session, err := manager.Ensure(t.Context(), op, machine)
+	require.NoError(t, err)
+	require.Equal(t, v1alpha3.NetbootSessionPhaseReady, session.Status.Phase)
+	require.Equal(t, "sha256:"+stringOf('a', 64), session.Spec.Artifacts.MachineImage.Digest)
+	require.Equal(t, "sha256:"+stringOf('b', 64), session.Spec.Artifacts.NetbootImage.Digest)
+	require.Equal(t, machine.UID, session.Spec.Machine.UID)
+	require.Equal(t, op.UID, session.Spec.Operation.UID)
+	require.Equal(t, endpoint.Spec.ExternalURL, session.Spec.Endpoint.ExternalURL)
+	require.True(t, session.Spec.ExpiresAt.Time.Equal(fixedNow().Add(24*time.Hour)))
+
+	machine.Spec.PXE.Image = "ghcr.io/test/changed:v2"
+	reused, err := manager.Ensure(t.Context(), op, machine)
+	require.NoError(t, err)
+	require.Equal(t, session.Name, reused.Name)
+	require.Equal(t, "ghcr.io/test/host:v1", reused.Spec.Artifacts.MachineImage.Reference)
+
+	var sessions v1alpha3.NetbootSessionList
+	require.NoError(t, c.List(t.Context(), &sessions, client.MatchingLabels{sessionOperationUIDLabel: string(op.UID)}))
+	require.Len(t, sessions.Items, 1)
+}
+
+func TestSessionManagerWaitsForImmutableDigests(t *testing.T) {
+	t.Parallel()
+
+	machine := testBareMetalMachine("machine-pending", "rack-a")
+	machine.UID = "machine-uid"
+	machine.Generation = 1
+	machine.Spec.PXE.EndpointRef = "rack-a-edge"
+	machine.Spec.PXE.NetbootImage = "ghcr.io/test/netboot:v1"
+	op := testOperation("replace-pending", v1alpha3.OperationHostReplace)
+	op.UID = "operation-uid"
+	op.Generation = 1
+
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(readyTestEndpoint()).WithStatusSubresource(&v1alpha3.NetbootSession{}).Build()
+	manager := &KubernetesSessionManager{Client: c, Cache: netboot.NewOCICache(t.TempDir())}
+
+	_, err := manager.Ensure(t.Context(), op, machine)
+	require.ErrorIs(t, err, netboot.ErrNotYetDownloaded)
+
+	var sessions v1alpha3.NetbootSessionList
+	require.NoError(t, c.List(t.Context(), &sessions))
+	require.Empty(t, sessions.Items)
+}
+
+func TestSessionManagerPromotesExistingSessionWhenEndpointBecomesReady(t *testing.T) {
+	t.Parallel()
+
+	machine := testBareMetalMachine("machine-endpoint", "rack-a")
+	machine.UID = "machine-uid"
+	machine.Generation = 1
+	machine.Spec.PXE.EndpointRef = "rack-a-edge"
+	machine.Spec.PXE.NetbootImage = "ghcr.io/test/netboot:v1"
+	op := testOperation("replace-endpoint", v1alpha3.OperationHostReplace)
+	op.UID = "operation-uid"
+	op.Generation = 1
+	endpoint := readyTestEndpoint()
+	endpoint.Status.Conditions[0].Status = metav1.ConditionFalse
+
+	cache := netboot.NewOCICache(t.TempDir())
+	cache.SetDigestForArchitecture(machine.Spec.PXE.Image, v1alpha3.DefaultPXEArchitecture, "sha256:"+stringOf('a', 64))
+	cache.SetDigestForArchitecture(machine.Spec.PXE.NetbootImage, v1alpha3.DefaultPXEArchitecture, "sha256:"+stringOf('b', 64))
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(endpoint).WithStatusSubresource(endpoint, &v1alpha3.NetbootSession{}).Build()
+	manager := &KubernetesSessionManager{Client: c, Cache: cache}
+
+	session, err := manager.Ensure(t.Context(), op, machine)
+	require.NoError(t, err)
+	require.Equal(t, v1alpha3.NetbootSessionPhasePreparing, session.Status.Phase)
+
+	endpoint.Status.Conditions[0].Status = metav1.ConditionTrue
+	require.NoError(t, c.Status().Update(t.Context(), endpoint))
+
+	session, err = manager.Ensure(t.Context(), op, machine)
+	require.NoError(t, err)
+	require.Equal(t, v1alpha3.NetbootSessionPhaseReady, session.Status.Phase)
+}
+
+func readyTestEndpoint() *v1alpha3.NetbootEndpoint {
+	return &v1alpha3.NetbootEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a-edge", UID: "endpoint-uid", Generation: 3},
+		Spec: v1alpha3.NetbootEndpointSpec{
+			SiteRef:     "rack-a",
+			Type:        v1alpha3.NetbootEndpointTypeExternalL2,
+			ExternalURL: "http://192.0.2.10:8880",
+			TLS: v1alpha3.NetbootEndpointTLS{
+				Trust: v1alpha3.NetbootEndpointTrustTrustedLAN,
+				Mode:  v1alpha3.NetbootEndpointTLSDisabled,
+			},
+		},
+		Status: v1alpha3.NetbootEndpointStatus{
+			ObservedGeneration: 3,
+			Conditions: []metav1.Condition{{
+				Type:   "Ready",
+				Status: metav1.ConditionTrue,
+				Reason: "Available",
+			}},
+		},
+	}
+}
+
+func stringOf(value byte, count int) string {
+	result := make([]byte, count)
+	for i := range result {
+		result[i] = value
+	}
+
+	return string(result)
+}

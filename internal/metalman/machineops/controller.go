@@ -64,6 +64,12 @@ type PowerClientFactory interface {
 	ForMachine(ctx context.Context, machine *v1alpha3.Machine) (PowerClient, error)
 }
 
+// SessionManager creates or retrieves the immutable session for one
+// HostReplace target.
+type SessionManager interface {
+	Ensure(ctx context.Context, operation *v1alpha3.MachineOperation, machine *v1alpha3.Machine) (*v1alpha3.NetbootSession, error)
+}
+
 // Reconciler reconciles metalman-owned host MachineOperations.
 type Reconciler struct {
 	client.Client
@@ -71,6 +77,7 @@ type Reconciler struct {
 
 	Site                  string
 	PowerClients          PowerClientFactory
+	Sessions              SessionManager
 	HTTPBootURL           func(*v1alpha3.Machine) (string, error)
 	MaxConcurrentMachines int
 	MaxAttempts           int32
@@ -83,6 +90,9 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=netbootendpoints,verbs=get;list;watch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=netbootsessions,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=netbootsessions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -387,6 +397,40 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	case v1alpha3.OperationHostReboot:
 		return r.advanceReboot(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
+		if r.Sessions != nil {
+			session, err := r.Sessions.Ensure(ctx, op, &machine)
+			if err != nil {
+				if errors.Is(err, netboot.ErrNotYetDownloaded) {
+					target.Message = "waiting for OCI images to resolve to immutable digests"
+
+					return targetChange{target: target}
+				}
+
+				return retryTarget(target, fmt.Errorf("ensure netboot session: %w", err), now, r.maxAttempts())
+			}
+
+			if target.Input == nil {
+				target.Input = &v1alpha3.MachineOperationTargetInput{}
+			}
+
+			if target.Input.NetbootSessionRef == nil {
+				target.Input.NetbootSessionRef = &v1alpha3.NetbootSessionReference{Name: session.Name, UID: session.UID}
+				target.Message = fmt.Sprintf("persisted netboot session %s", session.Name)
+
+				return targetChange{target: target}
+			}
+
+			if target.Input.NetbootSessionRef.Name != session.Name || target.Input.NetbootSessionRef.UID != session.UID {
+				return failTarget(target, reasonExecutionFailed, "persisted netboot session identity changed", now)
+			}
+
+			if session.Status.Phase != v1alpha3.NetbootSessionPhaseReady && session.Status.Phase != v1alpha3.NetbootSessionPhaseActive {
+				target.Message = fmt.Sprintf("waiting for netboot session %s to become ready", session.Name)
+
+				return targetChange{target: target}
+			}
+		}
+
 		return r.advanceReplace(ctx, op, &machine, target, now)
 	default:
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("%s is not handled by metalman", op.Spec.OperationKind), now)

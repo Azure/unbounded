@@ -123,6 +123,16 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineoperations/status"]
     verbs: ["get", "update", "patch"]
+  # Netboot session controller
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["netbootendpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["netbootsessions"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["netbootsessions/status"]
+    verbs: ["get", "update", "patch"]
   # Secrets (Redfish passwords)
   - apiGroups: [""]
     resources: ["secrets"]

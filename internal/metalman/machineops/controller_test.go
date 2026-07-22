@@ -380,6 +380,42 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	require.Equal(t, v1alpha3.OperationPhaseComplete, completed.Status.Phase)
 }
 
+func TestReconcilerPersistsReadySessionBeforeHostReplaceSideEffects(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-session", "rack-a")
+	machine.UID = "machine-uid"
+	machine.Generation = 3
+	op := testOperation("op-session", v1alpha3.OperationHostReplace)
+	op.UID = "operation-uid"
+	op.Generation = 2
+	op.Spec.MachineRef = machine.Name
+
+	session := &v1alpha3.NetbootSession{
+		ObjectMeta: metav1.ObjectMeta{Name: "netboot-session", UID: "session-uid"},
+		Status:     v1alpha3.NetbootSessionStatus{Phase: v1alpha3.NetbootSessionPhaseReady},
+	}
+	sessions := &recordingSessionManager{session: session}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerOff}}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.Sessions = sessions
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	require.Empty(t, power.calls)
+
+	var preparing v1alpha3.MachineOperation
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: op.Name}, &preparing))
+	require.Equal(t, &v1alpha3.NetbootSessionReference{Name: session.Name, UID: session.UID}, preparing.Status.Targets[0].Input.NetbootSessionRef)
+	require.Equal(t, "persisted netboot session netboot-session", preparing.Status.Targets[0].Message)
+
+	_, err = reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"machine-session:SetBootOverride:Pxe:Continuous", "machine-session:On"}, power.calls)
+}
+
 func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {
 	t.Parallel()
 
@@ -1167,6 +1203,14 @@ type recordingPowerClient struct {
 	biosHTTPBootUnsupported map[string]bool
 	resetErrors             map[redfish.ResetType]error
 	calls                   []string
+}
+
+type recordingSessionManager struct {
+	session *v1alpha3.NetbootSession
+}
+
+func (m *recordingSessionManager) Ensure(_ context.Context, _ *v1alpha3.MachineOperation, _ *v1alpha3.Machine) (*v1alpha3.NetbootSession, error) {
+	return m.session.DeepCopy(), nil
 }
 
 func (r *recordingPowerClient) ForMachine(_ context.Context, machine *v1alpha3.Machine) (PowerClient, error) {

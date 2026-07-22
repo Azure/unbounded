@@ -215,6 +215,13 @@ func ServePXECmd() *cobra.Command {
 			redfishPool := redfish.NewPool()
 			defer redfishPool.Close()
 
+			sessionManager := &metalmachineops.KubernetesSessionManager{
+				Client:                   mgr.GetClient(),
+				Cache:                    ociCache,
+				DefaultNetbootRef:        defaultNetbootImage,
+				DefaultNetbootPullSecret: defaultNetbootPullSecretRef,
+			}
+
 			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient()}
 
 			resolver := netboot.FileResolver{
@@ -237,6 +244,7 @@ func ServePXECmd() *cobra.Command {
 				APIReader:             mgr.GetAPIReader(),
 				Site:                  site,
 				PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
+				Sessions:              sessionManager,
 				HTTPBootURL:           resolver.HTTPBootURL,
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
