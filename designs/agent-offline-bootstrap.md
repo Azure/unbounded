@@ -435,7 +435,7 @@ The agent treats HTTPS only as the transport for the archive:
 5. Mark the extracted cache ready only after all validation succeeds.
 6. Produce `file://` download overrides that point into the extracted cache.
 
-The cache directory name includes a short hash of the rendered source URL. A ready cache can be reused by bootstrap, preflight, repave, and upgrade operations. An incomplete cache is removed and rebuilt on the next resolution attempt.
+The cache directory name includes a short hash of the rendered source URL without its query string. Signed query parameters are treated as credentials rather than artifact identity, so SAS rotation reuses the cache for the same scheme, host, and path. A ready cache can be reused by bootstrap, preflight, repave, and upgrade operations. An incomplete cache is removed and rebuilt on the next resolution attempt.
 
 HTTPS archive URLs must include a host and archive path. Signed query strings, including Azure Blob SAS parameters, are supported and preserved during download. URL user info and fragments are rejected. Query values must be treated as sensitive and redacted from logs, errors, and cache directory prefixes. The HTTPS endpoint must use a certificate trusted by the host. Archive extraction rejects absolute or parent-traversing paths, duplicate files, links, and entry types other than directories and regular files.
 

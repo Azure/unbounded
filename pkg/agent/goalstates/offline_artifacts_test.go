@@ -108,12 +108,17 @@ func TestNormalizeOfflineSourceRootHTTPS(t *testing.T) {
 	require.NotContains(t, err.Error(), "secret")
 }
 
-func TestContainerImageArchiveSourceKeyRedactsQuery(t *testing.T) {
+func TestContainerImageArchiveSourceKeyIgnoresSignedQuery(t *testing.T) {
 	t.Parallel()
 
-	key := containerImageArchiveSourceKey("https://artifacts.example.test/bootstrap?sp=r&sig=secret")
-	require.NotContains(t, key, "secret")
-	require.NotContains(t, key, "sig")
+	withoutQuery := containerImageArchiveSourceKey("https://artifacts.example.test/bootstrap")
+	firstSAS := containerImageArchiveSourceKey("https://artifacts.example.test/bootstrap?sp=r&sig=first-secret")
+	rotatedSAS := containerImageArchiveSourceKey("https://artifacts.example.test/bootstrap?sp=r&sig=rotated-secret")
+
+	require.Equal(t, withoutQuery, firstSAS)
+	require.Equal(t, firstSAS, rotatedSAS)
+	require.NotContains(t, firstSAS, "secret")
+	require.NotContains(t, firstSAS, "sig")
 }
 
 func TestMaterializeOfflineArchive(t *testing.T) {

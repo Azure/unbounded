@@ -10,6 +10,15 @@ import (
 	"testing"
 )
 
+func TestURLWithoutQuery(t *testing.T) {
+	t.Parallel()
+
+	got := URLWithoutQuery("https://artifacts.example.test/archive?sp=r&sig=secret")
+	if got != "https://artifacts.example.test/archive" {
+		t.Fatalf("URLWithoutQuery() = %q", got)
+	}
+}
+
 func TestRedactURLQuery(t *testing.T) {
 	t.Parallel()
 

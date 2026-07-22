@@ -528,8 +528,8 @@ func containerImageArchiveHostDir(sourceRoot string) string {
 func containerImageArchiveSourceKey(sourceRoot string) string {
 	var b strings.Builder
 
-	redactedSource := utilio.RedactURLQuery(sourceRoot)
-	for _, r := range strings.ToLower(redactedSource) {
+	sourceIdentity := utilio.URLWithoutQuery(sourceRoot)
+	for _, r := range strings.ToLower(sourceIdentity) {
 		switch {
 		case r >= 'a' && r <= 'z':
 			b.WriteRune(r)
@@ -551,7 +551,7 @@ func containerImageArchiveSourceKey(sourceRoot string) string {
 		prefix = "source"
 	}
 
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(sourceRoot)))[:12]
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(sourceIdentity)))[:12]
 
 	return prefix + "-" + hash
 }

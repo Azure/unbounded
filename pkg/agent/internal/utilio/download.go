@@ -42,6 +42,23 @@ func CheckRedirectNoHTTPSDowngrade(req *http.Request, via []*http.Request) error
 	return nil
 }
 
+// URLWithoutQuery removes query parameters from rawURL. It returns a redacted
+// placeholder when rawURL cannot be parsed safely.
+func URLWithoutQuery(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "<redacted>"
+	}
+
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.RawQuery == "" {
+		return rawURL
+	}
+
+	parsed.RawQuery = ""
+
+	return parsed.String()
+}
+
 // RedactURLQuery removes query parameters from rawURL before it is logged or
 // included in an error message.
 func RedactURLQuery(rawURL string) string {
