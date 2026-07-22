@@ -51,7 +51,7 @@ func TestNetbootSessionSchema(t *testing.T) {
 	}
 
 	spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
-	for _, field := range []string{"machine", "operation", "endpoint", "boot", "artifacts", "expiresAt"} {
+	for _, field := range []string{"machine", "operation", "endpoint", "boot", "provisioning", "artifacts", "expiresAt"} {
 		if _, ok := spec.Properties[field]; !ok {
 			t.Errorf("session spec is missing %q", field)
 		}
@@ -66,6 +66,12 @@ func TestNetbootSessionSchema(t *testing.T) {
 	}
 	if firmware.MinLength == nil || *firmware.MinLength != 1 {
 		t.Error("session boot firmwareArtifact must be non-empty")
+	}
+	provisioning := spec.Properties["provisioning"]
+	for _, field := range []string{"cluster", "kubernetes", "agent", "providerLabels", "userData"} {
+		if _, ok := provisioning.Properties[field]; !ok {
+			t.Errorf("session provisioning snapshot is missing %q", field)
+		}
 	}
 
 	status := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["status"]

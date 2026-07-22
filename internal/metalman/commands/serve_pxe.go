@@ -231,6 +231,10 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 				Cache:                    ociCache,
 				DefaultNetbootRef:        defaultNetbootImage,
 				DefaultNetbootPullSecret: defaultNetbootPullSecretRef,
+				Cluster:                  clusterInfoWatcher,
+				KubernetesVersion:        kubeVersion,
+				ClusterDNS:               clusterDNS,
+				ProviderLabels:           providerLabels,
 			}
 
 			var statusQueue *metalmachineops.StatusQueue

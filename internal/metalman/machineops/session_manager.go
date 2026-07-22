@@ -7,9 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,6 +34,10 @@ type KubernetesSessionManager struct {
 	Cache                    *netboot.OCICache
 	DefaultNetbootRef        string
 	DefaultNetbootPullSecret *v1alpha3.NamespacedSecretReference
+	Cluster                  netboot.ClusterInfoProvider
+	KubernetesVersion        string
+	ClusterDNS               string
+	ProviderLabels           map[string]string
 	Now                      func() metav1.Time
 }
 
@@ -96,6 +102,14 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 	}
 
 	now := m.now()
+	userData, err := m.resolveUserData(ctx, netbootSpec)
+	if err != nil {
+		return nil, err
+	}
+	clusterInfo := netboot.ClusterInfo{}
+	if m.Cluster != nil {
+		clusterInfo = m.Cluster.ClusterInfo()
+	}
 	session := &v1alpha3.NetbootSession{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -120,6 +134,18 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 				Architecture:        architecture,
 				DHCPLeases:          append([]v1alpha3.DHCPLease(nil), netbootSpec.DHCPLeases...),
 				TargetDisk:          netbootSpec.TargetDisk,
+			},
+			Provisioning: v1alpha3.NetbootSessionProvisioning{
+				Cluster: v1alpha3.NetbootSessionCluster{
+					APIServerURL:      clusterInfo.ApiserverURL,
+					CACertBase64:      clusterInfo.CACertBase64,
+					DNS:               m.ClusterDNS,
+					KubernetesVersion: m.KubernetesVersion,
+				},
+				Kubernetes:     machine.Spec.Kubernetes.DeepCopy(),
+				Agent:          machine.Spec.Agent.DeepCopy(),
+				ProviderLabels: maps.Clone(m.ProviderLabels),
+				UserData:       userData,
 			},
 			Artifacts: v1alpha3.NetbootSessionArtifacts{
 				MachineImage: v1alpha3.NetbootSessionImage{
@@ -151,6 +177,31 @@ func (m *KubernetesSessionManager) Ensure(ctx context.Context, operation *v1alph
 	}
 
 	return m.refreshEndpointReadinessWithEndpoint(ctx, session, &endpoint)
+}
+
+func (m *KubernetesSessionManager) resolveUserData(ctx context.Context, spec *v1alpha3.PXESpec) (string, error) {
+	if spec.CloudInit == nil || spec.CloudInit.UserDataConfigMapRef == nil {
+		return "#cloud-config\n", nil
+	}
+
+	ref := spec.CloudInit.UserDataConfigMapRef
+	var configMap corev1.ConfigMap
+	if err := m.Client.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &configMap); err != nil {
+		return "", fmt.Errorf("get cloud-init user-data ConfigMap %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	key := ref.Key
+	if key == "" {
+		key = "user-data"
+	}
+	if value, ok := configMap.Data[key]; ok {
+		return value, nil
+	}
+	if value, ok := configMap.BinaryData[key]; ok {
+		return string(value), nil
+	}
+
+	return "", fmt.Errorf("cloud-init user-data key %q not found in ConfigMap %s/%s", key, ref.Namespace, ref.Name)
 }
 
 func (m *KubernetesSessionManager) refreshEndpointReadiness(ctx context.Context, session *v1alpha3.NetbootSession) (*v1alpha3.NetbootSession, error) {

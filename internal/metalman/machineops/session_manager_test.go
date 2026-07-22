@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -27,6 +28,15 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 	machine.Spec.PXE.EndpointRef = "rack-a-edge"
 	machine.Spec.PXE.NetbootImage = "ghcr.io/test/netboot:v1"
 	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
+	machine.Spec.Kubernetes = &v1alpha3.KubernetesSpec{
+		Version:            "v1.35.0",
+		NodeLabels:         map[string]string{"user-label": "original"},
+		RegisterWithTaints: []string{"dedicated=metal:NoSchedule"},
+	}
+	machine.Spec.Agent = &v1alpha3.AgentSpec{Image: "ghcr.io/test/agent:v1", Version: "v1.2.3"}
+	machine.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{
+		Name: "machine-session-user-data", Namespace: "default",
+	}}
 	op := testOperation("replace-session", v1alpha3.OperationHostReplace)
 	op.UID = "operation-uid"
 	op.Generation = 2
@@ -40,11 +50,18 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 	require.NoError(t, writeSessionMetadata(cache, netbootDigest, "http/bootx64.efi"))
 
 	s := testScheme(t)
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(endpoint).WithStatusSubresource(&v1alpha3.NetbootSession{}).Build()
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(endpoint, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "machine-session-user-data", Namespace: "default"},
+		Data:       map[string]string{"user-data": "#cloud-config\nhostname: original\n"},
+	}).WithStatusSubresource(&v1alpha3.NetbootSession{}).Build()
 	manager := &KubernetesSessionManager{
-		Client: c,
-		Cache:  cache,
-		Now:    func() metav1.Time { return fixedNow() },
+		Client:            c,
+		Cache:             cache,
+		Cluster:           &netboot.StaticClusterInfo{Info: netboot.ClusterInfo{ApiserverURL: "https://api.example.com:6443", CACertBase64: "cluster-ca"}},
+		KubernetesVersion: "v1.34.0",
+		ClusterDNS:        "10.96.0.10",
+		ProviderLabels:    map[string]string{"provider-label": "original"},
+		Now:               func() metav1.Time { return fixedNow() },
 	}
 
 	session, err := manager.Ensure(t.Context(), op, machine)
@@ -56,6 +73,14 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 	require.Equal(t, op.UID, session.Spec.Operation.UID)
 	require.Equal(t, endpoint.Spec.ExternalURL, session.Spec.Endpoint.ExternalURL)
 	require.Equal(t, "http/bootx64.efi", session.Spec.Boot.FirmwareArtifact)
+	require.Equal(t, "https://api.example.com:6443", session.Spec.Provisioning.Cluster.APIServerURL)
+	require.Equal(t, "cluster-ca", session.Spec.Provisioning.Cluster.CACertBase64)
+	require.Equal(t, "10.96.0.10", session.Spec.Provisioning.Cluster.DNS)
+	require.Equal(t, "v1.34.0", session.Spec.Provisioning.Cluster.KubernetesVersion)
+	require.Equal(t, "original", session.Spec.Provisioning.Kubernetes.NodeLabels["user-label"])
+	require.Equal(t, "ghcr.io/test/agent:v1", session.Spec.Provisioning.Agent.Image)
+	require.Equal(t, "original", session.Spec.Provisioning.ProviderLabels["provider-label"])
+	require.Equal(t, "#cloud-config\nhostname: original\n", session.Spec.Provisioning.UserData)
 	require.Contains(t, session.Spec.Artifacts.Files, v1alpha3.NetbootSessionArtifact{
 		Name:   "http/bootx64.efi",
 		Source: "NetbootImage",
@@ -64,10 +89,16 @@ func TestSessionManagerSnapshotsDigestsAndReusesSession(t *testing.T) {
 	require.True(t, session.Spec.ExpiresAt.Time.Equal(fixedNow().Add(24*time.Hour)))
 
 	machine.Spec.PXE.Image = "ghcr.io/test/changed:v2"
+	machine.Spec.Kubernetes.NodeLabels["user-label"] = "changed"
+	machine.Spec.Agent.Image = "ghcr.io/test/agent:changed"
+	manager.ProviderLabels["provider-label"] = "changed"
 	reused, err := manager.Ensure(t.Context(), op, machine)
 	require.NoError(t, err)
 	require.Equal(t, session.Name, reused.Name)
 	require.Equal(t, "ghcr.io/test/host:v1", reused.Spec.Artifacts.MachineImage.Reference)
+	require.Equal(t, "original", reused.Spec.Provisioning.Kubernetes.NodeLabels["user-label"])
+	require.Equal(t, "ghcr.io/test/agent:v1", reused.Spec.Provisioning.Agent.Image)
+	require.Equal(t, "original", reused.Spec.Provisioning.ProviderLabels["provider-label"])
 
 	var sessions v1alpha3.NetbootSessionList
 	require.NoError(t, c.List(t.Context(), &sessions, client.MatchingLabels{sessionOperationUIDLabel: string(op.UID)}))

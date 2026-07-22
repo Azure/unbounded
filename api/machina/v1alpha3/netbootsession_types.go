@@ -86,6 +86,10 @@ type NetbootSessionSpec struct {
 	// Boot snapshots firmware and provisioning network configuration.
 	Boot NetbootSessionBoot `json:"boot"`
 
+	// Provisioning snapshots inputs used to render installer and first-boot
+	// configuration.
+	Provisioning NetbootSessionProvisioning `json:"provisioning"`
+
 	// Artifacts identifies immutable OCI sources and files for this session.
 	Artifacts NetbootSessionArtifacts `json:"artifacts"`
 
@@ -142,6 +146,37 @@ type NetbootSessionBoot struct {
 	// TargetDisk is the block device written by the installer.
 	// +optional
 	TargetDisk string `json:"targetDisk,omitempty"`
+}
+
+// NetbootSessionProvisioning snapshots installer and first-boot inputs.
+type NetbootSessionProvisioning struct {
+	Cluster NetbootSessionCluster `json:"cluster"`
+
+	// Kubernetes contains the target's immutable kubelet configuration.
+	// +optional
+	Kubernetes *KubernetesSpec `json:"kubernetes,omitempty"`
+
+	// Agent contains the immutable agent installation configuration.
+	// +optional
+	Agent *AgentSpec `json:"agent,omitempty"`
+
+	// ProviderLabels are merged into the rendered kubelet labels.
+	// +optional
+	ProviderLabels map[string]string `json:"providerLabels,omitempty"`
+
+	// UserData is the resolved cloud-init user-data content.
+	UserData string `json:"userData"`
+}
+
+// NetbootSessionCluster snapshots cluster connection inputs used by the agent.
+type NetbootSessionCluster struct {
+	APIServerURL string `json:"apiServerURL"`
+	CACertBase64 string `json:"caCertBase64"`
+	DNS          string `json:"dns"`
+
+	// KubernetesVersion is the cluster version used when the Machine does not
+	// specify one.
+	KubernetesVersion string `json:"kubernetesVersion"`
 }
 
 // NetbootSessionArtifacts snapshots immutable OCI sources and artifact paths.
