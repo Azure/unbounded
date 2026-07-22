@@ -71,6 +71,7 @@ func newRootCommand() *cobra.Command {
 	flags.StringSliceVar(&opts.Architectures, "arch", nil, "Target architecture to include. Repeat or comma separate. Defaults to the host GOARCH")
 
 	cmd.AddCommand(
+		newArchiveOCIImageCommand(&debug, &logFormat),
 		newResolvePublishInputsCommand(),
 		newPublishVersionGroupCommand(&debug, &logFormat),
 		newValidateOCICommand(&debug, &logFormat),
@@ -230,6 +231,42 @@ func logBundleContents(log *slog.Logger, root string) error {
 
 		return nil
 	})
+}
+
+func newArchiveOCIImageCommand(debug *bool, logFormat *string) *cobra.Command {
+	var sourceRef, outputPath string
+
+	cmd := &cobra.Command{
+		Use:          "archive-oci-image",
+		Short:        "Copy a registry image into a tarred OCI image layout",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if sourceRef == "" {
+				return fmt.Errorf("--source is required")
+			}
+
+			if outputPath == "" {
+				return fmt.Errorf("--output is required")
+			}
+
+			log := newLogger(*debug, *logFormat)
+			log.Info("archiving OCI image", slog.String("source", sourceRef), slog.String("archive", outputPath))
+
+			if err := artifacts.ArchiveOCIImage(cmd.Context(), sourceRef, outputPath); err != nil {
+				return err
+			}
+
+			log.Info("archived OCI image", slog.String("source", sourceRef), slog.String("archive", outputPath))
+
+			return nil
+		},
+	}
+
+	flags := cmd.Flags()
+	flags.StringVar(&sourceRef, "source", "", "Tagged OCI registry image reference to archive")
+	flags.StringVar(&outputPath, "output", "", "Output path for the gzip-compressed OCI layout archive")
+
+	return cmd
 }
 
 func newValidateOCICommand(debug *bool, logFormat *string) *cobra.Command {

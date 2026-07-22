@@ -27,6 +27,10 @@ func WriteBundleArchive(rootDir, archivePath string) error {
 		return fmt.Errorf("bundle archive path is required")
 	}
 
+	return writeDirectoryArchive(rootDir, archivePath)
+}
+
+func writeDirectoryArchive(rootDir, archivePath string) error {
 	inside, err := pathIsWithin(rootDir, archivePath)
 	if err != nil {
 		return err
