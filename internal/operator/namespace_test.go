@@ -166,12 +166,18 @@ func TestBootstrapNamespaceRefusesLegacyNamespace(t *testing.T) {
 }
 
 func TestBootstrapNamespaceDefaultsEmptyNamespace(t *testing.T) {
+	// Pin POD_NAMESPACE empty so the empty-namespace argument exercises the
+	// documented fallback to the build default rather than whatever namespace
+	// the test process happens to run in.
+	t.Setenv("POD_NAMESPACE", "")
+
 	c := namespaceTestClient(t)
 
 	if err := BootstrapNamespace(context.Background(), c, ""); err != nil {
 		t.Fatalf("BootstrapNamespace with empty namespace: %v", err)
 	}
 
-	// SystemNamespace() falls back to the default when POD_NAMESPACE is unset.
-	getNamespace(t, c, unbounded.SystemNamespace())
+	// With POD_NAMESPACE unset, an empty namespace falls back to the build
+	// default (DefaultSystemNamespace).
+	getNamespace(t, c, unbounded.DefaultSystemNamespace)
 }
