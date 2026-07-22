@@ -803,13 +803,24 @@ func isGatewayNodeFromCRDs(gatewayPoolInformer cache.SharedIndexInformer, myPubK
 	return false
 }
 
+func netbootMembershipFromCRDs(
+	sliceInformer, gatewayPoolInformer cache.SharedIndexInformer,
+	myPubKey string,
+) (string, bool) {
+	if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+		return siteName, true
+	}
+
+	return "", isGatewayNodeFromCRDs(gatewayPoolInformer, myPubKey)
+}
+
 // waitForSiteMembership waits for this node to appear in a SiteNodeSlice or GatewayPool.
 // This ensures the site controller has processed this node before we continue.
 // Returns the site name once found, or empty string for gateway nodes without a site.
 func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInformer cache.SharedIndexInformer, myPubKey string) (string, error) {
 	// Check immediately first
-	siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey)
-	if siteName != "" {
+	siteName, found := netbootMembershipFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey)
+	if found {
 		klog.Infof("Node found in site %q", siteName)
 		return siteName, nil
 	}
@@ -822,7 +833,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 	// Add event handlers to detect when we appear in a slice or pool
 	sliceHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+			if siteName, found := netbootMembershipFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); found {
 				select {
 				case foundCh <- siteName:
 				default:
@@ -830,7 +841,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+			if siteName, found := netbootMembershipFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); found {
 				select {
 				case foundCh <- siteName:
 				default:
@@ -841,7 +852,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 
 	poolHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+			if siteName, found := netbootMembershipFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); found {
 				select {
 				case foundCh <- siteName:
 				default:
@@ -849,7 +860,7 @@ func waitForSiteMembership(ctx context.Context, sliceInformer, gatewayPoolInform
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			if siteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); siteName != "" {
+			if siteName, found := netbootMembershipFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey); found {
 				select {
 				case foundCh <- siteName:
 				default:

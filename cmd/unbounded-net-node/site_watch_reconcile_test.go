@@ -106,6 +106,29 @@ func TestWaitForSiteMembershipImmediate(t *testing.T) {
 	}
 }
 
+func TestWaitForSiteMembershipAcceptsSiteLessGateway(t *testing.T) {
+	sliceInformer := newTestInformer()
+	gatewayPoolInformer := newTestInformer()
+	pool := &unboundednetv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "external"},
+		Spec:       unboundednetv1alpha1.GatewayPoolSpec{NodeSelector: map[string]string{"external": "true"}},
+		Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{
+			{Name: "admin-gateway", WireGuardPublicKey: "pub-external"},
+		}},
+	}
+	if err := gatewayPoolInformer.GetStore().Add(toUnstructuredSiteWatch(t, pool)); err != nil {
+		t.Fatalf("add pool failed: %v", err)
+	}
+
+	got, err := waitForSiteMembership(context.Background(), sliceInformer, gatewayPoolInformer, "pub-external")
+	if err != nil {
+		t.Fatalf("waitForSiteMembership returned error: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("site-less gateway membership = %q, want empty", got)
+	}
+}
+
 // TestGetManageCniPluginFromCRDs tests GetManageCniPluginFromCRDs.
 func TestGetManageCniPluginFromCRDs(t *testing.T) {
 	siteInformer := newTestInformer()
