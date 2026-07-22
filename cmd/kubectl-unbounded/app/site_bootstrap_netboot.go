@@ -6,9 +6,13 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -16,6 +20,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/transport/spdy"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -46,6 +53,35 @@ type siteBootstrapNetbootHandler struct {
 
 type bootstrapNetbootState struct {
 	originalEndpointRef string
+}
+
+type bootstrapPortForwardAttempt interface {
+	Done() <-chan error
+	Stop()
+}
+
+type bootstrapPortForwardStarter func(
+	ctx context.Context,
+	podName string,
+	localPort int,
+	remotePort int,
+) (bootstrapPortForwardAttempt, error)
+
+type bootstrapPortForward struct {
+	url    string
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (f *bootstrapPortForward) URL() string {
+	return f.url
+}
+
+func (f *bootstrapPortForward) Close() error {
+	f.cancel()
+	<-f.done
+
+	return nil
 }
 
 func siteBootstrapNetbootCommand(handler *siteBootstrapNetbootHandler) *cobra.Command {
@@ -310,4 +346,205 @@ func metaSetStatusCondition(conditions *[]metav1.Condition, condition metav1.Con
 	}
 
 	*conditions = append(*conditions, condition)
+}
+
+func newBootstrapPortForward(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	namespace string,
+	deploymentName string,
+	localPort int,
+	remotePort int,
+	start bootstrapPortForwardStarter,
+	retryInterval time.Duration,
+) (*bootstrapPortForward, error) {
+	if retryInterval <= 0 {
+		retryInterval = defaultBootstrapPollInterval
+	}
+
+	forwardCtx, cancel := context.WithCancel(ctx)
+	podName, err := readyDeploymentPod(forwardCtx, kubeClient, namespace, deploymentName, "")
+	if err != nil {
+		cancel()
+
+		return nil, err
+	}
+
+	attempt, err := start(forwardCtx, podName, localPort, remotePort)
+	if err != nil {
+		cancel()
+
+		return nil, fmt.Errorf("start port-forward to Pod %s: %w", podName, err)
+	}
+
+	forward := &bootstrapPortForward{
+		url:    "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort)),
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+
+	go func() {
+		defer close(forward.done)
+
+		current := attempt
+		for {
+			select {
+			case <-forwardCtx.Done():
+				current.Stop()
+				<-current.Done()
+
+				return
+			case <-current.Done():
+			}
+
+			for {
+				select {
+				case <-forwardCtx.Done():
+					current.Stop()
+
+					return
+				case <-time.After(retryInterval):
+				}
+
+				podName, err = readyDeploymentPod(forwardCtx, kubeClient, namespace, deploymentName, podName)
+				if err != nil {
+					continue
+				}
+
+				current, err = start(forwardCtx, podName, localPort, remotePort)
+				if err == nil {
+					break
+				}
+			}
+		}
+	}()
+
+	return forward, nil
+}
+
+func readyDeploymentPod(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	namespace string,
+	deploymentName string,
+	excludedPod string,
+) (string, error) {
+	deployment, err := kubeClient.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get Deployment %s/%s for port-forward: %w", namespace, deploymentName, err)
+	}
+
+	selector := metav1.FormatLabelSelector(deployment.Spec.Selector)
+	pods, err := kubeClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return "", fmt.Errorf("list Pods for Deployment %s/%s: %w", namespace, deploymentName, err)
+	}
+
+	ready := make([]string, 0, len(pods.Items))
+	excludedReady := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp == nil && podReady(pod) {
+			if pod.Name == excludedPod {
+				excludedReady = true
+
+				continue
+			}
+			ready = append(ready, pod.Name)
+		}
+	}
+	if len(ready) == 0 && excludedReady {
+		ready = append(ready, excludedPod)
+	}
+	if len(ready) == 0 {
+		return "", fmt.Errorf("Deployment %s/%s has no Ready Pods", namespace, deploymentName)
+	}
+
+	sort.Strings(ready)
+
+	return ready[0], nil
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
+}
+
+type spdyBootstrapPortForwardAttempt struct {
+	stop chan struct{}
+	done chan error
+	once sync.Once
+}
+
+func (a *spdyBootstrapPortForwardAttempt) Done() <-chan error {
+	return a.done
+}
+
+func (a *spdyBootstrapPortForwardAttempt) Stop() {
+	a.once.Do(func() { close(a.stop) })
+}
+
+func newSPDYBootstrapPortForwardStarter(
+	kubeClient kubernetes.Interface,
+	config *rest.Config,
+	namespace string,
+) bootstrapPortForwardStarter {
+	return func(
+		ctx context.Context,
+		podName string,
+		localPort int,
+		remotePort int,
+	) (bootstrapPortForwardAttempt, error) {
+		targetURL := kubeClient.CoreV1().RESTClient().Post().
+			Resource("pods").
+			Namespace(namespace).
+			Name(podName).
+			SubResource("portforward").
+			URL()
+		transport, upgrader, err := spdy.RoundTripperFor(config)
+		if err != nil {
+			return nil, fmt.Errorf("create SPDY transport: %w", err)
+		}
+
+		stop := make(chan struct{})
+		ready := make(chan struct{})
+		dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, targetURL)
+		forwarder, err := portforward.NewOnAddresses(
+			dialer,
+			[]string{"127.0.0.1"},
+			[]string{fmt.Sprintf("%d:%d", localPort, remotePort)},
+			stop,
+			ready,
+			io.Discard,
+			io.Discard,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create port-forward: %w", err)
+		}
+
+		attempt := &spdyBootstrapPortForwardAttempt{stop: stop, done: make(chan error, 1)}
+		go func() { attempt.done <- forwarder.ForwardPorts() }()
+
+		select {
+		case <-ctx.Done():
+			attempt.Stop()
+
+			return nil, ctx.Err()
+		case err := <-attempt.done:
+			attempt.Stop()
+
+			return nil, fmt.Errorf("port-forward exited before becoming ready: %w", err)
+		case <-ready:
+			return attempt, nil
+		case <-time.After(30 * time.Second):
+			attempt.Stop()
+
+			return nil, fmt.Errorf("port-forward to Pod %s timed out", podName)
+		}
+	}
 }

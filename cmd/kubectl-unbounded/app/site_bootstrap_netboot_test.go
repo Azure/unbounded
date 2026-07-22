@@ -5,6 +5,9 @@ package app
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -281,4 +284,137 @@ func TestBootstrapNetbootDesignatedNodeNameUsesMachineNodeRef(t *testing.T) {
 	require.Equal(t, "node-name", designatedNodeName(machine))
 	machine.Spec.Kubernetes.NodeRef = nil
 	require.Equal(t, "machine-name", designatedNodeName(machine))
+}
+
+func TestBootstrapPortForwardReconnectsToReadyServerPod(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	deployment := readyDeployment("metalman-server-rack-a", 2)
+	deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "metalman-server"}}
+	unready := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: deployment.Namespace, Labels: deployment.Spec.Selector.MatchLabels},
+	}
+	ready := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "server-b", Namespace: deployment.Namespace, Labels: deployment.Spec.Selector.MatchLabels},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}}},
+	}
+	replacement := ready.DeepCopy()
+	replacement.Name = "server-c"
+	kubeClient := fake.NewSimpleClientset(deployment, unready, ready, replacement)
+	starter := &fakeBootstrapPortForwardStarter{started: make(chan string, 4)}
+
+	forward, err := newBootstrapPortForward(
+		ctx,
+		kubeClient,
+		deployment.Namespace,
+		deployment.Name,
+		32123,
+		8880,
+		starter.start,
+		time.Millisecond,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "http://127.0.0.1:32123", forward.URL())
+	require.Equal(t, "server-b", <-starter.started)
+
+	starter.fail("server-b", errors.New("connection lost"))
+	select {
+	case podName := <-starter.started:
+		require.Equal(t, "server-c", podName)
+	case <-time.After(time.Second):
+		require.Fail(t, "port-forward did not reconnect")
+	}
+
+	require.NoError(t, forward.Close())
+	require.Equal(t, []int{32123, 32123}, starter.ports())
+}
+
+func TestBootstrapPortForwardClosesWhileWaitingToReconnect(t *testing.T) {
+	deployment := readyDeployment("metalman-server-rack-a", 1)
+	deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "metalman-server"}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: deployment.Namespace, Labels: deployment.Spec.Selector.MatchLabels},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}}},
+	}
+	starter := &fakeBootstrapPortForwardStarter{started: make(chan string, 2)}
+	forward, err := newBootstrapPortForward(
+		context.Background(),
+		fake.NewSimpleClientset(deployment, pod),
+		deployment.Namespace,
+		deployment.Name,
+		32123,
+		8880,
+		starter.start,
+		time.Hour,
+	)
+	require.NoError(t, err)
+	require.Equal(t, pod.Name, <-starter.started)
+	starter.fail(pod.Name, errors.New("connection lost"))
+	time.Sleep(time.Millisecond)
+
+	closed := make(chan error, 1)
+	go func() { closed <- forward.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.Fail(t, "port-forward close blocked during reconnect")
+	}
+}
+
+type fakeBootstrapPortForwardStarter struct {
+	mu       sync.Mutex
+	attempts map[string]*fakeBootstrapPortForwardAttempt
+	local    []int
+	started  chan string
+}
+
+func (f *fakeBootstrapPortForwardStarter) start(_ context.Context, podName string, localPort, remotePort int) (bootstrapPortForwardAttempt, error) {
+	if remotePort != 8880 {
+		return nil, fmt.Errorf("unexpected remote port %d", remotePort)
+	}
+
+	attempt := &fakeBootstrapPortForwardAttempt{done: make(chan error, 1)}
+	f.mu.Lock()
+	if f.attempts == nil {
+		f.attempts = map[string]*fakeBootstrapPortForwardAttempt{}
+	}
+	f.attempts[podName] = attempt
+	f.local = append(f.local, localPort)
+	f.mu.Unlock()
+	f.started <- podName
+
+	return attempt, nil
+}
+
+func (f *fakeBootstrapPortForwardStarter) fail(podName string, err error) {
+	f.mu.Lock()
+	attempt := f.attempts[podName]
+	f.mu.Unlock()
+	attempt.done <- err
+}
+
+func (f *fakeBootstrapPortForwardStarter) ports() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]int(nil), f.local...)
+}
+
+type fakeBootstrapPortForwardAttempt struct {
+	done chan error
+	once sync.Once
+}
+
+func (f *fakeBootstrapPortForwardAttempt) Done() <-chan error {
+	return f.done
+}
+
+func (f *fakeBootstrapPortForwardAttempt) Stop() {
+	f.once.Do(func() { close(f.done) })
 }
