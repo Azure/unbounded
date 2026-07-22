@@ -261,20 +261,39 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'unbounded-manifests-*.tar.gz' \
             --pattern 'unbounded-manifests-*.tar.gz.bundle.json' \
+            --pattern 'unbounded-operator-*.yaml' \
+            --pattern 'unbounded-operator-*.yaml.bundle.json' \
+            --pattern "unbounded-release-bom-${TAG}.json" \
+            --pattern "unbounded-release-bom-${TAG}.json.bundle.json" \
             --pattern 'kubectl-unbounded-linux-amd64.tar.gz' \
             --dir dist/
           ls -la dist/
 
-      - name: Verify cosign signature on manifests tarball
+      - name: Verify release signatures and BOM
         run: |
           set -euo pipefail
+          IDENTITY="^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG}$"
           ARCHIVE="dist/unbounded-manifests-${TAG}.tar.gz"
-          BUNDLE="${ARCHIVE}.bundle.json"
-          cosign verify-blob \
-            --bundle "${BUNDLE}" \
-            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yaml@refs/tags/${TAG}$" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${ARCHIVE}"
+          OPERATOR_MANIFEST="dist/unbounded-operator-${TAG}.yaml"
+          BOM="dist/unbounded-release-bom-${TAG}.json"
+
+          for artifact in "${ARCHIVE}" "${OPERATOR_MANIFEST}" "${BOM}"; do
+            cosign verify-blob \
+              --bundle "${artifact}.bundle.json" \
+              --certificate-identity-regexp "${IDENTITY}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${artifact}"
+          done
+
+          test "$(jq -r '.release.tag' "${BOM}")" = "${TAG}"
+          test "$(jq -r '.release.gitCommit' "${BOM}")" = "$(git rev-parse HEAD)"
+
+          jq -r '.images[] | (.reference | sub(":[^/]+$"; "")) + "@" + .digest' "${BOM}" | while IFS= read -r image; do
+            cosign verify \
+              --certificate-identity-regexp "${IDENTITY}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${image}" >/dev/null
+          done
 
       - name: Extract manifests
         run: |
