@@ -56,6 +56,9 @@ func writeDirectoryArchive(rootDir, archivePath string) error {
 	defer pending.Cleanup() //nolint:errcheck // pending file cleanup
 
 	gzipWriter := gzip.NewWriter(pending)
+	gzipWriter.ModTime = time.Unix(0, 0)
+	gzipWriter.OS = 255
+
 	tarWriter := tar.NewWriter(gzipWriter)
 
 	if err := writeBundleArchiveEntries(tarWriter, rootDir, paths); err != nil {

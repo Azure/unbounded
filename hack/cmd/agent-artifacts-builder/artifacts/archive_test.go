@@ -36,6 +36,13 @@ func TestWriteBundleArchive(t *testing.T) {
 	archive, err := os.ReadFile(archivePath)
 	require.NoError(t, err)
 
+	secondArchivePath := filepath.Join(t.TempDir(), "bootstrap-artifacts.tar.gz")
+	require.NoError(t, WriteBundleArchive(rootDir, secondArchivePath))
+
+	secondArchive, err := os.ReadFile(secondArchivePath)
+	require.NoError(t, err)
+	require.Equal(t, archive, secondArchive)
+
 	checksum, err := os.ReadFile(archivePath + ".sha256")
 	require.NoError(t, err)
 	require.Equal(t, fmt.Sprintf("%x  bootstrap-artifacts.tar.gz\n", sha256.Sum256(archive)), string(checksum))
