@@ -15,10 +15,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -402,6 +404,13 @@ func reconcileEndpointEdges(ctx context.Context, env *component.Env, site *unbou
 			if err := env.ApplyObject(ctx, deployment); err != nil {
 				return err
 			}
+			liveDeployment := &appsv1.Deployment{}
+			if err := env.Client.Get(ctx, client.ObjectKeyFromObject(deployment), liveDeployment); err != nil {
+				return fmt.Errorf("get managed edge Deployment %s: %w", deployment.Name, err)
+			}
+			if err := reconcileManagedEndpointStatus(ctx, env.Client, endpoint, liveDeployment); err != nil {
+				return fmt.Errorf("update NetbootEndpoint %s status: %w", endpoint.Name, err)
+			}
 			desiredDeployments[deployment.Name] = struct{}{}
 		}
 		if service != nil {
@@ -450,6 +459,44 @@ func reconcileEndpointEdges(ctx context.Context, env *component.Env, site *unbou
 	}
 
 	return nil
+}
+
+func reconcileManagedEndpointStatus(
+	ctx context.Context,
+	kubeClient client.Client,
+	endpoint *unboundedv1alpha3.NetbootEndpoint,
+	deployment *appsv1.Deployment,
+) error {
+	if endpoint.Spec.Type == unboundedv1alpha3.NetbootEndpointTypeExternalL2 {
+		return nil
+	}
+	if deployment == nil {
+		return fmt.Errorf("managed endpoint has no Deployment")
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &unboundedv1alpha3.NetbootEndpoint{}
+		if err := kubeClient.Get(ctx, client.ObjectKey{Name: endpoint.Name}, current); err != nil {
+			return err
+		}
+		base := current.DeepCopy()
+		current.Status.ObservedGeneration = current.Generation
+		condition := metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "EdgeUnavailable",
+			Message:            "managed edge Deployment is not available",
+			ObservedGeneration: current.Generation,
+		}
+		if deployment.Status.ObservedGeneration >= deployment.Generation && deployment.Status.AvailableReplicas > 0 {
+			condition.Status = metav1.ConditionTrue
+			condition.Reason = "EdgeAvailable"
+			condition.Message = "managed edge Deployment is available"
+		}
+		apimeta.SetStatusCondition(&current.Status.Conditions, condition)
+
+		return kubeClient.Status().Patch(ctx, current, client.MergeFrom(base))
+	})
 }
 
 func tlsSecretChecksum(secret *corev1.Secret) string {

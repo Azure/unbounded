@@ -19,6 +19,9 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["netbootendpoints"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["netbootendpoints/status"]
+    verbs: ["get", "patch", "update"]
   # Legacy net-group Sites are read during migration and translated into the
   # machina-group Sites above; their finalizers are cleared (update/patch) so the
   # CRD can be deleted once drained.

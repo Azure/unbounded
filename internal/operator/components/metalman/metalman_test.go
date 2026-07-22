@@ -124,12 +124,101 @@ func TestOperatorRBACCanReconcileNetbootEndpoints(t *testing.T) {
 	manifest := string(data)
 	for _, required := range []string{
 		"resources: [\"netbootendpoints\"]",
+		"resources: [\"netbootendpoints/status\"]",
 		"resources: [\"poddisruptionbudgets\"]",
 	} {
 		if !strings.Contains(manifest, required) {
 			t.Fatalf("operator RBAC template missing %q", required)
 		}
 	}
+}
+
+func TestReconcileManagedEndpointStatusFromDeploymentAvailability(t *testing.T) {
+	scheme := testScheme(t)
+	now := metav1.Now()
+	endpoint := &unboundedv1alpha3.NetbootEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "public-http", Generation: 3},
+		Spec: unboundedv1alpha3.NetbootEndpointSpec{
+			SiteRef: "rack-a",
+			Type:    unboundedv1alpha3.NetbootEndpointTypeHTTP,
+		},
+		Status: unboundedv1alpha3.NetbootEndpointStatus{Claim: &unboundedv1alpha3.NetbootEndpointClaim{
+			HolderIdentity: "edge-pod-1",
+			RenewedAt:      now,
+		}},
+	}
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: EdgeName(endpoint.Name), Namespace: component.DefaultNamespace, Generation: 7},
+		Status:     appsv1.DeploymentStatus{ObservedGeneration: 7, AvailableReplicas: 1},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(endpoint).WithObjects(endpoint, deployment).Build()
+
+	if err := reconcileManagedEndpointStatus(t.Context(), kubeClient, endpoint, deployment); err != nil {
+		t.Fatalf("reconcileManagedEndpointStatus: %v", err)
+	}
+	updated := &unboundedv1alpha3.NetbootEndpoint{}
+	if err := kubeClient.Get(t.Context(), client.ObjectKey{Name: endpoint.Name}, updated); err != nil {
+		t.Fatalf("get endpoint: %v", err)
+	}
+	if updated.Status.ObservedGeneration != endpoint.Generation {
+		t.Fatalf("observed generation = %d, want %d", updated.Status.ObservedGeneration, endpoint.Generation)
+	}
+	ready := findCondition(updated.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != "EdgeAvailable" {
+		t.Fatalf("Ready condition = %#v", ready)
+	}
+	if updated.Status.Claim == nil || updated.Status.Claim.HolderIdentity != "edge-pod-1" || updated.Status.Claim.RenewedAt.Time.Unix() != now.Time.Unix() {
+		t.Fatalf("claim was not preserved: %#v", updated.Status.Claim)
+	}
+
+	deployment.Status.AvailableReplicas = 0
+	if err := kubeClient.Status().Update(t.Context(), deployment); err != nil {
+		t.Fatalf("update Deployment status: %v", err)
+	}
+	if err := reconcileManagedEndpointStatus(t.Context(), kubeClient, updated, deployment); err != nil {
+		t.Fatalf("reconcile unavailable endpoint: %v", err)
+	}
+	if err := kubeClient.Get(t.Context(), client.ObjectKey{Name: endpoint.Name}, updated); err != nil {
+		t.Fatalf("get unavailable endpoint: %v", err)
+	}
+	ready = findCondition(updated.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "EdgeUnavailable" {
+		t.Fatalf("unavailable Ready condition = %#v", ready)
+	}
+}
+
+func TestReconcileManagedEndpointStatusLeavesExternalClaimUntouched(t *testing.T) {
+	scheme := testScheme(t)
+	endpoint := &unboundedv1alpha3.NetbootEndpoint{
+		ObjectMeta: metav1.ObjectMeta{Name: "admin-laptop", Generation: 2},
+		Spec:       unboundedv1alpha3.NetbootEndpointSpec{SiteRef: "rack-a", Type: unboundedv1alpha3.NetbootEndpointTypeExternalL2},
+		Status: unboundedv1alpha3.NetbootEndpointStatus{
+			ObservedGeneration: 1,
+			Conditions:         []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "ExternalEdgeReady"}},
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(endpoint).WithObjects(endpoint).Build()
+
+	if err := reconcileManagedEndpointStatus(t.Context(), kubeClient, endpoint, nil); err != nil {
+		t.Fatalf("reconcileManagedEndpointStatus: %v", err)
+	}
+	updated := &unboundedv1alpha3.NetbootEndpoint{}
+	if err := kubeClient.Get(t.Context(), client.ObjectKey{Name: endpoint.Name}, updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.ObservedGeneration != 1 || updated.Status.Conditions[0].Reason != "ExternalEdgeReady" {
+		t.Fatalf("external endpoint status changed: %#v", updated.Status)
+	}
+}
+
+func findCondition(conditions []metav1.Condition, conditionType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return &conditions[i]
+		}
+	}
+
+	return nil
 }
 
 func TestDeployment(t *testing.T) {
@@ -470,7 +559,7 @@ func TestReconcileEndpointEdgesMirrorsRotatesAndRemovesTLSSecret(t *testing.T) {
 		},
 	}
 	env := &component.Env{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(source, endpoint).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(endpoint).WithObjects(source, endpoint).Build(),
 		Scheme: scheme, Namespace: component.DefaultNamespace,
 		Config: component.Config{ImageRegistry: "registry.example.com", ImageTag: "v1.2.3"},
 	}
@@ -513,6 +602,9 @@ func TestReconcileEndpointEdgesMirrorsRotatesAndRemovesTLSSecret(t *testing.T) {
 		t.Fatalf("TLS edge checksum did not change after certificate rotation: %q", secondChecksum)
 	}
 
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Name: endpoint.Name}, endpoint); err != nil {
+		t.Fatalf("refresh endpoint: %v", err)
+	}
 	endpoint.Spec.TLS = unboundedv1alpha3.NetbootEndpointTLS{
 		Trust: unboundedv1alpha3.NetbootEndpointTrustPublic,
 		Mode:  unboundedv1alpha3.NetbootEndpointTLSExternal,
