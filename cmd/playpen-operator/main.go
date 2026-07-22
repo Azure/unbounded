@@ -6,10 +6,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,7 +21,6 @@ import (
 	apiregclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/Azure/unbounded/internal/playpen/operator"
 	"github.com/Azure/unbounded/internal/version"
@@ -91,7 +92,7 @@ func main() {
 }
 
 func run(ctx context.Context, cfg operator.Config) error {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
 
 	scheme := runtimeScheme()
 	restConfig := ctrl.GetConfigOrDie()
