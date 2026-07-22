@@ -331,16 +331,6 @@ spec:
                         - amd64
                         - arm64
                         type: string
-                      bootProtocol:
-                        default: PXE
-                        description: |-
-                          BootProtocol selects how metalman should trigger network boot for
-                          repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
-                          HTTP boot with a URL derived from the netboot image metadata.
-                        enum:
-                        - PXE
-                        - HTTP
-                        type: string
                       cloudInit:
                         description: |-
                           CloudInit contains optional cloud-init customization for PXE-booted
@@ -368,6 +358,14 @@ spec:
                             - namespace
                             type: object
                         type: object
+                      configurationSource:
+                        default: DHCP
+                        description: ConfigurationSource selects how firmware receives
+                          its boot target.
+                        enum:
+                        - DHCP
+                        - Redfish
+                        type: string
                       dhcpLeases:
                         description: |-
                           DHCPLeases defines static IPv4 provisioning network settings. PXE boot
@@ -401,6 +399,11 @@ spec:
                           - subnetMask
                           type: object
                         type: array
+                      endpointRef:
+                        description: EndpointRef names the NetbootEndpoint that serves
+                          this Machine.
+                        minLength: 1
+                        type: string
                       image:
                         description: |-
                           Image is an OCI image reference containing the machine disk image.
@@ -433,6 +436,14 @@ spec:
                         - name
                         - namespace
                         type: object
+                      networkMode:
+                        default: DHCP
+                        description: NetworkMode selects how firmware configures the
+                          provisioning network.
+                        enum:
+                        - DHCP
+                        - Static
+                        type: string
                       pullSecretRef:
                         description: |-
                           PullSecretRef references a Docker registry credential Secret used to pull
@@ -494,9 +505,27 @@ spec:
                           Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
                           When omitted, the installer chooses a target disk automatically.
                         type: string
+                      transport:
+                        default: TFTP
+                        description: Transport selects the firmware boot artifact
+                          transport.
+                        enum:
+                        - TFTP
+                        - HTTP
+                        type: string
                     required:
+                    - endpointRef
                     - image
                     type: object
+                    x-kubernetes-validations:
+                    - message: TFTP transport requires DHCP configuration
+                      rule: '!(self.transport == ''TFTP'' && self.configurationSource
+                        == ''Redfish'')'
+                    - message: static networking requires Redfish configuration
+                      rule: self.networkMode != 'Static' || self.configurationSource
+                        == 'Redfish'
+                    - message: Redfish configuration requires redfish connection details
+                      rule: self.configurationSource != 'Redfish' || has(self.redfish)
                 type: object
                 x-kubernetes-validations:
                 - message: at most one of netboot, azure, or external may be set
@@ -585,16 +614,6 @@ spec:
                     - amd64
                     - arm64
                     type: string
-                  bootProtocol:
-                    default: PXE
-                    description: |-
-                      BootProtocol selects how metalman should trigger network boot for
-                      repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
-                      HTTP boot with a URL derived from the netboot image metadata.
-                    enum:
-                    - PXE
-                    - HTTP
-                    type: string
                   cloudInit:
                     description: |-
                       CloudInit contains optional cloud-init customization for PXE-booted
@@ -622,6 +641,14 @@ spec:
                         - namespace
                         type: object
                     type: object
+                  configurationSource:
+                    default: DHCP
+                    description: ConfigurationSource selects how firmware receives
+                      its boot target.
+                    enum:
+                    - DHCP
+                    - Redfish
+                    type: string
                   dhcpLeases:
                     description: |-
                       DHCPLeases defines static IPv4 provisioning network settings. PXE boot
@@ -655,6 +682,11 @@ spec:
                       - subnetMask
                       type: object
                     type: array
+                  endpointRef:
+                    description: EndpointRef names the NetbootEndpoint that serves
+                      this Machine.
+                    minLength: 1
+                    type: string
                   image:
                     description: |-
                       Image is an OCI image reference containing the machine disk image.
@@ -687,6 +719,14 @@ spec:
                     - name
                     - namespace
                     type: object
+                  networkMode:
+                    default: DHCP
+                    description: NetworkMode selects how firmware configures the provisioning
+                      network.
+                    enum:
+                    - DHCP
+                    - Static
+                    type: string
                   pullSecretRef:
                     description: |-
                       PullSecretRef references a Docker registry credential Secret used to pull
@@ -748,9 +788,26 @@ spec:
                       Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
                       When omitted, the installer chooses a target disk automatically.
                     type: string
+                  transport:
+                    default: TFTP
+                    description: Transport selects the firmware boot artifact transport.
+                    enum:
+                    - TFTP
+                    - HTTP
+                    type: string
                 required:
+                - endpointRef
                 - image
                 type: object
+                x-kubernetes-validations:
+                - message: TFTP transport requires DHCP configuration
+                  rule: '!(self.transport == ''TFTP'' && self.configurationSource
+                    == ''Redfish'')'
+                - message: static networking requires Redfish configuration
+                  rule: self.networkMode != 'Static' || self.configurationSource ==
+                    'Redfish'
+                - message: Redfish configuration requires redfish connection details
+                  rule: self.configurationSource != 'Redfish' || has(self.redfish)
               ssh:
                 description: |-
                   SSH contains the SSH connection and credential details for the

@@ -237,9 +237,9 @@ func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "node-http"},
 				Spec: v1alpha3.MachineSpec{
 					PXE: &v1alpha3.PXESpec{
-						Image:        "ghcr.io/test/image:v1",
-						BootProtocol: v1alpha3.PXEBootProtocolHTTP,
-						DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
+						Image:      "ghcr.io/test/image:v1",
+						Transport:  v1alpha3.NetbootTransportHTTP,
+						DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
 					},
 				},
 			}
@@ -314,9 +314,9 @@ func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-revocations"},
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
-				Image:        "ghcr.io/test/image:v1",
-				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
-				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:11", IPv4: "10.0.1.61", SubnetMask: "255.255.255.0"}},
+				Image:      "ghcr.io/test/image:v1",
+				Transport:  v1alpha3.NetbootTransportHTTP,
+				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:11", IPv4: "10.0.1.61", SubnetMask: "255.255.255.0"}},
 			},
 		},
 	}

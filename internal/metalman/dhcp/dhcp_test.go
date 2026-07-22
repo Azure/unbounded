@@ -266,7 +266,7 @@ func TestDHCPHandlerHTTPBootSuppressesPXEBootOptions(t *testing.T) {
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
 				NetbootImage: netbootImageRef,
-				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				Transport:    v1alpha3.NetbootTransportHTTP,
 				DHCPLeases: []v1alpha3.DHCPLease{{
 					MAC:        "aa:bb:cc:dd:ee:f3",
 					IPv4:       "10.0.1.13",
@@ -341,7 +341,7 @@ func TestDHCPHandlerHTTPBootClientGetsHTTPBootURL(t *testing.T) {
 		Spec: v1alpha3.MachineSpec{
 			PXE: &v1alpha3.PXESpec{
 				NetbootImage: netbootImageRef,
-				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				Transport:    v1alpha3.NetbootTransportHTTP,
 				DHCPLeases: []v1alpha3.DHCPLease{{
 					MAC:        "aa:bb:cc:dd:ee:f4",
 					IPv4:       "10.0.1.14",

@@ -159,7 +159,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP &&
+	if node.Spec.Netboot().TargetTransport() == v1alpha3.NetbootTransportHTTP &&
 		h.isHTTPBootLoaderDownload(imageRef, node.Spec.Netboot().TargetArchitecture(), path) {
 		installRequested, err := h.installRequested(r.Context(), node)
 		if err != nil {
@@ -187,7 +187,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && isOptionalShimRevocationsFile(path) {
+		if node.Spec.Netboot().TargetTransport() == v1alpha3.NetbootTransportHTTP && isOptionalShimRevocationsFile(path) {
 			serveMissingShimRevocationsFile(w, log, node, path)
 
 			return
@@ -422,7 +422,7 @@ func (h *HTTPServer) recordBootImageWritten(ctx context.Context, log *slog.Logge
 }
 
 func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, path string) {
-	if h.StatusRecorder == nil || node == nil || node.Spec.Netboot() == nil || node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP {
+	if h.StatusRecorder == nil || node == nil || node.Spec.Netboot() == nil || node.Spec.Netboot().TargetTransport() != v1alpha3.NetbootTransportHTTP {
 		return
 	}
 

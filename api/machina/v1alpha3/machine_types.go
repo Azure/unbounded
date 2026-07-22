@@ -354,7 +354,11 @@ type RedfishSpec struct {
 	PasswordRef SecretKeySelector `json:"passwordRef"`
 }
 
-// PXESpec defines PXE boot configuration for a Machine.
+// +kubebuilder:validation:XValidation:rule="!(self.transport == 'TFTP' && self.configurationSource == 'Redfish')",message="TFTP transport requires DHCP configuration"
+// +kubebuilder:validation:XValidation:rule="self.networkMode != 'Static' || self.configurationSource == 'Redfish'",message="static networking requires Redfish configuration"
+// +kubebuilder:validation:XValidation:rule="self.configurationSource != 'Redfish' || has(self.redfish)",message="Redfish configuration requires redfish connection details"
+
+// PXESpec defines network boot configuration for a Machine.
 type PXESpec struct {
 	// Image is an OCI image reference containing the machine disk image.
 	// The image must contain /disk/disk.img.gz.
@@ -389,13 +393,24 @@ type PXESpec struct {
 	// +optional
 	NetbootPullSecretRef *NamespacedSecretReference `json:"netbootPullSecretRef,omitempty"`
 
-	// BootProtocol selects how metalman should trigger network boot for
-	// repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
-	// HTTP boot with a URL derived from the netboot image metadata.
-	// +kubebuilder:validation:Enum=PXE;HTTP
-	// +kubebuilder:default=PXE
+	// Transport selects the firmware boot artifact transport.
+	// +kubebuilder:default=TFTP
 	// +optional
-	BootProtocol string `json:"bootProtocol,omitempty"`
+	Transport NetbootTransport `json:"transport,omitempty"`
+
+	// ConfigurationSource selects how firmware receives its boot target.
+	// +kubebuilder:default=DHCP
+	// +optional
+	ConfigurationSource NetbootConfigurationSource `json:"configurationSource,omitempty"`
+
+	// NetworkMode selects how firmware configures the provisioning network.
+	// +kubebuilder:default=DHCP
+	// +optional
+	NetworkMode NetbootNetworkMode `json:"networkMode,omitempty"`
+
+	// EndpointRef names the NetbootEndpoint that serves this Machine.
+	// +kubebuilder:validation:MinLength=1
+	EndpointRef string `json:"endpointRef"`
 
 	// DHCPLeases defines static IPv4 provisioning network settings. PXE boot
 	// uses them as DHCP leases. HTTP boot uses the first entry to configure the
@@ -420,18 +435,39 @@ type PXESpec struct {
 }
 
 const (
-	// PXEBootProtocolPXE uses DHCP/TFTP PXE boot.
-	PXEBootProtocolPXE = "PXE"
-	// PXEBootProtocolHTTP uses Redfish UEFI HTTP boot.
-	PXEBootProtocolHTTP = "HTTP"
 	// PXEArchitectureAMD64 is the x86_64 target architecture for PXE boot.
 	PXEArchitectureAMD64 = "amd64"
 	// PXEArchitectureARM64 is the aarch64 target architecture for PXE boot.
 	PXEArchitectureARM64 = "arm64"
 	// DefaultPXEArchitecture is used when host.netboot.architecture is omitted.
 	DefaultPXEArchitecture = PXEArchitectureAMD64
-	// DefaultPXEBootProtocol is used when host.netboot.bootProtocol is omitted.
-	DefaultPXEBootProtocol = PXEBootProtocolPXE
+)
+
+// NetbootTransport is the protocol firmware uses to fetch boot artifacts.
+// +kubebuilder:validation:Enum=TFTP;HTTP
+type NetbootTransport string
+
+const (
+	NetbootTransportTFTP NetbootTransport = "TFTP"
+	NetbootTransportHTTP NetbootTransport = "HTTP"
+)
+
+// NetbootConfigurationSource supplies the firmware boot target.
+// +kubebuilder:validation:Enum=DHCP;Redfish
+type NetbootConfigurationSource string
+
+const (
+	NetbootConfigurationSourceDHCP    NetbootConfigurationSource = "DHCP"
+	NetbootConfigurationSourceRedfish NetbootConfigurationSource = "Redfish"
+)
+
+// NetbootNetworkMode configures the firmware provisioning interface.
+// +kubebuilder:validation:Enum=DHCP;Static
+type NetbootNetworkMode string
+
+const (
+	NetbootNetworkModeDHCP   NetbootNetworkMode = "DHCP"
+	NetbootNetworkModeStatic NetbootNetworkMode = "Static"
 )
 
 // TargetArchitecture returns the effective PXE target architecture.
@@ -443,13 +479,13 @@ func (p *PXESpec) TargetArchitecture() string {
 	return p.Architecture
 }
 
-// TargetBootProtocol returns the effective network boot protocol.
-func (p *PXESpec) TargetBootProtocol() string {
-	if p == nil || p.BootProtocol == "" {
-		return DefaultPXEBootProtocol
+// TargetTransport returns the effective firmware boot transport.
+func (p *PXESpec) TargetTransport() NetbootTransport {
+	if p == nil || p.Transport == "" {
+		return NetbootTransportTFTP
 	}
 
-	return p.BootProtocol
+	return p.Transport
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.

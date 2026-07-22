@@ -590,7 +590,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 }
 
 func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, machine *v1alpha3.Machine) error {
-	if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+	if machine.Spec.Netboot().TargetTransport() == v1alpha3.NetbootTransportHTTP {
 		bootURL, staticConfig, err := r.httpBootConfig(machine)
 		if err != nil {
 			return err
@@ -715,7 +715,7 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 		target.LastAttemptAt = nil
 	}
 
-	if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+	if machine.Spec.Netboot().TargetTransport() == v1alpha3.NetbootTransportHTTP {
 		if _, _, err := r.httpBootConfig(machine); err != nil {
 			if errors.Is(err, netboot.ErrNotYetDownloaded) {
 				target.Message = "waiting for OCI image to become available"

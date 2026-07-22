@@ -51,6 +51,33 @@ func TestMachineProviderOwnershipSchema(t *testing.T) {
 	})
 }
 
+func TestMachineNetbootSchema(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile("../../../deploy/machina/crd/unbounded-cloud.io_machines.yaml")
+	if err != nil {
+		t.Fatalf("read Machine CRD: %v", err)
+	}
+
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("parse Machine CRD: %v", err)
+	}
+
+	netbootSchema := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.
+		Properties["spec"].Properties["host"].Properties["netboot"]
+
+	for _, field := range []string{"transport", "configurationSource", "networkMode", "endpointRef"} {
+		if _, ok := netbootSchema.Properties[field]; !ok {
+			t.Errorf("netboot schema is missing %q", field)
+		}
+	}
+
+	if _, ok := netbootSchema.Properties["bootProtocol"]; ok {
+		t.Error("netboot schema still exposes bootProtocol")
+	}
+}
+
 func assertSchemaValidations(t *testing.T, schema apiextensionsv1.JSONSchemaProps, want map[string]string) {
 	t.Helper()
 

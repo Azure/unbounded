@@ -471,7 +471,7 @@ func TestReconcilerFallsBackToBIOSHTTPBootURIForHostReplace(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
 	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
@@ -512,7 +512,7 @@ func TestReconcilerUsesBIOSHTTPBootURIWhenStandardURIAbsent(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
 	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-bios", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
@@ -553,7 +553,7 @@ func TestReconcilerFallsBackToBIOSWhenStaticInterfaceIsReadOnly(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
 	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-read-only-nic", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
@@ -631,7 +631,7 @@ func TestReconcilerRetriesHTTPHostReplaceWithoutStaticLease(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
 	op := testOperation("op-replace-http-no-lease", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -664,7 +664,7 @@ func TestReconcilerWaitsForHTTPBootImage(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.PXE.Transport = v1alpha3.NetbootTransportHTTP
 	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-wait-image", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name

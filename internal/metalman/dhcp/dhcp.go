@@ -200,7 +200,7 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
 		if err != nil {
 			log.Warn("OCI image metadata not available", "image", netbootImage, "architecture", architecture, "err", err)
-		} else if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+		} else if node.Spec.Netboot().TargetTransport() == v1alpha3.NetbootTransportHTTP {
 			if isHTTPClientRequest(m) {
 				bootURL, err := netboot.JoinServeURLPath(s.ServeURL, netboot.HTTPBootPathFromMetadata(meta))
 				if err != nil {
