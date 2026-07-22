@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 // ANSI color/style codes for terminal output.
@@ -32,6 +33,7 @@ func buildScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(corev1.AddToScheme(s))
 	utilruntime.Must(v1alpha3.AddToScheme(s))
+	utilruntime.Must(netv1alpha1.AddToScheme(s))
 
 	return s
 }

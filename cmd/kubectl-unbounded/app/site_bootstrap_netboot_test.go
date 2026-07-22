@@ -28,6 +28,7 @@ import (
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 func TestSiteBootstrapNetbootCommandContract(t *testing.T) {
@@ -560,6 +561,64 @@ func TestBootstrapNetbootExecuteRunsPreflightBeforeClusterMutation(t *testing.T)
 	var gotSite v1alpha3.Site
 	require.NoError(t, resources.Get(context.Background(), client.ObjectKey{Name: site.Name}, &gotSite))
 	require.Nil(t, gotSite.Spec.Components.Metalman)
+}
+
+func TestBootstrapNetbootPreparesAndCleansExternalGatewayResources(t *testing.T) {
+	ctx := context.Background()
+	resources := fakeclient.NewClientBuilder().WithScheme(buildScheme()).Build()
+	kubeClient := fake.NewSimpleClientset()
+	h := &siteBootstrapNetbootHandler{
+		site: "rack-a", endpointName: "bootstrap-first-node", address: "192.0.2.10",
+		routedCIDRs: []string{"10.40.0.0/16", "10.50.0.0/24"}, resources: resources, kubeClient: kubeClient,
+	}
+
+	require.NoError(t, h.prepareGatewayResources(ctx))
+	var pool netv1alpha1.GatewayPool
+	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool))
+	require.Equal(t, "External", pool.Spec.Type)
+	require.Equal(t, h.routedCIDRs, pool.Spec.RoutedCidrs)
+	require.Equal(t, map[string]string{"net.unbounded-cloud.io/bootstrap-gateway": h.endpointName}, pool.Spec.NodeSelector)
+	require.Equal(t, netv1alpha1.TunnelProtocolWireGuard, *pool.Spec.TunnelProtocol)
+
+	var assignment netv1alpha1.SiteGatewayPoolAssignment
+	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &assignment))
+	require.Equal(t, []string{h.site}, assignment.Spec.Sites)
+	require.Equal(t, []string{h.endpointName}, assignment.Spec.GatewayPools)
+	require.True(t, *assignment.Spec.Enabled)
+	require.Equal(t, netv1alpha1.TunnelProtocolWireGuard, *assignment.Spec.TunnelProtocol)
+
+	node, err := kubeClient.CoreV1().Nodes().Get(ctx, h.endpointName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.True(t, node.Spec.Unschedulable)
+	require.Equal(t, h.endpointName, node.Labels["net.unbounded-cloud.io/bootstrap-gateway"])
+	require.Equal(t, "true", node.Labels["net.unbounded-cloud.io/external-node"])
+	require.Contains(t, node.Spec.Taints, corev1.Taint{
+		Key: "net.unbounded-cloud.io/gateway-node", Value: "true", Effect: corev1.TaintEffectNoSchedule,
+	})
+	require.ElementsMatch(t, []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: h.address},
+		{Type: corev1.NodeExternalIP, Address: h.address},
+	}, node.Status.Addresses)
+
+	require.NoError(t, h.cleanupGatewayResources(ctx))
+	_, err = kubeClient.CoreV1().Nodes().Get(ctx, h.endpointName, metav1.GetOptions{})
+	require.Error(t, err)
+	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &assignment))
+	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool))
+}
+
+func TestBootstrapNetbootRejectsInvalidRoutedCIDRBeforeCreatingGateway(t *testing.T) {
+	resources := fakeclient.NewClientBuilder().WithScheme(buildScheme()).Build()
+	h := &siteBootstrapNetbootHandler{
+		endpointName: "bootstrap-first-node", routedCIDRs: []string{"not-a-cidr"}, resources: resources,
+		kubeClient: fake.NewSimpleClientset(),
+	}
+
+	err := h.prepareGatewayResources(context.Background())
+	require.ErrorContains(t, err, "invalid routed CIDR")
+	var pools netv1alpha1.GatewayPoolList
+	require.NoError(t, resources.List(context.Background(), &pools))
+	require.Empty(t, pools.Items)
 }
 
 func bootstrapLifecycleFixture(

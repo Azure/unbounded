@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
@@ -490,6 +491,107 @@ func (h *siteBootstrapNetbootHandler) restoreClusterResources(ctx context.Contex
 	}
 
 	return nil
+}
+
+func (h *siteBootstrapNetbootHandler) prepareGatewayResources(ctx context.Context) (retErr error) {
+	for _, routedCIDR := range h.routedCIDRs {
+		if _, _, err := net.ParseCIDR(routedCIDR); err != nil {
+			return fmt.Errorf("invalid routed CIDR %q: %w", routedCIDR, err)
+		}
+	}
+
+	protocol := netv1alpha1.TunnelProtocolWireGuard
+	enabled := true
+	selector := map[string]string{"net.unbounded-cloud.io/bootstrap-gateway": h.endpointName}
+	pool := &netv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: h.endpointName},
+		Spec: netv1alpha1.GatewayPoolSpec{
+			Type:           "External",
+			NodeSelector:   selector,
+			RoutedCidrs:    append([]string(nil), h.routedCIDRs...),
+			TunnelProtocol: &protocol,
+		},
+	}
+	if err := h.resources.Create(ctx, pool); err != nil {
+		return fmt.Errorf("create bootstrap GatewayPool %s: %w", h.endpointName, err)
+	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, h.cleanupGatewayResources(context.WithoutCancel(ctx)))
+		}
+	}()
+
+	assignment := &netv1alpha1.SiteGatewayPoolAssignment{
+		ObjectMeta: metav1.ObjectMeta{Name: h.endpointName},
+		Spec: netv1alpha1.SiteGatewayPoolAssignmentSpec{
+			Enabled:        &enabled,
+			Sites:          []string{h.site},
+			GatewayPools:   []string{h.endpointName},
+			TunnelProtocol: &protocol,
+		},
+	}
+	if err := h.resources.Create(ctx, assignment); err != nil {
+		return fmt.Errorf("create bootstrap SiteGatewayPoolAssignment %s: %w", h.endpointName, err)
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: h.endpointName,
+			Labels: map[string]string{
+				"net.unbounded-cloud.io/bootstrap-gateway": h.endpointName,
+				"net.unbounded-cloud.io/external-node":     "true",
+			},
+		},
+		Spec: corev1.NodeSpec{
+			Unschedulable: true,
+			Taints: []corev1.Taint{{
+				Key: "net.unbounded-cloud.io/gateway-node", Value: "true", Effect: corev1.TaintEffectNoSchedule,
+			}},
+		},
+	}
+	createdNode, err := h.kubeClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("create bootstrap gateway Node %s: %w", h.endpointName, err)
+	}
+	createdNode.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: h.address},
+		{Type: corev1.NodeExternalIP, Address: h.address},
+	}
+	if _, err := h.kubeClient.CoreV1().Nodes().UpdateStatus(ctx, createdNode, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("set bootstrap gateway Node %s addresses: %w", h.endpointName, err)
+	}
+
+	return nil
+}
+
+func (h *siteBootstrapNetbootHandler) cleanupGatewayResources(ctx context.Context) error {
+	assignment := &netv1alpha1.SiteGatewayPoolAssignment{ObjectMeta: metav1.ObjectMeta{Name: h.endpointName}}
+	assignmentErr := h.resources.Delete(ctx, assignment)
+	if apierrors.IsNotFound(assignmentErr) {
+		assignmentErr = nil
+	}
+	if assignmentErr != nil {
+		assignmentErr = fmt.Errorf("delete bootstrap SiteGatewayPoolAssignment %s: %w", h.endpointName, assignmentErr)
+	}
+
+	nodeErr := h.kubeClient.CoreV1().Nodes().Delete(ctx, h.endpointName, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(nodeErr) {
+		nodeErr = nil
+	}
+	if nodeErr != nil {
+		nodeErr = fmt.Errorf("delete bootstrap gateway Node %s: %w", h.endpointName, nodeErr)
+	}
+
+	pool := &netv1alpha1.GatewayPool{ObjectMeta: metav1.ObjectMeta{Name: h.endpointName}}
+	poolErr := h.resources.Delete(ctx, pool)
+	if apierrors.IsNotFound(poolErr) {
+		poolErr = nil
+	}
+	if poolErr != nil {
+		poolErr = fmt.Errorf("delete bootstrap GatewayPool %s: %w", h.endpointName, poolErr)
+	}
+
+	return errors.Join(assignmentErr, nodeErr, poolErr)
 }
 
 func (h *siteBootstrapNetbootHandler) metalmanDeploymentsReady(ctx context.Context) (bool, error) {
