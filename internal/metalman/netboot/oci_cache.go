@@ -193,6 +193,19 @@ func (c *OCICache) ResolvePathForArchitecture(imageRef, architecture, reqPath st
 		return "", false, fmt.Errorf("image %q for architecture %q not yet pulled", imageRef, normalizeArchitecture(architecture))
 	}
 
+	return c.ResolveDigestPathForArchitecture(digest, architecture, reqPath)
+}
+
+// ResolveDigestPathForArchitecture resolves a file from an immutable cached
+// digest without consulting the mutable image-reference index.
+func (c *OCICache) ResolveDigestPathForArchitecture(digest, architecture, reqPath string) (diskPath string, isTemplate bool, err error) {
+	if digest == "" {
+		return "", false, fmt.Errorf("image digest is required")
+	}
+	if !c.IsCachedForArchitecture(digest, architecture) {
+		return "", false, fmt.Errorf("%w: image digest %q for architecture %q is not cached", ErrNotYetDownloaded, digest, normalizeArchitecture(architecture))
+	}
+
 	// Reject absolute paths and Windows-style volume names.
 	if filepath.IsAbs(reqPath) || filepath.VolumeName(reqPath) != "" {
 		return "", false, fmt.Errorf("invalid request path %q: must be relative", reqPath)
@@ -223,7 +236,7 @@ func (c *OCICache) ResolvePathForArchitecture(imageRef, architecture, reqPath st
 		return cleanedBase, false, nil
 	}
 
-	return "", false, fmt.Errorf("file not found in image %q: %s", imageRef, reqPath)
+	return "", false, fmt.Errorf("file not found in image digest %q: %s", digest, reqPath)
 }
 
 // InvalidateRef removes the digest mapping for an image reference,

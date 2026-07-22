@@ -1,0 +1,110 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package netboot
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+)
+
+func TestSessionHTTPServesImmutableArtifactWithCapabilityAndRange(t *testing.T) {
+	t.Parallel()
+
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cache := setupOCICache(t, "unused.example/image:latest", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", map[string][]byte{
+		"disk.img.gz": []byte("0123456789"),
+	})
+	require.NoError(t, populateOCICache(cache.CacheDir, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", map[string][]byte{
+		"disk.img.gz": []byte("mutable-tag-content"),
+	}))
+	cache.SetDigest("unused.example/image:latest", "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	session := testNetbootSession("session-a", digest)
+	client := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(session).Build()
+	signer, err := NewCapabilitySigner([]byte("01234567890123456789012345678901"), "test-key", func() time.Time {
+		return time.Unix(1_700_000_000, 0)
+	})
+	require.NoError(t, err)
+	capability, err := signer.Sign(session)
+	require.NoError(t, err)
+
+	handler := (&SessionHTTPServer{Client: client, Cache: cache, Capabilities: signer}).Handler()
+	request := httptest.NewRequest(http.MethodGet, "/v1/netboot/sessions/session-a/"+capability+"/artifacts/disk.img.gz", nil)
+	request.Header.Set("Range", "bytes=2-5")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusPartialContent, response.Code)
+	require.Equal(t, "bytes 2-5/10", response.Header().Get("Content-Range"))
+	require.Equal(t, "2345", response.Body.String())
+}
+
+func TestSessionHTTPRejectsInvalidExpiredAndUnlistedCapabilities(t *testing.T) {
+	t.Parallel()
+
+	const digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	cache := setupOCICache(t, "unused.example/image:latest", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", map[string][]byte{
+		"disk.img.gz": []byte("disk"),
+		"secret":      []byte("secret"),
+	})
+	session := testNetbootSession("session-b", digest)
+	client := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(session).Build()
+	now := time.Unix(1_700_000_000, 0)
+	signer, err := NewCapabilitySigner([]byte("01234567890123456789012345678901"), "test-key", func() time.Time { return now })
+	require.NoError(t, err)
+	capability, err := signer.Sign(session)
+	require.NoError(t, err)
+	handler := (&SessionHTTPServer{Client: client, Cache: cache, Capabilities: signer}).Handler()
+
+	for name, test := range map[string]struct {
+		path       string
+		wantStatus int
+	}{
+		"invalid capability":  {path: "/v1/netboot/sessions/session-b/not-a-capability/artifacts/disk.img.gz", wantStatus: http.StatusUnauthorized},
+		"tampered capability": {path: "/v1/netboot/sessions/session-b/" + capability + "x/artifacts/disk.img.gz", wantStatus: http.StatusUnauthorized},
+		"unlisted artifact":   {path: "/v1/netboot/sessions/session-b/" + capability + "/artifacts/secret", wantStatus: http.StatusNotFound},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, test.path, nil))
+			require.Equal(t, test.wantStatus, response.Code)
+		})
+	}
+
+	now = session.Spec.ExpiresAt.Add(time.Second)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/netboot/sessions/session-b/"+capability+"/artifacts/disk.img.gz", nil))
+	require.Equal(t, http.StatusUnauthorized, response.Code)
+	body, err := io.ReadAll(response.Result().Body)
+	require.NoError(t, err)
+	require.NotContains(t, string(body), capability)
+}
+
+func testNetbootSession(name, digest string) *v1alpha3.NetbootSession {
+	return &v1alpha3.NetbootSession{
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid")},
+		Spec: v1alpha3.NetbootSessionSpec{
+			Machine:   v1alpha3.NetbootSessionObjectSnapshot{Name: "machine-a", UID: "machine-uid", Generation: 1},
+			Operation: v1alpha3.NetbootSessionObjectSnapshot{Name: "operation-a", UID: "operation-uid", Generation: 1},
+			Endpoint:  v1alpha3.NetbootSessionEndpointSnapshot{Name: "endpoint-a", UID: "endpoint-uid", ExternalURL: "https://boot.example.com"},
+			Boot:      v1alpha3.NetbootSessionBoot{Architecture: v1alpha3.PXEArchitectureAMD64},
+			Artifacts: v1alpha3.NetbootSessionArtifacts{
+				MachineImage: v1alpha3.NetbootSessionImage{Reference: "unused.example/image:latest", Digest: digest},
+				NetbootImage: v1alpha3.NetbootSessionImage{Reference: "unused.example/netboot:latest", Digest: digest},
+				Files:        []v1alpha3.NetbootSessionArtifact{{Name: "disk.img.gz", Source: "MachineImage", Path: "/disk/disk.img.gz"}},
+			},
+			ExpiresAt: metav1.NewTime(time.Unix(1_700_003_600, 0)),
+		},
+		Status: v1alpha3.NetbootSessionStatus{Phase: v1alpha3.NetbootSessionPhaseReady},
+	}
+}
