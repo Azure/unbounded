@@ -348,6 +348,15 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 
 			if components.http {
 				httpMux := http.NewServeMux()
+				var attestHandler *attestation.Handler
+				if components.attestation {
+					attestHandler = &attestation.Handler{
+						Clientset:      clientset,
+						ClusterCA:      clusterCA,
+						LookupNodeByIP: resolver.LookupNodeByIP,
+						StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
+					}
+				}
 				if components.sessionHTTP {
 					capabilityKey, err := os.ReadFile(capabilityKeyFile)
 					if err != nil {
@@ -362,19 +371,14 @@ func newMetalmanRoleCmd(role metalmanRole, short string) *cobra.Command {
 						Cache:          ociCache,
 						Capabilities:   capabilities,
 						StatusRecorder: &metalmachineops.SessionStatusRecorder{Client: mgr.GetClient()},
+						Attestation:    attestHandler,
 						EdgeAuthenticator: &netboot.TokenReviewEdgeAuthenticator{
 							Client:             clientset.AuthenticationV1(),
 							ServiceAccountName: edgeServiceAccount,
 						},
 					}).RegisterHandlers(httpMux)
 				}
-				if components.attestation {
-					attestHandler := &attestation.Handler{
-						Clientset:      clientset,
-						ClusterCA:      clusterCA,
-						LookupNodeByIP: resolver.LookupNodeByIP,
-						StatusUpdater:  &StatusUpdater{Client: mgr.GetClient()},
-					}
+				if attestHandler != nil && !components.sessionHTTP {
 					httpMux.HandleFunc("POST /attest", attestHandler.Attest)
 				}
 

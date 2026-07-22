@@ -324,6 +324,21 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// AttestMachine performs attestation for an already authenticated Machine
+// identity instead of deriving identity from the request network path.
+func (h *Handler) AttestMachine(w http.ResponseWriter, r *http.Request, machine *v1alpha3.Machine) {
+	if machine == nil {
+		http.Error(w, "node not found", http.StatusNotFound)
+		return
+	}
+
+	exact := *h
+	exact.LookupNodeByIP = func(context.Context, string) (*v1alpha3.Machine, error) {
+		return machine, nil
+	}
+	exact.Attest(w, r)
+}
+
 // publicKeysEqual compares two crypto.PublicKey values structurally.
 func publicKeysEqual(a, b crypto.PublicKey) bool {
 	type equaler interface {

@@ -342,6 +342,30 @@ func TestAttestTOFUStoresKey(t *testing.T) {
 	}
 }
 
+func TestAttestMachineDoesNotUseRequestSourceIP(t *testing.T) {
+	_, ekPub := testEKKeyPair(t)
+	srkPub, _ := testSRKPub(t)
+	node := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "session-machine"}}
+	handler := testHandler(t, node)
+	handler.LookupNodeByIP = func(context.Context, string) (*v1alpha3.Machine, error) {
+		t.Fatal("session attestation must not resolve a Machine by source IP")
+		return nil, nil
+	}
+	body, err := json.Marshal(AttestRequest{EKPub: ekPub, SRKPub: srkPub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/session/attest", bytes.NewReader(body))
+	request.RemoteAddr = "198.51.100.20:12345"
+	response := httptest.NewRecorder()
+
+	handler.AttestMachine(response, request, node)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("attest exact Machine: expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
 func TestAttestTOFURejectsNewKey(t *testing.T) {
 	_, ekPub := testEKKeyPair(t)
 	srkPub, _ := testSRKPub(t)

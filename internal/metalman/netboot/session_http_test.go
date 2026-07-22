@@ -152,6 +152,37 @@ func TestSessionHTTPRecordsCloudInitCompletionOnlyForFinalSuccess(t *testing.T) 
 	}
 }
 
+func TestSessionHTTPAttestsExactSessionMachineAndRecordsMilestone(t *testing.T) {
+	t.Parallel()
+
+	session := testNetbootSession("session-attest", "sha256:dededededededededededededededededededededededededededededededede")
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: session.Spec.Machine.Name, UID: session.Spec.Machine.UID}}
+	client := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(session, machine).Build()
+	signer, err := NewCapabilitySigner([]byte("01234567890123456789012345678901"), "test-key", func() time.Time {
+		return time.Unix(1_700_000_000, 0)
+	})
+	require.NoError(t, err)
+	capability, err := signer.Sign(session)
+	require.NoError(t, err)
+	attester := &recordingSessionAttester{}
+	recorder := &recordingSessionConditionRecorder{}
+	handler := (&SessionHTTPServer{
+		Client: client, Cache: NewOCICache(t.TempDir()), Capabilities: signer,
+		StatusRecorder: recorder, Attestation: attester,
+	}).Handler()
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/netboot/sessions/session-attest/"+capability+"/attest", strings.NewReader(`{"ekPub":"a2V5","srkPub":"a2V5"}`))
+	request.RemoteAddr = "198.51.100.25:12345"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Equal(t, machine.Name, attester.machine.Name)
+	require.Equal(t, machine.UID, attester.machine.UID)
+	require.Equal(t, v1alpha3.NetbootSessionConditionAttested, recorder.condition.Type)
+	require.Equal(t, session.UID, recorder.sessionUID)
+}
+
 func TestSessionHTTPRecordsFirmwareDownloadForExactSession(t *testing.T) {
 	t.Parallel()
 
@@ -311,6 +342,16 @@ type recordingSessionConditionRecorder struct {
 
 type recordingSessionConditionsRecorder struct {
 	conditions []metav1.Condition
+}
+
+type recordingSessionAttester struct {
+	machine *v1alpha3.Machine
+}
+
+func (a *recordingSessionAttester) AttestMachine(w http.ResponseWriter, _ *http.Request, machine *v1alpha3.Machine) {
+	a.machine = machine.DeepCopy()
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"credentialBlob":"YQ=="}`))
 }
 
 func (r *recordingSessionConditionsRecorder) RecordCondition(_ context.Context, _ string, _ types.UID, condition metav1.Condition) error {

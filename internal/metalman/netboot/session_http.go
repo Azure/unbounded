@@ -33,6 +33,7 @@ type SessionHTTPServer struct {
 	Capabilities      *CapabilitySigner
 	StatusRecorder    SessionConditionRecorder
 	EdgeAuthenticator EdgeAuthenticator
+	Attestation       SessionAttester
 }
 
 // EdgeAuthenticator validates access to internal edge-only routes.
@@ -43,6 +44,11 @@ type EdgeAuthenticator interface {
 // SessionConditionRecorder persists a milestone for an exact session identity.
 type SessionConditionRecorder interface {
 	RecordCondition(ctx context.Context, sessionName string, sessionUID types.UID, condition metav1.Condition) error
+}
+
+// SessionAttester performs TPM attestation for an exact authenticated Machine.
+type SessionAttester interface {
+	AttestMachine(w http.ResponseWriter, r *http.Request, machine *v1alpha3.Machine)
 }
 
 // SessionArtifactURL returns the externally advertised capability URL for one
@@ -92,6 +98,7 @@ func (s *SessionHTTPServer) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/netboot/sessions/{session}/{capability}/artifacts/{artifact...}", s.handleArtifact)
 	mux.HandleFunc("POST /v1/netboot/sessions/{session}/{capability}/callbacks/{milestone}", s.handleCallback)
 	mux.HandleFunc("POST /v1/netboot/sessions/{session}/{capability}/logs/agent-install", s.handleInstallLog)
+	mux.HandleFunc("POST /v1/netboot/sessions/{session}/{capability}/attest", s.handleAttest)
 	mux.HandleFunc("GET /v1/netboot/endpoints/{endpoint}/dhcp/{mac}", s.handleDHCPDecision)
 }
 
@@ -244,6 +251,48 @@ func (s *SessionHTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Requ
 	}
 	slog.Warn("unbounded-agent install log", "session", session.Name, "body", strings.TrimSpace(string(body)))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *SessionHTTPServer) handleAttest(w http.ResponseWriter, r *http.Request) {
+	session, ok := s.authorizeSession(w, r)
+	if !ok {
+		return
+	}
+	if s.Attestation == nil || s.StatusRecorder == nil {
+		http.Error(w, "session attestation unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var machine v1alpha3.Machine
+	if err := s.Client.Get(r.Context(), client.ObjectKey{Name: session.Spec.Machine.Name}, &machine); err != nil {
+		if apierrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "loading Machine", http.StatusServiceUnavailable)
+		return
+	}
+	if machine.UID != session.Spec.Machine.UID {
+		http.Error(w, "Machine identity changed", http.StatusConflict)
+		return
+	}
+
+	response := newBufferedResponseWriter()
+	s.Attestation.AttestMachine(response, r, &machine)
+	if response.status < http.StatusOK || response.status >= http.StatusMultipleChoices {
+		response.writeTo(w)
+		return
+	}
+	if err := s.StatusRecorder.RecordCondition(r.Context(), session.Name, session.UID, metav1.Condition{
+		Type:    v1alpha3.NetbootSessionConditionAttested,
+		Status:  metav1.ConditionTrue,
+		Reason:  "Succeeded",
+		Message: "TPM attestation succeeded",
+	}); err != nil {
+		http.Error(w, "recording session status", http.StatusServiceUnavailable)
+		return
+	}
+	response.writeTo(w)
 }
 
 func (s *SessionHTTPServer) handleArtifact(w http.ResponseWriter, r *http.Request) {
@@ -420,10 +469,40 @@ func sessionMilestoneCondition(milestone string) (string, bool) {
 		return v1alpha3.NetbootSessionConditionBootImageWritten, true
 	case "cloud-init-done":
 		return v1alpha3.NetbootSessionConditionCloudInitDone, true
-	case "attested":
-		return v1alpha3.NetbootSessionConditionAttested, true
 	default:
 		return "", false
+	}
+}
+
+type bufferedResponseWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newBufferedResponseWriter() *bufferedResponseWriter {
+	return &bufferedResponseWriter{header: make(http.Header), status: http.StatusOK}
+}
+
+func (w *bufferedResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *bufferedResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *bufferedResponseWriter) Write(data []byte) (int, error) {
+	return w.body.Write(data)
+}
+
+func (w *bufferedResponseWriter) writeTo(destination http.ResponseWriter) {
+	for key, values := range w.header {
+		destination.Header()[key] = append([]string(nil), values...)
+	}
+	destination.WriteHeader(w.status)
+	if _, err := destination.Write(w.body.Bytes()); err != nil {
+		slog.Warn("writing buffered attestation response", "err", err)
 	}
 }
 
