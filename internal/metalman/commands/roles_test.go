@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -140,5 +141,117 @@ func TestEdgeProxyPreservesSessionPathAndRange(t *testing.T) {
 	}
 	if got := string(body); got != "range" {
 		t.Errorf("body = %q", got)
+	}
+}
+
+func TestEdgeProxyResumesTruncatedArtifactFromBackendRange(t *testing.T) {
+	t.Parallel()
+
+	const artifact = "immutable-artifact"
+
+	var requests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			if got := r.Header.Get("Range"); got != "" {
+				t.Errorf("initial Range = %q, want empty", got)
+			}
+			w.Header().Set("Content-Length", "18")
+			_, _ = io.WriteString(w, artifact[:9])
+		case 2:
+			if got := r.Header.Get("Range"); got != "bytes=9-17" {
+				t.Errorf("resume Range = %q, want %q", got, "bytes=9-17")
+			}
+			w.Header().Set("Content-Length", "9")
+			w.Header().Set("Content-Range", "bytes 9-17/18")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, artifact[9:])
+		default:
+			t.Errorf("unexpected backend request %d", requests.Load())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := httptest.NewServer(newEdgeProxy(backendURL))
+	defer edge.Close()
+
+	response, err := http.Get(edge.URL + "/v1/netboot/sessions/session/capability/artifacts/disk.img.gz") //nolint:noctx // Test request.
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close() //nolint:errcheck // Test cleanup.
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(body); got != artifact {
+		t.Errorf("body = %q, want %q", got, artifact)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("backend requests = %d, want 2", got)
+	}
+}
+
+func TestEdgeProxyRetriesFailedArtifactResumeRequest(t *testing.T) {
+	t.Parallel()
+
+	const artifact = "immutable-artifact"
+
+	var requests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			w.Header().Set("Content-Length", "18")
+			_, _ = io.WriteString(w, artifact[:9])
+		case 2:
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijacking failed resume request: %v", err)
+				return
+			}
+			_ = conn.Close()
+		case 3:
+			if got := r.Header.Get("Range"); got != "bytes=9-17" {
+				t.Errorf("resume Range = %q, want %q", got, "bytes=9-17")
+			}
+			w.Header().Set("Content-Length", "9")
+			w.Header().Set("Content-Range", "bytes 9-17/18")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, artifact[9:])
+		default:
+			t.Errorf("unexpected backend request %d", requests.Load())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := httptest.NewServer(newEdgeProxy(backendURL))
+	defer edge.Close()
+
+	response, err := http.Get(edge.URL + "/v1/netboot/sessions/session/capability/artifacts/disk.img.gz") //nolint:noctx // Test request.
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close() //nolint:errcheck // Test cleanup.
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(body); got != artifact {
+		t.Errorf("body = %q, want %q", got, artifact)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Errorf("backend requests = %d, want 3", got)
 	}
 }
