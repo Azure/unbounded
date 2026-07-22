@@ -34,6 +34,7 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/net/nodeagent"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 
@@ -43,32 +44,36 @@ const (
 )
 
 type siteBootstrapNetbootHandler struct {
-	site           string
-	machine        string
-	interfaceName  string
-	address        string
-	endpointName   string
-	httpPort       int
-	kubeconfigPath string
-	namespace      string
-	metalmanBinary string
-	timeout        time.Duration
-	routedCIDRs    []string
-	resources      client.Client
-	kubeClient     kubernetes.Interface
-	restConfig     *rest.Config
-	pollInterval   time.Duration
-	dependencies   bootstrapNetbootDependencies
+	site                   string
+	machine                string
+	interfaceName          string
+	address                string
+	gatewayExternalAddress string
+	endpointName           string
+	httpPort               int
+	kubeconfigPath         string
+	namespace              string
+	metalmanBinary         string
+	timeout                time.Duration
+	routedCIDRs            []string
+	resources              client.Client
+	kubeClient             kubernetes.Interface
+	restConfig             *rest.Config
+	pollInterval           time.Duration
+	dependencies           bootstrapNetbootDependencies
 }
 
 type bootstrapNetbootDependencies struct {
-	resolveBinary    func() (string, error)
-	preflightNetwork func() error
-	localPort        func() (int, error)
-	portForward      func(context.Context, int) (*bootstrapPortForward, error)
-	edgeToken        func(context.Context) (*bootstrapEdgeToken, error)
-	startEdge        func(string, []string) (bootstrapEdgeProcess, error)
-	dialEdge         func(context.Context, string) error
+	resolveBinary     func() (string, error)
+	preflightNetwork  func() error
+	localPort         func() (int, error)
+	portForward       func(context.Context, int) (*bootstrapPortForward, error)
+	edgeToken         func(context.Context) (*bootstrapEdgeToken, error)
+	startEdge         func(string, []string) (bootstrapEdgeProcess, error)
+	dialEdge          func(context.Context, string) error
+	preflightGateway  func() error
+	gatewayRuntimeDir func() (string, error)
+	startGateway      func(context.Context, nodeagent.ExternalGatewayOptions) (bootstrapEdgeProcess, error)
 }
 
 type bootstrapNetbootState struct {
@@ -114,6 +119,14 @@ type commandBootstrapEdgeProcess struct {
 	err      error
 }
 
+type embeddedBootstrapGatewayProcess struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	err    error
+}
+
 func (p *commandBootstrapEdgeProcess) Done() <-chan struct{} {
 	return p.done
 }
@@ -148,6 +161,25 @@ func (p *commandBootstrapEdgeProcess) Stop(ctx context.Context) error {
 		}
 		<-p.done
 
+		return ctx.Err()
+	}
+}
+
+func (p *embeddedBootstrapGatewayProcess) Done() <-chan struct{} { return p.done }
+
+func (p *embeddedBootstrapGatewayProcess) Err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.err
+}
+
+func (p *embeddedBootstrapGatewayProcess) Stop(ctx context.Context) error {
+	p.once.Do(p.cancel)
+	select {
+	case <-p.done:
+		return p.Err()
+	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
@@ -202,6 +234,7 @@ func siteBootstrapNetbootCommand(handler *siteBootstrapNetbootHandler) *cobra.Co
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.namespace, "namespace", unbounded.SystemNamespace(), "Namespace containing Metalman workloads")
 	cmd.Flags().StringVar(&handler.metalmanBinary, "metalman-binary", "", "Path to the metalman binary")
+	cmd.Flags().StringVar(&handler.gatewayExternalAddress, "gateway-external-address", "", "WireGuard address reachable by remote gateway peers (defaults to --address)")
 	cmd.Flags().DurationVar(&handler.timeout, "timeout", defaultBootstrapNetbootTimeout, "Maximum time to wait for the designated Node to become Ready")
 	cmd.Flags().StringSliceVar(&handler.routedCIDRs, "routed-cidr", nil, "CIDR routed through an ephemeral external gateway (repeatable)")
 
@@ -219,6 +252,9 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 	if h.endpointName == "" {
 		h.endpointName = "bootstrap-" + h.machine
 	}
+	if h.gatewayExternalAddress == "" {
+		h.gatewayExternalAddress = h.address
+	}
 
 	if err := h.initializeDependencies(); err != nil {
 		return err
@@ -229,6 +265,17 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 	}
 	if err := h.dependencies.preflightNetwork(); err != nil {
 		return err
+	}
+	var gatewayRuntimeDir string
+	if len(h.routedCIDRs) > 0 {
+		if err := h.dependencies.preflightGateway(); err != nil {
+			return err
+		}
+		gatewayRuntimeDir, err = h.dependencies.gatewayRuntimeDir()
+		if err != nil {
+			return fmt.Errorf("create external gateway runtime directory: %w", err)
+		}
+		defer func() { retErr = errors.Join(retErr, os.RemoveAll(gatewayRuntimeDir)) }()
 	}
 	if err := h.initializeClients(); err != nil {
 		return err
@@ -244,9 +291,11 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 	}
 	resourcesPrepared := true
 	var (
-		forward *bootstrapPortForward
-		token   *bootstrapEdgeToken
-		process bootstrapEdgeProcess
+		forward         *bootstrapPortForward
+		token           *bootstrapEdgeToken
+		process         bootstrapEdgeProcess
+		gatewayProcess  bootstrapEdgeProcess
+		gatewayPrepared bool
 	)
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -258,13 +307,35 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 		if process != nil {
 			retErr = errors.Join(retErr, process.Stop(cleanupCtx))
 		}
+		if gatewayProcess != nil {
+			retErr = errors.Join(retErr, gatewayProcess.Stop(cleanupCtx))
+		}
 		if forward != nil {
 			retErr = errors.Join(retErr, forward.Close())
 		}
 		if token != nil {
 			retErr = errors.Join(retErr, token.Close())
 		}
+		if gatewayPrepared {
+			retErr = errors.Join(retErr, h.cleanupGatewayResources(cleanupCtx))
+		}
 	}()
+
+	if len(h.routedCIDRs) > 0 {
+		if err := h.prepareGatewayResources(runCtx); err != nil {
+			return err
+		}
+		gatewayPrepared = true
+		gatewayProcess, err = h.dependencies.startGateway(runCtx, nodeagent.ExternalGatewayOptions{
+			NodeName: h.endpointName, RuntimeDir: gatewayRuntimeDir, RESTConfig: h.restConfig,
+		})
+		if err != nil {
+			return fmt.Errorf("start external gateway dataplane: %w", err)
+		}
+		if err := h.waitForGatewayReady(runCtx, gatewayProcess); err != nil {
+			return err
+		}
+	}
 
 	if err := h.waitForMetalman(runCtx); err != nil {
 		return err
@@ -297,7 +368,7 @@ func (h *siteBootstrapNetbootHandler) execute(ctx context.Context) (retErr error
 		return fmt.Errorf("get designated Machine %s: %w", h.machine, err)
 	}
 
-	return h.waitForNodeReadyAndEdge(runCtx, designatedNodeName(&machine), process)
+	return h.waitForNodeReadyAndProcesses(runCtx, designatedNodeName(&machine), process, gatewayProcess)
 }
 
 func (h *siteBootstrapNetbootHandler) initializeDependencies() error {
@@ -319,6 +390,17 @@ func (h *siteBootstrapNetbootHandler) initializeDependencies() error {
 	}
 	if h.dependencies.dialEdge == nil {
 		h.dependencies.dialEdge = dialBootstrapEdge
+	}
+	if h.dependencies.preflightGateway == nil {
+		h.dependencies.preflightGateway = h.validateExternalGateway
+	}
+	if h.dependencies.gatewayRuntimeDir == nil {
+		h.dependencies.gatewayRuntimeDir = func() (string, error) {
+			return os.MkdirTemp("/run", "unbounded-netboot-")
+		}
+	}
+	if h.dependencies.startGateway == nil {
+		h.dependencies.startGateway = startEmbeddedBootstrapGateway
 	}
 
 	return nil
@@ -388,6 +470,30 @@ func (h *siteBootstrapNetbootHandler) validateProvisioningInterface() error {
 	}
 
 	return fmt.Errorf("provisioning interface %s does not own address %s", h.interfaceName, h.address)
+}
+
+func (h *siteBootstrapNetbootHandler) validateExternalGateway() error {
+	if err := h.validateRoutedCIDRs(); err != nil {
+		return err
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("external gateway dataplane requires root privileges")
+	}
+	if ip := net.ParseIP(h.gatewayExternalAddress); ip == nil || ip.To4() == nil {
+		return fmt.Errorf("gateway external address %q must be an IPv4 address", h.gatewayExternalAddress)
+	}
+
+	return nil
+}
+
+func (h *siteBootstrapNetbootHandler) validateRoutedCIDRs() error {
+	for _, routedCIDR := range h.routedCIDRs {
+		if _, _, err := net.ParseCIDR(routedCIDR); err != nil {
+			return fmt.Errorf("invalid routed CIDR %q: %w", routedCIDR, err)
+		}
+	}
+
+	return nil
 }
 
 func availableLoopbackPort() (int, error) {
@@ -494,10 +600,8 @@ func (h *siteBootstrapNetbootHandler) restoreClusterResources(ctx context.Contex
 }
 
 func (h *siteBootstrapNetbootHandler) prepareGatewayResources(ctx context.Context) (retErr error) {
-	for _, routedCIDR := range h.routedCIDRs {
-		if _, _, err := net.ParseCIDR(routedCIDR); err != nil {
-			return fmt.Errorf("invalid routed CIDR %q: %w", routedCIDR, err)
-		}
+	if err := h.validateRoutedCIDRs(); err != nil {
+		return err
 	}
 
 	protocol := netv1alpha1.TunnelProtocolWireGuard
@@ -555,7 +659,7 @@ func (h *siteBootstrapNetbootHandler) prepareGatewayResources(ctx context.Contex
 	}
 	createdNode.Status.Addresses = []corev1.NodeAddress{
 		{Type: corev1.NodeInternalIP, Address: h.address},
-		{Type: corev1.NodeExternalIP, Address: h.address},
+		{Type: corev1.NodeExternalIP, Address: h.gatewayExternalAddress},
 	}
 	if _, err := h.kubeClient.CoreV1().Nodes().UpdateStatus(ctx, createdNode, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("set bootstrap gateway Node %s addresses: %w", h.endpointName, err)
@@ -726,6 +830,23 @@ func startBootstrapEdgeProcess(binary string, args []string, stdout, stderr io.W
 	return process, nil
 }
 
+func startEmbeddedBootstrapGateway(
+	ctx context.Context,
+	options nodeagent.ExternalGatewayOptions,
+) (bootstrapEdgeProcess, error) {
+	runCtx, cancel := context.WithCancel(ctx)
+	process := &embeddedBootstrapGatewayProcess{cancel: cancel, done: make(chan struct{})}
+	go func() {
+		err := nodeagent.RunExternalGateway(runCtx, options)
+		process.mu.Lock()
+		process.err = err
+		process.mu.Unlock()
+		close(process.done)
+	}()
+
+	return process, nil
+}
+
 func isSignalExit(err error) bool {
 	var exitError *exec.ExitError
 	if !errors.As(err, &exitError) || exitError.ProcessState == nil {
@@ -813,6 +934,121 @@ func (h *siteBootstrapNetbootHandler) waitForNodeReadyAndEdge(
 	case <-ctx.Done():
 		return fmt.Errorf("wait for designated Node %s while Metalman edge is running: %w", nodeName, ctx.Err())
 	}
+}
+
+func (h *siteBootstrapNetbootHandler) waitForNodeReadyAndProcesses(
+	ctx context.Context,
+	nodeName string,
+	edge bootstrapEdgeProcess,
+	gateway bootstrapEdgeProcess,
+) error {
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ready := make(chan error, 1)
+	go func() { ready <- h.waitForNodeReady(waitCtx, nodeName) }()
+
+	var gatewayDone <-chan struct{}
+	if gateway != nil {
+		gatewayDone = gateway.Done()
+	}
+	select {
+	case err := <-ready:
+		return err
+	case <-edge.Done():
+		return processExitError("Metalman edge", nodeName, edge.Err())
+	case <-gatewayDone:
+		return processExitError("external gateway", nodeName, gateway.Err())
+	case <-ctx.Done():
+		return fmt.Errorf("wait for designated Node %s while bootstrap dataplanes are running: %w", nodeName, ctx.Err())
+	}
+}
+
+func processExitError(name, nodeName string, err error) error {
+	if err != nil {
+		return fmt.Errorf("%s exited before designated Node %s became Ready: %w", name, nodeName, err)
+	}
+
+	return fmt.Errorf("%s exited before designated Node %s became Ready", name, nodeName)
+}
+
+func (h *siteBootstrapNetbootHandler) waitForGatewayReady(ctx context.Context, process bootstrapEdgeProcess) error {
+	interval := h.pollInterval
+	if interval <= 0 {
+		interval = defaultBootstrapPollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		ready, err := h.gatewayReady(ctx)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-process.Done():
+			if err := process.Err(); err != nil {
+				return fmt.Errorf("external gateway exited before becoming ready: %w", err)
+			}
+
+			return fmt.Errorf("external gateway exited before becoming ready")
+		case <-ctx.Done():
+			return fmt.Errorf("wait for external gateway readiness: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *siteBootstrapNetbootHandler) gatewayReady(ctx context.Context) (bool, error) {
+	node, err := h.kubeClient.CoreV1().Nodes().Get(ctx, h.endpointName, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("get bootstrap gateway Node %s: %w", h.endpointName, err)
+	}
+	if node.Annotations["net.unbounded-cloud.io/wg-pubkey"] == "" {
+		return false, nil
+	}
+
+	var pool netv1alpha1.GatewayPool
+	if err := h.resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool); err != nil {
+		return false, fmt.Errorf("get bootstrap GatewayPool %s: %w", h.endpointName, err)
+	}
+	if pool.Status.NodeCount != 1 || !containsString(pool.Status.ConnectedSites, h.site) {
+		return false, nil
+	}
+	matchedNode := false
+	for _, poolNode := range pool.Status.Nodes {
+		if poolNode.Name == h.endpointName && poolNode.WireGuardPublicKey != "" {
+			matchedNode = true
+			break
+		}
+	}
+	if !matchedNode {
+		return false, nil
+	}
+
+	var gatewayNode netv1alpha1.GatewayPoolNode
+	if err := h.resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &gatewayNode); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("get bootstrap GatewayPoolNode %s: %w", h.endpointName, err)
+	}
+
+	return !gatewayNode.Status.LastUpdated.IsZero() && len(gatewayNode.Status.Routes) > 0, nil
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+
+	return false
 }
 
 func nodeReady(node *corev1.Node) bool {

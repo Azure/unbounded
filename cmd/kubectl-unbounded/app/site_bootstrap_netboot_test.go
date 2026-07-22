@@ -29,6 +29,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/nodeagent"
 )
 
 func TestSiteBootstrapNetbootCommandContract(t *testing.T) {
@@ -47,6 +48,7 @@ func TestSiteBootstrapNetbootCommandContract(t *testing.T) {
 		"kubeconfig",
 		"namespace",
 		"metalman-binary",
+		"gateway-external-address",
 		"timeout",
 		"routed-cidr",
 	} {
@@ -569,7 +571,8 @@ func TestBootstrapNetbootPreparesAndCleansExternalGatewayResources(t *testing.T)
 	kubeClient := fake.NewSimpleClientset()
 	h := &siteBootstrapNetbootHandler{
 		site: "rack-a", endpointName: "bootstrap-first-node", address: "192.0.2.10",
-		routedCIDRs: []string{"10.40.0.0/16", "10.50.0.0/24"}, resources: resources, kubeClient: kubeClient,
+		gatewayExternalAddress: "198.51.100.10",
+		routedCIDRs:            []string{"10.40.0.0/16", "10.50.0.0/24"}, resources: resources, kubeClient: kubeClient,
 	}
 
 	require.NoError(t, h.prepareGatewayResources(ctx))
@@ -597,7 +600,7 @@ func TestBootstrapNetbootPreparesAndCleansExternalGatewayResources(t *testing.T)
 	})
 	require.ElementsMatch(t, []corev1.NodeAddress{
 		{Type: corev1.NodeInternalIP, Address: h.address},
-		{Type: corev1.NodeExternalIP, Address: h.address},
+		{Type: corev1.NodeExternalIP, Address: h.gatewayExternalAddress},
 	}, node.Status.Addresses)
 
 	require.NoError(t, h.cleanupGatewayResources(ctx))
@@ -605,6 +608,88 @@ func TestBootstrapNetbootPreparesAndCleansExternalGatewayResources(t *testing.T)
 	require.Error(t, err)
 	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &assignment))
 	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool))
+}
+
+func TestBootstrapNetbootExecuteRunsOptInGatewayUntilNodeReady(t *testing.T) {
+	ctx := context.Background()
+	site, machine, resources, kubeClient := bootstrapLifecycleFixture(t, true)
+	edgeProcess := &fakeBootstrapEdgeProcess{done: make(chan struct{})}
+	gatewayProcess := &fakeBootstrapEdgeProcess{done: make(chan struct{})}
+	forward := testBootstrapPortForward(ctx)
+	token := testBootstrapEdgeToken(t, ctx)
+	runtimeDir := t.TempDir()
+	h := &siteBootstrapNetbootHandler{
+		site: site.Name, machine: machine.Name, interfaceName: "eno1", address: "192.0.2.10",
+		gatewayExternalAddress: "198.51.100.10", routedCIDRs: []string{"10.40.0.0/16"},
+		httpPort: 8880, namespace: "unbounded-system", timeout: time.Second,
+		resources: resources, kubeClient: kubeClient, restConfig: &rest.Config{}, pollInterval: time.Millisecond,
+	}
+	h.dependencies = bootstrapNetbootDependencies{
+		resolveBinary:    func() (string, error) { return "/usr/bin/metalman", nil },
+		preflightNetwork: func() error { return nil },
+		preflightGateway: func() error { return nil },
+		localPort:        func() (int, error) { return 32123, nil },
+		portForward:      func(context.Context, int) (*bootstrapPortForward, error) { return forward, nil },
+		edgeToken:        func(context.Context) (*bootstrapEdgeToken, error) { return token, nil },
+		startEdge:        func(string, []string) (bootstrapEdgeProcess, error) { return edgeProcess, nil },
+		dialEdge:         func(context.Context, string) error { return nil },
+		gatewayRuntimeDir: func() (string, error) {
+			return runtimeDir, nil
+		},
+		startGateway: func(_ context.Context, options nodeagent.ExternalGatewayOptions) (bootstrapEdgeProcess, error) {
+			require.Equal(t, h.endpointName, options.NodeName)
+			require.Equal(t, runtimeDir, options.RuntimeDir)
+			require.Same(t, h.restConfig, options.RESTConfig)
+			markBootstrapGatewayReady(t, ctx, h, resources, kubeClient)
+
+			return gatewayProcess, nil
+		},
+	}
+
+	require.NoError(t, h.execute(ctx))
+	require.True(t, gatewayProcess.stopped)
+	require.True(t, edgeProcess.stopped)
+	var pool netv1alpha1.GatewayPool
+	require.Error(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool))
+	_, err := kubeClient.CoreV1().Nodes().Get(ctx, h.endpointName, metav1.GetOptions{})
+	require.Error(t, err)
+}
+
+func markBootstrapGatewayReady(
+	t *testing.T,
+	ctx context.Context,
+	h *siteBootstrapNetbootHandler,
+	resources client.Client,
+	kubeClient *fake.Clientset,
+) {
+	t.Helper()
+
+	node, err := kubeClient.CoreV1().Nodes().Get(ctx, h.endpointName, metav1.GetOptions{})
+	require.NoError(t, err)
+	if node.Annotations == nil {
+		node.Annotations = map[string]string{}
+	}
+	node.Annotations["net.unbounded-cloud.io/wg-pubkey"] = "public-key"
+	_, err = kubeClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	var pool netv1alpha1.GatewayPool
+	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: h.endpointName}, &pool))
+	pool.Status.NodeCount = 1
+	pool.Status.Nodes = []netv1alpha1.GatewayNodeInfo{{Name: h.endpointName, WireGuardPublicKey: "public-key"}}
+	pool.Status.ConnectedSites = []string{h.site}
+	require.NoError(t, resources.Update(ctx, &pool))
+
+	require.NoError(t, resources.Create(ctx, &netv1alpha1.GatewayPoolNode{
+		ObjectMeta: metav1.ObjectMeta{Name: h.endpointName},
+		Spec:       netv1alpha1.GatewayNodeSpec{NodeName: h.endpointName, GatewayPool: h.endpointName},
+		Status: netv1alpha1.GatewayNodeStatus{
+			LastUpdated: metav1.Now(),
+			Routes: map[string]netv1alpha1.GatewayNodeRoute{
+				"10.40.0.0/16": {Type: "RoutedCidr"},
+			},
+		},
+	}))
 }
 
 func TestBootstrapNetbootRejectsInvalidRoutedCIDRBeforeCreatingGateway(t *testing.T) {
@@ -619,6 +704,35 @@ func TestBootstrapNetbootRejectsInvalidRoutedCIDRBeforeCreatingGateway(t *testin
 	var pools netv1alpha1.GatewayPoolList
 	require.NoError(t, resources.List(context.Background(), &pools))
 	require.Empty(t, pools.Items)
+}
+
+func TestBootstrapNetbootExecuteRejectsInvalidRoutedCIDRBeforeClusterMutation(t *testing.T) {
+	ctx := context.Background()
+	site, machine, resources, kubeClient := bootstrapLifecycleFixture(t, false)
+	h := &siteBootstrapNetbootHandler{
+		site: site.Name, machine: machine.Name, interfaceName: "eno1", address: "192.0.2.10",
+		routedCIDRs: []string{"not-a-cidr"}, httpPort: 8880, namespace: "unbounded-system",
+		resources: resources, kubeClient: kubeClient, restConfig: &rest.Config{},
+	}
+	h.dependencies = bootstrapNetbootDependencies{
+		resolveBinary:    func() (string, error) { return "/usr/bin/metalman", nil },
+		preflightNetwork: func() error { return nil },
+		gatewayRuntimeDir: func() (string, error) {
+			t.Fatal("gateway runtime directory must not be created after invalid CIDR preflight")
+
+			return "", nil
+		},
+	}
+
+	err := h.execute(ctx)
+	require.ErrorContains(t, err, "invalid routed CIDR")
+
+	var actualMachine v1alpha3.Machine
+	require.NoError(t, resources.Get(ctx, client.ObjectKey{Name: machine.Name}, &actualMachine))
+	require.Equal(t, "permanent-edge", actualMachine.Spec.Netboot().EndpointRef)
+	var endpoints v1alpha3.NetbootEndpointList
+	require.NoError(t, resources.List(ctx, &endpoints))
+	require.Empty(t, endpoints.Items)
 }
 
 func bootstrapLifecycleFixture(
