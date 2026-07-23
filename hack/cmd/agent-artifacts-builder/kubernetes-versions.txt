@@ -1,6 +1,8 @@
 # Default Kubernetes versions for the agent offline artifact publishing workflow.
 # Values may be separated by newlines, commas, or whitespace. Lines beginning
 # with # are ignored.
+v1.33.12
+v1.33.13
 v1.34.0
 v1.34.1
 v1.34.2
