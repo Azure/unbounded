@@ -7,10 +7,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
+	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/credentials"
@@ -18,6 +20,25 @@ import (
 
 	"github.com/Azure/unbounded/internal/ociutil"
 )
+
+// OCIImageArchiveName returns the release archive filename for a tagged OCI
+// image reference.
+func OCIImageArchiveName(sourceRef string) (string, error) {
+	sourceRef = strings.TrimPrefix(strings.TrimSpace(sourceRef), "oci://")
+
+	ref, err := registry.ParseReference(sourceRef)
+	if err != nil {
+		return "", fmt.Errorf("parse OCI image source %q: %w", sourceRef, err)
+	}
+
+	if err := ref.ValidateReferenceAsTag(); err != nil {
+		return "", fmt.Errorf("OCI image source %q must use a tag: %w", sourceRef, err)
+	}
+
+	imageName := filepath.Base(ref.Repository)
+
+	return fmt.Sprintf("rootfs-%s-%s.oci.tar.gz", imageName, ref.Reference), nil
+}
 
 // ArchiveOCIImage copies a tagged image from an OCI registry into a local OCI
 // layout and writes that layout as a gzip-compressed tar archive.

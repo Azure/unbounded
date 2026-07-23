@@ -166,7 +166,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Run GoReleaser against the pushed tag.
-  # GoReleaser produces kubectl-unbounded + unbounded-agent archives,
+  # GoReleaser produces kubectl-unbounded, unbounded-agent, and
+  # agent-artifacts-builder archives,
   # signs the checksums file, generates SBOMs, and creates a DRAFT GitHub
   # release. Subsequent jobs attach more artifacts to that draft.
   # ---------------------------------------------------------------------------

@@ -71,12 +71,114 @@ func newRootCommand() *cobra.Command {
 
 	cmd.AddCommand(
 		newArchiveOCIImageCommand(&debug, &logFormat),
+		newBuildCommand(&debug, &logFormat),
 		newResolvePublishInputsCommand(),
 		newPublishVersionGroupCommand(&debug, &logFormat),
 		newValidateOCICommand(&debug, &logFormat),
 	)
 
 	return cmd
+}
+
+func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
+	var outputDir string
+
+	cmd := &cobra.Command{
+		Use:          "build",
+		Short:        "Build the default upload-ready bootstrap artifact layout",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if outputDir == "" {
+				return fmt.Errorf("--output-dir is required")
+			}
+
+			versionsRaw, err := defaultKubernetesVersions()
+			if err != nil {
+				return err
+			}
+
+			versions := normalizeKubernetesVersions(versionsRaw)
+			if len(versions) == 0 {
+				return fmt.Errorf("at least one Kubernetes version is required")
+			}
+
+			rootfsImagesRaw, err := defaultRootfsImages()
+			if err != nil {
+				return err
+			}
+
+			rootfsImages, err := normalizeRootfsImages(rootfsImagesRaw)
+			if err != nil {
+				return err
+			}
+
+			return buildReleaseLayout(cmd.Context(), newLogger(*debug, *logFormat), outputDir, versions, rootfsImages)
+		},
+	}
+
+	cmd.Flags().StringVar(&outputDir, "output-dir", "", "Directory for rootfs and bootstrap artifact archives")
+
+	return cmd
+}
+
+func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string, versions, rootfsImages []string) error {
+	rootfsDir := filepath.Join(outputDir, "rootfs")
+	bootstrapDir := filepath.Join(outputDir, "bootstrap-artifacts")
+
+	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
+		return fmt.Errorf("create rootfs archive output directory: %w", err)
+	}
+
+	if err := os.MkdirAll(bootstrapDir, 0o755); err != nil {
+		return fmt.Errorf("create bootstrap archive output directory: %w", err)
+	}
+
+	for _, image := range rootfsImages {
+		archiveName, err := artifacts.OCIImageArchiveName(image)
+		if err != nil {
+			return err
+		}
+
+		archivePath := filepath.Join(rootfsDir, archiveName)
+		log.Info("building rootfs OCI layout archive", slog.String("source", image), slog.String("archive", archivePath))
+
+		if err := artifacts.ArchiveOCIImage(ctx, image, archivePath); err != nil {
+			return err
+		}
+	}
+
+	stagingDir, cleanup, err := artifacts.NewStagingDir()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	for _, version := range versions {
+		if err := buildBootstrapArchive(ctx, log, stagingDir, bootstrapDir, version); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func buildBootstrapArchive(ctx context.Context, log *slog.Logger, stagingDir, outputDir, version string) error {
+	bundleDir, err := os.MkdirTemp("", "unbounded-bootstrap-artifacts-*")
+	if err != nil {
+		return fmt.Errorf("create temporary bootstrap bundle directory: %w", err)
+	}
+	defer os.RemoveAll(bundleDir) //nolint:errcheck // best effort cleanup
+
+	archivePath := filepath.Join(outputDir, fmt.Sprintf("bootstrap-artifacts-k8s-%s.tar.gz", version))
+	log.Info("building bootstrap artifact archive", slog.String("archive", archivePath), slog.String("kubernetes_version", version))
+
+	return artifacts.Build(ctx, log, artifacts.Options{
+		OutputDir:         bundleDir,
+		StagingDir:        stagingDir,
+		ArchivePath:       archivePath,
+		KubernetesVersion: version,
+		Architectures:     []string{"amd64", "arm64"},
+	})
 }
 
 func newLogger(debug bool, format string) *slog.Logger {
