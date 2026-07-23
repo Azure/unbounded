@@ -110,6 +110,15 @@ jobs:
       RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
       ROOTFS_IMAGES_JSON: ${{ needs.resolve.outputs.rootfs_images }}
     steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
+          sudo docker image prune -af &
+          wait
+          df -h /
+
       - name: Download agent artifacts builder
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -168,6 +177,15 @@ jobs:
       ARTIFACT_TAG_PREFIX: ${{ needs.resolve.outputs.tag }}
       KUBERNETES_VERSIONS_JSON: ${{ needs.resolve.outputs.kubernetes_versions }}
     steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
+          sudo docker image prune -af &
+          wait
+          df -h /
+
       - name: Download agent artifacts builder
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
