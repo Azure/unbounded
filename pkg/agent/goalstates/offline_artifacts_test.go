@@ -176,7 +176,27 @@ func TestResolveOfflineArtifactsRequiresExistingFiles(t *testing.T) {
 		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}},
 		&config.AgentOfflineArtifacts{Source: root},
 	)
-	require.ErrorContains(t, err, "required offline artifact")
+	require.ErrorContains(t, err, "is missing or is not a regular file")
+}
+
+func TestResolveOfflineArtifactsRejectsNonRegularRequiredFile(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{Versions: OfflineArtifactVersions{
+		Kubernetes: "v1.34.2",
+		Containerd: "2.1.8",
+		Runc:       "1.5.0",
+		CNI:        "1.5.1",
+		Crictl:     "1.34.0",
+	}})
+	runcPath := filepath.Join(root, "runc", "v1.5.0", "runc."+runtime.GOARCH)
+	require.NoError(t, os.Remove(runcPath))
+	require.NoError(t, os.Mkdir(runcPath, 0o755))
+
+	_, err := resolveOfflineArtifacts(
+		context.Background(),
+		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}},
+		&config.AgentOfflineArtifacts{Source: root},
+	)
+	require.ErrorContains(t, err, "is missing or is not a regular file")
 }
 
 func writeGoalStateOfflineBundle(t *testing.T, manifest OfflineArtifactManifest) string {

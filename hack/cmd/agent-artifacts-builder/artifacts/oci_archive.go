@@ -28,7 +28,9 @@ const (
 )
 
 // OCIImageArchiveName returns the release archive filename for a tagged OCI
-// image reference.
+// image reference. Callers producing multiple archives must reject duplicate
+// names before writing because the filename intentionally omits registry and
+// repository namespace components.
 func OCIImageArchiveName(sourceRef string) (string, error) {
 	sourceRef = strings.TrimPrefix(strings.TrimSpace(sourceRef), "oci://")
 

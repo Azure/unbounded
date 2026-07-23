@@ -176,7 +176,7 @@ func verifyOfflineFiles(ctx context.Context, bundle bootstrapartifacts.Bundle, m
 
 	var errs []error
 	for _, path := range diff.Missing {
-		errs = append(errs, fmt.Errorf("required offline artifact %q is missing", path))
+		errs = append(errs, fmt.Errorf("required offline artifact %q is missing or is not a regular file", path))
 	}
 
 	return errors.Join(errs...)

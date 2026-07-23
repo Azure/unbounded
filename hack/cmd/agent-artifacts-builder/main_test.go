@@ -257,6 +257,15 @@ func TestBuilderCommandVisibility(t *testing.T) {
 	require.NotContains(t, commands, "archive-oci-image")
 }
 
+func TestPlanRootfsArchivesRejectsFilenameCollision(t *testing.T) {
+	_, err := planRootfsArchives(t.TempDir(), []string{
+		"ghcr.io/first/agent-ubuntu2404:v1",
+		"ghcr.io/second/agent-ubuntu2404:v1",
+	})
+	require.ErrorContains(t, err, "produce the same archive name")
+	require.ErrorContains(t, err, "rootfs-agent-ubuntu2404-v1.oci.tar.gz")
+}
+
 func TestResolveBuildInputsUseExplicitValues(t *testing.T) {
 	versions, err := resolveBuildKubernetesVersions([]string{"1.34.9", "v1.35.6"})
 	require.NoError(t, err)

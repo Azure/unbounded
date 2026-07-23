@@ -290,7 +290,7 @@ Example HTTPS archive mode:
 ```json
 {
   "OfflineArtifacts": {
-    "Source": "https://artifacts.internal.example.com/bootstrap-artifacts-v0.4.0-k8s-{{ .KubernetesVersion }}.tar.gz"
+    "Source": "https://artifacts.internal.example.com/v0.4.0/bootstrap-artifacts-k8s-{{ .KubernetesVersion }}.tar.gz"
   }
 }
 ```
@@ -419,7 +419,7 @@ Example:
 ```json
 {
   "OfflineArtifacts": {
-    "Source": "https://artifacts.internal.example.com/bootstrap-artifacts-v0.4.0-k8s-{{ .KubernetesVersion }}.tar.gz"
+    "Source": "https://artifacts.internal.example.com/v0.4.0/bootstrap-artifacts-k8s-{{ .KubernetesVersion }}.tar.gz"
   }
 }
 ```
@@ -662,7 +662,7 @@ For HTTPS archive mode, operators publish a tarred OCI layout and a complete off
 {
   "OCIImage": "https://artifacts.internal.example.com/agent-ubuntu2404.oci.tar",
   "OfflineArtifacts": {
-    "Source": "https://artifacts.internal.example.com/bootstrap-artifacts-v0.4.0-k8s-{{ .KubernetesVersion }}.tar.gz"
+    "Source": "https://artifacts.internal.example.com/v0.4.0/bootstrap-artifacts-k8s-{{ .KubernetesVersion }}.tar.gz"
   }
 }
 ```

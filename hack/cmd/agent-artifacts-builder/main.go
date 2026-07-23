@@ -171,25 +171,53 @@ func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string,
 	return group.Wait()
 }
 
+type rootfsArchivePlan struct {
+	source      string
+	archivePath string
+}
+
 func buildRootfsArchives(ctx context.Context, log *slog.Logger, outputDir string, images []string) error {
+	plans, err := planRootfsArchives(outputDir, images)
+	if err != nil {
+		return err
+	}
+
 	group, ctx := errgroup.WithContext(ctx)
 	group.SetLimit(3)
 
-	for _, image := range images {
+	for _, plan := range plans {
 		group.Go(func() error {
-			archiveName, err := artifacts.OCIImageArchiveName(image)
-			if err != nil {
-				return err
-			}
+			log.Info("building rootfs OCI layout archive", slog.String("source", plan.source), slog.String("archive", plan.archivePath))
 
-			archivePath := filepath.Join(outputDir, archiveName)
-			log.Info("building rootfs OCI layout archive", slog.String("source", image), slog.String("archive", archivePath))
-
-			return artifacts.ArchiveOCIImage(ctx, image, archivePath)
+			return artifacts.ArchiveOCIImage(ctx, plan.source, plan.archivePath)
 		})
 	}
 
 	return group.Wait()
+}
+
+func planRootfsArchives(outputDir string, images []string) ([]rootfsArchivePlan, error) {
+	plans := make([]rootfsArchivePlan, 0, len(images))
+	sourcesByName := make(map[string]string, len(images))
+
+	for _, image := range images {
+		archiveName, err := artifacts.OCIImageArchiveName(image)
+		if err != nil {
+			return nil, err
+		}
+
+		if existingSource, ok := sourcesByName[archiveName]; ok {
+			return nil, fmt.Errorf("rootfs images %q and %q produce the same archive name %q", existingSource, image, archiveName)
+		}
+
+		sourcesByName[archiveName] = image
+		plans = append(plans, rootfsArchivePlan{
+			source:      image,
+			archivePath: filepath.Join(outputDir, archiveName),
+		})
+	}
+
+	return plans, nil
 }
 
 const bootstrapArchiveConcurrency = 3
