@@ -446,7 +446,7 @@ jobs:
           tags: ${{ env.REGISTRY }}/unbounded-net-controller:ci-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
-          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/net-controller.oci.tar,oci-mediatypes=true
           provenance: false
 
       - name: Build node image
@@ -463,8 +463,41 @@ jobs:
           tags: ${{ env.REGISTRY }}/unbounded-net-node:ci-${{ matrix.arch }}
           cache-from: type=gha,scope=build-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
-          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/net-node.oci.tar,oci-mediatypes=true
           provenance: false
+
+      - name: Verify OCI image layouts
+        run: |
+          set -euo pipefail
+
+          validate_layout() {
+            local name="$1"
+            local archive="${RUNNER_TEMP}/net-${name}.oci.tar"
+            local index
+            index="$(tar -xOf "$archive" index.json)"
+
+            jq -e '
+              .schemaVersion == 2 and
+              .mediaType == "application/vnd.oci.image.index.v1+json" and
+              (.manifests | length > 0) and
+              all(.manifests[]; .mediaType == "application/vnd.oci.image.manifest.v1+json")
+            ' <<<"$index"
+
+            while IFS= read -r digest; do
+              local algorithm="${digest%%:*}"
+              local encoded="${digest#*:}"
+              local manifest="blobs/$algorithm/$encoded"
+              tar -xOf "$archive" "$manifest" | jq -e '
+                .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+                .config.mediaType == "application/vnd.oci.image.config.v1+json" and
+                all(.layers[];
+                  .mediaType | test("^application/vnd\\.oci\\.image\\.layer\\.v1\\.tar(\\+(gzip|zstd))?$"))
+              '
+            done < <(jq -r '.manifests[].digest' <<<"$index")
+          }
+
+          validate_layout controller
+          validate_layout node
 
   # ---------- Publish Orca image (main only) ----------
   # Publishes a dev Orca image to ghcr on every merge to main so the
