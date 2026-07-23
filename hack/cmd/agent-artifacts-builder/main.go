@@ -16,6 +16,7 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 	"oras.land/oras-go/v2/registry"
 
 	"github.com/Azure/unbounded/hack/cmd/agent-artifacts-builder/artifacts"
@@ -133,52 +134,154 @@ func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string,
 		return fmt.Errorf("create bootstrap archive output directory: %w", err)
 	}
 
-	for _, image := range rootfsImages {
-		archiveName, err := artifacts.OCIImageArchiveName(image)
-		if err != nil {
-			return err
-		}
+	group, ctx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		return buildRootfsArchives(ctx, log, rootfsDir, rootfsImages)
+	})
+	group.Go(func() error {
+		return buildBootstrapArchives(ctx, log, bootstrapDir, versions)
+	})
 
-		archivePath := filepath.Join(rootfsDir, archiveName)
-		log.Info("building rootfs OCI layout archive", slog.String("source", image), slog.String("archive", archivePath))
+	return group.Wait()
+}
 
-		if err := artifacts.ArchiveOCIImage(ctx, image, archivePath); err != nil {
-			return err
-		}
+func buildRootfsArchives(ctx context.Context, log *slog.Logger, outputDir string, images []string) error {
+	group, ctx := errgroup.WithContext(ctx)
+	group.SetLimit(3)
+
+	for _, image := range images {
+		group.Go(func() error {
+			archiveName, err := artifacts.OCIImageArchiveName(image)
+			if err != nil {
+				return err
+			}
+
+			archivePath := filepath.Join(outputDir, archiveName)
+			log.Info("building rootfs OCI layout archive", slog.String("source", image), slog.String("archive", archivePath))
+
+			return artifacts.ArchiveOCIImage(ctx, image, archivePath)
+		})
 	}
 
+	return group.Wait()
+}
+
+const bootstrapArchiveConcurrency = 3
+
+type bootstrapArchiveTask struct {
+	bundleDir   string
+	archivePath string
+	cleanup     func()
+}
+
+func buildBootstrapArchives(ctx context.Context, log *slog.Logger, outputDir string, versions []string) error {
 	stagingDir, cleanup, err := artifacts.NewStagingDir()
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	for _, version := range versions {
-		if err := buildBootstrapArchive(ctx, log, stagingDir, bootstrapDir, version); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return runBootstrapArchivePipeline(
+		ctx,
+		versions,
+		func(ctx context.Context, version string) (bootstrapArchiveTask, error) {
+			return prepareBootstrapArchive(ctx, log, stagingDir, outputDir, version)
+		},
+		func(task bootstrapArchiveTask) error {
+			return artifacts.WriteBundleArchive(task.bundleDir, task.archivePath)
+		},
+	)
 }
 
-func buildBootstrapArchive(ctx context.Context, log *slog.Logger, stagingDir, outputDir, version string) error {
+func runBootstrapArchivePipeline(
+	ctx context.Context,
+	versions []string,
+	prepare func(context.Context, string) (bootstrapArchiveTask, error),
+	archive func(bootstrapArchiveTask) error,
+) error {
+	tasks := make(chan bootstrapArchiveTask)
+	group, ctx := errgroup.WithContext(ctx)
+
+	group.Go(func() error {
+		defer close(tasks)
+
+		for _, version := range versions {
+			task, err := prepare(ctx, version)
+			if err != nil {
+				return err
+			}
+
+			select {
+			case tasks <- task:
+			case <-ctx.Done():
+				task.cleanup()
+
+				return context.Cause(ctx)
+			}
+		}
+
+		return nil
+	})
+
+	for range bootstrapArchiveConcurrency {
+		group.Go(func() error {
+			for {
+				select {
+				case task, ok := <-tasks:
+					if !ok {
+						return nil
+					}
+
+					err := archive(task)
+					task.cleanup()
+
+					if err != nil {
+						return err
+					}
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		})
+	}
+
+	return group.Wait()
+}
+
+func prepareBootstrapArchive(ctx context.Context, log *slog.Logger, stagingDir, outputDir, version string) (bootstrapArchiveTask, error) {
 	bundleDir, err := os.MkdirTemp("", "unbounded-bootstrap-artifacts-*")
 	if err != nil {
-		return fmt.Errorf("create temporary bootstrap bundle directory: %w", err)
+		return bootstrapArchiveTask{}, fmt.Errorf("create temporary bootstrap bundle directory: %w", err)
 	}
-	defer os.RemoveAll(bundleDir) //nolint:errcheck // best effort cleanup
 
-	archivePath := filepath.Join(outputDir, fmt.Sprintf("bootstrap-artifacts-k8s-%s.tar.gz", version))
-	log.Info("building bootstrap artifact archive", slog.String("archive", archivePath), slog.String("kubernetes_version", version))
+	task := bootstrapArchiveTask{
+		bundleDir:   bundleDir,
+		archivePath: filepath.Join(outputDir, fmt.Sprintf("bootstrap-artifacts-k8s-%s.tar.gz", version)),
+		cleanup: func() {
+			os.RemoveAll(bundleDir) //nolint:errcheck // best effort cleanup
+		},
+	}
 
-	return artifacts.Build(ctx, log, artifacts.Options{
+	log.Info("building bootstrap artifact archive", slog.String("archive", task.archivePath), slog.String("kubernetes_version", version))
+
+	if err := artifacts.Build(ctx, log, artifacts.Options{
 		OutputDir:         bundleDir,
 		StagingDir:        stagingDir,
-		ArchivePath:       archivePath,
 		KubernetesVersion: version,
 		Architectures:     []string{"amd64", "arm64"},
-	})
+	}); err != nil {
+		task.cleanup()
+
+		return bootstrapArchiveTask{}, err
+	}
+
+	if err := artifacts.ValidateBundle(log, bundleDir); err != nil {
+		task.cleanup()
+
+		return bootstrapArchiveTask{}, err
+	}
+
+	return task, nil
 }
 
 func newLogger(debug bool, format string) *slog.Logger {

@@ -92,19 +92,27 @@ func Build(ctx context.Context, log *slog.Logger, opts Options) error {
 		defer cleanup()
 	}
 
-	if err := downloadArtifacts(ctx, log, stagingDir, plan.Artifacts); err != nil {
+	acquireGroup, acquireCtx := errgroup.WithContext(ctx)
+	acquireGroup.Go(func() error {
+		return downloadArtifacts(acquireCtx, log, stagingDir, plan.Artifacts)
+	})
+	acquireGroup.Go(func() error {
+		return exportContainerImages(acquireCtx, log, stagingDir, plan.ContainerImages)
+	})
+
+	if err := acquireGroup.Wait(); err != nil {
 		return err
 	}
 
-	if err := exportContainerImages(ctx, log, stagingDir, plan.ContainerImages); err != nil {
-		return err
-	}
+	materializeGroup := &errgroup.Group{}
+	materializeGroup.Go(func() error {
+		return materializeArtifacts(stagingDir, opts.OutputDir, plan.Artifacts)
+	})
+	materializeGroup.Go(func() error {
+		return materializeContainerImages(stagingDir, opts.OutputDir, plan.ContainerImages)
+	})
 
-	if err := materializeArtifacts(stagingDir, opts.OutputDir, plan.Artifacts); err != nil {
-		return err
-	}
-
-	if err := materializeContainerImages(stagingDir, opts.OutputDir, plan.ContainerImages); err != nil {
+	if err := materializeGroup.Wait(); err != nil {
 		return err
 	}
 
@@ -453,7 +461,7 @@ func writeManifest(rootDir string, manifest bootstrapartifacts.Manifest) error {
 
 func downloadArtifacts(ctx context.Context, log *slog.Logger, rootDir string, artifacts []Artifact) error {
 	eg, ctx := errgroup.WithContext(ctx)
-	eg.SetLimit(4)
+	eg.SetLimit(8)
 
 	for _, artifact := range artifacts {
 		eg.Go(func() error {

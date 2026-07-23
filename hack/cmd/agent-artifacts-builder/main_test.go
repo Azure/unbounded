@@ -4,11 +4,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -29,6 +33,104 @@ func TestRootfsImagesMatchAgentDefaults(t *testing.T) {
 		goalstates.DefaultAzureLinux3OCIImage,
 		goalstates.DefaultAzureLinux3NvidiaOCIImage,
 	}, strings.Fields(stripLineComments(string(data))))
+}
+
+func TestRunBootstrapArchivePipeline(t *testing.T) {
+	versions := []string{"v1", "v2", "v3", "v4", "v5", "v6"}
+	started := make(chan struct{}, len(versions))
+	release := make(chan struct{})
+	result := make(chan error, 1)
+
+	var (
+		active    atomic.Int32
+		maxActive atomic.Int32
+		cleaned   atomic.Int32
+	)
+
+	go func() {
+		result <- runBootstrapArchivePipeline(
+			context.Background(),
+			versions,
+			func(_ context.Context, version string) (bootstrapArchiveTask, error) {
+				return bootstrapArchiveTask{
+					archivePath: version,
+					cleanup: func() {
+						cleaned.Add(1)
+					},
+				}, nil
+			},
+			func(bootstrapArchiveTask) error {
+				current := active.Add(1)
+				defer active.Add(-1)
+
+				for {
+					maximum := maxActive.Load()
+					if current <= maximum || maxActive.CompareAndSwap(maximum, current) {
+						break
+					}
+				}
+
+				started <- struct{}{}
+
+				<-release
+
+				return nil
+			},
+		)
+	}()
+
+	for range bootstrapArchiveConcurrency {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("archive workers did not run concurrently")
+		}
+	}
+
+	require.EqualValues(t, bootstrapArchiveConcurrency, maxActive.Load())
+	close(release)
+	require.NoError(t, <-result)
+	require.EqualValues(t, len(versions), cleaned.Load())
+}
+
+func TestRunBootstrapArchivePipelinePropagatesPrepareFailure(t *testing.T) {
+	var cleaned atomic.Int32
+
+	prepareErr := errors.New("prepare failed")
+
+	err := runBootstrapArchivePipeline(
+		context.Background(),
+		[]string{"good", "bad"},
+		func(_ context.Context, version string) (bootstrapArchiveTask, error) {
+			if version == "bad" {
+				return bootstrapArchiveTask{}, prepareErr
+			}
+
+			return bootstrapArchiveTask{cleanup: func() { cleaned.Add(1) }}, nil
+		},
+		func(bootstrapArchiveTask) error { return nil },
+	)
+
+	require.ErrorIs(t, err, prepareErr)
+	require.EqualValues(t, 1, cleaned.Load())
+}
+
+func TestRunBootstrapArchivePipelinePropagatesArchiveFailure(t *testing.T) {
+	var cleaned atomic.Int32
+
+	archiveErr := errors.New("archive failed")
+
+	err := runBootstrapArchivePipeline(
+		context.Background(),
+		[]string{"v1"},
+		func(context.Context, string) (bootstrapArchiveTask, error) {
+			return bootstrapArchiveTask{cleanup: func() { cleaned.Add(1) }}, nil
+		},
+		func(bootstrapArchiveTask) error { return archiveErr },
+	)
+
+	require.ErrorIs(t, err, archiveErr)
+	require.EqualValues(t, 1, cleaned.Load())
 }
 
 func TestResolvePublishInputsWorkflowDispatchUsesExplicitInputs(t *testing.T) {
