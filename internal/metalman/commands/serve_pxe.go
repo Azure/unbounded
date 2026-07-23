@@ -4,6 +4,9 @@
 package commands
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"net"
@@ -58,6 +61,9 @@ func ServePXECmd() *cobra.Command {
 		operationPollInterval          time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
+		tlsCertFile                    string
+		tlsPrivateKeyFile              string
+		tlsCAFile                      string
 	)
 
 	cmd := &cobra.Command{
@@ -190,7 +196,12 @@ func ServePXECmd() *cobra.Command {
 					serverIP = detected
 				}
 
-				serveURL = fmt.Sprintf("http://%s:%d", ip, httpPort)
+				scheme := "http"
+				if tlsCertFile != "" {
+					scheme = "https"
+				}
+
+				serveURL = fmt.Sprintf("%s://%s:%d", scheme, ip, httpPort)
 			}
 
 			defaultNetbootImage = strings.TrimSpace(defaultNetbootImage)
@@ -199,6 +210,22 @@ func ServePXECmd() *cobra.Command {
 			defaultNetbootPullSecretRef, err := parseNamespacedSecretReference(defaultNetbootPullSecret)
 			if err != nil {
 				return err
+			}
+
+			if err := validateTLSFlags(tlsCertFile, tlsPrivateKeyFile, tlsCAFile); err != nil {
+				return err
+			}
+
+			var trustCertPEM []byte
+			if tlsCAFile != "" {
+				trustCertPEM, err = os.ReadFile(tlsCAFile)
+				if err != nil {
+					return fmt.Errorf("reading --tls-ca-file: %w", err)
+				}
+
+				if _, err := parseTrustCertificate(trustCertPEM); err != nil {
+					return fmt.Errorf("invalid --tls-ca-file: %w", err)
+				}
 			}
 
 			ociCache := netboot.NewOCICache(cacheDir)
@@ -238,6 +265,7 @@ func ServePXECmd() *cobra.Command {
 				Site:                  site,
 				PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
 				HTTPBootURL:           resolver.HTTPBootURL,
+				TrustCertificatePEM:   trustCertPEM,
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
 				PollInterval:          operationPollInterval,
@@ -308,6 +336,8 @@ func ServePXECmd() *cobra.Command {
 			httpServer := &netboot.HTTPServer{
 				BindAddr:       bindAddress,
 				Port:           httpPort,
+				TLSCertFile:    tlsCertFile,
+				TLSKeyFile:     tlsPrivateKeyFile,
 				Client:         mgr.GetClient(),
 				Mux:            httpMux,
 				FileResolver:   resolver,
@@ -338,7 +368,13 @@ func ServePXECmd() *cobra.Command {
 			}
 
 			PrintService("TFTP", fmt.Sprintf("%s:69", bindAddress))
-			PrintService("HTTP", fmt.Sprintf("%s:%d", bindAddress, httpPort))
+
+			if tlsCertFile != "" {
+				PrintService("HTTPS", fmt.Sprintf("%s:%d", bindAddress, httpPort))
+			} else {
+				PrintService("HTTP", fmt.Sprintf("%s:%d", bindAddress, httpPort))
+			}
+
 			PrintService("Redfish", "reconciler")
 			PrintReady()
 
@@ -363,6 +399,9 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
+	cmd.Flags().StringVar(&tlsCertFile, "tls-cert-file", "", "Path to PEM-encoded TLS certificate for the HTTPS artifact server")
+	cmd.Flags().StringVar(&tlsPrivateKeyFile, "tls-private-key-file", "", "Path to PEM-encoded TLS private key for the HTTPS artifact server")
+	cmd.Flags().StringVar(&tlsCAFile, "tls-ca-file", "", "Path to PEM-encoded CA certificate for Redfish HTTPS boot trust")
 
 	return cmd
 }
@@ -378,4 +417,52 @@ func parseNamespacedSecretReference(ref string) (*v1alpha3.NamespacedSecretRefer
 	}
 
 	return &v1alpha3.NamespacedSecretReference{Namespace: namespace, Name: name}, nil
+}
+
+func validateTLSFlags(certFile, keyFile, caFile string) error {
+	if certFile == "" && keyFile == "" && caFile == "" {
+		return nil
+	}
+
+	if certFile == "" {
+		return fmt.Errorf("--tls-cert-file is required when TLS flags are specified")
+	}
+
+	if keyFile == "" {
+		return fmt.Errorf("--tls-private-key-file is required when TLS flags are specified")
+	}
+
+	if caFile == "" {
+		return fmt.Errorf("--tls-ca-file is required when TLS flags are specified")
+	}
+
+	certPEM, err := os.ReadFile(certFile)
+	if err != nil {
+		return fmt.Errorf("reading --tls-cert-file: %w", err)
+	}
+
+	keyPEM, err := os.ReadFile(keyFile)
+	if err != nil {
+		return fmt.Errorf("reading --tls-private-key-file: %w", err)
+	}
+
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return fmt.Errorf("tls certificate and key do not match: %w", err)
+	}
+
+	return nil
+}
+
+func parseTrustCertificate(pemData []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemData)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block found")
+	}
+
+	switch block.Type {
+	case "CERTIFICATE":
+		return x509.ParseCertificate(block.Bytes)
+	default:
+		return nil, fmt.Errorf("expected PEM type CERTIFICATE, got %s", block.Type)
+	}
 }
