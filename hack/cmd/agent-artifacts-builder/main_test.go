@@ -60,7 +60,7 @@ func TestRunBootstrapArchivePipeline(t *testing.T) {
 					},
 				}, nil
 			},
-			func(bootstrapArchiveTask) error {
+			func(context.Context, bootstrapArchiveTask) error {
 				current := active.Add(1)
 				defer active.Add(-1)
 
@@ -109,7 +109,7 @@ func TestRunBootstrapArchivePipelinePropagatesPrepareFailure(t *testing.T) {
 
 			return bootstrapArchiveTask{cleanup: func() { cleaned.Add(1) }}, nil
 		},
-		func(bootstrapArchiveTask) error { return nil },
+		func(context.Context, bootstrapArchiveTask) error { return nil },
 	)
 
 	require.ErrorIs(t, err, prepareErr)
@@ -127,7 +127,7 @@ func TestRunBootstrapArchivePipelinePropagatesArchiveFailure(t *testing.T) {
 		func(context.Context, string) (bootstrapArchiveTask, error) {
 			return bootstrapArchiveTask{cleanup: func() { cleaned.Add(1) }}, nil
 		},
-		func(bootstrapArchiveTask) error { return archiveErr },
+		func(context.Context, bootstrapArchiveTask) error { return archiveErr },
 	)
 
 	require.ErrorIs(t, err, archiveErr)
@@ -158,10 +158,6 @@ func TestResolvePublishInputsWorkflowDispatchUsesExplicitInputs(t *testing.T) {
 		"ghcr.io/azure/agent-ubuntu2404:v1",
 		"ghcr.io/azure/agent-azlinux3:v2",
 	}, values["rootfs_images"])
-	requireJSONEqual(t, []kubernetesVersionGroup{
-		{Minor: "1.34", Versions: []string{"v1.34.9"}},
-		{Minor: "1.35", Versions: []string{"v1.35.6"}},
-	}, values["kubernetes_version_groups"])
 }
 
 func TestResolvePublishInputsWorkflowDispatchDefaultsTagAndVersions(t *testing.T) {
@@ -196,9 +192,6 @@ v1.34.9
 	require.Empty(t, values["release_tag"])
 	requireJSONEqual(t, []string{"v1.34.8", "v1.34.9"}, values["kubernetes_versions"])
 	requireJSONEqual(t, []string{"ghcr.io/azure/agent-ubuntu2404:v1"}, values["rootfs_images"])
-	requireJSONEqual(t, []kubernetesVersionGroup{
-		{Minor: "1.34", Versions: []string{"v1.34.8", "v1.34.9"}},
-	}, values["kubernetes_version_groups"])
 }
 
 func TestResolvePublishInputsTagPushUsesRefTagAndDefaultVersions(t *testing.T) {
@@ -252,8 +245,7 @@ func TestBuilderCommandVisibility(t *testing.T) {
 		commands[command.Name()] = command
 	}
 
-	require.Contains(t, commands, "publish-version-group")
-	require.False(t, commands["publish-version-group"].Hidden)
+	require.NotContains(t, commands, "publish-version-group")
 	require.NotContains(t, commands, "archive-oci-image")
 }
 
@@ -316,27 +308,23 @@ func TestNormalizeKubernetesVersions(t *testing.T) {
 	require.Equal(t, []string{"v1.34.9", "v1.35.0", "v1.35.1"}, got)
 }
 
-func TestGroupKubernetesVersionsByMinor(t *testing.T) {
-	got, err := groupKubernetesVersionsByMinor([]string{"v1.34.8", "v1.34.9", "v1.35.0"})
+func TestResolveOCIPublishConfig(t *testing.T) {
+	config, err := resolveOCIPublishConfig("GHCR.IO/Azure/Unbounded/", "v0.4.0")
 	require.NoError(t, err)
-	require.Equal(t, []kubernetesVersionGroup{
-		{Minor: "1.34", Versions: []string{"v1.34.8", "v1.34.9"}},
-		{Minor: "1.35", Versions: []string{"v1.35.0"}},
-	}, got)
-}
+	require.Equal(t, ociPublishConfig{
+		registry:  "ghcr.io/azure/unbounded",
+		tagPrefix: "v0.4.0",
+	}, config)
 
-func TestGroupKubernetesVersionsByMinorRejectsInvalidSemver(t *testing.T) {
-	_, err := groupKubernetesVersionsByMinor([]string{"not-a-version"})
-	require.ErrorContains(t, err, "parse Kubernetes version")
-}
-
-func TestKubernetesVersionsFromJSON(t *testing.T) {
-	versions, err := kubernetesVersionsFromJSON(`["v1.34.9","v1.35.6"]`)
+	config, err = resolveOCIPublishConfig("", "")
 	require.NoError(t, err)
-	require.Equal(t, []string{"v1.34.9", "v1.35.6"}, versions)
+	require.Equal(t, ociPublishConfig{}, config)
 
-	_, err = kubernetesVersionsFromJSON(`[]`)
-	require.ErrorContains(t, err, "must contain at least one version")
+	_, err = resolveOCIPublishConfig("ghcr.io/azure/unbounded", "")
+	require.ErrorContains(t, err, "--artifact-tag-prefix is required")
+
+	_, err = resolveOCIPublishConfig("", "v0.4.0")
+	require.ErrorContains(t, err, "--oci-registry is required")
 }
 
 func readGitHubOutput(t *testing.T, path string) map[string]string {

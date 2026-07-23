@@ -14,7 +14,6 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/Masterminds/semver/v3"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 	"oras.land/oras-go/v2/registry"
@@ -73,7 +72,6 @@ func newRootCommand() *cobra.Command {
 	cmd.AddCommand(
 		newBuildCommand(&debug, &logFormat),
 		newResolvePublishInputsCommand(),
-		newPublishVersionGroupCommand(&debug, &logFormat),
 		newValidateOCICommand(&debug, &logFormat),
 	)
 
@@ -85,11 +83,13 @@ func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
 		outputDir          string
 		kubernetesVersions []string
 		rootfsImages       []string
+		ociRegistry        string
+		artifactTagPrefix  string
 	)
 
 	cmd := &cobra.Command{
 		Use:          "build",
-		Short:        "Build the default upload-ready bootstrap artifact layout",
+		Short:        "Build upload-ready archives and optionally publish bootstrap OCI bundles",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if outputDir == "" {
@@ -106,13 +106,20 @@ func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
 				return err
 			}
 
-			return buildReleaseLayout(cmd.Context(), newLogger(*debug, *logFormat), outputDir, versions, images)
+			publish, err := resolveOCIPublishConfig(ociRegistry, artifactTagPrefix)
+			if err != nil {
+				return err
+			}
+
+			return buildReleaseLayout(cmd.Context(), newLogger(*debug, *logFormat), outputDir, versions, images, publish)
 		},
 	}
 
 	cmd.Flags().StringVar(&outputDir, "output-dir", "", "Directory for rootfs and bootstrap artifact archives")
 	cmd.Flags().StringArrayVar(&kubernetesVersions, "kubernetes-version", nil, "Kubernetes version to build. Repeat for multiple versions. Defaults to embedded versions")
 	cmd.Flags().StringArrayVar(&rootfsImages, "rootfs-image", nil, "Tagged rootfs OCI image to build. Repeat for multiple images. Defaults to embedded images")
+	cmd.Flags().StringVar(&ociRegistry, "oci-registry", "", "OCI registry/repository prefix for publishing bootstrap bundles")
+	cmd.Flags().StringVar(&artifactTagPrefix, "artifact-tag-prefix", "", "Tag prefix for published bootstrap OCI bundles")
 
 	return cmd
 }
@@ -148,7 +155,31 @@ func resolveBuildRootfsImages(images []string) ([]string, error) {
 	return normalizeRootfsImages(strings.Join(images, "\n"))
 }
 
-func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string, versions, rootfsImages []string) error {
+type ociPublishConfig struct {
+	registry  string
+	tagPrefix string
+}
+
+func resolveOCIPublishConfig(registry, tagPrefix string) (ociPublishConfig, error) {
+	registry = strings.TrimRight(strings.ToLower(strings.TrimSpace(registry)), "/")
+	tagPrefix = strings.TrimSpace(tagPrefix)
+
+	if registry == "" && tagPrefix == "" {
+		return ociPublishConfig{}, nil
+	}
+
+	if registry == "" {
+		return ociPublishConfig{}, fmt.Errorf("--oci-registry is required with --artifact-tag-prefix")
+	}
+
+	if tagPrefix == "" {
+		return ociPublishConfig{}, fmt.Errorf("--artifact-tag-prefix is required with --oci-registry")
+	}
+
+	return ociPublishConfig{registry: registry, tagPrefix: tagPrefix}, nil
+}
+
+func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string, versions, rootfsImages []string, publish ociPublishConfig) error {
 	rootfsDir := filepath.Join(outputDir, "rootfs")
 	bootstrapDir := filepath.Join(outputDir, "bootstrap-artifacts")
 
@@ -165,7 +196,7 @@ func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string,
 		return buildRootfsArchives(ctx, log, rootfsDir, rootfsImages)
 	})
 	group.Go(func() error {
-		return buildBootstrapArchives(ctx, log, bootstrapDir, versions)
+		return buildBootstrapArchives(ctx, log, bootstrapDir, versions, publish)
 	})
 
 	return group.Wait()
@@ -223,17 +254,21 @@ func planRootfsArchives(outputDir string, images []string) ([]rootfsArchivePlan,
 const bootstrapArchiveConcurrency = 3
 
 type bootstrapArchiveTask struct {
+	version     string
 	bundleDir   string
 	archivePath string
 	cleanup     func()
 }
 
-func buildBootstrapArchives(ctx context.Context, log *slog.Logger, outputDir string, versions []string) error {
+func buildBootstrapArchives(ctx context.Context, log *slog.Logger, outputDir string, versions []string, publish ociPublishConfig) error {
 	stagingDir, cleanup, err := artifacts.NewStagingDir()
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+
+	publishToken := make(chan struct{}, 1)
+	publishToken <- struct{}{}
 
 	return runBootstrapArchivePipeline(
 		ctx,
@@ -241,8 +276,26 @@ func buildBootstrapArchives(ctx context.Context, log *slog.Logger, outputDir str
 		func(ctx context.Context, version string) (bootstrapArchiveTask, error) {
 			return prepareBootstrapArchive(ctx, log, stagingDir, outputDir, version)
 		},
-		func(task bootstrapArchiveTask) error {
-			return artifacts.WriteBundleArchive(task.bundleDir, task.archivePath)
+		func(ctx context.Context, task bootstrapArchiveTask) error {
+			if err := artifacts.WriteBundleArchive(task.bundleDir, task.archivePath); err != nil {
+				return err
+			}
+
+			if publish.registry == "" {
+				return nil
+			}
+
+			select {
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			case <-publishToken:
+			}
+
+			defer func() { publishToken <- struct{}{} }()
+
+			ociRef := fmt.Sprintf("%s/bootstrap-artifacts:%s-k8s-%s", publish.registry, publish.tagPrefix, task.version)
+
+			return artifacts.PushOCI(ctx, log, task.bundleDir, ociRef)
 		},
 	)
 }
@@ -251,7 +304,7 @@ func runBootstrapArchivePipeline(
 	ctx context.Context,
 	versions []string,
 	prepare func(context.Context, string) (bootstrapArchiveTask, error),
-	archive func(bootstrapArchiveTask) error,
+	archive func(context.Context, bootstrapArchiveTask) error,
 ) error {
 	tasks := make(chan bootstrapArchiveTask)
 	group, ctx := errgroup.WithContext(ctx)
@@ -286,7 +339,7 @@ func runBootstrapArchivePipeline(
 						return nil
 					}
 
-					err := archive(task)
+					err := archive(ctx, task)
 					task.cleanup()
 
 					if err != nil {
@@ -309,6 +362,7 @@ func prepareBootstrapArchive(ctx context.Context, log *slog.Logger, stagingDir, 
 	}
 
 	task := bootstrapArchiveTask{
+		version:     version,
 		bundleDir:   bundleDir,
 		archivePath: filepath.Join(outputDir, fmt.Sprintf("bootstrap-artifacts-k8s-%s.tar.gz", version)),
 		cleanup: func() {
@@ -351,143 +405,6 @@ func newLogger(debug bool, format string) *slog.Logger {
 	return slog.New(logger.NewPrettyFieldHandler(&lvl, logger.PrettyFieldHandlerOptions{
 		AttrOrder: []string{"artifact", "source", "archive", "oci_ref", "digest", "staging_dir"},
 	}))
-}
-
-// GitHub Actions publishing flow:
-//
-//  1. The resolve job runs resolve-publish-inputs once. It resolves the OCI tag
-//     prefix, release tag, Kubernetes versions, and rootfs images from reusable
-//     workflow or workflow_dispatch inputs, then writes GitHub outputs.
-//  2. The main release workflow passes its version tag as both the OCI tag
-//     prefix and GitHub release tag, with embedded default version and image lists.
-//  3. Manual workflow_dispatch runs may pass explicit tags and comma, space, or
-//     newline separated Kubernetes version and rootfs image lists. Missing
-//     values use the short commit SHA or embedded defaults as appropriate.
-//  4. The workflow passes all requested Kubernetes versions to one publish job.
-//     This binary creates one temporary staging directory so artifacts shared by
-//     versions, such as containerd or runc, are downloaded once and materialized
-//     into each bundle.
-//  5. Each bundle is validated before publishing so invalid local content fails
-//     the job before creating the HTTPS archive or pushing to the registry. The
-//     archive is a gzip-compressed filesystem bundle, while the OCI tag is an
-//     index with one platform manifest per target architecture.
-//  6. Each published OCI tag must keep the shape documented in
-//     designs/agent-offline-bootstrap.md:
-//     ghcr.io/<owner>/unbounded/bootstrap-artifacts:<tag-prefix>-k8s-<kubernetes-version>
-func newPublishVersionGroupCommand(debug *bool, logFormat *string) *cobra.Command {
-	return &cobra.Command{
-		Use:          "publish-version-group",
-		Short:        "Build and publish Kubernetes versions from GitHub Actions inputs",
-		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return publishVersionGroup(cmd.Context(), newLogger(*debug, *logFormat))
-		},
-	}
-}
-
-func publishVersionGroup(ctx context.Context, log *slog.Logger) error {
-	registry := strings.TrimRight(strings.ToLower(strings.TrimSpace(os.Getenv("REGISTRY"))), "/")
-	if registry == "" {
-		return fmt.Errorf("REGISTRY is required")
-	}
-
-	tagPrefix := strings.TrimSpace(os.Getenv("ARTIFACT_TAG_PREFIX"))
-	if tagPrefix == "" {
-		return fmt.Errorf("ARTIFACT_TAG_PREFIX is required")
-	}
-
-	versions, err := kubernetesVersionsFromJSON(os.Getenv("KUBERNETES_VERSIONS_JSON"))
-	if err != nil {
-		return err
-	}
-
-	stagingDir, cleanup, err := artifacts.NewStagingDir()
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	log.Info("using offline artifact staging directory", slog.String("staging_dir", stagingDir))
-
-	for _, kubernetesVersion := range versions {
-		ociRef := fmt.Sprintf("%s/bootstrap-artifacts:%s-k8s-%s", registry, tagPrefix, kubernetesVersion)
-		outputDir := filepath.Join("dist", "bootstrap-artifacts", kubernetesVersion)
-		archivePath := filepath.Join("dist", "bootstrap-artifacts", fmt.Sprintf("bootstrap-artifacts-%s-k8s-%s.tar.gz", tagPrefix, kubernetesVersion))
-
-		log.Info("building offline artifact bundle",
-			slog.String("kubernetes_version", kubernetesVersion),
-			slog.String("output_dir", outputDir),
-			slog.String("oci_ref", ociRef),
-		)
-
-		if err := artifacts.Build(ctx, log, artifacts.Options{
-			OutputDir:         outputDir,
-			StagingDir:        stagingDir,
-			KubernetesVersion: kubernetesVersion,
-			Architectures:     []string{"amd64", "arm64"},
-			ArchivePath:       archivePath,
-			OCIRef:            ociRef,
-		}); err != nil {
-			return err
-		}
-
-		if err := logBundleContents(log, outputDir); err != nil {
-			return err
-		}
-
-		log.Info("published offline artifact bundle",
-			slog.String("archive", archivePath),
-			slog.String("oci_ref", ociRef),
-		)
-	}
-
-	return nil
-}
-
-func kubernetesVersionsFromJSON(raw string) ([]string, error) {
-	if strings.TrimSpace(raw) == "" {
-		return nil, fmt.Errorf("KUBERNETES_VERSIONS_JSON is required")
-	}
-
-	var versions []string
-	if err := json.Unmarshal([]byte(raw), &versions); err != nil {
-		return nil, fmt.Errorf("parse KUBERNETES_VERSIONS_JSON: %w", err)
-	}
-
-	if len(versions) == 0 {
-		return nil, fmt.Errorf("KUBERNETES_VERSIONS_JSON must contain at least one version")
-	}
-
-	return versions, nil
-}
-
-func logBundleContents(log *slog.Logger, root string) error {
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if entry.IsDir() {
-			return nil
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-
-		log.Info("offline artifact bundle file",
-			slog.String("artifact", filepath.ToSlash(rel)),
-			slog.Int64("bytes", info.Size()),
-		)
-
-		return nil
-	})
 }
 
 func newValidateOCICommand(debug *bool, logFormat *string) *cobra.Command {
@@ -606,22 +523,11 @@ func resolvePublishInputs() error {
 		return fmt.Errorf("marshal rootfs images: %w", err)
 	}
 
-	groups, err := groupKubernetesVersionsByMinor(versions)
-	if err != nil {
-		return err
-	}
-
-	groupsJSON, err := json.Marshal(groups)
-	if err != nil {
-		return fmt.Errorf("marshal Kubernetes version groups: %w", err)
-	}
-
 	if err := writeGitHubOutput(map[string]string{
-		"tag":                       tag,
-		"release_tag":               releaseTag,
-		"kubernetes_versions":       string(versionsJSON),
-		"kubernetes_version_groups": string(groupsJSON),
-		"rootfs_images":             string(rootfsImagesJSON),
+		"tag":                 tag,
+		"release_tag":         releaseTag,
+		"kubernetes_versions": string(versionsJSON),
+		"rootfs_images":       string(rootfsImagesJSON),
 	}); err != nil {
 		return err
 	}
@@ -629,7 +535,6 @@ func resolvePublishInputs() error {
 	fmt.Printf("Publishing tag prefix: %s\n", tag)
 	fmt.Printf("GitHub release tag: %s\n", releaseTag)
 	fmt.Printf("Kubernetes versions: %s\n", versionsJSON)
-	fmt.Printf("Kubernetes version groups: %s\n", groupsJSON)
 	fmt.Printf("Rootfs images: %s\n", rootfsImagesJSON)
 
 	return nil
@@ -739,43 +644,6 @@ func normalizeKubernetesVersions(raw string) []string {
 	}
 
 	return versions
-}
-
-type kubernetesVersionGroup struct {
-	Minor    string   `json:"minor"`
-	Versions []string `json:"versions"`
-}
-
-func groupKubernetesVersionsByMinor(versions []string) ([]kubernetesVersionGroup, error) {
-	groups := []kubernetesVersionGroup{}
-	indexByMinor := map[string]int{}
-
-	for _, version := range versions {
-		minor, err := kubernetesMinorVersion(version)
-		if err != nil {
-			return nil, err
-		}
-
-		index, ok := indexByMinor[minor]
-		if !ok {
-			index = len(groups)
-			indexByMinor[minor] = index
-			groups = append(groups, kubernetesVersionGroup{Minor: minor})
-		}
-
-		groups[index].Versions = append(groups[index].Versions, version)
-	}
-
-	return groups, nil
-}
-
-func kubernetesMinorVersion(version string) (string, error) {
-	parsed, err := semver.NewVersion(strings.TrimSpace(version))
-	if err != nil {
-		return "", fmt.Errorf("parse Kubernetes version %q: %w", version, err)
-	}
-
-	return fmt.Sprintf("%d.%d", parsed.Major(), parsed.Minor()), nil
 }
 
 func shortSHA(sha string) string {

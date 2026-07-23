@@ -110,12 +110,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build release assets
+      - name: Build and publish artifacts
         env:
+          ARTIFACT_TAG_PREFIX: ${{ steps.resolve.outputs.tag }}
           KUBERNETES_VERSIONS_JSON: ${{ steps.resolve.outputs.kubernetes_versions }}
           ROOTFS_IMAGES_JSON: ${{ steps.resolve.outputs.rootfs_images }}
         run: |
-          args=(build --output-dir dist)
+          args=(build --output-dir dist \
+            --oci-registry "${REGISTRY}" \
+            --artifact-tag-prefix "${ARTIFACT_TAG_PREFIX}")
 
           while IFS= read -r version; do
             args+=(--kubernetes-version "${version}")
@@ -148,18 +151,7 @@ jobs:
           path: dist/rootfs/
           retention-days: 7
 
-      - name: Remove release build workspace
-        run: |
-          rm -rf dist tmp/agent-artifacts-builder-stage
-          df -h /
-
-      - name: Build and publish offline artifact bundles
-        env:
-          ARTIFACT_TAG_PREFIX: ${{ steps.resolve.outputs.tag }}
-          KUBERNETES_VERSIONS_JSON: ${{ steps.resolve.outputs.kubernetes_versions }}
-        run: bin/agent-artifacts-builder publish-version-group
-
-      - name: Upload filesystem and HTTPS artifact bundles
+      - name: Upload bootstrap archives
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bootstrap-artifacts
