@@ -17,7 +17,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 )
 
-func TestSourceMaterializeArchive(t *testing.T) {
+func TestMaterializeHTTPSArchive(t *testing.T) {
 	t.Parallel()
 
 	archivePath := filepath.Join(t.TempDir(), "offline-artifacts.tar.gz")
@@ -29,30 +29,26 @@ func TestSourceMaterializeArchive(t *testing.T) {
 	source, err := artifactsource.Parse(archivePath)
 	require.NoError(t, err)
 
-	opts := ArchiveCacheOptions{
-		CacheRoot:   filepath.Join(t.TempDir(), "cache"),
-		RootMarker:  "manifest.json",
-		ReadyMarker: ".ready",
-	}
-	cache, err := MaterializeArchive(context.Background(), source, opts)
+	storageRoot := filepath.Join(t.TempDir(), "archives")
+	archive, err := materializeHTTPSArchive(context.Background(), source, storageRoot)
 	require.NoError(t, err)
-	require.FileExists(t, filepath.Join(cache.Root(), "manifest.json"))
-	require.FileExists(t, filepath.Join(cache.Root(), "runc"))
-	require.NoError(t, cache.MarkReady())
+	require.FileExists(t, filepath.Join(archive.root, "manifest.json"))
+	require.FileExists(t, filepath.Join(archive.root, "runc"))
+	require.NoError(t, archive.markValidated())
 
 	require.NoError(t, os.Remove(archivePath))
 
-	cached, err := MaterializeArchive(context.Background(), source, opts)
+	cached, err := materializeHTTPSArchive(context.Background(), source, storageRoot)
 	require.NoError(t, err)
-	require.Equal(t, cache.Root(), cached.Root())
+	require.Equal(t, archive.root, cached.root)
 }
 
-func TestCacheKeyIgnoresSignedQuery(t *testing.T) {
+func TestSourceKeyIgnoresSignedQuery(t *testing.T) {
 	t.Parallel()
 
-	withoutQuery := CacheKey("https://artifacts.example.test/bootstrap")
-	firstSAS := CacheKey("https://artifacts.example.test/bootstrap?sp=r&sig=first-secret")
-	rotatedSAS := CacheKey("https://artifacts.example.test/bootstrap?sp=r&sig=rotated-secret")
+	withoutQuery := SourceKey("https://artifacts.example.test/bootstrap")
+	firstSAS := SourceKey("https://artifacts.example.test/bootstrap?sp=r&sig=first-secret")
+	rotatedSAS := SourceKey("https://artifacts.example.test/bootstrap?sp=r&sig=rotated-secret")
 
 	require.Equal(t, withoutQuery, firstSAS)
 	require.Equal(t, firstSAS, rotatedSAS)

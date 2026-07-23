@@ -19,10 +19,7 @@ import (
 )
 
 // OfflineArtifactManifestFileName is the manifest file name in an offline artifact bundle.
-const (
-	OfflineArtifactManifestFileName = bootstrapartifacts.ManifestFileName
-	offlineArtifactCacheReadyFile   = ".ready"
-)
+const OfflineArtifactManifestFileName = bootstrapartifacts.ManifestFileName
 
 // OfflineArtifactVersions records the component versions included in an offline artifact bundle.
 type OfflineArtifactVersions = bootstrapartifacts.Versions
@@ -74,9 +71,8 @@ func resolveOfflineArtifacts(ctx context.Context, cfg *config.AgentConfig, offli
 		return nil, err
 	}
 
-	bundle, archiveCache, err := bootstrapartifacts.Resolve(ctx, renderedSource, bootstrapartifacts.ResolveOptions{
-		CacheRoot:   OfflineArtifactArchiveHostDir,
-		ReadyMarker: offlineArtifactCacheReadyFile,
+	bundle, markValidated, err := bootstrapartifacts.Resolve(ctx, renderedSource, bootstrapartifacts.ResolveOptions{
+		HTTPSArchiveRoot: OfflineArtifactArchiveHostDir,
 	})
 	if err != nil {
 		return nil, err
@@ -99,8 +95,8 @@ func resolveOfflineArtifacts(ctx context.Context, cfg *config.AgentConfig, offli
 		return nil, err
 	}
 
-	if archiveCache != nil {
-		if err := archiveCache.MarkReady(); err != nil {
+	if markValidated != nil {
+		if err := markValidated(); err != nil {
 			return nil, err
 		}
 	}
@@ -256,7 +252,7 @@ func containerImageArchiveURLsFromOfflineArtifacts(offlineArtifacts *ResolvedOff
 }
 
 func containerImageArchiveHostDir(sourceRoot string) string {
-	return filepath.Join(ContainerImageArchiveHostSourceDir, bootstrapartifacts.CacheKey(sourceRoot))
+	return filepath.Join(ContainerImageArchiveHostSourceDir, bootstrapartifacts.SourceKey(sourceRoot))
 }
 
 func offlineContainerImageArchivePath(arch, imageTag string) string {

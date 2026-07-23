@@ -15,13 +15,13 @@ import (
 
 // ResolveOptions configures HTTPS archive-backed bundle resolution.
 type ResolveOptions struct {
-	CacheRoot   string
-	ReadyMarker string
+	HTTPSArchiveRoot string
 }
 
 // Resolve opens a local or OCI bundle, or materializes an HTTPS archive as a
-// local bundle.
-func Resolve(ctx context.Context, raw string, opts ResolveOptions) (Bundle, *ArchiveCache, error) {
+// local bundle. For HTTPS archives, markValidated must be called after
+// caller-specific bundle validation succeeds.
+func Resolve(ctx context.Context, raw string, opts ResolveOptions) (bundle Bundle, markValidated func() error, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil, fmt.Errorf("bootstrap artifact bundle source is empty")
@@ -54,19 +54,15 @@ func Resolve(ctx context.Context, raw string, opts ResolveOptions) (Bundle, *Arc
 		return nil, nil, fmt.Errorf("parse HTTPS artifact bundle source: %w", err)
 	}
 
-	cache, err := MaterializeArchive(ctx, source, ArchiveCacheOptions{
-		CacheRoot:   opts.CacheRoot,
-		RootMarker:  ManifestFileName,
-		ReadyMarker: opts.ReadyMarker,
-	})
+	archive, err := materializeHTTPSArchive(ctx, source, opts.HTTPSArchiveRoot)
 	if err != nil {
 		return nil, nil, fmt.Errorf("materialize HTTPS artifact bundle: %w", err)
 	}
 
-	bundle, err := Open(cache.Root())
+	bundle, err = Open(archive.root)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open extracted HTTPS artifact bundle: %w", err)
 	}
 
-	return bundle, cache, nil
+	return bundle, archive.markValidated, nil
 }

@@ -17,9 +17,20 @@ import (
 
 // Bundle provides read access to a collection of bootstrap artifacts.
 type Bundle interface {
+	// Root returns the normalized filesystem path or OCI reference identifying
+	// the bundle root.
 	Root() string
+
+	// Artifact resolves a bundle-relative path into an openable artifact source.
 	Artifact(path string) (artifactsource.Source, error)
+
+	// ArtifactURL returns the source URL for a bundle-relative path. The path may
+	// contain format verbs used later when resolving download overrides.
 	ArtifactURL(path string) string
+
+	// List returns the sorted bundle-relative paths of all available artifacts.
+	// For OCI bundles, it fetches the selected platform manifest once and lists
+	// descriptor titles without downloading artifact contents.
 	List(ctx context.Context) ([]string, error)
 }
 
