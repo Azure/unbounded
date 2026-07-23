@@ -71,7 +71,6 @@ func newRootCommand() *cobra.Command {
 	flags.StringSliceVar(&opts.Architectures, "arch", nil, "Target architecture to include. Repeat or comma separate. Defaults to the host GOARCH")
 
 	cmd.AddCommand(
-		newArchiveOCIImageCommand(&debug, &logFormat),
 		newBuildCommand(&debug, &logFormat),
 		newResolvePublishInputsCommand(),
 		newPublishVersionGroupCommand(&debug, &logFormat),
@@ -82,7 +81,11 @@ func newRootCommand() *cobra.Command {
 }
 
 func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
-	var outputDir string
+	var (
+		outputDir          string
+		kubernetesVersions []string
+		rootfsImages       []string
+	)
 
 	cmd := &cobra.Command{
 		Use:          "build",
@@ -93,33 +96,56 @@ func newBuildCommand(debug *bool, logFormat *string) *cobra.Command {
 				return fmt.Errorf("--output-dir is required")
 			}
 
-			versionsRaw, err := defaultKubernetesVersions()
+			versions, err := resolveBuildKubernetesVersions(kubernetesVersions)
 			if err != nil {
 				return err
 			}
 
-			versions := normalizeKubernetesVersions(versionsRaw)
-			if len(versions) == 0 {
-				return fmt.Errorf("at least one Kubernetes version is required")
-			}
-
-			rootfsImagesRaw, err := defaultRootfsImages()
+			images, err := resolveBuildRootfsImages(rootfsImages)
 			if err != nil {
 				return err
 			}
 
-			rootfsImages, err := normalizeRootfsImages(rootfsImagesRaw)
-			if err != nil {
-				return err
-			}
-
-			return buildReleaseLayout(cmd.Context(), newLogger(*debug, *logFormat), outputDir, versions, rootfsImages)
+			return buildReleaseLayout(cmd.Context(), newLogger(*debug, *logFormat), outputDir, versions, images)
 		},
 	}
 
 	cmd.Flags().StringVar(&outputDir, "output-dir", "", "Directory for rootfs and bootstrap artifact archives")
+	cmd.Flags().StringArrayVar(&kubernetesVersions, "kubernetes-version", nil, "Kubernetes version to build. Repeat for multiple versions. Defaults to embedded versions")
+	cmd.Flags().StringArrayVar(&rootfsImages, "rootfs-image", nil, "Tagged rootfs OCI image to build. Repeat for multiple images. Defaults to embedded images")
 
 	return cmd
+}
+
+func resolveBuildKubernetesVersions(versions []string) ([]string, error) {
+	if len(versions) == 0 {
+		versionsRaw, err := defaultKubernetesVersions()
+		if err != nil {
+			return nil, err
+		}
+
+		versions = []string{versionsRaw}
+	}
+
+	resolved := normalizeKubernetesVersions(strings.Join(versions, "\n"))
+	if len(resolved) == 0 {
+		return nil, fmt.Errorf("at least one Kubernetes version is required")
+	}
+
+	return resolved, nil
+}
+
+func resolveBuildRootfsImages(images []string) ([]string, error) {
+	if len(images) == 0 {
+		imagesRaw, err := defaultRootfsImages()
+		if err != nil {
+			return nil, err
+		}
+
+		images = []string{imagesRaw}
+	}
+
+	return normalizeRootfsImages(strings.Join(images, "\n"))
 }
 
 func buildReleaseLayout(ctx context.Context, log *slog.Logger, outputDir string, versions, rootfsImages []string) error {
@@ -435,42 +461,6 @@ func logBundleContents(log *slog.Logger, root string) error {
 
 		return nil
 	})
-}
-
-func newArchiveOCIImageCommand(debug *bool, logFormat *string) *cobra.Command {
-	var sourceRef, outputPath string
-
-	cmd := &cobra.Command{
-		Use:          "archive-oci-image",
-		Short:        "Copy a registry image into a tarred OCI image layout",
-		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if sourceRef == "" {
-				return fmt.Errorf("--source is required")
-			}
-
-			if outputPath == "" {
-				return fmt.Errorf("--output is required")
-			}
-
-			log := newLogger(*debug, *logFormat)
-			log.Info("archiving OCI image", slog.String("source", sourceRef), slog.String("archive", outputPath))
-
-			if err := artifacts.ArchiveOCIImage(cmd.Context(), sourceRef, outputPath); err != nil {
-				return err
-			}
-
-			log.Info("archived OCI image", slog.String("source", sourceRef), slog.String("archive", outputPath))
-
-			return nil
-		},
-	}
-
-	flags := cmd.Flags()
-	flags.StringVar(&sourceRef, "source", "", "Tagged OCI registry image reference to archive")
-	flags.StringVar(&outputPath, "output", "", "Output path for the gzip-compressed OCI layout archive")
-
-	return cmd
 }
 
 func newValidateOCICommand(debug *bool, logFormat *string) *cobra.Command {

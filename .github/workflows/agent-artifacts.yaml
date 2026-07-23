@@ -102,12 +102,13 @@ jobs:
           path: bin/agent-artifacts-builder
           retention-days: 1
 
-  publish-rootfs-archives:
+  build-archives:
     needs: resolve
     runs-on: ubuntu-latest
     env:
-      ROOTFS_IMAGES_JSON: ${{ needs.resolve.outputs.rootfs_images }}
+      KUBERNETES_VERSIONS_JSON: ${{ needs.resolve.outputs.kubernetes_versions }}
       RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      ROOTFS_IMAGES_JSON: ${{ needs.resolve.outputs.rootfs_images }}
     steps:
       - name: Download agent artifacts builder
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -125,44 +126,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Export rootfs OCI layout archives
+      - name: Build release assets
         run: |
-          mkdir -p dist/rootfs-images
+          args=(build --output-dir dist)
+
+          while IFS= read -r version; do
+            args+=(--kubernetes-version "${version}")
+          done < <(jq -r '.[]' <<< "${KUBERNETES_VERSIONS_JSON}")
 
           while IFS= read -r image_ref; do
-            archive_name="${image_ref##*/}"
-            archive_name="${archive_name//:/-}"
-            archive_name="${archive_name//@/-}"
-
-            bin/agent-artifacts-builder archive-oci-image \
-              --source "${image_ref}" \
-              --output "dist/rootfs-images/${archive_name}.oci.tar.gz"
+            args+=(--rootfs-image "${image_ref}")
           done < <(jq -r '.[]' <<< "${ROOTFS_IMAGES_JSON}")
 
-      - name: Upload rootfs archives to GitHub release
+          bin/agent-artifacts-builder "${args[@]}"
+
+      - name: Upload archives to GitHub release
         if: env.RELEASE_TAG != ''
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p dist/release-assets
-
-          for source in dist/rootfs-images/*.oci.tar.gz; do
-            destination="dist/release-assets/rootfs-$(basename "${source}")"
-            cp "${source}" "${destination}"
-            sha256sum "${destination}" | sed 's#  dist/release-assets/#  #' > "${destination}.sha256"
-          done
-
           gh release upload "${RELEASE_TAG}" \
-            dist/release-assets/rootfs-*.oci.tar.gz \
-            dist/release-assets/rootfs-*.oci.tar.gz.sha256 \
+            dist/rootfs/*.oci.tar.gz \
+            dist/rootfs/*.oci.tar.gz.sha256 \
+            dist/bootstrap-artifacts/*.tar.gz \
+            dist/bootstrap-artifacts/*.tar.gz.sha256 \
             --clobber
 
       - name: Upload rootfs OCI layout archives
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rootfs-oci-layouts
-          path: dist/rootfs-images/
+          path: dist/rootfs/
           retention-days: 7
 
   publish:
@@ -181,7 +176,6 @@ jobs:
       ARTIFACT_TAG_PREFIX: ${{ needs.resolve.outputs.tag }}
       KUBERNETES_MINOR: ${{ matrix.group.minor }}
       KUBERNETES_VERSIONS_JSON: ${{ toJson(matrix.group.versions) }}
-      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
     steps:
       - name: Download agent artifacts builder
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -204,27 +198,6 @@ jobs:
 
       - name: Build and publish offline artifact bundles
         run: bin/agent-artifacts-builder publish-version-group
-
-      - name: Upload bootstrap archives to GitHub release
-        if: env.RELEASE_TAG != ''
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p dist/release-assets
-
-          for source in dist/bootstrap-artifacts/*.tar.gz; do
-            source_name=$(basename "${source}")
-            suffix=${source_name#"bootstrap-artifacts-${ARTIFACT_TAG_PREFIX}-"}
-            destination="dist/release-assets/bootstrap-artifacts-${suffix}"
-            cp "${source}" "${destination}"
-            sha256sum "${destination}" | sed 's#  dist/release-assets/#  #' > "${destination}.sha256"
-          done
-
-          gh release upload "${RELEASE_TAG}" \
-            dist/release-assets/bootstrap-artifacts-k8s-*.tar.gz \
-            dist/release-assets/bootstrap-artifacts-k8s-*.tar.gz.sha256 \
-            --clobber
 
       - name: Upload filesystem and HTTPS artifact bundles
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

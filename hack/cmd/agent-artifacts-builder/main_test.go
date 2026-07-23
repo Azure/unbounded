@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -241,6 +242,50 @@ func TestResolvePublishInputsRequiresTag(t *testing.T) {
 	t.Setenv("DEFAULT_KUBERNETES_VERSIONS_FILE", "")
 
 	require.ErrorContains(t, resolvePublishInputs(), "artifact tag could not be resolved")
+}
+
+func TestBuilderCommandVisibility(t *testing.T) {
+	root := newRootCommand()
+
+	commands := map[string]*cobra.Command{}
+	for _, command := range root.Commands() {
+		commands[command.Name()] = command
+	}
+
+	require.Contains(t, commands, "publish-version-group")
+	require.False(t, commands["publish-version-group"].Hidden)
+	require.NotContains(t, commands, "archive-oci-image")
+}
+
+func TestResolveBuildInputsUseExplicitValues(t *testing.T) {
+	versions, err := resolveBuildKubernetesVersions([]string{"1.34.9", "v1.35.6"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"v1.34.9", "v1.35.6"}, versions)
+
+	images, err := resolveBuildRootfsImages([]string{
+		"ghcr.io/azure/agent-ubuntu2404:v1",
+		"oci://ghcr.io/azure/agent-azlinux3:v2",
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"ghcr.io/azure/agent-ubuntu2404:v1",
+		"oci://ghcr.io/azure/agent-azlinux3:v2",
+	}, images)
+}
+
+func TestResolveBuildInputsUseEmbeddedDefaults(t *testing.T) {
+	versions, err := resolveBuildKubernetesVersions(nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, versions)
+
+	images, err := resolveBuildRootfsImages(nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, images)
+}
+
+func TestResolveBuildRootfsImagesRejectsDigest(t *testing.T) {
+	_, err := resolveBuildRootfsImages([]string{"ghcr.io/azure/agent-ubuntu2404@sha256:0000000000000000000000000000000000000000000000000000000000000000"})
+	require.ErrorContains(t, err, "must use a tag")
 }
 
 func TestNormalizeRootfsImages(t *testing.T) {
