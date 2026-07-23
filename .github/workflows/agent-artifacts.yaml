@@ -62,15 +62,18 @@ permissions:
   packages: write
 
 jobs:
-  resolve:
+  build-and-publish:
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      release_tag: ${{ steps.resolve.outputs.release_tag }}
-      kubernetes_versions: ${{ steps.resolve.outputs.kubernetes_versions }}
-      kubernetes_version_groups: ${{ steps.resolve.outputs.kubernetes_version_groups }}
-      rootfs_images: ${{ steps.resolve.outputs.rootfs_images }}
     steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
+          sudo docker image prune -af &
+          wait
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -95,38 +98,10 @@ jobs:
           GITHUB_SHA_VALUE: ${{ github.sha }}
         run: bin/agent-artifacts-builder resolve-publish-inputs
 
-      - name: Upload agent artifacts builder
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: agent-artifacts-builder
-          path: bin/agent-artifacts-builder
-          retention-days: 1
-
-  build-archives:
-    needs: resolve
-    runs-on: ubuntu-latest
-    env:
-      KUBERNETES_VERSIONS_JSON: ${{ needs.resolve.outputs.kubernetes_versions }}
-      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
-      ROOTFS_IMAGES_JSON: ${{ needs.resolve.outputs.rootfs_images }}
-    steps:
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
-                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
-          sudo docker image prune -af &
-          wait
-          df -h /
-
-      - name: Download agent artifacts builder
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: agent-artifacts-builder
-          path: bin
-
-      - name: Prepare agent artifacts builder
-        run: chmod +x bin/agent-artifacts-builder
+      - name: Normalize registry
+        env:
+          REGISTRY: ghcr.io/${{ github.repository_owner }}/unbounded
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
       - name: Log in to ghcr.io
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
@@ -136,6 +111,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build release assets
+        env:
+          KUBERNETES_VERSIONS_JSON: ${{ steps.resolve.outputs.kubernetes_versions }}
+          ROOTFS_IMAGES_JSON: ${{ steps.resolve.outputs.rootfs_images }}
         run: |
           args=(build --output-dir dist)
 
@@ -150,10 +128,11 @@ jobs:
           bin/agent-artifacts-builder "${args[@]}"
 
       - name: Upload archives to GitHub release
-        if: env.RELEASE_TAG != ''
+        if: steps.resolve.outputs.release_tag != ''
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
         run: |
           gh release upload "${RELEASE_TAG}" \
             dist/rootfs/*.oci.tar.gz \
@@ -169,43 +148,15 @@ jobs:
           path: dist/rootfs/
           retention-days: 7
 
-  publish:
-    needs: resolve
-    runs-on: ubuntu-latest
-    env:
-      REGISTRY: ghcr.io/${{ github.repository_owner }}/unbounded
-      ARTIFACT_TAG_PREFIX: ${{ needs.resolve.outputs.tag }}
-      KUBERNETES_VERSIONS_JSON: ${{ needs.resolve.outputs.kubernetes_versions }}
-    steps:
-      - name: Free disk space
+      - name: Remove release build workspace
         run: |
+          rm -rf dist tmp/agent-artifacts-builder-stage
           df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
-                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
-          sudo docker image prune -af &
-          wait
-          df -h /
-
-      - name: Download agent artifacts builder
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: agent-artifacts-builder
-          path: bin
-
-      - name: Prepare agent artifacts builder
-        run: chmod +x bin/agent-artifacts-builder
-
-      - name: Normalize registry
-        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and publish offline artifact bundles
+        env:
+          ARTIFACT_TAG_PREFIX: ${{ steps.resolve.outputs.tag }}
+          KUBERNETES_VERSIONS_JSON: ${{ steps.resolve.outputs.kubernetes_versions }}
         run: bin/agent-artifacts-builder publish-version-group
 
       - name: Upload filesystem and HTTPS artifact bundles
