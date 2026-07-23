@@ -363,11 +363,10 @@ func newLogger(debug bool, format string) *slog.Logger {
 //  3. Manual workflow_dispatch runs may pass explicit tags and comma, space, or
 //     newline separated Kubernetes version and rootfs image lists. Missing
 //     values use the short commit SHA or embedded defaults as appropriate.
-//  4. Versions are grouped by Kubernetes minor, for example 1.34 and 1.35. The
-//     workflow creates one publish job per minor group, while this binary still
-//     publishes every patch version inside that group. Each publish job creates
-//     one temporary staging directory so artifacts with the same version, such as
-//     containerd or runc, are downloaded once and materialized into each bundle.
+//  4. The workflow passes all requested Kubernetes versions to one publish job.
+//     This binary creates one temporary staging directory so artifacts shared by
+//     versions, such as containerd or runc, are downloaded once and materialized
+//     into each bundle.
 //  5. Each bundle is validated before publishing so invalid local content fails
 //     the job before creating the HTTPS archive or pushing to the registry. The
 //     archive is a gzip-compressed filesystem bundle, while the OCI tag is an
@@ -378,7 +377,7 @@ func newLogger(debug bool, format string) *slog.Logger {
 func newPublishVersionGroupCommand(debug *bool, logFormat *string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "publish-version-group",
-		Short:        "Build and publish a Kubernetes minor version group from GitHub Actions inputs",
+		Short:        "Build and publish Kubernetes versions from GitHub Actions inputs",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return publishVersionGroup(cmd.Context(), newLogger(*debug, *logFormat))
