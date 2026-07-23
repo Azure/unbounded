@@ -57,6 +57,7 @@ type PowerClient interface {
 	SetHTTPBootOverride(ctx context.Context, bootURL string) error
 	SetBIOSStaticIPv4(ctx context.Context, config redfish.StaticIPv4Config) error
 	SetBIOSHTTPBootURI(ctx context.Context, bootURL string) error
+	EnsureHTTPBootCertificate(ctx context.Context, trustCertPEM []byte) error
 }
 
 // PowerClientFactory builds a PowerClient for a Machine.
@@ -72,6 +73,7 @@ type Reconciler struct {
 	Site                  string
 	PowerClients          PowerClientFactory
 	HTTPBootURL           func(*v1alpha3.Machine) (string, error)
+	TrustCertificatePEM   []byte
 	MaxConcurrentMachines int
 	MaxAttempts           int32
 	PollInterval          time.Duration
@@ -594,6 +596,18 @@ func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, ma
 		bootURL, staticConfig, err := r.httpBootConfig(machine)
 		if err != nil {
 			return err
+		}
+
+		if strings.HasPrefix(bootURL, "https://") && len(r.TrustCertificatePEM) > 0 {
+			// Best-effort: install the trust certificate into the BMC's UEFI
+			// HTTPS boot store before setting the boot override. If this fails
+			// (e.g. unsupported BMC, network hiccup) we still set the override
+			// because the certificate may already be present from a prior run,
+			// and returning an error would block the entire repave operation.
+			if err := pc.EnsureHTTPBootCertificate(ctx, r.TrustCertificatePEM); err != nil {
+				slog.WarnContext(ctx, "Failed to ensure HTTPS boot trust certificate, proceeding with boot override",
+					"machine", machine.Name, "err", err)
+			}
 		}
 
 		if err := setHTTPBootOverride(ctx, pc, bootURL, staticConfig); err != nil {
