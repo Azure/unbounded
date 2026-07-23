@@ -201,13 +201,14 @@ jobs:
         run: echo "go_version=$(awk '/^go /{split($2,v,"."); print v[1]"."v[2]}' go.mod)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push controller image
+        id: push_controller
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: images/net/Containerfile
           target: controller
           platforms: linux/amd64
-          push: true
+          outputs: type=image,push=true,oci-mediatypes=true
           provenance: false
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
@@ -219,13 +220,14 @@ jobs:
           cache-to: type=gha,scope=nightly-net-controller,mode=max
 
       - name: Build and push node image
+        id: push_node
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: images/net/Containerfile
           target: node
           platforms: linux/amd64
-          push: true
+          outputs: type=image,push=true,oci-mediatypes=true
           provenance: false
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
@@ -235,6 +237,27 @@ jobs:
           tags: ${{ env.REGISTRY }}/unbounded-net-node:${{ env.TAG }}
           cache-from: type=gha,scope=nightly-net-node
           cache-to: type=gha,scope=nightly-net-node,mode=max
+
+      - name: Verify OCI image media types
+        env:
+          CONTROLLER_DIGEST: ${{ steps.push_controller.outputs.digest }}
+          NODE_DIGEST: ${{ steps.push_node.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for image in controller node; do
+            if [[ "$image" == "controller" ]]; then
+              digest="$CONTROLLER_DIGEST"
+            else
+              digest="$NODE_DIGEST"
+            fi
+            ref="${REGISTRY}/unbounded-net-${image}@${digest}"
+            docker buildx imagetools inspect --raw "$ref" | jq -e '
+              .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+              .config.mediaType == "application/vnd.oci.image.config.v1+json" and
+              all(.layers[];
+                .mediaType | test("^application/vnd\\.oci\\.image\\.layer\\.v1\\.tar(\\+(gzip|zstd))?$"))
+            '
+          done
 
   # ---------------------------------------------------------------------------
   # Build and push the remaining images the deploy needs (amd64).
