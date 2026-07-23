@@ -37,6 +37,12 @@ func TestParseHTTPSArchiveReference(t *testing.T) {
 			wantOK:  true,
 		},
 		{
+			name:    "trailing slash normalized",
+			image:   "https://artifacts.example.test/rootfs.oci.tar.gz/",
+			wantURL: "https://artifacts.example.test/rootfs.oci.tar.gz",
+			wantOK:  true,
+		},
+		{
 			name:   "registry reference",
 			image:  "registry.example.test/rootfs:v1",
 			wantOK: false,

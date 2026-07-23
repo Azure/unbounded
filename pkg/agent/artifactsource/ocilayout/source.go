@@ -93,6 +93,9 @@ func parseHTTPSArchiveReference(image string) (archiveURL string, ok bool, err e
 		return "", true, fmt.Errorf("HTTPS OCI archive reference must not include user info or a fragment")
 	}
 
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+
 	return parsed.String(), true, nil
 }
 

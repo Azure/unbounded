@@ -38,7 +38,11 @@ func ArchiveOCIImage(ctx context.Context, sourceRef, archivePath string) error {
 
 	reference := repo.Reference.Reference
 	if reference == "" {
-		return fmt.Errorf("OCI image source %q must include a tag or digest", sourceRef)
+		return fmt.Errorf("OCI image source %q must include a tag", sourceRef)
+	}
+
+	if err := repo.Reference.ValidateReferenceAsTag(); err != nil {
+		return fmt.Errorf("OCI image source %q must use a tag: %w", sourceRef, err)
 	}
 
 	ociutil.ConfigurePlainHTTP(repo)

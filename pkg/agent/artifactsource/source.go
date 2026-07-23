@@ -58,6 +58,14 @@ func Parse(source string) (Source, error) {
 	case "http", "https":
 		return Source{raw: source, kind: sourceHTTP}, nil
 	case "oci":
+		if parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {
+			return Source{}, fmt.Errorf("OCI artifact source must include registry and repository")
+		}
+
+		if parsed.User != nil || parsed.RawQuery != "" {
+			return Source{}, fmt.Errorf("OCI artifact source must not include user info or query parameters")
+		}
+
 		if strings.TrimPrefix(parsed.Fragment, "/") == "" {
 			return Source{}, fmt.Errorf("OCI artifact source must include a blob title fragment")
 		}

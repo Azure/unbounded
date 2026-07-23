@@ -87,7 +87,8 @@ func materializeHTTPSArchive(ctx context.Context, source artifactsource.Source, 
 	return archive, nil
 }
 
-// SourceKey returns a filesystem-safe, query-independent source identity key.
+// SourceKey returns a filesystem-safe source identity key. Signed HTTP(S)
+// query parameters are excluded so credential rotation reuses the same key.
 func SourceKey(source string) string {
 	sourceIdentity := utilio.URLWithoutQuery(source)
 

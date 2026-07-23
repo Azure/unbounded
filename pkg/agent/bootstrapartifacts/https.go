@@ -33,7 +33,7 @@ func Resolve(ctx context.Context, raw string, opts ResolveOptions) (bundle Bundl
 	}
 
 	if parsed.Scheme != "https" {
-		bundle, err := Open(raw)
+		bundle, err = Open(raw)
 
 		return bundle, nil, err
 	}

@@ -135,6 +135,29 @@ func TestParseRejectsOCIWithoutBlobTitle(t *testing.T) {
 	require.ErrorContains(t, err, "blob title fragment")
 }
 
+func TestParseRejectsInvalidOCISource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		source string
+		error  string
+	}{
+		{name: "missing repository", source: "oci://registry.example.test#manifest.json", error: "registry and repository"},
+		{name: "user info", source: "oci://user@registry.example.test/artifacts:v1#manifest.json", error: "user info"},
+		{name: "query", source: "oci://registry.example.test/artifacts:v1?token=secret#manifest.json", error: "query parameters"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Parse(tt.source)
+			require.ErrorContains(t, err, tt.error)
+		})
+	}
+}
+
 func TestReadExpectedSHA256(t *testing.T) {
 	t.Parallel()
 
