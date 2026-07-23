@@ -16,6 +16,7 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/spf13/cobra"
+	"oras.land/oras-go/v2/registry"
 
 	"github.com/Azure/unbounded/hack/cmd/agent-artifacts-builder/artifacts"
 	"github.com/Azure/unbounded/internal/logger"
@@ -23,8 +24,8 @@ import (
 
 const artifactTagRefPrefix = "agent-artifacts/"
 
-//go:embed kubernetes-versions.txt
-var defaultKubernetesVersionsFS embed.FS
+//go:embed kubernetes-versions.txt rootfs-images.txt
+var defaultPublishInputsFS embed.FS
 
 func main() {
 	if err := newRootCommand().ExecuteContext(context.Background()); err != nil {
@@ -307,11 +308,13 @@ func resolvePublishInputs() error {
 	refName := os.Getenv("REF_NAME")
 	inputTag := strings.TrimSpace(os.Getenv("INPUT_TAG"))
 	inputVersions := strings.TrimSpace(os.Getenv("INPUT_KUBERNETES_VERSIONS"))
+	inputRootfsImages := strings.TrimSpace(os.Getenv("INPUT_ROOTFS_IMAGES"))
 	githubSHA := os.Getenv("GITHUB_SHA_VALUE")
 
 	var (
-		tag         string
-		versionsRaw string
+		tag             string
+		versionsRaw     string
+		rootfsImagesRaw string
 	)
 	if eventName == "push" {
 		tag = strings.TrimPrefix(refName, artifactTagRefPrefix)
@@ -319,6 +322,11 @@ func resolvePublishInputs() error {
 		var err error
 
 		versionsRaw, err = defaultKubernetesVersions()
+		if err != nil {
+			return err
+		}
+
+		rootfsImagesRaw, err = defaultRootfsImages()
 		if err != nil {
 			return err
 		}
@@ -333,6 +341,16 @@ func resolvePublishInputs() error {
 			var err error
 
 			versionsRaw, err = defaultKubernetesVersions()
+			if err != nil {
+				return err
+			}
+		}
+
+		rootfsImagesRaw = inputRootfsImages
+		if rootfsImagesRaw == "" {
+			var err error
+
+			rootfsImagesRaw, err = defaultRootfsImages()
 			if err != nil {
 				return err
 			}
@@ -353,6 +371,16 @@ func resolvePublishInputs() error {
 		return fmt.Errorf("marshal Kubernetes versions: %w", err)
 	}
 
+	rootfsImages, err := normalizeRootfsImages(rootfsImagesRaw)
+	if err != nil {
+		return err
+	}
+
+	rootfsImagesJSON, err := json.Marshal(rootfsImages)
+	if err != nil {
+		return fmt.Errorf("marshal rootfs images: %w", err)
+	}
+
 	groups, err := groupKubernetesVersionsByMinor(versions)
 	if err != nil {
 		return err
@@ -367,6 +395,7 @@ func resolvePublishInputs() error {
 		"tag":                       tag,
 		"kubernetes_versions":       string(versionsJSON),
 		"kubernetes_version_groups": string(groupsJSON),
+		"rootfs_images":             string(rootfsImagesJSON),
 	}); err != nil {
 		return err
 	}
@@ -374,6 +403,7 @@ func resolvePublishInputs() error {
 	fmt.Printf("Publishing tag prefix: %s\n", tag)
 	fmt.Printf("Kubernetes versions: %s\n", versionsJSON)
 	fmt.Printf("Kubernetes version groups: %s\n", groupsJSON)
+	fmt.Printf("Rootfs images: %s\n", rootfsImagesJSON)
 
 	return nil
 }
@@ -389,9 +419,28 @@ func defaultKubernetesVersions() (string, error) {
 		return stripLineComments(string(data)), nil
 	}
 
-	data, err := defaultKubernetesVersionsFS.ReadFile("kubernetes-versions.txt")
+	data, err := defaultPublishInputsFS.ReadFile("kubernetes-versions.txt")
 	if err != nil {
 		return "", fmt.Errorf("read embedded default Kubernetes versions: %w", err)
+	}
+
+	return stripLineComments(string(data)), nil
+}
+
+func defaultRootfsImages() (string, error) {
+	path := strings.TrimSpace(os.Getenv("DEFAULT_ROOTFS_IMAGES_FILE"))
+	if path != "" {
+		data, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			return "", fmt.Errorf("read default rootfs images file %q: %w", path, err)
+		}
+
+		return stripLineComments(string(data)), nil
+	}
+
+	data, err := defaultPublishInputsFS.ReadFile("rootfs-images.txt")
+	if err != nil {
+		return "", fmt.Errorf("read embedded default rootfs images: %w", err)
 	}
 
 	return stripLineComments(string(data)), nil
@@ -410,6 +459,37 @@ func stripLineComments(raw string) string {
 	}
 
 	return strings.Join(out, "\n")
+}
+
+func normalizeRootfsImages(raw string) ([]string, error) {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	})
+
+	images := make([]string, 0, len(fields))
+	for _, field := range fields {
+		image := strings.TrimSpace(field)
+		if image == "" {
+			continue
+		}
+
+		ref, err := registry.ParseReference(strings.TrimPrefix(image, "oci://"))
+		if err != nil {
+			return nil, fmt.Errorf("parse rootfs image %q: %w", image, err)
+		}
+
+		if err := ref.ValidateReferenceAsTag(); err != nil {
+			return nil, fmt.Errorf("rootfs image %q must use a tag: %w", image, err)
+		}
+
+		images = append(images, image)
+	}
+
+	if len(images) == 0 {
+		return nil, fmt.Errorf("at least one rootfs image is required")
+	}
+
+	return images, nil
 }
 
 func normalizeKubernetesVersions(raw string) []string {

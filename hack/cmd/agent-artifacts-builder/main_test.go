@@ -38,15 +38,21 @@ func TestResolvePublishInputsWorkflowDispatchUsesExplicitInputs(t *testing.T) {
 	t.Setenv("REF_NAME", "")
 	t.Setenv("INPUT_TAG", "v0.4.0-alpha")
 	t.Setenv("INPUT_KUBERNETES_VERSIONS", "1.34.9, v1.35.6")
+	t.Setenv("INPUT_ROOTFS_IMAGES", "ghcr.io/azure/agent-ubuntu2404:v1, ghcr.io/azure/agent-azlinux3:v2")
 	t.Setenv("GITHUB_SHA_VALUE", "0123456789abcdef")
 	t.Setenv("GITHUB_OUTPUT", output)
 	t.Setenv("DEFAULT_KUBERNETES_VERSIONS_FILE", "")
+	t.Setenv("DEFAULT_ROOTFS_IMAGES_FILE", "")
 
 	require.NoError(t, resolvePublishInputs())
 
 	values := readGitHubOutput(t, output)
 	require.Equal(t, "v0.4.0-alpha", values["tag"])
 	requireJSONEqual(t, []string{"v1.34.9", "v1.35.6"}, values["kubernetes_versions"])
+	requireJSONEqual(t, []string{
+		"ghcr.io/azure/agent-ubuntu2404:v1",
+		"ghcr.io/azure/agent-azlinux3:v2",
+	}, values["rootfs_images"])
 	requireJSONEqual(t, []kubernetesVersionGroup{
 		{Minor: "1.34", Versions: []string{"v1.34.9"}},
 		{Minor: "1.35", Versions: []string{"v1.35.6"}},
@@ -62,21 +68,27 @@ func TestResolvePublishInputsWorkflowDispatchDefaultsTagAndVersions(t *testing.T
 v1.34.9
 `), 0o644))
 
+	rootfsImagesFile := filepath.Join(dir, "rootfs-images.txt")
+	require.NoError(t, os.WriteFile(rootfsImagesFile, []byte("ghcr.io/azure/agent-ubuntu2404:v1\n"), 0o644))
+
 	output := filepath.Join(dir, "github-output")
 
 	t.Setenv("EVENT_NAME", "workflow_dispatch")
 	t.Setenv("REF_NAME", "")
 	t.Setenv("INPUT_TAG", "")
 	t.Setenv("INPUT_KUBERNETES_VERSIONS", "")
+	t.Setenv("INPUT_ROOTFS_IMAGES", "")
 	t.Setenv("GITHUB_SHA_VALUE", "0123456789abcdef")
 	t.Setenv("GITHUB_OUTPUT", output)
 	t.Setenv("DEFAULT_KUBERNETES_VERSIONS_FILE", versionsFile)
+	t.Setenv("DEFAULT_ROOTFS_IMAGES_FILE", rootfsImagesFile)
 
 	require.NoError(t, resolvePublishInputs())
 
 	values := readGitHubOutput(t, output)
 	require.Equal(t, "0123456789ab", values["tag"])
 	requireJSONEqual(t, []string{"v1.34.8", "v1.34.9"}, values["kubernetes_versions"])
+	requireJSONEqual(t, []string{"ghcr.io/azure/agent-ubuntu2404:v1"}, values["rootfs_images"])
 	requireJSONEqual(t, []kubernetesVersionGroup{
 		{Minor: "1.34", Versions: []string{"v1.34.8", "v1.34.9"}},
 	}, values["kubernetes_version_groups"])
@@ -87,21 +99,27 @@ func TestResolvePublishInputsTagPushUsesRefTagAndDefaultVersions(t *testing.T) {
 	versionsFile := filepath.Join(dir, "versions.txt")
 	require.NoError(t, os.WriteFile(versionsFile, []byte("v1.35.5\nv1.35.6\n"), 0o644))
 
+	rootfsImagesFile := filepath.Join(dir, "rootfs-images.txt")
+	require.NoError(t, os.WriteFile(rootfsImagesFile, []byte("ghcr.io/azure/agent-azlinux3:v2\n"), 0o644))
+
 	output := filepath.Join(dir, "github-output")
 
 	t.Setenv("EVENT_NAME", "push")
 	t.Setenv("REF_NAME", "agent-artifacts/alpha-test")
 	t.Setenv("INPUT_TAG", "ignored")
 	t.Setenv("INPUT_KUBERNETES_VERSIONS", "v1.34.9")
+	t.Setenv("INPUT_ROOTFS_IMAGES", "ghcr.io/azure/ignored:v1")
 	t.Setenv("GITHUB_SHA_VALUE", "0123456789abcdef")
 	t.Setenv("GITHUB_OUTPUT", output)
 	t.Setenv("DEFAULT_KUBERNETES_VERSIONS_FILE", versionsFile)
+	t.Setenv("DEFAULT_ROOTFS_IMAGES_FILE", rootfsImagesFile)
 
 	require.NoError(t, resolvePublishInputs())
 
 	values := readGitHubOutput(t, output)
 	require.Equal(t, "alpha-test", values["tag"])
 	requireJSONEqual(t, []string{"v1.35.5", "v1.35.6"}, values["kubernetes_versions"])
+	requireJSONEqual(t, []string{"ghcr.io/azure/agent-azlinux3:v2"}, values["rootfs_images"])
 }
 
 func TestResolvePublishInputsRequiresTag(t *testing.T) {
@@ -114,6 +132,20 @@ func TestResolvePublishInputsRequiresTag(t *testing.T) {
 	t.Setenv("DEFAULT_KUBERNETES_VERSIONS_FILE", "")
 
 	require.ErrorContains(t, resolvePublishInputs(), "artifact tag could not be resolved")
+}
+
+func TestNormalizeRootfsImages(t *testing.T) {
+	t.Parallel()
+
+	got, err := normalizeRootfsImages("ghcr.io/azure/agent-ubuntu2404:v1, oci://ghcr.io/azure/agent-azlinux3:v2")
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"ghcr.io/azure/agent-ubuntu2404:v1",
+		"oci://ghcr.io/azure/agent-azlinux3:v2",
+	}, got)
+
+	_, err = normalizeRootfsImages("ghcr.io/azure/agent-ubuntu2404@sha256:0000000000000000000000000000000000000000000000000000000000000000")
+	require.ErrorContains(t, err, "must use a tag")
 }
 
 func TestNormalizeKubernetesVersions(t *testing.T) {
