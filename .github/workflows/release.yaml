@@ -355,7 +355,7 @@ jobs:
           file: images/net/Containerfile
           target: controller
           platforms: ${{ matrix.platform }}
-          push: true
+          outputs: type=image,push=true,oci-mediatypes=true
           provenance: false
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
@@ -374,7 +374,7 @@ jobs:
           file: images/net/Containerfile
           target: node
           platforms: ${{ matrix.platform }}
-          push: true
+          outputs: type=image,push=true,oci-mediatypes=true
           provenance: false
           build-args: |
             GO_VERSION=${{ steps.goversion.outputs.go_version }}
@@ -384,6 +384,27 @@ jobs:
           tags: ${{ env.REGISTRY }}/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=net-node-${{ matrix.arch }}
           cache-to: type=gha,scope=net-node-${{ matrix.arch }},mode=max
+
+      - name: Verify OCI image media types
+        env:
+          CONTROLLER_DIGEST: ${{ steps.push_controller.outputs.digest }}
+          NODE_DIGEST: ${{ steps.push_node.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for image in controller node; do
+            if [[ "$image" == "controller" ]]; then
+              digest="$CONTROLLER_DIGEST"
+            else
+              digest="$NODE_DIGEST"
+            fi
+            ref="${REGISTRY}/unbounded-net-${image}@${digest}"
+            docker buildx imagetools inspect --raw "$ref" | jq -e '
+              .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+              .config.mediaType == "application/vnd.oci.image.config.v1+json" and
+              all(.layers[];
+                .mediaType | test("^application/vnd\\.oci\\.image\\.layer\\.v1\\.tar(\\+(gzip|zstd))?$"))
+            '
+          done
 
       - name: Sign per-arch net images
         run: |
@@ -452,12 +473,23 @@ jobs:
           for image in controller node; do
             SRC="${{ env.REGISTRY }}/unbounded-net-${image}"
             echo "Creating manifest ${SRC}:${TAG}..."
+            metadata="$(mktemp)"
             docker buildx imagetools create \
               --tag "${SRC}:${TAG}" \
+              --metadata-file "$metadata" \
               "${SRC}:${TAG}-amd64" \
               "${SRC}:${TAG}-arm64"
 
-            digest="$(docker buildx imagetools inspect "${SRC}:${TAG}" | awk '$1 == "Digest:" {print $2; exit}')"
+            jq -e '
+              .["containerimage.descriptor"].mediaType == "application/vnd.oci.image.index.v1+json"
+            ' "$metadata"
+            docker buildx imagetools inspect --raw "${SRC}:${TAG}" | jq -e '
+              .mediaType == "application/vnd.oci.image.index.v1+json" and
+              all(.manifests[]; .mediaType == "application/vnd.oci.image.manifest.v1+json")
+            '
+
+            digest="$(jq -r '.["containerimage.descriptor"].digest // empty' "$metadata")"
+            rm -f "$metadata"
             if [[ -z "$digest" ]]; then
               echo "could not resolve digest for ${SRC}:${TAG}" >&2
               exit 1
