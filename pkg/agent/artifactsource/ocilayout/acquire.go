@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
@@ -99,33 +100,65 @@ func acquireRegistryImage(ctx context.Context, image string) (*Layout, error) {
 		return nil, fmt.Errorf("parse image reference: %w", err)
 	}
 
-	layoutDir, err := os.MkdirTemp("", "unbounded-oci-*")
+	repo, err := newRemoteRepository(repository)
 	if err != nil {
-		return nil, fmt.Errorf("create temporary OCI layout: %w", err)
+		return nil, fmt.Errorf("connect to remote repository %q: %w", repository, err)
+	}
+
+	layoutDir, err := copyRegistryImageWithRetry(ctx, func(layoutDir string) error {
+		store, err := oci.New(layoutDir)
+		if err != nil {
+			return fmt.Errorf("create OCI layout store: %w", err)
+		}
+
+		if _, err := oras.Copy(ctx, repo, reference, store, reference, oras.DefaultCopyOptions); err != nil {
+			return err
+		}
+
+		return nil
+	}, waitForOCIPullRetry)
+	if err != nil {
+		return nil, fmt.Errorf("pull image %s:%s: %w", repository, reference, err)
 	}
 
 	cleanup := func() {
 		os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup
 	}
 
-	store, err := oci.New(layoutDir)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("create OCI layout store: %w", err)
-	}
-
-	repo, err := newRemoteRepository(repository)
-	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("connect to remote repository %q: %w", repository, err)
-	}
-
-	if _, err := oras.Copy(ctx, repo, reference, store, reference, oras.DefaultCopyOptions); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("pull image %s:%s: %w", repository, reference, err)
-	}
-
 	return &Layout{Dir: layoutDir, Reference: reference, cleanup: cleanup}, nil
+}
+
+func copyRegistryImageWithRetry(
+	ctx context.Context,
+	copyImage func(string) error,
+	wait func(context.Context, time.Duration) error,
+) (string, error) {
+	var layoutDir string
+
+	err := retryOCIPullOperation(ctx, func() error {
+		if layoutDir != "" {
+			os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup before retry
+			layoutDir = ""
+		}
+
+		dir, err := os.MkdirTemp("", "unbounded-oci-*")
+		if err != nil {
+			return fmt.Errorf("create temporary OCI layout: %w", err)
+		}
+
+		layoutDir = dir
+
+		return copyImage(layoutDir)
+	}, wait)
+	if err != nil {
+		if layoutDir != "" {
+			os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup after failure
+		}
+
+		return "", err
+	}
+
+	return layoutDir, nil
 }
 
 func findOCILayoutRoot(extractDir string) (string, error) {

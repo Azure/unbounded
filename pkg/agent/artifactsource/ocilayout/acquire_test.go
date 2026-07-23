@@ -234,6 +234,78 @@ func TestSingleOCILayoutReferenceRejectsInvalidTag(t *testing.T) {
 	}
 }
 
+func TestCopyRegistryImageWithRetryUsesFreshLayout(t *testing.T) {
+	var layoutDirs []string
+
+	layoutDir, err := copyRegistryImageWithRetry(
+		context.Background(),
+		func(layoutDir string) error {
+			layoutDirs = append(layoutDirs, layoutDir)
+			if err := os.WriteFile(filepath.Join(layoutDir, "partial"), []byte("partial"), 0o644); err != nil {
+				return err
+			}
+
+			if len(layoutDirs) == 1 {
+				return syscall.ECONNRESET
+			}
+
+			return nil
+		},
+		func(context.Context, time.Duration) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("copyRegistryImageWithRetry() error = %v", err)
+	}
+	defer os.RemoveAll(layoutDir) //nolint:errcheck // test cleanup
+
+	if len(layoutDirs) != 2 {
+		t.Fatalf("copy attempts = %d, want 2", len(layoutDirs))
+	}
+
+	if layoutDirs[0] == layoutDirs[1] {
+		t.Fatalf("retry reused layout directory %q", layoutDirs[0])
+	}
+
+	if _, err := os.Stat(layoutDirs[0]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed layout directory still exists: %v", err)
+	}
+
+	if layoutDir != layoutDirs[1] {
+		t.Fatalf("layoutDir = %q, want %q", layoutDir, layoutDirs[1])
+	}
+}
+
+func TestCopyRegistryImageWithRetryCleansUpAfterExhaustion(t *testing.T) {
+	var layoutDirs []string
+
+	layoutDir, err := copyRegistryImageWithRetry(
+		context.Background(),
+		func(layoutDir string) error {
+			layoutDirs = append(layoutDirs, layoutDir)
+
+			return syscall.ECONNRESET
+		},
+		func(context.Context, time.Duration) error { return nil },
+	)
+	if !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("copyRegistryImageWithRetry() error = %v, want connection reset", err)
+	}
+
+	if layoutDir != "" {
+		t.Fatalf("layoutDir = %q, want empty", layoutDir)
+	}
+
+	if len(layoutDirs) != ociPullMaxAttempts {
+		t.Fatalf("copy attempts = %d, want %d", len(layoutDirs), ociPullMaxAttempts)
+	}
+
+	for _, dir := range layoutDirs {
+		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed layout directory %q still exists: %v", dir, err)
+		}
+	}
+}
+
 func TestConfigureOCIPullRetryUsesORASRetryClient(t *testing.T) {
 	repo := &remote.Repository{}
 	configureOCIPullRetry(repo)

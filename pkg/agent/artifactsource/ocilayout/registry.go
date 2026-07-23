@@ -5,10 +5,7 @@ package ocilayout
 
 import (
 	"context"
-	"errors"
-	"net"
 	"net/http"
-	"syscall"
 	"time"
 
 	"oras.land/oras-go/v2/registry/remote"
@@ -60,7 +57,7 @@ func newOCIPullRetryPolicy() retry.Policy {
 }
 
 func retryOCIPullFailure(resp *http.Response, err error) (bool, error) {
-	if retryableOCIPullTransportError(err) {
+	if ociutil.RetryableNetworkError(err) {
 		return true, nil
 	}
 
@@ -69,40 +66,6 @@ func retryOCIPullFailure(resp *http.Response, err error) (bool, error) {
 	}
 
 	return retry.DefaultPredicate(resp, nil)
-}
-
-func retryableOCIPullTransportError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
-		return true
-	}
-
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
-	}
-
-	for _, target := range []error{
-		syscall.ECONNABORTED,
-		syscall.ECONNREFUSED,
-		syscall.ECONNRESET,
-		syscall.EHOSTUNREACH,
-		syscall.ENETUNREACH,
-	} {
-		if errors.Is(err, target) {
-			return true
-		}
-	}
-
-	return false
 }
 
 func ociPullBackoff(attempt int, _ *http.Response) time.Duration {
@@ -121,4 +84,47 @@ func maxOCIPullRetryDelay() time.Duration {
 	}
 
 	return delay
+}
+
+func retryOCIPullOperation(
+	ctx context.Context,
+	pull func() error,
+	wait func(context.Context, time.Duration) error,
+) error {
+	delay := ociPullRetryDelay
+
+	for attempt := 1; attempt <= ociPullMaxAttempts; attempt++ {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+
+		err := pull()
+		if err == nil {
+			return nil
+		}
+
+		if !ociutil.RetryableNetworkError(err) || attempt == ociPullMaxAttempts {
+			return err
+		}
+
+		if err := wait(ctx, delay); err != nil {
+			return err
+		}
+
+		delay *= 2
+	}
+
+	return nil
+}
+
+func waitForOCIPullRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
 }

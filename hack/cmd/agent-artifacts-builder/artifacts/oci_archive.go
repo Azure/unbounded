@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
@@ -19,6 +20,11 @@ import (
 	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/Azure/unbounded/internal/ociutil"
+)
+
+const (
+	ociImageCopyMaxAttempts = 5
+	ociImageCopyRetryDelay  = 2 * time.Second
 )
 
 // OCIImageArchiveName returns the release archive filename for a tagged OCI
@@ -79,24 +85,96 @@ func ArchiveOCIImage(ctx context.Context, sourceRef, archivePath string) error {
 		Credential: credentials.Credential(credentialStore),
 	}
 
-	layoutDir, err := os.MkdirTemp("", "unbounded-rootfs-oci-layout-*")
+	layoutDir, err := copyOCIImageToLayout(ctx, repo, reference)
 	if err != nil {
-		return fmt.Errorf("create OCI image layout directory: %w", err)
-	}
-	defer os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup
-
-	store, err := oci.New(layoutDir)
-	if err != nil {
-		return fmt.Errorf("create OCI image layout: %w", err)
-	}
-
-	if _, err := oras.Copy(ctx, repo, reference, store, reference, oras.DefaultCopyOptions); err != nil {
 		return fmt.Errorf("copy OCI image %q into layout: %w", sourceRef, err)
 	}
+	defer os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup
 
 	if err := writeDirectoryArchive(layoutDir, archivePath); err != nil {
 		return fmt.Errorf("write OCI image layout archive: %w", err)
 	}
 
 	return nil
+}
+
+func copyOCIImageToLayout(ctx context.Context, repo *remote.Repository, reference string) (string, error) {
+	var layoutDir string
+
+	err := retryOCIImageCopy(ctx, func() error {
+		if layoutDir != "" {
+			os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup before retry
+			layoutDir = ""
+		}
+
+		dir, err := os.MkdirTemp("", "unbounded-rootfs-oci-layout-*")
+		if err != nil {
+			return fmt.Errorf("create OCI image layout directory: %w", err)
+		}
+
+		layoutDir = dir
+
+		store, err := oci.New(layoutDir)
+		if err != nil {
+			return fmt.Errorf("create OCI image layout: %w", err)
+		}
+
+		if _, err := oras.Copy(ctx, repo, reference, store, reference, oras.DefaultCopyOptions); err != nil {
+			return err
+		}
+
+		return nil
+	}, waitForOCIImageCopyRetry)
+	if err != nil {
+		if layoutDir != "" {
+			os.RemoveAll(layoutDir) //nolint:errcheck // best effort cleanup after failure
+		}
+
+		return "", err
+	}
+
+	return layoutDir, nil
+}
+
+func retryOCIImageCopy(
+	ctx context.Context,
+	copyImage func() error,
+	wait func(context.Context, time.Duration) error,
+) error {
+	delay := ociImageCopyRetryDelay
+
+	for attempt := 1; attempt <= ociImageCopyMaxAttempts; attempt++ {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+
+		err := copyImage()
+		if err == nil {
+			return nil
+		}
+
+		if !ociutil.RetryableNetworkError(err) || attempt == ociImageCopyMaxAttempts {
+			return err
+		}
+
+		if err := wait(ctx, delay); err != nil {
+			return err
+		}
+
+		delay *= 2
+	}
+
+	return nil
+}
+
+func waitForOCIImageCopyRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
 }
