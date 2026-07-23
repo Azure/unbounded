@@ -24,6 +24,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 )
 
 // ValidateOCI pulls each platform from an offline artifact OCI index into a
@@ -215,13 +216,18 @@ func validateBundle(rootDir string) error {
 
 	expectedPaths := expectedBundlePaths(plan)
 
-	actualPaths, err := collectArtifactPaths(rootDir)
+	bundle, err := bootstrapartifacts.Open(rootDir)
 	if err != nil {
 		return err
 	}
 
-	if !equalStrings(expectedPaths, actualPaths) {
-		return fmt.Errorf("offline artifact bundle content mismatch: got %s, want %s", strings.Join(actualPaths, ", "), strings.Join(expectedPaths, ", "))
+	diff, err := bootstrapartifacts.CompareContents(context.Background(), bundle, expectedPaths)
+	if err != nil {
+		return err
+	}
+
+	if len(diff.Missing) > 0 || len(diff.Unexpected) > 0 {
+		return fmt.Errorf("offline artifact bundle content mismatch: missing %s, unexpected %s", strings.Join(diff.Missing, ", "), strings.Join(diff.Unexpected, ", "))
 	}
 
 	for _, artifact := range plan.Artifacts {
@@ -291,18 +297,4 @@ func detectArchitectures(rootDir, kubernetesVersion string) ([]string, error) {
 	sort.Strings(architectures)
 
 	return architectures, nil
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-
-	return true
 }

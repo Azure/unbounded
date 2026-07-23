@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-package artifactsource
+package bootstrapartifacts
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
@@ -56,13 +57,13 @@ func (c *ArchiveCache) MarkReady() error {
 // MaterializeArchive downloads and extracts an archive source into a stable
 // source-specific cache. The returned cache must be marked ready after the
 // caller validates its contents.
-func (s Source) MaterializeArchive(ctx context.Context, opts ArchiveCacheOptions) (*ArchiveCache, error) {
+func MaterializeArchive(ctx context.Context, source artifactsource.Source, opts ArchiveCacheOptions) (*ArchiveCache, error) {
 	if err := validateArchiveCacheOptions(opts); err != nil {
 		return nil, err
 	}
 
 	cache := &ArchiveCache{
-		root:        filepath.Join(opts.CacheRoot, CacheKey(s.raw)),
+		root:        filepath.Join(opts.CacheRoot, CacheKey(source.String())),
 		readyMarker: opts.ReadyMarker,
 	}
 	if cache.isReady() {
@@ -83,7 +84,7 @@ func (s Source) MaterializeArchive(ctx context.Context, opts ArchiveCacheOptions
 	}
 	defer os.RemoveAll(tempDir) //nolint:errcheck // best effort cleanup
 
-	if err := s.ExtractTar(ctx, tempDir); err != nil {
+	if err := source.ExtractTar(ctx, tempDir); err != nil {
 		return nil, fmt.Errorf("download and extract archive: %w", err)
 	}
 

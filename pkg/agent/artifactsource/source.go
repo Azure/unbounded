@@ -21,13 +21,12 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
-// Kind identifies how an artifact source is accessed.
-type Kind int
+type sourceKind int
 
 const (
-	KindLocal Kind = iota
-	KindHTTP
-	KindOCI
+	sourceLocal sourceKind = iota
+	sourceHTTP
+	sourceOCI
 )
 
 var httpClient = &http.Client{
@@ -35,27 +34,17 @@ var httpClient = &http.Client{
 	CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
 }
 
-// Source is a parsed artifact source. It can reference an absolute local path,
-// file:// URL, HTTP(S) URL, an OCI bundle root, or an OCI artifact blob using
+// Source is a parsed, openable artifact source. It can reference an absolute
+// local path, file:// URL, HTTP(S) URL, or OCI artifact blob using
 // oci://...#title.
 type Source struct {
 	raw       string
-	kind      Kind
+	kind      sourceKind
 	localPath string
 }
 
 // Parse validates and parses an openable artifact source string.
 func Parse(source string) (Source, error) {
-	return parse(source, true)
-}
-
-// ParseRoot validates and parses an artifact root. Unlike Parse, it accepts an
-// OCI bundle root without a blob title fragment.
-func ParseRoot(source string) (Source, error) {
-	return parse(source, false)
-}
-
-func parse(source string, requireOCITitle bool) (Source, error) {
 	parsed, err := url.Parse(source)
 	if err != nil {
 		return Source{}, fmt.Errorf("parse artifact source: %w", utilio.RedactHTTPError(err))
@@ -67,18 +56,13 @@ func parse(source string, requireOCITitle bool) (Source, error) {
 	case "file":
 		return parseLocal(source, parsed)
 	case "http", "https":
-		return Source{raw: source, kind: KindHTTP}, nil
+		return Source{raw: source, kind: sourceHTTP}, nil
 	case "oci":
-		title := strings.TrimPrefix(parsed.Fragment, "/")
-		if requireOCITitle && title == "" {
+		if strings.TrimPrefix(parsed.Fragment, "/") == "" {
 			return Source{}, fmt.Errorf("OCI artifact source must include a blob title fragment")
 		}
 
-		if !requireOCITitle && title != "" {
-			return Source{}, fmt.Errorf("OCI artifact root must not include a blob title fragment")
-		}
-
-		return Source{raw: source, kind: KindOCI}, nil
+		return Source{raw: source, kind: sourceOCI}, nil
 	default:
 		return Source{}, fmt.Errorf("unsupported artifact source scheme %q", parsed.Scheme)
 	}
@@ -104,7 +88,7 @@ func parseLocal(source string, parsed *url.URL) (Source, error) {
 		return Source{}, fmt.Errorf("local artifact source must use an absolute path: %q", source)
 	}
 
-	return Source{raw: source, kind: KindLocal, localPath: path}, nil
+	return Source{raw: source, kind: sourceLocal, localPath: path}, nil
 }
 
 // String returns the original artifact source string.
@@ -112,105 +96,19 @@ func (s Source) String() string {
 	return s.raw
 }
 
-// Kind returns how the source is accessed.
-func (s Source) Kind() Kind {
-	return s.kind
-}
-
-// LocalPath returns the resolved local path when this source is an absolute
-// path or file URL.
-func (s Source) LocalPath() (string, bool) {
-	if s.kind != KindLocal {
-		return "", false
-	}
-
-	return s.localPath, true
-}
-
-// Artifact resolves a child artifact from a local or OCI bundle root.
-func (s Source) Artifact(path string) (Source, error) {
-	if path == "" || !filepath.IsLocal(filepath.FromSlash(path)) {
-		return Source{}, fmt.Errorf("artifact path must be local: %q", path)
-	}
-
-	switch s.kind {
-	case KindLocal:
-		return Parse(filepath.Join(s.localPath, filepath.FromSlash(path)))
-	case KindOCI:
-		return s.OCIArtifact(filepath.ToSlash(path))
-	default:
-		return Source{}, fmt.Errorf("artifact source kind %d does not support child artifacts", s.kind)
-	}
-}
-
-// OCIArtifact returns an openable OCI blob source selected by title from an OCI
-// bundle root.
-func (s Source) OCIArtifact(title string) (Source, error) {
-	if s.kind != KindOCI {
-		return Source{}, fmt.Errorf("artifact source is not an OCI bundle root")
-	}
-
-	if strings.TrimPrefix(title, "/") == "" {
-		return Source{}, fmt.Errorf("OCI artifact title is required")
-	}
-
-	parsed, err := url.Parse(s.raw)
-	if err != nil {
-		return Source{}, fmt.Errorf("parse OCI artifact root: %w", err)
-	}
-
-	if parsed.Fragment != "" {
-		return Source{}, fmt.Errorf("OCI artifact source already includes a blob title fragment")
-	}
-
-	parsed.Fragment = strings.TrimPrefix(title, "/")
-
-	return Parse(parsed.String())
-}
-
-// OCIArtifactTitles returns the blob titles in an OCI artifact bundle root.
-func (s Source) OCIArtifactTitles(ctx context.Context) (map[string]struct{}, error) {
-	if s.kind != KindOCI {
-		return nil, fmt.Errorf("artifact source is not an OCI bundle root")
-	}
-
-	parsed, err := url.Parse(s.raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse OCI artifact root: %w", err)
-	}
-
-	if parsed.Fragment != "" {
-		return nil, fmt.Errorf("OCI artifact bundle root must not include a blob title fragment")
-	}
-
-	manifest, err := ociartifact.FetchManifest(ctx, s.raw)
-	if err != nil {
-		return nil, err
-	}
-
-	descriptors := ociartifact.DescriptorsByTitle(manifest)
-
-	titles := make(map[string]struct{}, len(descriptors))
-	for title := range descriptors {
-		titles[title] = struct{}{}
-	}
-
-	return titles, nil
-}
-
 // Open opens the artifact source for streaming.
 func (s Source) Open(ctx context.Context) (io.ReadCloser, error) {
 	switch s.kind {
-	case KindLocal:
+	case sourceLocal:
 		file, err := os.Open(s.localPath)
 		if err != nil {
 			return nil, fmt.Errorf("open local artifact source %q: %w", s.localPath, err)
 		}
 
 		return file, nil
-	case KindHTTP:
+	case sourceHTTP:
 		return openHTTP(ctx, s.raw)
-	case KindOCI:
+	case sourceOCI:
 		return ociartifact.Open(ctx, s.raw)
 	default:
 		return nil, fmt.Errorf("unsupported artifact source kind %d", s.kind)
@@ -355,14 +253,14 @@ func (s Source) DecompressTarGz(ctx context.Context) utilio.TarFileSeq {
 // Probe checks that the artifact source is reachable without installing it.
 func (s Source) Probe(ctx context.Context) error {
 	switch s.kind {
-	case KindLocal, KindOCI:
+	case sourceLocal, sourceOCI:
 		body, err := s.Open(ctx)
 		if err != nil {
 			return err
 		}
 
 		return body.Close()
-	case KindHTTP:
+	case sourceHTTP:
 		return utilio.ProbeRemoteHTTPObject(ctx, s.raw)
 	default:
 		return fmt.Errorf("unsupported artifact source kind %d", s.kind)

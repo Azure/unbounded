@@ -13,7 +13,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
@@ -81,52 +80,6 @@ func TestResolveDownloadOverridesWithOfflineArtifactsNoopWithoutOfflineConfig(t 
 	require.NotNil(t, containerImageArchives)
 	require.Equal(t, filepath.Join(ContainerImageArchiveHostSourceDir, "empty"), containerImageArchives.HostDir)
 	require.Empty(t, containerImageArchives.URLs)
-}
-
-func TestNormalizeOfflineSourceRootHTTPS(t *testing.T) {
-	t.Parallel()
-
-	got, err := normalizeOfflineSourceRoot("  https://artifacts.example.test/bootstrap/v1.34.2.tar.gz  ")
-	require.NoError(t, err)
-	require.Equal(t, artifactsource.KindHTTP, got.artifact.Kind())
-	require.Equal(t, "https://artifacts.example.test/bootstrap/v1.34.2.tar.gz", got.root)
-	require.Equal(t, got.root, got.artifact.String())
-
-	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test/bootstrap#manifest.json")
-	require.ErrorContains(t, err, "must not include user info or a fragment")
-
-	got, err = normalizeOfflineSourceRoot("https://artifacts.example.test/bootstrap?sp=r&sig=secret")
-	require.NoError(t, err)
-	require.Equal(t, artifactsource.KindHTTP, got.artifact.Kind())
-	require.Equal(t, "https://artifacts.example.test/bootstrap?sp=r&sig=secret", got.root)
-	require.Equal(t, got.root, got.artifact.String())
-
-	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test")
-	require.ErrorContains(t, err, "must include a host and archive path")
-
-	_, err = normalizeOfflineSourceRoot("https://artifacts.example.test/%zz?sig=secret")
-	require.Error(t, err)
-	require.NotContains(t, err.Error(), "secret")
-}
-
-func TestNormalizeOfflineSourceRootTypes(t *testing.T) {
-	t.Parallel()
-
-	localPath := filepath.Join(t.TempDir(), "bundle with space")
-	local, err := normalizeOfflineSourceRoot(fileURL(localPath))
-	require.NoError(t, err)
-	require.Equal(t, artifactsource.KindLocal, local.artifact.Kind())
-	require.Equal(t, localPath, local.root)
-
-	resolvedPath, ok := local.artifact.LocalPath()
-	require.True(t, ok)
-	require.Equal(t, localPath, resolvedPath)
-
-	oci, err := normalizeOfflineSourceRoot("oci://registry.example.test/unbounded/bootstrap:v1")
-	require.NoError(t, err)
-	require.Equal(t, artifactsource.KindOCI, oci.artifact.Kind())
-	require.Equal(t, "oci://registry.example.test/unbounded/bootstrap:v1", oci.root)
-	require.Equal(t, oci.root, oci.artifact.String())
 }
 
 func TestResolveOfflineArtifacts(t *testing.T) {

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-package artifactsource
+package bootstrapartifacts
 
 import (
 	"archive/tar"
@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 )
 
 func TestSourceMaterializeArchive(t *testing.T) {
@@ -24,7 +26,7 @@ func TestSourceMaterializeArchive(t *testing.T) {
 		"bundle/runc":          "runc",
 	})
 
-	source, err := Parse(archivePath)
+	source, err := artifactsource.Parse(archivePath)
 	require.NoError(t, err)
 
 	opts := ArchiveCacheOptions{
@@ -32,7 +34,7 @@ func TestSourceMaterializeArchive(t *testing.T) {
 		RootMarker:  "manifest.json",
 		ReadyMarker: ".ready",
 	}
-	cache, err := source.MaterializeArchive(context.Background(), opts)
+	cache, err := MaterializeArchive(context.Background(), source, opts)
 	require.NoError(t, err)
 	require.FileExists(t, filepath.Join(cache.Root(), "manifest.json"))
 	require.FileExists(t, filepath.Join(cache.Root(), "runc"))
@@ -40,7 +42,7 @@ func TestSourceMaterializeArchive(t *testing.T) {
 
 	require.NoError(t, os.Remove(archivePath))
 
-	cached, err := source.MaterializeArchive(context.Background(), opts)
+	cached, err := MaterializeArchive(context.Background(), source, opts)
 	require.NoError(t, err)
 	require.Equal(t, cache.Root(), cached.Root())
 }

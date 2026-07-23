@@ -16,48 +16,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSourceKind(t *testing.T) {
+func TestParseRedactsInvalidURL(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name   string
-		source string
-		kind   Kind
-	}{
-		{name: "local", source: "/opt/unbounded/artifact", kind: KindLocal},
-		{name: "HTTPS", source: "https://artifacts.example.test/archive.tar.gz", kind: KindHTTP},
-		{name: "OCI", source: "oci://registry.example.test/artifacts:v1#manifest.json", kind: KindOCI},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			source, err := Parse(tt.source)
-			require.NoError(t, err)
-			require.Equal(t, tt.kind, source.Kind())
-		})
-	}
-}
-
-func TestParseRootRedactsInvalidURL(t *testing.T) {
-	t.Parallel()
-
-	_, err := ParseRoot("https://artifacts.example.test/%zz?sig=secret")
+	_, err := Parse("https://artifacts.example.test/%zz?sig=secret")
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), "secret")
-}
-
-func TestParseRootResolvesOCIArtifact(t *testing.T) {
-	t.Parallel()
-
-	root, err := ParseRoot("oci://registry.example.test/artifacts:v1")
-	require.NoError(t, err)
-	require.Equal(t, KindOCI, root.Kind())
-
-	manifest, err := root.Artifact("manifest.json")
-	require.NoError(t, err)
-	require.Equal(t, "oci://registry.example.test/artifacts:v1#manifest.json", manifest.String())
 }
 
 func TestSourceOpenHTTPSURL(t *testing.T) {
