@@ -33,11 +33,12 @@ import (
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 const (
-	ManifestFileName = agentartifacts.ManifestFileName
+	ManifestFileName = bootstrapartifacts.ManifestFileName
 
 	artifactType  = "application/vnd.unbounded.agent.bootstrap-artifacts.v1"
 	fileMediaType = "application/octet-stream"
@@ -49,7 +50,7 @@ type Options struct {
 	ArchivePath       string
 	OCIRef            string
 	ManifestPath      string
-	Manifest          agentartifacts.Manifest
+	Manifest          bootstrapartifacts.Manifest
 	KubernetesVersion string
 
 	Architectures []string
@@ -69,7 +70,7 @@ type ContainerImageArchive struct {
 }
 
 type Plan struct {
-	Manifest        agentartifacts.Manifest
+	Manifest        bootstrapartifacts.Manifest
 	Artifacts       []Artifact
 	ContainerImages []ContainerImageArchive
 }
@@ -157,8 +158,8 @@ func NewPlan(opts Options) (Plan, error) {
 
 	containerImages := make([]ContainerImageArchive, 0, len(arches)*len(manifest.ContainerImages))
 	for _, arch := range arches {
-		for _, binary := range agentartifacts.KubernetesBinaries {
-			path := agentartifacts.KubernetesArtifactPath(manifest.Versions.Kubernetes, arch, binary)
+		for _, binary := range bootstrapartifacts.KubernetesBinaries {
+			path := bootstrapartifacts.KubernetesArtifactPath(manifest.Versions.Kubernetes, arch, binary)
 			url := agentartifacts.KubernetesBinary(nil, manifest.Versions.Kubernetes, arch, binary)
 			artifacts = append(artifacts, Artifact{Name: binary, URL: url, Path: path})
 			artifacts = append(artifacts, Artifact{Name: binary + ".sha256", URL: url + ".sha256", Path: path + ".sha256"})
@@ -168,7 +169,7 @@ func NewPlan(opts Options) (Plan, error) {
 			containerImages = append(containerImages, ContainerImageArchive{
 				ImageTag: imageTag,
 				Arch:     arch,
-				Path:     agentartifacts.ContainerImageArchivePath(arch, imageTag),
+				Path:     bootstrapartifacts.ContainerImageArchivePath(arch, imageTag),
 			})
 		}
 
@@ -176,25 +177,25 @@ func NewPlan(opts Options) (Plan, error) {
 			Artifact{
 				Name:             "containerd",
 				URL:              agentartifacts.ContainerdArchive(nil, manifest.Versions.Containerd, arch),
-				Path:             agentartifacts.ContainerdArtifactPath(manifest.Versions.Containerd, arch),
+				Path:             bootstrapartifacts.ContainerdArtifactPath(manifest.Versions.Containerd, arch),
 				GenerateChecksum: true,
 			},
 			Artifact{
 				Name:             "runc",
 				URL:              agentartifacts.RuncBinary(nil, manifest.Versions.Runc, arch),
-				Path:             agentartifacts.RuncArtifactPath(manifest.Versions.Runc, arch),
+				Path:             bootstrapartifacts.RuncArtifactPath(manifest.Versions.Runc, arch),
 				GenerateChecksum: true,
 			},
 			Artifact{
 				Name:             "cni",
 				URL:              agentartifacts.CNIPluginsArchive(nil, manifest.Versions.CNI, arch),
-				Path:             agentartifacts.CNIArtifactPath(manifest.Versions.CNI, arch),
+				Path:             bootstrapartifacts.CNIArtifactPath(manifest.Versions.CNI, arch),
 				GenerateChecksum: true,
 			},
 			Artifact{
 				Name:             "crictl",
 				URL:              agentartifacts.CrictlArchive(nil, manifest.Versions.Crictl, "linux", arch),
-				Path:             agentartifacts.CrictlArtifactPath(manifest.Versions.Crictl, "linux", arch),
+				Path:             bootstrapartifacts.CrictlArtifactPath(manifest.Versions.Crictl, "linux", arch),
 				GenerateChecksum: true,
 			},
 		)
@@ -240,7 +241,7 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 		return err
 	}
 
-	manifest, err = agentartifacts.NormalizeManifest(manifest)
+	manifest, err = bootstrapartifacts.NormalizeManifest(manifest)
 	if err != nil {
 		return err
 	}
@@ -296,7 +297,7 @@ func PushOCI(ctx context.Context, log *slog.Logger, rootDir, ref string) error {
 	return nil
 }
 
-func packPlatformManifest(ctx context.Context, store *file.Store, manifest agentartifacts.Manifest, arch string, descriptorsByPath map[string]ocispec.Descriptor) (ocispec.Descriptor, error) {
+func packPlatformManifest(ctx context.Context, store *file.Store, manifest bootstrapartifacts.Manifest, arch string, descriptorsByPath map[string]ocispec.Descriptor) (ocispec.Descriptor, error) {
 	plan, err := NewPlan(Options{
 		OutputDir:     ".",
 		Manifest:      manifest,
@@ -423,7 +424,7 @@ func copyFileAtomically(source, dest string) error {
 	return nil
 }
 
-func writeManifest(rootDir string, manifest agentartifacts.Manifest) error {
+func writeManifest(rootDir string, manifest bootstrapartifacts.Manifest) error {
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return fmt.Errorf("create output dir %q: %w", rootDir, err)
 	}
@@ -597,36 +598,36 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func resolveManifest(opts Options) (agentartifacts.Manifest, error) {
+func resolveManifest(opts Options) (bootstrapartifacts.Manifest, error) {
 	if opts.ManifestPath != "" {
 		manifest, err := loadManifest(opts.ManifestPath)
 		if err != nil {
-			return agentartifacts.Manifest{}, err
+			return bootstrapartifacts.Manifest{}, err
 		}
 
-		return agentartifacts.NormalizeManifest(manifest)
+		return bootstrapartifacts.NormalizeManifest(manifest)
 	}
 
 	if opts.KubernetesVersion != "" {
 		manifest, err := defaultManifest(opts.KubernetesVersion)
 		if err != nil {
-			return agentartifacts.Manifest{}, err
+			return bootstrapartifacts.Manifest{}, err
 		}
 
 		return manifest, nil
 	}
 
-	return agentartifacts.NormalizeManifest(opts.Manifest)
+	return bootstrapartifacts.NormalizeManifest(opts.Manifest)
 }
 
-func defaultManifest(kubernetesVersion string) (agentartifacts.Manifest, error) {
+func defaultManifest(kubernetesVersion string) (bootstrapartifacts.Manifest, error) {
 	crictlVersion, err := agentartifacts.CrictlVersionForKubernetesVersion(kubernetesVersion)
 	if err != nil {
-		return agentartifacts.Manifest{}, err
+		return bootstrapartifacts.Manifest{}, err
 	}
 
-	return agentartifacts.NormalizeManifest(agentartifacts.Manifest{
-		Versions: agentartifacts.Versions{
+	return bootstrapartifacts.NormalizeManifest(bootstrapartifacts.Manifest{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: kubernetesVersion,
 			Containerd: goalstates.ContainerdVersion,
 			Runc:       goalstates.RunCVersion,
@@ -637,15 +638,15 @@ func defaultManifest(kubernetesVersion string) (agentartifacts.Manifest, error) 
 	})
 }
 
-func loadManifest(path string) (agentartifacts.Manifest, error) {
+func loadManifest(path string) (bootstrapartifacts.Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return agentartifacts.Manifest{}, fmt.Errorf("read manifest %q: %w", path, err)
+		return bootstrapartifacts.Manifest{}, fmt.Errorf("read manifest %q: %w", path, err)
 	}
 
-	var manifest agentartifacts.Manifest
+	var manifest bootstrapartifacts.Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return agentartifacts.Manifest{}, fmt.Errorf("parse manifest %q: %w", path, err)
+		return bootstrapartifacts.Manifest{}, fmt.Errorf("parse manifest %q: %w", path, err)
 	}
 
 	return manifest, nil

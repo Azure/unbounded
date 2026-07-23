@@ -37,6 +37,7 @@ func TestResolvePublishInputsWorkflowDispatchUsesExplicitInputs(t *testing.T) {
 	t.Setenv("EVENT_NAME", "workflow_dispatch")
 	t.Setenv("REF_NAME", "")
 	t.Setenv("INPUT_TAG", "v0.4.0-alpha")
+	t.Setenv("INPUT_RELEASE_TAG", "v0.4.0-alpha")
 	t.Setenv("INPUT_KUBERNETES_VERSIONS", "1.34.9, v1.35.6")
 	t.Setenv("INPUT_ROOTFS_IMAGES", "ghcr.io/azure/agent-ubuntu2404:v1, ghcr.io/azure/agent-azlinux3:v2")
 	t.Setenv("GITHUB_SHA_VALUE", "0123456789abcdef")
@@ -48,6 +49,7 @@ func TestResolvePublishInputsWorkflowDispatchUsesExplicitInputs(t *testing.T) {
 
 	values := readGitHubOutput(t, output)
 	require.Equal(t, "v0.4.0-alpha", values["tag"])
+	require.Equal(t, "v0.4.0-alpha", values["release_tag"])
 	requireJSONEqual(t, []string{"v1.34.9", "v1.35.6"}, values["kubernetes_versions"])
 	requireJSONEqual(t, []string{
 		"ghcr.io/azure/agent-ubuntu2404:v1",
@@ -76,6 +78,7 @@ v1.34.9
 	t.Setenv("EVENT_NAME", "workflow_dispatch")
 	t.Setenv("REF_NAME", "")
 	t.Setenv("INPUT_TAG", "")
+	t.Setenv("INPUT_RELEASE_TAG", "")
 	t.Setenv("INPUT_KUBERNETES_VERSIONS", "")
 	t.Setenv("INPUT_ROOTFS_IMAGES", "")
 	t.Setenv("GITHUB_SHA_VALUE", "0123456789abcdef")
@@ -87,6 +90,7 @@ v1.34.9
 
 	values := readGitHubOutput(t, output)
 	require.Equal(t, "0123456789ab", values["tag"])
+	require.Empty(t, values["release_tag"])
 	requireJSONEqual(t, []string{"v1.34.8", "v1.34.9"}, values["kubernetes_versions"])
 	requireJSONEqual(t, []string{"ghcr.io/azure/agent-ubuntu2404:v1"}, values["rootfs_images"])
 	requireJSONEqual(t, []kubernetesVersionGroup{
@@ -105,8 +109,9 @@ func TestResolvePublishInputsTagPushUsesRefTagAndDefaultVersions(t *testing.T) {
 	output := filepath.Join(dir, "github-output")
 
 	t.Setenv("EVENT_NAME", "push")
-	t.Setenv("REF_NAME", "agent-artifacts/alpha-test")
+	t.Setenv("REF_NAME", "v1.22.0")
 	t.Setenv("INPUT_TAG", "ignored")
+	t.Setenv("INPUT_RELEASE_TAG", "ignored")
 	t.Setenv("INPUT_KUBERNETES_VERSIONS", "v1.34.9")
 	t.Setenv("INPUT_ROOTFS_IMAGES", "ghcr.io/azure/ignored:v1")
 	t.Setenv("GITHUB_SHA_VALUE", "0123456789abcdef")
@@ -117,7 +122,8 @@ func TestResolvePublishInputsTagPushUsesRefTagAndDefaultVersions(t *testing.T) {
 	require.NoError(t, resolvePublishInputs())
 
 	values := readGitHubOutput(t, output)
-	require.Equal(t, "alpha-test", values["tag"])
+	require.Equal(t, "v1.22.0", values["tag"])
+	require.Equal(t, "v1.22.0", values["release_tag"])
 	requireJSONEqual(t, []string{"v1.35.5", "v1.35.6"}, values["kubernetes_versions"])
 	requireJSONEqual(t, []string{"ghcr.io/azure/agent-azlinux3:v2"}, values["rootfs_images"])
 }
@@ -126,6 +132,7 @@ func TestResolvePublishInputsRequiresTag(t *testing.T) {
 	t.Setenv("EVENT_NAME", "workflow_dispatch")
 	t.Setenv("REF_NAME", "")
 	t.Setenv("INPUT_TAG", "")
+	t.Setenv("INPUT_RELEASE_TAG", "")
 	t.Setenv("INPUT_KUBERNETES_VERSIONS", "v1.34.9")
 	t.Setenv("GITHUB_SHA_VALUE", "")
 	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "github-output"))

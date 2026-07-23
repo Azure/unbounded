@@ -22,8 +22,6 @@ import (
 	"github.com/Azure/unbounded/internal/logger"
 )
 
-const artifactTagRefPrefix = "agent-artifacts/"
-
 //go:embed kubernetes-versions.txt rootfs-images.txt
 var defaultPublishInputsFS embed.FS
 
@@ -99,13 +97,13 @@ func newLogger(debug bool, format string) *slog.Logger {
 // GitHub Actions publishing flow:
 //
 //  1. The resolve job runs resolve-publish-inputs once. It resolves the OCI tag
-//     prefix and Kubernetes versions from either a tag push or workflow_dispatch
-//     inputs, then writes GitHub outputs consumed by the publish matrix.
-//  2. Tag pushes use the pushed ref after "agent-artifacts/" as the OCI tag
-//     prefix and always use the embedded default Kubernetes version list.
-//  3. Manual workflow_dispatch runs may pass an explicit tag prefix and a comma,
-//     space, or newline separated Kubernetes version list. Missing values default
-//     to the short commit SHA and embedded version list respectively.
+//     prefix, release tag, Kubernetes versions, and rootfs images from either a
+//     version tag push or workflow_dispatch inputs, then writes GitHub outputs.
+//  2. Version tag pushes use the full pushed tag as both the OCI tag prefix and
+//     GitHub release tag, with embedded default version and image lists.
+//  3. Manual workflow_dispatch runs may pass explicit tags and comma, space, or
+//     newline separated Kubernetes version and rootfs image lists. Missing
+//     values use the short commit SHA or embedded defaults as appropriate.
 //  4. Versions are grouped by Kubernetes minor, for example 1.34 and 1.35. The
 //     workflow creates one publish job per minor group, while this binary still
 //     publishes every patch version inside that group. Each publish job creates
@@ -307,17 +305,20 @@ func resolvePublishInputs() error {
 	eventName := os.Getenv("EVENT_NAME")
 	refName := os.Getenv("REF_NAME")
 	inputTag := strings.TrimSpace(os.Getenv("INPUT_TAG"))
+	inputReleaseTag := strings.TrimSpace(os.Getenv("INPUT_RELEASE_TAG"))
 	inputVersions := strings.TrimSpace(os.Getenv("INPUT_KUBERNETES_VERSIONS"))
 	inputRootfsImages := strings.TrimSpace(os.Getenv("INPUT_ROOTFS_IMAGES"))
 	githubSHA := os.Getenv("GITHUB_SHA_VALUE")
 
 	var (
 		tag             string
+		releaseTag      string
 		versionsRaw     string
 		rootfsImagesRaw string
 	)
 	if eventName == "push" {
-		tag = strings.TrimPrefix(refName, artifactTagRefPrefix)
+		tag = strings.TrimSpace(refName)
+		releaseTag = tag
 
 		var err error
 
@@ -332,6 +333,8 @@ func resolvePublishInputs() error {
 		}
 	} else {
 		tag = inputTag
+		releaseTag = inputReleaseTag
+
 		if tag == "" {
 			tag = shortSHA(githubSHA)
 		}
@@ -393,6 +396,7 @@ func resolvePublishInputs() error {
 
 	if err := writeGitHubOutput(map[string]string{
 		"tag":                       tag,
+		"release_tag":               releaseTag,
 		"kubernetes_versions":       string(versionsJSON),
 		"kubernetes_version_groups": string(groupsJSON),
 		"rootfs_images":             string(rootfsImagesJSON),
@@ -401,6 +405,7 @@ func resolvePublishInputs() error {
 	}
 
 	fmt.Printf("Publishing tag prefix: %s\n", tag)
+	fmt.Printf("GitHub release tag: %s\n", releaseTag)
 	fmt.Printf("Kubernetes versions: %s\n", versionsJSON)
 	fmt.Printf("Kubernetes version groups: %s\n", groupsJSON)
 	fmt.Printf("Rootfs images: %s\n", rootfsImagesJSON)

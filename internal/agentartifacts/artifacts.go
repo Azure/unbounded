@@ -35,11 +35,7 @@ const (
 
 	// CrictlDefaultBaseURL is the upstream base URL for cri-tools releases.
 	CrictlDefaultBaseURL = "https://github.com/kubernetes-sigs/cri-tools/releases/download"
-
-	ManifestFileName = bootstrapartifacts.ManifestFileName
 )
-
-var KubernetesBinaries = bootstrapartifacts.KubernetesBinaries
 
 func DefaultContainerImages(kubernetesVersion string) []string {
 	return bootstrapartifacts.NormalizeContainerImages([]string{
@@ -47,10 +43,6 @@ func DefaultContainerImages(kubernetesVersion string) []string {
 		goalstates.KubeProxyImage(kubernetesVersion),
 	})
 }
-
-type Versions = bootstrapartifacts.Versions
-
-type Manifest = bootstrapartifacts.Manifest
 
 // KubernetesBinary resolves the download URL for a Kubernetes binary
 // (kubelet, kubectl, kube-proxy) honoring the optional override.
@@ -64,7 +56,7 @@ func KubernetesBinary(override *goalstates.DownloadSource, version, arch, binary
 		base = strings.TrimRight(override.BaseURL, "/")
 	}
 
-	return fmt.Sprintf("%s/v%s/bin/linux/%s/%s", base, StripLeadingV(version), arch, binary)
+	return fmt.Sprintf("%s/v%s/bin/linux/%s/%s", base, bootstrapartifacts.StripLeadingV(version), arch, binary)
 }
 
 // ContainerdArchive resolves the containerd release tarball URL, honoring
@@ -76,7 +68,7 @@ func ContainerdArchive(override *goalstates.DownloadSource, version, arch string
 		return fmt.Sprintf(override.URL, version, version, arch)
 	}
 
-	version = StripLeadingV(version)
+	version = bootstrapartifacts.StripLeadingV(version)
 
 	base := ContainerdDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
@@ -93,7 +85,7 @@ func RuncBinary(override *goalstates.DownloadSource, version, arch string) strin
 		return fmt.Sprintf(override.URL, version, arch)
 	}
 
-	version = StripLeadingV(version)
+	version = bootstrapartifacts.StripLeadingV(version)
 
 	base := RuncDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
@@ -110,7 +102,7 @@ func CNIPluginsArchive(override *goalstates.DownloadSource, version, arch string
 		return fmt.Sprintf(override.URL, version, arch, version)
 	}
 
-	version = StripLeadingV(version)
+	version = bootstrapartifacts.StripLeadingV(version)
 
 	base := CNIDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
@@ -128,7 +120,7 @@ func CrictlArchive(override *goalstates.DownloadSource, version, hostOS, hostArc
 		return fmt.Sprintf(override.URL, version, version, hostOS, hostArch)
 	}
 
-	version = StripLeadingV(version)
+	version = bootstrapartifacts.StripLeadingV(version)
 
 	base := CrictlDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
@@ -148,40 +140,4 @@ func CrictlVersionForKubernetesVersion(kubernetesVersion string) (string, error)
 	}
 
 	return fmt.Sprintf("%d.%d.0", version.Major(), version.Minor()), nil
-}
-
-func KubernetesArtifactPath(version, arch, binary string) string {
-	return bootstrapartifacts.KubernetesArtifactPath(version, arch, binary)
-}
-
-func ContainerdArtifactPath(version, arch string) string {
-	return bootstrapartifacts.ContainerdArtifactPath(version, arch)
-}
-
-func RuncArtifactPath(version, arch string) string {
-	return bootstrapartifacts.RuncArtifactPath(version, arch)
-}
-
-func CNIArtifactPath(version, arch string) string {
-	return bootstrapartifacts.CNIArtifactPath(version, arch)
-}
-
-func CrictlArtifactPath(version, hostOS, arch string) string {
-	return bootstrapartifacts.CrictlArtifactPath(version, hostOS, arch)
-}
-
-func ContainerImageArchivePath(arch, imageTag string) string {
-	return bootstrapartifacts.ContainerImageArchivePath(arch, imageTag)
-}
-
-func NormalizeManifest(manifest Manifest) (Manifest, error) {
-	return bootstrapartifacts.NormalizeManifest(manifest)
-}
-
-func NormalizeKubernetesVersion(version string) string {
-	return bootstrapartifacts.NormalizeKubernetesVersion(version)
-}
-
-func StripLeadingV(version string) string {
-	return bootstrapartifacts.StripLeadingV(version)
 }

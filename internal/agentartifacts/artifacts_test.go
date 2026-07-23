@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
@@ -278,15 +279,15 @@ func TestCrictlArchive(t *testing.T) {
 func TestContainerImageArchivePath(t *testing.T) {
 	t.Parallel()
 
-	got := ContainerImageArchivePath("amd64", "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9")
+	got := bootstrapartifacts.ContainerImageArchivePath("amd64", "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9")
 	require.Equal(t, "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-a68ffa05fa78.tar", got)
 }
 
 func TestNormalizeManifest(t *testing.T) {
 	t.Parallel()
 
-	got, err := NormalizeManifest(Manifest{
-		Versions: Versions{
+	got, err := bootstrapartifacts.NormalizeManifest(bootstrapartifacts.Manifest{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "1.34.2",
 			Containerd: "v2.1.8",
 			Runc:       "v1.5.0",
@@ -295,9 +296,9 @@ func TestNormalizeManifest(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	require.Equal(t, Manifest{
+	require.Equal(t, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -311,8 +312,8 @@ func TestNormalizeManifest(t *testing.T) {
 func TestNormalizeManifestPreservesContainerImages(t *testing.T) {
 	t.Parallel()
 
-	got, err := NormalizeManifest(Manifest{
-		Versions: Versions{
+	got, err := bootstrapartifacts.NormalizeManifest(bootstrapartifacts.Manifest{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -328,14 +329,14 @@ func TestNormalizeManifestPreservesContainerImages(t *testing.T) {
 func TestNormalizeManifestRejectsUnsupportedSchema(t *testing.T) {
 	t.Parallel()
 
-	_, err := NormalizeManifest(Manifest{SchemaVersion: 2})
+	_, err := bootstrapartifacts.NormalizeManifest(bootstrapartifacts.Manifest{SchemaVersion: 2})
 	require.ErrorContains(t, err, "unsupported manifest schemaVersion 2")
 }
 
 func TestNormalizeManifestRequiresVersions(t *testing.T) {
 	t.Parallel()
 
-	_, err := NormalizeManifest(Manifest{})
+	_, err := bootstrapartifacts.NormalizeManifest(bootstrapartifacts.Manifest{})
 	require.ErrorContains(t, err, "manifest is missing required fields")
 	require.ErrorContains(t, err, "versions.kubernetes")
 	require.ErrorContains(t, err, "versions.containerd")

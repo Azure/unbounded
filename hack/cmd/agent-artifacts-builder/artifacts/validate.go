@@ -22,7 +22,6 @@ import (
 	"oras.land/oras-go/v2/registry/remote/credentials"
 	"oras.land/oras-go/v2/registry/remote/retry"
 
-	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 )
@@ -195,7 +194,7 @@ func validateBundle(rootDir string) error {
 		return err
 	}
 
-	manifest, err = agentartifacts.NormalizeManifest(manifest)
+	manifest, err = bootstrapartifacts.NormalizeManifest(manifest)
 	if err != nil {
 		return err
 	}

@@ -17,13 +17,14 @@ import (
 	"oras.land/oras-go/v2/content/file"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
+	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 )
 
 func TestNewPlan(t *testing.T) {
 	plan, err := NewPlan(Options{
 		OutputDir: t.TempDir(),
-		Manifest: agentartifacts.Manifest{
-			Versions: agentartifacts.Versions{
+		Manifest: bootstrapartifacts.Manifest{
+			Versions: bootstrapartifacts.Versions{
 				Kubernetes: "1.34.2",
 				Containerd: "2.1.8",
 				Runc:       "1.5.0",
@@ -35,9 +36,9 @@ func TestNewPlan(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.Equal(t, agentartifacts.Manifest{
+	require.Equal(t, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -88,9 +89,9 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 			Path:     "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-a68ffa05fa78.tar",
 		},
 	}, plan.ContainerImages)
-	require.Equal(t, agentartifacts.Manifest{
+	require.Equal(t, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -104,8 +105,8 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 func TestNewPlanLoadsManifestFile(t *testing.T) {
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "manifest.json")
-	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
-		Versions: agentartifacts.Versions{
+	require.NoError(t, writeManifest(dir, bootstrapartifacts.Manifest{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -125,9 +126,9 @@ func TestNewPlanLoadsManifestFile(t *testing.T) {
 
 func TestWriteManifestOmitsV1SchemaVersion(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
+	require.NoError(t, writeManifest(dir, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -136,16 +137,16 @@ func TestWriteManifestOmitsV1SchemaVersion(t *testing.T) {
 		},
 	}))
 
-	data, err := os.ReadFile(filepath.Join(dir, agentartifacts.ManifestFileName))
+	data, err := os.ReadFile(filepath.Join(dir, bootstrapartifacts.ManifestFileName))
 	require.NoError(t, err)
 	require.NotContains(t, string(data), "schemaVersion")
 }
 
 func TestValidatePulledBundle(t *testing.T) {
 	dir := t.TempDir()
-	manifest := agentartifacts.Manifest{
+	manifest := bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -182,9 +183,9 @@ func TestValidatePulledBundle(t *testing.T) {
 
 func TestValidatePulledBundleDetectsContentMismatch(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
+	require.NoError(t, writeManifest(dir, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -199,9 +200,9 @@ func TestValidatePulledBundleDetectsContentMismatch(t *testing.T) {
 
 func TestPackPlatformManifestIncludesOnlyOneArchitecture(t *testing.T) {
 	dir := t.TempDir()
-	manifest := agentartifacts.Manifest{
+	manifest := bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",

@@ -8,21 +8,26 @@ name: unbounded agent offline artifacts
 #
 #   ghcr.io/<owner>/unbounded/bootstrap-artifacts:<tag-prefix>-k8s-<kubernetes-version>
 #
-# For example, pushing tag "agent-artifacts/v0.4.0" publishes:
+# For example, pushing tag "v0.4.0" publishes:
 #
 #   ghcr.io/azure/unbounded/bootstrap-artifacts:v0.4.0-k8s-v1.34.2
 #
+# Version tag runs also attach HTTPS archives to the matching GitHub release.
 # Manual dispatch uses the "tag" input as <tag-prefix>. If omitted, the first
 # 12 characters of the commit SHA are used.
 on:
   push:
     tags:
-      - "agent-artifacts/*"
+      - "v*"
 
   workflow_dispatch:
     inputs:
       tag:
         description: "OCI tag prefix to publish, for example v0.4.0. Defaults to the commit SHA."
+        required: false
+        type: string
+      release_tag:
+        description: "Existing GitHub release tag to receive archive assets. Empty skips release upload."
         required: false
         type: string
       kubernetes_versions:
@@ -35,7 +40,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -43,6 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
       kubernetes_versions: ${{ steps.resolve.outputs.kubernetes_versions }}
       kubernetes_version_groups: ${{ steps.resolve.outputs.kubernetes_version_groups }}
       rootfs_images: ${{ steps.resolve.outputs.rootfs_images }}
@@ -65,6 +71,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           INPUT_KUBERNETES_VERSIONS: ${{ inputs.kubernetes_versions }}
           INPUT_ROOTFS_IMAGES: ${{ inputs.rootfs_images }}
           GITHUB_SHA_VALUE: ${{ github.sha }}
@@ -82,6 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ROOTFS_IMAGES_JSON: ${{ needs.resolve.outputs.rootfs_images }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
     steps:
       - name: Download agent artifacts builder
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -113,6 +121,38 @@ jobs:
               --output "dist/rootfs-images/${archive_name}.oci.tar.gz"
           done < <(jq -r '.[]' <<< "${ROOTFS_IMAGES_JSON}")
 
+      - name: Wait for GitHub release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in $(seq 1 90); do
+            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "release ${RELEASE_TAG} was not created" >&2
+          exit 1
+
+      - name: Upload rootfs archives to GitHub release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist/release-assets
+
+          for source in dist/rootfs-images/*.oci.tar.gz; do
+            destination="dist/release-assets/rootfs-$(basename "${source}")"
+            cp "${source}" "${destination}"
+            sha256sum "${destination}" | sed 's#  dist/release-assets/#  #' > "${destination}.sha256"
+          done
+
+          gh release upload "${RELEASE_TAG}" \
+            dist/release-assets/rootfs-*.oci.tar.gz \
+            dist/release-assets/rootfs-*.oci.tar.gz.sha256 \
+            --clobber
+
       - name: Upload rootfs OCI layout archives
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -136,6 +176,7 @@ jobs:
       ARTIFACT_TAG_PREFIX: ${{ needs.resolve.outputs.tag }}
       KUBERNETES_MINOR: ${{ matrix.group.minor }}
       KUBERNETES_VERSIONS_JSON: ${{ toJson(matrix.group.versions) }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
     steps:
       - name: Download agent artifacts builder
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -158,6 +199,40 @@ jobs:
 
       - name: Build and publish offline artifact bundles
         run: bin/agent-artifacts-builder publish-version-group
+
+      - name: Wait for GitHub release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in $(seq 1 90); do
+            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "release ${RELEASE_TAG} was not created" >&2
+          exit 1
+
+      - name: Upload bootstrap archives to GitHub release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist/release-assets
+
+          for source in dist/bootstrap-artifacts/*.tar.gz; do
+            source_name=$(basename "${source}")
+            suffix=${source_name#"bootstrap-artifacts-${ARTIFACT_TAG_PREFIX}-"}
+            destination="dist/release-assets/bootstrap-artifacts-${suffix}"
+            cp "${source}" "${destination}"
+            sha256sum "${destination}" | sed 's#  dist/release-assets/#  #' > "${destination}.sha256"
+          done
+
+          gh release upload "${RELEASE_TAG}" \
+            dist/release-assets/bootstrap-artifacts-k8s-*.tar.gz \
+            dist/release-assets/bootstrap-artifacts-k8s-*.tar.gz.sha256 \
+            --clobber
 
       - name: Upload filesystem and HTTPS artifact bundles
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

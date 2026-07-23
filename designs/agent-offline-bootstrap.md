@@ -621,6 +621,8 @@ The OCI representation should use one OCI blob per target artifact, not one tarb
 
 For HTTPS archive mode, `agent-artifacts-builder` should also package the expanded filesystem bundle as a gzip-compressed tar archive and write an adjacent `.sha256` file. The archive contains `manifest.json` and the same component-prefixed paths as filesystem mode. It is intentionally a complete bundle because static HTTPS servers cannot provide OCI title-based blob selection. The version-group publishing flow writes archives named like `bootstrap-artifacts-<tag-prefix>-k8s-<kubernetes-version>.tar.gz` alongside the expanded bundles uploaded by the workflow.
 
+Version tag runs such as `v0.1.22` use the version tag as the OCI artifact tag prefix and attach rootfs OCI layout archives, bootstrap artifact archives, and their `.sha256` files to the matching GitHub release. GitHub Release assets use a flat namespace: rootfs archives are named `rootfs-<image>-<image-version>.oci.tar.gz`, and bootstrap archives are named `bootstrap-artifacts-k8s-<kubernetes-version>.tar.gz` without repeating the Unbounded version. Manual workflow dispatch can optionally set `release_tag` to attach assets to an existing release; leaving it empty only publishes OCI and GitHub Actions artifacts.
+
 ### Operator mirroring workflow
 
 A connected environment downloads or copies the official Unbounded artifacts, verifies them, and imports them into the target environment.
