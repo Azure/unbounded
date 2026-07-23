@@ -20,6 +20,25 @@ func TestURLWithoutQuery(t *testing.T) {
 	}
 }
 
+func TestURLWithoutQueryMalformedURL(t *testing.T) {
+	t.Parallel()
+
+	first := URLWithoutQuery("https://artifacts.example.test/%one?sig=first-secret")
+	second := URLWithoutQuery("https://artifacts.example.test/%two?sig=second-secret")
+
+	if first != "https://artifacts.example.test/%one" {
+		t.Fatalf("URLWithoutQuery() = %q", first)
+	}
+
+	if second != "https://artifacts.example.test/%two" {
+		t.Fatalf("URLWithoutQuery() = %q", second)
+	}
+
+	if first == second {
+		t.Fatal("malformed URLs collapsed to the same query-free identity")
+	}
+}
+
 func TestRedactURLQuery(t *testing.T) {
 	t.Parallel()
 

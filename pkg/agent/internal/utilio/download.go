@@ -47,7 +47,11 @@ func CheckRedirectNoHTTPSDowngrade(req *http.Request, via []*http.Request) error
 func URLWithoutQuery(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return "<redacted>"
+		if queryIndex := strings.IndexByte(rawURL, '?'); queryIndex >= 0 {
+			return rawURL[:queryIndex]
+		}
+
+		return rawURL
 	}
 
 	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.RawQuery == "" {

@@ -216,7 +216,12 @@ func validateBundle(rootDir string) error {
 
 	expectedPaths := expectedBundlePaths(plan)
 
-	bundle, err := bootstrapartifacts.Open(rootDir)
+	bundleRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return fmt.Errorf("resolve offline artifact bundle path %q: %w", rootDir, err)
+	}
+
+	bundle, err := bootstrapartifacts.Open(bundleRoot)
 	if err != nil {
 		return err
 	}

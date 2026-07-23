@@ -172,7 +172,12 @@ func TestValidatePulledBundle(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, validateBundle(dir))
+	workingDir, err := os.Getwd()
+	require.NoError(t, err)
+
+	relativeDir, err := filepath.Rel(workingDir, dir)
+	require.NoError(t, err)
+	require.NoError(t, validateBundle(relativeDir))
 }
 
 func TestValidatePulledBundleDetectsContentMismatch(t *testing.T) {
