@@ -205,6 +205,18 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
+  # Publish offline bootstrap bundles and rootfs OCI layout archives after
+  # GoReleaser has created the draft GitHub release.
+  # ---------------------------------------------------------------------------
+  agent-offline-artifacts:
+    needs: [version, binaries]
+    uses: ./.github/workflows/agent-artifacts.yaml
+    with:
+      tag: ${{ needs.version.outputs.tag }}
+      release_tag: ${{ needs.version.outputs.tag }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
   # Build, push, sign, and SBOM-attest unbounded-net-controller and
   # unbounded-net-node images. Native runners per arch (CGO + heavy tdnf
   # installs make QEMU prohibitively slow). Per-arch tags are stitched into
@@ -913,6 +925,7 @@ jobs:
       - version
       - changelog
       - binaries
+      - agent-offline-artifacts
       - net-images-manifest
       - netboot-image
       - metalman-image

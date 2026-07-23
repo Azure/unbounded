@@ -12,13 +12,31 @@ name: unbounded agent offline artifacts
 #
 #   ghcr.io/azure/unbounded/bootstrap-artifacts:v0.4.0-k8s-v1.34.2
 #
-# Version tag runs also attach HTTPS archives to the matching GitHub release.
-# Manual dispatch uses the "tag" input as <tag-prefix>. If omitted, the first
-# 12 characters of the commit SHA are used.
+# The main release workflow calls this workflow after GoReleaser creates the
+# draft release. Manual dispatch can publish OCI and Actions artifacts without
+# a release, or target an existing release explicitly.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "OCI tag prefix to publish."
+        required: true
+        type: string
+      release_tag:
+        description: "Existing GitHub release tag to receive archive assets."
+        required: false
+        type: string
+        default: ""
+      kubernetes_versions:
+        description: "Kubernetes versions to publish. Empty uses embedded defaults."
+        required: false
+        type: string
+        default: ""
+      rootfs_images:
+        description: "Tagged rootfs OCI images to export. Empty uses embedded defaults."
+        required: false
+        type: string
+        default: ""
 
   workflow_dispatch:
     inputs:
@@ -121,20 +139,6 @@ jobs:
               --output "dist/rootfs-images/${archive_name}.oci.tar.gz"
           done < <(jq -r '.[]' <<< "${ROOTFS_IMAGES_JSON}")
 
-      - name: Wait for GitHub release
-        if: env.RELEASE_TAG != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for attempt in $(seq 1 90); do
-            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "release ${RELEASE_TAG} was not created" >&2
-          exit 1
-
       - name: Upload rootfs archives to GitHub release
         if: env.RELEASE_TAG != ''
         env:
@@ -199,20 +203,6 @@ jobs:
 
       - name: Build and publish offline artifact bundles
         run: bin/agent-artifacts-builder publish-version-group
-
-      - name: Wait for GitHub release
-        if: env.RELEASE_TAG != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for attempt in $(seq 1 90); do
-            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "release ${RELEASE_TAG} was not created" >&2
-          exit 1
 
       - name: Upload bootstrap archives to GitHub release
         if: env.RELEASE_TAG != ''

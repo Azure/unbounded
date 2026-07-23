@@ -199,10 +199,10 @@ func newLogger(debug bool, format string) *slog.Logger {
 // GitHub Actions publishing flow:
 //
 //  1. The resolve job runs resolve-publish-inputs once. It resolves the OCI tag
-//     prefix, release tag, Kubernetes versions, and rootfs images from either a
-//     version tag push or workflow_dispatch inputs, then writes GitHub outputs.
-//  2. Version tag pushes use the full pushed tag as both the OCI tag prefix and
-//     GitHub release tag, with embedded default version and image lists.
+//     prefix, release tag, Kubernetes versions, and rootfs images from reusable
+//     workflow or workflow_dispatch inputs, then writes GitHub outputs.
+//  2. The main release workflow passes its version tag as both the OCI tag
+//     prefix and GitHub release tag, with embedded default version and image lists.
 //  3. Manual workflow_dispatch runs may pass explicit tags and comma, space, or
 //     newline separated Kubernetes version and rootfs image lists. Missing
 //     values use the short commit SHA or embedded defaults as appropriate.
