@@ -134,6 +134,25 @@ func TestManualBootstrapHandler_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "valid: offline artifacts HTTPS source",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "https://artifacts.example.com/unbounded/v1.31.2.tar.gz?sp=r&sig=test-signature",
+			},
+		},
+		{
+			name: "invalid: offline artifacts HTTPS source without archive path",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "https://artifacts.example.com",
+			},
+			expectErr: "HTTPS URL must include a host and archive path",
+		},
+		{
 			name: "valid: offline artifacts OCI source",
 			handler: manualBootstrapHandler{
 				siteName:               "dc1",
@@ -219,6 +238,14 @@ func newFakeCluster(t *testing.T, siteName string) *fake.Clientset {
 			},
 		},
 	)
+}
+
+func TestValidateHTTPSArtifactsSourceRedactsInvalidQuery(t *testing.T) {
+	t.Parallel()
+
+	err := validateHTTPSArtifactsSource("https://artifacts.example.test/%zz?sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
 }
 
 func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {

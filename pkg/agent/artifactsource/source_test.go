@@ -6,6 +6,8 @@ package artifactsource
 import (
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,6 +15,54 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestParseRedactsInvalidURL(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse("https://artifacts.example.test/%zz?sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
+}
+
+func TestSourceOpenHTTPSURL(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("artifact-data"))
+	}))
+	defer server.Close()
+
+	body, err := openHTTPWithClient(context.Background(), server.Client(), server.URL+"/artifact")
+	require.NoError(t, err)
+
+	defer body.Close() //nolint:errcheck // test cleanup
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, "artifact-data", string(got))
+}
+
+func TestSourceOpenHTTPErrorRedactsQuery(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	_, err := openHTTPWithClient(context.Background(), server.Client(), server.URL+"/artifact?sp=r&sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
+	require.NotContains(t, err.Error(), "sig")
+	require.Contains(t, err.Error(), "REDACTED")
+}
+
+func TestSourceOpenHTTPRequestErrorRedactsQuery(t *testing.T) {
+	t.Parallel()
+
+	_, err := openHTTPWithClient(context.Background(), http.DefaultClient, "https://artifacts.example.test/%zz?sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
+	require.Contains(t, err.Error(), "redacted")
+}
 
 func TestSourceOpenFileURL(t *testing.T) {
 	t.Parallel()
@@ -83,6 +133,29 @@ func TestParseRejectsOCIWithoutBlobTitle(t *testing.T) {
 
 	_, err := Parse("oci://registry.example.com/unbounded/bootstrap-artifacts:v1")
 	require.ErrorContains(t, err, "blob title fragment")
+}
+
+func TestParseRejectsInvalidOCISource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		source string
+		error  string
+	}{
+		{name: "missing repository", source: "oci://registry.example.test#manifest.json", error: "registry and repository"},
+		{name: "user info", source: "oci://user@registry.example.test/artifacts:v1#manifest.json", error: "user info"},
+		{name: "query", source: "oci://registry.example.test/artifacts:v1?token=secret#manifest.json", error: "query parameters"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Parse(tt.source)
+			require.ErrorContains(t, err, tt.error)
+		})
+	}
 }
 
 func TestReadExpectedSHA256(t *testing.T) {

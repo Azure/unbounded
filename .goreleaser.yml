@@ -44,6 +44,19 @@ builds:
       - amd64
       - arm64
 
+  - id: agent-artifacts-builder
+    main: ./hack/cmd/agent-artifacts-builder
+    binary: agent-artifacts-builder
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
 archives:
   - id: kubectl-unbounded
     ids:
@@ -58,6 +71,13 @@ archives:
     formats:
       - tar.gz
     name_template: "unbounded-agent-{{ .Os }}-{{ .Arch }}"
+
+  - id: agent-artifacts-builder
+    ids:
+      - agent-artifacts-builder
+    formats:
+      - tar.gz
+    name_template: "agent-artifacts-builder-{{ .Os }}-{{ .Arch }}"
 
 checksum:
   name_template: "checksums.txt"

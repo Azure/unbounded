@@ -25,8 +25,9 @@ type RootFS struct {
 	// runc, CNI plugins, crictl). Nil means upstream defaults apply.
 	Downloads *DownloadOverrides
 
-	// OCIImage is the fully-qualified OCI image reference (e.g.
-	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
+	// OCIImage is an OCI registry reference, local OCI layout, or HTTPS URL
+	// to a tarred OCI image layout used to bootstrap the machine rootfs. The
+	// single tagged image reference in an HTTPS archive is selected automatically.
 	// The image must use OCI media types and include a platform manifest
 	// matching the host architecture.
 	OCIImage string

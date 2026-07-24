@@ -8,16 +8,35 @@ name: unbounded agent offline artifacts
 #
 #   ghcr.io/<owner>/unbounded/bootstrap-artifacts:<tag-prefix>-k8s-<kubernetes-version>
 #
-# For example, pushing tag "agent-artifacts/v0.4.0" publishes:
+# For example, pushing tag "v0.4.0" publishes:
 #
 #   ghcr.io/azure/unbounded/bootstrap-artifacts:v0.4.0-k8s-v1.34.2
 #
-# Manual dispatch uses the "tag" input as <tag-prefix>. If omitted, the first
-# 12 characters of the commit SHA are used.
+# The main release workflow calls this workflow after GoReleaser creates the
+# draft release. Manual dispatch can publish OCI and Actions artifacts without
+# a release, or target an existing release explicitly.
 on:
-  push:
-    tags:
-      - "agent-artifacts/*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "OCI tag prefix to publish."
+        required: true
+        type: string
+      release_tag:
+        description: "Existing GitHub release tag to receive archive assets."
+        required: false
+        type: string
+        default: ""
+      kubernetes_versions:
+        description: "Kubernetes versions to publish. Empty uses embedded defaults."
+        required: false
+        type: string
+        default: ""
+      rootfs_images:
+        description: "Tagged rootfs OCI images to export. Empty uses embedded defaults."
+        required: false
+        type: string
+        default: ""
 
   workflow_dispatch:
     inputs:
@@ -25,23 +44,36 @@ on:
         description: "OCI tag prefix to publish, for example v0.4.0. Defaults to the commit SHA."
         required: false
         type: string
+      release_tag:
+        description: "Existing GitHub release tag to receive archive assets. Empty skips release upload."
+        required: false
+        type: string
       kubernetes_versions:
         description: "Kubernetes versions to publish. Accepts comma, space, or newline separated values. Defaults to hack/cmd/agent-artifacts-builder/kubernetes-versions.txt."
         required: false
         type: string
+      rootfs_images:
+        description: "Tagged rootfs OCI images to export. Accepts comma, space, or newline separated values. Defaults to hack/cmd/agent-artifacts-builder/rootfs-images.txt."
+        required: false
+        type: string
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
-  resolve:
+  build-and-publish:
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      kubernetes_versions: ${{ steps.resolve.outputs.kubernetes_versions }}
-      kubernetes_version_groups: ${{ steps.resolve.outputs.kubernetes_version_groups }}
     steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
+          sudo docker image prune -af &
+          wait
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -60,44 +92,15 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           INPUT_KUBERNETES_VERSIONS: ${{ inputs.kubernetes_versions }}
+          INPUT_ROOTFS_IMAGES: ${{ inputs.rootfs_images }}
           GITHUB_SHA_VALUE: ${{ github.sha }}
         run: bin/agent-artifacts-builder resolve-publish-inputs
 
-      - name: Upload agent artifacts builder
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: agent-artifacts-builder
-          path: bin/agent-artifacts-builder
-          retention-days: 1
-
-  publish:
-    needs: resolve
-    name: publish (${{ matrix.group.minor }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      # Limit concurrent pushes to the same GHCR package to avoid intermittent
-      # write_package failures from too many simultaneous blob uploads.
-      max-parallel: 3
-      matrix:
-        group: ${{ fromJson(needs.resolve.outputs.kubernetes_version_groups) }}
-    env:
-      REGISTRY: ghcr.io/${{ github.repository_owner }}/unbounded
-      ARTIFACT_TAG_PREFIX: ${{ needs.resolve.outputs.tag }}
-      KUBERNETES_MINOR: ${{ matrix.group.minor }}
-      KUBERNETES_VERSIONS_JSON: ${{ toJson(matrix.group.versions) }}
-    steps:
-      - name: Download agent artifacts builder
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: agent-artifacts-builder
-          path: bin
-
-      - name: Prepare agent artifacts builder
-        run: chmod +x bin/agent-artifacts-builder
-
       - name: Normalize registry
+        env:
+          REGISTRY: ghcr.io/${{ github.repository_owner }}/unbounded
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
       - name: Log in to ghcr.io
@@ -107,12 +110,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish offline artifact bundles
-        run: bin/agent-artifacts-builder publish-version-group
+      - name: Build and publish artifacts
+        env:
+          ARTIFACT_TAG_PREFIX: ${{ steps.resolve.outputs.tag }}
+          KUBERNETES_VERSIONS_JSON: ${{ steps.resolve.outputs.kubernetes_versions }}
+          ROOTFS_IMAGES_JSON: ${{ steps.resolve.outputs.rootfs_images }}
+        run: |
+          args=(build --output-dir dist \
+            --oci-registry "${REGISTRY}" \
+            --artifact-tag-prefix "${ARTIFACT_TAG_PREFIX}")
 
-      - name: Upload filesystem artifact bundle
+          while IFS= read -r version; do
+            args+=(--kubernetes-version "${version}")
+          done < <(jq -r '.[]' <<< "${KUBERNETES_VERSIONS_JSON}")
+
+          while IFS= read -r image_ref; do
+            args+=(--rootfs-image "${image_ref}")
+          done < <(jq -r '.[]' <<< "${ROOTFS_IMAGES_JSON}")
+
+          bin/agent-artifacts-builder "${args[@]}"
+
+      - name: Upload archives to GitHub release
+        if: steps.resolve.outputs.release_tag != ''
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" \
+            dist/rootfs/*.oci.tar.gz \
+            dist/rootfs/*.oci.tar.gz.sha256 \
+            dist/bootstrap-artifacts/*.tar.gz \
+            dist/bootstrap-artifacts/*.tar.gz.sha256 \
+            --clobber
+
+      - name: Upload rootfs OCI layout archives
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bootstrap-artifacts-${{ matrix.group.minor }}
+          name: rootfs-oci-layouts
+          path: dist/rootfs/
+          retention-days: 7
+
+      - name: Upload bootstrap archives
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bootstrap-artifacts
           path: dist/bootstrap-artifacts/
           retention-days: 7

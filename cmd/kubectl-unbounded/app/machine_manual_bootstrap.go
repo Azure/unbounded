@@ -206,6 +206,10 @@ func validateOfflineArtifactsSource(source string) error {
 		return validateOCIArtifactsSource(source)
 	}
 
+	if strings.HasPrefix(source, "https://") {
+		return validateHTTPSArtifactsSource(source)
+	}
+
 	if strings.HasPrefix(source, "file://") {
 		return validateFileArtifactsSource(source)
 	}
@@ -235,6 +239,23 @@ func validateOCIArtifactsSource(source string) error {
 	return nil
 }
 
+func validateHTTPSArtifactsSource(source string) error {
+	u, err := url.Parse(source)
+	if err != nil {
+		return errors.New("parse HTTPS URL")
+	}
+
+	if u.Host == "" || strings.Trim(u.Path, "/") == "" {
+		return errors.New("HTTPS URL must include a host and archive path")
+	}
+
+	if u.User != nil || u.Fragment != "" {
+		return errors.New("HTTPS URL must not include user info or a fragment")
+	}
+
+	return nil
+}
+
 func validateFileArtifactsSource(source string) error {
 	u, err := url.Parse(source)
 	if err != nil {
@@ -254,7 +275,7 @@ func validateFileArtifactsSource(source string) error {
 
 func validatePathArtifactsSource(source string) error {
 	if strings.Contains(source, "://") {
-		return fmt.Errorf("unsupported scheme in %q; supported sources are absolute paths, file:// URLs, and oci:// URLs", source)
+		return fmt.Errorf("unsupported scheme in %q; supported sources are absolute paths, file:// URLs, HTTPS URLs, and oci:// URLs", source)
 	}
 
 	if !filepath.IsAbs(source) {
@@ -682,9 +703,9 @@ Examples:
 	cmd.Flags().StringArrayVar(&handler.nodeLabels, "node-label", nil, "Label in key=value format to pass to kubelet (can be repeated)")
 	cmd.Flags().StringArrayVar(&handler.taints, "register-with-taint", nil, "Taint to register on the node (can be repeated)")
 	cmd.Flags().StringVar(&handler.nodeIP, "node-ip", "", "IP address to pass to kubelet")
-	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image reference for the agent rootfs")
+	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image source for the agent rootfs (registry reference, HTTPS OCI layout archive, or oci-layout:// URL)")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
-	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, or oci:// artifact reference)")
+	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)
 	cmd.Flags().StringArrayVar(&handler.additionalHostDevices, "additional-host-device", nil, `Extra host device node or systemd device group specifier to expose in the nspawn machine (can be repeated). Accepts absolute /dev/* paths and systemd device group specifiers like char-input or block-*`)
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")

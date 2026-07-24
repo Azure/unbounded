@@ -21,12 +21,78 @@ import (
 const remoteHTTPProbeTimeout = 10 * time.Second
 
 var remoteHTTPClient = &http.Client{
-	Timeout: 10 * time.Minute, // FIXME: proper configuration
+	Timeout:       10 * time.Minute, // FIXME: proper configuration
+	CheckRedirect: CheckRedirectNoHTTPSDowngrade,
 }
 
 var remoteHTTPProbeClient = &http.Client{
-	Transport: newRemoteHTTPProbeTransport(),
-	Timeout:   remoteHTTPProbeTimeout,
+	Transport:     newRemoteHTTPProbeTransport(),
+	Timeout:       remoteHTTPProbeTimeout,
+	CheckRedirect: CheckRedirectNoHTTPSDowngrade,
+}
+
+// CheckRedirectNoHTTPSDowngrade rejects redirects from an HTTPS source to an
+// insecure destination while allowing redirects that preserve or improve the
+// transport scheme.
+func CheckRedirectNoHTTPSDowngrade(req *http.Request, via []*http.Request) error {
+	if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing redirect from HTTPS to %q", req.URL.Scheme)
+	}
+
+	return nil
+}
+
+// URLWithoutQuery removes query parameters from rawURL. It returns a redacted
+// placeholder when rawURL cannot be parsed safely.
+func URLWithoutQuery(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		if queryIndex := strings.IndexByte(rawURL, '?'); queryIndex >= 0 {
+			return rawURL[:queryIndex]
+		}
+
+		return rawURL
+	}
+
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.RawQuery == "" {
+		return rawURL
+	}
+
+	parsed.RawQuery = ""
+
+	return parsed.String()
+}
+
+// RedactURLQuery removes query parameters from rawURL before it is logged or
+// included in an error message.
+func RedactURLQuery(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "<redacted>"
+	}
+
+	if parsed.RawQuery == "" {
+		return rawURL
+	}
+
+	parsed.RawQuery = "REDACTED"
+
+	return parsed.String()
+}
+
+// RedactHTTPError removes query parameters from URL errors returned by the Go
+// HTTP client while preserving the underlying transport error.
+func RedactHTTPError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+
+	return &url.Error{
+		Op:  urlErr.Op,
+		URL: RedactURLQuery(urlErr.URL),
+		Err: urlErr.Err,
+	}
 }
 
 func newRemoteHTTPProbeTransport() http.RoundTripper {
@@ -45,17 +111,17 @@ func downloadFromRemote(ctx context.Context, source string) (io.ReadCloser, erro
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to create HTTP request: %w", RedactHTTPError(err))
 	}
 
 	resp, err := remoteHTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to perform HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to perform HTTP request: %w", RedactHTTPError(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", source, resp.StatusCode)
+		return nil, fmt.Errorf("download %q failed with status code %d", RedactURLQuery(source), resp.StatusCode)
 	}
 
 	return resp.Body, nil
@@ -64,7 +130,7 @@ func downloadFromRemote(ctx context.Context, source string) (io.ReadCloser, erro
 func validateHTTPDownloadSource(source string) error {
 	parsed, err := url.Parse(source)
 	if err != nil {
-		return fmt.Errorf("parse download source %q: %w", source, err)
+		return fmt.Errorf("parse download source %q: %w", RedactURLQuery(source), RedactHTTPError(err))
 	}
 
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
@@ -92,7 +158,7 @@ func ProbeRemoteHTTPObject(ctx context.Context, source string) error {
 func probeRemoteHTTPObject(ctx context.Context, method, source string) error {
 	req, err := http.NewRequestWithContext(ctx, method, source, http.NoBody)
 	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
+		return fmt.Errorf("failed to create HTTP request: %w", RedactHTTPError(err))
 	}
 
 	if method == http.MethodGet {
@@ -106,7 +172,7 @@ func probeRemoteHTTPObject(ctx context.Context, method, source string) error {
 
 	resp, err := remoteHTTPProbeClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to perform HTTP request: %w", err)
+		return fmt.Errorf("failed to perform HTTP request: %w", RedactHTTPError(err))
 	}
 	defer resp.Body.Close() //nolint:errcheck // body close
 

@@ -6,13 +6,12 @@
 package agentartifacts
 
 import (
-	"crypto/sha256"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
 
+	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
@@ -36,31 +35,13 @@ const (
 
 	// CrictlDefaultBaseURL is the upstream base URL for cri-tools releases.
 	CrictlDefaultBaseURL = "https://github.com/kubernetes-sigs/cri-tools/releases/download"
-
-	ManifestFileName = "manifest.json"
 )
 
-var KubernetesBinaries = []string{"kubelet", "kubectl", "kube-proxy"}
-
 func DefaultContainerImages(kubernetesVersion string) []string {
-	return normalizeContainerImages([]string{
+	return bootstrapartifacts.NormalizeContainerImages([]string{
 		goalstates.SandboxImage,
 		goalstates.KubeProxyImage(kubernetesVersion),
 	})
-}
-
-type Versions struct {
-	Kubernetes string `json:"kubernetes"`
-	Containerd string `json:"containerd"`
-	Runc       string `json:"runc"`
-	CNI        string `json:"cni"`
-	Crictl     string `json:"crictl"`
-}
-
-type Manifest struct {
-	SchemaVersion   int      `json:"schemaVersion,omitempty"`
-	Versions        Versions `json:"versions"`
-	ContainerImages []string `json:"containerImages"`
 }
 
 // KubernetesBinary resolves the download URL for a Kubernetes binary
@@ -75,7 +56,7 @@ func KubernetesBinary(override *goalstates.DownloadSource, version, arch, binary
 		base = strings.TrimRight(override.BaseURL, "/")
 	}
 
-	return fmt.Sprintf("%s/v%s/bin/linux/%s/%s", base, StripLeadingV(version), arch, binary)
+	return fmt.Sprintf("%s/v%s/bin/linux/%s/%s", base, bootstrapartifacts.StripLeadingV(version), arch, binary)
 }
 
 // ContainerdArchive resolves the containerd release tarball URL, honoring
@@ -87,7 +68,7 @@ func ContainerdArchive(override *goalstates.DownloadSource, version, arch string
 		return fmt.Sprintf(override.URL, version, version, arch)
 	}
 
-	version = StripLeadingV(version)
+	version = bootstrapartifacts.StripLeadingV(version)
 
 	base := ContainerdDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
@@ -104,7 +85,7 @@ func RuncBinary(override *goalstates.DownloadSource, version, arch string) strin
 		return fmt.Sprintf(override.URL, version, arch)
 	}
 
-	version = StripLeadingV(version)
+	version = bootstrapartifacts.StripLeadingV(version)
 
 	base := RuncDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
@@ -121,7 +102,7 @@ func CNIPluginsArchive(override *goalstates.DownloadSource, version, arch string
 		return fmt.Sprintf(override.URL, version, arch, version)
 	}
 
-	version = StripLeadingV(version)
+	version = bootstrapartifacts.StripLeadingV(version)
 
 	base := CNIDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
@@ -139,7 +120,7 @@ func CrictlArchive(override *goalstates.DownloadSource, version, hostOS, hostArc
 		return fmt.Sprintf(override.URL, version, version, hostOS, hostArch)
 	}
 
-	version = StripLeadingV(version)
+	version = bootstrapartifacts.StripLeadingV(version)
 
 	base := CrictlDefaultBaseURL
 	if override != nil && override.BaseURL != "" {
@@ -159,119 +140,4 @@ func CrictlVersionForKubernetesVersion(kubernetesVersion string) (string, error)
 	}
 
 	return fmt.Sprintf("%d.%d.0", version.Major(), version.Minor()), nil
-}
-
-func KubernetesArtifactPath(version, arch, binary string) string {
-	return fmt.Sprintf("kubernetes/%s/bin/linux/%s/%s", NormalizeKubernetesVersion(version), arch, binary)
-}
-
-func ContainerdArtifactPath(version, arch string) string {
-	version = StripLeadingV(version)
-	return fmt.Sprintf("containerd/v%s/containerd-%s-linux-%s.tar.gz", version, version, arch)
-}
-
-func RuncArtifactPath(version, arch string) string {
-	return fmt.Sprintf("runc/v%s/runc.%s", StripLeadingV(version), arch)
-}
-
-func CNIArtifactPath(version, arch string) string {
-	version = StripLeadingV(version)
-	return fmt.Sprintf("cni/v%s/cni-plugins-linux-%s-v%s.tgz", version, arch, version)
-}
-
-func CrictlArtifactPath(version, hostOS, arch string) string {
-	version = StripLeadingV(version)
-	return fmt.Sprintf("crictl/v%s/crictl-v%s-%s-%s.tar.gz", version, version, hostOS, arch)
-}
-
-func ContainerImageArchivePath(arch, imageTag string) string {
-	imageTag = strings.TrimSpace(imageTag)
-	name := strings.NewReplacer(
-		"/", "_",
-		":", "_",
-		"@", "_",
-	).Replace(imageTag)
-	digest := sha256.Sum256([]byte(imageTag))
-
-	return fmt.Sprintf("container-images/%s/%s-%x.tar", arch, name, digest[:6])
-}
-
-func NormalizeManifest(manifest Manifest) (Manifest, error) {
-	if manifest.SchemaVersion == 0 {
-		manifest.SchemaVersion = 1
-	}
-
-	if manifest.SchemaVersion != 1 {
-		return Manifest{}, fmt.Errorf("unsupported manifest schemaVersion %d", manifest.SchemaVersion)
-	}
-
-	manifest.Versions.Kubernetes = NormalizeKubernetesVersion(manifest.Versions.Kubernetes)
-	manifest.Versions.Containerd = StripLeadingV(manifest.Versions.Containerd)
-	manifest.Versions.Runc = StripLeadingV(manifest.Versions.Runc)
-	manifest.Versions.CNI = StripLeadingV(manifest.Versions.CNI)
-	manifest.Versions.Crictl = StripLeadingV(manifest.Versions.Crictl)
-	manifest.ContainerImages = normalizeContainerImages(manifest.ContainerImages)
-
-	missing := make([]string, 0, 5)
-	if manifest.Versions.Kubernetes == "v" {
-		missing = append(missing, "versions.kubernetes")
-	}
-
-	if manifest.Versions.Containerd == "" {
-		missing = append(missing, "versions.containerd")
-	}
-
-	if manifest.Versions.Runc == "" {
-		missing = append(missing, "versions.runc")
-	}
-
-	if manifest.Versions.CNI == "" {
-		missing = append(missing, "versions.cni")
-	}
-
-	if manifest.Versions.Crictl == "" {
-		missing = append(missing, "versions.crictl")
-	}
-
-	if len(missing) > 0 {
-		return Manifest{}, fmt.Errorf("manifest is missing required fields: %s", strings.Join(missing, ", "))
-	}
-
-	return manifest, nil
-}
-
-func normalizeContainerImages(images []string) []string {
-	seen := map[string]struct{}{}
-
-	out := make([]string, 0, len(images))
-	for _, image := range images {
-		image = strings.TrimSpace(image)
-		if image == "" {
-			continue
-		}
-
-		if _, ok := seen[image]; ok {
-			continue
-		}
-
-		seen[image] = struct{}{}
-		out = append(out, image)
-	}
-
-	sort.Strings(out)
-
-	return out
-}
-
-func NormalizeKubernetesVersion(version string) string {
-	version = strings.TrimSpace(version)
-	if strings.HasPrefix(version, "v") {
-		return version
-	}
-
-	return "v" + version
-}
-
-func StripLeadingV(version string) string {
-	return strings.TrimPrefix(strings.TrimSpace(version), "v")
 }

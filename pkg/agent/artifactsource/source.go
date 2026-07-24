@@ -30,22 +30,24 @@ const (
 )
 
 var httpClient = &http.Client{
-	Timeout: 10 * time.Minute,
+	Timeout:       10 * time.Minute,
+	CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
 }
 
-// Source is a parsed artifact source. It can reference an absolute local path,
-// file:// URL, HTTP(S) URL, or OCI artifact blob using oci://...#title.
+// Source is a parsed, openable artifact source. It can reference an absolute
+// local path, file:// URL, HTTP(S) URL, or OCI artifact blob using
+// oci://...#title.
 type Source struct {
 	raw       string
 	kind      sourceKind
 	localPath string
 }
 
-// Parse validates and parses an artifact source string.
+// Parse validates and parses an openable artifact source string.
 func Parse(source string) (Source, error) {
 	parsed, err := url.Parse(source)
 	if err != nil {
-		return Source{}, fmt.Errorf("parse artifact source %q: %w", source, err)
+		return Source{}, fmt.Errorf("parse artifact source: %w", utilio.RedactHTTPError(err))
 	}
 
 	switch parsed.Scheme {
@@ -56,6 +58,14 @@ func Parse(source string) (Source, error) {
 	case "http", "https":
 		return Source{raw: source, kind: sourceHTTP}, nil
 	case "oci":
+		if parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {
+			return Source{}, fmt.Errorf("OCI artifact source must include registry and repository")
+		}
+
+		if parsed.User != nil || parsed.RawQuery != "" {
+			return Source{}, fmt.Errorf("OCI artifact source must not include user info or query parameters")
+		}
+
 		if strings.TrimPrefix(parsed.Fragment, "/") == "" {
 			return Source{}, fmt.Errorf("OCI artifact source must include a blob title fragment")
 		}
@@ -114,22 +124,42 @@ func (s Source) Open(ctx context.Context) (io.ReadCloser, error) {
 }
 
 func openHTTP(ctx context.Context, source string) (io.ReadCloser, error) {
+	return openHTTPWithClient(ctx, httpClient, source)
+}
+
+func openHTTPWithClient(ctx context.Context, client *http.Client, source string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to create HTTP request: %w", utilio.RedactHTTPError(err))
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to perform HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to perform HTTP request: %w", utilio.RedactHTTPError(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", source, resp.StatusCode)
+		return nil, fmt.Errorf("download %q failed with status code %d", utilio.RedactURLQuery(source), resp.StatusCode)
 	}
 
 	return resp.Body, nil
+}
+
+// ReadAll reads the complete artifact source.
+func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
+	body, err := s.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close() //nolint:errcheck // best effort close
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return nil, fmt.Errorf("read artifact source: %w", err)
+	}
+
+	return data, nil
 }
 
 // DownloadToLocalFile downloads the artifact source to filename and sets perm.
@@ -162,7 +192,7 @@ func (s Source) DownloadWithSHA256Verification(ctx context.Context, expectedHash
 	actualHash := hex.EncodeToString(hasher.Sum(nil))
 	if actualHash != expectedHash {
 		_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
-		return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", s.raw, expectedHash, actualHash)
+		return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", utilio.RedactURLQuery(s.raw), expectedHash, actualHash)
 	}
 
 	return nil
@@ -196,6 +226,17 @@ func ReadExpectedSHA256(ctx context.Context, checksumSource Source) (string, err
 	}
 
 	return hashStr, nil
+}
+
+// ExtractTar extracts a tar or gzip-compressed tar artifact into destDir.
+func (s Source) ExtractTar(ctx context.Context, destDir string) error {
+	body, err := s.Open(ctx)
+	if err != nil {
+		return err
+	}
+	defer body.Close() //nolint:errcheck // best effort close
+
+	return utilio.ExtractTar(body, destDir)
 }
 
 // DecompressTarGz returns an iterator that yields files from a gzip-compressed
