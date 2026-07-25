@@ -216,6 +216,7 @@ graph TD
 |------|------|---------|-------------|
 | `--cni-conf-dir` | string | `/etc/cni/net.d` | Directory to write CNI configuration. |
 | `--cni-conf-file` | string | `10-unbounded.conflist` | Name of the CNI configuration file. |
+| `--allow-cni-config-coexistence` | bool | `false` | Allow the unbounded CNI conflist alongside other conflists, such as Multus. |
 | `--bridge-name` | string | `cbr0` | Name of the bridge interface. |
 | `--mtu` | int | `1280` | MTU for tunnel and bridge interfaces. Must be set to the lowest physical-link MTU of any node in the cluster minus the encapsulation overhead -- 80 bytes for WireGuard, 58 bytes for GENEVE/VXLAN, or 20 bytes for IPIP. The system auto-selects the correct overhead based on the encapsulation type for each link. The node agent clamps the effective MTU to `min(configured, detected)` so packets are never larger than the physical link can carry. A value of `0` is treated as `1280`. See [MTU Guidance](#mtu-guidance) below. |
 

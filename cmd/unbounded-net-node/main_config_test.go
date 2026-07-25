@@ -19,6 +19,7 @@ func newNodeConfigTestCommand(cfg *config) *cobra.Command {
 	flags.StringVar(&cfg.NodeName, "node-name", "", "")
 	flags.StringVar(&cfg.CNIConfDir, "cni-conf-dir", "/etc/cni/net.d", "")
 	flags.StringVar(&cfg.CNIConfFile, "cni-conf-file", "10-unbounded.conflist", "")
+	flags.BoolVar(&cfg.AllowCNIConfigCoexistence, "allow-cni-config-coexistence", false, "")
 	flags.StringVar(&cfg.BridgeName, "bridge-name", "cbr0", "")
 	flags.StringVar(&cfg.WireGuardDir, "wireguard-dir", "/etc/wireguard", "")
 	flags.IntVar(&cfg.WireGuardPort, "wireguard-port", 51820, "")
@@ -87,6 +88,7 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 		"  nodeName: node-from-config\n" +
 		"  cniConfDir: /tmp/cni\n" +
 		"  cniConfFile: 20-test.conflist\n" +
+		"  allowCNIConfigCoexistence: true\n" +
 		"  bridgeName: cbr-test\n" +
 		"  wireGuardDir: /tmp/wg\n" +
 		"  wireGuardPort: 51888\n" +
@@ -125,6 +127,10 @@ func TestApplyNodeRuntimeConfig(t *testing.T) {
 
 	if cfg.CNIConfDir != "/tmp/cni" || cfg.CNIConfFile != "20-test.conflist" || cfg.BridgeName != "cbr-test" {
 		t.Fatalf("expected CNI settings from runtime config, got dir=%q file=%q bridge=%q", cfg.CNIConfDir, cfg.CNIConfFile, cfg.BridgeName)
+	}
+
+	if !cfg.AllowCNIConfigCoexistence {
+		t.Fatal("expected CNI config coexistence to be enabled from runtime config")
 	}
 
 	if cfg.WireGuardDir != "/tmp/wg" || cfg.WireGuardPort != 51888 || cfg.EnablePolicyRouting {
@@ -181,6 +187,7 @@ func TestApplyNodeRuntimeConfigRespectsChangedFlags(t *testing.T) {
 	runtimeYAML := []byte("node:\n" +
 		"  nodeName: from-config\n" +
 		"  healthPort: 11000\n" +
+		"  allowCNIConfigCoexistence: true\n" +
 		"  statusWsKeepaliveFailureCount: 6\n")
 	if err := os.WriteFile(cfg.ConfigFile, runtimeYAML, 0o644); err != nil {
 		t.Fatalf("failed to write runtime config fixture: %v", err)
@@ -193,6 +200,10 @@ func TestApplyNodeRuntimeConfigRespectsChangedFlags(t *testing.T) {
 
 	if err := cmd.Flags().Set("health-port", "12000"); err != nil {
 		t.Fatalf("failed setting health-port flag: %v", err)
+	}
+
+	if err := cmd.Flags().Set("allow-cni-config-coexistence", "false"); err != nil {
+		t.Fatalf("failed setting allow-cni-config-coexistence flag: %v", err)
 	}
 
 	if err := cmd.Flags().Set("status-ws-keepalive-failure-count", "4"); err != nil {
@@ -209,5 +220,9 @@ func TestApplyNodeRuntimeConfigRespectsChangedFlags(t *testing.T) {
 
 	if cfg.StatusWSKeepaliveFailureCount != 4 {
 		t.Fatalf("expected changed keepalive failure count flag to win over runtime config, got %d", cfg.StatusWSKeepaliveFailureCount)
+	}
+
+	if cfg.AllowCNIConfigCoexistence {
+		t.Fatal("expected changed CNI config coexistence flag to win over runtime config")
 	}
 }

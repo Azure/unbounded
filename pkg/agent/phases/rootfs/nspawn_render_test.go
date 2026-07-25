@@ -21,10 +21,11 @@ import (
 func TestServiceOverride_RenderedSnapshot(t *testing.T) {
 	t.Parallel()
 
-	requireRenderedSnapshot(t, "service-override-kube1.conf.golden", "service-override.conf", nspawnTemplateData{
+	out := requireRenderedSnapshot(t, "service-override-kube1.conf.golden", "service-override.conf", nspawnTemplateData{
 		MachineName:    "kube1",
 		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
 	})
+	require.Contains(t, out, "DeviceAllow=char-ipvtap rwm")
 }
 
 func TestServiceOverride_MachineNameSnapshot(t *testing.T) {
@@ -304,7 +305,7 @@ func TestPathsExcluding(t *testing.T) {
 	require.Equal(t, []string{"/dev/kfd"}, got)
 }
 
-func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
+func TestServiceOverride_NoHostDevicesOnlyAllowsIPVTAP(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
@@ -314,9 +315,8 @@ func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
 		// No HostDevicePaths and no GPU devices.
 	}))
 
-	// With no devices the drop-in must not contain any DeviceAllow lines,
-	// which is what keeps the existing golden snapshots unchanged.
-	require.NotContains(t, buf.String(), "DeviceAllow=")
+	require.Equal(t, 1, strings.Count(buf.String(), "DeviceAllow="))
+	require.Contains(t, buf.String(), "DeviceAllow=char-ipvtap rwm")
 }
 
 func nspawnRenderScenarioData() nspawnTemplateData {

@@ -38,6 +38,7 @@ data:
     node:
       cniConfDir: "{{ default "/host/etc/cni/net.d" .NodeCNIConfDir }}"
       cniConfFile: "{{ default "10-unbounded.conflist" .NodeCNIConfFile }}"
+      allowCNIConfigCoexistence: {{ default "false" .NodeAllowCNIConfigCoexistence }}
       bridgeName: "{{ default "cbr0" .NodeBridgeName }}"
       wireGuardDir: "{{ default "/host/etc/wireguard" .NodeWireGuardDir }}"
       wireGuardPort: {{ default "51820" .NodeWireGuardPort }}

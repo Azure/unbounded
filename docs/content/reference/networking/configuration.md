@@ -43,6 +43,7 @@ controller:
 node:
   cniConfDir: /host/etc/cni/net.d
   cniConfFile: 10-unbounded.conflist
+  allowCNIConfigCoexistence: false
   bridgeName: cbr0
   wireGuardDir: /host/etc/wireguard
   wireGuardPort: 51820
@@ -130,6 +131,7 @@ to disable their creation.
 |------|---------|-------------|
 | `--cni-conf-dir` | `/etc/cni/net.d` | CNI configuration directory. |
 | `--cni-conf-file` | `10-unbounded.conflist` | CNI configuration file name. |
+| `--allow-cni-config-coexistence` | `false` | Allow the unbounded CNI conflist alongside other conflists, such as Multus. |
 | `--bridge-name` | `cbr0` | Bridge interface name. |
 | `--mtu` | `1280` | MTU for tunnel and bridge interfaces. |
 

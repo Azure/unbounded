@@ -295,6 +295,29 @@ func TestWriteCNIConfigRefusesNonEmptyDir(t *testing.T) {
 	}
 }
 
+func TestWriteCNIConfigAllowsCoexistence(t *testing.T) {
+	confDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(confDir, "00-multus.conflist"), []byte(`{"cniVersion":"0.4.0"}`), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	cfg := &config{
+		CNIConfDir:                confDir,
+		CNIConfFile:               "10-unbounded.conflist",
+		AllowCNIConfigCoexistence: true,
+		BridgeName:                "cbr0",
+		MTU:                       1400,
+	}
+
+	if err := writeCNIConfig(cfg, []string{"10.244.0.0/24"}); err != nil {
+		t.Fatalf("expected CNI config coexistence to allow writing, got %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(confDir, cfg.CNIConfFile)); err != nil {
+		t.Fatalf("expected unbounded CNI config to be written: %v", err)
+	}
+}
+
 // TestWaitForPodCIDRsAndConfigureExistingCNIFatal tests that
 // waitForPodCIDRsAndConfigure returns immediately (without retrying)
 // when the CNI conf directory already contains files.

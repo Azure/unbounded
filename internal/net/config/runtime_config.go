@@ -58,13 +58,14 @@ type ControllerLeaderElectionYAML struct {
 
 // NodeRuntimeConfig contains node-agent runtime settings.
 type NodeRuntimeConfig struct {
-	InformerResyncPeriod string `yaml:"informerResyncPeriod"`
-	NodeName             string `yaml:"nodeName"`
-	CNIConfDir           string `yaml:"cniConfDir"`
-	CNIConfFile          string `yaml:"cniConfFile"`
-	BridgeName           string `yaml:"bridgeName"`
-	WireGuardDir         string `yaml:"wireGuardDir"`
-	WireGuardPort        *int   `yaml:"wireGuardPort"`
+	InformerResyncPeriod      string `yaml:"informerResyncPeriod"`
+	NodeName                  string `yaml:"nodeName"`
+	CNIConfDir                string `yaml:"cniConfDir"`
+	CNIConfFile               string `yaml:"cniConfFile"`
+	AllowCNIConfigCoexistence *bool  `yaml:"allowCNIConfigCoexistence"`
+	BridgeName                string `yaml:"bridgeName"`
+	WireGuardDir              string `yaml:"wireGuardDir"`
+	WireGuardPort             *int   `yaml:"wireGuardPort"`
 	// Deprecated: EnablePolicyRouting enables connmark/fwmark/ip-rule policy
 	// routing on gateway interfaces. Replaced by the UNBOUNDED-FORWARD chain.
 	// Defaults to false; retained for backward compatibility.
