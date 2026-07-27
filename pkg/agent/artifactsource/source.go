@@ -17,6 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/pkg/agent/internal/ociartifact"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
@@ -29,9 +32,57 @@ const (
 	sourceOCI
 )
 
+const (
+	httpDownloadMaxAttempts = 5
+	httpDownloadRetryDelay  = 2 * time.Second
+)
+
 var httpClient = &http.Client{
 	Timeout:       10 * time.Minute,
 	CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
+	Transport: &retry.Transport{
+		Policy: newHTTPDownloadRetryPolicy,
+	},
+}
+
+func newHTTPDownloadRetryPolicy() retry.Policy {
+	return &retry.GenericPolicy{
+		Retryable: retryHTTPDownloadFailure,
+		Backoff:   httpDownloadBackoff,
+		MinWait:   httpDownloadRetryDelay,
+		MaxWait:   maxHTTPDownloadRetryDelay(),
+		MaxRetry:  httpDownloadMaxAttempts - 1,
+	}
+}
+
+func retryHTTPDownloadFailure(resp *http.Response, err error) (bool, error) {
+	if ociutil.RetryableNetworkError(err) {
+		return true, nil
+	}
+
+	if resp == nil {
+		return false, nil
+	}
+
+	return retry.DefaultPredicate(resp, nil)
+}
+
+func httpDownloadBackoff(attempt int, _ *http.Response) time.Duration {
+	delay := httpDownloadRetryDelay
+	for range attempt {
+		delay *= 2
+	}
+
+	return delay
+}
+
+func maxHTTPDownloadRetryDelay() time.Duration {
+	delay := httpDownloadRetryDelay
+	for range httpDownloadMaxAttempts - 2 {
+		delay *= 2
+	}
+
+	return delay
 }
 
 // Source is a parsed, openable artifact source. It can reference an absolute

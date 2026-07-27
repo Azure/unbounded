@@ -5,15 +5,20 @@ package artifactsource
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	"oras.land/oras-go/v2/registry/remote/retry"
 )
 
 func TestParseRedactsInvalidURL(t *testing.T) {
@@ -38,6 +43,78 @@ func TestSourceOpenHTTPSURL(t *testing.T) {
 	got, err := io.ReadAll(body)
 	require.NoError(t, err)
 	require.Equal(t, "artifact-data", string(got))
+}
+
+func TestHTTPClientUsesRetryTransport(t *testing.T) {
+	t.Parallel()
+
+	transport, ok := httpClient.Transport.(*retry.Transport)
+	require.Truef(t, ok, "httpClient.Transport = %T, want *retry.Transport", httpClient.Transport)
+	require.NotNil(t, transport.Policy)
+}
+
+func TestHTTPDownloadRetryPolicyRetriesTransportErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []error{
+		&net.DNSError{
+			Err:        "no such host",
+			Name:       "artifacts.example.test",
+			IsNotFound: true,
+		},
+		&net.OpError{
+			Op:  "dial",
+			Err: syscall.ECONNREFUSED,
+		},
+	}
+
+	for _, transportErr := range tests {
+		delay, err := newHTTPDownloadRetryPolicy().Retry(0, nil, transportErr)
+		require.NoError(t, err)
+		require.Equal(t, httpDownloadRetryDelay, delay)
+	}
+}
+
+func TestHTTPDownloadRetryPolicySkipsPermanentFailures(t *testing.T) {
+	t.Parallel()
+
+	tests := []error{
+		errors.New("tls: failed to verify certificate"),
+		context.Canceled,
+	}
+
+	for _, transportErr := range tests {
+		delay, err := newHTTPDownloadRetryPolicy().Retry(0, nil, transportErr)
+		require.NoError(t, err)
+		require.Negative(t, delay)
+	}
+}
+
+func TestHTTPDownloadRetryPolicyUsesORASStatusPredicate(t *testing.T) {
+	t.Parallel()
+
+	policy := newHTTPDownloadRetryPolicy()
+
+	delay, err := policy.Retry(0, &http.Response{StatusCode: http.StatusServiceUnavailable}, nil)
+	require.NoError(t, err)
+	require.Equal(t, httpDownloadRetryDelay, delay)
+
+	delay, err = policy.Retry(0, &http.Response{StatusCode: http.StatusNotFound}, nil)
+	require.NoError(t, err)
+	require.Negative(t, delay)
+}
+
+func TestHTTPDownloadRetryPolicyStopsAfterMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	delay, err := newHTTPDownloadRetryPolicy().Retry(httpDownloadMaxAttempts-1, nil, &net.DNSError{
+		Err:        "no such host",
+		Name:       "artifacts.example.test",
+		IsNotFound: true,
+	})
+	require.NoError(t, err)
+	require.Negative(t, delay)
+	require.Equal(t, 16*time.Second, maxHTTPDownloadRetryDelay())
 }
 
 func TestSourceOpenHTTPErrorRedactsQuery(t *testing.T) {
