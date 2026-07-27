@@ -35,6 +35,24 @@ func TestConfigureContainerdWritesGantryHostsConfig(t *testing.T) {
 	require.Equal(t, os.FileMode(0o644), info.Mode().Perm())
 }
 
+func TestConfigureContainerdEnablesDeviceOwnershipFromSecurityContext(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	goalState := &goalstates.NodeStart{
+		MachineDir: machineDir,
+		Containerd: goalstates.ResolveContainerd(""),
+	}
+
+	require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
+
+	path := filepath.Join(machineDir, goalstates.ContainerdConfigPath)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(data), `[plugins.'io.containerd.cri.v1.runtime']
+device_ownership_from_security_context = true`)
+}
+
 func TestConfigureContainerdUpdatesManagedGantryHostsConfig(t *testing.T) {
 	t.Parallel()
 
