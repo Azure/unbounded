@@ -2635,8 +2635,18 @@ curl --silent --fail --noproxy '*' http://169.254.10.11:8181/ready | grep -q OK
 """)
     ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.10/32'")
     ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.11/32'")
-    ssh_cmd("test \"$(sudo iptables -w -t raw -S OUTPUT | grep -c 'unbounded-localdns: skip conntrack')\" -eq 4")
-    ssh_cmd("test \"$(sudo iptables -w -t raw -S PREROUTING | grep -c 'unbounded-localdns: skip conntrack')\" -eq 4")
+    ssh_cmd("""
+set -e
+for chain in OUTPUT PREROUTING; do
+  for address in 169.254.10.10 169.254.10.11; do
+    for protocol in tcp udp; do
+      sudo iptables -w -t raw -C "${chain}" \
+        -m comment --comment 'unbounded-localdns: skip conntrack' \
+        -p "${protocol}" -d "${address}" --dport 53 -j NOTRACK
+    done
+  done
+done
+""")
     ssh_cmd(f"curl --silent --fail --noproxy '*' http://{expected_node_ip(node_config)}:9253/metrics | grep -q '^coredns_build_info'")
     log("nspawn LocalDNS validation passed")
 
