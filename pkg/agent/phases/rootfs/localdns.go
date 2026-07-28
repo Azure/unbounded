@@ -54,6 +54,10 @@ func (c *configureLocalDNS) Do(ctx context.Context) error {
 	machineDir := c.goalState.MachineDir
 
 	localDNSDir := filepath.Join(machineDir, "etc/unbounded/localdns")
+	if err := ensureWorldExecutableDir(localDNSDir); err != nil {
+		return fmt.Errorf("create LocalDNS config directory: %w", err)
+	}
+
 	if err := utilio.WriteFile(filepath.Join(localDNSDir, "Corefile"), c.goalState.LocalDNS.Corefile, 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS Corefile: %w", err)
 	}
@@ -72,7 +76,12 @@ func (c *configureLocalDNS) Do(ctx context.Context) error {
 		return fmt.Errorf("write LocalDNS environment: %w", err)
 	}
 
-	if err := utilio.WriteFile(filepath.Join(machineDir, strings.TrimPrefix(goalstates.LocalDNSSupervisorPath, "/")), localDNSSupervisor, 0o755); err != nil {
+	supervisorPath := filepath.Join(machineDir, strings.TrimPrefix(goalstates.LocalDNSSupervisorPath, "/"))
+	if err := ensureWorldExecutableDir(filepath.Dir(supervisorPath)); err != nil {
+		return fmt.Errorf("create LocalDNS supervisor directory: %w", err)
+	}
+
+	if err := utilio.WriteFile(supervisorPath, localDNSSupervisor, 0o755); err != nil {
 		return fmt.Errorf("write LocalDNS supervisor: %w", err)
 	}
 
@@ -111,6 +120,10 @@ func (c *configureLocalDNS) Do(ctx context.Context) error {
 
 func (c *configureLocalDNS) installCoreDNS(ctx context.Context) error {
 	destination := filepath.Join(c.goalState.MachineDir, strings.TrimPrefix(goalstates.LocalDNSCoreDNSBinaryPath, "/"))
+	if err := ensureWorldExecutableDir(filepath.Dir(destination)); err != nil {
+		return fmt.Errorf("create CoreDNS binary directory: %w", err)
+	}
+
 	override := coreDNSDownloadSource(c.goalState)
 
 	source, err := artifactsource.Parse(agentartifacts.CoreDNSArchive(override, c.goalState.LocalDNS.CoreDNSVersion, c.goalState.HostArch))
@@ -196,6 +209,14 @@ func (c *configureLocalDNS) installCoreDNS(ctx context.Context) error {
 	c.log.Info("installed CoreDNS", "version", c.goalState.LocalDNS.CoreDNSVersion)
 
 	return nil
+}
+
+func ensureWorldExecutableDir(path string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+
+	return os.Chmod(path, 0o755)
 }
 
 func coreDNSDownloadSource(rootFS *goalstates.RootFS) *goalstates.DownloadSource {
