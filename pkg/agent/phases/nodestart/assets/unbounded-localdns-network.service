@@ -6,4 +6,3 @@ Before=systemd-nspawn@{{.MachineName}}.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/libexec/unbounded-localdns-network
-RemainAfterExit=yes
