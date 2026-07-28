@@ -541,6 +541,30 @@ type AgentSpec struct {
 	// artifact from its upstream default host.
 	// +optional
 	Downloads *AgentDownloadsSpec `json:"downloads,omitempty"`
+
+	// LocalDNS configures the optional CoreDNS cache inside the nspawn machine.
+	// +optional
+	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
+}
+
+// LocalDNSSpec configures machine-local CoreDNS.
+type LocalDNSSpec struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// +optional
+	NodeListenerIP string `json:"nodeListenerIP,omitempty"`
+	// +optional
+	ClusterListenerIP string `json:"clusterListenerIP,omitempty"`
+	// +optional
+	MetricsAddress string `json:"metricsAddress,omitempty"`
+	// +optional
+	CPULimitInMilliCores *int32 `json:"cpuLimitInMilliCores,omitempty"`
+	// +optional
+	MemoryLimitInMB *int32 `json:"memoryLimitInMB,omitempty"`
+	// +optional
+	RequiredPlugins []string `json:"requiredPlugins,omitempty"`
+	// +optional
+	CorefileTemplate string `json:"corefileTemplate,omitempty"`
 }
 
 // AgentDownloadsSpec overrides the download sources for the artifacts the
@@ -571,6 +595,10 @@ type AgentDownloadsSpec struct {
 	// (upstream default: https://github.com/kubernetes-sigs/cri-tools).
 	// +optional
 	Crictl *DownloadSource `json:"crictl,omitempty"`
+
+	// CoreDNS overrides the download source for CoreDNS.
+	// +optional
+	CoreDNS *DownloadSource `json:"coreDNS,omitempty"`
 }
 
 // DownloadSource configures an override for a binary download source.

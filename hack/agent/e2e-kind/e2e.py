@@ -595,6 +595,7 @@ class NodeConfig:
     block_external_network: bool = False
     additional_host_mounts: tuple[dict[str, Any], ...] = ()
     additional_host_devices: tuple[str, ...] = ()
+    local_dns: bool = False
     path: str = ""
 
 
@@ -635,6 +636,7 @@ def load_node_config(
     block_external_network = cfg.get("blockExternalNetwork", False)
     additional_host_mounts = cfg.get("additionalHostMounts", [])
     additional_host_devices = cfg.get("additionalHostDevices", [])
+    local_dns = cfg.get("localDNS", False)
 
     if not isinstance(name, str) or not name:
         die(f"node config {config_path} field 'name' must be a non-empty string")
@@ -668,6 +670,8 @@ def load_node_config(
             f"node config {config_path} field 'additionalHostMounts' must be a list of objects "
             f"with string 'source', optional string 'target', and optional bool 'readOnly'"
         )
+    if not isinstance(local_dns, bool):
+        die(f"node config {config_path} field 'localDNS' must be a boolean")
     if not isinstance(additional_host_devices, list) or not all(
         isinstance(d, str) and d for d in additional_host_devices
     ):
@@ -687,6 +691,7 @@ def load_node_config(
         block_external_network=block_external_network,
         additional_host_mounts=tuple(dict(m) for m in additional_host_mounts),
         additional_host_devices=tuple(additional_host_devices),
+        local_dns=local_dns,
         path=str(config_path),
     )
 
@@ -731,6 +736,8 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     args: list[str] = []
     if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
+    if node_config.local_dns:
+        args.append("--local-dns")
     for key, value in sorted(expected_node_labels(node_config).items()):
         args.extend(["--node-label", f"{key}={value}"])
     for taint in expected_node_taint_strings(node_config):
@@ -1990,6 +1997,7 @@ def offline_artifact_manifest(kube_version: str, container_images: list[str] | N
             "runc": "1.5.0",
             "cni": "1.5.1",
             "crictl": _crictl_version_for_kubernetes(kube_version),
+            "coredns": "1.12.3",
         },
     }
     if container_images is not None:
@@ -2547,6 +2555,7 @@ def validate_node_config(node_config: NodeConfig) -> None:
     validate_offline_bootstrap_config(node_config)
     validate_additional_host_mounts_config(node_config)
     validate_additional_host_devices_config(node_config)
+    validate_local_dns_config(node_config)
 
     log("============================================")
     log("  Node config validation PASSED")
@@ -2608,6 +2617,28 @@ PY
         die(f"kubelet service does not reference generated config: {service}")
 
     log("Kubelet configuration overlay validated")
+
+
+def validate_local_dns_config(node_config: NodeConfig) -> None:
+    """Verify LocalDNS service, listeners, resolver wiring, metrics, and NOTRACK rules."""
+    if not node_config.local_dns:
+        return
+
+    log("Validating nspawn LocalDNS...")
+    machine = active_nspawn_machine()
+    machine_shell(machine, """
+systemctl is-active --quiet localdns.service
+grep -qx 'nameserver 169.254.10.10' /etc/resolv.conf
+grep -q -- '--cluster-dns=169.254.10.11' /etc/systemd/system/kubelet.service.d/20-node-config.conf
+curl --silent --fail --noproxy '*' http://169.254.10.10:8181/ready | grep -q OK
+curl --silent --fail --noproxy '*' http://169.254.10.11:8181/ready | grep -q OK
+""")
+    ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.10/32'")
+    ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.11/32'")
+    ssh_cmd("test \"$(sudo iptables -w -t raw -S OUTPUT | grep -c 'unbounded-localdns: skip conntrack')\" -eq 4")
+    ssh_cmd("test \"$(sudo iptables -w -t raw -S PREROUTING | grep -c 'unbounded-localdns: skip conntrack')\" -eq 4")
+    ssh_cmd(f"curl --silent --fail --noproxy '*' http://{expected_node_ip(node_config)}:9253/metrics | grep -q '^coredns_build_info'")
+    log("nspawn LocalDNS validation passed")
 
 
 def validate_offline_bootstrap_config(node_config: NodeConfig) -> None:
@@ -2851,11 +2882,23 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
     ):
         _run_scenario_command(command, node_config, env)
 
-    for command in (
-        "validate-workload",
-        "validate-node-repave-upgrade",
-    ):
-        _run_scenario_command(command, node_config, env)
+    if node_config.local_dns:
+        _run_scenario_command("validate-node-reboot-operation", node_config, env)
+        _run_scenario_command("validate-node-config", node_config, env)
+
+    _run_scenario_command("validate-workload", node_config, env)
+    _run_scenario_command("validate-node-repave-upgrade", node_config, env)
+    if node_config.local_dns:
+        _run_scenario_command("validate-node-config", node_config, env)
+        _run_scenario_command("reset-agent", node_config, env)
+        child_env = {**os.environ, **env}
+        subprocess.run(
+            ["ssh", *SSH_OPTS, f"{VM_SSH_USER}@{env['VM_IP']}",
+             "test ! -e /sys/class/net/localdns && "
+             "! sudo iptables -w -t raw -S | grep -q 'unbounded-localdns: skip conntrack'"],
+            check=True,
+            env=child_env,
+        )
 
     log(f"Agent config scenario {name!r} passed")
 

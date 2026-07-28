@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -55,6 +56,23 @@ func (d *disableResolved) Do(_ context.Context) error {
 	hostResolvConf, err := os.ReadFile("/etc/resolv.conf")
 	if err != nil {
 		return fmt.Errorf("read host /etc/resolv.conf: %w", err)
+	}
+
+	if d.goalState.LocalDNS.Enabled {
+		var lines []string
+
+		for _, line := range strings.Split(string(hostResolvConf), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "nameserver ") {
+				continue
+			}
+
+			if line != "" {
+				lines = append(lines, line)
+			}
+		}
+
+		lines = append(lines, "nameserver "+d.goalState.LocalDNS.NodeListenerIP.String())
+		hostResolvConf = []byte(strings.Join(lines, "\n") + "\n")
 	}
 
 	dest := filepath.Join(d.goalState.MachineDir, "etc/resolv.conf")

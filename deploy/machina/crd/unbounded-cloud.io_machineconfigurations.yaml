@@ -144,6 +144,31 @@ spec:
                           Image is the OCI image reference used for provisioning the
                           nspawn machine (e.g. "ghcr.io/org/repo:tag").
                         type: string
+                      localDNS:
+                        description: LocalDNS configures the optional CoreDNS cache
+                          for this version.
+                        properties:
+                          clusterListenerIP:
+                            type: string
+                          corefileTemplate:
+                            type: string
+                          cpuLimitInMilliCores:
+                            format: int32
+                            type: integer
+                          enabled:
+                            type: boolean
+                          memoryLimitInMB:
+                            format: int32
+                            type: integer
+                          metricsAddress:
+                            type: string
+                          nodeListenerIP:
+                            type: string
+                          requiredPlugins:
+                            items:
+                              type: string
+                            type: array
+                        type: object
                     required:
                     - image
                     type: object
