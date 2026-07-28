@@ -179,7 +179,7 @@ func openHTTP(ctx context.Context, source string) (io.ReadCloser, error) {
 }
 
 func openHTTPWithClient(ctx context.Context, client *http.Client, source string) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", utilio.RedactHTTPError(err))
 	}
