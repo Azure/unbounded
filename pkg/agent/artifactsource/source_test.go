@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -43,6 +44,38 @@ func TestSourceOpenHTTPSURL(t *testing.T) {
 	got, err := io.ReadAll(body)
 	require.NoError(t, err)
 	require.Equal(t, "artifact-data", string(got))
+}
+
+func TestDownloadToLocalFileRetriesInterruptedHTTPBody(t *testing.T) {
+	t.Parallel()
+
+	const content = "artifact-data"
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "13")
+
+		if attempts.Add(1) == 1 {
+			_, _ = w.Write([]byte("partial"))
+
+			return
+		}
+
+		_, _ = w.Write([]byte(content))
+	}))
+	defer server.Close()
+
+	source, err := Parse(server.URL + "/artifact")
+	require.NoError(t, err)
+
+	dest := filepath.Join(t.TempDir(), "artifact")
+	require.NoError(t, source.DownloadToLocalFile(t.Context(), dest, 0o644))
+	require.EqualValues(t, 2, attempts.Load())
+
+	got, err := os.ReadFile(dest)
+	require.NoError(t, err)
+	require.Equal(t, content, string(got))
 }
 
 func TestHTTPClientUsesRetryTransport(t *testing.T) {
@@ -115,6 +148,17 @@ func TestHTTPDownloadRetryPolicyStopsAfterMaxAttempts(t *testing.T) {
 	require.NoError(t, err)
 	require.Negative(t, delay)
 	require.Equal(t, 16*time.Second, maxHTTPDownloadRetryDelay())
+}
+
+func TestRetryableHTTPBodyReadErrorHandlesClientTimeout(t *testing.T) {
+	t.Parallel()
+
+	timeoutErr := &url.Error{Op: http.MethodGet, URL: "https://artifacts.example.test/artifact", Err: context.DeadlineExceeded}
+	require.True(t, retryableHTTPBodyReadError(context.Background(), timeoutErr))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.False(t, retryableHTTPBodyReadError(ctx, timeoutErr))
 }
 
 func TestSourceOpenHTTPErrorRedactsQuery(t *testing.T) {

@@ -8,8 +8,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -199,15 +201,20 @@ func openHTTPWithClient(ctx context.Context, client *http.Client, source string)
 
 // ReadAll reads the complete artifact source.
 func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
-	body, err := s.Open(ctx)
+	var data []byte
+
+	err := s.readWithRetry(ctx, func(body io.Reader) error {
+		var err error
+
+		data, err = io.ReadAll(body)
+		if err != nil {
+			return fmt.Errorf("read artifact source: %w", err)
+		}
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	defer body.Close() //nolint:errcheck // best effort close
-
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return nil, fmt.Errorf("read artifact source: %w", err)
 	}
 
 	return data, nil
@@ -215,52 +222,109 @@ func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
 
 // DownloadToLocalFile downloads the artifact source to filename and sets perm.
 func (s Source) DownloadToLocalFile(ctx context.Context, filename string, perm os.FileMode) error {
-	body, err := s.Open(ctx)
-	if err != nil {
-		return err
-	}
-	defer body.Close() //nolint:errcheck // body close
-
-	return utilio.InstallFile(filename, body, perm)
+	return s.readWithRetry(ctx, func(body io.Reader) error {
+		return utilio.InstallFile(filename, body, perm)
+	})
 }
 
 // DownloadWithSHA256Verification downloads the artifact source to filename and
 // verifies the downloaded content against expectedHash.
 func (s Source) DownloadWithSHA256Verification(ctx context.Context, expectedHash, filename string, perm os.FileMode) error {
-	body, err := s.Open(ctx)
-	if err != nil {
-		return err
-	}
-	defer body.Close() //nolint:errcheck // body close
+	return s.readWithRetry(ctx, func(body io.Reader) error {
+		hasher := sha256.New()
+		teeReader := io.TeeReader(body, hasher)
 
-	hasher := sha256.New()
-	teeReader := io.TeeReader(body, hasher)
+		if err := utilio.InstallFile(filename, teeReader, perm); err != nil {
+			return err
+		}
 
-	if err := utilio.InstallFile(filename, teeReader, perm); err != nil {
-		return err
-	}
+		actualHash := hex.EncodeToString(hasher.Sum(nil))
+		if actualHash != expectedHash {
+			_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
+			return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", utilio.RedactURLQuery(s.raw), expectedHash, actualHash)
+		}
 
-	actualHash := hex.EncodeToString(hasher.Sum(nil))
-	if actualHash != expectedHash {
-		_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
-		return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", utilio.RedactURLQuery(s.raw), expectedHash, actualHash)
+		return nil
+	})
+}
+
+func (s Source) readWithRetry(ctx context.Context, read func(io.Reader) error) error {
+	delay := httpDownloadRetryDelay
+
+	for attempt := 1; attempt <= httpDownloadMaxAttempts; attempt++ {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+
+		body, err := s.Open(ctx)
+		if err != nil {
+			return err
+		}
+
+		err = read(body)
+		_ = body.Close() //nolint:errcheck // best effort close before retrying
+
+		if err == nil {
+			return nil
+		}
+
+		if s.kind != sourceHTTP || !retryableHTTPBodyReadError(ctx, err) || attempt == httpDownloadMaxAttempts {
+			return err
+		}
+
+		if err := waitForHTTPDownloadRetry(ctx, delay); err != nil {
+			return err
+		}
+
+		delay *= 2
 	}
 
 	return nil
 }
 
+func retryableHTTPBodyReadError(ctx context.Context, err error) bool {
+	if context.Cause(ctx) != nil {
+		return false
+	}
+
+	if ociutil.RetryableNetworkError(err) {
+		return true
+	}
+
+	var netErr net.Error
+
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func waitForHTTPDownloadRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
 // ReadExpectedSHA256 reads a sha256sum-format checksum source and returns the
 // expected hex-encoded SHA256 hash.
 func ReadExpectedSHA256(ctx context.Context, checksumSource Source) (string, error) {
-	body, err := checksumSource.Open(ctx)
+	var raw []byte
+
+	err := checksumSource.readWithRetry(ctx, func(body io.Reader) error {
+		var err error
+
+		raw, err = io.ReadAll(io.LimitReader(body, 1024))
+		if err != nil {
+			return fmt.Errorf("read checksum body: %w", err)
+		}
+
+		return nil
+	})
 	if err != nil {
 		return "", err
-	}
-	defer body.Close() //nolint:errcheck // body close
-
-	raw, err := io.ReadAll(io.LimitReader(body, 1024))
-	if err != nil {
-		return "", fmt.Errorf("read checksum body: %w", err)
 	}
 
 	hashStr := strings.TrimSpace(string(raw))
