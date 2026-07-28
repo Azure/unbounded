@@ -2901,14 +2901,21 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
     if node_config.local_dns:
         _run_scenario_command("validate-node-config", node_config, env)
         _run_scenario_command("reset-agent", node_config, env)
-        child_env = {**os.environ, **env}
-        subprocess.run(
-            ["ssh", *SSH_OPTS, f"{VM_SSH_USER}@{env['VM_IP']}",
-             "test ! -e /sys/class/net/localdns && "
-             "! sudo iptables -w -t raw -S | grep -q 'unbounded-localdns: skip conntrack'"],
-            check=True,
-            env=child_env,
+        cleanup_check = (
+            "test ! -e /sys/class/net/localdns && "
+            "! sudo iptables -w -t raw -S | grep -q 'unbounded-localdns: skip conntrack'"
         )
+        deadline = time.monotonic() + 60
+        while True:
+            result = ssh_capture_quiet(cleanup_check)
+            if result.returncode == 0:
+                break
+            if time.monotonic() >= deadline:
+                die(
+                    "LocalDNS host state remained after reset: "
+                    f"rc={result.returncode}, stderr={result.stderr.strip()}"
+                )
+            time.sleep(2)
 
     log(f"Agent config scenario {name!r} passed")
 
