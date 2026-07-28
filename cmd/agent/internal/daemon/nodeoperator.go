@@ -164,6 +164,10 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if !reflect.DeepEqual(applied.LocalDNS, desired.LocalDNS) {
+		return true
+	}
+
 	return false
 }
 

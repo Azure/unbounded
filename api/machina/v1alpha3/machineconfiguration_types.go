@@ -135,6 +135,10 @@ type MachineConfigurationAgent struct {
 	// nspawn machine (e.g. "ghcr.io/org/repo:tag").
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
+
+	// LocalDNS configures the optional CoreDNS cache for this version.
+	// +optional
+	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
 }
 
 // MachineConfigurationUpdateStrategyType defines how configuration

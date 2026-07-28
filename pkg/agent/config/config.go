@@ -40,12 +40,13 @@ type AgentConfig struct {
 	// once. Resolution prefers an explicitly configured value, then a valid
 	// host hostname, then MachineName. Explicit and resolved values must be
 	// valid Kubernetes DNS subdomains.
-	NodeName string             `json:"NodeName,omitempty"`
-	Cluster  AgentClusterConfig `json:"Cluster"`
-	Kubelet  AgentKubeletConfig `json:"Kubelet"`
-	CRI      CRIConfig          `json:"CRI"`
-	CNI      CNIConfig          `json:"CNI"`
-	Gantry   *GantryConfig      `json:"Gantry,omitempty"`
+	NodeName string               `json:"NodeName,omitempty"`
+	Cluster  AgentClusterConfig   `json:"Cluster"`
+	Kubelet  AgentKubeletConfig   `json:"Kubelet"`
+	CRI      CRIConfig            `json:"CRI"`
+	CNI      CNIConfig            `json:"CNI"`
+	Gantry   *GantryConfig        `json:"Gantry,omitempty"`
+	LocalDNS *AgentLocalDNSConfig `json:"LocalDNS,omitempty"`
 
 	// OCIImage is an OCI registry reference, local OCI layout, or HTTPS URL
 	// to a tarred OCI image layout used to bootstrap the machine rootfs. HTTPS
@@ -175,6 +176,8 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
 	}
 
+	out.LocalDNS = a.LocalDNS.DeepCopy()
+
 	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 
 	return &out
@@ -209,6 +212,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateAdditionalHostMounts(a.AdditionalHostMounts); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := a.LocalDNS.Validate(a.Cluster.ClusterDNS, a.Kubelet.NodeIP); err != nil {
 		errs = append(errs, err)
 	}
 

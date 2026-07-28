@@ -147,6 +147,9 @@ func applyMachineConfigurationTemplate(
 
 	if template.Agent != nil {
 		cfg.OCIImage = template.Agent.Image
+		if template.Agent.LocalDNS != nil {
+			cfg.LocalDNS = provision.LocalDNSFromSpec(template.Agent.LocalDNS)
+		}
 	}
 }
 

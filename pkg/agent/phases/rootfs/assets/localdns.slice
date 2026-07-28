@@ -1,0 +1,6 @@
+[Unit]
+Description=Unbounded LocalDNS resource limits
+
+[Slice]
+CPUQuota={{.CPUQuota}}
+MemoryMax={{.MemoryMax}}M

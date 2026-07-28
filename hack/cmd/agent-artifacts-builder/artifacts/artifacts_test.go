@@ -30,6 +30,7 @@ func TestNewPlan(t *testing.T) {
 				Runc:       "1.5.0",
 				CNI:        "1.5.1",
 				Crictl:     "1.34.0",
+				CoreDNS:    "1.12.3",
 			},
 		},
 		Architectures: []string{"amd64"},
@@ -44,6 +45,7 @@ func TestNewPlan(t *testing.T) {
 			Runc:       "1.5.0",
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
+			CoreDNS:    "1.12.3",
 		},
 		ContainerImages: []string{},
 	}, plan.Manifest)
@@ -59,11 +61,14 @@ func TestNewPlan(t *testing.T) {
 	runc := artifactsByPath["runc/v1.5.0/runc.amd64"]
 	cni := artifactsByPath["cni/v1.5.1/cni-plugins-linux-amd64-v1.5.1.tgz"]
 	crictl := artifactsByPath["crictl/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz"]
+	coreDNS := artifactsByPath["coredns/v1.12.3/bin/linux/amd64/coredns"]
 
 	require.True(t, containerd.GenerateChecksum)
 	require.True(t, runc.GenerateChecksum)
 	require.True(t, cni.GenerateChecksum)
 	require.True(t, crictl.GenerateChecksum)
+	require.True(t, coreDNS.GenerateChecksum)
+	require.Equal(t, "coredns", coreDNS.ExtractFile)
 	require.Equal(t,
 		"https://dl.k8s.io/v1.34.2/bin/linux/amd64/kubelet",
 		artifactsByPath["kubernetes/v1.34.2/bin/linux/amd64/kubelet"].URL,
@@ -97,6 +102,7 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 			Runc:       "1.5.0",
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
+			CoreDNS:    "1.12.3",
 		},
 		ContainerImages: agentartifacts.DefaultContainerImages("v1.34.2"),
 	}, plan.Manifest)

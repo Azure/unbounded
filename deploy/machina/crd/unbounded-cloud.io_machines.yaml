@@ -124,6 +124,29 @@ spec:
                               agent's compiled-in defaults.
                             type: string
                         type: object
+                      coreDNS:
+                        description: CoreDNS overrides the download source for CoreDNS.
+                        properties:
+                          baseURL:
+                            description: |-
+                              BaseURL replaces the upstream host + path prefix used to
+                              construct the download URL. Version and arch substitution are
+                              preserved so mirrors need to publish assets under the same
+                              layout as the upstream project.
+                            type: string
+                          url:
+                            description: |-
+                              URL is a fully qualified download URL template. Version/arch
+                              substitution via fmt directives is preserved. When set it
+                              overrides BaseURL entirely.
+                            type: string
+                          version:
+                            description: |-
+                              Version overrides the version of the artifact that would
+                              otherwise be derived from the cluster Kubernetes version or the
+                              agent's compiled-in defaults.
+                            type: string
+                        type: object
                       crictl:
                         description: |-
                           Crictl overrides the download source for crictl
@@ -206,6 +229,31 @@ spec:
                       nspawn machine (e.g. "ghcr.io/org/repo:tag"). When empty the
                       agent falls back to its built-in default image.
                     type: string
+                  localDNS:
+                    description: LocalDNS configures the optional CoreDNS cache inside
+                      the nspawn machine.
+                    properties:
+                      clusterListenerIP:
+                        type: string
+                      corefileTemplate:
+                        type: string
+                      cpuLimitInMilliCores:
+                        format: int32
+                        type: integer
+                      enabled:
+                        type: boolean
+                      memoryLimitInMB:
+                        format: int32
+                        type: integer
+                      metricsAddress:
+                        type: string
+                      nodeListenerIP:
+                        type: string
+                      requiredPlugins:
+                        items:
+                          type: string
+                        type: array
+                    type: object
                   url:
                     description: |-
                       URL is a fully qualified download URL for the unbounded-agent

@@ -25,6 +25,7 @@ var debianRequiredPackages = []string{
 	"systemd-container",
 	"curl",
 	"nftables",
+	"iptables",
 	"util-linux",
 }
 
@@ -33,6 +34,7 @@ var rpmRequiredPackages = []string{
 	"systemd-container",
 	"curl",
 	"nftables",
+	"iptables",
 	"util-linux",
 }
 

@@ -52,4 +52,13 @@ for command usage, exit behavior, and the current check list.
 | `Kubelet.RegisterWithTaints` | Taints applied to the Node on registration (`key=value:effect`). |
 | `OCIImage` | *(optional)* OCI registry reference, `oci-layout://` directory, or HTTPS URL to a tarred OCI image layout. Uses the built-in default image when empty. The agent automatically selects the archive's single tagged image reference. HTTPS URLs may include signed query strings such as Azure Blob SAS parameters. |
 | `OfflineArtifacts.Source` | *(optional)* Complete bootstrap artifact source. Accepts an absolute directory, `file://` directory, `oci://` artifact reference, or HTTPS tar/tar.gz archive. HTTPS archives are downloaded and extracted into the host artifact cache, and their URLs may include signed query strings such as Azure Blob SAS parameters. |
+| `LocalDNS.Enabled` | *(optional)* Runs a CoreDNS cache inside the nspawn machine and configures machine and ClusterFirst DNS through separate link-local listeners. |
+| `LocalDNS.NodeListenerIP` | *(optional)* Listener used by machine services and Default-policy pods. Defaults to `169.254.10.10`. |
+| `LocalDNS.ClusterListenerIP` | *(optional)* Listener supplied to kubelet for ClusterFirst pods. Defaults to `169.254.10.11`. |
+| `LocalDNS.MetricsAddress` | *(optional)* Native CoreDNS Prometheus bind address. Defaults to the configured IPv4 `Kubelet.NodeIP` on port `9253`; required when no IPv4 node IP is configured. |
+| `LocalDNS.CPULimitInMilliCores` | *(optional)* CoreDNS slice CPU quota. Defaults to `2000`. |
+| `LocalDNS.MemoryLimitInMB` | *(optional)* CoreDNS slice memory limit. Defaults to `128`. |
+| `LocalDNS.RequiredPlugins` | *(optional)* Additional plugins that the selected binary must report through `coredns -plugins`. |
+| `LocalDNS.CorefileTemplate` | *(optional)* Full replacement Go template for the Corefile. Empty uses the built-in two-listener template. |
+| `Downloads.CoreDNS` | *(optional)* CoreDNS URL, BaseURL, and version override. The offline manifest `versions.coredns` takes precedence when offline artifacts are configured. |
 | `Attest.URL` | *(optional)* Base URL of a metalman serve-pxe instance for TPM attestation. |
