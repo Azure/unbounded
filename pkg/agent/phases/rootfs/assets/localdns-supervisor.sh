@@ -17,23 +17,11 @@ trap shutdown EXIT INT TERM
 /usr/local/bin/coredns -conf "${corefile}" &
 coredns_pid=$!
 
-dns_health() {
-    local address=$1
-    timeout 3 bash -c '
-        exec 3<>/dev/udp/$1/53
-        printf "\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x0c health-check" | tr -d " " >&3
-        printf "\\x08localdns\\x05local\\x00\\x00\\x01\\x00\\x01" >&3
-        test "$(dd bs=1 count=12 <&3 2>/dev/null | wc -c)" -eq 12
-    ' _ "${address}"
-}
-
 ready() {
     curl --silent --fail --noproxy '*' --connect-timeout 2 --max-time 3 \
         "http://${node_listener}:8181/ready" >/dev/null &&
     curl --silent --fail --noproxy '*' --connect-timeout 2 --max-time 3 \
-        "http://${cluster_listener}:8181/ready" >/dev/null &&
-    dns_health "${node_listener}" &&
-    dns_health "${cluster_listener}"
+        "http://${cluster_listener}:8181/ready" >/dev/null
 }
 
 for _ in $(seq 1 60); do
