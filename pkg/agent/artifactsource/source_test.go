@@ -69,13 +69,53 @@ func TestDownloadToLocalFileRetriesInterruptedHTTPBody(t *testing.T) {
 	source, err := Parse(server.URL + "/artifact")
 	require.NoError(t, err)
 
+	var delays []time.Duration
+
+	wait := func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+
+		return nil
+	}
+
 	dest := filepath.Join(t.TempDir(), "artifact")
-	require.NoError(t, source.DownloadToLocalFile(t.Context(), dest, 0o644))
+	require.NoError(t, source.downloadToLocalFile(t.Context(), dest, 0o644, wait))
 	require.EqualValues(t, 2, attempts.Load())
+	require.Equal(t, []time.Duration{httpDownloadRetryDelay}, delays)
 
 	got, err := os.ReadFile(dest)
 	require.NoError(t, err)
 	require.Equal(t, content, string(got))
+}
+
+func TestDownloadToLocalFileUsesSingleRetryBudget(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.Header().Set("Content-Length", "13")
+		_, _ = w.Write([]byte("partial"))
+	}))
+	defer server.Close()
+
+	source, err := Parse(server.URL + "/artifact")
+	require.NoError(t, err)
+
+	var delays []time.Duration
+
+	wait := func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+
+		return nil
+	}
+
+	dest := filepath.Join(t.TempDir(), "artifact")
+	err = source.downloadToLocalFile(t.Context(), dest, 0o644, wait)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.EqualValues(t, httpDownloadMaxAttempts, attempts.Load())
+	require.Equal(t, []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}, delays)
+	require.NoFileExists(t, dest)
 }
 
 func TestHTTPClientUsesRetryTransport(t *testing.T) {
@@ -137,6 +177,15 @@ func TestHTTPDownloadRetryPolicyUsesORASStatusPredicate(t *testing.T) {
 	require.Negative(t, delay)
 }
 
+func TestHTTPDownloadRetryPolicyPreservesTransportErrorWithResponse(t *testing.T) {
+	t.Parallel()
+
+	transportErr := errors.New("permanent transport failure")
+	delay, err := newHTTPDownloadRetryPolicy().Retry(0, &http.Response{StatusCode: http.StatusServiceUnavailable}, transportErr)
+	require.ErrorIs(t, err, transportErr)
+	require.Negative(t, delay)
+}
+
 func TestHTTPDownloadRetryPolicyStopsAfterMaxAttempts(t *testing.T) {
 	t.Parallel()
 
@@ -150,15 +199,15 @@ func TestHTTPDownloadRetryPolicyStopsAfterMaxAttempts(t *testing.T) {
 	require.Equal(t, 16*time.Second, maxHTTPDownloadRetryDelay())
 }
 
-func TestRetryableHTTPBodyReadErrorHandlesClientTimeout(t *testing.T) {
+func TestRetryableHTTPDownloadErrorHandlesClientTimeout(t *testing.T) {
 	t.Parallel()
 
 	timeoutErr := &url.Error{Op: http.MethodGet, URL: "https://artifacts.example.test/artifact", Err: context.DeadlineExceeded}
-	require.True(t, retryableHTTPBodyReadError(context.Background(), timeoutErr))
+	require.True(t, retryableHTTPDownloadError(context.Background(), timeoutErr))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	require.False(t, retryableHTTPBodyReadError(ctx, timeoutErr))
+	require.False(t, retryableHTTPDownloadError(ctx, timeoutErr))
 }
 
 func TestSourceOpenHTTPErrorRedactsQuery(t *testing.T) {

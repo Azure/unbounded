@@ -39,12 +39,19 @@ const (
 	httpDownloadRetryDelay  = 2 * time.Second
 )
 
-var httpClient = &http.Client{
-	Timeout:       10 * time.Minute,
-	CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
-	Transport: &retry.Transport{
+var (
+	httpClient = newHTTPClient(&retry.Transport{
 		Policy: newHTTPDownloadRetryPolicy,
-	},
+	})
+	httpClientWithoutRetry = newHTTPClient(nil)
+)
+
+func newHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Timeout:       10 * time.Minute,
+		CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
+		Transport:     transport,
+	}
 }
 
 func newHTTPDownloadRetryPolicy() retry.Policy {
@@ -66,7 +73,7 @@ func retryHTTPDownloadFailure(resp *http.Response, err error) (bool, error) {
 		return false, nil
 	}
 
-	return retry.DefaultPredicate(resp, nil)
+	return retry.DefaultPredicate(resp, err)
 }
 
 func httpDownloadBackoff(attempt int, _ *http.Response) time.Duration {
@@ -193,10 +200,19 @@ func openHTTPWithClient(ctx context.Context, client *http.Client, source string)
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", utilio.RedactURLQuery(source), resp.StatusCode)
+		return nil, &httpDownloadStatusError{source: source, statusCode: resp.StatusCode}
 	}
 
 	return resp.Body, nil
+}
+
+type httpDownloadStatusError struct {
+	source     string
+	statusCode int
+}
+
+func (e *httpDownloadStatusError) Error() string {
+	return fmt.Sprintf("download %q failed with status code %d", utilio.RedactURLQuery(e.source), e.statusCode)
 }
 
 // ReadAll reads the complete artifact source.
@@ -222,9 +238,13 @@ func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
 
 // DownloadToLocalFile downloads the artifact source to filename and sets perm.
 func (s Source) DownloadToLocalFile(ctx context.Context, filename string, perm os.FileMode) error {
-	return s.readWithRetry(ctx, func(body io.Reader) error {
+	return s.downloadToLocalFile(ctx, filename, perm, waitForHTTPDownloadRetry)
+}
+
+func (s Source) downloadToLocalFile(ctx context.Context, filename string, perm os.FileMode, wait func(context.Context, time.Duration) error) error {
+	return s.readWithRetryAndWait(ctx, func(body io.Reader) error {
 		return utilio.InstallFile(filename, body, perm)
-	})
+	}, wait)
 }
 
 // DownloadWithSHA256Verification downloads the artifact source to filename and
@@ -249,6 +269,10 @@ func (s Source) DownloadWithSHA256Verification(ctx context.Context, expectedHash
 }
 
 func (s Source) readWithRetry(ctx context.Context, read func(io.Reader) error) error {
+	return s.readWithRetryAndWait(ctx, read, waitForHTTPDownloadRetry)
+}
+
+func (s Source) readWithRetryAndWait(ctx context.Context, read func(io.Reader) error, wait func(context.Context, time.Duration) error) error {
 	delay := httpDownloadRetryDelay
 
 	for attempt := 1; attempt <= httpDownloadMaxAttempts; attempt++ {
@@ -256,23 +280,21 @@ func (s Source) readWithRetry(ctx context.Context, read func(io.Reader) error) e
 			return err
 		}
 
-		body, err := s.Open(ctx)
-		if err != nil {
-			return err
+		body, err := s.openForRead(ctx)
+		if err == nil {
+			err = read(body)
+			_ = body.Close() //nolint:errcheck // best effort close before retrying
 		}
-
-		err = read(body)
-		_ = body.Close() //nolint:errcheck // best effort close before retrying
 
 		if err == nil {
 			return nil
 		}
 
-		if s.kind != sourceHTTP || !retryableHTTPBodyReadError(ctx, err) || attempt == httpDownloadMaxAttempts {
+		if s.kind != sourceHTTP || !retryableHTTPDownloadError(ctx, err) || attempt == httpDownloadMaxAttempts {
 			return err
 		}
 
-		if err := waitForHTTPDownloadRetry(ctx, delay); err != nil {
+		if err := wait(ctx, delay); err != nil {
 			return err
 		}
 
@@ -282,7 +304,15 @@ func (s Source) readWithRetry(ctx context.Context, read func(io.Reader) error) e
 	return nil
 }
 
-func retryableHTTPBodyReadError(ctx context.Context, err error) bool {
+func (s Source) openForRead(ctx context.Context) (io.ReadCloser, error) {
+	if s.kind == sourceHTTP {
+		return openHTTPWithClient(ctx, httpClientWithoutRetry, s.raw)
+	}
+
+	return s.Open(ctx)
+}
+
+func retryableHTTPDownloadError(ctx context.Context, err error) bool {
 	if context.Cause(ctx) != nil {
 		return false
 	}
@@ -292,8 +322,18 @@ func retryableHTTPBodyReadError(ctx context.Context, err error) bool {
 	}
 
 	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
 
-	return errors.As(err, &netErr) && netErr.Timeout()
+	var statusErr *httpDownloadStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+
+	retryable, predicateErr := retry.DefaultPredicate(&http.Response{StatusCode: statusErr.statusCode}, nil)
+
+	return predicateErr == nil && retryable
 }
 
 func waitForHTTPDownloadRetry(ctx context.Context, delay time.Duration) error {
