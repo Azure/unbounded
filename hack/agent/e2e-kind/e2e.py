@@ -2649,7 +2649,7 @@ def query(server, name):
         while len(response) < length:
             response += sock.recv(length - len(response))
     _, flags, _, answers, _, _ = struct.unpack('!HHHHHH', response[:12])
-    if flags & 0xF or answers == 0:
+    if flags & 0xF:
         raise SystemExit(f'DNS query {name} through {server} failed: rcode={flags & 0xF}, answers={answers}')
 
 
