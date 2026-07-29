@@ -1727,13 +1727,13 @@ if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     rm -f /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin
     apt-get update
-    apt-get install -y systemd-container curl nftables util-linux
+    apt-get install -y systemd-container curl nftables iptables util-linux
 elif command -v tdnf >/dev/null 2>&1; then
-    tdnf install -y systemd-container curl nftables util-linux
+    tdnf install -y systemd-container curl nftables iptables util-linux
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y systemd-container curl nftables util-linux
+    dnf install -y systemd-container curl nftables iptables util-linux
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y systemd-container curl nftables util-linux
+    yum install -y systemd-container curl nftables iptables util-linux
 else
     echo "no supported package manager found for blocked-network preparation" >&2
     exit 1
