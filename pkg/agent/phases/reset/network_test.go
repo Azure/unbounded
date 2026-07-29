@@ -45,6 +45,6 @@ func TestKnownOverlayInterfaces(t *testing.T) {
 	t.Parallel()
 
 	// Verify the known interfaces list contains the expected entries.
-	expected := []string{"geneve0", "vxlan0", "ipip0", "unbounded0", "cbr0", "localdns"}
+	expected := []string{"geneve0", "vxlan0", "ipip0", "unbounded0", "cbr0"}
 	assert.Equal(t, expected, knownOverlayInterfaces)
 }

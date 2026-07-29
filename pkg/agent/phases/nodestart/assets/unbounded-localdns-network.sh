@@ -6,7 +6,12 @@ node_listener={{.NodeListenerIP}}
 cluster_listener={{.ClusterListenerIP}}
 comment='unbounded-localdns: skip conntrack'
 
-if ! ip link show "${interface}" >/dev/null 2>&1; then
+if ip link show "${interface}" >/dev/null 2>&1; then
+    if ! ip -d -o link show dev "${interface}" | grep -Eq '(^|[[:space:]])dummy([[:space:]]|$)'; then
+        echo "existing ${interface} interface is not a dummy interface" >&2
+        exit 1
+    fi
+else
     ip link add name "${interface}" type dummy
 fi
 ip link set up dev "${interface}"
