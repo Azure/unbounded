@@ -2653,8 +2653,8 @@ def query(server, name):
         raise SystemExit(f'DNS query {name} through {server} failed: rcode={flags & 0xF}, answers={answers}')
 
 
-query('169.254.10.10', 'example.com')
-query('169.254.10.11', 'kubernetes.default.svc.cluster.local')
+query('169.254.10.10', 'health-check.localdns.local')
+query('169.254.10.11', 'health-check.localdns.local')
 PY
 """)
     ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.10/32'")
