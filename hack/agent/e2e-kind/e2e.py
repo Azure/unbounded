@@ -2786,8 +2786,23 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
             "! sudo iptables -w -t raw -S | grep -q 'unbounded-localdns: skip conntrack'"
         )
         deadline = time.monotonic() + 60
+        scenario_key = Path(env["VM_DIR"]) / "ssh" / "id_ed25519"
+        scenario_target = f"{VM_SSH_USER}@{env['VM_IP']}"
         while True:
-            result = ssh_capture_quiet(cleanup_check)
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=10",
+                    "-i", str(scenario_key),
+                    scenario_target,
+                    cleanup_check,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
             if result.returncode == 0:
                 break
             if time.monotonic() >= deadline:
