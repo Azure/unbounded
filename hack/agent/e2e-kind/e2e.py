@@ -2513,6 +2513,30 @@ grep -q -- '--cluster-dns=169.254.10.11' /etc/systemd/system/kubelet.service.d/2
 curl --silent --fail --noproxy '*' http://169.254.10.10:8181/ready | grep -q OK
 curl --silent --fail --noproxy '*' http://169.254.10.11:8181/ready | grep -q OK
 """)
+    ssh_cmd(r"""
+python3 - <<'PY'
+import socket
+import struct
+
+
+def query(server, name):
+    qname = b''.join(bytes([len(label)]) + label.encode() for label in name.split('.')) + b'\0'
+    message = struct.pack('!HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0) + qname + struct.pack('!HH', 1, 1)
+    with socket.create_connection((server, 53), timeout=5) as sock:
+        sock.sendall(struct.pack('!H', len(message)) + message)
+        length = struct.unpack('!H', sock.recv(2))[0]
+        response = b''
+        while len(response) < length:
+            response += sock.recv(length - len(response))
+    _, flags, _, answers, _, _ = struct.unpack('!HHHHHH', response[:12])
+    if flags & 0xF or answers == 0:
+        raise SystemExit(f'DNS query {name} through {server} failed: rcode={flags & 0xF}, answers={answers}')
+
+
+query('169.254.10.10', 'example.com')
+query('169.254.10.11', 'kubernetes.default.svc.cluster.local')
+PY
+""")
     ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.10/32'")
     ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.11/32'")
     ssh_cmd("""

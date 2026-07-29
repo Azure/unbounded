@@ -23,6 +23,7 @@ import (
 
 const (
 	checkIsPrivilegedUserName    = "is-privileged-user"
+	checkLocalDNSConntrackName   = "localdns-conntrack"
 	checkHostPackagesName        = "host-packages"
 	checkHostOSConfigurationName = "host-os-configuration"
 	checkNSpawnRuntimeName       = "nspawn-runtime"
@@ -70,7 +71,7 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 // Preflight returns the standard host environment checks required before
 // provisioning an nspawn machine.
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
-	return []preflight.Checker{
+	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
 		CheckExistingDeployment(log),
 		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
@@ -82,6 +83,38 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGo
 		CheckCgroups(log),
 		CheckNvidiaDriver(log),
 	}
+	if cfg.LocalDNS != nil && cfg.LocalDNS.Enabled {
+		checks = append(checks, checkLocalDNSConntrack(log, cfg.OfflineArtifactsConfigured()))
+	}
+
+	return checks
+}
+
+// CheckLocalDNSConntrack validates raw-table NOTRACK support without changing rules.
+func CheckLocalDNSConntrack(log *slog.Logger) preflight.Checker {
+	return checkLocalDNSConntrack(log, false)
+}
+
+func checkLocalDNSConntrack(log *slog.Logger, failMissing bool) preflight.Checker {
+	return simpleHostChecker{name: checkLocalDNSConntrackName, check: func(ctx context.Context) []preflight.Result {
+		if _, err := exec.LookPath("iptables"); err != nil {
+			if failMissing {
+				return preflight.ResultsError(checkLocalDNSConntrackName, "host conntrack", "iptables is required in offline mode")
+			}
+
+			return preflight.ResultsWarning(checkLocalDNSConntrackName, "host conntrack", "iptables will be installed before LocalDNS setup")
+		}
+
+		for _, args := range [][]string{{"-w", "-t", "raw", "-S"}, {"-w", "-t", "raw", "-j", "NOTRACK", "--help"}} {
+			cmd := exec.CommandContext(ctx, "iptables", args...)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				log.Debug("LocalDNS conntrack capability check failed", "args", args, "output", string(output), "error", err)
+				return preflight.ResultsError(checkLocalDNSConntrackName, "host conntrack", "iptables raw-table NOTRACK support is required")
+			}
+		}
+
+		return preflight.ResultsOK(checkLocalDNSConntrackName, "host conntrack", "iptables raw-table NOTRACK support is available")
+	}}
 }
 
 // CheckIsPrivilegedUser verifies preflight is running as root.

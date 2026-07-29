@@ -27,7 +27,6 @@ var knownOverlayInterfaces = []string{
 	"ipip0",
 	"unbounded0",
 	"cbr0",
-	"localdns",
 }
 
 type removeNetworkInterfaces struct {
@@ -99,6 +98,16 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 			if err := executil.RunCmd(ctx, t.log, executil.Iptables(), args...); err != nil {
 				return fmt.Errorf("remove LocalDNS NOTRACK rule: %w", err)
 			}
+		}
+	}
+
+	if output, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show", "dev", goalstates.LocalDNSInterfaceName); err == nil {
+		if !strings.Contains(" "+output+" ", " dummy ") {
+			return fmt.Errorf("refusing to remove non-dummy interface %s", goalstates.LocalDNSInterfaceName)
+		}
+
+		if err := executil.RunCmd(ctx, t.log, executil.Ip(), "link", "delete", goalstates.LocalDNSInterfaceName); err != nil {
+			return fmt.Errorf("remove LocalDNS interface: %w", err)
 		}
 	}
 
