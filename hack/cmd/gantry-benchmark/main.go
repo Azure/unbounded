@@ -53,6 +53,8 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return benchmark.disable(ctx)
 	case "enable":
 		return benchmark.enable(ctx)
+	case "prepare":
+		return benchmark.prepareImages(ctx)
 	case "preflight":
 		return benchmark.preflight(ctx)
 	case "run":
@@ -72,7 +74,8 @@ func printUsage(writer io.Writer) {
 Subcommands:
 	disable    restore the cluster and remove benchmark instrumentation
 	enable     install benchmark instrumentation after safety checks
-	preflight  validate proxy, ACR, monitoring, Gantry, and all 300 nodes
+	prepare    build and push both digest-pinned images before ACR goes private
+	preflight  validate Azure sources, monitoring, Gantry, and all target nodes
 	run        execute baseline and Gantry cold phases, then restore routing
 	status     print the active benchmark state
 	help       print this help

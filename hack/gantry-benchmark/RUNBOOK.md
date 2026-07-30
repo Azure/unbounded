@@ -12,10 +12,19 @@ cp hack/gantry-benchmark/env.example hack/gantry-benchmark/env.local
 Fill in:
 
 - `BENCHMARK_CONFIRM_CONTEXT`
+- `BENCHMARK_MODE` (`direct` or `proxy`)
 - `ACR_LOGIN_SERVER`
 - `ACR_USERNAME`
 - `ACR_PASSWORD`
-- `BENCHMARK_PROXY_IMAGE`
+- `BENCHMARK_PROXY_IMAGE` (proxy mode only)
+
+For source-authoritative measurements also fill in:
+
+- `BENCHMARK_AZURE_TELEMETRY=true`
+- `AZURE_LOG_ANALYTICS_WORKSPACE_ID`
+- `AZURE_ACR_RESOURCE_ID`
+- `AZURE_AKS_RESOURCE_ID`
+- `AZURE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID`
 
 The proxy image must be in the same ACR being measured. `env.local` is
 gitignored. Credentials are passed to the local container engine and stored
@@ -30,7 +39,12 @@ kubectl get nodes -l kubernetes.io/os=linux
 kubectl -n gantry-system get daemonset gantry
 ```
 
-## 2. Build the proxy
+When Azure telemetry is enabled, the operator machine needs ACR data-plane
+access only through image preparation. Preflight requires public access to be
+disabled and verifies that the configured Private Endpoint is approved for
+that exact registry and exposes `PEBytesIn`.
+
+## 2. Build the proxy (proxy mode only)
 
 ```bash
 make -C hack/gantry-benchmark test
@@ -43,6 +57,8 @@ The proxy exposes:
 - Port `5002`: OCI registry proxy.
 - Port `9090`: Prometheus metrics, `/debug/summary`, and authenticated phase
   control.
+
+Skip this section in direct mode.
 
 ## 3. Enable instrumentation
 
@@ -57,21 +73,41 @@ make -C hack/gantry-benchmark enable
 - Gantry reports 300 desired, updated, Ready, and available pods.
 - No benchmark state ConfigMap already exists.
 
-It then creates:
+It then creates in both modes:
 
 - Namespace `gantry-benchmark`.
 - Cluster-wide lock ConfigMap `gantry-system/gantry-benchmark-lock`.
-- The ACR credential and phase-control Secret.
-- One counting-proxy Deployment and ClusterIP Service.
-- PodMonitors scoped to the proxy and the Gantry pods. Their samples carry
+- A PodMonitor scoped to Gantry. Its samples carry
    `gantry_benchmark="true"` so existing scrapes cannot double the results.
 - The `Gantry ACR Benchmark` Grafana dashboard.
 - A state ConfigMap containing the exact original Gantry configuration but no
   credentials.
 
+Proxy mode additionally creates the ACR credential/phase-control Secret, one
+counting-proxy Deployment and Service, and the proxy PodMonitor.
+
 No containerd or Gantry routing is changed by `enable`.
 
-## 4. Run preflight
+## 4. Prepare workload images
+
+While the operator machine can still reach ACR, build and push both fresh,
+digest-pinned phase images:
+
+```bash
+make -C hack/gantry-benchmark prepare
+```
+
+`prepare` records both immutable image references in benchmark state. It does
+not run pull pods or warm containerd caches on target nodes.
+
+For Azure telemetry, disable public ACR access after `prepare` succeeds:
+
+```bash
+az acr update -g "$RESOURCE_GROUP" -n "$ACR_NAME" \
+   --public-network-enabled false
+```
+
+## 5. Run preflight
 
 ```bash
 make -C hack/gantry-benchmark preflight
@@ -79,44 +115,57 @@ make -C hack/gantry-benchmark preflight
 
 Preflight performs these mandatory checks before routing changes:
 
-1. Pulls the proxy image manifest and config blob through the proxy and
-   requires successful HTTP responses.
-2. Runs a host-network DaemonSet and requires the proxy ClusterIP to be
-   reachable from every target node.
-3. Requires Prometheus to report containerd storage mode for 300 Gantry pods.
-4. Requires the minimum Gantry DHT health score to be greater than zero.
-5. Requires the proxy setup request to appear in Prometheus.
+1. Requires Prometheus to report the current revision for every Gantry pod.
+2. Requires the minimum Gantry DHT health score to be greater than zero.
+3. In direct mode, requires `gantry_origin_bytes_total` on every Gantry pod.
+4. Requires `gantry_peer_serve_bytes_total` on every Gantry pod.
+5. With Azure telemetry, verifies Azure authentication, ACR/AKS/Private Endpoint
+   identity, disabled ACR public access, `PEBytesIn`, and both Log Analytics
+   tables.
+6. In proxy mode, smoke-tests the proxy, checks reachability from every target
+   node, and requires the setup request in Prometheus.
 
 Do not run the benchmark if preflight fails.
 
-## 5. Run the comparison
+## 6. Run the comparison
 
 ```bash
 make -C hack/gantry-benchmark run
 ```
 
-The command executes one transaction:
+The command executes one transaction using the images recorded by `prepare`:
 
-1. Logs in to ACR without putting the password on the command line.
-2. Builds and pushes two independent 1024 MiB random-payload images.
-3. Backs up each node's ACR-specific containerd configuration.
-4. Installs baseline routing and runs the 300-pod baseline Job.
-5. Patches only the matching ACR entry in Gantry's ConfigMap, rolls all Gantry
-   pods, installs measured Gantry routing, and runs the Gantry cold Job.
-6. Writes phase results and the comparison.
-7. Restores every node's prior ACR-specific file or removes the file when it
+1. Backs up each node's ACR-specific containerd configuration.
+2. Installs baseline routing and runs the 300-pod baseline Job.
+3. Installs strict Gantry routing and runs the Gantry cold Job. Proxy mode
+   points Gantry at the counting proxy; direct mode leaves Gantry pointed at ACR.
+4. Writes phase results and the comparison.
+5. Restores every node's prior ACR-specific file or removes the file when it
    was originally absent.
-8. Restores the exact Gantry ConfigMap and verifies the full DaemonSet rollout.
+6. Proxy mode restores the exact Gantry ConfigMap; direct mode verifies it was
+   never changed.
 
-Phase changes wait up to `BENCHMARK_ROLLOUT_TIMEOUT` for all proxy requests
-attributed to the current phase to drain before counters move to the next
-phase.
+Each pull container sleeps for 15 seconds after starting so AKS audit records a
+running status patch. Audit startup latency is creation-to-first-running-status
+receipt, not Job completion time.
 
-Both ACR-specific routing modes are fail-closed through the proxy. The
-Gantry-mode containerd fallback is the proxy, so fallback traffic remains
+In proxy mode, phase changes wait up to `BENCHMARK_ROLLOUT_TIMEOUT` for all
+proxy requests attributed to the current phase to drain. Both proxy-mode
+routing phases are fail-closed through the proxy, so fallback traffic remains
 measured rather than escaping directly to ACR.
 
-## 6. Inspect results
+In direct mode, Gantry-cold origin bytes come from
+`gantry_origin_bytes_total`. After the Job completes, the runner waits for zero
+in-flight pulls and 20 seconds of stable counters before recording the phase.
+
+With Azure telemetry enabled, each phase is isolated on whole UTC-minute
+boundaries and includes a three-minute trailing guard for delayed Private
+Endpoint metric buckets. The runner then polls until ACR pulls, `PEBytesIn`, and
+all expected audit pod timelines are complete and stable. `comparison.json`
+uses those Azure measurements as primary values and retains Kubernetes/Gantry
+values as cross-checks.
+
+## 7. Inspect results
 
 Print state:
 
@@ -139,8 +188,9 @@ kubectl -n monitoring port-forward service/kps-grafana 3000:80
 
 Select dashboard `Gantry ACR Benchmark` and choose the run ID. Check:
 
-- Baseline versus Gantry ACR upstream bytes.
-- Origin-byte reduction.
+- `comparison.json` for ACR pull counts, `PEBytesIn`, and audit latency.
+- Origin-byte and ACR image-pull reduction.
+- Per-pod Gantry peer bytes.
 - Gantry phase request source by `client_class`.
 - Peer hits versus origin pulls.
 - Completed pull pods by phase.
@@ -150,7 +200,7 @@ A saturated single proxy can distort latency even though byte and request
 totals remain valid. Treat sustained proxy CPU limits or a growing inflight
 queue as an invalid latency run.
 
-## 7. Disable
+## 8. Disable
 
 After recording the results:
 

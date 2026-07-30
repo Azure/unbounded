@@ -200,6 +200,7 @@ type metricsHooks struct {
 	onOriginStreamFailed      func(kind string)
 	onLiveStreamCompleted     func(d digest.Digest)
 	onPeerFetch               func(outcome string)
+	onMirrorBytesServed       func(kind, source string, bytes int64)
 	onPeerFetchLatency        func(outcome string, d time.Duration)
 	onPeerDialResult          func(success bool)
 	onDhtLookup               func(outcome string, dur time.Duration)
@@ -251,6 +252,15 @@ func WithMetrics(cacheHit, cacheMiss func()) Option {
 	return func(s *Server) {
 		s.metrics.onCacheHit = cacheHit
 		s.metrics.onCacheMiss = cacheMiss
+	}
+}
+
+// WithByteMetrics registers a callback for bytes written to the local
+// containerd caller, split by cache, peer, or origin source path. Peer receive
+// bytes are measured separately at transfer.Client's response-body boundary.
+func WithByteMetrics(mirrorBytesServed func(kind, source string, bytes int64)) Option {
+	return func(s *Server) {
+		s.metrics.onMirrorBytesServed = mirrorBytesServed
 	}
 }
 
@@ -931,7 +941,10 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 
 		s.firePrefetch(ctx, kind, upstream, repo, d)
 
-		if _, err := io.Copy(w, br); err != nil {
+		written, err := io.Copy(w, br)
+		s.fireMirrorBytesServed(kind, "cache", written)
+
+		if err != nil {
 			logger.Debug("mirror: copy from cache failed", slog.Any("err", err))
 		}
 
@@ -1060,6 +1073,8 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 
 	if s.liveStreamThrough {
 		written, streamErr := streamDigestToClient(w, pr, d, psize, kind)
+		s.fireMirrorBytesServed(kind, "origin", written)
+
 		if streamErr != nil {
 			logger.Debug("mirror: live origin stream failed",
 				slog.Int64("written", written),
@@ -1126,6 +1141,8 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	writeBlobHeadersWithPrefix(w, d, psize, kind, sniff)
 
 	written, err := io.Copy(dest, prBuf)
+	s.fireMirrorBytesServed(kind, "origin", written)
+
 	if err != nil {
 		// Bytes already sent; we can't undo. Cache will be aborted by defer.
 		// This is a terminal downstream failure: origin returned 2xx
@@ -1653,6 +1670,8 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 	if s.liveStreamThrough {
 		written, streamErr := streamDigestToClient(w, rc, d, psize, kind)
+		s.fireMirrorBytesServed(kind, "peer", written)
+
 		if streamErr != nil {
 			if isDigestMismatchErr(streamErr) {
 				s.markProviderSuspicious(d, p)
@@ -1696,7 +1715,8 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 	defer func() { _ = cw.Abort(pCtx) }() //nolint:errcheck // best-effort abort
 
-	if _, err := io.Copy(cw, rc); err != nil {
+	_, err = io.Copy(cw, rc)
+	if err != nil {
 		s.bumpPeerFetch("stall")
 		s.bumpPeerFetchLatency("stall", fetchStart)
 		logger.Debug("mirror: peer copy stalled",
@@ -1773,7 +1793,10 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
 	}
 
-	if _, err := io.Copy(w, rcLocalBuf); err != nil {
+	written, err := io.Copy(w, rcLocalBuf)
+	s.fireMirrorBytesServed(kind, "peer", written)
+
+	if err != nil {
 		logger.Debug("mirror: copy from cache (post-peer) failed", slog.Any("err", err))
 	}
 
@@ -2142,6 +2165,14 @@ func (s *Server) bumpCacheMiss() {
 	if s.metrics.onCacheMiss != nil {
 		s.metrics.onCacheMiss()
 	}
+}
+
+func (s *Server) fireMirrorBytesServed(kind ifaces.OriginRefKind, source string, bytes int64) {
+	if bytes <= 0 || s.metrics.onMirrorBytesServed == nil {
+		return
+	}
+
+	s.metrics.onMirrorBytesServed(kind.MetricLabel(), source, bytes)
 }
 
 func (s *Server) fireOriginStreamStarted(kind ifaces.OriginRefKind) {

@@ -79,8 +79,9 @@ type Describer interface {
 }
 
 type metricsHooks struct {
-	onPeerServe func()
-	onPeerMiss  func()
+	onPeerServe      func()
+	onPeerMiss       func()
+	onPeerServeBytes func(kind string, bytes int64)
 }
 
 // Option configures a Server.
@@ -99,6 +100,15 @@ func WithLogger(l *slog.Logger) Option {
 func WithMetrics(onPeerServe, onPeerMiss func()) Option {
 	return func(s *Server) {
 		s.metrics = metricsHooks{onPeerServe: onPeerServe, onPeerMiss: onPeerMiss}
+	}
+}
+
+// WithByteMetrics registers a callback for bytes actually transmitted to peer
+// agents. HEAD requests emit no bytes, and Range requests count only the range
+// body sent on the wire.
+func WithByteMetrics(onPeerServeBytes func(kind string, bytes int64)) Option {
+	return func(s *Server) {
+		s.metrics.onPeerServeBytes = onPeerServeBytes
 	}
 }
 
@@ -275,7 +285,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 			return
 		}
 
-		if _, err := io.Copy(w, rc); err != nil {
+		written, err := io.Copy(w, rc)
+		s.bumpServeBytes(kind, written)
+
+		if err != nil {
 			s.logger.Debug("transfer: copy failed", slog.Any("err", err))
 		}
 
@@ -314,7 +327,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 		return
 	}
 
-	if _, err := io.CopyN(w, rc, length); err != nil {
+	written, err := io.CopyN(w, rc, length)
+	s.bumpServeBytes(kind, written)
+
+	if err != nil {
 		s.logger.Debug("transfer: range copy failed", slog.Any("err", err))
 	}
 
@@ -325,6 +341,14 @@ func (s *Server) bumpServe() {
 	if s.metrics.onPeerServe != nil {
 		s.metrics.onPeerServe()
 	}
+}
+
+func (s *Server) bumpServeBytes(kind ifaces.OriginRefKind, bytes int64) {
+	if bytes <= 0 || s.metrics.onPeerServeBytes == nil {
+		return
+	}
+
+	s.metrics.onPeerServeBytes(kind.MetricLabel(), bytes)
 }
 
 // tryAcquireServe reserves a serve slot without blocking. The returned release

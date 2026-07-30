@@ -38,8 +38,12 @@ func (b *benchmark) preflight(ctx context.Context) error {
 		return err
 	}
 
-	if state.Status != "enabled" && state.Status != "preflight-passed" {
-		return fmt.Errorf("benchmark state is %q, complete enable or run disable before preflight", state.Status)
+	if state.Status != "images-prepared" && state.Status != "preflight-passed" {
+		return fmt.Errorf("benchmark state is %q, run prepare before preflight or disable the run", state.Status)
+	}
+
+	if _, _, err := state.preparedImages(); err != nil {
+		return err
 	}
 
 	if err := b.validateContext(ctx); err != nil {
@@ -54,12 +58,23 @@ func (b *benchmark) preflight(ctx context.Context) error {
 		return err
 	}
 
-	if err := b.smokeProxy(ctx, state); err != nil {
-		return err
+	if state.AzureTelemetry {
+		if err := b.checkAzureTelemetry(ctx); err != nil {
+			return err
+		}
 	}
 
-	if err := b.checkNodeProxyReachability(ctx, state); err != nil {
-		return err
+	// The proxy smoke test and the node-to-proxy reachability DaemonSet both
+	// exercise objects that direct mode never installs. Everything else
+	// (context, node inventory, Gantry convergence, monitoring) still applies.
+	if state.usesProxy() {
+		if err := b.smokeProxy(ctx, state); err != nil {
+			return err
+		}
+
+		if err := b.checkNodeProxyReachability(ctx, state); err != nil {
+			return err
+		}
 	}
 
 	if err := b.checkMonitoring(ctx, state); err != nil {
@@ -313,6 +328,53 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 		return fmt.Errorf("minimum Gantry DHT health is %.3f, want greater than zero", dhtHealth)
 	}
 
+	peerByteCountQuery := fmt.Sprintf(
+		`count(gantry_peer_serve_bytes_total{namespace=%q,kind="layer",gantry_benchmark="true",controller_revision_hash=%q})`,
+		b.config.GantryNamespace,
+		revision,
+	)
+
+	peerByteCount, err := b.queryPrometheus(ctx, peerByteCountQuery)
+	if err != nil {
+		return fmt.Errorf("query Gantry peer byte metric count: %w", err)
+	}
+
+	if int(peerByteCount) != b.config.NodeCount {
+		return fmt.Errorf(
+			"prometheus reports peer byte counters for %.0f/%d Gantry pods",
+			peerByteCount,
+			b.config.NodeCount,
+		)
+	}
+
+	if !state.usesProxy() {
+		originByteCountQuery := fmt.Sprintf(
+			`count(gantry_origin_bytes_total{namespace=%q,kind="layer",gantry_benchmark="true",controller_revision_hash=%q})`,
+			b.config.GantryNamespace,
+			revision,
+		)
+
+		originByteCount, err := b.queryPrometheus(ctx, originByteCountQuery)
+		if err != nil {
+			return fmt.Errorf("query Gantry origin byte metric count: %w", err)
+		}
+
+		if int(originByteCount) != b.config.NodeCount {
+			return fmt.Errorf(
+				"prometheus reports origin byte counters for %.0f/%d Gantry pods; direct mode requires gantry_origin_bytes_total",
+				originByteCount,
+				b.config.NodeCount,
+			)
+		}
+	}
+
+	// Direct mode has no proxy, so there are no proxy samples to wait for. The
+	// Gantry scrape checks above already prove the benchmark PodMonitor is
+	// being honoured by Prometheus.
+	if !state.usesProxy() {
+		return nil
+	}
+
 	proxyQuery := fmt.Sprintf(`sum(origin_requests_completed_total{run_id=%q,phase="setup",gantry_benchmark="true"})`, state.RunID)
 	deadline := time.Now().Add(2 * time.Minute)
 
@@ -336,6 +398,140 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 		case <-time.After(5 * time.Second):
 		}
 	}
+}
+
+func (b *benchmark) checkAzureTelemetry(ctx context.Context) error {
+	if _, err := b.commands.Run(ctx, nil, "az", "account", "show", "--output", "none"); err != nil {
+		return fmt.Errorf("validate Azure CLI authentication: %w", err)
+	}
+
+	acrName, found := strings.CutSuffix(strings.ToLower(b.config.ACRLoginServer), ".azurecr.io")
+	if !found || acrName == "" {
+		return fmt.Errorf("ACR login server %q must end in .azurecr.io", b.config.ACRLoginServer)
+	}
+
+	acrOutput, err := b.commands.Run(
+		ctx,
+		nil,
+		"az", "acr", "show",
+		"--name", acrName,
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("read ACR resource: %w", err)
+	}
+
+	var acr struct {
+		ID                  string `json:"id"`
+		LoginServer         string `json:"loginServer"`
+		PublicNetworkAccess string `json:"publicNetworkAccess"`
+	}
+	if err := json.Unmarshal(acrOutput, &acr); err != nil {
+		return fmt.Errorf("decode ACR resource: %w", err)
+	}
+
+	if !strings.EqualFold(acr.ID, b.config.ACRResourceID) || !strings.EqualFold(acr.LoginServer, b.config.ACRLoginServer) {
+		return fmt.Errorf(
+			"ACR telemetry resource mismatch: id=%q loginServer=%q",
+			acr.ID,
+			acr.LoginServer,
+		)
+	}
+
+	if !strings.EqualFold(acr.PublicNetworkAccess, "Disabled") {
+		return fmt.Errorf(
+			"ACR public network access is %q, want Disabled so all measured pulls cross the private endpoint",
+			acr.PublicNetworkAccess,
+		)
+	}
+
+	privateEndpointOutput, err := b.commands.Run(
+		ctx,
+		nil,
+		"az", "network", "private-endpoint", "show",
+		"--ids", b.config.ACRPrivateEndpointResourceID,
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("read ACR private endpoint: %w", err)
+	}
+
+	var privateEndpoint struct {
+		ProvisioningState string `json:"provisioningState"`
+		Connections       []struct {
+			PrivateLinkServiceID string `json:"privateLinkServiceId"`
+			State                struct {
+				Status string `json:"status"`
+			} `json:"privateLinkServiceConnectionState"`
+		} `json:"privateLinkServiceConnections"`
+	}
+	if err := json.Unmarshal(privateEndpointOutput, &privateEndpoint); err != nil {
+		return fmt.Errorf("decode ACR private endpoint: %w", err)
+	}
+
+	approved := false
+
+	for _, connection := range privateEndpoint.Connections {
+		if strings.EqualFold(connection.PrivateLinkServiceID, b.config.ACRResourceID) &&
+			strings.EqualFold(connection.State.Status, "Approved") {
+			approved = true
+
+			break
+		}
+	}
+
+	if !strings.EqualFold(privateEndpoint.ProvisioningState, "Succeeded") || !approved {
+		return fmt.Errorf(
+			"ACR private endpoint is not ready: provisioningState=%q approvedACRConnection=%t",
+			privateEndpoint.ProvisioningState,
+			approved,
+		)
+	}
+
+	metricDefinitions, err := b.commands.Run(
+		ctx,
+		nil,
+		"az", "monitor", "metrics", "list-definitions",
+		"--resource", b.config.ACRPrivateEndpointResourceID,
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("read private endpoint metric definitions: %w", err)
+	}
+
+	var definitions []struct {
+		Name struct {
+			Value string `json:"value"`
+		} `json:"name"`
+	}
+	if err := json.Unmarshal(metricDefinitions, &definitions); err != nil {
+		return fmt.Errorf("decode private endpoint metric definitions: %w", err)
+	}
+
+	hasPEBytesIn := false
+
+	for _, definition := range definitions {
+		if definition.Name.Value == "PEBytesIn" {
+			hasPEBytesIn = true
+
+			break
+		}
+	}
+
+	if !hasPEBytesIn {
+		return fmt.Errorf("private endpoint does not expose PEBytesIn")
+	}
+
+	probeWindow := telemetryWindow{StartedAt: time.Now().Add(-time.Hour), FinishedAt: time.Now()}
+	if _, err := b.queryLogAnalytics(ctx, false, "ContainerRegistryRepositoryEvents | take 0", probeWindow); err != nil {
+		return fmt.Errorf("query ACR repository table: %w", err)
+	}
+
+	if _, err := b.queryLogAnalytics(ctx, true, "AKSAuditAdmin | take 0", probeWindow); err != nil {
+		return fmt.Errorf("query AKS audit table: %w", err)
+	}
+
+	return nil
 }
 
 func (b *benchmark) queryPrometheus(ctx context.Context, query string) (float64, error) {

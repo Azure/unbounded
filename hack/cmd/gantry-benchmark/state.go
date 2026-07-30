@@ -18,23 +18,52 @@ const (
 )
 
 type benchmarkState struct {
-	RunID                   string `json:"run_id"`
-	Status                  string `json:"status"`
-	BenchmarkNamespace      string `json:"benchmark_namespace"`
-	GantryNamespace         string `json:"gantry_namespace"`
-	GantryDaemonSet         string `json:"gantry_daemonset"`
-	GantryConfigMap         string `json:"gantry_configmap"`
-	MonitoringNamespace     string `json:"monitoring_namespace"`
-	PrometheusService       string `json:"prometheus_service"`
-	NodeCount               int    `json:"node_count"`
-	ImagePlatform           string `json:"image_platform"`
-	ACRLoginServer          string `json:"acr_login_server"`
-	ProxyImage              string `json:"proxy_image"`
-	ProxyClusterIP          string `json:"proxy_cluster_ip"`
-	OriginalGantryConfig    string `json:"original_gantry_config"`
-	OriginalGantryConfigSHA string `json:"original_gantry_config_sha256"`
-	PatchedGantryConfigSHA  string `json:"patched_gantry_config_sha256,omitempty"`
-	GantryRestored          bool   `json:"gantry_restored"`
+	RunID                        string        `json:"run_id"`
+	Mode                         benchmarkMode `json:"mode"`
+	Status                       string        `json:"status"`
+	BenchmarkNamespace           string        `json:"benchmark_namespace"`
+	GantryNamespace              string        `json:"gantry_namespace"`
+	GantryDaemonSet              string        `json:"gantry_daemonset"`
+	GantryConfigMap              string        `json:"gantry_configmap"`
+	MonitoringNamespace          string        `json:"monitoring_namespace"`
+	PrometheusService            string        `json:"prometheus_service"`
+	NodeCount                    int           `json:"node_count"`
+	ImagePlatform                string        `json:"image_platform"`
+	ACRLoginServer               string        `json:"acr_login_server"`
+	BaselineImage                string        `json:"baseline_image,omitempty"`
+	GantryColdImage              string        `json:"gantry_cold_image,omitempty"`
+	ProxyImage                   string        `json:"proxy_image,omitempty"`
+	ProxyClusterIP               string        `json:"proxy_cluster_ip,omitempty"`
+	OriginalGantryConfig         string        `json:"original_gantry_config"`
+	OriginalGantryConfigSHA      string        `json:"original_gantry_config_sha256"`
+	PatchedGantryConfigSHA       string        `json:"patched_gantry_config_sha256,omitempty"`
+	GantryRestored               bool          `json:"gantry_restored"`
+	AzureTelemetry               bool          `json:"azure_telemetry"`
+	LogAnalyticsWorkspaceID      string        `json:"log_analytics_workspace_id,omitempty"`
+	ACRResourceID                string        `json:"acr_resource_id,omitempty"`
+	AKSResourceID                string        `json:"aks_resource_id,omitempty"`
+	ACRPrivateEndpointResourceID string        `json:"acr_private_endpoint_resource_id,omitempty"`
+}
+
+// usesProxy reports whether the enabled run installed the counting proxy.
+func (s benchmarkState) usesProxy() bool {
+	return s.Mode != benchmarkModeDirect
+}
+
+func (s benchmarkState) preparedImages() (string, string, error) {
+	if s.BaselineImage == "" || s.GantryColdImage == "" {
+		return "", "", fmt.Errorf("benchmark images are not prepared; run prepare before preflight")
+	}
+
+	if _, err := imageDigestFromReference(s.BaselineImage); err != nil {
+		return "", "", fmt.Errorf("invalid prepared baseline image: %w", err)
+	}
+
+	if _, err := imageDigestFromReference(s.GantryColdImage); err != nil {
+		return "", "", fmt.Errorf("invalid prepared Gantry-cold image: %w", err)
+	}
+
+	return s.BaselineImage, s.GantryColdImage, nil
 }
 
 func (b *benchmark) saveState(ctx context.Context, state benchmarkState) error {
@@ -233,6 +262,17 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 	}
 
 	state.OriginalGantryConfig = configMap.Data["gantry-config.yaml"]
+
+	// State written before direct mode existed has no mode field and always
+	// described a proxy run.
+	if state.Mode == "" {
+		state.Mode = benchmarkModeProxy
+	}
+
+	if state.Mode != benchmarkModeProxy && state.Mode != benchmarkModeDirect {
+		return benchmarkState{}, fmt.Errorf("benchmark state has unknown mode %q", state.Mode)
+	}
+
 	if state.RunID == "" ||
 		state.BenchmarkNamespace == "" ||
 		state.GantryNamespace == "" ||
@@ -243,9 +283,16 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 		state.NodeCount <= 0 ||
 		state.ImagePlatform == "" ||
 		state.ACRLoginServer == "" ||
-		state.ProxyImage == "" ||
 		state.OriginalGantryConfig == "" {
 		return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete")
+	}
+
+	if state.usesProxy() && state.ProxyImage == "" {
+		return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: proxy mode requires proxy_image")
+	}
+
+	if state.AzureTelemetry && (state.LogAnalyticsWorkspaceID == "" || state.ACRResourceID == "" || state.AKSResourceID == "" || state.ACRPrivateEndpointResourceID == "") {
+		return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: Azure telemetry resource IDs are required")
 	}
 
 	if state.BenchmarkNamespace != b.config.Namespace {
@@ -271,6 +318,14 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 	b.config.PrometheusService = state.PrometheusService
 	b.config.NodeCount = state.NodeCount
 	b.config.ImagePlatform = state.ImagePlatform
+	// The mode is fixed when the run is enabled. Later commands must not be able
+	// to change routing or restoration semantics through the environment.
+	b.config.Mode = state.Mode
+	b.config.AzureTelemetry = state.AzureTelemetry
+	b.config.LogAnalyticsWorkspaceID = state.LogAnalyticsWorkspaceID
+	b.config.ACRResourceID = state.ACRResourceID
+	b.config.AKSResourceID = state.AKSResourceID
+	b.config.ACRPrivateEndpointResourceID = state.ACRPrivateEndpointResourceID
 
 	return state, nil
 }

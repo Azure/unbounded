@@ -129,6 +129,54 @@ func TestClientFetchOK(t *testing.T) {
 	}
 }
 
+func TestClientByteMetricsReportsPartialReadOnClose(t *testing.T) {
+	body := []byte("peer-served bytes with a deliberately partial read")
+	d := mustDigest(body)
+
+	cache := fakes.NewCache()
+	cache.Put(d, body)
+	addr := startTransferOnEphemeral(t, cache)
+
+	var observations []int64
+
+	client := NewClient(
+		WithDialTimeout(time.Second),
+		WithRequestTimeout(5*time.Second),
+		WithClientByteMetrics(func(kind string, bytes int64) {
+			if kind != "layer" {
+				t.Errorf("kind = %q, want layer", kind)
+			}
+
+			observations = append(observations, bytes)
+		}),
+	)
+
+	rc, _, err := client.FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+		Repository: "myrepo",
+		Digest:     d,
+		Kind:       ifaces.KindBlob,
+	})
+	if err != nil {
+		t.Fatalf("FetchFromPeer: %v", err)
+	}
+
+	buf := make([]byte, 5)
+
+	if n, err := rc.Read(buf); err != nil || n != len(buf) {
+		t.Fatalf("Read = (%d, %v), want (%d, nil)", n, err, len(buf))
+	}
+
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	_ = rc.Close() //nolint:errcheck // verify no duplicate observation
+
+	if len(observations) != 1 || observations[0] != int64(len(buf)) {
+		t.Fatalf("observations = %v, want [%d]", observations, len(buf))
+	}
+}
+
 func TestClientFetchNotFound(t *testing.T) {
 	cache := fakes.NewCache()
 	addr := startTransferOnEphemeral(t, cache)

@@ -191,7 +191,12 @@ func runAgent(args []string) error {
 	// mode the primary local content store IS the containerd content
 	// store; the transfer endpoint reads from it directly with no
 	// SecondaryBlobSource hop.
-	peerClient := transfer.NewClient(transfer.WithRequestTimeout(c.PeerFetchTimeout))
+	peerClient := transfer.NewClient(
+		transfer.WithRequestTimeout(c.PeerFetchTimeout),
+		transfer.WithClientByteMetrics(func(kind string, bytes int64) {
+			p2.peerFetchBytes.WithLabelValues(kind).Add(float64(bytes))
+		}),
+	)
 	transferOpts := []transfer.Option{
 		transfer.WithLogger(logger),
 		transfer.WithDescriber(cdstore),
@@ -199,6 +204,9 @@ func runAgent(args []string) error {
 			func() { p2.peerServe.Inc() },
 			func() { p2.peerMiss.Inc() },
 		),
+		transfer.WithByteMetrics(func(kind string, bytes int64) {
+			p2.peerServeBytes.WithLabelValues(kind).Add(float64(bytes))
+		}),
 		transfer.WithMaxConcurrentServes(c.TransferMaxConcurrentServes),
 	}
 	transferSrv := transfer.New(cstore, transferOpts...)
@@ -573,6 +581,11 @@ func runAgent(args []string) error {
 		mirror.WithMetrics(
 			func() { inst.cacheHit.Inc() },
 			func() { inst.cacheMiss.Inc() },
+		),
+		mirror.WithByteMetrics(
+			func(kind, source string, bytes int64) {
+				p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
+			},
 		),
 		mirror.WithOriginStreamMetrics(
 			func(kind string) { p9.originStreamStarted.WithLabelValues(kind).Inc() },

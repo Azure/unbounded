@@ -2,8 +2,12 @@
 
 This playbook creates an AKS cluster with 300 nodes in a single system pool, or
 expands an existing system pool to 300 nodes. It uses supported AKS node-pool
-operations and checks regional SKU availability, quota, and network capacity
-before provisioning the pool.
+operations.
+
+This playbook assumes the target subscription already has sufficient regional
+and VM-family capacity. It does not run quota preflight checks: the `az vm
+list-usage` and `az vm list-skus` calls used for that are slow and frequently
+stall. If a pool creation fails for capacity reasons, Azure reports it directly.
 
 The validated layout is:
 
@@ -11,9 +15,25 @@ The validated layout is:
 |---|---|---:|---|---|
 | `system` | System | 300 | `Standard_D8ds_v6` | All Kubernetes and application workloads |
 
-Each `Standard_D8ds_v6` node has 8 vCPUs and 32 GiB of memory. For an existing
-cluster, the system pool may use a different VM family; calculate quota demand
-for the pool being scaled.
+Each `Standard_D8ds_v6` node has 8 vCPUs and 32 GiB of memory.
+
+## Gantry benchmark topology
+
+The Gantry benchmark counts every Ready, schedulable `linux/amd64` node as a
+target, and `enable` fails unless that count matches `BENCHMARK_NODE_COUNT`
+exactly. Node taints are *not* excluded from that count, and both the benchmark
+Job and the Gantry DaemonSet tolerate everything, so a dedicated pool stays
+consistent across all three checks.
+
+To keep Prometheus and Grafana off the measured worker nodes while still
+totalling 300 eligible nodes, split the cluster:
+
+| Pool | Mode | Nodes | VM size | Notes |
+|---|---|---:|---|---|
+| `system` | System | 298 | `Standard_D8ds_v6` | Benchmark workers |
+| `bench` | User | 2 | `Standard_D16ds_v6` | Labelled and tainted `gantry-benchmark-proxy=true`; hosts monitoring |
+
+Set `BENCHMARK_NODE_COUNT=300` for that layout.
 
 ## Design constraints
 
@@ -22,13 +42,10 @@ for the pool being scaled.
 - Use at least a `/15` pod CIDR. A `/16` contains only 256 `/24` blocks and
   cannot support 300 nodes. A `/15` contains 512 blocks, leaving room for
   upgrade surge nodes.
-- Check the quota family reported for the exact VM SKU. Similar names can use
-  different quota families. `Standard_D8ds_v6` uses
-  `StandardDdsv6Family`.
 - Scale the system pool through `az aks nodepool scale`. Do not modify the
   AKS-managed VM scale set directly. Direct VMSS changes bypass AKS
-  reconciliation and do not bypass family quota.
-- Treat 300-node clusters as capacity-sensitive. A quota limit does not
+  reconciliation.
+- Treat 300-node clusters as capacity-sensitive. Available quota does not
   guarantee that Azure has 300 instances of a SKU available at a particular
   moment.
 
@@ -41,10 +58,8 @@ The operator needs:
 - `kubectl` and `jq`.
 - Permission to create resource groups and AKS clusters, or to update the
   target AKS cluster and its node pools.
-- At least 2,400 free vCPUs in the selected eight-vCPU VM family for a fresh
-  cluster. Expanding an existing cluster requires 8 free vCPUs per node added to
-  reach 300 (for example, 2,320 vCPUs to grow a 10-node system pool to 300).
-- At least 300 free entries in the regional Virtual Machines quota.
+- Sufficient regional and VM-family capacity for the pool being created or
+  scaled. This playbook does not verify it.
 - A dedicated `KUBECONFIG` path.
 
 Use a Standard AKS tier for sustained or production use. Free tier can support
@@ -81,6 +96,13 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/15}"
 SERVICE_CIDR="${SERVICE_CIDR:-10.0.0.0/16}"
 DNS_SERVICE_IP="${DNS_SERVICE_IP:-10.0.0.10}"
 
+VNET_NAME="${VNET_NAME:-vapa-gantry-bench-vnet}"
+VNET_CIDR="${VNET_CIDR:-10.224.0.0/15}"
+NODE_SUBNET="${NODE_SUBNET:-aks-nodes}"
+NODE_SUBNET_CIDR="${NODE_SUBNET_CIDR:-10.224.0.0/16}"
+PRIVATE_ENDPOINT_SUBNET="${PRIVATE_ENDPOINT_SUBNET:-acr-private-endpoints}"
+PRIVATE_ENDPOINT_SUBNET_CIDR="${PRIVATE_ENDPOINT_SUBNET_CIDR:-10.225.0.0/27}"
+
 if (( SYSTEM_NODE_COUNT != TARGET_NODE_COUNT )); then
   echo "System pool count must equal ${TARGET_NODE_COUNT}" >&2
   exit 1
@@ -99,99 +121,6 @@ az aks get-versions \
   -o table
 ```
 
-## Check SKU and quota
-
-Resolve the quota family and vCPU count from the exact SKU. This avoids
-assuming that similarly named VM sizes consume the same family quota.
-
-For a fresh cluster, the quota check covers all 300 nodes. When expanding an
-existing system pool, set `QUOTA_NODE_COUNT` to the number of nodes being added
-before running this section:
-
-```bash
-QUOTA_NODE_COUNT="${QUOTA_NODE_COUNT:-$TARGET_NODE_COUNT}"
-```
-
-```bash
-SKU_JSON=$(az vm list-skus \
-  --location "$LOCATION" \
-  --size "$NODE_VM_SIZE" \
-  --resource-type virtualMachines \
-  -o json)
-
-SKU_FAMILY=$(jq -r '.[0].family // empty' <<<"$SKU_JSON")
-VCPUS_PER_NODE=$(jq -r \
-  '.[0].capabilities[] | select(.name == "vCPUs") | .value' \
-  <<<"$SKU_JSON")
-SKU_RESTRICTIONS=$(jq -r '(.[0].restrictions // []) | length' <<<"$SKU_JSON")
-
-if [[ -z "$SKU_FAMILY" || -z "$VCPUS_PER_NODE" ]]; then
-  echo "SKU ${NODE_VM_SIZE} is not available in ${LOCATION}" >&2
-  exit 1
-fi
-
-if (( SKU_RESTRICTIONS != 0 )); then
-  jq '.[0].restrictions' <<<"$SKU_JSON" >&2
-  echo "SKU ${NODE_VM_SIZE} has deployment restrictions in ${LOCATION}" >&2
-  exit 1
-fi
-
-USAGE_JSON=$(az vm list-usage --location "$LOCATION" -o json)
-
-FAMILY_USED=$(jq -r --arg family "$SKU_FAMILY" \
-  '.[] | select(.name.value == $family) | .currentValue | tonumber' \
-  <<<"$USAGE_JSON")
-FAMILY_LIMIT=$(jq -r --arg family "$SKU_FAMILY" \
-  '.[] | select(.name.value == $family) | .limit | tonumber' \
-  <<<"$USAGE_JSON")
-REGIONAL_USED=$(jq -r \
-  '.[] | select(.name.value == "cores") | .currentValue | tonumber' \
-  <<<"$USAGE_JSON")
-REGIONAL_LIMIT=$(jq -r \
-  '.[] | select(.name.value == "cores") | .limit | tonumber' \
-  <<<"$USAGE_JSON")
-VM_USED=$(jq -r \
-  '.[] | select(.name.value == "virtualMachines") | .currentValue | tonumber' \
-  <<<"$USAGE_JSON")
-VM_LIMIT=$(jq -r \
-  '.[] | select(.name.value == "virtualMachines") | .limit | tonumber' \
-  <<<"$USAGE_JSON")
-
-if [[ -z "$FAMILY_USED" || -z "$FAMILY_LIMIT" ]]; then
-  echo "No quota record found for ${SKU_FAMILY} in ${LOCATION}" >&2
-  exit 1
-fi
-
-REQUIRED_VCPUS=$((QUOTA_NODE_COUNT * VCPUS_PER_NODE))
-
-printf '%-28s used=%-6s limit=%-6s available=%s\n' \
-  "$SKU_FAMILY" "$FAMILY_USED" "$FAMILY_LIMIT" \
-  "$((FAMILY_LIMIT - FAMILY_USED))"
-printf '%-28s used=%-6s limit=%-6s available=%s\n' \
-  "Total regional vCPUs" "$REGIONAL_USED" "$REGIONAL_LIMIT" \
-  "$((REGIONAL_LIMIT - REGIONAL_USED))"
-printf '%-28s used=%-6s limit=%-6s available=%s\n' \
-  "Virtual Machines" "$VM_USED" "$VM_LIMIT" "$((VM_LIMIT - VM_USED))"
-
-if (( FAMILY_LIMIT - FAMILY_USED < REQUIRED_VCPUS )); then
-  echo "Insufficient ${SKU_FAMILY} quota: need ${REQUIRED_VCPUS} free vCPUs" >&2
-  exit 1
-fi
-
-if (( REGIONAL_LIMIT - REGIONAL_USED < REQUIRED_VCPUS )); then
-  echo "Insufficient total regional vCPU quota" >&2
-  exit 1
-fi
-
-if (( VM_LIMIT - VM_USED < QUOTA_NODE_COUNT )); then
-  echo "Insufficient regional Virtual Machines quota" >&2
-  exit 1
-fi
-```
-
-If this check fails, select another unrestricted eight-vCPU SKU with sufficient
-quota or request a quota increase. Do not continue with a direct VMSS scale.
-
 ## Create a new cluster
 
 Create the resource group and the 300-node system pool. Supplying the `/15` pod
@@ -202,6 +131,30 @@ az group create \
   --name "$RESOURCE_GROUP" \
   --location "$LOCATION" \
   --only-show-errors
+
+az network vnet create \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$VNET_NAME" \
+  --location "$LOCATION" \
+  --address-prefixes "$VNET_CIDR" \
+  --subnet-name "$NODE_SUBNET" \
+  --subnet-prefixes "$NODE_SUBNET_CIDR" \
+  --only-show-errors
+
+az network vnet subnet create \
+  --resource-group "$RESOURCE_GROUP" \
+  --vnet-name "$VNET_NAME" \
+  --name "$PRIVATE_ENDPOINT_SUBNET" \
+  --address-prefixes "$PRIVATE_ENDPOINT_SUBNET_CIDR" \
+  --disable-private-endpoint-network-policies true \
+  --only-show-errors
+
+NODE_SUBNET_ID=$(az network vnet subnet show \
+  --resource-group "$RESOURCE_GROUP" \
+  --vnet-name "$VNET_NAME" \
+  --name "$NODE_SUBNET" \
+  --query id \
+  --output tsv)
 
 az aks create \
   --resource-group "$RESOURCE_GROUP" \
@@ -217,6 +170,7 @@ az aks create \
   --node-osdisk-type Managed \
   --network-plugin azure \
   --network-plugin-mode overlay \
+  --vnet-subnet-id "$NODE_SUBNET_ID" \
   --pod-cidr "$POD_CIDR" \
   --service-cidr "$SERVICE_CIDR" \
   --dns-service-ip "$DNS_SERVICE_IP" \
@@ -283,14 +237,6 @@ az aks update \
   --pod-cidr "$POD_CIDR" \
   --yes \
   --only-show-errors
-```
-
-Set the quota demand to the number of nodes being added to reach 300, then
-re-run the commands in [Check SKU and quota](#check-sku-and-quota). For example,
-to grow a 10-node system pool:
-
-```bash
-QUOTA_NODE_COUNT=$((TARGET_NODE_COUNT - 10))
 ```
 
 Then scale the system pool to 300 nodes. Do not run `az vmss create`,

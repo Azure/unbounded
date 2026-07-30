@@ -33,6 +33,70 @@ func (b *benchmark) loginRegistry(ctx context.Context) error {
 	return nil
 }
 
+func (b *benchmark) prepareImages(ctx context.Context) error {
+	state, err := b.loadState(ctx)
+	if err != nil {
+		return err
+	}
+
+	if state.Status == "images-prepared" {
+		if _, _, err := state.preparedImages(); err != nil {
+			return err
+		}
+
+		writeAll(b.stdout, fmt.Sprintf("images already prepared for %s\n", state.RunID))
+
+		return nil
+	}
+
+	if state.Status != "enabled" {
+		return fmt.Errorf("benchmark state is %q, run enable before prepare", state.Status)
+	}
+
+	if err := b.requireLock(ctx, state.RunID); err != nil {
+		return err
+	}
+
+	if err := b.validateContext(ctx); err != nil {
+		return err
+	}
+
+	if b.config.ACRLoginServer == "" || b.config.ACRUsername == "" || b.config.ACRPassword == "" {
+		return fmt.Errorf("ACR build credentials require ACR_LOGIN_SERVER, ACR_USERNAME, and ACR_PASSWORD") //nolint:staticcheck // Environment variable names are intentionally uppercase.
+	}
+
+	if b.config.ACRLoginServer != state.ACRLoginServer {
+		return fmt.Errorf("configured ACR_LOGIN_SERVER=%q does not match enabled benchmark registry %q", b.config.ACRLoginServer, state.ACRLoginServer)
+	}
+
+	if err := b.loginRegistry(ctx); err != nil {
+		return err
+	}
+
+	writeAll(b.stdout, "building fresh baseline image\n")
+
+	state.BaselineImage, err = b.buildFreshImage(ctx, state, proxyPhaseBaseline)
+	if err != nil {
+		return err
+	}
+
+	writeAll(b.stdout, "building fresh Gantry cold image\n")
+
+	state.GantryColdImage, err = b.buildFreshImage(ctx, state, proxyPhaseGantryCold)
+	if err != nil {
+		return err
+	}
+
+	state.Status = "images-prepared"
+	if err := b.saveState(ctx, state); err != nil {
+		return err
+	}
+
+	writeAll(b.stdout, fmt.Sprintf("prepared digest-pinned images for %s\n", state.RunID))
+
+	return nil
+}
+
 func (b *benchmark) buildFreshImage(ctx context.Context, state benchmarkState, phase proxyPhase) (string, error) {
 	if phase != proxyPhaseBaseline && phase != proxyPhaseGantryCold {
 		return "", fmt.Errorf("cannot build image for phase %q", phase)

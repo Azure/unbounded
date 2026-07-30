@@ -27,6 +27,31 @@ func renderHosts(state benchmarkState, mode hostsMode) (string, error) {
 
 	switch mode {
 	case hostsModeBaseline:
+		if !state.usesProxy() {
+			// Direct mode has no counting proxy, so the baseline must reach ACR
+			// itself. This file cannot simply be omitted: Gantry's node
+			// configurator owns /etc/containerd/certs.d/_default/hosts.toml and
+			// sends *every* registry to the local mirror, so an absent
+			// ACR-specific file would silently route the baseline through
+			// Gantry and collapse the comparison. A host-specific certs.d
+			// directory takes precedence over _default, so writing an explicit
+			// direct-to-ACR entry is what actually bypasses Gantry.
+			if state.ACRLoginServer == "" {
+				return "", fmt.Errorf("benchmark state has no ACR login server for direct baseline routing")
+			}
+
+			return fmt.Sprintf(`%s
+server = "https://%s"
+
+[host."https://%s"]
+  capabilities = ["pull", "resolve"]
+`, marker, state.ACRLoginServer, state.ACRLoginServer), nil
+		}
+
+		if state.ProxyClusterIP == "" {
+			return "", fmt.Errorf("benchmark state has no proxy ClusterIP for baseline routing")
+		}
+
 		return fmt.Sprintf(`%s
 server = "http://%s:5002"
 
@@ -49,6 +74,10 @@ server = "http://%s:5002"
 		// certs.d directory name, which matches the upstream's `name` in
 		// gantry-config directly (the ns_alias is only needed for the
 		// server=<proxy> shape).
+		//
+		// This rendering is identical in direct mode, where the same
+		// fail-closed property keeps every origin byte attributable to Gantry's
+		// own origin client rather than a containerd-direct pull from ACR.
 		return fmt.Sprintf(`%s
 [host."http://127.0.0.1:5000"]
   capabilities = ["pull", "resolve"]

@@ -37,30 +37,66 @@ type proxySummary struct {
 
 type gantryMetrics struct {
 	OriginPulls   float64 `json:"origin_pulls"`
+	OriginBytes   float64 `json:"origin_bytes"`
 	PeerFetchHits float64 `json:"peer_fetch_hits"`
+	// OriginLayerPulls counts layer blobs Gantry streamed to completion from the
+	// origin registry. It remains a diagnostic alongside the byte counter.
+	OriginLayerPulls float64 `json:"origin_layer_pulls"`
+	// OriginFallbacks counts NF5 direct-origin fallback pulls. The direct byte
+	// counter includes these bytes, but a non-zero value still means the peer
+	// distribution path exhausted and the run should not pass its health gates.
+	OriginFallbacks float64 `json:"origin_fallbacks"`
 }
 
+// originByteSource records how a phase's origin-byte figure was obtained so the
+// artifact never presents a derived number as a measured one.
+type originByteSource string
+
+const (
+	// originBytesProxy is measured by the counting proxy.
+	originBytesProxy originByteSource = "proxy_upstream_bytes"
+	// originBytesGantryMeasured is measured at Gantry's upstream response-body
+	// boundary and includes partial failed transfers and retries.
+	originBytesGantryMeasured originByteSource = "gantry_origin_bytes_total"
+	// originBytesPrivateEndpoint is measured at the ACR Private Link boundary.
+	originBytesPrivateEndpoint originByteSource = "Microsoft.Network/privateEndpoints/PEBytesIn"
+	// originBytesAnalyticBaseline assumes every completed pull pod fetched the
+	// whole image from ACR, which is what a baseline pull with no peer sharing
+	// does.
+	originBytesAnalyticBaseline originByteSource = "completed_pods_x_image_size"
+)
+
 type phaseResult struct {
-	RunID        string           `json:"run_id"`
-	Phase        proxyPhase       `json:"phase"`
-	Image        string           `json:"image"`
-	ImageSizeMiB int              `json:"image_size_mib"`
-	Proxy        proxyPhaseTotals `json:"proxy"`
-	Gantry       gantryMetrics    `json:"gantry"`
-	Job          jobObservation   `json:"job"`
-	RecordedAt   time.Time        `json:"recorded_at"`
+	RunID        string                     `json:"run_id"`
+	Phase        proxyPhase                 `json:"phase"`
+	Image        string                     `json:"image"`
+	ImageSizeMiB int                        `json:"image_size_mib"`
+	Proxy        proxyPhaseTotals           `json:"proxy"`
+	Gantry       gantryMetrics              `json:"gantry"`
+	GantryPeer   gantryPeerPhaseMeasurement `json:"gantry_peer"`
+	Azure        azurePhaseMeasurement      `json:"azure"`
+	Job          jobObservation             `json:"job"`
+	// OriginBytes is the phase's ACR traffic as attributed by OriginBytesSource.
+	OriginBytes             uint64           `json:"origin_bytes"`
+	OriginBytesSource       originByteSource `json:"origin_bytes_source"`
+	PodStartupLatency       latencySummary   `json:"pod_startup_latency"`
+	PodStartupLatencySource string           `json:"pod_startup_latency_source"`
+	RecordedAt              time.Time        `json:"recorded_at"`
 }
 
 type benchmarkComparison struct {
-	RunID                    string                 `json:"run_id"`
-	Baseline                 phaseResult            `json:"baseline"`
-	GantryCold               phaseResult            `json:"gantry_cold"`
-	OriginByteReduction      float64                `json:"origin_byte_reduction"`
-	OriginRequestReduction   float64                `json:"origin_request_reduction"`
-	P50StartLatencyReduction float64                `json:"p50_start_latency_reduction"`
-	P95StartLatencyReduction float64                `json:"p95_start_latency_reduction"`
-	Checks                   map[string]resultCheck `json:"checks"`
-	Passed                   bool                   `json:"passed"`
+	RunID                           string                 `json:"run_id"`
+	Mode                            benchmarkMode          `json:"mode"`
+	Baseline                        phaseResult            `json:"baseline"`
+	GantryCold                      phaseResult            `json:"gantry_cold"`
+	OriginByteReduction             float64                `json:"origin_byte_reduction"`
+	OriginRequestReduction          float64                `json:"origin_request_reduction"`
+	OriginRequestReductionAvailable bool                   `json:"origin_request_reduction_available"`
+	OriginRequestSource             string                 `json:"origin_request_source,omitempty"`
+	P50StartLatencyReduction        float64                `json:"p50_start_latency_reduction"`
+	P95StartLatencyReduction        float64                `json:"p95_start_latency_reduction"`
+	Checks                          map[string]resultCheck `json:"checks"`
+	Passed                          bool                   `json:"passed"`
 }
 
 type resultCheck struct {
@@ -220,27 +256,115 @@ func (b *benchmark) fetchGantryRevisionMetrics(ctx context.Context, revision str
 		return gantryMetrics{}, fmt.Errorf("query Gantry peer hits: %w", err)
 	}
 
-	return gantryMetrics{OriginPulls: originPulls, PeerFetchHits: peerHits}, nil
+	originBytesQuery := fmt.Sprintf(
+		`sum(gantry_origin_bytes_total{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+		b.config.GantryNamespace,
+		revision,
+	)
+
+	originBytes, err := b.queryPrometheusOrZero(ctx, originBytesQuery)
+	if err != nil {
+		return gantryMetrics{}, fmt.Errorf("query Gantry origin bytes: %w", err)
+	}
+
+	// Successful layer pulls, not started pulls: a started pull that failed
+	// transferred no complete blob and must not be billed as origin bytes.
+	originLayerQuery := fmt.Sprintf(
+		`sum(p2p_origin_pull_success_total{namespace=%q,kind="layer",gantry_benchmark="true",controller_revision_hash=%q})`,
+		b.config.GantryNamespace,
+		revision,
+	)
+
+	originLayerPulls, err := b.queryPrometheusOrZero(ctx, originLayerQuery)
+	if err != nil {
+		return gantryMetrics{}, fmt.Errorf("query Gantry origin layer pulls: %w", err)
+	}
+
+	fallbackQuery := fmt.Sprintf(
+		`sum(p2p_origin_fallback_total{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+		b.config.GantryNamespace,
+		revision,
+	)
+
+	originFallbacks, err := b.queryPrometheusOrZero(ctx, fallbackQuery)
+	if err != nil {
+		return gantryMetrics{}, fmt.Errorf("query Gantry origin fallbacks: %w", err)
+	}
+
+	return gantryMetrics{
+		OriginPulls:      originPulls,
+		OriginBytes:      originBytes,
+		PeerFetchHits:    peerHits,
+		OriginLayerPulls: originLayerPulls,
+		OriginFallbacks:  originFallbacks,
+	}, nil
 }
 
 func (b *benchmark) waitForGantryMetricDelta(ctx context.Context, revision string, before gantryMetrics) (gantryMetrics, error) {
+	return b.waitForGantryMetricSettlement(ctx, revision, before, true)
+}
+
+func (b *benchmark) waitForGantryMetricSettlement(
+	ctx context.Context,
+	revision string,
+	before gantryMetrics,
+	requirePeerActivity bool,
+) (gantryMetrics, error) {
 	deadline := time.Now().Add(2 * time.Minute)
+	settlement := gantryMetricSettlement{window: 20 * time.Second, requirePeerActivity: requirePeerActivity}
+
+	inFlightQuery := fmt.Sprintf(
+		`sum(p2p_in_flight_pulls{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+		b.config.GantryNamespace,
+		revision,
+	)
+
+	var (
+		lastDelta    gantryMetrics
+		lastInFlight float64
+		lastErr      error
+	)
 
 	for {
 		after, err := b.fetchGantryRevisionMetrics(ctx, revision)
 		if err == nil {
-			delta := subtractGantryMetrics(after, before)
-			if delta.PeerFetchHits > 0 {
-				return delta, nil
+			inFlight, queryErr := b.queryPrometheusOrZero(ctx, inFlightQuery)
+			if queryErr == nil {
+				lastDelta, lastErr = subtractGantryMetrics(after, before)
+				if lastErr != nil {
+					settlement.initialized = false
+					settlement.stableSince = time.Time{}
+
+					continue
+				}
+
+				lastInFlight = inFlight
+
+				if settlement.Observe(time.Now(), lastDelta, inFlight) {
+					return lastDelta, nil
+				}
+			} else {
+				lastErr = queryErr
 			}
+		} else {
+			lastErr = err
 		}
 
 		if time.Now().After(deadline) {
-			if err != nil {
-				return gantryMetrics{}, fmt.Errorf("gantry cold metrics were not scraped: %w", err)
+			if lastErr != nil {
+				return gantryMetrics{}, fmt.Errorf("gantry cold metrics did not settle: %w", lastErr)
 			}
 
-			return gantryMetrics{}, fmt.Errorf("gantry peer-hit counter did not increase during the cold phase")
+			if requirePeerActivity && lastDelta.PeerFetchHits <= 0 {
+				return gantryMetrics{}, fmt.Errorf("gantry peer-hit counter did not increase during the cold phase")
+			}
+
+			return gantryMetrics{}, fmt.Errorf(
+				"gantry metrics did not remain stable for %s before timeout: in_flight=%.0f delta=%+v",
+				settlement.window,
+				lastInFlight,
+				lastDelta,
+			)
 		}
 
 		select {
@@ -251,58 +375,139 @@ func (b *benchmark) waitForGantryMetricDelta(ctx context.Context, revision strin
 	}
 }
 
-func subtractGantryMetrics(after, before gantryMetrics) gantryMetrics {
-	return gantryMetrics{
-		OriginPulls:   nonNegativeDifference(after.OriginPulls, before.OriginPulls),
-		PeerFetchHits: nonNegativeDifference(after.PeerFetchHits, before.PeerFetchHits),
-	}
+// gantryMetricSettlement waits for counters to remain unchanged while no
+// background origin pulls are in flight. The stable window spans two 10-second
+// PodMonitor scrape intervals, preventing a completed workload Job from racing
+// with late prefetches whose counters have not reached Prometheus yet.
+type gantryMetricSettlement struct {
+	window              time.Duration
+	requirePeerActivity bool
+	stableSince         time.Time
+	last                gantryMetrics
+	initialized         bool
 }
 
-func nonNegativeDifference(after, before float64) float64 {
-	if after < before {
-		return 0
+func (s *gantryMetricSettlement) Observe(now time.Time, current gantryMetrics, inFlight float64) bool {
+	if (s.requirePeerActivity && current.PeerFetchHits <= 0) || inFlight > 0 {
+		s.initialized = false
+		s.stableSince = time.Time{}
+
+		return false
 	}
 
-	return after - before
+	if !s.initialized || s.last != current {
+		s.last = current
+		s.stableSince = now
+		s.initialized = true
+
+		return false
+	}
+
+	return now.Sub(s.stableSince) >= s.window
+}
+
+func subtractGantryMetrics(after, before gantryMetrics) (gantryMetrics, error) {
+	fields := []struct {
+		name   string
+		after  float64
+		before float64
+	}{
+		{name: "origin_pulls", after: after.OriginPulls, before: before.OriginPulls},
+		{name: "origin_bytes", after: after.OriginBytes, before: before.OriginBytes},
+		{name: "peer_fetch_hits", after: after.PeerFetchHits, before: before.PeerFetchHits},
+		{name: "origin_layer_pulls", after: after.OriginLayerPulls, before: before.OriginLayerPulls},
+		{name: "origin_fallbacks", after: after.OriginFallbacks, before: before.OriginFallbacks},
+	}
+
+	for _, field := range fields {
+		if field.after < field.before {
+			return gantryMetrics{}, fmt.Errorf(
+				"gantry counter %s decreased during phase: before=%.0f after=%.0f",
+				field.name,
+				field.before,
+				field.after,
+			)
+		}
+	}
+
+	return gantryMetrics{
+		OriginPulls:      after.OriginPulls - before.OriginPulls,
+		OriginBytes:      after.OriginBytes - before.OriginBytes,
+		PeerFetchHits:    after.PeerFetchHits - before.PeerFetchHits,
+		OriginLayerPulls: after.OriginLayerPulls - before.OriginLayerPulls,
+		OriginFallbacks:  after.OriginFallbacks - before.OriginFallbacks,
+	}, nil
+}
+
+// deriveOriginBytes attributes a phase's ACR traffic. Proxy mode measures it
+// directly. Direct mode's baseline remains analytic because it bypasses Gantry;
+// the Gantry-cold phase uses bytes measured at Gantry's upstream response-body
+// boundary, including partial failed transfers and retries.
+func deriveOriginBytes(config benchmarkConfig, phase proxyPhase, proxy proxyPhaseTotals, gantry gantryMetrics, job jobObservation) (uint64, originByteSource) {
+	if config.usesProxy() {
+		return proxy.BytesUpstream, originBytesProxy
+	}
+
+	if phase == proxyPhaseBaseline {
+		return uint64(len(job.Nodes)) * config.imageBytes(), originBytesAnalyticBaseline
+	}
+
+	return uint64(gantry.OriginBytes), originBytesGantryMeasured
 }
 
 func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchmarkComparison {
 	comparison := benchmarkComparison{
 		RunID:      baseline.RunID,
+		Mode:       config.Mode,
 		Baseline:   baseline,
 		GantryCold: gantry,
 		Checks:     make(map[string]resultCheck),
 	}
+
 	comparison.OriginByteReduction = reduction(
-		float64(baseline.Proxy.BytesUpstream),
-		float64(gantry.Proxy.BytesUpstream),
+		float64(baseline.OriginBytes),
+		float64(gantry.OriginBytes),
 	)
-	comparison.OriginRequestReduction = reduction(
-		float64(baseline.Proxy.RequestsCompleted),
-		float64(gantry.Proxy.RequestsCompleted),
-	)
+	if baseline.Azure.Complete && gantry.Azure.Complete {
+		comparison.OriginRequestReduction = reduction(
+			float64(baseline.Azure.ACR.SuccessfulPullCount),
+			float64(gantry.Azure.ACR.SuccessfulPullCount),
+		)
+		comparison.OriginRequestReductionAvailable = true
+		comparison.OriginRequestSource = "ContainerRegistryRepositoryEvents"
+	} else if config.usesProxy() {
+		comparison.OriginRequestReduction = reduction(
+			float64(baseline.Proxy.RequestsCompleted),
+			float64(gantry.Proxy.RequestsCompleted),
+		)
+		comparison.OriginRequestReductionAvailable = true
+		comparison.OriginRequestSource = "acr-origin-proxy"
+	}
+
 	comparison.P50StartLatencyReduction = reduction(
-		baseline.Job.PodStartLatency.P50Seconds,
-		gantry.Job.PodStartLatency.P50Seconds,
+		phaseStartupLatency(baseline).P50Seconds,
+		phaseStartupLatency(gantry).P50Seconds,
 	)
 	comparison.P95StartLatencyReduction = reduction(
-		baseline.Job.PodStartLatency.P95Seconds,
-		gantry.Job.PodStartLatency.P95Seconds,
+		phaseStartupLatency(baseline).P95Seconds,
+		phaseStartupLatency(gantry).P95Seconds,
 	)
 
 	byteCheck := resultCheck{
 		Passed: comparison.OriginByteReduction >= config.MinimumByteReduction,
 		Message: fmt.Sprintf(
-			"origin byte reduction %.2f%%, minimum %.2f%%",
+			"origin byte reduction %.2f%%, minimum %.2f%% (baseline source %s, Gantry source %s)",
 			100*comparison.OriginByteReduction,
 			100*config.MinimumByteReduction,
+			baseline.OriginBytesSource,
+			gantry.OriginBytesSource,
 		),
 	}
 	comparison.Checks["origin_byte_reduction"] = byteCheck
 
 	latencyRatio := ratio(
-		gantry.Job.PodStartLatency.P95Seconds,
-		baseline.Job.PodStartLatency.P95Seconds,
+		phaseStartupLatency(gantry).P95Seconds,
+		phaseStartupLatency(baseline).P95Seconds,
 	)
 	latencyCheck := resultCheck{
 		Passed: latencyRatio <= config.MaximumLatencyRatio,
@@ -320,9 +525,105 @@ func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchm
 	}
 	comparison.Checks["peer_activity"] = peerCheck
 
-	comparison.Passed = byteCheck.Passed && latencyCheck.Passed && peerCheck.Passed
+	// Without a recorded source the byte figures are meaningless, and an unset
+	// OriginBytes would otherwise read as a clean 0% reduction rather than as an
+	// error. Fail loudly instead.
+	recordedCheck := resultCheck{
+		Passed: baseline.OriginBytesSource != "" && gantry.OriginBytesSource != "",
+		Message: fmt.Sprintf(
+			"origin byte sources baseline=%q Gantry=%q, want both recorded",
+			baseline.OriginBytesSource,
+			gantry.OriginBytesSource,
+		),
+	}
+	comparison.Checks["origin_bytes_recorded"] = recordedCheck
+
+	peerBytesCheck := resultCheck{
+		Passed: baseline.GantryPeer.Complete && gantry.GantryPeer.Complete,
+		Message: fmt.Sprintf(
+			"Gantry peer byte measurements baseline=%t Gantry=%t",
+			baseline.GantryPeer.Complete,
+			gantry.GantryPeer.Complete,
+		),
+	}
+	comparison.Checks["peer_bytes_recorded"] = peerBytesCheck
+
+	comparison.Passed = byteCheck.Passed && latencyCheck.Passed && peerCheck.Passed && recordedCheck.Passed && peerBytesCheck.Passed
+
+	if config.AzureTelemetry {
+		azureCheck := resultCheck{
+			Passed: baseline.Azure.Complete && gantry.Azure.Complete,
+			Message: fmt.Sprintf(
+				"Azure telemetry baseline=%t Gantry=%t",
+				baseline.Azure.Complete,
+				gantry.Azure.Complete,
+			),
+		}
+		comparison.Checks["azure_telemetry_complete"] = azureCheck
+		comparison.Passed = comparison.Passed && azureCheck.Passed
+	}
+
+	if !config.usesProxy() {
+		// Direct mode's baseline remains analytic, so its routing assumption has
+		// to be a gate rather than a footnote.
+
+		// Gantry's node configurator routes every registry through the local
+		// mirror via _default/hosts.toml. The baseline installs an explicit
+		// direct-to-ACR host file to override it; if that override failed the
+		// baseline silently ran through Gantry and the comparison is void.
+		bypassCheck := resultCheck{
+			Passed: baseline.Gantry.OriginPulls == 0 && baseline.Gantry.PeerFetchHits == 0,
+			Message: fmt.Sprintf(
+				"baseline Gantry activity origin_pulls=%.0f peer_hits=%.0f, want zero so the baseline bypassed Gantry",
+				baseline.Gantry.OriginPulls,
+				baseline.Gantry.PeerFetchHits,
+			),
+		}
+		comparison.Checks["baseline_bypassed_gantry"] = bypassCheck
+
+		// NF5 fallback bytes are included by gantry_origin_bytes_total, but a
+		// fallback means peer distribution exhausted and the run is unhealthy.
+		fallbackCheck := resultCheck{
+			Passed: gantry.Gantry.OriginFallbacks == 0,
+			Message: fmt.Sprintf(
+				"Gantry origin fallback pulls %.0f, want zero for a healthy peer-distribution path",
+				gantry.Gantry.OriginFallbacks,
+			),
+		}
+		comparison.Checks["no_origin_fallback"] = fallbackCheck
+
+		comparison.Passed = comparison.Passed && bypassCheck.Passed && fallbackCheck.Passed
+	}
 
 	return comparison
+}
+
+func phaseStartupLatency(phase phaseResult) latencySummary {
+	if phase.PodStartupLatencySource != "" {
+		return phase.PodStartupLatency
+	}
+
+	return phase.Job.PodStartLatency
+}
+
+func phaseStartupLatencySource(phase phaseResult) string {
+	if phase.PodStartupLatencySource != "" {
+		return phase.PodStartupLatencySource
+	}
+
+	return "kubernetes_pod_status"
+}
+
+func originByteMetricLabel(phase phaseResult) string {
+	if phase.OriginBytesSource == originBytesPrivateEndpoint {
+		return "ACR Private Endpoint bytes from ACR"
+	}
+
+	if phase.OriginBytesSource == originBytesProxy {
+		return "Proxy-measured ACR upstream bytes"
+	}
+
+	return "ACR origin bytes"
 }
 
 func reduction(baseline, candidate float64) float64 {
@@ -360,48 +661,142 @@ func (b *benchmark) writeComparisonArtifacts(comparison benchmarkComparison) err
 		return err
 	}
 
-	baselineDigestRequests := digestRequests(comparison.Baseline.Proxy)
-	gantryDigestRequests := digestRequests(comparison.GantryCold.Proxy)
-	markdown := fmt.Sprintf(`# Gantry benchmark %s
-
-| Metric | Baseline | Gantry cold | Reduction |
-| --- | ---: | ---: | ---: |
-| ACR upstream bytes | %d | %d | %.2f%% |
-| Proxy requests | %d | %d | %.2f%% |
-| Digest requests | %d | %d | %.2f%% |
-| Pod start P50 | %.3fs | %.3fs | %.2f%% |
-| Pod start P95 | %.3fs | %.3fs | %.2f%% |
-| Gantry origin pulls | 0 | %.0f | n/a |
-| Gantry peer hits | 0 | %.0f | n/a |
-
-Result: **%s**
-
-`,
-		comparison.RunID,
-		comparison.Baseline.Proxy.BytesUpstream,
-		comparison.GantryCold.Proxy.BytesUpstream,
-		100*comparison.OriginByteReduction,
-		comparison.Baseline.Proxy.RequestsCompleted,
-		comparison.GantryCold.Proxy.RequestsCompleted,
-		100*comparison.OriginRequestReduction,
-		baselineDigestRequests,
-		gantryDigestRequests,
-		100*reduction(float64(baselineDigestRequests), float64(gantryDigestRequests)),
-		comparison.Baseline.Job.PodStartLatency.P50Seconds,
-		comparison.GantryCold.Job.PodStartLatency.P50Seconds,
-		100*comparison.P50StartLatencyReduction,
-		comparison.Baseline.Job.PodStartLatency.P95Seconds,
-		comparison.GantryCold.Job.PodStartLatency.P95Seconds,
-		100*comparison.P95StartLatencyReduction,
-		comparison.GantryCold.Gantry.OriginPulls,
-		comparison.GantryCold.Gantry.PeerFetchHits,
-		strings.ToUpper(map[bool]string{true: "pass", false: "fail"}[comparison.Passed]),
-	)
+	markdown := renderComparisonMarkdown(comparison)
 
 	return os.WriteFile(
 		filepath.Join(b.config.StateRoot, comparison.RunID, "comparison.md"),
 		[]byte(markdown),
 		0o640,
+	)
+}
+
+func renderComparisonMarkdown(comparison benchmarkComparison) string {
+	result := strings.ToUpper(map[bool]string{true: "pass", false: "fail"}[comparison.Passed])
+	baselineLatency := phaseStartupLatency(comparison.Baseline)
+	gantryLatency := phaseStartupLatency(comparison.GantryCold)
+
+	if comparison.Mode == benchmarkModeDirect {
+		requestReduction := "unavailable without Azure telemetry"
+		baselinePulls := "n/a"
+		gantryPulls := "n/a"
+
+		if comparison.OriginRequestReductionAvailable {
+			requestReduction = fmt.Sprintf("%.2f%%", 100*comparison.OriginRequestReduction)
+			baselinePulls = fmt.Sprintf("%d", comparison.Baseline.Azure.ACR.SuccessfulPullCount)
+			gantryPulls = fmt.Sprintf("%d", comparison.GantryCold.Azure.ACR.SuccessfulPullCount)
+		}
+
+		byteLabel := originByteMetricLabel(comparison.Baseline)
+
+		return fmt.Sprintf(`# Gantry benchmark %s
+
+Mode: **direct**
+
+Origin byte sources:
+
+- Baseline: %s
+- Gantry cold: %s
+
+| Metric | Baseline | Gantry cold | Reduction |
+| --- | ---: | ---: | ---: |
+| %s | %d | %d | %.2f%% |
+| ACR successful image pulls | %s | %s | %s |
+| Pod start P50 | %.3fs | %.3fs | %.2f%% |
+| Pod start P95 | %.3fs | %.3fs | %.2f%% |
+| Gantry peer bytes served | %d | %d | n/a |
+| Gantry origin pulls | 0 | %.0f | n/a |
+| Gantry peer hits | 0 | %.0f | n/a |
+
+Pod startup latency source: **%s / %s**
+
+Result: **%s**
+
+`,
+			comparison.RunID,
+			comparison.Baseline.OriginBytesSource,
+			comparison.GantryCold.OriginBytesSource,
+			byteLabel,
+			comparison.Baseline.OriginBytes,
+			comparison.GantryCold.OriginBytes,
+			100*comparison.OriginByteReduction,
+			baselinePulls,
+			gantryPulls,
+			requestReduction,
+			baselineLatency.P50Seconds,
+			gantryLatency.P50Seconds,
+			100*comparison.P50StartLatencyReduction,
+			baselineLatency.P95Seconds,
+			gantryLatency.P95Seconds,
+			100*comparison.P95StartLatencyReduction,
+			comparison.Baseline.GantryPeer.Total,
+			comparison.GantryCold.GantryPeer.Total,
+			comparison.GantryCold.Gantry.OriginPulls,
+			comparison.GantryCold.Gantry.PeerFetchHits,
+			phaseStartupLatencySource(comparison.Baseline),
+			phaseStartupLatencySource(comparison.GantryCold),
+			result,
+		)
+	}
+
+	baselineDigestRequests := digestRequests(comparison.Baseline.Proxy)
+	gantryDigestRequests := digestRequests(comparison.GantryCold.Proxy)
+	baselineRequests := comparison.Baseline.Proxy.RequestsCompleted
+	gantryRequests := comparison.GantryCold.Proxy.RequestsCompleted
+	requestMetricLabel := "Proxy requests"
+	byteMetricLabel := originByteMetricLabel(comparison.Baseline)
+
+	if comparison.OriginRequestSource == "ContainerRegistryRepositoryEvents" {
+		baselineRequests = comparison.Baseline.Azure.ACR.SuccessfulPullCount
+		gantryRequests = comparison.GantryCold.Azure.ACR.SuccessfulPullCount
+		requestMetricLabel = "ACR successful image pulls"
+	}
+
+	return fmt.Sprintf(`# Gantry benchmark %s
+
+| Metric | Baseline | Gantry cold | Reduction |
+| --- | ---: | ---: | ---: |
+| %s | %d | %d | %.2f%% |
+| %s | %d | %d | %.2f%% |
+| Digest requests | %d | %d | %.2f%% |
+| Pod start P50 | %.3fs | %.3fs | %.2f%% |
+| Pod start P95 | %.3fs | %.3fs | %.2f%% |
+| Gantry peer bytes served | %d | %d | n/a |
+| Gantry origin pulls | 0 | %.0f | n/a |
+| Gantry peer hits | 0 | %.0f | n/a |
+
+Image pull count source: **%s**
+
+Pod startup latency source: **%s / %s**
+
+Result: **%s**
+
+`,
+		comparison.RunID,
+		byteMetricLabel,
+		comparison.Baseline.OriginBytes,
+		comparison.GantryCold.OriginBytes,
+		100*comparison.OriginByteReduction,
+		requestMetricLabel,
+		baselineRequests,
+		gantryRequests,
+		100*comparison.OriginRequestReduction,
+		baselineDigestRequests,
+		gantryDigestRequests,
+		100*reduction(float64(baselineDigestRequests), float64(gantryDigestRequests)),
+		baselineLatency.P50Seconds,
+		gantryLatency.P50Seconds,
+		100*comparison.P50StartLatencyReduction,
+		baselineLatency.P95Seconds,
+		gantryLatency.P95Seconds,
+		100*comparison.P95StartLatencyReduction,
+		comparison.Baseline.GantryPeer.Total,
+		comparison.GantryCold.GantryPeer.Total,
+		comparison.GantryCold.Gantry.OriginPulls,
+		comparison.GantryCold.Gantry.PeerFetchHits,
+		comparison.OriginRequestSource,
+		phaseStartupLatencySource(comparison.Baseline),
+		phaseStartupLatencySource(comparison.GantryCold),
+		result,
 	)
 }
 

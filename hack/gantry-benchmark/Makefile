@@ -1,7 +1,7 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 
-.PHONY: help test proxy-image proxy-push enable preflight run status disable
+.PHONY: help test proxy-image proxy-push enable prepare preflight run status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -11,6 +11,7 @@ help: ## Show benchmark targets
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
 	@echo "  proxy-push   Push BENCHMARK_PROXY_IMAGE"
 	@echo "  enable       Install benchmark instrumentation"
+	@echo "  prepare      Build and push both digest-pinned workload images"
 	@echo "  preflight    Validate ACR, monitoring, Gantry, and all target nodes"
 	@echo "  run          Execute baseline and Gantry cold phases"
 	@echo "  status       Print active benchmark state"
@@ -43,7 +44,7 @@ proxy-push:
 		--username "$${ACR_USERNAME}" --password-stdin "$${ACR_LOGIN_SERVER}"; \
 	"$${CONTAINER_ENGINE:-podman}" push "$${BENCHMARK_PROXY_IMAGE}"
 
-enable preflight run status disable:
+enable prepare preflight run status disable:
 	set -a; \
 	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
 	set +a; \
