@@ -30,7 +30,7 @@ ExecStart={{.KubeletBinPath}} \
         --pod-max-pids=-1 \
         --protect-kernel-defaults=true \
         --read-only-port=0 \
-        --resolv-conf=/etc/resolv.conf \
+        --resolv-conf={{.ResolvConf}} \
         --streaming-connection-idle-timeout=4h \
         --tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_RSA_WITH_AES_256_GCM_SHA384,TLS_RSA_WITH_AES_128_GCM_SHA256 \
         $KUBELET_NODE_CONFIG_ARGS \

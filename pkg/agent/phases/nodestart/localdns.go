@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -61,24 +60,24 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 		return fmt.Errorf("write LocalDNS slice: %w", err)
 	}
 
-	resolvPath := filepath.Join(c.goalState.MachineDir, "etc/resolv.conf")
-
-	resolvConf, err := os.ReadFile(resolvPath)
-	if err != nil {
-		return fmt.Errorf("read machine resolver: %w", err)
-	}
-
 	var resolverLines []string
 
-	for _, line := range strings.Split(string(resolvConf), "\n") {
+	for _, line := range strings.Split(string(c.goalState.LocalDNS.OriginalHostResolvConf), "\n") {
 		if line != "" && !strings.HasPrefix(strings.TrimSpace(line), "nameserver ") {
 			resolverLines = append(resolverLines, line)
 		}
 	}
 
 	resolverLines = append(resolverLines, "nameserver "+c.goalState.LocalDNS.NodeListenerIP.String())
-	if err := utilio.WriteFile(resolvPath, []byte(strings.Join(resolverLines, "\n")+"\n"), 0o644); err != nil {
-		return fmt.Errorf("write machine resolver: %w", err)
+
+	resolverContent := []byte(strings.Join(resolverLines, "\n") + "\n")
+	for _, resolvPath := range []string{
+		filepath.Join(c.goalState.MachineDir, "etc/resolv.conf"),
+		filepath.Join(c.goalState.MachineDir, strings.TrimPrefix(goalstates.LocalDNSResolvConfPath, "/")),
+	} {
+		if err := utilio.WriteFile(resolvPath, resolverContent, 0o644); err != nil {
+			return fmt.Errorf("write machine resolver %s: %w", resolvPath, err)
+		}
 	}
 
 	return nil

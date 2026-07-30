@@ -108,6 +108,7 @@ func (c *configureKubelet) ensureKubeletServiceUnit() error {
 	buf := &bytes.Buffer{}
 	if err := assetsTemplate.ExecuteTemplate(buf, "kubelet.service", map[string]any{
 		"KubeletBinPath": spec.KubeletBinPath,
+		"ResolvConf":     spec.ResolvConf,
 	}); err != nil {
 		return err
 	}
