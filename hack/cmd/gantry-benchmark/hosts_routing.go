@@ -495,8 +495,12 @@ func (b *benchmark) validateBenchmarkDaemonSet(ctx context.Context, name string)
 		return fmt.Errorf("decode DaemonSet %s: %w", name, err) //nolint:staticcheck // Kubernetes kind name starts with a capital.
 	}
 
-	if daemonSet.Status.DesiredNumberScheduled != b.config.NodeCount || daemonSet.Status.NumberReady != b.config.NodeCount {
-		return fmt.Errorf("daemonset %s is ready on %d/%d nodes", name, daemonSet.Status.NumberReady, b.config.NodeCount)
+	return validateBenchmarkDaemonSetStatus(daemonSet, name, b.config.NodeCount)
+}
+
+func validateBenchmarkDaemonSetStatus(daemonSet daemonSetStatus, name string, expectedCount int) error {
+	if daemonSet.Status.DesiredNumberScheduled != expectedCount || daemonSet.Status.NumberReady != expectedCount {
+		return fmt.Errorf("daemonset %s is ready on %d/%d nodes", name, daemonSet.Status.NumberReady, expectedCount)
 	}
 
 	return nil

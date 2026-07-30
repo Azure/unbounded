@@ -13,15 +13,16 @@ import (
 )
 
 func TestRenderHosts(t *testing.T) {
-	state := benchmarkState{RunID: "run-1", ProxyClusterIP: "10.0.0.42"}
+	state := benchmarkState{RunID: "run-1", Mode: benchmarkModeDirect, ACRLoginServer: "bench.azurecr.io"}
 
 	baseline, err := renderHosts(state, hostsModeBaseline)
 	if err != nil {
 		t.Fatalf("render baseline: %v", err)
 	}
 
-	if !strings.Contains(baseline, `server = "http://10.0.0.42:5002"`) ||
-		!strings.Contains(baseline, `[host."http://10.0.0.42:5002"]`) ||
+	if !strings.Contains(baseline, `server = "https://bench.azurecr.io"`) ||
+		!strings.Contains(baseline, `[host."https://bench.azurecr.io"]`) ||
+		strings.Contains(baseline, "acr-origin-proxy") ||
 		strings.Contains(baseline, "127.0.0.1") {
 		t.Fatalf("unexpected baseline hosts.toml:\n%s", baseline)
 	}
@@ -32,11 +33,10 @@ func TestRenderHosts(t *testing.T) {
 	}
 
 	// STRICT mode: Gantry is the ONLY upstream, so there must be no `server=`
-	// fall-through that would let containerd bypass Gantry to the proxy and
-	// miscount those pulls as origin load.
+	// fall-through that would let containerd bypass Gantry to ACR.
 	if strings.Contains(gantry, "server =") ||
 		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) ||
-		strings.Contains(gantry, "10.0.0.42") ||
+		strings.Contains(gantry, "bench.azurecr.io") ||
 		strings.Contains(gantry, "skip_verify") {
 		t.Fatalf("unexpected Gantry hosts.toml:\n%s", gantry)
 	}
