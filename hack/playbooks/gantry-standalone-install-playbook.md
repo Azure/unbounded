@@ -33,8 +33,8 @@ Gantry guide.
 - Workload manifests do not use `imagePullSecrets` for this validation.
 - Commands run from the repository root so relative `hack/` and `deploy/`
   paths resolve correctly.
-- Gantry is installed from this repository's plain manifests under
-  `deploy/gantry`.
+- Gantry is installed from this repository's manifest templates under
+  `deploy/gantry`, rendered with `make gantry-manifests`.
 
 ## Set Variables
 
@@ -222,23 +222,40 @@ GOTOOLCHAIN=auto make image-gantry-push \
 
 ## Prepare Gantry Manifests
 
-Render Gantry manifests into the working directory. The ConfigMap must list the
-ACR login server as an upstream registry, and the DaemonSet image must be the
-selected Gantry image.
+`deploy/gantry` holds Go templates (`*.yaml.tmpl`), not applyable manifests.
+Render them with `make gantry-manifests`, which writes to the gitignored
+`deploy/gantry/rendered/` directory. The template default namespace is
+`unbounded-system`, so set `GANTRY_NAMESPACE` explicitly: the Gantry benchmark
+tooling defaults to `gantry-system` and the two must agree.
 
 ```bash
-sed \
-  -e "s/registry.example.com/${ACR_LOGIN_SERVER}/g" \
-  -e "s#https://registry.example.com#https://${ACR_LOGIN_SERVER}#g" \
-  deploy/gantry/configmap.yaml > "$WORK_DIR/gantry-configmap.yaml"
+GANTRY_NAMESPACE="${GANTRY_NAMESPACE:-gantry-system}"
 
-kubectl set image --local \
-  -f deploy/gantry/daemonset.yaml \
-  gantry="$GANTRY_IMAGE" \
-  -o yaml > "$WORK_DIR/gantry-daemonset.yaml"
+make gantry-manifests \
+  GANTRY_NAMESPACE="$GANTRY_NAMESPACE" \
+  GANTRY_IMAGE="$GANTRY_IMAGE"
+```
 
-kubectl apply --dry-run=client -f deploy/gantry/serviceaccount.yaml -f deploy/gantry/node-config.yaml -o name
-kubectl apply --dry-run=client -f "$WORK_DIR/gantry-configmap.yaml" -f "$WORK_DIR/gantry-daemonset.yaml" -o name
+The rendered ConfigMap ships a placeholder upstream registry. Point it at the
+ACR login server, which rewrites both the `name` and the `endpoint`:
+
+```bash
+sed -i "s#registry.example.com#${ACR_LOGIN_SERVER}#g" \
+  deploy/gantry/rendered/configmap.yaml
+
+grep -A3 'upstream_registries:' deploy/gantry/rendered/configmap.yaml
+```
+
+Validate before applying. Apply the four manifests by name: the rendered
+directory also contains `examples/`, which must not be applied as part of a
+baseline install.
+
+```bash
+kubectl apply --dry-run=client -o name \
+  -f deploy/gantry/rendered/serviceaccount.yaml \
+  -f deploy/gantry/rendered/node-config.yaml \
+  -f deploy/gantry/rendered/configmap.yaml \
+  -f deploy/gantry/rendered/daemonset.yaml
 ```
 
 Do not add `credentials_path` for this validation. The image pull credential
@@ -251,16 +268,16 @@ required for standalone installs because it writes containerd's default
 `hosts.toml` mirror entry.
 
 ```bash
-kubectl apply -f deploy/gantry/serviceaccount.yaml
+kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
 
-kubectl apply -f deploy/gantry/node-config.yaml
-kubectl -n gantry-system rollout status daemonset/gantry-containerd-config --timeout=15m
+kubectl apply -f deploy/gantry/rendered/node-config.yaml
+kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-containerd-config --timeout=15m
 
-kubectl apply -f "$WORK_DIR/gantry-configmap.yaml"
-kubectl apply -f "$WORK_DIR/gantry-daemonset.yaml"
-kubectl -n gantry-system rollout status daemonset/gantry --timeout=15m
+kubectl apply -f deploy/gantry/rendered/configmap.yaml
+kubectl apply -f deploy/gantry/rendered/daemonset.yaml
+kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry --timeout=15m
 
-kubectl -n gantry-system get daemonsets -o wide
+kubectl -n "$GANTRY_NAMESPACE" get daemonsets -o wide
 kubectl get nodes --no-headers | awk '{count[$2]++} END {for (condition in count) print condition, count[condition]}'
 ```
 
@@ -409,20 +426,20 @@ curl -fsS http://127.0.0.1:9096/metrics | grep -E \
 ## Optional NetworkPolicy Hardening
 
 Apply NetworkPolicy only after baseline success. Copy
-`deploy/gantry/examples/networkpolicy.yaml` into an overlay, replace every
-operator-required CIDR, and ensure mirror TCP/5000 allows the node CIDR rather
-than only `127.0.0.1/32`. Re-run Gantry health and private ACR pull validation
-after applying the policy.
+`deploy/gantry/rendered/examples/networkpolicy.yaml` into an overlay, replace
+every operator-required CIDR, and ensure mirror TCP/5000 allows the node CIDR
+rather than only `127.0.0.1/32`. Re-run Gantry health and private ACR pull
+validation after applying the policy.
 
 ## Rollback
 
 Remove Gantry and provider installer Kubernetes objects:
 
 ```bash
-kubectl delete -f "$WORK_DIR/gantry-daemonset.yaml" --ignore-not-found
-kubectl delete -f "$WORK_DIR/gantry-configmap.yaml" --ignore-not-found
-kubectl delete -f deploy/gantry/node-config.yaml --ignore-not-found
-kubectl delete -f deploy/gantry/serviceaccount.yaml --ignore-not-found
+kubectl delete -f deploy/gantry/rendered/daemonset.yaml --ignore-not-found
+kubectl delete -f deploy/gantry/rendered/configmap.yaml --ignore-not-found
+kubectl delete -f deploy/gantry/rendered/node-config.yaml --ignore-not-found
+kubectl delete -f deploy/gantry/rendered/serviceaccount.yaml --ignore-not-found
 kubectl delete pod acr-provider-preflight acr-gantry-pull-a acr-gantry-pull-b --ignore-not-found
 ```
 
