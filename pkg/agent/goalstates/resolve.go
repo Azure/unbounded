@@ -79,6 +79,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 
 	if localDNS.Enabled {
 		kubelet.ClusterDNS = localDNS.ClusterListenerIP.String()
+		kubelet.ResolvConf = LocalDNSResolvConfPath
 	}
 
 	containerdVersion := cfg.CRI.Containerd.Version
@@ -200,6 +201,7 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		APIServer:               cfg.Kubelet.ApiServer,
 		CACertData:              caCert,
 		ClusterDNS:              cfg.Cluster.ClusterDNS,
+		ResolvConf:              "/etc/resolv.conf",
 		NodeIP:                  nodeIP,
 		NodeLabels:              labels,
 		RegisterWithTaints:      cfg.Kubelet.RegisterWithTaints,

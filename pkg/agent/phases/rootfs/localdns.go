@@ -62,6 +62,10 @@ func (c *configureLocalDNS) Do(ctx context.Context) error {
 		return fmt.Errorf("write LocalDNS Corefile: %w", err)
 	}
 
+	if err := utilio.WriteFile(filepath.Join(localDNSDir, "resolv.conf"), localDNSResolvConf(c.goalState.LocalDNS.OriginalHostResolvConf, c.goalState.LocalDNS.NodeListenerIP.String()), 0o644); err != nil {
+		return fmt.Errorf("write LocalDNS resolver: %w", err)
+	}
+
 	upstreams := make([]string, 0, len(c.goalState.LocalDNS.NodeUpstreamIPs))
 	for _, upstream := range c.goalState.LocalDNS.NodeUpstreamIPs {
 		upstreams = append(upstreams, upstream.String())
@@ -209,6 +213,20 @@ func (c *configureLocalDNS) installCoreDNS(ctx context.Context) error {
 	c.log.Info("installed CoreDNS", "version", c.goalState.LocalDNS.CoreDNSVersion)
 
 	return nil
+}
+
+func localDNSResolvConf(original []byte, listener string) []byte {
+	var lines []string
+
+	for _, line := range strings.Split(string(original), "\n") {
+		if line != "" && !strings.HasPrefix(strings.TrimSpace(line), "nameserver ") {
+			lines = append(lines, line)
+		}
+	}
+
+	lines = append(lines, "nameserver "+listener)
+
+	return []byte(strings.Join(lines, "\n") + "\n")
 }
 
 func ensureWorldExecutableDir(path string) error {

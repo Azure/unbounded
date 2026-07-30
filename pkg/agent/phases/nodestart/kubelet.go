@@ -118,6 +118,9 @@ func (c *configureKubelet) ensureKubeletConfiguration() error {
 	configuration["kind"] = "KubeletConfiguration"
 	configuration["clusterDNS"] = []string{spec.ClusterDNS}
 	configuration["containerRuntimeEndpoint"] = "unix:///run/containerd/containerd.sock"
+	if spec.ResolvConf != "" {
+		configuration["resolvConf"] = spec.ResolvConf
+	}
 
 	authentication := ensureConfigurationMap(configuration, "authentication")
 	x509 := ensureConfigurationMap(authentication, "x509")
