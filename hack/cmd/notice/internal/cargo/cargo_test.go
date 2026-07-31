@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/testutil"
 )
 
@@ -73,10 +74,16 @@ dependencies = [
 	if len(entries) != 3 {
 		t.Fatalf("got %d entries, want 3", len(entries))
 	}
-	if entries[0].Dependency != "build-helper" || entries[1].Dependency != "foo" || entries[2].Dependency != "linux-only" {
-		t.Fatalf("dependencies = %q, %q, %q", entries[0].Dependency, entries[1].Dependency, entries[2].Dependency)
+	byDependency := make(map[string]notice.Entry, len(entries))
+	for _, entry := range entries {
+		byDependency[entry.Dependency] = entry
 	}
-	if got := entries[1].License[0].Link; got != "https://docs.rs/crate/foo/1.2.3/source/LICENSE" {
+	for _, dependency := range []string{"build-helper", "foo", "linux-only"} {
+		if _, ok := byDependency[dependency]; !ok {
+			t.Errorf("dependency %q not collected", dependency)
+		}
+	}
+	if got := byDependency["foo"].License[0].Link; got != "https://docs.rs/crate/foo/1.2.3/source/LICENSE" {
 		t.Errorf("license link = %q", got)
 	}
 }

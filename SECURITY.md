@@ -7,7 +7,7 @@ latest release and the `main` branch. Older releases are not routinely supported
 Users should upgrade to the latest available release before reporting a problem
 that may already have been corrected.
 
-## Reporting A Vulnerability
+## Reporting a Vulnerability
 
 Do not report suspected vulnerabilities through public GitHub issues,
 discussions, or pull requests. Use the Microsoft Security Response Center

@@ -83,17 +83,11 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
 	}
 
-	names := make([]string, 0, len(versions))
-	for name := range versions {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	entries := make([]notice.Entry, 0, len(names))
-	for _, name := range names {
-		entry, err := c.buildEntry(name, versions[name])
+	entries := make([]notice.Entry, 0, len(versions))
+	for name, version := range versions {
+		entry, err := c.buildEntry(name, version)
 		if err != nil {
-			return nil, fmt.Errorf("crate %s@%s: %w", name, versions[name], err)
+			return nil, fmt.Errorf("crate %s@%s: %w", name, version, err)
 		}
 		entries = append(entries, entry)
 	}
