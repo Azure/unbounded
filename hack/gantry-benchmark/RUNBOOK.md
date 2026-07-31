@@ -49,9 +49,7 @@ az vm run-command invoke \
    -g "$AZURE_RESOURCE_GROUP" \
    -n "$OPERATOR_VM_NAME" \
    --command-id RunShellScript \
-   --scripts \
-      'systemctl reset-failed gantry-benchmark-operator.service || true' \
-      'systemctl start --no-block gantry-benchmark-operator.service'
+   --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
 ```
 
 The service performs `enable`, `prepare`, `preflight`, `run`, and `disable` from

@@ -504,9 +504,7 @@ az vm run-command invoke \
   -g "$RESOURCE_GROUP" \
   -n "$OPERATOR_VM_NAME" \
   --command-id RunShellScript \
-  --scripts \
-    'systemctl reset-failed gantry-benchmark-operator.service || true' \
-    'systemctl start --no-block gantry-benchmark-operator.service'
+  --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
 ```
 
 Inspect status, logs, and the latest report without logging into the VM:

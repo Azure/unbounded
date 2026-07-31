@@ -171,8 +171,12 @@ retry sh -c 'KUBECONFIG=/var/lib/gantry-benchmark/kubeconfig kubectl auth can-i 
 
 getent ahostsv4 "$baseline_login_server"
 getent ahostsv4 "$gantry_login_server"
-curl -fsS -o /dev/null -w 'baseline ACR status: %{http_code}\n' "https://$baseline_login_server/v2/" || true
-curl -fsS -o /dev/null -w 'Gantry ACR status: %{http_code}\n' "https://$gantry_login_server/v2/" || true
+baseline_status=$(curl -sS -o /dev/null -w '%{http_code}' "https://$baseline_login_server/v2/")
+gantry_status=$(curl -sS -o /dev/null -w '%{http_code}' "https://$gantry_login_server/v2/")
+[[ "$baseline_status" == 401 ]] || { echo "baseline ACR returned HTTP $baseline_status, want 401" >&2; exit 1; }
+[[ "$gantry_status" == 401 ]] || { echo "Gantry ACR returned HTTP $gantry_status, want 401" >&2; exit 1; }
+echo "baseline ACR status: $baseline_status"
+echo "Gantry ACR status: $gantry_status"
 
 cat <<SUMMARY
 operator VM bootstrap complete
