@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document describes how Unbounded Kubernetes makes technical and community
+This document describes how Project Unbounded makes technical and community
 decisions. It applies to the source, documentation, releases, and project policy
 maintained in this repository.
 
