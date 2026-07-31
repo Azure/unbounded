@@ -113,6 +113,20 @@ az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" \
   --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
 ```
 
+Follow progress from the workstation in a separate terminal:
+
+```bash
+export AZURE_RESOURCE_GROUP="<resource-group>"
+export OPERATOR_VM_NAME="gantry-benchmark-operator"
+make -C hack/gantry-benchmark operator-vm-watch
+```
+
+The live view reports the lifecycle stage and start time, immutable run shape,
+payload files/bytes/percentage, active Podman build or push, VM disk usage,
+Kubernetes Job completion, Gantry readiness, recent logs, and the final report.
+Use `operator-vm-status` for a single snapshot. Override the refresh cadence
+with `WATCH_INTERVAL_SECONDS` (default 30).
+
 Artifacts persist on the VM under
 `/var/lib/gantry-benchmark/artifacts/<run-id>/`; `latest` points at the newest
 run. The repository copy and Go/Podman caches live on its 512 GiB OS disk by

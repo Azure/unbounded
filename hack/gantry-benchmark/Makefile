@@ -1,7 +1,7 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 
-.PHONY: help test operator-vm-check operator-vm-provision proxy-image proxy-push enable prepare preflight run status disable
+.PHONY: help test operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare preflight run status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -10,6 +10,8 @@ help: ## Show benchmark targets
 	@echo "  test         Run focused proxy and benchmark tests"
 	@echo "  operator-vm-check      Validate operator VM scripts"
 	@echo "  operator-vm-provision  Provision/bootstrap the private operator VM"
+	@echo "  operator-vm-status     Print one live operator VM progress snapshot"
+	@echo "  operator-vm-watch      Follow operator VM progress until completion"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
 	@echo "  proxy-push   Push BENCHMARK_PROXY_IMAGE"
 	@echo "  enable       Install benchmark instrumentation"
@@ -24,10 +26,16 @@ test:
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go test ./hack/cmd/acr-origin-proxy ./hack/cmd/gantry-benchmark
 
 operator-vm-check:
-	bash -n operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-run.sh
+	bash -n operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-run.sh operator-vm-status.sh operator-vm-watch.sh
 
 operator-vm-provision: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-provision.sh
+
+operator-vm-status: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-watch.sh
+
+operator-vm-watch: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-watch.sh --follow
 
 proxy-image:
 	set -a; \

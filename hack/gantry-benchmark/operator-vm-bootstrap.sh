@@ -73,7 +73,7 @@ else
   git clone --branch "$repo_branch" --single-branch "$repo_url" "$repo_root"
 fi
 
-chmod +x "$repo_root/hack/gantry-benchmark/operator-vm-run.sh"
+chmod +x "$repo_root"/hack/gantry-benchmark/operator-vm-*.sh
 
 retry az login --identity --allow-no-subscriptions --output none
 az account set --subscription "$subscription_id"

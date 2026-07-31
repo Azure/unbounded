@@ -35,12 +35,28 @@ run_id=""
 run_status=0
 cleanup_started=false
 
+write_progress() {
+  local stage=$1
+  local message=$2
+  local temporary="$BENCHMARK_ARTIFACT_ROOT/.progress.json.tmp"
+
+  jq -n \
+    --arg run_id "$run_id" \
+    --arg stage "$stage" \
+    --arg message "$message" \
+    --arg stage_started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{run_id:$run_id,stage:$stage,message:$message,stage_started_at:$stage_started_at}' \
+    >"$temporary"
+  mv "$temporary" "$BENCHMARK_ARTIFACT_ROOT/progress.json"
+}
+
 cleanup() {
   local original_status=$?
   if [[ "$cleanup_started" == true ]]; then
     return
   fi
   cleanup_started=true
+  write_progress "cleanup" "restoring cluster state and preserving artifacts"
 
   unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token aad_access_token
   podman logout "$BASELINE_ACR_LOGIN_SERVER" >/dev/null 2>&1 || true
@@ -72,6 +88,12 @@ cleanup() {
     '{run_id:$run_id,finished_at:$finished_at,exit_code:$exit_code}' \
     >"$BENCHMARK_ARTIFACT_ROOT/last-run.json"
 
+  if ((original_status == 0)); then
+    write_progress "completed" "benchmark lifecycle completed successfully"
+  else
+    write_progress "failed" "benchmark lifecycle exited with code $original_status"
+  fi
+
   return "$original_status"
 }
 trap cleanup EXIT
@@ -80,6 +102,7 @@ trap 'exit 143' TERM
 
 cd "$BENCHMARK_REPO_ROOT"
 
+write_progress "authenticate" "authenticating managed identity and loading kubeconfig"
 echo "authenticating operator VM managed identity"
 az login --identity --allow-no-subscriptions --output none
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
@@ -102,9 +125,11 @@ if kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-be
   exit 1
 fi
 
+write_progress "enable" "installing benchmark state, lock, and monitoring"
 make -C hack/gantry-benchmark enable
 run_id=$(kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state -o jsonpath='{.data.state\.json}' | jq -er '.run_id')
 echo "enabled benchmark $run_id"
+write_progress "prepare" "generating shared payload and pushing both private ACR images"
 
 tenant_id=$(az account show --query tenantId -o tsv)
 aad_access_token=$(az account get-access-token --resource https://containerregistry.azure.net --query accessToken -o tsv)
@@ -133,10 +158,13 @@ unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_re
 podman logout "$BASELINE_ACR_LOGIN_SERVER" >/dev/null 2>&1 || true
 podman logout "$GANTRY_ACR_LOGIN_SERVER" >/dev/null 2>&1 || true
 
+write_progress "preflight" "validating nodes, Gantry, monitoring, ACRs, and telemetry"
 make -C hack/gantry-benchmark preflight
+write_progress "run" "executing baseline and Gantry phases"
 make -C hack/gantry-benchmark run || run_status=$?
 
 if [[ -f "$BENCHMARK_REPO_ROOT/tmp/gantry-benchmark/$run_id/comparison.md" ]]; then
+  write_progress "report" "comparison generated; preparing cleanup"
   cat "$BENCHMARK_REPO_ROOT/tmp/gantry-benchmark/$run_id/comparison.md"
 fi
 

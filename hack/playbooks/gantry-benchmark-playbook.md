@@ -510,6 +510,21 @@ az vm run-command invoke \
 Inspect status, logs, and the latest report without logging into the VM:
 
 ```bash
+export AZURE_RESOURCE_GROUP="$RESOURCE_GROUP"
+export OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
+
+make -C hack/gantry-benchmark operator-vm-watch
+```
+
+The watch view refreshes every 30 seconds by default and reports lifecycle
+stage, payload generation percentage, active image build/push, VM disk and
+Podman usage, Kubernetes Job completion, Gantry readiness, recent logs, and the
+final report. Set `WATCH_INTERVAL_SECONDS` to change the cadence. For one
+snapshot, use `operator-vm-status`.
+
+The underlying Azure Run Command equivalent is:
+
+```bash
 az vm run-command invoke \
   -g "$RESOURCE_GROUP" \
   -n "$OPERATOR_VM_NAME" \

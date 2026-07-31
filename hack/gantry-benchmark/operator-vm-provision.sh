@@ -188,5 +188,7 @@ benchmark service: gantry-benchmark-operator.service
 start command:
   az vm run-command invoke -g $AZURE_RESOURCE_GROUP -n $OPERATOR_VM_NAME --command-id RunShellScript --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
 status command:
-  az vm run-command invoke -g $AZURE_RESOURCE_GROUP -n $OPERATOR_VM_NAME --command-id RunShellScript --scripts 'systemctl status gantry-benchmark-operator.service --no-pager || true' 'tail -100 /var/log/gantry-benchmark/service.log'
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-status
+watch command:
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-watch
 SUMMARY

@@ -57,6 +57,24 @@ the VM. Cleanup runs on success, failure, or interruption.
 
 ## 3. Inspect Status And Results
 
+Use the repository progress dashboard while the service is running:
+
+```bash
+export AZURE_RESOURCE_GROUP="<resource-group>"
+export OPERATOR_VM_NAME="gantry-benchmark-operator"
+
+# One snapshot:
+make -C hack/gantry-benchmark operator-vm-status
+
+# Continuously refresh until completion or failure:
+WATCH_INTERVAL_SECONDS=30 make -C hack/gantry-benchmark operator-vm-watch
+```
+
+The dashboard combines lifecycle heartbeat, build progress, Podman storage,
+VM disk, active image command, Kubernetes Jobs, Gantry DaemonSet status, and
+recent logs. During a running lifecycle it never displays a previous run's
+comparison as if it were current.
+
 ```bash
 az vm run-command invoke \
    -g "$AZURE_RESOURCE_GROUP" \
