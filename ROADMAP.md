@@ -50,3 +50,6 @@ Maintainers prioritize items based on adopter feedback, contributor
 availability, architectural alignment, and CNCF ecosystem integration.
 
 Detailed implementation work is tracked through GitHub issues and milestones.
+
+Project governance is described in [GOVERNANCE.md](GOVERNANCE.md), and CNCF
+Sandbox preparation is tracked in [issue #555](https://github.com/Azure/unbounded/issues/555).

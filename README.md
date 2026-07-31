@@ -36,7 +36,7 @@ so that pods, services, and DNS work transparently across sites.
   <img src="docs/static/img/unbounded-overview.svg" alt="Unbounded Kubernetes overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking" width="800">
 </p>
 
-For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded/concepts/overview/).
+For a deeper dive, see the [Project Overview](https://unbounded-cloud.io/concepts/overview/).
 
 ## Key Features
 
@@ -51,17 +51,17 @@ For a deeper dive, see the [Project Overview](https://azure.github.io/unbounded/
 
 | Component | Description | Details |
 |-----------|-------------|---------|
-| **[unbounded-agent](https://azure.github.io/unbounded/guides/agent/)** | Single binary delivered to hosts to bootstrap them as Kubernetes worker nodes using `systemd-nspawn`. | [Agent Guide](https://azure.github.io/unbounded/guides/agent/) |
-| **[machina](https://azure.github.io/unbounded/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://azure.github.io/unbounded/guides/ssh/), [CRD Reference](https://azure.github.io/unbounded/reference/machina-crd/) |
-| **[metalman](https://azure.github.io/unbounded/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://azure.github.io/unbounded/guides/pxe/), [Bare Metal Concepts](https://azure.github.io/unbounded/concepts/bare-metal/) |
-| **[unbounded-net](https://github.com/Azure/unbounded-net)** | CNI plugin and multi-site networking system for cross-site pod connectivity. | [Networking Concepts](https://azure.github.io/unbounded/concepts/networking/) |
-| **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://azure.github.io/unbounded/reference/cli/) |
+| **[unbounded-agent](https://unbounded-cloud.io/guides/agent/)** | Single binary delivered to hosts to bootstrap them as Kubernetes worker nodes using `systemd-nspawn`. | [Agent Guide](https://unbounded-cloud.io/guides/agent/) |
+| **[machina](https://unbounded-cloud.io/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://unbounded-cloud.io/guides/ssh/), [CRD Reference](https://unbounded-cloud.io/reference/machina-crd/) |
+| **[metalman](https://unbounded-cloud.io/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://unbounded-cloud.io/guides/pxe/), [Bare Metal Concepts](https://unbounded-cloud.io/concepts/bare-metal/) |
+| **unbounded-net** | CNI plugin and multi-site networking system maintained in this repository for cross-site pod connectivity. | [Networking Concepts](https://unbounded-cloud.io/concepts/networking/) |
+| **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://unbounded-cloud.io/reference/cli/) |
 
 ## Quick Start
 
 Get a working multi-site cluster in under 10 minutes. This creates an AKS cluster
 and joins a remote node to it. Already have a cluster? See the
-[Bring Your Own Cluster](https://azure.github.io/unbounded/guides/existing-cluster/) guide.
+[Bring Your Own Cluster](https://unbounded-cloud.io/guides/existing-cluster/) guide.
 
 <p align="center">
   <img src="docs/static/img/quickstart-architecture.svg" alt="Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard" width="700">
@@ -120,17 +120,22 @@ kubectl get nodes -w
 After a few minutes your remote node appears with status **Ready**.
 
 For the full walkthrough including pod networking verification, see the
-[Getting Started Guide](https://azure.github.io/unbounded/guides/getting-started/).
+[Getting Started Guide](https://unbounded-cloud.io/guides/getting-started/).
 
 ## Documentation
 
-Full documentation is available at **[azure.github.io/unbounded](https://azure.github.io/unbounded/)**.
+Full documentation is available at **[unbounded-cloud.io](https://unbounded-cloud.io/)**.
 
 | | |
 |---|---|
-| **Concepts** | [Project Overview](https://azure.github.io/unbounded/concepts/overview/) · [Networking](https://azure.github.io/unbounded/concepts/networking/) · [Bare Metal](https://azure.github.io/unbounded/concepts/bare-metal/) |
-| **Guides** | [Getting Started](https://azure.github.io/unbounded/guides/getting-started/) · [Existing Cluster](https://azure.github.io/unbounded/guides/existing-cluster/) · [SSH Provisioning](https://azure.github.io/unbounded/guides/ssh/) · [Cloud API](https://azure.github.io/unbounded/guides/cloud-api/) · [PXE Boot](https://azure.github.io/unbounded/guides/pxe/) · [Agent](https://azure.github.io/unbounded/guides/agent/) |
-| **Reference** | [Architecture](https://azure.github.io/unbounded/reference/architecture/) · [CLI](https://azure.github.io/unbounded/reference/cli/) · [Machine CRD](https://azure.github.io/unbounded/reference/machina-crd/) · [GPU / NVIDIA](https://azure.github.io/unbounded/reference/gpu/nvidia/) · [GPU / AMD](https://azure.github.io/unbounded/reference/gpu/amd/) |
+| **Concepts** | [Project Overview](https://unbounded-cloud.io/concepts/overview/) · [Networking](https://unbounded-cloud.io/concepts/networking/) · [Bare Metal](https://unbounded-cloud.io/concepts/bare-metal/) |
+| **Guides** | [Getting Started](https://unbounded-cloud.io/guides/getting-started/) · [Existing Cluster](https://unbounded-cloud.io/guides/existing-cluster/) · [SSH Provisioning](https://unbounded-cloud.io/guides/ssh/) · [Cloud API](https://unbounded-cloud.io/guides/cloud-api/) · [PXE Boot](https://unbounded-cloud.io/guides/pxe/) · [Agent](https://unbounded-cloud.io/guides/agent/) |
+| **Reference** | [Architecture](https://unbounded-cloud.io/reference/architecture/) · [CLI](https://unbounded-cloud.io/reference/cli/) · [Machine CRD](https://unbounded-cloud.io/reference/machina-crd/) · [GPU / NVIDIA](https://unbounded-cloud.io/reference/gpu/nvidia/) · [GPU / AMD](https://unbounded-cloud.io/reference/gpu/amd/) |
+
+Project direction and stewardship are documented in the [roadmap](ROADMAP.md),
+[maintainer list](MAINTAINERS.md), [governance policy](GOVERNANCE.md), and
+[security policy](SECURITY.md). CNCF Sandbox preparation is tracked in
+[CNCF.md](CNCF.md) and [issue #555](https://github.com/Azure/unbounded/issues/555).
 
 ## Repository Structure
 
