@@ -71,7 +71,12 @@ if [[ -n "$run_id" ]]; then
     payload_files=$(find "$build_dir" -maxdepth 1 -name 'payload*.bin' -type f 2>/dev/null | wc -l)
     if ((payload_files > 0)); then
       payload_bytes=$(du -sb "$build_dir" 2>/dev/null | awk '{print $1}')
-      payload_target_mib=$(jq -r '.image_size_mib // 0' <<<"${state_json:-{}}" 2>/dev/null || echo 0)
+      payload_target_mib=0
+      payload_layers="?"
+      if [[ -n "$state_json" ]]; then
+        payload_target_mib=$(jq -r '.image_size_mib // 0' <<<"$state_json" 2>/dev/null) || payload_target_mib=0
+        payload_layers=$(jq -r '.image_layers // "?"' <<<"$state_json" 2>/dev/null) || payload_layers="?"
+      fi
       payload_target_bytes=$((payload_target_mib * 1024 * 1024))
       percent=0
       if ((payload_target_bytes > 0)); then
@@ -79,7 +84,7 @@ if [[ -n "$run_id" ]]; then
         ((percent > 100)) && percent=100
       fi
       printf 'payload generation: %d/%s files, %d%% (%s bytes)\n' \
-        "$payload_files" "$(jq -r '.image_layers // "?"' <<<"${state_json:-{}}" 2>/dev/null || echo '?')" "$percent" "$payload_bytes"
+        "$payload_files" "$payload_layers" "$percent" "$payload_bytes"
     fi
   fi
 fi
