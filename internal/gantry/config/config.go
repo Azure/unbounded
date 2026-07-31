@@ -290,8 +290,10 @@ type Config struct {
 	// PeerFetchTimeout caps the complete peer request, including streaming and
 	// committing the response body. It is deliberately SHORT (60s): a requester
 	// stuck on a lockstep-saturated seed must bail and re-select a fresher
-	// finisher-seed rather than ride the slow stream to completion. That
-	// bail-and-re-select is what drives the cold-start cascade (paired with the
+	// finisher-seed rather than ride the slow stream to completion. Live peer
+	// streams resume from the verified byte offset when re-selecting, so this
+	// deadline does not discard an already-delivered prefix. That bail-and-
+	// re-select is what drives the cold-start cascade (paired with the
 	// strict containerd hosts.toml, where an exhausted fetch 503s and containerd
 	// retries Gantry, re-discovering recent finishers). Setting this too high
 	// (e.g. 1h) removes the re-selection and collapses distribution to the

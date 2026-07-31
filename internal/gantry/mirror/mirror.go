@@ -870,6 +870,11 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 			}
 
 			return
+		case peerFallbackPartial:
+			// Response headers and a verified prefix were already written. Let
+			// the truncated response close so containerd can retry; writing a
+			// 503 body here would corrupt the content stream.
+			return
 		case peerFallbackExhausted:
 			http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
 			return
@@ -1263,6 +1268,10 @@ const (
 	// in live-stream-through mode they were proxied directly and the final
 	// digest check passed after proxying. Caller must not write further bytes.
 	peerFallbackServed
+	// peerFallbackPartial means live stream-through delivered a prefix but
+	// exhausted its re-discovery budget before completing the digest. The
+	// caller must close the response without writing an HTTP error body.
+	peerFallbackPartial
 	// peerFallbackExhausted means the DHT returned providers but all
 	// maxAttempts of them failed (stall or error), OR the cold-start
 	// cascade short-circuited with an error other than
@@ -1301,6 +1310,59 @@ const (
 type peerAttemptResult struct {
 	outcome peerFetchOutcomeKind
 	served  bool
+}
+
+type livePeerStream struct {
+	verifier  *digestpipe.Writer
+	totalSize int64
+	started   bool
+}
+
+func (s *livePeerStream) offset() int64 {
+	if s == nil || s.verifier == nil {
+		return 0
+	}
+
+	return s.verifier.Written()
+}
+
+func (s *livePeerStream) append(w http.ResponseWriter, src io.Reader, d digest.Digest, size int64, kind ifaces.OriginRefKind) (int64, bool, error) {
+	var reader io.Reader = src
+
+	if !s.started {
+		br := bufio.NewReader(src)
+
+		var sniff []byte
+		if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
+			if peek, _ := br.Peek(512); len(peek) > 0 { //nolint:errcheck // best-effort media sniff
+				sniff = peek
+			}
+		}
+
+		writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
+		s.verifier = digestpipe.New(w)
+		s.totalSize = size
+		s.started = true
+		reader = br
+	} else if size != s.totalSize {
+		return 0, false, fmt.Errorf("peer resume size changed from %d to %d", s.totalSize, size)
+	}
+
+	written, err := io.Copy(s.verifier, reader)
+	switch offset := s.offset(); {
+	case offset > s.totalSize:
+		return written, false, fmt.Errorf("peer stream exceeded content size: wrote %d, want %d", offset, s.totalSize)
+	case offset < s.totalSize && err != nil:
+		return written, false, err
+	case offset < s.totalSize:
+		return written, false, io.ErrUnexpectedEOF
+	}
+
+	if err := s.verifier.Verify(d); err != nil {
+		return written, false, err
+	}
+
+	return written, true, nil
 }
 
 type providerDigestKey struct {
@@ -1354,11 +1416,21 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 // (peerFallbackUnused -> direct origin, peerFallbackExhausted -> 503,
 // peerFallbackColdExhausted -> NF5 gating) are preserved exactly.
 func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) peerFallbackResult {
+	var stream *livePeerStream
+	if s.liveStreamThrough {
+		stream = &livePeerStream{}
+	}
+
 	budget := s.peerRediscoverBudget
 	if budget <= 0 {
 		// Re-discovery disabled: a single round with cold-start allowed,
 		// identical to the historical behavior.
-		return s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, logger)
+		result := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, stream, logger)
+		if stream != nil && stream.started && result != peerFallbackServed {
+			return peerFallbackPartial
+		}
+
+		return result
 	}
 
 	backoff := s.peerRediscoverBackoff
@@ -1368,7 +1440,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 	deadline := time.Now().Add(budget)
 
-	firstResult := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, logger)
+	firstResult := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, stream, logger)
 	switch firstResult {
 	case peerFallbackServed, peerFallbackLocalHit:
 		return firstResult
@@ -1382,22 +1454,30 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	for time.Now().Before(deadline) {
 		// A concurrent request or the local puller may have populated the
 		// cache since the last round.
-		if s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger) {
+		if (stream == nil || !stream.started) && s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger) {
 			return peerFallbackLocalHit
 		}
 
 		select {
 		case <-ctx.Done():
+			if stream != nil && stream.started {
+				return peerFallbackPartial
+			}
+
 			return firstResult
 		case <-time.After(jitteredBackoff(backoff)):
 		}
 
-		switch s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, false, logger) {
+		switch s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, false, stream, logger) {
 		case peerFallbackServed:
 			return peerFallbackServed
 		case peerFallbackLocalHit:
 			return peerFallbackLocalHit
 		}
+	}
+
+	if stream != nil && stream.started {
+		return peerFallbackPartial
 	}
 
 	return firstResult
@@ -1426,10 +1506,14 @@ func jitteredBackoff(base time.Duration) time.Duration {
 // containerd commit. When allowColdStart is false, the cold-start
 // (please_pull) legs are skipped so the re-discovery loop does not re-issue
 // please_pull on every round.
-func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, allowColdStart bool, logger *slog.Logger) peerFallbackResult {
+func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, allowColdStart bool, stream *livePeerStream, logger *slog.Logger) peerFallbackResult {
 	// Cold-start may designate this process as the puller, populating the
 	// local store after serveDigest's initial cache miss.
 	recheckLocalAfterColdStart := func() bool {
+		if stream != nil && stream.started {
+			return false
+		}
+
 		return s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger)
 	}
 
@@ -1560,12 +1644,16 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 
 		tried++
 		summary.attempted++
-		res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger)
+		res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, stream, logger)
 
 		summary = updatePeerSummary(summary, res.outcome)
 		if res.served {
 			return peerFallbackServed
 		}
+	}
+
+	if stream != nil && stream.started {
+		return peerFallbackExhausted
 	}
 
 	if tried > 0 && allowColdStart {
@@ -1602,7 +1690,7 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 
 			tried++
 			summary.attempted++
-			res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger)
+			res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, stream, logger)
 
 			summary = updatePeerSummary(summary, res.outcome)
 			if res.served {
@@ -1619,12 +1707,15 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 // from cache. In live-stream-through mode it proxies directly to the
 // caller and performs the final digest check after the streamed body ends;
 // containerd is still responsible for rejecting any bad bytes it received.
-func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, p ifaces.Provider, fetchBudget time.Duration, logger *slog.Logger) peerAttemptResult {
+func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, p ifaces.Provider, fetchBudget time.Duration, stream *livePeerStream, logger *slog.Logger) peerAttemptResult {
 	pCtx, cancel := context.WithTimeout(ctx, fetchBudget)
 	defer cancel()
 
 	fetchStart := time.Now()
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+	if stream != nil {
+		pRef.Offset = stream.offset()
+	}
 
 	rc, psize, err := s.peer.FetchFromPeer(pCtx, p.Addr, pRef)
 	if err != nil {
@@ -1669,7 +1760,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	s.bumpPeerDial(true)
 
 	if s.liveStreamThrough {
-		written, streamErr := streamDigestToClient(w, rc, d, psize, kind)
+		written, complete, streamErr := stream.append(w, rc, d, psize, kind)
 		s.fireMirrorBytesServed(kind, "peer", written)
 
 		if streamErr != nil {
@@ -1690,11 +1781,15 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 			s.bumpPeerFetchLatency("stall", fetchStart)
 			logger.Debug("mirror: peer live stream-through failed",
 				slog.String("peer", p.Addr),
+				slog.Int64("resume_offset", stream.offset()),
 				slog.Int64("written", written),
 				slog.Any("err", streamErr),
 			)
 
-			return peerAttemptResult{outcome: peerFetchOutcomeStall, served: true}
+			return peerAttemptResult{outcome: peerFetchOutcomeStall, served: ctx.Err() != nil}
+		}
+		if !complete {
+			return peerAttemptResult{outcome: peerFetchOutcomeStall}
 		}
 
 		s.bumpPeerFetch("hit")

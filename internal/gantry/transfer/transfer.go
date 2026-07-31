@@ -21,7 +21,8 @@
 // loop-breaker that prevents two agents from recursing into each
 // other's miss paths.
 // - `Range: bytes=N-M` returns `206 Partial Content` with the correct
-// `Content-Range`. v1 callers always fetch whole blobs, but the
+// `Content-Range`. Resumable peer callers use this to continue a live stream
+// from another provider without retransmitting the verified prefix; the
 // contract is preserved for v2 striping.
 // - Metric `p2p_peer_serve_total` is bumped per served body - not
 // `p2p_cache_hit_total`, so cluster scrapes distinguish containerd-

@@ -129,6 +129,58 @@ func TestClientFetchOK(t *testing.T) {
 	}
 }
 
+func TestClientFetchRange(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("peer-served bytes")
+	d := mustDigest(body)
+	cache.Put(d, body)
+
+	addr := startTransferOnEphemeral(t, cache)
+	rc, size, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+		Repository: "myrepo",
+		Digest:     d,
+		Offset:     5,
+	})
+	if err != nil {
+		t.Fatalf("FetchFromPeer: %v", err)
+	}
+	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
+	if size != int64(len(body)) {
+		t.Fatalf("size = %d, want full size %d", size, len(body))
+	}
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != string(body[5:]) {
+		t.Fatalf("body = %q, want %q", got, body[5:])
+	}
+}
+
+func TestClientRejectsInvalidRangeResponse(t *testing.T) {
+	body := []byte("wrong range")
+	d := mustDigest(body)
+	addr := startHandlerOnEphemeral(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-10/11")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+
+	rc, _, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+		Repository: "myrepo",
+		Digest:     d,
+		Offset:     5,
+	})
+	if rc != nil {
+		_ = rc.Close() //nolint:errcheck // best-effort close
+	}
+	if err == nil || !strings.Contains(err.Error(), "invalid Content-Range") {
+		t.Fatalf("error = %v, want invalid Content-Range", err)
+	}
+}
+
 func TestClientByteMetricsReportsPartialReadOnClose(t *testing.T) {
 	body := []byte("peer-served bytes with a deliberately partial read")
 	d := mustDigest(body)

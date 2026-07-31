@@ -129,7 +129,11 @@ write_progress "enable" "installing benchmark state, lock, and monitoring"
 make -C hack/gantry-benchmark enable
 run_id=$(kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state -o jsonpath='{.data.state\.json}' | jq -er '.run_id')
 echo "enabled benchmark $run_id"
-write_progress "prepare" "generating shared payload and pushing both private ACR images"
+if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+  write_progress "prepare" "rebuilding a cache-cold Gantry image from baseline $GANTRY_ONLY_BASELINE_RUN_ID"
+else
+  write_progress "prepare" "generating shared payload and pushing both private ACR images"
+fi
 
 tenant_id=$(az account show --query tenantId -o tsv)
 aad_access_token=$(az account get-access-token --resource https://containerregistry.azure.net --query accessToken -o tsv)
@@ -153,15 +157,24 @@ gantry_refresh_token=$(curl -fsS -X POST \
 unset aad_access_token
 export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
 export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
-make -C hack/gantry-benchmark prepare
+if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+  make -C hack/gantry-benchmark prepare-gantry GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID"
+else
+  make -C hack/gantry-benchmark prepare
+fi
 unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token
 podman logout "$BASELINE_ACR_LOGIN_SERVER" >/dev/null 2>&1 || true
 podman logout "$GANTRY_ACR_LOGIN_SERVER" >/dev/null 2>&1 || true
 
 write_progress "preflight" "validating nodes, Gantry, monitoring, ACRs, and telemetry"
 make -C hack/gantry-benchmark preflight
-write_progress "run" "executing baseline and Gantry phases"
-make -C hack/gantry-benchmark run || run_status=$?
+if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+  write_progress "run" "executing Gantry-only phase against baseline $GANTRY_ONLY_BASELINE_RUN_ID"
+  make -C hack/gantry-benchmark run-gantry || run_status=$?
+else
+  write_progress "run" "executing baseline and Gantry phases"
+  make -C hack/gantry-benchmark run || run_status=$?
+fi
 
 if [[ -f "$BENCHMARK_REPO_ROOT/tmp/gantry-benchmark/$run_id/comparison.md" ]]; then
   write_progress "report" "comparison generated; preparing cleanup"

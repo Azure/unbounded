@@ -1,7 +1,7 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 
-.PHONY: help test operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare preflight run status disable
+.PHONY: help test operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare prepare-gantry preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -16,8 +16,10 @@ help: ## Show benchmark targets
 	@echo "  proxy-push   Push BENCHMARK_PROXY_IMAGE"
 	@echo "  enable       Install benchmark instrumentation"
 	@echo "  prepare      Build and push both digest-pinned workload images"
+	@echo "  prepare-gantry  Build only a cache-cold Gantry image from a retained baseline"
 	@echo "  preflight    Validate ACR, monitoring, Gantry, and all target nodes"
 	@echo "  run          Execute baseline and Gantry cold phases"
+	@echo "  run-gantry   Execute only Gantry cold against the retained baseline"
 	@echo "  status       Print active benchmark state"
 	@echo "  disable      Restore routing and remove instrumentation"
 
@@ -61,8 +63,15 @@ proxy-push:
 		--username "$${ACR_USERNAME}" --password-stdin "$${ACR_LOGIN_SERVER}"; \
 	"$${CONTAINER_ENGINE:-podman}" push "$${BENCHMARK_PROXY_IMAGE}"
 
-enable prepare preflight run status disable:
+enable prepare preflight run run-gantry status disable:
 	set -a; \
 	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
 	set +a; \
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark $@
+
+prepare-gantry:
+	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }
+	set -a; \
+	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
+	set +a; \
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry "$(GANTRY_ONLY_BASELINE_RUN_ID)"
