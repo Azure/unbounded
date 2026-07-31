@@ -1,13 +1,15 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 
-.PHONY: help test proxy-image proxy-push enable prepare preflight run status disable
+.PHONY: help test operator-vm-check operator-vm-provision proxy-image proxy-push enable prepare preflight run status disable
 
 help: ## Show benchmark targets
 	@echo ""
 	@echo "Usage: make -C hack/gantry-benchmark <target> [ENV_FILE=path]"
 	@echo ""
 	@echo "  test         Run focused proxy and benchmark tests"
+	@echo "  operator-vm-check      Validate operator VM scripts"
+	@echo "  operator-vm-provision  Provision/bootstrap the private operator VM"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
 	@echo "  proxy-push   Push BENCHMARK_PROXY_IMAGE"
 	@echo "  enable       Install benchmark instrumentation"
@@ -18,7 +20,14 @@ help: ## Show benchmark targets
 	@echo "  disable      Restore routing and remove instrumentation"
 
 test:
+	$(MAKE) operator-vm-check
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go test ./hack/cmd/acr-origin-proxy ./hack/cmd/gantry-benchmark
+
+operator-vm-check:
+	bash -n operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-run.sh
+
+operator-vm-provision: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-provision.sh
 
 proxy-image:
 	set -a; \

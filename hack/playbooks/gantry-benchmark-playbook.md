@@ -78,24 +78,21 @@ The cluster should already have:
 - Permission to create privileged hostPath DaemonSets and patch the Gantry
   ConfigMap.
 
-The operator machine should have:
+The admin workstation needs only:
 
-- `az`, `kubectl`, `jq`, `helm`, and either `podman` or Docker Buildx.
-- Push permission to both ACRs. For admin-disabled registries, use
-  `az acr login --expose-token` for each ACR and the all-zero username.
+- Azure CLI permission to create the operator VM/network resources and assign
+  roles.
+- Git and Make for invoking the repository provisioning target.
+
+The private operator VM installs and owns `az`, `kubectl`, `jq`, Go, Podman,
+the repository, kubeconfig, image builds, lifecycle commands, telemetry
+queries, logs, and result artifacts.
 
 ## Safety Checks
 
-Confirm the target cluster:
-
-```bash
-kubectl config current-context
-kubectl get nodes -L kubernetes.azure.com/agentpool,kubernetes.io/os,kubernetes.io/arch
-kubectl -n gantry-system get daemonset gantry
-kubectl -n monitoring get pods,svc
-kubectl -n gantry-system get configmap gantry-config \
-  -o jsonpath='{.data.config\.yaml}' | grep -A3 'upstream_registries:'
-```
+Bootstrap retrieves the kubeconfig and verifies cluster-admin authorization.
+`enable` and `preflight` then confirm the exact context, eligible nodes, Gantry
+DaemonSet, monitoring, and upstream registry from the VM.
 
 For direct mode, the matching upstream entry must be named
 `$GANTRY_ACR_LOGIN_SERVER` and its endpoint must be
@@ -103,23 +100,10 @@ For direct mode, the matching upstream entry must be named
 baseline ACR is reached only through the benchmark's explicit direct
 containerd configuration.
 
-Check for existing benchmark state:
-
-```bash
-make -C hack/gantry-benchmark status || true
-kubectl -n gantry-system get configmap gantry-benchmark-lock -o yaml 2>/dev/null || true
-kubectl -n gantry-benchmark get configmap gantry-benchmark-state -o yaml 2>/dev/null || true
-```
-
-If an old benchmark namespace or lock exists, clean it up before starting a new
-run:
-
-```bash
-BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark disable
-```
-
-Do not manually delete benchmark resources unless you are deliberately doing
-failure recovery and have inspected the current routing state.
+The service refuses to start when an old benchmark state exists. Its cleanup
+trap invokes `disable` when either state or the Gantry-namespace lock remains.
+Do not manually delete benchmark resources unless VM logs show that normal
+restoration cannot proceed.
 
 ## Install kube-prometheus-stack
 
@@ -170,10 +154,9 @@ ACR itself does not expose an egress-byte metric. The Private Endpoint is the
 supported Azure-side byte meter. The benchmark requires public ACR access to be
 disabled so traffic cannot bypass that meter.
 
-The operator machine needs registry data-plane access only while `prepare`
-builds and pushes both generated images. After that, disable public access and
-run preflight plus both measured phases from the same operator machine; only
-AKS nodes transfer image content through the Private Endpoint.
+Both ACRs remain private-only. The operator VM resolves their login and data
+endpoints through the AKS VNet, builds and pushes both images over Private Link,
+and runs preflight plus both measured phases from that same VM.
 
 Set the Azure resource variables:
 
@@ -358,71 +341,54 @@ During collection, each phase also requires `PEBytesIn` to meet a minimum
 derived from the transferred workload. Non-null endpoint points containing only
 control traffic are incomplete and invalidate Azure promotion.
 
-## Configure The Environment
+## Provision The Private Operator VM
 
-Create local config:
-
-```bash
-cp hack/gantry-benchmark/env.example hack/gantry-benchmark/env.local
-```
-
-Edit `hack/gantry-benchmark/env.local`. Keep secrets out of git. At minimum,
-set:
+The provisioning script is idempotent. It creates a private subnet, an NSG with
+no inbound rules, a NAT gateway for outbound dependencies, a private VM with a
+system-assigned identity, and the required role assignments. It then uses Azure
+Run Command to install tools, clone the private benchmark branch, write a
+VM-only configuration, fetch an admin kubeconfig, and install the systemd unit.
 
 ```bash
-export BENCHMARK_CONFIRM_CONTEXT="$(kubectl config current-context)"
+export AZURE_SUBSCRIPTION_ID="<subscription-id>"
+export AZURE_RESOURCE_GROUP="$RESOURCE_GROUP"
+export AZURE_AKS_CLUSTER_NAME="$CLUSTER_NAME"
+export BASELINE_ACR_NAME="$BASELINE_ACR_NAME"
+export GANTRY_ACR_NAME="$GANTRY_ACR_NAME"
+export AZURE_LOG_ANALYTICS_WORKSPACE_NAME="$LAW_NAME"
+export AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="$BASELINE_PRIVATE_ENDPOINT_ID"
+export AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="$GANTRY_PRIVATE_ENDPOINT_ID"
+export OPERATOR_VNET_RESOURCE_GROUP="$VNET_RG"
+export OPERATOR_VNET_NAME="$VNET_NAME"
 
-# Direct mode compares the dedicated baseline and Gantry ACRs.
-export BENCHMARK_MODE="direct"
+# Directly select a known size; do not enumerate all regional SKUs.
+export OPERATOR_VM_SIZE="Standard_D8ds_v5"
+export OPERATOR_OS_DISK_GB="512"
+export OPERATOR_SUBNET_CIDR="10.236.0.0/24"
 
-export BASELINE_ACR_NAME="<baseline-acr-name>"
-export BASELINE_ACR_LOGIN_SERVER="<baseline-acr-name>.azurecr.io"
-export BASELINE_ACR_USERNAME="00000000-0000-0000-0000-000000000000"
-
-export GANTRY_ACR_NAME="<gantry-acr-name>"
-export GANTRY_ACR_LOGIN_SERVER="<gantry-acr-name>.azurecr.io"
-export GANTRY_ACR_USERNAME="00000000-0000-0000-0000-000000000000"
-
-export BENCHMARK_AZURE_TELEMETRY="true"
-export AZURE_LOG_ANALYTICS_WORKSPACE_ID="<workspace-customer-id>"
-export AZURE_AKS_RESOURCE_ID="<aks-resource-id>"
-export AZURE_BASELINE_ACR_RESOURCE_ID="<baseline-acr-resource-id>"
-export AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="<baseline-private-endpoint-resource-id>"
-export AZURE_GANTRY_ACR_RESOURCE_ID="<gantry-acr-resource-id>"
-export AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="<gantry-private-endpoint-resource-id>"
-export BENCHMARK_TELEMETRY_TIMEOUT="15m"
-export BENCHMARK_TELEMETRY_POLL_INTERVAL="15s"
-
-export GANTRY_NAMESPACE="gantry-system"
-export GANTRY_DAEMONSET="gantry"
-export GANTRY_CONFIGMAP="gantry-config"
-
-export BENCHMARK_NAMESPACE="gantry-benchmark"
+export BENCHMARK_REPO_BRANCH="private/gantry-benchmark-hardening"
 export BENCHMARK_NODE_COUNT="300"
 export BENCHMARK_IMAGE_SIZE_MIB="8192"
 export BENCHMARK_IMAGE_LAYERS="8"
-export BENCHMARK_IMAGE_PLATFORM="linux/amd64"
-export BENCHMARK_WORKLOAD_REPOSITORY="gantry-benchmark-pull"
-export BENCHMARK_JOB_TIMEOUT="180m"
-export BENCHMARK_ROLLOUT_TIMEOUT="30m"
+export BENCHMARK_AZURE_TELEMETRY="true"
 export BENCHMARK_MINIMUM_BYTE_REDUCTION="0.90"
 export BENCHMARK_MAXIMUM_LATENCY_RATIO="1.0"
 
-export MONITORING_NAMESPACE="monitoring"
-export PROMETHEUS_SERVICE="kps-kube-prometheus-stack-prometheus"
-export KPS_RELEASE="kps"
-export CONTAINER_ENGINE="podman"
+make -C hack/gantry-benchmark operator-vm-provision
 ```
 
-Direct mode supports uneven layer sizes because Gantry origin bytes are measured
-directly rather than reconstructed from pull counts.
+The VM identity receives:
 
-Set `BENCHMARK_NODE_COUNT` to the exact number of eligible nodes the benchmark
-will target. If you add dedicated proxy or monitoring nodes and the benchmark
-tool still sees them as eligible, either include them deliberately or adjust
-the node targeting before `enable`. The persisted benchmark state records the
-node count at enable time; changing `env.local` later does not rewrite existing
-state.
+- `AcrPush` on each ACR.
+- `Azure Kubernetes Service Cluster Admin Role` on the AKS resource, used only
+  to retrieve its VM-local kubeconfig.
+- `Reader` on the benchmark resource group for ACR, AKS, Private Endpoint, and
+  metric reads.
+- `Log Analytics Reader` on the workspace.
+
+The VM has no public IP. A 512 GiB OS disk accommodates the repository, Go and
+Podman caches, and two phase images for large benchmark payloads. Increase it
+before provisioning for repeated 20-40 GiB runs.
 
 ## Image Shape (single vs multi-layer)
 
@@ -440,25 +406,10 @@ Constraints: `IMAGE_LAYERS` must be `>= 1` and `<= IMAGE_SIZE_MIB`. Use a
 multi-layer shape when validating the target 20-40 GiB many-layer workload;
 use the single 1 GiB layer only to measure the worst case.
 
-For admin-disabled direct-mode ACR auth, inject one refresh token per registry
-only while running `prepare`:
-
-```bash
-set -a
-. hack/gantry-benchmark/env.local
-set +a
-
-baseline_refresh_token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
-gantry_refresh_token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
-export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
-export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
-```
-
-Unset it after the command that needs it:
-
-```bash
-unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token
-```
+During `prepare`, the VM exchanges its managed-identity AAD token for one
+short-lived ACR refresh token per registry. Tokens are exported only to that
+process, removed immediately afterward, and never stored in the VM config,
+Kubernetes state, or result artifacts.
 
 ## Optional Capacity Placement
 
@@ -540,102 +491,41 @@ make -C hack/gantry-benchmark proxy-push
 unset ACR_PASSWORD acr_refresh_token
 ```
 
-## Enable Instrumentation
+## Run The Full Lifecycle From The VM
 
-Enable creates the benchmark namespace, proxy, monitoring objects, state
-ConfigMap, and Gantry-namespace lock. It does not change node routing or Gantry
-routing.
-
-```bash
-BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark enable
-```
-
-Checkpoint:
+The service performs `enable`, managed-identity token exchange, `prepare`,
+`preflight`, `run`, artifact preservation, local image pruning, and `disable`.
+Both ACRs remain private-only throughout.
 
 ```bash
-kubectl -n gantry-benchmark get pods,svc,configmap
-kubectl -n gantry-system get configmap gantry-benchmark-lock -o jsonpath='{.data.run-id}{"\n"}'
-make -C hack/gantry-benchmark status
+OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
+
+az vm run-command invoke \
+  -g "$RESOURCE_GROUP" \
+  -n "$OPERATOR_VM_NAME" \
+  --command-id RunShellScript \
+  --scripts \
+    'systemctl reset-failed gantry-benchmark-operator.service || true' \
+    'systemctl start --no-block gantry-benchmark-operator.service'
 ```
 
-Expected state is `enabled`.
-
-## Prepare Workload Images
-
-While public access is still enabled on both ACRs, generate one payload set and
-push the same repository and tag to both registries. The tool records both OCI
-digests and their shared payload SHA in benchmark state:
+Inspect status, logs, and the latest report without logging into the VM:
 
 ```bash
-set -a
-. hack/gantry-benchmark/env.local
-set +a
-
-baseline_refresh_token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
-gantry_refresh_token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
-export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
-export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
-
-BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark prepare
-
-unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token
+az vm run-command invoke \
+  -g "$RESOURCE_GROUP" \
+  -n "$OPERATOR_VM_NAME" \
+  --command-id RunShellScript \
+  --scripts \
+    'systemctl status gantry-benchmark-operator.service --no-pager || true' \
+    'tail -100 /var/log/gantry-benchmark/service.log' \
+    'cat /var/lib/gantry-benchmark/artifacts/last-run.json 2>/dev/null || true' \
+    'cat /var/lib/gantry-benchmark/artifacts/latest/comparison.md 2>/dev/null || true'
 ```
 
-Checkpoint:
-
-```bash
-make -C hack/gantry-benchmark status
-```
-
-Expected state is `images-prepared`. Verify `baseline_image` and
-`gantry_cold_image` use different registry hosts and OCI digests while
-`workload_payload_sha256` is a single shared value. Then disable public access
-on both ACRs so all measured image traffic traverses the phase's Private
-Endpoint:
-
-```bash
-az acr update -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" \
-  --public-network-enabled false --only-show-errors
-az acr update -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
-  --public-network-enabled false --only-show-errors
-```
-
-## Preflight
-
-Run preflight before any routing changes:
-
-```bash
-BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark preflight
-```
-
-Preflight must pass before `run`. It checks proxy-to-ACR smoke requests,
-node-to-proxy reachability, Gantry metrics, and proxy metrics.
-
-Checkpoint:
-
-```bash
-make -C hack/gantry-benchmark status
-kubectl -n gantry-benchmark get daemonset acr-proxy-node-reachability 2>/dev/null || true
-```
-
-Expected state is `preflight-passed`.
-
-## Run The Benchmark
-
-Start the run:
-
-```bash
-BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark run
-```
-
-Useful watch commands in another terminal:
-
-```bash
-kubectl -n gantry-benchmark get configmap gantry-benchmark-state -o jsonpath='{.data.state\.json}' | jq '{status,run_id,node_count}'
-kubectl -n gantry-benchmark get jobs -l app.kubernetes.io/part-of=gantry-benchmark
-kubectl -n gantry-system get daemonset gantry
-kubectl get nodes -o json | jq -r '.items[] | select(any(.status.conditions[]; (.type=="MemoryPressure" or .type=="DiskPressure" or .type=="PIDPressure") and .status=="True")) | [.metadata.name, (.metadata.labels["kubernetes.azure.com/agentpool"] // "-"), ([.status.conditions[] | select((.type=="MemoryPressure" or .type=="DiskPressure" or .type=="PIDPressure") and .status=="True") | .type] | join(","))] | @tsv'
-```
+Artifacts persist under `/var/lib/gantry-benchmark/artifacts/<run-id>/` on the
+VM. The service cleanup trap restores registry routing and removes benchmark
+instrumentation whether the run passes, fails a regression gate, or is stopped.
 
 During baseline, expect a Job named like:
 
@@ -769,46 +659,57 @@ Peer hits should increase during the Gantry-cold phase.
 
 ## Inspect Results
 
-After `run` exits, inspect state and artifacts:
+After the VM service exits, inspect its preserved artifacts through Run Command:
 
 ```bash
-make -C hack/gantry-benchmark status
-run_id=$(jq -r '.run_id' tmp/gantry-benchmark/*/state.json | tail -1)
-cat "tmp/gantry-benchmark/${run_id}/comparison.md"
-jq . "tmp/gantry-benchmark/${run_id}/comparison.json"
+az vm run-command invoke \
+  -g "$RESOURCE_GROUP" \
+  -n "${OPERATOR_VM_NAME:-gantry-benchmark-operator}" \
+  --command-id RunShellScript \
+  --scripts \
+    'cat /var/lib/gantry-benchmark/artifacts/last-run.json' \
+    'cat /var/lib/gantry-benchmark/artifacts/latest/comparison.md' \
+    'jq . /var/lib/gantry-benchmark/artifacts/latest/comparison.json'
 ```
 
 The comparison includes upstream bytes, request counts, Gantry origin pulls,
 peer fetch hits, and pod latency summaries.
 
-Open Grafana if needed:
-
-```bash
-kubectl -n monitoring port-forward service/kps-grafana 3000:80
-```
-
-Use dashboard `Gantry ACR Benchmark` and select the run ID.
+Use dashboard `Gantry ACR Benchmark` through the cluster's normal monitoring
+access and select the run ID.
 
 ## Cleanup
 
-Use the tool cleanup path first:
+Cleanup is automatic in the VM service. To retry cleanup after a stopped or
+failed service, invoke `disable` on the VM:
 
 ```bash
-BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark disable
+az vm run-command invoke \
+  -g "$RESOURCE_GROUP" \
+  -n "${OPERATOR_VM_NAME:-gantry-benchmark-operator}" \
+  --command-id RunShellScript \
+  --scripts \
+    'set -a; . /etc/gantry-benchmark/env; set +a' \
+    'export HOME=/var/lib/gantry-benchmark KUBECONFIG=/var/lib/gantry-benchmark/kubeconfig' \
+    'export BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context)' \
+    'make -C /opt/gantry-benchmark/unbounded/hack/gantry-benchmark disable'
 ```
 
 Cleanup restores node routing, restores Gantry config, verifies Gantry, removes
 the benchmark namespace and dashboard, and releases the lock.
 
-Checkpoint after cleanup:
+Checkpoint after cleanup from the VM:
 
 ```bash
-kubectl get namespace gantry-benchmark 2>/dev/null || true
-kubectl -n gantry-system get configmap gantry-benchmark-lock 2>/dev/null || true
-kubectl -n gantry-system get daemonset gantry
-kubectl -n gantry-system get configmap gantry-config -o jsonpath='{.data.config\.yaml}' \
-  | grep -n -E 'gantryauth|acr-origin-proxy|endpoint|ns_alias' \
-  | sed -n '1,120p'
+az vm run-command invoke \
+  -g "$RESOURCE_GROUP" \
+  -n "${OPERATOR_VM_NAME:-gantry-benchmark-operator}" \
+  --command-id RunShellScript \
+  --scripts \
+    'export KUBECONFIG=/var/lib/gantry-benchmark/kubeconfig' \
+    'kubectl get namespace gantry-benchmark 2>/dev/null || true' \
+    'kubectl -n gantry-system get configmap gantry-benchmark-lock 2>/dev/null || true' \
+    'kubectl -n gantry-system get daemonset gantry'
 ```
 
 Expected after cleanup:

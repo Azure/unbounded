@@ -1,52 +1,83 @@
 # Gantry ACR benchmark runbook
 
-Run every command from the Unbounded repository root. This workflow is for a
-dedicated test cluster.
+This workflow is for a dedicated test cluster. The benchmark itself runs only
+on a private VM in the AKS VNet. Run the provisioning and Azure Run Command
+commands below from the Unbounded repository root on an admin workstation.
 
-## 1. Configure
-
-```bash
-cp hack/gantry-benchmark/env.example hack/gantry-benchmark/env.local
-```
-
-Fill in:
-
-- `BENCHMARK_CONFIRM_CONTEXT`
-- `BENCHMARK_MODE=direct`
-- `BASELINE_ACR_NAME`, `BASELINE_ACR_LOGIN_SERVER`, and baseline push credentials
-- `GANTRY_ACR_NAME`, `GANTRY_ACR_LOGIN_SERVER`, and Gantry push credentials
-
-Legacy proxy mode instead uses `ACR_LOGIN_SERVER`, `ACR_USERNAME`,
-`ACR_PASSWORD`, and `BENCHMARK_PROXY_IMAGE`.
-
-For source-authoritative measurements also fill in:
-
-- `BENCHMARK_AZURE_TELEMETRY=true`
-- `AZURE_LOG_ANALYTICS_WORKSPACE_ID`
-- `AZURE_AKS_RESOURCE_ID`
-- `AZURE_BASELINE_ACR_RESOURCE_ID`
-- `AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID`
-- `AZURE_GANTRY_ACR_RESOURCE_ID`
-- `AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID`
-
-`env.local` is gitignored. Direct-mode credentials are passed only to the local
-container engine; they are not written to Kubernetes, benchmark state, or
-result files. Proxy-mode credentials are also stored in its Kubernetes Secret.
-
-Confirm the current cluster before continuing:
+## 1. Provision The Operator VM
 
 ```bash
-kubectl config current-context
-kubectl get nodes -l kubernetes.io/os=linux
-kubectl -n gantry-system get daemonset gantry
+export AZURE_SUBSCRIPTION_ID="<subscription-id>"
+export AZURE_RESOURCE_GROUP="<resource-group>"
+export AZURE_AKS_CLUSTER_NAME="<aks-cluster>"
+export BASELINE_ACR_NAME="<baseline-acr-name>"
+export GANTRY_ACR_NAME="<gantry-acr-name>"
+export AZURE_LOG_ANALYTICS_WORKSPACE_NAME="<workspace-name>"
+export AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="<baseline-private-endpoint-id>"
+export AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="<gantry-private-endpoint-id>"
+export OPERATOR_VNET_RESOURCE_GROUP="<vnet-resource-group>"
+export OPERATOR_VNET_NAME="<vnet-name>"
+
+# Optional scale overrides. Defaults are 5 nodes and a 128 MiB / 4-layer image.
+export BENCHMARK_NODE_COUNT="5"
+export BENCHMARK_IMAGE_SIZE_MIB="128"
+export BENCHMARK_IMAGE_LAYERS="4"
+
+make -C hack/gantry-benchmark operator-vm-provision
 ```
 
-When Azure telemetry is enabled, the operator machine needs ACR data-plane
-access only through image preparation. Preflight requires public access to be
-disabled on both ACRs and verifies that each configured Private Endpoint is
-approved for its exact registry and exposes `PEBytesIn`.
+Provisioning creates:
 
-## 2. Build the proxy (proxy mode only)
+- A private `gantry-benchmark-operator` VM with no public IP.
+- A dedicated operator subnet with no inbound NSG rules.
+- A NAT gateway for package, GitHub, Go toolchain, and Azure API egress.
+- A 512 GiB Premium OS disk by default.
+- A system-assigned managed identity with `AcrPush` on both ACRs, AKS cluster
+   admin credential access, resource-group `Reader`, and Log Analytics Reader.
+- The repository, tools, VM-only configuration, kubeconfig, and systemd unit.
+
+No ACR password, kubeconfig, or benchmark payload is copied from the admin
+workstation. The VM obtains tokens and cluster credentials using managed
+identity.
+
+## 2. Start The Full Lifecycle
+
+```bash
+export OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
+
+az vm run-command invoke \
+   -g "$AZURE_RESOURCE_GROUP" \
+   -n "$OPERATOR_VM_NAME" \
+   --command-id RunShellScript \
+   --scripts \
+      'systemctl reset-failed gantry-benchmark-operator.service || true' \
+      'systemctl start --no-block gantry-benchmark-operator.service'
+```
+
+The service performs `enable`, `prepare`, `preflight`, `run`, and `disable` from
+the VM. Cleanup runs on success, failure, or interruption.
+
+## 3. Inspect Status And Results
+
+```bash
+az vm run-command invoke \
+   -g "$AZURE_RESOURCE_GROUP" \
+   -n "$OPERATOR_VM_NAME" \
+   --command-id RunShellScript \
+   --scripts \
+      'systemctl status gantry-benchmark-operator.service --no-pager || true' \
+      'tail -100 /var/log/gantry-benchmark/service.log' \
+      'cat /var/lib/gantry-benchmark/artifacts/last-run.json 2>/dev/null || true' \
+      'cat /var/lib/gantry-benchmark/artifacts/latest/comparison.md 2>/dev/null || true'
+```
+
+Complete artifacts stay on the VM under
+`/var/lib/gantry-benchmark/artifacts/<run-id>/`. The remaining sections describe
+the lifecycle performed by the service and are primarily for troubleshooting.
+
+## VM Lifecycle Internals
+
+### Build The Proxy (legacy proxy mode only)
 
 ```bash
 make -C hack/gantry-benchmark test
@@ -62,7 +93,7 @@ The proxy exposes:
 
 Skip this section in direct mode.
 
-## 3. Enable instrumentation
+### Enable Instrumentation
 
 ```bash
 make -C hack/gantry-benchmark enable
@@ -90,21 +121,14 @@ counting-proxy Deployment and Service, and the proxy PodMonitor.
 
 No containerd or Gantry routing is changed by `enable`.
 
-## 4. Prepare workload images
+### Prepare Workload Images
 
-While the operator machine can still reach both ACRs, mint their short-lived
-tokens, then build and push both fresh,
-digest-pinned phase images:
+The VM exchanges its managed-identity AAD token for one short-lived refresh
+token per private ACR, exports those tokens only for `prepare`, and removes the
+container-engine logins immediately afterward:
 
 ```bash
-baseline_refresh_token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
-gantry_refresh_token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
-export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
-export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
-
 make -C hack/gantry-benchmark prepare
-
-unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token
 ```
 
 `prepare` generates one random payload set and pushes the same repository and
@@ -113,16 +137,10 @@ Phase-specific paths inside every payload layer intentionally produce different
 OCI digests so the Gantry phase cannot reuse baseline content on the same node.
 It does not run pull pods or warm target-node caches.
 
-For Azure telemetry, disable public access on both ACRs after `prepare` succeeds:
+Both ACRs remain private-only before, during, and after preparation. Their login
+and data endpoints resolve through the AKS VNet Private Endpoints.
 
-```bash
-az acr update -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" \
-   --public-network-enabled false
-az acr update -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
-   --public-network-enabled false
-```
-
-## 5. Run preflight
+### Run Preflight
 
 ```bash
 make -C hack/gantry-benchmark preflight
@@ -142,7 +160,7 @@ Preflight performs these mandatory checks before routing changes:
 
 Do not run the benchmark if preflight fails.
 
-## 6. Run the comparison
+### Run The Comparison
 
 ```bash
 make -C hack/gantry-benchmark run
@@ -184,7 +202,7 @@ The collector rejects implausibly small `PEBytesIn` totals even when Azure marks
 the metric point non-null. Inspect `minimum_expected_bytes` in the phase
 artifact when endpoint metering remains incomplete.
 
-## 7. Inspect results
+### Inspect Results
 
 Print state:
 
@@ -219,7 +237,7 @@ A saturated single proxy can distort latency even though byte and request
 totals remain valid. Treat sustained proxy CPU limits or a growing inflight
 queue as an invalid latency run.
 
-## 8. Disable
+### Disable
 
 After recording the results:
 

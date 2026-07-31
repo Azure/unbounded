@@ -14,7 +14,8 @@ The workflow does not provision AKS, create ACR, or install Gantry. It expects:
   a Grafana dashboard sidecar. The workflow installs benchmark-owned
   PodMonitors for Gantry and, in proxy mode, the proxy.
 - Containerd configured to read `/etc/containerd/certs.d`.
-- Podman or Docker Buildx on the operator machine.
+- A private operator VM in the AKS VNet. The VM runs every benchmark command,
+  builds and pushes both images, queries Azure telemetry, and stores artifacts.
 - Cluster permission to create privileged hostPath DaemonSets. Proxy mode also
   patches the Gantry ConfigMap.
 
@@ -22,8 +23,8 @@ For source-authoritative Azure measurements, set
 `BENCHMARK_AZURE_TELEMETRY=true`. This additionally requires:
 
 - Both ACRs reachable only through their own approved Private Endpoints, with
-  public access disabled during preflight and both measured phases. Prepare
-  both images first while the operator machine can still reach both ACRs.
+  public access disabled throughout. The operator VM reaches both ACRs over
+  Private Link while preparing and measuring the images.
 - A Log Analytics workspace receiving `ContainerRegistryRepositoryEvents` and
   `AKSAuditAdmin` in resource-specific tables.
 - Azure resource IDs for both ACRs, both Private Endpoints, and AKS.
@@ -84,34 +85,38 @@ payload bytes.
 
 ## Lifecycle
 
-Create the local configuration:
+All lifecycle commands run on the operator VM under its system-assigned managed
+identity. The admin workstation only provisions the VM and uses Azure Run
+Command to start or inspect its systemd service. The VM has no public IP or
+inbound NSG rules; a subnet NAT gateway supplies outbound package, GitHub, and
+Azure API access.
 
-```bash
-cp hack/gantry-benchmark/env.example hack/gantry-benchmark/env.local
+Bootstrap writes the VM-only configuration to `/etc/gantry-benchmark/env` and
+fetches an admin kubeconfig using managed identity. The service executes:
+
+```text
+enable -> prepare -> preflight -> run -> disable
 ```
 
-Set `BENCHMARK_CONFIRM_CONTEXT` to the exact output of:
+Provision/bootstrap from the admin workstation:
 
 ```bash
-kubectl config current-context
+make -C hack/gantry-benchmark operator-vm-provision
 ```
 
-Set `BENCHMARK_MODE=direct` to avoid the proxy. Build/push the proxy only when
-`BENCHMARK_MODE=proxy`, then run the common lifecycle:
+Start the full VM lifecycle with Azure Run Command:
 
 ```bash
-# Proxy mode only:
-# make -C hack/gantry-benchmark proxy-image
-# make -C hack/gantry-benchmark proxy-push
-make -C hack/gantry-benchmark enable
-make -C hack/gantry-benchmark prepare
-az acr update -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" --public-network-enabled false
-az acr update -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --public-network-enabled false
-make -C hack/gantry-benchmark preflight
-make -C hack/gantry-benchmark run
-make -C hack/gantry-benchmark status
-make -C hack/gantry-benchmark disable
+az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" \
+  -n "${OPERATOR_VM_NAME:-gantry-benchmark-operator}" \
+  --command-id RunShellScript \
+  --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
 ```
+
+Artifacts persist on the VM under
+`/var/lib/gantry-benchmark/artifacts/<run-id>/`; `latest` points at the newest
+run. The repository copy and Go/Podman caches live on its 512 GiB OS disk by
+default.
 
 `prepare` is the only common-lifecycle step that logs in to either ACR or pushes
 workload content. `run` restores both per-node ACR routing files before
