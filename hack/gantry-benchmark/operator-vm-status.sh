@@ -89,7 +89,7 @@ if [[ -n "$run_id" ]]; then
   fi
 fi
 
-build_process=$(pgrep -af 'podman (build|push)' 2>/dev/null || true)
+build_process=$(pgrep -af 'podman (pull|build|push|create|cp)' 2>/dev/null || true)
 if [[ -n "$build_process" ]]; then
   printf 'image process:\n%s\n' "$build_process"
 fi
