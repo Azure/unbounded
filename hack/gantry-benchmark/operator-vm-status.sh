@@ -69,16 +69,18 @@ if [[ -n "$run_id" ]]; then
   build_dir="$REPO_ROOT/tmp/gantry-benchmark/$run_id/build/shared-payload"
   if [[ -d "$build_dir" ]]; then
     payload_files=$(find "$build_dir" -maxdepth 1 -name 'payload*.bin' -type f 2>/dev/null | wc -l)
-    payload_bytes=$(du -sb "$build_dir" 2>/dev/null | awk '{print $1}')
-    payload_target_mib=$(jq -r '.image_size_mib // 0' <<<"${state_json:-{}}" 2>/dev/null || echo 0)
-    payload_target_bytes=$((payload_target_mib * 1024 * 1024))
-    percent=0
-    if ((payload_target_bytes > 0)); then
-      percent=$((payload_bytes * 100 / payload_target_bytes))
-      ((percent > 100)) && percent=100
+    if ((payload_files > 0)); then
+      payload_bytes=$(du -sb "$build_dir" 2>/dev/null | awk '{print $1}')
+      payload_target_mib=$(jq -r '.image_size_mib // 0' <<<"${state_json:-{}}" 2>/dev/null || echo 0)
+      payload_target_bytes=$((payload_target_mib * 1024 * 1024))
+      percent=0
+      if ((payload_target_bytes > 0)); then
+        percent=$((payload_bytes * 100 / payload_target_bytes))
+        ((percent > 100)) && percent=100
+      fi
+      printf 'payload generation: %d/%s files, %d%% (%s bytes)\n' \
+        "$payload_files" "$(jq -r '.image_layers // "?"' <<<"${state_json:-{}}" 2>/dev/null || echo '?')" "$percent" "$payload_bytes"
     fi
-    printf 'payload generation: %d/%s files, %d%% (%s bytes)\n' \
-      "$payload_files" "$(jq -r '.image_layers // "?"' <<<"${state_json:-{}}" 2>/dev/null || echo '?')" "$percent" "$payload_bytes"
   fi
 fi
 
