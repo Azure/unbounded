@@ -716,8 +716,6 @@ notices:
     license:
       - name: BSD 2-Clause License
         link: https://github.com/ofiwg/libfabric/blob/v2.5.1/COPYING
-      - name: GNU General Public License, Version 2.0
-        link: https://github.com/ofiwg/libfabric/blob/v2.5.1/COPYING
   - dependency: modernc.org/sqlite
     ecosystem: go
     copyright:

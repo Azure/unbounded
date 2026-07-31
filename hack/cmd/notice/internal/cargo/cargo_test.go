@@ -56,6 +56,7 @@ dependencies = [
 ]
 `,
 	})
+
 	for _, crate := range []string{"foo-1.2.3", "build-helper-2.0.1", "linux-only-3.4.5"} {
 		testutil.WriteTree(t, cargoHome, map[string]string{
 			"registry/src/index/" + crate + "/Cargo.toml.orig": "[package]\nlicense = \"MIT\"\n",
@@ -67,22 +68,27 @@ dependencies = [
 	if err := c.Precheck(root); err != nil {
 		t.Fatalf("Precheck: %v", err)
 	}
+
 	entries, err := c.Collect(root)
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
+
 	if len(entries) != 3 {
 		t.Fatalf("got %d entries, want 3", len(entries))
 	}
+
 	byDependency := make(map[string]notice.Entry, len(entries))
 	for _, entry := range entries {
 		byDependency[entry.Dependency] = entry
 	}
+
 	for _, dependency := range []string{"build-helper", "foo", "linux-only"} {
 		if _, ok := byDependency[dependency]; !ok {
 			t.Errorf("dependency %q not collected", dependency)
 		}
 	}
+
 	if got := byDependency["foo"].License[0].Link; got != "https://docs.rs/crate/foo/1.2.3/source/LICENSE" {
 		t.Errorf("license link = %q", got)
 	}
@@ -103,10 +109,12 @@ dependencies = [
  "rand 0.8.6",
 ]
 `
+
 	versions, err := lockedDirectVersions(lock, direct)
 	if err != nil {
 		t.Fatalf("lockedDirectVersions: %v", err)
 	}
+
 	if versions["rand"] != "0.8.6" {
 		t.Errorf("rand version = %q", versions["rand"])
 	}
@@ -117,6 +125,7 @@ func TestDirectDependenciesResolvesPackageAlias(t *testing.T) {
 	if err != nil {
 		t.Fatalf("directDependencies: %v", err)
 	}
+
 	if got := direct["renamed"].packageName; got != "actual-name" {
 		t.Errorf("package name = %q", got)
 	}
@@ -128,9 +137,42 @@ func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
 		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\n",
 		"cmd/unbounded-storage/Cargo.lock": "version = 4\n",
 	})
+
 	err := New(t.TempDir()).Precheck(root)
 	if err == nil || !strings.Contains(err.Error(), "cargo fetch") {
 		t.Fatalf("Precheck error = %v", err)
+	}
+}
+
+func TestCollectorRejectsDuplicateRegistrySources(t *testing.T) {
+	root := t.TempDir()
+	cargoHome := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/unbounded-storage/Cargo.lock": `version = 4
+
+[[package]]
+name = "foo"
+version = "1.2.3"
+
+[[package]]
+name = "unbounded-storage"
+version = "0.1.0"
+dependencies = [
+ "foo",
+]
+`,
+	})
+
+	for _, registry := range []string{"first", "second"} {
+		testutil.WriteTree(t, cargoHome, map[string]string{
+			"registry/src/" + registry + "/foo-1.2.3/LICENSE": testutil.MITLicense("Copyright (c) 2026 Example"),
+		})
+	}
+
+	_, err := New(cargoHome).Collect(root)
+	if err == nil || !strings.Contains(err.Error(), "multiple registry source directories") {
+		t.Fatalf("Collect error = %v", err)
 	}
 }
 
@@ -162,9 +204,11 @@ dependencies = [
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
+
 	if len(entries) != 1 || len(entries[0].License) != 2 {
 		t.Fatalf("entries = %#v", entries)
 	}
+
 	if entries[0].License[0].Name != "Apache License, Version 2.0" || entries[0].License[1].Name != "MIT License" {
 		t.Fatalf("licenses = %#v", entries[0].License)
 	}
@@ -197,9 +241,11 @@ dependencies = [
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
+
 	if len(entries) != 1 || len(entries[0].License) != 2 {
 		t.Fatalf("entries = %#v", entries)
 	}
+
 	if entries[0].License[0].Name != "MIT License" || entries[0].License[1].Name != "Apache License, Version 2.0" {
 		t.Fatalf("licenses = %#v", entries[0].License)
 	}

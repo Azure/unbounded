@@ -54,7 +54,7 @@ For a deeper dive, see the [Project Overview](https://unbounded-cloud.io/concept
 | **[unbounded-agent](https://unbounded-cloud.io/guides/agent/)** | Single binary delivered to hosts to bootstrap them as Kubernetes worker nodes using `systemd-nspawn`. | [Agent Guide](https://unbounded-cloud.io/guides/agent/) |
 | **[machina](https://unbounded-cloud.io/guides/ssh/)** | Kubernetes controller that provisions remote Linux machines over SSH. | [SSH Guide](https://unbounded-cloud.io/guides/ssh/), [CRD Reference](https://unbounded-cloud.io/reference/machina-crd/) |
 | **[metalman](https://unbounded-cloud.io/guides/pxe/)** | Controller for PXE-booting bare-metal servers with DHCP, TFTP, HTTP, Redfish BMC, and TPM 2.0. | [PXE Guide](https://unbounded-cloud.io/guides/pxe/), [Bare Metal Concepts](https://unbounded-cloud.io/concepts/bare-metal/) |
-| **unbounded-net** | CNI plugin and multi-site networking system maintained in this repository for cross-site pod connectivity. | [Networking Concepts](https://unbounded-cloud.io/concepts/networking/) |
+| **[unbounded-net](https://unbounded-cloud.io/concepts/networking/)** | CNI plugin and multi-site networking system maintained in this repository for cross-site pod connectivity. | [Networking Concepts](https://unbounded-cloud.io/concepts/networking/) |
 | **kubectl-unbounded** | kubectl plugin for initializing sites, adding machines, and managing the cluster. | [CLI Reference](https://unbounded-cloud.io/reference/cli/) |
 
 ## Quick Start

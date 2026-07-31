@@ -39,6 +39,7 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading Makefile: %w", err)
 	}
+
 	versions := makeVersions(string(data), "LIBFABRIC_VERSION", "OPENSSL_VERSION")
 	for _, name := range []string{"LIBFABRIC_VERSION", "OPENSSL_VERSION"} {
 		if versions[name] == "" {
@@ -54,16 +55,11 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 				"Copyright (c) Intel Corporation. All rights reserved.",
 				"Copyright (c) 2015-2019 Cisco Systems, Inc. All rights reserved.",
 			},
-			License: []notice.License{
-				{
-					Name: "BSD 2-Clause License",
-					Link: "https://github.com/ofiwg/libfabric/blob/v" + versions["LIBFABRIC_VERSION"] + "/COPYING",
-				},
-				{
-					Name: "GNU General Public License, Version 2.0",
-					Link: "https://github.com/ofiwg/libfabric/blob/v" + versions["LIBFABRIC_VERSION"] + "/COPYING",
-				},
-			},
+			// Upstream offers BSD-2-Clause or GPL-2.0; this project selects BSD-2-Clause.
+			License: []notice.License{{
+				Name: "BSD 2-Clause License",
+				Link: "https://github.com/ofiwg/libfabric/blob/v" + versions["LIBFABRIC_VERSION"] + "/COPYING",
+			}},
 		},
 		{
 			Dependency: "OpenSSL",
@@ -85,10 +81,13 @@ func makeVersions(data string, names ...string) map[string]string {
 	for _, name := range names {
 		wanted[name] = true
 	}
+
 	versions := map[string]string{}
+
 	scanner := bufio.NewScanner(strings.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(strings.SplitN(scanner.Text(), "#", 2)[0])
+
 		fields := strings.Fields(line)
 		if len(fields) == 3 && wanted[fields[0]] && (fields[1] == "?=" || fields[1] == ":=" || fields[1] == "=") {
 			versions[fields[0]] = fields[2]
