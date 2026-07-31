@@ -4,8 +4,11 @@
 
 set -Eeuo pipefail
 
-: "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP}"
+AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-}"
 OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
+OPERATOR_SSH_HOST="${OPERATOR_SSH_HOST:-}"
+OPERATOR_SSH_KEY="${OPERATOR_SSH_KEY:-}"
+OPERATOR_SSH_USER="${OPERATOR_SSH_USER:-benchmark}"
 WATCH_INTERVAL_SECONDS="${WATCH_INTERVAL_SECONDS:-30}"
 follow=false
 
@@ -48,14 +51,27 @@ done
 
 status_once() {
   local output
-  output=$(az vm run-command invoke \
-    -g "$AZURE_RESOURCE_GROUP" \
-    -n "$OPERATOR_VM_NAME" \
-    --command-id RunShellScript \
-    --scripts '/opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh' \
-    --only-show-errors \
-    --query 'value[0].message' \
-    -o tsv)
+
+  if [[ -n "$OPERATOR_SSH_HOST" ]]; then
+    : "${OPERATOR_SSH_KEY:?Set OPERATOR_SSH_KEY when OPERATOR_SSH_HOST is set}"
+    output=$(ssh \
+      -i "$OPERATOR_SSH_KEY" \
+      -o BatchMode=yes \
+      -o ConnectTimeout=20 \
+      -o ServerAliveInterval=30 \
+      "$OPERATOR_SSH_USER@$OPERATOR_SSH_HOST" \
+      'sudo -n /opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh')
+  else
+    : "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP when OPERATOR_SSH_HOST is not set}"
+    output=$(az vm run-command invoke \
+      -g "$AZURE_RESOURCE_GROUP" \
+      -n "$OPERATOR_VM_NAME" \
+      --command-id RunShellScript \
+      --scripts '/opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh' \
+      --only-show-errors \
+      --query 'value[0].message' \
+      -o tsv)
+  fi
 
   printf '%s\n' "$output" | sed \
     -e '/^Enable succeeded: *$/d' \

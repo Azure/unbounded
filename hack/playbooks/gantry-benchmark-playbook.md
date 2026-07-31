@@ -512,6 +512,8 @@ Inspect status, logs, and the latest report without logging into the VM:
 ```bash
 export AZURE_RESOURCE_GROUP="$RESOURCE_GROUP"
 export OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
+export OPERATOR_SSH_HOST="<operator-public-ip>"
+export OPERATOR_SSH_KEY="tmp/gantry-benchmark-ssh-key"
 
 make -C hack/gantry-benchmark operator-vm-watch
 ```
@@ -521,6 +523,10 @@ stage, payload generation percentage, active image build/push, VM disk and
 Podman usage, Kubernetes Job completion, Gantry readiness, recent logs, and the
 final report. Set `WATCH_INTERVAL_SECONDS` to change the cadence. For one
 snapshot, use `operator-vm-status`.
+
+SSH mode is preferred for immediate refreshes and requires an NSG rule limited
+to the admin workstation's `/32`. Without SSH variables, the watcher uses Azure
+Run Command as a fallback.
 
 The underlying Azure Run Command equivalent is:
 

@@ -116,10 +116,15 @@ az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" \
 Follow progress from the workstation in a separate terminal:
 
 ```bash
-export AZURE_RESOURCE_GROUP="<resource-group>"
-export OPERATOR_VM_NAME="gantry-benchmark-operator"
+export OPERATOR_SSH_HOST="<operator-public-ip>"
+export OPERATOR_SSH_KEY="tmp/gantry-benchmark-ssh-key"
 make -C hack/gantry-benchmark operator-vm-watch
 ```
+
+SSH mode is preferred because each refresh is immediate. The operator VM SSH
+NSG rule must allow TCP/22 only from the current workstation `/32`. If
+`OPERATOR_SSH_HOST` is unset, the watcher falls back to Azure Run Command using
+`AZURE_RESOURCE_GROUP` and `OPERATOR_VM_NAME`.
 
 The live view reports the lifecycle stage and start time, immutable run shape,
 payload files/bytes/percentage, active Podman build or push, VM disk usage,

@@ -62,6 +62,8 @@ Use the repository progress dashboard while the service is running:
 ```bash
 export AZURE_RESOURCE_GROUP="<resource-group>"
 export OPERATOR_VM_NAME="gantry-benchmark-operator"
+export OPERATOR_SSH_HOST="<operator-public-ip>"
+export OPERATOR_SSH_KEY="tmp/gantry-benchmark-ssh-key"
 
 # One snapshot:
 make -C hack/gantry-benchmark operator-vm-status
@@ -74,6 +76,10 @@ The dashboard combines lifecycle heartbeat, build progress, Podman storage,
 VM disk, active image command, Kubernetes Jobs, Gantry DaemonSet status, and
 recent logs. During a running lifecycle it never displays a previous run's
 comparison as if it were current.
+
+Direct SSH is the preferred monitoring transport. Restrict TCP/22 to the admin
+workstation's `/32`; when SSH variables are absent, the command falls back to
+Azure Run Command.
 
 ```bash
 az vm run-command invoke \
