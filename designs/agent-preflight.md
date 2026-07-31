@@ -405,6 +405,7 @@ Host phase checks:
 | `disk-space` | Validate enough space exists for rootfs and component downloads. |
 | `cgroups` | Validate cgroup support expected by kubelet/containerd. |
 | `api-server-reachable` | Validate the configured Kubernetes API server is reachable from the host. |
+| `kubelet-bind-address` | Validate the kubelet can bind `0.0.0.0:10250` in the shared host network namespace. |
 | `cluster-credentials` | Validate the cluster CA data and configured bootstrap credential are present and parseable for kubelet registration. |
 
 Rootfs provisioning checks:

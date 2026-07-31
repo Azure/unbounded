@@ -31,6 +31,7 @@ type apiServerReachableChecker struct {
 // nspawn machine starts.
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
 	return []preflight.Checker{
+		CheckKubeletBindAddress(log),
 		CheckAPIServerReachable(log, cfg),
 	}
 }

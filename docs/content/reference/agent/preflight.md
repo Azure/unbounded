@@ -182,6 +182,7 @@ The `nvidia-driver` check can return multiple results with different targets:
 | Check | Severity when failing | What it validates |
 |---|---|---|
 | `api-server-reachable` | Error | Cluster CA data and bootstrap credentials are valid enough to use, the configured API server endpoint is well formed, and the host can reach the API server `/readyz` endpoint. API server responses with status 500 or higher are fatal. |
+| `kubelet-bind-address` | Error | The kubelet can bind `0.0.0.0:10250` in the shared host network namespace. |
 
 ### Rootfs and Artifact Checks
 
