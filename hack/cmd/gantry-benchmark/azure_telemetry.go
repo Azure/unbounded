@@ -32,9 +32,10 @@ type acrPhaseMeasurement struct {
 }
 
 type privateEndpointPhaseMeasurement struct {
-	BytesFromACR uint64 `json:"bytes_from_acr"`
-	Source       string `json:"source"`
-	Complete     bool   `json:"complete"`
+	BytesFromACR         uint64 `json:"bytes_from_acr"`
+	MinimumExpectedBytes uint64 `json:"minimum_expected_bytes"`
+	Source               string `json:"source"`
+	Complete             bool   `json:"complete"`
 }
 
 type auditPodLatency struct {
@@ -190,6 +191,7 @@ func imageDigestFromReference(image string) (string, error) {
 func (b *benchmark) collectACRPulls(
 	ctx context.Context,
 	image string,
+	acrResourceID string,
 	window telemetryWindow,
 ) (acrPhaseMeasurement, error) {
 	digest, err := imageDigestFromReference(image)
@@ -201,7 +203,7 @@ func (b *benchmark) collectACRPulls(
 | where _ResourceId =~ %s
 | extend IsPhasePull = Repository == %s and Digest == %s and OperationName == "Pull"
 | summarize pull_count=countif(IsPhasePull), successful_pull_count=countif(IsPhasePull and ResultDescription == "200"), other_repository_event_count=countif(not(IsPhasePull)), first_event_at=minif(TimeGenerated, IsPhasePull), last_event_at=maxif(TimeGenerated, IsPhasePull)`,
-		kustoQuote(b.config.ACRResourceID),
+		kustoQuote(acrResourceID),
 		kustoQuote(b.config.WorkloadRepository),
 		kustoQuote(digest),
 	)
@@ -266,13 +268,15 @@ type azureMetricsResponse struct {
 
 func (b *benchmark) collectPrivateEndpointBytes(
 	ctx context.Context,
+	privateEndpointID string,
+	minimumExpectedBytes uint64,
 	window telemetryWindow,
 ) (privateEndpointPhaseMeasurement, error) {
 	output, err := b.commands.Run(
 		ctx,
 		nil,
 		"az", "monitor", "metrics", "list",
-		"--resource", b.config.ACRPrivateEndpointResourceID,
+		"--resource", privateEndpointID,
 		"--metric", "PEBytesIn",
 		"--interval", "PT1M",
 		"--start-time", window.StartedAt.UTC().Format(time.RFC3339Nano),
@@ -316,9 +320,10 @@ func (b *benchmark) collectPrivateEndpointBytes(
 	}
 
 	return privateEndpointPhaseMeasurement{
-		BytesFromACR: uint64(total),
-		Source:       "Microsoft.Network/privateEndpoints/PEBytesIn",
-		Complete:     dataPoints > 0,
+		BytesFromACR:         uint64(total),
+		MinimumExpectedBytes: minimumExpectedBytes,
+		Source:               "Microsoft.Network/privateEndpoints/PEBytesIn",
+		Complete:             dataPoints > 0 && uint64(total) >= minimumExpectedBytes,
 	}, nil
 }
 

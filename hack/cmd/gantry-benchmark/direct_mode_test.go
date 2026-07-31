@@ -15,9 +15,10 @@ import (
 // through Gantry and void the comparison.
 func TestRenderHostsDirectBaselineOverridesGantryDefault(t *testing.T) {
 	state := benchmarkState{
-		RunID:          "run-1",
-		Mode:           benchmarkModeDirect,
-		ACRLoginServer: "bench.azurecr.io",
+		RunID:                  "run-1",
+		Mode:                   benchmarkModeDirect,
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
 	}
 
 	baseline, err := renderHosts(state, hostsModeBaseline)
@@ -25,8 +26,8 @@ func TestRenderHostsDirectBaselineOverridesGantryDefault(t *testing.T) {
 		t.Fatalf("render baseline: %v", err)
 	}
 
-	if !strings.Contains(baseline, `server = "https://bench.azurecr.io"`) ||
-		!strings.Contains(baseline, `[host."https://bench.azurecr.io"]`) {
+	if !strings.Contains(baseline, `server = "https://baseline.azurecr.io"`) ||
+		!strings.Contains(baseline, `[host."https://baseline.azurecr.io"]`) {
 		t.Fatalf("direct baseline must point containerd straight at ACR:\n%s", baseline)
 	}
 
@@ -43,9 +44,10 @@ func TestRenderHostsDirectBaselineOverridesGantryDefault(t *testing.T) {
 // fall-through, so containerd can never bypass Gantry to the origin.
 func TestRenderHostsDirectGantryPhaseIsStrict(t *testing.T) {
 	state := benchmarkState{
-		RunID:          "run-1",
-		Mode:           benchmarkModeDirect,
-		ACRLoginServer: "bench.azurecr.io",
+		RunID:                  "run-1",
+		Mode:                   benchmarkModeDirect,
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
 	}
 
 	gantry, err := renderHosts(state, hostsModeGantry)
@@ -55,7 +57,7 @@ func TestRenderHostsDirectGantryPhaseIsStrict(t *testing.T) {
 
 	if strings.Contains(gantry, "server =") ||
 		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) ||
-		strings.Contains(gantry, "bench.azurecr.io") {
+		strings.Contains(gantry, "gantry.azurecr.io") {
 		t.Fatalf("unexpected direct-mode Gantry hosts.toml:\n%s", gantry)
 	}
 }
@@ -152,6 +154,7 @@ func healthyDirectPhases() (phaseResult, phaseResult) {
 	baseline := phaseResult{
 		RunID:             "run-1",
 		Phase:             proxyPhaseBaseline,
+		PayloadSHA:        "sha256:shared-payload",
 		OriginBytes:       1000,
 		OriginBytesSource: originBytesAnalyticBaseline,
 		GantryPeer:        gantryPeerPhaseMeasurement{Complete: true},
@@ -162,6 +165,7 @@ func healthyDirectPhases() (phaseResult, phaseResult) {
 	gantry := phaseResult{
 		RunID:             "run-1",
 		Phase:             proxyPhaseGantryCold,
+		PayloadSHA:        "sha256:shared-payload",
 		OriginBytes:       50,
 		OriginBytesSource: originBytesGantryMeasured,
 		Gantry:            gantryMetrics{OriginBytes: 50, PeerFetchHits: 620, OriginLayerPulls: 9},
@@ -191,7 +195,7 @@ func TestCompareResultsDirectModePasses(t *testing.T) {
 		t.Fatalf("direct mode must not report proxy-derived request reduction as available")
 	}
 
-	for _, name := range []string{"baseline_bypassed_gantry", "no_origin_fallback"} {
+	for _, name := range []string{"same_workload_payload", "baseline_bypassed_gantry", "no_origin_fallback"} {
 		if _, ok := comparison.Checks[name]; !ok {
 			t.Fatalf("direct mode must add the %q check, got %+v", name, comparison.Checks)
 		}
@@ -232,6 +236,18 @@ func TestCompareResultsDirectModeFailsOnOriginFallback(t *testing.T) {
 	}
 }
 
+func TestCompareResultsDirectModeRejectsDifferentPayloads(t *testing.T) {
+	baseline, gantry := healthyDirectPhases()
+	gantry.PayloadSHA = "sha256:different-payload"
+
+	comparison := compareResults(directComparisonConfig(), baseline, gantry)
+
+	check := comparison.Checks["same_workload_payload"]
+	if comparison.Passed || check.Passed {
+		t.Fatalf("comparison passed with different payloads: %+v", check)
+	}
+}
+
 // Proxy mode must keep its original gate set so existing runs are unchanged.
 func TestCompareResultsProxyModeOmitsDirectChecks(t *testing.T) {
 	baseline, gantry := healthyDirectPhases()
@@ -245,7 +261,7 @@ func TestCompareResultsProxyModeOmitsDirectChecks(t *testing.T) {
 
 	comparison := compareResults(config, baseline, gantry)
 
-	for _, name := range []string{"baseline_bypassed_gantry", "no_origin_fallback"} {
+	for _, name := range []string{"same_workload_payload", "baseline_bypassed_gantry", "no_origin_fallback"} {
 		if _, ok := comparison.Checks[name]; ok {
 			t.Fatalf("proxy mode must not add the %q check", name)
 		}
@@ -433,7 +449,11 @@ func TestLoadBenchmarkConfigProxyAllowsUnevenLayerSplit(t *testing.T) {
 }
 
 func TestValidateEnableIsModeAware(t *testing.T) {
-	direct := benchmarkConfig{Mode: benchmarkModeDirect, ACRLoginServer: "bench.azurecr.io"}
+	direct := benchmarkConfig{
+		Mode:                   benchmarkModeDirect,
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+	}
 	if err := direct.validateEnable(); err != nil {
 		t.Fatalf("direct enable must not require proxy image or push credentials: %v", err)
 	}
@@ -446,17 +466,62 @@ func TestValidateEnableIsModeAware(t *testing.T) {
 
 func TestValidateEnableAcceptsCompleteAzureTelemetryConfig(t *testing.T) {
 	config := benchmarkConfig{
-		Mode:                         benchmarkModeDirect,
-		ACRLoginServer:               "bench.azurecr.io",
-		AzureTelemetry:               true,
-		LogAnalyticsWorkspaceID:      "workspace-id",
-		ACRResourceID:                "/subscriptions/s/registries/bench",
-		AKSResourceID:                "/subscriptions/s/managedClusters/bench",
-		ACRPrivateEndpointResourceID: "/subscriptions/s/privateEndpoints/bench",
+		Mode:                      benchmarkModeDirect,
+		BaselineACRLoginServer:    "baseline.azurecr.io",
+		GantryACRLoginServer:      "gantry.azurecr.io",
+		AzureTelemetry:            true,
+		LogAnalyticsWorkspaceID:   "workspace-id",
+		BaselineACRResourceID:     "/subscriptions/s/registries/baseline",
+		BaselinePrivateEndpointID: "/subscriptions/s/privateEndpoints/baseline",
+		GantryACRResourceID:       "/subscriptions/s/registries/gantry",
+		GantryPrivateEndpointID:   "/subscriptions/s/privateEndpoints/gantry",
+		AKSResourceID:             "/subscriptions/s/managedClusters/bench",
 	}
 
 	if err := config.validateEnable(); err != nil {
 		t.Fatalf("validateEnable: %v", err)
+	}
+}
+
+func TestValidateEnableRejectsSharedDirectRegistry(t *testing.T) {
+	config := benchmarkConfig{
+		Mode:                   benchmarkModeDirect,
+		BaselineACRLoginServer: "shared.azurecr.io",
+		GantryACRLoginServer:   "shared.azurecr.io",
+	}
+
+	if err := config.validateEnable(); err == nil || !strings.Contains(err.Error(), "must be different") {
+		t.Fatalf("error = %v, want distinct registry rejection", err)
+	}
+}
+
+func TestRegistryForPhaseUsesSeparateDirectResources(t *testing.T) {
+	config := benchmarkConfig{
+		Mode:                      benchmarkModeDirect,
+		BaselineACRLoginServer:    "baseline.azurecr.io",
+		BaselineACRResourceID:     "baseline-resource",
+		BaselinePrivateEndpointID: "baseline-endpoint",
+		GantryACRLoginServer:      "gantry.azurecr.io",
+		GantryACRResourceID:       "gantry-resource",
+		GantryPrivateEndpointID:   "gantry-endpoint",
+	}
+
+	baseline, err := config.registryForPhase(proxyPhaseBaseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gantry, err := config.registryForPhase(proxyPhaseGantryCold)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if baseline.LoginServer != "baseline.azurecr.io" || baseline.ResourceID != "baseline-resource" || baseline.PrivateEndpointID != "baseline-endpoint" {
+		t.Fatalf("baseline registry = %+v", baseline)
+	}
+
+	if gantry.LoginServer != "gantry.azurecr.io" || gantry.ResourceID != "gantry-resource" || gantry.PrivateEndpointID != "gantry-endpoint" {
+		t.Fatalf("Gantry registry = %+v", gantry)
 	}
 }
 
@@ -474,8 +539,13 @@ func TestStateModeControlsProxyUsage(t *testing.T) {
 
 func TestPreparedImagesRequiresBothDigestReferences(t *testing.T) {
 	state := benchmarkState{
-		BaselineImage:   "bench.azurecr.io/pull@sha256:baseline",
-		GantryColdImage: "bench.azurecr.io/pull@sha256:gantry",
+		Mode:                   benchmarkModeDirect,
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+		WorkloadRepository:     "pull",
+		BaselineImage:          "baseline.azurecr.io/pull@sha256:abc",
+		GantryColdImage:        "gantry.azurecr.io/pull@sha256:def",
+		WorkloadPayloadSHA256:  "sha256:payload",
 	}
 
 	baseline, gantry, err := state.preparedImages()
@@ -490,5 +560,21 @@ func TestPreparedImagesRequiresBothDigestReferences(t *testing.T) {
 	state.GantryColdImage = ""
 	if _, _, err := state.preparedImages(); err == nil || !strings.Contains(err.Error(), "run prepare") {
 		t.Fatalf("missing-image error = %v, want prepare guidance", err)
+	}
+}
+
+func TestPreparedImagesRejectsIdenticalDigests(t *testing.T) {
+	state := benchmarkState{
+		Mode:                   benchmarkModeDirect,
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+		WorkloadRepository:     "pull",
+		BaselineImage:          "baseline.azurecr.io/pull@sha256:same",
+		GantryColdImage:        "gantry.azurecr.io/pull@sha256:same",
+		WorkloadPayloadSHA256:  "sha256:payload",
+	}
+
+	if _, _, err := state.preparedImages(); err == nil || !strings.Contains(err.Error(), "would reuse") {
+		t.Fatalf("error = %v, want cache reuse rejection", err)
 	}
 }

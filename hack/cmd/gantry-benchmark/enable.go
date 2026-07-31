@@ -100,6 +100,12 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	if !b.config.usesProxy() {
+		if err := validateDirectGantryRegistry([]byte(originalConfig), b.config.GantryACRLoginServer); err != nil {
+			return fmt.Errorf("validate dedicated Gantry ACR configuration: %w", err)
+		}
+	}
+
 	state := benchmarkState{
 		RunID:                        runID,
 		Mode:                         b.config.Mode,
@@ -112,6 +118,11 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		PrometheusService:            b.config.PrometheusService,
 		NodeCount:                    b.config.NodeCount,
 		ImagePlatform:                b.config.ImagePlatform,
+		ImageSizeMiB:                 b.config.ImageSizeMiB,
+		ImageLayers:                  b.config.ImageLayers,
+		WorkloadRepository:           b.config.WorkloadRepository,
+		BaselineACRLoginServer:       b.config.BaselineACRLoginServer,
+		GantryACRLoginServer:         b.config.GantryACRLoginServer,
 		ACRLoginServer:               b.config.ACRLoginServer,
 		ProxyImage:                   b.config.ProxyImage,
 		OriginalGantryConfig:         originalConfig,
@@ -119,6 +130,10 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		GantryRestored:               true,
 		AzureTelemetry:               b.config.AzureTelemetry,
 		LogAnalyticsWorkspaceID:      b.config.LogAnalyticsWorkspaceID,
+		BaselineACRResourceID:        b.config.BaselineACRResourceID,
+		BaselinePrivateEndpointID:    b.config.BaselinePrivateEndpointID,
+		GantryACRResourceID:          b.config.GantryACRResourceID,
+		GantryPrivateEndpointID:      b.config.GantryPrivateEndpointID,
 		ACRResourceID:                b.config.ACRResourceID,
 		AKSResourceID:                b.config.AKSResourceID,
 		ACRPrivateEndpointResourceID: b.config.ACRPrivateEndpointResourceID,

@@ -38,6 +38,12 @@ type benchmarkConfig struct {
 	MonitoringNamespace          string
 	PrometheusService            string
 	KPSRelease                   string
+	BaselineACRLoginServer       string
+	BaselineACRUsername          string
+	BaselineACRPassword          string
+	GantryACRLoginServer         string
+	GantryACRUsername            string
+	GantryACRPassword            string
 	ACRLoginServer               string
 	ACRUsername                  string
 	ACRPassword                  string
@@ -55,12 +61,22 @@ type benchmarkConfig struct {
 	MaximumLatencyRatio          float64
 	AzureTelemetry               bool
 	LogAnalyticsWorkspaceID      string
+	BaselineACRResourceID        string
+	BaselinePrivateEndpointID    string
+	GantryACRResourceID          string
+	GantryPrivateEndpointID      string
 	ACRResourceID                string
 	AKSResourceID                string
 	ACRPrivateEndpointResourceID string
 	TelemetryTimeout             time.Duration
 	TelemetryPollInterval        time.Duration
 	StateRoot                    string
+}
+
+type phaseRegistry struct {
+	LoginServer       string
+	ResourceID        string
+	PrivateEndpointID string
 }
 
 func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
@@ -139,6 +155,12 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		MonitoringNamespace:          envDefault(getenv, "MONITORING_NAMESPACE", "monitoring"),
 		PrometheusService:            envDefault(getenv, "PROMETHEUS_SERVICE", "kps-kube-prometheus-stack-prometheus"),
 		KPSRelease:                   envDefault(getenv, "KPS_RELEASE", "kps"),
+		BaselineACRLoginServer:       getenv("BASELINE_ACR_LOGIN_SERVER"),
+		BaselineACRUsername:          getenv("BASELINE_ACR_USERNAME"),
+		BaselineACRPassword:          getenv("BASELINE_ACR_PASSWORD"),
+		GantryACRLoginServer:         getenv("GANTRY_ACR_LOGIN_SERVER"),
+		GantryACRUsername:            getenv("GANTRY_ACR_USERNAME"),
+		GantryACRPassword:            getenv("GANTRY_ACR_PASSWORD"),
 		ACRLoginServer:               getenv("ACR_LOGIN_SERVER"),
 		ACRUsername:                  getenv("ACR_USERNAME"),
 		ACRPassword:                  getenv("ACR_PASSWORD"),
@@ -156,6 +178,10 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		MaximumLatencyRatio:          maximumLatencyRatio,
 		AzureTelemetry:               azureTelemetry,
 		LogAnalyticsWorkspaceID:      getenv("AZURE_LOG_ANALYTICS_WORKSPACE_ID"),
+		BaselineACRResourceID:        getenv("AZURE_BASELINE_ACR_RESOURCE_ID"),
+		BaselinePrivateEndpointID:    getenv("AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"),
+		GantryACRResourceID:          getenv("AZURE_GANTRY_ACR_RESOURCE_ID"),
+		GantryPrivateEndpointID:      getenv("AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"),
 		ACRResourceID:                getenv("AZURE_ACR_RESOURCE_ID"),
 		AKSResourceID:                getenv("AZURE_AKS_RESOURCE_ID"),
 		ACRPrivateEndpointResourceID: getenv("AZURE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"),
@@ -203,31 +229,72 @@ func (c benchmarkConfig) usesProxy() bool {
 	return c.Mode != benchmarkModeDirect
 }
 
+func (c benchmarkConfig) registryForPhase(phase proxyPhase) (phaseRegistry, error) {
+	if c.usesProxy() {
+		return phaseRegistry{
+			LoginServer:       c.ACRLoginServer,
+			ResourceID:        c.ACRResourceID,
+			PrivateEndpointID: c.ACRPrivateEndpointResourceID,
+		}, nil
+	}
+
+	switch phase {
+	case proxyPhaseBaseline:
+		return phaseRegistry{
+			LoginServer:       c.BaselineACRLoginServer,
+			ResourceID:        c.BaselineACRResourceID,
+			PrivateEndpointID: c.BaselinePrivateEndpointID,
+		}, nil
+	case proxyPhaseGantryCold:
+		return phaseRegistry{
+			LoginServer:       c.GantryACRLoginServer,
+			ResourceID:        c.GantryACRResourceID,
+			PrivateEndpointID: c.GantryPrivateEndpointID,
+		}, nil
+	default:
+		return phaseRegistry{}, fmt.Errorf("phase %q has no registry", phase)
+	}
+}
+
 // imageBytes reports the total generated payload size of one benchmark image.
 func (c benchmarkConfig) imageBytes() uint64 {
 	return uint64(c.ImageSizeMiB) * mibibyte
 }
 
 func (c benchmarkConfig) validateEnable() error {
-	required := map[string]string{
-		"ACR_LOGIN_SERVER": c.ACRLoginServer,
-	}
+	required := make(map[string]string)
 
 	// The proxy Secret carries the registry credentials and the proxy image is
 	// the workload for both the proxy Deployment and the reachability DaemonSet.
-	// Direct mode deploys neither, and `run` validates the build credentials it
-	// actually needs, so enable stays usable without exporting a push token.
+	// Dual-ACR direct mode deploys neither and validates push credentials during
+	// prepare, so enable stays usable without exporting either push token.
 	if c.usesProxy() {
+		required["ACR_LOGIN_SERVER"] = c.ACRLoginServer
 		required["ACR_USERNAME"] = c.ACRUsername
 		required["ACR_PASSWORD"] = c.ACRPassword
 		required["BENCHMARK_PROXY_IMAGE"] = c.ProxyImage
+	} else {
+		required["BASELINE_ACR_LOGIN_SERVER"] = c.BaselineACRLoginServer
+		required["GANTRY_ACR_LOGIN_SERVER"] = c.GantryACRLoginServer
+
+		if c.BaselineACRLoginServer != "" && strings.EqualFold(c.BaselineACRLoginServer, c.GantryACRLoginServer) {
+			return errors.New("baseline and Gantry ACR login servers must be different")
+		}
 	}
 
 	if c.AzureTelemetry {
 		required["AZURE_LOG_ANALYTICS_WORKSPACE_ID"] = c.LogAnalyticsWorkspaceID
-		required["AZURE_ACR_RESOURCE_ID"] = c.ACRResourceID
 		required["AZURE_AKS_RESOURCE_ID"] = c.AKSResourceID
-		required["AZURE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"] = c.ACRPrivateEndpointResourceID
+
+		if c.usesProxy() {
+			required["AZURE_ACR_RESOURCE_ID"] = c.ACRResourceID
+			required["AZURE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"] = c.ACRPrivateEndpointResourceID
+		} else {
+			required["AZURE_BASELINE_ACR_RESOURCE_ID"] = c.BaselineACRResourceID
+			required["AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"] = c.BaselinePrivateEndpointID
+			required["AZURE_GANTRY_ACR_RESOURCE_ID"] = c.GantryACRResourceID
+			required["AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"] = c.GantryPrivateEndpointID
+		}
 	}
 
 	var missing []string

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 type hostsMode string
@@ -25,6 +26,11 @@ const (
 func renderHosts(state benchmarkState, mode hostsMode) (string, error) {
 	marker := fmt.Sprintf("# Managed by Gantry benchmark %s.", state.RunID)
 
+	registry, err := state.registryForHosts(mode)
+	if err != nil {
+		return "", err
+	}
+
 	switch mode {
 	case hostsModeBaseline:
 		if !state.usesProxy() {
@@ -36,16 +42,12 @@ func renderHosts(state benchmarkState, mode hostsMode) (string, error) {
 			// Gantry and collapse the comparison. A host-specific certs.d
 			// directory takes precedence over _default, so writing an explicit
 			// direct-to-ACR entry is what actually bypasses Gantry.
-			if state.ACRLoginServer == "" {
-				return "", fmt.Errorf("benchmark state has no ACR login server for direct baseline routing")
-			}
-
 			return fmt.Sprintf(`%s
 server = "https://%s"
 
 [host."https://%s"]
   capabilities = ["pull", "resolve"]
-`, marker, state.ACRLoginServer, state.ACRLoginServer), nil
+`, marker, registry, registry), nil
 		}
 
 		if state.ProxyClusterIP == "" {
@@ -87,6 +89,24 @@ server = "http://%s:5002"
 	}
 }
 
+func (s benchmarkState) registryForHosts(mode hostsMode) (string, error) {
+	registry := s.ACRLoginServer
+	if !s.usesProxy() {
+		switch mode {
+		case hostsModeBaseline:
+			registry = s.BaselineACRLoginServer
+		case hostsModeGantry:
+			registry = s.GantryACRLoginServer
+		}
+	}
+
+	if registry == "" {
+		return "", fmt.Errorf("benchmark state has no registry for %s routing", mode)
+	}
+
+	return registry, nil
+}
+
 func (b *benchmark) installHosts(ctx context.Context, state benchmarkState, mode hostsMode) error {
 	content, err := renderHosts(state, mode)
 	if err != nil {
@@ -120,7 +140,12 @@ func (b *benchmark) installHosts(ctx context.Context, state benchmarkState, mode
 		return err
 	}
 
-	if err := b.applyObject(ctx, b.hostsInstallerDaemonSet(state)); err != nil {
+	installer, err := b.hostsInstallerDaemonSet(state, mode)
+	if err != nil {
+		return err
+	}
+
+	if err := b.applyObject(ctx, installer); err != nil {
 		return err
 	}
 
@@ -137,12 +162,17 @@ func (b *benchmark) installHosts(ctx context.Context, state benchmarkState, mode
 	return b.validateBenchmarkDaemonSet(ctx, hostsDaemonSetName)
 }
 
-func (b *benchmark) hostsInstallerDaemonSet(state benchmarkState) map[string]any {
+func (b *benchmark) hostsInstallerDaemonSet(state benchmarkState, mode hostsMode) (map[string]any, error) {
+	registry, err := state.registryForHosts(mode)
+	if err != nil {
+		return nil, err
+	}
+
 	command := `set -eu
 target_dir="/host-certs/${REGISTRY_HOST}"
 target="${target_dir}/hosts.toml"
 active="${target_dir}/.gantry-benchmark-active"
-backup="/host-state/${RUN_ID}"
+backup="/host-state/${RUN_ID}/${REGISTRY_HOST}"
 marker="# Managed by Gantry benchmark ${RUN_ID}."
 first_install=false
 
@@ -218,7 +248,7 @@ exec sleep 2147483647
 		b.config.nodeSelector(),
 		command,
 		map[string]string{
-			"REGISTRY_HOST": state.ACRLoginServer,
+			"REGISTRY_HOST": registry,
 			"RUN_ID":        state.RunID,
 		},
 		[]any{
@@ -227,7 +257,7 @@ exec sleep 2147483647
 		[]any{
 			map[string]any{"name": "config", "configMap": map[string]any{"name": hostsConfigMapName}},
 		},
-	)
+	), nil
 }
 
 func (b *benchmark) restoreHosts(ctx context.Context, state benchmarkState) error {
@@ -241,6 +271,49 @@ func (b *benchmark) restoreHosts(ctx context.Context, state benchmarkState) erro
 		return err
 	}
 
+	registries, err := state.routingRegistries()
+	if err != nil {
+		return err
+	}
+
+	for _, registry := range registries {
+		if err := b.restoreRegistryHosts(ctx, state, registry); err != nil {
+			return err
+		}
+	}
+
+	if _, err := b.commands.Run(
+		ctx,
+		nil,
+		"kubectl", "-n", b.config.Namespace,
+		"delete", "configmap", hostsConfigMapName,
+		"--ignore-not-found=true",
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s benchmarkState) routingRegistries() ([]string, error) {
+	baseline, err := s.registryForHosts(hostsModeBaseline)
+	if err != nil {
+		return nil, err
+	}
+
+	gantry, err := s.registryForHosts(hostsModeGantry)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.EqualFold(baseline, gantry) {
+		return []string{baseline}, nil
+	}
+
+	return []string{baseline, gantry}, nil
+}
+
+func (b *benchmark) restoreRegistryHosts(ctx context.Context, state benchmarkState, registry string) error {
 	name := "gantry-benchmark-hosts-restore"
 	if _, err := b.commands.Run(
 		ctx,
@@ -256,7 +329,7 @@ func (b *benchmark) restoreHosts(ctx context.Context, state benchmarkState) erro
 target_dir="/host-certs/${REGISTRY_HOST}"
 target="${target_dir}/hosts.toml"
 active="${target_dir}/.gantry-benchmark-active"
-backup="/host-state/${RUN_ID}"
+backup="/host-state/${RUN_ID}/${REGISTRY_HOST}"
 marker="# Managed by Gantry benchmark ${RUN_ID}."
 
 if [ ! -e "${backup}/initialized" ]; then
@@ -352,7 +425,7 @@ exec sleep 2147483647
 		b.config.nodeSelector(),
 		command,
 		map[string]string{
-			"REGISTRY_HOST": state.ACRLoginServer,
+			"REGISTRY_HOST": registry,
 			"RUN_ID":        state.RunID,
 		},
 		nil,
@@ -381,16 +454,6 @@ exec sleep 2147483647
 		nil,
 		"kubectl", "-n", b.config.Namespace,
 		"delete", "daemonset", name, "--wait=true",
-	); err != nil {
-		return err
-	}
-
-	if _, err := b.commands.Run(
-		ctx,
-		nil,
-		"kubectl", "-n", b.config.Namespace,
-		"delete", "configmap", hostsConfigMapName,
-		"--ignore-not-found=true",
 	); err != nil {
 		return err
 	}

@@ -65,6 +65,7 @@ func TestCollectACRPulls(t *testing.T) {
 	measurement, err := benchmark.collectACRPulls(
 		context.Background(),
 		"acr.example/gantry-benchmark-pull@sha256:abc",
+		benchmark.config.ACRResourceID,
 		telemetryWindow{StartedAt: time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC), FinishedAt: time.Date(2026, 7, 30, 10, 1, 0, 0, time.UTC)},
 	)
 	if err != nil {
@@ -100,6 +101,7 @@ func TestCollectACRPullsRejectsConcurrentRepositoryTraffic(t *testing.T) {
 	measurement, err := benchmark.collectACRPulls(
 		context.Background(),
 		"acr.example/gantry-benchmark-pull@sha256:abc",
+		benchmark.config.ACRResourceID,
 		telemetryWindow{StartedAt: time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC), FinishedAt: time.Date(2026, 7, 30, 10, 1, 0, 0, time.UTC)},
 	)
 	if err != nil {
@@ -150,13 +152,15 @@ func TestCollectPrivateEndpointBytes(t *testing.T) {
 
 	measurement, err := benchmark.collectPrivateEndpointBytes(
 		context.Background(),
+		benchmark.config.ACRPrivateEndpointResourceID,
+		123,
 		telemetryWindow{StartedAt: time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC), FinishedAt: time.Date(2026, 7, 30, 10, 1, 0, 0, time.UTC)},
 	)
 	if err != nil {
 		t.Fatalf("collectPrivateEndpointBytes: %v", err)
 	}
 
-	if measurement.BytesFromACR != 123 || !measurement.Complete {
+	if measurement.BytesFromACR != 123 || measurement.MinimumExpectedBytes != 123 || !measurement.Complete {
 		t.Fatalf("measurement = %+v, want 123 complete bytes", measurement)
 	}
 }
@@ -198,6 +202,8 @@ func TestCollectPrivateEndpointBytesAcceptsQueryableZero(t *testing.T) {
 
 	measurement, err := benchmark.collectPrivateEndpointBytes(
 		context.Background(),
+		benchmark.config.ACRPrivateEndpointResourceID,
+		0,
 		telemetryWindow{StartedAt: time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC), FinishedAt: time.Date(2026, 7, 30, 10, 1, 0, 0, time.UTC)},
 	)
 	if err != nil {
@@ -206,6 +212,56 @@ func TestCollectPrivateEndpointBytesAcceptsQueryableZero(t *testing.T) {
 
 	if measurement.BytesFromACR != 0 || !measurement.Complete {
 		t.Fatalf("measurement = %+v, want complete zero-byte window", measurement)
+	}
+}
+
+func TestCollectPrivateEndpointBytesRejectsImplausiblySmallTotal(t *testing.T) {
+	total := 396.0
+
+	metrics, err := json.Marshal(azureMetricsResponse{Value: []struct {
+		Name struct {
+			Value string `json:"value"`
+		} `json:"name"`
+		Timeseries []struct {
+			Data []struct {
+				Total *float64 `json:"total"`
+			} `json:"data"`
+		} `json:"timeseries"`
+	}{
+		{
+			Name: struct {
+				Value string `json:"value"`
+			}{Value: "PEBytesIn"},
+			Timeseries: []struct {
+				Data []struct {
+					Total *float64 `json:"total"`
+				} `json:"data"`
+			}{{Data: []struct {
+				Total *float64 `json:"total"`
+			}{{Total: &total}}}},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("marshal metrics: %v", err)
+	}
+
+	benchmark := &benchmark{
+		config:   benchmarkConfig{ACRPrivateEndpointResourceID: "/subscriptions/s/privateEndpoints/acr"},
+		commands: &telemetryCommandRunner{metrics: metrics},
+	}
+
+	measurement, err := benchmark.collectPrivateEndpointBytes(
+		context.Background(),
+		benchmark.config.ACRPrivateEndpointResourceID,
+		128*mibibyte,
+		telemetryWindow{StartedAt: time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC), FinishedAt: time.Date(2026, 7, 30, 10, 1, 0, 0, time.UTC)},
+	)
+	if err != nil {
+		t.Fatalf("collectPrivateEndpointBytes: %v", err)
+	}
+
+	if measurement.Complete || measurement.BytesFromACR != 396 || measurement.MinimumExpectedBytes != 128*mibibyte {
+		t.Fatalf("measurement = %+v, want incomplete implausible total", measurement)
 	}
 }
 
@@ -263,7 +319,8 @@ func TestTelemetryConfigRequiresAllResourceIDs(t *testing.T) {
 	config, err := loadBenchmarkConfig(envFromMap(map[string]string{
 		"BENCHMARK_MODE":            "direct",
 		"BENCHMARK_AZURE_TELEMETRY": "true",
-		"ACR_LOGIN_SERVER":          "acr.example",
+		"BASELINE_ACR_LOGIN_SERVER": "baseline.azurecr.io",
+		"GANTRY_ACR_LOGIN_SERVER":   "gantry.azurecr.io",
 	}))
 	if err != nil {
 		t.Fatalf("loadBenchmarkConfig: %v", err)

@@ -74,12 +74,27 @@ func (b *benchmark) collectAzurePhaseOnce(
 	ctx context.Context,
 	phase phaseResult,
 ) (azurePhaseMeasurement, error) {
-	acr, err := b.collectACRPulls(ctx, phase.Image, phase.Azure.Window)
+	registry, err := b.config.registryForPhase(phase.Phase)
 	if err != nil {
 		return azurePhaseMeasurement{}, err
 	}
 
-	privateEndpoint, err := b.collectPrivateEndpointBytes(ctx, phase.Azure.Window)
+	acr, err := b.collectACRPulls(ctx, phase.Image, registry.ResourceID, phase.Azure.Window)
+	if err != nil {
+		return azurePhaseMeasurement{}, err
+	}
+
+	minimumPrivateEndpointBytes := uint64(phase.Gantry.OriginBytes)
+	if phase.Phase == proxyPhaseBaseline {
+		minimumPrivateEndpointBytes = uint64(len(phase.Job.Pods)) * b.config.imageBytes()
+	}
+
+	privateEndpoint, err := b.collectPrivateEndpointBytes(
+		ctx,
+		registry.PrivateEndpointID,
+		minimumPrivateEndpointBytes,
+		phase.Azure.Window,
+	)
 	if err != nil {
 		return azurePhaseMeasurement{}, err
 	}

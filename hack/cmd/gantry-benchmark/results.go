@@ -71,6 +71,7 @@ type phaseResult struct {
 	Phase        proxyPhase                 `json:"phase"`
 	Image        string                     `json:"image"`
 	ImageSizeMiB int                        `json:"image_size_mib"`
+	PayloadSHA   string                     `json:"workload_payload_sha256,omitempty"`
 	Proxy        proxyPhaseTotals           `json:"proxy"`
 	Gantry       gantryMetrics              `json:"gantry"`
 	GantryPeer   gantryPeerPhaseMeasurement `json:"gantry_peer"`
@@ -592,7 +593,17 @@ func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchm
 		}
 		comparison.Checks["no_origin_fallback"] = fallbackCheck
 
-		comparison.Passed = comparison.Passed && bypassCheck.Passed && fallbackCheck.Passed
+		payloadCheck := resultCheck{
+			Passed: baseline.PayloadSHA != "" && baseline.PayloadSHA == gantry.PayloadSHA,
+			Message: fmt.Sprintf(
+				"workload payload sha256 baseline=%q Gantry=%q, want the same non-empty fingerprint",
+				baseline.PayloadSHA,
+				gantry.PayloadSHA,
+			),
+		}
+		comparison.Checks["same_workload_payload"] = payloadCheck
+
+		comparison.Passed = comparison.Passed && bypassCheck.Passed && fallbackCheck.Passed && payloadCheck.Passed
 	}
 
 	return comparison
@@ -692,6 +703,11 @@ func renderComparisonMarkdown(comparison benchmarkComparison) string {
 
 Mode: **direct**
 
+Shared workload payload: **%s**
+
+- Baseline image: %s
+- Gantry image: %s
+
 Origin byte sources:
 
 - Baseline: %s
@@ -713,6 +729,9 @@ Result: **%s**
 
 `,
 			comparison.RunID,
+			comparison.Baseline.PayloadSHA,
+			comparison.Baseline.Image,
+			comparison.GantryCold.Image,
 			comparison.Baseline.OriginBytesSource,
 			comparison.GantryCold.OriginBytesSource,
 			byteLabel,

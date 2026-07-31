@@ -405,9 +405,57 @@ func (b *benchmark) checkAzureTelemetry(ctx context.Context) error {
 		return fmt.Errorf("validate Azure CLI authentication: %w", err)
 	}
 
-	acrName, found := strings.CutSuffix(strings.ToLower(b.config.ACRLoginServer), ".azurecr.io")
+	registries := []struct {
+		name     string
+		registry phaseRegistry
+	}{}
+
+	if b.config.usesProxy() {
+		registry, err := b.config.registryForPhase(proxyPhaseBaseline)
+		if err != nil {
+			return err
+		}
+
+		registries = append(registries, struct {
+			name     string
+			registry phaseRegistry
+		}{name: "proxy", registry: registry})
+	} else {
+		for _, phase := range []proxyPhase{proxyPhaseBaseline, proxyPhaseGantryCold} {
+			registry, err := b.config.registryForPhase(phase)
+			if err != nil {
+				return err
+			}
+
+			registries = append(registries, struct {
+				name     string
+				registry phaseRegistry
+			}{name: string(phase), registry: registry})
+		}
+	}
+
+	for _, candidate := range registries {
+		if err := b.checkAzureRegistry(ctx, candidate.registry); err != nil {
+			return fmt.Errorf("validate %s ACR telemetry: %w", candidate.name, err)
+		}
+	}
+
+	probeWindow := telemetryWindow{StartedAt: time.Now().Add(-time.Hour), FinishedAt: time.Now()}
+	if _, err := b.queryLogAnalytics(ctx, false, "ContainerRegistryRepositoryEvents | take 0", probeWindow); err != nil {
+		return fmt.Errorf("query ACR repository table: %w", err)
+	}
+
+	if _, err := b.queryLogAnalytics(ctx, true, "AKSAuditAdmin | take 0", probeWindow); err != nil {
+		return fmt.Errorf("query AKS audit table: %w", err)
+	}
+
+	return nil
+}
+
+func (b *benchmark) checkAzureRegistry(ctx context.Context, registry phaseRegistry) error {
+	acrName, found := strings.CutSuffix(strings.ToLower(registry.LoginServer), ".azurecr.io")
 	if !found || acrName == "" {
-		return fmt.Errorf("ACR login server %q must end in .azurecr.io", b.config.ACRLoginServer)
+		return fmt.Errorf("ACR login server %q must end in .azurecr.io", registry.LoginServer)
 	}
 
 	acrOutput, err := b.commands.Run(
@@ -430,7 +478,7 @@ func (b *benchmark) checkAzureTelemetry(ctx context.Context) error {
 		return fmt.Errorf("decode ACR resource: %w", err)
 	}
 
-	if !strings.EqualFold(acr.ID, b.config.ACRResourceID) || !strings.EqualFold(acr.LoginServer, b.config.ACRLoginServer) {
+	if !strings.EqualFold(acr.ID, registry.ResourceID) || !strings.EqualFold(acr.LoginServer, registry.LoginServer) {
 		return fmt.Errorf(
 			"ACR telemetry resource mismatch: id=%q loginServer=%q",
 			acr.ID,
@@ -449,7 +497,7 @@ func (b *benchmark) checkAzureTelemetry(ctx context.Context) error {
 		ctx,
 		nil,
 		"az", "network", "private-endpoint", "show",
-		"--ids", b.config.ACRPrivateEndpointResourceID,
+		"--ids", registry.PrivateEndpointID,
 		"--output", "json",
 	)
 	if err != nil {
@@ -472,7 +520,7 @@ func (b *benchmark) checkAzureTelemetry(ctx context.Context) error {
 	approved := false
 
 	for _, connection := range privateEndpoint.Connections {
-		if strings.EqualFold(connection.PrivateLinkServiceID, b.config.ACRResourceID) &&
+		if strings.EqualFold(connection.PrivateLinkServiceID, registry.ResourceID) &&
 			strings.EqualFold(connection.State.Status, "Approved") {
 			approved = true
 
@@ -492,7 +540,7 @@ func (b *benchmark) checkAzureTelemetry(ctx context.Context) error {
 		ctx,
 		nil,
 		"az", "monitor", "metrics", "list-definitions",
-		"--resource", b.config.ACRPrivateEndpointResourceID,
+		"--resource", registry.PrivateEndpointID,
 		"--output", "json",
 	)
 	if err != nil {
@@ -520,15 +568,6 @@ func (b *benchmark) checkAzureTelemetry(ctx context.Context) error {
 
 	if !hasPEBytesIn {
 		return fmt.Errorf("private endpoint does not expose PEBytesIn")
-	}
-
-	probeWindow := telemetryWindow{StartedAt: time.Now().Add(-time.Hour), FinishedAt: time.Now()}
-	if _, err := b.queryLogAnalytics(ctx, false, "ContainerRegistryRepositoryEvents | take 0", probeWindow); err != nil {
-		return fmt.Errorf("query ACR repository table: %w", err)
-	}
-
-	if _, err := b.queryLogAnalytics(ctx, true, "AKSAuditAdmin | take 0", probeWindow); err != nil {
-		return fmt.Errorf("query AKS audit table: %w", err)
 	}
 
 	return nil

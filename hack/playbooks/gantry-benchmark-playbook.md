@@ -25,14 +25,18 @@ metrics increasing. If large blob bytes mostly come from
 `client_class="containerd"`, the run is not a valid Gantry comparison even if
 the Kubernetes Job completes.
 
-`BENCHMARK_MODE=direct`:
+`BENCHMARK_MODE=direct` (the dual-ACR benchmark):
 
 | Phase | Intended pull path |
 |---|---|
-| Baseline | containerd -> ACR |
-| Gantry cold | containerd -> local Gantry -> peer or ACR |
+| Baseline | containerd -> baseline ACR |
+| Gantry cold | containerd -> local Gantry -> peer or Gantry ACR |
 
-There is no proxy. Origin bytes come from two sources:
+There is no proxy. `prepare` generates one payload set and pushes the same
+repository, tag, payload bytes, size, and layer count to both ACRs. Payload
+layers use phase-specific destination paths so OCI digests differ and the
+second phase cannot reuse the first phase's containerd content cache. Origin
+bytes come from two sources:
 
 - Baseline: completed pull pods x total image size (analytic, because Gantry is
   deliberately bypassed).
@@ -46,7 +50,7 @@ than footnotes:
   and zero peer hits. Gantry's node configurator owns
   `/etc/containerd/certs.d/_default/hosts.toml` and routes every registry
   through the local mirror, so the benchmark installs an explicit direct-to-ACR
-  host file for the ACR. If that override fails, the baseline silently runs
+  host file for the baseline ACR. If that override fails, the baseline silently runs
   through Gantry and the comparison is void.
 - `no_origin_fallback` - `p2p_origin_fallback_total` must stay at zero. Fallback
   bytes are counted, but a fallback means peer distribution exhausted and the
@@ -65,7 +69,8 @@ The cluster should already have:
 
 - An AKS context selected with `kubectl`.
 - A Ready `gantry-system/gantry` DaemonSet on every benchmark node.
-- The target ACR listed in Gantry's `upstream_registries` config.
+- A dedicated Gantry ACR listed in Gantry's `upstream_registries` config, and a
+  different baseline ACR that Gantry does not use as its origin.
 - kube-prometheus-stack installed, including Prometheus, Grafana, and
   PodMonitor CRDs. Nothing in this repository installs it; see
   [Install kube-prometheus-stack](#install-kube-prometheus-stack).
@@ -76,8 +81,8 @@ The cluster should already have:
 The operator machine should have:
 
 - `az`, `kubectl`, `jq`, `helm`, and either `podman` or Docker Buildx.
-- ACR push permission. For ACR admin-disabled clusters, use
-  `az acr login --expose-token` and the all-zero username.
+- Push permission to both ACRs. For admin-disabled registries, use
+  `az acr login --expose-token` for each ACR and the all-zero username.
 
 ## Safety Checks
 
@@ -88,7 +93,15 @@ kubectl config current-context
 kubectl get nodes -L kubernetes.azure.com/agentpool,kubernetes.io/os,kubernetes.io/arch
 kubectl -n gantry-system get daemonset gantry
 kubectl -n monitoring get pods,svc
+kubectl -n gantry-system get configmap gantry-config \
+  -o jsonpath='{.data.config\.yaml}' | grep -A3 'upstream_registries:'
 ```
+
+For direct mode, the matching upstream entry must be named
+`$GANTRY_ACR_LOGIN_SERVER` and its endpoint must be
+`https://$GANTRY_ACR_LOGIN_SERVER`. `enable` rejects any other binding. The
+baseline ACR is reached only through the benchmark's explicit direct
+containerd configuration.
 
 Check for existing benchmark state:
 
@@ -167,15 +180,41 @@ Set the Azure resource variables:
 ```bash
 : "${RESOURCE_GROUP:?Set RESOURCE_GROUP}"
 : "${CLUSTER_NAME:?Set CLUSTER_NAME}"
-: "${ACR_NAME:?Set ACR_NAME}"
+: "${BASELINE_ACR_NAME:?Set globally unique BASELINE_ACR_NAME, for example teamgantrybaseline}"
+: "${GANTRY_ACR_NAME:?Set globally unique GANTRY_ACR_NAME, for example teamgantryp2p}"
 
 LAW_NAME="${LAW_NAME:-vapa-gantry-bench-law}"
-PRIVATE_ENDPOINT_NAME="${PRIVATE_ENDPOINT_NAME:-vapa-gantry-bench-acr-pe}"
+BASELINE_PRIVATE_ENDPOINT_NAME="${BASELINE_PRIVATE_ENDPOINT_NAME:-gantry-benchmark-baseline-acr-pe}"
+GANTRY_PRIVATE_ENDPOINT_NAME="${GANTRY_PRIVATE_ENDPOINT_NAME:-gantry-benchmark-gantry-acr-pe}"
 PRIVATE_ENDPOINT_SUBNET_NAME="${PRIVATE_ENDPOINT_SUBNET_NAME:-acr-private-endpoints}"
 : "${PRIVATE_ENDPOINT_SUBNET_CIDR:?Set a /27 inside the AKS VNet address space}"
 
+if ! az acr show -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" --output none 2>/dev/null; then
+  az acr create -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" \
+    --sku Premium --only-show-errors
+fi
+if ! az acr show -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --output none 2>/dev/null; then
+  az acr create -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
+    --sku Premium --only-show-errors
+fi
+
 AKS_ID=$(az aks show -g "$RESOURCE_GROUP" -n "$CLUSTER_NAME" --query id -o tsv)
-ACR_ID=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query id -o tsv)
+BASELINE_ACR_ID=$(az acr show -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" --query id -o tsv)
+GANTRY_ACR_ID=$(az acr show -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --query id -o tsv)
+BASELINE_ACR_LOGIN_SERVER=$(az acr show -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" --query loginServer -o tsv)
+GANTRY_ACR_LOGIN_SERVER=$(az acr show -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --query loginServer -o tsv)
+KUBELET_OBJECT_ID=$(az aks show -g "$RESOURCE_GROUP" -n "$CLUSTER_NAME" \
+  --query identityProfile.kubeletidentity.objectId -o tsv)
+
+for acr_id in "$BASELINE_ACR_ID" "$GANTRY_ACR_ID"; do
+  az role assignment create \
+    --assignee-object-id "$KUBELET_OBJECT_ID" \
+    --assignee-principal-type ServicePrincipal \
+    --role AcrPull \
+    --scope "$acr_id" \
+    --only-show-errors
+done
+
 NODE_SUBNET_ID=$(az aks show -g "$RESOURCE_GROUP" -n "$CLUSTER_NAME" \
   --query 'agentPoolProfiles[0].vnetSubnetId' -o tsv)
 
@@ -200,8 +239,17 @@ LAW_CUSTOMER_ID=$(az monitor log-analytics workspace show \
   -g "$RESOURCE_GROUP" -n "$LAW_NAME" --query customerId -o tsv)
 
 az monitor diagnostic-settings create \
-  --name vapa-gantry-acr-diag \
-  --resource "$ACR_ID" \
+  --name gantry-benchmark-baseline-acr-diag \
+  --resource "$BASELINE_ACR_ID" \
+  --workspace "$LAW_ID" \
+  --export-to-resource-specific true \
+  --logs '[{"category":"ContainerRegistryRepositoryEvents","enabled":true},{"category":"ContainerRegistryLoginEvents","enabled":true}]' \
+  --metrics '[{"category":"AllMetrics","enabled":true}]' \
+  --only-show-errors
+
+az monitor diagnostic-settings create \
+  --name gantry-benchmark-gantry-acr-diag \
+  --resource "$GANTRY_ACR_ID" \
   --workspace "$LAW_ID" \
   --export-to-resource-specific true \
   --logs '[{"category":"ContainerRegistryRepositoryEvents","enabled":true},{"category":"ContainerRegistryLoginEvents","enabled":true}]' \
@@ -253,39 +301,62 @@ az network private-dns link vnet create \
 
 az network private-endpoint create \
   -g "$RESOURCE_GROUP" \
-  -n "$PRIVATE_ENDPOINT_NAME" \
+  -n "$BASELINE_PRIVATE_ENDPOINT_NAME" \
   --subnet "$PE_SUBNET_ID" \
-  --private-connection-resource-id "$ACR_ID" \
+  --private-connection-resource-id "$BASELINE_ACR_ID" \
   --group-ids registry \
-  --connection-name vapa-gantry-acr \
+  --connection-name gantry-benchmark-baseline-acr \
   --only-show-errors
 
 az network private-endpoint dns-zone-group create \
   -g "$RESOURCE_GROUP" \
-  --endpoint-name "$PRIVATE_ENDPOINT_NAME" \
+  --endpoint-name "$BASELINE_PRIVATE_ENDPOINT_NAME" \
   -n acr \
   --private-dns-zone "$DNS_ZONE_ID" \
   --zone-name privatelink.azurecr.io \
   --only-show-errors
 
-PRIVATE_ENDPOINT_ID=$(az network private-endpoint show \
-  -g "$RESOURCE_GROUP" -n "$PRIVATE_ENDPOINT_NAME" --query id -o tsv)
+az network private-endpoint create \
+  -g "$RESOURCE_GROUP" \
+  -n "$GANTRY_PRIVATE_ENDPOINT_NAME" \
+  --subnet "$PE_SUBNET_ID" \
+  --private-connection-resource-id "$GANTRY_ACR_ID" \
+  --group-ids registry \
+  --connection-name gantry-benchmark-gantry-acr \
+  --only-show-errors
+
+az network private-endpoint dns-zone-group create \
+  -g "$RESOURCE_GROUP" \
+  --endpoint-name "$GANTRY_PRIVATE_ENDPOINT_NAME" \
+  -n acr \
+  --private-dns-zone "$DNS_ZONE_ID" \
+  --zone-name privatelink.azurecr.io \
+  --only-show-errors
+
+BASELINE_PRIVATE_ENDPOINT_ID=$(az network private-endpoint show \
+  -g "$RESOURCE_GROUP" -n "$BASELINE_PRIVATE_ENDPOINT_NAME" --query id -o tsv)
+GANTRY_PRIVATE_ENDPOINT_ID=$(az network private-endpoint show \
+  -g "$RESOURCE_GROUP" -n "$GANTRY_PRIVATE_ENDPOINT_NAME" --query id -o tsv)
 ```
 
-From an AKS pod, confirm that both the login and data endpoints resolve
+From an AKS pod, confirm that both ACR login and regional data endpoints resolve
 privately. Run `prepare` before disabling public ACR access:
 
 ```bash
-az acr show-endpoints -n "$ACR_NAME" -o table
-getent ahostsv4 "${ACR_NAME}.azurecr.io"
-getent ahostsv4 "${ACR_NAME}.canadacentral.data.azurecr.io"
-
-az acr update -g "$RESOURCE_GROUP" -n "$ACR_NAME" \
-  --public-network-enabled false --only-show-errors
+for acr_name in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
+  az acr show-endpoints -n "$acr_name" -o table
+  getent ahostsv4 "${acr_name}.azurecr.io"
+  getent ahostsv4 "${acr_name}.canadacentral.data.azurecr.io"
+done
 ```
 
-Preflight independently verifies the resource binding, approved connection,
-disabled public access, `PEBytesIn`, and both Log Analytics tables.
+Preflight independently verifies both resource bindings, both approved
+connections, disabled public access on both ACRs, `PEBytesIn` on both Private
+Endpoints, and both Log Analytics tables.
+
+During collection, each phase also requires `PEBytesIn` to meet a minimum
+derived from the transferred workload. Non-null endpoint points containing only
+control traffic are incomplete and invalidate Azure promotion.
 
 ## Configure The Environment
 
@@ -301,21 +372,24 @@ set:
 ```bash
 export BENCHMARK_CONFIRM_CONTEXT="$(kubectl config current-context)"
 
-# proxy (default) routes both phases through the counting proxy.
-# direct removes the proxy and uses Gantry's direct origin-byte counter.
+# Direct mode compares the dedicated baseline and Gantry ACRs.
 export BENCHMARK_MODE="direct"
 
-export ACR_NAME="<acr-name>"
-export ACR_LOGIN_SERVER="<acr-name>.azurecr.io"
-export ACR_USERNAME="00000000-0000-0000-0000-000000000000"
-# Proxy mode only.
-export BENCHMARK_PROXY_IMAGE="${ACR_LOGIN_SERVER}/acr-origin-proxy:benchmark-$(date -u +%Y%m%d%H%M%S)"
+export BASELINE_ACR_NAME="<baseline-acr-name>"
+export BASELINE_ACR_LOGIN_SERVER="<baseline-acr-name>.azurecr.io"
+export BASELINE_ACR_USERNAME="00000000-0000-0000-0000-000000000000"
+
+export GANTRY_ACR_NAME="<gantry-acr-name>"
+export GANTRY_ACR_LOGIN_SERVER="<gantry-acr-name>.azurecr.io"
+export GANTRY_ACR_USERNAME="00000000-0000-0000-0000-000000000000"
 
 export BENCHMARK_AZURE_TELEMETRY="true"
-export AZURE_LOG_ANALYTICS_WORKSPACE_ID="$LAW_CUSTOMER_ID"
-export AZURE_ACR_RESOURCE_ID="$ACR_ID"
-export AZURE_AKS_RESOURCE_ID="$AKS_ID"
-export AZURE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="$PRIVATE_ENDPOINT_ID"
+export AZURE_LOG_ANALYTICS_WORKSPACE_ID="<workspace-customer-id>"
+export AZURE_AKS_RESOURCE_ID="<aks-resource-id>"
+export AZURE_BASELINE_ACR_RESOURCE_ID="<baseline-acr-resource-id>"
+export AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="<baseline-private-endpoint-resource-id>"
+export AZURE_GANTRY_ACR_RESOURCE_ID="<gantry-acr-resource-id>"
+export AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="<gantry-private-endpoint-resource-id>"
 export BENCHMARK_TELEMETRY_TIMEOUT="15m"
 export BENCHMARK_TELEMETRY_POLL_INTERVAL="15s"
 
@@ -366,22 +440,24 @@ Constraints: `IMAGE_LAYERS` must be `>= 1` and `<= IMAGE_SIZE_MIB`. Use a
 multi-layer shape when validating the target 20-40 GiB many-layer workload;
 use the single 1 GiB layer only to measure the worst case.
 
-For admin-disabled ACR auth, inject the refresh token only when building or
-pushing the proxy and when running `prepare`:
+For admin-disabled direct-mode ACR auth, inject one refresh token per registry
+only while running `prepare`:
 
 ```bash
 set -a
 . hack/gantry-benchmark/env.local
 set +a
 
-acr_refresh_token=$(az acr login --name "$ACR_NAME" --expose-token --query accessToken -o tsv)
-export ACR_PASSWORD="$acr_refresh_token"
+baseline_refresh_token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
+gantry_refresh_token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
+export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
+export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
 ```
 
 Unset it after the command that needs it:
 
 ```bash
-unset ACR_PASSWORD acr_refresh_token
+unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token
 ```
 
 ## Optional Capacity Placement
@@ -486,20 +562,23 @@ Expected state is `enabled`.
 
 ## Prepare Workload Images
 
-While public ACR access is still enabled, build and push both fresh phase
-images and bind their digest references to benchmark state:
+While public access is still enabled on both ACRs, generate one payload set and
+push the same repository and tag to both registries. The tool records both OCI
+digests and their shared payload SHA in benchmark state:
 
 ```bash
 set -a
 . hack/gantry-benchmark/env.local
 set +a
 
-acr_refresh_token=$(az acr login --name "$ACR_NAME" --expose-token --query accessToken -o tsv)
-export ACR_PASSWORD="$acr_refresh_token"
+baseline_refresh_token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
+gantry_refresh_token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
+export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
+export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
 
 BENCHMARK_CONFIRM_CONTEXT=$(kubectl config current-context) make -C hack/gantry-benchmark prepare
 
-unset ACR_PASSWORD acr_refresh_token
+unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token
 ```
 
 Checkpoint:
@@ -508,11 +587,16 @@ Checkpoint:
 make -C hack/gantry-benchmark status
 ```
 
-Expected state is `images-prepared`. For Azure telemetry, now disable public
-access so all measured image traffic traverses the Private Endpoint:
+Expected state is `images-prepared`. Verify `baseline_image` and
+`gantry_cold_image` use different registry hosts and OCI digests while
+`workload_payload_sha256` is a single shared value. Then disable public access
+on both ACRs so all measured image traffic traverses the phase's Private
+Endpoint:
 
 ```bash
-az acr update -g "$RESOURCE_GROUP" -n "$ACR_NAME" \
+az acr update -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" \
+  --public-network-enabled false --only-show-errors
+az acr update -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
   --public-network-enabled false --only-show-errors
 ```
 
@@ -569,7 +653,7 @@ gantry-benchmark-gantry-cold-<run-id>
 
 Proxy mode funnels every pull through one client, which incidentally shields ACR
 from the node fan-out. Direct mode removes that shield: the baseline phase is
-300 nodes pulling from ACR at once.
+300 nodes pulling from the baseline ACR at once.
 
 ACR Premium allows roughly 20,000 DataplaneRead requests per minute per
 registry, but only 10,000 per identity per registry. Every AKS node authenticates
@@ -611,12 +695,15 @@ node=$(kubectl -n gantry-benchmark get pods -l app.kubernetes.io/name=gantry-ben
   -o jsonpath='{.items[0].metadata.name}')
 
 kubectl -n gantry-benchmark exec "$node" -- \
-  cat "/host-certs/${ACR_LOGIN_SERVER}/hosts.toml"
+  cat "/host-certs/${BASELINE_ACR_LOGIN_SERVER}/hosts.toml"
+
+kubectl -n gantry-benchmark exec "$node" -- \
+  cat "/host-certs/${GANTRY_ACR_LOGIN_SERVER}/hosts.toml"
 ```
 
-During the baseline this must contain `server = "https://<acr>.azurecr.io"` and
-must not mention `127.0.0.1:5000`. During the Gantry phase it must contain only
-the `[host."http://127.0.0.1:5000"]` block with no `server =` line.
+The baseline ACR file must contain its direct HTTPS server and must not mention
+`127.0.0.1:5000`. The Gantry ACR file must contain only the
+`[host."http://127.0.0.1:5000"]` block with no `server =` line.
 
 Confirm Gantry was never patched. Direct mode leaves the ConfigMap untouched, so
 this hash must match before and after the run:
@@ -631,7 +718,7 @@ The two direct-mode routing/health assumptions are enforced automatically. After
 
 ```bash
 run_id=$(jq -r '.run_id' tmp/gantry-benchmark/*/state.json | tail -1)
-jq '.checks | {baseline_bypassed_gantry, no_origin_fallback}' \
+jq '.checks | {same_workload_payload, baseline_bypassed_gantry, no_origin_fallback}' \
   "tmp/gantry-benchmark/${run_id}/comparison.json"
 ```
 
@@ -763,7 +850,7 @@ Do not patch DaemonSets, force delete pods, or delete the namespace until the
 current routing state is understood. If manual recovery is needed, record:
 
 - Current benchmark state.
-- Current Gantry ConfigMap endpoint for the target ACR.
+- Current Gantry ConfigMap endpoint for the dedicated Gantry ACR.
 - Whether `gantry-benchmark-hosts` or `gantry-benchmark-hosts-restore` is
   installed and ready.
 - Which node is blocking and why.

@@ -29,9 +29,15 @@ type benchmarkState struct {
 	PrometheusService            string        `json:"prometheus_service"`
 	NodeCount                    int           `json:"node_count"`
 	ImagePlatform                string        `json:"image_platform"`
+	ImageSizeMiB                 int           `json:"image_size_mib"`
+	ImageLayers                  int           `json:"image_layers"`
+	WorkloadRepository           string        `json:"workload_repository"`
+	BaselineACRLoginServer       string        `json:"baseline_acr_login_server,omitempty"`
+	GantryACRLoginServer         string        `json:"gantry_acr_login_server,omitempty"`
 	ACRLoginServer               string        `json:"acr_login_server"`
 	BaselineImage                string        `json:"baseline_image,omitempty"`
 	GantryColdImage              string        `json:"gantry_cold_image,omitempty"`
+	WorkloadPayloadSHA256        string        `json:"workload_payload_sha256,omitempty"`
 	ProxyImage                   string        `json:"proxy_image,omitempty"`
 	ProxyClusterIP               string        `json:"proxy_cluster_ip,omitempty"`
 	OriginalGantryConfig         string        `json:"original_gantry_config"`
@@ -40,6 +46,10 @@ type benchmarkState struct {
 	GantryRestored               bool          `json:"gantry_restored"`
 	AzureTelemetry               bool          `json:"azure_telemetry"`
 	LogAnalyticsWorkspaceID      string        `json:"log_analytics_workspace_id,omitempty"`
+	BaselineACRResourceID        string        `json:"baseline_acr_resource_id,omitempty"`
+	BaselinePrivateEndpointID    string        `json:"baseline_acr_private_endpoint_resource_id,omitempty"`
+	GantryACRResourceID          string        `json:"gantry_acr_resource_id,omitempty"`
+	GantryPrivateEndpointID      string        `json:"gantry_acr_private_endpoint_resource_id,omitempty"`
 	ACRResourceID                string        `json:"acr_resource_id,omitempty"`
 	AKSResourceID                string        `json:"aks_resource_id,omitempty"`
 	ACRPrivateEndpointResourceID string        `json:"acr_private_endpoint_resource_id,omitempty"`
@@ -55,12 +65,43 @@ func (s benchmarkState) preparedImages() (string, string, error) {
 		return "", "", fmt.Errorf("benchmark images are not prepared; run prepare before preflight")
 	}
 
-	if _, err := imageDigestFromReference(s.BaselineImage); err != nil {
+	baselineDigest, err := imageDigestFromReference(s.BaselineImage)
+	if err != nil {
 		return "", "", fmt.Errorf("invalid prepared baseline image: %w", err)
 	}
 
-	if _, err := imageDigestFromReference(s.GantryColdImage); err != nil {
+	gantryDigest, err := imageDigestFromReference(s.GantryColdImage)
+	if err != nil {
 		return "", "", fmt.Errorf("invalid prepared Gantry-cold image: %w", err)
+	}
+
+	if !s.usesProxy() {
+		if s.WorkloadPayloadSHA256 == "" {
+			return "", "", fmt.Errorf("prepared direct images have no shared payload fingerprint")
+		}
+
+		baselineRepository, _, err := splitImageReference(s.BaselineImage, s.BaselineACRLoginServer)
+		if err != nil {
+			return "", "", fmt.Errorf("prepared baseline image registry mismatch: %w", err)
+		}
+
+		gantryRepository, _, err := splitImageReference(s.GantryColdImage, s.GantryACRLoginServer)
+		if err != nil {
+			return "", "", fmt.Errorf("prepared Gantry image registry mismatch: %w", err)
+		}
+
+		if baselineRepository != s.WorkloadRepository || gantryRepository != s.WorkloadRepository {
+			return "", "", fmt.Errorf(
+				"prepared image repositories baseline=%q Gantry=%q, want %q",
+				baselineRepository,
+				gantryRepository,
+				s.WorkloadRepository,
+			)
+		}
+
+		if baselineDigest == gantryDigest {
+			return "", "", fmt.Errorf("prepared direct image digests are identical and would reuse the node content cache: %s", baselineDigest)
+		}
 	}
 
 	return s.BaselineImage, s.GantryColdImage, nil
@@ -282,17 +323,33 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 		state.PrometheusService == "" ||
 		state.NodeCount <= 0 ||
 		state.ImagePlatform == "" ||
-		state.ACRLoginServer == "" ||
+		state.ImageSizeMiB <= 0 ||
+		state.ImageLayers <= 0 ||
+		state.WorkloadRepository == "" ||
 		state.OriginalGantryConfig == "" {
 		return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete")
 	}
 
-	if state.usesProxy() && state.ProxyImage == "" {
-		return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: proxy mode requires proxy_image")
+	if state.usesProxy() {
+		if state.ACRLoginServer == "" || state.ProxyImage == "" {
+			return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: proxy mode requires acr_login_server and proxy_image")
+		}
+	} else if state.BaselineACRLoginServer == "" || state.GantryACRLoginServer == "" {
+		return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: direct mode requires baseline and Gantry registries")
 	}
 
-	if state.AzureTelemetry && (state.LogAnalyticsWorkspaceID == "" || state.ACRResourceID == "" || state.AKSResourceID == "" || state.ACRPrivateEndpointResourceID == "") {
-		return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: Azure telemetry resource IDs are required")
+	if state.AzureTelemetry {
+		if state.LogAnalyticsWorkspaceID == "" || state.AKSResourceID == "" {
+			return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: Azure telemetry workspace and AKS resource IDs are required")
+		}
+
+		if state.usesProxy() && (state.ACRResourceID == "" || state.ACRPrivateEndpointResourceID == "") {
+			return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: proxy Azure telemetry resource IDs are required")
+		}
+
+		if !state.usesProxy() && (state.BaselineACRResourceID == "" || state.BaselinePrivateEndpointID == "" || state.GantryACRResourceID == "" || state.GantryPrivateEndpointID == "") {
+			return benchmarkState{}, fmt.Errorf("benchmark state ConfigMap is incomplete: direct Azure telemetry requires both ACR and private endpoint resource IDs")
+		}
 	}
 
 	if state.BenchmarkNamespace != b.config.Namespace {
@@ -318,11 +375,20 @@ func (b *benchmark) loadState(ctx context.Context) (benchmarkState, error) {
 	b.config.PrometheusService = state.PrometheusService
 	b.config.NodeCount = state.NodeCount
 	b.config.ImagePlatform = state.ImagePlatform
+	b.config.ImageSizeMiB = state.ImageSizeMiB
+	b.config.ImageLayers = state.ImageLayers
+	b.config.WorkloadRepository = state.WorkloadRepository
 	// The mode is fixed when the run is enabled. Later commands must not be able
 	// to change routing or restoration semantics through the environment.
 	b.config.Mode = state.Mode
 	b.config.AzureTelemetry = state.AzureTelemetry
 	b.config.LogAnalyticsWorkspaceID = state.LogAnalyticsWorkspaceID
+	b.config.BaselineACRLoginServer = state.BaselineACRLoginServer
+	b.config.GantryACRLoginServer = state.GantryACRLoginServer
+	b.config.BaselineACRResourceID = state.BaselineACRResourceID
+	b.config.BaselinePrivateEndpointID = state.BaselinePrivateEndpointID
+	b.config.GantryACRResourceID = state.GantryACRResourceID
+	b.config.GantryPrivateEndpointID = state.GantryPrivateEndpointID
 	b.config.ACRResourceID = state.ACRResourceID
 	b.config.AKSResourceID = state.AKSResourceID
 	b.config.ACRPrivateEndpointResourceID = state.ACRPrivateEndpointResourceID

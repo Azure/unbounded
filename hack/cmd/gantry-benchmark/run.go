@@ -36,8 +36,18 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if b.config.ACRLoginServer != state.ACRLoginServer {
-		return fmt.Errorf("configured ACR_LOGIN_SERVER=%q does not match enabled benchmark registry %q", b.config.ACRLoginServer, state.ACRLoginServer)
+	if state.usesProxy() {
+		if b.config.ACRLoginServer != state.ACRLoginServer {
+			return fmt.Errorf("configured ACR_LOGIN_SERVER=%q does not match enabled benchmark registry %q", b.config.ACRLoginServer, state.ACRLoginServer)
+		}
+	} else if b.config.BaselineACRLoginServer != state.BaselineACRLoginServer || b.config.GantryACRLoginServer != state.GantryACRLoginServer {
+		return fmt.Errorf(
+			"configured registries baseline=%q Gantry=%q do not match enabled benchmark registries baseline=%q Gantry=%q",
+			b.config.BaselineACRLoginServer,
+			b.config.GantryACRLoginServer,
+			state.BaselineACRLoginServer,
+			state.GantryACRLoginServer,
+		)
 	}
 
 	baselineImage, gantryImage, err := state.preparedImages()
@@ -167,6 +177,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		Phase:        proxyPhaseBaseline,
 		Image:        baselineImage,
 		ImageSizeMiB: b.config.ImageSizeMiB,
+		PayloadSHA:   state.WorkloadPayloadSHA256,
 		Proxy:        baselineProxy,
 		Gantry:       baselineGantry,
 		GantryPeer:   baselinePeer,
@@ -261,6 +272,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		Phase:        proxyPhaseGantryCold,
 		Image:        gantryImage,
 		ImageSizeMiB: b.config.ImageSizeMiB,
+		PayloadSHA:   state.WorkloadPayloadSHA256,
 		Proxy:        gantryProxy,
 		Gantry:       phaseMetrics,
 		GantryPeer:   gantryPeer,

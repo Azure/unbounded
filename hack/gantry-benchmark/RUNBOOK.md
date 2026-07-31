@@ -12,24 +12,26 @@ cp hack/gantry-benchmark/env.example hack/gantry-benchmark/env.local
 Fill in:
 
 - `BENCHMARK_CONFIRM_CONTEXT`
-- `BENCHMARK_MODE` (`direct` or `proxy`)
-- `ACR_LOGIN_SERVER`
-- `ACR_USERNAME`
-- `ACR_PASSWORD`
-- `BENCHMARK_PROXY_IMAGE` (proxy mode only)
+- `BENCHMARK_MODE=direct`
+- `BASELINE_ACR_NAME`, `BASELINE_ACR_LOGIN_SERVER`, and baseline push credentials
+- `GANTRY_ACR_NAME`, `GANTRY_ACR_LOGIN_SERVER`, and Gantry push credentials
+
+Legacy proxy mode instead uses `ACR_LOGIN_SERVER`, `ACR_USERNAME`,
+`ACR_PASSWORD`, and `BENCHMARK_PROXY_IMAGE`.
 
 For source-authoritative measurements also fill in:
 
 - `BENCHMARK_AZURE_TELEMETRY=true`
 - `AZURE_LOG_ANALYTICS_WORKSPACE_ID`
-- `AZURE_ACR_RESOURCE_ID`
 - `AZURE_AKS_RESOURCE_ID`
-- `AZURE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID`
+- `AZURE_BASELINE_ACR_RESOURCE_ID`
+- `AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID`
+- `AZURE_GANTRY_ACR_RESOURCE_ID`
+- `AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID`
 
-The proxy image must be in the same ACR being measured. `env.local` is
-gitignored. Credentials are passed to the local container engine and stored
-in a Kubernetes Secret; they are not written to benchmark state or result
-files.
+`env.local` is gitignored. Direct-mode credentials are passed only to the local
+container engine; they are not written to Kubernetes, benchmark state, or
+result files. Proxy-mode credentials are also stored in its Kubernetes Secret.
 
 Confirm the current cluster before continuing:
 
@@ -41,8 +43,8 @@ kubectl -n gantry-system get daemonset gantry
 
 When Azure telemetry is enabled, the operator machine needs ACR data-plane
 access only through image preparation. Preflight requires public access to be
-disabled and verifies that the configured Private Endpoint is approved for
-that exact registry and exposes `PEBytesIn`.
+disabled on both ACRs and verifies that each configured Private Endpoint is
+approved for its exact registry and exposes `PEBytesIn`.
 
 ## 2. Build the proxy (proxy mode only)
 
@@ -90,20 +92,33 @@ No containerd or Gantry routing is changed by `enable`.
 
 ## 4. Prepare workload images
 
-While the operator machine can still reach ACR, build and push both fresh,
+While the operator machine can still reach both ACRs, mint their short-lived
+tokens, then build and push both fresh,
 digest-pinned phase images:
 
 ```bash
+baseline_refresh_token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
+gantry_refresh_token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
+export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
+export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
+
 make -C hack/gantry-benchmark prepare
+
+unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token
 ```
 
-`prepare` records both immutable image references in benchmark state. It does
-not run pull pods or warm containerd caches on target nodes.
+`prepare` generates one random payload set and pushes the same repository and
+tag to both ACRs. The payload SHA, bytes, size, and layer count are identical.
+Phase-specific paths inside every payload layer intentionally produce different
+OCI digests so the Gantry phase cannot reuse baseline content on the same node.
+It does not run pull pods or warm target-node caches.
 
-For Azure telemetry, disable public ACR access after `prepare` succeeds:
+For Azure telemetry, disable public access on both ACRs after `prepare` succeeds:
 
 ```bash
-az acr update -g "$RESOURCE_GROUP" -n "$ACR_NAME" \
+az acr update -g "$RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" \
+   --public-network-enabled false
+az acr update -g "$RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
    --public-network-enabled false
 ```
 
@@ -119,9 +134,9 @@ Preflight performs these mandatory checks before routing changes:
 2. Requires the minimum Gantry DHT health score to be greater than zero.
 3. In direct mode, requires `gantry_origin_bytes_total` on every Gantry pod.
 4. Requires `gantry_peer_serve_bytes_total` on every Gantry pod.
-5. With Azure telemetry, verifies Azure authentication, ACR/AKS/Private Endpoint
-   identity, disabled ACR public access, `PEBytesIn`, and both Log Analytics
-   tables.
+5. With Azure telemetry, verifies Azure authentication, both ACR/Private
+   Endpoint bindings, disabled public access on both ACRs, `PEBytesIn`, AKS,
+   and both Log Analytics tables.
 6. In proxy mode, smoke-tests the proxy, checks reachability from every target
    node, and requires the setup request in Prometheus.
 
@@ -136,12 +151,12 @@ make -C hack/gantry-benchmark run
 The command executes one transaction using the images recorded by `prepare`:
 
 1. Backs up each node's ACR-specific containerd configuration.
-2. Installs baseline routing and runs the 300-pod baseline Job.
-3. Installs strict Gantry routing and runs the Gantry cold Job. Proxy mode
-   points Gantry at the counting proxy; direct mode leaves Gantry pointed at ACR.
+2. Installs direct routing for the baseline ACR and runs the 300-pod baseline Job.
+3. Installs strict local-mirror routing for the Gantry ACR and runs the Gantry
+   cold Job. Direct mode leaves Gantry pointed at its dedicated ACR.
 4. Writes phase results and the comparison.
-5. Restores every node's prior ACR-specific file or removes the file when it
-   was originally absent.
+5. Restores both prior registry-specific files on every node or removes each
+   file when it was originally absent.
 6. Proxy mode restores the exact Gantry ConfigMap; direct mode verifies it was
    never changed.
 
@@ -164,6 +179,10 @@ Endpoint metric buckets. The runner then polls until ACR pulls, `PEBytesIn`, and
 all expected audit pod timelines are complete and stable. `comparison.json`
 uses those Azure measurements as primary values and retains Kubernetes/Gantry
 values as cross-checks.
+
+The collector rejects implausibly small `PEBytesIn` totals even when Azure marks
+the metric point non-null. Inspect `minimum_expected_bytes` in the phase
+artifact when endpoint metering remains incomplete.
 
 ## 7. Inspect results
 

@@ -50,6 +50,9 @@ set -euo pipefail
 : "${CLUSTER_NAME:?Set CLUSTER_NAME}"
 : "${ACR_NAME:?Set ACR_NAME}"
 
+# For the dual-ACR benchmark, ACR_NAME is the dedicated GANTRY_ACR_NAME, never
+# the baseline ACR name.
+
 export KUBECONFIG
 
 LOCATION="${LOCATION:-canadacentral}"
