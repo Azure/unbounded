@@ -94,6 +94,11 @@ if [[ -n "$build_process" ]]; then
   printf 'image process:\n%s\n' "$build_process"
 fi
 
+benchmark_process=$(pgrep -af 'gantry-benchmark (prepare|preflight|run)' 2>/dev/null || true)
+if [[ -n "$benchmark_process" ]]; then
+  printf 'benchmark process:\n%s\n' "$benchmark_process"
+fi
+
 printf '\n=== VM resources ===\n'
 df -h / 2>/dev/null | tail -1 || true
 podman system df 2>/dev/null || true
