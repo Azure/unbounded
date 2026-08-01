@@ -25,6 +25,10 @@ spec:
       path: /metrics
       interval: 10s
       metricRelabelings:
+        - action: keep
+          sourceLabels:
+            - __name__
+          regex: gantry_storage_mode_info|p2p_dht_health_score|gantry_peer_serve_bytes_total|gantry_origin_bytes_total|p2p_origin_pull_total|p2p_peer_fetch_total|p2p_origin_pull_success_total|p2p_origin_fallback_total|p2p_in_flight_pulls|gantry_peer_fetch_bytes_total|gantry_mirror_bytes_served_total
         - action: replace
           targetLabel: gantry_benchmark
           replacement: "true"
