@@ -52,7 +52,12 @@ type gantryMetrics struct {
 // artifact never presents a derived number as a measured one.
 type originByteSource string
 
+type workloadComparisonMode string
+
 const (
+	workloadComparisonIdenticalPayload workloadComparisonMode = "identical_payload"
+	workloadComparisonRandomShape      workloadComparisonMode = "equivalent_random_payload_shape"
+
 	// originBytesProxy is measured by the counting proxy.
 	originBytesProxy originByteSource = "proxy_upstream_bytes"
 	// originBytesGantryMeasured is measured at Gantry's upstream response-body
@@ -67,16 +72,18 @@ const (
 )
 
 type phaseResult struct {
-	RunID        string                     `json:"run_id"`
-	Phase        proxyPhase                 `json:"phase"`
-	Image        string                     `json:"image"`
-	ImageSizeMiB int                        `json:"image_size_mib"`
-	PayloadSHA   string                     `json:"workload_payload_sha256,omitempty"`
-	Proxy        proxyPhaseTotals           `json:"proxy"`
-	Gantry       gantryMetrics              `json:"gantry"`
-	GantryPeer   gantryPeerPhaseMeasurement `json:"gantry_peer"`
-	Azure        azurePhaseMeasurement      `json:"azure"`
-	Job          jobObservation             `json:"job"`
+	RunID                  string                     `json:"run_id"`
+	Phase                  proxyPhase                 `json:"phase"`
+	Image                  string                     `json:"image"`
+	ImageSizeMiB           int                        `json:"image_size_mib"`
+	ImageLayers            int                        `json:"image_layers,omitempty"`
+	PayloadSHA             string                     `json:"workload_payload_sha256,omitempty"`
+	WorkloadComparisonMode workloadComparisonMode     `json:"workload_comparison_mode,omitempty"`
+	Proxy                  proxyPhaseTotals           `json:"proxy"`
+	Gantry                 gantryMetrics              `json:"gantry"`
+	GantryPeer             gantryPeerPhaseMeasurement `json:"gantry_peer"`
+	Azure                  azurePhaseMeasurement      `json:"azure"`
+	Job                    jobObservation             `json:"job"`
 	// OriginBytes is the phase's ACR traffic as attributed by OriginBytesSource.
 	OriginBytes             uint64           `json:"origin_bytes"`
 	OriginBytesSource       originByteSource `json:"origin_bytes_source"`
@@ -594,12 +601,27 @@ func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchm
 		comparison.Checks["no_origin_fallback"] = fallbackCheck
 
 		payloadCheck := resultCheck{
-			Passed: baseline.PayloadSHA != "" && baseline.PayloadSHA == gantry.PayloadSHA,
-			Message: fmt.Sprintf(
+			Passed: false,
+		}
+		if baseline.WorkloadComparisonMode == workloadComparisonRandomShape &&
+			gantry.WorkloadComparisonMode == workloadComparisonRandomShape {
+			payloadCheck.Passed = baseline.PayloadSHA != "" && gantry.PayloadSHA != "" &&
+				baseline.PayloadSHA != gantry.PayloadSHA &&
+				baseline.ImageSizeMiB == gantry.ImageSizeMiB &&
+				baseline.ImageLayers > 0 && baseline.ImageLayers == gantry.ImageLayers
+			payloadCheck.Message = fmt.Sprintf(
+				"equivalent random workload shape baseline=%d MiB/%d layers Gantry=%d MiB/%d layers, fingerprints intentionally differ baseline=%q Gantry=%q",
+				baseline.ImageSizeMiB, baseline.ImageLayers,
+				gantry.ImageSizeMiB, gantry.ImageLayers,
+				baseline.PayloadSHA, gantry.PayloadSHA,
+			)
+		} else {
+			payloadCheck.Passed = baseline.PayloadSHA != "" && baseline.PayloadSHA == gantry.PayloadSHA
+			payloadCheck.Message = fmt.Sprintf(
 				"workload payload sha256 baseline=%q Gantry=%q, want the same non-empty fingerprint",
 				baseline.PayloadSHA,
 				gantry.PayloadSHA,
-			),
+			)
 		}
 		comparison.Checks["same_workload_payload"] = payloadCheck
 
@@ -698,12 +720,23 @@ func renderComparisonMarkdown(comparison benchmarkComparison) string {
 		}
 
 		byteLabel := originByteMetricLabel(comparison.Baseline)
+		workloadDescription := fmt.Sprintf("Shared workload payload: **%s**", comparison.Baseline.PayloadSHA)
+		if comparison.Baseline.WorkloadComparisonMode == workloadComparisonRandomShape &&
+			comparison.GantryCold.WorkloadComparisonMode == workloadComparisonRandomShape {
+			workloadDescription = fmt.Sprintf(
+				"Equivalent random workload shape: **%d MiB in %d layers**\n\n- Baseline payload: %s\n- Gantry payload: %s",
+				comparison.GantryCold.ImageSizeMiB,
+				comparison.GantryCold.ImageLayers,
+				comparison.Baseline.PayloadSHA,
+				comparison.GantryCold.PayloadSHA,
+			)
+		}
 
 		return fmt.Sprintf(`# Gantry benchmark %s
 
 Mode: **direct**
 
-Shared workload payload: **%s**
+%s
 
 - Baseline image: %s
 - Gantry image: %s
@@ -729,7 +762,7 @@ Result: **%s**
 
 `,
 			comparison.RunID,
-			comparison.Baseline.PayloadSHA,
+			workloadDescription,
 			comparison.Baseline.Image,
 			comparison.GantryCold.Image,
 			comparison.Baseline.OriginBytesSource,

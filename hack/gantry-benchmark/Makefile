@@ -1,7 +1,7 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 
-.PHONY: help test operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare prepare-gantry preflight run run-gantry status disable
+.PHONY: help test operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare prepare-gantry prepare-gantry-fresh preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -17,6 +17,7 @@ help: ## Show benchmark targets
 	@echo "  enable       Install benchmark instrumentation"
 	@echo "  prepare      Build and push both digest-pinned workload images"
 	@echo "  prepare-gantry  Build only a cache-cold Gantry image from a retained baseline"
+	@echo "  prepare-gantry-fresh  Build only Gantry with a brand-new random payload"
 	@echo "  preflight    Validate ACR, monitoring, Gantry, and all target nodes"
 	@echo "  run          Execute baseline and Gantry cold phases"
 	@echo "  run-gantry   Execute only Gantry cold against the retained baseline"
@@ -76,3 +77,11 @@ prepare-gantry:
 	set +a; \
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry \
 		"$(GANTRY_ONLY_BASELINE_RUN_ID)" $(if $(GANTRY_ONLY_PREPARED_RUN_ID),"$(GANTRY_ONLY_PREPARED_RUN_ID)",)
+
+prepare-gantry-fresh:
+	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }
+	set -a; \
+	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
+	set +a; \
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-fresh \
+		"$(GANTRY_ONLY_BASELINE_RUN_ID)"

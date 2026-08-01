@@ -173,14 +173,16 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	baselineBytes, baselineBytesSource := deriveOriginBytes(b.config, proxyPhaseBaseline, baselineProxy, baselineGantry, baselineJob)
 
 	baselineResult := phaseResult{
-		RunID:        state.RunID,
-		Phase:        proxyPhaseBaseline,
-		Image:        baselineImage,
-		ImageSizeMiB: b.config.ImageSizeMiB,
-		PayloadSHA:   state.WorkloadPayloadSHA256,
-		Proxy:        baselineProxy,
-		Gantry:       baselineGantry,
-		GantryPeer:   baselinePeer,
+		RunID:                  state.RunID,
+		Phase:                  proxyPhaseBaseline,
+		Image:                  baselineImage,
+		ImageSizeMiB:           b.config.ImageSizeMiB,
+		ImageLayers:            b.config.ImageLayers,
+		PayloadSHA:             state.WorkloadPayloadSHA256,
+		WorkloadComparisonMode: workloadComparisonIdenticalPayload,
+		Proxy:                  baselineProxy,
+		Gantry:                 baselineGantry,
+		GantryPeer:             baselinePeer,
 		Azure: azurePhaseMeasurement{Window: telemetryWindow{
 			StartedAt:  baselineWindowStart,
 			FinishedAt: baselineWindowFinish,
@@ -268,14 +270,16 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	gantryBytes, gantryBytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, gantryProxy, phaseMetrics, gantryJob)
 
 	gantryResult := phaseResult{
-		RunID:        state.RunID,
-		Phase:        proxyPhaseGantryCold,
-		Image:        gantryImage,
-		ImageSizeMiB: b.config.ImageSizeMiB,
-		PayloadSHA:   state.WorkloadPayloadSHA256,
-		Proxy:        gantryProxy,
-		Gantry:       phaseMetrics,
-		GantryPeer:   gantryPeer,
+		RunID:                  state.RunID,
+		Phase:                  proxyPhaseGantryCold,
+		Image:                  gantryImage,
+		ImageSizeMiB:           b.config.ImageSizeMiB,
+		ImageLayers:            b.config.ImageLayers,
+		PayloadSHA:             state.WorkloadPayloadSHA256,
+		WorkloadComparisonMode: workloadComparisonIdenticalPayload,
+		Proxy:                  gantryProxy,
+		Gantry:                 phaseMetrics,
+		GantryPeer:             gantryPeer,
 		Azure: azurePhaseMeasurement{Window: telemetryWindow{
 			StartedAt:  gantryWindowStart,
 			FinishedAt: gantryWindowFinish,

@@ -248,6 +248,34 @@ func TestCompareResultsDirectModeRejectsDifferentPayloads(t *testing.T) {
 	}
 }
 
+func TestCompareResultsDirectModeAcceptsEquivalentRandomPayloadShape(t *testing.T) {
+	baseline, gantry := healthyDirectPhases()
+	baseline.PayloadSHA = "sha256:baseline-random"
+	gantry.PayloadSHA = "sha256:fresh-gantry-random"
+	baseline.ImageSizeMiB = 40960
+	gantry.ImageSizeMiB = 40960
+	baseline.ImageLayers = 40
+	gantry.ImageLayers = 40
+	baseline.WorkloadComparisonMode = workloadComparisonRandomShape
+	gantry.WorkloadComparisonMode = workloadComparisonRandomShape
+
+	comparison := compareResults(directComparisonConfig(), baseline, gantry)
+
+	check := comparison.Checks["same_workload_payload"]
+	if !comparison.Passed || !check.Passed {
+		t.Fatalf("equivalent random workload shape did not pass: %+v", check)
+	}
+	if !strings.Contains(check.Message, "fingerprints intentionally differ") {
+		t.Fatalf("workload check does not explain random equivalence: %q", check.Message)
+	}
+
+	gantry.ImageLayers = 39
+	comparison = compareResults(directComparisonConfig(), baseline, gantry)
+	if comparison.Checks["same_workload_payload"].Passed {
+		t.Fatal("comparison passed with different random payload layer counts")
+	}
+}
+
 // Proxy mode must keep its original gate set so existing runs are unchanged.
 func TestCompareResultsProxyModeOmitsDirectChecks(t *testing.T) {
 	baseline, gantry := healthyDirectPhases()

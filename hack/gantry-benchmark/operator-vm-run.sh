@@ -130,7 +130,11 @@ make -C hack/gantry-benchmark enable
 run_id=$(kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state -o jsonpath='{.data.state\.json}' | jq -er '.run_id')
 echo "enabled benchmark $run_id"
 if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
-  write_progress "prepare" "rebuilding a cache-cold Gantry image from baseline $GANTRY_ONLY_BASELINE_RUN_ID"
+  if [[ "${GANTRY_ONLY_FRESH_IMAGE:-false}" == true ]]; then
+    write_progress "prepare" "generating a brand-new random Gantry image against baseline $GANTRY_ONLY_BASELINE_RUN_ID"
+  else
+    write_progress "prepare" "rebuilding a cache-cold Gantry image from baseline $GANTRY_ONLY_BASELINE_RUN_ID"
+  fi
 else
   write_progress "prepare" "generating shared payload and pushing both private ACR images"
 fi
@@ -158,9 +162,14 @@ unset aad_access_token
 export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
 export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
 if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
-  make -C hack/gantry-benchmark prepare-gantry \
-    GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID" \
-    GANTRY_ONLY_PREPARED_RUN_ID="${GANTRY_ONLY_PREPARED_RUN_ID:-}"
+  if [[ "${GANTRY_ONLY_FRESH_IMAGE:-false}" == true ]]; then
+    make -C hack/gantry-benchmark prepare-gantry-fresh \
+      GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID"
+  else
+    make -C hack/gantry-benchmark prepare-gantry \
+      GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID" \
+      GANTRY_ONLY_PREPARED_RUN_ID="${GANTRY_ONLY_PREPARED_RUN_ID:-}"
+  fi
 else
   make -C hack/gantry-benchmark prepare
 fi
