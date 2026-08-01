@@ -72,6 +72,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		}
 
 		return benchmark.prepareFreshGantryOnly(ctx, args[1])
+	case "prepare-gantry-adopt":
+		if len(args) != 4 {
+			return fmt.Errorf("usage: gantry-benchmark prepare-gantry-adopt <baseline-run-id> <gantry-image> <payload-sha256>")
+		}
+
+		return benchmark.prepareAdoptedFreshGantryOnly(ctx, args[1], args[2], args[3])
 	case "preflight":
 		return benchmark.preflight(ctx)
 	case "run":
@@ -98,6 +104,8 @@ Subcommands:
 	           rebuild only the Gantry image, or reuse an already-prepared image
 	prepare-gantry-fresh <baseline-run-id>
 	           generate new random bytes and build only a fresh Gantry image
+	prepare-gantry-adopt <baseline-run-id> <gantry-image> <payload-sha256>
+	           adopt an already-pushed fresh Gantry image by immutable digest
 	preflight  validate Azure sources, monitoring, Gantry, and all target nodes
 	run        execute baseline and Gantry cold phases, then restore routing
 	run-gantry execute only Gantry cold against the retained baseline

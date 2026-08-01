@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/opencontainers/go-digest"
 )
 
 func (b *benchmark) prepareGantryOnly(ctx context.Context, baselineRunID, preparedRunID string) error {
@@ -175,6 +177,98 @@ func (b *benchmark) prepareFreshGantryOnly(ctx context.Context, baselineRunID st
 	}
 
 	writeAll(b.stdout, fmt.Sprintf("prepared brand-new cache-cold Gantry image for %s using random payload %s\n", state.RunID, payloadSHA))
+
+	return nil
+}
+
+func (b *benchmark) prepareAdoptedFreshGantryOnly(ctx context.Context, baselineRunID, image, payloadSHA string) error {
+	state, err := b.loadState(ctx)
+	if err != nil {
+		return err
+	}
+
+	if state.Status != "enabled" {
+		return fmt.Errorf("benchmark state is %q, run enable before prepare-gantry-adopt", state.Status)
+	}
+	if state.usesProxy() {
+		return fmt.Errorf("prepare-gantry-adopt requires direct dual-ACR mode")
+	}
+	if filepath.Base(baselineRunID) != baselineRunID || baselineRunID == "." || baselineRunID == "" {
+		return fmt.Errorf("invalid baseline run ID %q", baselineRunID)
+	}
+	if err := b.requireLock(ctx, state.RunID); err != nil {
+		return err
+	}
+	if err := b.validateContext(ctx); err != nil {
+		return err
+	}
+
+	baselineState, err := b.readLocalState(baselineRunID)
+	if err != nil {
+		return fmt.Errorf("read baseline run state: %w", err)
+	}
+	baselineResult, err := b.readPhaseResult(baselineRunID, "baseline.json")
+	if err != nil {
+		return fmt.Errorf("read retained baseline result: %w", err)
+	}
+	if err := validateGantryOnlySource(state, baselineState, baselineResult); err != nil {
+		return err
+	}
+	if err := validateAdoptedFreshGantryImage(state, baselineState, image, payloadSHA); err != nil {
+		return err
+	}
+
+	baselineResult.RunID = state.RunID
+	baselineResult.ImageLayers = state.ImageLayers
+	baselineResult.WorkloadComparisonMode = workloadComparisonRandomShape
+	state.BaselineImage = baselineState.BaselineImage
+	state.GantryColdImage = image
+	state.WorkloadPayloadSHA256 = payloadSHA
+	state.WorkloadComparisonMode = workloadComparisonRandomShape
+	state.Status = "images-prepared"
+
+	if err := b.writeJSONArtifact(state.RunID, "baseline.json", baselineResult); err != nil {
+		return err
+	}
+	if err := b.saveState(ctx, state); err != nil {
+		return err
+	}
+
+	writeAll(b.stdout, fmt.Sprintf("adopted brand-new cache-cold Gantry image %s for %s using random payload %s\n", image, state.RunID, payloadSHA))
+
+	return nil
+}
+
+func validateAdoptedFreshGantryImage(current, baseline benchmarkState, image, payloadSHA string) error {
+	payloadDigest, err := digest.Parse(payloadSHA)
+	if err != nil || payloadDigest.Algorithm() != digest.SHA256 {
+		return fmt.Errorf("adopted payload fingerprint %q must be a valid sha256 digest", payloadSHA)
+	}
+	if payloadSHA == baseline.WorkloadPayloadSHA256 {
+		return fmt.Errorf("adopted random payload matches baseline fingerprint %s", payloadSHA)
+	}
+
+	repository, imageDigest, err := splitImageReference(image, current.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("adopted Gantry image registry mismatch: %w", err)
+	}
+	if repository != current.WorkloadRepository {
+		return fmt.Errorf("adopted Gantry repository %q, want %q", repository, current.WorkloadRepository)
+	}
+	if _, err := imageDigestFromReference(image); err != nil {
+		return fmt.Errorf("adopted Gantry image must be digest-pinned: %w", err)
+	}
+	parsedImageDigest, err := digest.Parse(imageDigest)
+	if err != nil || parsedImageDigest.Algorithm() != digest.SHA256 {
+		return fmt.Errorf("adopted Gantry image digest %q must be a valid sha256 digest", imageDigest)
+	}
+	baselineDigest, err := imageDigestFromReference(baseline.BaselineImage)
+	if err != nil {
+		return fmt.Errorf("retained baseline image: %w", err)
+	}
+	if imageDigest == baselineDigest {
+		return fmt.Errorf("adopted Gantry image digest matches the retained baseline and would reuse the node content cache: %s", imageDigest)
+	}
 
 	return nil
 }

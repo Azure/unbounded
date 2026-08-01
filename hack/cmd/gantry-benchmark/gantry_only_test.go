@@ -83,6 +83,43 @@ func TestValidatePreparedGantryOnlySource(t *testing.T) {
 	}
 }
 
+func TestValidateAdoptedFreshGantryImage(t *testing.T) {
+	current := benchmarkState{
+		WorkloadRepository:    "gantry-benchmark-pull",
+		GantryACRLoginServer:  "gantry.example",
+		WorkloadPayloadSHA256: "sha256:" + repeatHex("b"),
+	}
+	baseline := current
+	baseline.BaselineImage = "baseline.example/gantry-benchmark-pull@sha256:" + repeatHex("a")
+	baseline.WorkloadPayloadSHA256 = "sha256:" + repeatHex("b")
+	image := "gantry.example/gantry-benchmark-pull@sha256:" + repeatHex("c")
+	payloadSHA := "sha256:" + repeatHex("d")
+
+	if err := validateAdoptedFreshGantryImage(current, baseline, image, payloadSHA); err != nil {
+		t.Fatalf("validate adopted image: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		image      string
+		payloadSHA string
+	}{
+		{name: "tagged image", image: "gantry.example/gantry-benchmark-pull:fresh", payloadSHA: payloadSHA},
+		{name: "wrong repository", image: "gantry.example/other@sha256:" + repeatHex("c"), payloadSHA: payloadSHA},
+		{name: "invalid image digest", image: "gantry.example/gantry-benchmark-pull@sha256:invalid", payloadSHA: payloadSHA},
+		{name: "invalid payload digest", image: image, payloadSHA: "sha256:invalid"},
+		{name: "baseline payload", image: image, payloadSHA: baseline.WorkloadPayloadSHA256},
+		{name: "baseline image digest", image: "gantry.example/gantry-benchmark-pull@sha256:" + repeatHex("a"), payloadSHA: payloadSHA},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateAdoptedFreshGantryImage(current, baseline, test.image, test.payloadSHA); err == nil {
+				t.Fatal("expected adopted image validation to fail")
+			}
+		})
+	}
+}
+
 func repeatHex(value string) string {
 	result := ""
 	for range 64 {
