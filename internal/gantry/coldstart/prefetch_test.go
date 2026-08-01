@@ -6,6 +6,7 @@ package coldstart_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"testing"
@@ -142,6 +143,46 @@ func TestPrefetchChildren_ReplicatesToTopNPullers(t *testing.T) {
 
 	if len(coord.pleasePullCalls) != 3 || len(seen) != 3 {
 		t.Fatalf("PleasePull calls: got %v, want 3 distinct pullers (top-3 replication)", coord.pleasePullCalls)
+	}
+}
+
+func TestPrefetchChildren_FractionScalesWithoutCap(t *testing.T) {
+	for _, test := range []struct {
+		nodes int
+		want  int
+	}{
+		{nodes: 300, want: 6},
+		{nodes: 1000, want: 20},
+		{nodes: 10_000, want: 200},
+	} {
+		t.Run(fmt.Sprintf("nodes-%d", test.nodes), func(t *testing.T) {
+			cluster := make([]ifaces.Node, 0, test.nodes)
+			for index := range test.nodes {
+				cluster = append(cluster, ifaces.Node{
+					ID:   ifaces.NodeID(fmt.Sprintf("node-%05d", index)),
+					Addr: fmt.Sprintf("10.0.%d.%d:5001", index/256, index%256),
+				})
+			}
+
+			coord := &stubCoord{}
+			disco := &stubDisco{health: 1.0}
+			resolver := buildResolverWithFraction(t, coord, disco, "self-outside-candidates", cluster, 0.02)
+			child := coldstart.ChildDigest{
+				Digest: digest.MustParse("sha256:" + digestHex(test.nodes)),
+				Kind:   ifaces.KindBlob,
+			}
+
+			if err := resolver.PrefetchChildren(context.Background(), []coldstart.ChildDigest{child}, "docker.io", "library/nginx"); err != nil {
+				t.Fatalf("PrefetchChildren: %v", err)
+			}
+
+			coord.mu.Lock()
+			defer coord.mu.Unlock()
+
+			if got := len(coord.pleasePullCalls); got != test.want {
+				t.Fatalf("PleasePull calls = %d, want %d for %d nodes", got, test.want, test.nodes)
+			}
+		})
 	}
 }
 

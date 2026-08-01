@@ -21,6 +21,10 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("AdvertiseReconcileInterval = %v, want 1m", c.AdvertiseReconcileInterval)
 	}
 
+	if c.PrefetchPullerFraction != 0 {
+		t.Fatalf("PrefetchPullerFraction = %v, want disabled", c.PrefetchPullerFraction)
+	}
+
 	// Defaults intentionally have no upstream registries - operator must
 	// supply at least one. Seed one and re-validate.
 	c.UpstreamRegistries = []UpstreamRegistry{
@@ -28,6 +32,50 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestPrefetchPullerFractionConfig(t *testing.T) {
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+		err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_PREFETCH_PULLER_FRACTION" {
+				return "0.02"
+			}
+
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+		if c.PrefetchPullerFraction != 0.02 {
+			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
+		}
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+		if err := flags.Parse([]string{"--prefetch-puller-fraction=0.02"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if c.PrefetchPullerFraction != 0.02 {
+			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
+		}
+	})
+}
+
+func TestValidate_PrefetchPullerFractionBounds(t *testing.T) {
+	for _, fraction := range []float64{-0.01, 1.01} {
+		c := NewDefault()
+		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+		c.PrefetchPullerFraction = fraction
+
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "prefetch_puller_fraction") {
+			t.Fatalf("fraction %v: want prefetch_puller_fraction error, got %v", fraction, err)
+		}
 	}
 }
 

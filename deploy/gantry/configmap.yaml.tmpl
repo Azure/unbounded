@@ -136,6 +136,10 @@ data:
     # copies of each layer. At 300 nodes N=8 keeps origin ~= N GiB per 1 GiB
     # layer (still >95% saved) while widening the initial fan-out 8x.
     prefetch_puller_replicas: 8
+    # Dynamically select 2% of eligible nodes for each layer, rounded up.
+    # A positive fraction overrides prefetch_puller_replicas. There is no
+    # maximum cap other than the eligible cluster/zone node count.
+    prefetch_puller_fraction: 0.02
     # Coord peer authorization. Default false ships observe-only: an
     # inbound coord request from a peer not in the membership view only
     # increments p2p_coord_unauthorized_peer_total and is still served.

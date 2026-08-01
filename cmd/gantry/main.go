@@ -464,6 +464,7 @@ func runAgent(args []string) error {
 			LocalIntent:            coordServer,
 			LocalPull:              coordServer,
 			PrefetchPullerReplicas: c.PrefetchPullerReplicas,
+			PrefetchPullerFraction: c.PrefetchPullerFraction,
 			TransientCooldownCap:   c.OriginFailureHonorWindowCap,
 			TopKExpansionFactor:    c.TopKExpansionFactorDegraded,
 			TrustedFailureClasses:  parseTrustedFailureClasses(c.OriginFailureClassesTrustedClusterWide, logger),
