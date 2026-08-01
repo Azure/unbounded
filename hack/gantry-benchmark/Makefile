@@ -74,4 +74,5 @@ prepare-gantry:
 	set -a; \
 	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
 	set +a; \
-	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry "$(GANTRY_ONLY_BASELINE_RUN_ID)"
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry \
+		"$(GANTRY_ONLY_BASELINE_RUN_ID)" $(if $(GANTRY_ONLY_PREPARED_RUN_ID),"$(GANTRY_ONLY_PREPARED_RUN_ID)",)

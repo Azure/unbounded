@@ -158,7 +158,9 @@ unset aad_access_token
 export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
 export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
 if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
-  make -C hack/gantry-benchmark prepare-gantry GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID"
+  make -C hack/gantry-benchmark prepare-gantry \
+    GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID" \
+    GANTRY_ONLY_PREPARED_RUN_ID="${GANTRY_ONLY_PREPARED_RUN_ID:-}"
 else
   make -C hack/gantry-benchmark prepare
 fi

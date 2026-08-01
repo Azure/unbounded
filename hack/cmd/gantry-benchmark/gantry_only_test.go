@@ -60,6 +60,29 @@ func TestValidateGantryOnlySource(t *testing.T) {
 	}
 }
 
+func TestValidatePreparedGantryOnlySource(t *testing.T) {
+	current := benchmarkState{
+		RunID: "new", Mode: benchmarkModeDirect, NodeCount: 1000,
+		ImagePlatform: "linux/amd64", ImageSizeMiB: 40960, ImageLayers: 40,
+		WorkloadRepository:     "gantry-benchmark-pull",
+		BaselineACRLoginServer: "baseline.example", GantryACRLoginServer: "gantry.example",
+	}
+	baseline := current
+	baseline.WorkloadPayloadSHA256 = "sha256:" + repeatHex("b")
+	prepared := current
+	prepared.WorkloadPayloadSHA256 = baseline.WorkloadPayloadSHA256
+	prepared.GantryColdImage = "gantry.example/gantry-benchmark-pull@sha256:" + repeatHex("c")
+
+	if err := validatePreparedGantryOnlySource(current, baseline, prepared); err != nil {
+		t.Fatalf("validate matching prepared source: %v", err)
+	}
+
+	prepared.ImageSizeMiB++
+	if err := validatePreparedGantryOnlySource(current, baseline, prepared); err == nil {
+		t.Fatal("expected mismatched image size to fail")
+	}
+}
+
 func repeatHex(value string) string {
 	result := ""
 	for range 64 {

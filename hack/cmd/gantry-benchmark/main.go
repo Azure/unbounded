@@ -56,11 +56,16 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	case "prepare":
 		return benchmark.prepareImages(ctx)
 	case "prepare-gantry":
-		if len(args) != 2 {
-			return fmt.Errorf("usage: gantry-benchmark prepare-gantry <baseline-run-id>")
+		if len(args) < 2 || len(args) > 3 {
+			return fmt.Errorf("usage: gantry-benchmark prepare-gantry <baseline-run-id> [prepared-run-id]")
 		}
 
-		return benchmark.prepareGantryOnly(ctx, args[1])
+		preparedRunID := ""
+		if len(args) == 3 {
+			preparedRunID = args[2]
+		}
+
+		return benchmark.prepareGantryOnly(ctx, args[1], preparedRunID)
 	case "preflight":
 		return benchmark.preflight(ctx)
 	case "run":
@@ -83,8 +88,8 @@ Subcommands:
 	disable    restore the cluster and remove benchmark instrumentation
 	enable     install benchmark instrumentation after safety checks
 	prepare    build and push both digest-pinned images before ACR goes private
-	prepare-gantry <baseline-run-id>
-	           rebuild only the Gantry image from a retained baseline payload
+	prepare-gantry <baseline-run-id> [prepared-run-id]
+	           rebuild only the Gantry image, or reuse an already-prepared image
 	preflight  validate Azure sources, monitoring, Gantry, and all target nodes
 	run        execute baseline and Gantry cold phases, then restore routing
 	run-gantry execute only Gantry cold against the retained baseline

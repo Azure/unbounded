@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func (b *benchmark) prepareGantryOnly(ctx context.Context, baselineRunID string) error {
+func (b *benchmark) prepareGantryOnly(ctx context.Context, baselineRunID, preparedRunID string) error {
 	state, err := b.loadState(ctx)
 	if err != nil {
 		return err
@@ -47,6 +47,36 @@ func (b *benchmark) prepareGantryOnly(ctx context.Context, baselineRunID string)
 	if err := validateGantryOnlySource(state, baselineState, baselineResult); err != nil {
 		return err
 	}
+	if preparedRunID != "" {
+		if filepath.Base(preparedRunID) != preparedRunID || preparedRunID == "." {
+			return fmt.Errorf("invalid prepared run ID %q", preparedRunID)
+		}
+
+		preparedState, err := b.readLocalState(preparedRunID)
+		if err != nil {
+			return fmt.Errorf("read prepared run state: %w", err)
+		}
+		if err := validatePreparedGantryOnlySource(state, baselineState, preparedState); err != nil {
+			return err
+		}
+
+		baselineResult.RunID = state.RunID
+		state.BaselineImage = baselineState.BaselineImage
+		state.GantryColdImage = preparedState.GantryColdImage
+		state.WorkloadPayloadSHA256 = baselineState.WorkloadPayloadSHA256
+		state.Status = "images-prepared"
+
+		if err := b.writeJSONArtifact(state.RunID, "baseline.json", baselineResult); err != nil {
+			return err
+		}
+		if err := b.saveState(ctx, state); err != nil {
+			return err
+		}
+
+		writeAll(b.stdout, fmt.Sprintf("reused cache-cold Gantry image from %s for %s\n", preparedRunID, state.RunID))
+
+		return nil
+	}
 
 	if b.config.GantryACRUsername == "" || b.config.GantryACRPassword == "" {
 		return fmt.Errorf("Gantry-only preparation requires GANTRY_ACR_USERNAME and GANTRY_ACR_PASSWORD")
@@ -75,6 +105,31 @@ func (b *benchmark) prepareGantryOnly(ctx context.Context, baselineRunID string)
 	}
 
 	writeAll(b.stdout, fmt.Sprintf("prepared cache-cold Gantry image for %s using baseline %s\n", state.RunID, baselineRunID))
+
+	return nil
+}
+
+func validatePreparedGantryOnlySource(current, baseline, prepared benchmarkState) error {
+	if prepared.Mode != current.Mode || prepared.NodeCount != current.NodeCount ||
+		prepared.ImagePlatform != current.ImagePlatform || prepared.ImageSizeMiB != current.ImageSizeMiB ||
+		prepared.ImageLayers != current.ImageLayers || prepared.WorkloadRepository != current.WorkloadRepository ||
+		prepared.BaselineACRLoginServer != current.BaselineACRLoginServer ||
+		prepared.GantryACRLoginServer != current.GantryACRLoginServer {
+		return fmt.Errorf("prepared Gantry run shape does not match current benchmark")
+	}
+	if prepared.WorkloadPayloadSHA256 != baseline.WorkloadPayloadSHA256 {
+		return fmt.Errorf("prepared Gantry payload %q does not match baseline %q", prepared.WorkloadPayloadSHA256, baseline.WorkloadPayloadSHA256)
+	}
+	if prepared.GantryColdImage == "" {
+		return fmt.Errorf("prepared Gantry run has no image")
+	}
+	repository, _, err := splitImageReference(prepared.GantryColdImage, current.GantryACRLoginServer)
+	if err != nil {
+		return fmt.Errorf("prepared Gantry image registry mismatch: %w", err)
+	}
+	if repository != current.WorkloadRepository {
+		return fmt.Errorf("prepared Gantry repository %q, want %q", repository, current.WorkloadRepository)
+	}
 
 	return nil
 }
