@@ -611,8 +611,10 @@ kubectl -n gantry-benchmark exec "$node" -- \
 ```
 
 The baseline ACR file must contain its direct HTTPS server and must not mention
-`127.0.0.1:5000`. The Gantry ACR file must contain only the
-`[host."http://127.0.0.1:5000"]` block with no `server =` line.
+`127.0.0.1:5000`. The Gantry ACR file must set
+`server = "http://127.0.0.1:5000"` and contain only the matching loopback host.
+Omitting `server` is not fail-closed: containerd derives the original registry
+as an implicit fallback after the configured host fails.
 
 Confirm Gantry was never patched. Direct mode leaves the ConfigMap untouched, so
 this hash must match before and after the run:

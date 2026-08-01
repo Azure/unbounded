@@ -40,8 +40,8 @@ func TestRenderHostsDirectBaselineOverridesGantryDefault(t *testing.T) {
 	}
 }
 
-// The Gantry phase renders identically in both modes: strict, no `server=`
-// fall-through, so containerd can never bypass Gantry to the origin.
+// The Gantry phase renders identically in both modes: Gantry is the root server
+// and only host, so containerd cannot derive the registry as an origin fallback.
 func TestRenderHostsDirectGantryPhaseIsStrict(t *testing.T) {
 	state := benchmarkState{
 		RunID:                  "run-1",
@@ -55,7 +55,7 @@ func TestRenderHostsDirectGantryPhaseIsStrict(t *testing.T) {
 		t.Fatalf("render Gantry: %v", err)
 	}
 
-	if strings.Contains(gantry, "server =") ||
+	if !strings.Contains(gantry, `server = "http://127.0.0.1:5000"`) ||
 		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) ||
 		strings.Contains(gantry, "gantry.azurecr.io") {
 		t.Fatalf("unexpected direct-mode Gantry hosts.toml:\n%s", gantry)

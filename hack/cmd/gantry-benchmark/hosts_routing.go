@@ -61,8 +61,10 @@ server = "http://%s:5002"
   capabilities = ["pull", "resolve"]
 `, marker, state.ProxyClusterIP, state.ProxyClusterIP), nil
 	case hostsModeGantry:
-		// STRICT mode: local Gantry is the ONLY upstream, with NO `server=`
-		// fall-through. If Gantry returns 5xx (peer exhausted, starting up,
+		// STRICT mode: local Gantry is both the default server and the only host.
+		// Omitting `server` is not fail-closed: containerd derives the image's
+		// registry namespace as the default server and falls through to ACR after
+		// the configured host fails. If Gantry returns 5xx (peer exhausted, starting up,
 		// draining) containerd retries against Gantry rather than pulling the
 		// blob straight from the proxy. This is what attributes the cold-phase
 		// origin load to Gantry's pipeline cleanly: every byte the proxy sees
@@ -72,15 +74,12 @@ server = "http://%s:5002"
 		// merely slow. Mirrors the upstream gantry benchmark methodology
 		// (deploy/demo/hosts.toml.gantry-strict.template).
 		//
-		// With no `server=` line containerd derives ns=<registry-host> from the
-		// certs.d directory name, which matches the upstream's `name` in
-		// gantry-config directly (the ns_alias is only needed for the
-		// server=<proxy> shape).
-		//
 		// This rendering is identical in direct mode, where the same
 		// fail-closed property keeps every origin byte attributable to Gantry's
 		// own origin client rather than a containerd-direct pull from ACR.
 		return fmt.Sprintf(`%s
+server = "http://127.0.0.1:5000"
+
 [host."http://127.0.0.1:5000"]
   capabilities = ["pull", "resolve"]
 `, marker), nil
