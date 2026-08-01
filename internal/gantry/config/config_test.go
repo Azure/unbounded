@@ -25,6 +25,10 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("PrefetchPullerFraction = %v, want disabled", c.PrefetchPullerFraction)
 	}
 
+	if c.TransferMaxConcurrentServes != 10 {
+		t.Fatalf("TransferMaxConcurrentServes = %d, want 10", c.TransferMaxConcurrentServes)
+	}
+
 	// Defaults intentionally have no upstream registries - operator must
 	// supply at least one. Seed one and re-validate.
 	c.UpstreamRegistries = []UpstreamRegistry{

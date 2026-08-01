@@ -179,10 +179,10 @@ data:
     # Retry-After hint so the requester re-selects a fresher finisher-seed
     # instead of queueing behind a saturated seed. This load-shedding is what
     # lets the first finishers complete early and seed the swarm ("leaders make
-    # leaders"). "0" means unlimited. Default 100. Requires the strict
+    # leaders"). "0" means unlimited. Default 10. Requires the strict
     # containerd hosts.toml (shipped in deploy/gantry/node-config.yaml) so a
     # shed request retries Gantry rather than falling through to origin.
-    transfer_max_concurrent_serves: 100
+    transfer_max_concurrent_serves: 10
     # Cadence of the background DHT advertiser inventory reconcile. Eager
     # per-digest advertise on stream completion is the fast path that makes
     # finishers discoverable within milliseconds; this reconcile is the

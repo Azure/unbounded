@@ -329,7 +329,7 @@ type Config struct {
 	// hint so the requester re-discovers another provider instead of queueing
 	// behind a saturated seed. This load-shedding is what lets the first
 	// finishers complete early and seed the swarm. Zero means unlimited; the
-	// default is 100. Shedding only preserves dedup with the strict containerd
+	// default is 10. Shedding only preserves dedup with the strict containerd
 	// hosts.toml (mirror-only, no origin fall-through), where a shed request
 	// retries Gantry rather than falling through to origin.
 	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
@@ -477,7 +477,7 @@ func NewDefault() *Config {
 		PeerFetchTimeout:            60 * time.Second,
 		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
 		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
-		TransferMaxConcurrentServes: 100,             // serve cap sheds excess GETs with 429 (validated cascade)
+		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
 		AdvertiseReconcileInterval:  time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
