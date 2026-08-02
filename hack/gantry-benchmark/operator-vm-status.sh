@@ -100,7 +100,8 @@ if [[ -n "$benchmark_process" ]]; then
 fi
 
 printf '\n=== VM resources ===\n'
-df -h / 2>/dev/null | tail -1 || true
+df -h / "$REPO_ROOT" 2>/dev/null | awk 'NR == 1 || !seen[$1]++' || true
+podman info --format 'Podman graph root: {{.Store.GraphRoot}}' 2>/dev/null || true
 podman system df 2>/dev/null || true
 
 if [[ -f "$KUBECONFIG" ]]; then

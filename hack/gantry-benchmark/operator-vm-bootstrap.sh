@@ -9,11 +9,12 @@ usage() {
 Usage: operator-vm-bootstrap.sh <subscription> <resource-group> <aks-cluster> \
   <baseline-acr> <gantry-acr> <workspace-customer-id> <baseline-pe-id> \
   <gantry-pe-id> <repo-url> <repo-branch> <node-count> <image-size-mib> \
-  <image-layers> <azure-telemetry> <minimum-byte-reduction> <maximum-latency-ratio>
+  <image-layers> <azure-telemetry> <minimum-byte-reduction> <maximum-latency-ratio> \
+  <build-disk-lun> <build-mount>
 USAGE
 }
 
-[[ $# -eq 16 ]] || { usage >&2; exit 2; }
+[[ $# -eq 18 ]] || { usage >&2; exit 2; }
 
 subscription_id=$1
 resource_group=$2
@@ -31,6 +32,8 @@ image_layers=${13}
 azure_telemetry=${14}
 minimum_byte_reduction=${15}
 maximum_latency_ratio=${16}
+build_disk_lun=${17}
+build_mount=${18}
 
 retry() {
   local attempts=0
@@ -49,7 +52,7 @@ retry() {
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl git gnupg jq make podman golang-go
+apt-get install -y ca-certificates curl e2fsprogs git gnupg jq make podman golang-go
 
 if ! command -v az >/dev/null 2>&1; then
   curl -sL https://aka.ms/InstallAzureCLIDeb | bash
@@ -59,12 +62,37 @@ if ! command -v kubectl >/dev/null 2>&1; then
   az aks install-cli --install-location /usr/local/bin/kubectl
 fi
 
-install -d -m 0755 /opt/gantry-benchmark
+build_device="/dev/disk/azure/scsi1/lun${build_disk_lun}"
+retry test -b "$build_device"
+
+if ! blkid "$build_device" >/dev/null 2>&1; then
+  mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$build_device"
+fi
+
+build_uuid=$(blkid -s UUID -o value "$build_device")
+install -d -m 0755 "$build_mount"
+if ! grep -Fq "UUID=$build_uuid " /etc/fstab; then
+  printf 'UUID=%s %s ext4 defaults,noatime,nofail 0 2\n' "$build_uuid" "$build_mount" >>/etc/fstab
+fi
+mount "$build_mount" 2>/dev/null || mount -a
+findmnt --mountpoint "$build_mount" >/dev/null
+
+install -d -m 0711 "$build_mount/containers"
+install -d -m 0755 /etc/containers
+cat >/etc/containers/storage.conf <<STORAGE
+[storage]
+driver = "overlay"
+runroot = "/run/containers/storage"
+graphroot = "$build_mount/containers"
+
+[storage.options.overlay]
+STORAGE
+
 install -d -m 0700 /var/lib/gantry-benchmark
 install -d -m 0750 /etc/gantry-benchmark
 install -d -m 0750 /var/log/gantry-benchmark
 
-repo_root=/opt/gantry-benchmark/unbounded
+repo_root="$build_mount/unbounded"
 if [[ -d "$repo_root/.git" ]]; then
   git -C "$repo_root" fetch origin "$repo_branch"
   git -C "$repo_root" checkout -B "$repo_branch" "origin/$repo_branch"
@@ -74,6 +102,12 @@ else
 fi
 
 chmod +x "$repo_root"/hack/gantry-benchmark/operator-vm-*.sh
+
+podman_graph_root=$(podman info --format '{{.Store.GraphRoot}}')
+[[ "$podman_graph_root" == "$build_mount/containers" ]] || {
+  echo "Podman graph root $podman_graph_root, want $build_mount/containers" >&2
+  exit 1
+}
 
 retry az login --identity --allow-no-subscriptions --output none
 az account set --subscription "$subscription_id"
@@ -93,6 +127,7 @@ AZURE_SUBSCRIPTION_ID="$subscription_id"
 AZURE_RESOURCE_GROUP="$resource_group"
 AZURE_AKS_CLUSTER_NAME="$aks_cluster"
 BENCHMARK_REPO_ROOT="$repo_root"
+BENCHMARK_BUILD_MOUNT="$build_mount"
 BENCHMARK_ARTIFACT_ROOT="/var/lib/gantry-benchmark/artifacts"
 BENCHMARK_OPERATOR_HOME="/var/lib/gantry-benchmark"
 BENCHMARK_CONFIRM_CONTEXT="$aks_cluster"
@@ -181,6 +216,8 @@ echo "Gantry ACR status: $gantry_status"
 cat <<SUMMARY
 operator VM bootstrap complete
 repo: $repo_root ($repo_branch)
+build mount: $build_mount
+Podman graph root: $podman_graph_root
 config: /etc/gantry-benchmark/env
 service: gantry-benchmark-operator.service
 artifacts: /var/lib/gantry-benchmark/artifacts

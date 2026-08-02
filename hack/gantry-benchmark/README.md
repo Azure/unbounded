@@ -134,8 +134,11 @@ with `WATCH_INTERVAL_SECONDS` (default 30).
 
 Artifacts persist on the VM under
 `/var/lib/gantry-benchmark/artifacts/<run-id>/`; `latest` points at the newest
-run. The repository copy and Go/Podman caches live on its 512 GiB OS disk by
-default.
+run. By default the operator is a `Standard_D32ds_v5` with a dedicated 512 GiB
+Premium SSD v2 build disk configured for 20,000 IOPS and 750 MB/s. The disk is
+mounted at `/opt/gantry-benchmark`; the repository, random payloads, image build
+layers, and Podman graphroot all live there. Durable artifacts remain on the OS
+disk under `/var/lib/gantry-benchmark`.
 
 `prepare` is the only common-lifecycle step that logs in to either ACR or pushes
 workload content. `run` restores both per-node ACR routing files before

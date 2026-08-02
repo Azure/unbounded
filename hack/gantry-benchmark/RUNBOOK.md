@@ -23,6 +23,14 @@ export BENCHMARK_NODE_COUNT="5"
 export BENCHMARK_IMAGE_SIZE_MIB="128"
 export BENCHMARK_IMAGE_LAYERS="4"
 
+# Optional operator storage overrides. These are the high-throughput defaults.
+export OPERATOR_VM_SIZE="Standard_D32ds_v5"
+export OPERATOR_VM_ZONE="1"
+export OPERATOR_BUILD_DISK_GB="512"
+export OPERATOR_BUILD_DISK_SKU="PremiumV2_LRS"
+export OPERATOR_BUILD_DISK_IOPS="20000"
+export OPERATOR_BUILD_DISK_MBPS="750"
+
 make -C hack/gantry-benchmark operator-vm-provision
 ```
 
@@ -31,7 +39,12 @@ Provisioning creates:
 - A private `gantry-benchmark-operator` VM with no public IP.
 - A dedicated operator subnet with no inbound NSG rules.
 - A NAT gateway for package, GitHub, Go toolchain, and Azure API egress.
-- A 512 GiB Premium OS disk by default.
+- A 128 GiB Premium OS disk for the operating system and durable artifacts.
+- A dedicated 512 GiB Premium SSD v2 build disk, configured for 20,000 IOPS
+   and 750 MB/s by default, mounted at `/opt/gantry-benchmark`.
+- The repository, benchmark payloads, image layers, and Podman graphroot on the
+   build disk. Durable result artifacts remain under `/var/lib/gantry-benchmark`
+   on the OS disk.
 - A system-assigned managed identity with `AcrPush` on both ACRs, AKS cluster
    admin credential access, resource-group `Reader`, and Log Analytics Reader.
 - The repository, tools, VM-only configuration, kubeconfig, and systemd unit.
@@ -39,6 +52,15 @@ Provisioning creates:
 No ACR password, kubeconfig, or benchmark payload is copied from the admin
 workstation. The VM obtains tokens and cluster credentials using managed
 identity.
+
+After bootstrap, verify storage placement before starting a large image build:
+
+```bash
+findmnt /opt/gantry-benchmark
+podman info --format '{{.Store.GraphRoot}}'
+```
+
+The graphroot must be `/opt/gantry-benchmark/containers`.
 
 ## 2. Start The Full Lifecycle
 

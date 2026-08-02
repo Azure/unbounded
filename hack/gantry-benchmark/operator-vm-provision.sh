@@ -17,8 +17,16 @@ set -Eeuo pipefail
 
 AZURE_LOCATION="${AZURE_LOCATION:-canadacentral}"
 OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
-OPERATOR_VM_SIZE="${OPERATOR_VM_SIZE:-Standard_D8ds_v5}"
-OPERATOR_OS_DISK_GB="${OPERATOR_OS_DISK_GB:-512}"
+OPERATOR_VM_SIZE="${OPERATOR_VM_SIZE:-Standard_D32ds_v5}"
+OPERATOR_VM_ZONE="${OPERATOR_VM_ZONE:-1}"
+OPERATOR_OS_DISK_GB="${OPERATOR_OS_DISK_GB:-128}"
+OPERATOR_BUILD_DISK_NAME="${OPERATOR_BUILD_DISK_NAME:-${OPERATOR_VM_NAME}-build}"
+OPERATOR_BUILD_DISK_GB="${OPERATOR_BUILD_DISK_GB:-512}"
+OPERATOR_BUILD_DISK_SKU="${OPERATOR_BUILD_DISK_SKU:-PremiumV2_LRS}"
+OPERATOR_BUILD_DISK_IOPS="${OPERATOR_BUILD_DISK_IOPS:-20000}"
+OPERATOR_BUILD_DISK_MBPS="${OPERATOR_BUILD_DISK_MBPS:-750}"
+OPERATOR_BUILD_DISK_LUN="${OPERATOR_BUILD_DISK_LUN:-0}"
+OPERATOR_BUILD_MOUNT="${OPERATOR_BUILD_MOUNT:-/opt/gantry-benchmark}"
 OPERATOR_SUBNET_NAME="${OPERATOR_SUBNET_NAME:-gantry-benchmark-operator}"
 OPERATOR_SUBNET_CIDR="${OPERATOR_SUBNET_CIDR:-10.236.0.0/24}"
 OPERATOR_NSG_NAME="${OPERATOR_NSG_NAME:-gantry-benchmark-operator-nsg}"
@@ -105,6 +113,7 @@ if ! az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" --output none 
     -l "$AZURE_LOCATION" \
     --image Canonical:ubuntu-24_04-lts:server:latest \
     --size "$OPERATOR_VM_SIZE" \
+    --zone "$OPERATOR_VM_ZONE" \
     --subnet "$subnet_id" \
     --nsg '' \
     --public-ip-address '' \
@@ -115,6 +124,37 @@ if ! az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" --output none 
     --storage-sku Premium_LRS \
     --only-show-errors \
     -o none
+fi
+
+if ! az disk show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_BUILD_DISK_NAME" --output none 2>/dev/null; then
+  az disk create \
+    -g "$AZURE_RESOURCE_GROUP" \
+    -n "$OPERATOR_BUILD_DISK_NAME" \
+    -l "$AZURE_LOCATION" \
+    --zone "$OPERATOR_VM_ZONE" \
+    --sku "$OPERATOR_BUILD_DISK_SKU" \
+    --size-gb "$OPERATOR_BUILD_DISK_GB" \
+    --disk-iops-read-write "$OPERATOR_BUILD_DISK_IOPS" \
+    --disk-mbps-read-write "$OPERATOR_BUILD_DISK_MBPS" \
+    --only-show-errors \
+    -o none
+fi
+
+build_disk_id=$(az disk show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_BUILD_DISK_NAME" --query id -o tsv)
+attached_disk_id=$(az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
+  --query "storageProfile.dataDisks[?lun==\`$OPERATOR_BUILD_DISK_LUN\`].managedDisk.id | [0]" -o tsv)
+if [[ -z "$attached_disk_id" ]]; then
+  az vm disk attach \
+    -g "$AZURE_RESOURCE_GROUP" \
+    --vm-name "$OPERATOR_VM_NAME" \
+    --ids "$build_disk_id" \
+    --lun "$OPERATOR_BUILD_DISK_LUN" \
+    --caching None \
+    --only-show-errors \
+    -o none
+elif [[ ! "$attached_disk_id" =~ /$OPERATOR_BUILD_DISK_NAME$ ]]; then
+  echo "operator VM LUN $OPERATOR_BUILD_DISK_LUN is already occupied by $attached_disk_id" >&2
+  exit 1
 fi
 
 principal_id=$(az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" --query identity.principalId -o tsv)
@@ -167,6 +207,8 @@ az vm run-command invoke \
     "$BENCHMARK_AZURE_TELEMETRY" \
     "$BENCHMARK_MINIMUM_BYTE_REDUCTION" \
     "$BENCHMARK_MAXIMUM_LATENCY_RATIO" \
+    "$OPERATOR_BUILD_DISK_LUN" \
+    "$OPERATOR_BUILD_MOUNT" \
   --only-show-errors \
   -o json
 
@@ -184,6 +226,8 @@ cat <<SUMMARY
 operator VM: $vm_id
 private subnet: $subnet_id
 managed identity: $principal_id
+build disk: $build_disk_id ($OPERATOR_BUILD_DISK_IOPS IOPS, $OPERATOR_BUILD_DISK_MBPS MB/s)
+build mount: $OPERATOR_BUILD_MOUNT
 benchmark service: gantry-benchmark-operator.service
 start command:
   az vm run-command invoke -g $AZURE_RESOURCE_GROUP -n $OPERATOR_VM_NAME --command-id RunShellScript --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
