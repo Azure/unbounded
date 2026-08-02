@@ -80,11 +80,13 @@ func inspectTCPListener(procRoot, address string) (string, bool, error) {
 	}
 
 	inodes := map[string]struct{}{}
+
 	for _, table := range []string{"tcp", "tcp6"} {
 		data, err := os.ReadFile(filepath.Join(procRoot, "net", table))
 		if errors.Is(err, fs.ErrNotExist) && table == "tcp6" {
 			continue
 		}
+
 		if err != nil {
 			return "", false, fmt.Errorf("read %s socket table: %w", table, err)
 		}

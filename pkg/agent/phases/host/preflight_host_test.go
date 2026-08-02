@@ -190,6 +190,11 @@ func testCheckSystemdUnitActive(
 	deps.outputCmd = outputWith("inactive\n", nil)
 	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+
+	deps.outputCmd = outputWith("", errors.New("systemd unavailable"))
+	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "could not be determined")
 }
 
 func TestCheckSwapActive(t *testing.T) {

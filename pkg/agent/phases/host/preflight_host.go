@@ -297,7 +297,16 @@ func checkSystemdUnitActive(
 			"error", err != nil,
 		)
 
-		if err == nil && strings.TrimSpace(out) == "active" {
+		if err != nil {
+			return preflight.ResultsWarning(
+				checkName,
+				unit,
+				"%s state could not be determined",
+				serviceName,
+			)
+		}
+
+		if strings.TrimSpace(out) == "active" {
 			return preflight.ResultsWarning(
 				checkName,
 				unit,
