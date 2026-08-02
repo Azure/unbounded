@@ -22,6 +22,7 @@ export OPERATOR_VNET_NAME="<vnet-name>"
 export BENCHMARK_NODE_COUNT="5"
 export BENCHMARK_IMAGE_SIZE_MIB="128"
 export BENCHMARK_IMAGE_LAYERS="4"
+export BENCHMARK_JOB_TIMEOUT="75m"
 
 # Optional operator storage overrides. These are the high-throughput defaults.
 export OPERATOR_VM_SIZE="Standard_D32ds_v5"

@@ -10,11 +10,11 @@ Usage: operator-vm-bootstrap.sh <subscription> <resource-group> <aks-cluster> \
   <baseline-acr> <gantry-acr> <workspace-customer-id> <baseline-pe-id> \
   <gantry-pe-id> <repo-url> <repo-branch> <node-count> <image-size-mib> \
   <image-layers> <azure-telemetry> <minimum-byte-reduction> <maximum-latency-ratio> \
-  <build-disk-lun> <build-mount>
+  <build-disk-lun> <build-mount> <job-timeout>
 USAGE
 }
 
-[[ $# -eq 18 ]] || { usage >&2; exit 2; }
+[[ $# -eq 19 ]] || { usage >&2; exit 2; }
 
 subscription_id=$1
 resource_group=$2
@@ -34,6 +34,7 @@ minimum_byte_reduction=${15}
 maximum_latency_ratio=${16}
 build_disk_lun=${17}
 build_mount=${18}
+job_timeout=${19}
 
 retry() {
   local attempts=0
@@ -163,7 +164,7 @@ BENCHMARK_IMAGE_SIZE_MIB="$image_size_mib"
 BENCHMARK_IMAGE_LAYERS="$image_layers"
 BENCHMARK_IMAGE_PLATFORM="linux/amd64"
 BENCHMARK_WORKLOAD_REPOSITORY="gantry-benchmark-pull"
-BENCHMARK_JOB_TIMEOUT="45m"
+BENCHMARK_JOB_TIMEOUT="$job_timeout"
 BENCHMARK_ROLLOUT_TIMEOUT="15m"
 BENCHMARK_MINIMUM_BYTE_REDUCTION="$minimum_byte_reduction"
 BENCHMARK_MAXIMUM_LATENCY_RATIO="$maximum_latency_ratio"
