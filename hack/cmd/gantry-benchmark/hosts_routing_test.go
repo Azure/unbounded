@@ -7,21 +7,31 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	containerdconfig "github.com/containerd/containerd/v2/core/remotes/docker/config"
 )
 
 func TestRenderHosts(t *testing.T) {
-	state := benchmarkState{RunID: "run-1", ProxyClusterIP: "10.0.0.42"}
+	state := benchmarkState{
+		RunID:                  "run-1",
+		Mode:                   benchmarkModeDirect,
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+	}
 
 	baseline, err := renderHosts(state, hostsModeBaseline)
 	if err != nil {
 		t.Fatalf("render baseline: %v", err)
 	}
 
-	if !strings.Contains(baseline, `server = "http://10.0.0.42:5002"`) ||
-		!strings.Contains(baseline, `[host."http://10.0.0.42:5002"]`) ||
+	if !strings.Contains(baseline, `server = "https://baseline.azurecr.io"`) ||
+		!strings.Contains(baseline, `[host."https://baseline.azurecr.io"]`) ||
+		strings.Contains(baseline, "acr-origin-proxy") ||
 		strings.Contains(baseline, "127.0.0.1") {
 		t.Fatalf("unexpected baseline hosts.toml:\n%s", baseline)
 	}
@@ -31,14 +41,56 @@ func TestRenderHosts(t *testing.T) {
 		t.Fatalf("render Gantry: %v", err)
 	}
 
-	// STRICT mode: Gantry is the ONLY upstream, so there must be no `server=`
-	// fall-through that would let containerd bypass Gantry to the proxy and
-	// miscount those pulls as origin load.
-	if strings.Contains(gantry, "server =") ||
+	// STRICT mode: Gantry must be both the root server and the only host.
+	// Without the root server, containerd derives ACR as an implicit fallback.
+	if !strings.Contains(gantry, `server = "http://127.0.0.1:5000"`) ||
 		!strings.Contains(gantry, `[host."http://127.0.0.1:5000"]`) ||
-		strings.Contains(gantry, "10.0.0.42") ||
+		strings.Contains(gantry, "gantry.azurecr.io") ||
 		strings.Contains(gantry, "skip_verify") {
 		t.Fatalf("unexpected Gantry hosts.toml:\n%s", gantry)
+	}
+}
+
+func TestRenderHostsGantryResolvesOnlyToLoopback(t *testing.T) {
+	const registry = "gantry.azurecr.io"
+
+	state := benchmarkState{
+		RunID:                "run-1",
+		Mode:                 benchmarkModeDirect,
+		GantryACRLoginServer: registry,
+	}
+
+	hostsFile, err := renderHosts(state, hostsModeGantry)
+	if err != nil {
+		t.Fatalf("render Gantry: %v", err)
+	}
+
+	hostDirectory := filepath.Join(t.TempDir(), registry)
+	if err := os.MkdirAll(hostDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(hostDirectory, "hosts.toml"), []byte(hostsFile), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := containerdconfig.ConfigureHosts(context.Background(), containerdconfig.HostOptions{
+		HostDir: containerdconfig.HostDirFromRoot(filepath.Dir(hostDirectory)),
+	})
+
+	resolved, err := resolver(registry)
+	if err != nil {
+		t.Fatalf("resolve containerd hosts: %v", err)
+	}
+
+	if len(resolved) == 0 {
+		t.Fatal("containerd resolved no Gantry hosts")
+	}
+
+	for index, host := range resolved {
+		if host.Scheme != "http" || host.Host != "127.0.0.1:5000" {
+			t.Fatalf("resolved host %d = %s://%s, want only http://127.0.0.1:5000", index, host.Scheme, host.Host)
+		}
 	}
 }
 
@@ -55,7 +107,7 @@ func TestNodeRoutingScriptsParse(t *testing.T) {
 	}
 
 	var restorer map[string]any
-	if err := json.Unmarshal(runner.applied, &restorer); err != nil {
+	if err := json.Unmarshal(runner.applied[len(runner.applied)-1], &restorer); err != nil {
 		t.Fatalf("decode applied restorer: %v", err)
 	}
 
@@ -63,9 +115,18 @@ func TestNodeRoutingScriptsParse(t *testing.T) {
 		name      string
 		daemonSet map[string]any
 	}{
-		{name: "installer", daemonSet: benchmark.hostsInstallerDaemonSet(state)},
 		{name: "restorer", daemonSet: restorer},
 	}
+
+	installer, err := benchmark.hostsInstallerDaemonSet(state, hostsModeBaseline)
+	if err != nil {
+		t.Fatalf("hostsInstallerDaemonSet: %v", err)
+	}
+
+	tests = append(tests, struct {
+		name      string
+		daemonSet map[string]any
+	}{name: "installer", daemonSet: installer})
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -80,13 +141,42 @@ func TestNodeRoutingScriptsParse(t *testing.T) {
 	}
 }
 
+func TestRestoreHostsTargetsBothDirectRegistries(t *testing.T) {
+	runner := &captureApplyRunner{}
+	benchmark := &benchmark{
+		config:   benchmarkConfig{Namespace: "gantry-benchmark", NodeCount: 1},
+		commands: runner,
+	}
+	state := benchmarkState{
+		RunID:                  "run-1",
+		Mode:                   benchmarkModeDirect,
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+	}
+
+	if err := benchmark.restoreHosts(context.Background(), state); err != nil {
+		t.Fatalf("restoreHosts: %v", err)
+	}
+
+	if len(runner.applied) != 2 {
+		t.Fatalf("applied restorers = %d, want 2", len(runner.applied))
+	}
+
+	for index, registry := range []string{"baseline.azurecr.io", "gantry.azurecr.io"} {
+		manifest := string(runner.applied[index])
+		if !strings.Contains(manifest, registry) || !strings.Contains(manifest, `/host-state/${RUN_ID}/${REGISTRY_HOST}`) {
+			t.Fatalf("restorer %d does not target %s with registry-scoped backup:\n%s", index, registry, manifest)
+		}
+	}
+}
+
 type captureApplyRunner struct {
-	applied []byte
+	applied [][]byte
 }
 
 func (r *captureApplyRunner) Run(_ context.Context, stdin []byte, _ string, args ...string) ([]byte, error) {
 	if len(stdin) != 0 {
-		r.applied = append([]byte(nil), stdin...)
+		r.applied = append(r.applied, append([]byte(nil), stdin...))
 
 		return nil, nil
 	}

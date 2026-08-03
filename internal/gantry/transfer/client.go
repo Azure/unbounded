@@ -11,6 +11,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -25,7 +28,8 @@ import (
 // Reuse a single Client across all peers - the underlying http2.Transport
 // pools per-host connections internally.
 type Client struct {
-	hc *http.Client
+	hc          *http.Client
+	onBytesRead func(kind string, bytes int64)
 }
 
 // ClientOption tweaks Client construction.
@@ -35,6 +39,7 @@ type clientOptions struct {
 	dialTimeout     time.Duration
 	requestTimeout  time.Duration
 	readIdleTimeout time.Duration
+	onBytesRead     func(kind string, bytes int64)
 }
 
 // WithDialTimeout sets the TCP dial timeout per peer.
@@ -50,6 +55,12 @@ func WithRequestTimeout(d time.Duration) ClientOption {
 // WithReadIdleTimeout configures the h2 ping-based idle stall detector.
 func WithReadIdleTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.readIdleTimeout = d }
+}
+
+// WithClientByteMetrics registers a callback for bytes actually read from peer
+// response bodies, including partial failed transfers and retries.
+func WithClientByteMetrics(onBytesRead func(kind string, bytes int64)) ClientOption {
+	return func(o *clientOptions) { o.onBytesRead = onBytesRead }
 }
 
 // NewClient builds a Client tuned for peer fetches.
@@ -79,11 +90,16 @@ func NewClient(opts ...ClientOption) *Client {
 			Transport: tr,
 			Timeout:   o.requestTimeout,
 		},
+		onBytesRead: o.onBytesRead,
 	}
 }
 
 // FetchFromPeer implements ifaces.PeerDialer.
 func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	if ref.Offset < 0 {
+		return nil, 0, fmt.Errorf("peer fetch offset %d is negative", ref.Offset)
+	}
+
 	url, err := buildPeerURL(peerAddr, ref)
 	if err != nil {
 		return nil, 0, err
@@ -97,6 +113,10 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 	req.Header.Set(MirroredHeader, "1")
 	req.Header.Set("Accept", "*/*")
 
+	if ref.Offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", ref.Offset))
+	}
+
 	if authorization := registryauth.Authorization(ctx); authorization != "" {
 		req.Header.Set("Authorization", authorization)
 	}
@@ -108,18 +128,108 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 		return nil, 0, fmt.Errorf("peer dial %s: %w", peerAddr, err)
 	}
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		size := resp.ContentLength
+	switch {
+	case resp.StatusCode == http.StatusOK && ref.Offset == 0:
+		return c.responseBody(resp, ref.Kind), resp.ContentLength, nil
+	case resp.StatusCode == http.StatusPartialContent && ref.Offset > 0:
+		start, end, size, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		if !ok || start != ref.Offset || end < start || size <= end ||
+			(resp.ContentLength >= 0 && resp.ContentLength != end-start+1) {
+			_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
-		return resp.Body, size, nil
-	case http.StatusNotFound:
+			return nil, 0, fmt.Errorf("peer %s returned invalid Content-Range %q for offset %d", peerAddr, resp.Header.Get("Content-Range"), ref.Offset)
+		}
+
+		return c.responseBody(resp, ref.Kind), size, nil
+	case resp.StatusCode == http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 		return nil, 0, &ifaces.ErrNotFound{Digest: ref.Digest}
 	default:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 		return nil, 0, &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode}
 	}
+}
+
+func (c *Client) responseBody(resp *http.Response, kind ifaces.OriginRefKind) io.ReadCloser {
+	body := resp.Body
+
+	if c.onBytesRead != nil {
+		kindLabel := kind.MetricLabel()
+		body = &countingReadCloser{
+			ReadCloser: body,
+			onFinish: func(bytes int64) {
+				c.onBytesRead(kindLabel, bytes)
+			},
+		}
+	}
+
+	return body
+}
+
+func parseContentRange(value string) (start, end, size int64, ok bool) {
+	if !strings.HasPrefix(value, "bytes ") {
+		return 0, 0, 0, false
+	}
+
+	rangeAndSize := strings.Split(strings.TrimPrefix(value, "bytes "), "/")
+	if len(rangeAndSize) != 2 {
+		return 0, 0, 0, false
+	}
+
+	bounds := strings.Split(rangeAndSize[0], "-")
+	if len(bounds) != 2 {
+		return 0, 0, 0, false
+	}
+
+	start, err := strconv.ParseInt(bounds[0], 10, 64)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+
+	end, err = strconv.ParseInt(bounds[1], 10, 64)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+
+	size, err = strconv.ParseInt(rangeAndSize[1], 10, 64)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+
+	return start, end, size, true
+}
+
+type countingReadCloser struct {
+	io.ReadCloser
+	onFinish func(bytes int64)
+	bytes    int64
+	once     sync.Once
+}
+
+func (r *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytes += int64(n)
+
+	if err != nil {
+		r.finish()
+	}
+
+	return n, err
+}
+
+func (r *countingReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.finish()
+
+	return err
+}
+
+func (r *countingReadCloser) finish() {
+	r.once.Do(func() {
+		if r.onFinish != nil && r.bytes > 0 {
+			r.onFinish(r.bytes)
+		}
+	})
 }
 
 func buildPeerURL(peerAddr string, ref ifaces.OriginRef) (string, error) {

@@ -276,7 +276,26 @@ func (p *PeerDialer) FetchFromPeer(ctx context.Context, addr string, ref ifaces.
 		return nil, 0, fmt.Errorf("fakes: no peer registered at %q", addr)
 	}
 
-	return cache.Open(ctx, ref.Digest)
+	rc, size, err := cache.Open(ctx, ref.Digest)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if ref.Offset <= 0 {
+		return rc, size, nil
+	}
+
+	if ref.Offset >= size {
+		_ = rc.Close() //nolint:errcheck // best-effort close
+		return nil, 0, fmt.Errorf("fakes: peer offset %d outside content size %d", ref.Offset, size)
+	}
+
+	if _, err := io.CopyN(io.Discard, rc, ref.Offset); err != nil {
+		_ = rc.Close() //nolint:errcheck // best-effort close
+		return nil, 0, err
+	}
+
+	return rc, size, nil
 }
 
 // ---------------------------------------------------------------------------

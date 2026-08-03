@@ -53,10 +53,37 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return benchmark.disable(ctx)
 	case "enable":
 		return benchmark.enable(ctx)
+	case "prepare":
+		return benchmark.prepareImages(ctx)
+	case "prepare-gantry":
+		if len(args) < 2 || len(args) > 3 {
+			return fmt.Errorf("usage: gantry-benchmark prepare-gantry <baseline-run-id> [prepared-run-id]")
+		}
+
+		preparedRunID := ""
+		if len(args) == 3 {
+			preparedRunID = args[2]
+		}
+
+		return benchmark.prepareGantryOnly(ctx, args[1], preparedRunID)
+	case "prepare-gantry-fresh":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: gantry-benchmark prepare-gantry-fresh <baseline-run-id>")
+		}
+
+		return benchmark.prepareFreshGantryOnly(ctx, args[1])
+	case "prepare-gantry-adopt":
+		if len(args) != 4 {
+			return fmt.Errorf("usage: gantry-benchmark prepare-gantry-adopt <baseline-run-id> <gantry-image> <payload-sha256>")
+		}
+
+		return benchmark.prepareAdoptedFreshGantryOnly(ctx, args[1], args[2], args[3])
 	case "preflight":
 		return benchmark.preflight(ctx)
 	case "run":
 		return benchmark.runBenchmark(ctx)
+	case "run-gantry":
+		return benchmark.runGantryOnly(ctx)
 	case "status":
 		return benchmark.status(ctx)
 	default:
@@ -72,8 +99,16 @@ func printUsage(writer io.Writer) {
 Subcommands:
 	disable    restore the cluster and remove benchmark instrumentation
 	enable     install benchmark instrumentation after safety checks
-	preflight  validate proxy, ACR, monitoring, Gantry, and all 300 nodes
+	prepare    build and push both digest-pinned images before ACR goes private
+	prepare-gantry <baseline-run-id> [prepared-run-id]
+	           rebuild only the Gantry image, or reuse an already-prepared image
+	prepare-gantry-fresh <baseline-run-id>
+	           generate new random bytes and build only a fresh Gantry image
+	prepare-gantry-adopt <baseline-run-id> <gantry-image> <payload-sha256>
+	           adopt an already-pushed fresh Gantry image by immutable digest
+	preflight  validate Azure sources, monitoring, Gantry, and all target nodes
 	run        execute baseline and Gantry cold phases, then restore routing
+	run-gantry execute only Gantry cold against the retained baseline
 	status     print the active benchmark state
 	help       print this help
 `)

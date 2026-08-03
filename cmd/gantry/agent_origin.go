@@ -68,6 +68,9 @@ func buildOriginClients(
 
 	puller, err = origin.New(c,
 		origin.WithLogger(logger),
+		origin.WithByteMetrics(func(kind string, bytes int64) {
+			inst.originBytes.WithLabelValues(kind).Add(float64(bytes))
+		}),
 		origin.WithMetrics(
 			func(kind string) { inst.originPullTotal.WithLabelValues(kind).Inc() },
 			// Failure: bump BOTH the per-(kind,class) counter
@@ -100,7 +103,12 @@ func buildOriginClients(
 		return nil, nil, nil, nil, fmt.Errorf("origin: %w", err)
 	}
 
-	mirror, err = origin.New(c, origin.WithLogger(logger))
+	mirror, err = origin.New(c,
+		origin.WithLogger(logger),
+		origin.WithByteMetrics(func(kind string, bytes int64) {
+			inst.originBytes.WithLabelValues(kind).Add(float64(bytes))
+		}),
+	)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("mirror origin: %w", err)
 	}
