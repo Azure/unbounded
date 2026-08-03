@@ -445,11 +445,163 @@ func (b *benchmark) checkAzureTelemetry(ctx context.Context) error {
 		return fmt.Errorf("query ACR repository table: %w", err)
 	}
 
-	if _, err := b.queryLogAnalytics(ctx, true, "AKSAuditAdmin | take 0", probeWindow); err != nil {
-		return fmt.Errorf("query AKS audit table: %w", err)
+	if err := b.checkAKSAuditDiagnosticSetting(ctx); err != nil {
+		return err
+	}
+
+	if err := b.checkAKSAuditIngestion(ctx); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+type azureDiagnosticSetting struct {
+	LogAnalyticsDestinationType string `json:"logAnalyticsDestinationType"`
+	WorkspaceID                 string `json:"workspaceId"`
+	Logs                        []struct {
+		Category string `json:"category"`
+		Enabled  bool   `json:"enabled"`
+	} `json:"logs"`
+}
+
+func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
+	output, err := b.commands.Run(
+		ctx,
+		nil,
+		"az", "monitor", "diagnostic-settings", "list",
+		"--resource", b.config.AKSResourceID,
+		"--output", "json",
+	)
+	if err != nil {
+		return fmt.Errorf("read AKS diagnostic settings: %w", err)
+	}
+
+	var settings []azureDiagnosticSetting
+	if err := json.Unmarshal(output, &settings); err != nil {
+		return fmt.Errorf("decode AKS diagnostic settings: %w", err)
+	}
+
+	for _, setting := range settings {
+		if !strings.EqualFold(setting.LogAnalyticsDestinationType, "Dedicated") || setting.WorkspaceID == "" {
+			continue
+		}
+
+		auditEnabled := false
+		for _, log := range setting.Logs {
+			if log.Enabled && strings.EqualFold(log.Category, "kube-audit-admin") {
+				auditEnabled = true
+
+				break
+			}
+		}
+		if !auditEnabled {
+			continue
+		}
+
+		customerID, err := b.commands.Run(
+			ctx,
+			nil,
+			"az", "monitor", "log-analytics", "workspace", "show",
+			"--ids", setting.WorkspaceID,
+			"--query", "customerId",
+			"--output", "tsv",
+		)
+		if err != nil {
+			return fmt.Errorf("read AKS diagnostic workspace: %w", err)
+		}
+
+		if strings.EqualFold(strings.TrimSpace(string(customerID)), b.config.LogAnalyticsWorkspaceID) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf(
+		"AKS has no resource-specific kube-audit-admin diagnostic setting targeting Log Analytics workspace %s",
+		b.config.LogAnalyticsWorkspaceID,
+	)
+}
+
+func (b *benchmark) checkAKSAuditIngestion(ctx context.Context) error {
+	probeName := fmt.Sprintf("gantry-audit-probe-%x", time.Now().UTC().UnixNano())
+	probe := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      probeName,
+			"namespace": b.config.Namespace,
+			"labels": map[string]string{
+				"app.kubernetes.io/name":    "gantry-benchmark-audit-probe",
+				"app.kubernetes.io/part-of": "gantry-benchmark",
+			},
+		},
+		"data": map[string]string{"created_at": time.Now().UTC().Format(time.RFC3339Nano)},
+	}
+
+	windowStart := time.Now().UTC().Add(-time.Minute)
+	if err := b.applyObject(ctx, probe); err != nil {
+		return fmt.Errorf("create AKS audit preflight probe: %w", err)
+	}
+
+	defer func() {
+		cleanupContext, cancel := context.WithTimeout(context.Background(), b.config.RolloutTimeout)
+		defer cancel()
+
+		if _, err := b.commands.Run(
+			cleanupContext,
+			nil,
+			"kubectl", "-n", b.config.Namespace,
+			"delete", "configmap/"+probeName,
+			"--ignore-not-found=true", "--wait=false",
+		); err != nil {
+			writeAll(b.stderr, fmt.Sprintf("warning: delete AKS audit preflight probe: %v\n", err))
+		}
+	}()
+
+	query := fmt.Sprintf(`AKSAuditAdmin
+| where _ResourceId =~ %s
+| extend ParsedObjectRef=parse_json(ObjectRef)
+| extend Resource=tostring(ParsedObjectRef.resource), Namespace=tostring(ParsedObjectRef.namespace), Name=tostring(ParsedObjectRef.name)
+| where Verb == "create" and Resource == "configmaps" and Namespace == %s and Name == %s
+| project RequestReceivedTime, Name`,
+		kustoQuote(b.config.AKSResourceID),
+		kustoQuote(b.config.Namespace),
+		kustoQuote(probeName),
+	)
+
+	pollContext, cancel := context.WithTimeout(ctx, b.config.TelemetryTimeout)
+	defer cancel()
+
+	var lastErr error
+
+	for {
+		rows, err := b.queryLogAnalytics(
+			pollContext,
+			true,
+			query,
+			telemetryWindow{StartedAt: windowStart, FinishedAt: time.Now().UTC()},
+		)
+		if err == nil && len(rows) > 0 {
+			writeAll(b.stdout, fmt.Sprintf("AKS audit preflight probe %s reached Log Analytics\n", probeName))
+
+			return nil
+		}
+		lastErr = err
+
+		select {
+		case <-pollContext.Done():
+			if lastErr != nil {
+				return fmt.Errorf("AKS audit preflight probe %s was not queryable before %s: %w", probeName, b.config.TelemetryTimeout, lastErr)
+			}
+
+			return fmt.Errorf(
+				"AKS audit preflight probe %s did not reach AKSAuditAdmin before %s",
+				probeName,
+				b.config.TelemetryTimeout,
+			)
+		case <-time.After(b.config.TelemetryPollInterval):
+		}
+	}
 }
 
 func (b *benchmark) checkAzureRegistry(ctx context.Context, registry phaseRegistry) error {
