@@ -23,6 +23,7 @@ logs, and measured peer traffic from Gantry metrics.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1000 nodes - sample 1 | 40 GiB | 47.296 TB | 174.773 GB | 99.630% | 1002 / 4 | 99.601% |
 | 1000 nodes - sample 2 | 40 GiB | 47.566 TB | 174.781 GB | 99.633% | 1008 / 5 | 99.504% |
+| 1000 nodes - cross-region | 40 GiB | 53.369 TB | 219.262 GB | 99.589% | 1254 / 5 | 99.601% |
 | 2000 nodes - sample 1 | 40 GiB | 95.285 TB | 243.589 GB | 99.744% | 2060 / 3 | 99.854% |
 | 2000 nodes - sample 2 | 40 GiB | 96.045 TB | 242.070 GB | 99.748% | 2035 / 5 | 99.754% |
 | 2000 nodes - sample 3 | 40 GiB | 97.110 TB | 247.528 GB | 99.745% | 2057 / 3 | 99.854% |
@@ -34,13 +35,16 @@ logs, and measured peer traffic from Gantry metrics.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1000 nodes - sample 1 | 40 GiB | 682.725s | 1099.629s | 821.209s | 1171.863s | 1422.461s | 1885.385s | 42.700% slower |
 | 1000 nodes - sample 2 | 40 GiB | 894.597s | 1087.179s | 1065.724s | 1169.448s | 1652.704s | 1885.011s | 9.733% slower |
+| 1000 nodes - cross-region | 40 GiB | 3561.000s | 1064.557s | 3953.000s | 1146.557s | 5399.000s | 1815.557s | 70.995% faster |
 | 2000 nodes - sample 1 | 40 GiB | 1180.178s | 1088.163s | 1407.710s | 1172.734s | 2103.281s | 1883.781s | 16.692% faster |
 | 2000 nodes - sample 2 | 40 GiB | 939.834s | 1093.091s | 1141.022s | 1177.821s | 1724.219s | 1856.380s | 3.225% slower |
 | 2000 nodes - sample 3 | 40 GiB | 1241.331s | 1096.589s | 1472.041s | 1184.248s | 2131.053s | 1821.000s | 19.551% faster |
 
 Positive improvement means Gantry started pods faster. The configured gate was
-a maximum Gantry-to-baseline P95 ratio of 3.0, so all five runs passed even
-when an unusually fast baseline made Gantry slower.
+a maximum Gantry-to-baseline P95 ratio of 3.0, so all five audit-complete runs
+and the cross-region performance sample passed even when an unusually fast
+baseline made Gantry slower. The cross-region row uses retained Kubernetes pod
+status timestamps; the other rows use AKS audit timestamps.
 
 #### Latency excluding image-pull backoff
 
@@ -71,6 +75,40 @@ The unfiltered table remains the primary end-to-end result because
 | 2000 nodes - sample 1 | 40 GiB | 86.971 TB | 221.210 GB | 213 | 210 | 85,044 | 0 |
 | 2000 nodes - sample 2 | 40 GiB | 86.926 TB | 223.358 GB | 214 | 209 | 85,001 | 0 |
 | 2000 nodes - sample 3 | 40 GiB | 87.227 TB | 226.579 GB | 218 | 215 | 85,294 | 0 |
+
+## Cross-region 1000-node sample
+
+We ran a separate 1000-node experiment with AKS and the benchmark operator in
+Canada Central and both private ACRs in UK South. This run used the same fresh
+40 GiB, 40-layer payload in both phases. Both Jobs completed on all 1000 nodes
+with no failed pods.
+
+The ACR event and Private Endpoint measurements below are authoritative. AKS
+did not export `AKSAuditAdmin` records for this run, so latency uses the
+retained Kubernetes pod status timestamps instead of audit timestamps. This
+sample is therefore not included in the same-region aggregates or the
+audit-derived backoff analysis above.
+
+| Metric | Baseline | Gantry cold | Reduction |
+| --- | ---: | ---: | ---: |
+| ACR Private Endpoint bytes | 53.369 TB | 219.262 GB | 99.589% |
+| Successful ACR pull events | 1,254 | 5 | 99.601% |
+| Pod start P50 | 3561.000s | 1064.557s | 70.105% |
+| Pod start P95 | 3953.000s | 1146.557s | 70.995% |
+| Pod start P100 | 5399.000s | 1815.557s | 66.372% |
+
+| Gantry measurement | Value |
+| --- | ---: |
+| Peer bytes served | 43.619 TB |
+| Internal origin bytes | 193.575 GB |
+| Origin pulls | 190 |
+| Origin layer pulls | 184 |
+| Peer fetch hits | 42,651 |
+| Direct-origin fallbacks | 0 |
+
+The performance-only comparison passed every non-audit gate. Private Endpoint
+bytes fell by 99.589%, P95 improved by 70.995%, the baseline recorded no
+Gantry activity, and the Gantry phase recorded no direct-origin fallback.
 
 
 
