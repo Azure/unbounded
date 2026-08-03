@@ -843,7 +843,7 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
 	}
 
-	if c.PrefetchPullerFraction < 0 || c.PrefetchPullerFraction > 1 {
+	if c.PrefetchPullerFraction != c.PrefetchPullerFraction || c.PrefetchPullerFraction < 0 || c.PrefetchPullerFraction > 1 {
 		errs = append(errs, fmt.Errorf("prefetch_puller_fraction: must be between 0 and 1, got %g", c.PrefetchPullerFraction))
 	}
 
