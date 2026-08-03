@@ -253,9 +253,11 @@ func TestMirror_PeerFallback_LiveStreamResumesFromAnotherPeer(t *testing.T) {
 		ifaces.Provider{NodeID: "peer-a", Addr: "10.0.0.1:5001"},
 		ifaces.Provider{NodeID: "peer-b", Addr: "10.0.0.2:5001"},
 	)
+
 	cfg, originSrc := newMirrorOriginNotFound(t)
 
 	var hits, stalls int32
+
 	m := mirror.New(cfg, &writerSpyCache{}, originSrc,
 		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, dialer),
@@ -276,21 +278,26 @@ func TestMirror_PeerFallback_LiveStreamResumesFromAnotherPeer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
 
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
+
 	if !bytes.Equal(got, body) {
 		t.Fatalf("body = %q, want %q", got, body)
 	}
+
 	if offsets := dialer.Offsets(); len(offsets) != 2 || offsets[0] != 0 || offsets[1] != 11 {
 		t.Fatalf("peer offsets = %v, want [0 11]", offsets)
 	}
+
 	if got := atomic.LoadInt32(&stalls); got != 1 {
 		t.Fatalf("stall outcomes = %d, want 1", got)
 	}
+
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Fatalf("hit outcomes = %d, want 1", got)
 	}

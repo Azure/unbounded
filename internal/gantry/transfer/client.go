@@ -112,6 +112,7 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 
 	req.Header.Set(MirroredHeader, "1")
 	req.Header.Set("Accept", "*/*")
+
 	if ref.Offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", ref.Offset))
 	}

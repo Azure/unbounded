@@ -136,6 +136,7 @@ func TestClientFetchRange(t *testing.T) {
 	cache.Put(d, body)
 
 	addr := startTransferOnEphemeral(t, cache)
+
 	rc, size, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
 		Repository: "myrepo",
 		Digest:     d,
@@ -144,6 +145,7 @@ func TestClientFetchRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchFromPeer: %v", err)
 	}
+
 	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
 
 	if size != int64(len(body)) {
@@ -154,6 +156,7 @@ func TestClientFetchRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
+
 	if string(got) != string(body[5:]) {
 		t.Fatalf("body = %q, want %q", got, body[5:])
 	}
@@ -176,6 +179,7 @@ func TestClientRejectsInvalidRangeResponse(t *testing.T) {
 	if rc != nil {
 		_ = rc.Close() //nolint:errcheck // best-effort close
 	}
+
 	if err == nil || !strings.Contains(err.Error(), "invalid Content-Range") {
 		t.Fatalf("error = %v, want invalid Content-Range", err)
 	}

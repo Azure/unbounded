@@ -174,6 +174,7 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 		if r.opts.PrefetchPullerFraction > 0 {
 			replicas = int(math.Ceil(float64(len(candidates)) * r.opts.PrefetchPullerFraction))
 		}
+
 		if replicas < 1 {
 			replicas = 1
 		}

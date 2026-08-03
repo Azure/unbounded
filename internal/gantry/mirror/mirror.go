@@ -1327,12 +1327,13 @@ func (s *livePeerStream) offset() int64 {
 }
 
 func (s *livePeerStream) append(w http.ResponseWriter, src io.Reader, d digest.Digest, size int64, kind ifaces.OriginRefKind) (int64, bool, error) {
-	var reader io.Reader = src
+	reader := src
 
 	if !s.started {
 		br := bufio.NewReader(src)
 
 		var sniff []byte
+
 		if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
 			if peek, _ := br.Peek(512); len(peek) > 0 { //nolint:errcheck // best-effort media sniff
 				sniff = peek
@@ -1712,6 +1713,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	defer cancel()
 
 	fetchStart := time.Now()
+
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 	if stream != nil {
 		pRef.Offset = stream.offset()
@@ -1788,6 +1790,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 			return peerAttemptResult{outcome: peerFetchOutcomeStall, served: ctx.Err() != nil}
 		}
+
 		if !complete {
 			return peerAttemptResult{outcome: peerFetchOutcomeStall}
 		}

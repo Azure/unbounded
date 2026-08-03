@@ -11,10 +11,12 @@ import (
 
 func TestIndexedPayloadPathsUsesNumericLayerOrder(t *testing.T) {
 	root := t.TempDir()
+
 	nested := filepath.Join(root, "gantry-cold")
 	if err := os.MkdirAll(nested, 0o750); err != nil {
 		t.Fatal(err)
 	}
+
 	for _, name := range []string{"payload2.bin", "payload0.bin", "payload1.bin"} {
 		if err := os.WriteFile(filepath.Join(nested, name), []byte(name), 0o640); err != nil {
 			t.Fatal(err)
@@ -25,6 +27,7 @@ func TestIndexedPayloadPathsUsesNumericLayerOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	for index, path := range paths {
 		want := filepath.Join(nested, "payload"+string(rune('0'+index))+".bin")
 		if path != want {

@@ -265,11 +265,13 @@ func TestCompareResultsDirectModeAcceptsEquivalentRandomPayloadShape(t *testing.
 	if !comparison.Passed || !check.Passed {
 		t.Fatalf("equivalent random workload shape did not pass: %+v", check)
 	}
+
 	if !strings.Contains(check.Message, "fingerprints intentionally differ") {
 		t.Fatalf("workload check does not explain random equivalence: %q", check.Message)
 	}
 
 	gantry.ImageLayers = 39
+
 	comparison = compareResults(directComparisonConfig(), baseline, gantry)
 	if comparison.Checks["same_workload_payload"].Passed {
 		t.Fatal("comparison passed with different random payload layer counts")

@@ -6,6 +6,7 @@ package config
 import (
 	"bytes"
 	"flag"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +43,7 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 func TestPrefetchPullerFractionConfig(t *testing.T) {
 	t.Run("environment", func(t *testing.T) {
 		c := NewDefault()
+
 		err := c.LoadEnv(func(key string) string {
 			if key == "GANTRY_PREFETCH_PULLER_FRACTION" {
 				return "0.02"
@@ -52,6 +54,7 @@ func TestPrefetchPullerFractionConfig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LoadEnv: %v", err)
 		}
+
 		if c.PrefetchPullerFraction != 0.02 {
 			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
 		}
@@ -61,9 +64,11 @@ func TestPrefetchPullerFractionConfig(t *testing.T) {
 		c := NewDefault()
 		flags := flag.NewFlagSet("test", flag.ContinueOnError)
 		c.BindFlags(flags)
+
 		if err := flags.Parse([]string{"--prefetch-puller-fraction=0.02"}); err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
+
 		if c.PrefetchPullerFraction != 0.02 {
 			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
 		}
@@ -71,7 +76,7 @@ func TestPrefetchPullerFractionConfig(t *testing.T) {
 }
 
 func TestValidate_PrefetchPullerFractionBounds(t *testing.T) {
-	for _, fraction := range []float64{-0.01, 1.01} {
+	for _, fraction := range []float64{-0.01, 1.01, math.NaN()} {
 		c := NewDefault()
 		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
 		c.PrefetchPullerFraction = fraction

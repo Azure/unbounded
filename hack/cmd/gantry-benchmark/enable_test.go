@@ -82,6 +82,7 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		!strings.Contains(string(rendered), `- controller-revision-hash`) {
 		t.Fatalf("rendered manifest is missing benchmark scrape or Gantry revision labels")
 	}
+
 	if !strings.Contains(string(rendered), `action: keep`) ||
 		!strings.Contains(string(rendered), `gantry_storage_mode_info|p2p_dht_health_score|gantry_peer_serve_bytes_total`) {
 		t.Fatalf("rendered manifest does not limit Gantry metric cardinality")

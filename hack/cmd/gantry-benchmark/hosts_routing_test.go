@@ -59,6 +59,7 @@ func TestRenderHostsGantryResolvesOnlyToLoopback(t *testing.T) {
 		Mode:                 benchmarkModeDirect,
 		GantryACRLoginServer: registry,
 	}
+
 	hostsFile, err := renderHosts(state, hostsModeGantry)
 	if err != nil {
 		t.Fatalf("render Gantry: %v", err)
@@ -68,6 +69,7 @@ func TestRenderHostsGantryResolvesOnlyToLoopback(t *testing.T) {
 	if err := os.MkdirAll(hostDirectory, 0o750); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := os.WriteFile(filepath.Join(hostDirectory, "hosts.toml"), []byte(hostsFile), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -75,13 +77,16 @@ func TestRenderHostsGantryResolvesOnlyToLoopback(t *testing.T) {
 	resolver := containerdconfig.ConfigureHosts(context.Background(), containerdconfig.HostOptions{
 		HostDir: containerdconfig.HostDirFromRoot(filepath.Dir(hostDirectory)),
 	})
+
 	resolved, err := resolver(registry)
 	if err != nil {
 		t.Fatalf("resolve containerd hosts: %v", err)
 	}
+
 	if len(resolved) == 0 {
 		t.Fatal("containerd resolved no Gantry hosts")
 	}
+
 	for index, host := range resolved {
 		if host.Scheme != "http" || host.Host != "127.0.0.1:5000" {
 			t.Fatalf("resolved host %d = %s://%s, want only http://127.0.0.1:5000", index, host.Scheme, host.Host)

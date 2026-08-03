@@ -623,6 +623,7 @@ func compareResults(config benchmarkConfig, baseline, gantry phaseResult) benchm
 				gantry.PayloadSHA,
 			)
 		}
+
 		comparison.Checks["same_workload_payload"] = payloadCheck
 
 		comparison.Passed = comparison.Passed && bypassCheck.Passed && fallbackCheck.Passed && payloadCheck.Passed
@@ -720,6 +721,7 @@ func renderComparisonMarkdown(comparison benchmarkComparison) string {
 		}
 
 		byteLabel := originByteMetricLabel(comparison.Baseline)
+
 		workloadDescription := fmt.Sprintf("Shared workload payload: **%s**", comparison.Baseline.PayloadSHA)
 		if comparison.Baseline.WorkloadComparisonMode == workloadComparisonRandomShape &&
 			comparison.GantryCold.WorkloadComparisonMode == workloadComparisonRandomShape {

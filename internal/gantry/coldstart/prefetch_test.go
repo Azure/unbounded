@@ -157,7 +157,7 @@ func TestPrefetchChildren_FractionScalesWithoutCap(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("nodes-%d", test.nodes), func(t *testing.T) {
 			cluster := make([]ifaces.Node, 0, test.nodes)
-			for index := range test.nodes {
+			for index := 0; index < test.nodes; index++ {
 				cluster = append(cluster, ifaces.Node{
 					ID:   ifaces.NodeID(fmt.Sprintf("node-%05d", index)),
 					Addr: fmt.Sprintf("10.0.%d.%d:5001", index/256, index%256),
