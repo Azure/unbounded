@@ -12,7 +12,7 @@ central control plane. It adds:
 
 - **CRD-driven lifecycle management** for remote machines (`Machine`).
 - **Two provisioning paths**: SSH-based (machina) and PXE-based (metalman).
-- **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}}), separate repo).
+- **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}})).
 
 ![Architecture overview: Control-Plane Cluster with machina and metalman controllers, provisioning Remote Nodes via SSH and Bare-Metal Nodes via PXE, connected through WireGuard Gateway Nodes](../../img/architecture-overview.svg)
 

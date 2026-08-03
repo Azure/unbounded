@@ -1,7 +1,7 @@
 ---
 title: "Project Overview"
 weight: 1
-description: "What Project Unbounded is, the problem it solves, and how its components work together."
+description: "What Unbounded Kubernetes is, the problem it solves, and how its components work together."
 ---
 
 ## The Problem
@@ -18,15 +18,15 @@ locations:
 
 Kubernetes itself has no opinion on how to provision nodes outside the cluster's
 network, how to route pod traffic across sites, or how to PXE-boot bare-metal
-servers. These are gaps that Project Unbounded fills.
+servers. These are gaps that Unbounded Kubernetes fills.
 
 ## The Solution
 
-**Project Unbounded** extends any conformant Kubernetes control plane so that
+**Unbounded Kubernetes** extends any conformant Kubernetes control plane so that
 worker nodes can run anywhere and join back to the cluster over encrypted
 tunnels. It supports four provisioning paths and a unified networking layer.
 
-![Project Unbounded overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking](../../img/unbounded-overview.svg)
+![Unbounded Kubernetes overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking](../../img/unbounded-overview.svg)
 
 ## Components
 
