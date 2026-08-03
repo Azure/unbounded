@@ -190,6 +190,9 @@ tmp/gantry-benchmark/<run-id>/
   gantry-config.original.yaml
 ```
 
+See [RESULTS.md](RESULTS.md) for the consolidated development, 1000-node, and
+2000-node benchmark campaign results.
+
 The comparison includes, in both modes:
 
 - The shared workload payload SHA-256.
