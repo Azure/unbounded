@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -47,5 +48,16 @@ func TestRenderDashboardNamespaces(t *testing.T) {
 
 	if values["namespace"] != "custom-benchmark" || values["gantry_namespace"] != "custom-gantry" {
 		t.Fatalf("rendered namespace variables = %v", values)
+	}
+
+	for _, metric := range []string{
+		"gantry_origin_bytes_total",
+		"gantry_peer_fetch_bytes_total",
+		"gantry_peer_serve_bytes_total",
+		"gantry_mirror_bytes_served_total",
+	} {
+		if !strings.Contains(string(rendered), metric) {
+			t.Fatalf("rendered dashboard is missing byte metric %q", metric)
+		}
 	}
 }

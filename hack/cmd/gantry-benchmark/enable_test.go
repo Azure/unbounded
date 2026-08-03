@@ -20,7 +20,7 @@ func TestRenderProxyManifest(t *testing.T) {
 
 	benchmark := &benchmark{config: benchmarkConfig{RepoRoot: repoRoot}}
 
-	rendered, err := benchmark.renderProxyManifest(proxyManifestData{
+	rendered, err := benchmark.renderManifest(proxyManifestPath, proxyManifestData{
 		Namespace:       "gantry-benchmark",
 		GantryNamespace: "gantry-system",
 		MonitoringLabel: "kps",
@@ -29,7 +29,49 @@ func TestRenderProxyManifest(t *testing.T) {
 		RunID:           "run-1",
 	})
 	if err != nil {
-		t.Fatalf("renderProxyManifest: %v", err)
+		t.Fatalf("renderManifest: %v", err)
+	}
+
+	if strings.Contains(string(rendered), "{{") {
+		t.Fatalf("rendered manifest contains an unresolved template expression")
+	}
+
+	if !strings.Contains(string(rendered), `targetLabel: gantry_benchmark`) {
+		t.Fatalf("rendered manifest is missing the benchmark scrape label")
+	}
+
+	kinds := decodeManifestKinds(t, rendered)
+
+	want := []string{"Deployment", "Service", "PodMonitor"}
+	if len(kinds) != len(want) {
+		t.Fatalf("rendered kinds = %v, want %v", kinds, want)
+	}
+
+	for index := range want {
+		if kinds[index] != want[index] {
+			t.Fatalf("rendered kinds = %v, want %v", kinds, want)
+		}
+	}
+}
+
+// The Gantry PodMonitor lives outside the proxy template because direct mode
+// installs no proxy but still needs gantry_benchmark-labelled agent samples.
+func TestRenderMonitoringManifest(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("findRepoRoot: %v", err)
+	}
+
+	benchmark := &benchmark{config: benchmarkConfig{RepoRoot: repoRoot}}
+
+	rendered, err := benchmark.renderManifest(monitoringManifestPath, proxyManifestData{
+		Namespace:       "gantry-benchmark",
+		GantryNamespace: "gantry-system",
+		MonitoringLabel: "kps",
+		RunID:           "run-1",
+	})
+	if err != nil {
+		t.Fatalf("renderManifest: %v", err)
 	}
 
 	if strings.Contains(string(rendered), "{{") {
@@ -40,6 +82,25 @@ func TestRenderProxyManifest(t *testing.T) {
 		!strings.Contains(string(rendered), `- controller-revision-hash`) {
 		t.Fatalf("rendered manifest is missing benchmark scrape or Gantry revision labels")
 	}
+
+	if !strings.Contains(string(rendered), `action: keep`) ||
+		!strings.Contains(string(rendered), `gantry_storage_mode_info|p2p_dht_health_score|gantry_peer_serve_bytes_total`) {
+		t.Fatalf("rendered manifest does not limit Gantry metric cardinality")
+	}
+
+	if strings.Contains(string(rendered), "acr-origin-proxy") {
+		t.Fatalf("monitoring manifest must not reference the proxy")
+	}
+
+	kinds := decodeManifestKinds(t, rendered)
+
+	if len(kinds) != 1 || kinds[0] != "PodMonitor" {
+		t.Fatalf("rendered kinds = %v, want [PodMonitor]", kinds)
+	}
+}
+
+func decodeManifestKinds(t *testing.T, rendered []byte) []string {
+	t.Helper()
 
 	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(rendered), 4096)
 
@@ -62,14 +123,5 @@ func TestRenderProxyManifest(t *testing.T) {
 		}
 	}
 
-	want := []string{"Deployment", "Service", "PodMonitor", "PodMonitor"}
-	if len(kinds) != len(want) {
-		t.Fatalf("rendered kinds = %v, want %v", kinds, want)
-	}
-
-	for index := range want {
-		if kinds[index] != want[index] {
-			t.Fatalf("rendered kinds = %v, want %v", kinds, want)
-		}
-	}
+	return kinds
 }

@@ -4,6 +4,7 @@
 package mirror_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,6 +29,54 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/origin"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
 )
+
+type failAfterReader struct {
+	reader    *bytes.Reader
+	remaining int
+}
+
+func (r *failAfterReader) Read(buffer []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, context.DeadlineExceeded
+	}
+
+	if len(buffer) > r.remaining {
+		buffer = buffer[:r.remaining]
+	}
+
+	n, err := r.reader.Read(buffer)
+	r.remaining -= n
+
+	return n, err
+}
+
+func (r *failAfterReader) Close() error { return nil }
+
+type resumingPeerDialer struct {
+	mu      sync.Mutex
+	body    []byte
+	offsets []int64
+}
+
+func (d *resumingPeerDialer) FetchFromPeer(_ context.Context, _ string, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	d.mu.Lock()
+	d.offsets = append(d.offsets, ref.Offset)
+	call := len(d.offsets)
+	d.mu.Unlock()
+
+	if call == 1 {
+		return &failAfterReader{reader: bytes.NewReader(d.body), remaining: 11}, int64(len(d.body)), nil
+	}
+
+	return io.NopCloser(bytes.NewReader(d.body[ref.Offset:])), int64(len(d.body)), nil
+}
+
+func (d *resumingPeerDialer) Offsets() []int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return append([]int64(nil), d.offsets...)
+}
 
 // startPeerTransfer stands up a real :5001-style h2c transfer server on an
 // ephemeral loopback port backed by the given Cache and returns its
@@ -191,6 +241,65 @@ func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
 
 	if got := dht.ProvideCount(d); got < 1 {
 		t.Errorf("dht.Provide call count = %d, want >= 1 (post-peer-fetch re-advertise)", got)
+	}
+}
+
+func TestMirror_PeerFallback_LiveStreamResumesFromAnotherPeer(t *testing.T) {
+	body := []byte("one complete digest assembled across two peer streams")
+	d := digestOf(body)
+	dialer := &resumingPeerDialer{body: body}
+	dht := fakes.NewDHT()
+	dht.Inject(d,
+		ifaces.Provider{NodeID: "peer-a", Addr: "10.0.0.1:5001"},
+		ifaces.Provider{NodeID: "peer-b", Addr: "10.0.0.2:5001"},
+	)
+
+	cfg, originSrc := newMirrorOriginNotFound(t)
+
+	var hits, stalls int32
+
+	m := mirror.New(cfg, &writerSpyCache{}, originSrc,
+		mirror.WithLiveStreamThrough(),
+		mirror.WithDiscovery(dht, dialer),
+		mirror.WithPeerBudgets(time.Second, time.Second, 2),
+		mirror.WithPeerMetrics(func(outcome string) {
+			switch outcome {
+			case "hit":
+				atomic.AddInt32(&hits, 1)
+			case "stall":
+				atomic.AddInt32(&stalls, 1)
+			}
+		}, nil),
+	)
+	ts := httptest.NewServer(m.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/v2/r/blobs/" + d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	if !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+
+	if offsets := dialer.Offsets(); len(offsets) != 2 || offsets[0] != 0 || offsets[1] != 11 {
+		t.Fatalf("peer offsets = %v, want [0 11]", offsets)
+	}
+
+	if got := atomic.LoadInt32(&stalls); got != 1 {
+		t.Fatalf("stall outcomes = %d, want 1", got)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("hit outcomes = %d, want 1", got)
 	}
 }
 
