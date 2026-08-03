@@ -30,6 +30,14 @@ jobs:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # In merge_group runs, GitHub's merge queue can complete and delete the
+    # temporary gh-readonly-queue ref before this job finishes uploading its
+    # SARIF results (Go analysis in particular can take 10+ minutes), which
+    # makes the upload step fail with a spurious "ref not found" error even
+    # though the merge itself already succeeded. Don't let that false
+    # failure block/redden the check; the same commit is also analyzed via
+    # the pull_request trigger before it ever enters the queue.
+    continue-on-error: ${{ github.event_name == 'merge_group' }}
     strategy:
       fail-fast: false
       matrix:
