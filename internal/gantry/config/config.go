@@ -259,6 +259,13 @@ type Config struct {
 	// layer. The default is 8.
 	PrefetchPullerReplicas int `yaml:"prefetch_puller_replicas"`
 
+	// PrefetchPullerFraction dynamically sizes the initial puller set from the
+	// eligible HRW candidate count. Values are fractions in (0, 1], so 0.02
+	// selects ceil(nodes * 0.02) pullers. Zero disables dynamic sizing and uses
+	// PrefetchPullerReplicas for backward compatibility. Selection is uncapped
+	// except by the number of eligible nodes.
+	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
+
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
 	// (HRW within the requester's zone) - the design doc / the design doc open question.
 	HRWTopologyScope string `yaml:"hrw_topology_scope"`
@@ -290,8 +297,10 @@ type Config struct {
 	// PeerFetchTimeout caps the complete peer request, including streaming and
 	// committing the response body. It is deliberately SHORT (60s): a requester
 	// stuck on a lockstep-saturated seed must bail and re-select a fresher
-	// finisher-seed rather than ride the slow stream to completion. That
-	// bail-and-re-select is what drives the cold-start cascade (paired with the
+	// finisher-seed rather than ride the slow stream to completion. Live peer
+	// streams resume from the verified byte offset when re-selecting, so this
+	// deadline does not discard an already-delivered prefix. That bail-and-
+	// re-select is what drives the cold-start cascade (paired with the
 	// strict containerd hosts.toml, where an exhausted fetch 503s and containerd
 	// retries Gantry, re-discovering recent finishers). Setting this too high
 	// (e.g. 1h) removes the re-selection and collapses distribution to the
@@ -320,7 +329,7 @@ type Config struct {
 	// hint so the requester re-discovers another provider instead of queueing
 	// behind a saturated seed. This load-shedding is what lets the first
 	// finishers complete early and seed the swarm. Zero means unlimited; the
-	// default is 100. Shedding only preserves dedup with the strict containerd
+	// default is 10. Shedding only preserves dedup with the strict containerd
 	// hosts.toml (mirror-only, no origin fall-through), where a shed request
 	// retries Gantry rather than falling through to origin.
 	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
@@ -458,6 +467,7 @@ func NewDefault() *Config {
 
 		HRWK:                   3,
 		PrefetchPullerReplicas: 8,
+		PrefetchPullerFraction: 0,
 		HRWTopologyScope:       "cluster",
 		ZoneLabelKey:           "topology.kubernetes.io/zone",
 
@@ -467,7 +477,7 @@ func NewDefault() *Config {
 		PeerFetchTimeout:            60 * time.Second,
 		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
 		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
-		TransferMaxConcurrentServes: 100,             // serve cap sheds excess GETs with 429 (validated cascade)
+		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
 		AdvertiseReconcileInterval:  time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
@@ -516,6 +526,17 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt := func(key string, dst *int) {
 		if v, ok := lookup(env, key); ok {
 			n, err := strconv.Atoi(v)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
+				return
+			}
+
+			*dst = n
+		}
+	}
+	setFloat := func(key string, dst *float64) {
+		if v, ok := lookup(env, key); ok {
+			n, err := strconv.ParseFloat(v, 64)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
 				return
@@ -577,6 +598,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 	setInt("HRW_K", &c.HRWK)
 	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
+	setFloat("PREFETCH_PULLER_FRACTION", &c.PrefetchPullerFraction)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
 	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
@@ -639,6 +661,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
+	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "fraction of eligible HRW nodes selected as initial pullers, rounded up (0 disables and uses --prefetch-puller-replicas)")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
 	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
@@ -818,6 +841,10 @@ func (c *Config) Validate() error {
 
 	if c.PrefetchPullerReplicas < 1 {
 		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
+	}
+
+	if c.PrefetchPullerFraction != c.PrefetchPullerFraction || c.PrefetchPullerFraction < 0 || c.PrefetchPullerFraction > 1 {
+		errs = append(errs, fmt.Errorf("prefetch_puller_fraction: must be between 0 and 1, got %g", c.PrefetchPullerFraction))
 	}
 
 	switch c.HRWTopologyScope {

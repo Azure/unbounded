@@ -28,11 +28,12 @@ type phase1Metrics struct {
 	originPullTotal    *prometheus.CounterVec
 	originPullSuccess  *prometheus.CounterVec
 	originPullFailure  *prometheus.CounterVec
+	originBytes        *prometheus.CounterVec
 	originFailureTotal *prometheus.CounterVec
 }
 
 func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
-	return &phase1Metrics{
+	p := &phase1Metrics{
 		cacheHit: reg.NewCounter("cache", prometheus.CounterOpts{
 			Name: "p2p_cache_hit_total",
 			Help: "Local content-store hits on the containerd-facing mirror endpoint.",
@@ -53,37 +54,56 @@ func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
 			Name: "p2p_origin_pull_failure_total",
 			Help: "Origin pulls that failed terminally: classified *OriginError responses from upstream plus downstream commit/copy failures observed after a successful HEAD/body fetch.",
 		}, []string{"kind", "class"}),
+		originBytes: reg.NewCounterVec("origin", prometheus.CounterOpts{
+			Name: "gantry_origin_bytes_total",
+			Help: "Bytes read from upstream OCI registries, including partial failed transfers and retries, labeled by OCI content kind.",
+		}, []string{"kind"}),
 		originFailureTotal: reg.NewCounterVec("mirror", prometheus.CounterOpts{
 			Name: "p2p_origin_failure_total",
 			Help: "Origin failures observed by the mirror, by class.",
 		}, []string{"class"}),
 	}
+
+	// Materialize all bounded kind labels at zero so direct-mode preflight can
+	// prove that every Gantry pod exposes the byte metric before any pull occurs.
+	for _, kind := range []string{"manifest", "config", "layer"} {
+		p.originBytes.WithLabelValues(kind).Add(0)
+	}
+
+	return p
 }
 
 // phase2Metrics groups metrics for peer fallback, DHT advertise,
 // and transfer endpoint (the design doc).
 type phase2Metrics struct {
-	peerServe       prometheus.Counter
-	peerMiss        prometheus.Counter
-	peerFetch       *prometheus.CounterVec
-	peerFetchDur    *prometheus.HistogramVec
-	peerDialSuccess prometheus.Counter
-	peerDialFailure prometheus.Counter
-	dhtProvide      prometheus.Counter
-	dhtProvideErr   *prometheus.CounterVec
-	dhtReconcile    prometheus.Counter
-	dhtLookup       *prometheus.CounterVec
-	dhtLookupDur    *prometheus.HistogramVec
-	dhtAdvertise    prometheus.Counter
-	cdsubReconnect  prometheus.Counter
+	peerServe        prometheus.Counter
+	peerServeBytes   *prometheus.CounterVec
+	peerMiss         prometheus.Counter
+	peerFetch        *prometheus.CounterVec
+	peerFetchBytes   *prometheus.CounterVec
+	mirrorServeBytes *prometheus.CounterVec
+	peerFetchDur     *prometheus.HistogramVec
+	peerDialSuccess  prometheus.Counter
+	peerDialFailure  prometheus.Counter
+	dhtProvide       prometheus.Counter
+	dhtProvideErr    *prometheus.CounterVec
+	dhtReconcile     prometheus.Counter
+	dhtLookup        *prometheus.CounterVec
+	dhtLookupDur     *prometheus.HistogramVec
+	dhtAdvertise     prometheus.Counter
+	cdsubReconnect   prometheus.Counter
 }
 
 func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
-	return &phase2Metrics{
+	p := &phase2Metrics{
 		peerServe: reg.NewCounter("transfer", prometheus.CounterOpts{
 			Name: "p2p_peer_serve_total",
 			Help: "Peer-fetch endpoint requests served from the local containerd content store.",
 		}),
+		peerServeBytes: reg.NewCounterVec("transfer", prometheus.CounterOpts{
+			Name: "gantry_peer_serve_bytes_total",
+			Help: "Bytes transmitted from this Gantry agent to peer agents, labeled by OCI content kind. Range requests count only transmitted range bytes.",
+		}, []string{"kind"}),
 		peerMiss: reg.NewCounter("transfer", prometheus.CounterOpts{
 			Name: "p2p_peer_miss_total",
 			Help: "Peer-fetch endpoint requests that 404'd because the local content store had no entry.",
@@ -92,6 +112,14 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 			Name: "p2p_peer_fetch_total",
 			Help: "Peer fetches initiated by the mirror miss path.",
 		}, []string{"outcome"}),
+		peerFetchBytes: reg.NewCounterVec("mirror", prometheus.CounterOpts{
+			Name: "gantry_peer_fetch_bytes_total",
+			Help: "Bytes received from peer Gantry agents, including partial failed transfers and retries, labeled by OCI content kind.",
+		}, []string{"kind"}),
+		mirrorServeBytes: reg.NewCounterVec("mirror", prometheus.CounterOpts{
+			Name: "gantry_mirror_bytes_served_total",
+			Help: "Bytes written by the containerd-facing mirror, labeled by OCI content kind and source path (cache, peer, or origin).",
+		}, []string{"kind", "source"}),
 		peerFetchDur: reg.NewHistogramVec("mirror", prometheus.HistogramOpts{
 			Name:    "p2p_peer_fetch_duration_seconds",
 			Help:    "End-to-end peer-fetch latency from FetchFromPeer dial to terminal outcome (hit = cache commit, error/stall/notfound = first failing branch). Together with p2p_peer_fetch_total{outcome} this isolates dial vs. body vs. commit-time-digest-verification slowness.",
@@ -135,6 +163,17 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 			Help: "cdsub subscriber reconnect attempts.",
 		}),
 	}
+
+	for _, kind := range []string{"manifest", "config", "layer"} {
+		p.peerServeBytes.WithLabelValues(kind).Add(0)
+		p.peerFetchBytes.WithLabelValues(kind).Add(0)
+
+		for _, source := range []string{"cache", "peer", "origin"} {
+			p.mirrorServeBytes.WithLabelValues(kind, source).Add(0)
+		}
+	}
+
+	return p
 }
 
 // phase3Metrics groups the instruments owned by // HRW-rank-mismatch detection, DHT-false-empty observability, top-K

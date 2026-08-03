@@ -1104,6 +1104,133 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 	})
 }
 
+func TestCountingReadCloserReportsActualBytesOnce(t *testing.T) {
+	tests := []struct {
+		name      string
+		read      func(t *testing.T, rc io.ReadCloser)
+		body      string
+		wantBytes int64
+		wantCalls int
+	}{
+		{
+			name: "complete read reports all bytes on EOF",
+			body: "complete-payload",
+			read: func(t *testing.T, rc io.ReadCloser) {
+				t.Helper()
+
+				if _, err := io.Copy(io.Discard, rc); err != nil {
+					t.Fatalf("copy: %v", err)
+				}
+			},
+			wantBytes: int64(len("complete-payload")),
+			wantCalls: 1,
+		},
+		{
+			name: "early close reports partial bytes",
+			body: "partial-payload",
+			read: func(t *testing.T, rc io.ReadCloser) {
+				t.Helper()
+
+				buf := make([]byte, 4)
+				if n, err := rc.Read(buf); err != nil || n != len(buf) {
+					t.Fatalf("Read = (%d, %v), want (%d, nil)", n, err, len(buf))
+				}
+			},
+			wantBytes: 4,
+			wantCalls: 1,
+		},
+		{
+			name: "empty response does not create a zero-value observation",
+			body: "",
+			read: func(t *testing.T, rc io.ReadCloser) {
+				t.Helper()
+
+				if _, err := io.Copy(io.Discard, rc); err != nil {
+					t.Fatalf("copy: %v", err)
+				}
+			},
+			wantBytes: 0,
+			wantCalls: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var observations []int64
+
+			rc := &countingReadCloser{
+				ReadCloser: io.NopCloser(strings.NewReader(tt.body)),
+				onFinish:   func(bytes int64) { observations = append(observations, bytes) },
+			}
+
+			tt.read(t, rc)
+
+			if err := rc.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			// A second close must not double-count a body already reported at
+			// EOF or on the first close.
+			_ = rc.Close()
+
+			if len(observations) != tt.wantCalls {
+				t.Fatalf("observations = %v, want %d calls", observations, tt.wantCalls)
+			}
+
+			if tt.wantCalls == 1 && observations[0] != tt.wantBytes {
+				t.Fatalf("observed bytes = %d, want %d", observations[0], tt.wantBytes)
+			}
+		})
+	}
+}
+
+func TestCountingReadCloserReportsBytesOnTerminalReadError(t *testing.T) {
+	terminalErr := errors.New("truncated response")
+	reader := &terminalReadCloser{payload: []byte("partial"), err: terminalErr}
+
+	var observations []int64
+
+	rc := &countingReadCloser{
+		ReadCloser: reader,
+		onFinish:   func(bytes int64) { observations = append(observations, bytes) },
+	}
+
+	buf := make([]byte, 32)
+
+	n, err := rc.Read(buf)
+	if !errors.Is(err, terminalErr) {
+		t.Fatalf("Read error = %v, want %v", err, terminalErr)
+	}
+
+	if n != len(reader.payload) {
+		t.Fatalf("Read bytes = %d, want %d", n, len(reader.payload))
+	}
+
+	_ = rc.Close()
+
+	if len(observations) != 1 || observations[0] != int64(len(reader.payload)) {
+		t.Fatalf("observations = %v, want [%d]", observations, len(reader.payload))
+	}
+}
+
+type terminalReadCloser struct {
+	payload []byte
+	err     error
+	read    bool
+}
+
+func (r *terminalReadCloser) Read(p []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+
+	r.read = true
+
+	return copy(p, r.payload), r.err
+}
+
+func (*terminalReadCloser) Close() error { return nil }
+
 // TestOriginMetricKind_MapsToDesignVocabulary locks in the
 // design-doc label set:
 //
