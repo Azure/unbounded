@@ -4,8 +4,6 @@
 package artifacts
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,13 +12,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/google/renameio/v2"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -543,56 +539,12 @@ func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
 }
 
 func downloadTarGzFile(ctx context.Context, sourceURL, wanted, dest string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	source, err := artifactsource.Parse(sourceURL)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close() //nolint:errcheck // best effort close
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("unexpected status %s", resp.Status)
-	}
-
-	gz, err := gzip.NewReader(resp.Body)
-	if err != nil {
-		return fmt.Errorf("open gzip stream: %w", err)
-	}
-	defer gz.Close() //nolint:errcheck // best effort close
-
-	archive := tar.NewReader(gz)
-	for {
-		header, err := archive.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-
-		if err != nil {
-			return fmt.Errorf("read tar archive: %w", err)
-		}
-
-		if header.Typeflag != tar.TypeReg || filepath.Base(header.Name) != wanted {
-			continue
-		}
-
-		out, err := renameio.NewPendingFile(dest, renameio.WithPermissions(0o755))
-		if err != nil {
-			return err
-		}
-		defer out.Cleanup() //nolint:errcheck // pending file cleanup
-
-		if _, err := io.Copy(out, archive); err != nil {
-			return err
-		}
-
-		return out.CloseAtomicallyReplace()
-	}
-
-	return fmt.Errorf("archive does not contain %q", wanted)
+	return source.DownloadToLocalFile(ctx, dest, 0o755, artifactsource.ExtractTarGzFile(wanted))
 }
 
 func writeGeneratedChecksum(path string) error {

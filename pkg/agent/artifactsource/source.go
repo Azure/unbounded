@@ -236,14 +236,63 @@ func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
 	return data, nil
 }
 
-// DownloadToLocalFile downloads the artifact source to filename and sets perm.
-func (s Source) DownloadToLocalFile(ctx context.Context, filename string, perm os.FileMode) error {
-	return s.downloadToLocalFile(ctx, filename, perm, waitForHTTPDownloadRetry)
+// DownloadToLocalFileOption configures DownloadToLocalFile.
+type DownloadToLocalFileOption func(*downloadToLocalFileOptions) error
+
+type downloadToLocalFileOptions struct {
+	tarGzFile string
 }
 
-func (s Source) downloadToLocalFile(ctx context.Context, filename string, perm os.FileMode, wait func(context.Context, time.Duration) error) error {
+// ExtractTarGzFile installs the first regular file in a tar.gz source whose
+// base name matches filename, instead of installing the archive itself.
+func ExtractTarGzFile(filename string) DownloadToLocalFileOption {
+	return func(options *downloadToLocalFileOptions) error {
+		filename = strings.TrimSpace(filename)
+		if filename == "" || filepath.Base(filename) != filename {
+			return fmt.Errorf("tar.gz filename must be a non-empty base name: %q", filename)
+		}
+
+		options.tarGzFile = filename
+
+		return nil
+	}
+}
+
+// DownloadToLocalFile downloads the artifact source to filename and sets perm.
+func (s Source) DownloadToLocalFile(ctx context.Context, filename string, perm os.FileMode, optionFuncs ...DownloadToLocalFileOption) error {
+	options := downloadToLocalFileOptions{}
+	for _, apply := range optionFuncs {
+		if err := apply(&options); err != nil {
+			return err
+		}
+	}
+
+	return s.downloadToLocalFile(ctx, filename, perm, options, waitForHTTPDownloadRetry)
+}
+
+func (s Source) downloadToLocalFile(
+	ctx context.Context,
+	filename string,
+	perm os.FileMode,
+	options downloadToLocalFileOptions,
+	wait func(context.Context, time.Duration) error,
+) error {
 	return s.readWithRetryAndWait(ctx, func(body io.Reader) error {
-		return utilio.InstallFile(filename, body, perm)
+		if options.tarGzFile == "" {
+			return utilio.InstallFile(filename, body, perm)
+		}
+
+		for file, err := range utilio.DecompressTarGz(body) {
+			if err != nil {
+				return fmt.Errorf("read tar.gz artifact: %w", err)
+			}
+
+			if filepath.Base(file.Name) == options.tarGzFile {
+				return utilio.InstallFile(filename, file.Body, perm)
+			}
+		}
+
+		return fmt.Errorf("tar.gz artifact does not contain %q", options.tarGzFile)
 	}, wait)
 }
 
