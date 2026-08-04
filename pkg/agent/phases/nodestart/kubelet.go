@@ -127,6 +127,9 @@ func (c *configureKubelet) ensureKubeletConfiguration() error {
 	x509 := ensureConfigurationMap(authentication, "x509")
 	x509["clientCAFile"] = goalstates.KubeletAPIServerCACertPath
 
+	authorization := ensureConfigurationMap(configuration, "authorization")
+	authorization["mode"] = "Webhook"
+
 	data, err := yaml.Marshal(configuration)
 	if err != nil {
 		return fmt.Errorf("marshal KubeletConfiguration: %w", err)

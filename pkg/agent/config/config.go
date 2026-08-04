@@ -355,9 +355,10 @@ type AgentKubeletConfig struct {
 
 	// Configuration is merged over the agent's baseline kubelet configuration
 	// and rendered as a kubelet.config.k8s.io/v1beta1
-	// KubeletConfiguration. apiVersion, kind, authentication, clusterDNS,
-	// containerRuntimeEndpoint, registerWithTaints, and rotateCertificates are
-	// agent-owned and must not be supplied here.
+	// KubeletConfiguration. apiVersion, kind, authentication,
+	// authorization.mode, clusterDNS, containerRuntimeEndpoint,
+	// registerWithTaints, and rotateCertificates are agent-owned and must not be
+	// supplied here.
 	Configuration map[string]any `json:"Configuration,omitempty"`
 
 	// ImageCredentialProvider configures kubelet's exec image credential
@@ -408,6 +409,17 @@ func validateKubeletConfiguration(configuration map[string]any) error {
 	}
 
 	var errs []error
+
+	if authorizationValue, exists := normalized["authorization"]; exists {
+		authorization, ok := authorizationValue.(map[string]any)
+		if !ok {
+			errs = append(errs, fmt.Errorf("Kubelet.Configuration.authorization must be an object"))
+		} else if _, exists := authorization["mode"]; exists {
+			errs = append(errs, fmt.Errorf(
+				"setting Kubelet.Configuration.authorization.mode is not supported; it is configured by the agent",
+			))
+		}
+	}
 
 	for _, field := range []string{
 		"apiVersion",
