@@ -4,9 +4,55 @@
 package netlink
 
 import (
+	"errors"
 	"slices"
 	"testing"
 )
+
+type fakeIPTables struct {
+	clearChainErr      error
+	deleteJumpErr      error
+	deletedCurrentJump bool
+	deletedLegacyJump  bool
+}
+
+func (f *fakeIPTables) Append(_, _ string, _ ...string) error {
+	return nil
+}
+
+func (f *fakeIPTables) ChainExists(_, _ string) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeIPTables) ClearChain(_, _ string) error {
+	return f.clearChainErr
+}
+
+func (f *fakeIPTables) DeleteChain(_, _ string) error {
+	return nil
+}
+
+func (f *fakeIPTables) DeleteIfExists(_, _ string, rulespec ...string) error {
+	if slices.Contains(rulespec, mssClampComment) {
+		f.deletedCurrentJump = true
+
+		return f.deleteJumpErr
+	}
+
+	if slices.Contains(rulespec, legacyMSSClampComment) {
+		f.deletedLegacyJump = true
+	}
+
+	return nil
+}
+
+func (f *fakeIPTables) Exists(_, _ string, _ ...string) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeIPTables) NewChain(_, _ string) error {
+	return nil
+}
 
 func TestMSSClampRule(t *testing.T) {
 	tests := []struct {
@@ -44,5 +90,35 @@ func TestMSSClampManagerIgnoresUnknownMTU(t *testing.T) {
 
 	if err := manager.EnsureRules(0); err != nil {
 		t.Fatalf("EnsureRules(0) returned error: %v", err)
+	}
+}
+
+func TestNewMSSClampManagerDetachesIPv6JumpWhenClearFails(t *testing.T) {
+	ipt4 := &fakeIPTables{}
+	ipt6 := &fakeIPTables{clearChainErr: errors.New("clear failed")}
+
+	manager, err := newMSSClampManager("wg", ipt4, ipt6)
+	if err != nil {
+		t.Fatalf("newMSSClampManager() returned error: %v", err)
+	}
+
+	if manager.ipt6 != nil {
+		t.Fatal("newMSSClampManager() left IPv6 reconciliation enabled")
+	}
+
+	if !ipt6.deletedCurrentJump || !ipt6.deletedLegacyJump {
+		t.Fatal("newMSSClampManager() did not detach IPv6 MSS clamp jumps")
+	}
+}
+
+func TestNewMSSClampManagerFailsIfIPv6JumpCannotBeDetached(t *testing.T) {
+	ipt4 := &fakeIPTables{}
+	ipt6 := &fakeIPTables{
+		clearChainErr: errors.New("clear failed"),
+		deleteJumpErr: errors.New("delete failed"),
+	}
+
+	if _, err := newMSSClampManager("wg", ipt4, ipt6); err == nil {
+		t.Fatal("newMSSClampManager() returned nil error when IPv6 jump remained active")
 	}
 }

@@ -890,11 +890,11 @@ func DetectRouteMTUAndInterface(destination net.IP, cache *NetlinkCache) (int, s
 	ifaceName := ""
 
 	for _, route := range routes {
-		if route.MTULock && route.MTU > 0 && (mtu == 0 || route.MTU < mtu) {
-			mtu = route.MTU
-		}
-
 		if route.LinkIndex == 0 {
+			if route.MTULock {
+				mtu, ifaceName = selectLowerMTU(mtu, ifaceName, route.MTU, "")
+			}
+
 			continue
 		}
 
@@ -905,16 +905,31 @@ func DetectRouteMTUAndInterface(destination net.IP, cache *NetlinkCache) (int, s
 
 		if linkErr != nil {
 			klog.V(3).Infof("Failed to get route link %d for %s: %v", route.LinkIndex, destination, linkErr)
+
+			if route.MTULock {
+				mtu, ifaceName = selectLowerMTU(mtu, ifaceName, route.MTU, "")
+			}
+
 			continue
 		}
 
-		ifaceName = link.Attrs().Name
-		if linkMTU := link.Attrs().MTU; linkMTU > 0 && (mtu == 0 || linkMTU < mtu) {
-			mtu = linkMTU
+		routeIfaceName := link.Attrs().Name
+		if route.MTULock {
+			mtu, ifaceName = selectLowerMTU(mtu, ifaceName, route.MTU, routeIfaceName)
 		}
+
+		mtu, ifaceName = selectLowerMTU(mtu, ifaceName, link.Attrs().MTU, routeIfaceName)
 	}
 
 	return mtu, ifaceName
+}
+
+func selectLowerMTU(currentMTU int, currentIface string, candidateMTU int, candidateIface string) (int, string) {
+	if candidateMTU <= 0 || (currentMTU > 0 && candidateMTU >= currentMTU) {
+		return currentMTU, currentIface
+	}
+
+	return candidateMTU, candidateIface
 }
 
 func detectDefaultRouteMTUImpl(cache *NetlinkCache) int {

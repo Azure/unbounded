@@ -25,13 +25,23 @@ const (
 // packets forwarded through the node. The explicit MSS is derived from the
 // lowest calculated MTU for the unbounded fabric.
 type MSSClampManager struct {
-	ipt4 *iptables.IPTables
-	ipt6 *iptables.IPTables
+	ipt4 iptablesClient
+	ipt6 iptablesClient
 	mu   sync.Mutex
 	// legacyWGPrefix is retained to remove rules created by older versions.
 	legacyWGPrefix string
 	// installedMTU is the fabric MTU represented by the current rules.
 	installedMTU int
+}
+
+type iptablesClient interface {
+	Append(table, chain string, rulespec ...string) error
+	ChainExists(table, chain string) (bool, error)
+	ClearChain(table, chain string) error
+	DeleteChain(table, chain string) error
+	DeleteIfExists(table, chain string, rulespec ...string) error
+	Exists(table, chain string, rulespec ...string) (bool, error)
+	NewChain(table, chain string) error
 }
 
 // NewMSSClampManager creates a manager and ensures the mangle chain exists.
@@ -47,9 +57,13 @@ func NewMSSClampManager(wgPrefix string) (*MSSClampManager, error) {
 	if err != nil {
 		klog.Warningf("Failed to initialize IPv6 iptables (IPv6 MSS clamping will be disabled): %v", err)
 
-		ipt6 = nil
+		return newMSSClampManager(wgPrefix, ipt4, nil)
 	}
 
+	return newMSSClampManager(wgPrefix, ipt4, ipt6)
+}
+
+func newMSSClampManager(wgPrefix string, ipt4, ipt6 iptablesClient) (*MSSClampManager, error) {
 	m := &MSSClampManager{ipt4: ipt4, ipt6: ipt6, legacyWGPrefix: wgPrefix}
 
 	if err := m.ensureChain(ipt4, "IPv4"); err != nil {
@@ -69,7 +83,13 @@ func NewMSSClampManager(wgPrefix string) (*MSSClampManager, error) {
 		} else if err := ipt6.ClearChain("mangle", mssClampChain); err != nil {
 			klog.Warningf("Failed to clear stale IPv6 MSS clamp rules: %v", err)
 
-			ipt6 = nil
+			if detachErr := m.detachChain(ipt6, "IPv6"); detachErr != nil {
+				return nil, fmt.Errorf(
+					"failed to disable IPv6 MSS clamping after clearing stale rules: %w",
+					detachErr,
+				)
+			}
+
 			m.ipt6 = nil
 		}
 	}
@@ -78,7 +98,7 @@ func NewMSSClampManager(wgPrefix string) (*MSSClampManager, error) {
 }
 
 // ensureChain creates the custom chain and adds a jump from FORWARD.
-func (m *MSSClampManager) ensureChain(ipt *iptables.IPTables, family string) error {
+func (m *MSSClampManager) ensureChain(ipt iptablesClient, family string) error {
 	exists, err := ipt.ChainExists("mangle", mssClampChain)
 	if err != nil {
 		return fmt.Errorf("failed to check if chain exists: %w", err)
@@ -110,6 +130,20 @@ func (m *MSSClampManager) ensureChain(ipt *iptables.IPTables, family string) err
 		}
 
 		klog.V(2).Infof("Added %s jump from FORWARD to %s", family, mssClampChain)
+	}
+
+	return nil
+}
+
+func (m *MSSClampManager) detachChain(ipt iptablesClient, family string) error {
+	jumpRule := []string{"-m", "comment", "--comment", mssClampComment, "-j", mssClampChain}
+	if err := ipt.DeleteIfExists("mangle", "FORWARD", jumpRule...); err != nil {
+		return fmt.Errorf("failed to remove %s MSS clamp jump rule: %w", family, err)
+	}
+
+	legacyJumpRule := []string{"-m", "comment", "--comment", legacyMSSClampComment, "-j", mssClampChain}
+	if err := ipt.DeleteIfExists("mangle", "FORWARD", legacyJumpRule...); err != nil {
+		return fmt.Errorf("failed to remove legacy %s MSS clamp jump rule: %w", family, err)
 	}
 
 	return nil
@@ -150,7 +184,7 @@ func (m *MSSClampManager) EnsureRules(fabricMTU int) error {
 }
 
 func (m *MSSClampManager) ensureRulesForFamily(
-	ipt *iptables.IPTables,
+	ipt iptablesClient,
 	family string,
 	fabricMTU, previousMTU int,
 	ipv6 bool,
@@ -240,7 +274,7 @@ func (m *MSSClampManager) Cleanup() error {
 }
 
 // cleanupFamily removes the jump and chain for one address family.
-func (m *MSSClampManager) cleanupFamily(ipt *iptables.IPTables, family string) error {
+func (m *MSSClampManager) cleanupFamily(ipt iptablesClient, family string) error {
 	if ipt == nil {
 		return nil
 	}
