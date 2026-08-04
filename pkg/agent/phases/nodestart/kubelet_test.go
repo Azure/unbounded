@@ -128,6 +128,9 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 			Configuration: map[string]any{
 				"maxPods": 250,
 				"logging": map[string]any{"verbosity": 4},
+				"authorization": map[string]any{
+					"webhook": map[string]any{"cacheAuthorizedTTL": "10m"},
+				},
 			},
 		},
 	}
@@ -167,7 +170,10 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 	require.Equal(t, false, authentication["anonymous"].(map[string]any)["enabled"])
 	require.Equal(t, true, authentication["webhook"].(map[string]any)["enabled"])
 	require.Equal(t, goalstates.KubeletAPIServerCACertPath, authentication["x509"].(map[string]any)["clientCAFile"])
-	require.Equal(t, "Webhook", got["authorization"].(map[string]any)["mode"])
+
+	authorization := got["authorization"].(map[string]any)
+	require.Equal(t, "Webhook", authorization["mode"])
+	require.Equal(t, "10m", authorization["webhook"].(map[string]any)["cacheAuthorizedTTL"])
 	require.EqualValues(t, 4, got["logging"].(map[string]any)["verbosity"])
 
 	service, err := os.ReadFile(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitKubelet))
