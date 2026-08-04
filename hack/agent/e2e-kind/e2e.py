@@ -197,6 +197,20 @@ def run_quiet(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
     )
 
 
+def download_file(url: str, destination: Path) -> None:
+    run([
+        "curl",
+        "-fsSL",
+        "--connect-timeout", "30",
+        "--retry", "5",
+        "--retry-delay", "5",
+        "--retry-all-errors",
+        "--remove-on-error",
+        "-o", str(destination),
+        url,
+    ])
+
+
 def capture(args: list[str], **kw: Any) -> str:
     result = subprocess.run(args, capture_output=True, text=True, **kw)
     if result.returncode != 0:
@@ -1551,7 +1565,7 @@ def launch_vm() -> None:
     image_file = VM_DIR / image.file_name
     if not image_file.exists():
         log(f"Downloading {HOST_BASE_OS} cloud image...")
-        run(["curl", "-fsSL", "-o", str(image_file), image.url])
+        download_file(image.url, image_file)
     else:
         log(f"Using existing image: {image_file}")
     run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
