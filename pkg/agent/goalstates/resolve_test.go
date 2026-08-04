@@ -353,11 +353,7 @@ func TestResolveKubelet_ConfigurationAndImageCredentialProvider(t *testing.T) {
 
 	k, err := resolveKubelet(cfg)
 	require.NoError(t, err)
-	require.EqualValues(t, 4, k.Configuration["logging"].(map[string]any)["verbosity"])
-	require.Equal(t, map[string]any{"Example": true}, k.Configuration["featureGates"])
-	require.Equal(t, []any{"net.ipv4.ip_local_port_range"}, k.Configuration["allowedUnsafeSysctls"])
-	k.Configuration["logging"].(map[string]any)["verbosity"] = 6
-	require.Equal(t, 4, cfg.Kubelet.Configuration["logging"].(map[string]any)["verbosity"])
+	require.Equal(t, cfg.Kubelet.Configuration, k.Configuration)
 	require.Equal(t, "/etc/kubernetes/credential-provider.yaml", k.ImageCredentialProvider.ConfigPath)
 	require.Equal(t, "/usr/local/lib/kubelet-credential-providers", k.ImageCredentialProvider.BinDir)
 }

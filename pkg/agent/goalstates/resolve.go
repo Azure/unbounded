@@ -161,8 +161,6 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		return zero, err
 	}
 
-	configuration := cfg.DeepCopy().Kubelet.Configuration
-
 	// Skip the "must have one" check when both fields are empty: in the
 	// metalman PXE/attestation flow the agent config intentionally ships
 	// with an empty Kubelet.Auth and the bootstrap token is filled in
@@ -194,7 +192,7 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		NodeIP:                  nodeIP,
 		NodeLabels:              labels,
 		RegisterWithTaints:      cfg.Kubelet.RegisterWithTaints,
-		Configuration:           configuration,
+		Configuration:           cfg.Kubelet.Configuration,
 		ImageCredentialProvider: imageCredentialProvider,
 	}, nil
 }
