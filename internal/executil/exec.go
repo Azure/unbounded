@@ -186,13 +186,6 @@ func Ip() func(context.Context) *exec.Cmd {
 	}
 }
 
-// Curl returns a command factory for curl.
-func Curl() func(context.Context) *exec.Cmd {
-	return func(ctx context.Context) *exec.Cmd {
-		return exec.CommandContext(ctx, "curl")
-	}
-}
-
 // Machinectl returns a command factory for machinectl.
 func Machinectl() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
