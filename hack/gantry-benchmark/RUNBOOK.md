@@ -22,7 +22,6 @@ export OPERATOR_VNET_NAME="<vnet-name>"
 export BENCHMARK_NODE_COUNT="5"
 export BENCHMARK_IMAGE_SIZE_MIB="128"
 export BENCHMARK_IMAGE_LAYERS="4"
-export BENCHMARK_JOB_TIMEOUT="75m"
 
 # Optional operator storage overrides. These are the high-throughput defaults.
 export OPERATOR_VM_SIZE="Standard_D32ds_v5"
@@ -198,12 +197,23 @@ Preflight performs these mandatory checks before routing changes:
 3. In direct mode, requires `gantry_origin_bytes_total` on every Gantry pod.
 4. Requires `gantry_peer_serve_bytes_total` on every Gantry pod.
 5. With Azure telemetry, verifies Azure authentication, both ACR/Private
-   Endpoint bindings, disabled public access on both ACRs, `PEBytesIn`, AKS,
-   and both Log Analytics tables.
+   Endpoint bindings, disabled public access on both ACRs, and `PEBytesIn`.
+   It also requires a resource-specific `kube-audit-admin` diagnostic setting
+   targeting the configured workspace, creates a unique ConfigMap, and waits
+   for that exact write to appear in `AKSAuditAdmin`.
 6. In proxy mode, smoke-tests the proxy, checks reachability from every target
    node, and requires the setup request in Prometheus.
 
 Do not run the benchmark if preflight fails.
+
+The audit probe is an end-to-end ingestion check, not just a table-schema
+query. It can take several minutes after creating or replacing an AKS
+diagnostic setting. A timeout means the benchmark must not start because audit
+startup latency cannot be recovered from Kubernetes objects after cleanup.
+If the setting is correctly configured but both `AKSAuditAdmin` and
+`AKSControlPlane` remain empty, delete and recreate the AKS diagnostic setting.
+This forces Azure Monitor to register the exporter again, which can be required
+after deleting and recreating an AKS cluster with the same resource ID.
 
 ### Run The Comparison
 

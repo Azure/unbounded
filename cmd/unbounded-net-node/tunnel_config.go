@@ -44,15 +44,6 @@ func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPee
 		return nil
 	}
 
-	mtu := cfg.MTU
-
-	if defaultMTU := unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache); defaultMTU > 0 {
-		detected := defaultMTU - unboundednetnetlink.GeneveMTUOverhead
-		if detected < mtu {
-			mtu = detected
-		}
-	}
-
 	supernets := collectSupernets(state, meshPeers, gatewayPeers, gatewayPeers)
 	for _, cidr := range extraSupernets {
 		supernets[cidr] = true
@@ -65,6 +56,7 @@ func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPee
 			continue
 		}
 
+		mtu := routeTunnelMTU(cidr, meshPeers, gatewayPeers)
 		routes = append(routes, unboundednetnetlink.DesiredRoute{
 			Prefix: *cidr,
 			Nexthops: []unboundednetnetlink.DesiredNexthop{{
@@ -236,16 +228,9 @@ func configureTunnelPeers(
 	// interface churn and rp_filter resets.
 	needsGeneve, needsIPIP, needsVXLAN := neededTunnelProtocols(meshPeers, gatewayPeers)
 
-	// geneveMTU is used for supernet route MTU below. Initialize to the
-	// configured MTU and refine if geneve0 is created.
-	geneveMTU := cfg.MTU
-
-	if defaultMTU := unboundednetnetlink.DetectDefaultRouteMTUFromCache(nlCache); defaultMTU > 0 {
-		detected := defaultMTU - unboundednetnetlink.GeneveMTUOverhead
-		if detected < geneveMTU {
-			geneveMTU = detected
-		}
-	}
+	defaultUnderlayMTU := unboundednetnetlink.DetectDefaultRouteMTUFromCache(nlCache)
+	geneveMTU := protocolInterfaceMTU(cfg.MTU, siteTunnelMTUs[mySiteName], defaultUnderlayMTU,
+		string(unboundednetv1alpha1.TunnelProtocolGENEVE), meshPeers, gatewayPeers)
 
 	// Compute the deterministic MAC used for both shared GENEVE and VXLAN
 	// devices. It is set at create time via LinkAttrs.HardwareAddr so the
@@ -352,14 +337,8 @@ func configureTunnelPeers(
 				klog.Warningf("eBPF: failed to bring up %s: %v", ipipIfName, err)
 			}
 
-			ipipMTU := cfg.MTU
-
-			if defaultMTU := unboundednetnetlink.DetectDefaultRouteMTUFromCache(nlCache); defaultMTU > 0 {
-				detected := defaultMTU - unboundednetnetlink.IPIPMTUOverhead
-				if detected < ipipMTU {
-					ipipMTU = detected
-				}
-			}
+			ipipMTU := protocolInterfaceMTU(cfg.MTU, siteTunnelMTUs[mySiteName], defaultUnderlayMTU,
+				string(unboundednetv1alpha1.TunnelProtocolIPIP), meshPeers, gatewayPeers)
 
 			if err := ipipLM.EnsureMTUWithCache(nlCache, ipipMTU); err != nil {
 				klog.Warningf("eBPF: failed to set MTU on %s: %v", ipipIfName, err)
@@ -425,14 +404,8 @@ func configureTunnelPeers(
 			}
 		}
 
-		vxlanMTU := cfg.MTU
-
-		if defaultMTU := unboundednetnetlink.DetectDefaultRouteMTUFromCache(nlCache); defaultMTU > 0 {
-			detected := defaultMTU - unboundednetnetlink.VXLANMTUOverhead
-			if detected < vxlanMTU {
-				vxlanMTU = detected
-			}
-		}
+		vxlanMTU := protocolInterfaceMTU(cfg.MTU, siteTunnelMTUs[mySiteName], defaultUnderlayMTU,
+			string(unboundednetv1alpha1.TunnelProtocolVXLAN), meshPeers, gatewayPeers)
 
 		if err := vxlanLM.EnsureMTUWithCache(nlCache, vxlanMTU); err != nil {
 			klog.Warningf("eBPF: failed to set MTU on %s: %v", vxlanIfName, err)

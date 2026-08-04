@@ -6,6 +6,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // Direct mode must write an explicit direct-to-ACR hosts.toml for the baseline.
@@ -442,6 +443,17 @@ func TestLoadBenchmarkConfigModeDefaultsToProxy(t *testing.T) {
 
 	if config.Mode != benchmarkModeProxy || !config.usesProxy() {
 		t.Fatalf("mode = %q, want %q so existing runs are unchanged", config.Mode, benchmarkModeProxy)
+	}
+}
+
+func TestLoadBenchmarkConfigJobTimeoutIsFourHours(t *testing.T) {
+	config, err := loadBenchmarkConfig(envFromMap(map[string]string{"BENCHMARK_JOB_TIMEOUT": "1m"}))
+	if err != nil {
+		t.Fatalf("loadBenchmarkConfig: %v", err)
+	}
+
+	if config.JobTimeout != 4*time.Hour {
+		t.Fatalf("JobTimeout = %s, want 4h", config.JobTimeout)
 	}
 }
 
