@@ -581,20 +581,17 @@ rules:
 ```
 
 Each rule carries the comment `unbounded-localdns: skip conntrack`. The host
-network oneshot prefers native nftables. It owns a dedicated IPv4 table with
-`PREROUTING` and `OUTPUT` base chains at raw priority and atomically reconciles
+network oneshot uses native nftables and owns a dedicated IPv4 table with
+`PREROUTING` and `OUTPUT` base chains at raw priority. It atomically reconciles
 the complete table to the desired eight `notrack` rules. Dedicated table
 ownership allows stale listener addresses to be removed without inspecting or
 modifying foreign rules.
 
-On a supported host without the native nftables frontend, the reconciler may
-fall back to the iptables-compatible frontend with lock waiting enabled. The
-fallback checks for an exact rule before adding it, removes only stale rules
-with the Unbounded ownership comment, and never removes unowned rules. Backend
-selection and ownership are persisted so cleanup and upgrades remove state from
-the backend that created it. At least one validated backend is required when
-LocalDNS is enabled. Missing support is a fatal preflight error in offline mode
-and follows normal host-package remediation in online mode.
+Native nftables is required when LocalDNS is enabled; there is no
+iptables-compatible fallback. Missing nftables is a fatal preflight error in
+offline mode and follows normal host-package remediation in online mode. A host
+with nftables installed but without raw-priority `notrack` support fails
+preflight.
 
 Host boot orders this reconciliation after `nftables-flush.service` and before
 the nspawn machine. Enabled-to-enabled repave keeps the rules. Disable-through-
@@ -1035,7 +1032,7 @@ Add LocalDNS checks near the phases they validate:
 | `localdns-config` | Validate the complete LocalDNS config, apply defaults, and render the Corefile template with discovered runtime values. |
 | `localdns-artifact` | Validate the online artifact or required offline bundle entries for the host architecture and verify required plugins when the selected binary is locally available. |
 | `localdns-interface` | Detect an incompatible existing interface or address ownership conflict. |
-| `localdns-conntrack` | Validate native nftables support for raw-priority `notrack` rules, or the iptables-compatible fallback's raw table, comment match, and `NOTRACK` target. |
+| `localdns-conntrack` | Validate native nftables support for raw-priority `notrack` rules. |
 | `localdns-ports` | Detect DNS, readiness, and metrics listener conflicts. |
 | `localdns-upstreams` | Confirm the host uses a supported direct or systemd-resolved layout, reject split-DNS policy, and require at least one usable direct node upstream. |
 | `localdns-rootfs` | Confirm LocalDNS files and unit paths can be written into the target rootfs. |
@@ -1153,9 +1150,8 @@ LocalDNS disabled, but LocalDNS preflight rejects the configuration.
 - Kubelet cluster DNS selection with LocalDNS enabled and disabled.
 - Interface reconciliation for absent, matching, incomplete, and conflicting
   state.
-- Exact `NOTRACK` rule generation, idempotent native nftables reconciliation,
-  stale owned-rule removal, foreign-rule preservation, backend migration, and
-  iptables-compatible fallback.
+- Exact `notrack` rule generation, idempotent native nftables reconciliation,
+  stale owned-rule removal, and foreign-rule preservation.
 - Online `Downloads.CoreDNS` source and version resolution and checksum
   verification.
 - Offline `versions.coredns` precedence, conditional bundle requirements, and

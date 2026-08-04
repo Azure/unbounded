@@ -24,7 +24,6 @@ import (
 
 const (
 	checkIsPrivilegedUserName    = "is-privileged-user"
-	checkLocalDNSConntrackName   = "localdns-conntrack"
 	checkHostPackagesName        = "host-packages"
 	checkHostOSConfigurationName = "host-os-configuration"
 	checkNSpawnRuntimeName       = "nspawn-runtime"
@@ -87,80 +86,10 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGo
 		CheckDiskSpace(log),
 		CheckCgroups(log),
 		CheckNvidiaDriver(log),
-	}
-	if cfg.LocalDNS != nil && cfg.LocalDNS.Enabled {
-		checks = append(checks, checkLocalDNSConntrack(log, cfg.OfflineArtifactsConfigured()))
+		checkLocalDNSConntrack(log, cfg, defaultLocalDNSConntrackDeps()),
 	}
 
 	return checks
-}
-
-// CheckLocalDNSConntrack validates raw-priority NOTRACK support without changing rules.
-func CheckLocalDNSConntrack(log *slog.Logger) preflight.Checker {
-	return checkLocalDNSConntrack(log, false)
-}
-
-type localDNSConntrackDeps struct {
-	lookupPath func(string) (string, error)
-	run        func(context.Context, string, []string, string) ([]byte, error)
-}
-
-func defaultLocalDNSConntrackDeps() localDNSConntrackDeps {
-	return localDNSConntrackDeps{
-		lookupPath: exec.LookPath,
-		run: func(ctx context.Context, name string, args []string, stdin string) ([]byte, error) {
-			cmd := exec.CommandContext(ctx, name, args...)
-			cmd.Stdin = strings.NewReader(stdin)
-
-			return cmd.CombinedOutput()
-		},
-	}
-}
-
-func checkLocalDNSConntrack(log *slog.Logger, failMissing bool) preflight.Checker {
-	return checkLocalDNSConntrackWithDeps(log, failMissing, defaultLocalDNSConntrackDeps())
-}
-
-func checkLocalDNSConntrackWithDeps(log *slog.Logger, failMissing bool, deps localDNSConntrackDeps) preflight.Checker {
-	return simpleHostChecker{name: checkLocalDNSConntrackName, check: func(ctx context.Context) []preflight.Result {
-		nftFound := false
-		if _, err := deps.lookupPath("nft"); err == nil {
-			nftFound = true
-			script := `add table ip unbounded_localdns_preflight
-add chain ip unbounded_localdns_preflight output { type filter hook output priority raw; policy accept; }
-add rule ip unbounded_localdns_preflight output ip daddr 127.0.0.1 udp dport 53 notrack
-`
-
-			args := []string{"--check", "--file", "-"}
-			if output, err := deps.run(ctx, "nft", args, script); err == nil {
-				return preflight.ResultsOK(checkLocalDNSConntrackName, "host conntrack", "native nftables raw-priority notrack support is available")
-			} else {
-				log.Debug("LocalDNS native nftables capability check failed", "output", string(output), "error", err)
-			}
-		}
-
-		if _, err := deps.lookupPath("iptables"); err == nil {
-			for _, args := range [][]string{{"-w", "-t", "raw", "-S"}, {"-w", "-t", "raw", "-j", "NOTRACK", "--help"}} {
-				if output, err := deps.run(ctx, "iptables", args, ""); err != nil {
-					log.Debug("LocalDNS iptables-compatible capability check failed", "args", args, "output", string(output), "error", err)
-
-					return preflight.ResultsError(checkLocalDNSConntrackName, "host conntrack", "native nftables or iptables-compatible raw-table NOTRACK support is required")
-				}
-			}
-
-			return preflight.ResultsOK(checkLocalDNSConntrackName, "host conntrack", "iptables-compatible raw-table NOTRACK support is available")
-		}
-
-		if failMissing {
-			return preflight.ResultsError(checkLocalDNSConntrackName, "host conntrack", "native nftables or iptables-compatible NOTRACK support is required")
-		}
-
-		if nftFound {
-			return preflight.ResultsWarning(checkLocalDNSConntrackName, "host conntrack", "native nftables lacks NOTRACK support; the iptables-compatible fallback will be installed before LocalDNS setup")
-		}
-
-		return preflight.ResultsWarning(checkLocalDNSConntrackName, "host conntrack", "nftables or iptables will be installed before LocalDNS setup")
-	}}
 }
 
 // CheckIsPrivilegedUser verifies preflight is running as root.

@@ -1727,13 +1727,13 @@ if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     rm -f /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin
     apt-get update
-    apt-get install -y systemd-container curl nftables iptables util-linux
+    apt-get install -y systemd-container curl nftables util-linux
 elif command -v tdnf >/dev/null 2>&1; then
-    tdnf install -y systemd-container curl nftables iptables util-linux
+    tdnf install -y systemd-container curl nftables util-linux
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y systemd-container curl nftables iptables util-linux
+    dnf install -y systemd-container curl nftables util-linux
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y systemd-container curl nftables iptables util-linux
+    yum install -y systemd-container curl nftables util-linux
 else
     echo "no supported package manager found for blocked-network preparation" >&2
     exit 1
@@ -2661,33 +2661,17 @@ PY
     ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.11/32'")
     ssh_cmd("""
 set -e
-backend=$(sudo cat /etc/unbounded/kube/localdns-network-backend)
-if [ "${backend}" = nftables ]; then
-  rules=$(sudo nft list table ip unbounded_localdns)
-  test "$(printf '%s\\n' "${rules}" | grep -c 'unbounded-localdns: skip conntrack')" -eq 8
-  for chain in output prerouting; do
-    chain_rules=$(sudo nft list chain ip unbounded_localdns "${chain}")
-    for address in 169.254.10.10 169.254.10.11; do
-      for protocol in tcp udp; do
-        printf '%s\\n' "${chain_rules}" | grep -Eq \
-          "ip daddr ${address} ${protocol} dport 53 notrack.*unbounded-localdns: skip conntrack"
-      done
+rules=$(sudo nft list table ip unbounded_localdns)
+test "$(printf '%s\\n' "${rules}" | grep -c 'unbounded-localdns: skip conntrack')" -eq 8
+for chain in output prerouting; do
+  chain_rules=$(sudo nft list chain ip unbounded_localdns "${chain}")
+  for address in 169.254.10.10 169.254.10.11; do
+    for protocol in tcp udp; do
+      printf '%s\\n' "${chain_rules}" | grep -Eq \
+        "ip daddr ${address} ${protocol} dport 53 notrack.*unbounded-localdns: skip conntrack"
     done
   done
-elif [ "${backend}" = iptables ]; then
-  for chain in OUTPUT PREROUTING; do
-    for address in 169.254.10.10 169.254.10.11; do
-      for protocol in tcp udp; do
-        sudo iptables -w -t raw -C "${chain}" \
-          -m comment --comment 'unbounded-localdns: skip conntrack' \
-          -p "${protocol}" -d "${address}" --dport 53 -j NOTRACK
-      done
-    done
-  done
-else
-  echo "unknown LocalDNS network backend: ${backend}" >&2
-  exit 1
-fi
+done
 """)
     ssh_cmd(f"curl --silent --fail --noproxy '*' http://{expected_node_ip(node_config)}:9253/metrics | grep -q '^coredns_build_info'")
     log("nspawn LocalDNS validation passed")
@@ -2945,8 +2929,7 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
         _run_scenario_command("reset-agent", node_config, env)
         cleanup_check = (
             "test ! -e /sys/class/net/localdns && "
-            "! sudo nft list table ip unbounded_localdns >/dev/null 2>&1 && "
-            "! sudo iptables -w -t raw -S | grep -q 'unbounded-localdns: skip conntrack'"
+            "! sudo nft list table ip unbounded_localdns >/dev/null 2>&1"
         )
         deadline = time.monotonic() + 60
         scenario_key = Path(env["VM_DIR"]) / "ssh" / "id_ed25519"

@@ -459,23 +459,12 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		RegisterWithTaints: h.taints,
 	}
 
-	if h.ociImage != "" {
-		machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
-	}
-
+	machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
 	if h.localDNS {
-		if machine.Spec.Agent == nil {
-			machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{}
-		}
-
 		machine.Spec.Agent.LocalDNS = &unboundedv1alpha3.LocalDNSSpec{Enabled: true}
 	}
 
 	if downloads := h.buildDownloadsSpec(); downloads != nil {
-		if machine.Spec.Agent == nil {
-			machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{}
-		}
-
 		machine.Spec.Agent.Downloads = downloads
 	}
 

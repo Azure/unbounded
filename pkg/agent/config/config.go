@@ -222,7 +222,7 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, err)
 	}
 
-	if err := a.LocalDNS.Validate(a.Cluster.ClusterDNS, a.Kubelet.NodeIP); err != nil {
+	if err := a.validateLocalDNS(); err != nil {
 		errs = append(errs, err)
 	}
 
