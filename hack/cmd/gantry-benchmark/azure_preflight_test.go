@@ -68,14 +68,14 @@ func (r azurePreflightRunner) Run(_ context.Context, _ []byte, name string, args
 		return []byte(`[{"name":{"value":"PEBytesIn"}}]`), nil
 	case strings.Contains(command, "diagnostic-settings list"):
 		if r.missingAuditDiagnostic {
-			return []byte(`[]`), nil
+			return []byte(`{"value":[]}`), nil
 		}
 
-		return []byte(`[{
+		return []byte(`{"value":[{
 			"logAnalyticsDestinationType":"Dedicated",
 			"workspaceId":"/subscriptions/s/workspaces/law",
 			"logs":[{"category":"kube-audit-admin","enabled":true}]
-		}]`), nil
+		}]}`), nil
 	case strings.Contains(command, "log-analytics workspace show"):
 		return []byte("workspace-id\n"), nil
 	case strings.HasPrefix(command, "kubectl apply") || strings.Contains(command, "kubectl -n gantry-benchmark delete configmap/"):

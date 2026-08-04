@@ -477,17 +477,20 @@ func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
 		return fmt.Errorf("read AKS diagnostic settings: %w", err)
 	}
 
-	var settings []azureDiagnosticSetting
+	var settings struct {
+		Value []azureDiagnosticSetting `json:"value"`
+	}
 	if err := json.Unmarshal(output, &settings); err != nil {
 		return fmt.Errorf("decode AKS diagnostic settings: %w", err)
 	}
 
-	for _, setting := range settings {
+	for _, setting := range settings.Value {
 		if !strings.EqualFold(setting.LogAnalyticsDestinationType, "Dedicated") || setting.WorkspaceID == "" {
 			continue
 		}
 
 		auditEnabled := false
+
 		for _, log := range setting.Logs {
 			if log.Enabled && strings.EqualFold(log.Category, "kube-audit-admin") {
 				auditEnabled = true
@@ -495,6 +498,7 @@ func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
 				break
 			}
 		}
+
 		if !auditEnabled {
 			continue
 		}
@@ -539,6 +543,7 @@ func (b *benchmark) checkAKSAuditIngestion(ctx context.Context) error {
 	}
 
 	windowStart := time.Now().UTC().Add(-time.Minute)
+
 	if err := b.applyObject(ctx, probe); err != nil {
 		return fmt.Errorf("create AKS audit preflight probe: %w", err)
 	}
@@ -586,6 +591,7 @@ func (b *benchmark) checkAKSAuditIngestion(ctx context.Context) error {
 
 			return nil
 		}
+
 		lastErr = err
 
 		select {
