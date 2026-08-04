@@ -123,9 +123,8 @@ func (c *configureKubelet) ensureKubeletConfiguration() error {
 	x509 := ensureConfigurationMap(authentication, "x509")
 	x509["clientCAFile"] = goalstates.KubeletAPIServerCACertPath
 
-	authorization := maps.Clone(ensureConfigurationMap(configuration, "authorization"))
+	authorization := ensureConfigurationMap(configuration, "authorization")
 	authorization["mode"] = "Webhook"
-	configuration["authorization"] = authorization
 
 	data, err := yaml.Marshal(configuration)
 	if err != nil {
@@ -177,11 +176,13 @@ func defaultKubeletConfiguration() map[string]any {
 }
 
 func ensureConfigurationMap(parent map[string]any, key string) map[string]any {
-	if value, ok := parent[key].(map[string]any); ok {
-		return value
+	value, ok := parent[key].(map[string]any)
+	if !ok {
+		value = map[string]any{}
+	} else {
+		value = maps.Clone(value)
 	}
 
-	value := map[string]any{}
 	parent[key] = value
 
 	return value
