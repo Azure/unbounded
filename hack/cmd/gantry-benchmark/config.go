@@ -100,11 +100,6 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		return benchmarkConfig{}, err
 	}
 
-	jobTimeout, err := envDuration(getenv, "BENCHMARK_JOB_TIMEOUT", 90*time.Minute)
-	if err != nil {
-		return benchmarkConfig{}, err
-	}
-
 	rolloutTimeout, err := envDuration(getenv, "BENCHMARK_ROLLOUT_TIMEOUT", 20*time.Minute)
 	if err != nil {
 		return benchmarkConfig{}, err
@@ -172,7 +167,7 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		NodeCount:                    nodeCount,
 		ImageSizeMiB:                 imageSizeMiB,
 		ImageLayers:                  imageLayers,
-		JobTimeout:                   jobTimeout,
+		JobTimeout:                   4 * time.Hour,
 		RolloutTimeout:               rolloutTimeout,
 		MinimumByteReduction:         minimumByteReduction,
 		MaximumLatencyRatio:          maximumLatencyRatio,

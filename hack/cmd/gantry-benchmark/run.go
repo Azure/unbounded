@@ -296,34 +296,14 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	if b.config.AzureTelemetry {
 		writeAll(b.stdout, "waiting for baseline Azure telemetry\n")
 
-		baselineResult.Azure, err = b.collectAzurePhaseUntilStable(ctx, baselineResult)
-		if err != nil {
+		if err := b.collectAndPersistAzurePhase(ctx, &baselineResult, "baseline.json"); err != nil {
 			return fmt.Errorf("collect baseline Azure telemetry: %w", err)
 		}
 
 		writeAll(b.stdout, "waiting for Gantry-cold Azure telemetry\n")
 
-		gantryResult.Azure, err = b.collectAzurePhaseUntilStable(ctx, gantryResult)
-		if err != nil {
+		if err := b.collectAndPersistAzurePhase(ctx, &gantryResult, "gantry-cold.json"); err != nil {
 			return fmt.Errorf("collect Gantry-cold Azure telemetry: %w", err)
-		}
-
-		baselineResult.OriginBytes = baselineResult.Azure.PrivateEndpoint.BytesFromACR
-		baselineResult.OriginBytesSource = originBytesPrivateEndpoint
-		baselineResult.PodStartupLatency = baselineResult.Azure.Audit.PodStartupLatency
-		baselineResult.PodStartupLatencySource = baselineResult.Azure.Audit.Source
-
-		gantryResult.OriginBytes = gantryResult.Azure.PrivateEndpoint.BytesFromACR
-		gantryResult.OriginBytesSource = originBytesPrivateEndpoint
-		gantryResult.PodStartupLatency = gantryResult.Azure.Audit.PodStartupLatency
-		gantryResult.PodStartupLatencySource = gantryResult.Azure.Audit.Source
-
-		if err := b.writeJSONArtifact(state.RunID, "baseline.json", baselineResult); err != nil {
-			return err
-		}
-
-		if err := b.writeJSONArtifact(state.RunID, "gantry-cold.json", gantryResult); err != nil {
-			return err
 		}
 	}
 

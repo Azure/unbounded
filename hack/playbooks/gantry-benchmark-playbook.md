@@ -573,8 +573,8 @@ returning HTTP 429 with `Retry-After`.
 
 Practical consequences:
 
-- Raise `BENCHMARK_JOB_TIMEOUT` well above the 90m default. The 180m in this
-  playbook is a starting point, not a measured value.
+- The benchmark Job timeout is fixed at four hours to accommodate throttling
+  and cross-region pulls at large scale.
 - Expect 429s in the baseline. Containerd retries them, which inflates baseline
   latency. That is real-world ACR behaviour at cold start, but record it so the
   comparison is read correctly.

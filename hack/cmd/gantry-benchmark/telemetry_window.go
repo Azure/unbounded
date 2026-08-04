@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -128,7 +129,7 @@ func (b *benchmark) collectAzurePhaseUntilStable(
 	tracker := azureTelemetrySettlement{window: stableWindow}
 
 	var (
-		last    azurePhaseMeasurement
+		last    = phase.Azure
 		lastErr error
 	)
 
@@ -148,10 +149,10 @@ func (b *benchmark) collectAzurePhaseUntilStable(
 		select {
 		case <-pollContext.Done():
 			if lastErr != nil {
-				return azurePhaseMeasurement{}, fmt.Errorf("azure telemetry did not become queryable: %w", lastErr)
+				return last, fmt.Errorf("azure telemetry did not become queryable: %w", lastErr)
 			}
 
-			return azurePhaseMeasurement{}, fmt.Errorf(
+			return last, fmt.Errorf(
 				"azure telemetry did not become complete and stable before %s: %+v",
 				b.config.TelemetryTimeout,
 				last,
@@ -159,6 +160,29 @@ func (b *benchmark) collectAzurePhaseUntilStable(
 		case <-time.After(b.config.TelemetryPollInterval):
 		}
 	}
+}
+
+func (b *benchmark) collectAndPersistAzurePhase(
+	ctx context.Context,
+	phase *phaseResult,
+	filename string,
+) error {
+	measurement, collectErr := b.collectAzurePhaseUntilStable(ctx, *phase)
+	phase.Azure = measurement
+
+	if collectErr == nil {
+		phase.OriginBytes = measurement.PrivateEndpoint.BytesFromACR
+		phase.OriginBytesSource = originBytesPrivateEndpoint
+		phase.PodStartupLatency = measurement.Audit.PodStartupLatency
+		phase.PodStartupLatencySource = measurement.Audit.Source
+	}
+
+	writeErr := b.writeJSONArtifact(phase.RunID, filename, *phase)
+	if writeErr != nil {
+		writeErr = fmt.Errorf("write %s: %w", filename, writeErr)
+	}
+
+	return errors.Join(collectErr, writeErr)
 }
 
 type azureTelemetrySettlement struct {

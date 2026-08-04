@@ -71,6 +71,10 @@ With Azure telemetry enabled, the primary measurements are instead:
   receipt timestamps.
 - Peer bytes: per-pod `gantry_peer_serve_bytes_total{kind}` deltas.
 
+Preflight validates the audit path end to end by creating a unique ConfigMap
+and requiring its create event to appear in `AKSAuditAdmin`. Merely being able
+to query an empty table is not sufficient.
+
 The workload is a Kubernetes Job with 300 completions and 300-way
 parallelism. Required hostname anti-affinity uses the run ID and phase, so the
 workflow proves that exactly one pull pod ran on each of 300 distinct nodes.
