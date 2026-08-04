@@ -38,3 +38,11 @@ func TestMSSClampRule(t *testing.T) {
 		})
 	}
 }
+
+func TestMSSClampManagerIgnoresUnknownMTU(t *testing.T) {
+	manager := &MSSClampManager{}
+
+	if err := manager.EnsureRules(0); err != nil {
+		t.Fatalf("EnsureRules(0) returned error: %v", err)
+	}
+}

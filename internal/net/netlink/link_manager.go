@@ -566,7 +566,7 @@ func (lm *LinkManager) EnsureBridgePortMTUs(mtu int) error {
 		klog.Infof("Setting MTU on bridge port %s from %d to %d", link.Attrs().Name, link.Attrs().MTU, mtu)
 
 		if err := netlink.LinkSetMTU(link, mtu); err != nil {
-			if errors.Is(err, syscall.ENODEV) || errors.Is(err, syscall.ENOENT) {
+			if isLinkGoneError(err) {
 				continue
 			}
 

@@ -118,6 +118,10 @@ func (m *MSSClampManager) EnsureRules(fabricMTU int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if fabricMTU <= 0 {
+		return nil
+	}
+
 	if fabricMTU <= 60 {
 		return fmt.Errorf("fabric MTU %d is too small for TCP MSS clamping", fabricMTU)
 	}

@@ -164,6 +164,10 @@ func TestResolveInitialCNIConfigMTU(t *testing.T) {
 	if got := resolveInitialCNIConfigMTU(1380, 1400, 1500); got != 1380 {
 		t.Fatalf("configured MTU = %d, want 1380", got)
 	}
+
+	if got := resolveInitialCNIConfigMTU(0, 0, 0); got != 0 {
+		t.Fatalf("unresolved MTU = %d, want 0 for caller fallback", got)
+	}
 }
 
 func TestResolveCNIConfigMTUUsesLowestPeer(t *testing.T) {
