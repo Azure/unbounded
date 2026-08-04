@@ -657,35 +657,35 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/api/blob/v0.36.2/LICENSE
+        link: https://github.com/kubernetes/api/blob/v0.36.3/LICENSE
   - dependency: k8s.io/apiextensions-apiserver
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.0/LICENSE
+        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.3/LICENSE
   - dependency: k8s.io/apimachinery
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apimachinery/blob/v0.36.2/LICENSE
+        link: https://github.com/kubernetes/apimachinery/blob/v0.36.3/LICENSE
   - dependency: k8s.io/cli-runtime
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/cli-runtime/blob/v0.36.2/LICENSE
+        link: https://github.com/kubernetes/cli-runtime/blob/v0.36.3/LICENSE
   - dependency: k8s.io/client-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/client-go/blob/v0.36.2/LICENSE
+        link: https://github.com/kubernetes/client-go/blob/v0.36.3/LICENSE
   - dependency: k8s.io/klog/v2
     ecosystem: go
     copyright:
@@ -699,7 +699,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/kube-aggregator/blob/v0.36.2/LICENSE
+        link: https://github.com/kubernetes/kube-aggregator/blob/v0.36.3/LICENSE
   - dependency: k8s.io/utils
     ecosystem: go
     copyright:
