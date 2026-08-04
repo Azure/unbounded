@@ -170,6 +170,38 @@
       ],
       "title": "Minimum DHT health",
       "type": "gauge"
+    },
+    {
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32},
+      "id": 500,
+      "title": "Gantry byte traffic",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "Bps"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+      "id": 16,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}},
+      "targets": [
+        {"expr": "sum by (kind) (rate(gantry_origin_bytes_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "origin RX {{kind}}", "refId": "A"},
+        {"expr": "sum by (kind) (rate(gantry_peer_fetch_bytes_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "peer RX {{kind}}", "refId": "B"},
+        {"expr": "sum by (kind) (rate(gantry_peer_serve_bytes_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "peer TX {{kind}}", "refId": "C"}
+      ],
+      "title": "Origin and peer bytes/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "Bps"}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
+      "id": 17,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}},
+      "targets": [
+        {"expr": "sum by (source,kind) (rate(gantry_mirror_bytes_served_total{namespace=\"$gantry_namespace\",gantry_benchmark=\"true\"}[1m]))", "legendFormat": "{{source}} {{kind}}", "refId": "A"}
+      ],
+      "title": "Mirror bytes/sec by source",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

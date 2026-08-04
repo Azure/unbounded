@@ -133,6 +133,9 @@ type OriginRef struct {
 	Registry   string // e.g. "registry.example.com"
 	Repository string // e.g. "library/nginx"
 	Digest     digest.Digest
+	// Offset requests bytes starting at this position when fetching from a
+	// peer. Origin registry callers ignore it. Zero requests the full object.
+	Offset int64
 
 	// Kind discriminates the OCI Distribution Spec URL family for this
 	// reference. Manifests live at /v2/<repo>/manifests/<digest>, blobs at
@@ -288,7 +291,9 @@ type PeerDialer interface {
 	// endpoint. The implementation MUST set `Gantry-Mirrored: 1` and MUST
 	// forward any request-scoped Basic/Bearer authorization carried by ctx, and MUST
 	// surface a NotFound error distinctly from transport errors so the
-	// caller can fail over to the next provider.
+	// caller can fail over to the next provider. When ref.Offset is non-zero,
+	// the implementation MUST request and validate a response beginning at
+	// that byte and still return the full object size.
 	FetchFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (io.ReadCloser, int64, error)
 }
 

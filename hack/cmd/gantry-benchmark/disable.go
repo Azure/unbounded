@@ -73,10 +73,6 @@ func (b *benchmark) disable(ctx context.Context) error {
 		return err
 	}
 
-	if err := b.switchProxyPhase(ctx, proxyPhaseIdle); err != nil {
-		writeAll(b.stderr, fmt.Sprintf("warning: could not switch proxy to idle before restoration: %v\n", err))
-	}
-
 	hostsErr := b.restoreHosts(ctx, state)
 
 	gantryErr := b.restoreGantry(ctx, &state)
@@ -89,7 +85,7 @@ func (b *benchmark) disable(ctx context.Context) error {
 		return fmt.Errorf("restore benchmark cluster changes: %w", restoreErr)
 	}
 
-	if err := b.validateGantry(ctx); err != nil {
+	if err := b.validateGantryAtCurrentSize(ctx); err != nil {
 		state.Status = "restore-failed"
 
 		validationErr := fmt.Errorf("validate Gantry after restoration: %w", err)

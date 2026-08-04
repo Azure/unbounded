@@ -160,7 +160,7 @@ provides efficient map-based lookups.
 
 ## How It Relates to unbounded-kube
 
-unbounded-net is the **networking layer** for the broader Project Unbounded
+unbounded-net is the **networking layer** for the broader Unbounded Kubernetes
 system:
 
 - **Unbounded** handles node provisioning -- getting remote machines
