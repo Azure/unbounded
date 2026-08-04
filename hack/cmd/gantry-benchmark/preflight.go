@@ -478,10 +478,16 @@ func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
 	}
 
 	var settings struct {
-		Value []azureDiagnosticSetting `json:"value"`
+		Value []struct {
+			Properties azureDiagnosticSetting `json:"properties"`
+		} `json:"value"`
 	}
 	if err := json.Unmarshal(output, &settings); err != nil {
 		return fmt.Errorf("decode AKS diagnostic settings: %w", err)
+	}
+
+	for _, entry := range settings.Value {
+		setting := entry.Properties
 	}
 
 	for _, setting := range settings.Value {
