@@ -684,18 +684,10 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 		Job:   job, OriginBytes: bytes, OriginBytesSource: bytesSource, RecordedAt: time.Now().UTC(),
 	}
 	if b.config.AzureTelemetry {
-		gantryResult.Azure, err = b.collectAzurePhaseUntilStable(ctx, gantryResult)
-		if err != nil {
+		if err := b.collectAndPersistAzurePhase(ctx, &gantryResult, "gantry-cold.json"); err != nil {
 			return fmt.Errorf("collect Gantry-only Azure telemetry: %w", err)
 		}
-
-		gantryResult.OriginBytes = gantryResult.Azure.PrivateEndpoint.BytesFromACR
-		gantryResult.OriginBytesSource = originBytesPrivateEndpoint
-		gantryResult.PodStartupLatency = gantryResult.Azure.Audit.PodStartupLatency
-		gantryResult.PodStartupLatencySource = gantryResult.Azure.Audit.Source
-	}
-
-	if err := b.writeJSONArtifact(state.RunID, "gantry-cold.json", gantryResult); err != nil {
+	} else if err := b.writeJSONArtifact(state.RunID, "gantry-cold.json", gantryResult); err != nil {
 		return err
 	}
 

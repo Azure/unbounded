@@ -72,9 +72,11 @@ func (r azurePreflightRunner) Run(_ context.Context, _ []byte, name string, args
 		}
 
 		return []byte(`{"value":[{
-			"logAnalyticsDestinationType":"Dedicated",
-			"workspaceId":"/subscriptions/s/workspaces/law",
-			"logs":[{"category":"kube-audit-admin","enabled":true}]
+			"properties":{
+				"logAnalyticsDestinationType":"Dedicated",
+				"workspaceId":"/subscriptions/s/workspaces/law",
+				"logs":[{"category":"kube-audit-admin","enabled":true}]
+			}
 		}]}`), nil
 	case strings.Contains(command, "log-analytics workspace show"):
 		return []byte("workspace-id\n"), nil

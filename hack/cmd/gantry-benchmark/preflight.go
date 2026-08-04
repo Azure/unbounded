@@ -488,9 +488,7 @@ func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
 
 	for _, entry := range settings.Value {
 		setting := entry.Properties
-	}
 
-	for _, setting := range settings.Value {
 		if !strings.EqualFold(setting.LogAnalyticsDestinationType, "Dedicated") || setting.WorkspaceID == "" {
 			continue
 		}

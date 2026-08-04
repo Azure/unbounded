@@ -12,17 +12,24 @@ import (
 )
 
 type telemetryCommandRunner struct {
-	logAnalytics []byte
-	metrics      []byte
-	commands     []string
+	logAnalytics      []byte
+	acrLogAnalytics   []byte
+	auditLogAnalytics []byte
+	metrics           []byte
+	commands          []string
 }
 
 func (r *telemetryCommandRunner) Run(_ context.Context, _ []byte, name string, args ...string) ([]byte, error) {
 	command := name + " " + strings.Join(args, " ")
 	r.commands = append(r.commands, command)
 
-	if strings.Contains(command, "monitor metrics list") {
+	switch {
+	case strings.Contains(command, "monitor metrics list"):
 		return r.metrics, nil
+	case strings.Contains(command, "ContainerRegistryRepositoryEvents") && r.acrLogAnalytics != nil:
+		return r.acrLogAnalytics, nil
+	case strings.Contains(command, "AKSAuditAdmin") && r.auditLogAnalytics != nil:
+		return r.auditLogAnalytics, nil
 	}
 
 	return r.logAnalytics, nil
@@ -379,5 +386,70 @@ func TestAzureTelemetrySettlementRequiresCompleteStableWindow(t *testing.T) {
 	measurement.Complete = false
 	if tracker.Observe(start.Add(time.Minute), measurement) {
 		t.Fatal("settled with incomplete telemetry")
+	}
+}
+
+func TestCollectAndPersistAzurePhaseWritesLastMeasurementOnTimeout(t *testing.T) {
+	window := telemetryWindow{
+		StartedAt:  time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC),
+		FinishedAt: time.Date(2026, 7, 30, 10, 1, 0, 0, time.UTC),
+	}
+	runner := &telemetryCommandRunner{
+		acrLogAnalytics: logAnalyticsFixture(
+			[]string{"pull_count", "successful_pull_count", "other_repository_event_count", "first_event_at", "last_event_at"},
+			[][]any{{float64(1), float64(1), float64(0), "2026-07-30T10:00:01Z", "2026-07-30T10:00:05Z"}},
+		),
+		auditLogAnalytics: logAnalyticsFixture(
+			[]string{"RequestReceivedTime", "Verb", "Subresource", "Name", "RequestObject"},
+			[][]any{
+				{"2026-07-30T10:00:01Z", "create", "", "job-a-pod", nil},
+				{"2026-07-30T10:00:02Z", "create", "binding", "job-a-pod", nil},
+				{"2026-07-30T10:00:04Z", "patch", "status", "job-a-pod", `{"status":{"containerStatuses":[{"state":{"running":{"startedAt":"2026-07-30T10:00:03Z"}}}]}}`},
+			},
+		),
+		metrics: []byte(`{"value":[{"name":{"value":"PEBytesIn"},"timeseries":[{"data":[{"total":1048576}]}]}]}`),
+	}
+	benchmark := &benchmark{
+		config: benchmarkConfig{
+			AzureTelemetry:               true,
+			ACRResourceID:                "/subscriptions/s/registries/acr",
+			ACRPrivateEndpointResourceID: "/subscriptions/s/privateEndpoints/acr",
+			AKSResourceID:                "/subscriptions/s/managedClusters/aks",
+			LogAnalyticsWorkspaceID:      "workspace-id",
+			Namespace:                    "gantry-benchmark",
+			WorkloadRepository:           "gantry-benchmark-pull",
+			ImageSizeMiB:                 1,
+			TelemetryTimeout:             time.Nanosecond,
+			TelemetryPollInterval:        time.Hour,
+			StateRoot:                    t.TempDir(),
+		},
+		commands: runner,
+	}
+	phase := phaseResult{
+		RunID:             "run-1",
+		Phase:             proxyPhaseBaseline,
+		Image:             "acr.azurecr.io/gantry-benchmark-pull@sha256:abc",
+		Azure:             azurePhaseMeasurement{Window: window},
+		Job:               jobObservation{JobName: "job-a", Pods: []string{"job-a-pod"}, PodNodes: map[string]string{"job-a-pod": "node-a"}},
+		OriginBytes:       42,
+		OriginBytesSource: originBytesAnalyticBaseline,
+	}
+
+	err := benchmark.collectAndPersistAzurePhase(context.Background(), &phase, "baseline.json")
+	if err == nil || !strings.Contains(err.Error(), "did not become complete and stable") {
+		t.Fatalf("error = %v, want telemetry stability timeout", err)
+	}
+
+	persisted, err := benchmark.readPhaseResult(phase.RunID, "baseline.json")
+	if err != nil {
+		t.Fatalf("readPhaseResult: %v", err)
+	}
+
+	if !persisted.Azure.Complete || persisted.Azure.PrivateEndpoint.BytesFromACR != mibibyte {
+		t.Fatalf("persisted Azure measurement = %+v, want last complete observation", persisted.Azure)
+	}
+
+	if persisted.OriginBytes != 42 || persisted.OriginBytesSource != originBytesAnalyticBaseline {
+		t.Fatalf("persisted origin = %d from %q, want unchanged fallback measurement", persisted.OriginBytes, persisted.OriginBytesSource)
 	}
 }
