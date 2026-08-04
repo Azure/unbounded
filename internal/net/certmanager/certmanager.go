@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,6 +68,10 @@ type CertManager struct {
 	certValue   atomic.Value // holds *tls.Certificate
 	caBundle    atomic.Value // holds []byte (PEM-encoded CA cert)
 	hmacKey     atomic.Value // holds []byte (HMAC signing key)
+
+	serviceIPsMu           sync.Mutex
+	lastObservedServiceIPs []string
+	serviceIPsObserved     bool
 }
 
 // NewCertManager creates a new CertManager with the given options, applying
@@ -572,7 +578,7 @@ func (cm *CertManager) serviceIPs(ctx context.Context) ([]net.IP, error) {
 		}
 	}
 
-	if len(ips) > 0 {
+	if cm.serviceIPsChanged(ips) && len(ips) > 0 {
 		names := make([]string, len(ips))
 		for i, ip := range ips {
 			names[i] = ip.String()
@@ -582,6 +588,24 @@ func (cm *CertManager) serviceIPs(ctx context.Context) ([]net.IP, error) {
 	}
 
 	return ips, nil
+}
+
+func (cm *CertManager) serviceIPsChanged(ips []net.IP) bool {
+	current := make([]string, len(ips))
+	for i, ip := range ips {
+		current[i] = ip.String()
+	}
+
+	slices.Sort(current)
+
+	cm.serviceIPsMu.Lock()
+	defer cm.serviceIPsMu.Unlock()
+
+	changed := !cm.serviceIPsObserved || !slices.Equal(cm.lastObservedServiceIPs, current)
+	cm.lastObservedServiceIPs = current
+	cm.serviceIPsObserved = true
+
+	return changed
 }
 
 // validateCertificate checks that the certificate is not expired, not expiring

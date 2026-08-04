@@ -764,6 +764,68 @@ func TestEnsureCertificateRotatesWhenClusterIPChanges(t *testing.T) {
 	}
 }
 
+func TestServiceIPsChanged(t *testing.T) {
+	tests := []struct {
+		name     string
+		observed [][]net.IP
+		want     []bool
+	}{
+		{
+			name: "initial observation and unchanged value",
+			observed: [][]net.IP{
+				{net.ParseIP("10.96.0.100")},
+				{net.ParseIP("10.96.0.100")},
+			},
+			want: []bool{true, false},
+		},
+		{
+			name: "changed value",
+			observed: [][]net.IP{
+				{net.ParseIP("10.96.0.100")},
+				{net.ParseIP("10.96.0.200")},
+			},
+			want: []bool{true, true},
+		},
+		{
+			name: "reordered values",
+			observed: [][]net.IP{
+				{net.ParseIP("10.96.0.100"), net.ParseIP("fd00::100")},
+				{net.ParseIP("fd00::100"), net.ParseIP("10.96.0.100")},
+			},
+			want: []bool{true, false},
+		},
+		{
+			name: "nil and empty are equivalent",
+			observed: [][]net.IP{
+				nil,
+				{},
+			},
+			want: []bool{true, false},
+		},
+		{
+			name: "empty transition is observed",
+			observed: [][]net.IP{
+				{net.ParseIP("10.96.0.100")},
+				nil,
+				{net.ParseIP("10.96.0.100")},
+			},
+			want: []bool{true, true, true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := &CertManager{}
+
+			for i, ips := range tt.observed {
+				if got := cm.serviceIPsChanged(ips); got != tt.want[i] {
+					t.Errorf("observation %d: serviceIPsChanged() = %t, want %t", i, got, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestGetCertificateFunc(t *testing.T) {
 	client := fake.NewClientset()
 	cm := NewCertManager(Options{
