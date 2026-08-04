@@ -301,6 +301,79 @@ func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {
 	t.Fatal("events.k8s.io Event writer RBAC rule not found")
 }
 
+// TestOperatorImageAndComponentRegistryShareRegistry guards against the #574
+// regression where the operator's own image and the component image-registry
+// came from two unrelated defaults that only agreed because the org was literally
+// "azure". The operator resolves component images as
+// <UNBOUNDED_IMAGE_REGISTRY>/<component>:<tag>, so the rendered operator image
+// must be exactly <UNBOUNDED_IMAGE_REGISTRY>/unbounded-operator:<tag>. Rendering
+// with the template's default ImageRegistry (OperatorImage supplied as the
+// make/release path does) asserts the two share a registry and cannot drift.
+func TestOperatorImageAndComponentRegistryShareRegistry(t *testing.T) {
+	t.Parallel()
+
+	const (
+		tag           = "v1.2.3"
+		operatorImage = "ghcr.io/azure/unbounded-operator:" + tag
+	)
+
+	outputDir := t.TempDir()
+	// Omit ImageRegistry so the ConfigMap default is exercised; supply
+	// OperatorImage as the make/release render path does.
+	if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
+		"Namespace":     "unbounded-system",
+		"OperatorImage": operatorImage,
+	}); err != nil {
+		t.Fatalf("render.Render: %v", err)
+	}
+
+	var cm struct {
+		Data map[string]string `yaml:"data"`
+	}
+	readYAML(t, filepath.Join(outputDir, "03-configmap.yaml"), &cm)
+
+	registry := cm.Data["UNBOUNDED_IMAGE_REGISTRY"]
+	if registry == "" {
+		t.Fatal("configmap UNBOUNDED_IMAGE_REGISTRY is empty")
+	}
+
+	var deploy struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Name  string `yaml:"name"`
+						Image string `yaml:"image"`
+					} `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	readYAML(t, filepath.Join(outputDir, "04-deployment.yaml"), &deploy)
+
+	var image string
+
+	for _, c := range deploy.Spec.Template.Spec.Containers {
+		if c.Name == "controller" {
+			image = c.Image
+
+			break
+		}
+	}
+
+	if image == "" {
+		t.Fatal("controller container image not found")
+	}
+
+	// The operator appends "/<component>:<tag>" to the registry, so its own image
+	// must share that exact registry prefix or it would deploy components from a
+	// different registry than itself.
+	want := registry + "/unbounded-operator:" + tag
+	if image != want {
+		t.Fatalf("operator image %q does not match component registry %q (want %q)", image, registry, want)
+	}
+}
+
 func readYAML(t *testing.T, path string, out any) {
 	t.Helper()
 

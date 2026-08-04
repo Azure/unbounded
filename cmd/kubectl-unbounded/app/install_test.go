@@ -265,7 +265,7 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			require.True(t, found)
 			require.Equal(t, map[string]string{
 				"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
-				"UNBOUNDED_IMAGE_REGISTRY":        "ghcr.io",
+				"UNBOUNDED_IMAGE_REGISTRY":        "ghcr.io/azure",
 				"UNBOUNDED_REAP_LEGACY_RESOURCES": tt.wantReaper,
 			}, data)
 
@@ -285,6 +285,65 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			require.Nil(t, rollingUpdate)
 		})
 	}
+}
+
+func TestMigrateLegacyImageRegistry(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		registry string
+		want     string
+	}{
+		{name: "released default bare host", registry: "ghcr.io", want: "ghcr.io/azure"},
+		{name: "already migrated default", registry: "ghcr.io/azure", want: "ghcr.io/azure"},
+		{name: "fork org left untouched", registry: "ghcr.io/myorg", want: "ghcr.io/myorg"},
+		{name: "custom bare host", registry: "registry.corp.internal", want: "registry.corp.internal/azure"},
+		{name: "custom mirror with path untouched", registry: "registry.corp.internal/unbounded", want: "registry.corp.internal/unbounded"},
+		{name: "trailing slash bare host", registry: "ghcr.io/", want: "ghcr.io/azure"},
+		{name: "empty preserved unchanged", registry: "", want: ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := migrateLegacyImageRegistry(tc.registry); got != tc.want {
+				t.Fatalf("migrateLegacyImageRegistry(%q) = %q, want %q", tc.registry, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInstallMigratesPreservedBareImageRegistry asserts that reinstalling onto a
+// cluster whose stored UNBOUNDED_IMAGE_REGISTRY is the pre-#574 bare "ghcr.io"
+// rewrites it to the full-prefix "ghcr.io/azure", so operator-managed components
+// keep resolving to the correct upstream images after upgrade.
+func TestInstallMigratesPreservedBareImageRegistry(t *testing.T) {
+	t.Parallel()
+
+	existing := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      "unbounded-operator-config",
+			"namespace": "unbounded-system",
+		},
+		"data": map[string]any{"UNBOUNDED_IMAGE_REGISTRY": "ghcr.io"},
+	}}
+	cli, captured := newCapturingInstallClient(existing)
+	h := installHandler{
+		namespace:        "unbounded-system",
+		kubeResourcesCli: cli,
+		logger:           discardLogger(),
+	}
+
+	require.NoError(t, h.execute(context.Background()))
+	require.NotNil(t, captured.configMap)
+
+	data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+	require.NoError(t, err)
+	require.Equal(t, "ghcr.io/azure", data["UNBOUNDED_IMAGE_REGISTRY"])
 }
 
 func TestInstallRejectsInvalidLiveReaperConfigBeforeApply(t *testing.T) {

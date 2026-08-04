@@ -288,7 +288,7 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	// override is preserved across reinstalls (like the reaper flag) rather than
 	// being cleared or replaced with the kubeconfig host.
 	endpoint := ""
-	imageRegistry := "ghcr.io"
+	imageRegistry := "ghcr.io/azure"
 	reapLegacyResources := true
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
@@ -307,7 +307,7 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 
 		endpoint = data["UNBOUNDED_API_SERVER_ENDPOINT"]
 		if value := data["UNBOUNDED_IMAGE_REGISTRY"]; value != "" {
-			imageRegistry = value
+			imageRegistry = migrateLegacyImageRegistry(value)
 		}
 
 		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
@@ -335,6 +335,22 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// migrateLegacyImageRegistry upgrades a preserved UNBOUNDED_IMAGE_REGISTRY value
+// from the pre-#574 semantics (where the operator appended a hardcoded /azure/
+// segment) to the current full-prefix semantics. A bare host with no path
+// segment (the released default "ghcr.io", or any custom bare host) gains an
+// "/azure" suffix so it keeps resolving to the same images after upgrade. Values
+// that already carry a path segment are assumed to be current full prefixes and
+// are left untouched, which also makes the rewrite idempotent across reinstalls.
+func migrateLegacyImageRegistry(registry string) string {
+	trimmed := strings.TrimRight(registry, "/")
+	if trimmed == "" || strings.Contains(trimmed, "/") {
+		return registry
+	}
+
+	return trimmed + "/azure"
 }
 
 func (h *installHandler) prepareOperatorRepair(ctx context.Context) error {

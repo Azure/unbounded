@@ -169,7 +169,7 @@ func TestApplyMutatorStampsConfigHash(t *testing.T) {
 	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
 	image := containers[0].(map[string]any)["image"].(string)
 
-	if image != "registry.example.com/azure/machina:v1.2.3" {
+	if image != "registry.example.com/machina:v1.2.3" {
 		t.Fatalf("image = %q", image)
 	}
 }

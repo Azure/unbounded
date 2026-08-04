@@ -69,15 +69,19 @@ Optional flags:
 | `--wait` | `bool` | `true` | Wait for the operator rollout and CRD establishment |
 | `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
 | `--api-server-endpoint` | `string` | auto-discovered | Override the API server endpoint advertised to provisioned machines; by default the operator discovers it from `kube-public/cluster-info`, or the `KUBERNETES_SERVICE_HOST` FQDN on clusters (e.g. AKS) that do not publish cluster-info |
-| `--image-registry` | `string` | `ghcr.io` | Registry prefix used by the operator for version-matched first-party component images |
+| `--image-registry` | `string` | `ghcr.io/azure` | Full image-repository prefix (registry host plus org/namespace) the operator resolves version-matched first-party component images under |
 
 > **Breaking change:** the `--skip-crds` flag has been removed. CRDs are now owned
 > and installed by the operator at startup (`operator.BootstrapCRDs`), so there is
 > nothing for `install` to skip. Automation passing `--skip-crds` must drop it.
 
-`--operator-image` overrides the operator image. `--image-registry` configures
-the registry for components; their image tag always matches the operator's
-compiled version.
+`--operator-image` overrides the operator image. `--image-registry` is the full
+image-repository prefix (registry host plus org/namespace, e.g. `ghcr.io/azure`,
+`ghcr.io/myorg`, or `registry.corp.internal/unbounded`) that components are
+resolved under; their flat repository name and image tag (always the operator's
+compiled version) are appended to it. Reinstalling a cluster whose stored value
+predates this change (a bare host such as `ghcr.io`) migrates it to the
+equivalent `ghcr.io/azure` prefix automatically.
 
 ---
 

@@ -111,7 +111,7 @@ func TestMutateObjectScopesDaemonSetToSite(t *testing.T) {
 
 	for _, field := range []string{"initContainers", "containers"} {
 		containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
-		if got := containers[0].(map[string]any)["image"]; got != "registry.example.com/azure/unbounded-storage-supervisor:v1.2.3" {
+		if got := containers[0].(map[string]any)["image"]; got != "registry.example.com/unbounded-storage-supervisor:v1.2.3" {
 			t.Fatalf("%s image = %q", field, got)
 		}
 	}

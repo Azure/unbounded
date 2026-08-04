@@ -85,7 +85,11 @@ UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
 UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION_TAG)
 UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
-UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= ghcr.io
+# Full image-repository prefix the operator resolves component images under. It
+# derives from CONTAINER_REGISTRY so it cannot drift from the operator's own
+# image: overriding CONTAINER_REGISTRY (as the release workflow does per fork)
+# points components at the same registry/org as the operator.
+UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
