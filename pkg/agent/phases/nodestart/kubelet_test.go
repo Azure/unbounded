@@ -136,6 +136,8 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 	}
 
 	require.NoError(t, ConfigureKubelet(goalState).Do(context.Background()))
+	_, modeWasAddedToOverlay := goalState.Kubelet.Configuration["authorization"].(map[string]any)["mode"]
+	require.False(t, modeWasAddedToOverlay)
 
 	data, err := os.ReadFile(filepath.Join(machineDir, goalstates.KubeletConfigurationPath))
 	require.NoError(t, err)
