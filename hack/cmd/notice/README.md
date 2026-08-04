@@ -1,7 +1,8 @@
 # notice
 
-Generates and verifies the project's `NOTICE` file from the direct dependencies
-declared in `go.mod` and `frontend/package.json`.
+Generates and verifies the project's `NOTICE` file from direct dependencies in
+`go.mod`, `frontend/package.json`, and `cmd/unbounded-storage/Cargo.toml` plus
+the pinned libfabric and OpenSSL source versions in `Makefile`.
 
 ## Usage
 
@@ -42,6 +43,8 @@ hack/cmd/notice/
     gomod/                 # Collector for go.mod direct deps; Go vanity-domain
                            # repo-base heuristics.
     npm/                   # Collector for frontend/package.json direct deps.
+    cargo/                 # Collector for direct non-dev Cargo dependencies.
+    native/                # Collector for Makefile-pinned native dependencies.
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
 
@@ -84,6 +87,14 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   sort by `Dependency`.
 - Do not commit fake `node_modules/`, module-cache, or `site-packages/` trees.
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
+- Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
+  reads license files from the local Cargo registry source cache. Populate it
+  with `cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked`.
+  Development dependencies are excluded; normal, target, build, and optional
+  direct dependencies are included.
+- Native collection is fully local. Its metadata and canonical license links
+  are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
+  `OPENSSL_VERSION` in `Makefile`.
 - License URL forge dispatch (GitHub, GitLab, cs.opensource.google, Bitbucket)
   lives in `license.BuildURL` as a switch on URL prefix. Add a case here when a
   new forge is needed.

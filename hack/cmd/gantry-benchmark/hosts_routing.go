@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 type hostsMode string
@@ -25,8 +26,34 @@ const (
 func renderHosts(state benchmarkState, mode hostsMode) (string, error) {
 	marker := fmt.Sprintf("# Managed by Gantry benchmark %s.", state.RunID)
 
+	registry, err := state.registryForHosts(mode)
+	if err != nil {
+		return "", err
+	}
+
 	switch mode {
 	case hostsModeBaseline:
+		if !state.usesProxy() {
+			// Direct mode has no counting proxy, so the baseline must reach ACR
+			// itself. This file cannot simply be omitted: Gantry's node
+			// configurator owns /etc/containerd/certs.d/_default/hosts.toml and
+			// sends *every* registry to the local mirror, so an absent
+			// ACR-specific file would silently route the baseline through
+			// Gantry and collapse the comparison. A host-specific certs.d
+			// directory takes precedence over _default, so writing an explicit
+			// direct-to-ACR entry is what actually bypasses Gantry.
+			return fmt.Sprintf(`%s
+server = "https://%s"
+
+[host."https://%s"]
+  capabilities = ["pull", "resolve"]
+`, marker, registry, registry), nil
+		}
+
+		if state.ProxyClusterIP == "" {
+			return "", fmt.Errorf("benchmark state has no proxy ClusterIP for baseline routing")
+		}
+
 		return fmt.Sprintf(`%s
 server = "http://%s:5002"
 
@@ -34,8 +61,10 @@ server = "http://%s:5002"
   capabilities = ["pull", "resolve"]
 `, marker, state.ProxyClusterIP, state.ProxyClusterIP), nil
 	case hostsModeGantry:
-		// STRICT mode: local Gantry is the ONLY upstream, with NO `server=`
-		// fall-through. If Gantry returns 5xx (peer exhausted, starting up,
+		// STRICT mode: local Gantry is both the default server and the only host.
+		// Omitting `server` is not fail-closed: containerd derives the image's
+		// registry namespace as the default server and falls through to ACR after
+		// the configured host fails. If Gantry returns 5xx (peer exhausted, starting up,
 		// draining) containerd retries against Gantry rather than pulling the
 		// blob straight from the proxy. This is what attributes the cold-phase
 		// origin load to Gantry's pipeline cleanly: every byte the proxy sees
@@ -45,17 +74,36 @@ server = "http://%s:5002"
 		// merely slow. Mirrors the upstream gantry benchmark methodology
 		// (deploy/demo/hosts.toml.gantry-strict.template).
 		//
-		// With no `server=` line containerd derives ns=<registry-host> from the
-		// certs.d directory name, which matches the upstream's `name` in
-		// gantry-config directly (the ns_alias is only needed for the
-		// server=<proxy> shape).
+		// This rendering is identical in direct mode, where the same
+		// fail-closed property keeps every origin byte attributable to Gantry's
+		// own origin client rather than a containerd-direct pull from ACR.
 		return fmt.Sprintf(`%s
+server = "http://127.0.0.1:5000"
+
 [host."http://127.0.0.1:5000"]
   capabilities = ["pull", "resolve"]
 `, marker), nil
 	default:
 		return "", fmt.Errorf("unsupported hosts mode %q", mode)
 	}
+}
+
+func (s benchmarkState) registryForHosts(mode hostsMode) (string, error) {
+	registry := s.ACRLoginServer
+	if !s.usesProxy() {
+		switch mode {
+		case hostsModeBaseline:
+			registry = s.BaselineACRLoginServer
+		case hostsModeGantry:
+			registry = s.GantryACRLoginServer
+		}
+	}
+
+	if registry == "" {
+		return "", fmt.Errorf("benchmark state has no registry for %s routing", mode)
+	}
+
+	return registry, nil
 }
 
 func (b *benchmark) installHosts(ctx context.Context, state benchmarkState, mode hostsMode) error {
@@ -91,7 +139,12 @@ func (b *benchmark) installHosts(ctx context.Context, state benchmarkState, mode
 		return err
 	}
 
-	if err := b.applyObject(ctx, b.hostsInstallerDaemonSet(state)); err != nil {
+	installer, err := b.hostsInstallerDaemonSet(state, mode)
+	if err != nil {
+		return err
+	}
+
+	if err := b.applyObject(ctx, installer); err != nil {
 		return err
 	}
 
@@ -108,12 +161,17 @@ func (b *benchmark) installHosts(ctx context.Context, state benchmarkState, mode
 	return b.validateBenchmarkDaemonSet(ctx, hostsDaemonSetName)
 }
 
-func (b *benchmark) hostsInstallerDaemonSet(state benchmarkState) map[string]any {
+func (b *benchmark) hostsInstallerDaemonSet(state benchmarkState, mode hostsMode) (map[string]any, error) {
+	registry, err := state.registryForHosts(mode)
+	if err != nil {
+		return nil, err
+	}
+
 	command := `set -eu
 target_dir="/host-certs/${REGISTRY_HOST}"
 target="${target_dir}/hosts.toml"
 active="${target_dir}/.gantry-benchmark-active"
-backup="/host-state/${RUN_ID}"
+backup="/host-state/${RUN_ID}/${REGISTRY_HOST}"
 marker="# Managed by Gantry benchmark ${RUN_ID}."
 first_install=false
 
@@ -189,7 +247,7 @@ exec sleep 2147483647
 		b.config.nodeSelector(),
 		command,
 		map[string]string{
-			"REGISTRY_HOST": state.ACRLoginServer,
+			"REGISTRY_HOST": registry,
 			"RUN_ID":        state.RunID,
 		},
 		[]any{
@@ -198,7 +256,7 @@ exec sleep 2147483647
 		[]any{
 			map[string]any{"name": "config", "configMap": map[string]any{"name": hostsConfigMapName}},
 		},
-	)
+	), nil
 }
 
 func (b *benchmark) restoreHosts(ctx context.Context, state benchmarkState) error {
@@ -212,6 +270,49 @@ func (b *benchmark) restoreHosts(ctx context.Context, state benchmarkState) erro
 		return err
 	}
 
+	registries, err := state.routingRegistries()
+	if err != nil {
+		return err
+	}
+
+	for _, registry := range registries {
+		if err := b.restoreRegistryHosts(ctx, state, registry); err != nil {
+			return err
+		}
+	}
+
+	if _, err := b.commands.Run(
+		ctx,
+		nil,
+		"kubectl", "-n", b.config.Namespace,
+		"delete", "configmap", hostsConfigMapName,
+		"--ignore-not-found=true",
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s benchmarkState) routingRegistries() ([]string, error) {
+	baseline, err := s.registryForHosts(hostsModeBaseline)
+	if err != nil {
+		return nil, err
+	}
+
+	gantry, err := s.registryForHosts(hostsModeGantry)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.EqualFold(baseline, gantry) {
+		return []string{baseline}, nil
+	}
+
+	return []string{baseline, gantry}, nil
+}
+
+func (b *benchmark) restoreRegistryHosts(ctx context.Context, state benchmarkState, registry string) error {
 	name := "gantry-benchmark-hosts-restore"
 	if _, err := b.commands.Run(
 		ctx,
@@ -227,7 +328,7 @@ func (b *benchmark) restoreHosts(ctx context.Context, state benchmarkState) erro
 target_dir="/host-certs/${REGISTRY_HOST}"
 target="${target_dir}/hosts.toml"
 active="${target_dir}/.gantry-benchmark-active"
-backup="/host-state/${RUN_ID}"
+backup="/host-state/${RUN_ID}/${REGISTRY_HOST}"
 marker="# Managed by Gantry benchmark ${RUN_ID}."
 
 if [ ! -e "${backup}/initialized" ]; then
@@ -323,7 +424,7 @@ exec sleep 2147483647
 		b.config.nodeSelector(),
 		command,
 		map[string]string{
-			"REGISTRY_HOST": state.ACRLoginServer,
+			"REGISTRY_HOST": registry,
 			"RUN_ID":        state.RunID,
 		},
 		nil,
@@ -352,16 +453,6 @@ exec sleep 2147483647
 		nil,
 		"kubectl", "-n", b.config.Namespace,
 		"delete", "daemonset", name, "--wait=true",
-	); err != nil {
-		return err
-	}
-
-	if _, err := b.commands.Run(
-		ctx,
-		nil,
-		"kubectl", "-n", b.config.Namespace,
-		"delete", "configmap", hostsConfigMapName,
-		"--ignore-not-found=true",
 	); err != nil {
 		return err
 	}
@@ -466,8 +557,12 @@ func (b *benchmark) validateBenchmarkDaemonSet(ctx context.Context, name string)
 		return fmt.Errorf("decode DaemonSet %s: %w", name, err) //nolint:staticcheck // Kubernetes kind name starts with a capital.
 	}
 
-	if daemonSet.Status.DesiredNumberScheduled != b.config.NodeCount || daemonSet.Status.NumberReady != b.config.NodeCount {
-		return fmt.Errorf("daemonset %s is ready on %d/%d nodes", name, daemonSet.Status.NumberReady, b.config.NodeCount)
+	return validateBenchmarkDaemonSetStatus(daemonSet, name, b.config.NodeCount)
+}
+
+func validateBenchmarkDaemonSetStatus(daemonSet daemonSetStatus, name string, expectedCount int) error {
+	if daemonSet.Status.DesiredNumberScheduled != expectedCount || daemonSet.Status.NumberReady != expectedCount {
+		return fmt.Errorf("daemonset %s is ready on %d/%d nodes", name, daemonSet.Status.NumberReady, expectedCount)
 	}
 
 	return nil

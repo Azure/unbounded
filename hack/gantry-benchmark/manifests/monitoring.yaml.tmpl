@@ -1,0 +1,34 @@
+# Monitoring objects the benchmark installs in every mode. The Gantry PodMonitor
+# stamps gantry_benchmark="true" onto agent samples so benchmark queries cannot
+# collide with an operator's existing Gantry scrape config. Direct mode has no
+# counting proxy but still needs these samples, so they live outside
+# proxy.yaml.tmpl.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gantry-benchmark-agent
+  namespace: {{ .Namespace }}
+  labels:
+    release: {{ .MonitoringLabel }}
+    app.kubernetes.io/part-of: gantry-benchmark
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .GantryNamespace }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+  podTargetLabels:
+    - controller-revision-hash
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 10s
+      metricRelabelings:
+        - action: keep
+          sourceLabels:
+            - __name__
+          regex: gantry_storage_mode_info|p2p_dht_health_score|gantry_peer_serve_bytes_total|gantry_origin_bytes_total|p2p_origin_pull_total|p2p_peer_fetch_total|p2p_origin_pull_success_total|p2p_origin_fallback_total|p2p_in_flight_pulls|gantry_peer_fetch_bytes_total|gantry_mirror_bytes_served_total
+        - action: replace
+          targetLabel: gantry_benchmark
+          replacement: "true"

@@ -136,6 +136,11 @@ type Options struct {
 	// Default 1.
 	PrefetchPullerReplicas int
 
+	// PrefetchPullerFraction overrides PrefetchPullerReplicas when greater
+	// than zero. The resolver selects ceil(eligible candidates * fraction),
+	// with a minimum of one and no cap other than the candidate count.
+	PrefetchPullerFraction float64
+
 	// LocalIntent computes self's PullIntent synchronously, without
 	// the libp2p coord round-trip. When non-nil, the cold-start
 	// orchestrator includes self as a first-class participant in the

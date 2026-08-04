@@ -378,6 +378,14 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked
+
       - name: Verify NOTICE
         run: make notice-check
 

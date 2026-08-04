@@ -157,15 +157,44 @@ func TestCheckNSpawnRuntime(t *testing.T) {
 }
 
 func TestCheckDockerActive(t *testing.T) {
-	deps := defaultHostCheckDeps()
-	deps.outputCmd = outputWith("active\n", nil)
+	testCheckSystemdUnitActive(t, checkDockerActive, dockerServiceUnit)
+}
 
-	results := checkDockerActive(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+func TestCheckContainerdActive(t *testing.T) {
+	testCheckSystemdUnitActive(t, checkContainerdActive, containerdServiceUnit)
+}
+
+func TestCheckKubeletActive(t *testing.T) {
+	testCheckSystemdUnitActive(t, checkKubeletActive, kubeletServiceUnit)
+}
+
+func testCheckSystemdUnitActive(
+	t *testing.T,
+	check func(*slog.Logger, hostCheckDeps) preflight.Checker,
+	wantUnit string,
+) {
+	t.Helper()
+
+	deps := defaultHostCheckDeps()
+	deps.outputCmd = func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
+		assert.Equal(t, "systemctl", name)
+		assert.Equal(t, []string{"is-active", wantUnit}, args)
+
+		return "active\n", nil
+	}
+
+	results := check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Equal(t, wantUnit, results[0].Target)
 
 	deps.outputCmd = outputWith("inactive\n", nil)
-	results = checkDockerActive(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+
+	deps.outputCmd = outputWith("", errors.New("systemd unavailable"))
+	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "could not be determined")
 }
 
 func TestCheckSwapActive(t *testing.T) {

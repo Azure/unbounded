@@ -226,6 +226,125 @@ func TestTunnelMTUFromSpec(t *testing.T) {
 	}
 }
 
+func TestMergeLowestTunnelMTU(t *testing.T) {
+	tunnelMTUs := map[string]int{"pool-a": 1400}
+
+	mergeLowestTunnelMTU(tunnelMTUs, "pool-a", 1450)
+	mergeLowestTunnelMTU(tunnelMTUs, "pool-a", 1280)
+	mergeLowestTunnelMTU(tunnelMTUs, " pool-b ", 1300)
+	mergeLowestTunnelMTU(tunnelMTUs, "", 1200)
+	mergeLowestTunnelMTU(tunnelMTUs, "pool-c", 0)
+
+	if got := tunnelMTUs["pool-a"]; got != 1280 {
+		t.Fatalf("pool-a MTU = %d, want 1280", got)
+	}
+
+	if got := tunnelMTUs["pool-b"]; got != 1300 {
+		t.Fatalf("pool-b MTU = %d, want 1300", got)
+	}
+
+	if _, exists := tunnelMTUs["pool-c"]; exists {
+		t.Fatal("zero MTU should not create a scope")
+	}
+}
+
+func TestMergeGatewayPoolPeeringTunnelMTU(t *testing.T) {
+	mtu := int32(1280)
+	peering := unboundednetv1alpha1.GatewayPoolPeering{
+		Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{
+			GatewayPools: []string{"pool-a", "pool-b"},
+			TunnelMTU:    &mtu,
+		},
+	}
+	tunnelMTUs := map[string]int{"pool-a": 1400, "pool-b": 1200}
+
+	mergeGatewayPoolPeeringTunnelMTU(tunnelMTUs, peering)
+
+	if got := tunnelMTUs["pool-a"]; got != 1280 {
+		t.Fatalf("pool-a MTU = %d, want 1280", got)
+	}
+
+	if got := tunnelMTUs["pool-b"]; got != 1200 {
+		t.Fatalf("pool-b MTU = %d, want existing lower value 1200", got)
+	}
+}
+
+func TestResolveSiteTopologyTunnelMTU(t *testing.T) {
+	siteMTUs := map[string]int{
+		"local":        1450,
+		"remote":       1250,
+		"disconnected": 576,
+	}
+	poolMTUs := map[string]int{
+		"local-pool":  1400,
+		"remote-pool": 1350,
+	}
+
+	sitePeerings := []unboundednetv1alpha1.SitePeering{{
+		Spec: unboundednetv1alpha1.SitePeeringSpec{
+			Sites:     []string{"local", "remote"},
+			TunnelMTU: ptrInt32(1300),
+		},
+	}}
+	assignments := []unboundednetv1alpha1.SiteGatewayPoolAssignment{
+		{
+			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+				Sites:        []string{"local"},
+				GatewayPools: []string{"local-pool"},
+				TunnelMTU:    ptrInt32(1380),
+			},
+		},
+		{
+			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+				Sites:        []string{"remote"},
+				GatewayPools: []string{"remote-pool"},
+			},
+		},
+	}
+	poolPeerings := []unboundednetv1alpha1.GatewayPoolPeering{{
+		Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{
+			GatewayPools: []string{"local-pool", "remote-pool"},
+			TunnelMTU:    ptrInt32(1280),
+		},
+	}}
+
+	if got := resolveSiteTopologyTunnelMTU(
+		"local",
+		siteMTUs,
+		poolMTUs,
+		sitePeerings,
+		assignments,
+		poolPeerings,
+		nil,
+	); got != 1250 {
+		t.Fatalf("local topology MTU = %d, want remote site minimum 1250", got)
+	}
+
+	if got := resolveSiteTopologyTunnelMTU(
+		"disconnected",
+		siteMTUs,
+		poolMTUs,
+		sitePeerings,
+		assignments,
+		poolPeerings,
+		nil,
+	); got != 576 {
+		t.Fatalf("disconnected topology MTU = %d, want 576", got)
+	}
+
+	if got := resolveSiteTopologyTunnelMTU(
+		"local",
+		map[string]int{"local": 1450},
+		map[string]int{"gateway-only": 1200},
+		nil,
+		nil,
+		nil,
+		[]string{"gateway-only"},
+	); got != 1200 {
+		t.Fatalf("gateway pool membership MTU = %d, want 1200", got)
+	}
+}
+
 // TestResolveTunnelMTU tests resolveTunnelMTU.
 func TestResolveTunnelMTU(t *testing.T) {
 	// No overrides -- global wins
@@ -243,6 +362,10 @@ func TestResolveTunnelMTU(t *testing.T) {
 	// Higher CRD value does not override global
 	if got := resolveTunnelMTU(1420, 1500); got != 1420 {
 		t.Fatalf("expected 1420, got %d", got)
+	}
+	// Zero global means automatic/unset, so a CRD value can establish the MTU.
+	if got := resolveTunnelMTU(0, 1420); got != 1420 {
+		t.Fatalf("expected 1420 with automatic global MTU, got %d", got)
 	}
 }
 

@@ -289,7 +289,7 @@ help: ## Show this help
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck"
 	@echo "  gomod                            go mod tidy"
-	@echo "  notice                           Regenerate NOTICE from go.mod and frontend/package.json"
+	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
 	@echo ""
 	@echo "Build:"
@@ -521,7 +521,7 @@ vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifes
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
 
-notice: ## Regenerate NOTICE from go.mod and frontend/package.json
+notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -529,7 +529,7 @@ notice: ## Regenerate NOTICE from go.mod and frontend/package.json
 	fi
 	$(GOCMD) run ./hack/cmd/notice generate --output NOTICE
 
-notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
+notice-check: ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
