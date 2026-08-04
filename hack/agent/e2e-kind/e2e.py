@@ -2585,7 +2585,8 @@ PY
 """)
 
     machine = active_nspawn_machine()
-    rendered = machine_shell(machine, "cat /var/lib/kubelet/config.yaml")
+    machine_root = f"/var/lib/machines/{machine}"
+    rendered = ssh_capture(f"sudo cat {machine_root}/var/lib/kubelet/config.yaml")
     for key, value in node_config.kubelet_configuration.items():
         if isinstance(value, bool):
             rendered_value = str(value).lower()
@@ -2601,9 +2602,9 @@ PY
                 f"full config:\n{rendered}"
             )
 
-    exec_start = machine_shell(machine, "systemctl show kubelet --property=ExecStart --value")
-    if "--config=/var/lib/kubelet/config.yaml" not in exec_start:
-        die(f"kubelet ExecStart does not reference generated config: {exec_start}")
+    service = ssh_capture(f"sudo cat {machine_root}/etc/systemd/system/kubelet.service")
+    if "--config=/var/lib/kubelet/config.yaml" not in service:
+        die(f"kubelet service does not reference generated config: {service}")
 
     log("Kubelet configuration overlay validated")
 
