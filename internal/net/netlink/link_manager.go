@@ -4,11 +4,16 @@
 package netlink
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
 	"k8s.io/klog/v2"
 )
 
@@ -538,6 +543,289 @@ func (lm *LinkManager) EnsureMTU(mtu int) error {
 	return nil
 }
 
+// EnsureBridgePortMTUs sets the MTU on every veth interface enslaved to the
+// managed bridge. Links removed concurrently with pod teardown are ignored.
+func (lm *LinkManager) EnsureBridgePortMTUs(mtu int) error {
+	bridge, err := netlink.LinkByName(lm.ifaceName)
+	if err != nil {
+		return fmt.Errorf("failed to get bridge %s: %w", lm.ifaceName, err)
+	}
+
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("failed to list links for bridge %s: %w", lm.ifaceName, err)
+	}
+
+	var updateErrors []error
+
+	for _, link := range bridgeVethLinks(bridge.Attrs().Index, links) {
+		if link.Attrs().MTU == mtu {
+			continue
+		}
+
+		klog.Infof("Setting MTU on bridge port %s from %d to %d", link.Attrs().Name, link.Attrs().MTU, mtu)
+
+		if err := netlink.LinkSetMTU(link, mtu); err != nil {
+			if errors.Is(err, syscall.ENODEV) || errors.Is(err, syscall.ENOENT) {
+				continue
+			}
+
+			InterfaceOperationErrors.WithLabelValues("set_mtu").Inc()
+
+			updateErrors = append(updateErrors, fmt.Errorf("failed to set MTU on bridge port %s: %w", link.Attrs().Name, err))
+
+			continue
+		}
+
+		InterfaceOperations.WithLabelValues("set_mtu").Inc()
+	}
+
+	return errors.Join(updateErrors...)
+}
+
+// EnsureBridgePodMTUs sets the MTU on the pod-side peer of every veth
+// interface enslaved to the managed bridge.
+func (lm *LinkManager) EnsureBridgePodMTUs(procDir string, mtu int) error {
+	bridge, err := netlink.LinkByName(lm.ifaceName)
+	if err != nil {
+		return fmt.Errorf("failed to get bridge %s: %w", lm.ifaceName, err)
+	}
+
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("failed to list links for bridge %s: %w", lm.ifaceName, err)
+	}
+
+	hostPeers := make(map[int]int)
+
+	for _, link := range bridgeVethLinks(bridge.Attrs().Index, links) {
+		veth, ok := link.(*netlink.Veth)
+		if !ok {
+			continue
+		}
+
+		peerIndex, err := netlink.VethPeerIndex(veth)
+		if err != nil {
+			if isLinkGoneError(err) {
+				continue
+			}
+
+			return fmt.Errorf("get peer index for bridge port %s: %w", link.Attrs().Name, err)
+		}
+
+		hostPeers[link.Attrs().Index] = peerIndex
+	}
+
+	if len(hostPeers) == 0 {
+		return nil
+	}
+
+	netnsPaths, err := processNetworkNamespacePaths(procDir)
+	if err != nil {
+		return err
+	}
+
+	matchedHostPeers := make(map[int]bool, len(hostPeers))
+
+	var updateErrors []error
+
+	for _, nsPath := range netnsPaths {
+		nsHandle, err := netns.GetFromPath(nsPath)
+		if err != nil {
+			if !errors.Is(err, syscall.ENOENT) {
+				klog.V(4).Infof("Failed to open network namespace %s: %v", nsPath, err)
+			}
+
+			continue
+		}
+
+		handle, err := netlink.NewHandleAt(nsHandle)
+		if err != nil {
+			if closeErr := nsHandle.Close(); closeErr != nil {
+				klog.V(4).Infof("Failed to close network namespace %s: %v", nsPath, closeErr)
+			}
+
+			if !errors.Is(err, syscall.ENOENT) {
+				klog.V(4).Infof("Failed to create netlink handle for network namespace %s: %v", nsPath, err)
+			}
+
+			continue
+		}
+
+		nsLinks, listErr := handle.LinkList()
+		if listErr != nil {
+			if !isLinkGoneError(listErr) {
+				klog.V(4).Infof("Failed to list links in network namespace %s: %v", nsPath, listErr)
+			}
+		} else {
+			for _, podLink := range bridgePodVethLinks(hostPeers, nsLinks) {
+				hostIndex := podLink.Attrs().ParentIndex
+				matchedHostPeers[hostIndex] = true
+
+				if podLink.Attrs().MTU == mtu {
+					continue
+				}
+
+				klog.Infof("Setting MTU on pod interface %s in %s from %d to %d",
+					podLink.Attrs().Name, nsPath, podLink.Attrs().MTU, mtu)
+
+				if err := handle.LinkSetMTU(podLink, mtu); err != nil {
+					if isLinkGoneError(err) {
+						continue
+					}
+
+					InterfaceOperationErrors.WithLabelValues("set_mtu").Inc()
+
+					updateErrors = append(updateErrors,
+						fmt.Errorf("failed to set MTU on pod interface %s in %s: %w", podLink.Attrs().Name, nsPath, err))
+
+					continue
+				}
+
+				InterfaceOperations.WithLabelValues("set_mtu").Inc()
+			}
+		}
+
+		handle.Close()
+
+		if err := nsHandle.Close(); err != nil {
+			klog.V(4).Infof("Failed to close network namespace %s: %v", nsPath, err)
+		}
+	}
+
+	for hostIndex := range hostPeers {
+		if matchedHostPeers[hostIndex] {
+			continue
+		}
+
+		link, err := netlink.LinkByIndex(hostIndex)
+		if err != nil {
+			if !isLinkGoneError(err) {
+				klog.V(4).Infof("Failed to recheck bridge port index %d: %v", hostIndex, err)
+			}
+
+			continue
+		}
+
+		if link.Attrs().MasterIndex == bridge.Attrs().Index {
+			updateErrors = append(updateErrors,
+				fmt.Errorf("pod-side peer for bridge port %s was not found through %s", link.Attrs().Name, procDir))
+		}
+	}
+
+	return errors.Join(updateErrors...)
+}
+
+type networkNamespaceID struct {
+	device uint64
+	inode  uint64
+}
+
+func processNetworkNamespacePaths(procDir string) ([]string, error) {
+	entries, err := os.ReadDir(procDir)
+	if err != nil {
+		return nil, fmt.Errorf("read process directory %s: %w", procDir, err)
+	}
+
+	selfID, err := networkNamespaceIDFromPath(filepath.Join(procDir, "self", "ns", "net"))
+	if err != nil {
+		return nil, fmt.Errorf("identify current network namespace: %w", err)
+	}
+
+	seen := map[networkNamespaceID]bool{selfID: true}
+	paths := make([]string, 0)
+
+	for _, entry := range entries {
+		if !isNumeric(entry.Name()) {
+			continue
+		}
+
+		nsPath := filepath.Join(procDir, entry.Name(), "ns", "net")
+
+		id, err := networkNamespaceIDFromPath(nsPath)
+		if err != nil {
+			if errors.Is(err, syscall.ENOENT) {
+				continue
+			}
+
+			klog.V(4).Infof("Failed to identify network namespace %s: %v", nsPath, err)
+
+			continue
+		}
+
+		if seen[id] {
+			continue
+		}
+
+		seen[id] = true
+
+		paths = append(paths, nsPath)
+	}
+
+	return paths, nil
+}
+
+func networkNamespaceIDFromPath(path string) (networkNamespaceID, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return networkNamespaceID{}, err
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return networkNamespaceID{}, fmt.Errorf("unexpected stat type for %s", path)
+	}
+
+	return networkNamespaceID{device: uint64(stat.Dev), inode: stat.Ino}, nil
+}
+
+func isNumeric(value string) bool {
+	if value == "" {
+		return false
+	}
+
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isLinkGoneError(err error) bool {
+	var linkNotFound netlink.LinkNotFoundError
+
+	return errors.As(err, &linkNotFound) ||
+		errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.ENOENT)
+}
+
+func bridgeVethLinks(bridgeIndex int, links []netlink.Link) []netlink.Link {
+	ports := make([]netlink.Link, 0)
+
+	for _, link := range links {
+		if link.Type() == "veth" && link.Attrs().MasterIndex == bridgeIndex {
+			ports = append(ports, link)
+		}
+	}
+
+	return ports
+}
+
+func bridgePodVethLinks(hostPeers map[int]int, links []netlink.Link) []netlink.Link {
+	peers := make([]netlink.Link, 0)
+
+	for _, link := range links {
+		expectedPeerIndex, ok := hostPeers[link.Attrs().ParentIndex]
+		if link.Type() == "veth" && ok && link.Attrs().Index == expectedPeerIndex {
+			peers = append(peers, link)
+		}
+	}
+
+	return peers
+}
+
 // WireGuardMTUOverhead is the number of bytes subtracted from the primary
 // interface MTU to derive the WireGuard tunnel MTU. This accounts for the
 // outer IP header, UDP header, and WireGuard encapsulation overhead.
@@ -573,6 +861,60 @@ func DetectDefaultRouteMTU() int {
 // to direct calls if the cache is nil.
 func DetectDefaultRouteMTUFromCache(cache *NetlinkCache) int {
 	return detectDefaultRouteMTUImpl(cache)
+}
+
+// DetectRouteMTU returns the MTU of the egress link selected for destination.
+// Returns 0 when the route or its link cannot be resolved.
+func DetectRouteMTU(destination net.IP, cache *NetlinkCache) int {
+	mtu, _ := DetectRouteMTUAndInterface(destination, cache)
+	return mtu
+}
+
+// DetectRouteMTUAndInterface returns the selected egress link MTU and interface
+// name for destination. Unlocked RouteGet MTUs are intentionally ignored
+// because Linux may report a transient destination-cache PMTU there; using it
+// as an underlay MTU would subtract tunnel overhead repeatedly after a tunnel
+// MTU change. Administratively locked route MTUs are still enforced.
+func DetectRouteMTUAndInterface(destination net.IP, cache *NetlinkCache) (int, string) {
+	if destination == nil {
+		return 0, ""
+	}
+
+	routes, err := netlink.RouteGet(destination)
+	if err != nil {
+		klog.V(3).Infof("Failed to resolve route MTU for %s: %v", destination, err)
+		return 0, ""
+	}
+
+	mtu := 0
+	ifaceName := ""
+
+	for _, route := range routes {
+		if route.MTULock && route.MTU > 0 && (mtu == 0 || route.MTU < mtu) {
+			mtu = route.MTU
+		}
+
+		if route.LinkIndex == 0 {
+			continue
+		}
+
+		link, linkErr := netlink.LinkByIndex(route.LinkIndex)
+		if linkErr != nil && cache != nil {
+			link, linkErr = cache.LinkByIndex(route.LinkIndex)
+		}
+
+		if linkErr != nil {
+			klog.V(3).Infof("Failed to get route link %d for %s: %v", route.LinkIndex, destination, linkErr)
+			continue
+		}
+
+		ifaceName = link.Attrs().Name
+		if linkMTU := link.Attrs().MTU; linkMTU > 0 && (mtu == 0 || linkMTU < mtu) {
+			mtu = linkMTU
+		}
+	}
+
+	return mtu, ifaceName
 }
 
 func detectDefaultRouteMTUImpl(cache *NetlinkCache) int {

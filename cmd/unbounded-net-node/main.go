@@ -198,7 +198,7 @@ func main() {
 		WireGuardDir:                  "/etc/wireguard",
 		WireGuardPort:                 51820,
 		EnablePolicyRouting:           false,
-		MTU:                           1280, // default WireGuard MTU (IPv6 minimum)
+		MTU:                           0,
 		HealthPort:                    9998,
 		InformerResyncPeriod:          600 * time.Second,
 		StatusPushEnabled:             true,             // Enabled by default
@@ -270,7 +270,7 @@ then annotates the node with the public key.`,
 	flags.StringVar(&cfg.CNIConfDir, "cni-conf-dir", "/etc/cni/net.d", "Directory to write CNI configuration")
 	flags.StringVar(&cfg.CNIConfFile, "cni-conf-file", "10-unbounded.conflist", "Name of the CNI configuration file")
 	flags.StringVar(&cfg.BridgeName, "bridge-name", "cbr0", "Name of the bridge interface")
-	flags.IntVar(&cfg.MTU, "mtu", 1280, "MTU for WireGuard and bridge interfaces (default 1280, the IPv6 minimum)")
+	flags.IntVar(&cfg.MTU, "mtu", 0, "Maximum MTU for tunnel and bridge interfaces (0 automatically derives MTU from each underlay route)")
 
 	// WireGuard configuration flags
 	flags.StringVar(&cfg.WireGuardDir, "wireguard-dir", "/etc/wireguard", "Directory to store WireGuard keys")
@@ -589,9 +589,8 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 		return err
 	}
 
-	// Normalize MTU: treat 0 as 1280 (the IPv6 minimum, safe for all links).
-	if cfg.MTU == 0 {
-		cfg.MTU = 1280
+	if cfg.MTU < 0 {
+		return fmt.Errorf("node MTU must be >= 0")
 	}
 
 	// Apply common config.
@@ -770,17 +769,27 @@ func run(cfg *config) error {
 
 	// Check if this node's site has manageCniPlugin enabled using the informer cache
 	manageCniPlugin := getManageCniPluginFromCRDs(siteInformer, mySiteName)
+	siteTunnelMTU := getSiteTunnelMTUFromCRDs(siteInformer, mySiteName)
+	initialCNIConfigMTU := resolveInitialCNIConfigMTU(cfg.MTU, siteTunnelMTU, unboundednetnetlink.DetectDefaultRouteMTU())
 
 	var nodePodCIDRs []string
+
 	if manageCniPlugin {
 		// Wait for podCIDRs and configure CNI
-		nodePodCIDRs, err = waitForPodCIDRsAndConfigure(ctx, clientset, cfg, &cniConfigured)
+		cniCfg := *cfg
+		cniCfg.MTU = initialCNIConfigMTU
+
+		nodePodCIDRs, err = waitForPodCIDRsAndConfigure(ctx, clientset, &cniCfg, &cniConfigured)
 		if err != nil {
 			if err == context.Canceled {
 				return nil
 			}
 
 			return err
+		}
+
+		if err := ensureCNIBridgeMTUFunc(cfg.BridgeName, initialCNIConfigMTU, netlinkCache, true); err != nil {
+			return fmt.Errorf("reconcile MTU on CNI bridge %s: %w", cfg.BridgeName, err)
 		}
 	} else {
 		klog.Info("manageCniPlugin is false for this site - skipping CNI configuration")
@@ -798,5 +807,5 @@ func run(cfg *config) error {
 	// After CNI is configured (or skipped), watch Site CRD for WireGuard peers
 	// Pass the node's podCIDRs so routes can be configured with preferred source IPs
 	// Also pass the informers so they can be reused (already synced)
-	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, healthState, netlinkCache, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
+	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
 }
