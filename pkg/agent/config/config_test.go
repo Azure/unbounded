@@ -351,13 +351,18 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 
 	copy := original.DeepCopy()
 	require.NotSame(t, original, copy)
-	require.Equal(t, original, copy)
+
+	originalJSON, err := json.Marshal(original)
+	require.NoError(t, err)
+	copyJSON, err := json.Marshal(copy)
+	require.NoError(t, err)
+	require.JSONEq(t, string(originalJSON), string(copyJSON))
 
 	copy.Kubelet.Labels["env"] = "prod"
 	copy.Kubelet.RegisterWithTaints[0] = "dedicated=prod:NoSchedule"
 	copy.Kubelet.Configuration["logging"].(map[string]any)["verbosity"] = 4
-	copy.Kubelet.Configuration["featureGates"].(map[string]bool)["Example"] = false
-	copy.Kubelet.Configuration["allowedUnsafeSysctls"].([]string)[0] = "kernel.shm_rmid_forced"
+	copy.Kubelet.Configuration["featureGates"].(map[string]any)["Example"] = false
+	copy.Kubelet.Configuration["allowedUnsafeSysctls"].([]any)[0] = "kernel.shm_rmid_forced"
 	copy.Kubelet.ImageCredentialProvider.ConfigPath = "/etc/kubernetes/other.yaml"
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
 	copy.AdditionalHostMounts[0].Source = "/opt/other"
@@ -374,7 +379,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	require.True(t, original.Gantry.Disabled)
 }
 
-func TestValidateKubeletConfiguration(t *testing.T) {
+func TestAgentKubeletConfigValidate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -391,23 +396,13 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 				"allowedUnsafeSysctls": []string{"net.ipv4.ip_local_port_range"},
 			},
 		},
-		{name: "agent-owned api version", configuration: map[string]any{"apiVersion": "v1"}, wantErr: "apiVersion is managed"},
-		{name: "agent-owned kind", configuration: map[string]any{"kind": "KubeletConfiguration"}, wantErr: "kind is managed"},
-		{name: "agent-owned cluster DNS", configuration: map[string]any{"clusterDNS": []any{"10.0.0.10"}}, wantErr: "clusterDNS is managed"},
-		{name: "agent-owned runtime endpoint", configuration: map[string]any{"containerRuntimeEndpoint": "unix:///other.sock"}, wantErr: "containerRuntimeEndpoint is managed"},
-		{name: "agent-owned taints", configuration: map[string]any{"registerWithTaints": []any{}}, wantErr: "registerWithTaints is managed"},
-		{name: "agent-owned certificate rotation", configuration: map[string]any{"rotateCertificates": false}, wantErr: "rotateCertificates is managed"},
-		{
-			name: "agent-owned client CA",
-			configuration: map[string]any{
-				"authentication": map[string]any{
-					"x509": map[string]any{"clientCAFile": "/other/ca.crt"},
-				},
-			},
-			wantErr: "clientCAFile is managed",
-		},
-		{name: "authentication is not object", configuration: map[string]any{"authentication": "invalid"}, wantErr: "authentication must be an object"},
-		{name: "x509 is not object", configuration: map[string]any{"authentication": map[string]any{"x509": "invalid"}}, wantErr: "x509 must be an object"},
+		{name: "agent-owned api version", configuration: map[string]any{"apiVersion": "v1"}, wantErr: "apiVersion is not supported"},
+		{name: "agent-owned kind", configuration: map[string]any{"kind": "KubeletConfiguration"}, wantErr: "kind is not supported"},
+		{name: "agent-owned authentication", configuration: map[string]any{"authentication": map[string]any{}}, wantErr: "authentication is not supported"},
+		{name: "agent-owned cluster DNS", configuration: map[string]any{"clusterDNS": []any{"10.0.0.10"}}, wantErr: "clusterDNS is not supported"},
+		{name: "agent-owned runtime endpoint", configuration: map[string]any{"containerRuntimeEndpoint": "unix:///other.sock"}, wantErr: "containerRuntimeEndpoint is not supported"},
+		{name: "agent-owned taints", configuration: map[string]any{"registerWithTaints": []any{}}, wantErr: "registerWithTaints is not supported"},
+		{name: "agent-owned certificate rotation", configuration: map[string]any{"rotateCertificates": false}, wantErr: "rotateCertificates is not supported"},
 		{name: "unsupported nested type", configuration: map[string]any{"logging": make(chan string)}, wantErr: "JSON-compatible values"},
 	}
 
@@ -415,7 +410,7 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := ValidateKubeletConfiguration(tt.configuration)
+			err := (&AgentKubeletConfig{Configuration: tt.configuration}).Validate()
 			if tt.wantErr == "" {
 				require.NoError(t, err)
 				return
@@ -426,7 +421,7 @@ func TestValidateKubeletConfiguration(t *testing.T) {
 	}
 }
 
-func TestValidateImageCredentialProvider(t *testing.T) {
+func TestImageCredentialProviderValidate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -452,7 +447,7 @@ func TestValidateImageCredentialProvider(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := ValidateImageCredentialProvider(tt.provider)
+			err := tt.provider.Validate()
 			if tt.wantErr == "" {
 				require.NoError(t, err)
 				return

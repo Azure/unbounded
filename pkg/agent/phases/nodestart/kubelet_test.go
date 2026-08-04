@@ -128,9 +128,6 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 			Configuration: map[string]any{
 				"maxPods": 250,
 				"logging": map[string]any{"verbosity": 4},
-				"authentication": map[string]any{
-					"webhook": map[string]any{"cacheTTL": "1m"},
-				},
 			},
 		},
 	}
@@ -169,7 +166,6 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 	authentication := got["authentication"].(map[string]any)
 	require.Equal(t, false, authentication["anonymous"].(map[string]any)["enabled"])
 	require.Equal(t, true, authentication["webhook"].(map[string]any)["enabled"])
-	require.Equal(t, "1m", authentication["webhook"].(map[string]any)["cacheTTL"])
 	require.Equal(t, goalstates.KubeletAPIServerCACertPath, authentication["x509"].(map[string]any)["clientCAFile"])
 	require.Equal(t, "Webhook", got["authorization"].(map[string]any)["mode"])
 	require.EqualValues(t, 4, got["logging"].(map[string]any)["verbosity"])

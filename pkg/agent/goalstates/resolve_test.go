@@ -374,7 +374,7 @@ func TestResolveKubelet_InvalidConfigurationRejected(t *testing.T) {
 	}
 
 	_, err := resolveKubelet(cfg)
-	require.ErrorContains(t, err, "clusterDNS is managed")
+	require.ErrorContains(t, err, "clusterDNS is not supported")
 }
 
 func TestResolveKubelet_InvalidImageCredentialProviderRejected(t *testing.T) {

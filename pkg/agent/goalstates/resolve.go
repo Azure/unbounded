@@ -157,18 +157,11 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		}
 	}
 
-	if err := config.ValidateKubeletConfiguration(cfg.Kubelet.Configuration); err != nil {
+	if err := cfg.Kubelet.Validate(); err != nil {
 		return zero, err
 	}
 
-	configuration, err := config.NormalizeKubeletConfiguration(cfg.Kubelet.Configuration)
-	if err != nil {
-		return zero, err
-	}
-
-	if err := config.ValidateImageCredentialProvider(cfg.Kubelet.ImageCredentialProvider); err != nil {
-		return zero, err
-	}
+	configuration := cfg.DeepCopy().Kubelet.Configuration
 
 	// Skip the "must have one" check when both fields are empty: in the
 	// metalman PXE/attestation flow the agent config intentionally ships

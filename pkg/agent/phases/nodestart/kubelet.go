@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -111,7 +112,7 @@ func (c *configureKubelet) ensureKubeletCACert() error {
 func (c *configureKubelet) ensureKubeletConfiguration() error {
 	spec := c.goalState.Kubelet
 	configuration := defaultKubeletConfiguration()
-	mergeKubeletConfiguration(configuration, spec.Configuration)
+	maps.Copy(configuration, spec.Configuration)
 
 	configuration["apiVersion"] = "kubelet.config.k8s.io/v1beta1"
 	configuration["kind"] = "KubeletConfiguration"
@@ -168,20 +169,6 @@ func defaultKubeletConfiguration() map[string]any {
 			"TLS_RSA_WITH_AES_128_GCM_SHA256",
 		},
 		"volumePluginDir": "/etc/kubernetes/volumeplugins",
-	}
-}
-
-func mergeKubeletConfiguration(destination, overlay map[string]any) {
-	for key, overlayValue := range overlay {
-		overlayMap, overlayIsMap := overlayValue.(map[string]any)
-
-		destinationMap, destinationIsMap := destination[key].(map[string]any)
-		if overlayIsMap && destinationIsMap {
-			mergeKubeletConfiguration(destinationMap, overlayMap)
-			continue
-		}
-
-		destination[key] = overlayValue
 	}
 }
 
