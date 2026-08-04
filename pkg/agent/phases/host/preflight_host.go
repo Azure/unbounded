@@ -151,8 +151,12 @@ add rule ip unbounded_localdns_preflight output ip daddr 127.0.0.1 udp dport 53 
 			return preflight.ResultsOK(checkLocalDNSConntrackName, "host conntrack", "iptables-compatible raw-table NOTRACK support is available")
 		}
 
-		if nftFound || failMissing {
+		if failMissing {
 			return preflight.ResultsError(checkLocalDNSConntrackName, "host conntrack", "native nftables or iptables-compatible NOTRACK support is required")
+		}
+
+		if nftFound {
+			return preflight.ResultsWarning(checkLocalDNSConntrackName, "host conntrack", "native nftables lacks NOTRACK support; the iptables-compatible fallback will be installed before LocalDNS setup")
 		}
 
 		return preflight.ResultsWarning(checkLocalDNSConntrackName, "host conntrack", "nftables or iptables will be installed before LocalDNS setup")

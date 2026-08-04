@@ -63,7 +63,12 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 	var resolverLines []string
 
 	for _, line := range strings.Split(string(c.goalState.LocalDNS.OriginalHostResolvConf), "\n") {
-		if line != "" && !strings.HasPrefix(strings.TrimSpace(line), "nameserver ") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "nameserver" {
+			continue
+		}
+
+		if line != "" {
 			resolverLines = append(resolverLines, line)
 		}
 	}
