@@ -111,7 +111,7 @@ audit-derived backoff analysis above.
 | Metric | Baseline | Gantry cold | Reduction |
 | --- | ---: | ---: | ---: |
 | ACR Private Endpoint bytes | 53.369 TB | 219.262 GB | 99.589% |
-| Successful ACR pull events | 1,254 | 5 | 99.601% |
+| Successful ACR pull events | 1254 | 5 | 99.601% |
 | Pod start P50 | 3561.000s | 1064.557s | 70.105% |
 | Pod start P95 | 3953.000s | 1146.557s | 70.995% |
 | Pod start P100 | 5399.000s | 1815.557s | 66.372% |
