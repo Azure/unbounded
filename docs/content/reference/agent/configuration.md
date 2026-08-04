@@ -76,3 +76,8 @@ for command usage, exit behavior, and the current check list.
 | `LocalDNS.CorefileTemplate` | *(optional)* Full replacement Go template for the Corefile. Empty uses the built-in two-listener template. |
 | `Downloads.CoreDNS` | *(optional)* CoreDNS URL, BaseURL, and version override. The offline manifest `versions.coredns` takes precedence when offline artifacts are configured. |
 | `Attest.URL` | *(optional)* Base URL of a metalman serve-pxe instance for TPM attestation. |
+
+LocalDNS requires direct IPv4 nameservers in `/etc/resolv.conf`, or a
+`systemd-resolved` stub backed by direct nameservers in
+`/run/systemd/resolve/resolv.conf`. Other local caching stubs and split-DNS
+routing policies are not supported when LocalDNS is enabled.

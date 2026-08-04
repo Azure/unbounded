@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"text/template"
@@ -17,21 +18,45 @@ import (
 )
 
 const (
-	CoreDNSVersion            = "1.12.3"
-	LocalDNSInterfaceName     = "localdns"
-	LocalDNSCorefilePath      = "/etc/unbounded/localdns/Corefile"
-	LocalDNSUpstreamsPath     = "/etc/unbounded/localdns/node-upstreams"
-	LocalDNSServiceUnit       = "localdns.service"
-	LocalDNSSliceUnit         = "localdns.slice"
-	LocalDNSReadinessPort     = 8181
-	LocalDNSMetricsPort       = 9253
-	LocalDNSRuleComment       = "unbounded-localdns: skip conntrack"
-	LocalDNSNetworkUnit       = "unbounded-localdns-network.service"
-	LocalDNSSupervisorPath    = "/usr/local/libexec/unbounded-localdns-supervisor"
-	LocalDNSCoreDNSBinaryPath = "/usr/local/bin/coredns"
+	CoreDNSVersion             = "1.12.3"
+	LocalDNSInterfaceName      = "localdns"
+	LocalDNSCorefilePath       = "/etc/unbounded/localdns/Corefile"
+	LocalDNSUpstreamsPath      = "/etc/unbounded/localdns/node-upstreams"
+	LocalDNSServiceUnit        = "localdns.service"
+	LocalDNSSliceUnit          = "localdns.slice"
+	LocalDNSReadinessPort      = 8181
+	LocalDNSMetricsPort        = 9253
+	LocalDNSRuleComment        = "unbounded-localdns: skip conntrack"
+	LocalDNSNFTTable           = "unbounded_localdns"
+	LocalDNSNetworkBackendPath = ConfigDir + "/localdns-network-backend"
+	LocalDNSNetworkUnit        = "unbounded-localdns-network.service"
+	LocalDNSSupervisorPath     = "/usr/local/libexec/unbounded-localdns-supervisor"
+	LocalDNSCoreDNSBinaryPath  = "/usr/local/bin/coredns"
 )
 
-var hostResolvConfPath = "/etc/resolv.conf"
+const (
+	hostResolvConfPath            = "/etc/resolv.conf"
+	systemdResolvedResolvConfPath = "/run/systemd/resolve/resolv.conf"
+)
+
+type localDNSResolverDeps struct {
+	readFile        func(string) ([]byte, error)
+	resolvedDomains func() (string, error)
+}
+
+func defaultLocalDNSResolverDeps() localDNSResolverDeps {
+	return localDNSResolverDeps{
+		readFile: os.ReadFile,
+		resolvedDomains: func() (string, error) {
+			output, err := exec.Command("resolvectl", "domain").CombinedOutput()
+			if err != nil {
+				return "", fmt.Errorf("query systemd-resolved routing domains: %w: %s", err, strings.TrimSpace(string(output)))
+			}
+
+			return string(output), nil
+		},
+	}
+}
 
 var baselineLocalDNSPlugins = []string{
 	"bind", "cache", "errors", "forward", "loop", "prometheus", "ready", "whoami",
@@ -77,7 +102,6 @@ const defaultLocalDNSCorefileTemplate = `health-check.localdns.local:53 {
         servfail 0
     }
     loop
-    prometheus {{ .MetricsAddress }}
 }
 `
 
@@ -120,12 +144,7 @@ func resolveLocalDNS(cfg *config.AgentConfig, downloads *DownloadOverrides) (Loc
 	clusterListener := netip.MustParseAddr(valueOrDefault(cfg.LocalDNS.ClusterListenerIP, config.DefaultLocalDNSClusterListenerIP))
 	clusterDNS := netip.MustParseAddr(strings.TrimSpace(cfg.Cluster.ClusterDNS))
 
-	resolvConf, err := os.ReadFile(hostResolvConfPath)
-	if err != nil {
-		return LocalDNS{}, fmt.Errorf("read host resolver configuration: %w", err)
-	}
-
-	upstreams, err := parseLocalDNSUpstreams(resolvConf, nodeListener, clusterListener)
+	resolvConf, upstreams, err := discoverLocalDNSUpstreams(defaultLocalDNSResolverDeps(), nodeListener, clusterListener)
 	if err != nil {
 		return LocalDNS{}, err
 	}
@@ -192,13 +211,47 @@ func resolveLocalDNS(cfg *config.AgentConfig, downloads *DownloadOverrides) (Loc
 	}, nil
 }
 
-func parseLocalDNSUpstreams(resolvConf []byte, listeners ...netip.Addr) ([]netip.Addr, error) {
-	listenerSet := make(map[netip.Addr]struct{}, len(listeners))
-	for _, listener := range listeners {
-		listenerSet[listener] = struct{}{}
+func discoverLocalDNSUpstreams(deps localDNSResolverDeps, listeners ...netip.Addr) ([]byte, []netip.Addr, error) {
+	resolvConf, err := deps.readFile(hostResolvConfPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read host resolver configuration: %w", err)
 	}
 
-	set := map[netip.Addr]struct{}{}
+	nameservers := localDNSNameservers(resolvConf)
+	if !hasLoopbackAddress(nameservers) {
+		upstreams, err := parseLocalDNSUpstreams(resolvConf, listeners...)
+
+		return resolvConf, upstreams, err
+	}
+
+	if !isSystemdResolvedStub(nameservers) {
+		return nil, nil, fmt.Errorf("host resolver uses an unsupported local caching stub; LocalDNS supports direct nameservers or the systemd-resolved stub")
+	}
+
+	domains, err := deps.resolvedDomains()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if hasSystemdResolvedSplitDNS(domains) {
+		return nil, nil, fmt.Errorf("host systemd-resolved configuration uses unsupported split-DNS routing domains")
+	}
+
+	upstreamConf, err := deps.readFile(systemdResolvedResolvConfPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read systemd-resolved upstream configuration: %w", err)
+	}
+
+	upstreams, err := parseLocalDNSUpstreams(upstreamConf, listeners...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("systemd-resolved upstream configuration: %w", err)
+	}
+
+	return resolvConf, upstreams, nil
+}
+
+func localDNSNameservers(resolvConf []byte) []netip.Addr {
+	var addresses []netip.Addr
 
 	for _, line := range strings.Split(string(resolvConf), "\n") {
 		fields := strings.Fields(line)
@@ -207,7 +260,65 @@ func parseLocalDNSUpstreams(resolvConf []byte, listeners ...netip.Addr) ([]netip
 		}
 
 		addr, err := netip.ParseAddr(fields[1])
-		if err != nil || !addr.Is4() || addr.IsUnspecified() || addr.IsMulticast() {
+		if err == nil && addr.Is4() && !addr.IsUnspecified() && !addr.IsMulticast() {
+			addresses = append(addresses, addr)
+		}
+	}
+
+	return addresses
+}
+
+func hasLoopbackAddress(addresses []netip.Addr) bool {
+	for _, address := range addresses {
+		if address.IsLoopback() {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isSystemdResolvedStub(addresses []netip.Addr) bool {
+	if len(addresses) == 0 {
+		return false
+	}
+
+	for _, address := range addresses {
+		if address.String() != "127.0.0.53" && address.String() != "127.0.0.54" {
+			return false
+		}
+	}
+
+	return true
+}
+
+func hasSystemdResolvedSplitDNS(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		_, values, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+
+		for _, domain := range strings.Fields(values) {
+			if domain != "~." {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func parseLocalDNSUpstreams(resolvConf []byte, listeners ...netip.Addr) ([]netip.Addr, error) {
+	listenerSet := make(map[netip.Addr]struct{}, len(listeners))
+	for _, listener := range listeners {
+		listenerSet[listener] = struct{}{}
+	}
+
+	set := map[netip.Addr]struct{}{}
+
+	for _, addr := range localDNSNameservers(resolvConf) {
+		if addr.IsLoopback() {
 			continue
 		}
 
@@ -219,7 +330,7 @@ func parseLocalDNSUpstreams(resolvConf []byte, listeners ...netip.Addr) ([]netip
 	}
 
 	if len(set) == 0 {
-		return nil, fmt.Errorf("host resolver contains no usable IPv4 nameserver")
+		return nil, fmt.Errorf("host resolver contains no usable direct IPv4 nameserver")
 	}
 
 	upstreams := make([]netip.Addr, 0, len(set))
