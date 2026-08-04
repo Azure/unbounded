@@ -23,10 +23,21 @@ logs, and measured peer traffic from Gantry metrics.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1000 nodes - sample 1 | 40 GiB | 47.296 TB | 174.773 GB | 99.630% | 1002 / 4 | 99.601% |
 | 1000 nodes - sample 2 | 40 GiB | 47.566 TB | 174.781 GB | 99.633% | 1008 / 5 | 99.504% |
-| **1000 nodes - cross-region** | **40 GiB** | **53.369 TB** | **219.262 GB** | **99.589%** | **1254 / 5** | **99.601%** |
+| **1000 nodes - UK South ACR** | **40 GiB** | **53.369 TB** | **219.262 GB** | **99.589%** | **1254 / 5** | **99.601%** |
+| **1000 nodes - East US ACR** | **40 GiB** | **47.562 TB** | **182.317 GB** | **99.617%** | **1004 / 4** | **99.602%** |
+| **1000 nodes - Central India ACR** <sup>1</sup> | **40 GiB** | **97.115 TB** | **803.184 GB** | **99.173%** | **2287 / 6** | **99.738%** |
 | 2000 nodes - sample 1 | 40 GiB | 95.285 TB | 243.589 GB | 99.744% | 2060 / 3 | 99.854% |
 | 2000 nodes - sample 2 | 40 GiB | 96.045 TB | 242.070 GB | 99.748% | 2035 / 5 | 99.754% |
 | 2000 nodes - sample 3 | 40 GiB | 97.110 TB | 247.528 GB | 99.745% | 2057 / 3 | 99.854% |
+
+<sup>1</sup> The Central India lifecycle timed out while the final `PEBytesIn`
+CLI response was being decoded, so the runner did not write Azure data into the
+phase JSON. We queried both closed metric windows and exact image digests
+retrospectively: byte values are Private Endpoint `PEBytesIn`, and pull counts
+are successful `ContainerRegistryRepositoryEvents`. One unrelated pull of the
+`gantry` agent image occurred in the Gantry ACR window; it is excluded from the
+six workload-image pulls. This sample is not included in the same-region
+aggregates below.
 
 
 ### Pod Startup latency
@@ -35,16 +46,22 @@ logs, and measured peer traffic from Gantry metrics.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1000 nodes - sample 1 | 40 GiB | 682.725s | 1099.629s | 821.209s | 1171.863s | 1422.461s | 1885.385s | 42.700% slower |
 | 1000 nodes - sample 2 | 40 GiB | 894.597s | 1087.179s | 1065.724s | 1169.448s | 1652.704s | 1885.011s | 9.733% slower |
-| **1000 nodes - cross-region** | **40 GiB** | **3561.000s** | **1064.557s** | **3953.000s** | **1146.557s** | **5399.000s** | **1815.557s** | **70.995% faster** |
+| **1000 nodes - UK South ACR** | **40 GiB** | **3561.000s** | **1064.557s** | **3953.000s** | **1146.557s** | **5399.000s** | **1815.557s** | **70.995% faster** |
+| **1000 nodes - East US ACR** | **40 GiB** | **1401.026s** | **1065.950s** | **1655.894s** | **1144.771s** | **2351.081s** | **1831.832s** | **30.867% faster** |
+| **1000 nodes - Central India ACR** <sup>2</sup> | **40 GiB** | **3184.649s** | **1065.570s** | **4851.649s** | **1155.570s** | **5351.649s** | **1865.570s** | **76.182% faster** |
 | 2000 nodes - sample 1 | 40 GiB | 1180.178s | 1088.163s | 1407.710s | 1172.734s | 2103.281s | 1883.781s | 16.692% faster |
 | 2000 nodes - sample 2 | 40 GiB | 939.834s | 1093.091s | 1141.022s | 1177.821s | 1724.219s | 1856.380s | 3.225% slower |
 | 2000 nodes - sample 3 | 40 GiB | 1241.331s | 1096.589s | 1472.041s | 1184.248s | 2131.053s | 1821.000s | 19.551% faster |
 
 Positive improvement means Gantry started pods faster. The configured gate was
-a maximum Gantry-to-baseline P95 ratio of 3.0, so all five audit-complete runs
-and the cross-region performance sample passed even when an unusually fast
-baseline made Gantry slower. The cross-region row uses retained Kubernetes pod
-status timestamps; the other rows use AKS audit timestamps.
+a maximum Gantry-to-baseline P95 ratio of 3.0, so all six audit-complete runs
+and the cross-region performance-only samples passed even when an unusually
+fast baseline made Gantry slower. The UK South and Central India rows use
+retained Kubernetes pod status timestamps; every other row, including East US,
+uses AKS audit timestamps.
+
+<sup>2</sup> Central India latency uses retained Kubernetes pod status because
+the telemetry timeout occurred before the runner wrote its audit measurement.
 
 #### Latency excluding image-pull backoff
 
@@ -72,11 +89,13 @@ The unfiltered table remains the primary end-to-end result because
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1000 nodes - sample 1 | 40 GiB | 43.566 TB | 158.928 GB | 157 | 153 | 42,597 | 0 |
 | 1000 nodes - sample 2 | 40 GiB | 43.438 TB | 160.002 GB | 159 | 154 | 42,472 | 0 |
+| **1000 nodes - East US ACR** | **40 GiB** | **43.137 TB** | **161.075 GB** | **159** | **155** | **42,179** | **0** |
+| **1000 nodes - Central India ACR** | **40 GiB** | **43.070 TB** | **709.766 GB** | **682** | **662** | **42,129** | **0** |
 | 2000 nodes - sample 1 | 40 GiB | 86.971 TB | 221.210 GB | 213 | 210 | 85,044 | 0 |
 | 2000 nodes - sample 2 | 40 GiB | 86.926 TB | 223.358 GB | 214 | 209 | 85,001 | 0 |
 | 2000 nodes - sample 3 | 40 GiB | 87.227 TB | 226.579 GB | 218 | 215 | 85,294 | 0 |
 
-## Cross-region 1000-node sample
+## UK South cross-region 1000-node sample
 
 We ran a separate 1000-node experiment with AKS and the benchmark operator in
 Canada Central and both private ACRs in UK South. This run used the same fresh
@@ -109,6 +128,61 @@ audit-derived backoff analysis above.
 The performance-only comparison passed every non-audit gate. Private Endpoint
 bytes fell by 99.589%, P95 improved by 70.995%, the baseline recorded no
 Gantry activity, and the Gantry phase recorded no direct-origin fallback.
+
+## Why Central India transferred more origin bytes
+
+Central India increased origin traffic for two independent reasons. The
+baseline retried direct ACR pulls after cross-region network failures, while
+Gantry created more origin seeds because the distant registry made active
+pullers exceed the stale-puller threshold.
+
+### Baseline retry amplification
+
+The 40 GiB workload across 1000 nodes contains 42.950 TB of payload, but the
+Central India baseline Private Endpoint recorded 97.115 TB, or 2.261 times the
+payload. The ACR recorded 2,287 successful image-pull events, or 2.287 pulls per
+node. These two amplification ratios closely agree.
+
+AKS audit logs showed that 932 of 1000 baseline pods entered `ErrImagePull` or
+`ImagePullBackOff`, producing 2,219 error/backoff status events. Representative
+kubelet errors included TCP read timeouts from an AKS node to the Central India
+ACR data endpoint at `10.128.17.12:443`. Containerd retried after those failed
+streams, increasing both successful pull events and bytes crossing the Private
+Endpoint. By comparison, the East US baseline had only four affected pods and
+eight error/backoff events.
+
+### Gantry seed and takeover amplification
+
+Peer delivery volume did not materially change: East US served 43.137 TB to
+peers and Central India served 43.070 TB. Peer fetch hits were similarly stable
+at 42,179 and 42,129, and both runs recorded zero direct-origin fallback. The
+additional Central India traffic therefore came from origin seeding, not failed
+peer distribution.
+
+| Gantry origin measurement | East US | Central India | Ratio |
+| --- | ---: | ---: | ---: |
+| Internal origin bytes | 161.075 GB | 709.766 GB | 4.406x |
+| Completed origin layer pulls | 155 | 662 | 4.271x |
+| Gantry pods completing an origin layer | 147 | 464 | 3.156x |
+
+`prefetch_puller_fraction: 0.02` selects
+`ceil(ready_membership_snapshot * 0.02)` origin pullers for each child digest.
+Direct agent metrics recorded two manifest prefetch batches carrying 1,640
+digest assignments, which is exactly two manifests times 41 children times 20
+pullers. Central India therefore exercised the full configured 20-way fanout.
+
+Slow origin streams also triggered takeover. A 1 GiB layer is considered stale
+after approximately 60 seconds under the current
+`size / 50 MiB/s * 3` threshold. Aggregated direct metrics recorded 37,062 stale
+layer-takeover observations across all 1000 Gantry pods. Once a designated
+puller crossed that threshold, requesters excluded it and allowed another
+HRW-ranked node to seed the same layer. This explains why 662 complete origin
+layer copies were produced even though only 40 unique layer digests existed.
+
+The Central India result is therefore not evidence of peer fallback. It shows
+that the baseline is sensitive to long-distance stream retries and that
+Gantry's fixed 60-second stale threshold plus 2% prefetch fanout can over-seed
+when the origin registry is sufficiently distant.
 
 
 
