@@ -376,6 +376,7 @@ func resolveSiteTopologyTunnelMTU(
 
 	mySiteName = strings.TrimSpace(mySiteName)
 	start := sitePrefix + mySiteName
+
 	queue := make([]string, 0, 1+len(localGatewayPools))
 	if mySiteName != "" && adjacency[start] != nil {
 		queue = append(queue, start)
@@ -383,6 +384,7 @@ func resolveSiteTopologyTunnelMTU(
 
 	for _, poolName := range localGatewayPools {
 		poolName = strings.TrimSpace(poolName)
+
 		scope := poolPrefix + poolName
 		if poolName != "" && adjacency[scope] != nil {
 			queue = append(queue, scope)
@@ -399,6 +401,7 @@ func resolveSiteTopologyTunnelMTU(
 	for len(queue) > 0 {
 		scope := queue[0]
 		queue = queue[1:]
+
 		if visited[scope] {
 			continue
 		}

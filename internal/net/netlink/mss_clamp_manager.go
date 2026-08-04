@@ -63,10 +63,12 @@ func NewMSSClampManager(wgPrefix string) (*MSSClampManager, error) {
 	if ipt6 != nil {
 		if err := m.ensureChain(ipt6, "IPv6"); err != nil {
 			klog.Warningf("Failed to create IPv6 MSS clamp chain: %v", err)
+
 			ipt6 = nil
 			m.ipt6 = nil
 		} else if err := ipt6.ClearChain("mangle", mssClampChain); err != nil {
 			klog.Warningf("Failed to clear stale IPv6 MSS clamp rules: %v", err)
+
 			ipt6 = nil
 			m.ipt6 = nil
 		}

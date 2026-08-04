@@ -770,9 +770,11 @@ func run(cfg *config) error {
 	// Check if this node's site has manageCniPlugin enabled using the informer cache
 	manageCniPlugin := getManageCniPluginFromCRDs(siteInformer, mySiteName)
 	siteTunnelMTU := getSiteTunnelMTUFromCRDs(siteInformer, mySiteName)
+
 	initialCNIConfigMTU := resolveInitialCNIConfigMTU(cfg.MTU, siteTunnelMTU, unboundednetnetlink.DetectDefaultRouteMTU())
 	if manageCniPlugin && initialCNIConfigMTU == 0 {
 		initialCNIConfigMTU = 1280
+
 		klog.Warning("Could not detect an initial route MTU; using safe CNI MTU 1280 until reconciliation resolves the fabric MTU")
 	}
 

@@ -79,6 +79,7 @@ func verifyActiveTunnelMTUs(cfg *config, fabricMTU int, meshPeers []meshPeerInfo
 	}
 
 	wireGuardMesh := false
+
 	for _, peer := range meshPeers {
 		if unboundednetv1alpha1.TunnelProtocol(peer.TunnelProtocol) == unboundednetv1alpha1.TunnelProtocolWireGuard {
 			wireGuardMesh = true
