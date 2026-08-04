@@ -15,12 +15,14 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"unicode"
@@ -168,6 +170,8 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	}
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
+	out.Kubelet.Configuration = DeepCopyKubeletConfiguration(a.Kubelet.Configuration)
+	out.Kubelet.ImageCredentialProvider = a.Kubelet.ImageCredentialProvider.DeepCopy()
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
@@ -209,6 +213,14 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateAdditionalHostMounts(a.AdditionalHostMounts); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateKubeletConfiguration(a.Kubelet.Configuration); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateImageCredentialProvider(a.Kubelet.ImageCredentialProvider); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -338,6 +350,258 @@ type AgentKubeletConfig struct {
 	Auth               KubeletAuthInfo   `json:"Auth"`
 	Labels             map[string]string `json:"Labels"`
 	RegisterWithTaints []string          `json:"RegisterWithTaints"`
+
+	// Configuration is recursively merged over the agent's baseline kubelet
+	// configuration and rendered as a kubelet.config.k8s.io/v1beta1
+	// KubeletConfiguration. apiVersion, kind, clusterDNS,
+	// containerRuntimeEndpoint, registerWithTaints, rotateCertificates, and
+	// authentication.x509.clientCAFile are agent-owned and must not be supplied
+	// here.
+	Configuration map[string]any `json:"Configuration,omitempty"`
+
+	// ImageCredentialProvider configures kubelet's exec image credential
+	// provider paths inside the nspawn machine.
+	ImageCredentialProvider *ImageCredentialProvider `json:"ImageCredentialProvider,omitempty"`
+}
+
+// ImageCredentialProvider holds paths inside the nspawn machine for kubelet's
+// exec image credential provider configuration and binaries. ConfigPath may
+// identify a single configuration file or a directory supported by the
+// installed kubelet version.
+type ImageCredentialProvider struct {
+	ConfigPath string `json:"ConfigPath"`
+	BinDir     string `json:"BinDir"`
+}
+
+// DeepCopy returns a copy of ImageCredentialProvider.
+func (i *ImageCredentialProvider) DeepCopy() *ImageCredentialProvider {
+	if i == nil {
+		return nil
+	}
+
+	out := *i
+
+	return &out
+}
+
+// ValidateKubeletConfiguration validates the JSON-shaped kubelet
+// configuration overlay and rejects fields owned by the agent.
+func ValidateKubeletConfiguration(configuration map[string]any) error {
+	if configuration == nil {
+		return nil
+	}
+
+	normalized, err := NormalizeKubeletConfiguration(configuration)
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+
+	for _, field := range []string{
+		"apiVersion",
+		"kind",
+		"clusterDNS",
+		"containerRuntimeEndpoint",
+		"registerWithTaints",
+		"rotateCertificates",
+	} {
+		if _, ok := normalized[field]; ok {
+			errs = append(errs, fmt.Errorf("Kubelet.Configuration.%s is managed by the agent", field))
+		}
+	}
+
+	if authenticationValue, exists := normalized["authentication"]; exists {
+		authentication, ok := authenticationValue.(map[string]any)
+		if !ok {
+			errs = append(errs, fmt.Errorf("Kubelet.Configuration.authentication must be an object"))
+		} else if x509Value, exists := authentication["x509"]; exists {
+			x509, ok := x509Value.(map[string]any)
+			if !ok {
+				errs = append(errs, fmt.Errorf("Kubelet.Configuration.authentication.x509 must be an object"))
+			} else if _, exists := x509["clientCAFile"]; exists {
+				errs = append(errs, fmt.Errorf("Kubelet.Configuration.authentication.x509.clientCAFile is managed by the agent"))
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// ValidateImageCredentialProvider validates paths that kubelet consumes inside
+// the nspawn machine. The paths are not required to exist in the unpacked
+// rootfs because they may be supplied by nspawn bind mounts at start time.
+func ValidateImageCredentialProvider(provider *ImageCredentialProvider) error {
+	if provider == nil {
+		return nil
+	}
+
+	var errs []error
+	if err := validateMachinePath(provider.ConfigPath); err != nil {
+		errs = append(errs, fmt.Errorf("Kubelet.ImageCredentialProvider.ConfigPath: %w", err))
+	}
+
+	if err := validateMachinePath(provider.BinDir); err != nil {
+		errs = append(errs, fmt.Errorf("Kubelet.ImageCredentialProvider.BinDir: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateMachinePath(path string) error {
+	if path == "" || !filepath.IsAbs(path) {
+		return fmt.Errorf("%q must be an absolute path", path)
+	}
+
+	if strings.IndexFunc(path, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 || strings.ContainsAny(path, "\"\\%$") {
+		return fmt.Errorf("%q contains characters that are unsafe in a systemd argument", path)
+	}
+
+	if cleaned := filepath.Clean(path); cleaned != path {
+		return fmt.Errorf("%q must be a clean absolute path", path)
+	}
+
+	return nil
+}
+
+// NormalizeKubeletConfiguration converts JSON-compatible typed maps and slices
+// into the map[string]any and []any representation produced by encoding/json.
+// Goal-state rendering uses this representation so programmatic consumers and
+// JSON-file consumers have identical merge behavior.
+func NormalizeKubeletConfiguration(value map[string]any) (map[string]any, error) {
+	if value == nil {
+		return nil, nil
+	}
+
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("Kubelet.Configuration must contain only JSON-compatible values: %w", err)
+	}
+
+	if err := validateJSONValue("Kubelet.Configuration", reflect.ValueOf(value)); err != nil {
+		return nil, err
+	}
+
+	var normalized map[string]any
+	if err := json.Unmarshal(data, &normalized); err != nil {
+		return nil, fmt.Errorf("normalize Kubelet.Configuration: %w", err)
+	}
+
+	return normalized, nil
+}
+
+func validateJSONValue(path string, value reflect.Value) error {
+	if !value.IsValid() {
+		return nil
+	}
+
+	if value.Kind() == reflect.Interface {
+		if value.IsNil() {
+			return nil
+		}
+
+		return validateJSONValue(path, value.Elem())
+	}
+
+	switch value.Kind() {
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return nil
+	case reflect.Map:
+		if value.Type().Key().Kind() != reflect.String {
+			return fmt.Errorf("%s contains map with non-string key type %s", path, value.Type().Key())
+		}
+
+		iterator := value.MapRange()
+		for iterator.Next() {
+			key := iterator.Key().String()
+			if err := validateJSONValue(path+"."+key, iterator.Value()); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	case reflect.Slice, reflect.Array:
+		for index := range value.Len() {
+			if err := validateJSONValue(fmt.Sprintf("%s[%d]", path, index), value.Index(index)); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("%s contains unsupported value of type %s", path, value.Type())
+	}
+}
+
+// DeepCopyKubeletConfiguration returns a recursive copy of a JSON-shaped
+// kubelet configuration overlay while preserving typed maps and slices.
+func DeepCopyKubeletConfiguration(value map[string]any) map[string]any {
+	if value == nil {
+		return nil
+	}
+
+	cloned, ok := cloneJSONValue(reflect.ValueOf(value)).Interface().(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	return cloned
+}
+
+func cloneJSONValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+
+		out := reflect.New(value.Type()).Elem()
+		out.Set(cloneJSONValue(value.Elem()))
+
+		return out
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+
+		iterator := value.MapRange()
+		for iterator.Next() {
+			out.SetMapIndex(iterator.Key(), cloneJSONValue(iterator.Value()))
+		}
+
+		return out
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+
+		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for index := range value.Len() {
+			out.Index(index).Set(cloneJSONValue(value.Index(index)))
+		}
+
+		return out
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for index := range value.Len() {
+			out.Index(index).Set(cloneJSONValue(value.Index(index)))
+		}
+
+		return out
+	default:
+		return value
+	}
 }
 
 // KubeletAuthInfo holds the kubelet authentication configuration.

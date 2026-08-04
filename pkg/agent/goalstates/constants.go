@@ -170,6 +170,7 @@ const (
 	ContainerdDefaultHostsPath = ContainerdDefaultHostsDir + "/hosts.toml"
 
 	SystemdUnitKubelet             = "kubelet.service"
+	KubeletConfigurationPath       = "/var/lib/kubelet/config.yaml"
 	KubeletKubeconfigPath          = "/var/lib/kubelet/kubeconfig"
 	KubeletBootstrapKubeconfigPath = "/var/lib/kubelet/bootstrap-kubeconfig"
 	KubeletPKIDir                  = "/etc/kubernetes/pki"

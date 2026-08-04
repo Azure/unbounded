@@ -157,6 +157,19 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		}
 	}
 
+	if err := config.ValidateKubeletConfiguration(cfg.Kubelet.Configuration); err != nil {
+		return zero, err
+	}
+
+	configuration, err := config.NormalizeKubeletConfiguration(cfg.Kubelet.Configuration)
+	if err != nil {
+		return zero, err
+	}
+
+	if err := config.ValidateImageCredentialProvider(cfg.Kubelet.ImageCredentialProvider); err != nil {
+		return zero, err
+	}
+
 	// Skip the "must have one" check when both fields are empty: in the
 	// metalman PXE/attestation flow the agent config intentionally ships
 	// with an empty Kubelet.Auth and the bootstrap token is filled in
@@ -171,15 +184,25 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		}
 	}
 
+	var imageCredentialProvider *ImageCredentialProvider
+	if cfg.Kubelet.ImageCredentialProvider != nil {
+		imageCredentialProvider = &ImageCredentialProvider{
+			ConfigPath: cfg.Kubelet.ImageCredentialProvider.ConfigPath,
+			BinDir:     cfg.Kubelet.ImageCredentialProvider.BinDir,
+		}
+	}
+
 	return Kubelet{
-		KubeletBinPath:     filepath.Join("/"+BinDir, "kubelet"),
-		KubeletAuthInfo:    cfg.Kubelet.Auth,
-		APIServer:          cfg.Kubelet.ApiServer,
-		CACertData:         caCert,
-		ClusterDNS:         cfg.Cluster.ClusterDNS,
-		NodeIP:             nodeIP,
-		NodeLabels:         labels,
-		RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
+		KubeletBinPath:          filepath.Join("/"+BinDir, "kubelet"),
+		KubeletAuthInfo:         cfg.Kubelet.Auth,
+		APIServer:               cfg.Kubelet.ApiServer,
+		CACertData:              caCert,
+		ClusterDNS:              cfg.Cluster.ClusterDNS,
+		NodeIP:                  nodeIP,
+		NodeLabels:              labels,
+		RegisterWithTaints:      cfg.Kubelet.RegisterWithTaints,
+		Configuration:           configuration,
+		ImageCredentialProvider: imageCredentialProvider,
 	}, nil
 }
 

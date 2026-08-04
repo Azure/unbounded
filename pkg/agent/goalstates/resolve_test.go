@@ -332,6 +332,69 @@ func TestResolveKubelet_NodeIP(t *testing.T) {
 	assert.Equal(t, "10.0.0.15,fd00::15", k.NodeIP)
 }
 
+func TestResolveKubelet_ConfigurationAndImageCredentialProvider(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+			Configuration: map[string]any{
+				"logging":              map[string]any{"verbosity": 4},
+				"featureGates":         map[string]bool{"Example": true},
+				"allowedUnsafeSysctls": []string{"net.ipv4.ip_local_port_range"},
+			},
+			ImageCredentialProvider: &config.ImageCredentialProvider{
+				ConfigPath: "/etc/kubernetes/credential-provider.yaml",
+				BinDir:     "/usr/local/lib/kubelet-credential-providers",
+			},
+		},
+	}
+
+	k, err := resolveKubelet(cfg)
+	require.NoError(t, err)
+	require.EqualValues(t, 4, k.Configuration["logging"].(map[string]any)["verbosity"])
+	require.Equal(t, map[string]any{"Example": true}, k.Configuration["featureGates"])
+	require.Equal(t, []any{"net.ipv4.ip_local_port_range"}, k.Configuration["allowedUnsafeSysctls"])
+	k.Configuration["logging"].(map[string]any)["verbosity"] = 6
+	require.Equal(t, 4, cfg.Kubelet.Configuration["logging"].(map[string]any)["verbosity"])
+	require.Equal(t, "/etc/kubernetes/credential-provider.yaml", k.ImageCredentialProvider.ConfigPath)
+	require.Equal(t, "/usr/local/lib/kubelet-credential-providers", k.ImageCredentialProvider.BinDir)
+}
+
+func TestResolveKubelet_InvalidConfigurationRejected(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer:     "https://api.example.com",
+			Configuration: map[string]any{"clusterDNS": []any{"10.0.0.11"}},
+		},
+	}
+
+	_, err := resolveKubelet(cfg)
+	require.ErrorContains(t, err, "clusterDNS is managed")
+}
+
+func TestResolveKubelet_InvalidImageCredentialProviderRejected(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+			ImageCredentialProvider: &config.ImageCredentialProvider{
+				ConfigPath: "relative.yaml",
+				BinDir:     "/usr/bin",
+			},
+		},
+	}
+
+	_, err := resolveKubelet(cfg)
+	require.ErrorContains(t, err, "ConfigPath")
+}
+
 func TestResolveKubelet_InvalidNodeIPRejected(t *testing.T) {
 	cfg := &config.AgentConfig{
 		Cluster: config.AgentClusterConfig{

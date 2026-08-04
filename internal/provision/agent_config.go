@@ -15,16 +15,17 @@ import (
 )
 
 type (
-	AgentConfig           = config.AgentConfig
-	AgentClusterConfig    = config.AgentClusterConfig
-	AgentKubeletConfig    = config.AgentKubeletConfig
-	GantryConfig          = config.GantryConfig
-	KubeletAuthInfo       = config.KubeletAuthInfo
-	CRIConfig             = config.CRIConfig
-	ContainerdConfig      = config.ContainerdConfig
-	RuncConfig            = config.RuncConfig
-	CNIConfig             = config.CNIConfig
-	AgentOfflineArtifacts = config.AgentOfflineArtifacts
+	AgentConfig             = config.AgentConfig
+	AgentClusterConfig      = config.AgentClusterConfig
+	AgentKubeletConfig      = config.AgentKubeletConfig
+	ImageCredentialProvider = config.ImageCredentialProvider
+	GantryConfig            = config.GantryConfig
+	KubeletAuthInfo         = config.KubeletAuthInfo
+	CRIConfig               = config.CRIConfig
+	ContainerdConfig        = config.ContainerdConfig
+	RuncConfig              = config.RuncConfig
+	CNIConfig               = config.CNIConfig
+	AgentOfflineArtifacts   = config.AgentOfflineArtifacts
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
