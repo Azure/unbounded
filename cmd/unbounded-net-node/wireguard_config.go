@@ -11,6 +11,7 @@ import (
 
 	"k8s.io/klog/v2"
 
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 	"github.com/Azure/unbounded/internal/net/routeplan"
 )
@@ -44,13 +45,9 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		detectedMTU = defaultMTU - unboundednetnetlink.WireGuardMTUOverhead
 	}
 
-	// The effective MTU is the lower of the configured value and the detected
-	// maximum. This ensures we never exceed the physical link capacity while
-	// still respecting an operator's deliberate lower setting.
-	tunnelMTU := cfg.MTU
-	if detectedMTU > 0 && detectedMTU < tunnelMTU {
-		tunnelMTU = detectedMTU
-	}
+	tunnelMTU := protocolInterfaceMTU(cfg.MTU, siteTunnelMTUs[mySiteName],
+		detectedMTU+unboundednetnetlink.WireGuardMTUOverhead,
+		string(unboundednetv1alpha1.TunnelProtocolWireGuard), peers, gatewayPeers)
 
 	// Warn if the configured MTU exceeds the detected maximum for this node.
 	if cfg.MTU > 0 && detectedMTU > 0 && cfg.MTU > detectedMTU {
@@ -182,9 +179,12 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		}
 
 		var endpoint string
-		if peeredSites[peer.SiteName] && len(peer.InternalIPs) > 0 {
+
+		if peeredSites[peer.SiteName] {
 			// Same site or directly peered site -- use internal IP as endpoint
-			endpoint = net.JoinHostPort(peer.InternalIPs[0], fmt.Sprintf("%d", peerEndpointPort))
+			if endpointIP := selectUnderlayIP(peer.InternalIPs, cfg.TunnelIPFamily); endpointIP != nil {
+				endpoint = net.JoinHostPort(endpointIP.String(), fmt.Sprintf("%d", peerEndpointPort))
+			}
 		}
 		// Non-peered sites: no endpoint, WireGuard learns it from incoming packets
 
@@ -371,9 +371,13 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			continue
 		}
 
-		// Apply the same tunnel MTU to gateway interfaces
-		if tunnelMTU > 0 {
-			if err := gwLinkManager.EnsureMTU(tunnelMTU); err != nil {
+		gatewayMTU := gwPeer.TunnelMTU
+		if gatewayMTU == 0 {
+			gatewayMTU = tunnelMTU
+		}
+
+		if gatewayMTU > 0 {
+			if err := gwLinkManager.EnsureMTU(gatewayMTU); err != nil {
 				klog.Warningf("Failed to set MTU on %s: %v", gwIfaceName, err)
 			}
 		}
@@ -416,18 +420,24 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			endpointPort = int32(port)
 		}
 
-		if gwPeer.SiteName == mySiteName && len(gwPeer.InternalIPs) > 0 {
+		if gwPeer.SiteName == mySiteName {
 			// Same site -- always use internal IP regardless of pool type
-			endpoint = net.JoinHostPort(gwPeer.InternalIPs[0], fmt.Sprintf("%d", endpointPort))
-			klog.V(3).Infof("Gateway %s is in same site, using internal IP %s:%d", gwPeer.Name, gwPeer.InternalIPs[0], endpointPort)
-		} else if networkPeeredSites[gwPeer.SiteName] && len(gwPeer.InternalIPs) > 0 {
+			if endpointIP := selectUnderlayIP(gwPeer.InternalIPs, cfg.TunnelIPFamily); endpointIP != nil {
+				endpoint = net.JoinHostPort(endpointIP.String(), fmt.Sprintf("%d", endpointPort))
+				klog.V(3).Infof("Gateway %s is in same site, using internal IP %s:%d", gwPeer.Name, endpointIP, endpointPort)
+			}
+		} else if networkPeeredSites[gwPeer.SiteName] {
 			// Different site but network-peered -- use internal IP since sites can reach each other
-			endpoint = net.JoinHostPort(gwPeer.InternalIPs[0], fmt.Sprintf("%d", endpointPort))
-			klog.V(3).Infof("Gateway %s is in peered site (%s), using internal IP %s:%d", gwPeer.Name, gwPeer.SiteName, gwPeer.InternalIPs[0], endpointPort)
-		} else if gwPeer.PoolType == "External" && len(gwPeer.ExternalIPs) > 0 {
+			if endpointIP := selectUnderlayIP(gwPeer.InternalIPs, cfg.TunnelIPFamily); endpointIP != nil {
+				endpoint = net.JoinHostPort(endpointIP.String(), fmt.Sprintf("%d", endpointPort))
+				klog.V(3).Infof("Gateway %s is in peered site (%s), using internal IP %s:%d", gwPeer.Name, gwPeer.SiteName, endpointIP, endpointPort)
+			}
+		} else if gwPeer.PoolType == "External" {
 			// Different site, External pool, not peered -- use public IP
-			endpoint = net.JoinHostPort(gwPeer.ExternalIPs[0], fmt.Sprintf("%d", endpointPort))
-			klog.V(3).Infof("Gateway %s is in different site (%s), external pool, using public IP %s:%d", gwPeer.Name, gwPeer.SiteName, gwPeer.ExternalIPs[0], endpointPort)
+			if endpointIP := gatewayPeerUnderlayIP(gwPeer, mySiteName, networkPeeredSites, cfg.TunnelIPFamily); endpointIP != nil {
+				endpoint = net.JoinHostPort(endpointIP.String(), fmt.Sprintf("%d", endpointPort))
+				klog.V(3).Infof("Gateway %s is in different site (%s), external pool, using public IP %s:%d", gwPeer.Name, gwPeer.SiteName, endpointIP, endpointPort)
+			}
 		} else if gwPeer.PoolType == "Internal" {
 			// Different site, Internal pool -- no endpoint, WireGuard learns it
 			klog.V(3).Infof("Gateway %s is in different site (%s), internal pool, no endpoint (WireGuard learns)", gwPeer.Name, gwPeer.SiteName)

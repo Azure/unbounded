@@ -531,6 +531,14 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/vishvananda/netlink/blob/v1.3.1/LICENSE
+  - dependency: github.com/vishvananda/netns
+    ecosystem: go
+    copyright:
+      - Copyright 2014 Vishvananda Ishaya.
+      - Copyright 2014 Docker, Inc.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/vishvananda/netns/blob/v0.0.5/LICENSE
   - dependency: golang.org/x/crypto
     ecosystem: go
     copyright:
