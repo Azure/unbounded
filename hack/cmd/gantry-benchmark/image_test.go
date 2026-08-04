@@ -4,8 +4,10 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -22,5 +24,102 @@ func TestWriteRandomPayload(t *testing.T) {
 
 	if info.Size() != 1024*1024+17 {
 		t.Fatalf("payload size = %d, want %d", info.Size(), 1024*1024+17)
+	}
+}
+
+type dualACRImageRunner struct {
+	commands []string
+}
+
+func (r *dualACRImageRunner) Run(_ context.Context, _ []byte, name string, args ...string) ([]byte, error) {
+	r.commands = append(r.commands, name+" "+strings.Join(args, " "))
+
+	if name == "podman" && len(args) > 0 && args[0] == "push" {
+		digestPath := ""
+
+		for index, arg := range args {
+			if arg == "--digestfile" && index+1 < len(args) {
+				digestPath = args[index+1]
+			}
+		}
+
+		digest := "sha256:" + strings.Repeat("a", 64)
+		if strings.Contains(args[len(args)-1], "gantry.azurecr.io") {
+			digest = "sha256:" + strings.Repeat("b", 64)
+		}
+
+		if err := os.WriteFile(digestPath, []byte(digest+"\n"), 0o600); err != nil {
+			return nil, err
+		}
+	}
+
+	return nil, nil
+}
+
+func TestBuildDualACRImagesUsesSharedPayloadAndSameImageName(t *testing.T) {
+	runner := &dualACRImageRunner{}
+	benchmark := &benchmark{
+		config: benchmarkConfig{
+			StateRoot:          t.TempDir(),
+			ContainerEngine:    "podman",
+			ImagePlatform:      "linux/amd64",
+			ImageSizeMiB:       2,
+			ImageLayers:        2,
+			WorkloadRepository: "benchmark-pull",
+		},
+		commands: runner,
+	}
+	state := benchmarkState{
+		RunID:                  "run-1",
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+	}
+
+	baseline, gantry, payloadSHA, err := benchmark.buildDualACRImages(context.Background(), state)
+	if err != nil {
+		t.Fatalf("buildDualACRImages: %v", err)
+	}
+
+	if !strings.HasPrefix(baseline, "baseline.azurecr.io/benchmark-pull@sha256:") ||
+		!strings.HasPrefix(gantry, "gantry.azurecr.io/benchmark-pull@sha256:") {
+		t.Fatalf("prepared images = %q and %q", baseline, gantry)
+	}
+
+	if !strings.HasPrefix(payloadSHA, "sha256:") || len(payloadSHA) != len("sha256:")+64 {
+		t.Fatalf("payload SHA = %q", payloadSHA)
+	}
+
+	joinedCommands := strings.Join(runner.commands, "\n")
+	for _, image := range []string{
+		"baseline.azurecr.io/benchmark-pull:run-1",
+		"gantry.azurecr.io/benchmark-pull:run-1",
+	} {
+		if !strings.Contains(joinedCommands, image) {
+			t.Fatalf("commands are missing image %q:\n%s", image, joinedCommands)
+		}
+	}
+
+	buildDirectory := filepath.Join(benchmark.config.StateRoot, state.RunID, "build", "shared-payload")
+
+	baselineDockerfile, err := os.ReadFile(filepath.Join(buildDirectory, "Dockerfile.baseline"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gantryDockerfile, err := os.ReadFile(filepath.Join(buildDirectory, "Dockerfile.gantry_cold"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, dockerfile := range [][]byte{baselineDockerfile, gantryDockerfile} {
+		if !strings.Contains(string(dockerfile), payloadSHA) {
+			t.Fatalf("Dockerfile is missing shared payload SHA:\n%s", dockerfile)
+		}
+	}
+
+	if !strings.Contains(string(baselineDockerfile), "/gantry-benchmark-payload/baseline/") ||
+		!strings.Contains(string(gantryDockerfile), "/gantry-benchmark-payload/gantry-cold/") ||
+		string(baselineDockerfile) == string(gantryDockerfile) {
+		t.Fatalf("phase Dockerfiles do not isolate content cache:\nbaseline:\n%s\nGantry:\n%s", baselineDockerfile, gantryDockerfile)
 	}
 }

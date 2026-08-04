@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	gantryconfig "github.com/Azure/unbounded/internal/gantry/config"
@@ -100,5 +101,27 @@ func TestPatchGantryRegistryRequiresExactlyOneMatch(t *testing.T) {
 				t.Fatal("patchGantryRegistry succeeded")
 			}
 		})
+	}
+}
+
+func TestValidateDirectGantryRegistry(t *testing.T) {
+	raw := []byte(`upstream_registries:
+  - name: gantry.azurecr.io
+    endpoint: https://gantry.azurecr.io
+`)
+
+	if err := validateDirectGantryRegistry(raw, "gantry.azurecr.io"); err != nil {
+		t.Fatalf("validateDirectGantryRegistry: %v", err)
+	}
+}
+
+func TestValidateDirectGantryRegistryRejectsBaselineEndpoint(t *testing.T) {
+	raw := []byte(`upstream_registries:
+  - name: gantry.azurecr.io
+    endpoint: https://baseline.azurecr.io
+`)
+
+	if err := validateDirectGantryRegistry(raw, "gantry.azurecr.io"); err == nil || !strings.Contains(err.Error(), "want") {
+		t.Fatalf("error = %v, want endpoint mismatch", err)
 	}
 }

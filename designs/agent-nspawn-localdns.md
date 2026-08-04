@@ -101,6 +101,7 @@ This provides two integration points:
 - Supporting two simultaneously active nspawn machines that bind the same
   LocalDNS addresses.
 - Supporting IPv6 listeners or upstreams in the initial implementation.
+- Translating host split-DNS or domain-routing policy into CoreDNS configuration.
 - Replacing cluster DNS or changing the cluster DNS deployment.
 
 ## DNS traffic model
@@ -220,9 +221,9 @@ A possible Go shape is:
 
 ```go
 type AgentLocalDNSConfig struct {
-    Enabled           bool   `json:"Enabled"`
-    NodeListenerIP    string `json:"NodeListenerIP,omitempty"`
-    ClusterListenerIP string `json:"ClusterListenerIP,omitempty"`
+    Enabled              bool     `json:"Enabled"`
+    NodeListenerIP       string   `json:"NodeListenerIP,omitempty"`
+    ClusterListenerIP    string   `json:"ClusterListenerIP,omitempty"`
     MetricsAddress       string   `json:"MetricsAddress,omitempty"`
     CPULimitInMilliCores *int     `json:"CPULimitInMilliCores,omitempty"`
     MemoryLimitInMB      *int     `json:"MemoryLimitInMB,omitempty"`
@@ -350,21 +351,35 @@ listener upstream.
 The agent must discover node-listener upstream IPs from the physical host while
 the physical host resolver is still unchanged.
 
-The initial discovery order should be:
+The initial implementation supports two resolver layouts:
 
-1. Use the physical host's effective resolver configuration.
-2. When `/etc/resolv.conf` points to a reachable local stub such as
-   `127.0.0.53`, either use that stub directly or obtain its upstream resolver
-   file through a resolver-backend-specific helper.
-3. Keep only valid IPv4 unicast upstream addresses for the initial
-   implementation.
-4. Reject the configured LocalDNS listener addresses as upstreams.
-5. Reject an empty upstream set.
+1. `/etc/resolv.conf` contains direct upstream addresses. The agent reads those
+   addresses regardless of which host component generated the file.
+2. `/etc/resolv.conf` points to the `systemd-resolved` stub and
+   `/run/systemd/resolve/resolv.conf` contains the direct upstream addresses.
+   The agent reads the upstream resolver file rather than using the stub as a
+   forwarding destination.
 
-Using `127.0.0.53` is valid for the current nspawn networking model because the
-machine shares the host network namespace. Direct upstream addresses are still
-preferable when they can be obtained reliably because they reduce coupling to a
-particular host resolver daemon.
+For either layout, discovery keeps only valid IPv4 unicast addresses, rejects
+loopback addresses and the configured LocalDNS listener addresses, normalizes
+and deduplicates the result, and rejects an empty upstream set.
+
+The `systemd-resolved` layout is supported only when its effective DNS policy
+can be represented as one default upstream set. The agent checks resolved's
+routing-domain state and rejects split-DNS configurations, including per-domain
+or VPN-specific resolver routing, rather than flattening them into one CoreDNS
+`forward .` destination list. Translating split-DNS policy into domain-specific
+CoreDNS server blocks is outside the initial scope.
+
+Other local stubs and resolver layouts are unsupported initially. If
+`/etc/resolv.conf` points to dnsmasq, a NetworkManager caching stub, or another
+local resolver, preflight fails with the detected layout and the supported
+alternatives. The agent does not attempt backend-specific discovery for those
+services.
+
+LocalDNS always forwards directly to the discovered upstreams. It does not send
+queries through `systemd-resolved` or another local caching stub, avoiding
+multiple caching layers and a runtime dependency on the host resolver daemon.
 
 Discovery must not assume Azure DNS or replace a hard-coded Azure DNS address.
 Those are product-specific AgentBaker behaviors.
@@ -476,9 +491,12 @@ health-check.localdns.local:53 {
     }
 
     loop
-    prometheus {{ .MetricsAddress }}
 }
 ```
+
+The `prometheus` directive appears in only one server block because its listener
+is process-wide and its endpoint exports metrics for the complete CoreDNS
+instance, including both DNS server blocks.
 
 The renderer replaces all template fields with validated values. In particular,
 `NodeUpstreamIPsJoined` contains discovered physical host upstreams and
@@ -563,14 +581,20 @@ rules:
 ```
 
 Each rule carries the comment `unbounded-localdns: skip conntrack`. The host
-network oneshot reconciles the exact desired set using the iptables-compatible
-frontend with lock waiting enabled. Reconciliation checks for an exact rule
-before adding it, removes stale agent-owned rules for old listener addresses,
-and never removes unowned rules. It must work with the nftables-backed iptables
-frontend used by supported hosts. The iptables-compatible frontend becomes a
-required host package when LocalDNS is enabled. Missing support is a fatal
-preflight error in offline mode and follows normal host-package remediation in
-online mode.
+network oneshot prefers native nftables. It owns a dedicated IPv4 table with
+`PREROUTING` and `OUTPUT` base chains at raw priority and atomically reconciles
+the complete table to the desired eight `notrack` rules. Dedicated table
+ownership allows stale listener addresses to be removed without inspecting or
+modifying foreign rules.
+
+On a supported host without the native nftables frontend, the reconciler may
+fall back to the iptables-compatible frontend with lock waiting enabled. The
+fallback checks for an exact rule before adding it, removes only stale rules
+with the Unbounded ownership comment, and never removes unowned rules. Backend
+selection and ownership are persisted so cleanup and upgrades remove state from
+the backend that created it. At least one validated backend is required when
+LocalDNS is enabled. Missing support is a fatal preflight error in offline mode
+and follows normal host-package remediation in online mode.
 
 Host boot orders this reconciliation after `nftables-flush.service` and before
 the nspawn machine. Enabled-to-enabled repave keeps the rules. Disable-through-
@@ -1011,9 +1035,9 @@ Add LocalDNS checks near the phases they validate:
 | `localdns-config` | Validate the complete LocalDNS config, apply defaults, and render the Corefile template with discovered runtime values. |
 | `localdns-artifact` | Validate the online artifact or required offline bundle entries for the host architecture and verify required plugins when the selected binary is locally available. |
 | `localdns-interface` | Detect an incompatible existing interface or address ownership conflict. |
-| `localdns-conntrack` | Validate the iptables-compatible frontend, raw table, comment match, and `NOTRACK` target needed for the desired rules. |
+| `localdns-conntrack` | Validate native nftables support for raw-priority `notrack` rules, or the iptables-compatible fallback's raw table, comment match, and `NOTRACK` target. |
 | `localdns-ports` | Detect DNS, readiness, and metrics listener conflicts. |
-| `localdns-upstreams` | Confirm the physical host resolver provides at least one usable node upstream. |
+| `localdns-upstreams` | Confirm the host uses a supported direct or systemd-resolved layout, reject split-DNS policy, and require at least one usable direct node upstream. |
 | `localdns-rootfs` | Confirm LocalDNS files and unit paths can be written into the target rootfs. |
 
 `localdns-config` runs only when LocalDNS is enabled and reports a fatal error
@@ -1021,8 +1045,9 @@ for invalid configuration. It validates listener and cluster DNS IPv4
 addresses, listener uniqueness, metrics address syntax, CPU and memory limits,
 required plugin names, Corefile template size, strict template parsing and
 execution, non-empty rendered output, usable host upstreams, and listener-loop
-rejection. The same normalization and validation functions are used by
-preflight and goal-state
+rejection. The upstream check also rejects unsupported local stubs and resolver
+policies that cannot be represented by one default upstream set. The same
+normalization and validation functions are used by preflight and goal-state
 resolution so a configuration accepted by preflight is interpreted identically
 during bootstrap.
 
@@ -1084,7 +1109,7 @@ differences remain relative to the reviewed AgentBaker implementation.
 | Exporter discovery label | Adds `kubernetes.azure.com/localdns-exporter=enabled`. | Product work if AKS monitoring requires this contract. Generic Unbounded leaves target discovery to the deployment. |
 | Ordinary LocalDNS service restart | The AgentBaker wrapper rediscovers upstreams and regenerates the Corefile whenever the service starts. | The nspawn supervisor restarts CoreDNS with the last rendered Corefile. Upstreams are rediscovered by managed node soft reboot or repave. |
 | Physical host reboot upstream discovery | LocalDNS starts on the host and rediscovers upstreams during boot. | The host network oneshot restores interface and `NOTRACK` state, but the nspawn machine initially uses the last rendered Corefile. A managed node soft reboot or repave refreshes it. |
-| Upstream discovery backend | Reads the systemd-resolved upstream resolver file on the controlled AKS image. | Still an open design choice between using a reachable local stub and resolver-backend-specific direct upstream discovery on customer-managed hosts. |
+| Upstream discovery backend | Reads the systemd-resolved upstream resolver file on the controlled AKS image. | Supports direct nameservers in `/etc/resolv.conf` and the systemd-resolved upstream resolver file when there is no split-DNS policy. Other local stubs and split-DNS layouts fail preflight. |
 | Binary delivery | Extracts CoreDNS from an image cached in the AKS VHD. | Intentionally different but functionally equivalent. Unbounded uses `Downloads.CoreDNS` or the complete offline bundle with checksum and plugin verification. |
 
 The physical-host DNS scope and restart-time upstream discovery differences are
@@ -1108,12 +1133,19 @@ Consumers that already replace `Cluster.ClusterDNS` with another node-local
 listener should not enable this feature without migrating that integration to
 the new LocalDNS goal state.
 
+Enabling LocalDNS also requires a supported host resolver layout. Hosts that use
+an unsupported local caching stub or split-DNS routing continue to work with
+LocalDNS disabled, but LocalDNS preflight rejects the configuration.
+
 ## Test strategy
 
 ### Unit tests
 
 - Config defaults and validation.
-- Host upstream discovery and listener-loop rejection.
+- Host upstream discovery from direct `/etc/resolv.conf` nameservers and the
+  systemd-resolved upstream resolver file.
+- Rejection of empty upstreams, listener loops, unsupported local stubs, and
+  systemd-resolved split-DNS policy.
 - Corefile rendering for IPv4 and multiple node upstreams.
 - Upstream normalization and rediscovery during managed node soft reboot and
   repave.
@@ -1121,8 +1153,9 @@ the new LocalDNS goal state.
 - Kubelet cluster DNS selection with LocalDNS enabled and disabled.
 - Interface reconciliation for absent, matching, incomplete, and conflicting
   state.
-- Exact `NOTRACK` rule generation, idempotent reconciliation, stale owned-rule
-  removal, foreign-rule preservation, and iptables-nft compatibility.
+- Exact `NOTRACK` rule generation, idempotent native nftables reconciliation,
+  stale owned-rule removal, foreign-rule preservation, backend migration, and
+  iptables-compatible fallback.
 - Online `Downloads.CoreDNS` source and version resolution and checksum
   verification.
 - Offline `versions.coredns` precedence, conditional bundle requirements, and
@@ -1211,8 +1244,3 @@ The native CoreDNS endpoint provides the DNS, cache, forwarding, process, and
 runtime metrics needed for the initial feature. A second exporter and port are
 not justified without a compatibility requirement for AgentBaker-specific
 metric names.
-
-## Open question
-
-- Should node upstream discovery use a local stub such as `127.0.0.53` when
-  present, or require resolver-backend-specific discovery of direct upstreams?

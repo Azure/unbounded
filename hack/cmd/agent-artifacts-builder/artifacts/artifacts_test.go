@@ -7,9 +7,12 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -19,6 +22,29 @@ import (
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 )
+
+func TestDownloadToFileUsesArtifactSourceRetry(t *testing.T) {
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+
+			return
+		}
+
+		_, _ = w.Write([]byte("artifact-data"))
+	}))
+	defer server.Close()
+
+	dest := filepath.Join(t.TempDir(), "artifact")
+	require.NoError(t, downloadToFile(t.Context(), server.URL, dest))
+	require.EqualValues(t, 2, attempts.Load())
+
+	got, err := os.ReadFile(dest)
+	require.NoError(t, err)
+	require.Equal(t, "artifact-data", string(got))
+}
 
 func TestNewPlan(t *testing.T) {
 	plan, err := NewPlan(Options{

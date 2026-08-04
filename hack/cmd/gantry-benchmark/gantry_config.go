@@ -6,11 +6,40 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	gantryconfig "github.com/Azure/unbounded/internal/gantry/config"
 )
+
+func validateDirectGantryRegistry(raw []byte, registryName string) error {
+	config := gantryconfig.NewDefault()
+	if err := config.LoadYAML(bytes.NewReader(raw)); err != nil {
+		return fmt.Errorf("load Gantry config: %w", err)
+	}
+
+	matches := 0
+	wantEndpoint := "https://" + registryName
+
+	for _, registry := range config.UpstreamRegistries {
+		if registry.Name != registryName {
+			continue
+		}
+
+		matches++
+
+		if strings.TrimSuffix(registry.Endpoint, "/") != wantEndpoint {
+			return fmt.Errorf("gantry registry %q endpoint is %q, want %q", registryName, registry.Endpoint, wantEndpoint)
+		}
+	}
+
+	if matches != 1 {
+		return fmt.Errorf("gantry config has %d upstream_registries entries named %q, want exactly 1", matches, registryName)
+	}
+
+	return nil
+}
 
 func patchGantryRegistry(raw []byte, registryName, endpoint, namespaceAlias string) ([]byte, error) {
 	if registryName == "" {

@@ -195,7 +195,7 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 		dhtOpts = append(dhtOpts, dht.ProtocolPrefix(protocol.ID(opts.ProtocolPrefix)))
 	}
 
-	d, err := dht.New(ctx, h, dhtOpts...)
+	d, err := dht.New(h, dhtOpts...)
 	if err != nil {
 		_ = h.Close() //nolint:errcheck // best-effort close
 		return nil, fmt.Errorf("discovery: dht new: %w", err)

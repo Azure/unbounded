@@ -14,13 +14,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/google/renameio/v2"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -35,6 +33,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -533,38 +532,12 @@ func downloadArtifact(ctx context.Context, log *slog.Logger, rootDir string, art
 }
 
 func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-
-	client := &http.Client{Timeout: 10 * time.Minute}
-
-	resp, err := client.Do(req)
+	source, err := artifactsource.Parse(sourceURL)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close() //nolint:errcheck // best effort close
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("unexpected status %s", resp.Status)
-	}
-
-	out, err := renameio.NewPendingFile(dest, renameio.WithPermissions(0o644))
-	if err != nil {
-		return err
-	}
-	defer out.Cleanup() //nolint:errcheck // pending file cleanup
-
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return err
-	}
-
-	if err := out.CloseAtomicallyReplace(); err != nil {
-		return err
-	}
-
-	return nil
+	return source.DownloadToLocalFile(ctx, dest, 0o644)
 }
 
 func downloadTarGzFile(ctx context.Context, sourceURL, wanted, dest string) error {

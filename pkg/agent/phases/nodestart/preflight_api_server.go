@@ -29,8 +29,16 @@ type apiServerReachableChecker struct {
 
 // Preflight returns the standard node-start checks that can run before the
 // nspawn machine starts.
-func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
+func Preflight(log *slog.Logger, cfg config.AgentConfig, goalState *goalstates.MachineGoalState) []preflight.Checker {
 	return []preflight.Checker{
+		// TODO: Consider moving the kubelet bind address to the kubelet goal state.
+		CheckBindAddress(log, checkKubeletBindAddressName, kubeletBindAddress, "kubelet bind address"),
+		CheckBindAddress(
+			log,
+			checkContainerdMetricsBindAddressName,
+			goalState.NodeStart.Containerd.MetricsAddress,
+			"containerd metrics bind address",
+		),
 		CheckAPIServerReachable(log, cfg),
 	}
 }
