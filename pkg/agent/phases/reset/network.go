@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -68,6 +69,14 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 		t.log.Debug("LocalDNS network unit was not active", "error", err)
 	}
 
+	if _, err := executil.OutputCmd(ctx, t.log, "nft", "list", "table", "ip", goalstates.LocalDNSNFTTable); err == nil {
+		if err := executil.RunCmd(ctx, t.log, func(ctx context.Context) *exec.Cmd {
+			return exec.CommandContext(ctx, "nft")
+		}, "delete", "table", "ip", goalstates.LocalDNSNFTTable); err != nil {
+			return fmt.Errorf("remove LocalDNS nftables table: %w", err)
+		}
+	}
+
 	for _, chain := range []string{"OUTPUT", "PREROUTING"} {
 		output, err := executil.OutputCmd(ctx, t.log, "iptables", "-w", "-t", "raw", "-S", chain)
 		if err != nil {
@@ -113,6 +122,7 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 
 	for _, path := range []string{
 		filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit),
+		goalstates.LocalDNSNetworkBackendPath,
 		"/usr/local/libexec/unbounded-localdns-network",
 	} {
 		removeFileIfExists(t.log, path)

@@ -14,11 +14,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/renameio/v2"
 	specs "github.com/opencontainers/image-spec/specs-go"
