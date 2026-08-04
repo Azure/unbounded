@@ -20,13 +20,11 @@ import (
 // - systemd-container: provides systemd-nspawn for running containers.
 // - curl: used for downloading resources.
 // - nftables: provides nft, used by nftables-flush.service and LocalDNS rules.
-// - iptables: provides the LocalDNS conntrack-rule fallback.
 // - util-linux: provides mountpoint for private bpffs cleanup.
 var debianRequiredPackages = []string{
 	"systemd-container",
 	"curl",
 	"nftables",
-	"iptables",
 	"util-linux",
 }
 
@@ -35,7 +33,6 @@ var rpmRequiredPackages = []string{
 	"systemd-container",
 	"curl",
 	"nftables",
-	"iptables",
 	"util-linux",
 }
 

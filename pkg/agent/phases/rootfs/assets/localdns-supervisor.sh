@@ -21,6 +21,7 @@ dns_health() {
     local address=$1
     timeout 3 bash -c '
         exec 3<>/dev/tcp/$1/53
+        # Send a length-prefixed TCP DNS A query for health-check.localdns.local.
         printf "\\x00\\x2d\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x0chealth-check\\x08localdns\\x05local\\x00\\x00\\x01\\x00\\x01" >&3
         read -r -a response < <(dd bs=1 count=14 <&3 2>/dev/null | od -An -tu1)
         ((${#response[@]} == 14))

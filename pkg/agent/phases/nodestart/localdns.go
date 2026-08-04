@@ -7,7 +7,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
@@ -53,10 +55,15 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 		return fmt.Errorf("write LocalDNS environment: %w", err)
 	}
 
-	cpuQuota := float64(c.goalState.LocalDNS.CPULimitInMilliCores) / 10
+	var slice bytes.Buffer
+	if err := assetsTemplate.ExecuteTemplate(&slice, "localdns.slice", map[string]any{
+		"CPUQuota":  float64(c.goalState.LocalDNS.CPULimitInMilliCores) / 10,
+		"MemoryMax": c.goalState.LocalDNS.MemoryLimitInMB,
+	}); err != nil {
+		return fmt.Errorf("render LocalDNS slice: %w", err)
+	}
 
-	slice := fmt.Sprintf("[Unit]\nDescription=Unbounded LocalDNS resource limits\n\n[Slice]\nCPUQuota=%g%%\nMemoryMax=%dM\n", cpuQuota, c.goalState.LocalDNS.MemoryLimitInMB)
-	if err := utilio.WriteFile(filepath.Join(c.goalState.MachineDir, "etc/systemd/system", goalstates.LocalDNSSliceUnit), []byte(slice), 0o644); err != nil {
+	if err := utilio.WriteFile(filepath.Join(c.goalState.MachineDir, "etc/systemd/system", goalstates.LocalDNSSliceUnit), slice.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS slice: %w", err)
 	}
 
@@ -171,18 +178,15 @@ func (w *waitLocalDNS) Do(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	transport := &http.Transport{Proxy: nil}
+	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
+	addresses := []string{w.goalState.LocalDNS.NodeListenerIP.String(), w.goalState.LocalDNS.ClusterListenerIP.String()}
+
 	for {
-		ready := true
-
-		for _, address := range []string{w.goalState.LocalDNS.NodeListenerIP.String(), w.goalState.LocalDNS.ClusterListenerIP.String()} {
-			if err := executil.RunCmd(ctx, w.log, executil.Curl(), "--silent", "--fail", "--noproxy", "*", "--max-time", "3", fmt.Sprintf("http://%s:8181/ready", address)); err != nil {
-				ready = false
-				break
-			}
-		}
-
-		if ready {
+		if err := localDNSReady(ctx, client, addresses); err == nil {
 			return nil
+		} else {
+			w.log.Debug("LocalDNS readiness check failed", "error", err)
 		}
 
 		select {
@@ -193,4 +197,37 @@ func (w *waitLocalDNS) Do(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func localDNSReady(ctx context.Context, client *http.Client, addresses []string) error {
+	for _, address := range addresses {
+		url := fmt.Sprintf("http://%s:%d/ready", address, goalstates.LocalDNSReadinessPort)
+
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return fmt.Errorf("create readiness request for %s: %w", address, err)
+		}
+
+		response, err := client.Do(request)
+		if err != nil {
+			return fmt.Errorf("query readiness endpoint for %s: %w", address, err)
+		}
+
+		_, copyErr := io.Copy(io.Discard, response.Body)
+		closeErr := response.Body.Close()
+
+		if copyErr != nil {
+			return fmt.Errorf("read readiness response for %s: %w", address, copyErr)
+		}
+
+		if closeErr != nil {
+			return fmt.Errorf("close readiness response for %s: %w", address, closeErr)
+		}
+
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return fmt.Errorf("readiness endpoint for %s returned %s", address, response.Status)
+		}
+	}
+
+	return nil
 }

@@ -58,8 +58,11 @@ func (c *AgentLocalDNSConfig) DeepCopy() *AgentLocalDNSConfig {
 	return &out
 }
 
-// Validate checks LocalDNS fields that do not require host discovery.
-func (c *AgentLocalDNSConfig) Validate(clusterDNS, nodeIP string) error {
+// validateLocalDNS checks LocalDNS fields that do not require host discovery.
+// Keeping this on AgentConfig ensures cross-field validation has access to the
+// complete configuration as LocalDNS gains additional integration points.
+func (a *AgentConfig) validateLocalDNS() error {
+	c := a.LocalDNS
 	if c == nil || !c.Enabled {
 		return nil
 	}
@@ -76,7 +79,7 @@ func (c *AgentLocalDNSConfig) Validate(clusterDNS, nodeIP string) error {
 		errs = append(errs, fmt.Errorf("LocalDNS.ClusterListenerIP: %w", err))
 	}
 
-	clusterDNSAddr, err := parseLocalDNSIPv4(clusterDNS)
+	clusterDNSAddr, err := parseLocalDNSIPv4(a.Cluster.ClusterDNS)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("Cluster.ClusterDNS for LocalDNS: %w", err))
 	}
@@ -89,7 +92,7 @@ func (c *AgentLocalDNSConfig) Validate(clusterDNS, nodeIP string) error {
 		errs = append(errs, fmt.Errorf("Cluster.ClusterDNS must be distinct from LocalDNS listeners"))
 	}
 
-	if _, err := resolveLocalDNSMetricsAddress(c.MetricsAddress, nodeIP); err != nil {
+	if _, err := resolveLocalDNSMetricsAddress(c.MetricsAddress, a.Kubelet.NodeIP); err != nil {
 		errs = append(errs, fmt.Errorf("LocalDNS.MetricsAddress: %w", err))
 	}
 
@@ -118,6 +121,9 @@ func (c *AgentLocalDNSConfig) Validate(clusterDNS, nodeIP string) error {
 	}
 
 	if c.CorefileTemplate != "" {
+		// This is an Unbounded input-safety limit rather than an AgentBaker
+		// compatibility requirement. It bounds template parsing and the config
+		// carried through goal state while leaving ample room for custom policy.
 		if len(c.CorefileTemplate) > 256*1024 {
 			errs = append(errs, fmt.Errorf("LocalDNS.CorefileTemplate exceeds 256 KiB"))
 		} else if _, err := template.New("localdns-corefile").Option("missingkey=error").Parse(c.CorefileTemplate); err != nil {

@@ -5,6 +5,7 @@ package goalstates
 
 import (
 	"bytes"
+	_ "embed"
 	"fmt"
 	"net"
 	"net/netip"
@@ -18,20 +19,19 @@ import (
 )
 
 const (
-	CoreDNSVersion             = "1.12.3"
-	LocalDNSInterfaceName      = "localdns"
-	LocalDNSCorefilePath       = "/etc/unbounded/localdns/Corefile"
-	LocalDNSUpstreamsPath      = "/etc/unbounded/localdns/node-upstreams"
-	LocalDNSServiceUnit        = "localdns.service"
-	LocalDNSSliceUnit          = "localdns.slice"
-	LocalDNSReadinessPort      = 8181
-	LocalDNSMetricsPort        = 9253
-	LocalDNSRuleComment        = "unbounded-localdns: skip conntrack"
-	LocalDNSNFTTable           = "unbounded_localdns"
-	LocalDNSNetworkBackendPath = ConfigDir + "/localdns-network-backend"
-	LocalDNSNetworkUnit        = "unbounded-localdns-network.service"
-	LocalDNSSupervisorPath     = "/usr/local/libexec/unbounded-localdns-supervisor"
-	LocalDNSCoreDNSBinaryPath  = "/usr/local/bin/coredns"
+	CoreDNSVersion            = "1.12.3"
+	LocalDNSInterfaceName     = "localdns"
+	LocalDNSCorefilePath      = "/etc/unbounded/localdns/Corefile"
+	LocalDNSUpstreamsPath     = "/etc/unbounded/localdns/node-upstreams"
+	LocalDNSServiceUnit       = "localdns.service"
+	LocalDNSSliceUnit         = "localdns.slice"
+	LocalDNSReadinessPort     = 8181
+	LocalDNSMetricsPort       = 9253
+	LocalDNSRuleComment       = "unbounded-localdns: skip conntrack"
+	LocalDNSNFTTable          = "unbounded_localdns"
+	LocalDNSNetworkUnit       = "unbounded-localdns-network.service"
+	LocalDNSSupervisorPath    = "/usr/local/libexec/unbounded-localdns-supervisor"
+	LocalDNSCoreDNSBinaryPath = "/usr/local/bin/coredns"
 )
 
 const (
@@ -62,48 +62,8 @@ var baselineLocalDNSPlugins = []string{
 	"bind", "cache", "errors", "forward", "loop", "prometheus", "ready", "whoami",
 }
 
-const defaultLocalDNSCorefileTemplate = `health-check.localdns.local:53 {
-    bind {{ .NodeListenerIP }} {{ .ClusterListenerIP }}
-    whoami
-}
-
-.:53 {
-    errors
-    bind {{ .NodeListenerIP }}
-    forward . {{ .NodeUpstreamIPsJoined }} {
-        force_tcp
-        policy sequential
-        max_concurrent 1000
-    }
-    ready {{ .NodeListenerIP }}:8181
-    cache 30 {
-        success 9984
-        denial 9984
-        serve_stale 3600s verify
-        servfail 0
-    }
-    loop
-    prometheus {{ .MetricsAddress }}
-}
-
-.:53 {
-    errors
-    bind {{ .ClusterListenerIP }}
-    forward . {{ .ClusterDNSServiceIP }} {
-        force_tcp
-        policy sequential
-        max_concurrent 1000
-    }
-    ready {{ .ClusterListenerIP }}:8181
-    cache 30 {
-        success 9984
-        denial 9984
-        serve_stale 3600s verify
-        servfail 0
-    }
-    loop
-}
-`
+//go:embed assets/default-localdns.Corefile.tmpl
+var defaultLocalDNSCorefileTemplate string
 
 // LocalDNS is the fully resolved machine-local DNS goal state.
 type LocalDNS struct {
@@ -131,65 +91,90 @@ type LocalDNSCorefileTemplateData struct {
 	MetricsAddress        string
 }
 
+type resolvedLocalDNSConfig struct {
+	coreDNSVersion   string
+	nodeListener     netip.Addr
+	clusterListener  netip.Addr
+	clusterDNS       netip.Addr
+	metricsAddress   string
+	cpuLimit         int
+	memoryLimit      int
+	requiredPlugins  []string
+	corefileTemplate string
+}
+
+func resolveLocalDNSConfig(cfg *config.AgentConfig, downloads *DownloadOverrides) (resolvedLocalDNSConfig, error) {
+	if err := cfg.Validate(); err != nil {
+		return resolvedLocalDNSConfig{}, err
+	}
+
+	resolved := resolvedLocalDNSConfig{
+		coreDNSVersion:   CoreDNSVersion,
+		nodeListener:     netip.MustParseAddr(valueOrDefault(cfg.LocalDNS.NodeListenerIP, config.DefaultLocalDNSNodeListenerIP)),
+		clusterListener:  netip.MustParseAddr(valueOrDefault(cfg.LocalDNS.ClusterListenerIP, config.DefaultLocalDNSClusterListenerIP)),
+		clusterDNS:       netip.MustParseAddr(strings.TrimSpace(cfg.Cluster.ClusterDNS)),
+		cpuLimit:         config.DefaultLocalDNSCPUMilliCores,
+		memoryLimit:      config.DefaultLocalDNSMemoryLimitMB,
+		corefileTemplate: cfg.LocalDNS.CorefileTemplate,
+	}
+
+	var err error
+
+	resolved.metricsAddress, err = localDNSMetricsAddress(cfg.LocalDNS.MetricsAddress, cfg.Kubelet.NodeIP)
+	if err != nil {
+		return resolvedLocalDNSConfig{}, err
+	}
+
+	if cfg.LocalDNS.CPULimitInMilliCores != nil {
+		resolved.cpuLimit = *cfg.LocalDNS.CPULimitInMilliCores
+	}
+
+	if cfg.LocalDNS.MemoryLimitInMB != nil {
+		resolved.memoryLimit = *cfg.LocalDNS.MemoryLimitInMB
+	}
+
+	if downloads != nil && downloads.CoreDNS != nil && downloads.CoreDNS.Version != "" {
+		resolved.coreDNSVersion = strings.TrimPrefix(downloads.CoreDNS.Version, "v")
+	}
+
+	plugins := append([]string(nil), baselineLocalDNSPlugins...)
+	plugins = append(plugins, cfg.LocalDNS.RequiredPlugins...)
+	resolved.requiredPlugins = normalizePluginNames(plugins)
+
+	if resolved.corefileTemplate == "" {
+		resolved.corefileTemplate = defaultLocalDNSCorefileTemplate
+	}
+
+	return resolved, nil
+}
+
 func resolveLocalDNS(cfg *config.AgentConfig, downloads *DownloadOverrides) (LocalDNS, error) {
 	if cfg.LocalDNS == nil || !cfg.LocalDNS.Enabled {
 		return LocalDNS{}, nil
 	}
 
-	if err := cfg.LocalDNS.Validate(cfg.Cluster.ClusterDNS, cfg.Kubelet.NodeIP); err != nil {
-		return LocalDNS{}, err
-	}
-
-	nodeListener := netip.MustParseAddr(valueOrDefault(cfg.LocalDNS.NodeListenerIP, config.DefaultLocalDNSNodeListenerIP))
-	clusterListener := netip.MustParseAddr(valueOrDefault(cfg.LocalDNS.ClusterListenerIP, config.DefaultLocalDNSClusterListenerIP))
-	clusterDNS := netip.MustParseAddr(strings.TrimSpace(cfg.Cluster.ClusterDNS))
-
-	resolvConf, upstreams, err := discoverLocalDNSUpstreams(defaultLocalDNSResolverDeps(), nodeListener, clusterListener)
+	resolved, err := resolveLocalDNSConfig(cfg, downloads)
 	if err != nil {
 		return LocalDNS{}, err
 	}
 
-	metricsAddress, err := localDNSMetricsAddress(cfg.LocalDNS.MetricsAddress, cfg.Kubelet.NodeIP)
+	resolvConf, upstreams, err := discoverLocalDNSUpstreams(defaultLocalDNSResolverDeps(), resolved.nodeListener, resolved.clusterListener)
 	if err != nil {
 		return LocalDNS{}, err
 	}
-
-	cpuLimit := config.DefaultLocalDNSCPUMilliCores
-	if cfg.LocalDNS.CPULimitInMilliCores != nil {
-		cpuLimit = *cfg.LocalDNS.CPULimitInMilliCores
-	}
-
-	memoryLimit := config.DefaultLocalDNSMemoryLimitMB
-	if cfg.LocalDNS.MemoryLimitInMB != nil {
-		memoryLimit = *cfg.LocalDNS.MemoryLimitInMB
-	}
-
-	version := CoreDNSVersion
-	if downloads != nil && downloads.CoreDNS != nil && downloads.CoreDNS.Version != "" {
-		version = strings.TrimPrefix(downloads.CoreDNS.Version, "v")
-	}
-
-	plugins := append([]string(nil), baselineLocalDNSPlugins...)
-	plugins = append(plugins, cfg.LocalDNS.RequiredPlugins...)
-	plugins = normalizePluginNames(plugins)
 
 	upstreamStrings := make([]string, 0, len(upstreams))
 	for _, upstream := range upstreams {
 		upstreamStrings = append(upstreamStrings, upstream.String())
 	}
 
-	templateSource := cfg.LocalDNS.CorefileTemplate
-	if templateSource == "" {
-		templateSource = defaultLocalDNSCorefileTemplate
-	}
-
-	corefile, err := renderLocalDNSCorefile(templateSource, LocalDNSCorefileTemplateData{
-		NodeListenerIP:        nodeListener.String(),
-		ClusterListenerIP:     clusterListener.String(),
+	corefile, err := renderLocalDNSCorefile(resolved.corefileTemplate, LocalDNSCorefileTemplateData{
+		NodeListenerIP:        resolved.nodeListener.String(),
+		ClusterListenerIP:     resolved.clusterListener.String(),
 		NodeUpstreamIPs:       upstreamStrings,
 		NodeUpstreamIPsJoined: strings.Join(upstreamStrings, " "),
-		ClusterDNSServiceIP:   clusterDNS.String(),
-		MetricsAddress:        metricsAddress,
+		ClusterDNSServiceIP:   resolved.clusterDNS.String(),
+		MetricsAddress:        resolved.metricsAddress,
 	})
 	if err != nil {
 		return LocalDNS{}, err
@@ -197,15 +182,15 @@ func resolveLocalDNS(cfg *config.AgentConfig, downloads *DownloadOverrides) (Loc
 
 	return LocalDNS{
 		Enabled:                true,
-		CoreDNSVersion:         version,
-		NodeListenerIP:         nodeListener,
-		ClusterListenerIP:      clusterListener,
+		CoreDNSVersion:         resolved.coreDNSVersion,
+		NodeListenerIP:         resolved.nodeListener,
+		ClusterListenerIP:      resolved.clusterListener,
 		NodeUpstreamIPs:        upstreams,
-		ClusterDNSServiceIP:    clusterDNS,
-		MetricsAddress:         metricsAddress,
-		CPULimitInMilliCores:   cpuLimit,
-		MemoryLimitInMB:        memoryLimit,
-		RequiredPlugins:        plugins,
+		ClusterDNSServiceIP:    resolved.clusterDNS,
+		MetricsAddress:         resolved.metricsAddress,
+		CPULimitInMilliCores:   resolved.cpuLimit,
+		MemoryLimitInMB:        resolved.memoryLimit,
+		RequiredPlugins:        resolved.requiredPlugins,
 		Corefile:               corefile,
 		OriginalHostResolvConf: resolvConf,
 	}, nil

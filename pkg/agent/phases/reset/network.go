@@ -77,39 +77,6 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 		}
 	}
 
-	for _, chain := range []string{"OUTPUT", "PREROUTING"} {
-		output, err := executil.OutputCmd(ctx, t.log, "iptables", "-w", "-t", "raw", "-S", chain)
-		if err != nil {
-			// Hosts without a LocalDNS deployment may not have iptables or a raw table.
-			continue
-		}
-
-		for _, line := range strings.Split(output, "\n") {
-			if !strings.Contains(line, "unbounded-localdns: skip conntrack") {
-				continue
-			}
-
-			fields := strings.Fields(strings.ReplaceAll(line, `"`, ""))
-			values := map[string]string{}
-
-			for i := 0; i+1 < len(fields); i++ {
-				switch fields[i] {
-				case "-A", "-p", "-d":
-					values[fields[i]] = strings.TrimSuffix(fields[i+1], "/32")
-				}
-			}
-
-			if values["-A"] == "" || values["-p"] == "" || values["-d"] == "" {
-				continue
-			}
-
-			args := []string{"-w", "-t", "raw", "-m", "comment", "--comment", "unbounded-localdns: skip conntrack", "-D", values["-A"], "-p", values["-p"], "-d", values["-d"], "--dport", "53", "-j", "NOTRACK"}
-			if err := executil.RunCmd(ctx, t.log, executil.Iptables(), args...); err != nil {
-				return fmt.Errorf("remove LocalDNS NOTRACK rule: %w", err)
-			}
-		}
-	}
-
 	if output, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show", "dev", goalstates.LocalDNSInterfaceName); err == nil {
 		if !strings.Contains(" "+output+" ", " dummy ") {
 			return fmt.Errorf("refusing to remove non-dummy interface %s", goalstates.LocalDNSInterfaceName)
@@ -122,7 +89,6 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 
 	for _, path := range []string{
 		filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit),
-		goalstates.LocalDNSNetworkBackendPath,
 		"/usr/local/libexec/unbounded-localdns-network",
 	} {
 		removeFileIfExists(t.log, path)
