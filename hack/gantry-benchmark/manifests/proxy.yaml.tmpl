@@ -122,29 +122,3 @@ spec:
         - action: replace
           targetLabel: gantry_benchmark
           replacement: "true"
----
-apiVersion: monitoring.coreos.com/v1
-kind: PodMonitor
-metadata:
-  name: gantry-benchmark-agent
-  namespace: {{ .Namespace }}
-  labels:
-    release: {{ .MonitoringLabel }}
-    app.kubernetes.io/part-of: gantry-benchmark
-spec:
-  namespaceSelector:
-    matchNames:
-      - {{ .GantryNamespace }}
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: gantry
-  podTargetLabels:
-    - controller-revision-hash
-  podMetricsEndpoints:
-    - port: metrics
-      path: /metrics
-      interval: 10s
-      metricRelabelings:
-        - action: replace
-          targetLabel: gantry_benchmark
-          replacement: "true"

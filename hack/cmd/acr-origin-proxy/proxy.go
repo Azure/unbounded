@@ -125,8 +125,17 @@ func proxyHandler(cfg *config, cache *tokenCache, observer *observer, client *ht
 		)
 		if err != nil {
 			status = strconv.Itoa(http.StatusBadGateway)
+			errorReason := classifyUpstreamError(err)
+			observer.recordUpstreamError(attribution, r.Method, path, caller, errorReason)
 
-			slog.Error("proxy upstream request failed", "method", r.Method, "path", r.URL.Path, "phase", attribution.Phase, "error", err)
+			slog.Error(
+				"proxy upstream request failed",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"phase", attribution.Phase,
+				"error_class", errorReason,
+				"error", err,
+			)
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 
 			return

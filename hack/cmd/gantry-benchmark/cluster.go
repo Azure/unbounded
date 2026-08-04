@@ -108,6 +108,28 @@ func (b *benchmark) targetNodes(ctx context.Context) ([]string, error) {
 }
 
 func (b *benchmark) validateGantry(ctx context.Context) error {
+	daemonSet, err := b.gantryDaemonSetStatus(ctx)
+	if err != nil {
+		return err
+	}
+
+	return validateGantryStatus(daemonSet, b.config.NodeCount)
+}
+
+func (b *benchmark) validateGantryAtCurrentSize(ctx context.Context) error {
+	daemonSet, err := b.gantryDaemonSetStatus(ctx)
+	if err != nil {
+		return err
+	}
+
+	if daemonSet.Status.DesiredNumberScheduled <= 0 {
+		return fmt.Errorf("gantry DaemonSet has no desired pods")
+	}
+
+	return validateGantryStatus(daemonSet, daemonSet.Status.DesiredNumberScheduled)
+}
+
+func (b *benchmark) gantryDaemonSetStatus(ctx context.Context) (daemonSetStatus, error) {
 	output, err := b.commands.Run(
 		ctx,
 		nil,
@@ -117,19 +139,23 @@ func (b *benchmark) validateGantry(ctx context.Context) error {
 		"-o", "json",
 	)
 	if err != nil {
-		return err
+		return daemonSetStatus{}, err
 	}
 
 	var daemonSet daemonSetStatus
 	if err := json.Unmarshal(output, &daemonSet); err != nil {
-		return fmt.Errorf("decode gantry DaemonSet: %w", err)
+		return daemonSetStatus{}, fmt.Errorf("decode gantry DaemonSet: %w", err)
 	}
 
+	return daemonSet, nil
+}
+
+func validateGantryStatus(daemonSet daemonSetStatus, expectedCount int) error {
 	status := daemonSet.Status
-	if status.DesiredNumberScheduled != b.config.NodeCount ||
-		status.UpdatedNumberScheduled != b.config.NodeCount ||
-		status.NumberReady != b.config.NodeCount ||
-		status.NumberAvailable != b.config.NodeCount ||
+	if status.DesiredNumberScheduled != expectedCount ||
+		status.UpdatedNumberScheduled != expectedCount ||
+		status.NumberReady != expectedCount ||
+		status.NumberAvailable != expectedCount ||
 		status.NumberUnavailable != 0 {
 		return fmt.Errorf(
 			"gantry DaemonSet is not converged: desired=%d updated=%d ready=%d available=%d unavailable=%d, want %d ready",
@@ -138,7 +164,7 @@ func (b *benchmark) validateGantry(ctx context.Context) error {
 			status.NumberReady,
 			status.NumberAvailable,
 			status.NumberUnavailable,
-			b.config.NodeCount,
+			expectedCount,
 		)
 	}
 

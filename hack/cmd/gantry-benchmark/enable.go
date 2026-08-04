@@ -17,7 +17,10 @@ import (
 	"time"
 )
 
-const proxyManifestPath = "hack/gantry-benchmark/manifests/proxy.yaml.tmpl"
+const (
+	proxyManifestPath      = "hack/gantry-benchmark/manifests/proxy.yaml.tmpl"
+	monitoringManifestPath = "hack/gantry-benchmark/manifests/monitoring.yaml.tmpl"
+)
 
 func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	if err := b.config.validateEnable(); err != nil {
@@ -41,9 +44,13 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	controlToken, err := randomHex(32)
-	if err != nil {
-		return err
+	var controlToken string
+
+	if b.config.usesProxy() {
+		controlToken, err = randomHex(32)
+		if err != nil {
+			return err
+		}
 	}
 
 	namespace := map[string]any{
@@ -93,87 +100,125 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	if !b.config.usesProxy() {
+		if err := validateDirectGantryRegistry([]byte(originalConfig), b.config.GantryACRLoginServer); err != nil {
+			return fmt.Errorf("validate dedicated Gantry ACR configuration: %w", err)
+		}
+	}
+
 	state := benchmarkState{
-		RunID:                   runID,
-		Status:                  "enabling",
-		BenchmarkNamespace:      b.config.Namespace,
-		GantryNamespace:         b.config.GantryNamespace,
-		GantryDaemonSet:         b.config.GantryDaemonSet,
-		GantryConfigMap:         b.config.GantryConfigMap,
-		MonitoringNamespace:     b.config.MonitoringNamespace,
-		PrometheusService:       b.config.PrometheusService,
-		NodeCount:               b.config.NodeCount,
-		ImagePlatform:           b.config.ImagePlatform,
-		ACRLoginServer:          b.config.ACRLoginServer,
-		ProxyImage:              b.config.ProxyImage,
-		OriginalGantryConfig:    originalConfig,
-		OriginalGantryConfigSHA: gantryConfigSHA(originalConfig),
-		GantryRestored:          true,
+		RunID:                        runID,
+		Mode:                         b.config.Mode,
+		Status:                       "enabling",
+		BenchmarkNamespace:           b.config.Namespace,
+		GantryNamespace:              b.config.GantryNamespace,
+		GantryDaemonSet:              b.config.GantryDaemonSet,
+		GantryConfigMap:              b.config.GantryConfigMap,
+		MonitoringNamespace:          b.config.MonitoringNamespace,
+		PrometheusService:            b.config.PrometheusService,
+		NodeCount:                    b.config.NodeCount,
+		ImagePlatform:                b.config.ImagePlatform,
+		ImageSizeMiB:                 b.config.ImageSizeMiB,
+		ImageLayers:                  b.config.ImageLayers,
+		WorkloadRepository:           b.config.WorkloadRepository,
+		BaselineACRLoginServer:       b.config.BaselineACRLoginServer,
+		GantryACRLoginServer:         b.config.GantryACRLoginServer,
+		ACRLoginServer:               b.config.ACRLoginServer,
+		ProxyImage:                   b.config.ProxyImage,
+		OriginalGantryConfig:         originalConfig,
+		OriginalGantryConfigSHA:      gantryConfigSHA(originalConfig),
+		GantryRestored:               true,
+		AzureTelemetry:               b.config.AzureTelemetry,
+		LogAnalyticsWorkspaceID:      b.config.LogAnalyticsWorkspaceID,
+		BaselineACRResourceID:        b.config.BaselineACRResourceID,
+		BaselinePrivateEndpointID:    b.config.BaselinePrivateEndpointID,
+		GantryACRResourceID:          b.config.GantryACRResourceID,
+		GantryPrivateEndpointID:      b.config.GantryPrivateEndpointID,
+		ACRResourceID:                b.config.ACRResourceID,
+		AKSResourceID:                b.config.AKSResourceID,
+		ACRPrivateEndpointResourceID: b.config.ACRPrivateEndpointResourceID,
 	}
 	if err := b.saveState(ctx, state); err != nil {
 		return err
 	}
 
-	secret := map[string]any{
-		"apiVersion": "v1",
-		"kind":       "Secret",
-		"metadata": map[string]any{
-			"name":      "acr-origin-proxy",
-			"namespace": b.config.Namespace,
-		},
-		"type": "Opaque",
-		"stringData": map[string]string{
-			"username":      b.config.ACRUsername,
-			"password":      b.config.ACRPassword,
-			"control-token": controlToken,
-		},
-	}
-	if err := b.applyObject(ctx, secret); err != nil {
-		return err
-	}
-
-	manifest, err := b.renderProxyManifest(proxyManifestData{
+	manifestData := proxyManifestData{
 		Namespace:       b.config.Namespace,
 		GantryNamespace: b.config.GantryNamespace,
 		MonitoringLabel: b.config.KPSRelease,
 		ProxyImage:      b.config.ProxyImage,
 		ACRLoginServer:  b.config.ACRLoginServer,
 		RunID:           runID,
-	})
+	}
+
+	// The Gantry PodMonitor stamps gantry_benchmark="true" onto agent samples and
+	// is required in both modes; only the proxy objects are mode-specific.
+	monitoring, err := b.renderManifest(monitoringManifestPath, manifestData)
 	if err != nil {
 		return err
 	}
 
-	if _, err := b.commands.Run(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
+	if _, err := b.commands.Run(ctx, monitoring, "kubectl", "apply", "-f", "-"); err != nil {
 		return err
 	}
 
-	if _, err := b.commands.Run(
-		ctx,
-		nil,
-		"kubectl",
-		"-n", b.config.Namespace,
-		"rollout", "status", "deployment/acr-origin-proxy",
-		"--timeout", b.config.RolloutTimeout.String(),
-	); err != nil {
-		return err
-	}
+	if b.config.usesProxy() {
+		secret := map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]any{
+				"name":      "acr-origin-proxy",
+				"namespace": b.config.Namespace,
+			},
+			"type": "Opaque",
+			"stringData": map[string]string{
+				"username":      b.config.ACRUsername,
+				"password":      b.config.ACRPassword,
+				"control-token": controlToken,
+			},
+		}
+		if err := b.applyObject(ctx, secret); err != nil {
+			return err
+		}
 
-	proxyIPOutput, err := b.commands.Run(
-		ctx,
-		nil,
-		"kubectl",
-		"-n", b.config.Namespace,
-		"get", "service", "acr-origin-proxy",
-		"-o", "jsonpath={.spec.clusterIP}",
-	)
-	if err != nil {
-		return err
-	}
+		manifest, err := b.renderManifest(proxyManifestPath, manifestData)
+		if err != nil {
+			return err
+		}
 
-	proxyIP := strings.TrimSpace(string(proxyIPOutput))
-	if proxyIP == "" || strings.EqualFold(proxyIP, "None") {
-		return fmt.Errorf("proxy service has no ClusterIP")
+		if _, err := b.commands.Run(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
+			return err
+		}
+
+		if _, err := b.commands.Run(
+			ctx,
+			nil,
+			"kubectl",
+			"-n", b.config.Namespace,
+			"rollout", "status", "deployment/acr-origin-proxy",
+			"--timeout", b.config.RolloutTimeout.String(),
+		); err != nil {
+			return err
+		}
+
+		proxyIPOutput, err := b.commands.Run(
+			ctx,
+			nil,
+			"kubectl",
+			"-n", b.config.Namespace,
+			"get", "service", "acr-origin-proxy",
+			"-o", "jsonpath={.spec.clusterIP}",
+		)
+		if err != nil {
+			return err
+		}
+
+		proxyIP := strings.TrimSpace(string(proxyIPOutput))
+		if proxyIP == "" || strings.EqualFold(proxyIP, "None") {
+			return fmt.Errorf("proxy service has no ClusterIP")
+		}
+
+		state.ProxyClusterIP = proxyIP
 	}
 
 	if err := b.installDashboard(ctx); err != nil {
@@ -182,8 +227,6 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 
 	dashboardInstalled = true
 
-	state.ProxyClusterIP = proxyIP
-
 	// Patch Gantry to route origin pulls through the counting proxy and roll it
 	// out now, at enable time. Restarting Gantry clears each agent's in-memory
 	// DHT routing table, and a 300-node cluster needs several minutes to
@@ -191,8 +234,13 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 	// the Gantry-cold phase - means `run` never restarts Gantry: the DHT is
 	// fully warm by the time the cold phase measures peer distribution.
 	// `disable` restores the original Gantry config.
-	if err := b.patchGantryForBenchmark(ctx, &state); err != nil {
-		return err
+	//
+	// Direct mode has no proxy to point at, so Gantry keeps its original ACR
+	// endpoint and is never patched or rolled by the benchmark at all.
+	if b.config.usesProxy() {
+		if err := b.patchGantryForBenchmark(ctx, &state); err != nil {
+			return err
+		}
 	}
 
 	state.Status = "enabled"
@@ -280,22 +328,22 @@ type proxyManifestData struct {
 	RunID           string
 }
 
-func (b *benchmark) renderProxyManifest(data proxyManifestData) ([]byte, error) {
-	path := filepath.Join(b.config.RepoRoot, proxyManifestPath)
+func (b *benchmark) renderManifest(manifestPath string, data proxyManifestData) ([]byte, error) {
+	path := filepath.Join(b.config.RepoRoot, manifestPath)
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read proxy manifest template: %w", err)
+		return nil, fmt.Errorf("read manifest template %s: %w", manifestPath, err)
 	}
 
-	tmpl, err := template.New("proxy").Option("missingkey=error").Parse(string(raw))
+	tmpl, err := template.New(filepath.Base(manifestPath)).Option("missingkey=error").Parse(string(raw))
 	if err != nil {
-		return nil, fmt.Errorf("parse proxy manifest template: %w", err)
+		return nil, fmt.Errorf("parse manifest template %s: %w", manifestPath, err)
 	}
 
 	var rendered bytes.Buffer
 	if err := tmpl.Execute(&rendered, data); err != nil {
-		return nil, fmt.Errorf("render proxy manifest template: %w", err)
+		return nil, fmt.Errorf("render manifest template %s: %w", manifestPath, err)
 	}
 
 	return rendered.Bytes(), nil
