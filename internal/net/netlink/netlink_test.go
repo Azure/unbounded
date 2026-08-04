@@ -114,6 +114,24 @@ func TestGeneveMTUOverhead(t *testing.T) {
 	}
 }
 
+func TestSelectLowerMTUTracksSelectedInterface(t *testing.T) {
+	mtu, ifaceName := selectLowerMTU(0, "", 1400, "eth0")
+	mtu, ifaceName = selectLowerMTU(mtu, ifaceName, 1500, "eth1")
+
+	if mtu != 1400 {
+		t.Fatalf("selectLowerMTU() MTU = %d, want 1400", mtu)
+	}
+
+	if ifaceName != "eth0" {
+		t.Fatalf("selectLowerMTU() interface = %q, want %q", ifaceName, "eth0")
+	}
+
+	mtu, ifaceName = selectLowerMTU(mtu, ifaceName, 1300, "eth2")
+	if mtu != 1300 || ifaceName != "eth2" {
+		t.Fatalf("selectLowerMTU() = (%d, %q), want (1300, %q)", mtu, ifaceName, "eth2")
+	}
+}
+
 // TestLinkManager_EnsureMTU_NonExistentInterface verifies EnsureMTU returns an
 // error for a non-existent interface.
 func TestLinkManager_EnsureMTU_NonExistentInterface(t *testing.T) {
