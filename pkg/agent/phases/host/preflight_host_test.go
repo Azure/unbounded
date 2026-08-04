@@ -66,6 +66,20 @@ func TestCheckLocalDNSConntrackFallsBackToIPTables(t *testing.T) {
 	assert.Contains(t, results[0].Message, "iptables-compatible")
 }
 
+func TestCheckLocalDNSConntrackAllowsOnlineFallbackInstallation(t *testing.T) {
+	deps := localDNSConntrackDeps{
+		lookupPath: lookupPathWith(map[string]bool{"nft": true}),
+		run: func(_ context.Context, _ string, _ []string, _ string) ([]byte, error) {
+			return nil, errors.New("notrack unsupported")
+		},
+	}
+
+	results := checkLocalDNSConntrackWithDeps(slog.New(slog.DiscardHandler), false, deps).Check(context.Background())
+
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "fallback will be installed")
+}
+
 func TestCheckLocalDNSConntrackMissingBackends(t *testing.T) {
 	deps := localDNSConntrackDeps{
 		lookupPath: lookupPathWith(nil),

@@ -78,6 +78,18 @@ func TestConfigureLocalDNS(t *testing.T) {
 	}
 }
 
+func TestLocalDNSResolvConfRemovesAllNameservers(t *testing.T) {
+	t.Parallel()
+
+	original := []byte("search example.test\n nameserver 10.0.0.4\nnameserver\t127.0.0.53\noptions timeout:2\n")
+	got := string(localDNSResolvConf(original, "169.254.10.10"))
+	want := "search example.test\noptions timeout:2\nnameserver 169.254.10.10\n"
+
+	if got != want {
+		t.Fatalf("localDNSResolvConf() = %q, want %q", got, want)
+	}
+}
+
 func mustAddr(t *testing.T, value string) netip.Addr {
 	t.Helper()
 

@@ -219,7 +219,12 @@ func localDNSResolvConf(original []byte, listener string) []byte {
 	var lines []string
 
 	for _, line := range strings.Split(string(original), "\n") {
-		if line != "" && !strings.HasPrefix(strings.TrimSpace(line), "nameserver ") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "nameserver" {
+			continue
+		}
+
+		if line != "" {
 			lines = append(lines, line)
 		}
 	}
