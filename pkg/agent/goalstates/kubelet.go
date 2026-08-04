@@ -25,6 +25,9 @@ type Kubelet struct {
 	// ClusterDNS is the ClusterIP of the kube-dns service.
 	ClusterDNS string
 
+	// ResolvConf is the resolver file kubelet uses for dnsPolicy: Default pods.
+	ResolvConf string
+
 	// NodeIP overrides kubelet --node-ip. Supports a single IP or a
 	// comma-separated dual-stack pair.
 	NodeIP string

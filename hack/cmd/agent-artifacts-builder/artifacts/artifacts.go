@@ -4,6 +4,8 @@
 package artifacts
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,11 +14,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/renameio/v2"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -60,6 +64,7 @@ type Artifact struct {
 	URL              string
 	Path             string
 	GenerateChecksum bool
+	ExtractFile      string
 }
 
 type ContainerImageArchive struct {
@@ -177,6 +182,16 @@ func NewPlan(opts Options) (Plan, error) {
 				ImageTag: imageTag,
 				Arch:     arch,
 				Path:     bootstrapartifacts.ContainerImageArchivePath(arch, imageTag),
+			})
+		}
+
+		if manifest.Versions.CoreDNS != "" {
+			artifacts = append(artifacts, Artifact{
+				Name:             "coredns",
+				URL:              agentartifacts.CoreDNSArchive(nil, manifest.Versions.CoreDNS, arch),
+				Path:             bootstrapartifacts.CoreDNSArtifactPath(manifest.Versions.CoreDNS, arch),
+				GenerateChecksum: true,
+				ExtractFile:      "coredns",
 			})
 		}
 
@@ -505,8 +520,12 @@ func downloadArtifact(ctx context.Context, log *slog.Logger, rootDir string, art
 
 	log.Info("downloading artifact", slog.String("artifact", artifact.Path), slog.String("source", artifact.URL))
 
-	if err := downloadToFile(ctx, artifact.URL, dest); err != nil {
-		return fmt.Errorf("download %s to %q: %w", artifact.URL, dest, err)
+	if artifact.ExtractFile == "" {
+		if err := downloadToFile(ctx, artifact.URL, dest); err != nil {
+			return fmt.Errorf("download %s to %q: %w", artifact.URL, dest, err)
+		}
+	} else if err := downloadTarGzFile(ctx, artifact.URL, artifact.ExtractFile, dest); err != nil {
+		return fmt.Errorf("download and extract %s to %q: %w", artifact.URL, dest, err)
 	}
 
 	log.Info("downloaded artifact", slog.String("artifact", artifact.Path))
@@ -521,6 +540,59 @@ func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
 	}
 
 	return source.DownloadToLocalFile(ctx, dest, 0o644)
+}
+
+func downloadTarGzFile(ctx context.Context, sourceURL, wanted, dest string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck // best effort close
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status %s", resp.Status)
+	}
+
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return fmt.Errorf("open gzip stream: %w", err)
+	}
+	defer gz.Close() //nolint:errcheck // best effort close
+
+	archive := tar.NewReader(gz)
+	for {
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			return fmt.Errorf("read tar archive: %w", err)
+		}
+
+		if header.Typeflag != tar.TypeReg || filepath.Base(header.Name) != wanted {
+			continue
+		}
+
+		out, err := renameio.NewPendingFile(dest, renameio.WithPermissions(0o755))
+		if err != nil {
+			return err
+		}
+		defer out.Cleanup() //nolint:errcheck // pending file cleanup
+
+		if _, err := io.Copy(out, archive); err != nil {
+			return err
+		}
+
+		return out.CloseAtomicallyReplace()
+	}
+
+	return fmt.Errorf("archive does not contain %q", wanted)
 }
 
 func writeGeneratedChecksum(path string) error {
@@ -614,6 +686,7 @@ func defaultManifest(kubernetesVersion string) (bootstrapartifacts.Manifest, err
 			Runc:       goalstates.RunCVersion,
 			CNI:        goalstates.CNIPluginVersion,
 			Crictl:     crictlVersion,
+			CoreDNS:    goalstates.CoreDNSVersion,
 		},
 		ContainerImages: agentartifacts.DefaultContainerImages(kubernetesVersion),
 	})

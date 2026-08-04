@@ -125,6 +125,7 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 				BootstrapToken: "token",
 			},
 			ClusterDNS: "10.0.0.10",
+			ResolvConf: goalstates.LocalDNSResolvConfPath,
 			Configuration: map[string]any{
 				"maxPods": 250,
 				"logging": map[string]any{"verbosity": 4},
@@ -158,7 +159,7 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 	require.EqualValues(t, -1, got["podPidsLimit"])
 	require.Equal(t, true, got["protectKernelDefaults"])
 	require.EqualValues(t, 0, got["readOnlyPort"])
-	require.Equal(t, "/etc/resolv.conf", got["resolvConf"])
+	require.Equal(t, goalstates.LocalDNSResolvConfPath, got["resolvConf"])
 	require.Equal(t, "4h", got["streamingConnectionIdleTimeout"])
 	require.Len(t, got["tlsCipherSuites"], 8)
 	require.Equal(t, true, got["rotateCertificates"])

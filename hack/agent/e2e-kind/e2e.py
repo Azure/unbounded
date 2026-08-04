@@ -595,6 +595,7 @@ class NodeConfig:
     block_external_network: bool = False
     additional_host_mounts: tuple[dict[str, Any], ...] = ()
     additional_host_devices: tuple[str, ...] = ()
+    local_dns: bool = False
     path: str = ""
 
 
@@ -635,6 +636,7 @@ def load_node_config(
     block_external_network = cfg.get("blockExternalNetwork", False)
     additional_host_mounts = cfg.get("additionalHostMounts", [])
     additional_host_devices = cfg.get("additionalHostDevices", [])
+    local_dns = cfg.get("localDNS", False)
 
     if not isinstance(name, str) or not name:
         die(f"node config {config_path} field 'name' must be a non-empty string")
@@ -668,6 +670,8 @@ def load_node_config(
             f"node config {config_path} field 'additionalHostMounts' must be a list of objects "
             f"with string 'source', optional string 'target', and optional bool 'readOnly'"
         )
+    if not isinstance(local_dns, bool):
+        die(f"node config {config_path} field 'localDNS' must be a boolean")
     if not isinstance(additional_host_devices, list) or not all(
         isinstance(d, str) and d for d in additional_host_devices
     ):
@@ -687,6 +691,7 @@ def load_node_config(
         block_external_network=block_external_network,
         additional_host_mounts=tuple(dict(m) for m in additional_host_mounts),
         additional_host_devices=tuple(additional_host_devices),
+        local_dns=local_dns,
         path=str(config_path),
     )
 
@@ -731,6 +736,8 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     args: list[str] = []
     if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
+    if node_config.local_dns:
+        args.append("--local-dns")
     for key, value in sorted(expected_node_labels(node_config).items()):
         args.extend(["--node-label", f"{key}={value}"])
     for taint in expected_node_taint_strings(node_config):
@@ -1720,13 +1727,13 @@ if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     rm -f /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin
     apt-get update
-    apt-get install -y systemd-container curl nftables util-linux
+    apt-get install -y systemd-container curl nftables iptables util-linux
 elif command -v tdnf >/dev/null 2>&1; then
-    tdnf install -y systemd-container curl nftables util-linux
+    tdnf install -y systemd-container curl nftables iptables util-linux
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y systemd-container curl nftables util-linux
+    dnf install -y systemd-container curl nftables iptables util-linux
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y systemd-container curl nftables util-linux
+    yum install -y systemd-container curl nftables iptables util-linux
 else
     echo "no supported package manager found for blocked-network preparation" >&2
     exit 1
@@ -1990,6 +1997,7 @@ def offline_artifact_manifest(kube_version: str, container_images: list[str] | N
             "runc": "1.5.0",
             "cni": "1.5.1",
             "crictl": _crictl_version_for_kubernetes(kube_version),
+            "coredns": "1.12.3",
         },
     }
     if container_images is not None:
@@ -2547,6 +2555,7 @@ def validate_node_config(node_config: NodeConfig) -> None:
     validate_offline_bootstrap_config(node_config)
     validate_additional_host_mounts_config(node_config)
     validate_additional_host_devices_config(node_config)
+    validate_local_dns_config(node_config)
 
     log("============================================")
     log("  Node config validation PASSED")
@@ -2606,6 +2615,63 @@ PY
         die(f"kubelet ExecStart does not reference generated config: {exec_start}")
 
     log("Kubelet configuration overlay validated")
+
+
+def validate_local_dns_config(node_config: NodeConfig) -> None:
+    """Verify LocalDNS service, listeners, resolver wiring, metrics, and NOTRACK rules."""
+    if not node_config.local_dns:
+        return
+
+    log("Validating nspawn LocalDNS...")
+    machine = active_nspawn_machine()
+    machine_shell(machine, """
+systemctl is-active --quiet localdns.service
+grep -qx 'nameserver 169.254.10.10' /etc/resolv.conf
+grep -q -- '^- 169.254.10.11$' /var/lib/kubelet/config.yaml
+grep -qx 'resolvConf: /etc/unbounded/localdns/resolv.conf' /var/lib/kubelet/config.yaml
+curl --silent --fail --noproxy '*' http://169.254.10.10:8181/ready | grep -q OK
+curl --silent --fail --noproxy '*' http://169.254.10.11:8181/ready | grep -q OK
+""")
+    ssh_cmd(r"""
+python3 - <<'PY'
+import socket
+import struct
+
+
+def query(server, name):
+    qname = b''.join(bytes([len(label)]) + label.encode() for label in name.split('.')) + b'\0'
+    message = struct.pack('!HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0) + qname + struct.pack('!HH', 1, 1)
+    with socket.create_connection((server, 53), timeout=5) as sock:
+        sock.sendall(struct.pack('!H', len(message)) + message)
+        length = struct.unpack('!H', sock.recv(2))[0]
+        response = b''
+        while len(response) < length:
+            response += sock.recv(length - len(response))
+    _, flags, _, answers, _, _ = struct.unpack('!HHHHHH', response[:12])
+    if flags & 0xF:
+        raise SystemExit(f'DNS query {name} through {server} failed: rcode={flags & 0xF}, answers={answers}')
+
+
+query('169.254.10.10', 'health-check.localdns.local')
+query('169.254.10.11', 'health-check.localdns.local')
+PY
+""")
+    ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.10/32'")
+    ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.11/32'")
+    ssh_cmd("""
+set -e
+for chain in OUTPUT PREROUTING; do
+  for address in 169.254.10.10 169.254.10.11; do
+    for protocol in tcp udp; do
+      sudo iptables -w -t raw -C "${chain}" \
+        -m comment --comment 'unbounded-localdns: skip conntrack' \
+        -p "${protocol}" -d "${address}" --dport 53 -j NOTRACK
+    done
+  done
+done
+""")
+    ssh_cmd(f"curl --silent --fail --noproxy '*' http://{expected_node_ip(node_config)}:9253/metrics | grep -q '^coredns_build_info'")
+    log("nspawn LocalDNS validation passed")
 
 
 def validate_offline_bootstrap_config(node_config: NodeConfig) -> None:
@@ -2849,11 +2915,45 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
     ):
         _run_scenario_command(command, node_config, env)
 
-    for command in (
-        "validate-workload",
-        "validate-node-repave-upgrade",
-    ):
-        _run_scenario_command(command, node_config, env)
+    if node_config.local_dns:
+        _run_scenario_command("validate-node-reboot-operation", node_config, env)
+        _run_scenario_command("validate-node-config", node_config, env)
+
+    _run_scenario_command("validate-workload", node_config, env)
+    _run_scenario_command("validate-node-repave-upgrade", node_config, env)
+    if node_config.local_dns:
+        _run_scenario_command("validate-node-config", node_config, env)
+        _run_scenario_command("reset-agent", node_config, env)
+        cleanup_check = (
+            "test ! -e /sys/class/net/localdns && "
+            "! sudo iptables -w -t raw -S | grep -q 'unbounded-localdns: skip conntrack'"
+        )
+        deadline = time.monotonic() + 60
+        scenario_key = Path(env["VM_DIR"]) / "ssh" / "id_ed25519"
+        scenario_target = f"{VM_SSH_USER}@{env['VM_IP']}"
+        while True:
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=10",
+                    "-i", str(scenario_key),
+                    scenario_target,
+                    cleanup_check,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+            if time.monotonic() >= deadline:
+                die(
+                    "LocalDNS host state remained after reset: "
+                    f"rc={result.returncode}, stderr={result.stderr.strip()}"
+                )
+            time.sleep(2)
 
     log(f"Agent config scenario {name!r} passed")
 
