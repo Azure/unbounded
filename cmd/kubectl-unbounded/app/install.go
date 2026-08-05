@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -46,10 +47,6 @@ const (
 	// operatorCRDRepairAnnotation restarts an existing operator when its startup
 	// CRD bootstrap needs to repair a missing or unestablished CRD.
 	operatorCRDRepairAnnotation = "unbounded-cloud.io/operator-crd-repair-token"
-
-	// fallbackImageRegistry is used only when the embedded operator ConfigMap
-	// cannot be read; normal builds render it with the build-time CONTAINER_REGISTRY.
-	fallbackImageRegistry = "ghcr.io/azure"
 )
 
 type installHandler struct {
@@ -302,9 +299,19 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	// operator image this binary deploys. Deriving it from the build (rather than
 	// preserving a stored cluster value) keeps it in lockstep with the operator
 	// image, which install also re-derives from the binary on every run, and
-	// avoids the #574 drift where the two could diverge. A stored value from an
-	// older install is simply overwritten.
-	imageRegistry := h.embeddedImageRegistry()
+	// avoids the #574 drift where the two could diverge. An explicit
+	// --image-registry wins; otherwise the build-derived value is required. A
+	// stored value from an older install is simply overwritten.
+	imageRegistry := h.imageRegistry
+	if imageRegistry == "" {
+		embedded, err := h.embeddedImageRegistry()
+		if err != nil {
+			return fmt.Errorf("determine component image registry from the embedded operator manifests: %w; pass --image-registry to set it explicitly", err)
+		}
+
+		imageRegistry = embedded
+	}
+
 	reapLegacyResources := true
 	previousImageRegistry := ""
 	configMap := &unstructured.Unstructured{}
@@ -341,10 +348,6 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 		endpoint = h.apiServerEndpoint
 	}
 
-	if h.imageRegistry != "" {
-		imageRegistry = h.imageRegistry
-	}
-
 	// Surface a registry change so repointing components is not silent (the main
 	// concern in #574): an upgrade of an existing cluster rewrites a pre-#574
 	// bare "ghcr.io" to the resolved full prefix.
@@ -375,18 +378,20 @@ func (h *installHandler) manifests() fs.FS {
 // embeddedImageRegistry returns the UNBOUNDED_IMAGE_REGISTRY baked into the
 // embedded operator ConfigMap at build time. Tying the component registry to the
 // build keeps it in lockstep with the operator image the binary deploys, so fork
-// and mirror builds work without a flag. It falls back to the release default
-// only if the manifest is unreadable.
-func (h *installHandler) embeddedImageRegistry() string {
+// and mirror builds work without a flag. It fails closed: an unreadable manifest
+// set, a missing unbounded-operator-config ConfigMap, or an empty registry value
+// is an error rather than a silent fallback to the upstream default, so a
+// malformed build cannot quietly install upstream components.
+func (h *installHandler) embeddedImageRegistry() (string, error) {
 	files, err := yamlFiles(h.manifests())
 	if err != nil {
-		return fallbackImageRegistry
+		return "", fmt.Errorf("list embedded operator manifests: %w", err)
 	}
 
 	for _, file := range files {
 		data, err := fs.ReadFile(h.manifests(), file)
 		if err != nil {
-			continue
+			return "", fmt.Errorf("read embedded operator manifest %s: %w", file, err)
 		}
 
 		decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
@@ -394,7 +399,11 @@ func (h *installHandler) embeddedImageRegistry() string {
 		for {
 			obj := &unstructured.Unstructured{}
 			if err := decoder.Decode(obj); err != nil {
-				break
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				return "", fmt.Errorf("decode embedded operator manifest %s: %w", file, err)
 			}
 
 			if obj.Object == nil || obj.GetKind() != "ConfigMap" || obj.GetName() != "unbounded-operator-config" {
@@ -402,13 +411,19 @@ func (h *installHandler) embeddedImageRegistry() string {
 			}
 
 			value, _, err := unstructured.NestedString(obj.Object, "data", "UNBOUNDED_IMAGE_REGISTRY")
-			if err == nil && value != "" {
-				return value
+			if err != nil {
+				return "", fmt.Errorf("read UNBOUNDED_IMAGE_REGISTRY from embedded unbounded-operator-config: %w", err)
 			}
+
+			if value == "" {
+				return "", fmt.Errorf("embedded unbounded-operator-config has an empty UNBOUNDED_IMAGE_REGISTRY")
+			}
+
+			return value, nil
 		}
 	}
 
-	return fallbackImageRegistry
+	return "", fmt.Errorf("embedded operator manifests contain no unbounded-operator-config ConfigMap")
 }
 
 func (h *installHandler) prepareOperatorRepair(ctx context.Context) error {

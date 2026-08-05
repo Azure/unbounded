@@ -411,6 +411,123 @@ spec:
 	require.Equal(t, "ghcr.io/myorg/unbounded-operator:v1.2.3", containers[0].(map[string]any)["image"])
 }
 
+// TestEmbeddedImageRegistryFailsClosed asserts the build-derived registry lookup
+// returns an error (rather than silently falling back to ghcr.io/azure) when the
+// embedded manifests are missing the ConfigMap, carry an empty value, or are
+// malformed, so a broken build cannot quietly install upstream components.
+func TestEmbeddedImageRegistryFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		manifests fstest.MapFS
+		want      string // "" means expect an error
+	}{
+		{
+			name: "valid",
+			manifests: fstest.MapFS{"03-configmap.yaml": &fstest.MapFile{Data: []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+data:
+  UNBOUNDED_IMAGE_REGISTRY: "ghcr.io/myorg"
+`)}},
+			want: "ghcr.io/myorg",
+		},
+		{
+			name:      "no configmap",
+			manifests: fstest.MapFS{"04-deployment.yaml": &fstest.MapFile{Data: []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: unbounded-operator\n")}},
+		},
+		{
+			name: "empty value",
+			manifests: fstest.MapFS{"03-configmap.yaml": &fstest.MapFile{Data: []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+data:
+  UNBOUNDED_IMAGE_REGISTRY: ""
+`)}},
+		},
+		{
+			name:      "malformed yaml",
+			manifests: fstest.MapFS{"03-configmap.yaml": &fstest.MapFile{Data: []byte("this: [is: not: valid: yaml")}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := installHandler{operatorManifests: tc.manifests}
+
+			got, err := h.embeddedImageRegistry()
+			if tc.want == "" {
+				require.Error(t, err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestInstallFailsClosedOnUnresolvableRegistry asserts install errors (rather
+// than defaulting to ghcr.io/azure) when the embedded registry cannot be
+// resolved and no --image-registry is given, and that --image-registry overrides
+// an unresolvable embedded value.
+func TestInstallFailsClosedOnUnresolvableRegistry(t *testing.T) {
+	t.Parallel()
+
+	brokenManifests := fstest.MapFS{
+		"03-configmap.yaml": &fstest.MapFile{Data: []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+data:
+  UNBOUNDED_IMAGE_REGISTRY: ""
+`)},
+	}
+
+	t.Run("errors without a flag", func(t *testing.T) {
+		t.Parallel()
+
+		cli, captured := newCapturingInstallClient()
+		h := installHandler{
+			namespace:         "unbounded-system",
+			kubeResourcesCli:  cli,
+			operatorManifests: brokenManifests,
+			logger:            discardLogger(),
+		}
+
+		err := h.execute(context.Background())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "--image-registry")
+		require.Zero(t, captured.applyCount)
+	})
+
+	t.Run("flag overrides unresolvable embedded value", func(t *testing.T) {
+		t.Parallel()
+
+		cli, captured := newCapturingInstallClient()
+		h := installHandler{
+			namespace:         "unbounded-system",
+			kubeResourcesCli:  cli,
+			operatorManifests: brokenManifests,
+			imageRegistry:     "registry.corp/unbounded",
+			logger:            discardLogger(),
+		}
+
+		require.NoError(t, h.execute(context.Background()))
+		require.NotNil(t, captured.configMap)
+
+		data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+		require.NoError(t, err)
+		require.Equal(t, "registry.corp/unbounded", data["UNBOUNDED_IMAGE_REGISTRY"])
+	})
+}
+
 func TestInstallRejectsInvalidLiveReaperConfigBeforeApply(t *testing.T) {
 	t.Parallel()
 
