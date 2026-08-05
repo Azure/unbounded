@@ -39,6 +39,7 @@ operator-vm-check:
 	./deploy.sh plan deploy.env.example >/dev/null
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
+	! grep -Eq '^[[:space:]]*export START_BENCHMARK=false' deploy.sh
 
 deploy: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh deploy "$(DEPLOY_CONFIG)"

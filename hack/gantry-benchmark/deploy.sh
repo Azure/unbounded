@@ -909,13 +909,12 @@ provision_operator() {
   export BENCHMARK_SOURCE_IMAGE=$SOURCE_IMAGE BENCHMARK_SOURCE_REVISION=$source_revision
   export BENCHMARK_NODE_COUNT BENCHMARK_IMAGE_SIZE_MIB BENCHMARK_IMAGE_LAYERS
   export BENCHMARK_AZURE_TELEMETRY=true BENCHMARK_MINIMUM_BYTE_REDUCTION BENCHMARK_MAXIMUM_LATENCY_RATIO
-  export START_BENCHMARK=false
   AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID=$(az network private-endpoint show \
     -g "$AZURE_RESOURCE_GROUP" -n "$BASELINE_PRIVATE_ENDPOINT_NAME" --query id -o tsv)
   AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID=$(az network private-endpoint show \
     -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_PRIVATE_ENDPOINT_NAME" --query id -o tsv)
   export AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID
-  "$repo_root/hack/gantry-benchmark/operator-vm-provision.sh"
+  START_BENCHMARK=false "$repo_root/hack/gantry-benchmark/operator-vm-provision.sh"
 
   assert_equal "operator VM size" \
     "$(az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" --query hardwareProfile.vmSize -o tsv)" \
