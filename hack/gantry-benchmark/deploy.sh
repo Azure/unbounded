@@ -81,6 +81,7 @@ BENCHMARK_IMAGE_SIZE_MIB=${BENCHMARK_IMAGE_SIZE_MIB:-40960}
 BENCHMARK_IMAGE_LAYERS=${BENCHMARK_IMAGE_LAYERS:-40}
 BENCHMARK_MINIMUM_BYTE_REDUCTION=${BENCHMARK_MINIMUM_BYTE_REDUCTION:-0.90}
 BENCHMARK_MAXIMUM_LATENCY_RATIO=${BENCHMARK_MAXIMUM_LATENCY_RATIO:-1.0}
+BASELINE_PULL_MAX_NODE_RESTARTS=${BASELINE_PULL_MAX_NODE_RESTARTS:-5}
 
 GANTRY_NAMESPACE=${GANTRY_NAMESPACE:-gantry-system}
 BENCHMARK_NAMESPACE=${BENCHMARK_NAMESPACE:-gantry-benchmark}
@@ -122,6 +123,10 @@ GANTRY_ACR_DATA_HOST=${GANTRY_ACR_NAME}.${AZURE_LOCATION}.data.azurecr.io
 [[ "$BENCHMARK_IMAGE_LAYERS" =~ ^[1-9][0-9]*$ ]] || { echo "BENCHMARK_IMAGE_LAYERS must be positive" >&2; exit 2; }
 ((BENCHMARK_IMAGE_LAYERS <= BENCHMARK_IMAGE_SIZE_MIB)) || {
   echo "BENCHMARK_IMAGE_LAYERS cannot exceed BENCHMARK_IMAGE_SIZE_MIB" >&2
+  exit 2
+}
+[[ "$BASELINE_PULL_MAX_NODE_RESTARTS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "BASELINE_PULL_MAX_NODE_RESTARTS must be positive" >&2
   exit 2
 }
 for acr_name in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
@@ -754,6 +759,53 @@ GUARD
   kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-acr-private-dns-guard --timeout=30m
 }
 
+restart_private_pull_tls_nodes() {
+  local pods_json node provider_id vmss instance_id old_boot_id
+  local -a nodes
+  pods_json=$(kubectl -n "$GANTRY_NAMESPACE" get pods \
+    -l app.kubernetes.io/name=gantry-baseline-acr-pull-probe -o json)
+  mapfile -t nodes < <(jq -r '.items[] |
+    select(any(.status.containerStatuses[]?; ((.state.waiting.message? // "") | contains("TLS handshake timeout")))) |
+    .spec.nodeName' <<<"$pods_json" | sort -u)
+  ((${#nodes[@]} > 0)) || return 1
+  ((${#nodes[@]} <= BASELINE_PULL_MAX_NODE_RESTARTS)) || {
+    echo "refusing to restart ${#nodes[@]} nodes with ACR TLS handshake timeouts; limit is $BASELINE_PULL_MAX_NODE_RESTARTS" >&2
+    return 1
+  }
+
+  for node in "${nodes[@]}"; do
+    provider_id=$(kubectl get node "$node" -o jsonpath='{.spec.providerID}')
+    vmss=$(sed -n 's#^.*/virtualMachineScaleSets/\([^/]*\)/virtualMachines/[^/]*$#\1#p' <<<"$provider_id")
+    instance_id=$(sed -n 's#^.*/virtualMachineScaleSets/[^/]*/virtualMachines/\([^/]*\)$#\1#p' <<<"$provider_id")
+    [[ -n "$vmss" && -n "$instance_id" ]] || {
+      echo "cannot parse VMSS instance from provider ID for $node: $provider_id" >&2
+      return 1
+    }
+    old_boot_id=$(kubectl get node "$node" -o jsonpath='{.status.nodeInfo.bootID}')
+    log "restarting $node (VMSS $vmss instance $instance_id) after ACR Private Endpoint TLS timeouts"
+    az vmss restart -g "$AZURE_NODE_RESOURCE_GROUP" -n "$vmss" \
+      --instance-ids "$instance_id" --only-show-errors -o none
+
+    local attempt current_boot_id ready
+    for attempt in $(seq 1 90); do
+      current_boot_id=$(kubectl get node "$node" -o jsonpath='{.status.nodeInfo.bootID}' 2>/dev/null || true)
+      ready=$(kubectl get node "$node" -o json | \
+        jq -r 'any(.status.conditions[]; .type == "Ready" and .status == "True")' 2>/dev/null || true)
+      if [[ -n "$current_boot_id" && "$current_boot_id" != "$old_boot_id" && "$ready" == true ]]; then
+        break
+      fi
+      sleep 10
+    done
+    [[ -n "$current_boot_id" && "$current_boot_id" != "$old_boot_id" && "$ready" == true ]] || {
+      echo "$node did not return Ready with a new boot ID after restart" >&2
+      return 1
+    }
+    kubectl -n "$GANTRY_NAMESPACE" delete pod \
+      -l app.kubernetes.io/name=gantry-baseline-acr-pull-probe \
+      --field-selector "spec.nodeName=$node" --wait=false
+  done
+}
+
 verify_private_baseline_pull() {
   export KUBECONFIG
   local manifest=$DEPLOY_STATE_DIR/baseline-private-pull-probe.yaml
@@ -793,12 +845,17 @@ spec:
 PROBE
   kubectl apply -f "$manifest"
   local ready=false
+  local repair_attempted=false
   local attempt
   for attempt in $(seq 1 6); do
     if kubectl -n "$GANTRY_NAMESPACE" rollout status \
       daemonset/gantry-baseline-acr-pull-probe --timeout=5m; then
       ready=true
       break
+    fi
+    if [[ "$repair_attempted" == false ]] && restart_private_pull_tls_nodes; then
+      repair_attempted=true
+      continue
     fi
     log "waiting for baseline AcrPull propagation ($attempt/6)"
   done
