@@ -121,9 +121,11 @@ changelog:
       - "^chore:"
 
 release:
-  github:
-    owner: Azure
-    name: unbounded
+  # owner/name are intentionally omitted so GoReleaser targets the repository the
+  # workflow runs in (detected from the git remote). The Actions GITHUB_TOKEN is
+  # scoped to that repository, so a release can only ever be created where the
+  # workflow runs; hardcoding Azure/unbounded only broke fork releases without
+  # adding any guard.
   # Always create as draft. The release workflow attaches additional
   # artifacts (manifests tarball, krew manifest, image signatures) before
   # a human flips the release to published.
