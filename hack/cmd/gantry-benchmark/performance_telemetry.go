@@ -76,7 +76,7 @@ func (b *benchmark) capturePhasePerformanceTelemetry(
 		{name: "node_network_transmit_errors_per_second", query: `rate(node_network_transmit_errs_total{gantry_benchmark="true",device!="lo"}[30s])`},
 		{name: "node_cpu_busy_ratio", query: `1 - avg by(pod) (rate(node_cpu_seconds_total{gantry_benchmark="true",mode="idle"}[30s]))`},
 		{name: "node_memory_available_bytes", query: `node_memory_MemAvailable_bytes{gantry_benchmark="true"}`},
-		{name: "containerd_process", query: `{__name__=~"process_(cpu_seconds_total|resident_memory_bytes|virtual_memory_bytes)",gantry_benchmark="true",endpoint="containerd-metrics"}`},
+		{name: "containerd_process", query: `{__name__=~"process_(cpu_seconds_total|resident_memory_bytes|virtual_memory_bytes)",gantry_benchmark="true",endpoint="ctr-metrics"}`},
 		{name: "containerd_metrics", query: `{__name__=~"containerd_.*|grpc_server_.*",gantry_benchmark="true"}`},
 		{name: "gantry_peer_outcomes", query: `p2p_peer_fetch_total{gantry_benchmark="true"}`},
 		{name: "gantry_peer_busy_stall_timestamps", query: `gantry_peer_fetch_last_timestamp_seconds{outcome=~"busy|stall",gantry_benchmark="true"}`},

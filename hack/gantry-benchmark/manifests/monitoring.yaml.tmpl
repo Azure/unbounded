@@ -99,7 +99,7 @@ spec:
           image: mcr.microsoft.com/cbl-mariner/busybox:2.0
           command: ["sh", "-c", "exec sleep 2147483647"]
           ports:
-            - name: containerd-metrics
+            - name: ctr-metrics
               containerPort: 10257
           resources:
             requests:
@@ -186,7 +186,7 @@ spec:
         - action: replace
           targetLabel: gantry_benchmark
           replacement: "true"
-    - port: containerd-metrics
+    - port: ctr-metrics
       path: /v1/metrics
       interval: 10s
       metricRelabelings:
