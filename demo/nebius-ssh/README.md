@@ -161,8 +161,7 @@ kubectl unbounded site init \
   --cluster-node-cidr <AKS_NODE_CIDR> \
   --cluster-pod-cidr <AKS_POD_CIDR> \
   --node-cidr 172.20.0.0/16 \
-  --pod-cidr 10.200.0.0/16 \
-  --skip-install
+  --pod-cidr 10.200.0.0/16
 ssh-keygen -t ed25519 -f ./unbounded_ed25519 -N ""
 ```
 

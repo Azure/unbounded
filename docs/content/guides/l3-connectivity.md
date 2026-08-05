@@ -337,10 +337,14 @@ kubectl get nodes -l unbounded-cloud.io/unbounded-net-gateway=true
 
 ## 6. Initialize the Site
 
-Run `kubectl unbounded site init` to bootstrap the operator and create site
-resources. The CIDRs must match the networks reachable over the VPN:
+Install `unbounded-operator` (if you haven't already), then run
+`kubectl unbounded site init` to create the site resources. `site init` requires
+the operator to be installed and errors otherwise. The CIDRs must match the
+networks reachable over the VPN:
 
 ```bash
+kubectl unbounded install
+
 kubectl unbounded site init \
     --name ubiquiti-site \
     --cluster-node-cidr 10.224.0.0/16 \
