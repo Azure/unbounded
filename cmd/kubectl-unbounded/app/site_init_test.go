@@ -6,6 +6,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -14,8 +15,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -304,99 +309,136 @@ func bufferLogger() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})), buf
 }
 
-// unestablishedCRD builds a CRD without the Established condition.
-func unestablishedCRD(name string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "apiextensions.k8s.io/v1",
-		"kind":       "CustomResourceDefinition",
-		"metadata":   map[string]any{"name": name},
-	}}
-}
-
-func establishedSiteCRDs() []client.Object {
-	objects := make([]client.Object, 0, len(siteRequiredCRDs))
-	for _, name := range siteRequiredCRDs {
-		objects = append(objects, establishedCRD(name))
+// servedSiteAPIs returns the discovery resource lists for a cluster that serves
+// every API type site init applies. Individual tests drop entries to simulate an
+// operator that is not (yet) installed.
+func servedSiteAPIs() []*metav1.APIResourceList {
+	return []*metav1.APIResourceList{
+		{
+			GroupVersion: "unbounded-cloud.io/v1alpha3",
+			APIResources: []metav1.APIResource{
+				{Name: "sites", Kind: "Site"},
+			},
+		},
+		{
+			GroupVersion: "net.unbounded-cloud.io/v1alpha1",
+			APIResources: []metav1.APIResource{
+				{Name: "gatewaypools", Kind: "GatewayPool"},
+				{Name: "sitegatewaypoolassignments", Kind: "SiteGatewayPoolAssignment"},
+			},
+		},
 	}
-
-	return objects
 }
 
-func TestCheckOperatorPrerequisites_MissingCRDs(t *testing.T) {
-	cli := fakeclient.NewClientBuilder().Build()
+// fakeClusterServing builds a fake clientset whose discovery serves the given
+// resource lists and whose objects seed the typed tracker.
+func fakeClusterServing(resources []*metav1.APIResourceList, objects ...runtime.Object) *k8sfake.Clientset {
+	cs := k8sfake.NewClientset(objects...)
+	cs.Resources = resources
+
+	return cs
+}
+
+func TestRequiredSiteAPIs(t *testing.T) {
+	gvks, err := requiredSiteAPIs()
+	require.NoError(t, err)
+
+	require.ElementsMatch(t, []schema.GroupVersionKind{
+		{Group: "unbounded-cloud.io", Version: "v1alpha3", Kind: "Site"},
+		{Group: "net.unbounded-cloud.io", Version: "v1alpha1", Kind: "GatewayPool"},
+		{Group: "net.unbounded-cloud.io", Version: "v1alpha1", Kind: "SiteGatewayPoolAssignment"},
+	}, gvks)
+}
+
+func TestCheckOperatorPrerequisites_APITypesNotServed(t *testing.T) {
+	cli := fakeClusterServing(nil)
 
 	logger, _ := bufferLogger()
-	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+	h := &siteInitHandler{kubeCli: cli, logger: logger}
 
 	err := h.checkOperatorPrerequisites(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unbounded-operator is not installed")
 	require.Contains(t, err.Error(), "kubectl unbounded install")
-	require.Contains(t, err.Error(), "sites.unbounded-cloud.io")
+	require.Contains(t, err.Error(), "Site.unbounded-cloud.io/v1alpha3")
 }
 
-func TestCheckOperatorPrerequisites_CRDsNotEstablished(t *testing.T) {
-	objects := make([]client.Object, 0, len(siteRequiredCRDs))
-	for _, name := range siteRequiredCRDs {
-		objects = append(objects, unestablishedCRD(name))
-	}
-
-	cli := fakeclient.NewClientBuilder().WithObjects(objects...).Build()
+func TestCheckOperatorPrerequisites_NetGroupNotServed(t *testing.T) {
+	// Only the machina (Site) group is served; the net types are still missing.
+	cli := fakeClusterServing([]*metav1.APIResourceList{servedSiteAPIs()[0]})
 
 	logger, _ := bufferLogger()
-	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+	h := &siteInitHandler{kubeCli: cli, logger: logger}
 
 	err := h.checkOperatorPrerequisites(context.Background())
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "not established")
-	require.Contains(t, err.Error(), "kubectl unbounded install")
+	require.Contains(t, err.Error(), "GatewayPool.net.unbounded-cloud.io/v1alpha1")
+	require.Contains(t, err.Error(), "SiteGatewayPoolAssignment.net.unbounded-cloud.io/v1alpha1")
+	require.NotContains(t, err.Error(), "Site.unbounded-cloud.io/v1alpha3")
 }
 
 func TestCheckOperatorPrerequisites_OperatorAbsentWarns(t *testing.T) {
-	cli := fakeclient.NewClientBuilder().WithObjects(establishedSiteCRDs()...).Build()
+	// All required types are served but the operator Deployment is absent: site
+	// init must proceed (no error) and only warn.
+	cli := fakeClusterServing(servedSiteAPIs())
 
 	logger, logs := bufferLogger()
-	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+	h := &siteInitHandler{kubeCli: cli, logger: logger}
 
-	// CRDs are established but the operator Deployment is absent: site init must
-	// proceed (no error) and only warn.
 	require.NoError(t, h.checkOperatorPrerequisites(context.Background()))
 	require.Contains(t, logs.String(), "unbounded-operator Deployment not found")
 }
 
 func TestCheckOperatorPrerequisites_OperatorNotRolledOutWarns(t *testing.T) {
-	objects := establishedSiteCRDs()
 	// Old pod Available while the new pod surges in: rollout is not complete.
-	objects = append(objects, operatorDeployment(appsv1.DeploymentStatus{
+	deploy := operatorDeployment(appsv1.DeploymentStatus{
 		ObservedGeneration: 2,
 		Replicas:           2,
 		UpdatedReplicas:    1,
 		AvailableReplicas:  1,
-	}))
-
-	cli := fakeclient.NewClientBuilder().WithObjects(objects...).Build()
+	})
+	cli := fakeClusterServing(servedSiteAPIs(), deploy)
 
 	logger, logs := bufferLogger()
-	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+	h := &siteInitHandler{kubeCli: cli, logger: logger}
 
 	require.NoError(t, h.checkOperatorPrerequisites(context.Background()))
 	require.Contains(t, logs.String(), "not fully rolled out")
 }
 
 func TestCheckOperatorPrerequisites_Ready(t *testing.T) {
-	objects := establishedSiteCRDs()
-	objects = append(objects, operatorDeployment(appsv1.DeploymentStatus{
+	deploy := operatorDeployment(appsv1.DeploymentStatus{
 		ObservedGeneration: 2,
 		Replicas:           1,
 		UpdatedReplicas:    1,
 		AvailableReplicas:  1,
-	}))
-
-	cli := fakeclient.NewClientBuilder().WithObjects(objects...).Build()
+	})
+	cli := fakeClusterServing(servedSiteAPIs(), deploy)
 
 	logger, logs := bufferLogger()
-	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+	h := &siteInitHandler{kubeCli: cli, logger: logger}
 
 	require.NoError(t, h.checkOperatorPrerequisites(context.Background()))
 	require.Empty(t, logs.String(), "a ready operator must not produce warnings")
+}
+
+// TestCheckOperatorPrerequisites_DeploymentForbiddenDoesNotFail proves that a
+// caller who may create Sites but cannot read Deployments is not blocked: the
+// served-API check passes and the forbidden Deployment read is downgraded to a
+// debug log (no warning, no error).
+func TestCheckOperatorPrerequisites_DeploymentForbiddenDoesNotFail(t *testing.T) {
+	cli := fakeClusterServing(servedSiteAPIs())
+	cli.PrependReactor("get", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(
+			schema.GroupResource{Group: "apps", Resource: "deployments"},
+			"unbounded-operator",
+			errors.New("not allowed"),
+		)
+	})
+
+	logger, logs := bufferLogger()
+	h := &siteInitHandler{kubeCli: cli, logger: logger}
+
+	require.NoError(t, h.checkOperatorPrerequisites(context.Background()))
+	require.Empty(t, logs.String(), "a forbidden Deployment read must not warn or fail")
 }
