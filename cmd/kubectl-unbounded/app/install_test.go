@@ -423,6 +423,23 @@ func TestInstallRejectsRegistryQualifiedOperatorImage(t *testing.T) {
 	require.Zero(t, captured.applyCount)
 }
 
+// TestResolveImagesRejectsNestedEmbeddedOperatorImage guards the derived
+// name:tag: if the embedded operator image sits below its registry (so it cannot
+// be re-expressed as a name:tag under another registry), install fails closed and
+// points at --operator-image. The render pipeline never produces this; it guards
+// a hand-edited manifest.
+func TestResolveImagesRejectsNestedEmbeddedOperatorImage(t *testing.T) {
+	t.Parallel()
+
+	h := installHandler{
+		operatorManifests: operatorManifestsFS("ghcr.io/azure", "ghcr.io/azure/sub/unbounded-operator:v1"),
+	}
+
+	_, _, err := h.resolveImages()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--operator-image")
+}
+
 // TestInstallForkBuildDerivesEmbeddedRegistry asserts a fork build (whose
 // embedded manifests were rendered with CONTAINER_REGISTRY=ghcr.io/myorg)
 // installs its own operator image and configures components from its own
