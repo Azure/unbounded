@@ -166,6 +166,7 @@ retry_command() {
     if ((attempt == attempts)); then
       return 1
     fi
+    log "attempt $attempt/$attempts failed; retrying in ${delay}s"
     sleep "$delay"
   done
 }
@@ -366,6 +367,10 @@ ensure_acr() {
     --data-endpoint-enabled true --only-show-errors -o none
 }
 
+acr_public_access_enabled() {
+  [[ $(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --query publicNetworkAccess -o tsv) == Enabled ]]
+}
+
 build_source_image() {
   log "publishing private source carrier from $source_revision"
   SOURCE_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry-benchmark-source:$source_revision
@@ -374,7 +379,9 @@ build_source_image() {
   az acr update -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
     --public-network-enabled true --only-show-errors -o none
 
-  retry_command 6 20 az acr build \
+  retry_command 30 10 acr_public_access_enabled
+
+  retry_command 18 30 az acr build \
     --registry "$GANTRY_ACR_NAME" \
     --image "gantry-benchmark-source:$source_revision" \
     --file "$repo_root/images/gantry-benchmark-source/Containerfile" \
