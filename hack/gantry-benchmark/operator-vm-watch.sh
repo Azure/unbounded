@@ -10,6 +10,7 @@ OPERATOR_SSH_HOST="${OPERATOR_SSH_HOST:-}"
 OPERATOR_SSH_KEY="${OPERATOR_SSH_KEY:-}"
 OPERATOR_SSH_USER="${OPERATOR_SSH_USER:-benchmark}"
 WATCH_INTERVAL_SECONDS="${WATCH_INTERVAL_SECONDS:-30}"
+OPERATOR_RUN_COMMAND_LOCK="${OPERATOR_RUN_COMMAND_LOCK:-${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.run-command.lock}"
 follow=false
 
 usage() {
@@ -63,6 +64,9 @@ status_once() {
       'sudo -n /opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh')
   else
     : "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP when OPERATOR_SSH_HOST is not set}"
+    local run_command_lock_fd
+    exec {run_command_lock_fd}>"$OPERATOR_RUN_COMMAND_LOCK"
+    flock "$run_command_lock_fd"
     output=$(az vm run-command invoke \
       -g "$AZURE_RESOURCE_GROUP" \
       -n "$OPERATOR_VM_NAME" \
@@ -71,6 +75,8 @@ status_once() {
       --only-show-errors \
       --query 'value[0].message' \
       -o tsv)
+    flock -u "$run_command_lock_fd"
+    exec {run_command_lock_fd}>&-
   fi
 
   printf '%s\n' "$output" | sed \

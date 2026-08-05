@@ -102,6 +102,7 @@ START_BENCHMARK=${START_BENCHMARK:-false}
 DEPLOY_CONFIRM=${DEPLOY_CONFIRM:-}
 DEPLOY_STATE_DIR=${DEPLOY_STATE_DIR:-$repo_root/tmp/$DEPLOYMENT_NAME}
 KUBECONFIG=${DEPLOY_KUBECONFIG:-$DEPLOY_STATE_DIR/kubeconfig}
+OPERATOR_RUN_COMMAND_LOCK=${OPERATOR_RUN_COMMAND_LOCK:-${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.run-command.lock}
 
 BASELINE_PRIVATE_ENDPOINT_NAME=${BASELINE_PRIVATE_ENDPOINT_NAME:-${DEPLOYMENT_NAME}-baseline-acr-pe}
 GANTRY_PRIVATE_ENDPOINT_NAME=${GANTRY_PRIVATE_ENDPOINT_NAME:-${DEPLOYMENT_NAME}-gantry-acr-pe}
@@ -889,6 +890,17 @@ build_operator_images() {
   }
 }
 
+acquire_operator_run_command_lock() {
+  log "waiting for exclusive operator VM Run Command access"
+  exec {operator_run_command_lock_fd}>"$OPERATOR_RUN_COMMAND_LOCK"
+  flock "$operator_run_command_lock_fd"
+}
+
+release_operator_run_command_lock() {
+  flock -u "$operator_run_command_lock_fd"
+  exec {operator_run_command_lock_fd}>&-
+}
+
 guard_active_benchmark
 ensure_group
 ensure_vnet
@@ -912,8 +924,10 @@ install_monitoring
 
 set_acrs_private
 
+acquire_operator_run_command_lock
 provision_operator
 build_operator_images
+release_operator_run_command_lock
 verify_private_baseline_pull
 deploy_gantry
 
@@ -934,10 +948,12 @@ done
 
 if [[ "$START_BENCHMARK" == true ]]; then
   log "starting benchmark operator service"
+  acquire_operator_run_command_lock
   az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
     --command-id RunShellScript \
     --scripts 'systemctl reset-failed gantry-benchmark-operator.service; systemctl start --no-block gantry-benchmark-operator.service' \
     --only-show-errors -o none
+  release_operator_run_command_lock
 fi
 
 trap - EXIT INT TERM
