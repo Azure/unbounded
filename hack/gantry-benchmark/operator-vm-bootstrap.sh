@@ -10,11 +10,12 @@ Usage: operator-vm-bootstrap.sh <subscription> <resource-group> <aks-cluster> \
   <baseline-acr> <gantry-acr> <workspace-customer-id> <baseline-pe-id> \
   <gantry-pe-id> <repo-url> <repo-branch> <node-count> <image-size-mib> \
   <image-layers> <azure-telemetry> <minimum-byte-reduction> <maximum-latency-ratio> \
-  <build-disk-lun> <build-mount> <source-image> <source-revision>
+  <build-disk-lun> <build-mount> <source-image> <source-revision> \
+  <adopt-baseline-image> <adopt-gantry-image> <adopt-payload-sha256>
 USAGE
 }
 
-[[ $# -eq 20 ]] || { usage >&2; exit 2; }
+[[ $# -eq 23 ]] || { usage >&2; exit 2; }
 
 subscription_id=$1
 resource_group=$2
@@ -36,6 +37,21 @@ build_disk_lun=${17}
 build_mount=${18}
 source_image=${19}
 source_revision=${20}
+adopt_baseline_image=${21}
+adopt_gantry_image=${22}
+adopt_payload_sha256=${23}
+[[ "$adopt_baseline_image" != - ]] || adopt_baseline_image=""
+[[ "$adopt_gantry_image" != - ]] || adopt_gantry_image=""
+[[ "$adopt_payload_sha256" != - ]] || adopt_payload_sha256=""
+
+adoption_values=0
+for value in "$adopt_baseline_image" "$adopt_gantry_image" "$adopt_payload_sha256"; do
+  [[ -z "$value" ]] || adoption_values=$((adoption_values + 1))
+done
+if ((adoption_values != 0 && adoption_values != 3)); then
+  echo "adopted baseline image, Gantry image, and payload digest must be set together" >&2
+  exit 2
+fi
 
 retry() {
   local attempts=0
@@ -226,6 +242,27 @@ aks_id=$(az aks show -g "$resource_group" -n "$aks_cluster" --query id -o tsv)
 baseline_login_server=$(az acr show -g "$resource_group" -n "$baseline_acr_name" --query loginServer -o tsv)
 gantry_login_server=$(az acr show -g "$resource_group" -n "$gantry_acr_name" --query loginServer -o tsv)
 
+valid_adopted_image() {
+  local image=$1
+  local login_server=$2
+  local prefix="$login_server/gantry-benchmark-pull@"
+  [[ "$image" == "$prefix"* && "${image#"$prefix"}" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+if ((adoption_values == 3)); then
+  valid_adopted_image "$adopt_baseline_image" "$baseline_login_server" || {
+    echo "adopted baseline image is not an immutable gantry-benchmark-pull image in $baseline_login_server" >&2
+    exit 2
+  }
+  valid_adopted_image "$adopt_gantry_image" "$gantry_login_server" || {
+    echo "adopted Gantry image is not an immutable gantry-benchmark-pull image in $gantry_login_server" >&2
+    exit 2
+  }
+  [[ "$adopt_payload_sha256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "adopted payload fingerprint must be a sha256 digest" >&2
+    exit 2
+  }
+fi
+
 cat >/etc/gantry-benchmark/env <<ENV
 AZURE_SUBSCRIPTION_ID="$subscription_id"
 AZURE_RESOURCE_GROUP="$resource_group"
@@ -270,6 +307,9 @@ BENCHMARK_WORKLOAD_REPOSITORY="gantry-benchmark-pull"
 BENCHMARK_ROLLOUT_TIMEOUT="15m"
 BENCHMARK_MINIMUM_BYTE_REDUCTION="$minimum_byte_reduction"
 BENCHMARK_MAXIMUM_LATENCY_RATIO="$maximum_latency_ratio"
+ADOPT_BASELINE_IMAGE="$adopt_baseline_image"
+ADOPT_GANTRY_IMAGE="$adopt_gantry_image"
+ADOPT_PAYLOAD_SHA256="$adopt_payload_sha256"
 CONTAINER_ENGINE="podman"
 ENV
 chmod 0600 /etc/gantry-benchmark/env

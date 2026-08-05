@@ -81,6 +81,9 @@ BENCHMARK_IMAGE_SIZE_MIB=${BENCHMARK_IMAGE_SIZE_MIB:-40960}
 BENCHMARK_IMAGE_LAYERS=${BENCHMARK_IMAGE_LAYERS:-40}
 BENCHMARK_MINIMUM_BYTE_REDUCTION=${BENCHMARK_MINIMUM_BYTE_REDUCTION:-0.90}
 BENCHMARK_MAXIMUM_LATENCY_RATIO=${BENCHMARK_MAXIMUM_LATENCY_RATIO:-1.0}
+ADOPT_BASELINE_IMAGE=${ADOPT_BASELINE_IMAGE:-}
+ADOPT_GANTRY_IMAGE=${ADOPT_GANTRY_IMAGE:-}
+ADOPT_PAYLOAD_SHA256=${ADOPT_PAYLOAD_SHA256:-}
 BASELINE_PULL_MAX_NODE_REPLACEMENTS=${BASELINE_PULL_MAX_NODE_REPLACEMENTS:-5}
 
 GANTRY_NAMESPACE=${GANTRY_NAMESPACE:-gantry-system}
@@ -139,6 +142,34 @@ done
   echo "START_BENCHMARK must be true or false" >&2
   exit 2
 }
+valid_adopted_image() {
+  local image=$1
+  local login_server=$2
+  local prefix="$login_server/gantry-benchmark-pull@"
+  [[ "$image" == "$prefix"* && "${image#"$prefix"}" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+adoption_values=0
+for value in "$ADOPT_BASELINE_IMAGE" "$ADOPT_GANTRY_IMAGE" "$ADOPT_PAYLOAD_SHA256"; do
+  [[ -z "$value" ]] || adoption_values=$((adoption_values + 1))
+done
+if ((adoption_values != 0 && adoption_values != 3)); then
+  echo "ADOPT_BASELINE_IMAGE, ADOPT_GANTRY_IMAGE, and ADOPT_PAYLOAD_SHA256 must be set together" >&2
+  exit 2
+fi
+if ((adoption_values == 3)); then
+  valid_adopted_image "$ADOPT_BASELINE_IMAGE" "$BASELINE_ACR_LOGIN_SERVER" || {
+    echo "ADOPT_BASELINE_IMAGE must be an immutable gantry-benchmark-pull image in $BASELINE_ACR_LOGIN_SERVER" >&2
+    exit 2
+  }
+  valid_adopted_image "$ADOPT_GANTRY_IMAGE" "$GANTRY_ACR_LOGIN_SERVER" || {
+    echo "ADOPT_GANTRY_IMAGE must be an immutable gantry-benchmark-pull image in $GANTRY_ACR_LOGIN_SERVER" >&2
+    exit 2
+  }
+  [[ "$ADOPT_PAYLOAD_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "ADOPT_PAYLOAD_SHA256 must be a sha256 digest" >&2
+    exit 2
+  }
+fi
 assert_default() {
   local name=$1
   local actual=$2
@@ -178,6 +209,10 @@ retry_command() {
 }
 
 print_plan() {
+  local image_preparation="build and push fresh workload images"
+  if ((adoption_values == 3)); then
+    image_preparation="adopt existing immutable workload images"
+  fi
   cat <<PLAN
 Gantry benchmark deployment plan
 
@@ -213,6 +248,10 @@ Registries
 Benchmark
   nodes:               $BENCHMARK_NODE_COUNT
   payload:             ${BENCHMARK_IMAGE_SIZE_MIB} MiB in $BENCHMARK_IMAGE_LAYERS layers
+  image preparation:   $image_preparation
+  adopted baseline:    ${ADOPT_BASELINE_IMAGE:-none}
+  adopted Gantry:      ${ADOPT_GANTRY_IMAGE:-none}
+  adopted payload:     ${ADOPT_PAYLOAD_SHA256:-none}
   monitoring:          kube-prometheus-stack $KPS_CHART_VERSION with benchmark-only discovery
   operator:            $OPERATOR_VM_SIZE with ${OPERATOR_BUILD_DISK_GB} GiB $OPERATOR_BUILD_DISK_SKU
   start benchmark:     $START_BENCHMARK
@@ -909,6 +948,7 @@ provision_operator() {
   export BENCHMARK_SOURCE_IMAGE=$SOURCE_IMAGE BENCHMARK_SOURCE_REVISION=$source_revision
   export BENCHMARK_NODE_COUNT BENCHMARK_IMAGE_SIZE_MIB BENCHMARK_IMAGE_LAYERS
   export BENCHMARK_AZURE_TELEMETRY=true BENCHMARK_MINIMUM_BYTE_REDUCTION BENCHMARK_MAXIMUM_LATENCY_RATIO
+  export ADOPT_BASELINE_IMAGE ADOPT_GANTRY_IMAGE ADOPT_PAYLOAD_SHA256
   AZURE_BASELINE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID=$(az network private-endpoint show \
     -g "$AZURE_RESOURCE_GROUP" -n "$BASELINE_PRIVATE_ENDPOINT_NAME" --query id -o tsv)
   AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID=$(az network private-endpoint show \
