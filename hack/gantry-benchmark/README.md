@@ -207,10 +207,13 @@ is the default status transport. SSH is optional only when the operator has
 deliberately provided private network connectivity to the VM.
 
 The live view reports the lifecycle stage and start time, immutable run shape,
-payload files/bytes/percentage, active Podman build or push, VM disk usage,
-Kubernetes Job completion, Gantry readiness, recent logs, and the final report.
-Use `operator-vm-status` for a single snapshot. Override the refresh cadence
-with `WATCH_INTERVAL_SECONDS` (default 30).
+payload files/bytes/percentage, each baseline and Gantry-cold image reference,
+image size, layer count, build/push state, completed digest, active image
+operation and elapsed time, per-phase Kubernetes Job completion, Gantry
+readiness, recent logs, and the final report. Podman 4.9 does not expose a
+machine-readable live push byte percentage, so the view reports that limitation
+instead of estimating it. Use `operator-vm-status` for a single snapshot.
+Override the refresh cadence with `WATCH_INTERVAL_SECONDS` (default 30).
 
 Artifacts persist on the VM under
 `/var/lib/gantry-benchmark/artifacts/<run-id>/`; `latest` points at the newest

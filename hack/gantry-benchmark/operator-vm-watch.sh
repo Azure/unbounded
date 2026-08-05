@@ -4,6 +4,8 @@
 
 set -Eeuo pipefail
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-}"
 OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
 OPERATOR_SSH_HOST="${OPERATOR_SSH_HOST:-}"
@@ -71,7 +73,7 @@ status_once() {
       -g "$AZURE_RESOURCE_GROUP" \
       -n "$OPERATOR_VM_NAME" \
       --command-id RunShellScript \
-      --scripts '/opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh' \
+      --scripts @"$script_dir/operator-vm-status.sh" \
       --only-show-errors \
       --query 'value[0].message' \
       -o tsv)
