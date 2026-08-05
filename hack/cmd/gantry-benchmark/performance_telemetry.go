@@ -13,13 +13,23 @@ import (
 	"time"
 )
 
-const performanceTelemetryStep = 10 * time.Second
+const (
+	performanceTelemetryStep        = 10 * time.Second
+	grpcHandledTelemetryStep        = 5 * time.Minute
+	maxPrometheusRangeResponseBytes = 256 * 1024 * 1024
+)
 
 type prometheusRangeCapture struct {
 	Name        string          `json:"name"`
 	Query       string          `json:"query"`
 	StepSeconds int             `json:"step_seconds"`
 	Response    json.RawMessage `json:"response"`
+}
+
+type performanceTelemetryQuery struct {
+	name  string
+	query string
+	step  time.Duration
 }
 
 type containerdJournalEvent struct {
@@ -43,25 +53,8 @@ type phasePerformanceTelemetry struct {
 
 var journalFieldPattern = regexp.MustCompile(`(?:^|[[:space:]])([a-zA-Z_]+)="?([^"[:space:]]+)"?`)
 
-func (b *benchmark) capturePhasePerformanceTelemetry(
-	ctx context.Context,
-	phase proxyPhase,
-	job jobObservation,
-) (phasePerformanceTelemetry, error) {
-	window := telemetryWindow{
-		StartedAt:  job.PhaseStartedAt,
-		FinishedAt: job.PhaseFinishedAt,
-	}
-
-	observerPods, err := b.observerPodNodes(ctx)
-	if err != nil {
-		return phasePerformanceTelemetry{}, err
-	}
-
-	queries := []struct {
-		name  string
-		query string
-	}{
+func performanceTelemetryQueries() []performanceTelemetryQuery {
+	return []performanceTelemetryQuery{
 		{name: "node_disk_read_bytes_per_second", query: `rate(node_disk_read_bytes_total{gantry_benchmark="true"}[30s])`},
 		{name: "node_disk_written_bytes_per_second", query: `rate(node_disk_written_bytes_total{gantry_benchmark="true"}[30s])`},
 		{name: "node_disk_busy_ratio", query: `rate(node_disk_io_time_seconds_total{gantry_benchmark="true"}[30s])`},
@@ -77,7 +70,9 @@ func (b *benchmark) capturePhasePerformanceTelemetry(
 		{name: "node_cpu_busy_ratio", query: `1 - avg by(pod) (rate(node_cpu_seconds_total{gantry_benchmark="true",mode="idle"}[30s]))`},
 		{name: "node_memory_available_bytes", query: `node_memory_MemAvailable_bytes{gantry_benchmark="true"}`},
 		{name: "containerd_process", query: `{__name__=~"process_(cpu_seconds_total|resident_memory_bytes|virtual_memory_bytes)",gantry_benchmark="true",endpoint="ctr-metrics"}`},
-		{name: "containerd_metrics", query: `{__name__=~"containerd_.*|grpc_server_.*",gantry_benchmark="true"}`},
+		{name: "containerd_image_pulls", query: `{__name__=~"containerd_cri_sandboxed_(image_pulls_total|in_progress_image_pulls_total|image_pulling_throughput_(sum|count))",gantry_benchmark="true"}`},
+		{name: "containerd_grpc_started", query: `sum by (pod, grpc_service, grpc_method) (rate(grpc_server_started_total{gantry_benchmark="true"}[30s])) > 0`},
+		{name: "containerd_grpc_handled", query: `sum by (pod, grpc_code) (rate(grpc_server_handled_total{gantry_benchmark="true"}[5m])) > 0`, step: grpcHandledTelemetryStep},
 		{name: "gantry_peer_outcomes", query: `p2p_peer_fetch_total{gantry_benchmark="true"}`},
 		{name: "gantry_peer_busy_stall_timestamps", query: `gantry_peer_fetch_last_timestamp_seconds{outcome=~"busy|stall",gantry_benchmark="true"}`},
 		{name: "gantry_peer_duration", query: `{__name__=~"p2p_peer_fetch_duration_seconds_(bucket|sum|count)",outcome=~"busy|stall",gantry_benchmark="true"}`},
@@ -87,10 +82,32 @@ func (b *benchmark) capturePhasePerformanceTelemetry(
 		{name: "gantry_response_completed", query: `gantry_mirror_response_completed_timestamp_seconds{kind="layer",gantry_benchmark="true"}`},
 		{name: "gantry_commit_observation", query: `{__name__=~"gantry_containerd_commit_(observed_total|observed_timestamp_seconds|observation_duration_seconds_(sum|count)|latest_observation_duration_seconds|missing_after_stream_total)",gantry_benchmark="true"}`},
 	}
+}
+
+func (b *benchmark) capturePhasePerformanceTelemetry(
+	ctx context.Context,
+	phase proxyPhase,
+	job jobObservation,
+) (phasePerformanceTelemetry, error) {
+	window := telemetryWindow{
+		StartedAt:  job.PhaseStartedAt,
+		FinishedAt: job.PhaseFinishedAt,
+	}
+
+	observerPods, err := b.observerPodNodes(ctx)
+	if err != nil {
+		return phasePerformanceTelemetry{}, err
+	}
+
+	queries := performanceTelemetryQueries()
 
 	captures := make([]prometheusRangeCapture, 0, len(queries))
 	for _, item := range queries {
-		response, err := b.queryPrometheusRange(ctx, item.query, window, performanceTelemetryStep)
+		step := item.step
+		if step == 0 {
+			step = performanceTelemetryStep
+		}
+		response, err := b.queryPrometheusRange(ctx, item.query, window, step)
 		if err != nil {
 			return phasePerformanceTelemetry{}, fmt.Errorf("capture %s: %w", item.name, err)
 		}
@@ -100,7 +117,7 @@ func (b *benchmark) capturePhasePerformanceTelemetry(
 		captures = append(captures, prometheusRangeCapture{
 			Name:        item.name,
 			Query:       item.query,
-			StepSeconds: int(performanceTelemetryStep.Seconds()),
+			StepSeconds: int(step.Seconds()),
 			Response:    response,
 		})
 	}
@@ -274,6 +291,9 @@ func (b *benchmark) queryPrometheusRange(
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePrometheusRangeResponseSize(output, maxPrometheusRangeResponseBytes); err != nil {
+		return nil, err
+	}
 
 	var envelope struct {
 		Status string `json:"status"`
@@ -286,6 +306,18 @@ func (b *benchmark) queryPrometheusRange(
 	}
 
 	return json.RawMessage(output), nil
+}
+
+func validatePrometheusRangeResponseSize(output []byte, limit int) error {
+	if len(output) > limit {
+		return fmt.Errorf(
+			"Prometheus range response is %d bytes, exceeds %d-byte capture limit",
+			len(output),
+			limit,
+		)
+	}
+
+	return nil
 }
 
 func (b *benchmark) observerPodNodes(ctx context.Context) (map[string]string, error) {

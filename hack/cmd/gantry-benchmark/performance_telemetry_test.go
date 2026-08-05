@@ -60,6 +60,38 @@ func TestQueryPrometheusRange(t *testing.T) {
 	}
 }
 
+func TestPerformanceTelemetryQueriesBoundContainerdCardinality(t *testing.T) {
+	queries := performanceTelemetryQueries()
+	byName := make(map[string]performanceTelemetryQuery, len(queries))
+	for _, query := range queries {
+		byName[query.name] = query
+		if strings.Contains(query.query, `containerd_.*|grpc_server_.*`) {
+			t.Fatalf("query %q uses unbounded containerd and gRPC selector", query.name)
+		}
+	}
+
+	for _, name := range []string{"containerd_image_pulls", "containerd_grpc_started", "containerd_grpc_handled"} {
+		if _, ok := byName[name]; !ok {
+			t.Fatalf("missing bounded telemetry query %q", name)
+		}
+	}
+	if byName["containerd_image_pulls"].step != 0 || byName["containerd_grpc_started"].step != 0 {
+		t.Fatal("containerd pull and gRPC started queries must use the default 10-second step")
+	}
+	if byName["containerd_grpc_handled"].step != 5*time.Minute {
+		t.Fatalf("gRPC handled step = %s, want 5m", byName["containerd_grpc_handled"].step)
+	}
+}
+
+func TestValidatePrometheusRangeResponseSize(t *testing.T) {
+	if err := validatePrometheusRangeResponseSize([]byte("1234"), 4); err != nil {
+		t.Fatalf("response at limit: %v", err)
+	}
+	if err := validatePrometheusRangeResponseSize([]byte("12345"), 4); err == nil || !strings.Contains(err.Error(), "5 bytes") {
+		t.Fatalf("oversized response error = %v", err)
+	}
+}
+
 func TestParseContainerdJournal(t *testing.T) {
 	window := telemetryWindow{
 		StartedAt:  time.Date(2026, time.August, 4, 1, 2, 3, 0, time.UTC),
