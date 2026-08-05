@@ -265,7 +265,7 @@ set_acrs_private() {
   for acr in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
     if az acr show -g "$AZURE_RESOURCE_GROUP" -n "$acr" --output none >/dev/null 2>&1; then
       az acr update -g "$AZURE_RESOURCE_GROUP" -n "$acr" \
-        --data-endpoint-enabled true --public-network-enabled false \
+        --data-endpoint-enabled true --default-action Deny --public-network-enabled false \
         --only-show-errors -o none
     fi
   done
@@ -368,7 +368,8 @@ ensure_acr() {
 }
 
 acr_public_access_enabled() {
-  [[ $(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --query publicNetworkAccess -o tsv) == Enabled ]]
+  [[ $(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
+    --query '[publicNetworkAccess,networkRuleSet.defaultAction]' -o tsv) == $'Enabled\tAllow' ]]
 }
 
 build_source_image() {
@@ -377,7 +378,7 @@ build_source_image() {
 
   public_restore_needed=true
   az acr update -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
-    --public-network-enabled true --only-show-errors -o none
+    --default-action Allow --public-network-enabled true --only-show-errors -o none
 
   retry_command 30 10 acr_public_access_enabled
 
