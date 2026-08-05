@@ -130,6 +130,55 @@ func (b *benchmark) prepareImages(ctx context.Context) error {
 	return nil
 }
 
+func (b *benchmark) prepareAdoptedImages(ctx context.Context, baselineImage, gantryImage, payloadSHA string) error {
+	state, err := b.loadState(ctx)
+	if err != nil {
+		return err
+	}
+	if state.Status != "enabled" {
+		return fmt.Errorf("benchmark state is %q, run enable before prepare-adopt", state.Status)
+	}
+	if state.usesProxy() {
+		return fmt.Errorf("prepare-adopt requires direct dual-ACR mode")
+	}
+	if err := b.requireLock(ctx, state.RunID); err != nil {
+		return err
+	}
+	if err := b.validateContext(ctx); err != nil {
+		return err
+	}
+
+	state, err = adoptPreparedImages(state, baselineImage, gantryImage, payloadSHA)
+	if err != nil {
+		return err
+	}
+	if err := b.saveState(ctx, state); err != nil {
+		return err
+	}
+
+	writeAll(b.stdout, fmt.Sprintf("adopted digest-pinned images for %s using shared payload %s\n", state.RunID, payloadSHA))
+
+	return nil
+}
+
+func adoptPreparedImages(state benchmarkState, baselineImage, gantryImage, payloadSHA string) (benchmarkState, error) {
+	payloadDigest, err := digest.Parse(payloadSHA)
+	if err != nil || payloadDigest.Algorithm() != digest.SHA256 {
+		return benchmarkState{}, fmt.Errorf("adopted payload fingerprint %q must be a valid sha256 digest", payloadSHA)
+	}
+
+	state.BaselineImage = baselineImage
+	state.GantryColdImage = gantryImage
+	state.WorkloadPayloadSHA256 = payloadSHA
+	state.WorkloadComparisonMode = workloadComparisonIdenticalPayload
+	if _, _, err := state.preparedImages(); err != nil {
+		return benchmarkState{}, fmt.Errorf("validate adopted images: %w", err)
+	}
+	state.Status = "images-prepared"
+
+	return state, nil
+}
+
 func (b *benchmark) buildDualACRImages(ctx context.Context, state benchmarkState) (string, string, string, error) {
 	buildDirectory := filepath.Join(b.config.StateRoot, state.RunID, "build", "shared-payload")
 	if err := os.RemoveAll(buildDirectory); err != nil {

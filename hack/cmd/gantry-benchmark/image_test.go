@@ -123,3 +123,46 @@ func TestBuildDualACRImagesUsesSharedPayloadAndSameImageName(t *testing.T) {
 		t.Fatalf("phase Dockerfiles do not isolate content cache:\nbaseline:\n%s\nGantry:\n%s", baselineDockerfile, gantryDockerfile)
 	}
 }
+
+func TestAdoptPreparedImages(t *testing.T) {
+	state := benchmarkState{
+		Mode:                   benchmarkModeDirect,
+		Status:                 "enabled",
+		WorkloadRepository:     "gantry-benchmark-pull",
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+	}
+	baseline := "baseline.azurecr.io/gantry-benchmark-pull@sha256:" + strings.Repeat("a", 64)
+	gantry := "gantry.azurecr.io/gantry-benchmark-pull@sha256:" + strings.Repeat("b", 64)
+	payload := "sha256:" + strings.Repeat("c", 64)
+
+	adopted, err := adoptPreparedImages(state, baseline, gantry, payload)
+	if err != nil {
+		t.Fatalf("adoptPreparedImages: %v", err)
+	}
+	if adopted.Status != "images-prepared" || adopted.BaselineImage != baseline ||
+		adopted.GantryColdImage != gantry || adopted.WorkloadPayloadSHA256 != payload ||
+		adopted.WorkloadComparisonMode != workloadComparisonIdenticalPayload {
+		t.Fatalf("adopted state = %+v", adopted)
+	}
+}
+
+func TestAdoptPreparedImagesRejectsInvalidInputs(t *testing.T) {
+	state := benchmarkState{
+		Mode:                   benchmarkModeDirect,
+		WorkloadRepository:     "gantry-benchmark-pull",
+		BaselineACRLoginServer: "baseline.azurecr.io",
+		GantryACRLoginServer:   "gantry.azurecr.io",
+	}
+	digestValue := "sha256:" + strings.Repeat("a", 64)
+	baseline := "baseline.azurecr.io/gantry-benchmark-pull@" + digestValue
+	gantry := "gantry.azurecr.io/gantry-benchmark-pull@" + digestValue
+
+	if _, err := adoptPreparedImages(state, baseline, gantry, "not-a-digest"); err == nil {
+		t.Fatal("expected invalid payload digest rejection")
+	}
+	if _, err := adoptPreparedImages(state, baseline, gantry, "sha256:"+strings.Repeat("c", 64)); err == nil ||
+		!strings.Contains(err.Error(), "would reuse") {
+		t.Fatalf("error = %v, want identical image digest rejection", err)
+	}
+}

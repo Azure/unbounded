@@ -130,7 +130,12 @@ write_progress "enable" "installing benchmark state, lock, and monitoring"
 make -C hack/gantry-benchmark enable
 run_id=$(kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state -o jsonpath='{.data.state\.json}' | jq -er '.run_id')
 echo "enabled benchmark $run_id"
-if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+if [[ -n "${ADOPT_BASELINE_IMAGE:-}" || -n "${ADOPT_GANTRY_IMAGE:-}" || -n "${ADOPT_PAYLOAD_SHA256:-}" ]]; then
+  : "${ADOPT_BASELINE_IMAGE:?Set ADOPT_BASELINE_IMAGE with the full adoption set}"
+  : "${ADOPT_GANTRY_IMAGE:?Set ADOPT_GANTRY_IMAGE with the full adoption set}"
+  : "${ADOPT_PAYLOAD_SHA256:?Set ADOPT_PAYLOAD_SHA256 with the full adoption set}"
+  write_progress "prepare" "adopting already-pushed identical-payload images"
+elif [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
   if [[ -n "${GANTRY_ONLY_ADOPT_IMAGE:-}" ]]; then
     : "${GANTRY_ONLY_ADOPT_PAYLOAD_SHA256:?Set GANTRY_ONLY_ADOPT_PAYLOAD_SHA256 with GANTRY_ONLY_ADOPT_IMAGE}"
     write_progress "prepare" "adopting an already-pushed fresh Gantry image against baseline $GANTRY_ONLY_BASELINE_RUN_ID"
@@ -165,7 +170,12 @@ gantry_refresh_token=$(curl -fsS -X POST \
 unset aad_access_token
 export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
 export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
-if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+if [[ -n "${ADOPT_BASELINE_IMAGE:-}" ]]; then
+  make -C hack/gantry-benchmark prepare-adopt \
+    ADOPT_BASELINE_IMAGE="$ADOPT_BASELINE_IMAGE" \
+    ADOPT_GANTRY_IMAGE="$ADOPT_GANTRY_IMAGE" \
+    ADOPT_PAYLOAD_SHA256="$ADOPT_PAYLOAD_SHA256"
+elif [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
   if [[ -n "${GANTRY_ONLY_ADOPT_IMAGE:-}" ]]; then
     make -C hack/gantry-benchmark prepare-gantry-adopt \
       GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID" \

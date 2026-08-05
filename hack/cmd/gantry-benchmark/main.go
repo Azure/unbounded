@@ -55,6 +55,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return benchmark.enable(ctx)
 	case "prepare":
 		return benchmark.prepareImages(ctx)
+	case "prepare-adopt":
+		if len(args) != 4 {
+			return fmt.Errorf("usage: gantry-benchmark prepare-adopt <baseline-image> <gantry-image> <payload-sha256>")
+		}
+
+		return benchmark.prepareAdoptedImages(ctx, args[1], args[2], args[3])
 	case "prepare-gantry":
 		if len(args) < 2 || len(args) > 3 {
 			return fmt.Errorf("usage: gantry-benchmark prepare-gantry <baseline-run-id> [prepared-run-id]")
@@ -100,6 +106,8 @@ Subcommands:
 	disable    restore the cluster and remove benchmark instrumentation
 	enable     install benchmark instrumentation after safety checks
 	prepare    build and push both digest-pinned images before ACR goes private
+	prepare-adopt <baseline-image> <gantry-image> <payload-sha256>
+	           adopt already-pushed direct-mode images with one shared payload
 	prepare-gantry <baseline-run-id> [prepared-run-id]
 	           rebuild only the Gantry image, or reuse an already-prepared image
 	prepare-gantry-fresh <baseline-run-id>

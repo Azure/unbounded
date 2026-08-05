@@ -554,6 +554,33 @@ type azureDiagnosticSetting struct {
 	} `json:"logs"`
 }
 
+func decodeAzureDiagnosticSettings(raw []byte) ([]azureDiagnosticSetting, error) {
+	if strings.HasPrefix(strings.TrimSpace(string(raw)), "[") {
+		var settings []azureDiagnosticSetting
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			return nil, err
+		}
+
+		return settings, nil
+	}
+
+	var envelope struct {
+		Value []struct {
+			Properties azureDiagnosticSetting `json:"properties"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, err
+	}
+
+	settings := make([]azureDiagnosticSetting, 0, len(envelope.Value))
+	for _, entry := range envelope.Value {
+		settings = append(settings, entry.Properties)
+	}
+
+	return settings, nil
+}
+
 func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
 	output, err := b.commands.Run(
 		ctx,
@@ -566,18 +593,12 @@ func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
 		return fmt.Errorf("read AKS diagnostic settings: %w", err)
 	}
 
-	var settings struct {
-		Value []struct {
-			Properties azureDiagnosticSetting `json:"properties"`
-		} `json:"value"`
-	}
-	if err := json.Unmarshal(output, &settings); err != nil {
+	settings, err := decodeAzureDiagnosticSettings(output)
+	if err != nil {
 		return fmt.Errorf("decode AKS diagnostic settings: %w", err)
 	}
 
-	for _, entry := range settings.Value {
-		setting := entry.Properties
-
+	for _, setting := range settings {
 		if !strings.EqualFold(setting.LogAnalyticsDestinationType, "Dedicated") || setting.WorkspaceID == "" {
 			continue
 		}
