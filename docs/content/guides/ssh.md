@@ -24,10 +24,16 @@ resulting Node.
 
 ## Cluster Setup
 
-Run `kubectl unbounded site init` to prepare the cluster and create a new site.
-This single command handles:
+First, bootstrap the Unbounded CRDs and `unbounded-operator`:
 
-- Bootstrapping the Unbounded CRDs and `unbounded-operator`
+```bash
+kubectl unbounded install
+```
+
+Then run `kubectl unbounded site init` to create a new site. It requires the
+operator to be installed (from the step above) and errors otherwise. This
+command handles:
+
 - Creating site resources for both the cluster and the new site
 - Recording requested components in `Site.spec.components`
 - Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-cloud.io/site=<name>`)
@@ -51,7 +57,6 @@ All five flags above are required. Optional flags:
 | `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
 | `--enable-storage` | Enable the unbounded-storage component in the Site spec |
-| `--skip-install` | Skip operator bootstrap if you already ran `kubectl unbounded install` or applied the operator manifests |
 
 ## Creating Machines
 

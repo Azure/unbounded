@@ -368,8 +368,8 @@ jobs:
   # the unbounded-system namespace. The reaper migrates any legacy split-namespace
   # state. We never render or apply component manifests directly here.
   #
-  #   MODE=init     -> 'install' then 'site init --skip-install' (creates the
-  #                    Site the operator reconciles). Used for the first bootstrap.
+  #   MODE=init     -> 'install' then 'site init' (creates the Site the operator
+  #                    reconciles). Used for the first bootstrap.
   #   MODE=upgrade  -> 'install' only; the operator reconciles the existing Site.
   #
   # The plugin is built from the snapshot checkout (no tarball download, no cosign
@@ -499,8 +499,7 @@ jobs:
             --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
             --node-cidr         "${SITE_NODE_CIDR}" \
             --pod-cidr          "${SITE_POD_CIDR}" \
-            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}" \
-            --skip-install
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
 
       - name: Wait for rollouts
         run: |

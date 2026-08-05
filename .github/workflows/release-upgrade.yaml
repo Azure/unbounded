@@ -370,8 +370,7 @@ jobs:
             --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
             --node-cidr         "${SITE_NODE_CIDR}" \
             --pod-cidr          "${SITE_POD_CIDR}" \
-            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}" \
-            --skip-install
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
 
       - name: Sanity check tarball contents (upgrade)
         if: env.MODE == 'upgrade'

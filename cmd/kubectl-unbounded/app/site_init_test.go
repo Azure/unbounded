@@ -4,13 +4,17 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"text/template"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -87,13 +91,11 @@ func TestSiteInitCommand_ComponentFlags(t *testing.T) {
 	require.NotNil(t, flag)
 	require.Equal(t, "false", flag.DefValue)
 
-	flag = cmd.Flags().Lookup("skip-install")
-	require.NotNil(t, flag)
-	require.Equal(t, "false", flag.DefValue)
-
-	flag = cmd.Flags().Lookup("install-timeout")
-	require.NotNil(t, flag)
-	require.Equal(t, defaultInstallTimeout.String(), flag.DefValue)
+	// site init no longer bootstraps the operator; the operator must be
+	// installed first via `kubectl unbounded install`. The install lifecycle
+	// flags were removed.
+	require.Nil(t, cmd.Flags().Lookup("skip-install"))
+	require.Nil(t, cmd.Flags().Lookup("install-timeout"))
 }
 
 func TestSiteInitCommand_ManageCniPluginFlag(t *testing.T) {
@@ -288,4 +290,113 @@ func TestSiteInitValidateClusterCIDRMessages(t *testing.T) {
 			require.EqualError(t, err, tc.wantErr)
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// checkOperatorPrerequisites tests
+// ---------------------------------------------------------------------------
+
+// bufferLogger returns a slog.Logger that writes warn-level records to buf so
+// tests can assert on the operator-readiness warnings.
+func bufferLogger() (*slog.Logger, *bytes.Buffer) {
+	buf := &bytes.Buffer{}
+
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})), buf
+}
+
+// unestablishedCRD builds a CRD without the Established condition.
+func unestablishedCRD(name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiextensions.k8s.io/v1",
+		"kind":       "CustomResourceDefinition",
+		"metadata":   map[string]any{"name": name},
+	}}
+}
+
+func establishedSiteCRDs() []client.Object {
+	objects := make([]client.Object, 0, len(siteRequiredCRDs))
+	for _, name := range siteRequiredCRDs {
+		objects = append(objects, establishedCRD(name))
+	}
+
+	return objects
+}
+
+func TestCheckOperatorPrerequisites_MissingCRDs(t *testing.T) {
+	cli := fakeclient.NewClientBuilder().Build()
+
+	logger, _ := bufferLogger()
+	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+
+	err := h.checkOperatorPrerequisites(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unbounded-operator is not installed")
+	require.Contains(t, err.Error(), "kubectl unbounded install")
+	require.Contains(t, err.Error(), "sites.unbounded-cloud.io")
+}
+
+func TestCheckOperatorPrerequisites_CRDsNotEstablished(t *testing.T) {
+	objects := make([]client.Object, 0, len(siteRequiredCRDs))
+	for _, name := range siteRequiredCRDs {
+		objects = append(objects, unestablishedCRD(name))
+	}
+
+	cli := fakeclient.NewClientBuilder().WithObjects(objects...).Build()
+
+	logger, _ := bufferLogger()
+	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+
+	err := h.checkOperatorPrerequisites(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not established")
+	require.Contains(t, err.Error(), "kubectl unbounded install")
+}
+
+func TestCheckOperatorPrerequisites_OperatorAbsentWarns(t *testing.T) {
+	cli := fakeclient.NewClientBuilder().WithObjects(establishedSiteCRDs()...).Build()
+
+	logger, logs := bufferLogger()
+	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+
+	// CRDs are established but the operator Deployment is absent: site init must
+	// proceed (no error) and only warn.
+	require.NoError(t, h.checkOperatorPrerequisites(context.Background()))
+	require.Contains(t, logs.String(), "unbounded-operator Deployment not found")
+}
+
+func TestCheckOperatorPrerequisites_OperatorNotRolledOutWarns(t *testing.T) {
+	objects := establishedSiteCRDs()
+	// Old pod Available while the new pod surges in: rollout is not complete.
+	objects = append(objects, operatorDeployment(appsv1.DeploymentStatus{
+		ObservedGeneration: 2,
+		Replicas:           2,
+		UpdatedReplicas:    1,
+		AvailableReplicas:  1,
+	}))
+
+	cli := fakeclient.NewClientBuilder().WithObjects(objects...).Build()
+
+	logger, logs := bufferLogger()
+	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+
+	require.NoError(t, h.checkOperatorPrerequisites(context.Background()))
+	require.Contains(t, logs.String(), "not fully rolled out")
+}
+
+func TestCheckOperatorPrerequisites_Ready(t *testing.T) {
+	objects := establishedSiteCRDs()
+	objects = append(objects, operatorDeployment(appsv1.DeploymentStatus{
+		ObservedGeneration: 2,
+		Replicas:           1,
+		UpdatedReplicas:    1,
+		AvailableReplicas:  1,
+	}))
+
+	cli := fakeclient.NewClientBuilder().WithObjects(objects...).Build()
+
+	logger, logs := bufferLogger()
+	h := &siteInitHandler{kubeResourcesCli: cli, logger: logger}
+
+	require.NoError(t, h.checkOperatorPrerequisites(context.Background()))
+	require.Empty(t, logs.String(), "a ready operator must not produce warnings")
 }

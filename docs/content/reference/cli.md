@@ -86,10 +86,18 @@ compiled version.
 Initialize a new Unbounded site. This command:
 
 1. Validates inputs and kubeconfig access.
-2. Bootstraps CRDs and `unbounded-operator` unless `--skip-install` is set.
+2. Verifies `unbounded-operator` is installed: the required CRDs
+   (`sites.unbounded-cloud.io`, `gatewaypools.net.unbounded-cloud.io`,
+   `sitegatewaypoolassignments.net.unbounded-cloud.io`) must be established.
 3. Creates a cluster `Site`, a remote `Site`, and related net `GatewayPool` resources.
 4. Records component choices in `Site.spec.components` for `unbounded-operator`.
 5. Creates a bootstrap token for the remote site.
+
+> **Prerequisite:** `site init` no longer bootstraps `unbounded-operator`. Run
+> [`kubectl unbounded install`](#kubectl-unbounded-install) first. If the operator
+> CRDs are not present, `site init` fails with guidance to run `install`. If the
+> CRDs exist but the operator Deployment is missing or not yet rolled out,
+> `site init` warns and proceeds (the operator reconciles the Site once ready).
 
 Global components (`unbounded-net`, `machina`, and `unbounded-storage`) are
 enabled on the cluster Site. `metalman` is per-site and is enabled on the remote
@@ -114,17 +122,23 @@ Site when `--enable-metalman` is set.
 | `--enable-machina` | `bool` | `true` | Enable machina in `Site.spec.components` |
 | `--enable-metalman` | `bool` | `false` | Enable metalman in `Site.spec.components` |
 | `--enable-storage` | `bool` | `false` | Enable unbounded-storage in `Site.spec.components` |
-| `--skip-install` | `bool` | `false` | Skip bootstrapping CRDs and `unbounded-operator` |
-| `--install-timeout` | `duration` | `5m0s` | Timeout while waiting for operator bootstrap |
+
+> **Breaking change:** the `--skip-install` and `--install-timeout` flags have
+> been removed. `site init` no longer installs the operator, so there is nothing
+> to skip or time out. Run `kubectl unbounded install` first. Automation passing
+> `--skip-install` must drop it.
 
 #### Validation
 
 - All CIDR values must be valid IPv4 CIDR notation.
 - The kubeconfig must be readable.
+- `unbounded-operator` must be installed (its CRDs must be established).
 
 #### Example
 
 ```bash
+kubectl unbounded install
+
 kubectl unbounded site init \
   --name my-edge-site \
   --cluster-node-cidr 10.224.0.0/16 \

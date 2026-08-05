@@ -11,10 +11,13 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strings"
 	"text/template"
-	"time"
 
 	"github.com/spf13/cobra"
+	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -22,6 +25,16 @@ import (
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
+
+// siteRequiredCRDs are the CustomResourceDefinitions the site manifests apply.
+// The unbounded-operator owns CRD lifecycle and establishes these at startup, so
+// site init requires them to exist before it can create Site, GatewayPool, and
+// SiteGatewayPoolAssignment resources.
+var siteRequiredCRDs = []string{
+	"sites.unbounded-cloud.io",
+	"gatewaypools.net.unbounded-cloud.io",
+	"sitegatewaypoolassignments.net.unbounded-cloud.io",
+}
 
 //go:embed assets/unbounded-net-site/*.yaml
 var siteTemplates embed.FS
@@ -54,8 +67,6 @@ type siteInitHandler struct {
 	enableMachina  bool
 	enableMetalman bool
 	enableStorage  bool
-	skipInstall    bool
-	installTimeout time.Duration
 
 	// kubeCli is the kubernetes client interface.
 	kubeCli kubernetes.Interface
@@ -94,20 +105,8 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	h.kubeResourcesCli = kubeResourcesCli
 	h.kubeConfig = kubeConfig
 
-	if !h.skipInstall {
-		installer := installHandler{
-			kubeconfigPath:   h.kubeconfigPath,
-			namespace:        unbounded.SystemNamespace(),
-			wait:             true,
-			timeout:          h.installTimeout,
-			kubeCli:          kubeCli,
-			kubeResourcesCli: kubeResourcesCli,
-			restConfig:       kubeConfig,
-			logger:           h.logger,
-		}
-		if err := installer.execute(ctx); err != nil {
-			return fmt.Errorf("bootstrapping unbounded-operator: %w", err)
-		}
+	if err := h.checkOperatorPrerequisites(ctx); err != nil {
+		return err
 	}
 
 	if err := h.ensureUnboundedSite(ctx, h.clusterSiteConfig()); err != nil {
@@ -123,6 +122,81 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// checkOperatorPrerequisites verifies the cluster is ready to accept Site
+// resources before site init creates them. The unbounded-operator owns CRD
+// lifecycle and reconciles Sites, so it must be installed first (via
+// `kubectl unbounded install`).
+//
+// Missing or unestablished CRDs are a hard error: the Site, GatewayPool, and
+// SiteGatewayPoolAssignment manifests cannot be applied without them. A missing
+// or not-yet-ready operator Deployment is only a warning, because the operator
+// reconciles the Site once it becomes ready.
+func (h *siteInitHandler) checkOperatorPrerequisites(ctx context.Context) error {
+	var missing []string
+
+	for _, name := range siteRequiredCRDs {
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion("apiextensions.k8s.io/v1")
+		obj.SetKind("CustomResourceDefinition")
+
+		if err := h.kubeResourcesCli.Get(ctx, client.ObjectKey{Name: name}, obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				missing = append(missing, name)
+
+				continue
+			}
+
+			return fmt.Errorf("inspecting customresourcedefinition %s: %w", name, err)
+		}
+
+		if !crdEstablished(obj) {
+			missing = append(missing, name)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"unbounded-operator is not installed: required CRDs are missing or not established (%s); run \"kubectl unbounded install\" first to bootstrap the unbounded-operator",
+			strings.Join(missing, ", "),
+		)
+	}
+
+	h.warnIfOperatorNotReady(ctx)
+
+	return nil
+}
+
+// warnIfOperatorNotReady logs a warning (never an error) when the
+// unbounded-operator Deployment is absent or not fully rolled out. The CRDs
+// checked by checkOperatorPrerequisites are enough to apply Site resources; a
+// not-yet-ready operator only delays reconciliation, so site init proceeds.
+func (h *siteInitHandler) warnIfOperatorNotReady(ctx context.Context) {
+	namespace := unbounded.SystemNamespace()
+	deploy := &appsv1.Deployment{}
+
+	if err := h.kubeResourcesCli.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "unbounded-operator"}, deploy); err != nil {
+		if apierrors.IsNotFound(err) {
+			h.logger.Warn(
+				"unbounded-operator Deployment not found; the Site will not be reconciled until the operator is installed and ready",
+				"namespace", namespace,
+			)
+
+			return
+		}
+
+		h.logger.Warn("inspecting unbounded-operator Deployment", "namespace", namespace, "error", err)
+
+		return
+	}
+
+	if !deploymentRolloutComplete(deploy) {
+		h.logger.Warn(
+			"unbounded-operator Deployment is not fully rolled out; the Site will be reconciled once the operator is ready",
+			"namespace", namespace,
+		)
+	}
 }
 
 func (h *siteInitHandler) clusterSiteConfig() unboundedSiteConfig {
@@ -305,8 +379,6 @@ func siteInitCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&handler.enableMachina, "enable-machina", true, "Enable machina for the Site")
 	cmd.Flags().BoolVar(&handler.enableMetalman, "enable-metalman", false, "Enable metalman for the Site")
 	cmd.Flags().BoolVar(&handler.enableStorage, "enable-storage", false, "Enable unbounded-storage for the Site")
-	cmd.Flags().BoolVar(&handler.skipInstall, "skip-install", false, "Skip bootstrapping CRDs and unbounded-operator before creating site resources")
-	cmd.Flags().DurationVar(&handler.installTimeout, "install-timeout", defaultInstallTimeout, "Timeout while waiting for unbounded-operator bootstrap")
 
 	if err := cmd.MarkFlagRequired("name"); err != nil {
 		panic(err)
