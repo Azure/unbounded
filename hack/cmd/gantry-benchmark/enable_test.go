@@ -87,6 +87,9 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		!strings.Contains(string(rendered), `- controller-revision-hash`) {
 		t.Fatalf("rendered manifest is missing benchmark scrape or Gantry revision labels")
 	}
+	if strings.Count(string(rendered), `gantry_benchmark: "true"`) != 2 {
+		t.Fatalf("rendered manifest does not label both benchmark PodMonitors for discovery")
+	}
 
 	if !strings.Contains(string(rendered), `action: keep`) {
 		t.Fatalf("rendered manifest does not limit Gantry metric cardinality")

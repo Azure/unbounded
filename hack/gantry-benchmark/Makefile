@@ -1,13 +1,17 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
+DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt preflight run run-gantry status disable
+.PHONY: help test deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
 	@echo "Usage: make -C hack/gantry-benchmark <target> [ENV_FILE=path]"
 	@echo ""
 	@echo "  test         Run focused proxy and benchmark tests"
+	@echo "  deploy       Idempotently deploy the complete benchmark stack"
+	@echo "  deploy-plan  Print the resolved deployment contract without mutation"
+	@echo "  deploy-status  Report deployment readiness without mutation"
 	@echo "  operator-vm-check      Validate operator VM scripts"
 	@echo "  operator-vm-provision  Provision/bootstrap the private operator VM"
 	@echo "  operator-vm-status     Print one live operator VM progress snapshot"
@@ -31,7 +35,17 @@ test:
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go test ./hack/cmd/acr-origin-proxy ./hack/cmd/gantry-benchmark
 
 operator-vm-check:
-	bash -n operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-run.sh operator-vm-status.sh operator-vm-watch.sh
+	bash -n deploy.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-run.sh operator-vm-status.sh operator-vm-watch.sh
+	./deploy.sh plan deploy.env.example >/dev/null
+
+deploy: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh deploy "$(DEPLOY_CONFIG)"
+
+deploy-plan: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh plan "$(DEPLOY_CONFIG)"
+
+deploy-status: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh status "$(DEPLOY_CONFIG)"
 
 operator-vm-provision: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-provision.sh

@@ -10,6 +10,7 @@ metadata:
   namespace: {{ .Namespace }}
   labels:
     release: {{ .MonitoringLabel }}
+    gantry_benchmark: "true"
     app.kubernetes.io/part-of: gantry-benchmark
 spec:
   namespaceSelector:
@@ -170,6 +171,7 @@ metadata:
   namespace: {{ .Namespace }}
   labels:
     release: {{ .MonitoringLabel }}
+    gantry_benchmark: "true"
     app.kubernetes.io/part-of: gantry-benchmark
 spec:
   selector:

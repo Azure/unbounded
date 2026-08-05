@@ -1,13 +1,40 @@
 # Gantry ACR benchmark
 
-This workflow compares direct ACR image distribution with Gantry on an
-existing 300-node test cluster. It is adapted from the standalone Gantry demo
-that produced the project's published 300-node results.
+## Repeatable full-stack deployment
 
-The workflow does not provision AKS, create ACR, or install Gantry. It expects:
+Use `deploy.sh` as the only entrypoint for creating or reconciling the Azure and
+Kubernetes infrastructure needed by this benchmark. Do not recreate the setup
+from commands copied out of the playbook or shell history.
 
-- Exactly 300 Ready, schedulable `linux/amd64` nodes.
-- A Ready `gantry-system/gantry` DaemonSet on all 300 nodes.
+```bash
+cp hack/gantry-benchmark/deploy.env.example hack/gantry-benchmark/deploy.env
+# Edit the subscription, deployment name, and globally unique ACR names.
+
+make -C hack/gantry-benchmark deploy-plan
+make -C hack/gantry-benchmark deploy
+make -C hack/gantry-benchmark deploy-status
+```
+
+The script is idempotent and rejects existing resources whose topology differs
+from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
+dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch
+images, containerd settings, deterministic node-side ACR routing, bounded
+Prometheus discovery, Gantry, and the private operator VM. It leaves the stack
+preflight-ready by default; set `START_BENCHMARK=true` in `deploy.env` only when
+the same invocation should start the benchmark after every deployment gate
+passes.
+
+The deployment config contains names and topology only. Credentials remain in
+Azure managed identities and short-lived ACR tokens.
+
+The sections below document benchmark behavior and direct lifecycle control.
+They do not replace `deploy.sh`; commands that assume an existing cluster are
+for diagnosis or manual operation after full-stack deployment succeeds.
+
+When invoking the benchmark tool directly, it expects:
+
+- Exactly `BENCHMARK_NODE_COUNT` Ready, schedulable `linux/amd64` nodes.
+- A Ready `gantry-system/gantry` DaemonSet on every benchmark node.
 - A dedicated Gantry ACR listed exactly once in Gantry's
   `upstream_registries` configuration, plus a different baseline ACR.
 - kube-prometheus-stack, the Prometheus Operator CRDs, kube-state-metrics, and
@@ -26,8 +53,9 @@ The workflow does not provision AKS, create ACR, or install Gantry. It expects:
 For source-authoritative Azure measurements, set
 `BENCHMARK_AZURE_TELEMETRY=true`. This additionally requires:
 
-- Both ACRs reachable only through their own approved Private Endpoints, with
-  public access disabled throughout. The operator VM reaches both ACRs over
+- Both ACRs reachable only through their own approved Private Endpoints before
+  operator and benchmark validation, with public access disabled throughout
+  image preparation and measurement. The operator VM reaches both ACRs over
   Private Link while preparing and measuring the images.
 - A Log Analytics workspace receiving `ContainerRegistryRepositoryEvents` and
   `AKSAuditAdmin` in resource-specific tables.
@@ -162,15 +190,14 @@ az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" \
 Follow progress from the workstation in a separate terminal:
 
 ```bash
-export OPERATOR_SSH_HOST="<operator-public-ip>"
-export OPERATOR_SSH_KEY="tmp/gantry-benchmark-ssh-key"
+export AZURE_RESOURCE_GROUP="<resource-group>"
+export OPERATOR_VM_NAME="gantry-benchmark-operator"
 make -C hack/gantry-benchmark operator-vm-watch
 ```
 
-SSH mode is preferred because each refresh is immediate. The operator VM SSH
-NSG rule must allow TCP/22 only from the current workstation `/32`. If
-`OPERATOR_SSH_HOST` is unset, the watcher falls back to Azure Run Command using
-`AZURE_RESOURCE_GROUP` and `OPERATOR_VM_NAME`.
+The full-stack deployment gives the operator VM no public IP. Azure Run Command
+is the default status transport. SSH is optional only when the operator has
+deliberately provided private network connectivity to the VM.
 
 The live view reports the lifecycle stage and start time, immutable run shape,
 payload files/bytes/percentage, active Podman build or push, VM disk usage,
