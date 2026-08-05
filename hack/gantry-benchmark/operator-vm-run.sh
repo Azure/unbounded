@@ -12,7 +12,7 @@ set -a
 # shellcheck source=/dev/null
 . "$CONFIG_FILE"
 set +a
-export ENV_FILE="$CONFIG_FILE"
+export ENV_FILE=/dev/null
 
 : "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID}"
 : "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP}"
