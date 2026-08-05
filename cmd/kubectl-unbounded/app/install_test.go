@@ -264,9 +264,15 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			data, found, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
 			require.NoError(t, err)
 			require.True(t, found)
+
+			// The registry is derived from the embedded manifest, which the make
+			// render stamps from CONTAINER_REGISTRY; read it rather than hardcode
+			// so a fork build (non-default CONTAINER_REGISTRY) still passes.
+			wantRegistry, err := (&installHandler{}).embeddedImageRegistry()
+			require.NoError(t, err)
 			require.Equal(t, map[string]string{
 				"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
-				"UNBOUNDED_IMAGE_REGISTRY":        "ghcr.io/azure",
+				"UNBOUNDED_IMAGE_REGISTRY":        wantRegistry,
 				"UNBOUNDED_REAP_LEGACY_RESOURCES": tt.wantReaper,
 			}, data)
 
@@ -291,10 +297,14 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 // TestInstallReinstallDerivesRegistryFromBuild asserts the component registry is
 // re-derived from the binary's embedded manifests on every install, not
 // preserved from cluster state. An older cluster storing the pre-#574 bare
-// "ghcr.io" (or any custom value) is overwritten with the embedded default, so
-// the registry cannot drift from the operator image install also re-derives.
+// "ghcr.io" (or any custom value) is overwritten with the embedded registry, so
+// it cannot drift from the operator image install also re-derives. The embedded
+// registry is injected (rather than read from the make-rendered manifests) so the
+// assertion does not depend on the build-time CONTAINER_REGISTRY.
 func TestInstallReinstallDerivesRegistryFromBuild(t *testing.T) {
 	t.Parallel()
+
+	const embeddedRegistry = "registry.test/unbounded"
 
 	cases := []struct {
 		name  string
@@ -319,9 +329,10 @@ func TestInstallReinstallDerivesRegistryFromBuild(t *testing.T) {
 			}}
 			cli, captured := newCapturingInstallClient(existing)
 			h := installHandler{
-				namespace:        "unbounded-system",
-				kubeResourcesCli: cli,
-				logger:           discardLogger(),
+				namespace:         "unbounded-system",
+				kubeResourcesCli:  cli,
+				operatorManifests: operatorManifestsFS(embeddedRegistry, embeddedRegistry+"/unbounded-operator:v1"),
+				logger:            discardLogger(),
 			}
 
 			require.NoError(t, h.execute(context.Background()))
@@ -329,8 +340,7 @@ func TestInstallReinstallDerivesRegistryFromBuild(t *testing.T) {
 
 			data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
 			require.NoError(t, err)
-			// The real embedded manifest renders ghcr.io/azure at build time.
-			require.Equal(t, "ghcr.io/azure", data["UNBOUNDED_IMAGE_REGISTRY"])
+			require.Equal(t, embeddedRegistry, data["UNBOUNDED_IMAGE_REGISTRY"])
 		})
 	}
 }
@@ -363,38 +373,16 @@ func TestInstallImageRegistryFlagOverridesEmbedded(t *testing.T) {
 func TestInstallForkBuildDerivesEmbeddedRegistry(t *testing.T) {
 	t.Parallel()
 
-	forkManifests := fstest.MapFS{
-		"03-configmap.yaml": &fstest.MapFile{Data: []byte(`apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: unbounded-operator-config
-  namespace: unbounded-system
-data:
-  UNBOUNDED_API_SERVER_ENDPOINT: ""
-  UNBOUNDED_IMAGE_REGISTRY: "ghcr.io/myorg"
-  UNBOUNDED_REAP_LEGACY_RESOURCES: "true"
-`)},
-		"04-deployment.yaml": &fstest.MapFile{Data: []byte(`apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: unbounded-operator
-  namespace: unbounded-system
-spec:
-  template:
-    spec:
-      containers:
-        - name: controller
-          image: ghcr.io/myorg/unbounded-operator:v1.2.3
-          args:
-            - --namespace=unbounded-system
-`)},
-	}
+	const (
+		registry      = "ghcr.io/myorg"
+		operatorImage = "ghcr.io/myorg/unbounded-operator:v1.2.3"
+	)
 
 	cli, captured := newCapturingInstallClient()
 	h := installHandler{
 		namespace:         "unbounded-system",
 		kubeResourcesCli:  cli,
-		operatorManifests: forkManifests,
+		operatorManifests: operatorManifestsFS(registry, operatorImage),
 		logger:            discardLogger(),
 	}
 
@@ -404,11 +392,49 @@ spec:
 
 	data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
 	require.NoError(t, err)
-	require.Equal(t, "ghcr.io/myorg", data["UNBOUNDED_IMAGE_REGISTRY"])
+	require.Equal(t, registry, data["UNBOUNDED_IMAGE_REGISTRY"])
 
 	containers, _, err := unstructured.NestedSlice(captured.deployment.Object, "spec", "template", "spec", "containers")
 	require.NoError(t, err)
-	require.Equal(t, "ghcr.io/myorg/unbounded-operator:v1.2.3", containers[0].(map[string]any)["image"])
+	require.Equal(t, operatorImage, containers[0].(map[string]any)["image"])
+}
+
+// operatorManifestsFS builds a minimal embedded operator manifest set (the
+// unbounded-operator-config ConfigMap and the operator Deployment) with a chosen
+// component registry and operator image. Injecting it lets a test assert the
+// build-derived registry/image without depending on the make-rendered manifests
+// or the build-time CONTAINER_REGISTRY.
+func operatorManifestsFS(registry, operatorImage string) fstest.MapFS {
+	configMap := fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+  namespace: unbounded-system
+data:
+  UNBOUNDED_API_SERVER_ENDPOINT: ""
+  UNBOUNDED_IMAGE_REGISTRY: %q
+  UNBOUNDED_REAP_LEGACY_RESOURCES: "true"
+`, registry)
+
+	deployment := fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unbounded-operator
+  namespace: unbounded-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          image: %q
+          args:
+            - --namespace=unbounded-system
+`, operatorImage)
+
+	return fstest.MapFS{
+		"03-configmap.yaml":  &fstest.MapFile{Data: []byte(configMap)},
+		"04-deployment.yaml": &fstest.MapFile{Data: []byte(deployment)},
+	}
 }
 
 // TestEmbeddedImageRegistryFailsClosed asserts the build-derived registry lookup

@@ -99,7 +99,7 @@ func addInstallFlags(cmd *cobra.Command, handler *installHandler) {
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.namespace, "namespace", unbounded.SystemNamespace(), "Namespace for unbounded-operator and default components")
 	cmd.Flags().StringVar(&handler.operatorImage, "operator-image", "", "unbounded-operator image override")
-	cmd.Flags().StringVar(&handler.imageRegistry, "image-registry", "", "Registry for operator-managed component images")
+	cmd.Flags().StringVar(&handler.imageRegistry, "image-registry", "", "Full image-repository prefix (registry host plus org/namespace) for operator-managed component images; defaults to the registry the binary was built with")
 	cmd.Flags().StringVar(&handler.apiServerEndpoint, "api-server-endpoint", "", "Override the Kubernetes API server endpoint advertised to provisioned machines; by default the operator auto-discovers it from kube-public/cluster-info, or the KUBERNETES_SERVICE_HOST FQDN on clusters (e.g. AKS) that do not publish cluster-info")
 	cmd.Flags().BoolVar(&handler.wait, "wait", true, "Wait for unbounded-operator rollout")
 	cmd.Flags().DurationVar(&handler.timeout, "timeout", defaultInstallTimeout, "Timeout for rollout waits")
@@ -382,6 +382,12 @@ func (h *installHandler) manifests() fs.FS {
 // set, a missing unbounded-operator-config ConfigMap, or an empty registry value
 // is an error rather than a silent fallback to the upstream default, so a
 // malformed build cannot quietly install upstream components.
+//
+// This walks the embedded manifests directly rather than reusing
+// component.DefaultConfigMap: that helper is a method on *Env (it retargets the
+// namespace and returns a typed ConfigMap) and does not enforce the fail-closed
+// empty-value check, so a self-contained lookup keeps the install command
+// decoupled from the operator's internals.
 func (h *installHandler) embeddedImageRegistry() (string, error) {
 	files, err := yamlFiles(h.manifests())
 	if err != nil {
