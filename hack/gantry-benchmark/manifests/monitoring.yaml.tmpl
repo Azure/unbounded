@@ -66,11 +66,11 @@ spec:
             - --path.procfs=/host/proc
             - --path.sysfs=/host/sys
             - --path.rootfs=/host/root
-            - --web.listen-address=:19100
+            - --web.listen-address=:29100
             - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/kubelet/pods/.+)($|/)
           ports:
             - name: node-metrics
-              containerPort: 19100
+              containerPort: 29100
           resources:
             requests:
               cpu: 10m

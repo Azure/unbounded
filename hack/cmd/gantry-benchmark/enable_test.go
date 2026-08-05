@@ -97,6 +97,9 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	if !strings.Contains(string(rendered), `- port: ctr-metrics`) || strings.Contains(string(rendered), `- port: containerd-metrics`) {
 		t.Fatalf("rendered manifest does not use the Kubernetes-valid containerd metrics port name")
 	}
+	if !strings.Contains(string(rendered), `--web.listen-address=:29100`) {
+		t.Fatalf("rendered manifest does not use the benchmark node-exporter port")
+	}
 	for _, metric := range []string{
 		"p2p_peer_fetch_duration_seconds_(bucket|sum|count)",
 		"p2p_dht_lookup_duration_seconds_(bucket|sum|count)",
