@@ -344,12 +344,6 @@ ensure_acr() {
     --data-endpoint-enabled true --only-show-errors -o none
 }
 
-acr_image_digest() {
-  local registry=$1
-  local image=$2
-  az acr repository show -n "$registry" --image "$image" --query digest -o tsv 2>/dev/null || true
-}
-
 build_branch_images() {
   log "building branch artifacts from $source_revision"
 
@@ -394,65 +388,37 @@ build_branch_images() {
       --public-network-enabled true --only-show-errors -o none
   done
 
-  local source_digest gantry_digest baseline_probe_digest
-  source_digest=$(acr_image_digest "$GANTRY_ACR_NAME" "gantry-benchmark-source:$source_revision")
-  gantry_digest=$(acr_image_digest "$GANTRY_ACR_NAME" "gantry:benchmark-$source_short")
-  baseline_probe_digest=$(acr_image_digest "$BASELINE_ACR_NAME" "gantry-deploy-probe:$source_revision")
-
-  if [[ -n "$source_digest" && -n "$gantry_digest" && -n "$baseline_probe_digest" ]]; then
-    log "reusing immutable branch artifacts already present in ACR"
-    GANTRY_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry@$gantry_digest
-    BASELINE_PROBE_IMAGE=$BASELINE_ACR_LOGIN_SERVER/gantry-deploy-probe@$baseline_probe_digest
-    cat >"$image_state" <<IMAGES
-SOURCE_REVISION='$source_revision'
-BASELINE_ACR_RESOURCE_ID='$current_baseline_acr_id'
-GANTRY_ACR_RESOURCE_ID='$current_gantry_acr_id'
-SOURCE_IMAGE='$SOURCE_IMAGE'
-GANTRY_IMAGE='$GANTRY_IMAGE'
-BASELINE_PROBE_IMAGE='$BASELINE_PROBE_IMAGE'
-IMAGES
-    chmod 0600 "$image_state"
-    return
-  fi
-
   local token
   token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
   printf '%s' "$token" | podman login "$GANTRY_ACR_LOGIN_SERVER" \
     --username 00000000-0000-0000-0000-000000000000 --password-stdin >/dev/null
   unset token
 
-  if [[ -z "$source_digest" ]]; then
-    podman build --isolation chroot --build-arg "SOURCE_REVISION=$source_revision" \
-      -t "$SOURCE_IMAGE" -f "$repo_root/images/gantry-benchmark-source/Containerfile" "$repo_root"
-    podman push "$SOURCE_IMAGE" >/dev/null
-    source_digest=$(acr_image_digest "$GANTRY_ACR_NAME" "gantry-benchmark-source:$source_revision")
-  else
-    podman pull "$SOURCE_IMAGE" >/dev/null
-  fi
+  podman build --isolation chroot --build-arg "SOURCE_REVISION=$source_revision" \
+    -t "$SOURCE_IMAGE" -f "$repo_root/images/gantry-benchmark-source/Containerfile" "$repo_root"
+  podman push "$SOURCE_IMAGE" >/dev/null
 
-  if [[ -z "$gantry_digest" ]]; then
-    podman build --isolation chroot \
-      --build-arg "VERSION=benchmark-$source_short" \
-      --build-arg "GIT_COMMIT=$source_revision" \
-      -t "$GANTRY_IMAGE_TAG" -f "$repo_root/images/gantry/Containerfile" "$repo_root"
-    local digest_file=$DEPLOY_STATE_DIR/gantry.digest
-    podman push --digestfile "$digest_file" "$GANTRY_IMAGE_TAG" >/dev/null
-    gantry_digest=$(tr -d '[:space:]' <"$digest_file")
-  fi
+  podman build --isolation chroot \
+    --build-arg "VERSION=benchmark-$source_short" \
+    --build-arg "GIT_COMMIT=$source_revision" \
+    -t "$GANTRY_IMAGE_TAG" -f "$repo_root/images/gantry/Containerfile" "$repo_root"
+  local digest_file=$DEPLOY_STATE_DIR/gantry.digest
+  podman push --digestfile "$digest_file" "$GANTRY_IMAGE_TAG" >/dev/null
+  local gantry_digest
+  gantry_digest=$(tr -d '[:space:]' <"$digest_file")
   podman logout "$GANTRY_ACR_LOGIN_SERVER" >/dev/null
 
-  if [[ -z "$baseline_probe_digest" ]]; then
-    token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
-    printf '%s' "$token" | podman login "$BASELINE_ACR_LOGIN_SERVER" \
-      --username 00000000-0000-0000-0000-000000000000 --password-stdin >/dev/null
-    unset token
-    podman pull mcr.microsoft.com/cbl-mariner/busybox:2.0 >/dev/null
-    podman tag mcr.microsoft.com/cbl-mariner/busybox:2.0 "$BASELINE_PROBE_TAG"
-    local probe_digest_file=$DEPLOY_STATE_DIR/baseline-probe.digest
-    podman push --digestfile "$probe_digest_file" "$BASELINE_PROBE_TAG" >/dev/null
-    baseline_probe_digest=$(tr -d '[:space:]' <"$probe_digest_file")
-    podman logout "$BASELINE_ACR_LOGIN_SERVER" >/dev/null
-  fi
+  token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
+  printf '%s' "$token" | podman login "$BASELINE_ACR_LOGIN_SERVER" \
+    --username 00000000-0000-0000-0000-000000000000 --password-stdin >/dev/null
+  unset token
+  podman pull mcr.microsoft.com/cbl-mariner/busybox:2.0 >/dev/null
+  podman tag mcr.microsoft.com/cbl-mariner/busybox:2.0 "$BASELINE_PROBE_TAG"
+  local probe_digest_file=$DEPLOY_STATE_DIR/baseline-probe.digest
+  podman push --digestfile "$probe_digest_file" "$BASELINE_PROBE_TAG" >/dev/null
+  local baseline_probe_digest
+  baseline_probe_digest=$(tr -d '[:space:]' <"$probe_digest_file")
+  podman logout "$BASELINE_ACR_LOGIN_SERVER" >/dev/null
 
   GANTRY_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry@$gantry_digest
   BASELINE_PROBE_IMAGE=$BASELINE_ACR_LOGIN_SERVER/gantry-deploy-probe@$baseline_probe_digest
