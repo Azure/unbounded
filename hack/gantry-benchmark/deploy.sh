@@ -495,7 +495,7 @@ ensure_private_endpoint() {
   local name=$1
   local acr_id=$2
   local connection_name=$3
-  local subnet_id zone_id
+  local subnet_id zone_id zone_group_count
   subnet_id=$(az network vnet subnet show -g "$AZURE_RESOURCE_GROUP" --vnet-name "$VNET_NAME" \
     -n "$PRIVATE_ENDPOINT_SUBNET_NAME" --query id -o tsv)
   zone_id=$(az network private-dns zone show -g "$AZURE_RESOURCE_GROUP" -n "$PRIVATE_DNS_ZONE" --query id -o tsv)
@@ -505,12 +505,17 @@ ensure_private_endpoint() {
       --subnet "$subnet_id" --private-connection-resource-id "$acr_id" \
       --group-ids registry --connection-name "$connection_name" --only-show-errors -o none
   fi
-  if ! az network private-endpoint dns-zone-group show -g "$AZURE_RESOURCE_GROUP" \
-    --endpoint-name "$name" -n acr --output none 2>/dev/null; then
+  zone_group_count=$(az network private-endpoint dns-zone-group list -g "$AZURE_RESOURCE_GROUP" \
+    --endpoint-name "$name" --query 'length(@)' -o tsv)
+  if [[ "$zone_group_count" == 0 ]]; then
     az network private-endpoint dns-zone-group create -g "$AZURE_RESOURCE_GROUP" \
       --endpoint-name "$name" -n acr --private-dns-zone "$zone_id" \
       --zone-name "$PRIVATE_DNS_ZONE" --only-show-errors -o none
   fi
+  assert_equal "$name private DNS zone" \
+    "$(az network private-endpoint dns-zone-group show -g "$AZURE_RESOURCE_GROUP" \
+      --endpoint-name "$name" -n acr --query 'privateDnsZoneConfigs[0].privateDnsZoneId' -o tsv)" \
+    "$zone_id"
   assert_equal "$name connection state" \
     "$(az network private-endpoint show -g "$AZURE_RESOURCE_GROUP" -n "$name" --query 'privateLinkServiceConnections[0].privateLinkServiceConnectionState.status' -o tsv)" \
     Approved
