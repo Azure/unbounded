@@ -368,8 +368,10 @@ ensure_acr() {
 }
 
 acr_public_access_enabled() {
-  [[ $(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
-    --query '[publicNetworkAccess,networkRuleSet.defaultAction]' -o tsv) == $'Enabled\tAllow' ]]
+  local state
+  state=$(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" -o json)
+  [[ $(jq -r .publicNetworkAccess <<<"$state") == Enabled &&
+    $(jq -r .networkRuleSet.defaultAction <<<"$state") == Allow ]]
 }
 
 build_source_image() {
