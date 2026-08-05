@@ -15,7 +15,7 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 
 1. **[Install the prerequisites](#1-install-the-prerequisites)** -- kubectl and the unbounded plugin
 2. **[Prepare gateway nodes](#2-prepare-gateway-nodes)** -- label and open WireGuard ports
-3. **[Initialize a site](#3-initialize-a-site)** -- bootstrap the operator and create site resources
+3. **[Initialize a site](#3-initialize-a-site)** -- install the operator and create site resources
 4. **[Add machines](#4-add-machines)** -- register remote hosts for SSH provisioning
 5. **[Watch progress](#5-watch-progress)** -- monitor the provisioning lifecycle
 
@@ -75,11 +75,18 @@ kubectl label node <node-name> "unbounded-cloud.io/unbounded-net-gateway=true"
 
 ## 3. Initialize a Site
 
+First, bootstrap `unbounded-operator` on the cluster. This installs the CRDs and
+the operator that reconciles Unbounded components:
+
+```bash
+kubectl unbounded install
+```
+
 A **Site** represents a remote location where machines will run. The `site init`
-command bootstraps `unbounded-operator`, creates site resources, records the
-requested components in `Site.spec.components`, and generates a bootstrap token.
-The operator deploys unbounded-net, machina, and optional components from the
-Site specs.
+command requires the operator to already be installed (it errors otherwise). It
+creates site resources, records the requested components in
+`Site.spec.components`, and generates a bootstrap token. The operator deploys
+unbounded-net, machina, and optional components from the Site specs.
 
 ```bash
 kubectl unbounded site init \
@@ -108,7 +115,6 @@ kubectl unbounded site init \
 | `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
 | `--enable-storage` | Enable the unbounded-storage component in the Site spec |
-| `--skip-install` | Skip operator bootstrap if you already ran `kubectl unbounded install` or applied the operator manifests |
 
 </details>
 

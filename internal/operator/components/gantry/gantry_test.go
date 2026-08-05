@@ -5,12 +5,14 @@ package gantry
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -158,7 +160,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash", "node-hash")(ds); err != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash")(ds); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -167,34 +169,17 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		t.Fatalf("pod template annotations = %#v", annotations)
 	}
 
-	nodeDS := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "apps/v1",
-		"kind":       "DaemonSet",
-		"metadata":   map[string]any{"name": nodeConfigDaemonSetName},
-		"spec":       map[string]any{"template": map[string]any{"metadata": map[string]any{}}},
-	}}
-
-	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash", "node-hash")(nodeDS); err != nil {
-		t.Fatalf("applyMutator node-config: %v", err)
-	}
-
-	nodeAnnotations, _, _ := unstructured.NestedStringMap(nodeDS.Object, "spec", "template", "metadata", "annotations")
-	if nodeAnnotations[nodeConfigHashAnnotation] != "node-hash" {
-		t.Fatalf("node-config pod template annotations = %#v", nodeAnnotations)
-	}
-
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash", "node-hash")(config); err != nil || config.Object != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash")(config); err != nil || config.Object != nil {
 		t.Fatalf("gantry ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
 }
 
 // TestApplyMutatorImagesOnlyAgentContainer asserts the operator-derived image is
 // stamped only on the gantry agent's own container, leaving the busybox init
-// container (and, on the node-config DaemonSet, the busybox worker) with their
-// pinned public images.
+// container with its pinned public image.
 func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 	const derived = "ghcr.io/azure/gantry:v1.2.3"
 
@@ -215,7 +200,7 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator(derived, "h", "n")(agent); err != nil {
+	if err := applyMutator(derived, "h")(agent); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -227,11 +212,11 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		t.Fatalf("agent container image = %q, want derived %q", agentImg, derived)
 	}
 
-	// The node-config DaemonSet is entirely busybox and must not be re-imaged.
+	// The standalone node-config DaemonSet is not an operator-managed workload.
 	nodeDS := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
 		"kind":       "DaemonSet",
-		"metadata":   map[string]any{"name": nodeConfigDaemonSetName},
+		"metadata":   map[string]any{"name": legacyNodeConfigDaemonSetName},
 		"spec": map[string]any{"template": map[string]any{
 			"metadata": map[string]any{},
 			"spec": map[string]any{
@@ -242,7 +227,7 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator(derived, "h", "n")(nodeDS); err != nil {
+	if err := applyMutator(derived, "h")(nodeDS); err != nil {
 		t.Fatalf("applyMutator node-config: %v", err)
 	}
 
@@ -274,34 +259,76 @@ func containerImage(t *testing.T, obj *unstructured.Unstructured, field, name st
 }
 
 func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
-	env, applied := reconcilerEnv(t)
+	legacyConfig := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigName}}
+	legacyDaemonSet := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigDaemonSetName}}
+	env, applied := reconcilerEnv(t, legacyConfig, legacyDaemonSet)
 
 	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
 
-	// Core install objects are applied, including the node-config objects that
-	// wire node containerd through the mirror.
+	// Core Gantry objects are applied, while host configuration remains owned by
+	// unbounded-agent.
 	for _, want := range []string{
 		"ServiceAccount/gantry", "DaemonSet/gantry", "PriorityClass/gantry-low", "ClusterRole/gantry-agent",
-		"ConfigMap/gantry-containerd-hosts", "DaemonSet/gantry-containerd-config",
 	} {
 		if !applied[want] {
 			t.Fatalf("expected %s to be applied; applied=%#v", want, applied)
 		}
 	}
 
-	// The optional examples (NetworkPolicy, sample Secret) must NOT be applied.
+	// The standalone node configurator and optional examples must not be applied.
 	for key := range applied {
-		if key == "NetworkPolicy/gantry" || key == "Secret/gantry-registry-credentials" {
-			t.Fatalf("example object %s was applied by the default install", key)
+		if key == "ConfigMap/"+legacyNodeConfigName || key == "DaemonSet/"+legacyNodeConfigDaemonSetName ||
+			key == "NetworkPolicy/gantry" || key == "Secret/gantry-registry-credentials" {
+			t.Fatalf("excluded object %s was applied by the operator", key)
+		}
+	}
+
+	var config corev1.ConfigMap
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: configName}, &config); err != nil {
+		t.Fatalf("get operator-managed gantry config: %v", err)
+	}
+
+	for _, obj := range []client.Object{legacyConfig, legacyDaemonSet} {
+		if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(obj), obj); !apierrors.IsNotFound(err) {
+			t.Fatalf("legacy node-config object %T was not deleted: %v", obj, err)
 		}
 	}
 
 	// The gantry ConfigMap is reconciled separately, not via the manifest apply.
 	if applied["ConfigMap/gantry-config"] {
 		t.Fatal("gantry-config ConfigMap should be reconciled separately, not applied")
+	}
+}
+
+func TestReconcileFailsWhenLegacyNodeConfigCleanupFails(t *testing.T) {
+	wantErr := errors.New("delete denied")
+	scheme := testScheme(t)
+	applied := false
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption) error {
+				return wantErr
+			},
+			Apply: func(_ context.Context, _ client.WithWatch, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				applied = true
+
+				return nil
+			},
+		}).
+		Build()
+	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
+
+	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if res.Ready || !errors.Is(res.Err, wantErr) {
+		t.Fatalf("Reconcile = %+v, want failure wrapping %v", res, wantErr)
+	}
+
+	if applied {
+		t.Fatal("manifests were applied after legacy node-config cleanup failed")
 	}
 }
 
@@ -332,8 +359,8 @@ func TestReconcileRetainsExistingWhenAllSitesOptOut(t *testing.T) {
 	}{
 		{name: "agent config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: configName}}},
 		{name: "agent DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: daemonSetName}}},
-		{name: "node config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: nodeConfigName}}},
-		{name: "node-config DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: nodeConfigDaemonSetName}}},
+		{name: "legacy node config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigName}}},
+		{name: "legacy node-config DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigDaemonSetName}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env, applied := reconcilerEnv(t, tc.existing)
@@ -343,10 +370,21 @@ func TestReconcileRetainsExistingWhenAllSitesOptOut(t *testing.T) {
 				t.Fatalf("Reconcile = %+v, want ready", res)
 			}
 
-			for _, want := range []string{"DaemonSet/gantry", "DaemonSet/gantry-containerd-config"} {
-				if !applied[want] {
-					t.Fatalf("retained gantry install did not reconcile %s; applied=%#v", want, applied)
+			legacy := tc.existing.GetName() == legacyNodeConfigName || tc.existing.GetName() == legacyNodeConfigDaemonSetName
+			if legacy {
+				if res.Reason != component.ReasonDisabled || len(applied) != 0 {
+					t.Fatalf("legacy-only install was retained: result=%+v applied=%#v", res, applied)
 				}
+
+				if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(tc.existing), tc.existing); !apierrors.IsNotFound(err) {
+					t.Fatalf("legacy-only object %T was not deleted: %v", tc.existing, err)
+				}
+
+				return
+			}
+
+			if !applied["DaemonSet/gantry"] {
+				t.Fatalf("retained gantry install did not reconcile DaemonSet/gantry; applied=%#v", applied)
 			}
 		})
 	}
@@ -393,18 +431,19 @@ func TestResourcesExist(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		existing client.Object
+		want     bool
 	}{
-		{name: "agent config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: configName}}},
-		{name: "agent DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: daemonSetName}}},
-		{name: "node config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: nodeConfigName}}},
-		{name: "node-config DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: nodeConfigDaemonSetName}}},
+		{name: "agent config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: configName}}, want: true},
+		{name: "agent DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: daemonSetName}}, want: true},
+		{name: "legacy node config", existing: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigName}}},
+		{name: "legacy node-config DaemonSet", existing: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigDaemonSetName}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := testEnv(t, tc.existing)
 
 			got, err := resourcesExist(t.Context(), env)
-			if err != nil || !got {
-				t.Fatalf("resourcesExist = %t, %v", got, err)
+			if err != nil || got != tc.want {
+				t.Fatalf("resourcesExist = %t, %v; want %t", got, err, tc.want)
 			}
 		})
 	}

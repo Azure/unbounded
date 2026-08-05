@@ -451,13 +451,18 @@ do_site_init() {
   local remote_node_cidr="$5"
   local remote_pod_cidr="$6"
 
-  log "Running kubectl unbounded site init..."
-
   local ctx_args=()
   if [[ ${#KUBECTL_CTX_ARGS[@]} -gt 0 ]]; then
     ctx_args=("${KUBECTL_CTX_ARGS[@]}")
   fi
 
+  # site init no longer bootstraps the unbounded-operator; it requires the
+  # operator (and its CRDs) to already be installed and errors otherwise. Run
+  # install first so the operator is present before creating Site resources.
+  log "Running kubectl unbounded install..."
+  kubectl "${ctx_args[@]}" unbounded install
+
+  log "Running kubectl unbounded site init..."
   kubectl "${ctx_args[@]}" unbounded site init \
     --name "$site_name" \
     --cluster-node-cidr "$cluster_node_cidr" \
@@ -642,7 +647,8 @@ cmd_create() {
   # Step 6: Detect cluster CIDRs.
   detect_cluster_cidrs
 
-  # Step 7: Run site init (installs CNI, creates site resources, deploys machina).
+  # Step 7: Install the operator, then run site init (creates site resources,
+  # deploys machina). do_site_init runs `kubectl unbounded install` first.
   do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr"
 }
 
@@ -733,7 +739,8 @@ cmd_setup() {
   # Step 5: Detect cluster CIDRs.
   detect_cluster_cidrs
 
-  # Step 6: Run site init (installs CNI, creates site resources, deploys machina).
+  # Step 6: Install the operator, then run site init (creates site resources,
+  # deploys machina). do_site_init runs `kubectl unbounded install` first.
   do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr"
 }
 

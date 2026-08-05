@@ -7,9 +7,8 @@
 // components it defaults to enabled: it is deployed unless every Site explicitly
 // opts out via spec.components.gantry.enabled=false.
 //
-// The component also manages the per-node containerd wiring: a helper DaemonSet
-// writes /etc/containerd/certs.d/_default/hosts.toml so pulls use the node-local
-// gantry agent as their default mirror.
+// The unbounded agent manages the per-node containerd wiring, so the operator
+// installs only the Gantry workload and its Kubernetes configuration.
 package gantry
 
 import (
@@ -20,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,19 +41,15 @@ const (
 
 	// agentContainerName is the gantry agent's main container. Only this
 	// container carries the operator-managed image; the DaemonSet's busybox
-	// init container (and the busybox node-config DaemonSet) keep their pinned
-	// public images.
+	// init container keeps its pinned public image.
 	agentContainerName = "gantry"
 
-	// nodeConfigName and nodeConfigDaemonSetName are the operator-managed
-	// containerd node-wiring objects: a ConfigMap carrying the certs.d
-	// hosts.toml and the DaemonSet that installs it into
-	// /etc/containerd/certs.d/_default on every node.
-	nodeConfigName          = "gantry-containerd-hosts"
-	nodeConfigDaemonSetName = "gantry-containerd-config"
+	// legacyNodeConfigName and legacyNodeConfigDaemonSetName were installed by
+	// older operator versions. The unbounded agent owns this host configuration.
+	legacyNodeConfigName          = "gantry-containerd-hosts"
+	legacyNodeConfigDaemonSetName = "gantry-containerd-config"
 
-	configHashAnnotation     = "unbounded-cloud.io/gantry-config-hash"
-	nodeConfigHashAnnotation = "unbounded-cloud.io/gantry-node-config-hash"
+	configHashAnnotation = "unbounded-cloud.io/gantry-config-hash"
 )
 
 // Component reconciles the gantry cluster singleton.
@@ -83,6 +79,10 @@ func EnabledFor(site *unboundedv1alpha3.Site) bool {
 // not opt out and keeps an existing installation reconciled when every Site opts
 // out.
 func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
+	if err := cleanupLegacyNodeConfig(ctx, env); err != nil {
+		return component.Failed(err)
+	}
+
 	enabled := false
 
 	for i := range sites {
@@ -111,34 +111,24 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	// The node-config ConfigMap is operator-owned static content (the certs.d
-	// hosts.toml), applied directly from the embedded manifests. Hash it so a
-	// content change rolls the writer DaemonSet, which otherwise writes once and
-	// sleeps.
-	nodeConfigHash, err := nodeConfigPayloadHash(env)
-	if err != nil {
-		return component.Failed(err)
-	}
-
-	if err := applyManifests(ctx, env, applyMutator(env.Config.Image(imageRepository), configHash, nodeConfigHash)); err != nil {
+	if err := applyManifests(ctx, env, applyMutator(env.Config.Image(imageRepository), configHash)); err != nil {
 		return component.Failed(err)
 	}
 
 	return component.Reconciled()
 }
 
-// SetupWatches reconciles gantry on changes to its config payloads and on
-// create/delete/generation changes of its agent and node-config DaemonSets.
+// SetupWatches reconciles Gantry on changes to its active resources and when
+// legacy node-config resources appear so they can be removed.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingletonAndAllSites(),
-		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, nodeConfigName))))
+		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, nodeConfigDaemonSetName))))
+		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName))))
 }
 
-// applyManifests applies gantry's top-level manifests. The examples/ subtree in
-// the embedded manifests (optional NetworkPolicy hardening and a sample registry
-// Secret) is intentionally excluded from the default install.
+// applyManifests applies Gantry's operator-managed top-level manifests. The
+// standalone node configurator and examples subtree are intentionally excluded.
 func applyManifests(ctx context.Context, env *component.Env, mutate func(*unstructured.Unstructured) error) error {
 	files, err := component.YamlFiles(gantrymanifests.Manifests)
 	if err != nil {
@@ -148,8 +138,8 @@ func applyManifests(ctx context.Context, env *component.Env, mutate func(*unstru
 	topLevel := make([]string, 0, len(files))
 
 	for _, file := range files {
-		if strings.Contains(file, "/") {
-			continue // skip examples/ and any other subdirectory
+		if file == "node-config.yaml" || strings.Contains(file, "/") {
+			continue
 		}
 
 		topLevel = append(topLevel, file)
@@ -165,8 +155,6 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 	}{
 		{name: configName, object: &corev1.ConfigMap{}},
 		{name: daemonSetName, object: &appsv1.DaemonSet{}},
-		{name: nodeConfigName, object: &corev1.ConfigMap{}},
-		{name: nodeConfigDaemonSetName, object: &appsv1.DaemonSet{}},
 	} {
 		key := client.ObjectKey{Namespace: env.Namespace, Name: resource.name}
 		if err := env.Client.Get(ctx, key, resource.object); err == nil {
@@ -179,13 +167,24 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 	return false, nil
 }
 
+func cleanupLegacyNodeConfig(ctx context.Context, env *component.Env) error {
+	for _, obj := range []client.Object{
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, Name: legacyNodeConfigDaemonSetName}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, Name: legacyNodeConfigName}},
+	} {
+		if err := env.DeleteIfExists(ctx, obj); err != nil {
+			return fmt.Errorf("remove legacy Gantry node config: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // applyMutator skips CRDs and the separately reconciled gantry-config ConfigMap,
 // stamps the operator-derived agent image onto the agent DaemonSet, and stamps
-// the config payload hashes on the workloads they belong to so a config change
-// rolls the corresponding DaemonSet. Only the agent's own container is
-// re-imaged; the busybox init and the busybox node-config DaemonSet keep their
-// pinned public images.
-func applyMutator(agentImage, configHash, nodeConfigHash string) func(*unstructured.Unstructured) error {
+// the config payload hash on its pod template so a config change rolls the
+// DaemonSet. Only the agent's own container is re-imaged.
+func applyMutator(agentImage, configHash string) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		if obj.GetKind() == component.CRDKind {
 			obj.Object = nil
@@ -199,18 +198,15 @@ func applyMutator(agentImage, configHash, nodeConfigHash string) func(*unstructu
 			return nil
 		}
 
-		switch {
-		case obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName:
+		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
 			if err := component.SetNamedContainerImage(obj, agentContainerName, agentImage); err != nil {
 				return fmt.Errorf("set gantry agent image: %w", err)
 			}
 
 			return stampConfigHash(obj, configHashAnnotation, configHash)
-		case obj.GetKind() == "DaemonSet" && obj.GetName() == nodeConfigDaemonSetName:
-			return stampConfigHash(obj, nodeConfigHashAnnotation, nodeConfigHash)
-		default:
-			return nil
 		}
+
+		return nil
 	}
 }
 
@@ -232,17 +228,6 @@ func stampConfigHash(obj *unstructured.Unstructured, annotation, hash string) er
 	}
 
 	return nil
-}
-
-// nodeConfigPayloadHash returns the payload hash of the embedded node-config
-// hosts ConfigMap so the writer DaemonSet can be rolled when it changes.
-func nodeConfigPayloadHash(env *component.Env) (string, error) {
-	cm, err := env.DefaultConfigMap(gantrymanifests.Manifests, nodeConfigName, "gantry node-config")
-	if err != nil {
-		return "", err
-	}
-
-	return component.ConfigMapPayloadHash(cm), nil
 }
 
 // ensureConfig creates the embedded default only when no config exists. An
