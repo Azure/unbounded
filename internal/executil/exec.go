@@ -186,20 +186,6 @@ func Ip() func(context.Context) *exec.Cmd {
 	}
 }
 
-// Iptables returns a command factory for iptables.
-func Iptables() func(context.Context) *exec.Cmd {
-	return func(ctx context.Context) *exec.Cmd {
-		return exec.CommandContext(ctx, "iptables")
-	}
-}
-
-// Curl returns a command factory for curl.
-func Curl() func(context.Context) *exec.Cmd {
-	return func(ctx context.Context) *exec.Cmd {
-		return exec.CommandContext(ctx, "curl")
-	}
-}
-
 // Machinectl returns a command factory for machinectl.
 func Machinectl() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {

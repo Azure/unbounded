@@ -21,8 +21,11 @@ dns_health() {
     local address=$1
     timeout 3 bash -c '
         exec 3<>/dev/tcp/$1/53
+        # Send a length-prefixed TCP DNS A query for health-check.localdns.local.
         printf "\\x00\\x2d\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x0chealth-check\\x08localdns\\x05local\\x00\\x00\\x01\\x00\\x01" >&3
-        test "$(dd bs=1 count=14 <&3 2>/dev/null | wc -c)" -eq 14
+        read -r -a response < <(dd bs=1 count=14 <&3 2>/dev/null | od -An -tu1)
+        ((${#response[@]} == 14))
+        (( (response[5] & 15) == 0 ))
     ' _ "${address}"
 }
 
@@ -33,8 +36,12 @@ ready() {
         "http://${cluster_listener}:8181/ready" >/dev/null
 }
 
+healthy() {
+    ready && dns_health "${node_listener}" && dns_health "${cluster_listener}"
+}
+
 for _ in $(seq 1 60); do
-    if ready; then
+    if healthy; then
         systemd-notify --ready
         break
     fi
@@ -45,8 +52,8 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 
-if ! ready; then
-    echo "LocalDNS did not become ready" >&2
+if ! healthy; then
+    echo "LocalDNS did not become ready and answer health queries" >&2
     exit 1
 fi
 
@@ -57,7 +64,7 @@ failures=0
 window_start=0
 
 while kill -0 "${coredns_pid}" 2>/dev/null; do
-    if ready && dns_health "${node_listener}" && dns_health "${cluster_listener}"; then
+    if healthy; then
         systemd-notify WATCHDOG=1
     else
         now=$(date +%s)

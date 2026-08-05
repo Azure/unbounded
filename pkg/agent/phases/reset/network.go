@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -68,36 +69,11 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 		t.log.Debug("LocalDNS network unit was not active", "error", err)
 	}
 
-	for _, chain := range []string{"OUTPUT", "PREROUTING"} {
-		output, err := executil.OutputCmd(ctx, t.log, "iptables", "-w", "-t", "raw", "-S", chain)
-		if err != nil {
-			// Hosts without a LocalDNS deployment may not have iptables or a raw table.
-			continue
-		}
-
-		for _, line := range strings.Split(output, "\n") {
-			if !strings.Contains(line, "unbounded-localdns: skip conntrack") {
-				continue
-			}
-
-			fields := strings.Fields(strings.ReplaceAll(line, `"`, ""))
-			values := map[string]string{}
-
-			for i := 0; i+1 < len(fields); i++ {
-				switch fields[i] {
-				case "-A", "-p", "-d":
-					values[fields[i]] = strings.TrimSuffix(fields[i+1], "/32")
-				}
-			}
-
-			if values["-A"] == "" || values["-p"] == "" || values["-d"] == "" {
-				continue
-			}
-
-			args := []string{"-w", "-t", "raw", "-m", "comment", "--comment", "unbounded-localdns: skip conntrack", "-D", values["-A"], "-p", values["-p"], "-d", values["-d"], "--dport", "53", "-j", "NOTRACK"}
-			if err := executil.RunCmd(ctx, t.log, executil.Iptables(), args...); err != nil {
-				return fmt.Errorf("remove LocalDNS NOTRACK rule: %w", err)
-			}
+	if _, err := executil.OutputCmd(ctx, t.log, "nft", "list", "table", "ip", goalstates.LocalDNSNFTTable); err == nil {
+		if err := executil.RunCmd(ctx, t.log, func(ctx context.Context) *exec.Cmd {
+			return exec.CommandContext(ctx, "nft")
+		}, "delete", "table", "ip", goalstates.LocalDNSNFTTable); err != nil {
+			return fmt.Errorf("remove LocalDNS nftables table: %w", err)
 		}
 	}
 

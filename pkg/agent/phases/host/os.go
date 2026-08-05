@@ -19,13 +19,12 @@ import (
 // debianRequiredPackages lists the OS packages that must be installed on a Debian host.
 // - systemd-container: provides systemd-nspawn for running containers.
 // - curl: used for downloading resources.
-// - nftables: provides nft, used by nftables-flush.service to reset firewall rules.
+// - nftables: provides nft, used by nftables-flush.service and LocalDNS rules.
 // - util-linux: provides mountpoint for private bpffs cleanup.
 var debianRequiredPackages = []string{
 	"systemd-container",
 	"curl",
 	"nftables",
-	"iptables",
 	"util-linux",
 }
 
@@ -34,7 +33,6 @@ var rpmRequiredPackages = []string{
 	"systemd-container",
 	"curl",
 	"nftables",
-	"iptables",
 	"util-linux",
 }
 

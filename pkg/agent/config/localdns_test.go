@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestAgentLocalDNSConfigValidate(t *testing.T) {
+func TestAgentConfigValidateLocalDNS(t *testing.T) {
 	t.Parallel()
 
 	positive := 1
@@ -33,7 +33,13 @@ func TestAgentLocalDNSConfigValidate(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := test.config.Validate("10.0.0.10", test.nodeIP)
+			cfg := AgentConfig{
+				Cluster:  AgentClusterConfig{ClusterDNS: "10.0.0.10"},
+				Kubelet:  AgentKubeletConfig{NodeIP: test.nodeIP},
+				LocalDNS: test.config,
+			}
+
+			err := cfg.validateLocalDNS()
 			if test.wantErr == "" {
 				if err != nil {
 					t.Fatalf("Validate() error = %v", err)
