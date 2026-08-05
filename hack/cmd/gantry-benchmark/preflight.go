@@ -390,7 +390,7 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 		},
 		{
 			description: "containerd build",
-			query:       fmt.Sprintf(`count(containerd_build_info{namespace=%q,gantry_benchmark="true"})`, b.config.Namespace),
+			query:       fmt.Sprintf(`count(containerd_build_info_total{namespace=%q,gantry_benchmark="true"})`, b.config.Namespace),
 		},
 		{
 			description: "Gantry response completion",

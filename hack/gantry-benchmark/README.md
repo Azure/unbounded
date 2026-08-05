@@ -97,7 +97,7 @@ payload bytes.
 node. It exposes node-exporter metrics, provides a Prometheus target for the
 host containerd metrics endpoint, and streams a filtered subset of the host
 containerd journal. Preflight requires both `node_uname_info` and
-`containerd_build_info` from every observer pod.
+`containerd_build_info_total` from every observer pod.
 
 Each phase writes `<phase>-performance.json` with the unmodified Prometheus
 range-query envelopes at 10-second resolution for:
