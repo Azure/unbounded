@@ -19,14 +19,23 @@ type latencySummary struct {
 }
 
 type jobObservation struct {
-	JobName          string            `json:"job_name"`
-	PhaseStartedAt   time.Time         `json:"phase_started_at"`
-	PhaseFinishedAt  time.Time         `json:"phase_finished_at"`
-	Nodes            []string          `json:"nodes"`
-	Pods             []string          `json:"pods"`
-	PodNodes         map[string]string `json:"pod_nodes"`
-	PodStartLatency  latencySummary    `json:"pod_start_latency"`
-	PodFinishLatency latencySummary    `json:"pod_finish_latency"`
+	JobName          string                          `json:"job_name"`
+	PhaseStartedAt   time.Time                       `json:"phase_started_at"`
+	PhaseFinishedAt  time.Time                       `json:"phase_finished_at"`
+	Nodes            []string                        `json:"nodes"`
+	Pods             []string                        `json:"pods"`
+	PodNodes         map[string]string               `json:"pod_nodes"`
+	PodTimings       map[string]podTimingObservation `json:"pod_timings"`
+	PodStartLatency  latencySummary                  `json:"pod_start_latency"`
+	PodFinishLatency latencySummary                  `json:"pod_finish_latency"`
+}
+
+type podTimingObservation struct {
+	NodeName             string    `json:"node_name"`
+	ContainerStartedAt   time.Time `json:"container_started_at"`
+	ContainerFinishedAt  time.Time `json:"container_finished_at"`
+	StartLatencySeconds  float64   `json:"start_latency_seconds"`
+	FinishLatencySeconds float64   `json:"finish_latency_seconds"`
 }
 
 type podList struct {
@@ -186,6 +195,7 @@ func parseJobObservation(raw []byte, expectedPods int, phaseStartedAt time.Time)
 	nodeSet := make(map[string]struct{}, expectedPods)
 	podNames := make([]string, 0, expectedPods)
 	podNodes := make(map[string]string, expectedPods)
+	podTimings := make(map[string]podTimingObservation, expectedPods)
 	startLatencies := make([]time.Duration, 0, expectedPods)
 	finishLatencies := make([]time.Duration, 0, expectedPods)
 
@@ -224,6 +234,13 @@ func parseJobObservation(raw []byte, expectedPods int, phaseStartedAt time.Time)
 
 			startLatencies = append(startLatencies, terminated.StartedAt.Sub(phaseStartedAt))
 			finishLatencies = append(finishLatencies, terminated.FinishedAt.Sub(phaseStartedAt))
+			podTimings[pod.Metadata.Name] = podTimingObservation{
+				NodeName:             pod.Spec.NodeName,
+				ContainerStartedAt:   terminated.StartedAt,
+				ContainerFinishedAt:  terminated.FinishedAt,
+				StartLatencySeconds:  terminated.StartedAt.Sub(phaseStartedAt).Seconds(),
+				FinishLatencySeconds: terminated.FinishedAt.Sub(phaseStartedAt).Seconds(),
+			}
 			terminatedFound = true
 
 			break
@@ -246,6 +263,7 @@ func parseJobObservation(raw []byte, expectedPods int, phaseStartedAt time.Time)
 		Nodes:            nodes,
 		Pods:             podNames,
 		PodNodes:         podNodes,
+		PodTimings:       podTimings,
 		PodStartLatency:  summarizeLatencies(startLatencies),
 		PodFinishLatency: summarizeLatencies(finishLatencies),
 	}, nil

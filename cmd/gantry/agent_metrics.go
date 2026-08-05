@@ -76,22 +76,24 @@ func newPhase1Metrics(reg *metrics.Registry) *phase1Metrics {
 // phase2Metrics groups metrics for peer fallback, DHT advertise,
 // and transfer endpoint (the design doc).
 type phase2Metrics struct {
-	peerServe        prometheus.Counter
-	peerServeBytes   *prometheus.CounterVec
-	peerMiss         prometheus.Counter
-	peerFetch        *prometheus.CounterVec
-	peerFetchBytes   *prometheus.CounterVec
-	mirrorServeBytes *prometheus.CounterVec
-	peerFetchDur     *prometheus.HistogramVec
-	peerDialSuccess  prometheus.Counter
-	peerDialFailure  prometheus.Counter
-	dhtProvide       prometheus.Counter
-	dhtProvideErr    *prometheus.CounterVec
-	dhtReconcile     prometheus.Counter
-	dhtLookup        *prometheus.CounterVec
-	dhtLookupDur     *prometheus.HistogramVec
-	dhtAdvertise     prometheus.Counter
-	cdsubReconnect   prometheus.Counter
+	peerServe         prometheus.Counter
+	peerServeBytes    *prometheus.CounterVec
+	peerMiss          prometheus.Counter
+	peerFetch         *prometheus.CounterVec
+	peerFetchLastAt   *prometheus.GaugeVec
+	peerFetchBytes    *prometheus.CounterVec
+	mirrorServeBytes  *prometheus.CounterVec
+	mirrorCompletedAt *prometheus.GaugeVec
+	peerFetchDur      *prometheus.HistogramVec
+	peerDialSuccess   prometheus.Counter
+	peerDialFailure   prometheus.Counter
+	dhtProvide        prometheus.Counter
+	dhtProvideErr     *prometheus.CounterVec
+	dhtReconcile      prometheus.Counter
+	dhtLookup         *prometheus.CounterVec
+	dhtLookupDur      *prometheus.HistogramVec
+	dhtAdvertise      prometheus.Counter
+	cdsubReconnect    prometheus.Counter
 }
 
 func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
@@ -112,6 +114,10 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 			Name: "p2p_peer_fetch_total",
 			Help: "Peer fetches initiated by the mirror miss path.",
 		}, []string{"outcome"}),
+		peerFetchLastAt: reg.NewGaugeVec("mirror", prometheus.GaugeOpts{
+			Name: "gantry_peer_fetch_last_timestamp_seconds",
+			Help: "Unix timestamp of the most recent peer fetch event, retained for busy and stall outcomes.",
+		}, []string{"outcome"}),
 		peerFetchBytes: reg.NewCounterVec("mirror", prometheus.CounterOpts{
 			Name: "gantry_peer_fetch_bytes_total",
 			Help: "Bytes received from peer Gantry agents, including partial failed transfers and retries, labeled by OCI content kind.",
@@ -119,6 +125,10 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 		mirrorServeBytes: reg.NewCounterVec("mirror", prometheus.CounterOpts{
 			Name: "gantry_mirror_bytes_served_total",
 			Help: "Bytes written by the containerd-facing mirror, labeled by OCI content kind and source path (cache, peer, or origin).",
+		}, []string{"kind", "source"}),
+		mirrorCompletedAt: reg.NewGaugeVec("mirror", prometheus.GaugeOpts{
+			Name: "gantry_mirror_response_completed_timestamp_seconds",
+			Help: "Unix timestamp when a complete response body was most recently written to the local containerd client, labeled by content kind and source path.",
 		}, []string{"kind", "source"}),
 		peerFetchDur: reg.NewHistogramVec("mirror", prometheus.HistogramOpts{
 			Name:    "p2p_peer_fetch_duration_seconds",
@@ -170,7 +180,30 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 
 		for _, source := range []string{"cache", "peer", "origin"} {
 			p.mirrorServeBytes.WithLabelValues(kind, source).Add(0)
+			p.mirrorCompletedAt.WithLabelValues(kind, source).Set(0)
 		}
+	}
+	for _, outcome := range []string{
+		"hit",
+		"notfound",
+		"unavailable",
+		"digest_mismatch",
+		"auth_or_config",
+		"server_error",
+		"protocol_error",
+		"stall",
+		"local_error",
+		"busy",
+	} {
+		p.peerFetch.WithLabelValues(outcome).Add(0)
+		p.peerFetchDur.WithLabelValues(outcome)
+	}
+	for _, outcome := range []string{"busy", "stall"} {
+		p.peerFetchLastAt.WithLabelValues(outcome).Set(0)
+	}
+	for _, outcome := range []string{"hit", "miss", "error", "timeout"} {
+		p.dhtLookup.WithLabelValues(outcome).Add(0)
+		p.dhtLookupDur.WithLabelValues(outcome)
 	}
 
 	return p
@@ -383,35 +416,38 @@ func newPhase5Metrics(reg *metrics.Registry, healthScore func() float64) *phase5
 // in its content inventory" so the agent does not pretend a local
 // commit happened just because the HTTP stream completed.
 type phase9Metrics struct {
-	storageMode               *prometheus.GaugeVec
-	advReconcileTotal         prometheus.Counter
-	advReconcileError         prometheus.Counter
-	advReconcileUnavailable   prometheus.Counter
-	advReconcileDur           prometheus.Histogram
-	advReconcileDigestCount   prometheus.Gauge
-	advReconcileAdded         prometheus.Counter
-	advReconcileRemoved       prometheus.Counter
-	withdrawTotal             prometheus.Counter
-	withdrawError             prometheus.Counter
-	containerdLeaseCreated    prometheus.Counter
-	containerdLeaseReleased   prometheus.Counter
-	containerdLeaseActive     prometheus.Gauge
-	containerdLeaseCleanupErr prometheus.Counter
-	containerdIngestTotal     prometheus.Counter
-	containerdIngestFailure   prometheus.Counter
-	containerdHit             prometheus.Counter
-	containerdMiss            prometheus.Counter
-	containerdUnavailable     prometheus.Counter
-	containerdOpenError       prometheus.Counter
-	originStreamStarted       *prometheus.CounterVec
-	originStreamCompleted     *prometheus.CounterVec
-	originStreamFailed        *prometheus.CounterVec
-	containerdCommitObserved  prometheus.Counter
-	dhtStaleOnly              prometheus.Counter
-	staleProviderFiltered     prometheus.Counter
-	commitMissingAfterStream  prometheus.Counter
-	advertiseTotal            prometheus.Counter
-	advertiseError            prometheus.Counter
+	storageMode                *prometheus.GaugeVec
+	advReconcileTotal          prometheus.Counter
+	advReconcileError          prometheus.Counter
+	advReconcileUnavailable    prometheus.Counter
+	advReconcileDur            prometheus.Histogram
+	advReconcileDigestCount    prometheus.Gauge
+	advReconcileAdded          prometheus.Counter
+	advReconcileRemoved        prometheus.Counter
+	withdrawTotal              prometheus.Counter
+	withdrawError              prometheus.Counter
+	containerdLeaseCreated     prometheus.Counter
+	containerdLeaseReleased    prometheus.Counter
+	containerdLeaseActive      prometheus.Gauge
+	containerdLeaseCleanupErr  prometheus.Counter
+	containerdIngestTotal      prometheus.Counter
+	containerdIngestFailure    prometheus.Counter
+	containerdHit              prometheus.Counter
+	containerdMiss             prometheus.Counter
+	containerdUnavailable      prometheus.Counter
+	containerdOpenError        prometheus.Counter
+	originStreamStarted        *prometheus.CounterVec
+	originStreamCompleted      *prometheus.CounterVec
+	originStreamFailed         *prometheus.CounterVec
+	containerdCommitObserved   prometheus.Counter
+	containerdCommitObservedAt prometheus.Gauge
+	containerdCommitObserveDur prometheus.Histogram
+	containerdCommitLatestDur  prometheus.Gauge
+	dhtStaleOnly               prometheus.Counter
+	staleProviderFiltered      prometheus.Counter
+	commitMissingAfterStream   prometheus.Counter
+	advertiseTotal             prometheus.Counter
+	advertiseError             prometheus.Counter
 }
 
 func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
@@ -512,6 +548,19 @@ func newPhase9Metrics(reg *metrics.Registry) *phase9Metrics {
 		containerdCommitObserved: reg.NewCounter("storage", prometheus.CounterOpts{
 			Name: "gantry_containerd_commit_observed_total",
 			Help: "Completed live stream-through responses whose digest later appeared in the local containerd inventory within the verification window. This is the truthful post-stream commit signal for live mirror traffic.",
+		}),
+		containerdCommitObservedAt: reg.NewGauge("storage", prometheus.GaugeOpts{
+			Name: "gantry_containerd_commit_observed_timestamp_seconds",
+			Help: "Unix timestamp when containerd inventory most recently showed a digest from a completed live stream-through response.",
+		}),
+		containerdCommitObserveDur: reg.NewHistogram("storage", prometheus.HistogramOpts{
+			Name:    "gantry_containerd_commit_observation_duration_seconds",
+			Help:    "Time from a digest-verified live stream-through response completing to the digest appearing in containerd inventory. Resolution is bounded by the inventory probe interval.",
+			Buckets: prometheus.ExponentialBuckets(0.25, 2, 9),
+		}),
+		containerdCommitLatestDur: reg.NewGauge("storage", prometheus.GaugeOpts{
+			Name: "gantry_containerd_commit_latest_observation_duration_seconds",
+			Help: "Most recent measured time from a digest-verified live stream-through response completing to the digest appearing in containerd inventory. Resolution is bounded by the inventory probe interval.",
 		}),
 		dhtStaleOnly: reg.NewCounter("discovery", prometheus.CounterOpts{
 			Name: "gantry_dht_stale_only_total",

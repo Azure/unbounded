@@ -72,24 +72,26 @@ const (
 )
 
 type phaseResult struct {
-	RunID                  string                     `json:"run_id"`
-	Phase                  proxyPhase                 `json:"phase"`
-	Image                  string                     `json:"image"`
-	ImageSizeMiB           int                        `json:"image_size_mib"`
-	ImageLayers            int                        `json:"image_layers,omitempty"`
-	PayloadSHA             string                     `json:"workload_payload_sha256,omitempty"`
-	WorkloadComparisonMode workloadComparisonMode     `json:"workload_comparison_mode,omitempty"`
-	Proxy                  proxyPhaseTotals           `json:"proxy"`
-	Gantry                 gantryMetrics              `json:"gantry"`
-	GantryPeer             gantryPeerPhaseMeasurement `json:"gantry_peer"`
-	Azure                  azurePhaseMeasurement      `json:"azure"`
-	Job                    jobObservation             `json:"job"`
+	RunID                  string                           `json:"run_id"`
+	Phase                  proxyPhase                       `json:"phase"`
+	Image                  string                           `json:"image"`
+	ImageSizeMiB           int                              `json:"image_size_mib"`
+	ImageLayers            int                              `json:"image_layers,omitempty"`
+	PayloadSHA             string                           `json:"workload_payload_sha256,omitempty"`
+	WorkloadComparisonMode workloadComparisonMode           `json:"workload_comparison_mode,omitempty"`
+	Proxy                  proxyPhaseTotals                 `json:"proxy"`
+	Gantry                 gantryMetrics                    `json:"gantry"`
+	GantryPeer             gantryPeerPhaseMeasurement       `json:"gantry_peer"`
+	GantryDiagnostics      gantryDiagnosticPhaseMeasurement `json:"gantry_diagnostics"`
+	Azure                  azurePhaseMeasurement            `json:"azure"`
+	Job                    jobObservation                   `json:"job"`
 	// OriginBytes is the phase's ACR traffic as attributed by OriginBytesSource.
-	OriginBytes             uint64           `json:"origin_bytes"`
-	OriginBytesSource       originByteSource `json:"origin_bytes_source"`
-	PodStartupLatency       latencySummary   `json:"pod_startup_latency"`
-	PodStartupLatencySource string           `json:"pod_startup_latency_source"`
-	RecordedAt              time.Time        `json:"recorded_at"`
+	OriginBytes                  uint64           `json:"origin_bytes"`
+	OriginBytesSource            originByteSource `json:"origin_bytes_source"`
+	PodStartupLatency            latencySummary   `json:"pod_startup_latency"`
+	PodStartupLatencySource      string           `json:"pod_startup_latency_source"`
+	PerformanceTelemetryArtifact string           `json:"performance_telemetry_artifact"`
+	RecordedAt                   time.Time        `json:"recorded_at"`
 }
 
 type benchmarkComparison struct {

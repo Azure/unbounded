@@ -563,6 +563,11 @@ func runAgent(args []string) error {
 
 	streamCommitTracker := newStreamCommitTracker(containerdInv, logger,
 		func(n int) { p9.containerdCommitObserved.Add(float64(n)) },
+		func(duration time.Duration) {
+			p9.containerdCommitObserveDur.Observe(duration.Seconds())
+			p9.containerdCommitLatestDur.Set(duration.Seconds())
+			p9.containerdCommitObservedAt.SetToCurrentTime()
+		},
 		func(n int) { p9.commitMissingAfterStream.Add(float64(n)) },
 	)
 
@@ -588,6 +593,9 @@ func runAgent(args []string) error {
 				p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
 			},
 		),
+		mirror.WithMirrorResponseCompletedHook(func(kind, source string) {
+			p2.mirrorCompletedAt.WithLabelValues(kind, source).SetToCurrentTime()
+		}),
 		mirror.WithOriginStreamMetrics(
 			func(kind string) { p9.originStreamStarted.WithLabelValues(kind).Inc() },
 			func(kind string) { p9.originStreamCompleted.WithLabelValues(kind).Inc() },
@@ -609,7 +617,12 @@ func runAgent(args []string) error {
 		mirror.WithSelfNodeID(memberView.Self()),
 		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
-			func(outcome string) { p2.peerFetch.WithLabelValues(outcome).Inc() },
+			func(outcome string) {
+				p2.peerFetch.WithLabelValues(outcome).Inc()
+				if outcome == "busy" || outcome == "stall" {
+					p2.peerFetchLastAt.WithLabelValues(outcome).SetToCurrentTime()
+				}
+			},
 			func(success bool) {
 				if success {
 					p2.peerDialSuccess.Inc()

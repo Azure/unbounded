@@ -14,6 +14,10 @@ The workflow does not provision AKS, create ACR, or install Gantry. It expects:
   a Grafana dashboard sidecar. The workflow installs benchmark-owned
   PodMonitors for Gantry and, in proxy mode, the proxy.
 - Containerd configured to read `/etc/containerd/certs.d`.
+- Containerd metrics listening on `0.0.0.0:10257` and debug logging enabled.
+  The managed node template in this repository configures both. Preflight
+  refuses to run without a containerd scrape from every target node, and the
+  node-observer DaemonSet fails if effective containerd log level is not debug.
 - A private operator VM in the AKS VNet. The VM runs every benchmark command,
   builds and pushes both images, queries Azure telemetry, and stores artifacts.
 - Cluster permission to create privileged hostPath DaemonSets. Proxy mode also
@@ -86,6 +90,44 @@ There is no warm-cache phase and no containerd content purge. Separate ACR
 hostnames alone do not isolate containerd's digest-addressed cache; the
 phase-specific layer paths provide that isolation while preserving identical
 payload bytes.
+
+## Performance attribution artifacts
+
+`enable` installs a benchmark-owned node-observer DaemonSet on every target
+node. It exposes node-exporter metrics, provides a Prometheus target for the
+host containerd metrics endpoint, and streams a filtered subset of the host
+containerd journal. Preflight requires both `node_uname_info` and
+`containerd_build_info` from every observer pod.
+
+Each phase writes `<phase>-performance.json` with the unmodified Prometheus
+range-query envelopes at 10-second resolution for:
+
+- host disk bytes, I/O busy time, CPU, memory, and network bytes/errors;
+- containerd process and built-in metrics;
+- per-Gantry-pod peer outcomes and durations;
+- exact latest peer busy/stall event timestamps plus interval counts;
+- per-Gantry-pod DHT outcomes and durations;
+- mirror bytes and final response-completion timestamps; and
+- stream-completion-to-containerd-inventory observation distributions and
+  latest measured durations.
+
+The same artifact includes the observer-pod-to-node map, raw filtered
+containerd journal, and phase-bounded structured events for `PullImage`,
+successful pull completion, no-progress cancellation, `layer unpacked`, and
+`image unpacked`. Capture fails unless every observer pod has an event in the
+phase window. Containerd's
+`layer unpacked` duration spans fetch, apply, and snapshot commit; it is not a
+pure filesystem-write duration. Host disk metrics provide the independent
+filesystem pressure signal during that span.
+
+Phase JSON also includes:
+
+- exact per-workload-pod container start/finish timestamps and node names; and
+- per-Gantry-pod counter deltas and phase-local timestamp gauges.
+
+These two node maps are the supported join key for correlating peer busy/stall
+events, DHT latency, final layer-response time, containerd commit observation,
+containerd unpack logs, host resource use, and workload startup latency.
 
 ## Lifecycle
 

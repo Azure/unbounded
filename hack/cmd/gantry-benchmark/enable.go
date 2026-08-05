@@ -146,6 +146,8 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 		Namespace:       b.config.Namespace,
 		GantryNamespace: b.config.GantryNamespace,
 		MonitoringLabel: b.config.KPSRelease,
+		NodeOS:          strings.SplitN(b.config.ImagePlatform, "/", 2)[0],
+		NodeArch:        strings.SplitN(b.config.ImagePlatform, "/", 2)[1],
 		ProxyImage:      b.config.ProxyImage,
 		ACRLoginServer:  b.config.ACRLoginServer,
 		RunID:           runID,
@@ -160,6 +162,16 @@ func (b *benchmark) enable(ctx context.Context) (returnErr error) {
 
 	if _, err := b.commands.Run(ctx, monitoring, "kubectl", "apply", "-f", "-"); err != nil {
 		return err
+	}
+
+	if _, err := b.commands.Run(
+		ctx,
+		nil,
+		"kubectl", "-n", b.config.Namespace,
+		"rollout", "status", "daemonset/gantry-benchmark-node-observer",
+		"--timeout", b.config.RolloutTimeout.String(),
+	); err != nil {
+		return fmt.Errorf("wait for benchmark node observer: %w", err)
 	}
 
 	if b.config.usesProxy() {
@@ -323,6 +335,8 @@ type proxyManifestData struct {
 	Namespace       string
 	GantryNamespace string
 	MonitoringLabel string
+	NodeOS          string
+	NodeArch        string
 	ProxyImage      string
 	ACRLoginServer  string
 	RunID           string

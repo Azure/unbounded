@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -68,6 +69,8 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		Namespace:       "gantry-benchmark",
 		GantryNamespace: "gantry-system",
 		MonitoringLabel: "kps",
+		NodeOS:          "linux",
+		NodeArch:        "amd64",
 		RunID:           "run-1",
 	})
 	if err != nil {
@@ -83,9 +86,29 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		t.Fatalf("rendered manifest is missing benchmark scrape or Gantry revision labels")
 	}
 
-	if !strings.Contains(string(rendered), `action: keep`) ||
-		!strings.Contains(string(rendered), `gantry_storage_mode_info|p2p_dht_health_score|gantry_peer_serve_bytes_total`) {
+	if !strings.Contains(string(rendered), `action: keep`) {
 		t.Fatalf("rendered manifest does not limit Gantry metric cardinality")
+	}
+	if !strings.Contains(string(rendered), `systemctl show --property MainPID --value containerd`) {
+		t.Fatalf("rendered manifest does not validate the running containerd debug configuration")
+	}
+	for _, metric := range []string{
+		"p2p_peer_fetch_duration_seconds_(bucket|sum|count)",
+		"p2p_dht_lookup_duration_seconds_(bucket|sum|count)",
+		"gantry_peer_fetch_last_timestamp_seconds",
+		"gantry_mirror_response_completed_timestamp_seconds",
+		"gantry_containerd_commit_observation_duration_seconds_(bucket|sum|count)",
+		"gantry_containerd_commit_latest_observation_duration_seconds",
+		"node_uname_info",
+		"node_disk_(read|written)_bytes_total",
+		"node_network_speed_bytes",
+		"node_network_(receive|transmit)_(bytes|drop|errs)_total",
+		"containerd_.*|grpc_server_.*",
+		"process_(cpu_seconds_total|resident_memory_bytes|virtual_memory_bytes)",
+	} {
+		if !strings.Contains(string(rendered), metric) {
+			t.Fatalf("rendered manifest does not retain required metric %q", metric)
+		}
 	}
 
 	if strings.Contains(string(rendered), "acr-origin-proxy") {
@@ -94,8 +117,9 @@ func TestRenderMonitoringManifest(t *testing.T) {
 
 	kinds := decodeManifestKinds(t, rendered)
 
-	if len(kinds) != 1 || kinds[0] != "PodMonitor" {
-		t.Fatalf("rendered kinds = %v, want [PodMonitor]", kinds)
+	wantKinds := []string{"PodMonitor", "DaemonSet", "PodMonitor"}
+	if !slices.Equal(kinds, wantKinds) {
+		t.Fatalf("rendered kinds = %v, want %v", kinds, wantKinds)
 	}
 }
 

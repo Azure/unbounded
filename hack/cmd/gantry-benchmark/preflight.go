@@ -368,6 +368,95 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 		}
 	}
 
+	monitoringChecks := []struct {
+		description string
+		query       string
+	}{
+		{
+			description: "node-exporter identity",
+			query:       fmt.Sprintf(`count(node_uname_info{namespace=%q,gantry_benchmark="true"})`, b.config.Namespace),
+		},
+		{
+			description: "host disk throughput",
+			query:       fmt.Sprintf(`count(count by(pod) (node_disk_written_bytes_total{namespace=%q,gantry_benchmark="true"}))`, b.config.Namespace),
+		},
+		{
+			description: "host network throughput",
+			query:       fmt.Sprintf(`count(count by(pod) (node_network_receive_bytes_total{namespace=%q,gantry_benchmark="true",device!="lo"}))`, b.config.Namespace),
+		},
+		{
+			description: "host network link speed",
+			query:       fmt.Sprintf(`count(count by(pod) (node_network_speed_bytes{namespace=%q,gantry_benchmark="true",device!="lo"} > 0))`, b.config.Namespace),
+		},
+		{
+			description: "containerd build",
+			query:       fmt.Sprintf(`count(containerd_build_info{namespace=%q,gantry_benchmark="true"})`, b.config.Namespace),
+		},
+		{
+			description: "Gantry response completion",
+			query: fmt.Sprintf(
+				`count(count by(pod) (gantry_mirror_response_completed_timestamp_seconds{namespace=%q,kind="layer",gantry_benchmark="true",controller_revision_hash=%q}))`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry peer busy and stall outcomes",
+			query: fmt.Sprintf(
+				`count(count by(pod) (p2p_peer_fetch_total{namespace=%q,outcome=~"busy|stall",gantry_benchmark="true",controller_revision_hash=%q}))`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry peer busy and stall timestamps",
+			query: fmt.Sprintf(
+				`count(count by(pod) (gantry_peer_fetch_last_timestamp_seconds{namespace=%q,outcome=~"busy|stall",gantry_benchmark="true",controller_revision_hash=%q}))`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry DHT lookup durations",
+			query: fmt.Sprintf(
+				`count(count by(pod) (p2p_dht_lookup_duration_seconds_count{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q}))`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry containerd commit observation",
+			query: fmt.Sprintf(
+				`count(gantry_containerd_commit_observation_duration_seconds_count{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry latest containerd commit observation duration",
+			query: fmt.Sprintf(
+				`count(gantry_containerd_commit_latest_observation_duration_seconds{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+	}
+
+	for _, check := range monitoringChecks {
+		count, err := b.queryPrometheus(ctx, check.query)
+		if err != nil {
+			return fmt.Errorf("query %s metric count: %w", check.description, err)
+		}
+		if int(count) != b.config.NodeCount {
+			return fmt.Errorf(
+				"prometheus reports %s metrics for %.0f/%d observer pods",
+				check.description,
+				count,
+				b.config.NodeCount,
+			)
+		}
+	}
+
 	// Direct mode has no proxy, so there are no proxy samples to wait for. The
 	// Gantry scrape checks above already prove the benchmark PodMonitor is
 	// being honoured by Prometheus.
