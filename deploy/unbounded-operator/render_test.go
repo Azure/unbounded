@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -328,6 +329,9 @@ func TestOperatorImageAndComponentRegistryShareRegistry(t *testing.T) {
 	}
 
 	var cm struct {
+		Metadata struct {
+			Annotations map[string]string `yaml:"annotations"`
+		} `yaml:"metadata"`
 		Data map[string]string `yaml:"data"`
 	}
 	readYAML(t, filepath.Join(outputDir, "03-configmap.yaml"), &cm)
@@ -335,6 +339,20 @@ func TestOperatorImageAndComponentRegistryShareRegistry(t *testing.T) {
 	registry := cm.Data["UNBOUNDED_IMAGE_REGISTRY"]
 	if registry == "" {
 		t.Fatal("configmap UNBOUNDED_IMAGE_REGISTRY is empty")
+	}
+
+	// ghcr (and OCI generally) reject uppercase repository names, so the resolved
+	// registry must be lowercase. This is cheap insurance against a release job
+	// feeding the raw github.repository_owner (e.g. "Azure") without lowercasing.
+	if registry != strings.ToLower(registry) {
+		t.Fatalf("configmap UNBOUNDED_IMAGE_REGISTRY %q is not lowercase; OCI repository names must be lowercase", registry)
+	}
+
+	// The ConfigMap must carry the image-registry schema marker so kubectl
+	// unbounded install recognizes a directly-applied config as already using the
+	// full-prefix semantics and never migrates it.
+	if got := cm.Metadata.Annotations["unbounded-cloud.io/image-registry-schema"]; got != "2" {
+		t.Fatalf("configmap image-registry-schema annotation = %q, want \"2\"", got)
 	}
 
 	var deploy struct {

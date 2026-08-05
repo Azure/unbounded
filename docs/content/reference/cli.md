@@ -79,9 +79,20 @@ Optional flags:
 image-repository prefix (registry host plus org/namespace, e.g. `ghcr.io/azure`,
 `ghcr.io/myorg`, or `registry.corp.internal/unbounded`) that components are
 resolved under; their flat repository name and image tag (always the operator's
-compiled version) are appended to it. Reinstalling a cluster whose stored value
-predates this change (a bare host such as `ghcr.io`) migrates it to the
-equivalent `ghcr.io/azure` prefix automatically.
+compiled version) are appended to it. Left unset, a fresh install inherits the
+registry the binary was built with (the same one as its operator image), so fork
+and mirror builds work without a flag.
+
+Reinstalling a cluster whose stored registry predates this change is migrated
+automatically: the old value was the prefix the operator appended an implicit
+`/azure/` to, so `ghcr.io` becomes `ghcr.io/azure` and a mirror `registry.corp/unbounded`
+becomes `registry.corp/unbounded/azure`, preserving the images it already pulled.
+A schema marker on the operator ConfigMap makes this run exactly once, so a value
+you set intentionally is never rewritten again.
+
+> **Breaking change:** `--image-registry` is now a full prefix. Automation that
+> passed the old bare `ghcr.io` must pass `ghcr.io/azure` (or its own equivalent),
+> otherwise components resolve to `ghcr.io/<component>`.
 
 ---
 

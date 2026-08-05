@@ -46,6 +46,19 @@ const (
 	// operatorCRDRepairAnnotation restarts an existing operator when its startup
 	// CRD bootstrap needs to repair a missing or unestablished CRD.
 	operatorCRDRepairAnnotation = "unbounded-cloud.io/operator-crd-repair-token"
+
+	// imageRegistrySchemaAnnotation records, on the unbounded-operator-config
+	// ConfigMap, the semantics version of its UNBOUNDED_IMAGE_REGISTRY value. An
+	// absent annotation means the value predates #574, when the operator appended
+	// an implicit "/azure/" segment, so the stored value was the prefix before it.
+	// imageRegistrySchemaCurrent means the value is already a full
+	// image-repository prefix. install migrates an unmarked value exactly once.
+	imageRegistrySchemaAnnotation = "unbounded-cloud.io/image-registry-schema"
+	imageRegistrySchemaCurrent    = "2"
+
+	// fallbackImageRegistry is used only when the embedded operator ConfigMap
+	// cannot be read; normal builds render it with the build-time CONTAINER_REGISTRY.
+	fallbackImageRegistry = "ghcr.io/azure"
 )
 
 type installHandler struct {
@@ -55,6 +68,11 @@ type installHandler struct {
 	operatorImage     string
 	imageRegistry     string
 	apiServerEndpoint string
+
+	// operatorManifests is the embedded operator manifest filesystem install
+	// applies and reads its build-time defaults from. It defaults to
+	// operatormanifests.Manifests; tests inject a fork-rendered set.
+	operatorManifests fs.FS
 
 	wait    bool
 	timeout time.Duration
@@ -145,7 +163,7 @@ func (h *installHandler) execute(ctx context.Context) error {
 		return err
 	}
 
-	if err := applyManifestFS(ctx, h.logger, h.kubeResourcesCli, operatormanifests.Manifests, fieldManagerID, h.mutateOperatorObject); err != nil {
+	if err := applyManifestFS(ctx, h.logger, h.kubeResourcesCli, h.manifests(), fieldManagerID, h.mutateOperatorObject); err != nil {
 		return fmt.Errorf("applying unbounded-operator manifests: %w", err)
 	}
 
@@ -229,6 +247,15 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 		}
 
 		h.operatorConfigData = data
+
+		// Stamp the schema marker so a later reinstall recognizes this value as a
+		// full prefix and does not migrate it again. Stamping here (not only in
+		// the template) keeps migration once-only even if the embedded manifest
+		// predates the marker. The annotation is not ConfigMap data, so it stays
+		// out of the operator's envFrom and the config-hash.
+		if err := unstructured.SetNestedField(obj.Object, imageRegistrySchemaCurrent, "metadata", "annotations", imageRegistrySchemaAnnotation); err != nil {
+			return fmt.Errorf("set image registry schema annotation: %w", err)
+		}
 	}
 
 	if obj.GetKind() == "Deployment" && obj.GetName() == "unbounded-operator" {
@@ -288,7 +315,12 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	// override is preserved across reinstalls (like the reaper flag) rather than
 	// being cleared or replaced with the kubeconfig host.
 	endpoint := ""
-	imageRegistry := "ghcr.io/azure"
+	// The fresh-install default tracks the registry baked into the embedded
+	// operator manifests, which is rendered from the same CONTAINER_REGISTRY as
+	// the operator image this binary deploys. Hardcoding it here would make a
+	// fork build (operator image ghcr.io/myorg) configure components from
+	// ghcr.io/azure, the exact drift #574 removed.
+	imageRegistry := h.embeddedImageRegistry()
 	reapLegacyResources := true
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
@@ -305,9 +337,21 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 			return fmt.Errorf("get existing unbounded-operator-config data: %w", err)
 		}
 
+		annotations, _, err := unstructured.NestedStringMap(configMap.Object, "metadata", "annotations")
+		if err != nil {
+			return fmt.Errorf("get existing unbounded-operator-config annotations: %w", err)
+		}
+
 		endpoint = data["UNBOUNDED_API_SERVER_ENDPOINT"]
 		if value := data["UNBOUNDED_IMAGE_REGISTRY"]; value != "" {
-			imageRegistry = migrateLegacyImageRegistry(value)
+			// A ConfigMap written before the schema marker existed stored the
+			// prefix the operator appended "/azure/" to, so migrate it once;
+			// a marked value is already a full prefix and is preserved verbatim.
+			if annotations[imageRegistrySchemaAnnotation] == imageRegistrySchemaCurrent {
+				imageRegistry = value
+			} else {
+				imageRegistry = migrateLegacyImageRegistry(value)
+			}
 		}
 
 		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
@@ -337,16 +381,65 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	return nil
 }
 
-// migrateLegacyImageRegistry upgrades a preserved UNBOUNDED_IMAGE_REGISTRY value
-// from the pre-#574 semantics (where the operator appended a hardcoded /azure/
-// segment) to the current full-prefix semantics. A bare host with no path
-// segment (the released default "ghcr.io", or any custom bare host) gains an
-// "/azure" suffix so it keeps resolving to the same images after upgrade. Values
-// that already carry a path segment are assumed to be current full prefixes and
-// are left untouched, which also makes the rewrite idempotent across reinstalls.
+// manifests returns the operator manifest filesystem, defaulting to the embedded
+// set when a test has not injected one.
+func (h *installHandler) manifests() fs.FS {
+	if h.operatorManifests != nil {
+		return h.operatorManifests
+	}
+
+	return operatormanifests.Manifests
+}
+
+// embeddedImageRegistry returns the UNBOUNDED_IMAGE_REGISTRY baked into the
+// embedded operator ConfigMap at build time. Tying the fresh-install default to
+// the build keeps the configured component registry in lockstep with the
+// operator image the binary deploys, so fork and mirror builds work without a
+// flag. It falls back to the release default only if the manifest is unreadable.
+func (h *installHandler) embeddedImageRegistry() string {
+	files, err := yamlFiles(h.manifests())
+	if err != nil {
+		return fallbackImageRegistry
+	}
+
+	for _, file := range files {
+		data, err := fs.ReadFile(h.manifests(), file)
+		if err != nil {
+			continue
+		}
+
+		decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+
+		for {
+			obj := &unstructured.Unstructured{}
+			if err := decoder.Decode(obj); err != nil {
+				break
+			}
+
+			if obj.Object == nil || obj.GetKind() != "ConfigMap" || obj.GetName() != "unbounded-operator-config" {
+				continue
+			}
+
+			value, _, err := unstructured.NestedString(obj.Object, "data", "UNBOUNDED_IMAGE_REGISTRY")
+			if err == nil && value != "" {
+				return value
+			}
+		}
+	}
+
+	return fallbackImageRegistry
+}
+
+// migrateLegacyImageRegistry upgrades a pre-#574 UNBOUNDED_IMAGE_REGISTRY value
+// (identified by the absence of the schema-marker annotation) to the current
+// full-prefix semantics. The operator used to append a hardcoded "/azure/"
+// segment, so the stored value was the prefix before it; appending "/azure"
+// reproduces the same images for every legacy value, bare host or path-based
+// mirror alike. The schema marker install stamps on write prevents this from
+// running twice.
 func migrateLegacyImageRegistry(registry string) string {
 	trimmed := strings.TrimRight(registry, "/")
-	if trimmed == "" || strings.Contains(trimmed, "/") {
+	if trimmed == "" {
 		return registry
 	}
 
