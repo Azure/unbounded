@@ -62,6 +62,11 @@ type installHandler struct {
 	// operatormanifests.Manifests; tests inject a fork-rendered set.
 	operatorManifests fs.FS
 
+	// resolvedOperatorImage is the operator Deployment image install stamps,
+	// computed by resolveImages as <registry>/<name:tag> so it always shares the
+	// component registry.
+	resolvedOperatorImage string
+
 	wait    bool
 	timeout time.Duration
 
@@ -98,8 +103,8 @@ Sites are created or updated.`,
 func addInstallFlags(cmd *cobra.Command, handler *installHandler) {
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.namespace, "namespace", unbounded.SystemNamespace(), "Namespace for unbounded-operator and default components")
-	cmd.Flags().StringVar(&handler.operatorImage, "operator-image", "", "unbounded-operator image override")
-	cmd.Flags().StringVar(&handler.imageRegistry, "image-registry", "", "Full image-repository prefix (registry host plus org/namespace) for operator-managed component images; defaults to the registry the binary was built with")
+	cmd.Flags().StringVar(&handler.operatorImage, "operator-image", "", "unbounded-operator image name and tag without a registry (e.g. unbounded-operator:v1); the registry comes from --image-registry")
+	cmd.Flags().StringVar(&handler.imageRegistry, "image-registry", "", "Full image-repository prefix (registry host plus org/namespace) all unbounded images are pulled from; defaults to the registry the binary was built with")
 	cmd.Flags().StringVar(&handler.apiServerEndpoint, "api-server-endpoint", "", "Override the Kubernetes API server endpoint advertised to provisioned machines; by default the operator auto-discovers it from kube-public/cluster-info, or the KUBERNETES_SERVICE_HOST FQDN on clusters (e.g. AKS) that do not publish cluster-info")
 	cmd.Flags().BoolVar(&handler.wait, "wait", true, "Wait for unbounded-operator rollout")
 	cmd.Flags().DurationVar(&handler.timeout, "timeout", defaultInstallTimeout, "Timeout for rollout waits")
@@ -238,7 +243,7 @@ func (h *installHandler) mutateOperatorObject(obj *unstructured.Unstructured) er
 	}
 
 	if obj.GetKind() == "Deployment" && obj.GetName() == "unbounded-operator" {
-		if err := setContainerImage(obj, "controller", h.operatorImage); err != nil {
+		if err := setContainerImage(obj, "controller", h.resolvedOperatorImage); err != nil {
 			return err
 		}
 
@@ -294,23 +299,20 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	// override is preserved across reinstalls (like the reaper flag) rather than
 	// being cleared or replaced with the kubeconfig host.
 	endpoint := ""
-	// The component registry tracks the registry baked into the embedded operator
-	// manifests, which is rendered from the same CONTAINER_REGISTRY as the
-	// operator image this binary deploys. Deriving it from the build (rather than
-	// preserving a stored cluster value) keeps it in lockstep with the operator
-	// image, which install also re-derives from the binary on every run, and
-	// avoids the #574 drift where the two could diverge. An explicit
-	// --image-registry wins; otherwise the build-derived value is required. A
-	// stored value from an older install is simply overwritten.
-	imageRegistry := h.imageRegistry
-	if imageRegistry == "" {
-		embedded, err := h.embeddedImageRegistry()
-		if err != nil {
-			return fmt.Errorf("determine component image registry from the embedded operator manifests: %w; pass --image-registry to set it explicitly", err)
-		}
-
-		imageRegistry = embedded
+	// The operator image and the component registry must stay in lockstep (the
+	// operator resolves components at its own version from this registry), so a
+	// single value drives both: the registry comes from --image-registry (or the
+	// registry baked into the embedded manifests at build time), and the operator
+	// Deployment image is that registry plus the operator's name:tag. Because
+	// --operator-image cannot carry a registry of its own, the two cannot diverge
+	// (the #574 drift). The registry is not preserved from cluster state; a stored
+	// value from an older install is simply overwritten.
+	resolvedOperatorImage, imageRegistry, err := h.resolveImages()
+	if err != nil {
+		return err
 	}
+
+	h.resolvedOperatorImage = resolvedOperatorImage
 
 	reapLegacyResources := true
 	previousImageRegistry := ""
@@ -373,6 +375,113 @@ func (h *installHandler) manifests() fs.FS {
 	}
 
 	return operatormanifests.Manifests
+}
+
+// resolveImages determines the operator Deployment image and the component
+// registry, keeping them in lockstep. The registry is the single source: it comes
+// from --image-registry, or the registry baked into the embedded manifests at
+// build time. The operator image is that registry plus the operator's name:tag,
+// taken from --operator-image (which must be a name:tag with no registry) or the
+// embedded operator image. Because the registry is never taken from
+// --operator-image, the operator and its components cannot come from different
+// registries. Both defaults fail closed rather than falling back to the upstream
+// registry.
+func (h *installHandler) resolveImages() (operatorImage, registry string, err error) {
+	embeddedRegistry, embeddedRegistryErr := h.embeddedImageRegistry()
+
+	registry = h.imageRegistry
+	if registry == "" {
+		if embeddedRegistryErr != nil {
+			return "", "", fmt.Errorf("determine component image registry from the embedded operator manifests: %w; pass --image-registry to set it explicitly", embeddedRegistryErr)
+		}
+
+		registry = embeddedRegistry
+	}
+
+	registry = strings.TrimRight(registry, "/")
+
+	nameTag := h.operatorImage
+	if nameTag != "" {
+		if strings.Contains(nameTag, "/") {
+			return "", "", fmt.Errorf("--operator-image %q must be an image name and tag with no registry (for example unbounded-operator:v1); set the registry with --image-registry", nameTag)
+		}
+	} else {
+		// Default the operator name:tag from the embedded operator image, stripped
+		// of the registry it was rendered with, so a bare --image-registry still
+		// yields <registry>/unbounded-operator:<embedded-tag>.
+		embeddedOperator, embeddedOperatorErr := h.embeddedOperatorImage()
+		if embeddedOperatorErr != nil {
+			return "", "", fmt.Errorf("determine operator image from the embedded manifests: %w; pass --operator-image to set it explicitly", embeddedOperatorErr)
+		}
+
+		if embeddedRegistryErr != nil {
+			return "", "", fmt.Errorf("determine operator image from the embedded manifests: %w; pass --operator-image to set it explicitly", embeddedRegistryErr)
+		}
+
+		prefix := strings.TrimRight(embeddedRegistry, "/") + "/"
+		if !strings.HasPrefix(embeddedOperator, prefix) {
+			return "", "", fmt.Errorf("cannot derive the operator image name from the embedded manifests (%q is not under %q); pass --operator-image", embeddedOperator, embeddedRegistry)
+		}
+
+		nameTag = strings.TrimPrefix(embeddedOperator, prefix)
+	}
+
+	return registry + "/" + nameTag, registry, nil
+}
+
+// embeddedOperatorImage returns the controller image baked into the embedded
+// operator Deployment at build time. It fails closed on an unreadable manifest
+// set, a missing unbounded-operator Deployment, or an empty image.
+func (h *installHandler) embeddedOperatorImage() (string, error) {
+	files, err := yamlFiles(h.manifests())
+	if err != nil {
+		return "", fmt.Errorf("list embedded operator manifests: %w", err)
+	}
+
+	for _, file := range files {
+		data, err := fs.ReadFile(h.manifests(), file)
+		if err != nil {
+			return "", fmt.Errorf("read embedded operator manifest %s: %w", file, err)
+		}
+
+		decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+
+		for {
+			obj := &unstructured.Unstructured{}
+			if err := decoder.Decode(obj); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				return "", fmt.Errorf("decode embedded operator manifest %s: %w", file, err)
+			}
+
+			if obj.Object == nil || obj.GetKind() != "Deployment" || obj.GetName() != "unbounded-operator" {
+				continue
+			}
+
+			containers, _, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+			if err != nil {
+				return "", fmt.Errorf("read embedded operator Deployment containers: %w", err)
+			}
+
+			for _, c := range containers {
+				container, ok := c.(map[string]any)
+				if !ok || container["name"] != "controller" {
+					continue
+				}
+
+				image, ok := container["image"].(string)
+				if ok && image != "" {
+					return image, nil
+				}
+
+				return "", fmt.Errorf("embedded operator Deployment controller container has no image")
+			}
+		}
+	}
+
+	return "", fmt.Errorf("embedded operator manifests contain no unbounded-operator Deployment")
 }
 
 // embeddedImageRegistry returns the UNBOUNDED_IMAGE_REGISTRY baked into the

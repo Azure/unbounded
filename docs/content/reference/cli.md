@@ -69,35 +69,41 @@ Optional flags:
 | `--wait` | `bool` | `true` | Wait for the operator rollout and CRD establishment |
 | `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
 | `--api-server-endpoint` | `string` | auto-discovered | Override the API server endpoint advertised to provisioned machines; by default the operator discovers it from `kube-public/cluster-info`, or the `KUBERNETES_SERVICE_HOST` FQDN on clusters (e.g. AKS) that do not publish cluster-info |
-| `--image-registry` | `string` | `ghcr.io/azure` | Full image-repository prefix (registry host plus org/namespace) the operator resolves version-matched first-party component images under |
+| `--image-registry` | `string` | build default | Full image-repository prefix (registry host plus org/namespace) all unbounded images are pulled from |
+| `--operator-image` | `string` | build default | `unbounded-operator` image name and tag, **without** a registry (e.g. `unbounded-operator:v1`); the registry comes from `--image-registry` |
 
 > **Breaking change:** the `--skip-crds` flag has been removed. CRDs are now owned
 > and installed by the operator at startup (`operator.BootstrapCRDs`), so there is
 > nothing for `install` to skip. Automation passing `--skip-crds` must drop it.
 
-`--operator-image` overrides the operator image. `--image-registry` is the full
-image-repository prefix (registry host plus org/namespace, e.g. `ghcr.io/azure`,
-`ghcr.io/myorg`, or `registry.corp.internal/unbounded`) that components are
-resolved under; their flat repository name and image tag (always the operator's
-compiled version) are appended to it.
+`--image-registry` is the single knob for where **all** unbounded images come
+from. It is written to `UNBOUNDED_IMAGE_REGISTRY`; the operator resolves each
+component as `<registry>/<component>:<operator-version>`, and the operator's own
+Deployment image is `<registry>/<operator-name:tag>`. Because both the operator
+and its components take the registry from this one value, they can never come from
+different registries. `--operator-image` overrides only the operator's `name:tag`
+(it must not include a registry); it is rarely needed. The component image tag is
+always the operator's compiled version.
 
-Unset, the registry is derived from the one the binary was built with (the same
-source as its operator image), so fork and mirror builds work without a flag. It
-is re-derived on every install, not preserved from cluster state, so it stays in
-lockstep with the operator image (which install also re-derives). Upgrading a
-cluster that stored the pre-change bare `ghcr.io` therefore rewrites it to
-`ghcr.io/azure` automatically; install logs the change. A stock binary pointed at
-a private registry must pass `--image-registry` (and `--operator-image`) on each
-install, or use a build whose `CONTAINER_REGISTRY` bakes them in.
+Unset, both the registry and the operator `name:tag` come from the manifests baked
+into the binary at build time (rendered from `CONTAINER_REGISTRY`), so fork and
+mirror builds work without any flag. The registry is applied on every install, not
+preserved from cluster state, so it cannot drift; upgrading a cluster that stored a
+pre-change bare `ghcr.io` rewrites it to the full prefix and install logs the
+change. A private or air-gapped install sets `--image-registry` (e.g.
+`--image-registry registry.corp/unbounded`); the operator image follows.
 
 `install` is the only command that bootstraps `unbounded-operator`
 ([`site init`](#kubectl-unbounded-site-init) requires it to be installed
-already), so a private or air-gapped setup sets `--image-registry` and
-`--operator-image` here, then runs `site init`.
+already), so a private or air-gapped setup runs `install --image-registry ...`
+first, then `site init`.
 
-> **Breaking change:** `--image-registry` is now a full prefix. Automation that
-> passed the old bare `ghcr.io` must pass `ghcr.io/azure` (or its own equivalent),
-> otherwise components resolve to `ghcr.io/<component>`.
+> **Breaking change:** `--image-registry` is now a full image-repository prefix
+> (registry host plus org/namespace), not a bare host the operator appends
+> `/azure/` to. `--operator-image` is now a `name:tag` with no registry (the
+> registry comes from `--image-registry`); a registry-qualified value is rejected.
+> Automation passing a bare `ghcr.io` to `--image-registry`, or a fully-qualified
+> image to `--operator-image`, must update.
 
 ---
 
