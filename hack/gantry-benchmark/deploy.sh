@@ -381,12 +381,27 @@ build_source_image() {
 
   retry_command 30 10 acr_public_access_enabled
 
-  retry_command 18 30 az acr build \
-    --registry "$GANTRY_ACR_NAME" \
-    --image "gantry-benchmark-source:$source_revision" \
-    --file "$repo_root/images/gantry-benchmark-source/Containerfile" \
-    --build-arg "SOURCE_REVISION=$source_revision" \
-    "$repo_root" --only-show-errors -o none
+  local build_log=$DEPLOY_STATE_DIR/source-carrier-build.log
+  local built=false
+  local attempt
+  for attempt in $(seq 1 18); do
+    if az acr build \
+      --registry "$GANTRY_ACR_NAME" \
+      --image "gantry-benchmark-source:$source_revision" \
+      --file "$repo_root/images/gantry-benchmark-source/Containerfile" \
+      --build-arg "SOURCE_REVISION=$source_revision" \
+      "$repo_root" --only-show-errors -o none >"$build_log" 2>&1; then
+      built=true
+      break
+    fi
+    log "source-carrier ACR Task is waiting for firewall propagation ($attempt/18)"
+    sleep 30
+  done
+  if [[ "$built" != true ]]; then
+    cat "$build_log" >&2
+    return 1
+  fi
+  cat "$build_log"
 
   set_acrs_private
   public_restore_needed=false
