@@ -27,6 +27,13 @@ passes.
 The deployment config contains names and topology only. Credentials remain in
 Azure managed identities and short-lived ACR tokens.
 
+The workstation needs one valid Azure management-plane login before invoking
+`deploy.sh`; the script never invokes `az login`, `az acr login`, or workstation
+Podman. It publishes only the revision-labelled source carrier through an ACR
+Task, creates Private Endpoints and disables public registry access, then
+bootstraps the private operator VM. Gantry and pull-probe images are built and
+pushed from that VM with its managed identity over Private Link.
+
 The sections below document benchmark behavior and direct lifecycle control.
 They do not replace `deploy.sh`; commands that assume an existing cluster are
 for diagnosis or manual operation after full-stack deployment succeeds.

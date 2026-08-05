@@ -35,8 +35,10 @@ test:
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go test ./hack/cmd/acr-origin-proxy ./hack/cmd/gantry-benchmark
 
 operator-vm-check:
-	bash -n deploy.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-run.sh operator-vm-status.sh operator-vm-watch.sh
+	bash -n deploy.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-run.sh operator-vm-status.sh operator-vm-watch.sh
 	./deploy.sh plan deploy.env.example >/dev/null
+	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
+	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
 
 deploy: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh deploy "$(DEPLOY_CONFIG)"

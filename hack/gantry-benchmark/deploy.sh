@@ -154,6 +154,22 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || { echo "required command not found: $1" >&2; exit 1; }
 }
 
+retry_command() {
+  local attempts=$1
+  local delay=$2
+  shift 2
+  local attempt
+  for attempt in $(seq 1 "$attempts"); do
+    if "$@"; then
+      return 0
+    fi
+    if ((attempt == attempts)); then
+      return 1
+    fi
+    sleep "$delay"
+  done
+}
+
 print_plan() {
   cat <<PLAN
 Gantry benchmark deployment plan
@@ -161,6 +177,8 @@ Gantry benchmark deployment plan
 Source
   repository:          $repo_root
   revision:            $(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)
+  source carrier:      ACR Task before registry privatization
+  runtime images:      managed-identity operator over Private Link
 
 Azure
   subscription:        $AZURE_SUBSCRIPTION_ID
@@ -199,11 +217,15 @@ if [[ "$action" == plan ]]; then
   exit 0
 fi
 
-for command in az jq kubectl helm podman git make sha256sum; do
+for command in az jq kubectl helm git make sha256sum timeout; do
   require_command "$command"
 done
 
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+if ! timeout 60s az account get-access-token --resource https://management.core.windows.net/ --output none; then
+  echo "Azure management authentication is unavailable; run az login once before deploy.sh" >&2
+  exit 1
+fi
 
 if [[ "$action" == status ]]; then
   az group show -g "$AZURE_RESOURCE_GROUP" --query '{name:name,location:location,state:properties.provisioningState}' -o json
@@ -344,93 +366,23 @@ ensure_acr() {
     --data-endpoint-enabled true --only-show-errors -o none
 }
 
-build_branch_images() {
-  log "building branch artifacts from $source_revision"
-
+build_source_image() {
+  log "publishing private source carrier from $source_revision"
   SOURCE_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry-benchmark-source:$source_revision
-  GANTRY_IMAGE_TAG=$GANTRY_ACR_LOGIN_SERVER/gantry:benchmark-$source_short
-  BASELINE_PROBE_TAG=$BASELINE_ACR_LOGIN_SERVER/gantry-deploy-probe:$source_revision
-  local current_baseline_acr_id current_gantry_acr_id
-  current_baseline_acr_id=$(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$BASELINE_ACR_NAME" --query id -o tsv)
-  current_gantry_acr_id=$(az acr show -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" --query id -o tsv)
-
-  local image_state=$DEPLOY_STATE_DIR/images.env
-  if [[ -f "$image_state" ]]; then
-    local recorded_revision recorded_baseline_acr_id recorded_gantry_acr_id
-    recorded_revision=$(sed -n "s/^SOURCE_REVISION='\([^']*\)'$/\1/p" "$image_state")
-    recorded_baseline_acr_id=$(sed -n "s/^BASELINE_ACR_RESOURCE_ID='\([^']*\)'$/\1/p" "$image_state")
-    recorded_gantry_acr_id=$(sed -n "s/^GANTRY_ACR_RESOURCE_ID='\([^']*\)'$/\1/p" "$image_state")
-    if [[ "$recorded_revision" == "$source_revision" &&
-      "$recorded_baseline_acr_id" == "$current_baseline_acr_id" &&
-      "$recorded_gantry_acr_id" == "$current_gantry_acr_id" ]]; then
-      # shellcheck source=/dev/null
-      . "$image_state"
-      [[ "$SOURCE_IMAGE" == "$GANTRY_ACR_LOGIN_SERVER/gantry-benchmark-source:$source_revision" ]] || {
-        echo "recorded source image does not match this deployment" >&2
-        exit 1
-      }
-      [[ "$GANTRY_IMAGE" == "$GANTRY_ACR_LOGIN_SERVER/gantry@sha256:"* ]] || {
-        echo "recorded Gantry image is not an immutable deployment reference" >&2
-        exit 1
-      }
-      [[ "$BASELINE_PROBE_IMAGE" == "$BASELINE_ACR_LOGIN_SERVER/gantry-deploy-probe@sha256:"* ]] || {
-        echo "recorded baseline probe image is not an immutable deployment reference" >&2
-        exit 1
-      }
-      log "reusing locally recorded immutable branch artifacts"
-      return
-    fi
-  fi
 
   public_restore_needed=true
-  for registry in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
-    az acr update -g "$AZURE_RESOURCE_GROUP" -n "$registry" \
-      --public-network-enabled true --only-show-errors -o none
-  done
+  az acr update -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
+    --public-network-enabled true --only-show-errors -o none
 
-  local token
-  token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
-  printf '%s' "$token" | podman login "$GANTRY_ACR_LOGIN_SERVER" \
-    --username 00000000-0000-0000-0000-000000000000 --password-stdin >/dev/null
-  unset token
+  retry_command 6 20 az acr build \
+    --registry "$GANTRY_ACR_NAME" \
+    --image "gantry-benchmark-source:$source_revision" \
+    --file "$repo_root/images/gantry-benchmark-source/Containerfile" \
+    --build-arg "SOURCE_REVISION=$source_revision" \
+    "$repo_root" --only-show-errors -o none
 
-  podman build --isolation chroot --build-arg "SOURCE_REVISION=$source_revision" \
-    -t "$SOURCE_IMAGE" -f "$repo_root/images/gantry-benchmark-source/Containerfile" "$repo_root"
-  podman push "$SOURCE_IMAGE" >/dev/null
-
-  podman build --isolation chroot \
-    --build-arg "VERSION=benchmark-$source_short" \
-    --build-arg "GIT_COMMIT=$source_revision" \
-    -t "$GANTRY_IMAGE_TAG" -f "$repo_root/images/gantry/Containerfile" "$repo_root"
-  local digest_file=$DEPLOY_STATE_DIR/gantry.digest
-  podman push --digestfile "$digest_file" "$GANTRY_IMAGE_TAG" >/dev/null
-  local gantry_digest
-  gantry_digest=$(tr -d '[:space:]' <"$digest_file")
-  podman logout "$GANTRY_ACR_LOGIN_SERVER" >/dev/null
-
-  token=$(az acr login --name "$BASELINE_ACR_NAME" --expose-token --query accessToken -o tsv)
-  printf '%s' "$token" | podman login "$BASELINE_ACR_LOGIN_SERVER" \
-    --username 00000000-0000-0000-0000-000000000000 --password-stdin >/dev/null
-  unset token
-  podman pull mcr.microsoft.com/cbl-mariner/busybox:2.0 >/dev/null
-  podman tag mcr.microsoft.com/cbl-mariner/busybox:2.0 "$BASELINE_PROBE_TAG"
-  local probe_digest_file=$DEPLOY_STATE_DIR/baseline-probe.digest
-  podman push --digestfile "$probe_digest_file" "$BASELINE_PROBE_TAG" >/dev/null
-  local baseline_probe_digest
-  baseline_probe_digest=$(tr -d '[:space:]' <"$probe_digest_file")
-  podman logout "$BASELINE_ACR_LOGIN_SERVER" >/dev/null
-
-  GANTRY_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry@$gantry_digest
-  BASELINE_PROBE_IMAGE=$BASELINE_ACR_LOGIN_SERVER/gantry-deploy-probe@$baseline_probe_digest
-  cat >"$image_state" <<IMAGES
-SOURCE_REVISION='$source_revision'
-BASELINE_ACR_RESOURCE_ID='$current_baseline_acr_id'
-GANTRY_ACR_RESOURCE_ID='$current_gantry_acr_id'
-SOURCE_IMAGE='$SOURCE_IMAGE'
-GANTRY_IMAGE='$GANTRY_IMAGE'
-BASELINE_PROBE_IMAGE='$BASELINE_PROBE_IMAGE'
-IMAGES
-  chmod 0600 "$image_state"
+  set_acrs_private
+  public_restore_needed=false
 }
 
 ensure_aks() {
@@ -740,7 +692,10 @@ spec:
                 - -c
                 - |
                     set -eu
-                    check() { getent ahostsv4 "\$1" | awk '{print \$1}' | grep -Fxq "\$2"; }
+                    check() {
+                      resolved=\$(getent ahostsv4 "\$1" | awk '{print \$1}' | sort -u)
+                      test "\$resolved" = "\$2"
+                    }
                     check $BASELINE_ACR_LOGIN_SERVER $baseline_login_ip
                     check $BASELINE_ACR_DATA_HOST $baseline_data_ip
                     check $GANTRY_ACR_LOGIN_SERVER $gantry_login_ip
@@ -806,7 +761,17 @@ spec:
             limits: {cpu: 20m, memory: 16Mi}
 PROBE
   kubectl apply -f "$manifest"
-  if ! kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-baseline-acr-pull-probe --timeout=30m; then
+  local ready=false
+  local attempt
+  for attempt in $(seq 1 6); do
+    if kubectl -n "$GANTRY_NAMESPACE" rollout status \
+      daemonset/gantry-baseline-acr-pull-probe --timeout=5m; then
+      ready=true
+      break
+    fi
+    log "waiting for baseline AcrPull propagation ($attempt/6)"
+  done
+  if [[ "$ready" != true ]]; then
     kubectl -n "$GANTRY_NAMESPACE" get pods -l app.kubernetes.io/name=gantry-baseline-acr-pull-probe -o json | \
       jq '{total:(.items|length),waiting:([.items[].status.containerStatuses[]?.state.waiting|select(.!=null)]|group_by(.reason)|map({reason:.[0].reason,count:length,messages:(map(.message)|unique)}))}' >&2
     return 1
@@ -866,23 +831,32 @@ provision_operator() {
     "$OPERATOR_BUILD_DISK_SKU"
 }
 
-verify_operator_private_pushes() {
-  log "verifying private operator pushes to both ACR data endpoints"
-  az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
-    --command-id RunShellScript --scripts "set -eu
-podman pull mcr.microsoft.com/cbl-mariner/busybox:2.0 >/dev/null
-for acr in '$BASELINE_ACR_NAME' '$GANTRY_ACR_NAME'; do
-  login=\"\${acr}.azurecr.io\"
-  token=\$(az acr login --name \"\$acr\" --expose-token --query accessToken -o tsv)
-  printf '%s' \"\$token\" | podman login \"\$login\" \\
-    --username 00000000-0000-0000-0000-000000000000 --password-stdin >/dev/null
-  unset token
-  target=\"\$login/gantry-deploy-operator-probe:$source_revision\"
-  podman tag mcr.microsoft.com/cbl-mariner/busybox:2.0 \"\$target\"
-  podman push \"\$target\" >/dev/null
-  podman logout \"\$login\" >/dev/null
-  podman image rm \"\$target\" >/dev/null
-done" --only-show-errors -o none
+build_operator_images() {
+  log "building Gantry and pull-probe images inside the private operator VM"
+  local output
+  output=$(az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
+    --command-id RunShellScript \
+    --scripts @"$repo_root/hack/gantry-benchmark/operator-vm-build-images.sh" \
+    --parameters "$AZURE_SUBSCRIPTION_ID" "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME" \
+      "$source_revision" "$source_short" \
+    --query 'value[0].message' -o tsv)
+  local result_json
+  result_json=$(tr -d '\r' <<<"$output" | sed -n 's/^DEPLOYMENT_IMAGES_JSON=//p' | tail -1)
+  jq -e 'type == "object" and (.gantry_image | type == "string") and (.baseline_probe_image | type == "string")' \
+    <<<"$result_json" >/dev/null || {
+    echo "operator did not return valid deployment image JSON" >&2
+    return 1
+  }
+  GANTRY_IMAGE=$(jq -r .gantry_image <<<"$result_json")
+  BASELINE_PROBE_IMAGE=$(jq -r .baseline_probe_image <<<"$result_json")
+  [[ "$GANTRY_IMAGE" == "$GANTRY_ACR_LOGIN_SERVER/gantry@sha256:"* ]] || {
+    echo "operator did not return an immutable Gantry image" >&2
+    return 1
+  }
+  [[ "$BASELINE_PROBE_IMAGE" == "$BASELINE_ACR_LOGIN_SERVER/gantry-deploy-probe@sha256:"* ]] || {
+    echo "operator did not return an immutable baseline probe image" >&2
+    return 1
+  }
 }
 
 guard_active_benchmark
@@ -890,11 +864,7 @@ ensure_group
 ensure_vnet
 ensure_acr "$BASELINE_ACR_NAME"
 ensure_acr "$GANTRY_ACR_NAME"
-build_branch_images
-if [[ "$public_restore_needed" == true ]]; then
-  set_acrs_private
-  public_restore_needed=false
-fi
+build_source_image
 ensure_private_network
 ensure_aks
 ensure_diagnostics
@@ -912,10 +882,10 @@ install_monitoring
 
 set_acrs_private
 
+provision_operator
+build_operator_images
 verify_private_baseline_pull
 deploy_gantry
-provision_operator
-verify_operator_private_pushes
 
 log "validating final deployment"
 assert_equal "baseline ACR public access" \

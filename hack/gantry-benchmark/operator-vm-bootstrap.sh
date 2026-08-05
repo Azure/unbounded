@@ -52,6 +52,64 @@ retry() {
   done
 }
 
+acr_access_token() {
+  local acr_name=$1
+  local attempts=0
+  local maximum=60
+  local token
+
+  until token=$(az acr login --name "$acr_name" --expose-token --query accessToken -o tsv); do
+    attempts=$((attempts + 1))
+    if ((attempts >= maximum)); then
+      echo "failed to obtain managed-identity ACR token for $acr_name after $attempts attempts" >&2
+      return 1
+    fi
+    sleep 10
+  done
+
+  printf '%s' "$token"
+}
+
+private_dns_ip() {
+  local record_name=$1
+  local attempts=0
+  local maximum=60
+  local ip
+
+  until ip=$(az network private-dns record-set a show \
+    --resource-group "$resource_group" \
+    --zone-name privatelink.azurecr.io \
+    --name "$record_name" \
+    --query 'aRecords[0].ipv4Address' \
+    --output tsv 2>/dev/null) && [[ -n "$ip" ]]; do
+    attempts=$((attempts + 1))
+    if ((attempts >= maximum)); then
+      echo "private DNS record $record_name did not become readable" >&2
+      return 1
+    fi
+    sleep 10
+  done
+
+  printf '%s' "$ip"
+}
+
+require_private_resolution() {
+  local host=$1
+  local expected_ip=$2
+  local attempts=0
+  local maximum=60
+
+  local resolved
+  until resolved=$(getent ahostsv4 "$host" | awk '{print $1}' | sort -u) && [[ "$resolved" == "$expected_ip" ]]; do
+    attempts=$((attempts + 1))
+    if ((attempts >= maximum)); then
+      echo "$host did not resolve to private IP $expected_ip" >&2
+      return 1
+    fi
+    sleep 10
+  done
+}
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y ca-certificates curl e2fsprogs git gnupg jq make podman golang-go
@@ -97,11 +155,31 @@ install -d -m 0700 /var/lib/gantry-benchmark
 install -d -m 0750 /etc/gantry-benchmark
 install -d -m 0750 /var/log/gantry-benchmark
 
+retry az acr show -g "$resource_group" -n "$baseline_acr_name" --output none
+retry az acr show -g "$resource_group" -n "$gantry_acr_name" --output none
+for acr_name in "$baseline_acr_name" "$gantry_acr_name"; do
+  public_access=$(az acr show -g "$resource_group" -n "$acr_name" --query publicNetworkAccess -o tsv)
+  data_endpoint=$(az acr show -g "$resource_group" -n "$acr_name" --query dataEndpointEnabled -o tsv)
+  [[ "$public_access" == Disabled ]] || { echo "$acr_name public access is $public_access, want Disabled" >&2; exit 1; }
+  [[ "$data_endpoint" == true ]] || { echo "$acr_name dedicated data endpoint is not enabled" >&2; exit 1; }
+done
+
+baseline_location=$(az acr show -g "$resource_group" -n "$baseline_acr_name" --query location -o tsv)
+gantry_location=$(az acr show -g "$resource_group" -n "$gantry_acr_name" --query location -o tsv)
+baseline_login_ip=$(private_dns_ip "$baseline_acr_name")
+baseline_data_ip=$(private_dns_ip "$baseline_acr_name.$baseline_location.data")
+gantry_login_ip=$(private_dns_ip "$gantry_acr_name")
+gantry_data_ip=$(private_dns_ip "$gantry_acr_name.$gantry_location.data")
+require_private_resolution "$baseline_acr_name.azurecr.io" "$baseline_login_ip"
+require_private_resolution "$baseline_acr_name.$baseline_location.data.azurecr.io" "$baseline_data_ip"
+require_private_resolution "$gantry_acr_name.azurecr.io" "$gantry_login_ip"
+require_private_resolution "$gantry_acr_name.$gantry_location.data.azurecr.io" "$gantry_data_ip"
+
 repo_root="$build_mount/unbounded"
 source_description="$repo_url ($repo_branch)"
 if [[ -n "$source_image" ]]; then
   gantry_login_server=$(az acr show -g "$resource_group" -n "$gantry_acr_name" --query loginServer -o tsv)
-  source_token=$(az acr login --name "$gantry_acr_name" --expose-token --query accessToken -o tsv)
+  source_token=$(acr_access_token "$gantry_acr_name")
   printf '%s' "$source_token" | podman login "$gantry_login_server" \
     --username 00000000-0000-0000-0000-000000000000 \
     --password-stdin
