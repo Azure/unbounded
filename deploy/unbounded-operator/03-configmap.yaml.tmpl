@@ -19,12 +19,6 @@ metadata:
   labels:
     app.kubernetes.io/name: unbounded-operator
     app.kubernetes.io/component: controller
-  annotations:
-    # Semantics version of UNBOUNDED_IMAGE_REGISTRY. "2" means the value is a
-    # full image-repository prefix (post-#574). kubectl unbounded install reads
-    # this to decide whether a preserved value predates the change and needs
-    # migrating. Not a data key, so it stays out of the operator's envFrom.
-    unbounded-cloud.io/image-registry-schema: "2"
 data:
   # Full image-repository prefix (registry host plus org/namespace) for all
   # operator-managed first-party component images. The flat component name and

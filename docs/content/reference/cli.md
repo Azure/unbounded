@@ -79,16 +79,21 @@ Optional flags:
 image-repository prefix (registry host plus org/namespace, e.g. `ghcr.io/azure`,
 `ghcr.io/myorg`, or `registry.corp.internal/unbounded`) that components are
 resolved under; their flat repository name and image tag (always the operator's
-compiled version) are appended to it. Left unset, a fresh install inherits the
-registry the binary was built with (the same one as its operator image), so fork
-and mirror builds work without a flag.
+compiled version) are appended to it.
 
-Reinstalling a cluster whose stored registry predates this change is migrated
-automatically: the old value was the prefix the operator appended an implicit
-`/azure/` to, so `ghcr.io` becomes `ghcr.io/azure` and a mirror `registry.corp/unbounded`
-becomes `registry.corp/unbounded/azure`, preserving the images it already pulled.
-A schema marker on the operator ConfigMap makes this run exactly once, so a value
-you set intentionally is never rewritten again.
+Unset, the registry is derived from the one the binary was built with (the same
+source as its operator image), so fork and mirror builds work without a flag. It
+is re-derived on every install, not preserved from cluster state, so it stays in
+lockstep with the operator image (which install also re-derives). Upgrading a
+cluster that stored the pre-change bare `ghcr.io` therefore rewrites it to
+`ghcr.io/azure` automatically; install logs the change. A stock binary pointed at
+a private registry must pass `--image-registry` (and `--operator-image`) on each
+install, or use a build whose `CONTAINER_REGISTRY` bakes them in.
+
+`install` is the only command that bootstraps `unbounded-operator`
+([`site init`](#kubectl-unbounded-site-init) requires it to be installed
+already), so a private or air-gapped setup sets `--image-registry` and
+`--operator-image` here, then runs `site init`.
 
 > **Breaking change:** `--image-registry` is now a full prefix. Automation that
 > passed the old bare `ghcr.io` must pass `ghcr.io/azure` (or its own equivalent),

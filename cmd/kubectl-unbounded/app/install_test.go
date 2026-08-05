@@ -288,74 +288,34 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 	}
 }
 
-func TestMigrateLegacyImageRegistry(t *testing.T) {
+// TestInstallReinstallDerivesRegistryFromBuild asserts the component registry is
+// re-derived from the binary's embedded manifests on every install, not
+// preserved from cluster state. An older cluster storing the pre-#574 bare
+// "ghcr.io" (or any custom value) is overwritten with the embedded default, so
+// the registry cannot drift from the operator image install also re-derives.
+func TestInstallReinstallDerivesRegistryFromBuild(t *testing.T) {
 	t.Parallel()
 
-	// migrateLegacyImageRegistry runs only on unmarked (pre-#574) values, which
-	// were the prefix the operator appended "/azure/" to, so every non-empty
-	// value gains "/azure" - bare host and path-based mirror alike.
 	cases := []struct {
-		name     string
-		registry string
-		want     string
+		name  string
+		value string
 	}{
-		{name: "released default bare host", registry: "ghcr.io", want: "ghcr.io/azure"},
-		{name: "fork org", registry: "ghcr.io/myorg", want: "ghcr.io/myorg/azure"},
-		{name: "custom bare host", registry: "registry.corp.internal", want: "registry.corp.internal/azure"},
-		{name: "path-based mirror", registry: "registry.corp.internal/unbounded", want: "registry.corp.internal/unbounded/azure"},
-		{name: "trailing slash", registry: "ghcr.io/", want: "ghcr.io/azure"},
-		{name: "empty unchanged", registry: "", want: ""},
+		{name: "legacy bare host overwritten", value: "ghcr.io"},
+		{name: "stale custom mirror overwritten", value: "registry.old/mirror"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
-			if got := migrateLegacyImageRegistry(tc.registry); got != tc.want {
-				t.Fatalf("migrateLegacyImageRegistry(%q) = %q, want %q", tc.registry, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestInstallImageRegistryMigration covers the schema-marker migration end to
-// end: an unmarked (legacy) value is rewritten to a full prefix and the marker
-// is stamped, while a marked value is preserved verbatim so the migration never
-// runs twice.
-func TestInstallImageRegistryMigration(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name   string
-		value  string
-		schema string // schema annotation on the existing ConfigMap ("" = absent)
-		want   string
-	}{
-		{name: "legacy bare host migrates", value: "ghcr.io", schema: "", want: "ghcr.io/azure"},
-		{name: "legacy path mirror migrates", value: "registry.corp/unbounded", schema: "", want: "registry.corp/unbounded/azure"},
-		{name: "marked default preserved", value: "ghcr.io/azure", schema: "2", want: "ghcr.io/azure"},
-		{name: "marked bare host preserved", value: "registry.internal", schema: "2", want: "registry.internal"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			metadata := map[string]any{
-				"name":      "unbounded-operator-config",
-				"namespace": "unbounded-system",
-			}
-			if tc.schema != "" {
-				metadata["annotations"] = map[string]any{
-					"unbounded-cloud.io/image-registry-schema": tc.schema,
-				}
-			}
 
 			existing := &unstructured.Unstructured{Object: map[string]any{
 				"apiVersion": "v1",
 				"kind":       "ConfigMap",
-				"metadata":   metadata,
-				"data":       map[string]any{"UNBOUNDED_IMAGE_REGISTRY": tc.value},
+				"metadata": map[string]any{
+					"name":      "unbounded-operator-config",
+					"namespace": "unbounded-system",
+				},
+				"data": map[string]any{"UNBOUNDED_IMAGE_REGISTRY": tc.value},
 			}}
 			cli, captured := newCapturingInstallClient(existing)
 			h := installHandler{
@@ -369,22 +329,38 @@ func TestInstallImageRegistryMigration(t *testing.T) {
 
 			data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
 			require.NoError(t, err)
-			require.Equal(t, tc.want, data["UNBOUNDED_IMAGE_REGISTRY"])
-
-			// Every applied ConfigMap carries the current schema marker, so a
-			// subsequent reinstall treats the value as a full prefix.
-			schema, _, err := unstructured.NestedString(captured.configMap.Object, "metadata", "annotations", "unbounded-cloud.io/image-registry-schema")
-			require.NoError(t, err)
-			require.Equal(t, "2", schema)
+			// The real embedded manifest renders ghcr.io/azure at build time.
+			require.Equal(t, "ghcr.io/azure", data["UNBOUNDED_IMAGE_REGISTRY"])
 		})
 	}
 }
 
-// TestInstallForkBuildPreservesEmbeddedRegistry asserts a fork build (whose
+// TestInstallImageRegistryFlagOverridesEmbedded asserts an explicit
+// --image-registry wins over the embedded default.
+func TestInstallImageRegistryFlagOverridesEmbedded(t *testing.T) {
+	t.Parallel()
+
+	cli, captured := newCapturingInstallClient()
+	h := installHandler{
+		namespace:        "unbounded-system",
+		kubeResourcesCli: cli,
+		imageRegistry:    "registry.corp/unbounded",
+		logger:           discardLogger(),
+	}
+
+	require.NoError(t, h.execute(context.Background()))
+	require.NotNil(t, captured.configMap)
+
+	data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+	require.NoError(t, err)
+	require.Equal(t, "registry.corp/unbounded", data["UNBOUNDED_IMAGE_REGISTRY"])
+}
+
+// TestInstallForkBuildDerivesEmbeddedRegistry asserts a fork build (whose
 // embedded manifests were rendered with CONTAINER_REGISTRY=ghcr.io/myorg)
 // installs its own operator image and configures components from its own
 // registry, rather than discarding the embedded value for ghcr.io/azure.
-func TestInstallForkBuildPreservesEmbeddedRegistry(t *testing.T) {
+func TestInstallForkBuildDerivesEmbeddedRegistry(t *testing.T) {
 	t.Parallel()
 
 	forkManifests := fstest.MapFS{
@@ -393,8 +369,6 @@ kind: ConfigMap
 metadata:
   name: unbounded-operator-config
   namespace: unbounded-system
-  annotations:
-    unbounded-cloud.io/image-registry-schema: "2"
 data:
   UNBOUNDED_API_SERVER_ENDPOINT: ""
   UNBOUNDED_IMAGE_REGISTRY: "ghcr.io/myorg"
