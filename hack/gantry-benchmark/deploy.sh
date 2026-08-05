@@ -855,7 +855,7 @@ provision_operator() {
   local build_disk_name
   build_disk_name=${OPERATOR_BUILD_DISK_NAME:-${OPERATOR_VM_NAME}-build}
   assert_equal "operator build disk size" \
-    "$(az disk show -g "$AZURE_RESOURCE_GROUP" -n "$build_disk_name" --query diskSizeGb -o tsv)" \
+    "$(az disk show -g "$AZURE_RESOURCE_GROUP" -n "$build_disk_name" --query diskSizeGB -o tsv)" \
     "$OPERATOR_BUILD_DISK_GB"
   assert_equal "operator build disk SKU" \
     "$(az disk show -g "$AZURE_RESOURCE_GROUP" -n "$build_disk_name" --query sku.name -o tsv)" \
