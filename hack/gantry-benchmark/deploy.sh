@@ -388,6 +388,12 @@ build_branch_images() {
     fi
   fi
 
+  public_restore_needed=true
+  for registry in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
+    az acr update -g "$AZURE_RESOURCE_GROUP" -n "$registry" \
+      --public-network-enabled true --only-show-errors -o none
+  done
+
   local source_digest gantry_digest baseline_probe_digest
   source_digest=$(acr_image_digest "$GANTRY_ACR_NAME" "gantry-benchmark-source:$source_revision")
   gantry_digest=$(acr_image_digest "$GANTRY_ACR_NAME" "gantry:benchmark-$source_short")
@@ -408,12 +414,6 @@ IMAGES
     chmod 0600 "$image_state"
     return
   fi
-
-  public_restore_needed=true
-  for registry in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
-    az acr update -g "$AZURE_RESOURCE_GROUP" -n "$registry" \
-      --public-network-enabled true --only-show-errors -o none
-  done
 
   local token
   token=$(az acr login --name "$GANTRY_ACR_NAME" --expose-token --query accessToken -o tsv)
