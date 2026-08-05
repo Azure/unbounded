@@ -81,7 +81,7 @@ BENCHMARK_IMAGE_SIZE_MIB=${BENCHMARK_IMAGE_SIZE_MIB:-40960}
 BENCHMARK_IMAGE_LAYERS=${BENCHMARK_IMAGE_LAYERS:-40}
 BENCHMARK_MINIMUM_BYTE_REDUCTION=${BENCHMARK_MINIMUM_BYTE_REDUCTION:-0.90}
 BENCHMARK_MAXIMUM_LATENCY_RATIO=${BENCHMARK_MAXIMUM_LATENCY_RATIO:-1.0}
-BASELINE_PULL_MAX_NODE_REIMAGES=${BASELINE_PULL_MAX_NODE_REIMAGES:-5}
+BASELINE_PULL_MAX_NODE_REPLACEMENTS=${BASELINE_PULL_MAX_NODE_REPLACEMENTS:-5}
 
 GANTRY_NAMESPACE=${GANTRY_NAMESPACE:-gantry-system}
 BENCHMARK_NAMESPACE=${BENCHMARK_NAMESPACE:-gantry-benchmark}
@@ -125,8 +125,8 @@ GANTRY_ACR_DATA_HOST=${GANTRY_ACR_NAME}.${AZURE_LOCATION}.data.azurecr.io
   echo "BENCHMARK_IMAGE_LAYERS cannot exceed BENCHMARK_IMAGE_SIZE_MIB" >&2
   exit 2
 }
-[[ "$BASELINE_PULL_MAX_NODE_REIMAGES" =~ ^[1-9][0-9]*$ ]] || {
-  echo "BASELINE_PULL_MAX_NODE_REIMAGES must be positive" >&2
+[[ "$BASELINE_PULL_MAX_NODE_REPLACEMENTS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "BASELINE_PULL_MAX_NODE_REPLACEMENTS must be positive" >&2
   exit 2
 }
 for acr_name in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
@@ -759,8 +759,8 @@ GUARD
   kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-acr-private-dns-guard --timeout=30m
 }
 
-reimage_private_pull_tls_nodes() {
-  local pods_json node provider_id vmss instance_id old_boot_id
+replace_private_pull_tls_nodes() {
+  local pods_json node provider_id machine_name current_count
   local -a nodes
   pods_json=$(kubectl -n "$GANTRY_NAMESPACE" get pods \
     -l app.kubernetes.io/name=gantry-baseline-acr-pull-probe -o json)
@@ -768,42 +768,57 @@ reimage_private_pull_tls_nodes() {
     select(any(.status.containerStatuses[]?; ((.state.waiting.message? // "") | contains("TLS handshake timeout")))) |
     .spec.nodeName' <<<"$pods_json" | sort -u)
   ((${#nodes[@]} > 0)) || return 1
-  ((${#nodes[@]} <= BASELINE_PULL_MAX_NODE_REIMAGES)) || {
-    echo "refusing to reimage ${#nodes[@]} nodes with ACR TLS handshake timeouts; limit is $BASELINE_PULL_MAX_NODE_REIMAGES" >&2
+  ((${#nodes[@]} <= BASELINE_PULL_MAX_NODE_REPLACEMENTS)) || {
+    echo "refusing to replace ${#nodes[@]} nodes with ACR TLS handshake timeouts; limit is $BASELINE_PULL_MAX_NODE_REPLACEMENTS" >&2
     return 1
   }
 
   for node in "${nodes[@]}"; do
     provider_id=$(kubectl get node "$node" -o jsonpath='{.spec.providerID}')
-    vmss=$(sed -n 's#^.*/virtualMachineScaleSets/\([^/]*\)/virtualMachines/[^/]*$#\1#p' <<<"$provider_id")
-    instance_id=$(sed -n 's#^.*/virtualMachineScaleSets/[^/]*/virtualMachines/\([^/]*\)$#\1#p' <<<"$provider_id")
-    [[ -n "$vmss" && -n "$instance_id" ]] || {
-      echo "cannot parse VMSS instance from provider ID for $node: $provider_id" >&2
+    machine_name=$(az aks machine list -g "$AZURE_RESOURCE_GROUP" \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" --nodepool-name "$AKS_NODE_POOL_NAME" -o json | \
+      jq -r --arg resource_id "${provider_id#azure://}" \
+        '.[] | select((.properties.resourceId | ascii_downcase) == ($resource_id | ascii_downcase)) | .name')
+    [[ -n "$machine_name" ]] || {
+      echo "cannot resolve AKS machine for $node provider ID $provider_id" >&2
       return 1
     }
-    old_boot_id=$(kubectl get node "$node" -o jsonpath='{.status.nodeInfo.bootID}')
-    log "reimaging $node (VMSS $vmss instance $instance_id) after ACR Private Endpoint TLS timeouts"
-    az vmss reimage -g "$AZURE_NODE_RESOURCE_GROUP" -n "$vmss" \
-      --instance-ids "$instance_id" --only-show-errors -o none
-
-    local attempt current_boot_id ready
-    for attempt in $(seq 1 90); do
-      current_boot_id=$(kubectl get node "$node" -o jsonpath='{.status.nodeInfo.bootID}' 2>/dev/null || true)
-      ready=$(kubectl get node "$node" -o json | \
-        jq -r 'any(.status.conditions[]; .type == "Ready" and .status == "True")' 2>/dev/null || true)
-      if [[ -n "$current_boot_id" && "$current_boot_id" != "$old_boot_id" && "$ready" == true ]]; then
-        break
-      fi
-      sleep 10
-    done
-    [[ -n "$current_boot_id" && "$current_boot_id" != "$old_boot_id" && "$ready" == true ]] || {
-      echo "$node did not return Ready with a new boot ID after reimage" >&2
-      return 1
-    }
-    kubectl -n "$GANTRY_NAMESPACE" delete pod \
-      -l app.kubernetes.io/name=gantry-baseline-acr-pull-probe \
-      --field-selector "spec.nodeName=$node" --wait=false
+    log "replacing $node (AKS machine $machine_name) after persistent ACR Private Endpoint TLS timeouts"
+    az aks nodepool delete-machines -g "$AZURE_RESOURCE_GROUP" \
+      --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" \
+      --machine-names "$machine_name" --only-show-errors -o none
   done
+
+  current_count=$(az aks nodepool show -g "$AZURE_RESOURCE_GROUP" \
+    --cluster-name "$AZURE_AKS_CLUSTER_NAME" -n "$AKS_NODE_POOL_NAME" --query count -o tsv)
+  if [[ "$current_count" != "$AKS_NODE_COUNT" ]]; then
+    log "restoring AKS node pool count from $current_count to $AKS_NODE_COUNT"
+    az aks nodepool scale -g "$AZURE_RESOURCE_GROUP" --cluster-name "$AZURE_AKS_CLUSTER_NAME" \
+      -n "$AKS_NODE_POOL_NAME" --node-count "$AKS_NODE_COUNT" --only-show-errors -o none
+  fi
+
+  local attempt total ready old_nodes_remaining
+  for attempt in $(seq 1 180); do
+    total=$(kubectl get nodes -l "agentpool=$AKS_NODE_POOL_NAME" -o json | jq '.items | length')
+    ready=$(kubectl get nodes -l "agentpool=$AKS_NODE_POOL_NAME" -o json | \
+      jq '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')
+    old_nodes_remaining=0
+    for node in "${nodes[@]}"; do
+      kubectl get node "$node" >/dev/null 2>&1 && ((old_nodes_remaining += 1))
+    done
+    if [[ "$total" == "$AKS_NODE_COUNT" && "$ready" == "$AKS_NODE_COUNT" && "$old_nodes_remaining" == 0 ]]; then
+      break
+    fi
+    sleep 10
+  done
+  [[ "$total" == "$AKS_NODE_COUNT" && "$ready" == "$AKS_NODE_COUNT" && "$old_nodes_remaining" == 0 ]] || {
+    echo "AKS node replacement did not restore $AKS_NODE_COUNT Ready nodes or remove all failed nodes" >&2
+    return 1
+  }
+  kubectl -n "$GANTRY_NAMESPACE" rollout status \
+    daemonset/gantry-benchmark-containerd-config --timeout=30m
+  kubectl -n "$GANTRY_NAMESPACE" rollout status \
+    daemonset/gantry-acr-private-dns-guard --timeout=30m
 }
 
 verify_private_baseline_pull() {
@@ -853,7 +868,7 @@ PROBE
       ready=true
       break
     fi
-    if [[ "$repair_attempted" == false ]] && reimage_private_pull_tls_nodes; then
+    if [[ "$repair_attempted" == false ]] && replace_private_pull_tls_nodes; then
       repair_attempted=true
       continue
     fi
