@@ -10,11 +10,11 @@ Usage: operator-vm-bootstrap.sh <subscription> <resource-group> <aks-cluster> \
   <baseline-acr> <gantry-acr> <workspace-customer-id> <baseline-pe-id> \
   <gantry-pe-id> <repo-url> <repo-branch> <node-count> <image-size-mib> \
   <image-layers> <azure-telemetry> <minimum-byte-reduction> <maximum-latency-ratio> \
-  <build-disk-lun> <build-mount>
+  <build-disk-lun> <build-mount> <source-image> <source-revision>
 USAGE
 }
 
-[[ $# -eq 18 ]] || { usage >&2; exit 2; }
+[[ $# -eq 20 ]] || { usage >&2; exit 2; }
 
 subscription_id=$1
 resource_group=$2
@@ -34,6 +34,8 @@ minimum_byte_reduction=${15}
 maximum_latency_ratio=${16}
 build_disk_lun=${17}
 build_mount=${18}
+source_image=${19}
+source_revision=${20}
 
 retry() {
   local attempts=0
@@ -61,6 +63,9 @@ fi
 if ! command -v kubectl >/dev/null 2>&1; then
   az aks install-cli --install-location /usr/local/bin/kubectl
 fi
+
+retry az login --identity --allow-no-subscriptions --output none
+az account set --subscription "$subscription_id"
 
 build_device="/dev/disk/azure/scsi1/lun${build_disk_lun}"
 retry test -b "$build_device"
@@ -93,7 +98,31 @@ install -d -m 0750 /etc/gantry-benchmark
 install -d -m 0750 /var/log/gantry-benchmark
 
 repo_root="$build_mount/unbounded"
-if [[ -d "$repo_root/.git" ]]; then
+source_description="$repo_url ($repo_branch)"
+if [[ -n "$source_image" ]]; then
+  gantry_login_server=$(az acr show -g "$resource_group" -n "$gantry_acr_name" --query loginServer -o tsv)
+  source_token=$(az acr login --name "$gantry_acr_name" --expose-token --query accessToken -o tsv)
+  printf '%s' "$source_token" | podman login "$gantry_login_server" \
+    --username 00000000-0000-0000-0000-000000000000 \
+    --password-stdin
+  unset source_token
+
+  podman pull "$source_image"
+  actual_source_revision=$(podman image inspect \
+    --format '{{ index .Labels "org.opencontainers.image.revision" }}' \
+    "$source_image")
+  if [[ -n "$source_revision" && "$actual_source_revision" != "$source_revision" ]]; then
+    echo "source image revision $actual_source_revision, want $source_revision" >&2
+    exit 1
+  fi
+  source_container=$(podman create "$source_image")
+  rm -rf "$repo_root"
+  install -d -m 0755 "$repo_root"
+  podman cp "$source_container:/workspace/." "$repo_root/"
+  podman rm "$source_container"
+  podman logout "$gantry_login_server"
+  source_description="$source_image ($actual_source_revision)"
+elif [[ -d "$repo_root/.git" ]]; then
   git -C "$repo_root" fetch origin "$repo_branch"
   git -C "$repo_root" checkout -B "$repo_branch" "origin/$repo_branch"
 else
@@ -108,9 +137,6 @@ podman_graph_root=$(podman info --format '{{.Store.GraphRoot}}')
   echo "Podman graph root $podman_graph_root, want $build_mount/containers" >&2
   exit 1
 }
-
-retry az login --identity --allow-no-subscriptions --output none
-az account set --subscription "$subscription_id"
 
 retry az acr show -g "$resource_group" -n "$baseline_acr_name" --output none
 retry az acr show -g "$resource_group" -n "$gantry_acr_name" --output none
@@ -214,7 +240,7 @@ echo "Gantry ACR status: $gantry_status"
 
 cat <<SUMMARY
 operator VM bootstrap complete
-repo: $repo_root ($repo_branch)
+repo: $repo_root ($source_description)
 build mount: $build_mount
 Podman graph root: $podman_graph_root
 config: /etc/gantry-benchmark/env

@@ -6,6 +6,8 @@ package main
 import (
 	"bytes"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -120,6 +122,34 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	wantKinds := []string{"PodMonitor", "DaemonSet", "PodMonitor"}
 	if !slices.Equal(kinds, wantKinds) {
 		t.Fatalf("rendered kinds = %v, want %v", kinds, wantKinds)
+	}
+}
+
+func TestContainerdBenchmarkManifest(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("findRepoRoot: %v", err)
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(repoRoot, "hack/gantry-benchmark/manifests/containerd.yaml"))
+	if err != nil {
+		t.Fatalf("read containerd manifest: %v", err)
+	}
+
+	wantKinds := []string{"ConfigMap", "DaemonSet"}
+	if kinds := decodeManifestKinds(t, manifest); !slices.Equal(kinds, wantKinds) {
+		t.Fatalf("manifest kinds = %v, want %v", kinds, wantKinds)
+	}
+
+	for _, setting := range []string{
+		`level = "debug"`,
+		`image_pull_progress_timeout = "15m"`,
+		`max_concurrent_downloads = 6`,
+		`systemd-run`,
+	} {
+		if !bytes.Contains(manifest, []byte(setting)) {
+			t.Fatalf("containerd manifest is missing %q", setting)
+		}
 	}
 }
 

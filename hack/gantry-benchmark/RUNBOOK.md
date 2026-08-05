@@ -31,7 +31,26 @@ export OPERATOR_BUILD_DISK_SKU="PremiumV2_LRS"
 export OPERATOR_BUILD_DISK_IOPS="20000"
 export OPERATOR_BUILD_DISK_MBPS="750"
 
+# Optional private source delivery. Build this image from the exact local
+# commit and set both values together; bootstrap rejects a revision mismatch.
+export BENCHMARK_SOURCE_IMAGE="<gantry-acr>.azurecr.io/gantry-benchmark-source:<commit>"
+export BENCHMARK_SOURCE_REVISION="<full-commit-sha>"
+
 make -C hack/gantry-benchmark operator-vm-provision
+```
+
+To create the private source image without publishing the branch to GitHub:
+
+```bash
+SOURCE_REVISION=$(git rev-parse HEAD)
+az acr build \
+   --registry "$GANTRY_ACR_NAME" \
+   --image "gantry-benchmark-source:${SOURCE_REVISION}" \
+   --file images/gantry-benchmark-source/Containerfile \
+   --build-arg "SOURCE_REVISION=${SOURCE_REVISION}" \
+   .
+export BENCHMARK_SOURCE_IMAGE="${GANTRY_ACR_NAME}.azurecr.io/gantry-benchmark-source:${SOURCE_REVISION}"
+export BENCHMARK_SOURCE_REVISION="$SOURCE_REVISION"
 ```
 
 Provisioning creates:
@@ -63,6 +82,19 @@ podman info --format '{{.Store.GraphRoot}}'
 The graphroot must be `/opt/gantry-benchmark/containers`.
 
 ## 2. Start The Full Lifecycle
+
+Before provisioning the operator VM or starting the lifecycle on AKS, apply
+the benchmark containerd configuration and require it to be Ready on every
+target node. This enables debug unpack logs, sets the no-progress timeout to
+15 minutes, and raises transfer-service layer downloads to six. The DaemonSet
+performs one detached containerd restart per configuration hash.
+
+```bash
+kubectl create namespace gantry-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f hack/gantry-benchmark/manifests/containerd.yaml
+kubectl -n gantry-system rollout status \
+   daemonset/gantry-benchmark-containerd-config --timeout=45m
+```
 
 ```bash
 export OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"

@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gantry-benchmark-containerd-config
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/part-of: gantry-benchmark
+data:
+  benchmark.toml: |
+    [debug]
+    level = "debug"
+
+    [plugins."io.containerd.cri.v1.images"]
+    image_pull_progress_timeout = "15m"
+
+    [plugins."io.containerd.transfer.v1.local"]
+    max_concurrent_downloads = 6
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-benchmark-containerd-config
+  namespace: gantry-system
+  labels:
+    app.kubernetes.io/name: gantry-benchmark-containerd-config
+    app.kubernetes.io/part-of: gantry-benchmark
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry-benchmark-containerd-config
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry-benchmark-containerd-config
+        app.kubernetes.io/part-of: gantry-benchmark
+    spec:
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: configure
+          image: mcr.microsoft.com/cbl-mariner/busybox:2.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+
+              conf_dir=/host/etc/containerd/conf.d
+              drop_in="$conf_dir/97-gantry-benchmark.toml"
+              main_config=/host/etc/containerd/config.toml
+              marker=/host/etc/containerd/.gantry-benchmark-config
+              desired_sha="$(sha256sum /config/benchmark.toml | awk '{print $1}')"
+
+              mkdir -p "$conf_dir"
+              temp="$conf_dir/.97-gantry-benchmark.toml.tmp"
+              cp /config/benchmark.toml "$temp"
+              chmod 0644 "$temp"
+              mv "$temp" "$drop_in"
+
+              if grep -Eq '^[[:space:]]*imports[[:space:]]*=' "$main_config"; then
+                if ! grep -Fq '/etc/containerd/conf.d/' "$main_config"; then
+                  echo "refusing: $main_config declares imports excluding /etc/containerd/conf.d" >&2
+                  exit 1
+                fi
+              else
+                [ -e "$main_config.gantry-benchmark-backup" ] || \
+                  cp "$main_config" "$main_config.gantry-benchmark-backup"
+                config_temp=/host/etc/containerd/.config.toml.gantry-benchmark.tmp
+                {
+                  echo '# Added by the Gantry benchmark.'
+                  echo 'imports = ["/etc/containerd/conf.d/*.toml"]'
+                  cat "$main_config"
+                } >"$config_temp"
+                chmod 0644 "$config_temp"
+                mv "$config_temp" "$main_config"
+              fi
+
+              if [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$desired_sha" ]; then
+                echo "$desired_sha" >"$marker"
+                chroot /host systemd-run \
+                  --unit="gantry-benchmark-containerd-restart-$(date +%s)" \
+                  --no-block systemctl restart containerd
+              fi
+
+              exec sleep 2147483647
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  cmp -s /config/benchmark.toml /host/etc/containerd/conf.d/97-gantry-benchmark.toml
+                  config_dump="$(chroot /host sh -c '
+                    pid=$(systemctl show --property MainPID --value containerd)
+                    bin=$(readlink -f "/proc/${pid}/exe")
+                    "$bin" config dump
+                  ')"
+                  printf '%s\n' "$config_dump" | grep -Eq "^[[:space:]]*level = ['\"]debug['\"]$"
+                  printf '%s\n' "$config_dump" | grep -Eq "^[[:space:]]*image_pull_progress_timeout = ['\"]15m(0s)?['\"]$"
+                  printf '%s\n' "$config_dump" | grep -Eq '^[[:space:]]*max_concurrent_downloads = 6$'
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          volumeMounts:
+            - name: host
+              mountPath: /host
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+            type: Directory
+        - name: config
+          configMap:
+            name: gantry-benchmark-containerd-config
