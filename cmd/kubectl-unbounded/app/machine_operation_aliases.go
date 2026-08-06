@@ -71,7 +71,10 @@ func newMachinePowerOnCommand(rt *machineCommandRuntime) *cobra.Command {
 }
 
 func newMachineAgentUpgradeCommand(rt *machineCommandRuntime) *cobra.Command {
-	var downloadURL string
+	var (
+		downloadURL  string
+		sha256Digest string
+	)
 
 	cmd := newMachineOperationAliasCommand(
 		rt,
@@ -81,7 +84,8 @@ func newMachineAgentUpgradeCommand(rt *machineCommandRuntime) *cobra.Command {
 		"agent-upgrade",
 	)
 
-	cmd.Flags().StringVar(&downloadURL, "download-url", "", "URL of the unbounded-agent release tarball")
+	cmd.Flags().StringVar(&downloadURL, "download-url", "", "HTTPS URL of the unbounded-agent release tarball")
+	cmd.Flags().StringVar(&sha256Digest, "sha256", "", "SHA-256 digest of the release tarball")
 
 	oldRunE := cmd.RunE
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
@@ -89,8 +93,13 @@ func newMachineAgentUpgradeCommand(rt *machineCommandRuntime) *cobra.Command {
 			return fmt.Errorf("--download-url is required")
 		}
 
+		if sha256Digest == "" {
+			return fmt.Errorf("--sha256 is required")
+		}
+
 		cmd.SetContext(context.WithValue(cmd.Context(), machineOperationParametersKey{}, map[string]string{
 			"downloadURL": downloadURL,
+			"sha256":      sha256Digest,
 		}))
 
 		return oldRunE(cmd, args)

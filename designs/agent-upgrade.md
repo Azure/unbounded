@@ -62,7 +62,7 @@ Pending MachineOperation
         v
 Validate parameters
         |
-        +-- missing downloadURL -------------------------> Failed
+        +-- missing URL/digest or non-HTTPS URL ---------> Failed
         |
         v
 Mark InProgress
@@ -96,18 +96,20 @@ Old process exits, new daemon starts
 
 ## Staging and switching
 
-The daemon reads `spec.parameters["downloadURL"]` from the
-`MachineOperation`. It logs the URL, resolves the current binary target, and
-calls `agentbinary.InstallAndSwitchFromTarGz`.
+The daemon reads `spec.parameters["downloadURL"]` and
+`spec.parameters["sha256"]` from the `MachineOperation`, resolves the current
+binary target, and calls `agentbinary.SecureInstallAndSwitch`. Logs and errors
+omit URL query and fragment data.
 
-`InstallAndSwitchFromTarGz` performs the upgrade as one logical operation:
+`SecureInstallAndSwitch` performs the upgrade as one logical operation:
 
-1. Download the tarball.
-2. Extract the `unbounded-agent` entry into `NextTargetPath()`.
-3. Reject an empty agent entry.
-4. Run `unbounded-agent version` against the staged binary.
-5. Update `LastGoodPath` to the previous `CurrentTargetPath`.
-6. Update `CurrentPath` to the staged binary.
+1. Require an HTTPS URL and an exact compressed-archive SHA-256.
+2. Download the tarball within the configured size bound.
+3. Require the archive to contain only the exact `unbounded-agent` entry.
+4. Bound decompression and atomically install the inactive slot.
+5. Run `unbounded-agent version` against the staged binary without exposing output.
+6. Protect the running binary through `LastGoodPath` before replacing an inactive slot.
+7. Atomically update `CurrentPath` to the staged binary.
 
 Symlink replacement uses `renameio.Symlink` through `utilio`, so each link is
 replaced atomically after parent directory creation.
@@ -166,7 +168,8 @@ startup signal path.
 
 | Failure | Operation status | Binary state |
 |---------|------------------|--------------|
-| Missing `downloadURL` | `Failed`, `InvalidParameters` | No link changes. |
+| Missing `downloadURL` or `sha256` | `Failed`, `InvalidParameters` | No link changes. |
+| Non-HTTPS URL or digest mismatch | `Failed`, `InvalidParameters` or `ExecutionFailed` | No current link change. |
 | Download or extraction failure | `Failed`, `ExecutionFailed` | No link changes after failure. |
 | Empty archive entry | `Failed`, `ExecutionFailed` | No link changes after failure. |
 | Staged binary fails `version` | `Failed`, `ExecutionFailed` | Current and last-good remain unchanged. |

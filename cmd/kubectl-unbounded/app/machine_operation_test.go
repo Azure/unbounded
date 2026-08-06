@@ -23,6 +23,8 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
+const testAgentUpgradeSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func TestBuildMachineOperationWithMachineRef(t *testing.T) {
 	t.Parallel()
 
@@ -76,7 +78,7 @@ func TestBuildMachineOperationParameters(t *testing.T) {
 		name:          "upgrade-worker-01",
 		kind:          v1alpha3.OperationAgentUpgrade,
 		machine:       "worker-01",
-		parameterArgs: []string{"downloadURL=https://example.com/agent.tar.gz"},
+		parameterArgs: []string{"downloadURL=https://example.com/agent.tar.gz", "sha256=" + testAgentUpgradeSHA256},
 		output:        operationOutputName,
 		dryRun:        dryRunNone,
 	}
@@ -86,6 +88,7 @@ func TestBuildMachineOperationParameters(t *testing.T) {
 	op, err := opts.build()
 	require.NoError(t, err)
 	require.Equal(t, "https://example.com/agent.tar.gz", op.Spec.Parameters["downloadURL"])
+	require.Equal(t, testAgentUpgradeSHA256, op.Spec.Parameters["sha256"])
 }
 
 func TestValidateMachineOperationRequiresTarget(t *testing.T) {
@@ -117,6 +120,23 @@ func TestValidateAgentUpgradeRequiresDownloadURL(t *testing.T) {
 	err := opts.validate()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "downloadURL")
+}
+
+func TestValidateAgentUpgradeRequiresSHA256(t *testing.T) {
+	t.Parallel()
+
+	opts := &machineOperationCreateOptions{
+		name:          "upgrade-worker-01",
+		kind:          v1alpha3.OperationAgentUpgrade,
+		machine:       "worker-01",
+		parameterArgs: []string{"downloadURL=https://example.com/agent.tar.gz"},
+		output:        operationOutputName,
+		dryRun:        dryRunNone,
+	}
+
+	err := opts.validate()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "sha256")
 }
 
 func TestValidateWaitRejectsStructuredOutput(t *testing.T) {
@@ -173,6 +193,7 @@ func TestMachineOperationCreateCommandDryRunYAML(t *testing.T) {
 		"--kind", string(v1alpha3.OperationAgentUpgrade),
 		"--machine", "worker-01",
 		"--param", "downloadURL=https://example.com/agent.tar.gz",
+		"--param", "sha256="+testAgentUpgradeSHA256,
 		"--ttl", "900",
 		"--dry-run=client",
 		"-o", "yaml",
@@ -183,6 +204,7 @@ func TestMachineOperationCreateCommandDryRunYAML(t *testing.T) {
 	require.Contains(t, out, "operationKind: AgentUpgrade")
 	require.Contains(t, out, "machineRef: worker-01")
 	require.Contains(t, out, "downloadURL: https://example.com/agent.tar.gz")
+	require.Contains(t, out, "sha256: "+testAgentUpgradeSHA256)
 	require.Contains(t, out, "ttlSecondsAfterFinished: 900")
 }
 
@@ -214,7 +236,7 @@ func TestMachineOperationCreateSmokeCreatesMachineRefOperation(t *testing.T) {
 		name:          "upgrade-worker-01",
 		kind:          v1alpha3.OperationAgentUpgrade,
 		machine:       "worker-01",
-		parameterArgs: []string{"downloadURL=https://example.com/agent.tar.gz"},
+		parameterArgs: []string{"downloadURL=https://example.com/agent.tar.gz", "sha256=" + testAgentUpgradeSHA256},
 		ttlSeconds:    900,
 		output:        operationOutputName,
 		dryRun:        dryRunNone,
@@ -233,6 +255,7 @@ func TestMachineOperationCreateSmokeCreatesMachineRefOperation(t *testing.T) {
 	require.Nil(t, got.Spec.MachineSelector)
 	require.Equal(t, v1alpha3.OperationAgentUpgrade, got.Spec.OperationKind)
 	require.Equal(t, "https://example.com/agent.tar.gz", got.Spec.Parameters["downloadURL"])
+	require.Equal(t, testAgentUpgradeSHA256, got.Spec.Parameters["sha256"])
 	require.NotNil(t, got.Spec.TTLSecondsAfterFinished)
 	require.Equal(t, int32(900), *got.Spec.TTLSecondsAfterFinished)
 }

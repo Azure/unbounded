@@ -319,7 +319,7 @@ Create a `MachineOperation`.
 | `--kind` | string | Operation kind: `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, or `HostReplace` |
 | `--machine` or `--selector` | string | Target one Machine by name or select Machines by label selector |
 
-`AgentUpgrade` also requires `--param downloadURL=<url>`.
+`AgentUpgrade` also requires `--param downloadURL=<https-url>` and `--param sha256=<archive-sha256>`.
 
 #### Optional Flags
 
@@ -372,7 +372,8 @@ Upgrade the agent:
 kubectl unbounded machine operation create upgrade-worker-01 \
   --kind AgentUpgrade \
   --machine worker-01 \
-  --param downloadURL=https://example.com/unbounded-agent-linux-amd64.tar.gz
+  --param downloadURL=https://example.com/unbounded-agent-linux-amd64.tar.gz \
+  --param sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 Selector support is implemented at the CRD level. Agent operations support
@@ -411,7 +412,7 @@ name, default `--ttl 300`, and `--wait=true`.
 | `kubectl unbounded machine host-reboot NAME` | `HostReboot` | Reboots or power-cycles the host through the owning backend. |
 | `kubectl unbounded machine power-off NAME` | `HostPowerOff` | Powers off the host. |
 | `kubectl unbounded machine power-on NAME` | `HostPowerOn` | Powers on the host. |
-| `kubectl unbounded machine agent-upgrade NAME --download-url URL` | `AgentUpgrade` | Upgrades the host-side agent binary. |
+| `kubectl unbounded machine agent-upgrade NAME --download-url URL --sha256 DIGEST` | `AgentUpgrade` | Upgrades the host-side agent binary. |
 | `kubectl unbounded machine agent-reset NAME --force` | `AgentReset` | Removes the agent and managed resources from the host. Requires confirmation unless `--force` is set. |
 | `kubectl unbounded machine replace NAME --force` | `HostReplace` | Destructively replaces the host. Requires confirmation unless `--force` is set. |
 

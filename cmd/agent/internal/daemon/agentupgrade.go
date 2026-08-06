@@ -18,8 +18,14 @@ import (
 
 const (
 	agentUpgradeDownloadURLParameter = "downloadURL"
+	agentUpgradeSHA256Parameter      = "sha256"
 	agentUpgradeBinaryMode           = 0o755
 )
+
+type agentUpgradeRequest struct {
+	downloadURL string
+	sha256      string
+}
 
 // agentUpgradeSignal is the JSON payload for pending and failure signals.
 type agentUpgradeSignal struct {
@@ -42,15 +48,32 @@ type fileAgentUpgradeSignalOperator struct {
 	path string
 }
 
-func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
-	downloadURL := strings.TrimSpace(parameters[agentUpgradeDownloadURLParameter])
-	if downloadURL == "" {
-		return "", fmt.Errorf("missing required parameter %q", agentUpgradeDownloadURLParameter)
+func parseAgentUpgradeRequest(parameters map[string]string) (agentUpgradeRequest, error) {
+	request := agentUpgradeRequest{
+		downloadURL: strings.TrimSpace(parameters[agentUpgradeDownloadURLParameter]),
+		sha256:      strings.TrimSpace(parameters[agentUpgradeSHA256Parameter]),
+	}
+	if request.downloadURL == "" {
+		return agentUpgradeRequest{}, fmt.Errorf("missing required parameter %q", agentUpgradeDownloadURLParameter)
 	}
 
-	return downloadURL, nil
+	if request.sha256 == "" {
+		return agentUpgradeRequest{}, fmt.Errorf("missing required parameter %q", agentUpgradeSHA256Parameter)
+	}
+
+	if err := agentbinary.ValidateSecureInstallOptions(agentbinary.SecureInstallOptions{
+		DownloadURL:    request.downloadURL,
+		ExpectedSHA256: request.sha256,
+		ExpectedMember: goalstates.AgentUpgradeBinaryName,
+	}); err != nil {
+		return agentUpgradeRequest{}, err
+	}
+
+	return request, nil
 }
 
+// upgradeDaemonBinary retains the legacy Unbounded download contract for
+// compatibility tests. Managed MachineOperations use upgradeDaemonBinarySecure.
 func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL string) error {
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
@@ -69,6 +92,29 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL stri
 	)
 
 	return nil
+}
+
+func upgradeDaemonBinarySecure(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	if err != nil {
+		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
+	}
+
+	layout := agentbinary.Layout{
+		BinaryPath:   paths.BinaryPath,
+		BluePath:     paths.BluePath,
+		GreenPath:    paths.GreenPath,
+		CurrentPath:  paths.CurrentPath,
+		LastGoodPath: paths.LastGoodPath,
+	}
+	_, err = agentbinary.SecureInstallAndSwitch(ctx, log, layout, agentbinary.SecureInstallOptions{
+		DownloadURL:    request.downloadURL,
+		ExpectedSHA256: request.sha256,
+		ExpectedMember: goalstates.AgentUpgradeBinaryName,
+		Mode:           agentUpgradeBinaryMode,
+	})
+
+	return err
 }
 
 func newAgentUpgradeSignalOperator() (agentUpgradeSignalOperator, error) {

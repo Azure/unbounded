@@ -25,18 +25,26 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
-func TestAgentUpgradeDownloadURL(t *testing.T) {
+func TestParseAgentUpgradeRequest(t *testing.T) {
 	t.Parallel()
 
-	downloadURL, err := agentUpgradeDownloadURL(map[string]string{
+	request, err := parseAgentUpgradeRequest(map[string]string{
 		agentUpgradeDownloadURLParameter: " https://example.com/agent.tar.gz ",
+		agentUpgradeSHA256Parameter:      " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "https://example.com/agent.tar.gz", downloadURL)
+	assert.Equal(t, "https://example.com/agent.tar.gz", request.downloadURL)
+	assert.Equal(t, testAgentUpgradeSHA256, request.sha256)
 
-	_, err = agentUpgradeDownloadURL(nil)
+	_, err = parseAgentUpgradeRequest(nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), agentUpgradeDownloadURLParameter)
+
+	_, err = parseAgentUpgradeRequest(map[string]string{
+		agentUpgradeDownloadURLParameter: "https://example.com/agent.tar.gz",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), agentUpgradeSHA256Parameter)
 }
 
 func TestAgentUpgradeSignalOperator_RecordFailure(t *testing.T) {
