@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,7 +57,7 @@ Example:
 				taints:            taints,
 				updateStrategy:    updateStrategy,
 				priority:          priority,
-			})
+			}, cmd.OutOrStdout())
 		},
 	}
 
@@ -79,7 +80,7 @@ type configCreateOpts struct {
 	priority          int32
 }
 
-func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts configCreateOpts) error {
+func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts configCreateOpts, out io.Writer) error {
 	mc := &v1alpha3.MachineConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -127,29 +128,29 @@ func runConfigCreate(ctx context.Context, c client.WithWatch, name string, opts 
 		return fmt.Errorf("creating MachineConfiguration: %w", err)
 	}
 
-	printStep(fmt.Sprintf("Created MachineConfiguration %s", name))
+	printStep(out, fmt.Sprintf("Created MachineConfiguration %s", name))
 
 	if opts.kubernetesVersion != "" {
-		printConfig("kubernetes", opts.kubernetesVersion)
+		printConfig(out, "kubernetes", opts.kubernetesVersion)
 	}
 
 	if opts.agentImage != "" {
-		printConfig("agent-image", opts.agentImage)
+		printConfig(out, "agent-image", opts.agentImage)
 	}
 
 	if len(opts.nodeLabels) > 0 {
-		printConfig("node-labels", strings.Join(opts.nodeLabels, ", "))
+		printConfig(out, "node-labels", strings.Join(opts.nodeLabels, ", "))
 	}
 
 	if len(opts.taints) > 0 {
-		printConfig("taints", strings.Join(opts.taints, ", "))
+		printConfig(out, "taints", strings.Join(opts.taints, ", "))
 	}
 
-	printConfig("update-strategy", opts.updateStrategy)
-	fmt.Println()
+	printConfig(out, "update-strategy", opts.updateStrategy)
+	fprintln(out)
 
-	printStep("MachineConfigurationVersion v1 will be created by the controller")
-	fmt.Println()
+	printStep(out, "MachineConfigurationVersion v1 will be created by the controller")
+	fprintln(out)
 
 	return nil
 }

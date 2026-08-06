@@ -6,7 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
-	"os"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -39,24 +39,24 @@ Example:
 			}
 
 			if len(args) == 1 {
-				return runConfigGetOne(ctx, c, args[0])
+				return runConfigGetOne(ctx, c, args[0], cmd.OutOrStdout())
 			}
 
-			return runConfigGetAll(ctx, c)
+			return runConfigGetAll(ctx, c, cmd.OutOrStdout())
 		},
 	}
 
 	return cmd
 }
 
-func runConfigGetAll(ctx context.Context, c client.WithWatch) error {
+func runConfigGetAll(ctx context.Context, c client.WithWatch, out io.Writer) error {
 	var list v1alpha3.MachineConfigurationList
 	if err := c.List(ctx, &list); err != nil {
 		return fmt.Errorf("listing MachineConfigurations: %w", err)
 	}
 
 	if len(list.Items) == 0 {
-		fmt.Println("No MachineConfigurations found")
+		fprintln(out, "No MachineConfigurations found")
 		return nil
 	}
 
@@ -83,45 +83,45 @@ func runConfigGetAll(ctx context.Context, c client.WithWatch) error {
 		}})
 	}
 
-	return printers.NewTablePrinter(printers.PrintOptions{}).PrintObj(table, os.Stdout)
+	return printers.NewTablePrinter(printers.PrintOptions{}).PrintObj(table, out)
 }
 
-func runConfigGetOne(ctx context.Context, c client.WithWatch, name string) error {
+func runConfigGetOne(ctx context.Context, c client.WithWatch, name string, out io.Writer) error {
 	mc := &v1alpha3.MachineConfiguration{}
 	if err := c.Get(ctx, client.ObjectKey{Name: name}, mc); err != nil {
 		return fmt.Errorf("getting MachineConfiguration: %w", err)
 	}
 
-	printStep(fmt.Sprintf("MachineConfiguration: %s", mc.Name))
-	printConfig("latest-version", fmt.Sprintf("%d", mc.Status.LatestVersion))
-	printConfig("current-version", fmt.Sprintf("%d", mc.Status.CurrentVersion))
-	printConfig("update-strategy", string(mc.Spec.UpdateStrategy.Type))
-	printConfig("priority", fmt.Sprintf("%d", mc.Spec.Priority))
+	printStep(out, fmt.Sprintf("MachineConfiguration: %s", mc.Name))
+	printConfig(out, "latest-version", fmt.Sprintf("%d", mc.Status.LatestVersion))
+	printConfig(out, "current-version", fmt.Sprintf("%d", mc.Status.CurrentVersion))
+	printConfig(out, "update-strategy", string(mc.Spec.UpdateStrategy.Type))
+	printConfig(out, "priority", fmt.Sprintf("%d", mc.Spec.Priority))
 
 	if mc.Spec.Template.Kubernetes != nil {
 		k := mc.Spec.Template.Kubernetes
 		if k.Version != "" {
-			printConfig("k8s-version", k.Version)
+			printConfig(out, "k8s-version", k.Version)
 		}
 
 		if len(k.NodeLabels) > 0 {
 			for lk, lv := range k.NodeLabels {
-				printConfig("node-label", fmt.Sprintf("%s=%s", lk, lv))
+				printConfig(out, "node-label", fmt.Sprintf("%s=%s", lk, lv))
 			}
 		}
 
 		if len(k.RegisterWithTaints) > 0 {
 			for _, t := range k.RegisterWithTaints {
-				printConfig("taint", formatTaint(t))
+				printConfig(out, "taint", formatTaint(t))
 			}
 		}
 	}
 
 	if mc.Spec.Template.Agent != nil {
-		printConfig("agent-image", mc.Spec.Template.Agent.Image)
+		printConfig(out, "agent-image", mc.Spec.Template.Agent.Image)
 	}
 
-	fmt.Println()
+	fprintln(out)
 
 	return nil
 }

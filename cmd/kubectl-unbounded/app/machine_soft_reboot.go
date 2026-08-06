@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -45,7 +46,7 @@ to "Complete" or "Failed".`,
 				return err
 			}
 
-			return runSoftReboot(ctx, c, args[0], ttl)
+			return runSoftReboot(ctx, c, args[0], ttl, cmd.OutOrStdout())
 		},
 	}
 
@@ -55,18 +56,18 @@ to "Complete" or "Failed".`,
 	return cmd
 }
 
-func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32) error {
+func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, out io.Writer) error {
 	opName := fmt.Sprintf("%s-reboot-%d", name, time.Now().Unix())
 
 	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationNodeReboot, ttlSeconds); err != nil {
 		return err
 	}
 
-	printStep(fmt.Sprintf("Soft-rebooting Machine %s...", name))
-	printConfig("operation", opName)
-	fmt.Println()
+	printStep(out, fmt.Sprintf("Soft-rebooting Machine %s...", name))
+	printConfig(out, "operation", opName)
+	fprintln(out)
 
-	return watchMachineOperation(ctx, c, opName)
+	return watchMachineOperation(ctx, c, opName, out)
 }
 
 func createMachineOperation(ctx context.Context, c client.WithWatch, name, opName string, kind v1alpha3.OperationKind, ttlSeconds int32) error {
@@ -107,20 +108,20 @@ func createMachineOperation(ctx context.Context, c client.WithWatch, name, opNam
 
 // watchMachineOperation watches a MachineOperation CR until it reaches a
 // terminal phase (Complete or Failed).
-func watchMachineOperation(ctx context.Context, c client.WithWatch, opName string) error {
+func watchMachineOperation(ctx context.Context, c client.WithWatch, opName string, out io.Writer) error {
 	var initial v1alpha3.MachineOperation
 	if err := c.Get(ctx, client.ObjectKey{Name: opName}, &initial); err != nil {
 		return fmt.Errorf("getting MachineOperation: %w", err)
 	}
 
 	if initial.Status.IsTerminal() {
-		return finishMachineOperationWait(&initial)
+		return finishMachineOperationWait(&initial, out)
 	}
 
-	return watchMachineOperationFromResourceVersion(ctx, c, opName, initial.ResourceVersion)
+	return watchMachineOperationFromResourceVersion(ctx, c, opName, initial.ResourceVersion, out)
 }
 
-func watchMachineOperationFromResourceVersion(ctx context.Context, c client.WithWatch, opName, resourceVersion string) error {
+func watchMachineOperationFromResourceVersion(ctx context.Context, c client.WithWatch, opName, resourceVersion string, out io.Writer) error {
 	listOptions := []client.ListOption{
 		client.MatchingFields{"metadata.name": opName},
 	}
@@ -161,17 +162,17 @@ func watchMachineOperationFromResourceVersion(ctx context.Context, c client.With
 		}
 
 		phase := op.Status.Phase
-		reportConditionTransitions(op.Status.Conditions, seenConditions)
-		reportTargetTransitions(op.Status.Targets, seenTargets)
+		reportConditionTransitions(out, op.Status.Conditions, seenConditions)
+		reportTargetTransitions(out, op.Status.Targets, seenTargets)
 
 		if phase != lastPhase {
 			switch phase {
 			case v1alpha3.OperationPhaseInProgress:
-				printStep(fmt.Sprintf("Operation %s: %s in progress...", op.Spec.OperationKind, opName))
+				printStep(out, fmt.Sprintf("Operation %s: %s in progress...", op.Spec.OperationKind, opName))
 			case v1alpha3.OperationPhaseComplete:
-				printStep(fmt.Sprintf("Operation %s: %s completed", op.Spec.OperationKind, opName))
+				printStep(out, fmt.Sprintf("Operation %s: %s completed", op.Spec.OperationKind, opName))
 			case v1alpha3.OperationPhaseFailed:
-				printStep(fmt.Sprintf("Operation %s: %s failed: %s", op.Spec.OperationKind, opName, op.Status.Message))
+				printStep(out, fmt.Sprintf("Operation %s: %s failed: %s", op.Spec.OperationKind, opName, op.Status.Message))
 			}
 
 			lastPhase = phase
@@ -182,7 +183,7 @@ func watchMachineOperationFromResourceVersion(ctx context.Context, c client.With
 				return fmt.Errorf("operation failed: %s", op.Status.Message)
 			}
 
-			printReady()
+			printReady(out)
 
 			return nil
 		}
@@ -195,7 +196,7 @@ func watchMachineOperationFromResourceVersion(ctx context.Context, c client.With
 	return fmt.Errorf("watch closed before operation completed")
 }
 
-func reportTargetTransitions(targets []v1alpha3.MachineOperationTargetStatus, seen map[string]string) {
+func reportTargetTransitions(out io.Writer, targets []v1alpha3.MachineOperationTargetStatus, seen map[string]string) {
 	for _, target := range targets {
 		key := target.MachineRef
 		if key == "" {
@@ -214,7 +215,7 @@ func reportTargetTransitions(targets []v1alpha3.MachineOperationTargetStatus, se
 			text = targetTransitionState(target)
 		}
 
-		printStep(fmt.Sprintf("Target %s: %s", key, text))
+		printStep(out, fmt.Sprintf("Target %s: %s", key, text))
 	}
 }
 

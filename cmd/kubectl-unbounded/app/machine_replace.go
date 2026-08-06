@@ -50,7 +50,7 @@ Host-local OS disk state is destroyed.`,
 				wait:          wait,
 				timeout:       timeout,
 				operationName: operationName,
-			})
+			}, cmd.OutOrStdout())
 		},
 	}
 
@@ -73,15 +73,15 @@ type machineReplaceOptions struct {
 	operationName string
 }
 
-func runReplace(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, force bool) error {
+func runReplace(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, force bool, out io.Writer) error {
 	return runReplaceWithOptions(ctx, c, name, machineReplaceOptions{
 		ttlSeconds: ttlSeconds,
 		force:      force,
 		wait:       true,
-	})
+	}, out)
 }
 
-func runReplaceWithOptions(ctx context.Context, c client.WithWatch, name string, opts machineReplaceOptions) error {
+func runReplaceWithOptions(ctx context.Context, c client.WithWatch, name string, opts machineReplaceOptions, out io.Writer) error {
 	if !opts.force {
 		if err := confirmReplace(name, os.Stdin, os.Stderr); err != nil {
 			return err
@@ -102,6 +102,7 @@ func runReplaceWithOptions(ctx context.Context, c client.WithWatch, name string,
 		dryRun:       dryRunNone,
 		fieldManager: fieldManagerID,
 		printCreated: false,
+		out:          out,
 	}
 	if err := createOptions.validate(); err != nil {
 		return err
@@ -120,9 +121,9 @@ func runReplaceWithOptions(ctx context.Context, c client.WithWatch, name string,
 		return err
 	}
 
-	printStep(fmt.Sprintf("Replacing Machine %s...", name))
-	printConfig("operation", opName)
-	fmt.Println()
+	printStep(out, fmt.Sprintf("Replacing Machine %s...", name))
+	printConfig(out, "operation", opName)
+	fprintln(out)
 
 	if !opts.wait {
 		return nil
@@ -131,7 +132,7 @@ func runReplaceWithOptions(ctx context.Context, c client.WithWatch, name string,
 	waitCtx, cancel := contextWithOptionalTimeout(ctx, opts.timeout)
 	defer cancel()
 
-	return waitForMachineOperation(waitCtx, c, opName)
+	return waitForMachineOperation(waitCtx, c, opName, out)
 }
 
 func confirmReplace(name string, in *os.File, out io.Writer) error {
