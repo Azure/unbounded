@@ -12,6 +12,9 @@ data:
 
     [plugins."io.containerd.cri.v1.images"]
     image_pull_progress_timeout = "15m"
+
+    [plugins."io.containerd.transfer.v1.local"]
+    max_concurrent_downloads = 6
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -103,6 +106,7 @@ spec:
                   ')"
                   printf '%s\n' "$config_dump" | grep -Eq "^[[:space:]]*level = ['\"]debug['\"]$"
                   printf '%s\n' "$config_dump" | grep -Eq "^[[:space:]]*image_pull_progress_timeout = ['\"]15m(0s)?['\"]$"
+                  printf '%s\n' "$config_dump" | grep -Eq '^[[:space:]]*max_concurrent_downloads = 6$'
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 30
