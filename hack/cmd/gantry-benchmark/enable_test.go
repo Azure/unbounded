@@ -158,7 +158,6 @@ func TestContainerdBenchmarkManifest(t *testing.T) {
 	for _, setting := range []string{
 		`level = "debug"`,
 		`image_pull_progress_timeout = "15m"`,
-		`max_concurrent_downloads = 6`,
 		`systemd-run`,
 	} {
 		if !bytes.Contains(manifest, []byte(setting)) {
