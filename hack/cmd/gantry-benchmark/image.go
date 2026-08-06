@@ -14,9 +14,36 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 )
+
+// runStreaming reports child-process output live. Image builds and pushes run
+// for many minutes, so buffering until exit hides all progress.
+func (b *benchmark) runStreaming(ctx context.Context, prefix, name string, args ...string) ([]byte, error) {
+	streamer, ok := b.commands.(streamingCommandRunner)
+	if !ok {
+		return b.commands.Run(ctx, nil, name, args...)
+	}
+
+	writer := &prefixWriter{target: b.stdout, prefix: prefix}
+	defer writer.Flush()
+
+	return streamer.RunStreaming(ctx, nil, writer, name, args...)
+}
+
+func formatMiB(sizeMiB int) string {
+	if sizeMiB >= 1024 {
+		return fmt.Sprintf("%.2f GiB", float64(sizeMiB)/1024)
+	}
+
+	return fmt.Sprintf("%d MiB", sizeMiB)
+}
+
+func formatElapsed(since time.Time) string {
+	return time.Since(since).Round(time.Second).String()
+}
 
 func (b *benchmark) loginRegistry(ctx context.Context, loginServer, username, password string) error {
 	_, err := b.commands.Run(
@@ -203,10 +230,16 @@ func (b *benchmark) buildDualACRImages(ctx context.Context, state benchmarkState
 
 	defer removePayloads(payloadPaths)
 
+	hashStarted := time.Now()
+
+	writeAll(b.stdout, fmt.Sprintf("hashing %s shared payload\n", formatMiB(b.config.ImageSizeMiB)))
+
 	payloadSHA, err := payloadSHA256(payloadPaths)
 	if err != nil {
 		return "", "", "", err
 	}
+
+	writeAll(b.stdout, fmt.Sprintf("shared payload fingerprint %s in %s\n", payloadSHA, formatElapsed(hashStarted)))
 
 	for _, phase := range []proxyPhase{proxyPhaseBaseline, proxyPhaseGantryCold} {
 		dockerfile := dualACRDockerfile(phase, payloadPaths, payloadSHA)
@@ -219,10 +252,14 @@ func (b *benchmark) buildDualACRImages(ctx context.Context, state benchmarkState
 	baselineTagged := fmt.Sprintf("%s/%s:%s", state.BaselineACRLoginServer, b.config.WorkloadRepository, tag)
 	gantryTagged := fmt.Sprintf("%s/%s:%s", state.GantryACRLoginServer, b.config.WorkloadRepository, tag)
 
+	writeAll(b.stdout, fmt.Sprintf("image 1 of 2: baseline -> %s\n", baselineTagged))
+
 	baselineDigest, err := b.buildAndPushPreparedImage(ctx, buildDirectory, proxyPhaseBaseline, baselineTagged)
 	if err != nil {
 		return "", "", "", fmt.Errorf("build and push baseline ACR image: %w", err)
 	}
+
+	writeAll(b.stdout, fmt.Sprintf("image 2 of 2: Gantry -> %s\n", gantryTagged))
 
 	gantryDigest, err := b.buildAndPushPreparedImage(ctx, buildDirectory, proxyPhaseGantryCold, gantryTagged)
 	if err != nil {
@@ -245,6 +282,14 @@ func (b *benchmark) writeImagePayloads(buildDirectory string) ([]string, error) 
 	remainderMiB := b.config.ImageSizeMiB % layers
 	payloadPaths := make([]string, 0, layers)
 
+	started := time.Now()
+	writtenMiB := 0
+
+	writeAll(b.stdout, fmt.Sprintf(
+		"generating %s of random payload across %d layers in %s\n",
+		formatMiB(b.config.ImageSizeMiB), layers, buildDirectory,
+	))
+
 	for index := range layers {
 		sizeMiB := perLayerMiB
 		if index == layers-1 {
@@ -252,6 +297,9 @@ func (b *benchmark) writeImagePayloads(buildDirectory string) ([]string, error) 
 		}
 
 		path := filepath.Join(buildDirectory, fmt.Sprintf("payload%d.bin", index))
+
+		layerStarted := time.Now()
+
 		if err := writeRandomPayload(path, int64(sizeMiB)*mibibyte); err != nil {
 			removePayloads(payloadPaths)
 
@@ -259,7 +307,20 @@ func (b *benchmark) writeImagePayloads(buildDirectory string) ([]string, error) 
 		}
 
 		payloadPaths = append(payloadPaths, path)
+		writtenMiB += sizeMiB
+
+		writeAll(b.stdout, fmt.Sprintf(
+			"  payload layer %d/%d: %s in %s (%s of %s, %.0f%%)\n",
+			index+1, layers, formatMiB(sizeMiB), formatElapsed(layerStarted),
+			formatMiB(writtenMiB), formatMiB(b.config.ImageSizeMiB),
+			float64(writtenMiB)/float64(b.config.ImageSizeMiB)*100,
+		))
 	}
+
+	writeAll(b.stdout, fmt.Sprintf(
+		"payload generation complete: %s in %s\n",
+		formatMiB(b.config.ImageSizeMiB), formatElapsed(started),
+	))
 
 	return payloadPaths, nil
 }
@@ -315,11 +376,16 @@ func (b *benchmark) buildAndPushPreparedImage(ctx context.Context, buildDirector
 
 	switch b.config.ContainerEngine {
 	case "docker":
-		if _, err := b.commands.Run(
+		buildStarted := time.Now()
+
+		writeAll(b.stdout, fmt.Sprintf("  [%s] docker buildx build and push starting\n", phase))
+
+		if _, err := b.runStreaming(
 			ctx,
-			nil,
+			"  ["+string(phase)+"] ",
 			"docker", "buildx", "build",
 			"--platform", b.config.ImagePlatform,
+			"--progress", "plain",
 			"--file", dockerfilePath,
 			"--tag", taggedImage,
 			"--output", "type=image,push=true,oci-mediatypes=true",
@@ -330,6 +396,8 @@ func (b *benchmark) buildAndPushPreparedImage(ctx context.Context, buildDirector
 		); err != nil {
 			return "", err
 		}
+
+		writeAll(b.stdout, fmt.Sprintf("  [%s] build and push complete in %s\n", phase, formatElapsed(buildStarted)))
 
 		metadata, err := os.ReadFile(metadataPath)
 		if err != nil {
@@ -345,9 +413,13 @@ func (b *benchmark) buildAndPushPreparedImage(ctx context.Context, buildDirector
 
 		imageDigest = parsed.Digest
 	case "podman":
-		if _, err := b.commands.Run(
+		buildStarted := time.Now()
+
+		writeAll(b.stdout, fmt.Sprintf("  [%s] podman build starting\n", phase))
+
+		if _, err := b.runStreaming(
 			ctx,
-			nil,
+			"  ["+string(phase)+" build] ",
 			"podman", "build",
 			"--isolation", "chroot",
 			"--platform", b.config.ImagePlatform,
@@ -359,9 +431,21 @@ func (b *benchmark) buildAndPushPreparedImage(ctx context.Context, buildDirector
 			return "", err
 		}
 
-		if _, err := b.commands.Run(ctx, nil, "podman", "push", "--digestfile", digestPath, taggedImage); err != nil {
+		writeAll(b.stdout, fmt.Sprintf("  [%s] build complete in %s\n", phase, formatElapsed(buildStarted)))
+
+		pushStarted := time.Now()
+
+		writeAll(b.stdout, fmt.Sprintf("  [%s] pushing %s to %s\n", phase, formatMiB(b.config.ImageSizeMiB), taggedImage))
+
+		if _, err := b.runStreaming(
+			ctx,
+			"  ["+string(phase)+" push] ",
+			"podman", "push", "--digestfile", digestPath, taggedImage,
+		); err != nil {
 			return "", err
 		}
+
+		writeAll(b.stdout, fmt.Sprintf("  [%s] push complete in %s\n", phase, formatElapsed(pushStarted)))
 
 		pushedDigest, err := os.ReadFile(digestPath)
 		if err != nil {

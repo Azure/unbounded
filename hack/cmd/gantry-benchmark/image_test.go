@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -58,6 +59,9 @@ func (r *dualACRImageRunner) Run(_ context.Context, _ []byte, name string, args 
 
 func TestBuildDualACRImagesUsesSharedPayloadAndSameImageName(t *testing.T) {
 	runner := &dualACRImageRunner{}
+
+	var progress bytes.Buffer
+
 	benchmark := &benchmark{
 		config: benchmarkConfig{
 			StateRoot:          t.TempDir(),
@@ -68,6 +72,7 @@ func TestBuildDualACRImagesUsesSharedPayloadAndSameImageName(t *testing.T) {
 			WorkloadRepository: "benchmark-pull",
 		},
 		commands: runner,
+		stdout:   &progress,
 	}
 	state := benchmarkState{
 		RunID:                  "run-1",
@@ -121,6 +126,23 @@ func TestBuildDualACRImagesUsesSharedPayloadAndSameImageName(t *testing.T) {
 		!strings.Contains(string(gantryDockerfile), "/gantry-benchmark-payload/gantry-cold/") ||
 		string(baselineDockerfile) == string(gantryDockerfile) {
 		t.Fatalf("phase Dockerfiles do not isolate content cache:\nbaseline:\n%s\nGantry:\n%s", baselineDockerfile, gantryDockerfile)
+	}
+
+	for _, want := range []string{
+		"payload layer 1/2",
+		"payload layer 2/2",
+		"payload generation complete",
+		"shared payload fingerprint sha256:",
+		"image 1 of 2: baseline -> baseline.azurecr.io/benchmark-pull:run-1",
+		"image 2 of 2: Gantry -> gantry.azurecr.io/benchmark-pull:run-1",
+		"[baseline] build complete",
+		"[baseline] push complete",
+		"[gantry_cold] build complete",
+		"[gantry_cold] push complete",
+	} {
+		if !strings.Contains(progress.String(), want) {
+			t.Fatalf("progress output is missing %q:\n%s", want, progress.String())
+		}
 	}
 }
 
