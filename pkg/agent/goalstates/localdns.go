@@ -15,6 +15,8 @@ import (
 	"strings"
 	"text/template"
 
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+
 	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
@@ -44,6 +46,12 @@ type localDNSResolverDeps struct {
 	resolvedDomains func() (string, error)
 }
 
+type localDNSMetricsDeps struct {
+	interfaceAddrs     func() ([]net.Addr, error)
+	lookupIP           func(string) ([]net.IP, error)
+	resolveBindAddress func(net.IP) (net.IP, error)
+}
+
 func defaultLocalDNSResolverDeps() localDNSResolverDeps {
 	return localDNSResolverDeps{
 		readFile: os.ReadFile,
@@ -55,6 +63,14 @@ func defaultLocalDNSResolverDeps() localDNSResolverDeps {
 
 			return string(output), nil
 		},
+	}
+}
+
+func defaultLocalDNSMetricsDeps() localDNSMetricsDeps {
+	return localDNSMetricsDeps{
+		interfaceAddrs:     net.InterfaceAddrs,
+		lookupIP:           net.LookupIP,
+		resolveBindAddress: utilnet.ResolveBindAddress,
 	}
 }
 
@@ -120,7 +136,12 @@ func resolveLocalDNSConfig(cfg *config.AgentConfig, downloads *DownloadOverrides
 
 	var err error
 
-	resolved.metricsAddress, err = localDNSMetricsAddress(cfg.LocalDNS.MetricsAddress, cfg.Kubelet.NodeIP)
+	resolved.metricsAddress, err = localDNSMetricsAddress(
+		cfg.LocalDNS.MetricsAddress,
+		cfg.Kubelet.NodeIP,
+		cfg.NodeName,
+		defaultLocalDNSMetricsDeps(),
+	)
 	if err != nil {
 		return resolvedLocalDNSConfig{}, err
 	}
@@ -328,19 +349,103 @@ func parseLocalDNSUpstreams(resolvConf []byte, listeners ...netip.Addr) ([]netip
 	return upstreams, nil
 }
 
-func localDNSMetricsAddress(configured, nodeIPs string) (string, error) {
+// localDNSMetricsAddress follows kubelet's non-cloud node address selection:
+// explicit node IP, IP-valued node name, host-local node-name DNS result, then
+// ResolveBindAddress using the host's default route. LocalDNS selects IPv4 only.
+func localDNSMetricsAddress(configured, nodeIPs, nodeName string, deps localDNSMetricsDeps) (string, error) {
 	if strings.TrimSpace(configured) != "" {
 		return strings.TrimSpace(configured), nil
 	}
 
-	for _, candidate := range strings.Split(nodeIPs, ",") {
-		addr, err := netip.ParseAddr(strings.TrimSpace(candidate))
-		if err == nil && addr.Is4() && !addr.IsUnspecified() {
-			return net.JoinHostPort(addr.String(), fmt.Sprint(LocalDNSMetricsPort)), nil
+	if strings.TrimSpace(nodeIPs) != "" {
+		for _, candidate := range strings.Split(nodeIPs, ",") {
+			ip := net.ParseIP(strings.TrimSpace(candidate))
+			if ip == nil || ip.To4() == nil {
+				continue
+			}
+
+			if err := validateLocalDNSHostIP(ip, deps.interfaceAddrs); err != nil {
+				return "", fmt.Errorf("resolve LocalDNS metrics address from Kubelet.NodeIP: %w", err)
+			}
+
+			return localDNSMetricsEndpoint(ip), nil
+		}
+
+		return "", fmt.Errorf("resolve LocalDNS metrics address: Kubelet.NodeIP contains no IPv4 address")
+	}
+
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeNameIP := net.ParseIP(nodeName); nodeNameIP != nil {
+		if nodeNameIP.To4() == nil {
+			return "", fmt.Errorf("resolve LocalDNS metrics address: node name IP %s is not IPv4", nodeNameIP)
+		}
+
+		if err := validateLocalDNSHostIP(nodeNameIP, deps.interfaceAddrs); err != nil {
+			return "", fmt.Errorf("resolve LocalDNS metrics address from node name: %w", err)
+		}
+
+		return localDNSMetricsEndpoint(nodeNameIP), nil
+	}
+
+	if nodeName != "" {
+		addresses, lookupErr := deps.lookupIP(nodeName)
+		if lookupErr == nil {
+			for _, address := range addresses {
+				if address.To4() == nil || validateLocalDNSHostIP(address, deps.interfaceAddrs) != nil {
+					continue
+				}
+
+				return localDNSMetricsEndpoint(address), nil
+			}
 		}
 	}
 
-	return "", fmt.Errorf("resolve LocalDNS metrics address: no IPv4 Kubelet.NodeIP")
+	hostIP, err := deps.resolveBindAddress(nil)
+	if err != nil {
+		return "", fmt.Errorf("resolve LocalDNS metrics address from host default route: %w", err)
+	}
+
+	if hostIP == nil || hostIP.To4() == nil {
+		return "", fmt.Errorf("resolve LocalDNS metrics address: default host address %v is not IPv4", hostIP)
+	}
+
+	return localDNSMetricsEndpoint(hostIP), nil
+}
+
+func localDNSMetricsEndpoint(ip net.IP) string {
+	return net.JoinHostPort(ip.String(), fmt.Sprint(LocalDNSMetricsPort))
+}
+
+func validateLocalDNSHostIP(ip net.IP, interfaceAddrs func() ([]net.Addr, error)) error {
+	if ip == nil || ip.To4() == nil {
+		return fmt.Errorf("IP must be IPv4")
+	}
+
+	if ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return fmt.Errorf("IP %s is not a usable host address", ip)
+	}
+
+	addresses, err := interfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("list host interface addresses: %w", err)
+	}
+
+	for _, address := range addresses {
+		var candidate net.IP
+
+		switch value := address.(type) {
+		case *net.IPNet:
+			candidate = value.IP
+		case *net.IPAddr:
+			candidate = value.IP
+		}
+
+		if candidate != nil && candidate.Equal(ip) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("IP %s is not assigned to a host interface", ip)
 }
 
 func renderLocalDNSCorefile(source string, data LocalDNSCorefileTemplateData) ([]byte, error) {

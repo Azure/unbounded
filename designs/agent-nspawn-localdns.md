@@ -207,10 +207,13 @@ template:
 ```
 
 The initial API provides defaults for listener addresses. `MetricsAddress`
-defaults to `<Kubelet.NodeIP>:9253` when kubelet has a configured IPv4 node IP.
-When kubelet node IP is omitted or ambiguous, LocalDNS requires an explicit
-metrics address. It does not default to a wildcard bind. An empty
-`CorefileTemplate` selects the built-in default template described below.
+defaults to port `9253` on the IPv4 node address selected using kubelet's
+non-cloud resolution order: an explicit `Kubelet.NodeIP`, an IP-valued node
+name, a host-local IPv4 address resolved from the node name, then the address of
+the host's default-route interface. LocalDNS requires an explicit metrics
+address when that process cannot select IPv4. It does not default to a wildcard
+bind. An empty `CorefileTemplate` selects the built-in default template
+described below.
 CoreDNS version and source selection use `Downloads.CoreDNS`, consistent with
 other downloaded rootfs components, rather than LocalDNS runtime config. CPU
 and memory limits default to the AgentBaker values of 2000 millicores and 128
@@ -854,12 +857,14 @@ and scrapes `http://<node-internal-ip>:9253/metrics`. Binding only to loopback
 would not be reachable from a normal Prometheus pod, while a wildcard bind would
 unnecessarily expose metrics on every host interface.
 
-When `Kubelet.NodeIP` contains one configured IPv4 address, the resolver derives
-`MetricsAddress` from that value. If node IP is omitted, contains no IPv4
-address, or cannot identify one intended InternalIP, the caller supplies
-`MetricsAddress` explicitly. Preflight verifies that the bind IP is assigned in
-the shared network namespace and detects port conflicts. Host firewall policy
-and Prometheus target discovery remain deployment concerns.
+When `Kubelet.NodeIP` contains a configured IPv4 address, the resolver derives
+`MetricsAddress` from that value. Otherwise it follows kubelet's non-cloud node
+address selection: use an IP-valued node name, resolve the node name through DNS
+and select a host-local IPv4 address, then fall back to Kubernetes default-route
+interface discovery. If that process cannot identify an IPv4 address, the
+caller supplies `MetricsAddress` explicitly. Preflight verifies that the bind IP
+is assigned in the shared network namespace and detects port conflicts. Host
+firewall policy and Prometheus target discovery remain deployment concerns.
 
 Logs are collected through the nspawn machine's journal:
 

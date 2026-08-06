@@ -19,9 +19,10 @@ func TestAgentConfigValidateLocalDNS(t *testing.T) {
 		wantErr string
 	}{
 		{name: "disabled", config: &AgentLocalDNSConfig{}},
-		{name: "defaults", config: &AgentLocalDNSConfig{Enabled: true}, nodeIP: "10.0.0.4"},
+		{name: "defaults with node IP", config: &AgentLocalDNSConfig{Enabled: true}, nodeIP: "10.0.0.4"},
+		{name: "defaults without node IP", config: &AgentLocalDNSConfig{Enabled: true}},
 		{name: "explicit metrics", config: &AgentLocalDNSConfig{Enabled: true, MetricsAddress: "10.0.0.4:9253"}},
-		{name: "missing metrics address", config: &AgentLocalDNSConfig{Enabled: true}, wantErr: "MetricsAddress"},
+		{name: "invalid explicit metrics", config: &AgentLocalDNSConfig{Enabled: true, MetricsAddress: "not-an-address"}, wantErr: "MetricsAddress"},
 		{name: "duplicate listeners", config: &AgentLocalDNSConfig{Enabled: true, NodeListenerIP: "169.254.10.10", ClusterListenerIP: "169.254.10.10"}, nodeIP: "10.0.0.4", wantErr: "distinct"},
 		{name: "invalid CPU", config: &AgentLocalDNSConfig{Enabled: true, CPULimitInMilliCores: new(int)}, nodeIP: "10.0.0.4", wantErr: "CPULimit"},
 		{name: "valid resources", config: &AgentLocalDNSConfig{Enabled: true, CPULimitInMilliCores: &positive, MemoryLimitInMB: &positive}, nodeIP: "10.0.0.4"},
