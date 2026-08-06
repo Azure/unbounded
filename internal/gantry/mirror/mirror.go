@@ -875,9 +875,11 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		case peerFallbackLocalHit:
 			return
 		case peerFallbackServed:
-			if !s.liveStreamThrough {
-				s.firePrefetch(ctx, kind, upstream, repo, d)
-			}
+			// Live stream-through proxies the body straight to containerd, so a
+			// served manifest reaches the shared content store on containerd's
+			// commit rather than ours. The prefetcher waits for it there, so this
+			// must fire in both modes or cold-start seeding never runs.
+			s.firePrefetch(ctx, kind, upstream, repo, d)
 
 			return
 		case peerFallbackPartial:

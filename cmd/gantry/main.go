@@ -1933,6 +1933,43 @@ func newLayerPrefetcher(r *coldstart.Resolver, cache ifaces.LocalContentStore, l
 	}
 }
 
+// openManifest reads the manifest body from the shared content store. Under
+// live stream-through the mirror proxies the body straight to containerd, so
+// it only appears once containerd commits it; retry briefly rather than
+// dropping the prefetch and losing cold-start seeding entirely.
+func (p *layerPrefetchAdapter) openManifest(ctx context.Context, d digest.Digest) (io.ReadCloser, error) {
+	const attempts = 8
+
+	delay := 100 * time.Millisecond
+
+	var lastErr error
+
+	for attempt := range attempts {
+		rc, _, err := p.cache.Open(ctx, d)
+		if err == nil {
+			return rc, nil
+		}
+
+		lastErr = err
+
+		if attempt == attempts-1 {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		if delay < time.Second {
+			delay *= 2
+		}
+	}
+
+	return nil, lastErr
+}
+
 func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest) {
 	if p.resolver == nil {
 		return
@@ -1943,7 +1980,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	rc, _, err := p.cache.Open(ctx, manifestDigest)
+	rc, err := p.openManifest(ctx, manifestDigest)
 	if err != nil {
 		p.logger.Debug("prefetch: manifest not in cache",
 			slog.String("digest", manifestDigest.String()),
