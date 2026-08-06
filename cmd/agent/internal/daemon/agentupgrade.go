@@ -72,28 +72,6 @@ func parseAgentUpgradeRequest(parameters map[string]string) (agentUpgradeRequest
 	return request, nil
 }
 
-// upgradeDaemonBinary retains the legacy Unbounded download contract for
-// compatibility tests. Managed MachineOperations use upgradeDaemonBinarySecure.
-func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL string) error {
-	paths, err := goalstates.ResolvedAgentUpgradePaths()
-	if err != nil {
-		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
-	}
-
-	targetPath := paths.NextTargetPath()
-	if err := agentbinary.InstallAndSwitchFromTarGz(ctx, downloadURL, paths, agentUpgradeBinaryMode); err != nil {
-		return err
-	}
-
-	log.Info("staged upgraded daemon binary",
-		"url", downloadURL,
-		"previous", paths.CurrentTargetPath,
-		"current", targetPath,
-	)
-
-	return nil
-}
-
 func upgradeDaemonBinarySecure(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
