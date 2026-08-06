@@ -117,6 +117,38 @@ func TestMutateObjectScopesDaemonSetToSite(t *testing.T) {
 	}
 }
 
+func TestMutateObjectUsesSiteImageRegistry(t *testing.T) {
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec:       unboundedv1alpha3.SiteSpec{ImageRegistry: "registry.corp.internal/unbounded"},
+	}
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata":   map[string]any{"name": daemonSetName},
+		"spec": map[string]any{
+			"selector": map[string]any{"matchLabels": map[string]any{"app.kubernetes.io/name": daemonSetName}},
+			"template": map[string]any{
+				"metadata": map[string]any{"labels": map[string]any{"app.kubernetes.io/name": daemonSetName}},
+				"spec": map[string]any{
+					"containers": []any{map[string]any{"name": "run", "image": "old:run"}},
+				},
+			},
+		},
+	}}
+
+	// Reconcile resolves the image through component.ConfigForSite.
+	cfg := component.ConfigForSite(component.Config{ImageRegistry: "ghcr.io/azure", ImageTag: "v1.2.3"}, site)
+	if err := mutateObject(site, cfg, "storage-hash", obj); err != nil {
+		t.Fatalf("mutateObject returned error: %v", err)
+	}
+
+	containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	if got := containers[0].(map[string]any)["image"]; got != "registry.corp.internal/unbounded/unbounded-storage-supervisor:v1.2.3" {
+		t.Fatalf("image = %q, want site-registry storage supervisor", got)
+	}
+}
+
 func TestDaemonSetPointsAtPerSiteConfig(t *testing.T) {
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
 	obj := &unstructured.Unstructured{Object: map[string]any{

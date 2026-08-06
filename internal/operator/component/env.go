@@ -83,6 +83,20 @@ func (c Config) Image(repository string) string {
 	return strings.TrimRight(c.ImageRegistry, "/") + "/" + repository + ":" + c.ImageTag
 }
 
+// ConfigForSite returns the operator Config a site's node-scoped workloads
+// resolve their images from. When the Site sets spec.imageRegistry it overrides
+// ImageRegistry (keeping the operator's own ImageTag), so a site whose network
+// cannot reach the default registry pulls the operator's component images from a
+// local mirror instead. An empty override leaves the operator-wide Config
+// unchanged.
+func ConfigForSite(base Config, site *unboundedv1alpha3.Site) Config {
+	if site != nil && site.Spec.ImageRegistry != "" {
+		base.ImageRegistry = site.Spec.ImageRegistry
+	}
+
+	return base
+}
+
 // SetPodSpecImages replaces every init and main container image in a workload.
 func SetPodSpecImages(obj *unstructured.Unstructured, image string) error {
 	for _, field := range []string{"initContainers", "containers"} {
@@ -520,5 +534,32 @@ func siteNodeSelectorTerm(key, siteName string) corev1.NodeSelectorTerm {
 			Operator: corev1.NodeSelectorOpIn,
 			Values:   []string{siteName},
 		}},
+	}
+}
+
+// UnsitedNodeAffinity matches only Nodes that carry neither the canonical nor
+// the deprecated site label, i.e. Nodes that do not belong to any Site. The
+// cluster-wide "base" net-node and gantry DaemonSets use it so they run on
+// control-plane and other un-Sited Nodes while the per-Site DaemonSets (which
+// select on the site label via SiteNodeAffinity) cover the Nodes of each Site.
+// Because a Node carries at most one site value, the two selectors partition the
+// cluster: every Node is covered by exactly one DaemonSet.
+//
+// Both keys must be absent (a single term with two DoesNotExist requirements is
+// a logical AND) so a Node labelled with only the deprecated key during the
+// label migration window is still treated as Sited and left to its per-Site
+// DaemonSet rather than double-scheduled by the base.
+func UnsitedNodeAffinity() *corev1.Affinity {
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist},
+						{Key: DeprecatedSiteLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist},
+					},
+				}},
+			},
+		},
 	}
 }

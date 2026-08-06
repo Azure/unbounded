@@ -448,3 +448,221 @@ func TestResourcesExist(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyMutatorScopesBaseToUnsitedNodes(t *testing.T) {
+	base, err := baseDaemonSet()
+	if err != nil {
+		t.Fatalf("baseDaemonSet: %v", err)
+	}
+
+	if err := applyMutator("ghcr.io/azure/gantry:v1", "h")(base); err != nil {
+		t.Fatalf("applyMutator: %v", err)
+	}
+
+	affinity, ok, err := unstructured.NestedMap(base.Object, "spec", "template", "spec", "affinity")
+	if err != nil || !ok {
+		t.Fatalf("base gantry missing affinity: ok=%t err=%v", ok, err)
+	}
+
+	converted := &corev1.Affinity{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(affinity, converted); err != nil {
+		t.Fatalf("convert affinity: %v", err)
+	}
+
+	terms := converted.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) != 1 || len(terms[0].MatchExpressions) != 2 {
+		t.Fatalf("un-Sited affinity = %#v, want one term with two DoesNotExist", terms)
+	}
+
+	for _, expr := range terms[0].MatchExpressions {
+		if expr.Operator != corev1.NodeSelectorOpDoesNotExist {
+			t.Fatalf("expression %q operator = %q, want DoesNotExist", expr.Key, expr.Operator)
+		}
+	}
+}
+
+func TestScopeDaemonSetToSite(t *testing.T) {
+	base, err := baseDaemonSet()
+	if err != nil {
+		t.Fatalf("baseDaemonSet: %v", err)
+	}
+
+	wantInit := containerImage(t, base, "initContainers", "chown-hostpaths")
+
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge", UID: "edge-uid"},
+		Spec:       unboundedv1alpha3.SiteSpec{ImageRegistry: "registry.corp.internal/unbounded"},
+	}
+	cfg := component.ConfigForSite(component.Config{ImageRegistry: "ghcr.io/azure", ImageTag: "v1.2.3"}, site)
+
+	ds := base.DeepCopy()
+	if err := scopeDaemonSetToSite(site, cfg, "gantry-hash", ds); err != nil {
+		t.Fatalf("scopeDaemonSetToSite: %v", err)
+	}
+
+	if got := ds.GetName(); got != "gantry-edge" {
+		t.Fatalf("name = %q, want gantry-edge", got)
+	}
+
+	for _, path := range [][]string{
+		{"spec", "selector", "matchLabels", component.SiteLabelKey},
+		{"spec", "template", "metadata", "labels", component.SiteLabelKey},
+	} {
+		got, ok, err := unstructured.NestedString(ds.Object, path...)
+		if err != nil || !ok || got != "edge" {
+			t.Fatalf("%v = %q (ok=%t err=%v), want edge", path, got, ok, err)
+		}
+	}
+
+	// Only the agent container is repointed at the Site's registry; the busybox
+	// init container keeps its pinned public image.
+	if got := containerImage(t, ds, "containers", agentContainerName); got != "registry.corp.internal/unbounded/gantry:v1.2.3" {
+		t.Fatalf("agent image = %q, want site-registry gantry", got)
+	}
+
+	if got := containerImage(t, ds, "initContainers", "chown-hostpaths"); got != wantInit {
+		t.Fatalf("busybox init image = %q, want unchanged %q", got, wantInit)
+	}
+
+	assertSiteAffinity(t, ds)
+	assertSiteOwnerRef(t, ds.GetOwnerReferences(), "edge", "edge-uid")
+
+	volumes, _, _ := unstructured.NestedSlice(ds.Object, "spec", "template", "spec", "volumes")
+	if name := configVolumeName(t, volumes); name != "gantry-config-edge" {
+		t.Fatalf("config volume = %q, want gantry-config-edge", name)
+	}
+
+	annotations, _, _ := unstructured.NestedStringMap(ds.Object, "spec", "template", "metadata", "annotations")
+	if annotations[configHashAnnotation] != "gantry-hash" {
+		t.Fatalf("config hash annotation = %q", annotations[configHashAnnotation])
+	}
+}
+
+func TestEnsureSiteConfigSeedsFromSharedConfig(t *testing.T) {
+	shared := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: configName, Namespace: component.DefaultNamespace},
+		Data:       map[string]string{"config.yaml": "upstream_registries:\n  - name: mirror\n"},
+	}
+	env := testEnv(t, shared)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge", UID: "edge-uid"}}
+
+	hash, err := ensureSiteConfig(t.Context(), env, site)
+	if err != nil {
+		t.Fatalf("ensureSiteConfig: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: SiteConfigName("edge")}, &got); err != nil {
+		t.Fatalf("get per-site config: %v", err)
+	}
+
+	if got.Data["config.yaml"] != "upstream_registries:\n  - name: mirror\n" {
+		t.Fatalf("per-site config not seeded from shared config: %#v", got.Data)
+	}
+
+	if hash != component.ConfigMapPayloadHash(&got) {
+		t.Fatalf("hash = %q, want exact payload hash", hash)
+	}
+
+	assertSiteOwnerRef(t, got.OwnerReferences, "edge", "edge-uid")
+}
+
+func TestReconcileFansOutPerSiteAndCleansUpOptedOut(t *testing.T) {
+	no := false
+	// A per-Site DaemonSet and config left over for a site that now opts out.
+	staleDS := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: SiteDaemonSetName("legacy")}}
+	staleConfig := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: SiteConfigName("legacy")}}
+
+	env, applied := reconcilerEnv(t, staleDS, staleConfig)
+
+	sites := []unboundedv1alpha3.Site{
+		*siteWithGantry("edge", nil),   // enabled (default)
+		*siteWithGantry("legacy", &no), // opted out
+	}
+
+	res := Component{}.Reconcile(t.Context(), env, sites)
+	if !res.Ready || res.Err != nil {
+		t.Fatalf("Reconcile = %+v, want ready", res)
+	}
+
+	// Base plus the enabled Site's DaemonSet are applied.
+	if !applied["DaemonSet/gantry"] || !applied["DaemonSet/gantry-edge"] {
+		t.Fatalf("expected base and per-site DaemonSets applied; applied=%#v", applied)
+	}
+
+	// The opted-out Site gets no per-site DaemonSet applied and its stale one is
+	// removed.
+	if applied["DaemonSet/gantry-legacy"] {
+		t.Fatal("opted-out site had a per-site DaemonSet applied")
+	}
+
+	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(staleDS), &appsv1.DaemonSet{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("opted-out per-site DaemonSet not cleaned up: %v", err)
+	}
+
+	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(staleConfig), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("opted-out per-site config not cleaned up: %v", err)
+	}
+
+	// The enabled Site's config is created.
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: SiteConfigName("edge")}, &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("enabled site config not created: %v", err)
+	}
+}
+
+func assertSiteAffinity(t *testing.T, obj *unstructured.Unstructured) {
+	t.Helper()
+
+	affinity, ok, err := unstructured.NestedMap(obj.Object, "spec", "template", "spec", "affinity")
+	if err != nil || !ok {
+		t.Fatalf("missing site affinity: ok=%t err=%v", ok, err)
+	}
+
+	converted := &corev1.Affinity{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(affinity, converted); err != nil {
+		t.Fatalf("convert affinity: %v", err)
+	}
+
+	terms := converted.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) != 2 {
+		t.Fatalf("site affinity terms = %d, want 2", len(terms))
+	}
+}
+
+func assertSiteOwnerRef(t *testing.T, refs []metav1.OwnerReference, siteName, uid string) {
+	t.Helper()
+
+	if len(refs) != 1 {
+		t.Fatalf("ownerReferences len = %d, want 1: %#v", len(refs), refs)
+	}
+
+	ref := refs[0]
+	if ref.Kind != "Site" || ref.Name != siteName || string(ref.UID) != uid {
+		t.Fatalf("unexpected ownerRef: %#v", ref)
+	}
+
+	if ref.Controller == nil || !*ref.Controller {
+		t.Fatalf("ownerRef is not a controller reference: %#v", ref)
+	}
+}
+
+func configVolumeName(t *testing.T, volumes []any) string {
+	t.Helper()
+
+	for _, v := range volumes {
+		vol, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if cm, ok := vol["configMap"].(map[string]any); ok && vol["name"] == "config" {
+			name, _ := cm["name"].(string)
+
+			return name
+		}
+	}
+
+	t.Fatal("config volume not found")
+
+	return ""
+}

@@ -154,6 +154,28 @@ func TestDeployment(t *testing.T) {
 	}
 }
 
+func TestDeploymentUsesSiteImageRegistry(t *testing.T) {
+	enabled := true
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec: unboundedv1alpha3.SiteSpec{
+			ImageRegistry: "registry.corp.internal/unbounded",
+			Components: unboundedv1alpha3.SiteComponents{Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled},
+			}},
+		},
+	}
+
+	// Reconcile resolves the image through component.ConfigForSite, so a Site
+	// with an imageRegistry override pulls metalman from that registry.
+	cfg := component.ConfigForSite(component.Config{ImageRegistry: "ghcr.io/azure", ImageTag: "v1.2.3"}, site)
+
+	d := deployment(site, component.DefaultNamespace, cfg)
+	if got := d.Spec.Template.Spec.Containers[0].Image; got != "registry.corp.internal/unbounded/metalman:v1.2.3" {
+		t.Fatalf("image = %q, want site-registry metalman", got)
+	}
+}
+
 func TestDeploymentRespectsNamespaceAndDefaults(t *testing.T) {
 	enabled := true
 	site := &unboundedv1alpha3.Site{

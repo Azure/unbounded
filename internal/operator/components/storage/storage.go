@@ -67,7 +67,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboun
 	}
 
 	if err := env.ApplyManifestFS(ctx, storagemanifests.Manifests, func(obj *unstructured.Unstructured) error {
-		return mutateObject(site, env.Config, configHash, obj)
+		return mutateObject(site, component.ConfigForSite(env.Config, site), configHash, obj)
 	}); err != nil {
 		return component.Failed(err)
 	}

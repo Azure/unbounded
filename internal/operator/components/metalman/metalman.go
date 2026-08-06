@@ -46,7 +46,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboun
 		return component.Failed(err)
 	}
 
-	if err := env.ApplyObject(ctx, deployment(site, env.Namespace, env.Config)); err != nil {
+	if err := env.ApplyObject(ctx, deployment(site, env.Namespace, component.ConfigForSite(env.Config, site))); err != nil {
 		return component.Failed(err)
 	}
 

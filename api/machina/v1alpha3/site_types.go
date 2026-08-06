@@ -101,6 +101,25 @@ type SiteSpec struct {
 	// +optional
 	TunnelMTU *int32 `json:"tunnelMTU,omitempty"`
 
+	// ImageRegistry overrides the container image repository prefix for the
+	// operator-managed component workloads that run on this site's nodes
+	// (unbounded-net-node, gantry, metalman, and the unbounded-storage
+	// supervisor). It is a full repository prefix (registry host plus any
+	// org/namespace path); the operator appends the component's repository name
+	// and its own image tag, so imageRegistry=registry.corp.internal/unbounded
+	// yields registry.corp.internal/unbounded/unbounded-net-node:<tag>, matching
+	// the semantics of the operator-wide UNBOUNDED_IMAGE_REGISTRY setting.
+	//
+	// When empty the operator-wide registry is used. It is intended for sites
+	// whose networking cannot reach the default registry and must pull from a
+	// local mirror; the referenced registry must already host copies of the
+	// operator's component images at the operator's version. Pulls are anonymous
+	// (per-site pull credentials are not yet supported). Control-plane and other
+	// nodes that do not belong to any site are unaffected and keep pulling from
+	// the operator-wide registry.
+	// +optional
+	ImageRegistry string `json:"imageRegistry,omitempty"`
+
 	// Components declares optional Unbounded components managed for this site.
 	// +optional
 	Components SiteComponents `json:"components,omitempty"`

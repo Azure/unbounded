@@ -49,6 +49,65 @@ func TestConfigImage(t *testing.T) {
 	}
 }
 
+func TestConfigForSite(t *testing.T) {
+	base := Config{ImageRegistry: "ghcr.io/azure", ImageTag: "v1"}
+
+	override := ConfigForSite(base, &unboundedv1alpha3.Site{
+		Spec: unboundedv1alpha3.SiteSpec{ImageRegistry: "registry.corp.internal/unbounded"},
+	})
+	if override.ImageRegistry != "registry.corp.internal/unbounded" || override.ImageTag != "v1" {
+		t.Fatalf("override config = %#v", override)
+	}
+
+	if got := override.Image("gantry"); got != "registry.corp.internal/unbounded/gantry:v1" {
+		t.Fatalf("overridden image = %q", got)
+	}
+
+	if got := ConfigForSite(base, &unboundedv1alpha3.Site{}); got.ImageRegistry != "ghcr.io/azure" {
+		t.Fatalf("empty override changed registry: %#v", got)
+	}
+
+	if got := ConfigForSite(base, nil); got.ImageRegistry != "ghcr.io/azure" {
+		t.Fatalf("nil site changed registry: %#v", got)
+	}
+
+	if base.ImageRegistry != "ghcr.io/azure" {
+		t.Fatalf("base config was mutated: %#v", base)
+	}
+}
+
+func TestUnsitedNodeAffinity(t *testing.T) {
+	terms := UnsitedNodeAffinity().NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) != 1 {
+		t.Fatalf("node selector terms = %d, want 1 (AND of two DoesNotExist)", len(terms))
+	}
+
+	exprs := terms[0].MatchExpressions
+	if len(exprs) != 2 {
+		t.Fatalf("match expressions = %d, want 2", len(exprs))
+	}
+
+	want := map[string]bool{SiteLabelKey: false, DeprecatedSiteLabelKey: false}
+
+	for _, expr := range exprs {
+		if expr.Operator != corev1.NodeSelectorOpDoesNotExist || len(expr.Values) != 0 {
+			t.Fatalf("unexpected expression: %#v", expr)
+		}
+
+		if _, ok := want[expr.Key]; !ok {
+			t.Fatalf("unexpected key %q", expr.Key)
+		}
+
+		want[expr.Key] = true
+	}
+
+	for key, seen := range want {
+		if !seen {
+			t.Fatalf("un-Sited affinity missing key %q", key)
+		}
+	}
+}
+
 func TestSetPodSpecImages(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{

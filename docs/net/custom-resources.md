@@ -58,6 +58,7 @@ status:
 | `spec.healthCheckSettings` | `HealthCheckSettings` | No | Health check settings for node-to-node routes within this site. |
 | `spec.tunnelProtocol` | `string` | No | Tunnel encapsulation: `WireGuard`, `IPIP`, `GENEVE`, `VXLAN`, `None`, or `Auto` (default). When `Auto`, links using external IPs use WireGuard and links using only internal IPs use GENEVE. |
 | `spec.tunnelMTU` | `*int32` | No | Tunnel MTU for routes in this scope (576-9000). |
+| `spec.imageRegistry` | `string` | No | Overrides the container image registry prefix for operator-managed workloads on this site's nodes. See below. |
 | `status.nodeCount` | `int` | - | Read-only. Number of nodes assigned to this site. |
 | `status.sliceCount` | `int` | - | Read-only. Number of SiteNodeSlice objects. |
 
@@ -114,6 +115,57 @@ spec:
         - 10.244.0.0/16
       assignmentEnabled: false
 ```
+
+### Per-Site Image Registry
+
+Some sites have networking that cannot reach the default container registry the
+operator pulls its component images from. `spec.imageRegistry` lets such a site
+pull the operator-managed workloads that run on its nodes from a registry its
+network can reach.
+
+It is a full image repository prefix (registry host plus any org/namespace path),
+identical in meaning to the operator-wide `UNBOUNDED_IMAGE_REGISTRY` setting: the
+operator appends the component's repository name and its own image tag. With
+`spec.imageRegistry: registry.corp.internal/unbounded`, the site's
+`unbounded-net-node` resolves to
+`registry.corp.internal/unbounded/unbounded-net-node:<operator-version>`. When
+empty, the operator-wide registry is used.
+
+The override applies to the four operator-managed workloads that run on a site's
+nodes: `unbounded-net-node`, `gantry`, `metalman`, and the
+`unbounded-storage-supervisor`. The control-plane components (the net controller
+and machina) are unaffected. Each of these workloads runs as a per-site
+DaemonSet/Deployment (`<component>-<site>`) scheduled onto the site's nodes via
+the `unbounded-cloud.io/site` label, with its own per-site config ConfigMap
+(`<config>-<site>`) seeded from the shared default so existing tuning carries
+over. Nodes that do not belong to any site (for example control-plane nodes) keep
+running the cluster-wide "base" workloads from the operator-wide registry.
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+  name: isolated-rack
+spec:
+  nodeCidrs:
+    - 10.20.0.0/16
+  imageRegistry: registry.corp.internal/unbounded
+```
+
+**Caveats:**
+
+- The referenced registry must already host copies of the operator's component
+  images at the operator's version; the operator only repoints image references,
+  it does not mirror images.
+- Pulls are anonymous. Registries that require credentials (per-site image pull
+  secrets) are not yet supported.
+- `unbounded-net-node` uses `imagePullPolicy: Always`, so the site registry must
+  be reachable on every node (re)start.
+- The `gantry` pod's busybox init container is a third-party image
+  (`mcr.microsoft.com/...`) and is not repointed by this override.
+- The first time an override is set on a site, each of the site's nodes hands the
+  affected workload off from the base to the per-site copy, causing a brief
+  restart on those nodes.
 
 ### NonMasqueradeCIDRs Behavior
 

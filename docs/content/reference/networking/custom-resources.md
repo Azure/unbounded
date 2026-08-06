@@ -52,6 +52,7 @@ spec:
 | `spec.healthCheckSettings` | `HealthCheckSettings` | No | Health check settings for node-to-node routes within this site. |
 | `spec.tunnelProtocol` | `string` | No | `WireGuard`, `IPIP`, `GENEVE`, `VXLAN`, `None`, or `Auto` (default). |
 | `spec.tunnelMTU` | `*int32` | No | Tunnel MTU for routes in this scope (576-9000). |
+| `spec.imageRegistry` | `string` | No | Full image repository prefix (host plus org/path) for operator-managed workloads on this site's nodes (`unbounded-net-node`, `gantry`, `metalman`, `unbounded-storage-supervisor`). Empty uses the operator-wide registry. Pulls are anonymous; the registry must already host the images at the operator's version. |
 
 ### PodCidrAssignment Fields
 
