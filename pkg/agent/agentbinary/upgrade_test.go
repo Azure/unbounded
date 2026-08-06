@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -104,6 +105,12 @@ func TestSecureInstallAndSwitchRejectsInvalidInputs(t *testing.T) {
 			ExpectedSHA256:  strings.Repeat("a", 64),
 			ExpectedMember:  "custom-agent",
 			MaxArchiveBytes: -1,
+		},
+		"archive size overflow": {
+			DownloadURL:     "https://example.com/agent.tar.gz",
+			ExpectedSHA256:  strings.Repeat("a", 64),
+			ExpectedMember:  "custom-agent",
+			MaxArchiveBytes: math.MaxInt64,
 		},
 	}
 	for name, opts := range tests {
@@ -257,7 +264,8 @@ func TestSecureInstallAndSwitchRejectsUnsafeAndDuplicateMembers(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string][]secureTarMember{
-		"unsafe": {{name: "../custom-agent", body: []byte("binary")}},
+		"unsafe":        {{name: "../custom-agent", body: []byte("binary")}},
+		"path prefixed": {{name: "./custom-agent", body: []byte("binary")}},
 		"duplicate": {
 			{name: "custom-agent", body: []byte("#!/bin/sh\nexit 0\n")},
 			{name: "custom-agent", body: []byte("#!/bin/sh\nexit 0\n")},

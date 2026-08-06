@@ -56,34 +56,70 @@ type SwitchResult struct {
 	CurrentPath  string
 }
 
+type normalizedSecureInstallOptions struct {
+	options        SecureInstallOptions
+	parsedURL      *url.URL
+	expectedDigest [sha256.Size]byte
+}
+
 // ValidateSecureInstallOptions validates caller-provided secure install inputs.
 func ValidateSecureInstallOptions(opts SecureInstallOptions) error {
-	if _, err := validateSecureDownloadURL(opts.DownloadURL); err != nil {
-		return err
+	_, err := normalizeSecureInstallOptions(opts)
+
+	return err
+}
+
+func normalizeSecureInstallOptions(opts SecureInstallOptions) (normalizedSecureInstallOptions, error) {
+	parsedURL, err := validateSecureDownloadURL(opts.DownloadURL)
+	if err != nil {
+		return normalizedSecureInstallOptions{}, err
 	}
 
-	if _, err := parseSHA256(opts.ExpectedSHA256); err != nil {
-		return err
+	expectedDigest, err := parseSHA256(opts.ExpectedSHA256)
+	if err != nil {
+		return normalizedSecureInstallOptions{}, err
 	}
 
-	expectedMember := strings.TrimSpace(opts.ExpectedMember)
-	if expectedMember == "" || filepath.Base(expectedMember) != expectedMember {
-		return fmt.Errorf("expected archive member must be a base name")
+	opts.ExpectedMember = strings.TrimSpace(opts.ExpectedMember)
+	if opts.ExpectedMember == "" || filepath.Base(opts.ExpectedMember) != opts.ExpectedMember {
+		return normalizedSecureInstallOptions{}, fmt.Errorf("expected archive member must be an exact base name without a path prefix")
 	}
 
 	if opts.Mode != 0 && opts.Mode.Perm() != opts.Mode {
-		return fmt.Errorf("agent binary mode must contain permission bits only")
+		return normalizedSecureInstallOptions{}, fmt.Errorf("agent binary mode must contain permission bits only")
 	}
 
 	if opts.MaxArchiveBytes < 0 || opts.MaxExtractedBytes < 0 {
-		return fmt.Errorf("agent archive size limits must not be negative")
+		return normalizedSecureInstallOptions{}, fmt.Errorf("agent archive size limits must not be negative")
+	}
+
+	if opts.MaxArchiveBytes > math.MaxInt64-1 {
+		return normalizedSecureInstallOptions{}, fmt.Errorf("maximum archive size is too large")
 	}
 
 	if opts.MaxExtractedBytes > math.MaxInt64/2 {
-		return fmt.Errorf("maximum extracted size is too large")
+		return normalizedSecureInstallOptions{}, fmt.Errorf("maximum extracted size is too large")
 	}
 
-	return nil
+	if opts.Mode == 0 {
+		opts.Mode = daemonBinaryMode
+	}
+
+	if opts.MaxArchiveBytes == 0 {
+		opts.MaxArchiveBytes = defaultMaxArchiveBytes
+	}
+
+	if opts.MaxExtractedBytes == 0 {
+		opts.MaxExtractedBytes = defaultMaxBinaryBytes
+	}
+
+	opts.HTTPClient = secureHTTPClient(opts.HTTPClient)
+
+	return normalizedSecureInstallOptions{
+		options:        opts,
+		parsedURL:      parsedURL,
+		expectedDigest: expectedDigest,
+	}, nil
 }
 
 // ValidateLayout verifies that all binary paths are clean, absolute, and distinct.
@@ -114,7 +150,8 @@ func ValidateLayout(paths Layout) error {
 
 // SecureInstallAndSwitch downloads and verifies an HTTPS release archive,
 // installs its only member into the inactive slot, and atomically updates the
-// last-good and current links.
+// last-good and current links. The archive member must exactly equal the
+// configured base name; path prefixes such as "./" are intentionally rejected.
 func SecureInstallAndSwitch(
 	ctx context.Context,
 	log *slog.Logger,
@@ -129,35 +166,14 @@ func SecureInstallAndSwitch(
 		return SwitchResult{}, err
 	}
 
-	if err := ValidateSecureInstallOptions(opts); err != nil {
-		return SwitchResult{}, err
-	}
-
-	parsedURL, err := validateSecureDownloadURL(opts.DownloadURL)
+	normalized, err := normalizeSecureInstallOptions(opts)
 	if err != nil {
 		return SwitchResult{}, err
 	}
 
-	expectedDigest, err := parseSHA256(opts.ExpectedSHA256)
-	if err != nil {
-		return SwitchResult{}, err
-	}
-
-	opts.ExpectedMember = strings.TrimSpace(opts.ExpectedMember)
-
-	if opts.Mode == 0 {
-		opts.Mode = daemonBinaryMode
-	}
-
-	if opts.MaxArchiveBytes <= 0 {
-		opts.MaxArchiveBytes = defaultMaxArchiveBytes
-	}
-
-	if opts.MaxExtractedBytes <= 0 {
-		opts.MaxExtractedBytes = defaultMaxBinaryBytes
-	}
-
-	opts.HTTPClient = secureHTTPClient(opts.HTTPClient)
+	opts = normalized.options
+	parsedURL := normalized.parsedURL
+	expectedDigest := normalized.expectedDigest
 
 	previousPath, err := executablePath(paths.CurrentPath)
 	if err != nil {
@@ -218,7 +234,7 @@ func validateSecureDownloadURL(rawURL string) (*url.URL, error) {
 	}
 
 	if parsedURL.Scheme != "https" || parsedURL.Host == "" || parsedURL.User != nil || parsedURL.Fragment != "" {
-		return nil, fmt.Errorf("download URL must be an HTTPS URL without user information")
+		return nil, fmt.Errorf("download URL must use HTTPS, include a host, omit user information, and omit fragments")
 	}
 
 	return parsedURL, nil
