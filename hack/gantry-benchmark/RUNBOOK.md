@@ -91,9 +91,9 @@ The graphroot must be `/opt/gantry-benchmark/containers`.
 
 Before provisioning the operator VM or starting the lifecycle on AKS, apply
 the benchmark containerd configuration and require it to be Ready on every
-target node. This enables debug unpack logs, sets the no-progress timeout to
-15 minutes, and raises transfer-service layer downloads to six. The DaemonSet
-performs one detached containerd restart per configuration hash.
+target node. This enables debug unpack logs and sets the no-progress timeout
+to 15 minutes. The DaemonSet performs one detached containerd restart per
+configuration hash.
 
 ```bash
 kubectl create namespace gantry-system --dry-run=client -o yaml | kubectl apply -f -
