@@ -76,6 +76,15 @@ func TestConfigureLocalDNS(t *testing.T) {
 			t.Errorf("expected %s: %v", path, err)
 		}
 	}
+
+	slice, err := os.ReadFile(filepath.Join(machineDir, "etc/systemd/system/localdns.slice"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(slice), "CPUQuota=200%") {
+		t.Fatalf("localdns.slice missing percentage CPU quota:\n%s", slice)
+	}
 }
 
 func TestLocalDNSResolvConfRemovesAllNameservers(t *testing.T) {
