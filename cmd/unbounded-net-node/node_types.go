@@ -27,6 +27,8 @@ type wireGuardState struct {
 	nodeExternalIPs  []string // This node's external IPs (cached from node object)
 	siteName         string   // Site name this node belongs to
 	manageCniPlugin  bool     // Whether this node's site manages CNI plugin and full podCIDR mesh routes
+	cniMTU           int      // Last MTU written to the managed CNI configuration
+	cniConfigWritten bool     // Whether this process has written the managed CNI configuration
 	mu               sync.Mutex
 
 	// Kubernetes client for tainting nodes
@@ -100,7 +102,7 @@ type wireGuardState struct {
 	// Masquerade manager for iptables rules
 	masqueradeManager *unboundednetnetlink.MasqueradeManager
 
-	// MSS clamp manager for TCP MSS clamping on WireGuard interfaces
+	// MSS clamp manager for TCP MSS clamping across the unbounded fabric
 	mssClampManager *unboundednetnetlink.MSSClampManager
 
 	// Forward manager for tunnel-to-tunnel iptables FORWARD rules
@@ -189,6 +191,7 @@ type gatewayPeerInfo struct {
 	PodCIDRs               []string // Gateway node's podCIDRs for specific routing
 	SkipPodCIDRRoutes      bool     // Keep tunnel reachability host routes but skip explicit PodCIDR routes
 	TunnelProtocol         string   // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
+	TunnelMTU              int      // Effective MTU after route, encapsulation, and CRD limits
 }
 
 // meshPeerInfo contains information about a peer on the main mesh interface.
@@ -204,6 +207,7 @@ type meshPeerInfo struct {
 	PodCIDRs               []string
 	SkipPodCIDRRoutes      bool   // Keep tunnel reachability host routes but skip explicit PodCIDR routes
 	TunnelProtocol         string // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
+	TunnelMTU              int    // Effective MTU after route, encapsulation, and CRD limits
 }
 
 // Status types for /status and /status/json endpoints

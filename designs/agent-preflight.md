@@ -401,10 +401,14 @@ Host phase checks:
 | `host-os-configuration` | Validate host OS configuration can be applied: sysctl config path writable, relevant kernel parameters acceptable or settable, and systemd unit paths writable. |
 | `nspawn-runtime` | Validate the host systemd environment can manage nspawn machines using installed host capabilities. Missing tools are warnings when bootstrap can install them. They should become errors in offline mode. |
 | `docker-active` | Warn if Docker is active and bootstrap will disable or avoid it. |
+| `containerd-active` | Warn if the host containerd service is active and bootstrap will disable it. |
+| `kubelet-active` | Warn if the host kubelet service is active and bootstrap will disable it. |
 | `swap-active` | Warn when swap is enabled if bootstrap will disable it. |
 | `disk-space` | Validate enough space exists for rootfs and component downloads. |
 | `cgroups` | Validate cgroup support expected by kubelet/containerd. |
 | `api-server-reachable` | Validate the configured Kubernetes API server is reachable from the host. |
+| `kubelet-bind-address` | Validate no TCP listener occupies kubelet's `0.0.0.0:10250` port in the shared host network namespace. |
+| `containerd-metrics-bind-address` | Validate no TCP listener occupies containerd's configured metrics port in the shared host network namespace. |
 | `cluster-credentials` | Validate the cluster CA data and configured bootstrap credential are present and parseable for kubelet registration. |
 
 Rootfs provisioning checks:

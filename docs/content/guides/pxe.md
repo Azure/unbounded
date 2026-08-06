@@ -35,10 +35,11 @@ setting the metalman entry in `Site.spec.components`:
 kubectl unbounded site init --name my-edge-site --enable-metalman
 ```
 
-`kubectl unbounded site init` also runs `install` by default, so a fresh site only
-needs the single command above. The operator then reconciles the `unbounded-system`
-namespace, ServiceAccounts (`metalman-controller`, `metalman-bootstrap`), RBAC roles,
-and a metalman Deployment for the Site.
+`kubectl unbounded site init` requires the operator to be installed first (the
+`kubectl unbounded install` step above), and errors otherwise. The operator then
+reconciles the `unbounded-system` namespace, ServiceAccounts
+(`metalman-controller`, `metalman-bootstrap`), RBAC roles, and a metalman
+Deployment for the Site.
 
 Key `serve-pxe` flags (baked into the operator-managed per-site Deployment; `--site`
 scoping is inherent to the per-site component):

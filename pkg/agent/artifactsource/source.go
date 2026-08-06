@@ -8,8 +8,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/pkg/agent/internal/ociartifact"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
@@ -29,9 +34,64 @@ const (
 	sourceOCI
 )
 
-var httpClient = &http.Client{
-	Timeout:       10 * time.Minute,
-	CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
+const (
+	httpDownloadMaxAttempts = 5
+	httpDownloadRetryDelay  = 2 * time.Second
+)
+
+var (
+	httpClient = newHTTPClient(&retry.Transport{
+		Policy: newHTTPDownloadRetryPolicy,
+	})
+	httpClientWithoutRetry = newHTTPClient(nil)
+)
+
+func newHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Timeout:       10 * time.Minute,
+		CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
+		Transport:     transport,
+	}
+}
+
+func newHTTPDownloadRetryPolicy() retry.Policy {
+	return &retry.GenericPolicy{
+		Retryable: retryHTTPDownloadFailure,
+		Backoff:   httpDownloadBackoff,
+		MinWait:   httpDownloadRetryDelay,
+		MaxWait:   maxHTTPDownloadRetryDelay(),
+		MaxRetry:  httpDownloadMaxAttempts - 1,
+	}
+}
+
+func retryHTTPDownloadFailure(resp *http.Response, err error) (bool, error) {
+	if ociutil.RetryableNetworkError(err) {
+		return true, nil
+	}
+
+	if resp == nil {
+		return false, nil
+	}
+
+	return retry.DefaultPredicate(resp, err)
+}
+
+func httpDownloadBackoff(attempt int, _ *http.Response) time.Duration {
+	delay := httpDownloadRetryDelay
+	for range attempt {
+		delay *= 2
+	}
+
+	return delay
+}
+
+func maxHTTPDownloadRetryDelay() time.Duration {
+	delay := httpDownloadRetryDelay
+	for range httpDownloadMaxAttempts - 2 {
+		delay *= 2
+	}
+
+	return delay
 }
 
 // Source is a parsed, openable artifact source. It can reference an absolute
@@ -128,7 +188,7 @@ func openHTTP(ctx context.Context, source string) (io.ReadCloser, error) {
 }
 
 func openHTTPWithClient(ctx context.Context, client *http.Client, source string) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", utilio.RedactHTTPError(err))
 	}
@@ -140,23 +200,37 @@ func openHTTPWithClient(ctx context.Context, client *http.Client, source string)
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", utilio.RedactURLQuery(source), resp.StatusCode)
+		return nil, &httpDownloadStatusError{source: source, statusCode: resp.StatusCode}
 	}
 
 	return resp.Body, nil
 }
 
+type httpDownloadStatusError struct {
+	source     string
+	statusCode int
+}
+
+func (e *httpDownloadStatusError) Error() string {
+	return fmt.Sprintf("download %q failed with status code %d", utilio.RedactURLQuery(e.source), e.statusCode)
+}
+
 // ReadAll reads the complete artifact source.
 func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
-	body, err := s.Open(ctx)
+	var data []byte
+
+	err := s.readWithRetry(ctx, func(body io.Reader) error {
+		var err error
+
+		data, err = io.ReadAll(body)
+		if err != nil {
+			return fmt.Errorf("read artifact source: %w", err)
+		}
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	defer body.Close() //nolint:errcheck // best effort close
-
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return nil, fmt.Errorf("read artifact source: %w", err)
 	}
 
 	return data, nil
@@ -164,52 +238,133 @@ func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
 
 // DownloadToLocalFile downloads the artifact source to filename and sets perm.
 func (s Source) DownloadToLocalFile(ctx context.Context, filename string, perm os.FileMode) error {
-	body, err := s.Open(ctx)
-	if err != nil {
-		return err
-	}
-	defer body.Close() //nolint:errcheck // body close
+	return s.downloadToLocalFile(ctx, filename, perm, waitForHTTPDownloadRetry)
+}
 
-	return utilio.InstallFile(filename, body, perm)
+func (s Source) downloadToLocalFile(ctx context.Context, filename string, perm os.FileMode, wait func(context.Context, time.Duration) error) error {
+	return s.readWithRetryAndWait(ctx, func(body io.Reader) error {
+		return utilio.InstallFile(filename, body, perm)
+	}, wait)
 }
 
 // DownloadWithSHA256Verification downloads the artifact source to filename and
 // verifies the downloaded content against expectedHash.
 func (s Source) DownloadWithSHA256Verification(ctx context.Context, expectedHash, filename string, perm os.FileMode) error {
-	body, err := s.Open(ctx)
-	if err != nil {
-		return err
-	}
-	defer body.Close() //nolint:errcheck // body close
+	return s.readWithRetry(ctx, func(body io.Reader) error {
+		hasher := sha256.New()
+		teeReader := io.TeeReader(body, hasher)
 
-	hasher := sha256.New()
-	teeReader := io.TeeReader(body, hasher)
+		if err := utilio.InstallFile(filename, teeReader, perm); err != nil {
+			return err
+		}
 
-	if err := utilio.InstallFile(filename, teeReader, perm); err != nil {
-		return err
-	}
+		actualHash := hex.EncodeToString(hasher.Sum(nil))
+		if actualHash != expectedHash {
+			_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
+			return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", utilio.RedactURLQuery(s.raw), expectedHash, actualHash)
+		}
 
-	actualHash := hex.EncodeToString(hasher.Sum(nil))
-	if actualHash != expectedHash {
-		_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
-		return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", utilio.RedactURLQuery(s.raw), expectedHash, actualHash)
+		return nil
+	})
+}
+
+func (s Source) readWithRetry(ctx context.Context, read func(io.Reader) error) error {
+	return s.readWithRetryAndWait(ctx, read, waitForHTTPDownloadRetry)
+}
+
+func (s Source) readWithRetryAndWait(ctx context.Context, read func(io.Reader) error, wait func(context.Context, time.Duration) error) error {
+	delay := httpDownloadRetryDelay
+
+	for attempt := 1; attempt <= httpDownloadMaxAttempts; attempt++ {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+
+		body, err := s.openForRead(ctx)
+		if err == nil {
+			err = read(body)
+			_ = body.Close() //nolint:errcheck // best effort close before retrying
+		}
+
+		if err == nil {
+			return nil
+		}
+
+		if s.kind != sourceHTTP || !retryableHTTPDownloadError(ctx, err) || attempt == httpDownloadMaxAttempts {
+			return err
+		}
+
+		if err := wait(ctx, delay); err != nil {
+			return err
+		}
+
+		delay *= 2
 	}
 
 	return nil
 }
 
+func (s Source) openForRead(ctx context.Context) (io.ReadCloser, error) {
+	if s.kind == sourceHTTP {
+		return openHTTPWithClient(ctx, httpClientWithoutRetry, s.raw)
+	}
+
+	return s.Open(ctx)
+}
+
+func retryableHTTPDownloadError(ctx context.Context, err error) bool {
+	if context.Cause(ctx) != nil {
+		return false
+	}
+
+	if ociutil.RetryableNetworkError(err) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	var statusErr *httpDownloadStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+
+	retryable, predicateErr := retry.DefaultPredicate(&http.Response{StatusCode: statusErr.statusCode}, nil)
+
+	return predicateErr == nil && retryable
+}
+
+func waitForHTTPDownloadRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
 // ReadExpectedSHA256 reads a sha256sum-format checksum source and returns the
 // expected hex-encoded SHA256 hash.
 func ReadExpectedSHA256(ctx context.Context, checksumSource Source) (string, error) {
-	body, err := checksumSource.Open(ctx)
+	var raw []byte
+
+	err := checksumSource.readWithRetry(ctx, func(body io.Reader) error {
+		var err error
+
+		raw, err = io.ReadAll(io.LimitReader(body, 1024))
+		if err != nil {
+			return fmt.Errorf("read checksum body: %w", err)
+		}
+
+		return nil
+	})
 	if err != nil {
 		return "", err
-	}
-	defer body.Close() //nolint:errcheck // body close
-
-	raw, err := io.ReadAll(io.LimitReader(body, 1024))
-	if err != nil {
-		return "", fmt.Errorf("read checksum body: %w", err)
 	}
 
 	hashStr := strings.TrimSpace(string(raw))

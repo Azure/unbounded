@@ -76,6 +76,7 @@ type Client struct {
 type metricsHooks struct {
 	onPullStart   func(kind string)        // before request
 	onPullFailure func(kind, class string) // any non-success terminal status
+	onBytesRead   func(kind string, bytes int64)
 }
 
 // Option configures a Client.
@@ -101,6 +102,16 @@ func WithMetrics(start func(kind string), failure func(kind, class string)) Opti
 	return func(c *Client) {
 		c.metrics.onPullStart = start
 		c.metrics.onPullFailure = failure
+	}
+}
+
+// WithByteMetrics registers a callback for bytes actually read from upstream
+// response bodies. It includes partial failed transfers and retries, and does
+// not count HEAD requests. The callback fires once when the body reaches a
+// terminal read result or is closed.
+func WithByteMetrics(onBytesRead func(kind string, bytes int64)) Option {
+	return func(c *Client) {
+		c.metrics.onBytesRead = onBytesRead
 	}
 }
 
@@ -178,7 +189,49 @@ func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser,
 		return nil, 0, err
 	}
 
+	if c.metrics.onBytesRead != nil {
+		rc = &countingReadCloser{
+			ReadCloser: rc,
+			onFinish: func(bytes int64) {
+				c.metrics.onBytesRead(kind, bytes)
+			},
+		}
+	}
+
 	return rc, size, nil
+}
+
+type countingReadCloser struct {
+	io.ReadCloser
+	onFinish func(bytes int64)
+	bytes    int64
+	once     sync.Once
+}
+
+func (r *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytes += int64(n)
+
+	if err != nil {
+		r.finish()
+	}
+
+	return n, err
+}
+
+func (r *countingReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.finish()
+
+	return err
+}
+
+func (r *countingReadCloser) finish() {
+	r.once.Do(func() {
+		if r.onFinish != nil && r.bytes > 0 {
+			r.onFinish(r.bytes)
+		}
+	})
 }
 
 func (c *Client) recordFailure(kind string, err error) {

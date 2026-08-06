@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -110,6 +111,62 @@ func TestServeFromCache(t *testing.T) {
 
 	if *served != 1 {
 		t.Errorf("served count = %d, want 1", *served)
+	}
+}
+
+func TestPeerServeByteMetrics(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	d := mustDigest(body)
+	cache := fakes.NewCache()
+	cache.Put(d, body)
+
+	type observation struct {
+		kind  string
+		bytes int64
+	}
+
+	var observations []observation
+
+	s := New(cache, WithByteMetrics(func(kind string, bytes int64) {
+		observations = append(observations, observation{kind: kind, bytes: bytes})
+	}))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	request := func(method, byteRange string) {
+		t.Helper()
+
+		req, err := http.NewRequest(method, ts.URL+"/v2/r/blobs/"+d.String(), nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+
+		req.Header.Set(MirroredHeader, "1")
+
+		if byteRange != "" {
+			req.Header.Set("Range", byteRange)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+
+		_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck // drain response
+		_ = resp.Body.Close()                 //nolint:errcheck // best-effort close
+	}
+
+	request(http.MethodGet, "")
+	request(http.MethodGet, "bytes=2-5")
+	request(http.MethodHead, "")
+
+	want := []observation{
+		{kind: "layer", bytes: int64(len(body))},
+		{kind: "layer", bytes: 4},
+	}
+
+	if !reflect.DeepEqual(observations, want) {
+		t.Fatalf("byte observations = %+v, want %+v", observations, want)
 	}
 }
 

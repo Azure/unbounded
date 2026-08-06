@@ -19,12 +19,14 @@ type latencySummary struct {
 }
 
 type jobObservation struct {
-	JobName          string         `json:"job_name"`
-	PhaseStartedAt   time.Time      `json:"phase_started_at"`
-	PhaseFinishedAt  time.Time      `json:"phase_finished_at"`
-	Nodes            []string       `json:"nodes"`
-	PodStartLatency  latencySummary `json:"pod_start_latency"`
-	PodFinishLatency latencySummary `json:"pod_finish_latency"`
+	JobName          string            `json:"job_name"`
+	PhaseStartedAt   time.Time         `json:"phase_started_at"`
+	PhaseFinishedAt  time.Time         `json:"phase_finished_at"`
+	Nodes            []string          `json:"nodes"`
+	Pods             []string          `json:"pods"`
+	PodNodes         map[string]string `json:"pod_nodes"`
+	PodStartLatency  latencySummary    `json:"pod_start_latency"`
+	PodFinishLatency latencySummary    `json:"pod_finish_latency"`
 }
 
 type podList struct {
@@ -109,11 +111,7 @@ func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase 
 						},
 					},
 					"containers": []any{
-						map[string]any{
-							"name":            "pull",
-							"image":           image,
-							"imagePullPolicy": "Always",
-						},
+						pullContainer(image),
 					},
 				},
 			},
@@ -164,6 +162,17 @@ func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase 
 	return observation, nil
 }
 
+func pullContainer(image string) map[string]any {
+	return map[string]any{
+		"name":            "pull",
+		"image":           image,
+		"imagePullPolicy": "Always",
+		// Keep the container Running long enough for kubelet to publish a
+		// running status patch for audit-derived startup latency.
+		"command": []string{"sh", "-c", "sleep 15"},
+	}
+}
+
 func parseJobObservation(raw []byte, expectedPods int, phaseStartedAt time.Time) (jobObservation, error) {
 	var pods podList
 	if err := json.Unmarshal(raw, &pods); err != nil {
@@ -175,6 +184,8 @@ func parseJobObservation(raw []byte, expectedPods int, phaseStartedAt time.Time)
 	}
 
 	nodeSet := make(map[string]struct{}, expectedPods)
+	podNames := make([]string, 0, expectedPods)
+	podNodes := make(map[string]string, expectedPods)
 	startLatencies := make([]time.Duration, 0, expectedPods)
 	finishLatencies := make([]time.Duration, 0, expectedPods)
 
@@ -192,6 +203,8 @@ func parseJobObservation(raw []byte, expectedPods int, phaseStartedAt time.Time)
 		}
 
 		nodeSet[pod.Spec.NodeName] = struct{}{}
+		podNames = append(podNames, pod.Metadata.Name)
+		podNodes[pod.Metadata.Name] = pod.Spec.NodeName
 
 		var terminatedFound bool
 
@@ -227,9 +240,12 @@ func parseJobObservation(raw []byte, expectedPods int, phaseStartedAt time.Time)
 	}
 
 	sort.Strings(nodes)
+	sort.Strings(podNames)
 
 	return jobObservation{
 		Nodes:            nodes,
+		Pods:             podNames,
+		PodNodes:         podNodes,
 		PodStartLatency:  summarizeLatencies(startLatencies),
 		PodFinishLatency: summarizeLatencies(finishLatencies),
 	}, nil

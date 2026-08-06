@@ -36,28 +36,21 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if b.config.ACRLoginServer == "" || b.config.ACRUsername == "" || b.config.ACRPassword == "" {
-		return fmt.Errorf("ACR build credentials require ACR_LOGIN_SERVER, ACR_USERNAME, and ACR_PASSWORD") //nolint:staticcheck // Environment variable names are intentionally uppercase.
+	if state.usesProxy() {
+		if b.config.ACRLoginServer != state.ACRLoginServer {
+			return fmt.Errorf("configured ACR_LOGIN_SERVER=%q does not match enabled benchmark registry %q", b.config.ACRLoginServer, state.ACRLoginServer)
+		}
+	} else if b.config.BaselineACRLoginServer != state.BaselineACRLoginServer || b.config.GantryACRLoginServer != state.GantryACRLoginServer {
+		return fmt.Errorf(
+			"configured registries baseline=%q Gantry=%q do not match enabled benchmark registries baseline=%q Gantry=%q",
+			b.config.BaselineACRLoginServer,
+			b.config.GantryACRLoginServer,
+			state.BaselineACRLoginServer,
+			state.GantryACRLoginServer,
+		)
 	}
 
-	if b.config.ACRLoginServer != state.ACRLoginServer {
-		return fmt.Errorf("configured ACR_LOGIN_SERVER=%q does not match enabled benchmark registry %q", b.config.ACRLoginServer, state.ACRLoginServer)
-	}
-
-	if err := b.loginRegistry(ctx); err != nil {
-		return err
-	}
-
-	writeAll(b.stdout, "building fresh baseline image\n")
-
-	baselineImage, err := b.buildFreshImage(ctx, state, proxyPhaseBaseline)
-	if err != nil {
-		return err
-	}
-
-	writeAll(b.stdout, "building fresh Gantry cold image\n")
-
-	gantryImage, err := b.buildFreshImage(ctx, state, proxyPhaseGantryCold)
+	baselineImage, gantryImage, err := state.preparedImages()
 	if err != nil {
 		return err
 	}
@@ -108,6 +101,35 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	// The Gantry revision is captured once. Proxy mode patched and rolled Gantry
+	// at enable time and direct mode never touches it, so the revision is stable
+	// across both phases and every counter delta is comparable.
+	revision, err := b.gantryRevision(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := b.waitForGantryRevisionScrape(ctx, revision); err != nil {
+		return err
+	}
+
+	baselineWindowStart, err := b.beginTelemetryWindow(ctx, proxyPhaseBaseline)
+	if err != nil {
+		return err
+	}
+
+	// Snapshot after the Azure minute boundary so Gantry/peer deltas and
+	// PEBytesIn covers the same phase window.
+	baselineMetricsBefore, err := b.fetchGantryRevisionMetrics(ctx, revision)
+	if err != nil {
+		return err
+	}
+
+	baselinePeerBefore, err := b.fetchGantryPeerByteSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
 	writeAll(b.stdout, fmt.Sprintf("running baseline pull on %d nodes\n", b.config.NodeCount))
 
 	baselineJob, err := b.runPullJob(ctx, state, proxyPhaseBaseline, baselineImage)
@@ -119,19 +141,56 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	baselineProxy, err := b.fetchProxyTotals(ctx, state, proxyPhaseBaseline)
+	var baselineProxy proxyPhaseTotals
+
+	if state.usesProxy() {
+		baselineProxy, err = b.fetchProxyTotals(ctx, state, proxyPhaseBaseline)
+		if err != nil {
+			return err
+		}
+	}
+
+	baselineGantry, err := b.waitForGantryMetricSettlement(ctx, revision, baselineMetricsBefore, false)
 	if err != nil {
 		return err
 	}
 
+	baselineWindowFinish, err := b.finishTelemetryWindow(ctx, proxyPhaseBaseline)
+	if err != nil {
+		return err
+	}
+
+	baselinePeerAfter, err := b.fetchGantryPeerByteSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
+	baselinePeer, err := subtractPeerByteSnapshots(baselinePeerBefore, baselinePeerAfter)
+	if err != nil {
+		return err
+	}
+
+	baselineBytes, baselineBytesSource := deriveOriginBytes(b.config, proxyPhaseBaseline, baselineProxy, baselineGantry, baselineJob)
+
 	baselineResult := phaseResult{
-		RunID:        state.RunID,
-		Phase:        proxyPhaseBaseline,
-		Image:        baselineImage,
-		ImageSizeMiB: b.config.ImageSizeMiB,
-		Proxy:        baselineProxy,
-		Job:          baselineJob,
-		RecordedAt:   time.Now().UTC(),
+		RunID:                  state.RunID,
+		Phase:                  proxyPhaseBaseline,
+		Image:                  baselineImage,
+		ImageSizeMiB:           b.config.ImageSizeMiB,
+		ImageLayers:            b.config.ImageLayers,
+		PayloadSHA:             state.WorkloadPayloadSHA256,
+		WorkloadComparisonMode: workloadComparisonIdenticalPayload,
+		Proxy:                  baselineProxy,
+		Gantry:                 baselineGantry,
+		GantryPeer:             baselinePeer,
+		Azure: azurePhaseMeasurement{Window: telemetryWindow{
+			StartedAt:  baselineWindowStart,
+			FinishedAt: baselineWindowFinish,
+		}},
+		Job:               baselineJob,
+		OriginBytes:       baselineBytes,
+		OriginBytesSource: baselineBytesSource,
+		RecordedAt:        time.Now().UTC(),
 	}
 	if err := b.writeJSONArtifact(state.RunID, "baseline.json", baselineResult); err != nil {
 		return err
@@ -142,19 +201,19 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	// Gantry was already patched and rolled out at enable time, so its DHT has
-	// long since re-converged. Only the containerd host routing changes here;
-	// `run` never restarts Gantry.
+	// Gantry was already patched and rolled out at enable time (proxy mode) or is
+	// deliberately untouched (direct mode), so its DHT has long since converged.
+	// Only the containerd host routing changes here; `run` never restarts Gantry.
 	if err := b.installHosts(ctx, state, hostsModeGantry); err != nil {
 		return err
 	}
 
-	revision, err := b.gantryRevision(ctx)
-	if err != nil {
+	if err := b.switchProxyPhase(ctx, proxyPhaseGantryCold); err != nil {
 		return err
 	}
 
-	if err := b.waitForGantryRevisionScrape(ctx, revision); err != nil {
+	gantryWindowStart, err := b.beginTelemetryWindow(ctx, proxyPhaseGantryCold)
+	if err != nil {
 		return err
 	}
 
@@ -163,7 +222,8 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	if err := b.switchProxyPhase(ctx, proxyPhaseGantryCold); err != nil {
+	gantryPeerBefore, err := b.fetchGantryPeerByteSnapshot(ctx, revision)
+	if err != nil {
 		return err
 	}
 
@@ -183,23 +243,68 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
-	gantryProxy, err := b.fetchProxyTotals(ctx, state, proxyPhaseGantryCold)
+	gantryWindowFinish, err := b.finishTelemetryWindow(ctx, proxyPhaseGantryCold)
 	if err != nil {
 		return err
 	}
 
+	gantryPeerAfter, err := b.fetchGantryPeerByteSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
+	gantryPeer, err := subtractPeerByteSnapshots(gantryPeerBefore, gantryPeerAfter)
+	if err != nil {
+		return err
+	}
+
+	var gantryProxy proxyPhaseTotals
+
+	if state.usesProxy() {
+		gantryProxy, err = b.fetchProxyTotals(ctx, state, proxyPhaseGantryCold)
+		if err != nil {
+			return err
+		}
+	}
+
+	gantryBytes, gantryBytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, gantryProxy, phaseMetrics, gantryJob)
+
 	gantryResult := phaseResult{
-		RunID:        state.RunID,
-		Phase:        proxyPhaseGantryCold,
-		Image:        gantryImage,
-		ImageSizeMiB: b.config.ImageSizeMiB,
-		Proxy:        gantryProxy,
-		Gantry:       phaseMetrics,
-		Job:          gantryJob,
-		RecordedAt:   time.Now().UTC(),
+		RunID:                  state.RunID,
+		Phase:                  proxyPhaseGantryCold,
+		Image:                  gantryImage,
+		ImageSizeMiB:           b.config.ImageSizeMiB,
+		ImageLayers:            b.config.ImageLayers,
+		PayloadSHA:             state.WorkloadPayloadSHA256,
+		WorkloadComparisonMode: workloadComparisonIdenticalPayload,
+		Proxy:                  gantryProxy,
+		Gantry:                 phaseMetrics,
+		GantryPeer:             gantryPeer,
+		Azure: azurePhaseMeasurement{Window: telemetryWindow{
+			StartedAt:  gantryWindowStart,
+			FinishedAt: gantryWindowFinish,
+		}},
+		Job:               gantryJob,
+		OriginBytes:       gantryBytes,
+		OriginBytesSource: gantryBytesSource,
+		RecordedAt:        time.Now().UTC(),
 	}
 	if err := b.writeJSONArtifact(state.RunID, "gantry-cold.json", gantryResult); err != nil {
 		return err
+	}
+
+	if b.config.AzureTelemetry {
+		writeAll(b.stdout, "waiting for baseline Azure telemetry\n")
+
+		if err := b.collectAndPersistAzurePhase(ctx, &baselineResult, "baseline.json"); err != nil {
+			return fmt.Errorf("collect baseline Azure telemetry: %w", err)
+		}
+
+		writeAll(b.stdout, "waiting for Gantry-cold Azure telemetry\n")
+
+		if err := b.collectAndPersistAzurePhase(ctx, &gantryResult, "gantry-cold.json"); err != nil {
+			return fmt.Errorf("collect Gantry-cold Azure telemetry: %w", err)
+		}
 	}
 
 	comparison := compareResults(b.config, baselineResult, gantryResult)
@@ -208,15 +313,17 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	}
 
 	writeAll(b.stdout, fmt.Sprintf(
-		"origin bytes: baseline=%d Gantry=%d reduction=%.2f%%\n",
-		baselineResult.Proxy.BytesUpstream,
-		gantryResult.Proxy.BytesUpstream,
+		"origin bytes: baseline=%d Gantry=%d reduction=%.2f%% (source %s/%s)\n",
+		baselineResult.OriginBytes,
+		gantryResult.OriginBytes,
 		100*comparison.OriginByteReduction,
+		baselineResult.OriginBytesSource,
+		gantryResult.OriginBytesSource,
 	))
 	writeAll(b.stdout, fmt.Sprintf(
 		"pod start P95: baseline=%.3fs Gantry=%.3fs\n",
-		baselineResult.Job.PodStartLatency.P95Seconds,
-		gantryResult.Job.PodStartLatency.P95Seconds,
+		phaseStartupLatency(baselineResult).P95Seconds,
+		phaseStartupLatency(gantryResult).P95Seconds,
 	))
 
 	if !comparison.Passed {

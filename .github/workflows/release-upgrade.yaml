@@ -218,7 +218,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Check out the deployed tag, not the default branch. The deploy
           # steps below use tag-pinned content (manifests tarball, cosign
@@ -370,8 +370,7 @@ jobs:
             --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
             --node-cidr         "${SITE_NODE_CIDR}" \
             --pod-cidr          "${SITE_POD_CIDR}" \
-            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}" \
-            --skip-install
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
 
       - name: Sanity check tarball contents (upgrade)
         if: env.MODE == 'upgrade'
@@ -413,7 +412,6 @@ jobs:
             "deploy unbounded-net-controller" \
             "ds unbounded-net-node" \
             "deploy machina-controller" \
-            "ds gantry-containerd-config" \
             "ds gantry"; do
             set -- $target
             wait_exists "$1" "$2"
@@ -444,7 +442,7 @@ jobs:
           kubectl -n "$NS" get deploy,ds,pods -o wide 2>&1
           echo "::endgroup::"
           echo "::group::Applied component images"
-          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "ds/gantry-containerd-config" "ds/gantry"; do
+          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "ds/gantry"; do
             img=$(kubectl -n "$NS" get "$kn" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null)
             printf '%s image=[%s]\n' "$kn" "$img"
           done
@@ -530,7 +528,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Orca deploy tooling (hack/orca/) is read from the deployed
           # tag, not the default branch. It is present in every release
@@ -625,7 +623,7 @@ jobs:
       has_tasks: ${{ steps.list.outputs.has_tasks }}
       smoke_sha: ${{ steps.pin.outputs.sha }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Use the default branch's hack/release/smoke/, not the deployed
           # tag's. See the rationale above the job.
@@ -719,7 +717,7 @@ jobs:
       TAG: ${{ needs.resolve.outputs.tag }}
       SITE_NAME: ${{ vars.SITE_NAME }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Check out the exact commit smoke-discover enumerated, not a
           # fresh resolve of the default branch (which may have advanced

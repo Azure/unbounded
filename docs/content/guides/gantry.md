@@ -168,6 +168,10 @@ metrics:
 | `p2p_cache_hit_total` | Increases when the local containerd store satisfies mirror requests. |
 | `p2p_peer_fetch_total{outcome="hit"}` | Increases when a node receives content from a peer. |
 | `p2p_origin_pull_total` | Increases only on designated origin pullers during a cold rollout. |
+| `gantry_origin_bytes_total{kind}` | Counts bytes read from upstream registries, including partial transfers and retries. |
+| `gantry_peer_fetch_bytes_total{kind}` | Counts bytes received from peer Gantry agents. |
+| `gantry_peer_serve_bytes_total{kind}` | Counts bytes transmitted to peers; range requests count only the transmitted range. |
+| `gantry_mirror_bytes_served_total{kind,source}` | Counts bytes served to local containerd, split by `cache`, `peer`, or `origin`. |
 | `p2p_origin_fallback_total` | Remains near zero during healthy operation. |
 | `gantry_advertise_reconcile_total` | Continues increasing as Gantry reconciles containerd content with the DHT. |
 | `gantry_containerd_lease_created_total` | Increases when coordinated background pulls ingest new content. |

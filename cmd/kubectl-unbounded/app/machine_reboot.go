@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -31,7 +32,7 @@ func machineRebootCommand() *cobra.Command {
 				return err
 			}
 
-			return runReboot(ctx, c, args[0], ttl)
+			return runReboot(ctx, c, args[0], ttl, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().Int32Var(&ttl, "ttl", defaultTTLSeconds,
@@ -40,7 +41,7 @@ func machineRebootCommand() *cobra.Command {
 	return cmd
 }
 
-func runReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32) error {
+func runReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, out io.Writer) error {
 	machine, err := getMachine(ctx, c, name)
 	if err != nil {
 		return err
@@ -55,9 +56,9 @@ func runReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds 
 		return err
 	}
 
-	printStep(fmt.Sprintf("Rebooting Machine %s...", name))
-	printConfig("operation", opName)
-	fmt.Println()
+	printStep(out, fmt.Sprintf("Rebooting Machine %s...", name))
+	printConfig(out, "operation", opName)
+	fprintln(out)
 
-	return watchMachineOperation(ctx, c, opName)
+	return watchMachineOperation(ctx, c, opName, out)
 }

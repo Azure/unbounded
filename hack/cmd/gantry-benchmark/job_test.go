@@ -36,6 +36,10 @@ func TestParseJobObservation(t *testing.T) {
 	if observation.PodStartLatency.P50Seconds != 20 || observation.PodStartLatency.P95Seconds != 40 || observation.PodStartLatency.P100Seconds != 40 {
 		t.Fatalf("start latency = %+v", observation.PodStartLatency)
 	}
+
+	if len(observation.Pods) != 4 || len(observation.PodNodes) != 4 {
+		t.Fatalf("pod identities = %v nodes=%v, want four", observation.Pods, observation.PodNodes)
+	}
 }
 
 func TestParseJobObservationRejectsDuplicateNode(t *testing.T) {
@@ -52,6 +56,19 @@ func TestParseJobObservationRejectsDuplicateNode(t *testing.T) {
 
 	if _, err := parseJobObservation(raw, 2, phaseStartedAt); err == nil {
 		t.Fatal("parseJobObservation accepted duplicate node placement")
+	}
+}
+
+func TestBenchmarkJobManifestKeepsContainerRunningForAudit(t *testing.T) {
+	container := pullContainer("registry.example/image:tag")
+
+	command, ok := container["command"].([]string)
+	if !ok || len(command) != 3 || command[0] != "sh" || command[1] != "-c" || command[2] != "sleep 15" {
+		t.Fatalf("command = %#v, want [sh -c sleep 15]", container["command"])
+	}
+
+	if container["imagePullPolicy"] != "Always" {
+		t.Fatalf("imagePullPolicy = %v, want Always", container["imagePullPolicy"])
 	}
 }
 

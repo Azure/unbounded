@@ -5,7 +5,11 @@ package netlink
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/vishvananda/netlink"
 )
 
 // Note: Most netlink operations require root privileges and actual network interfaces.
@@ -110,6 +114,24 @@ func TestGeneveMTUOverhead(t *testing.T) {
 	}
 }
 
+func TestSelectLowerMTUTracksSelectedInterface(t *testing.T) {
+	mtu, ifaceName := selectLowerMTU(0, "", 1400, "eth0")
+	mtu, ifaceName = selectLowerMTU(mtu, ifaceName, 1500, "eth1")
+
+	if mtu != 1400 {
+		t.Fatalf("selectLowerMTU() MTU = %d, want 1400", mtu)
+	}
+
+	if ifaceName != "eth0" {
+		t.Fatalf("selectLowerMTU() interface = %q, want %q", ifaceName, "eth0")
+	}
+
+	mtu, ifaceName = selectLowerMTU(mtu, ifaceName, 1300, "eth2")
+	if mtu != 1300 || ifaceName != "eth2" {
+		t.Fatalf("selectLowerMTU() = (%d, %q), want (1300, %q)", mtu, ifaceName, "eth2")
+	}
+}
+
 // TestLinkManager_EnsureMTU_NonExistentInterface verifies EnsureMTU returns an
 // error for a non-existent interface.
 func TestLinkManager_EnsureMTU_NonExistentInterface(t *testing.T) {
@@ -118,6 +140,89 @@ func TestLinkManager_EnsureMTU_NonExistentInterface(t *testing.T) {
 	err := lm.EnsureMTU(1420)
 	if err == nil {
 		t.Error("expected error for non-existent interface, got nil")
+	}
+}
+
+func TestBridgeVethLinks(t *testing.T) {
+	links := []netlink.Link{
+		&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "veth-cbr0", MasterIndex: 10}},
+		&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "veth-other", MasterIndex: 20}},
+		&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy-cbr0", MasterIndex: 10}},
+	}
+
+	got := bridgeVethLinks(10, links)
+	if len(got) != 1 {
+		t.Fatalf("bridgeVethLinks() returned %d links, want 1", len(got))
+	}
+
+	if got[0].Attrs().Name != "veth-cbr0" {
+		t.Fatalf("bridgeVethLinks() returned %q, want veth-cbr0", got[0].Attrs().Name)
+	}
+}
+
+func TestBridgePodVethLinks(t *testing.T) {
+	hostPeers := map[int]int{
+		100: 2,
+		200: 3,
+	}
+	links := []netlink.Link{
+		&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "eth0", Index: 2, ParentIndex: 100}},
+		&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "net1", Index: 3, ParentIndex: 999}},
+		&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "wrong-index", Index: 4, ParentIndex: 200}},
+		&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy", Index: 3, ParentIndex: 200}},
+	}
+
+	got := bridgePodVethLinks(hostPeers, links)
+	if len(got) != 1 {
+		t.Fatalf("bridgePodVethLinks() returned %d links, want 1", len(got))
+	}
+
+	if got[0].Attrs().Name != "eth0" {
+		t.Fatalf("bridgePodVethLinks() returned %q, want eth0", got[0].Attrs().Name)
+	}
+}
+
+func TestProcessNetworkNamespacePaths(t *testing.T) {
+	procDir := t.TempDir()
+
+	selfPath := filepath.Join(procDir, "self", "ns", "net")
+	if err := os.MkdirAll(filepath.Dir(selfPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(selfPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	duplicatePath := filepath.Join(procDir, "1", "ns", "net")
+	if err := os.MkdirAll(filepath.Dir(duplicatePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Link(selfPath, duplicatePath); err != nil {
+		t.Fatal(err)
+	}
+
+	distinctPath := filepath.Join(procDir, "2", "ns", "net")
+	if err := os.MkdirAll(filepath.Dir(distinctPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(distinctPath, []byte("distinct"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(procDir, "not-a-pid", "ns"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := processNetworkNamespacePaths(procDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 1 || got[0] != distinctPath {
+		t.Fatalf("processNetworkNamespacePaths() = %v, want [%s]", got, distinctPath)
 	}
 }
 

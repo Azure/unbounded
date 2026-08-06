@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -64,6 +66,92 @@ func TestProxyCountsUpstreamAndClientBytesByPhase(t *testing.T) {
 	baseline := snapshot.Totals.ByPhase[phaseBaseline]
 	if baseline.RequestsCompleted != 1 || baseline.BytesUpstream != 11 || baseline.BytesToClient != 11 {
 		t.Fatalf("baseline totals = %+v", baseline)
+	}
+}
+
+func TestProxyRecordsHTTPErrorStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer upstream.Close()
+
+	_, observer, handler := testProxy(t, upstream.URL)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, "/v2/acme/app/manifests/"+testDigest(), nil),
+	)
+
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusTooManyRequests)
+	}
+
+	setup := observer.snapshot(time.Now()).Totals.ByPhase[phaseSetup]
+	if setup.ByStatus["429"] != 1 {
+		t.Fatalf("status totals = %+v, want one 429", setup.ByStatus)
+	}
+
+	if len(setup.UpstreamErrors) != 0 {
+		t.Fatalf("transport errors = %+v, want none", setup.UpstreamErrors)
+	}
+}
+
+func TestProxyRecordsUpstreamTransportError(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, syscall.ECONNREFUSED
+	})}
+	_, observer, handler := testProxyWithClient(t, "https://registry.example", "basic", client)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, "/v2/acme/app/blobs/"+testDigest(), nil),
+	)
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadGateway)
+	}
+
+	setup := observer.snapshot(time.Now()).Totals.ByPhase[phaseSetup]
+	if setup.ByStatus["502"] != 1 {
+		t.Fatalf("status totals = %+v, want one 502", setup.ByStatus)
+	}
+
+	if setup.UpstreamErrors[upstreamErrorConnectionRefused] != 1 {
+		t.Fatalf("transport errors = %+v, want one connection_refused", setup.UpstreamErrors)
+	}
+
+	labels := []string{
+		string(upstreamErrorConnectionRefused),
+		http.MethodGet,
+		string(pathClassBlob),
+		string(clientClassOther),
+		"run-1",
+		string(phaseSetup),
+	}
+	if got := testutil.ToFloat64(observer.upstreamErrors.WithLabelValues(labels...)); got != 1 {
+		t.Fatalf("upstream error metric = %v, want 1", got)
+	}
+}
+
+func TestClassifyUpstreamError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want upstreamErrorReason
+	}{
+		{name: "timeout", err: context.DeadlineExceeded, want: upstreamErrorTimeout},
+		{name: "connection refused", err: syscall.ECONNREFUSED, want: upstreamErrorConnectionRefused},
+		{name: "connection reset", err: syscall.ECONNRESET, want: upstreamErrorConnectionReset},
+		{name: "other", err: errors.New("upstream failed"), want: upstreamErrorOther},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyUpstreamError(test.err); got != test.want {
+				t.Fatalf("classifyUpstreamError() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -298,6 +386,12 @@ func testProxy(t *testing.T, upstreamURL string) (*phaseController, *observer, h
 func testProxyWithAuth(t *testing.T, upstreamURL, authMode string) (*phaseController, *observer, http.Handler) {
 	t.Helper()
 
+	return testProxyWithClient(t, upstreamURL, authMode, http.DefaultClient)
+}
+
+func testProxyWithClient(t *testing.T, upstreamURL, authMode string, client *http.Client) (*phaseController, *observer, http.Handler) {
+	t.Helper()
+
 	parsed, err := url.Parse(upstreamURL)
 	if err != nil {
 		t.Fatalf("parse upstream: %v", err)
@@ -319,7 +413,7 @@ func testProxyWithAuth(t *testing.T, upstreamURL, authMode string) (*phaseContro
 	}
 	observer := newObserver(prometheus.NewRegistry(), time.Now(), controller)
 
-	return controller, observer, proxyHandler(config, newTokenCache(defaultRefreshSkewSecs), observer, http.DefaultClient)
+	return controller, observer, proxyHandler(config, newTokenCache(defaultRefreshSkewSecs), observer, client)
 }
 
 func testDigest() string {
@@ -330,6 +424,12 @@ type failingResponseWriter struct {
 	header    http.Header
 	written   int
 	failAfter int
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 func (w *failingResponseWriter) Header() http.Header {

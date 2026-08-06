@@ -69,15 +69,41 @@ Optional flags:
 | `--wait` | `bool` | `true` | Wait for the operator rollout and CRD establishment |
 | `--timeout` | `duration` | `5m0s` | Timeout for rollout waits |
 | `--api-server-endpoint` | `string` | auto-discovered | Override the API server endpoint advertised to provisioned machines; by default the operator discovers it from `kube-public/cluster-info`, or the `KUBERNETES_SERVICE_HOST` FQDN on clusters (e.g. AKS) that do not publish cluster-info |
-| `--image-registry` | `string` | `ghcr.io` | Registry prefix used by the operator for version-matched first-party component images |
+| `--image-registry` | `string` | build default | Full image-repository prefix (registry host plus org/namespace) all unbounded images are pulled from |
+| `--operator-image` | `string` | build default | `unbounded-operator` image name and tag, **without** a registry (e.g. `unbounded-operator:v1`); the registry comes from `--image-registry` |
 
 > **Breaking change:** the `--skip-crds` flag has been removed. CRDs are now owned
 > and installed by the operator at startup (`operator.BootstrapCRDs`), so there is
 > nothing for `install` to skip. Automation passing `--skip-crds` must drop it.
 
-`--operator-image` overrides the operator image. `--image-registry` configures
-the registry for components; their image tag always matches the operator's
-compiled version.
+`--image-registry` is the single knob for where **all** unbounded images come
+from. It is written to `UNBOUNDED_IMAGE_REGISTRY`; the operator resolves each
+component as `<registry>/<component>:<operator-version>`, and the operator's own
+Deployment image is `<registry>/<operator-name:tag>`. Because both the operator
+and its components take the registry from this one value, they can never come from
+different registries. `--operator-image` overrides only the operator's `name:tag`
+(it must not include a registry); it is rarely needed. The component image tag is
+always the operator's compiled version.
+
+Unset, both the registry and the operator `name:tag` come from the manifests baked
+into the binary at build time (rendered from `CONTAINER_REGISTRY`), so fork and
+mirror builds work without any flag. The registry is applied on every install, not
+preserved from cluster state, so it cannot drift; upgrading a cluster that stored a
+pre-change bare `ghcr.io` rewrites it to the full prefix and install logs the
+change. A private or air-gapped install sets `--image-registry` (e.g.
+`--image-registry registry.corp/unbounded`); the operator image follows.
+
+`install` is the only command that bootstraps `unbounded-operator`
+([`site init`](#kubectl-unbounded-site-init) requires it to be installed
+already), so a private or air-gapped setup runs `install --image-registry ...`
+first, then `site init`.
+
+> **Breaking change:** `--image-registry` is now a full image-repository prefix
+> (registry host plus org/namespace), not a bare host the operator appends
+> `/azure/` to. `--operator-image` is now a `name:tag` with no registry (the
+> registry comes from `--image-registry`); a registry-qualified value is rejected.
+> Automation passing a bare `ghcr.io` to `--image-registry`, or a fully-qualified
+> image to `--operator-image`, must update.
 
 ---
 
@@ -86,10 +112,20 @@ compiled version.
 Initialize a new Unbounded site. This command:
 
 1. Validates inputs and kubeconfig access.
-2. Bootstraps CRDs and `unbounded-operator` unless `--skip-install` is set.
+2. Verifies `unbounded-operator` is installed: the cluster must serve the API
+   types `site init` applies (`Site` in `unbounded-cloud.io/v1alpha3`;
+   `GatewayPool` and `SiteGatewayPoolAssignment` in
+   `net.unbounded-cloud.io/v1alpha1`). This is checked via API discovery.
 3. Creates a cluster `Site`, a remote `Site`, and related net `GatewayPool` resources.
 4. Records component choices in `Site.spec.components` for `unbounded-operator`.
 5. Creates a bootstrap token for the remote site.
+
+> **Prerequisite:** `site init` no longer bootstraps `unbounded-operator`. Run
+> [`kubectl unbounded install`](#kubectl-unbounded-install) first. If the cluster
+> is not serving the required API types, `site init` fails with guidance to run
+> `install`. If those types are served but the operator Deployment is missing or
+> not yet rolled out, `site init` warns and proceeds (the operator reconciles the
+> Site once ready).
 
 Global components (`unbounded-net`, `machina`, and `unbounded-storage`) are
 enabled on the cluster Site. `metalman` is per-site and is enabled on the remote
@@ -114,17 +150,23 @@ Site when `--enable-metalman` is set.
 | `--enable-machina` | `bool` | `true` | Enable machina in `Site.spec.components` |
 | `--enable-metalman` | `bool` | `false` | Enable metalman in `Site.spec.components` |
 | `--enable-storage` | `bool` | `false` | Enable unbounded-storage in `Site.spec.components` |
-| `--skip-install` | `bool` | `false` | Skip bootstrapping CRDs and `unbounded-operator` |
-| `--install-timeout` | `duration` | `5m0s` | Timeout while waiting for operator bootstrap |
+
+> **Breaking change:** the `--skip-install` and `--install-timeout` flags have
+> been removed. `site init` no longer installs the operator, so there is nothing
+> to skip or time out. Run `kubectl unbounded install` first. Automation passing
+> `--skip-install` must drop it.
 
 #### Validation
 
 - All CIDR values must be valid IPv4 CIDR notation.
 - The kubeconfig must be readable.
+- `unbounded-operator` must be installed (the cluster must serve the required API types).
 
 #### Example
 
 ```bash
+kubectl unbounded install
+
 kubectl unbounded site init \
   --name my-edge-site \
   --cluster-node-cidr 10.224.0.0/16 \

@@ -12,7 +12,7 @@ central control plane. It adds:
 
 - **CRD-driven lifecycle management** for remote machines (`Machine`).
 - **Two provisioning paths**: SSH-based (machina) and PXE-based (metalman).
-- **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}}), separate repo).
+- **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}})).
 
 ![Architecture overview: Control-Plane Cluster with machina and metalman controllers, provisioning Remote Nodes via SSH and Bare-Metal Nodes via PXE, connected through WireGuard Gateway Nodes](../../img/architecture-overview.svg)
 
@@ -70,7 +70,7 @@ Binary `cmd/kubectl-unbounded`. Provides subcommands:
 | Subcommand         | Purpose |
 |--------------------|---------|
 | `install`          | Bootstraps CRDs and `unbounded-operator`; component workloads are reconciled from `Site.spec.components`. |
-| `site init`        | Initializes a new site by bootstrapping Unbounded when needed, creating site resources, and creating the bootstrap token. |
+| `site init`        | Initializes a new site (requires `unbounded-operator` to be installed first): creates site resources and the bootstrap token. |
 | `machine register`   | Registers a machine to a site, creating a `Machine` CR with auto-discovery of SSH secrets and bootstrap tokens. |
 
 ### inventory -- Hardware Collector

@@ -1,6 +1,6 @@
 # unbounded-storage Architecture
 
-`unbounded-storage` is the per-host storage daemon for Project Unbounded. It is
+`unbounded-storage` is the per-host storage daemon for Unbounded Kubernetes. It is
 the only Rust crate in the repository (Rust edition 2024) and has its own
 conventions for layout, build, and testing. Agents working under
 `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the
@@ -8,7 +8,7 @@ repository-wide Go conventions do not apply here.
 
 ## 1. Purpose and Place in the System
 
-Project Unbounded serves immutable, content-addressed data to workloads through
+Unbounded Kubernetes serves immutable, content-addressed data to workloads through
 a tiered cache that sits in front of a slow origin. The design (see
 `designs/storage-high-level.md`) has three tiers:
 

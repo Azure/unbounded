@@ -160,7 +160,7 @@ provides efficient map-based lookups.
 
 ## How It Relates to unbounded-kube
 
-unbounded-net is the **networking layer** for the broader Project Unbounded
+unbounded-net is the **networking layer** for the broader Unbounded Kubernetes
 system:
 
 - **Unbounded** handles node provisioning -- getting remote machines
@@ -169,9 +169,10 @@ system:
   traffic.
 
 They share the same API group prefix (`unbounded-cloud.io` / `net.unbounded-cloud.io`)
-and are designed to work together. When you run `kubectl unbounded site init`,
-it bootstraps `unbounded-operator`, creates Site resources, and lets the
-operator deploy machina and unbounded-net from `Site.spec.components`.
+and are designed to work together. After you bootstrap `unbounded-operator` with
+`kubectl unbounded install`, running `kubectl unbounded site init` creates Site
+resources and lets the operator deploy machina and unbounded-net from
+`Site.spec.components`.
 
 ## Next Steps
 

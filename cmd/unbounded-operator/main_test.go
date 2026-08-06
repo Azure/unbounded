@@ -96,7 +96,7 @@ func TestImageRegistryConfiguration(t *testing.T) {
 		args []string
 		want string
 	}{
-		{name: "default", want: "ghcr.io"},
+		{name: "default", want: "ghcr.io/azure"},
 		{name: "environment", env: "mirror.example.com", want: "mirror.example.com"},
 		{name: "flag overrides environment", env: "mirror.example.com", args: []string{"--image-registry=registry.example.com"}, want: "registry.example.com"},
 	}

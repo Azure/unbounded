@@ -72,6 +72,25 @@ func (b *benchmark) restoreGantry(ctx context.Context, state *benchmarkState) er
 	}
 
 	currentSHA := gantryConfigSHA(current)
+
+	// Direct mode never patches Gantry, so there is nothing to restore. Still
+	// verify the ConfigMap is byte-identical to what enable recorded: a drift
+	// here means something outside the benchmark changed Gantry mid-run, which
+	// invalidates the comparison.
+	if !state.usesProxy() {
+		if currentSHA != state.OriginalGantryConfigSHA {
+			return fmt.Errorf(
+				"gantry ConfigMap changed during a direct-mode run, which never patches it: current sha256=%s, recorded sha256=%s",
+				currentSHA,
+				state.OriginalGantryConfigSHA,
+			)
+		}
+
+		state.GantryRestored = true
+
+		return nil
+	}
+
 	if currentSHA == state.OriginalGantryConfigSHA {
 		if state.PatchedGantryConfigSHA == "" || state.GantryRestored {
 			state.GantryRestored = true
@@ -164,6 +183,12 @@ func (b *benchmark) rolloutGantry(ctx context.Context) error {
 func (b *benchmark) switchProxyPhase(ctx context.Context, phase proxyPhase) error {
 	if !phase.valid() {
 		return fmt.Errorf("invalid proxy phase %q", phase)
+	}
+
+	// Direct mode has no proxy to hold phase state. Phases are attributed by
+	// counter deltas over the recorded phase window instead.
+	if !b.config.usesProxy() {
+		return nil
 	}
 
 	if _, err := b.commands.Run(

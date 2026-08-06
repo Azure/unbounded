@@ -62,6 +62,12 @@ var DefaultNamespace = unbounded.SystemNamespace()
 
 // Config carries operator-level settings components read while reconciling.
 type Config struct {
+	// ImageRegistry is the full image-repository prefix (registry host plus any
+	// org/namespace path) that operator-managed component images live under. The
+	// component's flat repository name and the operator's image tag are appended
+	// to it, so ImageRegistry=ghcr.io/azure yields ghcr.io/azure/machina:<tag>.
+	// It carries no implicit path segment: forks and mirrors set it to their own
+	// prefix (for example ghcr.io/myorg or registry.corp.internal/unbounded).
 	ImageRegistry string
 	ImageTag      string
 
@@ -70,9 +76,11 @@ type Config struct {
 	APIServerEndpoint string
 }
 
-// Image returns the operator-managed image for repository.
+// Image returns the operator-managed image for repository. ImageRegistry is a
+// full repository prefix, so repository is appended directly with no implicit
+// org/namespace segment.
 func (c Config) Image(repository string) string {
-	return strings.TrimRight(c.ImageRegistry, "/") + "/azure/" + repository + ":" + c.ImageTag
+	return strings.TrimRight(c.ImageRegistry, "/") + "/" + repository + ":" + c.ImageTag
 }
 
 // SetPodSpecImages replaces every init and main container image in a workload.

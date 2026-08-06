@@ -85,7 +85,11 @@ UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
 UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION_TAG)
 UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
-UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= ghcr.io
+# Full image-repository prefix the operator resolves component images under. It
+# derives from CONTAINER_REGISTRY so it cannot drift from the operator's own
+# image: overriding CONTAINER_REGISTRY (as the release workflow does per fork)
+# points components at the same registry/org as the operator.
+UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
@@ -289,7 +293,7 @@ help: ## Show this help
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck"
 	@echo "  gomod                            go mod tidy"
-	@echo "  notice                           Regenerate NOTICE from go.mod and frontend/package.json"
+	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
 	@echo ""
 	@echo "Build:"
@@ -521,7 +525,7 @@ vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifes
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
 
-notice: ## Regenerate NOTICE from go.mod and frontend/package.json
+notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -529,7 +533,7 @@ notice: ## Regenerate NOTICE from go.mod and frontend/package.json
 	fi
 	$(GOCMD) run ./hack/cmd/notice generate --output NOTICE
 
-notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
+notice-check: ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \

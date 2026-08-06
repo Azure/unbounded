@@ -160,6 +160,8 @@ set is organized around the same bootstrap phases as `unbounded-agent start`.
 | `host-os-configuration` | Error | Host OS configuration paths are writable, including the sysctl config directory and systemd unit directory. |
 | `nspawn-runtime` | Warning | Required nspawn runtime tools are available: `systemctl`, `machinectl`, and `systemd-nspawn`. It also checks that `/run/systemd/system` is available. Missing tools are warnings because bootstrap may install them. |
 | `docker-active` | Warning | Docker is active. Bootstrap will disable Docker when needed. |
+| `containerd-active` | Warning | The host containerd service is active. Bootstrap will disable it before starting the node. |
+| `kubelet-active` | Warning | The host kubelet service is active. Bootstrap will disable it before starting the node. |
 | `swap-active` | Warning | Swap is active or swap state cannot be determined. Bootstrap will disable active swap. |
 | `disk-space` | Error | At least 8 GiB is available under `/var/lib` for machine rootfs and artifacts. |
 | `cgroups` | Error | The cgroup filesystem exists at `/sys/fs/cgroup`. |
@@ -182,6 +184,8 @@ The `nvidia-driver` check can return multiple results with different targets:
 | Check | Severity when failing | What it validates |
 |---|---|---|
 | `api-server-reachable` | Error | Cluster CA data and bootstrap credentials are valid enough to use, the configured API server endpoint is well formed, and the host can reach the API server `/readyz` endpoint. API server responses with status 500 or higher are fatal. |
+| `kubelet-bind-address` | Error | No TCP listener occupies kubelet's `0.0.0.0:10250` port in the shared host network namespace. |
+| `containerd-metrics-bind-address` | Error | No TCP listener occupies containerd's configured metrics port, currently `0.0.0.0:10257`, in the shared host network namespace. |
 
 ### Rootfs and Artifact Checks
 

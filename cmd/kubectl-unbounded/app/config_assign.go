@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/spf13/cobra"
 	"k8s.io/utils/ptr"
@@ -46,7 +47,7 @@ Example:
 				versionPtr = ptr.To(version)
 			}
 
-			return runConfigAssign(ctx, c, configName, args[0], versionPtr)
+			return runConfigAssign(ctx, c, configName, args[0], versionPtr, cmd.OutOrStdout())
 		},
 	}
 
@@ -57,7 +58,7 @@ Example:
 	return cmd
 }
 
-func runConfigAssign(ctx context.Context, c client.WithWatch, configName, machineName string, version *int32) error {
+func runConfigAssign(ctx context.Context, c client.WithWatch, configName, machineName string, version *int32, out io.Writer) error {
 	// Verify the MachineConfiguration exists.
 	mc := &v1alpha3.MachineConfiguration{}
 	if err := c.Get(ctx, client.ObjectKey{Name: configName}, mc); err != nil {
@@ -90,16 +91,16 @@ func runConfigAssign(ctx context.Context, c client.WithWatch, configName, machin
 		return fmt.Errorf("updating Machine: %w", err)
 	}
 
-	printStep(fmt.Sprintf("Assigned %s to Machine %s", configName, machineName))
-	printConfig("configuration", configName)
+	printStep(out, fmt.Sprintf("Assigned %s to Machine %s", configName, machineName))
+	printConfig(out, "configuration", configName)
 
 	if version != nil {
-		printConfig("version", fmt.Sprintf("%d", *version))
+		printConfig(out, "version", fmt.Sprintf("%d", *version))
 	} else {
-		printConfig("version", "(controller will select latest)")
+		printConfig(out, "version", "(controller will select latest)")
 	}
 
-	fmt.Println()
+	fprintln(out)
 
 	return nil
 }
