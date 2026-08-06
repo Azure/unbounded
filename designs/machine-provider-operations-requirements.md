@@ -730,7 +730,7 @@ Cancelling a client request or watch should not implicitly cancel provider work.
 
 ```json
 {
-  "state": "CANCELLED",
+  "state": "Canceled",
   "residualEffects": {
     "powerState": "OFF",
     "imageComplete": false,
