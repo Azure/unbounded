@@ -136,14 +136,21 @@ func (b *benchmark) runPullJob(ctx context.Context, state benchmarkState, phase 
 	waitContext, cancel := context.WithTimeout(ctx, b.config.JobTimeout)
 	defer cancel()
 
-	if _, err := b.commands.Run(
+	progressStopped := b.startPullJobProgress(waitContext, jobName, phaseStartedAt)
+
+	_, waitErr := b.commands.Run(
 		waitContext,
 		nil,
 		"kubectl", "-n", b.config.Namespace,
 		"wait", "--for=condition=complete", "job/"+jobName,
 		"--timeout", b.config.JobTimeout.String(),
-	); err != nil {
-		return jobObservation{}, err
+	)
+
+	cancel()
+	<-progressStopped
+
+	if waitErr != nil {
+		return jobObservation{}, waitErr
 	}
 
 	phaseFinishedAt := time.Now().UTC()
@@ -182,8 +189,188 @@ func pullContainer(image string) map[string]any {
 	}
 }
 
+// pullPodList is the reduced projection used for live progress. It reads the
+// waiting reason that podList intentionally omits.
+type pullPodList struct {
+	Items []struct {
+		Spec struct {
+			NodeName string `json:"nodeName"`
+		} `json:"spec"`
+		Status struct {
+			Phase             string `json:"phase"`
+			ContainerStatuses []struct {
+				Name  string `json:"name"`
+				State struct {
+					Waiting *struct {
+						Reason string `json:"reason"`
+					} `json:"waiting"`
+				} `json:"state"`
+			} `json:"containerStatuses"`
+		} `json:"status"`
+	} `json:"items"`
+}
+
+// pullProgress is a point-in-time breakdown of the pull Job's pods, reported
+// while the phase runs so a stalled pull is visible before the Job times out.
+type pullProgress struct {
+	Total             int
+	Succeeded         int
+	Running           int
+	ContainerCreating int
+	PullingImage      int
+	ImagePullBackOff  int
+	Unscheduled       int
+	Failed            int
+	Other             int
+	BackOffReasons    map[string]int
+}
+
+func (p pullProgress) String() string {
+	parts := []string{fmt.Sprintf("%d/%d succeeded", p.Succeeded, p.Total)}
+
+	for _, entry := range []struct {
+		label string
+		count int
+	}{
+		{"running", p.Running},
+		{"pulling", p.PullingImage},
+		{"creating", p.ContainerCreating},
+		{"unscheduled", p.Unscheduled},
+		{"failed", p.Failed},
+		{"other", p.Other},
+	} {
+		if entry.count > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", entry.count, entry.label))
+		}
+	}
+
+	if p.ImagePullBackOff > 0 {
+		reasons := make([]string, 0, len(p.BackOffReasons))
+		for reason, count := range p.BackOffReasons {
+			reasons = append(reasons, fmt.Sprintf("%s=%d", reason, count))
+		}
+
+		sort.Strings(reasons)
+		parts = append(parts, fmt.Sprintf("%d image-pull-backoff (%s)", p.ImagePullBackOff, strings.Join(reasons, ",")))
+	}
+
+	return strings.Join(parts, ", ")
+}
+
+func summarizePullProgress(raw []byte, expectedPods int) (pullProgress, error) {
+	var pods pullPodList
+	if err := json.Unmarshal(raw, &pods); err != nil {
+		return pullProgress{}, fmt.Errorf("decode pull Job pod progress: %w", err)
+	}
+
+	progress := pullProgress{Total: expectedPods, BackOffReasons: map[string]int{}}
+
+	for _, pod := range pods.Items {
+		switch pod.Status.Phase {
+		case "Succeeded":
+			progress.Succeeded++
+
+			continue
+		case "Failed":
+			progress.Failed++
+
+			continue
+		case "Running":
+			progress.Running++
+
+			continue
+		}
+
+		waitingReason := ""
+
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Name == "pull" && status.State.Waiting != nil {
+				waitingReason = status.State.Waiting.Reason
+			}
+		}
+
+		switch waitingReason {
+		case "ImagePullBackOff", "ErrImagePull", "RegistryUnavailable":
+			progress.ImagePullBackOff++
+			progress.BackOffReasons[waitingReason]++
+		case "ContainerCreating", "PodInitializing":
+			progress.ContainerCreating++
+		case "":
+			if pod.Spec.NodeName == "" {
+				progress.Unscheduled++
+			} else {
+				progress.PullingImage++
+			}
+		default:
+			progress.Other++
+		}
+	}
+
+	return progress, nil
+}
+
+// startPullJobProgress streams pod-state counts until ctx is cancelled. The
+// returned channel closes once the reporter has stopped, so the caller can
+// avoid interleaving output with whatever it prints next.
+func (b *benchmark) startPullJobProgress(ctx context.Context, jobName string, phaseStartedAt time.Time) <-chan struct{} {
+	stopped := make(chan struct{})
+
+	if b.config.JobProgressInterval <= 0 {
+		close(stopped)
+
+		return stopped
+	}
+
+	go func() {
+		defer close(stopped)
+
+		ticker := time.NewTicker(b.config.JobProgressInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			output, err := b.commands.Run(
+				ctx,
+				nil,
+				"kubectl", "-n", b.config.Namespace,
+				"get", "pods", "-l", "job-name="+jobName,
+				"-o", "json",
+			)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+
+				writeAll(b.stdout, fmt.Sprintf("  [%s] pod progress unavailable: %v\n", jobName, err))
+
+				continue
+			}
+
+			progress, err := summarizePullProgress(output, b.config.NodeCount)
+			if err != nil {
+				writeAll(b.stdout, fmt.Sprintf("  [%s] pod progress unreadable: %v\n", jobName, err))
+
+				continue
+			}
+
+			writeAll(b.stdout, fmt.Sprintf(
+				"  [%s] %s (elapsed %s)\n",
+				jobName, progress, time.Since(phaseStartedAt).Round(time.Second),
+			))
+		}
+	}()
+
+	return stopped
+}
+
 func parseJobObservation(raw []byte, expectedPods int, phaseStartedAt time.Time) (jobObservation, error) {
 	var pods podList
+
 	if err := json.Unmarshal(raw, &pods); err != nil {
 		return jobObservation{}, fmt.Errorf("decode pull Job pods: %w", err)
 	}

@@ -70,6 +70,7 @@ type benchmarkConfig struct {
 	ACRPrivateEndpointResourceID string
 	TelemetryTimeout             time.Duration
 	TelemetryPollInterval        time.Duration
+	JobProgressInterval          time.Duration
 	StateRoot                    string
 }
 
@@ -130,6 +131,11 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		return benchmarkConfig{}, err
 	}
 
+	jobProgressInterval, err := envDuration(getenv, "BENCHMARK_JOB_PROGRESS_INTERVAL", 15*time.Second)
+	if err != nil {
+		return benchmarkConfig{}, err
+	}
+
 	mode := benchmarkMode(envDefault(getenv, "BENCHMARK_MODE", string(benchmarkModeProxy)))
 	if mode != benchmarkModeProxy && mode != benchmarkModeDirect {
 		return benchmarkConfig{}, fmt.Errorf(
@@ -182,6 +188,7 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		ACRPrivateEndpointResourceID: getenv("AZURE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"),
 		TelemetryTimeout:             telemetryTimeout,
 		TelemetryPollInterval:        telemetryPollInterval,
+		JobProgressInterval:          jobProgressInterval,
 		StateRoot:                    filepath.Join(repoRoot, "tmp", "gantry-benchmark"),
 	}
 
