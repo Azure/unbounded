@@ -181,6 +181,7 @@ func (b *benchmark) fetchGantryDiagnosticSnapshot(ctx context.Context, revision 
 		if _, ok := podNodes[pod]; !ok {
 			return gantryDiagnosticSnapshot{}, fmt.Errorf("diagnostic sample belongs to unexpected pod %q", pod)
 		}
+
 		if sample.Value < 0 {
 			return gantryDiagnosticSnapshot{}, fmt.Errorf("diagnostic sample for pod %s is negative: %v", pod, sample.Value)
 		}
@@ -189,6 +190,7 @@ func (b *benchmark) fetchGantryDiagnosticSnapshot(ctx context.Context, revision 
 		if err != nil {
 			return gantryDiagnosticSnapshot{}, err
 		}
+
 		counters[pod][key] = sample.Value
 	}
 
@@ -202,11 +204,13 @@ func diagnosticMetricKey(labels map[string]string) (string, error) {
 	}
 
 	parts := make([]string, 0, 3)
+
 	for _, label := range []string{"kind", "outcome", "source"} {
 		if value := labels[label]; value != "" {
 			parts = append(parts, label+"="+value)
 		}
 	}
+
 	if len(parts) == 0 {
 		return name, nil
 	}
@@ -233,9 +237,11 @@ func (b *benchmark) fetchGantryDiagnosticTimestamps(
 	if err != nil {
 		return nil, err
 	}
+
 	if err := validatePrometheusRangePodCoverage("gantry diagnostic timestamps", raw, b.config.NodeCount); err != nil {
 		return nil, err
 	}
+
 	var response struct {
 		Data struct {
 			Result []struct {
@@ -249,28 +255,34 @@ func (b *benchmark) fetchGantryDiagnosticTimestamps(
 	}
 
 	result := map[string]map[string]float64{}
+
 	for _, series := range response.Data.Result {
 		key, err := diagnosticMetricKey(series.Metric)
 		if err != nil {
 			return nil, err
 		}
+
 		pod := series.Metric["pod"]
 		for _, pair := range series.Values {
 			rawValue, ok := pair[1].(string)
 			if !ok {
 				return nil, fmt.Errorf("diagnostic timestamp sample has non-string value")
 			}
+
 			value, err := strconv.ParseFloat(rawValue, 64)
 			if err != nil {
 				return nil, fmt.Errorf("parse diagnostic timestamp sample %q: %w", rawValue, err)
 			}
+
 			observedAt := time.Unix(0, int64(value*float64(time.Second)))
 			if observedAt.Before(window.StartedAt) || observedAt.After(window.FinishedAt) {
 				continue
 			}
+
 			if result[pod] == nil {
 				result[pod] = map[string]float64{}
 			}
+
 			if value > result[pod][key] {
 				result[pod][key] = value
 			}
@@ -300,6 +312,7 @@ func subtractGantryDiagnosticSnapshots(
 		}
 
 		deltas := map[string]float64{}
+
 		for key, afterValue := range after.Counters[pod] {
 			beforeValue := before.Counters[pod][key]
 			if afterValue < beforeValue {
@@ -311,6 +324,7 @@ func subtractGantryDiagnosticSnapshots(
 					afterValue,
 				)
 			}
+
 			if delta := afterValue - beforeValue; delta != 0 {
 				deltas[key] = delta
 			}
@@ -348,11 +362,13 @@ func requireFinalLayerResponseTimestamps(
 	podNodes map[string]string,
 ) error {
 	missing := make([]string, 0)
+
 	for pod := range podNodes {
 		if finalLayerResponseCompletedTimestamp(timestamps[pod]) == 0 {
 			missing = append(missing, pod)
 		}
 	}
+
 	if len(missing) == 0 {
 		return nil
 	}

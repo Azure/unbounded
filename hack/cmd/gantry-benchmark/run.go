@@ -179,6 +179,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	baselineDiagnosticTimestamps, err := b.fetchGantryDiagnosticTimestamps(ctx, revision, telemetryWindow{
 		StartedAt:  baselineJob.PhaseStartedAt,
 		FinishedAt: baselineJob.PhaseFinishedAt,
@@ -186,6 +187,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	baselineDiagnostics, err := subtractGantryDiagnosticSnapshots(
 		baselineDiagnosticsBefore,
 		baselineDiagnosticsAfter,
@@ -196,10 +198,12 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	}
 
 	baselineBytes, baselineBytesSource := deriveOriginBytes(b.config, proxyPhaseBaseline, baselineProxy, baselineGantry, baselineJob)
+
 	baselinePerformance, err := b.capturePhasePerformanceTelemetry(ctx, proxyPhaseBaseline, baselineJob)
 	if err != nil {
 		return err
 	}
+
 	if err := b.writePerformanceTelemetryArtifact(state.RunID, proxyPhaseBaseline, baselinePerformance); err != nil {
 		return err
 	}
@@ -301,6 +305,7 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	gantryDiagnosticTimestamps, err := b.fetchGantryDiagnosticTimestamps(ctx, revision, telemetryWindow{
 		StartedAt:  gantryJob.PhaseStartedAt,
 		FinishedAt: gantryJob.PhaseFinishedAt,
@@ -308,9 +313,11 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	if err := requireFinalLayerResponseTimestamps(gantryDiagnosticTimestamps, gantryDiagnosticsAfter.PodNodes); err != nil {
 		return err
 	}
+
 	gantryDiagnostics, err := subtractGantryDiagnosticSnapshots(
 		gantryDiagnosticsBefore,
 		gantryDiagnosticsAfter,
@@ -330,10 +337,12 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	}
 
 	gantryBytes, gantryBytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, gantryProxy, phaseMetrics, gantryJob)
+
 	gantryPerformance, err := b.capturePhasePerformanceTelemetry(ctx, proxyPhaseGantryCold, gantryJob)
 	if err != nil {
 		return err
 	}
+
 	if err := b.writePerformanceTelemetryArtifact(state.RunID, proxyPhaseGantryCold, gantryPerformance); err != nil {
 		return err
 	}

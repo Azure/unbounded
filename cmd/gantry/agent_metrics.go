@@ -183,6 +183,7 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 			p.mirrorCompletedAt.WithLabelValues(kind, source).Set(0)
 		}
 	}
+
 	for _, outcome := range []string{
 		"hit",
 		"notfound",
@@ -198,9 +199,11 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 		p.peerFetch.WithLabelValues(outcome).Add(0)
 		p.peerFetchDur.WithLabelValues(outcome)
 	}
+
 	for _, outcome := range []string{"busy", "stall"} {
 		p.peerFetchLastAt.WithLabelValues(outcome).Set(0)
 	}
+
 	for _, outcome := range []string{"hit", "miss", "error", "timeout"} {
 		p.dhtLookup.WithLabelValues(outcome).Add(0)
 		p.dhtLookupDur.WithLabelValues(outcome)

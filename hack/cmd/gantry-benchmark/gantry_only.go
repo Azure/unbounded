@@ -682,6 +682,7 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	diagnosticTimestamps, err := b.fetchGantryDiagnosticTimestamps(ctx, revision, telemetryWindow{
 		StartedAt:  job.PhaseStartedAt,
 		FinishedAt: job.PhaseFinishedAt,
@@ -689,19 +690,23 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+
 	if err := requireFinalLayerResponseTimestamps(diagnosticTimestamps, diagnosticsAfter.PodNodes); err != nil {
 		return err
 	}
+
 	diagnostics, err := subtractGantryDiagnosticSnapshots(diagnosticsBefore, diagnosticsAfter, diagnosticTimestamps)
 	if err != nil {
 		return err
 	}
 
 	bytes, bytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, proxyPhaseTotals{}, metrics, job)
+
 	performance, err := b.capturePhasePerformanceTelemetry(ctx, proxyPhaseGantryCold, job)
 	if err != nil {
 		return err
 	}
+
 	if err := b.writePerformanceTelemetryArtifact(state.RunID, proxyPhaseGantryCold, performance); err != nil {
 		return err
 	}

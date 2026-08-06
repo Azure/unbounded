@@ -87,6 +87,7 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		!strings.Contains(string(rendered), `- controller-revision-hash`) {
 		t.Fatalf("rendered manifest is missing benchmark scrape or Gantry revision labels")
 	}
+
 	if strings.Count(string(rendered), `gantry_benchmark: "true"`) != 2 {
 		t.Fatalf("rendered manifest does not label both benchmark PodMonitors for discovery")
 	}
@@ -94,15 +95,19 @@ func TestRenderMonitoringManifest(t *testing.T) {
 	if !strings.Contains(string(rendered), `action: keep`) {
 		t.Fatalf("rendered manifest does not limit Gantry metric cardinality")
 	}
+
 	if !strings.Contains(string(rendered), `systemctl show --property MainPID --value containerd`) {
 		t.Fatalf("rendered manifest does not validate the running containerd debug configuration")
 	}
+
 	if !strings.Contains(string(rendered), `- port: ctr-metrics`) || strings.Contains(string(rendered), `- port: containerd-metrics`) {
 		t.Fatalf("rendered manifest does not use the Kubernetes-valid containerd metrics port name")
 	}
+
 	if !strings.Contains(string(rendered), `--web.listen-address=:29100`) {
 		t.Fatalf("rendered manifest does not use the benchmark node-exporter port")
 	}
+
 	for _, metric := range []string{
 		"p2p_peer_fetch_duration_seconds_(bucket|sum|count)",
 		"p2p_dht_lookup_duration_seconds_(bucket|sum|count)",

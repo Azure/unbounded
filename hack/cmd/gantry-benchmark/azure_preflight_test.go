@@ -210,6 +210,7 @@ func TestDecodeAzureDiagnosticSettingsSupportsCLIAndARMShapes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("decodeAzureDiagnosticSettings: %v", err)
 			}
+
 			if len(settings) != 1 || settings[0].WorkspaceID != "/subscriptions/s/workspaces/law" ||
 				len(settings[0].Logs) != 1 || !settings[0].Logs[0].Enabled {
 				t.Fatalf("settings = %+v, want one dedicated audit setting", settings)

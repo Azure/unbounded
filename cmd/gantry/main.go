@@ -619,6 +619,7 @@ func runAgent(args []string) error {
 		mirror.WithPeerMetrics(
 			func(outcome string) {
 				p2.peerFetch.WithLabelValues(outcome).Inc()
+
 				if outcome == "busy" || outcome == "stall" {
 					p2.peerFetchLastAt.WithLabelValues(outcome).SetToCurrentTime()
 				}

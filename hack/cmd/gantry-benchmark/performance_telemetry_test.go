@@ -45,9 +45,11 @@ func TestQueryPrometheusRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("queryPrometheusRange: %v", err)
 	}
+
 	if !strings.Contains(string(response), `"status":"success"`) {
 		t.Fatalf("response = %s, want successful raw envelope", response)
 	}
+
 	if len(runner.commands) != 1 {
 		t.Fatalf("commands = %v, want one command", runner.commands)
 	}
@@ -62,6 +64,7 @@ func TestQueryPrometheusRange(t *testing.T) {
 
 func TestPerformanceTelemetryQueriesBoundContainerdCardinality(t *testing.T) {
 	queries := performanceTelemetryQueries()
+
 	byName := make(map[string]performanceTelemetryQuery, len(queries))
 	for _, query := range queries {
 		byName[query.name] = query
@@ -75,9 +78,11 @@ func TestPerformanceTelemetryQueriesBoundContainerdCardinality(t *testing.T) {
 			t.Fatalf("missing bounded telemetry query %q", name)
 		}
 	}
+
 	if byName["containerd_image_pulls"].step != 0 || byName["containerd_grpc_started"].step != 0 {
 		t.Fatal("containerd pull and gRPC started queries must use the default 10-second step")
 	}
+
 	if byName["containerd_grpc_handled"].step != 5*time.Minute {
 		t.Fatalf("gRPC handled step = %s, want 5m", byName["containerd_grpc_handled"].step)
 	}
@@ -87,6 +92,7 @@ func TestValidatePrometheusRangeResponseSize(t *testing.T) {
 	if err := validatePrometheusRangeResponseSize([]byte("1234"), 4); err != nil {
 		t.Fatalf("response at limit: %v", err)
 	}
+
 	if err := validatePrometheusRangeResponseSize([]byte("12345"), 4); err == nil || !strings.Contains(err.Error(), "5 bytes") {
 		t.Fatalf("oversized response error = %v", err)
 	}
@@ -111,13 +117,16 @@ func TestParseContainerdJournal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseContainerdJournal: %v", err)
 	}
+
 	if len(events) != 2 {
 		t.Fatalf("events = %v, want two phase-bounded events", events)
 	}
+
 	if events[0].NodeName != "node-a" || events[0].Type != "layer_unpacked" ||
 		events[0].LayerDigest != "sha256:abc" || events[0].DurationSeconds != 2.5 {
 		t.Fatalf("first event = %+v, want parsed layer event", events[0])
 	}
+
 	if events[1].NodeName != "node-b" || events[1].Type != "pull_completed" {
 		t.Fatalf("second event = %+v, want correlated pull completion", events[1])
 	}
@@ -148,6 +157,7 @@ func TestValidatePrometheusRangePodCoverage(t *testing.T) {
 	if err := validatePrometheusRangePodCoverage("disk", raw, 2); err != nil {
 		t.Fatalf("validatePrometheusRangePodCoverage: %v", err)
 	}
+
 	if err := validatePrometheusRangePodCoverage("disk", raw, 3); err == nil || !strings.Contains(err.Error(), "2/3 pods") {
 		t.Fatalf("error = %v, want partial pod coverage", err)
 	}

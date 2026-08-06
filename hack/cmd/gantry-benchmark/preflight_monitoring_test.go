@@ -25,10 +25,12 @@ type monitoringCoverageRunner struct {
 
 func (r *monitoringCoverageRunner) Run(_ context.Context, _ []byte, _ string, _ ...string) ([]byte, error) {
 	index := r.calls
+
 	r.calls++
 	if index >= len(r.results) {
 		index = len(r.results) - 1
 	}
+
 	result := r.results[index]
 	if result.err != nil {
 		return nil, result.err
@@ -42,8 +44,10 @@ func (r *monitoringCoverageRunner) Run(_ context.Context, _ []byte, _ string, _ 
 
 func TestWaitForPrometheusMetricCoverageRetriesPartialScrape(t *testing.T) {
 	runner := &monitoringCoverageRunner{results: []monitoringCoverageResult{{count: 9}, {count: 1000}}}
+
 	var stdout bytes.Buffer
-	benchmark := benchmark{
+
+	bench := benchmark{
 		config: benchmarkConfig{
 			MonitoringNamespace:   "monitoring",
 			PrometheusService:     "prometheus",
@@ -55,12 +59,14 @@ func TestWaitForPrometheusMetricCoverageRetriesPartialScrape(t *testing.T) {
 		stdout:   &stdout,
 	}
 
-	if err := benchmark.waitForPrometheusMetricCoverage(context.Background(), "containerd build", "count(metric)"); err != nil {
+	if err := bench.waitForPrometheusMetricCoverage(context.Background(), "containerd build", "count(metric)"); err != nil {
 		t.Fatal(err)
 	}
+
 	if runner.calls != 2 {
 		t.Fatalf("query calls = %d, want 2", runner.calls)
 	}
+
 	if !strings.Contains(stdout.String(), "9/1000 observer pods") {
 		t.Fatalf("progress output = %q", stdout.String())
 	}
@@ -68,7 +74,7 @@ func TestWaitForPrometheusMetricCoverageRetriesPartialScrape(t *testing.T) {
 
 func TestWaitForPrometheusMetricCoverageRetriesQueryError(t *testing.T) {
 	runner := &monitoringCoverageRunner{results: []monitoringCoverageResult{{err: errors.New("not ready")}, {count: 1000}}}
-	benchmark := benchmark{
+	bench := benchmark{
 		config: benchmarkConfig{
 			MonitoringNamespace:   "monitoring",
 			PrometheusService:     "prometheus",
@@ -80,9 +86,10 @@ func TestWaitForPrometheusMetricCoverageRetriesQueryError(t *testing.T) {
 		stdout:   &bytes.Buffer{},
 	}
 
-	if err := benchmark.waitForPrometheusMetricCoverage(context.Background(), "containerd build", "count(metric)"); err != nil {
+	if err := bench.waitForPrometheusMetricCoverage(context.Background(), "containerd build", "count(metric)"); err != nil {
 		t.Fatal(err)
 	}
+
 	if runner.calls != 2 {
 		t.Fatalf("query calls = %d, want 2", runner.calls)
 	}
@@ -90,7 +97,7 @@ func TestWaitForPrometheusMetricCoverageRetriesQueryError(t *testing.T) {
 
 func TestWaitForPrometheusMetricCoverageTimesOut(t *testing.T) {
 	runner := &monitoringCoverageRunner{results: []monitoringCoverageResult{{count: 9}}}
-	benchmark := benchmark{
+	bench := benchmark{
 		config: benchmarkConfig{
 			MonitoringNamespace:   "monitoring",
 			PrometheusService:     "prometheus",
@@ -102,7 +109,7 @@ func TestWaitForPrometheusMetricCoverageTimesOut(t *testing.T) {
 		stdout:   &bytes.Buffer{},
 	}
 
-	err := benchmark.waitForPrometheusMetricCoverage(context.Background(), "containerd build", "count(metric)")
+	err := bench.waitForPrometheusMetricCoverage(context.Background(), "containerd build", "count(metric)")
 	if err == nil || !strings.Contains(err.Error(), "9/1000 observer pods after waiting 1ns") {
 		t.Fatalf("timeout error = %v", err)
 	}

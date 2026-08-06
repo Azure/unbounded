@@ -50,13 +50,16 @@ func TestFetchGantryDiagnosticTimestampsUsesExactJobWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchGantryDiagnosticTimestamps: %v", err)
 	}
+
 	if len(timestamps["gantry-a"]) != 2 || timestamps["gantry-b"] != nil {
 		t.Fatalf("timestamps = %v, want only two in-window gantry-a values", timestamps)
 	}
+
 	if timestamps["gantry-a"]["gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=peer}"] !=
 		float64(time.Date(2026, time.August, 4, 1, 3, 0, 0, time.UTC).Unix()) {
 		t.Fatalf("timestamps = %v, want latest in-window layer completion", timestamps)
 	}
+
 	if !strings.Contains(runner.queryPath, `kind%3D%22layer%22`) {
 		t.Fatalf("query path %q does not restrict completion timestamps to layers", runner.queryPath)
 	}
@@ -171,6 +174,7 @@ func TestDiagnosticMetricKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("diagnosticMetricKey: %v", err)
 	}
+
 	if key != "p2p_peer_fetch_total{outcome=busy}" {
 		t.Fatalf("key = %q, want p2p_peer_fetch_total{outcome=busy}", key)
 	}
@@ -200,9 +204,11 @@ func TestSubtractGantryDiagnosticSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subtractGantryDiagnosticSnapshots: %v", err)
 	}
+
 	if !measurement.Complete || len(measurement.Pods) != 1 {
 		t.Fatalf("measurement = %+v, want one complete pod", measurement)
 	}
+
 	pod := measurement.Pods[0]
 	if pod.NodeName != "node-a" || pod.CounterDeltas["p2p_peer_fetch_total{outcome=busy}"] != 3 ||
 		pod.TimestampSeconds["gantry_mirror_response_completed_timestamp_seconds{kind=layer,source=peer}"] != 1234 ||

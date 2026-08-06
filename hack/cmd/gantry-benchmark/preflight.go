@@ -484,8 +484,10 @@ func (b *benchmark) waitForPrometheusMetricCoverage(ctx context.Context, descrip
 	pollContext, cancel := context.WithTimeout(ctx, b.config.TelemetryTimeout)
 	defer cancel()
 
-	var count float64
-	var queryErr error
+	var (
+		count    float64
+		queryErr error
+	)
 
 	for {
 		count, queryErr = b.queryPrometheus(pollContext, query)
@@ -511,9 +513,11 @@ func (b *benchmark) waitForPrometheusMetricCoverage(ctx context.Context, descrip
 				default:
 				}
 			}
+
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+
 			if queryErr != nil {
 				return fmt.Errorf(
 					"prometheus %s metrics were not queryable before %s: %w",

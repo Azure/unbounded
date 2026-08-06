@@ -99,6 +99,7 @@ func TestStreamCommitTracker_ObservedAfterInventoryAppears(t *testing.T) {
 			if duration <= 0 {
 				t.Errorf("observed duration = %s, want positive", duration)
 			}
+
 			atomic.AddInt32(&durations, 1)
 		},
 		func(n int) { atomic.AddInt32(&missing, int32(n)) },
@@ -190,6 +191,7 @@ func TestStreamCommitTracker_ReportsLatestCompletedStreamLast(t *testing.T) {
 	inv := &fakeInventorySource{current: []digest.Digest{earlier, later}}
 
 	var durations []time.Duration
+
 	tracker := newStreamCommitTracker(inv, nil, nil, func(duration time.Duration) {
 		durations = append(durations, duration)
 	}, nil)

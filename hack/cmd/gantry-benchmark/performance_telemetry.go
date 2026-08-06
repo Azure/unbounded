@@ -107,13 +107,16 @@ func (b *benchmark) capturePhasePerformanceTelemetry(
 		if step == 0 {
 			step = performanceTelemetryStep
 		}
+
 		response, err := b.queryPrometheusRange(ctx, item.query, window, step)
 		if err != nil {
 			return phasePerformanceTelemetry{}, fmt.Errorf("capture %s: %w", item.name, err)
 		}
+
 		if err := validatePrometheusRangePodCoverage(item.name, response, b.config.NodeCount); err != nil {
 			return phasePerformanceTelemetry{}, err
 		}
+
 		captures = append(captures, prometheusRangeCapture{
 			Name:        item.name,
 			Query:       item.query,
@@ -126,6 +129,7 @@ func (b *benchmark) capturePhasePerformanceTelemetry(
 	if err != nil {
 		return phasePerformanceTelemetry{}, err
 	}
+
 	journalEvents, err := parseContainerdJournal(journal, observerPods, window)
 	if err != nil {
 		return phasePerformanceTelemetry{}, err
@@ -155,15 +159,18 @@ func validatePrometheusRangePodCoverage(name string, raw json.RawMessage, expect
 	}
 
 	pods := map[string]struct{}{}
+
 	for _, series := range response.Data.Result {
 		pod := series.Metric["pod"]
 		if pod == "" {
 			return fmt.Errorf("%s range series has no pod label", name)
 		}
+
 		if len(series.Values) > 0 {
 			pods[pod] = struct{}{}
 		}
 	}
+
 	if len(pods) != expectedPods {
 		return fmt.Errorf("%s range capture has samples from %d/%d pods", name, len(pods), expectedPods)
 	}
@@ -189,31 +196,37 @@ func parseContainerdJournal(
 		if !strings.HasPrefix(line, "[pod/") || prefixEnd < 0 {
 			return nil, fmt.Errorf("parse containerd journal prefix: %q", line)
 		}
+
 		prefixParts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(line[:prefixEnd], "["), "]"), "/")
 		if len(prefixParts) != 3 || prefixParts[0] != "pod" || prefixParts[2] != "containerd-journal" {
 			return nil, fmt.Errorf("parse containerd journal source: %q", line[:prefixEnd+1])
 		}
 
 		observerPod := prefixParts[1]
+
 		nodeName, ok := observerPodNodes[observerPod]
 		if !ok {
 			return nil, fmt.Errorf("containerd journal belongs to unexpected observer pod %q", observerPod)
 		}
 
 		remainder := line[prefixEnd+2:]
+
 		timestampEnd := strings.IndexByte(remainder, ' ')
 		if timestampEnd < 0 {
 			return nil, fmt.Errorf("parse containerd journal timestamp: %q", line)
 		}
+
 		timestamp, err := time.Parse(time.RFC3339Nano, remainder[:timestampEnd])
 		if err != nil {
 			return nil, fmt.Errorf("parse containerd journal timestamp %q: %w", remainder[:timestampEnd], err)
 		}
+
 		if timestamp.Before(window.StartedAt) || timestamp.After(window.FinishedAt) {
 			continue
 		}
 
 		message := remainder[timestampEnd+1:]
+
 		eventType := classifyContainerdJournalEvent(message)
 		if eventType == "" {
 			return nil, fmt.Errorf("classify filtered containerd journal message: %q", message)
@@ -233,6 +246,7 @@ func parseContainerdJournal(
 				if err != nil {
 					return nil, fmt.Errorf("parse containerd journal duration %q: %w", match[2], err)
 				}
+
 				event.DurationSeconds = duration.Seconds()
 			case "layer":
 				event.LayerDigest = match[2]
@@ -291,6 +305,7 @@ func (b *benchmark) queryPrometheusRange(
 	if err != nil {
 		return nil, err
 	}
+
 	if err := validatePrometheusRangeResponseSize(output, maxPrometheusRangeResponseBytes); err != nil {
 		return nil, err
 	}
@@ -301,6 +316,7 @@ func (b *benchmark) queryPrometheusRange(
 	if err := json.Unmarshal(output, &envelope); err != nil {
 		return nil, fmt.Errorf("decode Prometheus range response: %w", err)
 	}
+
 	if envelope.Status != "success" {
 		return nil, fmt.Errorf("prometheus range query status is %q", envelope.Status)
 	}
@@ -311,7 +327,7 @@ func (b *benchmark) queryPrometheusRange(
 func validatePrometheusRangeResponseSize(output []byte, limit int) error {
 	if len(output) > limit {
 		return fmt.Errorf(
-			"Prometheus range response is %d bytes, exceeds %d-byte capture limit",
+			"prometheus range response is %d bytes, exceeds %d-byte capture limit",
 			len(output),
 			limit,
 		)
@@ -351,8 +367,10 @@ func (b *benchmark) observerPodNodes(ctx context.Context) (map[string]string, er
 		if pod.Metadata.Name == "" || pod.Spec.NodeName == "" {
 			return nil, fmt.Errorf("observer pod has empty name or nodeName")
 		}
+
 		result[pod.Metadata.Name] = pod.Spec.NodeName
 	}
+
 	if len(result) != b.config.NodeCount {
 		return nil, fmt.Errorf("observer pod/node map has %d pods, want %d", len(result), b.config.NodeCount)
 	}

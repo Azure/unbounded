@@ -135,15 +135,19 @@ func (b *benchmark) prepareAdoptedImages(ctx context.Context, baselineImage, gan
 	if err != nil {
 		return err
 	}
+
 	if state.Status != "enabled" {
 		return fmt.Errorf("benchmark state is %q, run enable before prepare-adopt", state.Status)
 	}
+
 	if state.usesProxy() {
 		return fmt.Errorf("prepare-adopt requires direct dual-ACR mode")
 	}
+
 	if err := b.requireLock(ctx, state.RunID); err != nil {
 		return err
 	}
+
 	if err := b.validateContext(ctx); err != nil {
 		return err
 	}
@@ -152,6 +156,7 @@ func (b *benchmark) prepareAdoptedImages(ctx context.Context, baselineImage, gan
 	if err != nil {
 		return err
 	}
+
 	if err := b.saveState(ctx, state); err != nil {
 		return err
 	}
@@ -170,10 +175,12 @@ func adoptPreparedImages(state benchmarkState, baselineImage, gantryImage, paylo
 	state.BaselineImage = baselineImage
 	state.GantryColdImage = gantryImage
 	state.WorkloadPayloadSHA256 = payloadSHA
+
 	state.WorkloadComparisonMode = workloadComparisonIdenticalPayload
 	if _, _, err := state.preparedImages(); err != nil {
 		return benchmarkState{}, fmt.Errorf("validate adopted images: %w", err)
 	}
+
 	state.Status = "images-prepared"
 
 	return state, nil

@@ -78,6 +78,7 @@ func TestMirrorByteMetricsCacheSource(t *testing.T) {
 	if len(served) != 1 || served[0] != want {
 		t.Fatalf("served observations = %+v, want [%+v]", served, want)
 	}
+
 	if len(completed) != 1 || completed[0].kind != want.kind || completed[0].source != want.source {
 		t.Fatalf("completed observations = %+v, want kind=%s source=%s", completed, want.kind, want.source)
 	}
@@ -128,6 +129,7 @@ func TestMirrorByteMetricsPeerSource(t *testing.T) {
 	if len(served) != 1 || served[0] != wantServed {
 		t.Fatalf("served observations = %+v, want [%+v]", served, wantServed)
 	}
+
 	if len(completed) != 1 || completed[0].kind != wantServed.kind || completed[0].source != wantServed.source {
 		t.Fatalf("completed observations = %+v, want kind=%s source=%s", completed, wantServed.kind, wantServed.source)
 	}
@@ -187,6 +189,7 @@ func TestMirrorByteMetricsOriginSource(t *testing.T) {
 	if len(served) != 1 || served[0] != wantServed {
 		t.Fatalf("served observations = %+v, want [%+v]", served, wantServed)
 	}
+
 	if len(completed) != 1 || completed[0].kind != wantServed.kind || completed[0].source != wantServed.source {
 		t.Fatalf("completed observations = %+v, want kind=%s source=%s", completed, wantServed.kind, wantServed.source)
 	}

@@ -140,6 +140,7 @@ func TestAdoptPreparedImages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("adoptPreparedImages: %v", err)
 	}
+
 	if adopted.Status != "images-prepared" || adopted.BaselineImage != baseline ||
 		adopted.GantryColdImage != gantry || adopted.WorkloadPayloadSHA256 != payload ||
 		adopted.WorkloadComparisonMode != workloadComparisonIdenticalPayload {
@@ -161,6 +162,7 @@ func TestAdoptPreparedImagesRejectsInvalidInputs(t *testing.T) {
 	if _, err := adoptPreparedImages(state, baseline, gantry, "not-a-digest"); err == nil {
 		t.Fatal("expected invalid payload digest rejection")
 	}
+
 	if _, err := adoptPreparedImages(state, baseline, gantry, "sha256:"+strings.Repeat("c", 64)); err == nil ||
 		!strings.Contains(err.Error(), "would reuse") {
 		t.Fatalf("error = %v, want identical image digest rejection", err)

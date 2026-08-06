@@ -40,6 +40,7 @@ func TestParseJobObservation(t *testing.T) {
 	if len(observation.Pods) != 4 || len(observation.PodNodes) != 4 || len(observation.PodTimings) != 4 {
 		t.Fatalf("pod identities = %v nodes=%v timings=%v, want four", observation.Pods, observation.PodNodes, observation.PodTimings)
 	}
+
 	podB := observation.PodTimings["pod-b"]
 	if podB.NodeName != "node-b" || podB.StartLatencySeconds != 20 || podB.FinishLatencySeconds != 21 ||
 		!podB.ContainerStartedAt.Equal(phaseStartedAt.Add(20*time.Second)) {

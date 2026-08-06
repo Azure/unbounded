@@ -186,9 +186,11 @@ func (t *streamCommitTracker) probe(parent context.Context) {
 	if observed > 0 && t.onObserved != nil {
 		t.onObserved(observed)
 	}
+
 	sort.Slice(observedCommits, func(i, j int) bool {
 		return observedCommits[i].completedAt.Before(observedCommits[j].completedAt)
 	})
+
 	if t.onObservedDuration != nil {
 		for _, commit := range observedCommits {
 			t.onObservedDuration(commit.duration)
