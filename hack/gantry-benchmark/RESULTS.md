@@ -16,6 +16,10 @@ We removed prior benchmark images before repeat samples, measured registry
 traffic at each Azure Private Endpoint, measured pod startup from AKS audit
 logs, and measured peer traffic from Gantry metrics.
 
+For a breakdown of where pod startup time is actually spent, and the effect of
+containerd download and unpack concurrency, see
+[PULL-LATENCY-ANALYSIS.md](PULL-LATENCY-ANALYSIS.md).
+
 
 ### ACR traffic
 
@@ -25,6 +29,7 @@ logs, and measured peer traffic from Gantry metrics.
 | 1000 nodes - sample 2 | 40 GiB | 47.566 TB | 174.781 GB | 99.633% | 1008 / 5 | 99.504% |
 | **1000 nodes - Canada Central ACR** | **40 GiB** | **47.178 TB** | **245.878 GB** | **99.479%** | **1000 / 2** | **99.800%** |
 | **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **45.008 TB** | **154.787 GB** | **99.656%** | **1000 / 2** | **99.800%** |
+| **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **47.165 TB** | **256.512 GB** | **99.456%** | **1000 / 4** | **99.600%** |
 | **1000 nodes - UK South ACR** | **40 GiB** | **53.369 TB** | **219.262 GB** | **99.589%** | **1254 / 5** | **99.601%** |
 | **1000 nodes - East US ACR** | **40 GiB** | **47.562 TB** | **182.317 GB** | **99.617%** | **1004 / 4** | **99.602%** |
 | **1000 nodes - Central India ACR** <sup>1</sup> | **40 GiB** | **97.115 TB** | **803.184 GB** | **99.173%** | **2287 / 6** | **99.738%** |
@@ -50,6 +55,7 @@ aggregates below.
 | 1000 nodes - sample 2 | 40 GiB | 894.597s | 1087.179s | 1065.724s | 1169.448s | 1652.704s | 1885.011s | 9.733% slower |
 | **1000 nodes - Canada Central ACR** | **40 GiB** | **1862.580s** | **774.028s** | **2030.636s** | **817.139s** | **2149.535s** | **891.766s** | **59.759% faster** |
 | **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **939.368s** | **1105.766s** | **1091.173s** | **1180.970s** | **1180.111s** | **1239.429s** | **8.229% slower** |
+| **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **759.746s** | **923.473s** | **867.850s** | **994.468s** | **956.492s** | **1058.555s** | **14.590% slower** |
 | **1000 nodes - UK South ACR** | **40 GiB** | **3561.000s** | **1064.557s** | **3953.000s** | **1146.557s** | **5399.000s** | **1815.557s** | **70.995% faster** |
 | **1000 nodes - East US ACR** | **40 GiB** | **1401.026s** | **1065.950s** | **1655.894s** | **1144.771s** | **2351.081s** | **1831.832s** | **30.867% faster** |
 | **1000 nodes - Central India ACR** <sup>2</sup> | **40 GiB** | **3184.649s** | **1065.570s** | **4851.649s** | **1155.570s** | **5351.649s** | **1865.570s** | **76.182% faster** |
@@ -79,6 +85,16 @@ phases succeeded with no image-pull backoff and no origin fallbacks. This
 sample also ran with the containerd transfer-service download concurrency
 override removed, so both phases used the containerd default of 3.
 
+<sup>4</sup> Run `run-20260806-205719-51c38730`, reported **FAIL**. Same cluster
+as footnote 3 with the containerd transfer-service override restored to 6
+concurrent downloads, isolating that one variable. Both phases got faster:
+baseline P95 improved 20.5% and Gantry P95 improved 15.8%. Baseline gained more
+because Gantry nodes were already near their CPU limit at 90.2% P95 while
+serving peers, so the P95 ratio worsened from 1.0823 to 1.1459 and again
+exceeded the 1.0 gate this run used. All 2000 pods succeeded with no image-pull
+backoff and no origin fallbacks. See
+[PULL-LATENCY-ANALYSIS.md](PULL-LATENCY-ANALYSIS.md).
+
 #### Latency excluding image-pull backoff
 
 AKS audit logs retained the pod status patches containing `ErrImagePull` and
@@ -107,6 +123,7 @@ The unfiltered table remains the primary end-to-end result because
 | 1000 nodes - sample 2 | 40 GiB | 43.438 TB | 160.002 GB | 159 | 154 | 42,472 | 0 |
 | **1000 nodes - Canada Central ACR** | **40 GiB** | **42.735 TB** | **223.358 GB** | **214** | **212** | **41,791** | **0** |
 | **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **42.817 TB** | **140.672 GB** | **134** | **132** | **41,870** | **0** |
+| **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **42.734 TB** | **233.022 GB** | **223** | **219** | **41,789** | **0** |
 | **1000 nodes - East US ACR** | **40 GiB** | **43.137 TB** | **161.075 GB** | **159** | **155** | **42,179** | **0** |
 | **1000 nodes - Central India ACR** | **40 GiB** | **43.070 TB** | **709.766 GB** | **682** | **662** | **42,129** | **0** |
 | 2000 nodes - sample 1 | 40 GiB | 86.971 TB | 221.210 GB | 213 | 210 | 85,044 | 0 |
