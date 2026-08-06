@@ -70,7 +70,7 @@ Binary `cmd/kubectl-unbounded`. Provides subcommands:
 | Subcommand         | Purpose |
 |--------------------|---------|
 | `install`          | Bootstraps CRDs and `unbounded-operator`; component workloads are reconciled from `Site.spec.components`. |
-| `site init`        | Initializes a new site by bootstrapping Unbounded when needed, creating site resources, and creating the bootstrap token. |
+| `site init`        | Initializes a new site (requires `unbounded-operator` to be installed first): creates site resources and the bootstrap token. |
 | `machine register`   | Registers a machine to a site, creating a `Machine` CR with auto-discovery of SSH secrets and bootstrap tokens. |
 
 ### inventory -- Hardware Collector

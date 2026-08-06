@@ -232,6 +232,10 @@ echo
 echo "Run the following to initialize an unbounded site."
 echo "Edit <SITE-NAME>, <REMOTE-NODE-CIDR>, and <REMOTE-POD-CIDR> before running:"
 echo
+echo "  # Bootstrap the unbounded-operator first; 'site init' requires it and"
+echo "  # errors if it is not installed."
+echo "  kubectl unbounded install"
+echo
 echo "  kubectl unbounded site init \\"
 echo "    --name <SITE-NAME> \\"
 printf "    --cluster-node-cidr    %-20s\\\\\n" "$NODE_CIDR"
