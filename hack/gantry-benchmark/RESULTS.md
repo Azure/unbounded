@@ -24,6 +24,7 @@ logs, and measured peer traffic from Gantry metrics.
 | 1000 nodes - sample 1 | 40 GiB | 47.296 TB | 174.773 GB | 99.630% | 1002 / 4 | 99.601% |
 | 1000 nodes - sample 2 | 40 GiB | 47.566 TB | 174.781 GB | 99.633% | 1008 / 5 | 99.504% |
 | **1000 nodes - Canada Central ACR** | **40 GiB** | **47.178 TB** | **245.878 GB** | **99.479%** | **1000 / 2** | **99.800%** |
+| **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **45.008 TB** | **154.787 GB** | **99.656%** | **1000 / 2** | **99.800%** |
 | **1000 nodes - UK South ACR** | **40 GiB** | **53.369 TB** | **219.262 GB** | **99.589%** | **1254 / 5** | **99.601%** |
 | **1000 nodes - East US ACR** | **40 GiB** | **47.562 TB** | **182.317 GB** | **99.617%** | **1004 / 4** | **99.602%** |
 | **1000 nodes - Central India ACR** <sup>1</sup> | **40 GiB** | **97.115 TB** | **803.184 GB** | **99.173%** | **2287 / 6** | **99.738%** |
@@ -48,6 +49,7 @@ aggregates below.
 | 1000 nodes - sample 1 | 40 GiB | 682.725s | 1099.629s | 821.209s | 1171.863s | 1422.461s | 1885.385s | 42.700% slower |
 | 1000 nodes - sample 2 | 40 GiB | 894.597s | 1087.179s | 1065.724s | 1169.448s | 1652.704s | 1885.011s | 9.733% slower |
 | **1000 nodes - Canada Central ACR** | **40 GiB** | **1862.580s** | **774.028s** | **2030.636s** | **817.139s** | **2149.535s** | **891.766s** | **59.759% faster** |
+| **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **939.368s** | **1105.766s** | **1091.173s** | **1180.970s** | **1180.111s** | **1239.429s** | **8.229% slower** |
 | **1000 nodes - UK South ACR** | **40 GiB** | **3561.000s** | **1064.557s** | **3953.000s** | **1146.557s** | **5399.000s** | **1815.557s** | **70.995% faster** |
 | **1000 nodes - East US ACR** | **40 GiB** | **1401.026s** | **1065.950s** | **1655.894s** | **1144.771s** | **2351.081s** | **1831.832s** | **30.867% faster** |
 | **1000 nodes - Central India ACR** <sup>2</sup> | **40 GiB** | **3184.649s** | **1065.570s** | **4851.649s** | **1155.570s** | **5351.649s** | **1865.570s** | **76.182% faster** |
@@ -55,15 +57,27 @@ aggregates below.
 | 2000 nodes - sample 2 | 40 GiB | 939.834s | 1093.091s | 1141.022s | 1177.821s | 1724.219s | 1856.380s | 3.225% slower |
 | 2000 nodes - sample 3 | 40 GiB | 1241.331s | 1096.589s | 1472.041s | 1184.248s | 2131.053s | 1821.000s | 19.551% faster |
 
-Positive improvement means Gantry started pods faster. The configured gate was
-a maximum Gantry-to-baseline P95 ratio of 3.0, so all six audit-complete runs
-and the cross-region performance-only samples passed even when an unusually
-fast baseline made Gantry slower. The UK South and Central India rows use
-retained Kubernetes pod status timestamps; every other row, including East US,
-uses AKS audit timestamps.
+Positive improvement means Gantry started pods faster. Most rows used a maximum
+Gantry-to-baseline P95 ratio of 3.0, so all six audit-complete runs and the
+cross-region performance-only samples passed even when an unusually fast
+baseline made Gantry slower. The Canada Central rerun is the exception: it ran
+with the gate tightened to 1.0 and did not meet it. The UK South and Central
+India rows use retained Kubernetes pod status timestamps; every other row,
+including East US, uses AKS audit timestamps.
 
 <sup>2</sup> Central India latency uses retained Kubernetes pod status because
 the telemetry timeout occurred before the runner wrote its audit measurement.
+
+<sup>3</sup> Run `run-20260806-185139-9995e167`, reported **FAIL**. Byte and
+pull reduction were the strongest Canada Central results recorded, but the
+baseline was unusually fast: its P95 of 1091.173s is roughly half the 2030.636s
+of the earlier Canada Central sample, while Gantry landed at 1180.970s, close to
+the 1146.557s to 1184.248s that Gantry produces on nearly every run. The
+resulting P95 ratio of 1.0823 exceeded the 1.0 gate configured for this run,
+which the 3.0 gate used elsewhere would have passed. All 2000 pods across both
+phases succeeded with no image-pull backoff and no origin fallbacks. This
+sample also ran with the containerd transfer-service download concurrency
+override removed, so both phases used the containerd default of 3.
 
 #### Latency excluding image-pull backoff
 
@@ -92,6 +106,7 @@ The unfiltered table remains the primary end-to-end result because
 | 1000 nodes - sample 1 | 40 GiB | 43.566 TB | 158.928 GB | 157 | 153 | 42,597 | 0 |
 | 1000 nodes - sample 2 | 40 GiB | 43.438 TB | 160.002 GB | 159 | 154 | 42,472 | 0 |
 | **1000 nodes - Canada Central ACR** | **40 GiB** | **42.735 TB** | **223.358 GB** | **214** | **212** | **41,791** | **0** |
+| **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **42.817 TB** | **140.672 GB** | **134** | **132** | **41,870** | **0** |
 | **1000 nodes - East US ACR** | **40 GiB** | **43.137 TB** | **161.075 GB** | **159** | **155** | **42,179** | **0** |
 | **1000 nodes - Central India ACR** | **40 GiB** | **43.070 TB** | **709.766 GB** | **682** | **662** | **42,129** | **0** |
 | 2000 nodes - sample 1 | 40 GiB | 86.971 TB | 221.210 GB | 213 | 210 | 85,044 | 0 |
