@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -49,8 +50,20 @@ func TestConfigureContainerdEnablesDeviceOwnershipFromSecurityContext(t *testing
 	path := filepath.Join(machineDir, goalstates.ContainerdConfigPath)
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.Contains(t, string(data), `[plugins.'io.containerd.cri.v1.runtime']
-device_ownership_from_security_context = true`)
+
+	config := string(data)
+
+	const sectionHeader = `[plugins."io.containerd.grpc.v1.cri"]`
+
+	sectionStart := strings.Index(config, sectionHeader)
+	require.NotEqual(t, -1, sectionStart)
+
+	section := config[sectionStart+len(sectionHeader):]
+	if sectionEnd := strings.Index(section, "\n["); sectionEnd >= 0 {
+		section = section[:sectionEnd]
+	}
+
+	require.Contains(t, section, "device_ownership_from_security_context = true")
 }
 
 func TestConfigureContainerdUpdatesManagedGantryHostsConfig(t *testing.T) {
