@@ -420,6 +420,16 @@ func stageTargetWorkloads(ctx context.Context, t *testing.T, cli client.Client) 
 
 	mustCreate(ctx, t, cli, netController)
 	mustCreate(ctx, t, cli, netNode)
+
+	// net-node is not opt-outable, so every Site must have its per-Site node
+	// DaemonSet present and carrying the migrated config hash before the legacy
+	// blanket net-node is reaped (the base above covers only un-Sited nodes).
+	for _, site := range []string{"cluster", "edge", repairSite} {
+		perSiteNode := readyDaemonSet(targetNS, "unbounded-net-node-"+site)
+		perSiteNode.Spec.Template.Annotations = map[string]string{"unbounded-cloud.io/net-config-hash": configMapHash(netConfig)}
+		mustCreate(ctx, t, cli, perSiteNode)
+	}
+
 	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-cluster"))
 	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-edge"))
 	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-"+repairSite))
@@ -561,6 +571,11 @@ func updateTargetConfigHashes(ctx context.Context, t *testing.T, cli client.Clie
 	updateDaemonSetHash(ctx, t, cli, "unbounded-net-node", "unbounded-net-config", "unbounded-cloud.io/net-config-hash")
 
 	for _, site := range []string{"cluster", "edge", repairSite} {
+		updateDaemonSetHash(ctx, t, cli,
+			"unbounded-net-node-"+site,
+			"unbounded-net-config",
+			"unbounded-cloud.io/net-config-hash")
+
 		updateDaemonSetHash(ctx, t, cli,
 			"unbounded-storage-supervisor-"+site,
 			"unbounded-storage-config-"+site,
