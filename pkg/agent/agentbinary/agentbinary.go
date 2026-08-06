@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package agentbinary installs unbounded-agent binaries from release archives.
+// Package agentbinary installs and switches verified agent binaries from release archives.
 package agentbinary
 
 import (
@@ -26,7 +26,9 @@ const verifyTimeout = 30 * time.Second
 const daemonBinaryMode os.FileMode = 0o755
 
 // InstallFromTarGz downloads a remote .tar.gz archive and installs binaryName
-// from it to targetPath.
+// from it to targetPath. It is retained for the legacy Unbounded upgrade
+// contract, which does not provide an archive digest. New managed upgrade
+// callers should use SecureInstallAndSwitch.
 func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName string, perm os.FileMode) error {
 	parsedURL, err := url.Parse(downloadURL)
 	if err != nil {
@@ -85,6 +87,8 @@ func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error
 }
 
 // InstallAndSwitchFromTarGz installs the next agent binary and switches daemon links.
+// It is retained for the legacy Unbounded upgrade contract. New managed upgrade
+// callers should use SecureInstallAndSwitch.
 func InstallAndSwitchFromTarGz(ctx context.Context, downloadURL string, paths goalstates.AgentUpgradePaths, perm os.FileMode) error {
 	targetPath := paths.NextTargetPath()
 	if err := InstallFromTarGz(ctx, downloadURL, targetPath, goalstates.AgentUpgradeBinaryName, perm); err != nil {

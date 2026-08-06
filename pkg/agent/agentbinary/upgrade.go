@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,7 +22,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
@@ -29,6 +29,15 @@ const (
 	defaultMaxArchiveBytes = 256 << 20
 	defaultMaxBinaryBytes  = 256 << 20
 )
+
+// Layout describes caller-owned blue-green agent binary paths.
+type Layout struct {
+	BinaryPath   string
+	BluePath     string
+	GreenPath    string
+	CurrentPath  string
+	LastGoodPath string
+}
 
 // SecureInstallOptions configures a verified agent release archive install.
 type SecureInstallOptions struct {
@@ -62,6 +71,44 @@ func ValidateSecureInstallOptions(opts SecureInstallOptions) error {
 		return fmt.Errorf("expected archive member must be a base name")
 	}
 
+	if opts.Mode != 0 && opts.Mode.Perm() != opts.Mode {
+		return fmt.Errorf("agent binary mode must contain permission bits only")
+	}
+
+	if opts.MaxArchiveBytes < 0 || opts.MaxExtractedBytes < 0 {
+		return fmt.Errorf("agent archive size limits must not be negative")
+	}
+
+	if opts.MaxExtractedBytes > math.MaxInt64/2 {
+		return fmt.Errorf("maximum extracted size is too large")
+	}
+
+	return nil
+}
+
+// ValidateLayout verifies that all binary paths are clean, absolute, and distinct.
+func ValidateLayout(paths Layout) error {
+	values := []string{
+		paths.BinaryPath,
+		paths.BluePath,
+		paths.GreenPath,
+		paths.CurrentPath,
+		paths.LastGoodPath,
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+			return fmt.Errorf("invalid agent binary path %q", value)
+		}
+
+		if _, ok := seen[value]; ok {
+			return fmt.Errorf("duplicate agent binary path %q", value)
+		}
+
+		seen[value] = struct{}{}
+	}
+
 	return nil
 }
 
@@ -71,11 +118,15 @@ func ValidateSecureInstallOptions(opts SecureInstallOptions) error {
 func SecureInstallAndSwitch(
 	ctx context.Context,
 	log *slog.Logger,
-	paths goalstates.AgentUpgradePaths,
+	paths Layout,
 	opts SecureInstallOptions,
 ) (SwitchResult, error) {
 	if log == nil {
 		return SwitchResult{}, fmt.Errorf("logger is nil")
+	}
+
+	if err := ValidateLayout(paths); err != nil {
+		return SwitchResult{}, err
 	}
 
 	if err := ValidateSecureInstallOptions(opts); err != nil {
