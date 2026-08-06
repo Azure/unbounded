@@ -121,7 +121,7 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 
 			for _, field := range []string{"initContainers", "containers"} {
 				containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
-				if got := containers[0].(map[string]any)["image"]; got != "registry.example.com/azure/"+wantRepository+":v1.2.3" {
+				if got := containers[0].(map[string]any)["image"]; got != "registry.example.com/"+wantRepository+":v1.2.3" {
 					t.Fatalf("%s image = %q", field, got)
 				}
 			}
