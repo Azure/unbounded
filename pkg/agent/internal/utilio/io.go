@@ -22,14 +22,14 @@ var errFileTooLarge = errors.New("file exceeds maximum allowed size")
 // NOTE: we assume the filename is trusted and cleaned without path traversal characters.
 func InstallFile(filename string, r io.Reader, perm os.FileMode) error {
 	const maxFileSize = 1 * 1024 * 1024 * 1024 // 1 GiB
-	return installFileWithLimitedSize(filename, r, perm, maxFileSize)
+	return InstallFileWithLimitedSize(filename, r, perm, maxFileSize)
 }
 
-// installFileWithLimitedSize streams content to local file with limited size and specified permissions.
+// InstallFileWithLimitedSize streams content to a local file with limited size and specified permissions.
 // It ensures that the target directory exists and handles the file writing atomically.
 //
 // NOTE: we assume the filename is trusted and cleaned without path traversal characters.
-func installFileWithLimitedSize(filename string, r io.Reader, perm os.FileMode, maxBytes int64) error {
+func InstallFileWithLimitedSize(filename string, r io.Reader, perm os.FileMode, maxBytes int64) error {
 	if maxBytes <= 0 {
 		return fmt.Errorf("invalid maxBytes: %d", maxBytes)
 	}
