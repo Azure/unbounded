@@ -100,11 +100,73 @@ because unpacking is write-heavy.
 Gantry CPU is the exception. Gantry nodes pull layers, unpack them, and serve
 roughly 42 TB to peers, which puts them at 90.2% P95 CPU on 8 vCPU at 6
 concurrent downloads. Baseline nodes, doing only the first two, sit at 53.4%.
+That is worth watching as a headroom limit, but the delivery timeline below
+shows it is not what makes the Gantry phase slower.
 
-That headroom difference explains why raising concurrency helped baseline more
-than Gantry (20.5% versus 15.8% at P95) and why the Gantry-to-baseline P95 ratio
-worsened from 1.0823 to 1.1459. Feeding more concurrent streams to a node with
-no spare CPU does not help it.
+## The Gantry phase is slower because of its cold start, not contention
+
+Peer fetch outcomes over the whole Gantry-cold phase, summed across 1000 nodes:
+
+| Outcome | Count | Mean duration |
+| --- | ---: | ---: |
+| busy (HTTP 429) | 1,162,435 | 0.0015s |
+| hit | 41,789 | n/a |
+| stall | 31,339 | 60.0007s |
+| notfound | 10,164 | n/a |
+| unavailable | 4,668 | n/a |
+| digest_mismatch, auth, protocol, server, local error | 0 | n/a |
+
+Only 3.3% of attempts succeed, and there are 27.8 rejections per success. Those
+headline numbers invite two wrong conclusions, so both are worth ruling out.
+
+First, the rejections are almost entirely a startup transient. 99.6% of them
+occur in the first six minutes and 56% in the second minute alone, falling to
+zero by minute eleven. At 1.5ms each they cost about 1.7 seconds per node in
+total.
+
+Second, the stalls are not lost work. The 60.0007s mean is `PeerFetchTimeout`
+firing, but `livePeerStream` streams through to the containerd-facing response
+and records the verified byte offset, and re-selection resumes from that offset.
+A stall costs a DHT lookup and a redial, not the delivered prefix. Stalls also
+hold steady at roughly 3,700 per minute from minute four to minute ten, which is
+exactly when delivery runs at peak rate.
+
+What does explain the gap is the rate at which layer bytes reach nodes:
+
+| Minute | Layer GB served, all nodes | MB/s per node | Cumulative |
+| ---: | ---: | ---: | ---: |
+| 0 | 0 | 0.0 | 0.0% |
+| 1 | 936 | 15.6 | 2.2% |
+| 2 | 2,220 | 37.0 | 7.3% |
+| 3 | 4,306 | 71.8 | 17.4% |
+| 4 | 4,953 | 82.6 | 28.9% |
+| 5 to 9 | about 5,100 each | about 85 | 88.1% |
+| 10 | 4,617 | 77.0 | 98.9% |
+| 11 | 487 | 8.1 | 100.0% |
+
+Baseline reaches its full network rate inside the first minute because ACR is
+already at capacity. Gantry needs four minutes, because at the start of a cold
+run almost no node holds the image and there is nothing to serve. Supply has to
+be built before it can be consumed, and the 429 storm is the visible signature
+of that shortage rather than a cost in its own right.
+
+Once the swarm is warm, Gantry is the faster of the two. Node network receive
+peaks near 350 MB/s during the Gantry phase against about 182 MB/s for baseline.
+
+At the observed steady rate of about 5,087 GB per minute, all 42.95 TB would
+move in 8.4 minutes. It took roughly 11, so the cascade ramp costs about 2.6
+minutes. Byte delivery finishes at minute 11 while the phase runs to minute 18;
+that closing stretch is the serialized unpack draining, which matches the 334s
+of measured unpack work per node.
+
+| Component | Time | Attribution |
+| --- | ---: | --- |
+| Cascade cold-start ramp | about 2.6 min | Gantry only |
+| Steady-state delivery | about 8.4 min | Gantry faster than baseline |
+| Serialized unpack tail | about 5.6 min | both phases |
+
+Gantry's total penalty against baseline in this run was 1.7 minutes, less than
+the ramp alone, because its steady-state throughput recovers part of the deficit.
 
 ## Byte reduction is unaffected and remains the headline
 
@@ -127,18 +189,28 @@ Gantry-to-baseline P95 ratio of 1.0. Every other sample in `RESULTS.md` used
 3. `max_concurrent_unpacks = 1` leaves roughly 333s of strictly serialized work
    per node, now 36-44% of the pull. Overlayfs supports the `rebase` capability
    needed to parallelize it, so this is the largest untested lever.
-4. Gantry's constraint is node CPU, not network. At 90.2% P95 CPU it cannot
-   convert extra download concurrency into speed, so raising concurrency alone
-   widens the gap against baseline rather than closing it.
-5. Gantry's value on this workload is the 99.5% reduction in registry egress
+4. The Gantry phase is slower than baseline because of its cold start. Delivery
+   takes four minutes to reach full rate while baseline is there in one, costing
+   about 2.6 minutes. Neither the 429 storm nor the 60s stalls are the cost:
+   the first is a startup transient at 1.5ms each, and the second preserves the
+   delivered prefix and occurs while delivery is at peak rate.
+5. Once warm, Gantry delivers faster than pulling from the registry, peaking
+   near 350 MB/s per node against about 182 MB/s for baseline.
+6. `PeerFetchTimeout` is a total request deadline rather than a no-progress
+   deadline, so the throughput a stream must sustain to survive it scales with
+   layer size: 17.9 MB/s for a 1 GiB layer, 716 MB/s for a 40 GiB one. This did
+   not dominate these runs, but it does not scale to larger layers. containerd's
+   own `image_pull_progress_timeout` uses no-progress semantics by contrast.
+7. Gantry's value on this workload is the 99.5% reduction in registry egress
    and origin pulls, not pod startup latency, which stays 15-22% above baseline.
 
 ## Suggested next experiments
 
 - `max_concurrent_unpacks = 4` at `max_concurrent_downloads = 6`, changing one
   variable from the run above. Watch disk busy, which is already at 73.7% P95.
-- A larger node SKU or a smaller peer-serving fan-out for the Gantry phase, to
-  test whether Gantry latency is CPU-bound as the data suggests.
+- Anything that shortens the cascade ramp, since that is the whole Gantry
+  penalty. Seeding more than the observed 223 origin pulls before the fan-out
+  begins is the obvious direction to test.
 - Do not raise `max_concurrent_downloads` past 6 until unpack concurrency is
   addressed, since byte-waiting is no longer the majority of baseline pull time.
 
@@ -165,3 +237,9 @@ Node resource utilization is under `.prometheus[] | select(.name == "<capture>")
 | .response.data.result` in the phase performance artifacts, using capture names
 `node_cpu_busy_ratio`, `node_disk_busy_ratio`, and
 `node_network_receive_utilization_ratio`.
+
+Peer fetch outcomes, DHT results, and layer bytes served use the same path with
+capture names `gantry_peer_outcomes`, `gantry_peer_duration`,
+`gantry_dht_outcomes`, `gantry_dht_duration`, and `gantry_mirror_bytes`. These
+are counters, so a phase total is the last sample minus the first, summed across
+pods; bin those per-sample increases by minute to recover the timelines above.

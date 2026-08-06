@@ -88,11 +88,12 @@ override removed, so both phases used the containerd default of 3.
 <sup>4</sup> Run `run-20260806-205719-51c38730`, reported **FAIL**. Same cluster
 as footnote 3 with the containerd transfer-service override restored to 6
 concurrent downloads, isolating that one variable. Both phases got faster:
-baseline P95 improved 20.5% and Gantry P95 improved 15.8%. Baseline gained more
-because Gantry nodes were already near their CPU limit at 90.2% P95 while
-serving peers, so the P95 ratio worsened from 1.0823 to 1.1459 and again
-exceeded the 1.0 gate this run used. All 2000 pods succeeded with no image-pull
-backoff and no origin fallbacks. See
+baseline P95 improved 20.5% and Gantry P95 improved 15.8%. The remaining gap is
+Gantry's cold start: layer delivery takes four minutes to reach full rate while
+baseline is at full rate within one, costing about 2.6 minutes. Once warm,
+Gantry delivers faster than the registry. The P95 ratio was 1.1459 and exceeded
+the 1.0 gate this run used. All 2000 pods succeeded with no image-pull backoff
+and no origin fallbacks. See
 [PULL-LATENCY-ANALYSIS.md](PULL-LATENCY-ANALYSIS.md).
 
 #### Latency excluding image-pull backoff
