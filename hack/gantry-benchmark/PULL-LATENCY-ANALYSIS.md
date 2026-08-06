@@ -168,6 +168,52 @@ of measured unpack work per node.
 Gantry's total penalty against baseline in this run was 1.7 minutes, less than
 the ramp alone, because its steady-state throughput recovers part of the deficit.
 
+### The ramp exists because every node pulls layers in the same order
+
+containerd walks the manifest in order, so all 1000 nodes request layer
+positions in the same sequence. The containerd journal records each
+`layer unpacked` event with its digest, and the completions fall into strict
+waves. Seconds are measured from the first event in the phase.
+
+| Gantry-cold layer | events | first | median | last |
+| --- | ---: | ---: | ---: | ---: |
+| `6a98e6e4b146` | 2000 | 0 | 114 | 232 |
+| `b407264bc620` | 2000 | 8 | 121 | 243 |
+| `06e50d442e52` | 2000 | 15 | 129 | 255 |
+| `8d171b1dbb8e` | 2000 | 21 | 138 | 266 |
+| `c3e575abbc22` | 2000 | 28 | 147 | 275 |
+| `5843544c2584` | 2000 | 36 | 155 | 285 |
+| `1af94d827f87` | 2000 | 43 | 163 | 297 |
+
+Each layer's first completion trails the previous one by roughly 7 seconds, and
+the medians advance in the same order. Independent per-node layer selection
+would instead produce overlapping distributions starting near zero. The 7 second
+step also matches the serialized unpack cost, so the wavefront advances at about
+the speed of one layer.
+
+Extrapolating that step across 40 layers puts the first seed for the final layer
+near 280 seconds, which is the same scale as the observed four minute ramp.
+Until some node has worked through the preceding layers, the later positions
+have no seeder anywhere in the swarm, so demand for them cannot be served at any
+price.
+
+Baseline is the control. It shows the same stagger, with first completions at 0,
+6, 13, 22, 29, 36 and 44 seconds, because it uses the same manifest order. It
+has no ramp at all, because ACR already holds every layer at t=0. Uniform
+ordering is therefore harmless when supply exists and expensive only when supply
+has to be built.
+
+This also re-explains the 429 storm. The rejections are not diffuse contention:
+1000 nodes want the same layer at the same moment, which saturates whichever few
+nodes hold it. Concentrated demand on a narrow wavefront is the cause, and the
+serve cap is what makes it visible.
+
+The journal capture is truncated to 7 distinct layers per phase, and the 2000
+events per layer indicate some line duplication in the capture, so the ordering
+and the 7 second step are measured while the 40 layer figure is arithmetic.
+Capturing the full journal, or timestamping per-digest mirror advertisements,
+would close that gap.
+
 ## Byte reduction is unaffected and remains the headline
 
 | Run | ACR bytes | Byte reduction | Pulls B/G | Peer bytes served | Fallbacks |
@@ -194,23 +240,30 @@ Gantry-to-baseline P95 ratio of 1.0. Every other sample in `RESULTS.md` used
    about 2.6 minutes. Neither the 429 storm nor the 60s stalls are the cost:
    the first is a startup transient at 1.5ms each, and the second preserves the
    delivered prefix and occurs while delivery is at peak rate.
-5. Once warm, Gantry delivers faster than pulling from the registry, peaking
+5. The ramp exists because every node walks the manifest in the same order, so
+   the swarm seeds one layer position at a time instead of all 40 at once. Layer
+   completions arrive in strict waves about 7 seconds apart. Baseline shows the
+   same ordering and no ramp, which isolates ordering as costly only when supply
+   must be built rather than already existing at the origin.
+6. Once warm, Gantry delivers faster than pulling from the registry, peaking
    near 350 MB/s per node against about 182 MB/s for baseline.
-6. `PeerFetchTimeout` is a total request deadline rather than a no-progress
+7. `PeerFetchTimeout` is a total request deadline rather than a no-progress
    deadline, so the throughput a stream must sustain to survive it scales with
    layer size: 17.9 MB/s for a 1 GiB layer, 716 MB/s for a 40 GiB one. This did
    not dominate these runs, but it does not scale to larger layers. containerd's
    own `image_pull_progress_timeout` uses no-progress semantics by contrast.
-7. Gantry's value on this workload is the 99.5% reduction in registry egress
+8. Gantry's value on this workload is the 99.5% reduction in registry egress
    and origin pulls, not pod startup latency, which stays 15-22% above baseline.
 
 ## Suggested next experiments
 
 - `max_concurrent_unpacks = 4` at `max_concurrent_downloads = 6`, changing one
   variable from the run above. Watch disk busy, which is already at 73.7% P95.
-- Anything that shortens the cascade ramp, since that is the whole Gantry
-  penalty. Seeding more than the observed 223 origin pulls before the fan-out
-  begins is the obvious direction to test.
+- Desynchronize layer acquisition order across nodes so the swarm seeds every
+  layer position at once instead of advancing a single wavefront. With 1000
+  nodes and 40 layers, starting nodes at staggered offsets would put a seed on
+  every position within roughly one layer-time rather than 40. This targets the
+  ramp, which is the entire Gantry penalty.
 - Do not raise `max_concurrent_downloads` past 6 until unpack concurrency is
   addressed, since byte-waiting is no longer the majority of baseline pull time.
 
@@ -223,6 +276,13 @@ r=/var/lib/gantry-benchmark/artifacts/<run-id>
 grep -ao 'msg=\\"layer unpacked\\" duration=[0-9.]*[a-z]*' "$r/baseline-performance.json"
 grep -ao 'msg=\\"image unpacked\\"[^|]\{0,400\}' "$r/baseline-performance.json"
 grep -ao 'parallel=[a-z]*' "$r/baseline-performance.json" | sort | uniq -c
+```
+
+Per-layer completion order, which shows the wavefront:
+
+```bash
+grep -ao 'time=\\"[0-9T:.Z-]*\\" level=debug msg=\\"layer unpacked\\" duration=[0-9.a-z]* layer=\\"sha256:[0-9a-f]*' \
+  "$r/gantry_cold-performance.json"
 ```
 
 Audit-derived latency decomposition:
