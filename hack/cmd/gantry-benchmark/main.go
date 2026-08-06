@@ -23,8 +23,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := runCLI(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	stdout := &timestampWriter{target: os.Stdout}
+	stderr := &timestampWriter{target: os.Stderr}
+
+	defer func() {
+		stdout.Flush()
+		stderr.Flush()
+	}()
+
+	if err := runCLI(ctx, os.Args[1:], stdout, stderr); err != nil {
+		writeAll(stderr, err.Error()+"\n")
+		stdout.Flush()
+		stderr.Flush()
 		os.Exit(1)
 	}
 }

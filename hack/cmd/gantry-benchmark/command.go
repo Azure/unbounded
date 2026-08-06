@@ -10,6 +10,8 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 )
 
 type commandRunner interface {
@@ -116,6 +118,73 @@ func (w *prefixWriter) emit(line []byte) {
 	}
 
 	writeAll(w.target, w.prefix+trimmed+"\n")
+}
+
+// timestampWriter prefixes each complete line with a UTC timestamp. It is
+// applied once at the process boundary so every progress line is stamped, and
+// its lock also serializes the concurrent pull-progress reporter.
+type timestampWriter struct {
+	target  io.Writer
+	now     func() time.Time
+	mu      sync.Mutex
+	pending []byte
+}
+
+func (w *timestampWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.pending = append(w.pending, p...)
+
+	for {
+		index := bytes.IndexByte(w.pending, '\n')
+		if index < 0 {
+			break
+		}
+
+		line := w.pending[:index]
+		w.pending = w.pending[index+1:]
+
+		if err := w.emit(line); err != nil {
+			return len(p), err
+		}
+	}
+
+	return len(p), nil
+}
+
+// Flush writes any line not terminated by a newline, so a final partial line
+// is not lost when the process exits.
+func (w *timestampWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if len(w.pending) == 0 {
+		return
+	}
+
+	line := w.pending
+	w.pending = nil
+
+	_ = w.emit(line) //nolint:errcheck // Progress output is best effort.
+}
+
+func (w *timestampWriter) emit(line []byte) error {
+	// Blank separator lines stay blank rather than becoming a bare timestamp.
+	if len(bytes.TrimSpace(line)) == 0 {
+		_, err := io.WriteString(w.target, "\n")
+
+		return err
+	}
+
+	clock := w.now
+	if clock == nil {
+		clock = time.Now
+	}
+
+	_, err := io.WriteString(w.target, clock().UTC().Format("2006-01-02T15:04:05Z")+" "+string(line)+"\n")
+
+	return err
 }
 
 func writeAll(writer io.Writer, value string) {

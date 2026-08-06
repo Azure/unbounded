@@ -88,6 +88,7 @@ status_once() {
 }
 
 if [[ "$follow" == false ]]; then
+  printf '%s snapshot\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   status_once
   exit 0
 fi
@@ -95,6 +96,7 @@ fi
 while true; do
   printf '\033[2J\033[H'
   status=$(status_once)
+  printf '%s snapshot (refreshing every %ss)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WATCH_INTERVAL_SECONDS"
   printf '%s\n' "$status"
 
   service=$(awk -F': ' '/^service: /{print $2; exit}' <<<"$status")

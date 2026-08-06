@@ -32,6 +32,8 @@ chmod 0700 "$HOME"
 LOG_FILE="$BENCHMARK_ARTIFACT_ROOT/operator.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+log() { printf '%s [operator] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+
 run_id=""
 run_status=0
 cleanup_started=false
@@ -66,7 +68,7 @@ cleanup() {
   if [[ -f "$KUBECONFIG" ]]; then
     if kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state >/dev/null 2>&1 || \
       kubectl -n "${GANTRY_NAMESPACE:-gantry-system}" get configmap gantry-benchmark-lock >/dev/null 2>&1; then
-      echo "restoring benchmark cluster state"
+      log "restoring benchmark cluster state"
       make -C "$BENCHMARK_REPO_ROOT/hack/gantry-benchmark" disable || original_status=$?
     fi
   fi
@@ -104,7 +106,7 @@ trap 'exit 143' TERM
 cd "$BENCHMARK_REPO_ROOT"
 
 write_progress "authenticate" "authenticating managed identity and loading kubeconfig"
-echo "authenticating operator VM managed identity"
+log "authenticating operator VM managed identity"
 az login --identity --allow-no-subscriptions --output none
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 
@@ -119,7 +121,7 @@ chmod 0600 "$KUBECONFIG"
 
 kubectl auth can-i '*' '*' --all-namespaces | grep -qx yes
 export BENCHMARK_CONFIRM_CONTEXT="$(kubectl config current-context)"
-echo "using Kubernetes context $BENCHMARK_CONFIRM_CONTEXT"
+log "using Kubernetes context $BENCHMARK_CONFIRM_CONTEXT"
 
 if kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state >/dev/null 2>&1; then
   echo "an active benchmark state already exists; run disable before starting a new VM lifecycle" >&2
@@ -129,7 +131,7 @@ fi
 write_progress "enable" "installing benchmark state, lock, and monitoring"
 make -C hack/gantry-benchmark enable
 run_id=$(kubectl -n "${BENCHMARK_NAMESPACE:-gantry-benchmark}" get configmap gantry-benchmark-state -o jsonpath='{.data.state\.json}' | jq -er '.run_id')
-echo "enabled benchmark $run_id"
+log "enabled benchmark $run_id"
 if [[ -n "${ADOPT_BASELINE_IMAGE:-}" || -n "${ADOPT_GANTRY_IMAGE:-}" || -n "${ADOPT_PAYLOAD_SHA256:-}" ]]; then
   : "${ADOPT_BASELINE_IMAGE:?Set ADOPT_BASELINE_IMAGE with the full adoption set}"
   : "${ADOPT_GANTRY_IMAGE:?Set ADOPT_GANTRY_IMAGE with the full adoption set}"

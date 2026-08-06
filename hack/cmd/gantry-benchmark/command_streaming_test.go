@@ -155,3 +155,97 @@ func slicesEqual(a, b []string) bool {
 
 	return true
 }
+
+func TestTimestampWriterStampsEveryLine(t *testing.T) {
+	var target bytes.Buffer
+
+	fixed := time.Date(2026, 8, 6, 19, 30, 5, 0, time.UTC)
+	writer := &timestampWriter{target: &target, now: func() time.Time { return fixed }}
+
+	if _, err := writer.Write([]byte("first\nsecond\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	want := "2026-08-06T19:30:05Z first\n2026-08-06T19:30:05Z second\n"
+	if target.String() != want {
+		t.Fatalf("output = %q, want %q", target.String(), want)
+	}
+}
+
+// Progress arriving in fragments must still produce exactly one stamp per line.
+func TestTimestampWriterStampsOncePerLineAcrossPartialWrites(t *testing.T) {
+	var target bytes.Buffer
+
+	fixed := time.Date(2026, 8, 6, 19, 30, 5, 0, time.UTC)
+	writer := &timestampWriter{target: &target, now: func() time.Time { return fixed }}
+
+	for _, fragment := range []string{"pay", "load ", "layer 1/40"} {
+		if _, err := writer.Write([]byte(fragment)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	if target.String() != "" {
+		t.Fatalf("partial line emitted before newline: %q", target.String())
+	}
+
+	if _, err := writer.Write([]byte("\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	want := "2026-08-06T19:30:05Z payload layer 1/40\n"
+	if target.String() != want {
+		t.Fatalf("output = %q, want %q", target.String(), want)
+	}
+}
+
+func TestTimestampWriterFlushEmitsTrailingLine(t *testing.T) {
+	var target bytes.Buffer
+
+	fixed := time.Date(2026, 8, 6, 19, 30, 5, 0, time.UTC)
+	writer := &timestampWriter{target: &target, now: func() time.Time { return fixed }}
+
+	if _, err := writer.Write([]byte("no trailing newline")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	writer.Flush()
+
+	want := "2026-08-06T19:30:05Z no trailing newline\n"
+	if target.String() != want {
+		t.Fatalf("output = %q, want %q", target.String(), want)
+	}
+}
+
+func TestTimestampWriterIsConcurrencySafe(t *testing.T) {
+	var target bytes.Buffer
+
+	writer := &timestampWriter{target: &target}
+
+	var group sync.WaitGroup
+
+	for i := range 8 {
+		group.Add(1)
+
+		go func() {
+			defer group.Done()
+
+			for j := range 25 {
+				writeAll(writer, fmt.Sprintf("worker %d line %d\n", i, j))
+			}
+		}()
+	}
+
+	group.Wait()
+
+	lines := strings.Split(strings.TrimRight(target.String(), "\n"), "\n")
+	if len(lines) != 200 {
+		t.Fatalf("lines = %d, want 200", len(lines))
+	}
+
+	for _, line := range lines {
+		if !strings.Contains(line, "Z worker ") {
+			t.Fatalf("line is missing its timestamp: %q", line)
+		}
+	}
+}

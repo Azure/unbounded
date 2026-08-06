@@ -185,7 +185,7 @@ assert_default MONITORING_NAMESPACE "$MONITORING_NAMESPACE" monitoring
 assert_default KPS_RELEASE "$KPS_RELEASE" kps
 assert_default PROMETHEUS_SERVICE "$PROMETHEUS_SERVICE" kps-kube-prometheus-stack-prometheus
 
-log() { printf '[deploy] %s\n' "$*"; }
+log() { printf '%s [deploy] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || { echo "required command not found: $1" >&2; exit 1; }
