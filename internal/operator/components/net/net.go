@@ -328,54 +328,61 @@ func pointNodeDaemonSetAtSiteConfig(site *unboundedv1alpha3.Site, obj *unstructu
 	return repointConfigEnv(obj, configName, siteConfig)
 }
 
-// repointConfigEnv rewrites every container env var that sources a value from
-// the old ConfigMap to the new one, so per-Site node pods read LOG_LEVEL (and any
-// other configMapKeyRef) from their own config.
+// repointConfigEnv rewrites every container env var (init and main) that sources
+// a value from the old ConfigMap to the new one, so per-Site node pods read
+// LOG_LEVEL (and any other configMapKeyRef) from their own config.
 func repointConfigEnv(obj *unstructured.Unstructured, oldName, newName string) error {
-	containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
-	if err != nil {
-		return fmt.Errorf("get net node containers: %w", err)
-	}
+	for _, field := range []string{"initContainers", "containers"} {
+		containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		if err != nil {
+			return fmt.Errorf("get net node %s: %w", field, err)
+		}
 
-	if !found {
-		return nil
-	}
-
-	for i := range containers {
-		container, ok := containers[i].(map[string]any)
-		if !ok {
+		if !found {
 			continue
 		}
 
-		envVars, ok := container["env"].([]any)
-		if !ok {
-			continue
+		changed := false
+
+		for i := range containers {
+			container, ok := containers[i].(map[string]any)
+			if !ok {
+				continue
+			}
+
+			envVars, ok := container["env"].([]any)
+			if !ok {
+				continue
+			}
+
+			for j := range envVars {
+				envVar, ok := envVars[j].(map[string]any)
+				if !ok {
+					continue
+				}
+
+				valueFrom, ok := envVar["valueFrom"].(map[string]any)
+				if !ok {
+					continue
+				}
+
+				ref, ok := valueFrom["configMapKeyRef"].(map[string]any)
+				if !ok {
+					continue
+				}
+
+				if ref["name"] == oldName {
+					ref["name"] = newName
+					changed = true
+				}
+			}
 		}
 
-		for j := range envVars {
-			envVar, ok := envVars[j].(map[string]any)
-			if !ok {
-				continue
-			}
-
-			valueFrom, ok := envVar["valueFrom"].(map[string]any)
-			if !ok {
-				continue
-			}
-
-			ref, ok := valueFrom["configMapKeyRef"].(map[string]any)
-			if !ok {
-				continue
-			}
-
-			if ref["name"] == oldName {
-				ref["name"] = newName
+		if changed {
+			if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", field); err != nil {
+				return fmt.Errorf("set net node %s: %w", field, err)
 			}
 		}
-	}
-
-	if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers"); err != nil {
-		return fmt.Errorf("set net node containers: %w", err)
 	}
 
 	return nil
@@ -514,11 +521,15 @@ func seedSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1al
 		return nil, fmt.Errorf("get net config to seed site %s: %w", site.Name, err)
 	}
 
+	// Deep-copy the payload so the per-Site ConfigMap does not alias the shared
+	// config's maps (a later mutation of either must not affect the other).
+	payload := shared.DeepCopy()
+
 	cm := &corev1.ConfigMap{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{Name: SiteConfigName(site.Name), Namespace: env.Namespace, OwnerReferences: []metav1.OwnerReference{component.SiteOwnerReference(site)}},
-		Data:       shared.Data,
-		BinaryData: shared.BinaryData,
+		Data:       payload.Data,
+		BinaryData: payload.BinaryData,
 	}
 
 	return cm, nil

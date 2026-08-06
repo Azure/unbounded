@@ -551,11 +551,15 @@ func seedSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1al
 		return nil, fmt.Errorf("get gantry config to seed site %s: %w", site.Name, err)
 	}
 
+	// Deep-copy the payload so the per-Site ConfigMap does not alias the shared
+	// config's maps (a later mutation of either must not affect the other).
+	payload := shared.DeepCopy()
+
 	cm := &corev1.ConfigMap{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{Name: SiteConfigName(site.Name), Namespace: env.Namespace, OwnerReferences: []metav1.OwnerReference{component.SiteOwnerReference(site)}},
-		Data:       shared.Data,
-		BinaryData: shared.BinaryData,
+		Data:       payload.Data,
+		BinaryData: payload.BinaryData,
 	}
 
 	return cm, nil

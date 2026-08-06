@@ -350,6 +350,38 @@ func TestScopeNodeDaemonSetToSite(t *testing.T) {
 	}
 }
 
+func TestRepointConfigEnvCoversInitAndMainContainers(t *testing.T) {
+	envWithRef := func(name string) []any {
+		return []any{map[string]any{
+			"name":      "LOG_LEVEL",
+			"valueFrom": map[string]any{"configMapKeyRef": map[string]any{"name": name, "key": "LOG_LEVEL"}},
+		}}
+	}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			"initContainers": []any{map[string]any{"name": "install", "env": envWithRef(configName)}},
+			"containers":     []any{map[string]any{"name": "node", "env": envWithRef(configName)}},
+		}}},
+	}}
+
+	if err := repointConfigEnv(obj, configName, "unbounded-net-config-edge"); err != nil {
+		t.Fatalf("repointConfigEnv: %v", err)
+	}
+
+	// Both the init container and the main container are repointed.
+	for _, field := range []string{"initContainers", "containers"} {
+		containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", field)
+		container := containers[0].(map[string]any)
+		envVar := container["env"].([]any)[0].(map[string]any)
+		ref := envVar["valueFrom"].(map[string]any)["configMapKeyRef"].(map[string]any)
+
+		if ref["name"] != "unbounded-net-config-edge" {
+			t.Fatalf("%s configMapKeyRef = %q, want per-site config", field, ref["name"])
+		}
+	}
+}
+
 func TestEnsureSiteConfigSeedsFromSharedConfig(t *testing.T) {
 	shared := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: configName, Namespace: component.DefaultNamespace},
