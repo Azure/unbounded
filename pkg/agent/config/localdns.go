@@ -92,8 +92,10 @@ func (a *AgentConfig) validateLocalDNS() error {
 		errs = append(errs, fmt.Errorf("Cluster.ClusterDNS must be distinct from LocalDNS listeners"))
 	}
 
-	if _, err := resolveLocalDNSMetricsAddress(c.MetricsAddress, a.Kubelet.NodeIP); err != nil {
-		errs = append(errs, fmt.Errorf("LocalDNS.MetricsAddress: %w", err))
+	if strings.TrimSpace(c.MetricsAddress) != "" {
+		if err := validateLocalDNSMetricsAddress(c.MetricsAddress); err != nil {
+			errs = append(errs, fmt.Errorf("LocalDNS.MetricsAddress: %w", err))
+		}
 	}
 
 	if c.CPULimitInMilliCores != nil && *c.CPULimitInMilliCores <= 0 {
@@ -147,34 +149,22 @@ func parseLocalDNSIPv4(value string) (netip.Addr, error) {
 	return addr, nil
 }
 
-func resolveLocalDNSMetricsAddress(configured, nodeIP string) (string, error) {
-	address := strings.TrimSpace(configured)
-	if address == "" {
-		for _, candidate := range strings.Split(nodeIP, ",") {
-			addr, err := netip.ParseAddr(strings.TrimSpace(candidate))
-			if err == nil && addr.Is4() && !addr.IsUnspecified() {
-				return net.JoinHostPort(addr.String(), DefaultLocalDNSMetricsPort), nil
-			}
-		}
-
-		return "", fmt.Errorf("is required when Kubelet.NodeIP has no IPv4 address")
-	}
-
-	host, port, err := net.SplitHostPort(address)
+func validateLocalDNSMetricsAddress(configured string) error {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(configured))
 	if err != nil {
-		return "", fmt.Errorf("must use IP:port syntax: %w", err)
+		return fmt.Errorf("must use IP:port syntax: %w", err)
 	}
 
 	if _, err := parseLocalDNSIPv4(host); err != nil {
-		return "", err
+		return err
 	}
 
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return "", fmt.Errorf("port must be between 1 and 65535")
+		return fmt.Errorf("port must be between 1 and 65535")
 	}
 
-	return address, nil
+	return nil
 }
 
 func defaultString(value, fallback string) string {
