@@ -20,8 +20,10 @@ metadata:
     app.kubernetes.io/name: unbounded-operator
     app.kubernetes.io/component: controller
 data:
-  # Registry prefix for all operator-managed first-party component images.
-  UNBOUNDED_IMAGE_REGISTRY: {{ default "ghcr.io" .ImageRegistry | quote }}
+  # Full image-repository prefix (registry host plus org/namespace) for all
+  # operator-managed first-party component images. The flat component name and
+  # operator version are appended, so ghcr.io/azure yields ghcr.io/azure/machina.
+  UNBOUNDED_IMAGE_REGISTRY: {{ default "ghcr.io/azure" .ImageRegistry | quote }}
   # External Kubernetes API endpoint advertised to provisioned machines. Remote
   # nodes dial this to join, so it must be reachable from outside the cluster.
   # Leave empty to let the operator auto-discover it: it prefers the standard

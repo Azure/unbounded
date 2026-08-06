@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -350,7 +351,7 @@ func TestWatchMachineOperationUsesResourceVersion(t *testing.T) {
 
 	c := &recordingWatchClient{}
 
-	err := watchMachineOperationFromResourceVersion(context.Background(), c, "op-1", "12345")
+	err := watchMachineOperationFromResourceVersion(context.Background(), c, "op-1", "12345", io.Discard)
 	require.Error(t, err)
 	require.Equal(t, "12345", c.resourceVersion)
 	require.Equal(t, "metadata.name=op-1", c.fieldSelector)

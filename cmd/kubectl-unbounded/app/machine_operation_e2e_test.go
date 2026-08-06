@@ -117,18 +117,15 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 		require.Equal(t, "worker-01", op.OwnerReferences[0].Name)
 	})
 
-	replaceStdout := captureStdout(t, func() {
-		out, err = executeKubectlUnboundedMachineCommand(
-			ctx, rt,
-			"machine", "replace", "worker-01",
-			"--force",
-			"--operation-name", "replace-worker-01",
-			"--wait=false",
-		)
-	})
+	out, err = executeKubectlUnboundedMachineCommand(
+		ctx, rt,
+		"machine", "replace", "worker-01",
+		"--force",
+		"--operation-name", "replace-worker-01",
+		"--wait=false",
+	)
 	require.NoError(t, err)
-	require.Empty(t, out)
-	require.Contains(t, replaceStdout, "Replacing Machine worker-01")
+	require.Contains(t, out, "Replacing Machine worker-01")
 	assertMachineOperation(t, ctx, c, "replace-worker-01", func(op v1alpha3.MachineOperation) {
 		require.Equal(t, "worker-01", op.Spec.MachineRef)
 		require.Equal(t, v1alpha3.OperationHostReplace, op.Spec.OperationKind)
@@ -136,17 +133,12 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 		require.Equal(t, "worker-01", op.OwnerReferences[0].Name)
 	})
 
-	var waitOut string
-
-	stdout := captureStdout(t, func() {
-		waitOut, err = executeKubectlUnboundedMachineCommand(
-			ctx, rt,
-			"machine", "operation", "wait", "wait-complete",
-		)
-	})
+	out, err = executeKubectlUnboundedMachineCommand(
+		ctx, rt,
+		"machine", "operation", "wait", "wait-complete",
+	)
 	require.NoError(t, err)
-	require.Empty(t, waitOut)
-	require.Contains(t, strings.TrimSpace(stdout), "ready")
+	require.Contains(t, strings.TrimSpace(out), "ready")
 }
 
 func newMachineOperationE2ERuntime(c client.WithWatch) *machineCommandRuntime {

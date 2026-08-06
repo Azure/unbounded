@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -33,7 +34,7 @@ operation and updates MachineOperation status to "Complete" or "Failed".`,
 				return err
 			}
 
-			return runHardReboot(ctx, c, args[0], ttl)
+			return runHardReboot(ctx, c, args[0], ttl, cmd.OutOrStdout())
 		},
 	}
 
@@ -43,16 +44,16 @@ operation and updates MachineOperation status to "Complete" or "Failed".`,
 	return cmd
 }
 
-func runHardReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32) error {
+func runHardReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, out io.Writer) error {
 	opName := fmt.Sprintf("%s-hard-reboot-%d", name, time.Now().Unix())
 
 	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostReboot, ttlSeconds); err != nil {
 		return err
 	}
 
-	printStep(fmt.Sprintf("Hard-rebooting Machine %s...", name))
-	printConfig("operation", opName)
-	fmt.Println()
+	printStep(out, fmt.Sprintf("Hard-rebooting Machine %s...", name))
+	printConfig(out, "operation", opName)
+	fprintln(out)
 
-	return watchMachineOperation(ctx, c, opName)
+	return watchMachineOperation(ctx, c, opName, out)
 }
