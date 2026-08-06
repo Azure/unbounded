@@ -47,6 +47,24 @@ type SwitchResult struct {
 	CurrentPath  string
 }
 
+// ValidateSecureInstallOptions validates caller-provided secure install inputs.
+func ValidateSecureInstallOptions(opts SecureInstallOptions) error {
+	if _, err := validateSecureDownloadURL(opts.DownloadURL); err != nil {
+		return err
+	}
+
+	if _, err := parseSHA256(opts.ExpectedSHA256); err != nil {
+		return err
+	}
+
+	expectedMember := strings.TrimSpace(opts.ExpectedMember)
+	if expectedMember == "" || filepath.Base(expectedMember) != expectedMember {
+		return fmt.Errorf("expected archive member must be a base name")
+	}
+
+	return nil
+}
+
 // SecureInstallAndSwitch downloads and verifies an HTTPS release archive,
 // installs its only member into the inactive slot, and atomically updates the
 // last-good and current links.
@@ -60,6 +78,10 @@ func SecureInstallAndSwitch(
 		return SwitchResult{}, fmt.Errorf("logger is nil")
 	}
 
+	if err := ValidateSecureInstallOptions(opts); err != nil {
+		return SwitchResult{}, err
+	}
+
 	parsedURL, err := validateSecureDownloadURL(opts.DownloadURL)
 	if err != nil {
 		return SwitchResult{}, err
@@ -71,9 +93,6 @@ func SecureInstallAndSwitch(
 	}
 
 	opts.ExpectedMember = strings.TrimSpace(opts.ExpectedMember)
-	if opts.ExpectedMember == "" || filepath.Base(opts.ExpectedMember) != opts.ExpectedMember {
-		return SwitchResult{}, fmt.Errorf("expected archive member must be a base name")
-	}
 
 	if opts.Mode == 0 {
 		opts.Mode = daemonBinaryMode
