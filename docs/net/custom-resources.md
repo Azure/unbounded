@@ -134,12 +134,24 @@ empty, the operator-wide registry is used.
 The override applies to the four operator-managed workloads that run on a site's
 nodes: `unbounded-net-node`, `gantry`, `metalman`, and the
 `unbounded-storage-supervisor`. The control-plane components (the net controller
-and machina) are unaffected. Each of these workloads runs as a per-site
-DaemonSet/Deployment (`<component>-<site>`) scheduled onto the site's nodes via
-the `unbounded-cloud.io/site` label, with its own per-site config ConfigMap
-(`<config>-<site>`) seeded from the shared default so existing tuning carries
-over. Nodes that do not belong to any site (for example control-plane nodes) keep
-running the cluster-wide "base" workloads from the operator-wide registry.
+and machina) are unaffected. Each of these runs as a per-site DaemonSet/Deployment
+(`<component>-<site>`) scheduled onto the site's nodes via the
+`unbounded-cloud.io/site` label. Nodes that do not belong to any site (for example
+control-plane nodes) keep running a cluster-wide "base" workload from the
+operator-wide registry.
+
+Per-site configuration:
+
+- **`unbounded-net-node`** mounts a per-site config (`unbounded-net-config-<site>`)
+  seeded from the shared `unbounded-net-config`. The operator keeps a per-site
+  config tracking the shared config until you edit it: while the per-site copy is
+  unchanged from what it was seeded with, a later change to the shared config is
+  propagated to it; once you edit the per-site copy it is preserved and no longer
+  overwritten.
+- **`gantry`** mounts a per-site config (`gantry-config-<site>`) seeded from the
+  shared `gantry-config`. This is site-owned (for example each site's
+  `upstream_registries`): it is preserved across reconciles and across a temporary
+  `gantry.enabled=false`, and is removed only when the Site is deleted.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -163,9 +175,14 @@ spec:
   be reachable on every node (re)start.
 - The `gantry` pod's busybox init container is a third-party image
   (`mcr.microsoft.com/...`) and is not repointed by this override.
-- The first time an override is set on a site, each of the site's nodes hands the
-  affected workload off from the base to the per-site copy, causing a brief
-  restart on those nodes.
+- On the upgrade that introduces per-site DaemonSets, each site's nodes hand
+  `unbounded-net-node` (and `gantry`) off from the base to the per-site copy. Only
+  one net-node can own a node's dataplane at a time, so this is a brief restart
+  per node, equivalent to a normal net-node rollout; `unbounded-net-node` does not
+  tear down its dataplane on shutdown, so established traffic keeps flowing and
+  only new-pod networking briefly stalls. The operator applies the per-site
+  DaemonSets before narrowing the base, so a failed per-site apply leaves the base
+  covering the fleet rather than stranding nodes.
 
 ### NonMasqueradeCIDRs Behavior
 

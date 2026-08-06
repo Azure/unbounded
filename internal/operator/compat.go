@@ -7,6 +7,7 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
+	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
 	"github.com/Azure/unbounded/internal/operator/components/storage"
 )
 
@@ -25,6 +26,7 @@ var (
 	metalmanDeploymentName = metalman.DeploymentName
 	storageConfigName      = storage.SiteConfigName
 	storageDaemonSetName   = storage.SiteDaemonSetName
+	netSiteDaemonSetName   = netcomponent.SiteNodeDaemonSetName
 )
 
 // componentEnabled reports whether a Site enables the named component. It is used

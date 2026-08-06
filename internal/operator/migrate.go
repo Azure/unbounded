@@ -1256,6 +1256,31 @@ func (r *LegacyReaper) netTargetsPresent(ctx context.Context, target string) (bo
 		return false, nil
 	}
 
+	// Every Site must have its per-Site node DaemonSet in place carrying the
+	// migrated config hash before the legacy blanket net-node is reaped. The base
+	// DaemonSet above covers only un-Sited nodes, so a Site whose per-Site
+	// DaemonSet has not yet been applied/rolled would otherwise be left with no
+	// net agent once the legacy blanket is deleted.
+	var sites unboundedv1alpha3.SiteList
+	if err := reader.List(ctx, &sites); err != nil {
+		return false, fmt.Errorf("list sites: %w", err)
+	}
+
+	for i := range sites.Items {
+		var siteDS appsv1.DaemonSet
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: target, Name: netSiteDaemonSetName(sites.Items[i].Name)}, &siteDS); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, err
+		}
+
+		if siteDS.Spec.Template.Annotations[netConfigHashAnnotation] != wantHash {
+			return false, nil
+		}
+	}
+
 	targetCurrent, err := r.configMapPayloadStillCurrent(ctx, &config)
 	if err != nil || !targetCurrent {
 		return false, err

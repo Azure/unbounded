@@ -512,28 +512,45 @@ func controllerEqual(a, b *bool) bool {
 	return ptr.Deref(a, false) == ptr.Deref(b, false)
 }
 
-// SiteNodeAffinity matches Nodes carrying either the canonical site label or the
-// deprecated net-prefixed site label. The OR is required during migration.
+// SiteNodeAffinity matches Nodes that belong to siteName, treating the canonical
+// site label (unbounded-cloud.io/site) as authoritative and falling back to the
+// deprecated net-prefixed label only when the canonical label is absent.
+//
+// The two node-selector terms are logically OR'd:
+//   - canonical == siteName, or
+//   - canonical absent AND deprecated == siteName.
+//
+// Making the canonical label authoritative prevents a Node that briefly carries
+// conflicting values (for example canonical=A left over next to deprecated=B
+// during the label migration) from matching two Sites' per-Site DaemonSets at
+// once, which would double-schedule two privileged agents onto one Node.
 func SiteNodeAffinity(siteName string) *corev1.Affinity {
 	return &corev1.Affinity{
 		NodeAffinity: &corev1.NodeAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
 				NodeSelectorTerms: []corev1.NodeSelectorTerm{
-					siteNodeSelectorTerm(SiteLabelKey, siteName),
-					siteNodeSelectorTerm(DeprecatedSiteLabelKey, siteName),
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							siteInRequirement(SiteLabelKey, siteName),
+						},
+					},
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{Key: SiteLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist},
+							siteInRequirement(DeprecatedSiteLabelKey, siteName),
+						},
+					},
 				},
 			},
 		},
 	}
 }
 
-func siteNodeSelectorTerm(key, siteName string) corev1.NodeSelectorTerm {
-	return corev1.NodeSelectorTerm{
-		MatchExpressions: []corev1.NodeSelectorRequirement{{
-			Key:      key,
-			Operator: corev1.NodeSelectorOpIn,
-			Values:   []string{siteName},
-		}},
+func siteInRequirement(key, siteName string) corev1.NodeSelectorRequirement {
+	return corev1.NodeSelectorRequirement{
+		Key:      key,
+		Operator: corev1.NodeSelectorOpIn,
+		Values:   []string{siteName},
 	}
 }
 

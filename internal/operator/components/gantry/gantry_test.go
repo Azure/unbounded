@@ -600,13 +600,59 @@ func TestReconcileFansOutPerSiteAndCleansUpOptedOut(t *testing.T) {
 		t.Fatalf("opted-out per-site DaemonSet not cleaned up: %v", err)
 	}
 
-	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(staleConfig), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("opted-out per-site config not cleaned up: %v", err)
+	// The opted-out Site's config is preserved (user-editable; only GC'd with the
+	// Site), so re-enabling does not lose custom registries/credentials.
+	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(staleConfig), &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("opted-out per-site config was deleted, want preserved: %v", err)
 	}
 
 	// The enabled Site's config is created.
 	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: SiteConfigName("edge")}, &corev1.ConfigMap{}); err != nil {
 		t.Fatalf("enabled site config not created: %v", err)
+	}
+}
+
+func TestReconcileFailSafeOrderingKeepsBaseOnPerSiteFailure(t *testing.T) {
+	scheme := testScheme(t)
+	applied := map[string]bool{}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				o, ok := obj.(interface {
+					GetName() string
+					GetKind() string
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				applied[o.GetKind()+"/"+o.GetName()] = true
+
+				if o.GetKind() == "DaemonSet" && o.GetName() == SiteDaemonSetName("edge") {
+					return errors.New("apply per-site gantry failed")
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
+
+	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if res.Ready || res.Err == nil {
+		t.Fatalf("Reconcile = %+v, want failure", res)
+	}
+
+	// The base gantry DaemonSet must not be applied after the per-site apply
+	// failed, so the blanket base keeps covering the fleet.
+	if applied["DaemonSet/"+daemonSetName] {
+		t.Fatalf("base gantry DaemonSet was applied despite per-site failure; applied=%#v", applied)
+	}
+
+	if !applied["DaemonSet/"+SiteDaemonSetName("edge")] {
+		t.Fatalf("per-site apply was not attempted; applied=%#v", applied)
 	}
 }
 

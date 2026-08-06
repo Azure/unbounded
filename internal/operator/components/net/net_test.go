@@ -5,6 +5,7 @@ package net
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -408,7 +409,92 @@ func TestEnsureSiteConfigSeedsFromSharedConfig(t *testing.T) {
 		t.Fatalf("hash = %q, want exact payload hash", hash)
 	}
 
+	if got.Annotations[seedHashAnnotation] != component.ConfigMapPayloadHash(shared) {
+		t.Fatalf("seed-hash annotation = %q, want shared payload hash", got.Annotations[seedHashAnnotation])
+	}
+
 	assertSiteOwnerRef(t, got.OwnerReferences, "edge", "edge-uid")
+}
+
+func TestEnsureSiteConfigReseedsUntouchedWhenSharedChanges(t *testing.T) {
+	shared := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: configName, Namespace: component.DefaultNamespace},
+		Data:       map[string]string{"config.yaml": "shared: v1"},
+	}
+	env := testEnv(t, shared)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge", UID: "edge-uid"}}
+
+	// First reconcile seeds the per-site config from shared v1.
+	if _, err := ensureSiteConfig(t.Context(), env, site); err != nil {
+		t.Fatalf("ensureSiteConfig (seed): %v", err)
+	}
+
+	// The shared config changes (for example a migrated legacy config lands).
+	shared.Data["config.yaml"] = "shared: v2"
+	if err := env.Client.Update(t.Context(), shared); err != nil {
+		t.Fatalf("update shared config: %v", err)
+	}
+
+	hash, err := ensureSiteConfig(t.Context(), env, site)
+	if err != nil {
+		t.Fatalf("ensureSiteConfig (reseed): %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: SiteConfigName("edge")}, &got); err != nil {
+		t.Fatalf("get per-site config: %v", err)
+	}
+
+	if got.Data["config.yaml"] != "shared: v2" {
+		t.Fatalf("untouched per-site config was not re-seeded: %#v", got.Data)
+	}
+
+	if got.Annotations[seedHashAnnotation] != component.ConfigMapPayloadHash(shared) || hash != component.ConfigMapPayloadHash(&got) {
+		t.Fatalf("re-seed did not refresh provenance/hash: ann=%q hash=%q", got.Annotations[seedHashAnnotation], hash)
+	}
+}
+
+func TestEnsureSiteConfigPreservesUserEdits(t *testing.T) {
+	shared := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: configName, Namespace: component.DefaultNamespace},
+		Data:       map[string]string{"config.yaml": "shared: v1"},
+	}
+	env := testEnv(t, shared)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge", UID: "edge-uid"}}
+
+	if _, err := ensureSiteConfig(t.Context(), env, site); err != nil {
+		t.Fatalf("ensureSiteConfig (seed): %v", err)
+	}
+
+	// The Site edits its per-site config.
+	var perSite corev1.ConfigMap
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: SiteConfigName("edge")}, &perSite); err != nil {
+		t.Fatalf("get per-site config: %v", err)
+	}
+
+	perSite.Data["config.yaml"] = "site: custom"
+	if err := env.Client.Update(t.Context(), &perSite); err != nil {
+		t.Fatalf("edit per-site config: %v", err)
+	}
+
+	// The shared config also changes; the edited per-site config must be kept.
+	shared.Data["config.yaml"] = "shared: v2"
+	if err := env.Client.Update(t.Context(), shared); err != nil {
+		t.Fatalf("update shared config: %v", err)
+	}
+
+	if _, err := ensureSiteConfig(t.Context(), env, site); err != nil {
+		t.Fatalf("ensureSiteConfig (preserve): %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: SiteConfigName("edge")}, &got); err != nil {
+		t.Fatalf("get per-site config: %v", err)
+	}
+
+	if got.Data["config.yaml"] != "site: custom" {
+		t.Fatalf("user-edited per-site config was overwritten: %#v", got.Data)
+	}
 }
 
 func TestEnsureSiteConfigPreservesExisting(t *testing.T) {
@@ -468,6 +554,60 @@ func TestReconcileCreatesPerSiteNodeAndConfig(t *testing.T) {
 	containers, _, _ := unstructured.NestedSlice(perSite.Object, "spec", "template", "spec", "containers")
 	if got := containers[0].(map[string]any)["image"]; got != "registry.corp.internal/unbounded/unbounded-net-node:v1.2.3" {
 		t.Fatalf("per-site node image = %q, want site registry", got)
+	}
+}
+
+func TestReconcileFailSafeOrderingKeepsBaseOnPerSiteFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatalf("add to scheme: %v", err)
+		}
+	}
+
+	applied := map[string]bool{}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				o, ok := obj.(interface{ GetName() string })
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				applied[o.GetName()] = true
+
+				// Fail the per-site DaemonSet apply.
+				if o.GetName() == SiteNodeDaemonSetName("edge") {
+					return errors.New("apply per-site net node failed")
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	env := &component.Env{
+		Client:    cl,
+		Scheme:    scheme,
+		Namespace: component.DefaultNamespace,
+		Config:    component.Config{ImageRegistry: "ghcr.io/azure", ImageTag: "v1.2.3"},
+	}
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge", UID: "edge-uid"}}
+
+	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{site})
+	if res.Ready || res.Err == nil {
+		t.Fatalf("Reconcile = %+v, want failure", res)
+	}
+
+	// The base node DaemonSet must not have been narrowed/applied after the
+	// per-site apply failed, so the blanket base keeps covering the fleet.
+	if applied[nodeName] {
+		t.Fatalf("base node DaemonSet was applied despite per-site failure; applied=%#v", applied)
+	}
+
+	if !applied[SiteNodeDaemonSetName("edge")] {
+		t.Fatalf("per-site apply was not attempted; applied=%#v", applied)
 	}
 }
 

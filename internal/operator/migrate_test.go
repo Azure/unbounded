@@ -1095,6 +1095,57 @@ func TestNetTargetsPresentRequiresCurrentHashOnBothWorkloads(t *testing.T) {
 	}
 }
 
+func TestNetTargetsPresentRequiresPerSiteDaemonSets(t *testing.T) {
+	const target = "unbounded-system"
+
+	r := newReaper(t, ns(target))
+
+	cm, deploy, ds := netConfigAndTargets(target, "sentinel: current", true)
+	for _, obj := range []client.Object{cm, deploy, ds} {
+		if err := r.Create(t.Context(), obj); err != nil {
+			t.Fatalf("create net target %T: %v", obj, err)
+		}
+	}
+
+	// With no Sites the base singletons are sufficient.
+	if present, err := r.netTargetsPresent(t.Context(), target); err != nil || !present {
+		t.Fatalf("netTargetsPresent (no sites) = %t, err=%v; want present", present, err)
+	}
+
+	// Adding a Site requires its per-Site node DaemonSet before reaping the
+	// legacy blanket net-node, since the base covers only un-Sited nodes.
+	if err := r.Create(t.Context(), &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}); err != nil {
+		t.Fatalf("create site: %v", err)
+	}
+
+	if present, err := r.netTargetsPresent(t.Context(), target); err != nil || present {
+		t.Fatalf("netTargetsPresent (missing per-site DS) = %t, err=%v; want not present", present, err)
+	}
+
+	// A present per-Site node DaemonSet carrying the current config hash unblocks.
+	wantHash := configMapPayloadHash(cm)
+	siteDS := readyDaemonSet(target, netSiteDaemonSetName("edge"))
+	siteDS.Spec.Template.Annotations = map[string]string{netConfigHashAnnotation: wantHash}
+
+	if err := r.Create(t.Context(), siteDS); err != nil {
+		t.Fatalf("create per-site node: %v", err)
+	}
+
+	if present, err := r.netTargetsPresent(t.Context(), target); err != nil || !present {
+		t.Fatalf("netTargetsPresent (per-site DS present) = %t, err=%v; want present", present, err)
+	}
+
+	// A stale per-Site config hash blocks reaping again.
+	siteDS.Spec.Template.Annotations[netConfigHashAnnotation] = "stale"
+	if err := r.Update(t.Context(), siteDS); err != nil {
+		t.Fatalf("update per-site node: %v", err)
+	}
+
+	if present, err := r.netTargetsPresent(t.Context(), target); err != nil || present {
+		t.Fatalf("netTargetsPresent (stale per-site hash) = %t, err=%v; want not present", present, err)
+	}
+}
+
 func TestReapOnceReapsNetWhenNewNetNotReady(t *testing.T) {
 	// The new net workloads exist but are NOT Ready (they stay Pending until the
 	// old net frees the shared host ports). Net must still be reaped: gating net

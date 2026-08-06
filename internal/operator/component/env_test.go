@@ -6,6 +6,7 @@ package component
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -74,6 +75,95 @@ func TestConfigForSite(t *testing.T) {
 	if base.ImageRegistry != "ghcr.io/azure" {
 		t.Fatalf("base config was mutated: %#v", base)
 	}
+}
+
+func TestSiteNodeAffinityCanonicalAuthoritative(t *testing.T) {
+	terms := SiteNodeAffinity("rack-a").NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) != 2 {
+		t.Fatalf("terms = %d, want 2 (canonical, then deprecated-when-canonical-absent)", len(terms))
+	}
+
+	// Term 0: canonical In [rack-a].
+	if got := terms[0].MatchExpressions; len(got) != 1 ||
+		got[0].Key != SiteLabelKey || got[0].Operator != corev1.NodeSelectorOpIn ||
+		len(got[0].Values) != 1 || got[0].Values[0] != "rack-a" {
+		t.Fatalf("term 0 = %#v, want canonical In [rack-a]", got)
+	}
+
+	// Term 1: canonical DoesNotExist AND deprecated In [rack-a].
+	got := terms[1].MatchExpressions
+	if len(got) != 2 {
+		t.Fatalf("term 1 = %#v, want two expressions", got)
+	}
+
+	if got[0].Key != SiteLabelKey || got[0].Operator != corev1.NodeSelectorOpDoesNotExist {
+		t.Fatalf("term 1[0] = %#v, want canonical DoesNotExist", got[0])
+	}
+
+	if got[1].Key != DeprecatedSiteLabelKey || got[1].Operator != corev1.NodeSelectorOpIn ||
+		len(got[1].Values) != 1 || got[1].Values[0] != "rack-a" {
+		t.Fatalf("term 1[1] = %#v, want deprecated In [rack-a]", got[1])
+	}
+
+	// Semantics: a Node whose canonical label points at a different Site than the
+	// deprecated label must match only the canonical Site, never both. Evaluate
+	// the terms against representative Node label sets.
+	cases := []struct {
+		name   string
+		labels map[string]string
+		match  bool
+	}{
+		{name: "canonical match", labels: map[string]string{SiteLabelKey: "rack-a"}, match: true},
+		{name: "deprecated only", labels: map[string]string{DeprecatedSiteLabelKey: "rack-a"}, match: true},
+		{name: "both canonical+deprecated match", labels: map[string]string{SiteLabelKey: "rack-a", DeprecatedSiteLabelKey: "rack-a"}, match: true},
+		{name: "conflict: canonical elsewhere", labels: map[string]string{SiteLabelKey: "rack-b", DeprecatedSiteLabelKey: "rack-a"}, match: false},
+		{name: "canonical elsewhere only", labels: map[string]string{SiteLabelKey: "rack-b"}, match: false},
+		{name: "unlabelled", labels: map[string]string{}, match: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nodeMatchesTerms(terms, tc.labels); got != tc.match {
+				t.Fatalf("match(%v) = %t, want %t", tc.labels, got, tc.match)
+			}
+		})
+	}
+}
+
+// nodeMatchesTerms evaluates a RequiredDuringScheduling node selector (OR of
+// terms, AND of expressions) against a Node's labels, supporting the In and
+// DoesNotExist operators used by the site affinities.
+func nodeMatchesTerms(terms []corev1.NodeSelectorTerm, labels map[string]string) bool {
+	for _, term := range terms {
+		matched := true
+
+		for _, expr := range term.MatchExpressions {
+			value, present := labels[expr.Key]
+
+			switch expr.Operator {
+			case corev1.NodeSelectorOpIn:
+				if !present || !slices.Contains(expr.Values, value) {
+					matched = false
+				}
+			case corev1.NodeSelectorOpDoesNotExist:
+				if present {
+					matched = false
+				}
+			default:
+				matched = false
+			}
+
+			if !matched {
+				break
+			}
+		}
+
+		if matched {
+			return true
+		}
+	}
+
+	return false
 }
 
 func TestUnsitedNodeAffinity(t *testing.T) {

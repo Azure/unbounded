@@ -273,32 +273,38 @@ func assertSiteAffinity(t *testing.T, affinity *corev1.Affinity, siteName string
 	}
 
 	terms := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	assertCanonicalAuthoritativeSiteAffinity(t, terms, siteName)
+}
+
+// assertCanonicalAuthoritativeSiteAffinity checks the SiteNodeAffinity shape:
+// term 0 matches the canonical label, term 1 matches the deprecated label only
+// when the canonical label is absent.
+func assertCanonicalAuthoritativeSiteAffinity(t *testing.T, terms []corev1.NodeSelectorTerm, siteName string) {
+	t.Helper()
+
 	if len(terms) != 2 {
 		t.Fatalf("node selector terms len = %d, want 2: %#v", len(terms), terms)
 	}
 
-	want := map[string]bool{component.SiteLabelKey: false, component.DeprecatedSiteLabelKey: false}
-
-	for _, term := range terms {
-		if len(term.MatchExpressions) != 1 {
-			t.Fatalf("term must have one expression: %#v", term)
-		}
-
-		expr := term.MatchExpressions[0]
-		if expr.Operator != corev1.NodeSelectorOpIn || len(expr.Values) != 1 || expr.Values[0] != siteName {
-			t.Fatalf("unexpected site affinity expression: %#v", expr)
-		}
-
-		if _, ok := want[expr.Key]; !ok {
-			t.Fatalf("unexpected site affinity key %q", expr.Key)
-		}
-
-		want[expr.Key] = true
+	canonical := terms[0].MatchExpressions
+	if len(canonical) != 1 ||
+		canonical[0].Key != component.SiteLabelKey ||
+		canonical[0].Operator != corev1.NodeSelectorOpIn ||
+		len(canonical[0].Values) != 1 || canonical[0].Values[0] != siteName {
+		t.Fatalf("term 0 must be canonical In [%s]: %#v", siteName, canonical)
 	}
 
-	for key, seen := range want {
-		if !seen {
-			t.Fatalf("site affinity missing key %q", key)
-		}
+	deprecated := terms[1].MatchExpressions
+	if len(deprecated) != 2 {
+		t.Fatalf("term 1 must have two expressions (canonical DoesNotExist, deprecated In): %#v", deprecated)
+	}
+
+	if deprecated[0].Key != component.SiteLabelKey || deprecated[0].Operator != corev1.NodeSelectorOpDoesNotExist {
+		t.Fatalf("term 1[0] must be canonical DoesNotExist: %#v", deprecated[0])
+	}
+
+	if deprecated[1].Key != component.DeprecatedSiteLabelKey || deprecated[1].Operator != corev1.NodeSelectorOpIn ||
+		len(deprecated[1].Values) != 1 || deprecated[1].Values[0] != siteName {
+		t.Fatalf("term 1[1] must be deprecated In [%s]: %#v", siteName, deprecated[1])
 	}
 }

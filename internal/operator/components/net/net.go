@@ -54,6 +54,13 @@ const (
 	nodeDaemonSetManifest = "node/03-daemonset.yaml"
 
 	ConfigHashAnnotation = "unbounded-cloud.io/net-config-hash"
+
+	// seedHashAnnotation records the shared-config payload hash a per-Site config
+	// was last seeded from. While the per-Site config's own payload still matches
+	// this hash (the Site has not edited it), the operator keeps it tracking the
+	// shared config; once the payload diverges the Site owns it and it is
+	// preserved.
+	seedHashAnnotation = "unbounded-cloud.io/net-config-seed-hash"
 )
 
 // Component reconciles the unbounded-net cluster singleton.
@@ -92,11 +99,17 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, applyMutator(env.Config, configHash)); err != nil {
+	// Apply the per-Site node DaemonSets before narrowing the base to un-Sited
+	// nodes. net-node is hostNetwork and only one instance can own a Node's
+	// dataplane, so the handoff is break-before-make; applying per-Site first
+	// means a per-Site apply failure returns here with the base still covering
+	// every Node (blanket), rather than excluding Sited nodes with no
+	// replacement in place.
+	if err := reconcileSiteNodes(ctx, env, sites); err != nil {
 		return component.Failed(err)
 	}
 
-	if err := reconcileSiteNodes(ctx, env, sites); err != nil {
+	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, applyMutator(env.Config, configHash)); err != nil {
 		return component.Failed(err)
 	}
 
@@ -457,32 +470,37 @@ func ensureConfig(ctx context.Context, env *component.Env) (string, error) {
 	return component.ConfigMapPayloadHash(desired), nil
 }
 
-// ensureSiteConfig creates the per-Site node config ConfigMap by cloning the
-// shared config when it is absent, so a Site starts from the operator-tuned
-// baseline. An existing per-Site config (operator/user-edited) is preserved and
-// only adopted with a Site owner reference so it is garbage collected with the
-// Site.
+// ensureSiteConfig reconciles the per-Site node config ConfigMap and returns its
+// payload hash for the DaemonSet's config-hash annotation.
+//
+// The per-Site config is created by cloning the shared config, and it keeps
+// tracking the shared config until the Site edits it: on each reconcile, if the
+// per-Site payload is still exactly what it was seeded with (recorded in the
+// seed-hash annotation) and the shared config has since changed, the per-Site
+// config is re-seeded from the shared config. Once the payload diverges (a user
+// edit) it no longer matches the seed hash, so it is preserved. This closes the
+// window where a per-Site config seeded from an embedded default before the
+// operator/reaper installs the intended shared config would otherwise stay stale
+// forever. The ConfigMap is owner-referenced to the Site so it is garbage
+// collected with the Site.
 func ensureSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (string, error) {
-	key := client.ObjectKey{Namespace: env.Namespace, Name: SiteConfigName(site.Name)}
-	existing := &corev1.ConfigMap{}
-
-	err := env.Client.Get(ctx, key, existing)
-	switch {
-	case err == nil:
-		if err := adoptSiteConfig(ctx, env, site, existing); err != nil {
-			return "", err
-		}
-
-		return component.ConfigMapPayloadHash(existing), nil
-	case !apierrors.IsNotFound(err):
-		return "", fmt.Errorf("get net site config %s/%s: %w", key.Namespace, key.Name, err)
-	}
-
-	cm, err := seedSiteConfig(ctx, env, site)
+	shared, sharedHash, err := sharedConfig(ctx, env, site)
 	if err != nil {
 		return "", err
 	}
 
+	key := client.ObjectKey{Namespace: env.Namespace, Name: SiteConfigName(site.Name)}
+	existing := &corev1.ConfigMap{}
+
+	err = env.Client.Get(ctx, key, existing)
+	switch {
+	case err == nil:
+		return reconcileExistingSiteConfig(ctx, env, site, existing, shared, sharedHash)
+	case !apierrors.IsNotFound(err):
+		return "", fmt.Errorf("get net site config %s/%s: %w", key.Namespace, key.Name, err)
+	}
+
+	cm := newSiteConfig(site, env.Namespace, shared, sharedHash)
 	if err := env.Client.Create(ctx, cm); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return "", fmt.Errorf("create net site config %s/%s: %w", cm.Namespace, cm.Name, err)
@@ -492,20 +510,15 @@ func ensureSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1
 			return "", fmt.Errorf("get raced net site config %s/%s: %w", key.Namespace, key.Name, getErr)
 		}
 
-		if err := adoptSiteConfig(ctx, env, site, existing); err != nil {
-			return "", err
-		}
-
-		return component.ConfigMapPayloadHash(existing), nil
+		return reconcileExistingSiteConfig(ctx, env, site, existing, shared, sharedHash)
 	}
 
 	return component.ConfigMapPayloadHash(cm), nil
 }
 
-// seedSiteConfig builds the per-Site node config from the shared config so
-// operator tuning carries over. It falls back to the embedded default if the
-// shared config is somehow absent.
-func seedSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*corev1.ConfigMap, error) {
+// sharedConfig returns the shared net config and its payload hash, falling back
+// to the embedded default when the shared ConfigMap is absent.
+func sharedConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*corev1.ConfigMap, string, error) {
 	shared := &corev1.ConfigMap{}
 	key := client.ObjectKey{Namespace: env.Namespace, Name: configName}
 
@@ -515,24 +528,84 @@ func seedSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1al
 	case apierrors.IsNotFound(err):
 		shared, err = env.DefaultConfigMap(netmanifests.Manifests, configName, "net")
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	default:
-		return nil, fmt.Errorf("get net config to seed site %s: %w", site.Name, err)
+		return nil, "", fmt.Errorf("get net config to seed site %s: %w", site.Name, err)
 	}
 
+	return shared, component.ConfigMapPayloadHash(shared), nil
+}
+
+// newSiteConfig builds a fresh per-Site config cloned from the shared config,
+// stamped with the seed-hash provenance annotation and the Site owner reference.
+func newSiteConfig(site *unboundedv1alpha3.Site, namespace string, shared *corev1.ConfigMap, sharedHash string) *corev1.ConfigMap {
 	// Deep-copy the payload so the per-Site ConfigMap does not alias the shared
 	// config's maps (a later mutation of either must not affect the other).
 	payload := shared.DeepCopy()
 
-	cm := &corev1.ConfigMap{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-		ObjectMeta: metav1.ObjectMeta{Name: SiteConfigName(site.Name), Namespace: env.Namespace, OwnerReferences: []metav1.OwnerReference{component.SiteOwnerReference(site)}},
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            SiteConfigName(site.Name),
+			Namespace:       namespace,
+			OwnerReferences: []metav1.OwnerReference{component.SiteOwnerReference(site)},
+			Annotations:     map[string]string{seedHashAnnotation: sharedHash},
+		},
 		Data:       payload.Data,
 		BinaryData: payload.BinaryData,
 	}
+}
 
-	return cm, nil
+// reconcileExistingSiteConfig re-seeds an existing per-Site config from the
+// shared config when the Site has not edited it and the shared config changed,
+// otherwise preserves it. Either way it ensures the Site owner reference.
+func reconcileExistingSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site, existing, shared *corev1.ConfigMap, sharedHash string) (string, error) {
+	seedHash := existing.Annotations[seedHashAnnotation]
+	payloadHash := component.ConfigMapPayloadHash(existing)
+
+	// Re-seed only when the per-Site payload is still exactly what it was seeded
+	// with (the Site has not edited it) and the shared config has since changed.
+	if seedHash != "" && payloadHash == seedHash && sharedHash != seedHash {
+		if err := reseedSiteConfig(ctx, env, site, existing, shared, sharedHash); err != nil {
+			return "", err
+		}
+
+		return sharedHash, nil
+	}
+
+	if err := adoptSiteConfig(ctx, env, site, existing); err != nil {
+		return "", err
+	}
+
+	return payloadHash, nil
+}
+
+// reseedSiteConfig overwrites an existing per-Site config's payload from the
+// shared config and refreshes the seed-hash annotation and Site owner reference.
+func reseedSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site, existing, shared *corev1.ConfigMap, sharedHash string) error {
+	before := existing.DeepCopy()
+	payload := shared.DeepCopy()
+
+	existing.Data = payload.Data
+	existing.BinaryData = payload.BinaryData
+
+	if existing.Annotations == nil {
+		existing.Annotations = map[string]string{}
+	}
+
+	existing.Annotations[seedHashAnnotation] = sharedHash
+
+	if refs, changed := component.UpsertOwnerReference(existing.OwnerReferences, component.SiteOwnerReference(site)); changed {
+		existing.OwnerReferences = refs
+	}
+
+	patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
+	if err := env.Client.Patch(ctx, existing, patch); err != nil {
+		return fmt.Errorf("re-seed net site config %s/%s: %w", existing.Namespace, existing.Name, err)
+	}
+
+	return nil
 }
 
 func adoptSiteConfig(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site, cm *corev1.ConfigMap) error {

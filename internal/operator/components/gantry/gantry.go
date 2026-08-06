@@ -135,11 +135,14 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	if err := applyManifests(ctx, env, applyMutator(env.Config.Image(imageRepository), configHash)); err != nil {
+	// Apply the per-Site DaemonSets before narrowing the base to un-Sited nodes,
+	// so a per-Site apply failure leaves the base covering every Node rather than
+	// excluding Sited nodes with no replacement in place.
+	if err := reconcileSiteDaemonSets(ctx, env, sites); err != nil {
 		return component.Failed(err)
 	}
 
-	if err := reconcileSiteDaemonSets(ctx, env, sites); err != nil {
+	if err := applyManifests(ctx, env, applyMutator(env.Config.Image(imageRepository), configHash)); err != nil {
 		return component.Failed(err)
 	}
 
@@ -296,20 +299,16 @@ func reconcileSiteDaemonSets(ctx context.Context, env *component.Env, sites []un
 	return nil
 }
 
-// cleanupSiteDaemonSet removes the per-Site DaemonSet and config for a Site that
-// opts out of gantry. The Site's nodes then run no gantry (the base excludes
-// Sited nodes).
+// cleanupSiteDaemonSet removes the per-Site DaemonSet for a Site that opts out of
+// gantry, so the Site's nodes run no gantry (the base excludes Sited nodes). The
+// per-Site config ConfigMap is deliberately preserved: it is user-editable
+// (upstream_registries, credentials) and re-enabling the Site should not lose
+// those edits. It is owner-referenced to the Site, so it is still garbage
+// collected when the Site itself is deleted.
 func cleanupSiteDaemonSet(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) error {
-	if err := env.DeleteIfExists(ctx, &appsv1.DaemonSet{
+	return env.DeleteIfExists(ctx, &appsv1.DaemonSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
 		ObjectMeta: metav1.ObjectMeta{Name: SiteDaemonSetName(site.Name), Namespace: env.Namespace},
-	}); err != nil {
-		return err
-	}
-
-	return env.DeleteIfExists(ctx, &corev1.ConfigMap{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-		ObjectMeta: metav1.ObjectMeta{Name: SiteConfigName(site.Name), Namespace: env.Namespace},
 	})
 }
 

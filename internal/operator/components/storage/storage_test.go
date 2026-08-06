@@ -305,20 +305,20 @@ func assertSiteAffinityMap(t *testing.T, affinity map[string]any, siteName strin
 		t.Fatalf("node selector terms len = %d, want 2", len(terms))
 	}
 
-	want := map[string]bool{component.SiteLabelKey: false, component.DeprecatedSiteLabelKey: false}
-
-	for _, term := range terms {
-		expr := term.MatchExpressions[0]
-		if len(expr.Values) != 1 || expr.Values[0] != siteName {
-			t.Fatalf("unexpected site affinity expression: %#v", expr)
-		}
-
-		want[expr.Key] = true
+	// term 0: canonical In [site]
+	canonical := terms[0].MatchExpressions
+	if len(canonical) != 1 || canonical[0].Key != component.SiteLabelKey ||
+		canonical[0].Operator != corev1.NodeSelectorOpIn ||
+		len(canonical[0].Values) != 1 || canonical[0].Values[0] != siteName {
+		t.Fatalf("term 0 must be canonical In [%s]: %#v", siteName, canonical)
 	}
 
-	for key, seen := range want {
-		if !seen {
-			t.Fatalf("site affinity missing key %q", key)
-		}
+	// term 1: canonical DoesNotExist AND deprecated In [site]
+	deprecated := terms[1].MatchExpressions
+	if len(deprecated) != 2 ||
+		deprecated[0].Key != component.SiteLabelKey || deprecated[0].Operator != corev1.NodeSelectorOpDoesNotExist ||
+		deprecated[1].Key != component.DeprecatedSiteLabelKey || deprecated[1].Operator != corev1.NodeSelectorOpIn ||
+		len(deprecated[1].Values) != 1 || deprecated[1].Values[0] != siteName {
+		t.Fatalf("term 1 must be canonical DoesNotExist AND deprecated In [%s]: %#v", siteName, deprecated)
 	}
 }
