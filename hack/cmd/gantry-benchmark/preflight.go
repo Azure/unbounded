@@ -443,17 +443,8 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 	}
 
 	for _, check := range monitoringChecks {
-		count, err := b.queryPrometheus(ctx, check.query)
-		if err != nil {
-			return fmt.Errorf("query %s metric count: %w", check.description, err)
-		}
-		if int(count) != b.config.NodeCount {
-			return fmt.Errorf(
-				"prometheus reports %s metrics for %.0f/%d observer pods",
-				check.description,
-				count,
-				b.config.NodeCount,
-			)
+		if err := b.waitForPrometheusMetricCoverage(ctx, check.description, check.query); err != nil {
+			return err
 		}
 	}
 
@@ -485,6 +476,61 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (b *benchmark) waitForPrometheusMetricCoverage(ctx context.Context, description, query string) error {
+	pollContext, cancel := context.WithTimeout(ctx, b.config.TelemetryTimeout)
+	defer cancel()
+
+	var count float64
+	var queryErr error
+
+	for {
+		count, queryErr = b.queryPrometheus(pollContext, query)
+		if queryErr == nil && int(count) == b.config.NodeCount {
+			return nil
+		}
+
+		if queryErr == nil {
+			writeAll(b.stdout, fmt.Sprintf(
+				"waiting for Prometheus %s coverage: %.0f/%d observer pods\n",
+				description,
+				count,
+				b.config.NodeCount,
+			))
+		}
+
+		timer := time.NewTimer(b.config.TelemetryPollInterval)
+		select {
+		case <-pollContext.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if queryErr != nil {
+				return fmt.Errorf(
+					"prometheus %s metrics were not queryable before %s: %w",
+					description,
+					b.config.TelemetryTimeout,
+					queryErr,
+				)
+			}
+
+			return fmt.Errorf(
+				"prometheus reports %s metrics for %.0f/%d observer pods after waiting %s",
+				description,
+				count,
+				b.config.NodeCount,
+				b.config.TelemetryTimeout,
+			)
+		case <-timer.C:
 		}
 	}
 }
