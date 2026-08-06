@@ -69,7 +69,7 @@ for command usage, exit behavior, and the current check list.
 | `LocalDNS.Enabled` | *(optional)* Runs a CoreDNS cache inside the nspawn machine and configures machine and ClusterFirst DNS through separate link-local listeners. |
 | `LocalDNS.NodeListenerIP` | *(optional)* Listener used by machine services and Default-policy pods. Defaults to `169.254.10.10`. |
 | `LocalDNS.ClusterListenerIP` | *(optional)* Listener supplied to kubelet for ClusterFirst pods. Defaults to `169.254.10.11`. |
-| `LocalDNS.MetricsAddress` | *(optional)* Native CoreDNS Prometheus bind address. Defaults to the configured IPv4 `Kubelet.NodeIP` on port `9253`; required when no IPv4 node IP is configured. |
+| `LocalDNS.MetricsAddress` | *(optional)* Native CoreDNS Prometheus bind address. Defaults to port `9253` on the IPv4 node address selected by following kubelet's non-cloud behavior: `Kubelet.NodeIP`, an IP-valued node name, a host-local node-name DNS result, then the host's default-route interface. |
 | `LocalDNS.CPULimitInMilliCores` | *(optional)* CoreDNS slice CPU quota. Defaults to `2000`. |
 | `LocalDNS.MemoryLimitInMB` | *(optional)* CoreDNS slice memory limit. Defaults to `128`. |
 | `LocalDNS.RequiredPlugins` | *(optional)* Additional plugins that the selected binary must report through `coredns -plugins`. |
