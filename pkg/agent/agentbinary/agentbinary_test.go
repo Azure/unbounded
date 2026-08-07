@@ -45,7 +45,11 @@ func TestInstallFromTarGzVerifiesInstalledBinary(t *testing.T) {
 
 			targetPath := filepath.Join(t.TempDir(), "unbounded-agent")
 
-			err := InstallFromTarGz(context.Background(), server.URL, targetPath, "unbounded-agent", 0o755)
+			err := installFromTarGz(context.Background(), targetPath, InstallOptions{
+				DownloadURL:    server.URL,
+				ExpectedMember: "unbounded-agent",
+				Mode:           0o755,
+			})
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
@@ -106,7 +110,11 @@ func TestInstallAndSwitchFromTarGz(t *testing.T) {
 func TestInstallFromTarGzRejectsUnsupportedScheme(t *testing.T) {
 	t.Parallel()
 
-	err := InstallFromTarGz(context.Background(), "file:///tmp/unbounded-agent.tar.gz", filepath.Join(t.TempDir(), "agent"), "unbounded-agent", 0o755)
+	err := installFromTarGz(context.Background(), filepath.Join(t.TempDir(), "agent"), InstallOptions{
+		DownloadURL:    "file:///tmp/unbounded-agent.tar.gz",
+		ExpectedMember: "unbounded-agent",
+		Mode:           0o755,
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
 }

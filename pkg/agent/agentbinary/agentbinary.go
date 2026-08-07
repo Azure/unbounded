@@ -24,16 +24,6 @@ const verifyTimeout = 30 * time.Second
 
 const daemonBinaryMode os.FileMode = 0o755
 
-// InstallFromTarGz downloads a bounded HTTP or HTTPS .tar.gz archive, installs
-// binaryName to targetPath, and verifies the installed binary.
-func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName string, perm os.FileMode) error {
-	return installFromTarGz(ctx, targetPath, InstallOptions{
-		DownloadURL:    downloadURL,
-		ExpectedMember: binaryName,
-		Mode:           perm,
-	})
-}
-
 // InstallFromFile installs a local agent binary to targetPath.
 func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error) {
 	source, err := os.Open(sourcePath)
