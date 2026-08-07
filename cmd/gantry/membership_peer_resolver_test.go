@@ -87,6 +87,8 @@ func TestMembershipPeerIDResolverRejectsMismatchedAddressIdentity(t *testing.T) 
 		PeerID:   target.ID().String(),
 		P2PAddrs: []string{"/ip4/10.64.1.23/tcp/4001/p2p/" + other.ID().String()},
 	})
+	known := multiaddr.StringCast("/ip4/127.0.0.1/tcp/4001")
+	caller.Peerstore().AddAddr(target.ID(), known, peerstore.PermanentAddrTTL)
 
 	resolve := membershipPeerIDResolver(members, caller.Peerstore(), slog.Default())
 
@@ -95,8 +97,8 @@ func TestMembershipPeerIDResolverRejectsMismatchedAddressIdentity(t *testing.T) 
 		t.Fatalf("resolved peer = %q, %v; want %q, true", got, ok, target.ID())
 	}
 
-	if addrs := caller.Peerstore().Addrs(target.ID()); len(addrs) != 0 {
-		t.Fatalf("peerstore addresses = %v, want none for mismatched identity", addrs)
+	if addrs := caller.Peerstore().Addrs(target.ID()); len(addrs) != 1 || !addrs[0].Equal(known) {
+		t.Fatalf("peerstore addresses = %v, want existing address [%s]", addrs, known)
 	}
 }
 

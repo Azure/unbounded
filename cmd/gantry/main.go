@@ -1374,12 +1374,9 @@ func membershipPeerIDResolver(mv ifaces.Members, ps peerstore.Peerstore, logger 
 				addrs = append(addrs, info.Addrs...)
 			}
 
-			if ps != nil {
+			if ps != nil && len(addrs) > 0 {
 				ps.ClearAddrs(pid)
-
-				if len(addrs) > 0 {
-					ps.AddAddrs(pid, addrs, peerstore.AddressTTL)
-				}
+				ps.AddAddrs(pid, addrs, peerstore.AddressTTL)
 			}
 
 			return pid, true

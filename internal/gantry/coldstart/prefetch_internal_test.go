@@ -14,14 +14,11 @@ import (
 func TestPrefetchDispatchPlanDesynchronizesNodesDeterministically(t *testing.T) {
 	t.Parallel()
 
-	children := []ChildDigest{{
-		Digest: digest.MustParse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		Kind:   ifaces.KindBlob,
-	}}
+	coordinationKey := digest.MustParse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
-	offsetA, delayA := prefetchDispatchPlan("node-a", children, 554, time.Second)
-	offsetA2, delayA2 := prefetchDispatchPlan("node-a", children, 554, time.Second)
-	offsetB, delayB := prefetchDispatchPlan("node-b", children, 554, time.Second)
+	offsetA, delayA := prefetchDispatchPlan("node-a", coordinationKey, 554, time.Second)
+	offsetA2, delayA2 := prefetchDispatchPlan("node-a", coordinationKey, 554, time.Second)
+	offsetB, delayB := prefetchDispatchPlan("node-b", coordinationKey, 554, time.Second)
 
 	if offsetA != offsetA2 || delayA != delayA2 {
 		t.Fatalf("same node plan changed: (%d, %v) != (%d, %v)", offsetA, delayA, offsetA2, delayA2)
@@ -51,7 +48,9 @@ func TestPrefetchDispatchPlanDesynchronizesNodesDeterministically(t *testing.T) 
 func TestPrefetchDispatchPlanDisabledJitter(t *testing.T) {
 	t.Parallel()
 
-	offset, delay := prefetchDispatchPlan("node-a", nil, 0, 0)
+	coordinationKey := digest.MustParse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+	offset, delay := prefetchDispatchPlan("node-a", coordinationKey, 0, 0)
 	if offset != 0 || delay != 0 {
 		t.Fatalf("plan = (%d,%v), want (0,0)", offset, delay)
 	}

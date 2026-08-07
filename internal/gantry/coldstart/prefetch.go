@@ -41,20 +41,17 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
-func prefetchDispatchHash(self ifaces.NodeID, children []ChildDigest) uint64 {
+func prefetchDispatchHash(self ifaces.NodeID, coordinationKey digest.Digest) uint64 {
 	hasher := fnv.New64a()
 	_, _ = hasher.Write([]byte(self))
 	_, _ = hasher.Write([]byte{0})
-
-	if len(children) > 0 {
-		_, _ = hasher.Write([]byte(children[0].Digest.String()))
-	}
+	_, _ = hasher.Write([]byte(coordinationKey.String()))
 
 	return hasher.Sum64()
 }
 
-func prefetchDispatchPlan(self ifaces.NodeID, children []ChildDigest, groups int, maxJitter time.Duration) (int, time.Duration) {
-	dispatchHash := prefetchDispatchHash(self, children)
+func prefetchDispatchPlan(self ifaces.NodeID, coordinationKey digest.Digest, groups int, maxJitter time.Duration) (int, time.Duration) {
+	dispatchHash := prefetchDispatchHash(self, coordinationKey)
 
 	offset := 0
 	if groups > 1 {
@@ -308,7 +305,7 @@ func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.
 		return groupKeys[i].kind < groupKeys[j].kind
 	})
 
-	dispatchOffset, dispatchDelay := prefetchDispatchPlan(self, children, len(groupKeys), r.opts.PrefetchDispatchJitter)
+	dispatchOffset, dispatchDelay := prefetchDispatchPlan(self, coordinationKey, len(groupKeys), r.opts.PrefetchDispatchJitter)
 	if len(groupKeys) > 1 {
 		rotated := make([]groupKey, 0, len(groupKeys))
 		rotated = append(rotated, groupKeys[dispatchOffset:]...)
