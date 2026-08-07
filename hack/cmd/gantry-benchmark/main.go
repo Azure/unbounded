@@ -59,6 +59,19 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	}
 
 	switch args[0] {
+	case "image-pool-status":
+		return benchmark.printImagePoolStatus()
+	case "prebuild-gantry":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: gantry-benchmark prebuild-gantry <count>")
+		}
+
+		count, err := parsePrebuildCount(args[1])
+		if err != nil {
+			return err
+		}
+
+		return benchmark.prebuildGantryImages(ctx, count)
 	case "disable":
 		return benchmark.disable(ctx)
 	case "enable":
@@ -94,6 +107,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		}
 
 		return benchmark.prepareAdoptedFreshGantryOnly(ctx, args[1], args[2], args[3])
+	case "prepare-gantry-pool":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: gantry-benchmark prepare-gantry-pool <baseline-run-id>")
+		}
+
+		return benchmark.prepareGantryOnlyFromPool(ctx, args[1])
 	case "preflight":
 		return benchmark.preflight(ctx)
 	case "run":
@@ -113,6 +132,10 @@ func printUsage(writer io.Writer) {
 	writeAll(writer, `Usage: gantry-benchmark <subcommand>
 
 Subcommands:
+	image-pool-status
+	           list ready and claimed prebuilt Gantry images
+	prebuild-gantry <count>
+	           build and push reusable Gantry images without enabling a benchmark
 	disable    restore the cluster and remove benchmark instrumentation
 	enable     install benchmark instrumentation after safety checks
 	prepare    build and push both digest-pinned images before ACR goes private
@@ -124,6 +147,8 @@ Subcommands:
 	           generate new random bytes and build only a fresh Gantry image
 	prepare-gantry-adopt <baseline-run-id> <gantry-image> <payload-sha256>
 	           adopt an already-pushed fresh Gantry image by immutable digest
+	prepare-gantry-pool <baseline-run-id>
+	           atomically claim and adopt one compatible prebuilt Gantry image
 	preflight  validate Azure sources, monitoring, Gantry, and all target nodes
 	run        execute baseline and Gantry cold phases, then restore routing
 	run-gantry execute only Gantry cold against the retained baseline

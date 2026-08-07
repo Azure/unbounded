@@ -226,12 +226,85 @@ It redraws every second and shows per-phase-minute peer outcomes (`busy`,
 and per-node throughput, cumulative payload percentage, and live Pod counts for
 completed, running, creating, image-pull failures, and failed Pods. Pod counts
 come from one Kubernetes list followed by watch events rather than polling all
-1000 Pod objects. The header uses ANSI emphasis on a TTY and remains plain when
-redirected or piped. The monitor uses one server-side aggregated Prometheus
-range query per refresh; it does not download per-pod metric series. Prometheus
-scrapes Gantry every 10 seconds, so the screen updates each second while counter
-values advance at scrape cadence.
+1000 Pod objects.
+
+Two node-paged grids show the current image in detail. The layer-by-node grid
+uses `.` for pending and `0-9/A-Z` for the phase minute when Gantry finished
+writing that layer to the node's containerd client (`Z` means minute 35 or
+later). The image-by-node grid uses `.` for not started, `0` for started,
+`1-9` for unpacked-layer deciles, and `#` after containerd reports the image
+unpacked. Node columns are sorted and identified by their three-character
+suffix. The default page width follows the terminal, bounded to 16-96 nodes.
+Select another page or a fixed width with, for example:
+
+```bash
+make -C hack/gantry-benchmark monitor \
+  MONITOR_ARGS="--node-page 2 --nodes-per-page 64"
+```
+
+The header uses ANSI emphasis on a TTY and remains plain when redirected or
+piped. The monitor uses one server-side aggregated Prometheus range query per
+display refresh and one exact-image progress query every 10 seconds. Prometheus
+scrapes at 10-second cadence, so the screen updates each second while grid and
+counter values advance at scrape cadence.
 Use `MONITOR_ARGS="--once --no-clear"` for a single non-interactive snapshot.
+
+## Reusable Gantry image pool
+
+Gantry-only benchmarks can consume prebuilt images instead of generating,
+building, and pushing 40 GiB during every benchmark lifecycle. Start a batch
+on the operator VM from the workstation:
+
+```bash
+AZURE_RESOURCE_GROUP=vapa-gantry-benchmark1 \
+OPERATOR_VM_NAME=gantry-benchmark-operator \
+GANTRY_IMAGE_POOL_COUNT=10 \
+make -C hack/gantry-benchmark operator-vm-prebuild
+```
+
+The command starts `gantry-benchmark-image-builder.service` asynchronously.
+The builder authenticates its managed identity once, generates each random
+payload sequentially, pushes each image to the Gantry ACR, records its
+immutable digest and payload SHA-256, removes the local image, and deletes the
+40 GiB build context before starting the next image. Durable pool metadata
+lives under `/var/lib/gantry-benchmark/image-pool`; transient build data lives
+on the `/opt/gantry-benchmark` build disk.
+
+Use the bounded status view while it runs:
+
+```bash
+AZURE_RESOURCE_GROUP=vapa-gantry-benchmark1 \
+OPERATOR_VM_NAME=gantry-benchmark-operator \
+make -C hack/gantry-benchmark operator-vm-image-pool-status
+```
+
+Start a Gantry-only benchmark with the oldest compatible ready image:
+
+```bash
+AZURE_RESOURCE_GROUP=vapa-gantry-benchmark1 \
+OPERATOR_VM_NAME=gantry-benchmark-operator \
+GANTRY_ONLY_BASELINE_RUN_ID=run-20260806-205719-51c38730 \
+make -C hack/gantry-benchmark operator-vm-run-pool
+```
+
+The benchmark restores the retained baseline metadata automatically, atomically
+moves one image from `ready/` to `claimed/`, and adopts its immutable digest.
+Claimed images are never offered to a later run, preserving the cache-cold
+contract. Pool adoption performs no image build, push, or registry credential
+exchange inside the benchmark lifecycle.
+
+Pool building and benchmark execution are mutually exclusive on one operator
+VM. Both services hold the same lifecycle lock, and the builder also refuses
+to run while a benchmark state exists. This is required for measurement
+correctness: pushing another image to the Gantry ACR during a measured phase
+would produce unrelated repository events and invalidate the Azure telemetry
+completeness gate. Build the 5-10 image batch before starting benchmark runs,
+not concurrently with them.
+
+For direct CLI use with an already-authenticated container engine, the
+equivalent targets are `prebuild-gantry`, `image-pool-status`, and
+`prepare-gantry-pool`. Configure metadata and scratch locations with
+`BENCHMARK_IMAGE_POOL_ROOT` and `BENCHMARK_IMAGE_POOL_BUILD_ROOT`.
 
 Artifacts persist on the VM under
 `/var/lib/gantry-benchmark/artifacts/<run-id>/`; `latest` points at the newest

@@ -239,10 +239,17 @@ managed identity: $principal_id
 build disk: $build_disk_id ($OPERATOR_BUILD_DISK_IOPS IOPS, $OPERATOR_BUILD_DISK_MBPS MB/s)
 build mount: $OPERATOR_BUILD_MOUNT
 benchmark service: gantry-benchmark-operator.service
+image pool service: gantry-benchmark-image-builder.service
 start command:
   az vm run-command invoke -g $AZURE_RESOURCE_GROUP -n $OPERATOR_VM_NAME --command-id RunShellScript --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
 status command:
   AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-status
 watch command:
   AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-watch
+prebuild command:
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME GANTRY_IMAGE_POOL_COUNT=10 make -C hack/gantry-benchmark operator-vm-prebuild
+run from pool command:
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME GANTRY_ONLY_BASELINE_RUN_ID=<run-id> make -C hack/gantry-benchmark operator-vm-run-pool
+pool status command:
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-image-pool-status
 SUMMARY

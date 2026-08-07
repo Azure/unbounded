@@ -457,6 +457,20 @@ func TestLoadBenchmarkConfigJobTimeoutIsFourHours(t *testing.T) {
 	}
 }
 
+func TestLoadBenchmarkConfigImagePoolRoots(t *testing.T) {
+	config, err := loadBenchmarkConfig(envFromMap(map[string]string{
+		"BENCHMARK_IMAGE_POOL_ROOT":       "/durable/pool",
+		"BENCHMARK_IMAGE_POOL_BUILD_ROOT": "/build/pool",
+	}))
+	if err != nil {
+		t.Fatalf("loadBenchmarkConfig: %v", err)
+	}
+
+	if config.ImagePoolRoot != "/durable/pool" || config.ImagePoolBuildRoot != "/build/pool" {
+		t.Fatalf("image pool roots = %q and %q", config.ImagePoolRoot, config.ImagePoolBuildRoot)
+	}
+}
+
 func TestLoadBenchmarkConfigRejectsUnknownMode(t *testing.T) {
 	_, err := loadBenchmarkConfig(envFromMap(map[string]string{"BENCHMARK_MODE": "proxyless"}))
 	if err == nil {

@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
@@ -113,6 +115,8 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		"p2p_dht_lookup_duration_seconds_(bucket|sum|count)",
 		"gantry_peer_fetch_last_timestamp_seconds",
 		"gantry_mirror_response_completed_timestamp_seconds",
+		"gantry_layer_download_completed_timestamp_seconds",
+		"gantry_benchmark_(image_unpack_started|image_unpacked|layer_unpacked)_timestamp_seconds",
 		"gantry_containerd_commit_observation_duration_seconds_(bucket|sum|count)",
 		"gantry_containerd_commit_latest_observation_duration_seconds",
 		"node_uname_info",
@@ -131,12 +135,158 @@ func TestRenderMonitoringManifest(t *testing.T) {
 		t.Fatalf("monitoring manifest must not reference the proxy")
 	}
 
+	journalScript := renderedContainerScript(t, rendered, "gantry-benchmark-node-observer", "containerd-journal")
+	command := exec.Command("sh", "-n")
+
+	command.Stdin = strings.NewReader(journalScript)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("containerd-journal script syntax: %v: %s", err, output)
+	}
+
 	kinds := decodeManifestKinds(t, rendered)
 
 	wantKinds := []string{"PodMonitor", "DaemonSet", "PodMonitor"}
 	if !slices.Equal(kinds, wantKinds) {
 		t.Fatalf("rendered kinds = %v, want %v", kinds, wantKinds)
 	}
+}
+
+func TestContainerdJournalProgressScript(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("findRepoRoot: %v", err)
+	}
+
+	benchmark := &benchmark{config: benchmarkConfig{RepoRoot: repoRoot}}
+
+	rendered, err := benchmark.renderManifest(monitoringManifestPath, proxyManifestData{
+		Namespace:       "gantry-benchmark",
+		GantryNamespace: "gantry-system",
+		MonitoringLabel: "kps",
+		NodeOS:          "linux",
+		NodeArch:        "amd64",
+		RunID:           "run-1",
+	})
+	if err != nil {
+		t.Fatalf("renderManifest: %v", err)
+	}
+
+	script := renderedContainerScript(t, rendered, "gantry-benchmark-node-observer", "containerd-journal")
+	tempDir := t.TempDir()
+	progressDir := filepath.Join(tempDir, "textfile")
+
+	if err := os.Mkdir(progressDir, 0o750); err != nil {
+		t.Fatalf("mkdir textfile: %v", err)
+	}
+
+	fakeChroot := `#!/bin/sh
+shift
+case "$1" in
+  systemctl) echo 123 ;;
+  readlink) echo /usr/bin/containerd ;;
+  /usr/bin/containerd) echo 'level = "debug"' ;;
+  journalctl)
+    cat <<'EOF'
+level=info msg="PullImage request" image="registry.example/gantry-benchmark-pull@sha256:image"
+level=debug msg="layer unpacked" duration=1s layer=sha256:aaaaaaaa
+level=debug msg="image unpacked" duration=2s
+EOF
+    ;;
+  *) echo "unexpected chroot command: $*" >&2; exit 1 ;;
+esac
+`
+
+	fakePath := filepath.Join(tempDir, "chroot")
+	if err := os.WriteFile(fakePath, []byte(fakeChroot), 0o750); err != nil {
+		t.Fatalf("write fake chroot: %v", err)
+	}
+
+	command := exec.Command("sh", "-c", script)
+
+	command.Env = append(os.Environ(),
+		"PATH="+tempDir+":"+os.Getenv("PATH"),
+		"NODE_NAME=node-a",
+		"TEXTFILE_DIR="+progressDir,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("run containerd-journal script: %v: %s", err, output)
+	}
+
+	wantFiles := map[string][]string{
+		"image-start.prom": {
+			`gantry_benchmark_image_unpack_started_timestamp_seconds`,
+			`node="node-a"`,
+			`image="registry.example/gantry-benchmark-pull@sha256:image"`,
+		},
+		"layer-aaaaaaaa.prom": {
+			`gantry_benchmark_layer_unpacked_timestamp_seconds`,
+			`layer_digest="sha256:aaaaaaaa"`,
+		},
+		"image-complete.prom": {
+			`gantry_benchmark_image_unpacked_timestamp_seconds`,
+		},
+	}
+	for name, fragments := range wantFiles {
+		content, err := os.ReadFile(filepath.Join(progressDir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+
+		for _, fragment := range fragments {
+			if !bytes.Contains(content, []byte(fragment)) {
+				t.Errorf("%s missing %q: %s", name, fragment, content)
+			}
+		}
+	}
+}
+
+func renderedContainerScript(t *testing.T, rendered []byte, objectName, containerName string) string {
+	t.Helper()
+
+	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(rendered), 4096)
+
+	for {
+		object := &unstructured.Unstructured{}
+		if err := decoder.Decode(object); err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			t.Fatalf("decode rendered manifest: %v", err)
+		}
+
+		if object.GetName() != objectName {
+			continue
+		}
+
+		containers, found, err := unstructured.NestedSlice(object.Object, "spec", "template", "spec", "containers")
+		if err != nil || !found {
+			t.Fatalf("containers for %s: found=%t err=%v", objectName, found, err)
+		}
+
+		for _, raw := range containers {
+			container, ok := raw.(map[string]any)
+			if !ok || container["name"] != containerName {
+				continue
+			}
+
+			command, ok := container["command"].([]any)
+			if !ok || len(command) < 3 {
+				t.Fatalf("container %s command = %#v", containerName, container["command"])
+			}
+
+			script, ok := command[len(command)-1].(string)
+			if !ok {
+				t.Fatalf("container %s script = %#v", containerName, command[len(command)-1])
+			}
+
+			return script
+		}
+	}
+
+	t.Fatalf("container %s in %s not found", containerName, objectName)
+
+	return ""
 }
 
 func TestContainerdBenchmarkManifest(t *testing.T) {

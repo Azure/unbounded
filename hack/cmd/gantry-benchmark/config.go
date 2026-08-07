@@ -72,6 +72,8 @@ type benchmarkConfig struct {
 	TelemetryPollInterval        time.Duration
 	JobProgressInterval          time.Duration
 	StateRoot                    string
+	ImagePoolRoot                string
+	ImagePoolBuildRoot           string
 }
 
 type phaseRegistry struct {
@@ -146,6 +148,8 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		)
 	}
 
+	stateRoot := filepath.Join(repoRoot, "tmp", "gantry-benchmark")
+
 	config := benchmarkConfig{
 		RepoRoot:                     repoRoot,
 		Mode:                         mode,
@@ -189,7 +193,9 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		TelemetryTimeout:             telemetryTimeout,
 		TelemetryPollInterval:        telemetryPollInterval,
 		JobProgressInterval:          jobProgressInterval,
-		StateRoot:                    filepath.Join(repoRoot, "tmp", "gantry-benchmark"),
+		StateRoot:                    stateRoot,
+		ImagePoolRoot:                envDefault(getenv, "BENCHMARK_IMAGE_POOL_ROOT", filepath.Join(stateRoot, "image-pool")),
+		ImagePoolBuildRoot:           envDefault(getenv, "BENCHMARK_IMAGE_POOL_BUILD_ROOT", filepath.Join(stateRoot, "image-pool-build")),
 	}
 
 	if config.NodeCount <= 0 {

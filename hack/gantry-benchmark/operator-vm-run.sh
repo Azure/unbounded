@@ -34,6 +34,13 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() { printf '%s [operator] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
+LOCK_FILE="${BENCHMARK_LIFECYCLE_LOCK:-$HOME/benchmark-lifecycle.lock}"
+exec {lifecycle_lock_fd}>"$LOCK_FILE"
+if ! flock -n "$lifecycle_lock_fd"; then
+  log "another benchmark or image-pool lifecycle owns $LOCK_FILE"
+  exit 1
+fi
+
 run_id=""
 run_status=0
 cleanup_started=false
@@ -75,7 +82,9 @@ cleanup() {
 
   if [[ -n "$run_id" && -d "$BENCHMARK_REPO_ROOT/tmp/gantry-benchmark/$run_id" ]]; then
     rm -rf "$BENCHMARK_ARTIFACT_ROOT/$run_id"
-    cp -a "$BENCHMARK_REPO_ROOT/tmp/gantry-benchmark/$run_id" "$BENCHMARK_ARTIFACT_ROOT/$run_id"
+    install -d -m 0750 "$BENCHMARK_ARTIFACT_ROOT/$run_id"
+    find "$BENCHMARK_REPO_ROOT/tmp/gantry-benchmark/$run_id" -maxdepth 1 -type f \
+      -exec cp -a -- {} "$BENCHMARK_ARTIFACT_ROOT/$run_id/" \;
     ln -sfn "$run_id" "$BENCHMARK_ARTIFACT_ROOT/latest"
 
     podman image rm \
@@ -104,6 +113,47 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 cd "$BENCHMARK_REPO_ROOT"
+
+restore_gantry_only_baseline() {
+  [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]] || return 0
+  [[ "$(basename "$GANTRY_ONLY_BASELINE_RUN_ID")" == "$GANTRY_ONLY_BASELINE_RUN_ID" ]] || {
+    echo "invalid GANTRY_ONLY_BASELINE_RUN_ID=$GANTRY_ONLY_BASELINE_RUN_ID" >&2
+    return 1
+  }
+
+  local source="$BENCHMARK_ARTIFACT_ROOT/$GANTRY_ONLY_BASELINE_RUN_ID"
+  local destination="$BENCHMARK_REPO_ROOT/tmp/gantry-benchmark/$GANTRY_ONLY_BASELINE_RUN_ID"
+  [[ -s "$source/state.json" && -s "$source/baseline.json" ]] || {
+    echo "retained baseline $GANTRY_ONLY_BASELINE_RUN_ID is missing state.json or baseline.json under $source" >&2
+    return 1
+  }
+
+  install -d -m 0750 "$destination"
+  install -m 0640 "$source/state.json" "$source/baseline.json" "$destination/"
+  log "restored retained baseline metadata for $GANTRY_ONLY_BASELINE_RUN_ID"
+}
+
+restore_gantry_only_baseline
+
+[[ "${GANTRY_ONLY_USE_IMAGE_POOL:-false}" == true || "${GANTRY_ONLY_USE_IMAGE_POOL:-false}" == false ]] || {
+  echo "GANTRY_ONLY_USE_IMAGE_POOL must be true or false" >&2
+  exit 2
+}
+[[ "${GANTRY_ONLY_FRESH_IMAGE:-false}" == true || "${GANTRY_ONLY_FRESH_IMAGE:-false}" == false ]] || {
+  echo "GANTRY_ONLY_FRESH_IMAGE must be true or false" >&2
+  exit 2
+}
+if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+  preparation_modes=0
+  [[ -z "${GANTRY_ONLY_ADOPT_IMAGE:-}" ]] || ((preparation_modes += 1))
+  [[ "${GANTRY_ONLY_USE_IMAGE_POOL:-false}" != true ]] || ((preparation_modes += 1))
+  [[ "${GANTRY_ONLY_FRESH_IMAGE:-false}" != true ]] || ((preparation_modes += 1))
+  [[ -z "${GANTRY_ONLY_PREPARED_RUN_ID:-}" ]] || ((preparation_modes += 1))
+  ((preparation_modes <= 1)) || {
+    echo "set only one of GANTRY_ONLY_ADOPT_IMAGE, GANTRY_ONLY_USE_IMAGE_POOL, GANTRY_ONLY_FRESH_IMAGE, or GANTRY_ONLY_PREPARED_RUN_ID" >&2
+    exit 2
+  }
+fi
 
 write_progress "authenticate" "authenticating managed identity and loading kubeconfig"
 log "authenticating operator VM managed identity"
@@ -141,6 +191,8 @@ elif [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
   if [[ -n "${GANTRY_ONLY_ADOPT_IMAGE:-}" ]]; then
     : "${GANTRY_ONLY_ADOPT_PAYLOAD_SHA256:?Set GANTRY_ONLY_ADOPT_PAYLOAD_SHA256 with GANTRY_ONLY_ADOPT_IMAGE}"
     write_progress "prepare" "adopting an already-pushed fresh Gantry image against baseline $GANTRY_ONLY_BASELINE_RUN_ID"
+  elif [[ "${GANTRY_ONLY_USE_IMAGE_POOL:-false}" == true ]]; then
+    write_progress "prepare" "claiming a prebuilt Gantry image against baseline $GANTRY_ONLY_BASELINE_RUN_ID"
   elif [[ "${GANTRY_ONLY_FRESH_IMAGE:-false}" == true ]]; then
     write_progress "prepare" "generating a brand-new random Gantry image against baseline $GANTRY_ONLY_BASELINE_RUN_ID"
   else
@@ -150,28 +202,46 @@ else
   write_progress "prepare" "generating shared payload and pushing both private ACR images"
 fi
 
-tenant_id=$(az account show --query tenantId -o tsv)
-aad_access_token=$(az account get-access-token --resource https://containerregistry.azure.net --query accessToken -o tsv)
+needs_baseline_credentials=false
+needs_gantry_credentials=false
+if [[ -z "${ADOPT_BASELINE_IMAGE:-}" ]]; then
+  if [[ -z "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
+    needs_baseline_credentials=true
+    needs_gantry_credentials=true
+  elif [[ -z "${GANTRY_ONLY_ADOPT_IMAGE:-}" && "${GANTRY_ONLY_USE_IMAGE_POOL:-false}" != true && -z "${GANTRY_ONLY_PREPARED_RUN_ID:-}" ]]; then
+    needs_gantry_credentials=true
+  fi
+fi
 
-baseline_refresh_token=$(curl -fsS -X POST \
-  -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data-urlencode grant_type=access_token \
-  --data-urlencode "service=$BASELINE_ACR_LOGIN_SERVER" \
-  --data-urlencode "tenant=$tenant_id" \
-  --data-urlencode "access_token=$aad_access_token" \
-  "https://$BASELINE_ACR_LOGIN_SERVER/oauth2/exchange" | jq -er '.refresh_token')
+if [[ "$needs_baseline_credentials" == true || "$needs_gantry_credentials" == true ]]; then
+  tenant_id=$(az account show --query tenantId -o tsv)
+  aad_access_token=$(az account get-access-token --resource https://containerregistry.azure.net --query accessToken -o tsv)
 
-gantry_refresh_token=$(curl -fsS -X POST \
-  -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data-urlencode grant_type=access_token \
-  --data-urlencode "service=$GANTRY_ACR_LOGIN_SERVER" \
-  --data-urlencode "tenant=$tenant_id" \
-  --data-urlencode "access_token=$aad_access_token" \
-  "https://$GANTRY_ACR_LOGIN_SERVER/oauth2/exchange" | jq -er '.refresh_token')
+  if [[ "$needs_baseline_credentials" == true ]]; then
+    baseline_refresh_token=$(curl -fsS -X POST \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      --data-urlencode grant_type=access_token \
+      --data-urlencode "service=$BASELINE_ACR_LOGIN_SERVER" \
+      --data-urlencode "tenant=$tenant_id" \
+      --data-urlencode "access_token=$aad_access_token" \
+      "https://$BASELINE_ACR_LOGIN_SERVER/oauth2/exchange" | jq -er '.refresh_token')
+    export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
+  fi
 
-unset aad_access_token
-export BASELINE_ACR_PASSWORD="$baseline_refresh_token"
-export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
+  if [[ "$needs_gantry_credentials" == true ]]; then
+    gantry_refresh_token=$(curl -fsS -X POST \
+      -H 'Content-Type: application/x-www-form-urlencoded' \
+      --data-urlencode grant_type=access_token \
+      --data-urlencode "service=$GANTRY_ACR_LOGIN_SERVER" \
+      --data-urlencode "tenant=$tenant_id" \
+      --data-urlencode "access_token=$aad_access_token" \
+      "https://$GANTRY_ACR_LOGIN_SERVER/oauth2/exchange" | jq -er '.refresh_token')
+    export GANTRY_ACR_PASSWORD="$gantry_refresh_token"
+  fi
+
+  unset aad_access_token
+fi
+
 if [[ -n "${ADOPT_BASELINE_IMAGE:-}" ]]; then
   make -C hack/gantry-benchmark prepare-adopt \
     ADOPT_BASELINE_IMAGE="$ADOPT_BASELINE_IMAGE" \
@@ -183,6 +253,9 @@ elif [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
       GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID" \
       GANTRY_ONLY_ADOPT_IMAGE="$GANTRY_ONLY_ADOPT_IMAGE" \
       GANTRY_ONLY_ADOPT_PAYLOAD_SHA256="$GANTRY_ONLY_ADOPT_PAYLOAD_SHA256"
+  elif [[ "${GANTRY_ONLY_USE_IMAGE_POOL:-false}" == true ]]; then
+    make -C hack/gantry-benchmark prepare-gantry-pool \
+      GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID"
   elif [[ "${GANTRY_ONLY_FRESH_IMAGE:-false}" == true ]]; then
     make -C hack/gantry-benchmark prepare-gantry-fresh \
       GANTRY_ONLY_BASELINE_RUN_ID="$GANTRY_ONLY_BASELINE_RUN_ID"

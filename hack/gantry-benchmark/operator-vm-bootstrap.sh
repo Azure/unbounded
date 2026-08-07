@@ -193,6 +193,12 @@ require_private_resolution "$gantry_acr_name.$gantry_location.data.azurecr.io" "
 
 repo_root="$build_mount/unbounded"
 source_description="$repo_url ($repo_branch)"
+for lifecycle_service in gantry-benchmark-operator.service gantry-benchmark-image-builder.service; do
+  if systemctl is-active --quiet "$lifecycle_service"; then
+    echo "$lifecycle_service is active; finish it before refreshing the operator checkout" >&2
+    exit 1
+  fi
+done
 if [[ -n "$source_image" ]]; then
   gantry_login_server=$(az acr show -g "$resource_group" -n "$gantry_acr_name" --query loginServer -o tsv)
   source_token=$(acr_access_token "$gantry_acr_name")
@@ -271,6 +277,11 @@ BENCHMARK_REPO_ROOT="$repo_root"
 BENCHMARK_BUILD_MOUNT="$build_mount"
 BENCHMARK_ARTIFACT_ROOT="/var/lib/gantry-benchmark/artifacts"
 BENCHMARK_OPERATOR_HOME="/var/lib/gantry-benchmark"
+BENCHMARK_IMAGE_POOL_ROOT="/var/lib/gantry-benchmark/image-pool"
+BENCHMARK_IMAGE_POOL_BUILD_ROOT="$repo_root/tmp/gantry-benchmark/image-pool-build"
+BENCHMARK_IMAGE_POOL_PROGRESS="/var/lib/gantry-benchmark/image-pool-progress.json"
+BENCHMARK_IMAGE_POOL_LOG="/var/lib/gantry-benchmark/image-pool-builder.log"
+BENCHMARK_LIFECYCLE_LOCK="/var/lib/gantry-benchmark/benchmark-lifecycle.lock"
 BENCHMARK_CONFIRM_CONTEXT="$aks_cluster"
 BENCHMARK_MODE="direct"
 
@@ -334,6 +345,34 @@ TimeoutStopSec=45min
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+cat >/etc/systemd/system/gantry-benchmark-image-builder.service <<UNIT
+[Unit]
+Description=Gantry reusable benchmark image pool builder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=$repo_root
+Environment=GANTRY_BENCHMARK_CONFIG=/etc/gantry-benchmark/env
+EnvironmentFile=/etc/gantry-benchmark/image-pool.env
+ExecStart=$repo_root/hack/gantry-benchmark/operator-vm-prebuild-images.sh
+StandardOutput=append:/var/log/gantry-benchmark/image-pool-service.log
+StandardError=append:/var/log/gantry-benchmark/image-pool-service.log
+TimeoutStartSec=0
+TimeoutStopSec=45min
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+if [[ ! -f /etc/gantry-benchmark/image-pool.env ]]; then
+  cat >/etc/gantry-benchmark/image-pool.env <<'ENV'
+GANTRY_IMAGE_POOL_COUNT="1"
+ENV
+fi
 
 systemctl daemon-reload
 
