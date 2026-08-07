@@ -26,6 +26,14 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("PrefetchPullerFraction = %v, want disabled", c.PrefetchPullerFraction)
 	}
 
+	if c.PrefetchMaxConcurrentGroups != 64 {
+		t.Fatalf("PrefetchMaxConcurrentGroups = %d, want 64", c.PrefetchMaxConcurrentGroups)
+	}
+
+	if c.PrefetchDispatchJitter != time.Second {
+		t.Fatalf("PrefetchDispatchJitter = %v, want 1s", c.PrefetchDispatchJitter)
+	}
+
 	if c.TransferMaxConcurrentServes != 10 {
 		t.Fatalf("TransferMaxConcurrentServes = %d, want 10", c.TransferMaxConcurrentServes)
 	}
@@ -85,6 +93,66 @@ func TestValidate_PrefetchPullerFractionBounds(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "prefetch_puller_fraction") {
 			t.Fatalf("fraction %v: want prefetch_puller_fraction error, got %v", fraction, err)
 		}
+	}
+}
+
+func TestPrefetchDispatchConfig(t *testing.T) {
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadEnv(func(key string) string {
+			switch key {
+			case "GANTRY_PREFETCH_MAX_CONCURRENT_GROUPS":
+				return "32"
+			case "GANTRY_PREFETCH_DISPATCH_JITTER":
+				return "750ms"
+			default:
+				return ""
+			}
+		})
+		if err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
+			t.Fatalf("prefetch dispatch config = %d, %v", c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		}
+	})
+
+	t.Run("flags", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--prefetch-max-concurrent-groups=32", "--prefetch-dispatch-jitter=750ms"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
+			t.Fatalf("prefetch dispatch config = %d, %v", c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		}
+	})
+}
+
+func TestValidate_PrefetchDispatchBounds(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{name: "zero groups", mutate: func(c *Config) { c.PrefetchMaxConcurrentGroups = 0 }, want: "prefetch_max_concurrent_groups"},
+		{name: "negative jitter", mutate: func(c *Config) { c.PrefetchDispatchJitter = -time.Second }, want: "prefetch_dispatch_jitter"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			test.mutate(c)
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("want %s error, got %v", test.want, err)
+			}
+		})
 	}
 }
 

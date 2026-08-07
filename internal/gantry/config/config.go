@@ -266,6 +266,14 @@ type Config struct {
 	// except by the number of eligible nodes.
 	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
 
+	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
+	// per manifest. Group dispatch is best effort and target-side deduplicated.
+	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
+
+	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
+	// node derives a stable delay in [0, jitter) from itself and the manifest.
+	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
+
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
 	// (HRW within the requester's zone) - the design doc / the design doc open question.
 	HRWTopologyScope string `yaml:"hrw_topology_scope"`
@@ -465,11 +473,13 @@ func NewDefault() *Config {
 
 		UpstreamRegistries: nil,
 
-		HRWK:                   3,
-		PrefetchPullerReplicas: 8,
-		PrefetchPullerFraction: 0,
-		HRWTopologyScope:       "cluster",
-		ZoneLabelKey:           "topology.kubernetes.io/zone",
+		HRWK:                        3,
+		PrefetchPullerReplicas:      8,
+		PrefetchPullerFraction:      0,
+		PrefetchMaxConcurrentGroups: 64,
+		PrefetchDispatchJitter:      time.Second,
+		HRWTopologyScope:            "cluster",
+		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
 		CoordPeerAuthzEnforce:       false,
 		CoordMaxDigestsPerRequest:   256,
@@ -599,6 +609,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("HRW_K", &c.HRWK)
 	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
 	setFloat("PREFETCH_PULLER_FRACTION", &c.PrefetchPullerFraction)
+	setInt("PREFETCH_MAX_CONCURRENT_GROUPS", &c.PrefetchMaxConcurrentGroups)
+	setDur("PREFETCH_DISPATCH_JITTER", &c.PrefetchDispatchJitter)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
 	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
@@ -662,6 +674,8 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
 	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "fraction of eligible HRW nodes selected as initial pullers, rounded up (0 disables and uses --prefetch-puller-replicas)")
+	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "maximum simultaneous outbound prefetch RPC groups per manifest")
+	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "maximum deterministic per-node delay before dispatching manifest prefetch")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
 	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
@@ -855,6 +869,14 @@ func (c *Config) Validate() error {
 
 	if c.CoordMaxDigestsPerRequest < 1 {
 		errs = append(errs, fmt.Errorf("coord_max_digests_per_request: must be >= 1, got %d", c.CoordMaxDigestsPerRequest))
+	}
+
+	if c.PrefetchMaxConcurrentGroups < 1 {
+		errs = append(errs, fmt.Errorf("prefetch_max_concurrent_groups: must be >= 1, got %d", c.PrefetchMaxConcurrentGroups))
+	}
+
+	if c.PrefetchDispatchJitter < 0 {
+		errs = append(errs, fmt.Errorf("prefetch_dispatch_jitter: must be >= 0, got %v", c.PrefetchDispatchJitter))
 	}
 
 	if c.CoordMaxConcurrentPulls < 1 {

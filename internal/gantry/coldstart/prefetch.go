@@ -28,16 +28,46 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
+
+func prefetchDispatchHash(self ifaces.NodeID, children []ChildDigest) uint64 {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(self))
+	_, _ = hasher.Write([]byte{0})
+
+	if len(children) > 0 {
+		_, _ = hasher.Write([]byte(children[0].Digest.String()))
+	}
+
+	return hasher.Sum64()
+}
+
+func prefetchDispatchPlan(self ifaces.NodeID, children []ChildDigest, groups int, maxJitter time.Duration) (int, time.Duration) {
+	dispatchHash := prefetchDispatchHash(self, children)
+
+	offset := 0
+	if groups > 1 {
+		offset = int(dispatchHash % uint64(groups))
+	}
+
+	delay := time.Duration(0)
+	if maxJitter > 0 {
+		delay = time.Duration(dispatchHash % uint64(maxJitter))
+	}
+
+	return offset, delay
+}
 
 // PrefetchLayers groups digests by their HRW rank-0 reachable
 // designated puller and issues one PleasePull RPC per puller. Digests
@@ -236,6 +266,15 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 
 		return groupKeys[i].kind < groupKeys[j].kind
 	})
+
+	dispatchOffset, dispatchDelay := prefetchDispatchPlan(self, children, len(groupKeys), r.opts.PrefetchDispatchJitter)
+	if len(groupKeys) > 1 {
+		rotated := make([]groupKey, 0, len(groupKeys))
+		rotated = append(rotated, groupKeys[dispatchOffset:]...)
+		rotated = append(rotated, groupKeys[:dispatchOffset]...)
+		groupKeys = rotated
+	}
+
 	// Sort self-kinds too so the goroutine launch is deterministic.
 	selfKinds := make([]ifaces.OriginRefKind, 0, len(selfByKind))
 	for k := range selfByKind {
@@ -276,10 +315,24 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 		slog.Int("pullers", totalPullers),
 		slog.Int("rpc_groups", len(byGroup)+len(selfByKind)),
 		slog.Int("skipped_self", skippedSelf),
+		slog.Int("max_concurrent_groups", r.opts.PrefetchMaxConcurrentGroups),
+		slog.Int("dispatch_offset", dispatchOffset),
+		slog.Duration("dispatch_delay", dispatchDelay),
 	)
 
 	if r.opts.Metrics.OnPrefetchBatch != nil {
 		r.opts.Metrics.OnPrefetchBatch(totalPullers, totalDigests)
+	}
+
+	if dispatchDelay > 0 {
+		timer := time.NewTimer(dispatchDelay)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 
 	var (
@@ -326,13 +379,25 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 		}(k, digests)
 	}
 
-	for _, gk := range groupKeys {
+	remoteSlots := make(chan struct{}, r.opts.PrefetchMaxConcurrentGroups)
+
+dispatchRemote:
+	for index, gk := range groupKeys {
 		ds := byGroup[gk]
+
+		select {
+		case remoteSlots <- struct{}{}:
+		case <-ctx.Done():
+			failures.Add(int32(len(groupKeys) - index))
+
+			break dispatchRemote
+		}
 
 		wg.Add(1)
 
 		go func(node ifaces.NodeID, kind ifaces.OriginRefKind, digests []digest.Digest) {
 			defer wg.Done()
+			defer func() { <-remoteSlots }()
 
 			callCtx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
 			defer cancel()

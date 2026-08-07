@@ -140,6 +140,10 @@ data:
     # A positive fraction overrides prefetch_puller_replicas. There is no
     # maximum cap other than the eligible cluster/zone node count.
     prefetch_puller_fraction: 0.02
+    # Bound and desynchronize redundant best-effort prefetch dispatch. Without
+    # this, every requester opens roughly 550 libp2p RPC groups at once.
+    prefetch_max_concurrent_groups: 64
+    prefetch_dispatch_jitter: "1s"
     # Coord peer authorization. Default false ships observe-only: an
     # inbound coord request from a peer not in the membership view only
     # increments p2p_coord_unauthorized_peer_total and is still served.

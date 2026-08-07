@@ -142,6 +142,12 @@ type Options struct {
 	// than zero. The resolver selects ceil(eligible candidates * fraction),
 	// with a minimum of one and no cap other than the candidate count.
 	PrefetchPullerFraction float64
+	// PrefetchMaxConcurrentGroups caps simultaneous remote dispatch groups.
+	// Zero uses 64.
+	PrefetchMaxConcurrentGroups int
+	// PrefetchDispatchJitter is disabled at zero. Production config defaults
+	// it to one second; direct tests can remain deterministic and immediate.
+	PrefetchDispatchJitter time.Duration
 
 	// LocalIntent computes self's PullIntent synchronously, without
 	// the libp2p coord round-trip. When non-nil, the cold-start
@@ -237,6 +243,10 @@ func New(opts Options) *Resolver {
 
 	if opts.QueryTimeout <= 0 {
 		opts.QueryTimeout = 2 * time.Second
+	}
+
+	if opts.PrefetchMaxConcurrentGroups <= 0 {
+		opts.PrefetchMaxConcurrentGroups = 64
 	}
 
 	if opts.PollManifest <= 0 {
