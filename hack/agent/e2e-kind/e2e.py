@@ -3715,7 +3715,7 @@ def validate_agent_upgrade_rollback() -> None:
         broken_tarball, broken_operation_name, expect_complete=False)
     broken_status = broken_operation.get("status", {})
     log(f"Broken AgentUpgrade failure reason: {broken_status.get('reason')!r}")
-    if "verify agent binary" not in broken_status.get("message", ""):
+    if "verify upgraded agent binary" not in broken_status.get("message", ""):
         die(f"unexpected broken AgentUpgrade failure message: {broken_status.get('message')!r}")
     if read_daemon_current_target() != previous_good:
         die("broken AgentUpgrade changed current daemon binary symlink")
