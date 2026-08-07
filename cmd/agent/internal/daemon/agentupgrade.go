@@ -18,8 +18,14 @@ import (
 
 const (
 	agentUpgradeDownloadURLParameter = "downloadURL"
+	agentUpgradeSHA256Parameter      = "sha256"
 	agentUpgradeBinaryMode           = 0o755
 )
+
+type agentUpgradeRequest struct {
+	downloadURL string
+	sha256      string
+}
 
 // agentUpgradeSignal is the JSON payload for pending and failure signals.
 type agentUpgradeSignal struct {
@@ -42,33 +48,40 @@ type fileAgentUpgradeSignalOperator struct {
 	path string
 }
 
-func agentUpgradeDownloadURL(parameters map[string]string) (string, error) {
-	downloadURL := strings.TrimSpace(parameters[agentUpgradeDownloadURLParameter])
-	if downloadURL == "" {
-		return "", fmt.Errorf("missing required parameter %q", agentUpgradeDownloadURLParameter)
+func parseAgentUpgradeRequest(parameters map[string]string) (agentUpgradeRequest, error) {
+	request := agentUpgradeRequest{
+		downloadURL: strings.TrimSpace(parameters[agentUpgradeDownloadURLParameter]),
+		sha256:      strings.TrimSpace(parameters[agentUpgradeSHA256Parameter]),
+	}
+	if request.downloadURL == "" {
+		return agentUpgradeRequest{}, fmt.Errorf("missing required parameter %q", agentUpgradeDownloadURLParameter)
 	}
 
-	return downloadURL, nil
+	return request, nil
 }
 
-func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, downloadURL string) error {
+func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
 		return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 	}
 
-	targetPath := paths.NextTargetPath()
-	if err := agentbinary.InstallAndSwitchFromTarGz(ctx, downloadURL, paths, agentUpgradeBinaryMode); err != nil {
-		return err
+	layout := agentbinary.Layout{
+		BinaryPath:   paths.BinaryPath,
+		BluePath:     paths.BluePath,
+		GreenPath:    paths.GreenPath,
+		CurrentPath:  paths.CurrentPath,
+		LastGoodPath: paths.LastGoodPath,
 	}
+	_, err = agentbinary.InstallAndSwitchFromTarGz(ctx, log, layout, agentbinary.InstallOptions{
+		DownloadURL:    request.downloadURL,
+		ExpectedSHA256: request.sha256,
+		ExpectedMember: goalstates.AgentUpgradeBinaryName,
+		Mode:           agentUpgradeBinaryMode,
+		ExactMember:    true,
+	})
 
-	log.Info("staged upgraded daemon binary",
-		"url", downloadURL,
-		"previous", paths.CurrentTargetPath,
-		"current", targetPath,
-	)
-
-	return nil
+	return err
 }
 
 func newAgentUpgradeSignalOperator() (agentUpgradeSignalOperator, error) {

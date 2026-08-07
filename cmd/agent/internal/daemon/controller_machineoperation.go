@@ -59,14 +59,14 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 		return ctrl.Result{}, err
 	}
 
-	downloadURL, err := agentUpgradeDownloadURL(op.Parameters)
+	request, err := parseAgentUpgradeRequest(op.Parameters)
 	if err != nil {
 		return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult[int64]{Phase: v1alpha3.OperationPhaseFailed, Reason: "InvalidParameters", Message: err.Error()})
 	}
 
-	t.log.Info("staging AgentUpgrade binary", "operation", op.Name, "url", downloadURL)
+	t.log.Info("staging AgentUpgrade binary", "operation", op.Name)
 
-	if err := t.nodeOperator.StageAgentUpgrade(ctx, t.log, downloadURL); err != nil {
+	if err := t.nodeOperator.StageAgentUpgrade(ctx, t.log, request); err != nil {
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 
