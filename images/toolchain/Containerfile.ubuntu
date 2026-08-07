@@ -1,0 +1,126 @@
+FROM ubuntu:26.04
+
+# Set so scripts and tools know they are running inside a container. This
+# env var is well-known as it is used by systemd.
+ENV container=docker
+
+# Make Python pip ignore the fact it is running as root in a container. Noisy
+# warnings if this is not set.
+ENV PIP_ROOT_USER_ACTION=ignore
+
+ENV LANG=C.UTF-8
+
+# Keep apt non-interactive during the image build so package installs that
+# would otherwise prompt (e.g. tzdata) proceed without intervention.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime dependencies. Please keep this list in alphabetical order
+# for easy scanning.
+#
+# bc              - shell arithmetic, useful for base conversions.
+# build-essential - gcc/g++/make and friends for cgo builds.
+# ca-certificates - TLS root store for anything that opens HTTPS.
+# curl            - HTTP downloads (also needed below for the Microsoft repo).
+# git             - source control.
+# gnupg           - apt repo key handling for the Microsoft azure-cli repo.
+# golang-go       - the Go toolchain (Ubuntu 26.04 ships 1.26.0; GOTOOLCHAIN=auto
+#                   will fetch the exact go.mod-pinned patch version on demand).
+# jq              - shell processing of JSON documents.
+# libssl-dev      - cgo headers needed by deps that link against OpenSSL
+#                   (e.g. github.com/google/go-tpm-tools/simulator).
+# locales         - so locale-gen can produce a usable en_US.UTF-8.
+# openssh-client  - ssh/scp for git over SSH and remote shells.
+# python3         - required by various linting and codegen tools.
+# python3-pip     - pip for Python-based dev tooling.
+# rsync           - file syncing for scripts and tests.
+# sudo            - the entrypoint runs as the unprivileged "dev" user;
+#                   sudoers allows escalation when needed.
+# tar             - archive extraction.
+# tree            - pretty-print a directory tree.
+# unzip           - archive extraction.
+# wget            - HTTP downloads.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bc \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        golang-go \
+        jq \
+        libssl-dev \
+        locales \
+        openssh-client \
+        python3 \
+        python3-pip \
+        rsync \
+        sudo \
+        tar \
+        tree \
+        unzip \
+        wget \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+# azure-cli from Microsoft's apt repo (the version in Ubuntu's universe lags
+# upstream substantially). Follows Microsoft's documented install steps:
+# https://learn.microsoft.com/cli/azure/install-azure-cli-linux
+#
+# Microsoft's azure-cli apt repo lags Ubuntu's release schedule and does not
+# always have a suite for the latest Ubuntu codename. We pin to the most
+# recent LTS suite Microsoft does publish ("noble" = 24.04); the .deb is a
+# Python package and works across Ubuntu versions. Update AZ_DIST when MS
+# adds a suite matching this image's Ubuntu base.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+       | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
+    && chmod 0644 /etc/apt/keyrings/microsoft.gpg \
+    && AZ_DIST=noble \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ ${AZ_DIST} main" \
+       > /etc/apt/sources.list.d/azure-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends azure-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pinned Go tool versions are supplied by the caller via --build-arg. The
+# repository Makefile is the single source of truth (GOFUMPT_VERSION,
+# GOLANGCI_LINT_VERSION, PROTOC_GEN_GO_VERSION, PROTOC_GEN_GO_GRPC_VERSION,
+# CONTROLLER_GEN_VERSION); toolchain.sh extracts them from the Makefile and
+# passes them in. Building without these args will fail fast at the
+# `go install ...@` step, which is intentional: the image should never be
+# built with unpinned tool versions.
+ARG GOFUMPT_VERSION
+ARG GOLANGCI_LINT_VERSION
+ARG PROTOC_GEN_GO_VERSION
+ARG PROTOC_GEN_GO_GRPC_VERSION
+ARG CONTROLLER_GEN_VERSION
+
+# GOBIN is set inline to /usr/local/bin so installed binaries land on the
+# default PATH for every user, without leaking a build-time GOBIN/GOPATH into
+# the runtime environment of the dev user (see entrypoint.sh).
+RUN GOBIN=/usr/local/bin go install golang.org/x/tools/cmd/goimports@latest \
+        && GOBIN=/usr/local/bin go install mvdan.cc/gofumpt@${GOFUMPT_VERSION} \
+        && GOBIN=/usr/local/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION} \
+        && GOBIN=/usr/local/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION} \
+        && GOBIN=/usr/local/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@${PROTOC_GEN_GO_GRPC_VERSION} \
+        && GOBIN=/usr/local/bin go install sigs.k8s.io/controller-tools/cmd/controller-gen@${CONTROLLER_GEN_VERSION} \
+        && rm -rf /root/go /root/.cache
+
+# Create the unprivileged "dev" user the entrypoint runs as. The uid/gid are
+# fixed at 1000:1000 so toolchain.sh can map the host invoking user 1:1 onto
+# them via --userns=keep-id:uid=1000,gid=1000 under rootless podman. Sudoers
+# is baked in so `sudo` works inside the container without the entrypoint
+# having to mutate /etc/sudoers.d at runtime.
+#
+# Ubuntu's cloud images ship a default `ubuntu` user at uid 1000; remove it
+# first so our `dev` user can claim uid 1000.
+RUN userdel --remove ubuntu 2>/dev/null || true \
+        && useradd --create-home --shell /bin/bash --uid 1000 --user-group dev \
+        && echo 'dev ALL=(root) NOPASSWD:ALL' > /etc/sudoers.d/dev \
+        && chmod 0440 /etc/sudoers.d/dev
+
+COPY --chmod=755 entrypoint.sh /
+
+USER dev
+ENTRYPOINT ["/entrypoint.sh"]
