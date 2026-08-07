@@ -1212,6 +1212,10 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
     try:
         log(f"Verifying VM can reach agent upgrade URL: {agent_url}")
         ssh_cmd(f"curl -fsSL --connect-timeout 10 -o /dev/null {agent_url}")
+        # Each scenario intentionally restarts or fails the daemon. Isolate its
+        # systemd start-limit budget so the candidate under test gets the
+        # configured retries before recovery runs.
+        ssh_cmd("sudo systemctl reset-failed unbounded-agent-daemon.service")
         run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
                    "--ignore-not-found"], check=False)
         create_machine_operation(
