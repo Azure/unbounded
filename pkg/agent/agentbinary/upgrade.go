@@ -163,10 +163,6 @@ func SecureInstallAndSwitch(
 	paths Layout,
 	opts SecureInstallOptions,
 ) (SwitchResult, error) {
-	if log == nil {
-		return SwitchResult{}, fmt.Errorf("logger is nil")
-	}
-
 	if err := ValidateLayout(paths); err != nil {
 		return SwitchResult{}, err
 	}
