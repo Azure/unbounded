@@ -189,6 +189,23 @@ claimed_dir="$BENCHMARK_IMAGE_POOL_ROOT/claimed"
 printf 'ready: %s\n' "$(find "$ready_dir" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l)"
 printf 'claimed: %s\n' "$(find "$claimed_dir" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l)"
 find "$ready_dir" -maxdepth 1 -type f -name '*.json' -printf '%f\n' 2>/dev/null | sort | tail -10
+printf '\n=== Ready metadata ===\n'
+for metadata in "$ready_dir"/*.json; do
+  [[ -f "$metadata" ]] || continue
+  jq -c '{schema_version,id,created_at,image,payload_sha256,image_size_mib,image_layers,image_platform,workload_repository,gantry_acr_login_server}' "$metadata"
+done
+printf '\n=== Local cleanup ===\n'
+build_root="${BENCHMARK_IMAGE_POOL_BUILD_ROOT:-$BENCHMARK_REPO_ROOT/tmp/gantry-benchmark/image-pool-build}"
+printf 'scratch entries: %s\n' "$(find "$build_root" -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l)"
+local_pool_tags=0
+for metadata in "$ready_dir"/*.json "$claimed_dir"/*.json; do
+  [[ -f "$metadata" ]] || continue
+  entry_id="$(jq -r '.id' "$metadata")"
+  if podman image exists "$GANTRY_ACR_LOGIN_SERVER/$BENCHMARK_WORKLOAD_REPOSITORY:$entry_id"; then
+    ((local_pool_tags += 1))
+  fi
+done
+printf 'local pool tags: %s\n' "$local_pool_tags"
 printf '\n=== Recent log ===\n'
 tail -20 "${BENCHMARK_IMAGE_POOL_LOG:-$BENCHMARK_OPERATOR_HOME/image-pool-builder.log}" 2>/dev/null || true
 printf '\n=== VM space ===\n'
