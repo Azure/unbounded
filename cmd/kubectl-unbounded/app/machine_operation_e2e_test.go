@@ -48,6 +48,7 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 		"--kind", string(v1alpha3.OperationAgentUpgrade),
 		"--machine", "worker-01",
 		"--param", "downloadURL=https://example.com/agent.tar.gz",
+		"--param", "sha256="+testAgentUpgradeSHA256,
 		"--ttl", "900",
 	)
 	require.NoError(t, err)
@@ -57,6 +58,7 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 		require.Nil(t, op.Spec.MachineSelector)
 		require.Equal(t, v1alpha3.OperationAgentUpgrade, op.Spec.OperationKind)
 		require.Equal(t, "https://example.com/agent.tar.gz", op.Spec.Parameters["downloadURL"])
+		require.Equal(t, testAgentUpgradeSHA256, op.Spec.Parameters["sha256"])
 		require.NotNil(t, op.Spec.TTLSecondsAfterFinished)
 		require.Equal(t, int32(900), *op.Spec.TTLSecondsAfterFinished)
 	})
@@ -102,7 +104,7 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 		ctx, rt,
 		"machine", "agent-upgrade", "worker-01",
 		"--operation-name", "worker-01-agent-upgrade",
-		"--download-url", "https://example.com/new-agent.tar.gz",
+		"--download-url", "http://example.com/new-agent.tar.gz",
 		"--wait=false",
 	)
 	require.NoError(t, err)
@@ -110,7 +112,8 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 	assertMachineOperation(t, ctx, c, "worker-01-agent-upgrade", func(op v1alpha3.MachineOperation) {
 		require.Equal(t, "worker-01", op.Spec.MachineRef)
 		require.Equal(t, v1alpha3.OperationAgentUpgrade, op.Spec.OperationKind)
-		require.Equal(t, "https://example.com/new-agent.tar.gz", op.Spec.Parameters["downloadURL"])
+		require.Equal(t, "http://example.com/new-agent.tar.gz", op.Spec.Parameters["downloadURL"])
+		require.NotContains(t, op.Spec.Parameters, "sha256")
 		require.NotNil(t, op.Spec.TTLSecondsAfterFinished)
 		require.Equal(t, int32(defaultTTLSeconds), *op.Spec.TTLSecondsAfterFinished)
 		require.Len(t, op.OwnerReferences, 1)

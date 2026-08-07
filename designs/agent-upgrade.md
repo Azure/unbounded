@@ -62,7 +62,7 @@ Pending MachineOperation
         v
 Validate parameters
         |
-        +-- missing downloadURL -------------------------> Failed
+        +-- missing/invalid HTTP(S) URL -----------------> Failed
         |
         v
 Mark InProgress
@@ -96,18 +96,20 @@ Old process exits, new daemon starts
 
 ## Staging and switching
 
-The daemon reads `spec.parameters["downloadURL"]` from the
-`MachineOperation`. It logs the URL, resolves the current binary target, and
-calls `agentbinary.InstallAndSwitchFromTarGz`.
+The daemon reads `spec.parameters["downloadURL"]` and the optional
+`spec.parameters["sha256"]` from the `MachineOperation`, resolves the current
+binary target, and calls `agentbinary.InstallAndSwitchFromTarGz`.
+Logs and errors omit URL query and fragment data.
 
 `InstallAndSwitchFromTarGz` performs the upgrade as one logical operation:
 
-1. Download the tarball.
-2. Extract the `unbounded-agent` entry into `NextTargetPath()`.
-3. Reject an empty agent entry.
-4. Run `unbounded-agent version` against the staged binary.
-5. Update `LastGoodPath` to the previous `CurrentTargetPath`.
-6. Update `CurrentPath` to the staged binary.
+1. Require an HTTP or HTTPS URL and verify the compressed-archive SHA-256 when provided.
+2. Download the tarball within the configured size bound.
+3. Require the archive to contain only the exact `unbounded-agent` entry.
+4. Bound decompression and atomically install the inactive slot.
+5. Run `unbounded-agent version` against the staged binary without exposing output.
+6. If the inactive slot is last-good, protect the running binary through `LastGoodPath` before replacing it; otherwise defer the last-good update until candidate verification succeeds.
+7. Atomically update `CurrentPath` to the staged binary.
 
 Symlink replacement uses `renameio.Symlink` through `utilio`, so each link is
 replaced atomically after parent directory creation.
@@ -167,9 +169,10 @@ startup signal path.
 | Failure | Operation status | Binary state |
 |---------|------------------|--------------|
 | Missing `downloadURL` | `Failed`, `InvalidParameters` | No link changes. |
-| Download or extraction failure | `Failed`, `ExecutionFailed` | No link changes after failure. |
-| Empty archive entry | `Failed`, `ExecutionFailed` | No link changes after failure. |
-| Staged binary fails `version` | `Failed`, `ExecutionFailed` | Current and last-good remain unchanged. |
+| Unsupported URL or digest mismatch | `Failed`, `InvalidParameters` or `ExecutionFailed` | No current link change. |
+| Download or extraction failure | `Failed`, `ExecutionFailed` | Current remains unchanged. Last-good changes to current only when needed to protect an inactive slot that it referenced. |
+| Empty archive entry | `Failed`, `ExecutionFailed` | Current remains unchanged. Last-good changes to current only when needed to protect an inactive slot that it referenced. |
+| Staged binary fails `version` | `Failed`, `ExecutionFailed` | Current remains unchanged. A distinct last-good target remains unchanged. |
 | Restart command fails | `Failed` | Signal is cleared. Links may already point to the staged binary. |
 | Upgraded daemon fails under systemd | `Failed`, `DaemonFailed` | Recovery restores current to last-good. |
 

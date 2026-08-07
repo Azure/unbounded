@@ -139,6 +139,7 @@ spec:
   operationKind: AgentUpgrade
   parameters:
     downloadURL: https://example.com/releases/unbounded-agent-v1.2.0-linux-amd64.tar.gz
+    sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   ttlSecondsAfterFinished: 7200
 EOF
 
@@ -170,6 +171,7 @@ spec:
   operationKind: AgentUpgrade
   parameters:
     downloadURL: https://example.com/releases/unbounded-agent-v1.2.0-linux-amd64.tar.gz
+    sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 ### Node Upgrade via Recreation
