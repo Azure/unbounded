@@ -41,7 +41,9 @@ type Layout struct {
 
 // InstallOptions configures a bounded agent release archive install.
 type InstallOptions struct {
-	DownloadURL       string
+	DownloadURL string
+	// ExpectedSHA256 may be empty only when the caller trusts both the archive
+	// source and the transport path.
 	ExpectedSHA256    string
 	ExpectedMember    string
 	Mode              os.FileMode
@@ -326,17 +328,21 @@ func boundedHTTPClient(base *http.Client) *http.Client {
 	client := *base
 	originalCheckRedirect := client.CheckRedirect
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if originalCheckRedirect != nil {
+			if err := originalCheckRedirect(req, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+
 		if (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Host == "" ||
 			req.URL.User != nil || req.URL.Fragment != "" {
 			return fmt.Errorf("redirect URL must use HTTP or HTTPS, include a host, omit user information, and omit fragments")
 		}
 
-		if originalCheckRedirect != nil {
-			return originalCheckRedirect(req, via)
-		}
-
-		if len(via) >= 10 {
-			return fmt.Errorf("stopped after 10 redirects")
+		if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("HTTPS download cannot redirect to HTTP")
 		}
 
 		return nil

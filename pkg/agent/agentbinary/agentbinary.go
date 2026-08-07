@@ -20,7 +20,10 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
-const verifyTimeout = 30 * time.Second
+const (
+	verifyTimeout   = 30 * time.Second
+	verifyWaitDelay = time.Second
+)
 
 const daemonBinaryMode os.FileMode = 0o755
 
@@ -122,6 +125,7 @@ func Verify(ctx context.Context, path string) error {
 		cmd := exec.CommandContext(verifyCtx, path, "version")
 		cmd.Stdout = &output
 		cmd.Stderr = &output
+		cmd.WaitDelay = verifyWaitDelay
 
 		err := cmd.Run()
 		if err == nil {

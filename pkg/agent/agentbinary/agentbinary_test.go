@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -117,6 +118,20 @@ func TestInstallFromTarGzRejectsUnsupportedScheme(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
+}
+
+func TestVerifyBoundsInheritedOutputWait(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "agent")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n(sleep 5) &\nexit 42\n"), 0o755); err != nil {
+		t.Fatalf("write agent: %v", err)
+	}
+
+	start := time.Now()
+	err := Verify(t.Context(), path)
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 3*time.Second)
 }
 
 func TestEnsureDaemonBinaryLinks_InitializesFromBlue(t *testing.T) {

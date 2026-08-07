@@ -376,25 +376,51 @@ func TestInstallAndSwitchFromTarGzWithOptionsAllowsHTTPRedirect(t *testing.T) {
 	}))
 	t.Cleanup(insecure.Close)
 
-	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		http.Redirect(w, request, insecure.URL, http.StatusFound)
 	}))
-	t.Cleanup(secure.Close)
+	t.Cleanup(redirector.Close)
 
 	digest := sha256.Sum256(payload)
 
 	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
-		DownloadURL:    secure.URL + "/agent.tar.gz",
+		DownloadURL:    redirector.URL + "/agent.tar.gz",
 		ExpectedSHA256: fmt.Sprintf("%x", digest),
 		ExpectedMember: "custom-agent",
 		ExactMember:    true,
-		HTTPClient:     secure.Client(),
 	})
 	if err != nil {
 		t.Fatalf("InstallAndSwitchFromTarGz: %v", err)
 	}
 
 	assertSecureUpgradeLink(t, paths.CurrentPath, paths.GreenPath)
+}
+
+func TestInstallAndSwitchFromTarGzRejectsHTTPSDowngrade(t *testing.T) {
+	t.Parallel()
+
+	paths := secureUpgradeReadyPaths(t)
+	insecure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("not reached"))
+	}))
+	t.Cleanup(insecure.Close)
+
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		http.Redirect(w, request, insecure.URL, http.StatusFound)
+	}))
+	t.Cleanup(secure.Close)
+
+	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
+		DownloadURL:    secure.URL + "/agent.tar.gz",
+		ExpectedMember: "custom-agent",
+		ExactMember:    true,
+		HTTPClient:     secure.Client(),
+	})
+	if err == nil {
+		t.Fatal("InstallAndSwitchFromTarGz error = nil")
+	}
+
+	assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
 }
 
 func TestRedactedURL(t *testing.T) {
