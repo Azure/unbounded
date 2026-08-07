@@ -111,7 +111,9 @@ fi
 cat >/etc/gantry-benchmark/image-pool.env <<'ENV'
 GANTRY_IMAGE_POOL_COUNT="$count"
 ENV
-systemctl reset-failed gantry-benchmark-image-builder.service
+if systemctl is-failed --quiet gantry-benchmark-image-builder.service; then
+  systemctl reset-failed gantry-benchmark-image-builder.service
+fi
 systemctl start --no-block gantry-benchmark-image-builder.service
 systemctl show gantry-benchmark-image-builder.service --property=ActiveState --property=SubState --no-pager
 SCRIPT
@@ -156,7 +158,9 @@ cat >>/etc/gantry-benchmark/env <<'ENV'
 GANTRY_ONLY_BASELINE_RUN_ID="$baseline_run_id"
 GANTRY_ONLY_USE_IMAGE_POOL="true"
 ENV
-systemctl reset-failed gantry-benchmark-operator.service
+if systemctl is-failed --quiet gantry-benchmark-operator.service; then
+  systemctl reset-failed gantry-benchmark-operator.service
+fi
 systemctl start --no-block gantry-benchmark-operator.service
 systemctl show gantry-benchmark-operator.service --property=ActiveState --property=SubState --no-pager
 SCRIPT
