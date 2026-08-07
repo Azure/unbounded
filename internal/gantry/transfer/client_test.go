@@ -68,6 +68,19 @@ func TestClientDefaultRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestClientAdvertisesLargePeerFrames(t *testing.T) {
+	client := NewClient()
+
+	transport, ok := client.hc.Transport.(*http2.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http2.Transport", client.hc.Transport)
+	}
+
+	if transport.MaxReadFrameSize != peerMaxReadFrameSize {
+		t.Fatalf("MaxReadFrameSize = %d, want %d", transport.MaxReadFrameSize, peerMaxReadFrameSize)
+	}
+}
+
 func TestClientForwardsDelegatedAuthorization(t *testing.T) {
 	for _, authorization := range []string{
 		"Bearer requester-token",
