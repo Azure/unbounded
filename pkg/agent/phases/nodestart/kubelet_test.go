@@ -127,8 +127,9 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 			ClusterDNS: "10.0.0.10",
 			ResolvConf: goalstates.LocalDNSResolvConfPath,
 			Configuration: map[string]any{
-				"maxPods": 250,
-				"logging": map[string]any{"verbosity": 4},
+				"maxPods":    250,
+				"resolvConf": "/caller/override/resolv.conf",
+				"logging":    map[string]any{"verbosity": 4},
 				"authorization": map[string]any{
 					"webhook": map[string]any{"cacheAuthorizedTTL": "10m"},
 				},

@@ -66,7 +66,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
@@ -589,7 +589,7 @@ class NodeConfig:
     node_labels: dict[str, str]
     register_with_taints: list[str]
     node_ip: str = ""
-    kubelet_configuration: dict[str, Any] | None = None
+    kubelet_configuration: dict[str, Any] = field(default_factory=dict)
     offline_artifacts_oci_ref: str = ""
     rootfs_oci_image: str = ""
     block_external_network: bool = False
@@ -2579,6 +2579,7 @@ import sys
 
 expected = json.loads({expected_configuration_literal})
 paths = sorted(pathlib.Path("/tmp").glob("unbounded-agent-config.*.json"))
+paths.append(pathlib.Path("/etc/unbounded/agent/config.json"))
 paths.extend(sorted(pathlib.Path("/etc/unbounded/agent").glob("*-applied-config.json")))
 for config_path in paths:
     if not config_path.exists():
@@ -2628,7 +2629,8 @@ def validate_local_dns_config(node_config: NodeConfig) -> None:
     machine_shell(machine, """
 systemctl is-active --quiet localdns.service
 grep -qx 'nameserver 169.254.10.10' /etc/resolv.conf
-grep -q -- '^- 169.254.10.11$' /var/lib/kubelet/config.yaml
+grep -qx 'clusterDNS:' /var/lib/kubelet/config.yaml
+grep -qx -- '- 169.254.10.11' /var/lib/kubelet/config.yaml
 grep -qx 'resolvConf: /etc/unbounded/localdns/resolv.conf' /var/lib/kubelet/config.yaml
 curl --silent --fail --noproxy '*' http://169.254.10.10:8181/ready | grep -q OK
 curl --silent --fail --noproxy '*' http://169.254.10.11:8181/ready | grep -q OK

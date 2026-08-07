@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -35,7 +36,7 @@ func newMachineOperationWaitCommand(rt *machineCommandRuntime) *cobra.Command {
 				return err
 			}
 
-			return waitForMachineOperation(ctx, c, args[0])
+			return waitForMachineOperation(ctx, c, args[0], cmd.OutOrStdout())
 		},
 	}
 
@@ -45,16 +46,16 @@ func newMachineOperationWaitCommand(rt *machineCommandRuntime) *cobra.Command {
 	return cmd
 }
 
-func waitForMachineOperation(ctx context.Context, c client.WithWatch, opName string) error {
-	return watchMachineOperation(ctx, c, opName)
+func waitForMachineOperation(ctx context.Context, c client.WithWatch, opName string, out io.Writer) error {
+	return watchMachineOperation(ctx, c, opName, out)
 }
 
-func finishMachineOperationWait(op *v1alpha3.MachineOperation) error {
+func finishMachineOperationWait(op *v1alpha3.MachineOperation, out io.Writer) error {
 	if op.Status.Phase == v1alpha3.OperationPhaseFailed {
 		return fmt.Errorf("operation failed: %s", op.Status.Message)
 	}
 
-	printReady()
+	printReady(out)
 
 	return nil
 }

@@ -179,6 +179,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -196,6 +199,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_CURRENT_TAG: ${{ needs.version.outputs.tag }}
+          # The GoReleaser before-hook renders the operator manifests embedded in
+          # kubectl-unbounded. Pass the (lowercased) release registry so a fork's
+          # binary embeds its own registry/org instead of the ghcr.io/azure
+          # Makefile default. REGISTRY is normalized to lowercase above because
+          # ghcr rejects uppercase repository names (owner "Azure" -> "azure").
+          CONTAINER_REGISTRY: ${{ env.REGISTRY }}
 
       - name: Upload dist artifact for downstream jobs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

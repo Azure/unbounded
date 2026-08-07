@@ -117,10 +117,10 @@ func (c *configureKubelet) ensureKubeletConfiguration() error {
 	configuration["apiVersion"] = "kubelet.config.k8s.io/v1beta1"
 	configuration["kind"] = "KubeletConfiguration"
 	configuration["clusterDNS"] = []string{spec.ClusterDNS}
+
 	configuration["containerRuntimeEndpoint"] = "unix:///run/containerd/containerd.sock"
-	configuration["resolvConf"] = spec.ResolvConf
-	if spec.ResolvConf == "" {
-		configuration["resolvConf"] = "/etc/resolv.conf"
+	if spec.ResolvConf != "" {
+		configuration["resolvConf"] = spec.ResolvConf
 	}
 
 	authentication := ensureConfigurationMap(configuration, "authentication")

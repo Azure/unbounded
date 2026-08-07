@@ -85,7 +85,11 @@ UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
 UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION_TAG)
 UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
-UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= ghcr.io
+# Full image-repository prefix the operator resolves component images under. It
+# derives from CONTAINER_REGISTRY so it cannot drift from the operator's own
+# image: overriding CONTAINER_REGISTRY (as the release workflow does per fork)
+# points components at the same registry/org as the operator.
+UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
@@ -291,6 +295,8 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
+	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
+	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
 	@echo ""
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
@@ -536,6 +542,14 @@ notice-check: ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native
 		exit 1; \
 	fi
 	$(GOCMD) run ./hack/cmd/notice check --notice NOTICE
+
+.PHONY: toolchain-shell
+toolchain-shell: ## Drop into the toolchain container with the repo mounted at /project (builds the image on first use)
+	@./images/toolchain/toolchain.sh
+
+.PHONY: toolchain-build
+toolchain-build: ## Rebuild the toolchain container image (otherwise built lazily on first toolchain-shell use)
+	@TOOLCHAIN_REBUILD=1 ./images/toolchain/toolchain.sh true
 
 ##@ Build
 
