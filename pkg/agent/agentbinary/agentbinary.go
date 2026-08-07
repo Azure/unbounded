@@ -24,8 +24,7 @@ const verifyTimeout = 30 * time.Second
 
 const daemonBinaryMode os.FileMode = 0o755
 
-// InstallFromFile installs a local agent binary to targetPath.
-func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error) {
+func installFromFile(sourcePath, targetPath string, perm os.FileMode) (err error) {
 	source, err := os.Open(sourcePath)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", sourcePath, err)
@@ -106,7 +105,7 @@ func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, erro
 		return target, nil
 	}
 
-	if err := InstallFromFile(paths.BinaryPath, paths.BluePath, daemonBinaryMode); err != nil {
+	if err := installFromFile(paths.BinaryPath, paths.BluePath, daemonBinaryMode); err != nil {
 		return "", err
 	}
 
