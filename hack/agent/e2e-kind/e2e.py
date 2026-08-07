@@ -2629,7 +2629,9 @@ def validate_local_dns_config(node_config: NodeConfig) -> None:
     machine_shell(machine, """
 systemctl is-active --quiet localdns.service
 grep -qx 'nameserver 169.254.10.10' /etc/resolv.conf
-grep -q -- '--cluster-dns=169.254.10.11' /etc/systemd/system/kubelet.service.d/20-node-config.conf
+grep -qx 'clusterDNS:' /var/lib/kubelet/config.yaml
+grep -qx -- '- 169.254.10.11' /var/lib/kubelet/config.yaml
+grep -qx 'resolvConf: /etc/unbounded/localdns/resolv.conf' /var/lib/kubelet/config.yaml
 curl --silent --fail --noproxy '*' http://169.254.10.10:8181/ready | grep -q OK
 curl --silent --fail --noproxy '*' http://169.254.10.11:8181/ready | grep -q OK
 """)
