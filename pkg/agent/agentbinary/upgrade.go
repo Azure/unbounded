@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	defaultMaxArchiveBytes = 256 << 20
-	defaultMaxBinaryBytes  = 256 << 20
+	defaultMaxArchiveBytes = 256 << 20 // 256 MiB
+	defaultMaxBinaryBytes  = 256 << 20 // 256 MiB
 )
 
 // Layout describes caller-owned blue-green agent binary paths.
