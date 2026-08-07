@@ -241,9 +241,12 @@ func doWriteCNIConfig(cfg *config, podCIDRs []string) error {
 		return fmt.Errorf("failed to marshal CNI config: %w", err)
 	}
 
-	// Refuse to install if the directory already contains conflist files
-	if err := checkCNIConfDirForConflists(cfg.CNIConfDir, cfg.CNIConfFile); err != nil {
-		return err
+	// Refuse to install if the directory already contains conflist files unless
+	// coexistence was explicitly enabled for a meta-CNI such as Multus.
+	if !cfg.AllowCNIConfigCoexistence {
+		if err := checkCNIConfDirForConflists(cfg.CNIConfDir, cfg.CNIConfFile); err != nil {
+			return err
+		}
 	}
 
 	// Ensure the CNI conf directory exists

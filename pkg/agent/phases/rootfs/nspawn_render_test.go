@@ -139,23 +139,36 @@ func TestServiceOverride_HostDeviceGroupSpecifiers(t *testing.T) {
 	t.Parallel()
 
 	var nspawnBuf bytes.Buffer
+
+	hostDevices := goalstates.HostDevices{Additional: []string{"char-input", "char-pts"}}
+	hostDeviceGroupSpecifiers := nspawnHostDeviceGroupSpecifiers(hostDevices)
+
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", nspawnTemplateData{
 		BPFFSMountPath:               goalstates.BPFFSMountPath("kube1"),
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
-		HostDeviceGroupSpecifiers:    []string{"char-input", "char-pts"},
+		HostDeviceGroupSpecifiers:    hostDeviceGroupSpecifiers,
 	}))
 
 	var overrideBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", nspawnTemplateData{
 		MachineName:               "kube1",
 		BPFFSMountPath:            goalstates.BPFFSMountPath("kube1"),
-		HostDeviceGroupSpecifiers: []string{"char-input", "char-pts"},
+		HostDeviceGroupSpecifiers: hostDeviceGroupSpecifiers,
 	}))
 
 	require.NotContains(t, nspawnBuf.String(), "Bind=char-")
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-input rwm")
 	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-pts rwm")
+	require.Contains(t, overrideBuf.String(), "DeviceAllow=char-ipvtap rwm")
+}
+
+func TestNSpawnHostDeviceGroupSpecifiersDoesNotDuplicateIPVTAP(t *testing.T) {
+	t.Parallel()
+
+	hostDevices := goalstates.HostDevices{Additional: []string{"char-ipvtap"}}
+
+	require.Equal(t, []string{"char-ipvtap"}, nspawnHostDeviceGroupSpecifiers(hostDevices))
 }
 
 func TestServiceOverride_MultipleHostDevices(t *testing.T) {
@@ -314,8 +327,6 @@ func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
 		// No HostDevicePaths and no GPU devices.
 	}))
 
-	// With no devices the drop-in must not contain any DeviceAllow lines,
-	// which is what keeps the existing golden snapshots unchanged.
 	require.NotContains(t, buf.String(), "DeviceAllow=")
 }
 

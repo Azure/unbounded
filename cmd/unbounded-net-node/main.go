@@ -75,6 +75,7 @@ type config struct {
 	NodeName                      string
 	CNIConfDir                    string
 	CNIConfFile                   string
+	AllowCNIConfigCoexistence     bool
 	BridgeName                    string
 	WireGuardDir                  string
 	WireGuardPort                 int
@@ -269,6 +270,7 @@ then annotates the node with the public key.`,
 	// CNI configuration flags
 	flags.StringVar(&cfg.CNIConfDir, "cni-conf-dir", "/etc/cni/net.d", "Directory to write CNI configuration")
 	flags.StringVar(&cfg.CNIConfFile, "cni-conf-file", "10-unbounded.conflist", "Name of the CNI configuration file")
+	flags.BoolVar(&cfg.AllowCNIConfigCoexistence, "allow-cni-config-coexistence", false, "Allow unbounded-net CNI configuration alongside other conflist files, such as Multus")
 	flags.StringVar(&cfg.BridgeName, "bridge-name", "cbr0", "Name of the bridge interface")
 	flags.IntVar(&cfg.MTU, "mtu", 0, "Maximum MTU for tunnel and bridge interfaces (0 automatically derives MTU from each underlay route)")
 
@@ -354,6 +356,10 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 
 	if !flags.Changed("cni-conf-file") && nodeCfg.CNIConfFile != "" {
 		cfg.CNIConfFile = nodeCfg.CNIConfFile
+	}
+
+	if !flags.Changed("allow-cni-config-coexistence") && nodeCfg.AllowCNIConfigCoexistence != nil {
+		cfg.AllowCNIConfigCoexistence = *nodeCfg.AllowCNIConfigCoexistence
 	}
 
 	if !flags.Changed("bridge-name") && nodeCfg.BridgeName != "" {

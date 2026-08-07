@@ -56,6 +56,8 @@ type NSpawnDeviceTarget struct {
 	Allow NSpawnDeviceAllow
 }
 
+const ipvtapDeviceGroupSpecifier = "char-ipvtap"
+
 // EnsureNSpawnWorkspace returns a task that bootstraps an OCI rootfs into the
 // machine directory (if it is empty or missing) and writes the
 // systemd-nspawn configuration files needed to run a Kubernetes node inside a
@@ -116,7 +118,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	// directory.
 	machineName := filepath.Base(e.goalState.MachineDir)
 	hostDevicePaths := e.goalState.HostDevices.Paths()
-	hostDeviceGroupSpecifiers := e.goalState.HostDevices.DeviceGroupSpecifiers()
+	hostDeviceGroupSpecifiers := nspawnHostDeviceGroupSpecifiers(e.goalState.HostDevices)
 	amdGPUDevicePaths := pathsExcluding(e.goalState.AMD.GPUDevicePaths, e.goalState.Nvidia.GPUDevicePaths)
 
 	archiveDir := filepath.Join(e.goalState.MachineDir, strings.TrimPrefix(goalstates.ContainerImageArchiveDir, "/"))
@@ -186,6 +188,17 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	}
 
 	return nil
+}
+
+func nspawnHostDeviceGroupSpecifiers(hostDevices goalstates.HostDevices) []string {
+	specifiers := hostDevices.DeviceGroupSpecifiers()
+	for _, specifier := range specifiers {
+		if specifier == ipvtapDeviceGroupSpecifier {
+			return specifiers
+		}
+	}
+
+	return append(specifiers, ipvtapDeviceGroupSpecifier)
 }
 
 func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {

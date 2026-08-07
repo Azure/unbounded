@@ -216,6 +216,7 @@ graph TD
 |------|------|---------|-------------|
 | `--cni-conf-dir` | string | `/etc/cni/net.d` | Directory to write CNI configuration. |
 | `--cni-conf-file` | string | `10-unbounded.conflist` | Name of the CNI configuration file. |
+| `--allow-cni-config-coexistence` | bool | `false` | Allow the unbounded CNI conflist alongside other conflists, such as Multus. |
 | `--bridge-name` | string | `cbr0` | Name of the bridge interface. |
 | `--mtu` | int | `0` | Optional maximum MTU for tunnel and bridge interfaces. With `0`, the node agent derives each route's MTU from the selected underlay route and encapsulation overhead. Positive values cap the automatically detected and CRD-configured MTU. |
 
