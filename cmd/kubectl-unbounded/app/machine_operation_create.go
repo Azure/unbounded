@@ -181,7 +181,7 @@ func (o *machineOperationCreateOptions) runWithClient(ctx context.Context, c cli
 	waitCtx, cancel := contextWithOptionalTimeout(ctx, o.timeout)
 	defer cancel()
 
-	return waitForMachineOperation(waitCtx, c, op.Name)
+	return waitForMachineOperation(waitCtx, c, op.Name, o.out)
 }
 
 func (o *machineOperationCreateOptions) validate() error {

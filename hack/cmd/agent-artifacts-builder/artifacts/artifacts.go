@@ -60,6 +60,7 @@ type Artifact struct {
 	URL              string
 	Path             string
 	GenerateChecksum bool
+	ExtractFile      string
 }
 
 type ContainerImageArchive struct {
@@ -177,6 +178,16 @@ func NewPlan(opts Options) (Plan, error) {
 				ImageTag: imageTag,
 				Arch:     arch,
 				Path:     bootstrapartifacts.ContainerImageArchivePath(arch, imageTag),
+			})
+		}
+
+		if manifest.Versions.CoreDNS != "" {
+			artifacts = append(artifacts, Artifact{
+				Name:             "coredns",
+				URL:              agentartifacts.CoreDNSArchive(nil, manifest.Versions.CoreDNS, arch),
+				Path:             bootstrapartifacts.CoreDNSArtifactPath(manifest.Versions.CoreDNS, arch),
+				GenerateChecksum: true,
+				ExtractFile:      "coredns",
 			})
 		}
 
@@ -505,8 +516,12 @@ func downloadArtifact(ctx context.Context, log *slog.Logger, rootDir string, art
 
 	log.Info("downloading artifact", slog.String("artifact", artifact.Path), slog.String("source", artifact.URL))
 
-	if err := downloadToFile(ctx, artifact.URL, dest); err != nil {
-		return fmt.Errorf("download %s to %q: %w", artifact.URL, dest, err)
+	if artifact.ExtractFile == "" {
+		if err := downloadToFile(ctx, artifact.URL, dest); err != nil {
+			return fmt.Errorf("download %s to %q: %w", artifact.URL, dest, err)
+		}
+	} else if err := downloadTarGzFile(ctx, artifact.URL, artifact.ExtractFile, dest); err != nil {
+		return fmt.Errorf("download and extract %s to %q: %w", artifact.URL, dest, err)
 	}
 
 	log.Info("downloaded artifact", slog.String("artifact", artifact.Path))
@@ -521,6 +536,15 @@ func downloadToFile(ctx context.Context, sourceURL, dest string) (err error) {
 	}
 
 	return source.DownloadToLocalFile(ctx, dest, 0o644)
+}
+
+func downloadTarGzFile(ctx context.Context, sourceURL, wanted, dest string) error {
+	source, err := artifactsource.Parse(sourceURL)
+	if err != nil {
+		return err
+	}
+
+	return source.DownloadToLocalFile(ctx, dest, 0o755, artifactsource.ExtractTarGzFile(wanted))
 }
 
 func writeGeneratedChecksum(path string) error {
@@ -614,6 +638,7 @@ func defaultManifest(kubernetesVersion string) (bootstrapartifacts.Manifest, err
 			Runc:       goalstates.RunCVersion,
 			CNI:        goalstates.CNIPluginVersion,
 			Crictl:     crictlVersion,
+			CoreDNS:    goalstates.CoreDNSVersion,
 		},
 		ContainerImages: agentartifacts.DefaultContainerImages(kubernetesVersion),
 	})

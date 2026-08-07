@@ -43,9 +43,9 @@ wg --version
    `kubectl label node <name> net.unbounded-cloud.io/gateway=true`
 6. **Verify Connectivity**: Test with pod-to-pod ping across sites.
 
-> **Note:** `kubectl unbounded site init` runs the bootstrap step by default,
-> creates the initial Site and gateway resources, and lets the operator deploy
-> controller and node workloads. See the
+> **Note:** After `kubectl unbounded install` bootstraps the operator,
+> `kubectl unbounded site init` creates the initial Site and gateway resources
+> (steps 2-4) and lets the operator deploy controller and node workloads. See the
 > [Getting Started guide]({{< relref "guides/getting-started" >}}).
 
 ---

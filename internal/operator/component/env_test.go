@@ -27,9 +27,25 @@ import (
 )
 
 func TestConfigImage(t *testing.T) {
-	cfg := Config{ImageRegistry: "registry.example.com/mirror/", ImageTag: "v1.2.3"}
-	if got := cfg.Image("machina"); got != "registry.example.com/mirror/azure/machina:v1.2.3" {
-		t.Fatalf("Image = %q", got)
+	cases := []struct {
+		name     string
+		registry string
+		want     string
+	}{
+		{name: "bare host", registry: "ghcr.io", want: "ghcr.io/machina:v1.2.3"},
+		{name: "host and org", registry: "ghcr.io/azure", want: "ghcr.io/azure/machina:v1.2.3"},
+		{name: "fork org", registry: "ghcr.io/myorg", want: "ghcr.io/myorg/machina:v1.2.3"},
+		{name: "host and multi-segment path", registry: "registry.corp.internal/unbounded/mirror", want: "registry.corp.internal/unbounded/mirror/machina:v1.2.3"},
+		{name: "trailing slash", registry: "registry.example.com/mirror/", want: "registry.example.com/mirror/machina:v1.2.3"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{ImageRegistry: tc.registry, ImageTag: "v1.2.3"}
+			if got := cfg.Image("machina"); got != tc.want {
+				t.Fatalf("Image = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

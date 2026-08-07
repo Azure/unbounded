@@ -9,12 +9,19 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
+	"strings"
 	"text/template"
-	"time"
 
 	"github.com/spf13/cobra"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -25,6 +32,9 @@ import (
 
 //go:embed assets/unbounded-net-site/*.yaml
 var siteTemplates embed.FS
+
+// siteTemplateDir is the embedded directory holding the Site manifest templates.
+const siteTemplateDir = "assets/unbounded-net-site"
 
 // siteInitHandler creates declarative Site configuration and bootstrap credentials.
 // Component installation is reconciled by unbounded-operator from the Site spec.
@@ -54,8 +64,6 @@ type siteInitHandler struct {
 	enableMachina  bool
 	enableMetalman bool
 	enableStorage  bool
-	skipInstall    bool
-	installTimeout time.Duration
 
 	// kubeCli is the kubernetes client interface.
 	kubeCli kubernetes.Interface
@@ -94,20 +102,8 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	h.kubeResourcesCli = kubeResourcesCli
 	h.kubeConfig = kubeConfig
 
-	if !h.skipInstall {
-		installer := installHandler{
-			kubeconfigPath:   h.kubeconfigPath,
-			namespace:        unbounded.SystemNamespace(),
-			wait:             true,
-			timeout:          h.installTimeout,
-			kubeCli:          kubeCli,
-			kubeResourcesCli: kubeResourcesCli,
-			restConfig:       kubeConfig,
-			logger:           h.logger,
-		}
-		if err := installer.execute(ctx); err != nil {
-			return fmt.Errorf("bootstrapping unbounded-operator: %w", err)
-		}
+	if err := h.checkOperatorPrerequisites(ctx); err != nil {
+		return err
 	}
 
 	if err := h.ensureUnboundedSite(ctx, h.clusterSiteConfig()); err != nil {
@@ -123,6 +119,195 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// checkOperatorPrerequisites verifies the cluster is ready to accept the Site
+// resources site init is about to create. The unbounded-operator owns CRD
+// lifecycle and reconciles Sites, so it must be installed first (via
+// `kubectl unbounded install`).
+//
+// The check uses API discovery to confirm the apiserver actually serves the
+// GroupVersionKinds site init applies (derived from the embedded manifests, so
+// the check tracks future API versions automatically). Discovery is used rather
+// than reading CustomResourceDefinition objects because it does not require
+// cluster-scoped CRD read permission and reflects the versions the apiserver
+// serves, not merely that a CRD is Established. A type that is not served is a
+// hard error; a missing or not-yet-ready operator Deployment is only a warning,
+// because the operator reconciles the Site once it becomes ready.
+func (h *siteInitHandler) checkOperatorPrerequisites(ctx context.Context) error {
+	required, err := requiredSiteAPIs()
+	if err != nil {
+		return fmt.Errorf("determining required Site API types: %w", err)
+	}
+
+	disco := h.kubeCli.Discovery()
+	servedKinds := map[schema.GroupVersion]map[string]bool{}
+
+	var missing []string
+
+	for _, gvk := range required {
+		gv := gvk.GroupVersion()
+
+		kinds, cached := servedKinds[gv]
+		if !cached {
+			kinds, err = servedKindsForGroupVersion(disco, gv)
+			if err != nil {
+				return fmt.Errorf("checking whether the cluster serves %s: %w", gv, err)
+			}
+
+			servedKinds[gv] = kinds
+		}
+
+		if !kinds[gvk.Kind] {
+			missing = append(missing, fmt.Sprintf("%s.%s", gvk.Kind, gv))
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"unbounded-operator is not installed: the cluster is not serving required API types (%s); run \"kubectl unbounded install\" first to bootstrap the unbounded-operator",
+			strings.Join(missing, ", "),
+		)
+	}
+
+	h.warnIfOperatorNotReady(ctx)
+
+	return nil
+}
+
+// servedKindsForGroupVersion returns the set of Kinds the apiserver serves for
+// gv. A GroupVersion the apiserver does not serve yields an empty set (not an
+// error), so callers can treat "not served" uniformly with "kind absent".
+func servedKindsForGroupVersion(disco discovery.DiscoveryInterface, gv schema.GroupVersion) (map[string]bool, error) {
+	list, err := disco.ServerResourcesForGroupVersion(gv.String())
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return map[string]bool{}, nil
+		}
+
+		return nil, err
+	}
+
+	kinds := make(map[string]bool, len(list.APIResources))
+	for _, resource := range list.APIResources {
+		kinds[resource.Kind] = true
+	}
+
+	return kinds, nil
+}
+
+// requiredSiteAPIs returns the distinct GroupVersionKinds declared by the
+// embedded Site manifest templates. Deriving the set from the templates (instead
+// of a hard-coded list) keeps the preflight in lockstep with the versions site
+// init actually applies, including future API bumps.
+func requiredSiteAPIs() ([]schema.GroupVersionKind, error) {
+	entries, err := fs.ReadDir(siteTemplates, siteTemplateDir)
+	if err != nil {
+		return nil, fmt.Errorf("reading site manifest templates: %w", err)
+	}
+
+	// Placeholder values so the templates render into valid YAML; only the
+	// static apiVersion/kind fields are read, which do not depend on the data.
+	data := unboundedSiteConfig{
+		SiteName:  "preflight",
+		NodeCIDRs: []string{"0.0.0.0/0"},
+		PodCIDRs:  []string{"0.0.0.0/0"},
+	}
+
+	seen := map[schema.GroupVersionKind]bool{}
+
+	var gvks []schema.GroupVersionKind
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+
+		content, err := fs.ReadFile(siteTemplates, siteTemplateDir+"/"+name)
+		if err != nil {
+			return nil, fmt.Errorf("reading site manifest template %s: %w", name, err)
+		}
+
+		tmpl, err := template.New(name).Parse(string(content))
+		if err != nil {
+			return nil, fmt.Errorf("parsing site manifest template %s: %w", name, err)
+		}
+
+		buf := &bytes.Buffer{}
+		if err := tmpl.Execute(buf, data); err != nil {
+			return nil, fmt.Errorf("rendering site manifest template %s: %w", name, err)
+		}
+
+		decoder := utilyaml.NewYAMLOrJSONDecoder(buf, 4096)
+
+		for {
+			obj := &unstructured.Unstructured{}
+
+			if err := decoder.Decode(obj); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				return nil, fmt.Errorf("decoding site manifest template %s: %w", name, err)
+			}
+
+			gvk := obj.GroupVersionKind()
+			if gvk.Empty() {
+				continue
+			}
+
+			if !seen[gvk] {
+				seen[gvk] = true
+
+				gvks = append(gvks, gvk)
+			}
+		}
+	}
+
+	return gvks, nil
+}
+
+// warnIfOperatorNotReady logs a warning (never an error) when the
+// unbounded-operator Deployment is absent or not fully rolled out. The served
+// API types checked by checkOperatorPrerequisites are enough to apply Site
+// resources; a not-yet-ready operator only delays reconciliation, so site init
+// proceeds. Permission errors are downgraded to a debug log so a caller that can
+// apply Sites but cannot read Deployments is not blocked or alarmed.
+func (h *siteInitHandler) warnIfOperatorNotReady(ctx context.Context) {
+	namespace := unbounded.SystemNamespace()
+
+	deploy, err := h.kubeCli.AppsV1().Deployments(namespace).Get(ctx, "unbounded-operator", metav1.GetOptions{})
+	if err != nil {
+		switch {
+		case apierrors.IsNotFound(err):
+			h.logger.Warn(
+				"unbounded-operator Deployment not found; the Site will not be reconciled until the operator is installed and ready",
+				"namespace", namespace,
+			)
+		case apierrors.IsForbidden(err):
+			h.logger.Debug(
+				"skipping unbounded-operator readiness check: not permitted to read Deployments",
+				"namespace", namespace,
+			)
+		default:
+			h.logger.Debug(
+				"could not inspect unbounded-operator Deployment",
+				"namespace", namespace,
+				"error", err,
+			)
+		}
+
+		return
+	}
+
+	if !deploymentRolloutComplete(deploy) {
+		h.logger.Warn(
+			"unbounded-operator Deployment is not fully rolled out; the Site will be reconciled once the operator is ready",
+			"namespace", namespace,
+		)
+	}
 }
 
 func (h *siteInitHandler) clusterSiteConfig() unboundedSiteConfig {
@@ -229,10 +414,9 @@ func (h *siteInitHandler) ensureUnboundedSite(ctx context.Context, cfg unbounded
 	buf := &bytes.Buffer{}
 
 	templateFS := siteTemplates
-	templateDir := "assets/unbounded-net-site/"
 
 	for _, name := range cfg.Manifests {
-		path := templateDir + name
+		path := siteTemplateDir + "/" + name
 
 		content, err := fs.ReadFile(templateFS, path)
 		if err != nil {
@@ -305,8 +489,6 @@ func siteInitCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&handler.enableMachina, "enable-machina", true, "Enable machina for the Site")
 	cmd.Flags().BoolVar(&handler.enableMetalman, "enable-metalman", false, "Enable metalman for the Site")
 	cmd.Flags().BoolVar(&handler.enableStorage, "enable-storage", false, "Enable unbounded-storage for the Site")
-	cmd.Flags().BoolVar(&handler.skipInstall, "skip-install", false, "Skip bootstrapping CRDs and unbounded-operator before creating site resources")
-	cmd.Flags().DurationVar(&handler.installTimeout, "install-timeout", defaultInstallTimeout, "Timeout while waiting for unbounded-operator bootstrap")
 
 	if err := cmd.MarkFlagRequired("name"); err != nil {
 		panic(err)

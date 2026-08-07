@@ -370,8 +370,7 @@ jobs:
             --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
             --node-cidr         "${SITE_NODE_CIDR}" \
             --pod-cidr          "${SITE_POD_CIDR}" \
-            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}" \
-            --skip-install
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
 
       - name: Sanity check tarball contents (upgrade)
         if: env.MODE == 'upgrade'
@@ -413,7 +412,6 @@ jobs:
             "deploy unbounded-net-controller" \
             "ds unbounded-net-node" \
             "deploy machina-controller" \
-            "ds gantry-containerd-config" \
             "ds gantry"; do
             set -- $target
             wait_exists "$1" "$2"
@@ -444,7 +442,7 @@ jobs:
           kubectl -n "$NS" get deploy,ds,pods -o wide 2>&1
           echo "::endgroup::"
           echo "::group::Applied component images"
-          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "ds/gantry-containerd-config" "ds/gantry"; do
+          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "ds/gantry"; do
             img=$(kubectl -n "$NS" get "$kn" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null)
             printf '%s image=[%s]\n' "$kn" "$img"
           done

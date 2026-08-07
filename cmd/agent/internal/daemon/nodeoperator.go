@@ -160,7 +160,19 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if !reflect.DeepEqual(applied.Kubelet.Configuration, desired.Kubelet.Configuration) {
+		return true
+	}
+
+	if !reflect.DeepEqual(applied.Kubelet.ImageCredentialProvider, desired.Kubelet.ImageCredentialProvider) {
+		return true
+	}
+
 	if gantryDisabled(applied) != gantryDisabled(desired) {
+		return true
+	}
+
+	if !reflect.DeepEqual(applied.LocalDNS, desired.LocalDNS) {
 		return true
 	}
 

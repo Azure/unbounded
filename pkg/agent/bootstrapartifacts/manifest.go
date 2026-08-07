@@ -20,6 +20,7 @@ type Versions struct {
 	Runc       string `json:"runc"`
 	CNI        string `json:"cni"`
 	Crictl     string `json:"crictl"`
+	CoreDNS    string `json:"coredns,omitempty"`
 }
 
 // Manifest describes a complete bootstrap artifact bundle.
@@ -44,6 +45,7 @@ func NormalizeManifest(manifest Manifest) (Manifest, error) {
 	manifest.Versions.Runc = StripLeadingV(manifest.Versions.Runc)
 	manifest.Versions.CNI = StripLeadingV(manifest.Versions.CNI)
 	manifest.Versions.Crictl = StripLeadingV(manifest.Versions.Crictl)
+	manifest.Versions.CoreDNS = StripLeadingV(manifest.Versions.CoreDNS)
 	manifest.ContainerImages = NormalizeContainerImages(manifest.ContainerImages)
 
 	missing := make([]string, 0, 5)

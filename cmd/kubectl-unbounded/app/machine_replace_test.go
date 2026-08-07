@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -26,7 +27,7 @@ func TestRunReplaceRequiresForceInNonInteractiveMode(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1"}}
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
 
-	err := runReplace(context.Background(), c, "machine-1", 0, false)
+	err := runReplace(context.Background(), c, "machine-1", 0, false, io.Discard)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "--force")
 }
@@ -40,15 +41,11 @@ func TestRunReplaceCreatesNamedOperationWithoutWaiting(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1"}}
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine).Build()
 
-	var err error
-
-	_ = captureStdout(t, func() {
-		err = runReplaceWithOptions(context.Background(), c, "machine-1", machineReplaceOptions{
-			force:         true,
-			wait:          false,
-			operationName: "replace-machine-1",
-		})
-	})
+	err := runReplaceWithOptions(context.Background(), c, "machine-1", machineReplaceOptions{
+		force:         true,
+		wait:          false,
+		operationName: "replace-machine-1",
+	}, io.Discard)
 	require.NoError(t, err)
 
 	var op v1alpha3.MachineOperation

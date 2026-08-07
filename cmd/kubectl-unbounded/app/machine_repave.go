@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -31,7 +32,7 @@ func machineRepaveCommand() *cobra.Command {
 				return err
 			}
 
-			return runRepave(ctx, c, args[0], ttl)
+			return runRepave(ctx, c, args[0], ttl, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().Int32Var(&ttl, "ttl", defaultTTLSeconds,
@@ -40,16 +41,16 @@ func machineRepaveCommand() *cobra.Command {
 	return cmd
 }
 
-func runRepave(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32) error {
+func runRepave(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, out io.Writer) error {
 	opName := fmt.Sprintf("%s-repave-%d", name, time.Now().Unix())
 
 	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostReplace, ttlSeconds); err != nil {
 		return err
 	}
 
-	printStep(fmt.Sprintf("Repaving Machine %s...", name))
-	printConfig("operation", opName)
-	fmt.Println()
+	printStep(out, fmt.Sprintf("Repaving Machine %s...", name))
+	printConfig(out, "operation", opName)
+	fprintln(out)
 
-	return watchMachineOperation(ctx, c, opName)
+	return watchMachineOperation(ctx, c, opName, out)
 }

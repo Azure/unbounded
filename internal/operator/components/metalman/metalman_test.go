@@ -98,7 +98,7 @@ func TestDeployment(t *testing.T) {
 	}
 
 	container := d.Spec.Template.Spec.Containers[0]
-	if container.Image != "registry.example.com/azure/metalman:v1.2.3" {
+	if container.Image != "registry.example.com/metalman:v1.2.3" {
 		t.Fatalf("image = %q", container.Image)
 	}
 

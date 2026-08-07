@@ -75,9 +75,10 @@ chmod +x aks-quickstart.sh
     --remote-pod-cidr 10.245.0.0/16
 ```
 
-> The script creates an AKS cluster, adds a gateway node pool, and runs
-> `kubectl unbounded site init` to bootstrap the operator and request the
-> networking stack through the cluster Site.
+> The script creates an AKS cluster, adds a gateway node pool, runs
+> `kubectl unbounded install` to bootstrap the operator, then
+> `kubectl unbounded site init` to request the networking stack through the
+> cluster Site.
 
 | Flag | Description |
 |------|-------------|
@@ -197,6 +198,7 @@ WireGuard tunnels.
 ## What the Script Creates
 
 The quickstart script automates AKS infrastructure setup and then delegates to
+[`kubectl unbounded install`]({{< relref "reference/cli" >}}) and
 [`kubectl unbounded site init`]({{< relref "reference/cli" >}}) for the
 Kubernetes-level configuration. Here's what each piece does.
 

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -94,7 +95,8 @@ func TestInstallHandlerApplyBootstrapManifests(t *testing.T) {
 
 	h := installHandler{
 		namespace:         "custom-system",
-		operatorImage:     "operator:test",
+		operatorImage:     "unbounded-operator:test",
+		imageRegistry:     "registry.example.com",
 		apiServerEndpoint: "https://api.example.test:6443",
 		wait:              false,
 		kubeResourcesCli:  cli,
@@ -263,9 +265,15 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			data, found, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
 			require.NoError(t, err)
 			require.True(t, found)
+
+			// The registry is derived from the embedded manifest, which the make
+			// render stamps from CONTAINER_REGISTRY; read it rather than hardcode
+			// so a fork build (non-default CONTAINER_REGISTRY) still passes.
+			wantRegistry, err := (&installHandler{}).embeddedImageRegistry()
+			require.NoError(t, err)
 			require.Equal(t, map[string]string{
 				"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
-				"UNBOUNDED_IMAGE_REGISTRY":        "ghcr.io",
+				"UNBOUNDED_IMAGE_REGISTRY":        wantRegistry,
 				"UNBOUNDED_REAP_LEGACY_RESOURCES": tt.wantReaper,
 			}, data)
 
@@ -285,6 +293,340 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			require.Nil(t, rollingUpdate)
 		})
 	}
+}
+
+// TestInstallReinstallDerivesRegistryFromBuild asserts the component registry is
+// re-derived from the binary's embedded manifests on every install, not
+// preserved from cluster state. An older cluster storing the pre-#574 bare
+// "ghcr.io" (or any custom value) is overwritten with the embedded registry, so
+// it cannot drift from the operator image install also re-derives. The embedded
+// registry is injected (rather than read from the make-rendered manifests) so the
+// assertion does not depend on the build-time CONTAINER_REGISTRY.
+func TestInstallReinstallDerivesRegistryFromBuild(t *testing.T) {
+	t.Parallel()
+
+	const embeddedRegistry = "registry.test/unbounded"
+
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "legacy bare host overwritten", value: "ghcr.io"},
+		{name: "stale custom mirror overwritten", value: "registry.old/mirror"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			existing := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "unbounded-operator-config",
+					"namespace": "unbounded-system",
+				},
+				"data": map[string]any{"UNBOUNDED_IMAGE_REGISTRY": tc.value},
+			}}
+			cli, captured := newCapturingInstallClient(existing)
+			h := installHandler{
+				namespace:         "unbounded-system",
+				kubeResourcesCli:  cli,
+				operatorManifests: operatorManifestsFS(embeddedRegistry, embeddedRegistry+"/unbounded-operator:v1"),
+				logger:            discardLogger(),
+			}
+
+			require.NoError(t, h.execute(context.Background()))
+			require.NotNil(t, captured.configMap)
+
+			data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+			require.NoError(t, err)
+			require.Equal(t, embeddedRegistry, data["UNBOUNDED_IMAGE_REGISTRY"])
+		})
+	}
+}
+
+// TestInstallImageRegistryDrivesBothImages asserts --image-registry sets the
+// component registry and the operator Deployment image shares it: with a
+// name:tag --operator-image the operator image is <registry>/<name:tag>.
+func TestInstallImageRegistryDrivesBothImages(t *testing.T) {
+	t.Parallel()
+
+	cli, captured := newCapturingInstallClient()
+	h := installHandler{
+		namespace:        "unbounded-system",
+		kubeResourcesCli: cli,
+		imageRegistry:    "registry.corp/unbounded",
+		operatorImage:    "unbounded-operator:v9",
+		logger:           discardLogger(),
+	}
+
+	require.NoError(t, h.execute(context.Background()))
+	require.NotNil(t, captured.configMap)
+	require.NotNil(t, captured.deployment)
+
+	data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+	require.NoError(t, err)
+	require.Equal(t, "registry.corp/unbounded", data["UNBOUNDED_IMAGE_REGISTRY"])
+
+	containers, _, err := unstructured.NestedSlice(captured.deployment.Object, "spec", "template", "spec", "containers")
+	require.NoError(t, err)
+	require.Equal(t, "registry.corp/unbounded/unbounded-operator:v9", containers[0].(map[string]any)["image"])
+}
+
+// TestInstallImageRegistryReconstructsOperatorImage asserts that --image-registry
+// alone (no --operator-image) rewrites the operator image's registry to match, so
+// the operator does not run from the embedded registry while components come from
+// --image-registry. The operator's name:tag is taken from the embedded image.
+func TestInstallImageRegistryReconstructsOperatorImage(t *testing.T) {
+	t.Parallel()
+
+	cli, captured := newCapturingInstallClient()
+	h := installHandler{
+		namespace:         "unbounded-system",
+		kubeResourcesCli:  cli,
+		operatorManifests: operatorManifestsFS("ghcr.io/azure", "ghcr.io/azure/unbounded-operator:v9"),
+		imageRegistry:     "registry.corp/mirror",
+		logger:            discardLogger(),
+	}
+
+	require.NoError(t, h.execute(context.Background()))
+	require.NotNil(t, captured.configMap)
+	require.NotNil(t, captured.deployment)
+
+	data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+	require.NoError(t, err)
+	require.Equal(t, "registry.corp/mirror", data["UNBOUNDED_IMAGE_REGISTRY"])
+
+	containers, _, err := unstructured.NestedSlice(captured.deployment.Object, "spec", "template", "spec", "containers")
+	require.NoError(t, err)
+	require.Equal(t, "registry.corp/mirror/unbounded-operator:v9", containers[0].(map[string]any)["image"])
+}
+
+// TestInstallRejectsRegistryQualifiedOperatorImage asserts --operator-image must
+// be a name:tag with no registry, so it can never contradict --image-registry.
+func TestInstallRejectsRegistryQualifiedOperatorImage(t *testing.T) {
+	t.Parallel()
+
+	cli, captured := newCapturingInstallClient()
+	h := installHandler{
+		namespace:        "unbounded-system",
+		kubeResourcesCli: cli,
+		operatorImage:    "ghcr.io/foo/unbounded-operator:v1",
+		logger:           discardLogger(),
+	}
+
+	err := h.execute(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--operator-image")
+	require.Contains(t, err.Error(), "--image-registry")
+	require.Zero(t, captured.applyCount)
+}
+
+// TestResolveImagesRejectsNestedEmbeddedOperatorImage guards the derived
+// name:tag: if the embedded operator image sits below its registry (so it cannot
+// be re-expressed as a name:tag under another registry), install fails closed and
+// points at --operator-image. The render pipeline never produces this; it guards
+// a hand-edited manifest.
+func TestResolveImagesRejectsNestedEmbeddedOperatorImage(t *testing.T) {
+	t.Parallel()
+
+	h := installHandler{
+		operatorManifests: operatorManifestsFS("ghcr.io/azure", "ghcr.io/azure/sub/unbounded-operator:v1"),
+	}
+
+	_, _, err := h.resolveImages()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--operator-image")
+}
+
+// TestInstallForkBuildDerivesEmbeddedRegistry asserts a fork build (whose
+// embedded manifests were rendered with CONTAINER_REGISTRY=ghcr.io/myorg)
+// installs its own operator image and configures components from its own
+// registry, rather than discarding the embedded value for ghcr.io/azure.
+func TestInstallForkBuildDerivesEmbeddedRegistry(t *testing.T) {
+	t.Parallel()
+
+	const (
+		registry      = "ghcr.io/myorg"
+		operatorImage = "ghcr.io/myorg/unbounded-operator:v1.2.3"
+	)
+
+	cli, captured := newCapturingInstallClient()
+	h := installHandler{
+		namespace:         "unbounded-system",
+		kubeResourcesCli:  cli,
+		operatorManifests: operatorManifestsFS(registry, operatorImage),
+		logger:            discardLogger(),
+	}
+
+	require.NoError(t, h.execute(context.Background()))
+	require.NotNil(t, captured.configMap)
+	require.NotNil(t, captured.deployment)
+
+	data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+	require.NoError(t, err)
+	require.Equal(t, registry, data["UNBOUNDED_IMAGE_REGISTRY"])
+
+	containers, _, err := unstructured.NestedSlice(captured.deployment.Object, "spec", "template", "spec", "containers")
+	require.NoError(t, err)
+	require.Equal(t, operatorImage, containers[0].(map[string]any)["image"])
+}
+
+// operatorManifestsFS builds a minimal embedded operator manifest set (the
+// unbounded-operator-config ConfigMap and the operator Deployment) with a chosen
+// component registry and operator image. Injecting it lets a test assert the
+// build-derived registry/image without depending on the make-rendered manifests
+// or the build-time CONTAINER_REGISTRY.
+func operatorManifestsFS(registry, operatorImage string) fstest.MapFS {
+	configMap := fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+  namespace: unbounded-system
+data:
+  UNBOUNDED_API_SERVER_ENDPOINT: ""
+  UNBOUNDED_IMAGE_REGISTRY: %q
+  UNBOUNDED_REAP_LEGACY_RESOURCES: "true"
+`, registry)
+
+	deployment := fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unbounded-operator
+  namespace: unbounded-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          image: %q
+          args:
+            - --namespace=unbounded-system
+`, operatorImage)
+
+	return fstest.MapFS{
+		"03-configmap.yaml":  &fstest.MapFile{Data: []byte(configMap)},
+		"04-deployment.yaml": &fstest.MapFile{Data: []byte(deployment)},
+	}
+}
+
+// TestEmbeddedImageRegistryFailsClosed asserts the build-derived registry lookup
+// returns an error (rather than silently falling back to ghcr.io/azure) when the
+// embedded manifests are missing the ConfigMap, carry an empty value, or are
+// malformed, so a broken build cannot quietly install upstream components.
+func TestEmbeddedImageRegistryFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		manifests fstest.MapFS
+		want      string // "" means expect an error
+	}{
+		{
+			name: "valid",
+			manifests: fstest.MapFS{"03-configmap.yaml": &fstest.MapFile{Data: []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+data:
+  UNBOUNDED_IMAGE_REGISTRY: "ghcr.io/myorg"
+`)}},
+			want: "ghcr.io/myorg",
+		},
+		{
+			name:      "no configmap",
+			manifests: fstest.MapFS{"04-deployment.yaml": &fstest.MapFile{Data: []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: unbounded-operator\n")}},
+		},
+		{
+			name: "empty value",
+			manifests: fstest.MapFS{"03-configmap.yaml": &fstest.MapFile{Data: []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+data:
+  UNBOUNDED_IMAGE_REGISTRY: ""
+`)}},
+		},
+		{
+			name:      "malformed yaml",
+			manifests: fstest.MapFS{"03-configmap.yaml": &fstest.MapFile{Data: []byte("this: [is: not: valid: yaml")}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := installHandler{operatorManifests: tc.manifests}
+
+			got, err := h.embeddedImageRegistry()
+			if tc.want == "" {
+				require.Error(t, err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestInstallFailsClosedOnUnresolvableRegistry asserts install errors (rather
+// than defaulting to ghcr.io/azure) when the embedded registry cannot be resolved
+// and no --image-registry is given, and that supplying the flags lets install
+// proceed without reading the embedded manifests.
+func TestInstallFailsClosedOnUnresolvableRegistry(t *testing.T) {
+	t.Parallel()
+
+	brokenManifests := fstest.MapFS{
+		"03-configmap.yaml": &fstest.MapFile{Data: []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-operator-config
+data:
+  UNBOUNDED_IMAGE_REGISTRY: ""
+`)},
+	}
+
+	t.Run("errors without --image-registry", func(t *testing.T) {
+		t.Parallel()
+
+		cli, captured := newCapturingInstallClient()
+		h := installHandler{
+			namespace:         "unbounded-system",
+			kubeResourcesCli:  cli,
+			operatorManifests: brokenManifests,
+			logger:            discardLogger(),
+		}
+
+		err := h.execute(context.Background())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "--image-registry")
+		require.Zero(t, captured.applyCount)
+	})
+
+	t.Run("flags let install proceed despite unresolvable embedded value", func(t *testing.T) {
+		t.Parallel()
+
+		cli, captured := newCapturingInstallClient()
+		h := installHandler{
+			namespace:         "unbounded-system",
+			kubeResourcesCli:  cli,
+			operatorManifests: brokenManifests,
+			imageRegistry:     "registry.corp/unbounded",
+			operatorImage:     "unbounded-operator:v1",
+			logger:            discardLogger(),
+		}
+
+		require.NoError(t, h.execute(context.Background()))
+		require.NotNil(t, captured.configMap)
+
+		data, _, err := unstructured.NestedStringMap(captured.configMap.Object, "data")
+		require.NoError(t, err)
+		require.Equal(t, "registry.corp/unbounded", data["UNBOUNDED_IMAGE_REGISTRY"])
+	})
 }
 
 func TestInstallRejectsInvalidLiveReaperConfigBeforeApply(t *testing.T) {

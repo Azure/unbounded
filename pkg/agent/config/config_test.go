@@ -332,6 +332,15 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 				"env": "test",
 			},
 			RegisterWithTaints: []string{"dedicated=test:NoSchedule"},
+			Configuration: map[string]any{
+				"logging":              map[string]any{"verbosity": 2},
+				"featureGates":         map[string]bool{"Example": true},
+				"allowedUnsafeSysctls": []string{"net.ipv4.ip_local_port_range"},
+			},
+			ImageCredentialProvider: &ImageCredentialProvider{
+				ConfigPath: "/etc/kubernetes/credential-provider.yaml",
+				BinDir:     "/usr/local/lib/kubelet-credential-providers",
+			},
 		},
 		AdditionalHostDevices: []string{"/dev/uinput"},
 		AdditionalHostMounts: []AdditionalHostMount{{
@@ -342,19 +351,116 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 
 	copy := original.DeepCopy()
 	require.NotSame(t, original, copy)
-	require.Equal(t, original, copy)
+
+	originalJSON, err := json.Marshal(original)
+	require.NoError(t, err)
+	copyJSON, err := json.Marshal(copy)
+	require.NoError(t, err)
+	require.JSONEq(t, string(originalJSON), string(copyJSON))
 
 	copy.Kubelet.Labels["env"] = "prod"
 	copy.Kubelet.RegisterWithTaints[0] = "dedicated=prod:NoSchedule"
+	copy.Kubelet.Configuration["logging"].(map[string]any)["verbosity"] = 4
+	copy.Kubelet.Configuration["featureGates"].(map[string]any)["Example"] = false
+	copy.Kubelet.Configuration["allowedUnsafeSysctls"].([]any)[0] = "kernel.shm_rmid_forced"
+	copy.Kubelet.ImageCredentialProvider.ConfigPath = "/etc/kubernetes/other.yaml"
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
 	copy.AdditionalHostMounts[0].Source = "/opt/other"
 	copy.Gantry.Disabled = false
 
 	require.Equal(t, "test", original.Kubelet.Labels["env"])
 	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
+	require.Equal(t, 2, original.Kubelet.Configuration["logging"].(map[string]any)["verbosity"])
+	require.True(t, original.Kubelet.Configuration["featureGates"].(map[string]bool)["Example"])
+	require.Equal(t, "net.ipv4.ip_local_port_range", original.Kubelet.Configuration["allowedUnsafeSysctls"].([]string)[0])
+	require.Equal(t, "/etc/kubernetes/credential-provider.yaml", original.Kubelet.ImageCredentialProvider.ConfigPath)
 	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0])
 	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
 	require.True(t, original.Gantry.Disabled)
+}
+
+func TestAgentKubeletConfigValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		configuration map[string]any
+		wantErr       string
+	}{
+		{
+			name: "valid nested configuration",
+			configuration: map[string]any{
+				"maxPods":              250,
+				"logging":              map[string]any{"verbosity": 4},
+				"featureGates":         map[string]bool{"Example": true},
+				"allowedUnsafeSysctls": []string{"net.ipv4.ip_local_port_range"},
+				"authorization": map[string]any{
+					"webhook": map[string]any{"cacheAuthorizedTTL": "10m"},
+				},
+			},
+		},
+		{name: "agent-owned api version", configuration: map[string]any{"apiVersion": "v1"}, wantErr: "apiVersion is not supported"},
+		{name: "agent-owned kind", configuration: map[string]any{"kind": "KubeletConfiguration"}, wantErr: "kind is not supported"},
+		{name: "agent-owned authentication", configuration: map[string]any{"authentication": map[string]any{}}, wantErr: "authentication is not supported"},
+		{name: "authorization is not object", configuration: map[string]any{"authorization": "Webhook"}, wantErr: "authorization must be an object"},
+		{name: "agent-owned authorization mode", configuration: map[string]any{"authorization": map[string]any{"mode": "AlwaysAllow"}}, wantErr: "authorization.mode is not supported"},
+		{name: "agent-owned cluster DNS", configuration: map[string]any{"clusterDNS": []any{"10.0.0.10"}}, wantErr: "clusterDNS is not supported"},
+		{name: "agent-owned runtime endpoint", configuration: map[string]any{"containerRuntimeEndpoint": "unix:///other.sock"}, wantErr: "containerRuntimeEndpoint is not supported"},
+		{name: "agent-owned taints", configuration: map[string]any{"registerWithTaints": []any{}}, wantErr: "registerWithTaints is not supported"},
+		{name: "agent-owned certificate rotation", configuration: map[string]any{"rotateCertificates": false}, wantErr: "rotateCertificates is not supported"},
+		{name: "unsupported nested type", configuration: map[string]any{"logging": make(chan string)}, wantErr: "JSON-compatible values"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := (&AgentKubeletConfig{Configuration: tt.configuration}).Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestImageCredentialProviderValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		provider *ImageCredentialProvider
+		wantErr  string
+	}{
+		{name: "unset"},
+		{
+			name: "valid",
+			provider: &ImageCredentialProvider{
+				ConfigPath: "/etc/kubernetes/credential-provider.yaml",
+				BinDir:     "/usr/local/lib/kubelet-credential-providers",
+			},
+		},
+		{name: "missing config path", provider: &ImageCredentialProvider{BinDir: "/usr/bin"}, wantErr: "ConfigPath"},
+		{name: "relative config path", provider: &ImageCredentialProvider{ConfigPath: "config.yaml", BinDir: "/usr/bin"}, wantErr: "absolute path"},
+		{name: "unclean binary directory", provider: &ImageCredentialProvider{ConfigPath: "/etc/config.yaml", BinDir: "/usr/local/../bin"}, wantErr: "clean absolute path"},
+		{name: "unsafe config path", provider: &ImageCredentialProvider{ConfigPath: `/etc/config"bad.yaml`, BinDir: "/usr/bin"}, wantErr: "unsafe in a systemd argument"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.provider.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
 }
 
 func TestAgentConfig_DeepCopyNil(t *testing.T) {

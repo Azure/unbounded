@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -36,16 +37,27 @@ func buildScheme() *runtime.Scheme {
 	return s
 }
 
-func printStep(msg string) {
-	fmt.Printf("  %s-->%s %s\n", cyan, reset, msg)
+// fprintf and fprintln write best-effort styled/terminal output. A failed write
+// to the command's output stream is not actionable, so the error is intentionally
+// ignored here (centralizing the errcheck exception).
+func fprintf(out io.Writer, format string, args ...any) {
+	fmt.Fprintf(out, format, args...) //nolint:errcheck // best-effort terminal output
 }
 
-func printConfig(key, value string) {
-	fmt.Printf("  %s%-18s%s %s\n", dim, key, reset, value)
+func fprintln(out io.Writer, args ...any) {
+	fmt.Fprintln(out, args...) //nolint:errcheck // best-effort terminal output
 }
 
-func printReady() {
-	fmt.Printf("\n  %s%sready%s\n\n", green, bold, reset)
+func printStep(out io.Writer, msg string) {
+	fprintf(out, "  %s-->%s %s\n", cyan, reset, msg)
+}
+
+func printConfig(out io.Writer, key, value string) {
+	fprintf(out, "  %s%-18s%s %s\n", dim, key, reset, value)
+}
+
+func printReady(out io.Writer) {
+	fprintf(out, "\n  %s%sready%s\n\n", green, bold, reset)
 }
 
 type conditionState struct {
@@ -69,7 +81,7 @@ func conditionChanged(cond metav1.Condition, seen map[string]conditionState) boo
 	return true
 }
 
-func reportConditionTransitions(conditions []metav1.Condition, seen map[string]conditionState) {
+func reportConditionTransitions(out io.Writer, conditions []metav1.Condition, seen map[string]conditionState) {
 	ordered := append([]metav1.Condition(nil), conditions...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		return ordered[i].Type < ordered[j].Type
@@ -84,7 +96,7 @@ func reportConditionTransitions(conditions []metav1.Condition, seen map[string]c
 			continue
 		}
 
-		printStep(conditionStepText(cond))
+		printStep(out, conditionStepText(cond))
 	}
 }
 
