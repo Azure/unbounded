@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -672,6 +673,72 @@ func TestPrefetchChildren_PropagatesDelegatedAuthorization(t *testing.T) {
 		if authorization != "Bearer requester-token" {
 			t.Fatalf("PleasePull[%d] authorization = %q, want requester token", i, authorization)
 		}
+	}
+}
+
+func TestPrefetchChildren_RemoteDispatchUsesDeterministicCoordinators(t *testing.T) {
+	cluster := clusterNodes()
+	digests := findManyDigestsForPullers(t, cluster, map[ifaces.NodeID]int{
+		"n0": 1,
+		"n1": 1,
+		"n2": 1,
+		"n3": 1,
+	})
+
+	children := make([]coldstart.ChildDigest, 0, len(digests))
+	for _, d := range digests {
+		children = append(children, coldstart.ChildDigest{Digest: d, Kind: ifaces.KindBlob})
+	}
+
+	callersWithRemoteDispatch := 0
+	totalRemoteGroups := 0
+	totalLocalGroups := 0
+	manifestDigest := digest.MustParse("sha256:" + strings.Repeat("f", 64))
+
+	for _, node := range cluster {
+		coord := &stubCoord{}
+		localPull := &stubLocalPull{}
+		now := time.Now
+		resolver := coldstart.New(coldstart.Options{
+			Members:                     fakes.NewMembers(node.ID, cluster...),
+			Discovery:                   &stubDisco{health: 1.0},
+			Coord:                       coord,
+			Inflight:                    inflight.New(inflight.DefaultStalls(), now),
+			Now:                         now,
+			HrwScope:                    hrw.ScopeCluster,
+			LocalPull:                   localPull,
+			PrefetchCoordinatorReplicas: 1,
+			QueryTimeout:                200 * time.Millisecond,
+		})
+
+		if err := resolver.PrefetchManifestChildren(context.Background(), manifestDigest, children, "docker.io", "library/nginx"); err != nil {
+			t.Fatalf("PrefetchChildren for %s: %v", node.ID, err)
+		}
+
+		coord.mu.Lock()
+		groups := len(coord.pleasePullCalls)
+		coord.mu.Unlock()
+
+		if groups > 0 {
+			callersWithRemoteDispatch++
+			totalRemoteGroups += groups
+		}
+
+		localPull.mu.Lock()
+		totalLocalGroups += len(localPull.digests)
+		localPull.mu.Unlock()
+	}
+
+	if callersWithRemoteDispatch != 1 {
+		t.Fatalf("callers with remote dispatch = %d, want 1", callersWithRemoteDispatch)
+	}
+
+	if totalRemoteGroups != len(cluster)-1 {
+		t.Fatalf("remote groups = %d, want %d", totalRemoteGroups, len(cluster)-1)
+	}
+
+	if totalLocalGroups != len(cluster) {
+		t.Fatalf("local groups = %d, want %d", totalLocalGroups, len(cluster))
 	}
 }
 

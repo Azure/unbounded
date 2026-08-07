@@ -69,6 +69,20 @@ func prefetchDispatchPlan(self ifaces.NodeID, children []ChildDigest, groups int
 	return offset, delay
 }
 
+func coordinatesRemotePrefetch(self ifaces.NodeID, candidates []ifaces.Node, key digest.Digest, replicas int) bool {
+	if replicas <= 0 || replicas >= len(candidates) {
+		return true
+	}
+
+	for _, candidate := range hrw.TopK(candidates, key, replicas) {
+		if candidate.Node.ID == self {
+			return true
+		}
+	}
+
+	return false
+}
+
 // PrefetchLayers groups digests by their HRW rank-0 reachable
 // designated puller and issues one PleasePull RPC per puller. Digests
 // HRW'ing to self are diverted to the local LocalPullStarter (if
@@ -141,6 +155,23 @@ type ChildDigest struct {
 // into blob on the wire) leaves
 // p2p_origin_pull_total{kind="config"} permanently zero.
 func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest, registry, repository string) error {
+	var coordinationKey digest.Digest
+	if len(children) > 0 {
+		coordinationKey = children[0].Digest
+	}
+
+	return r.prefetchChildren(ctx, coordinationKey, children, registry, repository)
+}
+
+// PrefetchManifestChildren uses the manifest digest as the stable remote
+// coordinator election key. Callers that parsed a manifest should prefer
+// this method because local cache filtering can produce different first-child
+// digests on different nodes.
+func (r *Resolver) PrefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string) error {
+	return r.prefetchChildren(ctx, manifestDigest, children, registry, repository)
+}
+
+func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.Digest, children []ChildDigest, registry, repository string) error {
 	if registry == "" || repository == "" {
 		return fmt.Errorf("%w: registry=%q repository=%q",
 			ErrPrefetchInvalid, registry, repository)
@@ -241,6 +272,16 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 		}
 	}
 
+	remoteCoordinator := coordinatesRemotePrefetch(
+		self,
+		candidates,
+		coordinationKey,
+		r.opts.PrefetchCoordinatorReplicas,
+	)
+	if !remoteCoordinator {
+		byGroup = nil
+	}
+
 	if len(byGroup) == 0 && len(selfByKind) == 0 {
 		r.opts.Logger.Debug("coldstart: prefetch had no remote pullers",
 			slog.Int("children", len(children)),
@@ -315,6 +356,8 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 		slog.Int("pullers", totalPullers),
 		slog.Int("rpc_groups", len(byGroup)+len(selfByKind)),
 		slog.Int("skipped_self", skippedSelf),
+		slog.Bool("remote_coordinator", remoteCoordinator),
+		slog.Int("coordinator_replicas", r.opts.PrefetchCoordinatorReplicas),
 		slog.Int("max_concurrent_groups", r.opts.PrefetchMaxConcurrentGroups),
 		slog.Int("dispatch_offset", dispatchOffset),
 		slog.Duration("dispatch_delay", dispatchDelay),

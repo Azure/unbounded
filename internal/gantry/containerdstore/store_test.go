@@ -559,6 +559,47 @@ func TestStore_OpenUnavailableMappedToErrUnavailable(t *testing.T) {
 	}
 }
 
+func TestStore_ContextErrorsAreNotMappedToUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "deadline", err: context.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cs := &flakyReaderStore{fakeStore: newFake(), failErr: test.err}
+			payload := []byte("caller-context-" + test.name)
+			cs.put(godigest.FromBytes(payload), payload)
+
+			var ctx context.Context
+
+			if errors.Is(test.err, context.DeadlineExceeded) {
+				var cancel context.CancelFunc
+
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				defer cancel()
+			} else {
+				var cancel context.CancelFunc
+
+				ctx, cancel = context.WithCancel(context.Background())
+				cancel()
+			}
+
+			s := New(cs)
+			d := mustDigest(t, payload)
+
+			if _, err := s.Has(ctx, d); !errors.Is(err, test.err) {
+				t.Fatalf("Has err = %v, want %v", err, test.err)
+			}
+
+			if _, _, err := s.Open(ctx, d); !errors.Is(err, test.err) {
+				t.Fatalf("Open err = %v, want %v", err, test.err)
+			}
+		})
+	}
+}
+
 // flakyReaderStore wraps fakeStore and forces ReaderAt to fail with a
 // non-NotFound error so we can exercise the unavailable path.
 type flakyReaderStore struct {

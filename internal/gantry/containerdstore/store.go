@@ -204,6 +204,10 @@ func (s *Store) withNS(ctx context.Context) context.Context {
 func (s *Store) Has(ctx context.Context, d gdigest.Digest) (bool, error) {
 	ra, err := s.cs.ReaderAt(s.withNS(ctx), ocispec.Descriptor{Digest: godigest.Digest(d.String())})
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+
 		if errors.Is(err, cerrdefs.ErrNotFound) {
 			if s.metrics.OnMiss != nil {
 				s.metrics.OnMiss()
@@ -250,6 +254,10 @@ func (s *Store) Open(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int6
 
 	ra, err := s.cs.ReaderAt(s.withNS(ctx), desc)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
+
 		if errors.Is(err, cerrdefs.ErrNotFound) {
 			if s.metrics.OnMiss != nil {
 				s.metrics.OnMiss()

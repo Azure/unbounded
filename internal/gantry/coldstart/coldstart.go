@@ -142,6 +142,13 @@ type Options struct {
 	// than zero. The resolver selects ceil(eligible candidates * fraction),
 	// with a minimum of one and no cap other than the candidate count.
 	PrefetchPullerFraction float64
+	// PrefetchCoordinatorReplicas limits remote speculative dispatch to the
+	// top-N HRW nodes for a shared coordination key (the manifest digest for
+	// production callers). Every caller still starts any self-selected local
+	// pull, and the demand path recovers when none of the coordinators consumed
+	// the manifest. Zero preserves all-caller dispatch for direct callers and
+	// tests.
+	PrefetchCoordinatorReplicas int
 	// PrefetchMaxConcurrentGroups caps simultaneous remote dispatch groups.
 	// Zero uses 64.
 	PrefetchMaxConcurrentGroups int

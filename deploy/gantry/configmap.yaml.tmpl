@@ -140,8 +140,10 @@ data:
     # A positive fraction overrides prefetch_puller_replicas. There is no
     # maximum cap other than the eligible cluster/zone node count.
     prefetch_puller_fraction: 0.02
-    # Bound and desynchronize redundant best-effort prefetch dispatch. Without
-    # this, every requester opens roughly 550 libp2p RPC groups at once.
+    # Only three deterministic manifest consumers dispatch remote groups; all
+    # consumers still start any self-selected local seed. This bounds redundant
+    # fan-out without reducing the configured pullers per layer.
+    prefetch_coordinator_replicas: 3
     prefetch_max_concurrent_groups: 64
     prefetch_dispatch_jitter: "1s"
     # Coord peer authorization. Default false ships observe-only: an

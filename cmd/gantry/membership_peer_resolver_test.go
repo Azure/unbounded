@@ -9,6 +9,7 @@ import (
 
 	libp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
@@ -38,6 +39,11 @@ func TestMembershipPeerIDResolverInstallsPodAddresses(t *testing.T) {
 		PeerID:   target.ID().String(),
 		P2PAddrs: []string{announced},
 	})
+	caller.Peerstore().AddAddr(
+		target.ID(),
+		multiaddr.StringCast("/ip4/127.0.0.1/tcp/4001"),
+		peerstore.PermanentAddrTTL,
+	)
 
 	resolve := membershipPeerIDResolver(members, caller.Peerstore(), slog.Default())
 

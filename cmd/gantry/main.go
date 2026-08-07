@@ -466,6 +466,7 @@ func runAgent(args []string) error {
 			LocalPull:                   coordServer,
 			PrefetchPullerReplicas:      c.PrefetchPullerReplicas,
 			PrefetchPullerFraction:      c.PrefetchPullerFraction,
+			PrefetchCoordinatorReplicas: c.PrefetchCoordinatorReplicas,
 			PrefetchMaxConcurrentGroups: c.PrefetchMaxConcurrentGroups,
 			PrefetchDispatchJitter:      c.PrefetchDispatchJitter,
 			TransientCooldownCap:        c.OriginFailureHonorWindowCap,
@@ -1347,8 +1348,12 @@ func membershipPeerIDResolver(mv ifaces.Members, ps peerstore.Peerstore, logger 
 				addrs = append(addrs, info.Addrs...)
 			}
 
-			if ps != nil && len(addrs) > 0 {
-				ps.AddAddrs(pid, addrs, peerstore.AddressTTL)
+			if ps != nil {
+				ps.ClearAddrs(pid)
+
+				if len(addrs) > 0 {
+					ps.AddAddrs(pid, addrs, peerstore.AddressTTL)
+				}
 			}
 
 			return pid, true
@@ -2089,7 +2094,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		return
 	}
 
-	if err := p.resolver.PrefetchChildren(ctx, pending, registry, repository); err != nil {
+	if err := p.resolver.PrefetchManifestChildren(ctx, manifestDigest, pending, registry, repository); err != nil {
 		p.logger.Debug("prefetch: PrefetchChildren reported errors",
 			slog.String("manifest", manifestDigest.String()),
 			slog.Int("children", len(pending)),

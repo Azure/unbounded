@@ -975,6 +975,11 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 		return false
 	}
 
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		logger.Debug("mirror: cache open canceled", slog.Any("err", err))
+		return true
+	}
+
 	var eun *ifaces.ErrUnavailable
 	if errors.As(err, &eun) {
 		logger.Warn("mirror: storage unavailable", slog.Any("err", err))

@@ -266,6 +266,11 @@ type Config struct {
 	// except by the number of eligible nodes.
 	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
 
+	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
+	// to a deterministic HRW-ranked subset of manifest consumers. Local
+	// self-selected pulls still run on every consumer. The default is 3.
+	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
+
 	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
 	// per manifest. Group dispatch is best effort and target-side deduplicated.
 	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
@@ -471,6 +476,7 @@ func NewDefault() *Config {
 		HRWK:                        3,
 		PrefetchPullerReplicas:      8,
 		PrefetchPullerFraction:      0,
+		PrefetchCoordinatorReplicas: 3,
 		PrefetchMaxConcurrentGroups: 64,
 		PrefetchDispatchJitter:      time.Second,
 		HRWTopologyScope:            "cluster",
@@ -604,6 +610,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("HRW_K", &c.HRWK)
 	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
 	setFloat("PREFETCH_PULLER_FRACTION", &c.PrefetchPullerFraction)
+	setInt("PREFETCH_COORDINATOR_REPLICAS", &c.PrefetchCoordinatorReplicas)
 	setInt("PREFETCH_MAX_CONCURRENT_GROUPS", &c.PrefetchMaxConcurrentGroups)
 	setDur("PREFETCH_DISPATCH_JITTER", &c.PrefetchDispatchJitter)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
@@ -669,6 +676,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
 	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "fraction of eligible HRW nodes selected as initial pullers, rounded up (0 disables and uses --prefetch-puller-replicas)")
+	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "number of deterministic manifest consumers allowed to dispatch remote speculative prefetch groups")
 	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "maximum simultaneous outbound prefetch RPC groups per manifest")
 	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "maximum deterministic per-node delay before dispatching manifest prefetch")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
@@ -854,6 +862,10 @@ func (c *Config) Validate() error {
 
 	if c.PrefetchPullerFraction != c.PrefetchPullerFraction || c.PrefetchPullerFraction < 0 || c.PrefetchPullerFraction > 1 {
 		errs = append(errs, fmt.Errorf("prefetch_puller_fraction: must be between 0 and 1, got %g", c.PrefetchPullerFraction))
+	}
+
+	if c.PrefetchCoordinatorReplicas < 1 {
+		errs = append(errs, fmt.Errorf("prefetch_coordinator_replicas: must be >= 1, got %d", c.PrefetchCoordinatorReplicas))
 	}
 
 	switch c.HRWTopologyScope {

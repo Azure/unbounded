@@ -26,6 +26,10 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("PrefetchPullerFraction = %v, want disabled", c.PrefetchPullerFraction)
 	}
 
+	if c.PrefetchCoordinatorReplicas != 3 {
+		t.Fatalf("PrefetchCoordinatorReplicas = %d, want 3", c.PrefetchCoordinatorReplicas)
+	}
+
 	if c.PrefetchMaxConcurrentGroups != 64 {
 		t.Fatalf("PrefetchMaxConcurrentGroups = %d, want 64", c.PrefetchMaxConcurrentGroups)
 	}
@@ -102,6 +106,8 @@ func TestPrefetchDispatchConfig(t *testing.T) {
 
 		err := c.LoadEnv(func(key string) string {
 			switch key {
+			case "GANTRY_PREFETCH_COORDINATOR_REPLICAS":
+				return "5"
 			case "GANTRY_PREFETCH_MAX_CONCURRENT_GROUPS":
 				return "32"
 			case "GANTRY_PREFETCH_DISPATCH_JITTER":
@@ -114,8 +120,8 @@ func TestPrefetchDispatchConfig(t *testing.T) {
 			t.Fatalf("LoadEnv: %v", err)
 		}
 
-		if c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
-			t.Fatalf("prefetch dispatch config = %d, %v", c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		if c.PrefetchCoordinatorReplicas != 5 || c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
+			t.Fatalf("prefetch dispatch config = %d, %d, %v", c.PrefetchCoordinatorReplicas, c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
 		}
 	})
 
@@ -124,12 +130,12 @@ func TestPrefetchDispatchConfig(t *testing.T) {
 		flags := flag.NewFlagSet("test", flag.ContinueOnError)
 		c.BindFlags(flags)
 
-		if err := flags.Parse([]string{"--prefetch-max-concurrent-groups=32", "--prefetch-dispatch-jitter=750ms"}); err != nil {
+		if err := flags.Parse([]string{"--prefetch-coordinator-replicas=5", "--prefetch-max-concurrent-groups=32", "--prefetch-dispatch-jitter=750ms"}); err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
 
-		if c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
-			t.Fatalf("prefetch dispatch config = %d, %v", c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		if c.PrefetchCoordinatorReplicas != 5 || c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
+			t.Fatalf("prefetch dispatch config = %d, %d, %v", c.PrefetchCoordinatorReplicas, c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
 		}
 	})
 }
@@ -140,6 +146,7 @@ func TestValidate_PrefetchDispatchBounds(t *testing.T) {
 		mutate func(*Config)
 		want   string
 	}{
+		{name: "zero coordinators", mutate: func(c *Config) { c.PrefetchCoordinatorReplicas = 0 }, want: "prefetch_coordinator_replicas"},
 		{name: "zero groups", mutate: func(c *Config) { c.PrefetchMaxConcurrentGroups = 0 }, want: "prefetch_max_concurrent_groups"},
 		{name: "negative jitter", mutate: func(c *Config) { c.PrefetchDispatchJitter = -time.Second }, want: "prefetch_dispatch_jitter"},
 	} {
