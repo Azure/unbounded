@@ -4,6 +4,7 @@ oom_score = 0
 version = 2
 
 [plugins."io.containerd.grpc.v1.cri"]
+device_ownership_from_security_context = true
 sandbox_image = "{{.SandboxImage}}"
 
 [plugins."io.containerd.grpc.v1.cri".containerd]
