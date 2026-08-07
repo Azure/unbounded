@@ -207,10 +207,13 @@ template:
 ```
 
 The initial API provides defaults for listener addresses. `MetricsAddress`
-defaults to `<Kubelet.NodeIP>:9253` when kubelet has a configured IPv4 node IP.
-When kubelet node IP is omitted or ambiguous, LocalDNS requires an explicit
-metrics address. It does not default to a wildcard bind. An empty
-`CorefileTemplate` selects the built-in default template described below.
+defaults to port `9253` on the IPv4 node address selected using kubelet's
+non-cloud resolution order: an explicit `Kubelet.NodeIP`, an IP-valued node
+name, a host-local IPv4 address resolved from the node name, then the address of
+the host's default-route interface. LocalDNS requires an explicit metrics
+address when that process cannot select IPv4. It does not default to a wildcard
+bind. An empty `CorefileTemplate` selects the built-in default template
+described below.
 CoreDNS version and source selection use `Downloads.CoreDNS`, consistent with
 other downloaded rootfs components, rather than LocalDNS runtime config. CPU
 and memory limits default to the AgentBaker values of 2000 millicores and 128
@@ -581,20 +584,17 @@ rules:
 ```
 
 Each rule carries the comment `unbounded-localdns: skip conntrack`. The host
-network oneshot prefers native nftables. It owns a dedicated IPv4 table with
-`PREROUTING` and `OUTPUT` base chains at raw priority and atomically reconciles
+network oneshot uses native nftables and owns a dedicated IPv4 table with
+`PREROUTING` and `OUTPUT` base chains at raw priority. It atomically reconciles
 the complete table to the desired eight `notrack` rules. Dedicated table
 ownership allows stale listener addresses to be removed without inspecting or
 modifying foreign rules.
 
-On a supported host without the native nftables frontend, the reconciler may
-fall back to the iptables-compatible frontend with lock waiting enabled. The
-fallback checks for an exact rule before adding it, removes only stale rules
-with the Unbounded ownership comment, and never removes unowned rules. Backend
-selection and ownership are persisted so cleanup and upgrades remove state from
-the backend that created it. At least one validated backend is required when
-LocalDNS is enabled. Missing support is a fatal preflight error in offline mode
-and follows normal host-package remediation in online mode.
+Native nftables is required when LocalDNS is enabled; there is no
+iptables-compatible fallback. Missing nftables is a fatal preflight error in
+offline mode and follows normal host-package remediation in online mode. A host
+with nftables installed but without raw-priority `notrack` support fails
+preflight.
 
 Host boot orders this reconciliation after `nftables-flush.service` and before
 the nspawn machine. Enabled-to-enabled repave keeps the rules. Disable-through-
@@ -857,12 +857,14 @@ and scrapes `http://<node-internal-ip>:9253/metrics`. Binding only to loopback
 would not be reachable from a normal Prometheus pod, while a wildcard bind would
 unnecessarily expose metrics on every host interface.
 
-When `Kubelet.NodeIP` contains one configured IPv4 address, the resolver derives
-`MetricsAddress` from that value. If node IP is omitted, contains no IPv4
-address, or cannot identify one intended InternalIP, the caller supplies
-`MetricsAddress` explicitly. Preflight verifies that the bind IP is assigned in
-the shared network namespace and detects port conflicts. Host firewall policy
-and Prometheus target discovery remain deployment concerns.
+When `Kubelet.NodeIP` contains a configured IPv4 address, the resolver derives
+`MetricsAddress` from that value. Otherwise it follows kubelet's non-cloud node
+address selection: use an IP-valued node name, resolve the node name through DNS
+and select a host-local IPv4 address, then fall back to Kubernetes default-route
+interface discovery. If that process cannot identify an IPv4 address, the
+caller supplies `MetricsAddress` explicitly. Preflight verifies that the bind IP
+is assigned in the shared network namespace and detects port conflicts. Host
+firewall policy and Prometheus target discovery remain deployment concerns.
 
 Logs are collected through the nspawn machine's journal:
 
@@ -1035,7 +1037,7 @@ Add LocalDNS checks near the phases they validate:
 | `localdns-config` | Validate the complete LocalDNS config, apply defaults, and render the Corefile template with discovered runtime values. |
 | `localdns-artifact` | Validate the online artifact or required offline bundle entries for the host architecture and verify required plugins when the selected binary is locally available. |
 | `localdns-interface` | Detect an incompatible existing interface or address ownership conflict. |
-| `localdns-conntrack` | Validate native nftables support for raw-priority `notrack` rules, or the iptables-compatible fallback's raw table, comment match, and `NOTRACK` target. |
+| `localdns-conntrack` | Validate native nftables support for raw-priority `notrack` rules. |
 | `localdns-ports` | Detect DNS, readiness, and metrics listener conflicts. |
 | `localdns-upstreams` | Confirm the host uses a supported direct or systemd-resolved layout, reject split-DNS policy, and require at least one usable direct node upstream. |
 | `localdns-rootfs` | Confirm LocalDNS files and unit paths can be written into the target rootfs. |
@@ -1153,9 +1155,8 @@ LocalDNS disabled, but LocalDNS preflight rejects the configuration.
 - Kubelet cluster DNS selection with LocalDNS enabled and disabled.
 - Interface reconciliation for absent, matching, incomplete, and conflicting
   state.
-- Exact `NOTRACK` rule generation, idempotent native nftables reconciliation,
-  stale owned-rule removal, foreign-rule preservation, backend migration, and
-  iptables-compatible fallback.
+- Exact `notrack` rule generation, idempotent native nftables reconciliation,
+  stale owned-rule removal, and foreign-rule preservation.
 - Online `Downloads.CoreDNS` source and version resolution and checksum
   verification.
 - Offline `versions.coredns` precedence, conditional bundle requirements, and

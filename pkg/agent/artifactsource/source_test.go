@@ -4,8 +4,12 @@
 package artifactsource
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -78,7 +82,7 @@ func TestDownloadToLocalFileRetriesInterruptedHTTPBody(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "artifact")
-	require.NoError(t, source.downloadToLocalFile(t.Context(), dest, 0o644, wait))
+	require.NoError(t, source.downloadToLocalFile(t.Context(), dest, 0o644, downloadToLocalFileOptions{}, wait))
 	require.EqualValues(t, 2, attempts.Load())
 	require.Equal(t, []time.Duration{httpDownloadRetryDelay}, delays)
 
@@ -111,11 +115,127 @@ func TestDownloadToLocalFileUsesSingleRetryBudget(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "artifact")
-	err = source.downloadToLocalFile(t.Context(), dest, 0o644, wait)
+	err = source.downloadToLocalFile(t.Context(), dest, 0o644, downloadToLocalFileOptions{}, wait)
 	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	require.EqualValues(t, httpDownloadMaxAttempts, attempts.Load())
 	require.Equal(t, []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}, delays)
 	require.NoFileExists(t, dest)
+}
+
+func TestDownloadToLocalFileExtractsTarGzFile(t *testing.T) {
+	t.Parallel()
+
+	archive := tarGzArchive(t, map[string]string{
+		"nested/coredns": "binary-content",
+		"README.md":      "documentation",
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(archive)
+	}))
+	defer server.Close()
+
+	source, err := Parse(server.URL + "/coredns.tgz")
+	require.NoError(t, err)
+
+	dest := filepath.Join(t.TempDir(), "coredns")
+	require.NoError(t, source.DownloadToLocalFile(t.Context(), dest, 0o755, ExtractTarGzFile("coredns")))
+
+	content, err := os.ReadFile(dest)
+	require.NoError(t, err)
+	require.Equal(t, "binary-content", string(content))
+
+	info, err := os.Stat(dest)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+}
+
+func TestDownloadToLocalFileRetriesInterruptedTarGz(t *testing.T) {
+	t.Parallel()
+
+	archive := tarGzArchive(t, map[string]string{"coredns": "binary-content"})
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(archive)))
+
+		if attempts.Add(1) == 1 {
+			_, _ = w.Write(archive[:len(archive)/2])
+
+			return
+		}
+
+		_, _ = w.Write(archive)
+	}))
+	defer server.Close()
+
+	source, err := Parse(server.URL + "/coredns.tgz")
+	require.NoError(t, err)
+
+	var delays []time.Duration
+
+	wait := func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+
+		return nil
+	}
+
+	dest := filepath.Join(t.TempDir(), "coredns")
+	options := downloadToLocalFileOptions{tarGzFile: "coredns"}
+	require.NoError(t, source.downloadToLocalFile(t.Context(), dest, 0o755, options, wait))
+	require.EqualValues(t, 2, attempts.Load())
+	require.Equal(t, []time.Duration{httpDownloadRetryDelay}, delays)
+}
+
+func TestDownloadToLocalFileRejectsMissingTarGzFile(t *testing.T) {
+	t.Parallel()
+
+	archive := tarGzArchive(t, map[string]string{"README.md": "documentation"})
+	archivePath := filepath.Join(t.TempDir(), "archive.tgz")
+	require.NoError(t, os.WriteFile(archivePath, archive, 0o644))
+
+	source, err := Parse(archivePath)
+	require.NoError(t, err)
+
+	dest := filepath.Join(t.TempDir(), "coredns")
+	err = source.DownloadToLocalFile(t.Context(), dest, 0o755, ExtractTarGzFile("coredns"))
+	require.ErrorContains(t, err, `does not contain "coredns"`)
+	require.NoFileExists(t, dest)
+}
+
+func TestExtractTarGzFileRejectsPath(t *testing.T) {
+	t.Parallel()
+
+	source, err := Parse(filepath.Join(t.TempDir(), "archive.tgz"))
+	require.NoError(t, err)
+
+	err = source.DownloadToLocalFile(t.Context(), filepath.Join(t.TempDir(), "output"), 0o755, ExtractTarGzFile("nested/coredns"))
+	require.ErrorContains(t, err, "base name")
+}
+
+func tarGzArchive(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+
+	var output bytes.Buffer
+
+	gzipWriter := gzip.NewWriter(&output)
+	tarWriter := tar.NewWriter(gzipWriter)
+
+	for name, content := range files {
+		require.NoError(t, tarWriter.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(content)),
+		}))
+		_, err := tarWriter.Write([]byte(content))
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, tarWriter.Close())
+	require.NoError(t, gzipWriter.Close())
+
+	return output.Bytes()
 }
 
 func TestHTTPClientUsesRetryTransport(t *testing.T) {

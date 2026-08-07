@@ -1,0 +1,28 @@
+[Unit]
+Description=Unbounded LocalDNS
+After=network.target
+Before=containerd.service kubelet.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/local/libexec/unbounded-localdns-supervisor
+WatchdogSec=60
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=30
+Slice=localdns.slice
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

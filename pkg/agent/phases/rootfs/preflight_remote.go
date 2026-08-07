@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"runtime"
 
+	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
@@ -19,6 +20,7 @@ const (
 	checkKubernetesArtifactsName = "kubernetes-artifacts"
 	checkCRIArtifactsName        = "cri-artifacts"
 	checkCNIArtifactsName        = "cni-artifacts"
+	checkLocalDNSArtifactName    = "localdns-artifact"
 )
 
 type ociImageReachableChecker struct {
@@ -71,6 +73,27 @@ func CheckCRIArtifacts(log *slog.Logger, rootFS *goalstates.RootFS) preflight.Ch
 		ErrMessage: "one or more required CRI artifact sources are not reachable",
 		Sources: func() (artifactsource.Sources, error) {
 			return criArtifactSources(rootFS)
+		},
+	}
+}
+
+// CheckLocalDNSArtifact validates that the selected CoreDNS artifact is reachable.
+func CheckLocalDNSArtifact(log *slog.Logger, rootFS *goalstates.RootFS) preflight.Checker {
+	return artifactsource.ReachabilityChecker{
+		Log:        log,
+		CheckName:  checkLocalDNSArtifactName,
+		Target:     "LocalDNS artifact",
+		OKMessage:  "CoreDNS artifact source is reachable",
+		ErrMessage: "CoreDNS artifact source is not reachable",
+		Sources: func() (artifactsource.Sources, error) {
+			override := coreDNSDownloadSource(rootFS)
+
+			source, err := artifactsource.Parse(agentartifacts.CoreDNSArchive(override, rootFS.LocalDNS.CoreDNSVersion, rootFS.HostArch))
+			if err != nil {
+				return nil, err
+			}
+
+			return artifactsource.Sources{"coredns": source}, nil
 		},
 	}
 }

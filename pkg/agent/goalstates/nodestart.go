@@ -20,6 +20,7 @@ type NodeStart struct {
 	Containerd Containerd
 	Gantry     Gantry
 	Kubelet    Kubelet
+	LocalDNS   LocalDNS
 
 	// Nvidia holds NVIDIA GPU state discovered on the host. After the nspawn
 	// boots, the setup-nvidia-libraries task uses LibMappings to create
