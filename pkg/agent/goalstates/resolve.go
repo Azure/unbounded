@@ -72,6 +72,16 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("resolve kubelet config: %w", err)
 	}
 
+	localDNS, err := resolveLocalDNS(cfg, downloads)
+	if err != nil {
+		return nil, fmt.Errorf("resolve LocalDNS config: %w", err)
+	}
+
+	if localDNS.Enabled {
+		kubelet.ClusterDNS = localDNS.ClusterListenerIP.String()
+		kubelet.ResolvConf = LocalDNSResolvConfPath
+	}
+
 	containerdVersion := cfg.CRI.Containerd.Version
 	if containerdVersion == "" {
 		containerdVersion = ContainerdVersion
@@ -105,6 +115,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		RunCVersion:          runcVersion,
 		CNIPluginVersion:     cniVersion,
 		KubernetesVersion:    cfg.Cluster.Version,
+		LocalDNS:             localDNS,
 		Downloads:            downloads,
 		OCIImage:             ociImage,
 		Nvidia:               nvidia,
@@ -121,6 +132,7 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		Containerd:      ResolveContainerd(sandboxImage),
 		Gantry:          ResolveGantry(cfg.Gantry),
 		Kubelet:         kubelet,
+		LocalDNS:        localDNS,
 		Nvidia:          nvidia,
 	}
 
@@ -189,6 +201,7 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		APIServer:               cfg.Kubelet.ApiServer,
 		CACertData:              caCert,
 		ClusterDNS:              cfg.Cluster.ClusterDNS,
+		ResolvConf:              "/etc/resolv.conf",
 		NodeIP:                  nodeIP,
 		NodeLabels:              labels,
 		RegisterWithTaints:      cfg.Kubelet.RegisterWithTaints,
