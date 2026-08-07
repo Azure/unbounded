@@ -21,6 +21,7 @@ import (
 )
 
 type byteObservation struct {
+	digest digest.Digest
 	kind   string
 	source string
 	bytes  int64
@@ -65,8 +66,8 @@ func TestMirrorByteMetricsCacheSource(t *testing.T) {
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			served = append(served, byteObservation{kind: kind, source: source, bytes: bytes})
 		}),
-		mirror.WithMirrorResponseCompletedHook(func(kind, source string) {
-			completed = append(completed, byteObservation{kind: kind, source: source})
+		mirror.WithMirrorResponseCompletedHook(func(completedDigest digest.Digest, kind, source string) {
+			completed = append(completed, byteObservation{digest: completedDigest, kind: kind, source: source})
 		}),
 	)
 
@@ -79,8 +80,8 @@ func TestMirrorByteMetricsCacheSource(t *testing.T) {
 		t.Fatalf("served observations = %+v, want [%+v]", served, want)
 	}
 
-	if len(completed) != 1 || completed[0].kind != want.kind || completed[0].source != want.source {
-		t.Fatalf("completed observations = %+v, want kind=%s source=%s", completed, want.kind, want.source)
+	if len(completed) != 1 || completed[0].digest != d || completed[0].kind != want.kind || completed[0].source != want.source {
+		t.Fatalf("completed observations = %+v, want digest=%s kind=%s source=%s", completed, d, want.kind, want.source)
 	}
 }
 
@@ -111,8 +112,8 @@ func TestMirrorByteMetricsPeerSource(t *testing.T) {
 				served = append(served, byteObservation{kind: kind, source: source, bytes: bytes})
 			},
 		),
-		mirror.WithMirrorResponseCompletedHook(func(kind, source string) {
-			completed = append(completed, byteObservation{kind: kind, source: source})
+		mirror.WithMirrorResponseCompletedHook(func(completedDigest digest.Digest, kind, source string) {
+			completed = append(completed, byteObservation{digest: completedDigest, kind: kind, source: source})
 		}),
 	)
 
@@ -130,8 +131,8 @@ func TestMirrorByteMetricsPeerSource(t *testing.T) {
 		t.Fatalf("served observations = %+v, want [%+v]", served, wantServed)
 	}
 
-	if len(completed) != 1 || completed[0].kind != wantServed.kind || completed[0].source != wantServed.source {
-		t.Fatalf("completed observations = %+v, want kind=%s source=%s", completed, wantServed.kind, wantServed.source)
+	if len(completed) != 1 || completed[0].digest != d || completed[0].kind != wantServed.kind || completed[0].source != wantServed.source {
+		t.Fatalf("completed observations = %+v, want digest=%s kind=%s source=%s", completed, d, wantServed.kind, wantServed.source)
 	}
 }
 
@@ -171,8 +172,8 @@ func TestMirrorByteMetricsOriginSource(t *testing.T) {
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			served = append(served, byteObservation{kind: kind, source: source, bytes: bytes})
 		}),
-		mirror.WithMirrorResponseCompletedHook(func(kind, source string) {
-			completed = append(completed, byteObservation{kind: kind, source: source})
+		mirror.WithMirrorResponseCompletedHook(func(completedDigest digest.Digest, kind, source string) {
+			completed = append(completed, byteObservation{digest: completedDigest, kind: kind, source: source})
 		}),
 	)
 
@@ -190,7 +191,7 @@ func TestMirrorByteMetricsOriginSource(t *testing.T) {
 		t.Fatalf("served observations = %+v, want [%+v]", served, wantServed)
 	}
 
-	if len(completed) != 1 || completed[0].kind != wantServed.kind || completed[0].source != wantServed.source {
-		t.Fatalf("completed observations = %+v, want kind=%s source=%s", completed, wantServed.kind, wantServed.source)
+	if len(completed) != 1 || completed[0].digest != d || completed[0].kind != wantServed.kind || completed[0].source != wantServed.source {
+		t.Fatalf("completed observations = %+v, want digest=%s kind=%s source=%s", completed, d, wantServed.kind, wantServed.source)
 	}
 }

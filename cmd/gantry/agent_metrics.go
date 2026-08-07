@@ -12,12 +12,17 @@ package main
 // dependencies between subsystems instead of declaring metric metadata.
 
 import (
+	"strconv"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 )
 
@@ -84,6 +89,7 @@ type phase2Metrics struct {
 	peerFetchBytes    *prometheus.CounterVec
 	mirrorServeBytes  *prometheus.CounterVec
 	mirrorCompletedAt *prometheus.GaugeVec
+	layerCompletedAt  *prometheus.GaugeVec
 	peerFetchDur      *prometheus.HistogramVec
 	peerDialSuccess   prometheus.Counter
 	peerDialFailure   prometheus.Counter
@@ -130,6 +136,10 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 			Name: "gantry_mirror_response_completed_timestamp_seconds",
 			Help: "Unix timestamp when a complete response body was most recently written to the local containerd client, labeled by content kind and source path.",
 		}, []string{"kind", "source"}),
+		layerCompletedAt: reg.NewGaugeVec("mirror", prometheus.GaugeOpts{
+			Name: "gantry_layer_download_completed_timestamp_seconds",
+			Help: "Unix timestamp when a current-image layer response completed to the local containerd client. Zero means pending. Labels are bounded to the current manifest and deleted when the manifest changes.",
+		}, []string{"node", "image_digest", "layer_digest", "layer_index"}),
 		peerFetchDur: reg.NewHistogramVec("mirror", prometheus.HistogramOpts{
 			Name:    "p2p_peer_fetch_duration_seconds",
 			Help:    "End-to-end peer-fetch latency from FetchFromPeer dial to terminal outcome (hit = cache commit, error/stall/notfound = first failing branch). Together with p2p_peer_fetch_total{outcome} this isolates dial vs. body vs. commit-time-digest-verification slowness.",
@@ -210,6 +220,97 @@ func newPhase2Metrics(reg *metrics.Registry) *phase2Metrics {
 	}
 
 	return p
+}
+
+type layerProgressTracker struct {
+	mu              sync.Mutex
+	gauge           *prometheus.GaugeVec
+	node            string
+	now             func() time.Time
+	manifest        digest.Digest
+	layers          map[digest.Digest]string
+	completedLayers map[digest.Digest]struct{}
+	earlyCompleted  map[digest.Digest]time.Time
+	oldLabels       [][]string
+}
+
+const maxEarlyLayerCompletions = 256
+
+func newLayerProgressTracker(gauge *prometheus.GaugeVec, node string, now func() time.Time) *layerProgressTracker {
+	return &layerProgressTracker{
+		gauge:           gauge,
+		node:            node,
+		now:             now,
+		layers:          map[digest.Digest]string{},
+		completedLayers: map[digest.Digest]struct{}{},
+		earlyCompleted:  map[digest.Digest]time.Time{},
+	}
+}
+
+func (t *layerProgressTracker) observeManifest(manifestDigest digest.Digest, children []manifest.TypedChild) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.manifest == manifestDigest {
+		return
+	}
+
+	for _, labels := range t.oldLabels {
+		t.gauge.DeleteLabelValues(labels...)
+	}
+
+	t.manifest = manifestDigest
+	t.layers = make(map[digest.Digest]string, len(children))
+	t.completedLayers = make(map[digest.Digest]struct{}, len(children))
+	t.oldLabels = t.oldLabels[:0]
+
+	layerIndex := 0
+
+	for _, child := range children {
+		if child.Kind != ifaces.KindBlob {
+			continue
+		}
+
+		index := strconv.Itoa(layerIndex)
+		labels := []string{t.node, manifestDigest.String(), child.Digest.String(), index}
+		t.layers[child.Digest] = index
+		t.oldLabels = append(t.oldLabels, labels)
+
+		completedAt, completed := t.earlyCompleted[child.Digest]
+		if completed {
+			t.gauge.WithLabelValues(labels...).Set(float64(completedAt.UnixNano()) / float64(time.Second))
+			t.completedLayers[child.Digest] = struct{}{}
+		} else {
+			t.gauge.WithLabelValues(labels...).Set(0)
+		}
+
+		layerIndex++
+	}
+
+	t.earlyCompleted = map[digest.Digest]time.Time{}
+}
+
+func (t *layerProgressTracker) completed(d digest.Digest) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	index, ok := t.layers[d]
+	if !ok {
+		if _, exists := t.earlyCompleted[d]; !exists && len(t.earlyCompleted) < maxEarlyLayerCompletions {
+			t.earlyCompleted[d] = t.now()
+		}
+
+		return
+	}
+
+	if _, ok := t.completedLayers[d]; ok {
+		return
+	}
+
+	t.gauge.WithLabelValues(t.node, t.manifest.String(), d.String(), index).
+		Set(float64(t.now().UnixNano()) / float64(time.Second))
+
+	t.completedLayers[d] = struct{}{}
 }
 
 // phase3Metrics groups the instruments owned by // HRW-rank-mismatch detection, DHT-false-empty observability, top-K

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/manifest"
 )
 
 // delayedManifestStore returns ErrNotFound until availableAfter opens, which
@@ -114,5 +115,34 @@ func TestOpenManifestGivesUpWhenNeverCommitted(t *testing.T) {
 
 	if store.openCount() < 2 {
 		t.Fatalf("open attempts = %d, want more than one before giving up", store.openCount())
+	}
+}
+
+func TestLayerPrefetchAdapterReportsManifestChildrenWithoutResolver(t *testing.T) {
+	manifestDigest := testDigest(t, "a")
+	configDigest := testDigest(t, "b")
+	layer0 := testDigest(t, "c")
+	layer1 := testDigest(t, "d")
+	body := `{"schemaVersion":2,"config":{"digest":"` + configDigest.String() + `"},"layers":[{"digest":"` + layer0.String() + `"},{"digest":"` + layer1.String() + `"}]}`
+	store := &delayedManifestStore{body: body, ready: true}
+
+	var (
+		gotManifest digest.Digest
+		gotChildren int
+	)
+
+	adapter := &layerPrefetchAdapter{
+		cache:  store,
+		logger: slog.Default(),
+		onManifest: func(observed digest.Digest, children []manifest.TypedChild) {
+			gotManifest = observed
+			gotChildren = len(children)
+		},
+	}
+
+	adapter.OnManifestServed(context.Background(), "registry.example", "pull", manifestDigest)
+
+	if gotManifest != manifestDigest || gotChildren != 3 {
+		t.Fatalf("manifest callback = %s with %d children, want %s with 3", gotManifest, gotChildren, manifestDigest)
 	}
 }

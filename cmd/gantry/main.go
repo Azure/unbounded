@@ -149,6 +149,7 @@ func runAgent(args []string) error {
 	reg.RegisterDefaultCollectors()
 	inst := newPhase1Metrics(reg)
 	p2 := newPhase2Metrics(reg)
+	layerProgress := newLayerProgressTracker(p2.layerCompletedAt, c.NodeName, time.Now)
 	p9 := newPhase9Metrics(reg)
 	// Storage mode info: emit a single time-series at 1 for the
 	// active backend so dashboards can filter by it.
@@ -498,13 +499,17 @@ func runAgent(args []string) error {
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
-		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger)
+		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("cold-start orchestrator wired",
 			slog.Int("hrw_k", c.HRWK),
 			slog.String("hrw_scope", c.HRWTopologyScope),
 		)
 	} else {
 		logger.Info("cold-start orchestrator disabled (single-self membership; no Kubernetes informer)")
+	}
+
+	if layerPrefetcher == nil {
+		layerPrefetcher = newLayerPrefetcher(nil, cstore, logger, layerProgress.observeManifest)
 	}
 
 	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
@@ -600,8 +605,9 @@ func runAgent(args []string) error {
 				p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
 			},
 		),
-		mirror.WithMirrorResponseCompletedHook(func(kind, source string) {
+		mirror.WithMirrorResponseCompletedHook(func(d digest.Digest, kind, source string) {
 			p2.mirrorCompletedAt.WithLabelValues(kind, source).SetToCurrentTime()
+			layerProgress.completed(d)
 		}),
 		mirror.WithOriginStreamMetrics(
 			func(kind string) { p9.originStreamStarted.WithLabelValues(kind).Inc() },
@@ -1906,9 +1912,10 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 // The implementation runs in a goroutine spawned by the mirror; it
 // MUST NOT panic. All errors are logged at DEBUG.
 type layerPrefetchAdapter struct {
-	resolver *coldstart.Resolver
-	cache    ifaces.LocalContentStore
-	logger   *slog.Logger
+	resolver   *coldstart.Resolver
+	cache      ifaces.LocalContentStore
+	logger     *slog.Logger
+	onManifest func(digest.Digest, []manifest.TypedChild)
 }
 
 // maxManifestBytes caps the size of a manifest body the prefetcher
@@ -1967,11 +1974,17 @@ func advertiseOnCommit(ctx context.Context, adv *advertise.Advertiser, store ifa
 	}
 }
 
-func newLayerPrefetcher(r *coldstart.Resolver, cache ifaces.LocalContentStore, logger *slog.Logger) mirror.LayerPrefetcher {
+func newLayerPrefetcher(
+	r *coldstart.Resolver,
+	cache ifaces.LocalContentStore,
+	logger *slog.Logger,
+	onManifest func(digest.Digest, []manifest.TypedChild),
+) mirror.LayerPrefetcher {
 	return &layerPrefetchAdapter{
-		resolver: r,
-		cache:    cache,
-		logger:   logger.With(slog.String("subsystem", "prefetch")),
+		resolver:   r,
+		cache:      cache,
+		logger:     logger.With(slog.String("subsystem", "prefetch")),
+		onManifest: onManifest,
 	}
 }
 
@@ -2013,7 +2026,7 @@ func (p *layerPrefetchAdapter) openManifest(ctx context.Context, d digest.Digest
 }
 
 func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest) {
-	if p.resolver == nil {
+	if p.resolver == nil && p.onManifest == nil {
 		return
 	}
 	// Use a fresh deadline so the prefetch survives the request
@@ -2064,7 +2077,11 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		return
 	}
 
-	if len(children) == 0 {
+	if p.onManifest != nil {
+		p.onManifest(manifestDigest, children)
+	}
+
+	if len(children) == 0 || p.resolver == nil {
 		// Image index or no children - nothing to fan out.
 		return
 	}
