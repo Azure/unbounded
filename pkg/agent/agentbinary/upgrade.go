@@ -32,6 +32,7 @@ const (
 
 // Layout describes caller-owned blue-green agent binary paths.
 type Layout struct {
+	// BinaryPath is an optional compatibility path included in collision validation.
 	BinaryPath   string
 	BluePath     string
 	GreenPath    string
@@ -81,7 +82,8 @@ func normalizeSecureInstallOptions(opts SecureInstallOptions) (normalizedSecureI
 	}
 
 	opts.ExpectedMember = strings.TrimSpace(opts.ExpectedMember)
-	if opts.ExpectedMember == "" || filepath.Base(opts.ExpectedMember) != opts.ExpectedMember {
+	if opts.ExpectedMember == "" || opts.ExpectedMember == "." || opts.ExpectedMember == ".." ||
+		filepath.Base(opts.ExpectedMember) != opts.ExpectedMember {
 		return normalizedSecureInstallOptions{}, fmt.Errorf("expected archive member must be an exact base name without a path prefix")
 	}
 
@@ -122,14 +124,17 @@ func normalizeSecureInstallOptions(opts SecureInstallOptions) (normalizedSecureI
 	}, nil
 }
 
-// ValidateLayout verifies that all binary paths are clean, absolute, and distinct.
+// ValidateLayout verifies that all required binary paths are clean, absolute,
+// and distinct. It also validates BinaryPath when provided.
 func ValidateLayout(paths Layout) error {
 	values := []string{
-		paths.BinaryPath,
 		paths.BluePath,
 		paths.GreenPath,
 		paths.CurrentPath,
 		paths.LastGoodPath,
+	}
+	if paths.BinaryPath != "" {
+		values = append(values, paths.BinaryPath)
 	}
 
 	seen := make(map[string]struct{}, len(values))
@@ -180,8 +185,13 @@ func SecureInstallAndSwitch(
 		return SwitchResult{}, fmt.Errorf("resolve current agent binary: %w", err)
 	}
 
+	currentIsBlue, err := pathResolvesTo(paths.BluePath, previousPath)
+	if err != nil {
+		return SwitchResult{}, fmt.Errorf("resolve blue agent binary: %w", err)
+	}
+
 	targetPath := paths.BluePath
-	if previousPath == paths.BluePath {
+	if currentIsBlue {
 		targetPath = paths.GreenPath
 	}
 
@@ -191,10 +201,25 @@ func SecureInstallAndSwitch(
 	}
 	defer os.Remove(archivePath) //nolint:errcheck // temporary archive cleanup
 
-	// The inactive slot may still be last-good. Protect the verified running
-	// binary before replacing that slot.
-	if err := utilio.UpdateSymlink(paths.LastGoodPath, previousPath); err != nil {
-		return SwitchResult{}, fmt.Errorf("protect current agent as last-good: %w", err)
+	lastGoodTarget, err := filepath.EvalSymlinks(paths.LastGoodPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return SwitchResult{}, fmt.Errorf("resolve last-good agent binary: %w", err)
+	}
+
+	canonicalTargetDir, err := filepath.EvalSymlinks(filepath.Dir(targetPath))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return SwitchResult{}, fmt.Errorf("resolve inactive agent binary directory: %w", err)
+	}
+
+	// Protect last-good before replacing the inactive slot only when that slot
+	// contains last-good. Otherwise, preserve the existing rollback target until
+	// the candidate has been staged and verified. A missing target directory
+	// cannot contain a last-good binary.
+	lastGoodProtected := err == nil && lastGoodTarget == filepath.Join(canonicalTargetDir, filepath.Base(targetPath))
+	if lastGoodProtected {
+		if err := utilio.UpdateSymlink(paths.LastGoodPath, previousPath); err != nil {
+			return SwitchResult{}, fmt.Errorf("protect current agent as last-good: %w", err)
+		}
 	}
 
 	if err := extractOnlyArchiveMember(archivePath, targetPath, opts); err != nil {
@@ -203,6 +228,12 @@ func SecureInstallAndSwitch(
 
 	if err := verifyQuiet(ctx, targetPath); err != nil {
 		return SwitchResult{}, err
+	}
+
+	if !lastGoodProtected {
+		if err := utilio.UpdateSymlink(paths.LastGoodPath, previousPath); err != nil {
+			return SwitchResult{}, fmt.Errorf("update last-good agent symlink: %w", err)
+		}
 	}
 
 	if err := utilio.UpdateSymlink(paths.CurrentPath, targetPath); err != nil {
@@ -220,6 +251,10 @@ func SecureInstallAndSwitch(
 
 // RedactedURL removes query and fragment data that may contain credentials.
 func RedactedURL(parsedURL *url.URL) string {
+	if parsedURL == nil {
+		return ""
+	}
+
 	redacted := *parsedURL
 	redacted.RawQuery = ""
 	redacted.Fragment = ""
@@ -371,6 +406,14 @@ func extractOnlyArchiveMember(archivePath, targetPath string, opts SecureInstall
 	defer gz.Close() //nolint:errcheck // extraction reports read errors
 
 	found := false
+	stagedPath := ""
+
+	defer func() {
+		if stagedPath != "" {
+			os.Remove(stagedPath) //nolint:errcheck // best effort staged file cleanup
+		}
+	}()
+
 	decompressed := &countingReader{reader: io.LimitReader(gz, 2*opts.MaxExtractedBytes+1)}
 
 	tarReader := tar.NewReader(decompressed)
@@ -400,11 +443,29 @@ func extractOnlyArchiveMember(archivePath, targetPath string, opts SecureInstall
 			return fmt.Errorf("agent archive member %q is not a valid bounded regular file", opts.ExpectedMember)
 		}
 
-		if err := utilio.InstallFileWithLimitedSize(targetPath, tarReader, opts.Mode, opts.MaxExtractedBytes); err != nil {
-			return fmt.Errorf("install upgraded agent binary: %w", err)
+		if mkdirErr := os.MkdirAll(filepath.Dir(targetPath), 0o750); mkdirErr != nil {
+			return fmt.Errorf("create agent binary directory: %w", mkdirErr)
+		}
+
+		staged, createErr := os.CreateTemp(filepath.Dir(targetPath), ".agent-upgrade-*")
+		if createErr != nil {
+			return fmt.Errorf("create staged agent binary: %w", createErr)
+		}
+
+		stagedPath = staged.Name()
+		if closeErr := staged.Close(); closeErr != nil {
+			return fmt.Errorf("close staged agent binary: %w", closeErr)
+		}
+
+		if err := utilio.InstallFileWithLimitedSize(stagedPath, tarReader, opts.Mode, opts.MaxExtractedBytes); err != nil {
+			return fmt.Errorf("stage upgraded agent binary: %w", err)
 		}
 
 		found = true
+	}
+
+	if _, err := io.Copy(io.Discard, decompressed); err != nil {
+		return fmt.Errorf("finish reading agent archive: %w", err)
 	}
 
 	if decompressed.count > 2*opts.MaxExtractedBytes {
@@ -415,15 +476,34 @@ func extractOnlyArchiveMember(archivePath, targetPath string, opts SecureInstall
 		return fmt.Errorf("agent archive does not contain expected member %q", opts.ExpectedMember)
 	}
 
+	if err := os.Rename(stagedPath, targetPath); err != nil {
+		return fmt.Errorf("install upgraded agent binary: %w", err)
+	}
+
+	stagedPath = ""
+
 	return nil
 }
 
 func safeArchiveName(name string) bool {
-	return name != "" &&
+	return name != "" && name != "." && name != ".." &&
 		!filepath.IsAbs(name) &&
 		filepath.Clean(name) == name &&
 		!strings.Contains(name, `\`) &&
 		!strings.HasPrefix(name, ".."+string(filepath.Separator))
+}
+
+func pathResolvesTo(path, expected string) (bool, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	return resolved == expected, nil
 }
 
 func executablePath(path string) (string, error) {

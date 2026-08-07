@@ -94,6 +94,16 @@ func TestSecureInstallAndSwitchRejectsInvalidInputs(t *testing.T) {
 			ExpectedSHA256: strings.Repeat("a", 64),
 			ExpectedMember: "bin/custom-agent",
 		},
+		"dot member": {
+			DownloadURL:    "https://example.com/agent.tar.gz",
+			ExpectedSHA256: strings.Repeat("a", 64),
+			ExpectedMember: ".",
+		},
+		"dot-dot member": {
+			DownloadURL:    "https://example.com/agent.tar.gz",
+			ExpectedSHA256: strings.Repeat("a", 64),
+			ExpectedMember: "..",
+		},
 		"invalid mode": {
 			DownloadURL:    "https://example.com/agent.tar.gz",
 			ExpectedSHA256: strings.Repeat("a", 64),
@@ -130,6 +140,11 @@ func TestValidateLayout(t *testing.T) {
 	paths := secureUpgradeTestPaths(t)
 	if err := ValidateLayout(paths); err != nil {
 		t.Fatalf("ValidateLayout: %v", err)
+	}
+
+	paths.BinaryPath = ""
+	if err := ValidateLayout(paths); err != nil {
+		t.Fatalf("ValidateLayout without optional BinaryPath: %v", err)
 	}
 
 	paths.LastGoodPath = paths.CurrentPath
@@ -220,6 +235,44 @@ func TestSecureInstallAndSwitchPreservesCurrentOnVerificationFailures(t *testing
 	}
 }
 
+func TestSecureInstallAndSwitchPreservesDistinctLastGoodOnCandidateFailure(t *testing.T) {
+	t.Parallel()
+
+	paths := secureUpgradeReadyPaths(t)
+	if err := os.WriteFile(paths.BinaryPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write distinct last-good: %v", err)
+	}
+
+	if err := os.Remove(paths.LastGoodPath); err != nil {
+		t.Fatalf("remove last-good link: %v", err)
+	}
+
+	if err := os.Symlink(paths.BinaryPath, paths.LastGoodPath); err != nil {
+		t.Fatalf("symlink distinct last-good: %v", err)
+	}
+
+	payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\nexit 42\n"))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	digest := sha256.Sum256(payload)
+
+	_, err := SecureInstallAndSwitch(t.Context(), slog.Default(), paths, SecureInstallOptions{
+		DownloadURL:    server.URL + "/agent.tar.gz",
+		ExpectedSHA256: fmt.Sprintf("%x", digest),
+		ExpectedMember: "custom-agent",
+		HTTPClient:     server.Client(),
+	})
+	if err == nil {
+		t.Fatal("SecureInstallAndSwitch error = nil")
+	}
+
+	assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
+	assertSecureUpgradeLink(t, paths.LastGoodPath, paths.BinaryPath)
+}
+
 func TestSecureInstallAndSwitchEnforcesSizeLimits(t *testing.T) {
 	t.Parallel()
 
@@ -293,6 +346,10 @@ func TestSecureInstallAndSwitchRejectsUnsafeAndDuplicateMembers(t *testing.T) {
 			}
 
 			assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
+
+			if _, statErr := os.Stat(paths.GreenPath); !os.IsNotExist(statErr) {
+				t.Fatalf("inactive slot changed on invalid archive: %v", statErr)
+			}
 		})
 	}
 }
@@ -326,6 +383,10 @@ func TestSecureInstallAndSwitchRejectsHTTPRedirect(t *testing.T) {
 
 func TestRedactedURL(t *testing.T) {
 	t.Parallel()
+
+	if got := RedactedURL(nil); got != "" {
+		t.Fatalf("RedactedURL(nil) = %q", got)
+	}
 
 	parsed, err := url.Parse("https://example.com/agent.tar.gz?sig=secret")
 	if err != nil {

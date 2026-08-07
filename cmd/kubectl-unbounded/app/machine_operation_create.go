@@ -228,7 +228,7 @@ func (o *machineOperationCreateOptions) validate() error {
 
 	if o.kind == v1alpha3.OperationAgentUpgrade {
 		if parameters["downloadURL"] == "" {
-			return fmt.Errorf("AgentUpgrade requires --param downloadURL=<url>")
+			return fmt.Errorf("AgentUpgrade requires --param downloadURL=<https-url>")
 		}
 
 		if parameters["sha256"] == "" {

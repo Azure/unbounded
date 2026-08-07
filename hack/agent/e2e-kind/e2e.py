@@ -1175,15 +1175,20 @@ def wait_for_daemon_active(timeout_secs: int = 180) -> None:
     die(f"Timed out waiting for daemon to become active; last status={last_status!r}")
 
 
+_agent_upgrade_certificate_ready = False
+
+
 def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_complete: bool = True) -> dict[str, Any]:
     """Serve *tarball* to the VM, create AgentUpgrade, and wait for it."""
+
+    global _agent_upgrade_certificate_ready
 
     runner_ip = VM_GATEWAY
     agent_url = f"https://{runner_ip}:{SERVE_PORT}/{tarball.name}"
     digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
     cert_path = tarball.parent / "agent-upgrade-e2e.crt"
     key_path = tarball.parent / "agent-upgrade-e2e.key"
-    if not cert_path.exists() or not key_path.exists():
+    if not _agent_upgrade_certificate_ready:
         run([
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
             "-subj", f"/CN={runner_ip}", "-addext", f"subjectAltName=IP:{runner_ip}",
@@ -1201,6 +1206,7 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
         # Restart once after installing the test CA, before any upgrade candidate runs.
         ssh_cmd("sudo systemctl restart unbounded-agent-daemon.service")
         wait_for_daemon_active()
+        _agent_upgrade_certificate_ready = True
     log(f"Starting HTTPS file server on {runner_ip}:{SERVE_PORT} for {tarball.name}...")
     handler = _make_handler(str(tarball.parent))
     httpd = HTTPServer((runner_ip, SERVE_PORT), handler)

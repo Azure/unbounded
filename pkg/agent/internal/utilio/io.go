@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -30,7 +31,7 @@ func InstallFile(filename string, r io.Reader, perm os.FileMode) error {
 //
 // NOTE: we assume the filename is trusted and cleaned without path traversal characters.
 func InstallFileWithLimitedSize(filename string, r io.Reader, perm os.FileMode, maxBytes int64) error {
-	if maxBytes <= 0 {
+	if maxBytes <= 0 || maxBytes == math.MaxInt64 {
 		return fmt.Errorf("invalid maxBytes: %d", maxBytes)
 	}
 
