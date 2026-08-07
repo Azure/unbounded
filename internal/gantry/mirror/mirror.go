@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
 
 const providerFailureSweepInterval = time.Minute
@@ -1369,7 +1370,7 @@ func (s *livePeerStream) append(w http.ResponseWriter, src io.Reader, d digest.D
 		return 0, false, fmt.Errorf("peer resume size changed from %d to %d", s.totalSize, size)
 	}
 
-	written, err := io.Copy(s.verifier, reader)
+	written, err := streamcopy.CopyN(s.verifier, reader, s.totalSize-s.offset())
 	switch offset := s.offset(); {
 	case offset > s.totalSize:
 		return written, false, fmt.Errorf("peer stream exceeded content size: wrote %d, want %d", offset, s.totalSize)
