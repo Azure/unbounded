@@ -10,8 +10,8 @@ handled by the agent itself.
 ## AgentUpgrade
 
 Replaces the host agent binary using blue-green staging with automatic rollback.
-The operation requires a `downloadURL` parameter pointing to an HTTPS agent
-release tarball and a `sha256` parameter containing the compressed archive digest.
+The operation requires a `downloadURL` parameter pointing to an HTTP or HTTPS
+agent release tarball. An optional `sha256` parameter verifies the compressed archive digest.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -45,7 +45,7 @@ active at a time.
 
 **Staging:**
 
-1. Downloads the release tarball from `downloadURL` and verifies `sha256`.
+1. Downloads the release tarball from `downloadURL` and verifies `sha256` when provided.
 2. Requires the bounded archive to contain only the exact `unbounded-agent` member.
 3. Runs `unbounded-agent version` against the staged binary as a binary
    validation check. If this fails, the operation is marked `Failed` and the

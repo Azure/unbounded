@@ -29,11 +29,11 @@ func TestParseAgentUpgradeRequest(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), agentUpgradeDownloadURLParameter)
 
-	_, err = parseAgentUpgradeRequest(map[string]string{
-		agentUpgradeDownloadURLParameter: "https://example.com/agent.tar.gz",
+	request, err = parseAgentUpgradeRequest(map[string]string{
+		agentUpgradeDownloadURLParameter: "http://example.com/agent.tar.gz",
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), agentUpgradeSHA256Parameter)
+	require.NoError(t, err)
+	assert.Empty(t, request.sha256)
 }
 
 func TestAgentUpgradeSignalOperatorRecordFailure(t *testing.T) {

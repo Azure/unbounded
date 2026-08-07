@@ -62,7 +62,6 @@ import os
 import re
 import secrets
 import shutil
-import ssl
 import subprocess
 import sys
 import textwrap
@@ -1175,44 +1174,15 @@ def wait_for_daemon_active(timeout_secs: int = 180) -> None:
     die(f"Timed out waiting for daemon to become active; last status={last_status!r}")
 
 
-_agent_upgrade_certificate_ready = False
-
-
 def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_complete: bool = True) -> dict[str, Any]:
     """Serve *tarball* to the VM, create AgentUpgrade, and wait for it."""
 
-    global _agent_upgrade_certificate_ready
-
     runner_ip = VM_GATEWAY
-    agent_url = f"https://{runner_ip}:{SERVE_PORT}/{tarball.name}"
+    agent_url = f"http://{runner_ip}:{SERVE_PORT}/{tarball.name}"
     digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
-    cert_path = tarball.parent / "agent-upgrade-e2e.crt"
-    key_path = tarball.parent / "agent-upgrade-e2e.key"
-    if not _agent_upgrade_certificate_ready:
-        run([
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-            "-subj", f"/CN={runner_ip}", "-addext", f"subjectAltName=IP:{runner_ip}",
-            "-keyout", str(key_path), "-out", str(cert_path),
-        ])
-        scp_cmd(str(cert_path), f"{SSH_TARGET}:/tmp/agent-upgrade-e2e.crt")
-        ssh_cmd(
-            "if command -v update-ca-certificates >/dev/null 2>&1; then "
-            "sudo cp /tmp/agent-upgrade-e2e.crt /usr/local/share/ca-certificates/agent-upgrade-e2e.crt && "
-            "sudo update-ca-certificates >/dev/null; "
-            "else sudo cp /tmp/agent-upgrade-e2e.crt /etc/pki/ca-trust/source/anchors/agent-upgrade-e2e.crt && "
-            "sudo update-ca-trust; fi"
-        )
-        # Go loads system roots lazily and may cache them for the process lifetime.
-        # Restart once after installing the test CA, before any upgrade candidate runs.
-        ssh_cmd("sudo systemctl restart unbounded-agent-daemon.service")
-        wait_for_daemon_active()
-        _agent_upgrade_certificate_ready = True
-    log(f"Starting HTTPS file server on {runner_ip}:{SERVE_PORT} for {tarball.name}...")
+    log(f"Starting HTTP file server on {runner_ip}:{SERVE_PORT} for {tarball.name}...")
     handler = _make_handler(str(tarball.parent))
     httpd = HTTPServer((runner_ip, SERVE_PORT), handler)
-    tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    tls_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
-    httpd.socket = tls_context.wrap_socket(httpd.socket, server_side=True)
     server_thread = Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
     try:
@@ -3725,7 +3695,7 @@ def validate_agent_upgrade_rollback() -> None:
         broken_tarball, broken_operation_name, expect_complete=False)
     broken_status = broken_operation.get("status", {})
     log(f"Broken AgentUpgrade failure reason: {broken_status.get('reason')!r}")
-    if "verify upgraded agent binary" not in broken_status.get("message", ""):
+    if "verify agent binary" not in broken_status.get("message", ""):
         die(f"unexpected broken AgentUpgrade failure message: {broken_status.get('message')!r}")
     if read_daemon_current_target() != previous_good:
         die("broken AgentUpgrade changed current daemon binary symlink")

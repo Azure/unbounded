@@ -62,7 +62,7 @@ Pending MachineOperation
         v
 Validate parameters
         |
-        +-- missing URL/digest or non-HTTPS URL ---------> Failed
+        +-- missing/invalid HTTP(S) URL -----------------> Failed
         |
         v
 Mark InProgress
@@ -96,14 +96,14 @@ Old process exits, new daemon starts
 
 ## Staging and switching
 
-The daemon reads `spec.parameters["downloadURL"]` and
+The daemon reads `spec.parameters["downloadURL"]` and the optional
 `spec.parameters["sha256"]` from the `MachineOperation`, resolves the current
-binary target, and calls `agentbinary.SecureInstallAndSwitch`. Logs and errors
-omit URL query and fragment data.
+binary target, and calls `agentbinary.InstallAndSwitchFromTarGzWithOptions`.
+Logs and errors omit URL query and fragment data.
 
-`SecureInstallAndSwitch` performs the upgrade as one logical operation:
+`InstallAndSwitchFromTarGzWithOptions` performs the upgrade as one logical operation:
 
-1. Require an HTTPS URL and an exact compressed-archive SHA-256.
+1. Require an HTTP or HTTPS URL and verify the compressed-archive SHA-256 when provided.
 2. Download the tarball within the configured size bound.
 3. Require the archive to contain only the exact `unbounded-agent` entry.
 4. Bound decompression and atomically install the inactive slot.
@@ -168,8 +168,8 @@ startup signal path.
 
 | Failure | Operation status | Binary state |
 |---------|------------------|--------------|
-| Missing `downloadURL` or `sha256` | `Failed`, `InvalidParameters` | No link changes. |
-| Non-HTTPS URL or digest mismatch | `Failed`, `InvalidParameters` or `ExecutionFailed` | No current link change. |
+| Missing `downloadURL` | `Failed`, `InvalidParameters` | No link changes. |
+| Unsupported URL or digest mismatch | `Failed`, `InvalidParameters` or `ExecutionFailed` | No current link change. |
 | Download or extraction failure | `Failed`, `ExecutionFailed` | Current remains unchanged. Last-good changes to current only when needed to protect an inactive slot that it referenced. |
 | Empty archive entry | `Failed`, `ExecutionFailed` | Current remains unchanged. Last-good changes to current only when needed to protect an inactive slot that it referenced. |
 | Staged binary fails `version` | `Failed`, `ExecutionFailed` | Current remains unchanged. A distinct last-good target remains unchanged. |

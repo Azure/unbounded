@@ -58,6 +58,40 @@ func TestInstallFromTarGzVerifiesInstalledBinary(t *testing.T) {
 	}
 }
 
+func TestInstallAndSwitchFromTarGz(t *testing.T) {
+	t.Parallel()
+
+	paths := setupDaemonBinaryTestPaths(t)
+
+	release := testAgentScript("release", 0)
+	if err := os.WriteFile(paths.BinaryPath, testAgentScript("current", 0), 0o755); err != nil {
+		t.Fatalf("write current binary: %v", err)
+	}
+
+	if err := os.Symlink(paths.BinaryPath, paths.CurrentPath); err != nil {
+		t.Fatalf("symlink current binary: %v", err)
+	}
+
+	if err := os.Symlink(paths.BinaryPath, paths.LastGoodPath); err != nil {
+		t.Fatalf("symlink last-good binary: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if err := writeTestAgentArchive(w, release); err != nil {
+			t.Errorf("write archive: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	if err := InstallAndSwitchFromTarGz(t.Context(), server.URL, paths, 0o755); err != nil {
+		t.Fatalf("InstallAndSwitchFromTarGz: %v", err)
+	}
+
+	assertSymlinkTarget(t, paths.CurrentPath, paths.BluePath)
+	assertSymlinkTarget(t, paths.LastGoodPath, paths.BinaryPath)
+	assertFileContent(t, paths.BluePath, string(release))
+}
+
 func TestInstallFromTarGzRejectsUnsupportedScheme(t *testing.T) {
 	t.Parallel()
 

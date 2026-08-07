@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -40,8 +39,8 @@ type Layout struct {
 	LastGoodPath string
 }
 
-// SecureInstallOptions configures a verified agent release archive install.
-type SecureInstallOptions struct {
+// InstallOptions configures a bounded agent release archive install.
+type InstallOptions struct {
 	DownloadURL       string
 	ExpectedSHA256    string
 	ExpectedMember    string
@@ -49,6 +48,7 @@ type SecureInstallOptions struct {
 	MaxArchiveBytes   int64
 	MaxExtractedBytes int64
 	HTTPClient        *http.Client
+	ExactMember       bool
 }
 
 // SwitchResult describes a completed blue-green binary switch.
@@ -57,50 +57,56 @@ type SwitchResult struct {
 	CurrentPath  string
 }
 
-type normalizedSecureInstallOptions struct {
-	options        SecureInstallOptions
+type normalizedInstallOptions struct {
+	options        InstallOptions
 	parsedURL      *url.URL
 	expectedDigest [sha256.Size]byte
+	verifyDigest   bool
 }
 
-// ValidateSecureInstallOptions validates caller-provided secure install inputs.
-func ValidateSecureInstallOptions(opts SecureInstallOptions) error {
-	_, err := normalizeSecureInstallOptions(opts)
+// ValidateInstallOptions validates caller-provided install inputs.
+func ValidateInstallOptions(opts InstallOptions) error {
+	_, err := normalizeInstallOptions(opts)
 
 	return err
 }
 
-func normalizeSecureInstallOptions(opts SecureInstallOptions) (normalizedSecureInstallOptions, error) {
-	parsedURL, err := validateSecureDownloadURL(opts.DownloadURL)
+func normalizeInstallOptions(opts InstallOptions) (normalizedInstallOptions, error) {
+	parsedURL, err := validateDownloadURL(opts.DownloadURL)
 	if err != nil {
-		return normalizedSecureInstallOptions{}, err
+		return normalizedInstallOptions{}, err
 	}
 
-	expectedDigest, err := parseSHA256(opts.ExpectedSHA256)
-	if err != nil {
-		return normalizedSecureInstallOptions{}, err
+	var expectedDigest [sha256.Size]byte
+
+	verifyDigest := strings.TrimSpace(opts.ExpectedSHA256) != ""
+	if verifyDigest {
+		expectedDigest, err = parseSHA256(opts.ExpectedSHA256)
+		if err != nil {
+			return normalizedInstallOptions{}, err
+		}
 	}
 
 	opts.ExpectedMember = strings.TrimSpace(opts.ExpectedMember)
 	if opts.ExpectedMember == "" || opts.ExpectedMember == "." || opts.ExpectedMember == ".." ||
 		filepath.Base(opts.ExpectedMember) != opts.ExpectedMember {
-		return normalizedSecureInstallOptions{}, fmt.Errorf("expected archive member must be an exact base name without a path prefix")
+		return normalizedInstallOptions{}, fmt.Errorf("expected archive member must be an exact base name without a path prefix")
 	}
 
 	if opts.Mode != 0 && opts.Mode.Perm() != opts.Mode {
-		return normalizedSecureInstallOptions{}, fmt.Errorf("agent binary mode must contain permission bits only")
+		return normalizedInstallOptions{}, fmt.Errorf("agent binary mode must contain permission bits only")
 	}
 
 	if opts.MaxArchiveBytes < 0 || opts.MaxExtractedBytes < 0 {
-		return normalizedSecureInstallOptions{}, fmt.Errorf("agent archive size limits must not be negative")
+		return normalizedInstallOptions{}, fmt.Errorf("agent archive size limits must not be negative")
 	}
 
 	if opts.MaxArchiveBytes > math.MaxInt64-1 {
-		return normalizedSecureInstallOptions{}, fmt.Errorf("maximum archive size is too large")
+		return normalizedInstallOptions{}, fmt.Errorf("maximum archive size is too large")
 	}
 
 	if opts.MaxExtractedBytes > math.MaxInt64/2 {
-		return normalizedSecureInstallOptions{}, fmt.Errorf("maximum extracted size is too large")
+		return normalizedInstallOptions{}, fmt.Errorf("maximum extracted size is too large")
 	}
 
 	if opts.Mode == 0 {
@@ -115,12 +121,13 @@ func normalizeSecureInstallOptions(opts SecureInstallOptions) (normalizedSecureI
 		opts.MaxExtractedBytes = defaultMaxBinaryBytes
 	}
 
-	opts.HTTPClient = secureHTTPClient(opts.HTTPClient)
+	opts.HTTPClient = boundedHTTPClient(opts.HTTPClient)
 
-	return normalizedSecureInstallOptions{
+	return normalizedInstallOptions{
 		options:        opts,
 		parsedURL:      parsedURL,
 		expectedDigest: expectedDigest,
+		verifyDigest:   verifyDigest,
 	}, nil
 }
 
@@ -153,21 +160,49 @@ func ValidateLayout(paths Layout) error {
 	return nil
 }
 
-// SecureInstallAndSwitch downloads and verifies an HTTPS release archive,
-// installs its only member into the inactive slot, and atomically updates the
-// last-good and current links. The archive member must exactly equal the
-// configured base name; path prefixes such as "./" are intentionally rejected.
-func SecureInstallAndSwitch(
+func installFromTarGz(ctx context.Context, targetPath string, opts InstallOptions) error {
+	normalized, err := normalizeInstallOptions(opts)
+	if err != nil {
+		return err
+	}
+
+	opts = normalized.options
+
+	archivePath, err := downloadArchive(
+		ctx,
+		opts.HTTPClient,
+		normalized.parsedURL,
+		normalized.expectedDigest,
+		normalized.verifyDigest,
+		opts.MaxArchiveBytes,
+	)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(archivePath) //nolint:errcheck // temporary archive cleanup
+
+	if err := extractOnlyArchiveMember(archivePath, targetPath, opts); err != nil {
+		return err
+	}
+
+	return Verify(ctx, targetPath)
+}
+
+// InstallAndSwitchFromTarGzWithOptions downloads a bounded HTTP or HTTPS release
+// archive, installs the configured member into the inactive slot, and atomically
+// updates the last-good and current links. When ExactMember is set, the archive
+// must contain only the exact configured base name.
+func InstallAndSwitchFromTarGzWithOptions(
 	ctx context.Context,
 	log *slog.Logger,
 	paths Layout,
-	opts SecureInstallOptions,
+	opts InstallOptions,
 ) (SwitchResult, error) {
 	if err := ValidateLayout(paths); err != nil {
 		return SwitchResult{}, err
 	}
 
-	normalized, err := normalizeSecureInstallOptions(opts)
+	normalized, err := normalizeInstallOptions(opts)
 	if err != nil {
 		return SwitchResult{}, err
 	}
@@ -175,6 +210,7 @@ func SecureInstallAndSwitch(
 	opts = normalized.options
 	parsedURL := normalized.parsedURL
 	expectedDigest := normalized.expectedDigest
+	verifyDigest := normalized.verifyDigest
 
 	previousPath, err := executablePath(paths.CurrentPath)
 	if err != nil {
@@ -191,7 +227,7 @@ func SecureInstallAndSwitch(
 		targetPath = paths.GreenPath
 	}
 
-	archivePath, err := downloadVerifiedArchive(ctx, opts.HTTPClient, parsedURL, expectedDigest, opts.MaxArchiveBytes)
+	archivePath, err := downloadArchive(ctx, opts.HTTPClient, parsedURL, expectedDigest, verifyDigest, opts.MaxArchiveBytes)
 	if err != nil {
 		return SwitchResult{}, err
 	}
@@ -222,7 +258,7 @@ func SecureInstallAndSwitch(
 		return SwitchResult{}, err
 	}
 
-	if err := verifyQuiet(ctx, targetPath); err != nil {
+	if err := Verify(ctx, targetPath); err != nil {
 		return SwitchResult{}, err
 	}
 
@@ -258,14 +294,18 @@ func RedactedURL(parsedURL *url.URL) string {
 	return redacted.String()
 }
 
-func validateSecureDownloadURL(rawURL string) (*url.URL, error) {
+func validateDownloadURL(rawURL string) (*url.URL, error) {
 	parsedURL, err := url.ParseRequestURI(strings.TrimSpace(rawURL))
 	if err != nil {
 		return nil, fmt.Errorf("invalid download URL")
 	}
 
-	if parsedURL.Scheme != "https" || parsedURL.Host == "" || parsedURL.User != nil || parsedURL.Fragment != "" {
-		return nil, fmt.Errorf("download URL must use HTTPS, include a host, omit user information, and omit fragments")
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported agent download URL scheme %q", parsedURL.Scheme)
+	}
+
+	if parsedURL.Host == "" || parsedURL.User != nil || parsedURL.Fragment != "" {
+		return nil, fmt.Errorf("download URL must include a host, omit user information, and omit fragments")
 	}
 
 	return parsedURL, nil
@@ -287,7 +327,7 @@ func parseSHA256(value string) ([sha256.Size]byte, error) {
 	return expected, nil
 }
 
-func secureHTTPClient(base *http.Client) *http.Client {
+func boundedHTTPClient(base *http.Client) *http.Client {
 	if base == nil {
 		base = &http.Client{Timeout: 10 * time.Minute}
 	}
@@ -295,8 +335,9 @@ func secureHTTPClient(base *http.Client) *http.Client {
 	client := *base
 	originalCheckRedirect := client.CheckRedirect
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if req.URL.Scheme != "https" {
-			return fmt.Errorf("redirect to non-HTTPS URL is not allowed")
+		if (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Host == "" ||
+			req.URL.User != nil || req.URL.Fragment != "" {
+			return fmt.Errorf("redirect URL must use HTTP or HTTPS, include a host, omit user information, and omit fragments")
 		}
 
 		if originalCheckRedirect != nil {
@@ -313,11 +354,12 @@ func secureHTTPClient(base *http.Client) *http.Client {
 	return &client
 }
 
-func downloadVerifiedArchive(
+func downloadArchive(
 	ctx context.Context,
 	client *http.Client,
 	parsedURL *url.URL,
 	expected [sha256.Size]byte,
+	verifyDigest bool,
 	maxBytes int64,
 ) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), http.NoBody)
@@ -370,7 +412,7 @@ func downloadVerifiedArchive(
 		return "", fmt.Errorf("agent archive exceeds %d-byte limit", maxBytes)
 	}
 
-	if !equalDigest(hasher.Sum(nil), expected[:]) {
+	if verifyDigest && !equalDigest(hasher.Sum(nil), expected[:]) {
 		return "", fmt.Errorf("agent archive SHA-256 does not match expected digest")
 	}
 
@@ -383,7 +425,7 @@ func downloadVerifiedArchive(
 	return path, nil
 }
 
-func extractOnlyArchiveMember(archivePath, targetPath string, opts SecureInstallOptions) (err error) {
+func extractOnlyArchiveMember(archivePath, targetPath string, opts InstallOptions) (err error) {
 	archive, err := os.Open(archivePath)
 	if err != nil {
 		return fmt.Errorf("open agent archive: %w", err)
@@ -423,12 +465,17 @@ func extractOnlyArchiveMember(archivePath, targetPath string, opts SecureInstall
 			return fmt.Errorf("read agent archive: %w", nextErr)
 		}
 
-		if !safeArchiveName(header.Name) {
+		memberName := filepath.Clean(header.Name)
+		if !safeArchiveName(header.Name, opts.ExactMember) {
 			return fmt.Errorf("agent archive contains unsafe member name %q", header.Name)
 		}
 
-		if header.Name != opts.ExpectedMember {
+		if opts.ExactMember && header.Name != opts.ExpectedMember {
 			return fmt.Errorf("agent archive contains unexpected member %q", header.Name)
+		}
+
+		if !opts.ExactMember && filepath.Base(memberName) != opts.ExpectedMember {
+			continue
 		}
 
 		if found {
@@ -481,12 +528,14 @@ func extractOnlyArchiveMember(archivePath, targetPath string, opts SecureInstall
 	return nil
 }
 
-func safeArchiveName(name string) bool {
-	return name != "" && name != "." && name != ".." &&
-		!filepath.IsAbs(name) &&
-		filepath.Clean(name) == name &&
-		!strings.Contains(name, `\`) &&
-		!strings.HasPrefix(name, ".."+string(filepath.Separator))
+func safeArchiveName(name string, exact bool) bool {
+	cleaned := filepath.Clean(name)
+	if name == "" || cleaned == "." || cleaned == ".." || filepath.IsAbs(name) ||
+		strings.Contains(name, `\`) || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return false
+	}
+
+	return !exact || cleaned == name
 }
 
 func pathResolvesTo(path, expected string) (bool, error) {
@@ -518,21 +567,6 @@ func executablePath(path string) (string, error) {
 	}
 
 	return resolved, nil
-}
-
-func verifyQuiet(ctx context.Context, path string) error {
-	verifyCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(verifyCtx, path, "version")
-	cmd.Stdout = io.Discard
-
-	cmd.Stderr = io.Discard
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("verify upgraded agent binary: %w", err)
-	}
-
-	return nil
 }
 
 type countingReader struct {

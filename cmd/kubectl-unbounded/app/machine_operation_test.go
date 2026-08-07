@@ -129,14 +129,13 @@ func TestValidateAgentUpgradeRequiresSHA256(t *testing.T) {
 		name:          "upgrade-worker-01",
 		kind:          v1alpha3.OperationAgentUpgrade,
 		machine:       "worker-01",
-		parameterArgs: []string{"downloadURL=https://example.com/agent.tar.gz"},
+		parameterArgs: []string{"downloadURL=http://example.com/agent.tar.gz"},
 		output:        operationOutputName,
 		dryRun:        dryRunNone,
 	}
 
-	err := opts.validate()
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "sha256")
+	// SHA-256 is optional when the operation source is trusted.
+	require.NoError(t, opts.validate())
 }
 
 func TestValidateWaitRejectsStructuredOutput(t *testing.T) {

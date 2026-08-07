@@ -253,7 +253,7 @@ func (nspawnNodeOperator) RepaveNode(
 }
 
 func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
-	return upgradeDaemonBinarySecure(ctx, log, request)
+	return upgradeDaemonBinary(ctx, log, request)
 }
 
 func (nspawnNodeOperator) RestartAgentDaemon(ctx context.Context, log *slog.Logger) error {

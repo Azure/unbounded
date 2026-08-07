@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package agentbinary installs and switches verified agent binaries from release archives.
+// Package agentbinary installs and switches agent binaries from release archives.
 package agentbinary
 
 import (
@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,45 +24,14 @@ const verifyTimeout = 30 * time.Second
 
 const daemonBinaryMode os.FileMode = 0o755
 
-// InstallFromTarGz downloads a remote .tar.gz archive and installs binaryName
-// from it to targetPath. It is retained for the legacy Unbounded upgrade
-// contract, which does not provide an archive digest. New managed upgrade
-// callers should use SecureInstallAndSwitch.
+// InstallFromTarGz downloads a bounded HTTP or HTTPS .tar.gz archive, installs
+// binaryName to targetPath, and verifies the installed binary.
 func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName string, perm os.FileMode) error {
-	parsedURL, err := url.Parse(downloadURL)
-	if err != nil {
-		return fmt.Errorf("parse download URL %q: %w", downloadURL, err)
-	}
-
-	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-		return fmt.Errorf("unsupported agent download URL scheme %q", parsedURL.Scheme)
-	}
-
-	for tarFile, err := range utilio.DecompressTarGzFromRemote(ctx, downloadURL) {
-		if err != nil {
-			return err
-		}
-
-		if filepath.Base(tarFile.Name) != binaryName {
-			continue
-		}
-
-		if tarFile.Size == 0 {
-			return fmt.Errorf("agent binary %q in archive %q is empty", binaryName, downloadURL)
-		}
-
-		if err := utilio.InstallFile(targetPath, tarFile.Body, perm); err != nil {
-			return fmt.Errorf("install %s from %q: %w", binaryName, downloadURL, err)
-		}
-
-		if err := Verify(ctx, targetPath); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	return fmt.Errorf("agent binary %q not found in archive %q", binaryName, downloadURL)
+	return installFromTarGz(ctx, targetPath, InstallOptions{
+		DownloadURL:    downloadURL,
+		ExpectedMember: binaryName,
+		Mode:           perm,
+	})
 }
 
 // InstallFromFile installs a local agent binary to targetPath.
@@ -87,23 +55,20 @@ func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error
 }
 
 // InstallAndSwitchFromTarGz installs the next agent binary and switches daemon links.
-// It is retained for the legacy Unbounded upgrade contract. New managed upgrade
-// callers should use SecureInstallAndSwitch.
 func InstallAndSwitchFromTarGz(ctx context.Context, downloadURL string, paths goalstates.AgentUpgradePaths, perm os.FileMode) error {
-	targetPath := paths.NextTargetPath()
-	if err := InstallFromTarGz(ctx, downloadURL, targetPath, goalstates.AgentUpgradeBinaryName, perm); err != nil {
-		return fmt.Errorf("install upgraded daemon binary to %s: %w", targetPath, err)
-	}
+	_, err := InstallAndSwitchFromTarGzWithOptions(ctx, slog.Default(), Layout{
+		BinaryPath:   paths.BinaryPath,
+		BluePath:     paths.BluePath,
+		GreenPath:    paths.GreenPath,
+		CurrentPath:  paths.CurrentPath,
+		LastGoodPath: paths.LastGoodPath,
+	}, InstallOptions{
+		DownloadURL:    downloadURL,
+		ExpectedMember: goalstates.AgentUpgradeBinaryName,
+		Mode:           perm,
+	})
 
-	if err := utilio.UpdateSymlink(paths.LastGoodPath, paths.CurrentTargetPath); err != nil {
-		return fmt.Errorf("update last-good daemon symlink: %w", err)
-	}
-
-	if err := utilio.UpdateSymlink(paths.CurrentPath, targetPath); err != nil {
-		return fmt.Errorf("update current daemon symlink: %w", err)
-	}
-
-	return nil
+	return err
 }
 
 // EnsureDaemonBinaryLinks initializes daemon current, last-good, and
@@ -181,7 +146,12 @@ func Verify(ctx context.Context, path string) error {
 	defer cancel()
 
 	for {
-		output, err := exec.CommandContext(verifyCtx, path, "version").CombinedOutput()
+		output := cappedOutput{remaining: 4 << 10}
+		cmd := exec.CommandContext(verifyCtx, path, "version")
+		cmd.Stdout = &output
+		cmd.Stderr = &output
+
+		err := cmd.Run()
 		if err == nil {
 			return nil
 		}
@@ -195,11 +165,28 @@ func Verify(ctx context.Context, path string) error {
 			}
 		}
 
-		details := strings.TrimSpace(string(output))
+		details := strings.TrimSpace(output.String())
 		if details != "" {
 			return fmt.Errorf("verify agent binary %s: %w: %s", path, err, details)
 		}
 
 		return fmt.Errorf("verify agent binary %s: %w", path, err)
 	}
+}
+
+type cappedOutput struct {
+	strings.Builder
+	remaining int
+}
+
+func (w *cappedOutput) Write(data []byte) (int, error) {
+	originalLength := len(data)
+	if len(data) > w.remaining {
+		data = data[:w.remaining]
+	}
+
+	_, _ = w.Builder.Write(data)
+	w.remaining -= len(data)
+
+	return originalLength, nil
 }

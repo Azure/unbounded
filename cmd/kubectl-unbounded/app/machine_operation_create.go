@@ -226,14 +226,8 @@ func (o *machineOperationCreateOptions) validate() error {
 		return err
 	}
 
-	if o.kind == v1alpha3.OperationAgentUpgrade {
-		if parameters["downloadURL"] == "" {
-			return fmt.Errorf("AgentUpgrade requires --param downloadURL=<https-url>")
-		}
-
-		if parameters["sha256"] == "" {
-			return fmt.Errorf("AgentUpgrade requires --param sha256=<archive-sha256>")
-		}
+	if o.kind == v1alpha3.OperationAgentUpgrade && parameters["downloadURL"] == "" {
+		return fmt.Errorf("AgentUpgrade requires --param downloadURL=<url>")
 	}
 
 	return nil
