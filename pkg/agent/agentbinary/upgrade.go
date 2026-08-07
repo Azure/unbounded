@@ -143,11 +143,16 @@ func validateLayout(paths Layout) error {
 			return fmt.Errorf("invalid agent binary path %q", value)
 		}
 
-		if _, ok := seen[value]; ok {
+		canonical, err := canonicalPathEntry(value)
+		if err != nil {
+			return fmt.Errorf("resolve agent binary path %q: %w", value, err)
+		}
+
+		if _, ok := seen[canonical]; ok {
 			return fmt.Errorf("duplicate agent binary path %q", value)
 		}
 
-		seen[value] = struct{}{}
+		seen[canonical] = struct{}{}
 	}
 
 	return nil
@@ -226,21 +231,14 @@ func InstallAndSwitchFromTarGz(
 	}
 	defer os.Remove(archivePath) //nolint:errcheck // temporary archive cleanup
 
-	lastGoodTarget, err := filepath.EvalSymlinks(paths.LastGoodPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	lastGoodProtected, err := symlinkReferencesPath(paths.LastGoodPath, targetPath)
+	if err != nil {
 		return SwitchResult{}, fmt.Errorf("resolve last-good agent binary: %w", err)
-	}
-
-	canonicalTargetDir, err := filepath.EvalSymlinks(filepath.Dir(targetPath))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return SwitchResult{}, fmt.Errorf("resolve inactive agent binary directory: %w", err)
 	}
 
 	// Protect last-good before replacing the inactive slot only when that slot
 	// contains last-good. Otherwise, preserve the existing rollback target until
-	// the candidate has been staged and verified. A missing target directory
-	// cannot contain a last-good binary.
-	lastGoodProtected := err == nil && lastGoodTarget == filepath.Join(canonicalTargetDir, filepath.Base(targetPath))
+	// the candidate has been staged and verified.
 	if lastGoodProtected {
 		if err := utilio.UpdateSymlink(paths.LastGoodPath, previousPath); err != nil {
 			return SwitchResult{}, fmt.Errorf("protect current agent as last-good: %w", err)
@@ -533,6 +531,79 @@ func safeArchiveName(name string, exact bool) bool {
 	}
 
 	return !exact || cleaned == name
+}
+
+func canonicalPathEntry(path string) (string, error) {
+	dir := filepath.Dir(path)
+	missing := make([]string, 0)
+
+	for {
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+
+			return filepath.Join(resolved, filepath.Base(path)), nil
+		}
+
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", err
+		}
+
+		missing = append(missing, filepath.Base(dir))
+		dir = parent
+	}
+}
+
+func symlinkReferencesPath(linkPath, targetPath string) (bool, error) {
+	targetEntry, err := canonicalPathEntry(targetPath)
+	if err != nil {
+		return false, err
+	}
+
+	resolved, err := filepath.EvalSymlinks(linkPath)
+	if err == nil {
+		return resolved == targetEntry, nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+
+	info, lstatErr := os.Lstat(linkPath)
+	if errors.Is(lstatErr, os.ErrNotExist) {
+		return false, nil
+	}
+
+	if lstatErr != nil {
+		return false, lstatErr
+	}
+
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+
+	intended, err := os.Readlink(linkPath)
+	if err != nil {
+		return false, err
+	}
+
+	if !filepath.IsAbs(intended) {
+		intended = filepath.Join(filepath.Dir(linkPath), intended)
+	}
+
+	intendedEntry, err := canonicalPathEntry(filepath.Clean(intended))
+	if err != nil {
+		return false, err
+	}
+
+	return intendedEntry == targetEntry, nil
 }
 
 func pathResolvesTo(path, expected string) (bool, error) {

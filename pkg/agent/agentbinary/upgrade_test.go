@@ -159,6 +159,29 @@ func TestValidateLayout(t *testing.T) {
 	}
 }
 
+func TestValidateLayoutRejectsAliasedEntries(t *testing.T) {
+	t.Parallel()
+
+	paths := secureUpgradeTestPaths(t)
+
+	realDir := filepath.Join(t.TempDir(), "real")
+	if err := os.Mkdir(realDir, 0o750); err != nil {
+		t.Fatalf("create real directory: %v", err)
+	}
+
+	aliasDir := filepath.Join(filepath.Dir(realDir), "alias")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatalf("create directory alias: %v", err)
+	}
+
+	paths.BluePath = filepath.Join(realDir, "agent")
+	paths.GreenPath = filepath.Join(aliasDir, "agent")
+
+	if err := validateLayout(paths); err == nil {
+		t.Fatal("validateLayout aliased path error = nil")
+	}
+}
+
 func TestInstallAndSwitchFromTarGzWithOptionsRejectsUnexpectedMember(t *testing.T) {
 	t.Parallel()
 
@@ -241,6 +264,38 @@ func TestInstallAndSwitchFromTarGzWithOptionsPreservesCurrentOnVerificationFailu
 			assertSecureUpgradeLink(t, paths.LastGoodPath, paths.BluePath)
 		})
 	}
+}
+
+func TestInstallAndSwitchFromTarGzProtectsDanglingLastGood(t *testing.T) {
+	t.Parallel()
+
+	paths := secureUpgradeReadyPaths(t)
+	if err := os.Remove(paths.LastGoodPath); err != nil {
+		t.Fatalf("remove last-good link: %v", err)
+	}
+
+	if err := os.Symlink(paths.GreenPath, paths.LastGoodPath); err != nil {
+		t.Fatalf("symlink dangling last-good: %v", err)
+	}
+
+	payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\nexit 42\n"))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
+		DownloadURL:    server.URL + "/agent.tar.gz",
+		ExpectedMember: "custom-agent",
+		ExactMember:    true,
+		HTTPClient:     server.Client(),
+	})
+	if err == nil {
+		t.Fatal("InstallAndSwitchFromTarGz error = nil")
+	}
+
+	assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
+	assertSecureUpgradeLink(t, paths.LastGoodPath, paths.BluePath)
 }
 
 func TestInstallAndSwitchFromTarGzWithOptionsPreservesDistinctLastGoodOnCandidateFailure(t *testing.T) {
