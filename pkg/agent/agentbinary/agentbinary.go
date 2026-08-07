@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -20,10 +19,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
-const (
-	verifyTimeout   = 30 * time.Second
-	verifyWaitDelay = time.Second
-)
+const verifyTimeout = 30 * time.Second
 
 const daemonBinaryMode os.FileMode = 0o755
 
@@ -121,13 +117,7 @@ func Verify(ctx context.Context, path string) error {
 	defer cancel()
 
 	for {
-		output := cappedOutput{remaining: 4 << 10}
-		cmd := exec.CommandContext(verifyCtx, path, "version")
-		cmd.Stdout = &output
-		cmd.Stderr = &output
-		cmd.WaitDelay = verifyWaitDelay
-
-		err := cmd.Run()
+		err := exec.CommandContext(verifyCtx, path, "version").Run()
 		if err == nil {
 			return nil
 		}
@@ -141,28 +131,6 @@ func Verify(ctx context.Context, path string) error {
 			}
 		}
 
-		details := strings.TrimSpace(output.String())
-		if details != "" {
-			return fmt.Errorf("verify agent binary %s: %w: %s", path, err, details)
-		}
-
 		return fmt.Errorf("verify agent binary %s: %w", path, err)
 	}
-}
-
-type cappedOutput struct {
-	strings.Builder
-	remaining int
-}
-
-func (w *cappedOutput) Write(data []byte) (int, error) {
-	originalLength := len(data)
-	if len(data) > w.remaining {
-		data = data[:w.remaining]
-	}
-
-	_, _ = w.Builder.Write(data)
-	w.remaining -= len(data)
-
-	return originalLength, nil
 }

@@ -124,13 +124,14 @@ func TestVerifyBoundsInheritedOutputWait(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "agent")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n(sleep 5) &\nexit 42\n"), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'candidate-secret\\n' >&2\n(sleep 5) &\nexit 42\n"), 0o755); err != nil {
 		t.Fatalf("write agent: %v", err)
 	}
 
 	start := time.Now()
 	err := Verify(t.Context(), path)
 	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "candidate-secret")
 	assert.Less(t, time.Since(start), 3*time.Second)
 }
 
