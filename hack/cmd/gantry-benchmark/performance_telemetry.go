@@ -83,7 +83,7 @@ func performanceTelemetryQueries() []performanceTelemetryQuery {
 		{name: "gantry_commit_observation", query: `{__name__=~"gantry_containerd_commit_(observed_total|observed_timestamp_seconds|observation_duration_seconds_(sum|count)|latest_observation_duration_seconds|missing_after_stream_total)",gantry_benchmark="true"}`},
 		// Seeding width: how many HRW pullers each layer actually activates, and
 		// how many please_pull requests convert into origin pulls versus dedup.
-		{name: "gantry_coord_seeding", query: `{__name__=~"p2p_coord_please_pull_(served|started|declined)_total|p2p_coord_pull_intent_served_total|p2p_prefetch_(batches|digests)_total",gantry_benchmark="true"}`},
+		{name: "gantry_coord_seeding", query: `{__name__=~"p2p_coord_please_pull_(served|started|declined)_total|p2p_coord_pull_intent_served_total|p2p_prefetch_(batches|digests|groups)_total",gantry_benchmark="true"}`},
 		{name: "gantry_prefetch_pullers", query: `{__name__=~"p2p_prefetch_pullers_per_manifest_(bucket|sum|count)",gantry_benchmark="true"}`},
 	}
 }

@@ -230,6 +230,7 @@ type phase3Metrics struct {
 	prefetchBatchesTotal              prometheus.Counter
 	prefetchDigestsTotal              prometheus.Counter
 	prefetchPullersPerBatch           prometheus.Histogram
+	prefetchGroupsTotal               *prometheus.CounterVec
 }
 
 func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics {
@@ -239,6 +240,17 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		Name: "p2p_in_flight_pulls",
 		Help: "Current count of in-flight digest pulls on this node.",
 	}, func() float64 { return float64(infl.Len()) })
+
+	prefetchGroupsTotal := reg.NewCounterVec("coord", prometheus.CounterOpts{
+		Name: "p2p_prefetch_groups_total",
+		Help: "Prefetch dispatch groups by local or remote target and success or error outcome.",
+	}, []string{"target", "outcome"})
+
+	for _, target := range []string{"local", "remote"} {
+		for _, outcome := range []string{"success", "error"} {
+			prefetchGroupsTotal.WithLabelValues(target, outcome).Add(0)
+		}
+	}
 
 	return &phase3Metrics{
 		hrwRankMismatch: reg.NewCounterVec("coord", prometheus.CounterOpts{
@@ -297,8 +309,9 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		prefetchPullersPerBatch: reg.NewHistogram("coord", prometheus.HistogramOpts{
 			Name:    "p2p_prefetch_pullers_per_manifest",
 			Help:    "Distribution of distinct HRW rank-0 pullers contacted per manifest pre-fan call.",
-			Buckets: prometheus.LinearBuckets(1, 1, 10),
+			Buckets: prometheus.ExponentialBuckets(1, 2, 11),
 		}),
+		prefetchGroupsTotal: prefetchGroupsTotal,
 	}
 }
 

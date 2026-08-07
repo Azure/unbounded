@@ -111,6 +111,8 @@ type MetricsHooks struct {
 	// `p2p_prefetch_batches_total` (count) and
 	// `p2p_prefetch_digests_batched_total` (sum).
 	OnPrefetchBatch func(pullers, digests int)
+	// OnPrefetchGroup fires once per local or remote dispatch group.
+	OnPrefetchGroup func(target, outcome string)
 }
 
 // Options configures a Resolver.

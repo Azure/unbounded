@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/Azure/unbounded/internal/gantry/advertise"
@@ -384,7 +385,7 @@ func runAgent(args []string) error {
 		// annotation (the design doc) which Members reads in Snapshot. This
 		// lets the cluster use stable K8s node names as NodeIDs
 		// while still dialing libp2p RPCs to the right peer.
-		coord.WithPeerIDResolver(membershipPeerIDResolver(memberView, logger)),
+		coord.WithPeerIDResolver(membershipPeerIDResolver(memberView, disco.LibP2P().Peerstore(), logger)),
 	)
 	// pullerPump bridges inbound please_pull RPCs to the local origin
 	// puller (the step 7). The pump itself MUST NOT block the coord
@@ -487,6 +488,9 @@ func runAgent(args []string) error {
 					p3.prefetchBatchesTotal.Inc()
 					p3.prefetchDigestsTotal.Add(float64(digests))
 					p3.prefetchPullersPerBatch.Observe(float64(pullers))
+				},
+				OnPrefetchGroup: func(target, outcome string) {
+					p3.prefetchGroupsTotal.WithLabelValues(target, outcome).Inc()
 				},
 			},
 		})
@@ -1288,13 +1292,9 @@ func transferPortFromListen(listen string) int {
 	return n
 }
 
-// membershipPeerIDResolver returns a coord.WithPeerIDResolver callback
-// that consults the live members snapshot. NodeID -> Node.PeerID is the
-// fast path; on miss the resolver returns (_, false) so coord.Client
-// falls through to its static teach-cache and finally to
-// peer.Decode(NodeID). The membership view is read on every call (cheap
-// in-memory copy) so newly-joined peers are picked up without restart.
-func membershipPeerIDResolver(mv ifaces.Members, logger *slog.Logger) func(ifaces.NodeID) (peer.ID, bool) {
+// membershipPeerIDResolver also installs the target's Pod-IP addresses before
+// direct coordination RPCs dial it; DHT bootstrap does not populate every peer.
+func membershipPeerIDResolver(mv ifaces.Members, ps peerstore.Peerstore, logger *slog.Logger) func(ifaces.NodeID) (peer.ID, bool) {
 	return func(id ifaces.NodeID) (peer.ID, bool) {
 		for _, n := range mv.Snapshot() {
 			if n.ID != id || n.PeerID == "" {
@@ -1312,6 +1312,41 @@ func membershipPeerIDResolver(mv ifaces.Members, logger *slog.Logger) func(iface
 				}
 
 				return "", false
+			}
+
+			var addrs []multiaddr.Multiaddr
+
+			for _, raw := range n.P2PAddrs {
+				info, err := peer.AddrInfoFromString(raw)
+				if err != nil {
+					if logger != nil {
+						logger.Debug("membership peer address decode failed",
+							slog.String("node_id", string(id)),
+							slog.String("address", raw),
+							slog.Any("err", err),
+						)
+					}
+
+					continue
+				}
+
+				if info.ID != pid {
+					if logger != nil {
+						logger.Warn("membership peer address identity mismatch",
+							slog.String("node_id", string(id)),
+							slog.String("peer_id", pid.String()),
+							slog.String("address_peer_id", info.ID.String()),
+						)
+					}
+
+					continue
+				}
+
+				addrs = append(addrs, info.Addrs...)
+			}
+
+			if ps != nil && len(addrs) > 0 {
+				ps.AddAddrs(pid, addrs, peerstore.AddressTTL)
 			}
 
 			return pid, true

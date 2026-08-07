@@ -310,11 +310,18 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 			_, err := r.opts.LocalPull.StartLocalPull(callCtx, registry, repository, kind, ds)
 			if err != nil {
 				failures.Add(1)
+
+				if r.opts.Metrics.OnPrefetchGroup != nil {
+					r.opts.Metrics.OnPrefetchGroup("local", "error")
+				}
+
 				r.opts.Logger.Debug("coldstart: prefetch local pull failed",
 					slog.String("kind", kind.String()),
 					slog.Int("batch_size", len(ds)),
 					slog.Any("err", err),
 				)
+			} else if r.opts.Metrics.OnPrefetchGroup != nil {
+				r.opts.Metrics.OnPrefetchGroup("local", "success")
 			}
 		}(k, digests)
 	}
@@ -333,12 +340,19 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 			_, err := r.opts.Coord.PleasePull(callCtx, node, registry, repository, kind, digests)
 			if err != nil {
 				failures.Add(1)
+
+				if r.opts.Metrics.OnPrefetchGroup != nil {
+					r.opts.Metrics.OnPrefetchGroup("remote", "error")
+				}
+
 				r.opts.Logger.Debug("coldstart: prefetch please_pull failed",
 					slog.String("puller", string(node)),
 					slog.String("kind", kind.String()),
 					slog.Int("batch_size", len(digests)),
 					slog.Any("err", err),
 				)
+			} else if r.opts.Metrics.OnPrefetchGroup != nil {
+				r.opts.Metrics.OnPrefetchGroup("remote", "success")
 			}
 		}(gk.node, gk.kind, ds)
 	}

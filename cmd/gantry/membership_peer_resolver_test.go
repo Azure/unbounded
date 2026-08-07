@@ -1,0 +1,106 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package main
+
+import (
+	"log/slog"
+	"testing"
+
+	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+
+	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
+)
+
+func TestMembershipPeerIDResolverInstallsPodAddresses(t *testing.T) {
+	t.Parallel()
+
+	target, err := libp2p.New(libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatalf("create target host: %v", err)
+	}
+
+	defer func() { _ = target.Close() }() //nolint:errcheck // best-effort test cleanup
+
+	caller, err := libp2p.New(libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatalf("create caller host: %v", err)
+	}
+
+	defer func() { _ = caller.Close() }() //nolint:errcheck // best-effort test cleanup
+
+	announced := "/ip4/10.64.1.23/tcp/4001/p2p/" + target.ID().String()
+	members := fakes.NewMembers("self", ifaces.Node{
+		ID:       "target-node",
+		PeerID:   target.ID().String(),
+		P2PAddrs: []string{announced},
+	})
+
+	resolve := membershipPeerIDResolver(members, caller.Peerstore(), slog.Default())
+
+	got, ok := resolve("target-node")
+	if !ok || got != target.ID() {
+		t.Fatalf("resolved peer = %q, %v; want %q, true", got, ok, target.ID())
+	}
+
+	want := multiaddr.StringCast("/ip4/10.64.1.23/tcp/4001")
+	if addrs := caller.Peerstore().Addrs(target.ID()); len(addrs) != 1 || !addrs[0].Equal(want) {
+		t.Fatalf("peerstore addresses = %v, want [%s]", addrs, want)
+	}
+}
+
+func TestMembershipPeerIDResolverRejectsMismatchedAddressIdentity(t *testing.T) {
+	t.Parallel()
+
+	target, err := libp2p.New(libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatalf("create target host: %v", err)
+	}
+
+	defer func() { _ = target.Close() }() //nolint:errcheck // best-effort test cleanup
+
+	other, err := libp2p.New(libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatalf("create other host: %v", err)
+	}
+
+	defer func() { _ = other.Close() }() //nolint:errcheck // best-effort test cleanup
+
+	caller, err := libp2p.New(libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatalf("create caller host: %v", err)
+	}
+
+	defer func() { _ = caller.Close() }() //nolint:errcheck // best-effort test cleanup
+
+	members := fakes.NewMembers("self", ifaces.Node{
+		ID:       "target-node",
+		PeerID:   target.ID().String(),
+		P2PAddrs: []string{"/ip4/10.64.1.23/tcp/4001/p2p/" + other.ID().String()},
+	})
+
+	resolve := membershipPeerIDResolver(members, caller.Peerstore(), slog.Default())
+
+	got, ok := resolve("target-node")
+	if !ok || got != target.ID() {
+		t.Fatalf("resolved peer = %q, %v; want %q, true", got, ok, target.ID())
+	}
+
+	if addrs := caller.Peerstore().Addrs(target.ID()); len(addrs) != 0 {
+		t.Fatalf("peerstore addresses = %v, want none for mismatched identity", addrs)
+	}
+}
+
+func TestMembershipPeerIDResolverMiss(t *testing.T) {
+	t.Parallel()
+
+	members := fakes.NewMembers("self")
+	resolve := membershipPeerIDResolver(members, nil, slog.Default())
+
+	if got, ok := resolve(ifaces.NodeID(peer.ID("missing"))); ok || got != "" {
+		t.Fatalf("resolved missing peer = %q, %v; want empty, false", got, ok)
+	}
+}

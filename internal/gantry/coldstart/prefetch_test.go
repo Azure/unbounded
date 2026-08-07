@@ -124,7 +124,7 @@ func TestPrefetchChildren_ReplicatesToTopNPullers(t *testing.T) {
 
 	coord := &stubCoord{}
 	disco := &stubDisco{health: 1.0}
-	r := buildResolverWithReplicas(t, coord, disco, self, cluster, 3)
+	r := buildResolverWithReplicas(t, coord, disco, self, cluster, 3, coldstart.MetricsHooks{})
 
 	children := []coldstart.ChildDigest{{Digest: d, Kind: ifaces.KindBlob}}
 	if err := r.PrefetchChildren(context.Background(), children, "docker.io", "library/nginx"); err != nil {
@@ -143,6 +143,65 @@ func TestPrefetchChildren_ReplicatesToTopNPullers(t *testing.T) {
 
 	if len(coord.pleasePullCalls) != 3 || len(seen) != 3 {
 		t.Fatalf("PleasePull calls: got %v, want 3 distinct pullers (top-3 replication)", coord.pleasePullCalls)
+	}
+}
+
+func TestPrefetchChildren_ReportsRemoteGroupOutcomes(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n3")
+
+	var (
+		d     digest.Digest
+		found bool
+	)
+
+	for i := 0; i < 8192; i++ {
+		candidate := digest.MustParse("sha256:" + digestHex(i))
+
+		top := hrw.TopK(cluster, candidate, 2)
+		if len(top) == 2 && top[0].Node.ID != self && top[1].Node.ID != self {
+			d = candidate
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		t.Fatal("could not find digest with two remote pullers")
+	}
+
+	top := hrw.TopK(cluster, d, 2)
+	coord := &stubCoord{pleasePullErrs: map[ifaces.NodeID]error{
+		top[0].Node.ID: errors.New("dial failed"),
+	}}
+
+	var (
+		mu       sync.Mutex
+		outcomes []string
+	)
+
+	r := buildResolverWithReplicas(t, coord, &stubDisco{health: 1.0}, self, cluster, 2, coldstart.MetricsHooks{
+		OnPrefetchGroup: func(target, outcome string) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			outcomes = append(outcomes, target+":"+outcome)
+		},
+	})
+
+	err := r.PrefetchChildren(context.Background(), []coldstart.ChildDigest{{Digest: d, Kind: ifaces.KindBlob}}, "docker.io", "library/nginx")
+	if !errors.Is(err, coldstart.ErrPrefetchPartial) {
+		t.Fatalf("PrefetchChildren error = %v, want ErrPrefetchPartial", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	sort.Strings(outcomes)
+
+	if got, want := fmt.Sprint(outcomes), "[remote:error remote:success]"; got != want {
+		t.Fatalf("group outcomes = %s, want %s", got, want)
 	}
 }
 
