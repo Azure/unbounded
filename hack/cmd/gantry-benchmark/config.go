@@ -70,7 +70,10 @@ type benchmarkConfig struct {
 	ACRPrivateEndpointResourceID string
 	TelemetryTimeout             time.Duration
 	TelemetryPollInterval        time.Duration
+	JobProgressInterval          time.Duration
 	StateRoot                    string
+	ImagePoolRoot                string
+	ImagePoolBuildRoot           string
 }
 
 type phaseRegistry struct {
@@ -130,6 +133,11 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		return benchmarkConfig{}, err
 	}
 
+	jobProgressInterval, err := envDuration(getenv, "BENCHMARK_JOB_PROGRESS_INTERVAL", 15*time.Second)
+	if err != nil {
+		return benchmarkConfig{}, err
+	}
+
 	mode := benchmarkMode(envDefault(getenv, "BENCHMARK_MODE", string(benchmarkModeProxy)))
 	if mode != benchmarkModeProxy && mode != benchmarkModeDirect {
 		return benchmarkConfig{}, fmt.Errorf(
@@ -139,6 +147,8 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 			mode,
 		)
 	}
+
+	stateRoot := filepath.Join(repoRoot, "tmp", "gantry-benchmark")
 
 	config := benchmarkConfig{
 		RepoRoot:                     repoRoot,
@@ -182,7 +192,10 @@ func loadBenchmarkConfig(getenv func(string) string) (benchmarkConfig, error) {
 		ACRPrivateEndpointResourceID: getenv("AZURE_ACR_PRIVATE_ENDPOINT_RESOURCE_ID"),
 		TelemetryTimeout:             telemetryTimeout,
 		TelemetryPollInterval:        telemetryPollInterval,
-		StateRoot:                    filepath.Join(repoRoot, "tmp", "gantry-benchmark"),
+		JobProgressInterval:          jobProgressInterval,
+		StateRoot:                    stateRoot,
+		ImagePoolRoot:                envDefault(getenv, "BENCHMARK_IMAGE_POOL_ROOT", filepath.Join(stateRoot, "image-pool")),
+		ImagePoolBuildRoot:           envDefault(getenv, "BENCHMARK_IMAGE_POOL_BUILD_ROOT", filepath.Join(stateRoot, "image-pool-build")),
 	}
 
 	if config.NodeCount <= 0 {

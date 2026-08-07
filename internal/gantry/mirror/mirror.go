@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
 
 const providerFailureSweepInterval = time.Minute
@@ -201,6 +202,7 @@ type metricsHooks struct {
 	onLiveStreamCompleted     func(d digest.Digest)
 	onPeerFetch               func(outcome string)
 	onMirrorBytesServed       func(kind, source string, bytes int64)
+	onMirrorResponseCompleted func(d digest.Digest, kind, source string)
 	onPeerFetchLatency        func(outcome string, d time.Duration)
 	onPeerDialResult          func(success bool)
 	onDhtLookup               func(outcome string, dur time.Duration)
@@ -363,6 +365,15 @@ func WithOriginStreamMetrics(started, completed, failed func(kind string)) Optio
 func WithLiveStreamCompletedHook(onCompleted func(d digest.Digest)) Option {
 	return func(s *Server) {
 		s.metrics.onLiveStreamCompleted = onCompleted
+	}
+}
+
+// WithMirrorResponseCompletedHook registers a callback after a complete GET
+// response body has been written successfully to the local containerd client.
+// It is not fired for HEAD requests, partial streams, or failed copies.
+func WithMirrorResponseCompletedHook(onCompleted func(d digest.Digest, kind, source string)) Option {
+	return func(s *Server) {
+		s.metrics.onMirrorResponseCompleted = onCompleted
 	}
 }
 
@@ -865,9 +876,11 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		case peerFallbackLocalHit:
 			return
 		case peerFallbackServed:
-			if !s.liveStreamThrough {
-				s.firePrefetch(ctx, kind, upstream, repo, d)
-			}
+			// Live stream-through proxies the body straight to containerd, so a
+			// served manifest reaches the shared content store on containerd's
+			// commit rather than ours. The prefetcher waits for it there, so this
+			// must fire in both modes or cold-start seeding never runs.
+			s.firePrefetch(ctx, kind, upstream, repo, d)
 
 			return
 		case peerFallbackPartial:
@@ -951,6 +964,8 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 
 		if err != nil {
 			logger.Debug("mirror: copy from cache failed", slog.Any("err", err))
+		} else {
+			s.fireMirrorResponseCompleted(d, kind, "cache")
 		}
 
 		return true
@@ -959,6 +974,11 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 	var enf *ifaces.ErrNotFound
 	if errors.As(err, &enf) {
 		return false
+	}
+
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		logger.Debug("mirror: cache open canceled", slog.Any("err", err))
+		return true
 	}
 
 	var eun *ifaces.ErrUnavailable
@@ -1092,6 +1112,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		}
 
 		s.fireOriginStreamCompleted(kind)
+		s.fireMirrorResponseCompleted(d, kind, "origin")
 		s.fireLiveStreamCompleted(d)
 		s.recordNegCacheSuccess(d)
 
@@ -1349,7 +1370,7 @@ func (s *livePeerStream) append(w http.ResponseWriter, src io.Reader, d digest.D
 		return 0, false, fmt.Errorf("peer resume size changed from %d to %d", s.totalSize, size)
 	}
 
-	written, err := io.Copy(s.verifier, reader)
+	written, err := streamcopy.CopyN(s.verifier, reader, s.totalSize-s.offset())
 	switch offset := s.offset(); {
 	case offset > s.totalSize:
 		return written, false, fmt.Errorf("peer stream exceeded content size: wrote %d, want %d", offset, s.totalSize)
@@ -1797,6 +1818,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 		s.bumpPeerFetch("hit")
 		s.bumpPeerFetchLatency("hit", fetchStart)
+		s.fireMirrorResponseCompleted(d, kind, "peer")
 		s.fireLiveStreamCompleted(d)
 
 		return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
@@ -2271,6 +2293,14 @@ func (s *Server) fireMirrorBytesServed(kind ifaces.OriginRefKind, source string,
 	}
 
 	s.metrics.onMirrorBytesServed(kind.MetricLabel(), source, bytes)
+}
+
+func (s *Server) fireMirrorResponseCompleted(d digest.Digest, kind ifaces.OriginRefKind, source string) {
+	if s.metrics.onMirrorResponseCompleted == nil {
+		return
+	}
+
+	s.metrics.onMirrorResponseCompleted(d, kind.MetricLabel(), source)
 }
 
 func (s *Server) fireOriginStreamStarted(kind ifaces.OriginRefKind) {

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -37,27 +38,45 @@ type streamCommitTracker struct {
 	verifyWindow    time.Duration
 	inventoryBudget time.Duration
 
-	onObserved func(n int)
-	onMissing  func(n int)
+	onObserved         func(n int)
+	onObservedDuration func(time.Duration)
+	onMissing          func(n int)
 
 	mu      sync.Mutex
-	pending map[string][]time.Time
+	pending map[string][]pendingStreamCommit
 }
 
-func newStreamCommitTracker(inv inventorySource, logger *slog.Logger, onObserved, onMissing func(n int)) *streamCommitTracker {
+type pendingStreamCommit struct {
+	completedAt time.Time
+	deadline    time.Time
+}
+
+type observedStreamCommit struct {
+	completedAt time.Time
+	duration    time.Duration
+}
+
+func newStreamCommitTracker(
+	inv inventorySource,
+	logger *slog.Logger,
+	onObserved func(n int),
+	onObservedDuration func(time.Duration),
+	onMissing func(n int),
+) *streamCommitTracker {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	return &streamCommitTracker{
-		inv:             inv,
-		logger:          logger.With(slog.String("subsystem", "stream_commit_tracker")),
-		probeInterval:   defaultStreamCommitProbeInterval,
-		verifyWindow:    defaultStreamCommitVerifyWindow,
-		inventoryBudget: defaultStreamCommitInventoryBudget,
-		onObserved:      onObserved,
-		onMissing:       onMissing,
-		pending:         map[string][]time.Time{},
+		inv:                inv,
+		logger:             logger.With(slog.String("subsystem", "stream_commit_tracker")),
+		probeInterval:      defaultStreamCommitProbeInterval,
+		verifyWindow:       defaultStreamCommitVerifyWindow,
+		inventoryBudget:    defaultStreamCommitInventoryBudget,
+		onObserved:         onObserved,
+		onObservedDuration: onObservedDuration,
+		onMissing:          onMissing,
+		pending:            map[string][]pendingStreamCommit{},
 	}
 }
 
@@ -67,7 +86,11 @@ func (t *streamCommitTracker) RecordCompleted(d digest.Digest) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.pending[d.String()] = append(t.pending[d.String()], time.Now().Add(t.verifyWindow))
+	completedAt := time.Now()
+	t.pending[d.String()] = append(t.pending[d.String()], pendingStreamCommit{
+		completedAt: completedAt,
+		deadline:    completedAt.Add(t.verifyWindow),
+	})
 }
 
 func (t *streamCommitTracker) Run(ctx context.Context) error {
@@ -123,25 +146,32 @@ func (t *streamCommitTracker) probe(parent context.Context) {
 	now := time.Now()
 	observed := 0
 	missing := 0
+	observedCommits := make([]observedStreamCommit, 0)
 
 	t.mu.Lock()
-	for ds, deadlines := range t.pending {
+	for ds, commits := range t.pending {
 		if _, ok := present[ds]; ok {
-			observed += len(deadlines)
+			observed += len(commits)
+			for _, commit := range commits {
+				observedCommits = append(observedCommits, observedStreamCommit{
+					completedAt: commit.completedAt,
+					duration:    now.Sub(commit.completedAt),
+				})
+			}
 
 			delete(t.pending, ds)
 
 			continue
 		}
 
-		kept := make([]time.Time, 0, len(deadlines))
-		for _, deadline := range deadlines {
-			if now.After(deadline) || now.Equal(deadline) {
+		kept := make([]pendingStreamCommit, 0, len(commits))
+		for _, commit := range commits {
+			if now.After(commit.deadline) || now.Equal(commit.deadline) {
 				missing++
 				continue
 			}
 
-			kept = append(kept, deadline)
+			kept = append(kept, commit)
 		}
 
 		if len(kept) == 0 {
@@ -155,6 +185,16 @@ func (t *streamCommitTracker) probe(parent context.Context) {
 
 	if observed > 0 && t.onObserved != nil {
 		t.onObserved(observed)
+	}
+
+	sort.Slice(observedCommits, func(i, j int) bool {
+		return observedCommits[i].completedAt.Before(observedCommits[j].completedAt)
+	})
+
+	if t.onObservedDuration != nil {
+		for _, commit := range observedCommits {
+			t.onObservedDuration(commit.duration)
+		}
 	}
 
 	if missing > 0 && t.onMissing != nil {

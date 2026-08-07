@@ -27,6 +27,7 @@ type shutdownDeps struct {
 	coordStop      func()
 	pullerPumpGate *pullerPumpGate
 	metricsHTTP    *http.Server
+	pprofHTTP      *http.Server
 	shutdownBudget time.Duration
 }
 
@@ -42,8 +43,8 @@ type shutdownDeps struct {
 // handlers up to the shutdown deadline.
 // 4. Wait for cdsub.Run + outstanding pull-pump advertise calls to
 // flush before libp2p is closed by the runAgent defer chain.
-// 5. Ops endpoint (Shutdown) - last so /readyz can keep reporting
-// NotReady while we drain.
+// 5. Profiling endpoint, then ops endpoint (Shutdown) - ops stays last so
+// /readyz can keep reporting NotReady while we drain.
 //
 // discovery.Close + members.Stop run from the runAgent defer chain
 // after this returns.
@@ -97,6 +98,12 @@ func gracefulShutdown(d shutdownDeps) {
 	case <-pumpDone:
 	case <-shutdownCtx.Done():
 		d.logger.Warn("puller-pump did not drain within shutdown budget")
+	}
+
+	if d.pprofHTTP != nil {
+		if err := d.pprofHTTP.Shutdown(shutdownCtx); err != nil {
+			d.logger.Warn("pprof shutdown error", slog.Any("err", err))
+		}
 	}
 
 	if err := d.metricsHTTP.Shutdown(shutdownCtx); err != nil {

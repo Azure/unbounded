@@ -16,6 +16,10 @@ We removed prior benchmark images before repeat samples, measured registry
 traffic at each Azure Private Endpoint, measured pod startup from AKS audit
 logs, and measured peer traffic from Gantry metrics.
 
+For a breakdown of where pod startup time is actually spent, and the effect of
+containerd download and unpack concurrency, see
+[PULL-LATENCY-ANALYSIS.md](PULL-LATENCY-ANALYSIS.md).
+
 
 ### ACR traffic
 
@@ -23,6 +27,10 @@ logs, and measured peer traffic from Gantry metrics.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1000 nodes - sample 1 | 40 GiB | 47.296 TB | 174.773 GB | 99.630% | 1002 / 4 | 99.601% |
 | 1000 nodes - sample 2 | 40 GiB | 47.566 TB | 174.781 GB | 99.633% | 1008 / 5 | 99.504% |
+| **1000 nodes - Canada Central ACR** | **40 GiB** | **47.178 TB** | **245.878 GB** | **99.479%** | **1000 / 2** | **99.800%** |
+| **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **45.008 TB** | **154.787 GB** | **99.656%** | **1000 / 2** | **99.800%** |
+| **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **47.165 TB** | **256.512 GB** | **99.456%** | **1000 / 4** | **99.600%** |
+| **1000 nodes - Canada Central, bounded coordination** <sup>5</sup> | **40 GiB** | **47.165 TB** | **945.400 GB** | **97.996%** | **1000 / 1** | **99.900%** |
 | **1000 nodes - UK South ACR** | **40 GiB** | **53.369 TB** | **219.262 GB** | **99.589%** | **1254 / 5** | **99.601%** |
 | **1000 nodes - East US ACR** | **40 GiB** | **47.562 TB** | **182.317 GB** | **99.617%** | **1004 / 4** | **99.602%** |
 | **1000 nodes - Central India ACR** <sup>1</sup> | **40 GiB** | **97.115 TB** | **803.184 GB** | **99.173%** | **2287 / 6** | **99.738%** |
@@ -46,6 +54,10 @@ aggregates below.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1000 nodes - sample 1 | 40 GiB | 682.725s | 1099.629s | 821.209s | 1171.863s | 1422.461s | 1885.385s | 42.700% slower |
 | 1000 nodes - sample 2 | 40 GiB | 894.597s | 1087.179s | 1065.724s | 1169.448s | 1652.704s | 1885.011s | 9.733% slower |
+| **1000 nodes - Canada Central ACR** | **40 GiB** | **1862.580s** | **774.028s** | **2030.636s** | **817.139s** | **2149.535s** | **891.766s** | **59.759% faster** |
+| **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **939.368s** | **1105.766s** | **1091.173s** | **1180.970s** | **1180.111s** | **1239.429s** | **8.229% slower** |
+| **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **759.746s** | **923.473s** | **867.850s** | **994.468s** | **956.492s** | **1058.555s** | **14.590% slower** |
+| **1000 nodes - Canada Central, bounded coordination** <sup>5</sup> | **40 GiB** | **759.746s** | **917.602s** | **867.850s** | **1001.609s** | **956.492s** | **1132.420s** | **15.413% slower** |
 | **1000 nodes - UK South ACR** | **40 GiB** | **3561.000s** | **1064.557s** | **3953.000s** | **1146.557s** | **5399.000s** | **1815.557s** | **70.995% faster** |
 | **1000 nodes - East US ACR** | **40 GiB** | **1401.026s** | **1065.950s** | **1655.894s** | **1144.771s** | **2351.081s** | **1831.832s** | **30.867% faster** |
 | **1000 nodes - Central India ACR** <sup>2</sup> | **40 GiB** | **3184.649s** | **1065.570s** | **4851.649s** | **1155.570s** | **5351.649s** | **1865.570s** | **76.182% faster** |
@@ -53,15 +65,72 @@ aggregates below.
 | 2000 nodes - sample 2 | 40 GiB | 939.834s | 1093.091s | 1141.022s | 1177.821s | 1724.219s | 1856.380s | 3.225% slower |
 | 2000 nodes - sample 3 | 40 GiB | 1241.331s | 1096.589s | 1472.041s | 1184.248s | 2131.053s | 1821.000s | 19.551% faster |
 
-Positive improvement means Gantry started pods faster. The configured gate was
-a maximum Gantry-to-baseline P95 ratio of 3.0, so all six audit-complete runs
-and the cross-region performance-only samples passed even when an unusually
-fast baseline made Gantry slower. The UK South and Central India rows use
-retained Kubernetes pod status timestamps; every other row, including East US,
-uses AKS audit timestamps.
+Positive improvement means Gantry started pods faster. Most rows used a maximum
+Gantry-to-baseline P95 ratio of 3.0. The three Canada Central follow-ups marked
+3 through 5 used a tightened ratio of 1.0 and reported FAIL on latency while
+passing their traffic and integrity gates. The UK South and Central India rows
+use retained Kubernetes pod status timestamps; every other row, including
+East US, uses AKS audit timestamps.
 
 <sup>2</sup> Central India latency uses retained Kubernetes pod status because
 the telemetry timeout occurred before the runner wrote its audit measurement.
+
+<sup>3</sup> Run `run-20260806-185139-9995e167`, reported **FAIL**. Byte and
+pull reduction were the strongest Canada Central results recorded, but the
+baseline was unusually fast: its P95 of 1091.173s is roughly half the 2030.636s
+of the earlier Canada Central sample, while Gantry landed at 1180.970s, close to
+the 1146.557s to 1184.248s that Gantry produces on nearly every run. The
+resulting P95 ratio of 1.0823 exceeded the 1.0 gate configured for this run,
+which the 3.0 gate used elsewhere would have passed. All 2000 pods across both
+phases succeeded with no image-pull backoff and no origin fallbacks. This
+sample also ran with the containerd transfer-service download concurrency
+override removed, so both phases used the containerd default of 3.
+
+<sup>4</sup> Run `run-20260806-205719-51c38730`, reported **FAIL**. Same cluster
+as footnote 3 with the containerd transfer-service override restored to 6
+concurrent downloads, isolating that one variable. Both phases got faster:
+baseline P95 improved 20.5% and Gantry P95 improved 15.8%. The remaining gap is
+Gantry's cold start: layer delivery takes four minutes to reach full rate while
+baseline is at full rate within one, costing about 2.6 minutes. Once warm,
+Gantry delivers faster than the registry. The P95 ratio was 1.1459 and exceeded
+the 1.0 gate this run used. All 2000 pods succeeded with no image-pull backoff
+and no origin fallbacks. See
+[PULL-LATENCY-ANALYSIS.md](PULL-LATENCY-ANALYSIS.md).
+
+<sup>5</sup> Gantry-only run `run-20260807-035224-b5d10f22`, reported
+**FAIL** against the retained baseline from footnote 4 because its P95 ratio
+was 1.154, above the strict 1.0 gate. All 1000 pods succeeded, no Gantry pod
+restarted, peer delivery reached 100% in minute 11, and no direct-origin
+fallback occurred. This run deployed the 15-minute absolute peer-fetch
+ceiling, three deterministic remote-prefetch coordinators, bounded 8/4/32
+bootstrap dialing with peer-ID address deduplication, authoritative Pod-IP
+replacement before coordination RPCs, and context-aware containerd storage
+error classification.
+
+The fixes removed the targeted failure signatures. Peer stalls fell from
+30,829 to zero; remote prefetch groups fell from 575,623 to 1,138 (880
+successful and 258 failed); bootstrap dial failures fell from 1,099,355 to
+2,088; and the 1,614 former `storage unavailable` warnings fell to zero. The
+configured 2% fanout remained intact: 801 layer origin pulls completed for 40
+layers and 20 selected seeds per layer, plus one extra completed layer copy.
+The higher 945.400 GB ACR figure is therefore expected seed traffic, not peer
+fallback. Compared with the immediately preceding Gantry-only run using the
+60-second ceiling, P50 increased 4.566%, P95 increased 5.794%, and ACR traffic
+changed by only +0.011%. The 15-minute ceiling removed false stall
+classification, but did not improve startup latency in this sample.
+
+Two issues remain visible in the complete all-pod log scan. One remote
+prefetch coordinator hit libp2p's default connection resource limit for 117
+groups, while another had 141 transient refusal/backoff failures; redundant
+dispatch still started every intended seed. Also, one canceled transfer-store
+open was logged at WARN and returned HTTP 500, so the transfer endpoint still
+needs the same cancellation handling already applied to the mirror endpoint.
+The 6,311 peer `notfound` outcomes were confined to the first 44 seconds and
+came from current healthy pods whose stale provider records preceded
+containerd inventory reconciliation. None of these observations caused a
+failed workload pod, origin fallback, digest mismatch, protocol error, or
+server-error peer outcome. This Gantry-only validation reuses the footnote 4
+baseline and is excluded from the aggregate independent-run statistics below.
 
 #### Latency excluding image-pull backoff
 
@@ -89,6 +158,10 @@ The unfiltered table remains the primary end-to-end result because
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1000 nodes - sample 1 | 40 GiB | 43.566 TB | 158.928 GB | 157 | 153 | 42,597 | 0 |
 | 1000 nodes - sample 2 | 40 GiB | 43.438 TB | 160.002 GB | 159 | 154 | 42,472 | 0 |
+| **1000 nodes - Canada Central ACR** | **40 GiB** | **42.735 TB** | **223.358 GB** | **214** | **212** | **41,791** | **0** |
+| **1000 nodes - Canada Central ACR rerun** <sup>3</sup> | **40 GiB** | **42.817 TB** | **140.672 GB** | **134** | **132** | **41,870** | **0** |
+| **1000 nodes - Canada Central ACR, 6 downloads** <sup>4</sup> | **40 GiB** | **42.734 TB** | **233.022 GB** | **223** | **219** | **41,789** | **0** |
+| **1000 nodes - Canada Central, bounded coordination** <sup>5</sup> | **40 GiB** | **42.153 TB** | **859.069 GB** | **806** | **801** | **41,250** | **0** |
 | **1000 nodes - East US ACR** | **40 GiB** | **43.137 TB** | **161.075 GB** | **159** | **155** | **42,179** | **0** |
 | **1000 nodes - Central India ACR** | **40 GiB** | **43.070 TB** | **709.766 GB** | **682** | **662** | **42,129** | **0** |
 | 2000 nodes - sample 1 | 40 GiB | 86.971 TB | 221.210 GB | 213 | 210 | 85,044 | 0 |

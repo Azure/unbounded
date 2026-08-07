@@ -97,6 +97,12 @@ type Config struct {
 	// and pod ports, not in the bind address.
 	MetricsListen string `yaml:"metrics_listen"`
 
+	// PprofListen is an optional Go runtime profiling endpoint. Empty disables
+	// profiling. When enabled it must bind loopback so profiles, command lines,
+	// and runtime state are reachable only through local access such as
+	// `kubectl port-forward`.
+	PprofListen string `yaml:"pprof_listen"`
+
 	// Libp2pListen is the multiaddr(s) the libp2p host advertises (the design doc).
 	// Empty means "use libp2p defaults" and pick at random.
 	Libp2pListen []string `yaml:"libp2p_listen"`
@@ -266,6 +272,19 @@ type Config struct {
 	// except by the number of eligible nodes.
 	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
 
+	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
+	// to a deterministic HRW-ranked subset of manifest consumers. Local
+	// self-selected pulls still run on every consumer. The default is 3.
+	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
+
+	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
+	// per manifest. Group dispatch is best effort and target-side deduplicated.
+	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
+
+	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
+	// node derives a stable delay in [0, jitter) from itself and the manifest.
+	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
+
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
 	// (HRW within the requester's zone) - the design doc / the design doc open question.
 	HRWTopologyScope string `yaml:"hrw_topology_scope"`
@@ -295,16 +314,11 @@ type Config struct {
 	CoordMaxConcurrentPulls int `yaml:"coord_max_concurrent_pulls"`
 
 	// PeerFetchTimeout caps the complete peer request, including streaming and
-	// committing the response body. It is deliberately SHORT (60s): a requester
-	// stuck on a lockstep-saturated seed must bail and re-select a fresher
-	// finisher-seed rather than ride the slow stream to completion. Live peer
-	// streams resume from the verified byte offset when re-selecting, so this
-	// deadline does not discard an already-delivered prefix. That bail-and-
-	// re-select is what drives the cold-start cascade (paired with the
-	// strict containerd hosts.toml, where an exhausted fetch 503s and containerd
-	// retries Gantry, re-discovering recent finishers). Setting this too high
-	// (e.g. 1h) removes the re-selection and collapses distribution to the
-	// single-seed bandwidth bound (the ~12min lockstep regression).
+	// committing the response body. The default is 15m so progressing large
+	// layers are not forced to switch providers at a size-dependent throughput
+	// threshold. The HTTP/2 transport separately probes connections after 10s
+	// without reads, so dead connections are detected before this safety ceiling.
+	// Live stream-through still preserves a verified prefix if the ceiling fires.
 	PeerFetchTimeout time.Duration `yaml:"peer_fetch_timeout"`
 
 	// PeerRediscoverBudget bounds the total wall-clock time the mirror keeps
@@ -446,6 +460,7 @@ func NewDefault() *Config {
 		MirrorBindAllowNonLoopback: false,
 		TransferListen:             "0.0.0.0:5001",
 		MetricsListen:              "0.0.0.0:9095",
+		PprofListen:                "",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
 
@@ -465,16 +480,19 @@ func NewDefault() *Config {
 
 		UpstreamRegistries: nil,
 
-		HRWK:                   3,
-		PrefetchPullerReplicas: 8,
-		PrefetchPullerFraction: 0,
-		HRWTopologyScope:       "cluster",
-		ZoneLabelKey:           "topology.kubernetes.io/zone",
+		HRWK:                        3,
+		PrefetchPullerReplicas:      8,
+		PrefetchPullerFraction:      0,
+		PrefetchCoordinatorReplicas: 3,
+		PrefetchMaxConcurrentGroups: 64,
+		PrefetchDispatchJitter:      time.Second,
+		HRWTopologyScope:            "cluster",
+		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
 		CoordPeerAuthzEnforce:       false,
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
-		PeerFetchTimeout:            60 * time.Second,
+		PeerFetchTimeout:            15 * time.Minute,
 		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
 		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
 		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
@@ -572,6 +590,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
+	setStr("PPROF_LISTEN", &c.PprofListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
 
 	setStr("NODE_NAME", &c.NodeName)
@@ -599,6 +618,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("HRW_K", &c.HRWK)
 	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
 	setFloat("PREFETCH_PULLER_FRACTION", &c.PrefetchPullerFraction)
+	setInt("PREFETCH_COORDINATOR_REPLICAS", &c.PrefetchCoordinatorReplicas)
+	setInt("PREFETCH_MAX_CONCURRENT_GROUPS", &c.PrefetchMaxConcurrentGroups)
+	setDur("PREFETCH_DISPATCH_JITTER", &c.PrefetchDispatchJitter)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
 	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
@@ -635,6 +657,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
+	fs.StringVar(&c.PprofListen, "pprof-listen", c.PprofListen, "optional loopback address for Go runtime profiles (empty disables pprof)")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
@@ -662,6 +685,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
 	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "fraction of eligible HRW nodes selected as initial pullers, rounded up (0 disables and uses --prefetch-puller-replicas)")
+	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "number of deterministic manifest consumers allowed to dispatch remote speculative prefetch groups")
+	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "maximum simultaneous outbound prefetch RPC groups per manifest")
+	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "maximum deterministic per-node delay before dispatching manifest prefetch")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
 	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
@@ -744,6 +770,22 @@ func (c *Config) Validate() error {
 	mustAddr("mirror_listen", c.MirrorListen)
 	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
+
+	if c.PprofListen != "" {
+		mustAddr("pprof_listen", c.PprofListen)
+
+		if host, portText, err := net.SplitHostPort(c.PprofListen); err == nil {
+			ip := net.ParseIP(host)
+			if host == "" || (ip != nil && !ip.IsLoopback()) || (ip == nil && host != "localhost") {
+				errs = append(errs, fmt.Errorf("pprof_listen %q must bind loopback (127.0.0.1, ::1, or localhost)", c.PprofListen))
+			}
+
+			port, portErr := strconv.Atoi(portText)
+			if portErr != nil || port < 1 || port > 65535 {
+				errs = append(errs, fmt.Errorf("pprof_listen %q must use a numeric port between 1 and 65535", c.PprofListen))
+			}
+		}
+	}
 
 	// MirrorListen MUST be loopback (the design doc, the design doc) unless the operator has
 	// explicitly opted in to a non-loopback bind. See the field comment on
@@ -847,6 +889,10 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("prefetch_puller_fraction: must be between 0 and 1, got %g", c.PrefetchPullerFraction))
 	}
 
+	if c.PrefetchCoordinatorReplicas < 1 {
+		errs = append(errs, fmt.Errorf("prefetch_coordinator_replicas: must be >= 1, got %d", c.PrefetchCoordinatorReplicas))
+	}
+
 	switch c.HRWTopologyScope {
 	case "cluster", "zone":
 	default:
@@ -855,6 +901,14 @@ func (c *Config) Validate() error {
 
 	if c.CoordMaxDigestsPerRequest < 1 {
 		errs = append(errs, fmt.Errorf("coord_max_digests_per_request: must be >= 1, got %d", c.CoordMaxDigestsPerRequest))
+	}
+
+	if c.PrefetchMaxConcurrentGroups < 1 {
+		errs = append(errs, fmt.Errorf("prefetch_max_concurrent_groups: must be >= 1, got %d", c.PrefetchMaxConcurrentGroups))
+	}
+
+	if c.PrefetchDispatchJitter < 0 {
+		errs = append(errs, fmt.Errorf("prefetch_dispatch_jitter: must be >= 0, got %v", c.PrefetchDispatchJitter))
 	}
 
 	if c.CoordMaxConcurrentPulls < 1 {

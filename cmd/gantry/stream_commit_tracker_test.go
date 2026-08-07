@@ -91,10 +91,17 @@ func TestStreamCommitTracker_ObservedAfterInventoryAppears(t *testing.T) {
 	d := trackerDigestOf([]byte("observed-after-stream"))
 	inv := &fakeInventorySource{}
 
-	var observed, missing int32
+	var observed, missing, durations int32
 
 	tracker := newStreamCommitTracker(inv, nil,
 		func(n int) { atomic.AddInt32(&observed, int32(n)) },
+		func(duration time.Duration) {
+			if duration <= 0 {
+				t.Errorf("observed duration = %s, want positive", duration)
+			}
+
+			atomic.AddInt32(&durations, 1)
+		},
 		func(n int) { atomic.AddInt32(&missing, int32(n)) },
 	)
 	tracker.probeInterval = 5 * time.Millisecond
@@ -111,6 +118,7 @@ func TestStreamCommitTracker_ObservedAfterInventoryAppears(t *testing.T) {
 	inv.SetCurrent(d)
 
 	waitForAtomic(t, &observed, 1)
+	waitForAtomic(t, &durations, 1)
 
 	if got := atomic.LoadInt32(&missing); got != 0 {
 		t.Fatalf("missing = %d, want 0", got)
@@ -125,6 +133,7 @@ func TestStreamCommitTracker_MissingAfterDeadline(t *testing.T) {
 
 	tracker := newStreamCommitTracker(inv, nil,
 		func(n int) { atomic.AddInt32(&observed, int32(n)) },
+		nil,
 		func(n int) { atomic.AddInt32(&missing, int32(n)) },
 	)
 	tracker.probeInterval = 5 * time.Millisecond
@@ -153,6 +162,7 @@ func TestStreamCommitTracker_RetriesAfterUnavailableInventory(t *testing.T) {
 
 	tracker := newStreamCommitTracker(inv, nil,
 		func(n int) { atomic.AddInt32(&observed, int32(n)) },
+		nil,
 		func(n int) { atomic.AddInt32(&missing, int32(n)) },
 	)
 	tracker.probeInterval = 5 * time.Millisecond
@@ -172,5 +182,32 @@ func TestStreamCommitTracker_RetriesAfterUnavailableInventory(t *testing.T) {
 
 	if got := atomic.LoadInt32(&missing); got != 0 {
 		t.Fatalf("missing = %d, want 0", got)
+	}
+}
+
+func TestStreamCommitTracker_ReportsLatestCompletedStreamLast(t *testing.T) {
+	earlier := trackerDigestOf([]byte("earlier"))
+	later := trackerDigestOf([]byte("later"))
+	inv := &fakeInventorySource{current: []digest.Digest{earlier, later}}
+
+	var durations []time.Duration
+
+	tracker := newStreamCommitTracker(inv, nil, nil, func(duration time.Duration) {
+		durations = append(durations, duration)
+	}, nil)
+	now := time.Now()
+	tracker.pending[earlier.String()] = []pendingStreamCommit{{
+		completedAt: now.Add(-2 * time.Second),
+		deadline:    now.Add(time.Minute),
+	}}
+	tracker.pending[later.String()] = []pendingStreamCommit{{
+		completedAt: now.Add(-time.Second),
+		deadline:    now.Add(time.Minute),
+	}}
+
+	tracker.probe(context.Background())
+
+	if len(durations) != 2 || durations[0] <= durations[1] {
+		t.Fatalf("durations = %v, want earlier completion before latest completion", durations)
 	}
 }

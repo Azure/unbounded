@@ -43,6 +43,9 @@ data:
     mirror_bind_allow_non_loopback: true
     transfer_listen: "0.0.0.0:5001"
     metrics_listen: "0.0.0.0:9095"
+    # Disabled by default. When enabled, Config.Validate requires a loopback
+    # bind; use kubectl port-forward rather than exposing this as a pod port.
+    pprof_listen: {{ default "" .PprofListen | quote }}
 
     # ---------- libp2p ----------
     # IPv4 wildcard listeners. The pods/patch self-announce only
@@ -140,6 +143,12 @@ data:
     # A positive fraction overrides prefetch_puller_replicas. There is no
     # maximum cap other than the eligible cluster/zone node count.
     prefetch_puller_fraction: 0.02
+    # Only three deterministic manifest consumers dispatch remote groups; all
+    # consumers still start any self-selected local seed. This bounds redundant
+    # fan-out without reducing the configured pullers per layer.
+    prefetch_coordinator_replicas: 3
+    prefetch_max_concurrent_groups: 64
+    prefetch_dispatch_jitter: "1s"
     # Coord peer authorization. Default false ships observe-only: an
     # inbound coord request from a peer not in the membership view only
     # increments p2p_coord_unauthorized_peer_total and is still served.
@@ -155,13 +164,10 @@ data:
     # one node. Each pull holds an HTTP body, containerd writer,
     # goroutine, and lease.
     coord_max_concurrent_pulls: 16
-    # Deliberately SHORT. A requester stuck on a lockstep-saturated seed must
-    # bail at this deadline and re-select a fresher finisher-seed rather than
-    # ride the slow stream to completion; that bail-and-re-select (with the
-    # strict containerd hosts.toml) drives the cold-start cascade. Too high
-    # (e.g. 1h) removes re-selection and collapses to single-seed bandwidth
-    # (the ~12min lockstep). Matches upstream gantry's hardcoded 60s.
-    peer_fetch_timeout: "60s"
+    # Safety ceiling for a complete peer request. Progressing large layers must
+    # not switch providers only because their total transfer exceeds 60s. The
+    # HTTP/2 transport separately probes connections after 10s without reads.
+    peer_fetch_timeout: "15m"
     # Peer re-discovery loop. On a cache miss the mirror repeatedly re-runs DHT
     # FindProviders and retries peer fetches for up to peer_rediscover_budget to
     # pick up finisher-seeds that advertise mid-swarm (the cold-start cascade),

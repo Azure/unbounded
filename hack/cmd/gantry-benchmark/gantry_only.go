@@ -642,6 +642,11 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	diagnosticsBefore, err := b.fetchGantryDiagnosticSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
 	writeAll(b.stdout, fmt.Sprintf("running Gantry-only cold pull on %d nodes\n", b.config.NodeCount))
 
 	job, err := b.runPullJob(ctx, state, proxyPhaseGantryCold, gantryImage)
@@ -673,15 +678,47 @@ func (b *benchmark) runGantryOnly(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	diagnosticsAfter, err := b.fetchGantryDiagnosticSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
+	diagnosticTimestamps, err := b.fetchGantryDiagnosticTimestamps(ctx, revision, telemetryWindow{
+		StartedAt:  job.PhaseStartedAt,
+		FinishedAt: job.PhaseFinishedAt,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := requireFinalLayerResponseTimestamps(diagnosticTimestamps, diagnosticsAfter.PodNodes); err != nil {
+		return err
+	}
+
+	diagnostics, err := subtractGantryDiagnosticSnapshots(diagnosticsBefore, diagnosticsAfter, diagnosticTimestamps)
+	if err != nil {
+		return err
+	}
+
 	bytes, bytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, proxyPhaseTotals{}, metrics, job)
+
+	performance, err := b.capturePhasePerformanceTelemetry(ctx, proxyPhaseGantryCold, job)
+	if err != nil {
+		return err
+	}
+
+	if err := b.writePerformanceTelemetryArtifact(state.RunID, proxyPhaseGantryCold, performance); err != nil {
+		return err
+	}
 
 	gantryResult := phaseResult{
 		RunID: state.RunID, Phase: proxyPhaseGantryCold, Image: gantryImage,
 		ImageSizeMiB: b.config.ImageSizeMiB, ImageLayers: b.config.ImageLayers,
 		PayloadSHA: state.WorkloadPayloadSHA256, WorkloadComparisonMode: state.WorkloadComparisonMode,
-		Gantry: metrics, GantryPeer: peer,
+		Gantry: metrics, GantryPeer: peer, GantryDiagnostics: diagnostics,
 		Azure: azurePhaseMeasurement{Window: telemetryWindow{StartedAt: windowStart, FinishedAt: windowFinish}},
-		Job:   job, OriginBytes: bytes, OriginBytesSource: bytesSource, RecordedAt: time.Now().UTC(),
+		Job:   job, OriginBytes: bytes, OriginBytesSource: bytesSource,
+		PerformanceTelemetryArtifact: string(proxyPhaseGantryCold) + "-performance.json", RecordedAt: time.Now().UTC(),
 	}
 	if b.config.AzureTelemetry {
 		if err := b.collectAndPersistAzurePhase(ctx, &gantryResult, "gantry-cold.json"); err != nil {

@@ -368,6 +368,86 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 		}
 	}
 
+	monitoringChecks := []struct {
+		description string
+		query       string
+	}{
+		{
+			description: "node-exporter identity",
+			query:       fmt.Sprintf(`count(node_uname_info{namespace=%q,gantry_benchmark="true"})`, b.config.Namespace),
+		},
+		{
+			description: "host disk throughput",
+			query:       fmt.Sprintf(`count(count by(pod) (node_disk_written_bytes_total{namespace=%q,gantry_benchmark="true"}))`, b.config.Namespace),
+		},
+		{
+			description: "host network throughput",
+			query:       fmt.Sprintf(`count(count by(pod) (node_network_receive_bytes_total{namespace=%q,gantry_benchmark="true",device!="lo"}))`, b.config.Namespace),
+		},
+		{
+			description: "host network link speed",
+			query:       fmt.Sprintf(`count(count by(pod) (node_network_speed_bytes{namespace=%q,gantry_benchmark="true",device!="lo"} > 0))`, b.config.Namespace),
+		},
+		{
+			description: "containerd build",
+			query:       fmt.Sprintf(`count(containerd_build_info_total{namespace=%q,gantry_benchmark="true"})`, b.config.Namespace),
+		},
+		{
+			description: "Gantry response completion",
+			query: fmt.Sprintf(
+				`count(count by(pod) (gantry_mirror_response_completed_timestamp_seconds{namespace=%q,kind="layer",gantry_benchmark="true",controller_revision_hash=%q}))`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry peer busy and stall outcomes",
+			query: fmt.Sprintf(
+				`count(count by(pod) (p2p_peer_fetch_total{namespace=%q,outcome=~"busy|stall",gantry_benchmark="true",controller_revision_hash=%q}))`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry peer busy and stall timestamps",
+			query: fmt.Sprintf(
+				`count(count by(pod) (gantry_peer_fetch_last_timestamp_seconds{namespace=%q,outcome=~"busy|stall",gantry_benchmark="true",controller_revision_hash=%q}))`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry DHT lookup durations",
+			query: fmt.Sprintf(
+				`count(count by(pod) (p2p_dht_lookup_duration_seconds_count{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q}))`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry containerd commit observation",
+			query: fmt.Sprintf(
+				`count(gantry_containerd_commit_observation_duration_seconds_count{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+		{
+			description: "Gantry latest containerd commit observation duration",
+			query: fmt.Sprintf(
+				`count(gantry_containerd_commit_latest_observation_duration_seconds{namespace=%q,gantry_benchmark="true",controller_revision_hash=%q})`,
+				b.config.GantryNamespace,
+				revision,
+			),
+		},
+	}
+
+	for _, check := range monitoringChecks {
+		if err := b.waitForPrometheusMetricCoverage(ctx, check.description, check.query); err != nil {
+			return err
+		}
+	}
+
 	// Direct mode has no proxy, so there are no proxy samples to wait for. The
 	// Gantry scrape checks above already prove the benchmark PodMonitor is
 	// being honoured by Prometheus.
@@ -396,6 +476,65 @@ func (b *benchmark) checkMonitoring(ctx context.Context, state benchmarkState) e
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (b *benchmark) waitForPrometheusMetricCoverage(ctx context.Context, description, query string) error {
+	pollContext, cancel := context.WithTimeout(ctx, b.config.TelemetryTimeout)
+	defer cancel()
+
+	var (
+		count    float64
+		queryErr error
+	)
+
+	for {
+		count, queryErr = b.queryPrometheus(pollContext, query)
+		if queryErr == nil && int(count) == b.config.NodeCount {
+			return nil
+		}
+
+		if queryErr == nil {
+			writeAll(b.stdout, fmt.Sprintf(
+				"waiting for Prometheus %s coverage: %.0f/%d observer pods\n",
+				description,
+				count,
+				b.config.NodeCount,
+			))
+		}
+
+		timer := time.NewTimer(b.config.TelemetryPollInterval)
+		select {
+		case <-pollContext.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			if queryErr != nil {
+				return fmt.Errorf(
+					"prometheus %s metrics were not queryable before %s: %w",
+					description,
+					b.config.TelemetryTimeout,
+					queryErr,
+				)
+			}
+
+			return fmt.Errorf(
+				"prometheus reports %s metrics for %.0f/%d observer pods after waiting %s",
+				description,
+				count,
+				b.config.NodeCount,
+				b.config.TelemetryTimeout,
+			)
+		case <-timer.C:
 		}
 	}
 }
@@ -465,6 +604,33 @@ type azureDiagnosticSetting struct {
 	} `json:"logs"`
 }
 
+func decodeAzureDiagnosticSettings(raw []byte) ([]azureDiagnosticSetting, error) {
+	if strings.HasPrefix(strings.TrimSpace(string(raw)), "[") {
+		var settings []azureDiagnosticSetting
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			return nil, err
+		}
+
+		return settings, nil
+	}
+
+	var envelope struct {
+		Value []struct {
+			Properties azureDiagnosticSetting `json:"properties"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, err
+	}
+
+	settings := make([]azureDiagnosticSetting, 0, len(envelope.Value))
+	for _, entry := range envelope.Value {
+		settings = append(settings, entry.Properties)
+	}
+
+	return settings, nil
+}
+
 func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
 	output, err := b.commands.Run(
 		ctx,
@@ -477,18 +643,12 @@ func (b *benchmark) checkAKSAuditDiagnosticSetting(ctx context.Context) error {
 		return fmt.Errorf("read AKS diagnostic settings: %w", err)
 	}
 
-	var settings struct {
-		Value []struct {
-			Properties azureDiagnosticSetting `json:"properties"`
-		} `json:"value"`
-	}
-	if err := json.Unmarshal(output, &settings); err != nil {
+	settings, err := decodeAzureDiagnosticSettings(output)
+	if err != nil {
 		return fmt.Errorf("decode AKS diagnostic settings: %w", err)
 	}
 
-	for _, entry := range settings.Value {
-		setting := entry.Properties
-
+	for _, setting := range settings {
 		if !strings.EqualFold(setting.LogAnalyticsDestinationType, "Dedicated") || setting.WorkspaceID == "" {
 			continue
 		}

@@ -1,19 +1,57 @@
 # Gantry ACR benchmark
 
-This workflow compares direct ACR image distribution with Gantry on an
-existing 300-node test cluster. It is adapted from the standalone Gantry demo
-that produced the project's published 300-node results.
+## Repeatable full-stack deployment
 
-The workflow does not provision AKS, create ACR, or install Gantry. It expects:
+Use `deploy.sh` as the only entrypoint for creating or reconciling the Azure and
+Kubernetes infrastructure needed by this benchmark. Do not recreate the setup
+from commands copied out of the playbook or shell history.
 
-- Exactly 300 Ready, schedulable `linux/amd64` nodes.
-- A Ready `gantry-system/gantry` DaemonSet on all 300 nodes.
+```bash
+cp hack/gantry-benchmark/deploy.env.example hack/gantry-benchmark/deploy.env
+# Edit the subscription, deployment name, and globally unique ACR names.
+
+make -C hack/gantry-benchmark deploy-plan
+make -C hack/gantry-benchmark deploy
+make -C hack/gantry-benchmark deploy-status
+```
+
+The script is idempotent and rejects existing resources whose topology differs
+from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
+dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch
+images, containerd settings, deterministic node-side ACR routing, bounded
+Prometheus discovery, Gantry, and the private operator VM. It leaves the stack
+preflight-ready by default; set `START_BENCHMARK=true` in `deploy.env` only when
+the same invocation should start the benchmark after every deployment gate
+passes.
+
+The deployment config contains names and topology only. Credentials remain in
+Azure managed identities and short-lived ACR tokens.
+
+The workstation needs one valid Azure management-plane login before invoking
+`deploy.sh`; the script never invokes `az login`, `az acr login`, or workstation
+Podman. It publishes only the revision-labelled source carrier through an ACR
+Task, creates Private Endpoints and disables public registry access, then
+bootstraps the private operator VM. Gantry and pull-probe images are built and
+pushed from that VM with its managed identity over Private Link.
+
+The sections below document benchmark behavior and direct lifecycle control.
+They do not replace `deploy.sh`; commands that assume an existing cluster are
+for diagnosis or manual operation after full-stack deployment succeeds.
+
+When invoking the benchmark tool directly, it expects:
+
+- Exactly `BENCHMARK_NODE_COUNT` Ready, schedulable `linux/amd64` nodes.
+- A Ready `gantry-system/gantry` DaemonSet on every benchmark node.
 - A dedicated Gantry ACR listed exactly once in Gantry's
   `upstream_registries` configuration, plus a different baseline ACR.
 - kube-prometheus-stack, the Prometheus Operator CRDs, kube-state-metrics, and
   a Grafana dashboard sidecar. The workflow installs benchmark-owned
   PodMonitors for Gantry and, in proxy mode, the proxy.
 - Containerd configured to read `/etc/containerd/certs.d`.
+- Containerd metrics listening on `0.0.0.0:10257` and debug logging enabled.
+  The managed node template in this repository configures both. Preflight
+  refuses to run without a containerd scrape from every target node, and the
+  node-observer DaemonSet fails if effective containerd log level is not debug.
 - A private operator VM in the AKS VNet. The VM runs every benchmark command,
   builds and pushes both images, queries Azure telemetry, and stores artifacts.
 - Cluster permission to create privileged hostPath DaemonSets. Proxy mode also
@@ -22,8 +60,9 @@ The workflow does not provision AKS, create ACR, or install Gantry. It expects:
 For source-authoritative Azure measurements, set
 `BENCHMARK_AZURE_TELEMETRY=true`. This additionally requires:
 
-- Both ACRs reachable only through their own approved Private Endpoints, with
-  public access disabled throughout. The operator VM reaches both ACRs over
+- Both ACRs reachable only through their own approved Private Endpoints before
+  operator and benchmark validation, with public access disabled throughout
+  image preparation and measurement. The operator VM reaches both ACRs over
   Private Link while preparing and measuring the images.
 - A Log Analytics workspace receiving `ContainerRegistryRepositoryEvents` and
   `AKSAuditAdmin` in resource-specific tables.
@@ -87,6 +126,44 @@ hostnames alone do not isolate containerd's digest-addressed cache; the
 phase-specific layer paths provide that isolation while preserving identical
 payload bytes.
 
+## Performance attribution artifacts
+
+`enable` installs a benchmark-owned node-observer DaemonSet on every target
+node. It exposes node-exporter metrics, provides a Prometheus target for the
+host containerd metrics endpoint, and streams a filtered subset of the host
+containerd journal. Preflight requires both `node_uname_info` and
+`containerd_build_info_total` from every observer pod.
+
+Each phase writes `<phase>-performance.json` with the unmodified Prometheus
+range-query envelopes at 10-second resolution for:
+
+- host disk bytes, I/O busy time, CPU, memory, and network bytes/errors;
+- containerd process and built-in metrics;
+- per-Gantry-pod peer outcomes and durations;
+- exact latest peer busy/stall event timestamps plus interval counts;
+- per-Gantry-pod DHT outcomes and durations;
+- mirror bytes and final response-completion timestamps; and
+- stream-completion-to-containerd-inventory observation distributions and
+  latest measured durations.
+
+The same artifact includes the observer-pod-to-node map, raw filtered
+containerd journal, and phase-bounded structured events for `PullImage`,
+successful pull completion, no-progress cancellation, `layer unpacked`, and
+`image unpacked`. Capture fails unless every observer pod has an event in the
+phase window. Containerd's
+`layer unpacked` duration spans fetch, apply, and snapshot commit; it is not a
+pure filesystem-write duration. Host disk metrics provide the independent
+filesystem pressure signal during that span.
+
+Phase JSON also includes:
+
+- exact per-workload-pod container start/finish timestamps and node names; and
+- per-Gantry-pod counter deltas and phase-local timestamp gauges.
+
+These two node maps are the supported join key for correlating peer busy/stall
+events, DHT latency, final layer-response time, containerd commit observation,
+containerd unpack logs, host resource use, and workload startup latency.
+
 ## Lifecycle
 
 All lifecycle commands run on the operator VM under its system-assigned managed
@@ -120,21 +197,156 @@ az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" \
 Follow progress from the workstation in a separate terminal:
 
 ```bash
-export OPERATOR_SSH_HOST="<operator-public-ip>"
-export OPERATOR_SSH_KEY="tmp/gantry-benchmark-ssh-key"
+export AZURE_RESOURCE_GROUP="<resource-group>"
+export OPERATOR_VM_NAME="gantry-benchmark-operator"
 make -C hack/gantry-benchmark operator-vm-watch
 ```
 
-SSH mode is preferred because each refresh is immediate. The operator VM SSH
-NSG rule must allow TCP/22 only from the current workstation `/32`. If
-`OPERATOR_SSH_HOST` is unset, the watcher falls back to Azure Run Command using
-`AZURE_RESOURCE_GROUP` and `OPERATOR_VM_NAME`.
+The full-stack deployment gives the operator VM no public IP. Azure Run Command
+is the default status transport. SSH is optional only when the operator has
+deliberately provided private network connectivity to the VM.
 
 The live view reports the lifecycle stage and start time, immutable run shape,
-payload files/bytes/percentage, active Podman build or push, VM disk usage,
-Kubernetes Job completion, Gantry readiness, recent logs, and the final report.
-Use `operator-vm-status` for a single snapshot. Override the refresh cadence
-with `WATCH_INTERVAL_SECONDS` (default 30).
+payload files/bytes/percentage, each baseline and Gantry-cold image reference,
+image size, layer count, build/push state, completed digest, active image
+operation and elapsed time, per-phase Kubernetes Job completion, Gantry
+readiness, recent logs, and the final report. Podman 4.9 does not expose a
+machine-readable live push byte percentage, so the view reports that limitation
+instead of estimating it. Use `operator-vm-status` for a single snapshot.
+Override the refresh cadence with `WATCH_INTERVAL_SECONDS` (default 30).
+
+For the Gantry pull phase, use the dedicated live monitor from the workstation:
+
+```bash
+make -C hack/gantry-benchmark monitor
+```
+
+It redraws every second and shows per-phase-minute peer outcomes (`busy`,
+`hit`, `stall`, `notfound`, `unavailable`) alongside layer bytes, aggregate
+and per-node throughput, cumulative payload percentage, and live Pod counts for
+completed, running, creating, image-pull failures, and failed Pods. Pod counts
+come from one Kubernetes list followed by watch events rather than polling all
+1000 Pod objects.
+
+Two node-paged grids show the current image in detail. The layer-by-node grid
+uses `.` for pending and `0-9/A-Z` for the phase minute when Gantry finished
+writing that layer to the node's containerd client (`Z` means minute 35 or
+later). The image-by-node grid uses `.` for not started, `0` for started,
+`1-9` for unpacked-layer deciles, and `#` after containerd reports the image
+unpacked.
+
+The same node page shows one-minute CPU utilization averaged across cores and
+current memory-used percentage (`1 - MemAvailable / MemTotal`) for every node
+as `0-9` deciles, plus fleet p50, p95, and maximum values. These resource
+values advance at the 10-second Prometheus scrape cadence. Node columns are
+sorted and identified by their three-character
+suffix. The default page width follows the terminal, bounded to 16-96 nodes.
+Select another page or a fixed width with, for example:
+
+```bash
+make -C hack/gantry-benchmark monitor \
+  MONITOR_ARGS="--node-page 2 --nodes-per-page 64"
+```
+
+The header uses ANSI emphasis on a TTY and remains plain when redirected or
+piped. The monitor uses one server-side aggregated Prometheus range query per
+display refresh and one exact-image progress query every 10 seconds. Prometheus
+scrapes at 10-second cadence, so the screen updates each second while grid and
+counter values advance at scrape cadence.
+Use `MONITOR_ARGS="--once --no-clear"` for a single non-interactive snapshot.
+
+### Gantry CPU profiles
+
+Benchmark deployments enable Go pprof on each Gantry pod at the loopback-only
+address `127.0.0.1:6060`. It is not declared as a pod port and is reachable
+from the workstation only through `kubectl port-forward`. During an active
+Gantry-cold phase, capture concurrent CPU profiles from the three nodes with
+the highest one-minute CPU utilization:
+
+```bash
+make -C hack/gantry-benchmark profile-gantry
+```
+
+Override the sample duration and node count with `GANTRY_PPROF_SECONDS` and
+`GANTRY_PPROF_COUNT`. The command stores individual and merged protobuf
+profiles plus text reports under `tmp/gantry-pprof/<run>-<timestamp>/` and
+prints the merged top functions. Open the merged profile interactively with
+the `go tool pprof -http=...` command printed at completion.
+
+CPU profiling adds runtime overhead to the selected pods. Treat a profiled
+run as diagnostic and do not use it for benchmark comparisons. The sampler
+annotates the active Job with the capture timestamp, duration, requested pod
+count, and successfully captured pod count so the diagnostic status remains
+visible after the run finishes. If one target fails, two or more valid profiles
+are still merged and the failed target's port-forward log is retained.
+
+## Reusable Gantry image pool
+
+For a one-off Gantry-only run that creates a brand-new random 40 GiB image
+inside the lifecycle, use the retained baseline without involving the image
+pool:
+
+```bash
+AZURE_RESOURCE_GROUP=vapa-gantry-benchmark1 \
+OPERATOR_VM_NAME=gantry-benchmark-operator \
+GANTRY_ONLY_BASELINE_RUN_ID=run-20260806-205719-51c38730 \
+make -C hack/gantry-benchmark operator-vm-run-fresh
+```
+
+Gantry-only benchmarks can consume prebuilt images instead of generating,
+building, and pushing 40 GiB during every benchmark lifecycle. Start a batch
+on the operator VM from the workstation:
+
+```bash
+AZURE_RESOURCE_GROUP=vapa-gantry-benchmark1 \
+OPERATOR_VM_NAME=gantry-benchmark-operator \
+GANTRY_IMAGE_POOL_COUNT=10 \
+make -C hack/gantry-benchmark operator-vm-prebuild
+```
+
+The command starts `gantry-benchmark-image-builder.service` asynchronously.
+The builder authenticates its managed identity once, generates each random
+payload sequentially, pushes each image to the Gantry ACR, records its
+immutable digest and payload SHA-256, removes the local image, and deletes the
+40 GiB build context before starting the next image. Durable pool metadata
+lives under `/var/lib/gantry-benchmark/image-pool`; transient build data lives
+on the `/opt/gantry-benchmark` build disk.
+
+Use the bounded status view while it runs:
+
+```bash
+AZURE_RESOURCE_GROUP=vapa-gantry-benchmark1 \
+OPERATOR_VM_NAME=gantry-benchmark-operator \
+make -C hack/gantry-benchmark operator-vm-image-pool-status
+```
+
+Start a Gantry-only benchmark with the oldest compatible ready image:
+
+```bash
+AZURE_RESOURCE_GROUP=vapa-gantry-benchmark1 \
+OPERATOR_VM_NAME=gantry-benchmark-operator \
+GANTRY_ONLY_BASELINE_RUN_ID=run-20260806-205719-51c38730 \
+make -C hack/gantry-benchmark operator-vm-run-pool
+```
+
+The benchmark restores the retained baseline metadata automatically, atomically
+moves one image from `ready/` to `claimed/`, and adopts its immutable digest.
+Claimed images are never offered to a later run, preserving the cache-cold
+contract. Pool adoption performs no image build, push, or registry credential
+exchange inside the benchmark lifecycle.
+
+Pool building and benchmark execution are mutually exclusive on one operator
+VM. Both services hold the same lifecycle lock, and the builder also refuses
+to run while a benchmark state exists. This is required for measurement
+correctness: pushing another image to the Gantry ACR during a measured phase
+would produce unrelated repository events and invalidate the Azure telemetry
+completeness gate. Build the 5-10 image batch before starting benchmark runs,
+not concurrently with them.
+
+For direct CLI use with an already-authenticated container engine, the
+equivalent targets are `prebuild-gantry`, `image-pool-status`, and
+`prepare-gantry-pool`. Configure metadata and scratch locations with
+`BENCHMARK_IMAGE_POOL_ROOT` and `BENCHMARK_IMAGE_POOL_BUILD_ROOT`.
 
 Artifacts persist on the VM under
 `/var/lib/gantry-benchmark/artifacts/<run-id>/`; `latest` points at the newest

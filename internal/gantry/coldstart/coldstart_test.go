@@ -146,7 +146,7 @@ func buildResolver(t *testing.T, coord ifaces.Coordinator, disco coldstart.Disco
 
 // buildResolverWithReplicas mirrors buildResolver but sets
 // PrefetchPullerReplicas so prefetch fan-out can be exercised.
-func buildResolverWithReplicas(t *testing.T, coord ifaces.Coordinator, disco coldstart.Discovery, self ifaces.NodeID, members []ifaces.Node, replicas int) *coldstart.Resolver {
+func buildResolverWithReplicas(t *testing.T, coord ifaces.Coordinator, disco coldstart.Discovery, self ifaces.NodeID, members []ifaces.Node, replicas int, metrics coldstart.MetricsHooks) *coldstart.Resolver {
 	t.Helper()
 
 	mems := fakes.NewMembers(self, members...)
@@ -162,6 +162,7 @@ func buildResolverWithReplicas(t *testing.T, coord ifaces.Coordinator, disco col
 		HrwK:                   3,
 		HrwScope:               hrw.ScopeCluster,
 		PrefetchPullerReplicas: replicas,
+		Metrics:                metrics,
 		QueryTimeout:           200 * time.Millisecond,
 		PollManifest:           20 * time.Millisecond,
 		PollLayer:              50 * time.Millisecond,
