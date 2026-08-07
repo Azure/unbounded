@@ -223,16 +223,26 @@ for index in "${!targets[@]}"; do
   profile_pids+=("$!")
 done
 
-profile_status=0
+failed_profiles=0
 for profile_pid in "${profile_pids[@]}"; do
-  wait "$profile_pid" || profile_status=1
+  wait "$profile_pid" || failed_profiles=$((failed_profiles + 1))
 done
-((profile_status == 0)) || {
-  echo "one or more Gantry CPU profiles failed; inspect $output/*/port-forward.log" >&2
-  exit 1
-}
 
 mapfile -t profiles < <(find "$output" -mindepth 2 -maxdepth 2 -type f -name cpu.pb.gz | sort)
+captured_profiles=${#profiles[@]}
+"$KUBECTL" -n "$BENCHMARK_NAMESPACE" annotate job "$job_name" \
+  gantry.unbounded-cloud.io/cpu-profile-captured-pods="$captured_profiles" \
+  --overwrite >/dev/null
+
+((captured_profiles >= 2)) || {
+  echo "captured $captured_profiles/$GANTRY_PPROF_COUNT Gantry CPU profiles; need at least 2 to merge" >&2
+  echo "inspect $output/*/port-forward.log" >&2
+  exit 1
+}
+if ((failed_profiles > 0)); then
+  echo "warning: captured $captured_profiles/$GANTRY_PPROF_COUNT profiles; inspect failed target logs under $output" >&2
+fi
+
 go tool pprof -proto -output="$output/merged.pb.gz" "${profiles[@]}"
 go tool pprof -top -nodecount=100 "$output/merged.pb.gz" >"$output/merged-top.txt"
 

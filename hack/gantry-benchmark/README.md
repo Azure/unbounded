@@ -275,8 +275,10 @@ the `go tool pprof -http=...` command printed at completion.
 
 CPU profiling adds runtime overhead to the selected pods. Treat a profiled
 run as diagnostic and do not use it for benchmark comparisons. The sampler
-annotates the active Job with the capture timestamp, duration, and pod count so
-the diagnostic status remains visible after the run finishes.
+annotates the active Job with the capture timestamp, duration, requested pod
+count, and successfully captured pod count so the diagnostic status remains
+visible after the run finishes. If one target fails, two or more valid profiles
+are still merged and the failed target's port-forward log is retained.
 
 ## Reusable Gantry image pool
 
