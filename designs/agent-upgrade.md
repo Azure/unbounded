@@ -98,10 +98,10 @@ Old process exits, new daemon starts
 
 The daemon reads `spec.parameters["downloadURL"]` and the optional
 `spec.parameters["sha256"]` from the `MachineOperation`, resolves the current
-binary target, and calls `agentbinary.InstallAndSwitchFromTarGzWithOptions`.
+binary target, and calls `agentbinary.InstallAndSwitchFromTarGz`.
 Logs and errors omit URL query and fragment data.
 
-`InstallAndSwitchFromTarGzWithOptions` performs the upgrade as one logical operation:
+`InstallAndSwitchFromTarGz` performs the upgrade as one logical operation:
 
 1. Require an HTTP or HTTPS URL and verify the compressed-archive SHA-256 when provided.
 2. Download the tarball within the configured size bound.

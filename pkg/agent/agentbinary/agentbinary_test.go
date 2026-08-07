@@ -83,7 +83,18 @@ func TestInstallAndSwitchFromTarGz(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	if err := InstallAndSwitchFromTarGz(t.Context(), server.URL, paths, 0o755); err != nil {
+	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), Layout{
+		BinaryPath:   paths.BinaryPath,
+		BluePath:     paths.BluePath,
+		GreenPath:    paths.GreenPath,
+		CurrentPath:  paths.CurrentPath,
+		LastGoodPath: paths.LastGoodPath,
+	}, InstallOptions{
+		DownloadURL:    server.URL,
+		ExpectedMember: goalstates.AgentUpgradeBinaryName,
+		Mode:           0o755,
+	})
+	if err != nil {
 		t.Fatalf("InstallAndSwitchFromTarGz: %v", err)
 	}
 

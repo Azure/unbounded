@@ -45,7 +45,7 @@ func TestInstallAndSwitchFromTarGzWithOptions(t *testing.T) {
 
 	digest := sha256.Sum256(payload)
 
-	result, err := InstallAndSwitchFromTarGzWithOptions(t.Context(), slog.Default(), paths, InstallOptions{
+	result, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
 		DownloadURL:       server.URL + "/agent.tar.gz?sig=secret",
 		ExpectedSHA256:    fmt.Sprintf("%x", digest),
 		ExpectedMember:    "custom-agent",
@@ -56,7 +56,7 @@ func TestInstallAndSwitchFromTarGzWithOptions(t *testing.T) {
 		HTTPClient:        server.Client(),
 	})
 	if err != nil {
-		t.Fatalf("InstallAndSwitchFromTarGzWithOptions: %v", err)
+		t.Fatalf("InstallAndSwitchFromTarGz: %v", err)
 	}
 
 	if result.PreviousPath != paths.BluePath || result.CurrentPath != paths.GreenPath {
@@ -133,8 +133,8 @@ func TestInstallAndSwitchFromTarGzWithOptionsRejectsInvalidInputs(t *testing.T) 
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if _, err := InstallAndSwitchFromTarGzWithOptions(t.Context(), slog.Default(), paths, opts); err == nil {
-				t.Fatal("InstallAndSwitchFromTarGzWithOptions error = nil")
+			if _, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, opts); err == nil {
+				t.Fatal("InstallAndSwitchFromTarGz error = nil")
 			}
 		})
 	}
@@ -144,17 +144,17 @@ func TestValidateLayout(t *testing.T) {
 	t.Parallel()
 
 	paths := secureUpgradeTestPaths(t)
-	if err := ValidateLayout(paths); err != nil {
+	if err := validateLayout(paths); err != nil {
 		t.Fatalf("ValidateLayout: %v", err)
 	}
 
 	paths.BinaryPath = ""
-	if err := ValidateLayout(paths); err != nil {
+	if err := validateLayout(paths); err != nil {
 		t.Fatalf("ValidateLayout without optional BinaryPath: %v", err)
 	}
 
 	paths.LastGoodPath = paths.CurrentPath
-	if err := ValidateLayout(paths); err == nil {
+	if err := validateLayout(paths); err == nil {
 		t.Fatal("ValidateLayout duplicate path error = nil")
 	}
 }
@@ -179,7 +179,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsRejectsUnexpectedMember(t *testing.
 
 	digest := sha256.Sum256(payload)
 
-	_, err := InstallAndSwitchFromTarGzWithOptions(t.Context(), slog.Default(), paths, InstallOptions{
+	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
 		DownloadURL:    server.URL + "/agent.tar.gz",
 		ExpectedSHA256: fmt.Sprintf("%x", digest),
 		ExpectedMember: "custom-agent",
@@ -222,7 +222,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsPreservesCurrentOnVerificationFailu
 				digest = fmt.Sprintf("%x", sum)
 			}
 
-			_, err := InstallAndSwitchFromTarGzWithOptions(t.Context(), slog.Default(), paths, InstallOptions{
+			_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
 				DownloadURL:    server.URL + "/agent.tar.gz?sig=secret",
 				ExpectedSHA256: digest,
 				ExpectedMember: "custom-agent",
@@ -230,7 +230,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsPreservesCurrentOnVerificationFailu
 				HTTPClient:     server.Client(),
 			})
 			if err == nil {
-				t.Fatal("InstallAndSwitchFromTarGzWithOptions error = nil")
+				t.Fatal("InstallAndSwitchFromTarGz error = nil")
 			}
 
 			if strings.Contains(err.Error(), "secret") {
@@ -267,7 +267,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsPreservesDistinctLastGoodOnCandidat
 
 	digest := sha256.Sum256(payload)
 
-	_, err := InstallAndSwitchFromTarGzWithOptions(t.Context(), slog.Default(), paths, InstallOptions{
+	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
 		DownloadURL:    server.URL + "/agent.tar.gz",
 		ExpectedSHA256: fmt.Sprintf("%x", digest),
 		ExpectedMember: "custom-agent",
@@ -275,7 +275,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsPreservesDistinctLastGoodOnCandidat
 		HTTPClient:     server.Client(),
 	})
 	if err == nil {
-		t.Fatal("InstallAndSwitchFromTarGzWithOptions error = nil")
+		t.Fatal("InstallAndSwitchFromTarGz error = nil")
 	}
 
 	assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
@@ -315,8 +315,8 @@ func TestInstallAndSwitchFromTarGzWithOptionsEnforcesSizeLimits(t *testing.T) {
 			opts.DownloadURL = server.URL + "/agent.tar.gz"
 
 			opts.HTTPClient = server.Client()
-			if _, err := InstallAndSwitchFromTarGzWithOptions(t.Context(), slog.Default(), paths, opts); err == nil {
-				t.Fatal("InstallAndSwitchFromTarGzWithOptions error = nil")
+			if _, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, opts); err == nil {
+				t.Fatal("InstallAndSwitchFromTarGz error = nil")
 			}
 
 			assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
@@ -346,7 +346,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsRejectsUnsafeAndDuplicateMembers(t 
 			}))
 			t.Cleanup(server.Close)
 
-			_, err := InstallAndSwitchFromTarGzWithOptions(t.Context(), slog.Default(), paths, InstallOptions{
+			_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
 				DownloadURL:    server.URL + "/agent.tar.gz",
 				ExpectedSHA256: fmt.Sprintf("%x", digest),
 				ExpectedMember: "custom-agent",
@@ -354,7 +354,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsRejectsUnsafeAndDuplicateMembers(t 
 				HTTPClient:     server.Client(),
 			})
 			if err == nil {
-				t.Fatal("InstallAndSwitchFromTarGzWithOptions error = nil")
+				t.Fatal("InstallAndSwitchFromTarGz error = nil")
 			}
 
 			assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
@@ -383,7 +383,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsAllowsHTTPRedirect(t *testing.T) {
 
 	digest := sha256.Sum256(payload)
 
-	_, err := InstallAndSwitchFromTarGzWithOptions(t.Context(), slog.Default(), paths, InstallOptions{
+	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
 		DownloadURL:    secure.URL + "/agent.tar.gz",
 		ExpectedSHA256: fmt.Sprintf("%x", digest),
 		ExpectedMember: "custom-agent",
@@ -391,7 +391,7 @@ func TestInstallAndSwitchFromTarGzWithOptionsAllowsHTTPRedirect(t *testing.T) {
 		HTTPClient:     secure.Client(),
 	})
 	if err != nil {
-		t.Fatalf("InstallAndSwitchFromTarGzWithOptions: %v", err)
+		t.Fatalf("InstallAndSwitchFromTarGz: %v", err)
 	}
 
 	assertSecureUpgradeLink(t, paths.CurrentPath, paths.GreenPath)
@@ -400,8 +400,8 @@ func TestInstallAndSwitchFromTarGzWithOptionsAllowsHTTPRedirect(t *testing.T) {
 func TestRedactedURL(t *testing.T) {
 	t.Parallel()
 
-	if got := RedactedURL(nil); got != "" {
-		t.Fatalf("RedactedURL(nil) = %q", got)
+	if got := redactedURL(nil); got != "" {
+		t.Fatalf("redactedURL(nil) = %q", got)
 	}
 
 	parsed, err := url.Parse("https://example.com/agent.tar.gz?sig=secret")
@@ -409,7 +409,7 @@ func TestRedactedURL(t *testing.T) {
 		t.Fatalf("parse URL: %v", err)
 	}
 
-	if got := RedactedURL(parsed); got != "https://example.com/agent.tar.gz" {
+	if got := redactedURL(parsed); got != "https://example.com/agent.tar.gz" {
 		t.Fatalf("RedactedURL = %q", got)
 	}
 }

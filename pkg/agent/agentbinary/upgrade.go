@@ -64,13 +64,6 @@ type normalizedInstallOptions struct {
 	verifyDigest   bool
 }
 
-// ValidateInstallOptions validates caller-provided install inputs.
-func ValidateInstallOptions(opts InstallOptions) error {
-	_, err := normalizeInstallOptions(opts)
-
-	return err
-}
-
 func normalizeInstallOptions(opts InstallOptions) (normalizedInstallOptions, error) {
 	parsedURL, err := validateDownloadURL(opts.DownloadURL)
 	if err != nil {
@@ -131,9 +124,7 @@ func normalizeInstallOptions(opts InstallOptions) (normalizedInstallOptions, err
 	}, nil
 }
 
-// ValidateLayout verifies that all required binary paths are clean, absolute,
-// and distinct. It also validates BinaryPath when provided.
-func ValidateLayout(paths Layout) error {
+func validateLayout(paths Layout) error {
 	values := []string{
 		paths.BluePath,
 		paths.GreenPath,
@@ -188,17 +179,17 @@ func installFromTarGz(ctx context.Context, targetPath string, opts InstallOption
 	return Verify(ctx, targetPath)
 }
 
-// InstallAndSwitchFromTarGzWithOptions downloads a bounded HTTP or HTTPS release
+// InstallAndSwitchFromTarGz downloads a bounded HTTP or HTTPS release
 // archive, installs the configured member into the inactive slot, and atomically
 // updates the last-good and current links. When ExactMember is set, the archive
 // must contain only the exact configured base name.
-func InstallAndSwitchFromTarGzWithOptions(
+func InstallAndSwitchFromTarGz(
 	ctx context.Context,
 	log *slog.Logger,
 	paths Layout,
 	opts InstallOptions,
 ) (SwitchResult, error) {
-	if err := ValidateLayout(paths); err != nil {
+	if err := validateLayout(paths); err != nil {
 		return SwitchResult{}, err
 	}
 
@@ -273,7 +264,7 @@ func InstallAndSwitchFromTarGzWithOptions(
 	}
 
 	log.Info("staged upgraded agent binary",
-		"url", RedactedURL(parsedURL),
+		"url", redactedURL(parsedURL),
 		"previous", previousPath,
 		"current", targetPath,
 	)
@@ -282,7 +273,7 @@ func InstallAndSwitchFromTarGzWithOptions(
 }
 
 // RedactedURL removes query and fragment data that may contain credentials.
-func RedactedURL(parsedURL *url.URL) string {
+func redactedURL(parsedURL *url.URL) string {
 	if parsedURL == nil {
 		return ""
 	}
@@ -370,15 +361,15 @@ func downloadArchive(
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("download agent archive from %s: %w", RedactedURL(parsedURL), ctx.Err())
+			return "", fmt.Errorf("download agent archive from %s: %w", redactedURL(parsedURL), ctx.Err())
 		}
 		// Redirect and transport errors can contain credential-bearing URLs.
-		return "", fmt.Errorf("download agent archive from %s failed", RedactedURL(parsedURL))
+		return "", fmt.Errorf("download agent archive from %s failed", redactedURL(parsedURL))
 	}
 	defer resp.Body.Close() //nolint:errcheck // response body cleanup
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download agent archive from %s: HTTP status %d", RedactedURL(parsedURL), resp.StatusCode)
+		return "", fmt.Errorf("download agent archive from %s: HTTP status %d", redactedURL(parsedURL), resp.StatusCode)
 	}
 
 	if resp.ContentLength > maxBytes {

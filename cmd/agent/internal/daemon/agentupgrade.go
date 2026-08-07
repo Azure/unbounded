@@ -57,14 +57,6 @@ func parseAgentUpgradeRequest(parameters map[string]string) (agentUpgradeRequest
 		return agentUpgradeRequest{}, fmt.Errorf("missing required parameter %q", agentUpgradeDownloadURLParameter)
 	}
 
-	if err := agentbinary.ValidateInstallOptions(agentbinary.InstallOptions{
-		DownloadURL:    request.downloadURL,
-		ExpectedSHA256: request.sha256,
-		ExpectedMember: goalstates.AgentUpgradeBinaryName,
-	}); err != nil {
-		return agentUpgradeRequest{}, err
-	}
-
 	return request, nil
 }
 
@@ -81,7 +73,7 @@ func upgradeDaemonBinary(ctx context.Context, log *slog.Logger, request agentUpg
 		CurrentPath:  paths.CurrentPath,
 		LastGoodPath: paths.LastGoodPath,
 	}
-	_, err = agentbinary.InstallAndSwitchFromTarGzWithOptions(ctx, log, layout, agentbinary.InstallOptions{
+	_, err = agentbinary.InstallAndSwitchFromTarGz(ctx, log, layout, agentbinary.InstallOptions{
 		DownloadURL:    request.downloadURL,
 		ExpectedSHA256: request.sha256,
 		ExpectedMember: goalstates.AgentUpgradeBinaryName,

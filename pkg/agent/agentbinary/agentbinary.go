@@ -54,23 +54,6 @@ func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error
 	return nil
 }
 
-// InstallAndSwitchFromTarGz installs the next agent binary and switches daemon links.
-func InstallAndSwitchFromTarGz(ctx context.Context, downloadURL string, paths goalstates.AgentUpgradePaths, perm os.FileMode) error {
-	_, err := InstallAndSwitchFromTarGzWithOptions(ctx, slog.Default(), Layout{
-		BinaryPath:   paths.BinaryPath,
-		BluePath:     paths.BluePath,
-		GreenPath:    paths.GreenPath,
-		CurrentPath:  paths.CurrentPath,
-		LastGoodPath: paths.LastGoodPath,
-	}, InstallOptions{
-		DownloadURL:    downloadURL,
-		ExpectedMember: goalstates.AgentUpgradeBinaryName,
-		Mode:           perm,
-	})
-
-	return err
-}
-
 // EnsureDaemonBinaryLinks initializes daemon current, last-good, and
 // compatibility binary links.
 func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalstates.AgentUpgradePaths) error {
