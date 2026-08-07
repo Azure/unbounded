@@ -112,6 +112,25 @@ func Test_hasDrift_TaintsChange(t *testing.T) {
 	assert.True(t, hasDrift(applied, desired))
 }
 
+func Test_hasDrift_KubeletConfigurationChange(t *testing.T) {
+	applied := baseConfig()
+	applied.Kubelet.Configuration = map[string]any{"maxPods": float64(110)}
+	desired := applied.DeepCopy()
+	desired.Kubelet.Configuration["maxPods"] = float64(250)
+	assert.True(t, hasDrift(applied, desired))
+}
+
+func Test_hasDrift_ImageCredentialProviderChange(t *testing.T) {
+	applied := baseConfig()
+	applied.Kubelet.ImageCredentialProvider = &provision.ImageCredentialProvider{
+		ConfigPath: "/etc/kubernetes/credential-provider.yaml",
+		BinDir:     "/usr/local/lib/kubelet-credential-providers",
+	}
+	desired := applied.DeepCopy()
+	desired.Kubelet.ImageCredentialProvider.BinDir = "/opt/credential-providers"
+	assert.True(t, hasDrift(applied, desired))
+}
+
 func Test_hasDrift_GantryChange(t *testing.T) {
 	applied := baseConfig()
 	desired := baseConfig()

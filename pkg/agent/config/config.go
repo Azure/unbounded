@@ -15,6 +15,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -168,6 +169,8 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	}
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
+	out.Kubelet.Configuration = deepCopyKubeletConfiguration(a.Kubelet.Configuration)
+	out.Kubelet.ImageCredentialProvider = a.Kubelet.ImageCredentialProvider.DeepCopy()
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
@@ -209,6 +212,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateAdditionalHostMounts(a.AdditionalHostMounts); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := a.Kubelet.Validate(); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -338,6 +345,162 @@ type AgentKubeletConfig struct {
 	Auth               KubeletAuthInfo   `json:"Auth"`
 	Labels             map[string]string `json:"Labels"`
 	RegisterWithTaints []string          `json:"RegisterWithTaints"`
+
+	// Configuration is merged over the agent's baseline kubelet configuration
+	// and rendered as a kubelet.config.k8s.io/v1beta1
+	// KubeletConfiguration. apiVersion, kind, authentication,
+	// authorization.mode, clusterDNS, containerRuntimeEndpoint,
+	// registerWithTaints, and rotateCertificates are agent-owned and must not be
+	// supplied here.
+	Configuration map[string]any `json:"Configuration,omitempty"`
+
+	// ImageCredentialProvider configures kubelet's exec image credential
+	// provider paths inside the nspawn machine.
+	ImageCredentialProvider *ImageCredentialProvider `json:"ImageCredentialProvider,omitempty"`
+}
+
+// ImageCredentialProvider holds paths inside the nspawn machine for kubelet's
+// exec image credential provider configuration and binaries. ConfigPath may
+// identify a single configuration file or a directory supported by the
+// installed kubelet version.
+type ImageCredentialProvider struct {
+	ConfigPath string `json:"ConfigPath"`
+	BinDir     string `json:"BinDir"`
+}
+
+// DeepCopy returns a copy of ImageCredentialProvider.
+func (i *ImageCredentialProvider) DeepCopy() *ImageCredentialProvider {
+	if i == nil {
+		return nil
+	}
+
+	out := *i
+
+	return &out
+}
+
+// Validate checks the kubelet configuration overlay and optional image
+// credential provider paths. Kubelet authentication is validated separately
+// because some consumers populate it after initial configuration resolution.
+func (a *AgentKubeletConfig) Validate() error {
+	return errors.Join(
+		validateKubeletConfiguration(a.Configuration),
+		a.ImageCredentialProvider.Validate(),
+	)
+}
+
+// validateKubeletConfiguration validates the JSON-shaped kubelet
+// configuration overlay and rejects unsupported agent-handled fields.
+func validateKubeletConfiguration(configuration map[string]any) error {
+	if configuration == nil {
+		return nil
+	}
+
+	normalized, err := normalizeKubeletConfiguration(configuration)
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+
+	if authorizationValue, exists := normalized["authorization"]; exists {
+		authorization, ok := authorizationValue.(map[string]any)
+		if !ok {
+			errs = append(errs, fmt.Errorf("Kubelet.Configuration.authorization must be an object"))
+		} else if _, exists := authorization["mode"]; exists {
+			errs = append(errs, fmt.Errorf(
+				"setting Kubelet.Configuration.authorization.mode is not supported; it is configured by the agent",
+			))
+		}
+	}
+
+	for _, field := range []string{
+		"apiVersion",
+		"kind",
+		"authentication",
+		"clusterDNS",
+		"containerRuntimeEndpoint",
+		"registerWithTaints",
+		"rotateCertificates",
+	} {
+		if _, ok := normalized[field]; ok {
+			errs = append(errs, fmt.Errorf(
+				"setting Kubelet.Configuration.%s is not supported; it is configured by the agent",
+				field,
+			))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// Validate validates paths that kubelet consumes inside the nspawn machine.
+// The paths are not required to exist in the unpacked rootfs because they may
+// be supplied by nspawn bind mounts at start time.
+func (provider *ImageCredentialProvider) Validate() error {
+	if provider == nil {
+		return nil
+	}
+
+	var errs []error
+	if err := validateMachinePath(provider.ConfigPath); err != nil {
+		errs = append(errs, fmt.Errorf("Kubelet.ImageCredentialProvider.ConfigPath: %w", err))
+	}
+
+	if err := validateMachinePath(provider.BinDir); err != nil {
+		errs = append(errs, fmt.Errorf("Kubelet.ImageCredentialProvider.BinDir: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateMachinePath(path string) error {
+	if path == "" || !filepath.IsAbs(path) {
+		return fmt.Errorf("%q must be an absolute path", path)
+	}
+
+	if strings.IndexFunc(path, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 || strings.ContainsAny(path, "\"\\%$") {
+		return fmt.Errorf("%q contains characters that are unsafe in a systemd argument", path)
+	}
+
+	if cleaned := filepath.Clean(path); cleaned != path {
+		return fmt.Errorf("%q must be a clean absolute path", path)
+	}
+
+	return nil
+}
+
+// normalizeKubeletConfiguration converts JSON-compatible typed maps and slices
+// into the map[string]any and []any representation produced by encoding/json.
+func normalizeKubeletConfiguration(value map[string]any) (map[string]any, error) {
+	if value == nil {
+		return nil, nil
+	}
+
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("Kubelet.Configuration must contain only JSON-compatible values: %w", err)
+	}
+
+	var normalized map[string]any
+	if err := json.Unmarshal(data, &normalized); err != nil {
+		return nil, fmt.Errorf("normalize Kubelet.Configuration: %w", err)
+	}
+
+	return normalized, nil
+}
+
+func deepCopyKubeletConfiguration(value map[string]any) map[string]any {
+	copied, err := normalizeKubeletConfiguration(value)
+	if err != nil {
+		// Invalid values are reported by AgentKubeletConfig.Validate. Preserve
+		// the top-level map here so DeepCopy remains total for invalid configs.
+		return maps.Clone(value)
+	}
+
+	return copied
 }
 
 // KubeletAuthInfo holds the kubelet authentication configuration.
