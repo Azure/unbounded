@@ -170,6 +170,8 @@ func TestProgressExpressionScopesCurrentImage(t *testing.T) {
 		`image_digest="sha256:image"`,
 		`gantry_benchmark_(image_unpack_started|image_unpacked|layer_unpacked)_timestamp_seconds`,
 		`image="registry.example/pull@sha256:image"`,
+		`node_cpu_seconds_total`,
+		`node_memory_MemAvailable_bytes`,
 	} {
 		if !strings.Contains(expression, want) {
 			t.Errorf("expression %q is missing %q", expression, want)

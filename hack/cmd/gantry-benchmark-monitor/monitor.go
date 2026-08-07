@@ -49,6 +49,7 @@ type monitorSnapshot struct {
 	PodStates       podStateCounts
 	PodStateError   string
 	Progress        progressGrid
+	Resources       nodeResourceGrid
 	GridError       string
 	NodePage        int
 	NodesPerPage    int
@@ -350,6 +351,7 @@ func renderSnapshot(snapshot monitorSnapshot) string {
 		fmt.Fprintf(&builder, "%spod watch: %s%s\n", metaStart, snapshot.PodStateError, reset)
 	}
 
+	renderNodeResources(&builder, snapshot)
 	renderProgressGrids(&builder, snapshot)
 
 	fmt.Fprintf(&builder, "%sdisplay refresh: %s; Prometheus scrape cadence: 10s (values repeat between scrapes)\n", metaStart, snapshot.RefreshInterval)

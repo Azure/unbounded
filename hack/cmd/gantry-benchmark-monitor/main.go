@@ -392,10 +392,12 @@ func progressExpression(session monitorSession, config monitorConfig) string {
 		observerLabels += `,image=` + strconv.Quote(session.image)
 	}
 
-	return fmt.Sprintf(`gantry_layer_download_completed_timestamp_seconds{%s} or {__name__=~"gantry_benchmark_(image_unpack_started|image_unpacked|layer_unpacked)_timestamp_seconds",%s}`,
+	progress := fmt.Sprintf(`gantry_layer_download_completed_timestamp_seconds{%s} or {__name__=~"gantry_benchmark_(image_unpack_started|image_unpacked|layer_unpacked)_timestamp_seconds",%s}`,
 		downloadLabels,
 		observerLabels,
 	)
+
+	return progress + " or " + nodeResourceExpression(config)
 }
 
 func queryProgress(ctx context.Context, runner kubectlRunner, session monitorSession, config monitorConfig, now time.Time) (instantResponse, error) {
@@ -427,12 +429,13 @@ func runMonitor(ctx context.Context, config monitorConfig) error {
 	runner := kubectlRunner{binary: config.kubectl, kubeconfig: config.kubeconfig}
 
 	var (
-		session      *monitorSession
-		podTracker   *podStateTracker
-		lastSnapshot monitorSnapshot
-		lastProgress progressGrid
-		gridError    string
-		nextGridAt   time.Time
+		session       *monitorSession
+		podTracker    *podStateTracker
+		lastSnapshot  monitorSnapshot
+		lastProgress  progressGrid
+		lastResources nodeResourceGrid
+		gridError     string
+		nextGridAt    time.Time
 	)
 
 	for {
@@ -544,15 +547,18 @@ func runMonitor(ctx context.Context, config monitorConfig) error {
 				gridError = gridErr.Error()
 			} else {
 				lastProgress = aggregateProgressGrid(gridResponse, nodes, session.image)
+				lastResources = aggregateNodeResources(gridResponse, nodes)
 				gridError = ""
 			}
 
 			nextGridAt = now.Add(gridQueryInterval)
 		} else if len(nodes) > 0 {
 			lastProgress.Nodes = append(lastProgress.Nodes[:0], nodes...)
+			lastResources.Nodes = append(lastResources.Nodes[:0], nodes...)
 		}
 
 		lastSnapshot.Progress = lastProgress
+		lastSnapshot.Resources = lastResources
 		lastSnapshot.GridError = gridError
 
 		if !config.noClear && term.IsTerminal(int(os.Stdout.Fd())) {

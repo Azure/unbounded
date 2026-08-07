@@ -233,7 +233,13 @@ uses `.` for pending and `0-9/A-Z` for the phase minute when Gantry finished
 writing that layer to the node's containerd client (`Z` means minute 35 or
 later). The image-by-node grid uses `.` for not started, `0` for started,
 `1-9` for unpacked-layer deciles, and `#` after containerd reports the image
-unpacked. Node columns are sorted and identified by their three-character
+unpacked.
+
+The same node page shows one-minute CPU utilization averaged across cores and
+current memory-used percentage (`1 - MemAvailable / MemTotal`) for every node
+as `0-9` deciles, plus fleet p50, p95, and maximum values. These resource
+values advance at the 10-second Prometheus scrape cadence. Node columns are
+sorted and identified by their three-character
 suffix. The default page width follows the terminal, bounded to 16-96 nodes.
 Select another page or a fixed width with, for example:
 
