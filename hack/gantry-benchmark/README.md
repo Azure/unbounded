@@ -223,10 +223,14 @@ make -C hack/gantry-benchmark monitor
 
 It redraws every second and shows per-phase-minute peer outcomes (`busy`,
 `hit`, `stall`, `notfound`, `unavailable`) alongside layer bytes, aggregate
-and per-node throughput, and cumulative payload percentage. The monitor uses
-one server-side aggregated Prometheus range query per refresh; it does not
-download per-pod series. Prometheus scrapes Gantry every 10 seconds, so the
-screen updates each second while counter values advance at scrape cadence.
+and per-node throughput, cumulative payload percentage, and live Pod counts for
+completed, running, creating, image-pull failures, and failed Pods. Pod counts
+come from one Kubernetes list followed by watch events rather than polling all
+1000 Pod objects. The header uses ANSI emphasis on a TTY and remains plain when
+redirected or piped. The monitor uses one server-side aggregated Prometheus
+range query per refresh; it does not download per-pod metric series. Prometheus
+scrapes Gantry every 10 seconds, so the screen updates each second while counter
+values advance at scrape cadence.
 Use `MONITOR_ARGS="--once --no-clear"` for a single non-interactive snapshot.
 
 Artifacts persist on the VM under

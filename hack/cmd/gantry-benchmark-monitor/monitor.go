@@ -46,6 +46,9 @@ type monitorSnapshot struct {
 	PeerTotals      map[string]float64
 	TotalBytes      float64
 	Job             jobStatus
+	PodStates       podStateCounts
+	PodStateError   string
+	Color           bool
 }
 
 func parseRangeResponse(raw []byte) (rangeResponse, error) {
@@ -311,19 +314,45 @@ func renderSnapshot(snapshot monitorSnapshot) string {
 		elapsed = 0
 	}
 
-	fmt.Fprintln(&builder, "Gantry benchmark live monitor")
-	fmt.Fprintf(&builder, "time: %s\n", snapshot.Now.UTC().Format(time.RFC3339))
+	titleStart, metaStart, statusStart, reset := "", "", "", ""
+	if snapshot.Color {
+		titleStart = "\033[1;36m"
+		metaStart = "\033[2m"
+		statusStart = "\033[1m"
+		reset = "\033[0m"
+	}
+
+	fmt.Fprintf(&builder, "%sGantry benchmark live monitor%s\n", titleStart, reset)
+	fmt.Fprintf(&builder, "%stime: %s\n", metaStart, snapshot.Now.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&builder, "run: %s\n", snapshot.RunID)
 	fmt.Fprintf(&builder, "job: %s\n", snapshot.JobName)
-	fmt.Fprintf(&builder, "phase started: %s (elapsed %s)\n", snapshot.PhaseStart.UTC().Format(time.RFC3339), elapsed.Round(time.Second))
-	fmt.Fprintf(&builder, "pods: %d/%d succeeded, %d active, %d failed\n", snapshot.Job.Succeeded, snapshot.NodeCount, snapshot.Job.Active, snapshot.Job.Failed)
-	fmt.Fprintf(&builder, "display refresh: %s; Prometheus scrape cadence: 10s (values repeat between scrapes)\n", snapshot.RefreshInterval)
+	fmt.Fprintf(&builder, "phase started: %s (elapsed %s)%s\n", snapshot.PhaseStart.UTC().Format(time.RFC3339), elapsed.Round(time.Second), reset)
+	fmt.Fprintf(&builder, "%spods: %d/%d completed | %d running | %d creating | %d image-pull | %d failed%s\n",
+		statusStart,
+		snapshot.PodStates.Completed,
+		snapshot.NodeCount,
+		snapshot.PodStates.Running,
+		snapshot.PodStates.Creating,
+		snapshot.PodStates.ImagePull,
+		snapshot.PodStates.Failed,
+		reset,
+	)
+
+	if snapshot.PodStates.Unscheduled > 0 || snapshot.PodStates.Other > 0 {
+		fmt.Fprintf(&builder, "%spod detail: %d unscheduled, %d other%s\n", metaStart, snapshot.PodStates.Unscheduled, snapshot.PodStates.Other, reset)
+	}
+
+	if snapshot.PodStateError != "" {
+		fmt.Fprintf(&builder, "%spod watch: %s%s\n", metaStart, snapshot.PodStateError, reset)
+	}
+
+	fmt.Fprintf(&builder, "%sdisplay refresh: %s; Prometheus scrape cadence: 10s (values repeat between scrapes)\n", metaStart, snapshot.RefreshInterval)
 
 	if !snapshot.LatestSample.IsZero() {
 		fmt.Fprintf(&builder, "latest query sample: %s\n", snapshot.LatestSample.UTC().Format(time.RFC3339))
 	}
 
-	fmt.Fprintln(&builder, "*: current partial minute")
+	fmt.Fprintf(&builder, "*: current partial minute%s\n", reset)
 	fmt.Fprintln(&builder)
 
 	renderPeerTable(&builder, snapshot)

@@ -88,6 +88,7 @@ func TestRenderSnapshotIncludesBothLiveTables(t *testing.T) {
 	snapshot.Now = start.Add(150 * time.Second)
 	snapshot.RefreshInterval = time.Second
 	snapshot.Job = jobStatus{Succeeded: 12, Active: 988}
+	snapshot.PodStates = podStateCounts{Completed: 12, Running: 20, Creating: 960, ImagePull: 8}
 
 	output := renderSnapshot(snapshot)
 	for _, want := range []string{
@@ -100,11 +101,40 @@ func TestRenderSnapshotIncludesBothLiveTables(t *testing.T) {
 		"MB/s per node",
 		"2*",
 		"total 0.150 TB of 0.200 TB (75.0%)",
-		"pods: 12/1000 succeeded, 988 active, 0 failed",
+		"pods: 12/1000 completed | 20 running | 960 creating | 8 image-pull | 0 failed",
 		"Prometheus scrape cadence: 10s",
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("output is missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestRenderSnapshotHighlightsHeaderWhenColorEnabled(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 8, 7, 1, 0, 0, 0, time.UTC)
+	snapshot := monitorSnapshot{
+		RunID:           "run-1",
+		JobName:         "job-1",
+		PhaseStart:      start,
+		Now:             start.Add(time.Minute),
+		RefreshInterval: time.Second,
+		NodeCount:       1000,
+		Bins:            []minuteBin{{Minute: 0, PeerOutcomes: map[string]float64{}}},
+		PeerTotals:      map[string]float64{},
+		PodStates:       podStateCounts{Completed: 1, Running: 2, Creating: 997},
+		Color:           true,
+	}
+
+	output := renderSnapshot(snapshot)
+	for _, want := range []string{
+		"\033[1;36mGantry benchmark live monitor\033[0m",
+		"\033[2mtime:",
+		"\033[1mpods: 1/1000 completed | 2 running | 997 creating",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("colored output is missing %q:\n%q", want, output)
 		}
 	}
 }

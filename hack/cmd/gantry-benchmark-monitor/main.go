@@ -348,6 +348,7 @@ func runMonitor(ctx context.Context, config monitorConfig) error {
 
 	var (
 		session      *monitorSession
+		podTracker   *podStateTracker
 		lastSnapshot monitorSnapshot
 	)
 
@@ -374,6 +375,25 @@ func runMonitor(ctx context.Context, config monitorConfig) error {
 
 			session = &discovered
 			status = job
+
+			tracker, err := newPodStateTracker(ctx, config.kubeconfig, config.benchmarkNamespace, session.jobName)
+			if err != nil {
+				session = nil
+
+				renderWaiting(config, err)
+
+				if config.once {
+					return err
+				}
+
+				if err := waitForNext(ctx, config.refreshInterval); err != nil {
+					return err
+				}
+
+				continue
+			}
+
+			podTracker = tracker
 		} else {
 			job, err := refreshJobStatus(ctx, runner, config, *session)
 			if err != nil {
@@ -415,6 +435,16 @@ func runMonitor(ctx context.Context, config monitorConfig) error {
 		lastSnapshot.Now = now
 		lastSnapshot.RefreshInterval = config.refreshInterval
 		lastSnapshot.Job = status
+		lastSnapshot.Color = term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("NO_COLOR") == ""
+
+		if podTracker != nil {
+			counts, podErr := podTracker.snapshot()
+
+			lastSnapshot.PodStates = counts
+			if podErr != nil {
+				lastSnapshot.PodStateError = podErr.Error()
+			}
+		}
 
 		if !config.noClear && term.IsTerminal(int(os.Stdout.Fd())) {
 			fmt.Print("\033[H\033[2J")
