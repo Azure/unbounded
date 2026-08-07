@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-run-fresh operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -20,6 +20,7 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-watch      Follow operator VM progress until completion"
 	@echo "  operator-vm-prebuild   Start an asynchronous operator-VM pool build"
 	@echo "  operator-vm-run-pool   Start Gantry-only using the next compatible pool image"
+	@echo "  operator-vm-run-fresh  Build a brand-new image, then run Gantry-only"
 	@echo "  operator-vm-image-pool-status  Show operator-VM pool builder and entries"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
 	@echo "  proxy-push   Push BENCHMARK_PROXY_IMAGE"
@@ -90,6 +91,10 @@ operator-vm-prebuild: operator-vm-check
 operator-vm-run-pool: operator-vm-check
 	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh run "$(GANTRY_ONLY_BASELINE_RUN_ID)"
+
+operator-vm-run-fresh: operator-vm-check
+	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh fresh "$(GANTRY_ONLY_BASELINE_RUN_ID)"
 
 operator-vm-image-pool-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status

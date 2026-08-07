@@ -282,6 +282,17 @@ are still merged and the failed target's port-forward log is retained.
 
 ## Reusable Gantry image pool
 
+For a one-off Gantry-only run that creates a brand-new random 40 GiB image
+inside the lifecycle, use the retained baseline without involving the image
+pool:
+
+```bash
+AZURE_RESOURCE_GROUP=vapa-gantry-benchmark1 \
+OPERATOR_VM_NAME=gantry-benchmark-operator \
+GANTRY_ONLY_BASELINE_RUN_ID=run-20260806-205719-51c38730 \
+make -C hack/gantry-benchmark operator-vm-run-fresh
+```
+
 Gantry-only benchmarks can consume prebuilt images instead of generating,
 building, and pushing 40 GiB during every benchmark lifecycle. Start a batch
 on the operator VM from the workstation:

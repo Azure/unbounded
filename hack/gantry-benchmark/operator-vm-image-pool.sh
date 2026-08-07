@@ -12,11 +12,13 @@ usage() {
   cat <<'USAGE'
 Usage: operator-vm-image-pool.sh start COUNT
   operator-vm-image-pool.sh run BASELINE_RUN_ID
+  operator-vm-image-pool.sh fresh BASELINE_RUN_ID
        operator-vm-image-pool.sh status
 
-Starts an asynchronous operator-VM image-pool build, or prints bounded status.
-Pool builds and benchmark runs are mutually exclusive because pushes to the
-Gantry ACR during a measured phase invalidate Azure telemetry.
+Starts an asynchronous operator-VM image-pool build, starts a pool-backed or
+brand-new-image Gantry-only run, or prints bounded status. Pool builds and
+benchmark runs are mutually exclusive because pushes to the Gantry ACR during
+a measured phase invalidate Azure telemetry.
 USAGE
 }
 
@@ -120,13 +122,18 @@ SCRIPT
 )
   invoke_remote "$script"
     ;;
-  run)
+  run|fresh)
     (($# == 1)) || { usage >&2; exit 2; }
     baseline_run_id=$1
     [[ "$baseline_run_id" =~ ^[A-Za-z0-9._-]+$ && "$baseline_run_id" != "." && "$baseline_run_id" != ".." ]] || {
       echo "BASELINE_RUN_ID contains unsupported characters" >&2
       exit 2
     }
+
+    mode_config='GANTRY_ONLY_USE_IMAGE_POOL="true"'
+    if [[ "$action" == fresh ]]; then
+      mode_config='GANTRY_ONLY_FRESH_IMAGE="true"'
+    fi
 
     script=$(cat <<SCRIPT
 set -eu
@@ -148,15 +155,17 @@ test -s "\$baseline_dir/state.json" && test -s "\$baseline_dir/baseline.json" ||
   echo "retained baseline $baseline_run_id is missing state.json or baseline.json" >&2
   exit 1
 }
-ready_count="\$(find "\$BENCHMARK_IMAGE_POOL_ROOT/ready" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l)"
-test "\$ready_count" -gt 0 || {
-  echo "the Gantry image pool has no ready entries" >&2
-  exit 1
-}
+if [[ "$action" == run ]]; then
+  ready_count="\$(find "\$BENCHMARK_IMAGE_POOL_ROOT/ready" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l)"
+  test "\$ready_count" -gt 0 || {
+    echo "the Gantry image pool has no ready entries" >&2
+    exit 1
+  }
+fi
 sed -i '/^GANTRY_ONLY_/d' /etc/gantry-benchmark/env
 cat >>/etc/gantry-benchmark/env <<'ENV'
 GANTRY_ONLY_BASELINE_RUN_ID="$baseline_run_id"
-GANTRY_ONLY_USE_IMAGE_POOL="true"
+$mode_config
 ENV
 if systemctl is-failed --quiet gantry-benchmark-operator.service; then
   systemctl reset-failed gantry-benchmark-operator.service
