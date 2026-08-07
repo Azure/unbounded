@@ -227,35 +227,35 @@ notices:
       - Copyright 2014-2015 Stripe, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.43.2/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.43.3/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/config
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.33/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.32.34/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.32/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.19.33/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.106.2/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.106.3/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.27.5/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.27.6/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -730,7 +730,7 @@ notices:
       - Copyright (c) 2017 The Sqlite Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://gitlab.com/cznic/sqlite/-/blob/v1.55.0/LICENSE
+        link: https://gitlab.com/cznic/sqlite/-/blob/v1.56.0/LICENSE
   - dependency: notify
     ecosystem: cargo
     copyright:
