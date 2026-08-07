@@ -36,4 +36,19 @@ type Kubelet struct {
 	// Each entry uses the kubelet format: "key=value:effect"
 	// (e.g. "dedicated=gpu:NoSchedule").
 	RegisterWithTaints []string
+
+	// Configuration is merged over the agent's baseline and rendered as a
+	// kubelet.config.k8s.io/v1beta1 KubeletConfiguration.
+	Configuration map[string]any
+
+	// ImageCredentialProvider holds optional kubelet exec image credential
+	// provider paths inside the nspawn machine.
+	ImageCredentialProvider *ImageCredentialProvider
+}
+
+// ImageCredentialProvider holds paths inside the nspawn machine for kubelet's
+// exec image credential provider configuration and binaries.
+type ImageCredentialProvider struct {
+	ConfigPath string
+	BinDir     string
 }

@@ -295,6 +295,8 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
+	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
+	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
 	@echo ""
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
@@ -540,6 +542,14 @@ notice-check: ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native
 		exit 1; \
 	fi
 	$(GOCMD) run ./hack/cmd/notice check --notice NOTICE
+
+.PHONY: toolchain-shell
+toolchain-shell: ## Drop into the toolchain container with the repo mounted at /project (builds the image on first use)
+	@./images/toolchain/toolchain.sh
+
+.PHONY: toolchain-build
+toolchain-build: ## Rebuild the toolchain container image (otherwise built lazily on first toolchain-shell use)
+	@TOOLCHAIN_REBUILD=1 ./images/toolchain/toolchain.sh true
 
 ##@ Build
 

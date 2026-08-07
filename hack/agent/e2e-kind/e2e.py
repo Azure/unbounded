@@ -29,7 +29,7 @@ Subcommands (called as individual workflow steps):
     unblock-external-network           Remove VM external egress block rules.
     wait-for-node                      Wait for the node to appear and become Ready.
     validate-host-nspawn-distro        Verify the nspawn machine distro matches the host.
-    validate-node-config               Verify configured labels and taints reached the Node.
+    validate-node-config               Verify configured node and kubelet settings.
     dump-persisted-agent-config        Print persisted agent config files from the VM.
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
@@ -66,7 +66,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
@@ -589,6 +589,7 @@ class NodeConfig:
     node_labels: dict[str, str]
     register_with_taints: list[str]
     node_ip: str = ""
+    kubelet_configuration: dict[str, Any] = field(default_factory=dict)
     offline_artifacts_oci_ref: str = ""
     rootfs_oci_image: str = ""
     block_external_network: bool = False
@@ -628,6 +629,7 @@ def load_node_config(
     node_labels = cfg.get("nodeLabels", {})
     register_with_taints = cfg.get("registerWithTaints", [])
     node_ip = cfg.get("nodeIP", "")
+    kubelet_configuration = cfg.get("kubeletConfiguration", {})
     offline_artifacts_oci_ref = offline_artifacts_oci_ref_override or cfg.get("offlineArtifactsOCIRef", "")
     rootfs_oci_image = offline_rootfs_oci_image_override or cfg.get("offlineRootfsOCIImage", "")
     block_external_network = cfg.get("blockExternalNetwork", False)
@@ -647,6 +649,8 @@ def load_node_config(
         die(f"node config {config_path} field 'registerWithTaints' must be a list of strings")
     if not isinstance(node_ip, str):
         die(f"node config {config_path} field 'nodeIP' must be a string")
+    if not isinstance(kubelet_configuration, dict):
+        die(f"node config {config_path} field 'kubeletConfiguration' must be an object")
     if not isinstance(offline_artifacts_oci_ref, str):
         die(f"node config {config_path} field 'offlineArtifactsOCIRef' must be a string")
     if not isinstance(rootfs_oci_image, str):
@@ -677,6 +681,7 @@ def load_node_config(
         node_labels=dict(node_labels),
         register_with_taints=list(register_with_taints),
         node_ip=node_ip,
+        kubelet_configuration=dict(kubelet_configuration),
         offline_artifacts_oci_ref=offline_artifacts_oci_ref,
         rootfs_oci_image=rootfs_oci_image,
         block_external_network=block_external_network,
@@ -744,6 +749,33 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     return args
 
 
+def inject_kubelet_configuration(bootstrap_script: str, node_config: NodeConfig) -> str:
+    """Inject a scenario's kubelet configuration into generated agent config JSON."""
+    if not node_config.kubelet_configuration:
+        return bootstrap_script
+
+    start_marker = "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n"
+    end_marker = "\nAGENT_CONFIG_EOF"
+    prefix, separator, remainder = bootstrap_script.partition(start_marker)
+    if not separator:
+        die("generated bootstrap script does not contain the agent config heredoc")
+
+    agent_config_json, separator, suffix = remainder.partition(end_marker)
+    if not separator:
+        die("generated bootstrap script has an unterminated agent config heredoc")
+
+    try:
+        agent_config = json.loads(agent_config_json)
+        kubelet = agent_config["Kubelet"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        die(f"generated bootstrap script contains invalid agent config: {exc}")
+
+    kubelet["Configuration"] = node_config.kubelet_configuration
+    rendered_config = json.dumps(agent_config, indent=2)
+
+    return prefix + start_marker + rendered_config + end_marker + suffix
+
+
 def log_active_node_config(node_config: NodeConfig) -> None:
     """Log the active e2e node config variant."""
     labels = [f"{key}={value}" for key, value in sorted(expected_node_labels(node_config).items())]
@@ -752,6 +784,12 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
+    kubelet_configuration = (
+        json.dumps(node_config.kubelet_configuration, sort_keys=True)
+        if node_config.kubelet_configuration
+        else "<none>"
+    )
+    log(f"  kubelet configuration: {kubelet_configuration}")
     log(f"  offline artifacts OCI ref: {node_config.offline_artifacts_oci_ref or '<none>'}")
     log(f"  rootfs OCI image: {node_config.rootfs_oci_image or '<default>'}")
     log(f"  block external network: {node_config.block_external_network}")
@@ -2364,6 +2402,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         bootstrap_args.extend(["--offline-artifacts-source", offline_source])
 
     bootstrap_script = capture(bootstrap_args)
+    bootstrap_script = inject_kubelet_configuration(bootstrap_script, node_config)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
     # Patch the generated script to use the Kind container IP instead.
@@ -2487,13 +2526,24 @@ def _assert_expected_node_config(node: dict[str, Any], node_config: NodeConfig) 
     if node_ip not in internal_ips:
         die(f"node InternalIP mismatch: got {internal_ips}, expected {node_ip!r}")
 
+    kubelet_configuration = node_config.kubelet_configuration or {}
+    if "maxPods" in kubelet_configuration:
+        expected_max_pods = str(kubelet_configuration["maxPods"])
+        actual_max_pods = str(node.get("status", {}).get("capacity", {}).get("pods", ""))
+        if actual_max_pods != expected_max_pods:
+            die(
+                f"node pod capacity mismatch: got {actual_max_pods!r}, "
+                f"expected {expected_max_pods!r}"
+            )
+
 
 def validate_node_config(node_config: NodeConfig) -> None:
-    """Verify configured node labels and taints are present on the Node."""
+    """Verify configured node and kubelet settings."""
 
     log_active_node_config(node_config)
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)
+    validate_kubelet_configuration_config(node_config)
     validate_offline_bootstrap_config(node_config)
     validate_additional_host_mounts_config(node_config)
     validate_additional_host_devices_config(node_config)
@@ -2502,6 +2552,62 @@ def validate_node_config(node_config: NodeConfig) -> None:
     log("  Node config validation PASSED")
     log("============================================")
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+def validate_kubelet_configuration_config(node_config: NodeConfig) -> None:
+    """Verify the kubelet overlay was persisted, rendered, and passed to kubelet."""
+    if not node_config.kubelet_configuration:
+        return
+
+    log("Validating kubelet configuration overlay...")
+    expected_configuration = json.dumps(node_config.kubelet_configuration, sort_keys=True)
+    expected_configuration_literal = json.dumps(expected_configuration)
+    ssh_cmd(f"""
+sudo python3 - <<'PY'
+import json
+import pathlib
+import sys
+
+expected = json.loads({expected_configuration_literal})
+paths = sorted(pathlib.Path("/tmp").glob("unbounded-agent-config.*.json"))
+paths.append(pathlib.Path("/etc/unbounded/agent/config.json"))
+paths.extend(sorted(pathlib.Path("/etc/unbounded/agent").glob("*-applied-config.json")))
+for config_path in paths:
+    if not config_path.exists():
+        continue
+    cfg = json.loads(config_path.read_text())
+    actual = (cfg.get("Kubelet") or {{}}).get("Configuration") or {{}}
+    if actual == expected:
+        print(f"Kubelet.Configuration verified in {{config_path}}: {{actual}}")
+        break
+else:
+    sys.exit(f"Kubelet.Configuration {{expected!r}} not found in agent config files")
+PY
+""")
+
+    machine = active_nspawn_machine()
+    machine_root = f"/var/lib/machines/{machine}"
+    rendered = ssh_capture(f"sudo cat {machine_root}/var/lib/kubelet/config.yaml")
+    for key, value in node_config.kubelet_configuration.items():
+        if isinstance(value, bool):
+            rendered_value = str(value).lower()
+        elif isinstance(value, (int, float)):
+            rendered_value = str(value)
+        else:
+            continue
+
+        expected_line = f"{key}: {rendered_value}"
+        if expected_line not in rendered.splitlines():
+            die(
+                f"generated kubelet config is missing {expected_line!r}; "
+                f"full config:\n{rendered}"
+            )
+
+    service = ssh_capture(f"sudo cat {machine_root}/etc/systemd/system/kubelet.service")
+    if "--config=/var/lib/kubelet/config.yaml" not in service:
+        die(f"kubelet service does not reference generated config: {service}")
+
+    log("Kubelet configuration overlay validated")
 
 
 def validate_offline_bootstrap_config(node_config: NodeConfig) -> None:
