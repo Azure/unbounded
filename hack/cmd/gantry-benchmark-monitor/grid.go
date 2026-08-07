@@ -346,7 +346,7 @@ func renderNodeHeader(builder *strings.Builder, nodes []string) {
 				suffix = suffix[len(suffix)-3:]
 			}
 
-			for len(suffix) < 3 {
+			for len(suffix) <= position {
 				suffix = " " + suffix
 			}
 
