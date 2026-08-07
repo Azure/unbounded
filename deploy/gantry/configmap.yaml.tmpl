@@ -159,13 +159,10 @@ data:
     # one node. Each pull holds an HTTP body, containerd writer,
     # goroutine, and lease.
     coord_max_concurrent_pulls: 16
-    # Deliberately SHORT. A requester stuck on a lockstep-saturated seed must
-    # bail at this deadline and re-select a fresher finisher-seed rather than
-    # ride the slow stream to completion; that bail-and-re-select (with the
-    # strict containerd hosts.toml) drives the cold-start cascade. Too high
-    # (e.g. 1h) removes re-selection and collapses to single-seed bandwidth
-    # (the ~12min lockstep). Matches upstream gantry's hardcoded 60s.
-    peer_fetch_timeout: "60s"
+    # Safety ceiling for a complete peer request. Progressing large layers must
+    # not switch providers only because their total transfer exceeds 60s. The
+    # HTTP/2 transport separately probes connections after 10s without reads.
+    peer_fetch_timeout: "15m"
     # Peer re-discovery loop. On a cache miss the mirror repeatedly re-runs DHT
     # FindProviders and retries peer fetches for up to peer_rediscover_budget to
     # pick up finisher-seeds that advertise mid-swarm (the cold-start cascade),

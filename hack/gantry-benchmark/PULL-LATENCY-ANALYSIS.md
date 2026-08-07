@@ -124,12 +124,12 @@ occur in the first six minutes and 56% in the second minute alone, falling to
 zero by minute eleven. At 1.5ms each they cost about 1.7 seconds per node in
 total.
 
-Second, the stalls are not lost work. The 60.0007s mean is `PeerFetchTimeout`
-firing, but `livePeerStream` streams through to the containerd-facing response
-and records the verified byte offset, and re-selection resumes from that offset.
-A stall costs a DHT lookup and a redial, not the delivered prefix. Stalls also
-hold steady at roughly 3,700 per minute from minute four to minute ten, which is
-exactly when delivery runs at peak rate.
+Second, the stalls are not lost work. These historical runs used a 60s
+`PeerFetchTimeout`, and the measured 60.0007s mean is that absolute deadline
+firing on progressing transfers. `livePeerStream` streams through to the
+containerd-facing response, records the verified byte offset, and resumes from
+that offset after re-selection. The default is now 15m; the HTTP/2 transport's
+10s idle-health probe remains the dead-connection detector.
 
 What does explain the gap is the rate at which layer bytes reach nodes:
 
@@ -237,9 +237,9 @@ Gantry-to-baseline P95 ratio of 1.0. Every other sample in `RESULTS.md` used
    needed to parallelize it, so this is the largest untested lever.
 4. The Gantry phase is slower than baseline because of its cold start. Delivery
    takes four minutes to reach full rate while baseline is there in one, costing
-   about 2.6 minutes. Neither the 429 storm nor the 60s stalls are the cost:
-   the first is a startup transient at 1.5ms each, and the second preserves the
-   delivered prefix and occurs while delivery is at peak rate.
+   about 2.6 minutes. Neither the 429 storm nor the historical 60s stalls are
+   the cost: the first is a startup transient at 1.5ms each, and the second
+   preserves the delivered prefix and occurs while delivery is at peak rate.
 5. The ramp exists because every node walks the manifest in the same order, so
    the swarm seeds one layer position at a time instead of all 40 at once. Layer
    completions arrive in strict waves about 7 seconds apart. Baseline shows the
@@ -248,10 +248,9 @@ Gantry-to-baseline P95 ratio of 1.0. Every other sample in `RESULTS.md` used
 6. Once warm, Gantry delivers faster than pulling from the registry, peaking
    near 350 MB/s per node against about 182 MB/s for baseline.
 7. `PeerFetchTimeout` is a total request deadline rather than a no-progress
-   deadline, so the throughput a stream must sustain to survive it scales with
-   layer size: 17.9 MB/s for a 1 GiB layer, 716 MB/s for a 40 GiB one. This did
-   not dominate these runs, but it does not scale to larger layers. containerd's
-   own `image_pull_progress_timeout` uses no-progress semantics by contrast.
+   deadline. The 60s setting used by these runs imposed a size-dependent rate
+   floor: 17.9 MB/s for a 1 GiB layer and 716 MB/s for a 40 GiB one. The default
+   is now 15m, while the transport retains its 10s idle-health probe.
 8. Gantry's value on this workload is the 99.5% reduction in registry egress
    and origin pulls, not pod startup latency, which stays 15-22% above baseline.
 
