@@ -57,6 +57,10 @@ func (d *disableResolved) Do(_ context.Context) error {
 		return fmt.Errorf("read host /etc/resolv.conf: %w", err)
 	}
 
+	if d.goalState.LocalDNS.Enabled {
+		hostResolvConf = localDNSResolvConf(hostResolvConf, d.goalState.LocalDNS.NodeListenerIP.String())
+	}
+
 	dest := filepath.Join(d.goalState.MachineDir, "etc/resolv.conf")
 	if err := utilio.WriteFile(dest, hostResolvConf, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", dest, err)

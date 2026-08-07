@@ -29,7 +29,7 @@ Subcommands (called as individual workflow steps):
     unblock-external-network           Remove VM external egress block rules.
     wait-for-node                      Wait for the node to appear and become Ready.
     validate-host-nspawn-distro        Verify the nspawn machine distro matches the host.
-    validate-node-config               Verify configured labels and taints reached the Node.
+    validate-node-config               Verify configured node and kubelet settings.
     dump-persisted-agent-config        Print persisted agent config files from the VM.
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
@@ -66,7 +66,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
@@ -589,11 +589,13 @@ class NodeConfig:
     node_labels: dict[str, str]
     register_with_taints: list[str]
     node_ip: str = ""
+    kubelet_configuration: dict[str, Any] = field(default_factory=dict)
     offline_artifacts_oci_ref: str = ""
     rootfs_oci_image: str = ""
     block_external_network: bool = False
     additional_host_mounts: tuple[dict[str, Any], ...] = ()
     additional_host_devices: tuple[str, ...] = ()
+    local_dns: bool = False
     path: str = ""
 
 
@@ -628,11 +630,13 @@ def load_node_config(
     node_labels = cfg.get("nodeLabels", {})
     register_with_taints = cfg.get("registerWithTaints", [])
     node_ip = cfg.get("nodeIP", "")
+    kubelet_configuration = cfg.get("kubeletConfiguration", {})
     offline_artifacts_oci_ref = offline_artifacts_oci_ref_override or cfg.get("offlineArtifactsOCIRef", "")
     rootfs_oci_image = offline_rootfs_oci_image_override or cfg.get("offlineRootfsOCIImage", "")
     block_external_network = cfg.get("blockExternalNetwork", False)
     additional_host_mounts = cfg.get("additionalHostMounts", [])
     additional_host_devices = cfg.get("additionalHostDevices", [])
+    local_dns = cfg.get("localDNS", False)
 
     if not isinstance(name, str) or not name:
         die(f"node config {config_path} field 'name' must be a non-empty string")
@@ -647,6 +651,8 @@ def load_node_config(
         die(f"node config {config_path} field 'registerWithTaints' must be a list of strings")
     if not isinstance(node_ip, str):
         die(f"node config {config_path} field 'nodeIP' must be a string")
+    if not isinstance(kubelet_configuration, dict):
+        die(f"node config {config_path} field 'kubeletConfiguration' must be an object")
     if not isinstance(offline_artifacts_oci_ref, str):
         die(f"node config {config_path} field 'offlineArtifactsOCIRef' must be a string")
     if not isinstance(rootfs_oci_image, str):
@@ -664,6 +670,8 @@ def load_node_config(
             f"node config {config_path} field 'additionalHostMounts' must be a list of objects "
             f"with string 'source', optional string 'target', and optional bool 'readOnly'"
         )
+    if not isinstance(local_dns, bool):
+        die(f"node config {config_path} field 'localDNS' must be a boolean")
     if not isinstance(additional_host_devices, list) or not all(
         isinstance(d, str) and d for d in additional_host_devices
     ):
@@ -677,11 +685,13 @@ def load_node_config(
         node_labels=dict(node_labels),
         register_with_taints=list(register_with_taints),
         node_ip=node_ip,
+        kubelet_configuration=dict(kubelet_configuration),
         offline_artifacts_oci_ref=offline_artifacts_oci_ref,
         rootfs_oci_image=rootfs_oci_image,
         block_external_network=block_external_network,
         additional_host_mounts=tuple(dict(m) for m in additional_host_mounts),
         additional_host_devices=tuple(additional_host_devices),
+        local_dns=local_dns,
         path=str(config_path),
     )
 
@@ -726,6 +736,8 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     args: list[str] = []
     if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
+    if node_config.local_dns:
+        args.append("--local-dns")
     for key, value in sorted(expected_node_labels(node_config).items()):
         args.extend(["--node-label", f"{key}={value}"])
     for taint in expected_node_taint_strings(node_config):
@@ -744,6 +756,33 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     return args
 
 
+def inject_kubelet_configuration(bootstrap_script: str, node_config: NodeConfig) -> str:
+    """Inject a scenario's kubelet configuration into generated agent config JSON."""
+    if not node_config.kubelet_configuration:
+        return bootstrap_script
+
+    start_marker = "cat > \"${UNBOUNDED_AGENT_CONFIG_FILE}\" <<'AGENT_CONFIG_EOF'\n"
+    end_marker = "\nAGENT_CONFIG_EOF"
+    prefix, separator, remainder = bootstrap_script.partition(start_marker)
+    if not separator:
+        die("generated bootstrap script does not contain the agent config heredoc")
+
+    agent_config_json, separator, suffix = remainder.partition(end_marker)
+    if not separator:
+        die("generated bootstrap script has an unterminated agent config heredoc")
+
+    try:
+        agent_config = json.loads(agent_config_json)
+        kubelet = agent_config["Kubelet"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        die(f"generated bootstrap script contains invalid agent config: {exc}")
+
+    kubelet["Configuration"] = node_config.kubelet_configuration
+    rendered_config = json.dumps(agent_config, indent=2)
+
+    return prefix + start_marker + rendered_config + end_marker + suffix
+
+
 def log_active_node_config(node_config: NodeConfig) -> None:
     """Log the active e2e node config variant."""
     labels = [f"{key}={value}" for key, value in sorted(expected_node_labels(node_config).items())]
@@ -752,6 +791,12 @@ def log_active_node_config(node_config: NodeConfig) -> None:
     log(f"  node ip: {expected_node_ip(node_config) if node_config.node_ip else '<default>'}")
     log(f"  node labels: {', '.join(labels) if labels else '<none>'}")
     log(f"  register-with-taints: {', '.join(taints) if taints else '<none>'}")
+    kubelet_configuration = (
+        json.dumps(node_config.kubelet_configuration, sort_keys=True)
+        if node_config.kubelet_configuration
+        else "<none>"
+    )
+    log(f"  kubelet configuration: {kubelet_configuration}")
     log(f"  offline artifacts OCI ref: {node_config.offline_artifacts_oci_ref or '<none>'}")
     log(f"  rootfs OCI image: {node_config.rootfs_oci_image or '<default>'}")
     log(f"  block external network: {node_config.block_external_network}")
@@ -1957,6 +2002,7 @@ def offline_artifact_manifest(kube_version: str, container_images: list[str] | N
             "runc": "1.5.0",
             "cni": "1.5.1",
             "crictl": _crictl_version_for_kubernetes(kube_version),
+            "coredns": "1.12.3",
         },
     }
     if container_images is not None:
@@ -2369,6 +2415,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         bootstrap_args.extend(["--offline-artifacts-source", offline_source])
 
     bootstrap_script = capture(bootstrap_args)
+    bootstrap_script = inject_kubelet_configuration(bootstrap_script, node_config)
 
     # The kubeconfig uses a localhost address that is not reachable from the VM.
     # Patch the generated script to use the Kind container IP instead.
@@ -2492,21 +2539,149 @@ def _assert_expected_node_config(node: dict[str, Any], node_config: NodeConfig) 
     if node_ip not in internal_ips:
         die(f"node InternalIP mismatch: got {internal_ips}, expected {node_ip!r}")
 
+    kubelet_configuration = node_config.kubelet_configuration or {}
+    if "maxPods" in kubelet_configuration:
+        expected_max_pods = str(kubelet_configuration["maxPods"])
+        actual_max_pods = str(node.get("status", {}).get("capacity", {}).get("pods", ""))
+        if actual_max_pods != expected_max_pods:
+            die(
+                f"node pod capacity mismatch: got {actual_max_pods!r}, "
+                f"expected {expected_max_pods!r}"
+            )
+
 
 def validate_node_config(node_config: NodeConfig) -> None:
-    """Verify configured node labels and taints are present on the Node."""
+    """Verify configured node and kubelet settings."""
 
     log_active_node_config(node_config)
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)
+    validate_kubelet_configuration_config(node_config)
     validate_offline_bootstrap_config(node_config)
     validate_additional_host_mounts_config(node_config)
     validate_additional_host_devices_config(node_config)
+    validate_local_dns_config(node_config)
 
     log("============================================")
     log("  Node config validation PASSED")
     log("============================================")
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+
+def validate_kubelet_configuration_config(node_config: NodeConfig) -> None:
+    """Verify the kubelet overlay was persisted, rendered, and passed to kubelet."""
+    if not node_config.kubelet_configuration:
+        return
+
+    log("Validating kubelet configuration overlay...")
+    expected_configuration = json.dumps(node_config.kubelet_configuration, sort_keys=True)
+    expected_configuration_literal = json.dumps(expected_configuration)
+    ssh_cmd(f"""
+sudo python3 - <<'PY'
+import json
+import pathlib
+import sys
+
+expected = json.loads({expected_configuration_literal})
+paths = sorted(pathlib.Path("/tmp").glob("unbounded-agent-config.*.json"))
+paths.append(pathlib.Path("/etc/unbounded/agent/config.json"))
+paths.extend(sorted(pathlib.Path("/etc/unbounded/agent").glob("*-applied-config.json")))
+for config_path in paths:
+    if not config_path.exists():
+        continue
+    cfg = json.loads(config_path.read_text())
+    actual = (cfg.get("Kubelet") or {{}}).get("Configuration") or {{}}
+    if actual == expected:
+        print(f"Kubelet.Configuration verified in {{config_path}}: {{actual}}")
+        break
+else:
+    sys.exit(f"Kubelet.Configuration {{expected!r}} not found in agent config files")
+PY
+""")
+
+    machine = active_nspawn_machine()
+    machine_root = f"/var/lib/machines/{machine}"
+    rendered = ssh_capture(f"sudo cat {machine_root}/var/lib/kubelet/config.yaml")
+    for key, value in node_config.kubelet_configuration.items():
+        if isinstance(value, bool):
+            rendered_value = str(value).lower()
+        elif isinstance(value, (int, float)):
+            rendered_value = str(value)
+        else:
+            continue
+
+        expected_line = f"{key}: {rendered_value}"
+        if expected_line not in rendered.splitlines():
+            die(
+                f"generated kubelet config is missing {expected_line!r}; "
+                f"full config:\n{rendered}"
+            )
+
+    service = ssh_capture(f"sudo cat {machine_root}/etc/systemd/system/kubelet.service")
+    if "--config=/var/lib/kubelet/config.yaml" not in service:
+        die(f"kubelet service does not reference generated config: {service}")
+
+    log("Kubelet configuration overlay validated")
+
+
+def validate_local_dns_config(node_config: NodeConfig) -> None:
+    """Verify LocalDNS service, listeners, resolver wiring, metrics, and NOTRACK rules."""
+    if not node_config.local_dns:
+        return
+
+    log("Validating nspawn LocalDNS...")
+    machine = active_nspawn_machine()
+    machine_shell(machine, """
+systemctl is-active --quiet localdns.service
+grep -qx 'nameserver 169.254.10.10' /etc/resolv.conf
+grep -qx 'clusterDNS:' /var/lib/kubelet/config.yaml
+grep -qx -- '- 169.254.10.11' /var/lib/kubelet/config.yaml
+grep -qx 'resolvConf: /etc/unbounded/localdns/resolv.conf' /var/lib/kubelet/config.yaml
+curl --silent --fail --noproxy '*' http://169.254.10.10:8181/ready | grep -q OK
+curl --silent --fail --noproxy '*' http://169.254.10.11:8181/ready | grep -q OK
+""")
+    ssh_cmd(r"""
+python3 - <<'PY'
+import socket
+import struct
+
+
+def query(server, name):
+    qname = b''.join(bytes([len(label)]) + label.encode() for label in name.split('.')) + b'\0'
+    message = struct.pack('!HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0) + qname + struct.pack('!HH', 1, 1)
+    with socket.create_connection((server, 53), timeout=5) as sock:
+        sock.sendall(struct.pack('!H', len(message)) + message)
+        length = struct.unpack('!H', sock.recv(2))[0]
+        response = b''
+        while len(response) < length:
+            response += sock.recv(length - len(response))
+    _, flags, _, answers, _, _ = struct.unpack('!HHHHHH', response[:12])
+    if flags & 0xF:
+        raise SystemExit(f'DNS query {name} through {server} failed: rcode={flags & 0xF}, answers={answers}')
+
+
+query('169.254.10.10', 'health-check.localdns.local')
+query('169.254.10.11', 'health-check.localdns.local')
+PY
+""")
+    ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.10/32'")
+    ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.11/32'")
+    ssh_cmd("""
+set -e
+rules=$(sudo nft list table ip unbounded_localdns)
+test "$(printf '%s\\n' "${rules}" | grep -c 'unbounded-localdns: skip conntrack')" -eq 8
+for chain in output prerouting; do
+  chain_rules=$(sudo nft list chain ip unbounded_localdns "${chain}")
+  for address in 169.254.10.10 169.254.10.11; do
+    for protocol in tcp udp; do
+      printf '%s\\n' "${chain_rules}" | grep -Eq \
+        "ip daddr ${address} ${protocol} dport 53 notrack.*unbounded-localdns: skip conntrack"
+    done
+  done
+done
+""")
+    ssh_cmd(f"curl --silent --fail --noproxy '*' http://{expected_node_ip(node_config)}:9253/metrics | grep -q '^coredns_build_info'")
+    log("nspawn LocalDNS validation passed")
 
 
 def validate_offline_bootstrap_config(node_config: NodeConfig) -> None:
@@ -2750,11 +2925,45 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
     ):
         _run_scenario_command(command, node_config, env)
 
-    for command in (
-        "validate-workload",
-        "validate-node-repave-upgrade",
-    ):
-        _run_scenario_command(command, node_config, env)
+    if node_config.local_dns:
+        _run_scenario_command("validate-node-reboot-operation", node_config, env)
+        _run_scenario_command("validate-node-config", node_config, env)
+
+    _run_scenario_command("validate-workload", node_config, env)
+    _run_scenario_command("validate-node-repave-upgrade", node_config, env)
+    if node_config.local_dns:
+        _run_scenario_command("validate-node-config", node_config, env)
+        _run_scenario_command("reset-agent", node_config, env)
+        cleanup_check = (
+            "test ! -e /sys/class/net/localdns && "
+            "! sudo nft list table ip unbounded_localdns >/dev/null 2>&1"
+        )
+        deadline = time.monotonic() + 60
+        scenario_key = Path(env["VM_DIR"]) / "ssh" / "id_ed25519"
+        scenario_target = f"{VM_SSH_USER}@{env['VM_IP']}"
+        while True:
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=10",
+                    "-i", str(scenario_key),
+                    scenario_target,
+                    cleanup_check,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+            if time.monotonic() >= deadline:
+                die(
+                    "LocalDNS host state remained after reset: "
+                    f"rc={result.returncode}, stderr={result.stderr.strip()}"
+                )
+            time.sleep(2)
 
     log(f"Agent config scenario {name!r} passed")
 

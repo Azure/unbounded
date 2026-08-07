@@ -17,11 +17,16 @@ const checkOCIImageReachableName = "oci-image-reachable"
 func Preflight(log *slog.Logger, _ config.AgentConfig, goalState *goalstates.MachineGoalState) []preflight.Checker {
 	rootFS := goalState.RootFS
 
-	return []preflight.Checker{
+	checks := []preflight.Checker{
 		CheckOCIImageReachable(log, rootFS),
 		CheckKubernetesArtifacts(log, rootFS),
 		CheckCRIArtifacts(log, rootFS),
 		CheckCNIArtifacts(log, rootFS),
 		CheckNSpawnMachineProvisioning(log, rootFS),
 	}
+	if rootFS.LocalDNS.Enabled {
+		checks = append(checks, CheckLocalDNSArtifact(log, rootFS))
+	}
+
+	return checks
 }

@@ -34,6 +34,10 @@ func CrictlArtifactPath(version, hostOS, arch string) string {
 	return fmt.Sprintf("crictl/v%s/crictl-v%s-%s-%s.tar.gz", version, version, hostOS, arch)
 }
 
+func CoreDNSArtifactPath(version, arch string) string {
+	return fmt.Sprintf("coredns/v%s/bin/linux/%s/coredns", StripLeadingV(version), arch)
+}
+
 func ContainerImageArchivePath(arch, imageTag string) string {
 	imageTag = strings.TrimSpace(imageTag)
 	name := strings.NewReplacer(
@@ -62,6 +66,11 @@ func RequiredPaths(manifest Manifest, hostOS, arch string) []string {
 		CNIArtifactPath(manifest.Versions.CNI, arch),
 		CrictlArtifactPath(manifest.Versions.Crictl, hostOS, arch),
 	)
+
+	if manifest.Versions.CoreDNS != "" {
+		path := CoreDNSArtifactPath(manifest.Versions.CoreDNS, arch)
+		paths = append(paths, path, path+".sha256")
+	}
 
 	for _, imageTag := range manifest.ContainerImages {
 		path := ContainerImageArchivePath(arch, imageTag)

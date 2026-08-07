@@ -170,10 +170,12 @@ const (
 	ContainerdDefaultHostsPath = ContainerdDefaultHostsDir + "/hosts.toml"
 
 	SystemdUnitKubelet             = "kubelet.service"
+	KubeletConfigurationPath       = "/var/lib/kubelet/config.yaml"
 	KubeletKubeconfigPath          = "/var/lib/kubelet/kubeconfig"
 	KubeletBootstrapKubeconfigPath = "/var/lib/kubelet/bootstrap-kubeconfig"
 	KubeletPKIDir                  = "/etc/kubernetes/pki"
 	KubeletAPIServerCACertPath     = "/etc/kubernetes/pki/apiserver-client-ca.crt"
 	KubeletServiceDropInDir        = "/etc/systemd/system/kubelet.service.d"
 	KubeletStaticPodManifestsDir   = "/etc/kubernetes/manifests"
+	LocalDNSResolvConfPath         = "/etc/unbounded/localdns/resolv.conf"
 )
