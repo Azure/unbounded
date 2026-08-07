@@ -255,6 +255,29 @@ scrapes at 10-second cadence, so the screen updates each second while grid and
 counter values advance at scrape cadence.
 Use `MONITOR_ARGS="--once --no-clear"` for a single non-interactive snapshot.
 
+### Gantry CPU profiles
+
+Benchmark deployments enable Go pprof on each Gantry pod at the loopback-only
+address `127.0.0.1:6060`. It is not declared as a pod port and is reachable
+from the workstation only through `kubectl port-forward`. During an active
+Gantry-cold phase, capture concurrent CPU profiles from the three nodes with
+the highest one-minute CPU utilization:
+
+```bash
+make -C hack/gantry-benchmark profile-gantry
+```
+
+Override the sample duration and node count with `GANTRY_PPROF_SECONDS` and
+`GANTRY_PPROF_COUNT`. The command stores individual and merged protobuf
+profiles plus text reports under `tmp/gantry-pprof/<run>-<timestamp>/` and
+prints the merged top functions. Open the merged profile interactively with
+the `go tool pprof -http=...` command printed at completion.
+
+CPU profiling adds runtime overhead to the selected pods. Treat a profiled
+run as diagnostic and do not use it for benchmark comparisons. The sampler
+annotates the active Job with the capture timestamp, duration, and pod count so
+the diagnostic status remains visible after the run finishes.
+
 ## Reusable Gantry image pool
 
 Gantry-only benchmarks can consume prebuilt images instead of generating,

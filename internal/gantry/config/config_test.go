@@ -199,6 +199,72 @@ func TestValidate_MirrorListenAllowNonLoopbackOptIn(t *testing.T) {
 	}
 }
 
+func TestPprofListenConfig(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		if got := NewDefault().PprofListen; got != "" {
+			t.Fatalf("PprofListen = %q, want disabled", got)
+		}
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+		if err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_PPROF_LISTEN" {
+				return "127.0.0.1:6060"
+			}
+
+			return ""
+		}); err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.PprofListen != "127.0.0.1:6060" {
+			t.Fatalf("PprofListen = %q", c.PprofListen)
+		}
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--pprof-listen=localhost:6060"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.PprofListen != "localhost:6060" {
+			t.Fatalf("PprofListen = %q", c.PprofListen)
+		}
+	})
+}
+
+func TestValidate_PprofListenMustBeLoopback(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:6060", "10.0.0.1:6060", ":6060", "pod.example:6060", "127.0.0.1:0", "127.0.0.1:70000", "127.0.0.1:http"} {
+		t.Run(address, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			c.PprofListen = address
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), "pprof_listen") {
+				t.Fatalf("want pprof validation error, got %v", err)
+			}
+		})
+	}
+
+	for _, address := range []string{"127.0.0.1:6060", "[::1]:6060", "localhost:6060"} {
+		t.Run(address, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			c.PprofListen = address
+
+			if err := c.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidate_DuplicateUpstreamName(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{

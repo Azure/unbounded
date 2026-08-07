@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-pool operator-vm-image-pool-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
@@ -10,6 +10,7 @@ help: ## Show benchmark targets
 	@echo ""
 	@echo "  test         Run focused proxy and benchmark tests"
 	@echo "  monitor      Live peer-outcome and layer-byte tables for the active Gantry phase"
+	@echo "  profile-gantry  CPU-profile the hottest Gantry pods in an active diagnostic run"
 	@echo "  deploy       Idempotently deploy the complete benchmark stack"
 	@echo "  deploy-plan  Print the resolved deployment contract without mutation"
 	@echo "  deploy-status  Report deployment readiness without mutation"
@@ -48,8 +49,17 @@ monitor:
 	export KUBECONFIG="$${DEPLOY_KUBECONFIG:-$(REPO_ROOT)/tmp/$${DEPLOYMENT_NAME}/kubeconfig}"; \
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark-monitor $(MONITOR_ARGS)
 
+profile-gantry: operator-vm-check
+	set -a; \
+	. "$(DEPLOY_CONFIG)"; \
+	set +a; \
+	export KUBECONFIG="$${DEPLOY_KUBECONFIG:-$(REPO_ROOT)/tmp/$${DEPLOYMENT_NAME}/kubeconfig}"; \
+	cd "$(REPO_ROOT)" && GANTRY_PPROF_SECONDS="$${GANTRY_PPROF_SECONDS:-30}" \
+		GANTRY_PPROF_COUNT="$${GANTRY_PPROF_COUNT:-3}" \
+		hack/gantry-benchmark/profile-gantry.sh
+
 operator-vm-check:
-	bash -n deploy.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-status.sh operator-vm-watch.sh
+	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-status.sh operator-vm-watch.sh
 	./deploy.sh plan deploy.env.example >/dev/null
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh

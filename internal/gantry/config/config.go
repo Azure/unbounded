@@ -97,6 +97,12 @@ type Config struct {
 	// and pod ports, not in the bind address.
 	MetricsListen string `yaml:"metrics_listen"`
 
+	// PprofListen is an optional Go runtime profiling endpoint. Empty disables
+	// profiling. When enabled it must bind loopback so profiles, command lines,
+	// and runtime state are reachable only through local access such as
+	// `kubectl port-forward`.
+	PprofListen string `yaml:"pprof_listen"`
+
 	// Libp2pListen is the multiaddr(s) the libp2p host advertises (the design doc).
 	// Empty means "use libp2p defaults" and pick at random.
 	Libp2pListen []string `yaml:"libp2p_listen"`
@@ -454,6 +460,7 @@ func NewDefault() *Config {
 		MirrorBindAllowNonLoopback: false,
 		TransferListen:             "0.0.0.0:5001",
 		MetricsListen:              "0.0.0.0:9095",
+		PprofListen:                "",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
 
@@ -583,6 +590,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
+	setStr("PPROF_LISTEN", &c.PprofListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
 
 	setStr("NODE_NAME", &c.NodeName)
@@ -649,6 +657,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
+	fs.StringVar(&c.PprofListen, "pprof-listen", c.PprofListen, "optional loopback address for Go runtime profiles (empty disables pprof)")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
@@ -761,6 +770,22 @@ func (c *Config) Validate() error {
 	mustAddr("mirror_listen", c.MirrorListen)
 	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
+
+	if c.PprofListen != "" {
+		mustAddr("pprof_listen", c.PprofListen)
+
+		if host, portText, err := net.SplitHostPort(c.PprofListen); err == nil {
+			ip := net.ParseIP(host)
+			if host == "" || (ip != nil && !ip.IsLoopback()) || (ip == nil && host != "localhost") {
+				errs = append(errs, fmt.Errorf("pprof_listen %q must bind loopback (127.0.0.1, ::1, or localhost)", c.PprofListen))
+			}
+
+			port, portErr := strconv.Atoi(portText)
+			if portErr != nil || port < 1 || port > 65535 {
+				errs = append(errs, fmt.Errorf("pprof_listen %q must use a numeric port between 1 and 65535", c.PprofListen))
+			}
+		}
+	}
 
 	// MirrorListen MUST be loopback (the design doc, the design doc) unless the operator has
 	// explicitly opted in to a non-loopback bind. See the field comment on

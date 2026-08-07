@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -976,7 +977,25 @@ func runAgent(args []string) error {
 	// agent_readiness.go for the full handler wiring.
 	metricsHTTP, metricsErr := startOpsEndpoint(c.MetricsListen, reg, readyCheck, logger)
 
-	// Block until signal or metrics-server crash.
+	var pprofHTTP *http.Server
+
+	if c.PprofListen != "" {
+		startedPprofHTTP, pprofErr, pprofListenErr := startPprofEndpoint(c.PprofListen, logger)
+		if pprofListenErr != nil {
+			logger.Warn("pprof endpoint unavailable", slog.Any("err", pprofListenErr))
+		} else {
+			pprofHTTP = startedPprofHTTP
+
+			go func() {
+				if pprofServeErr, ok := <-pprofErr; ok && pprofServeErr != nil {
+					logger.Warn("pprof endpoint died", slog.Any("err", pprofServeErr))
+				}
+			}()
+		}
+	}
+
+	// Block until signal or an essential background server crashes. Profiling
+	// is diagnostic and never owns data-plane availability.
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
@@ -998,6 +1017,7 @@ func runAgent(args []string) error {
 		coordStop:      func() { coordServer.Unbind(disco.LibP2P()) },
 		pullerPumpGate: pullerPumpGate,
 		metricsHTTP:    metricsHTTP,
+		pprofHTTP:      pprofHTTP,
 		shutdownBudget: 10 * time.Second,
 	})
 	logger.Info("gantry stopped")

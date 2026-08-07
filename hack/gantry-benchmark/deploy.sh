@@ -927,7 +927,8 @@ deploy_gantry() {
   rm -rf "$rendered"
   GOTOOLCHAIN=auto go run "$repo_root/hack/cmd/render-manifests" \
     --templates-dir "$repo_root/deploy/gantry" --output-dir "$rendered" \
-    --set "Namespace=$GANTRY_NAMESPACE" --set "Image=$GANTRY_IMAGE"
+    --set "Namespace=$GANTRY_NAMESPACE" --set "Image=$GANTRY_IMAGE" \
+    --set "PprofListen=127.0.0.1:6060"
   sed -i "s/registry\.example\.com/$GANTRY_ACR_LOGIN_SERVER/g" "$rendered/configmap.yaml"
 
   kubectl apply -f "$rendered/serviceaccount.yaml"

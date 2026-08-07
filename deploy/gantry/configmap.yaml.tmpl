@@ -43,6 +43,9 @@ data:
     mirror_bind_allow_non_loopback: true
     transfer_listen: "0.0.0.0:5001"
     metrics_listen: "0.0.0.0:9095"
+    # Disabled by default. When enabled, Config.Validate requires a loopback
+    # bind; use kubectl port-forward rather than exposing this as a pod port.
+    pprof_listen: {{ default "" .PprofListen | quote }}
 
     # ---------- libp2p ----------
     # IPv4 wildcard listeners. The pods/patch self-announce only
