@@ -2,13 +2,14 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt preflight run run-gantry status disable
+.PHONY: help test monitor deploy deploy-plan deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch proxy-image proxy-push enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-adopt preflight run run-gantry status disable
 
 help: ## Show benchmark targets
 	@echo ""
 	@echo "Usage: make -C hack/gantry-benchmark <target> [ENV_FILE=path]"
 	@echo ""
 	@echo "  test         Run focused proxy and benchmark tests"
+	@echo "  monitor      Live peer-outcome and layer-byte tables for the active Gantry phase"
 	@echo "  deploy       Idempotently deploy the complete benchmark stack"
 	@echo "  deploy-plan  Print the resolved deployment contract without mutation"
 	@echo "  deploy-status  Report deployment readiness without mutation"
@@ -32,7 +33,14 @@ help: ## Show benchmark targets
 
 test:
 	$(MAKE) operator-vm-check
-	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go test ./hack/cmd/acr-origin-proxy ./hack/cmd/gantry-benchmark
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go test ./hack/cmd/acr-origin-proxy ./hack/cmd/gantry-benchmark ./hack/cmd/gantry-benchmark-monitor
+
+monitor:
+	set -a; \
+	. "$(DEPLOY_CONFIG)"; \
+	set +a; \
+	export KUBECONFIG="$${DEPLOY_KUBECONFIG:-$(REPO_ROOT)/tmp/$${DEPLOYMENT_NAME}/kubeconfig}"; \
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark-monitor $(MONITOR_ARGS)
 
 operator-vm-check:
 	bash -n deploy.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-run.sh operator-vm-status.sh operator-vm-watch.sh

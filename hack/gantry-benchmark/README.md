@@ -215,6 +215,20 @@ machine-readable live push byte percentage, so the view reports that limitation
 instead of estimating it. Use `operator-vm-status` for a single snapshot.
 Override the refresh cadence with `WATCH_INTERVAL_SECONDS` (default 30).
 
+For the Gantry pull phase, use the dedicated live monitor from the workstation:
+
+```bash
+make -C hack/gantry-benchmark monitor
+```
+
+It redraws every second and shows per-phase-minute peer outcomes (`busy`,
+`hit`, `stall`, `notfound`, `unavailable`) alongside layer bytes, aggregate
+and per-node throughput, and cumulative payload percentage. The monitor uses
+one server-side aggregated Prometheus range query per refresh; it does not
+download per-pod series. Prometheus scrapes Gantry every 10 seconds, so the
+screen updates each second while counter values advance at scrape cadence.
+Use `MONITOR_ARGS="--once --no-clear"` for a single non-interactive snapshot.
+
 Artifacts persist on the VM under
 `/var/lib/gantry-benchmark/artifacts/<run-id>/`; `latest` points at the newest
 run. By default the operator is a `Standard_D32ds_v5` with a dedicated 512 GiB
