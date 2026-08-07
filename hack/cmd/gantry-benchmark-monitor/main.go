@@ -28,6 +28,7 @@ const (
 	defaultPrometheusService  = "kps-kube-prometheus-stack-prometheus"
 	stateConfigMapName        = "gantry-benchmark-state"
 	gantryPhaseLabel          = "gantry-cold"
+	gridQueryInterval         = 10 * time.Second
 )
 
 type monitorConfig struct {
@@ -39,6 +40,8 @@ type monitorConfig struct {
 	prometheusService   string
 	runID               string
 	refreshInterval     time.Duration
+	nodePage            int
+	nodesPerPage        int
 	once                bool
 	noClear             bool
 }
@@ -80,6 +83,7 @@ type monitorSession struct {
 	monitoringNamespace string
 	prometheusService   string
 	revision            string
+	image               string
 }
 
 type jobStatus struct {
@@ -102,8 +106,8 @@ func parseConfig(args []string) (monitorConfig, error) {
 	flags := flag.NewFlagSet("gantry-benchmark-monitor", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), "Usage: gantry-benchmark-monitor [options]")                     //nolint:errcheck // best-effort help output
-		fmt.Fprintln(flags.Output(), "Live per-minute Gantry peer outcomes and layer-byte delivery.") //nolint:errcheck // best-effort help output
+		fmt.Fprintln(flags.Output(), "Usage: gantry-benchmark-monitor [options]")                           //nolint:errcheck // best-effort help output
+		fmt.Fprintln(flags.Output(), "Live peer traffic, layer downloads, image unpacking, and Pod state.") //nolint:errcheck // best-effort help output
 		flags.PrintDefaults()
 	}
 
@@ -115,6 +119,8 @@ func parseConfig(args []string) (monitorConfig, error) {
 	flags.StringVar(&config.prometheusService, "prometheus-service", envDefault("PROMETHEUS_SERVICE", defaultPrometheusService), "Prometheus service")
 	flags.StringVar(&config.runID, "run-id", "", "run ID (default: active benchmark state)")
 	flags.DurationVar(&config.refreshInterval, "refresh", time.Second, "display and query refresh interval")
+	flags.IntVar(&config.nodePage, "node-page", 1, "1-based node page shown in progress grids")
+	flags.IntVar(&config.nodesPerPage, "nodes-per-page", defaultGridColumns(), "node columns shown per progress-grid page")
 	flags.BoolVar(&config.once, "once", false, "print one snapshot and exit")
 	flags.BoolVar(&config.noClear, "no-clear", false, "do not redraw the terminal")
 
@@ -124,6 +130,14 @@ func parseConfig(args []string) (monitorConfig, error) {
 
 	if config.refreshInterval <= 0 {
 		return monitorConfig{}, fmt.Errorf("refresh must be positive, got %s", config.refreshInterval)
+	}
+
+	if config.nodePage < 1 {
+		return monitorConfig{}, fmt.Errorf("node-page must be at least 1, got %d", config.nodePage)
+	}
+
+	if config.nodesPerPage < 1 {
+		return monitorConfig{}, fmt.Errorf("nodes-per-page must be at least 1, got %d", config.nodesPerPage)
 	}
 
 	return config, nil
@@ -215,6 +229,14 @@ func loadJob(ctx context.Context, runner kubectlRunner, namespace, runID string)
 			} `json:"metadata"`
 			Spec struct {
 				Completions int `json:"completions"`
+				Template    struct {
+					Spec struct {
+						Containers []struct {
+							Name  string `json:"name"`
+							Image string `json:"image"`
+						} `json:"containers"`
+					} `json:"spec"`
+				} `json:"template"`
 			} `json:"spec"`
 			Status struct {
 				StartTime  string `json:"startTime"`
@@ -253,7 +275,25 @@ func loadJob(ctx context.Context, runner kubectlRunner, namespace, runID string)
 		}
 	}
 
-	return monitorSession{jobName: job.Metadata.Name, phaseStart: startedAt, nodeCount: job.Spec.Completions}, status, nil
+	image := ""
+
+	for _, container := range job.Spec.Template.Spec.Containers {
+		if container.Name == "pull" {
+			image = container.Image
+			break
+		}
+	}
+
+	return monitorSession{jobName: job.Metadata.Name, phaseStart: startedAt, nodeCount: job.Spec.Completions, image: image}, status, nil
+}
+
+func defaultGridColumns() int {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return defaultNodesPerPage
+	}
+
+	return min(96, max(16, width-14))
 }
 
 func discoverSession(ctx context.Context, runner kubectlRunner, config monitorConfig) (monitorSession, jobStatus, error) {
@@ -335,6 +375,46 @@ func queryPrometheusRange(ctx context.Context, runner kubectlRunner, session mon
 	return parseRangeResponse(output)
 }
 
+func progressExpression(session monitorSession, config monitorConfig) string {
+	downloadLabels := fmt.Sprintf(
+		`namespace=%s,gantry_benchmark="true",controller_revision_hash=%s`,
+		strconv.Quote(config.gantryNamespace),
+		strconv.Quote(session.revision),
+	)
+
+	observerLabels := fmt.Sprintf(`namespace=%s,gantry_benchmark="true"`, strconv.Quote(config.benchmarkNamespace))
+
+	if digest := imageDigest(session.image); digest != "" {
+		downloadLabels += `,image_digest=` + strconv.Quote(digest)
+	}
+
+	if session.image != "" {
+		observerLabels += `,image=` + strconv.Quote(session.image)
+	}
+
+	return fmt.Sprintf(`gantry_layer_download_completed_timestamp_seconds{%s} or {__name__=~"gantry_benchmark_(image_unpack_started|image_unpacked|layer_unpacked)_timestamp_seconds",%s}`,
+		downloadLabels,
+		observerLabels,
+	)
+}
+
+func queryProgress(ctx context.Context, runner kubectlRunner, session monitorSession, config monitorConfig, now time.Time) (instantResponse, error) {
+	rawPath := fmt.Sprintf(
+		"/api/v1/namespaces/%s/services/http:%s:9090/proxy/api/v1/query?query=%s&time=%s",
+		session.monitoringNamespace,
+		session.prometheusService,
+		url.QueryEscape(progressExpression(session, config)),
+		url.QueryEscape(now.UTC().Format(time.RFC3339Nano)),
+	)
+
+	output, err := runner.run(ctx, "get", "--raw", rawPath)
+	if err != nil {
+		return instantResponse{}, err
+	}
+
+	return parseInstantResponse(output)
+}
+
 func renderWaiting(config monitorConfig, err error) {
 	if !config.noClear && term.IsTerminal(int(os.Stdout.Fd())) {
 		fmt.Print("\033[H\033[2J")
@@ -350,6 +430,9 @@ func runMonitor(ctx context.Context, config monitorConfig) error {
 		session      *monitorSession
 		podTracker   *podStateTracker
 		lastSnapshot monitorSnapshot
+		lastProgress progressGrid
+		gridError    string
+		nextGridAt   time.Time
 	)
 
 	for {
@@ -436,15 +519,41 @@ func runMonitor(ctx context.Context, config monitorConfig) error {
 		lastSnapshot.RefreshInterval = config.refreshInterval
 		lastSnapshot.Job = status
 		lastSnapshot.Color = term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("NO_COLOR") == ""
+		lastSnapshot.NodePage = config.nodePage
+		lastSnapshot.NodesPerPage = config.nodesPerPage
+
+		var nodes []string
 
 		if podTracker != nil {
 			counts, podErr := podTracker.snapshot()
+			nodes = podTracker.snapshotNodes()
 
 			lastSnapshot.PodStates = counts
 			if podErr != nil {
 				lastSnapshot.PodStateError = podErr.Error()
 			}
 		}
+
+		if status.Complete || !now.Before(nextGridAt) {
+			gridCtx, gridCancel := context.WithTimeout(ctx, 15*time.Second)
+			gridResponse, gridErr := queryProgress(gridCtx, runner, *session, config, now)
+
+			gridCancel()
+
+			if gridErr != nil {
+				gridError = gridErr.Error()
+			} else {
+				lastProgress = aggregateProgressGrid(gridResponse, nodes, session.image)
+				gridError = ""
+			}
+
+			nextGridAt = now.Add(gridQueryInterval)
+		} else if len(nodes) > 0 {
+			lastProgress.Nodes = append(lastProgress.Nodes[:0], nodes...)
+		}
+
+		lastSnapshot.Progress = lastProgress
+		lastSnapshot.GridError = gridError
 
 		if !config.noClear && term.IsTerminal(int(os.Stdout.Fd())) {
 			fmt.Print("\033[H\033[2J")

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -41,6 +42,7 @@ type podStateCounts struct {
 type podStateTracker struct {
 	mu     sync.RWMutex
 	states map[string]podState
+	nodes  map[string]string
 	err    error
 }
 
@@ -69,7 +71,7 @@ func newPodStateTracker(ctx context.Context, kubeconfig, namespace, jobName stri
 		return nil, fmt.Errorf("create Kubernetes client: %w", err)
 	}
 
-	tracker := &podStateTracker{states: map[string]podState{}}
+	tracker := &podStateTracker{states: map[string]podState{}, nodes: map[string]string{}}
 	if err := tracker.replaceFromList(ctx, client, namespace, jobName); err != nil {
 		return nil, err
 	}
@@ -86,13 +88,18 @@ func (t *podStateTracker) replaceFromList(ctx context.Context, client kubernetes
 	}
 
 	states := make(map[string]podState, len(list.Items))
+	nodes := make(map[string]string, len(list.Items))
+
 	for index := range list.Items {
 		pod := &list.Items[index]
-		states[string(pod.UID)] = classifyPod(pod)
+		key := string(pod.UID)
+		states[key] = classifyPod(pod)
+		nodes[key] = pod.Spec.NodeName
 	}
 
 	t.mu.Lock()
 	t.states = states
+	t.nodes = nodes
 	t.err = nil
 	t.mu.Unlock()
 
@@ -113,12 +120,16 @@ func (t *podStateTracker) run(ctx context.Context, client kubernetes.Interface, 
 		}
 
 		states := make(map[string]podState, len(list.Items))
+		nodes := make(map[string]string, len(list.Items))
+
 		for index := range list.Items {
 			pod := &list.Items[index]
-			states[string(pod.UID)] = classifyPod(pod)
+			key := string(pod.UID)
+			states[key] = classifyPod(pod)
+			nodes[key] = pod.Spec.NodeName
 		}
 
-		t.replace(states)
+		t.replace(states, nodes)
 
 		watcher, err := client.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
 			LabelSelector:       "job-name=" + jobName,
@@ -169,8 +180,10 @@ func (t *podStateTracker) consumeWatch(ctx context.Context, watcher watch.Interf
 			t.mu.Lock()
 			if event.Type == watch.Deleted {
 				delete(t.states, key)
+				delete(t.nodes, key)
 			} else {
 				t.states[key] = classifyPod(pod)
+				t.nodes[key] = pod.Spec.NodeName
 			}
 
 			t.err = nil
@@ -191,9 +204,10 @@ func waitForRetry(ctx context.Context) bool {
 	}
 }
 
-func (t *podStateTracker) replace(states map[string]podState) {
+func (t *podStateTracker) replace(states map[string]podState, nodes map[string]string) {
 	t.mu.Lock()
 	t.states = states
+	t.nodes = nodes
 	t.err = nil
 	t.mu.Unlock()
 }
@@ -230,6 +244,27 @@ func (t *podStateTracker) snapshot() (podStateCounts, error) {
 	}
 
 	return counts, t.err
+}
+
+func (t *podStateTracker) snapshotNodes() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	seen := make(map[string]struct{}, len(t.nodes))
+	for _, node := range t.nodes {
+		if node != "" {
+			seen[node] = struct{}{}
+		}
+	}
+
+	nodes := make([]string, 0, len(seen))
+	for node := range seen {
+		nodes = append(nodes, node)
+	}
+
+	sort.Strings(nodes)
+
+	return nodes
 }
 
 func classifyPod(pod *corev1.Pod) podState {

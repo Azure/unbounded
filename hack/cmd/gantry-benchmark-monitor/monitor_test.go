@@ -155,6 +155,28 @@ func TestPrometheusExpressionScopesCurrentRevision(t *testing.T) {
 	}
 }
 
+func TestProgressExpressionScopesCurrentImage(t *testing.T) {
+	expression := progressExpression(monitorSession{
+		revision: "gantry-abc123",
+		image:    "registry.example/pull@sha256:image",
+	}, monitorConfig{
+		gantryNamespace:    "gantry-system",
+		benchmarkNamespace: "gantry-benchmark",
+	})
+
+	for _, want := range []string{
+		`gantry_layer_download_completed_timestamp_seconds`,
+		`controller_revision_hash="gantry-abc123"`,
+		`image_digest="sha256:image"`,
+		`gantry_benchmark_(image_unpack_started|image_unpacked|layer_unpacked)_timestamp_seconds`,
+		`image="registry.example/pull@sha256:image"`,
+	} {
+		if !strings.Contains(expression, want) {
+			t.Errorf("expression %q is missing %q", expression, want)
+		}
+	}
+}
+
 func TestCommaInteger(t *testing.T) {
 	for value, want := range map[float64]string{
 		0:        "0",

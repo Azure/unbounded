@@ -83,3 +83,21 @@ func TestPodStateTrackerSnapshot(t *testing.T) {
 		t.Fatalf("counts = %#v, want %#v", counts, want)
 	}
 }
+
+func TestPodStateTrackerSnapshotNodes(t *testing.T) {
+	t.Parallel()
+
+	tracker := &podStateTracker{nodes: map[string]string{
+		"a": "node-c",
+		"b": "node-a",
+		"c": "node-c",
+		"d": "",
+	}}
+
+	got := tracker.snapshotNodes()
+	want := []string{"node-a", "node-c"}
+
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("snapshotNodes() = %v, want %v", got, want)
+	}
+}
