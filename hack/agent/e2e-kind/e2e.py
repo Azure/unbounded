@@ -62,6 +62,7 @@ import os
 import re
 import secrets
 import shutil
+import ssl
 import subprocess
 import sys
 import textwrap
@@ -1178,10 +1179,31 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
     """Serve *tarball* to the VM, create AgentUpgrade, and wait for it."""
 
     runner_ip = VM_GATEWAY
-    agent_url = f"http://{runner_ip}:{SERVE_PORT}/{tarball.name}"
-    log(f"Starting HTTP file server on {runner_ip}:{SERVE_PORT} for {tarball.name}...")
+    agent_url = f"https://{runner_ip}:{SERVE_PORT}/{tarball.name}"
+    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    cert_path = tarball.parent / "agent-upgrade-e2e.crt"
+    key_path = tarball.parent / "agent-upgrade-e2e.key"
+    run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+        "-subj", f"/CN={runner_ip}", "-addext", f"subjectAltName=IP:{runner_ip}",
+        "-keyout", str(key_path), "-out", str(cert_path),
+    ])
+    scp_cmd(str(cert_path), f"{SSH_TARGET}:/tmp/agent-upgrade-e2e.crt")
+    ssh_cmd(
+        "if command -v update-ca-certificates >/dev/null 2>&1; then "
+        "sudo cp /tmp/agent-upgrade-e2e.crt /usr/local/share/ca-certificates/agent-upgrade-e2e.crt && "
+        "sudo update-ca-certificates >/dev/null; "
+        "else sudo cp /tmp/agent-upgrade-e2e.crt /etc/pki/ca-trust/source/anchors/agent-upgrade-e2e.crt && "
+        "sudo update-ca-trust; fi"
+    )
+    ssh_cmd("sudo systemctl restart unbounded-agent-daemon.service")
+    wait_for_daemon_active()
+    log(f"Starting HTTPS file server on {runner_ip}:{SERVE_PORT} for {tarball.name}...")
     handler = _make_handler(str(tarball.parent))
     httpd = HTTPServer((runner_ip, SERVE_PORT), handler)
+    tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    httpd.socket = tls_context.wrap_socket(httpd.socket, server_side=True)
     server_thread = Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
     try:
@@ -1193,7 +1215,7 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
             operation_name,
             AGENT_MACHINE_NAME,
             "AgentUpgrade",
-            parameters={"downloadURL": agent_url},
+            parameters={"downloadURL": agent_url, "sha256": digest},
         )
         if expect_complete:
             return wait_for_machine_operation_complete(operation_name)
