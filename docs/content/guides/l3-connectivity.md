@@ -337,10 +337,14 @@ kubectl get nodes -l unbounded-cloud.io/unbounded-net-gateway=true
 
 ## 6. Initialize the Site
 
-Run `kubectl unbounded site init` to install the networking stack and create
-site resources. The CIDRs must match the networks reachable over the VPN:
+Install `unbounded-operator` (if you haven't already), then run
+`kubectl unbounded site init` to create the site resources. `site init` requires
+the operator to be installed and errors otherwise. The CIDRs must match the
+networks reachable over the VPN:
 
 ```bash
+kubectl unbounded install
+
 kubectl unbounded site init \
     --name ubiquiti-site \
     --cluster-node-cidr 10.224.0.0/16 \
@@ -363,13 +367,13 @@ kubectl unbounded site init \
 
 This command creates:
 
-- The **unbounded-net CNI** controller and node agent
+- The **unbounded-operator**, which deploys the enabled components
 - A **cluster** Site for the AKS nodes
 - A **ubiquiti-site** Site for the remote machines
 - A **GatewayPool** (`gw-main`) selecting labeled gateway nodes
 - **SiteGatewayPoolAssignments** linking both sites to the gateway pool
 - A **bootstrap token** for the remote site
-- The **machina** controller for SSH-based provisioning
+- Component settings that enable unbounded-net and the **machina** controller
 
 ---
 
@@ -482,11 +486,11 @@ kubectl get nodes -w
 ```bash
 # Run a pod on the remote node
 kubectl run test-remote --image=busybox --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"ubiquiti-site"}}}' \
+    --overrides='{"spec":{"nodeSelector":{"unbounded-cloud.io/site":"ubiquiti-site"}}}' \
     -- sleep 3600
 
 # Get a cluster node's internal IP
-CLUSTER_NODE_IP=$(kubectl get nodes -l 'net.unbounded-cloud.io/site=cluster' \
+CLUSTER_NODE_IP=$(kubectl get nodes -l 'unbounded-cloud.io/site=cluster' \
     -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
 # Ping a cluster node from the remote pod (over the VPN -- no WireGuard)
@@ -494,7 +498,7 @@ kubectl exec test-remote -- ping -c 3 "$CLUSTER_NODE_IP"
 
 # Run a pod on a cluster node and curl it from the remote pod
 kubectl run test-cluster --image=nginx --restart=Never \
-    --overrides='{"spec":{"nodeSelector":{"net.unbounded-cloud.io/site":"cluster"}}}'
+    --overrides='{"spec":{"nodeSelector":{"unbounded-cloud.io/site":"cluster"}}}'
 kubectl wait --for=condition=ready pod/test-cluster --timeout=60s
 CLUSTER_POD_IP=$(kubectl get pod test-cluster -o jsonpath='{.status.podIP}')
 kubectl exec test-remote -- wget -qO- "http://$CLUSTER_POD_IP"

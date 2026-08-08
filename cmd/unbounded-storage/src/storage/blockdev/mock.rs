@@ -34,7 +34,6 @@ pub enum MockFaultMode {
 pub struct MockDeviceConfig {
     pub page_size: usize,
     pub capacity_pages: u64,
-    pub write_queue_depth: u32,
     pub fault_mode: MockFaultMode,
     pub fault_errno: i32,
 }
@@ -44,7 +43,6 @@ impl Default for MockDeviceConfig {
         Self {
             page_size: 4096,
             capacity_pages: 1024,
-            write_queue_depth: 32,
             fault_mode: MockFaultMode::None,
             fault_errno: libc_eio(),
         }
@@ -149,10 +147,6 @@ impl BlockDevice for MockDevice {
     fn register_buffers(&self, base: *mut u8, len: usize) -> Result<(), Error> {
         self.registered.borrow_mut().push((base, len));
         Ok(())
-    }
-
-    fn write_queue_depth(&self) -> u32 {
-        self.cfg.get().write_queue_depth
     }
 
     async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), Error> {

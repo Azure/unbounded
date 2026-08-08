@@ -126,11 +126,16 @@ type Members interface {
 // ---------------------------------------------------------------------------
 
 // OriginRef identifies a digest at a specific upstream registry / repository.
-// The triple matches the fields of coordv1.PleasePullRequest.
+// Request-scoped registry authorization is carried through context rather than
+// this value so credentials cannot accidentally be persisted or logged with a
+// content reference.
 type OriginRef struct {
 	Registry   string // e.g. "registry.example.com"
 	Repository string // e.g. "library/nginx"
 	Digest     digest.Digest
+	// Offset requests bytes starting at this position when fetching from a
+	// peer. Origin registry callers ignore it. Zero requests the full object.
+	Offset int64
 
 	// Kind discriminates the OCI Distribution Spec URL family for this
 	// reference. Manifests live at /v2/<repo>/manifests/<digest>, blobs at
@@ -245,9 +250,10 @@ type OriginPuller interface {
 // failures. The Class field is the classification used by the negative
 // cache and propagated via PullIntentResponse.failure_class.
 type OriginError struct {
-	Ref   OriginRef
-	Class FailureClass
-	Err   error
+	Ref       OriginRef
+	Class     FailureClass
+	Challenge string
+	Err       error
 }
 
 func (e *OriginError) Error() string {
@@ -283,8 +289,11 @@ const (
 type PeerDialer interface {
 	// FetchFromPeer streams the digest's bytes from peerAddr's :5001
 	// endpoint. The implementation MUST set `Gantry-Mirrored: 1` and MUST
+	// forward any request-scoped Basic/Bearer authorization carried by ctx, and MUST
 	// surface a NotFound error distinctly from transport errors so the
-	// caller can fail over to the next provider.
+	// caller can fail over to the next provider. When ref.Offset is non-zero,
+	// the implementation MUST request and validate a response beginning at
+	// that byte and still return the full object size.
 	FetchFromPeer(ctx context.Context, peerAddr string, ref OriginRef) (io.ReadCloser, int64, error)
 }
 

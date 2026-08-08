@@ -25,13 +25,72 @@ use std::path::Path;
 
 use prost::Message;
 
-use super::graph::runtime_projection;
+use super::graph::{RuntimeGraph, project_runtime, route_snapshot, validate_binding_graph};
 use super::schema::{Config, backend_spec, disk_spec, frontend_spec, peer_spec};
+use crate::p2p::RouteTableSnapshot;
+
+/// One finalized configuration and every immutable runtime view derived from it.
+pub struct LoadedConfig {
+    config: Config,
+    runtime: RuntimeGraph,
+    routes: RouteTableSnapshot,
+}
+
+impl fmt::Debug for LoadedConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadedConfig")
+            .field("version", &self.config.version)
+            .field("backend_count", &self.config.backends.len())
+            .field("frontend_count", &self.config.frontends.len())
+            .field("cache_count", &self.config.caches.len())
+            .field("disk_count", &self.config.disks.len())
+            .field("peer_count", &self.config.peers.len())
+            .field("route_cache_ids", &self.routes.cache_ids)
+            .field("has_fingers", &self.routes.fingers.is_some())
+            .finish()
+    }
+}
+
+impl LoadedConfig {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        load(path.as_ref())
+    }
+
+    pub fn from_config(mut config: Config) -> Result<Self, ConfigError> {
+        config.apply_defaults();
+        validate(&config)?;
+        let runtime = project_runtime(&config);
+        let routes = route_snapshot(&runtime);
+        Ok(Self {
+            config,
+            runtime,
+            routes,
+        })
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn runtime(&self) -> &RuntimeGraph {
+        &self.runtime
+    }
+
+    pub fn routes(&self) -> &RouteTableSnapshot {
+        &self.routes
+    }
+
+    pub fn into_config(self) -> Config {
+        self.config
+    }
+}
 
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
-    Toml(toml::de::Error),
+    Toml {
+        span: Option<std::ops::Range<usize>>,
+    },
     Protobuf(prost::DecodeError),
     DuplicateDiskPath(String),
     MissingFileDiskSize(String),
@@ -79,12 +138,24 @@ pub enum ConfigError {
     EmptyBackendUrl(String),
     InvalidBackendUrl {
         backend_name: String,
-        url: String,
         reason: String,
     },
     ConflictingTlsConfig(String),
     IncompleteTlsClientAuth(String),
+    EmptyTlsValue {
+        backend_name: String,
+        field: &'static str,
+    },
     PlaintextTlsConfig(String),
+    MissingS3AuthField {
+        backend_name: String,
+        field: &'static str,
+    },
+    S3SessionTokenWithoutCredentials(String),
+    EmptyS3AuthValue {
+        backend_name: String,
+        field: &'static str,
+    },
     EmptyFrontendAddr(String),
     StripeSizeNotPowerOfTwo {
         backend_name: String,
@@ -111,7 +182,10 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::Io(e) => write!(f, "io error reading config: {e}"),
-            ConfigError::Toml(e) => write!(f, "toml parse error: {e}"),
+            ConfigError::Toml { span: Some(span) } => {
+                write!(f, "toml parse error at bytes {}..{}", span.start, span.end)
+            }
+            ConfigError::Toml { span: None } => write!(f, "toml parse error"),
             ConfigError::Protobuf(e) => write!(f, "protobuf decode error: {e}"),
             ConfigError::DuplicateDiskPath(p) => {
                 write!(f, "duplicate disk path: {p}")
@@ -194,20 +268,44 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::InvalidBackendUrl {
                 backend_name,
-                url,
                 reason,
-            } => write!(f, "backend {backend_name:?}: invalid url {url:?}: {reason}"),
+            } => write!(f, "backend {backend_name:?}: invalid url: {reason}"),
             ConfigError::ConflictingTlsConfig(name) => write!(
                 f,
-                "backend {name:?}: ca_cert_path and insecure_skip_verify are mutually exclusive"
+                "backend {name:?}: ca_cert and insecure_skip_verify are mutually exclusive"
             ),
             ConfigError::IncompleteTlsClientAuth(name) => write!(
                 f,
-                "backend {name:?}: client_cert_path and client_key_path must be set together"
+                "backend {name:?}: client_cert and client_key must be set together"
+            ),
+            ConfigError::EmptyTlsValue {
+                backend_name,
+                field,
+            } => write!(
+                f,
+                "backend {backend_name:?}: TLS field {field} must not be empty or whitespace"
             ),
             ConfigError::PlaintextTlsConfig(name) => {
                 write!(f, "backend {name:?}: TLS settings require an https url")
             }
+            ConfigError::MissingS3AuthField {
+                backend_name,
+                field,
+            } => write!(
+                f,
+                "backend {backend_name:?}: S3 static authentication requires {field}"
+            ),
+            ConfigError::S3SessionTokenWithoutCredentials(name) => write!(
+                f,
+                "backend {name:?}: S3 session_token requires region, access_key_id, and secret_access_key"
+            ),
+            ConfigError::EmptyS3AuthValue {
+                backend_name,
+                field,
+            } => write!(
+                f,
+                "backend {backend_name:?}: S3 authentication field {field} must not be empty or whitespace"
+            ),
             ConfigError::EmptyFrontendAddr(id) => {
                 write!(f, "frontend {id:?}: addr must not be empty")
             }
@@ -257,7 +355,6 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::Io(e) => Some(e),
-            ConfigError::Toml(e) => Some(e),
             ConfigError::Protobuf(e) => Some(e),
             _ => None,
         }
@@ -272,7 +369,7 @@ impl From<io::Error> for ConfigError {
 
 impl From<toml::de::Error> for ConfigError {
     fn from(e: toml::de::Error) -> Self {
-        ConfigError::Toml(e)
+        ConfigError::Toml { span: e.span() }
     }
 }
 
@@ -284,22 +381,20 @@ impl From<prost::DecodeError> for ConfigError {
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        load(path.as_ref())
+        LoadedConfig::load(path).map(LoadedConfig::into_config)
     }
 }
 
 /// Loads a config from `path`, decoding raw binary protobuf for a
 /// `.binpb` extension and strict TOML for anything else. Both encodings
 /// share the same defaulting and validation finalization.
-pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let mut cfg = if has_binpb_extension(path) {
+pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
+    let cfg = if has_binpb_extension(path) {
         Config::decode(fs::read(path)?.as_slice())?
     } else {
         toml::from_str(&fs::read_to_string(path)?)?
     };
-    cfg.apply_defaults();
-    validate(&cfg)?;
-    Ok(cfg)
+    LoadedConfig::from_config(cfg)
 }
 
 fn has_binpb_extension(path: &Path) -> bool {
@@ -320,10 +415,10 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 validate_backend_url(
                     &b.name,
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -331,21 +426,22 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 validate_backend_url(
                     &b.name,
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
+                validate_s3_auth(&b.name, cfg)?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
             Some(backend_spec::Config::Azure(cfg)) => {
                 validate_backend_url(
                     &b.name,
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
                 cfg.stripe_size_bytes.unwrap_or(0)
             }
@@ -407,7 +503,7 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         }
     }
 
-    runtime_projection(cfg).map_err(ConfigError::InvalidBindingGraph)?;
+    validate_binding_graph(cfg).map_err(ConfigError::InvalidBindingGraph)?;
 
     // The metrics exporter addr is optional; when set it must parse as a
     // socket address (an empty value disables the exporter).
@@ -424,10 +520,10 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
 fn validate_backend_url(
     backend_name: &str,
     url: &str,
-    ca_cert_path: &Option<String>,
+    ca_cert: &Option<String>,
     insecure_skip_verify: bool,
-    client_cert_path: &Option<String>,
-    client_key_path: &Option<String>,
+    client_cert: &Option<String>,
+    client_key: &Option<String>,
 ) -> Result<(), ConfigError> {
     if url.is_empty() {
         return Err(ConfigError::EmptyBackendUrl(backend_name.to_string()));
@@ -435,24 +531,83 @@ fn validate_backend_url(
     let parsed =
         crate::backend::url::parse_endpoint(url).map_err(|e| ConfigError::InvalidBackendUrl {
             backend_name: backend_name.to_string(),
-            url: url.to_string(),
             reason: e.to_string(),
         })?;
-    if ca_cert_path.is_some() && insecure_skip_verify {
+    for (field, value) in [
+        ("ca_cert", ca_cert),
+        ("client_cert", client_cert),
+        ("client_key", client_key),
+    ] {
+        if value.as_deref().is_some_and(|value| value.trim().is_empty()) {
+            return Err(ConfigError::EmptyTlsValue {
+                backend_name: backend_name.to_string(),
+                field,
+            });
+        }
+    }
+    if ca_cert.is_some() && insecure_skip_verify {
         return Err(ConfigError::ConflictingTlsConfig(backend_name.to_string()));
     }
-    if client_cert_path.is_some() != client_key_path.is_some() {
+    if client_cert.is_some() != client_key.is_some() {
         return Err(ConfigError::IncompleteTlsClientAuth(
             backend_name.to_string(),
         ));
     }
     if !parsed.scheme.is_tls()
-        && (ca_cert_path.is_some()
+        && (ca_cert.is_some()
             || insecure_skip_verify
-            || client_cert_path.is_some()
-            || client_key_path.is_some())
+            || client_cert.is_some()
+            || client_key.is_some())
     {
         return Err(ConfigError::PlaintextTlsConfig(backend_name.to_string()));
+    }
+
+    Ok(())
+}
+
+fn validate_s3_auth(
+    backend_name: &str,
+    cfg: &super::schema::S3BackendConfig,
+) -> Result<(), ConfigError> {
+    let credentials_absent = cfg.region.is_none()
+        && cfg.access_key_id.is_none()
+        && cfg.secret_access_key.is_none();
+    if credentials_absent && cfg.session_token.is_none() {
+        return Ok(());
+    }
+    if credentials_absent {
+        return Err(ConfigError::S3SessionTokenWithoutCredentials(
+            backend_name.to_string(),
+        ));
+    }
+
+    for (field, value) in [
+        ("region", &cfg.region),
+        ("access_key_id", &cfg.access_key_id),
+        ("secret_access_key", &cfg.secret_access_key),
+    ] {
+        let Some(value) = value else {
+            return Err(ConfigError::MissingS3AuthField {
+                backend_name: backend_name.to_string(),
+                field,
+            });
+        };
+        if value.trim().is_empty() {
+            return Err(ConfigError::EmptyS3AuthValue {
+                backend_name: backend_name.to_string(),
+                field,
+            });
+        }
+    }
+    if cfg
+        .session_token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(ConfigError::EmptyS3AuthValue {
+            backend_name: backend_name.to_string(),
+            field: "session_token",
+        });
     }
 
     Ok(())
@@ -711,10 +866,24 @@ source = "b"
 "#
     }
 
+    fn s3_toml(auth: &str) -> String {
+        format!(
+            r#"
+[[backends]]
+name = "s3"
+
+[backends.config.s3]
+url = "https://s3.example.com"
+{auth}
+"#
+        )
+    }
+
     #[test]
     fn loads_minimal_config() {
         let f = write_cfg("");
         let cfg = load(f.path()).unwrap();
+        let cfg = cfg.config();
         assert!(cfg.peers.is_empty());
         assert!(cfg.caches.is_empty());
     }
@@ -763,12 +932,14 @@ addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
-        assert_eq!(cfg.peers.len(), 2);
-        assert_eq!(cfg.disks.len(), 2);
-        assert_eq!(cfg.self_, "node-a");
-        let projection = runtime_projection(&cfg).unwrap();
-        assert!(!projection.frontends["f"].bypass_cache);
-        assert_eq!(projection.frontends["f"].backend_id, "b");
+        let raw = cfg.config();
+        assert_eq!(raw.peers.len(), 2);
+        assert_eq!(raw.disks.len(), 2);
+        assert_eq!(raw.self_, "node-a");
+        assert!(!cfg.runtime().frontends["f"].bypass_cache);
+        assert_eq!(cfg.runtime().frontends["f"].backend_id, "b");
+        assert!(cfg.routes().cache_ids.contains("c"));
+        assert!(cfg.routes().fingers.is_some());
     }
 
     #[test]
@@ -935,6 +1106,7 @@ addr = "hex:01020304"
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
         let peer = cfg
+            .config()
             .peers
             .iter()
             .find(|peer| peer.name == "node-rdma")
@@ -960,6 +1132,7 @@ addr = "10.0.0.2:5000"
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
         let peer = cfg
+            .config()
             .peers
             .iter()
             .find(|peer| peer.name == "node-rdma")
@@ -986,6 +1159,7 @@ addrs = ["hex:01020304", "10.0.0.2:5000"]
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
         let peer = cfg
+            .config()
             .peers
             .iter()
             .find(|peer| peer.name == "node-rdma")
@@ -1078,8 +1252,8 @@ size = 16777216
         );
         let f = write_cfg(&s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.disks[0].kind_name(), "file");
-        assert_eq!(cfg.disks[0].file_size(), Some(16 * 1024 * 1024));
+        assert_eq!(cfg.config().disks[0].kind_name(), "file");
+        assert_eq!(cfg.config().disks[0].file_size(), Some(16 * 1024 * 1024));
     }
 
     #[test]
@@ -1148,7 +1322,10 @@ path = "/dev/nvme0n1"
             cache_toml()
         );
         let f = write_cfg(&s);
-        assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::Toml { .. })
+        ));
     }
 
     #[test]
@@ -1162,8 +1339,11 @@ path = "/dev/nvme0n1"
 
     #[test]
     fn toml_error_on_bad_syntax() {
-        let f = write_cfg("this is = not = valid = toml");
-        assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+        const SECRET: &str = "TOML_SECRET_SENTINEL";
+        let f = write_cfg(&format!("secret_access_key = {SECRET:?} trailing"));
+        let error = load(f.path()).unwrap_err();
+        assert!(matches!(error, ConfigError::Toml { .. }));
+        assert!(!error.to_string().contains(SECRET));
     }
 
     #[test]
@@ -1205,8 +1385,8 @@ addr = "10.0.0.1:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.self_, "node-a");
-        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(cfg.config().self_, "node-a");
+        assert_eq!(cfg.config().peers.len(), 1);
     }
 
     #[test]
@@ -1250,8 +1430,8 @@ addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends.len(), 1);
-        assert_eq!(cfg.frontends.len(), 1);
+        assert_eq!(cfg.config().backends.len(), 1);
+        assert_eq!(cfg.config().frontends.len(), 1);
     }
 
     #[test]
@@ -1357,8 +1537,12 @@ name = "synthetic"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("fake backend without url should load");
-        assert_eq!(cfg.backends[0].name, "synthetic");
-        match cfg.backends[0].config.as_ref().expect("backend config set") {
+        assert_eq!(cfg.config().backends[0].name, "synthetic");
+        match cfg.config().backends[0]
+            .config
+            .as_ref()
+            .expect("backend config set")
+        {
             backend_spec::Config::Fake(fake) => {
                 assert_eq!(fake.object_size_bytes, Some(1024 * 1024));
             }
@@ -1383,6 +1567,37 @@ url = "origin.example.com:443"
     }
 
     #[test]
+    fn invalid_backend_url_error_does_not_expose_url() {
+        const SECRET: &str = "URL_SECRET_SENTINEL";
+        let s = format!(
+            r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://user:{SECRET}@origin.example.com"
+"#
+        );
+        let f = write_cfg(&s);
+        let error = load(f.path()).unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidBackendUrl { .. }));
+        assert!(!error.to_string().contains(SECRET));
+    }
+
+    #[test]
+    fn loaded_config_debug_does_not_expose_credentials() {
+        const SECRET: &str = "CONFIG_SECRET_SENTINEL";
+        let s = s3_toml(&format!(
+            "region = \"us-east-1\"\naccess_key_id = \"access\"\nsecret_access_key = {SECRET:?}"
+        ));
+        let f = write_cfg(&s);
+        let loaded = load(f.path()).unwrap();
+        let debug = format!("{loaded:?}");
+        assert!(!debug.contains(SECRET));
+        assert!(debug.contains("backend_count"));
+    }
+
+    #[test]
     fn rejects_conflicting_tls_config() {
         let s = r#"
 [[backends]]
@@ -1390,13 +1605,42 @@ name = "b"
 
 [backends.config.http]
 url = "https://e"
-ca_cert_path = "/etc/ca.pem"
+ca_cert = "CA PEM"
 insecure_skip_verify = true
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
             Err(ConfigError::ConflictingTlsConfig(name)) if name == "b" => {}
             other => panic!("expected ConflictingTlsConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_whitespace_tls_inline_values() {
+        for (field, value) in [
+            ("ca_cert", "   "),
+            ("client_cert", "\n\t"),
+            ("client_key", "  \n"),
+        ] {
+            let s = format!(
+                r#"
+[[backends]]
+name = "b"
+
+[backends.config.http]
+url = "https://e"
+{field} = '''{value}'''
+"#
+            );
+            let f = write_cfg(&s);
+            assert!(
+                matches!(
+                    load(f.path()),
+                    Err(ConfigError::EmptyTlsValue { backend_name, field: actual })
+                        if backend_name == "b" && actual == field
+                ),
+                "expected EmptyTlsValue for {field}"
+            );
         }
     }
 
@@ -1425,7 +1669,7 @@ name = "b"
 
 [backends.config.http]
 url = "https://e"
-client_cert_path = "/etc/client.pem"
+client_cert = "CLIENT CERT PEM"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -1442,7 +1686,7 @@ name = "b"
 
 [backends.config.http]
 url = "https://e"
-client_key_path = "/etc/client-key.pem"
+client_key = "CLIENT KEY PEM"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -1459,8 +1703,8 @@ name = "b"
 
 [backends.config.http]
 url = "http://e"
-client_cert_path = "/etc/client.pem"
-client_key_path = "/etc/client-key.pem"
+client_cert = "CLIENT CERT PEM"
+client_key = "CLIENT KEY PEM"
 "#;
         let f = write_cfg(s);
         match load(f.path()) {
@@ -1499,7 +1743,10 @@ stripe_size_bytes = 8388608
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].stripe_size_bytes(), 8 * 1024 * 1024);
+        assert_eq!(
+            cfg.config().backends[0].stripe_size_bytes(),
+            8 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -1578,14 +1825,14 @@ addr = "example.com:9000"
     fn accepts_valid_metrics_addr() {
         let f = write_cfg("[startup.metrics]\naddr = \"0.0.0.0:9100\"\n");
         let cfg = load(f.path()).expect("valid metrics addr loads");
-        assert_eq!(cfg.startup().metrics().addr, "0.0.0.0:9100");
+        assert_eq!(cfg.config().startup().metrics().addr, "0.0.0.0:9100");
     }
 
     #[test]
     fn empty_metrics_addr_is_allowed() {
         let f = write_cfg("");
         let cfg = load(f.path()).expect("absent metrics section loads");
-        assert_eq!(cfg.startup().metrics().addr, "");
+        assert_eq!(cfg.config().startup().metrics().addr, "");
     }
 
     #[test]
@@ -1648,8 +1895,8 @@ read_bytes = 65536
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("loadgen frontend without addr should load");
-        assert_eq!(cfg.frontends[0].kind_name(), "loadgen");
-        assert_eq!(cfg.frontends[0].addr(), None);
+        assert_eq!(cfg.config().frontends[0].kind_name(), "loadgen");
+        assert_eq!(cfg.config().frontends[0].addr(), None);
     }
 
     #[test]
@@ -1681,7 +1928,7 @@ addr = "0.0.0.0:9000"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("empty loadgen addrs should not collide");
-        assert_eq!(cfg.frontends.len(), 3);
+        assert_eq!(cfg.config().frontends.len(), 3);
     }
 
     #[test]
@@ -1695,8 +1942,119 @@ url = "https://s3.example.com:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].kind_name(), "s3");
-        assert_eq!(cfg.backends[0].url(), Some("https://s3.example.com:443"));
+        assert_eq!(cfg.config().backends[0].kind_name(), "s3");
+        assert_eq!(
+            cfg.config().backends[0].url(),
+            Some("https://s3.example.com:443")
+        );
+    }
+
+    #[test]
+    fn accepts_s3_static_auth_with_session_token() {
+        let s = s3_toml(
+            r#"region = "us-east-1"
+access_key_id = "access"
+secret_access_key = "secret"
+session_token = "token""#,
+        );
+        let f = write_cfg(&s);
+        let cfg = load(f.path()).expect("authenticated S3 config should load");
+        let Some(backend_spec::Config::S3(s3)) = cfg.config().backends[0].config.as_ref() else {
+            panic!("expected s3 backend config");
+        };
+        assert_eq!(s3.region.as_deref(), Some("us-east-1"));
+        assert_eq!(s3.access_key_id.as_deref(), Some("access"));
+        assert_eq!(s3.secret_access_key.as_deref(), Some("secret"));
+        assert_eq!(s3.session_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn accepts_anonymous_s3_auth() {
+        let s = s3_toml("");
+        let f = write_cfg(&s);
+        let cfg = load(f.path()).expect("anonymous S3 config should load");
+        let Some(backend_spec::Config::S3(s3)) = cfg.config().backends[0].config.as_ref() else {
+            panic!("expected s3 backend config");
+        };
+        assert_eq!(s3.region, None);
+        assert_eq!(s3.access_key_id, None);
+        assert_eq!(s3.secret_access_key, None);
+        assert_eq!(s3.session_token, None);
+    }
+
+    #[test]
+    fn rejects_s3_static_auth_missing_each_required_field() {
+        for (missing, auth) in [
+            (
+                "region",
+                r#"access_key_id = "access"
+secret_access_key = "secret""#,
+            ),
+            (
+                "access_key_id",
+                r#"region = "us-east-1"
+secret_access_key = "secret""#,
+            ),
+            (
+                "secret_access_key",
+                r#"region = "us-east-1"
+access_key_id = "access""#,
+            ),
+        ] {
+            let s = s3_toml(auth);
+            let f = write_cfg(&s);
+            assert!(
+                matches!(
+                    load(f.path()),
+                    Err(ConfigError::MissingS3AuthField { backend_name, field })
+                        if backend_name == "s3" && field == missing
+                ),
+                "expected missing S3 auth field {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_s3_session_token_without_credentials() {
+        let s = s3_toml(r#"session_token = "token""#);
+        let f = write_cfg(&s);
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::S3SessionTokenWithoutCredentials(name)) if name == "s3"
+        ));
+    }
+
+    #[test]
+    fn rejects_whitespace_s3_auth_values() {
+        for field in [
+            "region",
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+        ] {
+            let mut values = [
+                ("region", "us-east-1"),
+                ("access_key_id", "access"),
+                ("secret_access_key", "secret"),
+                ("session_token", "token"),
+            ];
+            values.iter_mut().find(|(name, _)| *name == field).unwrap().1 = " \t ";
+            let auth = values
+                .iter()
+                .map(|(name, value)| format!("{name} = {value:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let s = s3_toml(&auth);
+            let f = write_cfg(&s);
+            assert!(
+                matches!(
+                    load(f.path()),
+                    Err(ConfigError::EmptyS3AuthValue { backend_name, field: actual })
+                        if backend_name == "s3" && actual == field
+                ),
+                "expected whitespace S3 auth field {field}"
+            );
+        }
     }
 
     #[test]
@@ -1710,7 +2068,7 @@ url = "https://acct.blob.core.windows.net:443"
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).expect("load should succeed");
-        assert_eq!(cfg.backends[0].kind_name(), "azure");
+        assert_eq!(cfg.config().backends[0].kind_name(), "azure");
     }
 
     #[test]
@@ -1721,7 +2079,10 @@ url = "https://acct.blob.core.windows.net:443"
 fingers_per_nod = 128
 "#;
         let f = write_cfg(s);
-        assert!(matches!(load(f.path()), Err(ConfigError::Toml(_))));
+        assert!(matches!(
+            load(f.path()),
+            Err(ConfigError::Toml { .. })
+        ));
     }
 
     #[test]
@@ -1795,10 +2156,10 @@ addr = "0.0.0.0:9000"
         let cfg: Config = toml::from_str(toml).unwrap();
         let f = write_binpb(&encode_config(&cfg));
         let loaded = load(f.path()).unwrap();
-        assert_eq!(loaded.peers.len(), 1);
-        assert_eq!(loaded.peers[0].name, "node-a");
-        assert_eq!(loaded.disks.len(), 1);
-        assert_eq!(loaded.self_, "node-a");
+        assert_eq!(loaded.config().peers.len(), 1);
+        assert_eq!(loaded.config().peers[0].name, "node-a");
+        assert_eq!(loaded.config().disks.len(), 1);
+        assert_eq!(loaded.config().self_, "node-a");
     }
 
     #[test]
@@ -1806,9 +2167,9 @@ addr = "0.0.0.0:9000"
         // The binpb path shares the TOML path's defaulting finalization.
         let f = write_binpb(&encode_config(&Config::default()));
         let loaded = load(f.path()).unwrap();
-        assert!(loaded.peers.is_empty());
+        assert!(loaded.config().peers.is_empty());
         assert_eq!(
-            loaded.startup().fabric().default_listen_addr(),
+            loaded.config().startup().fabric().default_listen_addr(),
             Some("0.0.0.0:0")
         );
     }
@@ -1864,7 +2225,7 @@ addr = "10.0.0.2:9000"
         // documented defaults during load.
         let f = write_cfg("");
         let cfg = load(f.path()).unwrap();
-        let s = cfg.startup();
+        let s = cfg.config().startup();
         assert_eq!(s.memory().memory_total_bytes, Some(128 * 1024 * 1024));
         assert_eq!(s.fabric().default_listen_addr(), Some("0.0.0.0:0"));
         assert_eq!(s.fabric().max_inflight, Some(1024));
@@ -1888,18 +2249,18 @@ disable_rdma = true
 "#;
         let f = write_cfg(s);
         let cfg = load(f.path()).unwrap();
-        assert!(cfg.startup().memory().no_hugepages);
+        assert!(cfg.config().startup().memory().no_hugepages);
         assert_eq!(
-            cfg.startup().memory().memory_total_bytes,
+            cfg.config().startup().memory().memory_total_bytes,
             Some(64 * 1024 * 1024)
         );
         assert_eq!(
-            cfg.startup().fabric().default_listen_addr(),
+            cfg.config().startup().fabric().default_listen_addr(),
             Some("10.0.0.1:7000")
         );
-        assert!(cfg.startup().topology().disable_rdma);
+        assert!(cfg.config().startup().topology().disable_rdma);
         // Unset siblings still default.
-        assert_eq!(cfg.startup().fabric().progress_threads, Some(2));
+        assert_eq!(cfg.config().startup().fabric().progress_threads, Some(2));
     }
 
     #[test]
@@ -1920,13 +2281,13 @@ disable_rdma = true
         let f = write_binpb(&encode_config(&cfg));
         let loaded = load(f.path()).unwrap();
         assert_eq!(
-            loaded.startup().fabric().default_listen_addr(),
+            loaded.config().startup().fabric().default_listen_addr(),
             Some("10.0.0.2:8000")
         );
-        assert_eq!(loaded.startup().fabric().max_inflight, Some(4096));
-        assert!(loaded.startup().topology().disable_rdma);
+        assert_eq!(loaded.config().startup().fabric().max_inflight, Some(4096));
+        assert!(loaded.config().startup().topology().disable_rdma);
         assert_eq!(
-            loaded.startup().memory().memory_total_bytes,
+            loaded.config().startup().memory().memory_total_bytes,
             Some(128 * 1024 * 1024)
         );
     }

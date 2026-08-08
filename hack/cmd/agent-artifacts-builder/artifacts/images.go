@@ -18,34 +18,46 @@ import (
 	"github.com/containerd/platforms"
 	"github.com/google/renameio/v2"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/errgroup"
 )
 
 func exportContainerImages(ctx context.Context, log *slog.Logger, rootDir string, imageArchives []ContainerImageArchive) error {
+	group, ctx := errgroup.WithContext(ctx)
+	group.SetLimit(2)
+
 	for _, image := range imageArchives {
-		path := filepath.Join(rootDir, filepath.FromSlash(image.Path))
-		if _, err := os.Stat(path); err == nil {
-			log.Info("skipping existing container image archive", slog.String("artifact", image.Path), slog.String("source", image.ImageTag))
-			continue
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("stat %q: %w", path, err)
-		}
-
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return fmt.Errorf("create dir for %q: %w", path, err)
-		}
-
-		log.Info("exporting container image archive", slog.String("artifact", image.Path), slog.String("source", image.ImageTag))
-
-		if err := exportContainerImageArchive(ctx, image.ImageTag, image.Arch, path); err != nil {
-			return err
-		}
-
-		if err := writeGeneratedChecksum(path); err != nil {
-			return err
-		}
-
-		log.Info("exported container image archive", slog.String("artifact", image.Path), slog.String("source", image.ImageTag))
+		group.Go(func() error {
+			return exportContainerImage(ctx, log, rootDir, image)
+		})
 	}
+
+	return group.Wait()
+}
+
+func exportContainerImage(ctx context.Context, log *slog.Logger, rootDir string, image ContainerImageArchive) error {
+	path := filepath.Join(rootDir, filepath.FromSlash(image.Path))
+	if _, err := os.Stat(path); err == nil {
+		log.Info("skipping existing container image archive", slog.String("artifact", image.Path), slog.String("source", image.ImageTag))
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %q: %w", path, err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create dir for %q: %w", path, err)
+	}
+
+	log.Info("exporting container image archive", slog.String("artifact", image.Path), slog.String("source", image.ImageTag))
+
+	if err := exportContainerImageArchive(ctx, image.ImageTag, image.Arch, path); err != nil {
+		return err
+	}
+
+	if err := writeGeneratedChecksum(path); err != nil {
+		return err
+	}
+
+	log.Info("exported container image archive", slog.String("artifact", image.Path), slog.String("source", image.ImageTag))
 
 	return nil
 }

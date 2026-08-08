@@ -6,7 +6,7 @@ package app
 import (
 	"context"
 	"fmt"
-	"os"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -37,14 +37,14 @@ Example:
 				return err
 			}
 
-			return runConfigVersions(ctx, c, args[0])
+			return runConfigVersions(ctx, c, args[0], cmd.OutOrStdout())
 		},
 	}
 
 	return cmd
 }
 
-func runConfigVersions(ctx context.Context, c client.WithWatch, name string) error {
+func runConfigVersions(ctx context.Context, c client.WithWatch, name string, out io.Writer) error {
 	var list v1alpha3.MachineConfigurationVersionList
 	if err := c.List(ctx, &list,
 		client.MatchingLabels{v1alpha3.MCVConfigurationLabelKey: name},
@@ -53,7 +53,7 @@ func runConfigVersions(ctx context.Context, c client.WithWatch, name string) err
 	}
 
 	if len(list.Items) == 0 {
-		fmt.Printf("No MachineConfigurationVersions found for %s\n", name)
+		fprintf(out, "No MachineConfigurationVersions found for %s\n", name)
 		return nil
 	}
 
@@ -96,5 +96,5 @@ func runConfigVersions(ctx context.Context, c client.WithWatch, name string) err
 		}})
 	}
 
-	return printers.NewTablePrinter(printers.PrintOptions{}).PrintObj(table, os.Stdout)
+	return printers.NewTablePrinter(printers.PrintOptions{}).PrintObj(table, out)
 }

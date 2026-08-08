@@ -32,11 +32,8 @@ files in `deploy/gantry/` remain plain kubectl-apply-able YAML.
 
 ### Installation
 
-`kubectl unbounded site init` gains an optional `--with-gantry` flag. When set, gantry is
-installed as part of the site bootstrap sequence after machina. The embedded manifests in
-the binary are used by default; a `--gantry-manifests` flag lets operators point at a local
-path or URL instead. This is the same pattern as `--cni-manifests` and `--machina-manifests`
-today.
+`Site.spec.components` gains an optional Gantry component. When set, `unbounded-operator`
+installs and reconciles Gantry from the declarative Site configuration.
 
 ### Day-2 operations
 

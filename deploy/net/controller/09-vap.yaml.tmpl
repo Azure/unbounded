@@ -5,7 +5,7 @@
 # Restrict what resources the unbounded-net controller service account may create.
 # RBAC cannot scope the "create" verb by resourceNames, so this VAP ensures the
 # controller can only create resources with the expected names. This prevents the
-# SA from creating arbitrary Secrets, ConfigMaps, or EndpointSlices.
+# SA from creating arbitrary Secrets, ConfigMaps, Endpoints, or EndpointSlices.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -20,14 +20,14 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE"]
-        resources: ["secrets", "configmaps"]
+        resources: ["secrets", "configmaps", "endpoints"]
       - apiGroups: ["discovery.k8s.io"]
         apiVersions: ["v1"]
         operations: ["CREATE"]
         resources: ["endpointslices"]
   matchConditions:
     - name: "is-unbounded-net-controller-sa"
-      expression: "request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-controller'"
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-controller'"
   validations:
     # Secrets: only unbounded-net-serving-cert
     - expression: >-
@@ -39,6 +39,11 @@ spec:
         request.resource.resource != 'configmaps' ||
         object.metadata.name == 'unbounded-net-serving-ca'
       message: "unbounded-net controller may only create the unbounded-net-serving-ca configmap"
+    # Endpoints: only unbounded-net-controller
+    - expression: >-
+        request.resource.resource != 'endpoints' ||
+        object.metadata.name == 'unbounded-net-controller'
+      message: "unbounded-net controller may only create the unbounded-net-controller endpoints"
     # EndpointSlices: only unbounded-net-controller
     - expression: >-
         request.resource.resource != 'endpointslices' ||
@@ -83,8 +88,8 @@ spec:
   matchConditions:
     - name: "is-unbounded-net-sa"
       expression: >-
-        request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-controller' ||
-        request.userInfo.username == 'system:serviceaccount:{{ .Namespace }}:unbounded-net-node'
+        request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-controller' ||
+        request.userInfo.username == 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:unbounded-net-node'
   validations:
     # Status must be unchanged.
     - expression: "object.status == oldObject.status"
@@ -94,17 +99,20 @@ spec:
         object.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in oldObject.spec && object.spec[k] == oldObject.spec[k])) &&
         oldObject.spec.all(k, k in ['podCIDR', 'podCIDRs'] || (k in object.spec && oldObject.spec[k] == object.spec[k]))
       message: "unbounded-net may only modify spec.podCIDR and spec.podCIDRs on nodes"
-    # Labels: only net.unbounded-cloud.io/ prefix labels may be added, changed, or removed.
+    # Labels: only net.unbounded-cloud.io/ prefix labels and the canonical
+    # unbounded-cloud.io/site label may be added, changed, or removed. The
+    # canonical site label is dual-written alongside the deprecated
+    # net.unbounded-cloud.io/site during the label deprecation window.
     - expression: >-
         (!has(object.metadata.labels) && !has(oldObject.metadata.labels)) ||
-        (!has(oldObject.metadata.labels) && object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/'))) ||
-        (!has(object.metadata.labels) && oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/'))) ||
+        (!has(oldObject.metadata.labels) && object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site')) ||
+        (!has(object.metadata.labels) && oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site')) ||
         (has(object.metadata.labels) && has(oldObject.metadata.labels) &&
-          object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') ||
+          object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site' ||
             (k in oldObject.metadata.labels && object.metadata.labels[k] == oldObject.metadata.labels[k])) &&
-          oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') ||
+          oldObject.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site' ||
             (k in object.metadata.labels && oldObject.metadata.labels[k] == object.metadata.labels[k])))
-      message: "unbounded-net may only modify labels with net.unbounded-cloud.io/ prefix"
+      message: "unbounded-net may only modify labels with the net.unbounded-cloud.io/ prefix or the unbounded-cloud.io/site label"
     # Annotations: only net.unbounded-cloud.io/ prefix annotations may be added, changed, or removed.
     - expression: >-
         (!has(object.metadata.annotations) && !has(oldObject.metadata.annotations)) ||

@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: machina-controller
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app: machina-controller
 spec:
@@ -40,6 +40,13 @@ spec:
           args:
             - controller
             - --config=/etc/machina/config.yaml
+          env:
+            # The namespace machina reads SSH key secrets from and scopes its
+            # informer cache / lease to. Follows the install namespace.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - containerPort: 8080
               name: metrics

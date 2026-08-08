@@ -21,10 +21,10 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -236,13 +236,13 @@ jobs:
           ACR_USERNAME=$(az acr credential show --name "$ACR_NAME" --query username -o tsv)
           ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query 'passwords[0].value' -o tsv)
 
-          kubectl -n unbounded-net delete secret unbounded-net-acr-pull --ignore-not-found
-          kubectl -n unbounded-net create secret docker-registry unbounded-net-acr-pull \
+          kubectl -n unbounded-system delete secret unbounded-net-acr-pull --ignore-not-found
+          kubectl -n unbounded-system create secret docker-registry unbounded-net-acr-pull \
             --docker-server="$ACR_LOGIN_SERVER" \
             --docker-username="$ACR_USERNAME" \
             --docker-password="$ACR_PASSWORD"
 
-          kubectl -n unbounded-net patch serviceaccount unbounded-net-node \
+          kubectl -n unbounded-system patch serviceaccount unbounded-net-node \
             --type merge \
             -p '{"imagePullSecrets":[{"name":"unbounded-net-acr-pull"}]}'
 
@@ -317,10 +317,10 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -534,7 +534,7 @@ jobs:
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl get machines -o wide > logs/machines.txt 2>&1 || true
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl get machines -o yaml > logs/machines.yaml 2>&1 || true
           KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl describe machines > logs/machines-describe.txt 2>&1 || true
-          KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl -n unbounded-kube logs deploy/machina-controller > logs/machina.log 2>&1 || true
+          KUBECONFIG="$WORKFLOW_KUBECONFIG" kubectl -n unbounded-system logs deploy/machina-controller > logs/machina.log 2>&1 || true
 
       - name: Upload diagnostics
         if: failure()

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -42,6 +43,11 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, err
 	}
 
+	additionalHostMounts, err := resolveAdditionalHostMounts(cfg.AdditionalHostMounts)
+	if err != nil {
+		return nil, err
+	}
+
 	kernel, err := hostKernel()
 	if err != nil {
 		return nil, fmt.Errorf("get host kernel: %w", err)
@@ -64,6 +70,16 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	kubelet, err := resolveKubelet(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("resolve kubelet config: %w", err)
+	}
+
+	localDNS, err := resolveLocalDNS(cfg, downloads)
+	if err != nil {
+		return nil, fmt.Errorf("resolve LocalDNS config: %w", err)
+	}
+
+	if localDNS.Enabled {
+		kubelet.ClusterDNS = localDNS.ClusterListenerIP.String()
+		kubelet.ResolvConf = LocalDNSResolvConfPath
 	}
 
 	containerdVersion := cfg.CRI.Containerd.Version
@@ -92,18 +108,20 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
 			"override.conf",
 		),
-		HostArch:          runtime.GOARCH,
-		HostKernel:        kernel,
-		Hostname:          hostname,
-		ContainerdVersion: containerdVersion,
-		RunCVersion:       runcVersion,
-		CNIPluginVersion:  cniVersion,
-		KubernetesVersion: cfg.Cluster.Version,
-		Downloads:         downloads,
-		OCIImage:          ociImage,
-		Nvidia:            nvidia,
-		AMD:               amd,
-		HostDevices:       DiscoverHostDevices(cfg.AdditionalHostDevices),
+		HostArch:             runtime.GOARCH,
+		HostKernel:           kernel,
+		Hostname:             hostname,
+		ContainerdVersion:    containerdVersion,
+		RunCVersion:          runcVersion,
+		CNIPluginVersion:     cniVersion,
+		KubernetesVersion:    cfg.Cluster.Version,
+		LocalDNS:             localDNS,
+		Downloads:            downloads,
+		OCIImage:             ociImage,
+		Nvidia:               nvidia,
+		AMD:                  amd,
+		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
+		AdditionalHostMounts: additionalHostMounts,
 	}
 
 	nodeStart := &NodeStart{
@@ -112,7 +130,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
 		Containerd:      ResolveContainerd(sandboxImage),
+		Gantry:          ResolveGantry(cfg.Gantry),
 		Kubelet:         kubelet,
+		LocalDNS:        localDNS,
 		Nvidia:          nvidia,
 	}
 
@@ -120,6 +140,10 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		RootFS:    rootFS,
 		NodeStart: nodeStart,
 	}, nil
+}
+
+func ResolveGantry(cfg *config.GantryConfig) Gantry {
+	return Gantry{Disabled: cfg != nil && cfg.Disabled}
 }
 
 // resolveKubelet builds the kubelet goal state from an agent config.
@@ -145,6 +169,10 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		}
 	}
 
+	if err := cfg.Kubelet.Validate(); err != nil {
+		return zero, err
+	}
+
 	// Skip the "must have one" check when both fields are empty: in the
 	// metalman PXE/attestation flow the agent config intentionally ships
 	// with an empty Kubelet.Auth and the bootstrap token is filled in
@@ -159,15 +187,26 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		}
 	}
 
+	var imageCredentialProvider *ImageCredentialProvider
+	if cfg.Kubelet.ImageCredentialProvider != nil {
+		imageCredentialProvider = &ImageCredentialProvider{
+			ConfigPath: cfg.Kubelet.ImageCredentialProvider.ConfigPath,
+			BinDir:     cfg.Kubelet.ImageCredentialProvider.BinDir,
+		}
+	}
+
 	return Kubelet{
-		KubeletBinPath:     filepath.Join("/"+BinDir, "kubelet"),
-		KubeletAuthInfo:    cfg.Kubelet.Auth,
-		APIServer:          cfg.Kubelet.ApiServer,
-		CACertData:         caCert,
-		ClusterDNS:         cfg.Cluster.ClusterDNS,
-		NodeIP:             nodeIP,
-		NodeLabels:         labels,
-		RegisterWithTaints: cfg.Kubelet.RegisterWithTaints,
+		KubeletBinPath:          filepath.Join("/"+BinDir, "kubelet"),
+		KubeletAuthInfo:         cfg.Kubelet.Auth,
+		APIServer:               cfg.Kubelet.ApiServer,
+		CACertData:              caCert,
+		ClusterDNS:              cfg.Cluster.ClusterDNS,
+		ResolvConf:              "/etc/resolv.conf",
+		NodeIP:                  nodeIP,
+		NodeLabels:              labels,
+		RegisterWithTaints:      cfg.Kubelet.RegisterWithTaints,
+		Configuration:           cfg.Kubelet.Configuration,
+		ImageCredentialProvider: imageCredentialProvider,
 	}, nil
 }
 
@@ -326,4 +365,22 @@ func normalizeOSReleaseID(value string) string {
 
 func normalizeOSReleaseValue(value string) string {
 	return strings.Trim(strings.TrimSpace(value), `"'`)
+}
+
+// resolveAdditionalHostMounts validates the supplied mount entries, clones the
+// slice so the caller's config is not mutated, and defaults any empty Target to
+// the corresponding Source.
+func resolveAdditionalHostMounts(mounts []config.AdditionalHostMount) ([]config.AdditionalHostMount, error) {
+	if err := config.ValidateAdditionalHostMounts(mounts); err != nil {
+		return nil, err
+	}
+
+	resolved := slices.Clone(mounts)
+	for i := range resolved {
+		if resolved[i].Target == "" {
+			resolved[i].Target = resolved[i].Source
+		}
+	}
+
+	return resolved, nil
 }

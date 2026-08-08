@@ -34,7 +34,7 @@ const (
 	clusterName       = "gantry-e2e"
 	imageTag          = "gantry:e2e"
 	manifestsDir      = "../deploy"
-	namespace         = "gantry-system"
+	namespace         = "unbounded-system"
 	dsName            = "gantry"
 	e2eRegistry       = "registry.k8s.io"
 	e2eRegistryServer = "https://registry.k8s.io"

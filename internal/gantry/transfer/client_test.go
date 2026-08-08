@@ -19,6 +19,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // startTransferOnEphemeral starts an h2c transfer server on an ephemeral
@@ -28,13 +29,19 @@ func startTransferOnEphemeral(t *testing.T, cache ifaces.LocalContentStore) stri
 
 	srv := New(cache)
 
+	return startHandlerOnEphemeral(t, srv.Handler())
+}
+
+func startHandlerOnEphemeral(t *testing.T, handler http.Handler) string {
+	t.Helper()
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 
 	h2s := &http2.Server{}
-	handler := h2c.NewHandler(srv.Handler(), h2s) //nolint:staticcheck // h2c deliberate
+	handler = h2c.NewHandler(handler, h2s) //nolint:staticcheck // h2c deliberate
 
 	hsrv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 
@@ -51,6 +58,56 @@ func startTransferOnEphemeral(t *testing.T, cache ifaces.LocalContentStore) stri
 	})
 
 	return ln.Addr().String()
+}
+
+func TestClientDefaultRequestTimeout(t *testing.T) {
+	client := NewClient()
+
+	if client.hc.Timeout != time.Hour {
+		t.Fatalf("request timeout = %v, want 1h", client.hc.Timeout)
+	}
+}
+
+func TestClientAdvertisesLargePeerFrames(t *testing.T) {
+	client := NewClient()
+
+	transport, ok := client.hc.Transport.(*http2.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http2.Transport", client.hc.Transport)
+	}
+
+	if transport.MaxReadFrameSize != peerMaxReadFrameSize {
+		t.Fatalf("MaxReadFrameSize = %d, want %d", transport.MaxReadFrameSize, peerMaxReadFrameSize)
+	}
+}
+
+func TestClientForwardsDelegatedAuthorization(t *testing.T) {
+	for _, authorization := range []string{
+		"Bearer requester-token",
+		"Basic cmVxdWVzdGVyOnNlY3JldA==",
+	} {
+		t.Run(strings.Fields(authorization)[0], func(t *testing.T) {
+			body := []byte("peer-served bytes")
+			d := mustDigest(body)
+
+			addr := startHandlerOnEphemeral(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Authorization"); got != authorization {
+					t.Errorf("Authorization = %q, want %q", got, authorization)
+				}
+
+				_, _ = w.Write(body) //nolint:errcheck // best-effort write
+			}))
+
+			ctx := registryauth.WithAuthorization(context.Background(), authorization)
+
+			rc, _, err := NewClient().FetchFromPeer(ctx, addr, ifaces.OriginRef{Repository: "repo", Digest: d})
+			if err != nil {
+				t.Fatalf("FetchFromPeer: %v", err)
+			}
+
+			_ = rc.Close() //nolint:errcheck // best-effort close
+		})
+	}
 }
 
 func TestClientFetchOK(t *testing.T) {
@@ -82,6 +139,110 @@ func TestClientFetchOK(t *testing.T) {
 	got, _ := io.ReadAll(rc)
 	if string(got) != string(body) {
 		t.Errorf("body mismatch: got %q, want %q", got, body)
+	}
+}
+
+func TestClientFetchRange(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("peer-served bytes")
+	d := mustDigest(body)
+	cache.Put(d, body)
+
+	addr := startTransferOnEphemeral(t, cache)
+
+	rc, size, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+		Repository: "myrepo",
+		Digest:     d,
+		Offset:     5,
+	})
+	if err != nil {
+		t.Fatalf("FetchFromPeer: %v", err)
+	}
+
+	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
+	if size != int64(len(body)) {
+		t.Fatalf("size = %d, want full size %d", size, len(body))
+	}
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	if string(got) != string(body[5:]) {
+		t.Fatalf("body = %q, want %q", got, body[5:])
+	}
+}
+
+func TestClientRejectsInvalidRangeResponse(t *testing.T) {
+	body := []byte("wrong range")
+	d := mustDigest(body)
+	addr := startHandlerOnEphemeral(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-10/11")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+
+	rc, _, err := NewClient().FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+		Repository: "myrepo",
+		Digest:     d,
+		Offset:     5,
+	})
+	if rc != nil {
+		_ = rc.Close() //nolint:errcheck // best-effort close
+	}
+
+	if err == nil || !strings.Contains(err.Error(), "invalid Content-Range") {
+		t.Fatalf("error = %v, want invalid Content-Range", err)
+	}
+}
+
+func TestClientByteMetricsReportsPartialReadOnClose(t *testing.T) {
+	body := []byte("peer-served bytes with a deliberately partial read")
+	d := mustDigest(body)
+
+	cache := fakes.NewCache()
+	cache.Put(d, body)
+	addr := startTransferOnEphemeral(t, cache)
+
+	var observations []int64
+
+	client := NewClient(
+		WithDialTimeout(time.Second),
+		WithRequestTimeout(5*time.Second),
+		WithClientByteMetrics(func(kind string, bytes int64) {
+			if kind != "layer" {
+				t.Errorf("kind = %q, want layer", kind)
+			}
+
+			observations = append(observations, bytes)
+		}),
+	)
+
+	rc, _, err := client.FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
+		Repository: "myrepo",
+		Digest:     d,
+		Kind:       ifaces.KindBlob,
+	})
+	if err != nil {
+		t.Fatalf("FetchFromPeer: %v", err)
+	}
+
+	buf := make([]byte, 5)
+
+	if n, err := rc.Read(buf); err != nil || n != len(buf) {
+		t.Fatalf("Read = (%d, %v), want (%d, nil)", n, err, len(buf))
+	}
+
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	_ = rc.Close() //nolint:errcheck // verify no duplicate observation
+
+	if len(observations) != 1 || observations[0] != int64(len(buf)) {
+		t.Fatalf("observations = %v, want [%d]", observations, len(buf))
 	}
 }
 

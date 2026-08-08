@@ -7,7 +7,10 @@ use std::collections::{HashMap, HashSet};
 
 use super::schema::{Config, DiskSpec, PeerSpec, RoutingPlan, TopologyWeighting};
 use crate::fabric::PeerId;
-use crate::p2p::{NodeId, node_id_from_name};
+use crate::p2p::{
+    FingerTable, FingerTableConfig, NodeId, PeerEntry, RouteTableSnapshot, TopologyPrefixWeight,
+    TopologySelection, TopologyTags, node_id_from_name, node_to_ring,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFrontendBinding {
@@ -124,7 +127,10 @@ fn validate_peer_names(config: &Config) -> Result<(), String> {
 
 pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
     validate_binding_graph(config)?;
+    Ok(project_runtime(config))
+}
 
+pub(crate) fn project_runtime(config: &Config) -> RuntimeGraph {
     let backends = by_id(&config.backends, |b| b.name.as_str());
     let caches = by_id(&config.caches, |c| c.name.as_str());
 
@@ -191,7 +197,7 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
         })
         .collect();
 
-    Ok(RuntimeGraph {
+    RuntimeGraph {
         disks: config.disks.clone(),
         caches,
         mesh: RuntimeMesh {
@@ -205,7 +211,80 @@ pub fn runtime_projection(config: &Config) -> Result<RuntimeGraph, String> {
             peers,
         },
         frontends: bindings,
-    })
+    }
+}
+
+pub(crate) fn route_snapshot(graph: &RuntimeGraph) -> RouteTableSnapshot {
+    if graph.caches.is_empty() {
+        return RouteTableSnapshot::default();
+    }
+
+    let mesh = &graph.mesh;
+    let local = PeerEntry {
+        node: mesh.self_node_id,
+        ring: node_to_ring(mesh.self_node_id),
+        tags: TopologyTags(mesh.self_tags.clone()),
+    };
+    let fingers = if let Some(plan) = &mesh.routing_plan {
+        let peer_by_name: HashMap<&str, &RuntimePeer> = mesh
+            .peers
+            .iter()
+            .map(|peer| (peer.name.as_str(), peer))
+            .collect();
+        let entry_of = |name: &str| {
+            let peer = peer_by_name
+                .get(name)
+                .expect("validated routing_plan names reference peers");
+            PeerEntry {
+                node: peer.node_id,
+                ring: node_to_ring(peer.node_id),
+                tags: TopologyTags(peer.spec.tags.clone()),
+            }
+        };
+        FingerTable::from_explicit(
+            local,
+            plan.fingers.iter().map(|name| entry_of(name)).collect(),
+            plan.successor.as_deref().map(entry_of),
+            plan.predecessor.as_deref().map(entry_of),
+        )
+    } else {
+        let peers: Vec<PeerEntry> = mesh
+            .peers
+            .iter()
+            .map(|peer| PeerEntry {
+                node: peer.node_id,
+                ring: node_to_ring(peer.node_id),
+                tags: TopologyTags(peer.spec.tags.clone()),
+            })
+            .collect();
+        FingerTable::build(
+            local,
+            &peers,
+            FingerTableConfig {
+                k: mesh.fingers_per_node.max(1),
+                topology: mesh
+                    .topology_weighting
+                    .as_ref()
+                    .map(|weighting| crate::p2p::TopologyWeighting {
+                        prefix_weights: weighting
+                            .prefix_weights
+                            .iter()
+                            .map(|weight| TopologyPrefixWeight {
+                                tag_index: weight.tag_index,
+                                weight: weight.weight,
+                            })
+                            .collect(),
+                    })
+                    .map(TopologySelection::Weighted)
+                    .unwrap_or_default(),
+            },
+        )
+    };
+
+    RouteTableSnapshot {
+        cache_ids: graph.caches.keys().cloned().collect(),
+        fingers: Some(std::sync::Arc::new(fingers)),
+    }
 }
 
 pub fn runtime_disks(graph: &RuntimeGraph) -> Vec<DiskSpec> {
@@ -264,10 +343,10 @@ mod tests {
                 url: "https://example.com".to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
-                ca_cert_path: None,
+                ca_cert: None,
                 insecure_skip_verify: false,
-                client_cert_path: None,
-                client_key_path: None,
+                client_cert: None,
+                client_key: None,
             })),
         }
     }

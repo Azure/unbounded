@@ -7,9 +7,12 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -17,32 +20,58 @@ import (
 	"oras.land/oras-go/v2/content/file"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
+	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 )
+
+func TestDownloadToFileUsesArtifactSourceRetry(t *testing.T) {
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+
+			return
+		}
+
+		_, _ = w.Write([]byte("artifact-data"))
+	}))
+	defer server.Close()
+
+	dest := filepath.Join(t.TempDir(), "artifact")
+	require.NoError(t, downloadToFile(t.Context(), server.URL, dest))
+	require.EqualValues(t, 2, attempts.Load())
+
+	got, err := os.ReadFile(dest)
+	require.NoError(t, err)
+	require.Equal(t, "artifact-data", string(got))
+}
 
 func TestNewPlan(t *testing.T) {
 	plan, err := NewPlan(Options{
 		OutputDir: t.TempDir(),
-		Manifest: agentartifacts.Manifest{
-			Versions: agentartifacts.Versions{
+		Manifest: bootstrapartifacts.Manifest{
+			Versions: bootstrapartifacts.Versions{
 				Kubernetes: "1.34.2",
 				Containerd: "2.1.8",
 				Runc:       "1.5.0",
 				CNI:        "1.5.1",
 				Crictl:     "1.34.0",
+				CoreDNS:    "1.12.3",
 			},
 		},
 		Architectures: []string{"amd64"},
 	})
 	require.NoError(t, err)
 
-	require.Equal(t, agentartifacts.Manifest{
+	require.Equal(t, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
+			CoreDNS:    "1.12.3",
 		},
 		ContainerImages: []string{},
 	}, plan.Manifest)
@@ -58,11 +87,14 @@ func TestNewPlan(t *testing.T) {
 	runc := artifactsByPath["runc/v1.5.0/runc.amd64"]
 	cni := artifactsByPath["cni/v1.5.1/cni-plugins-linux-amd64-v1.5.1.tgz"]
 	crictl := artifactsByPath["crictl/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz"]
+	coreDNS := artifactsByPath["coredns/v1.12.3/bin/linux/amd64/coredns"]
 
 	require.True(t, containerd.GenerateChecksum)
 	require.True(t, runc.GenerateChecksum)
 	require.True(t, cni.GenerateChecksum)
 	require.True(t, crictl.GenerateChecksum)
+	require.True(t, coreDNS.GenerateChecksum)
+	require.Equal(t, "coredns", coreDNS.ExtractFile)
 	require.Equal(t,
 		"https://dl.k8s.io/v1.34.2/bin/linux/amd64/kubelet",
 		artifactsByPath["kubernetes/v1.34.2/bin/linux/amd64/kubelet"].URL,
@@ -88,14 +120,15 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 			Path:     "container-images/amd64/mcr.microsoft.com_oss_v2_kubernetes_pause_3.9-a68ffa05fa78.tar",
 		},
 	}, plan.ContainerImages)
-	require.Equal(t, agentartifacts.Manifest{
+	require.Equal(t, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
+			CoreDNS:    "1.12.3",
 		},
 		ContainerImages: agentartifacts.DefaultContainerImages("v1.34.2"),
 	}, plan.Manifest)
@@ -104,8 +137,8 @@ func TestNewPlanUsesDefaultManifestFromKubernetesVersion(t *testing.T) {
 func TestNewPlanLoadsManifestFile(t *testing.T) {
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "manifest.json")
-	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
-		Versions: agentartifacts.Versions{
+	require.NoError(t, writeManifest(dir, bootstrapartifacts.Manifest{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -125,9 +158,9 @@ func TestNewPlanLoadsManifestFile(t *testing.T) {
 
 func TestWriteManifestOmitsV1SchemaVersion(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
+	require.NoError(t, writeManifest(dir, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -136,16 +169,16 @@ func TestWriteManifestOmitsV1SchemaVersion(t *testing.T) {
 		},
 	}))
 
-	data, err := os.ReadFile(filepath.Join(dir, agentartifacts.ManifestFileName))
+	data, err := os.ReadFile(filepath.Join(dir, bootstrapartifacts.ManifestFileName))
 	require.NoError(t, err)
 	require.NotContains(t, string(data), "schemaVersion")
 }
 
 func TestValidatePulledBundle(t *testing.T) {
 	dir := t.TempDir()
-	manifest := agentartifacts.Manifest{
+	manifest := bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -172,14 +205,19 @@ func TestValidatePulledBundle(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, validateBundle(dir))
+	workingDir, err := os.Getwd()
+	require.NoError(t, err)
+
+	relativeDir, err := filepath.Rel(workingDir, dir)
+	require.NoError(t, err)
+	require.NoError(t, validateBundle(relativeDir))
 }
 
 func TestValidatePulledBundleDetectsContentMismatch(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, writeManifest(dir, agentartifacts.Manifest{
+	require.NoError(t, writeManifest(dir, bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",
@@ -194,9 +232,9 @@ func TestValidatePulledBundleDetectsContentMismatch(t *testing.T) {
 
 func TestPackPlatformManifestIncludesOnlyOneArchitecture(t *testing.T) {
 	dir := t.TempDir()
-	manifest := agentartifacts.Manifest{
+	manifest := bootstrapartifacts.Manifest{
 		SchemaVersion: 1,
-		Versions: agentartifacts.Versions{
+		Versions: bootstrapartifacts.Versions{
 			Kubernetes: "v1.34.2",
 			Containerd: "2.1.8",
 			Runc:       "1.5.0",

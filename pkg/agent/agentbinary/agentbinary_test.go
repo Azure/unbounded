@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,7 +46,11 @@ func TestInstallFromTarGzVerifiesInstalledBinary(t *testing.T) {
 
 			targetPath := filepath.Join(t.TempDir(), "unbounded-agent")
 
-			err := InstallFromTarGz(context.Background(), server.URL, targetPath, "unbounded-agent", 0o755)
+			err := installFromTarGz(context.Background(), targetPath, InstallOptions{
+				DownloadURL:    server.URL,
+				ExpectedMember: "unbounded-agent",
+				Mode:           0o755,
+			})
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
@@ -58,12 +63,76 @@ func TestInstallFromTarGzVerifiesInstalledBinary(t *testing.T) {
 	}
 }
 
+func TestInstallAndSwitchFromTarGz(t *testing.T) {
+	t.Parallel()
+
+	paths := setupDaemonBinaryTestPaths(t)
+
+	release := testAgentScript("release", 0)
+	if err := os.WriteFile(paths.BinaryPath, testAgentScript("current", 0), 0o755); err != nil {
+		t.Fatalf("write current binary: %v", err)
+	}
+
+	if err := os.Symlink(paths.BinaryPath, paths.CurrentPath); err != nil {
+		t.Fatalf("symlink current binary: %v", err)
+	}
+
+	if err := os.Symlink(paths.BinaryPath, paths.LastGoodPath); err != nil {
+		t.Fatalf("symlink last-good binary: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if err := writeTestAgentArchive(w, release); err != nil {
+			t.Errorf("write archive: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), Layout{
+		BinaryPath:   paths.BinaryPath,
+		BluePath:     paths.BluePath,
+		GreenPath:    paths.GreenPath,
+		CurrentPath:  paths.CurrentPath,
+		LastGoodPath: paths.LastGoodPath,
+	}, InstallOptions{
+		DownloadURL:    server.URL,
+		ExpectedMember: goalstates.AgentUpgradeBinaryName,
+		Mode:           0o755,
+	})
+	if err != nil {
+		t.Fatalf("InstallAndSwitchFromTarGz: %v", err)
+	}
+
+	assertSymlinkTarget(t, paths.CurrentPath, paths.BluePath)
+	assertSymlinkTarget(t, paths.LastGoodPath, paths.BinaryPath)
+	assertFileContent(t, paths.BluePath, string(release))
+}
+
 func TestInstallFromTarGzRejectsUnsupportedScheme(t *testing.T) {
 	t.Parallel()
 
-	err := InstallFromTarGz(context.Background(), "file:///tmp/unbounded-agent.tar.gz", filepath.Join(t.TempDir(), "agent"), "unbounded-agent", 0o755)
+	err := installFromTarGz(context.Background(), filepath.Join(t.TempDir(), "agent"), InstallOptions{
+		DownloadURL:    "file:///tmp/unbounded-agent.tar.gz",
+		ExpectedMember: "unbounded-agent",
+		Mode:           0o755,
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
+}
+
+func TestVerifyBoundsInheritedOutputWait(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "agent")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'candidate-secret\\n' >&2\n(sleep 5) &\nexit 42\n"), 0o755); err != nil {
+		t.Fatalf("write agent: %v", err)
+	}
+
+	start := time.Now()
+	err := Verify(t.Context(), path)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "candidate-secret")
+	assert.Less(t, time.Since(start), 3*time.Second)
 }
 
 func TestEnsureDaemonBinaryLinks_InitializesFromBlue(t *testing.T) {

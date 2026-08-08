@@ -4,6 +4,7 @@
 package goalstates
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ func TestResolveDownloadOverridesWithOfflineArtifacts(t *testing.T) {
 			Runc:       "1.5.0",
 			CNI:        "1.5.1",
 			Crictl:     "1.34.0",
+			CoreDNS:    "1.12.3",
 		},
 		ContainerImages: []string{SandboxImage, KubeProxyImage("v1.34.2")},
 	})
@@ -43,7 +45,7 @@ func TestResolveDownloadOverridesWithOfflineArtifacts(t *testing.T) {
 		},
 	}
 
-	downloads, containerImageArchives, err := ResolveDownloadOverridesWithOfflineArtifacts(cfg, &DownloadOverrides{
+	downloads, containerImageArchives, err := ResolveDownloadOverridesWithOfflineArtifacts(context.Background(), cfg, &DownloadOverrides{
 		Runc: &DownloadSource{BaseURL: "https://ignored.example.test/runc"},
 	})
 	require.NoError(t, err)
@@ -64,6 +66,8 @@ func assertOfflineArtifactDownloads(t *testing.T, downloads *DownloadOverrides) 
 	t.Helper()
 
 	require.Equal(t, "1.5.0", downloads.Runc.Version)
+	require.Equal(t, "1.12.3", downloads.CoreDNS.Version)
+	require.Contains(t, downloads.CoreDNS.URL, "coredns/v%s/bin/linux/%s/coredns")
 	require.Contains(t, downloads.Runc.URL, "file://")
 	require.NotContains(t, downloads.Runc.URL, "ignored")
 }
@@ -73,7 +77,7 @@ func TestResolveDownloadOverridesWithOfflineArtifactsNoopWithoutOfflineConfig(t 
 
 	input := &DownloadOverrides{Runc: &DownloadSource{BaseURL: "https://example.test/runc"}}
 
-	got, containerImageArchives, err := ResolveDownloadOverridesWithOfflineArtifacts(&config.AgentConfig{}, input)
+	got, containerImageArchives, err := ResolveDownloadOverridesWithOfflineArtifacts(context.Background(), &config.AgentConfig{}, input)
 	require.NoError(t, err)
 	require.Same(t, input, got)
 	require.NotNil(t, containerImageArchives)
@@ -94,6 +98,7 @@ func TestResolveOfflineArtifacts(t *testing.T) {
 	})
 
 	resolved, err := resolveOfflineArtifacts(
+		context.Background(),
 		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}},
 		&config.AgentOfflineArtifacts{Source: root},
 	)
@@ -114,12 +119,32 @@ func TestResolveOfflineArtifactsRendersStrictTemplate(t *testing.T) {
 	parent := filepath.Dir(root)
 
 	cfg := &config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}}
-	resolved, err := resolveOfflineArtifacts(cfg, &config.AgentOfflineArtifacts{Source: filepath.Join(parent, "{{ .KubernetesVersion }}")})
+	resolved, err := resolveOfflineArtifacts(context.Background(), cfg, &config.AgentOfflineArtifacts{Source: filepath.Join(parent, "{{ .KubernetesVersion }}")})
 	require.NoError(t, err)
 	require.Equal(t, root, resolved.SourceRoot)
 
-	_, err = resolveOfflineArtifacts(cfg, &config.AgentOfflineArtifacts{Source: filepath.Join(parent, "{{ .Typo }}")})
+	_, err = resolveOfflineArtifacts(context.Background(), cfg, &config.AgentOfflineArtifacts{Source: filepath.Join(parent, "{{ .Typo }}")})
 	require.ErrorContains(t, err, "render OfflineArtifacts.Source template")
+}
+
+func TestResolveOfflineArtifactsRequiresCoreDNSWhenLocalDNSEnabled(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{Versions: OfflineArtifactVersions{
+		Kubernetes: "v1.34.2",
+		Containerd: "2.1.8",
+		Runc:       "1.5.0",
+		CNI:        "1.5.1",
+		Crictl:     "1.34.0",
+	}})
+
+	_, err := resolveOfflineArtifacts(
+		t.Context(),
+		&config.AgentConfig{
+			Cluster:  config.AgentClusterConfig{Version: "1.34.2"},
+			LocalDNS: &config.AgentLocalDNSConfig{Enabled: true},
+		},
+		&config.AgentOfflineArtifacts{Source: root},
+	)
+	require.ErrorContains(t, err, "versions.coredns is required")
 }
 
 func TestResolveOfflineArtifactsRejectsVersionMismatch(t *testing.T) {
@@ -132,6 +157,7 @@ func TestResolveOfflineArtifactsRejectsVersionMismatch(t *testing.T) {
 	}})
 
 	_, err := resolveOfflineArtifacts(
+		context.Background(),
 		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.35.0"}},
 		&config.AgentOfflineArtifacts{Source: root},
 	)
@@ -148,6 +174,7 @@ func TestResolveOfflineArtifactsRejectsRuntimeConflict(t *testing.T) {
 	}})
 
 	_, err := resolveOfflineArtifacts(
+		context.Background(),
 		&config.AgentConfig{
 			Cluster: config.AgentClusterConfig{Version: "1.34.2"},
 			CRI:     config.CRIConfig{Containerd: config.ContainerdConfig{Version: "2.1.9"}},
@@ -168,10 +195,31 @@ func TestResolveOfflineArtifactsRequiresExistingFiles(t *testing.T) {
 	require.NoError(t, os.Remove(filepath.Join(root, "runc", "v1.5.0", "runc."+runtime.GOARCH)))
 
 	_, err := resolveOfflineArtifacts(
+		context.Background(),
 		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}},
 		&config.AgentOfflineArtifacts{Source: root},
 	)
-	require.ErrorContains(t, err, "required offline artifact")
+	require.ErrorContains(t, err, "is missing or is not a regular file")
+}
+
+func TestResolveOfflineArtifactsRejectsNonRegularRequiredFile(t *testing.T) {
+	root := writeGoalStateOfflineBundle(t, OfflineArtifactManifest{Versions: OfflineArtifactVersions{
+		Kubernetes: "v1.34.2",
+		Containerd: "2.1.8",
+		Runc:       "1.5.0",
+		CNI:        "1.5.1",
+		Crictl:     "1.34.0",
+	}})
+	runcPath := filepath.Join(root, "runc", "v1.5.0", "runc."+runtime.GOARCH)
+	require.NoError(t, os.Remove(runcPath))
+	require.NoError(t, os.Mkdir(runcPath, 0o755))
+
+	_, err := resolveOfflineArtifacts(
+		context.Background(),
+		&config.AgentConfig{Cluster: config.AgentClusterConfig{Version: "1.34.2"}},
+		&config.AgentOfflineArtifacts{Source: root},
+	)
+	require.ErrorContains(t, err, "is missing or is not a regular file")
 }
 
 func writeGoalStateOfflineBundle(t *testing.T, manifest OfflineArtifactManifest) string {

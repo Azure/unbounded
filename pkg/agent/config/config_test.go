@@ -91,6 +91,12 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 		},
 		CNI:                   CNIConfig{PluginVersion: "1.6.0"},
 		AdditionalHostDevices: []string{"/dev/uinput"},
+		AdditionalHostMounts: []AdditionalHostMount{{
+			Source:   "/opt/config",
+			Target:   "/etc/config",
+			ReadOnly: true,
+		}},
+		Gantry: &GantryConfig{Disabled: true},
 	}
 
 	data, err := json.Marshal(cfg)
@@ -103,6 +109,50 @@ func TestCRIConfig_JSONRoundTrip(t *testing.T) {
 	assert.Equal(t, "1.2.0", decoded.CRI.Runc.Version)
 	assert.Equal(t, "1.6.0", decoded.CNI.PluginVersion)
 	assert.Equal(t, []string{"/dev/uinput"}, decoded.AdditionalHostDevices)
+	assert.Equal(t, []AdditionalHostMount{{
+		Source:   "/opt/config",
+		Target:   "/etc/config",
+		ReadOnly: true,
+	}}, decoded.AdditionalHostMounts)
+	require.NotNil(t, decoded.Gantry)
+	assert.True(t, decoded.Gantry.Disabled)
+}
+
+func TestIsSystemdDeviceGroupSpecifier(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "character group", value: "char-input", want: true},
+		{name: "character wildcard", value: "char-*", want: true},
+		{name: "block group", value: "block-loop", want: true},
+		{name: "block wildcard", value: "block-*", want: true},
+		{name: "empty group", value: "char-", want: false},
+		{name: "slash group", value: "char-/", want: false},
+		{name: "slash wildcard", value: "char-/*", want: false},
+		{name: "nested group", value: "char-input/foo", want: false},
+		{name: "question mark wildcard", value: "block-??", want: false},
+		{name: "device path group", value: "block-/dev/sda", want: false},
+		{name: "parent traversal group", value: "char-..", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, IsSystemdDeviceGroupSpecifier(tt.value))
+		})
+	}
+}
+
+func TestValidateAdditionalHostDeviceRejectsInvalidGroupSpecifiers(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"char-/", "char-input/foo", "block-/dev/sda", "char-.."} {
+		require.Error(t, validateAdditionalHostDevice(value), value)
+	}
 }
 
 func TestAgentConfig_Validate(t *testing.T) {
@@ -161,6 +211,19 @@ func TestAgentConfig_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "additional host device group",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostDevices = []string{"char-input", "char-pts", "block-*"}
+			},
+		},
+		{
+			name: "additional host device group with invalid characters",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostDevices = []string{"char-input=all"}
+			},
+			wantErr: "AdditionalHostDevices",
+		},
+		{
 			name: "additional host device outside dev",
 			mutate: func(cfg *AgentConfig) {
 				cfg.AdditionalHostDevices = []string{"/sys/class/uinput"}
@@ -173,6 +236,46 @@ func TestAgentConfig_Validate(t *testing.T) {
 				cfg.AdditionalHostDevices = []string{"/dev/uinput:/dev/uinput"}
 			},
 			wantErr: "AdditionalHostDevices",
+		},
+		{
+			name: "additional host mounts",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{
+					{Source: "/opt/config", ReadOnly: true},
+					{Source: "/var/lib/data", Target: "/data"},
+				}
+			},
+		},
+		{
+			name: "additional host mount relative source",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{Source: "opt/config"}}
+			},
+			wantErr: "AdditionalHostMounts[0].Source",
+		},
+		{
+			name: "additional host mount unclean target",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{
+					Source: "/opt/config",
+					Target: "/etc/../config",
+				}}
+			},
+			wantErr: "AdditionalHostMounts[0].Target",
+		},
+		{
+			name: "additional host mount unsafe path",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{Source: "/opt/config:/etc/config"}}
+			},
+			wantErr: "AdditionalHostMounts[0].Source",
+		},
+		{
+			name: "additional host mount control character",
+			mutate: func(cfg *AgentConfig) {
+				cfg.AdditionalHostMounts = []AdditionalHostMount{{Source: "/opt/config\u0000"}}
+			},
+			wantErr: "AdditionalHostMounts[0].Source",
 		},
 	}
 
@@ -229,21 +332,135 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 				"env": "test",
 			},
 			RegisterWithTaints: []string{"dedicated=test:NoSchedule"},
+			Configuration: map[string]any{
+				"logging":              map[string]any{"verbosity": 2},
+				"featureGates":         map[string]bool{"Example": true},
+				"allowedUnsafeSysctls": []string{"net.ipv4.ip_local_port_range"},
+			},
+			ImageCredentialProvider: &ImageCredentialProvider{
+				ConfigPath: "/etc/kubernetes/credential-provider.yaml",
+				BinDir:     "/usr/local/lib/kubelet-credential-providers",
+			},
 		},
 		AdditionalHostDevices: []string{"/dev/uinput"},
+		AdditionalHostMounts: []AdditionalHostMount{{
+			Source: "/opt/config",
+		}},
+		Gantry: &GantryConfig{Disabled: true},
 	}
 
 	copy := original.DeepCopy()
 	require.NotSame(t, original, copy)
-	require.Equal(t, original, copy)
+
+	originalJSON, err := json.Marshal(original)
+	require.NoError(t, err)
+	copyJSON, err := json.Marshal(copy)
+	require.NoError(t, err)
+	require.JSONEq(t, string(originalJSON), string(copyJSON))
 
 	copy.Kubelet.Labels["env"] = "prod"
 	copy.Kubelet.RegisterWithTaints[0] = "dedicated=prod:NoSchedule"
+	copy.Kubelet.Configuration["logging"].(map[string]any)["verbosity"] = 4
+	copy.Kubelet.Configuration["featureGates"].(map[string]any)["Example"] = false
+	copy.Kubelet.Configuration["allowedUnsafeSysctls"].([]any)[0] = "kernel.shm_rmid_forced"
+	copy.Kubelet.ImageCredentialProvider.ConfigPath = "/etc/kubernetes/other.yaml"
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
+	copy.AdditionalHostMounts[0].Source = "/opt/other"
+	copy.Gantry.Disabled = false
 
 	require.Equal(t, "test", original.Kubelet.Labels["env"])
 	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
+	require.Equal(t, 2, original.Kubelet.Configuration["logging"].(map[string]any)["verbosity"])
+	require.True(t, original.Kubelet.Configuration["featureGates"].(map[string]bool)["Example"])
+	require.Equal(t, "net.ipv4.ip_local_port_range", original.Kubelet.Configuration["allowedUnsafeSysctls"].([]string)[0])
+	require.Equal(t, "/etc/kubernetes/credential-provider.yaml", original.Kubelet.ImageCredentialProvider.ConfigPath)
 	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0])
+	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
+	require.True(t, original.Gantry.Disabled)
+}
+
+func TestAgentKubeletConfigValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		configuration map[string]any
+		wantErr       string
+	}{
+		{
+			name: "valid nested configuration",
+			configuration: map[string]any{
+				"maxPods":              250,
+				"logging":              map[string]any{"verbosity": 4},
+				"featureGates":         map[string]bool{"Example": true},
+				"allowedUnsafeSysctls": []string{"net.ipv4.ip_local_port_range"},
+				"authorization": map[string]any{
+					"webhook": map[string]any{"cacheAuthorizedTTL": "10m"},
+				},
+			},
+		},
+		{name: "agent-owned api version", configuration: map[string]any{"apiVersion": "v1"}, wantErr: "apiVersion is not supported"},
+		{name: "agent-owned kind", configuration: map[string]any{"kind": "KubeletConfiguration"}, wantErr: "kind is not supported"},
+		{name: "agent-owned authentication", configuration: map[string]any{"authentication": map[string]any{}}, wantErr: "authentication is not supported"},
+		{name: "authorization is not object", configuration: map[string]any{"authorization": "Webhook"}, wantErr: "authorization must be an object"},
+		{name: "agent-owned authorization mode", configuration: map[string]any{"authorization": map[string]any{"mode": "AlwaysAllow"}}, wantErr: "authorization.mode is not supported"},
+		{name: "agent-owned cluster DNS", configuration: map[string]any{"clusterDNS": []any{"10.0.0.10"}}, wantErr: "clusterDNS is not supported"},
+		{name: "agent-owned runtime endpoint", configuration: map[string]any{"containerRuntimeEndpoint": "unix:///other.sock"}, wantErr: "containerRuntimeEndpoint is not supported"},
+		{name: "agent-owned taints", configuration: map[string]any{"registerWithTaints": []any{}}, wantErr: "registerWithTaints is not supported"},
+		{name: "agent-owned certificate rotation", configuration: map[string]any{"rotateCertificates": false}, wantErr: "rotateCertificates is not supported"},
+		{name: "unsupported nested type", configuration: map[string]any{"logging": make(chan string)}, wantErr: "JSON-compatible values"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := (&AgentKubeletConfig{Configuration: tt.configuration}).Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestImageCredentialProviderValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		provider *ImageCredentialProvider
+		wantErr  string
+	}{
+		{name: "unset"},
+		{
+			name: "valid",
+			provider: &ImageCredentialProvider{
+				ConfigPath: "/etc/kubernetes/credential-provider.yaml",
+				BinDir:     "/usr/local/lib/kubelet-credential-providers",
+			},
+		},
+		{name: "missing config path", provider: &ImageCredentialProvider{BinDir: "/usr/bin"}, wantErr: "ConfigPath"},
+		{name: "relative config path", provider: &ImageCredentialProvider{ConfigPath: "config.yaml", BinDir: "/usr/bin"}, wantErr: "absolute path"},
+		{name: "unclean binary directory", provider: &ImageCredentialProvider{ConfigPath: "/etc/config.yaml", BinDir: "/usr/local/../bin"}, wantErr: "clean absolute path"},
+		{name: "unsafe config path", provider: &ImageCredentialProvider{ConfigPath: `/etc/config"bad.yaml`, BinDir: "/usr/bin"}, wantErr: "unsafe in a systemd argument"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.provider.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
 }
 
 func TestAgentConfig_DeepCopyNil(t *testing.T) {

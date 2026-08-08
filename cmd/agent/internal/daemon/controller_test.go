@@ -26,6 +26,8 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
+const testAgentUpgradeSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 type fakeNodeOperator struct {
 	active  *ActiveMachine
 	findErr error
@@ -46,6 +48,7 @@ type fakeNodeOperator struct {
 
 	stageUpgradeCalled bool
 	stageUpgradeURL    string
+	stageUpgradeSHA256 string
 	stageUpgradeErr    error
 
 	restartAgentCalled bool
@@ -91,9 +94,10 @@ func (op *fakeNodeOperator) RepaveNode(
 	return op.repaveErr
 }
 
-func (op *fakeNodeOperator) StageAgentUpgrade(_ context.Context, _ *slog.Logger, downloadURL string) error {
+func (op *fakeNodeOperator) StageAgentUpgrade(_ context.Context, _ *slog.Logger, request agentUpgradeRequest) error {
 	op.stageUpgradeCalled = true
-	op.stageUpgradeURL = downloadURL
+	op.stageUpgradeURL = request.downloadURL
+	op.stageUpgradeSHA256 = request.sha256
 
 	return op.stageUpgradeErr
 }
@@ -238,6 +242,7 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 			OperationKind: v1alpha3.OperationAgentUpgrade,
 			Parameters: map[string]string{
 				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+				agentUpgradeSHA256Parameter:      testAgentUpgradeSHA256,
 			},
 		},
 	}
@@ -250,6 +255,7 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, op.stageUpgradeCalled)
 	assert.Equal(t, "https://example.com/unbounded-agent.tar.gz", op.stageUpgradeURL)
+	assert.Equal(t, testAgentUpgradeSHA256, op.stageUpgradeSHA256)
 	assert.True(t, op.restartAgentCalled)
 
 	var updated v1alpha3.MachineOperation
@@ -307,6 +313,7 @@ func TestReconcileAgentUpgrade_Failed(t *testing.T) {
 			OperationKind: v1alpha3.OperationAgentUpgrade,
 			Parameters: map[string]string{
 				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+				agentUpgradeSHA256Parameter:      testAgentUpgradeSHA256,
 			},
 		},
 	}
@@ -336,6 +343,7 @@ func TestReconcileAgentUpgrade_RestartFailureFailsOperation(t *testing.T) {
 			OperationKind: v1alpha3.OperationAgentUpgrade,
 			Parameters: map[string]string{
 				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+				agentUpgradeSHA256Parameter:      testAgentUpgradeSHA256,
 			},
 		},
 	}

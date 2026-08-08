@@ -4,10 +4,14 @@
 package origin_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"text/template"
+
+	"github.com/Masterminds/sprig/v3"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/origin"
@@ -48,11 +52,24 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 		t.Fatalf("repo root: %v", err)
 	}
 
-	yamlPath := filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml")
+	yamlPath := filepath.Join(repoRoot, "deploy", "gantry", "configmap.yaml.tmpl")
 
 	raw, err := os.ReadFile(yamlPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", yamlPath, err)
+	}
+
+	tmpl, err := template.New(filepath.Base(yamlPath)).
+		Funcs(sprig.TxtFuncMap()).
+		Option("missingkey=zero").
+		Parse(string(raw))
+	if err != nil {
+		t.Fatalf("parse %s: %v", yamlPath, err)
+	}
+
+	var rendered bytes.Buffer
+	if err := tmpl.Execute(&rendered, map[string]any{}); err != nil {
+		t.Fatalf("render %s: %v", yamlPath, err)
 	}
 
 	// deploy/gantry/configmap.yaml is a Kubernetes ConfigMap whose
@@ -64,7 +81,7 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 	// first line of the inline config; if the operator reformats
 	// the ConfigMap heavily this test fails loud (good - that means
 	// the test needs reanchoring before shipping).
-	cfgYAML := extractInlineConfig(t, string(raw))
+	cfgYAML := extractInlineConfig(t, rendered.String())
 
 	cfg := config.NewDefault()
 	if err := cfg.LoadYAML(strings.NewReader(cfgYAML)); err != nil {

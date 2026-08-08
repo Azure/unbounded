@@ -12,7 +12,7 @@ central control plane. It adds:
 
 - **CRD-driven lifecycle management** for remote machines (`Machine`).
 - **Two provisioning paths**: SSH-based (machina) and PXE-based (metalman).
-- **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}}), separate repo).
+- **Cross-site networking** via WireGuard tunnels ([unbounded-net]({{< relref "concepts/networking" >}})).
 
 ![Architecture overview: Control-Plane Cluster with machina and metalman controllers, provisioning Remote Nodes via SSH and Bare-Metal Nodes via PXE, connected through WireGuard Gateway Nodes](../../img/architecture-overview.svg)
 
@@ -20,7 +20,7 @@ central control plane. It adds:
 
 ### machina -- SSH Provisioning Controller
 
-Binary `cmd/machina`, deployed as `machina-controller` in the `unbounded-kube`
+Binary `cmd/machina`, deployed as `machina-controller` in the `unbounded-system`
 namespace. Built on controller-runtime.
 
 **Responsibilities:**
@@ -46,15 +46,15 @@ but the shipped ConfigMap (rendered from `deploy/machina/03-config.yaml.tmpl`) s
 
 ### metalman -- Bare Metal PXE Controller
 
-Binary `cmd/metalman`, deployed as `metalman-controller` in `unbounded-kube`.
+Binary `cmd/metalman`, deployed as `metalman-controller` in `unbounded-system`.
 
 Runs three reconcilers and four network servers:
 
 | Reconciler / Server     | Role                                                        |
 |-------------------------|-------------------------------------------------------------|
 | OCIReconciler           | Pulls and caches OCI netboot images from container registries. |
-| Redfish Reconciler      | BMC power control and boot order via Redfish REST. TOFU TLS cert pinning. |
-| Lifecycle Reconciler    | Detects 30-min repave timeout and triggers automatic retry. |
+| Redfish Reconciler      | TOFU TLS cert pinning for BMC Redfish endpoints. |
+| MachineOperation Reconciler | BMC power control, boot override, reboot, and repave operations via Redfish REST. |
 | DHCP server (UDP/67)    | Static IP assignment by MAC address.                        |
 | TFTP server (UDP/69)    | Bootloader delivery.                                        |
 | HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
@@ -69,7 +69,8 @@ Binary `cmd/kubectl-unbounded`. Provides subcommands:
 
 | Subcommand         | Purpose |
 |--------------------|---------|
-| `site init`        | Initializes a new site: installs CNI, machina, creates RBAC, bootstrap token, and site resources. |
+| `install`          | Bootstraps CRDs and `unbounded-operator`; component workloads are reconciled from `Site.spec.components`. |
+| `site init`        | Initializes a new site (requires `unbounded-operator` to be installed first): creates site resources and the bootstrap token. |
 | `machine register`   | Registers a machine to a site, creating a `Machine` CR with auto-discovery of SSH secrets and bootstrap tokens. |
 
 ### inventory -- Hardware Collector
@@ -93,14 +94,12 @@ Represents a host and drives its lifecycle.
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
 | `spec.pxe`            | PXE config: machine image reference, optional netboot image override, dhcpLeases, redfish settings. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
-| `spec.operations`     | Reboot and repave counters. |
 
 Status includes phase, message, conditions, SSH fingerprint, Redfish cert
-fingerprint, TPM info, and operation results. The API defines four condition
-type constants: `Provisioned`, `SSHReachable`, `Provisioning`, and `Repaved`.
-Additional conditions such as `PoweredOff` and `BootOrderConfigSupported` may
-be set by the metalman controller but are not defined as constants in the
-Machine types.
+fingerprint, and TPM info. The API defines condition type constants including
+`Provisioned`, `SSHReachable`, `Provisioning`, `CloudInitDone`, and
+`RepavePending`. Day-2 reboot and repave progress is tracked on
+`MachineOperation` objects rather than on the Machine itself.
 
 ### Netboot OCI Images
 
@@ -155,7 +154,7 @@ For a walkthrough, see the [SSH Provisioning Guide]({{< ref "guides/ssh" >}}).
 ### PXE Path (metalman)
 
 1. `Machine` CR created with `spec.pxe`.
-2. Redfish reconciler sets boot device to PXE and power-cycles the host.
+2. A `HostReplace` `MachineOperation` requests a repave; metalman sets the PXE or HTTP boot override and force-restarts the host through Redfish.
 3. Host PXE-boots: DHCP (IP + boot filename) -> TFTP (bootloader) -> HTTP
    (kernel, initrd, configs).
 4. Init script: writes disk image, injects configs, calls `/pxe/disable`,
@@ -173,7 +172,7 @@ For a walkthrough, see the [PXE Provisioning Guide]({{< ref "guides/pxe" >}}).
 
 | Area | Mechanism |
 |------|-----------|
-| SSH keys | Ed25519, RSA, and ECDSA supported (user-provided). Stored as Secrets in `unbounded-kube`. |
+| SSH keys | Ed25519, RSA, and ECDSA supported (user-provided). Stored as Secrets in `unbounded-system`. |
 | SSH host verification | Currently disabled (`InsecureIgnoreHostKey`). The `status.ssh.fingerprint` field exists in the CRD but host key verification is not yet enforced. |
 | Bootstrap tokens | Standard kubeadm tokens (`token-id` + `token-secret`). SSH path passes as env var; PXE path encrypts via TPM. |
 | TPM attestation | TOFU EK pinning. AES-256-GCM encrypted service-account tokens with 1-hour expiry. |
@@ -183,8 +182,13 @@ For a walkthrough, see the [PXE Provisioning Guide]({{< ref "guides/pxe" >}}).
 
 ## Deployment
 
-All components deploy into the `unbounded-kube` namespace. Manifests are plain
-numbered YAML files (no Helm or Kustomize).
+All components deploy into the `unbounded-system` namespace. Installation is driven
+by the unbounded operator: `kubectl unbounded install` bootstraps the CRDs and the
+operator, and `site init` creates or updates `Site` resources (and writes the
+bootstrap token). The operator then reconciles component workloads from each
+`Site.spec.components`. The manifests below are plain numbered YAML files (no Helm
+or Kustomize) that the operator renders and applies; they are not meant to be
+applied by hand.
 
 | Directory | Contents |
 |-----------|----------|

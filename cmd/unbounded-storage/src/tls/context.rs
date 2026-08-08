@@ -24,9 +24,11 @@
 //! non-blocking fd and `WANT_READ`/`WANT_WRITE` are driven through the
 //! ring's `poll_ready` (io_uring `POLL_ADD`).
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use super::ffi;
@@ -36,19 +38,29 @@ use crate::ring::NetHandle;
 /// Per-connection TLS knobs derived from the caller's config.
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
-    /// Optional path to a PEM CA bundle to trust in addition to the
-    /// system trust store. Mutually exclusive with `insecure_skip_verify`
-    /// (rejected at config validation time).
-    pub ca_cert_path: Option<String>,
+    /// Optional inline PEM CA bundle. When set, these certificates replace
+    /// the host trust store.
+    pub ca_cert: Option<String>,
     /// When true, skip certificate and hostname verification entirely.
     /// For test/private origins only.
     pub insecure_skip_verify: bool,
-    /// Optional path to a PEM client certificate presented when an origin
-    /// requires TLS client authentication.
-    pub client_cert_path: Option<String>,
-    /// Optional path to the PEM private key for `client_cert_path`.
-    pub client_key_path: Option<String>,
+    /// Optional inline PEM client leaf certificate and additional chain.
+    pub client_cert: Option<String>,
+    /// Optional inline PEM private key for `client_cert`.
+    pub client_key: Option<String>,
 }
+
+const HOST_CA_FILES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/var/lib/ca-certificates/ca-bundle.pem",
+    "/etc/pki/tls/cacert.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+];
+
+const HOST_CA_DIRS: &[&str] = &["/etc/ssl/certs", "/etc/pki/tls/certs"];
 
 /// A configured client `SSL_CTX`, shared by every connection a caller
 /// makes. Shard-pinned: a `TlsContext` and the backend that owns it live
@@ -59,16 +71,11 @@ pub struct TlsContext {
     verify: bool,
 }
 
-// SAFETY: the same shard-pinned justification as the backends. The
-// `SSL_CTX` is only used from the single thread that owns the context;
-// the Send + Sync bounds exist solely so a backend holding a
-// `TlsContext` can satisfy the `Backend: Send + Sync` supertrait.
-unsafe impl Send for TlsContext {}
-unsafe impl Sync for TlsContext {}
-
 impl TlsContext {
     /// Build a client TLS context from `config`.
     pub fn new(config: &TlsConfig) -> Result<Self, Error> {
+        validate_config(config)?;
+
         // SAFETY: OpenSSL 3 self-initializes on first use; every call
         // below is a standard libssl entry point with checked returns.
         unsafe {
@@ -96,49 +103,35 @@ impl TlsContext {
             let verify = !config.insecure_skip_verify;
             if verify {
                 ffi::SSL_CTX_set_verify(ctx, ffi::SSL_VERIFY_PEER, None);
-                if ffi::SSL_CTX_set_default_verify_paths(ctx) != 1 {
-                    return Err(ssl_error("SSL_CTX_set_default_verify_paths failed"));
-                }
-                if let Some(path) = config.ca_cert_path.as_deref() {
-                    let c_path = CString::new(path).map_err(|_| {
-                        Error::transport(TlsError("ca_cert_path contains NUL".into()))
-                    })?;
-                    if ffi::SSL_CTX_load_verify_locations(ctx, c_path.as_ptr(), std::ptr::null())
-                        != 1
-                    {
-                        return Err(ssl_error("SSL_CTX_load_verify_locations failed"));
+                if let Some(pem) = config.ca_cert.as_deref() {
+                    if ffi::ub_ssl_ctx_load_ca_pem(ctx, pem.as_ptr(), pem.len()) != 1 {
+                        return Err(ssl_error("failed to parse inline CA certificate PEM"));
                     }
+                } else {
+                    load_host_roots(ctx)?;
                 }
             } else {
                 ffi::SSL_CTX_set_verify(ctx, ffi::SSL_VERIFY_NONE, None);
             }
 
-            match (
-                config.client_cert_path.as_deref(),
-                config.client_key_path.as_deref(),
-            ) {
+            match (config.client_cert.as_deref(), config.client_key.as_deref()) {
                 (Some(cert), Some(key)) => {
-                    let c_cert = CString::new(cert).map_err(|_| {
-                        Error::transport(TlsError("client_cert_path contains NUL".into()))
-                    })?;
-                    let c_key = CString::new(key).map_err(|_| {
-                        Error::transport(TlsError("client_key_path contains NUL".into()))
-                    })?;
-                    let filetype = ffi::ub_ssl_filetype_pem();
-                    if ffi::SSL_CTX_use_certificate_file(ctx, c_cert.as_ptr(), filetype) != 1 {
-                        return Err(ssl_error("SSL_CTX_use_certificate_file failed"));
+                    if ffi::ub_ssl_ctx_use_certificate_chain_pem(ctx, cert.as_ptr(), cert.len())
+                        != 1
+                    {
+                        return Err(ssl_error("failed to parse inline client certificate PEM"));
                     }
-                    if ffi::SSL_CTX_use_PrivateKey_file(ctx, c_key.as_ptr(), filetype) != 1 {
-                        return Err(ssl_error("SSL_CTX_use_PrivateKey_file failed"));
+                    if ffi::ub_ssl_ctx_use_private_key_pem(ctx, key.as_ptr(), key.len()) != 1 {
+                        return Err(ssl_error("failed to parse inline client private key PEM"));
                     }
                     if ffi::SSL_CTX_check_private_key(ctx) != 1 {
-                        return Err(ssl_error("SSL_CTX_check_private_key failed"));
+                        return Err(ssl_error("client certificate and private key do not match"));
                     }
                 }
                 (None, None) => {}
                 _ => {
                     return Err(Error::transport(TlsError(
-                        "client_cert_path and client_key_path must be set together".into(),
+                        "client_cert and client_key must be set together".into(),
                     )));
                 }
             }
@@ -308,6 +301,155 @@ impl Drop for SslGuard {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct HostTrustLocations {
+    file: Option<PathBuf>,
+    dir: Option<OsString>,
+}
+
+fn validate_config(config: &TlsConfig) -> Result<(), Error> {
+    if config.ca_cert.is_some() && config.insecure_skip_verify {
+        return Err(tls_error(
+            "ca_cert and insecure_skip_verify are mutually exclusive",
+        ));
+    }
+    if config.client_cert.is_some() != config.client_key.is_some() {
+        return Err(tls_error("client_cert and client_key must be set together"));
+    }
+
+    for (name, value) in [
+        ("ca_cert", config.ca_cert.as_deref()),
+        ("client_cert", config.client_cert.as_deref()),
+        ("client_key", config.client_key.as_deref()),
+    ] {
+        if value.is_some_and(|pem| pem.trim().is_empty()) {
+            return Err(tls_error(&format!("{name} must not be empty")));
+        }
+    }
+
+    Ok(())
+}
+
+fn load_host_roots(ctx: *mut ffi::SSL_CTX) -> Result<(), Error> {
+    let locations = resolve_host_trust_locations(
+        std::env::var_os("SSL_CERT_FILE"),
+        std::env::var_os("SSL_CERT_DIR"),
+        Path::is_file,
+        Path::is_dir,
+    )?;
+
+    if locations.file.is_none() && locations.dir.is_none() {
+        // Keep a final fallback for distributions with non-standard paths.
+        // This may use OPENSSLDIR, so it is attempted only after probing the
+        // host paths that a bundled OpenSSL cannot discover itself.
+        unsafe { ffi::ERR_clear_error() };
+        if unsafe { ffi::SSL_CTX_set_default_verify_paths(ctx) } != 1 {
+            return Err(ssl_error(
+                "no host CA bundle or hashed directory found and OpenSSL defaults failed",
+            ));
+        }
+        return Ok(());
+    }
+
+    let file = locations
+        .file
+        .as_deref()
+        .map(|path| path_to_cstring(path.as_os_str(), "CA file path"))
+        .transpose()?;
+    let dir = locations
+        .dir
+        .as_deref()
+        .map(|path| path_to_cstring(path, "CA directory path"))
+        .transpose()?;
+
+    unsafe { ffi::ERR_clear_error() };
+    if unsafe {
+        ffi::SSL_CTX_load_verify_locations(
+            ctx,
+            file.as_ref().map_or(std::ptr::null(), |path| path.as_ptr()),
+            dir.as_ref().map_or(std::ptr::null(), |path| path.as_ptr()),
+        )
+    } != 1
+    {
+        return Err(ssl_error("failed to load host certificate trust"));
+    }
+
+    Ok(())
+}
+
+fn resolve_host_trust_locations<F, D>(
+    ssl_cert_file: Option<OsString>,
+    ssl_cert_dir: Option<OsString>,
+    mut is_file: F,
+    mut is_dir: D,
+) -> Result<HostTrustLocations, Error>
+where
+    F: FnMut(&Path) -> bool,
+    D: FnMut(&Path) -> bool,
+{
+    let file = match ssl_cert_file {
+        Some(value) => {
+            if value.as_bytes().is_empty() {
+                return Err(tls_error("SSL_CERT_FILE must not be empty"));
+            }
+            let path = PathBuf::from(value);
+            if !is_file(&path) {
+                return Err(tls_error(&format!(
+                    "SSL_CERT_FILE is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            Some(path)
+        }
+        None => HOST_CA_FILES
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| is_file(path)),
+    };
+
+    let dir = match ssl_cert_dir {
+        Some(value) => {
+            validate_ca_dir_list(&value, &mut is_dir)?;
+            Some(value)
+        }
+        None => HOST_CA_DIRS
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| is_dir(path))
+            .map(PathBuf::into_os_string),
+    };
+
+    Ok(HostTrustLocations { file, dir })
+}
+
+fn validate_ca_dir_list<D>(value: &OsStr, is_dir: &mut D) -> Result<(), Error>
+where
+    D: FnMut(&Path) -> bool,
+{
+    if value.as_bytes().is_empty() {
+        return Err(tls_error("SSL_CERT_DIR must not be empty"));
+    }
+
+    for bytes in value.as_bytes().split(|byte| *byte == b':') {
+        if bytes.is_empty() {
+            return Err(tls_error("SSL_CERT_DIR contains an empty directory"));
+        }
+        let path = Path::new(OsStr::from_bytes(bytes));
+        if !is_dir(path) {
+            return Err(tls_error(&format!(
+                "SSL_CERT_DIR entry is not a directory: {}",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn path_to_cstring(path: &OsStr, name: &str) -> Result<CString, Error> {
+    CString::new(path.as_bytes()).map_err(|_| tls_error(&format!("{name} contains NUL")))
+}
+
 fn set_nonblocking(fd: RawFd) -> Result<(), Error> {
     // SAFETY: standard fcntl get/set flags on a valid fd.
     unsafe {
@@ -357,6 +499,10 @@ fn ssl_error(context: &str) -> Error {
     }
 }
 
+fn tls_error(message: &str) -> Error {
+    Error::transport(TlsError(message.to_string()))
+}
+
 #[derive(Debug)]
 struct TlsError(String);
 
@@ -367,3 +513,196 @@ impl fmt::Display for TlsError {
 }
 
 impl std::error::Error for TlsError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDDzCCAfegAwIBAgIUQsl2SwaDk66oMpVqFl3hYEOkKPEwDQYJKoZIhvcNAQEL\n\
+BQAwFzEVMBMGA1UEAwwMc3RvcmFnZS10ZXN0MB4XDTI2MDcxNzIwMjAxMVoXDTI2\n\
+MDcxODIwMjAxMVowFzEVMBMGA1UEAwwMc3RvcmFnZS10ZXN0MIIBIjANBgkqhkiG\n\
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsFh5KbDC9AK8PfwLC1rhjy2wxJhJHbXIfD79\n\
+l/F+uXOdSQZTK4MS/qtZt6sTChfts2Auxe8+xzX33z8310E9VHu5T7BfljhjEr2U\n\
+aMLRuzZxiKGhA1IloQGzqsNoxsvV+IJ97j86IaUU6SqD0DuIEC4SvDFhM0mgt13X\n\
+Y15pkmadKYwHmf8VRHO79dfAL5Tdkbijn4oGVcjTudOGKVvCyZ59zqKbwKN4UWQM\n\
+ajU51o04OZfzGV6bhN0BJydO90EM4RGvVleGMZBoyMiITjscGCLSCsJsFs9aMAYE\n\
+AWCUIp+vRofutRUztcK6O1rhLZ1duOBAO7LWwgkuDu4X2b5u7wIDAQABo1MwUTAd\n\
+BgNVHQ4EFgQU1WiQf8joyXMZ689kmbNLK6g8c0MwHwYDVR0jBBgwFoAU1WiQf8jo\n\
+yXMZ689kmbNLK6g8c0MwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOC\n\
+AQEAJLGbs7HlspZJvBWGvo8w/5cJXH+qPvLjBGugULxDCLryn8tpnVRmr1gOpJWj\n\
+tvWOBA5O6d9jnHPoLUAk0Jtzh67B/kDcAc44poxIDqsvSfVbAln5UqG9vih+TFVo\n\
+G6jTKkt3q63e8ahLJwRe0qa61IU0lA2j0zBAcwrK++iGOezyuAKUeo0Vwk5BGsSa\n\
+ilIOWfp1I0ySgE0InRH8rTTORAMtY6nKfKmkuF6m2CYKXnaI/VqF01GEOPZBnHoo\n\
+Spy+sYgDRl+cTmrhsUrCHdt/P6K7CaMuIf/gn/Imh4kN+R0TpWmfdkW7B+IREN1G\n\
+KMjAx6YCVh/vMzoLdoypKqR9hw==\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwWHkpsML0Arw9\n\
+/AsLWuGPLbDEmEkdtch8Pv2X8X65c51JBlMrgxL+q1m3qxMKF+2zYC7F7z7HNfff\n\
+PzfXQT1Ue7lPsF+WOGMSvZRowtG7NnGIoaEDUiWhAbOqw2jGy9X4gn3uPzohpRTp\n\
+KoPQO4gQLhK8MWEzSaC3XddjXmmSZp0pjAeZ/xVEc7v118AvlN2RuKOfigZVyNO5\n\
+04YpW8LJnn3OopvAo3hRZAxqNTnWjTg5l/MZXpuE3QEnJ073QQzhEa9WV4YxkGjI\n\
+yIhOOxwYItIKwmwWz1owBgQBYJQin69Gh+61FTO1wro7WuEtnV244EA7stbCCS4O\n\
+7hfZvm7vAgMBAAECggEAF51BXFvXP2W+X26I7BRXcBzmNu1NnTTijADDZL1qAtuA\n\
+jG7UZFdBC+lWMkouWoOpyQNwQAExnuuTLcoBaEnMNKv8vLcZlbwnSDMq1HyCKVe5\n\
+DFrYfOFbOJxJuuw/858IICcZRfYhiq/YhQC0dgYCymfhCmJyabPKWcOvPBdAe+IY\n\
+wxOg0Lk5xQJYGlYir3J1C6e38RgrhEmbr9NvaO2MI5qguvYayg58QB9Ug95mtJkf\n\
+T9nxquj1Ts4kSuYDCeZtdGLNUB0nlEEOUU0AO65z7+a1otiXeX0Yj56AnuWvOX+4\n\
+hD3XGSfynfUjKpW+jLVgZZ3VthooBr+51yJDS4roAQKBgQDmOPJMbdHDJAX/Nrq/\n\
+eM1UkkFIqhD/PHBV9RBsqJwHuZip62ah7M1iSuBKMXG/ogLglB+Q8f/rcYsi1f02\n\
+R+F0Hf/WZe0/5rhC8tqanFAtL31EgSHitaLfbRheW204Pp4YwY2AeHHW+Z0KIhD6\n\
+9ihqV7ZsByKf3pL2nnJmbx5JgQKBgQDEFzX4p1Vi+vhwiI684CsM50pxzgfx91vC\n\
+VfCgugMGZ82xp0s1zBkcXevv3iIl35ndGh2PhKOGE6+XHFtldttMXrdAs29q463V\n\
+fWNEBQiU4N5VBKlWNlW5odFnLsBOnNxsobrbtrcWjbcKayw6n2wq1TJdxmtlxKo9\n\
+ToaXHESQbwKBgQC8tDS2vNVQ1DguJtgPlZ8IERF91Bg2fX2+ly6tQc8S7efab18i\n\
+no0CYklRxxFreApPtlnhXtrcS6c2GJyCX4zGtsg7HjTHSgACsDjKvhFh2Ckfe5Eg\n\
+2Kz14eA1h08Q6RKBTDUF9rOo99Tmt2GfsyEReW/HQFn7HF7t0pYGrFHxAQKBgQC1\n\
+pFqWb0slWR3yAE1YoL7AQTAwo42wklYperpf6G8M6/MaccG1n85S/J2loLs5IhvB\n\
+OIPRgiiH9oxdCiOPpb4WzFYsVQsMlMNeU7w0MgV1A6hwUNUby1E1l7QGRMRXDe8R\n\
+oe8Zv/NxrOy1dfmOhEcKllsFitvJdZfNGoSKTeEleQKBgFXIgwBzyLfiHRJGpmR0\n\
+dK68dKQskMoi0+P3DkuPbYPt4+r40dsCxi6Ior7i5+siuKEYf+boYEaa6oLucC2v\n\
+QL/z3kv6kTv8rl+Ltxnd0zvwg0aCW1G80/xR7kdCR37JqzleKjBHVaNEPqK47e/Y\n\
+gkCxP7WO2UaJv3eZFti4iPPm\n\
+-----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn inline_ca_and_insecure_are_mutually_exclusive() {
+        let config = TlsConfig {
+            ca_cert: Some("certificate".into()),
+            insecure_skip_verify: true,
+            ..TlsConfig::default()
+        };
+
+        let error = validate_config(&config).unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn client_certificate_and_key_must_be_paired() {
+        let config = TlsConfig {
+            client_cert: Some("certificate".into()),
+            ..TlsConfig::default()
+        };
+
+        let error = validate_config(&config).unwrap_err();
+        assert!(error.to_string().contains("must be set together"));
+    }
+
+    #[test]
+    fn inline_pem_must_not_be_empty() {
+        let config = TlsConfig {
+            ca_cert: Some(" \n\t".into()),
+            ..TlsConfig::default()
+        };
+
+        let error = validate_config(&config).unwrap_err();
+        assert!(error.to_string().contains("ca_cert must not be empty"));
+    }
+
+    #[test]
+    fn environment_trust_paths_override_standard_locations() {
+        let file = OsString::from("/custom/ca.pem");
+        let dirs = OsString::from("/custom/certs:/other/certs");
+        let locations = resolve_host_trust_locations(
+            Some(file.clone()),
+            Some(dirs.clone()),
+            |path| path == Path::new("/custom/ca.pem"),
+            |path| path == Path::new("/custom/certs") || path == Path::new("/other/certs"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            locations,
+            HostTrustLocations {
+                file: Some(PathBuf::from(file)),
+                dir: Some(dirs),
+            }
+        );
+    }
+
+    #[test]
+    fn standard_locations_fill_unset_environment_paths() {
+        let locations = resolve_host_trust_locations(
+            None,
+            None,
+            |path| path == Path::new(HOST_CA_FILES[1]),
+            |path| path == Path::new(HOST_CA_DIRS[1]),
+        )
+        .unwrap();
+
+        assert_eq!(locations.file, Some(PathBuf::from(HOST_CA_FILES[1])));
+        assert_eq!(locations.dir, Some(OsString::from(HOST_CA_DIRS[1])));
+    }
+
+    #[test]
+    fn malformed_inline_ca_pem_is_rejected() {
+        let config = TlsConfig {
+            ca_cert: Some("not a PEM certificate".into()),
+            ..TlsConfig::default()
+        };
+
+        let error = match TlsContext::new(&config) {
+            Ok(_) => panic!("malformed CA PEM was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("inline CA certificate PEM"));
+    }
+
+    #[test]
+    fn malformed_inline_client_pem_is_rejected() {
+        let config = TlsConfig {
+            insecure_skip_verify: true,
+            client_cert: Some("not a PEM certificate".into()),
+            client_key: Some("not a PEM key".into()),
+            ..TlsConfig::default()
+        };
+
+        let error = match TlsContext::new(&config) {
+            Ok(_) => panic!("malformed client certificate PEM was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("inline client certificate PEM"));
+    }
+
+    #[test]
+    fn inline_ca_rejects_trailing_non_whitespace() {
+        TlsContext::new(&TlsConfig {
+            ca_cert: Some(format!("{TEST_CERT} \n\t")),
+            ..TlsConfig::default()
+        })
+        .expect("trailing whitespace should be accepted");
+
+        let error = match TlsContext::new(&TlsConfig {
+            ca_cert: Some(format!("{TEST_CERT}garbage")),
+            ..TlsConfig::default()
+        }) {
+            Ok(_) => panic!("trailing CA material was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("inline CA certificate PEM"));
+    }
+
+    #[test]
+    fn inline_private_key_rejects_trailing_non_whitespace() {
+        TlsContext::new(&TlsConfig {
+            insecure_skip_verify: true,
+            client_cert: Some(TEST_CERT.into()),
+            client_key: Some(format!("{TEST_KEY} \n\t")),
+            ..TlsConfig::default()
+        })
+        .expect("trailing whitespace should be accepted");
+
+        let error = match TlsContext::new(&TlsConfig {
+            insecure_skip_verify: true,
+            client_cert: Some(TEST_CERT.into()),
+            client_key: Some(format!("{TEST_KEY}{TEST_KEY}")),
+            ..TlsConfig::default()
+        }) {
+            Ok(_) => panic!("additional private key was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("inline client private key PEM"));
+    }
+}

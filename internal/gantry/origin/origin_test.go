@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 func digestOf(b []byte) digest.Digest {
@@ -342,6 +343,284 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 
 	if atomic.LoadInt32(&tokenReqs) != 1 {
 		t.Errorf("tokenReqs after 2nd pull = %d, want 1 (cached)", tokenReqs)
+	}
+}
+
+func TestAuthenticationChallenge_BearerCached(t *testing.T) {
+	var (
+		hits int32
+		srv  *httptest.Server
+	)
+
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+
+		if r.URL.Path != "/v2/" {
+			t.Errorf("path = %q, want /v2/", r.URL.Path)
+		}
+
+		w.Header().Set("WWW-Authenticate", `Bearer realm="`+srv.URL+`/token",service="private.example"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	c.registries["reg"].hc = srv.Client()
+
+	want := `Bearer realm="` + srv.URL + `/token",service="private.example"`
+
+	for i := 0; i < 2; i++ {
+		challenge, required, err := c.AuthenticationChallenge(context.Background(), "reg")
+		if err != nil {
+			t.Fatalf("AuthenticationChallenge[%d]: %v", i, err)
+		}
+
+		if !required {
+			t.Fatalf("AuthenticationChallenge[%d] required = false", i)
+		}
+
+		if challenge != want {
+			t.Fatalf("AuthenticationChallenge[%d] = %q, want %q", i, challenge, want)
+		}
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("authentication probe hits = %d, want 1", got)
+	}
+}
+
+func TestAuthenticationChallenge_Basic(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="private"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	c.registries["reg"].hc = srv.Client()
+
+	challenge, required, err := c.AuthenticationChallenge(context.Background(), "reg")
+	if err != nil {
+		t.Fatalf("AuthenticationChallenge: %v", err)
+	}
+
+	if !required {
+		t.Fatal("AuthenticationChallenge required = false")
+	}
+
+	if challenge != `Basic realm="private"` {
+		t.Fatalf("challenge = %q, want Basic challenge", challenge)
+	}
+}
+
+func TestAuthenticationChallenge_Anonymous(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	c.registries["reg"].hc = srv.Client()
+
+	challenge, required, err := c.AuthenticationChallenge(context.Background(), "reg")
+	if err != nil {
+		t.Fatalf("AuthenticationChallenge: %v", err)
+	}
+
+	if required || challenge != "" {
+		t.Fatalf("AuthenticationChallenge = %q, %v; want anonymous", challenge, required)
+	}
+}
+
+func TestAuthenticationChallenge_ConfiguredCredentialsUseSharedIdentityMode(t *testing.T) {
+	var hits int32
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("WWW-Authenticate", `Basic realm="private"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	credsPath := filepath.Join(t.TempDir(), "creds")
+	if err := os.WriteFile(credsPath, []byte("shared:secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c.registries["reg"].hc = srv.Client()
+
+	challenge, required, err := c.AuthenticationChallenge(context.Background(), "reg")
+	if err != nil {
+		t.Fatalf("AuthenticationChallenge: %v", err)
+	}
+
+	if required || challenge != "" {
+		t.Fatalf("AuthenticationChallenge = %q, %v; want shared identity mode", challenge, required)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("authentication probe hits = %d, want 0", got)
+	}
+}
+
+func TestAuthenticationChallenge_RejectsInsecureBearerRealm(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="http://auth.example/token",service="private.example"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	c.registries["reg"].hc = srv.Client()
+
+	if _, _, err := c.AuthenticationChallenge(context.Background(), "reg"); err == nil {
+		t.Fatal("AuthenticationChallenge accepted insecure Bearer realm")
+	}
+}
+
+func TestPull_UsesDelegatedBearerWithoutLocalCredentials(t *testing.T) {
+	body := []byte("delegated-token-protected")
+	d := digestOf(body)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer requester-token" {
+			t.Errorf("Authorization = %q, want requester token", got)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	c.registries["reg"].hc = srv.Client()
+
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
+
+	rc, _, err := c.Pull(ctx, ifaces.OriginRef{Registry: "reg", Repository: "repo", Digest: d})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	got, _ := io.ReadAll(rc)
+	_ = rc.Close() //nolint:errcheck // best-effort close
+
+	if string(got) != string(body) {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+}
+
+func TestPull_UsesDelegatedBasicWithoutLocalCredentials(t *testing.T) {
+	body := []byte("basic-protected")
+	d := digestOf(body)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, password, ok := r.BasicAuth()
+		if !ok || user != "requester" || password != "secret" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="private"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		_, _ = w.Write(body) //nolint:errcheck // best-effort write
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	c.registries["reg"].hc = srv.Client()
+
+	ctx := registryauth.WithAuthorization(context.Background(), "Basic cmVxdWVzdGVyOnNlY3JldA==")
+
+	rc, _, err := c.Pull(ctx, ifaces.OriginRef{Registry: "reg", Repository: "repo", Digest: d})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	got, _ := io.ReadAll(rc)
+	_ = rc.Close() //nolint:errcheck // best-effort close
+
+	if string(got) != string(body) {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+}
+
+func TestPull_DelegatedBearerRejectionDoesNotUseLocalCredentials(t *testing.T) {
+	body := []byte("protected")
+	d := digestOf(body)
+
+	var (
+		dataRequests, tokenRequests int32
+		srv                         *httptest.Server
+	)
+
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			atomic.AddInt32(&tokenRequests, 1)
+
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "local-token"}) //nolint:errcheck // best-effort
+
+			return
+		}
+
+		atomic.AddInt32(&dataRequests, 1)
+		w.Header().Set("WWW-Authenticate", `Bearer realm="`+srv.URL+`/token",service="reg",scope="repository:repo:pull"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	credsPath := filepath.Join(t.TempDir(), "creds")
+	if err := os.WriteFile(credsPath, []byte("local:credentials\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c.registries["reg"].hc = srv.Client()
+
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer rejected-requester-token")
+
+	_, _, err := c.Pull(ctx, ifaces.OriginRef{Registry: "reg", Repository: "repo", Digest: d})
+	if err == nil {
+		t.Fatal("Pull succeeded with rejected delegated token")
+	}
+
+	var originErr *ifaces.OriginError
+	if !errors.As(err, &originErr) || originErr.Challenge == "" {
+		t.Fatalf("error = %v, want OriginError with authentication challenge", err)
+	}
+
+	if got := atomic.LoadInt32(&dataRequests); got != 1 {
+		t.Fatalf("data requests = %d, want 1", got)
+	}
+
+	if got := atomic.LoadInt32(&tokenRequests); got != 0 {
+		t.Fatalf("local-credential token requests = %d, want 0", got)
+	}
+}
+
+func TestPull_RefusesDelegatedBearerOverHTTP(t *testing.T) {
+	var requests int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	body := []byte("x")
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
+
+	_, _, err := c.Pull(ctx, ifaces.OriginRef{Registry: "reg", Repository: "repo", Digest: digestOf(body)})
+	if err == nil {
+		t.Fatal("Pull unexpectedly sent delegated auth to HTTP origin")
+	}
+
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("origin requests = %d, want 0", got)
 	}
 }
 
@@ -824,6 +1103,133 @@ func TestPull_StartCallbackFiresOnceBeforeOutcome(t *testing.T) {
 		}
 	})
 }
+
+func TestCountingReadCloserReportsActualBytesOnce(t *testing.T) {
+	tests := []struct {
+		name      string
+		read      func(t *testing.T, rc io.ReadCloser)
+		body      string
+		wantBytes int64
+		wantCalls int
+	}{
+		{
+			name: "complete read reports all bytes on EOF",
+			body: "complete-payload",
+			read: func(t *testing.T, rc io.ReadCloser) {
+				t.Helper()
+
+				if _, err := io.Copy(io.Discard, rc); err != nil {
+					t.Fatalf("copy: %v", err)
+				}
+			},
+			wantBytes: int64(len("complete-payload")),
+			wantCalls: 1,
+		},
+		{
+			name: "early close reports partial bytes",
+			body: "partial-payload",
+			read: func(t *testing.T, rc io.ReadCloser) {
+				t.Helper()
+
+				buf := make([]byte, 4)
+				if n, err := rc.Read(buf); err != nil || n != len(buf) {
+					t.Fatalf("Read = (%d, %v), want (%d, nil)", n, err, len(buf))
+				}
+			},
+			wantBytes: 4,
+			wantCalls: 1,
+		},
+		{
+			name: "empty response does not create a zero-value observation",
+			body: "",
+			read: func(t *testing.T, rc io.ReadCloser) {
+				t.Helper()
+
+				if _, err := io.Copy(io.Discard, rc); err != nil {
+					t.Fatalf("copy: %v", err)
+				}
+			},
+			wantBytes: 0,
+			wantCalls: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var observations []int64
+
+			rc := &countingReadCloser{
+				ReadCloser: io.NopCloser(strings.NewReader(tt.body)),
+				onFinish:   func(bytes int64) { observations = append(observations, bytes) },
+			}
+
+			tt.read(t, rc)
+
+			if err := rc.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			// A second close must not double-count a body already reported at
+			// EOF or on the first close.
+			_ = rc.Close()
+
+			if len(observations) != tt.wantCalls {
+				t.Fatalf("observations = %v, want %d calls", observations, tt.wantCalls)
+			}
+
+			if tt.wantCalls == 1 && observations[0] != tt.wantBytes {
+				t.Fatalf("observed bytes = %d, want %d", observations[0], tt.wantBytes)
+			}
+		})
+	}
+}
+
+func TestCountingReadCloserReportsBytesOnTerminalReadError(t *testing.T) {
+	terminalErr := errors.New("truncated response")
+	reader := &terminalReadCloser{payload: []byte("partial"), err: terminalErr}
+
+	var observations []int64
+
+	rc := &countingReadCloser{
+		ReadCloser: reader,
+		onFinish:   func(bytes int64) { observations = append(observations, bytes) },
+	}
+
+	buf := make([]byte, 32)
+
+	n, err := rc.Read(buf)
+	if !errors.Is(err, terminalErr) {
+		t.Fatalf("Read error = %v, want %v", err, terminalErr)
+	}
+
+	if n != len(reader.payload) {
+		t.Fatalf("Read bytes = %d, want %d", n, len(reader.payload))
+	}
+
+	_ = rc.Close()
+
+	if len(observations) != 1 || observations[0] != int64(len(reader.payload)) {
+		t.Fatalf("observations = %v, want [%d]", observations, len(reader.payload))
+	}
+}
+
+type terminalReadCloser struct {
+	payload []byte
+	err     error
+	read    bool
+}
+
+func (r *terminalReadCloser) Read(p []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+
+	r.read = true
+
+	return copy(p, r.payload), r.err
+}
+
+func (*terminalReadCloser) Close() error { return nil }
 
 // TestOriginMetricKind_MapsToDesignVocabulary locks in the
 // design-doc label set:

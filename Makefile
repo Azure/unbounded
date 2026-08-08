@@ -12,6 +12,16 @@ GO_PACKAGE_DIRS=$(shell $(GOCMD) list -f '{{.Dir}}' $(GO_PACKAGE_PATTERNS))
 CONTAINER_ENGINE ?= podman
 CONTAINER_REGISTRY ?= ghcr.io/azure
 
+# Unified install namespace for all unbounded components. Each component's
+# *_NAMESPACE var derives from this by default, so overriding UNBOUNDED_NAMESPACE
+# moves everything at once, while a component var can still be overridden
+# individually when needed. Components resolve their runtime namespace from the
+# POD_NAMESPACE Downward-API env (see internal/unbounded.SystemNamespace), so a
+# non-default namespace lines up end to end; when installing to a non-default
+# namespace, pass `kubectl unbounded machine register --namespace <ns>` so the
+# SSH secret and its Machine ref land where machina runs.
+UNBOUNDED_NAMESPACE ?= unbounded-system
+
 FORGE_BIN=bin/forge
 FORGE_CMD=./hack/cmd/forge
 
@@ -20,6 +30,10 @@ AGENT_ARTIFACTS_BUILDER_CMD=./hack/cmd/agent-artifacts-builder
 
 INVENTORY_AGENT_BIN=bin/inventory-agent
 INVENTORY_AGENT_CMD=./cmd/inventory/inventory-agent
+
+INVENTORY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+INVENTORY_MANIFEST_TEMPLATES_DIR := deploy/inventory
+INVENTORY_MANIFEST_RENDERED_DIR  := deploy/inventory/rendered
 
 INVENTORY_AGGREGATOR_BIN=bin/inventory-aggregator
 INVENTORY_AGGREGATOR_CMD=./cmd/inventory/inventory-aggregator
@@ -41,21 +55,45 @@ AGENT_CMD=./cmd/agent
 
 MACHINA_BIN=bin/machina
 MACHINA_CMD=./cmd/machina
-MACHINA_IMAGE ?= $(CONTAINER_REGISTRY)/machina:$(VERSION)
+# Fall back to the default even when the variable is set to an empty string, not
+# just when unset. GNU make's `?=` treats a set-but-empty environment variable as
+# already defined; a Docker `ARG MACHINA_IMAGE=` exported into the operator image
+# build as "" therefore defeated `?=` and blanked the image baked into the
+# operator's embedded machina manifests. `override` also neutralizes an empty
+# value passed on the command line; `=` keeps CONTAINER_REGISTRY/VERSION_TAG
+# expansion deferred (VERSION_TAG is defined later in this file).
+ifeq ($(strip $(MACHINA_IMAGE)),)
+override MACHINA_IMAGE = $(CONTAINER_REGISTRY)/machina:$(VERSION_TAG)
+endif
 
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
-MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION)
+MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION_TAG)
 MACHINE_OPS_CONTROLLER_NAME ?= machine-ops-controller
 MACHINE_OPS_PROVIDER ?=
 MACHINE_OPS_SITE ?=
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
-NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION)
+NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION_TAG)
 
-PLAYPEN_TAG ?= $(subst /,-,$(VERSION))
+PLAYPEN_TAG ?= $(VERSION_TAG)
 PLAYPEN_IMAGE ?= $(CONTAINER_REGISTRY)/playpen:$(PLAYPEN_TAG)
+
+UNBOUNDED_OPERATOR_BIN=bin/unbounded-operator
+UNBOUNDED_OPERATOR_CMD=./cmd/unbounded-operator
+UNBOUNDED_OPERATOR_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-operator:$(VERSION_TAG)
+UNBOUNDED_OPERATOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
+# Full image-repository prefix the operator resolves component images under. It
+# derives from CONTAINER_REGISTRY so it cannot drift from the operator's own
+# image: overriding CONTAINER_REGISTRY (as the release workflow does per fork)
+# points components at the same registry/org as the operator.
+UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
+UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
+export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
+UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
+UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
 
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
@@ -79,15 +117,19 @@ UNROUTE_CMD=./cmd/unroute
 # Gantry (peer-to-peer OCI distribution)
 GANTRY_BIN=bin/gantry
 GANTRY_CMD=./cmd/gantry
-GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION)
-GANTRY_NAMESPACE ?= gantry
+GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION_TAG)
+GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+GANTRY_MANIFEST_TEMPLATES_DIR := deploy/gantry
+GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
 
 # unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
 UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_CMD=./cmd/unbounded-storage-supervisor
-UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= latest
+# Default to the version-matched tag so operator-managed storage components stay
+# aligned with the release; override for local/e2e (e.g. TAG=dev).
+UNBOUNDED_STORAGE_SUPERVISOR_TAG ?= $(VERSION_TAG)
 UNBOUNDED_STORAGE_SUPERVISOR_IMAGE=$(CONTAINER_REGISTRY)/unbounded-storage-supervisor:$(UNBOUNDED_STORAGE_SUPERVISOR_TAG)
-UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= unbounded-kube
+UNBOUNDED_STORAGE_SUPERVISOR_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-storage-supervisor
 UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-storage-supervisor/rendered
 
@@ -146,6 +188,11 @@ STORAGE_TARBALL := $(STORAGE_DIST_DIR)/$(STORAGE_TARBALL_STEM).tar.gz
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# VERSION_TAG is VERSION made safe for use as a Docker image tag: git describe can
+# surface a nearest tag containing a slash (e.g. agent-artifacts/v20260710), which
+# is invalid in an image reference. VERSION itself is kept intact for the embedded
+# version string (ldflags) and release artifact paths.
+VERSION_TAG ?= $(subst /,-,$(VERSION))
 GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -155,13 +202,13 @@ STAMP_LDFLAGS=-X github.com/Azure/unbounded/internal/version.Version=$(VERSION) 
               -X github.com/Azure/unbounded/internal/version.BuildTime=$(BUILD_TIME)
 METALMAN_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/internal/metalman/commands.DefaultNetbootImage=$(NETBOOT_IMAGE)
 
-METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION)
+METALMAN_IMAGE=$(CONTAINER_REGISTRY)/metalman:$(VERSION_TAG)
 
 # Orca configuration
 ORCA_BIN=bin/orca
 ORCA_CMD=./cmd/orca
-ORCA_IMAGE ?= $(CONTAINER_REGISTRY)/orca:$(VERSION)
-ORCA_NAMESPACE ?= unbounded-kube
+ORCA_IMAGE ?= $(CONTAINER_REGISTRY)/orca:$(VERSION_TAG)
+ORCA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 ORCA_MANIFEST_TEMPLATES_DIR := deploy/orca
 ORCA_MANIFEST_RENDERED_DIR  := deploy/orca/rendered
 
@@ -177,13 +224,18 @@ ORCA_DEV_IMAGE ?= ghcr.io/azure/orca:dev
 # the default in hack/orca/kind-up.sh.
 ORCA_KIND_CLUSTER ?= orca-dev
 
-# kubectl-unbounded also stamps the metalman image reference.
-KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS) -X github.com/Azure/unbounded/cmd/kubectl-unbounded/app.MetalmanImage=$(METALMAN_IMAGE)
+KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS)
 
 # --- Net (unbounded-net) configuration -------------------------------------
 # Container images for the net controller and node agent.
-NET_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION)
-NET_NODE_IMAGE       ?= $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION)
+# See the MACHINA_IMAGE note above: default when empty-or-unset so an empty
+# Docker ARG cannot blank the images baked into the embedded net manifests.
+ifeq ($(strip $(NET_CONTROLLER_IMAGE)),)
+override NET_CONTROLLER_IMAGE = $(CONTAINER_REGISTRY)/unbounded-net-controller:$(VERSION_TAG)
+endif
+ifeq ($(strip $(NET_NODE_IMAGE)),)
+override NET_NODE_IMAGE = $(CONTAINER_REGISTRY)/unbounded-net-node:$(VERSION_TAG)
+endif
 
 # CNI plugins version baked into the net-node image. Keep in sync with the
 # defaults in images/net-{node,controller}/Dockerfile and the workflow envs.
@@ -194,7 +246,7 @@ CNI_PLUGINS_VERSION  ?= v1.9.1
 HOST_GOARCH := $(shell $(GOCMD) env GOARCH)
 
 # Kubernetes deploy knobs.
-NET_NAMESPACE           ?= unbounded-net
+NET_NAMESPACE           ?= $(UNBOUNDED_NAMESPACE)
 NET_FORCE_NOT_LEADER    ?= false
 NET_AZURE_TENANT_ID     ?=
 NET_APISERVER_URL       ?= $(shell kubectl config view --flatten --minify --template '{{ (index .clusters 0).cluster.server }}' 2>/dev/null)
@@ -212,16 +264,16 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build
-.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-manifests
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
+.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
 
 ##@ General
 
-all: kubectl-unbounded forge machina machine-ops-controller unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -241,8 +293,10 @@ help: ## Show this help
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck"
 	@echo "  gomod                            go mod tidy"
-	@echo "  notice                           Regenerate NOTICE from go.mod and frontend/package.json"
+	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
+	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
+	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
 	@echo ""
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
@@ -261,6 +315,7 @@ help: ## Show this help
 	@echo "  machina | machina-build          Build machina controller (with/without lint/test)"
 	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
+	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
 	@echo "  unbounded-net-controller         Build net controller"
 	@echo "  unbounded-net-node               Build net node agent"
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
@@ -295,6 +350,8 @@ help: ## Show this help
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-metalman-local             Build metalman image"
+	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
+	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
 	@echo "  image-playpen-local              Build playpen image"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
 	@echo "  image-net-controller-push        Build and push unbounded-net-controller image"
@@ -323,6 +380,8 @@ help: ## Show this help
 	@echo "  machine-ops-manifests            Render machine-ops manifests into deploy/machine-ops/rendered"
 	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo "  orca-manifests                   Render orca manifests into deploy/orca/rendered"
+	@echo "  unbounded-operator-manifests     Render unbounded-operator manifests into deploy/unbounded-operator/rendered"
+	@echo "  unbounded-operator-release-manifest Build a versioned, directly applicable operator manifest under build/"
 	@echo "  unbounded-storage-supervisor-manifests  Render storage supervisor manifests into deploy/unbounded-storage-supervisor/rendered"
 	@echo ""
 	@echo "Net Kubernetes (apply to current kubectl context):"
@@ -430,33 +489,33 @@ lint: ## Run golangci-lint (matches CI; run `make fmt` to auto-fix)
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Run all tests with race detector
-	$(GOTEST) -race $(GO_PACKAGES)
+test: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
+	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Run all tests (implies lint)
-	$(GOTEST) $(GO_PACKAGES)
+test: lint machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
+	$(GOTEST) ./...
 
 endif
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-build: machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Build all Go packages
-	$(GOBUILD) $(GO_PACKAGES)
+build: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
+	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests ## Run govulncheck for known vulnerabilities
+vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck for known vulnerabilities
 	@# GO-2024-3218 (libp2p/go-libp2p-kad-dht): all versions affected, no fix
 	@# available. Theoretical DHT content-censorship attack, not exploitable in
 	@# gantry's private-cluster deployment model. Tracked upstream at
 	@# https://github.com/advisories/GHSA-mqr9-hjr8-2m9w
 	@tmpf=$$(mktemp); \
-	$(GOCMD) tool govulncheck ./... > "$$tmpf" 2>&1; rc=$$?; \
+	$(GOCMD) tool govulncheck $(GO_PACKAGE_PATTERNS) > "$$tmpf" 2>&1; rc=$$?; \
 	cat "$$tmpf"; \
 	if [ $$rc -eq 0 ]; then rm -f "$$tmpf"; exit 0; fi; \
 	if grep -q 'affected by 1 vulnerability' "$$tmpf" && grep -q 'GO-2024-3218' "$$tmpf"; then \
@@ -468,7 +527,7 @@ vulncheck: machina-manifests machine-ops-manifests playpen-manifests net-manifes
 gomod: ## Tidy go.mod and go.sum
 	$(GOMOD) tidy
 
-notice: ## Regenerate NOTICE from go.mod and frontend/package.json
+notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -476,7 +535,7 @@ notice: ## Regenerate NOTICE from go.mod and frontend/package.json
 	fi
 	$(GOCMD) run ./hack/cmd/notice generate --output NOTICE
 
-notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
+notice-check: ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -484,9 +543,17 @@ notice-check: ## Verify NOTICE is in sync with go.mod and frontend/package.json
 	fi
 	$(GOCMD) run ./hack/cmd/notice check --notice NOTICE
 
+.PHONY: toolchain-shell
+toolchain-shell: ## Drop into the toolchain container with the repo mounted at /project (builds the image on first use)
+	@./images/toolchain/toolchain.sh
+
+.PHONY: toolchain-build
+toolchain-build: ## Rebuild the toolchain container image (otherwise built lazily on first toolchain-shell use)
+	@TOOLCHAIN_REBUILD=1 ./images/toolchain/toolchain.sh true
+
 ##@ Build
 
-kubectl-unbounded-build: machina-manifests net-manifests ## Build the kubectl-unbounded binary (no lint/test)
+kubectl-unbounded-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build the kubectl-unbounded binary (no lint/test)
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
@@ -556,6 +623,11 @@ metalman-build: ## Build the metalman binary (no lint/test)
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
+unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
+
+unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
+
 ##@ Net Binaries
 
 unbounded-net-controller-build: ## Build the unbounded-net-controller binary (no lint/test)
@@ -587,6 +659,34 @@ gantry-build: ## Build the gantry binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(GANTRY_BIN) $(GANTRY_CMD)
 
 gantry: test gantry-build ## Build gantry (implies test)
+
+gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rendered
+	@mkdir -p $(GANTRY_MANIFEST_RENDERED_DIR)
+	@find $(GANTRY_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(GANTRY_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(GANTRY_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(GANTRY_NAMESPACE) \
+		--set Image=$(GANTRY_IMAGE)
+	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
+
+# Inventory render knobs. SSLMode/Password feed the database config and
+# secret templates; Password is base64-encoded data and defaults empty so
+# the generic target stays secret-free (hack/inventory-dev/local.sh supplies
+# a generated value).
+INVENTORY_SSL_MODE        ?= disable
+INVENTORY_PG_PASSWORD_B64 ?=
+
+inventory-manifests: ## Render inventory deployment manifests into deploy/inventory/rendered
+	@mkdir -p $(INVENTORY_MANIFEST_RENDERED_DIR)
+	@find $(INVENTORY_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(INVENTORY_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(INVENTORY_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(INVENTORY_NAMESPACE) \
+		--set SSLMode=$(INVENTORY_SSL_MODE) \
+		--set Password=$(INVENTORY_PG_PASSWORD_B64)
+	@echo "Rendered inventory manifests into $(INVENTORY_MANIFEST_RENDERED_DIR) (namespace: $(INVENTORY_NAMESPACE))"
 
 unbounded-storage-supervisor-build: ## Build the unbounded-storage-supervisor binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_STORAGE_SUPERVISOR_BIN) $(UNBOUNDED_STORAGE_SUPERVISOR_CMD)
@@ -775,7 +875,7 @@ bench: $(LIBFABRIC_STAMP) $(OPENSSL_STAMP) ## Build the bench tool (excluded fro
 TLA_TOOLS_JAR ?= tmp/tla2tools.jar
 TLA_TOOLS_VERSION ?= v1.8.0
 TLA_TOOLS_URL ?= https://github.com/tlaplus/tlaplus/releases/download/$(TLA_TOOLS_VERSION)/tla2tools.jar
-TLA_TOOLS_SHA256 ?= 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
+TLA_TOOLS_SHA256 ?= cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3
 
 # Root directory holding the TLA+ models.  Each subdirectory contains exactly
 # one <Name>.tla plus a matching <Name>.cfg and is model-checked by a per-model
@@ -923,7 +1023,7 @@ image-machina-local: ## Build the machina container image locally (single-arch)
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t machina:$(VERSION) -t $(MACHINA_IMAGE) \
+		-t machina:$(VERSION_TAG) -t $(MACHINA_IMAGE) \
 		-f ./images/machina/Containerfile .
 	$(call trivy-maybe,$(MACHINA_IMAGE))
 
@@ -938,7 +1038,7 @@ image-machine-ops-controller-local: ## Build the machine-ops-controller containe
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t machine-ops-controller:$(VERSION) -t $(MACHINE_OPS_CONTROLLER_IMAGE) \
+		-t machine-ops-controller:$(VERSION_TAG) -t $(MACHINE_OPS_CONTROLLER_IMAGE) \
 		-f ./images/machine-ops-controller/Containerfile .
 	$(call trivy-maybe,$(MACHINE_OPS_CONTROLLER_IMAGE))
 
@@ -947,11 +1047,11 @@ machine-ops-controller-oci: image-machine-ops-controller-local ## Alias for imag
 machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push the machine-ops-controller image
 	$(CONTAINER_ENGINE) push $(MACHINE_OPS_CONTROLLER_IMAGE)
 
-MACHINA_NAMESPACE ?= unbounded-kube
+MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
-MACHINE_OPS_NAMESPACE ?= unbounded-kube
+MACHINE_OPS_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
@@ -980,6 +1080,19 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
+
+unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy/unbounded-operator/rendered
+	@mkdir -p $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)
+	@find $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
+		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
+		--set ImageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
+		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
+		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
+	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
 
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
 	@mkdir -p $(MACHINE_OPS_MANIFEST_RENDERED_DIR)
@@ -1015,8 +1128,8 @@ playpen-manifests: ## Render playpen operator and runner manifests into deploy/p
 	@echo "Rendered playpen manifests into $(PLAYPEN_MANIFEST_RENDERED_DIR) (image: $(PLAYPEN_IMAGE))"
 
 machina-run: machina ## Replace the in-cluster machina with a locally built binary
-	kubectl scale deployment/machina-controller --replicas=0 -n unbounded-kube
-	kubectl get configmap machina-config -n unbounded-kube -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
+	kubectl scale deployment/machina-controller --replicas=0 -n $(MACHINA_NAMESPACE)
+	kubectl get configmap machina-config -n $(MACHINA_NAMESPACE) -o jsonpath='{.data.config\.yaml}' > hack/machina-config.yaml
 	$(MACHINA_BIN) controller --config=hack/machina-config.yaml
 
 image-metalman-local: ## Build the metalman container image locally (single-arch)
@@ -1025,7 +1138,7 @@ image-metalman-local: ## Build the metalman container image locally (single-arch
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		--build-arg CONTAINER_REGISTRY=$(CONTAINER_REGISTRY) \
-		-t metalman:$(VERSION) -t $(METALMAN_IMAGE) \
+		-t metalman:$(VERSION_TAG) -t $(METALMAN_IMAGE) \
 		-f ./images/metalman/Containerfile .
 	$(call trivy-maybe,$(METALMAN_IMAGE))
 
@@ -1033,6 +1146,18 @@ metalman-oci: image-metalman-local ## Alias for image-metalman-local
 
 metalman-oci-push: metalman-oci ## Build and push the metalman container image
 	$(CONTAINER_ENGINE) push $(METALMAN_IMAGE)
+
+image-unbounded-operator-local: ## Build the unbounded-operator container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t unbounded-operator:$(VERSION_TAG) -t $(UNBOUNDED_OPERATOR_IMAGE) \
+		-f ./images/unbounded-operator/Containerfile .
+	$(call trivy-maybe,$(UNBOUNDED_OPERATOR_IMAGE))
+
+image-unbounded-operator-push: image-unbounded-operator-local ## Build and push the unbounded-operator image
+	$(CONTAINER_ENGINE) push $(UNBOUNDED_OPERATOR_IMAGE)
 
 image-playpen-local: ## Build the playpen container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
@@ -1048,7 +1173,7 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t gantry:$(VERSION) -t $(GANTRY_IMAGE) \
+		-t gantry:$(VERSION_TAG) -t $(GANTRY_IMAGE) \
 		-f ./images/gantry/Containerfile .
 	$(call trivy-maybe,$(GANTRY_IMAGE))
 
@@ -1081,7 +1206,7 @@ image-orca-local: ## Build the orca container image locally (single-arch)
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t orca:$(VERSION) -t $(ORCA_IMAGE) \
+		-t orca:$(VERSION_TAG) -t $(ORCA_IMAGE) \
 		-f ./images/orca/Containerfile .
 
 orca-oci: image-orca-local ## Alias for image-orca-local
@@ -1205,7 +1330,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-net-controller-local image-net-node-local ## Build all container images locally
+images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
 
 ##@ Net Frontend
 
@@ -1275,15 +1400,39 @@ net-manifests: ## Render net manifests into $(NET_MANIFEST_RENDERED_DIR)
 
 RELEASE_MANIFESTS_STAGE_DIR := build/release-manifests
 RELEASE_MANIFESTS_NAME      := unbounded-manifests-$(VERSION)
+UNBOUNDED_OPERATOR_RELEASE_MANIFEST := build/unbounded-operator-$(VERSION).yaml
+RELEASE_BOM_OUTPUT ?= build/unbounded-release-bom-$(VERSION).json
 
-release-manifests: machina-manifests machine-ops-manifests net-manifests ## Build stamped combined manifest tarball under build/
+release-bom: ## Generate a digest-pinned release bill of materials
+	$(GOCMD) run ./hack/cmd/release-bom \
+		--tag "$(VERSION)" \
+		--commit "$(GIT_COMMIT)" \
+		--registry "$(CONTAINER_REGISTRY)" \
+		--net-cni-version "$(CNI_PLUGINS_VERSION)" \
+		--output "$(RELEASE_BOM_OUTPUT)"
+
+unbounded-operator-release-manifest: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
+unbounded-operator-release-manifest: unbounded-operator-manifests ## Build a versioned, directly applicable operator manifest under build/
+	@mkdir -p build
+	@cat $$(ls -1 "$(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)"/*.yaml | LC_ALL=C sort) > "$(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
+	@echo "Operator release manifest: $(UNBOUNDED_OPERATOR_RELEASE_MANIFEST)"
+
+release-manifests: NET_APISERVER_URL :=
+release-manifests: UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT :=
+release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests ## Build stamped combined manifest tarball under build/
 	@rm -rf $(RELEASE_MANIFESTS_STAGE_DIR)
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops
 	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor
+	@mkdir -p $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator
 	@cp -R $(MACHINA_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machina/
 	@cp -R $(MACHINE_OPS_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/machine-ops/
 	@cp -R $(NET_MANIFEST_RENDERED_DIR)/.     $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/net/
+	@cp -R $(GANTRY_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/gantry/
+	@cp -R $(UNBOUNDED_STORAGE_SUPERVISOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-storage-supervisor/
+	@cp -R $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR)/. $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/unbounded-operator/
 	@echo "$(VERSION)" > $(RELEASE_MANIFESTS_STAGE_DIR)/$(RELEASE_MANIFESTS_NAME)/VERSION
 	@mkdir -p build
 	tar czf "build/$(RELEASE_MANIFESTS_NAME).tar.gz" -C $(RELEASE_MANIFESTS_STAGE_DIR) $(RELEASE_MANIFESTS_NAME)

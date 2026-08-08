@@ -1,4 +1,4 @@
-{{ if le .SpecRepaveCounter .StatusRepaveCounter }}
+{{ if not .InstallRequested }}
 # No pending repave. Chainload the locally installed bootloader.
 insmod part_gpt
 insmod fat
@@ -36,10 +36,13 @@ menuentry "Unbounded Metal Install" {
     unbounded.apiserver_url={{ .ApiserverURL }} \
     {{- if .BootLease }}
     unbounded.boot_mac={{ .BootLease.MAC }} \
+    {{- if (ipAddresses .BootLease.DNS) }}
+    unbounded.dns={{ join (ipAddresses .BootLease.DNS) "," }} \
+    {{- end }}
     ip={{ .BootLease.IPv4 }}::{{ .BootLease.Gateway }}:{{ .BootLease.SubnetMask }}:::none \
     {{- end }}
-    {{- if .Machine.Spec.PXE.TargetDisk }}
-    unbounded.disk={{ .Machine.Spec.PXE.TargetDisk }} \
+    {{- if .Machine.Spec.Netboot.TargetDisk }}
+    unbounded.disk={{ .Machine.Spec.Netboot.TargetDisk }} \
     {{- end }}
     console=tty0 console=ttyS0,115200n8 \
     ---

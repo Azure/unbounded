@@ -37,12 +37,15 @@ controller:
   statusWebsocketKeepaliveInterval: 10s
   statusWsKeepaliveFailureCount: 2
   registerAggregatedAPIServer: true
+  managedKubeProxy:
+    enabled: true
+    image: ""
   leaderElection:
     enabled: true
     leaseDuration: 15s
     renewDeadline: 5s
     retryPeriod: 10s
-    resourceNamespace: kube-system
+    resourceNamespace: unbounded-system
     resourceName: unbounded-net-controller
 
 node:
@@ -52,7 +55,7 @@ node:
   wireGuardDir: /host/etc/wireguard
   wireGuardPort: 51820
   enablePolicyRouting: false    # Deprecated -- PBR replaced by per-interface FORWARD ACCEPT rules
-  mtu: 1280
+  mtu: 0
   healthPort: 9998
   informerResyncPeriod: 3600s
   statusWebsocketEnabled: true
@@ -91,6 +94,26 @@ node:
 ```
 
 ## Controller Configuration
+
+### Managed kube-proxy
+
+The controller creates a kube-proxy DaemonSet for each Site whose nodes are not
+covered by the provider-managed kube-proxy. The image setting defaults to an
+empty string. When it is empty, the controller reuses the image from the
+`kube-system/kube-proxy` DaemonSet. If that DaemonSet does not exist, it uses
+`registry.k8s.io/kube-proxy:<server version>`.
+
+Set `controller.managedKubeProxy.image` to override the image for all
+unbounded-managed kube-proxy DaemonSets, for example when pulling kube-proxy
+through a private registry. Set `controller.managedKubeProxy.enabled` to `false`
+to disable their creation. See the
+[rendered networking configuration](../content/reference/networking/configuration.md#managed-kube-proxy)
+for scheduling and per-Site behavior.
+
+| Flag | Runtime setting | Type | Default | Description |
+|------|-----------------|------|---------|-------------|
+| `--managed-kube-proxy` | `controller.managedKubeProxy.enabled` | bool | `true` | Create kube-proxy DaemonSets for unbounded-managed Site nodes not covered by provider kube-proxy. |
+| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | string | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. |
 
 ### Pod CIDR Assignment (Site CRD)
 
@@ -194,22 +217,23 @@ graph TD
 | `--cni-conf-dir` | string | `/etc/cni/net.d` | Directory to write CNI configuration. |
 | `--cni-conf-file` | string | `10-unbounded.conflist` | Name of the CNI configuration file. |
 | `--bridge-name` | string | `cbr0` | Name of the bridge interface. |
-| `--mtu` | int | `1280` | MTU for tunnel and bridge interfaces. Must be set to the lowest physical-link MTU of any node in the cluster minus the encapsulation overhead -- 80 bytes for WireGuard, 58 bytes for GENEVE/VXLAN, or 20 bytes for IPIP. The system auto-selects the correct overhead based on the encapsulation type for each link. The node agent clamps the effective MTU to `min(configured, detected)` so packets are never larger than the physical link can carry. A value of `0` is treated as `1280`. See [MTU Guidance](#mtu-guidance) below. |
+| `--mtu` | int | `0` | Optional maximum MTU for tunnel and bridge interfaces. With `0`, the node agent derives each route's MTU from the selected underlay route and encapsulation overhead. Positive values cap the automatically detected and CRD-configured MTU. |
 
 ### MTU Guidance
 
-The `node.mtu` setting controls the MTU used on tunnel interfaces (WireGuard,
-GENEVE, VXLAN, and IPIP) and the CNI bridge. WireGuard adds 80 bytes of
-encapsulation overhead, GENEVE and VXLAN add 58 bytes, and IPIP adds 20 bytes.
-The tunnel MTU must be lower than the underlying network interface MTU.
+The `node.mtu` setting is an optional upper bound for tunnel interfaces,
+per-destination routes, and the CNI bridge. WireGuard adds 80 bytes of
+encapsulation overhead, GENEVE adds 58 bytes, VXLAN adds 50 bytes, and IPIP
+adds 20 bytes. With the default value of `0`, the node agent looks up the
+actual route to each peer, subtracts the selected encapsulation overhead, and
+uses the lowest applicable Site, peering, assignment, or pool `tunnelMTU`.
+The node agent treats Sites and GatewayPools as a topology graph connected by
+SitePeerings, SiteGatewayPoolAssignments, and GatewayPoolPeerings. The lowest
+`tunnelMTU` anywhere in the local site's connected topology is applied
+site-wide, including downstream multi-hop gateway paths.
 
-**Formula:** `node.mtu = <lowest physical-link MTU of any node in the cluster> - 80`
-
-(Using 80, the largest overhead, ensures the value is safe for all tunnel types.)
-
-For example, if all nodes have a 1500-byte link MTU, set `node.mtu` to `1420`.
-If some nodes have jumbo frames (9000) but others have standard Ethernet (1500),
-the configured MTU must be based on the smallest value: `1500 - 80 = 1420`.
+For example, a WireGuard peer reached through a 1500-byte Ethernet route gets
+an automatic MTU of `1420`.
 
 **Behavior:**
 - Each node agent detects its default-route interface MTU at startup and on
@@ -223,7 +247,12 @@ the configured MTU must be based on the smallest value: `1500 - 80 = 1420`.
 - The controller reads `node.mtu` from the shared configmap and compares it
   against every node's `tunnel-mtu` annotation. Mismatches are reported as
   warnings on the status page and in the controller logs.
-- A value of `0` is normalized to `1280` (the IPv6 minimum MTU).
+- The CNI MTU is the lowest effective peer or connected-topology MTU. At
+  startup and whenever that value changes, the node agent updates the CNI
+  bridge and both endpoints of existing pod veth pairs.
+- Forwarded TCP SYN packets on every interface are MSS-clamped to the
+  site-wide fabric MTU (`MTU - 40` for IPv4 and `MTU - 60` for IPv6).
+- A value of `0` enables route-specific automatic MTU selection.
 
 ### WireGuard Configuration
 
@@ -624,7 +653,7 @@ graph TD
 |----------|-------------|
 | `LOG_LEVEL` | Initial klog verbosity passed as `-v=$(LOG_LEVEL)`. For dynamic changes without restart, edit `common.logLevel` in the ConfigMap YAML instead. |
 | `POD_NAME` | Pod name for leader election identity. Auto-populated from downward API. |
-| `POD_NAMESPACE` | Namespace for leader election lease. Default: `kube-system`. |
+| `POD_NAMESPACE` | Namespace for leader election lease. Default: `unbounded-system`. |
 | `POD_IP` | Pod IP address. Used for EndpointSlice management so the leader's dashboard is accessible via the controller Service. |
 | `NODE_NAME` | Node name. Displayed in the dashboard as the leader node. |
 | `AZURE_TENANT_ID` | Optional tenant ID used only to build Azure Portal URLs in the UI. Required only when the managed VMs are in a different tenant than the admin account currently signed into Azure Portal. |

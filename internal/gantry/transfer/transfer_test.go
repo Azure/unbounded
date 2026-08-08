@@ -4,12 +4,14 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -113,6 +115,62 @@ func TestServeFromCache(t *testing.T) {
 	}
 }
 
+func TestPeerServeByteMetrics(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	d := mustDigest(body)
+	cache := fakes.NewCache()
+	cache.Put(d, body)
+
+	type observation struct {
+		kind  string
+		bytes int64
+	}
+
+	var observations []observation
+
+	s := New(cache, WithByteMetrics(func(kind string, bytes int64) {
+		observations = append(observations, observation{kind: kind, bytes: bytes})
+	}))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	request := func(method, byteRange string) {
+		t.Helper()
+
+		req, err := http.NewRequest(method, ts.URL+"/v2/r/blobs/"+d.String(), nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+
+		req.Header.Set(MirroredHeader, "1")
+
+		if byteRange != "" {
+			req.Header.Set("Range", byteRange)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+
+		_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck // drain response
+		_ = resp.Body.Close()                 //nolint:errcheck // best-effort close
+	}
+
+	request(http.MethodGet, "")
+	request(http.MethodGet, "bytes=2-5")
+	request(http.MethodHead, "")
+
+	want := []observation{
+		{kind: "layer", bytes: int64(len(body))},
+		{kind: "layer", bytes: 4},
+	}
+
+	if !reflect.DeepEqual(observations, want) {
+		t.Fatalf("byte observations = %+v, want %+v", observations, want)
+	}
+}
+
 func TestMiss404(t *testing.T) {
 	ts, _, _ := newTestServer(t)
 	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
@@ -148,6 +206,67 @@ func TestTagAlways404(t *testing.T) {
 	}
 }
 
+func TestServeCapShedsBlobGetWith429(t *testing.T) {
+	cache := fakes.NewCache()
+	body := []byte("a blob served under a concurrency cap")
+	d := mustDigest(body)
+	cache.Put(d, body)
+
+	s := New(cache, WithMaxConcurrentServes(1))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	get := func(method string) *http.Response {
+		t.Helper()
+
+		req, _ := http.NewRequest(method, ts.URL+"/v2/r/blobs/"+d.String(), nil)
+		req.Header.Set(MirroredHeader, "1")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return resp
+	}
+
+	// Occupy the single serve slot so the server is at capacity.
+	release, ok := s.tryAcquireServe()
+	if !ok {
+		t.Fatal("expected to acquire the only serve slot")
+	}
+
+	// A blob GET while at capacity is shed with 429 + Retry-After.
+	resp := get(http.MethodGet)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("blob GET at capacity: status = %d, want 429", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Error("429 response missing Retry-After header")
+	}
+
+	_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+	// A HEAD is never capped.
+	hresp := get(http.MethodHead)
+	if hresp.StatusCode != http.StatusOK {
+		t.Errorf("blob HEAD at capacity: status = %d, want 200 (HEAD is never capped)", hresp.StatusCode)
+	}
+
+	_ = hresp.Body.Close() //nolint:errcheck // best-effort body close
+
+	// After releasing the slot, the blob GET succeeds.
+	release()
+
+	resp2 := get(http.MethodGet)
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("blob GET after release: status = %d, want 200", resp2.StatusCode)
+	}
+
+	_ = resp2.Body.Close() //nolint:errcheck // best-effort body close
+}
+
 func TestRangeRequest(t *testing.T) {
 	ts, cache, _ := newTestServer(t)
 	body := []byte("0123456789ABCDEF")
@@ -176,6 +295,52 @@ func TestRangeRequest(t *testing.T) {
 	got, _ := io.ReadAll(resp.Body)
 	if string(got) != "2345" {
 		t.Errorf("body = %q, want 2345", got)
+	}
+}
+
+type shortNonSeekerStore struct {
+	digest digest.Digest
+}
+
+func (s shortNonSeekerStore) Has(context.Context, digest.Digest) (bool, error) {
+	return true, nil
+}
+
+func (s shortNonSeekerStore) Open(context.Context, digest.Digest) (io.ReadCloser, int64, error) {
+	return io.NopCloser(bytes.NewReader([]byte("ab"))), 16, nil
+}
+
+func (s shortNonSeekerStore) Writer(context.Context, digest.Digest) (ifaces.ContentWriter, error) {
+	return nil, context.Canceled
+}
+
+func TestRangePositionFailureDoesNotSendPartialContent(t *testing.T) {
+	d := mustDigest([]byte("expected digest identity only"))
+	server := New(shortNonSeekerStore{digest: d})
+	testServer := httptest.NewServer(server.Handler())
+	t.Cleanup(testServer.Close)
+
+	request, err := http.NewRequest(http.MethodGet, testServer.URL+"/v2/r/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	request.Header.Set(MirroredHeader, "1")
+	request.Header.Set("Range", "bytes=4-7")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", response.StatusCode)
+	}
+
+	if got := response.Header.Get("Content-Range"); got != "" {
+		t.Fatalf("Content-Range = %q, want empty", got)
 	}
 }
 

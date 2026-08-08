@@ -97,6 +97,12 @@ type Config struct {
 	// and pod ports, not in the bind address.
 	MetricsListen string `yaml:"metrics_listen"`
 
+	// PprofListen is an optional Go runtime profiling endpoint. Empty disables
+	// profiling. When enabled it must bind loopback so profiles, command lines,
+	// and runtime state are reachable only through local access such as
+	// `kubectl port-forward`.
+	PprofListen string `yaml:"pprof_listen"`
+
 	// Libp2pListen is the multiaddr(s) the libp2p host advertises (the design doc).
 	// Empty means "use libp2p defaults" and pick at random.
 	Libp2pListen []string `yaml:"libp2p_listen"`
@@ -249,6 +255,36 @@ type Config struct {
 	// open question).
 	HRWK int `yaml:"hrw_k"`
 
+	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
+	// prefetched layer digest is dispatched to. 1 designates a single origin
+	// puller per layer (tightest dedup), but the whole swarm then fans out
+	// from ONE initial seed, which bottlenecks a cold thundering-herd (peer
+	// transfers pile onto the lone seed and stall). N>1 asks the top-N pullers
+	// to origin-pull the layer in parallel, giving N initial seeds so peer
+	// transfers fan out N-fold, at the cost of up to N origin copies of each
+	// layer. The default is 8.
+	PrefetchPullerReplicas int `yaml:"prefetch_puller_replicas"`
+
+	// PrefetchPullerFraction dynamically sizes the initial puller set from the
+	// eligible HRW candidate count. Values are fractions in (0, 1], so 0.02
+	// selects ceil(nodes * 0.02) pullers. Zero disables dynamic sizing and uses
+	// PrefetchPullerReplicas for backward compatibility. Selection is uncapped
+	// except by the number of eligible nodes.
+	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
+
+	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
+	// to a deterministic HRW-ranked subset of manifest consumers. Local
+	// self-selected pulls still run on every consumer. The default is 3.
+	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
+
+	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
+	// per manifest. Group dispatch is best effort and target-side deduplicated.
+	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
+
+	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
+	// node derives a stable delay in [0, jitter) from itself and the manifest.
+	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
+
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
 	// (HRW within the requester's zone) - the design doc / the design doc open question.
 	HRWTopologyScope string `yaml:"hrw_topology_scope"`
@@ -276,6 +312,49 @@ type Config struct {
 	// please_pull. Each pull holds an HTTP response body, a containerd writer,
 	// goroutine state, and a lease, so this protects the node from fan-out.
 	CoordMaxConcurrentPulls int `yaml:"coord_max_concurrent_pulls"`
+
+	// PeerFetchTimeout caps the complete peer request, including streaming and
+	// committing the response body. The default is 15m so progressing large
+	// layers are not forced to switch providers at a size-dependent throughput
+	// threshold. The HTTP/2 transport separately probes connections after 10s
+	// without reads, so dead connections are detected before this safety ceiling.
+	// Live stream-through still preserves a verified prefix if the ceiling fires.
+	PeerFetchTimeout time.Duration `yaml:"peer_fetch_timeout"`
+
+	// PeerRediscoverBudget bounds the total wall-clock time the mirror keeps
+	// re-running DHT FindProviders and retrying peer fetches on a cache miss
+	// before it gives up and falls to origin. Re-discovery lets a node pick up
+	// finisher-seeds that advertise mid-swarm (the cascade) instead of
+	// exhausting a fixed provider set and going to origin. Zero disables
+	// re-discovery, restoring the historical single-shot provider attempt.
+	// The default is 5m: paired with the strict containerd hosts.toml (shipped
+	// in deploy/gantry/node-config.yaml) and TransferMaxConcurrentServes, this
+	// drives the validated cold-start cascade.
+	PeerRediscoverBudget time.Duration `yaml:"peer_rediscover_budget"`
+
+	// PeerRediscoverBackoff is the pause between re-discovery rounds. It gives
+	// newly-finished seeds time to advertise into the DHT before the next
+	// FindProviders. Zero uses a built-in default (1s) when re-discovery is
+	// enabled. Ignored when PeerRediscoverBudget is zero.
+	PeerRediscoverBackoff time.Duration `yaml:"peer_rediscover_backoff"`
+
+	// TransferMaxConcurrentServes caps concurrent peer blob-body serves on the
+	// transfer endpoint. Requests over the cap receive 429 with a Retry-After
+	// hint so the requester re-discovers another provider instead of queueing
+	// behind a saturated seed. This load-shedding is what lets the first
+	// finishers complete early and seed the swarm. Zero means unlimited; the
+	// default is 10. Shedding only preserves dedup with the strict containerd
+	// hosts.toml (mirror-only, no origin fall-through), where a shed request
+	// retries Gantry rather than falling through to origin.
+	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
+
+	// AdvertiseReconcileInterval is the cadence of the background
+	// advertiser's full inventory reconcile. Eager per-digest advertise on
+	// stream completion is the fast path that makes finishers discoverable
+	// within milliseconds; this reconcile is the backstop that catches
+	// missed events and drives withdraws. Lower values converge faster
+	// after a missed event at the cost of more periodic inventory scans.
+	AdvertiseReconcileInterval time.Duration `yaml:"advertise_reconcile_interval"`
 
 	// ---------- DHT / direct-origin-fallback ----------
 
@@ -339,9 +418,13 @@ type UpstreamRegistry struct {
 	// "https://registry.example.com".
 	Endpoint string `yaml:"endpoint"`
 
-	// CredentialsPath is a hostPath-mounted file containing the registry
+	// CredentialsPath is an optional fallback file containing registry
 	// credentials. Format: "username:password" (or "_json_key:<json>" for
-	// the well-known GCR pattern). Empty means anonymous pulls.
+	// the well-known GCR pattern). A request-scoped Basic/Bearer credential
+	// delegated by containerd takes precedence and is never cached. Setting
+	// this file opts the registry into legacy shared-identity mode for requests
+	// without delegated auth; leaving it empty enables containerd challenge
+	// negotiation for private HTTPS registries.
 	CredentialsPath string `yaml:"credentials_path"`
 
 	// NSAlias lets containerd's ?ns= use a different name than Name.
@@ -377,6 +460,7 @@ func NewDefault() *Config {
 		MirrorBindAllowNonLoopback: false,
 		TransferListen:             "0.0.0.0:5001",
 		MetricsListen:              "0.0.0.0:9095",
+		PprofListen:                "",
 		Libp2pListen:               nil,
 		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
 
@@ -396,13 +480,23 @@ func NewDefault() *Config {
 
 		UpstreamRegistries: nil,
 
-		HRWK:             3,
-		HRWTopologyScope: "cluster",
-		ZoneLabelKey:     "topology.kubernetes.io/zone",
+		HRWK:                        3,
+		PrefetchPullerReplicas:      8,
+		PrefetchPullerFraction:      0,
+		PrefetchCoordinatorReplicas: 3,
+		PrefetchMaxConcurrentGroups: 64,
+		PrefetchDispatchJitter:      time.Second,
+		HRWTopologyScope:            "cluster",
+		ZoneLabelKey:                "topology.kubernetes.io/zone",
 
-		CoordPeerAuthzEnforce:     false,
-		CoordMaxDigestsPerRequest: 256,
-		CoordMaxConcurrentPulls:   16,
+		CoordPeerAuthzEnforce:       false,
+		CoordMaxDigestsPerRequest:   256,
+		CoordMaxConcurrentPulls:     16,
+		PeerFetchTimeout:            15 * time.Minute,
+		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
+		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
+		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
+		AdvertiseReconcileInterval:  time.Minute,
 
 		NF5JitterBase:               3 * time.Second,
 		NF5JitterCap:                0, // no cap by default (original behaviour)
@@ -458,6 +552,17 @@ func (c *Config) LoadEnv(env func(string) string) error {
 			*dst = n
 		}
 	}
+	setFloat := func(key string, dst *float64) {
+		if v, ok := lookup(env, key); ok {
+			n, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
+				return
+			}
+
+			*dst = n
+		}
+	}
 	setDur := func(key string, dst *time.Duration) {
 		if v, ok := lookup(env, key); ok {
 			d, err := time.ParseDuration(v)
@@ -485,6 +590,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
 	setStr("METRICS_LISTEN", &c.MetricsListen)
+	setStr("PPROF_LISTEN", &c.PprofListen)
 	setStr("LIBP2P_IDENTITY_PATH", &c.Libp2pIdentityPath)
 
 	setStr("NODE_NAME", &c.NodeName)
@@ -510,11 +616,21 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("CONTAINERD_LEASE_CLEANUP_INTERVAL", &c.ContainerdLeaseCleanupInterval)
 
 	setInt("HRW_K", &c.HRWK)
+	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
+	setFloat("PREFETCH_PULLER_FRACTION", &c.PrefetchPullerFraction)
+	setInt("PREFETCH_COORDINATOR_REPLICAS", &c.PrefetchCoordinatorReplicas)
+	setInt("PREFETCH_MAX_CONCURRENT_GROUPS", &c.PrefetchMaxConcurrentGroups)
+	setDur("PREFETCH_DISPATCH_JITTER", &c.PrefetchDispatchJitter)
 	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
 	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
 	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
+	setDur("PEER_FETCH_TIMEOUT", &c.PeerFetchTimeout)
+	setDur("PEER_REDISCOVER_BUDGET", &c.PeerRediscoverBudget)
+	setDur("PEER_REDISCOVER_BACKOFF", &c.PeerRediscoverBackoff)
+	setInt("TRANSFER_MAX_CONCURRENT_SERVES", &c.TransferMaxConcurrentServes)
+	setDur("ADVERTISE_RECONCILE_INTERVAL", &c.AdvertiseReconcileInterval)
 
 	setDur("NF5_JITTER_BASE", &c.NF5JitterBase)
 	setDur("NF5_JITTER_CAP", &c.NF5JitterCap)
@@ -541,6 +657,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
 	fs.StringVar(&c.MetricsListen, "metrics-listen", c.MetricsListen, "address for the Prometheus metrics endpoint")
+	fs.StringVar(&c.PprofListen, "pprof-listen", c.PprofListen, "optional loopback address for Go runtime profiles (empty disables pprof)")
 	fs.StringVar(&c.Libp2pIdentityPath, "libp2p-identity-path", c.Libp2pIdentityPath, "path to the persisted libp2p identity key")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name this agent runs on (Downward API spec.nodeName)")
@@ -566,11 +683,21 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
 
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
+	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
+	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "fraction of eligible HRW nodes selected as initial pullers, rounded up (0 disables and uses --prefetch-puller-replicas)")
+	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "number of deterministic manifest consumers allowed to dispatch remote speculative prefetch groups")
+	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "maximum simultaneous outbound prefetch RPC groups per manifest")
+	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "maximum deterministic per-node delay before dispatching manifest prefetch")
 	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, `HRW scope: "cluster" or "zone"`)
 	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "Kubernetes node label identifying the zone (used when hrw-topology-scope=zone)")
 	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "reject inbound coord requests from peers not in the membership view (default false = observe-only)")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
+	fs.DurationVar(&c.PeerFetchTimeout, "peer-fetch-timeout", c.PeerFetchTimeout, "maximum time for a complete peer fetch, including body transfer and commit")
+	fs.DurationVar(&c.PeerRediscoverBudget, "peer-rediscover-budget", c.PeerRediscoverBudget, "total wall-clock budget for the peer re-discovery loop (0 disables re-discovery, restoring the single-shot provider attempt)")
+	fs.DurationVar(&c.PeerRediscoverBackoff, "peer-rediscover-backoff", c.PeerRediscoverBackoff, "pause between peer re-discovery rounds (0 uses the built-in 1s default when re-discovery is enabled)")
+	fs.IntVar(&c.TransferMaxConcurrentServes, "transfer-max-concurrent-serves", c.TransferMaxConcurrentServes, "cap on concurrent peer blob-body serves (over the cap returns 429; 0 = unlimited)")
+	fs.DurationVar(&c.AdvertiseReconcileInterval, "advertise-reconcile-interval", c.AdvertiseReconcileInterval, "cadence of the background DHT advertiser inventory reconcile (backstop; eager advertise handles the fast path)")
 
 	fs.DurationVar(&c.NF5JitterBase, "nf5-jitter-base", c.NF5JitterBase, "base delay for the NF5 jitter window")
 	fs.DurationVar(&c.NF5JitterCap, "nf5-jitter-cap", c.NF5JitterCap, "hard ceiling on the NF5 jitter window (0 = no cap)")
@@ -644,6 +771,22 @@ func (c *Config) Validate() error {
 	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
 
+	if c.PprofListen != "" {
+		mustAddr("pprof_listen", c.PprofListen)
+
+		if host, portText, err := net.SplitHostPort(c.PprofListen); err == nil {
+			ip := net.ParseIP(host)
+			if host == "" || (ip != nil && !ip.IsLoopback()) || (ip == nil && host != "localhost") {
+				errs = append(errs, fmt.Errorf("pprof_listen %q must bind loopback (127.0.0.1, ::1, or localhost)", c.PprofListen))
+			}
+
+			port, portErr := strconv.Atoi(portText)
+			if portErr != nil || port < 1 || port > 65535 {
+				errs = append(errs, fmt.Errorf("pprof_listen %q must use a numeric port between 1 and 65535", c.PprofListen))
+			}
+		}
+	}
+
 	// MirrorListen MUST be loopback (the design doc, the design doc) unless the operator has
 	// explicitly opted in to a non-loopback bind. See the field comment on
 	// Config.MirrorBindAllowNonLoopback for when that's safe.
@@ -651,13 +794,13 @@ func (c *Config) Validate() error {
 		if host, _, err := net.SplitHostPort(c.MirrorListen); err == nil {
 			ip := net.ParseIP(host)
 			if ip != nil && !ip.IsLoopback() {
-				errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe (containerd mirror uses skip_verify=true) - set mirror_bind_allow_non_loopback: true to override (operator opt-in)", c.MirrorListen))
+				errs = append(errs, fmt.Errorf("mirror_listen %q is not loopback; only 127.0.0.1 / ::1 are safe - set mirror_bind_allow_non_loopback: true to override (operator opt-in)", c.MirrorListen))
 			}
 
 			// Empty host (e.g. ":5000") binds all interfaces, which is
 			// equivalent to 0.0.0.0 and must also require the opt-in.
 			if host == "" {
-				errs = append(errs, fmt.Errorf("mirror_listen %q binds all interfaces; only loopback is safe (containerd mirror uses skip_verify=true) - set mirror_bind_allow_non_loopback: true to override", c.MirrorListen))
+				errs = append(errs, fmt.Errorf("mirror_listen %q binds all interfaces; only loopback is safe - set mirror_bind_allow_non_loopback: true to override", c.MirrorListen))
 			}
 
 			if ip == nil && host != "localhost" && host != "" {
@@ -738,6 +881,18 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("hrw_k: must be >= 1, got %d", c.HRWK))
 	}
 
+	if c.PrefetchPullerReplicas < 1 {
+		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
+	}
+
+	if c.PrefetchPullerFraction != c.PrefetchPullerFraction || c.PrefetchPullerFraction < 0 || c.PrefetchPullerFraction > 1 {
+		errs = append(errs, fmt.Errorf("prefetch_puller_fraction: must be between 0 and 1, got %g", c.PrefetchPullerFraction))
+	}
+
+	if c.PrefetchCoordinatorReplicas < 1 {
+		errs = append(errs, fmt.Errorf("prefetch_coordinator_replicas: must be >= 1, got %d", c.PrefetchCoordinatorReplicas))
+	}
+
 	switch c.HRWTopologyScope {
 	case "cluster", "zone":
 	default:
@@ -748,8 +903,36 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("coord_max_digests_per_request: must be >= 1, got %d", c.CoordMaxDigestsPerRequest))
 	}
 
+	if c.PrefetchMaxConcurrentGroups < 1 {
+		errs = append(errs, fmt.Errorf("prefetch_max_concurrent_groups: must be >= 1, got %d", c.PrefetchMaxConcurrentGroups))
+	}
+
+	if c.PrefetchDispatchJitter < 0 {
+		errs = append(errs, fmt.Errorf("prefetch_dispatch_jitter: must be >= 0, got %v", c.PrefetchDispatchJitter))
+	}
+
 	if c.CoordMaxConcurrentPulls < 1 {
 		errs = append(errs, fmt.Errorf("coord_max_concurrent_pulls: must be >= 1, got %d", c.CoordMaxConcurrentPulls))
+	}
+
+	if c.PeerFetchTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("peer_fetch_timeout: must be > 0, got %v", c.PeerFetchTimeout))
+	}
+
+	if c.PeerRediscoverBudget < 0 {
+		errs = append(errs, fmt.Errorf("peer_rediscover_budget: must be >= 0, got %v", c.PeerRediscoverBudget))
+	}
+
+	if c.PeerRediscoverBackoff < 0 {
+		errs = append(errs, fmt.Errorf("peer_rediscover_backoff: must be >= 0, got %v", c.PeerRediscoverBackoff))
+	}
+
+	if c.TransferMaxConcurrentServes < 0 {
+		errs = append(errs, fmt.Errorf("transfer_max_concurrent_serves: must be >= 0, got %d", c.TransferMaxConcurrentServes))
+	}
+
+	if c.AdvertiseReconcileInterval <= 0 {
+		errs = append(errs, fmt.Errorf("advertise_reconcile_interval: must be > 0, got %v", c.AdvertiseReconcileInterval))
 	}
 
 	if c.NF5JitterBase <= 0 {

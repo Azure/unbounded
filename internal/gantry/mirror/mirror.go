@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -49,15 +50,24 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
 
 const providerFailureSweepInterval = time.Minute
+
+const authenticationChallengeTimeout = 2 * time.Second
+
+type AuthenticationChallenger interface {
+	AuthenticationChallenge(ctx context.Context, registry string) (challenge string, required bool, err error)
+}
 
 // Server is the mirror HTTP handler.
 type Server struct {
 	cfg     *config.Config
 	store   ifaces.LocalContentStore
 	origin  ifaces.OriginPuller
+	auth    AuthenticationChallenger
 	logger  *slog.Logger
 	metrics metricsHooks
 
@@ -90,8 +100,15 @@ type Server struct {
 	peerLookupBudget time.Duration
 	peerFetchBudget  time.Duration
 	maxPeerAttempts  int
-	selfNodeID       ifaces.NodeID
-	selfPeerID       ifaces.NodeID
+	// peerRediscoverBudget, when > 0, enables the re-discovery loop: the
+	// mirror keeps re-running FindProviders and retrying peer fetches for up
+	// to this total wall-clock budget so it picks up finisher-seeds that
+	// advertise mid-swarm before falling to origin. Zero keeps the historical
+	// single-shot provider attempt.
+	peerRediscoverBudget  time.Duration
+	peerRediscoverBackoff time.Duration
+	selfNodeID            ifaces.NodeID
+	selfPeerID            ifaces.NodeID
 
 	staleProviderTTL         time.Duration
 	unavailablePeerTTL       time.Duration
@@ -184,6 +201,8 @@ type metricsHooks struct {
 	onOriginStreamFailed      func(kind string)
 	onLiveStreamCompleted     func(d digest.Digest)
 	onPeerFetch               func(outcome string)
+	onMirrorBytesServed       func(kind, source string, bytes int64)
+	onMirrorResponseCompleted func(d digest.Digest, kind, source string)
 	onPeerFetchLatency        func(outcome string, d time.Duration)
 	onPeerDialResult          func(success bool)
 	onDhtLookup               func(outcome string, dur time.Duration)
@@ -235,6 +254,15 @@ func WithMetrics(cacheHit, cacheMiss func()) Option {
 	return func(s *Server) {
 		s.metrics.onCacheHit = cacheHit
 		s.metrics.onCacheMiss = cacheMiss
+	}
+}
+
+// WithByteMetrics registers a callback for bytes written to the local
+// containerd caller, split by cache, peer, or origin source path. Peer receive
+// bytes are measured separately at transfer.Client's response-body boundary.
+func WithByteMetrics(mirrorBytesServed func(kind, source string, bytes int64)) Option {
+	return func(s *Server) {
+		s.metrics.onMirrorBytesServed = mirrorBytesServed
 	}
 }
 
@@ -337,6 +365,15 @@ func WithOriginStreamMetrics(started, completed, failed func(kind string)) Optio
 func WithLiveStreamCompletedHook(onCompleted func(d digest.Digest)) Option {
 	return func(s *Server) {
 		s.metrics.onLiveStreamCompleted = onCompleted
+	}
+}
+
+// WithMirrorResponseCompletedHook registers a callback after a complete GET
+// response body has been written successfully to the local containerd client.
+// It is not fired for HEAD requests, partial streams, or failed copies.
+func WithMirrorResponseCompletedHook(onCompleted func(d digest.Digest, kind, source string)) Option {
+	return func(s *Server) {
+		s.metrics.onMirrorResponseCompleted = onCompleted
 	}
 }
 
@@ -475,13 +512,27 @@ func WithDiscovery(d ifaces.DHT, peer ifaces.PeerDialer) Option {
 }
 
 // WithPeerBudgets overrides the default peer-path budgets.
-// lookup ≤ 0 means "use default 2s"; fetch ≤ 0 means "use default 10s";
+// lookup ≤ 0 means "use default 2s"; fetch ≤ 0 means "use default 1h";
 // maxAttempts ≤ 0 means "use default 3".
 func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 	return func(s *Server) {
 		s.peerLookupBudget = lookup
 		s.peerFetchBudget = fetch
 		s.maxPeerAttempts = maxAttempts
+	}
+}
+
+// WithPeerRediscover enables the peer re-discovery loop. budget is the total
+// wall-clock time the mirror keeps re-running DHT FindProviders and retrying
+// peer fetches on a cache miss before falling to origin; it lets a node pick
+// up finisher-seeds that advertise mid-swarm instead of exhausting a fixed
+// provider set. backoff is the pause between rounds (<= 0 uses a built-in 1s
+// default). budget <= 0 disables re-discovery, restoring the single-shot
+// provider attempt.
+func WithPeerRediscover(budget, backoff time.Duration) Option {
+	return func(s *Server) {
+		s.peerRediscoverBudget = budget
+		s.peerRediscoverBackoff = backoff
 	}
 }
 
@@ -587,6 +638,10 @@ func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.Origi
 		unavailablePeerTTL:   30 * time.Second,
 		suspiciousPeerTTL:    5 * time.Minute,
 	}
+	if auth, ok := origin.(AuthenticationChallenger); ok {
+		s.auth = auth
+	}
+
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -668,6 +723,21 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	// Common headers.
 	w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
+	// Keep the requester's request-scoped registry identity attached to this
+	// request as it moves through peer lookup, please_pull, and origin. Basic
+	// and Bearer auth are accepted for delegation. An unsupported or malformed
+	// credential falls through to containerd's next host rather than silently
+	// switching to this agent's configured fallback identity.
+	rawAuthorization := strings.TrimSpace(r.Header.Get("Authorization"))
+
+	authorization := registryauth.Normalize(rawAuthorization)
+	if rawAuthorization != "" && authorization == "" {
+		http.Error(w, "unsupported registry authorization", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
 
 	path := r.URL.Path
 	if path == "/v2/" || path == "/v2" {
@@ -717,6 +787,30 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "invalid digest", http.StatusBadRequest)
 		return
+	}
+
+	if authorization == "" && s.auth != nil {
+		challengeCtx, cancel := context.WithTimeout(r.Context(), authenticationChallengeTimeout)
+		challenge, required, challengeErr := s.auth.AuthenticationChallenge(challengeCtx, upstream)
+
+		cancel()
+
+		if challengeErr != nil {
+			s.logger.Warn("mirror: registry authentication challenge unavailable",
+				slog.String("registry", upstream),
+				slog.Any("err", challengeErr),
+			)
+			http.Error(w, "registry authentication unavailable", http.StatusServiceUnavailable)
+
+			return
+		}
+
+		if required {
+			w.Header().Set("WWW-Authenticate", challenge)
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+
+			return
+		}
 	}
 
 	s.serveDigest(w, r, upstream, repo, d, kind)
@@ -779,11 +873,20 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	// replaces this leg for the cold-start case.
 	if s.dht != nil && s.peer != nil {
 		switch s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
+		case peerFallbackLocalHit:
+			return
 		case peerFallbackServed:
-			if !s.liveStreamThrough {
-				s.firePrefetch(kind, upstream, repo, d)
-			}
+			// Live stream-through proxies the body straight to containerd, so a
+			// served manifest reaches the shared content store on containerd's
+			// commit rather than ours. The prefetcher waits for it there, so this
+			// must fire in both modes or cold-start seeding never runs.
+			s.firePrefetch(ctx, kind, upstream, repo, d)
 
+			return
+		case peerFallbackPartial:
+			// Response headers and a verified prefix were already written. Let
+			// the truncated response close so containerd can retry; writing a
+			// 503 body here would corrupt the content stream.
 			return
 		case peerFallbackExhausted:
 			http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
@@ -854,10 +957,15 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 			return true
 		}
 
-		s.firePrefetch(kind, upstream, repo, d)
+		s.firePrefetch(ctx, kind, upstream, repo, d)
 
-		if _, err := io.Copy(w, br); err != nil {
+		written, err := io.Copy(w, br)
+		s.fireMirrorBytesServed(kind, "cache", written)
+
+		if err != nil {
 			logger.Debug("mirror: copy from cache failed", slog.Any("err", err))
+		} else {
+			s.fireMirrorResponseCompleted(d, kind, "cache")
 		}
 
 		return true
@@ -866,6 +974,11 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 	var enf *ifaces.ErrNotFound
 	if errors.As(err, &enf) {
 		return false
+	}
+
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		logger.Debug("mirror: cache open canceled", slog.Any("err", err))
+		return true
 	}
 
 	var eun *ifaces.ErrUnavailable
@@ -966,7 +1079,11 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// could fire again on the next request through this node at
 		// the bottom of the next jitter window, retry-amplifying
 		// against an origin that just returned 4xx/5xx.
-		s.recordNegCacheFailure(d, perr)
+		// Requester-specific origin failures cannot be shared safely in a
+		// cache keyed only by digest. A later request may carry another token.
+		if registryauth.Authorization(ctx) == "" {
+			s.recordNegCacheFailure(d, perr)
+		}
 
 		if s.liveStreamThrough {
 			s.fireOriginStreamFailed(kind)
@@ -981,6 +1098,8 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 
 	if s.liveStreamThrough {
 		written, streamErr := streamDigestToClient(w, pr, d, psize, kind)
+		s.fireMirrorBytesServed(kind, "origin", written)
+
 		if streamErr != nil {
 			logger.Debug("mirror: live origin stream failed",
 				slog.Int64("written", written),
@@ -993,6 +1112,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		}
 
 		s.fireOriginStreamCompleted(kind)
+		s.fireMirrorResponseCompleted(d, kind, "origin")
 		s.fireLiveStreamCompleted(d)
 		s.recordNegCacheSuccess(d)
 
@@ -1047,6 +1167,8 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	writeBlobHeadersWithPrefix(w, d, psize, kind, sniff)
 
 	written, err := io.Copy(dest, prBuf)
+	s.fireMirrorBytesServed(kind, "origin", written)
+
 	if err != nil {
 		// Bytes already sent; we can't undo. Cache will be aborted by defer.
 		// This is a terminal downstream failure: origin returned 2xx
@@ -1136,7 +1258,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		// the deduplication promise of the step 7 specifically for
 		// the cold-start-exhausted path that just escalated to origin.
 		s.reAdvertiseDigest(d, "mirror_origin_announce", logger)
-		s.firePrefetch(kind, upstream, repo, d)
+		s.firePrefetch(ctx, kind, upstream, repo, d)
 		// Bytes streamed AND committed: this is the canonical
 		// mirror-direct origin-pull success. Fire AFTER commit
 		// (not after Copy) so a commit failure correctly leaves
@@ -1151,7 +1273,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	}
 }
 
-// peerFallbackResult is the tri-state outcome of tryPeerFallback.
+// peerFallbackResult is the outcome of tryPeerFallback.
 type peerFallbackResult int
 
 const (
@@ -1159,11 +1281,18 @@ const (
 	// fired (caller-gated), or it errored, or it returned no providers.
 	// The caller may fall through to origin (behavior).
 	peerFallbackUnused peerFallbackResult = iota
+	// peerFallbackLocalHit means cold-start populated the local cache after
+	// serveDigest's initial miss and the response has already been written.
+	peerFallbackLocalHit
 	// peerFallbackServed means a peer's bytes were fully delivered to the
 	// client. In default mode they were verified+committed to cache first;
 	// in live-stream-through mode they were proxied directly and the final
 	// digest check passed after proxying. Caller must not write further bytes.
 	peerFallbackServed
+	// peerFallbackPartial means live stream-through delivered a prefix but
+	// exhausted its re-discovery budget before completing the digest. The
+	// caller must close the response without writing an HTTP error body.
+	peerFallbackPartial
 	// peerFallbackExhausted means the DHT returned providers but all
 	// maxAttempts of them failed (stall or error), OR the cold-start
 	// cascade short-circuited with an error other than
@@ -1192,11 +1321,70 @@ const (
 	peerFetchOutcomeProtocolError
 	peerFetchOutcomeStall
 	peerFetchOutcomeLocalError
+	// peerFetchOutcomeBusy is a peer that answered 429: it is alive and
+	// healthy but at its serve cap. It is deliberately NOT a hard failure and
+	// the provider is NOT quarantined; the re-discovery loop retries it (or a
+	// finisher) on the next round.
+	peerFetchOutcomeBusy
 )
 
 type peerAttemptResult struct {
 	outcome peerFetchOutcomeKind
 	served  bool
+}
+
+type livePeerStream struct {
+	verifier  *digestpipe.Writer
+	totalSize int64
+	started   bool
+}
+
+func (s *livePeerStream) offset() int64 {
+	if s == nil || s.verifier == nil {
+		return 0
+	}
+
+	return s.verifier.Written()
+}
+
+func (s *livePeerStream) append(w http.ResponseWriter, src io.Reader, d digest.Digest, size int64, kind ifaces.OriginRefKind) (int64, bool, error) {
+	reader := src
+
+	if !s.started {
+		br := bufio.NewReader(src)
+
+		var sniff []byte
+
+		if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
+			if peek, _ := br.Peek(512); len(peek) > 0 { //nolint:errcheck // best-effort media sniff
+				sniff = peek
+			}
+		}
+
+		writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
+		s.verifier = digestpipe.New(w)
+		s.totalSize = size
+		s.started = true
+		reader = br
+	} else if size != s.totalSize {
+		return 0, false, fmt.Errorf("peer resume size changed from %d to %d", s.totalSize, size)
+	}
+
+	written, err := streamcopy.CopyN(s.verifier, reader, s.totalSize-s.offset())
+	switch offset := s.offset(); {
+	case offset > s.totalSize:
+		return written, false, fmt.Errorf("peer stream exceeded content size: wrote %d, want %d", offset, s.totalSize)
+	case offset < s.totalSize && err != nil:
+		return written, false, err
+	case offset < s.totalSize:
+		return written, false, io.ErrUnexpectedEOF
+	}
+
+	if err := s.verifier.Verify(d); err != nil {
+		return written, false, err
+	}
+
+	return written, true, nil
 }
 
 type providerDigestKey struct {
@@ -1215,6 +1403,7 @@ type peerAttemptSummary struct {
 	protocolError       int
 	stall               int
 	localError          int
+	busy                int
 	staleFiltered       int
 	unavailableFiltered int
 	suspiciousFiltered  int
@@ -1232,16 +1421,124 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 		s.peerServerError == 0 &&
 		s.protocolError == 0 &&
 		s.stall == 0 &&
-		s.localError == 0
+		s.localError == 0 &&
+		s.busy == 0
 }
 
-// tryPeerFallback attempts to satisfy a cache miss via a DHT-discovered
-// peer. Returns one of peerFallbackResult above. In default mode, no
-// bytes are written to w until a peer's body is digest-verified and
-// committed to the local cache. In live-stream-through mode, a
-// successful peer fetch streams directly to the caller and later
-// inventory observation is used to confirm the local containerd commit.
+// tryPeerFallback attempts to satisfy a cache miss via DHT-discovered peers.
+// When re-discovery is enabled (peerRediscoverBudget > 0) it repeatedly
+// re-runs a discovery round so it can pick up finisher-seeds that advertise
+// mid-swarm, turning a "fall to origin" cohort into a real peer cascade.
+//
+// Round 0 runs the full path including cold-start (please_pull), which
+// designates the HRW puller; its terminal result is the authoritative
+// origin-fallback decision returned if the swarm never delivers. Later rounds
+// suppress cold-start (so please_pull is not re-issued every iteration) and
+// exist only to catch a newly-advertised finisher. The result semantics
+// (peerFallbackUnused -> direct origin, peerFallbackExhausted -> 503,
+// peerFallbackColdExhausted -> NF5 gating) are preserved exactly.
 func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) peerFallbackResult {
+	var stream *livePeerStream
+	if s.liveStreamThrough {
+		stream = &livePeerStream{}
+	}
+
+	budget := s.peerRediscoverBudget
+	if budget <= 0 {
+		// Re-discovery disabled: a single round with cold-start allowed,
+		// identical to the historical behavior.
+		result := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, stream, logger)
+		if stream != nil && stream.started && result != peerFallbackServed {
+			return peerFallbackPartial
+		}
+
+		return result
+	}
+
+	backoff := s.peerRediscoverBackoff
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+
+	deadline := time.Now().Add(budget)
+
+	firstResult := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, stream, logger)
+	switch firstResult {
+	case peerFallbackServed, peerFallbackLocalHit:
+		return firstResult
+	}
+
+	// Keep re-discovering. A seed that just finished advertises into the DHT,
+	// so a later FindProviders can hand us a provider even though round 0 fell
+	// through. We only look for a served/local-hit outcome here; if the swarm
+	// never delivers within the budget we return round 0's authoritative
+	// origin-fallback decision unchanged.
+	for time.Now().Before(deadline) {
+		// A concurrent request or the local puller may have populated the
+		// cache since the last round.
+		if (stream == nil || !stream.started) && s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger) {
+			return peerFallbackLocalHit
+		}
+
+		select {
+		case <-ctx.Done():
+			if stream != nil && stream.started {
+				return peerFallbackPartial
+			}
+
+			return firstResult
+		case <-time.After(jitteredBackoff(backoff)):
+		}
+
+		switch s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, false, stream, logger) {
+		case peerFallbackServed:
+			return peerFallbackServed
+		case peerFallbackLocalHit:
+			return peerFallbackLocalHit
+		}
+	}
+
+	if stream != nil && stream.started {
+		return peerFallbackPartial
+	}
+
+	return firstResult
+}
+
+// jitteredBackoff returns base +/- 25% so a cohort of nodes that missed
+// together does not re-discover in lockstep.
+func jitteredBackoff(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+
+	delta := base / 4
+	if delta <= 0 {
+		return base
+	}
+
+	return base - delta + time.Duration(rand.Int64N(int64(2*delta)+1))
+}
+
+// tryPeerFallbackRound runs one discovery-and-fetch pass. Returns one of
+// peerFallbackResult above. In default mode, no bytes are written to w until a
+// peer's body is digest-verified and committed to the local cache. In
+// live-stream-through mode, a successful peer fetch streams directly to the
+// caller and later inventory observation is used to confirm the local
+// containerd commit. When allowColdStart is false, the cold-start
+// (please_pull) legs are skipped so the re-discovery loop does not re-issue
+// please_pull on every round.
+func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, allowColdStart bool, stream *livePeerStream, logger *slog.Logger) peerFallbackResult {
+	// Cold-start may designate this process as the puller, populating the
+	// local store after serveDigest's initial cache miss.
+	recheckLocalAfterColdStart := func() bool {
+		if stream != nil && stream.started {
+			return false
+		}
+
+		return s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger)
+	}
+
 	lookupBudget := s.peerLookupBudget
 	if lookupBudget <= 0 {
 		lookupBudget = 2 * time.Second
@@ -1249,7 +1546,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 	fetchBudget := s.peerFetchBudget
 	if fetchBudget <= 0 {
-		fetchBudget = 10 * time.Second
+		fetchBudget = time.Hour
 	}
 
 	maxAttempts := s.maxPeerAttempts
@@ -1281,7 +1578,22 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	}
 
 	if err != nil || len(providers) == 0 {
+		if !allowColdStart {
+			// Re-discovery round: cold-start is suppressed. No providers
+			// this round; a finisher may advertise before the next round.
+			if recheckLocalAfterColdStart() {
+				return peerFallbackLocalHit
+			}
+
+			return peerFallbackUnused
+		}
+
 		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, err != nil, false, peerAttemptSummary{}, logger)
+
+		if recheckLocalAfterColdStart() {
+			return peerFallbackLocalHit
+		}
+
 		if res != peerFallbackUnused {
 			return res
 		}
@@ -1319,7 +1631,21 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 			slog.Int("self_filtered", summary.selfFiltered),
 		)
 
+		if !allowColdStart {
+			// Re-discovery round: cold-start is suppressed.
+			if recheckLocalAfterColdStart() {
+				return peerFallbackLocalHit
+			}
+
+			return peerFallbackUnused
+		}
+
 		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, true, summary, logger)
+
+		if recheckLocalAfterColdStart() {
+			return peerFallbackLocalHit
+		}
+
 		if res != peerFallbackUnused {
 			return res
 		}
@@ -1340,7 +1666,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 		tried++
 		summary.attempted++
-		res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger)
+		res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, stream, logger)
 
 		summary = updatePeerSummary(summary, res.outcome)
 		if res.served {
@@ -1348,7 +1674,11 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		}
 	}
 
-	if tried > 0 {
+	if stream != nil && stream.started {
+		return peerFallbackExhausted
+	}
+
+	if tried > 0 && allowColdStart {
 		allStale := summary.allStaleOrFiltered()
 		logger.Debug("mirror: peer providers exhausted, consulting cold-start",
 			slog.Int("attempted", summary.attempted),
@@ -1364,6 +1694,11 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		)
 
 		csProviders, csResult := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, allStale, summary, logger)
+
+		if recheckLocalAfterColdStart() {
+			return peerFallbackLocalHit
+		}
+
 		if csResult != peerFallbackUnused {
 			return csResult
 		}
@@ -1377,7 +1712,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 			tried++
 			summary.attempted++
-			res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, logger)
+			res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, stream, logger)
 
 			summary = updatePeerSummary(summary, res.outcome)
 			if res.served {
@@ -1394,20 +1729,32 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 // from cache. In live-stream-through mode it proxies directly to the
 // caller and performs the final digest check after the streamed body ends;
 // containerd is still responsible for rejecting any bad bytes it received.
-func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, p ifaces.Provider, fetchBudget time.Duration, logger *slog.Logger) peerAttemptResult {
+func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, p ifaces.Provider, fetchBudget time.Duration, stream *livePeerStream, logger *slog.Logger) peerAttemptResult {
 	pCtx, cancel := context.WithTimeout(ctx, fetchBudget)
 	defer cancel()
 
 	fetchStart := time.Now()
+
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+	if stream != nil {
+		pRef.Offset = stream.offset()
+	}
 
 	rc, psize, err := s.peer.FetchFromPeer(pCtx, p.Addr, pRef)
 	if err != nil {
 		outcome, label := classifyPeerFetchError(err)
-		if outcome == peerFetchOutcomeStaleProvider {
+
+		switch outcome {
+		case peerFetchOutcomeBusy:
+			// The peer answered 429: it is alive (dial succeeded) but at
+			// its serve cap. Do not quarantine it - it will serve once its
+			// load drops, and the re-discovery loop retries it or a
+			// finisher on the next round.
+			s.bumpPeerDial(true)
+		case peerFetchOutcomeStaleProvider:
 			s.bumpPeerDial(true)
 			s.markProviderStale(d, p)
-		} else {
+		default:
 			s.bumpPeerDial(false)
 
 			if outcome == peerFetchOutcomeUnavailable {
@@ -1436,7 +1783,9 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	s.bumpPeerDial(true)
 
 	if s.liveStreamThrough {
-		written, streamErr := streamDigestToClient(w, rc, d, psize, kind)
+		written, complete, streamErr := stream.append(w, rc, d, psize, kind)
+		s.fireMirrorBytesServed(kind, "peer", written)
+
 		if streamErr != nil {
 			if isDigestMismatchErr(streamErr) {
 				s.markProviderSuspicious(d, p)
@@ -1455,15 +1804,21 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 			s.bumpPeerFetchLatency("stall", fetchStart)
 			logger.Debug("mirror: peer live stream-through failed",
 				slog.String("peer", p.Addr),
+				slog.Int64("resume_offset", stream.offset()),
 				slog.Int64("written", written),
 				slog.Any("err", streamErr),
 			)
 
-			return peerAttemptResult{outcome: peerFetchOutcomeStall, served: true}
+			return peerAttemptResult{outcome: peerFetchOutcomeStall, served: ctx.Err() != nil}
+		}
+
+		if !complete {
+			return peerAttemptResult{outcome: peerFetchOutcomeStall}
 		}
 
 		s.bumpPeerFetch("hit")
 		s.bumpPeerFetchLatency("hit", fetchStart)
+		s.fireMirrorResponseCompleted(d, kind, "peer")
 		s.fireLiveStreamCompleted(d)
 
 		return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
@@ -1480,7 +1835,8 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 	defer func() { _ = cw.Abort(pCtx) }() //nolint:errcheck // best-effort abort
 
-	if _, err := io.Copy(cw, rc); err != nil {
+	_, err = io.Copy(cw, rc)
+	if err != nil {
 		s.bumpPeerFetch("stall")
 		s.bumpPeerFetchLatency("stall", fetchStart)
 		logger.Debug("mirror: peer copy stalled",
@@ -1557,7 +1913,10 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
 	}
 
-	if _, err := io.Copy(w, rcLocalBuf); err != nil {
+	written, err := io.Copy(w, rcLocalBuf)
+	s.fireMirrorBytesServed(kind, "peer", written)
+
+	if err != nil {
 		logger.Debug("mirror: copy from cache (post-peer) failed", slog.Any("err", err))
 	}
 
@@ -1621,6 +1980,17 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 		filtered = append(filtered, p)
 	}
 
+	// Shuffle so each requester tries the surviving providers in a random
+	// order. Without this, every node walks the DHT/cold-start provider list
+	// in the same order and piles onto whichever seed sorts first, re-creating
+	// a single-seed hotspot even when the layer is seeded on N pullers
+	// (prefetch_puller_replicas) and finishers have joined the provider set.
+	// Randomizing spreads the maxPeerAttempts fetches across the available
+	// seeds, which is what turns the N initial seeds into an even fan-out.
+	rand.Shuffle(len(filtered), func(i, j int) {
+		filtered[i], filtered[j] = filtered[j], filtered[i]
+	})
+
 	return filtered, summary
 }
 
@@ -1647,6 +2017,8 @@ func updatePeerSummary(summary peerAttemptSummary, outcome peerFetchOutcomeKind)
 		summary.stall++
 	case peerFetchOutcomeLocalError:
 		summary.localError++
+	case peerFetchOutcomeBusy:
+		summary.busy++
 	}
 
 	return summary
@@ -1661,6 +2033,8 @@ func classifyPeerFetchError(err error) (peerFetchOutcomeKind, string) {
 	var statusErr *ifaces.ErrPeerHTTPStatus
 	if errors.As(err, &statusErr) {
 		switch {
+		case statusErr.StatusCode == http.StatusTooManyRequests:
+			return peerFetchOutcomeBusy, "busy"
 		case statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusForbidden:
 			return peerFetchOutcomeAuthOrConfigError, "auth_or_config"
 		case statusErr.StatusCode >= 500 && statusErr.StatusCode <= 599:
@@ -1825,12 +2199,14 @@ func (s *Server) isUnavailablePeerInWindow(addr string, now time.Time) bool {
 // callback; the prefetcher's job is to read the manifest body from
 // cache and dispatch batched please_pull RPCs entirely in the
 // background.
-func (s *Server) firePrefetch(kind ifaces.OriginRefKind, registry, repository string, d digest.Digest) {
+func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, registry, repository string, d digest.Digest) {
 	if s.prefetcher == nil || kind != ifaces.KindManifest {
 		return
 	}
 
-	go s.prefetcher.OnManifestServed(context.Background(), registry, repository, d)
+	// The callback outlives the HTTP request, so detach cancellation while
+	// retaining only the delegated registry credential.
+	go s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
 }
 
 // reAdvertiseDigest does a fire-and-forget dht.Provide(d) in a
@@ -1909,6 +2285,22 @@ func (s *Server) bumpCacheMiss() {
 	if s.metrics.onCacheMiss != nil {
 		s.metrics.onCacheMiss()
 	}
+}
+
+func (s *Server) fireMirrorBytesServed(kind ifaces.OriginRefKind, source string, bytes int64) {
+	if bytes <= 0 || s.metrics.onMirrorBytesServed == nil {
+		return
+	}
+
+	s.metrics.onMirrorBytesServed(kind.MetricLabel(), source, bytes)
+}
+
+func (s *Server) fireMirrorResponseCompleted(d digest.Digest, kind ifaces.OriginRefKind, source string) {
+	if s.metrics.onMirrorResponseCompleted == nil {
+		return
+	}
+
+	s.metrics.onMirrorResponseCompleted(d, kind.MetricLabel(), source)
 }
 
 func (s *Server) fireOriginStreamStarted(kind ifaces.OriginRefKind) {
@@ -2193,6 +2585,10 @@ func writeOriginError(w http.ResponseWriter, err error, logger *slog.Logger) {
 
 	switch oe.Class {
 	case ifaces.FailureAuth:
+		if oe.Challenge != "" {
+			w.Header().Set("WWW-Authenticate", oe.Challenge)
+		}
+
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	case ifaces.FailureNotFound:
 		http.Error(w, "not found", http.StatusNotFound)

@@ -20,8 +20,8 @@ use std::sync::Arc;
 use crate::bufferpool;
 use crate::bufferpool::{Error, PageRef, StripeKey};
 use crate::storage::blockdev::BlockDevice;
+use crate::storage::checksum::checksum;
 use crate::storage::engine::StorageEngine;
-use crate::storage::traits::{PageChecksum, Xxh3Checksum};
 
 /// Fans the [`bufferpool::BlockStore`] surface across `N` per-disk
 /// engines on a single node. Construction takes ownership of the
@@ -137,7 +137,7 @@ pub fn disk_for(key: &StripeKey, stripe_off: u64, num_disks: usize) -> usize {
     let mut buf = [0u8; 40];
     buf[..32].copy_from_slice(&key.0);
     buf[32..].copy_from_slice(&stripe_off.to_le_bytes());
-    let h = Xxh3Checksum::checksum_of(&buf).0;
+    let h = checksum(&buf).0;
     (h % num_disks as u64) as usize
 }
 

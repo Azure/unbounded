@@ -6,6 +6,7 @@ package v1alpha3
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func init() {
@@ -112,6 +113,19 @@ const (
 	// MachineOperationConditionCloudInitDone indicates that a metalman PXE
 	// target has completed first-boot cloud-init after writing the boot image.
 	MachineOperationConditionCloudInitDone = "CloudInitDone"
+
+	// MachineOperationConditionProviderOperationStalled reports that an
+	// accepted external provider operation has exceeded its expected duration.
+	MachineOperationConditionProviderOperationStalled = "ProviderOperationStalled"
+)
+
+// Condition types for MachineOperation targets.
+const (
+	// MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported
+	// indicates that metalman determined the target BMC does not support
+	// disabling the Redfish boot override. When True, metalman falls back to
+	// setting Hdd/Continuous for this target within this operation only.
+	MachineOperationTargetConditionRedfishDisableBootOverrideUnsupported = "RedfishDisableBootOverrideUnsupported"
 )
 
 // OperationStage represents the current stage of a target operation.
@@ -126,7 +140,65 @@ const (
 	OperationStageWaitingRepave    OperationStage = "WaitingRepave"
 	OperationStageWaitingCloudInit OperationStage = "WaitingCloudInit"
 	OperationStageWaitingNode      OperationStage = "WaitingNode"
+	OperationStageWaitingProvider  OperationStage = "WaitingProviderOperation"
 )
+
+// ProviderOperationStatus identifies a resumable operation owned by an
+// external provider.
+type ProviderOperationStatus struct {
+	// Provider is the external provider that accepted the operation.
+	// +kubebuilder:validation:Required
+	Provider string `json:"provider"`
+
+	// OperationID is the provider-assigned operation identifier.
+	// +kubebuilder:validation:Required
+	OperationID string `json:"operationID"`
+
+	// ResumeToken is opaque provider data needed to resume polling. Providers
+	// must not store credentials or other secrets in this field.
+	// +optional
+	ResumeToken string `json:"resumeToken,omitempty"`
+}
+
+// MachineOperationTargetInput is the immutable, controller-resolved input for
+// one MachineOperation target. It is persisted before provider execution so
+// retries do not silently adopt later desired-state changes.
+type MachineOperationTargetInput struct {
+	// ProviderRef identifies the exact provider-owned resource referenced by
+	// host.external.machineRef when the operation target was initialized.
+	// +optional
+	ProviderRef *ProviderMachineSnapshot `json:"providerRef,omitempty"`
+
+	// HostImage is the resolved provider-interpreted host image for HostReplace.
+	// An empty value instructs the provider to preserve the current image.
+	// +optional
+	HostImage string `json:"hostImage,omitempty"`
+}
+
+// ProviderMachineSnapshot identifies the exact provider-owned resource
+// observed when a MachineOperation target was initialized.
+type ProviderMachineSnapshot struct {
+	// APIGroup is the API group of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	APIGroup string `json:"apiGroup"`
+
+	// Kind is the kind of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	Kind string `json:"kind"`
+
+	// Name is the name of the provider-owned Machine resource.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// UID detects deletion and recreation of the provider-owned resource.
+	// +kubebuilder:validation:Required
+	UID types.UID `json:"uid"`
+
+	// Generation records the provider-owned resource generation whose inputs
+	// were observed.
+	// +kubebuilder:validation:Minimum=1
+	Generation int64 `json:"generation"`
+}
 
 // MachineOperationSpec defines the desired state of a MachineOperation.
 type MachineOperationSpec struct {
@@ -234,11 +306,9 @@ type MachineOperationTargetStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// TargetOperations records the Machine operation counters this operation
-	// requested. It is used by counter-backed HostReplace operations to remain
-	// idempotent across controller restarts.
+	// Input is the immutable provider input resolved before execution begins.
 	// +optional
-	TargetOperations *OperationsStatus `json:"targetOperations,omitempty"`
+	Input *MachineOperationTargetInput `json:"input,omitempty"`
 
 	// Attempts is the number of external action attempts made for this target.
 	// Polling expected state changes does not increment this field.
@@ -248,6 +318,19 @@ type MachineOperationTargetStatus struct {
 	// LastAttemptAt records when the latest external action attempt occurred.
 	// +optional
 	LastAttemptAt *metav1.Time `json:"lastAttemptAt,omitempty"`
+
+	// ProviderOperation identifies the resumable external operation for this
+	// target, when the provider returned one.
+	// +optional
+	ProviderOperation *ProviderOperationStatus `json:"providerOperation,omitempty"`
+
+	// Conditions represent target-scoped observations for this operation. These
+	// conditions are not persisted on the Machine, so BMC capability fallbacks
+	// apply only to this MachineOperation target.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // IsTerminal returns true if the operation phase is Complete or Failed.

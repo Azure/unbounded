@@ -112,6 +112,10 @@ const (
 	SandboxImage             = "mcr.microsoft.com/oss/v2/kubernetes/pause:3.9"
 	KubeProxyImageRepository = "mcr.microsoft.com/oss/v2/kubernetes/kube-proxy"
 
+	// OfflineArtifactArchiveHostDir stores HTTPS offline artifact archives
+	// after download and extraction.
+	OfflineArtifactArchiveHostDir = "/var/lib/unbounded/offline-artifacts"
+
 	// ContainerImageArchiveDir is the path inside the nspawn machine where
 	// staged container image archives are mounted.
 	ContainerImageArchiveDir = "/var/lib/unbounded/container-images"
@@ -134,6 +138,14 @@ const (
 	// host NVIDIA library directories are bind-mounted read-only. Each unique
 	// host directory gets a numbered subdirectory (e.g. /run/host-nvidia/0/).
 	NvidiaHostLibDir = "/run/host-nvidia"
+	// NvidiaHostI386LibDir is the base directory for optional i386 NVIDIA
+	// library bind mounts.
+	NvidiaHostI386LibDir = "/run/host-nvidia-i386"
+	// NvidiaHostBinDir exposes the host directory containing NVIDIA helper binaries.
+	NvidiaHostBinDir = "/run/host-nvidia-bin"
+	// NvidiaDriverDir is the driver-root layout used by NVIDIA tooling and
+	// device plugins inside the nspawn machine.
+	NvidiaDriverDir = "/run/nvidia/driver"
 
 	NvidiaContainerRuntimePath = "/usr/bin/nvidia-container-runtime"
 	NvidiaRuntimeClassName     = "nvidia"
@@ -156,15 +168,20 @@ const (
 	DefaultAzureLinux3OCIImage       = "ghcr.io/azure/agent-azlinux3:v20260619"
 	DefaultAzureLinux3NvidiaOCIImage = "ghcr.io/azure/agent-azlinux3-nvidia:v20260626"
 
-	SystemdUnitContainerd   = "containerd.service"
-	ContainerdConfigPath    = "/etc/containerd/config.toml"
-	ContainerdConfDropInDir = "/etc/containerd/conf.d"
+	SystemdUnitContainerd      = "containerd.service"
+	ContainerdConfigPath       = "/etc/containerd/config.toml"
+	ContainerdConfDropInDir    = "/etc/containerd/conf.d"
+	ContainerdCertsDir         = "/etc/containerd/certs.d"
+	ContainerdDefaultHostsDir  = ContainerdCertsDir + "/_default"
+	ContainerdDefaultHostsPath = ContainerdDefaultHostsDir + "/hosts.toml"
 
 	SystemdUnitKubelet             = "kubelet.service"
+	KubeletConfigurationPath       = "/var/lib/kubelet/config.yaml"
 	KubeletKubeconfigPath          = "/var/lib/kubelet/kubeconfig"
 	KubeletBootstrapKubeconfigPath = "/var/lib/kubelet/bootstrap-kubeconfig"
 	KubeletPKIDir                  = "/etc/kubernetes/pki"
 	KubeletAPIServerCACertPath     = "/etc/kubernetes/pki/apiserver-client-ca.crt"
 	KubeletServiceDropInDir        = "/etc/systemd/system/kubelet.service.d"
 	KubeletStaticPodManifestsDir   = "/etc/kubernetes/manifests"
+	LocalDNSResolvConfPath         = "/etc/unbounded/localdns/resolv.conf"
 )

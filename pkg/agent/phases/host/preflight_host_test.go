@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"os"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -72,6 +73,65 @@ func TestCheckHostOSConfiguration(t *testing.T) {
 	assert.Contains(t, results[1].Message, "systemd")
 }
 
+func TestCheckExistingDeploymentCleanHost(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.stat = statNotExist()
+	deps.outputCmd = outputWith("", errors.New("not found"))
+
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+
+	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+}
+
+func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.stat = statNotExist()
+	deps.outputCmd = func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
+		if name == "machinectl" && len(args) == 2 && args[0] == "show" && args[1] == "kube2" {
+			return "Name=kube2", nil
+		}
+
+		return "", errors.New("not found")
+	}
+
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+
+	assert.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Equal(t, "kube2", results[0].Target)
+	assert.Contains(t, results[0].Message, "registered nspawn machine kube2")
+	assert.Contains(t, results[0].Message, "node reset is needed")
+	assert.NotContains(t, results[0].Message, "unbounded-agent reset")
+}
+
+func TestCheckExistingDeploymentDetectsPartialArtifact(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.stat = statOnlyExists("/var/lib/machines/kube1")
+	deps.outputCmd = outputWith("", errors.New("not found"))
+
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+
+	assert.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Equal(t, "/var/lib/machines/kube1", results[0].Target)
+	assert.Contains(t, results[0].Message, "nspawn machine rootfs")
+	assert.Contains(t, results[0].Message, "node reset is needed")
+	assert.NotContains(t, results[0].Message, "unbounded-agent reset")
+}
+
+func TestEnsureNoExistingDeploymentReturnsResetInstruction(t *testing.T) {
+	deps := defaultHostCheckDeps()
+	deps.stat = statOnlyExists("/etc/systemd/system/unbounded-agent-daemon.service")
+	deps.outputCmd = outputWith("", errors.New("not found"))
+
+	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "node reset is needed")
+	assert.NotContains(t, err.Error(), "unbounded-agent reset")
+	assert.Contains(t, err.Error(), "/etc/systemd/system/unbounded-agent-daemon.service")
+}
+
 func TestCheckNSpawnRuntime(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.lookupPath = lookupPathWith(map[string]bool{
@@ -97,15 +157,44 @@ func TestCheckNSpawnRuntime(t *testing.T) {
 }
 
 func TestCheckDockerActive(t *testing.T) {
-	deps := defaultHostCheckDeps()
-	deps.outputCmd = outputWith("active\n", nil)
+	testCheckSystemdUnitActive(t, checkDockerActive, dockerServiceUnit)
+}
 
-	results := checkDockerActive(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+func TestCheckContainerdActive(t *testing.T) {
+	testCheckSystemdUnitActive(t, checkContainerdActive, containerdServiceUnit)
+}
+
+func TestCheckKubeletActive(t *testing.T) {
+	testCheckSystemdUnitActive(t, checkKubeletActive, kubeletServiceUnit)
+}
+
+func testCheckSystemdUnitActive(
+	t *testing.T,
+	check func(*slog.Logger, hostCheckDeps) preflight.Checker,
+	wantUnit string,
+) {
+	t.Helper()
+
+	deps := defaultHostCheckDeps()
+	deps.outputCmd = func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
+		assert.Equal(t, "systemctl", name)
+		assert.Equal(t, []string{"is-active", wantUnit}, args)
+
+		return "active\n", nil
+	}
+
+	results := check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Equal(t, wantUnit, results[0].Target)
 
 	deps.outputCmd = outputWith("inactive\n", nil)
-	results = checkDockerActive(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+
+	deps.outputCmd = outputWith("", errors.New("systemd unavailable"))
+	results = check(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	assert.Equal(t, preflight.SeverityWarning, results[0].Severity)
+	assert.Contains(t, results[0].Message, "could not be determined")
 }
 
 func TestCheckSwapActive(t *testing.T) {
@@ -167,6 +256,20 @@ func statExists() func(string) (fs.FileInfo, error) {
 
 func statMissing() func(string) (fs.FileInfo, error) {
 	return func(string) (fs.FileInfo, error) { return nil, errors.New("missing") }
+}
+
+func statNotExist() func(string) (fs.FileInfo, error) {
+	return func(string) (fs.FileInfo, error) { return nil, os.ErrNotExist }
+}
+
+func statOnlyExists(path string) func(string) (fs.FileInfo, error) {
+	return func(candidate string) (fs.FileInfo, error) {
+		if candidate == path {
+			return nil, nil
+		}
+
+		return nil, os.ErrNotExist
+	}
 }
 
 func packageManagerWithInstalled(installed bool) func(func(string) (string, error)) (*hostPackageManager, error) {

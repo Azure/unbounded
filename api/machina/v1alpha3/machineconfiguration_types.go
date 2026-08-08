@@ -88,6 +88,10 @@ type MachineConfigurationSpec struct {
 // MachineConfigurationTemplate holds the versioned configuration
 // fields. These fields are copied into each MachineConfigurationVersion.
 type MachineConfigurationTemplate struct {
+	// Host contains provider-neutral desired host settings.
+	// +optional
+	Host *MachineConfigurationHostSpec `json:"host,omitempty"`
+
 	// Kubernetes contains Kubernetes-specific configuration such as
 	// the target version, node labels, and taints.
 	// +optional
@@ -97,6 +101,14 @@ type MachineConfigurationTemplate struct {
 	// OCI image reference for the nspawn machine).
 	// +optional
 	Agent *MachineConfigurationAgent `json:"agent,omitempty"`
+}
+
+// MachineConfigurationHostSpec contains versioned, provider-neutral host
+// settings. Per-machine host ownership belongs on Machine.spec.host.
+type MachineConfigurationHostSpec struct {
+	// Image is an opaque provider-interpreted image identifier.
+	// +optional
+	Image string `json:"image,omitempty"`
 }
 
 // MachineConfigurationKubernetes holds the Kubernetes-specific fields
@@ -123,6 +135,10 @@ type MachineConfigurationAgent struct {
 	// nspawn machine (e.g. "ghcr.io/org/repo:tag").
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
+
+	// LocalDNS configures the optional CoreDNS cache for this version.
+	// +optional
+	LocalDNS *LocalDNSSpec `json:"localDNS,omitempty"`
 }
 
 // MachineConfigurationUpdateStrategyType defines how configuration

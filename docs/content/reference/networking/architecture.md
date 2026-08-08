@@ -1,7 +1,7 @@
 ---
 title: "Architecture"
 weight: 1
-description: "Deep dive into unbounded-net system design, dataplanes, data flows, and security."
+description: "Deep dive into unbounded-net system design, dataplane, data flows, and security."
 ---
 
 This document provides a detailed overview of unbounded-net's architecture,
@@ -15,10 +15,8 @@ sites using encrypted (WireGuard) or unencrypted (GENEVE, VXLAN, IPIP) tunnels.
 The encapsulation type is selected per link scope and can be set explicitly or
 resolved automatically based on link characteristics.
 
-The data plane supports two modes: **eBPF** (default) and **netlink**. The eBPF
-dataplane uses a TC egress BPF program and LPM trie maps for tunnel endpoint
-resolution, while the netlink dataplane uses per-peer tunnel interfaces and
-kernel routing tables.
+The eBPF dataplane uses a TC egress BPF program and LPM trie maps for tunnel
+endpoint resolution.
 
 ### High-Level Architecture
 
@@ -52,7 +50,7 @@ rules:
 Manages site membership and SiteNodeSlice objects:
 
 - Matches node internal IPs against Site `nodeCidrs`.
-- Labels matching nodes with `net.unbounded-cloud.io/site=<name>`.
+- Labels matching nodes with `unbounded-cloud.io/site=<name>`.
 - Splits site nodes into **SiteNodeSlice** objects (max 500 nodes per slice to
   avoid etcd object size limits).
 - Slices are named `{site-name}-{index}` with OwnerReferences for automatic
@@ -73,7 +71,7 @@ The node agent runs as a DaemonSet on every node, including control plane nodes.
 It manages:
 
 - WireGuard interfaces and key management
-- Tunnel configuration (eBPF or netlink)
+- Tunnel configuration
 - eBPF program lifecycle and BPF map reconciliation
 - Route programming
 - CNI bridge configuration
@@ -186,9 +184,7 @@ the link uses WireGuard regardless of other scopes.
 See [Routing Flows]({{< relref "reference/networking/routing-flows" >}}) for
 the full protocol selection algorithm.
 
-## Tunnel Dataplane Modes
-
-### eBPF Dataplane (default)
+## Tunnel Dataplane
 
 Uses a single dummy device (`unbounded0`) as a routing anchor, a TC egress BPF
 program for tunnel endpoint resolution, and shared flow-based tunnel interfaces.
@@ -240,22 +236,9 @@ Entries are not applied incrementally. Each protocol appends entries to a
 pending map, then a single `Reconcile()` call atomically deletes stale entries
 and upserts desired entries, keeping IPv4 and IPv6 tries synchronized.
 
-### Netlink Dataplane (legacy)
-
-Creates per-peer tunnel interfaces and uses kernel routing tables:
-
-- Each GENEVE peer gets `gn<decimal_ip>` (fixed remote endpoint and VNI).
-- Each IPIP peer gets `ip<decimal_ip>`.
-- VXLAN uses a single shared `vxlan0` with lightweight tunnel encap metadata
-  on each route.
-- WireGuard works identically in both modes.
-
-The netlink dataplane is simpler but creates more kernel objects as the mesh
-grows.
-
 ## Data Flows
 
-### Same-Site Pod-to-Pod (eBPF, GENEVE)
+### Same-Site Pod-to-Pod (GENEVE)
 
 ![Same-site pod-to-pod flow: Pod A through cbr0, kernel routing, unbounded0, TC egress BPF with LPM lookup, GENEVE encap over LAN to Pod B](../../../img/networking-same-site-flow.svg)
 

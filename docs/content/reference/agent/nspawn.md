@@ -69,8 +69,20 @@ Azure Linux 3.0. Other unknown host distros fall back to Ubuntu 24.04.
 | [`agent-azlinux3-nvidia`](https://github.com/Azure/unbounded/pkgs/container/agent-azlinux3-nvidia) | `ghcr.io/azure/agent-azlinux3-nvidia` | Azure Linux 3.0 image with the NVIDIA Container Toolkit (`nvidia-ctk`, `nvidia-container-runtime`). ([Containerfile](https://github.com/Azure/unbounded/tree/main/images/agent-azlinux3-nvidia/Containerfile)) |
 
 The agent pins a specific image tag by default at build time. The `OCIImage`
-field in the agent config can override the full image reference for custom or
-pinned builds.
+field in the agent config can select a registry image, a local OCI layout, or a
+tarred OCI image layout downloaded over HTTPS. For example:
+
+```text
+ghcr.io/azure/agent-ubuntu2404:v20260619
+oci-layout:///opt/unbounded/images/agent-ubuntu2404:v20260619
+https://artifacts.example.com/agent-ubuntu2404.oci.tar
+```
+
+HTTPS archives may be plain tar or gzip-compressed tar files. They must contain
+an OCI image layout with `oci-layout`, `index.json`, and `blobs/` content, and
+exactly one tagged image reference. The agent selects that reference automatically.
+Signed query strings such as Azure Blob SAS parameters are supported and are
+redacted from logs and errors.
 
 Image sources are maintained in the
 [images/](https://github.com/Azure/unbounded/tree/main/images)
@@ -98,8 +110,10 @@ When GPUs are detected on the host, the agent automatically exposes the host
 paths needed by the corresponding Kubernetes device plugin:
 
 - **NVIDIA GPUs.** Bind-mounts GPU device nodes and host driver libraries,
-  grants cgroup device permissions, generates a CDI spec, and configures the
-  NVIDIA container runtime. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}).
+  including NVIDIA IMEX channel devices used by multi-node GPU and NVLink
+  communication, grants cgroup device permissions, generates a CDI spec, and
+  configures the NVIDIA container runtime. See
+  [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}).
 - **AMD GPUs.** Bind-mounts `/dev/kfd` and DRM device nodes, grants cgroup
   device permissions, and exposes AMD sysfs paths read-only so the AMD
   Kubernetes device plugin can discover GPUs inside nspawn. See
@@ -125,9 +139,18 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   `/dev/infiniband` (e.g. `uverbs0`, `umad0`, `issm0`, `rdma_cm`) is
   bind-mounted so that RDMA workloads inside the container can reach the
   host's HCAs.
-- **Configured extra devices.** `AdditionalHostDevices` in the agent config can
-  list non-standard host device nodes under `/dev` (for example `/dev/uinput`) that
-  should be exposed to workloads inside the machine.
+- **Configured extra devices.** `AdditionalHostDevices` can list either
+  non-standard host device nodes under `/dev`, such as `/dev/uinput`, or systemd
+  device group specifiers, such as `char-input`, `char-pts`, and `block-*`.
+  Device paths are bind-mounted and granted with `DeviceAllow=`. Group
+  specifiers are rendered only as `DeviceAllow=` rules.
+- **Configured extra mounts.** `AdditionalHostMounts` binds non-device host
+  files or directories into the machine. `Source` must be a clean absolute
+  path (no `.`, `..`, or repeated slashes, no whitespace, control characters,
+  or `:`). `Target` is also a clean absolute path and defaults to `Source`
+  when omitted. Set `ReadOnly` to `true` unless the machine requires write
+  access. Sources are not created or required to exist during config
+  validation.
 
 Device discovery runs when the machine is provisioned and is refreshed by a
 host-side systemd hook before systemd starts the nspawn machine. Device mapping
@@ -160,8 +183,10 @@ The configuration is written to these files on the host before the machine boots
 | `Bind=<block device>` | nspawn config | Storage block device bind-mount (auto-generated for non-virtual `/sys/class/block` entries, including partitions, `dm-*`, and `md*`). |
 | `Bind=/dev/infiniband/*` | nspawn config | InfiniBand HCA device bind-mount (auto-generated when `/dev/infiniband` devices are present). |
 | `Bind=<configured /dev path>` | nspawn config | Additional host device bind-mount (configured with agent config `AdditionalHostDevices`). |
+| `Bind=<source>:<target>` / `BindReadOnly=<source>:<target>` | nspawn config | Additional filesystem bind-mount configured through `AdditionalHostMounts`. |
 | `Bind=` / `BindReadOnly=` | nspawn config | GPU device and library bind-mounts (auto-generated when GPUs are present). |
 | `DeviceAllow=` | Service override | Cgroup device permissions for all bind-mounted host device nodes (KVM, block, InfiniBand, configured extra devices, GPU). |
+| `DeviceAllow=<char/block group> rwm` | Service override | Additional systemd device group access configured through `AdditionalHostDevices`, for example `char-input`. |
 
 #### System call filter
 

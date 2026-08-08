@@ -2,8 +2,8 @@
 
 # Quick Start Guide
 
-This guide walks you through deploying unbounded-net on a Kubernetes cluster,
-creating your first Site, and optionally configuring gateway pools for
+This guide walks you through bootstrapping Unbounded Networking on a Kubernetes
+cluster, creating your first Site, and optionally configuring gateway pools for
 multi-site or AKS deployments.
 
 ## Prerequisites
@@ -14,49 +14,52 @@ multi-site or AKS deployments.
 - For **AKS**: Azure CLI (`az`), a subscription with permissions to create
   clusters, node pools, and public IP prefixes
 
-## Deploying unbounded-net
+## Deploying Unbounded Networking
 
-You can deploy unbounded-net either with `make -C hack/net deploy` (recommended -- handles
-template rendering and ordering) or by applying manifests manually.
+Component workloads are deployed by `unbounded-operator` from `Site.spec.components`.
+Bootstrap the CRDs and operator first, then create Site resources.
 
 ### Option A: Deploy with Make (recommended)
 
 ```bash
-# Deploy everything: CRDs, namespace, config, controller, and node agent
+# Build the kubectl plugin, then bootstrap CRDs and unbounded-operator
 make -C hack/net deploy
 ```
 
-By default this deploys into the `unbounded-net` namespace. Override with:
+The operator deploys unbounded-system into the `unbounded-system` namespace by default
+when a Site enables the net component.
+
+For direct component debugging, use:
 
 ```bash
-make -C hack/net deploy NET_NAMESPACE=kube-system
+make -C hack/net deploy-direct
 ```
 
-You can also deploy components individually:
+### Option B: Deploy with the plugin
 
 ```bash
-make -C hack/net deploy-crds          # CRDs only
-make -C hack/net deploy-controller    # Controller (includes CRDs, namespace, config)
-make -C hack/net deploy-node          # Node agent (includes CRDs, namespace, config)
+kubectl unbounded install
 ```
 
-### Option B: Manual deployment
+### Option C: Manual deployment
 
-If you are working from a pre-rendered manifest archive or want to apply
-resources step by step, follow the order below.
+If you are working from a pre-rendered manifest archive, apply the CRDs and
+operator manifests. The operator will deploy controller and node workloads after
+Sites are created.
 
 #### 1. Install CRDs
 
 ```bash
+kubectl apply -f deploy/machina/crd/
 kubectl apply -f deploy/net/crd/
 ```
 
-This installs the following CustomResourceDefinitions in the
-`net.unbounded-cloud.io` API group:
+This installs the shared Site CRD in `unbounded-cloud.io` plus the networking
+CRDs in `net.unbounded-cloud.io`:
 
 | CRD | Short Name | Description |
 |-----|-----------|-------------|
-| `sites` | `st` | Network location containing nodes |
+| `sites` | `st` | Shared network location containing nodes |
 | `sitenodeslices` | `sns` | Controller-managed node membership slices |
 | `gatewaypools` | `gp` | Pool of gateway nodes for inter-site routing |
 | `gatewaypoolnodes` | `gpn` | Per-node gateway status (controller-managed) |
@@ -64,79 +67,41 @@ This installs the following CustomResourceDefinitions in the
 | `sitepeerings` | `spr` | Direct peering between sites |
 | `gatewaypoolpeerings` | `gpp` | Peering between gateway pools |
 
-#### 2. Create namespace
-
-Skip this step if deploying into `kube-system`.
+#### 2. Deploy the operator
 
 ```bash
-kubectl create namespace unbounded-net
+kubectl apply -f deploy/unbounded-operator/rendered/
 ```
 
-#### 3. Deploy controller
-
-The controller manifests are in `deploy/net/controller/` (as `.yaml.tmpl`
-templates that must be rendered -- see `hack/cmd/render-manifests`). After
-rendering, apply them in order:
+When using source templates, render first:
 
 ```bash
-# Render templates first
-make net-manifests
-
-# Then apply rendered manifests
-kubectl apply -f deploy/net/rendered/01-configmap.yaml
-kubectl apply -f deploy/net/rendered/controller/
+make unbounded-operator-manifests
+kubectl apply -f deploy/unbounded-operator/rendered/
 ```
 
-The controller deployment includes:
+The operator deployment includes:
 
-- **ConfigMap** (`unbounded-net-config`) -- shared configuration for controller
-  and node agent, with sections for `common`, `controller`, and `node` settings
 - **ServiceAccount**, **ClusterRole**, **ClusterRoleBinding** -- RBAC for
-  managing nodes, CRDs, webhooks, and leader election leases
-- **Deployment** (1 replica) -- runs with leader election enabled, non-root
-  user, read-only root filesystem
-- **Services** -- ClusterIP service for metrics/health (port 9999) and webhook
-  service (port 9999)
-- **ValidatingWebhookConfiguration** -- validates Site, GatewayPool, SitePeering,
-  and other CRD mutations
-- **MutatingWebhookConfiguration** -- mutates new nodes (e.g., pod CIDR
-  assignment)
-- **APIService** -- aggregated API server for node status push
-- **ValidatingAdmissionPolicies** -- restricts which fields the controller
-  service accounts can modify on webhooks, API services, and nodes
+  reconciling enabled components.
+- **Deployment** -- watches Sites and applies component manifests.
 
-#### 4. Deploy node agent
+#### 3. Create a Site
 
-The node agent manifests are in `deploy/net/node/` (also `.yaml.tmpl` templates).
+Create a Site that enables unbounded-system:
 
-```bash
-kubectl apply -f deploy/net/rendered/node/
-```
-
-The node agent DaemonSet:
-
-- Runs on **all nodes** (tolerates all taints, `system-node-critical` priority)
-- Uses `hostNetwork: true` and `hostPID: true`
-- Runs as **privileged** to manage network interfaces and routing
-- **Init container** installs CNI plugins onto the host (`/opt/cni/bin`)
-- **Host mounts**:
-  - `/etc/cni/net.d` -- CNI configuration directory
-  - `/opt/cni/bin` -- CNI plugin binaries
-  - `/etc/wireguard` -- WireGuard key storage
-  - `/etc/iproute2` -- iproute2 configuration (e.g., rt_tables)
-- **Ports**: health on 9998/TCP, health check probe on 9997/UDP
-
-#### 5. Create a Site
-
-A Site defines a network location and its pod CIDR allocation. Create a Site
-resource to start managing nodes:
+A Site defines a network location, its pod CIDR allocation, and enabled
+components:
 
 ```yaml
-apiVersion: net.unbounded-cloud.io/v1alpha1
+apiVersion: unbounded-cloud.io/v1alpha3
 kind: Site
 metadata:
   name: primary
 spec:
+  components:
+    net:
+      enabled: true
   nodeCidrs:
     - 10.240.0.0/16
   podCidrAssignments:
@@ -157,6 +122,7 @@ Key fields:
   this site
 - `podCidrAssignments` -- defines pod CIDR pools and per-node block sizes;
   the controller allocates `/24` blocks from the pool to each node
+- `components.net.enabled` -- asks `unbounded-operator` to deploy unbounded-system
 - `tunnelProtocol` -- tunnel encapsulation mode; `Auto` selects WireGuard for
   external IPs and GENEVE for internal IPs. Options: `WireGuard`, `IPIP`,
   `GENEVE`, `VXLAN`, `None`, `Auto`
@@ -164,19 +130,23 @@ Key fields:
 See [docs/templates/site.yaml](templates/site.yaml) for a fully annotated
 example with all optional fields.
 
-#### 6. Verify
+#### 4. Verify
 
-Check that the controller and node agents are running:
+Check that the operator has reconciled the net component and the controller and
+node agents are running:
 
 ```bash
+# Operator
+kubectl -n unbounded-system get deploy unbounded-operator
+
 # Controller pod
-kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-controller
+kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-controller
 
 # Node agent pods (one per node)
-kubectl -n unbounded-net get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
+kubectl -n unbounded-system get pods -l app.kubernetes.io/name=unbounded-net-node -o wide
 
 # Nodes should be labeled with their site
-kubectl get nodes -L net.unbounded-cloud.io/site
+kubectl get nodes -L unbounded-cloud.io/site
 ```
 
 If you have the kubectl plugin installed (`make kubectl-unbounded`):
@@ -188,14 +158,14 @@ kubectl unbounded net node list
 Check controller health:
 
 ```bash
-kubectl unbounded-net dashboard
+kubectl unbounded-system dashboard
 ```
 
 ## AKS-Specific Setup
 
 ### Creating an AKS cluster
 
-Use `--network-plugin none` so that unbounded-net replaces the built-in CNI:
+Use `--network-plugin none` so that unbounded-system replaces the built-in CNI:
 
 ```bash
 az aks create \

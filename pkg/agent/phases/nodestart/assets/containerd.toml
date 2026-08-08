@@ -3,8 +3,12 @@ imports = ["/etc/containerd/conf.d/*.toml"]
 oom_score = 0
 version = 2
 
+[debug]
+level = "info"
+
 [plugins."io.containerd.grpc.v1.cri"]
 sandbox_image = "{{.SandboxImage}}"
+image_pull_progress_timeout = "15m"
 
 [plugins."io.containerd.grpc.v1.cri".containerd]
 default_runtime_name = "runc"

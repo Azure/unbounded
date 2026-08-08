@@ -10,14 +10,9 @@ mod executor;
 mod shard;
 
 #[cfg(target_os = "linux")]
-mod context;
-
-#[cfg(target_os = "linux")]
 pub use pinned::{PinnedRuntime, WorkerSpec, set_preferred_node};
 
-#[cfg(target_os = "linux")]
-pub use context::ShardContext;
-
+pub(crate) use executor::flag_waker;
 pub use executor::{block_on_cooperative, noop_waker, park_block_on_until, thread_waker};
 pub use shard::ShardLoop;
 

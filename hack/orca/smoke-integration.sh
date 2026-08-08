@@ -27,7 +27,7 @@
 # Usage: smoke-integration.sh [flags]
 #
 #   --context CTX        kubectl context to target (default: current)
-#   --namespace NS       namespace Orca is deployed in (default: unbounded-kube)
+#   --namespace NS       namespace Orca is deployed in (default: unbounded-system)
 #   --size-mib N         object size in MiB (default: 256)
 #   --key NAME           object key/blob name (default: smoke-<N>mib-<ts>.bin)
 #   --account NAME       Azure storage account (default: from orca-config)
@@ -40,7 +40,7 @@
 set -euo pipefail
 
 CONTEXT=""
-NAMESPACE="unbounded-kube"
+NAMESPACE="unbounded-system"
 SIZE_MIB=256
 KEY=""
 ACCOUNT=""

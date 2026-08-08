@@ -44,3 +44,11 @@ func TestWireguardTableRange(t *testing.T) {
 	assert.Equal(t, 51820, wireguardTableStart)
 	assert.Equal(t, 51899, wireguardTableEnd)
 }
+
+func TestCleanupNetwork(t *testing.T) {
+	t.Parallel()
+
+	task := CleanupNetwork(slog.Default())
+
+	assert.Equal(t, "serial(cleanup-localdns-rules, remove-network-interfaces, cleanup-routes)", task.Name())
+}

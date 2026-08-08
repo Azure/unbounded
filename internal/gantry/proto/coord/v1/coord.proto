@@ -1,6 +1,6 @@
 // Gantry coordination RPCs (libp2p, length-prefixed protobuf).
 //
-// Carried over libp2p stream protocol ID `/gantry/coord/1.0.0` as described in
+// Carried over libp2p stream protocol ID `/gantry/coord/1.1.0` as described in
 // detailed-design.md §4.4. One stream per request/response pair; the stream
 // is closed after the response is written. Forward-compat policy: additive
 // changes bump the minor (`/gantry/coord/1.1.0`), breaking changes bump the
@@ -27,7 +27,7 @@ enum FailureClass {
   FAILURE_CLASS_TRANSIENT    = 4; // connection / timeout / DNS / 5xx
 }
 
-// Envelope is the single message kind sent over `/gantry/coord/1.0.0`.
+// Envelope is the single message kind sent over `/gantry/coord/1.1.0`.
 // Receivers dispatch on the `msg` oneof.
 message Envelope {
   oneof msg {
@@ -100,6 +100,11 @@ message PleasePullRequest {
   string upstream_registry  = 2; // e.g. "registry.example.com"
   string repository         = 3; // e.g. "library/nginx"
   Kind   kind               = 4;
+
+  // Basic or Bearer authorization delegated by the requesting node. The
+  // recipient uses it only if it must contact origin for this request; local
+  // cache hits ignore it. It MUST NOT be persisted, logged, or cached.
+  string authorization      = 5;
 }
 
 // PleasePullResponse reports the per-digest outcome of a `please_pull` request.

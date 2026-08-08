@@ -122,6 +122,51 @@ startup:
 	assert.Equal(t, "0.0.0.0:9100", cfg.GetStartup().GetMetrics().GetAddr())
 }
 
+func TestRenderConfigS3TLSAndAuthRoundTrip(t *testing.T) {
+	dir := writeSource(t, `
+backends:
+  - name: secure-s3
+    s3:
+      url: https://s3.example.com
+      caCert: |
+        -----BEGIN CERTIFICATE-----
+        ca-certificate-data
+        -----END CERTIFICATE-----
+      clientCert: |
+        -----BEGIN CERTIFICATE-----
+        client-certificate-data
+        -----END CERTIFICATE-----
+      clientKey: |
+        -----BEGIN PRIVATE KEY-----
+        client-private-key-data
+        -----END PRIVATE KEY-----
+      region: us-west-2
+      accessKeyId: test-access-key
+      secretAccessKey: test-secret-key
+      sessionToken: test-session-token
+`)
+
+	cfg := decode(t, dir)
+
+	require.Len(t, cfg.GetBackends(), 1)
+	s3 := cfg.GetBackends()[0].GetS3()
+	require.NotNil(t, s3)
+	require.NotNil(t, s3.CaCert)
+	require.NotNil(t, s3.ClientCert)
+	require.NotNil(t, s3.ClientKey)
+	require.NotNil(t, s3.Region)
+	require.NotNil(t, s3.AccessKeyId)
+	require.NotNil(t, s3.SecretAccessKey)
+	require.NotNil(t, s3.SessionToken)
+	assert.Equal(t, "-----BEGIN CERTIFICATE-----\nca-certificate-data\n-----END CERTIFICATE-----\n", s3.GetCaCert())
+	assert.Equal(t, "-----BEGIN CERTIFICATE-----\nclient-certificate-data\n-----END CERTIFICATE-----\n", s3.GetClientCert())
+	assert.Equal(t, "-----BEGIN PRIVATE KEY-----\nclient-private-key-data\n-----END PRIVATE KEY-----\n", s3.GetClientKey())
+	assert.Equal(t, "us-west-2", s3.GetRegion())
+	assert.Equal(t, "test-access-key", s3.GetAccessKeyId())
+	assert.Equal(t, "test-secret-key", s3.GetSecretAccessKey())
+	assert.Equal(t, "test-session-token", s3.GetSessionToken())
+}
+
 func TestRenderConfigDefaultsConfigMap(t *testing.T) {
 	// The committed ConfigMap defaults render to a config the daemon accepts.
 	// Explicit values are preserved for the daemon to consume; absent optional
@@ -137,7 +182,7 @@ startup:
       addr: "0.0.0.0:0"
     max_inflight: 1024
   topology:
-    serving_cores: 0
+    serving_cores: 8
     nic_workers: 4
   metrics:
     addr: ""
@@ -153,7 +198,7 @@ startup:
 	assert.NotNil(t, cfg.GetStartup().GetFabric().MaxInflight)
 	assert.Equal(t, uint32(1024), cfg.GetStartup().GetFabric().GetMaxInflight())
 	assert.NotNil(t, cfg.GetStartup().GetTopology().ServingCores)
-	assert.Equal(t, uint64(0), cfg.GetStartup().GetTopology().GetServingCores())
+	assert.Equal(t, uint64(8), cfg.GetStartup().GetTopology().GetServingCores())
 	assert.NotNil(t, cfg.GetStartup().GetTopology().NicWorkers)
 	assert.Equal(t, uint64(4), cfg.GetStartup().GetTopology().GetNicWorkers())
 	assert.Empty(t, cfg.GetStartup().GetMetrics().GetAddr())

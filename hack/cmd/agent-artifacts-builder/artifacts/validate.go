@@ -22,8 +22,8 @@ import (
 	"oras.land/oras-go/v2/registry/remote/credentials"
 	"oras.land/oras-go/v2/registry/remote/retry"
 
-	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/internal/ociutil"
+	"github.com/Azure/unbounded/pkg/agent/bootstrapartifacts"
 )
 
 // ValidateOCI pulls each platform from an offline artifact OCI index into a
@@ -194,7 +194,7 @@ func validateBundle(rootDir string) error {
 		return err
 	}
 
-	manifest, err = agentartifacts.NormalizeManifest(manifest)
+	manifest, err = bootstrapartifacts.NormalizeManifest(manifest)
 	if err != nil {
 		return err
 	}
@@ -215,13 +215,23 @@ func validateBundle(rootDir string) error {
 
 	expectedPaths := expectedBundlePaths(plan)
 
-	actualPaths, err := collectArtifactPaths(rootDir)
+	bundleRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return fmt.Errorf("resolve offline artifact bundle path %q: %w", rootDir, err)
+	}
+
+	bundle, err := bootstrapartifacts.Open(bundleRoot)
 	if err != nil {
 		return err
 	}
 
-	if !equalStrings(expectedPaths, actualPaths) {
-		return fmt.Errorf("offline artifact bundle content mismatch: got %s, want %s", strings.Join(actualPaths, ", "), strings.Join(expectedPaths, ", "))
+	diff, err := bootstrapartifacts.CompareContents(context.Background(), bundle, expectedPaths)
+	if err != nil {
+		return err
+	}
+
+	if len(diff.Missing) > 0 || len(diff.Unexpected) > 0 {
+		return fmt.Errorf("offline artifact bundle content mismatch: missing %s, unexpected %s", strings.Join(diff.Missing, ", "), strings.Join(diff.Unexpected, ", "))
 	}
 
 	for _, artifact := range plan.Artifacts {
@@ -291,18 +301,4 @@ func detectArchitectures(rootDir, kubernetesVersion string) ([]string, error) {
 	sort.Strings(architectures)
 
 	return architectures, nil
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-
-	return true
 }

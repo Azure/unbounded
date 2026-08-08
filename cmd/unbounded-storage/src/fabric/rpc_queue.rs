@@ -50,7 +50,7 @@ impl JobQueue {
     }
 
     /// Enqueue `job`. Returns `Err(job)` if the queue is closed so the
-    /// caller can unwind any accounting it did for the rejected work.
+    /// caller can drop the work and its captured resources.
     pub(crate) fn push(&self, job: Job) -> Result<(), Job> {
         let mut inner = self.inner.lock().expect("job queue poisoned");
         if inner.closed {
@@ -118,6 +118,25 @@ mod tests {
         q.close();
         let rejected = q.push(Box::new(|| {}));
         assert!(rejected.is_err(), "closed queue must reject pushes");
+    }
+
+    #[test]
+    fn rejected_job_drops_captured_resources() {
+        struct DropCount(Arc<AtomicU32>);
+
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let q = JobQueue::new();
+        let drops = Arc::new(AtomicU32::new(0));
+        let guard = DropCount(drops.clone());
+        q.close();
+
+        drop(q.push(Box::new(move || drop(guard))));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

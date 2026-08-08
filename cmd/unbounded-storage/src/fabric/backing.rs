@@ -113,15 +113,13 @@ impl Fabric {
     }
 }
 
-/// A transient local-access memory region covering a single control
-/// message buffer. Providers that negotiate `FI_MR_LOCAL` (verbs)
+/// A local-access memory region covering one stable control-message
+/// buffer. Providers that negotiate `FI_MR_LOCAL` (verbs)
 /// require every send/recv buffer to carry a `desc` from a registered
-/// region; this owns that registration for one in-flight buffer and
-/// closes it on `Drop`. The completion handler that frees the buffer
-/// also drops the `LocalMr`, so the region lives exactly as long as the
-/// buffer is posted. Unlike `register_backing`, the `fid_mr` is *not*
-/// retained in the `Fabric`: a per-message control MR is closed as soon
-/// as its operation completes rather than at fabric teardown.
+/// region; this owns that registration and closes it on `Drop`. Send
+/// fallbacks retain it for one operation, while receive pools retain it
+/// across successful reposts of the same buffer. Unlike
+/// `register_backing`, the `fid_mr` is not retained by `Fabric`.
 pub(crate) struct LocalMr {
     mr: *mut ffi::fid_mr,
 }
@@ -195,8 +193,8 @@ impl LocalMrCtx {
     /// Register `ptr[..len]` for local `access` (`FI_RECV` for a recv
     /// buffer, `FI_TRANSMIT` for a send buffer). Returns `Ok(None)` when
     /// the provider does not require a local MR. The returned `LocalMr`
-    /// must outlive the posted operation: capture it in the completion
-    /// handler so it is closed when the buffer is freed.
+    /// must outlive every operation using the buffer: capture it with the
+    /// buffer until the operation completes or the receive lane retires.
     pub(crate) fn register(
         &self,
         ptr: *mut c_void,

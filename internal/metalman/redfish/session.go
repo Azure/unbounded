@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -46,13 +47,13 @@ func createSession(ctx context.Context, httpClient *http.Client, baseURL, user, 
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("redfish %s %s failed: %w", http.MethodPost, "/redfish/v1/SessionService/Sessions", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
 
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body) //nolint:errcheck // Best-effort read of error body.
-		return "", "", fmt.Errorf("session creation returned %d: %s", resp.StatusCode, body)
+		return "", "", redfishResponseError(http.MethodPost, "/redfish/v1/SessionService/Sessions", resp.StatusCode, body, nil)
 	}
 
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck // Best-effort drain of response body.
@@ -123,13 +124,13 @@ func (s *bmcSession) doOnce(ctx context.Context, method, path string, body any) 
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("redfish %s %s failed: %w", method, path, err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // Best-effort close of HTTP response body.
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return nil, resp.StatusCode, fmt.Errorf("reading Redfish %s %s response body: %w", method, path, err)
 	}
 
 	return data, resp.StatusCode, nil
@@ -157,4 +158,6 @@ func (s *bmcSession) close() {
 	}
 
 	resp.Body.Close() //nolint:errcheck // Best-effort close of session delete response.
+
+	slog.Info("Redfish deleted session", "url", s.baseURL)
 }

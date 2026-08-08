@@ -14,6 +14,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -30,6 +31,29 @@ var nspawnTemplates = template.Must(
 type ensureNSpawnWorkspace struct {
 	log       *slog.Logger
 	goalState *goalstates.RootFS
+}
+
+type NSpawnBind struct {
+	// Source is the host path passed to Bind=/BindReadOnly=.
+	Source string
+	// Target is the optional container path. Empty means "bind at Source".
+	Target string
+	// ReadOnly controls whether BindReadOnly= is used instead of Bind=.
+	ReadOnly bool
+}
+
+type NSpawnDeviceAllow struct {
+	// Specifier is the systemd DeviceAllow selector (path or char-* class).
+	Specifier string
+	// Access is the device permission mode, usually "rwm".
+	Access string
+}
+
+type NSpawnDeviceTarget struct {
+	// Bind controls visibility of a host path inside nspawn.
+	Bind NSpawnBind
+	// Allow controls cgroup device access for the corresponding target.
+	Allow NSpawnDeviceAllow
 }
 
 // EnsureNSpawnWorkspace returns a task that bootstraps an OCI rootfs into the
@@ -87,13 +111,21 @@ type nspawnTemplateData struct {
 	ContainerImageArchiveDir     string
 	ContainerImageArchiveHostDir string
 	HostDevicePaths              []string
-	NvidiaGPUDevicePaths         []string
-	NvidiaLibDirMounts           []goalstates.NvidiaLibDirMount
-	AMDGPUDevicePaths            []string
-	AMDSysFSPaths                []string
-	ConfigRegenerationUnit       string
-	AgentBinaryPath              string
+	HostDeviceGroupSpecifiers    []string
+	AdditionalHostMounts         []config.AdditionalHostMount
+	// NvidiaDeviceTargets contains render-ready Bind+DeviceAllow pairs.
+	NvidiaDeviceTargets    []NSpawnDeviceTarget
+	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount
+	NvidiaI386LibDirMounts []goalstates.NvidiaLibDirMount
+	NvidiaBinDir           string
+	AMDGPUDevicePaths      []string
+	AMDSysFSPaths          []string
+	ConfigRegenerationUnit string
+	AgentBinaryPath        string
 }
+
+// TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
+// and AMDGPUDevicePaths to structured bind/device-allow targets in a follow-up PR.
 
 // writeNSpawnConfigs renders the nspawn-related templates with device and GPU
 // data (when present) and writes them to their configured paths.
@@ -103,6 +135,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	// directory.
 	machineName := filepath.Base(goalState.MachineDir)
 	hostDevicePaths := goalState.HostDevices.Paths()
+	hostDeviceGroupSpecifiers := goalState.HostDevices.DeviceGroupSpecifiers()
 	amdGPUDevicePaths := pathsExcluding(goalState.AMD.GPUDevicePaths, goalState.Nvidia.GPUDevicePaths)
 
 	archiveDir := filepath.Join(goalState.MachineDir, strings.TrimPrefix(goalstates.ContainerImageArchiveDir, "/"))
@@ -116,8 +149,12 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		HostDevicePaths:              hostDevicePaths,
-		NvidiaGPUDevicePaths:         goalState.Nvidia.GPUDevicePaths,
+		HostDeviceGroupSpecifiers:    hostDeviceGroupSpecifiers,
+		AdditionalHostMounts:         goalState.AdditionalHostMounts,
+		NvidiaDeviceTargets:          nvidiaNSpawnDeviceTargets(goalState.Nvidia.GPUDevicePaths),
 		NvidiaLibDirMounts:           goalState.Nvidia.LibDirMounts,
+		NvidiaI386LibDirMounts:       goalState.Nvidia.I386LibDirMounts,
+		NvidiaBinDir:                 nvidiaHostBinDir(goalState.Nvidia),
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
@@ -132,6 +169,11 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 			"block", len(goalState.HostDevices.Block),
 			"infiniband", len(goalState.HostDevices.Infiniband),
 			"additional", len(goalState.HostDevices.Additional))
+	}
+
+	if len(goalState.AdditionalHostMounts) > 0 {
+		log.Info("additional host mounts configured",
+			"count", len(goalState.AdditionalHostMounts))
 	}
 
 	if len(goalState.Nvidia.GPUDevicePaths) > 0 {
@@ -176,6 +218,45 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	}
 
 	return nil
+}
+
+func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {
+	for _, path := range []string{nvidia.NvidiaSMIPath, nvidia.NvidiaIMEXPath, nvidia.NvidiaIMEXCtlPath} {
+		if path != "" {
+			return filepath.Dir(path)
+		}
+	}
+
+	return ""
+}
+
+func nvidiaNSpawnDeviceTargets(paths []string) []NSpawnDeviceTarget {
+	targets := make([]NSpawnDeviceTarget, 0, len(paths))
+
+	for _, path := range paths {
+		target := NSpawnDeviceTarget{
+			Bind: NSpawnBind{Source: path},
+			Allow: NSpawnDeviceAllow{
+				Specifier: path,
+				Access:    "rwm",
+			},
+		}
+
+		// The caps paths are directories that must be bind-mounted so dynamic
+		// NVIDIA capability and channel device nodes are visible inside nspawn.
+		// DeviceAllow operates on character device nodes and classes, so use
+		// the kernel device-class names to grant current and future nodes access.
+		switch path {
+		case "/dev/nvidia-caps":
+			target.Allow.Specifier = "char-nvidia-caps"
+		case "/dev/nvidia-caps-imex-channels":
+			target.Allow.Specifier = "char-nvidia-caps-imex-channels"
+		}
+
+		targets = append(targets, target)
+	}
+
+	return targets
 }
 
 func pathsExcluding(paths, excluded []string) []string {

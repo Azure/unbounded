@@ -11,7 +11,7 @@
 //! the engine that holds it can be published to any thread, but every
 //! [`BlockDevice`] call only succeeds on the storage core whose ring
 //! has been installed (via
-//! [`set_current_storage_ring`](crate::ring::set_current_storage_ring)).
+//! [`install_current_storage_ring`](crate::ring::install_current_storage_ring)).
 //! Off-core calls fail with `Err(Io(ENXIO))` rather than touching a
 //! foreign ring.
 
@@ -35,24 +35,17 @@ pub struct CoreLocalDevice {
     file_index: u32,
     page_size: usize,
     capacity_pages: u64,
-    write_queue_depth: u32,
 }
 
 impl CoreLocalDevice {
     /// Build a device bound to `file_index` on the storage core's
     /// ring, carrying the disk geometry the engine needs without
     /// touching the ring.
-    pub fn new(
-        file_index: u32,
-        page_size: usize,
-        capacity_pages: u64,
-        write_queue_depth: u32,
-    ) -> Self {
+    pub fn new(file_index: u32, page_size: usize, capacity_pages: u64) -> Self {
         Self {
             file_index,
             page_size,
             capacity_pages,
-            write_queue_depth,
         }
     }
 
@@ -104,10 +97,6 @@ impl BlockDevice for CoreLocalDevice {
         let offset = self.io_offset(lba, src.len())?;
         let ring = current_storage_ring().ok_or_else(off_core_err)?;
         ring.write(self.file_index, offset, src).await
-    }
-
-    fn write_queue_depth(&self) -> u32 {
-        self.write_queue_depth
     }
 
     fn progress(&self) -> Result<(), Error> {
@@ -169,7 +158,7 @@ mod tests {
 
     #[test]
     fn io_offset_validates_geometry() {
-        let dev = CoreLocalDevice::new(0, 4096, 16, 8);
+        let dev = CoreLocalDevice::new(0, 4096, 16);
         // Happy path: page-aligned, in range.
         assert_eq!(dev.io_offset(Lba(2), 4096).unwrap(), 8192);
         // Non-multiple of page size.
@@ -198,7 +187,7 @@ mod tests {
     fn read_off_core_returns_enxio() {
         // Ensure no ring is installed on this test thread.
         clear_current_storage_ring();
-        let dev = CoreLocalDevice::new(0, 4096, 16, 8);
+        let dev = CoreLocalDevice::new(0, 4096, 16);
         let mut buf = vec![0u8; 4096];
         let res = block_on(dev.read(Lba(0), &mut buf));
         assert!(
@@ -210,7 +199,7 @@ mod tests {
     #[test]
     fn write_off_core_returns_enxio() {
         clear_current_storage_ring();
-        let dev = CoreLocalDevice::new(0, 4096, 16, 8);
+        let dev = CoreLocalDevice::new(0, 4096, 16);
         let buf = vec![0u8; 4096];
         let res = block_on(dev.write(Lba(0), &buf));
         assert!(
@@ -222,7 +211,7 @@ mod tests {
     #[test]
     fn register_and_progress_off_core_return_enxio() {
         clear_current_storage_ring();
-        let dev = CoreLocalDevice::new(0, 4096, 16, 8);
+        let dev = CoreLocalDevice::new(0, 4096, 16);
         let mut buf = vec![0u8; 4096];
         assert!(matches!(
             dev.register_buffers(buf.as_mut_ptr(), buf.len()),
@@ -237,11 +226,10 @@ mod tests {
     #[test]
     fn metadata_accessors_do_not_touch_the_ring() {
         clear_current_storage_ring();
-        let dev = CoreLocalDevice::new(3, 4096, 128, 32);
+        let dev = CoreLocalDevice::new(3, 4096, 128);
         assert_eq!(dev.file_index(), 3);
         assert_eq!(dev.page_size(), 4096);
         assert_eq!(dev.capacity_pages(), 128);
-        assert_eq!(dev.write_queue_depth(), 32);
     }
 
     #[test]

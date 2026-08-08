@@ -39,7 +39,7 @@ the data plane:
 
 - Writes CNI bridge configuration for local pod networking.
 - Manages WireGuard keys and tunnel interfaces.
-- Programs routes using eBPF or netlink.
+- Programs routes through eBPF maps and kernel networking interfaces.
 - Monitors gateway health with UDP probes.
 
 ## Core Concepts
@@ -56,7 +56,7 @@ edge deployment. Each site is defined by:
   controller hands out per-node slices from these pools.
 
 When a node joins the cluster, the controller matches its internal IP against
-all Site `nodeCidrs` and labels it with `net.unbounded-cloud.io/site=<name>`.
+all Site `nodeCidrs` and labels it with `unbounded-cloud.io/site=<name>`.
 
 ### Gateway Pools
 
@@ -147,30 +147,20 @@ Choosing `None` on a `SitePeering` with `meshNodes: false` is the standard
 pattern for sites already connected over a dedicated private link. Traffic
 travels at full line rate with no encapsulation overhead.
 
-## Dataplane Modes
+## Dataplane
 
-The node agent supports two dataplanes for programming routes:
-
-### eBPF (default)
-
-The eBPF dataplane attaches a TC egress BPF program to a `unbounded0` dummy
+The node agent uses an eBPF dataplane to program routes. It attaches a TC
+egress BPF program to a `unbounded0` dummy
 interface. It uses LPM (Longest Prefix Match) trie maps for per-destination
 tunnel endpoint resolution. Tunnel interfaces (`geneve0`, `vxlan0`, `ipip0`)
 are shared across all peers using flow-based encapsulation.
 
-**Advantages:** Fewer kernel objects at scale, shared tunnel interfaces,
-efficient map-based lookups.
-
-### Netlink (legacy)
-
-The netlink dataplane creates per-peer tunnel interfaces and programs routes
-using standard kernel routing tables.
-
-**Advantages:** Simpler debugging with standard `ip route` tools.
+This design minimizes kernel objects at scale, shares tunnel interfaces, and
+provides efficient map-based lookups.
 
 ## How It Relates to unbounded-kube
 
-unbounded-net is the **networking layer** for the broader Project Unbounded
+unbounded-net is the **networking layer** for the broader Unbounded Kubernetes
 system:
 
 - **Unbounded** handles node provisioning -- getting remote machines
@@ -179,13 +169,16 @@ system:
   traffic.
 
 They share the same API group prefix (`unbounded-cloud.io` / `net.unbounded-cloud.io`)
-and are designed to work together. When you run `kubectl unbounded site init`,
-it installs both the machina controller and the unbounded-net CNI plugin.
+and are designed to work together. After you bootstrap `unbounded-operator` with
+`kubectl unbounded install`, running `kubectl unbounded site init` creates Site
+resources and lets the operator deploy machina and unbounded-net from
+`Site.spec.components`.
 
 ## Next Steps
 
 - **[Getting Started]({{< relref "guides/getting-started" >}})** -- The
-  quickstart installs unbounded-net as part of site initialization.
+  quickstart bootstraps `unbounded-operator` and requests unbounded-net through
+  the cluster Site.
 - **[Networking Reference]({{< relref "reference/networking" >}})** -- Full
   CRD specifications, configuration flags, routing flows, and operational
   guides.

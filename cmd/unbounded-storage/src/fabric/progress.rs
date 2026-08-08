@@ -130,17 +130,15 @@ unsafe impl Send for ProgressGroup {}
 unsafe impl Sync for ProgressGroup {}
 
 impl ProgressGroup {
-    /// Spawn the progress pool. Creates `cfg.progress_threads` (at least
-    /// one) threads pinned to `cfg.worker_idx`, each labeled with the
-    /// fabric's NUMA node (`cfg.numa`, defaulting to 0). In a daemon
-    /// that runs one fabric per NUMA node this yields one progress
-    /// thread per NUMA across the process.
+    /// Spawn the progress pool, distributing threads over the fabric
+    /// unit's reserved workers.
     pub(crate) fn new(cfg: &FabricConfig) -> Result<Self> {
         let count = (cfg.progress_threads as usize).max(1);
-        let numa = cfg.numa.unwrap_or(0);
         let mut threads = Vec::with_capacity(count);
 
         for i in 0..count {
+            let worker_idx = cfg.worker_for_thread(i);
+            let numa = cfg.runtime.numa_of(worker_idx).or(cfg.numa).unwrap_or(0);
             let registry = Arc::new(CqRegistry::new());
             let shutdown = Arc::new(AtomicBool::new(false));
             let transient_errors = Arc::new(AtomicU64::new(0));
@@ -154,7 +152,7 @@ impl ProgressGroup {
             let name = format!("fabric-progress-{numa}-{i}");
 
             let handle = cfg.runtime.spawn_pinned(
-                cfg.worker_idx,
+                worker_idx,
                 &name,
                 Box::new(move || {
                     progress_loop(
@@ -235,12 +233,16 @@ impl ProgressGroup {
     }
 
     fn pick_thread(&self, numa: Option<u16>) -> usize {
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.threads.len();
         if let Some(n) = numa {
-            if let Some(i) = self.threads.iter().position(|t| t.numa == n) {
-                return i;
+            for offset in 0..self.threads.len() {
+                let idx = (start + offset) % self.threads.len();
+                if self.threads[idx].numa == n {
+                    return idx;
+                }
             }
         }
-        self.next.fetch_add(1, Ordering::Relaxed) % self.threads.len()
+        start
     }
 
     /// Total transient (non-EAGAIN, non-EAVAIL) error count across all
@@ -320,7 +322,7 @@ fn deliver_success(entry: &ffi::fi_cq_data_entry) {
     // `CompletionSlot::into_raw` at submission; libfabric returns it
     // untouched on completion. Under MSG there is no tag or source
     // address, so those fields are zero.
-    let slot = unsafe { CompletionSlot::from_raw(ctx) };
+    let mut slot = unsafe { CompletionSlot::from_raw(ctx) };
     slot.complete(Ok(CompletionInfo {
         flags: entry.flags,
         bytes: entry.len,
@@ -346,7 +348,7 @@ fn drain_errors(cq: *mut ffi::fid_cq, errors: &AtomicU64) {
         let ctx = err_entry.op_context;
         if !ctx.is_null() {
             // SAFETY: same provenance contract as `deliver_success`.
-            let slot = unsafe { CompletionSlot::from_raw(ctx) };
+            let mut slot = unsafe { CompletionSlot::from_raw(ctx) };
             slot.complete(Err(FabricError::Cq {
                 prov_errno: err_entry.prov_errno,
                 err: err_entry.err,
@@ -420,5 +422,22 @@ mod tests {
             .sum();
         assert_eq!(total, 0);
         drop(group);
+    }
+
+    #[test]
+    fn matching_numa_registrations_round_robin() {
+        let cfg = test_cfg(2);
+        let group = ProgressGroup::new(&cfg).expect("group");
+        group.stop();
+
+        let a = 0x1234 as *mut ffi::fid_cq;
+        let b = 0x5678 as *mut ffi::fid_cq;
+        group.register(Some(0), a);
+        group.register(Some(0), b);
+
+        let first = group.threads[0].registry.snapshot();
+        let second = group.threads[1].registry.snapshot();
+        assert!(first.len() == 1 && first[0] == CqPtr(a));
+        assert!(second.len() == 1 && second[0] == CqPtr(b));
     }
 }

@@ -1,0 +1,8 @@
+# Syntax-only source carrier for private benchmark branches. The operator VM
+# copies /workspace out of this image and does not run it.
+FROM mcr.microsoft.com/cbl-mariner/busybox:2.0
+
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+
+COPY . /workspace

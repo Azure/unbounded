@@ -4,8 +4,7 @@
 //! Per-shard [`BlockStore`] view over a hot-swappable
 //! [`DiskChannelDirectory`].
 //!
-//! Each shard holds a [`LiveShardLocalStore`] and registers its
-//! NUMA-local backing through [`Self::register_backing`]. The view
+//! Each shard registers one NUMA-local backing. The view
 //! resolves the `PageRef`s emitted by its `Pool` to absolute byte
 //! ranges in that backing, picks the owning disk with
 //! [`crate::storage::local::disk_for`], and ships the raw `(ptr, len)`
@@ -13,14 +12,10 @@
 //! and its ring run entirely on the storage core; the shard never
 //! touches the device directly.
 //!
-//! On every `BlockStore` call the view loads the directory's published
-//! `(channels, generation)` pair atomically and compares the
-//! generation against the one it last replayed against; on a mismatch
-//! it re-registers every recorded backing against every channel in
-//! the newly-published set before delegating. Because the snapshot
-//! and generation come from a single `ArcSwap` load, "last_seen ==
-//! N" always means the recorded set was registered against the
-//! snapshot published as gen N.
+//! `LiveShardLocalStore` replays registrations by directory generation.
+//! The production `ChainLocalStore` instead tracks storage service IDs
+//! once per shard, so cache IDs that publish the same channels do not
+//! repeat fixed-buffer registration.
 //!
 //! When the directory has no channels published (no projected cache disks)
 //! reads and writes return [`Error::Transport`] - the data path is
@@ -54,20 +49,19 @@ pub struct CacheDirectorySet {
 /// cache's own [`DiskChannelDirectory`] and replay state.
 pub struct ChainLocalStore {
     directories: Arc<CacheDirectorySet>,
-    stores: Mutex<HashMap<String, StoreEntry>>,
-    registered: Mutex<Vec<RegisteredBacking>>,
-}
-
-struct StoreEntry {
-    directory: Arc<DiskChannelDirectory>,
-    store: Arc<LiveShardLocalStore>,
+    state: Mutex<ChainState>,
 }
 
 struct RegisteredBacking {
     base: *mut u8,
     page_size: usize,
     page_count: usize,
-    keepalive: Arc<dyn Send + Sync>,
+    _keepalive: Arc<dyn Send + Sync>,
+}
+
+struct ChainState {
+    backing: Option<RegisteredBacking>,
+    registered_services: HashSet<u64>,
 }
 
 /// Registered backings plus the directory generation we last replayed
@@ -149,11 +143,10 @@ impl CacheDirectorySet {
         self.get_or_create(cache_id).apply_channels(channels);
     }
 
-    pub fn drive_numa(&self, cache_id: Option<&str>) -> Arc<Vec<Option<u16>>> {
+    pub fn snapshot(&self, cache_id: Option<&str>) -> Option<Arc<super::channels::ChannelSet>> {
         cache_id
             .and_then(|id| self.get(id))
-            .map(|directory| directory.drive_numa())
-            .unwrap_or_else(|| Arc::new(Vec::new()))
+            .map(|directory| directory.snapshot())
     }
 }
 
@@ -161,37 +154,48 @@ impl ChainLocalStore {
     pub fn new(directories: Arc<CacheDirectorySet>) -> Arc<Self> {
         Arc::new(Self {
             directories,
-            stores: Mutex::new(HashMap::new()),
-            registered: Mutex::new(Vec::new()),
+            state: Mutex::new(ChainState {
+                backing: None,
+                registered_services: HashSet::new(),
+            }),
         })
     }
 
-    fn store_for(&self, cache_id: &str) -> Arc<LiveShardLocalStore> {
-        let directory = self.directories.get_or_create(cache_id);
-        let mut guard = self.stores.lock().unwrap();
-        if let Some(entry) = guard.get(cache_id) {
-            if Arc::ptr_eq(&entry.directory, &directory) {
-                return entry.store.clone();
+    fn prepare(
+        &self,
+        channels: &super::channels::ChannelSet,
+        page: PageRef,
+    ) -> Result<(*mut u8, usize), Error> {
+        let mut state = self.state.lock().unwrap();
+        let Some(backing) = state.backing.as_ref() else {
+            return Err(Error::Io(libc::ENXIO));
+        };
+        let base = backing.base;
+        let page_size = backing.page_size;
+        let page_count = backing.page_count;
+        let bytes = page_size * page_count;
+        let mut first_error = None;
+
+        for channel in &channels.channels {
+            let service_id = channel.service_id();
+            if !state.registered_services.contains(&service_id) {
+                if let Err(error) = channel.register_buffer(base, bytes) {
+                    eprintln!("disks: register_buffer failed: {error:?}");
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+                state.registered_services.insert(service_id);
             }
         }
-        let store = Arc::new(LiveShardLocalStore::new(directory.clone()));
-        for backing in self.registered.lock().unwrap().iter() {
-            let backing = crate::memory::Backing {
-                base: backing.base,
-                page_size: backing.page_size,
-                page_count: backing.page_count,
-                keepalive: backing.keepalive.clone(),
-            };
-            let _ = store.register_pages(&backing);
+        if let Some(error) = first_error {
+            return Err(error);
         }
-        guard.insert(
-            cache_id.to_string(),
-            StoreEntry {
-                directory,
-                store: store.clone(),
-            },
-        );
-        store
+
+        debug_assert!((page.page_idx as usize) < page_count);
+        // SAFETY: `page_idx < page_count` and the pool guarantees
+        // `offset + len <= page_size` for its shard-owned backing.
+        let ptr = unsafe { base.add(page.page_idx as usize * page_size + page.offset as usize) };
+        Ok((ptr, page.len as usize))
     }
 }
 
@@ -243,12 +247,14 @@ impl LiveShardLocalStore {
     /// [`DiskChannelDirectory::snapshot`] load, so the pair is
     /// consistent. Returns `None` when the directory has no channels.
     fn current_or_replay(&self) -> Option<Arc<super::channels::ChannelSet>> {
-        let (set, gen_n) = self.directory.snapshot();
-        let set = set?;
+        let set = self.directory.snapshot();
+        if set.channels.is_empty() {
+            return None;
+        }
         let mut guard = self.state.lock().unwrap();
-        if guard.last_seen_generation != Some(gen_n) {
+        if guard.last_seen_generation != Some(set.generation) {
             Self::replay_locked(&set.channels, &guard.registered);
-            guard.last_seen_generation = Some(gen_n);
+            guard.last_seen_generation = Some(set.generation);
         }
         Some(set)
     }
@@ -356,22 +362,18 @@ impl BlockStore for LiveShardLocalStore {
 
 impl BlockStore for ChainLocalStore {
     fn register_pages(&self, backing: &crate::memory::Backing) -> Result<(), Error> {
-        let mut registered = self.registered.lock().unwrap();
-        if !registered.is_empty() {
+        let mut state = self.state.lock().unwrap();
+        if state.backing.is_some() {
             return Err(Error::BadConfig(
                 "register_pages: chain store already has a registered backing",
             ));
         }
-        registered.push(RegisteredBacking {
+        state.backing = Some(RegisteredBacking {
             base: backing.base,
             page_size: backing.page_size,
             page_count: backing.page_count,
-            keepalive: backing.keepalive.clone(),
+            _keepalive: backing.keepalive.clone(),
         });
-        drop(registered);
-        for entry in self.stores.lock().unwrap().values() {
-            entry.store.register_pages(backing)?;
-        }
         Ok(())
     }
 
@@ -411,11 +413,15 @@ impl BlockStore for ChainLocalStore {
         let Some(directory) = self.directories.get(cache_id) else {
             return Ok(false);
         };
-        if directory.current().is_none() {
+        let channels = directory.snapshot();
+        if channels.channels.is_empty() {
             return Ok(false);
         }
-        self.store_for(cache_id)
-            .read_page(req, stripe_off, dst)
+        let (p, len) = self.prepare(&channels, dst)?;
+        let idx = disk_for(&req.key(), stripe_off, channels.channels.len());
+        let slice = std::ptr::slice_from_raw_parts_mut(p, len);
+        channels.channels[idx]
+            .read_page(req.key(), stripe_off, slice)
             .await
     }
 
@@ -431,11 +437,15 @@ impl BlockStore for ChainLocalStore {
         let Some(directory) = self.directories.get(cache_id) else {
             return Ok(());
         };
-        if directory.current().is_none() {
+        let channels = directory.snapshot();
+        if channels.channels.is_empty() {
             return Ok(());
         }
-        self.store_for(cache_id)
-            .write_page(req, stripe_off, page)
+        let (p, len) = self.prepare(&channels, page)?;
+        let idx = disk_for(&req.key(), stripe_off, channels.channels.len());
+        let slice = std::ptr::slice_from_raw_parts(p.cast_const(), len);
+        channels.channels[idx]
+            .write_page(req.key(), stripe_off, slice)
             .await
     }
 }
@@ -494,9 +504,6 @@ mod tests {
         fn register_buffers(&self, base: *mut u8, len: usize) -> Result<(), DevError> {
             self.registers.fetch_add(1, Ordering::Relaxed);
             self.inner.register_buffers(base, len)
-        }
-        fn write_queue_depth(&self) -> u32 {
-            self.inner.write_queue_depth()
         }
         async fn read(&self, lba: Lba, dst: &mut [u8]) -> Result<(), DevError> {
             self.inner.read(lba, dst).await
@@ -748,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_id_readd_rebinds_chain_store_to_new_directory() {
+    fn cache_id_readd_registers_replacement_service() {
         let dirs = CacheDirectorySet::new();
         dirs.reconcile(["cache-a"]);
         let core1 = Core::spawn();
@@ -760,7 +767,15 @@ mod tests {
         let view = ChainLocalStore::new(dirs.clone());
         let (_buf, backing) = make_backing(2);
         view.register_pages(&backing).unwrap();
-        let first = view.store_for("cache-a");
+        let req = StripeReq::new(StripeKey([0x22; 32])).with_cache_id(Some("cache-a".into()));
+        let page = PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 4096,
+        };
+        let before1 = core1.registers.load(Ordering::Relaxed);
+        block_on(view.write_page(&req, 0, page)).unwrap();
+        assert_eq!(core1.registers.load(Ordering::Relaxed), before1 + 1);
 
         dirs.reconcile(std::iter::empty::<&str>());
         dirs.reconcile(["cache-a"]);
@@ -770,17 +785,9 @@ mod tests {
             vec![(PathBuf::from("/b"), core2.channel.clone(), None, true)],
         );
 
-        let second = view.store_for("cache-a");
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "re-added cache id must get a store bound to the new directory",
-        );
-        assert_eq!(
-            second.state.lock().unwrap().registered.len(),
-            1,
-            "registered backing must be replayed into replacement store",
-        );
-        assert!(second.current_or_replay().is_some());
+        let before2 = core2.registers.load(Ordering::Relaxed);
+        block_on(view.write_page(&req, 0, page)).unwrap();
+        assert_eq!(core2.registers.load(Ordering::Relaxed), before2 + 1);
 
         core1.shutdown();
         core2.shutdown();
@@ -798,8 +805,8 @@ mod tests {
 
         assert!(!view.page_cache_enabled(&req, 0));
         assert!(
-            view.stores.lock().unwrap().is_empty(),
-            "policy lookup must not instantiate or replay a live store",
+            view.state.lock().unwrap().registered_services.is_empty(),
+            "policy lookup must not register a backing",
         );
     }
 
@@ -815,9 +822,40 @@ mod tests {
 
         assert!(!view.page_cache_enabled(&req, 0));
         assert!(
-            view.stores.lock().unwrap().is_empty(),
-            "no-cache policy lookup must not instantiate a live store",
+            view.state.lock().unwrap().registered_services.is_empty(),
+            "no-cache policy lookup must not register a backing",
         );
+    }
+
+    #[test]
+    fn shared_service_is_registered_once_across_cache_ids() {
+        let dirs = CacheDirectorySet::new();
+        dirs.reconcile(["cache-a", "cache-b"]);
+        let core = Core::spawn();
+        for cache_id in ["cache-a", "cache-b"] {
+            dirs.apply_channels(
+                cache_id,
+                vec![(PathBuf::from("/a"), core.channel.clone(), None, true)],
+            );
+        }
+
+        let view = ChainLocalStore::new(dirs);
+        let (_buf, backing) = make_backing(2);
+        view.register_pages(&backing).unwrap();
+        let page = PageRef {
+            page_idx: 0,
+            offset: 0,
+            len: 4096,
+        };
+        let before = core.registers.load(Ordering::Relaxed);
+        for cache_id in ["cache-a", "cache-b"] {
+            let req =
+                StripeReq::new(StripeKey([0x33; 32])).with_cache_id(Some(cache_id.to_string()));
+            block_on(view.write_page(&req, 0, page)).unwrap();
+        }
+        assert_eq!(core.registers.load(Ordering::Relaxed), before + 1);
+
+        core.shutdown();
     }
 
     #[test]
@@ -832,6 +870,6 @@ mod tests {
         let (_b2, backing2) = make_backing(4);
         let err = view.register_pages(&backing2);
         assert!(matches!(err, Err(Error::BadConfig(_))));
-        assert_eq!(view.registered.lock().unwrap().len(), 1);
+        assert!(view.state.lock().unwrap().backing.is_some());
     }
 }

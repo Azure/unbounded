@@ -56,7 +56,7 @@ type nodeOperator interface {
 	// not perform Kubernetes eviction or CNI-specific dataplane cleanup itself.
 	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
 	// StageAgentUpgrade stages a new host-side agent binary.
-	StageAgentUpgrade(context.Context, *slog.Logger, string) error
+	StageAgentUpgrade(context.Context, *slog.Logger, agentUpgradeRequest) error
 	// RestartAgentDaemon restarts the host-side agent daemon after an upgrade
 	// operation has been recorded as complete.
 	RestartAgentDaemon(context.Context, *slog.Logger) error
@@ -160,7 +160,27 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if !reflect.DeepEqual(applied.Kubelet.Configuration, desired.Kubelet.Configuration) {
+		return true
+	}
+
+	if !reflect.DeepEqual(applied.Kubelet.ImageCredentialProvider, desired.Kubelet.ImageCredentialProvider) {
+		return true
+	}
+
+	if gantryDisabled(applied) != gantryDisabled(desired) {
+		return true
+	}
+
+	if !reflect.DeepEqual(applied.LocalDNS, desired.LocalDNS) {
+		return true
+	}
+
 	return false
+}
+
+func gantryDisabled(cfg *provision.AgentConfig) bool {
+	return cfg.Gantry != nil && cfg.Gantry.Disabled
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
@@ -211,7 +231,7 @@ func (nspawnNodeOperator) RepaveNode(
 	)
 
 	// Resolve goal states for the new machine.
-	downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(newCfg)
+	downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, newCfg)
 	if err != nil {
 		return fmt.Errorf("resolve download overrides: %w", err)
 	}
@@ -225,6 +245,7 @@ func (nspawnNodeOperator) RepaveNode(
 		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
+		reset.CleanupNetwork(log),
 		nodestart.StartNode(log, gs.NodeStart),
 		PersistAppliedConfig(log, gs.NodeStart.MachineName, &newCfg.AgentConfig),
 		nodestart.WaitForKubelet(log, newMachine),
@@ -243,8 +264,8 @@ func (nspawnNodeOperator) RepaveNode(
 	return nil
 }
 
-func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, downloadURL string) error {
-	return upgradeDaemonBinary(ctx, log, downloadURL)
+func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
+	return upgradeDaemonBinary(ctx, log, request)
 }
 
 func (nspawnNodeOperator) RestartAgentDaemon(ctx context.Context, log *slog.Logger) error {

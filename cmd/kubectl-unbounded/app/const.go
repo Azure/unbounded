@@ -3,6 +3,4 @@
 
 package app
 
-const (
-	fieldManagerID = "kubectl-unbounded"
-)
+const fieldManagerID = "kubectl-unbounded"

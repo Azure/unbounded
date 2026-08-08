@@ -47,7 +47,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			log := cmdCtx.Logger
 
-			downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(cfg)
+			downloads, containerImageArchives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, cfg)
 			if err != nil {
 				return err
 			}
@@ -60,6 +60,10 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			rootFSGoalState := gs.RootFS
 			nodeStartGoalState := gs.NodeStart
 
+			if err := host.EnsureNoExistingDeployment(ctx, log); err != nil {
+				return err
+			}
+
 			// Run host setup and attestation first. Metalman bootstrap tokens are
 			// only available after attestation, so Machine status reporting starts
 			// after this block.
@@ -69,7 +73,9 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				phases.Parallel(log,
 					host.ConfigureOS(log),
 					host.ConfigureNFTables(log),
-					host.DisableDocker(log),
+					phases.Serial(log, host.DisableDocker(log), host.ConfigureDocker(log)),
+					host.DisableContainerd(log),
+					host.DisableKubelet(log),
 					host.DisableSwap(log),
 					host.HardenAPT(log),
 				),

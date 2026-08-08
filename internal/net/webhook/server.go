@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -22,7 +23,10 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	unboundednet "github.com/Azure/unbounded/internal/net/client/unboundednet"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
@@ -85,7 +89,7 @@ func NewServer(clientset kubernetes.Interface, restConfig *rest.Config, namespac
 	}
 
 	if namespace == "" {
-		namespace = "kube-system"
+		namespace = unbounded.SystemNamespace()
 	}
 
 	mux := http.NewServeMux()
@@ -443,15 +447,34 @@ func buildNodeAdmissionPatch(podCIDR string, podCIDRs []string, siteName string)
 		{"op": "add", "path": "/spec/podCIDR", "value": podCIDR},
 		{"op": "add", "path": "/spec/podCIDRs", "value": podCIDRs},
 	}
+
 	if siteName != "" {
-		patches = append(patches,
-			map[string]interface{}{"op": "add", "path": "/metadata/labels/net.unbounded-cloud.io~1site", "value": siteName},
-		)
+		// Dual-write the canonical (unbounded-cloud.io/site) and deprecated
+		// (net.unbounded-cloud.io/site) keys during the deprecation window.
+		for _, key := range nodeSiteLabelKeys() {
+			patches = append(patches,
+				map[string]interface{}{"op": "add", "path": "/metadata/labels/" + escapeJSONPointer(key), "value": siteName},
+			)
+		}
 	}
 
 	data, _ := json.Marshal(patches) //nolint:errcheck
 
 	return data
+}
+
+// nodeSiteLabelKeys are the node site-membership label keys, canonical first.
+func nodeSiteLabelKeys() []string {
+	return []string{unboundedv1alpha3.MachineSiteLabelKey, unboundednetv1alpha1.SiteLabelKey}
+}
+
+// escapeJSONPointer escapes a string for use in a JSON Pointer path segment
+// (RFC 6901): "~" becomes "~0" and "/" becomes "~1".
+func escapeJSONPointer(s string) string {
+	s = strings.ReplaceAll(s, "~", "~0")
+	s = strings.ReplaceAll(s, "/", "~1")
+
+	return s
 }
 
 func writeAdmissionResponse(w http.ResponseWriter, review admissionv1.AdmissionReview, response *admissionv1.AdmissionResponse) {

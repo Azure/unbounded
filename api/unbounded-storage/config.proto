@@ -283,18 +283,18 @@ message HttpBackendConfig {
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
 
-  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
-  optional string ca_cert_path = 4;
+  // Optional inline PEM CA certificate bundle used instead of host trust roots for TLS verification.
+  optional string ca_cert = 4;
 
-  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert.
   bool insecure_skip_verify = 5;
 
-  // Optional PEM client certificate presented for TLS client authentication on `https://` origins.
-  // Must be set together with client_key_path.
-  optional string client_cert_path = 6;
+  // Optional inline PEM client certificate chain presented for TLS client authentication.
+  // Must be set together with client_key.
+  optional string client_cert = 6;
 
-  // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
-  optional string client_key_path = 7;
+  // Optional inline PEM private key for client_cert. Must be set together with client_cert.
+  optional string client_key = 7;
 }
 
 message S3BackendConfig {
@@ -309,18 +309,30 @@ message S3BackendConfig {
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
 
-  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
-  optional string ca_cert_path = 4;
+  // Optional inline PEM CA certificate bundle used instead of host trust roots for TLS verification.
+  optional string ca_cert = 4;
 
-  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert.
   bool insecure_skip_verify = 5;
 
-  // Optional PEM client certificate presented for TLS client authentication on `https://` origins.
-  // Must be set together with client_key_path.
-  optional string client_cert_path = 6;
+  // Optional inline PEM client certificate chain presented for TLS client authentication.
+  // Must be set together with client_key.
+  optional string client_cert = 6;
 
-  // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
-  optional string client_key_path = 7;
+  // Optional inline PEM private key for client_cert. Must be set together with client_cert.
+  optional string client_key = 7;
+
+  // AWS region used for Signature Version 4. Required with static credentials.
+  optional string region = 8;
+
+  // Static S3 access key ID. Must be set together with region and secret_access_key.
+  optional string access_key_id = 9;
+
+  // Static S3 secret access key. Must be set together with region and access_key_id.
+  optional string secret_access_key = 10;
+
+  // Optional session token for temporary static credentials.
+  optional string session_token = 11;
 }
 
 message AzureBackendConfig {
@@ -335,18 +347,18 @@ message AzureBackendConfig {
   // Maximum concurrent origin HTTP fetches. Defaults to 64 when unset.
   optional uint32 http_concurrency = 3;
 
-  // Optional CA certificate bundle/path used for TLS verification on `https://` origins.
-  optional string ca_cert_path = 4;
+  // Optional inline PEM CA certificate bundle used instead of host trust roots for TLS verification.
+  optional string ca_cert = 4;
 
-  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert_path.
+  // Skips TLS certificate verification on `https://` origins. Mutually exclusive with ca_cert.
   bool insecure_skip_verify = 5;
 
-  // Optional PEM client certificate presented for TLS client authentication on `https://` origins.
-  // Must be set together with client_key_path.
-  optional string client_cert_path = 6;
+  // Optional inline PEM client certificate chain presented for TLS client authentication.
+  // Must be set together with client_key.
+  optional string client_cert = 6;
 
-  // Optional PEM private key for client_cert_path. Must be set together with client_cert_path.
-  optional string client_key_path = 7;
+  // Optional inline PEM private key for client_cert. Must be set together with client_cert.
+  optional string client_key = 7;
 }
 
 message FakeBackendConfig {

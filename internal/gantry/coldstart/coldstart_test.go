@@ -16,6 +16,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // stubCoord returns canned PullIntent / PleasePullOutcome per node.
@@ -29,6 +30,7 @@ type stubCoord struct {
 	pleasePullRepos []string
 	pleasePullKinds []ifaces.OriginRefKind
 	pleasePullDgs   [][]digest.Digest
+	pleasePullAuth  []string
 	pleasePullErrs  map[ifaces.NodeID]error
 	// pleasePullOutcomes, when non-nil for a given (node, digest), is
 	// returned verbatim from PleasePull. Used by rule-7 cooldown /
@@ -49,7 +51,7 @@ func (s *stubCoord) PullIntentQuery(_ context.Context, id ifaces.NodeID, _ diges
 	return s.intents[id], nil
 }
 
-func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+func (s *stubCoord) PleasePull(ctx context.Context, id ifaces.NodeID, registry, repository string, kind ifaces.OriginRefKind, ds []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -57,6 +59,7 @@ func (s *stubCoord) PleasePull(_ context.Context, id ifaces.NodeID, registry, re
 	s.pleasePullRegs = append(s.pleasePullRegs, registry)
 	s.pleasePullRepos = append(s.pleasePullRepos, repository)
 	s.pleasePullKinds = append(s.pleasePullKinds, kind)
+	s.pleasePullAuth = append(s.pleasePullAuth, registryauth.Authorization(ctx))
 	// Copy ds so the caller can reuse the slice without aliasing.
 	dsCopy := append([]digest.Digest(nil), ds...)
 
@@ -138,6 +141,56 @@ func buildResolver(t *testing.T, coord ifaces.Coordinator, disco coldstart.Disco
 		PollManifest:         20 * time.Millisecond,
 		PollLayer:            50 * time.Millisecond,
 		TransientCooldownCap: 30 * time.Second,
+	})
+}
+
+// buildResolverWithReplicas mirrors buildResolver but sets
+// PrefetchPullerReplicas so prefetch fan-out can be exercised.
+func buildResolverWithReplicas(t *testing.T, coord ifaces.Coordinator, disco coldstart.Discovery, self ifaces.NodeID, members []ifaces.Node, replicas int, metrics coldstart.MetricsHooks) *coldstart.Resolver {
+	t.Helper()
+
+	mems := fakes.NewMembers(self, members...)
+	now := time.Now
+	infl := inflight.New(inflight.DefaultStalls(), now)
+
+	return coldstart.New(coldstart.Options{
+		Members:                mems,
+		Discovery:              disco,
+		Coord:                  coord,
+		Inflight:               infl,
+		Now:                    now,
+		HrwK:                   3,
+		HrwScope:               hrw.ScopeCluster,
+		PrefetchPullerReplicas: replicas,
+		Metrics:                metrics,
+		QueryTimeout:           200 * time.Millisecond,
+		PollManifest:           20 * time.Millisecond,
+		PollLayer:              50 * time.Millisecond,
+		TransientCooldownCap:   30 * time.Second,
+	})
+}
+
+func buildResolverWithFraction(t *testing.T, coord ifaces.Coordinator, disco coldstart.Discovery, self ifaces.NodeID, members []ifaces.Node, fraction float64) *coldstart.Resolver {
+	t.Helper()
+
+	mems := fakes.NewMembers(self, members...)
+	now := time.Now
+	infl := inflight.New(inflight.DefaultStalls(), now)
+
+	return coldstart.New(coldstart.Options{
+		Members:                mems,
+		Discovery:              disco,
+		Coord:                  coord,
+		Inflight:               infl,
+		Now:                    now,
+		HrwK:                   3,
+		HrwScope:               hrw.ScopeCluster,
+		PrefetchPullerReplicas: 8,
+		PrefetchPullerFraction: fraction,
+		QueryTimeout:           200 * time.Millisecond,
+		PollManifest:           20 * time.Millisecond,
+		PollLayer:              50 * time.Millisecond,
+		TransientCooldownCap:   30 * time.Second,
 	})
 }
 
@@ -224,6 +277,37 @@ func TestRule1_FailureShortCircuitBeatsCacheHit(t *testing.T) {
 	_, err := r.Resolve(context.Background(), d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
 	if !errors.Is(err, coldstart.ErrFailureShortCircuit) {
 		t.Fatalf("err = %v; want ErrFailureShortCircuit", err)
+	}
+}
+
+func TestRule1_DelegatedAuthorizationBypassesCredentialSpecificFailure(t *testing.T) {
+	for _, class := range []ifaces.FailureClass{ifaces.FailureAuth, ifaces.FailureNotFound, ifaces.FailureRateLimited} {
+		t.Run(string(class), func(t *testing.T) {
+			d := digest.MustParse("sha256:" + rep('b', 64))
+			nodes := clusterNodes()
+
+			top := hrw.TopK(nodes, d, 3)
+			if len(top) < 2 {
+				t.Fatal("need at least 2 nodes in top-K")
+			}
+
+			cacheHolder := top[0].Node.ID
+			coord := &stubCoord{intents: map[ifaces.NodeID]ifaces.PullIntent{
+				cacheHolder:    {HasCached: true},
+				top[1].Node.ID: {RecentlyFailed: true, FailureClass: class},
+			}}
+			r := buildResolver(t, coord, &stubDisco{}, "self", nodes, coldstart.MetricsHooks{}, time.Now)
+			ctx := registryauth.WithAuthorization(context.Background(), "Bearer requester-token")
+
+			res, err := r.Resolve(ctx, d, ifaces.KindManifest, "reg.example.com", "test/repo", 0)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			if len(res.Providers) == 0 || res.Providers[0].NodeID != cacheHolder {
+				t.Fatalf("providers = %+v, want cache holder %s", res.Providers, cacheHolder)
+			}
+		})
 	}
 }
 

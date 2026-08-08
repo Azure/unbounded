@@ -77,7 +77,7 @@ prereq CLIs:
 | `bootCluster()` | `kind create cluster --config kind-config.yaml` |
 | `buildAndLoadImage()` | `deploy/build.sh -t e2e` then `kind load docker-image gantry:e2e` |
 | `applyManifests()` | rewrites the DaemonSet image to `gantry:e2e` then `kubectl apply -f deploy/` (NetworkPolicy is intentionally NOT applied - `deploy/examples/networkpolicy.yaml` is a templated production reference with placeholder CIDRs that fail validation in kind; a kind-friendly hardening overlay is a separate work item) |
-| `waitForRollout()` | polls `kubectl rollout status ds/gantry -n gantry-system` |
+| `waitForRollout()` | polls `kubectl rollout status ds/gantry -n unbounded-system` |
 | `checkReadyz()` | port-forwards one Gantry pod and curls `/readyz` on port 9095 |
 | pull-through check | installs `hosts.toml` on each kind node, removes the test image from node-local containerd, schedules a pull on worker A, waits for advertise metrics, then schedules the same image on worker B and waits for `p2p_peer_fetch_total{outcome="hit"}` |
 | `teardown()` | `kind delete cluster` (skipped when `E2E_KEEP=1`) |

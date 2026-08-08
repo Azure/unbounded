@@ -71,6 +71,15 @@ For that reason, these are intentionally not operation names:
 conditions that identify the executor and failure reason. Completed and failed
 operations may be removed with `spec.ttlSecondsAfterFinished`.
 
+Controllers for providers with long-running operations persist the accepted
+provider operation handle in the matching `status.targets[]` entry and poll it
+one step per reconciliation. Begin callbacks must be idempotent for the stable
+`MachineOperation` UID because they may be repeated until the handle is
+persisted. Each provider request uses the provider ID from the current Machine.
+Host operations targeting the same Machine are serialized. This keeps provider
+operations resumable without changing the four-phase MachineOperation
+lifecycle.
+
 ## Risks and open questions
 
 If no component claims an operation, the operation may remain pending forever.

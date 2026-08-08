@@ -6,6 +6,7 @@ package host
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -27,6 +28,8 @@ const (
 	checkHostOSConfigurationName = "host-os-configuration"
 	checkNSpawnRuntimeName       = "nspawn-runtime"
 	checkDockerActiveName        = "docker-active"
+	checkContainerdActiveName    = "containerd-active"
+	checkKubeletActiveName       = "kubelet-active"
 	checkSwapActiveName          = "swap-active"
 	checkDiskSpaceName           = "disk-space"
 	checkCgroupsName             = "cgroups"
@@ -70,17 +73,23 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 // Preflight returns the standard host environment checks required before
 // provisioning an nspawn machine.
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
-	return []preflight.Checker{
+	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
+		CheckExistingDeployment(log),
 		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
 		CheckHostOSConfiguration(log),
 		CheckNSpawnRuntime(log),
 		CheckDockerActive(log),
+		CheckContainerdActive(log),
+		CheckKubeletActive(log),
 		CheckSwapActive(log),
 		CheckDiskSpace(log),
 		CheckCgroups(log),
 		CheckNvidiaDriver(log),
+		checkLocalDNSConntrack(log, cfg, defaultLocalDNSConntrackDeps()),
 	}
+
+	return checks
 }
 
 // CheckIsPrivilegedUser verifies preflight is running as root.
@@ -254,24 +263,62 @@ func CheckDockerActive(log *slog.Logger) preflight.Checker {
 }
 
 func checkDockerActive(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
-	return simpleHostChecker{name: checkDockerActiveName, check: func(ctx context.Context) []preflight.Result {
-		out, err := deps.outputCmd(ctx, log, "systemctl", "is-active", dockerServiceUnit)
+	return checkSystemdUnitActive(log, deps, checkDockerActiveName, dockerServiceUnit, "Docker")
+}
+
+// CheckContainerdActive warns when the host containerd service is active.
+func CheckContainerdActive(log *slog.Logger) preflight.Checker {
+	return checkContainerdActive(log, defaultHostCheckDeps())
+}
+
+func checkContainerdActive(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+	return checkSystemdUnitActive(log, deps, checkContainerdActiveName, containerdServiceUnit, "containerd")
+}
+
+// CheckKubeletActive warns when the host kubelet service is active.
+func CheckKubeletActive(log *slog.Logger) preflight.Checker {
+	return checkKubeletActive(log, defaultHostCheckDeps())
+}
+
+func checkKubeletActive(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+	return checkSystemdUnitActive(log, deps, checkKubeletActiveName, kubeletServiceUnit, "kubelet")
+}
+
+func checkSystemdUnitActive(
+	log *slog.Logger,
+	deps hostCheckDeps,
+	checkName string,
+	unit string,
+	serviceName string,
+) preflight.Checker {
+	return simpleHostChecker{name: checkName, check: func(ctx context.Context) []preflight.Result {
+		out, err := deps.outputCmd(ctx, log, "systemctl", "is-active", unit)
 		log.Debug(
-			"checked Docker unit state",
-			"unit", dockerServiceUnit,
+			"checked host systemd unit state",
+			"unit", unit,
 			"state", strings.TrimSpace(out),
 			"error", err != nil,
 		)
 
-		if err == nil && strings.TrimSpace(out) == "active" {
+		if err != nil {
 			return preflight.ResultsWarning(
-				checkDockerActiveName,
-				"docker service",
-				"Docker is active and bootstrap will disable it",
+				checkName,
+				unit,
+				"%s state could not be determined",
+				serviceName,
 			)
 		}
 
-		return preflight.ResultsOK(checkDockerActiveName, "docker service", "Docker is not active")
+		if strings.TrimSpace(out) == "active" {
+			return preflight.ResultsWarning(
+				checkName,
+				unit,
+				"%s is active and bootstrap will disable it",
+				serviceName,
+			)
+		}
+
+		return preflight.ResultsOK(checkName, unit, fmt.Sprintf("%s is not active", serviceName))
 	}}
 }
 

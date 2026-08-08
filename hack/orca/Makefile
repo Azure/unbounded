@@ -22,7 +22,7 @@ REPO_ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 # kind-up.sh; override on the command line if your install used a
 # non-default context or namespace.
 CLUSTER_NAME ?= orca-dev
-NAMESPACE    ?= unbounded-kube
+NAMESPACE    ?= unbounded-system
 KUBECTL_CTX   = kind-$(CLUSTER_NAME)
 
 .PHONY: help status logs port-forward

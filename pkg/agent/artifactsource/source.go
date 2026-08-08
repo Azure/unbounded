@@ -8,8 +8,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/pkg/agent/internal/ociartifact"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
@@ -29,23 +34,80 @@ const (
 	sourceOCI
 )
 
-var httpClient = &http.Client{
-	Timeout: 10 * time.Minute,
+const (
+	httpDownloadMaxAttempts = 5
+	httpDownloadRetryDelay  = 2 * time.Second
+)
+
+var (
+	httpClient = newHTTPClient(&retry.Transport{
+		Policy: newHTTPDownloadRetryPolicy,
+	})
+	httpClientWithoutRetry = newHTTPClient(nil)
+)
+
+func newHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Timeout:       10 * time.Minute,
+		CheckRedirect: utilio.CheckRedirectNoHTTPSDowngrade,
+		Transport:     transport,
+	}
 }
 
-// Source is a parsed artifact source. It can reference an absolute local path,
-// file:// URL, HTTP(S) URL, or OCI artifact blob using oci://...#title.
+func newHTTPDownloadRetryPolicy() retry.Policy {
+	return &retry.GenericPolicy{
+		Retryable: retryHTTPDownloadFailure,
+		Backoff:   httpDownloadBackoff,
+		MinWait:   httpDownloadRetryDelay,
+		MaxWait:   maxHTTPDownloadRetryDelay(),
+		MaxRetry:  httpDownloadMaxAttempts - 1,
+	}
+}
+
+func retryHTTPDownloadFailure(resp *http.Response, err error) (bool, error) {
+	if ociutil.RetryableNetworkError(err) {
+		return true, nil
+	}
+
+	if resp == nil {
+		return false, nil
+	}
+
+	return retry.DefaultPredicate(resp, err)
+}
+
+func httpDownloadBackoff(attempt int, _ *http.Response) time.Duration {
+	delay := httpDownloadRetryDelay
+	for range attempt {
+		delay *= 2
+	}
+
+	return delay
+}
+
+func maxHTTPDownloadRetryDelay() time.Duration {
+	delay := httpDownloadRetryDelay
+	for range httpDownloadMaxAttempts - 2 {
+		delay *= 2
+	}
+
+	return delay
+}
+
+// Source is a parsed, openable artifact source. It can reference an absolute
+// local path, file:// URL, HTTP(S) URL, or OCI artifact blob using
+// oci://...#title.
 type Source struct {
 	raw       string
 	kind      sourceKind
 	localPath string
 }
 
-// Parse validates and parses an artifact source string.
+// Parse validates and parses an openable artifact source string.
 func Parse(source string) (Source, error) {
 	parsed, err := url.Parse(source)
 	if err != nil {
-		return Source{}, fmt.Errorf("parse artifact source %q: %w", source, err)
+		return Source{}, fmt.Errorf("parse artifact source: %w", utilio.RedactHTTPError(err))
 	}
 
 	switch parsed.Scheme {
@@ -56,6 +118,14 @@ func Parse(source string) (Source, error) {
 	case "http", "https":
 		return Source{raw: source, kind: sourceHTTP}, nil
 	case "oci":
+		if parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {
+			return Source{}, fmt.Errorf("OCI artifact source must include registry and repository")
+		}
+
+		if parsed.User != nil || parsed.RawQuery != "" {
+			return Source{}, fmt.Errorf("OCI artifact source must not include user info or query parameters")
+		}
+
 		if strings.TrimPrefix(parsed.Fragment, "/") == "" {
 			return Source{}, fmt.Errorf("OCI artifact source must include a blob title fragment")
 		}
@@ -114,72 +184,236 @@ func (s Source) Open(ctx context.Context) (io.ReadCloser, error) {
 }
 
 func openHTTP(ctx context.Context, source string) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, http.NoBody)
+	return openHTTPWithClient(ctx, httpClient, source)
+}
+
+func openHTTPWithClient(ctx context.Context, client *http.Client, source string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to create HTTP request: %w", utilio.RedactHTTPError(err))
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to perform HTTP request: %w", err)
+		return nil, fmt.Errorf("failed to perform HTTP request: %w", utilio.RedactHTTPError(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close() //nolint:errcheck // body close
-		return nil, fmt.Errorf("download %q failed with status code %d", source, resp.StatusCode)
+		return nil, &httpDownloadStatusError{source: source, statusCode: resp.StatusCode}
 	}
 
 	return resp.Body, nil
 }
 
-// DownloadToLocalFile downloads the artifact source to filename and sets perm.
-func (s Source) DownloadToLocalFile(ctx context.Context, filename string, perm os.FileMode) error {
-	body, err := s.Open(ctx)
-	if err != nil {
-		return err
-	}
-	defer body.Close() //nolint:errcheck // body close
+type httpDownloadStatusError struct {
+	source     string
+	statusCode int
+}
 
-	return utilio.InstallFile(filename, body, perm)
+func (e *httpDownloadStatusError) Error() string {
+	return fmt.Sprintf("download %q failed with status code %d", utilio.RedactURLQuery(e.source), e.statusCode)
+}
+
+// ReadAll reads the complete artifact source.
+func (s Source) ReadAll(ctx context.Context) ([]byte, error) {
+	var data []byte
+
+	err := s.readWithRetry(ctx, func(body io.Reader) error {
+		var err error
+
+		data, err = io.ReadAll(body)
+		if err != nil {
+			return fmt.Errorf("read artifact source: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+// DownloadToLocalFileOption configures DownloadToLocalFile.
+type DownloadToLocalFileOption func(*downloadToLocalFileOptions) error
+
+type downloadToLocalFileOptions struct {
+	tarGzFile string
+}
+
+// ExtractTarGzFile installs the first regular file in a tar.gz source whose
+// base name matches filename, instead of installing the archive itself.
+func ExtractTarGzFile(filename string) DownloadToLocalFileOption {
+	return func(options *downloadToLocalFileOptions) error {
+		filename = strings.TrimSpace(filename)
+		if filename == "" || filepath.Base(filename) != filename {
+			return fmt.Errorf("tar.gz filename must be a non-empty base name: %q", filename)
+		}
+
+		options.tarGzFile = filename
+
+		return nil
+	}
+}
+
+// DownloadToLocalFile downloads the artifact source to filename and sets perm.
+func (s Source) DownloadToLocalFile(ctx context.Context, filename string, perm os.FileMode, optionFuncs ...DownloadToLocalFileOption) error {
+	options := downloadToLocalFileOptions{}
+	for _, apply := range optionFuncs {
+		if err := apply(&options); err != nil {
+			return err
+		}
+	}
+
+	return s.downloadToLocalFile(ctx, filename, perm, options, waitForHTTPDownloadRetry)
+}
+
+func (s Source) downloadToLocalFile(
+	ctx context.Context,
+	filename string,
+	perm os.FileMode,
+	options downloadToLocalFileOptions,
+	wait func(context.Context, time.Duration) error,
+) error {
+	return s.readWithRetryAndWait(ctx, func(body io.Reader) error {
+		if options.tarGzFile == "" {
+			return utilio.InstallFile(filename, body, perm)
+		}
+
+		for file, err := range utilio.DecompressTarGz(body) {
+			if err != nil {
+				return fmt.Errorf("read tar.gz artifact: %w", err)
+			}
+
+			if filepath.Base(file.Name) == options.tarGzFile {
+				return utilio.InstallFile(filename, file.Body, perm)
+			}
+		}
+
+		return fmt.Errorf("tar.gz artifact does not contain %q", options.tarGzFile)
+	}, wait)
 }
 
 // DownloadWithSHA256Verification downloads the artifact source to filename and
 // verifies the downloaded content against expectedHash.
 func (s Source) DownloadWithSHA256Verification(ctx context.Context, expectedHash, filename string, perm os.FileMode) error {
-	body, err := s.Open(ctx)
-	if err != nil {
-		return err
-	}
-	defer body.Close() //nolint:errcheck // body close
+	return s.readWithRetry(ctx, func(body io.Reader) error {
+		hasher := sha256.New()
+		teeReader := io.TeeReader(body, hasher)
 
-	hasher := sha256.New()
-	teeReader := io.TeeReader(body, hasher)
+		if err := utilio.InstallFile(filename, teeReader, perm); err != nil {
+			return err
+		}
 
-	if err := utilio.InstallFile(filename, teeReader, perm); err != nil {
-		return err
-	}
+		actualHash := hex.EncodeToString(hasher.Sum(nil))
+		if actualHash != expectedHash {
+			_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
+			return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", utilio.RedactURLQuery(s.raw), expectedHash, actualHash)
+		}
 
-	actualHash := hex.EncodeToString(hasher.Sum(nil))
-	if actualHash != expectedHash {
-		_ = os.Remove(filename) //nolint:errcheck // best-effort cleanup
-		return fmt.Errorf("SHA256 mismatch for %q: expected %s, got %s", s.raw, expectedHash, actualHash)
+		return nil
+	})
+}
+
+func (s Source) readWithRetry(ctx context.Context, read func(io.Reader) error) error {
+	return s.readWithRetryAndWait(ctx, read, waitForHTTPDownloadRetry)
+}
+
+func (s Source) readWithRetryAndWait(ctx context.Context, read func(io.Reader) error, wait func(context.Context, time.Duration) error) error {
+	delay := httpDownloadRetryDelay
+
+	for attempt := 1; attempt <= httpDownloadMaxAttempts; attempt++ {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+
+		body, err := s.openForRead(ctx)
+		if err == nil {
+			err = read(body)
+			_ = body.Close() //nolint:errcheck // best effort close before retrying
+		}
+
+		if err == nil {
+			return nil
+		}
+
+		if s.kind != sourceHTTP || !retryableHTTPDownloadError(ctx, err) || attempt == httpDownloadMaxAttempts {
+			return err
+		}
+
+		if err := wait(ctx, delay); err != nil {
+			return err
+		}
+
+		delay *= 2
 	}
 
 	return nil
 }
 
+func (s Source) openForRead(ctx context.Context) (io.ReadCloser, error) {
+	if s.kind == sourceHTTP {
+		return openHTTPWithClient(ctx, httpClientWithoutRetry, s.raw)
+	}
+
+	return s.Open(ctx)
+}
+
+func retryableHTTPDownloadError(ctx context.Context, err error) bool {
+	if context.Cause(ctx) != nil {
+		return false
+	}
+
+	if ociutil.RetryableNetworkError(err) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	var statusErr *httpDownloadStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+
+	retryable, predicateErr := retry.DefaultPredicate(&http.Response{StatusCode: statusErr.statusCode}, nil)
+
+	return predicateErr == nil && retryable
+}
+
+func waitForHTTPDownloadRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
 // ReadExpectedSHA256 reads a sha256sum-format checksum source and returns the
 // expected hex-encoded SHA256 hash.
 func ReadExpectedSHA256(ctx context.Context, checksumSource Source) (string, error) {
-	body, err := checksumSource.Open(ctx)
+	var raw []byte
+
+	err := checksumSource.readWithRetry(ctx, func(body io.Reader) error {
+		var err error
+
+		raw, err = io.ReadAll(io.LimitReader(body, 1024))
+		if err != nil {
+			return fmt.Errorf("read checksum body: %w", err)
+		}
+
+		return nil
+	})
 	if err != nil {
 		return "", err
-	}
-	defer body.Close() //nolint:errcheck // body close
-
-	raw, err := io.ReadAll(io.LimitReader(body, 1024))
-	if err != nil {
-		return "", fmt.Errorf("read checksum body: %w", err)
 	}
 
 	hashStr := strings.TrimSpace(string(raw))
@@ -196,6 +430,17 @@ func ReadExpectedSHA256(ctx context.Context, checksumSource Source) (string, err
 	}
 
 	return hashStr, nil
+}
+
+// ExtractTar extracts a tar or gzip-compressed tar artifact into destDir.
+func (s Source) ExtractTar(ctx context.Context, destDir string) error {
+	body, err := s.Open(ctx)
+	if err != nil {
+		return err
+	}
+	defer body.Close() //nolint:errcheck // best effort close
+
+	return utilio.ExtractTar(body, destDir)
 }
 
 // DecompressTarGz returns an iterator that yields files from a gzip-compressed

@@ -21,7 +21,8 @@
 // loop-breaker that prevents two agents from recursing into each
 // other's miss paths.
 // - `Range: bytes=N-M` returns `206 Partial Content` with the correct
-// `Content-Range`. v1 callers always fetch whole blobs, but the
+// `Content-Range`. Resumable peer callers use this to continue a live stream
+// from another provider without retransmitting the verified prefix; the
 // contract is preserved for v2 striping.
 // - Metric `p2p_peer_serve_total` is bumped per served body - not
 // `p2p_cache_hit_total`, so cluster scrapes distinguish containerd-
@@ -46,6 +47,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
 
 // MirroredHeader is the OCI-extension header peers MUST include on every
@@ -58,6 +60,10 @@ type Server struct {
 	describer Describer
 	logger    *slog.Logger
 	metrics   metricsHooks
+	// serveSem, when non-nil, caps concurrent blob-body serves. A full
+	// channel means the server is at capacity and further blob GETs are
+	// shed with 429 so the requester re-discovers another provider.
+	serveSem chan struct{}
 }
 
 // Describer is an optional capability that callers (typically the
@@ -75,8 +81,9 @@ type Describer interface {
 }
 
 type metricsHooks struct {
-	onPeerServe func()
-	onPeerMiss  func()
+	onPeerServe      func()
+	onPeerMiss       func()
+	onPeerServeBytes func(kind string, bytes int64)
 }
 
 // Option configures a Server.
@@ -98,6 +105,15 @@ func WithMetrics(onPeerServe, onPeerMiss func()) Option {
 	}
 }
 
+// WithByteMetrics registers a callback for bytes actually transmitted to peer
+// agents. HEAD requests emit no bytes, and Range requests count only the range
+// body sent on the wire.
+func WithByteMetrics(onPeerServeBytes func(kind string, bytes int64)) Option {
+	return func(s *Server) {
+		s.metrics.onPeerServeBytes = onPeerServeBytes
+	}
+}
+
 // WithDescriber registers an optional media-type lookup for cached
 // digests. Wire this with the containerdstore.Store so manifest
 // responses carry the correct OCI/Docker media type instead of
@@ -105,6 +121,21 @@ func WithMetrics(onPeerServe, onPeerMiss func()) Option {
 func WithDescriber(d Describer) Option {
 	return func(s *Server) {
 		s.describer = d
+	}
+}
+
+// WithMaxConcurrentServes caps concurrent peer blob-body serves. When the cap
+// is reached, further blob GETs receive 429 Too Many Requests with a
+// Retry-After hint so the requester re-selects another provider instead of
+// queueing behind a saturated seed. That load-shedding is what lets the first
+// finishers complete early and seed the swarm (the cascade). n <= 0 means
+// unlimited. HEAD requests and manifest serves are never capped: they are
+// cheap and are needed for discovery and verification.
+func WithMaxConcurrentServes(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.serveSem = make(chan struct{}, n)
+		}
 	}
 }
 
@@ -185,6 +216,22 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind) {
+	// Shed load on a saturated seed so the requester re-discovers another
+	// provider (the cascade) instead of queueing behind us. Only full
+	// blob-body GETs are capped: HEADs are cheap and manifests are small and
+	// needed for discovery/verification.
+	if r.Method == http.MethodGet && kind == ifaces.KindBlob {
+		release, ok := s.tryAcquireServe()
+		if !ok {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "peer serving at capacity", http.StatusTooManyRequests)
+
+			return
+		}
+
+		defer release()
+	}
+
 	rc, size, err := s.openBlob(r.Context(), d)
 	if err != nil {
 		var enf *ifaces.ErrNotFound
@@ -240,7 +287,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 			return
 		}
 
-		if _, err := io.Copy(w, rc); err != nil {
+		written, err := streamcopy.CopyN(w, rc, size)
+		s.bumpServeBytes(kind, written)
+
+		if err != nil {
 			s.logger.Debug("transfer: copy failed", slog.Any("err", err))
 		}
 
@@ -258,28 +308,40 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 	}
 
 	length := end - start + 1
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	w.WriteHeader(http.StatusPartialContent)
 
 	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+		w.WriteHeader(http.StatusPartialContent)
 		s.bumpServe()
+
 		return
 	}
 
 	rs, isSeeker := rc.(io.ReadSeeker)
 	if !isSeeker {
 		// Fall back to discarding the unwanted prefix.
-		if _, err := io.CopyN(io.Discard, rc, start); err != nil {
-			s.logger.Debug("transfer: discard prefix failed", slog.Any("err", err))
+		if _, err := streamcopy.CopyN(io.Discard, rc, start); err != nil {
+			s.logger.Warn("transfer: discard prefix failed", slog.Any("err", err))
+			http.Error(w, "range positioning failed", http.StatusInternalServerError)
+
 			return
 		}
 	} else if _, err := rs.Seek(start, io.SeekStart); err != nil {
-		s.logger.Debug("transfer: seek failed", slog.Any("err", err))
+		s.logger.Warn("transfer: seek failed", slog.Any("err", err))
+		http.Error(w, "range positioning failed", http.StatusInternalServerError)
+
 		return
 	}
 
-	if _, err := io.CopyN(w, rc, length); err != nil {
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.WriteHeader(http.StatusPartialContent)
+
+	written, err := streamcopy.CopyN(w, rc, length)
+	s.bumpServeBytes(kind, written)
+
+	if err != nil {
 		s.logger.Debug("transfer: range copy failed", slog.Any("err", err))
 	}
 
@@ -289,6 +351,32 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 func (s *Server) bumpServe() {
 	if s.metrics.onPeerServe != nil {
 		s.metrics.onPeerServe()
+	}
+}
+
+func (s *Server) bumpServeBytes(kind ifaces.OriginRefKind, bytes int64) {
+	if bytes <= 0 || s.metrics.onPeerServeBytes == nil {
+		return
+	}
+
+	s.metrics.onPeerServeBytes(kind.MetricLabel(), bytes)
+}
+
+// tryAcquireServe reserves a serve slot without blocking. The returned release
+// func MUST be called when the serve completes. ok is false when the server is
+// already at its configured serve cap; callers should shed the request (429)
+// rather than block. When no cap is configured (serveSem nil), it always
+// succeeds with a no-op release.
+func (s *Server) tryAcquireServe() (release func(), ok bool) {
+	if s.serveSem == nil {
+		return func() {}, true
+	}
+
+	select {
+	case s.serveSem <- struct{}{}:
+		return func() { <-s.serveSem }, true
+	default:
+		return nil, false
 	}
 }
 

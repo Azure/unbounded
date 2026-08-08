@@ -44,6 +44,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/inflight"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // Sentinel errors. Mirror layer maps all of these to 5xx; tests
@@ -110,6 +111,8 @@ type MetricsHooks struct {
 	// `p2p_prefetch_batches_total` (count) and
 	// `p2p_prefetch_digests_batched_total` (sum).
 	OnPrefetchBatch func(pullers, digests int)
+	// OnPrefetchGroup fires once per local or remote dispatch group.
+	OnPrefetchGroup func(target, outcome string)
 }
 
 // Options configures a Resolver.
@@ -124,6 +127,34 @@ type Options struct {
 	HrwK      int       // default 3
 	HrwScope  hrw.Scope // default ScopeCluster
 	SelfZone  string    // required when HrwScope == ScopeZone
+
+	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
+	// prefetched layer digest is dispatched to. 1 designates a single origin
+	// puller per layer (tightest dedup, but the whole swarm then fans out
+	// from ONE initial seed, which bottlenecks a cold thundering-herd and
+	// makes peer transfers pile up and stall). N>1 dispatches please_pull to
+	// the top-N pullers in parallel, giving N initial seeds so peer transfers
+	// fan out N-fold, at the cost of up to N origin copies of each layer.
+	// Default 1.
+	PrefetchPullerReplicas int
+
+	// PrefetchPullerFraction overrides PrefetchPullerReplicas when greater
+	// than zero. The resolver selects ceil(eligible candidates * fraction),
+	// with a minimum of one and no cap other than the candidate count.
+	PrefetchPullerFraction float64
+	// PrefetchCoordinatorReplicas limits remote speculative dispatch to the
+	// top-N HRW nodes for a shared coordination key (the manifest digest for
+	// production callers). Every caller still starts any self-selected local
+	// pull, and the demand path recovers when none of the coordinators consumed
+	// the manifest. Zero preserves all-caller dispatch for direct callers and
+	// tests.
+	PrefetchCoordinatorReplicas int
+	// PrefetchMaxConcurrentGroups caps simultaneous remote dispatch groups.
+	// Zero uses 64.
+	PrefetchMaxConcurrentGroups int
+	// PrefetchDispatchJitter is disabled at zero. Production config defaults
+	// it to one second; direct tests can remain deterministic and immediate.
+	PrefetchDispatchJitter time.Duration
 
 	// LocalIntent computes self's PullIntent synchronously, without
 	// the libp2p coord round-trip. When non-nil, the cold-start
@@ -221,6 +252,10 @@ func New(opts Options) *Resolver {
 		opts.QueryTimeout = 2 * time.Second
 	}
 
+	if opts.PrefetchMaxConcurrentGroups <= 0 {
+		opts.PrefetchMaxConcurrentGroups = 64
+	}
+
 	if opts.PollManifest <= 0 {
 		opts.PollManifest = 200 * time.Millisecond
 	}
@@ -239,6 +274,10 @@ func New(opts Options) *Resolver {
 
 	if opts.TopKExpansionFactor < 2 {
 		opts.TopKExpansionFactor = 2
+	}
+
+	if opts.PrefetchPullerReplicas < 1 {
+		opts.PrefetchPullerReplicas = 1
 	}
 
 	if len(opts.TrustedFailureClasses) == 0 {
@@ -481,7 +520,16 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 	reachable := reachableResponses(responses)
 
 	// Rule 1: failure short-circuit.
-	if v := findFailureShortCircuit(reachable, r.opts.TrustedFailureClasses); v != nil {
+	trustedFailureClasses := r.opts.TrustedFailureClasses
+	if registryauth.Authorization(ctx) != "" {
+		trustedFailureClasses = withoutFailureClasses(trustedFailureClasses,
+			ifaces.FailureAuth,
+			ifaces.FailureNotFound,
+			ifaces.FailureRateLimited,
+		)
+	}
+
+	if v := findFailureShortCircuit(reachable, trustedFailureClasses); v != nil {
 		return nil, prefix(expandLabel, "rule1_failure"), ErrFailureShortCircuit
 	}
 
@@ -569,7 +617,7 @@ func (r *Resolver) probe(ctx context.Context, d digest.Digest, kind ifaces.Origi
 		// Pull is committed (or already running) - falls through
 		// to the DHT poll below.
 	case ifaces.PleasePullRecentlyFailed:
-		if isTrustedFailureClass(outcome.FailureClass, r.opts.TrustedFailureClasses) {
+		if isTrustedFailureClass(outcome.FailureClass, trustedFailureClasses) {
 			// auth / not_found / rate_limited: the puller's local
 			// negative cache reports a class for which retry-now
 			// is provably useless cluster-wide. Identical handling
@@ -703,6 +751,22 @@ func isTrustedFailureClass(class ifaces.FailureClass, trusted []ifaces.FailureCl
 	}
 
 	return false
+}
+
+func withoutFailureClasses(classes []ifaces.FailureClass, excluded ...ifaces.FailureClass) []ifaces.FailureClass {
+	excludedSet := make(map[ifaces.FailureClass]struct{}, len(excluded))
+	for _, class := range excluded {
+		excludedSet[class] = struct{}{}
+	}
+
+	out := make([]ifaces.FailureClass, 0, len(classes))
+	for _, class := range classes {
+		if _, skip := excludedSet[class]; !skip {
+			out = append(out, class)
+		}
+	}
+
+	return out
 }
 
 func findCacheHit(rs []response) *response {

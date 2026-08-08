@@ -4,9 +4,8 @@
 
 # hack/test-goreleaser-hook.sh
 #
-# Tests that the goreleaser pre-hooks correctly stamp the machina and
-# unbounded-net deployment manifests with the release tag before
-# building kubectl-unbounded.
+# Tests that the goreleaser pre-hooks correctly stamp the rendered manifests
+# with the release tag before building kubectl-unbounded.
 #
 # Usage: ./hack/test-goreleaser-hook.sh
 
@@ -15,13 +14,13 @@ set -euo pipefail
 TAG="v0.0.0-test"
 MANIFEST="deploy/machina/rendered/04-deployment.yaml"
 EXPECTED_IMAGE="ghcr.io/azure/machina:${TAG}"
-NET_MANIFEST="deploy/net/rendered/controller/03-deployment.yaml"
-EXPECTED_NET_IMAGE="ghcr.io/azure/unbounded-net-controller:${TAG}"
+OPERATOR_MANIFEST="deploy/unbounded-operator/rendered/04-deployment.yaml"
+EXPECTED_OPERATOR_IMAGE="ghcr.io/azure/unbounded-operator:${TAG}"
 
 # Save the original manifest so we can restore it on exit.
 cleanup() {
     echo "Restoring manifests to default..."
-    make machina-manifests net-manifests
+    make machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests
     git tag -d "$TAG" 2>/dev/null || true
     echo "Done."
 }
@@ -42,12 +41,12 @@ else
     exit 1
 fi
 
-echo "=== Checking net manifest ==="
-actual_net=$(grep 'image:' "$NET_MANIFEST" | xargs)
-if [[ "$actual_net" == *"$EXPECTED_NET_IMAGE"* ]]; then
-    echo "PASS: net manifest stamped correctly -> ${EXPECTED_NET_IMAGE}"
+echo "=== Checking unbounded-operator manifest ==="
+actual_operator=$(grep 'image:' "$OPERATOR_MANIFEST" | xargs)
+if [[ "$actual_operator" == *"$EXPECTED_OPERATOR_IMAGE"* ]]; then
+    echo "PASS: unbounded-operator manifest stamped correctly -> ${EXPECTED_OPERATOR_IMAGE}"
 else
-    echo "FAIL: expected '${EXPECTED_NET_IMAGE}' but got '${actual_net}'"
+    echo "FAIL: expected '${EXPECTED_OPERATOR_IMAGE}' but got '${actual_operator}'"
     exit 1
 fi
 
@@ -67,11 +66,18 @@ else
     exit 1
 fi
 
-if grep -qF "$EXPECTED_NET_IMAGE" <(strings "$binary"); then
-    echo "PASS: binary embeds ${EXPECTED_NET_IMAGE}"
+if grep -qF 'UNBOUNDED_IMAGE_REGISTRY' <(strings "$binary"); then
+    echo "PASS: binary embeds the component registry configuration"
 else
-    echo "FAIL: binary does not contain ${EXPECTED_NET_IMAGE}"
-    grep -F 'unbounded-net-controller:' <(strings "$binary") || true
+    echo "FAIL: binary does not contain the component registry configuration"
+    exit 1
+fi
+
+if grep -qF "$EXPECTED_OPERATOR_IMAGE" <(strings "$binary"); then
+    echo "PASS: binary embeds ${EXPECTED_OPERATOR_IMAGE}"
+else
+    echo "FAIL: binary does not contain ${EXPECTED_OPERATOR_IMAGE}"
+    grep -F 'unbounded-operator:' <(strings "$binary") || true
     exit 1
 fi
 

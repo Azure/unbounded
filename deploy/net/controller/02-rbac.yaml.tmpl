@@ -27,17 +27,32 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # Sites and GatewayPools: read access and finalizer management for controllers
+  # Sites: read access, finalizer management, and status updates for controllers.
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["sites"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["sites/status"]
+    verbs: ["get", "patch", "update"]
+  # Legacy net-group Sites: read-only, used only by SiteNodeSlice orphan cleanup
+  # during the unbounded-system migration window to distinguish a Site that has
+  # not been translated into the machina group yet (still present here) from one
+  # that is genuinely gone. Can be removed once legacy net-group Sites are fully
+  # retired.
   - apiGroups: ["net.unbounded-cloud.io"]
-    resources: ["sites", "gatewaypools"]
+    resources: ["sites"]
+    verbs: ["get", "list", "watch"]
+  # GatewayPools: read access and finalizer management for controllers
+  - apiGroups: ["net.unbounded-cloud.io"]
+    resources: ["gatewaypools"]
     verbs: ["get", "list", "watch", "update", "patch"]
   # Peering and assignment resources: read access for controllers and status aggregation
   - apiGroups: ["net.unbounded-cloud.io"]
     resources: ["sitepeerings", "sitegatewaypoolassignments", "gatewaypoolpeerings"]
     verbs: ["get", "list", "watch"]
-  # Status subresources: update observed state for sites, site peerings, gateway pools, and gateway pool nodes
+  # Status subresources: update observed state for site peerings, gateway pools, and gateway pool nodes
   - apiGroups: ["net.unbounded-cloud.io"]
-    resources: ["sites/status", "sitepeerings/status", "gatewaypools/status", "gatewaypoolnodes/status"]
+    resources: ["sitepeerings/status", "gatewaypools/status", "gatewaypoolnodes/status"]
     verbs: ["get", "patch", "update"]
   # SiteNodeSlices: full access to manage node slices
   - apiGroups: ["net.unbounded-cloud.io"]
@@ -85,7 +100,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-kube-proxy
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -101,14 +116,14 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-controller
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: unbounded-net-controller
-  namespace: {{ .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-net-controller
     app.kubernetes.io/component: controller
@@ -130,11 +145,15 @@ rules:
     resources: ["endpointslices"]
     resourceNames: ["unbounded-net-controller"]
     verbs: ["get", "update", "delete"]
-  # Endpoints: delete stale v1/Endpoints left over from previous controller versions
+  # Endpoints: leader manages the legacy resource required by APIService availability
+  # checks on Kubernetes 1.33 and earlier.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["create"]
   - apiGroups: [""]
     resources: ["endpoints"]
     resourceNames: ["unbounded-net-controller"]
-    verbs: ["delete"]
+    verbs: ["get", "update", "delete"]
   # Secrets: store serving certificate TLS material.
   # Create cannot be constrained by resourceNames in RBAC, so split create from named-object ops.
   # The create verb below allows creating arbitrary secrets in the namespace; RBAC cannot scope
@@ -169,7 +188,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: unbounded-net-controller
-  namespace: {{ .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-net-controller
     app.kubernetes.io/component: controller
@@ -180,7 +199,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-controller
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}
 
 ---
 # Role in kube-system for reading extension-apiserver-authentication ConfigMap
@@ -213,4 +232,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: unbounded-net-controller
-    namespace: {{ .Namespace }}
+    namespace: {{ default "unbounded-system" .Namespace }}

@@ -256,11 +256,11 @@ fn first_stripe_routes_remote(cfg: &LoadgenRun, object: SyntheticObjectId) -> bo
 
     let object_id = synthetic_object_id(object.seed, object.ordinal);
     let req = request_from_origin(OriginRef::new(&cfg.backend_id, &object_id, 0), cfg);
-    let Some(route) = cfg.routes.route_for_req(&req) else {
+    let Some(fingers) = cfg.routes.route_for_req(&req) else {
         return false;
     };
 
-    route.fingers.next_hop(stripe_to_ring(req.key())).is_some()
+    fingers.next_hop(stripe_to_ring(req.key())).is_some()
 }
 
 struct YieldOnce {
@@ -481,6 +481,7 @@ fn unit_f64(rng: &mut WorkerRng) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::pin::Pin;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
@@ -559,20 +560,7 @@ mod tests {
             &[peer],
             FingerTableConfig::with_k(4),
         ));
-        let node_to_peer = std::sync::Arc::new(std::collections::HashMap::from([(
-            NodeId(2),
-            crate::fabric::PeerId(2),
-        )]));
-        let mut routes = std::collections::HashMap::new();
-        routes.insert(
-            "cache".to_string(),
-            crate::p2p::RoutingSnapshot {
-                fingers,
-                node_to_peer,
-            },
-        );
-
-        RouteTableHandle::new(routes)
+        RouteTableHandle::new(HashSet::from(["cache".to_string()]), fingers)
     }
 
     fn find_object_with_remote_route(cfg: &LoadgenRun, want_remote: bool) -> SyntheticObjectId {

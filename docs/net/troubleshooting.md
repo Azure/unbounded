@@ -19,12 +19,12 @@ kubectl unbounded net node show <name> json   # raw JSON status
 Available inside the node agent container:
 
 ```
-kubectl exec -n unbounded-net <pod> -c node -- unroute           # dump all entries
-kubectl exec -n unbounded-net <pod> -c node -- unroute 10.244.1.5  # LPM lookup
-kubectl exec -n unbounded-net <pod> -c node -- unroute -j         # JSON output
-kubectl exec -n unbounded-net <pod> -c node -- unroute -4         # IPv4 entries only
-kubectl exec -n unbounded-net <pod> -c node -- unroute -6         # IPv6 entries only
-kubectl exec -n unbounded-net <pod> -c node -- unroute --raw      # raw key/value hex dump
+kubectl exec -n unbounded-system <pod> -c node -- unroute           # dump all entries
+kubectl exec -n unbounded-system <pod> -c node -- unroute 10.244.1.5  # LPM lookup
+kubectl exec -n unbounded-system <pod> -c node -- unroute -j         # JSON output
+kubectl exec -n unbounded-system <pod> -c node -- unroute -4         # IPv4 entries only
+kubectl exec -n unbounded-system <pod> -c node -- unroute -6         # IPv6 entries only
+kubectl exec -n unbounded-system <pod> -c node -- unroute --raw      # raw key/value hex dump
 ```
 
 Columns: CIDR, REMOTE (underlay IP), NODE (destination node), IFACE, PROTO, VNI, MTU, HEALTHY
@@ -40,11 +40,11 @@ to a remote node's overlay IP and prints round-trip times (similar to standard
 ping but uses the unbounded-net health check protocol over UDP port 9997):
 
 ```
-kubectl exec -n unbounded-net <pod> -c node -- unping 100.80.1.1
-kubectl exec -n unbounded-net <pod> -c node -- unping -c 5 100.80.1.1          # send 5 probes
-kubectl exec -n unbounded-net <pod> -c node -- unping -i 0.5s 100.80.1.1       # 500ms interval
-kubectl exec -n unbounded-net <pod> -c node -- unping -I 100.80.6.1 100.80.1.1 # specify source IP
-kubectl exec -n unbounded-net <pod> -c node -- unping -p 9997 100.80.1.1       # explicit port
+kubectl exec -n unbounded-system <pod> -c node -- unping 100.80.1.1
+kubectl exec -n unbounded-system <pod> -c node -- unping -c 5 100.80.1.1          # send 5 probes
+kubectl exec -n unbounded-system <pod> -c node -- unping -i 0.5s 100.80.1.1       # 500ms interval
+kubectl exec -n unbounded-system <pod> -c node -- unping -I 100.80.6.1 100.80.1.1 # specify source IP
+kubectl exec -n unbounded-system <pod> -c node -- unping -p 9997 100.80.1.1       # explicit port
 ```
 
 Options:
@@ -80,9 +80,10 @@ Each node agent exposes status on port 9998:
 
 ### Route mismatch
 
-- In eBPF mode, routes should be on unbounded0 (scope global), not on per-peer tunnel interfaces
+- Routes should be on unbounded0 (scope global), not on per-peer tunnel interfaces
 - Check: `ip route show dev unbounded0` -- should show supernet routes
-- Phantom routes on wg*/geneve0/vxlan0 that are "expected but not present" are normal in eBPF mode and should be suppressed by the annotation system
+- Phantom routes on wg*/geneve0/vxlan0 that are "expected but not present" are
+  normal and should be suppressed by the annotation system
 
 ### Migrating a node from Cilium to unbounded-net
 

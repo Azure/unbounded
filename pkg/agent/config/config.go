@@ -15,6 +15,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -23,6 +24,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -39,27 +41,36 @@ type AgentConfig struct {
 	// once. Resolution prefers an explicitly configured value, then a valid
 	// host hostname, then MachineName. Explicit and resolved values must be
 	// valid Kubernetes DNS subdomains.
-	NodeName string             `json:"NodeName,omitempty"`
-	Cluster  AgentClusterConfig `json:"Cluster"`
-	Kubelet  AgentKubeletConfig `json:"Kubelet"`
-	CRI      CRIConfig          `json:"CRI"`
-	CNI      CNIConfig          `json:"CNI"`
+	NodeName string               `json:"NodeName,omitempty"`
+	Cluster  AgentClusterConfig   `json:"Cluster"`
+	Kubelet  AgentKubeletConfig   `json:"Kubelet"`
+	CRI      CRIConfig            `json:"CRI"`
+	CNI      CNIConfig            `json:"CNI"`
+	Gantry   *GantryConfig        `json:"Gantry,omitempty"`
+	LocalDNS *AgentLocalDNSConfig `json:"LocalDNS,omitempty"`
 
-	// OCIImage is the fully-qualified OCI image reference (e.g.
-	// "ghcr.io/org/repo:tag") used to bootstrap the machine rootfs.
+	// OCIImage is an OCI registry reference, local OCI layout, or HTTPS URL
+	// to a tarred OCI image layout used to bootstrap the machine rootfs. HTTPS
+	// archives must contain exactly one tagged image reference, which the agent
+	// selects automatically. HTTPS URLs may contain signed query parameters.
 	// When empty the agent uses the built-in default image.
 	OCIImage string `json:"OCIImage,omitempty"`
 
-	// AdditionalHostDevices lists extra host device nodes under /dev that
-	// should be exposed to the nspawn machine in addition to automatically
-	// discovered devices.
+	// AdditionalHostDevices lists extra host device nodes under /dev or systemd
+	// device group specifiers that should be exposed to the nspawn machine in
+	// addition to automatically discovered devices.
 	AdditionalHostDevices []string `json:"AdditionalHostDevices,omitempty"`
+
+	// AdditionalHostMounts lists extra host paths that should be bind-mounted
+	// into the nspawn machine. ReadOnly should be used unless write access is
+	// required.
+	AdditionalHostMounts []AdditionalHostMount `json:"AdditionalHostMounts,omitempty"`
 
 	// OfflineArtifacts points to a complete offline binary artifact source.
 	// When set, it takes precedence over download overrides. Source is rendered
 	// as a strict Go template using the cluster Kubernetes version, then
-	// resolved as an absolute filesystem path, file:// URL, or oci:// artifact
-	// reference.
+	// resolved as an absolute filesystem path, file:// URL, HTTPS archive, or
+	// oci:// artifact reference. HTTPS URLs may contain signed query parameters.
 	OfflineArtifacts *AgentOfflineArtifacts `json:"OfflineArtifacts,omitempty"`
 }
 
@@ -67,6 +78,22 @@ type AgentConfig struct {
 // agent installs into the nspawn rootfs.
 type AgentOfflineArtifacts struct {
 	Source string `json:"Source,omitempty"`
+}
+
+// GantryConfig holds optional Gantry integration settings.
+type GantryConfig struct {
+	// Disabled skips writing the default containerd hosts.toml that points at
+	// Gantry. This is a breakglass setting for environments that need to own
+	// containerd registry routing independently.
+	Disabled bool `json:"Disabled,omitempty"`
+}
+
+// AdditionalHostMount configures a host path bind mount for the nspawn
+// machine. Target defaults to Source when omitted.
+type AdditionalHostMount struct {
+	Source   string `json:"Source"`
+	Target   string `json:"Target,omitempty"`
+	ReadOnly bool   `json:"ReadOnly,omitempty"`
 }
 
 // DeepCopy returns a copy of AgentOfflineArtifacts.
@@ -143,7 +170,16 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	}
 
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
+	out.Kubelet.Configuration = deepCopyKubeletConfiguration(a.Kubelet.Configuration)
+	out.Kubelet.ImageCredentialProvider = a.Kubelet.ImageCredentialProvider.DeepCopy()
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
+
+	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
+	if a.Gantry != nil {
+		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
+	}
+
+	out.LocalDNS = a.LocalDNS.DeepCopy()
 
 	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
 
@@ -178,6 +214,18 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, err)
 	}
 
+	if err := ValidateAdditionalHostMounts(a.AdditionalHostMounts); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := a.Kubelet.Validate(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := a.validateLocalDNS(); err != nil {
+		errs = append(errs, err)
+	}
+
 	apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
 	if apiServer == "" {
 		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
@@ -193,8 +241,8 @@ func (a *AgentConfig) Validate() error {
 	return errors.Join(errs...)
 }
 
-// ValidateAdditionalHostDevices checks that configured host device paths are
-// safe to render into systemd-nspawn Bind= and DeviceAllow= directives.
+// ValidateAdditionalHostDevices checks that configured host device paths and
+// systemd device group specifiers are safe to render into nspawn directives.
 func ValidateAdditionalHostDevices(paths []string) error {
 	var errs []error
 
@@ -212,8 +260,12 @@ func validateAdditionalHostDevice(path string) error {
 		return fmt.Errorf("AdditionalHostDevices entry %q must not contain whitespace or ':'", path)
 	}
 
+	if IsSystemdDeviceGroupSpecifier(path) {
+		return nil
+	}
+
 	if path == "" || !strings.HasPrefix(path, "/dev/") {
-		return fmt.Errorf("AdditionalHostDevices entry %q must be an absolute path under /dev", path)
+		return fmt.Errorf("AdditionalHostDevices entry %q must be an absolute path under /dev or a systemd device group specifier", path)
 	}
 
 	if cleaned := filepath.Clean(path); cleaned != path || !strings.HasPrefix(cleaned, "/dev/") {
@@ -221,6 +273,66 @@ func validateAdditionalHostDevice(path string) error {
 	}
 
 	return nil
+}
+
+// ValidateAdditionalHostMounts checks that configured host bind-mount paths
+// are safe to render into nspawn directives.
+func ValidateAdditionalHostMounts(mounts []AdditionalHostMount) error {
+	var errs []error
+
+	for i, mount := range mounts {
+		if err := validateAdditionalHostMountPath(mount.Source); err != nil {
+			errs = append(errs, fmt.Errorf("AdditionalHostMounts[%d].Source: %w", i, err))
+		}
+
+		if mount.Target != "" {
+			if err := validateAdditionalHostMountPath(mount.Target); err != nil {
+				errs = append(errs, fmt.Errorf("AdditionalHostMounts[%d].Target: %w", i, err))
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateAdditionalHostMountPath(path string) error {
+	if path == "" || !filepath.IsAbs(path) {
+		return fmt.Errorf("%q must be an absolute path", path)
+	}
+
+	if strings.IndexFunc(path, func(r rune) bool {
+		return r == ':' || unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return fmt.Errorf("%q must not contain whitespace, control characters, or ':'", path)
+	}
+
+	if cleaned := filepath.Clean(path); cleaned != path {
+		return fmt.Errorf("%q must be a clean absolute path", path)
+	}
+
+	return nil
+}
+
+// IsSystemdDeviceGroupSpecifier reports whether value is a systemd DeviceAllow
+// device group specifier, such as char-input or block-*. Group names accept
+// ASCII letters, digits, underscores, hyphens, and the '*' wildcard only.
+func IsSystemdDeviceGroupSpecifier(value string) bool {
+	for _, prefix := range []string{"char-", "block-"} {
+		if !strings.HasPrefix(value, prefix) {
+			continue
+		}
+
+		group := strings.TrimPrefix(value, prefix)
+
+		return group != "" && strings.IndexFunc(group, func(r rune) bool {
+			return (r < 'a' || r > 'z') &&
+				(r < 'A' || r > 'Z') &&
+				(r < '0' || r > '9') &&
+				r != '_' && r != '-' && r != '*'
+		}) == -1
+	}
+
+	return false
 }
 
 // AgentClusterConfig holds the cluster-level values the agent needs to
@@ -240,6 +352,162 @@ type AgentKubeletConfig struct {
 	Auth               KubeletAuthInfo   `json:"Auth"`
 	Labels             map[string]string `json:"Labels"`
 	RegisterWithTaints []string          `json:"RegisterWithTaints"`
+
+	// Configuration is merged over the agent's baseline kubelet configuration
+	// and rendered as a kubelet.config.k8s.io/v1beta1
+	// KubeletConfiguration. apiVersion, kind, authentication,
+	// authorization.mode, clusterDNS, containerRuntimeEndpoint,
+	// registerWithTaints, and rotateCertificates are agent-owned and must not be
+	// supplied here.
+	Configuration map[string]any `json:"Configuration,omitempty"`
+
+	// ImageCredentialProvider configures kubelet's exec image credential
+	// provider paths inside the nspawn machine.
+	ImageCredentialProvider *ImageCredentialProvider `json:"ImageCredentialProvider,omitempty"`
+}
+
+// ImageCredentialProvider holds paths inside the nspawn machine for kubelet's
+// exec image credential provider configuration and binaries. ConfigPath may
+// identify a single configuration file or a directory supported by the
+// installed kubelet version.
+type ImageCredentialProvider struct {
+	ConfigPath string `json:"ConfigPath"`
+	BinDir     string `json:"BinDir"`
+}
+
+// DeepCopy returns a copy of ImageCredentialProvider.
+func (i *ImageCredentialProvider) DeepCopy() *ImageCredentialProvider {
+	if i == nil {
+		return nil
+	}
+
+	out := *i
+
+	return &out
+}
+
+// Validate checks the kubelet configuration overlay and optional image
+// credential provider paths. Kubelet authentication is validated separately
+// because some consumers populate it after initial configuration resolution.
+func (a *AgentKubeletConfig) Validate() error {
+	return errors.Join(
+		validateKubeletConfiguration(a.Configuration),
+		a.ImageCredentialProvider.Validate(),
+	)
+}
+
+// validateKubeletConfiguration validates the JSON-shaped kubelet
+// configuration overlay and rejects unsupported agent-handled fields.
+func validateKubeletConfiguration(configuration map[string]any) error {
+	if configuration == nil {
+		return nil
+	}
+
+	normalized, err := normalizeKubeletConfiguration(configuration)
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+
+	if authorizationValue, exists := normalized["authorization"]; exists {
+		authorization, ok := authorizationValue.(map[string]any)
+		if !ok {
+			errs = append(errs, fmt.Errorf("Kubelet.Configuration.authorization must be an object"))
+		} else if _, exists := authorization["mode"]; exists {
+			errs = append(errs, fmt.Errorf(
+				"setting Kubelet.Configuration.authorization.mode is not supported; it is configured by the agent",
+			))
+		}
+	}
+
+	for _, field := range []string{
+		"apiVersion",
+		"kind",
+		"authentication",
+		"clusterDNS",
+		"containerRuntimeEndpoint",
+		"registerWithTaints",
+		"rotateCertificates",
+	} {
+		if _, ok := normalized[field]; ok {
+			errs = append(errs, fmt.Errorf(
+				"setting Kubelet.Configuration.%s is not supported; it is configured by the agent",
+				field,
+			))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// Validate validates paths that kubelet consumes inside the nspawn machine.
+// The paths are not required to exist in the unpacked rootfs because they may
+// be supplied by nspawn bind mounts at start time.
+func (provider *ImageCredentialProvider) Validate() error {
+	if provider == nil {
+		return nil
+	}
+
+	var errs []error
+	if err := validateMachinePath(provider.ConfigPath); err != nil {
+		errs = append(errs, fmt.Errorf("Kubelet.ImageCredentialProvider.ConfigPath: %w", err))
+	}
+
+	if err := validateMachinePath(provider.BinDir); err != nil {
+		errs = append(errs, fmt.Errorf("Kubelet.ImageCredentialProvider.BinDir: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateMachinePath(path string) error {
+	if path == "" || !filepath.IsAbs(path) {
+		return fmt.Errorf("%q must be an absolute path", path)
+	}
+
+	if strings.IndexFunc(path, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 || strings.ContainsAny(path, "\"\\%$") {
+		return fmt.Errorf("%q contains characters that are unsafe in a systemd argument", path)
+	}
+
+	if cleaned := filepath.Clean(path); cleaned != path {
+		return fmt.Errorf("%q must be a clean absolute path", path)
+	}
+
+	return nil
+}
+
+// normalizeKubeletConfiguration converts JSON-compatible typed maps and slices
+// into the map[string]any and []any representation produced by encoding/json.
+func normalizeKubeletConfiguration(value map[string]any) (map[string]any, error) {
+	if value == nil {
+		return nil, nil
+	}
+
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("Kubelet.Configuration must contain only JSON-compatible values: %w", err)
+	}
+
+	var normalized map[string]any
+	if err := json.Unmarshal(data, &normalized); err != nil {
+		return nil, fmt.Errorf("normalize Kubelet.Configuration: %w", err)
+	}
+
+	return normalized, nil
+}
+
+func deepCopyKubeletConfiguration(value map[string]any) map[string]any {
+	copied, err := normalizeKubeletConfiguration(value)
+	if err != nil {
+		// Invalid values are reported by AgentKubeletConfig.Validate. Preserve
+		// the top-level map here so DeepCopy remains total for invalid configs.
+		return maps.Clone(value)
+	}
+
+	return copied
 }
 
 // KubeletAuthInfo holds the kubelet authentication configuration.

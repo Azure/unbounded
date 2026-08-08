@@ -4,6 +4,7 @@
 package provision
 
 import (
+	"context"
 	"maps"
 	"strings"
 
@@ -14,15 +15,17 @@ import (
 )
 
 type (
-	AgentConfig           = config.AgentConfig
-	AgentClusterConfig    = config.AgentClusterConfig
-	AgentKubeletConfig    = config.AgentKubeletConfig
-	KubeletAuthInfo       = config.KubeletAuthInfo
-	CRIConfig             = config.CRIConfig
-	ContainerdConfig      = config.ContainerdConfig
-	RuncConfig            = config.RuncConfig
-	CNIConfig             = config.CNIConfig
-	AgentOfflineArtifacts = config.AgentOfflineArtifacts
+	AgentConfig             = config.AgentConfig
+	AgentClusterConfig      = config.AgentClusterConfig
+	AgentKubeletConfig      = config.AgentKubeletConfig
+	ImageCredentialProvider = config.ImageCredentialProvider
+	GantryConfig            = config.GantryConfig
+	KubeletAuthInfo         = config.KubeletAuthInfo
+	CRIConfig               = config.CRIConfig
+	ContainerdConfig        = config.ContainerdConfig
+	RuncConfig              = config.RuncConfig
+	CNIConfig               = config.CNIConfig
+	AgentOfflineArtifacts   = config.AgentOfflineArtifacts
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
@@ -63,6 +66,7 @@ type AgentDownloads struct {
 	Runc       *AgentDownloadSource `json:"Runc,omitempty"`
 	CNI        *AgentDownloadSource `json:"CNI,omitempty"`
 	Crictl     *AgentDownloadSource `json:"Crictl,omitempty"`
+	CoreDNS    *AgentDownloadSource `json:"CoreDNS,omitempty"`
 }
 
 // AgentDownloadSource configures an override for a single binary download
@@ -172,10 +176,20 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		ociImage = machine.Spec.Agent.Image
 	}
 
-	// Resolve download overrides from the Machine spec.
-	var downloads *AgentDownloads
-	if machine.Spec.Agent != nil && machine.Spec.Agent.Downloads != nil {
-		downloads = agentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+	// Resolve download overrides and LocalDNS from the Machine spec.
+	var (
+		downloads *AgentDownloads
+		localDNS  *config.AgentLocalDNSConfig
+	)
+
+	if machine.Spec.Agent != nil {
+		if machine.Spec.Agent.Downloads != nil {
+			downloads = agentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+		}
+
+		if machine.Spec.Agent.LocalDNS != nil {
+			localDNS = LocalDNSFromSpec(machine.Spec.Agent.LocalDNS)
+		}
 	}
 
 	cfg := UnboundedAgentConfig{
@@ -196,6 +210,7 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				RegisterWithTaints: taints,
 			},
 			OCIImage: ociImage,
+			LocalDNS: localDNS,
 		},
 		Downloads: downloads,
 	}
@@ -205,6 +220,36 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	}
 
 	return cfg
+}
+
+// LocalDNSFromSpec converts the Machine API LocalDNS settings to agent config.
+func LocalDNSFromSpec(spec *v1alpha3.LocalDNSSpec) *config.AgentLocalDNSConfig {
+	if spec == nil {
+		return nil
+	}
+
+	var cpuLimit, memoryLimit *int
+
+	if spec.CPULimitInMilliCores != nil {
+		value := int(*spec.CPULimitInMilliCores)
+		cpuLimit = &value
+	}
+
+	if spec.MemoryLimitInMB != nil {
+		value := int(*spec.MemoryLimitInMB)
+		memoryLimit = &value
+	}
+
+	return &config.AgentLocalDNSConfig{
+		Enabled:              spec.Enabled,
+		NodeListenerIP:       spec.NodeListenerIP,
+		ClusterListenerIP:    spec.ClusterListenerIP,
+		MetricsAddress:       spec.MetricsAddress,
+		CPULimitInMilliCores: cpuLimit,
+		MemoryLimitInMB:      memoryLimit,
+		RequiredPlugins:      append([]string(nil), spec.RequiredPlugins...),
+		CorefileTemplate:     spec.CorefileTemplate,
+	}
 }
 
 // agentDownloadsFromSpec converts the Machine API AgentDownloadsSpec into
@@ -221,9 +266,10 @@ func agentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
 		Runc:       downloadSourceFromSpec(spec.Runc),
 		CNI:        downloadSourceFromSpec(spec.CNI),
 		Crictl:     downloadSourceFromSpec(spec.Crictl),
+		CoreDNS:    downloadSourceFromSpec(spec.CoreDNS),
 	}
 
-	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil {
+	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil && out.CoreDNS == nil {
 		return nil
 	}
 
@@ -251,8 +297,8 @@ func downloadSourceFromSpec(s *v1alpha3.DownloadSource) *AgentDownloadSource {
 // takes precedence over cfg.Downloads when configured; otherwise cfg.Downloads is
 // converted into the goalstates.DownloadOverrides shape that rootfs phase tasks
 // consume.
-func ResolveDownloadOverridesWithOfflineArtifacts(cfg *UnboundedAgentConfig) (*goalstates.DownloadOverrides, *goalstates.ContainerImageArchiveStaging, error) {
-	return goalstates.ResolveDownloadOverridesWithOfflineArtifacts(&cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
+func ResolveDownloadOverridesWithOfflineArtifacts(ctx context.Context, cfg *UnboundedAgentConfig) (*goalstates.DownloadOverrides, *goalstates.ContainerImageArchiveStaging, error) {
+	return goalstates.ResolveDownloadOverridesWithOfflineArtifacts(ctx, &cfg.AgentConfig, resolveDownloadOverrides(cfg.Downloads))
 }
 
 // ResolveDownloadOverrides converts the provision AgentDownloads into the
@@ -288,9 +334,10 @@ func resolveDownloadOverrides(d *AgentDownloads) *goalstates.DownloadOverrides {
 		Runc:       convert(d.Runc),
 		CNI:        convert(d.CNI),
 		Crictl:     convert(d.Crictl),
+		CoreDNS:    convert(d.CoreDNS),
 	}
 
-	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil {
+	if out.Kubernetes == nil && out.Containerd == nil && out.Runc == nil && out.CNI == nil && out.Crictl == nil && out.CoreDNS == nil {
 		return nil
 	}
 

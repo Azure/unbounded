@@ -332,6 +332,65 @@ func TestResolveKubelet_NodeIP(t *testing.T) {
 	assert.Equal(t, "10.0.0.15,fd00::15", k.NodeIP)
 }
 
+func TestResolveKubelet_ConfigurationAndImageCredentialProvider(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+			Configuration: map[string]any{
+				"logging":              map[string]any{"verbosity": 4},
+				"featureGates":         map[string]bool{"Example": true},
+				"allowedUnsafeSysctls": []string{"net.ipv4.ip_local_port_range"},
+			},
+			ImageCredentialProvider: &config.ImageCredentialProvider{
+				ConfigPath: "/etc/kubernetes/credential-provider.yaml",
+				BinDir:     "/usr/local/lib/kubelet-credential-providers",
+			},
+		},
+	}
+
+	k, err := resolveKubelet(cfg)
+	require.NoError(t, err)
+	require.Equal(t, cfg.Kubelet.Configuration, k.Configuration)
+	require.Equal(t, "/etc/kubernetes/credential-provider.yaml", k.ImageCredentialProvider.ConfigPath)
+	require.Equal(t, "/usr/local/lib/kubelet-credential-providers", k.ImageCredentialProvider.BinDir)
+}
+
+func TestResolveKubelet_InvalidConfigurationRejected(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer:     "https://api.example.com",
+			Configuration: map[string]any{"clusterDNS": []any{"10.0.0.11"}},
+		},
+	}
+
+	_, err := resolveKubelet(cfg)
+	require.ErrorContains(t, err, "clusterDNS is not supported")
+}
+
+func TestResolveKubelet_InvalidImageCredentialProviderRejected(t *testing.T) {
+	cfg := &config.AgentConfig{
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+			ImageCredentialProvider: &config.ImageCredentialProvider{
+				ConfigPath: "relative.yaml",
+				BinDir:     "/usr/bin",
+			},
+		},
+	}
+
+	_, err := resolveKubelet(cfg)
+	require.ErrorContains(t, err, "ConfigPath")
+}
+
 func TestResolveKubelet_InvalidNodeIPRejected(t *testing.T) {
 	cfg := &config.AgentConfig{
 		Cluster: config.AgentClusterConfig{
@@ -371,11 +430,30 @@ func TestResolveMachine_UsesConfigNodeName(t *testing.T) {
 	assert.Equal(t, "machine-1", got.NodeStart.KubeMachineName)
 }
 
+func TestResolveMachine_GantryDisabled(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+		Gantry: &config.GantryConfig{Disabled: true},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+
+	assert.True(t, got.NodeStart.Gantry.Disabled)
+}
+
 func TestResolveMachine_AdditionalHostDevices(t *testing.T) {
 	cfg := &config.AgentConfig{
 		MachineName:           "machine-1",
 		NodeName:              "configured-node",
-		AdditionalHostDevices: []string{"/dev/uinput"},
+		AdditionalHostDevices: []string{"char-input", "/dev/uinput"},
 		Cluster: config.AgentClusterConfig{
 			CaCertBase64: "Y2EtYnl0ZXM=",
 		},
@@ -387,8 +465,10 @@ func TestResolveMachine_AdditionalHostDevices(t *testing.T) {
 	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
 	require.NoError(t, err)
 
-	require.Equal(t, []string{"/dev/uinput"}, got.RootFS.HostDevices.Additional)
+	require.Equal(t, []string{"char-input", "/dev/uinput"}, got.RootFS.HostDevices.Additional)
 	require.Contains(t, got.RootFS.HostDevices.Paths(), "/dev/uinput")
+	require.NotContains(t, got.RootFS.HostDevices.Paths(), "char-input")
+	require.Equal(t, []string{"char-input"}, got.RootFS.HostDevices.DeviceGroupSpecifiers())
 }
 
 func TestResolveMachine_InvalidAdditionalHostDevice(t *testing.T) {
@@ -406,4 +486,49 @@ func TestResolveMachine_InvalidAdditionalHostDevice(t *testing.T) {
 
 	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
 	require.ErrorContains(t, err, "AdditionalHostDevices")
+}
+
+func TestResolveMachine_AdditionalHostMounts(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+		AdditionalHostMounts: []config.AdditionalHostMount{
+			{Source: "/opt/config", ReadOnly: true},
+			{Source: "/var/lib/data", Target: "/data"},
+		},
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+
+	require.Equal(t, []config.AdditionalHostMount{
+		{Source: "/opt/config", Target: "/opt/config", ReadOnly: true},
+		{Source: "/var/lib/data", Target: "/data"},
+	}, got.RootFS.AdditionalHostMounts)
+	require.Empty(t, cfg.AdditionalHostMounts[0].Target)
+}
+
+func TestResolveMachine_InvalidAdditionalHostMount(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "configured-node",
+		AdditionalHostMounts: []config.AdditionalHostMount{{
+			Source: "../config",
+		}},
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.ErrorContains(t, err, "AdditionalHostMounts")
 }

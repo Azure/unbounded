@@ -258,6 +258,115 @@ spec:
                         phase.
                       format: date-time
                       type: string
+                    conditions:
+                      description: |-
+                        Conditions represent target-scoped observations for this operation. These
+                        conditions are not persisted on the Machine, so BMC capability fallbacks
+                        apply only to this MachineOperation target.
+                      items:
+                        description: Condition contains details for one aspect of
+                          the current state of this API Resource.
+                        properties:
+                          lastTransitionTime:
+                            description: |-
+                              lastTransitionTime is the last time the condition transitioned from one status to another.
+                              This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                            format: date-time
+                            type: string
+                          message:
+                            description: |-
+                              message is a human readable message indicating details about the transition.
+                              This may be an empty string.
+                            maxLength: 32768
+                            type: string
+                          observedGeneration:
+                            description: |-
+                              observedGeneration represents the .metadata.generation that the condition was set based upon.
+                              For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                              with respect to the current state of the instance.
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          reason:
+                            description: |-
+                              reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                              Producers of specific condition types may define expected values and meanings for this field,
+                              and whether the values are considered a guaranteed API.
+                              The value should be a CamelCase string.
+                              This field may not be empty.
+                            maxLength: 1024
+                            minLength: 1
+                            pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                            type: string
+                          status:
+                            description: status of the condition, one of True, False,
+                              Unknown.
+                            enum:
+                            - "True"
+                            - "False"
+                            - Unknown
+                            type: string
+                          type:
+                            description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                            maxLength: 316
+                            pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                            type: string
+                        required:
+                        - lastTransitionTime
+                        - message
+                        - reason
+                        - status
+                        - type
+                        type: object
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - type
+                      x-kubernetes-list-type: map
+                    input:
+                      description: Input is the immutable provider input resolved
+                        before execution begins.
+                      properties:
+                        hostImage:
+                          description: |-
+                            HostImage is the resolved provider-interpreted host image for HostReplace.
+                            An empty value instructs the provider to preserve the current image.
+                          type: string
+                        providerRef:
+                          description: |-
+                            ProviderRef identifies the exact provider-owned resource referenced by
+                            host.external.machineRef when the operation target was initialized.
+                          properties:
+                            apiGroup:
+                              description: APIGroup is the API group of the provider-owned
+                                Machine resource.
+                              type: string
+                            generation:
+                              description: |-
+                                Generation records the provider-owned resource generation whose inputs
+                                were observed.
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            kind:
+                              description: Kind is the kind of the provider-owned
+                                Machine resource.
+                              type: string
+                            name:
+                              description: Name is the name of the provider-owned
+                                Machine resource.
+                              type: string
+                            uid:
+                              description: UID detects deletion and recreation of
+                                the provider-owned resource.
+                              type: string
+                          required:
+                          - apiGroup
+                          - generation
+                          - kind
+                          - name
+                          - uid
+                          type: object
+                      type: object
                     lastAttemptAt:
                       description: LastAttemptAt records when the latest external
                         action attempt occurred.
@@ -278,6 +387,28 @@ spec:
                     phase:
                       description: Phase is the current lifecycle phase for this target.
                       type: string
+                    providerOperation:
+                      description: |-
+                        ProviderOperation identifies the resumable external operation for this
+                        target, when the provider returned one.
+                      properties:
+                        operationID:
+                          description: OperationID is the provider-assigned operation
+                            identifier.
+                          type: string
+                        provider:
+                          description: Provider is the external provider that accepted
+                            the operation.
+                          type: string
+                        resumeToken:
+                          description: |-
+                            ResumeToken is opaque provider data needed to resume polling. Providers
+                            must not store credentials or other secrets in this field.
+                          type: string
+                      required:
+                      - operationID
+                      - provider
+                      type: object
                     stage:
                       description: Stage is the current operation-specific stage for
                         this target.
@@ -286,23 +417,6 @@ spec:
                       description: StartedAt is when execution began for this target.
                       format: date-time
                       type: string
-                    targetOperations:
-                      description: |-
-                        TargetOperations records the Machine operation counters this operation
-                        requested. It is used by counter-backed HostReplace operations to remain
-                        idempotent across controller restarts.
-                      properties:
-                        rebootCounter:
-                          description: RebootCounter is the last reboot counter value
-                            that was acted on.
-                          format: int64
-                          type: integer
-                        repaveCounter:
-                          description: RepaveCounter is the last repave counter value
-                            that was acted on.
-                          format: int64
-                          type: integer
-                      type: object
                   required:
                   - machineRef
                   type: object

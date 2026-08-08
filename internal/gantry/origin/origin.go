@@ -9,9 +9,10 @@
 // by the operator.
 // - Endpoints: GET /v2/, GET /v2/<repo>/blobs/<digest>,
 // GET /v2/<repo>/manifests/<digest>.
-// - Auth: optional Basic auth (credentials from a hostPath file in
-// "username:password" format) plus the OCI Distribution Spec bearer-
-// token flow (401 -> realm/service/scope -> token -> retry).
+// - Auth: request-scoped delegated Basic/Bearer authorization takes precedence
+// and is used without caching or identity fallback. Without configured shared
+// credentials, the client discovers the upstream /v2/ challenge for containerd.
+// An optional "username:password" file retains the legacy shared-identity flow.
 // - Failure classification: maps HTTP status and network errors to
 // ifaces.FailureClass for the design doc propagation. Tag-resolution requests are
 // not handled here (the mirror returns 503 on tag manifests so
@@ -34,14 +35,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	dockerauth "github.com/containerd/containerd/v2/core/remotes/docker/auth"
+
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // Client is the concrete OriginPuller. It fans out to one *registry per
@@ -71,6 +76,7 @@ type Client struct {
 type metricsHooks struct {
 	onPullStart   func(kind string)        // before request
 	onPullFailure func(kind, class string) // any non-success terminal status
+	onBytesRead   func(kind string, bytes int64)
 }
 
 // Option configures a Client.
@@ -96,6 +102,16 @@ func WithMetrics(start func(kind string), failure func(kind, class string)) Opti
 	return func(c *Client) {
 		c.metrics.onPullStart = start
 		c.metrics.onPullFailure = failure
+	}
+}
+
+// WithByteMetrics registers a callback for bytes actually read from upstream
+// response bodies. It includes partial failed transfers and retries, and does
+// not count HEAD requests. The callback fires once when the body reaches a
+// terminal read result or is closed.
+func WithByteMetrics(onBytesRead func(kind string, bytes int64)) Option {
+	return func(c *Client) {
+		c.metrics.onBytesRead = onBytesRead
 	}
 }
 
@@ -173,7 +189,49 @@ func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser,
 		return nil, 0, err
 	}
 
+	if c.metrics.onBytesRead != nil {
+		rc = &countingReadCloser{
+			ReadCloser: rc,
+			onFinish: func(bytes int64) {
+				c.metrics.onBytesRead(kind, bytes)
+			},
+		}
+	}
+
 	return rc, size, nil
+}
+
+type countingReadCloser struct {
+	io.ReadCloser
+	onFinish func(bytes int64)
+	bytes    int64
+	once     sync.Once
+}
+
+func (r *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytes += int64(n)
+
+	if err != nil {
+		r.finish()
+	}
+
+	return n, err
+}
+
+func (r *countingReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.finish()
+
+	return err
+}
+
+func (r *countingReadCloser) finish() {
+	r.once.Do(func() {
+		if r.onFinish != nil && r.bytes > 0 {
+			r.onFinish(r.bytes)
+		}
+	})
 }
 
 func (c *Client) recordFailure(kind string, err error) {
@@ -189,6 +247,19 @@ func (c *Client) recordFailure(kind string, err error) {
 	}
 
 	c.metrics.onPullFailure(kind, class)
+}
+
+// AuthenticationChallenge returns the configured registry's current
+// Basic/Bearer challenge. required is false when the registry's /v2/ endpoint
+// permits anonymous access. Results are cached per registry so ordinary mirror
+// requests do not add an upstream round trip.
+func (c *Client) AuthenticationChallenge(ctx context.Context, registry string) (challenge string, required bool, err error) {
+	r, ok := c.registries[registry]
+	if !ok {
+		return "", false, fmt.Errorf("origin: unknown registry %q", registry)
+	}
+
+	return r.authenticationChallenge(ctx)
 }
 
 // Head implements ifaces.OriginPuller.
@@ -256,12 +327,26 @@ type registry struct {
 	// lands when the design doc retries make that worthwhile.
 	tokMu sync.Mutex
 	token *cachedToken
+
+	challengeMu sync.Mutex
+	challenge   *cachedAuthenticationChallenge
 }
 
 type cachedToken struct {
 	value     string
 	expiresAt time.Time
 }
+
+type cachedAuthenticationChallenge struct {
+	value     string
+	required  bool
+	expiresAt time.Time
+}
+
+const (
+	authenticationChallengeTTL = 30 * time.Minute
+	anonymousRegistryTTL       = time.Minute
+)
 
 func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
 	u, err := url.Parse(ur.Endpoint)
@@ -297,6 +382,83 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 	}
 
 	return r, nil
+}
+
+func (r *registry) authenticationChallenge(ctx context.Context) (string, bool, error) {
+	r.challengeMu.Lock()
+	defer r.challengeMu.Unlock()
+
+	if r.challenge != nil && time.Now().Before(r.challenge.expiresAt) {
+		return r.challenge.value, r.challenge.required, nil
+	}
+	// An explicitly configured credential opts into the legacy shared-identity
+	// mode. In that mode Gantry authenticates to origin itself and containerd
+	// does not need to negotiate a requester credential with the mirror.
+	if r.username != "" {
+		return "", false, nil
+	}
+	// Challenge discovery and delegated credentials are HTTPS-only. Reporting
+	// no challenge preserves anonymous HTTP registries; private HTTP registries
+	// cannot use requester-delegated authentication.
+	if !strings.EqualFold(r.base.Scheme, "https") {
+		return "", false, nil
+	}
+
+	u := *r.base
+	u.User = nil
+	u.Path = strings.TrimRight(u.Path, "/") + "/v2/"
+	u.RawQuery = ""
+	u.Fragment = ""
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", false, err
+	}
+
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return "", false, fmt.Errorf("probe registry authentication: %w", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		r.challenge = &cachedAuthenticationChallenge{
+			expiresAt: time.Now().Add(anonymousRegistryTTL),
+		}
+
+		return "", false, nil
+	case http.StatusUnauthorized:
+		challenge, err := validatedAuthenticationChallenge(resp)
+		if err != nil {
+			return "", false, err
+		}
+
+		r.challenge = &cachedAuthenticationChallenge{
+			value:     challenge,
+			required:  true,
+			expiresAt: time.Now().Add(authenticationChallengeTTL),
+		}
+
+		return challenge, true, nil
+	default:
+		return "", false, fmt.Errorf("registry authentication probe returned %s", resp.Status)
+	}
+}
+
+func (r *registry) rememberAuthenticationChallenge(challenge string) {
+	if challenge == "" {
+		return
+	}
+
+	r.challengeMu.Lock()
+	r.challenge = &cachedAuthenticationChallenge{
+		value:     challenge,
+		required:  true,
+		expiresAt: time.Now().Add(authenticationChallengeTTL),
+	}
+	r.challengeMu.Unlock()
 }
 
 func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
@@ -348,7 +510,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 			if mResp.StatusCode != http.StatusNotFound {
 				defer func() { _ = mResp.Body.Close() }() //nolint:errcheck // best-effort body close
 
-				return nil, 0, classify(mRef, mResp)
+				return nil, 0, r.classify(mRef, mResp)
 			}
 
 			_ = mResp.Body.Close() //nolint:errcheck // best-effort body close
@@ -366,7 +528,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 
 	if resp.StatusCode != http.StatusOK {
 		defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
-		return nil, 0, classify(ref, resp)
+		return nil, 0, r.classify(ref, resp)
 	}
 
 	size := int64(-1)
@@ -427,7 +589,7 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 			if mResp.StatusCode != http.StatusNotFound {
 				defer func() { _ = mResp.Body.Close() }() //nolint:errcheck // best-effort body close
 
-				return 0, "", classify(mRef, mResp)
+				return 0, "", r.classify(mRef, mResp)
 			}
 
 			_ = mResp.Body.Close() //nolint:errcheck // best-effort body close
@@ -443,7 +605,7 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, "", classify(ref, resp)
+		return 0, "", r.classify(ref, resp)
 	}
 
 	size := int64(-1)
@@ -467,11 +629,21 @@ func (r *registry) urlFor(ref ifaces.OriginRef) string {
 	}
 }
 
-// do issues a request, transparently performing the bearer-token flow on
-// 401. The cached token (if any) is sent on the first attempt; on 401 the
-// challenge is honored, the token is replaced, and one retry is issued.
+// do issues a request, preferring request-scoped delegated Basic/Bearer auth. A
+// delegated credential is used exactly as supplied and is never cached; if it
+// is rejected, the 401 is returned rather than silently changing identity to
+// this node's configured credentials. Without delegated auth, the legacy
+// credentials-file bearer-token flow remains available.
 func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Response, error) {
-	build := func(tok string) (*http.Request, error) {
+	delegatedAuthorization := registryauth.Authorization(ctx)
+	if delegatedAuthorization != "" && !r.canSendBasicAuth() {
+		return nil, &tokenError{
+			class: ifaces.FailureAuth,
+			err:   errors.New("delegated registry authorization requires an HTTPS origin endpoint"),
+		}
+	}
+
+	build := func(authorization string) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
 		if err != nil {
 			return nil, err
@@ -485,16 +657,24 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 					"application/vnd.docker.distribution.manifest.list.v2+json")
 		}
 
-		if tok != "" {
-			req.Header.Set("Authorization", "Bearer "+tok)
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
 		}
 
 		return req, nil
 	}
 
-	cachedTok := r.cachedToken()
+	cachedTok := ""
 
-	req, err := build(cachedTok)
+	initialAuthorization := delegatedAuthorization
+	if initialAuthorization == "" {
+		cachedTok = r.cachedToken()
+		if cachedTok != "" {
+			initialAuthorization = "Bearer " + cachedTok
+		}
+	}
+
+	req, err := build(initialAuthorization)
 	if err != nil {
 		return nil, err
 	}
@@ -505,6 +685,11 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 	}
 
 	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+	// A delegated token represents the requesting node's authority. Never
+	// replace it with this puller node's identity on rejection.
+	if delegatedAuthorization != "" {
 		return resp, nil
 	}
 
@@ -528,7 +713,7 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 
 	r.setToken(tok, ttl)
 
-	req2, err := build(tok)
+	req2, err := build("Bearer " + tok)
 	if err != nil {
 		return nil, err
 	}
@@ -718,8 +903,10 @@ func (r *registry) clearToken() {
 	r.token = nil
 }
 
-// classify maps an HTTP status to a the design doc FailureClass.
-func classify(ref ifaces.OriginRef, resp *http.Response) error {
+// classify maps an HTTP status to a the design doc FailureClass and preserves
+// a validated Basic/Bearer challenge so containerd can refresh rejected
+// delegated credentials.
+func (r *registry) classify(ref ifaces.OriginRef, resp *http.Response) error {
 	var class ifaces.FailureClass
 
 	switch resp.StatusCode {
@@ -733,11 +920,69 @@ func classify(ref ifaces.OriginRef, resp *http.Response) error {
 		class = ifaces.FailureTransient
 	}
 
-	return &ifaces.OriginError{
+	oe := &ifaces.OriginError{
 		Ref:   ref,
 		Class: class,
 		Err:   fmt.Errorf("upstream returned %s", resp.Status),
 	}
+	if class == ifaces.FailureAuth {
+		if challenge, err := validatedAuthenticationChallenge(resp); err == nil {
+			oe.Challenge = challenge
+			r.rememberAuthenticationChallenge(challenge)
+		}
+	}
+
+	return oe
+}
+
+func validatedAuthenticationChallenge(resp *http.Response) (string, error) {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return "", errors.New("authentication challenge has no request URL")
+	}
+
+	if !strings.EqualFold(resp.Request.URL.Scheme, "https") {
+		return "", errors.New("authentication challenge requires an HTTPS registry endpoint")
+	}
+
+	challenges := dockerauth.ParseAuthHeader(resp.Header)
+	for _, challenge := range challenges {
+		scheme := ""
+
+		switch challenge.Scheme {
+		case dockerauth.BearerAuth:
+			realm, err := url.Parse(challenge.Parameters["realm"])
+			if err != nil || !realm.IsAbs() || realm.Host == "" || !strings.EqualFold(realm.Scheme, "https") {
+				continue
+			}
+
+			scheme = "Bearer"
+		case dockerauth.BasicAuth:
+			scheme = "Basic"
+		default:
+			continue
+		}
+
+		keys := make([]string, 0, len(challenge.Parameters))
+		for key := range challenge.Parameters {
+			keys = append(keys, key)
+		}
+
+		sort.Strings(keys)
+
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			value := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(challenge.Parameters[key])
+			parts = append(parts, fmt.Sprintf(`%s="%s"`, key, value))
+		}
+
+		if len(parts) == 0 {
+			return scheme, nil
+		}
+
+		return scheme + " " + strings.Join(parts, ","), nil
+	}
+
+	return "", errors.New("registry returned no supported Basic/Bearer authentication challenge")
 }
 
 // tokenError carries a FailureClass through the token-exchange path so that

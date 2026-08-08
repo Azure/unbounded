@@ -9,43 +9,35 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
+	"strings"
 	"text/template"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	v1 "k8s.io/client-go/applyconfigurations/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/unbounded/cmd/machina/machina/controller"
 	"github.com/Azure/unbounded/internal/kube"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 //go:embed assets/unbounded-net-site/*.yaml
 var siteTemplates embed.FS
 
-// siteInitHandler is responsible for handling initial unbounded-kube bootstrap and also ensuring a site
-// is ready for machines to be added to it. The handler performs the following duties:
-//
-//  1. Validate inputs and runtime environment.
-//     - Check if parameters themselves are valid (e.g. CIDRs, site name, etc.).
-//     - Check if kubectl is available and can connect to the cluster.
-//     - Check if the cluster has at least one node with a label unbounded-cloud.io/unbounded-net-gateway=true. If not,
-//     the handler will exit and prompt the user to label at least one node with that label.
-//
-//  2. Install the unbounded-net plugin.
-//     - Download the CNI plugin release OR use a local tarball/directory of manifests provided by the user.
-//     - Verify the unbounded-net controller is up and running.
-//
-// 3. Install a site specific manifest for the unbounded-net.
-// 4. Install and configure machina-controller.
-// 5. Create a bootstrap token for the site if one does not already exist.
-// 6. Verify machina-controller is up and running.
-// 7. Print out Site Initialized message and show how to access unbounded-net UI and register a machine.
+// siteTemplateDir is the embedded directory holding the Site manifest templates.
+const siteTemplateDir = "assets/unbounded-net-site"
+
+// siteInitHandler creates declarative Site configuration and bootstrap credentials.
+// Component installation is reconciled by unbounded-operator from the Site spec.
 type siteInitHandler struct {
 	// name is the site name and is used to create CNI resources as well as label things like machines and other
 	// secondary resources created for the site.
@@ -63,39 +55,25 @@ type siteInitHandler struct {
 	// podCIDR is the CIDR to use for pod IPs in this site.
 	podCIDR string
 
-	// cniManifests is a path to either a directory or archive containing CNI manifests to apply
-	// to the cluster for this site. This is temporarily required to support installing the
-	// unbounded CNI until we have public downloadable releases coming from that repository.
-	cniManifests string
-
-	// machinaManifests is a path to either a directory or archive containing machina manifests to apply
-	// to the cluster for this site. This is temporarily required to support installing the
-	// machina controller until we have public downloadable releases coming from that repository.
-	machinaManifests string
-
 	// manageCniPlugin controls whether unbounded-net manages the CNI plugin
 	// for the site. When false, the Site is configured with manageCniPlugin: false
 	// so that an existing CNI (e.g. Cilium, Calico) handles intra-site networking.
 	// Defaults to true.
 	manageCniPlugin bool
 
+	enableMachina  bool
+	enableMetalman bool
+	enableStorage  bool
+
 	// kubeCli is the kubernetes client interface.
 	kubeCli kubernetes.Interface
-
-	kubeConfig *rest.Config
 
 	// kubeconfigPath is the path to the kubeconfig file to use for connecting to the cluster.
 	kubeconfigPath string
 
 	// kubeResourcesCli is the controller-runtime client used for server-side apply of manifests.
 	kubeResourcesCli client.Client
-
-	// kubectl is function that creates a kubectl command pointed to the correct KUBECONFIG for the cluster.
-	kubectl kube.KubectlFunc
-
-	installUnboundedCNI *installUnboundedCNI
-
-	installMachina *installMachina
+	kubeConfig       *rest.Config
 
 	logger *slog.Logger
 }
@@ -115,8 +93,6 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	}
 
 	h.kubeCli = kubeCli
-	h.kubeConfig = kubeConfig
-	h.kubectl = kube.Kubectl(nil, h.kubeconfigPath)
 
 	kubeResourcesCli, err := client.New(kubeConfig, client.Options{})
 	if err != nil {
@@ -124,49 +100,17 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 	}
 
 	h.kubeResourcesCli = kubeResourcesCli
+	h.kubeConfig = kubeConfig
 
-	if h.installUnboundedCNI == nil {
-		h.installUnboundedCNI = newInstallUnboundedCNI(
-			h.cniManifests,
-			nil,
-			h.logger,
-			h.kubeResourcesCli,
-			h.kubeCli,
-		)
+	if err := h.checkOperatorPrerequisites(ctx); err != nil {
+		return err
 	}
 
-	if h.installMachina == nil {
-		h.installMachina = newInstallMachina(h.machinaManifests, nil, h.logger, h.kubeResourcesCli, h.kubeCli)
-	}
-
-	if err := h.ensureUnboundedCNI(ctx); err != nil {
-		return fmt.Errorf("ensuring unbounded CNI for site %s: %w", h.name, err)
-	}
-
-	if err := h.ensureUnboundedSite(ctx, unboundedSiteConfig{
-		SiteName:        "cluster",
-		NodeCIDRs:       []string{h.clusterNodeCIDR},
-		PodCIDRs:        []string{h.clusterPodCIDR},
-		ManageCniPlugin: h.manageCniPlugin,
-		Manifests: []string{
-			"gatewaypool.yaml",
-			"site.yaml",
-			"sitegatewaypoolassignment.yaml",
-		},
-	}); err != nil {
+	if err := h.ensureUnboundedSite(ctx, h.clusterSiteConfig()); err != nil {
 		return fmt.Errorf("ensuring unbounded CNI site %s: %w", h.name, err)
 	}
 
-	if err := h.ensureUnboundedSite(ctx, unboundedSiteConfig{
-		SiteName:        h.name,
-		NodeCIDRs:       []string{h.nodeCIDR},
-		PodCIDRs:        []string{h.podCIDR},
-		ManageCniPlugin: h.manageCniPlugin,
-		Manifests: []string{
-			"site.yaml",
-			"sitegatewaypoolassignment.yaml",
-		},
-	}); err != nil {
+	if err := h.ensureUnboundedSite(ctx, h.remoteSiteConfig()); err != nil {
 		return fmt.Errorf("ensuring unbounded CNI site %s: %w", h.name, err)
 	}
 
@@ -174,11 +118,228 @@ func (h *siteInitHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("ensuring bootstrap token for site %s: %w", h.name, err)
 	}
 
-	if err := h.ensureMachinaIsRunning(ctx); err != nil {
-		return fmt.Errorf("installing machina controller for site %s: %w", h.name, err)
+	return nil
+}
+
+// checkOperatorPrerequisites verifies the cluster is ready to accept the Site
+// resources site init is about to create. The unbounded-operator owns CRD
+// lifecycle and reconciles Sites, so it must be installed first (via
+// `kubectl unbounded install`).
+//
+// The check uses API discovery to confirm the apiserver actually serves the
+// GroupVersionKinds site init applies (derived from the embedded manifests, so
+// the check tracks future API versions automatically). Discovery is used rather
+// than reading CustomResourceDefinition objects because it does not require
+// cluster-scoped CRD read permission and reflects the versions the apiserver
+// serves, not merely that a CRD is Established. A type that is not served is a
+// hard error; a missing or not-yet-ready operator Deployment is only a warning,
+// because the operator reconciles the Site once it becomes ready.
+func (h *siteInitHandler) checkOperatorPrerequisites(ctx context.Context) error {
+	required, err := requiredSiteAPIs()
+	if err != nil {
+		return fmt.Errorf("determining required Site API types: %w", err)
 	}
 
+	disco := h.kubeCli.Discovery()
+	servedKinds := map[schema.GroupVersion]map[string]bool{}
+
+	var missing []string
+
+	for _, gvk := range required {
+		gv := gvk.GroupVersion()
+
+		kinds, cached := servedKinds[gv]
+		if !cached {
+			kinds, err = servedKindsForGroupVersion(disco, gv)
+			if err != nil {
+				return fmt.Errorf("checking whether the cluster serves %s: %w", gv, err)
+			}
+
+			servedKinds[gv] = kinds
+		}
+
+		if !kinds[gvk.Kind] {
+			missing = append(missing, fmt.Sprintf("%s.%s", gvk.Kind, gv))
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"unbounded-operator is not installed: the cluster is not serving required API types (%s); run \"kubectl unbounded install\" first to bootstrap the unbounded-operator",
+			strings.Join(missing, ", "),
+		)
+	}
+
+	h.warnIfOperatorNotReady(ctx)
+
 	return nil
+}
+
+// servedKindsForGroupVersion returns the set of Kinds the apiserver serves for
+// gv. A GroupVersion the apiserver does not serve yields an empty set (not an
+// error), so callers can treat "not served" uniformly with "kind absent".
+func servedKindsForGroupVersion(disco discovery.DiscoveryInterface, gv schema.GroupVersion) (map[string]bool, error) {
+	list, err := disco.ServerResourcesForGroupVersion(gv.String())
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return map[string]bool{}, nil
+		}
+
+		return nil, err
+	}
+
+	kinds := make(map[string]bool, len(list.APIResources))
+	for _, resource := range list.APIResources {
+		kinds[resource.Kind] = true
+	}
+
+	return kinds, nil
+}
+
+// requiredSiteAPIs returns the distinct GroupVersionKinds declared by the
+// embedded Site manifest templates. Deriving the set from the templates (instead
+// of a hard-coded list) keeps the preflight in lockstep with the versions site
+// init actually applies, including future API bumps.
+func requiredSiteAPIs() ([]schema.GroupVersionKind, error) {
+	entries, err := fs.ReadDir(siteTemplates, siteTemplateDir)
+	if err != nil {
+		return nil, fmt.Errorf("reading site manifest templates: %w", err)
+	}
+
+	// Placeholder values so the templates render into valid YAML; only the
+	// static apiVersion/kind fields are read, which do not depend on the data.
+	data := unboundedSiteConfig{
+		SiteName:  "preflight",
+		NodeCIDRs: []string{"0.0.0.0/0"},
+		PodCIDRs:  []string{"0.0.0.0/0"},
+	}
+
+	seen := map[schema.GroupVersionKind]bool{}
+
+	var gvks []schema.GroupVersionKind
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+
+		content, err := fs.ReadFile(siteTemplates, siteTemplateDir+"/"+name)
+		if err != nil {
+			return nil, fmt.Errorf("reading site manifest template %s: %w", name, err)
+		}
+
+		tmpl, err := template.New(name).Parse(string(content))
+		if err != nil {
+			return nil, fmt.Errorf("parsing site manifest template %s: %w", name, err)
+		}
+
+		buf := &bytes.Buffer{}
+		if err := tmpl.Execute(buf, data); err != nil {
+			return nil, fmt.Errorf("rendering site manifest template %s: %w", name, err)
+		}
+
+		decoder := utilyaml.NewYAMLOrJSONDecoder(buf, 4096)
+
+		for {
+			obj := &unstructured.Unstructured{}
+
+			if err := decoder.Decode(obj); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+
+				return nil, fmt.Errorf("decoding site manifest template %s: %w", name, err)
+			}
+
+			gvk := obj.GroupVersionKind()
+			if gvk.Empty() {
+				continue
+			}
+
+			if !seen[gvk] {
+				seen[gvk] = true
+
+				gvks = append(gvks, gvk)
+			}
+		}
+	}
+
+	return gvks, nil
+}
+
+// warnIfOperatorNotReady logs a warning (never an error) when the
+// unbounded-operator Deployment is absent or not fully rolled out. The served
+// API types checked by checkOperatorPrerequisites are enough to apply Site
+// resources; a not-yet-ready operator only delays reconciliation, so site init
+// proceeds. Permission errors are downgraded to a debug log so a caller that can
+// apply Sites but cannot read Deployments is not blocked or alarmed.
+func (h *siteInitHandler) warnIfOperatorNotReady(ctx context.Context) {
+	namespace := unbounded.SystemNamespace()
+
+	deploy, err := h.kubeCli.AppsV1().Deployments(namespace).Get(ctx, "unbounded-operator", metav1.GetOptions{})
+	if err != nil {
+		switch {
+		case apierrors.IsNotFound(err):
+			h.logger.Warn(
+				"unbounded-operator Deployment not found; the Site will not be reconciled until the operator is installed and ready",
+				"namespace", namespace,
+			)
+		case apierrors.IsForbidden(err):
+			h.logger.Debug(
+				"skipping unbounded-operator readiness check: not permitted to read Deployments",
+				"namespace", namespace,
+			)
+		default:
+			h.logger.Debug(
+				"could not inspect unbounded-operator Deployment",
+				"namespace", namespace,
+				"error", err,
+			)
+		}
+
+		return
+	}
+
+	if !deploymentRolloutComplete(deploy) {
+		h.logger.Warn(
+			"unbounded-operator Deployment is not fully rolled out; the Site will be reconciled once the operator is ready",
+			"namespace", namespace,
+		)
+	}
+}
+
+func (h *siteInitHandler) clusterSiteConfig() unboundedSiteConfig {
+	return unboundedSiteConfig{
+		SiteName:        "cluster",
+		NodeCIDRs:       []string{h.clusterNodeCIDR},
+		PodCIDRs:        []string{h.clusterPodCIDR},
+		ManageCniPlugin: h.manageCniPlugin,
+		EnableMachina:   h.enableMachina,
+		Manifests: []string{
+			"gatewaypool.yaml",
+			"site.yaml",
+			"sitegatewaypoolassignment.yaml",
+		},
+	}
+}
+
+func (h *siteInitHandler) remoteSiteConfig() unboundedSiteConfig {
+	return unboundedSiteConfig{
+		SiteName:        h.name,
+		NodeCIDRs:       []string{h.nodeCIDR},
+		PodCIDRs:        []string{h.podCIDR},
+		ManageCniPlugin: h.manageCniPlugin,
+		EnableMetalman:  h.enableMetalman,
+		// Storage (RDMA) targets the worker nodes of the site being
+		// initialized, so --enable-storage applies to the remote Site.
+		EnableStorage: h.enableStorage,
+		Manifests: []string{
+			"site.yaml",
+			"sitegatewaypoolassignment.yaml",
+		},
+	}
 }
 
 func (h *siteInitHandler) validate() error {
@@ -193,11 +354,11 @@ func (h *siteInitHandler) validate() error {
 	}
 
 	if !isValidIPv4CIDR(h.clusterNodeCIDR) {
-		return errors.New("cluster pod CIDR is invalid")
+		return errors.New("cluster node CIDR is invalid")
 	}
 
 	if isEmpty(h.clusterPodCIDR) {
-		return errors.New("cluster node CIDR is required")
+		return errors.New("cluster pod CIDR is required")
 	}
 
 	if !isValidIPv4CIDR(h.clusterPodCIDR) {
@@ -222,14 +383,6 @@ func (h *siteInitHandler) validate() error {
 		return errors.New("pod CIDR is invalid")
 	}
 
-	if h.cniManifests != "" && !isHTTPSURL(h.cniManifests) && !isDirectoryOrFile(h.cniManifests) {
-		return errors.New("CNI manifests path is invalid")
-	}
-
-	if err := kube.CheckKubectlAvailable(); err != nil {
-		return fmt.Errorf("kubectl not available: %w", err)
-	}
-
 	h.kubeconfigPath = getKubeconfigPath(h.kubeconfigPath)
 
 	if !isReadableFile(h.kubeconfigPath) {
@@ -239,90 +392,18 @@ func (h *siteInitHandler) validate() error {
 	return nil
 }
 
-func (h *siteInitHandler) checkUnboundedCNIGatewayNode(ctx context.Context) (bool, error) {
-	opts := metav1.ListOptions{
-		LabelSelector: "unbounded-cloud.io/unbounded-net-gateway=true",
-	}
-
-	nodes, err := h.kubeCli.CoreV1().Nodes().List(ctx, opts)
-	if err != nil {
-		return false, fmt.Errorf("listing nodes with unbounded CNI gateway label: %w", err)
-	}
-
-	return len(nodes.Items) > 0, nil
-}
-
-func (h *siteInitHandler) ensureUnboundedCNI(ctx context.Context) error {
-	hasGatewayAssignableNode, err := h.checkUnboundedCNIGatewayNode(ctx)
-	if err != nil {
-		return fmt.Errorf("checking for unbounded CNI gateway node: %w", err)
-	}
-
-	if !hasGatewayAssignableNode {
-		return fmt.Errorf(
-			"no nodes with label unbounded-cloud.io/unbounded-net-gateway=true found; please label at least one node with that label before initializing the site",
-		)
-	}
-
-	if h.cniManifests == "" {
-		h.logger.Info("Using embedded unbounded-net manifests")
-	}
-
-	if err := h.installUnboundedCNI.run(ctx); err != nil {
-		return fmt.Errorf("installing unbounded CNI: %w", err)
-	}
-
-	return nil
-}
-
 type unboundedSiteConfig struct {
-	SiteName  string
-	NodeCIDRs []string
-	PodCIDRs  []string
-	Manifests []string
+	SiteName       string
+	NodeCIDRs      []string
+	PodCIDRs       []string
+	Manifests      []string
+	EnableMachina  bool
+	EnableMetalman bool
+	EnableStorage  bool
 	// ManageCniPlugin controls whether unbounded-net manages the CNI plugin.
 	// When false, the template emits manageCniPlugin: false so that an
 	// existing CNI (e.g. Cilium, Calico) is left in place.
 	ManageCniPlugin bool
-}
-
-func (h *siteInitHandler) ensureMachinaIsRunning(ctx context.Context) error {
-	machinaCfg := controller.DefaultConfig()
-	machinaCfg.APIServerEndpoint = h.kubeConfig.Host
-
-	ao := metav1.ApplyOptions{
-		FieldManager: fieldManagerID,
-	}
-
-	// Ensure the unbounded-kube namespace exists before applying the
-	// ConfigMap — the namespace manifest is part of the installer bundle
-	// but we need it earlier.
-	nsApply := v1.Namespace(machinaNamespace)
-	if _, err := h.kubeCli.CoreV1().Namespaces().Apply(ctx, nsApply, ao); err != nil {
-		return fmt.Errorf("ensuring namespace %s: %w", machinaNamespace, err)
-	}
-
-	b, err := yaml.Marshal(machinaCfg)
-	if err != nil {
-		return fmt.Errorf("marshaling machina controller config: %w", err)
-	}
-
-	s := v1.ConfigMap("machina-config", "unbounded-kube").
-		WithData(map[string]string{
-			"config.yaml": string(b),
-		})
-
-	if err := kube.ApplyConfigMap(ctx, h.kubeCli, s, ao); err != nil {
-		return fmt.Errorf("applying machina config: %w", err)
-	}
-
-	if h.machinaManifests == "" {
-		h.logger.Info("Using embedded machina manifests")
-	}
-
-	h.installMachina.skipPaths = []string{"03-config.yaml"}
-
-	return h.installMachina.run(ctx)
 }
 
 // ensureUnboundedSite sets up the main gateway and the cluster site that encompasses any nodes attached to the
@@ -333,10 +414,9 @@ func (h *siteInitHandler) ensureUnboundedSite(ctx context.Context, cfg unbounded
 	buf := &bytes.Buffer{}
 
 	templateFS := siteTemplates
-	templateDir := "assets/unbounded-net-site/"
 
 	for _, name := range cfg.Manifests {
-		path := templateDir + name
+		path := siteTemplateDir + "/" + name
 
 		content, err := fs.ReadFile(templateFS, path)
 		if err != nil {
@@ -399,8 +479,6 @@ func siteInitCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&handler.cniManifests, "cni-manifests", "", "Path or https URL to CNI plugin manifests (uses embedded manifests if omitted)")
-	cmd.Flags().StringVar(&handler.machinaManifests, "machina-manifests", "", "Path or https URL to Machina manifests (uses embedded manifests if omitted)")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringVar(&handler.name, "name", "", "The name of the site")
 	cmd.Flags().StringVar(&handler.clusterNodeCIDR, "cluster-node-cidr", "", "The cluster node cidr")
@@ -408,6 +486,9 @@ func siteInitCommand() *cobra.Command {
 	cmd.Flags().StringVar(&handler.nodeCIDR, "node-cidr", "", "The node CIDR")
 	cmd.Flags().StringVar(&handler.podCIDR, "pod-cidr", "", "The pod CIDR")
 	cmd.Flags().BoolVar(&handler.manageCniPlugin, "manage-cni-plugin", true, "Whether unbounded-net manages the CNI plugin; set to false when the cluster already has a CNI (e.g. Cilium, Calico)")
+	cmd.Flags().BoolVar(&handler.enableMachina, "enable-machina", true, "Enable machina for the Site")
+	cmd.Flags().BoolVar(&handler.enableMetalman, "enable-metalman", false, "Enable metalman for the Site")
+	cmd.Flags().BoolVar(&handler.enableStorage, "enable-storage", false, "Enable unbounded-storage for the Site")
 
 	if err := cmd.MarkFlagRequired("name"); err != nil {
 		panic(err)

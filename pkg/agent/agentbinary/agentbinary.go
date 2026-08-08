@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Package agentbinary installs unbounded-agent binaries from release archives.
+// Package agentbinary installs and switches agent binaries from release archives.
 package agentbinary
 
 import (
@@ -9,11 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -25,47 +23,7 @@ const verifyTimeout = 30 * time.Second
 
 const daemonBinaryMode os.FileMode = 0o755
 
-// InstallFromTarGz downloads a remote .tar.gz archive and installs binaryName
-// from it to targetPath.
-func InstallFromTarGz(ctx context.Context, downloadURL, targetPath, binaryName string, perm os.FileMode) error {
-	parsedURL, err := url.Parse(downloadURL)
-	if err != nil {
-		return fmt.Errorf("parse download URL %q: %w", downloadURL, err)
-	}
-
-	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-		return fmt.Errorf("unsupported agent download URL scheme %q", parsedURL.Scheme)
-	}
-
-	for tarFile, err := range utilio.DecompressTarGzFromRemote(ctx, downloadURL) {
-		if err != nil {
-			return err
-		}
-
-		if filepath.Base(tarFile.Name) != binaryName {
-			continue
-		}
-
-		if tarFile.Size == 0 {
-			return fmt.Errorf("agent binary %q in archive %q is empty", binaryName, downloadURL)
-		}
-
-		if err := utilio.InstallFile(targetPath, tarFile.Body, perm); err != nil {
-			return fmt.Errorf("install %s from %q: %w", binaryName, downloadURL, err)
-		}
-
-		if err := Verify(ctx, targetPath); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	return fmt.Errorf("agent binary %q not found in archive %q", binaryName, downloadURL)
-}
-
-// InstallFromFile installs a local agent binary to targetPath.
-func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error) {
+func installFromFile(sourcePath, targetPath string, perm os.FileMode) (err error) {
 	source, err := os.Open(sourcePath)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", sourcePath, err)
@@ -79,24 +37,6 @@ func InstallFromFile(sourcePath, targetPath string, perm os.FileMode) (err error
 
 	if err := utilio.InstallFile(targetPath, source, perm); err != nil {
 		return fmt.Errorf("install %s to %s: %w", sourcePath, targetPath, err)
-	}
-
-	return nil
-}
-
-// InstallAndSwitchFromTarGz installs the next agent binary and switches daemon links.
-func InstallAndSwitchFromTarGz(ctx context.Context, downloadURL string, paths goalstates.AgentUpgradePaths, perm os.FileMode) error {
-	targetPath := paths.NextTargetPath()
-	if err := InstallFromTarGz(ctx, downloadURL, targetPath, goalstates.AgentUpgradeBinaryName, perm); err != nil {
-		return fmt.Errorf("install upgraded daemon binary to %s: %w", targetPath, err)
-	}
-
-	if err := utilio.UpdateSymlink(paths.LastGoodPath, paths.CurrentTargetPath); err != nil {
-		return fmt.Errorf("update last-good daemon symlink: %w", err)
-	}
-
-	if err := utilio.UpdateSymlink(paths.CurrentPath, targetPath); err != nil {
-		return fmt.Errorf("update current daemon symlink: %w", err)
 	}
 
 	return nil
@@ -164,7 +104,7 @@ func initialDaemonBinaryTarget(paths goalstates.AgentUpgradePaths) (string, erro
 		return target, nil
 	}
 
-	if err := InstallFromFile(paths.BinaryPath, paths.BluePath, daemonBinaryMode); err != nil {
+	if err := installFromFile(paths.BinaryPath, paths.BluePath, daemonBinaryMode); err != nil {
 		return "", err
 	}
 
@@ -177,7 +117,7 @@ func Verify(ctx context.Context, path string) error {
 	defer cancel()
 
 	for {
-		output, err := exec.CommandContext(verifyCtx, path, "version").CombinedOutput()
+		err := exec.CommandContext(verifyCtx, path, "version").Run()
 		if err == nil {
 			return nil
 		}
@@ -189,11 +129,6 @@ func Verify(ctx context.Context, path string) error {
 			case <-time.After(100 * time.Millisecond):
 				continue
 			}
-		}
-
-		details := strings.TrimSpace(string(output))
-		if details != "" {
-			return fmt.Errorf("verify agent binary %s: %w: %s", path, err, details)
 		}
 
 		return fmt.Errorf("verify agent binary %s: %w", path, err)

@@ -176,7 +176,7 @@ impl SendPool {
         // do not overlap.
         unsafe { ptr::copy_nonoverlapping(framed.as_ptr(), slot_ptr, len) };
 
-        let (slot, fut) = match self.completions.allocate() {
+        let (mut slot, fut) = match self.completions.allocate() {
             Ok(pair) => pair,
             Err(e) => {
                 slab.free.lock().unwrap().push(idx);
@@ -217,7 +217,7 @@ impl SendPool {
             .map(|m| m.desc())
             .unwrap_or(ptr::null_mut());
 
-        let (slot, fut) = match self.completions.allocate() {
+        let (mut slot, fut) = match self.completions.allocate() {
             Ok(pair) => pair,
             Err(e) => {
                 // SAFETY: `buf_addr`/`len` came from `Box::into_raw` on a

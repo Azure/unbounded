@@ -10,15 +10,9 @@ import (
 	"github.com/spf13/pflag"
 )
 
-// defaultNamespace is the namespace hack/orca/setup-orca.sh installs
-// Orca + Azurite + Garage into. Mirrored here so the dev preset
-// can drive its own auto-port-forward without needing to read a
-// manifest or kubeconfig context annotation.
-const defaultNamespace = "unbounded-kube"
-
 // Service name constants used by the dev preset. These match the
 // Service objects produced by deploy/orca/**/*.yaml.tmpl, which the
-// setup-orca.sh install script applies into defaultNamespace.
+// setup-orca.sh install script applies into the system namespace.
 const (
 	devSvcOrca    = "orca"
 	devSvcAzurite = "azurite"

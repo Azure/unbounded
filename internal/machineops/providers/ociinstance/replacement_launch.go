@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/oracle/oci-go-sdk/v65/core"
@@ -108,7 +107,7 @@ func (p *Provider) findExistingReplacement(ctx context.Context, client computeCl
 }
 
 func (p *Provider) buildReplacementLaunchDetails(ctx context.Context, client computeClient, oldInstance core.Instance, primaryVNIC core.Vnic, request machineops.OperationRequest) (core.LaunchInstanceDetails, error) {
-	imageID, err := p.resolveImageID(ctx, client, oldInstance, request.Parameters)
+	imageID, err := resolveImageID(oldInstance, request)
 	if err != nil {
 		return core.LaunchInstanceDetails{}, err
 	}
@@ -116,45 +115,30 @@ func (p *Provider) buildReplacementLaunchDetails(ctx context.Context, client com
 	return buildReplacementLaunchDetails(oldInstance, primaryVNIC, imageID, request)
 }
 
-func (p *Provider) resolveImageID(ctx context.Context, client computeClient, oldInstance core.Instance, parameters map[string]string) (string, error) {
-	// Operators can pin an image for controlled rollout; otherwise choose the
-	// newest Ubuntu image OCI reports as compatible with the source shape.
-	if imageID := strings.TrimSpace(parameters[parameterImageID]); imageID != "" {
+func resolveImageID(oldInstance core.Instance, request machineops.OperationRequest) (string, error) {
+	if imageID := strings.TrimSpace(request.HostImage); imageID != "" {
 		return imageID, nil
 	}
 
-	images, err := client.ListImages(ctx, *oldInstance.CompartmentId, *oldInstance.Shape)
-	if err != nil {
-		return "", fmt.Errorf("list OCI images: %w", err)
+	// Keep the legacy MachineOperation parameter as a temporary compatibility
+	// path while callers migrate image selection to Machine.spec.host.image.
+	if imageID := strings.TrimSpace(request.Parameters[parameterImageID]); imageID != "" {
+		return imageID, nil
 	}
 
-	sort.SliceStable(images, func(i, j int) bool {
-		if images[i].TimeCreated == nil {
-			return false
-		}
-
-		if images[j].TimeCreated == nil {
-			return true
-		}
-
-		return images[i].TimeCreated.After(images[j].TimeCreated.Time)
-	})
-
-	for _, image := range images {
-		if image.Id == nil || image.LifecycleState != core.ImageLifecycleStateAvailable {
-			continue
-		}
-
-		if image.OperatingSystem == nil || image.OperatingSystemVersion == nil {
-			continue
-		}
-
-		if *image.OperatingSystem == defaultUbuntuOS && *image.OperatingSystemVersion == defaultUbuntuOSVersion {
-			return *image.Id, nil
-		}
+	if source, ok := oldInstance.SourceDetails.(core.InstanceSourceViaImageDetails); ok && source.ImageId != nil && strings.TrimSpace(*source.ImageId) != "" {
+		return *source.ImageId, nil
 	}
 
-	return "", fmt.Errorf("no compatible %s %s image found for shape %s; set spec.parameters.%s", defaultUbuntuOS, defaultUbuntuOSVersion, *oldInstance.Shape, parameterImageID)
+	if source, ok := oldInstance.SourceDetails.(*core.InstanceSourceViaImageDetails); ok && source.ImageId != nil && strings.TrimSpace(*source.ImageId) != "" {
+		return *source.ImageId, nil
+	}
+
+	if oldInstance.ImageId != nil && strings.TrimSpace(*oldInstance.ImageId) != "" {
+		return *oldInstance.ImageId, nil
+	}
+
+	return "", fmt.Errorf("cannot determine the current OCI image; set Machine spec.host.image or spec.parameters.%s", parameterImageID)
 }
 
 func buildReplacementLaunchDetails(oldInstance core.Instance, primaryVNIC core.Vnic, imageID string, request machineops.OperationRequest) (core.LaunchInstanceDetails, error) {
@@ -207,7 +191,7 @@ func replacementTags(oldInstance core.Instance, request machineops.OperationRequ
 	freeformTags := copyStringMap(oldInstance.FreeformTags)
 	// OCI freeform tag keys cannot use slash-delimited Kubernetes-style names.
 	// These tags are also the restart-safe replacement lookup keys.
-	freeformTags[tagMachine] = request.Machine.Name
+	freeformTags[tagMachine] = request.MachineName
 	freeformTags[tagOperation] = request.OperationName
 	freeformTags[tagOperationUID] = string(request.OperationUID)
 	freeformTags[tagOldProviderID] = request.ProviderID

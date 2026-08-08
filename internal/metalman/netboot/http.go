@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,8 +44,8 @@ type StatusRecorder interface {
 	RecordBootLoaderDownloaded(ctx context.Context, machineName, filename string) error
 	RecordBootImageWritten(ctx context.Context, machineName string) error
 	RecordCloudInitDone(ctx context.Context, machineName string) error
-	RecordMachineCondition(ctx context.Context, machineName string, condition metav1.Condition) error
-	RecordPXEDisabled(ctx context.Context, machineName string, repaveCounter int64, imageName string) error
+	RecordOperationCondition(ctx context.Context, machineName string, condition metav1.Condition) error
+	RecordPXEDisabled(ctx context.Context, machineName, imageName string) error
 }
 
 func (h *HTTPServer) NeedLeaderElection() bool { return false }
@@ -70,7 +71,7 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /", h.handleFile)
 
 	addr := fmt.Sprintf("%s:%d", h.BindAddr, h.Port)
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Addr: addr, Handler: normalizePath(mux)}
 
 	go func() {
 		<-ctx.Done()
@@ -84,6 +85,41 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// normalizePath collapses redundant slashes in the request path before the
+// ServeMux routes it. When shim is HTTP-booted from the web root it requests
+// its second stage as "//grubx64.efi": it appends its absolute-path loader name
+// to its boot URL's directory. Go's ServeMux would answer that with a 307
+// redirect, which shim refuses to follow (it treats the 3xx as EFI_HTTP_ERROR
+// 0x23 and aborts the boot). Normalizing the path here makes the mux serve the
+// file directly with a 200.
+func normalizePath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if cleaned := cleanRequestPath(r.URL.Path); cleaned != r.URL.Path {
+			r.URL.Path = cleaned
+			r.URL.RawPath = ""
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// cleanRequestPath normalizes a URL path the same way path.Clean does, so the
+// middleware can collapse unclean paths (e.g. "//grubx64.efi") that the
+// ServeMux would otherwise redirect. A trailing slash is preserved to mirror
+// ServeMux behavior.
+func cleanRequestPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+
+	cleaned := path.Clean(p)
+	if cleaned != "/" && strings.HasSuffix(p, "/") {
+		cleaned += "/"
+	}
+
+	return cleaned
 }
 
 func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
@@ -104,14 +140,14 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node.Spec.PXE == nil {
+	if node.Spec.Netboot() == nil {
 		log.Warn("node has no PXE config", "node", node.Name)
 		http.NotFound(w, r)
 
 		return
 	}
 
-	imageRef := node.Spec.PXE.Image
+	imageRef := node.Spec.Netboot().Image
 	if path != "disk.img.gz" {
 		imageRef = h.NetbootImageRef(node)
 	}
@@ -123,12 +159,36 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP &&
+		h.isHTTPBootLoaderDownload(imageRef, node.Spec.Netboot().TargetArchitecture(), path) {
+		installRequested, err := h.installRequested(r.Context(), node)
+		if err != nil {
+			log.Warn("checking active install operation", "node", node.Name, "err", err)
+			http.Error(w, "checking active install operation", http.StatusServiceUnavailable)
+
+			return
+		}
+
+		if !installRequested {
+			log.Info("HTTP boot disabled because no install operation is active", "node", node.Name)
+			http.NotFound(w, r)
+
+			return
+		}
+	}
+
 	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, imageRef, ip)
 	if err != nil {
 		if errors.Is(err, ErrNotYetDownloaded) {
 			log.Info("file not yet downloaded", "node", node.Name)
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, "file not yet available, retry later", http.StatusServiceUnavailable)
+
+			return
+		}
+
+		if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && isOptionalShimRevocationsFile(path) {
+			serveMissingShimRevocationsFile(w, log, node, path)
 
 			return
 		}
@@ -151,6 +211,33 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", resolved.ContentType)
 	w.Write(resolved.Data) //nolint:errcheck // Best-effort HTTP response write.
 	h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, imageRef, path)
+}
+
+const shimRevocationsNotPresentBody = "unbounded: no optional shim revocations file is present\n"
+
+func isOptionalShimRevocationsFile(path string) bool {
+	path = strings.Trim(path, "/")
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		path = path[i+1:]
+	}
+
+	switch strings.ToLower(path) {
+	case "revocations.efi", "revocations_sbat.efi", "revocations_sku.efi":
+		return true
+	default:
+		return false
+	}
+}
+
+func serveMissingShimRevocationsFile(w http.ResponseWriter, log *slog.Logger, node *v1alpha3.Machine, path string) {
+	// shim treats these files as optional for netboot, but its HTTP fetch path
+	// requires a 200 response with a non-empty body. Returning a small invalid
+	// EFI payload preserves the "not present" semantics without sending a 404.
+	log.Info("serving no-op body for missing optional shim revocations file", "node", node.Name, "path", path)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprint(len(shimRevocationsNotPresentBody)))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(shimRevocationsNotPresentBody)) //nolint:errcheck // Best-effort HTTP response write.
 }
 
 func (h *HTTPServer) handleCloudInitLog(w http.ResponseWriter, r *http.Request) {
@@ -208,9 +295,8 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 // finishes successfully the CloudInitDone condition transitions to True.
 const cloudInitLastStage = "modules-final"
 
-// recordCloudInitCondition records the CloudInitDone condition for the Machine
-// that matches the request source IP. The recorder is asynchronous in the
-// serve-pxe command, so cloud-init webhooks do not wait on Kubernetes status IO.
+// recordCloudInitCondition records the CloudInitDone condition for the active
+// MachineOperation targeting the Machine that matches the request source IP.
 func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Logger, ip string, ev *cloudInitEvent) string {
 	if h.Reader == nil {
 		return ""
@@ -225,7 +311,7 @@ func (h *HTTPServer) recordCloudInitCondition(ctx context.Context, log *slog.Log
 
 	cond := buildCloudInitCondition(ev, node.Generation)
 	if cond != nil && h.StatusRecorder != nil {
-		if err := h.StatusRecorder.RecordMachineCondition(ctx, node.Name, *cond); err != nil {
+		if err := h.StatusRecorder.RecordOperationCondition(ctx, node.Name, *cond); err != nil {
 			log.Error("recording cloud-init condition", "node", node.Name, "err", err)
 		}
 	}
@@ -241,7 +327,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 	switch ev.EventType {
 	case "start":
 		return &metav1.Condition{
-			Type:               v1alpha3.MachineConditionCloudInitDone,
+			Type:               v1alpha3.MachineOperationConditionCloudInitDone,
 			Status:             metav1.ConditionFalse,
 			Reason:             "Running",
 			Message:            fmt.Sprintf("stage %q started: %s", ev.Name, ev.Description),
@@ -256,7 +342,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 			}
 
 			return &metav1.Condition{
-				Type:               v1alpha3.MachineConditionCloudInitDone,
+				Type:               v1alpha3.MachineOperationConditionCloudInitDone,
 				Status:             metav1.ConditionFalse,
 				Reason:             "Failed",
 				Message:            msg,
@@ -266,7 +352,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 
 		if ev.Name == cloudInitLastStage {
 			return &metav1.Condition{
-				Type:               v1alpha3.MachineConditionCloudInitDone,
+				Type:               v1alpha3.MachineOperationConditionCloudInitDone,
 				Status:             metav1.ConditionTrue,
 				Reason:             "Succeeded",
 				Message:            "cloud-init completed successfully",
@@ -276,7 +362,7 @@ func buildCloudInitCondition(ev *cloudInitEvent, generation int64) *metav1.Condi
 
 		// An earlier stage succeeded - cloud-init is still running.
 		return &metav1.Condition{
-			Type:               v1alpha3.MachineConditionCloudInitDone,
+			Type:               v1alpha3.MachineOperationConditionCloudInitDone,
 			Status:             metav1.ConditionFalse,
 			Reason:             "Running",
 			Message:            fmt.Sprintf("stage %q finished successfully, waiting for remaining stages", ev.Name),
@@ -302,25 +388,9 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 
 	h.recordBootImageWritten(r.Context(), log, node.Name)
 
-	var specRepave, statusRepave int64
-	if node.Spec.Operations != nil {
-		specRepave = node.Spec.Operations.RepaveCounter
-	}
-
-	if node.Status.Operations != nil {
-		statusRepave = node.Status.Operations.RepaveCounter
-	}
-
-	if specRepave <= statusRepave {
-		log.Info("repave already cleared", "node", node.Name)
-		w.WriteHeader(http.StatusOK)
-
-		return
-	}
-
 	imageName := ""
-	if node.Spec.PXE != nil {
-		imageName = node.Spec.PXE.Image
+	if node.Spec.Netboot() != nil {
+		imageName = node.Spec.Netboot().Image
 	}
 
 	if h.StatusRecorder == nil {
@@ -330,7 +400,7 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.StatusRecorder.RecordPXEDisabled(r.Context(), node.Name, specRepave, imageName); err != nil {
+	if err := h.StatusRecorder.RecordPXEDisabled(r.Context(), node.Name, imageName); err != nil {
 		log.Error("recording PXE disabled", "node", node.Name, "err", err)
 		http.Error(w, "recording PXE disabled", http.StatusServiceUnavailable)
 
@@ -352,11 +422,11 @@ func (h *HTTPServer) recordBootImageWritten(ctx context.Context, log *slog.Logge
 }
 
 func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, path string) {
-	if h.StatusRecorder == nil || node == nil || node.Spec.PXE == nil || node.Spec.PXE.TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP {
+	if h.StatusRecorder == nil || node == nil || node.Spec.Netboot() == nil || node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP {
 		return
 	}
 
-	if !h.isHTTPBootLoaderDownload(imageRef, node.Spec.PXE.TargetArchitecture(), path) {
+	if !h.isHTTPBootLoaderDownload(imageRef, node.Spec.Netboot().TargetArchitecture(), path) {
 		return
 	}
 

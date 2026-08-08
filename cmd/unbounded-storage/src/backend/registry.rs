@@ -8,10 +8,10 @@
 //! [`OriginRef::backend_id`](crate::storage::OriginRef), stamped by the
 //! frontend that accepted it, so the data path can resolve which
 //! configured backend to fetch from per request. [`BackendRegistry`]
-//! owns the `name -> OriginBackend` map behind an [`ArcSwap`] so the
+//! owns the `name -> OriginBackend` map in shard-local storage so the
 //! config watcher can add, remove, or replace a backend at runtime
-//! without tearing down the shard: a reconcile pass builds the new map
-//! and publishes it atomically, and the next fetch observes it.
+//! without tearing down the shard. In-flight streams retain their chosen
+//! backend independently of later registry changes.
 //!
 //! The registry implements [`Backend`] itself, so it drops into the
 //! same generic slot the single [`OriginBackend`] used to fill in the
@@ -19,82 +19,69 @@
 //! [`BackendReconcileTarget`] so the live-config reconciler drives it
 //! the same way it drives the peer fabric.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::task::{Context, Poll};
-
-use arc_swap::ArcSwap;
 
 use crate::bufferpool::{BulkRef, Error, PageRef, PageStream};
 use crate::config::reconcile::BackendReconcileTarget;
 use crate::config::{BackendSpec, backend_spec};
+use crate::ring::NetHandle;
 use crate::storage::StripeReq;
 use crate::tls::{TlsConfig, TlsContext};
 
 use super::url::parse_endpoint;
 use super::{
-    AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginRing, OriginStream,
-    S3Backend,
+    AzureBackend, Backend, FakeBackend, HttpBackend, OriginBackend, OriginStream, S3Auth, S3Backend,
 };
 
 /// The build context a registry needs to (re)construct an
 /// [`OriginBackend`] from a [`BackendSpec`]. Captured once per registry
-/// instance because the pool transport and the RPC handler each own a
-/// registry that differs only in which ring a cache-miss fetch drives
-/// and which registered region origin bytes land in.
+/// instance because every shard has its own network ring and registered
+/// backing region.
 #[derive(Clone)]
 struct BuildCtx {
-    ring: OriginRing,
+    handle: NetHandle,
     page_size: usize,
     backing_base: *mut u8,
 }
 
 /// A shard-local set of origin backends keyed by component name, swappable at
-/// runtime. Clones share the same underlying map (cheap `Arc` clone),
+/// runtime. Clones share the same underlying map (cheap `Rc` clone),
 /// so a clone handed to the control-drain tick hook reconciles the
 /// very map the data path reads.
 #[derive(Clone)]
 pub struct BackendRegistry {
-    backends: Arc<ArcSwap<HashMap<String, Arc<OriginBackend>>>>,
+    backends: Rc<RefCell<HashMap<String, Rc<OriginBackend>>>>,
     ctx: BuildCtx,
 }
 
-// SAFETY: shard-pinned exactly like the `OriginBackend`s it holds (see
-// `backend::http`/`backend::s3`). The `*mut u8` build base and the
-// `Rc`-bearing `OriginRing::Shard` are only ever touched on the owning
-// shard thread or the ephemeral `fabric-rpc-worker` thread driving a
-// `WorkerLocal` ring; the marker only lets the registry live in the
-// `Send + Sync` generic slots the transport/handler require. It is not
-// safe to move a registry to an unrelated thread.
-unsafe impl Send for BackendRegistry {}
-unsafe impl Sync for BackendRegistry {}
-
 impl BackendRegistry {
-    /// Build a registry seeded from `specs`, fetching through `ring`
+    /// Build a registry seeded from `specs`, fetching through `handle`
     /// into the region based at `backing_base`. A spec that fails to
     /// build (e.g. a URL that does not resolve) aborts the seed
     /// with the error, because startup must fail loudly rather than
     /// silently drop a configured backend.
     pub fn new(
         specs: &[BackendSpec],
-        ring: OriginRing,
+        handle: NetHandle,
         page_size: usize,
         backing_base: *mut u8,
     ) -> io::Result<Self> {
         let ctx = BuildCtx {
-            ring,
+            handle,
             page_size,
             backing_base,
         };
-        let mut map: HashMap<String, Arc<OriginBackend>> = HashMap::with_capacity(specs.len());
+        let mut map: HashMap<String, Rc<OriginBackend>> = HashMap::with_capacity(specs.len());
         for spec in specs {
-            map.insert(spec.name.clone(), Arc::new(ctx.build(spec)?));
+            map.insert(spec.name.clone(), Rc::new(ctx.build(spec)?));
         }
         Ok(Self {
-            backends: Arc::new(ArcSwap::from_pointee(map)),
+            backends: Rc::new(RefCell::new(map)),
             ctx,
         })
     }
@@ -102,21 +89,13 @@ impl BackendRegistry {
     /// Number of backends currently registered.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.backends.load().len()
+        self.backends.borrow().len()
     }
 
     /// Whether a backend with `name` is currently registered.
     #[cfg(test)]
     pub fn contains(&self, id: &str) -> bool {
-        self.backends.load().contains_key(id)
-    }
-
-    /// Copy-on-write mutate the live map: clone the current contents,
-    /// apply `f`, then publish the result atomically.
-    fn mutate<F: FnOnce(&mut HashMap<String, Arc<OriginBackend>>)>(&self, f: F) {
-        let mut next = HashMap::clone(&self.backends.load());
-        f(&mut next);
-        self.backends.store(Arc::new(next));
+        self.backends.borrow().contains_key(id)
     }
 }
 
@@ -134,14 +113,14 @@ impl BuildCtx {
             Some(backend_spec::Config::Http(cfg)) => {
                 let endpoint = build_origin_endpoint(
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
                 let origin = HttpBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Http(HttpBackend::new(
-                    self.ring.clone(),
+                    self.handle.clone(),
                     origin,
                     endpoint.host,
                     endpoint.sni_host,
@@ -156,14 +135,15 @@ impl BuildCtx {
             Some(backend_spec::Config::S3(cfg)) => {
                 let endpoint = build_origin_endpoint(
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
+                let auth = build_s3_auth(cfg)?;
                 let origin = S3Backend::resolve_origin(&endpoint.authority)?;
-                Ok(OriginBackend::S3(S3Backend::new(
-                    self.ring.clone(),
+                Ok(OriginBackend::S3(S3Backend::new_with_auth(
+                    self.handle.clone(),
                     origin,
                     endpoint.host,
                     endpoint.sni_host,
@@ -173,19 +153,20 @@ impl BuildCtx {
                     self.page_size,
                     self.backing_base,
                     cfg.http_concurrency.expect("http_concurrency defaulted") as usize,
+                    auth,
                 )))
             }
             Some(backend_spec::Config::Azure(cfg)) => {
                 let endpoint = build_origin_endpoint(
                     &cfg.url,
-                    &cfg.ca_cert_path,
+                    &cfg.ca_cert,
                     cfg.insecure_skip_verify,
-                    &cfg.client_cert_path,
-                    &cfg.client_key_path,
+                    &cfg.client_cert,
+                    &cfg.client_key,
                 )?;
                 let origin = AzureBackend::resolve_origin(&endpoint.authority)?;
                 Ok(OriginBackend::Azure(AzureBackend::new(
-                    self.ring.clone(),
+                    self.handle.clone(),
                     origin,
                     endpoint.host,
                     endpoint.sni_host,
@@ -221,20 +202,20 @@ struct OriginEndpoint {
 
 fn build_origin_endpoint(
     url: &str,
-    ca_cert_path: &Option<String>,
+    ca_cert: &Option<String>,
     insecure_skip_verify: bool,
-    client_cert_path: &Option<String>,
-    client_key_path: &Option<String>,
+    client_cert: &Option<String>,
+    client_key: &Option<String>,
 ) -> io::Result<OriginEndpoint> {
     let url = parse_endpoint(url)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let authority = url.authority();
     let tls = if url.scheme.is_tls() {
         let cfg = TlsConfig {
-            ca_cert_path: ca_cert_path.clone(),
+            ca_cert: ca_cert.clone(),
             insecure_skip_verify,
-            client_cert_path: client_cert_path.clone(),
-            client_key_path: client_key_path.clone(),
+            client_cert: client_cert.clone(),
+            client_key: client_key.clone(),
         };
         let ctx = TlsContext::new(&cfg).map_err(|e| io::Error::other(e.to_string()))?;
         Some(Rc::new(ctx))
@@ -248,6 +229,26 @@ fn build_origin_endpoint(
         sni_host: url.host,
         tls,
     })
+}
+
+fn build_s3_auth(cfg: &crate::config::S3BackendConfig) -> io::Result<Option<S3Auth>> {
+    match (
+        cfg.access_key_id.as_deref(),
+        cfg.secret_access_key.as_deref(),
+        cfg.region.as_deref(),
+    ) {
+        (None, None, None) if cfg.session_token.is_none() => Ok(None),
+        (Some(access_key_id), Some(secret_access_key), Some(region)) => Ok(Some(S3Auth::new(
+            access_key_id,
+            secret_access_key,
+            region,
+            cfg.session_token.clone(),
+        ))),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 authentication requires region, access_key_id, and secret_access_key",
+        )),
+    }
 }
 
 impl Backend for BackendRegistry {
@@ -264,14 +265,11 @@ impl Backend for BackendRegistry {
             Some(origin) => origin.backend_id.as_str(),
             None => return RegistryFetchStream::unknown(""),
         };
-        let map = self.backends.load();
-        match map.get(backend_id) {
-            Some(backend) => RegistryFetchStream::Origin(OriginBackend::fetch_stream(
-                Arc::clone(backend),
-                req,
-                src,
-                dsts,
-            )),
+        let backend = self.backends.borrow().get(backend_id).cloned();
+        match backend {
+            Some(backend) => {
+                RegistryFetchStream::Origin(OriginBackend::fetch_stream(backend, req, src, dsts))
+            }
             None => RegistryFetchStream::unknown(backend_id),
         }
     }
@@ -279,27 +277,23 @@ impl Backend for BackendRegistry {
 
 impl BackendReconcileTarget for BackendRegistry {
     fn list(&self) -> Vec<String> {
-        self.backends.load().keys().cloned().collect()
+        self.backends.borrow().keys().cloned().collect()
     }
 
     fn add(&self, spec: &BackendSpec) -> Result<(), String> {
-        // Build before taking the swap so a failed build leaves the
-        // live map untouched.
+        // Build before mutating so a failed build leaves the live map untouched.
         let backend = self
             .ctx
             .build(spec)
             .map_err(|e| format!("build backend {}: {e}", spec.name))?;
-        let built = Arc::new(backend);
-        self.mutate(|map| {
-            map.insert(spec.name.clone(), built);
-        });
+        self.backends
+            .borrow_mut()
+            .insert(spec.name.clone(), Rc::new(backend));
         Ok(())
     }
 
     fn remove(&self, id: &str) -> Result<(), String> {
-        self.mutate(|map| {
-            map.remove(id);
-        });
+        self.backends.borrow_mut().remove(id);
         Ok(())
     }
 }
@@ -344,9 +338,13 @@ impl PageStream for RegistryFetchStream<'_> {
 #[cfg(test)]
 mod tests {
     use std::ptr;
+    use std::rc::Rc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
+    use crate::bufferpool::StripeKey;
     use crate::config::{FakeBackendConfig, HttpBackendConfig, backend_spec};
+    use crate::ring::NetworkRing;
+    use crate::storage::{OriginRef, synthetic_object_id};
 
     use super::*;
 
@@ -357,10 +355,10 @@ mod tests {
                 url: url.to_string(),
                 stripe_size_bytes: Some(4 * 1024 * 1024),
                 http_concurrency: Some(64),
-                ca_cert_path: None,
+                ca_cert: None,
                 insecure_skip_verify: false,
-                client_cert_path: None,
-                client_key_path: None,
+                client_cert: None,
+                client_key: None,
             })),
         }
     }
@@ -375,21 +373,10 @@ mod tests {
         }
     }
 
-    /// A registry over a worker-local ring with no fixed region and a
-    /// null backing base. Sound for tests that never drive a fetch (they
-    /// only exercise the id map and the unknown-backend path); the ring
-    /// is built lazily on first `handle()`, which these tests never hit.
     fn registry(specs: &[BackendSpec]) -> BackendRegistry {
-        BackendRegistry::new(
-            specs,
-            OriginRing::WorkerLocal {
-                queue_depth: 1,
-                region: None,
-            },
-            4096,
-            ptr::null_mut(),
-        )
-        .expect("seed registry")
+        let ring = Rc::new(NetworkRing::new(8).expect("network ring"));
+        BackendRegistry::new(specs, NetHandle::new(ring), 4096, ptr::null_mut())
+            .expect("seed registry")
     }
 
     fn noop_waker() -> Waker {
@@ -475,5 +462,58 @@ mod tests {
         let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
         assert_eq!(reg.len(), 1);
         assert!(reg.contains("synthetic"));
+    }
+
+    #[test]
+    fn selected_backend_outlives_removal() {
+        let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
+        let selected = Rc::downgrade(
+            reg.backends
+                .borrow()
+                .get("synthetic")
+                .expect("seeded backend"),
+        );
+        let origin = OriginRef::new("synthetic", synthetic_object_id(1, 2), 0);
+        let req = StripeReq::new(StripeKey([0; 32])).with_origin(origin);
+        let dsts = [];
+        let src = BulkRef {
+            stripe: StripeKey([0; 32]),
+            offset: 0,
+            len: 0,
+        };
+        let stream = reg.bulk_get(&req, src, &dsts);
+
+        reg.remove("synthetic").expect("remove backend");
+        assert!(selected.upgrade().is_some());
+
+        drop(stream);
+        assert!(selected.upgrade().is_none());
+    }
+
+    #[test]
+    fn selected_backend_outlives_same_name_replacement() {
+        let reg = registry(&[fake_spec("synthetic", 1024 * 1024)]);
+        let selected = Rc::downgrade(
+            reg.backends
+                .borrow()
+                .get("synthetic")
+                .expect("seeded backend"),
+        );
+        let origin = OriginRef::new("synthetic", synthetic_object_id(3, 4), 0);
+        let req = StripeReq::new(StripeKey([0; 32])).with_origin(origin);
+        let dsts = [];
+        let src = BulkRef {
+            stripe: StripeKey([0; 32]),
+            offset: 0,
+            len: 0,
+        };
+        let stream = reg.bulk_get(&req, src, &dsts);
+
+        reg.add(&fake_spec("synthetic", 2 * 1024 * 1024))
+            .expect("replace backend");
+        assert!(selected.upgrade().is_some());
+
+        drop(stream);
+        assert!(selected.upgrade().is_none());
     }
 }

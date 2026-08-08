@@ -559,9 +559,9 @@ name = "primary-http"
 url = "https://origin.example.com"
 stripe_size_bytes = 8388608
 http_concurrency = 32
-ca_cert_path = "/etc/unbounded-storage/origin-ca.pem"
-client_cert_path = "/etc/unbounded-storage/client.pem"
-client_key_path = "/etc/unbounded-storage/client-key.pem"
+ca_cert = "CA PEM"
+client_cert = "CLIENT CERT PEM"
+client_key = "CLIENT KEY PEM"
 
 [[frontends]]
 name = "workload-http"
@@ -582,17 +582,17 @@ max_requests_per_connection = 256
                 assert_eq!(cfg.stripe_size_bytes, Some(8 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(32));
                 assert_eq!(
-                    cfg.ca_cert_path.as_deref(),
-                    Some("/etc/unbounded-storage/origin-ca.pem")
+                    cfg.ca_cert.as_deref(),
+                    Some("CA PEM")
                 );
                 assert!(!cfg.insecure_skip_verify);
                 assert_eq!(
-                    cfg.client_cert_path.as_deref(),
-                    Some("/etc/unbounded-storage/client.pem")
+                    cfg.client_cert.as_deref(),
+                    Some("CLIENT CERT PEM")
                 );
                 assert_eq!(
-                    cfg.client_key_path.as_deref(),
-                    Some("/etc/unbounded-storage/client-key.pem")
+                    cfg.client_key.as_deref(),
+                    Some("CLIENT KEY PEM")
                 );
             }
             other => panic!("expected http backend config, got {other:?}"),
@@ -641,10 +641,10 @@ url = "https://example.com"
             backend_spec::Config::Http(cfg) => {
                 assert_eq!(cfg.stripe_size_bytes, Some(4 * 1024 * 1024));
                 assert_eq!(cfg.http_concurrency, Some(64));
-                assert_eq!(cfg.ca_cert_path, None);
+                assert_eq!(cfg.ca_cert, None);
                 assert!(!cfg.insecure_skip_verify);
-                assert_eq!(cfg.client_cert_path, None);
-                assert_eq!(cfg.client_key_path, None);
+                assert_eq!(cfg.client_cert, None);
+                assert_eq!(cfg.client_key, None);
             }
             other => panic!("expected http backend config, got {other:?}"),
         }
@@ -676,6 +676,19 @@ name = "primary-s3"
 
 [backends.config.s3]
 url = "https://s3.us-east-1.amazonaws.com:443"
+ca_cert = '''-----BEGIN CERTIFICATE-----
+CA DATA
+-----END CERTIFICATE-----'''
+client_cert = '''-----BEGIN CERTIFICATE-----
+CLIENT DATA
+-----END CERTIFICATE-----'''
+client_key = '''-----BEGIN PRIVATE KEY-----
+KEY DATA
+-----END PRIVATE KEY-----'''
+region = "us-east-1"
+access_key_id = "AKIAEXAMPLE"
+secret_access_key = "secret"
+session_token = "token"
 "#;
         let mut c: Config = toml::from_str(s).unwrap();
         c.apply_defaults();
@@ -684,6 +697,25 @@ url = "https://s3.us-east-1.amazonaws.com:443"
             c.backends[0].url(),
             Some("https://s3.us-east-1.amazonaws.com:443")
         );
+        let backend_spec::Config::S3(cfg) = c.backends[0].config.as_ref().unwrap() else {
+            panic!("expected s3 backend config");
+        };
+        assert_eq!(
+            cfg.ca_cert.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\nCA DATA\n-----END CERTIFICATE-----")
+        );
+        assert_eq!(
+            cfg.client_cert.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\nCLIENT DATA\n-----END CERTIFICATE-----")
+        );
+        assert_eq!(
+            cfg.client_key.as_deref(),
+            Some("-----BEGIN PRIVATE KEY-----\nKEY DATA\n-----END PRIVATE KEY-----")
+        );
+        assert_eq!(cfg.region.as_deref(), Some("us-east-1"));
+        assert_eq!(cfg.access_key_id.as_deref(), Some("AKIAEXAMPLE"));
+        assert_eq!(cfg.secret_access_key.as_deref(), Some("secret"));
+        assert_eq!(cfg.session_token.as_deref(), Some("token"));
     }
 
     #[test]

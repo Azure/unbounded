@@ -2,9 +2,9 @@
 
 Join bare metal nodes to a Kubernetes cluster using PXE and (optionally) Redfish.
 
-Metalman commands are available through the `kubectl unbounded` plugin. A
-dedicated `metalman` binary is also shipped as a container image for running
-the PXE server inside a cluster.
+A dedicated `metalman` binary is shipped as a container image for running the
+PXE server inside a cluster. `unbounded-operator` deploys that image when a
+Site enables the Metalman component.
 
 Run `metalman version` to print the binary version.
 
@@ -47,51 +47,47 @@ kubectl unbounded machine repave node-01
 
 ### Controller
 
-`kubectl unbounded site serve-pxe` runs a single long-lived process that provides
+`metalman serve-pxe` runs a single long-lived process that provides
 everything needed to PXE-boot and manage bare metal hosts:
 
 | Service | Default Port | Protocol | Purpose |
 |---------|-------------|----------|---------|
-| DHCP    | 67/udp      | DHCPv4   | Static leases derived from Machine NIC specs |
+| DHCP    | 67/udp      | DHCPv4   | Static leases derived from Machine NIC specs for PXE or DHCP-assisted HTTP boot |
 | TFTP    | 69/udp      | TFTP     | Initial bootloader delivery (e.g. shimx64.efi) |
 | HTTP    | 8880/tcp    | HTTP     | Artifact serving, templated configs, attestation endpoints |
 | Health  | 8081/tcp    | HTTP     | Liveness/readiness probes |
 
 The controller also runs reconcilers for OCI image pulling (downloading and
-caching machine and netboot images from container registries) and Machine resources with
-Redfish BMC specs (power management, boot order configuration).
+caching machine and netboot images from container registries), Redfish TLS
+certificate pinning, and `MachineOperation` host actions such as reboot and
+repave.
 
 When deployed inside a cluster, the container entrypoint is `metalman` and the
-`site deploy-pxe` command passes `serve-pxe` as an argument:
+operator passes `serve-pxe` as an argument:
 
 ```bash
 metalman serve-pxe --site=<site> [flags]
 ```
 
-#### Deploying with `site deploy-pxe`
+#### Deploying With Site Components
 
-`kubectl unbounded site deploy-pxe` is a convenience command that creates (or
-updates) a Kubernetes Deployment running `metalman serve-pxe` for a given
-site. The Deployment is server-side applied into the `unbounded-kube`
-namespace.
+Enable Metalman in the Site spec and let `unbounded-operator` create or update
+the per-site Deployment running `metalman serve-pxe`:
 
-```bash
-# Deploy the PXE server for a site called "rack-a"
-kubectl unbounded site deploy-pxe --site=rack-a
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+  name: rack-a
+spec:
+  components:
+    metalman:
+      enabled: true
+      dhcpAutoInterface: true
 ```
 
 The resulting Deployment (`metalman-controller-<site>`) runs with host networking for DHCP.
 It exposes ports 8880/tcp (HTTP), 8081/tcp (health), 67/udp (DHCP), and 69/udp (TFTP).
-
-`site deploy-pxe` flags:
-
-- `--site` - Site name (required; scopes the PXE instance to machines
-  labeled `unbounded-cloud.io/site=<site>`).
-- `--image` - Container image for the PXE deployment (default: build-time
-  value or `metalman:latest`).
-- `--default-netboot-image` - OCI image containing PXE boot artifacts to use
-  when a Machine omits `spec.pxe.netbootImage`.
-- `--kubeconfig` - Path to kubeconfig file.
 
 The generated Deployment uses host networking, a `CriticalAddonsOnly`
 toleration, DNS policy `ClusterFirstWithHostNet`, and a node selector
@@ -131,20 +127,20 @@ So it's possible to prove that the bootstrap token was delivered only to trusted
 
 #### Sites
 
-The `--site` flag scopes a `site serve-pxe` instance to a subset of Machines. The
-value is matched against the `unbounded-cloud.io/site` label on Machine
+The `--site` flag scopes a `metalman serve-pxe` instance to a subset of Machines.
+The value is matched against the `unbounded-cloud.io/site` label on Machine
 resources:
 
 ```bash
 # Manage only Machines labeled site=rack-a
-kubectl unbounded site serve-pxe --site=rack-a --dhcp-interface=eth0
+metalman serve-pxe --site=rack-a --dhcp-interface=eth0
 
 # Manage only unlabeled Machines (the default)
-kubectl unbounded site serve-pxe --dhcp-interface=eth0
+metalman serve-pxe --dhcp-interface=eth0
 ```
 
 Each site gets its own leader-election lease (`metalman-<site>`), so
-multiple sites can coexist on one cluster with independent HA. A `site serve-pxe`
+multiple sites can coexist on one cluster with independent HA. A `metalman serve-pxe`
 instance with no `--site` manages Machines that do not have the site label
 at all.
 
@@ -152,9 +148,12 @@ at all.
 
 Metalman uses two OCI images when repaving a machine:
 
-- `spec.pxe.image` is the machine image. It contains `/disk/disk.img.gz`, a
+Existing Machines may continue to use the deprecated top-level `spec.pxe`
+shape; Metalman resolves both forms through the same compatibility accessor.
+
+- `spec.host.netboot.image` is the machine image. It contains `/disk/disk.img.gz`, a
   gzip-compressed raw disk image written to the target disk.
-- `spec.pxe.netbootImage` is the reusable PXE boot environment. It contains
+- `spec.host.netboot.netbootImage` is the reusable PXE boot environment. It contains
   bootloaders, kernel, initrd, templates, and metadata. Its cloud-init template
   downloads and installs `unbounded-agent` from the configured release/source.
   If omitted, Metalman uses the release-matched `--default-netboot-image`.
@@ -199,20 +198,40 @@ spec:
 ```
 
 This is enough for the DHCP server to issue a lease and for TFTP/HTTP to serve
-boot artifacts from the default netboot image. Set `spec.pxe.netbootImage` only
+boot artifacts from the default netboot image. Set `spec.host.netboot.netbootImage` only
 when a Machine needs a non-default PXE boot environment. The node must be
 manually PXE-booted (or have PXE as its default boot option).
 
-The default netboot template passes the matching DHCP lease MAC to the installer
+When `spec.host.netboot.bootProtocol` is `HTTP`, `dhcpLeases` also supplies the static
+UEFI HTTP boot client configuration. Metalman uses Redfish to disable DHCPv4 on
+the host EthernetInterface matching the first lease MAC and writes that lease's
+IPv4 address, subnet mask, gateway, and DNS servers before setting the UEFI HTTP
+boot override. With Redfish access and an HTTP boot URL, repaving can run without
+any DHCP server on the provisioning network. If a host has multiple NICs, put the
+UEFI HTTP boot NIC first in `dhcpLeases`.
+
+The default netboot template passes the selected lease MAC to the installer
 initrd, which uses it to select the provisioning NIC instead of assuming a fixed
-interface name such as `eth0`. If `spec.pxe.targetDisk` is set, the installer
-writes the image to that disk; otherwise it falls back to automatic disk
-selection.
+interface name such as `eth0`. It also passes the lease DNS servers, configures
+the installer network without DHCP, and writes matching MAC-based static netplan
+configuration into the installed system before its first boot. It disables
+cloud-init network rendering so fallback DHCP configuration cannot conflict with
+that file. The default netboot image serves the same lease as NoCloud
+`network-config`. If `spec.host.netboot.targetDisk` is
+set, the installer writes the image to that disk; otherwise it falls back to
+automatic disk selection.
+
+Stock Ubuntu OVMF and sushy-emulator cannot emulate the complete DHCP-free
+Redfish-to-firmware UEFI HTTP path. Repository CI therefore tests Metalman's
+Redfish writes and then starts at a staged post-firmware EFI boundary, while
+capturing the guest's traffic through installation and reboot to prove it emits
+no DHCP packets. Applying Redfish settings and fetching the first EFI binary
+remain firmware and BMC hardware-conformance responsibilities.
 
 #### BMC
 
-Adding a `redfish` block enables remote power management. The controller will
-manage boot order and execute reboot cycles without physical access:
+Adding a `redfish` block enables remote power management. Metalman uses it for
+`MachineOperation` host actions without physical access:
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -247,7 +266,7 @@ To repave a node with BMC access:
 kubectl unbounded machine repave node-01
 ```
 
-This increments `spec.operations.repaveCounter` and `spec.operations.rebootCounter`. The
-controller handles the rest - it configures the boot order for the selected
-`spec.pxe.bootProtocol`, executes a ForceOff/On power cycle, and clears the
-condition once the node is back up.
+This creates a `HostReplace` `MachineOperation`. Metalman handles the rest: it
+configures the boot override for the selected `spec.host.netboot.bootProtocol`, executes
+a Redfish force restart, waits for the installer `/pxe/disable` signal, tracks
+first-boot cloud-init on the operation, and completes after the node is back up.

@@ -20,13 +20,13 @@ mod limiter;
 mod origin;
 
 #[cfg(target_os = "linux")]
-mod origin_ring;
-
-#[cfg(target_os = "linux")]
 mod registry;
 
 #[cfg(target_os = "linux")]
 mod s3;
+
+#[cfg(target_os = "linux")]
+mod s3_sigv4;
 
 #[cfg(target_os = "linux")]
 mod azure;
@@ -50,13 +50,13 @@ pub use limiter::{Acquire, FetchLimiter, FetchPermit};
 pub use origin::{OriginBackend, OriginStream};
 
 #[cfg(target_os = "linux")]
-pub use origin_ring::{FixedRegion, OriginRing};
-
-#[cfg(target_os = "linux")]
 pub use registry::{BackendRegistry, RegistryFetchStream};
 
 #[cfg(target_os = "linux")]
 pub use s3::S3Backend;
+
+#[cfg(target_os = "linux")]
+pub(crate) use s3_sigv4::S3Auth;
 
 #[cfg(target_os = "linux")]
 pub use azure::AzureBackend;
@@ -68,7 +68,7 @@ pub use fake::{FakeBackend, FakeFetchStream};
 /// `Backend` resolves a `BulkRef` from an authoritative origin (as
 /// opposed to a peer) into the supplied destination pages, yielding
 /// one page at a time through a `PageStream`.
-pub trait Backend: Send + Sync {
+pub trait Backend {
     type Req: Req;
 
     /// Stream of pages produced by `bulk_get`. One `poll_next` may
@@ -90,9 +90,8 @@ pub trait Backend: Send + Sync {
     ) -> Self::Stream<'a>;
 }
 
-/// Blanket impl mirroring `Transport for Arc<T>`, so a `Backend` can
-/// be shared across shards by handing each consumer an `Arc`-wrapped
-/// clone instead of an owned instance.
+/// Blanket impl mirroring `Transport for Arc<T>` for callers that
+/// already own a backend through an `Arc`.
 impl<T: Backend + ?Sized> Backend for Arc<T> {
     type Req = T::Req;
 

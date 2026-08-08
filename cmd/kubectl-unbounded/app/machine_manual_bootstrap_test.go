@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,25 @@ func TestManualBootstrapHandler_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "valid: offline artifacts HTTPS source",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "https://artifacts.example.com/unbounded/v1.31.2.tar.gz?sp=r&sig=test-signature",
+			},
+		},
+		{
+			name: "invalid: offline artifacts HTTPS source without archive path",
+			handler: manualBootstrapHandler{
+				siteName:               "dc1",
+				machineName:            "my-node",
+				kubeconfigPath:         kubeconfigPath,
+				offlineArtifactsSource: "https://artifacts.example.com",
+			},
+			expectErr: "HTTPS URL must include a host and archive path",
+		},
+		{
 			name: "valid: offline artifacts OCI source",
 			handler: manualBootstrapHandler{
 				siteName:               "dc1",
@@ -218,6 +238,14 @@ func newFakeCluster(t *testing.T, siteName string) *fake.Clientset {
 			},
 		},
 	)
+}
+
+func TestValidateHTTPSArtifactsSourceRedactsInvalidQuery(t *testing.T) {
+	t.Parallel()
+
+	err := validateHTTPSArtifactsSource("https://artifacts.example.test/%zz?sig=secret")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "secret")
 }
 
 func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
@@ -979,4 +1007,185 @@ func requireValidBashSyntax(t *testing.T, script string) {
 
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "bash -n failed: %s", string(out))
+}
+
+// ---------------------------------------------------------------------------
+// parseAdditionalHostMount() tests
+// ---------------------------------------------------------------------------
+
+func TestParseAdditionalHostMount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		wantMount config.AdditionalHostMount
+		wantErr   string
+	}{
+		{
+			name:      "source only",
+			input:     "/opt/config",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config"},
+		},
+		{
+			name:      "source and target",
+			input:     "/opt/config:/etc/config",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config", Target: "/etc/config"},
+		},
+		{
+			name:      "source only read-only",
+			input:     "/opt/config:ro",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config", ReadOnly: true},
+		},
+		{
+			name:      "source and target read-only",
+			input:     "/opt/config:/etc/config:ro",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config", Target: "/etc/config", ReadOnly: true},
+		},
+		{
+			name:    "empty value",
+			input:   "",
+			wantErr: "mount spec must not be empty",
+		},
+		{
+			name:    "relative source",
+			input:   "opt/config",
+			wantErr: "invalid --additional-host-mount",
+		},
+		{
+			name:    "unclean source",
+			input:   "/opt/../config",
+			wantErr: "invalid --additional-host-mount",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseAdditionalHostMount(tt.input)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.wantMount, got)
+		})
+	}
+}
+
+func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostMounts(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	h := &manualBootstrapHandler{
+		siteName:    "dc1",
+		machineName: "my-node",
+		additionalHostMounts: []string{
+			"/opt/config:ro",
+			"/var/lib/data:/data",
+		},
+		kubeCli:    kubeCli,
+		kubeConfig: &rest.Config{Host: "https://my-api-server:6443"},
+		logger:     discardLogger(),
+	}
+
+	cfg, err := h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, []config.AdditionalHostMount{
+		{Source: "/opt/config", ReadOnly: true},
+		{Source: "/var/lib/data", Target: "/data"},
+	}, cfg.AdditionalHostMounts)
+}
+
+// parseAdditionalHostDevice() tests
+// ---------------------------------------------------------------------------
+
+func TestParseAdditionalHostDevice(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		input      string
+		wantDevice string
+		wantErr    string
+	}{
+		{
+			name:       "absolute /dev path",
+			input:      "/dev/uinput",
+			wantDevice: "/dev/uinput",
+		},
+		{
+			name:       "systemd char group specifier",
+			input:      "char-input",
+			wantDevice: "char-input",
+		},
+		{
+			name:       "systemd block group wildcard",
+			input:      "block-*",
+			wantDevice: "block-*",
+		},
+		{
+			name:    "empty value",
+			input:   "",
+			wantErr: "device spec must not be empty",
+		},
+		{
+			name:    "relative path",
+			input:   "dev/uinput",
+			wantErr: "invalid --additional-host-device",
+		},
+		{
+			name:    "path outside /dev",
+			input:   "/etc/config",
+			wantErr: "invalid --additional-host-device",
+		},
+		{
+			name:    "unclean /dev path",
+			input:   "/dev/../dev/uinput",
+			wantErr: "invalid --additional-host-device",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseAdditionalHostDevice(tt.input)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.wantDevice, got)
+		})
+	}
+}
+
+func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostDevices(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	h := &manualBootstrapHandler{
+		siteName:              "dc1",
+		machineName:           "my-node",
+		additionalHostDevices: []string{"/dev/uinput", "char-input"},
+		kubeCli:               kubeCli,
+		kubeConfig:            &rest.Config{Host: "https://my-api-server:6443"},
+		logger:                discardLogger(),
+	}
+
+	cfg, err := h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"/dev/uinput", "char-input"}, cfg.AdditionalHostDevices)
 }

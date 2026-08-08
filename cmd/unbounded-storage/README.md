@@ -59,7 +59,11 @@ restart.
 | `-V, --version` | - | Print version. |
 
 The daemon traps `SIGINT` and `SIGTERM` and tears shards down in a
-deterministic order (disks closed first, then fabric / pool drops).
+deterministic order: shards stop and join first, disk-channel publications are
+cleared, and disks are drained last. At startup shards complete both readiness
+phases while parked; initial disks are reconciled and published before RPC
+servers and shard serving are activated. A startup disk-open failure retires
+the prepared shard layer rather than reporting a partial startup configuration.
 
 ## Configuration file
 
@@ -101,7 +105,7 @@ fingers_per_node = 100           # routing finger-table fanout per node.
 name = "origin"
 
 [backends.config.http]
-url = "origin.example.com:80"    # host:port resolved for origin fetches.
+url = "http://origin.example.com:80" # authority-only origin URL.
 stripe_size_bytes = 4194304      # optional; must be a power of two.
 
 # Optional. Disjoint discovery: configure this node with ONLY its direct
@@ -159,15 +163,18 @@ source = "cache"                # backend or cache component name.
 addr = "0.0.0.0:9000"
 
 [startup.memory]                 # startup-fixed; read once at process start.
-no_hugepages   = false           # true allocates per-shard backing from the heap.
-memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Total backing pool split
-                                 #   evenly across serving shards. 0 -> 128 MiB.
+no_hugepages   = false           # true allocates shard backings from the heap.
+memory_total_bytes = 134217728   # u64 bytes (no K/M/G suffix). Node-wide data pool;
+                                 #   partial 2 MiB pages are unused, then whole pages
+                                 #   are split across serving shards. Unset -> 128 MiB;
+                                 #   explicit 0 is invalid when shards are configured.
+                                 #   RPC scratch adds 8 pages per fabric unit.
 
 [startup.fabric]
-progress_threads    = 2          # libfabric progress threads per shard.
+progress_threads    = 2          # libfabric progress threads per fabric unit.
 progress_poll_us    = 10         # progress-thread busy-poll budget (us).
-rpc_worker_threads  = 4          # fabric RPC worker threads per shard.
-max_inflight        = 1024       # max in-flight fabric ops per shard (back-pressure).
+rpc_worker_threads  = 4          # RPC worker threads per fabric unit.
+max_inflight        = 1024       # max in-flight ops per fabric unit (back-pressure).
 
 [startup.fabric.binds.tcp]
 addr                = "0.0.0.0:0" # fabric listen address; :0 picks a free port.
@@ -184,4 +191,56 @@ ignore_isolated       = false    # also schedule onto isolcpus-isolated CPUs.
 include_node_cpu0     = false    # allow placing a shard on each NUMA node's CPU 0.
 allow_inactive_port   = false    # use HCA ports not in the active state.
 disable_rdma          = false    # disable RDMA and force the libfabric tcp provider.
+```
+
+### Origin authentication and TLS
+
+HTTP, S3, and Azure backend URLs must contain only a scheme and authority, with
+an optional root `/`. User information, non-root paths, queries, and fragments
+are rejected. Object paths come from frontend requests.
+
+S3 backends use anonymous requests when all authentication fields are omitted.
+Set `region`, `access_key_id`, and `secret_access_key` together to sign GET and
+HEAD requests with AWS Signature Version 4. `session_token` is optional:
+
+```toml
+[[backends]]
+name = "origin"
+
+[backends.config.s3]
+url = "https://s3.us-west-2.amazonaws.com"
+region = "us-west-2"
+access_key_id = "example-access-key"
+secret_access_key = "example-secret-key"
+# session_token = "example-session-token"
+```
+
+These static credentials are stored directly in TOML or binary protobuf. When
+the supervisor renders them from YAML, they also reside in its Kubernetes
+ConfigMap. Protect access to those files and objects accordingly.
+
+For every HTTPS origin, certificate and hostname verification use the host CA
+trust by default. `ca_cert` replaces the host roots for that backend with an
+inline PEM bundle. `client_cert` and `client_key` configure mTLS and must be set
+together as inline PEM. `insecure_skip_verify = true` disables certificate and
+hostname verification and cannot be combined with `ca_cert`.
+
+```toml
+[backends.config.s3]
+url = "https://objects.example.com"
+region = "us-east-1"
+access_key_id = "example-access-key"
+secret_access_key = "example-secret-key"
+ca_cert = """-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+"""
+client_cert = """-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+"""
+client_key = """-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----
+"""
 ```

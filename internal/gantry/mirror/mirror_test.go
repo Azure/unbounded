@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/origin"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 func digestOf(b []byte) digest.Digest {
@@ -138,6 +139,143 @@ func (unavailableCache) Open(_ context.Context, _ digest.Digest) (io.ReadCloser,
 
 func (unavailableCache) Writer(_ context.Context, _ digest.Digest) (ifaces.ContentWriter, error) {
 	return nil, errors.New("writer should not be called when storage is unavailable")
+}
+
+type authorizationCapturingOrigin struct {
+	body []byte
+	seen chan string
+}
+
+type authorizationRejectingOrigin struct{}
+
+func (authorizationRejectingOrigin) Pull(_ context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureAuth, Err: errors.New("delegated token rejected")}
+}
+
+func (authorizationRejectingOrigin) Head(_ context.Context, ref ifaces.OriginRef) (int64, string, error) {
+	return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureAuth, Err: errors.New("delegated token rejected")}
+}
+
+func (o *authorizationCapturingOrigin) Pull(ctx context.Context, _ ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	o.seen <- registryauth.Authorization(ctx)
+
+	return io.NopCloser(bytes.NewReader(o.body)), int64(len(o.body)), nil
+}
+
+func (o *authorizationCapturingOrigin) Head(ctx context.Context, _ ifaces.OriginRef) (int64, string, error) {
+	o.seen <- registryauth.Authorization(ctx)
+
+	return int64(len(o.body)), "application/octet-stream", nil
+}
+
+func TestMirror_CapturesInboundAuthorizationForOrigin(t *testing.T) {
+	body := []byte("origin bytes")
+	d := digestOf(body)
+	origin := &authorizationCapturingOrigin{body: body, seen: make(chan string, 1)}
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "https://reg.example.com"}}}
+
+	srv := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), origin).Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header.Set("Authorization", "Bearer requester-token")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if got := <-origin.seen; got != "Bearer requester-token" {
+		t.Fatalf("origin authorization = %q, want requester token", got)
+	}
+}
+
+func TestMirror_UnsupportedAuthorizationFallsThroughWithoutOrigin(t *testing.T) {
+	tests := []struct {
+		name          string
+		authorization string
+	}{
+		{name: "malformed bearer", authorization: "Bearer two tokens"},
+		{name: "malformed basic", authorization: "Basic not-base64"},
+		{name: "oversized bearer", authorization: "Bearer " + strings.Repeat("x", 64*1024)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte("origin bytes")
+			d := digestOf(body)
+			origin := &authorizationCapturingOrigin{body: body, seen: make(chan string, 1)}
+			cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "https://reg.example.com"}}}
+
+			srv := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), origin).Handler())
+			defer srv.Close()
+
+			req, err := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/blobs/"+d.String(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req.Header.Set("Authorization", tt.authorization)
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_ = resp.Body.Close() //nolint:errcheck // best-effort close
+
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", resp.StatusCode)
+			}
+
+			select {
+			case got := <-origin.seen:
+				t.Fatalf("origin called with authorization %q", got)
+			default:
+			}
+		})
+	}
+}
+
+func TestMirror_DelegatedOriginFailureDoesNotEnterSharedNegativeCache(t *testing.T) {
+	d := digestOf([]byte("protected content"))
+	recorder := &fakeNegCacheRecorder{}
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "https://reg.example.com"}}}
+	m := mirror.New(cfg, fakes.NewCache(), authorizationRejectingOrigin{}, mirror.WithNegativeCacheRecorder(recorder))
+
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header.Set("Authorization", "Bearer requester-token")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+
+	failures, _ := recorder.snapshot()
+	if len(failures) != 0 {
+		t.Fatalf("shared negative-cache failures = %v, want none", failures)
+	}
 }
 
 func TestMirror_V2Root(t *testing.T) {

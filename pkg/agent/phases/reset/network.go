@@ -10,9 +10,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -38,6 +42,60 @@ func RemoveNetworkInterfaces(log *slog.Logger) phases.Task {
 }
 
 func (t *removeNetworkInterfaces) Name() string { return "remove-network-interfaces" }
+
+// CleanupNetwork returns a task that removes network interfaces and policy
+// routing state left by unbounded-net.
+func CleanupNetwork(log *slog.Logger) phases.Task {
+	return phases.Serial(log,
+		CleanupLocalDNSRules(log),
+		RemoveNetworkInterfaces(log),
+		CleanupRoutes(log),
+	)
+}
+
+type cleanupLocalDNSRules struct {
+	log *slog.Logger
+}
+
+// CleanupLocalDNSRules removes raw-table rules owned by LocalDNS.
+func CleanupLocalDNSRules(log *slog.Logger) phases.Task {
+	return &cleanupLocalDNSRules{log: log}
+}
+
+func (t *cleanupLocalDNSRules) Name() string { return "cleanup-localdns-rules" }
+
+func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", "--now", goalstates.LocalDNSNetworkUnit); err != nil {
+		t.log.Debug("LocalDNS network unit was not active", "error", err)
+	}
+
+	if _, err := executil.OutputCmd(ctx, t.log, "nft", "list", "table", "ip", goalstates.LocalDNSNFTTable); err == nil {
+		if err := executil.RunCmd(ctx, t.log, func(ctx context.Context) *exec.Cmd {
+			return exec.CommandContext(ctx, "nft")
+		}, "delete", "table", "ip", goalstates.LocalDNSNFTTable); err != nil {
+			return fmt.Errorf("remove LocalDNS nftables table: %w", err)
+		}
+	}
+
+	if output, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show", "dev", goalstates.LocalDNSInterfaceName); err == nil {
+		if !strings.Contains(" "+output+" ", " dummy ") {
+			return fmt.Errorf("refusing to remove non-dummy interface %s", goalstates.LocalDNSInterfaceName)
+		}
+
+		if err := executil.RunCmd(ctx, t.log, executil.Ip(), "link", "delete", goalstates.LocalDNSInterfaceName); err != nil {
+			return fmt.Errorf("remove LocalDNS interface: %w", err)
+		}
+	}
+
+	for _, path := range []string{
+		filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit),
+		"/usr/local/libexec/unbounded-localdns-network",
+	} {
+		removeFileIfExists(t.log, path)
+	}
+
+	return nil
+}
 
 func (t *removeNetworkInterfaces) Do(ctx context.Context) error {
 	// Remove WireGuard interfaces (wg51820, wg51821, ...).
@@ -87,8 +145,8 @@ func (t *removeWireGuardKeys) Do(_ context.Context) error {
 	return nil
 }
 
-// listWireGuardInterfaces returns the names of all WireGuard interfaces (names
-// matching wg[0-9]*) visible on the host.
+// listWireGuardInterfaces returns the names of unbounded-managed WireGuard
+// interfaces visible on the host.
 func listWireGuardInterfaces(ctx context.Context, log *slog.Logger) ([]string, error) {
 	out, err := executil.OutputCmd(ctx, log, "ip", "-o", "link", "show")
 	if err != nil {
@@ -115,8 +173,8 @@ func listWireGuardInterfaces(ctx context.Context, log *slog.Logger) ([]string, e
 	return ifaces, nil
 }
 
-// isWireGuardInterface returns true if the interface name matches the wg[0-9]+
-// pattern used by unbounded-net.
+// isWireGuardInterface returns true if the interface name matches the
+// unbounded-net WireGuard naming and table range (wg51820-wg51899).
 func isWireGuardInterface(name string) bool {
 	if !strings.HasPrefix(name, "wg") {
 		return false
@@ -127,13 +185,12 @@ func isWireGuardInterface(name string) bool {
 		return false
 	}
 
-	for _, c := range suffix {
-		if c < '0' || c > '9' {
-			return false
-		}
+	port, err := strconv.Atoi(suffix)
+	if err != nil {
+		return false
 	}
 
-	return true
+	return port >= wireguardTableStart && port <= wireguardTableEnd
 }
 
 // linkExists checks whether a network interface exists by looking up its

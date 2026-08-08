@@ -7,9 +7,8 @@
 //! `Box::into_raw`s the slot and hands the resulting `*mut c_void` to
 //! libfabric as the operation's `op_context`. On the progress thread,
 //! `fi_cq_read` returns the same pointer back inside a
-//! `fi_cq_data_entry`; we `Box::from_raw` it, drop the box (releasing
-//! libfabric's reference) after calling `complete`, and the awaiting
-//! future is woken.
+//! `fi_cq_data_entry`; we `Box::from_raw` it, release its registry
+//! reservation, run its completion handler, and wake the awaiting future.
 //!
 //! The slot's shared state lives in an `Arc<SlotInner>` cloned into a
 //! `CompletionFuture`, so completion and future-drop can race in
@@ -25,60 +24,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use super::error::{FabricError, Result};
-
-const WAKER_NONE: u8 = 0;
-const WAKER_REGISTERED: u8 = 1;
-const WAKER_WOKEN: u8 = 3;
-
-/// Small register-store-wake state machine. One-shot semantics: a
-/// single completer wakes a single awaiter exactly once.
-struct AtomicWaker {
-    state: AtomicU8,
-    waker: Mutex<Option<Waker>>,
-}
-
-impl AtomicWaker {
-    fn new() -> Self {
-        Self {
-            state: AtomicU8::new(WAKER_NONE),
-            waker: Mutex::new(None),
-        }
-    }
-
-    fn register(&self, w: &Waker) {
-        if self.state.load(Ordering::Acquire) == WAKER_WOKEN {
-            w.wake_by_ref();
-            return;
-        }
-        if let Ok(mut slot) = self.waker.lock() {
-            *slot = Some(w.clone());
-        }
-        let prev = self.state.swap(WAKER_REGISTERED, Ordering::AcqRel);
-        if prev == WAKER_WOKEN {
-            if let Ok(mut slot) = self.waker.lock() {
-                if let Some(w) = slot.take() {
-                    w.wake();
-                }
-            }
-        }
-    }
-
-    fn wake(&self) {
-        let prev = self.state.swap(WAKER_WOKEN, Ordering::AcqRel);
-        if prev == WAKER_REGISTERED {
-            if let Ok(mut slot) = self.waker.lock() {
-                if let Some(w) = slot.take() {
-                    w.wake();
-                }
-            }
-        }
-    }
-}
 
 /// Result a `CompletionSlot` carries back to its future. Per-op
 /// metadata is encoded in `bytes`, `flags`, `tag` and `src_addr`
@@ -95,16 +45,22 @@ pub struct CompletionInfo {
     pub data: u64,
 }
 
+struct CompletionState {
+    result: Option<Result<CompletionInfo>>,
+    waker: Option<Waker>,
+}
+
 pub(crate) struct SlotInner {
-    result: Mutex<Option<Result<CompletionInfo>>>,
-    waker: AtomicWaker,
+    state: Mutex<CompletionState>,
 }
 
 impl SlotInner {
     fn new() -> Self {
         Self {
-            result: Mutex::new(None),
-            waker: AtomicWaker::new(),
+            state: Mutex::new(CompletionState {
+                result: None,
+                waker: None,
+            }),
         }
     }
 }
@@ -118,14 +74,15 @@ impl SlotInner {
 /// dropping the reclaimed box releases libfabric's reference.
 pub struct CompletionSlot {
     inner: Arc<SlotInner>,
-    /// Back-reference so the registry's live count drops when this
-    /// box is reclaimed by the progress thread (or by `cancel_raw`
-    /// on a synchronous submission failure).
+    /// Back-reference so the registry reservation is released before a
+    /// completion handler runs, or when the box is dropped after a
+    /// synchronous submission failure.
     registry: Arc<RegistryShared>,
     /// Optional handler invoked when the slot completes, before the
     /// future is woken. Used by the ping responder to re-post its
     /// recv and emit the pong without involving any future at all.
-    handler: Mutex<Option<Box<dyn FnOnce(&Result<CompletionInfo>) + Send>>>,
+    handler: Option<Box<dyn FnOnce(&Result<CompletionInfo>) + Send>>,
+    reservation_live: AtomicBool,
 }
 
 impl CompletionSlot {
@@ -148,39 +105,50 @@ impl CompletionSlot {
         unsafe { Box::from_raw(ptr as *mut CompletionSlot) }
     }
 
-    /// Store a result and wake the awaiting future. If a handler was
-    /// installed via [`CompletionSlot::set_handler`] it is invoked
-    /// first; the handler may not panic.
-    pub fn complete(&self, result: Result<CompletionInfo>) {
-        let handler = self.handler.lock().ok().and_then(|mut h| h.take());
-        if let Some(h) = handler {
+    /// Release registry capacity, store a result, and wake the awaiting
+    /// future. If a handler was installed via
+    /// [`CompletionSlot::set_handler`] it is invoked after capacity is
+    /// released and before the future is woken; the handler may not panic.
+    pub fn complete(&mut self, result: Result<CompletionInfo>) {
+        // Completion handlers may allocate a replacement slot, notably
+        // when a receive pool rearms at full registry capacity.
+        self.release_reservation();
+        if let Some(h) = self.handler.take() {
             h(&result);
         }
-        if let Ok(mut slot) = self.inner.result.lock() {
-            *slot = Some(result);
+        let waker = {
+            let mut state = self.inner.state.lock().expect("completion state mutex");
+            state.result = Some(result);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
-        self.inner.waker.wake();
     }
 
     /// Install a one-shot handler that fires when the slot completes.
     /// Used by self-managed slots (e.g. the ping responder) that do
     /// not have a future awaiting the outcome.
-    pub fn set_handler<F>(&self, f: F)
+    pub fn set_handler<F>(&mut self, f: F)
     where
         F: FnOnce(&Result<CompletionInfo>) + Send + 'static,
     {
-        if let Ok(mut h) = self.handler.lock() {
-            *h = Some(Box::new(f));
+        self.handler = Some(Box::new(f));
+    }
+
+    fn release_reservation(&self) {
+        if self.reservation_live.swap(false, Ordering::AcqRel) {
+            self.registry.live.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
 
 impl Drop for CompletionSlot {
     fn drop(&mut self) {
-        // Decrement live-slot count exactly once, on the same box
-        // libfabric handed back. The `CompletionFuture` keeps the
-        // inner `SlotInner` Arc alive across this drop if needed.
-        self.registry.live.fetch_sub(1, Ordering::AcqRel);
+        // Synchronous submission failures drop without completing. A
+        // completed slot already released its reservation before running
+        // its handler, so this is idempotent.
+        self.release_reservation();
     }
 }
 
@@ -195,11 +163,11 @@ pub struct CompletionFuture {
 impl Future for CompletionFuture {
     type Output = Result<CompletionInfo>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.waker.register(cx.waker());
-        let mut result = self.inner.result.lock().expect("completion slot mutex");
-        if let Some(r) = result.take() {
+        let mut state = self.inner.state.lock().expect("completion state mutex");
+        if let Some(r) = state.result.take() {
             Poll::Ready(r)
         } else {
+            state.waker = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -212,9 +180,9 @@ pub(crate) struct RegistryShared {
 }
 
 /// Bounded back-pressure on in-flight ops. Capacity is checked at
-/// allocate time; the count drops when the boxed slot is freed (by
-/// the progress thread reclaiming it, or by `CompletionSlot::cancel`
-/// on a synchronous submission failure).
+/// allocate time; the count drops when completion begins, before its
+/// handler runs, or when an unsubmitted slot is dropped after a
+/// synchronous submission failure.
 pub struct CompletionRegistry {
     shared: Arc<RegistryShared>,
 }
@@ -257,7 +225,8 @@ impl CompletionRegistry {
         let slot = Box::new(CompletionSlot {
             inner: inner.clone(),
             registry: self.shared.clone(),
-            handler: Mutex::new(None),
+            handler: None,
+            reservation_live: AtomicBool::new(true),
         });
         let fut = CompletionFuture { inner };
         Ok((slot, fut))
@@ -283,46 +252,6 @@ impl CompletionRegistry {
     }
 }
 
-/// Collapse a libfabric completion outcome to the shared boundary
-/// type. `Cq` errors keep their numeric detail; the remaining
-/// `FabricError` variants have no numeric boundary form and render to
-/// [`crate::io::IoError::Other`]. Backend-specific detail (the full
-/// `CompletionInfo` with tag/src_addr) stays available to callers that
-/// take the `Result<CompletionInfo>` directly instead of going through
-/// this collapse.
-impl crate::io::CompletionOutcome for Result<CompletionInfo> {
-    fn into_io_result(self) -> crate::io::IoResult {
-        match self {
-            Ok(info) => Ok(crate::io::Completed { bytes: info.bytes }),
-            Err(FabricError::Cq { prov_errno, err }) => {
-                Err(crate::io::IoError::Provider { prov_errno, err })
-            }
-            Err(other) => Err(crate::io::IoError::Other(other.to_string())),
-        }
-    }
-}
-
-/// libfabric admits via the registry's capacity check: [`allocate`]
-/// fails once `live == cap`, so the policy is
-/// [`crate::io::BackPressurePolicy::Capacity`]. This impl is the shared
-/// introspection surface; the actual capacity check stays in
-/// [`CompletionRegistry::allocate`].
-///
-/// [`allocate`]: CompletionRegistry::allocate
-impl crate::io::BackPressure for CompletionRegistry {
-    fn capacity(&self) -> usize {
-        self.shared.cap
-    }
-
-    fn in_flight(&self) -> usize {
-        self.live_count()
-    }
-
-    fn policy(&self) -> crate::io::BackPressurePolicy {
-        crate::io::BackPressurePolicy::Capacity
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,7 +269,7 @@ mod tests {
 
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(Ok(CompletionInfo {
             flags: 0xCAFE,
             bytes: 4096,
@@ -367,7 +296,7 @@ mod tests {
         let (slot, mut fut) = reg.allocate().unwrap();
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(Err(FabricError::Cq {
             prov_errno: -3,
             err: -5,
@@ -421,12 +350,50 @@ mod tests {
     }
 
     #[test]
+    fn completion_handler_can_replace_slot_at_full_capacity() {
+        let reg = CompletionRegistry::new(1);
+        let (mut slot, _fut) = reg.allocate().unwrap();
+        let replacement = Arc::new(Mutex::new(None));
+        let dispatch_was_blocked = Arc::new(AtomicBool::new(false));
+
+        let handler_reg = Arc::clone(&reg);
+        let handler_replacement = Arc::clone(&replacement);
+        let handler_dispatch_was_blocked = Arc::clone(&dispatch_was_blocked);
+        slot.set_handler(move |_| {
+            let (slot, _fut) = handler_reg
+                .allocate()
+                .expect("completed slot releases capacity before handler");
+            *handler_replacement.lock().unwrap() = Some(slot);
+            handler_dispatch_was_blocked.store(handler_reg.allocate().is_err(), Ordering::Release);
+        });
+
+        let raw = slot.into_raw();
+        // SAFETY: raw was just produced by `into_raw`.
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        reclaimed.complete(Ok(CompletionInfo {
+            flags: 0,
+            bytes: 0,
+            tag: 0,
+            src_addr: 0,
+            op_context: raw as usize,
+            data: 0,
+        }));
+
+        assert_eq!(reg.live_count(), 1);
+        assert!(dispatch_was_blocked.load(Ordering::Acquire));
+        drop(reclaimed);
+        assert_eq!(reg.live_count(), 1);
+        drop(replacement.lock().unwrap().take());
+        assert_eq!(reg.live_count(), 0);
+    }
+
+    #[test]
     fn wake_before_register_still_resolves_future() {
         let reg = CompletionRegistry::new(1);
         let (slot, mut fut) = reg.allocate().unwrap();
         let raw = slot.into_raw();
         // SAFETY: raw was just produced by `into_raw`.
-        let reclaimed = unsafe { CompletionSlot::from_raw(raw) };
+        let mut reclaimed = unsafe { CompletionSlot::from_raw(raw) };
         reclaimed.complete(Ok(CompletionInfo {
             flags: 0,
             bytes: 0,
@@ -443,59 +410,5 @@ mod tests {
             Poll::Ready(Ok(_)) => {}
             _ => panic!("expected Ready(Ok)"),
         }
-    }
-
-    #[test]
-    fn completion_info_collapses_to_unified_result() {
-        use crate::io::{CompletionOutcome, IoError};
-
-        let ok: Result<CompletionInfo> = Ok(CompletionInfo {
-            flags: 0,
-            bytes: 4096,
-            tag: 7,
-            src_addr: 9,
-            op_context: 0,
-            data: 0,
-        });
-        match ok.into_io_result() {
-            Ok(c) => assert_eq!(c.bytes, 4096),
-            Err(e) => panic!("expected Ok, got {e}"),
-        }
-
-        let cq: Result<CompletionInfo> = Err(FabricError::Cq {
-            prov_errno: -3,
-            err: -5,
-        });
-        match cq.into_io_result() {
-            Err(IoError::Provider { prov_errno, err }) => {
-                assert_eq!(prov_errno, -3);
-                assert_eq!(err, -5);
-            }
-            other => panic!("expected Provider, got {other:?}"),
-        }
-
-        let other: Result<CompletionInfo> = Err(FabricError::BadConfig("nope"));
-        match other.into_io_result() {
-            Err(IoError::Other(msg)) => assert!(msg.contains("nope")),
-            other => panic!("expected Other, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn registry_reports_capacity_backpressure_policy() {
-        use crate::io::{BackPressure, BackPressurePolicy};
-
-        let reg = CompletionRegistry::new(2);
-        assert_eq!(reg.capacity(), 2);
-        assert_eq!(BackPressure::in_flight(&*reg), 0);
-        assert_eq!(reg.available(), 2);
-        assert!(reg.admits());
-        assert_eq!(reg.policy(), BackPressurePolicy::Capacity);
-
-        let (_s0, _f0) = reg.allocate().unwrap();
-        let (_s1, _f1) = reg.allocate().unwrap();
-        assert_eq!(BackPressure::in_flight(&*reg), 2);
-        assert_eq!(reg.available(), 0);
-        assert!(!reg.admits());
     }
 }

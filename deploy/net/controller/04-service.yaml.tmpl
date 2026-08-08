@@ -6,13 +6,13 @@ apiVersion: v1
 kind: Service
 metadata:
   name: unbounded-net-controller
-  namespace: {{ .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-net-controller
     app.kubernetes.io/component: controller
 spec:
   type: ClusterIP
-  # No selector — EndpointSlice managed by the leader pod
+  # No selector - Endpoints and EndpointSlice are managed by the leader pod.
   ports:
     - name: https
       port: 9999

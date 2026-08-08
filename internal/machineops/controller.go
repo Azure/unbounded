@@ -5,6 +5,7 @@ package machineops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -38,22 +39,26 @@ type OperationAuth = publicmachineops.OperationAuth
 // OperationResult describes provider-side changes that must be reflected after execution.
 type OperationResult = publicmachineops.OperationResult
 
-// Provider executes MachineOperation requests for a specific external provider.
+// Provider registers MachineOperation lifecycle strategies for one external provider.
 type Provider = publicmachineops.Provider
 
 // MachineOperationReconciler reconciles MachineOperation objects that target
 // externally controlled machines.
 type MachineOperationReconciler struct {
 	client.Client
-	Providers                 []Provider
-	SiteName                  string
-	ProviderName              string
-	MaxConcurrentReconciles   int
-	Now                       func() metav1.Time
-	ClusterInfo               *ClusterInfo
-	KubeClient                kubernetes.Interface
-	APIServerEndpoint         string
-	CredentialSecretNamespace string
+	RESTMapper                  apimeta.RESTMapper
+	Providers                   []*Provider
+	SiteName                    string
+	ProviderName                string
+	MaxConcurrentReconciles     int
+	ProviderPollInterval        time.Duration
+	ProviderStallAfter          time.Duration
+	ProviderStalledPollInterval time.Duration
+	Now                         func() metav1.Time
+	ClusterInfo                 *ClusterInfo
+	KubeClient                  kubernetes.Interface
+	APIServerEndpoint           string
+	CredentialSecretNamespace   string
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
@@ -61,6 +66,7 @@ type MachineOperationReconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperationcredentials,verbs=get;list;watch
+// +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineconfigurationversions,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=list
 // +kubebuilder:rbac:groups="",resources=configmaps;services;secrets,verbs=get
 // +kubebuilder:rbac:nonResourceURLs=/version,verbs=get
@@ -96,23 +102,28 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, fmt.Errorf("get Machine %s: %w", op.Spec.MachineRef, err)
 	}
 
-	if !r.ownsMachine(&machine) {
+	host, err := resolveMachineHost(&machine)
+	if err != nil {
+		return r.failOperation(ctx, &op, "InvalidHost", err.Error())
+	}
+
+	if !r.ownsMachine(&machine, host.provider) {
 		logger.V(1).Info("operation not owned by this external power controller",
 			"operation", op.Name,
 			"operationKind", op.Spec.OperationKind,
 			"machine", machine.Name,
 			"machineSite", siteNameFromLabels(machine.Labels),
-			"machineProvider", machine.Spec.Provider,
+			"machineProvider", host.provider,
 			"controllerSite", r.SiteName,
 			"controllerProvider", r.ProviderName)
 
 		return ctrl.Result{}, nil
 	}
 
-	providerMatch := r.providerFor(&machine, op.Spec.OperationKind)
-	if providerMatch.provider == nil {
-		if providerMatch.providerExists && isHostOperation(op.Spec.OperationKind) {
-			return r.failOperation(ctx, &op, "UnsupportedOperation", fmt.Sprintf("%s is not supported for %s", op.Spec.OperationKind, machine.Spec.Provider))
+	providerMatch := r.providerFor(host.provider, op.Spec.OperationKind)
+	if !providerMatch.supported() {
+		if providerMatch.provider != nil && isHostOperation(op.Spec.OperationKind) {
+			return r.failOperation(ctx, &op, "UnsupportedOperation", fmt.Sprintf("%s is not supported for %s", op.Spec.OperationKind, host.provider))
 		}
 
 		logger.V(1).Info("operation not handled by external power controller",
@@ -121,6 +132,36 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"machine", machine.Name)
 
 		return ctrl.Result{}, nil
+	}
+
+	if err := validateProviderReference(&machine, providerMatch.provider); err != nil {
+		return r.failOperation(ctx, &op, "InvalidProviderRef", err.Error())
+	}
+
+	if isHostOperation(op.Spec.OperationKind) {
+		result, waiting, err := r.waitForOlderConflictingOperation(ctx, &op, &machine, providerMatch)
+		if err != nil || waiting {
+			return result, err
+		}
+	}
+
+	if _, ok := operationTarget(&op, machine.Name); !ok {
+		if err := r.initializeOperationTarget(ctx, &op, &machine, providerMatch); err != nil {
+			var permanentErr *targetInputError
+			if errors.As(err, &permanentErr) {
+				return r.failOperation(ctx, &op, "RequestBuildFailed", err.Error())
+			}
+
+			return ctrl.Result{}, fmt.Errorf("initialize MachineOperation target input: %w", err)
+		}
+
+		if err := r.Get(ctx, opKey, &op); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+	}
+
+	if providerMatch.operation.Mode() == publicmachineops.OperationModeLongRunning {
+		return r.reconcileResumableOperation(ctx, &op, &machine, providerMatch)
 	}
 
 	return r.reconcileSupportedOperation(ctx, opKey, &op, &machine, providerMatch)
@@ -135,7 +176,7 @@ func (r *MachineOperationReconciler) reconcileSupportedOperation(
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	shouldExecute := shouldExecuteOperation(op)
+	shouldExecute := shouldExecuteOperation(op, providerMatch.operation)
 	if !shouldExecute {
 		logger.V(1).Info("operation already in progress, not re-executing external power action",
 			"operation", op.Name,
@@ -151,7 +192,7 @@ func (r *MachineOperationReconciler) reconcileSupportedOperation(
 	}
 
 	if authFailure != nil {
-		return r.failOperation(ctx, op, authFailure.Reason, authFailure.Message)
+		return r.failOperationTarget(ctx, op, machine.Name, authFailure.Reason, authFailure.Message)
 	}
 
 	message := fmt.Sprintf("executing %s via %s", op.Spec.OperationKind, providerMatch.provider.Name())
@@ -159,21 +200,36 @@ func (r *MachineOperationReconciler) reconcileSupportedOperation(
 		return ctrl.Result{}, err
 	}
 
-	operationRequest, err := r.operationRequest(ctx, op, machine, providerMatch.providerID, auth)
-	if err != nil {
-		return r.failOperation(ctx, op, "BootstrapDataFailed", err.Error())
+	target, ok := operationTarget(op, machine.Name)
+	if !ok {
+		return r.failOperation(ctx, op, "TargetStateMissing", fmt.Sprintf("MachineOperation target %s is missing", machine.Name))
 	}
 
-	operationResult, err := providerMatch.provider.Execute(ctx, operationRequest)
+	host, err := resolveMachineHost(machine)
 	if err != nil {
-		return r.failOperation(ctx, op, "ExecutionFailed", err.Error())
+		return r.failOperationTarget(ctx, op, machine.Name, "InvalidHost", err.Error())
+	}
+
+	operationRequest, err := r.operationRequest(ctx, op, machine, target, host.providerID, auth, providerMatch.operation.RequiresReplaceUserData())
+	if err != nil {
+		return r.failOperationTarget(ctx, op, machine.Name, "BootstrapDataFailed", err.Error())
+	}
+
+	operationResult, err := providerMatch.operation.Execute(ctx, operationRequest)
+	if err != nil {
+		return r.failOperationTarget(ctx, op, machine.Name, "ExecutionFailed", err.Error())
 	}
 
 	if err := r.applyOperationResult(ctx, machine, providerMatch, operationRequest, operationResult); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	return r.completeOperation(ctx, op, machine.Generation, fmt.Sprintf("%s completed via %s", op.Spec.OperationKind, providerMatch.provider.Name()))
+	message = fmt.Sprintf("%s completed via %s", op.Spec.OperationKind, providerMatch.provider.Name())
+	if err := r.finishOperationTarget(ctx, op.Name, machine.Name, unboundedv1alpha3.OperationPhaseComplete, message); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return r.completeOperation(ctx, op, machine.Generation, message)
 }
 
 func (r *MachineOperationReconciler) ensureOperationInProgress(
@@ -197,19 +253,29 @@ func (r *MachineOperationReconciler) operationRequest(
 	ctx context.Context,
 	op *unboundedv1alpha3.MachineOperation,
 	machine *unboundedv1alpha3.Machine,
+	target *unboundedv1alpha3.MachineOperationTargetStatus,
 	providerID string,
 	auth *OperationAuth,
+	includeReplaceUserData bool,
 ) (OperationRequest, error) {
 	request := OperationRequest{
-		Machine:       machine,
-		OperationName: op.Name,
-		OperationUID:  op.UID,
-		ProviderID:    providerID,
-		Operation:     op.Spec.OperationKind,
-		Parameters:    op.Spec.Parameters,
-		Auth:          auth,
+		MachineName:       machine.Name,
+		MachineUID:        machine.UID,
+		MachineGeneration: target.ObservedGeneration,
+		OperationName:     op.Name,
+		OperationUID:      op.UID,
+		ProviderID:        providerID,
+		Operation:         op.Spec.OperationKind,
+		Parameters:        op.Spec.Parameters,
+		Auth:              auth,
 	}
-	if op.Spec.OperationKind != unboundedv1alpha3.OperationHostReplace {
+
+	if target.Input != nil {
+		request.ProviderRef = target.Input.ProviderRef.DeepCopy()
+		request.HostImage = target.Input.HostImage
+	}
+
+	if op.Spec.OperationKind != unboundedv1alpha3.OperationHostReplace || !includeReplaceUserData {
 		return request, nil
 	}
 
@@ -230,17 +296,27 @@ func (r *MachineOperationReconciler) applyOperationResult(
 	request OperationRequest,
 	result OperationResult,
 ) error {
-	if result.ProviderID != "" && result.ProviderID != machine.Spec.ProviderID {
+	host, err := resolveMachineHost(machine)
+	if err != nil {
+		return err
+	}
+
+	if result.ProviderID != "" && result.ProviderID != host.providerID {
 		updatedGeneration, err := r.updateMachineProviderID(ctx, machine, result.ProviderID)
 		if err != nil {
 			return err
 		}
 
-		machine.Spec.ProviderID = result.ProviderID
+		if machine.Spec.Host != nil && machine.Spec.Host.External != nil {
+			machine.Spec.Host.External.ProviderID = result.ProviderID
+		} else {
+			machine.Spec.ProviderID = result.ProviderID
+		}
+
 		machine.Generation = updatedGeneration
 	}
 
-	if err := providerMatch.provider.Cleanup(ctx, request, result); err != nil {
+	if err := providerMatch.operation.Cleanup(ctx, request, result); err != nil {
 		return fmt.Errorf("cleanup %s via %s: %w", request.Operation, providerMatch.provider.Name(), err)
 	}
 
@@ -257,7 +333,14 @@ func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context
 
 		patch := client.MergeFrom(latest.DeepCopy())
 
-		latest.Spec.ProviderID = providerID
+		if latest.Spec.Host != nil && latest.Spec.Host.External != nil {
+			latest.Spec.Host.External.ProviderID = providerID
+		} else if latest.Spec.Host != nil && latest.Spec.Host.Azure != nil {
+			return fmt.Errorf("patch Machine providerID: Azure resourceID is immutable")
+		} else {
+			latest.Spec.ProviderID = providerID
+		}
+
 		if err := r.Patch(ctx, &latest, patch); err != nil {
 			return fmt.Errorf("patch Machine providerID: %w", err)
 		}
@@ -274,12 +357,12 @@ func (r *MachineOperationReconciler) updateMachineProviderID(ctx context.Context
 	return updatedGeneration, err
 }
 
-func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation) bool {
+func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation, operation *publicmachineops.Operation) bool {
 	if op.Status.Phase == "" || op.Status.Phase == unboundedv1alpha3.OperationPhasePending {
 		return true
 	}
 
-	return op.Spec.OperationKind == unboundedv1alpha3.OperationHostReplace && op.Status.Phase == unboundedv1alpha3.OperationPhaseInProgress
+	return operation.ReplaySafe() && op.Status.Phase == unboundedv1alpha3.OperationPhaseInProgress
 }
 
 func isHostOperation(operation unboundedv1alpha3.OperationKind) bool {
@@ -287,9 +370,8 @@ func isHostOperation(operation unboundedv1alpha3.OperationKind) bool {
 }
 
 type providerMatch struct {
-	provider       Provider
-	providerID     string
-	providerExists bool
+	provider  *Provider
+	operation *publicmachineops.Operation
 }
 
 func (r *MachineOperationReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -307,8 +389,10 @@ func (r *MachineOperationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return ok && shouldReconcileOperation(op)
 			},
 			UpdateFunc: func(e event.UpdateEvent) bool {
-				op, ok := e.ObjectNew.(*unboundedv1alpha3.MachineOperation)
-				return ok && shouldReconcileOperation(op)
+				oldOperation, oldOK := e.ObjectOld.(*unboundedv1alpha3.MachineOperation)
+				newOperation, newOK := e.ObjectNew.(*unboundedv1alpha3.MachineOperation)
+
+				return oldOK && newOK && shouldReconcileOperationUpdate(oldOperation, newOperation)
 			},
 			DeleteFunc: func(e event.DeleteEvent) bool { return false },
 			GenericFunc: func(e event.GenericEvent) bool {
@@ -328,36 +412,51 @@ func shouldReconcileOperation(op *unboundedv1alpha3.MachineOperation) bool {
 	return op.Spec.TTLSecondsAfterFinished != nil && op.Status.CompletedAt != nil
 }
 
-func (r *MachineOperationReconciler) providerFor(machine *unboundedv1alpha3.Machine, operation unboundedv1alpha3.OperationKind) providerMatch {
-	if machine.Spec.Provider == "" || machine.Spec.ProviderID == "" {
+func shouldReconcileOperationUpdate(oldOperation, newOperation *unboundedv1alpha3.MachineOperation) bool {
+	if oldOperation.Generation != newOperation.Generation {
+		return shouldReconcileOperation(newOperation)
+	}
+
+	becameTerminal := !oldOperation.Status.IsTerminal() && newOperation.Status.IsTerminal()
+
+	return becameTerminal && shouldReconcileOperation(newOperation)
+}
+
+func (r *MachineOperationReconciler) providerFor(providerName string, operation unboundedv1alpha3.OperationKind) providerMatch {
+	if providerName == "" {
 		return providerMatch{}
 	}
 
 	var matched providerMatch
 
 	for _, provider := range r.Providers {
-		if provider.Name() != machine.Spec.Provider {
+		if provider == nil {
 			continue
 		}
 
-		matched.providerExists = true
-		if provider.Supports(operation) {
-			matched.provider = provider
-			matched.providerID = machine.Spec.ProviderID
-
-			return matched
+		if provider.Name() != providerName {
+			continue
 		}
+
+		matched.provider = provider
+		matched.operation, _ = provider.Operation(operation)
+
+		return matched
 	}
 
 	return matched
 }
 
-func (r *MachineOperationReconciler) ownsMachine(machine *unboundedv1alpha3.Machine) bool {
+func (m providerMatch) supported() bool {
+	return m.provider != nil && m.operation != nil
+}
+
+func (r *MachineOperationReconciler) ownsMachine(machine *unboundedv1alpha3.Machine, providerName string) bool {
 	if r.SiteName != "" && siteNameFromLabels(machine.Labels) != r.SiteName {
 		return false
 	}
 
-	if r.ProviderName != "" && machine.Spec.Provider != r.ProviderName {
+	if r.ProviderName != "" && providerName != r.ProviderName {
 		return false
 	}
 
@@ -384,6 +483,8 @@ func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *
 }
 
 func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unboundedv1alpha3.MachineOperation, message string) error {
+	message = truncateUTF8Bytes(message, maxConditionMessageBytes)
+
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latest unboundedv1alpha3.MachineOperation
 		if err := r.Get(ctx, client.ObjectKeyFromObject(op), &latest); err != nil {
@@ -398,13 +499,28 @@ func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unb
 			latest.Status.StartedAt = &now
 		}
 
-		apimeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+		for i := range latest.Status.Targets {
+			target := &latest.Status.Targets[i]
+			if target.Phase == unboundedv1alpha3.OperationPhaseComplete || target.Phase == unboundedv1alpha3.OperationPhaseFailed {
+				continue
+			}
+
+			target.Phase = unboundedv1alpha3.OperationPhaseInProgress
+
+			target.Message = message
+			if target.StartedAt == nil {
+				target.StartedAt = &now
+			}
+		}
+
+		condition := normalizeCondition(metav1.Condition{
 			Type:               OperationConditionCompleted,
 			Status:             metav1.ConditionFalse,
 			Reason:             "InProgress",
 			Message:            message,
 			ObservedGeneration: latest.Generation,
 		})
+		apimeta.SetStatusCondition(&latest.Status.Conditions, condition)
 
 		if err := r.Status().Update(ctx, &latest); err != nil {
 			return fmt.Errorf("mark MachineOperation InProgress: %w", err)
@@ -415,11 +531,11 @@ func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unb
 }
 
 func (r *MachineOperationReconciler) completeOperation(ctx context.Context, op *unboundedv1alpha3.MachineOperation, observedMachineGeneration int64, message string) (ctrl.Result, error) {
-	return r.finishOperation(ctx, op, unboundedv1alpha3.OperationPhaseComplete, "Succeeded", message, observedMachineGeneration, nil)
+	return r.finishOperation(ctx, op, unboundedv1alpha3.OperationPhaseComplete, "Succeeded", message, observedMachineGeneration)
 }
 
 func (r *MachineOperationReconciler) failOperation(ctx context.Context, op *unboundedv1alpha3.MachineOperation, reason, message string) (ctrl.Result, error) {
-	return r.finishOperation(ctx, op, unboundedv1alpha3.OperationPhaseFailed, reason, message, 0, nil)
+	return r.finishOperation(ctx, op, unboundedv1alpha3.OperationPhaseFailed, reason, message, 0)
 }
 
 func (r *MachineOperationReconciler) finishOperation(
@@ -429,8 +545,10 @@ func (r *MachineOperationReconciler) finishOperation(
 	reason string,
 	message string,
 	observedMachineGeneration int64,
-	execErr error,
 ) (ctrl.Result, error) {
+	reason = normalizeConditionReason(reason)
+	message = truncateUTF8Bytes(message, maxConditionMessageBytes)
+
 	var updated unboundedv1alpha3.MachineOperation
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -456,20 +574,17 @@ func (r *MachineOperationReconciler) finishOperation(
 			conditionStatus = metav1.ConditionFalse
 		}
 
-		apimeta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+		condition := normalizeCondition(metav1.Condition{
 			Type:               OperationConditionCompleted,
 			Status:             conditionStatus,
 			Reason:             reason,
 			Message:            message,
 			ObservedGeneration: updated.Generation,
 		})
+		apimeta.SetStatusCondition(&updated.Status.Conditions, condition)
 
 		return r.Status().Update(ctx, &updated)
 	}); err != nil {
-		if execErr != nil {
-			return ctrl.Result{}, execErr
-		}
-
 		return ctrl.Result{}, fmt.Errorf("finish MachineOperation: %w", err)
 	}
 
@@ -477,7 +592,7 @@ func (r *MachineOperationReconciler) finishOperation(
 		return r.reconcileTerminal(ctx, &updated)
 	}
 
-	return ctrl.Result{}, execErr
+	return ctrl.Result{}, nil
 }
 
 func (r *MachineOperationReconciler) now() metav1.Time {

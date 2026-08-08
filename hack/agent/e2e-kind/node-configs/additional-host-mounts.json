@@ -1,0 +1,20 @@
+{
+  "name": "additional-host-mounts",
+  "nodeLabels": {
+    "e2e.unbounded-cloud.io/config": "additional-host-mounts"
+  },
+  "additionalHostMounts": [
+    {
+      "source": "/etc/os-release",
+      "target": "/run/host-config/os-release",
+      "readOnly": true
+    },
+    {
+      "source": "/etc/hostname",
+      "readOnly": true
+    }
+  ],
+  "additionalHostDevices": [
+    "/dev/null"
+  ]
+}

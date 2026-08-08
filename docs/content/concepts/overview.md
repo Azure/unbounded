@@ -1,7 +1,7 @@
 ---
 title: "Project Overview"
 weight: 1
-description: "What Project Unbounded is, the problem it solves, and how its components work together."
+description: "What Unbounded Kubernetes is, the problem it solves, and how its components work together."
 ---
 
 ## The Problem
@@ -18,15 +18,15 @@ locations:
 
 Kubernetes itself has no opinion on how to provision nodes outside the cluster's
 network, how to route pod traffic across sites, or how to PXE-boot bare-metal
-servers. These are gaps that Project Unbounded fills.
+servers. These are gaps that Unbounded Kubernetes fills.
 
 ## The Solution
 
-**Project Unbounded** extends any conformant Kubernetes control plane so that
+**Unbounded Kubernetes** extends any conformant Kubernetes control plane so that
 worker nodes can run anywhere and join back to the cluster over encrypted
 tunnels. It supports four provisioning paths and a unified networking layer.
 
-![Project Unbounded overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking](../../img/unbounded-overview.svg)
+![Unbounded Kubernetes overview: Control Plane connected to Bare Metal (PXE Boot), Public Cloud (cloud-init), and AI Infrastructure (SSH) sites via WireGuard and Direct L3 networking](../../img/unbounded-overview.svg)
 
 ## Components
 
@@ -54,8 +54,9 @@ over SSH. Given a `Machine` custom resource with SSH connection details, it:
 4. Watches for the corresponding `Node` object and transitions the Machine
    through its lifecycle phases.
 
-machina is deployed as a `Deployment` in the `unbounded-kube` namespace and is
-installed automatically by `kubectl unbounded site init`.
+machina is deployed by `unbounded-operator` when it is enabled in
+`Site.spec.components`. Install the operator first with
+`kubectl unbounded install`, then `kubectl unbounded site init` creates the Site.
 
 See the [SSH guide]({{< relref "guides/ssh" >}}) for a hands-on walkthrough
 and the [Architecture reference]({{< relref "reference/architecture" >}}) for
@@ -105,7 +106,7 @@ connectivity across sites by:
 - Grouping nodes into **Sites** based on their internal IPs.
 - Routing cross-site traffic through **Gateway** nodes using configurable
   tunnels (WireGuard, GENEVE, VXLAN, IPIP, or direct routing).
-- Running an eBPF or netlink dataplane on each node to program routes.
+- Running an eBPF dataplane on each node to program routes.
 
 See the [Networking concepts]({{< relref "concepts/networking" >}}) for an
 introduction and the
@@ -119,7 +120,7 @@ The system is driven by Kubernetes custom resources:
 | CRD | API Group | Scope | Purpose |
 |-----|-----------|-------|---------|
 | **Machine** | `unbounded-cloud.io` | Cluster | Represents a remote host to be provisioned (SSH, cloud API, or PXE) |
-| **Site** | `net.unbounded-cloud.io` | Cluster | Groups nodes by internal IP range; allocates pod CIDRs |
+| **Site** | `unbounded-cloud.io` | Cluster | Groups nodes by internal IP range, allocates pod CIDRs, and declares enabled components |
 | **GatewayPool** | `net.unbounded-cloud.io` | Cluster | Defines a set of gateway nodes for inter-site routing |
 | **SitePeering** | `net.unbounded-cloud.io` | Cluster | Enables direct node-to-node tunnels between sites |
 
@@ -134,9 +135,9 @@ The flow varies by provisioning path, but all paths share the same final steps:
 
 **SSH path:**
 
-1. **`kubectl unbounded site init`** prepares the cluster: installs
-   unbounded-net, creates Site and GatewayPool resources, generates a bootstrap
-   token, and deploys the machina controller.
+1. **`kubectl unbounded install`** bootstraps `unbounded-operator` and its CRDs,
+   then **`kubectl unbounded site init`** creates Site and GatewayPool resources,
+   records enabled components, and generates a bootstrap token.
 2. **`kubectl unbounded machine register`** creates a `Machine` resource with
    SSH connection details.
 3. **machina** SSHs into the host, runs the install script, and waits for the

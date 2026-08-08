@@ -1,0 +1,70 @@
+# Per-machine systemd service drop-in that sets environment variables consumed
+# by systemd-nspawn at startup. We intentionally do NOT override ExecStart -
+# the default systemd-nspawn@.service template uses `--settings=override`,
+# which means the .nspawn file in the trusted directory /etc/systemd/nspawn/
+# takes precedence over CLI flags like -U and --network-veth.
+#
+#   SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
+#     Forces cgroups v2 inside the container. Without this, older
+#     systemd-nspawn versions detect the systemd version inside the container
+#     image and may fall back to a legacy cgroups v1 hierarchy. This env var
+#     bypasses that detection entirely.
+#
+#   SYSTEMD_NSPAWN_API_VFS_WRITABLE=network
+#     Makes /proc/sys/net writable inside the container. With VirtualEthernet=no
+#     (shared host network namespace), nspawn normally mounts all of /proc/sys
+#     read-only including /proc/sys/net. This env var carves out /proc/sys/net
+#     as writable so that CNI plugins and kube-proxy can set network sysctls.
+
+# Self-healing: when systemd-machined is restarted (for example by needrestart
+# during an unattended-upgrades run that touches libcap/systemd), this nspawn
+# unit is stopped. Restart=on-failure brings it back; ExecStartPre clears any
+# stale machinectl registration that would otherwise cause the next start to
+# fail with "Machine '<name>' already exists" / errno 17. The leading '-' on
+# ExecStartPre marks the command as non-fatal, so a fresh start (where there
+# is nothing to terminate) is unaffected. StartLimitIntervalSec=0 disables
+# the start-rate limiter so a long machined outage cannot leave the unit
+# permanently failed.
+#
+# The bpffs ExecStartPre lines ensure the per-machine host source path exists
+# and is a bpffs mount before the .nspawn Bind= directive exposes it inside the
+# machine. eBPF CNIs need a usable bpffs at /sys/fs/bpf to create and share BPF
+# maps, but each nspawn machine should get its own pinned-object namespace.
+
+[Unit]
+Requires=unbounded-agent-regenerate-config@kube1.service
+After=unbounded-agent-regenerate-config@kube1.service
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+ExecStartPre=-/usr/bin/machinectl terminate kube1
+ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube1
+ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube1 || /usr/bin/mount -t bpf bpf /run/bpffs/kube1'
+Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
+Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=network
+
+# GPU support - allow the container to access NVIDIA device nodes via the
+# cgroup device controller. DeviceAllow grants read/write permission so that
+# the bind-mounted devices from the [Files] section in the .nspawn config
+# are actually usable inside the container.
+DeviceAllow=/dev/dri/card0 rwm
+DeviceAllow=/dev/dri/card1 rwm
+DeviceAllow=/dev/dri/card2 rwm
+DeviceAllow=/dev/dri/card3 rwm
+DeviceAllow=/dev/dri/card4 rwm
+DeviceAllow=/dev/dri/renderD128 rwm
+DeviceAllow=/dev/dri/renderD129 rwm
+DeviceAllow=/dev/dri/renderD130 rwm
+DeviceAllow=/dev/dri/renderD131 rwm
+DeviceAllow=/dev/nvidia-modeset rwm
+DeviceAllow=/dev/nvidia-uvm rwm
+DeviceAllow=/dev/nvidia-uvm-tools rwm
+DeviceAllow=/dev/nvidia0 rwm
+DeviceAllow=/dev/nvidia1 rwm
+DeviceAllow=/dev/nvidia2 rwm
+DeviceAllow=/dev/nvidia3 rwm
+DeviceAllow=/dev/nvidiactl rwm
+DeviceAllow=char-nvidia-caps rwm
+DeviceAllow=char-nvidia-caps-imex-channels rwm

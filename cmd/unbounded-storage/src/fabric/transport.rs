@@ -219,52 +219,44 @@ fn forward_dest_mr(mr: MrHandle, dest_offset: usize) -> MrHandle {
 /// delivers acks from the progress thread. Implements [`AckSink`] so
 /// the dispatch can route replies straight into the queue.
 pub(crate) struct StreamShared {
-    /// FIFO of reply messages arriving from the dispatch.
-    queue: Mutex<VecDeque<RecvCompletion>>,
-    /// Waker registered by the stream when it last returned Pending.
-    waker: Mutex<Option<Waker>>,
+    delivery: Mutex<DeliveryState>,
 }
 
 impl StreamShared {
     fn push(&self, item: RecvCompletion) {
-        if let Ok(mut q) = self.queue.lock() {
-            q.push_back(item);
-        }
-        if let Ok(mut w) = self.waker.lock() {
-            if let Some(w) = w.take() {
-                w.wake();
-            }
+        let waker = {
+            let mut delivery = self.delivery.lock().expect("stream delivery poisoned");
+            delivery.queue.push_back(item);
+            delivery.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
 
 impl AckSink for StreamShared {
-    fn deliver(&self, kind: MsgKind, body: &[u8]) {
-        self.push(RecvCompletion {
+    fn deliver(&self, kind: MsgKind, body: Vec<u8>) {
+        self.push(RecvCompletion::Message {
             kind,
-            payload: body.to_vec(),
+            payload: body,
         });
     }
 
     fn deliver_page(&self, ordinal: u32) {
-        // A page-landed write-with-immediate carries no framed body.
-        // Re-encode it as the internal `PAGE_ACK` event so the poll
-        // loop's existing ack bookkeeping (bounds, dedup, end-of-stream)
-        // handles it verbatim. A serialize failure is impossible for a
-        // fixed-size struct; fall back to an empty body, which the poll
-        // loop rejects as a malformed ack rather than panicking on the
-        // progress thread.
-        let payload = bincode::serialize(&PageAck { page_idx: ordinal }).unwrap_or_default();
-        self.push(RecvCompletion {
-            kind: MsgKind::PageAck,
-            payload,
-        });
+        self.push(RecvCompletion::PageLanded(ordinal));
     }
 }
 
-struct RecvCompletion {
-    kind: MsgKind,
-    payload: Vec<u8>,
+#[derive(Default)]
+struct DeliveryState {
+    queue: VecDeque<RecvCompletion>,
+    waker: Option<Waker>,
+}
+
+enum RecvCompletion {
+    Message { kind: MsgKind, payload: Vec<u8> },
+    PageLanded(u32),
 }
 
 /// Stream returned by `FabricTransport::bulk_get`. On first poll it
@@ -304,6 +296,7 @@ enum StreamState<'a> {
         /// the write-with-immediate path; Drop releases it.
         page_handle: u16,
         acked: Vec<bool>,
+        acked_count: usize,
         ended: bool,
         emitted_error: bool,
         log: Option<crate::obs::ReqLog>,
@@ -408,6 +401,7 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                                 request_id,
                                 page_handle,
                                 acked: vec![false; dsts.len()],
+                                acked_count: 0,
                                 ended: false,
                                 emitted_error: false,
                                 log: Some(log),
@@ -427,6 +421,7 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                     request_id: _,
                     page_handle: _,
                     acked,
+                    acked_count,
                     ended,
                     emitted_error,
                     log,
@@ -434,84 +429,108 @@ impl<'a, R> PageStream for FabricBulkStream<'a, R> {
                     if *ended {
                         return Poll::Ready(None);
                     }
-                    // Register waker first to avoid a lost wakeup.
-                    if let Ok(mut w) = shared.waker.lock() {
-                        *w = Some(cx.waker().clone());
-                    }
-                    let item = shared.queue.lock().ok().and_then(|mut q| q.pop_front());
+                    let item = {
+                        let mut delivery =
+                            shared.delivery.lock().expect("stream delivery poisoned");
+                        match delivery.queue.pop_front() {
+                            Some(item) => Some(item),
+                            None => {
+                                delivery.waker = Some(cx.waker().clone());
+                                None
+                            }
+                        }
+                    };
                     match item {
                         None => return Poll::Pending,
-                        Some(RecvCompletion { kind, payload }) => match kind {
-                            MsgKind::PageAck => {
-                                let ack: PageAck = match bincode::deserialize(&payload) {
-                                    Ok(v) => v,
-                                    Err(_) => {
+                        Some(item) => {
+                            let (kind, payload, page_idx) = match item {
+                                RecvCompletion::Message { kind, payload } => {
+                                    let page_idx = if kind == MsgKind::PageAck {
+                                        let ack: PageAck = match bincode::deserialize(&payload) {
+                                            Ok(v) => v,
+                                            Err(_) => {
+                                                *ended = true;
+                                                if let Some(mut l) = log.take() {
+                                                    l.finish_err("malformed PAGE_ACK");
+                                                }
+                                                return Poll::Ready(Some(Err(
+                                                    PoolError::transport(FabricError::BadConfig(
+                                                        "malformed PAGE_ACK",
+                                                    )),
+                                                )));
+                                            }
+                                        };
+                                        Some(ack.page_idx)
+                                    } else {
+                                        None
+                                    };
+                                    (kind, payload, page_idx)
+                                }
+                                RecvCompletion::PageLanded(page_idx) => {
+                                    (MsgKind::PageAck, Vec::new(), Some(page_idx))
+                                }
+                            };
+                            match kind {
+                                MsgKind::PageAck => {
+                                    let page_idx = page_idx.expect("page event missing ordinal");
+                                    let idx = page_idx as usize;
+                                    if idx >= dsts.len() {
                                         *ended = true;
                                         if let Some(mut l) = log.take() {
-                                            l.finish_err("malformed PAGE_ACK");
+                                            l.finish_err("PAGE_ACK index out of range");
                                         }
                                         return Poll::Ready(Some(Err(PoolError::transport(
-                                            FabricError::BadConfig("malformed PAGE_ACK"),
+                                            FabricError::BadConfig("PAGE_ACK index out of range"),
                                         ))));
                                     }
-                                };
-                                let idx = ack.page_idx as usize;
-                                if idx >= dsts.len() {
+                                    if acked[idx] {
+                                        *ended = true;
+                                        if let Some(mut l) = log.take() {
+                                            l.finish_err("duplicate PAGE_ACK index");
+                                        }
+                                        return Poll::Ready(Some(Err(PoolError::transport(
+                                            FabricError::BadConfig("duplicate PAGE_ACK index"),
+                                        ))));
+                                    }
+                                    acked[idx] = true;
+                                    *acked_count += 1;
+                                    // Full success carries no RESPONSE_END;
+                                    // the final distinct ack ends the stream.
+                                    if *acked_count == dsts.len() {
+                                        *ended = true;
+                                        if let Some(mut l) = log.take() {
+                                            l.field("acked", *acked_count).finish_ok();
+                                        }
+                                    }
+                                    return Poll::Ready(Some(Ok(dsts[idx])));
+                                }
+                                MsgKind::ResponseEnd => {
                                     *ended = true;
                                     if let Some(mut l) = log.take() {
-                                        l.finish_err("PAGE_ACK index out of range");
+                                        l.field("acked", *acked_count).finish_ok();
                                     }
-                                    return Poll::Ready(Some(Err(PoolError::transport(
-                                        FabricError::BadConfig("PAGE_ACK index out of range"),
-                                    ))));
-                                }
-                                if acked[idx] {
-                                    *ended = true;
-                                    if let Some(mut l) = log.take() {
-                                        l.finish_err("duplicate PAGE_ACK index");
-                                    }
-                                    return Poll::Ready(Some(Err(PoolError::transport(
-                                        FabricError::BadConfig("duplicate PAGE_ACK index"),
-                                    ))));
-                                }
-                                acked[idx] = true;
-                                // Full success carries no RESPONSE_END;
-                                // the last in-order ack ends the stream.
-                                if acked.iter().all(|a| *a) {
-                                    *ended = true;
-                                    if let Some(mut l) = log.take() {
-                                        l.field("acked", acked.len()).finish_ok();
-                                    }
-                                }
-                                return Poll::Ready(Some(Ok(dsts[idx])));
-                            }
-                            MsgKind::ResponseEnd => {
-                                *ended = true;
-                                if let Some(mut l) = log.take() {
-                                    l.field("acked", acked.iter().filter(|a| **a).count())
-                                        .finish_ok();
-                                }
-                                return Poll::Ready(None);
-                            }
-                            MsgKind::ErrorAck => {
-                                *ended = true;
-                                if *emitted_error {
                                     return Poll::Ready(None);
                                 }
-                                *emitted_error = true;
-                                let ack = bincode::deserialize::<ErrorAck>(&payload)
-                                    .unwrap_or_else(|_| {
-                                        ErrorAck::generic("server error (undecodable)")
-                                    });
-                                if let Some(mut l) = log.take() {
-                                    l.finish_err(&ack.message);
+                                MsgKind::ErrorAck => {
+                                    *ended = true;
+                                    if *emitted_error {
+                                        return Poll::Ready(None);
+                                    }
+                                    *emitted_error = true;
+                                    let ack = bincode::deserialize::<ErrorAck>(&payload)
+                                        .unwrap_or_else(|_| {
+                                            ErrorAck::generic("server error (undecodable)")
+                                        });
+                                    if let Some(mut l) = log.take() {
+                                        l.finish_err(&ack.message);
+                                    }
+                                    return Poll::Ready(Some(Err(error_ack_to_pool_error(ack))));
                                 }
-                                return Poll::Ready(Some(Err(error_ack_to_pool_error(ack))));
+                                // A REQUEST is never routed to a client ack
+                                // sink; ignore any stray delivery.
+                                MsgKind::Request => continue,
                             }
-                            // A REQUEST is never routed to a client ack
-                            // sink; ignore any stray delivery.
-                            MsgKind::Request => continue,
-                        },
+                        }
                     }
                 }
             }
@@ -604,8 +623,7 @@ fn launch(
     let (ep, _addr) = fabric.resolve_peer(peer)?;
 
     let shared = Arc::new(StreamShared {
-        queue: Mutex::new(VecDeque::new()),
-        waker: Mutex::new(None),
+        delivery: Mutex::new(DeliveryState::default()),
     });
 
     // Register the ack sink BEFORE sending so no reply can race ahead
@@ -737,17 +755,18 @@ mod tests {
 
     fn active_stream<'a>(dsts: &'a [PageRef], acked: Vec<bool>) -> FabricBulkStream<'a, ()> {
         assert_eq!(acked.len(), dsts.len());
+        let acked_count = acked.iter().filter(|value| **value).count();
         FabricBulkStream {
             state: StreamState::Active {
                 shared: Arc::new(StreamShared {
-                    queue: Mutex::new(VecDeque::new()),
-                    waker: Mutex::new(None),
+                    delivery: Mutex::new(DeliveryState::default()),
                 }),
                 dsts,
                 dispatch: InboundDispatch::new(),
                 request_id: 1,
                 page_handle: 0,
                 acked,
+                acked_count,
                 ended: false,
                 emitted_error: false,
                 log: None,
@@ -761,7 +780,7 @@ mod tests {
             panic!("expected active stream");
         };
         let payload = bincode::serialize(&PageAck { page_idx }).expect("serialize page ack");
-        shared.push(RecvCompletion {
+        shared.push(RecvCompletion::Message {
             kind: MsgKind::PageAck,
             payload,
         });
@@ -771,7 +790,7 @@ mod tests {
         let StreamState::Active { shared, .. } = &stream.state else {
             panic!("expected active stream");
         };
-        shared.push(RecvCompletion {
+        shared.push(RecvCompletion::Message {
             kind: MsgKind::ResponseEnd,
             payload: Vec::new(),
         });
@@ -786,7 +805,7 @@ mod tests {
             message: message.to_string(),
         })
         .expect("serialize error ack");
-        shared.push(RecvCompletion {
+        shared.push(RecvCompletion::Message {
             kind: MsgKind::ErrorAck,
             payload,
         });
@@ -1006,6 +1025,37 @@ mod tests {
     }
 
     #[test]
+    fn immediate_duplicate_has_same_error_as_framed_ack() {
+        let dsts = [
+            PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            },
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            },
+        ];
+        let mut stream = active_stream(&dsts, vec![false, false]);
+        push_page_landed(&mut stream, 1);
+        push_page_landed(&mut stream, 1);
+
+        assert!(matches!(
+            poll_once(&mut stream),
+            Poll::Ready(Some(Ok(PageRef { page_idx: 1, .. })))
+        ));
+        match poll_once(&mut stream) {
+            Poll::Ready(Some(Err(PoolError::Transport(err)))) => assert!(
+                err.to_string().contains("duplicate PAGE_ACK index"),
+                "unexpected error: {err}",
+            ),
+            other => panic!("expected transport error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn response_end_after_short_success_returns_eof() {
         let dsts = [
             PageRef {
@@ -1100,6 +1150,39 @@ mod tests {
             stream.as_mut().poll_next(&mut cx),
             Poll::Ready(None)
         ));
+    }
+
+    #[test]
+    fn out_of_order_acks_yield_arrival_order_and_end_at_exact_count() {
+        let dsts = [
+            PageRef {
+                page_idx: 0,
+                offset: 0,
+                len: 4096,
+            },
+            PageRef {
+                page_idx: 1,
+                offset: 0,
+                len: 4096,
+            },
+            PageRef {
+                page_idx: 2,
+                offset: 0,
+                len: 4096,
+            },
+        ];
+        let mut stream = active_stream(&dsts, vec![false; 3]);
+        push_page_ack(&mut stream, 2);
+        push_page_landed(&mut stream, 0);
+        push_page_ack(&mut stream, 1);
+
+        for page_idx in [2, 0, 1] {
+            assert!(matches!(
+                poll_once(&mut stream),
+                Poll::Ready(Some(Ok(PageRef { page_idx: actual, .. }))) if actual == page_idx
+            ));
+        }
+        assert!(matches!(poll_once(&mut stream), Poll::Ready(None)));
     }
 
     #[test]

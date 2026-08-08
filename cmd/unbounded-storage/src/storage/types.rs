@@ -81,8 +81,8 @@ impl PageKey {
     }
 
     /// FNV-1a-style mixer over the key's bytes, tagged with a
-    /// per-caller domain separator. Used by admission's count-min
-    /// sketch and the singleflight shard selector. Not cryptographic;
+    /// per-caller domain separator. Used by the admission doorkeeper
+    /// and the singleflight shard selector. Not cryptographic;
     /// the `domain` tag is not a secret and only exists to give
     /// different callers near-independent 64-bit lanes.
     pub fn mix(&self, domain: u32) -> u64 {

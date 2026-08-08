@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +16,7 @@ import (
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -42,6 +44,10 @@ func (c *configureKubelet) Do(_ context.Context) error {
 
 	if err := c.ensureKubeletCACert(); err != nil {
 		return fmt.Errorf("ensure kubelet CA cert: %w", err)
+	}
+
+	if err := c.ensureKubeletConfiguration(); err != nil {
+		return fmt.Errorf("ensure kubelet configuration: %w", err)
 	}
 
 	if err := c.ensureKubeletServiceUnit(); err != nil {
@@ -100,6 +106,92 @@ func (c *configureKubelet) ensureKubeletCACert() error {
 	return utilio.WriteFile(dest, c.goalState.Kubelet.CACertData, 0o644)
 }
 
+// ensureKubeletConfiguration writes a KubeletConfiguration assembled from the
+// agent baseline and the user-provided overlay. Agent-owned connectivity and
+// authentication fields are applied after the overlay.
+func (c *configureKubelet) ensureKubeletConfiguration() error {
+	spec := c.goalState.Kubelet
+	configuration := defaultKubeletConfiguration()
+	maps.Copy(configuration, spec.Configuration)
+
+	configuration["apiVersion"] = "kubelet.config.k8s.io/v1beta1"
+	configuration["kind"] = "KubeletConfiguration"
+	configuration["clusterDNS"] = []string{spec.ClusterDNS}
+
+	configuration["containerRuntimeEndpoint"] = "unix:///run/containerd/containerd.sock"
+	if spec.ResolvConf != "" {
+		configuration["resolvConf"] = spec.ResolvConf
+	}
+
+	authentication := ensureConfigurationMap(configuration, "authentication")
+	x509 := ensureConfigurationMap(authentication, "x509")
+	x509["clientCAFile"] = goalstates.KubeletAPIServerCACertPath
+
+	authorization := ensureConfigurationMap(configuration, "authorization")
+	authorization["mode"] = "Webhook"
+
+	data, err := yaml.Marshal(configuration)
+	if err != nil {
+		return fmt.Errorf("marshal KubeletConfiguration: %w", err)
+	}
+
+	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletConfigurationPath)
+
+	return utilio.WriteFile(dest, data, 0o644)
+}
+
+func defaultKubeletConfiguration() map[string]any {
+	return map[string]any{
+		"address": "0.0.0.0",
+		"authentication": map[string]any{
+			"anonymous": map[string]any{"enabled": false},
+			"webhook":   map[string]any{"enabled": true},
+		},
+		"authorization": map[string]any{
+			"mode": "Webhook",
+		},
+		"cgroupDriver":                   "systemd",
+		"cgroupsPerQOS":                  true,
+		"clusterDomain":                  "cluster.local",
+		"enableServer":                   true,
+		"enforceNodeAllocatable":         []string{"pods"},
+		"eventRecordQPS":                 0,
+		"nodeStatusUpdateFrequency":      "10s",
+		"podPidsLimit":                   -1,
+		"protectKernelDefaults":          true,
+		"readOnlyPort":                   0,
+		"resolvConf":                     "/etc/resolv.conf",
+		"rotateCertificates":             true,
+		"runtimeRequestTimeout":          "15m",
+		"staticPodPath":                  goalstates.KubeletStaticPodManifestsDir,
+		"streamingConnectionIdleTimeout": "4h",
+		"tlsCipherSuites": []string{
+			"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+			"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+			"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
+			"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+			"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
+			"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+			"TLS_RSA_WITH_AES_256_GCM_SHA384",
+			"TLS_RSA_WITH_AES_128_GCM_SHA256",
+		},
+		"volumePluginDir": "/etc/kubernetes/volumeplugins",
+	}
+}
+
+func ensureConfigurationMap(parent map[string]any, key string) map[string]any {
+	value, ok := parent[key].(map[string]any)
+	if !ok {
+		value = map[string]any{}
+	} else {
+		value = maps.Clone(value)
+	}
+
+	parent[key] = value
+
+	return value
+}
+
 // ensureKubeletServiceUnit renders and writes the kubelet systemd unit file
 // into the machine rootfs.
 func (c *configureKubelet) ensureKubeletServiceUnit() error {
@@ -107,7 +199,8 @@ func (c *configureKubelet) ensureKubeletServiceUnit() error {
 
 	buf := &bytes.Buffer{}
 	if err := assetsTemplate.ExecuteTemplate(buf, "kubelet.service", map[string]any{
-		"KubeletBinPath": spec.KubeletBinPath,
+		"KubeletBinPath":           spec.KubeletBinPath,
+		"KubeletConfigurationPath": goalstates.KubeletConfigurationPath,
 	}); err != nil {
 		return err
 	}
@@ -139,19 +232,17 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 			data: map[string]any{
 				"KubeconfigPath":          goalstates.KubeletKubeconfigPath,
 				"BootstrapKubeconfigPath": goalstates.KubeletBootstrapKubeconfigPath,
-				"RotateCertificates":      true,
 				"UseExecCredential":       spec.ExecCredential != nil,
 			},
 		},
 		{
 			name: "20-node-config.conf",
 			data: map[string]any{
-				"NodeName":           c.goalState.NodeName,
-				"NodeIP":             spec.NodeIP,
-				"NodeLabels":         nodeLabels,
-				"RegisterWithTaints": registerWithTaints,
-				"ClientCAFile":       goalstates.KubeletAPIServerCACertPath,
-				"ClusterDNS":         spec.ClusterDNS,
+				"NodeName":                c.goalState.NodeName,
+				"NodeIP":                  spec.NodeIP,
+				"NodeLabels":              nodeLabels,
+				"RegisterWithTaints":      registerWithTaints,
+				"ImageCredentialProvider": spec.ImageCredentialProvider,
 			},
 		},
 		{

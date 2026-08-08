@@ -5,6 +5,8 @@ package config
 
 import (
 	"bytes"
+	"flag"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,34 @@ import (
 
 func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	c := NewDefault()
+	if c.PeerFetchTimeout != 15*time.Minute {
+		t.Fatalf("PeerFetchTimeout = %v, want 15m", c.PeerFetchTimeout)
+	}
+
+	if c.AdvertiseReconcileInterval != time.Minute {
+		t.Fatalf("AdvertiseReconcileInterval = %v, want 1m", c.AdvertiseReconcileInterval)
+	}
+
+	if c.PrefetchPullerFraction != 0 {
+		t.Fatalf("PrefetchPullerFraction = %v, want disabled", c.PrefetchPullerFraction)
+	}
+
+	if c.PrefetchCoordinatorReplicas != 3 {
+		t.Fatalf("PrefetchCoordinatorReplicas = %d, want 3", c.PrefetchCoordinatorReplicas)
+	}
+
+	if c.PrefetchMaxConcurrentGroups != 64 {
+		t.Fatalf("PrefetchMaxConcurrentGroups = %d, want 64", c.PrefetchMaxConcurrentGroups)
+	}
+
+	if c.PrefetchDispatchJitter != time.Second {
+		t.Fatalf("PrefetchDispatchJitter = %v, want 1s", c.PrefetchDispatchJitter)
+	}
+
+	if c.TransferMaxConcurrentServes != 10 {
+		t.Fatalf("TransferMaxConcurrentServes = %d, want 10", c.TransferMaxConcurrentServes)
+	}
+
 	// Defaults intentionally have no upstream registries - operator must
 	// supply at least one. Seed one and re-validate.
 	c.UpstreamRegistries = []UpstreamRegistry{
@@ -19,6 +49,117 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestPrefetchPullerFractionConfig(t *testing.T) {
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_PREFETCH_PULLER_FRACTION" {
+				return "0.02"
+			}
+
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.PrefetchPullerFraction != 0.02 {
+			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
+		}
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--prefetch-puller-fraction=0.02"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.PrefetchPullerFraction != 0.02 {
+			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
+		}
+	})
+}
+
+func TestValidate_PrefetchPullerFractionBounds(t *testing.T) {
+	for _, fraction := range []float64{-0.01, 1.01, math.NaN()} {
+		c := NewDefault()
+		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+		c.PrefetchPullerFraction = fraction
+
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "prefetch_puller_fraction") {
+			t.Fatalf("fraction %v: want prefetch_puller_fraction error, got %v", fraction, err)
+		}
+	}
+}
+
+func TestPrefetchDispatchConfig(t *testing.T) {
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadEnv(func(key string) string {
+			switch key {
+			case "GANTRY_PREFETCH_COORDINATOR_REPLICAS":
+				return "5"
+			case "GANTRY_PREFETCH_MAX_CONCURRENT_GROUPS":
+				return "32"
+			case "GANTRY_PREFETCH_DISPATCH_JITTER":
+				return "750ms"
+			default:
+				return ""
+			}
+		})
+		if err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.PrefetchCoordinatorReplicas != 5 || c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
+			t.Fatalf("prefetch dispatch config = %d, %d, %v", c.PrefetchCoordinatorReplicas, c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		}
+	})
+
+	t.Run("flags", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--prefetch-coordinator-replicas=5", "--prefetch-max-concurrent-groups=32", "--prefetch-dispatch-jitter=750ms"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.PrefetchCoordinatorReplicas != 5 || c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
+			t.Fatalf("prefetch dispatch config = %d, %d, %v", c.PrefetchCoordinatorReplicas, c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		}
+	})
+}
+
+func TestValidate_PrefetchDispatchBounds(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{name: "zero coordinators", mutate: func(c *Config) { c.PrefetchCoordinatorReplicas = 0 }, want: "prefetch_coordinator_replicas"},
+		{name: "zero groups", mutate: func(c *Config) { c.PrefetchMaxConcurrentGroups = 0 }, want: "prefetch_max_concurrent_groups"},
+		{name: "negative jitter", mutate: func(c *Config) { c.PrefetchDispatchJitter = -time.Second }, want: "prefetch_dispatch_jitter"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			test.mutate(c)
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("want %s error, got %v", test.want, err)
+			}
+		})
 	}
 }
 
@@ -55,6 +196,72 @@ func TestValidate_MirrorListenAllowNonLoopbackOptIn(t *testing.T) {
 	c.MirrorBindAllowNonLoopback = true
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate (opt-in): %v", err)
+	}
+}
+
+func TestPprofListenConfig(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		if got := NewDefault().PprofListen; got != "" {
+			t.Fatalf("PprofListen = %q, want disabled", got)
+		}
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+		if err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_PPROF_LISTEN" {
+				return "127.0.0.1:6060"
+			}
+
+			return ""
+		}); err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.PprofListen != "127.0.0.1:6060" {
+			t.Fatalf("PprofListen = %q", c.PprofListen)
+		}
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--pprof-listen=localhost:6060"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.PprofListen != "localhost:6060" {
+			t.Fatalf("PprofListen = %q", c.PprofListen)
+		}
+	})
+}
+
+func TestValidate_PprofListenMustBeLoopback(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:6060", "10.0.0.1:6060", ":6060", "pod.example:6060", "127.0.0.1:0", "127.0.0.1:70000", "127.0.0.1:http"} {
+		t.Run(address, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			c.PprofListen = address
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), "pprof_listen") {
+				t.Fatalf("want pprof validation error, got %v", err)
+			}
+		})
+	}
+
+	for _, address := range []string{"127.0.0.1:6060", "[::1]:6060", "localhost:6060"} {
+		t.Run(address, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			c.PprofListen = address
+
+			if err := c.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
 	}
 }
 
@@ -114,6 +321,56 @@ func TestValidate_CoordBoundsMustBePositive(t *testing.T) {
 	}
 }
 
+func TestValidate_PeerFetchTimeoutMustBePositive(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.PeerFetchTimeout = 0
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "peer_fetch_timeout") {
+		t.Fatalf("want peer_fetch_timeout error, got %v", err)
+	}
+}
+
+func TestBindFlags_PeerFetchTimeout(t *testing.T) {
+	c := NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--peer-fetch-timeout=35m"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if c.PeerFetchTimeout != 35*time.Minute {
+		t.Fatalf("PeerFetchTimeout = %v, want 35m", c.PeerFetchTimeout)
+	}
+}
+
+func TestValidate_AdvertiseReconcileIntervalMustBePositive(t *testing.T) {
+	c := NewDefault()
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+	c.AdvertiseReconcileInterval = 0
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "advertise_reconcile_interval") {
+		t.Fatalf("want advertise_reconcile_interval error, got %v", err)
+	}
+}
+
+func TestBindFlags_AdvertiseReconcileInterval(t *testing.T) {
+	c := NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--advertise-reconcile-interval=90s"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if c.AdvertiseReconcileInterval != 90*time.Second {
+		t.Fatalf("AdvertiseReconcileInterval = %v, want 90s", c.AdvertiseReconcileInterval)
+	}
+}
+
 // TestValidate_NodeNameRequiresPodName pins the fail-fast
 // rule: production K8s mode set via GANTRY_NODE_NAME but without
 // GANTRY_POD_NAME is the silent-peer-coordination-failure case the
@@ -163,7 +420,7 @@ func TestValidate_FullProdTripleOK(t *testing.T) {
 	c.NodeName = "ip-10-0-0-7"
 	c.PodName = "gantry-abc12"
 
-	c.MembersNamespace = "gantry-system"
+	c.MembersNamespace = "unbounded-system"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -253,6 +510,8 @@ hrw_k: 5
 coord_peer_authz_enforce: true
 coord_max_digests_per_request: 12
 coord_max_concurrent_pulls: 4
+peer_fetch_timeout: 45m
+advertise_reconcile_interval: 90s
 nf5_jitter_base: 7s
 log_level: debug
 `)
@@ -286,6 +545,14 @@ log_level: debug
 		t.Errorf("CoordMaxConcurrentPulls = %d, want 4", c.CoordMaxConcurrentPulls)
 	}
 
+	if c.PeerFetchTimeout != 45*time.Minute {
+		t.Errorf("PeerFetchTimeout = %v, want 45m", c.PeerFetchTimeout)
+	}
+
+	if c.AdvertiseReconcileInterval != 90*time.Second {
+		t.Errorf("AdvertiseReconcileInterval = %v, want 90s", c.AdvertiseReconcileInterval)
+	}
+
 	if c.NF5JitterBase != 7*time.Second {
 		t.Errorf("NF5JitterBase = %v, want 7s", c.NF5JitterBase)
 	}
@@ -305,6 +572,8 @@ func TestLoadEnv(t *testing.T) {
 		"GANTRY_HRW_K":                         "9",
 		"GANTRY_COORD_MAX_DIGESTS_PER_REQUEST": "11",
 		"GANTRY_COORD_MAX_CONCURRENT_PULLS":    "3",
+		"GANTRY_PEER_FETCH_TIMEOUT":            "50m",
+		"GANTRY_ADVERTISE_RECONCILE_INTERVAL":  "90s",
 		"GANTRY_NF5_JITTER_BASE":               "4500ms",
 	}
 
@@ -331,6 +600,14 @@ func TestLoadEnv(t *testing.T) {
 
 	if c.CoordMaxConcurrentPulls != 3 {
 		t.Errorf("CoordMaxConcurrentPulls = %d", c.CoordMaxConcurrentPulls)
+	}
+
+	if c.PeerFetchTimeout != 50*time.Minute {
+		t.Errorf("PeerFetchTimeout = %v", c.PeerFetchTimeout)
+	}
+
+	if c.AdvertiseReconcileInterval != 90*time.Second {
+		t.Errorf("AdvertiseReconcileInterval = %v", c.AdvertiseReconcileInterval)
 	}
 
 	if c.NF5JitterBase != 4500*time.Millisecond {

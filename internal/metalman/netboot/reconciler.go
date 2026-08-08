@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -26,7 +27,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -73,28 +73,28 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 		return nil
 	}
 
-	if machine.Spec.PXE == nil {
+	if machine.Spec.Netboot() == nil {
 		return nil
 	}
 
 	refs := []imagePullRequest{
 		{
-			ImageRef:      machine.Spec.PXE.Image,
-			Architecture:  machine.Spec.PXE.TargetArchitecture(),
-			PullSecretRef: machine.Spec.PXE.PullSecretRef,
+			ImageRef:      machine.Spec.Netboot().Image,
+			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
+			PullSecretRef: machine.Spec.Netboot().PullSecretRef,
 		},
 	}
 
-	if machine.Spec.PXE.NetbootImage != "" {
+	if machine.Spec.Netboot().NetbootImage != "" {
 		refs = append(refs, imagePullRequest{
-			ImageRef:      machine.Spec.PXE.NetbootImage,
-			Architecture:  machine.Spec.PXE.TargetArchitecture(),
-			PullSecretRef: machine.Spec.PXE.NetbootPullSecretRef,
+			ImageRef:      machine.Spec.Netboot().NetbootImage,
+			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
+			PullSecretRef: machine.Spec.Netboot().NetbootPullSecretRef,
 		})
 	} else {
 		refs = append(refs, imagePullRequest{
 			ImageRef:      r.DefaultNetbootRef,
-			Architecture:  machine.Spec.PXE.TargetArchitecture(),
+			Architecture:  machine.Spec.Netboot().TargetArchitecture(),
 			PullSecretRef: r.DefaultNetbootPullSecretRef,
 		})
 	}
@@ -126,11 +126,11 @@ func (r *OCIReconciler) mapMachineToImage(_ context.Context, obj client.Object) 
 }
 
 func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+	logger := slog.Default()
 
 	pullReq, err := decodeImagePullRequest(req.NamespacedName)
 	if err != nil {
-		logger.Error(err, "decoding OCI image pull request", "request", req.String())
+		logger.ErrorContext(ctx, "decoding OCI image pull request", "err", err, "request", req.String())
 		return ctrl.Result{}, nil
 	}
 
@@ -140,7 +140,7 @@ func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	// Always resolve the remote digest so we detect tag updates.
 	remoteDigest, repo, err := r.resolveRemoteDigest(ctx, imageRef, pullReq.PullSecretRef)
 	if err != nil {
-		logger.Error(err, "resolving OCI image digest", "image", imageRef)
+		logger.ErrorContext(ctx, "resolving OCI image digest", "err", err, "image", imageRef)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -150,15 +150,15 @@ func (r *OCIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
 	}
 
-	logger.Info("pulling OCI image", "image", imageRef, "digest", remoteDigest, "architecture", architecture)
+	logger.InfoContext(ctx, "pulling OCI image", "image", imageRef, "digest", remoteDigest, "architecture", architecture)
 
 	if err := r.pullAndUnpack(ctx, imageRef, remoteDigest, repo, architecture); err != nil {
-		logger.Error(err, "pulling OCI image", "image", imageRef, "architecture", architecture)
+		logger.ErrorContext(ctx, "pulling OCI image", "err", err, "image", imageRef, "architecture", architecture)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	r.Cache.SetDigestForArchitecture(imageRef, architecture, remoteDigest)
-	logger.Info("OCI image cached", "image", imageRef, "digest", remoteDigest, "architecture", architecture)
+	logger.InfoContext(ctx, "OCI image cached", "image", imageRef, "digest", remoteDigest, "architecture", architecture)
 
 	return ctrl.Result{RequeueAfter: imageResyncInterval}, nil
 }

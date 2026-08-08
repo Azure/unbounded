@@ -17,19 +17,19 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/machineops"
 	"github.com/Azure/unbounded/internal/machineops/providers/azurevm"
 	"github.com/Azure/unbounded/internal/machineops/providers/ociinstance"
+	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
+	"github.com/Azure/unbounded/pkg/machineops"
+	machineopscontroller "github.com/Azure/unbounded/pkg/machineops/controller"
 )
 
 const (
@@ -57,8 +57,8 @@ func main() {
 	cmd.Flags().StringVar(&cfg.metricsAddr, "metrics-bind-address", ":8080", "Address for metrics endpoint")
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
-	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", "unbounded-kube", "Namespace for the leader election lease")
-	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", "unbounded-kube", "Namespace containing MachineOperationCredential referenced Secrets")
+	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
+	cmd.Flags().StringVar(&cfg.credentialSecretNamespace, "credential-secret-namespace", unbounded.SystemNamespace(), "Namespace containing MachineOperationCredential referenced Secrets")
 	cmd.Flags().IntVar(&cfg.maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Maximum concurrent MachineOperation reconciles")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", "", "Kubernetes API server endpoint used in host replacement bootstrap config")
 	cmd.Flags().StringVar(&cfg.siteName, "site", "", "Site name this controller should operate on")
@@ -92,11 +92,6 @@ func run(ctx context.Context, cfg config) error {
 		return errors.New(errSiteProviderPair)
 	}
 
-	providers, err := configuredProviders(cfg.providerName)
-	if err != nil {
-		return err
-	}
-
 	restConfig := ctrl.GetConfigOrDie()
 	scheme := runtimeScheme()
 
@@ -113,27 +108,19 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
-	kubeClient, err := kubernetes.NewForConfig(restConfig)
+	providers, err := configuredProviders(cfg.providerName)
 	if err != nil {
-		return fmt.Errorf("create kubernetes client: %w", err)
+		return err
 	}
 
-	directClient, err := client.New(restConfig, client.Options{Scheme: scheme, Mapper: mgr.GetRESTMapper()})
-	if err != nil {
-		return fmt.Errorf("create direct client: %w", err)
-	}
-
-	if err := (&machineops.MachineOperationReconciler{
-		Client:                    directClient,
-		Providers:                 providers,
+	if err := machineopscontroller.AddToManager(mgr, providers, machineopscontroller.Options{
 		SiteName:                  cfg.siteName,
 		ProviderName:              cfg.providerName,
 		MaxConcurrentReconciles:   cfg.maxConcurrentReconciles,
-		KubeClient:                kubeClient,
 		APIServerEndpoint:         cfg.apiServerEndpoint,
 		CredentialSecretNamespace: cfg.credentialSecretNamespace,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("setup MachineOperation controller: %w", err)
+	}); err != nil {
+		return err
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -153,10 +140,12 @@ func run(ctx context.Context, cfg config) error {
 	return nil
 }
 
-func configuredProviders(providerName string) ([]machineops.Provider, error) {
-	factories := map[string]func() machineops.Provider{
-		unboundedv1alpha3.ExternalProviderAzureVM:     func() machineops.Provider { return &azurevm.Provider{} },
-		unboundedv1alpha3.ExternalProviderOCIInstance: func() machineops.Provider { return &ociinstance.Provider{} },
+func configuredProviders(providerName string) ([]*machineops.Provider, error) {
+	factories := map[string]func() (*machineops.Provider, error){
+		unboundedv1alpha3.ExternalProviderAzureVM: func() (*machineops.Provider, error) {
+			return (&azurevm.Provider{}).Registration()
+		},
+		unboundedv1alpha3.ExternalProviderOCIInstance: func() (*machineops.Provider, error) { return (&ociinstance.Provider{}).Registration() },
 	}
 
 	if providerName != "" {
@@ -165,13 +154,25 @@ func configuredProviders(providerName string) ([]machineops.Provider, error) {
 			return nil, fmt.Errorf("unknown machine-ops provider %q", providerName)
 		}
 
-		return []machineops.Provider{factory()}, nil
+		provider, err := factory()
+		if err != nil {
+			return nil, fmt.Errorf("register machine-ops provider %q: %w", providerName, err)
+		}
+
+		return []*machineops.Provider{provider}, nil
 	}
 
-	return []machineops.Provider{
-		factories[unboundedv1alpha3.ExternalProviderAzureVM](),
-		factories[unboundedv1alpha3.ExternalProviderOCIInstance](),
-	}, nil
+	azureProvider, err := factories[unboundedv1alpha3.ExternalProviderAzureVM]()
+	if err != nil {
+		return nil, fmt.Errorf("register Azure VM machine-ops provider: %w", err)
+	}
+
+	ociProvider, err := factories[unboundedv1alpha3.ExternalProviderOCIInstance]()
+	if err != nil {
+		return nil, fmt.Errorf("register OCI instance machine-ops provider: %w", err)
+	}
+
+	return []*machineops.Provider{azureProvider, ociProvider}, nil
 }
 
 func leaderElectionID(cfg config) string {

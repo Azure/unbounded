@@ -1,6 +1,6 @@
 # unbounded-storage Architecture
 
-`unbounded-storage` is the per-host storage daemon for Project Unbounded. It is
+`unbounded-storage` is the per-host storage daemon for Unbounded Kubernetes. It is
 the only Rust crate in the repository (Rust edition 2024) and has its own
 conventions for layout, build, and testing. Agents working under
 `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the
@@ -8,7 +8,7 @@ repository-wide Go conventions do not apply here.
 
 ## 1. Purpose and Place in the System
 
-Project Unbounded serves immutable, content-addressed data to workloads through
+Unbounded Kubernetes serves immutable, content-addressed data to workloads through
 a tiered cache that sits in front of a slow origin. The design (see
 `designs/storage-high-level.md`) has three tiers:
 
@@ -99,7 +99,7 @@ dynamically reloadable cluster state and the startup-fixed settings - is
 read from the config file.
 
 The startup-fixed settings (collected into `StartupSettings`: the fabric
-endpoint and thread pools, per-shard memory sizing, and CPU-topology
+endpoint and thread pools, node-wide memory sizing, and CPU-topology
 selection) live in the config's `[startup]` section. They are read once
 at process start and cannot change without a restart, so they are
 excluded from the live-reload diff.
@@ -107,8 +107,10 @@ excluded from the live-reload diff.
 - `[startup.memory]` - `no_hugepages` (allocate shard backings from
   the heap instead of 2 MiB hugepages) and `memory_total_bytes` (u64
   bytes, no suffix; unset/null defaults to 128 MiB) - the total backing
-  pool, split evenly across the serving shards so the host footprint stays
-  fixed regardless of the auto-scaled shard count.
+  pool for shard data. The budget is floored to whole 2 MiB pages, requires
+  at least one page per serving shard, and distributes whole pages evenly
+  with any remainder assigned in worker order. Each fabric unit also allocates
+  a separate fixed eight-page RPC scratch backing outside this pool.
 - `[startup.fabric]` - one `binds` table (`tcp`, `rdma`, or `auto_rdma`),
   `progress_threads` (2), `progress_poll_us` (10), `rpc_worker_threads` (4),
   `max_inflight` (1024) - the fabric endpoint, thread pools, and in-flight
@@ -126,8 +128,9 @@ excluded from the live-reload diff.
 
 ### Startup sequence
 
-1. Load and validate config; build `StartupSettings` from the config's
-   `[startup]` section.
+1. Load and validate config into one immutable `LoadedConfig` containing the raw
+   config, owned runtime graph, and route snapshot; build `StartupSettings` from
+   its raw config's `[startup]` section.
 2. `Host::discover()` reads hardware from sysfs.
 3. `CorePlan::for_host(&host, &settings.core_plan_config)` partitions the
    host's usable CPUs into three disjoint, NUMA-local classes: one
@@ -142,26 +145,43 @@ excluded from the live-reload diff.
    i-th worker thread to its assigned core and NUMA node.
 6. A `DiskChannelDirectory` (Arc) is created before shards as the hot-swap
    publication surface for disk channels.
-7. Read-only shared state (`Arc<Vec<FrontendSpec>>`, `Arc<Vec<BackendSpec>>`;
-   startup-fixed fabric settings come from the config `[startup]` section via
-   `StartupSettings`) and routing (`build_routing` -> `Arc<FingerTable>` plus
-   `Arc<HashMap<NodeId, PeerId>>`) are constructed once and shared across
-   shards.
+7. One `Arc<LoadedConfig>` shares the raw config, owned runtime graph, and route
+   snapshot across startup consumers and shards. Startup-fixed fabric settings
+   still come from the raw `[startup]` section via `StartupSettings`. `PeerId`
+   uses the same stable numeric identity as `NodeId`.
 8. Each shard is spawned with `rt.spawn_pinned(widx, name, Box<FnOnce>)`. The
    `!Send` shard objects are constructed **inside** `run_shard`, after pinning.
-9. After every shard reports `Up`, peers are reconciled per shard, the disk
-   supervisor opens disks and publishes channels, and the config watcher takes
-   over for the lifetime of the process.
+9. After every shard reports `Up`, peers are reconciled per shard and every
+   shard completes phase B while parked. The disk supervisor then opens the
+   initial disks and publishes channels. Only after publication does activation
+   start the recursive RPC servers and release shards into their serve loops;
+   the config watcher then takes over for the lifetime of the process. Disk-open
+   failures retire the prepared layer rather than activating a partial startup
+   configuration.
 
 ### Shard readiness and panic safety
 
-Each shard reports exactly one `ShardReady` message: `Up { descriptor, fabric }`
-(after which it parks while holding its `Sender`), or `Failed(String)`.
-`report_on_panic` wraps shard bring-up in `catch_unwind`/`AssertUnwindSafe` so a
-panicking shard still emits one `Failed` via a dedicated panic channel;
-otherwise main's bounded receive would hang. Main performs a bounded `recv()`
-exactly `joins.len()` times (it does **not** drain to disconnect, because `Up`
-shards never drop their sender).
+Each shard owns a phase-A reporter that emits exactly one `ShardReady` message:
+`Up { worker_idx, publish }` or `Failed(String)`. Its Drop fallback covers an
+early return or panic before the explicit report. Phase B uses the same
+consuming-report/Drop pattern. Main performs a bounded `recv()` exactly
+`joins.len()` times (it does **not** drain to disconnect, because live shards
+retain channel senders). Preparation returns a `PreparedShardLayer` only after
+all phase-B reports succeed. Activation starts RPC and releases the parked
+shards; on failure it sets the layer stop flag, drops the serve gates, joins
+shards in reverse order, and tears down fabric and backing keepalives.
+
+Shard panics are logged and resumed so the native join handle remains failed.
+Once serving starts, a lifetime guard balances the live-shard metric and sends
+a terminal report on abnormal exit. That report also sets process-wide
+shutdown; teardown drains terminal reports and returns a failing process status
+instead of continuing with a missing shard.
+
+Backend and frontend reloads construct replacements before swapping them into
+their shard-local registries. A failed replacement therefore leaves the prior
+resource, binding, and stripe geometry live and retryable. This is a
+per-resource guarantee; route, peer, shard, and disk publication across the
+whole process is not yet one transaction.
 
 ### Shutdown
 
@@ -170,7 +190,7 @@ SIGINT/SIGTERM handler (installed via `libc::sigaction`, relaxed atomic store).
 Every thread polls this flag.
 
 Teardown order is deliberate: join shard threads in reverse (releasing
-`Arc<engine>` references) **first**, then drop the disk channel directory, then
+`Arc<engine>` references) **first**, clear disk channel publications, then
 `disk_registry.drain()`.
 
 ## 5. Shard Bring-up (`run_shard`)
@@ -182,8 +202,9 @@ per-shard `!Send` object graph:
    `Provider::Tcp` fallback on `lo`); build a `FabricConfig` via
    `fabric::defaults_for(device_name, runtime, widx)`; `Fabric::new` and resolve
    `self_address()`.
-2. **Memory.** Allocate a NUMA-local `Backing` via `memory::allocate` **on the
-   pinned thread** (mempolicy keeps pages local; the hugepage variant `mbind`s).
+2. **Memory.** Allocate the shard's assigned whole-page share of the node-wide
+   data pool as a NUMA-local `Backing` via `memory::allocate` **on the pinned
+   thread** (mempolicy keeps pages local; the hugepage variant `mbind`s).
    Register it with the fabric as a memory region (MR), and register it with the
    socket ring as a fixed buffer for zero-copy send/recv.
 3. **Origin backend.** Resolve the origin URL and build an `HttpBackend`
@@ -191,11 +212,13 @@ per-shard `!Send` object graph:
 4. **Transport + blockstore + pool.** Build a `RoutedTransport` (Chord routing +
    fabric transport + origin backend), a `LiveShardLocalStore` over the disk
    channel directory as the `BlockStore`, then `Pool::new`.
-5. **RPC server.** Allocate a **separate** scratch backing
-   (`RPC_SCRATCH_PAGES = 8`, one scratch page per in-flight serve/forward),
-   register it as its own fabric MR and its own `LiveShardLocalStore` (a
-   `PageRef` resolves through exactly one backing's geometry, so scratch needs a
-   distinct store). Build a `RecursiveHandler` and start the fabric RPC server.
+5. **RPC server.** `FabricGroup`, constructed before the shards, allocates a
+   **separate** scratch backing for each fabric unit (`RPC_SCRATCH_PAGES = 8`,
+   one scratch page per in-flight serve/forward) and registers it as its own
+   fabric MR. After phase B and initial disk publication, activation builds the
+   unit's `RecursiveHandler` and starts the RPC server. Scratch uses a distinct
+   `LiveShardLocalStore` because a `PageRef` resolves through exactly one
+   backing's geometry.
 6. **Frontends.** A shard hosts a `FrontendRegistry` of any number of
    frontends keyed by component name. Each spec binds its listener with `SO_REUSEPORT` and
    builds an `HttpDriver`/`S3Driver`; the registry can add and remove frontends
@@ -215,7 +238,7 @@ scratch MR, and tears libfabric down).
 ## 6. Module Map (`src/lib.rs`)
 
 All subsystems are `pub mod`: `backend`, `bufferpool`, `config`, `fabric`,
-`fanout`, `frontend`, `http`, `io`, `memory`, `metrics`, `obs`, `p2p`,
+`fanout`, `frontend`, `http`, `memory`, `metrics`, `obs`, `p2p`,
 `ring`, `runtime`, `storage`, `tls`, and `topology`. The `profiling` module is
 exported when the `profiling` feature is enabled.
 
@@ -346,9 +369,8 @@ stripe, and knows how to fill a miss from either a peer or the local disk.
   local, futures-core-free `Stream` of `Result<PageRef, Error>`); and
   `Transport<R> { bulk_get(&req, src: BulkRef, dsts: &[PageRef]) -> Stream }`,
   which fetches from a **peer**. Blanket impls cover `Arc<T>`.
-- Public surface also includes `PoolGroup`/`ShardDescriptor`/`ShardRouter`
-  (sharding helpers), `PageGuard`/`ReadStream`/`WindowedRead` (read API), and
-  `NullBlockStore`.
+- Public surface also includes `PageGuard`/`ReadStream`/`WindowedRead` (read
+  API) and `NullBlockStore`.
 
 A shard's data path therefore has two miss sources: the `Transport` (peer pull
 over fabric) and the `BlockStore` (local NVMe). The `RoutedTransport` decides
@@ -369,7 +391,7 @@ between them, and the origin `Backend` is the final fallback.
 - `RoutedTransport<R, B: Backend<Req = R>>` (the client side) makes the
   first-hop decision via a single Chord `next_hop(stripe_to_ring(key))`:
   - `None` -> this node owns the stripe; serve from the local origin `Backend`.
-  - `Some(peer)` -> hand off to a wrapped `FabricTransport<R, FingerRouter>`
+  - `Some(peer)` -> hand off to a wrapped `FabricTransport<R, ChainFingerRouter>`
     with a `MAX_HOPS` TTL; recursion happens server-side.
 - `RecursiveHandler` (the server side) **resolves** every request (in contrast
   to `fabric::PoolHandler`, which only serves locally resident pages). It
@@ -403,6 +425,8 @@ streaming RPC server plus client `Transport`.
 - The completion machinery (`CompletionFuture`, `CompletionInfo`,
   `CompletionRegistry`, `CompletionSlot`) bridges libfabric CQ entries to
   futures.
+- Each connection keeps stable receive buffers posted and reuses each buffer's
+  local MR across successful reposts; completion slots remain one-shot.
 - **RPC server model** (`rpc.rs`): `start_rpc_server` spawns a fixed pool of
   `rpc_worker_threads` long-lived OS threads pinned to the shard's worker slot.
   The connection receive path decodes framed requests and enqueues jobs onto a
@@ -411,9 +435,10 @@ streaming RPC server plus client `Transport`.
   submits libfabric writes/sends, and parks on completion futures with a real
   thread waker. Wire framing uses an 8-byte `MsgHeader` prefix with a message
   kind and request id. The client sends a bincode `RequestHeader` plus request
-  body; the server `fi_write`s each page into the client's destination MR and
-  sends one `PageAck` per page. A short success sends `RESPONSE_END`; any error
-  sends `ERROR_ACK`. `RpcServerHandle::drop` uninstalls the request sink, closes
+  body. Verbs uses write-with-immediate to deliver typed page ordinals; the TCP
+  fallback follows each `fi_write` with a framed bincode `PageAck`. A short
+  success sends `RESPONSE_END`; any error sends `ERROR_ACK`.
+  `RpcServerHandle::drop` uninstalls the request sink, closes
   the queue, signals shutdown, and joins the workers.
 - `Handler`/`HandlerStream` is the server-side resolution trait;
   `PoolHandler`/`PoolHandlerStream` serve locally-resident pages.
@@ -429,7 +454,11 @@ These are symmetric twins around the buffer pool.
   Stream` resolves a `BulkRef` from the authoritative **origin** into
   destination pages, one page at a time (contrast `Transport`, which pulls from
   a peer). `HttpBackend` (Linux) memcpys origin bytes into pages carved from the
-  backing and holds an `Rc<socket>`. `NullBackend` is the no-op.
+  backing and holds an `Rc<socket>`. `S3Backend` optionally signs bodyless GET
+  and HEAD requests with static AWS Signature Version 4 credentials; it signs
+  the exact request that the shared HTTP serializer writes, including ranged
+  GETs. Omitting every S3 authentication field preserves anonymous access.
+  `NullBackend` is the no-op.
 - Frontend (client side): concrete `HttpFrontend`/`S3Frontend` (Linux), built
   from a `FrontendSpec` via `from_spec`, that bind a listener once per shard with
   `SO_REUSEPORT` (`bind_listener`) and produce a per-shard `HttpDriver`/`S3Driver`.
@@ -478,10 +507,10 @@ touches the kernel device) -> `alloc` + `refcount` (pure LBA tables) -> `btree`
 
 `EngineConfig` defaults: `page_size_bytes` 2 MiB (a multiple of
 `btree_page_bytes`), `btree_page_bytes` 4096 (the device atomic write unit),
-`commit_batch_max` 1024, `commit_batch_deadline_us` 200,
-`eviction_watermark` 0.9, `probationary_fraction` 0.1,
-`admission_sketch_multiplier` 2, `singleflight_shards` 64,
-`restart_scan_queue_depth` 256, `bypass_admission` false (bench/tooling only),
+`commit_batch_max` 1024, `commit_batch_ticks` 8,
+`eviction_watermark` 0.9,
+`singleflight_shards` 64,
+`bypass_admission` false (bench/tooling only),
 and `skip_recovery_scan_if_no_meta` false (set from the public
 `skip_recovery_scan` config flag; production keeps it false so partial recovery
 runs).
@@ -519,10 +548,10 @@ bufferpool `Backing`.
 
 **Disk lifecycle** (`disks/`): `trait DiskTarget { open(spec, pin) ->
 (Handle, PageChannel) }`, with `UringDiskTarget` in production (runs the disk on
-a pinned storage core) and a mock for tests. `DiskRegistrySet<T>` is seeded with
-the plan's disjoint NVMe `DiskCpuSlot`s, keeps those slots globally disjoint
-across per-cache registries, and `reconcile(desired)` closes missing paths, opens
-new ones, and treats any spec drift (kind/numa/size/queue_depth/page_size/
+a pinned storage core) and a mock for tests. `DiskRegistry<T>` is seeded with
+the plan's disjoint NVMe `DiskCpuSlot`s. `reconcile(desired)` closes missing
+paths, opens new ones, and treats any spec drift
+(kind/numa/size/queue_depth/page_size/
 skip_recovery_scan) as a remove + add.
 `assign_disk_cpus` keeps survivors on their physical pin (preserving the
 disjoint-CPU invariant and idempotence under churn) and assigns new disks
@@ -531,6 +560,10 @@ path-sorted for stable hashing; `drain()` clears channels before handles.
 `DiskChannelDirectory` is the Arc'd hot-swap publication surface, and
 `LiveShardLocalStore` is a per-shard view over the live directory that
 re-registers buffers when it observes a swap (`current_or_replay`).
+Every reconcile publishes the realized open subset. A live open failure aborts
+config convergence so the same desired snapshot remains retryable; a startup
+open failure retires the parked shard layer. Same-path drift remains remove then
+add because provisioning and recovery cannot safely run beside the old engine.
 
 **Stripe keys**: `stripe_key` derives the 32-byte content-addressed key;
 `METADATA_STRIPE_IDX` and `OriginRef`/`StripeReq` describe the request shape.
@@ -565,14 +598,34 @@ registries are all updated without tearing the shard layer down. Backing
 memory, the topology plan, the fabric max in-flight knob, and the local
 `self` peer identity are fixed at startup (mostly sourced from the
 config `[startup]` section, see the CLI section), not reloadable config
-fields.
+fields. Shard apply and page-cache-drain fan-in use one 60-second deadline
+for the complete worker set and report outstanding worker identities. A
+timeout, acknowledgement-channel disconnect, or partial broadcast send failure
+requests process shutdown: already-delivered commands may complete later, so
+retrying against the old controller snapshot would be unsafe.
+Peer availability failures are accepted as desired reconnect intent inside the
+fabric. Errors that reach process-level peer reconciliation are therefore hard
+lifecycle/configuration failures; startup rejects them, while live apply
+requests fail-stop shutdown because remove/add mutations cannot be rolled back.
+All shard transports and fabric RPC handlers share one process-wide
+`RouteTableHandle`. The apply target is its only writer and publishes the new
+snapshot once, after shard acknowledgement, page-cache drain, and disk
+publication succeed. Disk open failures are returned after the realized subset
+is published, leaving the desired config retryable and routing on the prior
+snapshot. This keeps routing on the prior snapshot when an earlier
+apply step reports failure; other resource reconciliation is still not a
+whole-process transaction.
 
 Sections (all optional, each falling back to defaults):
 
 - `version` - top-level opaque `u64` config version (0 = unversioned).
 - `[[backends]]` - `name` and one `config` table: `http`, `s3`, or `azure`
   with a required `url`, or `fake` for synthetic objects. Backend stripe size
-  must be a power of two.
+  must be a power of two. Origin URLs are authority-only. S3 authentication is
+  either fully anonymous or static SigV4 credentials consisting of `region`,
+  `access_key_id`, `secret_access_key`, and an optional `session_token`.
+  Credentials are part of the config itself and credential-only changes replace
+  the live backend.
 - `self`, `fingers_per_node` (100), optional `[routing_plan]` (`fingers`,
   `successor`, `predecessor`), and `[[peers]]` define the process-wide
   transport mesh. `self` selects the local peer by name; internal fabric peer
@@ -611,11 +664,15 @@ Sections (all optional, each falling back to defaults):
 - `[[frontends]]` - `name`, `source` (a backend or cache component name), and
   one `config` table (`http`, `s3`, or `loadgen`).
 
-The watcher (`notify`-based) emits `ConfigUpdate`s; main's
+After defaults and validation, loading constructs one immutable `LoadedConfig`:
+the raw `Config`, one owned `RuntimeGraph`, and one route snapshot built from
+that graph. The watcher (`notify`-based) emits these loaded snapshots; main's
 `wait_for_shutdown_with_updates` reconciles peers (remove + add on address/numa
 drift, via a `last_applied` cache), disks, and - by broadcasting the applied
 config to every shard - each shard's backend and frontend registries plus the
-routing snapshot. It republishes the channel snapshot each update, logs
+routing snapshot. The apply target and shards consume the same loaded graph and
+routes; this is coherent preparation, not whole-process transactionality. It
+republishes the channel snapshot each update, logs
 `config gen=N ...`, and sets `SHUTDOWN` if the watcher disconnects.
 
 ### 7.12 `tls/` - the shared TLS transport
@@ -633,7 +690,10 @@ ships, exposing OpenSSL macro-only entry points as linkable functions, compiled
 by `build.rs`). Public surface: `TlsConfig`/`TlsContext`, with
 `recv_chunk`/`recv_fixed` re-exported `pub(crate)` for the backends. See the
 OpenSSL dependency note in `AGENTS.md` for why a pinned OpenSSL >= 3.5 is
-required (kTLS receive on TLS 1.3).
+required (kTLS receive on TLS 1.3). Verification uses the local host trust when
+`ca_cert` is absent. An inline PEM `ca_cert` replaces host roots for that
+backend; inline `client_cert` and `client_key` configure mTLS. Trust and client
+material are parsed from memory and are never written to temporary files.
 
 ## 8. Concurrency Model Summary
 
@@ -641,8 +701,8 @@ required (kTLS receive on TLS 1.3).
 |-------|-----------|-------|
 | Shard | One pinned OS thread per `ServingShard` | Owns `!Send` pool, transport, frontend, RPC handler |
 | Shard loop | Cooperative tick hooks, noop waker | Busy-poll active, sleep 100us idle |
-| Fabric progress | One pinned thread per CQ | Self-driving |
-| Fabric RPC serve | Fixed worker pool per shard | Bounded job queue, real-waker completion waits |
+| Fabric progress | Fixed pool per fabric unit | Pinned across reserved workers, CQs distributed by NUMA |
+| Fabric RPC serve | Fixed worker pool per fabric unit | Bounded job queue, real-waker completion waits |
 | Storage engine | One pinned storage core per disk | Reached only via `PageChannel` mpsc |
 | Config watcher | `notify` thread + main loop | Reconciles peers/disks live |
 
@@ -687,9 +747,10 @@ Four complementary layers:
    `bufferpool`, `fabric`, `p2p`, `page_channel`, and `storage` (the last with
    `oracle.rs` and `recovery.rs`).
 4. **End-to-end smoke test** - `hack/smoke-storage.py` runs two real binaries on
-   loopback over real libfabric tcp, with file-backed disks, HTTP frontends, and
-   a stub origin, exercising a cross-node fabric RPC fetch. It needs `sudo` (to
-   pin io_uring buffers and raise `RLIMIT_MEMLOCK`) and runs in CI
-   (`.github/workflows/smoke-storage.yaml`). Run it after any change to the
-   fabric layer, `shim.c`, the FFI, the `main.rs` wiring, or the libfabric
-   version.
+    loopback over real libfabric tcp, with file-backed disks, stub HTTP origins,
+    and an ephemeral Garage S3-compatible server. It exercises cross-node
+    fabric RPC fetches, authenticated S3 `HEAD` and ranged `GET` compatibility,
+    and HTTPS kTLS. It needs Docker and `sudo` (to pin io_uring buffers and raise
+    `RLIMIT_MEMLOCK`) and runs in CI (`.github/workflows/smoke-storage.yaml`). Run
+    it after any change to the fabric layer, S3 signing, `shim.c`, the FFI, the
+    `main.rs` wiring, or the libfabric version.

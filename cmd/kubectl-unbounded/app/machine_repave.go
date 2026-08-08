@@ -6,17 +6,23 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
+	"time"
 
 	"github.com/spf13/cobra"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 // machineRepaveCommand returns a cobra.Command that repaves a Machine via Redfish.
 func machineRepaveCommand() *cobra.Command {
+	var ttl int32
+
 	cmd := &cobra.Command{
 		Use:   "repave NAME",
-		Short: "Repave a Machine via Redfish",
+		Short: "Repave a Machine via a HostReplace operation",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()
@@ -26,31 +32,25 @@ func machineRepaveCommand() *cobra.Command {
 				return err
 			}
 
-			return runRepave(ctx, c, args[0])
+			return runRepave(ctx, c, args[0], ttl, cmd.OutOrStdout())
 		},
 	}
+	cmd.Flags().Int32Var(&ttl, "ttl", defaultTTLSeconds,
+		"Seconds after completion before the MachineOperation CR is automatically deleted (0 to disable)")
 
 	return cmd
 }
 
-func runRepave(ctx context.Context, c client.WithWatch, name string) error {
-	machine, err := getMachine(ctx, c, name)
-	if err != nil {
+func runRepave(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, out io.Writer) error {
+	opName := fmt.Sprintf("%s-repave-%d", name, time.Now().Unix())
+
+	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostReplace, ttlSeconds); err != nil {
 		return err
 	}
 
-	machine.Spec.Operations.RepaveCounter++
-	machine.Spec.Operations.RebootCounter++
-	target := machine.Spec.Operations.RebootCounter
+	printStep(out, fmt.Sprintf("Repaving Machine %s...", name))
+	printConfig(out, "operation", opName)
+	fprintln(out)
 
-	if err := c.Update(ctx, machine); err != nil {
-		return fmt.Errorf("updating Machine: %w", err)
-	}
-
-	printStep(fmt.Sprintf("Repaving Machine %s...", name))
-	printConfig("target", fmt.Sprintf("%d", target))
-	printConfig("repave", fmt.Sprintf("%d", machine.Spec.Operations.RepaveCounter))
-	fmt.Println()
-
-	return watchReboot(ctx, c, name, target)
+	return watchMachineOperation(ctx, c, opName, out)
 }

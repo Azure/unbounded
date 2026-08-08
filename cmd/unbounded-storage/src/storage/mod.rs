@@ -21,6 +21,8 @@ pub mod types;
 
 mod alloc;
 mod btree;
+mod checksum;
+mod completion;
 mod engine;
 mod local;
 mod lru;
@@ -31,7 +33,6 @@ mod page_channel;
 mod refcount;
 mod singleflight;
 mod synthetic;
-mod traits;
 
 pub use admission::{AdmissionFilter, AdmitDecision, StripeAdmission};
 pub use engine::{EngineConfig, StorageEngine};
@@ -44,5 +45,4 @@ pub use synthetic::{
     matches_bytes as synthetic_matches_bytes, object_hash, object_id as synthetic_object_id,
     parse_object_id as parse_synthetic_object_id, splitmix64,
 };
-pub use traits::PageChecksum;
 pub use types::{Checksum, DiskId, Error, Lba, PageKey};

@@ -4,20 +4,19 @@
 //! Minimal URL parser for backend `url` config values.
 //!
 //! A backend URL is a value of the form
-//! `scheme://host[:port][/path]` where `scheme` is `http` or `https`.
-//! Parsing of the authority (host, optional port, optional userinfo,
-//! IPv6 brackets, and any trailing path/query/fragment) is delegated to
+//! `scheme://host[:port]` where `scheme` is `http` or `https`.
+//! Parsing of the authority (host and optional port) is delegated to
 //! [`http::Uri`] from the `http` crate, which the backends already
 //! depend on, rather than re-implementing URL parsing or pulling in the
 //! `url` crate. `http::Uri` is permissive in ways a config value must
 //! not be, so this is a thin wrapper that enforces the strict rules:
-//! the scheme must be `http` or `https`, the host must be non-empty, and
+//! the scheme must be `http` or `https`, userinfo, IPv6 literals, and endpoint
+//! path/query/fragment components are rejected, the host must be non-empty, and
 //! a present port must be a valid `u16` (`http::Uri` silently ignores an
 //! out-of-range or non-numeric port). Backends only need the scheme (to
 //! decide TLS), the host (for DNS resolution, TLS SNI, and the `Host:`
 //! header), and the port (defaulted from the scheme when absent). The
-//! path component is accepted and ignored; object paths are derived from
-//! the request, not the endpoint.
+//! Object paths are derived from requests, not the endpoint.
 
 use std::fmt;
 
@@ -91,6 +90,12 @@ pub enum UrlError {
     EmptyHost,
     /// The port component is present but not a valid `u16`.
     InvalidPort(String),
+    /// User credentials are not supported in backend endpoint URLs.
+    Userinfo,
+    /// Origin connections currently support IPv4 only.
+    Ipv6Unsupported,
+    /// A non-root path, query, or fragment would be discarded by the backend.
+    UnsupportedTarget,
 }
 
 impl fmt::Display for UrlError {
@@ -100,13 +105,25 @@ impl fmt::Display for UrlError {
                 write!(f, "backend url must be of the form scheme://host[:port]")
             }
             UrlError::UnsupportedScheme(s) => {
+                let _ = s;
                 write!(
                     f,
-                    "unsupported backend url scheme {s:?} (expected http or https)"
+                    "unsupported backend url scheme (expected http or https)"
                 )
             }
             UrlError::EmptyHost => write!(f, "backend url host must not be empty"),
-            UrlError::InvalidPort(p) => write!(f, "invalid backend url port {p:?}"),
+            UrlError::InvalidPort(p) => {
+                let _ = p;
+                write!(f, "invalid backend url port")
+            }
+            UrlError::Userinfo => write!(f, "backend url must not contain userinfo"),
+            UrlError::Ipv6Unsupported => {
+                write!(f, "IPv6 backend urls are not supported")
+            }
+            UrlError::UnsupportedTarget => write!(
+                f,
+                "backend url must not contain a base path, query, or fragment"
+            ),
         }
     }
 }
@@ -126,25 +143,33 @@ pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, UrlError> {
         other => return Err(UrlError::UnsupportedScheme(other.to_string())),
     };
 
-    // http::Uri handles userinfo, IPv6 brackets, and path/query/fragment
-    // stripping. It rejects an empty host outright (parse error), which we
-    // surface as `EmptyHost`.
+    if rest.contains('#') {
+        return Err(UrlError::UnsupportedTarget);
+    }
+
+    // http::Uri handles authority and path/query parsing. It rejects an empty
+    // host outright (parse error), which we surface as `EmptyHost`.
     let uri: Uri = url.parse().map_err(|_| UrlError::EmptyHost)?;
     let authority = uri.authority().ok_or(UrlError::EmptyHost)?;
+    if authority.as_str().contains('@') {
+        return Err(UrlError::Userinfo);
+    }
+    if uri
+        .path_and_query()
+        .is_some_and(|target| target.as_str() != "/")
+    {
+        return Err(UrlError::UnsupportedTarget);
+    }
 
     let raw_host = authority.host();
     if raw_host.is_empty() {
         return Err(UrlError::EmptyHost);
     }
+    if raw_host.starts_with('[') {
+        return Err(UrlError::Ipv6Unsupported);
+    }
 
-    // http::Uri keeps the brackets on an IPv6 literal; strip them so the
-    // host is a bare name usable for DNS, TLS SNI, and the Host header.
-    let host = raw_host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(raw_host)
-        .trim_end_matches('.')
-        .to_string();
+    let host = raw_host.trim_end_matches('.').to_string();
 
     if host.is_empty() {
         return Err(UrlError::EmptyHost);
@@ -232,17 +257,29 @@ mod tests {
     }
 
     #[test]
-    fn strips_path_query_fragment() {
-        let u = parse_endpoint("http://host:81/bucket/object?x=1#frag").unwrap();
+    fn accepts_root_path() {
+        let u = parse_endpoint("http://host:81/").unwrap();
         assert_eq!(u.host, "host");
-        assert_eq!(u.port, 81);
     }
 
     #[test]
-    fn strips_userinfo() {
-        let u = parse_endpoint("https://user:pass@host:443").unwrap();
-        assert_eq!(u.host, "host");
-        assert_eq!(u.port, 443);
+    fn rejects_path_query_fragment_and_userinfo() {
+        assert_eq!(
+            parse_endpoint("http://host:81/bucket/object"),
+            Err(UrlError::UnsupportedTarget)
+        );
+        assert_eq!(
+            parse_endpoint("http://host:81/?x=1"),
+            Err(UrlError::UnsupportedTarget)
+        );
+        assert_eq!(
+            parse_endpoint("http://host:81/#frag"),
+            Err(UrlError::UnsupportedTarget)
+        );
+        assert_eq!(
+            parse_endpoint("https://user:pass@host:443"),
+            Err(UrlError::Userinfo)
+        );
     }
 
     #[test]
@@ -253,14 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_bracketed_ipv6() {
-        let u = parse_endpoint("https://[::1]:9443").unwrap();
-        assert_eq!(u.host, "::1");
-        assert_eq!(u.port, 9443);
-
-        let u = parse_endpoint("https://[2001:db8::1]").unwrap();
-        assert_eq!(u.host, "2001:db8::1");
-        assert_eq!(u.port, 443);
+    fn rejects_bracketed_ipv6() {
+        assert_eq!(
+            parse_endpoint("https://[::1]:9443"),
+            Err(UrlError::Ipv6Unsupported)
+        );
+        assert_eq!(
+            parse_endpoint("https://[2001:db8::1]"),
+            Err(UrlError::Ipv6Unsupported)
+        );
     }
 
     #[test]

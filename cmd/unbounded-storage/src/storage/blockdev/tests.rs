@@ -127,7 +127,7 @@ mod uring_tests {
 
     use super::super::{BlockDevice, CoreLocalDevice, OpenDisk, UringDevice};
     use crate::ring::{
-        StorageRing, StorageRingConfig, clear_current_storage_ring, set_current_storage_ring,
+        CurrentStorageRingGuard, StorageRing, StorageRingConfig, install_current_storage_ring,
     };
     use crate::runtime::noop_waker;
     use crate::storage::types::{Error, Lba};
@@ -167,19 +167,14 @@ mod uring_tests {
     ///
     /// A [`CoreLocalDevice`] resolves its ring from the thread-local
     /// registry, so a ring must be installed before any device I/O. On
-    /// drop the thread-local is cleared first (so a later test reusing
+    /// drop the thread-local is restored first (so a later test reusing
     /// this pooled thread never observes a stale ring), then `ring`
     /// drops - unregistering the disk fd - and finally `_file` closes
     /// it.
     struct Installed {
+        _ring_install: CurrentStorageRingGuard,
         ring: Rc<StorageRing>,
         _file: std::fs::File,
-    }
-
-    impl Drop for Installed {
-        fn drop(&mut self) {
-            clear_current_storage_ring();
-        }
     }
 
     /// Open `path` through the production [`UringDevice::open`] path with
@@ -191,8 +186,15 @@ mod uring_tests {
             UringDevice::open(path, StorageRingConfig::test_local(), false, page_size)
                 .expect("open uring device");
         let ring = Rc::new(ring);
-        set_current_storage_ring(ring.clone());
-        (device, Installed { ring, _file: file })
+        let ring_install = install_current_storage_ring(ring.clone());
+        (
+            device,
+            Installed {
+                _ring_install: ring_install,
+                ring,
+                _file: file,
+            },
+        )
     }
 
     /// Drive a single block-device future to completion, pumping the
@@ -234,7 +236,6 @@ mod uring_tests {
         let (device, _installed) = open_installed(&path.0, page_size);
         assert_eq!(device.page_size(), page_size);
         assert_eq!(device.capacity_pages(), pages);
-        assert_eq!(device.write_queue_depth(), 8);
     }
 
     #[test]

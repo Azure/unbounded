@@ -73,6 +73,14 @@ func TestParseAzureVMProviderID(t *testing.T) {
 	}
 }
 
+func TestNormalizeResourceID(t *testing.T) {
+	t.Parallel()
+
+	resourceID, err := NormalizeResourceID("azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1")
+	require.NoError(t, err)
+	require.Equal(t, "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", resourceID)
+}
+
 func TestProviderExecute(t *testing.T) {
 	t.Parallel()
 
@@ -84,7 +92,7 @@ func TestProviderExecute(t *testing.T) {
 		{name: "hard reboot", operation: unboundedv1alpha3.OperationHostReboot, wantCalls: []string{"restart:rg/vm1"}},
 		{name: "power off", operation: unboundedv1alpha3.OperationHostPowerOff, wantCalls: []string{"powerOff:rg/vm1"}},
 		{name: "power on", operation: unboundedv1alpha3.OperationHostPowerOn, wantCalls: []string{"start:rg/vm1"}},
-		{name: "replace", operation: unboundedv1alpha3.OperationHostReplace, wantCalls: []string{"replace:rg/vm1:cloud-init"}},
+		{name: "replace", operation: unboundedv1alpha3.OperationHostReplace, wantCalls: []string{"replace:rg/vm1:cloud-init:"}},
 	}
 
 	for _, tt := range tests {
@@ -185,10 +193,68 @@ func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
 		return &recordingAzureVMClient{}, nil
 	}}
 
-	require.True(t, provider.Supports(unboundedv1alpha3.OperationHostReplace))
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{ProviderID: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm1", Operation: unboundedv1alpha3.OperationHostReplace})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "replacement user data is required")
+}
+
+func TestProviderRegistrationDoesNotDeclareHostReplaceReplaySafe(t *testing.T) {
+	t.Parallel()
+
+	provider, err := (&Provider{}).Registration()
+	require.NoError(t, err)
+
+	operation, ok := provider.Operation(unboundedv1alpha3.OperationHostReplace)
+	require.True(t, ok)
+	require.False(t, operation.ReplaySafe())
+
+	groupKind, ok := provider.ProviderMachineKind()
+	require.False(t, ok)
+	require.Empty(t, groupKind)
+}
+
+func TestPrepareReplacementVMChangesHostImage(t *testing.T) {
+	t.Parallel()
+
+	vm := armcompute.VirtualMachine{
+		Name: toPtr("vm1"),
+		Properties: &armcompute.VirtualMachineProperties{
+			StorageProfile: &armcompute.StorageProfile{
+				ImageReference: &armcompute.ImageReference{
+					Publisher: toPtr("old-publisher"),
+					Offer:     toPtr("old-offer"),
+					SKU:       toPtr("old-sku"),
+					Version:   toPtr("old-version"),
+				},
+				OSDisk: &armcompute.OSDisk{},
+			},
+		},
+	}
+
+	replacement, err := prepareReplacementVM(
+		vm,
+		"#cloud-config\n",
+		"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/gallery/images/image/versions/2.0.0",
+		123,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/gallery/images/image/versions/2.0.0", *replacement.Properties.StorageProfile.ImageReference.ID)
+	require.Nil(t, replacement.Properties.StorageProfile.ImageReference.Publisher)
+}
+
+func TestParseAzureImageReference(t *testing.T) {
+	t.Parallel()
+
+	marketplace, err := parseAzureImageReference("Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest")
+	require.NoError(t, err)
+	require.Equal(t, "Canonical", *marketplace.Publisher)
+	require.Equal(t, "latest", *marketplace.Version)
+
+	_, err = parseAzureImageReference("not-an-image")
+	require.ErrorContains(t, err, "Azure resource ID or publisher:offer:sku:version")
+
+	_, err = parseAzureImageReference("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/not-an-image")
+	require.ErrorContains(t, err, "Microsoft.Compute image or gallery image")
 }
 
 func TestPrepareReplacementVM(t *testing.T) {
@@ -204,13 +270,17 @@ func TestPrepareReplacementVM(t *testing.T) {
 			ProvisioningState: toPtr("Succeeded"),
 			OSProfile:         &armcompute.OSProfile{RequireGuestProvisionSignal: toPtr(true)},
 			StorageProfile: &armcompute.StorageProfile{OSDisk: &armcompute.OSDisk{
-				Name:        toPtr("old-osdisk"),
-				ManagedDisk: &armcompute.ManagedDiskParameters{},
+				Name: toPtr("old-osdisk"),
+				ManagedDisk: &armcompute.ManagedDiskParameters{
+					ID:                 toPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/old-osdisk"),
+					StorageAccountType: toPtr(armcompute.StorageAccountTypesPremiumLRS),
+				},
 			}},
 		},
 	}
 
-	replacement := prepareReplacementVM(vm, "#cloud-config\n", 123)
+	replacement, err := prepareReplacementVM(vm, "#cloud-config\n", "", 123)
+	require.NoError(t, err)
 
 	require.Nil(t, replacement.ID)
 	require.Nil(t, replacement.Name)
@@ -223,7 +293,10 @@ func TestPrepareReplacementVM(t *testing.T) {
 	require.Nil(t, replacement.Properties.OSProfile.RequireGuestProvisionSignal)
 	require.Equal(t, armcompute.DiskCreateOptionTypesFromImage, *replacement.Properties.StorageProfile.OSDisk.CreateOption)
 	require.NotNil(t, replacement.Properties.StorageProfile.OSDisk.ManagedDisk)
+	require.Nil(t, replacement.Properties.StorageProfile.OSDisk.ManagedDisk.ID)
+	require.Equal(t, armcompute.StorageAccountTypesPremiumLRS, *replacement.Properties.StorageProfile.OSDisk.ManagedDisk.StorageAccountType)
 	require.Equal(t, "vm1-osdisk-123", *replacement.Properties.StorageProfile.OSDisk.Name)
+	require.NotNil(t, vm.Properties.StorageProfile.OSDisk.ManagedDisk.ID)
 }
 
 func TestValidateAzureCustomData(t *testing.T) {
@@ -254,6 +327,24 @@ func TestPrepareVMForReplacementDelete(t *testing.T) {
 	require.Equal(t, armcompute.DiskDeleteOptionTypesDetach, *updated.Properties.StorageProfile.DataDisks[0].DeleteOption)
 }
 
+func TestPreparingReplacementDoesNotMutateDeleteOptionPayload(t *testing.T) {
+	t.Parallel()
+
+	source := armcompute.VirtualMachine{
+		Name: toPtr("vm1"),
+		Properties: &armcompute.VirtualMachineProperties{
+			StorageProfile: &armcompute.StorageProfile{
+				OSDisk: &armcompute.OSDisk{Name: toPtr("existing-osdisk")},
+			},
+		},
+	}
+
+	deleteOptionPayload := prepareVMForReplacementDelete(source)
+	_, err := prepareReplacementVM(source, "#cloud-config\n", "", 123)
+	require.NoError(t, err)
+	require.Equal(t, "existing-osdisk", *deleteOptionPayload.Properties.StorageProfile.OSDisk.Name)
+}
+
 type recordingAzureVMClient struct {
 	calls []string
 	err   error
@@ -274,8 +365,8 @@ func (c *recordingAzureVMClient) Start(_ context.Context, resourceGroupName, vmN
 	return c.err
 }
 
-func (c *recordingAzureVMClient) Replace(_ context.Context, resourceGroupName, vmName, userData string) error {
-	c.calls = append(c.calls, fmt.Sprintf("replace:%s/%s:%s", resourceGroupName, vmName, userData))
+func (c *recordingAzureVMClient) Replace(_ context.Context, resourceGroupName, vmName, userData, hostImage string) error {
+	c.calls = append(c.calls, fmt.Sprintf("replace:%s/%s:%s:%s", resourceGroupName, vmName, userData, hostImage))
 	return c.err
 }
 

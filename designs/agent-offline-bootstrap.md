@@ -3,13 +3,15 @@
 ## Goals
 
 - Describe how an operator can mirror or pre-stage agent bootstrap artifacts.
-- Propose support for reading binary artifacts from either the local filesystem or an internal OCI artifact bundle.
+- Propose support for reading binary artifacts from the local filesystem, an internal OCI artifact bundle, or an archive downloaded over HTTPS.
+- Allow HTTPS to act as a transport for both rootfs OCI layouts and complete offline artifact bundles.
 - Keep the existing agent config shape as much as possible.
 
 ## Non-goals
 
 - Changing Kubernetes image pull behavior for workload images.
 - Supporting authenticated OCI registries for offline artifact bundles.
+- Supporting HTTPS authentication mechanisms other than signed query strings, such as URL user info or client certificates.
 - Replacing host OS package management.
 
 ## Bootstrap artifact targets
@@ -35,7 +37,7 @@ ghcr.io/azure/agent-azlinux3:v20260619
 ghcr.io/azure/agent-azlinux3-nvidia:v20260626
 ```
 
-Offline environments must either mirror the selected image into an internal registry or pre-stage it in a local format supported by the agent.
+Offline environments must either mirror the selected image into an internal registry, pre-stage it as a local OCI layout, or make a tarred OCI layout available from an HTTPS endpoint reachable by the host.
 
 ### Rootfs binary artifacts
 
@@ -138,13 +140,27 @@ The agent config already has two relevant controls.
 
 ### `OCIImage`
 
-`OCIImage` selects the rootfs image:
+`OCIImage` selects the rootfs image. It accepts a registry reference, a local OCI layout, or an HTTPS URL to a tarred OCI layout:
 
 ```json
 {
   "OCIImage": "registry.internal.example.com/unbounded/agent-ubuntu2404:v20260619"
 }
 ```
+
+```json
+{
+  "OCIImage": "oci-layout:///opt/unbounded/images/agent-ubuntu2404:v20260619"
+}
+```
+
+```json
+{
+  "OCIImage": "https://artifacts.internal.example.com/agent-ubuntu2404.oci.tar"
+}
+```
+
+An HTTPS archive must contain exactly one tagged image reference, which the agent selects automatically. Archives with zero or multiple tagged image references are rejected.
 
 ### `Downloads`
 
@@ -245,7 +261,7 @@ https://mirror.internal.example.com/runc/v1.5.0/runc.amd64
 
 ## Proposal
 
-Add a top-level `OfflineArtifacts` config block for complete offline binary artifact sets. It points at one bundle root, either on the local filesystem or in an internal OCI registry. The bundle is self-describing: it includes a small manifest that tells the agent which binary versions are present.
+Add a top-level `OfflineArtifacts` config block for complete offline binary artifact sets. It points at one bundle root on the local filesystem, one bundle in an internal OCI registry, or one tar archive served over HTTPS. The bundle is self-describing: it includes a small manifest that tells the agent which binary versions are present.
 
 `OfflineArtifacts.Source` is a Go template string that resolves to the bundle root.
 
@@ -269,7 +285,17 @@ Example OCI registry mode:
 }
 ```
 
-When `OfflineArtifacts.Source` is non-empty, the agent treats the offline source as the complete binary artifact source and ignores `Downloads`. This avoids partial offline configuration where some artifacts come from the offline bundle and others fall back to internet defaults. The agent renders the offline source template, reads `manifest.json` from it, and uses the versions declared there when resolving binary artifact paths.
+Example HTTPS archive mode:
+
+```json
+{
+  "OfflineArtifacts": {
+    "Source": "https://artifacts.internal.example.com/v0.4.0/bootstrap-artifacts-k8s-{{ .KubernetesVersion }}.tar.gz"
+  }
+}
+```
+
+When `OfflineArtifacts.Source` is non-empty, the agent treats the offline source as the complete binary artifact source and ignores `Downloads`. This avoids partial offline configuration where some artifacts come from the offline bundle and others fall back to internet defaults. The agent renders the offline source template and resolves the bundle. For HTTPS mode, resolution first downloads and extracts the archive into a source-specific host cache. The agent then reads `manifest.json` and uses the versions declared there when resolving binary artifact paths.
 
 `OfflineArtifacts.Source` is rendered before reading `manifest.json`, using values derived from the agent config. This lets one config be reused across clusters on different Kubernetes versions.
 
@@ -317,7 +343,7 @@ Container image archive paths are derived from each image ref in `manifest.json`
 
 The existing `Downloads` block remains the regular per-artifact override mechanism. As a separate compatibility improvement, `Downloads.*.BaseURL` and `Downloads.*.URL` should also support `file://` and `oci://` endpoints for non-offline custom layouts. Those `Downloads` settings are ignored whenever offline artifacts are configured.
 
-The rootfs image remains controlled by `OCIImage`. Even in offline mode, operators must set `OCIImage` to the full image reference or local image source they want the agent to use. Offline artifact source settings do not infer or rewrite `OCIImage`.
+The rootfs image remains controlled by `OCIImage`. Even in offline mode, operators must set `OCIImage` to the registry reference, local OCI layout, or HTTPS OCI layout archive they want the agent to use. Offline artifact source settings do not infer or rewrite `OCIImage`.
 
 ### Offline artifact manifest
 
@@ -383,6 +409,35 @@ file:///opt/unbounded/artifacts/v1.34.2/kubernetes/v1.34.2/bin/linux/amd64/kubel
 ```
 
 Kubernetes checksum resolution remains unchanged. The agent appends `.sha256` to the resolved Kubernetes binary source, so the local directory must also contain the checksum files.
+
+### HTTPS archive mode
+
+In HTTPS archive mode, `OfflineArtifacts.Source` is the URL of one plain tar or gzip-compressed tar archive containing the complete filesystem bundle layout. This mode is useful when operators can host static files but do not want to operate an OCI registry or copy the expanded bundle onto every host.
+
+Example:
+
+```json
+{
+  "OfflineArtifacts": {
+    "Source": "https://artifacts.internal.example.com/v0.4.0/bootstrap-artifacts-k8s-{{ .KubernetesVersion }}.tar.gz"
+  }
+}
+```
+
+The archive may place the bundle directly at its root or under a containing directory. It must contain exactly one `manifest.json`; the directory containing that file becomes the resolved bundle root. All component-prefixed paths are interpreted relative to that directory.
+
+The agent treats HTTPS only as the transport for the archive:
+
+1. Render and validate the HTTPS URL.
+2. Download and safely extract the archive into a source-specific host cache under `/var/lib/unbounded/offline-artifacts/`.
+3. Resolve the extracted directory using the same filesystem logic as `file://` mode.
+4. Validate the manifest, configured versions, required host-architecture artifacts, and required checksum files.
+5. Mark the extracted cache ready only after all validation succeeds.
+6. Produce `file://` download overrides that point into the extracted cache.
+
+The cache directory name includes a short hash of the rendered source URL without its query string. Signed query parameters are treated as credentials rather than artifact identity, so SAS rotation reuses the cache for the same scheme, host, and path. A ready cache can be reused by bootstrap, preflight, repave, and upgrade operations. An incomplete cache is removed and rebuilt on the next resolution attempt.
+
+HTTPS archive URLs must include a host and archive path. Signed query strings, including Azure Blob SAS parameters, are supported and preserved during download. URL user info and fragments are rejected. Query values must be treated as sensitive and redacted from logs, errors, and cache directory prefixes. The HTTPS endpoint must use a certificate trusted by the host. Archive extraction rejects absolute or parent-traversing paths, duplicate files, links, and entry types other than directories and regular files.
 
 ### OCI registry mode
 
@@ -496,15 +551,27 @@ These custom `Downloads` endpoints are useful for testing, bespoke layouts, and 
 
 ### Rootfs image sources
 
-`OCIImage` should continue to support normal registry image references, including internal registry mirrors. In filesystem mode, add support for local OCI image sources so an airgapped node can bootstrap without a registry pull.
+`OCIImage` should support three source modes:
 
-Proposed source form:
+1. Normal OCI registry image references, including internal registry mirrors.
+2. Local OCI layout directories.
+3. Tarred OCI layout archives downloaded over HTTPS.
+
+Local layout example:
 
 ```text
 oci-layout:///opt/unbounded/images/agent-ubuntu2404:v20260619
 ```
 
-The agent can reuse the existing OCI unpack path after resolving the local OCI layout directory.
+HTTPS archive example:
+
+```text
+https://artifacts.internal.example.com/agent-ubuntu2404.oci.tar
+```
+
+The HTTPS object may be a plain tar or gzip-compressed tar archive. After download, the archive must extract to an OCI image layout containing `oci-layout`, `index.json`, and `blobs/`. It may contain those files at the archive root or under one containing directory. The archive must contain exactly one tagged image reference, which the agent selects automatically; archives with zero or multiple tagged references are rejected.
+
+The agent probes the HTTPS object during preflight without downloading its full contents. During rootfs provisioning, it downloads and safely extracts the archive into a temporary directory, locates the single OCI layout and image reference, and reuses the same OCI unpack path as `oci-layout://`. The temporary archive contents are removed after provisioning. Signed query strings such as Azure Blob SAS parameters are supported and redacted from logs and errors; URL user info and fragments are rejected.
 
 ## Artifact publishing process
 
@@ -526,7 +593,7 @@ ghcr.io/azure/agent-azlinux3:v20260619
 ghcr.io/azure/agent-azlinux3-nvidia:v20260626
 ```
 
-Offline operators mirror these images into their target environment, either by copying them to an internal registry or by exporting them as local OCI layout directories for filesystem-mode bootstrap.
+Offline operators mirror these images into their target environment by copying them to an internal registry, exporting them as local OCI layout directories, or packaging those layouts as tar archives for HTTPS delivery. An HTTPS rootfs archive should contain the same OCI layout content that filesystem mode consumes, with exactly one tagged image reference. The rootfs image references exported with offline artifacts are declared in `hack/cmd/agent-artifacts-builder/rootfs-images.txt`. A manual workflow dispatch can override that list with the `rootfs_images` input, which accepts comma, space, or newline separated tagged OCI references. The agent offline artifacts workflow uses `agent-artifacts-builder archive-oci-image` to pull each selected image and publish an `.oci.tar.gz` archive with an adjacent `.sha256` file. The normal container image publishing workflow remains unchanged.
 
 ### Binary artifact bundle publishing
 
@@ -550,7 +617,11 @@ Each bundle should contain:
 
 OCI bundles should be published as multi-platform OCI indexes under the single Kubernetes-versioned tag. Each index entry points to a platform-specific artifact manifest, and each platform-specific manifest contains only that architecture's blobs plus `manifest.json` and platform-specific image archives under `container-images/`. For example, pulling `--platform linux/amd64` should return only `amd64` binaries and `amd64` image archives, and pulling `--platform linux/arm64` should return only `arm64` binaries and `arm64` image archives. The tag remains architecture-neutral.
 
-The bundle should use one OCI blob per target artifact, not one tarball containing all artifacts. This lets the agent fetch only the artifacts it needs and allows registries to deduplicate unchanged blobs across bundle tags.
+The OCI representation should use one OCI blob per target artifact, not one tarball layer containing all artifacts. This lets the agent fetch only the artifacts it needs and allows registries to deduplicate unchanged blobs across bundle tags.
+
+For HTTPS archive mode, `agent-artifacts-builder` should also package the expanded filesystem bundle as a gzip-compressed tar archive and write an adjacent `.sha256` file. The archive contains `manifest.json` and the same component-prefixed paths as filesystem mode. It is intentionally a complete bundle because static HTTPS servers cannot provide OCI title-based blob selection. The version-group publishing flow writes archives named like `bootstrap-artifacts-<tag-prefix>-k8s-<kubernetes-version>.tar.gz` alongside the expanded bundles uploaded by the workflow.
+
+Version tag runs such as `v0.1.22` use the version tag as the OCI artifact tag prefix and attach rootfs OCI layout archives, bootstrap artifact archives, and their `.sha256` files to the matching GitHub release. GitHub Release assets use a flat namespace: rootfs archives are named `rootfs-<image>-<image-version>.oci.tar.gz`, and bootstrap archives are named `bootstrap-artifacts-k8s-<kubernetes-version>.tar.gz` without repeating the Unbounded version. Manual workflow dispatch can optionally set `release_tag` to attach assets to an existing release; leaving it empty only publishes OCI and GitHub Actions artifacts.
 
 ### Operator mirroring workflow
 
@@ -585,6 +656,19 @@ For filesystem mode, operators export the official rootfs image as a local OCI l
 }
 ```
 
+For HTTPS archive mode, operators publish a tarred OCI layout and a complete offline artifact archive on an HTTPS server trusted by the target hosts, then configure:
+
+```json
+{
+  "OCIImage": "https://artifacts.internal.example.com/agent-ubuntu2404.oci.tar",
+  "OfflineArtifacts": {
+    "Source": "https://artifacts.internal.example.com/v0.4.0/bootstrap-artifacts-k8s-{{ .KubernetesVersion }}.tar.gz"
+  }
+}
+```
+
+The OCI layout archive in this example contains one tagged rootfs image reference, which the agent selects automatically. Archives with zero or multiple tagged references are rejected.
+
 ## Repave and upgrade behavior
 
 Repave and rootfs upgrade operations rebuild or reprovision the nspawn rootfs, so they need the same offline artifacts as initial bootstrap. `OfflineArtifacts` should be treated as durable agent config and used for these operations whenever it is set.
@@ -603,6 +687,8 @@ With this pattern, the same agent config can resolve different offline bundles a
 
 Filesystem mode can also support upgrades, but each target host must already have the matching artifact directory for every Kubernetes version it may need. This is simpler for small fleets but harder to manage for broad upgrades.
 
+HTTPS archive mode supports the same version-template pattern as OCI registry mode. Operators should publish immutable, versioned archive URLs for every supported Kubernetes version. The source-specific extracted cache lets preflight, bootstrap, and repave reuse a bundle after it has been downloaded and validated.
+
 `OfflineArtifacts` does not cover the `unbounded-agent` binary itself. Agent binary upgrades still need their own offline-capable source.
 
 ## Preflight checks
@@ -618,9 +704,11 @@ When `OfflineArtifacts.Source` is configured, preflight should:
 5. Resolve every required artifact path for the host architecture from the manifest versions.
 6. Verify every required artifact exists in the offline source.
 
-For filesystem mode, existence checks should verify regular files under the resolved source root. For OCI registry mode, existence checks should resolve the OCI artifact manifest once, build a title-to-descriptor map, and verify that each required artifact title exists. Preflight should not download large artifact blobs just to check availability; descriptor presence is enough. Kubernetes checksum blobs are required artifacts and must be checked just like the binaries.
+For filesystem mode, existence checks should verify regular files under the resolved source root. For OCI registry mode, existence checks should resolve the OCI artifact manifest once, build a title-to-descriptor map, and verify that each required artifact title exists. Preflight should not download large OCI artifact blobs just to check availability; descriptor presence is enough. Kubernetes checksum blobs are required artifacts and must be checked just like the binaries.
 
-Preflight should also validate `OCIImage` independently because `OfflineArtifacts.Source` does not control the rootfs image. For registry image references, preflight should check that the image reference is syntactically valid and reachable. For local `oci-layout://` references, preflight should check that the OCI layout directory exists and contains the requested reference.
+For HTTPS archive mode, source resolution downloads and safely extracts the complete archive before validating it with the filesystem checks. A cache is only marked ready after the manifest, versions, required artifact paths, and required checksum files validate as present. Artifact contents are verified through the normal installation path. This is intentionally different from OCI registry mode because a static archive does not expose per-file descriptors before download.
+
+Preflight should also validate `OCIImage` independently because `OfflineArtifacts.Source` does not control the rootfs image. For registry image references, preflight should check that the image reference is syntactically valid and reachable. For local `oci-layout://` references, preflight should check that the OCI layout directory exists and contains the requested reference. For HTTPS OCI layout archives, preflight should probe the archive URL without downloading it; provisioning performs full download, safe extraction, layout validation, and unpacking.
 
 ## Host package behavior and preflight
 

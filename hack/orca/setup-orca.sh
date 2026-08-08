@@ -16,7 +16,7 @@
 # Usage: setup-orca.sh [flags]
 #
 #   --context CTX        kubectl context to target (default: current)
-#   --namespace NS       namespace to install into (default: unbounded-kube)
+#   --namespace NS       namespace to install into (default: unbounded-system)
 #   --origin DRIVER      azureblob | awss3 (default: azureblob)
 #   --image IMG          orca container image (default: ghcr.io/azure/orca:dev)
 #   --build              build the orca image locally with `make image-orca-local`
@@ -69,7 +69,7 @@ set -euo pipefail
 # Defaults
 
 CONTEXT=""
-NAMESPACE="unbounded-kube"
+NAMESPACE="unbounded-system"
 ORIGIN_DRIVER="azureblob"
 ORCA_IMAGE="ghcr.io/azure/orca:dev"
 DO_BUILD=0

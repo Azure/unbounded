@@ -26,17 +26,16 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/metalman/attestation"
-	"github.com/Azure/unbounded/internal/metalman/cloudinit"
 	"github.com/Azure/unbounded/internal/metalman/dhcp"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
-	"github.com/Azure/unbounded/internal/metalman/lifecycle"
 	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // DefaultNetbootImage is the default netboot OCI image used when a Machine
-// omits spec.pxe.netbootImage. It is set at build time via -ldflags.
+// omits spec.host.netboot.netbootImage. It is set at build time via -ldflags.
 var DefaultNetbootImage = "netboot:latest"
 
 // ServePXECmd returns a cobra.Command that runs PXE servers and the BMC control loop.
@@ -75,13 +74,20 @@ func ServePXECmd() *cobra.Command {
 
 			leID := LeaderElectionID(site)
 
+			// Leader-election lease lives in the namespace metalman is
+			// deployed into. unbounded.SystemNamespace() sources it from the
+			// Downward API POD_NAMESPACE env (set by the deployment) so the
+			// lease and its RBAC stay co-located even when the install
+			// namespace is overridden, falling back to the default when unset.
+			leaderElectionNamespace := unbounded.SystemNamespace()
+
 			scheme := BuildScheme()
 
 			mgr, err := ctrl.NewManager(cfg, manager.Options{
 				Scheme:                        scheme,
 				LeaderElection:                true,
 				LeaderElectionID:              leID,
-				LeaderElectionNamespace:       "unbounded-kube",
+				LeaderElectionNamespace:       leaderElectionNamespace,
 				LeaseDuration:                 &leaseDuration,
 				RenewDeadline:                 &renewDeadline,
 				RetryPeriod:                   &retryPeriod,
@@ -231,19 +237,12 @@ func ServePXECmd() *cobra.Command {
 				APIReader:             mgr.GetAPIReader(),
 				Site:                  site,
 				PowerClients:          &metalmachineops.RedfishPowerClientFactory{Reader: mgr.GetClient(), Pool: redfishPool},
+				HTTPBootURL:           resolver.HTTPBootURL,
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
 				PollInterval:          operationPollInterval,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
-			}
-
-			if err := (&lifecycle.Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up Lifecycle reconciler: %w", err)
-			}
-
-			if err := (&cloudinit.Reconciler{Client: mgr.GetClient(), StatusRecorder: statusQueue}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up CloudInit reconciler: %w", err)
 			}
 
 			if dhcpInterface != "" && dhcpAutoInterface {
@@ -276,6 +275,7 @@ func ServePXECmd() *cobra.Command {
 				Reader:            mgr.GetClient(),
 				ServerIP:          dhcpServerIP,
 				OCICache:          ociCache,
+				ServeURL:          serveURL,
 				DefaultNetbootRef: defaultNetbootImage,
 			}
 			if err := mgr.Add(dhcpServer); err != nil {

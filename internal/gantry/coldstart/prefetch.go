@@ -28,15 +28,57 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
+
+func prefetchDispatchHash(self ifaces.NodeID, coordinationKey digest.Digest) uint64 {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(self))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(coordinationKey.String()))
+
+	return hasher.Sum64()
+}
+
+func prefetchDispatchPlan(self ifaces.NodeID, coordinationKey digest.Digest, groups int, maxJitter time.Duration) (int, time.Duration) {
+	dispatchHash := prefetchDispatchHash(self, coordinationKey)
+
+	offset := 0
+	if groups > 1 {
+		offset = int(dispatchHash % uint64(groups))
+	}
+
+	delay := time.Duration(0)
+	if maxJitter > 0 {
+		delay = time.Duration(dispatchHash % uint64(maxJitter))
+	}
+
+	return offset, delay
+}
+
+func coordinatesRemotePrefetch(self ifaces.NodeID, candidates []ifaces.Node, key digest.Digest, replicas int) bool {
+	if replicas <= 0 || replicas >= len(candidates) {
+		return true
+	}
+
+	for _, candidate := range hrw.TopK(candidates, key, replicas) {
+		if candidate.Node.ID == self {
+			return true
+		}
+	}
+
+	return false
+}
 
 // PrefetchLayers groups digests by their HRW rank-0 reachable
 // designated puller and issues one PleasePull RPC per puller. Digests
@@ -110,6 +152,23 @@ type ChildDigest struct {
 // into blob on the wire) leaves
 // p2p_origin_pull_total{kind="config"} permanently zero.
 func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest, registry, repository string) error {
+	var coordinationKey digest.Digest
+	if len(children) > 0 {
+		coordinationKey = children[0].Digest
+	}
+
+	return r.prefetchChildren(ctx, coordinationKey, children, registry, repository)
+}
+
+// PrefetchManifestChildren uses the manifest digest as the stable remote
+// coordinator election key. Callers that parsed a manifest should prefer
+// this method because local cache filtering can produce different first-child
+// digests on different nodes.
+func (r *Resolver) PrefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string) error {
+	return r.prefetchChildren(ctx, manifestDigest, children, registry, repository)
+}
+
+func (r *Resolver) prefetchChildren(ctx context.Context, coordinationKey digest.Digest, children []ChildDigest, registry, repository string) error {
 	if registry == "" || repository == "" {
 		return fmt.Errorf("%w: registry=%q repository=%q",
 			ErrPrefetchInvalid, registry, repository)
@@ -165,25 +224,59 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 
 		seen[key] = struct{}{}
 
-		top := hrw.TopK(candidates, c.Digest, 1)
+		// Designate the top-N HRW pullers for this digest. N=1 is the
+		// historical single-puller behavior (one initial seed); N>1 asks
+		// several pullers to origin-pull the same layer in parallel so the
+		// swarm fans out from N seeds instead of one.
+		replicas := r.opts.PrefetchPullerReplicas
+		if r.opts.PrefetchPullerFraction > 0 {
+			replicas = int(math.Ceil(float64(len(candidates)) * r.opts.PrefetchPullerFraction))
+		}
+
+		if replicas < 1 {
+			replicas = 1
+		}
+
+		top := hrw.TopK(candidates, c.Digest, replicas)
 		if len(top) == 0 {
 			skippedNoTop++
 			continue
 		}
 
-		puller := top[0].Node.ID
-		if puller == self {
-			if r.opts.LocalPull != nil {
-				selfByKind[c.Kind] = append(selfByKind[c.Kind], c.Digest)
-			} else {
-				skippedSelf++
+		routed := false
+
+		for _, scored := range top {
+			puller := scored.Node.ID
+			if puller == self {
+				// Self is a valid puller only when LocalPull is wired;
+				// otherwise the please_pull-to-self path is a no-op.
+				if r.opts.LocalPull != nil {
+					selfByKind[c.Kind] = append(selfByKind[c.Kind], c.Digest)
+					routed = true
+				}
+
+				continue
 			}
 
-			continue
+			gk := groupKey{node: puller, kind: c.Kind}
+			byGroup[gk] = append(byGroup[gk], c.Digest)
+			routed = true
 		}
 
-		gk := groupKey{node: puller, kind: c.Kind}
-		byGroup[gk] = append(byGroup[gk], c.Digest)
+		if !routed {
+			// Every designated puller was self with no LocalPull wired.
+			skippedSelf++
+		}
+	}
+
+	remoteCoordinator := coordinatesRemotePrefetch(
+		self,
+		candidates,
+		coordinationKey,
+		r.opts.PrefetchCoordinatorReplicas,
+	)
+	if !remoteCoordinator {
+		byGroup = nil
 	}
 
 	if len(byGroup) == 0 && len(selfByKind) == 0 {
@@ -211,6 +304,15 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 
 		return groupKeys[i].kind < groupKeys[j].kind
 	})
+
+	dispatchOffset, dispatchDelay := prefetchDispatchPlan(self, coordinationKey, len(groupKeys), r.opts.PrefetchDispatchJitter)
+	if len(groupKeys) > 1 {
+		rotated := make([]groupKey, 0, len(groupKeys))
+		rotated = append(rotated, groupKeys[dispatchOffset:]...)
+		rotated = append(rotated, groupKeys[:dispatchOffset]...)
+		groupKeys = rotated
+	}
+
 	// Sort self-kinds too so the goroutine launch is deterministic.
 	selfKinds := make([]ifaces.OriginRefKind, 0, len(selfByKind))
 	for k := range selfByKind {
@@ -251,10 +353,26 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 		slog.Int("pullers", totalPullers),
 		slog.Int("rpc_groups", len(byGroup)+len(selfByKind)),
 		slog.Int("skipped_self", skippedSelf),
+		slog.Bool("remote_coordinator", remoteCoordinator),
+		slog.Int("coordinator_replicas", r.opts.PrefetchCoordinatorReplicas),
+		slog.Int("max_concurrent_groups", r.opts.PrefetchMaxConcurrentGroups),
+		slog.Int("dispatch_offset", dispatchOffset),
+		slog.Duration("dispatch_delay", dispatchDelay),
 	)
 
 	if r.opts.Metrics.OnPrefetchBatch != nil {
 		r.opts.Metrics.OnPrefetchBatch(totalPullers, totalDigests)
+	}
+
+	if dispatchDelay > 0 {
+		timer := time.NewTimer(dispatchDelay)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 
 	var (
@@ -285,22 +403,41 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 			_, err := r.opts.LocalPull.StartLocalPull(callCtx, registry, repository, kind, ds)
 			if err != nil {
 				failures.Add(1)
+
+				if r.opts.Metrics.OnPrefetchGroup != nil {
+					r.opts.Metrics.OnPrefetchGroup("local", "error")
+				}
+
 				r.opts.Logger.Debug("coldstart: prefetch local pull failed",
 					slog.String("kind", kind.String()),
 					slog.Int("batch_size", len(ds)),
 					slog.Any("err", err),
 				)
+			} else if r.opts.Metrics.OnPrefetchGroup != nil {
+				r.opts.Metrics.OnPrefetchGroup("local", "success")
 			}
 		}(k, digests)
 	}
 
-	for _, gk := range groupKeys {
+	remoteSlots := make(chan struct{}, r.opts.PrefetchMaxConcurrentGroups)
+
+dispatchRemote:
+	for index, gk := range groupKeys {
 		ds := byGroup[gk]
+
+		select {
+		case remoteSlots <- struct{}{}:
+		case <-ctx.Done():
+			failures.Add(int32(len(groupKeys) - index))
+
+			break dispatchRemote
+		}
 
 		wg.Add(1)
 
 		go func(node ifaces.NodeID, kind ifaces.OriginRefKind, digests []digest.Digest) {
 			defer wg.Done()
+			defer func() { <-remoteSlots }()
 
 			callCtx, cancel := context.WithTimeout(ctx, r.opts.QueryTimeout)
 			defer cancel()
@@ -308,12 +445,19 @@ func (r *Resolver) PrefetchChildren(ctx context.Context, children []ChildDigest,
 			_, err := r.opts.Coord.PleasePull(callCtx, node, registry, repository, kind, digests)
 			if err != nil {
 				failures.Add(1)
+
+				if r.opts.Metrics.OnPrefetchGroup != nil {
+					r.opts.Metrics.OnPrefetchGroup("remote", "error")
+				}
+
 				r.opts.Logger.Debug("coldstart: prefetch please_pull failed",
 					slog.String("puller", string(node)),
 					slog.String("kind", kind.String()),
 					slog.Int("batch_size", len(digests)),
 					slog.Any("err", err),
 				)
+			} else if r.opts.Metrics.OnPrefetchGroup != nil {
+				r.opts.Metrics.OnPrefetchGroup("remote", "success")
 			}
 		}(gk.node, gk.kind, ds)
 	}

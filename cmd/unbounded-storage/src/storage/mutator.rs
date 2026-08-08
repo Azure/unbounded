@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use crate::storage::btree::LeafEntry;
+use crate::storage::completion::{Completion, CompletionWait};
+use crate::storage::lru::Resident;
 use crate::storage::types::PageKey;
 
 /// A single submission to the mutator. The submitter has already
@@ -39,7 +41,7 @@ pub(crate) enum MutatorReq {
         done: Arc<MutatorReply>,
     },
     Delete {
-        keys: Vec<PageKey>,
+        victims: Vec<Resident>,
         done: Arc<MutatorReply>,
     },
 }
@@ -52,73 +54,18 @@ pub(crate) enum MutatorOutcome {
     /// `None` if the key was unmapped. The entry's `byte_len` lets
     /// the submitter free the entire prior contiguous LBA range.
     InsertCommitted { prior: Option<LeafEntry> },
-    /// `apply_batch` committed the delete set.
-    DeleteCommitted,
+    /// `apply_batch` committed. Only victims whose expected LBA still matched
+    /// are returned for reclamation.
+    DeleteCommitted { removed: Vec<Resident> },
     /// `apply_batch` returned an error. The submitter must clean
     /// up the LBA range it allocated (insert) or leave eviction
     /// state untouched (delete).
     Failed,
 }
 
-/// Shared reply slot: filled by the mutator, awaited by the
-/// submitter. Cheap to construct (`Arc<Self>`) so the engine can
-/// allocate one per request.
-pub(crate) struct MutatorReply {
-    inner: Mutex<ReplyInner>,
-}
-
-struct ReplyInner {
-    result: Option<MutatorOutcome>,
-    waker: Option<Waker>,
-}
-
-impl MutatorReply {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(ReplyInner {
-                result: None,
-                waker: None,
-            }),
-        })
-    }
-
-    /// Called by the mutator once the batch this request was part
-    /// of has been processed. Wakes the submitter if it has
-    /// already polled.
-    pub(crate) fn set(&self, outcome: MutatorOutcome) {
-        let waker = {
-            let mut g = self.inner.lock().unwrap();
-            g.result = Some(outcome);
-            g.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-
-    pub(crate) fn wait(self: Arc<Self>) -> ReplyWait {
-        ReplyWait { inner: self }
-    }
-}
-
-pub(crate) struct ReplyWait {
-    inner: Arc<MutatorReply>,
-}
-
-impl Future for ReplyWait {
-    type Output = MutatorOutcome;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut g = self.inner.inner.lock().unwrap();
-        if let Some(o) = g.result.take() {
-            Poll::Ready(o)
-        } else {
-            if !g.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-                g.waker = Some(cx.waker().clone());
-            }
-            Poll::Pending
-        }
-    }
-}
+/// Shared reply slot filled by the mutator and awaited by one submitter.
+pub(crate) type MutatorReply = Completion<MutatorOutcome>;
+pub(crate) type ReplyWait = CompletionWait<MutatorOutcome>;
 
 /// MPSC-style queue between writer/eviction tasks (producers)
 /// and the engine's `run_mutator` loop (single consumer). All
@@ -227,12 +174,10 @@ impl MutatorQueue {
     /// as the batch reaches `max`, the queue is closed, or the
     /// yield budget is exhausted.
     ///
-    /// This is the wall-clock-free realization of
-    /// [`crate::storage::EngineConfig::commit_batch_deadline_us`]:
-    /// the DST harness forbids reading elapsed time, so the
-    /// deadline is expressed as a budget of `ticks` logical yields
-    /// (see [`crate::storage::EngineConfig::commit_batch_ticks`]).
-    /// Each [`yield_once`] gives the executor a chance to
+    /// The DST harness forbids reading elapsed time, so coalescing is
+    /// expressed as a budget of `ticks` logical yields (see
+    /// [`crate::storage::EngineConfig::commit_batch_ticks`]). Each
+    /// [`yield_once`] gives the executor a chance to
     /// interleave producers that are about to push, so batches
     /// grow under load while a drained or closed queue never
     /// stalls. `ticks == 0` disables coalescing (a single drain).
@@ -357,9 +302,9 @@ mod tests {
     #[test]
     fn reply_resolves_after_set() {
         let r = MutatorReply::new();
-        r.set(MutatorOutcome::DeleteCommitted);
+        r.set(MutatorOutcome::DeleteCommitted { removed: vec![] });
         let out = block_on(r.wait());
-        assert!(matches!(out, MutatorOutcome::DeleteCommitted));
+        assert!(matches!(out, MutatorOutcome::DeleteCommitted { .. }));
     }
 
     #[test]
@@ -368,11 +313,11 @@ mod tests {
         let r1 = MutatorReply::new();
         let r2 = MutatorReply::new();
         q.push(MutatorReq::Delete {
-            keys: vec![],
+            victims: vec![],
             done: r1.clone(),
         });
         q.push(MutatorReq::Delete {
-            keys: vec![],
+            victims: vec![],
             done: r2.clone(),
         });
         let drained = q.try_drain_up_to(10);
@@ -385,7 +330,7 @@ mod tests {
         q.close();
         let r = MutatorReply::new();
         q.push(MutatorReq::Delete {
-            keys: vec![],
+            victims: vec![],
             done: r.clone(),
         });
         let out = block_on(r.wait());
@@ -403,7 +348,7 @@ mod tests {
     fn push_n(q: &Arc<MutatorQueue>, n: usize) {
         for _ in 0..n {
             q.push(MutatorReq::Delete {
-                keys: vec![],
+                victims: vec![],
                 done: MutatorReply::new(),
             });
         }
@@ -560,7 +505,7 @@ mod tests {
             }
         } else {
             MutatorReq::Delete {
-                keys: vec![page_key(idx as u32)],
+                victims: vec![],
                 done: reply.clone(),
             }
         };
@@ -597,7 +542,7 @@ mod tests {
                             done.set(MutatorOutcome::InsertCommitted { prior: None })
                         }
                         MutatorReq::Delete { done, .. } => {
-                            done.set(MutatorOutcome::DeleteCommitted)
+                            done.set(MutatorOutcome::DeleteCommitted { removed: vec![] })
                         }
                     }
                 }

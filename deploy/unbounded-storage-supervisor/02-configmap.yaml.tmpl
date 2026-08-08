@@ -6,7 +6,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: unbounded-storage-config
-  namespace: {{ default "unbounded-kube" .Namespace }}
+  namespace: {{ default "unbounded-system" .Namespace }}
   labels:
     app.kubernetes.io/name: unbounded-storage-supervisor
     app.kubernetes.io/component: storage
@@ -37,6 +37,11 @@ metadata:
 # entries like /dev/sdb?name=sdb&size_bytes=1234; discovery does not allocate
 # disks. The shared disk set is available to every cache; the supervisor does not
 # invent caches, backends, or frontends.
+#
+# Backend ca_cert, client_cert, and client_key fields contain literal PEM, not
+# filesystem paths. Static S3 access_key_id, secret_access_key, and session_token
+# values are also stored directly in this ConfigMap and in the rendered host
+# config. Restrict access to both when origin credentials are configured.
 data:
   config.yaml: |
     # Operator-assigned config version (opaque counter; 0 means unversioned).
@@ -58,7 +63,8 @@ data:
       memory:
         # Allocate per-shard backing from the heap instead of 2 MiB hugepages.
         no_hugepages: false
-        # Total backing pool across all serving shards in bytes (128 MiB).
+        # Node-wide shard data pool in bytes (128 MiB). Partial 2 MiB pages are
+        # unused; RPC scratch adds 8 pages per fabric unit outside this pool.
         memory_total_bytes: 134217728
       fabric:
         tcp:
@@ -83,8 +89,8 @@ data:
         allow_inactive_port: false
         # Disable RDMA and force the libfabric tcp provider.
         disable_rdma: false
-        # Cap on serving-shard CPUs to pin. Omit to claim every usable core.
-        # serving_cores: 12
+        # Cap serving shards to fit the default data and RPC scratch budgets.
+        serving_cores: 8
         # NIC-worker CPUs to pin per active HCA.
         nic_workers: 4
       metrics:

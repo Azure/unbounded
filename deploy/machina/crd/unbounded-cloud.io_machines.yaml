@@ -124,6 +124,29 @@ spec:
                               agent's compiled-in defaults.
                             type: string
                         type: object
+                      coreDNS:
+                        description: CoreDNS overrides the download source for CoreDNS.
+                        properties:
+                          baseURL:
+                            description: |-
+                              BaseURL replaces the upstream host + path prefix used to
+                              construct the download URL. Version and arch substitution are
+                              preserved so mirrors need to publish assets under the same
+                              layout as the upstream project.
+                            type: string
+                          url:
+                            description: |-
+                              URL is a fully qualified download URL template. Version/arch
+                              substitution via fmt directives is preserved. When set it
+                              overrides BaseURL entirely.
+                            type: string
+                          version:
+                            description: |-
+                              Version overrides the version of the artifact that would
+                              otherwise be derived from the cluster Kubernetes version or the
+                              agent's compiled-in defaults.
+                            type: string
+                        type: object
                       crictl:
                         description: |-
                           Crictl overrides the download source for crictl
@@ -206,6 +229,31 @@ spec:
                       nspawn machine (e.g. "ghcr.io/org/repo:tag"). When empty the
                       agent falls back to its built-in default image.
                     type: string
+                  localDNS:
+                    description: LocalDNS configures the optional CoreDNS cache inside
+                      the nspawn machine.
+                    properties:
+                      clusterListenerIP:
+                        type: string
+                      corefileTemplate:
+                        type: string
+                      cpuLimitInMilliCores:
+                        format: int32
+                        type: integer
+                      enabled:
+                        type: boolean
+                      memoryLimitInMB:
+                        format: int32
+                        type: integer
+                      metricsAddress:
+                        type: string
+                      nodeListenerIP:
+                        type: string
+                      requiredPlugins:
+                        items:
+                          type: string
+                        type: array
+                    type: object
                   url:
                     description: |-
                       URL is a fully qualified download URL for the unbounded-agent
@@ -241,6 +289,273 @@ spec:
                 required:
                 - name
                 type: object
+              host:
+                description: |-
+                  Host contains desired host settings and exactly one optional host owner.
+                  New Machines should set one of Netboot, Azure, or External. Image alone
+                  may be used with deprecated ownership fields during migration.
+                properties:
+                  azure:
+                    description: Azure identifies an Azure VM managed by the built-in
+                      Azure provider.
+                    properties:
+                      resourceID:
+                        description: ResourceID is the full Azure Resource Manager
+                          ID of the virtual machine.
+                        minLength: 1
+                        type: string
+                    required:
+                    - resourceID
+                    type: object
+                    x-kubernetes-validations:
+                    - message: resourceID is immutable
+                      rule: self.resourceID == oldSelf.resourceID
+                  external:
+                    description: External identifies a host managed by a registered
+                      external provider.
+                    properties:
+                      machineRef:
+                        description: |-
+                          MachineRef identifies an optional provider-owned resource containing rich
+                          provider-specific state for this Machine.
+                        properties:
+                          apiGroup:
+                            description: APIGroup is the API group of the provider-owned
+                              Machine resource.
+                            minLength: 1
+                            type: string
+                          kind:
+                            description: Kind is the kind of the provider-owned Machine
+                              resource.
+                            minLength: 1
+                            type: string
+                          name:
+                            description: Name is the name of the cluster-scoped provider-owned
+                              Machine resource.
+                            minLength: 1
+                            type: string
+                        required:
+                        - apiGroup
+                        - kind
+                        - name
+                        type: object
+                      provider:
+                        description: Provider selects the registered provider controller
+                          and its credentials.
+                        minLength: 1
+                        type: string
+                      providerID:
+                        description: |-
+                          ProviderID is an opaque provider-specific host identifier. Providers that
+                          replace the underlying resource may update it after a successful handoff.
+                        type: string
+                    required:
+                    - provider
+                    type: object
+                    x-kubernetes-validations:
+                    - message: providerID or machineRef is required
+                      rule: has(self.providerID) || has(self.machineRef)
+                    - message: machineRef is immutable
+                      rule: has(self.machineRef) == has(oldSelf.machineRef) && (!has(self.machineRef)
+                        || self.machineRef == oldSelf.machineRef)
+                    - message: provider is immutable
+                      rule: self.provider == oldSelf.provider
+                  image:
+                    description: |-
+                      Image is an opaque provider-interpreted image identifier. If omitted,
+                      HostReplace preserves the host's current image.
+                    type: string
+                  netboot:
+                    description: |-
+                      Netboot contains the machine-specific network boot configuration owned by
+                      Metalman.
+                    properties:
+                      architecture:
+                        default: amd64
+                        description: |-
+                          Architecture is the target CPU architecture for PXE boot artifacts and
+                          machine images.
+                        enum:
+                        - amd64
+                        - arm64
+                        type: string
+                      bootProtocol:
+                        default: PXE
+                        description: |-
+                          BootProtocol selects how metalman should trigger network boot for
+                          repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
+                          HTTP boot with a URL derived from the netboot image metadata.
+                        enum:
+                        - PXE
+                        - HTTP
+                        type: string
+                      cloudInit:
+                        description: |-
+                          CloudInit contains optional cloud-init customization for PXE-booted
+                          machines.
+                        properties:
+                          userDataConfigMapRef:
+                            description: |-
+                              UserDataConfigMapRef references a ConfigMap containing custom
+                              cloud-init user-data. The referenced key (default "user-data")
+                              must contain a valid cloud-init configuration (e.g. a
+                              #cloud-config YAML document).
+                            properties:
+                              key:
+                                default: user-data
+                                description: Key within the ConfigMap.
+                                type: string
+                              name:
+                                description: Name of the ConfigMap.
+                                type: string
+                              namespace:
+                                description: Namespace of the ConfigMap.
+                                type: string
+                            required:
+                            - name
+                            - namespace
+                            type: object
+                        type: object
+                      dhcpLeases:
+                        description: |-
+                          DHCPLeases defines static IPv4 provisioning network settings. PXE boot
+                          uses them as DHCP leases. HTTP boot uses the first entry to configure the
+                          Redfish UEFI HTTP boot client.
+                        items:
+                          description: DHCPLease defines static IPv4 provisioning
+                            network settings.
+                          properties:
+                            dns:
+                              description: DNS is a list of DNS server addresses.
+                              items:
+                                type: string
+                              type: array
+                            gateway:
+                              description: Gateway is the default gateway.
+                              type: string
+                            ipv4:
+                              description: IPv4 is the IP address to assign.
+                              type: string
+                            mac:
+                              description: MAC is the MAC address of the network interface.
+                              type: string
+                            subnetMask:
+                              description: SubnetMask is the subnet mask for the lease.
+                              type: string
+                          required:
+                          - gateway
+                          - ipv4
+                          - mac
+                          - subnetMask
+                          type: object
+                        type: array
+                      image:
+                        description: |-
+                          Image is an OCI image reference containing the machine disk image.
+                          The image must contain /disk/disk.img.gz.
+                          Example: "ghcr.io/azure/host-ubuntu2404:v1"
+                        type: string
+                      netbootImage:
+                        description: |-
+                          NetbootImage is an OCI image reference containing the PXE boot
+                          artifacts used to install Image. When omitted, metalman uses the
+                          default netboot image that corresponds to its release.
+                        type: string
+                      netbootPullSecretRef:
+                        description: |-
+                          NetbootPullSecretRef references a Docker registry credential Secret used to
+                          pull NetbootImage. It is ignored when NetbootImage is omitted; metalman's
+                          configured default netboot pull secret is used for the default netboot image.
+                          The Secret must be type kubernetes.io/dockerconfigjson or
+                          kubernetes.io/dockercfg.
+                        properties:
+                          name:
+                            description: Name of the secret.
+                            minLength: 1
+                            type: string
+                          namespace:
+                            description: Namespace of the secret.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                      pullSecretRef:
+                        description: |-
+                          PullSecretRef references a Docker registry credential Secret used to pull
+                          Image. The Secret must be type kubernetes.io/dockerconfigjson or
+                          kubernetes.io/dockercfg.
+                        properties:
+                          name:
+                            description: Name of the secret.
+                            minLength: 1
+                            type: string
+                          namespace:
+                            description: Namespace of the secret.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                      redfish:
+                        description: Redfish configures optional Redfish BMC access.
+                        properties:
+                          deviceID:
+                            default: "1"
+                            description: DeviceID is the Redfish system device ID.
+                              Defaults to "1".
+                            type: string
+                          passwordRef:
+                            description: PasswordRef references a secret containing
+                              the Redfish password.
+                            properties:
+                              key:
+                                default: ssh-privatekey
+                                description: Key within the secret.
+                                type: string
+                              name:
+                                description: Name of the secret.
+                                type: string
+                              namespace:
+                                description: Namespace of the secret.
+                                type: string
+                            required:
+                            - name
+                            - namespace
+                            type: object
+                          url:
+                            description: URL is the Redfish endpoint URL.
+                            type: string
+                          username:
+                            description: Username is the Redfish username.
+                            type: string
+                        required:
+                        - passwordRef
+                        - url
+                        - username
+                        type: object
+                      targetDisk:
+                        description: |-
+                          TargetDisk is the block device the installer writes the machine image to.
+                          Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
+                          When omitted, the installer chooses a target disk automatically.
+                        type: string
+                    required:
+                    - image
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: at most one of netboot, azure, or external may be set
+                  rule: '(has(self.netboot) ? 1 : 0) + (has(self.azure) ? 1 : 0) +
+                    (has(self.external) ? 1 : 0) <= 1'
+                - message: netboot host ownership is immutable once set
+                  rule: '!has(oldSelf.netboot) || has(self.netboot)'
+                - message: azure host ownership is immutable once set
+                  rule: '!has(oldSelf.azure) || has(self.azure)'
+                - message: external host ownership is immutable once set
+                  rule: '!has(oldSelf.external) || has(self.external)'
               kubernetes:
                 description: Kubernetes contains Kubernetes-specific configuration.
                 properties:
@@ -289,25 +604,10 @@ spec:
                       Kubernetes version.
                     type: string
                 type: object
-              operations:
-                description: Operations contains counter-based operation triggers.
-                properties:
-                  rebootCounter:
-                    description: |-
-                      RebootCounter triggers a reboot when it exceeds the status
-                      reboot counter.
-                    format: int64
-                    type: integer
-                  repaveCounter:
-                    description: |-
-                      RepaveCounter triggers a repave when it exceeds the status
-                      repave counter.
-                    format: int64
-                    type: integer
-                type: object
               provider:
-                description: Provider identifies the external control provider for
-                  this machine.
+                description: |-
+                  Provider identifies the legacy external control provider for this machine.
+                  New callers should use Host.External.Provider or Host.Azure.
                 minLength: 1
                 type: string
               providerID:
@@ -315,9 +615,14 @@ spec:
                   ProviderID identifies the underlying infrastructure resource for this
                   machine, using a Kubernetes-style provider ID such as
                   azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
+
+                  This is a legacy field. New callers should use Host.External.ProviderID,
+                  Host.External.MachineRef, or Host.Azure.ResourceID.
                 type: string
               pxe:
-                description: PXE contains PXE boot configuration for the machine.
+                description: |-
+                  PXE contains legacy PXE boot configuration for the machine. New callers
+                  should use Host.Netboot.
                 properties:
                   architecture:
                     default: amd64
@@ -366,9 +671,13 @@ spec:
                         type: object
                     type: object
                   dhcpLeases:
-                    description: DHCPLeases defines static DHCP leases for PXE booting.
+                    description: |-
+                      DHCPLeases defines static IPv4 provisioning network settings. PXE boot
+                      uses them as DHCP leases. HTTP boot uses the first entry to configure the
+                      Redfish UEFI HTTP boot client.
                     items:
-                      description: DHCPLease defines a static DHCP lease for PXE booting.
+                      description: DHCPLease defines static IPv4 provisioning network
+                        settings.
                       properties:
                         dns:
                           description: DNS is a list of DNS server addresses.
@@ -567,6 +876,15 @@ spec:
                 - privateKeyRef
                 type: object
             type: object
+            x-kubernetes-validations:
+            - message: provider is immutable once set
+              rule: '!has(oldSelf.provider) || (has(self.provider) && self.provider
+                == oldSelf.provider)'
+            - message: host ownership cannot be combined with legacy pxe, provider,
+                or providerID fields
+              rule: '!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure)
+                && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider)
+                && !has(self.providerID))'
           status:
             description: MachineStatus defines the observed state of a Machine.
             properties:
@@ -660,20 +978,6 @@ spec:
               message:
                 description: Message provides additional status information.
                 type: string
-              operations:
-                description: Operations holds the last-observed operation counters.
-                properties:
-                  rebootCounter:
-                    description: RebootCounter is the last reboot counter value that
-                      was acted on.
-                    format: int64
-                    type: integer
-                  repaveCounter:
-                    description: RepaveCounter is the last repave counter value that
-                      was acted on.
-                    format: int64
-                    type: integer
-                type: object
               phase:
                 description: |-
                   Phase is the current phase of the machine. Intended for human

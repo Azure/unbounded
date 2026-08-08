@@ -32,7 +32,7 @@ set -euo pipefail
 : "${TAG:?TAG must be set}"
 : "${KUBECONFIG:?KUBECONFIG must be set}"
 
-NAMESPACES=(unbounded-kube unbounded-net)
+NAMESPACES=(unbounded-system)
 KUBECTL=(kubectl --request-timeout=30s)
 
 echo "Smoke: validate core namespaces and pod readiness for ${TAG}"

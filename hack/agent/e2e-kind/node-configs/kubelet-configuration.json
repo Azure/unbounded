@@ -1,0 +1,12 @@
+{
+  "name": "kubelet-configuration",
+  "nodeLabels": {
+    "e2e.unbounded-cloud.io/config": "kubelet-configuration"
+  },
+  "kubeletConfiguration": {
+    "maxPods": 42,
+    "imageGCHighThresholdPercent": 90,
+    "imageGCLowThresholdPercent": 80,
+    "serializeImagePulls": false
+  }
+}

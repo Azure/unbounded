@@ -2,12 +2,11 @@
 
 # Routing Flows
 
-This document describes the detailed packet-level routing flows for both the
-eBPF dataplane (default) and the netlink dataplane (legacy). It covers
-intra-site mesh traffic, cross-site gateway transit, reply-path symmetry, and
-protocol selection.
+This document describes the detailed packet-level routing flows for the eBPF
+dataplane. It covers intra-site mesh traffic, cross-site gateway transit,
+reply-path symmetry, and protocol selection.
 
-## eBPF Dataplane Mode (default)
+## eBPF Dataplane
 
 The eBPF dataplane uses a single TC egress BPF program (`unbounded_encap`)
 attached to the `unbounded0` dummy interface. All overlay traffic is attracted
@@ -432,7 +431,7 @@ results. During nexthop selection:
 The `unroute` CLI displays per-nexthop health state in the HEALTHY column:
 
 ```
-kubectl exec -n unbounded-net <pod> -c node -- unroute
+kubectl exec -n unbounded-system <pod> -c node -- unroute
 ```
 
 Output includes a HEALTHY column showing `Y` (healthy) or `N` (unhealthy) for
@@ -582,8 +581,6 @@ returns `WireGuard`.
 | BPF program              | `bpf/unbounded_encap.c`                                   |
 | BPF map management       | `internal/net/ebpf/tunnel_map.go`                                  |
 | eBPF tunnel setup        | `cmd/unbounded-net-node/ebpf_geneve_config.go`            |
-| Netlink GENEVE/IPIP      | `cmd/unbounded-net-node/geneve_config.go`                 |
-| Netlink VXLAN            | `cmd/unbounded-net-node/vxlan_config.go`                  |
 | WireGuard config         | `cmd/unbounded-net-node/wireguard_config.go`              |
 | Gateway policy routing   | `pkg/netlink/gateway_policy_manager.go`                   |
 | Route manager            | `pkg/netlink/route_manager.go`                            |

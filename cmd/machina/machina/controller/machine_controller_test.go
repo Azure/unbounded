@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // ---------------------------------------------------------------------------
@@ -98,7 +99,7 @@ func newSSHKeySecret(t *testing.T, name string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: SecretNamespaceUnboundedKube,
+			Namespace: unbounded.SystemNamespace(),
 		},
 		Data: map[string][]byte{
 			"ssh-privatekey": generateTestSSHKeyPEM(t),
@@ -765,7 +766,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "unbounded-kube"},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: unbounded.SystemNamespace()},
 			Data:       map[string][]byte{"custom-key": []byte("secret-value")},
 		}
 
@@ -781,7 +782,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "unbounded-kube"},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: unbounded.SystemNamespace()},
 			Data:       map[string][]byte{"ssh-privatekey": []byte("my-key")},
 		}
 
@@ -808,7 +809,7 @@ func TestGetSecretValue(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: "unbounded-kube"},
+			ObjectMeta: metav1.ObjectMeta{Name: "my-secret", Namespace: unbounded.SystemNamespace()},
 			Data:       map[string][]byte{"other-key": []byte("value")},
 		}
 
@@ -937,7 +938,7 @@ func TestBuildSSHConfig(t *testing.T) {
 		t.Parallel()
 
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "ssh-key-secret", Namespace: "unbounded-kube"},
+			ObjectMeta: metav1.ObjectMeta{Name: "ssh-key-secret", Namespace: unbounded.SystemNamespace()},
 			Data:       map[string][]byte{"ssh-privatekey": []byte("not-a-valid-key")},
 		}
 

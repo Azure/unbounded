@@ -14,6 +14,10 @@ on:
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - hack/metalman-redfish-fixture.py
+      - hack/smoke-metalman-http.py
+      - hack/smoke-metalman.py
+      - .github/workflows/smoke-metalman.yaml
   push:
     branches: [main]
     paths:
@@ -25,6 +29,10 @@ on:
       - images/agent-ubuntu2404/**
       - images/host-ubuntu2404/**
       - images/netboot/**
+      - hack/metalman-redfish-fixture.py
+      - hack/smoke-metalman-http.py
+      - hack/smoke-metalman.py
+      - .github/workflows/smoke-metalman.yaml
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -33,7 +41,7 @@ permissions:
   contents: read
 
 jobs:
-  smoke:
+  pxe-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -50,7 +58,7 @@ jobs:
           wait
           df -h /
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Enable KVM
         run: |
@@ -59,7 +67,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -73,17 +81,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          # Install sushy-tools via pip in the background while apt-get
-          # installs system packages.  pip3 is already available on the
-          # runner image so this does not depend on apt-get.
-          sudo pip3 install --break-system-packages --ignore-installed sushy-tools &
-          PIP_PID=$!
           sudo apt-get install -y --no-install-recommends \
             dnsmasq qemu-kvm libvirt-daemon-system libvirt-clients virtinst \
             ovmf qemu-utils swtpm swtpm-tools \
-            python3-pip python3-yaml cpio iptables
+            python3-yaml cpio iptables
           sudo systemctl start libvirtd
-          wait "$PIP_PID"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -139,3 +141,96 @@ jobs:
           sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
           sudo -E env "PATH=$PATH" \
             python3 hack/smoke-metalman.py
+
+  layered-http-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet \
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL &
+          sudo docker image prune -af &
+          wait
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Cache apt packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives
+          key: apt-smoke-http-noble-${{ hashFiles('.github/workflows/smoke-metalman.yaml') }}
+          restore-keys: apt-smoke-http-noble-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-kvm libvirt-daemon-system libvirt-clients ovmf qemu-utils \
+            swtpm swtpm-tools python3-yaml cpio iptables tcpdump dnsmasq \
+            dosfstools mtools curl
+          sudo systemctl start libvirtd
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: network=host
+
+      - name: Build host-ubuntu2404 image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: images/host-ubuntu2404/Containerfile
+          load: true
+          tags: localhost:5556/unbounded/host-ubuntu2404:http-smoke
+          cache-from: type=gha,scope=host-ubuntu2404
+          cache-to: type=gha,mode=max,scope=host-ubuntu2404
+          provenance: false
+
+      - name: Build netboot image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: images/netboot/Containerfile
+          load: true
+          tags: localhost:5556/unbounded/netboot:http-smoke
+          cache-from: type=gha,scope=netboot
+          cache-to: type=gha,mode=max,scope=netboot
+          provenance: false
+
+      - name: Build agent image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: images/agent-ubuntu2404
+          file: images/agent-ubuntu2404/Containerfile
+          load: true
+          tags: localhost:5556/unbounded/agent-ubuntu2404:http-smoke
+          cache-from: type=gha,scope=agent-ubuntu2404
+          cache-to: type=gha,mode=max,scope=agent-ubuntu2404
+          provenance: false
+
+      - name: Create kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          cluster_name: kind
+          # Each job has an isolated runner, so both can use the same smoke SAN.
+          config: hack/kind-smoke-config.yaml
+
+      - name: Run layered DHCP-free HTTP smoke test
+        run: |
+          sudo mkdir -p /root/.kube
+          sudo cp "${KUBECONFIG:-$HOME/.kube/config}" /root/.kube/config
+          sudo -E env "PATH=$PATH" KUBECONFIG=/root/.kube/config \
+            python3 hack/smoke-metalman-http.py
