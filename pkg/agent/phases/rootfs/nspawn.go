@@ -101,6 +101,7 @@ type nspawnTemplateData struct {
 	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount
 	NvidiaI386LibDirMounts []goalstates.NvidiaLibDirMount
 	NvidiaBinDir           string
+	NvidiaEnabled          bool
 	AMDGPUDevicePaths      []string
 	AMDSysFSPaths          []string
 }
@@ -136,6 +137,7 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       e.goalState.Nvidia.I386LibDirMounts,
 		NvidiaBinDir:                 nvidiaHostBinDir(e.goalState.Nvidia),
+		NvidiaEnabled:                nvidiaSetupEnabled(e.goalState.Nvidia),
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                e.goalState.AMD.SysFSPaths,
 	}
@@ -186,6 +188,10 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 	}
 
 	return nil
+}
+
+func nvidiaSetupEnabled(nvidia goalstates.NvidiaHost) bool {
+	return len(nvidia.GPUDevicePaths) > 0 && len(nvidia.LibMappings) > 0
 }
 
 func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {

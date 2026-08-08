@@ -201,6 +201,7 @@ func (c *configureKubelet) ensureKubeletServiceUnit() error {
 	if err := assetsTemplate.ExecuteTemplate(buf, "kubelet.service", map[string]any{
 		"KubeletBinPath":           spec.KubeletBinPath,
 		"KubeletConfigurationPath": goalstates.KubeletConfigurationPath,
+		"NvidiaEnabled":            nvidiaSetupEnabled(c.goalState),
 	}); err != nil {
 		return err
 	}

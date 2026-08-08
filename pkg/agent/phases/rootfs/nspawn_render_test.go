@@ -319,6 +319,32 @@ func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
 	require.NotContains(t, buf.String(), "DeviceAllow=")
 }
 
+func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", nspawnTemplateData{
+		MachineName:    "kube1",
+		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
+		NvidiaEnabled:  true,
+	}))
+
+	require.Contains(t, buf.String(),
+		"exec /usr/local/bin/unbounded-agent-current reconcile-nvidia kube1")
+}
+
+func TestServiceOverride_CPUNodesDoNotReconcileNVIDIA(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", nspawnTemplateData{
+		MachineName:    "kube1",
+		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
+	}))
+
+	require.NotContains(t, buf.String(), "reconcile-nvidia")
+}
+
 func nspawnRenderScenarioData() nspawnTemplateData {
 	return nspawnTemplateData{
 		MachineName:                  "kube1",

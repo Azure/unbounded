@@ -31,6 +31,7 @@ func Run() {
 		newCmdReset(cmdCtx),
 		newCmdVersion(),
 		newCmdRecordAgentUpgradeFailureSignal(),
+		newCmdReconcileNVIDIA(cmdCtx),
 	)
 
 	if err := root.Execute(); err != nil {

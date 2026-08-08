@@ -68,7 +68,7 @@ func (s *setupNVIDIA) Do(ctx context.Context) error {
 		return err
 	}
 
-	return nil
+	return s.markReady(ctx)
 }
 
 func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
@@ -115,6 +115,22 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	s.log.Info("NVIDIA library symlinks created and ldconfig updated",
 		slog.Int("count", len(libs)),
 	)
+
+	return nil
+}
+
+func (s *setupNVIDIA) markReady(ctx context.Context) error {
+	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
+		"mkdir", "-p", filepath.Dir(goalstates.NVIDIAReadyPath),
+	); err != nil {
+		return fmt.Errorf("create NVIDIA ready directory: %w", err)
+	}
+
+	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
+		"touch", goalstates.NVIDIAReadyPath,
+	); err != nil {
+		return fmt.Errorf("mark NVIDIA runtime ready: %w", err)
+	}
 
 	return nil
 }
