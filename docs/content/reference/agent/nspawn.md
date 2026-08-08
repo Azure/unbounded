@@ -175,7 +175,9 @@ The configuration is written to two files on the host before the machine boots:
 | bpffs `ExecStartPre=` mount commands | Service override | Creates and mounts the machine-scoped host bpffs before the machine starts. |
 | `SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1` | Service override | Forces cgroups v2 inside the container. |
 | `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network` | Service override | Makes `/proc/sys/net` writable for CNI and kube-proxy. |
+| `DeviceAllow=char-ipvtap rwm` / `DeviceAllow=char-macvtap rwm` | Service override | Allows network tooling inside the node to create and use ipvtap and macvtap devices. |
 | `Bind=/dev/kvm` | nspawn config | KVM device bind-mount (auto-generated when `/dev/kvm` is present). |
+| `Bind=/dev/net/tun` / `DeviceAllow=/dev/net/tun rwm` | Both | Exposes the generic TUN/TAP device when it is present on the host. |
 | `Bind=<block device>` | nspawn config | Storage block device bind-mount (auto-generated for non-virtual `/sys/class/block` entries, including partitions, `dm-*`, and `md*`). |
 | `Bind=/dev/infiniband/*` | nspawn config | InfiniBand HCA device bind-mount (auto-generated when `/dev/infiniband` devices are present). |
 | `Bind=<configured /dev path>` | nspawn config | Additional host device bind-mount (configured with agent config `AdditionalHostDevices`). |
