@@ -42,3 +42,6 @@ ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube2
 ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube2 || /usr/bin/mount -t bpf bpf /run/bpffs/kube2'
 Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
 Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=network
+
+DeviceAllow=char-ipvtap rwm
+DeviceAllow=char-macvtap rwm
