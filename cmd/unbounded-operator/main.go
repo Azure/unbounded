@@ -6,11 +6,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 
+	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -25,7 +27,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -140,7 +141,11 @@ func resolveAPIServerEndpoint(ctx context.Context, override string, clientset ku
 }
 
 func run(ctx context.Context, cfg config) error {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	// Route controller-runtime's logr logging through slog, consistent with the
+	// rest of the repo (metalman, agent). slog.Default() is an Info-level
+	// handler, so logr V(1)+ maps to sub-Info slog levels and is suppressed by
+	// default.
+	ctrl.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
 
 	scheme := runtimeScheme()
 
