@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/fstest"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +26,61 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
+
+// TestApplyManifestFSSkipsNamespace asserts the operator apply path never writes
+// the shared system Namespace object: it is owned solely by the operator's
+// namespace bootstrap, so components that ship it in their manifests (for the
+// standalone kubectl-apply path) must not clobber it. The skip is scoped by
+// name, so any other Namespace object is still applied.
+func TestApplyManifestFSSkipsNamespace(t *testing.T) {
+	manifests := fstest.MapFS{
+		"00-namespace.yaml":       {Data: []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: unbounded-system\n")},
+		"05-other-namespace.yaml": {Data: []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: other-ns\n")},
+		"10-configmap.yaml":       {Data: []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\n  namespace: unbounded-system\n")},
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+
+	applied := map[string]bool{}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+			o, ok := obj.(interface {
+				GetKind() string
+				GetName() string
+			})
+			if !ok {
+				t.Fatalf("unexpected apply type %T", obj)
+			}
+
+			applied[o.GetKind()+"/"+o.GetName()] = true
+
+			return nil
+		},
+	}).Build()
+
+	env := &Env{Client: cl, Scheme: scheme, Namespace: BuildDefaultNamespace}
+	if err := env.ApplyManifestFS(context.Background(), manifests, nil); err != nil {
+		t.Fatalf("ApplyManifestFS: %v", err)
+	}
+
+	if applied["Namespace/unbounded-system"] {
+		t.Fatal("shared system Namespace object must be skipped by the operator apply path")
+	}
+
+	// A Namespace that is not the shared system namespace must still be applied:
+	// the skip is scoped by name so a future component that needs a distinct
+	// namespace is not silently dropped.
+	if !applied["Namespace/other-ns"] {
+		t.Fatalf("non-system Namespace object should be applied; applied=%#v", applied)
+	}
+
+	if !applied["ConfigMap/demo"] {
+		t.Fatalf("non-Namespace object should be applied; applied=%#v", applied)
+	}
+}
 
 func TestConfigImage(t *testing.T) {
 	cases := []struct {

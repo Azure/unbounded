@@ -35,7 +35,7 @@ const (
 	// apply phase while CRDBootstrapTimeout bounds the complete operation.
 	crdEstablishedTimeout = 2 * time.Minute
 
-	defaultCRDMaintenanceInterval = time.Minute
+	defaultBootstrapMaintenanceInterval = time.Minute
 )
 
 // CRDBootstrapTimeout bounds the complete CRD bootstrap, including manifest
@@ -78,36 +78,52 @@ func BootstrapCRDs(ctx context.Context, c client.Client) error {
 	return bootstrapCRDs(ctx, c, CRDBootstrapTimeout)
 }
 
-// CRDMaintainer periodically reapplies the operator-owned CRDs using an
-// uncached client. Maintenance failures are logged and retried on the next
-// interval; they never stop the manager. CRDs that are already established stay
-// served by the apiserver regardless of the operator's liveness, so stopping on
-// maintenance failures would needlessly take down the Site reconciler and the
-// migration reaper for what is typically a transient apiserver blip.
-type CRDMaintainer struct {
+// BootstrapAll applies the operator-owned bootstrap resources in order: the
+// shared system namespace (canonical identity + Pod Security Admission labels)
+// followed by the CRDs. It is idempotent and is the single bootstrap entry point
+// shared by operator startup and the periodic BootstrapMaintainer.
+func BootstrapAll(ctx context.Context, c client.Client, namespace string) error {
+	if err := BootstrapNamespace(ctx, c, namespace); err != nil {
+		return fmt.Errorf("bootstrap namespace: %w", err)
+	}
+
+	return BootstrapCRDs(ctx, c)
+}
+
+// BootstrapMaintainer periodically reapplies the operator-owned bootstrap
+// resources (the shared system namespace and the CRDs) using an uncached client.
+// Maintenance failures are logged and retried on the next interval; they never
+// stop the manager. CRDs that are already established stay served by the
+// apiserver regardless of the operator's liveness, so stopping on maintenance
+// failures would needlessly take down the Site reconciler and the migration
+// reaper for what is typically a transient apiserver blip.
+type BootstrapMaintainer struct {
 	Client    client.Client
+	Namespace string
 	Interval  time.Duration
 	Bootstrap func(context.Context, client.Client) error
 }
 
-// NeedLeaderElection ensures only the elected operator replica maintains CRDs.
-func (*CRDMaintainer) NeedLeaderElection() bool { return true }
+// NeedLeaderElection ensures only the elected operator replica runs maintenance.
+func (*BootstrapMaintainer) NeedLeaderElection() bool { return true }
 
-// Start runs CRD maintenance until the manager stops (context cancellation).
-// Maintenance failures are logged and retried on the next interval; they do not
-// stop the manager.
-func (m *CRDMaintainer) Start(ctx context.Context) error {
+// Start runs bootstrap maintenance until the manager stops (context
+// cancellation). Maintenance failures are logged and retried on the next
+// interval; they do not stop the manager.
+func (m *BootstrapMaintainer) Start(ctx context.Context) error {
 	interval := m.Interval
 	if interval <= 0 {
-		interval = defaultCRDMaintenanceInterval
+		interval = defaultBootstrapMaintenanceInterval
 	}
 
 	bootstrap := m.Bootstrap
 	if bootstrap == nil {
-		bootstrap = BootstrapCRDs
+		bootstrap = func(ctx context.Context, c client.Client) error {
+			return BootstrapAll(ctx, c, m.Namespace)
+		}
 	}
 
-	logger := log.FromContext(ctx).WithName("crd-maintainer")
+	logger := log.FromContext(ctx).WithName("bootstrap-maintainer")
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -126,7 +142,7 @@ func (m *CRDMaintainer) Start(ctx context.Context) error {
 
 				failures++
 
-				logger.Error(err, "CRD maintenance failed; will retry on the next interval", "consecutiveFailures", failures)
+				logger.Error(err, "bootstrap maintenance failed; will retry on the next interval", "consecutiveFailures", failures)
 
 				continue
 			}

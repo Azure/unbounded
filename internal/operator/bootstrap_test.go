@@ -19,18 +19,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-func TestCRDMaintainerNeedsLeaderElection(t *testing.T) {
-	if !(&CRDMaintainer{}).NeedLeaderElection() {
-		t.Fatal("CRDMaintainer must require leader election")
+func TestBootstrapMaintainerNeedsLeaderElection(t *testing.T) {
+	if !(&BootstrapMaintainer{}).NeedLeaderElection() {
+		t.Fatal("BootstrapMaintainer must require leader election")
 	}
 }
 
-func TestCRDMaintainerInvokesBootstrap(t *testing.T) {
+func TestBootstrapMaintainerInvokesBootstrap(t *testing.T) {
 	cli := fake.NewClientBuilder().Build()
 	ctx, cancel := context.WithCancel(context.Background())
 	called := make(chan struct{})
 
-	maintainer := &CRDMaintainer{
+	maintainer := &BootstrapMaintainer{
 		Client:   cli,
 		Interval: time.Millisecond,
 		Bootstrap: func(_ context.Context, got client.Client) error {
@@ -52,16 +52,16 @@ func TestCRDMaintainerInvokesBootstrap(t *testing.T) {
 	select {
 	case <-called:
 	default:
-		t.Fatal("CRDMaintainer did not invoke Bootstrap")
+		t.Fatal("BootstrapMaintainer did not invoke Bootstrap")
 	}
 }
 
-func TestCRDMaintainerCancellation(t *testing.T) {
+func TestBootstrapMaintainerCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	called := false
-	maintainer := &CRDMaintainer{
+	maintainer := &BootstrapMaintainer{
 		Interval: time.Hour,
 		Bootstrap: func(context.Context, client.Client) error {
 			called = true
@@ -79,14 +79,14 @@ func TestCRDMaintainerCancellation(t *testing.T) {
 	}
 }
 
-func TestCRDMaintainerKeepsRetryingOnPersistentFailureWithoutStopping(t *testing.T) {
+func TestBootstrapMaintainerKeepsRetryingOnPersistentFailureWithoutStopping(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	wantErr := errors.New("apply failed")
 	calls := make(chan struct{}, 16)
 
-	maintainer := &CRDMaintainer{
+	maintainer := &BootstrapMaintainer{
 		Interval: time.Millisecond,
 		Bootstrap: func(context.Context, client.Client) error {
 			select {
@@ -119,7 +119,7 @@ func TestCRDMaintainerKeepsRetryingOnPersistentFailureWithoutStopping(t *testing
 	}
 }
 
-func TestCRDMaintainerRetriesTransientFailureWithoutCrashing(t *testing.T) {
+func TestBootstrapMaintainerRetriesTransientFailureWithoutCrashing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -127,7 +127,7 @@ func TestCRDMaintainerRetriesTransientFailureWithoutCrashing(t *testing.T) {
 	recovered := make(chan struct{})
 	calls := 0
 
-	maintainer := &CRDMaintainer{
+	maintainer := &BootstrapMaintainer{
 		Interval: time.Millisecond,
 		Bootstrap: func(context.Context, client.Client) error {
 			calls++

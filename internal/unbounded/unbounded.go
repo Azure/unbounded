@@ -54,3 +54,53 @@ const (
 func IsLegacyNamespace(ns string) bool {
 	return ns == LegacyKubeNamespace || ns == LegacyNetNamespace
 }
+
+const (
+	// SystemNamespaceAppName is the canonical value of the app.kubernetes.io/name
+	// label on the shared system namespace. Every component's manifest template
+	// declares this single value (rather than a per-component name) so the
+	// operator-owned namespace has one stable identity instead of a label that
+	// churns as each component reapplies it.
+	SystemNamespaceAppName = "unbounded-cloud"
+
+	// SystemNamespaceManagedBy is the value of the app.kubernetes.io/managed-by
+	// label on the shared system namespace.
+	SystemNamespaceManagedBy = "unbounded-operator"
+
+	// SystemNamespacePSAEnforce is the Pod Security Admission enforce level for
+	// the shared system namespace. The privileged workloads that run here
+	// (net-node hostNetwork, storage hostPath, gantry containerd socket and
+	// /etc/containerd/certs.d hostPath) require the privileged level; a stricter
+	// level would reject them at admission.
+	SystemNamespacePSAEnforce = "privileged"
+
+	// SystemNamespacePSAEnforceVersion pins the Pod Security Standard version the
+	// enforce level is evaluated against. "latest" tracks the cluster's current
+	// version; privileged is the most permissive level, so version drift is
+	// low-risk.
+	SystemNamespacePSAEnforceVersion = "latest"
+)
+
+// Well-known label keys stamped on the shared system namespace. They are the
+// only keys the operator manages on the namespace; see SystemNamespaceLabels.
+const (
+	appNameLabelKey           = "app.kubernetes.io/name"
+	appManagedByLabelKey      = "app.kubernetes.io/managed-by"
+	psaEnforceLabelKey        = "pod-security.kubernetes.io/enforce"
+	psaEnforceVersionLabelKey = "pod-security.kubernetes.io/enforce-version"
+)
+
+// SystemNamespaceLabels returns the canonical label set the operator stamps on
+// the shared system namespace. It is the single source of truth shared by the
+// operator's namespace bootstrap and the manifest-template drift guard, so the
+// Go-side owner and the rendered templates cannot diverge. The operator applies
+// these keys authoritatively (server-side apply, granular per-key ownership) and
+// leaves every other label and annotation on the namespace untouched.
+func SystemNamespaceLabels() map[string]string {
+	return map[string]string{
+		appNameLabelKey:           SystemNamespaceAppName,
+		appManagedByLabelKey:      SystemNamespaceManagedBy,
+		psaEnforceLabelKey:        SystemNamespacePSAEnforce,
+		psaEnforceVersionLabelKey: SystemNamespacePSAEnforceVersion,
+	}
+}

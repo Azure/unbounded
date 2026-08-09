@@ -301,6 +301,15 @@ func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 	if applied["ConfigMap/gantry-config"] {
 		t.Fatal("gantry-config ConfigMap should be reconciled separately, not applied")
 	}
+
+	// The shared system namespace is owned by the operator's namespace
+	// bootstrap; a component reconcile must never apply (and clobber) it, even
+	// though gantry ships a Namespace doc for the standalone kubectl-apply path.
+	for key := range applied {
+		if strings.HasPrefix(key, "Namespace/") {
+			t.Fatalf("component reconcile applied a Namespace object %q; it must be skipped", key)
+		}
+	}
 }
 
 func TestReconcileFailsWhenLegacyNodeConfigCleanupFails(t *testing.T) {

@@ -167,17 +167,18 @@ func run(ctx context.Context, cfg config) error {
 
 	cfg.apiServerEndpoint = apiServerEndpoint
 
-	// Install/upgrade the CRDs before starting the manager: the typed Site
-	// informer cannot sync until the Site CRD is served, and the operator owns
-	// CRD lifecycle so a cluster can be maintained by applying the operator
-	// manifests alone. This runs on every start and is idempotent.
+	// Install/upgrade the operator-owned resources before starting the manager:
+	// the shared system namespace (labels + Pod Security Admission) and the CRDs.
+	// The typed Site informer cannot sync until the Site CRD is served, and the
+	// operator owns this lifecycle so a cluster can be maintained by applying the
+	// operator manifests alone. This runs on every start and is idempotent.
 	bootstrapClient, err := client.New(restConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		return fmt.Errorf("create bootstrap client: %w", err)
 	}
 
-	if err := operator.BootstrapCRDs(ctx, bootstrapClient); err != nil {
-		return fmt.Errorf("bootstrap CRDs: %w", err)
+	if err := operator.BootstrapAll(ctx, bootstrapClient, namespace); err != nil {
+		return fmt.Errorf("bootstrap operator resources: %w", err)
 	}
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
@@ -193,8 +194,8 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
-	if err := mgr.Add(&operator.CRDMaintainer{Client: bootstrapClient}); err != nil {
-		return fmt.Errorf("add CRD maintainer: %w", err)
+	if err := mgr.Add(&operator.BootstrapMaintainer{Client: bootstrapClient, Namespace: namespace}); err != nil {
+		return fmt.Errorf("add bootstrap maintainer: %w", err)
 	}
 
 	if err := (&operator.SiteReconciler{
