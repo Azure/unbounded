@@ -207,6 +207,28 @@ field restriction can achieve.
 | `metalman` | `HostNetwork: true` (`metalman.go:165`) |
 | `gantry` | `hostNetwork: false` by deliberate design decision, one hostPath cache mount (`daemonset.yaml.tmpl:99`, `:284`) |
 
+**3.9 Apply is not transactional.** `applyManifestData` writes object by object
+in a loop (`env.go:202-237`), and each `ApplyObject` is an independent API call.
+There is no batch, no transaction, and no rollback. An API or admission failure
+on the fifth object leaves the first four updated. Any design that promises
+all-or-nothing across objects is promising something Kubernetes does not offer.
+
+**3.10 Components do more than apply objects.** Reconciliation is not reducible
+to "produce objects, apply them". The existing components perform at least five
+other kinds of operation:
+
+| Operation | Example |
+|---|---|
+| Create-if-absent, preserving user data | `ensureConfig` (`storage.go:115-154`, `net.go:156-187`) |
+| Adopt via optimistic-lock merge patch | `adoptConfig` (`storage.go:156-170`) |
+| Delete | `Cleanup` (`storage.go:78-90`), `cleanupLegacyNodeConfig` (`gantry.go:170-178`) |
+| Conditional retention | `resourcesExist` (`machina.go:57-69`) |
+| Shared objects rendered per Site | metalman RBAC (`metalman.go:45`), identical for every Site |
+
+Ordering also matters: `ensureConfig` returns the hash that the workload's pod
+template carries, so the ConfigMap must exist before the workload that
+references it.
+
 ## 4. Security model
 
 ### 4.1 Threat model
@@ -284,48 +306,68 @@ operator namespace:
 
 | Role | Grant | Assessment |
 |---|---|---|
-| `machina-controller` | `configmaps`, all verbs, no `resourceNames`, no admission constraint (`deploy/machina/02-rbac.yaml.tmpl:15-17`) | **Over-granted.** Can write the overrides ConfigMap. |
+| `machina-controller` | `configmaps`, all verbs, no `resourceNames` (`deploy/machina/02-rbac.yaml.tmpl:15-17`) | **Over-granted, and unused.** See below. |
 | `metalman-controller` | `configmaps` `["get","list","watch"]` in the operator namespace; `resourceNames: ["cluster-info","aks-cluster-metadata"]` with `["get"]` in `kube-public` (`06-metalman-rbac.yaml.tmpl:59-61`, `:132-133`) | Read-only. Not a vector. |
-| `unbounded-net-controller` | `configmaps` `["create"]` namespace-wide, plus `resourceNames: ["unbounded-net-serving-ca"]` for `["get","update","patch"]` (`net/controller/02-rbac.yaml.tmpl:169-176`) | Constrained. See below. |
+| `unbounded-net-controller` | `configmaps` `["create"]` namespace-wide, plus `resourceNames: ["unbounded-net-serving-ca"]` for `["get","update","patch"]` (`net/controller/02-rbac.yaml.tmpl:169-176`) | Constrained at admission. Not a vector. |
 
 `unbounded-net-controller` holds namespace-wide `create` because RBAC cannot
-scope that verb, but it is already constrained at admission by
+scope that verb: the authorizer has no object name to match against on a create
+request. It is constrained instead by
 `deploy/net/controller/09-vap.yaml.tmpl`, a `ValidatingAdmissionPolicy` with
 `failurePolicy: Fail` that rejects any ConfigMap create from that ServiceAccount
 not named `unbounded-net-serving-ca`. It cannot create the overrides ConfigMap.
 
-So the exposure is `machina-controller` alone: a compromised machina controller
-can write the overrides ConfigMap and cause the operator to deploy arbitrary
-code on every node. This is a pre-existing over-grant that this design makes
-materially more dangerous.
+**The machina grant is dead permission.** The machina controller makes exactly
+one ConfigMap API call in the entire codebase:
 
-**The gap is closable, and the project has already solved it once.** The comment
-at the head of `09-vap.yaml.tmpl` states the problem exactly:
+```
+cmd/machina/machina/controller/cluster_info.go:63
+    k.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(ctx, "kube-root-ca.crt", ...)
+```
 
-> RBAC cannot scope the "create" verb by resourceNames, so this VAP ensures the
-> controller can only create resources with the expected names.
+That is a read, in `kube-public`, and it is already served by machina's
+**ClusterRole**, which grants `configmaps: ["get"]` cluster-wide
+(`02-rbac.yaml.tmpl:77-80`). Nothing uses the namespaced Role's ConfigMap verbs:
 
-The same pattern applies here. Hardening machina has two parts, and both are
-**blocking prerequisites** rather than independent work, because the feature
-widens an exposure that the hardening removes:
+- `machina-config` reaches the pod as a **volume mount**. The kubelet performs
+  the mount; the pod's ServiceAccount needs no RBAC for it.
+- Leader election uses **Leases**, which have their own rule in the same Role.
 
-1. Narrow the machina Role to `resourceNames` for `get`, `update`, `patch`, and
-   `delete`, matching the shape already used for net.
-2. Add a `ValidatingAdmissionPolicy` restricting machina's ConfigMap `create` to
-   the names it legitimately creates, modelled directly on
-   `09-vap.yaml.tmpl`.
+The fix is therefore to **delete the grant**, not to constrain it. That is
+strictly better than the alternatives:
 
-With both in place, no component ServiceAccount can create or modify the
+| Option | Cost |
+|---|---|
+| **Delete the unused grant** | None. Removes machinery. |
+| Narrow to `resourceNames`, drop `create` | Keeps a grant nothing uses. |
+| Keep the grant, add a machina VAP | Requires `ValidatingAdmissionPolicy`, stable only in Kubernetes 1.30, against a documented baseline of 1.24+. |
+
+With the grant removed, no component ServiceAccount can create or modify the
 overrides ConfigMap. Write access is then held only by principals a cluster
 administrator has granted it to, which is the posture
-[§4.3](#43-required-posture-for-cluster-operators) requires.
+[§4.3](#43-required-posture-for-cluster-operators) requires. This is a blocking
+prerequisite ([§14](#14-implementation-plan)), because the feature widens an
+exposure that removing the grant eliminates.
+
+**Verification is required before deletion.** Removing RBAC fails at runtime,
+not at build or test time, so the hardening change must be exercised against a
+live cluster in `e2e/` rather than justified by a code search alone. If
+something does depend on the grant, narrowing plus a VAP is the documented
+fallback, and the Kubernetes baseline question returns with it.
 
 **This resolves the ConfigMap versus dedicated-resource question.** An earlier
 revision argued that only a dedicated resource type could scope `create`, and
-recorded the choice as an open question on that basis. That argument was wrong:
-admission policy scopes `create` by name, the repository already relies on this,
-and a dedicated resource type is therefore not required to reach the same
-posture. The ConfigMap is retained.
+recorded the choice as an open question on that basis. That argument was wrong
+twice over: admission policy scopes `create` by name and the repository already
+relies on it, and in this specific case no `create` grant needs to exist at all.
+The ConfigMap is retained.
+
+**Out of scope, but worth raising separately.** The documented Kubernetes
+baseline of 1.24+
+(`docs/content/reference/networking/operations.md:15`) is already stale
+independently of this design: the operator installs `09-vap.yaml.tmpl`
+unconditionally, and `ValidatingAdmissionPolicy` is not stable before 1.30. That
+is a pre-existing documentation defect and should be filed on its own.
 
 ## 5. Alternatives considered
 
@@ -495,7 +537,9 @@ overrides:
 | `component` | yes | One of `net`, `machina`, `gantry`, `metalman`, `storage`. Matched against `ClusterComponent.Name()` / `SiteComponent.Name()`. |
 | `kind` | yes | `Deployment` or `DaemonSet`. |
 | `sites` | no | Per-Site components only. Absent matches every Site. An explicitly empty list is a validation error. Rejected on `net`, `machina`, and `gantry`. |
-| `extraArgs` | no | Map of container name to arguments appended after the patch merges. See [§7.2](#72-extraargs). |
+| `addContainers` | no | Names of containers the entry intends to **create** rather than modify. See [§8.2](#82-adding-containers-requires-explicit-intent). |
+| `addInitContainers` | no | As `addContainers`, for `initContainers`. The two lists are separate because the merge keys are separate. |
+| `extraArgs` | no | Map of container name to arguments appended after the patch merges. Names must resolve to a container that exists or is being added. See [§7.2](#72-extraargs). |
 | `patch` | no | Strategic merge patch applied to the whole workload object. See [§7](#7-merge-semantics). |
 
 `component` plus `kind` uniquely identifies every workload the operator emits
@@ -504,7 +548,26 @@ to reconstruct derived names such as `unbounded-storage-<site>`.
 
 At least one of `patch` and `extraArgs` must be present.
 
-### 6.2 Resolution
+### 6.2 Parsing rules
+
+The `apiVersion` gate is only meaningful if parsing is deterministic, so the
+rules are fixed rather than inherited from whichever YAML library is used:
+
+| Rule | Behaviour |
+|---|---|
+| Unknown fields | **Rejected.** Strict decoding at every level, including inside `patch`, where an unknown field means a path outside the allowlist. |
+| Duplicate keys | **Rejected.** YAML permits them and most decoders silently take the last; a duplicate `patch` key would silently discard the first. |
+| Documents per key | **Exactly one.** A `---` separator producing a second document is rejected rather than the remainder being ignored. |
+| Trailing content | **Rejected**, for the same reason. |
+| YAML merge keys (`<<`) | **Rejected.** Anchor and alias expansion would let a document reference content the allowlist walker never visits. |
+| Anchors and aliases | Permitted only where expansion is fully resolved before validation, so the allowlist sees the expanded document. |
+| Empty or whitespace-only key | Ignored, not an error. `kubectl create configmap --from-file` on an empty file is a plausible accident, not an intent. |
+
+All of these are document-level failures per
+[§9.4](#94-failure-scope): they fail preflight and no override is applied
+anywhere.
+
+### 6.3 Resolution
 
 An entry resolves to zero or more concrete objects:
 
@@ -518,13 +581,11 @@ Site must not retroactively invalidate an unrelated override. Unmatched names
 appear in the component's Site condition message and in
 `kubectl unbounded overrides list`.
 
-### 6.3 Multiple entries and conflicts
+### 6.4 Multiple entries and conflicts
 
 The normal model is **one entry per workload carrying all of its changes**.
 Strategic merge patch is structural, not sequential: a single patch document can
-set resources, add a sidecar, add a toleration, and add a volume at once. That
-also keeps the entry directly usable with `kubectl patch --type=strategic` for a
-dry run.
+set resources, add a sidecar, add a toleration, and add a volume at once.
 
 Multiple entries may nonetheless resolve to the same object, which supports
 splitting by ownership (a platform team owning one ConfigMap key, a security
@@ -535,14 +596,47 @@ team owning another). When they do:
    to site `b`'s object only.
 2. They are composed in deterministic order: sorted ConfigMap key, then document
    order within a key.
-3. Composition is rejected only on **true conflict**, meaning two contributors
-   assign different values to the same leaf path. Disjoint concerns compose
-   silently; genuine disagreement fails with both contributing entries named.
-4. A conflict fails only the affected object. In the `[a, b]` and `[b, c]`
+3. A conflict fails only the affected object. In the `[a, b]` and `[b, c]`
    example, site `b`'s workload is not applied and sites `a` and `c` reconcile
    normally.
-5. Every contributor is recorded on the workload and in the condition message,
+4. Every contributor is recorded on the workload and in the condition message,
    so overlap is visible even when it composes cleanly.
+
+### 6.5 What counts as a conflict
+
+"Two contributors assigning different values to the same leaf" is not a
+sufficient definition, because several parts of this mechanism are not leaf
+assignments. Tolerations append, affinity takes a Cartesian product,
+`extraArgs` concatenates, and `addContainers` declares intent. Comparing raw
+patch leaves would report conflicts where none exist and miss conflicts that do.
+
+Conflict detection therefore operates on the **normalized operation set** for an
+object, after each contributor has been reduced to typed operations but before
+they are combined:
+
+| Operation | Composition across contributors | Conflicts when |
+|---|---|---|
+| Scalar set (`image`, `replicas`, `priorityClassName`, a `resources` leaf) | Last writer would win | Two contributors set the same path to **different** values. Identical values do not conflict. |
+| Map merge (`nodeSelector`, labels, annotations) | Keys union | Two contributors set the same key to different values |
+| List append (`tolerations`, `topologySpreadConstraints`) | Concatenate in contributor order | Never. Duplicates are permitted; the scheduler treats them as idempotent. |
+| `extraArgs` | Concatenate per container in contributor order | Never |
+| Cartesian affinity ([§8.4](#84-additive-only-scheduling)) | Product of all contributors' term lists with the operator's | Never. The product is associative and order-independent. |
+| Merge-by-key list entry (`containers[name]`, `volumes[name]`, `env[name]`, `volumeMounts[mountPath]`) | Recurse into the entry and apply the rules above | Per the nested rule that applies |
+| `addContainers` / `addInitContainers` | Union of names | Two contributors declare the same name with **non-identical** container definitions |
+| `args`, `command` replace | Last writer would win | Two contributors supply different lists |
+
+Two consequences worth stating explicitly:
+
+- **Identical values never conflict.** Two teams independently setting the same
+  memory limit is not an error, and failing it would make the ownership-split
+  use case unusable.
+- **Order-dependence is a conflict, not a resolution.** Where the table says
+  "last writer would win", that outcome is rejected rather than accepted.
+  Deterministic ordering exists so composition is reproducible, not so that
+  silent precedence can be inferred from ConfigMap key names.
+
+A conflict is reported with both contributors named by ConfigMap key and entry
+index, and the normalized operation and path that disagree.
 
 ## 7. Merge semantics
 
@@ -905,7 +999,7 @@ rollout, one log line, and a Site still reporting `Ready=True`.
 | Path outside the allowlist, protected path, `$` directive, explicit null | Whole ConfigMap | As above |
 | Resolution: container absent and not in `addContainers`, name in `addContainers` that already exists, `mountPath` collision | That object only | Object not applied; other objects reconcile normally |
 | True conflict between contributors to one resolved object | That object only | As above |
-| `sites` naming a Site that does not exist | Nothing | Inert, reported ([§6.2](#62-resolution)) |
+| `sites` naming a Site that does not exist | Nothing | Inert, reported ([§6.3](#63-resolution)) |
 
 Document-level failures are ConfigMap-wide because a document that does not
 parse cannot be attributed to a component. Resolution and conflict failures are
@@ -1256,7 +1350,7 @@ nothing about override behaviour.
 
 **Ordering.** The ConfigMap may be created before or after the Sites it names,
 and before or after the components it patches. Unmatched entries are inert and
-reported ([§6.2](#62-resolution)).
+reported ([§6.3](#63-resolution)).
 
 ## 14. Implementation plan
 
