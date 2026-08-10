@@ -16,7 +16,6 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
 )
@@ -196,7 +195,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		return fmt.Errorf("render nspawn config template: %w", err)
 	}
 
-	if err := utilio.WriteFile(goalState.NSpawnConfigFile, nspawnBuf.Bytes(), 0o644); err != nil {
+	if err := writeNSpawnHostFile(goalState.NSpawnConfigFile, nspawnBuf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write nspawn config %s: %w", goalState.NSpawnConfigFile, err)
 	}
 
@@ -206,7 +205,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		return fmt.Errorf("render service override template: %w", err)
 	}
 
-	if err := utilio.WriteFile(goalState.ServiceOverrideFile, overrideBuf.Bytes(), 0o644); err != nil {
+	if err := writeNSpawnHostFile(goalState.ServiceOverrideFile, overrideBuf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write service override %s: %w", goalState.ServiceOverrideFile, err)
 	}
 
@@ -220,11 +219,22 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		return fmt.Errorf("render config regeneration unit template: %w", err)
 	}
 
-	if err := utilio.WriteFile(unitFile, unitBuf.Bytes(), 0o644); err != nil {
+	if err := writeNSpawnHostFile(unitFile, unitBuf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write config regeneration unit %s: %w", unitFile, err)
 	}
 
 	return nil
+}
+
+// writeNSpawnHostFile writes the final named path directly so SELinux applies
+// and preserves the path-specific label. Atomic temp-file replacement can be
+// denied when the hidden temp name receives a different label.
+func writeNSpawnHostFile(path string, data []byte, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, perm)
 }
 
 func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {
