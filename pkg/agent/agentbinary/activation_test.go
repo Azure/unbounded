@@ -4,6 +4,7 @@
 package agentbinary
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -130,7 +131,11 @@ func TestActivateHostDaemonInitializesAndActivatesCandidate(t *testing.T) {
 	require.NoError(t, os.WriteFile(candidatePath, candidate, 0o755))
 
 	service := &fakeDaemonService{}
-	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
+
+	var logs bytes.Buffer
+
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	result, err := ActivateHostDaemon(context.Background(), log, ActivationOptions{
 		Layout:        layout,
 		CandidatePath: candidatePath,
 		LockPath:      filepath.Join(dir, "activation.lock"),
@@ -148,6 +153,24 @@ func TestActivateHostDaemonInitializesAndActivatesCandidate(t *testing.T) {
 	assert.Equal(t, 1, service.reloads)
 	assert.Equal(t, 1, service.restarts)
 	assert.Equal(t, []string{layout.GreenPath}, service.healthTargets)
+
+	for _, step := range []string{
+		"validate-options",
+		"acquire-lock",
+		"preflight",
+		"verify-candidate",
+		"initialize-layout",
+		"install-candidate",
+		"verify-installed-candidate",
+		"prepare-service",
+		"switch-links",
+		"reload-service-manager",
+		"restart-service",
+		"wait-for-health",
+		"release-lock",
+	} {
+		assert.Contains(t, logs.String(), "step="+step)
+	}
 }
 
 func TestActivateHostDaemonAdoptsCurrentLinkToSingleBinary(t *testing.T) {
