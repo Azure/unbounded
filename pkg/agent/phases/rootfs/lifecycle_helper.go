@@ -7,10 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -46,8 +47,27 @@ func installNSpawnLifecycleHelper(sourcePath, targetPath string) (retErr error) 
 		}
 	}()
 
-	if err := utilio.InstallFile(targetPath, source, 0o755); err != nil {
-		return fmt.Errorf("install lifecycle helper %s: %w", targetPath, err)
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return fmt.Errorf("create lifecycle helper directory: %w", err)
+	}
+
+	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return fmt.Errorf("open lifecycle helper target %s: %w", targetPath, err)
+	}
+
+	defer func() {
+		if err := target.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close lifecycle helper target %s: %w", targetPath, err))
+		}
+	}()
+
+	if _, err := io.Copy(target, source); err != nil {
+		return fmt.Errorf("copy lifecycle helper to %s: %w", targetPath, err)
+	}
+
+	if err := target.Chmod(0o755); err != nil {
+		return fmt.Errorf("chmod lifecycle helper %s: %w", targetPath, err)
 	}
 
 	return nil

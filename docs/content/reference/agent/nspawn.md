@@ -157,7 +157,7 @@ start. The pre-start hook refreshes host devices, mounts, and GPU paths changed
 by a host reboot. On GPU hosts, the post-start hook stops kubelet and containerd,
 rewires the driver root and CDI state, then restores both services. Hook failures
 fail the nspawn start and are retried through systemd. On the host,
-`nspawn-lifecycle-helper nspawn-lifecycle reconcile <machine>` triggers both
+`unbounded-agent-nspawn-lifecycle nspawn-lifecycle reconcile <machine>` triggers both
 steps by restarting the managed nspawn unit. Managed `NodeReboot` operations
 invoke the same reconcile flow.
 
@@ -180,7 +180,7 @@ The configuration is written to these files on the host before the machine boots
 | nspawn config | `/etc/systemd/nspawn/<MachineName>.nspawn` |
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
 | Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
-| Rollback-stable lifecycle helper | `/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper` |
+| Rollback-stable lifecycle helper | `/usr/local/bin/unbounded-agent-nspawn-lifecycle` |
 
 ### Customization points
 
@@ -307,7 +307,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
 | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
-| `/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper` | Lifecycle command binary retained across daemon binary rollback. |
+| `/usr/local/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback. |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also

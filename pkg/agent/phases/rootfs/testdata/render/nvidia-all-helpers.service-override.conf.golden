@@ -42,7 +42,7 @@ RestartSec=10s
 ExecStartPre=-/usr/bin/machinectl terminate kube1
 ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube1
 ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube1 || /usr/bin/mount -t bpf bpf /run/bpffs/kube1'
-ExecStartPost=/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper nspawn-lifecycle post-start kube1
+ExecStartPost=/usr/local/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1
 Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
 Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=network
 

@@ -320,7 +320,7 @@ func TestConfigRegenerationUnit(t *testing.T) {
 	require.Contains(t, out, "Wants=systemd-udev-settle.service")
 	require.Contains(t, out, "After=systemd-udev-settle.service")
 	require.Contains(t, out, "Type=oneshot")
-	require.Contains(t, out, "ExecStart=/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper nspawn-lifecycle pre-start kube1")
+	require.Contains(t, out, "ExecStart=/usr/local/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle pre-start kube1")
 	require.NotContains(t, out, "ExecStart=-")
 	require.NotContains(t, out, "if [ ! -x")
 	require.Contains(t, out, "Restart=on-failure")
@@ -334,7 +334,7 @@ func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
 
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
-	require.Contains(t, buf.String(), "ExecStartPost=/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper nspawn-lifecycle post-start kube1")
+	require.Contains(t, buf.String(), "ExecStartPost=/usr/local/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1")
 	require.NotContains(t, buf.String(), "ExecStartPost=-")
 	require.NotContains(t, buf.String(), "if [ ! -x")
 }
