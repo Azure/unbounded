@@ -6,6 +6,7 @@ package component
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -160,6 +161,49 @@ func (p *Plan) Len() int {
 
 // NewPlan returns an empty plan.
 func NewPlan() *Plan { return &Plan{} }
+
+// Summary renders the plan as one line per operation, in plan order.
+//
+// It exists so tests can pin exactly what a component intends to write, and so
+// a plan can be logged or displayed without dumping whole objects. The reaper
+// gates its migration on the objects and annotations components produce, so an
+// object silently appearing, disappearing or being renamed is a real hazard.
+func (p *Plan) Summary() string {
+	if p.Len() == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+
+	for _, op := range p.Operations {
+		b.WriteString(op.Kind.String())
+		b.WriteString(" ")
+		b.WriteString(op.Ref().String())
+
+		if op.Overridable {
+			b.WriteString(" [overridable]")
+		}
+
+		if op.SharedKey != "" {
+			b.WriteString(" [shared]")
+		}
+
+		if len(op.DependsOn) > 0 {
+			b.WriteString(" [after")
+
+			for _, dep := range op.DependsOn {
+				b.WriteString(" ")
+				b.WriteString(dep.String())
+			}
+
+			b.WriteString("]")
+		}
+
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
 
 // sortOperations groups operations by the component that planned them,
 // preserving the order components were planned in and, within a component, the

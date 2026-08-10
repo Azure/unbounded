@@ -154,33 +154,41 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		patch = client.MergeFrom(site.DeepCopy())
 	}
 
+	// Plan every component before executing any of it. Planning performs no
+	// writes, so a planning failure leaves the cluster untouched, and the
+	// merged plan is what lets shared operations deduplicate across components.
+	planned, plan := planComponents(ctx, env, reg, sites, site)
+
+	exec, execErr := env.Execute(ctx, plan)
+
 	var (
 		reconcileErrs []error
 		requeueAfter  time.Duration
 	)
 
-	record := func(name, conditionType string, res component.Result) {
+	if execErr != nil {
+		// A plan the executor refuses to run (a dependency cycle, or
+		// contradictory shared operations) is a programming error, not a
+		// component outcome, so it is reported once rather than per component.
+		reconcileErrs = append(reconcileErrs, fmt.Errorf("execute plan: %w", execErr))
+	}
+
+	for _, outcome := range planned {
+		res := component.CombineResult(outcome.name, outcome.result, exec)
+
 		switch {
 		case site != nil:
-			if err := setComponentResult(logger, site, name, conditionType, res); err != nil {
+			if err := setComponentResult(logger, site, outcome.name, outcome.conditionType, res); err != nil {
 				reconcileErrs = append(reconcileErrs, err)
 			}
 		case res.Err != nil:
-			reconcileErrs = append(reconcileErrs, fmt.Errorf("%s: %w", name, res.Err))
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("%s: %w", outcome.name, res.Err))
 		}
 
 		requeueAfter = nextRequeue(requeueAfter, res.RequeueAfter)
 	}
 
-	for _, c := range reg.Cluster {
-		record(c.Name(), c.ConditionType(), c.Reconcile(ctx, env, sites))
-	}
-
 	if site != nil {
-		for _, c := range reg.Site {
-			record(c.Name(), c.ConditionType(), reconcileSiteComponent(ctx, env, c, site))
-		}
-
 		pruneStaleConditions(site, reg)
 
 		if err := r.Status().Patch(ctx, site, patch); err != nil {
@@ -189,6 +197,73 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 	}
 
 	return ctrl.Result{RequeueAfter: requeueAfter}, errors.Join(reconcileErrs...)
+}
+
+// componentOutcome is a component's planning verdict, held until execution
+// completes so the two can be folded together.
+type componentOutcome struct {
+	name          string
+	conditionType string
+	result        component.Result
+}
+
+// planComponents plans every component in registry order and merges the result
+// into one plan. A planning error becomes that component's Result rather than
+// aborting the pass, so one component failing to plan does not stop the others
+// from reconciling.
+func planComponents(
+	ctx context.Context,
+	env *component.Env,
+	reg *component.Registry,
+	sites []unboundedv1alpha3.Site,
+	site *unboundedv1alpha3.Site,
+) ([]componentOutcome, *component.Plan) {
+	outcomes := make([]componentOutcome, 0, len(reg.Cluster)+len(reg.Site))
+	plan := component.NewPlan()
+
+	for _, c := range reg.Cluster {
+		componentPlan, res, err := c.Plan(ctx, env, sites)
+		if err != nil {
+			res = component.Failed(err)
+		} else {
+			plan.Merge(componentPlan)
+		}
+
+		outcomes = append(outcomes, componentOutcome{name: c.Name(), conditionType: c.ConditionType(), result: res})
+	}
+
+	if site == nil {
+		return outcomes, plan
+	}
+
+	for _, c := range reg.Site {
+		componentPlan, res, err := planSiteComponent(ctx, env, c, site)
+		if err != nil {
+			res = component.Failed(err)
+		} else {
+			plan.Merge(componentPlan)
+		}
+
+		outcomes = append(outcomes, componentOutcome{name: c.Name(), conditionType: c.ConditionType(), result: res})
+	}
+
+	return outcomes, plan
+}
+
+// planSiteComponent owns the enable/disable branch: an enabled component plans
+// its desired state, a disabled one plans the removal of its per-Site
+// resources.
+func planSiteComponent(
+	ctx context.Context,
+	env *component.Env,
+	c component.SiteComponent,
+	site *unboundedv1alpha3.Site,
+) (*component.Plan, component.Result, error) {
+	if !c.Enabled(site) {
+		return c.CleanupPlan(ctx, env, site)
+	}
+
+	return c.Plan(ctx, env, site)
 }
 
 // nextRequeue returns the smallest positive of the current and candidate
@@ -233,20 +308,6 @@ func pruneStaleConditions(site *unboundedv1alpha3.Site, reg *component.Registry)
 	for _, conditionType := range stale {
 		apimeta.RemoveStatusCondition(&site.Status.Conditions, conditionType)
 	}
-}
-
-// reconcileSiteComponent reconciles a per-Site component when enabled and tears
-// it down when disabled, turning the outcome into a component.Result.
-func reconcileSiteComponent(ctx context.Context, env *component.Env, c component.SiteComponent, site *unboundedv1alpha3.Site) component.Result {
-	if !c.Enabled(site) {
-		if err := c.Cleanup(ctx, env, site); err != nil {
-			return component.Failed(err)
-		}
-
-		return component.Disabled("component disabled")
-	}
-
-	return c.Reconcile(ctx, env, site)
 }
 
 // setComponentResult publishes a component's Result as a Site status condition

@@ -359,31 +359,31 @@ func TestSingletonAndAllSiteRequestsPreservesSingletonOnListError(t *testing.T) 
 	}
 }
 
-func TestApplyManifestDataSkipsNilledObjects(t *testing.T) {
+func TestDecodeManifestDataSkipsNilledObjects(t *testing.T) {
 	env := &Env{
 		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
 		Namespace: "unbounded-system",
 	}
 
-	applied := 0
+	mutated := 0
 	data := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: keep\n  namespace: unbounded-system\n")
 
-	err := env.applyManifestData(t.Context(), data, func(obj *unstructured.Unstructured) error {
-		applied++
+	objects, err := env.decodeManifestData(data, func(obj *unstructured.Unstructured) error {
+		mutated++
 		obj.Object = nil // skip
 
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("applyManifestData: %v", err)
+		t.Fatalf("decodeManifestData: %v", err)
 	}
 
-	if applied != 1 {
-		t.Fatalf("mutate called %d times, want 1", applied)
+	if mutated != 1 {
+		t.Fatalf("mutate called %d times, want 1", mutated)
 	}
 
-	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: "keep"}, &corev1.ConfigMap{}); err == nil {
-		t.Fatal("nilled object was applied")
+	if len(objects) != 0 {
+		t.Fatalf("decoded %d objects, want 0; a nilled object must be dropped", len(objects))
 	}
 }
 

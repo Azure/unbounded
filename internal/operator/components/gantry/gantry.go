@@ -78,9 +78,18 @@ func EnabledFor(site *unboundedv1alpha3.Site) bool {
 // Reconcile deploys the gantry cluster singleton whenever at least one Site does
 // not opt out and keeps an existing installation reconciled when every Site opts
 // out.
-func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
-	if err := cleanupLegacyNodeConfig(ctx, env); err != nil {
-		return component.Failed(err)
+func (c Component) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	plan := component.NewPlan()
+
+	// The legacy node config is removed before anything else is applied, and
+	// the applies depend on those deletes, so a failure to remove the legacy
+	// DaemonSet does not race the replacement into the cluster alongside it.
+	legacy := legacyCleanupOperations(c.Name(), env.Namespace)
+	plan.Add(legacy...)
+
+	legacyRefs := make([]component.ObjectRef, 0, len(legacy))
+	for _, op := range legacy {
+		legacyRefs = append(legacyRefs, op.Ref())
 	}
 
 	enabled := false
@@ -98,24 +107,48 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		// should handle removal.
 		retained, err := resourcesExist(ctx, env)
 		if err != nil {
-			return component.Failed(err)
+			return nil, component.Result{}, err
 		}
 
 		if !retained {
-			return component.Disabled("no site enables gantry")
+			return plan, component.Disabled("no site enables gantry"), nil
 		}
 	}
 
-	configHash, err := ensureConfig(ctx, env)
+	configHash, configOp, err := planConfig(ctx, env)
 	if err != nil {
-		return component.Failed(err)
+		return nil, component.Result{}, err
 	}
 
-	if err := applyManifests(ctx, env, applyMutator(env.Config.Image(imageRepository), configHash)); err != nil {
-		return component.Failed(err)
+	dependsOn := legacyRefs
+
+	if configOp != nil {
+		plan.Add(*configOp)
+
+		dependsOn = append(dependsOn, configOp.Ref())
 	}
 
-	return component.Reconciled()
+	objects, err := decodeManifests(env, applyMutator(env.Config.Image(imageRepository), configHash))
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	for _, obj := range objects {
+		op := component.Operation{
+			Kind:      component.OpApply,
+			Object:    obj,
+			Component: c.Name(),
+			DependsOn: dependsOn,
+		}
+
+		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
+			op.Overridable = true
+		}
+
+		plan.Add(op)
+	}
+
+	return plan, component.Reconciled(), nil
 }
 
 // SetupWatches reconciles Gantry on changes to its active resources and when
@@ -127,12 +160,12 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName))))
 }
 
-// applyManifests applies Gantry's operator-managed top-level manifests. The
+// decodeManifests decodes Gantry's operator-managed top-level manifests. The
 // standalone node configurator and examples subtree are intentionally excluded.
-func applyManifests(ctx context.Context, env *component.Env, mutate func(*unstructured.Unstructured) error) error {
+func decodeManifests(env *component.Env, mutate func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, error) {
 	files, err := component.YamlFiles(gantrymanifests.Manifests)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	topLevel := make([]string, 0, len(files))
@@ -145,7 +178,7 @@ func applyManifests(ctx context.Context, env *component.Env, mutate func(*unstru
 		topLevel = append(topLevel, file)
 	}
 
-	return env.ApplyManifestFiles(ctx, gantrymanifests.Manifests, topLevel, mutate)
+	return env.DecodeManifestFiles(gantrymanifests.Manifests, topLevel, mutate)
 }
 
 func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
@@ -167,17 +200,17 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 	return false, nil
 }
 
-func cleanupLegacyNodeConfig(ctx context.Context, env *component.Env) error {
-	for _, obj := range []client.Object{
-		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, Name: legacyNodeConfigDaemonSetName}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, Name: legacyNodeConfigName}},
-	} {
-		if err := env.DeleteIfExists(ctx, obj); err != nil {
-			return fmt.Errorf("remove legacy Gantry node config: %w", err)
-		}
+func legacyCleanupOperations(componentName, namespace string) []component.Operation {
+	return []component.Operation{
+		component.DeleteOperation(&appsv1.DaemonSet{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: legacyNodeConfigDaemonSetName},
+		}, componentName, ""),
+		component.DeleteOperation(&corev1.ConfigMap{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: legacyNodeConfigName},
+		}, componentName, ""),
 	}
-
-	return nil
 }
 
 // applyMutator skips CRDs and the separately reconciled gantry-config ConfigMap,
@@ -230,38 +263,34 @@ func stampConfigHash(obj *unstructured.Unstructured, annotation, hash string) er
 	return nil
 }
 
-// ensureConfig creates the embedded default only when no config exists. An
-// existing operator/user-managed payload (for example an edited
-// upstream_registries list) is never applied over.
-func ensureConfig(ctx context.Context, env *component.Env) (string, error) {
+// planConfig hashes the gantry config payload and, when no config exists,
+// returns the operation that creates the embedded default. An existing
+// operator or user-managed payload (for example an edited upstream_registries
+// list) is never applied over, so the returned operation is create-if-absent.
+//
+// See net.planConfig for why the hash is computed at plan time and what happens
+// if another writer wins the create.
+func planConfig(ctx context.Context, env *component.Env) (string, *component.Operation, error) {
 	key := client.ObjectKey{Namespace: env.Namespace, Name: configName}
 	existing := &corev1.ConfigMap{}
 
 	err := env.Client.Get(ctx, key, existing)
 	if err == nil {
-		return component.ConfigMapPayloadHash(existing), nil
+		return component.ConfigMapPayloadHash(existing), nil, nil
 	}
 
 	if !apierrors.IsNotFound(err) {
-		return "", fmt.Errorf("get gantry config %s/%s: %w", key.Namespace, key.Name, err)
+		return "", nil, fmt.Errorf("get gantry config %s/%s: %w", key.Namespace, key.Name, err)
 	}
 
 	desired, err := env.DefaultConfigMap(gantrymanifests.Manifests, configName, "gantry")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	if err := env.Client.Create(ctx, desired); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return "", fmt.Errorf("create gantry config %s/%s: %w", key.Namespace, key.Name, err)
-		}
-
-		if err := env.Client.Get(ctx, key, existing); err != nil {
-			return "", fmt.Errorf("get raced gantry config %s/%s: %w", key.Namespace, key.Name, err)
-		}
-
-		return component.ConfigMapPayloadHash(existing), nil
-	}
-
-	return component.ConfigMapPayloadHash(desired), nil
+	return component.ConfigMapPayloadHash(desired), &component.Operation{
+		Kind:      component.OpCreateIfAbsent,
+		Object:    component.ToUnstructured(desired),
+		Component: Component{}.Name(),
+	}, nil
 }

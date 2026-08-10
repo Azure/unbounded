@@ -4,7 +4,10 @@
 package metalman
 
 import (
+	"context"
 	"testing"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -12,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -201,8 +205,8 @@ func TestCleanupDeletesDeployment(t *testing.T) {
 		Namespace: component.DefaultNamespace,
 	}
 
-	if err := (Component{}).Cleanup(t.Context(), env, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}); err != nil {
-		t.Fatalf("Cleanup: %v", err)
+	if err := cleanup(t, env, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}); err != nil {
+		t.Fatalf("cleanup: %v", err)
 	}
 
 	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(deploy), &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
@@ -277,6 +281,178 @@ func assertSiteAffinity(t *testing.T, affinity *corev1.Affinity, siteName string
 	for key, seen := range want {
 		if !seen {
 			t.Fatalf("site affinity missing key %q", key)
+		}
+	}
+}
+
+// cleanup plans and executes the component's cleanup, mirroring the reconciler.
+func cleanup(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) error {
+	t.Helper()
+
+	c := Component{}
+
+	plan, _, err := c.CleanupPlan(t.Context(), env, site)
+	if err != nil {
+		return err
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return err
+	}
+
+	return exec.Err()
+}
+
+// reconcile plans and executes the component, mirroring the reconciler.
+func reconcile(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) component.Result {
+	t.Helper()
+
+	c := Component{}
+
+	plan, res, err := c.Plan(t.Context(), env, site)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	return component.CombineResult(c.Name(), res, exec)
+}
+
+// TestPlanGolden pins the complete set of operations the metalman component
+// plans for one Site.
+//
+// The support RBAC ships in the machina manifest set and is byte-identical for
+// every Site, so every entry carries a shared key and the executor writes it
+// once per pass rather than once per Site. Before plan-then-execute this set
+// was re-applied in full for every Site on every pass.
+//
+// The machina component skips exactly these objects (see
+// machina.applyMutator), so a change here without a matching change there
+// either double-applies or drops RBAC silently.
+func TestPlanGolden(t *testing.T) {
+	env := &component.Env{
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
+			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)},
+			},
+		}},
+	}
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, site)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	want := `Apply ServiceAccount/unbounded-system/metalman-controller [shared]
+Apply ServiceAccount/unbounded-system/metalman-bootstrap [shared]
+Apply Role/unbounded-system/metalman-controller [shared]
+Apply RoleBinding/unbounded-system/metalman-controller [shared]
+Apply Role/kube-public/metalman-controller [shared]
+Apply RoleBinding/kube-public/metalman-controller [shared]
+Apply Role/kube-system/metalman-controller [shared]
+Apply RoleBinding/kube-system/metalman-controller [shared]
+Apply ClusterRole/metalman-controller [shared]
+Apply ClusterRoleBinding/metalman-controller [shared]
+Apply ClusterRoleBinding/metalman:node-bootstrapper [shared]
+Apply ClusterRoleBinding/metalman:node-autoapprove-bootstrap [shared]
+Apply ClusterRole/metalman-bootstrap [shared]
+Apply ClusterRoleBinding/metalman:bootstrap-machine [shared]
+Apply Deployment/unbounded-system/metalman-controller-rack-a [overridable]
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestCleanupPlanGolden pins what disabling metalman for a Site removes. The
+// shared RBAC is deliberately left behind: it is harmless unreferenced and may
+// still be in use by another Site.
+func TestCleanupPlanGolden(t *testing.T) {
+	env := &component.Env{
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	plan, res, err := (Component{}).CleanupPlan(t.Context(), env,
+		&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}})
+	if err != nil {
+		t.Fatalf("CleanupPlan: %v", err)
+	}
+
+	if !res.Ready || res.Reason != component.ReasonDisabled {
+		t.Fatalf("result = %+v, want ready with reason %q", res, component.ReasonDisabled)
+	}
+
+	want := "Delete Deployment/unbounded-system/metalman-controller-rack-a\n"
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestReconcileAppliesPlannedObjects exercises the full plan-then-execute path
+// and asserts the executor writes exactly what the plan described, so a plan
+// that looks right in TestPlanGolden cannot silently fail to reach the cluster.
+func TestReconcileAppliesPlannedObjects(t *testing.T) {
+	applied := map[string]bool{}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				named, ok := obj.(interface {
+					GetKind() string
+					GetName() string
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				applied[named.GetKind()+"/"+named.GetName()] = true
+
+				return nil
+			},
+		}).
+		Build()
+
+	env := &component.Env{Client: cl, Scheme: testScheme(t), Namespace: component.DefaultNamespace}
+
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
+			Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+				SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: ptr.To(true)},
+			},
+		}},
+	}
+
+	if res := reconcile(t, env, site); !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	for _, want := range []string{
+		"Deployment/metalman-controller-rack-a",
+		"ServiceAccount/metalman-controller",
+		"ClusterRole/metalman-controller",
+	} {
+		if !applied[want] {
+			t.Fatalf("%s was planned but never applied", want)
 		}
 	}
 }

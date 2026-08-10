@@ -85,7 +85,7 @@ func TestEnabledForDefaultsToEnabled(t *testing.T) {
 func TestEnsureConfigCreatesDefaultOnlyWhenAbsent(t *testing.T) {
 	env := testEnv(t)
 
-	hash, err := ensureConfig(t.Context(), env)
+	hash, err := ensureConfig(t, env)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestEnsureConfigPreservesExistingPayload(t *testing.T) {
 	}
 	env := testEnv(t, existing)
 
-	hash, err := ensureConfig(t.Context(), env)
+	hash, err := ensureConfig(t, env)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 	legacyDaemonSet := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigDaemonSetName}}
 	env, applied := reconcilerEnv(t, legacyConfig, legacyDaemonSet)
 
-	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	res := reconcile(t, env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
@@ -322,7 +322,7 @@ func TestReconcileFailsWhenLegacyNodeConfigCleanupFails(t *testing.T) {
 		Build()
 	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
 
-	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	res := reconcile(t, env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
 	if res.Ready || !errors.Is(res.Err, wantErr) {
 		t.Fatalf("Reconcile = %+v, want failure wrapping %v", res, wantErr)
 	}
@@ -336,7 +336,7 @@ func TestReconcileRetainedWhenAllSitesOptOut(t *testing.T) {
 	no := false
 	env, applied := reconcilerEnv(t)
 
-	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", &no)})
+	res := reconcile(t, env, []unboundedv1alpha3.Site{*siteWithGantry("edge", &no)})
 	if !res.Ready || res.Reason != component.ReasonDisabled {
 		t.Fatalf("Reconcile = %+v, want ready with Disabled", res)
 	}
@@ -365,7 +365,7 @@ func TestReconcileRetainsExistingWhenAllSitesOptOut(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			env, applied := reconcilerEnv(t, tc.existing)
 
-			res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", &no)})
+			res := reconcile(t, env, []unboundedv1alpha3.Site{*siteWithGantry("edge", &no)})
 			if !res.Ready || res.Err != nil {
 				t.Fatalf("Reconcile = %+v, want ready", res)
 			}
@@ -446,5 +446,91 @@ func TestResourcesExist(t *testing.T) {
 				t.Fatalf("resourcesExist = %t, %v; want %t", got, err, tc.want)
 			}
 		})
+	}
+}
+
+// ensureConfig plans and executes the gantry config operation, mirroring what
+// the reconciler does so these tests exercise the production path.
+func ensureConfig(t *testing.T, env *component.Env) (string, error) {
+	t.Helper()
+
+	hash, op, err := planConfig(t.Context(), env)
+	if err != nil {
+		return "", err
+	}
+
+	if op == nil {
+		return hash, nil
+	}
+
+	plan := component.NewPlan()
+	plan.Add(*op)
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return "", err
+	}
+
+	return hash, exec.Err()
+}
+
+// reconcile plans and executes the component, mirroring the reconciler.
+func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
+	t.Helper()
+
+	c := Component{}
+
+	plan, res, err := c.Plan(t.Context(), env, sites)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	return component.CombineResult(c.Name(), res, exec)
+}
+
+// TestPlanGolden pins the complete set of operations the gantry component
+// plans.
+//
+// Two properties matter beyond the object set. The legacy node config is
+// removed first and every apply depends on those deletes, so a failure to
+// remove the legacy DaemonSet skips the replacement rather than running both
+// side by side. And node-config.yaml plus the examples/ subtree are excluded:
+// they are for operators to apply themselves, not for the operator to install.
+func TestPlanGolden(t *testing.T) {
+	env := testEnv(t)
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	const after = " [after DaemonSet/unbounded-system/gantry-containerd-config " +
+		"ConfigMap/unbounded-system/gantry-containerd-hosts " +
+		"ConfigMap/unbounded-system/gantry-config]"
+
+	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
+Delete ConfigMap/unbounded-system/gantry-containerd-hosts
+CreateIfAbsent ConfigMap/unbounded-system/gantry-config
+Apply Namespace/unbounded-system` + after + `
+Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
+Apply ServiceAccount/unbounded-system/gantry` + after + `
+Apply ClusterRole/gantry-agent` + after + `
+Apply ClusterRoleBinding/gantry-agent` + after + `
+Apply Role/unbounded-system/gantry-agent` + after + `
+Apply RoleBinding/unbounded-system/gantry-agent` + after + `
+Apply PriorityClass/gantry-low` + after + `
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
 	}
 }

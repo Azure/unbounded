@@ -169,38 +169,48 @@ type Env struct {
 	Config    Config
 }
 
-// ApplyManifestFS server-side applies every YAML object in the manifest
-// filesystem, running mutate on each decoded object first. A mutate that nils
-// out obj.Object skips that object.
-func (e *Env) ApplyManifestFS(ctx context.Context, manifests fs.FS, mutate func(*unstructured.Unstructured) error) error {
+// DecodeManifestFS decodes every YAML object in the manifest filesystem,
+// running mutate on each decoded object and then retargeting its namespace. A
+// mutate that nils out obj.Object drops that object.
+//
+// It performs no writes. Components use it while planning, so a pass can decide
+// everything it intends to do before anything is written.
+func (e *Env) DecodeManifestFS(manifests fs.FS, mutate func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, error) {
 	files, err := YamlFiles(manifests)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return e.ApplyManifestFiles(ctx, manifests, files, mutate)
+	return e.DecodeManifestFiles(manifests, files, mutate)
 }
 
-// ApplyManifestFiles applies a specific list of YAML manifest files from the
-// filesystem. Callers use it to apply a curated subset (for example excluding an
-// examples/ subtree that YamlFiles would otherwise include).
-func (e *Env) ApplyManifestFiles(ctx context.Context, manifests fs.FS, files []string, mutate func(*unstructured.Unstructured) error) error {
+// DecodeManifestFiles decodes a specific list of YAML manifest files. Callers
+// use it for a curated subset, for example excluding an examples/ subtree that
+// YamlFiles would otherwise include.
+func (e *Env) DecodeManifestFiles(manifests fs.FS, files []string, mutate func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, error) {
+	var objects []*unstructured.Unstructured
+
 	for _, file := range files {
 		data, err := fs.ReadFile(manifests, file)
 		if err != nil {
-			return fmt.Errorf("read manifest %s: %w", file, err)
+			return nil, fmt.Errorf("read manifest %s: %w", file, err)
 		}
 
-		if err := e.applyManifestData(ctx, data, mutate); err != nil {
-			return fmt.Errorf("apply manifest %s: %w", file, err)
+		decoded, err := e.decodeManifestData(data, mutate)
+		if err != nil {
+			return nil, fmt.Errorf("decode manifest %s: %w", file, err)
 		}
+
+		objects = append(objects, decoded...)
 	}
 
-	return nil
+	return objects, nil
 }
 
-func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*unstructured.Unstructured) error) error {
+func (e *Env) decodeManifestData(data []byte, mutate func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, error) {
 	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+
+	var objects []*unstructured.Unstructured
 
 	for {
 		obj := &unstructured.Unstructured{}
@@ -209,7 +219,7 @@ func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*u
 				break
 			}
 
-			return fmt.Errorf("decode resource: %w", err)
+			return nil, fmt.Errorf("decode resource: %w", err)
 		}
 
 		if obj.Object == nil {
@@ -218,7 +228,7 @@ func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*u
 
 		if mutate != nil {
 			if err := mutate(obj); err != nil {
-				return err
+				return nil, err
 			}
 		}
 
@@ -228,12 +238,37 @@ func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*u
 
 		e.RetargetNamespace(obj)
 
-		if err := e.ApplyObject(ctx, obj); err != nil {
-			return err
-		}
+		objects = append(objects, obj)
 	}
 
-	return nil
+	return objects, nil
+}
+
+// ApplyOperations wraps decoded objects as apply operations attributed to a
+// component and Site. Site is empty for cluster-scoped components.
+func ApplyOperations(objects []*unstructured.Unstructured, componentName, site string) []Operation {
+	ops := make([]Operation, 0, len(objects))
+
+	for _, obj := range objects {
+		ops = append(ops, Operation{
+			Kind:      OpApply,
+			Object:    obj,
+			Component: componentName,
+			Site:      site,
+		})
+	}
+
+	return ops
+}
+
+// DeleteOperation builds a delete operation for a typed object.
+func DeleteOperation(obj client.Object, componentName, site string) Operation {
+	return Operation{
+		Kind:      OpDelete,
+		Object:    ToUnstructured(obj),
+		Component: componentName,
+		Site:      site,
+	}
 }
 
 // ApplyObject server-side applies a single object with the operator field owner.

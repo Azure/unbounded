@@ -33,12 +33,12 @@ type fakeCluster struct {
 
 func (f fakeCluster) Name() string          { return f.name }
 func (f fakeCluster) ConditionType() string { return f.condition }
-func (f fakeCluster) Reconcile(context.Context, *component.Env, []unboundedv1alpha3.Site) component.Result {
+func (f fakeCluster) Plan(context.Context, *component.Env, []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	if f.ran != nil {
 		*f.ran = true
 	}
 
-	return f.result
+	return component.NewPlan(), f.result, nil
 }
 
 // fakeSite is a configurable SiteComponent that records enable/reconcile/cleanup.
@@ -55,24 +55,28 @@ type fakeSite struct {
 func (f fakeSite) Name() string                         { return f.name }
 func (f fakeSite) ConditionType() string                { return f.condition }
 func (f fakeSite) Enabled(*unboundedv1alpha3.Site) bool { return f.enabled }
-func (f fakeSite) Reconcile(context.Context, *component.Env, *unboundedv1alpha3.Site) component.Result {
+func (f fakeSite) Plan(context.Context, *component.Env, *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	if f.reconciled != nil {
 		*f.reconciled = true
 	}
 
-	return f.result
+	return component.NewPlan(), f.result, nil
 }
 
-func (f fakeSite) Cleanup(context.Context, *component.Env, *unboundedv1alpha3.Site) error {
+func (f fakeSite) CleanupPlan(context.Context, *component.Env, *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	if f.cleaned != nil {
 		*f.cleaned = true
 	}
 
-	return f.cleanupErr
+	if f.cleanupErr != nil {
+		return nil, component.Result{}, f.cleanupErr
+	}
+
+	return component.NewPlan(), component.Disabled("component disabled"), nil
 }
 
 // statefulCluster is a pointer-receiver ClusterComponent that counts how many
-// times it reconciled, used to prove the driver reuses a single registry
+// times it planned, used to prove the driver reuses a single registry
 // instance instead of rebuilding it each pass.
 type statefulCluster struct {
 	runs int
@@ -80,10 +84,10 @@ type statefulCluster struct {
 
 func (c *statefulCluster) Name() string          { return "stateful" }
 func (c *statefulCluster) ConditionType() string { return "StatefulReady" }
-func (c *statefulCluster) Reconcile(context.Context, *component.Env, []unboundedv1alpha3.Site) component.Result {
+func (c *statefulCluster) Plan(context.Context, *component.Env, []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	c.runs++
 
-	return component.Reconciled()
+	return component.NewPlan(), component.Reconciled(), nil
 }
 
 func newReconcilerTestScheme(t *testing.T) *runtime.Scheme {
@@ -266,13 +270,17 @@ func TestReconcileSiteLessPassJoinsClusterErrors(t *testing.T) {
 	}
 }
 
-func TestReconcileSiteComponentDisabledRunsCleanup(t *testing.T) {
+func TestPlanSiteComponentDisabledPlansCleanup(t *testing.T) {
 	cleaned := false
 	c := fakeSite{name: "storage", condition: "StorageReady", enabled: false, cleaned: &cleaned}
 
-	res := reconcileSiteComponent(t.Context(), &component.Env{}, c, &unboundedv1alpha3.Site{})
+	_, res, err := planSiteComponent(t.Context(), &component.Env{}, c, &unboundedv1alpha3.Site{})
+	if err != nil {
+		t.Fatalf("planSiteComponent: %v", err)
+	}
+
 	if !cleaned {
-		t.Fatal("cleanup was not called for a disabled component")
+		t.Fatal("cleanup was not planned for a disabled component")
 	}
 
 	if !res.Ready || res.Reason != component.ReasonDisabled {
@@ -280,13 +288,13 @@ func TestReconcileSiteComponentDisabledRunsCleanup(t *testing.T) {
 	}
 }
 
-func TestReconcileSiteComponentDisabledCleanupErrorFails(t *testing.T) {
+func TestPlanSiteComponentDisabledCleanupErrorFails(t *testing.T) {
 	cleanupErr := errors.New("cleanup failed")
 	c := fakeSite{name: "storage", condition: "StorageReady", enabled: false, cleanupErr: cleanupErr}
 
-	res := reconcileSiteComponent(t.Context(), &component.Env{}, c, &unboundedv1alpha3.Site{})
-	if res.Ready || !errors.Is(res.Err, cleanupErr) {
-		t.Fatalf("result = %+v, want failed with cleanup error", res)
+	_, _, err := planSiteComponent(t.Context(), &component.Env{}, c, &unboundedv1alpha3.Site{})
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("err = %v, want the cleanup error", err)
 	}
 }
 

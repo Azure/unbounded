@@ -123,6 +123,10 @@ func (e *Env) Execute(ctx context.Context, plan *Plan) (ExecutionResult, error) 
 		return ExecutionResult{}, nil
 	}
 
+	if err := validatePlan(plan); err != nil {
+		return ExecutionResult{}, err
+	}
+
 	ops := make([]Operation, len(plan.Operations))
 	copy(ops, plan.Operations)
 	sortOperations(ops)
@@ -138,6 +142,29 @@ func (e *Env) Execute(ctx context.Context, plan *Plan) (ExecutionResult, error) 
 	}
 
 	return e.run(ctx, ordered, aliases), nil
+}
+
+// validatePlan rejects operations the executor cannot route.
+//
+// The common trap is converting an object read with Client.Get, which strips
+// TypeMeta, so the resulting unstructured object carries no GVK and the
+// apiserver rejects the write with an opaque "Kind is missing" error far from
+// the code that built it. Catching it here names the component instead.
+func validatePlan(plan *Plan) error {
+	for _, op := range plan.Operations {
+		if op.Object == nil {
+			return fmt.Errorf("component %q planned a %s operation with no object", op.Component, op.Kind)
+		}
+
+		if op.Object.GetKind() == "" || op.Object.GetAPIVersion() == "" {
+			return fmt.Errorf(
+				"component %q planned a %s operation on %s/%s with no apiVersion or kind; "+
+					"objects read with Client.Get lose TypeMeta and must have it restored",
+				op.Component, op.Kind, op.Object.GetNamespace(), op.Object.GetName())
+		}
+	}
+
+	return nil
 }
 
 // run executes ordered operations, tracking which refs failed so dependents can
@@ -392,4 +419,36 @@ func refList(ops []Operation) string {
 	sort.Strings(refs)
 
 	return strings.Join(refs, ", ")
+}
+
+// CombineResult folds a component's execution outcomes into its planning
+// verdict.
+//
+// Planning reaches verdicts execution cannot, such as Disabled or NoSites, so
+// those survive when there was nothing to execute. When operations did run, a
+// failure replaces the planning verdict, because a component that planned
+// successfully but failed to write is not reconciled.
+//
+// Skipped operations do not by themselves produce a failure: the dependency
+// that caused them already reported the underlying error.
+func CombineResult(componentName string, planned Result, exec ExecutionResult) Result {
+	var errs []error
+
+	for _, result := range exec.Results {
+		if result.Component != componentName {
+			continue
+		}
+
+		if result.Status != OpFailed || result.Err == nil {
+			continue
+		}
+
+		errs = append(errs, fmt.Errorf("%s %s: %w", result.Kind, result.Ref, result.Err))
+	}
+
+	if len(errs) > 0 {
+		return Failed(errors.Join(errs...))
+	}
+
+	return planned
 }

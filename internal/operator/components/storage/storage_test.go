@@ -4,7 +4,10 @@
 package storage
 
 import (
+	"context"
 	"testing"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -159,7 +162,7 @@ func TestEnsureConfigCreatesDefaultWhenAbsent(t *testing.T) {
 	env := testEnv(t)
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
 
-	hash, err := ensureConfig(t.Context(), env, site)
+	hash, err := ensureConfig(t, env, site)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -188,7 +191,7 @@ func TestEnsureConfigAdoptsExistingAndPreservesData(t *testing.T) {
 	env := testEnv(t, existing)
 	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
 
-	hash, err := ensureConfig(t.Context(), env, site)
+	hash, err := ensureConfig(t, env, site)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -216,8 +219,8 @@ func TestCleanupDeletesPerSiteResourcesOnly(t *testing.T) {
 
 	env := testEnv(t, ds, cm, otherDS)
 
-	if err := (Component{}).Cleanup(t.Context(), env, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}); err != nil {
-		t.Fatalf("Cleanup: %v", err)
+	if err := cleanup(t, env, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}); err != nil {
+		t.Fatalf("cleanup: %v", err)
 	}
 
 	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(ds), &appsv1.DaemonSet{}); !apierrors.IsNotFound(err) {
@@ -288,5 +291,179 @@ func assertSiteAffinityMap(t *testing.T, affinity map[string]any, siteName strin
 		if !seen {
 			t.Fatalf("site affinity missing key %q", key)
 		}
+	}
+}
+
+// ensureConfig plans and executes the per-site config operation, mirroring what
+// the reconciler does so these tests exercise the production path, including
+// owner-reference adoption of an existing payload.
+func ensureConfig(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) (string, error) {
+	t.Helper()
+
+	hash, op, err := planConfig(t.Context(), env, site)
+	if err != nil {
+		return "", err
+	}
+
+	if op == nil {
+		return hash, nil
+	}
+
+	plan := component.NewPlan()
+	plan.Add(*op)
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return "", err
+	}
+
+	return hash, exec.Err()
+}
+
+// cleanup plans and executes the component's cleanup, mirroring the reconciler.
+func cleanup(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) error {
+	t.Helper()
+
+	c := Component{}
+
+	plan, _, err := c.CleanupPlan(t.Context(), env, site)
+	if err != nil {
+		return err
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return err
+	}
+
+	return exec.Err()
+}
+
+// reconcile plans and executes the component, mirroring the reconciler.
+func reconcile(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) component.Result {
+	t.Helper()
+
+	c := Component{}
+
+	plan, res, err := c.Plan(t.Context(), env, site)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	return component.CombineResult(c.Name(), res, exec)
+}
+
+// TestPlanGolden pins the complete set of operations the storage component
+// plans for one Site.
+//
+// This is the safety net for the plan-then-execute conversion and for anything
+// that later changes what storage writes. The reaper gates its migration on the
+// per-site DaemonSet name and the config-hash annotation it carries
+// (internal/operator/migrate.go), so an object silently appearing,
+// disappearing, or being renamed here breaks the upgrade path rather than
+// failing a test.
+//
+// The namespace and RBAC are shared across Sites and carry a shared key so the
+// executor writes them once per pass rather than once per Site.
+func TestPlanGolden(t *testing.T) {
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "uid-a"}}
+	env := testEnv(t)
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, site)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	want := `CreateIfAbsent ConfigMap/unbounded-system/unbounded-storage-config-rack-a
+Apply Namespace/unbounded-system [shared]
+Apply ServiceAccount/unbounded-system/unbounded-storage-supervisor [shared]
+Apply ClusterRole/unbounded-storage-supervisor [shared]
+Apply ClusterRoleBinding/unbounded-storage-supervisor [shared]
+Apply DaemonSet/unbounded-system/unbounded-storage-supervisor-rack-a [overridable] [after ConfigMap/unbounded-system/unbounded-storage-config-rack-a]
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestCleanupPlanGolden pins what disabling storage for a Site removes. It must
+// stay scoped to the per-Site resources; the shared namespace and RBAC belong
+// to every Site.
+func TestCleanupPlanGolden(t *testing.T) {
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+
+	plan, res, err := (Component{}).CleanupPlan(t.Context(), testEnv(t), site)
+	if err != nil {
+		t.Fatalf("CleanupPlan: %v", err)
+	}
+
+	if !res.Ready || res.Reason != component.ReasonDisabled {
+		t.Fatalf("result = %+v, want ready with reason %q", res, component.ReasonDisabled)
+	}
+
+	want := `Delete DaemonSet/unbounded-system/unbounded-storage-supervisor-rack-a
+Delete ConfigMap/unbounded-system/unbounded-storage-config-rack-a
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestReconcileAppliesPlannedObjects exercises the full plan-then-execute path
+// and asserts the executor writes exactly what the plan described, including
+// creating the per-site ConfigMap before the DaemonSet that carries its hash.
+func TestReconcileAppliesPlannedObjects(t *testing.T) {
+	applied := map[string]bool{}
+
+	scheme := testEnv(t).Scheme
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				named, ok := obj.(interface {
+					GetKind() string
+					GetName() string
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				applied[named.GetKind()+"/"+named.GetName()] = true
+
+				return nil
+			},
+		}).
+		Build()
+
+	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "uid-a"}}
+
+	if res := reconcile(t, env, site); !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	if !applied["DaemonSet/unbounded-storage-supervisor-rack-a"] {
+		t.Fatal("per-site DaemonSet was planned but never applied")
+	}
+
+	// The create-if-absent config must have reached the cluster too.
+	var cm corev1.ConfigMap
+	if err := cl.Get(t.Context(), client.ObjectKey{
+		Namespace: component.DefaultNamespace,
+		Name:      "unbounded-storage-config-rack-a",
+	}, &cm); err != nil {
+		t.Fatalf("per-site ConfigMap was planned but never created: %v", err)
 	}
 }
