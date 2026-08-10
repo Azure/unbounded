@@ -5,6 +5,7 @@ package nodestart
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -53,7 +54,7 @@ func SetupNVIDIA(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task 
 
 func (s *setupNVIDIA) Name() string { return "setup-nvidia" }
 
-func (s *setupNVIDIA) Do(ctx context.Context) error {
+func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
 	if !s.goalState.Containerd.NvidiaRuntime.Enabled || len(s.goalState.Nvidia.LibMappings) == 0 {
 		s.log.Info("NVIDIA runtime not enabled or no host libraries found, skipping")
 
@@ -64,7 +65,10 @@ func (s *setupNVIDIA) Do(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer unlock()
+
+	defer func() {
+		retErr = errors.Join(retErr, unlock())
+	}()
 
 	// Managed node starts and the nspawn ExecStartPost hook can reach this task
 	// concurrently. The first successful caller creates the lifecycle-scoped
@@ -94,7 +98,7 @@ func (s *setupNVIDIA) Do(ctx context.Context) error {
 	return s.markReady(ctx)
 }
 
-func acquireNVIDIASetupLock(ctx context.Context, machine string) (func(), error) {
+func acquireNVIDIASetupLock(ctx context.Context, machine string) (func() error, error) {
 	const retryInterval = 100 * time.Millisecond
 
 	lockDir := filepath.Join("/run", "unbounded", "locks")
@@ -112,26 +116,45 @@ func acquireNVIDIASetupLock(ctx context.Context, machine string) (func(), error)
 	for {
 		err = unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
-			return func() {
-				unix.Flock(int(file.Fd()), unix.LOCK_UN) //nolint:errcheck // Closing the descriptor also releases the lock.
-				file.Close()                             //nolint:errcheck // There is no useful recovery during deferred cleanup.
+			return func() error {
+				unlockErr := unix.Flock(int(file.Fd()), unix.LOCK_UN)
+				closeErr := file.Close()
+
+				return errors.Join(
+					wrapError("unlock NVIDIA setup", unlockErr),
+					wrapError("close NVIDIA setup lock", closeErr),
+				)
 			}, nil
 		}
 
 		if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
-			file.Close() //nolint:errcheck // Preserve the lock error.
+			closeErr := file.Close()
 
-			return nil, fmt.Errorf("lock NVIDIA setup: %w", err)
+			return nil, errors.Join(
+				fmt.Errorf("lock NVIDIA setup: %w", err),
+				wrapError("close NVIDIA setup lock", closeErr),
+			)
 		}
 
 		select {
 		case <-ctx.Done():
-			file.Close() //nolint:errcheck // Preserve the context error.
+			closeErr := file.Close()
 
-			return nil, fmt.Errorf("wait for NVIDIA setup lock: %w", ctx.Err())
+			return nil, errors.Join(
+				fmt.Errorf("wait for NVIDIA setup lock: %w", ctx.Err()),
+				wrapError("close NVIDIA setup lock", closeErr),
+			)
 		case <-time.After(retryInterval):
 		}
 	}
+}
+
+func wrapError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
