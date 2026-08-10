@@ -12,8 +12,9 @@ import (
 
 // StartNode returns a composite task that configures and starts an nspawn
 // machine node: configuring containerd and kubelet in parallel, then starting
-// the nspawn machine, setting up NVIDIA (if applicable), starting containerd
-// and kubelet in sequence.
+// the nspawn machine and starting containerd and kubelet in sequence. NVIDIA
+// setup is owned by the nspawn ExecStartPost lifecycle hook; GPU services remain
+// blocked on its readiness gate.
 //
 // This is the shared node-start sequence used by both the initial agent start
 // and node update flows. Callers that need to persist the applied config for
@@ -28,7 +29,6 @@ func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
 		SetupLocalDNSNetwork(log, gs),
 		StartNSpawnMachine(log, gs),
 		WaitForLocalDNS(log, gs),
-		SetupNVIDIA(log, gs),
 		StartContainerd(log, gs),
 		ImportContainerImages(log, gs),
 		StartKubelet(log, gs),

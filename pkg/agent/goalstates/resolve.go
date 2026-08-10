@@ -33,10 +33,27 @@ type MachineGoalState struct {
 	NodeStart *NodeStart
 }
 
+type resolveNVIDIAHostFunc func(string) (NvidiaHost, error)
+
 // ResolveNSpawnConfig probes only the host state needed to render the
 // systemd-nspawn configuration for a machine. Unlike ResolveMachine, it does
 // not resolve network-dependent node services such as LocalDNS.
 func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, error) {
+	return resolveNSpawnConfig(cfg, machineName, nil, ResolveNvidiaHost)
+}
+
+// ResolveNSpawnConfigForNVIDIACapability refreshes nspawn host state without
+// allowing discovery to change an existing machine's provisioned capability.
+func ResolveNSpawnConfigForNVIDIACapability(cfg *config.AgentConfig, machineName string, nvidiaRequired bool) (*RootFS, error) {
+	return resolveNSpawnConfig(cfg, machineName, &nvidiaRequired, ResolveNvidiaHost)
+}
+
+func resolveNSpawnConfig(
+	cfg *config.AgentConfig,
+	machineName string,
+	provisionedNVIDIARequired *bool,
+	resolveNVIDIA resolveNVIDIAHostFunc,
+) (*RootFS, error) {
 	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
 		return nil, err
 	}
@@ -46,7 +63,7 @@ func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, 
 		return nil, err
 	}
 
-	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
+	nvidia, err := resolveNVIDIA(runtime.GOARCH)
 	if err != nil {
 		return nil, fmt.Errorf("resolve nvidia host: %w", err)
 	}
@@ -55,6 +72,14 @@ func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, 
 	// disable switch (PR #309) must be applied here before persisting the
 	// lifecycle state, rather than in either lifecycle phase.
 	nvidiaRequired := len(nvidia.GPUDevicePaths) > 0
+	if provisionedNVIDIARequired != nil {
+		nvidiaRequired = *provisionedNVIDIARequired
+	}
+
+	if nvidiaRequired && !NVIDIAStateAvailable(nvidia) {
+		return nil, fmt.Errorf("NVIDIA is required for machine %s but fresh host state is incomplete", machineName)
+	}
+
 	if !nvidiaRequired {
 		nvidia = NvidiaHost{}
 	}
@@ -84,9 +109,51 @@ func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, 
 // resolves the complete goal state for the named nspawn machine from an agent
 // config and caller-provided download overrides.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
+	return resolveMachine(log, cfg, machineName, downloads, nil, ResolveNvidiaHost)
+}
+
+// ResolveExistingMachine resolves a managed restart using the validated
+// capability persisted when the machine was provisioned. Fresh host state is
+// still discovered, but it cannot change a GPU machine into a CPU machine or
+// enable NVIDIA on a CPU machine.
+func ResolveExistingMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
+	return resolveExistingMachine(
+		log,
+		cfg,
+		machineName,
+		downloads,
+		NSpawnLifecycleStatePath(machineName),
+		ResolveNvidiaHost,
+	)
+}
+
+func resolveExistingMachine(
+	log *slog.Logger,
+	cfg *config.AgentConfig,
+	machineName string,
+	downloads *DownloadOverrides,
+	lifecycleStatePath string,
+	resolveNVIDIA resolveNVIDIAHostFunc,
+) (*MachineGoalState, error) {
+	state, err := LoadNSpawnLifecycleState(lifecycleStatePath, machineName)
+	if err != nil {
+		return nil, err
+	}
+
+	return resolveMachine(log, cfg, machineName, downloads, &state.NVIDIARequired, resolveNVIDIA)
+}
+
+func resolveMachine(
+	log *slog.Logger,
+	cfg *config.AgentConfig,
+	machineName string,
+	downloads *DownloadOverrides,
+	provisionedNVIDIARequired *bool,
+	resolveNVIDIA resolveNVIDIAHostFunc,
+) (*MachineGoalState, error) {
 	sandboxImage := cfg.CRI.Containerd.SandboxImage
 
-	nspawnConfig, err := ResolveNSpawnConfig(cfg, machineName)
+	nspawnConfig, err := resolveNSpawnConfig(cfg, machineName, provisionedNVIDIARequired, resolveNVIDIA)
 	if err != nil {
 		return nil, err
 	}

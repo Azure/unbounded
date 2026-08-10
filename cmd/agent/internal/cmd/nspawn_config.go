@@ -19,7 +19,7 @@ import (
 )
 
 type (
-	resolveNSpawnConfigFunc  func(*provision.AgentConfig, string) (*goalstates.RootFS, error)
+	resolveNSpawnConfigFunc  func(*provision.AgentConfig, string, bool) (*goalstates.RootFS, error)
 	executeLifecycleTaskFunc func(context.Context, *slog.Logger, phases.Task) error
 	reloadSystemdFunc        func(context.Context, *slog.Logger) error
 )
@@ -32,7 +32,7 @@ func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineNa
 		goalstates.AppliedConfigPath(machineName),
 		goalstates.AppliedConfigChecksumPath(machineName),
 		goalstates.NSpawnLifecycleStatePath(machineName),
-		goalstates.ResolveNSpawnConfig,
+		goalstates.ResolveNSpawnConfigForNVIDIACapability,
 		phases.ExecuteTask,
 		func(ctx context.Context, log *slog.Logger) error {
 			return executil.RunCmd(ctx, log, executil.Systemctl(), "daemon-reload")
@@ -48,7 +48,7 @@ func nspawnLifecyclePreStart(
 	executeTask executeLifecycleTaskFunc,
 	reloadSystemd reloadSystemdFunc,
 ) error {
-	state, err := loadNSpawnLifecycleState(statePath, machineName)
+	state, err := goalstates.LoadNSpawnLifecycleState(statePath, machineName)
 	if err != nil {
 		return err
 	}
@@ -64,23 +64,12 @@ func nspawnLifecyclePreStart(
 		return nil
 	}
 
-	rootFS, err := resolve(cfg, machineName)
+	rootFS, err := resolve(cfg, machineName, state.NVIDIARequired)
 	if err != nil {
 		return fmt.Errorf("resolve nspawn config goal state: %w", err)
 	}
 
-	rootFS.NVIDIARequired = state.NVIDIARequired
 	rootFS.LifecycleStateFile = statePath
-
-	if state.NVIDIARequired {
-		if !goalstates.NVIDIAStateAvailable(rootFS.Nvidia) {
-			return fmt.Errorf("NVIDIA is required for machine %s but host discovery is incomplete", machineName)
-		}
-	} else {
-		// Capability is selected at provisioning time. Do not turn a CPU node
-		// into a GPU node merely because hardware appears later.
-		rootFS.Nvidia = goalstates.NvidiaHost{}
-	}
 
 	if err := executeTask(ctx, log, rootfs.EnsureNSpawnConfig(log, rootFS)); err != nil {
 		return fmt.Errorf("regenerate nspawn config for %s: %w", machineName, err)
@@ -135,24 +124,6 @@ func loadAppliedConfig(log *slog.Logger, path, checksumPath string) (*provision.
 	}
 
 	return &cfg, true, nil
-}
-
-func loadNSpawnLifecycleState(path, machineName string) (*goalstates.NSpawnLifecycleState, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read nspawn lifecycle state %s: %w", path, err)
-	}
-
-	var state goalstates.NSpawnLifecycleState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("decode nspawn lifecycle state %s: %w", path, err)
-	}
-
-	if err := state.Validate(machineName); err != nil {
-		return nil, fmt.Errorf("validate nspawn lifecycle state %s: %w", path, err)
-	}
-
-	return &state, nil
 }
 
 func validateNSpawnMachine(machineName string) error {

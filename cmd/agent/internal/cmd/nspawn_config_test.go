@@ -70,14 +70,18 @@ func TestNSpawnLifecyclePreStartPersistsExactResolvedNVIDIAState(t *testing.T) {
 
 	err := nspawnLifecyclePreStart(
 		context.Background(), testLogger(), "kube1", configPath, checksumPath, statePath,
-		func(*provision.AgentConfig, string) (*goalstates.RootFS, error) { return root, nil },
+		func(_ *provision.AgentConfig, _ string, required bool) (*goalstates.RootFS, error) {
+			require.True(t, required)
+
+			return root, nil
+		},
 		phases.ExecuteTask,
 		func(context.Context, *slog.Logger) error { reloaded = true; return nil },
 	)
 	require.NoError(t, err)
 	require.True(t, reloaded)
 
-	got, err := loadNSpawnLifecycleState(statePath, "kube1")
+	got, err := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
 	require.NoError(t, err)
 	require.Equal(t, resolved, got.NVIDIA)
 
@@ -95,16 +99,19 @@ func TestNSpawnLifecyclePreStartGPUDiscoveryFailureDoesNotReplaceState(t *testin
 	old := completeNVIDIA("old")
 	writeLifecycleState(t, statePath, true, old)
 
-	root := temporaryRootFS(dir)
 	err := nspawnLifecyclePreStart(
 		context.Background(), testLogger(), "kube1", configPath, checksumPath, statePath,
-		func(*provision.AgentConfig, string) (*goalstates.RootFS, error) { return root, nil },
+		func(_ *provision.AgentConfig, _ string, required bool) (*goalstates.RootFS, error) {
+			require.True(t, required)
+
+			return nil, errors.New("NVIDIA is required")
+		},
 		func(context.Context, *slog.Logger, phases.Task) error { return errors.New("must not execute") },
 		func(context.Context, *slog.Logger) error { return errors.New("must not reload") },
 	)
 	require.ErrorContains(t, err, "NVIDIA is required")
 
-	got, loadErr := loadNSpawnLifecycleState(statePath, "kube1")
+	got, loadErr := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
 	require.NoError(t, loadErr)
 	require.Equal(t, old, got.NVIDIA)
 }
@@ -121,13 +128,19 @@ func TestNSpawnLifecyclePreStartCPUNodeIgnoresAppearingGPU(t *testing.T) {
 	root.Nvidia = completeNVIDIA("appeared")
 	err := nspawnLifecyclePreStart(
 		context.Background(), testLogger(), "kube1", configPath, checksumPath, statePath,
-		func(*provision.AgentConfig, string) (*goalstates.RootFS, error) { return root, nil },
+		func(_ *provision.AgentConfig, _ string, required bool) (*goalstates.RootFS, error) {
+			require.False(t, required)
+
+			root.Nvidia = goalstates.NvidiaHost{}
+
+			return root, nil
+		},
 		phases.ExecuteTask,
 		func(context.Context, *slog.Logger) error { return nil },
 	)
 	require.NoError(t, err)
 
-	got, loadErr := loadNSpawnLifecycleState(statePath, "kube1")
+	got, loadErr := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
 	require.NoError(t, loadErr)
 	require.False(t, got.NVIDIARequired)
 	require.Empty(t, got.NVIDIA.GPUDevicePaths)
@@ -142,7 +155,7 @@ func TestNSpawnLifecyclePreStartBootstrapAndStaleState(t *testing.T) {
 
 	err := nspawnLifecyclePreStart(
 		context.Background(), testLogger(), "kube1", filepath.Join(dir, "missing"), filepath.Join(dir, "missing.sha256"), statePath,
-		func(*provision.AgentConfig, string) (*goalstates.RootFS, error) {
+		func(*provision.AgentConfig, string, bool) (*goalstates.RootFS, error) {
 			return nil, errors.New("must not resolve")
 		},
 		func(context.Context, *slog.Logger, phases.Task) error { return errors.New("must not execute") },
@@ -160,7 +173,7 @@ func TestNSpawnLifecyclePreStartBootstrapAndStaleState(t *testing.T) {
 	data, err = json.Marshal(&state)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(statePath, data, 0o600))
-	_, err = loadNSpawnLifecycleState(statePath, "kube1")
+	_, err = goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
 	require.ErrorContains(t, err, "not \"kube1\"")
 }
 

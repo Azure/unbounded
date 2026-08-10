@@ -4,7 +4,9 @@
 package goalstates
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 )
@@ -24,6 +26,25 @@ type NSpawnLifecycleState struct {
 
 func NSpawnLifecycleStatePath(machineName string) string {
 	return filepath.Join(AgentConfigDir, machineName+"-nspawn-lifecycle.json")
+}
+
+// LoadNSpawnLifecycleState loads and validates a persisted lifecycle handoff.
+func LoadNSpawnLifecycleState(path, machineName string) (*NSpawnLifecycleState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read nspawn lifecycle state %s: %w", path, err)
+	}
+
+	var state NSpawnLifecycleState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("decode nspawn lifecycle state %s: %w", path, err)
+	}
+
+	if err := state.Validate(machineName); err != nil {
+		return nil, fmt.Errorf("validate nspawn lifecycle state %s: %w", path, err)
+	}
+
+	return &state, nil
 }
 
 func (s *NSpawnLifecycleState) Validate(machineName string) error {

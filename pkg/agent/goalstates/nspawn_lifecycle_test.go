@@ -4,6 +4,9 @@
 package goalstates
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -40,6 +43,34 @@ func TestNSpawnLifecycleStateValidation(t *testing.T) {
 
 	err = (&NSpawnLifecycleState{Version: NSpawnLifecycleStateVersion + 1, MachineName: "kube1"}).Validate("kube1")
 	require.ErrorContains(t, err, "unsupported")
+}
+
+func TestLoadNSpawnLifecycleState(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	state := NSpawnLifecycleState{
+		Version:        NSpawnLifecycleStateVersion,
+		MachineName:    "kube1",
+		NVIDIARequired: true,
+		NVIDIA: NvidiaHost{
+			GPUDevicePaths: []string{"/dev/nvidia0"},
+			LibMappings:    []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
+			DriverVersion:  "580.1",
+		},
+	}
+	data, err := json.Marshal(&state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	got, err := LoadNSpawnLifecycleState(path, "kube1")
+	require.NoError(t, err)
+	require.Equal(t, &state, got)
+
+	require.NoError(t, os.WriteFile(path, []byte("{"), 0o600))
+	_, err = LoadNSpawnLifecycleState(path, "kube1")
+	require.ErrorContains(t, err, "decode nspawn lifecycle state")
 }
 
 func TestResolveContainerdUsesProvisionedNVIDIACapability(t *testing.T) {

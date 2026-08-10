@@ -4,8 +4,10 @@
 package goalstates
 
 import (
+	"encoding/json"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -31,6 +33,67 @@ func TestResolveNSpawnConfigDoesNotResolveLocalDNS(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "/var/lib/machines/kube1", got.MachineDir)
 	require.Equal(t, "/etc/systemd/nspawn/kube1.nspawn", got.NSpawnConfigFile)
+}
+
+func TestResolveMachineWithPersistedGPUCapabilityRejectsTransientEmptyDiscovery(t *testing.T) {
+	t.Parallel()
+
+	statePath := writeResolvedLifecycleState(t, true, completeResolvedNVIDIA())
+	_, err := resolveExistingMachine(
+		discardLogger(),
+		&config.AgentConfig{},
+		NSpawnMachineKube1,
+		nil,
+		statePath,
+		func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
+	)
+	require.ErrorContains(t, err, "NVIDIA is required")
+}
+
+func TestResolveMachineWithPersistedCPUCapabilityIgnoresAppearingGPU(t *testing.T) {
+	t.Parallel()
+
+	statePath := writeResolvedLifecycleState(t, false, NvidiaHost{})
+	gs, err := resolveExistingMachine(
+		discardLogger(),
+		&config.AgentConfig{},
+		NSpawnMachineKube1,
+		nil,
+		statePath,
+		func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
+	)
+	require.NoError(t, err)
+	require.False(t, gs.RootFS.NVIDIARequired)
+	require.Empty(t, gs.RootFS.Nvidia.GPUDevicePaths)
+	require.False(t, gs.NodeStart.NVIDIARequired)
+	require.False(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
+	require.Empty(t, gs.NodeStart.Nvidia.GPUDevicePaths)
+}
+
+func writeResolvedLifecycleState(t *testing.T, required bool, nvidia NvidiaHost) string {
+	t.Helper()
+
+	state := NSpawnLifecycleState{
+		Version:        NSpawnLifecycleStateVersion,
+		MachineName:    NSpawnMachineKube1,
+		NVIDIARequired: required,
+		NVIDIA:         nvidia,
+	}
+	data, err := json.Marshal(&state)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "lifecycle.json")
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	return path
+}
+
+func completeResolvedNVIDIA() NvidiaHost {
+	return NvidiaHost{
+		GPUDevicePaths: []string{"/dev/nvidia0"},
+		LibMappings:    []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
+		DriverVersion:  "580.1",
+	}
 }
 
 func TestResolveOCIImage_ConfigImageTakesPrecedence(t *testing.T) {

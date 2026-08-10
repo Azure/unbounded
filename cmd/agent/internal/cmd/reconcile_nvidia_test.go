@@ -104,10 +104,10 @@ func TestNSpawnLifecyclePostStartRejectsMissingAndCorruptState(t *testing.T) {
 
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "missing.json")
-	_, err := loadNSpawnLifecycleState(statePath, "kube1")
+	_, err := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
 	require.ErrorIs(t, err, os.ErrNotExist)
 
 	require.NoError(t, os.WriteFile(statePath, []byte("{"), 0o600))
-	_, err = loadNSpawnLifecycleState(statePath, "kube1")
+	_, err = goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
 	require.ErrorContains(t, err, "decode nspawn lifecycle state")
 }

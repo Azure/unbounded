@@ -77,7 +77,7 @@ func nspawnLifecyclePostStart(
 	setupNVIDIA setupNVIDIATaskFunc,
 	executeTask executeLifecycleTaskFunc,
 ) error {
-	state, err := loadNSpawnLifecycleState(statePath, machineName)
+	state, err := goalstates.LoadNSpawnLifecycleState(statePath, machineName)
 	if err != nil {
 		return err
 	}
