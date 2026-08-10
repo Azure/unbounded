@@ -64,6 +64,9 @@ type ActivationPlan struct {
 	RepairLastGood   bool
 	Service          ServicePlan
 	Actions          []string
+
+	previousLastGoodExists bool
+	previousLastGoodTarget string
 }
 
 // ActivationResult describes a completed host activation.
@@ -141,6 +144,14 @@ func PreflightHostDaemonActivation(
 		}
 	}
 
+	lastGoodExists, lastGoodTarget, err := readSymlinkState(opts.Layout.LastGoodPath)
+	if err != nil {
+		return ActivationPlan{}, fmt.Errorf("inspect last-good agent symlink: %w", err)
+	}
+
+	plan.previousLastGoodExists = lastGoodExists
+	plan.previousLastGoodTarget = lastGoodTarget
+
 	if !plan.InitializeLayout && !plan.CandidateChanged {
 		if _, err := executablePath(opts.Layout.LastGoodPath); errors.Is(err, os.ErrNotExist) {
 			plan.RepairLastGood = true
@@ -208,12 +219,15 @@ func ActivateHostDaemon(
 		}
 	}
 
+	lastGoodProtected := false
+
 	if plan.CandidateChanged {
 		protected, protectErr := symlinkReferencesPath(opts.Layout.LastGoodPath, plan.TargetPath)
 		if protectErr != nil {
 			return ActivationResult{}, fmt.Errorf("resolve last-good agent binary: %w", protectErr)
 		}
 
+		lastGoodProtected = protected
 		if protected {
 			if err := utilio.UpdateSymlink(opts.Layout.LastGoodPath, plan.RollbackPath); err != nil {
 				return ActivationResult{}, fmt.Errorf("protect active agent as last-good: %w", err)
@@ -234,12 +248,17 @@ func ActivateHostDaemon(
 	}
 
 	if err := switchActivationLinks(opts.Layout, plan); err != nil {
-		rollbackErr := utilio.UpdateSymlink(opts.Layout.CurrentPath, plan.RollbackPath)
-		if rollbackErr != nil {
-			rollbackErr = fmt.Errorf("restore current agent symlink after switch failure: %w", rollbackErr)
+		currentRollbackErr := utilio.UpdateSymlink(opts.Layout.CurrentPath, plan.RollbackPath)
+		if currentRollbackErr != nil {
+			currentRollbackErr = fmt.Errorf("restore current agent symlink after switch failure: %w", currentRollbackErr)
 		}
 
-		return ActivationResult{}, errors.Join(err, rollbackErr)
+		var lastGoodRollbackErr error
+		if !lastGoodProtected {
+			lastGoodRollbackErr = restoreLastGoodSymlink(opts.Layout.LastGoodPath, plan)
+		}
+
+		return ActivationResult{}, errors.Join(err, currentRollbackErr, lastGoodRollbackErr)
 	}
 
 	result := ActivationResult{
@@ -384,8 +403,48 @@ func switchActivationLinks(layout Layout, plan ActivationPlan) error {
 		}
 	}
 
-	if err := utilio.UpdateSymlink(layout.BinaryPath, layout.CurrentPath); err != nil {
-		return fmt.Errorf("update compatibility agent symlink: %w", err)
+	if layout.BinaryPath != "" {
+		if err := utilio.UpdateSymlink(layout.BinaryPath, layout.CurrentPath); err != nil {
+			return fmt.Errorf("update compatibility agent symlink: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func readSymlinkState(path string) (bool, string, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, "", nil
+	}
+
+	if err != nil {
+		return false, "", err
+	}
+
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, "", fmt.Errorf("%s is not a symlink", path)
+	}
+
+	target, err := os.Readlink(path)
+	if err != nil {
+		return false, "", err
+	}
+
+	return true, target, nil
+}
+
+func restoreLastGoodSymlink(path string, plan ActivationPlan) error {
+	if plan.previousLastGoodExists {
+		if err := utilio.UpdateSymlink(path, plan.previousLastGoodTarget); err != nil {
+			return fmt.Errorf("restore last-good agent symlink: %w", err)
+		}
+
+		return nil
+	}
+
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove newly created last-good agent symlink: %w", err)
 	}
 
 	return nil
@@ -463,13 +522,14 @@ func AcquireHostActivationLock(path string) (*HostActivationLock, error) {
 	}
 
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		file.Close() //nolint:errcheck // preserve lock acquisition error
+		closeErr := file.Close()
+		lockErr := errors.Join(err, closeErr)
 
 		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
-			return nil, fmt.Errorf("%w: %w", ErrActivationInProgress, err)
+			return nil, fmt.Errorf("%w: %w", ErrActivationInProgress, lockErr)
 		}
 
-		return nil, fmt.Errorf("acquire host agent activation lock: %w", err)
+		return nil, fmt.Errorf("acquire host agent activation lock: %w", lockErr)
 	}
 
 	return &HostActivationLock{file: file}, nil
