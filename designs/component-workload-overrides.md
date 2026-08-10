@@ -17,7 +17,7 @@ unbounded-operator generates and reconciles.
 7. [Merge semantics](#7-merge-semantics)
 8. [Permitted and protected fields](#8-permitted-and-protected-fields)
 9. [Failure and update semantics](#9-failure-and-update-semantics)
-10. [Wiring](#10-wiring)
+10. [Wiring and execution](#10-wiring)
 11. [Drift visibility and observability](#11-drift-visibility-and-observability)
 12. [CLI](#12-cli)
 13. [Operational notes](#13-operational-notes)
@@ -564,7 +564,7 @@ rules are fixed rather than inherited from whichever YAML library is used:
 | Empty or whitespace-only key | Ignored, not an error. `kubectl create configmap --from-file` on an empty file is a plausible accident, not an intent. |
 
 All of these are document-level failures per
-[§9.4](#94-failure-scope): they fail preflight and no override is applied
+[§9.5](#95-failure-scope): they fail preflight and no override is applied
 anywhere.
 
 ### 6.3 Resolution
@@ -711,7 +711,7 @@ Precedence is defined and documented: if an entry sets both `patch` (replacing
 followed by the appended arguments. Naming a container that does not exist in
 the generated workload is a **resolution** failure, not a schema failure: it is
 scoped to the affected object and reported as Degraded
-([§9.4](#94-failure-scope)), because container names are release-specific and
+([§9.5](#95-failure-scope)), because container names are release-specific and
 the syntactic compatibility promise in [§2](#2-goals-and-non-goals) must not be
 contradicted by one.
 
@@ -815,7 +815,7 @@ generated workload. Adding one requires naming it explicitly:
 A name in `addContainers` that already exists in the workload is a validation
 error, since the intent was to create rather than modify. A name in the patch
 that is neither present in the workload nor listed in `addContainers` is a
-resolution failure ([§9.4](#94-failure-scope)). The two rules together mean
+resolution failure ([§9.5](#95-failure-scope)). The two rules together mean
 neither a typo nor a renamed operator container can silently become a sidecar.
 
 ### 8.3 Protected
@@ -912,59 +912,76 @@ An override document is user-authored input that the API server accepts without
 validation. The operator must therefore define what happens when it is wrong,
 and in particular must never let a bad edit silently undo a good one.
 
-### 9.1 Render, then validate, then apply
+### 9.1 Preflight atomicity, not transactional apply
 
-Validation is atomic because rendering is separated from applying. Each pass:
+An earlier revision claimed the pass would "apply everything, or nothing".
+That is not achievable. Kubernetes offers no multi-object transaction and no
+rollback; `applyManifestData` issues one API call per object
+([§3.9](#3-constraints-from-the-current-design)), so a failure on the fifth
+leaves the first four written.
+
+What is achievable is **preflight atomicity**: everything that can be decided
+without touching the cluster is decided before anything is written.
 
 ```
-1. render    every enabled component produces its objects, no writes
-2. validate  parse, schema, allowlist, protected paths, resolution, merge
-3. apply     write everything, or nothing for the affected components
+1. snapshot   read the overrides ConfigMap once, record its resourceVersion
+2. preflight  parse, schema, allowlist, protected paths, directives, nulls
+              pure function of the snapshot; no cluster access, no writes
+3. plan       every enabled component produces an operation plan; no writes
+4. resolve    merge overrides into Overridable operations, per object
+5. execute    run the plan; NOT atomic, see below
 ```
 
-This ordering is the reason [§14](#14-implementation-plan) sequences the
-render/apply split as a prerequisite. Without it, atomicity is unachievable:
-components write before they reach a workload apply. `storage.go:64` and
-`net.go:64` create a ConfigMap before `ApplyManifestFS`; `metalman.go:45`
-applies its entire RBAC set before the Deployment at `:49`; and
-`applyManifestData` writes object by object in a loop (`env.go:202-237`). A
-resolution failure discovered at the DaemonSet would follow several completed
-writes, and components earlier in the registry would already have been applied
-with their new overrides.
+Steps 1 to 4 are side-effect free. A failure in any of them means nothing was
+written, which is a real guarantee. Step 5 is where the honest limits are.
 
-Resolution belongs in step 2 and not earlier, because it needs the rendered
-object: whether container `run` exists, and whether a `mountPath` collides with
-an operator mount, are not answerable from the ConfigMap alone.
+### 9.2 Execution semantics
 
-Splitting render from apply also requires splitting `ensureConfig`, which today
-both creates the component ConfigMap and returns the hash stamped into the pod
-template. It becomes a read-only hash computation used during render, and a
-separate write performed in the apply phase.
+Execution is explicitly non-transactional. The rules exist so that partial
+outcomes are predictable rather than arbitrary:
 
-### 9.2 Invalid overrides skip, they do not revert
+| Property | Behaviour |
+|---|---|
+| **Ordering** | Operations execute in dependency order declared by the plan ([§10.1](#101-the-operation-plan)). A ConfigMap that a workload hashes is written before that workload. Within a dependency level, order is deterministic: component registry order, then kind, then name. |
+| **Continuation** | A failed operation does not abort the pass. Operations that do not depend on it still execute. Operations that do depend on it are **skipped**, not attempted, so a failure does not cascade into a half-configured workload. |
+| **No rollback** | Completed operations are never undone. There is no compensating action, and none is attempted. |
+| **Attribution** | Each failed operation is reported with its component, Site, object identity, and error. Aggregated into the existing `errors.Join` (`reconciler.go:191`). |
+| **Retry** | The pass returns an error and controller-runtime requeues with backoff. Because every operation is idempotent under server-side apply, the retry re-executes the whole plan rather than resuming from a checkpoint. |
+| **Partial status** | Objects that were applied carry their override annotations; objects that were skipped do not. Status therefore reflects what actually happened, not what was intended ([§11](#11-drift-visibility-and-observability)). |
 
-The operator distinguishes three states, because conflating them turns a typo
+A pass that fails partway is a normal, recoverable state: the next reconcile
+recomputes the plan from current cluster state and re-executes it.
+
+### 9.3 Invalid overrides skip, they do not revert
+
+The operator distinguishes four states, because conflating them turns a typo
 into an uninstall:
 
-| ConfigMap state | Behaviour | Rationale |
+| Snapshot state | Behaviour | Rationale |
 |---|---|---|
-| **Absent** | Apply vanilla manifests | Removing overrides is deliberate. Reverting to defaults is the requested outcome. |
-| **Present and valid** | Apply with overrides | |
-| **Present and invalid** | **Skip applying Deployments and DaemonSets.** All other objects reconcile normally. | The user tried to express something and failed. Their intent was not "remove my configuration". |
-| **Unreadable** (API error) | Skip workload applies, return the error, requeue with backoff | Transient. Indistinguishable from invalid for safety purposes. |
+| **Absent** | Execute the full plan with no overrides | Removing overrides is deliberate. Reverting to defaults is the requested outcome. |
+| **Present and valid** | Execute the full plan with overrides merged | |
+| **Present and invalid** | Drop every `Overridable` operation from the plan; execute the rest | The user tried to express something and failed. Their intent was not "remove my configuration". |
+| **Unreadable** (API error) | As invalid, plus return the error so the pass requeues | Transient. Treated as invalid for safety. |
+
+**The blast radius is the workloads, not the pass.** Only operations marked
+`Overridable`, meaning the Deployments and DaemonSets an override could target,
+are dropped. RBAC, Services, component ConfigMaps, adoptions and deletes all
+continue to reconcile normally. An override typo must not stop the operator
+doing its other work.
 
 Applying vanilla manifests on invalid input was considered and rejected. It is
 not a safe fallback, because defaults are not the current state: falling back
 rewrites running infrastructure. A single mis-indented line would strip
 resources, tolerations, sidecars, and pinned images from every component and
 roll all of them at once, with a zero-available window on the two host-networked
-workloads that use `maxSurge: 0`
-([§13](#13-operational-notes)). A typo must not be able to cause that.
+workloads that use `maxSurge: 0` ([§13](#13-operational-notes)). A typo must not
+be able to cause that.
 
-Skipping leaves the fleet exactly as it is. The cluster holds the last good
-state because the operator does not write, which makes the behaviour
-**restart-safe by construction**. This matters concretely: the operator runs
-`replicas: 1` with `strategy: Recreate`
+Dropping the operations instead leaves those workloads exactly as they are. The
+cluster holds the last good state because the operator does not write, which
+makes the behaviour **restart-safe by construction**. This matters concretely:
+the operator runs `replicas: 1` with `strategy: Recreate`
 (`deploy/unbounded-operator/04-deployment.yaml.tmpl:13-16`), so it restarts on
 every upgrade. An earlier revision cached last-known-good in memory, which that
 restart discards; the next apply would then have stripped every override. There
@@ -975,15 +992,18 @@ DaemonSets is not corrected. A workload someone edited by hand stays edited
 until the override document is fixed. That is recoverable and non-disruptive,
 which the alternative is not.
 
-### 9.3 Failure is loud
+### 9.4 Failure is loud
 
-Skipping is not silent. Every invalid-override pass produces:
+Dropping operations is not silent. Every invalid-override pass produces:
 
 - An **error-level log** naming the ConfigMap key, the entry index, and the
   specific failure.
 - A **Degraded condition** on every affected component, so `kubectl wait` and
   any condition-based alerting fire.
-- An **Event** on the Site.
+- An **Event on the overrides ConfigMap itself**, which exists whenever
+  overrides do and is the object the user edited. Events on Sites are emitted
+  too, but the ConfigMap is the durable observation point when no Site exists
+  ([§11](#11-drift-visibility-and-observability)).
 - A **requeue with backoff**, repeating until the document is fixed.
 - `kubectl unbounded overrides status` reporting the parse error and which
   workloads are consequently unmanaged.
@@ -991,23 +1011,46 @@ Skipping is not silent. Every invalid-override pass produces:
 This is louder than applying vanilla manifests would be, which produces a
 rollout, one log line, and a Site still reporting `Ready=True`.
 
-### 9.4 Failure scope
+### 9.5 Failure scope
 
 | Failure | Scope | Result |
 |---|---|---|
-| Malformed YAML, missing or unknown `apiVersion`, schema violation | Whole ConfigMap | Skip all workload applies, every component Degraded |
-| Path outside the allowlist, protected path, `$` directive, explicit null | Whole ConfigMap | As above |
-| Resolution: container absent and not in `addContainers`, name in `addContainers` that already exists, `mountPath` collision | That object only | Object not applied; other objects reconcile normally |
-| True conflict between contributors to one resolved object | That object only | As above |
+| Parse: malformed YAML, duplicate keys, multiple documents, trailing content, merge keys ([§6.2](#62-parsing-rules)) | Whole snapshot | Preflight fails. Every `Overridable` operation dropped, every component Degraded. |
+| Missing or unknown `apiVersion`, schema violation | Whole snapshot | As above |
+| Path outside the allowlist, protected path, `$` directive, explicit null | Whole snapshot | As above |
+| Resolution: container absent and not in `addContainers`, name in `addContainers` that already exists, `mountPath` collision | That object only | That object's operation dropped; every other operation executes |
+| Conflict between contributors ([§6.5](#65-what-counts-as-a-conflict)) | That object only | As above |
 | `sites` naming a Site that does not exist | Nothing | Inert, reported ([§6.3](#63-resolution)) |
+| API or admission error during execution | That operation and its dependents | Per [§9.2](#92-execution-semantics) |
 
-Document-level failures are ConfigMap-wide because a document that does not
-parse cannot be attributed to a component. Resolution and conflict failures are
-object-scoped because they can be, and because step 2 of
-[§9.1](#91-render-then-validate-then-apply) knows exactly which object failed
-before anything is written.
+Preflight failures are snapshot-wide because a document that does not parse
+cannot be attributed to a component. Resolution and conflict failures are
+object-scoped because step 4 knows exactly which object failed before anything
+is written.
 
-### 9.5 Desired versus applied
+### 9.6 Snapshot and consistency
+
+Each pass reads the overrides ConfigMap **once** and records the observed
+`resourceVersion`. Every decision in that pass derives from that single
+snapshot, so a result is always traceable to a specific input version.
+
+This matters because passes are not serialized against user edits. A user can
+write the ConfigMap while a pass is executing, and different passes routinely
+observe different versions. Without a recorded version, two Sites could carry
+results computed from different inputs with nothing to indicate it.
+
+| Question | Answer |
+|---|---|
+| What version produced this result? | `SiteStatus.Overrides.ObservedResourceVersion` |
+| Can two Sites disagree? | Yes, transiently, when a pass for one Site precedes an edit and a pass for another follows it. Both record which version they saw. |
+| How does it converge? | The ConfigMap watch enqueues a pass on every payload change ([§10.3](#103-watch-and-fan-out)), so a newer version always triggers reconciliation of every Site. |
+| Is a stale snapshot harmful? | No. It produces a correct result for an older input, superseded by the pass the newer version triggers. |
+
+The operator does **not** attempt read-modify-write consistency against the
+ConfigMap, because it never writes it. There is no lost-update hazard, only a
+convergence delay bounded by watch delivery.
+
+### 9.7 Desired versus applied
 
 Divergence must be observable rather than inferred, but the two values have to
 be comparable to mean anything.
@@ -1021,64 +1064,131 @@ than one workload is targeted, so the signal was always on.
 | Value | Where | Meaning |
 |---|---|---|
 | `unbounded-cloud.io/override-hash` | Annotation on the workload | Hash of the contributor set actually merged into this object |
-| Desired hash | Computed in `SiteStatus.Overrides` and by the CLI | Same computation over the current ConfigMap for the same object |
+| `SiteStatus.Overrides.Workloads[].DesiredHash` | Site status, written by the operator | Same computation over the snapshot, for the same object |
+| `SiteStatus.Overrides.Workloads[].AppliedHash` | Site status, read back from the object | Mirrors the annotation |
 
-Desired is **computed, not annotated**. Writing it would require touching an
-object the operator has just decided not to apply, contradicting
-[§9.2](#92-invalid-overrides-skip-they-do-not-revert). Comparison happens in
-status and in `overrides status`, both of which read the live annotation and
-recompute the desired value.
+Desired is **computed by the operator and persisted in status**, never written
+as an annotation. Annotating an object the operator has just decided not to
+apply would contradict [§9.3](#93-invalid-overrides-skip-they-do-not-revert),
+and persisting it in status is what allows the CLI to report divergence without
+recomputing anything ([§12](#12-cli)).
 
 ## 10. Wiring
 
-### 10.1 Component contract
+### 10.1 The operation plan
 
-The render/apply split gives components one new capability:
+An earlier revision proposed components returning `[]*unstructured.Unstructured`.
+That cannot represent what components actually do
+([§3.10](#3-constraints-from-the-current-design)): create-if-absent, owner-
+reference adoption, deletion, conditional retention, shared objects, or
+ordering. A list of objects has no way to say "create this only if absent,
+preserving its data" or "this RBAC is the same for every Site".
+
+Components therefore produce an **operation plan**, side-effect free:
 
 ```go
-// Renderer returns the objects a component would apply, without applying them.
-// Implementations must not write. Cluster components receive every Site,
-// because enablement is resolved as "any Site enables it"; per-Site components
-// receive the single Site they are reconciling.
-type ClusterRenderer interface {
-    Render(ctx context.Context, env *Env, sites []unboundedv1alpha3.Site) ([]*unstructured.Unstructured, error)
+// OpKind is what the executor should do with an operation's object.
+type OpKind int
+
+const (
+    // OpApply server-side applies, taking ownership of declared fields.
+    OpApply OpKind = iota
+    // OpCreateIfAbsent creates only when the object does not exist, and never
+    // overwrites an existing payload. Models ensureConfig.
+    OpCreateIfAbsent
+    // OpAdoptOwnerRef adds an owner reference under optimistic lock, leaving
+    // all other fields untouched. Models adoptConfig.
+    OpAdoptOwnerRef
+    // OpDelete removes the object, treating absence as success. Models
+    // Cleanup and legacy reaping.
+    OpDelete
+)
+
+type Operation struct {
+    Kind   OpKind
+    Object *unstructured.Unstructured
+
+    // Component and Site attribute results and scope override resolution.
+    // Site is empty for cluster-scoped operations.
+    Component string
+    Site      string
+
+    // Overridable marks the Deployments and DaemonSets that overrides may
+    // target. Only these are dropped when preflight fails
+    // (§9.3), and only these are merge candidates.
+    Overridable bool
+
+    // SharedKey, when non-empty, identifies an operation that is identical
+    // across Sites and must execute once per pass (§10.4).
+    SharedKey string
+
+    // DependsOn declares ordering. The executor runs dependencies first and
+    // skips dependents when a dependency fails (§9.2).
+    DependsOn []ObjectRef
 }
 
-type SiteRenderer interface {
-    Render(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) ([]*unstructured.Unstructured, error)
+type Plan struct {
+    Operations []Operation
 }
 ```
 
-Two signatures rather than one, because a single-Site signature is wrong for
-`net`, `machina`, and `gantry`, which render from the full Site set
-(`machina.go:47`, `gantry.go:81`).
+Cluster components plan from the full Site set, per-Site components from one
+Site, because enablement for the singletons is resolved as "any Site enables it"
+(`machina.go:47`, `gantry.go:81`):
+
+```go
+type ClusterPlanner interface {
+    Plan(ctx context.Context, env *Env, sites []unboundedv1alpha3.Site) (*Plan, error)
+}
+
+type SitePlanner interface {
+    Plan(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) (*Plan, error)
+}
+```
+
+Planning may **read** cluster state, since decisions like machina's retention
+check (`machina.go:57-69`) and storage's create-versus-adopt branch
+(`storage.go:115-154`) depend on it. It may not write.
 
 `metalman` satisfies this by converting its typed `appsv1.Deployment`
 (`metalman.go:98-196`) to unstructured, so both generation paths
 ([§3.6](#3-constraints-from-the-current-design)) converge before the merge
 rather than at apply.
 
+Mapping the existing behaviour onto operation kinds:
+
+| Existing code | Operation |
+|---|---|
+| `ApplyManifestFS` per object | `OpApply` |
+| `ensureConfig` create branch (`storage.go:136`, `net.go:174`) | `OpCreateIfAbsent` |
+| `adoptConfig` (`storage.go:156-170`) | `OpAdoptOwnerRef` |
+| `Cleanup` (`storage.go:78-90`) | `OpDelete` |
+| `cleanupLegacyNodeConfig` (`gantry.go:170-178`) | `OpDelete` |
+| metalman support RBAC (`metalman.go:45`) | `OpApply` with `SharedKey` |
+| Workload apply | `OpApply` with `Overridable: true` |
+
 ### 10.2 Pass structure
 
 ```
 runComponents
   |
-  +- read overrides ConfigMap                      once per pass
-  +- parse, schema, allowlist validation           pure, atomic
+  +- snapshot overrides ConfigMap, record resourceVersion    §9.6
+  +- preflight: parse, schema, allowlist                     §9.1, pure
   |
-  +- for each enabled component: Render(...)       no writes
-  +- resolve and merge overrides into workloads    per object
+  +- for each enabled component: Plan(...)                   no writes
+  +- deduplicate SharedKey operations                        §10.4
+  +- resolve and merge overrides into Overridable operations
   +- re-stamp protected paths, assert GVK
   |
-  +- for each component: write ConfigMaps, then ApplyObject each rendered object
+  +- execute the plan in dependency order                    §9.2, not atomic
 ```
 
-The merge therefore happens between render and apply rather than inside
+The merge happens between planning and execution rather than inside
 `ApplyObject`. `ApplyObject` retains the `apps/v1` assertion from
 [§8.5](#85-apply-time-assertion) as a defensive layer, not as the mechanism.
 
-`Env` still gains `ForComponent(name, site)` returning a shallow copy, so the
-merge step knows which component and Site an object belongs to. `r.env()`
+`Env` gains `ForComponent(name, site)` returning a shallow copy, so planning and
+merging know which component and Site an operation belongs to. `r.env()`
 constructs a fresh `Env` per Reconcile (`reconciler.go:90-96`), so there is no
 shared mutable state.
 
@@ -1106,40 +1216,69 @@ b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 handle; its signature returns only its own `ctrl.Result` (`reconciler.go:112`),
 so it cannot enqueue other Sites. Rather than introduce a `source.Channel` and
 its attendant acknowledgement and backpressure questions, the Site-less pass
-runs per-Site components inline for every Site it lists.
+plans and executes per-Site components inline for every Site it lists.
 
-This is sound because the controller is single-threaded.
-`MaxConcurrentReconciles` is not configured anywhere in the operator, so it
-takes controller-runtime's default of 1. Consequently:
+**Concurrency is pinned explicitly.** The controller is configured with
+`MaxConcurrentReconciles: 1` rather than inheriting controller-runtime's
+default, so the guarantee is a property of this operator rather than of an
+upstream default that could change:
+
+```go
+ctrl.NewControllerManagedBy(mgr).
+    WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
+    For(&unboundedv1alpha3.Site{}, ...)
+```
+
+What that does and does not buy:
 
 | Concern | Resolution |
 |---|---|
-| Concurrent update | Impossible. One reconcile runs at a time. |
+| Two reconciles racing each other | Prevented. One pass runs at a time. |
 | Acknowledgement | Not needed. Work completes before the pass returns. |
 | Backpressure | Not needed. No queue is involved. |
-| Restart | The pass either completed or it did not; the next reconcile redoes it. Idempotent under SSA. |
-| Partial failure | Errors aggregate into the existing `errors.Join` (`reconciler.go:191`) and the whole pass requeues with backoff. |
+| Restart mid-pass | The next reconcile replans from current state. Every operation is idempotent. |
+| Partial failure | Per [§9.2](#92-execution-semantics). |
+| **External concurrent writes** | **Not prevented.** Users, other controllers, and admission all write the ConfigMap and the workloads while a pass runs. Single-threading says nothing about them. |
 
-The Site-less pass already lists Sites and already returns that error to the
-caller (`reconciler.go:145-148`), so a transient List failure retries rather
-than silently dropping the fan-out.
-
-It also gains a responsibility it does not have today: publishing Site status
-for the per-Site components it runs. `runComponents` currently gates status
-patching on `site != nil` (`reconciler.go:179-189`); that gate moves so the
-inline fan-out reports conditions for each Site it touches.
+That last row corrects a claim an earlier revision made. Concurrent update is
+not impossible; it is merely not self-inflicted. The snapshot model in
+[§9.6](#96-snapshot-and-consistency) is what makes external concurrency safe:
+each pass derives from one recorded `resourceVersion`, a newer version always
+triggers another pass through the watch, and server-side apply makes
+re-execution idempotent.
 
 The cost is an O(Sites) pass on override change. Sites are per-location and
-few, so this is acceptable; `source.Channel` with explicit backpressure is the
-documented fallback if that stops holding.
+few. If Site counts grow past the low hundreds, or if the controller is ever
+parallelized, `source.Channel` with explicit backpressure is the documented
+fallback; both assumptions are recorded in [§17](#17-open-questions).
 
 `ManagedConfigPredicate` (`watch.go:107`) is reused unchanged. It matches on
 namespace, name, and payload change with no ownership requirement, so it works
 on a user-owned ConfigMap.
 
-**Rollout.** No config-hash annotation is needed for the override itself. The
-merge changes the pod template, SSA writes the change, and the workload's own
-rollout strategy takes over.
+### 10.4 Shared operation deduplication
+
+Per-Site planning produces duplicate operations for objects that are not
+per-Site. `metalman.Reconcile` applies the machina support manifests on every
+pass for every Site (`metalman.go:45`), and `mutateSupportObject`
+(`metalman.go:90-96`) keeps only metalman RBAC, which is byte-identical
+regardless of Site. With N Sites that is N applies of the same objects; the
+synchronous fan-out in [§10.3](#103-watch-and-fan-out) multiplies an
+inefficiency that already exists.
+
+Operations carrying a `SharedKey` are therefore collapsed before execution:
+
+1. Index all planned operations by `SharedKey`.
+2. Where several operations share a key, compare their objects semantically.
+3. **Identical**: execute once, attribute the result to every contributing
+   component and Site.
+4. **Not identical**: reject the pass with a conflict error naming the
+   contributors. A shared object that differs by Site is a planning bug, not a
+   user error, and silently letting the last writer win would make the result
+   depend on Site iteration order.
+
+Deduplication happens after planning and before merging, so a shared object is
+never a merge candidate for more than one Site.
 
 ## 11. Drift visibility and observability
 
@@ -1161,13 +1300,13 @@ implementation work, not free:
 
 | Annotation | Meaning |
 |---|---|
-| `unbounded-cloud.io/override-hash` | Hash of the canonical resolved contributor set merged into this object ([§9.5](#95-desired-versus-applied)) |
+| `unbounded-cloud.io/override-hash` | Hash of the canonical resolved contributor set merged into this object ([§9.7](#97-desired-versus-applied)) |
 | `unbounded-cloud.io/override-source` | Contributing ConfigMap keys and entry indices |
 | `unbounded-cloud.io/version-drift` | Present only when a patch changed a container image. Value is `<container>=<image>`. |
 
 The desired hash is deliberately **not** an annotation. Writing it to an object
 the operator has decided not to apply would contradict
-[§9.2](#92-invalid-overrides-skip-they-do-not-revert).
+[§9.3](#93-invalid-overrides-skip-they-do-not-revert).
 
 **On the Site.** `SiteStatus` gains one field:
 
@@ -1178,15 +1317,18 @@ type OverrideStatus struct {
     // +kubebuilder:validation:Enum=None;Applied;Degraded
     Phase string `json:"phase"`
 
-    // DesiredHash is the hash of the override set currently in the ConfigMap,
-    // recomputed each pass. Empty when no overrides target this Site.
+    // ObservedResourceVersion is the resourceVersion of the overrides
+    // ConfigMap this status was computed from (§9.6). Empty when the
+    // ConfigMap is absent.
     // +optional
-    DesiredHash string `json:"desiredHash,omitempty"`
+    ObservedResourceVersion string `json:"observedResourceVersion,omitempty"`
 
-    // Workloads lists each overridden workload and the hash actually applied,
-    // read back from the object. Sorted by kind then name for stability.
+    // Workloads carries desired and applied hashes per workload. Both are
+    // per-workload because contributors differ per workload; a Site-wide
+    // desired hash would not be comparable to any of them.
     // +optional
     // +listType=map
+    // +listMapKey=kind
     // +listMapKey=name
     Workloads []OverriddenWorkload `json:"workloads,omitempty"`
 
@@ -1197,30 +1339,60 @@ type OverrideStatus struct {
 }
 
 type OverriddenWorkload struct {
-    Name        string `json:"name"`
-    Kind        string `json:"kind"`
+    // Kind and Name together identify the workload. Name alone is not unique:
+    // a Deployment and a DaemonSet may share a name.
+    Kind string `json:"kind"`
+    Name string `json:"name"`
+
+    // DesiredHash is computed by the operator from the observed snapshot.
+    // AppliedHash is read back from the object's annotation. They are equal
+    // when the override is in effect, and differ when the operation was
+    // dropped or execution failed.
+    // +optional
+    DesiredHash string `json:"desiredHash,omitempty"`
+    // +optional
     AppliedHash string `json:"appliedHash,omitempty"`
+
+    // VersionDrift is set when the applied override changed a container image,
+    // formatted as `<container>=<image>`.
+    // +optional
     VersionDrift string `json:"versionDrift,omitempty"`
 }
 ```
 
-Semantics:
+Both hashes are per workload. An earlier revision paired one Site-wide
+`DesiredHash` against many per-workload `AppliedHash` values, which are
+incomparable by construction whenever a document targets more than one workload.
+The list is keyed on `kind` **and** `name`, because a Deployment and a DaemonSet
+can legitimately share a name.
 
 | Phase | Meaning |
 |---|---|
 | `None` | No override entry resolves to any workload for this Site. Also the value when the ConfigMap is absent. |
-| `Applied` | Every resolved workload carries an `appliedHash` equal to `desiredHash`. |
-| `Degraded` | The document is invalid, or a resolved object failed, or any `appliedHash` differs from `desiredHash`. `Message` explains which. |
+| `Applied` | Every resolved workload has `AppliedHash == DesiredHash`. |
+| `Degraded` | Preflight failed, or a resolved object failed, or any workload has `AppliedHash != DesiredHash`. `Message` explains which. |
 
 Aggregation is per Site, not per component, because the ConfigMap is
 cluster-scoped and a single document routinely targets several components.
-Component-level detail stays in the existing conditions. With zero Sites the
-field is never written, since there is no Site to write it to; the Site-less
-pass reports override failures through logs and the reconcile error only.
+Component-level detail stays in the existing conditions.
 
 `Ready` on a component condition still means the apply succeeded, not that the
 workload is healthy. `Phase: Applied` likewise means the override merged and was
 written, not that the resulting pods run.
+
+**Zero Sites is still observable.** `SiteStatus` cannot be written when no Site
+exists, yet cluster singletons are deliberately retained in that state
+(`machina.go:57-69`), so overrides can be both configured and failing with
+nowhere to report it. Two mechanisms cover this:
+
+- **Events on the overrides ConfigMap.** It exists whenever overrides do, is the
+  object the user edited, and is the natural place to look. All override
+  outcomes emit here, not only Site-scoped ones.
+- **Error-level logs** naming the ConfigMap key and entry index.
+
+The promise is scoped accordingly: `SiteStatus.Overrides` reports overrides
+affecting Sites that exist; ConfigMap Events and logs report everything,
+including singleton workloads with no Site.
 
 **A printer column** sourced from `.status.overrides.phase`, so a customized or
 degraded install is visible in `kubectl get site` without `-o yaml`. Adding
@@ -1242,23 +1414,48 @@ on every node by other means.
 Overrides are cluster-scoped, so they get a new top-level noun under
 `kubectl unbounded` rather than living under `site`.
 
-**`kubectl unbounded overrides list`** reads the ConfigMap and every Site and
-prints each entry, the objects it resolved to, any Site names that matched
-nothing, and drift flags read back from workload annotations. This is the
-first thing to run on a support case.
+Every command reports what the operator did or would do, and is explicit about
+which of the two it is. The authority problem that rules out client-side
+diffing ([§12.1](#121-why-there-is-no-overrides-diff)) applies to the other
+commands too, so each is scoped to what it can answer correctly.
 
-**`kubectl unbounded overrides validate`** parses and validates without
-applying, reusing the operator's validation path from
-`internal/operator/component`. This narrows the weakest property of ConfigMap
-storage: the API server accepts any ConfigMap, so a malformed document is only
-rejected later, in reconcile, as a Site condition. `validate` moves that
-feedback to authoring time, and can run against a file before it is applied.
+**`kubectl unbounded overrides validate [-f FILE]`** performs **offline syntax
+validation only**: parsing rules ([§6.2](#62-parsing-rules)), schema,
+`apiVersion`, allowlist paths, protected paths, `$` directives, and nulls. Every
+one of these is a pure function of the document, so a client can evaluate them
+correctly regardless of operator version.
 
-**`kubectl unbounded overrides status`** reports, per resolved object, the
-applied and desired override hashes ([§9.5](#95-desired-versus-applied)),
-whether any workload is being skipped and why, image drift, and the
-component conditions. It is authoritative because every value is read back from
-what the operator actually did.
+It deliberately does **not** attempt resolution. Whether container `run` exists,
+or a `mountPath` collides, depends on the workload the running operator renders,
+and a plugin built from a different commit would answer from its own embedded
+manifests. The command says so in its output rather than implying full
+validation:
+
+```
+$ kubectl unbounded overrides validate -f overrides.yaml
+ok: 3 entries, syntax and allowlist valid
+note: container and volume names are resolved by the operator; run
+      `kubectl unbounded overrides status` after applying to confirm
+```
+
+Scoping it this way is what makes it useful: an offline check that is always
+correct beats an online check that is correct only when versions match.
+
+**`kubectl unbounded overrides status`** reports resolution and application, and
+**reads persisted state without recomputing it**. Desired hashes come from
+`SiteStatus.Overrides.Workloads[].DesiredHash`, which the operator computed
+([§9.7](#97-desired-versus-applied)); applied hashes and drift come from the
+workload annotations. The CLI performs no rendering, no merging, and no hashing.
+
+That is the whole reason [§9.7](#97-desired-versus-applied) persists the desired
+hash in status rather than leaving it implicit. A CLI that recomputed it would
+reintroduce exactly the skew that rules out `diff`: under version mismatch it
+would report divergence that does not exist, or miss divergence that does.
+
+**`kubectl unbounded overrides list`** shows the document as authored: each
+entry, the objects it resolved to according to status, any Site names that
+matched nothing, and the observed `resourceVersion` the operator last acted on.
+Also read, not recomputed.
 
 ### 12.1 Why there is no `overrides diff`
 
@@ -1272,27 +1469,30 @@ manifests from its own embedded copy and shows a diff against a workload the
 cluster will never produce. A tool whose output is wrong precisely when an
 install is unusual is worse than no tool.
 
-**The signature was wrong.** The proposed `Renderer` accepted a single Site, but
-cluster components render from the full Site set (`machina.go:47`,
-`gantry.go:81`) because enablement is "any Site enables it".
+**The signature was wrong.** The proposed renderer accepted a single Site, but
+cluster components plan from the full Site set (`machina.go:47`,
+`gantry.go:81`) because enablement is "any Site enables it". The operation plan
+in [§10.1](#101-the-operation-plan) splits this into `ClusterPlanner` and
+`SitePlanner` for that reason.
 
-**Render was not separable from side effects.** Components write before they
+**Rendering was not separable from side effects.** Components write before they
 render: `ensureConfig` creates the component ConfigMap and returns the hash that
 the render then stamps (`net.go:64`, `gantry.go:109`, `machina.go:71`,
-`storage.go:136`). A pure `Render` would either skip the hash, producing output
+`storage.go:136`). A pure render would either skip the hash, producing output
 that does not match reality, or perform writes, which a read-only CLI command
-must not do. [§9.1](#91-render-then-validate-then-apply) resolves this by
-splitting `ensureConfig` into a read-only hash and a separate write, but that
-fixes the operator, not the skew problem above.
+must not do. [§10.1](#101-the-operation-plan) resolves this by expressing the
+ConfigMap as an `OpCreateIfAbsent` operation and computing the hash read-only,
+but that fixes the operator, not the skew problem above.
 
 The correct shape is an operator-side dry-run: the operator renders and merges
 using its own code and reports the result, and the CLI displays it. That keeps
 rendering authority in the running operator, where it belongs.
 
-That option is now cheap. [§9.1](#91-render-then-validate-then-apply) requires
-the render/apply split for atomicity, so the machinery a dry-run needs exists as
-a side effect. It remains [§17](#17-open-questions) rather than being designed
-here, but it is no longer blocked on a refactor.
+That option is now cheap. [§9.1](#91-preflight-atomicity-not-transactional-apply)
+requires the operation plan for preflight atomicity, so a dry-run reduces to
+plan, merge, report, and do not execute. It remains
+[§17](#17-open-questions) rather than being designed here, but it is no longer
+blocked on a refactor.
 
 ## 13. Operational notes
 
@@ -1304,7 +1504,7 @@ narrowing and its admission policy
 by the time this ships no component ServiceAccount can write the object.
 
 **Unmanaged workloads during an invalid override.** Skipping
-([§9.2](#92-invalid-overrides-skip-they-do-not-revert)) means Deployments and
+([§9.3](#93-invalid-overrides-skip-they-do-not-revert)) means Deployments and
 DaemonSets are not reconciled while the override document is invalid. Drift
 introduced by hand, or by another controller, persists until the document is
 fixed. Everything else, including RBAC, Services, and component ConfigMaps,
@@ -1329,13 +1529,13 @@ problem. Overrides touching `resources`, `nodeSelector`, `affinity`, or
 conflicting document is only detected in reconcile, so there is a window where
 the user believes the change landed. `overrides validate` is the mitigation, and
 skipping rather than reverting
-([§9.2](#92-invalid-overrides-skip-they-do-not-revert)) makes the window inert
+([§9.3](#93-invalid-overrides-skip-they-do-not-revert)) makes the window inert
 rather than destructive. What admission can and cannot add is
 [§17](#17-open-questions).
 
 **Upgrade behavior.** A patch referencing a container or volume that a later
 release renames becomes a resolution failure, which is loud and object-scoped
-([§9.4](#94-failure-scope)); the modify-only default in
+([§9.5](#95-failure-scope)); the modify-only default in
 [§8.2](#82-adding-containers-requires-explicit-intent) is what stops it becoming
 a silently added sidecar instead. A patch that merges cleanly but is
 semantically wrong for the new version is not detectable by the operator. Pinned
@@ -1345,7 +1545,7 @@ that behaves unlike its reported version.
 The operator restarts on every upgrade: it runs `replicas: 1` with
 `strategy: Recreate` (`deploy/unbounded-operator/04-deployment.yaml.tmpl:13-16`).
 Because the failure model holds no in-memory state
-([§9.2](#92-invalid-overrides-skip-they-do-not-revert)), that restart changes
+([§9.3](#93-invalid-overrides-skip-they-do-not-revert)), that restart changes
 nothing about override behaviour.
 
 **Ordering.** The ConfigMap may be created before or after the Sites it names,
@@ -1357,17 +1557,24 @@ reported ([§6.3](#63-resolution)).
 | PR | Scope | Depends on |
 |---|---|---|
 | 1 | This design document | - |
-| 2 | **Security hardening.** Narrow the `machina-controller` Role to `resourceNames` for `get`, `update`, `patch`, `delete` (`deploy/machina/02-rbac.yaml.tmpl:15-17`), and add a `ValidatingAdmissionPolicy` restricting its ConfigMap `create` by name, modelled on `deploy/net/controller/09-vap.yaml.tmpl`. **Blocking**: this feature widens the exposure that this PR removes ([§4.4](#44-residual-risk-and-how-it-is-closed)). | 1 |
-| 3 | **Render/apply split** across `net`, `machina`, `gantry`, `metalman`, `storage`. Split `ensureConfig` into a read-only hash computation and a separate write. Behaviour-preserving, verified by golden-object tests. Prerequisite for atomicity ([§9.1](#91-render-then-validate-then-apply)). | 1 |
-| 4 | **Override engine**: `internal/operator/component/override.go`. Load, document validation, allowlist, resolution, `addContainers` intent, composition, conflict detection, strategic merge, Cartesian affinity, protected-path re-stamp, GVK lockdown, hashing. Pure functions plus unit tests; no reconciler changes. | 1 |
-| 5 | **Wiring**: render-merge-apply pass structure, `Env.ForComponent`, apply-time GVK assertion, skip-on-invalid with the absent/invalid distinction, synchronous fan-out with Site status publication, `SiteStatus.Overrides`, `EventRecorder`, printer column. | 3, 4 |
-| 6 | `kubectl unbounded overrides list`, `validate`, `status` | 5 |
+| 2 | **Security hardening**, blocking. Delete the unused ConfigMap grant from the `machina-controller` Role (`deploy/machina/02-rbac.yaml.tmpl:15-17`). Verified by an `e2e/` run against a live cluster, not by code inspection, because RBAC removal fails at runtime ([§4.4](#44-residual-risk-and-how-it-is-closed)). | 1 |
+| 3 | **Operation plan refactor.** Introduce `Plan`, `Operation`, `OpKind`, `ClusterPlanner` and `SitePlanner`; convert all five components to plan-then-execute; split `ensureConfig` into a read-only hash computation and an `OpCreateIfAbsent` operation; add dependency ordering and shared-key deduplication. Behaviour-preserving, verified by golden-plan and golden-object tests. Prerequisite for preflight atomicity ([§9.1](#91-preflight-atomicity-not-transactional-apply)). | 1 |
+| 4 | **Override engine**: `internal/operator/component/override.go`. Snapshot handling, parsing rules, document validation, allowlist, resolution, `addContainers` intent, normalized-operation composition and conflict detection, strategic merge, Cartesian affinity, protected-path re-stamp, GVK lockdown, per-workload hashing. Pure functions plus unit tests; no reconciler changes. | 1 |
+| 5 | **Wiring**: pass structure, `Env.ForComponent`, execution semantics (ordering, continuation, no rollback, attribution), skip-`Overridable`-on-invalid, synchronous fan-out with explicit `MaxConcurrentReconciles: 1`, `SiteStatus.Overrides`, `EventRecorder` on both Site and the overrides ConfigMap, printer column. | 3, 4 |
+| 6 | `kubectl unbounded overrides validate` (offline syntax), `status` and `list` (read persisted state, no recomputation) | 5 |
 | 7 | Documentation: new reference page under `docs/content/reference/`, amend `architecture.md:189`, amend the `SiteComponentSpec` comment at `site_types.go:141-143`, update `cli.md`, add `deploy/unbounded-operator/examples/component-overrides.example.yaml` as a plain `.yaml` so neither `render-manifests` nor `go:embed` picks it up. The access-control guidance in [§4.3](#43-required-posture-for-cluster-operators) is part of this, not an afterthought. | 5, 6 |
 
 PR 5 requires `make generate` for `SiteStatus.Overrides` and the printer column.
 Nothing else changes the CRD schema, and there is no API version churn.
 
-PRs 2, 3 and 4 are independent of one another and can land in parallel.
+PRs 2, 3 and 4 are independent of one another and can land in parallel. PR 3 is
+the largest and touches all five components; it is worth landing early and on
+its own merits, since plan-then-execute makes components testable without a
+client irrespective of overrides.
+
+Filed separately, not part of this work: the documented Kubernetes baseline of
+1.24+ is already stale because the operator installs `09-vap.yaml.tmpl`
+unconditionally ([§4.4](#44-residual-risk-and-how-it-is-closed)).
 
 ## 15. Testing
 
@@ -1380,10 +1587,13 @@ Host-namespace changes. `$`-prefixed directive smuggling at every nesting depth.
 Explicit `null` deletion of managed content. Reserved-prefix annotation and
 label writes. Allowlist bypass through unenumerated top-level paths.
 
+**RBAC removal (PR 2).** An `e2e/` run exercising machina registration, CSR
+approval and cluster-info resolution with the ConfigMap grant deleted. This is
+the only test that can prove the grant is unused; a code search cannot.
+
 **Mount identity.** A patch supplying a volumeMount with a **different `name`
 but a colliding `mountPath`** must be rejected. This is the bypass that
-protecting mounts by name would have allowed
-([§8.3](#83-protected)).
+protecting mounts by name would have allowed ([§8.3](#83-protected)).
 
 **Site isolation.** The Cartesian product with two operator terms and two user
 terms must yield four terms, each carrying both sides' `matchExpressions` and
@@ -1394,24 +1604,58 @@ scheduled onto the same nodes through any permitted override.
 in `addContainers` fails resolution rather than adding a container. A name in
 `addContainers` that already exists is rejected. A deliberately misspelled
 operator container name (`machina-contoller`) must fail rather than produce an
-image-less sidecar.
+image-less sidecar. `addInitContainers` is honoured separately from
+`addContainers`.
 
-**Atomicity.** No write occurs anywhere in the pass when any document is
-invalid, asserted against a real API server by counting writes. Specifically:
-component ConfigMaps and RBAC must not be written either, which is the failure
-the pre-split design could not prevent.
+**Parsing rules ([§6.2](#62-parsing-rules)).** Unknown fields at every nesting
+level; duplicate keys; a second document after `---`; trailing content; YAML
+merge keys; unresolved aliases; empty keys ignored rather than failing.
 
-**Failure semantics.** The three states in
-[§9.2](#92-invalid-overrides-skip-they-do-not-revert) behave distinctly: absent
-applies vanilla, invalid skips Deployments and DaemonSets while other objects
-reconcile, unreadable skips and returns an error. An operator restart holding an
-invalid document leaves workloads untouched, which is the destructive path the
-in-memory design had. Failure scoping per [§9.4](#94-failure-scope).
+**Preflight atomicity.** No write of any kind occurs when preflight fails,
+asserted against a real API server by counting writes. Specifically: component
+ConfigMaps, RBAC and adoptions must all be absent, since preflight precedes the
+whole plan.
+
+**Execution semantics ([§9.2](#92-execution-semantics)).** Dependency ordering:
+a ConfigMap is written before the workload that hashes it. Continuation: a
+failed operation does not prevent independent operations from executing.
+Dependents of a failed operation are skipped, not attempted. No rollback:
+operations completed before a failure remain. Attribution: each failure names
+its component, Site and object. Idempotent replay: re-running a partially failed
+plan converges.
+
+**Invalid-input blast radius ([§9.3](#93-invalid-overrides-skip-they-do-not-revert)).**
+With an invalid document, `Overridable` operations are dropped **and every other
+operation still executes**: RBAC is applied, component ConfigMaps are created,
+deletes happen. This replaces an earlier test that demanded zero writes, which
+contradicted the stated policy. The four snapshot states behave distinctly, and
+an operator restart holding an invalid document leaves workloads untouched.
+
+**Shared operation deduplication ([§10.4](#104-shared-operation-deduplication)).**
+With three Sites, metalman's support RBAC is applied **once** per pass, not
+three times. Unequal operations sharing a key are rejected rather than
+last-writer-wins.
+
+**Snapshot and consistency ([§9.6](#96-snapshot-and-consistency)).** A pass
+records the observed `resourceVersion`; a ConfigMap edit mid-pass does not
+corrupt the in-flight result; the subsequent watch-triggered pass converges.
+
+**Conflict normalization ([§6.5](#65-what-counts-as-a-conflict)).** Per operation
+type: identical scalar values do not conflict; differing ones do; appended
+tolerations never conflict; Cartesian affinity never conflicts; `extraArgs`
+concatenate in contributor order; `addContainers` conflicts only on non-identical
+definitions of the same name. Conflict messages name both contributors by
+ConfigMap key and entry index.
 
 **Hash comparability.** With one ConfigMap targeting three workloads, each
-object's applied hash equals its desired hash when healthy. The earlier
+workload's desired hash equals its applied hash when healthy. The earlier
 per-object-versus-whole-ConfigMap scheme would have reported permanent
-divergence, so this is a regression test for a specific defect.
+divergence, so this is a regression test for a specific defect. Status list
+entries are distinguishable when a Deployment and a DaemonSet share a name.
+
+**Zero-Site observability ([§11](#11-drift-visibility-and-observability)).** With
+no Sites and a retained singleton, an invalid document still produces an Event
+on the overrides ConfigMap and an error log.
 
 **Merge semantics.** Container merge by name; sidecar addition via
 `addContainers`; volume and volumeMount addition; `retainKeys` sibling
@@ -1419,24 +1663,24 @@ preservation on a partial volume patch; env merge by name; additive toleration
 and nodeSelector merge; workload level labels and annotations; `spec.replicas`;
 `extraArgs` append; `extraArgs` combined with a patch that replaces `args`.
 
-**Validation.** Missing, empty, and unrecognized `apiVersion`; unknown
-`component`; unsupported `kind`; `sites` on a cluster singleton; explicitly
-empty `sites`; neither `patch` nor `extraArgs` present; malformed YAML.
-
-**Resolution and composition.** Absent `sites` matching every Site; partial
-overlap (`[a,b]` and `[b,c]`) failing only site `b`; disjoint concerns composing
-cleanly; true conflict rejected with both entries named; deterministic ordering
-across ConfigMap keys; unmatched Site names reported without failing.
+**Resolution.** Absent `sites` matching every Site; partial overlap (`[a,b]` and
+`[b,c]`) failing only site `b`; deterministic ordering across ConfigMap keys;
+unmatched Site names reported without failing.
 
 **Watch and fan-out.** A ConfigMap change while the Site List fails must still
 reach Site components once the List recovers; this must fail against the
 `RequestSingletonAndAllSites` wiring. Synchronous fan-out publishes Site status
 for every Site it touches.
 
-**Render parity.** Golden-object tests asserting each component's `Render`
-output equals what the pre-split apply path produced, for all five components.
+**Plan parity.** Golden-plan tests asserting each component's `Plan` output
+matches the operations the pre-refactor code performed, for all five components.
 Plus: an identical override produces an identical result on `metalman`'s typed
 path and on `net`'s unstructured path.
+
+**CLI authority ([§12](#12-cli)).** `overrides validate` performs no resolution
+and its output says so. `overrides status` issues no rendering or hashing calls,
+asserted by fake-client call counting, so a version-skewed plugin cannot
+misreport.
 
 **Integration (envtest, real API server).** Override applied through SSA and
 observable in `managedFields`; ConfigMap deleted and the default restored, with
@@ -1499,18 +1743,20 @@ directly applicable for users who want full control.
 
 ## 17. Open questions
 
-Two questions carried by earlier revisions are now **resolved** and are recorded
-here so the reasoning is not lost:
+Three questions carried by earlier revisions are now **resolved** and are
+recorded here so the reasoning is not lost:
 
 - *Dedicated resource type instead of a ConfigMap.* Resolved in favour of the
-  ConfigMap. The argument for a dedicated resource rested entirely on RBAC being
-  unable to scope `create` by name. Admission policy can, the repository already
-  relies on this for `unbounded-net-controller`, and the same pattern is a
-  blocking prerequisite here. See
+  ConfigMap. The argument rested on RBAC being unable to scope `create` by name.
+  Admission policy can, the repository already relies on it, and in the one case
+  that mattered no `create` grant needs to exist at all. See
   [§4.4](#44-residual-risk-and-how-it-is-closed).
 - *Last-known-good across restarts.* No longer applicable. The failure model
   holds no in-memory state
-  ([§9.2](#92-invalid-overrides-skip-they-do-not-revert)).
+  ([§9.3](#93-invalid-overrides-skip-they-do-not-revert)).
+- *Whether to add a machina `ValidatingAdmissionPolicy`.* Not needed; the grant
+  it would have constrained is unused and is deleted instead, which also avoids
+  raising the Kubernetes baseline to 1.30.
 
 Remaining:
 
@@ -1521,13 +1767,14 @@ Remaining:
    `ConfigMap.data`. It **can** enforce writer identity, restrict `create` by
    name, cap `data` size, and constrain key naming. Deeper validation needs a
    webhook, which is a new serving path and certificate to maintain. Is the
-   shallow coverage worth an installed policy, given `overrides validate`
-   already exists?
+   shallow coverage worth an installed policy, given `overrides validate` covers
+   syntax offline?
 2. **Operator-side dry-run.** [§12.1](#121-why-there-is-no-overrides-diff)
-   rejects a client-side `diff` on version-skew grounds, but the render/apply
-   split required by [§9.1](#91-render-then-validate-then-apply) makes an
-   operator-side dry-run cheap. Worth a surface, or is `overrides status`
-   sufficient?
+   rejects a client-side `diff` on version-skew grounds, and
+   [§12](#12-cli) scopes `validate` to syntax for the same reason. An
+   operator-side dry-run would close the resolution gap authoritatively, and the
+   operation plan makes it cheap: plan, merge, report, do not execute. Worth a
+   surface?
 3. **`spec.replicas` and `metalman.replicas`.** `Site` already has a typed,
    supported `spec.components.metalman.replicas` (`site_types.go:167`). An
    override can also set `spec.replicas`. Should the typed field win, the
@@ -1549,7 +1796,15 @@ Remaining:
    ([§8.2](#82-adding-containers-requires-explicit-intent)) stops a typo becoming
    a sidecar, but not a user-added sidecar colliding with a container a future
    release introduces. A documented naming convention is probably sufficient.
-8. **Fan-out cost at scale.** Synchronous fan-out
-   ([§10.3](#103-watch-and-fan-out)) is O(Sites) per override change and relies
-   on `MaxConcurrentReconciles` remaining 1. Both assumptions should be revisited
-   if Site counts grow or the controller is parallelized.
+8. **Scaling assumptions.** Synchronous fan-out
+   ([§10.3](#103-watch-and-fan-out)) is O(Sites) per override change and
+   `MaxConcurrentReconciles` is now pinned to 1 explicitly. Both are recorded
+   assumptions rather than permanent choices; `source.Channel` with explicit
+   backpressure is the fallback if Site counts grow past the low hundreds or the
+   controller is parallelized.
+9. **Retention of overrides for deleted Sites.** Per-Site components clean up on
+   Site deletion (`storage.go:78-90`), but an override entry naming a deleted
+   Site becomes inert and is merely reported
+   ([§6.3](#63-resolution)). Should stale entries be surfaced more strongly, for
+   example as a Degraded condition after some period, or is inert-and-reported
+   the right behaviour?
