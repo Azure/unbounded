@@ -178,6 +178,34 @@ func TestActivateHostDaemonAdoptsCurrentLinkToSingleBinary(t *testing.T) {
 	assert.Equal(t, candidate, mustReadFile(t, layout.GreenPath))
 }
 
+func TestActivateHostDaemonRepairsMissingCurrentLink(t *testing.T) {
+	dir := t.TempDir()
+	layout := testActivationLayout(dir)
+	legacy := []byte("#!/bin/sh\nexit 0\n")
+	candidate := []byte("#!/bin/sh\n[ \"$1\" = version ]\n")
+
+	require.NoError(t, os.WriteFile(layout.BluePath, legacy, 0o755))
+	require.NoError(t, os.Symlink(layout.BluePath, layout.LastGoodPath))
+	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
+
+	candidatePath := filepath.Join(dir, "candidate")
+	require.NoError(t, os.WriteFile(candidatePath, candidate, 0o755))
+
+	service := &fakeDaemonService{}
+	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
+		Layout:        layout,
+		CandidatePath: candidatePath,
+		LockPath:      filepath.Join(dir, "activation.lock"),
+	}, service)
+	require.NoError(t, err)
+
+	assert.True(t, result.Initialized)
+	assert.Equal(t, layout.GreenPath, mustEvalSymlinks(t, layout.CurrentPath))
+	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.LastGoodPath))
+	assert.Equal(t, legacy, mustReadFile(t, layout.BluePath))
+	assert.Equal(t, candidate, mustReadFile(t, layout.GreenPath))
+}
+
 func TestActivateHostDaemonSwitchesExistingLayout(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
@@ -199,6 +227,80 @@ func TestActivateHostDaemonSwitchesExistingLayout(t *testing.T) {
 
 	assert.False(t, result.Initialized)
 	assert.Equal(t, layout.GreenPath, mustEvalSymlinks(t, layout.CurrentPath))
+	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.LastGoodPath))
+}
+
+func TestActivateHostDaemonRestoresCurrentAfterLinkSwitchFailure(t *testing.T) {
+	dir := t.TempDir()
+	layout := testActivationLayout(dir)
+	writeExecutable(t, layout.BluePath, "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, layout.GreenPath, "#!/bin/sh\nexit 0\n# previous\n")
+	require.NoError(t, os.Symlink(layout.BluePath, layout.CurrentPath))
+	require.NoError(t, os.Symlink(layout.GreenPath, layout.LastGoodPath))
+
+	layout.BinaryPath = filepath.Join(dir, "compatibility-directory")
+	require.NoError(t, os.Mkdir(layout.BinaryPath, 0o755))
+
+	candidatePath := filepath.Join(dir, "candidate")
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
+
+	_, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
+		Layout:        layout,
+		CandidatePath: candidatePath,
+		LockPath:      filepath.Join(dir, "activation.lock"),
+	}, &fakeDaemonService{})
+	require.Error(t, err)
+
+	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.CurrentPath))
+}
+
+func TestActivateHostDaemonIdenticalCandidatePreservesLastGood(t *testing.T) {
+	dir := t.TempDir()
+	layout := testActivationLayout(dir)
+	active := "#!/bin/sh\n[ \"$1\" = version ]\n"
+	writeExecutable(t, layout.BluePath, active)
+	writeExecutable(t, layout.GreenPath, "#!/bin/sh\nexit 0\n")
+	require.NoError(t, os.Symlink(layout.BluePath, layout.CurrentPath))
+	require.NoError(t, os.Symlink(layout.GreenPath, layout.LastGoodPath))
+	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
+
+	candidatePath := filepath.Join(dir, "candidate")
+	writeExecutable(t, candidatePath, active)
+
+	service := &fakeDaemonService{}
+	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
+		Layout:        layout,
+		CandidatePath: candidatePath,
+		LockPath:      filepath.Join(dir, "activation.lock"),
+	}, service)
+	require.NoError(t, err)
+
+	assert.False(t, result.Changed)
+	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.CurrentPath))
+	assert.Equal(t, layout.GreenPath, mustEvalSymlinks(t, layout.LastGoodPath))
+}
+
+func TestActivateHostDaemonIdenticalCandidateRepairsMissingLastGood(t *testing.T) {
+	dir := t.TempDir()
+	layout := testActivationLayout(dir)
+	active := "#!/bin/sh\n[ \"$1\" = version ]\n"
+	writeExecutable(t, layout.BluePath, active)
+	require.NoError(t, os.Symlink(layout.BluePath, layout.CurrentPath))
+	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
+
+	candidatePath := filepath.Join(dir, "candidate")
+	writeExecutable(t, candidatePath, active)
+
+	service := &fakeDaemonService{}
+	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
+		Layout:        layout,
+		CandidatePath: candidatePath,
+		LockPath:      filepath.Join(dir, "activation.lock"),
+	}, service)
+	require.NoError(t, err)
+
+	assert.False(t, result.Changed)
+	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.CurrentPath))
 	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.LastGoodPath))
 }
 

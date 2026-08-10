@@ -61,6 +61,7 @@ type ActivationPlan struct {
 	RollbackPath     string
 	InitializeLayout bool
 	CandidateChanged bool
+	RepairLastGood   bool
 	Service          ServicePlan
 	Actions          []string
 }
@@ -137,6 +138,14 @@ func PreflightHostDaemonActivation(
 			if currentIsBlue {
 				plan.TargetPath = opts.Layout.GreenPath
 			}
+		}
+	}
+
+	if !plan.InitializeLayout && !plan.CandidateChanged {
+		if _, err := executablePath(opts.Layout.LastGoodPath); errors.Is(err, os.ErrNotExist) {
+			plan.RepairLastGood = true
+		} else if err != nil {
+			return ActivationPlan{}, fmt.Errorf("resolve last-good agent binary: %w", err)
 		}
 	}
 
@@ -225,7 +234,12 @@ func ActivateHostDaemon(
 	}
 
 	if err := switchActivationLinks(opts.Layout, plan); err != nil {
-		return ActivationResult{}, err
+		rollbackErr := utilio.UpdateSymlink(opts.Layout.CurrentPath, plan.RollbackPath)
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("restore current agent symlink after switch failure: %w", rollbackErr)
+		}
+
+		return ActivationResult{}, errors.Join(err, rollbackErr)
 	}
 
 	result := ActivationResult{
@@ -306,12 +320,23 @@ func activationCurrentPath(layout Layout) (string, bool, error) {
 		return "", false, fmt.Errorf("resolve current agent binary: %w", err)
 	}
 
-	legacyPath, legacyErr := executablePath(layout.BinaryPath)
-	if legacyErr != nil {
-		return "", false, fmt.Errorf("resolve existing agent binary: %w", legacyErr)
+	for _, fallbackPath := range []string{
+		layout.LastGoodPath,
+		layout.BluePath,
+		layout.GreenPath,
+		layout.BinaryPath,
+	} {
+		fallback, fallbackErr := executablePath(fallbackPath)
+		if fallbackErr == nil {
+			return fallback, false, nil
+		}
+
+		if !errors.Is(fallbackErr, os.ErrNotExist) {
+			return "", false, fmt.Errorf("resolve fallback agent binary %s: %w", fallbackPath, fallbackErr)
+		}
 	}
 
-	return legacyPath, false, nil
+	return "", false, fmt.Errorf("no executable existing agent binary found")
 }
 
 func activationActions(plan ActivationPlan, layout Layout) []string {
@@ -330,6 +355,10 @@ func activationActions(plan ActivationPlan, layout Layout) []string {
 		)
 	}
 
+	if plan.RepairLastGood {
+		actions = append(actions, "repair last-good agent symlink")
+	}
+
 	if plan.Service.UpdateRequired {
 		actions = append(actions, "update daemon service configuration")
 	}
@@ -343,12 +372,16 @@ func activationActions(plan ActivationPlan, layout Layout) []string {
 }
 
 func switchActivationLinks(layout Layout, plan ActivationPlan) error {
-	if err := utilio.UpdateSymlink(layout.LastGoodPath, plan.RollbackPath); err != nil {
-		return fmt.Errorf("update last-good agent symlink: %w", err)
+	if plan.InitializeLayout || plan.CandidateChanged || plan.RepairLastGood {
+		if err := utilio.UpdateSymlink(layout.LastGoodPath, plan.RollbackPath); err != nil {
+			return fmt.Errorf("update last-good agent symlink: %w", err)
+		}
 	}
 
-	if err := utilio.UpdateSymlink(layout.CurrentPath, plan.TargetPath); err != nil {
-		return fmt.Errorf("update current agent symlink: %w", err)
+	if plan.InitializeLayout || plan.CandidateChanged {
+		if err := utilio.UpdateSymlink(layout.CurrentPath, plan.TargetPath); err != nil {
+			return fmt.Errorf("update current agent symlink: %w", err)
+		}
 	}
 
 	if err := utilio.UpdateSymlink(layout.BinaryPath, layout.CurrentPath); err != nil {
