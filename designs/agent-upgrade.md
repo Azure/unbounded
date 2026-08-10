@@ -12,6 +12,10 @@ publish success or rollback failure back to the operation.
 - Complete the `MachineOperation` only after the restarted daemon is healthy
   enough to publish startup state.
 - Roll back automatically when systemd cannot keep the upgraded daemon running.
+- Support host-driven binary activation when a Kubernetes `MachineOperation` is
+  unavailable or intentionally not used.
+- Keep the host activation logic reusable by other consumers, including AKS
+  Flex, without depending on Kubernetes APIs or Unbounded command packages.
 - Keep signal file structure in Go code instead of shell scripts.
 
 ## Host paths
@@ -54,7 +58,133 @@ the systemd unit:
 This preserves legacy installs while making the daemon run through
 `CurrentPath` for future upgrades.
 
-## Operation state machine
+## Host-driven agent-upgrade command
+
+A newer agent binary also exposes this hidden command:
+
+```text
+unbounded-agent agent-upgrade [--preflight]
+```
+
+The command is a host-driven alternative to the Kubernetes-driven
+`AgentUpgrade` `MachineOperation`. It is useful for upgrading an existing
+deployment that might not support the `AgentUpgrade` `MachineOperation` yet,
+without reimaging the host or repaving the nspawn worker. It is intended for
+host provisioning and management systems that have already
+delivered a candidate binary, including AKS Flex node-side integration. The
+candidate is invoked directly from its staging path:
+
+```bash
+/var/tmp/unbounded-agent-candidate agent-upgrade --preflight
+/var/tmp/unbounded-agent-candidate agent-upgrade
+```
+
+The command does not download a release archive. The caller is responsible for
+obtaining and authenticating the candidate before execution. The command uses
+the executable that contains the command as the candidate, rather than
+accepting another candidate path from a flag.
+
+The host-driven command does not:
+
+- Create or update a `MachineOperation`.
+- Read `downloadURL` or `sha256` operation parameters.
+- Write the AgentUpgrade operation signal file.
+- Publish success or failure through Kubernetes.
+
+It reports through command output, its exit status, and daemon service logs.
+The command remains named `agent-upgrade` to match the MachineOperation naming
+convention, even though the activation primitive does not enforce semantic
+version ordering and may also be used for reinstall, repair, or downgrade.
+
+### Host activation flow
+
+Without `--preflight`, the command performs one transactional activation:
+
+1. Require sufficient host privileges and acquire an exclusive activation
+   lock.
+2. Resolve the executing candidate path and inspect the current binary layout.
+3. Validate path safety and reject path collisions or unsafe aliases.
+4. Verify the candidate by running its `version` command.
+5. If the managed layout is not initialized, preserve the existing
+   single-path daemon binary in one slot and establish `CurrentPath` and
+   `LastGoodPath`.
+6. Install the candidate atomically into the inactive slot. If the managed
+   layout already exists, use the normal blue-green slot selection.
+7. Preserve the active binary through `LastGoodPath` and atomically switch
+   `CurrentPath` to the candidate.
+8. Ensure the daemon service runs through `CurrentPath`, then reload the
+   service manager.
+9. Restart the daemon and wait for the caller-defined health check.
+10. If restart or health verification fails, restore `CurrentPath` to
+    `LastGoodPath`, restart the previous daemon, and return a failure.
+11. Return success only after the candidate daemon passes its health check.
+
+The command must be idempotent. Re-executing the active binary may repair
+missing links or service configuration, but it must not unnecessarily replace
+an identical active binary. Candidate and active binary content can be compared
+by SHA-256 when determining whether a binary change is required.
+
+The command must not be run from a path that has already destructively replaced
+the only copy of the previous daemon binary. Host delivery must stage the
+candidate separately so the previous executable remains available for
+last-good initialization and rollback.
+
+### Preflight
+
+`--preflight` computes and displays the host activation plan without applying
+it. A successful preflight reports at least:
+
+- The candidate and currently active binary paths.
+- Whether the managed layout needs initialization or repair.
+- The inactive slot selected as the installation target.
+- The planned current and last-good link changes.
+- Whether daemon service configuration needs an update.
+- The planned reload, restart, health check, and rollback actions.
+
+Preflight may inspect files, links, binary digests, service configuration, and
+service status. It must not:
+
+- Create, replace, or remove binaries, links, directories, or lock files.
+- Write service units or drop-ins.
+- Reload, start, stop, or restart a service.
+- Create an AgentUpgrade signal.
+
+Preflight exits nonzero when it finds a condition that would block activation.
+Because host state can change after preflight, the applying command repeats all
+validation while holding the activation lock.
+
+### Reusable activation library
+
+The safety-sensitive host activation behavior lives in an exported package,
+not under `cmd/agent/internal`. The hidden command is a thin adapter over that
+library. Other node-side consumers can use the same implementation with their
+own paths, service unit, and health definition.
+
+The reusable boundary has two conceptual operations:
+
+```go
+PreflightHostDaemonActivation(ctx, options, serviceInspector) (ActivationPlan, error)
+ActivateHostDaemon(ctx, log, options, service) (ActivationResult, error)
+```
+
+`ActivationOptions` supplies an explicit candidate path, binary layout, mode,
+and lock path. The CLI adapter obtains the candidate with `os.Executable()`.
+The service integration supplies operations to prepare the daemon entrypoint,
+reload the service manager, restart the daemon, and wait for health.
+
+The reusable library must not:
+
+- Import `cmd/agent` packages.
+- Depend on Kubernetes clients or `MachineOperation` types.
+- Hard-code the Unbounded systemd unit or operation signal schema.
+- Download or authenticate a candidate implicitly.
+
+The Unbounded CLI supplies an adapter for
+`unbounded-agent-daemon.service`. AKS Flex can supply its own service adapter
+and binary paths while sharing installation, link switching, idempotency,
+locking, and rollback behavior.
+
+## MachineOperation state machine
 
 ```text
 Pending MachineOperation
