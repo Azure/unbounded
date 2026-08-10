@@ -304,19 +304,24 @@ func TestPathsExcluding(t *testing.T) {
 	require.Equal(t, []string{"/dev/kfd"}, got)
 }
 
-func TestServiceOverride_NoHostDevicesNoDeviceAllow(t *testing.T) {
+func TestServiceOverride_BaseDeviceAllow(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", nspawnTemplateData{
 		MachineName:    "kube1",
 		BPFFSMountPath: goalstates.BPFFSMountPath("kube1"),
-		// No HostDevicePaths and no GPU devices.
 	}))
 
-	// With no devices the drop-in must not contain any DeviceAllow lines,
-	// which is what keeps the existing golden snapshots unchanged.
-	require.NotContains(t, buf.String(), "DeviceAllow=")
+	out := buf.String()
+
+	// With no detected host devices, the override must not contain direct
+	// device paths. This keeps the golden image unchanged while still allowing
+	// generic device classes that do not depend on host discovery.
+	require.NotContains(t, out, "DeviceAllow=/")
+	require.Contains(t, out, "DeviceAllow=char-ipvtap rwm")
+	require.Contains(t, out, "DeviceAllow=char-macvtap rwm")
+	require.Equal(t, 2, strings.Count(out, "DeviceAllow="))
 }
 
 func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
