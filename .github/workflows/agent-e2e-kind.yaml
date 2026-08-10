@@ -116,6 +116,9 @@ jobs:
       - name: Validate node restart operation
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-node-reboot-operation
 
+      - name: Validate host-driven agent upgrade
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-host-agent-upgrade
+
       - name: Validate agent upgrade operation
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose validate-agent-upgrade-operation
 

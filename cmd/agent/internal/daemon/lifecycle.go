@@ -106,6 +106,15 @@ func (d *enableDaemon) Do(ctx context.Context) error {
 }
 
 func renderDaemonAsset(name string, content []byte) ([]byte, error) {
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	if err != nil {
+		return nil, err
+	}
+
+	return renderDaemonAssetForPaths(name, content, paths)
+}
+
+func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.AgentUpgradePaths) ([]byte, error) {
 	data := struct {
 		DaemonUnit                   string
 		DaemonRecoveryUnit           string
@@ -116,10 +125,10 @@ func renderDaemonAsset(name string, content []byte) ([]byte, error) {
 	}{
 		DaemonUnit:                   goalstates.DaemonUnit,
 		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
-		DaemonBinaryCurrentPath:      goalstates.DaemonBinaryCurrentPath,
-		DaemonBinaryLastGoodPath:     goalstates.DaemonBinaryLastGoodPath,
+		DaemonBinaryCurrentPath:      paths.CurrentPath,
+		DaemonBinaryLastGoodPath:     paths.LastGoodPath,
 		DaemonRecoveryScriptPath:     goalstates.DaemonRecoveryScriptPath,
-		DaemonAgentUpgradeSignalPath: goalstates.DaemonAgentUpgradeSignalPath,
+		DaemonAgentUpgradeSignalPath: paths.SignalPath,
 	}
 
 	tmpl, err := template.New(name).Parse(string(content))

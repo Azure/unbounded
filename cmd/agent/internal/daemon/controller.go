@@ -23,6 +23,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 type repaveReconciler struct {
@@ -68,10 +69,11 @@ func runController(
 
 	c := mgr.GetClient()
 	machineOperations := &machineOperationTarget{
-		Client:       c,
-		log:          log,
-		machineName:  machineName,
-		nodeOperator: nodeOperator,
+		Client:               c,
+		log:                  log,
+		machineName:          machineName,
+		nodeOperator:         nodeOperator,
+		agentUpgradeLockPath: goalstates.DaemonAgentUpgradeLockPath,
 	}
 
 	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconciler(
