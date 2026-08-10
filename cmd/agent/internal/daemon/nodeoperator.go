@@ -210,11 +210,17 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
+	if err != nil {
+		return fmt.Errorf("resolve machine goal state: %w", err)
+	}
+
 	log.Info("restarting active node", "machine", active.Name)
 
-	err := phases.Serial(
+	err = phases.Serial(
 		log,
 		nodestart.ReconcileNSpawnLifecycle(log, active.Name),
+		nodestart.WaitForLocalDNS(log, gs.NodeStart),
 		nodestart.WaitForKubelet(log, active.Name),
 	).Do(ctx)
 	if err != nil {
