@@ -27,39 +27,33 @@ import (
 	"github.com/Azure/unbounded/internal/version"
 )
 
-// errCNIConfDirNotEmpty is returned when existing CNI configuration files are
-// found in the CNI conf directory, indicating another CNI plugin is installed.
-var errCNIConfDirNotEmpty = errors.New("CNI configuration directory is not empty")
-
-// checkCNIConfDirForConflists checks whether the CNI configuration directory
-// already contains any *.conflist files other than the node agent's own file.
-// Returns errCNIConfDirNotEmpty if foreign conflist files are found, which
-// indicates another CNI plugin is installed.
-func checkCNIConfDirForConflists(dir, ownConfFile string) error {
-	matches, err := filepath.Glob(filepath.Join(dir, "*.conflist"))
+// higherPriorityCNIConfigFiles returns CNI configuration files that sort before
+// the node agent's file and will therefore be selected as the active CNI config.
+func higherPriorityCNIConfigFiles(dir, ownConfFile string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return fmt.Errorf("failed to glob CNI conf directory %s: %w", dir, err)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("failed to read CNI conf directory %s: %w", dir, err)
 	}
 
-	names := make([]string, 0, len(matches))
-	for _, m := range matches {
-		base := filepath.Base(m)
-		if base == ownConfFile {
+	var names []string
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || name == ownConfFile || name >= ownConfFile {
 			continue
 		}
 
-		names = append(names, base)
+		switch filepath.Ext(name) {
+		case ".conf", ".conflist", ".json":
+			names = append(names, name)
+		}
 	}
 
-	if len(names) > 0 {
-		return fmt.Errorf(
-			"%w: found existing conflist files in %s: %s -- "+
-				"unbounded-net refuses to overwrite an existing CNI configuration",
-			errCNIConfDirNotEmpty, dir, strings.Join(names, ", "),
-		)
-	}
-
-	return nil
+	return names, nil
 }
 
 func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Interface, cfg *config, cniConfigured *bool) ([]string, error) {
@@ -84,10 +78,6 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 			klog.Infof("Node %s has podCIDRs: %v", cfg.NodeName, node.Spec.PodCIDRs)
 
 			if err := writeCNIConfig(cfg, node.Spec.PodCIDRs); err != nil {
-				if errors.Is(err, errCNIConfDirNotEmpty) {
-					return nil, err
-				}
-
 				klog.Errorf("Failed to write CNI config: %v", err)
 				time.Sleep(5 * time.Second)
 
@@ -144,10 +134,6 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 						watcher.Stop()
 
 						if err := writeCNIConfig(cfg, updatedNode.Spec.PodCIDRs); err != nil {
-							if errors.Is(err, errCNIConfDirNotEmpty) {
-								return nil, err
-							}
-
 							klog.Errorf("Failed to write CNI config: %v", err)
 							time.Sleep(5 * time.Second)
 
@@ -241,9 +227,17 @@ func doWriteCNIConfig(cfg *config, podCIDRs []string) error {
 		return fmt.Errorf("failed to marshal CNI config: %w", err)
 	}
 
-	// Refuse to install if the directory already contains conflist files
-	if err := checkCNIConfDirForConflists(cfg.CNIConfDir, cfg.CNIConfFile); err != nil {
+	higherPriorityFiles, err := higherPriorityCNIConfigFiles(cfg.CNIConfDir, cfg.CNIConfFile)
+	if err != nil {
 		return err
+	}
+
+	if len(higherPriorityFiles) > 0 {
+		klog.Warningf(
+			"CNI configuration files %s have higher priority than %s due to lexicographic ordering; "+
+				"unbounded-net CNI is not the active CNI plugin",
+			strings.Join(higherPriorityFiles, ", "), cfg.CNIConfFile,
+		)
 	}
 
 	// Ensure the CNI conf directory exists

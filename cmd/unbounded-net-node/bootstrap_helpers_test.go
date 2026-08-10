@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -205,57 +204,78 @@ func TestWriteCNIConfigWritesExpectedConflist(t *testing.T) {
 	}
 }
 
-// TestCheckCNIConfDirForConflists tests checkCNIConfDirForConflists behavior.
-func TestCheckCNIConfDirForConflists(t *testing.T) {
+// TestHigherPriorityCNIConfigFiles tests higherPriorityCNIConfigFiles behavior.
+func TestHigherPriorityCNIConfigFiles(t *testing.T) {
 	ownFile := "10-unbounded.conflist"
 
 	t.Run("nonexistent directory", func(t *testing.T) {
-		if err := checkCNIConfDirForConflists(filepath.Join(t.TempDir(), "does-not-exist"), ownFile); err != nil {
-			t.Fatalf("expected nil for nonexistent dir, got %v", err)
+		files, err := higherPriorityCNIConfigFiles(filepath.Join(t.TempDir(), "does-not-exist"), ownFile)
+		if err != nil {
+			t.Fatalf("higherPriorityCNIConfigFiles returned error: %v", err)
+		}
+
+		if len(files) != 0 {
+			t.Fatalf("expected no higher-priority files, got %v", files)
 		}
 	})
 	t.Run("empty directory", func(t *testing.T) {
-		if err := checkCNIConfDirForConflists(t.TempDir(), ownFile); err != nil {
-			t.Fatalf("expected nil for empty dir, got %v", err)
+		files, err := higherPriorityCNIConfigFiles(t.TempDir(), ownFile)
+		if err != nil {
+			t.Fatalf("higherPriorityCNIConfigFiles returned error: %v", err)
+		}
+
+		if len(files) != 0 {
+			t.Fatalf("expected no higher-priority files, got %v", files)
 		}
 	})
-	t.Run("directory with foreign conflist file", func(t *testing.T) {
+	t.Run("directory with higher priority CNI files", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "10-flannel.conflist"), []byte("{}"), 0o644); err != nil {
+		for _, name := range []string{"00-containerd.conf", "05-cilium.conflist", "09-plugin.json"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o644); err != nil {
+				t.Fatalf("setup %s: %v", name, err)
+			}
+		}
+
+		files, err := higherPriorityCNIConfigFiles(dir, ownFile)
+		if err != nil {
+			t.Fatalf("higherPriorityCNIConfigFiles returned error: %v", err)
+		}
+
+		want := []string{"00-containerd.conf", "05-cilium.conflist", "09-plugin.json"}
+		if strings.Join(files, ",") != strings.Join(want, ",") {
+			t.Fatalf("higher-priority files = %v, want %v", files, want)
+		}
+	})
+	t.Run("own and lower priority files", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, name := range []string{ownFile, "20-calico.conflist", "99-other.conf"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o644); err != nil {
+				t.Fatalf("setup %s: %v", name, err)
+			}
+		}
+
+		files, err := higherPriorityCNIConfigFiles(dir, ownFile)
+		if err != nil {
+			t.Fatalf("higherPriorityCNIConfigFiles returned error: %v", err)
+		}
+
+		if len(files) != 0 {
+			t.Fatalf("expected no higher-priority files, got %v", files)
+		}
+	})
+	t.Run("non-CNI file", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "00-readme.txt"), []byte("{}"), 0o644); err != nil {
 			t.Fatalf("setup: %v", err)
 		}
 
-		err := checkCNIConfDirForConflists(dir, ownFile)
-		if err == nil {
-			t.Fatal("expected error for dir with foreign conflist")
+		files, err := higherPriorityCNIConfigFiles(dir, ownFile)
+		if err != nil {
+			t.Fatalf("higherPriorityCNIConfigFiles returned error: %v", err)
 		}
 
-		if !errors.Is(err, errCNIConfDirNotEmpty) {
-			t.Fatalf("expected errCNIConfDirNotEmpty, got %v", err)
-		}
-
-		if !strings.Contains(err.Error(), "10-flannel.conflist") {
-			t.Fatalf("expected error to list the offending file, got %v", err)
-		}
-	})
-	t.Run("directory with own conflist file only", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, ownFile), []byte("{}"), 0o644); err != nil {
-			t.Fatalf("setup: %v", err)
-		}
-
-		if err := checkCNIConfDirForConflists(dir, ownFile); err != nil {
-			t.Fatalf("expected nil when only own conflist is present, got %v", err)
-		}
-	})
-	t.Run("directory with non-conflist file only", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "bridge.conf"), []byte("{}"), 0o644); err != nil {
-			t.Fatalf("setup: %v", err)
-		}
-
-		if err := checkCNIConfDirForConflists(dir, ownFile); err != nil {
-			t.Fatalf("expected nil for dir with only non-conflist files, got %v", err)
+		if len(files) != 0 {
+			t.Fatalf("expected no higher-priority files, got %v", files)
 		}
 	})
 	t.Run("directory with subdirectory only", func(t *testing.T) {
@@ -264,41 +284,48 @@ func TestCheckCNIConfDirForConflists(t *testing.T) {
 			t.Fatalf("setup: %v", err)
 		}
 
-		if err := checkCNIConfDirForConflists(dir, ownFile); err != nil {
-			t.Fatalf("expected nil for dir with only subdirs, got %v", err)
+		files, err := higherPriorityCNIConfigFiles(dir, ownFile)
+		if err != nil {
+			t.Fatalf("higherPriorityCNIConfigFiles returned error: %v", err)
+		}
+
+		if len(files) != 0 {
+			t.Fatalf("expected no higher-priority files, got %v", files)
 		}
 	})
 }
 
-// TestWriteCNIConfigRefusesNonEmptyDir tests that writeCNIConfig refuses to
-// write when the CNI conf directory already contains files.
-func TestWriteCNIConfigRefusesNonEmptyDir(t *testing.T) {
-	confDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(confDir, "05-cilium.conflist"), []byte(`{"cniVersion":"0.4.0"}`), 0o644); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
+// TestWriteCNIConfigAllowsOtherCNIConfigs tests that other CNI configuration
+// files do not prevent unbounded-net from writing its configuration.
+func TestWriteCNIConfigAllowsOtherCNIConfigs(t *testing.T) {
+	for _, otherFile := range []string{"05-cilium.conflist", "20-calico.conflist"} {
+		t.Run(otherFile, func(t *testing.T) {
+			confDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(confDir, otherFile), []byte(`{"cniVersion":"0.4.0"}`), 0o644); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
 
-	cfg := &config{
-		CNIConfDir:  confDir,
-		CNIConfFile: "10-unbounded.conflist",
-		BridgeName:  "cbr0",
-		MTU:         1400,
-	}
+			cfg := &config{
+				CNIConfDir:  confDir,
+				CNIConfFile: "10-unbounded.conflist",
+				BridgeName:  "cbr0",
+				MTU:         1400,
+			}
 
-	err := writeCNIConfig(cfg, []string{"10.244.0.0/24"})
-	if err == nil {
-		t.Fatal("expected error when CNI dir is not empty")
-	}
+			if err := writeCNIConfig(cfg, []string{"10.244.0.0/24"}); err != nil {
+				t.Fatalf("writeCNIConfig returned error: %v", err)
+			}
 
-	if !errors.Is(err, errCNIConfDirNotEmpty) {
-		t.Fatalf("expected errCNIConfDirNotEmpty, got %v", err)
+			if _, err := os.Stat(filepath.Join(confDir, cfg.CNIConfFile)); err != nil {
+				t.Fatalf("expected unbounded-net CNI config to be written: %v", err)
+			}
+		})
 	}
 }
 
-// TestWaitForPodCIDRsAndConfigureExistingCNIFatal tests that
-// waitForPodCIDRsAndConfigure returns immediately (without retrying)
-// when the CNI conf directory already contains files.
-func TestWaitForPodCIDRsAndConfigureExistingCNIFatal(t *testing.T) {
+// TestWaitForPodCIDRsAndConfigureExistingCNI tests that an existing CNI config
+// does not prevent node bootstrap.
+func TestWaitForPodCIDRsAndConfigureExistingCNI(t *testing.T) {
 	nodeName := "node-a"
 	client := fake.NewClientset(&corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
@@ -322,17 +349,17 @@ func TestWaitForPodCIDRsAndConfigureExistingCNIFatal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	_, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, &cniConfigured)
-	if err == nil {
-		t.Fatal("expected error for non-empty CNI dir")
+	podCIDRs, err := waitForPodCIDRsAndConfigure(ctx, client, cfg, &cniConfigured)
+	if err != nil {
+		t.Fatalf("waitForPodCIDRsAndConfigure returned error: %v", err)
 	}
 
-	if !errors.Is(err, errCNIConfDirNotEmpty) {
-		t.Fatalf("expected errCNIConfDirNotEmpty, got %v", err)
+	if !cniConfigured {
+		t.Fatal("expected cniConfigured to be true")
 	}
 
-	if cniConfigured {
-		t.Fatal("expected cniConfigured to remain false")
+	if len(podCIDRs) != 1 || podCIDRs[0] != "10.244.1.0/24" {
+		t.Fatalf("podCIDRs = %v, want [10.244.1.0/24]", podCIDRs)
 	}
 }
 
