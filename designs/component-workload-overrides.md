@@ -277,34 +277,55 @@ Documentation must instruct operators to treat write access to
   object itself should be under change control.
 - Prefer managing it through the same review path as RBAC changes.
 
-### 4.4 Residual risk
+### 4.4 Residual risk and how it is closed
 
-Several component ServiceAccounts currently hold namespace-wide ConfigMap write
-in the operator namespace with no `resourceNames` restriction:
+Exactly one component ServiceAccount can write an arbitrary ConfigMap in the
+operator namespace:
 
-| Role | Location |
-|---|---|
-| `machina-controller` | `deploy/machina/02-rbac.yaml.tmpl:15-17` |
-| `metalman-controller` | `deploy/machina/06-metalman-rbac.yaml.tmpl:59`, `:132` |
-| `unbounded-net-controller` | `deploy/net/controller/02-rbac.yaml.tmpl:170`, `:173`, `:216` |
+| Role | Grant | Assessment |
+|---|---|---|
+| `machina-controller` | `configmaps`, all verbs, no `resourceNames`, no admission constraint (`deploy/machina/02-rbac.yaml.tmpl:15-17`) | **Over-granted.** Can write the overrides ConfigMap. |
+| `metalman-controller` | `configmaps` `["get","list","watch"]` in the operator namespace; `resourceNames: ["cluster-info","aks-cluster-metadata"]` with `["get"]` in `kube-public` (`06-metalman-rbac.yaml.tmpl:59-61`, `:132-133`) | Read-only. Not a vector. |
+| `unbounded-net-controller` | `configmaps` `["create"]` namespace-wide, plus `resourceNames: ["unbounded-net-serving-ca"]` for `["get","update","patch"]` (`net/controller/02-rbac.yaml.tmpl:169-176`) | Constrained. See below. |
 
-A compromised component holding one of these can write the overrides ConfigMap
-and cause the operator to deploy arbitrary code on every node. This is a
-pre-existing over-grant that this design makes materially more dangerous.
+`unbounded-net-controller` holds namespace-wide `create` because RBAC cannot
+scope that verb, but it is already constrained at admission by
+`deploy/net/controller/09-vap.yaml.tmpl`, a `ValidatingAdmissionPolicy` with
+`failurePolicy: Fail` that rejects any ConfigMap create from that ServiceAccount
+not named `unbounded-net-serving-ca`. It cannot create the overrides ConfigMap.
 
-A parallel hardening change narrows these Roles to `resourceNames` for `get`,
-`update`, `patch`, and `delete`. It is worth doing on its own merits and is
-sequenced independently in [§14](#14-implementation-plan).
+So the exposure is `machina-controller` alone: a compromised machina controller
+can write the overrides ConfigMap and cause the operator to deploy arbitrary
+code on every node. This is a pre-existing over-grant that this design makes
+materially more dangerous.
 
-**It does not fully close the gap.** RBAC cannot scope `create` by
-`resourceNames`, because the object name is not available to the authorizer for
-create requests. A component retaining namespace-wide ConfigMap `create` can
-therefore still seed the overrides ConfigMap when it does not already exist.
+**The gap is closable, and the project has already solved it once.** The comment
+at the head of `09-vap.yaml.tmpl` states the problem exactly:
 
-The only complete fix is a dedicated resource type, where `create` is scopable
-by resource rather than by name. That was consciously not taken here in favour
-of keeping the API surface small, and is recorded as an open question in
-[§17](#17-open-questions) so it can be re-argued.
+> RBAC cannot scope the "create" verb by resourceNames, so this VAP ensures the
+> controller can only create resources with the expected names.
+
+The same pattern applies here. Hardening machina has two parts, and both are
+**blocking prerequisites** rather than independent work, because the feature
+widens an exposure that the hardening removes:
+
+1. Narrow the machina Role to `resourceNames` for `get`, `update`, `patch`, and
+   `delete`, matching the shape already used for net.
+2. Add a `ValidatingAdmissionPolicy` restricting machina's ConfigMap `create` to
+   the names it legitimately creates, modelled directly on
+   `09-vap.yaml.tmpl`.
+
+With both in place, no component ServiceAccount can create or modify the
+overrides ConfigMap. Write access is then held only by principals a cluster
+administrator has granted it to, which is the posture
+[§4.3](#43-required-posture-for-cluster-operators) requires.
+
+**This resolves the ConfigMap versus dedicated-resource question.** An earlier
+revision argued that only a dedicated resource type could scope `create`, and
+recorded the choice as an open question on that basis. That argument was wrong:
+admission policy scopes `create` by name, the repository already relies on this,
+and a dedicated resource type is therefore not required to reach the same
+posture. The ConfigMap is retained.
 
 ## 5. Alternatives considered
 
@@ -344,7 +365,7 @@ distinction that survives scrutiny. The real distinction is containment.
 
 A patch surface can be forced to produce only `apps/v1` `Deployment` and
 `DaemonSet` objects, by validation, by re-stamping, and by an assertion
-immediately before apply ([§8.4](#84-apply-time-assertion)). An attacker holding
+immediately before apply ([§8.5](#85-apply-time-assertion)). An attacker holding
 write access is then confined to node compromise, which is severe but requires a
 chain. An overlay engine cannot be constrained that way, because selecting group,
 version, and kind is precisely what it exists to do. Constraining kustomize to
@@ -535,12 +556,12 @@ adds nothing to `go.mod`.
 Strategic merge is schema-aware through the `patchStrategy` and `patchMergeKey`
 struct tags on the core types. The table below is **raw strategic-merge
 behaviour**, which the mechanism follows except where
-[§8.3](#83-additive-only-scheduling) deliberately departs from it:
+[§8.4](#84-additive-only-scheduling) deliberately departs from it:
 
 | Field | Raw behaviour | Mechanism |
 |---|---|---|
 | `containers`, `initContainers` | Merge by `name`. An unknown name adds a container. | As raw |
-| `volumes` | Merge by `name`, `retainKeys` | As raw, except operator-declared volumes ([§8.2](#82-protected)) |
+| `volumes` | Merge by `name`, `retainKeys` | As raw, except operator-declared volumes ([§8.3](#83-protected)) |
 | `env` | Merge by `name` | As raw |
 | `volumeMounts` | Merge by `mountPath` | As raw |
 | `imagePullSecrets` | Merge by `name` | As raw |
@@ -552,7 +573,7 @@ behaviour**, which the mechanism follows except where
 
 The three departures exist because raw semantics would silently destroy the
 mandatory Site affinity that `metalman` and `storage` depend on. See
-[§8.3](#83-additive-only-scheduling).
+[§8.4](#84-additive-only-scheduling).
 
 The patch targets the **whole workload object**, not just the pod template, so
 `metadata.labels`, `metadata.annotations`, `spec.replicas` and
@@ -614,48 +635,96 @@ component mutator            (image resolution, config hash, Site scoping)
   -> Env.ApplyObject         (env.go:240, SSA with ForceOwnership)
 ```
 
-The surface is an **allowlist**: paths not enumerated below are rejected.
-An earlier revision of this design used a denylist, which fails open. Fields
-added by future Kubernetes versions, and fields nobody thought to enumerate,
-would have been silently patchable. Rejecting by default inverts that.
+The surface is an **allowlist**: top-level paths not enumerated below are
+rejected. An earlier revision of this design used a denylist, which fails open
+against fields nobody thought to enumerate.
 
-Per [§4.2](#42-the-allowlist-is-an-integrity-control-not-a-security-control),
-these restrictions are integrity controls. They prevent an authorized operator
-from accidentally severing the operator's ability to reconcile a workload. They
-do not contain an adversary, with the two exceptions noted below.
+The allowlist is **fail-closed at the path level and fail-open within a
+permitted subtree**. Where a path is marked as a subtree, every descendant is
+permitted, including fields added by future Kubernetes releases. That is a
+deliberate choice, not an oversight: per
+[§4.2](#42-the-allowlist-is-an-integrity-control-not-a-security-control) the
+allowlist is an integrity control, and a new field under `securityContext` is
+not a new capability for a principal who can already replace the container
+image. Enumerating leaves would mean revisiting the list on every Kubernetes
+minor release for no security benefit.
+
+Per that same section, these restrictions prevent an authorized operator from
+accidentally severing the operator's ability to reconcile a workload. They do
+not contain an adversary, with the two exceptions noted below.
 
 ### 8.1 Permitted
 
+Paths marked **subtree** permit all descendants. Paths marked **leaf** permit
+only the named field.
+
 Within `spec.template.spec`:
 
-| Path | Notes |
-|---|---|
-| `containers[*].image` | Breaks version lockstep, reported per [§11](#11-drift-visibility-and-observability) |
-| `containers[*].args`, `.command` | Replace semantics, see [§7.2](#72-extraargs) |
-| `containers[*].env`, `.envFrom` | Merged by name |
-| `containers[*].resources` | |
-| `containers[*].volumeMounts` | Except mounts the operator declares, see [§8.2](#82-protected) |
-| `containers[*].securityContext` | Except changes that would reduce an operator-set value |
-| `containers[*].livenessProbe`, `.readinessProbe`, `.startupProbe` | |
-| Added `containers`, `initContainers` | Names not present in the generated workload |
-| `volumes` | Except volumes the operator declares |
-| `imagePullSecrets` | |
-| `nodeSelector`, `tolerations`, `affinity` | Additive only, see [§8.3](#83-additive-only-scheduling) |
-| `topologySpreadConstraints` | |
-| `priorityClassName` | |
-| `dnsPolicy`, `dnsConfig` | |
-| `terminationGracePeriodSeconds` | |
+| Path | Kind | Notes |
+|---|---|---|
+| `containers[*].image` | leaf | Breaks version lockstep, reported per [§11](#11-drift-visibility-and-observability) |
+| `containers[*].args`, `.command` | leaf | Replace semantics, see [§7.2](#72-extraargs) |
+| `containers[*].env`, `.envFrom` | subtree | Merged by name |
+| `containers[*].resources` | subtree | |
+| `containers[*].volumeMounts` | subtree | Except operator-declared mounts, see [§8.3](#83-protected) |
+| `containers[*].securityContext` | subtree | |
+| `containers[*].livenessProbe`, `.readinessProbe`, `.startupProbe` | subtree | |
+| `volumes` | subtree | Except operator-declared volumes |
+| `imagePullSecrets` | subtree | |
+| `nodeSelector`, `tolerations`, `affinity` | subtree | Additive only, see [§8.4](#84-additive-only-scheduling) |
+| `topologySpreadConstraints` | subtree | |
+| `priorityClassName` | leaf | |
+| `dnsPolicy`, `dnsConfig` | subtree | |
+| `terminationGracePeriodSeconds` | leaf | |
 
 At the workload level:
 
-| Path | Notes |
-|---|---|
-| `spec.replicas` | Deployments only |
-| `spec.strategy`, `spec.updateStrategy` | |
-| `metadata.labels`, `metadata.annotations` | Excluding the reserved prefix |
-| `spec.template.metadata.labels`, `.annotations` | Excluding the reserved prefix and selector keys |
+| Path | Kind | Notes |
+|---|---|---|
+| `spec.replicas` | leaf | Deployments only |
+| `spec.strategy`, `spec.updateStrategy` | subtree | |
+| `metadata.labels`, `metadata.annotations` | subtree | Excluding the reserved prefix |
+| `spec.template.metadata.labels`, `.annotations` | subtree | Excluding the reserved prefix and selector keys |
 
-### 8.2 Protected
+### 8.2 Adding containers requires explicit intent
+
+Strategic merge cannot distinguish an intended sidecar from a typo. Both are
+"this name is not in the workload", and merging by name silently creates a
+container in either case. A patch meaning to raise the memory limit on
+`machina-controller` but spelling it `machina-contoller` would add an image-less
+container and leave the real limit untouched.
+
+Container names are also release-specific
+([§2](#2-goals-and-non-goals)), so a name that was correct at authoring time can
+stop matching after an upgrade, with the same silent outcome.
+
+The default is therefore **modify-only**: every container named under
+`containers` or `initContainers` in a `patch` must already exist in the
+generated workload. Adding one requires naming it explicitly:
+
+```yaml
+- component: net
+  kind: DaemonSet
+  addContainers: [log-shipper]
+  patch:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: log-shipper
+              image: fluent/fluent-bit:3.1
+            - name: node
+              resources:
+                limits: {memory: 512Mi}
+```
+
+A name in `addContainers` that already exists in the workload is a validation
+error, since the intent was to create rather than modify. A name in the patch
+that is neither present in the workload nor listed in `addContainers` is a
+resolution failure ([§9.3](#93-failure-scope)). The two rules together mean
+neither a typo nor a renamed operator container can silently become a sidecar.
+
+### 8.3 Protected
 
 Rejected at validation **and** re-stamped after the merge. Validation gives a
 clear error; the re-stamp means correctness does not depend on validation being
@@ -671,7 +740,16 @@ exhaustive.
 | `spec.template.spec.serviceAccountName` | **Security.** Retargeting borrows another identity's API permissions. Also detaches the component from its RBAC. |
 | `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. `gantry` runs `hostNetwork: false` by design; `net-node` cannot function without `hostNetwork: true`. |
 | Labels and annotations under `unbounded-cloud.io/` | Carry config hashes, Site scoping, and override visibility ([§11](#11-drift-visibility-and-observability)). |
-| Operator-declared `volumes` and `volumeMounts`, by name | `Volumes` uses `patchStrategy:"merge,retainKeys"` (`k8s.io/api/core/v1/types.go:4145`), so a partial patch silently drops sibling fields of the volume it names. |
+| Operator-declared `volumes`, by name | `Volumes` uses `patchStrategy:"merge,retainKeys"` (`k8s.io/api/core/v1/types.go:4145`), so a partial patch silently drops sibling fields of the volume it names. |
+| Operator-declared `volumeMounts`, by **container plus `mountPath`** | See below. |
+
+**Mount identity is `(container, mountPath)`, not name.** `volumeMounts` merges
+on `patchMergeKey:"mountPath"` (`k8s.io/api/core/v1/types.go:3029`), not on
+`name`. Protecting operator mounts by name would therefore be bypassable: a
+patch supplying `{name: attacker-volume, mountPath: /host}` merges on the
+matching `mountPath` and repoints an operator mount at a different volume while
+never colliding on the protected name. Protection is keyed on the merge key that
+strategic merge actually uses.
 
 Also rejected:
 
@@ -682,7 +760,7 @@ Also rejected:
   a second route to removing managed content that a path allowlist alone does
   not catch.
 
-### 8.3 Additive-only scheduling
+### 8.4 Additive-only scheduling
 
 `metalman` and `storage` place their workloads with a mandatory Site affinity
 (`metalman.go:170`, `storage.go:261-268`) built by `SiteNodeAffinity`
@@ -695,13 +773,27 @@ constraint would silently remove Site isolation and allow two Sites' workloads
 onto the same nodes, violating the no-retarget goal in
 [§2](#2-goals-and-non-goals).
 
-Scheduling constraints are therefore merged additively rather than applied as a
-raw patch:
+Scheduling constraints are therefore combined rather than patched.
 
-- `affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution`: user
-  `matchExpressions` are appended to **each** operator term, so the result is
-  the conjunction of the Site constraint and the user constraint. Operator terms
-  are never removed or replaced.
+**Node affinity requires a Cartesian product, not appending.**
+`SiteNodeAffinity` emits **two** terms, matching the canonical and the
+deprecated Site label, and `NodeSelectorTerms` are ORed. Appending the user's
+expressions to each operator term is only correct when the user supplies a
+single term. Given operator terms `O = [O1, O2]` and user terms `U = [U1, U2]`,
+the required semantics are:
+
+```
+(O1 OR O2) AND (U1 OR U2)
+  = (O1 AND U1) OR (O1 AND U2) OR (O2 AND U1) OR (O2 AND U2)
+```
+
+which is the Cartesian product of the two term lists. Each product term carries
+the concatenation of both sides' `matchExpressions` **and** both sides'
+`matchFields`; `NodeSelectorTerm` has both (`k8s.io/api/core/v1/types.go:3789`,
+`:3793`) and dropping `matchFields` would silently discard a user constraint.
+
+Operator terms are never removed or replaced. The remaining constraints:
+
 - `affinity.nodeAffinity.preferredDuringScheduling...`, `podAffinity`, and
   `podAntiAffinity`: appended, since the operator sets none today. If a
   component later sets them, the same conjunction rule applies.
@@ -709,7 +801,7 @@ raw patch:
 - `tolerations`: appended, never replaced, despite strategic merge's default
   replace semantics for that list.
 
-### 8.4 Apply-time assertion
+### 8.5 Apply-time assertion
 
 Independently of validation and re-stamping, the object is asserted to be
 `apps/v1` `Deployment` or `DaemonSet` immediately before apply, and `ApplyObject`
@@ -958,7 +1050,7 @@ critical path.
 **Access control.** Write access to the overrides ConfigMap is
 cluster-admin-equivalent ([§4.1](#41-threat-model)). It must be granted only to
 cluster administrators and audited like an RBAC change. Operators should also
-apply the RBAC narrowing in [§4.4](#44-residual-risk), and should be aware that
+apply the RBAC narrowing in [§4.4](#44-residual-risk-and-how-it-is-closed), and should be aware that
 a component retaining namespace-wide ConfigMap `create` can still seed the
 object when it is absent.
 
@@ -1008,7 +1100,7 @@ Sequenced independently, not blocking and not blocked:
 
 | PR | Scope |
 |---|---|
-| H1 | RBAC hardening: narrow the namespace-wide ConfigMap grants at `deploy/machina/02-rbac.yaml.tmpl:15-17`, `deploy/machina/06-metalman-rbac.yaml.tmpl:59,132`, and `deploy/net/controller/02-rbac.yaml.tmpl:170,173,216` to `resourceNames` for `get`, `update`, `patch`, and `delete`. Worth doing on its own merits ([§4.4](#44-residual-risk)). |
+| H1 | RBAC hardening: narrow the namespace-wide ConfigMap grants at `deploy/machina/02-rbac.yaml.tmpl:15-17`, `deploy/machina/06-metalman-rbac.yaml.tmpl:59,132`, and `deploy/net/controller/02-rbac.yaml.tmpl:170,173,216` to `resourceNames` for `get`, `update`, `patch`, and `delete`. Worth doing on its own merits ([§4.4](#44-residual-risk-and-how-it-is-closed)). |
 
 The `Site` printer column requires `make generate`. Nothing else in the plan
 changes the CRD schema, and there is no API version churn at any step.
@@ -1113,7 +1205,7 @@ directly applicable for users who want full control.
 
 1. **Dedicated resource type instead of a ConfigMap.** Review raised this as the
    remedy for [§4.1](#41-threat-model). It was not taken, in favour of keeping
-   the API surface small, and [§4.4](#44-residual-risk) documents the accepted
+   the API surface small, and [§4.4](#44-residual-risk-and-how-it-is-closed) documents the accepted
    residual risk: RBAC cannot scope `create` by `resourceNames`, so a component
    holding namespace-wide ConfigMap `create` can seed the object when absent. A
    dedicated resource is the only complete fix. Is the smaller API surface worth
@@ -1139,7 +1231,7 @@ directly applicable for users who want full control.
    that does not exist today. It can be added alongside `sites` later with a
    documented precedence.
 7. **ServiceAccount annotations.** `serviceAccountName` is protected
-   ([§8.2](#82-protected)), but workload identity integrations normally require
+   ([§8.3](#83-protected)), but workload identity integrations normally require
    annotating the ServiceAccount. The operator applies component ServiceAccounts
    with `ForceOwnership`, so user annotations on them are reverted. This is a
    real gap that neither this mechanism nor the existing ConfigMap escape hatch
