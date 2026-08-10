@@ -4,10 +4,8 @@
 package goalstates
 
 import (
-	"encoding/json"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,75 +33,12 @@ func TestResolveNSpawnConfigDoesNotResolveLocalDNS(t *testing.T) {
 	require.Equal(t, "/etc/systemd/nspawn/kube1.nspawn", got.NSpawnConfigFile)
 }
 
-func TestLegacyNVIDIADropInPath(t *testing.T) {
+func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "/var/lib/machines/kube1/etc/containerd/conf.d/99-nvidia-runtime.toml", legacyNVIDIADropInPath("kube1"))
-}
-
-func TestResolveMachineWithPersistedGPUCapabilityRejectsTransientEmptyDiscovery(t *testing.T) {
-	t.Parallel()
-
-	statePath := writeResolvedLifecycleState(t, true, completeResolvedNVIDIA())
-	_, err := resolveExistingMachine(
-		discardLogger(),
-		&config.AgentConfig{},
-		NSpawnMachineKube1,
-		nil,
-		statePath,
-		func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
-	)
-	require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
-}
-
-func TestResolveMachineWithPersistedCPUCapabilityIgnoresAppearingGPU(t *testing.T) {
-	t.Parallel()
-
-	statePath := writeResolvedLifecycleState(t, false, NvidiaHost{})
-	gs, err := resolveExistingMachine(
-		discardLogger(),
-		&config.AgentConfig{},
-		NSpawnMachineKube1,
-		nil,
-		statePath,
-		func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
-	)
-	require.NoError(t, err)
-	require.False(t, gs.RootFS.Nvidia.Required)
-	require.Empty(t, gs.RootFS.Nvidia.GPUDevicePaths)
-	require.False(t, gs.NodeStart.Nvidia.Required)
-	require.False(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
-	require.Empty(t, gs.NodeStart.Nvidia.GPUDevicePaths)
-}
-
-func TestResolveExistingLifecycleMigratesLegacyCapability(t *testing.T) {
-	t.Parallel()
-
-	t.Run("legacy GPU retries incomplete discovery", func(t *testing.T) {
-		dir := t.TempDir()
-		legacyDropIn := filepath.Join(dir, "99-nvidia-runtime.toml")
-		require.NoError(t, os.WriteFile(legacyDropIn, []byte("managed"), 0o600))
-
-		_, err := resolveExistingLifecycle(
-			&config.AgentConfig{},
-			NSpawnMachineKube1,
-			filepath.Join(dir, "missing-state.json"),
-			legacyDropIn,
-			func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
-		)
-		require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
-	})
-
-	t.Run("legacy GPU preserves inferred capability", func(t *testing.T) {
-		dir := t.TempDir()
-		legacyDropIn := filepath.Join(dir, "99-nvidia-runtime.toml")
-		require.NoError(t, os.WriteFile(legacyDropIn, []byte("managed"), 0o600))
-
-		gs, err := resolveExistingLifecycle(
-			&config.AgentConfig{},
-			NSpawnMachineKube1,
-			filepath.Join(dir, "missing-state.json"),
-			legacyDropIn,
+	t.Run("complete GPU discovery enables NVIDIA", func(t *testing.T) {
+		gs, err := resolveMachine(
+			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
 			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
 		)
 		require.NoError(t, err)
@@ -112,39 +47,38 @@ func TestResolveExistingLifecycleMigratesLegacyCapability(t *testing.T) {
 		require.True(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
 	})
 
-	t.Run("legacy CPU ignores appearing GPU", func(t *testing.T) {
-		dir := t.TempDir()
-		gs, err := resolveExistingLifecycle(
-			&config.AgentConfig{},
-			NSpawnMachineKube1,
-			filepath.Join(dir, "missing-state.json"),
-			filepath.Join(dir, "missing-nvidia-drop-in.toml"),
-			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
+	t.Run("empty discovery produces CPU state", func(t *testing.T) {
+		gs, err := resolveMachine(
+			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
 		)
 		require.NoError(t, err)
 		require.False(t, gs.RootFS.Nvidia.Required)
-		require.Empty(t, gs.RootFS.Nvidia.GPUDevicePaths)
-		require.False(t, gs.NodeStart.Nvidia.Required)
 		require.False(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
+	})
+
+	t.Run("incomplete GPU discovery fails", func(t *testing.T) {
+		_, err := resolveMachine(
+			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) {
+				return NvidiaHost{GPUDevicePaths: []string{"/dev/nvidia0"}}, nil
+			},
+		)
+		require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
 	})
 }
 
-func writeResolvedLifecycleState(t *testing.T, required bool, nvidia NvidiaHost) string {
-	t.Helper()
+func TestResolveExistingLifecycleUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
+	t.Parallel()
 
-	nvidia.Required = required
-	state := NSpawnLifecycleState{
-		Version:     NSpawnLifecycleStateVersion,
-		MachineName: NSpawnMachineKube1,
-		NVIDIA:      nvidia,
-	}
-	data, err := json.Marshal(&state)
+	gs, err := resolveExistingLifecycle(
+		&config.AgentConfig{}, NSpawnMachineKube1,
+		func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
+	)
 	require.NoError(t, err)
-
-	path := filepath.Join(t.TempDir(), "lifecycle.json")
-	require.NoError(t, os.WriteFile(path, data, 0o600))
-
-	return path
+	require.True(t, gs.RootFS.Nvidia.Required)
+	require.True(t, gs.NodeStart.Nvidia.Required)
+	require.True(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
 }
 
 func completeResolvedNVIDIA() NvidiaHost {

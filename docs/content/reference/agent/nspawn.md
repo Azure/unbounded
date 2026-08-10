@@ -156,21 +156,21 @@ Two systemd hooks run common lifecycle reconciliation around every nspawn
 start. The pre-start hook refreshes host devices, mounts, and GPU paths changed
 by a host reboot. The post-start hook prepares in-machine runtime state before
 containerd and kubelet proceed. Hook failures keep the machine from becoming
-ready and are retried through systemd.
+ready and are retried through systemd. On the host,
+`nspawn-lifecycle-helper nspawn-lifecycle reconcile <machine>` triggers both
+steps by restarting the managed nspawn unit.
 
-The provisioned NVIDIA capability is durable. A GPU-provisioned machine fails
-and retries pre-start discovery if its devices or driver libraries are
-temporarily unavailable. A CPU-provisioned machine remains CPU-only even if
-NVIDIA hardware later appears. The exact NVIDIA state used to render nspawn
-mounts is persisted for the post-start setup hook, preventing the two phases
-from discovering different paths.
+Each lifecycle refresh discovers NVIDIA devices and driver libraries from the
+current host. Complete GPU discovery enables the NVIDIA runtime and post-start
+rewiring; no devices produces CPU-only configuration, while devices with
+incomplete driver state cause the start to retry. Post-start rewiring refreshes
+the driver root and CDI state after every machine start.
 
 When an upgraded daemon starts for a machine created by an older agent, it
 idempotently installs the host lifecycle hooks and the on-disk containerd and
 kubelet readiness units without restarting the running machine or its services.
-Legacy NVIDIA capability is inferred from the agent-managed NVIDIA containerd
-drop-in. The daemon retries migration while required GPU state is temporarily
-unavailable; corrupt lifecycle state remains a hard failure.
+The daemon migration uses the same current-host discovery and retries while
+NVIDIA devices have incomplete driver state.
 
 The configuration is written to these files on the host before the machine boots:
 
@@ -180,7 +180,6 @@ The configuration is written to these files on the host before the machine boots
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
 | Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
 | Rollback-stable lifecycle helper | `/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper` |
-| Lifecycle state handoff | `/etc/unbounded/agent/<MachineName>-nspawn-lifecycle.json` |
 
 ### Customization points
 
@@ -308,7 +307,6 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
 | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
 | `/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper` | Lifecycle command binary retained across daemon binary rollback. |
-| `/etc/unbounded/agent/<MachineName>-nspawn-lifecycle.json` | Durable provisioned capability and exact pre-start NVIDIA resolved-state handoff. |
 | `/run/unbounded/nvidia-ready` | (Inside GPU container) Lifecycle-scoped marker that releases containerd and kubelet after NVIDIA setup. |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 

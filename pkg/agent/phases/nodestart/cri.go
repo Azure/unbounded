@@ -134,7 +134,6 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 	buf := &bytes.Buffer{}
 	if err := assetsTemplate.ExecuteTemplate(buf, "containerd.service", map[string]any{
 		"ContainerdBinPath": spec.ContainerdBinPath,
-		"NvidiaEnabled":     nvidiaSetupEnabled(c.goalState),
 	}); err != nil {
 		return err
 	}
@@ -146,13 +145,6 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 
 func (c *configureContainerd) ensureNVIDIAReadyServiceUnit() error {
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitNVIDIAReady)
-	if !nvidiaSetupEnabled(c.goalState) {
-		if err := os.Remove(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-
-		return nil
-	}
 
 	data, err := assets.ReadFile("assets/unbounded-nvidia-ready.service")
 	if err != nil {
@@ -160,10 +152,6 @@ func (c *configureContainerd) ensureNVIDIAReadyServiceUnit() error {
 	}
 
 	return utilio.WriteFile(dest, data, 0o644)
-}
-
-func nvidiaSetupEnabled(goalState *goalstates.NodeStart) bool {
-	return goalState.Nvidia.Required
 }
 
 // ensureGPUDropInConfigs manages GPU-related containerd drop-in configs.

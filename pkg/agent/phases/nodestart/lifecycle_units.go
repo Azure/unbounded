@@ -34,6 +34,10 @@ func (e *ensureNSpawnLifecycleUnits) Do(_ context.Context) error {
 		return fmt.Errorf("ensure NVIDIA ready service unit: %w", err)
 	}
 
+	if err := containerd.ensureGPUDropInConfigs(); err != nil {
+		return fmt.Errorf("ensure NVIDIA containerd runtime config: %w", err)
+	}
+
 	kubelet := &configureKubelet{goalState: e.goalState}
 	if err := kubelet.ensureKubeletServiceUnit(); err != nil {
 		return fmt.Errorf("ensure kubelet lifecycle unit: %w", err)

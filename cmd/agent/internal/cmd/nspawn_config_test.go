@@ -53,151 +53,74 @@ func TestLoadAppliedConfigMissingAndCorrupt(t *testing.T) {
 	require.ErrorIs(t, err, goalstates.ErrChecksumMismatch)
 }
 
-func TestNSpawnLifecyclePreStartPersistsExactResolvedNVIDIAState(t *testing.T) {
+func TestNSpawnLifecyclePreStartRefreshesConfig(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	configPath, checksumPath := writeAppliedConfig(t, dir)
-	statePath := filepath.Join(dir, "lifecycle.json")
-	writeLifecycleState(t, statePath, true, completeNVIDIA("old"))
-
-	resolved := completeNVIDIA("new")
 	root := temporaryRootFS(dir)
-	root.Nvidia = resolved
-	root.Nvidia.Required = true
+	root.Nvidia = completeNVIDIA("fresh")
 
 	var reloaded bool
 
 	err := nspawnLifecyclePreStart(
-		context.Background(), testLogger(), "kube1", configPath, checksumPath, statePath,
-		func(_ *provision.AgentConfig, _ string, required bool) (*goalstates.RootFS, error) {
-			require.True(t, required)
-
-			return root, nil
-		},
+		context.Background(), testLogger(), "kube1", configPath, checksumPath,
+		func(_ *provision.AgentConfig, _ string) (*goalstates.RootFS, error) { return root, nil },
 		phases.ExecuteTask,
 		func(context.Context, *slog.Logger) error { reloaded = true; return nil },
 	)
 	require.NoError(t, err)
 	require.True(t, reloaded)
 
-	got, err := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
-	require.NoError(t, err)
-	require.Equal(t, resolved, got.NVIDIA)
-
 	nspawnData, err := os.ReadFile(root.NSpawnConfigFile)
 	require.NoError(t, err)
-	require.Contains(t, string(nspawnData), resolved.LibDirMounts[0].HostDir)
+	require.Contains(t, string(nspawnData), root.Nvidia.LibDirMounts[0].HostDir)
+
+	containerdUnit, err := os.ReadFile(filepath.Join(root.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd))
+	require.NoError(t, err)
+	require.Contains(t, string(containerdUnit), goalstates.SystemdUnitNVIDIAReady)
 }
 
-func TestNSpawnLifecyclePreStartGPUDiscoveryFailureDoesNotReplaceState(t *testing.T) {
+func TestNSpawnLifecyclePreStartKeepsFreshBootstrapConfigWithoutAppliedConfig(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	configPath, checksumPath := writeAppliedConfig(t, dir)
-	statePath := filepath.Join(dir, "lifecycle.json")
-	old := completeNVIDIA("old")
-	writeLifecycleState(t, statePath, true, old)
-
+	called := false
 	err := nspawnLifecyclePreStart(
-		context.Background(), testLogger(), "kube1", configPath, checksumPath, statePath,
-		func(_ *provision.AgentConfig, _ string, required bool) (*goalstates.RootFS, error) {
-			require.True(t, required)
+		context.Background(), testLogger(), "kube1",
+		filepath.Join(dir, "missing.json"), filepath.Join(dir, "missing.sha256"),
+		func(*provision.AgentConfig, string) (*goalstates.RootFS, error) {
+			called = true
 
-			return nil, errors.New("NVIDIA is required")
+			return nil, errors.New("unexpected resolve")
 		},
-		func(context.Context, *slog.Logger, phases.Task) error { return errors.New("must not execute") },
-		func(context.Context, *slog.Logger) error { return errors.New("must not reload") },
+		func(context.Context, *slog.Logger, phases.Task) error { return errors.New("unexpected execute") },
+		func(context.Context, *slog.Logger) error { return errors.New("unexpected reload") },
 	)
-	require.ErrorContains(t, err, "NVIDIA is required")
-
-	got, loadErr := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
-	require.NoError(t, loadErr)
-	require.Equal(t, old, got.NVIDIA)
+	require.NoError(t, err)
+	require.False(t, called)
 }
 
-func TestNSpawnLifecyclePreStartCPUNodeIgnoresAppearingGPU(t *testing.T) {
+func TestNSpawnLifecyclePreStartCPUNodeStaysCPU(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	configPath, checksumPath := writeAppliedConfig(t, dir)
-	statePath := filepath.Join(dir, "lifecycle.json")
-	writeLifecycleState(t, statePath, false, goalstates.NvidiaHost{})
-
 	root := temporaryRootFS(dir)
-	root.Nvidia = completeNVIDIA("appeared")
 	err := nspawnLifecyclePreStart(
-		context.Background(), testLogger(), "kube1", configPath, checksumPath, statePath,
-		func(_ *provision.AgentConfig, _ string, required bool) (*goalstates.RootFS, error) {
-			require.False(t, required)
-
-			root.Nvidia = goalstates.NvidiaHost{}
-
-			return root, nil
-		},
+		context.Background(), testLogger(), "kube1", configPath, checksumPath,
+		func(_ *provision.AgentConfig, _ string) (*goalstates.RootFS, error) { return root, nil },
 		phases.ExecuteTask,
 		func(context.Context, *slog.Logger) error { return nil },
 	)
 	require.NoError(t, err)
 
-	got, loadErr := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
-	require.NoError(t, loadErr)
-	require.False(t, got.NVIDIA.Required)
-	require.Empty(t, got.NVIDIA.GPUDevicePaths)
-}
-
-func TestNSpawnLifecyclePreStartBootstrapAndStaleState(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	statePath := filepath.Join(dir, "lifecycle.json")
-	state := goalstates.NSpawnLifecycleState{
-		Version:     goalstates.NSpawnLifecycleStateVersion,
-		MachineName: "kube1",
-		NSpawnConfigInput: goalstates.NSpawnConfigInput{
-			AdditionalHostDevices: []string{"/dev/uinput"},
-		},
-	}
-	data, err := json.Marshal(&state)
+	containerdUnit, err := os.ReadFile(filepath.Join(root.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd))
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(statePath, data, 0o600))
+	require.Contains(t, string(containerdUnit), goalstates.SystemdUnitNVIDIAReady)
 
-	root := temporaryRootFS(dir)
-
-	var reloaded bool
-
-	err = nspawnLifecyclePreStart(
-		context.Background(), testLogger(), "kube1", filepath.Join(dir, "missing"), filepath.Join(dir, "missing.sha256"), statePath,
-		func(cfg *provision.AgentConfig, _ string, required bool) (*goalstates.RootFS, error) {
-			require.False(t, required)
-			require.Equal(t, []string{"/dev/uinput"}, cfg.AdditionalHostDevices)
-
-			root.NSpawnConfigInput = state.NSpawnConfigInput
-
-			return root, nil
-		},
-		phases.ExecuteTask,
-		func(context.Context, *slog.Logger) error { reloaded = true; return nil },
-	)
-	require.NoError(t, err)
-	require.True(t, reloaded)
-
-	persisted, err := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
-	require.NoError(t, err)
-	require.Equal(t, state.NSpawnConfigInput, persisted.NSpawnConfigInput)
-
-	writeLifecycleState(t, statePath, false, goalstates.NvidiaHost{})
-	staleData, readErr := os.ReadFile(statePath)
-	require.NoError(t, readErr)
-
-	var staleState goalstates.NSpawnLifecycleState
-	require.NoError(t, json.Unmarshal(staleData, &staleState))
-	staleState.MachineName = "kube2"
-	staleData, err = json.Marshal(&staleState)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(statePath, staleData, 0o600))
-	_, err = goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
-	require.ErrorContains(t, err, "not \"kube1\"")
+	_, err = os.Stat(filepath.Join(root.MachineDir, goalstates.NvidiaRuntimeDropInPath))
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func writeAppliedConfig(t *testing.T, dir string) (string, string) {
@@ -211,16 +134,6 @@ func writeAppliedConfig(t *testing.T, dir string) (string, string) {
 	require.NoError(t, os.WriteFile(checksumPath, []byte(goalstates.ComputeChecksum(data)), 0o600))
 
 	return path, checksumPath
-}
-
-func writeLifecycleState(t *testing.T, path string, required bool, nvidia goalstates.NvidiaHost) {
-	t.Helper()
-
-	nvidia.Required = required
-	state := goalstates.NSpawnLifecycleState{Version: goalstates.NSpawnLifecycleStateVersion, MachineName: "kube1", NVIDIA: nvidia}
-	data, err := json.Marshal(&state)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(path, data, 0o600))
 }
 
 func completeNVIDIA(suffix string) goalstates.NvidiaHost {
@@ -243,7 +156,6 @@ func temporaryRootFS(dir string) *goalstates.RootFS {
 		MachineDir:             filepath.Join(dir, "kube1"),
 		NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
 		ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
-		LifecycleStateFile:     filepath.Join(dir, "lifecycle.json"),
 		ConfigRegenerationFile: filepath.Join(dir, "regeneration.service"),
 	}
 }

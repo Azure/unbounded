@@ -7,9 +7,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
@@ -25,6 +27,7 @@ func newCmdNSpawnLifecycle(cmdCtx *CommandContext) *cobra.Command {
 	cmd.AddCommand(
 		newCmdNSpawnLifecyclePhase(cmdCtx, "pre-start", "Refresh host-side nspawn state before machine start", runNSpawnLifecyclePreStart),
 		newCmdNSpawnLifecyclePhase(cmdCtx, "post-start", "Reconcile in-machine state after machine start", runNSpawnLifecyclePostStart),
+		newCmdNSpawnLifecyclePhase(cmdCtx, "reconcile", "Restart a machine and run its lifecycle reconciliation", runNSpawnLifecycleReconcile),
 	)
 
 	return cmd
@@ -52,9 +55,28 @@ func newCmdNSpawnLifecyclePhase(
 	}
 }
 
+type restartNSpawnFunc func(context.Context, *slog.Logger, string) error
+
+func runNSpawnLifecycleReconcile(ctx context.Context, log *slog.Logger, machineName string) error {
+	return reconcileNSpawnLifecycle(ctx, log, machineName, func(ctx context.Context, log *slog.Logger, unit string) error {
+		return executil.RunCmd(ctx, log, executil.Systemctl(), "restart", unit)
+	})
+}
+
+func reconcileNSpawnLifecycle(ctx context.Context, log *slog.Logger, machineName string, restart restartNSpawnFunc) error {
+	unit := fmt.Sprintf("systemd-nspawn@%s.service", machineName)
+	if err := restart(ctx, log, unit); err != nil {
+		return fmt.Errorf("reconcile nspawn machine %s: %w", machineName, err)
+	}
+
+	return nil
+}
+
 type (
 	waitForLifecycleMachineFunc func(context.Context, *slog.Logger, string) error
 	setupNVIDIATaskFunc         func(*slog.Logger, *goalstates.NodeStart) phases.Task
+	markNVIDIAReadyTaskFunc     func(*slog.Logger, string) phases.Task
+	resolveNVIDIAHostFunc       func(string) (goalstates.NvidiaHost, error)
 )
 
 func runNSpawnLifecyclePostStart(ctx context.Context, log *slog.Logger, machineName string) error {
@@ -62,9 +84,10 @@ func runNSpawnLifecyclePostStart(ctx context.Context, log *slog.Logger, machineN
 		ctx,
 		log,
 		machineName,
-		goalstates.NSpawnLifecycleStatePath(machineName),
+		goalstates.ResolveNvidiaHost,
 		nodestart.WaitForMachine,
 		nodestart.SetupNVIDIA,
+		nodestart.MarkNVIDIAReady,
 		phases.ExecuteTask,
 	)
 }
@@ -72,21 +95,37 @@ func runNSpawnLifecyclePostStart(ctx context.Context, log *slog.Logger, machineN
 func nspawnLifecyclePostStart(
 	ctx context.Context,
 	log *slog.Logger,
-	machineName, statePath string,
+	machineName string,
+	resolveNVIDIA resolveNVIDIAHostFunc,
 	waitForMachine waitForLifecycleMachineFunc,
 	setupNVIDIA setupNVIDIATaskFunc,
+	markReady markNVIDIAReadyTaskFunc,
 	executeTask executeLifecycleTaskFunc,
 ) error {
-	state, err := goalstates.LoadNSpawnLifecycleState(statePath, machineName)
+	nvidia, err := resolveNVIDIA(runtime.GOARCH)
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve NVIDIA host state: %w", err)
 	}
 
-	if !state.NVIDIA.Required {
-		log.Info("NVIDIA was not provisioned for machine; skipping post-start setup", "machine", machineName)
+	if len(nvidia.GPUDevicePaths) == 0 {
+		log.Info("no NVIDIA devices discovered; releasing post-start readiness gate", "machine", machineName)
+
+		if err := waitForMachine(ctx, log, machineName); err != nil {
+			return fmt.Errorf("wait for machine %s: %w", machineName, err)
+		}
+
+		if err := executeTask(ctx, log, markReady(log, machineName)); err != nil {
+			return fmt.Errorf("release post-start readiness gate for %s: %w", machineName, err)
+		}
 
 		return nil
 	}
+
+	if !goalstates.NVIDIAStateAvailable(nvidia) {
+		return fmt.Errorf("%w for machine %s", goalstates.ErrNVIDIAStateUnavailable, machineName)
+	}
+
+	nvidia.Required = true
 
 	if err := waitForMachine(ctx, log, machineName); err != nil {
 		return fmt.Errorf("wait for machine %s: %w", machineName, err)
@@ -97,7 +136,7 @@ func nspawnLifecyclePostStart(
 		MachineName: machineName,
 		MachineDir:  "/var/lib/machines/" + machineName,
 		Containerd:  containerd,
-		Nvidia:      state.NVIDIA,
+		Nvidia:      nvidia,
 	}
 
 	if err := executeTask(ctx, log, setupNVIDIA(log, nodeStart)); err != nil {

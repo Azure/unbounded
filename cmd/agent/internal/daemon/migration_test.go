@@ -46,11 +46,11 @@ func TestEnsureLifecycleMigrationRetriesUnavailableNVIDIA(t *testing.T) {
 	require.Equal(t, 2, op.lifecycleCalls)
 }
 
-func TestEnsureLifecycleMigrationFailsCorruptStateWithoutRetry(t *testing.T) {
+func TestEnsureLifecycleMigrationFailsNonRetryableError(t *testing.T) {
 	t.Parallel()
 
-	corruptErr := errors.New("corrupt lifecycle state")
-	op := &fakeNodeOperator{lifecycleErrs: []error{corruptErr}}
+	resolveErr := errors.New("resolve lifecycle configuration")
+	op := &fakeNodeOperator{lifecycleErrs: []error{resolveErr}}
 	err := ensureLifecycleMigration(
 		context.Background(),
 		discardLogger(),
@@ -58,6 +58,6 @@ func TestEnsureLifecycleMigrationFailsCorruptStateWithoutRetry(t *testing.T) {
 		&ActiveMachine{Name: "kube1"},
 		time.Millisecond,
 	)
-	require.ErrorIs(t, err, corruptErr)
+	require.ErrorIs(t, err, resolveErr)
 	require.Equal(t, 1, op.lifecycleCalls)
 }

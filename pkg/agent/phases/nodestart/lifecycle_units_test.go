@@ -35,12 +35,19 @@ func TestEnsureNSpawnLifecycleUnitsMigratesLegacyGPUNode(t *testing.T) {
 
 	ready := readLifecycleUnit(t, machineDir, goalstates.SystemdUnitNVIDIAReady)
 	require.Contains(t, ready, goalstates.NVIDIAReadyPath)
+
+	_, err := os.Stat(filepath.Join(machineDir, goalstates.NvidiaRuntimeDropInPath))
+	require.NoError(t, err)
 }
 
-func TestEnsureNSpawnLifecycleUnitsKeepsLegacyCPUNodeUngated(t *testing.T) {
+func TestEnsureNSpawnLifecycleUnitsGatesCPUNodeButRemovesNVIDIARuntime(t *testing.T) {
 	t.Parallel()
 
 	machineDir := t.TempDir()
+	staleNVIDIAConfig := filepath.Join(machineDir, goalstates.NvidiaRuntimeDropInPath)
+	require.NoError(t, os.MkdirAll(filepath.Dir(staleNVIDIAConfig), 0o755))
+	require.NoError(t, os.WriteFile(staleNVIDIAConfig, []byte("stale"), 0o600))
+
 	state := &goalstates.NodeStart{
 		MachineDir: machineDir,
 		Containerd: goalstates.ResolveContainerd(goalstates.ContainerdOptions{}),
@@ -48,10 +55,12 @@ func TestEnsureNSpawnLifecycleUnitsKeepsLegacyCPUNodeUngated(t *testing.T) {
 	}
 	require.NoError(t, EnsureNSpawnLifecycleUnits(state).Do(context.Background()))
 
-	require.NotContains(t, readLifecycleUnit(t, machineDir, goalstates.SystemdUnitContainerd), "unbounded-nvidia-ready")
-	require.NotContains(t, readLifecycleUnit(t, machineDir, goalstates.SystemdUnitKubelet), "unbounded-nvidia-ready")
+	require.Contains(t, readLifecycleUnit(t, machineDir, goalstates.SystemdUnitContainerd), "unbounded-nvidia-ready")
+	require.Contains(t, readLifecycleUnit(t, machineDir, goalstates.SystemdUnitKubelet), "unbounded-nvidia-ready")
 
 	_, err := os.Stat(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitNVIDIAReady))
+	require.NoError(t, err)
+	_, err = os.Stat(staleNVIDIAConfig)
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 

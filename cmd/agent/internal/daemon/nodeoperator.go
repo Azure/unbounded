@@ -211,7 +211,7 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
-	gs, err := goalstates.ResolveExistingMachine(log, active.Config, active.Name, nil)
+	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
 	if err != nil {
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}

@@ -87,7 +87,7 @@ func TestConfigureContainerdGatesNVIDIAStartup(t *testing.T) {
 		"ExecStart=/bin/sh -c 'until test -e /run/unbounded/nvidia-ready; do sleep 1; done'")
 }
 
-func TestConfigureContainerdDoesNotGateCPUNodes(t *testing.T) {
+func TestConfigureContainerdGatesCPUNodeUntilPostStartDiscovery(t *testing.T) {
 	t.Parallel()
 
 	machineDir := t.TempDir()
@@ -100,10 +100,10 @@ func TestConfigureContainerdDoesNotGateCPUNodes(t *testing.T) {
 
 	service, err := os.ReadFile(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd))
 	require.NoError(t, err)
-	require.NotContains(t, string(service), "unbounded-nvidia-ready.service")
+	require.Contains(t, string(service), "unbounded-nvidia-ready.service")
 
 	_, err = os.Stat(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitNVIDIAReady))
-	require.ErrorIs(t, err, os.ErrNotExist)
+	require.NoError(t, err)
 }
 
 func TestConfigureContainerdUpdatesManagedGantryHostsConfig(t *testing.T) {

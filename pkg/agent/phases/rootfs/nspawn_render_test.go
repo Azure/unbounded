@@ -75,7 +75,6 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 				},
 			}
 			data.NvidiaBinDir = "/usr/bin"
-			data.NvidiaEnabled = true
 
 			return data
 		}(),
@@ -87,7 +86,6 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 				"/dev/nvidia-uvm",
 				"/dev/dri/renderD128",
 			})
-			data.NvidiaEnabled = true
 			data.NvidiaBinDir = nvidiaHostBinDir(goalstates.NvidiaHost{
 				NvidiaSMIPath:     "/usr/bin/nvidia-smi",
 				NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
@@ -333,7 +331,6 @@ func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
 	t.Parallel()
 
 	data := defaultNSpawnTemplateData("kube1")
-	data.NvidiaEnabled = true
 
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
@@ -342,12 +339,12 @@ func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
 	require.NotContains(t, buf.String(), "if [ ! -x")
 }
 
-func TestServiceOverride_CPUNodesDoNotReconcileNVIDIA(t *testing.T) {
+func TestServiceOverride_CPUNodesRunCommonPostStartHook(t *testing.T) {
 	t.Parallel()
 
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
-	require.NotContains(t, buf.String(), "nspawn-lifecycle post-start")
+	require.Contains(t, buf.String(), "nspawn-lifecycle post-start")
 }
 
 func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {

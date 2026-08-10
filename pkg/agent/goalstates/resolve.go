@@ -39,19 +39,12 @@ type resolveNVIDIAHostFunc func(string) (NvidiaHost, error)
 // systemd-nspawn configuration for a machine. Unlike ResolveMachine, it does
 // not resolve network-dependent node services such as LocalDNS.
 func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, error) {
-	return resolveNSpawnConfig(cfg, machineName, nil, ResolveNvidiaHost)
-}
-
-// ResolveNSpawnConfigForNVIDIACapability refreshes nspawn host state without
-// allowing discovery to change an existing machine's provisioned capability.
-func ResolveNSpawnConfigForNVIDIACapability(cfg *config.AgentConfig, machineName string, nvidiaRequired bool) (*RootFS, error) {
-	return resolveNSpawnConfig(cfg, machineName, &nvidiaRequired, ResolveNvidiaHost)
+	return resolveNSpawnConfig(cfg, machineName, ResolveNvidiaHost)
 }
 
 func resolveNSpawnConfig(
 	cfg *config.AgentConfig,
 	machineName string,
-	provisionedNVIDIARequired *bool,
 	resolveNVIDIA resolveNVIDIAHostFunc,
 ) (*RootFS, error) {
 	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
@@ -69,10 +62,6 @@ func resolveNSpawnConfig(
 	}
 
 	nvidiaRequired := len(nvidia.GPUDevicePaths) > 0
-	if provisionedNVIDIARequired != nil {
-		nvidiaRequired = *provisionedNVIDIARequired
-	}
-
 	if nvidiaRequired && !NVIDIAStateAvailable(nvidia) {
 		return nil, fmt.Errorf("%w for machine %s: fresh host state is incomplete", ErrNVIDIAStateUnavailable, machineName)
 	}
@@ -94,16 +83,11 @@ func resolveNSpawnConfig(
 			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
 			"override.conf",
 		),
-		LifecycleStateFile:     NSpawnLifecycleStatePath(machineName),
 		ConfigRegenerationFile: filepath.Join(SystemdSystemDir, ConfigRegenerationUnit(machineName)),
-		NSpawnConfigInput: NSpawnConfigInput{
-			AdditionalHostDevices: slices.Clone(cfg.AdditionalHostDevices),
-			AdditionalHostMounts:  slices.Clone(cfg.AdditionalHostMounts),
-		},
-		Nvidia:               nvidia,
-		AMD:                  ResolveAMDHost(),
-		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
-		AdditionalHostMounts: additionalHostMounts,
+		Nvidia:                 nvidia,
+		AMD:                    ResolveAMDHost(),
+		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
+		AdditionalHostMounts:   additionalHostMounts,
 	}, nil
 }
 
@@ -111,47 +95,21 @@ func resolveNSpawnConfig(
 // resolves the complete goal state for the named nspawn machine from an agent
 // config and caller-provided download overrides.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
-	return resolveMachine(log, cfg, machineName, downloads, nil, ResolveNvidiaHost)
-}
-
-// ResolveExistingMachine resolves a managed restart using the validated
-// capability persisted when the machine was provisioned. Fresh host state is
-// still discovered, but it cannot change a GPU machine into a CPU machine or
-// enable NVIDIA on a CPU machine.
-func ResolveExistingMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
-	return resolveExistingMachine(
-		log,
-		cfg,
-		machineName,
-		downloads,
-		NSpawnLifecycleStatePath(machineName),
-		ResolveNvidiaHost,
-	)
+	return resolveMachine(log, cfg, machineName, downloads, ResolveNvidiaHost)
 }
 
 // ResolveExistingLifecycle resolves only the host and in-machine state needed
 // to migrate lifecycle hooks for an already provisioned machine.
 func ResolveExistingLifecycle(cfg *config.AgentConfig, machineName string) (*MachineGoalState, error) {
-	return resolveExistingLifecycle(
-		cfg,
-		machineName,
-		NSpawnLifecycleStatePath(machineName),
-		legacyNVIDIADropInPath(machineName),
-		ResolveNvidiaHost,
-	)
+	return resolveExistingLifecycle(cfg, machineName, ResolveNvidiaHost)
 }
 
 func resolveExistingLifecycle(
 	cfg *config.AgentConfig,
-	machineName, lifecycleStatePath, legacyDropInPath string,
+	machineName string,
 	resolveNVIDIA resolveNVIDIAHostFunc,
 ) (*MachineGoalState, error) {
-	nvidiaRequired, err := LoadOrInferNVIDIACapability(lifecycleStatePath, legacyDropInPath, machineName)
-	if err != nil {
-		return nil, err
-	}
-
-	rootFS, err := resolveNSpawnConfig(cfg, machineName, &nvidiaRequired, resolveNVIDIA)
+	rootFS, err := resolveNSpawnConfig(cfg, machineName, resolveNVIDIA)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +121,7 @@ func resolveExistingLifecycle(
 			MachineDir:  rootFS.MachineDir,
 			Containerd: ResolveContainerd(ContainerdOptions{
 				SandboxImage:   cfg.CRI.Containerd.SandboxImage,
-				NvidiaRequired: nvidiaRequired,
+				NvidiaRequired: rootFS.Nvidia.Required,
 			}),
 			Kubelet: Kubelet{KubeletBinPath: filepath.Join("/"+BinDir, "kubelet")},
 			Nvidia:  rootFS.Nvidia,
@@ -171,41 +129,16 @@ func resolveExistingLifecycle(
 	}, nil
 }
 
-func legacyNVIDIADropInPath(machineName string) string {
-	return filepath.Join("/var/lib/machines", machineName, strings.TrimPrefix(NvidiaRuntimeDropInPath, "/"))
-}
-
-func resolveExistingMachine(
-	log *slog.Logger,
-	cfg *config.AgentConfig,
-	machineName string,
-	downloads *DownloadOverrides,
-	lifecycleStatePath string,
-	resolveNVIDIA resolveNVIDIAHostFunc,
-) (*MachineGoalState, error) {
-	nvidiaRequired, err := LoadOrInferNVIDIACapability(
-		lifecycleStatePath,
-		legacyNVIDIADropInPath(machineName),
-		machineName,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return resolveMachine(log, cfg, machineName, downloads, &nvidiaRequired, resolveNVIDIA)
-}
-
 func resolveMachine(
 	log *slog.Logger,
 	cfg *config.AgentConfig,
 	machineName string,
 	downloads *DownloadOverrides,
-	provisionedNVIDIARequired *bool,
 	resolveNVIDIA resolveNVIDIAHostFunc,
 ) (*MachineGoalState, error) {
 	sandboxImage := cfg.CRI.Containerd.SandboxImage
 
-	nspawnConfig, err := resolveNSpawnConfig(cfg, machineName, provisionedNVIDIARequired, resolveNVIDIA)
+	nspawnConfig, err := resolveNSpawnConfig(cfg, machineName, resolveNVIDIA)
 	if err != nil {
 		return nil, err
 	}
@@ -259,9 +192,7 @@ func resolveMachine(
 		MachineDir:             nspawnConfig.MachineDir,
 		NSpawnConfigFile:       nspawnConfig.NSpawnConfigFile,
 		ServiceOverrideFile:    nspawnConfig.ServiceOverrideFile,
-		LifecycleStateFile:     nspawnConfig.LifecycleStateFile,
 		ConfigRegenerationFile: nspawnConfig.ConfigRegenerationFile,
-		NSpawnConfigInput:      nspawnConfig.NSpawnConfigInput,
 		HostArch:               runtime.GOARCH,
 		HostKernel:             kernel,
 		Hostname:               hostname,

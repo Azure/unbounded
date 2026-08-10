@@ -6,6 +6,7 @@ package goalstates
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,6 +35,10 @@ import (
 //  3. After the nspawn boots, create symlinks in the container's standard
 //     multiarch library path pointing into the bind mounts and run ldconfig
 //     to update the linker cache.
+
+// ErrNVIDIAStateUnavailable indicates that discovered NVIDIA devices do not
+// have the complete host state needed for safe startup.
+var ErrNVIDIAStateUnavailable = errors.New("required NVIDIA host state is unavailable")
 
 // NvidiaHost aggregates all NVIDIA-related host state discovered at agent
 // startup: GPU device paths, driver library mappings, and the derived
@@ -144,6 +149,12 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
 		DriverVersion:     libraries.driverVersion,
 	}, nil
+}
+
+// NVIDIAStateAvailable reports whether discovery produced all host state needed
+// to render mounts and perform in-machine setup.
+func NVIDIAStateAvailable(nvidia NvidiaHost) bool {
+	return len(nvidia.GPUDevicePaths) > 0 && len(nvidia.LibMappings) > 0 && nvidia.DriverVersion != ""
 }
 
 // resolveNvidiaRuntime returns the NVIDIA container runtime goal state using

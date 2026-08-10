@@ -10,16 +10,18 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
 type (
-	resolveNSpawnConfigFunc  func(*provision.AgentConfig, string, bool) (*goalstates.RootFS, error)
+	resolveNSpawnConfigFunc  func(*provision.AgentConfig, string) (*goalstates.RootFS, error)
 	executeLifecycleTaskFunc func(context.Context, *slog.Logger, phases.Task) error
 	reloadSystemdFunc        func(context.Context, *slog.Logger) error
 )
@@ -31,8 +33,7 @@ func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineNa
 		machineName,
 		goalstates.AppliedConfigPath(machineName),
 		goalstates.AppliedConfigChecksumPath(machineName),
-		goalstates.NSpawnLifecycleStatePath(machineName),
-		goalstates.ResolveNSpawnConfigForNVIDIACapability,
+		goalstates.ResolveNSpawnConfig,
 		phases.ExecuteTask,
 		func(ctx context.Context, log *slog.Logger) error {
 			return executil.RunCmd(ctx, log, executil.Systemctl(), "daemon-reload")
@@ -43,36 +44,46 @@ func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineNa
 func nspawnLifecyclePreStart(
 	ctx context.Context,
 	log *slog.Logger,
-	machineName, configPath, checksumPath, statePath string,
+	machineName, configPath, checksumPath string,
 	resolve resolveNSpawnConfigFunc,
 	executeTask executeLifecycleTaskFunc,
 	reloadSystemd reloadSystemdFunc,
 ) error {
-	state, err := goalstates.LoadNSpawnLifecycleState(statePath, machineName)
-	if err != nil {
-		return err
-	}
-
 	cfg, ok, err := loadAppliedConfig(log, configPath, checksumPath)
 	if err != nil {
 		return err
 	}
 
 	if !ok {
-		log.Info("applied config not available during initial bootstrap; using persisted nspawn lifecycle input", "machine", machineName)
+		log.Info("applied config not available during initial bootstrap; keeping freshly provisioned nspawn config", "machine", machineName)
 
-		cfg = state.NSpawnConfigInput.AgentConfig()
+		return nil
 	}
 
-	rootFS, err := resolve(cfg, machineName, state.NVIDIA.Required)
+	rootFS, err := resolve(cfg, machineName)
 	if err != nil {
 		return fmt.Errorf("resolve nspawn config goal state: %w", err)
 	}
 
-	rootFS.LifecycleStateFile = statePath
+	nodeStart := &goalstates.NodeStart{
+		MachineName: machineName,
+		MachineDir:  rootFS.MachineDir,
+		Containerd: goalstates.ResolveContainerd(goalstates.ContainerdOptions{
+			SandboxImage:   cfg.CRI.Containerd.SandboxImage,
+			NvidiaRequired: rootFS.Nvidia.Required,
+		}),
+		Kubelet: goalstates.Kubelet{KubeletBinPath: filepath.Join("/"+goalstates.BinDir, "kubelet")},
+		Nvidia:  rootFS.Nvidia,
+	}
 
-	if err := executeTask(ctx, log, rootfs.EnsureNSpawnConfig(log, rootFS)); err != nil {
-		return fmt.Errorf("regenerate nspawn config for %s: %w", machineName, err)
+	refresh := phases.Serial(
+		log,
+		rootfs.EnsureNSpawnConfig(log, rootFS),
+		nodestart.EnsureNSpawnLifecycleUnits(nodeStart),
+	)
+
+	if err := executeTask(ctx, log, refresh); err != nil {
+		return fmt.Errorf("regenerate nspawn lifecycle config for %s: %w", machineName, err)
 	}
 
 	// The nspawn start transaction loaded its drop-in before this dependency.

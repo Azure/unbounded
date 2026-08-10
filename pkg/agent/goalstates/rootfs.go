@@ -12,7 +12,6 @@ type RootFS struct {
 	MachineDir             string
 	NSpawnConfigFile       string // e.g. /etc/systemd/nspawn/node.nspawn
 	ServiceOverrideFile    string // e.g. /etc/systemd/system/systemd-nspawn@node.service.d/override.conf
-	LifecycleStateFile     string // durable pre-start to post-start resolved-state handoff
 	ConfigRegenerationFile string // host systemd pre-start unit
 	HostArch               string
 	HostKernel             string // running kernel version from uname -r, e.g. "6.8.0-45-generic"
@@ -34,9 +33,6 @@ type RootFS struct {
 	// The image must use OCI media types and include a platform manifest
 	// matching the host architecture.
 	OCIImage string
-
-	// NSpawnConfigInput persists the inputs required for pre-start rediscovery.
-	NSpawnConfigInput NSpawnConfigInput
 
 	// Nvidia holds NVIDIA GPU state discovered on the host: device paths,
 	// driver library mappings, and bind-mount specifications for the nspawn

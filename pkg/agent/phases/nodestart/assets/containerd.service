@@ -2,10 +2,8 @@
 Description=containerd container runtime
 Documentation=https://containerd.io
 After=network.target local-fs.target
-{{- if .NvidiaEnabled}}
 Requires=unbounded-nvidia-ready.service
 After=unbounded-nvidia-ready.service
-{{- end}}
 
 [Service]
 ExecStartPre=-/sbin/modprobe overlay

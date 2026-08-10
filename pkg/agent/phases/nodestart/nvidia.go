@@ -26,6 +26,11 @@ type setupNVIDIA struct {
 	goalState *goalstates.NodeStart
 }
 
+type markNVIDIAReady struct {
+	log         *slog.Logger
+	machineName string
+}
+
 // SetupNVIDIA returns a task that makes NVIDIA driver libraries from the host
 // accessible inside the running nspawn machine and generates a CDI specification
 // describing the available GPUs.
@@ -52,7 +57,18 @@ func SetupNVIDIA(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task 
 	return &setupNVIDIA{log: log, goalState: goalState}
 }
 
-func (s *setupNVIDIA) Name() string { return "setup-nvidia" }
+// MarkNVIDIAReady returns a task that releases the lifecycle readiness gate
+// when current host discovery does not require NVIDIA setup.
+func MarkNVIDIAReady(log *slog.Logger, machineName string) phases.Task {
+	return &markNVIDIAReady{log: log, machineName: machineName}
+}
+
+func (s *setupNVIDIA) Name() string     { return "setup-nvidia" }
+func (m *markNVIDIAReady) Name() string { return "mark-nvidia-ready" }
+
+func (m *markNVIDIAReady) Do(ctx context.Context) error {
+	return markNVIDIAReadyForMachine(ctx, m.log, m.machineName)
+}
 
 func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
 	if !s.goalState.Nvidia.Required {
@@ -102,7 +118,7 @@ func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	return s.markReady(ctx)
+	return markNVIDIAReadyForMachine(ctx, s.log, s.goalState.MachineName)
 }
 
 type machineRunFunc func(context.Context, *slog.Logger, string, ...string) (string, error)
@@ -236,14 +252,14 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	return nil
 }
 
-func (s *setupNVIDIA) markReady(ctx context.Context) error {
-	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
+func markNVIDIAReadyForMachine(ctx context.Context, log *slog.Logger, machineName string) error {
+	if _, err := executil.MachineRun(ctx, log, machineName,
 		"mkdir", "-p", filepath.Dir(goalstates.NVIDIAReadyPath),
 	); err != nil {
 		return fmt.Errorf("create NVIDIA ready directory: %w", err)
 	}
 
-	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
+	if _, err := executil.MachineRun(ctx, log, machineName,
 		"touch", goalstates.NVIDIAReadyPath,
 	); err != nil {
 		return fmt.Errorf("mark NVIDIA runtime ready: %w", err)

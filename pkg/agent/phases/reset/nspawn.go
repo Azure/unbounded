@@ -32,14 +32,11 @@ func (t *removeNSpawnConfig) Do(_ context.Context) error {
 	nspawnFile := fmt.Sprintf("%s/%s.nspawn", goalstates.SystemdNSpawnDir, t.machineName)
 	overrideDir := fmt.Sprintf("%s/systemd-nspawn@%s.service.d", goalstates.SystemdSystemDir, t.machineName)
 	configRegenerationUnit := fmt.Sprintf("%s/%s", goalstates.SystemdSystemDir, goalstates.ConfigRegenerationUnit(t.machineName))
-	lifecycleState := goalstates.NSpawnLifecycleStatePath(t.machineName)
-
-	t.log.Info("removing nspawn configuration", "nspawn_file", nspawnFile, "override_dir", overrideDir, "config_regeneration_unit", configRegenerationUnit, "lifecycle_state", lifecycleState)
+	t.log.Info("removing nspawn configuration", "nspawn_file", nspawnFile, "override_dir", overrideDir, "config_regeneration_unit", configRegenerationUnit)
 
 	removeFileIfExists(t.log, nspawnFile)
 	removeAllIfExists(t.log, overrideDir)
 	removeFileIfExists(t.log, configRegenerationUnit)
-	removeFileIfExists(t.log, lifecycleState)
 
 	return nil
 }
