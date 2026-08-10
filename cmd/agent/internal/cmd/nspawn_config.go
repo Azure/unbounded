@@ -10,9 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
-
-	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
@@ -21,86 +18,86 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
-func newCmdRegenerateConfig(cmdCtx *CommandContext) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:    "regenerate-config MACHINE_NAME",
-		Short:  "Regenerate host-side configuration for a machine",
-		Hidden: true,
-		Args:   cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
-			defer cancel()
+type (
+	resolveNSpawnConfigFunc  func(*provision.AgentConfig, string) (*goalstates.RootFS, error)
+	executeLifecycleTaskFunc func(context.Context, *slog.Logger, phases.Task) error
+	reloadSystemdFunc        func(context.Context, *slog.Logger) error
+)
 
-			cmdCtx.Setup()
-
-			return regenerateConfig(ctx, cmdCtx.Logger, args[0])
+func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineName string) error {
+	return nspawnLifecyclePreStart(
+		ctx,
+		log,
+		machineName,
+		goalstates.AppliedConfigPath(machineName),
+		goalstates.AppliedConfigChecksumPath(machineName),
+		goalstates.NSpawnLifecycleStatePath(machineName),
+		goalstates.ResolveNSpawnConfig,
+		phases.ExecuteTask,
+		func(ctx context.Context, log *slog.Logger) error {
+			return executil.RunCmd(ctx, log, executil.Systemctl(), "daemon-reload")
 		},
+	)
+}
+
+func nspawnLifecyclePreStart(
+	ctx context.Context,
+	log *slog.Logger,
+	machineName, configPath, checksumPath, statePath string,
+	resolve resolveNSpawnConfigFunc,
+	executeTask executeLifecycleTaskFunc,
+	reloadSystemd reloadSystemdFunc,
+) error {
+	state, err := loadNSpawnLifecycleState(statePath, machineName)
+	if err != nil {
+		return err
 	}
 
-	return cmd
-}
-
-func newCmdRegenerateNSpawnConfig(cmdCtx *CommandContext) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:    "regenerate-nspawn-config MACHINE_NAME",
-		Short:  "Regenerate host-side nspawn configuration for a machine",
-		Hidden: true,
-		Args:   cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
-			defer cancel()
-
-			cmdCtx.Setup()
-
-			return regenerateNSpawnConfig(ctx, cmdCtx.Logger, args[0])
-		},
-	}
-
-	return cmd
-}
-
-func regenerateConfig(ctx context.Context, log *slog.Logger, machineName string) error {
-	return regenerateNSpawnConfig(ctx, log, machineName)
-}
-
-func regenerateNSpawnConfig(ctx context.Context, log *slog.Logger, machineName string) error {
-	cfg, ok, err := loadAppliedConfigForMachine(log, machineName)
+	cfg, ok, err := loadAppliedConfig(log, configPath, checksumPath)
 	if err != nil {
 		return err
 	}
 
 	if !ok {
-		log.Info("applied config not found, skipping nspawn config regeneration", "machine", machineName)
+		log.Info("applied config not available during initial bootstrap; using provisioned nspawn lifecycle state", "machine", machineName)
+
 		return nil
 	}
 
-	rootFS, err := goalstates.ResolveNSpawnConfig(cfg, machineName)
+	rootFS, err := resolve(cfg, machineName)
 	if err != nil {
 		return fmt.Errorf("resolve nspawn config goal state: %w", err)
 	}
 
-	if err := phases.ExecuteTask(ctx, log, rootfs.EnsureNSpawnConfig(log, rootFS)); err != nil {
+	rootFS.NVIDIARequired = state.NVIDIARequired
+	rootFS.LifecycleStateFile = statePath
+
+	if state.NVIDIARequired {
+		if !goalstates.NVIDIAStateAvailable(rootFS.Nvidia) {
+			return fmt.Errorf("NVIDIA is required for machine %s but host discovery is incomplete", machineName)
+		}
+	} else {
+		// Capability is selected at provisioning time. Do not turn a CPU node
+		// into a GPU node merely because hardware appears later.
+		rootFS.Nvidia = goalstates.NvidiaHost{}
+	}
+
+	if err := executeTask(ctx, log, rootfs.EnsureNSpawnConfig(log, rootFS)); err != nil {
 		return fmt.Errorf("regenerate nspawn config for %s: %w", machineName, err)
 	}
 
-	// systemd loaded the nspawn service drop-in before starting this required
-	// oneshot unit. Reload the manager so the pending nspawn start observes the
-	// regenerated service properties, including path-specific DeviceAllow entries.
-	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "daemon-reload"); err != nil {
+	// The nspawn start transaction loaded its drop-in before this dependency.
+	// Reload so the pending start observes refreshed DeviceAllow properties.
+	if err := reloadSystemd(ctx, log); err != nil {
 		return fmt.Errorf("reload systemd after regenerating config for %s: %w", machineName, err)
 	}
 
 	return nil
 }
 
-func loadAppliedConfigForMachine(log *slog.Logger, machineName string) (*provision.AgentConfig, bool, error) {
-	if machineName != goalstates.NSpawnMachineKube1 && machineName != goalstates.NSpawnMachineKube2 {
-		return nil, false, fmt.Errorf("unsupported nspawn machine %q", machineName)
-	}
-
-	return loadAppliedConfig(log, goalstates.AppliedConfigPath(machineName), goalstates.AppliedConfigChecksumPath(machineName))
-}
-
+// loadAppliedConfig is the single persisted applied-config loader used by the
+// lifecycle path. A missing checksum remains backward compatible, while a
+// present checksum must verify.
 func loadAppliedConfig(log *slog.Logger, path, checksumPath string) (*provision.AgentConfig, bool, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -116,11 +113,7 @@ func loadAppliedConfig(log *slog.Logger, path, checksumPath string) (*provision.
 	}
 
 	if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
-		log.Warn(
-			"no checksum sidecar found, skipping integrity check",
-			"config_path", path,
-			"checksum_path", checksumPath,
-		)
+		log.Warn("no checksum sidecar found, skipping integrity check", "config_path", path, "checksum_path", checksumPath)
 	}
 
 	var cfg provision.AgentConfig
@@ -142,4 +135,30 @@ func loadAppliedConfig(log *slog.Logger, path, checksumPath string) (*provision.
 	}
 
 	return &cfg, true, nil
+}
+
+func loadNSpawnLifecycleState(path, machineName string) (*goalstates.NSpawnLifecycleState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read nspawn lifecycle state %s: %w", path, err)
+	}
+
+	var state goalstates.NSpawnLifecycleState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("decode nspawn lifecycle state %s: %w", path, err)
+	}
+
+	if err := state.Validate(machineName); err != nil {
+		return nil, fmt.Errorf("validate nspawn lifecycle state %s: %w", path, err)
+	}
+
+	return &state, nil
+}
+
+func validateNSpawnMachine(machineName string) error {
+	if machineName != goalstates.NSpawnMachineKube1 && machineName != goalstates.NSpawnMachineKube2 {
+		return fmt.Errorf("unknown nspawn machine %q", machineName)
+	}
+
+	return nil
 }

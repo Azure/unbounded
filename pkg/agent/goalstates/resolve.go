@@ -51,6 +51,14 @@ func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, 
 		return nil, fmt.Errorf("resolve nvidia host: %w", err)
 	}
 
+	// This is the single capability-selection point. A config-level NVIDIA
+	// disable switch (PR #309) must be applied here before persisting the
+	// lifecycle state, rather than in either lifecycle phase.
+	nvidiaRequired := len(nvidia.GPUDevicePaths) > 0
+	if !nvidiaRequired {
+		nvidia = NvidiaHost{}
+	}
+
 	return &RootFS{
 		MachineDir: filepath.Join("/var/lib/machines", machineName),
 		NSpawnConfigFile: filepath.Join(
@@ -62,10 +70,13 @@ func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, 
 			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
 			"override.conf",
 		),
-		Nvidia:               nvidia,
-		AMD:                  ResolveAMDHost(),
-		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
-		AdditionalHostMounts: additionalHostMounts,
+		LifecycleStateFile:     NSpawnLifecycleStatePath(machineName),
+		ConfigRegenerationFile: filepath.Join(SystemdSystemDir, ConfigRegenerationUnit(machineName)),
+		NVIDIARequired:         nvidiaRequired,
+		Nvidia:                 nvidia,
+		AMD:                    ResolveAMDHost(),
+		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
+		AdditionalHostMounts:   additionalHostMounts,
 	}, nil
 }
 
@@ -126,34 +137,40 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	rootFS := &RootFS{
-		MachineDir:           nspawnConfig.MachineDir,
-		NSpawnConfigFile:     nspawnConfig.NSpawnConfigFile,
-		ServiceOverrideFile:  nspawnConfig.ServiceOverrideFile,
-		HostArch:             runtime.GOARCH,
-		HostKernel:           kernel,
-		Hostname:             hostname,
-		ContainerdVersion:    containerdVersion,
-		RunCVersion:          runcVersion,
-		CNIPluginVersion:     cniVersion,
-		KubernetesVersion:    cfg.Cluster.Version,
-		LocalDNS:             localDNS,
-		Downloads:            downloads,
-		OCIImage:             ociImage,
-		Nvidia:               nvidia,
-		AMD:                  amd,
-		HostDevices:          nspawnConfig.HostDevices,
-		AdditionalHostMounts: nspawnConfig.AdditionalHostMounts,
+		MachineDir:             nspawnConfig.MachineDir,
+		NSpawnConfigFile:       nspawnConfig.NSpawnConfigFile,
+		ServiceOverrideFile:    nspawnConfig.ServiceOverrideFile,
+		LifecycleStateFile:     nspawnConfig.LifecycleStateFile,
+		ConfigRegenerationFile: nspawnConfig.ConfigRegenerationFile,
+		HostArch:               runtime.GOARCH,
+		HostKernel:             kernel,
+		Hostname:               hostname,
+		ContainerdVersion:      containerdVersion,
+		RunCVersion:            runcVersion,
+		CNIPluginVersion:       cniVersion,
+		KubernetesVersion:      cfg.Cluster.Version,
+		LocalDNS:               localDNS,
+		Downloads:              downloads,
+		OCIImage:               ociImage,
+		NVIDIARequired:         nspawnConfig.NVIDIARequired,
+		Nvidia:                 nvidia,
+		AMD:                    amd,
+		HostDevices:            nspawnConfig.HostDevices,
+		AdditionalHostMounts:   nspawnConfig.AdditionalHostMounts,
 	}
+
+	containerd := ResolveContainerdForNVIDIACapability(sandboxImage, nspawnConfig.NVIDIARequired)
 
 	nodeStart := &NodeStart{
 		MachineName:     machineName,
 		KubeMachineName: cfg.MachineName,
 		NodeName:        cfg.NodeName,
 		MachineDir:      filepath.Join("/var/lib/machines", machineName),
-		Containerd:      ResolveContainerd(sandboxImage),
+		Containerd:      containerd,
 		Gantry:          ResolveGantry(cfg.Gantry),
 		Kubelet:         kubelet,
 		LocalDNS:        localDNS,
+		NVIDIARequired:  nspawnConfig.NVIDIARequired,
 		Nvidia:          nvidia,
 	}
 

@@ -153,11 +153,20 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   validation.
 
 Device discovery runs when the machine is provisioned and is refreshed by a
-host-side systemd hook before systemd starts the nspawn machine. Device mapping
-changes that occur while the host is offline are picked up on the next host
-boot before the machine starts. Disks or HCAs hot-plugged after the machine has
-started are not picked up until the machine is restarted, re-provisioned, or
-soft-rebooted.
+host-side systemd hook before systemd starts the nspawn machine. The hook runs
+`unbounded-agent nspawn-lifecycle pre-start`, waits for udev to settle, and
+retries failures through systemd without allowing the machine to start. Device
+mapping changes that occur while the host is offline are picked up on the next
+host boot before the machine starts. Disks or HCAs hot-plugged after the machine
+has started are not picked up until the machine is restarted, re-provisioned,
+or soft-rebooted.
+
+The provisioned NVIDIA capability is durable. A GPU-provisioned machine fails
+and retries pre-start discovery if its devices or driver libraries are
+temporarily unavailable. A CPU-provisioned machine remains CPU-only even if
+NVIDIA hardware later appears. The exact NVIDIA state used to render nspawn
+mounts is persisted for the post-start setup hook, preventing the two phases
+from discovering different paths.
 
 The configuration is written to these files on the host before the machine boots:
 
@@ -166,6 +175,7 @@ The configuration is written to these files on the host before the machine boots
 | nspawn config | `/etc/systemd/nspawn/<MachineName>.nspawn` |
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
 | Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
+| Lifecycle state handoff | `/etc/unbounded/agent/<MachineName>-nspawn-lifecycle.json` |
 
 ### Customization points
 
@@ -239,8 +249,11 @@ The agent's three-phase bootstrap drives the nspawn lifecycle:
    service override, downloads Kubernetes and container runtime binaries, and
    configures the OS inside the rootfs (hostname, DNS, kernel modules).
 
-3. **Node start.** Starts the nspawn machine, polls until it is responsive,
-   then enables containerd and kubelet inside it.
+3. **Node start.** Starts the nspawn machine, runs the hidden
+   `nspawn-lifecycle post-start` hook for GPU-provisioned machines, and only
+   releases containerd and kubelet after NVIDIA driver-root and CDI setup is
+   complete. A post-start failure fails the nspawn unit so its existing
+   `Restart=on-failure` policy retries the complete lifecycle.
 
 ### Removal
 
@@ -288,7 +301,9 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/var/lib/machines/<MachineName>` | Container rootfs directory. |
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
-| `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side oneshot unit that regenerates host-side configuration before machine start. |
+| `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
+| `/etc/unbounded/agent/<MachineName>-nspawn-lifecycle.json` | Durable provisioned capability and exact pre-start NVIDIA resolved-state handoff. |
+| `/run/unbounded/nvidia-ready` | (Inside GPU container) Lifecycle-scoped marker that releases containerd and kubelet after NVIDIA setup. |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also

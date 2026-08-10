@@ -142,12 +142,11 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	}, nil
 }
 
-// resolveNvidiaRuntime returns the NVIDIA container runtime goal state.
-// When GPU devices are present the runtime is enabled with default paths;
-// otherwise it is disabled.
-func resolveNvidiaRuntime() NvidiaRuntime {
+// resolveNvidiaRuntime returns the NVIDIA container runtime goal state using
+// the caller-selected provisioned capability.
+func resolveNvidiaRuntime(enabled bool) NvidiaRuntime {
 	return NvidiaRuntime{
-		Enabled:                    len(discoverNVIDIADevices()) > 0,
+		Enabled:                    enabled,
 		RuntimeClassName:           NvidiaRuntimeClassName,
 		RuntimePath:                NvidiaContainerRuntimePath,
 		DisableSetAsDefaultRuntime: false,

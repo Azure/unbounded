@@ -18,6 +18,13 @@ type Containerd struct {
 
 // ResolveContainerd returns the containerd configuration goal state.
 func ResolveContainerd(sandboxImage string) Containerd {
+	return ResolveContainerdForNVIDIACapability(sandboxImage, len(discoverNVIDIADevices()) > 0)
+}
+
+// ResolveContainerdForNVIDIACapability resolves containerd without probing GPU
+// hardware again. Lifecycle callers use this to preserve the capability chosen
+// when the machine was provisioned.
+func ResolveContainerdForNVIDIACapability(sandboxImage string, nvidiaRequired bool) Containerd {
 	if sandboxImage == "" {
 		sandboxImage = SandboxImage
 	}
@@ -29,6 +36,6 @@ func ResolveContainerd(sandboxImage string) Containerd {
 		CNIBinDir:         CNIBinDir,
 		CNIConfDir:        CNIConfigDir,
 		MetricsAddress:    ContainerdMetricsAddress,
-		NvidiaRuntime:     resolveNvidiaRuntime(),
+		NvidiaRuntime:     resolveNvidiaRuntime(nvidiaRequired),
 	}
 }

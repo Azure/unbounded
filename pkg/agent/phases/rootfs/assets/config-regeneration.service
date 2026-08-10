@@ -8,4 +8,7 @@ After=systemd-udev-settle.service
 
 [Service]
 Type=oneshot
-ExecStart={{.AgentBinaryPath}} regenerate-config {{.MachineName}}
+ExecStart={{.AgentBinaryPath}} nspawn-lifecycle pre-start {{.MachineName}}
+Restart=on-failure
+RestartMode=direct
+RestartSec=10s

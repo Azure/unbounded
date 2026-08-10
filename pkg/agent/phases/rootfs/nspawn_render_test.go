@@ -75,6 +75,7 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 				},
 			}
 			data.NvidiaBinDir = "/usr/bin"
+			data.NvidiaEnabled = true
 
 			return data
 		}(),
@@ -86,6 +87,7 @@ func TestNSpawnRenderedScenarios(t *testing.T) {
 				"/dev/nvidia-uvm",
 				"/dev/dri/renderD128",
 			})
+			data.NvidiaEnabled = true
 			data.NvidiaBinDir = nvidiaHostBinDir(goalstates.NvidiaHost{
 				NvidiaSMIPath:     "/usr/bin/nvidia-smi",
 				NvidiaIMEXPath:    "/usr/bin/nvidia-imex",
@@ -320,7 +322,32 @@ func TestConfigRegenerationUnit(t *testing.T) {
 	require.Contains(t, out, "Wants=systemd-udev-settle.service")
 	require.Contains(t, out, "After=systemd-udev-settle.service")
 	require.Contains(t, out, "Type=oneshot")
-	require.Contains(t, out, "ExecStart=/usr/local/bin/unbounded-agent regenerate-config kube1")
+	require.Contains(t, out, "ExecStart=/usr/local/bin/unbounded-agent nspawn-lifecycle pre-start kube1")
+	require.NotContains(t, out, "ExecStart=-")
+	require.NotContains(t, out, "if [ ! -x")
+	require.Contains(t, out, "Restart=on-failure")
+	require.Contains(t, out, "RestartMode=direct")
+}
+
+func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
+	t.Parallel()
+
+	data := defaultNSpawnTemplateData("kube1")
+	data.NvidiaEnabled = true
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
+	require.Contains(t, buf.String(), "ExecStartPost=/usr/local/bin/unbounded-agent-current nspawn-lifecycle post-start kube1")
+	require.NotContains(t, buf.String(), "ExecStartPost=-")
+	require.NotContains(t, buf.String(), "if [ ! -x")
+}
+
+func TestServiceOverride_CPUNodesDoNotReconcileNVIDIA(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
+	require.NotContains(t, buf.String(), "nspawn-lifecycle post-start")
 }
 
 func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
@@ -331,6 +358,7 @@ func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
 		AgentBinaryPath:              goalstates.DaemonBinaryPath,
+		AgentCurrentBinaryPath:       goalstates.DaemonBinaryCurrentPath,
 	}
 }
 

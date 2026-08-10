@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -118,10 +119,12 @@ type nspawnTemplateData struct {
 	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount
 	NvidiaI386LibDirMounts []goalstates.NvidiaLibDirMount
 	NvidiaBinDir           string
+	NvidiaEnabled          bool
 	AMDGPUDevicePaths      []string
 	AMDSysFSPaths          []string
 	ConfigRegenerationUnit string
 	AgentBinaryPath        string
+	AgentCurrentBinaryPath string
 }
 
 // TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
@@ -155,10 +158,12 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		NvidiaLibDirMounts:           goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       goalState.Nvidia.I386LibDirMounts,
 		NvidiaBinDir:                 nvidiaHostBinDir(goalState.Nvidia),
+		NvidiaEnabled:                goalState.NVIDIARequired,
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
 		AgentBinaryPath:              goalstates.DaemonBinaryPath,
+		AgentCurrentBinaryPath:       goalstates.DaemonBinaryCurrentPath,
 	}
 
 	if len(hostDevicePaths) > 0 {
@@ -206,7 +211,10 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		return fmt.Errorf("write service override %s: %w", goalState.ServiceOverrideFile, err)
 	}
 
-	unitFile := filepath.Join(goalstates.SystemdSystemDir, templateData.ConfigRegenerationUnit)
+	unitFile := goalState.ConfigRegenerationFile
+	if unitFile == "" {
+		unitFile = filepath.Join(goalstates.SystemdSystemDir, templateData.ConfigRegenerationUnit)
+	}
 
 	unitBuf := &bytes.Buffer{}
 	if err := nspawnTemplates.ExecuteTemplate(unitBuf, "config-regeneration.service", templateData); err != nil {
@@ -215,6 +223,30 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 
 	if err := utilio.WriteFile(unitFile, unitBuf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write config regeneration unit %s: %w", unitFile, err)
+	}
+
+	state := goalstates.NSpawnLifecycleState{
+		Version:        goalstates.NSpawnLifecycleStateVersion,
+		MachineName:    machineName,
+		NVIDIARequired: goalState.NVIDIARequired,
+		NVIDIA:         goalState.Nvidia,
+	}
+	if err := state.Validate(machineName); err != nil {
+		return fmt.Errorf("validate nspawn lifecycle state: %w", err)
+	}
+
+	stateData, err := json.MarshalIndent(&state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal nspawn lifecycle state: %w", err)
+	}
+
+	stateFile := goalState.LifecycleStateFile
+	if stateFile == "" {
+		stateFile = goalstates.NSpawnLifecycleStatePath(machineName)
+	}
+
+	if err := utilio.WriteFile(stateFile, stateData, 0o600); err != nil {
+		return fmt.Errorf("write nspawn lifecycle state %s: %w", stateFile, err)
 	}
 
 	return nil
