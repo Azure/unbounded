@@ -11,18 +11,19 @@ unbounded-operator generates and reconciles.
 1. [Problem statement](#1-problem-statement)
 2. [Goals and non-goals](#2-goals-and-non-goals)
 3. [Constraints from the current design](#3-constraints-from-the-current-design)
-4. [Alternatives considered](#4-alternatives-considered)
-5. [Format](#5-format)
-6. [Merge semantics](#6-merge-semantics)
-7. [Ordering and invariants](#7-ordering-and-invariants)
-8. [Wiring](#8-wiring)
-9. [Drift visibility](#9-drift-visibility)
-10. [CLI](#10-cli)
-11. [Operational notes](#11-operational-notes)
-12. [Implementation plan](#12-implementation-plan)
-13. [Testing](#13-testing)
-14. [Prior art](#14-prior-art)
-15. [Open questions](#15-open-questions)
+4. [Security model](#4-security-model)
+5. [Alternatives considered](#5-alternatives-considered)
+6. [Format](#6-format)
+7. [Merge semantics](#7-merge-semantics)
+8. [Permitted and protected fields](#8-permitted-and-protected-fields)
+9. [Wiring](#9-wiring)
+10. [Drift visibility](#10-drift-visibility)
+11. [CLI](#11-cli)
+12. [Operational notes](#12-operational-notes)
+13. [Implementation plan](#13-implementation-plan)
+14. [Testing](#14-testing)
+15. [Prior art](#15-prior-art)
+16. [Open questions](#16-open-questions)
 
 ---
 
@@ -111,7 +112,7 @@ The **content of any individual user's patch** is not supported:
 - That a component with an override applied functions correctly, meets its
   health checks, or upgrades cleanly.
 - Any behavior of a component running an image other than the operator's own
-  version (see [§9](#9-drift-visibility)).
+  version (see [§10](#10-drift-visibility)).
 
 ### Non-goals
 
@@ -167,7 +168,126 @@ singletons.
 `appsv1.Deployment` in Go (`metalman.go:98-196`). A mechanism implemented at the
 YAML layer would not apply to `metalman`.
 
-## 4. Alternatives considered
+**3.7 Apply is GVK-directed and the operator holds `escalate` and `bind`.**
+`ApplyObject` derives the target resource from the object's own
+`apiVersion` and `kind` (`env.go:241`) and performs no kind assertion. The
+operator's ClusterRole grants `escalate` and `bind` on `roles`, `rolebindings`,
+`clusterroles`, and `clusterrolebindings`
+(`deploy/unbounded-operator/02-rbac.yaml.tmpl:60-66`), deliberately, so it can
+install component RBAC granting permissions it does not itself hold. Any
+mechanism that can influence the GVK of an applied object can therefore mint a
+cluster-admin binding. GVK containment is not optional.
+
+**3.8 The workloads are already maximally privileged.** This bounds what any
+field restriction can achieve.
+
+| Workload | Privilege |
+|---|---|
+| `unbounded-net-node` | `hostNetwork: true`, `hostPID: true` (`deploy/net/node/03-daemonset.yaml.tmpl:32-33`), `privileged: true` on two containers (`:53`, `:108`), four hostPath mounts (`:125-137`) |
+| `unbounded-storage-supervisor` | `privileged: true` (`04-daemonset.yaml.tmpl:64`, `:100`), three hostPath mounts (`:103-111`) |
+| `metalman` | `HostNetwork: true` (`metalman.go:165`) |
+| `gantry` | `hostNetwork: false` by deliberate design decision, one hostPath cache mount (`daemonset.yaml.tmpl:99`, `:284`) |
+
+## 4. Security model
+
+### 4.1 Threat model
+
+**Write access to the overrides ConfigMap is equivalent to root on every node in
+every affected Site, and therefore to cluster-admin.** This is a property of the
+mechanism, not a defect in it, and it must be stated plainly in user-facing
+documentation.
+
+The reasoning follows from [§3.8](#3-constraints-from-the-current-design). The
+workloads being patched already run with `hostNetwork`, `hostPID`,
+`privileged: true`, and hostPath mounts of the host root filesystem. Against
+pods in that state:
+
+- Rejecting `securityContext.privileged: true` achieves nothing. The containers
+  are already privileged.
+- Rejecting new `hostPath` volumes achieves nothing. The host filesystem is
+  already mounted.
+- Changing a container **image** substitutes arbitrary code into a privileged,
+  host-namespaced process on every node in the Site.
+- Changing **args** or **command** does the same.
+- Injecting an **environment variable** into an existing privileged container
+  does the same, for example through `LD_PRELOAD`.
+- Adding a **sidecar** does the same. `hostNetwork` and `hostPID` are pod-level
+  and inherited by every container, and the existing hostPath volumes are
+  mountable by any container in the pod.
+
+A field allowlist bounds this only if image, args, command, env, sidecars, and
+volumes are all excluded. That is precisely the closed typed set rejected in
+[§5.2](#52-why-not-a-typed-override-struct), and it removes five of the eight
+requirements in [§1](#1-problem-statement).
+
+The requirement set and containment are therefore in direct conflict. This
+design resolves that conflict by **accepting the privilege level and being
+explicit about it** rather than by implying a boundary that does not exist.
+
+### 4.2 The allowlist is an integrity control, not a security control
+
+Given [§4.1](#41-threat-model), the restrictions in
+[§8](#8-permitted-and-protected-fields) are not containing an adversary. Their
+purpose is to stop a legitimate, authorized operator from accidentally breaking
+the operator's ability to reconcile what it manages: severing a workload from
+its selector, detaching it from its ServiceAccount and therefore its RBAC,
+collapsing per-Site node isolation, or clobbering the annotations the operator
+uses to detect drift.
+
+Two exceptions in [§8](#8-permitted-and-protected-fields) are genuine security
+controls rather than integrity controls, because they escape the workload
+boundary entirely rather than merely damaging a workload:
+
+- **GVK** ([§3.7](#3-constraints-from-the-current-design)). Without containment,
+  an override applies as any resource the operator's ClusterRole permits,
+  including `ClusterRoleBinding` with `escalate` and `bind`. This converts
+  node-root into cluster-admin without touching a node.
+- **`serviceAccountName`.** Retargeting a workload at a different ServiceAccount
+  borrows that identity's API permissions rather than the host's.
+
+### 4.3 Required posture for cluster operators
+
+Documentation must instruct operators to treat write access to
+`unbounded-component-overrides` with the same care as write access to
+`clusterrolebindings`:
+
+- Grant it to cluster administrators only. Do not include it in namespace-wide
+  ConfigMap grants for platform or application teams.
+- Audit changes to it. The override hash annotations in
+  [§10](#10-drift-visibility) make cluster-side changes detectable, and the
+  object itself should be under change control.
+- Prefer managing it through the same review path as RBAC changes.
+
+### 4.4 Residual risk
+
+Several component ServiceAccounts currently hold namespace-wide ConfigMap write
+in the operator namespace with no `resourceNames` restriction:
+
+| Role | Location |
+|---|---|
+| `machina-controller` | `deploy/machina/02-rbac.yaml.tmpl:15-17` |
+| `metalman-controller` | `deploy/machina/06-metalman-rbac.yaml.tmpl:59`, `:132` |
+| `unbounded-net-controller` | `deploy/net/controller/02-rbac.yaml.tmpl:170`, `:173`, `:216` |
+
+A compromised component holding one of these can write the overrides ConfigMap
+and cause the operator to deploy arbitrary code on every node. This is a
+pre-existing over-grant that this design makes materially more dangerous.
+
+A parallel hardening change narrows these Roles to `resourceNames` for `get`,
+`update`, `patch`, and `delete`. It is worth doing on its own merits and is
+sequenced independently in [§13](#13-implementation-plan).
+
+**It does not fully close the gap.** RBAC cannot scope `create` by
+`resourceNames`, because the object name is not available to the authorizer for
+create requests. A component retaining namespace-wide ConfigMap `create` can
+therefore still seed the overrides ConfigMap when it does not already exist.
+
+The only complete fix is a dedicated resource type, where `create` is scopable
+by resource rather than by name. That was consciously not taken here in favour
+of keeping the API surface small, and is recorded as an open question in
+[§16](#16-open-questions) so it can be re-argued.
+
+## 5. Alternatives considered
 
 | | Mechanism | Expressiveness | Blast radius | Validation | Cost |
 |---|---|---|---|---|---|
@@ -179,7 +299,7 @@ YAML layer would not apply to `metalman`.
 
 **C is the proposal.** The reasoning for rejecting the others follows.
 
-### 4.1 Why not kustomize as a library
+### 5.1 Why not kustomize as a library
 
 Kustomize was the team's initial suggestion. It is rejected here not because it
 is a poor tool but because its contract mismatches this operator on five axes.
@@ -221,7 +341,7 @@ Adopting it would also promote `sigs.k8s.io/kustomize/api` from a transitive
 dependency of `k8s.io/cli-runtime` (`go.mod:336-337`) to a direct one, pulling
 kyaml's YAML stack into the operator alongside the existing one.
 
-### 4.2 Why not a typed override struct
+### 5.2 Why not a typed override struct
 
 A closed set of fields (`resources`, `tolerations`, `nodeSelector`, `affinity`,
 `priorityClassName`) is safe, fully validated by the API server, and
@@ -232,16 +352,16 @@ them is not meaningfully closed. The well-trodden path is that projects starting
 here add a free-form pod template later and then carry two overlapping surfaces
 with an awkward precedence rule. Starting at C avoids that.
 
-### 4.3 Why not SSA field disownership
+### 5.3 Why not SSA field disownership
 
 Having the operator stop declaring selected paths so another field manager can
 own them is elegant, requires no new API, and is the correct answer to "let VPA
 manage resources". It is not a general mechanism: it cannot add a sidecar or a
 volume, it requires users to understand field managers, and it makes the
 operator's declared field set the configuration surface. It remains a good
-complement and is listed in [§15](#15-open-questions).
+complement and is listed in [§16](#16-open-questions).
 
-### 4.4 Why not user-supplied mutating admission
+### 5.4 Why not user-supplied mutating admission
 
 `MutatingAdmissionPolicy` genuinely works with this operator: admission mutates
 the operator's own apply request, so the result is attributed to the operator's
@@ -252,7 +372,7 @@ and requires users to write CEL against object shapes the project does not
 document. It remains a legitimate path for users who want it and will be
 mentioned in the reference documentation.
 
-## 5. Format
+## 6. Format
 
 Overrides live in a ConfigMap named `unbounded-component-overrides` in the
 operator's namespace. The operator **only reads it**: it is never created, never
@@ -268,7 +388,7 @@ A ConfigMap rather than a field on `Site` because:
 - It matches the existing component-configuration pattern, where user-owned
   ConfigMaps in the same namespace carry component configuration.
 
-### 5.1 Document schema
+### 6.1 Document schema
 
 Every key in `.data` is parsed as an independent overrides document. This lets
 users split by concern or ownership (`kubectl create configmap --from-file`)
@@ -302,8 +422,8 @@ overrides:
 | `component` | yes | One of `net`, `machina`, `gantry`, `metalman`, `storage`. Matched against `ClusterComponent.Name()` / `SiteComponent.Name()`. |
 | `kind` | yes | `Deployment` or `DaemonSet`. |
 | `sites` | no | Per-Site components only. Absent matches every Site. An explicitly empty list is a validation error. Rejected on `net`, `machina`, and `gantry`. |
-| `extraArgs` | no | Map of container name to arguments appended after the patch merges. See [§6.2](#62-extraargs). |
-| `patch` | no | Strategic merge patch applied to the whole workload object. See [§6](#6-merge-semantics). |
+| `extraArgs` | no | Map of container name to arguments appended after the patch merges. See [§7.2](#72-extraargs). |
+| `patch` | no | Strategic merge patch applied to the whole workload object. See [§7](#7-merge-semantics). |
 
 `component` plus `kind` uniquely identifies every workload the operator emits
 today: only `net` emits two workloads and they differ by kind. Users never have
@@ -311,7 +431,7 @@ to reconstruct derived names such as `unbounded-storage-<site>`.
 
 At least one of `patch` and `extraArgs` must be present.
 
-### 5.2 Resolution
+### 6.2 Resolution
 
 An entry resolves to zero or more concrete objects:
 
@@ -325,7 +445,7 @@ Site must not retroactively invalidate an unrelated override. Unmatched names
 appear in the component's Site condition message and in
 `kubectl unbounded overrides list`.
 
-### 5.3 Multiple entries and conflicts
+### 6.3 Multiple entries and conflicts
 
 The normal model is **one entry per workload carrying all of its changes**.
 Strategic merge patch is structural, not sequential: a single patch document can
@@ -351,9 +471,9 @@ team owning another). When they do:
 5. Every contributor is recorded on the workload and in the condition message,
    so overlap is visible even when it composes cleanly.
 
-## 6. Merge semantics
+## 7. Merge semantics
 
-### 6.1 Strategic merge patch
+### 7.1 Strategic merge patch
 
 Merging uses `k8s.io/apimachinery/pkg/util/strategicpatch` with patch metadata
 from `strategicpatch.NewPatchMetaFromStruct(&appsv1.DaemonSet{})` or the
@@ -371,7 +491,7 @@ struct tags on the core types, which gives the behavior users expect:
 | `volumeMounts` | Merge by `mountPath`. |
 | `imagePullSecrets` | Merge by `name`. |
 | `tolerations` | Replace the whole list. |
-| `args`, `command` | Replace the whole list. See [§6.2](#62-extraargs). |
+| `args`, `command` | Replace the whole list. See [§7.2](#72-extraargs). |
 | `nodeSelector`, `labels`, `annotations` | Map merge. |
 
 The patch targets the **whole workload object**, not just the pod template, so
@@ -384,7 +504,7 @@ A useful consequence: the value of `patch` is exactly a
 live object before committing it, which is what makes this mechanism
 debuggable in the field.
 
-### 6.2 extraArgs
+### 7.2 extraArgs
 
 `args` and `command` carry no `patchMergeKey`, so strategic merge replaces them
 wholesale. A user who patches `args` to add one flag silently drops every
@@ -414,51 +534,127 @@ followed by the appended arguments. Naming a container that does not exist is a
 validation error, since unlike an unknown Site name it cannot become valid
 later.
 
-## 7. Ordering and invariants
+## 8. Permitted and protected fields
 
 Each object passes through a fixed pipeline:
 
 ```
 component mutator            (image resolution, config hash, Site scoping)
   -> Env.RetargetNamespace   (env.go:229)
-  -> user patch              (this proposal)
-  -> re-stamp identity       (this proposal)
+  -> validate against allowlist
+  -> user patch
+  -> re-stamp protected paths
+  -> assert apps/v1 Deployment|DaemonSet
   -> Env.ApplyObject         (env.go:240, SSA with ForceOwnership)
 ```
 
-Placing the patch after the mutators means users can override anything the
-operator computes, including images. Re-stamping afterwards means the fields
-that make the object findable and reconcilable are restored unconditionally.
+The surface is an **allowlist**: paths not enumerated below are rejected.
+An earlier revision of this design used a denylist, which fails open. Fields
+added by future Kubernetes versions, and fields nobody thought to enumerate,
+would have been silently patchable. Rejecting by default inverts that.
 
-**Re-stamped after the merge**, and therefore unbreakable by construction:
+Per [§4.2](#42-the-allowlist-is-an-integrity-control-not-a-security-control),
+these restrictions are integrity controls. They prevent an authorized operator
+from accidentally severing the operator's ability to reconcile a workload. They
+do not contain an adversary, with the two exceptions noted below.
 
-- `metadata.name`
-- `metadata.namespace`
-- `metadata.ownerReferences`
-- `spec.selector`
-- Any key in `spec.template.metadata.labels` referenced by `spec.selector`
+### 8.1 Permitted
 
-The last one matters: a `Deployment` or `DaemonSet` whose template labels no
-longer satisfy its selector is rejected by the API server, so a careless label
-patch would otherwise break the component with an opaque error.
+Within `spec.template.spec`:
 
-**Rejected at validation**, so users get a clear message rather than a silently
-discarded patch:
+| Path | Notes |
+|---|---|
+| `containers[*].image` | Breaks version lockstep, reported per [§10](#10-drift-visibility) |
+| `containers[*].args`, `.command` | Replace semantics, see [§7.2](#72-extraargs) |
+| `containers[*].env`, `.envFrom` | Merged by name |
+| `containers[*].resources` | |
+| `containers[*].volumeMounts` | Except mounts the operator declares, see [§8.2](#82-protected) |
+| `containers[*].securityContext` | Except changes that would reduce an operator-set value |
+| `containers[*].livenessProbe`, `.readinessProbe`, `.startupProbe` | |
+| Added `containers`, `initContainers` | Names not present in the generated workload |
+| `volumes` | Except volumes the operator declares |
+| `imagePullSecrets` | |
+| `nodeSelector`, `tolerations`, `affinity` | Additive only, see [§8.3](#83-additive-only-scheduling) |
+| `topologySpreadConstraints` | |
+| `priorityClassName` | |
+| `dnsPolicy`, `dnsConfig` | |
+| `terminationGracePeriodSeconds` | |
 
-- Any of the re-stamped paths above.
-- The `$patch` and `$setElementOrder` directives, which would otherwise allow
-  deleting operator-managed containers, volumes, and mounts.
-- `extraArgs` naming a container that does not exist in the generated workload.
+At the workload level:
 
-Behavioral fields are deliberately **not** protected: images, args, environment,
-resources, sidecars, volumes, scheduling. Those are the requirement table in
-[§1](#1-problem-statement).
+| Path | Notes |
+|---|---|
+| `spec.replicas` | Deployments only |
+| `spec.strategy`, `spec.updateStrategy` | |
+| `metadata.labels`, `metadata.annotations` | Excluding the reserved prefix |
+| `spec.template.metadata.labels`, `.annotations` | Excluding the reserved prefix and selector keys |
 
-**Reverting is free.** The operator declares the full object on every apply and
-owns those fields under SSA. Deleting an override, or the whole ConfigMap,
-restores the default on the next reconcile with no special-casing.
+### 8.2 Protected
 
-## 8. Wiring
+Rejected at validation **and** re-stamped after the merge. Validation gives a
+clear error; the re-stamp means correctness does not depend on validation being
+exhaustive.
+
+| Path | Reason |
+|---|---|
+| `apiVersion`, `kind` | **Security.** Apply is GVK-directed and the operator holds `escalate` and `bind` ([§3.7](#3-constraints-from-the-current-design)). |
+| `metadata.name`, `.namespace` | Identity. A rename orphans the original, and the operator does not prune ([§3.4](#3-constraints-from-the-current-design)). |
+| `metadata.ownerReferences`, `.finalizers` | Garbage collection and Site-scoped cleanup. |
+| `spec.selector` | The API server rejects a workload whose template labels do not satisfy its selector. |
+| `spec.template.metadata.labels` keys referenced by the selector | Same. |
+| `spec.template.spec.serviceAccountName` | **Security.** Retargeting borrows another identity's API permissions. Also detaches the component from its RBAC. |
+| `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. `gantry` runs `hostNetwork: false` by design; `net-node` cannot function without `hostNetwork: true`. |
+| Labels and annotations under `unbounded-cloud.io/` | Carry config hashes, Site scoping, and override visibility ([§10](#10-drift-visibility)). |
+| Operator-declared `volumes` and `volumeMounts`, by name | `Volumes` uses `patchStrategy:"merge,retainKeys"` (`k8s.io/api/core/v1/types.go:4145`), so a partial patch silently drops sibling fields of the volume it names. |
+
+Also rejected:
+
+- **Any `$`-prefixed key** anywhere in the patch. Restricting only `$patch` and
+  `$setElementOrder` was incomplete; the directive namespace is open and
+  directives can delete operator-managed content.
+- **Explicit `null` values.** Strategic merge treats null as deletion, which is
+  a second route to removing managed content that a path allowlist alone does
+  not catch.
+
+### 8.3 Additive-only scheduling
+
+`metalman` and `storage` place their workloads with a mandatory Site affinity
+(`metalman.go:170`, `storage.go:261-268`) built by `SiteNodeAffinity`
+(`env.go:503-514`), which is `RequiredDuringSchedulingIgnoredDuringExecution`.
+
+`NodeSelectorTerms` carries no `patchMergeKey`
+(`k8s.io/api/core/v1/types.go:3778`), so a patch supplying `nodeSelectorTerms`
+**replaces** the operator's terms outright. A user adding an unrelated node
+constraint would silently remove Site isolation and allow two Sites' workloads
+onto the same nodes, violating the no-retarget goal in
+[§2](#2-goals-and-non-goals).
+
+Scheduling constraints are therefore merged additively rather than applied as a
+raw patch:
+
+- `affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution`: user
+  `matchExpressions` are appended to **each** operator term, so the result is
+  the conjunction of the Site constraint and the user constraint. Operator terms
+  are never removed or replaced.
+- `affinity.nodeAffinity.preferredDuringScheduling...`, `podAffinity`, and
+  `podAntiAffinity`: appended, since the operator sets none today. If a
+  component later sets them, the same conjunction rule applies.
+- `nodeSelector`: keys are merged; overwriting an operator-set key is rejected.
+- `tolerations`: appended, never replaced, despite strategic merge's default
+  replace semantics for that list.
+
+### 8.4 Apply-time assertion
+
+Independently of validation and re-stamping, the object is asserted to be
+`apps/v1` `Deployment` or `DaemonSet` immediately before apply, and `ApplyObject`
+itself gains a defensive check for objects carrying an override annotation.
+
+Three layers for one property is deliberate. GVK escape is the difference
+between a damaged workload and a cluster-admin binding
+([§4.2](#42-the-allowlist-is-an-integrity-control-not-a-security-control)), so
+it should not depend on any single check being correct.
+
+## 9. Wiring
 
 **Application point.** The patch is applied inside `Env.ApplyObject`
 (`env.go:240`), gated on `kind` being `Deployment` or `DaemonSet`. This is the
@@ -506,7 +702,7 @@ ConfigMap without modification.
 patch changes the pod template, SSA writes the change, and the workload's own
 rollout strategy takes over.
 
-## 9. Drift visibility
+## 10. Drift visibility
 
 An override is invisible in the generated manifests and survives operator
 upgrades. A pinned image or a replaced argument list silently freezes a
@@ -540,13 +736,13 @@ into the reconcile error and requeues with backoff.
 **As an Event** on the Site, gated on the override hash so it fires on change
 rather than on every reconcile.
 
-**Through the CLI**, see [§10](#10-cli).
+**Through the CLI**, see [§11](#11-cli).
 
 Images are permitted with no additional gate. The signalling above is the whole
 of the friction: users asked for image overrides, and the mechanism is an
 acknowledged escape hatch rather than a supported configuration surface.
 
-## 10. CLI
+## 11. CLI
 
 Overrides are cluster-scoped, so they get a new top-level noun under
 `kubectl unbounded` rather than living under `site`.
@@ -585,13 +781,13 @@ type Renderer interface {
 ```
 
 This is a real refactor across all five components and is sequenced as its own
-behavior-preserving PR in [§12](#12-implementation-plan). It stands on its own
+behavior-preserving PR in [§13](#13-implementation-plan). It stands on its own
 merits beyond `diff`: it makes components unit-testable without a client and
 opens the door to an operator-internal dry-run mode later.
 
-## 11. Operational notes
+## 12. Operational notes
 
-**Argument replacement.** Covered in [§6.2](#62-extraargs). It is the sharpest
+**Argument replacement.** Covered in [§7.2](#72-extraargs). It is the sharpest
 edge in the design and must be prominent in user documentation, not only in the
 API reference.
 
@@ -607,7 +803,7 @@ behind a healthy old pod. Overrides touching `resources`, `nodeSelector`,
 conflicting document is only detected in reconcile and reported as a Site
 condition, so there is a window where the user believes the change landed.
 `overrides validate` is the mitigation; moving validation to admission is
-[§15](#15-open-questions).
+[§16](#16-open-questions).
 
 **Upgrade behavior.** Overrides are not versioned against component releases. A
 patch referencing a container or volume that a later release renames becomes a
@@ -618,9 +814,9 @@ behaves unlike its reported version.
 
 **Ordering.** The ConfigMap may be created before or after the Sites it names,
 and before or after the components it patches. Unmatched entries are inert and
-reported ([§5.2](#52-resolution)).
+reported ([§6.2](#62-resolution)).
 
-## 12. Implementation plan
+## 13. Implementation plan
 
 | PR | Scope | Depends on |
 |---|---|---|
@@ -633,7 +829,7 @@ reported ([§5.2](#52-resolution)).
 
 No CRD change, no `make generate`, and no API version churn at any step.
 
-## 13. Testing
+## 14. Testing
 
 **Merge semantics.** Container merge by name; sidecar addition; volume and
 volumeMount addition; env merge by name; toleration list replacement; workload
@@ -669,7 +865,7 @@ the condition reason.
 **Refactor safety (PR 4).** Golden-object tests asserting `Render` output equals
 what the pre-refactor apply path produced, for all five components.
 
-## 14. Prior art
+## 15. Prior art
 
 Operators that manage workloads on a user's behalf have converged on bounded
 patching rather than on embedding a templating or overlay engine.
@@ -683,7 +879,7 @@ patching rather than on embedding a templating or overlay engine.
   tractable.
 - **Prometheus Operator** inlines a curated subset of `PodSpec` fields
   individually, and has added to that set steadily over years, which is the
-  field-creep failure mode described in [§4.2](#42-why-not-a-typed-override-struct).
+  field-creep failure mode described in [§5.2](#52-why-not-a-typed-override-struct).
 
 None of them embed kustomize, Helm, or a templating engine in the operator. The
 consistent pattern is: bounded target, open content within it.
@@ -694,13 +890,13 @@ tooling rather than as something the operator consumes, and
 `designs/gantry-unbounded-integration.md` states that raw manifests must remain
 directly applicable for users who want full control.
 
-## 15. Open questions
+## 16. Open questions
 
 1. **`overrides diff` output format.** Unified diff of YAML is readable but
    noisy for deep pod specs. Worth considering a path-oriented summary as the
    default with full diff behind a flag.
 2. **Admission-time validation.** A `ValidatingAdmissionPolicy` on the ConfigMap
-   would close the window described in [§11](#11-operational-notes) without a
+   would close the window described in [§12](#12-operational-notes) without a
    webhook. It cannot do full validation, since resolving `component` and
    `sites` needs cluster state, but it could reject schema errors, unknown
    `apiVersion`, and reserved paths. Is the partial coverage worth the
