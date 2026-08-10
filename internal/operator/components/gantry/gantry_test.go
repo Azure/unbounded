@@ -501,6 +501,10 @@ func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site)
 // remove the legacy DaemonSet skips the replacement rather than running both
 // side by side. And node-config.yaml plus the examples/ subtree are excluded:
 // they are for operators to apply themselves, not for the operator to install.
+//
+// The Namespace ships inside daemonset.yaml, after the DaemonSet, which is why
+// it appears second rather than first. Gantry has no separate namespace
+// manifest, unlike net, machina and storage.
 func TestPlanGolden(t *testing.T) {
 	env := testEnv(t)
 
@@ -520,8 +524,8 @@ func TestPlanGolden(t *testing.T) {
 	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
-Apply Namespace/unbounded-system` + after + `
 Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
+Apply Namespace/unbounded-system` + after + `
 Apply ServiceAccount/unbounded-system/gantry` + after + `
 Apply ClusterRole/gantry-agent` + after + `
 Apply ClusterRoleBinding/gantry-agent` + after + `
