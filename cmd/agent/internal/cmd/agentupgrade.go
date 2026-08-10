@@ -5,10 +5,12 @@ package cmd
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"text/template"
 
 	"github.com/spf13/cobra"
 
@@ -18,6 +20,13 @@ import (
 )
 
 const hostAgentBinaryMode = 0o755
+
+//go:embed assets/agent-upgrade-plan.txt.tmpl
+var hostAgentUpgradePlanTemplateText string
+
+var hostAgentUpgradePlanTemplate = template.Must(
+	template.New("host-agent-upgrade-plan").Parse(hostAgentUpgradePlanTemplateText),
+)
 
 type hostAgentUpgradeHandler struct {
 	cmdCtx       *CommandContext
@@ -42,9 +51,12 @@ func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
 	}
 
 	cmd := &cobra.Command{
-		Use:    "agent-upgrade",
-		Short:  "Activate this executable as the host agent daemon",
-		Long:   "Activate this executable as the host agent daemon without creating a MachineOperation.",
+		Use:   "agent-upgrade",
+		Short: "Activate this executable as the host agent daemon",
+		Long:  "Activate this executable as the host agent daemon without creating a MachineOperation.",
+		// Host delivery automation invokes this command from a separately staged
+		// candidate. Keep it out of normal user-facing help because the supported
+		// interactive upgrade surface is the coordinated MachineOperation command.
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -85,7 +97,7 @@ func (h *hostAgentUpgradeHandler) execute(ctx context.Context) error {
 			LastGoodPath: paths.LastGoodPath,
 		},
 		CandidatePath: candidatePath,
-		Mode:          hostAgentBinaryMode,
+		BinaryMode:    hostAgentBinaryMode,
 		LockPath:      goalstates.DaemonAgentUpgradeLockPath,
 	}
 	service := h.newService(paths)
@@ -123,51 +135,7 @@ func resolveExecutablePath(path string) (string, error) {
 }
 
 func writeHostAgentUpgradePlan(w io.Writer, plan agentbinary.ActivationPlan) error {
-	if _, err := fmt.Fprintln(w, "Agent upgrade mode: host-driven"); err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintln(w, "Kubernetes MachineOperation: not created"); err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintf(w, "Candidate: %s\n", plan.CandidatePath); err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintf(w, "Active binary: %s\n", plan.ActivePath); err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintf(w, "Install target: %s\n", plan.TargetPath); err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintf(w, "Current link: %s -> %s\n", plan.CurrentLinkPath, plan.TargetPath); err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintf(w, "Last-good link: %s -> %s\n", plan.LastGoodLinkPath, plan.RollbackPath); err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintf(w, "Initialize managed layout: %t\n", plan.InitializeLayout); err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintln(w, "Planned actions:"); err != nil {
-		return err
-	}
-
-	for _, action := range plan.Actions {
-		if _, err := fmt.Fprintf(w, "  - %s\n", action); err != nil {
-			return err
-		}
-	}
-
-	_, err := fmt.Fprintln(w, "Preflight: no changes applied")
-
-	return err
+	return hostAgentUpgradePlanTemplate.Execute(w, plan)
 }
 
 func newCmdRecordAgentUpgradeFailureSignal() *cobra.Command {

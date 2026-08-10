@@ -1,0 +1,13 @@
+Agent upgrade mode: host-driven
+Kubernetes MachineOperation: not created
+Candidate: {{ .CandidatePath }}
+Active binary: {{ .ActivePath }}
+Install target: {{ .TargetPath }}
+Current link: {{ .CurrentLinkPath }} -> {{ .TargetPath }}
+Last-good link: {{ .LastGoodLinkPath }} -> {{ .RollbackPath }}
+Initialize managed layout: {{ .InitializeLayout }}
+Planned actions:
+{{- range .Actions }}
+  - {{ . }}
+{{- end }}
+Preflight: no changes applied

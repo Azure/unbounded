@@ -172,8 +172,9 @@ PreflightHostDaemonActivation(ctx, options, serviceInspector) (ActivationPlan, e
 ActivateHostDaemon(ctx, log, options, service) (ActivationResult, error)
 ```
 
-`ActivationOptions` supplies an explicit candidate path, binary layout, mode,
-and lock path. The CLI adapter obtains the candidate with `os.Executable()`.
+`ActivationOptions` supplies an explicit candidate path, binary layout, binary
+file mode, and lock path. The CLI adapter obtains the candidate with
+`os.Executable()`.
 The service integration supplies operations to prepare the daemon entrypoint,
 reload the service manager, restart the daemon, and wait for health.
 
