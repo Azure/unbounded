@@ -5,7 +5,6 @@ package nodestart
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"testing"
 
@@ -24,29 +23,13 @@ func TestSetupNVIDIAProvisionedCapabilityControlsBehavior(t *testing.T) {
 	require.ErrorContains(t, err, "NVIDIA is required")
 }
 
-func TestNVIDIAReadyMarkerProbeDistinguishesMissingFromExecutionFailure(t *testing.T) {
+func TestReconcileNVIDIANonGPUIsNoop(t *testing.T) {
 	t.Parallel()
 
-	log := slog.New(slog.DiscardHandler)
-	for output, want := range map[string]bool{"ready": true, "missing": false} {
-		got, err := nvidiaReadyMarkerExists(
-			context.Background(), log, "kube1",
-			func(context.Context, *slog.Logger, string, ...string) (string, error) {
-				return output, nil
-			},
-		)
-		require.NoError(t, err)
-		require.Equal(t, want, got)
-	}
-
-	transportErr := errors.New("D-Bus unavailable")
-	_, err := nvidiaReadyMarkerExists(
-		context.Background(), log, "kube1",
-		func(context.Context, *slog.Logger, string, ...string) (string, error) {
-			return "", transportErr
-		},
-	)
-	require.ErrorIs(t, err, transportErr)
+	require.NoError(t, ReconcileNVIDIA(
+		slog.New(slog.DiscardHandler),
+		&goalstates.NodeStart{MachineName: "kube1"},
+	).Do(context.Background()))
 }
 
 func TestRequiredVersionedNVIDIALibraryPaths(t *testing.T) {

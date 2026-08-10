@@ -5,16 +5,12 @@ package nodestart
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -24,11 +20,6 @@ import (
 type setupNVIDIA struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
-}
-
-type markNVIDIAReady struct {
-	log         *slog.Logger
-	machineName string
 }
 
 // SetupNVIDIA returns a task that makes NVIDIA driver libraries from the host
@@ -57,20 +48,9 @@ func SetupNVIDIA(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task 
 	return &setupNVIDIA{log: log, goalState: goalState}
 }
 
-// MarkNVIDIAReady returns a task that releases the lifecycle readiness gate
-// when current host discovery does not require NVIDIA setup.
-func MarkNVIDIAReady(log *slog.Logger, machineName string) phases.Task {
-	return &markNVIDIAReady{log: log, machineName: machineName}
-}
+func (s *setupNVIDIA) Name() string { return "setup-nvidia" }
 
-func (s *setupNVIDIA) Name() string     { return "setup-nvidia" }
-func (m *markNVIDIAReady) Name() string { return "mark-nvidia-ready" }
-
-func (m *markNVIDIAReady) Do(ctx context.Context) error {
-	return markNVIDIAReadyForMachine(ctx, m.log, m.machineName)
-}
-
-func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
+func (s *setupNVIDIA) Do(ctx context.Context) error {
 	if !s.goalState.Nvidia.Required {
 		s.log.Info("NVIDIA was not provisioned for this machine, skipping")
 
@@ -79,31 +59,6 @@ func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
 
 	if !s.goalState.Containerd.NvidiaRuntime.Enabled || !goalstates.NVIDIAStateAvailable(s.goalState.Nvidia) {
 		return fmt.Errorf("NVIDIA is required but resolved setup state is incomplete")
-	}
-
-	unlock, err := acquireNVIDIASetupLock(ctx, s.goalState.MachineName)
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		retErr = errors.Join(retErr, unlock())
-	}()
-
-	// Managed node starts and the nspawn ExecStartPost hook can reach this task
-	// concurrently. The first successful caller creates the lifecycle-scoped
-	// ready marker; later callers must not rebuild the driver root after that
-	// marker has allowed containerd to start.
-	ready, err := nvidiaReadyMarkerExists(ctx, s.log, s.goalState.MachineName, executil.MachineRun)
-	if err != nil {
-		return err
-	}
-
-	if ready {
-		s.log.Info("NVIDIA runtime already reconciled for this machine start, skipping",
-			"machine", s.goalState.MachineName)
-
-		return nil
 	}
 
 	if err := s.setupLibraries(ctx); err != nil {
@@ -118,90 +73,7 @@ func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	return markNVIDIAReadyForMachine(ctx, s.log, s.goalState.MachineName)
-}
-
-type machineRunFunc func(context.Context, *slog.Logger, string, ...string) (string, error)
-
-func nvidiaReadyMarkerExists(ctx context.Context, log *slog.Logger, machine string, run machineRunFunc) (bool, error) {
-	output, err := run(
-		ctx,
-		log,
-		machine,
-		"sh", "-c", `if test -e "$1"; then printf ready; else printf missing; fi`,
-		"nvidia-ready-probe", goalstates.NVIDIAReadyPath,
-	)
-	if err != nil {
-		return false, fmt.Errorf("probe NVIDIA ready marker: %w", err)
-	}
-
-	switch output {
-	case "ready":
-		return true, nil
-	case "missing":
-		return false, nil
-	default:
-		return false, fmt.Errorf("probe NVIDIA ready marker: unexpected output %q", output)
-	}
-}
-
-func acquireNVIDIASetupLock(ctx context.Context, machine string) (func() error, error) {
-	const retryInterval = 100 * time.Millisecond
-
-	lockDir := filepath.Join("/run", "unbounded", "locks")
-	if err := os.MkdirAll(lockDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create NVIDIA setup lock directory: %w", err)
-	}
-
-	lockPath := filepath.Join(lockDir, "nvidia-"+machine+".lock")
-
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open NVIDIA setup lock: %w", err)
-	}
-
-	for {
-		err = unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-		if err == nil {
-			return func() error {
-				unlockErr := unix.Flock(int(file.Fd()), unix.LOCK_UN)
-				closeErr := file.Close()
-
-				return errors.Join(
-					wrapError("unlock NVIDIA setup", unlockErr),
-					wrapError("close NVIDIA setup lock", closeErr),
-				)
-			}, nil
-		}
-
-		if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
-			closeErr := file.Close()
-
-			return nil, errors.Join(
-				fmt.Errorf("lock NVIDIA setup: %w", err),
-				wrapError("close NVIDIA setup lock", closeErr),
-			)
-		}
-
-		select {
-		case <-ctx.Done():
-			closeErr := file.Close()
-
-			return nil, errors.Join(
-				fmt.Errorf("wait for NVIDIA setup lock: %w", ctx.Err()),
-				wrapError("close NVIDIA setup lock", closeErr),
-			)
-		case <-time.After(retryInterval):
-		}
-	}
-}
-
-func wrapError(operation string, err error) error {
-	if err == nil {
-		return nil
-	}
-
-	return fmt.Errorf("%s: %w", operation, err)
+	return nil
 }
 
 func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
@@ -248,22 +120,6 @@ func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {
 	s.log.Info("NVIDIA library symlinks created and ldconfig updated",
 		slog.Int("count", len(libs)),
 	)
-
-	return nil
-}
-
-func markNVIDIAReadyForMachine(ctx context.Context, log *slog.Logger, machineName string) error {
-	if _, err := executil.MachineRun(ctx, log, machineName,
-		"mkdir", "-p", filepath.Dir(goalstates.NVIDIAReadyPath),
-	); err != nil {
-		return fmt.Errorf("create NVIDIA ready directory: %w", err)
-	}
-
-	if _, err := executil.MachineRun(ctx, log, machineName,
-		"touch", goalstates.NVIDIAReadyPath,
-	); err != nil {
-		return fmt.Errorf("mark NVIDIA runtime ready: %w", err)
-	}
 
 	return nil
 }

@@ -98,37 +98,6 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	return resolveMachine(log, cfg, machineName, downloads, ResolveNvidiaHost)
 }
 
-// ResolveExistingLifecycle resolves only the host and in-machine state needed
-// to migrate lifecycle hooks for an already provisioned machine.
-func ResolveExistingLifecycle(cfg *config.AgentConfig, machineName string) (*MachineGoalState, error) {
-	return resolveExistingLifecycle(cfg, machineName, ResolveNvidiaHost)
-}
-
-func resolveExistingLifecycle(
-	cfg *config.AgentConfig,
-	machineName string,
-	resolveNVIDIA resolveNVIDIAHostFunc,
-) (*MachineGoalState, error) {
-	rootFS, err := resolveNSpawnConfig(cfg, machineName, resolveNVIDIA)
-	if err != nil {
-		return nil, err
-	}
-
-	return &MachineGoalState{
-		RootFS: rootFS,
-		NodeStart: &NodeStart{
-			MachineName: machineName,
-			MachineDir:  rootFS.MachineDir,
-			Containerd: ResolveContainerd(ContainerdOptions{
-				SandboxImage:   cfg.CRI.Containerd.SandboxImage,
-				NvidiaRequired: rootFS.Nvidia.Required,
-			}),
-			Kubelet: Kubelet{KubeletBinPath: filepath.Join("/"+BinDir, "kubelet")},
-			Nvidia:  rootFS.Nvidia,
-		},
-	}, nil
-}
-
 func resolveMachine(
 	log *slog.Logger,
 	cfg *config.AgentConfig,

@@ -75,10 +75,6 @@ func TestNSpawnLifecyclePreStartRefreshesConfig(t *testing.T) {
 	nspawnData, err := os.ReadFile(root.NSpawnConfigFile)
 	require.NoError(t, err)
 	require.Contains(t, string(nspawnData), root.Nvidia.LibDirMounts[0].HostDir)
-
-	containerdUnit, err := os.ReadFile(filepath.Join(root.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd))
-	require.NoError(t, err)
-	require.Contains(t, string(containerdUnit), goalstates.SystemdUnitNVIDIAReady)
 }
 
 func TestNSpawnLifecyclePreStartKeepsFreshBootstrapConfigWithoutAppliedConfig(t *testing.T) {
@@ -114,13 +110,6 @@ func TestNSpawnLifecyclePreStartCPUNodeStaysCPU(t *testing.T) {
 		func(context.Context, *slog.Logger) error { return nil },
 	)
 	require.NoError(t, err)
-
-	containerdUnit, err := os.ReadFile(filepath.Join(root.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd))
-	require.NoError(t, err)
-	require.Contains(t, string(containerdUnit), goalstates.SystemdUnitNVIDIAReady)
-
-	_, err = os.Stat(filepath.Join(root.MachineDir, goalstates.NvidiaRuntimeDropInPath))
-	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func writeAppliedConfig(t *testing.T, dir string) (string, string) {

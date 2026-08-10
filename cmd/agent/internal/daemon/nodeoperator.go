@@ -187,7 +187,7 @@ func gantryDisabled(cfg *provision.AgentConfig) bool {
 }
 
 func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
-	gs, err := goalstates.ResolveExistingLifecycle(active.Config, active.Name)
+	rootFS, err := goalstates.ResolveNSpawnConfig(active.Config, active.Name)
 	if err != nil {
 		return fmt.Errorf("resolve existing machine lifecycle: %w", err)
 	}
@@ -195,8 +195,7 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 	if err := phases.Serial(
 		log,
 		rootfs.EnsureNSpawnLifecycleHelper(),
-		rootfs.EnsureNSpawnConfig(log, gs.RootFS),
-		nodestart.EnsureNSpawnLifecycleUnits(gs.NodeStart),
+		rootfs.EnsureNSpawnConfig(log, rootFS),
 	).Do(ctx); err != nil {
 		return fmt.Errorf("write existing machine lifecycle: %w", err)
 	}

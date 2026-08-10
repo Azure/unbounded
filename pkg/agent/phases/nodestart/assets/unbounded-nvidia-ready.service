@@ -1,9 +1,0 @@
-[Unit]
-Description=Wait for unbounded NVIDIA runtime setup
-Before=containerd.service kubelet.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'until test -e /run/unbounded/nvidia-ready; do sleep 1; done'
-RemainAfterExit=yes
-TimeoutStartSec=infinity

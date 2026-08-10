@@ -68,7 +68,6 @@ func TestNSpawnLifecyclePostStartRewiresFreshNVIDIAState(t *testing.T) {
 			got = state
 			return lifecycleTestTask{name: "test-nvidia"}
 		},
-		func(*slog.Logger, string) phases.Task { return lifecycleTestTask{name: "mark-ready"} },
 		func(_ context.Context, _ *slog.Logger, task phases.Task) error {
 			executed = true
 
@@ -88,27 +87,20 @@ func TestNSpawnLifecyclePostStartRewiresFreshNVIDIAState(t *testing.T) {
 func TestNSpawnLifecyclePostStartCPUNodeDoesNotEnableNVIDIA(t *testing.T) {
 	t.Parallel()
 
-	var waited, marked bool
-
+	called := false
 	err := nspawnLifecyclePostStart(
 		context.Background(), testLogger(), "kube1",
 		func(string) (goalstates.NvidiaHost, error) { return goalstates.NvidiaHost{}, nil },
-		func(context.Context, *slog.Logger, string) error { waited = true; return nil },
+		func(context.Context, *slog.Logger, string) error { called = true; return nil },
 		func(*slog.Logger, *goalstates.NodeStart) phases.Task {
-			return lifecycleTestTask{name: "unexpected-setup"}
-		},
-		func(*slog.Logger, string) phases.Task { return lifecycleTestTask{name: "mark-ready"} },
-		func(_ context.Context, _ *slog.Logger, task phases.Task) error {
-			marked = true
+			called = true
 
-			require.Equal(t, "mark-ready", task.Name())
-
-			return nil
+			return lifecycleTestTask{name: "unexpected-reconcile"}
 		},
+		func(context.Context, *slog.Logger, phases.Task) error { called = true; return nil },
 	)
 	require.NoError(t, err)
-	require.True(t, waited)
-	require.True(t, marked)
+	require.False(t, called)
 }
 
 func TestNSpawnLifecyclePostStartFailurePropagatesForNSpawnRestart(t *testing.T) {
@@ -119,7 +111,6 @@ func TestNSpawnLifecyclePostStartFailurePropagatesForNSpawnRestart(t *testing.T)
 		func(string) (goalstates.NvidiaHost, error) { return completeNVIDIA("direct-restart"), nil },
 		func(context.Context, *slog.Logger, string) error { return nil },
 		func(*slog.Logger, *goalstates.NodeStart) phases.Task { return lifecycleTestTask{name: "test-nvidia"} },
-		func(*slog.Logger, string) phases.Task { return lifecycleTestTask{name: "mark-ready"} },
 		func(context.Context, *slog.Logger, phases.Task) error { return errors.New("setup failed") },
 	)
 	require.ErrorContains(t, err, "setup failed")
@@ -135,7 +126,6 @@ func TestNSpawnLifecyclePostStartRejectsIncompleteNVIDIAState(t *testing.T) {
 		},
 		func(context.Context, *slog.Logger, string) error { return nil },
 		func(*slog.Logger, *goalstates.NodeStart) phases.Task { return lifecycleTestTask{name: "test-nvidia"} },
-		func(*slog.Logger, string) phases.Task { return lifecycleTestTask{name: "mark-ready"} },
 		func(context.Context, *slog.Logger, phases.Task) error { return nil },
 	)
 	require.ErrorIs(t, err, goalstates.ErrNVIDIAStateUnavailable)

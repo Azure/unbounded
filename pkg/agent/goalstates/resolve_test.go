@@ -68,19 +68,6 @@ func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 	})
 }
 
-func TestResolveExistingLifecycleUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
-	t.Parallel()
-
-	gs, err := resolveExistingLifecycle(
-		&config.AgentConfig{}, NSpawnMachineKube1,
-		func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
-	)
-	require.NoError(t, err)
-	require.True(t, gs.RootFS.Nvidia.Required)
-	require.True(t, gs.NodeStart.Nvidia.Required)
-	require.True(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
-}
-
 func completeResolvedNVIDIA() NvidiaHost {
 	return NvidiaHost{
 		GPUDevicePaths: []string{"/dev/nvidia0"},

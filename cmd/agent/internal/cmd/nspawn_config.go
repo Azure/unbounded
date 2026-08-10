@@ -10,13 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
@@ -65,25 +63,8 @@ func nspawnLifecyclePreStart(
 		return fmt.Errorf("resolve nspawn config goal state: %w", err)
 	}
 
-	nodeStart := &goalstates.NodeStart{
-		MachineName: machineName,
-		MachineDir:  rootFS.MachineDir,
-		Containerd: goalstates.ResolveContainerd(goalstates.ContainerdOptions{
-			SandboxImage:   cfg.CRI.Containerd.SandboxImage,
-			NvidiaRequired: rootFS.Nvidia.Required,
-		}),
-		Kubelet: goalstates.Kubelet{KubeletBinPath: filepath.Join("/"+goalstates.BinDir, "kubelet")},
-		Nvidia:  rootFS.Nvidia,
-	}
-
-	refresh := phases.Serial(
-		log,
-		rootfs.EnsureNSpawnConfig(log, rootFS),
-		nodestart.EnsureNSpawnLifecycleUnits(nodeStart),
-	)
-
-	if err := executeTask(ctx, log, refresh); err != nil {
-		return fmt.Errorf("regenerate nspawn lifecycle config for %s: %w", machineName, err)
+	if err := executeTask(ctx, log, rootfs.EnsureNSpawnConfig(log, rootFS)); err != nil {
+		return fmt.Errorf("regenerate nspawn config for %s: %w", machineName, err)
 	}
 
 	// The nspawn start transaction loaded its drop-in before this dependency.

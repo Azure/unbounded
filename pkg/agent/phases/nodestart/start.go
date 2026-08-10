@@ -13,8 +13,8 @@ import (
 // StartNode returns a composite task that configures and starts an nspawn
 // machine node: configuring containerd and kubelet in parallel, then starting
 // the nspawn machine and starting containerd and kubelet in sequence. NVIDIA
-// setup is owned by the nspawn ExecStartPost lifecycle hook; GPU services remain
-// blocked on its readiness gate.
+// setup is owned by the nspawn ExecStartPost lifecycle hook, which safely
+// restarts GPU services around driver rewiring.
 //
 // This is the shared node-start sequence used by both the initial agent start
 // and node update flows. Callers that need to persist the applied config for

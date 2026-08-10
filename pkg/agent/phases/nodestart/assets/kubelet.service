@@ -3,8 +3,6 @@ Description=Kubelet
 ConditionPathExists={{.KubeletBinPath}}
 Wants=network-online.target containerd.service
 After=network-online.target containerd.service
-Requires=unbounded-nvidia-ready.service
-After=unbounded-nvidia-ready.service
 
 [Service]
 Restart=always

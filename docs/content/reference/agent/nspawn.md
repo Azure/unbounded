@@ -154,9 +154,9 @@ The agent also auto-mounts host storage and InfiniBand hardware:
 
 Two systemd hooks run common lifecycle reconciliation around every nspawn
 start. The pre-start hook refreshes host devices, mounts, and GPU paths changed
-by a host reboot. The post-start hook prepares in-machine runtime state before
-containerd and kubelet proceed. Hook failures keep the machine from becoming
-ready and are retried through systemd. On the host,
+by a host reboot. On GPU hosts, the post-start hook stops kubelet and containerd,
+rewires the driver root and CDI state, then restores both services. Hook failures
+fail the nspawn start and are retried through systemd. On the host,
 `nspawn-lifecycle-helper nspawn-lifecycle reconcile <machine>` triggers both
 steps by restarting the managed nspawn unit.
 
@@ -167,9 +167,9 @@ incomplete driver state cause the start to retry. Post-start rewiring refreshes
 the driver root and CDI state after every machine start.
 
 When an upgraded daemon starts for a machine created by an older agent, it
-idempotently installs the host lifecycle hooks and the on-disk containerd and
-kubelet readiness units without restarting the running machine or its services.
-The daemon migration uses the same current-host discovery and retries while
+idempotently installs the host lifecycle hooks without restarting the running
+machine or its services. The daemon migration uses the same current-host
+discovery and retries while
 NVIDIA devices have incomplete driver state.
 
 The configuration is written to these files on the host before the machine boots:
@@ -253,10 +253,10 @@ The agent's three-phase bootstrap drives the nspawn lifecycle:
    service override, downloads Kubernetes and container runtime binaries, and
    configures the OS inside the rootfs (hostname, DNS, kernel modules).
 
-3. **Node start.** Starts the nspawn machine, runs the hidden
-   `nspawn-lifecycle post-start` hook for GPU-provisioned machines, and only
-   releases containerd and kubelet after NVIDIA driver-root and CDI setup is
-   complete. A post-start failure fails the nspawn unit so its existing
+3. **Node start.** Starts the nspawn machine and runs the hidden
+   `nspawn-lifecycle post-start` hook. On GPU hosts, the hook stops kubelet and
+   containerd, rebuilds NVIDIA driver-root and CDI state, then starts containerd
+   and kubelet again. A post-start failure fails the nspawn unit so its existing
    `Restart=on-failure` policy retries the complete lifecycle.
 
 ### Removal
@@ -307,7 +307,6 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
 | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
 | `/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper` | Lifecycle command binary retained across daemon binary rollback. |
-| `/run/unbounded/nvidia-ready` | (Inside GPU container) Lifecycle-scoped marker that releases containerd and kubelet after NVIDIA setup. |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also

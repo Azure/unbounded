@@ -55,39 +55,7 @@ func TestConfigureContainerdSetsObservabilityDefaults(t *testing.T) {
 		"image_pull_progress_timeout = \"15m\"")
 }
 
-func TestConfigureContainerdGatesNVIDIAStartup(t *testing.T) {
-	t.Parallel()
-
-	machineDir := t.TempDir()
-	goalState := &goalstates.NodeStart{
-		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd(goalstates.ContainerdOptions{}),
-		Nvidia: goalstates.NvidiaHost{
-			Required:       true,
-			GPUDevicePaths: []string{"/dev/nvidia0"},
-			LibMappings:    []goalstates.NvidiaLibMapping{{HostPath: "/usr/lib/libcuda.so.1"}},
-		},
-	}
-	goalState.Containerd.NvidiaRuntime.Enabled = true
-
-	require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
-
-	service, err := os.ReadFile(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd))
-	require.NoError(t, err)
-	require.Contains(t, string(service), "Requires=unbounded-nvidia-ready.service")
-	require.Contains(t, string(service), "After=unbounded-nvidia-ready.service")
-
-	readyService, err := os.ReadFile(filepath.Join(
-		machineDir,
-		goalstates.SystemdSystemDir,
-		goalstates.SystemdUnitNVIDIAReady,
-	))
-	require.NoError(t, err)
-	require.Contains(t, string(readyService),
-		"ExecStart=/bin/sh -c 'until test -e /run/unbounded/nvidia-ready; do sleep 1; done'")
-}
-
-func TestConfigureContainerdGatesCPUNodeUntilPostStartDiscovery(t *testing.T) {
+func TestConfigureContainerdDoesNotInstallLifecycleReadinessGate(t *testing.T) {
 	t.Parallel()
 
 	machineDir := t.TempDir()
@@ -100,10 +68,7 @@ func TestConfigureContainerdGatesCPUNodeUntilPostStartDiscovery(t *testing.T) {
 
 	service, err := os.ReadFile(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd))
 	require.NoError(t, err)
-	require.Contains(t, string(service), "unbounded-nvidia-ready.service")
-
-	_, err = os.Stat(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitNVIDIAReady))
-	require.NoError(t, err)
+	require.NotContains(t, string(service), "unbounded-nvidia-ready")
 }
 
 func TestConfigureContainerdUpdatesManagedGantryHostsConfig(t *testing.T) {

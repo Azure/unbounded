@@ -170,8 +170,6 @@ const (
 	DefaultAzureLinux3NvidiaOCIImage = "ghcr.io/azure/agent-azlinux3-nvidia:v20260626"
 
 	SystemdUnitContainerd      = "containerd.service"
-	SystemdUnitNVIDIAReady     = "unbounded-nvidia-ready.service"
-	NVIDIAReadyPath            = "/run/unbounded/nvidia-ready"
 	ContainerdConfigPath       = "/etc/containerd/config.toml"
 	ContainerdConfDropInDir    = "/etc/containerd/conf.d"
 	NvidiaRuntimeDropInPath    = ContainerdConfDropInDir + "/99-nvidia-runtime.toml"

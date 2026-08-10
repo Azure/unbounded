@@ -185,7 +185,7 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 	require.NotContains(t, string(service), "--cluster-dns=")
 }
 
-func TestConfigureKubeletGatesNVIDIAStartup(t *testing.T) {
+func TestConfigureKubeletDoesNotInstallLifecycleReadinessGate(t *testing.T) {
 	t.Parallel()
 
 	machineDir := t.TempDir()
@@ -211,8 +211,7 @@ func TestConfigureKubeletGatesNVIDIAStartup(t *testing.T) {
 
 	service, err := os.ReadFile(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitKubelet))
 	require.NoError(t, err)
-	require.Contains(t, string(service), "Requires=unbounded-nvidia-ready.service")
-	require.Contains(t, string(service), "After=unbounded-nvidia-ready.service")
+	require.NotContains(t, string(service), "unbounded-nvidia-ready")
 }
 
 func TestConfigureKubeletWritesImageCredentialProviderFlags(t *testing.T) {

@@ -74,8 +74,7 @@ func reconcileNSpawnLifecycle(ctx context.Context, log *slog.Logger, machineName
 
 type (
 	waitForLifecycleMachineFunc func(context.Context, *slog.Logger, string) error
-	setupNVIDIATaskFunc         func(*slog.Logger, *goalstates.NodeStart) phases.Task
-	markNVIDIAReadyTaskFunc     func(*slog.Logger, string) phases.Task
+	reconcileNVIDIATaskFunc     func(*slog.Logger, *goalstates.NodeStart) phases.Task
 	resolveNVIDIAHostFunc       func(string) (goalstates.NvidiaHost, error)
 )
 
@@ -86,8 +85,7 @@ func runNSpawnLifecyclePostStart(ctx context.Context, log *slog.Logger, machineN
 		machineName,
 		goalstates.ResolveNvidiaHost,
 		nodestart.WaitForMachine,
-		nodestart.SetupNVIDIA,
-		nodestart.MarkNVIDIAReady,
+		nodestart.ReconcileNVIDIA,
 		phases.ExecuteTask,
 	)
 }
@@ -98,8 +96,7 @@ func nspawnLifecyclePostStart(
 	machineName string,
 	resolveNVIDIA resolveNVIDIAHostFunc,
 	waitForMachine waitForLifecycleMachineFunc,
-	setupNVIDIA setupNVIDIATaskFunc,
-	markReady markNVIDIAReadyTaskFunc,
+	reconcileNVIDIA reconcileNVIDIATaskFunc,
 	executeTask executeLifecycleTaskFunc,
 ) error {
 	nvidia, err := resolveNVIDIA(runtime.GOARCH)
@@ -108,15 +105,7 @@ func nspawnLifecyclePostStart(
 	}
 
 	if len(nvidia.GPUDevicePaths) == 0 {
-		log.Info("no NVIDIA devices discovered; releasing post-start readiness gate", "machine", machineName)
-
-		if err := waitForMachine(ctx, log, machineName); err != nil {
-			return fmt.Errorf("wait for machine %s: %w", machineName, err)
-		}
-
-		if err := executeTask(ctx, log, markReady(log, machineName)); err != nil {
-			return fmt.Errorf("release post-start readiness gate for %s: %w", machineName, err)
-		}
+		log.Info("no NVIDIA devices discovered; skipping post-start rewiring", "machine", machineName)
 
 		return nil
 	}
@@ -139,7 +128,7 @@ func nspawnLifecyclePostStart(
 		Nvidia:      nvidia,
 	}
 
-	if err := executeTask(ctx, log, setupNVIDIA(log, nodeStart)); err != nil {
+	if err := executeTask(ctx, log, reconcileNVIDIA(log, nodeStart)); err != nil {
 		return fmt.Errorf("reconcile NVIDIA state for %s: %w", machineName, err)
 	}
 

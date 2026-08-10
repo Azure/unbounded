@@ -63,10 +63,6 @@ func (c *configureContainerd) Do(_ context.Context) error {
 		return fmt.Errorf("ensure containerd service unit: %w", err)
 	}
 
-	if err := c.ensureNVIDIAReadyServiceUnit(); err != nil {
-		return fmt.Errorf("ensure NVIDIA ready service unit: %w", err)
-	}
-
 	if err := c.ensureGPUDropInConfigs(); err != nil {
 		return fmt.Errorf("ensure GPU drop-in configs: %w", err)
 	}
@@ -141,17 +137,6 @@ func (c *configureContainerd) ensureContainerdServiceUnit() error {
 	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitContainerd)
 
 	return utilio.WriteFile(dest, buf.Bytes(), 0o644)
-}
-
-func (c *configureContainerd) ensureNVIDIAReadyServiceUnit() error {
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitNVIDIAReady)
-
-	data, err := assets.ReadFile("assets/unbounded-nvidia-ready.service")
-	if err != nil {
-		return err
-	}
-
-	return utilio.WriteFile(dest, data, 0o644)
 }
 
 // ensureGPUDropInConfigs manages GPU-related containerd drop-in configs.
