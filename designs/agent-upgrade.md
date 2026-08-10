@@ -107,9 +107,12 @@ Without `--preflight`, the command performs one transactional activation:
 
 1. Require sufficient host privileges and acquire an exclusive activation
    lock.
-2. Resolve the executing candidate path and inspect the current binary layout.
-3. Validate path safety and reject path collisions or unsafe aliases.
-4. Verify the candidate by running its `version` command.
+2. Open the executing candidate once and copy that inode into a private,
+   root-owned snapshot so later path replacement cannot change the bytes being
+   activated.
+3. Inspect the current binary layout and validate path safety, destination
+   entry types, collisions, and unsafe aliases.
+4. Verify the pinned candidate snapshot by running its `version` command.
 5. If the managed layout is not initialized, preserve the existing
    single-path daemon binary in one slot and establish `CurrentPath` and
    `LastGoodPath`.
@@ -121,7 +124,8 @@ Without `--preflight`, the command performs one transactional activation:
    service manager.
 9. Restart the daemon and wait for the caller-defined health check.
 10. If restart or health verification fails, restore `CurrentPath` to
-    `LastGoodPath`, restart the previous daemon, and return a failure.
+    `LastGoodPath`, restart the previous daemon using a bounded cleanup context
+    independent of caller cancellation, and return a failure.
 11. Return success only after the candidate daemon passes its health check.
 
 The command must be idempotent. Re-executing the active binary may repair
