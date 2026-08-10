@@ -152,15 +152,11 @@ The agent also auto-mounts host storage and InfiniBand hardware:
   access. Sources are not created or required to exist during config
   validation.
 
-Device discovery runs when the machine is provisioned and is refreshed by a
-host-side systemd hook before systemd starts the nspawn machine. The hook runs
-the rollback-stable lifecycle helper with `nspawn-lifecycle pre-start`, waits
-for udev to settle, and
-retries failures through systemd without allowing the machine to start. Device
-mapping changes that occur while the host is offline are picked up on the next
-host boot before the machine starts. Disks or HCAs hot-plugged after the machine
-has started are not picked up until the machine is restarted, re-provisioned,
-or soft-rebooted.
+Two systemd hooks run common lifecycle reconciliation around every nspawn
+start. The pre-start hook refreshes host devices, mounts, and GPU paths changed
+by a host reboot. The post-start hook prepares in-machine runtime state before
+containerd and kubelet proceed. Hook failures keep the machine from becoming
+ready and are retried through systemd.
 
 The provisioned NVIDIA capability is durable. A GPU-provisioned machine fails
 and retries pre-start discovery if its devices or driver libraries are

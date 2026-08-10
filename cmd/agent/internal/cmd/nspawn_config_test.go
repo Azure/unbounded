@@ -64,7 +64,7 @@ func TestNSpawnLifecyclePreStartPersistsExactResolvedNVIDIAState(t *testing.T) {
 	resolved := completeNVIDIA("new")
 	root := temporaryRootFS(dir)
 	root.Nvidia = resolved
-	root.NVIDIARequired = true
+	root.Nvidia.Required = true
 
 	var reloaded bool
 
@@ -142,7 +142,7 @@ func TestNSpawnLifecyclePreStartCPUNodeIgnoresAppearingGPU(t *testing.T) {
 
 	got, loadErr := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
 	require.NoError(t, loadErr)
-	require.False(t, got.NVIDIARequired)
+	require.False(t, got.NVIDIA.Required)
 	require.Empty(t, got.NVIDIA.GPUDevicePaths)
 }
 
@@ -216,7 +216,8 @@ func writeAppliedConfig(t *testing.T, dir string) (string, string) {
 func writeLifecycleState(t *testing.T, path string, required bool, nvidia goalstates.NvidiaHost) {
 	t.Helper()
 
-	state := goalstates.NSpawnLifecycleState{Version: goalstates.NSpawnLifecycleStateVersion, MachineName: "kube1", NVIDIARequired: required, NVIDIA: nvidia}
+	nvidia.Required = required
+	state := goalstates.NSpawnLifecycleState{Version: goalstates.NSpawnLifecycleStateVersion, MachineName: "kube1", NVIDIA: nvidia}
 	data, err := json.Marshal(&state)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(path, data, 0o600))
@@ -224,6 +225,7 @@ func writeLifecycleState(t *testing.T, path string, required bool, nvidia goalst
 
 func completeNVIDIA(suffix string) goalstates.NvidiaHost {
 	return goalstates.NvidiaHost{
+		Required:        true,
 		GPUDevicePaths:  []string{"/dev/nvidia0"},
 		ContainerLibDir: "/usr/lib/x86_64-linux-gnu",
 		LibMappings: []goalstates.NvidiaLibMapping{{

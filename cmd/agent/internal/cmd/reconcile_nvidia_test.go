@@ -61,7 +61,7 @@ func TestNSpawnLifecyclePostStartUsesExactPreStartState(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, waited)
 	require.True(t, executed)
-	require.True(t, got.NVIDIARequired)
+	require.True(t, got.Nvidia.Required)
 	require.True(t, got.Containerd.NvidiaRuntime.Enabled)
 	require.Equal(t, want, got.Nvidia)
 }

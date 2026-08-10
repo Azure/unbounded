@@ -77,7 +77,9 @@ func resolveNSpawnConfig(
 		return nil, fmt.Errorf("%w for machine %s: fresh host state is incomplete", ErrNVIDIAStateUnavailable, machineName)
 	}
 
-	if !nvidiaRequired {
+	if nvidiaRequired {
+		nvidia.Required = true
+	} else {
 		nvidia = NvidiaHost{}
 	}
 
@@ -98,7 +100,6 @@ func resolveNSpawnConfig(
 			AdditionalHostDevices: slices.Clone(cfg.AdditionalHostDevices),
 			AdditionalHostMounts:  slices.Clone(cfg.AdditionalHostMounts),
 		},
-		NVIDIARequired:       nvidiaRequired,
 		Nvidia:               nvidia,
 		AMD:                  ResolveAMDHost(),
 		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
@@ -158,12 +159,11 @@ func resolveExistingLifecycle(
 	return &MachineGoalState{
 		RootFS: rootFS,
 		NodeStart: &NodeStart{
-			MachineName:    machineName,
-			MachineDir:     rootFS.MachineDir,
-			Containerd:     ResolveContainerdForNVIDIACapability(cfg.CRI.Containerd.SandboxImage, nvidiaRequired),
-			Kubelet:        Kubelet{KubeletBinPath: filepath.Join("/"+BinDir, "kubelet")},
-			NVIDIARequired: nvidiaRequired,
-			Nvidia:         rootFS.Nvidia,
+			MachineName: machineName,
+			MachineDir:  rootFS.MachineDir,
+			Containerd:  ResolveContainerd(cfg.CRI.Containerd.SandboxImage, nvidiaRequired),
+			Kubelet:     Kubelet{KubeletBinPath: filepath.Join("/"+BinDir, "kubelet")},
+			Nvidia:      rootFS.Nvidia,
 		},
 	}, nil
 }
@@ -269,14 +269,13 @@ func resolveMachine(
 		LocalDNS:               localDNS,
 		Downloads:              downloads,
 		OCIImage:               ociImage,
-		NVIDIARequired:         nspawnConfig.NVIDIARequired,
 		Nvidia:                 nvidia,
 		AMD:                    amd,
 		HostDevices:            nspawnConfig.HostDevices,
 		AdditionalHostMounts:   nspawnConfig.AdditionalHostMounts,
 	}
 
-	containerd := ResolveContainerdForNVIDIACapability(sandboxImage, nspawnConfig.NVIDIARequired)
+	containerd := ResolveContainerd(sandboxImage, nspawnConfig.Nvidia.Required)
 
 	nodeStart := &NodeStart{
 		MachineName:     machineName,
@@ -287,7 +286,6 @@ func resolveMachine(
 		Gantry:          ResolveGantry(cfg.Gantry),
 		Kubelet:         kubelet,
 		LocalDNS:        localDNS,
-		NVIDIARequired:  nspawnConfig.NVIDIARequired,
 		Nvidia:          nvidia,
 	}
 

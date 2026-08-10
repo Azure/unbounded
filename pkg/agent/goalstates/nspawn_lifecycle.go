@@ -21,13 +21,11 @@ const NSpawnLifecycleStateVersion = 1
 var ErrNVIDIAStateUnavailable = errors.New("required NVIDIA host state is unavailable")
 
 // NSpawnLifecycleState is the durable handoff between nspawn pre-start
-// discovery and post-start NVIDIA setup. NVIDIARequired records the capability
-// selected when the machine was provisioned; NVIDIA is the exact host state
-// used to render the current nspawn mounts.
+// discovery and post-start NVIDIA setup. NVIDIA contains both the provisioned
+// capability and the exact host state used to render the current nspawn mounts.
 type NSpawnLifecycleState struct {
 	Version           int               `json:"version"`
 	MachineName       string            `json:"machineName"`
-	NVIDIARequired    bool              `json:"nvidiaRequired"`
 	NVIDIA            NvidiaHost        `json:"nvidia"`
 	NSpawnConfigInput NSpawnConfigInput `json:"nspawnConfigInput"`
 }
@@ -76,7 +74,7 @@ func LoadNSpawnLifecycleState(path, machineName string) (*NSpawnLifecycleState, 
 func LoadOrInferNVIDIACapability(statePath, legacyNVIDIADropInPath, machineName string) (bool, error) {
 	state, err := LoadNSpawnLifecycleState(statePath, machineName)
 	if err == nil {
-		return state.NVIDIARequired, nil
+		return state.NVIDIA.Required, nil
 	}
 
 	if !errors.Is(err, os.ErrNotExist) {
@@ -101,11 +99,11 @@ func (s *NSpawnLifecycleState) Validate(machineName string) error {
 		return fmt.Errorf("nspawn lifecycle state is for machine %q, not %q", s.MachineName, machineName)
 	}
 
-	if s.NVIDIARequired && !NVIDIAStateAvailable(s.NVIDIA) {
+	if s.NVIDIA.Required && !NVIDIAStateAvailable(s.NVIDIA) {
 		return fmt.Errorf("NVIDIA is required but persisted host state is incomplete")
 	}
 
-	if !s.NVIDIARequired && !reflect.DeepEqual(s.NVIDIA, NvidiaHost{}) {
+	if !s.NVIDIA.Required && !reflect.DeepEqual(s.NVIDIA, NvidiaHost{}) {
 		return fmt.Errorf("CPU-provisioned machine contains NVIDIA lifecycle state")
 	}
 

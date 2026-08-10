@@ -163,7 +163,7 @@ func (c *configureContainerd) ensureNVIDIAReadyServiceUnit() error {
 }
 
 func nvidiaSetupEnabled(goalState *goalstates.NodeStart) bool {
-	return goalState.NVIDIARequired
+	return goalState.Nvidia.Required
 }
 
 // ensureGPUDropInConfigs manages GPU-related containerd drop-in configs.

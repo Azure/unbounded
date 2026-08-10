@@ -16,22 +16,28 @@ func TestNSpawnLifecycleStateValidation(t *testing.T) {
 	t.Parallel()
 
 	complete := NvidiaHost{
+		Required:       true,
 		GPUDevicePaths: []string{"/dev/nvidia0"},
 		LibMappings:    []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
 		DriverVersion:  "580.1",
 	}
 
 	require.NoError(t, (&NSpawnLifecycleState{
-		Version:        NSpawnLifecycleStateVersion,
-		MachineName:    "kube1",
-		NVIDIARequired: true,
-		NVIDIA:         complete,
+		Version:     NSpawnLifecycleStateVersion,
+		MachineName: "kube1",
+		NVIDIA:      complete,
 	}).Validate("kube1"))
 
-	err := (&NSpawnLifecycleState{Version: NSpawnLifecycleStateVersion, MachineName: "kube1", NVIDIARequired: true}).Validate("kube1")
+	err := (&NSpawnLifecycleState{
+		Version:     NSpawnLifecycleStateVersion,
+		MachineName: "kube1",
+		NVIDIA:      NvidiaHost{Required: true},
+	}).Validate("kube1")
 	require.ErrorContains(t, err, "incomplete")
 
-	err = (&NSpawnLifecycleState{Version: NSpawnLifecycleStateVersion, MachineName: "kube1", NVIDIA: complete}).Validate("kube1")
+	unexpected := complete
+	unexpected.Required = false
+	err = (&NSpawnLifecycleState{Version: NSpawnLifecycleStateVersion, MachineName: "kube1", NVIDIA: unexpected}).Validate("kube1")
 	require.ErrorContains(t, err, "CPU-provisioned")
 
 	err = (&NSpawnLifecycleState{
@@ -51,10 +57,10 @@ func TestLoadNSpawnLifecycleState(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
 	state := NSpawnLifecycleState{
-		Version:        NSpawnLifecycleStateVersion,
-		MachineName:    "kube1",
-		NVIDIARequired: true,
+		Version:     NSpawnLifecycleStateVersion,
+		MachineName: "kube1",
 		NVIDIA: NvidiaHost{
+			Required:       true,
 			GPUDevicePaths: []string{"/dev/nvidia0"},
 			LibMappings:    []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
 			DriverVersion:  "580.1",
@@ -115,8 +121,8 @@ func TestLoadOrInferNVIDIACapabilityDoesNotReplaceCorruptState(t *testing.T) {
 func TestResolveContainerdUsesProvisionedNVIDIACapability(t *testing.T) {
 	t.Parallel()
 
-	require.False(t, ResolveContainerdForNVIDIACapability("", false).NvidiaRuntime.Enabled)
-	require.True(t, ResolveContainerdForNVIDIACapability("", true).NvidiaRuntime.Enabled)
+	require.False(t, ResolveContainerd("", false).NvidiaRuntime.Enabled)
+	require.True(t, ResolveContainerd("", true).NvidiaRuntime.Enabled)
 }
 
 func TestNSpawnLifecycleStatePath(t *testing.T) {

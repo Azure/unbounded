@@ -64,7 +64,7 @@ func nspawnLifecyclePreStart(
 		cfg = state.NSpawnConfigInput.AgentConfig()
 	}
 
-	rootFS, err := resolve(cfg, machineName, state.NVIDIARequired)
+	rootFS, err := resolve(cfg, machineName, state.NVIDIA.Required)
 	if err != nil {
 		return fmt.Errorf("resolve nspawn config goal state: %w", err)
 	}

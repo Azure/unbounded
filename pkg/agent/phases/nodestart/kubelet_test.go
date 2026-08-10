@@ -190,10 +190,10 @@ func TestConfigureKubeletGatesNVIDIAStartup(t *testing.T) {
 
 	machineDir := t.TempDir()
 	goalState := &goalstates.NodeStart{
-		MachineDir:     machineDir,
-		NodeName:       "worker-1",
-		NVIDIARequired: true,
+		MachineDir: machineDir,
+		NodeName:   "worker-1",
 		Nvidia: goalstates.NvidiaHost{
+			Required:       true,
 			GPUDevicePaths: []string{"/dev/nvidia0"},
 			LibMappings:    []goalstates.NvidiaLibMapping{{HostPath: "/usr/lib/libcuda.so.1"}},
 		},

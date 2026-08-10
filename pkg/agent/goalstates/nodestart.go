@@ -22,9 +22,6 @@ type NodeStart struct {
 	Kubelet    Kubelet
 	LocalDNS   LocalDNS
 
-	// NVIDIARequired is the GPU capability selected during provisioning.
-	NVIDIARequired bool
-
 	// Nvidia holds NVIDIA GPU state discovered on the host. After the nspawn
 	// boots, the setup-nvidia-libraries task uses LibMappings to create
 	// symlinks inside the container's library path pointing into the

@@ -20,7 +20,7 @@ func TestSetupNVIDIAProvisionedCapabilityControlsBehavior(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
 	require.NoError(t, SetupNVIDIA(log, &goalstates.NodeStart{}).Do(context.Background()))
 
-	err := SetupNVIDIA(log, &goalstates.NodeStart{NVIDIARequired: true}).Do(context.Background())
+	err := SetupNVIDIA(log, &goalstates.NodeStart{Nvidia: goalstates.NvidiaHost{Required: true}}).Do(context.Background())
 	require.ErrorContains(t, err, "NVIDIA is required")
 }
 

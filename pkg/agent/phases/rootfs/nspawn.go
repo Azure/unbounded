@@ -161,7 +161,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		NvidiaLibDirMounts:           goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       goalState.Nvidia.I386LibDirMounts,
 		NvidiaBinDir:                 nvidiaHostBinDir(goalState.Nvidia),
-		NvidiaEnabled:                goalState.NVIDIARequired,
+		NvidiaEnabled:                goalState.Nvidia.Required,
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
@@ -230,7 +230,6 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	state := goalstates.NSpawnLifecycleState{
 		Version:           goalstates.NSpawnLifecycleStateVersion,
 		MachineName:       machineName,
-		NVIDIARequired:    goalState.NVIDIARequired,
 		NVIDIA:            goalState.Nvidia,
 		NSpawnConfigInput: goalState.NSpawnConfigInput,
 	}

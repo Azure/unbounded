@@ -38,11 +38,6 @@ type RootFS struct {
 	// NSpawnConfigInput persists the inputs required for pre-start rediscovery.
 	NSpawnConfigInput NSpawnConfigInput
 
-	// NVIDIARequired is the provisioned GPU capability. It remains stable across
-	// lifecycle discovery so transient hardware absence cannot turn a GPU node
-	// into a CPU node, and newly appearing hardware cannot enable a CPU node.
-	NVIDIARequired bool
-
 	// Nvidia holds NVIDIA GPU state discovered on the host: device paths,
 	// driver library mappings, and bind-mount specifications for the nspawn
 	// container. Empty on non-GPU hosts.

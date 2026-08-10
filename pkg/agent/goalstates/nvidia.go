@@ -39,6 +39,10 @@ import (
 // startup: GPU device paths, driver library mappings, and the derived
 // bind-mount specifications for the nspawn container.
 type NvidiaHost struct {
+	// Required records whether NVIDIA capability was selected when the machine
+	// was provisioned. Discovery refreshes must preserve this value.
+	Required bool
+
 	// GPUDevicePaths lists NVIDIA GPU device paths discovered on the host
 	// (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-caps,
 	// /dev/nvidia-caps-imex-channels, /dev/dri/*).

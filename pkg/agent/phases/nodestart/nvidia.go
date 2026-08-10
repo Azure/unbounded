@@ -55,7 +55,7 @@ func SetupNVIDIA(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task 
 func (s *setupNVIDIA) Name() string { return "setup-nvidia" }
 
 func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
-	if !s.goalState.NVIDIARequired {
+	if !s.goalState.Nvidia.Required {
 		s.log.Info("NVIDIA was not provisioned for this machine, skipping")
 
 		return nil

@@ -69,9 +69,9 @@ func TestResolveMachineWithPersistedCPUCapabilityIgnoresAppearingGPU(t *testing.
 		func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
 	)
 	require.NoError(t, err)
-	require.False(t, gs.RootFS.NVIDIARequired)
+	require.False(t, gs.RootFS.Nvidia.Required)
 	require.Empty(t, gs.RootFS.Nvidia.GPUDevicePaths)
-	require.False(t, gs.NodeStart.NVIDIARequired)
+	require.False(t, gs.NodeStart.Nvidia.Required)
 	require.False(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
 	require.Empty(t, gs.NodeStart.Nvidia.GPUDevicePaths)
 }
@@ -107,8 +107,8 @@ func TestResolveExistingLifecycleMigratesLegacyCapability(t *testing.T) {
 			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
 		)
 		require.NoError(t, err)
-		require.True(t, gs.RootFS.NVIDIARequired)
-		require.True(t, gs.NodeStart.NVIDIARequired)
+		require.True(t, gs.RootFS.Nvidia.Required)
+		require.True(t, gs.NodeStart.Nvidia.Required)
 		require.True(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
 	})
 
@@ -122,9 +122,9 @@ func TestResolveExistingLifecycleMigratesLegacyCapability(t *testing.T) {
 			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
 		)
 		require.NoError(t, err)
-		require.False(t, gs.RootFS.NVIDIARequired)
+		require.False(t, gs.RootFS.Nvidia.Required)
 		require.Empty(t, gs.RootFS.Nvidia.GPUDevicePaths)
-		require.False(t, gs.NodeStart.NVIDIARequired)
+		require.False(t, gs.NodeStart.Nvidia.Required)
 		require.False(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
 	})
 }
@@ -132,11 +132,11 @@ func TestResolveExistingLifecycleMigratesLegacyCapability(t *testing.T) {
 func writeResolvedLifecycleState(t *testing.T, required bool, nvidia NvidiaHost) string {
 	t.Helper()
 
+	nvidia.Required = required
 	state := NSpawnLifecycleState{
-		Version:        NSpawnLifecycleStateVersion,
-		MachineName:    NSpawnMachineKube1,
-		NVIDIARequired: required,
-		NVIDIA:         nvidia,
+		Version:     NSpawnLifecycleStateVersion,
+		MachineName: NSpawnMachineKube1,
+		NVIDIA:      nvidia,
 	}
 	data, err := json.Marshal(&state)
 	require.NoError(t, err)

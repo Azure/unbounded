@@ -82,7 +82,7 @@ func nspawnLifecyclePostStart(
 		return err
 	}
 
-	if !state.NVIDIARequired {
+	if !state.NVIDIA.Required {
 		log.Info("NVIDIA was not provisioned for machine; skipping post-start setup", "machine", machineName)
 
 		return nil
@@ -92,13 +92,12 @@ func nspawnLifecyclePostStart(
 		return fmt.Errorf("wait for machine %s: %w", machineName, err)
 	}
 
-	containerd := goalstates.ResolveContainerdForNVIDIACapability("", true)
+	containerd := goalstates.ResolveContainerd("", true)
 	nodeStart := &goalstates.NodeStart{
-		MachineName:    machineName,
-		MachineDir:     "/var/lib/machines/" + machineName,
-		Containerd:     containerd,
-		NVIDIARequired: true,
-		Nvidia:         state.NVIDIA,
+		MachineName: machineName,
+		MachineDir:  "/var/lib/machines/" + machineName,
+		Containerd:  containerd,
+		Nvidia:      state.NVIDIA,
 	}
 
 	if err := executeTask(ctx, log, setupNVIDIA(log, nodeStart)); err != nil {

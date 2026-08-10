@@ -20,7 +20,7 @@ func TestConfigureContainerdWritesGantryHostsConfig(t *testing.T) {
 	machineDir := t.TempDir()
 	goalState := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd(""),
+		Containerd: goalstates.ResolveContainerd("", false),
 	}
 
 	require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
@@ -41,7 +41,7 @@ func TestConfigureContainerdSetsObservabilityDefaults(t *testing.T) {
 	machineDir := t.TempDir()
 	goalState := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd(""),
+		Containerd: goalstates.ResolveContainerd("", false),
 	}
 
 	require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
@@ -60,10 +60,10 @@ func TestConfigureContainerdGatesNVIDIAStartup(t *testing.T) {
 
 	machineDir := t.TempDir()
 	goalState := &goalstates.NodeStart{
-		MachineDir:     machineDir,
-		Containerd:     goalstates.ResolveContainerd(""),
-		NVIDIARequired: true,
+		MachineDir: machineDir,
+		Containerd: goalstates.ResolveContainerd("", false),
 		Nvidia: goalstates.NvidiaHost{
+			Required:       true,
 			GPUDevicePaths: []string{"/dev/nvidia0"},
 			LibMappings:    []goalstates.NvidiaLibMapping{{HostPath: "/usr/lib/libcuda.so.1"}},
 		},
@@ -93,7 +93,7 @@ func TestConfigureContainerdDoesNotGateCPUNodes(t *testing.T) {
 	machineDir := t.TempDir()
 	goalState := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd(""),
+		Containerd: goalstates.ResolveContainerd("", false),
 	}
 
 	require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
@@ -116,7 +116,7 @@ func TestConfigureContainerdUpdatesManagedGantryHostsConfig(t *testing.T) {
 
 	goalState := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd(""),
+		Containerd: goalstates.ResolveContainerd("", false),
 	}
 
 	require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
@@ -138,7 +138,7 @@ func TestConfigureContainerdRefusesUnmanagedGantryHostsConfig(t *testing.T) {
 
 	goalState := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd(""),
+		Containerd: goalstates.ResolveContainerd("", false),
 	}
 
 	err := ConfigureContainerd(goalState).Do(context.Background())
@@ -162,7 +162,7 @@ func TestConfigureContainerdSkipsGantryHostsConfigWhenDisabled(t *testing.T) {
 
 	goalState := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd(""),
+		Containerd: goalstates.ResolveContainerd("", false),
 		Gantry:     goalstates.Gantry{Disabled: true},
 	}
 
@@ -185,7 +185,7 @@ func TestConfigureContainerdLeavesPerRegistryHostsConfig(t *testing.T) {
 
 	goalState := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd(""),
+		Containerd: goalstates.ResolveContainerd("", false),
 	}
 
 	require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
