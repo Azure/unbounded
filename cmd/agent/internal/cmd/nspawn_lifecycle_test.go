@@ -32,23 +32,6 @@ func TestNSpawnLifecycleCommandHasExplicitOperations(t *testing.T) {
 	require.ErrorContains(t, cmd.ExecuteContext(context.Background()), "unknown nspawn machine")
 }
 
-func TestReconcileNSpawnLifecycleRestartsManagedUnit(t *testing.T) {
-	t.Parallel()
-
-	var gotUnit string
-
-	err := reconcileNSpawnLifecycle(
-		context.Background(), testLogger(), "kube1",
-		func(_ context.Context, _ *slog.Logger, unit string) error {
-			gotUnit = unit
-
-			return nil
-		},
-	)
-	require.NoError(t, err)
-	require.Equal(t, "systemd-nspawn@kube1.service", gotUnit)
-}
-
 func TestNSpawnLifecyclePostStartRewiresFreshNVIDIAState(t *testing.T) {
 	t.Parallel()
 

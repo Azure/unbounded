@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
@@ -55,21 +54,8 @@ func newCmdNSpawnLifecyclePhase(
 	}
 }
 
-type restartNSpawnFunc func(context.Context, *slog.Logger, string) error
-
 func runNSpawnLifecycleReconcile(ctx context.Context, log *slog.Logger, machineName string) error {
-	return reconcileNSpawnLifecycle(ctx, log, machineName, func(ctx context.Context, log *slog.Logger, unit string) error {
-		return executil.RunCmd(ctx, log, executil.Systemctl(), "restart", unit)
-	})
-}
-
-func reconcileNSpawnLifecycle(ctx context.Context, log *slog.Logger, machineName string, restart restartNSpawnFunc) error {
-	unit := fmt.Sprintf("systemd-nspawn@%s.service", machineName)
-	if err := restart(ctx, log, unit); err != nil {
-		return fmt.Errorf("reconcile nspawn machine %s: %w", machineName, err)
-	}
-
-	return nil
+	return phases.ExecuteTask(ctx, log, nodestart.ReconcileNSpawnLifecycle(log, machineName))
 }
 
 type (

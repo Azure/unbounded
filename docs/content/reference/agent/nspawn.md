@@ -158,7 +158,8 @@ by a host reboot. On GPU hosts, the post-start hook stops kubelet and containerd
 rewires the driver root and CDI state, then restores both services. Hook failures
 fail the nspawn start and are retried through systemd. On the host,
 `nspawn-lifecycle-helper nspawn-lifecycle reconcile <machine>` triggers both
-steps by restarting the managed nspawn unit.
+steps by restarting the managed nspawn unit. Managed `NodeReboot` operations
+invoke the same reconcile flow.
 
 Each lifecycle refresh discovers NVIDIA devices and driver libraries from the
 current host. Complete GPU discovery enables the NVIDIA runtime and post-start
