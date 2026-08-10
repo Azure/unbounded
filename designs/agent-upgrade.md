@@ -92,6 +92,11 @@ The host-driven command does not:
 - Publish success or failure through Kubernetes.
 
 It reports through command output, its exit status, and daemon service logs.
+It refuses to proceed while the shared AgentUpgrade operation signal exists,
+which covers the interval after a MachineOperation-driven daemon releases its
+process-owned activation lock and before startup publishes success or rollback
+failure.
+
 The command remains named `agent-upgrade` to match the MachineOperation naming
 convention, even though the activation primitive does not enforce semantic
 version ordering and may also be used for reinstall, repair, or downgrade.
@@ -190,6 +195,11 @@ locking, and rollback behavior.
 Pending MachineOperation
         |
         v
+Acquire shared host activation lock
+        |
+        +-- lock busy -----------------------------------> Requeue as Pending
+        |
+        v
 Validate parameters
         |
         +-- missing/invalid HTTP(S) URL -----------------> Failed
@@ -225,6 +235,14 @@ Old process exits, new daemon starts
 ```
 
 ## Staging and switching
+
+The daemon first acquires the same host activation lock used by the direct
+`unbounded-agent agent-upgrade` command. It holds the lock through archive
+staging, link switching, pending signal creation, and the systemd restart
+request. Lock contention leaves the operation Pending and requeues it instead
+of failing it. Process termination during restart releases the lock, while the
+pending signal prevents a direct host activation from entering the remaining
+startup window.
 
 The daemon reads `spec.parameters["downloadURL"]` and the optional
 `spec.parameters["sha256"]` from the `MachineOperation`, resolves the current

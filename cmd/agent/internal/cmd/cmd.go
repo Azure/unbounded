@@ -30,6 +30,7 @@ func Run() {
 		newCmdDaemon(cmdCtx),
 		newCmdReset(cmdCtx),
 		newCmdVersion(),
+		newCmdHostAgentUpgrade(cmdCtx),
 		newCmdRecordAgentUpgradeFailureSignal(),
 	)
 

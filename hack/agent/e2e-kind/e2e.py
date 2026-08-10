@@ -41,6 +41,7 @@ Subcommands (called as individual workflow steps):
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
+    validate-host-agent-upgrade        Verify host-driven upgrade adopts a single-binary deployment.
     validate-agent-upgrade-operation   Verify AgentUpgrade switches the host daemon binary.
     validate-agent-upgrade-rollback    Verify AgentUpgrade rollback restores last-known-good.
     validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
@@ -141,6 +142,9 @@ TEST_NS = "e2e-workload-test"
 UNBOUNDED_NS = "unbounded-system"
 E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
+DAEMON_BINARY = "/usr/local/bin/unbounded-agent"
+DAEMON_BINARY_BLUE = "/usr/local/bin/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = "/usr/local/bin/unbounded-agent-green"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
 BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
@@ -3850,6 +3854,107 @@ def validate_node_reboot_operation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-host-agent-upgrade
+# ---------------------------------------------------------------------------
+def validate_host_agent_upgrade() -> None:
+    """Validate host-driven activation from a single-binary deployment."""
+
+    marker = "e2e-host-agent-upgrade"
+    candidate = VM_DIR / "unbounded-agent-host-upgrade"
+    remote_candidate = "/var/tmp/unbounded-agent-host-upgrade"
+    legacy_copy = "/var/tmp/unbounded-agent-host-upgrade-previous"
+
+    log("Building host-driven agent upgrade candidate...")
+    run([
+        "go", "build",
+        "-ldflags", f"-X github.com/Azure/unbounded/internal/version.Version={marker}",
+        "-o", str(candidate),
+        str(REPO_ROOT / "cmd" / "agent" / "main.go"),
+    ], env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
+    scp_cmd(str(candidate), f"{SSH_TARGET}:{remote_candidate}")
+    ssh_cmd(f"sudo chmod 0755 {remote_candidate}")
+
+    operations_before = {
+        item["metadata"]["name"]
+        for item in json.loads(kubectl_capture([
+            "get", _machine_operation_resource(), "-o", "json",
+        ])).get("items", [])
+    }
+
+    before_current = read_daemon_current_target()
+    if not before_current:
+        die("daemon current binary symlink target was empty before host-driven upgrade")
+
+    log(f"Converting managed layout to an existing single-binary deployment from {before_current}...")
+    ssh_cmd(
+        "set -eu; "
+        f"sudo install -m 0755 {before_current} {legacy_copy}; "
+        f"sudo rm -f {DAEMON_BINARY}; "
+        f"sudo install -m 0755 {legacy_copy} {DAEMON_BINARY}; "
+        f"sudo rm -f {DAEMON_BINARY_CURRENT} {DAEMON_BINARY_LAST_GOOD} "
+        f"{DAEMON_BINARY_BLUE} {DAEMON_BINARY_GREEN}"
+    )
+    legacy_digest = ssh_capture(f"sudo sha256sum {DAEMON_BINARY} | awk '{{print $1}}'").strip()
+
+    log("Running host-driven agent upgrade preflight...")
+    preflight = ssh_capture(f"sudo {remote_candidate} agent-upgrade --preflight")
+    for expected in (
+        "Agent upgrade mode: host-driven",
+        "Kubernetes MachineOperation: not created",
+        "Initialize managed layout: true",
+        "Preflight: no changes applied",
+    ):
+        if expected not in preflight:
+            die(f"host-driven preflight output missing {expected!r}: {preflight!r}")
+
+    ssh_cmd(
+        "set -eu; "
+        f"test -f {DAEMON_BINARY}; test ! -L {DAEMON_BINARY}; "
+        f"test ! -e {DAEMON_BINARY_CURRENT}; test ! -L {DAEMON_BINARY_CURRENT}; "
+        f"test ! -e {DAEMON_BINARY_LAST_GOOD}; test ! -L {DAEMON_BINARY_LAST_GOOD}; "
+        f"test ! -e {DAEMON_BINARY_BLUE}; test ! -e {DAEMON_BINARY_GREEN}"
+    )
+
+    log("Applying host-driven agent upgrade...")
+    activation = ssh_capture(f"sudo {remote_candidate} agent-upgrade")
+    if "activated host agent daemon" not in activation:
+        die(f"unexpected host-driven activation output: {activation!r}")
+
+    wait_for_daemon_active()
+    after_current = read_daemon_current_target()
+    last_good = read_daemon_last_good_target()
+    if after_current != DAEMON_BINARY_GREEN:
+        die(f"host-driven current target mismatch: got {after_current!r}, expected {DAEMON_BINARY_GREEN!r}")
+    if last_good != DAEMON_BINARY_BLUE:
+        die(f"host-driven last-good target mismatch: got {last_good!r}, expected {DAEMON_BINARY_BLUE!r}")
+
+    preserved_digest = ssh_capture(f"sudo sha256sum {DAEMON_BINARY_BLUE} | awk '{{print $1}}'").strip()
+    if preserved_digest != legacy_digest:
+        die(f"host-driven activation did not preserve the previous binary: {preserved_digest!r} != {legacy_digest!r}")
+
+    version_output = ssh_capture(f"sudo {DAEMON_BINARY_CURRENT} version")
+    if marker not in version_output:
+        die(f"activated host daemon does not contain candidate version marker: {version_output!r}")
+
+    operations_after = {
+        item["metadata"]["name"]
+        for item in json.loads(kubectl_capture([
+            "get", _machine_operation_resource(), "-o", "json",
+        ])).get("items", [])
+    }
+    if operations_after != operations_before:
+        die(
+            "host-driven activation unexpectedly changed MachineOperations: "
+            f"before={sorted(operations_before)!r}, after={sorted(operations_after)!r}"
+        )
+
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+    log("============================================")
+    log("  Host-driven agent upgrade validation PASSED")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # validate-agent-upgrade-operation
 # ---------------------------------------------------------------------------
 def validate_agent_upgrade_operation() -> None:
@@ -4325,6 +4430,7 @@ COMMANDS: dict[str, Command] = {
     "delete-machine-cr": _without_node_config(delete_machine_cr),
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
+    "validate-host-agent-upgrade": _without_node_config(validate_host_agent_upgrade),
     "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
