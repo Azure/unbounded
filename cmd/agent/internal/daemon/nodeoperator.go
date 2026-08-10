@@ -37,6 +37,9 @@ type nodeOperator interface {
 	// FindActiveMachine returns the currently active nspawn machine and its
 	// applied agent configuration.
 	FindActiveMachine(*slog.Logger) (*ActiveMachine, error)
+	// EnsureLifecycleMigration installs lifecycle hooks for the active machine
+	// without restarting its currently running services.
+	EnsureLifecycleMigration(context.Context, *slog.Logger, *ActiveMachine) error
 	// RestartNode restarts the provided active nspawn-backed node in place.
 	RestartNode(context.Context, *slog.Logger, *ActiveMachine) error
 	// ResetAgentResources removes the unbounded-agent and associated resources
@@ -181,6 +184,29 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 
 func gantryDisabled(cfg *provision.AgentConfig) bool {
 	return cfg.Gantry != nil && cfg.Gantry.Disabled
+}
+
+func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	gs, err := goalstates.ResolveExistingLifecycle(active.Config, active.Name)
+	if err != nil {
+		return fmt.Errorf("resolve existing machine lifecycle: %w", err)
+	}
+
+	if err := phases.Serial(
+		log,
+		rootfs.EnsureNSpawnConfig(log, gs.RootFS),
+		nodestart.EnsureNSpawnLifecycleUnits(gs.NodeStart),
+	).Do(ctx); err != nil {
+		return fmt.Errorf("write existing machine lifecycle: %w", err)
+	}
+
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "daemon-reload"); err != nil {
+		return fmt.Errorf("reload host systemd after lifecycle migration: %w", err)
+	}
+
+	log.Info("nspawn lifecycle configuration reconciled", "machine", active.Name)
+
+	return nil
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {

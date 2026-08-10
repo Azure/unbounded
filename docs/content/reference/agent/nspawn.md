@@ -168,6 +168,13 @@ NVIDIA hardware later appears. The exact NVIDIA state used to render nspawn
 mounts is persisted for the post-start setup hook, preventing the two phases
 from discovering different paths.
 
+When an upgraded daemon starts for a machine created by an older agent, it
+idempotently installs the host lifecycle hooks and the on-disk containerd and
+kubelet readiness units without restarting the running machine or its services.
+Legacy NVIDIA capability is inferred from the agent-managed NVIDIA containerd
+drop-in. The daemon retries migration while required GPU state is temporarily
+unavailable; corrupt lifecycle state remains a hard failure.
+
 The configuration is written to these files on the host before the machine boots:
 
 | File | Path |

@@ -5,6 +5,7 @@ package goalstates
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,10 @@ import (
 )
 
 const NSpawnLifecycleStateVersion = 1
+
+// ErrNVIDIAStateUnavailable indicates that a provisioned GPU machine cannot
+// currently resolve the complete host state needed for safe startup.
+var ErrNVIDIAStateUnavailable = errors.New("required NVIDIA host state is unavailable")
 
 // NSpawnLifecycleState is the durable handoff between nspawn pre-start
 // discovery and post-start NVIDIA setup. NVIDIARequired records the capability
@@ -47,6 +52,29 @@ func LoadNSpawnLifecycleState(path, machineName string) (*NSpawnLifecycleState, 
 	return &state, nil
 }
 
+// LoadOrInferNVIDIACapability loads an existing lifecycle state. Only when the
+// state file is absent does it infer a legacy machine's capability from the
+// managed NVIDIA containerd drop-in. Corrupt or mismatched state is never
+// replaced by inference.
+func LoadOrInferNVIDIACapability(statePath, legacyNVIDIADropInPath, machineName string) (bool, error) {
+	state, err := LoadNSpawnLifecycleState(statePath, machineName)
+	if err == nil {
+		return state.NVIDIARequired, nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+
+	if _, err := os.Stat(legacyNVIDIADropInPath); err == nil {
+		return true, nil
+	} else if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else {
+		return false, fmt.Errorf("inspect legacy NVIDIA capability %s: %w", legacyNVIDIADropInPath, err)
+	}
+}
+
 func (s *NSpawnLifecycleState) Validate(machineName string) error {
 	if s.Version != NSpawnLifecycleStateVersion {
 		return fmt.Errorf("unsupported nspawn lifecycle state version %d", s.Version)
@@ -57,7 +85,7 @@ func (s *NSpawnLifecycleState) Validate(machineName string) error {
 	}
 
 	if s.NVIDIARequired && !NVIDIAStateAvailable(s.NVIDIA) {
-		return fmt.Errorf("NVIDIA is required but resolved host state is incomplete")
+		return fmt.Errorf("NVIDIA is required but persisted host state is incomplete")
 	}
 
 	if !s.NVIDIARequired && !reflect.DeepEqual(s.NVIDIA, NvidiaHost{}) {

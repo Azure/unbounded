@@ -32,6 +32,9 @@ type fakeNodeOperator struct {
 	active  *ActiveMachine
 	findErr error
 
+	lifecycleCalls int
+	lifecycleErrs  []error
+
 	restartCalled bool
 	restartActive *ActiveMachine
 	restartErr    error
@@ -61,6 +64,18 @@ func (op *fakeNodeOperator) FindActiveMachine(*slog.Logger) (*ActiveMachine, err
 	}
 
 	return op.active, nil
+}
+
+func (op *fakeNodeOperator) EnsureLifecycleMigration(context.Context, *slog.Logger, *ActiveMachine) error {
+	op.lifecycleCalls++
+	if len(op.lifecycleErrs) == 0 {
+		return nil
+	}
+
+	err := op.lifecycleErrs[0]
+	op.lifecycleErrs = op.lifecycleErrs[1:]
+
+	return err
 }
 
 func (op *fakeNodeOperator) RestartNode(_ context.Context, _ *slog.Logger, active *ActiveMachine) error {

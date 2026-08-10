@@ -173,6 +173,7 @@ const (
 	NVIDIAReadyPath            = "/run/unbounded/nvidia-ready"
 	ContainerdConfigPath       = "/etc/containerd/config.toml"
 	ContainerdConfDropInDir    = "/etc/containerd/conf.d"
+	NvidiaRuntimeDropInPath    = ContainerdConfDropInDir + "/99-nvidia-runtime.toml"
 	ContainerdCertsDir         = "/etc/containerd/certs.d"
 	ContainerdDefaultHostsDir  = ContainerdCertsDir + "/_default"
 	ContainerdDefaultHostsPath = ContainerdDefaultHostsDir + "/hosts.toml"

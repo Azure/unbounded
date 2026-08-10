@@ -73,6 +73,45 @@ func TestLoadNSpawnLifecycleState(t *testing.T) {
 	require.ErrorContains(t, err, "decode nspawn lifecycle state")
 }
 
+func TestLoadOrInferNVIDIACapabilityLegacyMigration(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "missing-state.json")
+	legacyDropIn := filepath.Join(dir, "99-nvidia-runtime.toml")
+
+	required, err := LoadOrInferNVIDIACapability(statePath, legacyDropIn, "kube1")
+	require.NoError(t, err)
+	require.False(t, required)
+
+	require.NoError(t, os.WriteFile(legacyDropIn, []byte("managed"), 0o600))
+	required, err = LoadOrInferNVIDIACapability(statePath, legacyDropIn, "kube1")
+	require.NoError(t, err)
+	require.True(t, required)
+}
+
+func TestLoadOrInferNVIDIACapabilityDoesNotReplaceCorruptState(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	legacyDropIn := filepath.Join(dir, "99-nvidia-runtime.toml")
+
+	require.NoError(t, os.WriteFile(statePath, []byte("{"), 0o600))
+	require.NoError(t, os.WriteFile(legacyDropIn, []byte("managed"), 0o600))
+
+	_, err := LoadOrInferNVIDIACapability(statePath, legacyDropIn, "kube1")
+	require.ErrorContains(t, err, "decode nspawn lifecycle state")
+
+	state := NSpawnLifecycleState{Version: NSpawnLifecycleStateVersion, MachineName: "kube2"}
+	data, err := json.Marshal(&state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(statePath, data, 0o600))
+
+	_, err = LoadOrInferNVIDIACapability(statePath, legacyDropIn, "kube1")
+	require.ErrorContains(t, err, "not \"kube1\"")
+}
+
 func TestResolveContainerdUsesProvisionedNVIDIACapability(t *testing.T) {
 	t.Parallel()
 

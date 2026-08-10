@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -94,6 +95,10 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		"applied_version", active.Config.Cluster.Version,
 	)
 
+	if err := ensureLifecycleMigration(ctx, log, runOpts.NodeOperator, active, 10*time.Second); err != nil {
+		return fmt.Errorf("ensure nspawn lifecycle migration: %w", err)
+	}
+
 	controllerCfg, stopControllerCreds, err := daemonControllerCredentials(ctx, log, active.Config, runOpts)
 	if err != nil {
 		return fmt.Errorf("build daemon controller credentials: %w", err)
@@ -121,6 +126,40 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 	}
 
 	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator)
+}
+
+func ensureLifecycleMigration(
+	ctx context.Context,
+	log *slog.Logger,
+	nodeOperator nodeOperator,
+	active *ActiveMachine,
+	retryInterval time.Duration,
+) error {
+	for {
+		err := nodeOperator.EnsureLifecycleMigration(ctx, log, active)
+		if err == nil {
+			return nil
+		}
+
+		if !errors.Is(err, goalstates.ErrNVIDIAStateUnavailable) {
+			return err
+		}
+
+		log.Warn("NVIDIA state unavailable during lifecycle migration; retrying",
+			"machine", active.Name,
+			"retry_after", retryInterval,
+			"error", err,
+		)
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return fmt.Errorf("wait to retry lifecycle migration: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func daemonControllerCredentials(

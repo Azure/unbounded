@@ -77,7 +77,7 @@ func resolveNSpawnConfig(
 	}
 
 	if nvidiaRequired && !NVIDIAStateAvailable(nvidia) {
-		return nil, fmt.Errorf("NVIDIA is required for machine %s but fresh host state is incomplete", machineName)
+		return nil, fmt.Errorf("%w for machine %s: fresh host state is incomplete", ErrNVIDIAStateUnavailable, machineName)
 	}
 
 	if !nvidiaRequired {
@@ -127,6 +127,50 @@ func ResolveExistingMachine(log *slog.Logger, cfg *config.AgentConfig, machineNa
 	)
 }
 
+// ResolveExistingLifecycle resolves only the host and in-machine state needed
+// to migrate lifecycle hooks for an already provisioned machine.
+func ResolveExistingLifecycle(cfg *config.AgentConfig, machineName string) (*MachineGoalState, error) {
+	return resolveExistingLifecycle(
+		cfg,
+		machineName,
+		NSpawnLifecycleStatePath(machineName),
+		legacyNVIDIADropInPath(machineName),
+		ResolveNvidiaHost,
+	)
+}
+
+func resolveExistingLifecycle(
+	cfg *config.AgentConfig,
+	machineName, lifecycleStatePath, legacyDropInPath string,
+	resolveNVIDIA resolveNVIDIAHostFunc,
+) (*MachineGoalState, error) {
+	nvidiaRequired, err := LoadOrInferNVIDIACapability(lifecycleStatePath, legacyDropInPath, machineName)
+	if err != nil {
+		return nil, err
+	}
+
+	rootFS, err := resolveNSpawnConfig(cfg, machineName, &nvidiaRequired, resolveNVIDIA)
+	if err != nil {
+		return nil, err
+	}
+
+	return &MachineGoalState{
+		RootFS: rootFS,
+		NodeStart: &NodeStart{
+			MachineName:    machineName,
+			MachineDir:     rootFS.MachineDir,
+			Containerd:     ResolveContainerdForNVIDIACapability(cfg.CRI.Containerd.SandboxImage, nvidiaRequired),
+			Kubelet:        Kubelet{KubeletBinPath: filepath.Join("/"+BinDir, "kubelet")},
+			NVIDIARequired: nvidiaRequired,
+			Nvidia:         rootFS.Nvidia,
+		},
+	}, nil
+}
+
+func legacyNVIDIADropInPath(machineName string) string {
+	return filepath.Join("/var/lib/machines", machineName, strings.TrimPrefix(NvidiaRuntimeDropInPath, "/"))
+}
+
 func resolveExistingMachine(
 	log *slog.Logger,
 	cfg *config.AgentConfig,
@@ -135,12 +179,16 @@ func resolveExistingMachine(
 	lifecycleStatePath string,
 	resolveNVIDIA resolveNVIDIAHostFunc,
 ) (*MachineGoalState, error) {
-	state, err := LoadNSpawnLifecycleState(lifecycleStatePath, machineName)
+	nvidiaRequired, err := LoadOrInferNVIDIACapability(
+		lifecycleStatePath,
+		legacyNVIDIADropInPath(machineName),
+		machineName,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	return resolveMachine(log, cfg, machineName, downloads, &state.NVIDIARequired, resolveNVIDIA)
+	return resolveMachine(log, cfg, machineName, downloads, &nvidiaRequired, resolveNVIDIA)
 }
 
 func resolveMachine(
