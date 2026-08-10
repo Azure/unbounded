@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -19,6 +20,8 @@ import (
 // ErrActivationInProgress indicates that another host agent activation owns
 // the shared activation lock.
 var ErrActivationInProgress = errors.New("host agent activation is already in progress")
+
+const activationRollbackTimeout = time.Minute
 
 // ActivationOptions configures a host-driven daemon binary activation.
 type ActivationOptions struct {
@@ -60,6 +63,7 @@ type ActivationPlan struct {
 	InitializeLayout bool
 	CandidateChanged bool
 	RepairLastGood   bool
+	UpdateLastGood   bool
 	Service          ServicePlan
 	Actions          []string
 
@@ -85,13 +89,13 @@ func ActivateHostDaemon(
 	opts ActivationOptions,
 	service DaemonService,
 ) (ActivationResult, error) {
-	log.Debug("host agent activation step", "step", "validate-options")
+	log.Debug("validating host agent activation options")
 
 	if err := validateActivationOptions(opts); err != nil {
 		return ActivationResult{}, err
 	}
 
-	log.Debug("host agent activation step", "step", "acquire-lock", "path", opts.LockPath)
+	log.Debug("acquiring host agent activation lock", "path", opts.LockPath)
 
 	lock, err := AcquireHostActivationLock(opts.LockPath)
 	if err != nil {
@@ -99,33 +103,44 @@ func ActivateHostDaemon(
 	}
 
 	defer func() {
-		log.Debug("host agent activation step", "step", "release-lock", "path", opts.LockPath)
+		log.Debug("releasing host agent activation lock", "path", opts.LockPath)
 
 		if err := lock.Close(); err != nil {
 			log.Warn("failed to release host agent activation lock", "error", err)
 		}
 	}()
 
-	log.Debug("host agent activation step", "step", "preflight")
-
-	plan, err := PreflightHostDaemonActivation(ctx, opts, service)
-	if err != nil {
-		return ActivationResult{}, err
-	}
-
-	log.Debug("host agent activation step", "step", "verify-candidate", "path", plan.CandidatePath)
-
-	if err := Verify(ctx, plan.CandidatePath); err != nil {
-		return ActivationResult{}, fmt.Errorf("verify candidate agent binary: %w", err)
-	}
-
 	mode := opts.BinaryMode
 	if mode == 0 {
 		mode = daemonBinaryMode
 	}
 
+	log.Debug("snapshotting host agent activation candidate", "path", opts.CandidatePath)
+
+	candidateSnapshot, removeCandidateSnapshot, err := snapshotActivationCandidate(opts.CandidatePath, mode)
+	if err != nil {
+		return ActivationResult{}, err
+	}
+	defer removeCandidateSnapshot()
+
+	activationOpts := opts
+	activationOpts.CandidatePath = candidateSnapshot
+
+	log.Debug("running host agent activation preflight")
+
+	plan, err := PreflightHostDaemonActivation(ctx, activationOpts, service)
+	if err != nil {
+		return ActivationResult{}, err
+	}
+
+	log.Debug("verifying host agent activation candidate", "path", plan.CandidatePath)
+
+	if err := Verify(ctx, plan.CandidatePath); err != nil {
+		return ActivationResult{}, fmt.Errorf("verify candidate agent binary: %w", err)
+	}
+
 	if plan.InitializeLayout {
-		log.Debug("host agent activation step", "step", "initialize-layout", "active", plan.ActivePath, "target", opts.Layout.BluePath)
+		log.Debug("initializing host agent binary layout", "active", plan.ActivePath, "target", opts.Layout.BluePath)
 
 		if err := installFromFile(plan.ActivePath, opts.Layout.BluePath, mode); err != nil {
 			return ActivationResult{}, fmt.Errorf("preserve active agent binary: %w", err)
@@ -142,36 +157,36 @@ func ActivateHostDaemon(
 
 		lastGoodProtected = protected
 		if protected {
-			log.Debug("host agent activation step", "step", "protect-last-good", "target", plan.RollbackPath)
+			log.Debug("protecting last-good host agent binary", "target", plan.RollbackPath)
 
 			if err := utilio.UpdateSymlink(opts.Layout.LastGoodPath, plan.RollbackPath); err != nil {
 				return ActivationResult{}, fmt.Errorf("protect active agent as last-good: %w", err)
 			}
 		}
 
-		log.Debug("host agent activation step", "step", "install-candidate", "source", plan.CandidatePath, "target", plan.TargetPath)
+		log.Debug("installing host agent activation candidate", "source", plan.CandidatePath, "target", plan.TargetPath)
 
 		if err := installFromFile(plan.CandidatePath, plan.TargetPath, mode); err != nil {
 			return ActivationResult{}, fmt.Errorf("install candidate agent binary: %w", err)
 		}
 
-		log.Debug("host agent activation step", "step", "verify-installed-candidate", "path", plan.TargetPath)
+		log.Debug("verifying installed host agent candidate", "path", plan.TargetPath)
 
 		if err := Verify(ctx, plan.TargetPath); err != nil {
 			return ActivationResult{}, fmt.Errorf("verify installed candidate agent binary: %w", err)
 		}
 	}
 
-	log.Debug("host agent activation step", "step", "prepare-service", "current", opts.Layout.CurrentPath)
+	log.Debug("preparing host agent daemon service", "current", opts.Layout.CurrentPath)
 
 	if err := service.Prepare(ctx, opts.Layout.CurrentPath); err != nil {
 		return ActivationResult{}, fmt.Errorf("prepare daemon service: %w", err)
 	}
 
-	log.Debug("host agent activation step", "step", "switch-links", "current", plan.TargetPath, "last_good", plan.RollbackPath)
+	log.Debug("switching host agent binary links", "current", plan.TargetPath, "last_good", plan.RollbackPath)
 
 	if err := switchActivationLinks(opts.Layout, plan); err != nil {
-		log.Debug("host agent activation step", "step", "restore-links-after-switch-failure")
+		log.Debug("restoring host agent binary links after switch failure")
 
 		currentRollbackErr := utilio.UpdateSymlink(opts.Layout.CurrentPath, plan.RollbackPath)
 		if currentRollbackErr != nil {
@@ -193,29 +208,29 @@ func ActivateHostDaemon(
 		Changed:      plan.CandidateChanged,
 	}
 
-	log.Debug("host agent activation step", "step", "reload-service-manager")
+	log.Debug("reloading host agent service manager")
 
 	if err := service.Reload(ctx); err != nil {
-		result.RolledBack = true
 		rollbackErr := rollbackHostActivation(ctx, log, opts.Layout, plan, service)
+		result.RolledBack = rollbackErr == nil
 
 		return result, errors.Join(fmt.Errorf("reload daemon service: %w", err), rollbackErr)
 	}
 
-	log.Debug("host agent activation step", "step", "restart-service")
+	log.Debug("restarting host agent daemon service")
 
 	if err := service.Restart(ctx); err != nil {
-		result.RolledBack = true
 		rollbackErr := rollbackHostActivation(ctx, log, opts.Layout, plan, service)
+		result.RolledBack = rollbackErr == nil
 
 		return result, errors.Join(fmt.Errorf("restart daemon service: %w", err), rollbackErr)
 	}
 
-	log.Debug("host agent activation step", "step", "wait-for-health", "expected", plan.TargetPath)
+	log.Debug("waiting for activated host agent health", "expected", plan.TargetPath)
 
 	if err := service.WaitHealthy(ctx, plan.TargetPath); err != nil {
-		result.RolledBack = true
 		rollbackErr := rollbackHostActivation(ctx, log, opts.Layout, plan, service)
+		result.RolledBack = rollbackErr == nil
 
 		return result, errors.Join(fmt.Errorf("wait for activated daemon health: %w", err), rollbackErr)
 	}
@@ -230,8 +245,51 @@ func ActivateHostDaemon(
 	return result, nil
 }
 
+func snapshotActivationCandidate(sourcePath string, mode os.FileMode) (snapshotPath string, cleanup func(), retErr error) {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return "", nil, fmt.Errorf("open host agent activation candidate: %w", err)
+	}
+
+	var snapshotDir string
+
+	defer func() {
+		if retErr != nil && snapshotDir != "" {
+			os.RemoveAll(snapshotDir) //nolint:errcheck // preserve the snapshot error
+		}
+	}()
+	defer func() {
+		if err := source.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close host agent activation candidate: %w", err))
+		}
+	}()
+
+	info, err := source.Stat()
+	if err != nil {
+		return "", nil, fmt.Errorf("stat host agent activation candidate: %w", err)
+	}
+
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", nil, fmt.Errorf("host agent activation candidate is not a regular executable file")
+	}
+
+	snapshotDir, err = os.MkdirTemp("", "host-agent-activation-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create private host agent activation directory: %w", err)
+	}
+
+	snapshotPath = filepath.Join(snapshotDir, "candidate")
+	if err := utilio.InstallFile(snapshotPath, source, mode); err != nil {
+		return "", nil, fmt.Errorf("snapshot host agent activation candidate: %w", err)
+	}
+
+	return snapshotPath, func() {
+		os.RemoveAll(snapshotDir) //nolint:errcheck // best effort private snapshot cleanup
+	}, nil
+}
+
 func switchActivationLinks(layout Layout, plan ActivationPlan) error {
-	if plan.InitializeLayout || plan.CandidateChanged || plan.RepairLastGood {
+	if plan.UpdateLastGood {
 		if err := utilio.UpdateSymlink(layout.LastGoodPath, plan.RollbackPath); err != nil {
 			return fmt.Errorf("update last-good agent symlink: %w", err)
 		}
@@ -269,21 +327,24 @@ func restoreLastGoodSymlink(path string, plan ActivationPlan) error {
 }
 
 func rollbackHostActivation(ctx context.Context, log *slog.Logger, layout Layout, plan ActivationPlan, service DaemonService) error {
-	log.Debug("host agent activation rollback step", "step", "restore-current-link", "target", plan.RollbackPath)
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), activationRollbackTimeout)
+	defer cancel()
+
+	log.Debug("restoring previous host agent binary link", "target", plan.RollbackPath)
 
 	if err := utilio.UpdateSymlink(layout.CurrentPath, plan.RollbackPath); err != nil {
 		return fmt.Errorf("roll back current agent symlink: %w", err)
 	}
 
-	log.Debug("host agent activation rollback step", "step", "restart-service")
+	log.Debug("restarting rolled-back host agent service")
 
-	if err := service.Restart(ctx); err != nil {
+	if err := service.Restart(rollbackCtx); err != nil {
 		return fmt.Errorf("restart rolled-back daemon service: %w", err)
 	}
 
-	log.Debug("host agent activation rollback step", "step", "wait-for-health", "expected", plan.RollbackPath)
+	log.Debug("waiting for rolled-back host agent health", "expected", plan.RollbackPath)
 
-	if err := service.WaitHealthy(ctx, plan.RollbackPath); err != nil {
+	if err := service.WaitHealthy(rollbackCtx, plan.RollbackPath); err != nil {
 		return fmt.Errorf("wait for rolled-back daemon health: %w", err)
 	}
 

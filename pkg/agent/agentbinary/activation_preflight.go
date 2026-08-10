@@ -79,6 +79,30 @@ func PreflightHostDaemonActivation(
 		}
 	}
 
+	targetAliasesActive, err := pathResolvesTo(plan.TargetPath, currentPath)
+	if err != nil {
+		return ActivationPlan{}, fmt.Errorf("resolve selected target agent binary: %w", err)
+	}
+
+	if targetAliasesActive && plan.CandidateChanged {
+		return ActivationPlan{}, fmt.Errorf("selected target agent binary %s resolves to active binary %s", plan.TargetPath, currentPath)
+	}
+
+	for _, destination := range []struct {
+		role string
+		path string
+	}{
+		{role: "binary compatibility path", path: opts.Layout.BinaryPath},
+		{role: "blue slot", path: opts.Layout.BluePath},
+		{role: "green slot", path: opts.Layout.GreenPath},
+		{role: "current link", path: opts.Layout.CurrentPath},
+		{role: "last-good link", path: opts.Layout.LastGoodPath},
+	} {
+		if err := validateReplaceableActivationPath(destination.path); err != nil {
+			return ActivationPlan{}, fmt.Errorf("validate %s: %w", destination.role, err)
+		}
+	}
+
 	lastGoodExists, lastGoodTarget, err := readSymlinkState(opts.Layout.LastGoodPath)
 	if err != nil {
 		return ActivationPlan{}, fmt.Errorf("inspect last-good agent symlink: %w", err)
@@ -94,6 +118,8 @@ func PreflightHostDaemonActivation(
 			return ActivationPlan{}, fmt.Errorf("resolve last-good agent binary: %w", err)
 		}
 	}
+
+	plan.UpdateLastGood = plan.InitializeLayout || plan.CandidateChanged || plan.RepairLastGood
 
 	servicePlan, err := service.Preflight(ctx, opts.Layout.CurrentPath)
 	if err != nil {
@@ -195,6 +221,27 @@ func activationActions(plan ActivationPlan, layout Layout) []string {
 		"wait for daemon health",
 		"roll back to "+plan.RollbackPath+" if activation fails",
 	)
+}
+
+func validateReplaceableActivationPath(path string) error {
+	if path == "" {
+		return nil
+	}
+
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+
+	return fmt.Errorf("%s is not a replaceable regular file or symlink", path)
 }
 
 func readSymlinkState(path string) (bool, string, error) {

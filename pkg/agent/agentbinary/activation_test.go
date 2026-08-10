@@ -4,7 +4,6 @@
 package agentbinary
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -18,12 +17,15 @@ import (
 )
 
 type fakeDaemonService struct {
-	plan          ServicePlan
-	prepared      []string
-	reloads       int
-	restarts      int
-	healthTargets []string
-	failHealthFor string
+	plan                  ServicePlan
+	prepared              []string
+	reloads               int
+	restarts              int
+	restartErr            error
+	restartContextErrors  []error
+	healthTargets         []string
+	failHealthFor         string
+	healthFailureCallback func()
 }
 
 func (s *fakeDaemonService) Preflight(context.Context, string) (ServicePlan, error) {
@@ -40,18 +42,41 @@ func (s *fakeDaemonService) Reload(context.Context) error {
 	return nil
 }
 
-func (s *fakeDaemonService) Restart(context.Context) error {
+func (s *fakeDaemonService) Restart(ctx context.Context) error {
 	s.restarts++
-	return nil
+	s.restartContextErrors = append(s.restartContextErrors, ctx.Err())
+
+	return s.restartErr
 }
 
 func (s *fakeDaemonService) WaitHealthy(_ context.Context, target string) error {
 	s.healthTargets = append(s.healthTargets, target)
 	if target == s.failHealthFor {
+		if s.healthFailureCallback != nil {
+			s.healthFailureCallback()
+		}
+
 		return errors.New("candidate unhealthy")
 	}
 
 	return nil
+}
+
+func TestSnapshotActivationCandidatePinsOpenedContent(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "candidate")
+	original := []byte("#!/bin/sh\nexit 0\n")
+	replacement := []byte("#!/bin/sh\nexit 42\n")
+
+	require.NoError(t, os.WriteFile(sourcePath, original, 0o755))
+
+	snapshotPath, cleanup, err := snapshotActivationCandidate(sourcePath, 0o755)
+	require.NoError(t, err)
+
+	defer cleanup()
+
+	require.NoError(t, os.WriteFile(sourcePath, replacement, 0o755))
+	assert.Equal(t, original, mustReadFile(t, snapshotPath))
 }
 
 func TestAcquireHostActivationLockSerializesCallers(t *testing.T) {
@@ -98,6 +123,7 @@ func TestPreflightHostDaemonActivationInitialLayoutDoesNotMutate(t *testing.T) {
 	assert.Equal(t, layout.CurrentPath, plan.CurrentLinkPath)
 	assert.Equal(t, layout.LastGoodPath, plan.LastGoodLinkPath)
 	assert.True(t, plan.Service.UpdateRequired)
+	assert.True(t, plan.UpdateLastGood)
 
 	for _, path := range []string{layout.BluePath, layout.GreenPath, layout.CurrentPath, layout.LastGoodPath, filepath.Join(dir, "activation.lock")} {
 		_, err := os.Lstat(path)
@@ -119,6 +145,27 @@ func TestPreflightHostDaemonActivationRejectsUnstagedCandidate(t *testing.T) {
 	assert.Contains(t, err.Error(), "staged separately")
 }
 
+func TestPreflightHostDaemonActivationRejectsAliasedTargetSlot(t *testing.T) {
+	dir := t.TempDir()
+	layout := testActivationLayout(dir)
+	writeExecutable(t, layout.GreenPath, "#!/bin/sh\nexit 0\n")
+	require.NoError(t, os.Symlink(layout.GreenPath, layout.BluePath))
+	require.NoError(t, os.Symlink(layout.BluePath, layout.CurrentPath))
+	require.NoError(t, os.Symlink(layout.GreenPath, layout.LastGoodPath))
+	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
+
+	candidatePath := filepath.Join(dir, "candidate")
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
+
+	_, err := PreflightHostDaemonActivation(context.Background(), ActivationOptions{
+		Layout:        layout,
+		CandidatePath: candidatePath,
+		LockPath:      filepath.Join(dir, "activation.lock"),
+	}, &fakeDaemonService{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolves to active binary")
+}
+
 func TestActivateHostDaemonInitializesAndActivatesCandidate(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
@@ -131,11 +178,7 @@ func TestActivateHostDaemonInitializesAndActivatesCandidate(t *testing.T) {
 	require.NoError(t, os.WriteFile(candidatePath, candidate, 0o755))
 
 	service := &fakeDaemonService{}
-
-	var logs bytes.Buffer
-
-	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	result, err := ActivateHostDaemon(context.Background(), log, ActivationOptions{
+	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
 		Layout:        layout,
 		CandidatePath: candidatePath,
 		LockPath:      filepath.Join(dir, "activation.lock"),
@@ -153,24 +196,6 @@ func TestActivateHostDaemonInitializesAndActivatesCandidate(t *testing.T) {
 	assert.Equal(t, 1, service.reloads)
 	assert.Equal(t, 1, service.restarts)
 	assert.Equal(t, []string{layout.GreenPath}, service.healthTargets)
-
-	for _, step := range []string{
-		"validate-options",
-		"acquire-lock",
-		"preflight",
-		"verify-candidate",
-		"initialize-layout",
-		"install-candidate",
-		"verify-installed-candidate",
-		"prepare-service",
-		"switch-links",
-		"reload-service-manager",
-		"restart-service",
-		"wait-for-health",
-		"release-lock",
-	} {
-		assert.Contains(t, logs.String(), "step="+step)
-	}
 }
 
 func TestActivateHostDaemonAdoptsCurrentLinkToSingleBinary(t *testing.T) {
@@ -253,7 +278,7 @@ func TestActivateHostDaemonSwitchesExistingLayout(t *testing.T) {
 	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.LastGoodPath))
 }
 
-func TestActivateHostDaemonRestoresLinksAfterLinkSwitchFailure(t *testing.T) {
+func TestActivateHostDaemonRejectsDirectoryDestinationDuringPreflight(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
 	previousLastGood := filepath.Join(dir, "previous-last-good")
@@ -269,13 +294,16 @@ func TestActivateHostDaemonRestoresLinksAfterLinkSwitchFailure(t *testing.T) {
 	candidatePath := filepath.Join(dir, "candidate")
 	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
+	service := &fakeDaemonService{}
 	_, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
 		Layout:        layout,
 		CandidatePath: candidatePath,
 		LockPath:      filepath.Join(dir, "activation.lock"),
-	}, &fakeDaemonService{})
+	}, service)
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a replaceable regular file or symlink")
 
+	assert.Empty(t, service.prepared)
 	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.CurrentPath))
 	assert.Equal(t, previousLastGood, mustEvalSymlinks(t, layout.LastGoodPath))
 }
@@ -364,8 +392,12 @@ func TestActivateHostDaemonRollsBackUnhealthyCandidate(t *testing.T) {
 	candidatePath := filepath.Join(dir, "candidate")
 	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
-	service := &fakeDaemonService{failHealthFor: layout.GreenPath}
-	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
+	ctx, cancel := context.WithCancel(context.Background())
+	service := &fakeDaemonService{
+		failHealthFor:         layout.GreenPath,
+		healthFailureCallback: cancel,
+	}
+	result, err := ActivateHostDaemon(ctx, discardLogger(), ActivationOptions{
 		Layout:        layout,
 		CandidatePath: candidatePath,
 		LockPath:      filepath.Join(dir, "activation.lock"),
@@ -375,7 +407,32 @@ func TestActivateHostDaemonRollsBackUnhealthyCandidate(t *testing.T) {
 	assert.True(t, result.RolledBack)
 	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.CurrentPath))
 	assert.Equal(t, 2, service.restarts)
+	assert.Equal(t, []error{nil, nil}, service.restartContextErrors)
 	assert.Equal(t, []string{layout.GreenPath, layout.BluePath}, service.healthTargets)
+}
+
+func TestActivateHostDaemonReportsUnsuccessfulRollback(t *testing.T) {
+	dir := t.TempDir()
+	layout := testActivationLayout(dir)
+	writeExecutable(t, layout.BluePath, "#!/bin/sh\nexit 0\n")
+	require.NoError(t, os.Symlink(layout.BluePath, layout.CurrentPath))
+	require.NoError(t, os.Symlink(layout.BluePath, layout.LastGoodPath))
+	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
+
+	candidatePath := filepath.Join(dir, "candidate")
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
+
+	service := &fakeDaemonService{restartErr: errors.New("restart failed")}
+	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
+		Layout:        layout,
+		CandidatePath: candidatePath,
+		LockPath:      filepath.Join(dir, "activation.lock"),
+	}, service)
+	require.Error(t, err)
+
+	assert.False(t, result.RolledBack)
+	assert.Equal(t, layout.BluePath, mustEvalSymlinks(t, layout.CurrentPath))
+	assert.Equal(t, 2, service.restarts)
 }
 
 func testActivationLayout(dir string) Layout {

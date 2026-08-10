@@ -69,6 +69,19 @@ func TestHostAgentUpgradePreflight(t *testing.T) {
 	}
 }
 
+func TestWriteHostAgentUpgradePlanOmitsUnchangedLastGood(t *testing.T) {
+	var output bytes.Buffer
+
+	plan := agentbinary.ActivationPlan{
+		CurrentLinkPath:  "/usr/local/bin/unbounded-agent-current",
+		LastGoodLinkPath: "/usr/local/bin/unbounded-agent-last-good",
+		RollbackPath:     "/usr/local/bin/unbounded-agent-blue",
+	}
+
+	require.NoError(t, writeHostAgentUpgradePlan(&output, plan))
+	assert.NotContains(t, output.String(), "Last-good link:")
+}
+
 func TestRecordAgentUpgradeFailureSignalCommand(t *testing.T) {
 	dir := t.TempDir()
 	signalPath := filepath.Join(dir, "agent-upgrade-signal")
