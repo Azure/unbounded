@@ -308,13 +308,19 @@ of keeping the API surface small, and is recorded as an open question in
 
 ## 5. Alternatives considered
 
-| | Mechanism | Expressiveness | Blast radius | Validation | Cost |
+| | Mechanism | Expressiveness | Mechanism reach | Validation | Cost |
 |---|---|---|---|---|---|
-| A | Kustomize as a library | Unlimited | Whole cluster | None practical | High |
-| B | Typed override struct on the CRD | Closed set | Chosen fields | Full OpenAPI | Low, permanent field creep |
-| C | Strategic merge patch, target restricted to operator-emitted workloads | Everything within a workload | One object | Decode plus reserved-path checks | Low |
+| A | Kustomize as a library | Unlimited | Any object, any GVK | None practical | High |
+| B | Typed override struct on the CRD | Closed set of fields | Chosen fields | Full OpenAPI | Low, permanent field creep |
+| C | Strategic merge over allowlisted paths on operator-emitted workloads | Allowlisted paths, open values | One workload object, GVK pinned | Allowlist, protected-path re-stamp, apply-time GVK assertion | Low |
 | D | SSA field disownership | "Let X own this" only | Chosen paths | N/A | Very low |
-| E | User-supplied `MutatingAdmissionPolicy` | High | Cluster | CEL type-checked | Zero code |
+| E | User-supplied `MutatingAdmissionPolicy` | High | Any object admission sees | CEL type-checked | Zero code |
+
+**Mechanism reach is not a security boundary.** The column describes what each
+mechanism can address, not what an authorized writer can ultimately achieve.
+Per [§4.1](#41-threat-model), write access to option C is already
+cluster-admin-equivalent. Reach matters because it determines what can be
+*contained*, which is the subject of [§5.1](#51-why-not-kustomize-as-a-library).
 
 **C is the proposal.** The reasoning for rejecting the others follows.
 
@@ -330,13 +336,25 @@ operator will happily recreate it on the next pass. There is no reconciliation
 model that survives arbitrary resource-graph rewriting without a full pruning
 and ownership-tracking implementation, which the operator does not have.
 
-**Privilege escalation.** `Site` is cluster-scoped and the operator's service
-account is highly privileged: it installs CRDs, ClusterRoles, webhooks, and
-host-networked privileged DaemonSets. An overlay is arbitrary object creation
-executed with those credentials. Anyone able to write the overlay source can
-mint a privileged workload or a ClusterRoleBinding. Patching an existing pod
-template is a materially smaller grant: those workloads are already privileged,
-so the delta is bounded, whereas arbitrary object creation is not.
+**GVK containment is impossible by construction.** This is the security
+argument, and it is not the one it first appears to be. Per
+[§4.1](#41-threat-model), write access to a bounded patch surface is *already*
+cluster-admin-equivalent, so "kustomize grants more privilege" is not a
+distinction that survives scrutiny. The real distinction is containment.
+
+A patch surface can be forced to produce only `apps/v1` `Deployment` and
+`DaemonSet` objects, by validation, by re-stamping, and by an assertion
+immediately before apply ([§8.4](#84-apply-time-assertion)). An attacker holding
+write access is then confined to node compromise, which is severe but requires a
+chain. An overlay engine cannot be constrained that way, because selecting group,
+version, and kind is precisely what it exists to do. Constraining kustomize to
+two GVKs would remove the reason to adopt it.
+
+The difference is therefore between an attacker who must pivot through a
+compromised node and one who writes a `ClusterRoleBinding` directly, using the
+`escalate` and `bind` verbs the operator holds
+([§3.7](#3-constraints-from-the-current-design)). Both are bad. Only one is
+containable.
 
 **The internal manifest layout becomes public API.** Overlays reference base
 resources by group, kind, name, and namespace. Adopting kustomize would freeze
@@ -370,6 +388,21 @@ the requirement table in [§1](#1-problem-statement), and a closed set covering
 them is not meaningfully closed. The well-trodden path is that projects starting
 here add a free-form pod template later and then carry two overlapping surfaces
 with an awkward precedence rule. Starting at C avoids that.
+
+This is not contradicted by the allowlist in
+[§8.1](#81-permitted), which is a closed set of *paths*, not of fields. The two
+differ in what they can express:
+
+| | Typed struct | Path allowlist over a structural merge |
+|---|---|---|
+| Adding a knob | A named Go field plus CRD schema per knob | Already covered if the path is permitted |
+| Values | Constrained by the declared type | Open |
+| Addressing something the operator never enumerated, such as a new sidecar or volume | Impossible | Natural, by merge key |
+| CRD size | Grows with every knob | Unaffected |
+
+`containers[*].env` as an allowlisted path permits any environment variable on
+any container, including one the user added. As a typed field it would permit
+exactly what the struct declared.
 
 ### 5.3 Why not SSA field disownership
 
@@ -500,28 +533,39 @@ from `strategicpatch.NewPatchMetaFromStruct(&appsv1.DaemonSet{})` or the
 adds nothing to `go.mod`.
 
 Strategic merge is schema-aware through the `patchStrategy` and `patchMergeKey`
-struct tags on the core types, which gives the behavior users expect:
+struct tags on the core types. The table below is **raw strategic-merge
+behaviour**, which the mechanism follows except where
+[§8.3](#83-additive-only-scheduling) deliberately departs from it:
 
-| Field | Behavior |
-|---|---|
-| `containers`, `initContainers` | Merge by `name`. An unknown name adds a container. |
-| `volumes` | Merge by `name`. |
-| `env` | Merge by `name`. |
-| `volumeMounts` | Merge by `mountPath`. |
-| `imagePullSecrets` | Merge by `name`. |
-| `tolerations` | Replace the whole list. |
-| `args`, `command` | Replace the whole list. See [§7.2](#72-extraargs). |
-| `nodeSelector`, `labels`, `annotations` | Map merge. |
+| Field | Raw behaviour | Mechanism |
+|---|---|---|
+| `containers`, `initContainers` | Merge by `name`. An unknown name adds a container. | As raw |
+| `volumes` | Merge by `name`, `retainKeys` | As raw, except operator-declared volumes ([§8.2](#82-protected)) |
+| `env` | Merge by `name` | As raw |
+| `volumeMounts` | Merge by `mountPath` | As raw |
+| `imagePullSecrets` | Merge by `name` | As raw |
+| `args`, `command` | Replace the whole list | As raw. See [§7.2](#72-extraargs) |
+| `labels`, `annotations` | Map merge | As raw, minus the reserved prefix |
+| `tolerations` | **Replace the whole list** | **Appended, never replaced** |
+| `nodeSelector` | Map merge | Merged, but overwriting an operator-set key is rejected |
+| `affinity.nodeAffinity` `nodeSelectorTerms` | **Replace the whole list** | **User expressions ANDed into each operator term** |
+
+The three departures exist because raw semantics would silently destroy the
+mandatory Site affinity that `metalman` and `storage` depend on. See
+[§8.3](#83-additive-only-scheduling).
 
 The patch targets the **whole workload object**, not just the pod template, so
 `metadata.labels`, `metadata.annotations`, `spec.replicas` and
 `spec.updateStrategy` are reachable through the same field as
 `spec.template.spec.*`. One field, one code path.
 
-A useful consequence: the value of `patch` is exactly a
-`kubectl patch --type=strategic` body. A user can validate a patch against a
-live object before committing it, which is what makes this mechanism
-debuggable in the field.
+For everything except scheduling, the value of `patch` is a
+`kubectl patch --type=strategic` body, so a user can rehearse it against a live
+object. That equivalence does **not** hold for `tolerations`, `nodeSelector`, or
+`affinity`, where `kubectl patch` replaces and the mechanism appends. Rehearsing
+a scheduling patch with `kubectl` will therefore show a more destructive result
+than the operator produces. `overrides validate` ([§12](#12-cli)) is the
+accurate check.
 
 ### 7.2 extraArgs
 
@@ -1044,7 +1088,20 @@ patching rather than on embedding a templating or overlay engine.
   field-creep failure mode described in [§5.2](#52-why-not-a-typed-override-struct).
 
 None of them embed kustomize, Helm, or a templating engine in the operator. The
-consistent pattern is: bounded target, open content within it.
+consistent pattern is a bounded target: patches apply to workloads the operator
+already generates, never to an arbitrary resource graph.
+
+**This design is deliberately more restrictive than ECK on content.** ECK
+accepts an essentially open `PodTemplateSpec`; [§8](#8-permitted-and-protected-fields)
+accepts only allowlisted paths. The reason is
+[§3.8](#3-constraints-from-the-current-design): the workloads here run
+`hostNetwork`, `hostPID`, and `privileged: true` with hostPath mounts of the
+host root, and two of them carry mandatory per-Site node affinity that raw
+strategic merge would silently destroy. ECK's managed workloads are ordinary
+StatefulSets, so open content costs it far less. The prior art supports the
+bounded target; the content restriction is specific to this operator's
+circumstances and is argued on its own terms in
+[§4.2](#42-the-allowlist-is-an-integrity-control-not-a-security-control).
 
 The project's own precedent points the same way. `deploy/gantry/README.md`
 already ships a hardening overlay as an example for users to copy into their own
