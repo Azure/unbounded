@@ -16,19 +16,25 @@ type Containerd struct {
 	NvidiaRuntime     NvidiaRuntime
 }
 
+// ContainerdOptions controls containerd goal-state resolution.
+type ContainerdOptions struct {
+	SandboxImage   string
+	NvidiaRequired bool
+}
+
 // ResolveContainerd returns the containerd configuration goal state.
-func ResolveContainerd(sandboxImage string, nvidiaRequired bool) Containerd {
-	if sandboxImage == "" {
-		sandboxImage = SandboxImage
+func ResolveContainerd(opts ContainerdOptions) Containerd {
+	if opts.SandboxImage == "" {
+		opts.SandboxImage = SandboxImage
 	}
 
 	return Containerd{
-		SandboxImage:      sandboxImage,
+		SandboxImage:      opts.SandboxImage,
 		ContainerdBinPath: filepath.Join("/"+BinDir, "containerd"),
 		RuncBinaryPath:    filepath.Join("/"+BinDir, "runc"),
 		CNIBinDir:         CNIBinDir,
 		CNIConfDir:        CNIConfigDir,
 		MetricsAddress:    ContainerdMetricsAddress,
-		NvidiaRuntime:     resolveNvidiaRuntime(nvidiaRequired),
+		NvidiaRuntime:     resolveNvidiaRuntime(opts.NvidiaRequired),
 	}
 }

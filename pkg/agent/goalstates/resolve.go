@@ -161,9 +161,12 @@ func resolveExistingLifecycle(
 		NodeStart: &NodeStart{
 			MachineName: machineName,
 			MachineDir:  rootFS.MachineDir,
-			Containerd:  ResolveContainerd(cfg.CRI.Containerd.SandboxImage, nvidiaRequired),
-			Kubelet:     Kubelet{KubeletBinPath: filepath.Join("/"+BinDir, "kubelet")},
-			Nvidia:      rootFS.Nvidia,
+			Containerd: ResolveContainerd(ContainerdOptions{
+				SandboxImage:   cfg.CRI.Containerd.SandboxImage,
+				NvidiaRequired: nvidiaRequired,
+			}),
+			Kubelet: Kubelet{KubeletBinPath: filepath.Join("/"+BinDir, "kubelet")},
+			Nvidia:  rootFS.Nvidia,
 		},
 	}, nil
 }
@@ -275,7 +278,10 @@ func resolveMachine(
 		AdditionalHostMounts:   nspawnConfig.AdditionalHostMounts,
 	}
 
-	containerd := ResolveContainerd(sandboxImage, nspawnConfig.Nvidia.Required)
+	containerd := ResolveContainerd(ContainerdOptions{
+		SandboxImage:   sandboxImage,
+		NvidiaRequired: nspawnConfig.Nvidia.Required,
+	})
 
 	nodeStart := &NodeStart{
 		MachineName:     machineName,

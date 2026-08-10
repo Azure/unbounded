@@ -20,7 +20,7 @@ func TestEnsureNSpawnLifecycleUnitsMigratesLegacyGPUNode(t *testing.T) {
 	machineDir := t.TempDir()
 	state := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd("", true),
+		Containerd: goalstates.ResolveContainerd(goalstates.ContainerdOptions{NvidiaRequired: true}),
 		Kubelet:    goalstates.Kubelet{KubeletBinPath: "/usr/local/bin/kubelet"},
 		Nvidia:     goalstates.NvidiaHost{Required: true},
 	}
@@ -43,7 +43,7 @@ func TestEnsureNSpawnLifecycleUnitsKeepsLegacyCPUNodeUngated(t *testing.T) {
 	machineDir := t.TempDir()
 	state := &goalstates.NodeStart{
 		MachineDir: machineDir,
-		Containerd: goalstates.ResolveContainerd("", false),
+		Containerd: goalstates.ResolveContainerd(goalstates.ContainerdOptions{}),
 		Kubelet:    goalstates.Kubelet{KubeletBinPath: "/usr/local/bin/kubelet"},
 	}
 	require.NoError(t, EnsureNSpawnLifecycleUnits(state).Do(context.Background()))

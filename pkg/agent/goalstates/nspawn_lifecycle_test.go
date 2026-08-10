@@ -121,8 +121,8 @@ func TestLoadOrInferNVIDIACapabilityDoesNotReplaceCorruptState(t *testing.T) {
 func TestResolveContainerdUsesProvisionedNVIDIACapability(t *testing.T) {
 	t.Parallel()
 
-	require.False(t, ResolveContainerd("", false).NvidiaRuntime.Enabled)
-	require.True(t, ResolveContainerd("", true).NvidiaRuntime.Enabled)
+	require.False(t, ResolveContainerd(ContainerdOptions{}).NvidiaRuntime.Enabled)
+	require.True(t, ResolveContainerd(ContainerdOptions{NvidiaRequired: true}).NvidiaRuntime.Enabled)
 }
 
 func TestNSpawnLifecycleStatePath(t *testing.T) {

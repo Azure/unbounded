@@ -92,7 +92,7 @@ func nspawnLifecyclePostStart(
 		return fmt.Errorf("wait for machine %s: %w", machineName, err)
 	}
 
-	containerd := goalstates.ResolveContainerd("", true)
+	containerd := goalstates.ResolveContainerd(goalstates.ContainerdOptions{NvidiaRequired: true})
 	nodeStart := &goalstates.NodeStart{
 		MachineName: machineName,
 		MachineDir:  "/var/lib/machines/" + machineName,
