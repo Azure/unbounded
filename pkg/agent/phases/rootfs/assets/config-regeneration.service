@@ -3,6 +3,8 @@
 
 [Unit]
 Description=Regenerate configuration for {{.MachineName}}
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
 
 [Service]
 Type=oneshot

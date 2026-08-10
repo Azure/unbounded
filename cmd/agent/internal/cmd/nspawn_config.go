@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
@@ -73,13 +74,20 @@ func regenerateNSpawnConfig(ctx context.Context, log *slog.Logger, machineName s
 		return nil
 	}
 
-	gs, err := goalstates.ResolveMachine(log, cfg, machineName, nil)
+	rootFS, err := goalstates.ResolveNSpawnConfig(cfg, machineName)
 	if err != nil {
-		return fmt.Errorf("resolve machine goal state: %w", err)
+		return fmt.Errorf("resolve nspawn config goal state: %w", err)
 	}
 
-	if err := phases.ExecuteTask(ctx, log, rootfs.EnsureNSpawnConfig(log, gs.RootFS)); err != nil {
+	if err := phases.ExecuteTask(ctx, log, rootfs.EnsureNSpawnConfig(log, rootFS)); err != nil {
 		return fmt.Errorf("regenerate nspawn config for %s: %w", machineName, err)
+	}
+
+	// systemd loaded the nspawn service drop-in before starting this required
+	// oneshot unit. Reload the manager so the pending nspawn start observes the
+	// regenerated service properties, including path-specific DeviceAllow entries.
+	if err := executil.RunCmd(ctx, log, executil.Systemctl(), "daemon-reload"); err != nil {
+		return fmt.Errorf("reload systemd after regenerating config for %s: %w", machineName, err)
 	}
 
 	return nil
@@ -90,8 +98,10 @@ func loadAppliedConfigForMachine(log *slog.Logger, machineName string) (*provisi
 		return nil, false, fmt.Errorf("unsupported nspawn machine %q", machineName)
 	}
 
-	path := goalstates.AppliedConfigPath(machineName)
+	return loadAppliedConfig(log, goalstates.AppliedConfigPath(machineName), goalstates.AppliedConfigChecksumPath(machineName))
+}
 
+func loadAppliedConfig(log *slog.Logger, path, checksumPath string) (*provision.AgentConfig, bool, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -101,9 +111,8 @@ func loadAppliedConfigForMachine(log *slog.Logger, machineName string) (*provisi
 		return nil, false, fmt.Errorf("read applied config %s: %w", path, err)
 	}
 
-	checksumPath := goalstates.AppliedConfigChecksumPath(machineName)
 	if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
-		return nil, false, fmt.Errorf("verify applied config checksum for %s: %w", machineName, err)
+		return nil, false, fmt.Errorf("verify applied config checksum for %s: %w", path, err)
 	}
 
 	if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {

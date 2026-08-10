@@ -311,6 +311,8 @@ func TestConfigRegenerationUnit(t *testing.T) {
 
 	out := buf.String()
 	require.Contains(t, out, "Description=Regenerate configuration for kube1")
+	require.Contains(t, out, "Wants=systemd-udev-settle.service")
+	require.Contains(t, out, "After=systemd-udev-settle.service")
 	require.Contains(t, out, "Type=oneshot")
 	require.Contains(t, out, "ExecStart=/usr/local/bin/unbounded-agent regenerate-config kube1")
 }

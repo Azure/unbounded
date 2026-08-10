@@ -30,6 +30,8 @@ Subcommands (called as individual workflow steps):
     wait-for-node                      Wait for the node to appear and become Ready.
     validate-host-nspawn-distro        Verify the nspawn machine distro matches the host.
     validate-node-config               Verify configured node and kubelet settings.
+    validate-device-refresh-after-host-reboot
+                                       Verify discovered devices refresh on host boot.
     dump-persisted-agent-config        Print persisted agent config files from the VM.
     validate-workload                  Deploy test pods on the agent node.
     validate-kube-proxy                Verify kube-proxy is Running on all nodes.
@@ -144,6 +146,8 @@ MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
 BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
+DEVICE_REFRESH_PATH = "/dev/infiniband/unbounded-e2e-zero"
+DEVICE_REFRESH_TMPFILES_PATH = "/etc/tmpfiles.d/unbounded-e2e-device.conf"
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +599,7 @@ class NodeConfig:
     block_external_network: bool = False
     additional_host_mounts: tuple[dict[str, Any], ...] = ()
     additional_host_devices: tuple[str, ...] = ()
+    validate_device_refresh_after_host_reboot: bool = False
     local_dns: bool = False
     path: str = ""
 
@@ -636,6 +641,9 @@ def load_node_config(
     block_external_network = cfg.get("blockExternalNetwork", False)
     additional_host_mounts = cfg.get("additionalHostMounts", [])
     additional_host_devices = cfg.get("additionalHostDevices", [])
+    validate_device_refresh_after_host_reboot = cfg.get(
+        "validateDeviceRefreshAfterHostReboot", False,
+    )
     local_dns = cfg.get("localDNS", False)
 
     if not isinstance(name, str) or not name:
@@ -672,6 +680,11 @@ def load_node_config(
         )
     if not isinstance(local_dns, bool):
         die(f"node config {config_path} field 'localDNS' must be a boolean")
+    if not isinstance(validate_device_refresh_after_host_reboot, bool):
+        die(
+            f"node config {config_path} field "
+            f"'validateDeviceRefreshAfterHostReboot' must be a boolean"
+        )
     if not isinstance(additional_host_devices, list) or not all(
         isinstance(d, str) and d for d in additional_host_devices
     ):
@@ -691,6 +704,7 @@ def load_node_config(
         block_external_network=block_external_network,
         additional_host_mounts=tuple(dict(m) for m in additional_host_mounts),
         additional_host_devices=tuple(additional_host_devices),
+        validate_device_refresh_after_host_reboot=validate_device_refresh_after_host_reboot,
         local_dns=local_dns,
         path=str(config_path),
     )
@@ -813,6 +827,10 @@ def log_active_node_config(node_config: NodeConfig) -> None:
         log(f"  additional host devices: {', '.join(node_config.additional_host_devices)}")
     else:
         log(f"  additional host devices: <none>")
+    log(
+        "  validate device refresh after host reboot: "
+        f"{node_config.validate_device_refresh_after_host_reboot}"
+    )
 
 
 def _safe_name(value: str) -> str:
@@ -2887,6 +2905,125 @@ PY
     log("Additional host devices configuration validated")
 
 
+def wait_for_vm_host_reboot(previous_boot_id: str, timeout_secs: int = 300) -> None:
+    """Wait for SSH to return with a different host boot ID."""
+
+    log(f"Waiting for VM host to reboot (timeout: {timeout_secs}s)...")
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [
+                "ssh", *SSH_OPTS, SSH_TARGET,
+                "cat /proc/sys/kernel/random/boot_id",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        current_boot_id = result.stdout.strip() if result.returncode == 0 else ""
+        if current_boot_id and current_boot_id != previous_boot_id:
+            log(f"VM host boot ID changed: {previous_boot_id} -> {current_boot_id}")
+            return
+        time.sleep(3)
+
+    die("timed out waiting for VM host reboot")
+
+
+def wait_for_nspawn_machine(machine: str, timeout_secs: int = 300) -> None:
+    """Wait for the named nspawn machine to become active after host reboot."""
+
+    log(f"Waiting for nspawn machine '{machine}' to become active...")
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        result = ssh_capture_quiet(f"sudo machinectl show {machine}")
+        if result.returncode == 0:
+            log(f"nspawn machine '{machine}' is active")
+            return
+        time.sleep(3)
+
+    die(f"timed out waiting for nspawn machine '{machine}' after host reboot")
+
+
+def validate_device_refresh_after_host_reboot() -> None:
+    """Verify a device appearing during host boot is usable inside nspawn."""
+
+    machine = active_nspawn_machine()
+    nspawn_config_path = f"/etc/systemd/nspawn/{machine}.nspawn"
+    override_path = (
+        f"/etc/systemd/system/systemd-nspawn@{machine}.service.d/override.conf"
+    )
+
+    log("Validating device discovery refresh after a VM host reboot...")
+    ssh_cmd(
+        f"sudo test ! -e {DEVICE_REFRESH_PATH} && "
+        f"! sudo grep -Fq {DEVICE_REFRESH_PATH} {nspawn_config_path} && "
+        f"! sudo grep -Fq {DEVICE_REFRESH_PATH} {override_path}"
+    )
+
+    # Create an alias of /dev/zero on the next boot. Placing it under
+    # /dev/infiniband makes it part of normal host device discovery without
+    # requiring RDMA hardware in the e2e VM.
+    ssh_cmd(f"""
+sudo tee {DEVICE_REFRESH_TMPFILES_PATH} >/dev/null <<'EOF'
+d /dev/infiniband 0755 root root -
+c {DEVICE_REFRESH_PATH} 0666 root root - 1:5
+EOF
+""")
+
+    previous_boot_id = ssh_capture("cat /proc/sys/kernel/random/boot_id").strip()
+    if not previous_boot_id:
+        die("VM host boot ID was empty before reboot")
+
+    # SSH normally exits with 255 when systemd tears down the connection.
+    subprocess.run(
+        ["ssh", *SSH_OPTS, SSH_TARGET, "sudo systemctl reboot"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+    wait_for_vm_host_reboot(previous_boot_id)
+    wait_for_nspawn_machine(machine)
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+
+    ssh_cmd(f"sudo test -c {DEVICE_REFRESH_PATH}")
+    nspawn_config = ssh_capture(f"sudo cat {nspawn_config_path}")
+    expected_bind = f"Bind={DEVICE_REFRESH_PATH}"
+    if expected_bind not in nspawn_config:
+        die(
+            f"nspawn config {nspawn_config_path} missing refreshed directive "
+            f"{expected_bind!r}; full config:\n{nspawn_config}"
+        )
+
+    service_override = ssh_capture(f"sudo cat {override_path}")
+    expected_allow = f"DeviceAllow={DEVICE_REFRESH_PATH} rwm"
+    if expected_allow not in service_override:
+        die(
+            f"service override {override_path} missing refreshed directive "
+            f"{expected_allow!r}; full override:\n{service_override}"
+        )
+
+    loaded_device_allow = ssh_capture(
+        f"sudo systemctl show systemd-nspawn@{machine}.service "
+        "--property=DeviceAllow"
+    )
+    if DEVICE_REFRESH_PATH not in loaded_device_allow:
+        die(
+            "systemd did not load the refreshed DeviceAllow setting; "
+            f"loaded property: {loaded_device_allow!r}"
+        )
+
+    # The manager property verifies the service-level permission was reloaded;
+    # reading the device verifies that the refreshed bind is usable in nspawn.
+    machine_shell(
+        machine,
+        f"test -c {DEVICE_REFRESH_PATH} && "
+        f"dd if={DEVICE_REFRESH_PATH} of=/dev/null bs=1 count=1 status=none",
+    )
+
+    log("Device discovery refresh after VM host reboot validated")
+
+
 def _run_scenario_command(command: str, node_config: NodeConfig, env: dict[str, str]) -> None:
     args = [sys.executable, str(Path(__file__))]
     if VERBOSE:
@@ -2924,6 +3061,11 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
         "validate-machine-cr-created",
     ):
         _run_scenario_command(command, node_config, env)
+
+    if node_config.validate_device_refresh_after_host_reboot:
+        _run_scenario_command(
+            "validate-device-refresh-after-host-reboot", node_config, env,
+        )
 
     if node_config.local_dns:
         _run_scenario_command("validate-node-reboot-operation", node_config, env)
@@ -4315,6 +4457,9 @@ COMMANDS: dict[str, Command] = {
     "wait-for-node-registered": _without_node_config(wait_for_node_registered),
     "validate-host-nspawn-distro": _without_node_config(validate_host_nspawn_distro),
     "validate-node-config": validate_node_config,
+    "validate-device-refresh-after-host-reboot": _without_node_config(
+        validate_device_refresh_after_host_reboot,
+    ),
     "validate-kube-proxy": _without_node_config(validate_kube_proxy),
     "validate-workload": _without_node_config(validate_workload),
     "install-machine-crd": _without_node_config(install_machine_crd),

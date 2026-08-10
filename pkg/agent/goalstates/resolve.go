@@ -33,17 +33,49 @@ type MachineGoalState struct {
 	NodeStart *NodeStart
 }
 
+// ResolveNSpawnConfig probes only the host state needed to render the
+// systemd-nspawn configuration for a machine. Unlike ResolveMachine, it does
+// not resolve network-dependent node services such as LocalDNS.
+func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, error) {
+	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
+		return nil, err
+	}
+
+	additionalHostMounts, err := resolveAdditionalHostMounts(cfg.AdditionalHostMounts)
+	if err != nil {
+		return nil, err
+	}
+
+	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
+	if err != nil {
+		return nil, fmt.Errorf("resolve nvidia host: %w", err)
+	}
+
+	return &RootFS{
+		MachineDir: filepath.Join("/var/lib/machines", machineName),
+		NSpawnConfigFile: filepath.Join(
+			SystemdNSpawnDir,
+			machineName+".nspawn",
+		),
+		ServiceOverrideFile: filepath.Join(
+			SystemdSystemDir,
+			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
+			"override.conf",
+		),
+		Nvidia:               nvidia,
+		AMD:                  ResolveAMDHost(),
+		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
+		AdditionalHostMounts: additionalHostMounts,
+	}, nil
+}
+
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
 // resolves the complete goal state for the named nspawn machine from an agent
 // config and caller-provided download overrides.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
 	sandboxImage := cfg.CRI.Containerd.SandboxImage
 
-	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
-		return nil, err
-	}
-
-	additionalHostMounts, err := resolveAdditionalHostMounts(cfg.AdditionalHostMounts)
+	nspawnConfig, err := ResolveNSpawnConfig(cfg, machineName)
 	if err != nil {
 		return nil, err
 	}
@@ -58,12 +90,8 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		return nil, fmt.Errorf("get host hostname: %w", err)
 	}
 
-	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
-	if err != nil {
-		return nil, fmt.Errorf("resolve nvidia host: %w", err)
-	}
-
-	amd := ResolveAMDHost()
+	nvidia := nspawnConfig.Nvidia
+	amd := nspawnConfig.AMD
 
 	ociImage := ResolveOCIImage(log, cfg.OCIImage, len(nvidia.GPUDevicePaths) > 0)
 
@@ -98,16 +126,9 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 	}
 
 	rootFS := &RootFS{
-		MachineDir: filepath.Join("/var/lib/machines", machineName),
-		NSpawnConfigFile: filepath.Join(
-			SystemdNSpawnDir,
-			machineName+".nspawn",
-		),
-		ServiceOverrideFile: filepath.Join(
-			SystemdSystemDir,
-			fmt.Sprintf("systemd-nspawn@%s.service.d", machineName),
-			"override.conf",
-		),
+		MachineDir:           nspawnConfig.MachineDir,
+		NSpawnConfigFile:     nspawnConfig.NSpawnConfigFile,
+		ServiceOverrideFile:  nspawnConfig.ServiceOverrideFile,
 		HostArch:             runtime.GOARCH,
 		HostKernel:           kernel,
 		Hostname:             hostname,
@@ -120,8 +141,8 @@ func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName strin
 		OCIImage:             ociImage,
 		Nvidia:               nvidia,
 		AMD:                  amd,
-		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
-		AdditionalHostMounts: additionalHostMounts,
+		HostDevices:          nspawnConfig.HostDevices,
+		AdditionalHostMounts: nspawnConfig.AdditionalHostMounts,
 	}
 
 	nodeStart := &NodeStart{

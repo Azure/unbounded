@@ -20,6 +20,19 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
+func TestResolveNSpawnConfigDoesNotResolveLocalDNS(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.AgentConfig{
+		LocalDNS: &config.AgentLocalDNSConfig{Enabled: true},
+	}
+
+	got, err := ResolveNSpawnConfig(cfg, NSpawnMachineKube1)
+	require.NoError(t, err)
+	require.Equal(t, "/var/lib/machines/kube1", got.MachineDir)
+	require.Equal(t, "/etc/systemd/nspawn/kube1.nspawn", got.NSpawnConfigFile)
+}
+
 func TestResolveOCIImage_ConfigImageTakesPrecedence(t *testing.T) {
 	// Even when env vars and GPU are present, configImage wins.
 	t.Setenv("AGENT_OCI_IMAGE", "env-image:latest")
