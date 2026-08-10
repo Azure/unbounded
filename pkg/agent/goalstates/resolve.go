@@ -68,9 +68,6 @@ func resolveNSpawnConfig(
 		return nil, fmt.Errorf("resolve nvidia host: %w", err)
 	}
 
-	// This is the single capability-selection point. A config-level NVIDIA
-	// disable switch (PR #309) must be applied here before persisting the
-	// lifecycle state, rather than in either lifecycle phase.
 	nvidiaRequired := len(nvidia.GPUDevicePaths) > 0
 	if provisionedNVIDIARequired != nil {
 		nvidiaRequired = *provisionedNVIDIARequired
@@ -97,11 +94,15 @@ func resolveNSpawnConfig(
 		),
 		LifecycleStateFile:     NSpawnLifecycleStatePath(machineName),
 		ConfigRegenerationFile: filepath.Join(SystemdSystemDir, ConfigRegenerationUnit(machineName)),
-		NVIDIARequired:         nvidiaRequired,
-		Nvidia:                 nvidia,
-		AMD:                    ResolveAMDHost(),
-		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
-		AdditionalHostMounts:   additionalHostMounts,
+		NSpawnConfigInput: NSpawnConfigInput{
+			AdditionalHostDevices: slices.Clone(cfg.AdditionalHostDevices),
+			AdditionalHostMounts:  slices.Clone(cfg.AdditionalHostMounts),
+		},
+		NVIDIARequired:       nvidiaRequired,
+		Nvidia:               nvidia,
+		AMD:                  ResolveAMDHost(),
+		HostDevices:          DiscoverHostDevices(cfg.AdditionalHostDevices),
+		AdditionalHostMounts: additionalHostMounts,
 	}, nil
 }
 
@@ -257,6 +258,7 @@ func resolveMachine(
 		ServiceOverrideFile:    nspawnConfig.ServiceOverrideFile,
 		LifecycleStateFile:     nspawnConfig.LifecycleStateFile,
 		ConfigRegenerationFile: nspawnConfig.ConfigRegenerationFile,
+		NSpawnConfigInput:      nspawnConfig.NSpawnConfigInput,
 		HostArch:               runtime.GOARCH,
 		HostKernel:             kernel,
 		Hostname:               hostname,

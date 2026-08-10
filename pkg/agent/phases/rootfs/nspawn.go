@@ -89,6 +89,10 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 		return fmt.Errorf("bootstrap machine directory %s: %w", e.goalState.MachineDir, err)
 	}
 
+	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelper()); err != nil {
+		return fmt.Errorf("install nspawn lifecycle helper: %w", err)
+	}
+
 	if err := writeNSpawnConfigs(e.log, e.goalState); err != nil {
 		return err
 	}
@@ -124,7 +128,6 @@ type nspawnTemplateData struct {
 	AMDSysFSPaths          []string
 	ConfigRegenerationUnit string
 	AgentBinaryPath        string
-	AgentCurrentBinaryPath string
 }
 
 // TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
@@ -162,8 +165,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:              goalstates.DaemonBinaryPath,
-		AgentCurrentBinaryPath:       goalstates.DaemonBinaryCurrentPath,
+		AgentBinaryPath:              goalstates.NSpawnLifecycleBinaryPath,
 	}
 
 	if len(hostDevicePaths) > 0 {
@@ -226,10 +228,11 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	}
 
 	state := goalstates.NSpawnLifecycleState{
-		Version:        goalstates.NSpawnLifecycleStateVersion,
-		MachineName:    machineName,
-		NVIDIARequired: goalState.NVIDIARequired,
-		NVIDIA:         goalState.Nvidia,
+		Version:           goalstates.NSpawnLifecycleStateVersion,
+		MachineName:       machineName,
+		NVIDIARequired:    goalState.NVIDIARequired,
+		NVIDIA:            goalState.Nvidia,
+		NSpawnConfigInput: goalState.NSpawnConfigInput,
 	}
 	if err := state.Validate(machineName); err != nil {
 		return fmt.Errorf("validate nspawn lifecycle state: %w", err)

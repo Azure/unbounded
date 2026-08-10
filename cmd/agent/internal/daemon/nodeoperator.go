@@ -194,6 +194,7 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 
 	if err := phases.Serial(
 		log,
+		rootfs.EnsureNSpawnLifecycleHelper(),
 		rootfs.EnsureNSpawnConfig(log, gs.RootFS),
 		nodestart.EnsureNSpawnLifecycleUnits(gs.NodeStart),
 	).Do(ctx); err != nil {

@@ -59,9 +59,9 @@ func nspawnLifecyclePreStart(
 	}
 
 	if !ok {
-		log.Info("applied config not available during initial bootstrap; using provisioned nspawn lifecycle state", "machine", machineName)
+		log.Info("applied config not available during initial bootstrap; using persisted nspawn lifecycle input", "machine", machineName)
 
-		return nil
+		cfg = state.NSpawnConfigInput.AgentConfig()
 	}
 
 	rootFS, err := resolve(cfg, machineName, state.NVIDIARequired)

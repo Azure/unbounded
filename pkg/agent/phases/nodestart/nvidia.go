@@ -78,9 +78,12 @@ func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
 	// concurrently. The first successful caller creates the lifecycle-scoped
 	// ready marker; later callers must not rebuild the driver root after that
 	// marker has allowed containerd to start.
-	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
-		"test", "-e", goalstates.NVIDIAReadyPath,
-	); err == nil {
+	ready, err := nvidiaReadyMarkerExists(ctx, s.log, s.goalState.MachineName, executil.MachineRun)
+	if err != nil {
+		return err
+	}
+
+	if ready {
 		s.log.Info("NVIDIA runtime already reconciled for this machine start, skipping",
 			"machine", s.goalState.MachineName)
 
@@ -100,6 +103,30 @@ func (s *setupNVIDIA) Do(ctx context.Context) (retErr error) {
 	}
 
 	return s.markReady(ctx)
+}
+
+type machineRunFunc func(context.Context, *slog.Logger, string, ...string) (string, error)
+
+func nvidiaReadyMarkerExists(ctx context.Context, log *slog.Logger, machine string, run machineRunFunc) (bool, error) {
+	output, err := run(
+		ctx,
+		log,
+		machine,
+		"sh", "-c", `if test -e "$1"; then printf ready; else printf missing; fi`,
+		"nvidia-ready-probe", goalstates.NVIDIAReadyPath,
+	)
+	if err != nil {
+		return false, fmt.Errorf("probe NVIDIA ready marker: %w", err)
+	}
+
+	switch output {
+	case "ready":
+		return true, nil
+	case "missing":
+		return false, nil
+	default:
+		return false, fmt.Errorf("probe NVIDIA ready marker: unexpected output %q", output)
+	}
 }
 
 func acquireNVIDIASetupLock(ctx context.Context, machine string) (func() error, error) {

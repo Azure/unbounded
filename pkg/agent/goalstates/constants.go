@@ -31,6 +31,7 @@ const (
 	DaemonBinaryGreenPath        = "/usr/local/bin/unbounded-agent-green"
 	DaemonBinaryCurrentPath      = "/usr/local/bin/unbounded-agent-current"
 	DaemonBinaryLastGoodPath     = "/usr/local/bin/unbounded-agent-last-good"
+	NSpawnLifecycleBinaryPath    = "/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper"
 	DaemonRecoveryScriptPath     = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
 

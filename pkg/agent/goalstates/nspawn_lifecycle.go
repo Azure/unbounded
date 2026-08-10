@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+
+	"github.com/Azure/unbounded/pkg/agent/config"
 )
 
 const NSpawnLifecycleStateVersion = 1
@@ -23,10 +25,25 @@ var ErrNVIDIAStateUnavailable = errors.New("required NVIDIA host state is unavai
 // selected when the machine was provisioned; NVIDIA is the exact host state
 // used to render the current nspawn mounts.
 type NSpawnLifecycleState struct {
-	Version        int        `json:"version"`
-	MachineName    string     `json:"machineName"`
-	NVIDIARequired bool       `json:"nvidiaRequired"`
-	NVIDIA         NvidiaHost `json:"nvidia"`
+	Version           int               `json:"version"`
+	MachineName       string            `json:"machineName"`
+	NVIDIARequired    bool              `json:"nvidiaRequired"`
+	NVIDIA            NvidiaHost        `json:"nvidia"`
+	NSpawnConfigInput NSpawnConfigInput `json:"nspawnConfigInput"`
+}
+
+// NSpawnConfigInput is the durable configuration needed to rediscover host
+// mounts and devices before the applied config is persisted.
+type NSpawnConfigInput struct {
+	AdditionalHostDevices []string                     `json:"additionalHostDevices,omitempty"`
+	AdditionalHostMounts  []config.AdditionalHostMount `json:"additionalHostMounts,omitempty"`
+}
+
+func (i NSpawnConfigInput) AgentConfig() *config.AgentConfig {
+	return &config.AgentConfig{
+		AdditionalHostDevices: i.AdditionalHostDevices,
+		AdditionalHostMounts:  i.AdditionalHostMounts,
+	}
 }
 
 func NSpawnLifecycleStatePath(machineName string) string {

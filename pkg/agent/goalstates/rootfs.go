@@ -35,6 +35,9 @@ type RootFS struct {
 	// matching the host architecture.
 	OCIImage string
 
+	// NSpawnConfigInput persists the inputs required for pre-start rediscovery.
+	NSpawnConfigInput NSpawnConfigInput
+
 	// NVIDIARequired is the provisioned GPU capability. It remains stable across
 	// lifecycle discovery so transient hardware absence cannot turn a GPU node
 	// into a CPU node, and newly appearing hardware cannot enable a CPU node.

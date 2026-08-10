@@ -154,7 +154,8 @@ The agent also auto-mounts host storage and InfiniBand hardware:
 
 Device discovery runs when the machine is provisioned and is refreshed by a
 host-side systemd hook before systemd starts the nspawn machine. The hook runs
-`unbounded-agent nspawn-lifecycle pre-start`, waits for udev to settle, and
+the rollback-stable lifecycle helper with `nspawn-lifecycle pre-start`, waits
+for udev to settle, and
 retries failures through systemd without allowing the machine to start. Device
 mapping changes that occur while the host is offline are picked up on the next
 host boot before the machine starts. Disks or HCAs hot-plugged after the machine
@@ -182,6 +183,7 @@ The configuration is written to these files on the host before the machine boots
 | nspawn config | `/etc/systemd/nspawn/<MachineName>.nspawn` |
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
 | Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
+| Rollback-stable lifecycle helper | `/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper` |
 | Lifecycle state handoff | `/etc/unbounded/agent/<MachineName>-nspawn-lifecycle.json` |
 
 ### Customization points
@@ -309,6 +311,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
 | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
+| `/usr/local/lib/unbounded-agent/nspawn-lifecycle-helper` | Lifecycle command binary retained across daemon binary rollback. |
 | `/etc/unbounded/agent/<MachineName>-nspawn-lifecycle.json` | Durable provisioned capability and exact pre-start NVIDIA resolved-state handoff. |
 | `/run/unbounded/nvidia-ready` | (Inside GPU container) Lifecycle-scoped marker that releases containerd and kubelet after NVIDIA setup. |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |

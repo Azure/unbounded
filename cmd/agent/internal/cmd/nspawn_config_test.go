@@ -151,28 +151,51 @@ func TestNSpawnLifecyclePreStartBootstrapAndStaleState(t *testing.T) {
 
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "lifecycle.json")
-	writeLifecycleState(t, statePath, false, goalstates.NvidiaHost{})
-
-	err := nspawnLifecyclePreStart(
-		context.Background(), testLogger(), "kube1", filepath.Join(dir, "missing"), filepath.Join(dir, "missing.sha256"), statePath,
-		func(*provision.AgentConfig, string, bool) (*goalstates.RootFS, error) {
-			return nil, errors.New("must not resolve")
+	state := goalstates.NSpawnLifecycleState{
+		Version:     goalstates.NSpawnLifecycleStateVersion,
+		MachineName: "kube1",
+		NSpawnConfigInput: goalstates.NSpawnConfigInput{
+			AdditionalHostDevices: []string{"/dev/uinput"},
 		},
-		func(context.Context, *slog.Logger, phases.Task) error { return errors.New("must not execute") },
-		func(context.Context, *slog.Logger) error { return errors.New("must not reload") },
-	)
-	require.NoError(t, err)
-
-	writeLifecycleState(t, statePath, false, goalstates.NvidiaHost{})
-	data, readErr := os.ReadFile(statePath)
-	require.NoError(t, readErr)
-
-	var state goalstates.NSpawnLifecycleState
-	require.NoError(t, json.Unmarshal(data, &state))
-	state.MachineName = "kube2"
-	data, err = json.Marshal(&state)
+	}
+	data, err := json.Marshal(&state)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(statePath, data, 0o600))
+
+	root := temporaryRootFS(dir)
+
+	var reloaded bool
+
+	err = nspawnLifecyclePreStart(
+		context.Background(), testLogger(), "kube1", filepath.Join(dir, "missing"), filepath.Join(dir, "missing.sha256"), statePath,
+		func(cfg *provision.AgentConfig, _ string, required bool) (*goalstates.RootFS, error) {
+			require.False(t, required)
+			require.Equal(t, []string{"/dev/uinput"}, cfg.AdditionalHostDevices)
+
+			root.NSpawnConfigInput = state.NSpawnConfigInput
+
+			return root, nil
+		},
+		phases.ExecuteTask,
+		func(context.Context, *slog.Logger) error { reloaded = true; return nil },
+	)
+	require.NoError(t, err)
+	require.True(t, reloaded)
+
+	persisted, err := goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
+	require.NoError(t, err)
+	require.Equal(t, state.NSpawnConfigInput, persisted.NSpawnConfigInput)
+
+	writeLifecycleState(t, statePath, false, goalstates.NvidiaHost{})
+	staleData, readErr := os.ReadFile(statePath)
+	require.NoError(t, readErr)
+
+	var staleState goalstates.NSpawnLifecycleState
+	require.NoError(t, json.Unmarshal(staleData, &staleState))
+	staleState.MachineName = "kube2"
+	staleData, err = json.Marshal(&staleState)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(statePath, staleData, 0o600))
 	_, err = goalstates.LoadNSpawnLifecycleState(statePath, "kube1")
 	require.ErrorContains(t, err, "not \"kube1\"")
 }
