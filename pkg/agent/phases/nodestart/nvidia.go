@@ -11,6 +11,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -53,6 +56,26 @@ func (s *setupNVIDIA) Name() string { return "setup-nvidia" }
 func (s *setupNVIDIA) Do(ctx context.Context) error {
 	if !s.goalState.Containerd.NvidiaRuntime.Enabled || len(s.goalState.Nvidia.LibMappings) == 0 {
 		s.log.Info("NVIDIA runtime not enabled or no host libraries found, skipping")
+
+		return nil
+	}
+
+	unlock, err := acquireNVIDIASetupLock(ctx, s.goalState.MachineName)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// Managed node starts and the nspawn ExecStartPost hook can reach this task
+	// concurrently. The first successful caller creates the lifecycle-scoped
+	// ready marker; later callers must not rebuild the driver root after that
+	// marker has allowed containerd to start.
+	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
+		"test", "-e", goalstates.NVIDIAReadyPath,
+	); err == nil {
+		s.log.Info("NVIDIA runtime already reconciled for this machine start, skipping",
+			"machine", s.goalState.MachineName)
+
 		return nil
 	}
 
@@ -69,6 +92,46 @@ func (s *setupNVIDIA) Do(ctx context.Context) error {
 	}
 
 	return s.markReady(ctx)
+}
+
+func acquireNVIDIASetupLock(ctx context.Context, machine string) (func(), error) {
+	const retryInterval = 100 * time.Millisecond
+
+	lockDir := filepath.Join("/run", "unbounded", "locks")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create NVIDIA setup lock directory: %w", err)
+	}
+
+	lockPath := filepath.Join(lockDir, "nvidia-"+machine+".lock")
+
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open NVIDIA setup lock: %w", err)
+	}
+
+	for {
+		err = unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return func() {
+				unix.Flock(int(file.Fd()), unix.LOCK_UN) //nolint:errcheck // Closing the descriptor also releases the lock.
+				file.Close()                             //nolint:errcheck // There is no useful recovery during deferred cleanup.
+			}, nil
+		}
+
+		if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
+			file.Close() //nolint:errcheck // Preserve the lock error.
+
+			return nil, fmt.Errorf("lock NVIDIA setup: %w", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			file.Close() //nolint:errcheck // Preserve the context error.
+
+			return nil, fmt.Errorf("wait for NVIDIA setup lock: %w", ctx.Err())
+		case <-time.After(retryInterval):
+		}
+	}
 }
 
 func (s *setupNVIDIA) setupLibraries(ctx context.Context) error {

@@ -33,6 +33,24 @@ type MachineGoalState struct {
 	NodeStart *NodeStart
 }
 
+// ResolveNVIDIASetup probes only the host state needed to reconcile NVIDIA
+// runtime state inside an already provisioned nspawn machine. Keeping this
+// path independent from kubelet, LocalDNS, and download resolution makes it
+// safe to run early during host boot.
+func ResolveNVIDIASetup(cfg *config.AgentConfig, machineName string) (*NodeStart, error) {
+	nvidia, err := ResolveNvidiaHost(runtime.GOARCH)
+	if err != nil {
+		return nil, fmt.Errorf("resolve nvidia host: %w", err)
+	}
+
+	return &NodeStart{
+		MachineName: machineName,
+		MachineDir:  filepath.Join("/var/lib/machines", machineName),
+		Containerd:  ResolveContainerd(cfg.CRI.Containerd.SandboxImage),
+		Nvidia:      nvidia,
+	}, nil
+}
+
 // ResolveMachine probes the host (kernel version, hostname, GPU hardware) and
 // resolves the complete goal state for the named nspawn machine from an agent
 // config and caller-provided download overrides.

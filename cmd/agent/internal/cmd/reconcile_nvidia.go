@@ -42,10 +42,33 @@ func newCmdReconcileNVIDIA(cmdCtx *CommandContext) *cobra.Command {
 	return cmd
 }
 
-func runNVIDIAReconciliation(ctx context.Context, log *slog.Logger, machine string) error {
-	path := goalstates.AppliedConfigPath(machine)
+type resolveNVIDIASetupFunc func(*provision.AgentConfig, string) (*goalstates.NodeStart, error)
 
-	data, err := os.ReadFile(path)
+type waitForNVIDIAMachineFunc func(context.Context, *slog.Logger, string) error
+
+type executeNVIDIATaskFunc func(context.Context, *slog.Logger, phases.Task) error
+
+func runNVIDIAReconciliation(ctx context.Context, log *slog.Logger, machine string) error {
+	return reconcileNVIDIA(ctx, log, machine,
+		goalstates.AppliedConfigPath(machine),
+		goalstates.AppliedConfigChecksumPath(machine),
+		goalstates.ResolveNVIDIASetup,
+		nodestart.WaitForMachine,
+		phases.ExecuteTask,
+	)
+}
+
+func reconcileNVIDIA(
+	ctx context.Context,
+	log *slog.Logger,
+	machine string,
+	configPath string,
+	checksumPath string,
+	resolve resolveNVIDIASetupFunc,
+	waitForMachine waitForNVIDIAMachineFunc,
+	executeTask executeNVIDIATaskFunc,
+) error {
+	data, err := os.ReadFile(configPath)
 	if errors.Is(err, os.ErrNotExist) {
 		log.Info("applied config not available; managed node start will reconcile NVIDIA state",
 			"machine", machine)
@@ -54,30 +77,30 @@ func runNVIDIAReconciliation(ctx context.Context, log *slog.Logger, machine stri
 	}
 
 	if err != nil {
-		return fmt.Errorf("read applied config %s: %w", path, err)
+		return fmt.Errorf("read applied config %s: %w", configPath, err)
 	}
 
-	if err := goalstates.VerifyChecksum(data, goalstates.AppliedConfigChecksumPath(machine)); err != nil {
+	if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
 		return fmt.Errorf("verify applied config checksum for %s: %w", machine, err)
 	}
 
 	var cfg provision.AgentConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return fmt.Errorf("decode applied config %s: %w", path, err)
+		return fmt.Errorf("decode applied config %s: %w", configPath, err)
 	}
 
-	goalState, err := goalstates.ResolveMachine(log, &cfg, machine, nil)
+	nodeStart, err := resolve(&cfg, machine)
 	if err != nil {
-		return fmt.Errorf("resolve machine goal state: %w", err)
+		return fmt.Errorf("resolve NVIDIA setup goal state: %w", err)
 	}
 
-	if !goalState.NodeStart.Containerd.NvidiaRuntime.Enabled || len(goalState.NodeStart.Nvidia.LibMappings) == 0 {
+	if !nodeStart.Containerd.NvidiaRuntime.Enabled || len(nodeStart.Nvidia.LibMappings) == 0 {
 		return fmt.Errorf("NVIDIA setup state is unavailable for machine %s", machine)
 	}
 
-	if err := nodestart.WaitForMachine(ctx, log, machine); err != nil {
+	if err := waitForMachine(ctx, log, machine); err != nil {
 		return fmt.Errorf("wait for machine %s: %w", machine, err)
 	}
 
-	return phases.ExecuteTask(ctx, log, nodestart.SetupNVIDIA(log, goalState.NodeStart))
+	return executeTask(ctx, log, nodestart.SetupNVIDIA(log, nodeStart))
 }

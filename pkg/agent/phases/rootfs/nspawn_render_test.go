@@ -335,7 +335,8 @@ func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
 	}))
 
 	require.Contains(t, buf.String(),
-		"exec /usr/local/bin/unbounded-agent-current reconcile-nvidia kube1")
+		"ExecStartPost=/usr/local/bin/unbounded-agent-current reconcile-nvidia kube1")
+	require.NotContains(t, buf.String(), "if [ ! -x")
 }
 
 func TestServiceOverride_CPUNodesDoNotReconcileNVIDIA(t *testing.T) {
