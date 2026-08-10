@@ -86,7 +86,7 @@ func ActivateHostDaemon(
 	service DaemonService,
 ) (ActivationResult, error) {
 	if log == nil {
-		log = slog.Default()
+		return ActivationResult{}, fmt.Errorf("logger is required")
 	}
 
 	if err := validateActivationOptions(opts); err != nil {

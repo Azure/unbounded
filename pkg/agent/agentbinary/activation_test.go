@@ -53,6 +53,12 @@ func (s *fakeDaemonService) WaitHealthy(_ context.Context, target string) error 
 	return nil
 }
 
+func TestActivateHostDaemonRequiresLogger(t *testing.T) {
+	_, err := ActivateHostDaemon(context.Background(), nil, ActivationOptions{}, &fakeDaemonService{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "logger is required")
+}
+
 func TestAcquireHostActivationLockSerializesCallers(t *testing.T) {
 	lockPath := filepath.Join(t.TempDir(), "activation.lock")
 
