@@ -244,7 +244,7 @@ struct Extent {
 }
 
 /// Extents per class, extent 0 included. Each one at least doubles the class, so eight
-/// is past any device that could be built.
+/// is past any store that could be built.
 const MAX_EXT: usize = 8;
 
 /// Where every region starts and how big it is. Computed at format time from the config
@@ -293,8 +293,8 @@ const GT_ROWS: usize = CLASSES.len() * (MAX_EXT - 1);
 const _: () = assert!(GT_OFF + GT_HDR + GT_ROWS * EXT_BYTES <= MBLOCK - SB_RESERVED);
 
 impl Geometry {
-    /// Size every region from the config. Fails if the device is too small.
-    fn plan(dev_bytes: u64, cfg: &crate::config::Config) -> io::Result<Geometry> {
+    /// Size every region from the config. Fails if the store is too small.
+    fn plan(store_bytes: u64, cfg: &crate::config::Config) -> io::Result<Geometry> {
         let mut g = Geometry::default();
         let want = wanted(cfg);
 
@@ -302,7 +302,7 @@ impl Geometry {
         g.zero_base = at;
         at += ZERO_BYTES;
         // Both classes' metadata, then both classes' data, so the two metadata regions
-        // sit together at the head of the device.
+        // sit together at the head of the store.
         let meta = [at, at + want[0] * 2 * MBLOCK as u64];
         at = meta[1] + want[1] * 2 * MBLOCK as u64;
         for (i, class) in CLASSES.into_iter().enumerate() {
@@ -324,7 +324,7 @@ impl Geometry {
         at += g.cache_huge_bytes;
         g.total = at;
 
-        g.check(dev_bytes)?;
+        g.check(store_bytes)?;
         Ok(g)
     }
 
@@ -366,7 +366,7 @@ impl Geometry {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("device has already been grown {} times", MAX_EXT - 1),
+                format!("store has already been grown {} times", MAX_EXT - 1),
             )
         })
     }
@@ -392,7 +392,7 @@ impl Geometry {
     }
 
     /// The first mblock id past the run holding `id`. A batched read of the metadata
-    /// region stops here: the next run's blocks are elsewhere on the device.
+    /// region stops here: the next run's blocks are elsewhere on the store.
     pub(crate) fn ext_end(&self, class: Class, id: u64) -> u64 {
         self.ext_of(class, id)
             .map_or(id, |(e, first)| first + e.mblocks)
@@ -431,7 +431,7 @@ impl Geometry {
     }
 
     /// Byte offset of one copy of an mblock. Copies A and B sit a whole run apart
-    /// rather than adjacent, so one bad neighbourhood of the device cannot take both
+    /// rather than adjacent, so one bad neighbourhood of the store cannot take both
     /// copies of a block.
     pub(crate) fn mblock_off(&self, class: Class, id: u32, copy: u8) -> u64 {
         let (e, first) = self
@@ -440,7 +440,7 @@ impl Geometry {
         e.meta + (copy as u64 * e.mblocks + (id as u64 - first)) * MBLOCK as u64
     }
 
-    /// Whether this layout has been grown. A grown device is written at a format version
+    /// Whether this layout has been grown. A grown store is written at a format version
     /// an older build refuses, because that build would read extent 0's block count as
     /// the whole class and address copy B of every block at the wrong offset.
     fn grown(&self) -> bool {
@@ -448,15 +448,18 @@ impl Geometry {
     }
 
     /// The two limits a layout has to stay inside, checked wherever one is built.
-    fn check(&self, dev_bytes: u64) -> io::Result<()> {
-        if self.total > dev_bytes {
+    fn check(&self, store_bytes: u64) -> io::Result<()> {
+        if self.total > store_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("config needs {} B, device has {dev_bytes} B", self.total),
+                format!(
+                    "config needs {} B, node.store.size_bytes is {store_bytes} B",
+                    self.total
+                ),
             ));
         }
         // Slot and mblock ids are u32 everywhere: on the wire, in the free lists, and in
-        // the mblock header. Reachable on a large device only after several growths.
+        // the mblock header. Reachable on a large store only after several growths.
         for class in CLASSES {
             if self.slots(class) > u32::MAX as u64 {
                 return Err(io::Error::new(
@@ -540,7 +543,7 @@ impl Geometry {
     }
 
     /// Extent 0 of each class, plus the regions growth never touches. This is the layout
-    /// the first version of the format had, kept word for word so a device written by it
+    /// the first version of the format had, kept word for word so a store written by it
     /// still opens.
     fn words(&self) -> [u64; WORDS] {
         let (s, h) = (self.small[0], self.huge[0]);
@@ -562,7 +565,7 @@ impl Geometry {
         ]
     }
 
-    /// The extents `grow` appended, in id order within each class. Absent on a device
+    /// The extents `grow` appended, in id order within each class. Absent on a store
     /// that has never grown, and on one formatted before this table existed.
     fn save_growth(&self, b: &mut [u8]) {
         if !self.grown() {
@@ -684,7 +687,7 @@ impl Consensus {
 
     /// Decode from a superblock image whose CRC the caller has already checked. A block
     /// written before this record existed has no magic and reads as empty, the correct
-    /// state for a device that has never run consensus.
+    /// state for a store that has never run consensus.
     fn decode(b: &[u8]) -> Consensus {
         let mut c = Consensus::default();
         if b.len() != MBLOCK || u32(&b[CS_OFF..]) != CS_MAGIC || u16(&b[CS_OFF + 4..]) != FMT_VER {
@@ -738,7 +741,7 @@ pub(crate) fn read_consensus(path: &Path) -> io::Result<Consensus> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "no valid superblock; device is not formatted",
+        "no valid superblock; store is not formatted",
     ))
 }
 
@@ -952,16 +955,16 @@ fn crc32c_sw(seed: u32, data: &[u8]) -> u32 {
 
 // ----------------------------------------------------------------------------- format
 
-/// Lay a device out for `cfg`: superblocks, the zero region, and an empty mblock for
+/// Lay the store out for `cfg`: superblocks, the zero region, and an empty mblock for
 /// every slot. Destroys whatever was there.
 pub fn format(path: &Path, cfg: &crate::config::Config) -> io::Result<Geometry> {
-    // Writing every mblock is the heaviest run of IO the device ever sees, and it is
+    // Writing every mblock is the heaviest run of IO the store ever sees, and it is
     // metered the same as anything else.
     let f = open_direct(path, true)?.meter(Arc::new(Limiter::new(
-        cfg.node.device_max_iops,
-        cfg.node.device_max_bytes_per_sec,
+        cfg.node.store_max_iops,
+        cfg.node.store_max_bytes_per_sec,
     )));
-    let g = Geometry::plan(device_bytes(&f)?, cfg)?;
+    let g = Geometry::plan(cfg.node.store_bytes, cfg)?;
 
     // One aligned staging buffer, reused. 4 MiB is both the zero-region unit and a
     // 1024-mblock batch.
@@ -976,8 +979,8 @@ pub fn format(path: &Path, cfg: &crate::config::Config) -> io::Result<Geometry> 
         write_empty(&f, &g, class, 0, g.mblocks(class), &mut buf)?;
     }
 
-    // Superblocks last, and only once every block they name is on the device: until
-    // they land the device is not formatted.
+    // Superblocks last, and only once every block they name is on the store: until
+    // they land the store is not formatted.
     sync(&f)?;
     g.encode(&mut buf.as_mut()[..MBLOCK]);
     for i in 0..SB_COPIES {
@@ -1024,8 +1027,9 @@ fn write_empty(
     Ok(())
 }
 
-/// Format a blank device, or leave an existing valid layout untouched.
+/// Format a blank store, or leave an existing valid layout untouched.
 pub fn format_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()> {
+    size_if_needed(path, cfg)?;
     let f = open_direct(path, false)?;
     let mut buf = Aligned::new(MBLOCK);
     let mut blank = true;
@@ -1046,7 +1050,7 @@ pub fn format_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<
     }
 }
 
-/// Give `cfg` the slots the device was not formatted for, without disturbing what is
+/// Give `cfg` the slots the store was not formatted for, without disturbing what is
 /// already on it. Everything new goes past the end of the layout, so no existing offset
 /// moves and no existing byte is read or rewritten; the pages already stored survive
 /// untouched, which is the whole point.
@@ -1055,36 +1059,35 @@ pub fn format_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<
 /// and the free lists are rebuilt from the scan, so appending blocks is only free
 /// between one boot and the next.
 pub fn grow_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()> {
+    size_if_needed(path, cfg)?;
     let mut g = read_geometry(path)?;
     let want = wanted(cfg);
     let have: [u64; 2] = CLASSES.map(|c| g.mblocks(c));
     let add: [u64; 2] = std::array::from_fn(|i| want[i].saturating_sub(have[i]));
 
     let f = open_direct(path, true)?.meter(Arc::new(Limiter::new(
-        cfg.node.device_max_iops,
-        cfg.node.device_max_bytes_per_sec,
+        cfg.node.store_max_iops,
+        cfg.node.store_max_bytes_per_sec,
     )));
     if add != [0, 0] {
-        // Place both runs before writing anything, so the size the device has to reach
-        // is known up front and a device that cannot reach it costs no IO.
+        // Place both runs before writing anything, so the size the store has to reach
+        // is known up front and a store too small for it costs no IO.
         for (i, class) in CLASSES.into_iter().enumerate() {
             if add[i] > 0 {
                 g.append(class, add[i])?;
             }
         }
 
-        let bytes = device_bytes(&f)?;
-        if g.total > bytes {
-            extend(&f, g.total, bytes)?;
-        }
-        g.check(device_bytes(&f)?)?;
+        // The file is already at `size_bytes`, so this is the config's own bound: raise
+        // `node.store.size_bytes` and restart to make room.
+        g.check(cfg.node.store_bytes)?;
 
         let mut buf = Aligned::new(HUGE_PAGE as usize);
         for (i, class) in CLASSES.into_iter().enumerate() {
             write_empty(&f, &g, class, have[i], add[i], &mut buf)?;
         }
-        // The blocks are on the device before a superblock names them; a run that got
-        // this far and then lost power is simply not part of the device, and the next
+        // The blocks are on the store before a superblock names them; a run that got
+        // this far and then lost power is simply not part of the store, and the next
         // boot places the same extent at the same offsets and writes it again.
         sync(&f)?;
     }
@@ -1118,7 +1121,7 @@ fn save_geometry(f: &Dev, g: &Geometry) -> io::Result<()> {
 }
 
 /// How far short of `cfg` this geometry is, in pages, for the metric that says a restart
-/// would grow the device. Zero when the config fits.
+/// would grow the store. Zero when the config fits.
 pub fn shortfall(g: &Geometry, cfg: &crate::config::Config) -> u64 {
     let want = wanted(cfg);
     CLASSES
@@ -1141,7 +1144,7 @@ pub(crate) fn read_geometry(path: &Path) -> io::Result<Geometry> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "no valid superblock; device is not formatted",
+        "no valid superblock; store is not formatted",
     ))
 }
 
@@ -1178,11 +1181,11 @@ impl Drop for Aligned {
     }
 }
 
-/// An open device, used only by control-plane paths: format, the superblock reads, and
+/// An open store, used only by control-plane paths: format, the superblock reads, and
 /// the startup scan. The hot path goes through the runtime's `Disk` instead. Under
 /// simulation this names an entry in the simulator's device table, so those paths run
 /// unchanged against an in-memory image. The limiter, when present, is shared: the scan
-/// drives one device from several threads and they meter against one budget between them.
+/// drives one store from several threads and they meter against one budget between them.
 #[cfg(not(feature = "sim"))]
 pub(crate) struct Dev(std::fs::File, Option<Arc<Limiter>>);
 
@@ -1227,60 +1230,72 @@ pub(crate) fn open_direct(path: &Path, _write: bool) -> io::Result<Dev> {
     Ok(Dev(crate::sim::device(path)?, None))
 }
 
-/// Capacity of a block device, or the length of a regular file.
+/// Hold the backing store at `node.store.size_bytes`, creating the file and its parent
+/// directory the first time. Called before every `format` and every `grow`, so a node
+/// whose config was raised picks the new size up on its next start.
+///
+/// Grow only, and deliberately: every offset in the layout is absolute, so a page that
+/// lives past a smaller end would not move, it would vanish. A file already longer than
+/// the config asks for is a config that went backwards, and both sizes are named.
+///
+/// The space is reserved with `fallocate`, not just declared with `ftruncate`: a store
+/// that discovers halfway through a write that its filesystem is full has no way to
+/// report that to the guest which already had the write acknowledged. Filesystems
+/// without it fall back to a plain length change.
 #[cfg(not(feature = "sim"))]
-fn device_bytes(d: &Dev) -> io::Result<u64> {
-    let fd = d.0.as_raw_fd();
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if st.st_mode & libc::S_IFMT == libc::S_IFBLK {
-        const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
-        let mut n: u64 = 0;
-        if unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut n) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        return Ok(n);
-    }
-    Ok(st.st_size as u64)
-}
+pub fn size_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
 
-#[cfg(feature = "sim")]
-fn device_bytes(d: &Dev) -> io::Result<u64> {
-    crate::sim::device_bytes(d.0)
-}
-
-/// Grow the backing store to `len`. A regular file is extended in place; a block device
-/// is whatever the operator gave us, so the shortfall is reported instead.
-#[cfg(not(feature = "sim"))]
-fn extend(d: &Dev, len: u64, have: u64) -> io::Result<()> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(d.0.as_raw_fd(), &mut st) } < 0 {
-        return Err(io::Error::last_os_error());
+    let want = cfg.node.store_bytes;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
     }
-    if st.st_mode & libc::S_IFMT == libc::S_IFBLK {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        // Never: an existing store is the thing being measured, not something to
+        // replace.
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+
+    let have = f.metadata()?.len();
+    if have > want {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "config needs {len} B, device has {have} B; grow the device by {} B first",
-                len - have
+                "store {} is {have} B, node.store.size_bytes is {want} B; a store cannot shrink",
+                path.display()
             ),
         ));
     }
-    d.0.set_len(len)
+    if have == want {
+        return Ok(());
+    }
+
+    if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, want as libc::off_t) } < 0 {
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => f.set_len(want)?,
+            _ => return Err(e),
+        }
+    }
+    // The length is metadata, and the superblock about to be written is addressed
+    // relative to it. Land it first.
+    if unsafe { libc::fdatasync(f.as_raw_fd()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "sim")]
-fn extend(_d: &Dev, len: u64, have: u64) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("config needs {len} B, device has {have} B"),
-    ))
+pub fn size_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()> {
+    crate::sim::resize(crate::sim::device(path)?, cfg.node.store_bytes)
 }
 
 /// Put everything written so far on stable storage. Both `format` and `grow` depend on
-/// the order: a superblock naming blocks the device has not got yet is a device that
+/// the order: a superblock naming blocks the store has not got yet is a store that
 /// cannot be opened.
 #[cfg(not(feature = "sim"))]
 fn sync(d: &Dev) -> io::Result<()> {
@@ -1425,7 +1440,7 @@ mod tests {
 
     fn test_config() -> crate::config::Config {
         crate::config::Config::parse(
-            "node id=1 zone=1 device=/dev/x cache_4k=4194304 cache_4m=8388608
+            "node id=1 zone=1 store=/dev/x size=68719476736 cache_4k=4194304 cache_4m=8388608
              group 1 2 3
              volume 1 slot=0
                extent pages=5000 kind=lww zone=1
@@ -1453,7 +1468,7 @@ mod tests {
         b[100] ^= 1;
         assert!(Geometry::decode(&b).is_none());
 
-        // Too small a device is refused rather than laid out short.
+        // Too small a store is refused rather than laid out short.
         assert!(Geometry::plan(1 << 20, &cfg).is_err());
     }
 
@@ -1554,5 +1569,58 @@ mod tests {
         g.append(Class::Small, u32::MAX as u64 / K_SMALL as u64 + 1)
             .unwrap();
         assert!(g.check(u64::MAX).is_err());
+    }
+
+    /// The store is a file this process owns end to end: it makes it, it holds it at the
+    /// size the config names, and it never gives length back.
+    #[cfg(not(feature = "sim"))]
+    #[test]
+    fn the_store_is_created_and_only_ever_grows() {
+        let dir = std::env::temp_dir().join(format!("racer-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A path two levels down, so the parent really has to be made.
+        let path = dir.join("d").join("store.img");
+
+        let sized = |bytes: u64| {
+            let mut c = test_config();
+            c.node.store = path.clone();
+            c.node.store_bytes = bytes;
+            c
+        };
+
+        // Nothing there: the directory and the file are both created, at the full size.
+        size_if_needed(&path, &sized(8 << 20)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 << 20);
+        // And with nothing readable by anyone else, since it holds guest data.
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&path).unwrap());
+        assert_eq!(mode & 0o777, 0o600);
+
+        // Asking for what it already is touches nothing.
+        size_if_needed(&path, &sized(8 << 20)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 << 20);
+
+        // A raised size is taken, and what was already written stays where it was.
+        let f = open_direct(&path, true).unwrap();
+        let mut buf = Aligned::new(MBLOCK);
+        buf.as_mut().fill(0xa5);
+        write_at(&f, buf.as_ref(), 4 << 20).unwrap();
+        drop(f);
+
+        size_if_needed(&path, &sized(32 << 20)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 32 << 20);
+        let f = open_direct(&path, false).unwrap();
+        buf.as_mut().fill(0);
+        read_at(&f, buf.as_mut(), 4 << 20).unwrap();
+        assert!(buf.as_ref().iter().all(|&b| b == 0xa5), "page survived");
+        drop(f);
+
+        // A lowered one is refused naming both sizes, and costs the file nothing.
+        let e = size_if_needed(&path, &sized(16 << 20)).expect_err("a store cannot shrink");
+        let msg = e.to_string();
+        assert!(msg.contains("33554432"), "the size it is: {msg}");
+        assert!(msg.contains("16777216"), "the size it was asked for: {msg}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 32 << 20);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

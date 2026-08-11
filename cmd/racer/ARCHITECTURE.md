@@ -2,9 +2,9 @@
 
 Racer is a Linux-only userspace distributed block dataplane. A process exports
 one ublk device per configured volume and one sparse ublk "fabric" device used
-by peers. It stores authoritative pages in a local file or block device opened
+by peers. It stores authoritative pages in one fixed-length local file opened
 with `O_DIRECT`, replicates page registers through fixed three-member consensus
-groups, and can use separate on-device regions as a cooperative read cache.
+groups, and can use separate regions of that file as a cooperative read cache.
 
 The process does not establish its peer network. An external control plane
 publishes each node's fabric ublk device through NVMe-oF and attaches remote
@@ -15,9 +15,15 @@ metrics HTTP endpoint, bound at `METRICS_ADDR` (`:9090` by default).
 ## Executables and Configuration
 
 `racer` has one command: `serve` starts the dataplane and watches the binary
-configuration for whole-file replacements. At startup it formats a blank
-backing device automatically. An existing valid layout is left untouched, and
-invalid nonblank superblocks are rejected rather than overwritten.
+configuration for whole-file replacements. The store is a single file whose path
+comes from the environment, `RACER_STORE`, defaulting to
+`/var/lib/racer/store.img`; the path belongs to the process rather than to a
+generation, so it is deliberately not in the configuration. At startup the file
+is created if it is missing, along with any parent directories, and reserved out
+to the configured `size_bytes`. A file already longer than that is refused
+rather than truncated, so a store never shrinks. A blank store is then formatted
+automatically. An existing valid layout is left untouched, and invalid nonblank
+superblocks are rejected rather than overwritten.
 
 `racer-bench` contains a checksum/copy benchmark and an end-to-end load driver.
 The configuration schema is `proto/config.proto`; `build.rs` generates Prost
@@ -26,8 +32,8 @@ types, requiring `protoc` at build time.
 The checked configuration describes:
 
 - A generation.
-- The local node: id, site, zone, and cohort. Its device — path, cache sizes,
-  and rate ceilings — plus peers. A peer may name the foreign site it lives in,
+- The local node: id, site, zone, and cohort. Its store - size, cache sizes,
+  and rate ceilings - plus peers. A peer may name the foreign site it lives in,
   making that link a site crossing, and may name the sites it will carry traffic
   to on our behalf. Nodes are otherwise alike; there is no gateway role.
 - A topology epoch, a balanced catalog of three distinct acceptors per group,
@@ -49,20 +55,20 @@ that says it can, so no node holds the far site's shape.
 
 The nodes of a zone are homogeneous. The catalog must give every node it names
 the same number of groups, so every node holds the same share of the zone and
-sizes its device for that same share: the zone's pages, times three replicas,
+sizes its store for that same share: the zone's pages, times three replicas,
 divided by the number of nodes. There is no way to declare one node larger than
 another. A node the catalog does not name holds nothing; it is either a spare
 about to join, or a member being decommissioned, or a node that only routes.
 
 The watcher uses inotify on the configuration's parent directory and reacts to
 close-write and rename-into-place. Generations must increase; a volume's
-tombstone epoch may not decrease, though it may jump by any amount; existing
-volume slots and extent shapes cannot change; the catalog keeps its length for
-the life of the zone, since that length is what folds a slot onto a group; and
-catalog membership moves one node at a time, as migration changes do. Parse,
-validation, and build failures leave the previous runtime
-configuration active and increment a metric. Reconciliation can still fail
-after publication and partially apply a generation.
+tombstone epoch may not decrease, though it may jump by any amount; the store's
+size may rise but never fall; existing volume slots and extent shapes cannot
+change; the catalog keeps its length for the life of the zone, since that length
+is what folds a slot onto a group; and catalog membership moves one node at a
+time, as migration changes do. Parse, validation, and build failures leave the
+previous runtime configuration active and increment a metric. Reconciliation can
+still fail after publication and partially apply a generation.
 
 ## Process and Runtime
 
@@ -137,7 +143,7 @@ healing, migration, or liveness operations.
 
 ## Persistent Layout and Allocator
 
-On the first `serve` of a blank device, formatting fixes all offsets and
+On the first `serve` of a blank store, formatting fixes all offsets and
 capacities. Four CRC32C-protected 4 KiB superblocks contain geometry plus
 bounded consensus promises and migration seals. The remaining regions are:
 
@@ -147,17 +153,20 @@ bounded consensus promises and migration seals. The remaining regions are:
 4. Out-of-place small and huge data slabs, with the huge slab aligned.
 5. Separate fixed-size small and huge cache regions.
 
-Capacity includes spare data slots and is checked whenever `serve` starts. The
-share a node is sized for is the zone's mean rather than a declared ceiling, so
-the overprovision above it, five percent plus a per-class floor, is also what
-absorbs the variance in how many pages actually hash into the groups a node
-holds. A configuration that has outgrown the device is satisfied by appending an
-extent per class: a fresh run of metadata blocks and the data slots they name,
-placed past the end of everything already written, recorded in a growth table in
-the superblock, and never moving a byte that already exists. Regular files are
-extended in place; a block device must be enlarged by the operator first, and
-`serve` refuses to start naming the shortfall. Growth happens only at startup,
-before shards are sized; a reload that asks for more publishes the shortfall as
+Capacity comes from one number, the configured `size_bytes`, and includes spare
+data slots. It is checked whenever `serve` starts. The share a node is sized for
+is the zone's mean rather than a declared ceiling, so the overprovision above it,
+five percent plus a per-class floor, is also what absorbs the variance in how
+many pages actually hash into the groups a node holds. A configuration that has
+outgrown the layout is satisfied by appending an extent per class: a fresh run of
+metadata blocks and the data slots they name, placed past the end of everything
+already written, recorded in a growth table in the superblock, and never moving a
+byte that already exists. The file is reserved out to `size_bytes` first, with
+`fallocate` where the file system supports it and a plain extension where it does
+not, so the space a growth run lands in is space the store already owns. If the
+appended extents would still not fit within `size_bytes`, `serve` refuses to
+start and names the shortfall. Growth happens only at startup, before shards are
+sized; a reload that asks for more publishes the shortfall as
 `racer_alloc_unbacked_pages` and runs short until the next restart.
 
 A metadata block is held wholly in memory and alternately
@@ -252,8 +261,8 @@ own hops. Relays reuse the same registered data buffer.
 The cache is advisory and divided per core. A periodically halved count-min
 sketch estimates popularity. A configured target request rate determines a
 bounded replica width; rendezvous ranking selects nested replicas without a
-directory. TinyLFU-style admission and CLOCK replacement manage fixed
-on-device slots.
+directory. TinyLFU-style admission and CLOCK replacement manage a fixed set of
+slots in the store's cache regions.
 
 Writes are in-place and non-durable, and cache metadata is not recovered after
 restart. A hit carries its claimed register, which consensus metadata must
@@ -291,8 +300,9 @@ configuration that changes the home zone and clears the next zone.
 
 ## Reload and Shutdown
 
-`Node::attach` declaratively builds a dataplane: backing disk, volume devices,
-fabric device, peer links, and process-lifetime allocator/Paxos/cache/healing
+`Node::attach` declaratively builds a dataplane: the backing store, volume
+devices, fabric device, peer links, and process-lifetime
+allocator/Paxos/cache/healing
 objects. Reconciliation registers new fixed files on all workers, stops and
 drains removed devices, publishes a new raw configuration pointer, starts new
 ublk devices, waits for every old per-worker configuration guard to drain, then
@@ -319,8 +329,10 @@ and exposes unauthenticated plaintext `GET /metrics` with five-second
 socket timeouts.
 
 Racer trusts the local configuration, external NVMe-oF control plane, Linux
-ublk/io_uring implementation, direct-I/O alignment, and device durability
-semantics. Configuration is unsigned and can select writable device paths. The
+ublk/io_uring implementation, direct-I/O alignment, and the durability semantics
+of the file system and device under its store. Configuration is unsigned and can
+select writable peer device paths; the store's own path comes from the process
+environment rather than from a generation. The
 fabric has no authentication, authorization, encryption, peer identity, or
 replay protection; access to its namespace permits consensus and control
 operations. Anti-entropy digests are collision-prone hints, not integrity
@@ -336,7 +348,7 @@ Important implementation boundaries are:
   guards. Topology epoch accompanies small writes but is not enforced by
   receivers.
 - Reload validation does not make all identity, peer, topology-epoch, or hash
-  slot changes immutable. A reload that outgrows the device is accepted and runs
+  slot changes immutable. A reload that outgrows the store is accepted and runs
   short until a restart grows it.
 - Empty peer links select quorum one. Promise changes can remain only in memory,
   and observed higher ballot terms are not persisted before a crash.

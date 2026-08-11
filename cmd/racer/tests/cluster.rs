@@ -2,7 +2,7 @@
 //! assertion goes through a ublk device, half of them through a node that does not hold
 //! the page. Separate processes because only one runtime may exist per process.
 //!
-//! Each node's device is a file on its own ext4, on a loop device backed by a memfd, so
+//! Each node's store is a file on its own ext4, on a loop device backed by a memfd, so
 //! the test never touches real storage. Peers are wired straight to each other's fabric
 //! block device, so only the nvme-of transport is left out.
 
@@ -20,8 +20,12 @@ use racer::config::Config;
 
 const NODES: u32 = 7;
 const ROOT: &str = "/tmp/racer-e2e";
-const FS_BYTES: u64 = 2 << 30;
+/// Room for the store twice over: a rebuild lays a fresh one down before the file
+/// system has finished accounting for the one it just removed.
+const FS_BYTES: u64 = 3 << 30;
 const IMG_BYTES: u64 = 1 << 30;
+/// What the store is raised to partway through, to watch a start reserve the difference.
+const GROWN_BYTES: u64 = IMG_BYTES + (256 << 20);
 const PAGE: usize = 4096;
 const HUGE: usize = 4 << 20;
 
@@ -54,6 +58,10 @@ struct Node {
     out: Option<BufReader<ChildStdout>>,
     volumes: Vec<(u32, PathBuf)>,
     fabric: PathBuf,
+    /// What the generations written for this node say its store must be. The control
+    /// plane's to raise, one node at a time, which is how the test asks for a bigger
+    /// file.
+    store_bytes: u64,
     /// Where this node's prometheus endpoint landed; the port is ephemeral.
     metrics: String,
 }
@@ -65,6 +73,9 @@ impl Node {
             .arg("serve")
             .arg(self.dir.join("node.pb"))
             .env("METRICS_ADDR", "127.0.0.1:0")
+            // The store's path is this process's own, so it never appears in a
+            // generation: the control plane places the file, racer sizes it.
+            .env(racer::config::STORE_PATH_ENV, &self.img)
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn racer serve");
@@ -132,6 +143,32 @@ impl Node {
             .1
             .clone();
         Dev::open(&p)
+    }
+
+    /// How much of the filesystem the store is holding, which is what `size=` asked for
+    /// the last time this node started.
+    fn store_len(&self) -> u64 {
+        std::fs::metadata(&self.img).expect("stat the store").len()
+    }
+
+    /// Start `racer serve` on a configuration it must refuse and return what it said on
+    /// the way out. The node has to be down: this is the same store.
+    fn serve_refuses(&self, text: &str) -> String {
+        let cfg = Config::parse(text).expect("parse config");
+        let path = self.dir.join("node.refused");
+        std::fs::write(&path, cfg.encode()).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_racer"))
+            .arg("serve")
+            .arg(&path)
+            .env("METRICS_ADDR", "127.0.0.1:0")
+            .env(racer::config::STORE_PATH_ENV, &self.img)
+            .output()
+            .expect("spawn racer serve");
+        assert!(
+            !out.status.success(),
+            "racer started on a store it must have refused"
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
     }
 }
 
@@ -294,8 +331,9 @@ fn build_node(id: u32) -> Node {
     };
     assert_eq!(rc, 0, "mount {loop_path}: {}", last_error());
 
-    let img = mnt.join("disk.img");
-    File::create(&img).unwrap().set_len(IMG_BYTES).unwrap();
+    // Deliberately not created: racer places and sizes its own store, and the first
+    // start of the cluster is where that is proved.
+    let img = mnt.join("store.img");
     Node {
         id,
         dir,
@@ -308,6 +346,7 @@ fn build_node(id: u32) -> Node {
         out: None,
         volumes: Vec::new(),
         fabric: PathBuf::new(),
+        store_bytes: IMG_BYTES,
         metrics: String::new(),
     }
 }
@@ -474,14 +513,14 @@ fn write_occ(dev: &Dev, off: u64, page: &[u8]) {
 /// owning group, which is what the forwarding rules exist for.
 ///
 /// The catalog is balanced, as a zone's catalog must be: each of the six members holds
-/// one of the six seats, so every device is formatted to the same size off one set of
+/// one of the six seats, so every store is formatted to the same size off one set of
 /// volumes. Node 7 holds nothing yet and sizes itself for the share it would inherit.
 fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     let mut s = format!(
-        "generation {generation}\nnode id={} zone=1 cohort={} device={} cache_4k=16777216 cache_4m=33554432\n",
+        "generation {generation}\nnode id={} zone=1 cohort={} size={} cache_4k=16777216 cache_4m=33554432\n",
         n.id,
         (n.id - 1) % 3,
-        n.img.display(),
+        n.store_bytes,
     );
     for (id, dev) in peers {
         s += &format!("peer id={id} device={}\n", dev.display());
@@ -515,6 +554,15 @@ fn catalog() -> Vec<[u32; 3]> {
 
 fn set_catalog(groups: &[[u32; 3]]) {
     *CATALOG.lock().unwrap() = groups.to_vec();
+}
+
+/// Every other node's fabric device, as `config_text` wants them.
+fn peers_of(nodes: &[Node], id: u32) -> Vec<(u32, PathBuf)> {
+    nodes
+        .iter()
+        .filter(|n| n.id != id)
+        .map(|n| (n.id, n.fabric.clone()))
+        .collect()
 }
 
 /// Tell the nodes at `who` where everyone's fabric device currently lives, as the
@@ -585,15 +633,16 @@ fn rebuild(
     let all: Vec<usize> = (0..nodes.len()).collect();
 
     // Remove the whole backing file, not just the metadata region a reformat would
-    // rewrite: what comes back is a blank disk.
+    // rewrite: what comes back is a blank store, placed and sized by the restart.
     nodes[i].signal(libc::SIGKILL);
     nodes[i].reap();
-    std::fs::remove_file(&nodes[i].img).expect("remove backing file");
-    File::create(&nodes[i].img)
-        .unwrap()
-        .set_len(IMG_BYTES)
-        .unwrap();
+    std::fs::remove_file(&nodes[i].img).expect("remove the store");
     nodes[i].serve();
+    assert_eq!(
+        nodes[i].store_len(),
+        nodes[i].store_bytes,
+        "a start must place a missing store at the configured size"
+    );
     // The restarted node's fabric device is a fresh minor, so its peers need telling.
     *generation += 1;
     wire(nodes, *generation, &all);
@@ -675,6 +724,16 @@ fn six_node_cluster() {
         let text = config_text(1, n, &[]);
         n.install(&text);
         n.serve();
+    }
+    // Nothing created the store: the file did not exist before the start that formatted
+    // it, and `size=` is the whole of what says how big it is.
+    for n in &nodes {
+        assert_eq!(
+            n.store_len(),
+            IMG_BYTES,
+            "node {} did not place its own store",
+            n.id
+        );
     }
 
     // ---- second generation: now every node can name every peer's fabric device ----
@@ -899,7 +958,36 @@ fn six_node_cluster() {
         pattern(2, PAGE),
         "a quorum keeps serving after a member dies"
     );
+    // ---- the store grows on the way up, and never the other way --------------------
+    // While the node is down, the control plane raises its share. A start reserves the
+    // difference in place; the pages already in the file stay where they were, which the
+    // reads below check. A start on a lower `size=` than the file already holds is the
+    // one case racer refuses outright: shrinking would cut the slabs off at the end.
+    assert_eq!(nodes[0].store_len(), IMG_BYTES, "formatted at its share");
+    {
+        let peers = peers_of(&nodes, nodes[0].id);
+        nodes[0].store_bytes = IMG_BYTES - PAGE as u64;
+        let said = nodes[0].serve_refuses(&config_text(3, &nodes[0], &peers));
+        assert!(
+            said.contains(&IMG_BYTES.to_string())
+                && said.contains(&(IMG_BYTES - PAGE as u64).to_string()),
+            "a refused shrink must name both sizes: {said}"
+        );
+        assert_eq!(
+            nodes[0].store_len(),
+            IMG_BYTES,
+            "a refused start must leave the store alone"
+        );
+
+        nodes[0].store_bytes = GROWN_BYTES;
+        nodes[0].install(&config_text(3, &nodes[0], &peers));
+    }
     nodes[0].serve();
+    assert_eq!(
+        nodes[0].store_len(),
+        GROWN_BYTES,
+        "a raised size= must be reserved at the next start"
+    );
     // The restarted node's fabric device is a fresh minor, so its peers need telling.
     wire(&mut nodes, 3, &(1..NODES as usize).collect::<Vec<_>>());
     let a = nodes[0].dev(LWW);

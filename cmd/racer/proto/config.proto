@@ -18,12 +18,11 @@
 // else. Sites are the exception — a site is the top 8 bits of a volume id, so 0 is an
 // ordinary site and the single-site case is site 0 throughout.
 //
-// What a reload can and cannot change is structural here. Everything in `Node.device`
-// is baked into the device superblock at format time or read once at startup, so a
-// change to it is accepted and does nothing until the device is reformatted and the
-// process restarted. An existing volume's `slot`, extent count, and each extent's
-// `pages` and `kind` are frozen for the life of the volume. Every other field
-// is hot.
+// What a reload can and cannot change is structural here. Everything in `Node.store` is
+// baked into the store's superblock at format time or read once at startup, so a change
+// to it is accepted and does nothing until the process restarts. An existing volume's
+// `slot`, extent count, and each extent's `pages` and `kind` are frozen for the life of
+// the volume. Every other field is hot.
 
 syntax = "proto3";
 
@@ -81,8 +80,8 @@ message Node {
   // degraded mode. Do not ship an empty peer list to a node meant to be replicated.
   repeated Peer peers = 5;
 
-  // The local namespace this node owns outright, and what is carved out of it.
-  Device device = 6;
+  // The local backing store this node owns outright, and what is carved out of it.
+  Store store = 6;
 }
 
 enum Cohort {
@@ -114,13 +113,27 @@ message Peer {
   repeated uint32 gateway_for = 4;
 }
 
-// The local NVMe namespace this node owns outright. Nothing in here is on an IO path:
-// every field is written into the superblock when the device is formatted, read once at
-// startup, or checked when a config is validated, so a change is accepted and takes
-// effect on the next restart.
-message Device {
-  // e.g. /dev/nvme0n1.
-  string path = 1;
+// The local backing store this node owns outright: one regular file, of exactly the
+// length named here. Nothing in this message is on an IO path: every field is written
+// into the superblock when the store is formatted, read once at startup, or checked when
+// a config is validated, so a change is accepted and takes effect on the next restart.
+//
+// The path is deliberately absent. Where the file lives is a property of how the node
+// was deployed, not of the cluster the control plane describes, so it comes from the
+// `RACER_STORE` environment variable instead (default /var/lib/racer/store.img).
+message Store {
+  // The length the backing file is held at, in bytes. Non-zero and a multiple of 4096.
+  // The file is created at this length on first start and extended to it on a later one,
+  // so raising this value and restarting is how a node is given more capacity.
+  //
+  // It may never be lowered: a config that asks for less than the file already has is
+  // rejected, and so is a start that finds a file longer than this. The store's contents
+  // are addressed by absolute offset and there is nothing that could move them.
+  //
+  // Everything the node holds comes out of this: the superblocks, the metadata region,
+  // the data slabs sized from `Volume.extents`, and both cache regions below. A
+  // configuration that does not fit is refused at startup, naming this field.
+  uint64 size_bytes = 1;
 
   // Bytes reserved for the read cache, per page class. Rounded down to a whole page and
   // carved at format time after the data slabs. Zero means no cache region for that
@@ -128,15 +141,15 @@ message Device {
   //
   // A separate address space from the allocator's slabs, deliberately, so cache
   // pressure can never reach the allocator's watermarks and the allocator can never
-  // reclaim cache space. The device must hold the slabs plus both cache regions.
+  // reclaim cache space. The store must hold the slabs plus both cache regions.
   uint64 cache_bytes_4k = 2;
   uint64 cache_bytes_4m = 3;
 
-  // The rate this node will drive its own device at. Storage that meters a client and
+  // The rate this node will drive its own storage at. Storage that meters a client and
   // then delays or fails whatever exceeds the meter is better served by staying under
   // it: pacing our own submissions costs a bounded wait, overshooting costs an
   // unbounded one applied to whichever IO happens to be in flight. Set these below what
-  // the device will actually take, not at it.
+  // the device under the file will actually take, not at it.
   //
   // Both are enforced at once and either can bind first — small writes exhaust
   // operations while the byte budget idles, and a 4 MiB page does the reverse. A
@@ -175,7 +188,7 @@ message Topology {
   // names appears in exactly `3 * len(catalog) / n` groups, where `n` is the number of
   // distinct nodes named, and `n` must divide `3 * len(catalog)`. A catalog that gives
   // one node more groups than another is refused. There is no other capacity model: a
-  // node sizes its device from that equal share, so every node of a zone formats
+  // node sizes its store from that equal share, so every node of a zone formats
   // identically and any of them can be replaced by any other.
   //
   // Between consecutive generations the set of members may differ by at most one id:
@@ -264,7 +277,7 @@ message Volume {
 
 message Extent {
   // Length in pages, not bytes, so a misaligned extent is unrepresentable. Non-zero.
-  // Summed across all volumes this sizes the device at format time and is what the index
+  // Summed across all volumes this sizes the store at format time and is what the index
   // budget is checked against, so it cannot change once the volume exists.
   uint32 pages = 1;
 

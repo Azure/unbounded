@@ -457,13 +457,13 @@ impl Cache {
         self.tau() > 0 && !self.roster.get().nodes.is_empty()
     }
 
-    /// Sheds while the allocator is short of free space, or while the device's rate
+    /// Sheds while the allocator is short of free space, or while the store's rate
     /// budget is already committed ahead. Cache space is statically separate from the
-    /// allocator's but device bandwidth is not, so the cache stops admitting before
+    /// allocator's but store bandwidth is not, so the cache stops admitting before
     /// anything authoritative slows down. An inbound extent migration reaches the cache
     /// through this and nothing else.
     pub fn shedding(&self) -> bool {
-        self.alloc.pressure() != Pressure::Normal || self.alloc.device_pressed()
+        self.alloc.pressure() != Pressure::Normal || self.alloc.store_pressed()
     }
 
     fn stat(&self, f: impl FnOnce(&mut Stats)) {

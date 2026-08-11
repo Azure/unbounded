@@ -28,14 +28,16 @@ fn main() -> std::io::Result<()> {
 }
 
 fn serve(cfg: Config, path: String, metrics: String) -> std::io::Result<()> {
-    let dev = Path::new(&cfg.node.device);
-    layout::format_if_needed(dev, &cfg)?;
+    // Sized, created and formatted before anything else: the store is the one thing
+    // this process cannot start without.
+    let store = cfg.node.store.as_path();
+    layout::format_if_needed(store, &cfg)?;
 
-    // A config that has outgrown the device gets the extra slots here, before the
+    // A config that has outgrown the store gets the extra slots here, before the
     // allocator sizes its shards from the geometry. Fails the start rather than running
-    // short: a device that cannot be grown is an operator's problem, not an ENOSPC an
-    // hour later.
-    layout::grow_if_needed(dev, &cfg)?;
+    // short: a store the config no longer fits in is an operator's problem, not an
+    // ENOSPC an hour later.
+    layout::grow_if_needed(store, &cfg)?;
 
     // Block the shutdown signals before any thread exists, so every thread inherits the
     // mask and `sigwait` below is the only place they are delivered.
