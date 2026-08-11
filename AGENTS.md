@@ -21,10 +21,11 @@ unbounded-kube is organized into several directories:
   - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
   - `machina` - sources for the machina controller.
   - `metalman` - sources for the metalman controller.
+  - `racer` - standalone Rust crate for the RACER peer-to-peer distributed block device. Read `cmd/racer/README.md` and `cmd/racer/ARCHITECTURE.md` before making changes; its Cargo-based build and testing conventions differ from the Go components.
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
-  - `unbounded-storage` - sources for the unbounded-storage daemon. **This is the only Rust crate in the repository** and is a special case: it has its own conventions for layout, build, and testing (in particular a deterministic simulation testing harness under `cmd/unbounded-storage/tests/`). Agents working on anything under `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the rules in this file are Go-oriented and largely do not apply there.
+  - `unbounded-storage` - sources for the Rust unbounded-storage daemon. It has its own conventions for layout, build, and testing (in particular a deterministic simulation testing harness under `cmd/unbounded-storage/tests/`). Agents working on anything under `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the Go-oriented rules in this file largely do not apply there.
   - `unping` - health check probe utility.
   - `unroute` - eBPF route inspection utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
@@ -56,6 +57,7 @@ unbounded-kube is organized into several directories:
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - To build `gantry` use `make gantry` which runs tests and builds the binary.
 - To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
+- To test `racer`, install `liburing-dev` and `protobuf-compiler`, then run `cargo test --locked --all-targets` and `cargo test --locked --all-targets --features sim` from `cmd/racer/`.
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).

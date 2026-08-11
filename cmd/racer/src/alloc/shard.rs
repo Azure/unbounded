@@ -1,0 +1,2388 @@
+//! The allocator's core state machine.
+//!
+//! Everything here is synchronous and touches no device, no runtime and no clock:
+//! `alloc.rs` owns the IO and the cross-core hops, this file owns the decisions those
+//! hops carry. A refusal costs nothing because no IO has been issued yet.
+//!
+//! That split is also what makes the state machine checkable: `mod model` at the foot
+//! of this file drives these types with `stateright` at a slot count small enough to
+//! enumerate, so the guard rules, slot accounting and startup reconciliation are
+//! checked as production code rather than as a paraphrase.
+//!
+//! Not modelled: the anti-entropy accumulators and snapshot cursors. They hang off
+//! `Slab` because they must sit next to `entries`, but their policy lives in `heal.rs`
+//! and they are excluded from shard equality — see `mod cmp`.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+
+use crate::config::Kind;
+use crate::heal::{self, Digests, Groups, Snaps, Tuple};
+use crate::layout::{Class, Entry, Header, State};
+use crate::paxos::{Ballot, Register};
+use crate::runtime::Errno;
+
+/// Local mblocks the tombstone sweep examines per `tick`, per class.
+const SWEEP_PER_TICK: u32 = 64;
+
+/// Maps a page address to its volume's tombstone epoch. Passed in for the same reason
+/// as [`Groups`]: the slab holds no config, and the epoch is per volume.
+pub(crate) type Epochs<'a> = dyn Fn(u64) -> u32 + 'a;
+
+// ---------------------------------------------------------------------------- address
+
+/// A page address in the flat address space: `volume:32 | offset:32`, the offset in
+/// pages of the extent's own size. Volume id 0 is reserved so that a zero address in an
+/// mblock entry unambiguously means "free slot".
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct GlobalAddr(pub u64);
+
+impl GlobalAddr {
+    pub fn new(volume: u32, offset: u32) -> GlobalAddr {
+        GlobalAddr((volume as u64) << 32 | offset as u64)
+    }
+
+    pub fn volume(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    pub fn offset(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+/// Why a request could not be served. The block layer must tell these apart: a hole
+/// reads as zeroes, everything else is an error.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Status {
+    /// Never written, or trimmed. Reads as zeroes.
+    Hole,
+    /// We are supposed to hold this page and cannot serve it: failed checksum, or its
+    /// metadata is quarantined. Never served; healed from peers.
+    Missing,
+    /// Kind semantics refused the write. `current` is the version we hold.
+    Conflict {
+        current: u64,
+    },
+    /// The address is not covered by any extent in the config.
+    Unmapped,
+    /// The slab class is full.
+    NoSpace,
+    Io,
+}
+
+impl Status {
+    pub fn errno(self) -> Errno {
+        match self {
+            Status::Hole => Errno::EIO,
+            Status::Missing => Errno::EIO,
+            Status::Conflict { .. } => Errno::from_raw(libc::EAGAIN),
+            Status::Unmapped => Errno::EINVAL,
+            Status::NoSpace => Errno::ENOSPC,
+            Status::Io => Errno::EIO,
+        }
+    }
+
+    /// A peer's error, back to a status. Anything unrecognised is `Io`: a remote error
+    /// we cannot name is not one we should act on.
+    pub fn from_wire(e: Errno) -> Status {
+        match e {
+            crate::fabric::status::MISSING => Status::Missing,
+            crate::fabric::status::STALE => Status::Conflict { current: 0 },
+            crate::fabric::status::NOSPC => Status::NoSpace,
+            _ => Status::Io,
+        }
+    }
+}
+
+/// Free-space state of the local shard. `Low` makes `server.rs` delay write
+/// completions; `Critical` turns writes into `ENOSPC`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Pressure {
+    Normal,
+    Low,
+    Critical,
+}
+
+// ------------------------------------------------------------------------- hash index
+
+/// `GlobalAddr -> global slot id`, open addressed with linear probing. Sized once at
+/// startup; an insert that would push the table past 7/8 full fails rather than
+/// growing, because nothing may allocate on the hot path.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct HashIndex {
+    /// Key and value share a slot: a lookup is one cache line, not two.
+    slots: Box<[(u64, u32)]>,
+    mask: usize,
+    len: usize,
+}
+
+impl HashIndex {
+    fn new(expect: u64) -> HashIndex {
+        let cap = (expect.max(8) * 2).next_power_of_two() as usize;
+        HashIndex {
+            slots: vec![(0u64, 0u32); cap].into_boxed_slice(),
+            mask: cap - 1,
+            len: 0,
+        }
+    }
+
+    fn probe(&self, key: u64) -> usize {
+        crate::config::mix(key) as usize & self.mask
+    }
+
+    fn find(&self, key: u64) -> Option<usize> {
+        let mut i = self.probe(key);
+        loop {
+            match self.slots[i].0 {
+                0 => return None,
+                k if k == key => return Some(i),
+                _ => i = (i + 1) & self.mask,
+            }
+        }
+    }
+
+    fn get(&self, key: u64) -> Option<u32> {
+        self.find(key).map(|i| self.slots[i].1)
+    }
+
+    /// Returns the slot this address used to occupy, if any.
+    fn insert(&mut self, key: u64, val: u32) -> Option<u32> {
+        let mut i = self.probe(key);
+        loop {
+            match self.slots[i].0 {
+                0 => break,
+                k if k == key => {
+                    let old = self.slots[i].1;
+                    self.slots[i].1 = val;
+                    return Some(old);
+                }
+                _ => i = (i + 1) & self.mask,
+            }
+        }
+        if self.len + 1 > self.slots.len() - self.slots.len() / 8 {
+            // Sized from the slab's slot count, so this means the group hash is far
+            // more skewed than uniform. Refuse rather than probe forever.
+            return None;
+        }
+        self.slots[i] = (key, val);
+        self.len += 1;
+        None
+    }
+
+    fn remove(&mut self, key: u64) -> Option<u32> {
+        let mut i = self.find(key)?;
+        let val = self.slots[i].1;
+        self.len -= 1;
+        // Backward-shift deletion: pull up any later key whose ideal position is at or
+        // before the hole, so probe chains stay unbroken.
+        let mut j = i;
+        loop {
+            self.slots[i].0 = 0;
+            loop {
+                j = (j + 1) & self.mask;
+                let k = self.slots[j].0;
+                if k == 0 {
+                    return Some(val);
+                }
+                let ideal = self.probe(k);
+                if (j.wrapping_sub(ideal) & self.mask) >= (j.wrapping_sub(i) & self.mask) {
+                    break;
+                }
+            }
+            self.slots[i] = self.slots[j];
+            i = j;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------- occ ring
+
+/// Volatile record of what this node last read for an OCC page. `guard_of` refuses an
+/// address with no record, so an empty ring after restart conflicts every in-flight OCC
+/// write.
+///
+/// Ordered by observation, not insertion: re-reading a page pushes a fresh position, so
+/// a hot page is never evicted ahead of a cold one. Superseded positions are left in
+/// `fifo` and skipped when they reach the front, which keeps `observe` O(1) at the cost
+/// of holding fewer than `cap` live records for a while.
+#[derive(Clone)]
+struct OccRing {
+    seen: HashMap<u64, (u64, u64)>,
+    fifo: VecDeque<(u64, u64)>,
+    seq: u64,
+    cap: usize,
+}
+
+impl OccRing {
+    fn new(cap: usize) -> OccRing {
+        OccRing {
+            seen: HashMap::with_capacity(cap),
+            fifo: VecDeque::with_capacity(cap),
+            seq: 0,
+            cap,
+        }
+    }
+
+    fn observe(&mut self, addr: u64, version: u64) {
+        self.seq += 1;
+        self.seen.insert(addr, (version, self.seq));
+        self.fifo.push_back((addr, self.seq));
+        self.trim();
+    }
+
+    /// Drop from the front until the pool is back within `cap`. A position whose address
+    /// has since been re-read is stale and costs nothing to discard.
+    fn trim(&mut self) {
+        while self.fifo.len() > self.cap
+            && let Some((addr, seq)) = self.fifo.pop_front()
+        {
+            if self.seen.get(&addr).is_some_and(|&(_, s)| s == seq) {
+                self.seen.remove(&addr);
+            }
+        }
+    }
+
+    /// Resize to this core's share of the pool; a config reload can change it.
+    fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+        self.trim();
+    }
+
+    /// The version this node last read for `addr`, if it is still in the ring.
+    fn version(&self, addr: u64) -> Option<u64> {
+        self.seen.get(&addr).map(|&(v, _)| v)
+    }
+}
+
+// --------------------------------------------------------------------------- slab
+
+/// One slab class on one core.
+///
+/// Slot ids are global within the class. This core owns mblock `m` iff
+/// `m % cores == core`, so `local = (m / cores) * k + i` is pure arithmetic and no
+/// ownership table is needed. `entries` is not a cache of the on-disk mblocks: it *is*
+/// their content, which is what makes a metadata write a full-block rewrite with no
+/// read-modify-write.
+struct Slab {
+    core: u32,
+    cores: u32,
+    pub(super) k: u32,
+    /// Number of mblocks in this core's stripe.
+    pub(super) local: u32,
+    pub(super) entries: Box<[Entry]>,
+    pub(super) generation: Box<[u64]>,
+    /// Both copies failed their CRC at startup: never allocated, never read.
+    pub(super) quarantined: Box<[bool]>,
+    /// Any mblock in this stripe was quarantined, so an index miss here could be a
+    /// page whose entry was in the block we lost. Derived from `quarantined`, cached
+    /// because every miss asks.
+    lost: bool,
+    index: HashIndex,
+    /// Entries for indexed pages whose slot is in another core's stripe. Empty unless
+    /// the index shard width changed since the last boot.
+    foreign: HashMap<u64, Entry>,
+    /// Free *local* slot ids, popped from the back. Built in descending order at
+    /// startup so pops ascend and consecutive allocations share an mblock, which is
+    /// all an "open mblock" needs to be.
+    free: Vec<u32>,
+    commit_seq: Box<[u64]>,
+    durable_seq: Box<[u64]>,
+    flushing: bool,
+    sweep: u32,
+    /// Anti-entropy accumulators over this slab's registers, keyed by consensus group.
+    /// Seeded once by `rebuild`, then maintained incrementally by `set`.
+    digests: Digests,
+    /// Live and tombstoned entries per volume, sorted by volume id. Maintained by
+    /// `set` alongside the digests and seeded by `rebuild` in the same pass, because
+    /// the control plane cannot advance a volume's epoch without knowing whether
+    /// anything in it is still live. Bounded by `MAX_VOLUMES`.
+    census: Vec<(u32, u32, u32)>,
+    /// Open enumerations and the reclamation they hold back.
+    snaps: Snaps,
+}
+
+impl Slab {
+    fn new(core: u32, cores: u32, k: u32, mblocks: u64, expect_pages: u64) -> Slab {
+        // Ids `core, core+cores, ...` below `mblocks`.
+        let local = if (core as u64) < mblocks {
+            ((mblocks - core as u64 - 1) / cores as u64 + 1) as u32
+        } else {
+            0
+        };
+        let n = local as usize * k as usize;
+        Slab {
+            core,
+            cores,
+            k,
+            local,
+            entries: vec![Entry::default(); n].into_boxed_slice(),
+            generation: vec![0u64; local as usize].into_boxed_slice(),
+            quarantined: vec![false; local as usize].into_boxed_slice(),
+            lost: false,
+            index: HashIndex::new(expect_pages),
+            foreign: HashMap::new(),
+            free: Vec::with_capacity(n),
+            commit_seq: vec![0u64; local as usize].into_boxed_slice(),
+            durable_seq: vec![0u64; local as usize].into_boxed_slice(),
+            flushing: false,
+            sweep: 0,
+            digests: Digests::default(),
+            census: Vec::new(),
+            snaps: Snaps::default(),
+        }
+    }
+
+    fn local_of(&self, slot: u32) -> Option<u32> {
+        let m = slot / self.k;
+        if m % self.cores != self.core {
+            return None;
+        }
+        Some((m / self.cores) * self.k + slot % self.k)
+    }
+
+    fn global_of(&self, local: u32) -> u32 {
+        let li = local / self.k;
+        (li * self.cores + self.core) * self.k + local % self.k
+    }
+
+    /// The durable record for an indexed address, wherever its slot lives.
+    fn entry_of(&self, addr: u64) -> Option<(u32, Entry)> {
+        let slot = self.index.get(addr)?;
+        match self.local_of(slot) {
+            Some(l) => Some((slot, self.entries[l as usize])),
+            None => self.foreign.get(&addr).map(|e| (slot, *e)),
+        }
+    }
+
+    fn dirty(&mut self, li: u32) -> u64 {
+        self.commit_seq[li as usize] += 1;
+        self.commit_seq[li as usize]
+    }
+
+    /// The one place an entry changes after startup. Routing every mutation through
+    /// here is what lets the digest be maintained incrementally — XOR is its own
+    /// inverse, so one call takes the old register out and puts the new one in — and
+    /// what lets an open cursor see every register exactly once.
+    ///
+    /// Entries in `foreign` are outside all of this on purpose: they exist only until
+    /// the page relocates on its next write, and a repair is such a write, so excluding
+    /// them makes the divergence they cause self-clearing.
+    fn set(&mut self, local: u32, e: Entry, gof: &Groups) {
+        let old = std::mem::replace(&mut self.entries[local as usize], e);
+        if old.addr != 0 {
+            self.snaps.retain(&old);
+            self.digests.toggle(gof(old.addr), &old);
+            self.count(old, -1);
+        }
+        if e.addr != 0 {
+            self.digests.toggle(gof(e.addr), &e);
+            self.count(e, 1);
+        }
+    }
+
+    /// Move an entry into or out of its volume's census row. Rows appear on the first
+    /// entry for a volume and go away when it holds nothing, so a deleted volume leaves
+    /// no series behind.
+    fn count(&mut self, e: Entry, by: i32) {
+        let (live, tomb) = match e.state {
+            State::Live => (by, 0),
+            State::Tombstone => (0, by),
+            State::Empty => return,
+        };
+        let v = (e.addr >> 32) as u32;
+        let i = match self.census.binary_search_by_key(&v, |r| r.0) {
+            Ok(i) => i,
+            Err(i) => {
+                self.census.insert(i, (v, 0, 0));
+                i
+            }
+        };
+        let r = &mut self.census[i];
+        r.1 = r.1.saturating_add_signed(live);
+        r.2 = r.2.saturating_add_signed(tomb);
+        if r.1 == 0 && r.2 == 0 {
+            self.census.remove(i);
+        }
+    }
+
+    /// Return a slot for reuse, or park it if a cursor might still need to walk it.
+    fn recycle(&mut self, local: u32) {
+        self.snaps.park(&mut self.free, local);
+    }
+
+    /// Return a slot to the free list. A no-op for a slot outside this core's stripe;
+    /// callers in `alloc.rs` hop to the holding core first.
+    fn release(&mut self, slot: u32, gof: &Groups) {
+        let Some(l) = self.local_of(slot) else { return };
+        if self.entries[l as usize].addr == 0 {
+            return;
+        }
+        self.set(l, Entry::default(), gof);
+        self.recycle(l);
+        self.dirty(l / self.k);
+    }
+
+    fn pressure(&self) -> Pressure {
+        let total = self.entries.len();
+        if total == 0 {
+            return Pressure::Normal;
+        }
+        let free = self.free.len();
+        if free * 200 < total {
+            Pressure::Critical
+        } else if free * 50 < total {
+            Pressure::Low
+        } else {
+            Pressure::Normal
+        }
+    }
+
+    /// Free and total slots in this core's stripe.
+    fn capacity(&self) -> (u64, u64) {
+        (self.free.len() as u64, self.entries.len() as u64)
+    }
+}
+
+// ---------------------------------------------------------------------------- tickets
+
+/// Reserved slot plus the register the page will carry once committed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct Ticket {
+    pub(super) slot: u32,
+    pub(super) version: u64,
+    pub(super) ballot: Ballot,
+    /// The row this reservation was issued against, `None` for an absent address.
+    /// `stage` refuses if it has moved, which is what makes the window between the
+    /// two safe.
+    pub(super) prior: Option<(u64, u64)>,
+}
+
+/// What a read needs from the owning core.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct Lookup {
+    pub(super) slot: u32,
+    pub(super) version: u64,
+    pub(super) ballot: u64,
+    pub(super) crc: u32,
+}
+
+/// What `flush_until` should do next. Splitting the decision out of the wait loop keeps
+/// the loop's only shard borrow synchronous and closed before its await.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Act {
+    /// Already durable at or past the sequence asked for.
+    Done,
+    /// Somebody else's write is in flight; park and re-check.
+    Wait,
+    /// This caller took the flush.
+    Go,
+}
+
+/// The version a page effectively holds, which is not always the version in its entry.
+/// An `Immutable` page with no entry, or with one left behind by an older epoch, is
+/// empty at the *current* epoch and so sits at `3 * epoch`. That is what lets an epoch
+/// advance take no consensus round: every replica computes the same number from the
+/// entry and the control-plane epoch alone.
+fn effective(e: Option<Entry>, kind: Kind, epoch: u64) -> u64 {
+    match (e, kind) {
+        (Some(e), Kind::Immutable) if e.version / 3 < epoch => 3 * epoch,
+        (Some(e), _) => e.version,
+        (None, Kind::Immutable) => 3 * epoch,
+        (None, _) => 0,
+    }
+}
+
+/// The state a freshly accepted version implies. Ordinal 2 of `Immutable`'s
+/// `3*epoch + ordinal` encoding is a tombstone, so a trim needs no opcode inside the
+/// allocator: it is an accept whose version happens to be one past the fill point.
+fn state_of(kind: Kind, version: u64) -> State {
+    match kind {
+        Kind::Immutable if version % 3 == 2 => State::Tombstone,
+        _ => State::Live,
+    }
+}
+
+// ----------------------------------------------------------------------------- shard
+
+/// What a commit still owes: the mblock it must make durable, and the slot the address
+/// used to occupy. The stale slot is only released once the new one is durable — free
+/// it eagerly and a crash between the two mblock writes leaves the address in neither,
+/// which is a lost acknowledged write. Crashing with both slots live is fine: startup
+/// resolves the duplicate by `(version, ballot)`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct Staged {
+    pub li: u32,
+    pub seq: u64,
+    pub stale: Option<u32>,
+}
+
+/// The shape a shard is built to. Production fills this from the device geometry; the
+/// model fills it with a handful of slots so the state space can be enumerated. Every
+/// dimension the code reads is here, so the two differ in numbers and nothing else.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Shape {
+    pub cores: u32,
+    /// Slots per mblock, per class. `layout::Class::k()` in production.
+    pub k: [u32; 2],
+    pub mblocks: [u64; 2],
+    /// Index capacity hint, per class.
+    pub expect: [u64; 2],
+    /// Cores that participate in each class's index sharding.
+    pub shards_for: [usize; 2],
+    /// This core's share of the node-wide OCC pool, in records.
+    pub occ: usize,
+    /// Re-check the ticket against the entry at commit time. Always `true` in
+    /// production; the model flips it to show the check is load-bearing.
+    pub recheck: bool,
+}
+
+/// One worker core's slice of the allocator: both slab classes plus the OCC ring they
+/// share. Holds no buffers and no wakers — those live in `alloc.rs`, which is what
+/// keeps this type comparable and therefore checkable.
+pub(super) struct Shard {
+    slabs: [Slab; 2],
+    recheck: bool,
+    /// A page we cannot serve can be healed from a peer. False for a single-node
+    /// deployment, where reporting a loss buys nothing and costs every hole.
+    recoverable: bool,
+    occ: OccRing,
+}
+
+impl Shard {
+    fn new(core: u32, shape: &Shape) -> Shard {
+        Shard {
+            slabs: [
+                Slab::new(
+                    core,
+                    shape.cores,
+                    shape.k[0],
+                    shape.mblocks[0],
+                    shape.expect[0],
+                ),
+                Slab::new(
+                    core,
+                    shape.cores,
+                    shape.k[1],
+                    shape.mblocks[1],
+                    shape.expect[1],
+                ),
+            ],
+            occ: OccRing::new(shape.occ),
+            recheck: shape.recheck,
+            recoverable: false,
+        }
+    }
+
+    /// Take a new share of the OCC pool; a config reload can resize it.
+    pub(super) fn set_occ(&mut self, cap: usize) {
+        self.occ.set_cap(cap);
+    }
+
+    /// Whether this node has peers to heal a lost page from. A config reload can add
+    /// the first one, so it is not fixed at startup.
+    pub(super) fn set_recoverable(&mut self, yes: bool) {
+        self.recoverable = yes;
+    }
+
+    /// What an index miss means in this class.
+    ///
+    /// A shard that lost an mblock cannot tell a page that was never written from one
+    /// whose entry was in the block it lost: the entries *are* what named them. So
+    /// while there is somewhere to heal from, both answer `Missing` — never served,
+    /// never a vote. Serving zeroes for a page this node accepted is the one wrong
+    /// answer; a hole costing a consensus round is the price of not giving it.
+    fn miss(&self, class: Class) -> Status {
+        if self.recoverable && self.slabs[class as usize].lost {
+            Status::Missing
+        } else {
+            Status::Hole
+        }
+    }
+
+    fn slab(&mut self, class: Class) -> &mut Slab {
+        &mut self.slabs[class as usize]
+    }
+
+    /// Worse of the two classes: either one full is enough to slow the node.
+    pub(super) fn pressure(&self) -> Pressure {
+        match (self.slabs[0].pressure(), self.slabs[1].pressure()) {
+            (Pressure::Critical, _) | (_, Pressure::Critical) => Pressure::Critical,
+            (Pressure::Low, _) | (_, Pressure::Low) => Pressure::Low,
+            _ => Pressure::Normal,
+        }
+    }
+
+    /// Free and total slots per class, small then huge. Summed across cores this is the
+    /// whole device, because the stripes partition it.
+    pub(super) fn capacity(&self) -> [(u64, u64); 2] {
+        [self.slabs[0].capacity(), self.slabs[1].capacity()]
+    }
+
+    /// Live and tombstoned entries per volume, `(volume, live, tombstones)` sorted by
+    /// volume. Summed across cores this is the whole node, which is what the control
+    /// plane needs before it dares advance a volume's tombstone epoch.
+    pub(super) fn census(&self) -> Vec<(u32, u64, u64)> {
+        let mut out: Vec<(u32, u64, u64)> = Vec::new();
+        for sl in &self.slabs {
+            for &(v, live, tomb) in &sl.census {
+                match out.binary_search_by_key(&v, |r| r.0) {
+                    Ok(i) => {
+                        out[i].1 += live as u64;
+                        out[i].2 += tomb as u64;
+                    }
+                    Err(i) => out.insert(i, (v, live as u64, tomb as u64)),
+                }
+            }
+        }
+        out
+    }
+
+    // ------------------------------------------------------------------ reservations
+
+    /// Guard check plus free-list pop. Synchronous: no IO has been issued when this
+    /// returns, so a refusal costs nothing.
+    ///
+    /// `guard` absent means "derive it here" from the type's own rule; every
+    /// production caller supplies one. The guard is the collision detector and the
+    /// whole of the type check: LWW, OCC and Immutable differ only in which version
+    /// the proposer presented.
+    pub(super) fn reserve(
+        &mut self,
+        addr: GlobalAddr,
+        kind: Kind,
+        class: Class,
+        guard: Option<u64>,
+        ballot: Ballot,
+        epoch: u64,
+    ) -> Result<Ticket, Status> {
+        let old = self.slab(class).entry_of(addr.0).map(|(_, e)| e);
+        let current = effective(old, kind, epoch);
+        let g = match guard {
+            Some(g) => g,
+            // The same rules the type table states: the version we hold for LWW, the
+            // last read version for OCC, the epoch's fill point for Immutable.
+            None => match kind {
+                Kind::Lww => current,
+                Kind::Occ => self
+                    .occ
+                    .version(addr.0)
+                    .ok_or(Status::Conflict { current })?,
+                Kind::Immutable => 3 * epoch,
+            },
+        };
+        // An acceptor refuses only a guard it is already past: that is the collision.
+        // Sitting behind the guard is a gap this accept closes, which lets a node that
+        // missed a round rejoin without waiting for the sweep. At the guard itself the
+        // ballot may not regress, which keeps a stale retry from overwriting a newer
+        // value at the same version.
+        if current > g || (current == g && old.is_some_and(|e| ballot.raw() < e.ballot as u32)) {
+            return Err(Status::Conflict { current });
+        }
+        let sl = self.slab(class);
+        if sl.pressure() == Pressure::Critical {
+            return Err(Status::NoSpace);
+        }
+        let local = sl.free.pop().ok_or(Status::NoSpace)?;
+        Ok(Ticket {
+            slot: sl.global_of(local),
+            version: g + 1,
+            ballot,
+            prior: old.map(|e| (e.version, e.ballot)),
+        })
+    }
+
+    /// The unguarded apply-if-newer reservation behind repair and `learn`. `None` means
+    /// what we already hold is at least as new, which makes the two migration streams
+    /// commutative and a repeated repair free. `replace_equal` additionally admits an
+    /// exactly equal live register, so repair can reinstall bytes that failed their
+    /// checksum.
+    pub(super) fn reserve_unguarded(
+        &mut self,
+        addr: GlobalAddr,
+        kind: Kind,
+        class: Class,
+        r: Register,
+        epoch: u64,
+        replace_equal: bool,
+    ) -> Result<Option<Ticket>, Status> {
+        let e = self.slab(class).entry_of(addr.0).map(|(_, x)| x);
+        let held = (effective(e, kind, epoch), e.map_or(0, |x| x.ballot as u32));
+        let equal_live = e.is_some_and(|x| {
+            x.state == State::Live && x.version == r.version && x.ballot as u32 == r.ballot.raw()
+        });
+        if held > (r.version, r.ballot.raw())
+            || (held == (r.version, r.ballot.raw()) && !(replace_equal && equal_live))
+        {
+            return Ok(None);
+        }
+        let sl = self.slab(class);
+        if sl.pressure() == Pressure::Critical {
+            return Err(Status::NoSpace);
+        }
+        let local = sl.free.pop().ok_or(Status::NoSpace)?;
+        Ok(Some(Ticket {
+            slot: sl.global_of(local),
+            version: r.version,
+            ballot: r.ballot,
+            prior: e.map(|x| (x.version, x.ballot)),
+        }))
+    }
+
+    /// Install the entry, retire the address's previous slot, and mark the mblock
+    /// dirty. Returns the mblock and the sequence number a flush must reach for this
+    /// commit to be durable.
+    pub(super) fn stage(
+        &mut self,
+        addr: GlobalAddr,
+        kind: Kind,
+        class: Class,
+        t: Ticket,
+        crc: u32,
+        gof: &Groups,
+    ) -> Result<Option<Staged>, Status> {
+        let state = state_of(kind, t.version);
+        let recheck = self.recheck;
+        let sl = self.slab(class);
+        let local = sl.local_of(t.slot).ok_or(Status::Io)?;
+        // A reservation and its commit are separated by the data write, so another
+        // accept, learn or trim for this address can land in between. The guard was
+        // checked against the row `reserve` saw, so it only still holds if that row has
+        // not moved; a trim in the window would otherwise let this stale accept
+        // resurrect a deleted value at a version someone else has already bound.
+        // Comparing the raw row rather than `effective` keeps epoch out of it: an epoch
+        // advance touches no row, and an Immutable accept from the old epoch lands
+        // below the new fill point and so reads as superseded anyway. Giving the slot
+        // back and reporting success is right, because something newer won.
+        let seen = sl.entry_of(addr.0).map(|(_, e)| (e.version, e.ballot));
+        if recheck && seen != t.prior {
+            sl.recycle(local);
+            return Ok(None);
+        }
+        let e = Entry {
+            addr: addr.0,
+            version: t.version,
+            ballot: t.ballot.raw() as u64,
+            data_crc: crc,
+            epoch: if state == State::Tombstone {
+                (t.version / 3) as u32
+            } else {
+                0
+            },
+            state,
+            flags: 0,
+        };
+        sl.set(local, e, gof);
+        let stale = match sl.index.insert(addr.0, t.slot) {
+            Some(old) if old != t.slot => Some(old),
+            _ => None,
+        };
+        sl.foreign.remove(&addr.0);
+        let li = local / sl.k;
+        Ok(Some(Staged {
+            li,
+            seq: sl.dirty(li),
+            stale,
+        }))
+    }
+
+    /// Retire the slot a commit displaced, once its replacement is durable. Returns the
+    /// mblock and sequence that retirement needs flushed to, or `None` if the slot is
+    /// outside this core's stripe.
+    pub(super) fn release(&mut self, class: Class, slot: u32, gof: &Groups) -> Option<(u32, u64)> {
+        let sl = self.slab(class);
+        let local = sl.local_of(slot)?;
+        sl.release(slot, gof);
+        Some((local / sl.k, sl.commit_seq[(local / sl.k) as usize]))
+    }
+
+    /// Undo a reservation whose data write failed, so the slot is not leaked.
+    pub(super) fn unreserve(&mut self, class: Class, t: Ticket, gof: &Groups) {
+        let sl = self.slab(class);
+        if let Some(l) = sl.local_of(t.slot) {
+            sl.set(l, Entry::default(), gof);
+            sl.recycle(l);
+        }
+    }
+
+    // -------------------------------------------------------------- consensus surface
+
+    /// The register as this node holds it, with no data read. A page we have never
+    /// seen is not an error: it sits at version zero, or at `3 * epoch` for an
+    /// Immutable extent, and consensus needs that to be a vote.
+    pub(super) fn register_of(
+        &mut self,
+        addr: GlobalAddr,
+        kind: Kind,
+        class: Class,
+        epoch: u64,
+    ) -> Result<Register, Status> {
+        let miss = self.miss(class);
+        let e = self.slab(class).entry_of(addr.0).map(|(_, e)| e);
+        if e.is_none() && miss == Status::Missing {
+            return Err(miss);
+        }
+        Ok(Register {
+            version: effective(e, kind, epoch),
+            ballot: Ballot::from_raw(e.map_or(0, |e| e.ballot as u32)),
+        })
+    }
+
+    /// Record what a read this node's *own* ublk device served returned. Answering a
+    /// peer deliberately does not land here: an acceptor keeps no read-tracking state,
+    /// which is what makes the OCC check cluster-wide.
+    pub(super) fn observed(&mut self, addr: GlobalAddr, kind: Kind, version: u64) {
+        if kind == Kind::Occ {
+            self.occ.observe(addr.0, version);
+        }
+    }
+
+    /// The guard a proposer on this node should present.
+    pub(super) fn guard_of(
+        &mut self,
+        addr: GlobalAddr,
+        kind: Kind,
+        class: Class,
+        epoch: u64,
+    ) -> Result<u64, Status> {
+        let e = self.slab(class).entry_of(addr.0).map(|(_, e)| e);
+        let current = effective(e, kind, epoch);
+        match kind {
+            Kind::Lww => Ok(current),
+            // The version this node read, whatever the local slab holds — on a
+            // non-member it holds nothing at all. The acceptor compares it against the
+            // register and that comparison *is* the OCC check, so a write with no prior
+            // read here cannot be checked and conflicts.
+            Kind::Occ => self.occ.version(addr.0).ok_or(Status::Conflict { current }),
+            Kind::Immutable => Ok(3 * epoch),
+        }
+    }
+
+    /// The OCC observation is *not* recorded here: this same path serves a peer's
+    /// `GET`, and only the node whose ublk device answered the client may record a
+    /// read. `Paxos::read` does that instead.
+    pub(super) fn lookup(
+        &mut self,
+        addr: GlobalAddr,
+        _kind: Kind,
+        class: Class,
+    ) -> Result<Lookup, Status> {
+        let miss = self.miss(class);
+        let (slot, e) = self
+            .slab(class)
+            .entry_of(addr.0)
+            .filter(|(_, e)| e.state == State::Live)
+            .ok_or(miss)?;
+        Ok(Lookup {
+            slot,
+            version: e.version,
+            ballot: e.ballot,
+            crc: e.data_crc,
+        })
+    }
+
+    // ----------------------------------------------------------------------- discard
+
+    /// The member side of a trim proposal. An immutable page becomes a tombstone so
+    /// readers can still tell a hole from a trim, and the entry is reclaimed when the
+    /// control plane advances the epoch past it; a mutable page is simply released.
+    /// The immutable case guards on `3*epoch + 1` and is idempotent, so a repeat is
+    /// `Ok` rather than a conflict.
+    #[allow(clippy::too_many_arguments)] // type, class and epoch all ride in
+    pub(super) fn trim(
+        &mut self,
+        addr: GlobalAddr,
+        kind: Kind,
+        class: Class,
+        guard: Option<u64>,
+        ballot: Ballot,
+        epoch: u64,
+        gof: &Groups,
+    ) -> Result<Option<(u32, u64)>, Status> {
+        let sl = self.slab(class);
+        let Some((slot, e)) = sl.entry_of(addr.0) else {
+            return Ok(None);
+        };
+        let Some(local) = sl.local_of(slot) else {
+            // The slot belongs to another core's stripe; leave it to relocate.
+            return Ok(None);
+        };
+        if kind == Kind::Immutable {
+            if e.state != State::Live {
+                return Ok(None);
+            }
+            let current = effective(Some(e), kind, epoch);
+            if guard.is_some_and(|g| g != current) {
+                return Err(Status::Conflict { current });
+            }
+            let t = Entry {
+                addr: addr.0,
+                version: current + 1,
+                ballot: ballot.raw() as u64,
+                data_crc: 0,
+                epoch: ((current + 1) / 3) as u32,
+                state: State::Tombstone,
+                flags: 0,
+            };
+            sl.set(local, t, gof);
+        } else {
+            sl.index.remove(addr.0);
+            sl.set(local, Entry::default(), gof);
+            sl.recycle(local);
+        }
+        let li = local / sl.k;
+        Ok(Some((li, sl.dirty(li))))
+    }
+
+    // ------------------------------------------------------------------- group commit
+
+    pub(super) fn flush_act(&mut self, class: Class, li: u32, need: u64) -> Act {
+        let sl = self.slab(class);
+        if sl.durable_seq[li as usize] >= need {
+            return Act::Done;
+        }
+        if sl.flushing {
+            Act::Wait
+        } else {
+            sl.flushing = true;
+            Act::Go
+        }
+    }
+
+    /// Snapshot one mblock for serialisation: the sequence this write will make
+    /// durable, the header to stamp on it, and the rows themselves. The generation is
+    /// bumped here, before the write is issued, so the copy this lands in is
+    /// `generation % 2`.
+    pub(super) fn begin_flush(&mut self, class: Class, li: u32) -> (u64, Header, &[Entry]) {
+        let sl = &mut self.slabs[class as usize];
+        let seq = sl.commit_seq[li as usize];
+        let g = sl.generation[li as usize] + 1;
+        sl.generation[li as usize] = g;
+        let k = sl.k as usize;
+        let id = li * sl.cores + sl.core;
+        let rows = &sl.entries[li as usize * k..(li as usize + 1) * k];
+        let live = rows.iter().filter(|e| e.addr != 0).count() as u16;
+        (
+            seq,
+            Header {
+                mblock_id: id,
+                generation: g,
+                class,
+                live,
+            },
+            rows,
+        )
+    }
+
+    /// Retire the flush. `durable_seq` only ever moves forward, and only on success:
+    /// that is the predicate every committer waits on.
+    pub(super) fn end_flush(&mut self, class: Class, li: u32, seq: u64, ok: bool) {
+        let sl = self.slab(class);
+        sl.flushing = false;
+        if ok {
+            sl.durable_seq[li as usize] = sl.durable_seq[li as usize].max(seq);
+        }
+    }
+
+    // -------------------------------------------------------------------- maintenance
+
+    /// One tick's worth of tombstone reclamation on one class. The only garbage
+    /// collection in the system: metadata only, bounded, and on no critical path.
+    ///
+    /// `eof` is resolved per tombstone rather than once per sweep, because the epoch is
+    /// the volume's: one volume may collect while every other one stands still. The
+    /// lookup only runs for entries already known to be tombstones.
+    pub(super) fn sweep(&mut self, class: Class, eof: &Epochs, gof: &Groups) {
+        let sl = self.slab(class);
+        if sl.local == 0 {
+            return;
+        }
+        for _ in 0..SWEEP_PER_TICK {
+            let li = sl.sweep % sl.local;
+            sl.sweep = sl.sweep.wrapping_add(1);
+            let k = sl.k as usize;
+            let mut hit = false;
+            for j in 0..k {
+                let l = li as usize * k + j;
+                let e = sl.entries[l];
+                if e.state == State::Tombstone && e.epoch < eof(e.addr) {
+                    sl.set(l as u32, Entry::default(), gof);
+                    sl.index.remove(e.addr);
+                    sl.recycle(l as u32);
+                    hit = true;
+                }
+            }
+            if hit {
+                // Persisted by whichever commit next lands on this mblock; a tombstone
+                // that outlives its epoch costs nothing but an entry.
+                sl.dirty(li);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------- anti-entropy
+
+    pub(super) fn digest_vector(&mut self, class: Class, group: u32) -> Box<[u64; heal::BUCKETS]> {
+        self.slab(class).digests.vector(group)
+    }
+
+    /// Groups this shard holds registers for, and the forget that prunes one it has
+    /// been drained of. Together these are how the shed finds work without scanning.
+    pub(super) fn held_groups(&mut self, class: Class) -> Vec<u32> {
+        self.slab(class).digests.held()
+    }
+
+    pub(super) fn forget_group(&mut self, class: Class, group: u32) {
+        self.slab(class).digests.forget(group);
+    }
+
+    /// Forget a register outright, leaving no tombstone: the page is not being deleted,
+    /// it is being left to the members that now own it, and a tombstone here would be a
+    /// deletion for them to replay. Conditional on the version the caller confirmed
+    /// those members hold, so a write that raced the confirmation is kept.
+    pub(super) fn discard(
+        &mut self,
+        addr: GlobalAddr,
+        class: Class,
+        version: u64,
+        gof: &Groups,
+    ) -> Option<(u32, u64)> {
+        let sl = self.slab(class);
+        let (slot, e) = sl.entry_of(addr.0)?;
+        // A slot in another core's stripe is that core's to drop.
+        let local = sl.local_of(slot)?;
+        if e.version != version {
+            return None;
+        }
+        sl.index.remove(addr.0);
+        sl.set(local, Entry::default(), gof);
+        sl.recycle(local);
+        let li = local / sl.k;
+        Some((li, sl.dirty(li)))
+    }
+
+    pub(super) fn snap_start(
+        &mut self,
+        class: Class,
+        core: usize,
+        huge: bool,
+        group: u32,
+        filter: heal::Filter,
+        now: std::time::Instant,
+    ) -> Option<u32> {
+        self.slab(class).snaps.start(core, huge, group, filter, now)
+    }
+
+    pub(super) fn snap_next(
+        &mut self,
+        class: Class,
+        id: u32,
+        seq: Option<u8>,
+        gof: &Groups,
+        now: std::time::Instant,
+    ) -> Result<(Vec<Tuple>, bool), Status> {
+        let sl = self.slab(class);
+        // Split the borrow: the walk reads `entries` while the cursor advances.
+        let (snaps, entries) = (&mut sl.snaps, &sl.entries);
+        snaps.next(id, seq, entries, gof, now)
+    }
+
+    pub(super) fn snap_stop(&mut self, class: Class, id: u32) {
+        let sl = self.slab(class);
+        let mut free = std::mem::take(&mut sl.free);
+        sl.snaps.stop(id, &mut free);
+        sl.free = free;
+    }
+
+    /// A cursor whose reader vanished must not hold reclamation for ever.
+    pub(super) fn snap_expire(&mut self, class: Class, now: std::time::Instant) {
+        let sl = self.slab(class);
+        let mut free = std::mem::take(&mut sl.free);
+        sl.snaps.expire(now, &mut free);
+        sl.free = free;
+    }
+}
+
+// --------------------------------------------------------------------------- startup
+
+/// One mblock as read from the device, after the A/B copies have been resolved.
+pub(super) struct Scanned {
+    pub id: u32,
+    pub class: Class,
+    pub generation: u64,
+    pub quarantined: bool,
+    pub entries: Vec<Entry>,
+}
+
+/// Which of an mblock's two copies to believe. Highest generation with a valid CRC
+/// wins; if the newer copy is bad we fall back to the older one, which is a lost write
+/// and not corruption. Neither valid is the only case that quarantines. The flag names
+/// the copy chosen.
+pub(super) fn pick_ab(ha: Option<Header>, hb: Option<Header>) -> Option<(Header, bool)> {
+    match (ha, hb) {
+        (Some(x), Some(y)) if y.generation > x.generation => Some((y, true)),
+        (Some(x), _) => Some((x, false)),
+        (None, Some(y)) => Some((y, true)),
+        (None, None) => None,
+    }
+}
+
+/// Rebuild every shard from a scan of the metadata region. There is no journal and
+/// nothing to replay, so whatever the scan found *is* the state; the only work is
+/// deciding who owns what.
+///
+/// Returns the shards and the number of mblocks that were quarantined.
+pub(super) fn rebuild(
+    shape: &Shape,
+    cores: usize,
+    scans: Vec<Scanned>,
+    gof: &Groups,
+) -> (Vec<Shard>, usize) {
+    let mut shards: Vec<Shard> = (0..cores).map(|c| Shard::new(c as u32, shape)).collect();
+
+    // Place every scanned mblock in its owning core's stripe.
+    let mut quarantined = 0usize;
+    let mut found: Vec<(u64, Class, u32, (u64, u32))> = Vec::new();
+    for m in &scans {
+        let owner = (m.id % cores as u32) as usize;
+        let sl = shards[owner].slab(m.class);
+        let li = (m.id / cores as u32) as usize;
+        let k = sl.k as usize;
+        sl.generation[li] = m.generation;
+        if m.quarantined {
+            sl.quarantined[li] = true;
+            sl.lost = true;
+            quarantined += 1;
+            continue;
+        }
+        sl.entries[li * k..(li + 1) * k].copy_from_slice(&m.entries);
+        for (j, e) in m.entries.iter().enumerate() {
+            if e.addr != 0 && e.state != State::Empty {
+                found.push((
+                    e.addr,
+                    m.class,
+                    m.id * sl.k + j as u32,
+                    (e.version, e.ballot as u32),
+                ));
+            }
+        }
+    }
+    drop(scans);
+
+    // Two slots can claim one address after a crash between the metadata write and the
+    // old slot's release. The higher version is the one that was acked, and the ballot
+    // breaks the tie: two accepts can share a version, and choosing between them any
+    // other way would let a restart resurrect the ballot that lost while the node was
+    // up. A `BTreeMap` so the loop below fills the index and the foreign map in key
+    // order: a rebuild must land on the same layout every time it sees the same device.
+    let mut winner: BTreeMap<u64, (Class, u32, (u64, u32))> = BTreeMap::new();
+    let mut losers: Vec<(Class, u32)> = Vec::new();
+    for (addr, class, slot, version) in found {
+        match winner.get(&addr) {
+            Some(&(_, _, pv)) if pv >= version => losers.push((class, slot)),
+            Some(&(pc, ps, _)) => {
+                losers.push((pc, ps));
+                winner.insert(addr, (class, slot, version));
+            }
+            None => {
+                winner.insert(addr, (class, slot, version));
+            }
+        }
+    }
+    for (class, slot) in losers {
+        let owner = (slot / shape.k[class as usize] % cores as u32) as usize;
+        let sl = shards[owner].slab(class);
+        if let Some(l) = sl.local_of(slot) {
+            sl.entries[l as usize] = Entry::default();
+            sl.dirty(l / sl.k);
+        }
+    }
+
+    // The index shards by consensus group, which need not be the core that owns the
+    // slot; when they differ the entry is copied into the small `foreign` side map and
+    // the page relocates on its next write.
+    for (addr, (class, slot, _)) in &winner {
+        let owner = gof(*addr) as usize % shape.shards_for[*class as usize];
+        let holder = (*slot / shape.k[*class as usize] % cores as u32) as usize;
+        // Read the holder before touching the owner: they may be the same shard.
+        let e = if holder == owner {
+            None
+        } else {
+            let hl = shards[holder].slab(*class);
+            hl.local_of(*slot).map(|l| hl.entries[l as usize])
+        };
+        let sl = shards[owner].slab(*class);
+        if sl.index.insert(*addr, *slot).is_none()
+            && sl.local_of(*slot).is_none()
+            && let Some(e) = e
+        {
+            sl.foreign.insert(*addr, e);
+        }
+    }
+    drop(winner);
+
+    // Free lists are never persisted: whatever is unclaimed after the scan is free.
+    // Pushed descending so pops ascend and stay inside one mblock.
+    for sh in &mut shards {
+        for class in [Class::Small, Class::Huge] {
+            let sl = sh.slab(class);
+            for l in (0..sl.entries.len()).rev() {
+                if sl.entries[l].addr == 0 && !sl.quarantined[l / sl.k as usize] {
+                    sl.free.push(l as u32);
+                }
+            }
+            // Seed the anti-entropy accumulators and the per-volume census from what
+            // survived the scan: the only full pass either gets, every later change
+            // goes through `set`.
+            for l in 0..sl.entries.len() {
+                let e = sl.entries[l];
+                if e.addr != 0 {
+                    sl.digests.toggle(gof(e.addr), &e);
+                    sl.count(e, 1);
+                }
+            }
+        }
+    }
+
+    (shards, quarantined)
+}
+
+// ------------------------------------------------------- comparability, for the model
+
+/// `stateright` has to clone, compare and hash whatever it explores, and the types
+/// above are ordinary owned data apart from two fields.
+///
+/// `digests` and `snaps` are excluded: the first is 4 KiB per consensus group, which
+/// has no business in a state space; the second holds wall-clock deadlines, which are
+/// not state at all. Both belong to `heal.rs` and are checked there. The impls are
+/// `cfg(test)` so no production path can pick up a `Clone` that silently drops them.
+#[cfg(test)]
+mod cmp {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    /// The OCC ring as a state. Its sequence numbers count up for ever and only their
+    /// ordering and equality are ever read, so renumbering them by rank loses nothing
+    /// and keeps the state space finite.
+    type Ring = (Vec<(u64, u64)>, Vec<(u64, u64, u64)>);
+
+    fn ring(r: &OccRing) -> Ring {
+        let mut seqs: Vec<u64> = r.fifo.iter().map(|&(_, s)| s).collect();
+        seqs.sort_unstable();
+        let rank = |s: u64| seqs.binary_search(&s).unwrap_or(usize::MAX) as u64;
+        let fifo = r.fifo.iter().map(|&(a, s)| (a, rank(s))).collect();
+        let mut seen: Vec<(u64, u64, u64)> =
+            r.seen.iter().map(|(&a, &(v, s))| (a, v, rank(s))).collect();
+        seen.sort_unstable();
+        (fifo, seen)
+    }
+
+    fn entries(m: &HashMap<u64, Entry>) -> Vec<(u64, Entry)> {
+        let mut v: Vec<(u64, Entry)> = m.iter().map(|(k, e)| (*k, *e)).collect();
+        v.sort_unstable_by_key(|(k, _)| *k);
+        v
+    }
+
+    impl PartialEq for OccRing {
+        fn eq(&self, o: &OccRing) -> bool {
+            self.cap == o.cap && ring(self) == ring(o)
+        }
+    }
+
+    impl Hash for OccRing {
+        fn hash<H: Hasher>(&self, h: &mut H) {
+            self.cap.hash(h);
+            ring(self).hash(h);
+        }
+    }
+
+    impl std::fmt::Debug for OccRing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "occ{:?}", ring(self).1)
+        }
+    }
+
+    impl Slab {
+        /// The sweep cursor counts up for ever but is only ever read modulo the stripe
+        /// length, so that is what a state is. Without this the state space is infinite
+        /// for no behavioural reason.
+        fn cursor(&self) -> u32 {
+            self.sweep % self.local.max(1)
+        }
+    }
+
+    impl Clone for Slab {
+        fn clone(&self) -> Slab {
+            Slab {
+                core: self.core,
+                cores: self.cores,
+                k: self.k,
+                local: self.local,
+                entries: self.entries.clone(),
+                generation: self.generation.clone(),
+                quarantined: self.quarantined.clone(),
+                lost: self.lost,
+                index: self.index.clone(),
+                foreign: self.foreign.clone(),
+                free: self.free.clone(),
+                commit_seq: self.commit_seq.clone(),
+                durable_seq: self.durable_seq.clone(),
+                flushing: self.flushing,
+                sweep: self.sweep,
+                census: self.census.clone(),
+                digests: Digests::default(),
+                snaps: Snaps::default(),
+            }
+        }
+    }
+
+    impl PartialEq for Slab {
+        fn eq(&self, o: &Slab) -> bool {
+            self.core == o.core
+                && self.k == o.k
+                && self.entries == o.entries
+                && self.generation == o.generation
+                && self.quarantined == o.quarantined
+                && self.index == o.index
+                && self.free == o.free
+                && self.commit_seq == o.commit_seq
+                && self.durable_seq == o.durable_seq
+                && self.flushing == o.flushing
+                && self.cursor() == o.cursor()
+                && self.census == o.census
+                && entries(&self.foreign) == entries(&o.foreign)
+        }
+    }
+
+    impl Hash for Slab {
+        fn hash<H: Hasher>(&self, h: &mut H) {
+            self.core.hash(h);
+            self.entries.hash(h);
+            self.generation.hash(h);
+            self.quarantined.hash(h);
+            self.index.hash(h);
+            self.free.hash(h);
+            self.commit_seq.hash(h);
+            self.durable_seq.hash(h);
+            self.flushing.hash(h);
+            self.cursor().hash(h);
+            self.census.hash(h);
+            entries(&self.foreign).hash(h);
+        }
+    }
+
+    impl std::fmt::Debug for Slab {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let live: Vec<(usize, u64, u64, u32)> = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.addr != 0)
+                .map(|(l, e)| (l, e.addr & 0xffff, e.version, e.data_crc))
+                .collect();
+            let idx: Vec<(u64, u32)> = self
+                .index
+                .slots
+                .iter()
+                .filter(|(k, _)| *k != 0)
+                .map(|(k, v)| (k & 0xffff, *v))
+                .collect();
+            write!(
+                f,
+                "slab{{live:{live:?} idx:{idx:?} free:{:?} gen:{:?} commit:{:?} durable:{:?}}}",
+                self.free, self.generation, self.commit_seq, self.durable_seq
+            )
+        }
+    }
+
+    impl Clone for Shard {
+        fn clone(&self) -> Shard {
+            Shard {
+                slabs: [self.slabs[0].clone(), self.slabs[1].clone()],
+                occ: self.occ.clone(),
+                recheck: self.recheck,
+                recoverable: self.recoverable,
+            }
+        }
+    }
+
+    impl PartialEq for Shard {
+        fn eq(&self, o: &Shard) -> bool {
+            self.slabs == o.slabs && self.occ == o.occ
+        }
+    }
+
+    impl Hash for Shard {
+        fn hash<H: Hasher>(&self, h: &mut H) {
+            self.slabs.hash(h);
+            self.occ.hash(h);
+        }
+    }
+
+    impl std::fmt::Debug for Shard {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{:?} {:?}", self.slabs[0], self.occ)
+        }
+    }
+}
+
+// ------------------------------------------------------------------------ the model
+
+/// Model checks over the code above, with `stateright`.
+///
+/// These drive the real `Shard` — the same `reserve`, `stage`, `trim`, `sweep`,
+/// `flush_act`/`begin_flush`/`end_flush` and `rebuild` that production calls — at a
+/// shape small enough to enumerate: two slots per mblock, two mblocks, two addresses.
+/// That is what `Shape` is for. A model that paraphrased the rules would only prove the
+/// paraphrase.
+///
+/// The rule under test is a parameter wherever the design had a choice, so each check
+/// runs twice: once with the rule the code uses, which must hold, and once with the
+/// weaker rule, which must fail. A mechanism no counterexample can distinguish is a
+/// mechanism nobody needs.
+///
+/// No IO, no runtime, no device: these run without root.
+#[cfg(test)]
+mod model {
+    use super::*;
+    use stateright::{Checker, Model, Property};
+    use std::collections::BTreeSet;
+
+    const K: u32 = 2;
+    const MBLOCKS: u64 = 2;
+    const SLOTS: usize = (K as u64 * MBLOCKS) as usize;
+    const MAX_WRITES: u8 = 3;
+    const MAX_PENDING: usize = 2;
+
+    /// One address in each of two volumes, in different consensus groups so that a
+    /// change of core count can separate an index shard from a slot's owner. Separate
+    /// volumes because the tombstone epoch is per volume, and the point of the sweep
+    /// properties below is that one volume's epoch says nothing about the other's.
+    const ADDRS: [u64; 2] = [1 << 32, (2 << 32) | 1];
+    const GUARDS: [Option<u64>; 4] = [None, Some(0), Some(1), Some(3)];
+    /// Trims are guarded too, but only the fill points (`3*epoch + 1`) are interesting.
+    const TGUARDS: [Option<u64>; 3] = [None, Some(1), Some(4)];
+    const BALLOTS: [(u32, u8); 2] = [(1, 1), (2, 0)];
+    const MAX_FLUSHES: u8 = 4;
+
+    /// One mblock's two on-disk copies, each `(generation, rows)`. `None` is a copy that
+    /// will not decode, which is what a torn or failed write leaves behind.
+    type Copies = [Option<(u64, Vec<Entry>)>; 2];
+
+    /// A commit that has staged but is not yet durable: address, version, ballot, value,
+    /// mblock, the commit sequence it needs, and the slot it displaced.
+    type Waiting = (u64, u64, u32, u32, u32, u64, Option<u32>);
+
+    fn group_of(a: u64) -> u32 {
+        (a & 1) as u32
+    }
+
+    /// Volume ids are 1 and 2, one address each, so a volume id indexes the epochs.
+    fn vol_of(addr: u64) -> usize {
+        ((addr >> 32) as usize).saturating_sub(1) % ADDRS.len()
+    }
+
+    /// The census a slab should be holding, recomputed the slow way.
+    fn recount(sl: &Slab) -> Vec<(u32, u32, u32)> {
+        let mut out: Vec<(u32, u32, u32)> = Vec::new();
+        for e in sl.entries.iter() {
+            let (live, tomb) = match e.state {
+                State::Live => (1, 0),
+                State::Tombstone => (0, 1),
+                State::Empty => continue,
+            };
+            let v = (e.addr >> 32) as u32;
+            match out.binary_search_by_key(&v, |r| r.0) {
+                Ok(i) => {
+                    out[i].1 += live;
+                    out[i].2 += tomb;
+                }
+                Err(i) => out.insert(i, (v, live, tomb)),
+            }
+        }
+        out
+    }
+
+    fn shape(cores: u32, recheck: bool) -> Shape {
+        Shape {
+            cores,
+            recheck,
+            k: [K, K],
+            mblocks: [MBLOCKS, 0],
+            expect: [8, 8],
+            shards_for: [cores as usize, 1],
+            // One record: eviction is unreachable at the production size, and the claim
+            // that eviction can only turn a success into a conflict is what wants
+            // checking.
+            occ: 1,
+        }
+    }
+
+    fn empty_rows() -> Vec<Entry> {
+        vec![Entry::default(); K as usize]
+    }
+
+    /// Every shard is built the way `open` builds one, because the free lists are not
+    /// persisted and only `rebuild` knows how to derive them.
+    fn boot(cores: u32, recheck: bool, image: &[Copies]) -> (Vec<Shard>, usize) {
+        let scans = (0..MBLOCKS as usize)
+            .map(|id| {
+                let hdr = |c: usize| {
+                    image[id][c].as_ref().map(|(g, _)| Header {
+                        mblock_id: id as u32,
+                        generation: *g,
+                        class: Class::Small,
+                        live: 0,
+                    })
+                };
+                match pick_ab(hdr(0), hdr(1)) {
+                    Some((h, b)) => Scanned {
+                        id: id as u32,
+                        class: Class::Small,
+                        generation: h.generation,
+                        quarantined: false,
+                        entries: image[id][b as usize].as_ref().unwrap().1.clone(),
+                    },
+                    None => Scanned {
+                        id: id as u32,
+                        class: Class::Small,
+                        generation: 0,
+                        quarantined: true,
+                        entries: Vec::new(),
+                    },
+                }
+            })
+            .collect();
+        rebuild(&shape(cores, recheck), cores as usize, scans, &group_of)
+    }
+
+    fn formatted() -> Vec<Copies> {
+        (0..MBLOCKS)
+            .map(|_| [Some((0, empty_rows())), Some((0, empty_rows()))])
+            .collect()
+    }
+
+    /// The free list and the index are where a leak or a dangling read would show up. A
+    /// slot is free or occupied, never both and never twice; and every key in the index
+    /// names a slot that really does hold that address.
+    fn sound(shards: &[Shard]) -> bool {
+        for sh in shards {
+            let sl = &sh.slabs[0];
+            let mut seen = vec![false; sl.entries.len()];
+            for &l in sl.free.iter() {
+                let l = l as usize;
+                if l >= seen.len() || seen[l] || sl.entries[l].addr != 0 {
+                    return false;
+                }
+                seen[l] = true;
+            }
+            for &(k, v) in sl.index.slots.iter() {
+                // A key whose slot sits in another core's stripe is a foreign entry,
+                // which this slab holds no row for.
+                if k != 0
+                    && let Some(l) = sl.local_of(v)
+                    && sl.entries[l as usize].addr != k
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// What a reader sees. Reads go through the index, never by scanning slots, and
+    /// once a displaced slot is retired late (`Staged::stale`) that distinction matters:
+    /// two slots may hold one address, but only one is reachable.
+    fn find(shards: &[Shard], addr: u64) -> Option<Entry> {
+        shards
+            .iter()
+            .find_map(|sh| sh.slabs[0].entry_of(addr).map(|(_, e)| e))
+    }
+
+    /// Every slot beyond the one the index names must be a stale slot some commit is
+    /// still holding on to. Anything else is a leak.
+    fn duplicates_are_owned(shards: &[Shard], held: &BTreeSet<u32>) -> bool {
+        // The index that names a row need not live on the core that holds it: the index
+        // shards by consensus group and the slots by core.
+        let mut named: BTreeSet<u32> = BTreeSet::new();
+        for sh in shards {
+            let sl = &sh.slabs[0];
+            for &(k, v) in sl.index.slots.iter() {
+                if k != 0 {
+                    named.insert(v);
+                }
+            }
+        }
+        shards.iter().all(|sh| {
+            let sl = &sh.slabs[0];
+            sl.entries.iter().enumerate().all(|(l, e)| {
+                let g = sl.global_of(l as u32);
+                e.addr == 0 || named.contains(&g) || held.contains(&g)
+            })
+        })
+    }
+
+    // -------------------------------------------------------------- register semantics
+
+    /// One core, no IO. Everything a page's type semantics decide happens here, so this
+    /// model is where the type table and the guard rule are pinned.
+    #[derive(Clone, PartialEq, Hash, Debug)]
+    struct Reg {
+        sh: Shard,
+        /// Reserved, not yet staged. A ticket in flight is a slot nobody else can have.
+        pending: Vec<(u64, Ticket, bool)>,
+        /// (address, version, ballot, value) this node has accepted.
+        acked: BTreeSet<(u64, u64, u32, u32)>,
+        /// Every version this node ever observed for an address. The OCC ring may forget
+        /// from this set but never invent outside it.
+        seen: BTreeSet<(u64, u64)>,
+        /// Guards the ring actually let through on the derived path.
+        used: BTreeSet<(u64, u64)>,
+        /// One per volume, because that is the scope the control plane advances.
+        epoch: [u64; ADDRS.len()],
+        /// Set for a volume whose tombstone the sweep has actually reclaimed.
+        reaped: [bool; ADDRS.len()],
+        writes: u8,
+        /// Reservations dropped without `unreserve`: the slot is not returned until the
+        /// next boot.
+        leaked: u8,
+        /// Successful mutable trims, so the model can prove the path is reached.
+        trimmed: u8,
+        /// Set if an Immutable accept presenting the epoch's fill point ever came back
+        /// at a version that is not `3*epoch + 1`. Learns are excluded: a repair stream
+        /// carries whatever version it was given, and apply-if-newer is its only rule.
+        offbeat: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum RegAct {
+        Lookup(u8),
+        Register(u8),
+        Guard(u8),
+        Learn { a: u8, version: u64, b: u8 },
+        Reserve { a: u8, g: u8, b: u8 },
+        Stage(u8),
+        Leak(u8),
+        Unreserve(u8),
+        Trim { a: u8, g: u8 },
+        AdvanceEpoch(u8),
+        Sweep,
+    }
+
+    struct RegModel {
+        kind: Kind,
+        /// `Commit::Checked` is what the allocator does. `Commit::Blind` installs
+        /// whatever the ticket says without re-reading the entry the reservation was
+        /// granted against.
+        commit: Commit,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Commit {
+        Checked,
+        Blind,
+    }
+
+    impl Model for RegModel {
+        type State = Reg;
+        type Action = RegAct;
+
+        fn init_states(&self) -> Vec<Reg> {
+            vec![Reg {
+                sh: boot(1, self.commit == Commit::Checked, &formatted())
+                    .0
+                    .pop()
+                    .unwrap(),
+                pending: Vec::new(),
+                acked: BTreeSet::new(),
+                seen: BTreeSet::new(),
+                used: BTreeSet::new(),
+                epoch: [0; ADDRS.len()],
+                reaped: [false; ADDRS.len()],
+                writes: 0,
+                leaked: 0,
+                trimmed: 0,
+                offbeat: false,
+            }]
+        }
+
+        fn actions(&self, s: &Reg, out: &mut Vec<RegAct>) {
+            for a in 0..ADDRS.len() as u8 {
+                out.push(RegAct::Lookup(a));
+                out.push(RegAct::Register(a));
+                out.push(RegAct::Guard(a));
+                for g in 0..TGUARDS.len() as u8 {
+                    out.push(RegAct::Trim { a, g });
+                }
+                if s.writes < MAX_WRITES && s.pending.len() < MAX_PENDING {
+                    for g in 0..GUARDS.len() as u8 {
+                        for b in 0..BALLOTS.len() as u8 {
+                            out.push(RegAct::Reserve { a, g, b });
+                        }
+                    }
+                    for version in 1..=2u64 {
+                        out.push(RegAct::Learn { a, version, b: 1 });
+                    }
+                }
+            }
+            for p in 0..s.pending.len() as u8 {
+                out.push(RegAct::Stage(p));
+                out.push(RegAct::Leak(p));
+                out.push(RegAct::Unreserve(p));
+            }
+            for v in 0..ADDRS.len() as u8 {
+                // Each volume's epoch moves on its own. One step is enough: nothing in
+                // the dataplane branches on the size of the jump, only on the ordering.
+                if s.epoch[v as usize] == 0 {
+                    out.push(RegAct::AdvanceEpoch(v));
+                }
+            }
+            out.push(RegAct::Sweep);
+        }
+
+        fn next_state(&self, last: &Reg, act: RegAct) -> Option<Reg> {
+            let mut s = last.clone();
+            let kind = self.kind;
+            let cls = Class::Small;
+            match act {
+                RegAct::Lookup(a) => {
+                    let ad = GlobalAddr(ADDRS[a as usize]);
+                    let v = s.sh.lookup(ad, kind, cls).map_or(0, |l| l.version);
+                    s.seen.insert((ad.0, v));
+                }
+                RegAct::Register(a) => {
+                    let ad = GlobalAddr(ADDRS[a as usize]);
+                    let r =
+                        s.sh.register_of(ad, kind, cls, s.epoch[a as usize])
+                            .unwrap();
+                    s.seen.insert((ad.0, r.version));
+                }
+                RegAct::Guard(a) => {
+                    let ad = GlobalAddr(ADDRS[a as usize]);
+                    let _ = s.sh.guard_of(ad, kind, cls, s.epoch[a as usize]);
+                }
+                RegAct::Learn { a, version, b } => {
+                    let ad = GlobalAddr(ADDRS[a as usize]);
+                    let ballot = Ballot::new(BALLOTS[b as usize].0, BALLOTS[b as usize].1);
+                    let r = Register { version, ballot };
+                    if let Ok(Some(t)) =
+                        s.sh.reserve_unguarded(ad, kind, cls, r, s.epoch[a as usize], false)
+                    {
+                        s.pending.push((ad.0, t, false));
+                        s.writes += 1;
+                    }
+                }
+                RegAct::Reserve { a, g, b } => {
+                    let ad = GlobalAddr(ADDRS[a as usize]);
+                    let guard = GUARDS[g as usize];
+                    let ballot = Ballot::new(BALLOTS[b as usize].0, BALLOTS[b as usize].1);
+                    if let Ok(t) =
+                        s.sh.reserve(ad, kind, cls, guard, ballot, s.epoch[a as usize])
+                    {
+                        // Only the guards a real proposer can present: `guard_of`
+                        // returns the epoch's fill point for Immutable, so an accept
+                        // either derives it or carries that same number. An arbitrary
+                        // guard is a different test, covered by the conflict rules.
+                        let fill = guard.is_none_or(|g| g == 3 * s.epoch[a as usize]);
+                        s.offbeat |= kind == Kind::Immutable && fill && t.version % 3 != 1;
+                        // A derived guard is the one the OCC ring vouched for.
+                        if guard.is_none() && kind == Kind::Occ {
+                            s.used.insert((ad.0, t.version - 1));
+                        }
+                        s.pending.push((ad.0, t, guard.is_none()));
+                        s.writes += 1;
+                    }
+                }
+                RegAct::Stage(p) => {
+                    let (addr, t, _) = s.pending.remove(p as usize);
+                    // The value rides in the entry's data checksum, so two proposers at
+                    // one version are distinguishable in the durable record.
+                    let value = t.ballot.raw();
+                    // `Ok(None)` is a commit that lost the race and gave its slot back:
+                    // the caller sees success but nothing was written, so nothing is
+                    // acknowledged as this address's value.
+                    if let Ok(Some(st)) =
+                        s.sh.stage(GlobalAddr(addr), kind, cls, t, value, &group_of)
+                    {
+                        s.acked.insert((addr, t.version, t.ballot.raw(), value));
+                        if let Some(old) = st.stale {
+                            s.sh.release(cls, old, &group_of);
+                        }
+                    }
+                }
+                RegAct::Leak(p) => {
+                    s.pending.remove(p as usize);
+                    s.leaked += 1;
+                }
+                RegAct::Unreserve(p) => {
+                    let (_, t, _) = s.pending.remove(p as usize);
+                    s.sh.unreserve(cls, t, &group_of);
+                }
+                RegAct::Trim { a, g } => {
+                    let ad = GlobalAddr(ADDRS[a as usize]);
+                    let ballot = Ballot::new(2, 0);
+                    let r = s.sh.trim(
+                        ad,
+                        kind,
+                        cls,
+                        TGUARDS[g as usize],
+                        ballot,
+                        s.epoch[a as usize],
+                        &group_of,
+                    );
+                    // A mutable trim destroys the register rather than tombstoning it,
+                    // so versions restart from zero and the history before it is no
+                    // longer a claim about the same incarnation. Forgetting it here
+                    // scopes the register property to "between trims".
+                    if kind != Kind::Immutable && matches!(r, Ok(Some(_))) {
+                        s.acked.retain(|&(x, _, _, _)| x != ad.0);
+                        s.trimmed += 1;
+                    }
+                }
+                RegAct::AdvanceEpoch(v) => s.epoch[v as usize] += 1,
+                RegAct::Sweep => {
+                    // Which tombstones the sweep took, and whose. That is the whole
+                    // claim: a volume the control plane has not advanced loses nothing.
+                    let before: Vec<u64> = s.sh.slabs[0]
+                        .entries
+                        .iter()
+                        .filter(|e| e.state == State::Tombstone)
+                        .map(|e| e.addr)
+                        .collect();
+                    let epochs = s.epoch;
+                    s.sh.sweep(cls, &|a: u64| epochs[vol_of(a)] as u32, &group_of);
+                    for a in before {
+                        if find(std::slice::from_ref(&s.sh), a).is_none() {
+                            s.reaped[vol_of(a)] = true;
+                        }
+                    }
+                }
+            }
+            Some(s)
+        }
+
+        fn properties(&self) -> Vec<Property<Self>> {
+            let mut ps = vec![
+                // A ballot names one value at one version, once and for all. Two values
+                // at one *version* is legal and expected — two proposers may propose at
+                // one version with different ballots, and only one is ever chosen — so
+                // the key is the pair.
+                Property::<Self>::always("one value per ballot", |_, s| {
+                    let mut v: Vec<(u64, u64, u32)> =
+                        s.acked.iter().map(|&(a, x, b, _)| (a, x, b)).collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    v.len() == s.acked.len()
+                }),
+                // The register never goes backwards: what the node holds must be at
+                // least the newest thing it ever acknowledged. Compared through
+                // `effective`, because an epoch advance legitimately carries an
+                // Immutable address forward past a tombstone the sweep has since
+                // reclaimed.
+                Property::<Self>::always("the register never regresses", |m: &Self, s: &Reg| {
+                    s.acked.iter().all(|&(a, v, b, _)| {
+                        let e = find(std::slice::from_ref(&s.sh), a);
+                        let held = (
+                            effective(e, m.kind, s.epoch[vol_of(a)]),
+                            e.map_or(0, |x| x.ballot as u32),
+                        );
+                        held >= (v, b)
+                    })
+                }),
+                // No version is ever accepted at zero: `reserve` returns `g + 1`.
+                Property::<Self>::always("accepted versions are nonzero", |_, s| {
+                    s.acked.iter().all(|&(_, v, _, _)| v > 0)
+                }),
+                // Every slot is free, live, reserved or leaked, exactly once. Catches a
+                // double free, a lost slot, and a stale index entry.
+                Property::<Self>::always("slots are accounted for", |_, s| {
+                    if !sound(std::slice::from_ref(&s.sh)) {
+                        return false;
+                    }
+                    let sl = &s.sh.slabs[0];
+                    let live = sl.entries.iter().filter(|e| e.addr != 0).count();
+                    // The index names the slot the entry actually occupies, both ways.
+                    for (l, e) in sl.entries.iter().enumerate() {
+                        if e.addr == 0 {
+                            continue;
+                        }
+                        match sl.index.get(e.addr).and_then(|g| sl.local_of(g)) {
+                            Some(x) if x as usize == l => {}
+                            _ => return false,
+                        }
+                    }
+                    sl.free.len() + live + s.pending.len() + s.leaked as usize == SLOTS
+                }),
+                // An accept on the derived path is only ever licensed by a version this
+                // node really read. Eviction may drop a record, turning a would-be
+                // success into a conflict; it may never manufacture one.
+                Property::<Self>::always("occ accepts were observed", |_, s| {
+                    s.used.is_subset(&s.seen)
+                }),
+                // The per-volume census is maintained one entry at a time, in `set`.
+                // This is the only thing that says it still agrees with the slab, and
+                // the control plane's epoch decision rests on it.
+                Property::<Self>::always("the census matches the slab", |_, s| {
+                    s.sh.slabs[0].census == recount(&s.sh.slabs[0])
+                }),
+                Property::<Self>::sometimes("a value is accepted", |_, s| !s.acked.is_empty()),
+                Property::<Self>::sometimes("a slot is reused", |_, s| {
+                    s.writes as usize > SLOTS - s.sh.slabs[0].free.len() + s.leaked as usize
+                }),
+            ];
+            match self.kind {
+                Kind::Immutable => {
+                    // `3*epoch + ordinal`: a fill is ordinal 1, a trim is ordinal 2.
+                    // Nothing else may be accepted, at any epoch.
+                    ps.push(Property::<Self>::always(
+                        "immutable versions are ordinals",
+                        |_, s| !s.offbeat,
+                    ));
+                    ps.push(Property::<Self>::sometimes(
+                        "a tombstone is written",
+                        |_, s| {
+                            s.sh.slabs[0]
+                                .entries
+                                .iter()
+                                .any(|e| e.state == State::Tombstone)
+                        },
+                    ));
+                    // The only garbage collection in the system, and it is scoped to one
+                    // volume. A volume whose epoch still sits at zero keeps every
+                    // tombstone it has, however far ahead the other volume runs.
+                    ps.push(Property::<Self>::always(
+                        "the sweep stays inside its volume",
+                        |_, s| (0..ADDRS.len()).all(|v| s.epoch[v] > 0 || !s.reaped[v]),
+                    ));
+                    ps.push(Property::<Self>::sometimes(
+                        "a tombstone is reclaimed",
+                        |_, s| {
+                            s.acked.iter().any(|&(a, v, _, _)| {
+                                v == 2
+                                    && s.epoch[vol_of(a)] > 0
+                                    && find(std::slice::from_ref(&s.sh), a).is_none()
+                            })
+                        },
+                    ));
+                    // The point of the rescope: one volume collects while the other,
+                    // still lagging, keeps its own tombstone.
+                    ps.push(Property::<Self>::sometimes(
+                        "one volume collects alone",
+                        |_, s| {
+                            s.reaped[0]
+                                && s.epoch[1] == 0
+                                && s.sh.slabs[0]
+                                    .entries
+                                    .iter()
+                                    .any(|e| e.state == State::Tombstone && vol_of(e.addr) == 1)
+                        },
+                    ));
+                }
+                _ => {
+                    // A mutable trim does not tombstone: it drops the entry and hands
+                    // the slot straight back.
+                    ps.push(Property::<Self>::sometimes(
+                        "a trim frees a slot",
+                        |_, s| {
+                            s.trimmed > 0
+                                && find(std::slice::from_ref(&s.sh), ADDRS[0]).is_none()
+                                && !s.sh.slabs[0].free.is_empty()
+                        },
+                    ));
+                }
+            }
+            ps
+        }
+    }
+
+    // ------------------------------------------------------------------- durability
+
+    /// Where a flush lands. Alternating is the A/B ping-pong; fixed is the obvious
+    /// alternative, in which a failed write destroys the only copy there was.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Ab {
+        Alternating,
+        Fixed,
+    }
+
+    /// When a write may be reported as done. Durable is what `flush_until` waits for;
+    /// staged is what the DRAM image alone would justify.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Ack {
+        Durable,
+        Staged,
+    }
+
+    /// Group commit, the A/B copies, and the startup scan that has to make sense of
+    /// whatever a crash left behind. There is no journal, so `rebuild` is the entire
+    /// recovery procedure and this is the only thing that checks it.
+    #[derive(Clone, PartialEq, Hash, Debug)]
+    struct Disk {
+        shards: Vec<Shard>,
+        /// Both copies of every mblock. `None` is a copy a failed write destroyed.
+        image: Vec<Copies>,
+        pending: Vec<(u64, Ticket)>,
+        /// Staged but not durable: what to report once `durable_seq` catches up, which
+        /// is exactly what `flush_until` waits on.
+        waiting: Vec<Waiting>,
+        acked: BTreeSet<(u64, u64, u32, u32)>,
+        /// The flush in flight: mblock, the sequence it makes durable, its generation
+        /// and the rows it carries.
+        flight: Option<(u32, u64, u64, Vec<Entry>)>,
+        /// Both copies of one mblock died. That is genuine media loss, which the node
+        /// answers with `Missing` rather than with a lie, and it is sticky: a later
+        /// successful write refills a copy but does not bring the lost rows back.
+        lost: bool,
+        writes: u8,
+        flushes: u8,
+        restarts: u8,
+        cores: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum DiskAct {
+        Reserve { a: u8, b: u8 },
+        Stage(u8),
+        FlushGo(u8),
+        FlushDone(bool),
+        Restart(u8),
+    }
+
+    struct DiskModel {
+        ab: Ab,
+        ack: Ack,
+        commit: Commit,
+    }
+
+    impl DiskModel {
+        /// Move everything whose mblock has reached its sequence into `acked`:
+        /// `flush_until`'s predicate and nothing else.
+        fn promote(&self, s: &mut Disk) {
+            if self.ack == Ack::Staged {
+                return;
+            }
+            let durable = s.shards[0].slab(Class::Small).durable_seq.to_vec();
+            let acked = &mut s.acked;
+            let mut stale = Vec::new();
+            s.waiting.retain(|&(a, v, b, val, li, seq, old)| {
+                if durable[li as usize] >= seq {
+                    acked.insert((a, v, b, val));
+                    stale.extend(old);
+                    false
+                } else {
+                    true
+                }
+            });
+            for slot in stale {
+                s.shards[0].release(Class::Small, slot, &group_of);
+            }
+        }
+    }
+
+    impl Model for DiskModel {
+        type State = Disk;
+        type Action = DiskAct;
+
+        fn init_states(&self) -> Vec<Disk> {
+            let image = formatted();
+            vec![Disk {
+                shards: boot(1, self.commit == Commit::Checked, &image).0,
+                image,
+                pending: Vec::new(),
+                waiting: Vec::new(),
+                acked: BTreeSet::new(),
+                flight: None,
+                lost: false,
+                writes: 0,
+                flushes: 0,
+                restarts: 0,
+                cores: 1,
+            }]
+        }
+
+        fn actions(&self, s: &Disk, out: &mut Vec<DiskAct>) {
+            // The model drives core 0 only, so writes stop once a restart has spread
+            // the shards wider. That restart is there for `rebuild`, not for traffic.
+            if s.cores == 1 && s.writes < MAX_WRITES && s.pending.len() < MAX_PENDING {
+                for a in 0..ADDRS.len() as u8 {
+                    for b in 0..2u8 {
+                        out.push(DiskAct::Reserve { a, b });
+                    }
+                }
+            }
+            for p in 0..s.pending.len() as u8 {
+                out.push(DiskAct::Stage(p));
+            }
+            if s.flight.is_none() {
+                if s.flushes < MAX_FLUSHES {
+                    for li in 0..s.shards[0].slabs[0].local as u8 {
+                        out.push(DiskAct::FlushGo(li));
+                    }
+                }
+            } else {
+                out.push(DiskAct::FlushDone(true));
+                out.push(DiskAct::FlushDone(false));
+            }
+            if s.restarts < 1 {
+                out.push(DiskAct::Restart(1));
+                out.push(DiskAct::Restart(2));
+            }
+        }
+
+        fn next_state(&self, last: &Disk, act: DiskAct) -> Option<Disk> {
+            let mut s = last.clone();
+            let cls = Class::Small;
+            match act {
+                DiskAct::Reserve { a, b } => {
+                    let ad = GlobalAddr(ADDRS[a as usize]);
+                    let ballot = Ballot::new(BALLOTS[b as usize].0, BALLOTS[b as usize].1);
+                    let t = s.shards[0]
+                        .reserve(ad, Kind::Lww, cls, None, ballot, 0)
+                        .ok()?;
+                    s.pending.push((ad.0, t));
+                    s.writes += 1;
+                }
+                DiskAct::Stage(p) => {
+                    let (addr, t) = s.pending.remove(p as usize);
+                    let value = t.ballot.raw();
+                    let st = s.shards[0]
+                        .stage(GlobalAddr(addr), Kind::Lww, cls, t, value, &group_of)
+                        .ok()??;
+                    match self.ack {
+                        Ack::Staged => {
+                            s.acked.insert((addr, t.version, t.ballot.raw(), value));
+                            if let Some(old) = st.stale {
+                                s.shards[0].release(cls, old, &group_of);
+                            }
+                        }
+                        Ack::Durable => s.waiting.push((
+                            addr,
+                            t.version,
+                            t.ballot.raw(),
+                            value,
+                            st.li,
+                            st.seq,
+                            st.stale,
+                        )),
+                    }
+                }
+                DiskAct::FlushGo(li) => {
+                    let li = li as u32;
+                    let need = s.shards[0].slab(cls).commit_seq[li as usize];
+                    if s.shards[0].flush_act(cls, li, need) != Act::Go {
+                        return None;
+                    }
+                    let (seq, h, rows) = s.shards[0].begin_flush(cls, li);
+                    s.flight = Some((li, seq, h.generation, rows.to_vec()));
+                    s.flushes += 1;
+                }
+                DiskAct::FlushDone(ok) => {
+                    let (li, seq, g, rows) = s.flight.take()?;
+                    let copy = match self.ab {
+                        Ab::Alternating => (g % 2) as usize,
+                        Ab::Fixed => 0,
+                    };
+                    // A write that fails leaves the copy it aimed at unreadable, which
+                    // is the whole reason there are two of them.
+                    s.image[li as usize][copy] = if ok { Some((g, rows)) } else { None };
+                    s.lost |= s.image[li as usize].iter().all(|c| c.is_none());
+                    s.shards[0].end_flush(cls, li, seq, ok);
+                    self.promote(&mut s);
+                }
+                DiskAct::Restart(cores) => {
+                    let (shards, _) = boot(cores as u32, self.commit == Commit::Checked, &s.image);
+                    s.shards = shards;
+                    s.cores = cores as u32;
+                    s.restarts += 1;
+                    // A crash loses every reservation and every unacknowledged commit.
+                    s.pending.clear();
+                    s.waiting.clear();
+                    s.flight = None;
+                }
+            }
+            Some(s)
+        }
+
+        fn properties(&self) -> Vec<Property<Self>> {
+            vec![
+                // The one that matters: what was reported done is still there. An
+                // mblock whose copies both died is genuine media loss, which the node
+                // answers with `Missing` rather than with a lie, so it is exempt.
+                Property::<Self>::always("acknowledged writes survive", |_, s: &Disk| {
+                    if s.lost {
+                        return true;
+                    }
+                    // Two ballots may legitimately hold one version and the higher one
+                    // wins, so the test is on `(version, ballot)` order rather than on
+                    // the value: never lost, never regressed, and equal keys must agree
+                    // on the bytes.
+                    s.acked
+                        .iter()
+                        .all(|&(a, v, b, val)| match find(&s.shards, a) {
+                            Some(e) => {
+                                let held = (e.version, e.ballot as u32);
+                                held > (v, b) || (held == (v, b) && e.data_crc == val)
+                            }
+                            None => false,
+                        })
+                }),
+                Property::<Self>::always("slots are accounted for", |_, s: &Disk| sound(&s.shards)),
+                // `rebuild` seeds the census in one pass and `set` keeps it from there.
+                // A restart is the only thing that exercises the seeding.
+                Property::<Self>::always("the census matches the slabs", |_, s: &Disk| {
+                    s.shards
+                        .iter()
+                        .all(|sh| sh.slabs[0].census == recount(&sh.slabs[0]))
+                }),
+                // A displaced slot is retired only once its replacement is durable, so
+                // until then one address legitimately occupies two slots. Every such
+                // extra slot must be one a commit is still holding; otherwise it is a
+                // slot nothing will ever give back.
+                Property::<Self>::always("displaced slots are owned", |_, s: &Disk| {
+                    let held = s.waiting.iter().filter_map(|w| w.6).collect();
+                    duplicates_are_owned(&s.shards, &held)
+                }),
+                Property::<Self>::sometimes("a write survives a restart", |_, s: &Disk| {
+                    s.restarts > 0 && !s.acked.is_empty() && find(&s.shards, ADDRS[0]).is_some()
+                }),
+                // The older copy is readable exactly when the newer one is not, which
+                // is a lost write rather than corruption.
+                Property::<Self>::sometimes("the older copy is used", |_, s: &Disk| {
+                    s.image.iter().any(|c| c[0].is_none() != c[1].is_none())
+                }),
+                // Two slots claiming one address, which is what a crash between the
+                // metadata write and the old slot's release leaves behind.
+                Property::<Self>::sometimes("a duplicate is resolved at startup", |_, s: &Disk| {
+                    s.restarts > 0
+                        && s.image
+                            .iter()
+                            .flatten()
+                            .flatten()
+                            .filter(|(_, rows)| rows.iter().any(|e| e.addr == ADDRS[0]))
+                            .count()
+                            > 1
+                        && find(&s.shards, ADDRS[0]).is_some()
+                }),
+                // The index shards by consensus group, the slots by core, and after a
+                // core count change those need not agree.
+                Property::<Self>::sometimes("a foreign entry appears", |_, s: &Disk| {
+                    s.shards.iter().any(|sh| !sh.slabs[0].foreign.is_empty())
+                }),
+            ]
+        }
+    }
+
+    // ------------------------------------------------------------------------ checks
+
+    fn threads() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+
+    #[test]
+    fn the_occ_pool_evicts_the_coldest_record() {
+        let mut r = OccRing::new(2);
+        r.observe(1, 10);
+        r.observe(2, 20);
+        r.observe(1, 11); // re-read moves 1 to the back, ahead of 2
+        r.observe(3, 30);
+        assert_eq!(
+            r.version(1),
+            Some(11),
+            "a re-read page was evicted before a colder one"
+        );
+        assert_eq!(r.version(2), None);
+        assert_eq!(r.version(3), Some(30));
+        // Both halves stay within the bound no matter how the reads repeat.
+        for i in 0..64u64 {
+            r.observe(i % 5, i);
+            assert!(r.seen.len() <= r.cap && r.fifo.len() <= r.cap);
+        }
+        r.set_cap(1);
+        assert_eq!(r.seen.len(), 1);
+    }
+
+    #[test]
+    fn register_semantics() {
+        for kind in [Kind::Lww, Kind::Occ, Kind::Immutable] {
+            RegModel {
+                kind,
+                commit: Commit::Checked,
+            }
+            .checker()
+            .threads(threads())
+            .spawn_bfs()
+            .join()
+            .assert_properties();
+        }
+    }
+
+    #[test]
+    fn durability() {
+        DiskModel {
+            ab: Ab::Alternating,
+            ack: Ack::Durable,
+            commit: Commit::Checked,
+        }
+        .checker()
+        .threads(threads())
+        .spawn_bfs()
+        .join()
+        .assert_properties();
+    }
+
+    /// A reservation and its commit are separated by the data write, so a second accept
+    /// for the same address can be granted and committed in between. Installing the
+    /// ticket without re-reading the entry lets the loser of that race land last and
+    /// pull the register back to an older ballot. This is the check `stage` makes.
+    #[test]
+    fn blind_commit_regresses_a_register() {
+        let path = DiskModel {
+            ab: Ab::Alternating,
+            ack: Ack::Durable,
+            commit: Commit::Blind,
+        }
+        .checker()
+        .threads(threads())
+        .spawn_bfs()
+        .join()
+        .assert_any_discovery("acknowledged writes survive");
+        assert!(path.into_actions().len() >= 4);
+    }
+
+    /// Acknowledging a commit the moment it is staged is the mistake group commit
+    /// exists to avoid: the entry is in DRAM, the mblock is not on the device, and a
+    /// crash takes it.
+    #[test]
+    fn staged_is_not_durable() {
+        let path = DiskModel {
+            ab: Ab::Alternating,
+            ack: Ack::Staged,
+            commit: Commit::Checked,
+        }
+        .checker()
+        .threads(threads())
+        .spawn_bfs()
+        .join()
+        .assert_any_discovery("acknowledged writes survive");
+        assert!(path.into_actions().len() >= 3);
+    }
+
+    /// Writing every generation to the same copy makes a failed metadata write
+    /// destructive: the previous contents are gone, and with them an acknowledged
+    /// value that had nothing to do with the write that failed.
+    #[test]
+    fn one_copy_is_not_enough() {
+        let path = DiskModel {
+            ab: Ab::Fixed,
+            ack: Ack::Durable,
+            commit: Commit::Checked,
+        }
+        .checker()
+        .threads(threads())
+        .spawn_bfs()
+        .join()
+        .assert_any_discovery("acknowledged writes survive");
+        assert!(path.into_actions().len() >= 3);
+    }
+}

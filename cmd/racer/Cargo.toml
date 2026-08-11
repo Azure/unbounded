@@ -1,0 +1,35 @@
+[package]
+name = "racer"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "racer"
+path = "src/main.rs"
+
+[[bin]]
+name = "racer-bench"
+path = "src/bench.rs"
+
+[features]
+# Deterministic simulation. Replaces the runtime's kernel seams — disk submission, the
+# timer, the clock, raw device IO and the guest copy — with an in-process model, and
+# shrinks every per-worker table so hundreds of nodes fit in one address space.
+# Everything above the runtime compiles and runs unchanged.
+sim = []
+
+[dependencies]
+io-uring = "0.7"
+libc = "0.2.189"
+prost = "0.14"
+
+[dev-dependencies]
+stateright = "0.31"
+
+[build-dependencies]
+prost-build = "0.14"
+
+[profile.release]
+# Line tables only: `perf` needs them to attribute a hot loop to a source line, and they
+# cost nothing at run time.
+debug = 1
