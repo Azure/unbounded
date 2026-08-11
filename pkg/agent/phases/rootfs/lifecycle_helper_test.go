@@ -11,6 +11,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestInstallNSpawnLifecycleHelperPreservesExistingTargetOnCopyFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "bin", "nspawn-lifecycle-helper")
+	require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o755))
+	require.NoError(t, os.WriteFile(target, []byte("working-agent"), 0o755))
+
+	// Opening a directory succeeds, but copying from it fails. This exercises
+	// cleanup after temporary-file creation without replacing the working target.
+	err := installNSpawnLifecycleHelper(dir, target)
+	require.Error(t, err)
+
+	data, readErr := os.ReadFile(target)
+	require.NoError(t, readErr)
+	require.Equal(t, []byte("working-agent"), data)
+
+	temps, globErr := filepath.Glob(filepath.Join(filepath.Dir(target), ".nspawn-lifecycle-helper-*"))
+	require.NoError(t, globErr)
+	require.Empty(t, temps)
+}
+
 func TestInstallNSpawnLifecycleHelper(t *testing.T) {
 	t.Parallel()
 

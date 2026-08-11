@@ -51,24 +51,56 @@ func installNSpawnLifecycleHelper(sourcePath, targetPath string) (retErr error) 
 		return fmt.Errorf("create lifecycle helper directory: %w", err)
 	}
 
-	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	targetDir := filepath.Dir(targetPath)
+
+	temp, err := os.CreateTemp(targetDir, "."+filepath.Base(targetPath)+"-*")
 	if err != nil {
-		return fmt.Errorf("open lifecycle helper target %s: %w", targetPath, err)
+		return fmt.Errorf("create lifecycle helper temporary file: %w", err)
 	}
 
+	tempPath := temp.Name()
+	tempClosed := false
+
 	defer func() {
-		if err := target.Close(); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("close lifecycle helper target %s: %w", targetPath, err))
+		if !tempClosed {
+			retErr = errors.Join(retErr, wrapCloseError(temp.Close(), tempPath))
+		}
+
+		if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			retErr = errors.Join(retErr, fmt.Errorf("remove lifecycle helper temporary file %s: %w", tempPath, err))
 		}
 	}()
 
-	if _, err := io.Copy(target, source); err != nil {
-		return fmt.Errorf("copy lifecycle helper to %s: %w", targetPath, err)
+	if _, err := io.Copy(temp, source); err != nil {
+		return fmt.Errorf("copy lifecycle helper to temporary file: %w", err)
 	}
 
-	if err := target.Chmod(0o755); err != nil {
-		return fmt.Errorf("chmod lifecycle helper %s: %w", targetPath, err)
+	if err := temp.Chmod(0o755); err != nil {
+		return fmt.Errorf("chmod lifecycle helper temporary file: %w", err)
+	}
+
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync lifecycle helper temporary file: %w", err)
+	}
+
+	closeErr := temp.Close()
+	tempClosed = true
+
+	if closeErr != nil {
+		return fmt.Errorf("close lifecycle helper temporary file %s: %w", tempPath, closeErr)
+	}
+
+	if err := os.Rename(tempPath, targetPath); err != nil {
+		return fmt.Errorf("replace lifecycle helper %s: %w", targetPath, err)
 	}
 
 	return nil
+}
+
+func wrapCloseError(err error, path string) error {
+	if err == nil {
+		return nil
+	}
+
+	return fmt.Errorf("close lifecycle helper temporary file %s: %w", path, err)
 }
