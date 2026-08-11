@@ -367,3 +367,150 @@ func TestOverridesStatusReadsOnly(t *testing.T) {
 		t.Fatalf("overrides status performed writes %v; it must only read", writes)
 	}
 }
+
+// TestOverridesValidateAcceptsAConfigMapManifest is a regression test.
+//
+// A ConfigMap manifest is the shape users actually have: it is what they apply,
+// and the shipped example is one, with comments in it telling the reader to
+// check it with this command. Doing so failed with three complaints about
+// fields missing from an internal Go type, none of which mentioned ConfigMaps.
+func TestOverridesValidateAcceptsAConfigMapManifest(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "component-overrides.yaml")
+
+	manifest := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ` + override.ConfigMapName + `
+  namespace: unbounded-system
+data:
+  resources.yaml: |
+` + indentBlock(validOverridesDocument(), "    ") + `
+  scheduling.yaml: |
+` + indentBlock(validOverridesDocument(), "    ")
+
+	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runOverridesValidateFiles([]string{path}, &out); err != nil {
+		t.Fatalf("a ConfigMap manifest must validate: %v", err)
+	}
+
+	// Both keys were read, not just the first.
+	if !strings.Contains(out.String(), "2 entries") {
+		t.Fatalf("output = %q, want both data keys validated", out.String())
+	}
+}
+
+// TestOverridesValidateShippedExample checks the exact file the repository
+// ships, since its own comments instruct the reader to run this command on it.
+func TestOverridesValidateShippedExample(t *testing.T) {
+	path := filepath.Join("..", "..", "..",
+		"deploy", "unbounded-operator", "examples", "component-overrides.example.yaml")
+
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("example not present: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runOverridesValidateFiles([]string{path}, &out); err != nil {
+		t.Fatalf("the shipped example must pass the command its own comments recommend: %v", err)
+	}
+}
+
+// TestOverridesValidateRejectsDuplicateKeys is a regression test for a silent
+// false pass.
+//
+// Files were keyed by base name, so two documents called overrides.yaml in
+// different directories overwrote each other. The command validated only the
+// last and reported a clean bill of health for a file it had never read. The
+// two cannot both become keys of one ConfigMap either way, so this is not a
+// case worth supporting silently.
+func TestOverridesValidateRejectsDuplicateKeys(t *testing.T) {
+	root := t.TempDir()
+
+	paths := make([]string, 0, 2)
+
+	for _, sub := range []string{"a", "b"} {
+		dir := filepath.Join(root, sub)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		path := filepath.Join(dir, "overrides.yaml")
+		if err := os.WriteFile(path, []byte(validOverridesDocument()), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		paths = append(paths, path)
+	}
+
+	var out bytes.Buffer
+
+	err := runOverridesValidateFiles(paths, &out)
+	if err == nil {
+		t.Fatal("two files sharing a base name must be refused, not silently reduced to one")
+	}
+
+	// The message has to name both, or the user cannot tell which to rename.
+	for _, path := range paths {
+		if !strings.Contains(err.Error(), path) {
+			t.Fatalf("error = %q, want it to name %q", err, path)
+		}
+	}
+}
+
+// TestOverridesValidateRejectsMixedDocuments covers a file that is half one
+// shape and half the other. Reading only the part that fits would leave the
+// rest unvalidated while the command printed ok.
+func TestOverridesValidateRejectsMixedDocuments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mixed.yaml")
+
+	mixed := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ` + override.ConfigMapName + `
+data:
+  a.yaml: |
+` + indentBlock(validOverridesDocument(), "    ") + `
+---
+` + validOverridesDocument()
+
+	if err := os.WriteFile(path, []byte(mixed), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runOverridesValidateFiles([]string{path}, &out); err == nil {
+		t.Fatal("a file mixing both shapes must be refused rather than half-read")
+	}
+}
+
+// TestOverridesValidateStillAcceptsBareDocuments confirms the ConfigMap
+// unwrapping did not cost the simpler shape.
+func TestOverridesValidateStillAcceptsBareDocuments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "overrides.yaml")
+	if err := os.WriteFile(path, []byte(validOverridesDocument()), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runOverridesValidateFiles([]string{path}, &out); err != nil {
+		t.Fatalf("a bare document must still validate: %v", err)
+	}
+}
+
+// indentBlock indents every line of a block so it can be embedded in a YAML
+// literal scalar.
+func indentBlock(block, indent string) string {
+	lines := strings.Split(strings.TrimRight(block, "\n"), "\n")
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = indent + line
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}

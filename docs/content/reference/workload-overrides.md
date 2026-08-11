@@ -190,6 +190,7 @@ are accepted.
 
 ```bash
 # Offline: syntax, schema and allowlist. Correct regardless of operator version.
+# Accepts either a bare overrides document or the ConfigMap manifest you apply.
 kubectl unbounded overrides validate -f overrides.yaml
 
 # What the ConfigMap currently declares.
