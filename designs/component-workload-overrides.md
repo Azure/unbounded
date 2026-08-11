@@ -752,6 +752,18 @@ not contain an adversary, with the two exceptions noted below.
 Paths marked **subtree** permit all descendants. Paths marked **leaf** permit
 only the named field.
 
+The authoritative list is `override.PermittedPaths()`, which the CLI and the
+user reference both render rather than restate. The table below is a summary and
+has drifted from the code before; `containers` and `initContainers` are now held
+in step by a test rather than by whoever edits the list.
+
+Values are also checked against the type Kubernetes fixes for the path.
+Strategic merge does not police this: writing `containers:` as a mapping rather
+than a list, one missing `-`, merged cleanly and produced an object whose
+`containers` was no longer an array, which the operator then hashed, reported
+`Applied`, and handed to an API server that rejected it with a message naming a
+Go type.
+
 Within `spec.template.spec`:
 
 | Path | Kind | Notes |
@@ -763,12 +775,17 @@ Within `spec.template.spec`:
 | `containers[*].volumeMounts` | subtree | Except operator-declared mounts, see [§8.3](#83-protected) |
 | `containers[*].securityContext` | subtree | |
 | `containers[*].livenessProbe`, `.readinessProbe`, `.startupProbe` | subtree | |
+| `containers[*].lifecycle`, `.ports` | subtree | |
+| `containers[*].imagePullPolicy`, `.workingDir`, `.terminationMessagePath`, `.terminationMessagePolicy` | leaf | |
+| `initContainers[*]` | as `containers[*]` | Identical surface, plus `restartPolicy`, which is what declares a native sidecar and is rejected by Kubernetes on an ordinary container |
 | `volumes` | subtree | Except operator-declared volumes |
 | `imagePullSecrets` | subtree | |
 | `nodeSelector`, `tolerations`, `affinity` | subtree | Additive only, see [§8.4](#84-additive-only-scheduling) |
 | `topologySpreadConstraints` | subtree | |
-| `priorityClassName` | leaf | |
-| `dnsPolicy`, `dnsConfig` | subtree | |
+| `securityContext` | subtree | Pod-level |
+| `priorityClassName`, `runtimeClassName`, `schedulerName` | leaf | |
+| `dnsPolicy` | leaf | |
+| `dnsConfig` | subtree | |
 | `terminationGracePeriodSeconds` | leaf | |
 
 At the workload level:
@@ -777,6 +794,7 @@ At the workload level:
 |---|---|---|
 | `spec.replicas` | leaf | Deployments only |
 | `spec.strategy`, `spec.updateStrategy` | subtree | |
+| `spec.minReadySeconds`, `spec.revisionHistoryLimit` | leaf | |
 | `metadata.labels`, `metadata.annotations` | subtree | Excluding the reserved prefix |
 | `spec.template.metadata.labels`, `.annotations` | subtree | Excluding the reserved prefix and selector keys |
 
@@ -834,7 +852,7 @@ exhaustive.
 | `spec.template.spec.serviceAccountName` | **Security.** Retargeting borrows another identity's API permissions. Also detaches the component from its RBAC. |
 | `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. `gantry` runs `hostNetwork: false` by design; `net-node` cannot function without `hostNetwork: true`. |
 | Labels and annotations under `unbounded-cloud.io/` | Carry config hashes, Site scoping, and override visibility ([§11](#11-drift-visibility-and-observability)). |
-| Operator-declared `volumes`, by name | `Volumes` uses `patchStrategy:"merge,retainKeys"` (`k8s.io/api/core/v1/types.go:4145`), so a partial patch silently drops sibling fields of the volume it names. |
+| Operator-declared `volumes`, by name | Two reasons. `Volumes` uses `patchStrategy:"merge,retainKeys"` (`k8s.io/api/core/v1/types.go:4145`), so a partial patch silently drops sibling fields of the volume it names. More seriously, volumes merge on `name`, so redefining one repoints **every** mount that uses it while naming no `mountPath` anywhere, which is the mount protection below bypassed from the other side. Adding volumes under new names is unrestricted. |
 | Operator-declared `volumeMounts`, by **container plus `mountPath`** | See below. |
 
 **Mount identity is `(container, mountPath)`, not name.** `volumeMounts` merges
@@ -886,6 +904,20 @@ the concatenation of both sides' `matchExpressions` **and** both sides'
 `matchFields`; `NodeSelectorTerm` has both (`k8s.io/api/core/v1/types.go:3789`,
 `:3793`) and dropping `matchFields` would silently discard a user constraint.
 
+**The product is bounded.** It is multiplicative, and any number of documents
+can target one workload, so three contributors with four terms each already
+produce sixty-four. Compounded this is a denial of service against etcd rather
+than a merely large object, and the resulting affinity would be unreadable to
+anyone debugging a scheduling failure. Combining is refused past a fixed
+ceiling, with an error explaining that required terms are ORed and that fewer,
+broader terms are wanted.
+
+**An empty `nodeSelectorTerms` list is refused rather than treated as the
+identity.** An empty list matches nothing, so combining with it should yield
+nothing; treating it as the identity quietly resolved to whichever side was
+non-empty, leaving the operator's own constraint as the entire result while the
+user's affinity was reported `Applied`.
+
 Operator terms are never removed or replaced. The remaining constraints:
 
 - `affinity.nodeAffinity.preferredDuringScheduling...`, `podAffinity`, and
@@ -894,6 +926,15 @@ Operator terms are never removed or replaced. The remaining constraints:
 - `nodeSelector`: keys are merged; overwriting an operator-set key is rejected.
 - `tolerations`: appended, never replaced, despite strategic merge's default
   replace semantics for that list.
+- `topologySpreadConstraints`: appended. Conflict detection treats it as
+  additive, so the merge has to be additive too, or two contributors sharing a
+  `topologyKey` would overwrite each other while conflict detection reported no
+  disagreement.
+
+A scheduling value of the wrong type is refused rather than dropped. Lifting
+scheduling out of the patch before the merge and then failing a type assertion
+silently discarded it, leaving the override hashed and reported `Applied` while
+doing nothing at all.
 
 ### 8.5 Apply-time assertion
 
@@ -942,12 +983,23 @@ outcomes are predictable rather than arbitrary:
 
 | Property | Behaviour |
 |---|---|
-| **Ordering** | Operations execute in dependency order declared by the plan ([§10.1](#101-the-operation-plan)). A ConfigMap that a workload hashes is written before that workload. Within a dependency level, order is deterministic: component registry order, then kind, then name. |
-| **Continuation** | A failed operation does not abort the pass. Operations that do not depend on it still execute. Operations that do depend on it are **skipped**, not attempted, so a failure does not cascade into a half-configured workload. |
+| **Ordering** | Order is **inferred from the kind**, not declared: removals, then namespaces, schema (CRDs, priority and storage classes, webhooks), identity (ServiceAccounts and RBAC), config (ConfigMaps, Secrets, Services), custom resources, and workloads last. Declared `DependsOn` is honoured on top, for orderings that do not follow from the kinds involved. Within a tier the order is deterministic: component registry order, then the order that component emitted its operations. |
+| **Continuation** | A failed operation does not abort the pass. Operations that do not depend on it still execute. Dependents are **skipped**, not attempted, so a failure does not cascade into a half-configured workload. |
+| **Gating** | Three things gate an operation, and only the first is declared: a failed `DependsOn`; a failed earlier operation on the same object; and a failed earlier tier **for the same component and Site**. The last is scoped deliberately, because skipping every workload in the cluster over one component's ConfigMap would turn a contained failure into an outage. A failed Namespace is the one exception and gates everything in it, whichever component planned it, since nothing can be written into a namespace that does not exist. |
 | **No rollback** | Completed operations are never undone. There is no compensating action, and none is attempted. |
 | **Attribution** | Each failed operation is reported with its component, Site, object identity, and error. Aggregated into the existing `errors.Join` (`reconciler.go:191`). |
 | **Retry** | The pass returns an error and controller-runtime requeues with backoff. Because every operation is idempotent under server-side apply, the retry re-executes the whole plan rather than resuming from a checkpoint. |
-| **Partial status** | Objects that were applied carry their override annotations; objects that were skipped do not. Status therefore reflects what actually happened, not what was intended ([§11](#11-drift-visibility-and-observability)). |
+| **Partial status** | Objects that were applied carry their override annotations; objects that were skipped do not. `AppliedHash` is reported only for operations the executor completed, so status reflects what reached the cluster rather than what was intended ([§11](#11-drift-visibility-and-observability)). |
+| **Skipped is not Ready** | A component whose operations were all skipped reports `DependencyNotWritten` rather than `Reconciled`. It did not write what it planned, and the component that actually failed already reports the underlying error, so repeating it here would bury the cause. |
+
+Ordering is inferred rather than declared because declaring it puts a
+correctness requirement on every component author in a place where getting it
+wrong is invisible. A DaemonSet applied before its ConfigMap exists **succeeds**;
+nothing fails and nothing is reported, and the symptom is a crash-looping pod
+that cannot mount, until some later pass happens to order the two the other way.
+The dependencies are a property of the Kubernetes object model rather than of
+any component, so inferring them makes the ordering correct by construction for
+every component, including ones that never consider it.
 
 A pass that fails partway is a normal, recoverable state: the next reconcile
 recomputes the plan from current cluster state and re-executes it.
@@ -1021,7 +1073,8 @@ rollout, one log line, and a Site still reporting `Ready=True`.
 | Resolution: container absent and not in `addContainers`, name in `addContainers` that already exists, `mountPath` collision | That object only | That object's operation dropped; every other operation executes |
 | Conflict between contributors ([§6.5](#65-what-counts-as-a-conflict)) | That object only | As above |
 | `sites` naming a Site that does not exist | Nothing | Inert, reported ([§6.3](#63-resolution)) |
-| API or admission error during execution | That operation and its dependents | Per [§9.2](#92-execution-semantics) |
+| API or admission error during execution | That operation, its declared dependents, later operations on the same object, and that component's later tiers for that Site | Per [§9.2](#92-execution-semantics). A failed Namespace additionally gates every namespaced object in it. |
+| An object the plan expected to create already exists | That pass | The write succeeds, since an existing payload surviving is the point of `OpCreateIfAbsent`, but the object is refreshed from the cluster and the pass re-plans: everything computed from the earlier read is stale, including the config hash stamped on the workload that mounts it. |
 
 Preflight failures are snapshot-wide because a document that does not parse
 cannot be attributed to a component. Resolution and conflict failures are
@@ -1065,7 +1118,14 @@ than one workload is targeted, so the signal was always on.
 |---|---|---|
 | `unbounded-cloud.io/override-hash` | Annotation on the workload | Hash of the contributor set actually merged into this object |
 | `SiteStatus.Overrides.Workloads[].DesiredHash` | Site status, written by the operator | Same computation over the snapshot, for the same object |
-| `SiteStatus.Overrides.Workloads[].AppliedHash` | Site status, read back from the object | Mirrors the annotation |
+| `SiteStatus.Overrides.Workloads[].AppliedHash` | Site status, from the object the operator successfully wrote | Empty when the write failed, was skipped, or never ran |
+
+`AppliedHash` is read from the merged object in the plan, because that is the
+only place it exists, but **only for operations the executor completed**. Taking
+it from the plan alone described intent rather than outcome: a workload whose
+apply the API server rejected still reported its desired hash as applied, so the
+Site said `Applied` for an override that had never reached the cluster, which is
+the one case this comparison exists to catch.
 
 Desired is **computed by the operator and persisted in status**, never written
 as an annotation. Annotating an object the operator has just decided not to
@@ -1224,12 +1284,24 @@ shared mutable state.
 The watch is registered centrally in `SetupWithManager` (`reconciler.go:279-311`)
 rather than per component, since the ConfigMap spans components.
 
-The obvious wiring, reusing `RequestSingletonAndAllSites` (`watch.go:35`), is
-**wrong**. That handler lists Sites at event-delivery time and, when the List
-fails, logs and returns only the singleton request (`watch.go:44-49`). There is
-no retry: the event is consumed and the per-Site fan-out is lost permanently.
-The singleton pass does not compensate, because Site components run only when
-`site != nil` (`reconciler.go:179`).
+The obvious wiring, reusing `RequestSingletonAndAllSites`, is **wrong**, for two
+reasons.
+
+It lists Sites at event-delivery time and, when the List fails, logs and returns
+only the singleton request. There is no retry: the event is consumed and the
+per-Site fan-out is lost permanently.
+
+It is also redundant. The singleton pass already reconciles every Site, because
+the Site-less pass fans out to all of them (see below), so enqueuing the Sites
+as well produced N extra full passes for one ConfigMap edit, each re-planning
+and re-applying every component for a Site that had just been done.
+
+That helper has been deleted rather than left available. An earlier revision of
+this section claimed the singleton pass "does not compensate, because Site
+components run only when `site != nil`", which contradicted the fan-out
+described three paragraphs below it and was the stated justification for a
+hazard that does not exist. The same wiring is now used by every component
+watch, not only this one.
 
 ```go
 // The ConfigMap watch enqueues only the synthetic singleton request. Fan-out
@@ -1282,6 +1354,16 @@ fallback; both assumptions are recorded in [§17](#17-open-questions).
 `ManagedConfigPredicate` (`watch.go:107`) is reused unchanged. It matches on
 namespace, name, and payload change with no ownership requirement, so it works
 on a user-owned ConfigMap.
+
+**The cache is scoped to the operator's namespace.** A predicate filters events
+after delivery; it does not stop the informer existing. Unscoped, the operator
+ran informers over every ConfigMap, Deployment and DaemonSet in every namespace
+in the cluster, which for ConfigMaps means a `kube-root-ca.crt` per namespace
+plus whatever Helm and other operators have left, none of it ever read.
+`DefaultNamespaces` applies only to namespaced kinds, so Sites, Nodes and CRDs
+stay cluster-wide as they must. The legacy reaper is the one component that
+legitimately reads other namespaces, and it already goes through `APIReader`
+precisely so those reads bypass the cache.
 
 ### 10.4 Shared operation deduplication
 
@@ -1473,6 +1555,14 @@ note: container and volume names are resolved by the operator; run
 Scoping it this way is what makes it useful: an offline check that is always
 correct beats an online check that is correct only when versions match.
 
+`-f` accepts both shapes users have: a bare overrides document, or the ConfigMap
+manifest they would apply. A manifest is unwrapped and each `data` key checked
+separately, which is how the operator reads it. This matters because the example
+shipped with the operator is a ConfigMap manifest whose own comments recommend
+this command. Keys must be unique across all inputs, since two files cannot
+become one ConfigMap key; supplying two that collide is refused rather than
+silently reduced to the last one.
+
 **`kubectl unbounded overrides status`** reports resolution and application, and
 **reads persisted state without recomputing it**. Desired hashes come from
 `SiteStatus.Overrides.Workloads[].DesiredHash`, which the operator computed
@@ -1621,7 +1711,9 @@ a reader to discover:
   bounded self-healing race documented in [§10.1](#101-the-operation-plan).
 - Within-component operation order has to be preserved rather than sorted, or
   gantry's legacy cleanup and storage's ConfigMap-before-DaemonSet sequencing
-  silently reorder.
+  silently reorder. (Superseded in part: order is now inferred from the kind,
+  and emission order is preserved *within* a tier. See
+  [§9.2](#92-execution-semantics).)
 - The testing section assumed envtest, which does not exist in this repository.
   Coverage extends the existing kind harness instead ([§15](#15-testing)).
 
@@ -1639,6 +1731,55 @@ because it is evidence about where the risk in this feature actually sits:
 - yaml.v3 decodes whole numbers as `int` while apimachinery accepts only
   `int64` and **panics** otherwise, so the first user to write `spec.replicas`
   would have crashed the operator. Parsing normalizes decoded values.
+
+### What review changed after implementation
+
+A review of the implemented feature raised twenty-five findings. The sections
+above are corrected rather than annotated, so this is only a record of where the
+remaining risk turned out to sit. Two of them crashed the operator from a
+document that passed validation, and both were reproduced before being fixed:
+
+- yaml.v3 resolves an unquoted date to `time.Time`, which apimachinery's
+  `DeepCopyJSONValue` panics on exactly as it does on a plain `int`. The
+  normalization added above covered numbers but not this.
+- strategicpatch compares merge keys with `==`, which panics at runtime on an
+  uncomparable type. `containers[*].env` is a permitted subtree, so
+  `env: [{name: [oops], value: x}]` reached that comparison. Merge keys are now
+  type-checked before the merge runs.
+
+The rest cluster into four themes, which is the useful part:
+
+- **Intent reported as outcome.** Applied hashes came from the plan, so a write
+  the API server rejected was still reported `Applied` ([§9.7](#97-desired-versus-applied)).
+  A component whose operations were all skipped still reported `Reconciled`
+  ([§9.2](#92-execution-semantics)). Malformed scheduling and wrongly typed
+  values were dropped silently while the override was hashed and reported
+  applied ([§8.4](#84-additive-only-scheduling)).
+- **Correctness left to component authors.** Execution order was declared per
+  component, and getting it wrong was invisible ([§9.2](#92-execution-semantics)).
+  Every component reconciled its own copy of the Namespace, under one field
+  owner and with labels they did not agree on, so the label flipped on every
+  pass; under server-side apply that is a write loop, not a race that settles.
+- **Tables drifting apart.** The permitted-path list claimed init containers
+  had the same surface as containers and gave them eight fields fewer; the
+  merge-key table named a path no patch could reach. Five invariant tests now
+  hold them together ([§8.1](#81-permitted)).
+- **Unbounded or amplified work.** The affinity product had no ceiling
+  ([§8.4](#84-additive-only-scheduling)); the cache was cluster-wide and the
+  component watches enqueued N redundant passes per edit
+  ([§10.3](#103-watch-and-fan-out)).
+
+Two findings were about the tooling rather than the operator. `overrides
+validate` rejected a ConfigMap manifest, which is the shape users have and which
+the shipped example is, with comments in it recommending the command that failed
+on it; and it keyed files by base name, so two files called `overrides.yaml`
+overwrote each other and it reported success for a document it never read. A
+test now runs the command against the shipped example.
+
+The e2e suite was rebuilding a simplified copy of the reconcile pass rather than
+running `SiteReconciler`, and that copy had already drifted: it dropped only the
+first overridable operation on an unusable document where the operator drops all
+of them. It now drives the real reconciler ([§15](#15-testing)).
 
 ## 15. Testing
 
@@ -1753,14 +1894,35 @@ suite instead. It is guarded by `//go:build e2e` and runs in CI through the
 existing `operator-e2e-kind` workflow, whose path filters already cover
 `internal/operator` and `e2e/operator`.
 
-It covers what the fake client cannot, because its Apply is a stub while
-server-side apply ownership and `managedFields` are real apiserver behaviour:
-an override applied and then removed restoring the operator's own value, with
-the operator asserted present in `managedFields` since that ownership is the
-mechanism the revert guarantee rests on; an invalid document leaving a running
-workload byte-identical rather than reverting it; and a field owned by a
-competing field manager surviving override removal, documenting the limit of
-the guarantee.
+**It drives the real `SiteReconciler`.** The first implementation rebuilt a
+simplified copy of the reconcile pass, which meant the parts most likely to be
+wrong were checked against a reimplementation that could drift from the
+original, and had: the copy dropped only the first overridable operation on an
+unusable document where the operator drops all of them.
+
+It covers what the fake client cannot, because its Apply is a stub, its
+validation is negligible, and server-side apply ownership and `managedFields`
+are real apiserver behaviour:
+
+- An override applied and then removed restores the operator's own value, with
+  the operator asserted present in `managedFields`, since that ownership is the
+  mechanism the revert guarantee rests on.
+- An invalid document leaves a running workload byte-identical rather than
+  reverting it, while an object overrides cannot target still reconciles.
+- A field owned by a competing field manager survives override removal,
+  documenting the limit of the guarantee.
+- **Order is inferred, not declared.** A component plans its DaemonSet and
+  ConfigMap before the namespace they live in, with no `DependsOn` anywhere. The
+  fake client accepts a write into a namespace that does not exist; a real
+  apiserver returns `NotFound`, so the pass only succeeds if the namespace was
+  hoisted ahead of them.
+- **A rejected write is not reported as applied.** The document used is valid by
+  every rule the operator enforces: allowlisted path, real container, string
+  value. Only the apiserver knows `cpu: banana` is not a quantity. This is the
+  end-to-end form of [§9.7](#97-desired-versus-applied), and nothing short of a
+  real apiserver can produce it.
+- The namespace is created by the operator rather than by the test, so every
+  case above also depends on there being exactly one owner for it.
 
 **End to end (`e2e/operator/`).** A resources override rolls the target
 DaemonSet; removing it reverts; an image override sets `version-drift` and moves
