@@ -14,9 +14,9 @@ use std::future::Future;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
 #[cfg(feature = "sim")]
 use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::task::Context;
 use std::time::{Duration, Instant};
 
@@ -133,9 +133,16 @@ pub(super) enum Ctl {
     /// Clear registered file slots.
     UnregisterFiles(Vec<u32>, Ack),
     /// Point this worker at a new config version.
-    Publish { ver: u32, ptr: *const (), ack: Ack },
+    Publish {
+        ver: u32,
+        ptr: *const (),
+        ack: Ack,
+    },
     /// Ack once no live task on this worker still holds a guard for `ver`.
-    Retire { ver: u32, ack: Ack },
+    Retire {
+        ver: u32,
+        ack: Ack,
+    },
     /// Take ownership of this worker's ublk queues for a device and arm their fetches.
     StartQueue {
         slot: u16,
@@ -146,7 +153,10 @@ pub(super) enum Ctl {
         ack: Ack,
     },
     /// Release a device's queues; acks once every tag has been reclaimed.
-    StopQueue { slot: u16, ack: Ack },
+    StopQueue {
+        slot: u16,
+        ack: Ack,
+    },
     Shutdown(Ack),
 }
 
@@ -340,7 +350,9 @@ pub(super) fn copy_req(
     };
     if n < 0 {
         return Err(Errno::from_raw(
-            io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO),
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
         ));
     }
     if n as usize != len {
@@ -700,7 +712,11 @@ pub(super) fn worker_main<H: Handler>(args: WorkerArgs, handler: &'static H) {
     // request futures live in the slab with no allocation.
     let mut w = Worker {
         l: &l,
-        exec: Exec::new(handler, H::handle, (MAX_DEVICES as u32 * TAGS_PER_DEV) as usize),
+        exec: Exec::new(
+            handler,
+            H::handle,
+            (MAX_DEVICES as u32 * TAGS_PER_DEV) as usize,
+        ),
         inbox: args.inbox,
         staged: VecDeque::new(),
         last_tick: Instant::now(),
@@ -774,7 +790,7 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             // millions of times a second, so re-read it only on a turn that did work
             // or every 64th idle turn — still far finer than the budgets below.
             turn = turn.wrapping_add(1);
-            if work > 0 || turn % 64 == 0 {
+            if work > 0 || turn.is_multiple_of(64) {
                 clock = Instant::now();
             }
             if work > 0 {
@@ -833,8 +849,12 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
         let l = self.l;
         let u = cqe.user_data();
         match ud_class(u) {
-            CLASS_OP => l.ops.complete(&l.pool, ud_slot(u), ud_gen(u), cqe.result(), false),
-            CLASS_LINK => l.ops.complete(&l.pool, ud_slot(u), ud_gen(u), cqe.result(), true),
+            CLASS_OP => l
+                .ops
+                .complete(&l.pool, ud_slot(u), ud_gen(u), cqe.result(), false),
+            CLASS_LINK => l
+                .ops
+                .complete(&l.pool, ud_slot(u), ud_gen(u), cqe.result(), true),
             CLASS_DOORBELL => {}
             CLASS_UBLK => self.ublk_cqe(ud_payload(u), cqe.result()),
             CLASS_BUFREG => self.bufreg_cqe(ud_payload(u), ud_slot(u) == 1, cqe.result()),
@@ -922,7 +942,8 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             return;
         }
         if res < 0 {
-            self.l.with_queue(id, |q| q.tag_state[tag as usize] = T_IDLE);
+            self.l
+                .with_queue(id, |q| q.tag_state[tag as usize] = T_IDLE);
             self.l.commit(id, res);
             return;
         }
@@ -961,7 +982,8 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             self.l.buf_reg(id, true);
             return;
         }
-        self.l.with_queue(id, |q| q.tag_state[tag as usize] = T_IDLE);
+        self.l
+            .with_queue(id, |q| q.tag_state[tag as usize] = T_IDLE);
         self.l.commit(id, result);
     }
 
@@ -1095,7 +1117,11 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
 
     fn start_queues(&mut self, slot: u16, vol: u64, cfd: RawFd, depth: u16, q_ids: &[u16]) {
         let l = self.l;
-        if let Err(e) = l.ring.submitter().register_files_update(slot as u32, &[cfd]) {
+        if let Err(e) = l
+            .ring
+            .submitter()
+            .register_files_update(slot as u32, &[cfd])
+        {
             eprintln!("racer: worker {} cannot register char device: {e}", l.core);
             return;
         }
@@ -1184,7 +1210,11 @@ pub(crate) mod sim {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let w = Worker {
                 l: lr,
-                exec: Exec::new(handler, boxed::<H>, (MAX_DEVICES as u32 * TAGS_PER_DEV) as usize),
+                exec: Exec::new(
+                    handler,
+                    boxed::<H>,
+                    (MAX_DEVICES as u32 * TAGS_PER_DEV) as usize,
+                ),
                 inbox: rx,
                 staged: VecDeque::new(),
                 last_tick: now,
@@ -1281,7 +1311,10 @@ pub(crate) mod sim {
                 fabric.publish(c, w.ring_fd());
                 workers.push(w);
             }
-            Ok(SimNode { workers, _fabric: fabric })
+            Ok(SimNode {
+                workers,
+                _fabric: fabric,
+            })
         }
 
         pub(crate) fn cores(&self) -> usize {

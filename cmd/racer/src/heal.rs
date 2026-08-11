@@ -67,7 +67,11 @@ pub(crate) enum Filter {
     /// One digest bucket: the anti-entropy comparison.
     Bucket(u16),
     /// One extent: the unit a migration hands between zones.
-    Extent { volume: u32, lo: u32, hi: u32 },
+    Extent {
+        volume: u32,
+        lo: u32,
+        hi: u32,
+    },
 }
 
 impl Filter {
@@ -105,14 +109,20 @@ impl Digests {
     /// Take a register out or put one in; XOR is its own inverse. `data_crc` is zero on
     /// 4 MiB entries, which carry no checksum, so one tuple shape serves both classes.
     pub(crate) fn toggle(&mut self, group: u32, e: &Entry) {
-        let v = self.groups.entry(group).or_insert_with(|| Box::new([0; BUCKETS]));
+        let v = self
+            .groups
+            .entry(group)
+            .or_insert_with(|| Box::new([0; BUCKETS]));
         v[bucket_of(e.addr) as usize] ^= leaf(e.addr, e.version, e.ballot, e.data_crc);
     }
 
     /// A group we hold nothing for reads as all zeroes — the digest of the empty set —
     /// so it compares equal to a peer that also holds nothing.
     pub(crate) fn vector(&self, group: u32) -> Box<[u64; BUCKETS]> {
-        self.groups.get(&group).cloned().unwrap_or_else(|| Box::new([0; BUCKETS]))
+        self.groups
+            .get(&group)
+            .cloned()
+            .unwrap_or_else(|| Box::new([0; BUCKETS]))
     }
 
     /// Groups this node holds registers for. A group it never held one for was never
@@ -126,7 +136,11 @@ impl Digests {
     /// noticing on the hot path would cost a scan of the vector — so the shed that
     /// emptied the group says so here, and `held` stops offering it.
     pub(crate) fn forget(&mut self, group: u32) {
-        if self.groups.get(&group).is_some_and(|v| v.iter().all(|&d| d == 0)) {
+        if self
+            .groups
+            .get(&group)
+            .is_some_and(|v| v.iter().all(|&d| d == 0))
+        {
             self.groups.remove(&group);
         }
     }
@@ -140,7 +154,13 @@ impl Digests {
 pub(crate) type Tuple = (u64, Register);
 
 fn tuple(e: &Entry) -> Tuple {
-    (e.addr, Register { version: e.version, ballot: Ballot::from_raw(e.ballot as u32) })
+    (
+        e.addr,
+        Register {
+            version: e.version,
+            ballot: Ballot::from_raw(e.ballot as u32),
+        },
+    )
 }
 
 /// A cursor id, self-describing so `SNAPNEXT` needs nothing but the id to find the slab
@@ -150,7 +170,12 @@ fn snap_id(core: usize, huge: bool, slot: usize, era: u32) -> u32 {
 }
 
 pub(crate) fn snap_parts(id: u32) -> (usize, bool, usize, u32) {
-    ((id >> 4 & 0x3ff) as usize, id >> 3 & 1 == 1, (id & 7) as usize, id >> 14)
+    (
+        (id >> 4 & 0x3ff) as usize,
+        id >> 3 & 1 == 1,
+        (id & 7) as usize,
+        id >> 14,
+    )
 }
 
 /// One open enumeration of a group's registers on one slab.
@@ -315,7 +340,9 @@ impl Snaps {
     /// pinned device.
     pub(crate) fn expire(&mut self, now: Instant, free: &mut Vec<u32>) {
         for s in self.open.iter_mut() {
-            if s.as_ref().is_some_and(|s| now.duration_since(s.touched) > SNAP_TTL) {
+            if s.as_ref()
+                .is_some_and(|s| now.duration_since(s.touched) > SNAP_TTL)
+            {
                 *s = None;
                 self.live -= 1;
             }
@@ -508,7 +535,11 @@ impl Heal {
             .iter()
             .filter(|&&huge| self.serves(huge))
             .flat_map(|&huge| self.alloc().held_groups(huge))
-            .filter(|&g| !self.paxos.members(g).is_some_and(|m| self.paxos.self_index(&m).is_some()))
+            .filter(|&g| {
+                self.paxos
+                    .members(g)
+                    .is_none_or(|m| self.paxos.self_index(&m).is_none())
+            })
             .count() as u64;
         (replaying, shedding)
     }
@@ -525,7 +556,11 @@ impl Heal {
     /// so the sweep runs and skips its anti-entropy half instead.
     pub fn tick(&'static self, now: Instant) {
         let c = &self.cores[runtime::core()];
-        if c.busy.get() || c.last.get().is_some_and(|t| now.duration_since(t) < INTERVAL) {
+        if c.busy.get()
+            || c.last
+                .get()
+                .is_some_and(|t| now.duration_since(t) < INTERVAL)
+        {
             return;
         }
         if self.alloc().device_pressed() {
@@ -574,7 +609,12 @@ impl Heal {
         // digest exchange they would only have found equal.
         let cores = self.cores.len() as u32;
         let mut g = c.next.get();
-        match self.paxos.replaying_here().into_iter().find(|&g| self.paxos.members(g).is_some()) {
+        match self
+            .paxos
+            .replaying_here()
+            .into_iter()
+            .find(|&g| self.paxos.members(g).is_some())
+        {
             Some(r) => g = r,
             None => {
                 let start = g;
@@ -642,16 +682,25 @@ impl Heal {
                 if ext.zone != cfg.node.zone || ext.next_zone == 0 {
                     continue;
                 }
-                let Some((lo, hi)) = v.extent_range(e) else { continue };
+                let Some((lo, hi)) = v.extent_range(e) else {
+                    continue;
+                };
                 let addr = (v.id as u64) << 32 | lo;
-                let id = paxos::ShardId { volume: v.id, extent: e as u32 };
+                let id = paxos::ShardId {
+                    volume: v.id,
+                    extent: e as u32,
+                };
                 if !self.paxos.sealed(id).await {
                     // Push on the next tick: a seal only just chosen may not have
                     // reached the members whose copies we are about to walk.
                     let _ = self.paxos.seal_extent(GlobalAddr(addr), id).await;
                     continue;
                 }
-                let filter = Filter::Extent { volume: v.id, lo: lo as u32, hi: hi as u32 };
+                let filter = Filter::Extent {
+                    volume: v.id,
+                    lo: lo as u32,
+                    hi: hi as u32,
+                };
                 // One stuck extent must not stop the others; the next tick retries it.
                 let _ = self.push_extent(group, v.huge, filter, ext.next_zone).await;
             }
@@ -710,7 +759,11 @@ impl Heal {
             .alloc()
             .held_groups(huge)
             .into_iter()
-            .filter(|&g| !self.paxos.members(g).is_some_and(|m| self.paxos.self_index(&m).is_some()))
+            .filter(|&g| {
+                self.paxos
+                    .members(g)
+                    .is_none_or(|m| self.paxos.self_index(&m).is_none())
+            })
             .collect();
         let mut budget = DROPS_PER_JOB;
         for g in orphans {
@@ -729,7 +782,12 @@ impl Heal {
     /// hold. A register nobody confirmed stays, so the degraded window between the
     /// catalog naming a new member and that member catching up costs availability, never
     /// the value.
-    async fn drain(&'static self, group: u32, huge: bool, budget: &mut usize) -> Result<(), Status> {
+    async fn drain(
+        &'static self,
+        group: u32,
+        huge: bool,
+        budget: &mut usize,
+    ) -> Result<(), Status> {
         let id = self.alloc().snap_open(group, huge, Filter::All).await?;
         let mut walked = false;
         while *budget > 0 {
@@ -778,7 +836,9 @@ impl Heal {
 
         let mine = self.alloc().digests(group, huge).await;
         let t = PoolBuf::alloc(fabric::BLOCK).await;
-        link.send(merkle_frame(group, huge), t.buf()).await.map_err(Status::from_wire)?;
+        link.send(merkle_frame(group, huge), t.buf())
+            .await
+            .map_err(Status::from_wire)?;
         let theirs = get_digests(&t);
 
         // Our whole side of the group empty against a peer that has data is a node
@@ -802,12 +862,17 @@ impl Heal {
         }
         self.stat(|s| s.buckets_diff += diff.len() as u64);
 
-        let mut budget = if replay { repairs_per_replay(cfg) } else { REPAIRS_PER_JOB };
+        let mut budget = if replay {
+            repairs_per_replay(cfg)
+        } else {
+            REPAIRS_PER_JOB
+        };
         for b in diff {
             if budget == 0 {
                 break;
             }
-            self.reconcile(cfg, group, huge, link, b, &mut budget).await?;
+            self.reconcile(cfg, group, huge, link, b, &mut budget)
+                .await?;
         }
         Ok(replay)
     }
@@ -904,7 +969,10 @@ impl Heal {
         huge: bool,
         bucket: u16,
     ) -> Result<Option<BTreeMap<u64, Register>>, Status> {
-        let id = self.alloc().snap_open(group, huge, Filter::Bucket(bucket)).await?;
+        let id = self
+            .alloc()
+            .snap_open(group, huge, Filter::Bucket(bucket))
+            .await?;
         let mut out = BTreeMap::new();
         let mut over = false;
         loop {
@@ -931,7 +999,13 @@ mod tests {
     use crate::layout::State;
 
     fn entry(addr: u64, version: u64) -> Entry {
-        Entry { addr, version, ballot: 1, state: State::Live, ..Entry::default() }
+        Entry {
+            addr,
+            version,
+            ballot: 1,
+            state: State::Live,
+            ..Entry::default()
+        }
     }
 
     /// Putting a tuple in and taking it out are the same operation, so an entry that
@@ -948,7 +1022,11 @@ mod tests {
 
         a.toggle(0, &y);
         a.toggle(0, &y);
-        assert_eq!(a.vector(0), b.vector(0), "toggling twice is toggling not at all");
+        assert_eq!(
+            a.vector(0),
+            b.vector(0),
+            "toggling twice is toggling not at all"
+        );
 
         // A version change is a difference, which is the only property the sweep needs.
         a.toggle(0, &y);
@@ -964,12 +1042,28 @@ mod tests {
     #[test]
     fn a_filter_narrows_to_exactly_its_unit() {
         let addr = |v: u64, off: u64| v << 32 | off;
-        let f = Filter::Extent { volume: 3, lo: 10, hi: 20 };
-        assert!(f.keeps(addr(3, 10)) && f.keeps(addr(3, 19)), "the range is half open");
-        assert!(!f.keeps(addr(3, 9)) && !f.keeps(addr(3, 20)), "and it is exclusive at the top");
-        assert!(!f.keeps(addr(4, 15)), "a page of another volume is not this extent's");
+        let f = Filter::Extent {
+            volume: 3,
+            lo: 10,
+            hi: 20,
+        };
+        assert!(
+            f.keeps(addr(3, 10)) && f.keeps(addr(3, 19)),
+            "the range is half open"
+        );
+        assert!(
+            !f.keeps(addr(3, 9)) && !f.keeps(addr(3, 20)),
+            "and it is exclusive at the top"
+        );
+        assert!(
+            !f.keeps(addr(4, 15)),
+            "a page of another volume is not this extent's"
+        );
 
-        assert!(Filter::All.keeps(addr(9, 9)), "the unfiltered cursor keeps everything");
+        assert!(
+            Filter::All.keeps(addr(9, 9)),
+            "the unfiltered cursor keeps everything"
+        );
         let b = bucket_of(addr(1, 1));
         assert!(Filter::Bucket(b).keeps(addr(1, 1)));
         assert!(!Filter::Bucket(b ^ 1).keeps(addr(1, 1)));
@@ -1022,7 +1116,10 @@ mod tests {
         s.retain(&entries[victim]);
         entries[victim] = Entry::default();
         s.park(&mut free, victim as u32);
-        assert!(free.is_empty(), "a slot freed under a cursor is deferred, not reused");
+        assert!(
+            free.is_empty(),
+            "a slot freed under a cursor is deferred, not reused"
+        );
 
         let mut seen: Vec<u64> = first.iter().map(|t| t.0).collect();
         let mut seq = 1;
@@ -1036,10 +1133,18 @@ mod tests {
         }
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), n, "every page live at open is in the stream exactly once");
+        assert_eq!(
+            seen.len(),
+            n,
+            "every page live at open is in the stream exactly once"
+        );
 
         s.stop(id, &mut free);
-        assert_eq!(free, vec![victim as u32], "reclamation resumes when the last cursor goes");
+        assert_eq!(
+            free,
+            vec![victim as u32],
+            "reclamation resumes when the last cursor goes"
+        );
     }
 
     /// A cursor whose peer stopped asking must not pin the device forever, and the id
@@ -1060,7 +1165,9 @@ mod tests {
         assert!(s.next(id, Some(0), &entries, gof, now).is_err());
 
         // And the slab refuses more cursors than it will hold rather than growing.
-        let ids: Vec<u32> = (0..MAX_SNAPS).filter_map(|_| s.start(0, false, 0, Filter::All, now)).collect();
+        let ids: Vec<u32> = (0..MAX_SNAPS)
+            .filter_map(|_| s.start(0, false, 0, Filter::All, now))
+            .collect();
         assert_eq!(ids.len(), MAX_SNAPS);
         assert!(s.start(0, false, 0, Filter::All, now).is_none());
     }

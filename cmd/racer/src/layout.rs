@@ -270,7 +270,11 @@ pub struct Geometry {
 /// configs workable; per class because 64 spare huge slots would be a quarter of a
 /// gigabyte.
 fn overprovision(pages: u64, floor: u64) -> u64 {
-    if pages == 0 { 0 } else { pages + pages / 20 + floor }
+    if pages == 0 {
+        0
+    } else {
+        pages + pages / 20 + floor
+    }
 }
 
 fn align_up(x: u64, a: u64) -> u64 {
@@ -303,7 +307,11 @@ impl Geometry {
         at = meta[1] + want[1] * 2 * MBLOCK as u64;
         for (i, class) in CLASSES.into_iter().enumerate() {
             at = align_up(at, class.bytes());
-            let e = Extent { meta: meta[i], data: at, mblocks: want[i] };
+            let e = Extent {
+                meta: meta[i],
+                data: at,
+                mblocks: want[i],
+            };
             at += e.mblocks * class.k() as u64 * class.bytes();
             g.push(class, e).expect("first extent of an empty geometry");
         }
@@ -347,13 +355,20 @@ impl Geometry {
         let meta = self.total;
         let data = align_up(meta + n * 2 * MBLOCK as u64, class.bytes());
         self.total = data + n * class.k() as u64 * class.bytes();
-        self.push(class, Extent { meta, data, mblocks: n })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("device has already been grown {} times", MAX_EXT - 1),
-                )
-            })
+        self.push(
+            class,
+            Extent {
+                meta,
+                data,
+                mblocks: n,
+            },
+        )
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("device has already been grown {} times", MAX_EXT - 1),
+            )
+        })
     }
 
     /// The run holding mblock `id`, and the id of that run's first block.
@@ -379,13 +394,16 @@ impl Geometry {
     /// The first mblock id past the run holding `id`. A batched read of the metadata
     /// region stops here: the next run's blocks are elsewhere on the device.
     pub(crate) fn ext_end(&self, class: Class, id: u64) -> u64 {
-        self.ext_of(class, id).map_or(id, |(e, first)| first + e.mblocks)
+        self.ext_of(class, id)
+            .map_or(id, |(e, first)| first + e.mblocks)
     }
 
     /// Byte offset of a data slot.
     pub(crate) fn slot_off(&self, class: Class, slot: u32) -> u64 {
         let k = class.k() as u64;
-        let (e, first) = self.ext_of(class, slot as u64 / k).expect("slot is within the geometry");
+        let (e, first) = self
+            .ext_of(class, slot as u64 / k)
+            .expect("slot is within the geometry");
         e.data + (slot as u64 - first * k) * class.bytes()
     }
 
@@ -416,7 +434,9 @@ impl Geometry {
     /// rather than adjacent, so one bad neighbourhood of the device cannot take both
     /// copies of a block.
     pub(crate) fn mblock_off(&self, class: Class, id: u32, copy: u8) -> u64 {
-        let (e, first) = self.ext_of(class, id as u64).expect("mblock id is within the geometry");
+        let (e, first) = self
+            .ext_of(class, id as u64)
+            .expect("mblock id is within the geometry");
         e.meta + (copy as u64 * e.mblocks + (id as u64 - first)) * MBLOCK as u64
     }
 
@@ -441,7 +461,10 @@ impl Geometry {
             if self.slots(class) > u32::MAX as u64 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("{} slots is past what a 32-bit slot id can name", self.slots(class)),
+                    format!(
+                        "{} slots is past what a 32-bit slot id can name",
+                        self.slots(class)
+                    ),
                 ));
             }
         }
@@ -496,8 +519,22 @@ impl Geometry {
             total: w[13],
             ..Geometry::default()
         };
-        g.push(Class::Small, Extent { meta: w[1], data: w[5], mblocks: w[3] })?;
-        g.push(Class::Huge, Extent { meta: w[2], data: w[6], mblocks: w[4] })?;
+        g.push(
+            Class::Small,
+            Extent {
+                meta: w[1],
+                data: w[5],
+                mblocks: w[3],
+            },
+        )?;
+        g.push(
+            Class::Huge,
+            Extent {
+                meta: w[2],
+                data: w[6],
+                mblocks: w[4],
+            },
+        )?;
         g.load_growth(b)?;
         Some(g)
     }
@@ -559,11 +596,14 @@ impl Geometry {
         for i in 0..n {
             let at = GT_OFF + GT_HDR + i * EXT_BYTES;
             let class = CLASSES[(u32(&b[at..]) as usize).min(CLASSES.len() - 1)];
-            self.push(class, Extent {
-                meta: u64f(&b[at + 8..]),
-                data: u64f(&b[at + 16..]),
-                mblocks: u64f(&b[at + 24..]),
-            })?;
+            self.push(
+                class,
+                Extent {
+                    meta: u64f(&b[at + 8..]),
+                    data: u64f(&b[at + 16..]),
+                    mblocks: u64f(&b[at + 24..]),
+                },
+            )?;
         }
         Some(())
     }
@@ -611,7 +651,8 @@ const SEAL_BYTES: usize = 16;
 /// a node joins and the shards it can be migrating at once.
 pub(crate) const MAX_TERMS: usize = 128;
 pub(crate) const MAX_SEALS: usize = 96;
-const _: () = assert!(CS_OFF + CS_HDR + MAX_TERMS * TERM_BYTES + MAX_SEALS * SEAL_BYTES <= MBLOCK - 4);
+const _: () =
+    assert!(CS_OFF + CS_HDR + MAX_TERMS * TERM_BYTES + MAX_SEALS * SEAL_BYTES <= MBLOCK - 4);
 const _: () = assert!(CS_OFF == MBLOCK - SB_RESERVED);
 
 impl Consensus {
@@ -888,7 +929,11 @@ const TABLE: [u32; 256] = {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0x82f6_3b78 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0x82f6_3b78 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         t[i] = c;
@@ -1258,7 +1303,8 @@ pub(crate) fn write_at(d: &Dev, b: &[u8], off: u64) -> io::Result<()> {
     return crate::sim::raw_write(d.0, off, b);
     #[cfg(not(feature = "sim"))]
     {
-        let n = unsafe { libc::pwrite(d.0.as_raw_fd(), b.as_ptr() as *const _, b.len(), off as i64) };
+        let n =
+            unsafe { libc::pwrite(d.0.as_raw_fd(), b.as_ptr() as *const _, b.len(), off as i64) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1275,7 +1321,14 @@ pub(crate) fn read_at(d: &Dev, b: &mut [u8], off: u64) -> io::Result<()> {
     return crate::sim::raw_read(d.0, off, b);
     #[cfg(not(feature = "sim"))]
     {
-        let n = unsafe { libc::pread(d.0.as_raw_fd(), b.as_mut_ptr() as *mut _, b.len(), off as i64) };
+        let n = unsafe {
+            libc::pread(
+                d.0.as_raw_fd(),
+                b.as_mut_ptr() as *mut _,
+                b.len(),
+                off as i64,
+            )
+        };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1312,7 +1365,10 @@ mod tests {
     fn crc32c_matches_known_vectors() {
         assert_eq!(crc32c(b""), 0);
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
-        assert_eq!(crc32c(b"The quick brown fox jumps over the lazy dog"), 0x22620404);
+        assert_eq!(
+            crc32c(b"The quick brown fox jumps over the lazy dog"),
+            0x22620404
+        );
         // The software and hardware paths must agree. The hardware path has two
         // interleaved block sizes, a u64 loop and a byte tail, so sweep lengths across
         // all of them.
@@ -1338,7 +1394,12 @@ mod tests {
                 flags: 1,
             };
             let mut b = vec![0u8; MBLOCK];
-            let h = Header { mblock_id: 11, generation: 5, class, live: 1 };
+            let h = Header {
+                mblock_id: 11,
+                generation: 5,
+                class,
+                live: 1,
+            };
             put_mblock(&mut b, h, &e);
 
             let got = get_header(&b).unwrap();
@@ -1379,7 +1440,10 @@ mod tests {
         let cfg = test_config();
         let g = Geometry::plan(64 << 30, &cfg).unwrap();
         assert!(g.slots(Class::Small) >= 5000 && g.slots(Class::Huge) >= 3);
-        assert_eq!(g.slots(Class::Small), g.mblocks(Class::Small) * K_SMALL as u64);
+        assert_eq!(
+            g.slots(Class::Small),
+            g.mblocks(Class::Small) * K_SMALL as u64
+        );
         assert_eq!(g.extents(Class::Huge)[0].data % HUGE_PAGE, 0);
 
         let mut b = vec![0u8; MBLOCK];
@@ -1413,7 +1477,10 @@ mod tests {
                 if e.mblocks > 0 {
                     let last = (first + e.mblocks - 1) as u32;
                     assert_eq!(g.mblock_off(class, first as u32, 0), e.meta);
-                    assert_eq!(g.mblock_off(class, last, 1), v[v.len() - 2].1 - MBLOCK as u64);
+                    assert_eq!(
+                        g.mblock_off(class, last, 1),
+                        v[v.len() - 2].1 - MBLOCK as u64
+                    );
                     assert_eq!(g.slot_off(class, (first * class.k() as u64) as u32), e.data);
                     assert_eq!(g.ext_end(class, first), first + e.mblocks);
                 }
@@ -1438,7 +1505,10 @@ mod tests {
         // where their entries say they are.
         assert_eq!(g.extents(Class::Small)[0], g0.extents(Class::Small)[0]);
         assert_eq!(g.extents(Class::Huge)[0], g0.extents(Class::Huge)[0]);
-        assert_eq!((g.zero_base, g.cache_small, g.cache_huge), (g0.zero_base, g0.cache_small, g0.cache_huge));
+        assert_eq!(
+            (g.zero_base, g.cache_small, g.cache_huge),
+            (g0.zero_base, g0.cache_small, g0.cache_huge)
+        );
         assert!(g.total > g0.total);
 
         // Ids simply continue, and every range is disjoint and on the device.
@@ -1460,7 +1530,10 @@ mod tests {
         assert_eq!(Geometry::decode(&b).unwrap(), g);
 
         // Patching a live superblock leaves the consensus record alone.
-        let c = Consensus { terms: vec![(7, 9)], ..Consensus::default() };
+        let c = Consensus {
+            terms: vec![(7, 9)],
+            ..Consensus::default()
+        };
         c.patch(&mut b);
         g.append(Class::Huge, 1).unwrap();
         g.patch(&mut b);
@@ -1478,7 +1551,8 @@ mod tests {
 
         // A class whose slots would outgrow a 32-bit id is refused, not truncated.
         let mut g = Geometry::plan(1 << 40, &test_config()).unwrap();
-        g.append(Class::Small, u32::MAX as u64 / K_SMALL as u64 + 1).unwrap();
+        g.append(Class::Small, u32::MAX as u64 / K_SMALL as u64 + 1)
+            .unwrap();
         assert!(g.check(u64::MAX).is_err());
     }
 }

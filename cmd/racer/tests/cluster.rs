@@ -80,7 +80,8 @@ impl Node {
                 self.metrics = rest.to_string();
             } else if let Some(rest) = line.strip_prefix("volume ") {
                 let (id, path) = rest.split_once(" -> ").expect("volume line");
-                self.volumes.push((id.parse().unwrap(), PathBuf::from(path)));
+                self.volumes
+                    .push((id.parse().unwrap(), PathBuf::from(path)));
             } else if let Some(rest) = line.strip_prefix("fabric -> ") {
                 self.fabric = PathBuf::from(rest);
                 break;
@@ -127,7 +128,13 @@ impl Node {
     }
 
     fn dev(&self, volume: u32) -> Dev {
-        let p = self.volumes.iter().find(|(id, _)| *id == volume).expect("volume").1.clone();
+        let p = self
+            .volumes
+            .iter()
+            .find(|(id, _)| *id == volume)
+            .expect("volume")
+            .1
+            .clone();
         Dev::open(&p)
     }
 }
@@ -188,8 +195,13 @@ fn wait_for(p: &Path) {
 fn http_get(addr: &str, path: &str) -> (String, String) {
     use std::io::{Read, Write};
     let mut c = std::net::TcpStream::connect(addr).expect("connect to the metrics endpoint");
-    c.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
-    write!(c, "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        c,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
     let mut raw = String::new();
     c.read_to_string(&mut raw).expect("read the response");
     let (head, body) = raw.split_once("\r\n\r\n").expect("headers end");
@@ -262,7 +274,12 @@ fn build_node(id: u32) -> Node {
     let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
     assert!(fd >= 0, "memfd_create: {}", last_error());
     let memfd = unsafe { OwnedFd::from_raw_fd(fd) };
-    assert_eq!(unsafe { libc::ftruncate(fd, FS_BYTES as i64) }, 0, "ftruncate: {}", last_error());
+    assert_eq!(
+        unsafe { libc::ftruncate(fd, FS_BYTES as i64) },
+        0,
+        "ftruncate: {}",
+        last_error()
+    );
 
     let (loop_dev, loop_path) = loop_attach(fd);
     let ok = Command::new("mkfs.ext4")
@@ -307,7 +324,11 @@ fn loop_attach(backing: RawFd) -> (OwnedFd, String) {
     assert!(n >= 0, "LOOP_CTL_GET_FREE: {}", last_error());
     let path = format!("/dev/loop{n}");
     wait_for(Path::new(&path));
-    let dev = OpenOptions::new().read(true).write(true).open(&path).expect("open loop device");
+    let dev = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open loop device");
     let rc = unsafe { libc::ioctl(dev.as_raw_fd(), LOOP_SET_FD, backing) };
     assert_eq!(rc, 0, "LOOP_SET_FD: {}", last_error());
     unsafe { libc::ioctl(dev.as_raw_fd(), LOOP_SET_BLOCK_SIZE, 4096) };
@@ -343,15 +364,28 @@ impl Dev {
     fn write(&self, off: u64, data: &[u8]) -> std::io::Result<()> {
         let buf = Aligned::from(data);
         let n = unsafe {
-            libc::pwrite(self.0.as_raw_fd(), buf.ptr as *const _, data.len(), off as i64)
+            libc::pwrite(
+                self.0.as_raw_fd(),
+                buf.ptr as *const _,
+                data.len(),
+                off as i64,
+            )
         };
-        if n as usize == data.len() { Ok(()) } else { Err(last_error()) }
+        if n as usize == data.len() {
+            Ok(())
+        } else {
+            Err(last_error())
+        }
     }
 
     fn read(&self, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
         let buf = Aligned::new(len);
         let n = unsafe { libc::pread(self.0.as_raw_fd(), buf.ptr as *mut _, len, off as i64) };
-        if n as usize == len { Ok(buf.to_vec()) } else { Err(last_error()) }
+        if n as usize == len {
+            Ok(buf.to_vec())
+        } else {
+            Err(last_error())
+        }
     }
 
     fn discard(&self, off: u64, len: u64) -> std::io::Result<()> {
@@ -395,7 +429,9 @@ impl Drop for Aligned {
 }
 
 fn pattern(seed: u8, len: usize) -> Vec<u8> {
-    (0..len).map(|i| seed ^ (i as u8).wrapping_mul(31)).collect()
+    (0..len)
+        .map(|i| seed ^ (i as u8).wrapping_mul(31))
+        .collect()
 }
 
 /// Write, retrying `EAGAIN`. A bulk write races the anti-entropy sweep for the same
@@ -485,7 +521,6 @@ fn set_catalog(groups: &[[u32; 3]]) {
     *CATALOG.lock().unwrap() = groups.to_vec();
 }
 
-
 /// Tell the nodes at `who` where everyone's fabric device currently lives, as the
 /// control plane would: a new generation, dropped in atomically.
 fn wire(nodes: &mut [Node], generation: u32, who: &[usize]) {
@@ -558,7 +593,10 @@ fn rebuild(
     nodes[i].signal(libc::SIGKILL);
     nodes[i].reap();
     std::fs::remove_file(&nodes[i].img).expect("remove backing file");
-    File::create(&nodes[i].img).unwrap().set_len(IMG_BYTES).unwrap();
+    File::create(&nodes[i].img)
+        .unwrap()
+        .set_len(IMG_BYTES)
+        .unwrap();
     nodes[i].serve();
     // The restarted node's fabric device is a fresh minor, so its peers need telling.
     *generation += 1;
@@ -586,7 +624,9 @@ fn rebuild(
         isolate(nodes, i, generation);
         let holes = {
             let d = nodes[i].dev(LWW);
-            want.iter().filter(|(p, v)| d.read(p * 4096, PAGE).ok().as_ref() != Some(v)).count()
+            want.iter()
+                .filter(|(p, v)| d.read(p * 4096, PAGE).ok().as_ref() != Some(v))
+                .count()
         };
         rejoin(nodes, i, generation);
         if holes == 0 {
@@ -654,14 +694,30 @@ fn six_node_cluster() {
     let a = nodes[0].dev(LWW);
     let b = nodes[5].dev(LWW);
     for &p in &[held, remote] {
-        assert_eq!(a.read(p * 4096, PAGE).unwrap(), vec![0u8; PAGE], "hole must read as zeroes");
-        assert_eq!(b.read(p * 4096, PAGE).unwrap(), vec![0u8; PAGE], "hole must read as zeroes");
+        assert_eq!(
+            a.read(p * 4096, PAGE).unwrap(),
+            vec![0u8; PAGE],
+            "hole must read as zeroes"
+        );
+        assert_eq!(
+            b.read(p * 4096, PAGE).unwrap(),
+            vec![0u8; PAGE],
+            "hole must read as zeroes"
+        );
 
         write_lww(&a, p * 4096, &pattern(1, PAGE));
-        assert_eq!(b.read(p * 4096, PAGE).unwrap(), pattern(1, PAGE), "write must be visible");
+        assert_eq!(
+            b.read(p * 4096, PAGE).unwrap(),
+            pattern(1, PAGE),
+            "write must be visible"
+        );
         // Both the member and the non-member drive a round for this page.
         write_lww(&b, p * 4096, &pattern(2, PAGE));
-        assert_eq!(a.read(p * 4096, PAGE).unwrap(), pattern(2, PAGE), "last write must win");
+        assert_eq!(
+            a.read(p * 4096, PAGE).unwrap(),
+            pattern(2, PAGE),
+            "last write must win"
+        );
     }
 
     // ---- cache: a hot page is cached, and a cached read is never stale ------------
@@ -669,7 +725,11 @@ fn six_node_cluster() {
     // the width past one and admit it locally; the mandatory metadata round confirms
     // every hit on `(version, ballot)`, which is the whole invalidation protocol.
     for _ in 0..64 {
-        assert_eq!(a.read(remote * 4096, PAGE).unwrap(), pattern(2, PAGE), "a hot read");
+        assert_eq!(
+            a.read(remote * 4096, PAGE).unwrap(),
+            pattern(2, PAGE),
+            "a hot read"
+        );
     }
     write_lww(&b, remote * 4096, &pattern(9, PAGE));
     assert_eq!(
@@ -714,7 +774,11 @@ fn six_node_cluster() {
         "a filled immutable page must refuse a second write"
     );
     ia.discard(imm_page * 4096, 4096).unwrap();
-    assert_eq!(ib.read(imm_page * 4096, PAGE).unwrap(), vec![0u8; PAGE], "a trimmed page is a hole");
+    assert_eq!(
+        ib.read(imm_page * 4096, PAGE).unwrap(),
+        vec![0u8; PAGE],
+        "a trimmed page is a hole"
+    );
     assert!(
         ib.write(imm_page * 4096, &pattern(9, PAGE)).is_err(),
         "a trimmed immutable page must not be refilled before the epoch advances"
@@ -725,29 +789,68 @@ fn six_node_cluster() {
     let ba = nodes[0].dev(BIG);
     let bb = nodes[5].dev(BIG);
     ba.write(0, &big).unwrap();
-    assert_eq!(bb.read(0, HUGE).unwrap(), big, "a 4 MiB fill must be visible cluster-wide");
-    assert_eq!(bb.read(0, HUGE).unwrap(), big, "a 4 MiB fill must be visible cluster-wide");
-    assert_eq!(ba.read(0, HUGE).unwrap(), big, "a non-member must fetch, not read zeroes");
-    assert!(ba.write(0, &big).is_err(), "a filled 4 MiB page must refuse a second write");
-    assert!(bb.write(4096, &pattern(1, PAGE)).is_err(), "a 4 MiB page is written whole or not at all");
-    assert_eq!(ba.read(HUGE as u64, HUGE).unwrap(), vec![0u8; HUGE], "an unfilled 4 MiB page reads as zeroes");
+    assert_eq!(
+        bb.read(0, HUGE).unwrap(),
+        big,
+        "a 4 MiB fill must be visible cluster-wide"
+    );
+    assert_eq!(
+        bb.read(0, HUGE).unwrap(),
+        big,
+        "a 4 MiB fill must be visible cluster-wide"
+    );
+    assert_eq!(
+        ba.read(0, HUGE).unwrap(),
+        big,
+        "a non-member must fetch, not read zeroes"
+    );
+    assert!(
+        ba.write(0, &big).is_err(),
+        "a filled 4 MiB page must refuse a second write"
+    );
+    assert!(
+        bb.write(4096, &pattern(1, PAGE)).is_err(),
+        "a 4 MiB page is written whole or not at all"
+    );
+    assert_eq!(
+        ba.read(HUGE as u64, HUGE).unwrap(),
+        vec![0u8; HUGE],
+        "an unfilled 4 MiB page reads as zeroes"
+    );
 
     // ---- metrics: what the work above did, as a scraper sees it -------------------
     // Node 1 has by now proposed, read, cached and served a page it does not hold, so
     // its counters cover the whole dataplane.
     let m = scrape(&nodes[0]);
-    assert!(m.get("racer_paxos_accept_total{result=\"ok\"}") > 0, "no accepts counted");
-    assert!(m.get("racer_cache_lookup_total{result=\"hit\"}") > 0, "no cache hits counted");
+    assert!(
+        m.get("racer_paxos_accept_total{result=\"ok\"}") > 0,
+        "no accepts counted"
+    );
+    assert!(
+        m.get("racer_cache_lookup_total{result=\"hit\"}") > 0,
+        "no cache hits counted"
+    );
     let slots = m.get("racer_alloc_slots{class=\"small\"}");
     assert!(slots > 0, "the device has no small slots");
-    assert!(m.get("racer_alloc_free_slots{class=\"small\"}") <= slots, "more free than there is");
+    assert!(
+        m.get("racer_alloc_free_slots{class=\"small\"}") <= slots,
+        "more free than there is"
+    );
     // Written by core 0 alone, so these also prove the single-writer rule: a second core
     // publishing them would multiply each by the worker count.
-    assert_eq!(m.get("racer_config_generation"), 2, "the generation in force");
+    assert_eq!(
+        m.get("racer_config_generation"),
+        2,
+        "the generation in force"
+    );
     assert_eq!(m.get("racer_node_id"), nodes[0].id as u64);
     assert_eq!(m.get("racer_volumes"), 4);
     assert_eq!(m.get("racer_peers"), NODES as u64 - 1);
-    assert_eq!(m.get("racer_config_rejected_total"), 0, "nothing rejected yet");
+    assert_eq!(
+        m.get("racer_config_rejected_total"),
+        0,
+        "nothing rejected yet"
+    );
 
     // ---- capacity: a device is sized from its declared ceiling, not the namespace ----
     // Both nodes are in one group of two, so both serve half the zone; node 1 declared a
@@ -771,10 +874,17 @@ fn six_node_cluster() {
     nodes[0].install(&config_text(1, &nodes[0], &[]));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while scrape(&nodes[0]).get("racer_config_rejected_total") != 1 {
-        assert!(std::time::Instant::now() < deadline, "a refused config was never counted");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a refused config was never counted"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert_eq!(scrape(&nodes[0]).get("racer_config_generation"), 2, "refusing changed nothing");
+    assert_eq!(
+        scrape(&nodes[0]).get("racer_config_generation"),
+        2,
+        "refusing changed nothing"
+    );
 
     let (status, _) = http_get(&nodes[0].metrics, "/nope");
     assert_eq!(status, "HTTP/1.1 404 Not Found", "only /metrics is served");
@@ -798,9 +908,20 @@ fn six_node_cluster() {
     // The restarted node's fabric device is a fresh minor, so its peers need telling.
     wire(&mut nodes, 3, &(1..NODES as usize).collect::<Vec<_>>());
     let a = nodes[0].dev(LWW);
-    assert_eq!(a.read(held * 4096, PAGE).unwrap(), pattern(2, PAGE), "durable across restart");
-    assert_eq!(a.read(remote * 4096, PAGE).unwrap(), pattern(2, PAGE), "reachable across restart");
-    assert_eq!(nodes[0].dev(IMM).read(imm_page * 4096, PAGE).unwrap(), vec![0u8; PAGE]);
+    assert_eq!(
+        a.read(held * 4096, PAGE).unwrap(),
+        pattern(2, PAGE),
+        "durable across restart"
+    );
+    assert_eq!(
+        a.read(remote * 4096, PAGE).unwrap(),
+        pattern(2, PAGE),
+        "reachable across restart"
+    );
+    assert_eq!(
+        nodes[0].dev(IMM).read(imm_page * 4096, PAGE).unwrap(),
+        vec![0u8; PAGE]
+    );
     drop(a);
 
     // ---- partial mesh: a member we cannot name is one we route through -----------
@@ -809,9 +930,17 @@ fn six_node_cluster() {
     // one answer, never a matching pair, and cannot complete.
     wire_without(&mut nodes, 4, &[0], &[5, 6]);
     let a = nodes[0].dev(LWW);
-    assert_eq!(a.read(remote * 4096, PAGE).unwrap(), pattern(2, PAGE), "read via a forward");
+    assert_eq!(
+        a.read(remote * 4096, PAGE).unwrap(),
+        pattern(2, PAGE),
+        "read via a forward"
+    );
     write_lww(&a, remote * 4096, &pattern(11, PAGE));
-    assert_eq!(a.read(remote * 4096, PAGE).unwrap(), pattern(11, PAGE), "write via a forward");
+    assert_eq!(
+        a.read(remote * 4096, PAGE).unwrap(),
+        pattern(11, PAGE),
+        "write via a forward"
+    );
     assert_eq!(
         nodes[5].dev(LWW).read(remote * 4096, PAGE).unwrap(),
         pattern(11, PAGE),
@@ -821,7 +950,11 @@ fn six_node_cluster() {
 
     // ---- a wiped member replays the group from its peers -------------------------
     let mut generation = 5;
-    wire(&mut nodes, generation, &(0..NODES as usize).collect::<Vec<_>>());
+    wire(
+        &mut nodes,
+        generation,
+        &(0..NODES as usize).collect::<Vec<_>>(),
+    );
     // Enough pages to spread over far more digest buckets than a steady-state sweep
     // walks in the window below: the test is that the whole group moves at once, not
     // that anti-entropy eventually gets there.
@@ -868,16 +1001,31 @@ fn six_node_cluster() {
     // the whole zone, which is more than its device was formatted for.
     set_catalog(&[[1, 2, 3], [1, 5, 6]]);
     let over = Config::parse(&config_text(generation + 1, &nodes[0], &[])).unwrap();
-    assert!(over.validate().is_err(), "a share above the device's ceiling must be refused");
+    assert!(
+        over.validate().is_err(),
+        "a share above the device's ceiling must be refused"
+    );
 
     // Node 1 hands group 0 to node 4, which is formatted for the whole zone. Slots are
     // untouched — the group keeps every address it had, and only its members change.
     let before = scrape(&nodes[0]).get("racer_alloc_free_slots{class=\"small\"}");
     set_catalog(&[[4, 2, 3], [4, 5, 6]]);
     generation += 1;
-    wire(&mut nodes, generation, &(0..NODES as usize).collect::<Vec<_>>());
-    assert_eq!(scrape(&nodes[0]).get("racer_share_slots"), 0, "node 1 holds none of the zone");
-    assert_eq!(scrape(&nodes[3]).get("racer_share_slots"), SLOTS, "node 4 holds all of it");
+    wire(
+        &mut nodes,
+        generation,
+        &(0..NODES as usize).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        scrape(&nodes[0]).get("racer_share_slots"),
+        0,
+        "node 1 holds none of the zone"
+    );
+    assert_eq!(
+        scrape(&nodes[3]).get("racer_share_slots"),
+        SLOTS,
+        "node 4 holds all of it"
+    );
 
     // Node 4 replays the group from 2 and 3; node 1 gives up only what it can see all
     // three of the new members holding, so the two halves finish in that order.
@@ -900,13 +1048,24 @@ fn six_node_cluster() {
 
     // The space came back, and none of the value went with it.
     let after = scrape(&nodes[0]).get("racer_alloc_free_slots{class=\"small\"}");
-    assert!(after > before, "shedding a group must return slots: {before} then {after}");
+    assert!(
+        after > before,
+        "shedding a group must return slots: {before} then {after}"
+    );
     let outside = nodes[5].dev(LWW);
     let shed = nodes[0].dev(LWW);
     for (p, v) in &want {
-        assert_eq!(&outside.read(p * 4096, PAGE).unwrap(), v, "page {p} lost in the rebalance");
+        assert_eq!(
+            &outside.read(p * 4096, PAGE).unwrap(),
+            v,
+            "page {p} lost in the rebalance"
+        );
         // And the node that gave its share away still serves the pages, by forwarding.
-        assert_eq!(&shed.read(p * 4096, PAGE).unwrap(), v, "page {p} unreachable through node 1");
+        assert_eq!(
+            &shed.read(p * 4096, PAGE).unwrap(),
+            v,
+            "page {p} unreachable through node 1"
+        );
     }
     drop((outside, shed));
 

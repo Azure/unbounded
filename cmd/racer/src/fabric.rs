@@ -252,7 +252,8 @@ const HUGE_SHIFT: u32 = 10;
 const HUGE_BLOCKS: u64 = 1 << HUGE_SHIFT;
 
 /// First LBA of the 4 MiB region. Also the size of the 4 KiB region.
-const HUGE_BASE_LBA: u64 = 1 << (SMALL_OFF_BITS + VOL_BITS + IMM_BITS + FLAG_BITS + OP_BITS + SMALL_SHIFT);
+const HUGE_BASE_LBA: u64 =
+    1 << (SMALL_OFF_BITS + VOL_BITS + IMM_BITS + FLAG_BITS + OP_BITS + SMALL_SHIFT);
 const MAX_LBA: u64 = HUGE_BASE_LBA * 2;
 
 /// Size the fabric device must be declared with: 4 EiB, entirely sparse. It is an
@@ -322,7 +323,14 @@ pub(crate) struct Frame {
 
 impl Frame {
     pub(crate) fn new(op: Op, huge: bool, vol: u8, offset: u32) -> Frame {
-        Frame { op, flags: 0, imm: 0, huge, vol, offset }
+        Frame {
+            op,
+            flags: 0,
+            imm: 0,
+            huge,
+            vol,
+            offset,
+        }
     }
 
     /// The frame's base LBA — block 0 of its footprint.
@@ -383,7 +391,9 @@ impl Frame {
             if block + blocks > HUGE_BLOCKS {
                 return Err(status::BAD);
             }
-            Part::Payload { off: block as usize * BLOCK }
+            Part::Payload {
+                off: block as usize * BLOCK,
+            }
         } else {
             match (block, blocks) {
                 (0, 1) => Part::Payload { off: 0 },
@@ -396,14 +406,20 @@ impl Frame {
 
     /// The frame as it leaves a forwarder: same request, one hop poorer.
     pub(crate) fn forwarded(&self) -> Frame {
-        Frame { flags: (self.flags & !HOPS) | hops(self.flags).saturating_sub(1), ..*self }
+        Frame {
+            flags: (self.flags & !HOPS) | hops(self.flags).saturating_sub(1),
+            ..*self
+        }
     }
 
     /// The frame as it leaves a site, with its budget restored. A crossing is bounded
     /// by the address rather than by the budget: past it the address is site-local, so
     /// a second crossing is unreachable and exactly one is possible.
     pub(crate) fn refreshed(&self) -> Frame {
-        Frame { flags: self.flags | HOPS, ..*self }
+        Frame {
+            flags: self.flags | HOPS,
+            ..*self
+        }
     }
 }
 
@@ -507,7 +523,11 @@ impl Link {
     pub(crate) fn open(c: &Configurator, p: &Peer) -> io::Result<Link> {
         let disk = c.disk(Path::new(&p.device), Some(TIMEOUT), None)?;
         let huge = disk.by(HUGE_TIMEOUT);
-        Ok(Link { disk, huge, peer: p.id })
+        Ok(Link {
+            disk,
+            huge,
+            peer: p.id,
+        })
     }
 
     pub(crate) fn peer(&self) -> u32 {
@@ -573,7 +593,14 @@ mod tests {
                     for imm in 0..4u8 {
                         // Alternating bits, so a field landing at the wrong shift shows.
                         let offset = if huge { 0x55_5555 } else { 0x5555_5555 };
-                        let f = Frame { op, flags, imm, huge, vol: 0b101010, offset };
+                        let f = Frame {
+                            op,
+                            flags,
+                            imm,
+                            huge,
+                            vol: 0b101010,
+                            offset,
+                        };
                         let (g, _) = Frame::decode(f.encode(), BLOCK).unwrap();
                         assert_eq!(f, g, "{f:?}");
                     }
@@ -584,8 +611,22 @@ mod tests {
 
     #[test]
     fn regions_do_not_overlap() {
-        let small = Frame { op: Op::Ping, flags: 7, imm: 3, huge: false, vol: 63, offset: u32::MAX };
-        let huge = Frame { op: Op::Ping, flags: 7, imm: 3, huge: true, vol: 63, offset: (MAX_HUGE_PAGES - 1) as u32 };
+        let small = Frame {
+            op: Op::Ping,
+            flags: 7,
+            imm: 3,
+            huge: false,
+            vol: 63,
+            offset: u32::MAX,
+        };
+        let huge = Frame {
+            op: Op::Ping,
+            flags: 7,
+            imm: 3,
+            huge: true,
+            vol: 63,
+            offset: (MAX_HUGE_PAGES - 1) as u32,
+        };
         assert!(small.encode() < HUGE_BASE_LBA);
         assert!(huge.encode() >= HUGE_BASE_LBA);
         assert!(huge.encode() + HUGE_BLOCKS <= MAX_LBA);
@@ -597,15 +638,24 @@ mod tests {
     #[test]
     fn classifies_frame_shape() {
         let get = Frame::new(Op::Get, false, 1, 7);
-        assert_eq!(Frame::decode(get.encode(), BLOCK).unwrap().1, Part::Payload { off: 0 });
-        assert_eq!(Frame::decode(get.encode(), 2 * BLOCK).unwrap().1, Part::Both);
+        assert_eq!(
+            Frame::decode(get.encode(), BLOCK).unwrap().1,
+            Part::Payload { off: 0 }
+        );
+        assert_eq!(
+            Frame::decode(get.encode(), 2 * BLOCK).unwrap().1,
+            Part::Both
+        );
         // Block 1 alone is the trailer half of a gather frame; it is not addressable.
         assert!(Frame::decode(get.encode() + 1, BLOCK).is_err());
         // Three blocks is not a shape a 4 KiB frame has.
         assert!(Frame::decode(get.encode(), 3 * BLOCK).is_err());
 
         let ping = Frame::new(Op::Ping, false, 0, 0);
-        assert_eq!(Frame::decode(ping.encode(), BLOCK).unwrap().1, Part::Trailer);
+        assert_eq!(
+            Frame::decode(ping.encode(), BLOCK).unwrap().1,
+            Part::Trailer
+        );
         assert!(Frame::decode(ping.encode(), 2 * BLOCK).is_err());
 
         // A 4 MiB page arrives in whatever pieces the peer's MDTS produced.
@@ -613,13 +663,21 @@ mod tests {
         for (block, blocks) in [(0u64, 1024u64), (0, 256), (256, 256), (1023, 1)] {
             let (g, p) = Frame::decode(huge.encode() + block, blocks as usize * BLOCK).unwrap();
             assert_eq!(g, huge);
-            assert_eq!(p, Part::Payload { off: block as usize * BLOCK });
+            assert_eq!(
+                p,
+                Part::Payload {
+                    off: block as usize * BLOCK
+                }
+            );
         }
         // Never past the end of the page.
         assert!(Frame::decode(huge.encode() + 1, 1024 * BLOCK).is_err());
         // A 4 MiB TRIM is a control frame and stays one block.
         let trim = Frame::new(Op::Trim, true, 2, 9);
-        assert_eq!(Frame::decode(trim.encode(), BLOCK).unwrap().1, Part::Trailer);
+        assert_eq!(
+            Frame::decode(trim.encode(), BLOCK).unwrap().1,
+            Part::Trailer
+        );
         assert!(Frame::decode(trim.encode(), 2 * BLOCK).is_err());
     }
 
@@ -649,7 +707,10 @@ mod tests {
         // to make us do something by accident.
         for raw in 12..32u64 {
             let sh = SMALL_OFF_BITS + VOL_BITS + IMM_BITS + FLAG_BITS;
-            assert_eq!(Frame::decode((raw << sh) << SMALL_SHIFT, BLOCK), Err(status::BAD));
+            assert_eq!(
+                Frame::decode((raw << sh) << SMALL_SHIFT, BLOCK),
+                Err(status::BAD)
+            );
         }
     }
 
@@ -661,7 +722,13 @@ mod tests {
         f.flags = 2 | CACHE_ONLY;
         f.imm = 2;
         let g = f.forwarded();
-        assert_eq!(Frame { flags: 1 | CACHE_ONLY, ..f }, g);
+        assert_eq!(
+            Frame {
+                flags: 1 | CACHE_ONLY,
+                ..f
+            },
+            g
+        );
         assert_eq!(hops(g.flags), 1);
         assert_eq!(hops(g.forwarded().flags), 0);
         assert_eq!(g.imm, f.imm);

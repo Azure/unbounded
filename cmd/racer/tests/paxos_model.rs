@@ -99,7 +99,11 @@ fn choose(replies: &[Reg], floored: bool) -> Option<Reg> {
     }
     // Nothing at or above the floor could have reached a quorum, so every register still
     // on offer there is a free choice; take the newest, the one a writer would build on.
-    replies.iter().copied().filter(|r| r.version >= floor).max_by_key(|r| key(*r))
+    replies
+        .iter()
+        .copied()
+        .filter(|r| r.version >= floor)
+        .max_by_key(|r| key(*r))
 }
 
 /// The apply-if-newer order: version first, ballot to break a tie within one.
@@ -212,7 +216,9 @@ impl Register {
             if s.reg[i].version == 0 || !self.votes(s, i) {
                 continue;
             }
-            let held = (0..N).filter(|j| self.votes(s, *j) && s.reg[*j] == s.reg[i]).count();
+            let held = (0..N)
+                .filter(|j| self.votes(s, *j) && s.reg[*j] == s.reg[i])
+                .count();
             if held >= NEED && !s.chosen.contains(&s.reg[i]) {
                 s.chosen.push(s.reg[i]);
                 s.chosen.sort();
@@ -225,7 +231,11 @@ impl Register {
     fn pick(&self, replies: &[Reg]) -> Option<Reg> {
         if self.rule == Rule::HighestBallot {
             let top = replies.iter().map(|r| r.version).max()?;
-            return replies.iter().copied().filter(|r| r.version == top).max_by_key(|r| r.ballot);
+            return replies
+                .iter()
+                .copied()
+                .filter(|r| r.version == top)
+                .max_by_key(|r| r.ballot);
         }
         choose(replies, true)
     }
@@ -275,7 +285,11 @@ impl Model for Register {
                 let respond = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
                 // A replaying acceptor cannot promise, so a round takes its quorum from
                 // the members that are left.
-                if respond.iter().enumerate().any(|(i, r)| *r && !self.votes(s, i)) {
+                if respond
+                    .iter()
+                    .enumerate()
+                    .any(|(i, r)| *r && !self.votes(s, i))
+                {
                     continue;
                 }
                 if respond.iter().filter(|x| **x).count() >= NEED {
@@ -371,7 +385,10 @@ impl Model for Register {
                     // it, so an older answer replaces it with something the group has
                     // already moved past. Nothing but a wipe makes that legal.
                     s.rolled |= s.chosen.iter().any(|c| c.newer_than(&pick));
-                    s.repair = Some(Repair { pick, left: [true; N] });
+                    s.repair = Some(Repair {
+                        pick,
+                        left: [true; N],
+                    });
                 }
             }
             RegisterAction::Learn { a } => {
@@ -417,7 +434,9 @@ impl Model for Register {
             // ever be decided at it.
             Property::<Self>::always("one value per version", |_, s| {
                 s.chosen.iter().all(|a| {
-                    s.chosen.iter().all(|b| a.version != b.version || a.value == b.value)
+                    s.chosen
+                        .iter()
+                        .all(|b| a.version != b.version || a.value == b.value)
                 })
             }),
             Property::<Self>::always("a repair never answers below a chosen version", |m, s| {
@@ -446,11 +465,11 @@ fn guarded_accepts_agree_on_one_value_per_version() {
         proposals: MAX_PROPOSALS,
         recover: None,
     }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_properties();
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_properties();
 }
 
 #[test]
@@ -466,11 +485,11 @@ fn choosing_by_ballot_alone_resurrects_a_losing_proposal() {
         proposals: MAX_PROPOSALS,
         recover: None,
     }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_any_discovery("one value per version");
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_any_discovery("one value per version");
     assert!(path.into_actions().len() >= 4);
 }
 
@@ -481,9 +500,21 @@ fn descending_past_the_floor_answers_with_a_rolled_back_write() {
     // nobody else, and the third never had it. No reply names it, so an unfloored
     // descent walks down to a register from before the write and hands that back.
     let replies = [
-        Reg { version: 1, ballot: ballot(0, 1), value: 1 },
-        Reg { version: 3, ballot: ballot(1, 2), value: 2 },
-        Reg { version: 3, ballot: ballot(1, 1), value: 3 },
+        Reg {
+            version: 1,
+            ballot: ballot(0, 1),
+            value: 1,
+        },
+        Reg {
+            version: 3,
+            ballot: ballot(1, 2),
+            value: 2,
+        },
+        Reg {
+            version: 3,
+            ballot: ballot(1, 1),
+            value: 3,
+        },
     ];
     assert_eq!(choose(&replies, false).map(|r| r.version), Some(1));
     // The floor is the highest version a quorum could still be standing at, and the
@@ -508,11 +539,11 @@ fn a_replaying_acceptor_is_not_counted_toward_quorum() {
         proposals: 2,
         recover: None,
     }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_properties();
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_properties();
 }
 
 #[test]
@@ -529,12 +560,16 @@ fn counting_a_replaying_acceptor_undoes_an_acknowledged_write() {
         proposals: 2,
         recover: None,
     }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_any_discovery("one value per version");
-    assert!(path.into_actions().iter().any(|a| matches!(a, RegisterAction::Wipe { .. })));
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_any_discovery("one value per version");
+    assert!(
+        path.into_actions()
+            .iter()
+            .any(|a| matches!(a, RegisterAction::Wipe { .. }))
+    );
 }
 
 #[test]
@@ -572,7 +607,11 @@ fn rejoining_without_the_promise_undoes_an_acknowledged_write() {
     .spawn_bfs()
     .join()
     .assert_any_discovery("one value per version");
-    assert!(path.into_actions().iter().any(|a| matches!(a, RegisterAction::Rejoin { .. })));
+    assert!(
+        path.into_actions()
+            .iter()
+            .any(|a| matches!(a, RegisterAction::Rejoin { .. }))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -621,14 +660,27 @@ struct CommitState {
 enum CommitAction {
     /// A member proposes at the version it holds. Ballots rise with the proposal order,
     /// as a prepare before each round would give.
-    Propose { by: u8 },
+    Propose {
+        by: u8,
+    },
     /// The accept reaches a peer, or is lost on the way to one.
-    Deliver { p: usize, a: u8 },
-    Lose { p: usize, a: u8 },
+    Deliver {
+        p: usize,
+        a: u8,
+    },
+    Lose {
+        p: usize,
+        a: u8,
+    },
     /// Every peer leg has resolved, so the proposer settles its own.
-    Finish { p: usize },
+    Finish {
+        p: usize,
+    },
     /// A repair: prepare at `respond`, then learn the answer to `to`.
-    Repair { respond: [bool; N], to: [bool; N] },
+    Repair {
+        respond: [bool; N],
+        to: [bool; N],
+    },
 }
 
 struct CommitModel {
@@ -655,7 +707,11 @@ fn take(reg: &mut Reg, sh: &Shot) -> bool {
     if reg.version > sh.guard || (reg.version == sh.guard && sh.ballot < reg.ballot) {
         return false;
     }
-    *reg = Reg { version: sh.guard + 1, ballot: sh.ballot, value: sh.value };
+    *reg = Reg {
+        version: sh.guard + 1,
+        ballot: sh.ballot,
+        value: sh.value,
+    };
     true
 }
 
@@ -788,12 +844,14 @@ impl Model for CommitModel {
 
 #[test]
 fn a_proposer_never_builds_on_a_version_of_its_own() {
-    CommitModel { commit: Commit::Deferred }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_properties();
+    CommitModel {
+        commit: Commit::Deferred,
+    }
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_properties();
 }
 
 #[test]
@@ -803,13 +861,19 @@ fn committing_beside_the_fan_out_resurrects_a_failed_write() {
     // prepare hearing from two of three finds that private top version uncontested — one
     // holder plus one silent member is a quorum's worth — and spreads it over a value
     // the group had chosen meanwhile.
-    let path = CommitModel { commit: Commit::Eager }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_any_discovery("a write is not undone");
-    assert!(path.into_actions().iter().any(|a| matches!(a, CommitAction::Repair { .. })));
+    let path = CommitModel {
+        commit: Commit::Eager,
+    }
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_any_discovery("a write is not undone");
+    assert!(
+        path.into_actions()
+            .iter()
+            .any(|a| matches!(a, CommitAction::Repair { .. }))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -839,12 +903,21 @@ struct HandoverState {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum HandoverAction {
-    WriteA { set: [bool; N] },
-    WriteB { set: [bool; N] },
+    WriteA {
+        set: [bool; N],
+    },
+    WriteB {
+        set: [bool; N],
+    },
     /// A live forward reaches one destination acceptor, apply-if-newer.
-    Forward { f: usize, a: u8 },
+    Forward {
+        f: usize,
+        a: u8,
+    },
     SealPending,
-    Seal { a: u8 },
+    Seal {
+        a: u8,
+    },
     /// The frozen source pushes what it holds; the destination applies if newer.
     Drain,
     GoLive,
@@ -946,7 +1019,11 @@ impl Model for Handover {
                     return None;
                 }
                 s.writes += 1;
-                let r = Reg { version: prev.version + 1, ballot: 0, value: s.writes };
+                let r = Reg {
+                    version: prev.version + 1,
+                    ballot: 0,
+                    value: s.writes,
+                };
                 for (i, on) in set.iter().enumerate() {
                     if *on {
                         s.a[i] = r;
@@ -961,7 +1038,11 @@ impl Model for Handover {
                     return None;
                 }
                 s.writes += 1;
-                let r = Reg { version: prev.version + 1, ballot: 0, value: 10 + s.writes };
+                let r = Reg {
+                    version: prev.version + 1,
+                    ballot: 0,
+                    value: 10 + s.writes,
+                };
                 for (i, on) in set.iter().enumerate() {
                     if *on {
                         s.b[i] = r;
@@ -1025,12 +1106,14 @@ impl Model for Handover {
 
 #[test]
 fn sealed_handover_preserves_acknowledged_writes() {
-    Handover { install: Install::AfterDrain }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_properties();
+    Handover {
+        install: Install::AfterDrain,
+    }
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_properties();
 }
 
 #[test]
@@ -1039,12 +1122,14 @@ fn installing_on_the_seal_alone_rolls_a_write_back() {
     // pages the source committed and acknowledged. Going live without draining serves
     // them at an older version, and the destination's next write is then chosen at a
     // version the source already used.
-    Handover { install: Install::OnSeal }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_any_discovery("acknowledged versions increase");
+    Handover {
+        install: Install::OnSeal,
+    }
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_any_discovery("acknowledged versions increase");
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,7 +1166,11 @@ enum SweepAction {
     /// A one-shot accept that reached `set` and no further. A `set` below a quorum is
     /// the divergence anti-entropy exists to find, and one nobody reads is noticed no
     /// other way.
-    Accept { member: u8, guard: u8, set: [bool; N] },
+    Accept {
+        member: u8,
+        guard: u8,
+        set: [bool; N],
+    },
     /// `a` finds a bucket whose digest differs from `b`'s and reconciles it.
     Compare { a: u8, b: u8 },
 }
@@ -1149,7 +1238,11 @@ impl Model for Sweep {
                 // and two proposers on one version with different ballots is precisely
                 // the state the sweep has to survive.
                 let b = ballot(1, member);
-                let v = Reg { version: guard + 1, ballot: b, value: s.accepts + 1 };
+                let v = Reg {
+                    version: guard + 1,
+                    ballot: b,
+                    value: s.accepts + 1,
+                };
                 s.accepts += 1;
                 for (i, hit) in set.iter().enumerate() {
                     if *hit && s.reg[i].version == guard && b >= s.reg[i].ballot {
@@ -1177,7 +1270,11 @@ impl Model for Sweep {
                         }
                     }
                     Anti::Propagate => {
-                        let best = if s.reg[b].newer_than(&s.reg[a]) { s.reg[b] } else { s.reg[a] };
+                        let best = if s.reg[b].newer_than(&s.reg[a]) {
+                            s.reg[b]
+                        } else {
+                            s.reg[a]
+                        };
                         for i in [a, b] {
                             if best.newer_than(&s.reg[i]) {
                                 s.reg[i] = best;
@@ -1198,7 +1295,9 @@ impl Model for Sweep {
             // background job could quietly undo a decision.
             Property::<Self>::always("one value per version", |_, s| {
                 s.chosen.iter().all(|a| {
-                    s.chosen.iter().all(|b| a.version != b.version || a.value == b.value)
+                    s.chosen
+                        .iter()
+                        .all(|b| a.version != b.version || a.value == b.value)
                 })
             }),
             Property::<Self>::sometimes("a divergence nobody read is healed", |_, s| s.healed),
@@ -1221,15 +1320,18 @@ fn reconciling_the_compared_pair_instead_of_the_group_loses_a_write() {
     // The cursor hands the sweep both registers, which makes "keep the newer one" look
     // free. It is not: the newer of two is not the chosen of three, and copying it onto
     // the pair is enough to give a losing proposal its second acceptor.
-    Sweep { rule: Anti::Propagate }
-        .checker()
-        .threads(num_threads())
-        .spawn_bfs()
-        .join()
-        .assert_any_discovery("one value per version");
+    Sweep {
+        rule: Anti::Propagate,
+    }
+    .checker()
+    .threads(num_threads())
+    .spawn_bfs()
+    .join()
+    .assert_any_discovery("one value per version");
 }
 
 fn num_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
-

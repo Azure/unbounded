@@ -274,7 +274,10 @@ impl PoolBuf {
                         _nosend: PhantomData,
                     });
                 }
-                pool.classes[c].waiters.borrow_mut().push_back(cx.waker().clone());
+                pool.classes[c]
+                    .waiters
+                    .borrow_mut()
+                    .push_back(cx.waker().clone());
                 Poll::Pending
             })
         })
@@ -307,7 +310,6 @@ impl PoolBuf {
             len: self.len as u32,
         }
     }
-
 }
 
 impl std::ops::Deref for PoolBuf {
@@ -407,7 +409,13 @@ impl OpSlab {
         self.users.borrow()[tag as usize] != 0
     }
 
-    fn acquire(&self, pool: &Pool, pending: u8, hold: Option<u16>, tag: Option<u16>) -> Option<(u32, u16)> {
+    fn acquire(
+        &self,
+        pool: &Pool,
+        pending: u8,
+        hold: Option<u16>,
+        tag: Option<u16>,
+    ) -> Option<(u32, u16)> {
         let idx = self.free.borrow_mut().pop()?;
         let mut slots = self.slots.borrow_mut();
         let s = &mut slots[idx as usize];
@@ -688,7 +696,10 @@ impl Disk {
         let len = buf.len;
         let (hold, tag) = buf.holds();
         let fut = worker::with_local(|l| {
-            let (idx, seq) = l.ops.acquire(&l.pool, 1, hold, tag).expect("op slab exhausted");
+            let (idx, seq) = l
+                .ops
+                .acquire(&l.pool, 1, hold, tag)
+                .expect("op slab exhausted");
             crate::sim::submit(
                 self.inner.slot,
                 kind,
@@ -696,8 +707,7 @@ impl Disk {
                 buf.addr,
                 len,
                 self.deadline(),
-                idx,
-                seq,
+                (idx, seq),
             );
             OpFuture {
                 idx,
@@ -716,7 +726,12 @@ impl Disk {
     }
 
     #[cfg(not(feature = "sim"))]
-    async fn run(&self, e: squeue::Entry, len: u32, holds: (Option<u16>, Option<u16>)) -> Result<(), Errno> {
+    async fn run(
+        &self,
+        e: squeue::Entry,
+        len: u32,
+        holds: (Option<u16>, Option<u16>),
+    ) -> Result<(), Errno> {
         let res = submit_op(e, self.deadline(), holds.0, holds.1).await;
         if res < 0 {
             return Err(Errno(-res));
@@ -742,10 +757,18 @@ pub(crate) enum Durability {
 
 /// Submits one operation, optionally guarded by a linked timeout, and awaits it.
 #[cfg(not(feature = "sim"))]
-async fn submit_op(e: squeue::Entry, timeout: Option<Duration>, hold: Option<u16>, tag: Option<u16>) -> i32 {
+async fn submit_op(
+    e: squeue::Entry,
+    timeout: Option<Duration>,
+    hold: Option<u16>,
+    tag: Option<u16>,
+) -> i32 {
     let fut = worker::with_local(|l| {
         let pending = if timeout.is_some() { 2 } else { 1 };
-        let (idx, seq) = l.ops.acquire(&l.pool, pending, hold, tag).expect("op slab exhausted");
+        let (idx, seq) = l
+            .ops
+            .acquire(&l.pool, pending, hold, tag)
+            .expect("op slab exhausted");
         match timeout {
             None => {
                 let e = e.user_data(worker::ud_op(idx, seq));
@@ -804,7 +827,10 @@ impl Volume {
 /// costs one SQE and no thread.
 pub(crate) async fn sleep(d: Duration) {
     let fut = worker::with_local(|l| {
-        let (idx, seq) = l.ops.acquire(&l.pool, 1, None, None).expect("op slab exhausted");
+        let (idx, seq) = l
+            .ops
+            .acquire(&l.pool, 1, None, None)
+            .expect("op slab exhausted");
         #[cfg(feature = "sim")]
         crate::sim::sleep(d, idx, seq);
         #[cfg(not(feature = "sim"))]

@@ -60,7 +60,9 @@ pub enum Status {
     /// metadata is quarantined. Never served; healed from peers.
     Missing,
     /// Kind semantics refused the write. `current` is the version we hold.
-    Conflict { current: u64 },
+    Conflict {
+        current: u64,
+    },
     /// The address is not covered by any extent in the config.
     Unmapped,
     /// The slab class is full.
@@ -550,8 +552,20 @@ impl Shard {
     fn new(core: u32, shape: &Shape) -> Shard {
         Shard {
             slabs: [
-                Slab::new(core, shape.cores, shape.k[0], shape.mblocks[0], shape.expect[0]),
-                Slab::new(core, shape.cores, shape.k[1], shape.mblocks[1], shape.expect[1]),
+                Slab::new(
+                    core,
+                    shape.cores,
+                    shape.k[0],
+                    shape.mblocks[0],
+                    shape.expect[0],
+                ),
+                Slab::new(
+                    core,
+                    shape.cores,
+                    shape.k[1],
+                    shape.mblocks[1],
+                    shape.expect[1],
+                ),
             ],
             occ: OccRing::new(shape.occ),
             recheck: shape.recheck,
@@ -649,7 +663,10 @@ impl Shard {
             // last read version for OCC, the epoch's fill point for Immutable.
             None => match kind {
                 Kind::Lww => current,
-                Kind::Occ => self.occ.version(addr.0).ok_or(Status::Conflict { current })?,
+                Kind::Occ => self
+                    .occ
+                    .version(addr.0)
+                    .ok_or(Status::Conflict { current })?,
                 Kind::Immutable => 3 * epoch,
             },
         };
@@ -691,9 +708,7 @@ impl Shard {
         let e = self.slab(class).entry_of(addr.0).map(|(_, x)| x);
         let held = (effective(e, kind, epoch), e.map_or(0, |x| x.ballot as u32));
         let equal_live = e.is_some_and(|x| {
-            x.state == State::Live
-                && x.version == r.version
-                && x.ballot as u32 == r.ballot.raw()
+            x.state == State::Live && x.version == r.version && x.ballot as u32 == r.ballot.raw()
         });
         if held > (r.version, r.ballot.raw())
             || (held == (r.version, r.ballot.raw()) && !(replace_equal && equal_live))
@@ -763,18 +778,17 @@ impl Shard {
         };
         sl.foreign.remove(&addr.0);
         let li = local / sl.k;
-        Ok(Some(Staged { li, seq: sl.dirty(li), stale }))
+        Ok(Some(Staged {
+            li,
+            seq: sl.dirty(li),
+            stale,
+        }))
     }
 
     /// Retire the slot a commit displaced, once its replacement is durable. Returns the
     /// mblock and sequence that retirement needs flushed to, or `None` if the slot is
     /// outside this core's stripe.
-    pub(super) fn release(
-        &mut self,
-        class: Class,
-        slot: u32,
-        gof: &Groups,
-    ) -> Option<(u32, u64)> {
+    pub(super) fn release(&mut self, class: Class, slot: u32, gof: &Groups) -> Option<(u32, u64)> {
         let sl = self.slab(class);
         let local = sl.local_of(slot)?;
         sl.release(slot, gof);
@@ -846,7 +860,12 @@ impl Shard {
     /// The OCC observation is *not* recorded here: this same path serves a peer's
     /// `GET`, and only the node whose ublk device answered the client may record a
     /// read. `Paxos::read` does that instead.
-    pub(super) fn lookup(&mut self, addr: GlobalAddr, _kind: Kind, class: Class) -> Result<Lookup, Status> {
+    pub(super) fn lookup(
+        &mut self,
+        addr: GlobalAddr,
+        _kind: Kind,
+        class: Class,
+    ) -> Result<Lookup, Status> {
         let miss = self.miss(class);
         let (slot, e) = self
             .slab(class)
@@ -1112,7 +1131,12 @@ pub(super) fn pick_ab(ha: Option<Header>, hb: Option<Header>) -> Option<(Header,
 /// deciding who owns what.
 ///
 /// Returns the shards and the number of mblocks that were quarantined.
-pub(super) fn rebuild(shape: &Shape, cores: usize, scans: Vec<Scanned>, gof: &Groups) -> (Vec<Shard>, usize) {
+pub(super) fn rebuild(
+    shape: &Shape,
+    cores: usize,
+    scans: Vec<Scanned>,
+    gof: &Groups,
+) -> (Vec<Shard>, usize) {
     let mut shards: Vec<Shard> = (0..cores).map(|c| Shard::new(c as u32, shape)).collect();
 
     // Place every scanned mblock in its owning core's stripe.
@@ -1133,7 +1157,12 @@ pub(super) fn rebuild(shape: &Shape, cores: usize, scans: Vec<Scanned>, gof: &Gr
         sl.entries[li * k..(li + 1) * k].copy_from_slice(&m.entries);
         for (j, e) in m.entries.iter().enumerate() {
             if e.addr != 0 && e.state != State::Empty {
-                found.push((e.addr, m.class, m.id * sl.k + j as u32, (e.version, e.ballot as u32)));
+                found.push((
+                    e.addr,
+                    m.class,
+                    m.id * sl.k + j as u32,
+                    (e.version, e.ballot as u32),
+                ));
             }
         }
     }
@@ -1659,7 +1688,10 @@ mod model {
 
         fn init_states(&self) -> Vec<Reg> {
             vec![Reg {
-                sh: boot(1, self.commit == Commit::Checked, &formatted()).0.pop().unwrap(),
+                sh: boot(1, self.commit == Commit::Checked, &formatted())
+                    .0
+                    .pop()
+                    .unwrap(),
                 pending: Vec::new(),
                 acked: BTreeSet::new(),
                 seen: BTreeSet::new(),
@@ -1719,7 +1751,9 @@ mod model {
                 }
                 RegAct::Register(a) => {
                     let ad = GlobalAddr(ADDRS[a as usize]);
-                    let r = s.sh.register_of(ad, kind, cls, s.epoch[a as usize]).unwrap();
+                    let r =
+                        s.sh.register_of(ad, kind, cls, s.epoch[a as usize])
+                            .unwrap();
                     s.seen.insert((ad.0, r.version));
                 }
                 RegAct::Guard(a) => {
@@ -1741,7 +1775,9 @@ mod model {
                     let ad = GlobalAddr(ADDRS[a as usize]);
                     let guard = GUARDS[g as usize];
                     let ballot = Ballot::new(BALLOTS[b as usize].0, BALLOTS[b as usize].1);
-                    if let Ok(t) = s.sh.reserve(ad, kind, cls, guard, ballot, s.epoch[a as usize]) {
+                    if let Ok(t) =
+                        s.sh.reserve(ad, kind, cls, guard, ballot, s.epoch[a as usize])
+                    {
                         // Only the guards a real proposer can present: `guard_of`
                         // returns the epoch's fill point for Immutable, so an accept
                         // either derives it or carries that same number. An arbitrary
@@ -1764,7 +1800,9 @@ mod model {
                     // `Ok(None)` is a commit that lost the race and gave its slot back:
                     // the caller sees success but nothing was written, so nothing is
                     // acknowledged as this address's value.
-                    if let Ok(Some(st)) = s.sh.stage(GlobalAddr(addr), kind, cls, t, value, &group_of) {
+                    if let Ok(Some(st)) =
+                        s.sh.stage(GlobalAddr(addr), kind, cls, t, value, &group_of)
+                    {
                         s.acked.insert((addr, t.version, t.ballot.raw(), value));
                         if let Some(old) = st.stale {
                             s.sh.release(cls, old, &group_of);
@@ -1782,7 +1820,15 @@ mod model {
                 RegAct::Trim { a, g } => {
                     let ad = GlobalAddr(ADDRS[a as usize]);
                     let ballot = Ballot::new(2, 0);
-                    let r = s.sh.trim(ad, kind, cls, TGUARDS[g as usize], ballot, s.epoch[a as usize], &group_of);
+                    let r = s.sh.trim(
+                        ad,
+                        kind,
+                        cls,
+                        TGUARDS[g as usize],
+                        ballot,
+                        s.epoch[a as usize],
+                        &group_of,
+                    );
                     // A mutable trim destroys the register rather than tombstoning it,
                     // so versions restart from zero and the history before it is no
                     // longer a claim about the same incarnation. Forgetting it here
@@ -1887,43 +1933,61 @@ mod model {
                 Kind::Immutable => {
                     // `3*epoch + ordinal`: a fill is ordinal 1, a trim is ordinal 2.
                     // Nothing else may be accepted, at any epoch.
-                    ps.push(Property::<Self>::always("immutable versions are ordinals", |_, s| {
-                        !s.offbeat
-                    }));
-                    ps.push(Property::<Self>::sometimes("a tombstone is written", |_, s| {
-                        s.sh.slabs[0].entries.iter().any(|e| e.state == State::Tombstone)
-                    }));
+                    ps.push(Property::<Self>::always(
+                        "immutable versions are ordinals",
+                        |_, s| !s.offbeat,
+                    ));
+                    ps.push(Property::<Self>::sometimes(
+                        "a tombstone is written",
+                        |_, s| {
+                            s.sh.slabs[0]
+                                .entries
+                                .iter()
+                                .any(|e| e.state == State::Tombstone)
+                        },
+                    ));
                     // The only garbage collection in the system, and it is scoped to one
                     // volume. A volume whose epoch still sits at zero keeps every
                     // tombstone it has, however far ahead the other volume runs.
-                    ps.push(Property::<Self>::always("the sweep stays inside its volume", |_, s| {
-                        (0..ADDRS.len()).all(|v| s.epoch[v] > 0 || !s.reaped[v])
-                    }));
-                    ps.push(Property::<Self>::sometimes("a tombstone is reclaimed", |_, s| {
-                        s.acked.iter().any(|&(a, v, _, _)| {
-                            v == 2
-                                && s.epoch[vol_of(a)] > 0
-                                && find(std::slice::from_ref(&s.sh), a).is_none()
-                        })
-                    }));
+                    ps.push(Property::<Self>::always(
+                        "the sweep stays inside its volume",
+                        |_, s| (0..ADDRS.len()).all(|v| s.epoch[v] > 0 || !s.reaped[v]),
+                    ));
+                    ps.push(Property::<Self>::sometimes(
+                        "a tombstone is reclaimed",
+                        |_, s| {
+                            s.acked.iter().any(|&(a, v, _, _)| {
+                                v == 2
+                                    && s.epoch[vol_of(a)] > 0
+                                    && find(std::slice::from_ref(&s.sh), a).is_none()
+                            })
+                        },
+                    ));
                     // The point of the rescope: one volume collects while the other,
                     // still lagging, keeps its own tombstone.
-                    ps.push(Property::<Self>::sometimes("one volume collects alone", |_, s| {
-                        s.reaped[0]
-                            && s.epoch[1] == 0
-                            && s.sh.slabs[0].entries.iter().any(|e| {
-                                e.state == State::Tombstone && vol_of(e.addr) == 1
-                            })
-                    }));
+                    ps.push(Property::<Self>::sometimes(
+                        "one volume collects alone",
+                        |_, s| {
+                            s.reaped[0]
+                                && s.epoch[1] == 0
+                                && s.sh.slabs[0]
+                                    .entries
+                                    .iter()
+                                    .any(|e| e.state == State::Tombstone && vol_of(e.addr) == 1)
+                        },
+                    ));
                 }
                 _ => {
                     // A mutable trim does not tombstone: it drops the entry and hands
                     // the slot straight back.
-                    ps.push(Property::<Self>::sometimes("a trim frees a slot", |_, s| {
-                        s.trimmed > 0
-                            && find(std::slice::from_ref(&s.sh), ADDRS[0]).is_none()
-                            && !s.sh.slabs[0].free.is_empty()
-                    }));
+                    ps.push(Property::<Self>::sometimes(
+                        "a trim frees a slot",
+                        |_, s| {
+                            s.trimmed > 0
+                                && find(std::slice::from_ref(&s.sh), ADDRS[0]).is_none()
+                                && !s.sh.slabs[0].free.is_empty()
+                        },
+                    ));
                 }
             }
             ps
@@ -2071,7 +2135,9 @@ mod model {
                 DiskAct::Reserve { a, b } => {
                     let ad = GlobalAddr(ADDRS[a as usize]);
                     let ballot = Ballot::new(BALLOTS[b as usize].0, BALLOTS[b as usize].1);
-                    let t = s.shards[0].reserve(ad, Kind::Lww, cls, None, ballot, 0).ok()?;
+                    let t = s.shards[0]
+                        .reserve(ad, Kind::Lww, cls, None, ballot, 0)
+                        .ok()?;
                     s.pending.push((ad.0, t));
                     s.writes += 1;
                 }
@@ -2149,19 +2215,23 @@ mod model {
                     // wins, so the test is on `(version, ballot)` order rather than on
                     // the value: never lost, never regressed, and equal keys must agree
                     // on the bytes.
-                    s.acked.iter().all(|&(a, v, b, val)| match find(&s.shards, a) {
-                        Some(e) => {
-                            let held = (e.version, e.ballot as u32);
-                            held > (v, b) || (held == (v, b) && e.data_crc == val)
-                        }
-                        None => false,
-                    })
+                    s.acked
+                        .iter()
+                        .all(|&(a, v, b, val)| match find(&s.shards, a) {
+                            Some(e) => {
+                                let held = (e.version, e.ballot as u32);
+                                held > (v, b) || (held == (v, b) && e.data_crc == val)
+                            }
+                            None => false,
+                        })
                 }),
                 Property::<Self>::always("slots are accounted for", |_, s: &Disk| sound(&s.shards)),
                 // `rebuild` seeds the census in one pass and `set` keeps it from there.
                 // A restart is the only thing that exercises the seeding.
                 Property::<Self>::always("the census matches the slabs", |_, s: &Disk| {
-                    s.shards.iter().all(|sh| sh.slabs[0].census == recount(&sh.slabs[0]))
+                    s.shards
+                        .iter()
+                        .all(|sh| sh.slabs[0].census == recount(&sh.slabs[0]))
                 }),
                 // A displaced slot is retired only once its replacement is durable, so
                 // until then one address legitimately occupies two slots. Every such
@@ -2183,9 +2253,12 @@ mod model {
                 // metadata write and the old slot's release leaves behind.
                 Property::<Self>::sometimes("a duplicate is resolved at startup", |_, s: &Disk| {
                     s.restarts > 0
-                        && s.image.iter().flatten().flatten().filter(|(_, rows)| {
-                            rows.iter().any(|e| e.addr == ADDRS[0])
-                        }).count()
+                        && s.image
+                            .iter()
+                            .flatten()
+                            .flatten()
+                            .filter(|(_, rows)| rows.iter().any(|e| e.addr == ADDRS[0]))
+                            .count()
                             > 1
                         && find(&s.shards, ADDRS[0]).is_some()
                 }),
@@ -2201,7 +2274,9 @@ mod model {
     // ------------------------------------------------------------------------ checks
 
     fn threads() -> usize {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     }
 
     #[test]
@@ -2211,7 +2286,11 @@ mod model {
         r.observe(2, 20);
         r.observe(1, 11); // re-read moves 1 to the back, ahead of 2
         r.observe(3, 30);
-        assert_eq!(r.version(1), Some(11), "a re-read page was evicted before a colder one");
+        assert_eq!(
+            r.version(1),
+            Some(11),
+            "a re-read page was evicted before a colder one"
+        );
         assert_eq!(r.version(2), None);
         assert_eq!(r.version(3), Some(30));
         // Both halves stay within the bound no matter how the reads repeat.
@@ -2226,12 +2305,15 @@ mod model {
     #[test]
     fn register_semantics() {
         for kind in [Kind::Lww, Kind::Occ, Kind::Immutable] {
-            RegModel { kind, commit: Commit::Checked }
-                .checker()
-                .threads(threads())
-                .spawn_bfs()
-                .join()
-                .assert_properties();
+            RegModel {
+                kind,
+                commit: Commit::Checked,
+            }
+            .checker()
+            .threads(threads())
+            .spawn_bfs()
+            .join()
+            .assert_properties();
         }
     }
 

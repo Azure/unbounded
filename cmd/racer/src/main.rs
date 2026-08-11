@@ -81,22 +81,24 @@ fn serve(cfg: Config, path: String, metrics: String) -> std::io::Result<()> {
     // accepted generation is applied whole. A rejected one leaves the running config
     // alone and only bumps `racer_config_rejected_total`.
     let watcher = rt.clone();
-    std::thread::Builder::new().name("racer-cfg".into()).spawn(move || {
-        let apply = move |c: Config| {
-            let n = node.clone();
-            watcher.reload(move |cfgr| n.attach(cfgr, c))?;
-            println!("racer: configuration applied");
-            Ok(())
-        };
-        if let Err(e) = config::watch(Path::new(&path), cfg, apply) {
-            // A node that can no longer see the file is one the control plane has lost:
-            // it would serve the generation it happens to hold and ignore every later
-            // one, silently. Leaving says so — the supervisor restarts it, and a start
-            // reads the file again.
-            eprintln!("racer: config watch stopped: {e}");
-            std::process::exit(1);
-        }
-    })?;
+    std::thread::Builder::new()
+        .name("racer-cfg".into())
+        .spawn(move || {
+            let apply = move |c: Config| {
+                let n = node.clone();
+                watcher.reload(move |cfgr| n.attach(cfgr, c))?;
+                println!("racer: configuration applied");
+                Ok(())
+            };
+            if let Err(e) = config::watch(Path::new(&path), cfg, apply) {
+                // A node that can no longer see the file is one the control plane has lost:
+                // it would serve the generation it happens to hold and ignore every later
+                // one, silently. Leaving says so — the supervisor restarts it, and a start
+                // reads the file again.
+                eprintln!("racer: config watch stopped: {e}");
+                std::process::exit(1);
+            }
+        })?;
 
     let mut sig = 0i32;
     unsafe { libc::sigwait(&set, &mut sig) };

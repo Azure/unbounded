@@ -452,7 +452,6 @@ impl Control {
         };
         self.exec(CMD_DEL_DEV, &cmd).map(|_| ())
     }
-
 }
 
 /// Packs `struct ublk_auto_buf_reg` into an SQE `addr`.

@@ -191,7 +191,9 @@ fn e2e(a: Args) {
         // bunched clients all land on one worker and the node looks single-threaded.
         let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as usize;
         let first = plan.client_first_core() * 2;
-        let cpus: Vec<usize> = (0..a.jobs).map(|i| first + i * (online - first) / a.jobs).collect();
+        let cpus: Vec<usize> = (0..a.jobs)
+            .map(|i| first + i * (online - first) / a.jobs)
+            .collect();
 
         if nodes == 1 {
             // A ram disk allocates a page on first write, so reading sectors nobody
@@ -234,8 +236,16 @@ fn e2e(a: Args) {
         }
         // Every node exports the volume and is a member of every group, so load is
         // spread over all of them; driving a single gateway would measure that node.
-        let small: Vec<_> = c.nodes.iter().map(|n| n.volume(LWW).to_path_buf()).collect();
-        let big: Vec<_> = c.nodes.iter().map(|n| n.volume(BIG).to_path_buf()).collect();
+        let small: Vec<_> = c
+            .nodes
+            .iter()
+            .map(|n| n.volume(LWW).to_path_buf())
+            .collect();
+        let big: Vec<_> = c
+            .nodes
+            .iter()
+            .map(|n| n.volume(BIG).to_path_buf())
+            .collect();
 
         // Fill the 4 KiB volume once, so reads find pages and writes overwrite rather
         // than allocate: a hole and a filled page are different amounts of work.
@@ -247,7 +257,11 @@ fn e2e(a: Args) {
         fill.warmup = Duration::ZERO;
         fill.run = Duration::from_secs(600);
         let f = load::run(&fill).expect("fill");
-        assert_eq!(f.errors, 0, "filling the 4 KiB volume failed with errno {}", f.errno);
+        assert_eq!(
+            f.errors, 0,
+            "filling the 4 KiB volume failed with errno {}",
+            f.errno
+        );
         emit(tag, "4k fill (seq)", &plan, &f);
 
         let mut j = Job::new(&small, 4096, plan.small_bytes());
@@ -288,8 +302,8 @@ fn e2e(a: Args) {
 
 fn header() {
     println!(
-        "  {:<9} {:<16} {:>10} {:>8} {:>9} {:>8} {:>8} {:>8} {:>8}  {}",
-        "target", "workload", "IOPS", "GiB/s", "mean µs", "p50", "p99", "p99.9", "max", "IOPS/core"
+        "  {:<9} {:<16} {:>10} {:>8} {:>9} {:>8} {:>8} {:>8} {:>8}  IOPS/core",
+        "target", "workload", "IOPS", "GiB/s", "mean µs", "p50", "p99", "p99.9", "max"
     );
 }
 

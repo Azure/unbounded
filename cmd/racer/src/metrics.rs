@@ -126,9 +126,13 @@ static ROWS: OnceLock<Box<[Row]>> = OnceLock::new();
 
 /// One row per worker in both tables. Called once, from the first configuration.
 pub(crate) fn init(cores: usize) {
-    let rows = (0..cores).map(|_| Row(std::array::from_fn(|_| AtomicU64::new(0)))).collect();
+    let rows = (0..cores)
+        .map(|_| Row(std::array::from_fn(|_| AtomicU64::new(0))))
+        .collect();
     let _ = ROWS.set(rows);
-    let vols = (0..cores).map(|_| VolRow(std::array::from_fn(|_| AtomicU64::new(0)))).collect();
+    let vols = (0..cores)
+        .map(|_| VolRow(std::array::from_fn(|_| AtomicU64::new(0))))
+        .collect();
     let _ = VOLS.set(vols);
 }
 
@@ -136,7 +140,9 @@ pub(crate) fn init(cores: usize) {
 /// adjacent ticks, indistinguishable from scraping a moment earlier and not worth a
 /// fence per worker per millisecond.
 pub(crate) fn publish(core: usize, s: &Sample) {
-    let Some(row) = ROWS.get().and_then(|r| r.get(core)) else { return };
+    let Some(row) = ROWS.get().and_then(|r| r.get(core)) else {
+        return;
+    };
     for (slot, v) in row.0.iter().zip(s.as_array()) {
         slot.store(v, Ordering::Relaxed);
     }
@@ -175,8 +181,14 @@ fn encode() -> String {
 /// exists only once a configuration names it and its fabric slot is what indexes the
 /// rows. Both sum across cores like everything else.
 const VOL_SERIES: [(&str, &str); 2] = [
-    ("racer_volume_live_pages", "Immutable pages still live in the volume, by volume."),
-    ("racer_volume_tombstones", "Trimmed pages awaiting the volume's next epoch, by volume."),
+    (
+        "racer_volume_live_pages",
+        "Immutable pages still live in the volume, by volume.",
+    ),
+    (
+        "racer_volume_tombstones",
+        "Trimmed pages awaiting the volume's next epoch, by volume.",
+    ),
 ];
 
 /// Volume ids by fabric slot, 0 when unused. Every core writes the same configuration's
@@ -192,7 +204,9 @@ static VOLS: OnceLock<Box<[VolRow]>> = OnceLock::new();
 /// slots are zeroed, so a volume this core holds nothing for stops contributing rather
 /// than sticking at its last value.
 pub(crate) fn publish_volumes(core: usize, rows: &[(u8, u32, u64, u64)]) {
-    let Some(row) = VOLS.get().and_then(|r| r.get(core)) else { return };
+    let Some(row) = VOLS.get().and_then(|r| r.get(core)) else {
+        return;
+    };
     for slot in row.0.iter() {
         slot.store(0, Ordering::Relaxed);
     }
@@ -284,7 +298,11 @@ fn handle(mut s: TcpStream) {
         }
     }
 
-    let line = std::str::from_utf8(&head).unwrap_or("").lines().next().unwrap_or("");
+    let line = std::str::from_utf8(&head)
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("");
     let mut words = line.split(' ');
     let method = words.next().unwrap_or("");
     let path = words.next().unwrap_or("").split('?').next().unwrap_or("");
@@ -327,7 +345,10 @@ mod tests {
                 seen.push(name);
                 last = name;
             }
-            assert!(name.starts_with("racer_"), "{name} is missing the namespace");
+            assert!(
+                name.starts_with("racer_"),
+                "{name} is missing the namespace"
+            );
             assert!(help.ends_with('.'), "{name} help should be a sentence");
         }
     }
@@ -336,8 +357,14 @@ mod tests {
     fn exposition_covers_every_row() {
         let text = encode();
         for &(name, labels, _, _) in TABLE {
-            assert!(text.contains(&format!("# TYPE {name} ")), "no TYPE for {name}");
-            assert!(text.contains(&format!("\n{name}{labels} 0\n")), "no sample for {name}{labels}");
+            assert!(
+                text.contains(&format!("# TYPE {name} ")),
+                "no TYPE for {name}"
+            );
+            assert!(
+                text.contains(&format!("\n{name}{labels} 0\n")),
+                "no sample for {name}{labels}"
+            );
         }
     }
 
@@ -349,10 +376,19 @@ mod tests {
         publish_volumes(0, &[(0, 7, 3, 1), (5, 9, 0, 0)]);
         publish_volumes(1, &[(0, 7, 4, 6)]);
         let text = encode();
-        assert!(text.contains("\nracer_volume_live_pages{volume=\"7\"} 7\n"), "{text}");
-        assert!(text.contains("\nracer_volume_tombstones{volume=\"7\"} 7\n"), "{text}");
+        assert!(
+            text.contains("\nracer_volume_live_pages{volume=\"7\"} 7\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nracer_volume_tombstones{volume=\"7\"} 7\n"),
+            "{text}"
+        );
         // Named by one core only, so it is present but contributes nothing.
-        assert!(text.contains("\nracer_volume_live_pages{volume=\"9\"} 0\n"), "{text}");
+        assert!(
+            text.contains("\nracer_volume_live_pages{volume=\"9\"} 0\n"),
+            "{text}"
+        );
         // A slot no configuration has named is not a series at all.
         assert!(!text.contains("volume=\"0\""), "{text}");
     }

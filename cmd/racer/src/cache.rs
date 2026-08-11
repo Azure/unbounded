@@ -179,7 +179,10 @@ impl Roster {
         nodes.push(cfg.node.id);
         nodes.sort_unstable();
         nodes.dedup();
-        Roster { me: cfg.node.id, nodes: nodes.into_boxed_slice() }
+        Roster {
+            me: cfg.node.id,
+            nodes: nodes.into_boxed_slice(),
+        }
     }
 }
 
@@ -275,7 +278,13 @@ impl Store {
         // A fresh entry starts with a clear reference bit: it already passed admission,
         // and a grace period would make the hand step over genuinely hot entries to
         // reach it.
-        self.slots[i as usize] = Slot { addr, reg, used: false, live: false, busy: true };
+        self.slots[i as usize] = Slot {
+            addr,
+            reg,
+            used: false,
+            live: false,
+            busy: true,
+        };
         Some(i)
     }
 
@@ -401,14 +410,20 @@ pub fn open(alloc: &'static Allocator, cores: usize) -> &'static Cache {
 /// measured rate is what makes zipf work — the head gets wide, the long tail gets zero,
 /// and the total replica count stays sublinear in the key space.
 fn width(q: u8, tau: u8, cap: u8) -> u8 {
-    u8::try_from((q as u32).div_ceil(tau as u32)).unwrap_or(u8::MAX).min(cap)
+    u8::try_from((q as u32).div_ceil(tau as u32))
+        .unwrap_or(u8::MAX)
+        .min(cap)
 }
 
 /// Hysteresis: raise fast, lower one step at a time. Rendezvous nesting means a one-step
 /// change churns only the boundary replica, so damping the descent is the whole of the
 /// anti-oscillation story.
 fn damp(cur: u8, w: u8) -> u8 {
-    if w >= cur { w } else { cur.saturating_sub(1).max(w) }
+    if w >= cur {
+        w
+    } else {
+        cur.saturating_sub(1).max(w)
+    }
 }
 
 /// Core `c`'s contiguous share of `total` slots. Contiguous rather than striped so a
@@ -493,13 +508,17 @@ impl Cache {
         if !self.enabled() {
             return 0;
         }
-        let Ok(owner) = self.alloc.owner_core(addr) else { return 0 };
+        let Ok(owner) = self.alloc.owner_core(addr) else {
+            return 0;
+        };
         runtime::on_core(owner, move || async move { self.observe_local(addr) }).await
     }
 
     /// `W_max = min(cohort_size, 64)`.
     fn w_max(&self) -> u8 {
-        u8::try_from(self.roster.get().nodes.len()).unwrap_or(W_CAP).min(W_CAP)
+        u8::try_from(self.roster.get().nodes.len())
+            .unwrap_or(W_CAP)
+            .min(W_CAP)
     }
 
     /// Admission filter: the same sketch used TinyLFU-style, so a one-hit wonder never
@@ -605,7 +624,8 @@ impl Cache {
         if !self.enabled() {
             return None;
         }
-        self.load_at(addr, huge, off, buf, Some(self.live_version(addr))).await
+        self.load_at(addr, huge, off, buf, Some(self.live_version(addr)))
+            .await
     }
 
     /// What our cached copy of `addr` claims, with no bytes moved: the register half of
@@ -643,7 +663,11 @@ impl Cache {
     ) -> Option<Register> {
         let owner = self.alloc.owner_core(addr).ok()?;
         let (class, base, slot, reg) =
-            runtime::on_core(owner, move || async move { self.find_here(addr, huge, want) }).await?;
+            runtime::on_core(
+                owner,
+                move || async move { self.find_here(addr, huge, want) },
+            )
+            .await?;
         if off as u64 + buf.len() as u64 > class.bytes() {
             return None;
         }
@@ -687,15 +711,28 @@ impl Cache {
     /// Declines silently — not one of the `w` replicas, not hot enough, device under
     /// pressure, or every slot being written. The cache never fails a write, it declines
     /// one.
-    pub async fn admit(&'static self, addr: GlobalAddr, huge: bool, buf: Buf, reg: Register, w: u8) {
+    pub async fn admit(
+        &'static self,
+        addr: GlobalAddr,
+        huge: bool,
+        buf: Buf,
+        reg: Register,
+        w: u8,
+    ) {
         if !self.enabled() || !self.holds(addr, w) {
             return;
         }
-        let Ok(owner) = self.alloc.owner_core(addr) else { return };
+        let Ok(owner) = self.alloc.owner_core(addr) else {
+            return;
+        };
         // Claim on the owning core, write here, then report back: the buffer's
         // registration belongs to this core's ring and cannot travel (see `load_at`).
         let Some((class, base, slot)) =
-            runtime::on_core(owner, move || async move { self.claim_here(addr, huge, reg) }).await
+            runtime::on_core(
+                owner,
+                move || async move { self.claim_here(addr, huge, reg) },
+            )
+            .await
         else {
             return;
         };
@@ -703,7 +740,10 @@ impl Cache {
         // these bytes after a restart.
         let ok = buf.len() as u64 == class.bytes() && {
             let off = self.geo.cache_off(class, base + slot);
-            self.disk.write(off, buf, Durability::Buffered).await.is_ok()
+            self.disk
+                .write(off, buf, Durability::Buffered)
+                .await
+                .is_ok()
         };
         runtime::on_core(owner, move || async move {
             self.local().stores[Cache::class(huge)].finish(slot, ok);
@@ -737,7 +777,9 @@ impl Cache {
 
     /// Drop an entry that failed confirmation. Cheap enough to call speculatively.
     pub async fn forget(&'static self, addr: GlobalAddr, huge: bool) {
-        let Ok(owner) = self.alloc.owner_core(addr) else { return };
+        let Ok(owner) = self.alloc.owner_core(addr) else {
+            return;
+        };
         runtime::on_core(owner, move || async move {
             let k = Cache::class(huge);
             self.local().stores[k].forget(addr.0);
@@ -841,7 +883,11 @@ mod tests {
         let nodes: Vec<u32> = (1..=8).collect();
         let mut hits = [0usize; 9];
         for addr in 0..4096u64 {
-            let best = nodes.iter().copied().max_by_key(|&n| rank(addr, n)).unwrap();
+            let best = nodes
+                .iter()
+                .copied()
+                .max_by_key(|&n| rank(addr, n))
+                .unwrap();
             hits[best as usize] += 1;
         }
         for n in &nodes {

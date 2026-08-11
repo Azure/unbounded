@@ -201,7 +201,9 @@ impl Fabric {
     }
 
     pub(super) fn set_sleeping(&self, me: usize) {
-        self.states[me].state.store(STATE_SLEEPING, Ordering::SeqCst);
+        self.states[me]
+            .state
+            .store(STATE_SLEEPING, Ordering::SeqCst);
     }
 
     pub(super) fn set_running(&self, me: usize) {
@@ -472,7 +474,11 @@ where
         _t: PhantomData,
     };
     let id = worker::with_local(|l| {
-        let id = l.hops.borrow_mut().alloc().expect("hop task slab exhausted");
+        let id = l
+            .hops
+            .borrow_mut()
+            .alloc()
+            .expect("hop task slab exhausted");
         let p = l.hops.borrow().data_ptr(id) as *mut HopJob<Fut, T>;
         // SAFETY: slot is exclusively ours and large enough per the const asserts.
         unsafe { p.write(job) };
@@ -539,7 +545,10 @@ where
                     const { assert!(align_of::<F>() <= 64) };
                     let (cell, src) = worker::with_local(|l| {
                         (
-                            l.cells.borrow_mut().alloc().expect("hop cell slab exhausted"),
+                            l.cells
+                                .borrow_mut()
+                                .alloc()
+                                .expect("hop cell slab exhausted"),
                             l.core as u16,
                         )
                     });

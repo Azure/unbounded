@@ -123,7 +123,12 @@ where
 
     /// Starts a request. The slot index is fixed by (device, queue, tag), so there is
     /// no allocation and no free list.
-    pub(super) fn start(&mut self, id: u32, cfg: Cfg<H::Config>, req: Request) -> Option<Result<(), Errno>> {
+    pub(super) fn start(
+        &mut self,
+        id: u32,
+        cfg: Cfg<H::Config>,
+        req: Request,
+    ) -> Option<Result<(), Errno>> {
         let s = &mut self.slots[id as usize];
         debug_assert!(!s.used, "request slot reused while live");
         s.used = true;

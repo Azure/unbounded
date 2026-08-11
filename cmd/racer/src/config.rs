@@ -186,7 +186,14 @@ impl Volume {
             acc += e.pages;
             starts.push(acc);
         }
-        Volume { id, slot, huge, extents, tombstone_epoch, starts }
+        Volume {
+            id,
+            slot,
+            huge,
+            extents,
+            tombstone_epoch,
+            starts,
+        }
     }
 
     /// The site this volume is homed in: the top 8 bits of its id.
@@ -397,7 +404,9 @@ impl Config {
     /// The two agree on a node whose ceiling the control plane has filled.
     fn count_pages(&self, huge: bool) -> u64 {
         let share = self.node.max_share_slots.min(SLOTS as u32) as u64;
-        self.zone_pages(huge).saturating_mul(share).div_ceil(SLOTS as u64)
+        self.zone_pages(huge)
+            .saturating_mul(share)
+            .div_ceil(SLOTS as u64)
     }
 
     /// Pages this zone is responsible for, by class: extents homed here, plus those
@@ -427,8 +436,15 @@ impl Config {
     /// its membership does.
     pub(crate) fn share_slots(&self) -> u32 {
         let t = &self.topology;
-        let mine: Vec<bool> = t.catalog.iter().map(|g| g.contains(&self.node.id)).collect();
-        t.group_slots.iter().filter(|&&g| *mine.get(g as usize).unwrap_or(&false)).count() as u32
+        let mine: Vec<bool> = t
+            .catalog
+            .iter()
+            .map(|g| g.contains(&self.node.id))
+            .collect();
+        t.group_slots
+            .iter()
+            .filter(|&&g| *mine.get(g as usize).unwrap_or(&false))
+            .count() as u32
     }
 
     /// The consensus group owning `addr`: the slot the address hashes into names it.
@@ -482,7 +498,8 @@ impl Config {
     /// volume covers, which is the same as a volume that has never collected: callers
     /// on a write path reject an unmapped address before they ever get here.
     pub(crate) fn tombstone_epoch_of(&self, addr: u64) -> u64 {
-        self.volume((addr >> 32) as u32).map_or(0, |v| v.tombstone_epoch)
+        self.volume((addr >> 32) as u32)
+            .map_or(0, |v| v.tombstone_epoch)
     }
 
     /// Whether any volume has ever collected. The sweep is a no-op until one has.
@@ -493,7 +510,11 @@ impl Config {
     /// Our own link into `site`, if we hold one — the crossing itself. Two crossings
     /// into one site are legal; this takes the first in config order.
     pub(crate) fn crossing_to(&self, site: u32) -> Option<u32> {
-        self.node.peers.iter().find(|p| p.site == Some(site)).map(|p| p.id)
+        self.node
+            .peers
+            .iter()
+            .find(|p| p.site == Some(site))
+            .map(|p| p.id)
     }
 
     /// A peer that will carry a page homed in `site` for us. Hashed over the peers named
@@ -508,7 +529,12 @@ impl Config {
         if n == 0 {
             return None;
         }
-        self.node.peers.iter().filter(named).nth(mix(addr) as usize % n).map(|p| p.id)
+        self.node
+            .peers
+            .iter()
+            .filter(named)
+            .nth(mix(addr) as usize % n)
+            .map(|p| p.id)
     }
 
     // ---------------------------------------------------------------- validation
@@ -596,7 +622,10 @@ impl Config {
             }
             for &s in &p.gateway_for {
                 if s == self.node.site {
-                    return Err(bad(format!("peer {} is gateway for this node's own site", p.id)));
+                    return Err(bad(format!(
+                        "peer {} is gateway for this node's own site",
+                        p.id
+                    )));
                 }
                 if s > 255 {
                     return Err(bad(format!("peer {} gateway_for {s} is not 0..255", p.id)));
@@ -626,12 +655,18 @@ impl Config {
                 t.group_slots.len()
             )));
         }
-        if let Some(&s) = t.group_slots.iter().find(|&&s| s as usize >= t.catalog.len()) {
+        if let Some(&s) = t
+            .group_slots
+            .iter()
+            .find(|&&s| s as usize >= t.catalog.len())
+        {
             return Err(bad(format!("group slot {s} is not in the catalog")));
         }
         for z in &t.zones {
             if z.id == 0 {
-                return Err(bad("zone 0 is reserved (next_zone 0 means 'not migrating')"));
+                return Err(bad(
+                    "zone 0 is reserved (next_zone 0 means 'not migrating')",
+                ));
             }
             if z.id == self.node.zone {
                 return Err(bad(format!("zone {} is this node's own zone", z.id)));
@@ -689,7 +724,12 @@ impl Config {
             )));
         }
         if v.slot as usize >= MAX_VOLUMES {
-            return Err(bad(format!("volume {} slot {} is above {}", v.id, v.slot, MAX_VOLUMES - 1)));
+            return Err(bad(format!(
+                "volume {} slot {} is above {}",
+                v.id,
+                v.slot,
+                MAX_VOLUMES - 1
+            )));
         }
         if v.extents.is_empty() {
             return Err(bad(format!("volume {} has no extents", v.id)));
@@ -745,7 +785,9 @@ impl Config {
         // groups' digests, and there is no mover between groups to repair it with.
         // Capacity moves by changing who is *in* a group, which leaves all three alone.
         if self.topology.group_slots != prev.topology.group_slots {
-            return Err(bad("group slots changed; the slot table is fixed for the zone"));
+            return Err(bad(
+                "group slots changed; the slot table is fixed for the zone",
+            ));
         }
         // The catalog moves one node at a time, so at most one group may differ; a
         // larger step would put two groups in flux at once.
@@ -762,12 +804,20 @@ impl Config {
             .zip(&prev.topology.catalog)
             .filter(|(a, b)| a != b)
             .count()
-            + self.topology.catalog.len().abs_diff(prev.topology.catalog.len());
+            + self
+                .topology
+                .catalog
+                .len()
+                .abs_diff(prev.topology.catalog.len());
         if adjacent && changed > 1 {
-            return Err(bad(format!("{changed} catalog groups differ; at most one may change")));
+            return Err(bad(format!(
+                "{changed} catalog groups differ; at most one may change"
+            )));
         }
         for old in &prev.volumes {
-            let Some(new) = self.volume(old.id) else { continue };
+            let Some(new) = self.volume(old.id) else {
+                continue;
+            };
             self.check_replacement(old, new)?;
         }
         Ok(())
@@ -854,7 +904,13 @@ impl Config {
                 });
             }
             let huge = huge.unwrap_or(false);
-            volumes.push(Volume::new(id, slot, huge, extents, v.tombstone_epoch as u64));
+            volumes.push(Volume::new(
+                id,
+                slot,
+                huge,
+                extents,
+                v.tombstone_epoch as u64,
+            ));
         }
         volumes.sort_by_key(|v| v.slot);
 
@@ -875,7 +931,9 @@ impl Config {
             .map_err(|_| bad(format!("unknown cohort {cohort}")))? as u8;
         let dev = n.device.unwrap_or_default();
         let policy = p.policy.map_or_else(Policy::default, |q| Policy {
-            max_index_bytes: q.max_index_bytes.unwrap_or(Policy::default().max_index_bytes),
+            max_index_bytes: q
+                .max_index_bytes
+                .unwrap_or(Policy::default().max_index_bytes),
             occ_bytes: q.occ_bytes.unwrap_or(Policy::default().occ_bytes),
             cache_target_rate: q.cache_target_rate,
             repairs_per_replay: q
@@ -910,7 +968,10 @@ impl Config {
                 zones: t
                     .zones
                     .into_iter()
-                    .map(|z| Zone { id: z.id, entry: trio(&z.entry.unwrap_or_default()) })
+                    .map(|z| Zone {
+                        id: z.id,
+                        entry: trio(&z.entry.unwrap_or_default()),
+                    })
                     .collect(),
             },
             volumes,
@@ -954,7 +1015,10 @@ impl Config {
                     .topology
                     .zones
                     .iter()
-                    .map(|z| pb::Zone { id: z.id, entry: Some(pb_trio(&z.entry)) })
+                    .map(|z| pb::Zone {
+                        id: z.id,
+                        entry: Some(pb_trio(&z.entry)),
+                    })
                     .collect(),
             }),
             volumes: self
@@ -1031,8 +1095,16 @@ impl Config {
                     let f = only(
                         &f,
                         &[
-                            "id", "site", "zone", "cohort", "device", "cache_4k", "cache_4m",
-                            "max_iops", "max_bps", "max_share",
+                            "id",
+                            "site",
+                            "zone",
+                            "cohort",
+                            "device",
+                            "cache_4k",
+                            "cache_4m",
+                            "max_iops",
+                            "max_bps",
+                            "max_share",
                         ],
                     )
                     .map_err(at)?;
@@ -1078,18 +1150,21 @@ impl Config {
                     });
                 }
                 "policy" => {
-                    let f =
-                        only(&f, &[
-                        "max_index_bytes",
-                        "occ_bytes",
-                        "cache_target_rate",
-                        "repairs_per_replay",
-                    ])
+                    let f = only(
+                        &f,
+                        &[
+                            "max_index_bytes",
+                            "occ_bytes",
+                            "cache_target_rate",
+                            "repairs_per_replay",
+                        ],
+                    )
                     .map_err(at)?;
                     // Absent means the default, which is not the same as zero.
                     policy.max_index_bytes = opt(f, "max_index_bytes").map_err(at)?;
                     policy.occ_bytes = opt(f, "occ_bytes").map_err(at)?;
-                    policy.cache_target_rate = get_or(f, "cache_target_rate", 0).map_err(at)? as u32;
+                    policy.cache_target_rate =
+                        get_or(f, "cache_target_rate", 0).map_err(at)? as u32;
                     policy.repairs_per_replay =
                         opt(f, "repairs_per_replay").map_err(at)?.map(|v| v as u32);
                 }
@@ -1159,7 +1234,9 @@ fn only<'a, 'b>(
 }
 
 fn ids(rest: &[&str]) -> io::Result<Vec<u32>> {
-    rest.iter().map(|s| s.parse::<u32>().map_err(|_| bad("expected a node id"))).collect()
+    rest.iter()
+        .map(|s| s.parse::<u32>().map_err(|_| bad("expected a node id")))
+        .collect()
 }
 
 fn as_trio(v: Vec<u32>) -> io::Result<pb::Trio> {
@@ -1218,7 +1295,10 @@ fn named<T>(
 fn list(f: &[(&str, &str)], k: &str) -> io::Result<Vec<u32>> {
     text_field(f, k)?
         .split(',')
-        .map(|s| s.parse::<u32>().map_err(|_| bad(format!("field {k} is not a node id list"))))
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|_| bad(format!("field {k} is not a node id list")))
+        })
         .collect()
 }
 
@@ -1235,7 +1315,11 @@ fn trio(t: &pb::Trio) -> [u32; 3] {
 }
 
 fn pb_trio(t: &[u32; 3]) -> pb::Trio {
-    pb::Trio { cohort_0: t[0], cohort_1: t[1], cohort_2: t[2] }
+    pb::Trio {
+        cohort_0: t[0],
+        cohort_1: t[1],
+        cohort_2: t[2],
+    }
 }
 
 /// A cheap avalanche so that adjacent addresses land in unrelated slots. Any fixed
@@ -1265,7 +1349,10 @@ struct Watch {
 
 impl Watch {
     fn new(path: &Path) -> io::Result<Watch> {
-        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         let name = path
             .file_name()
             .ok_or_else(|| bad("config path has no file name"))?
@@ -1288,12 +1375,20 @@ impl Watch {
     fn drain(&self) -> io::Result<()> {
         let mut buf = [0u64; 512];
         loop {
-            let mut p = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            let mut p = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             let ready = unsafe { libc::poll(&mut p, 1, 0) };
             let n = match ready {
                 0 => return Ok(()),
                 r if r > 0 => unsafe {
-                    libc::read(self.fd, buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf))
+                    libc::read(
+                        self.fd,
+                        buf.as_mut_ptr().cast(),
+                        std::mem::size_of_val(&buf),
+                    )
                 },
                 _ => -1,
             };
@@ -1314,7 +1409,11 @@ impl Watch {
         let mut buf = [0u64; 512];
         loop {
             let n = unsafe {
-                libc::read(self.fd, buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf))
+                libc::read(
+                    self.fd,
+                    buf.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buf),
+                )
             };
             if n < 0 {
                 let e = io::Error::last_os_error();
@@ -1329,9 +1428,8 @@ impl Watch {
             let mut hit = false;
             while off + hdr <= n as usize {
                 let ev = unsafe { std::ptr::read(base.add(off).cast::<libc::inotify_event>()) };
-                let name = unsafe {
-                    std::slice::from_raw_parts(base.add(off + hdr), ev.len as usize)
-                };
+                let name =
+                    unsafe { std::slice::from_raw_parts(base.add(off + hdr), ev.len as usize) };
                 // The name is NUL-padded to an alignment boundary.
                 let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
                 hit |= name == self.name;
@@ -1378,7 +1476,10 @@ pub fn watch(
         if next.generation <= current.generation {
             break;
         }
-        if let Err(e) = next.validate().and_then(|()| next.validate_against(&current)) {
+        if let Err(e) = next
+            .validate()
+            .and_then(|()| next.validate_against(&current))
+        {
             reject(path, e);
             break;
         }
@@ -1399,7 +1500,10 @@ pub fn watch(
                 continue;
             }
         };
-        if let Err(e) = next.validate().and_then(|()| next.validate_against(&current)) {
+        if let Err(e) = next
+            .validate()
+            .and_then(|()| next.validate_against(&current))
+        {
             reject(path, e);
             continue;
         }
@@ -1537,10 +1641,16 @@ mod tests {
         let home = ((1u64 << 24 | 5) << 32) | 7;
         let far = ((2u64 << 24 | 5) << 32) | 7;
         assert_eq!(c.site_of(home), Some(1), "the site is the id, not a lookup");
-        assert_eq!(c.site_of(far), None, "a volume we do not carry has no site here");
+        assert_eq!(
+            c.site_of(far),
+            None,
+            "a volume we do not carry has no site here"
+        );
 
         // Cross-site load shards over the peers named for that site, deterministically.
-        let picked: Vec<u32> = (0..64).map(|p| c.gateway_to(2, home | p).unwrap()).collect();
+        let picked: Vec<u32> = (0..64)
+            .map(|p| c.gateway_to(2, home | p).unwrap())
+            .collect();
         assert!([9, 10].iter().all(|g| picked.contains(g)));
         assert_eq!(c.gateway_to(2, home), c.gateway_to(2, home));
         assert_eq!(c.gateway_to(3, home), None, "no peer carries site 3");
@@ -1548,7 +1658,8 @@ mod tests {
         // A volume homed elsewhere is legal, but only with a peer that reaches it.
         let mut away = c.clone();
         away.volumes[0].id = (2 << 24) | 5;
-        away.validate().expect("a foreign volume routes through a peer named for its site");
+        away.validate()
+            .expect("a foreign volume routes through a peer named for its site");
         for p in &mut away.node.peers {
             p.gateway_for.clear();
         }
@@ -1571,13 +1682,23 @@ mod tests {
         .unwrap();
         wan.validate().unwrap();
         assert_eq!(wan.crossing_to(2), Some(40));
-        assert_eq!(wan.crossing_to(1), None, "our own site is not across anything");
+        assert_eq!(
+            wan.crossing_to(1),
+            None,
+            "our own site is not across anything"
+        );
         let mut own = wan.clone();
         own.node.peers[0].site = Some(1);
-        assert!(own.validate().is_err(), "a crossing that lands where it started");
+        assert!(
+            own.validate().is_err(),
+            "a crossing that lands where it started"
+        );
         let mut own = wan.clone();
         own.node.peers[0].gateway_for = vec![1];
-        assert!(own.validate().is_err(), "nor is a peer our way into our own site");
+        assert!(
+            own.validate().is_err(),
+            "nor is a peer our way into our own site"
+        );
     }
 
     /// The point of dissolving the role: a node in the catalog may also hold a crossing.
@@ -1600,13 +1721,18 @@ mod tests {
             (1u32 << 24) | 5
         ))
         .unwrap();
-        c.validate().expect("a catalog member holding a crossing is an ordinary node");
+        c.validate()
+            .expect("a catalog member holding a crossing is an ordinary node");
         assert_eq!(c.node.cohort, 2, "and has a cohort, so a cache roster too");
         assert!(c.topology.catalog[0].contains(&c.node.id));
         // Our own crossing wins: we are already the hop that leaves the site.
         let addr = ((2u64 << 24 | 5) << 32) | 7;
         assert_eq!(c.crossing_to(2), Some(2));
-        assert_eq!(c.gateway_to(2, addr), Some(3), "the hand-off is still there to take");
+        assert_eq!(
+            c.gateway_to(2, addr),
+            Some(3),
+            "the hand-off is still there to take"
+        );
     }
 
     /// A migration is named by an extent, and the dataplane must be able to say both
@@ -1619,7 +1745,11 @@ mod tests {
         c.validate().unwrap();
 
         let at = |page: u64| (1u64 << 32) | page;
-        assert_eq!(c.next_zone_of(at(99)), None, "an extent staying put is not moving");
+        assert_eq!(
+            c.next_zone_of(at(99)),
+            None,
+            "an extent staying put is not moving"
+        );
         assert_eq!(c.next_zone_of(at(100)), Some(2));
         assert_eq!(c.next_zone_of(at(149)), Some(2));
         assert_eq!(c.next_zone_of(at(150)), None, "past the end of the volume");
@@ -1651,7 +1781,9 @@ mod tests {
     #[test]
     fn stays_small() {
         let mut c = sample();
-        c.topology.catalog = (0..300).map(|i| [3 * i + 1, 3 * i + 2, 3 * i + 3]).collect();
+        c.topology.catalog = (0..300)
+            .map(|i| [3 * i + 1, 3 * i + 2, 3 * i + 3])
+            .collect();
         c.topology.group_slots = (0..SLOTS).map(|i| (i % 300) as u32).collect();
         assert!(c.encode().len() < 100 << 10, "{} B", c.encode().len());
     }
@@ -1748,7 +1880,10 @@ mod tests {
         c.topology.group_slots[0] = 1 - c.topology.group_slots[0];
         assert!(c.validate_against(&a).is_err());
         c.generation = 99;
-        assert!(c.validate_against(&a).is_err(), "a gap is not a licence to rehash");
+        assert!(
+            c.validate_against(&a).is_err(),
+            "a gap is not a licence to rehash"
+        );
     }
 
     /// A node's capacity is the share of its zone's slots that point at a group it is a
@@ -1797,7 +1932,10 @@ mod tests {
         let mut c = b.clone();
         c.generation = 9;
         c.volumes[0].tombstone_epoch = 4;
-        assert!(c.validate_against(&b).is_err(), "a decrease strands every live page");
+        assert!(
+            c.validate_against(&b).is_err(),
+            "a decrease strands every live page"
+        );
     }
 
     #[test]
@@ -1848,7 +1986,12 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let p = path.clone();
-        let t = std::thread::spawn(move || watch(&p, sample(), move |c| Ok(tx.send(c.generation).unwrap())));
+        let t = std::thread::spawn(move || {
+            watch(&p, sample(), move |c| {
+                tx.send(c.generation).unwrap();
+                Ok(())
+            })
+        });
 
         let put = |g: u64, f: &dyn Fn(&mut Config)| {
             let mut c = sample();

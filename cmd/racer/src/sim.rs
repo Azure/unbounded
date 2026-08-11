@@ -92,13 +92,33 @@ impl Device {
 enum What {
     /// A storage transfer, performed at completion time so overlapping IO to one block
     /// interleaves the way the device would.
-    Disk { who: Who, dev: u32, read: bool, off: u64, addr: u64, len: u32 },
+    Disk {
+        who: Who,
+        dev: u32,
+        read: bool,
+        off: u64,
+        addr: u64,
+        len: u32,
+    },
     /// A frame arriving at a peer. The payload is read out of the sender's buffer at
     /// delivery, not at submission, because that is when the transport reads it: a
     /// sender that recycles the buffer first puts whatever is there now on the wire.
-    Send { from: Who, to: u32, read: bool, lba: u64, back: u64, len: u32, tries: u32 },
+    Send {
+        from: Who,
+        to: u32,
+        read: bool,
+        lba: u64,
+        back: u64,
+        len: u32,
+        tries: u32,
+    },
     /// A result travelling back to the op's submitter, with the payload for a read.
-    Reply { who: Who, res: i32, back: u64, wire: Option<Vec<u8>> },
+    Reply {
+        who: Who,
+        res: i32,
+        back: u64,
+        wire: Option<Vec<u8>>,
+    },
     /// A `sleep` expiring, or a link timeout firing.
     Wake { who: Who, res: i32 },
     /// Nothing but a step of virtual time, so an idle cluster still runs maintenance.
@@ -220,7 +240,11 @@ impl Shared {
     fn at(&self, delay_us: u64, what: What) {
         let seq = self.seq.get();
         self.seq.set(seq + 1);
-        self.evs.borrow_mut().push(Reverse(Ev { at: self.now.get() + delay_us, seq, what }));
+        self.evs.borrow_mut().push(Reverse(Ev {
+            at: self.now.get() + delay_us,
+            seq,
+            what,
+        }));
     }
 
     /// How many times the allocation holding `addr` has been handed out. Zero for
@@ -269,7 +293,12 @@ pub(crate) fn device(path: &Path) -> std::io::Result<u32> {
     };
     let mut devs = s.devs.borrow_mut();
     let id = devs.len() as u32;
-    devs.push(Device { node, fabric, blocks: BTreeMap::new(), ops: 0 });
+    devs.push(Device {
+        node,
+        fabric,
+        blocks: BTreeMap::new(),
+        ops: 0,
+    });
     s.paths.borrow_mut().insert(path.to_path_buf(), id);
     Ok(id)
 }
@@ -332,7 +361,12 @@ pub(crate) fn copy_req(
 pub(crate) fn sleep(d: Duration, idx: u32, seq: u16) {
     let s = shared();
     let (node, core) = s.here.get();
-    let who = Who { node, core, idx, seq };
+    let who = Who {
+        node,
+        core,
+        idx,
+        seq,
+    };
     s.live.borrow_mut().insert(who);
     s.at(d.as_micros() as u64, What::Wake { who, res: 0 });
 }
@@ -346,12 +380,17 @@ pub(crate) fn submit(
     addr: u64,
     len: u32,
     timeout: Option<Duration>,
-    idx: u32,
-    seq: u16,
+    completion: (u32, u16),
 ) {
     let s = shared();
     let (node, core) = s.here.get();
-    let who = Who { node, core, idx, seq };
+    let (idx, seq) = completion;
+    let who = Who {
+        node,
+        core,
+        idx,
+        seq,
+    };
     s.live.borrow_mut().insert(who);
     s.held.borrow_mut().insert(who, s.generation(addr));
     let read = matches!(kind, Kind::Read);
@@ -359,7 +398,13 @@ pub(crate) fn submit(
     // The timeout is armed alongside: whichever event reaches the slab first wins, and
     // the other finds the op already gone.
     if let Some(t) = timeout {
-        s.at(t.as_micros() as u64, What::Wake { who, res: -libc::ETIME });
+        s.at(
+            t.as_micros() as u64,
+            What::Wake {
+                who,
+                res: -libc::ETIME,
+            },
+        );
     }
 
     let (peer, fabric) = {
@@ -374,7 +419,12 @@ pub(crate) fn submit(
             // Lost: only the timeout can finish this op now, which is the point.
             return;
         }
-        let lat = lat + if s.faults.borrow().slow(node, peer) { SLOW_US } else { 0 };
+        let lat = lat
+            + if s.faults.borrow().slow(node, peer) {
+                SLOW_US
+            } else {
+                0
+            };
         let lba = off / BLOCK as u64;
         // The transport splits anything above the peer's MDTS. The target sees the
         // pieces as separate requests at consecutive LBAs inside the frame's footprint,
@@ -406,7 +456,17 @@ pub(crate) fn submit(
             s.at(delay, e);
         }
     } else {
-        s.at(lat, What::Disk { who, dev, read, off, addr, len });
+        s.at(
+            lat,
+            What::Disk {
+                who,
+                dev,
+                read,
+                off,
+                addr,
+                len,
+            },
+        );
     }
 }
 
@@ -420,7 +480,12 @@ enum Use {
     Client(u64),
     /// A frame from a peer, owed a reply. `wire` is the simulator's copy of the payload,
     /// and is what the handler runs against.
-    Frame { origin: Who, read: bool, wire: Box<[u8]>, back: u64 },
+    Frame {
+        origin: Who,
+        read: bool,
+        wire: Box<[u8]>,
+        back: u64,
+    },
 }
 
 struct NodeState {
@@ -503,7 +568,10 @@ pub struct Sim {
 impl Sim {
     pub fn new(opts: Options) -> std::io::Result<Sim> {
         assert!(opts.nodes >= 3, "consensus needs three nodes");
-        assert!((opts.mdts as usize).is_multiple_of(BLOCK), "mdts must be a whole number of blocks");
+        assert!(
+            (opts.mdts as usize).is_multiple_of(BLOCK),
+            "mdts must be a whole number of blocks"
+        );
         raise_files();
         let s = Rc::new(Shared {
             now: Cell::new(0),
@@ -606,7 +674,10 @@ impl Sim {
         t.push_str(&format!("extent pages={} kind=lww zone=1\n", o.pages));
         if o.huge_pages > 0 {
             t.push_str(&format!("volume {HUGE} slot=2\n"));
-            t.push_str(&format!("extent pages={} kind=immutable_4m zone=1\n", o.huge_pages));
+            t.push_str(&format!(
+                "extent pages={} kind=immutable_4m zone=1\n",
+                o.huge_pages
+            ));
         }
         t
     }
@@ -628,8 +699,12 @@ impl Sim {
         for c in 0..cores {
             workers.at(c).publish(1, dp);
         }
-        n.free = (0..cores).map(|_| (0..slots_per_worker()).collect()).collect();
-        n.slots = (0..cores).map(|_| (0..slots_per_worker()).map(|_| None).collect()).collect();
+        n.free = (0..cores)
+            .map(|_| (0..slots_per_worker()).collect())
+            .collect();
+        n.slots = (0..cores)
+            .map(|_| (0..slots_per_worker()).map(|_| None).collect())
+            .collect();
         n.workers = Some(workers);
         n.node = Some(node);
         n.dp = dp;
@@ -658,8 +733,12 @@ impl Sim {
         self.s.owed.borrow_mut().retain(|w, _| w.node != id);
         self.s.held.borrow_mut().retain(|w, _| w.node != id);
         // Its in-flight client requests can never complete, so fail them now.
-        let lost: Vec<u64> =
-            self.pending.iter().filter(|(_, p)| p.node == i).map(|(&k, _)| k).collect();
+        let lost: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.node == i)
+            .map(|(&k, _)| k)
+            .collect();
         for k in lost {
             if let Some(p) = self.pending.remove(&k) {
                 self.put_buf(p.buf);
@@ -733,12 +812,12 @@ impl Sim {
             return false;
         };
         let path = Path::new(&self.nodes[node].cfg.node.device);
-        let Some(&dev) = self.s.paths.borrow().get(path) else { return false };
+        let Some(&dev) = self.s.paths.borrow().get(path) else {
+            return false;
+        };
         let mut page = [0u8; BLOCK];
-        self.s.devs.borrow()[dev as usize].read(
-            geo.slot_off(Class::Small, slot) / BLOCK as u64,
-            &mut page,
-        );
+        self.s.devs.borrow()[dev as usize]
+            .read(geo.slot_off(Class::Small, slot) / BLOCK as u64, &mut page);
         layout::page_crc(entry.addr, entry.version, &page) == entry.data_crc
     }
 
@@ -761,11 +840,16 @@ impl Sim {
             let mut best: Option<(u64, [u8; BLOCK])> = None;
             for copy in 0..2u8 {
                 raw_read(dev, geo.mblock_off(Class::Small, id, copy), &mut raw).ok()?;
-                let Some(h) = layout::get_header(&raw) else { continue };
+                let Some(h) = layout::get_header(&raw) else {
+                    continue;
+                };
                 if h.class != Class::Small || h.mblock_id != id {
                     continue;
                 }
-                if best.as_ref().is_none_or(|(generation, _)| h.generation > *generation) {
+                if best
+                    .as_ref()
+                    .is_none_or(|(generation, _)| h.generation > *generation)
+                {
                     best = Some((h.generation, raw));
                 }
             }
@@ -822,7 +906,17 @@ impl Sim {
         };
         let b = sim_buf(0, buf.as_ptr() as u64, len as u32);
         self.pending.insert(id, Pending { buf, node: i });
-        self.start(i, core, Use::Client(id), Request { vol, op, lba, buf: b });
+        self.start(
+            i,
+            core,
+            Use::Client(id),
+            Request {
+                vol,
+                op,
+                lba,
+                buf: b,
+            },
+        );
         id
     }
 
@@ -874,7 +968,9 @@ impl Sim {
                 Use::Client(id) => {
                     self.results.insert(id, Err(libc::EAGAIN));
                 }
-                Use::Frame { origin, back, wire, .. } => {
+                Use::Frame {
+                    origin, back, wire, ..
+                } => {
                     let me = self.nodes[i].id;
                     self.put_buf(wire);
                     self.reply(me, origin, -libc::EIO, back, None)
@@ -911,7 +1007,12 @@ impl Sim {
                     self.put_buf(old);
                 }
             }
-            Some(Use::Frame { origin, read, wire, back }) => {
+            Some(Use::Frame {
+                origin,
+                read,
+                wire,
+                back,
+            }) => {
                 let r = match res {
                     Ok(()) => wire.len() as i32,
                     Err(e) => -e.raw(),
@@ -934,7 +1035,15 @@ impl Sim {
             return;
         }
         let lat = self.s.latency();
-        self.s.at(lat, What::Reply { who: origin, res, back, wire });
+        self.s.at(
+            lat,
+            What::Reply {
+                who: origin,
+                res,
+                back,
+                wire,
+            },
+        );
     }
 
     // ---------------------------------------------------------------- the loop
@@ -1005,8 +1114,12 @@ impl Sim {
     }
 
     fn complete(&mut self, who: Who, res: i32) {
-        let Some(i) = self.nodes.iter().position(|n| n.id == who.node) else { return };
-        let Some(w) = self.nodes[i].workers.as_mut() else { return };
+        let Some(i) = self.nodes.iter().position(|n| n.id == who.node) else {
+            return;
+        };
+        let Some(w) = self.nodes[i].workers.as_mut() else {
+            return;
+        };
         if who.core as usize >= w.cores() {
             return;
         }
@@ -1025,7 +1138,12 @@ impl Sim {
                     self.complete(who, res);
                 }
             }
-            What::Reply { who, res, back, wire } => {
+            What::Reply {
+                who,
+                res,
+                back,
+                wire,
+            } => {
                 if !self.s.live.borrow().contains(&who) {
                     return;
                 }
@@ -1055,7 +1173,14 @@ impl Sim {
                     self.complete(who, res);
                 }
             }
-            What::Disk { who, dev, read, off, addr, len } => {
+            What::Disk {
+                who,
+                dev,
+                read,
+                off,
+                addr,
+                len,
+            } => {
                 if !self.s.live.borrow().contains(&who) {
                     return;
                 }
@@ -1064,9 +1189,15 @@ impl Sim {
                 let res = self.transfer(dev, read, off, addr, len);
                 self.complete(who, res);
             }
-            What::Send { from, to, read, lba, back, len, tries } => {
-                self.deliver(from, to, read, lba, back, len, tries)
-            }
+            What::Send {
+                from,
+                to,
+                read,
+                lba,
+                back,
+                len,
+                tries,
+            } => self.deliver(from, to, read, lba, back, len, tries),
         }
     }
 
@@ -1105,14 +1236,25 @@ impl Sim {
     /// Deliver a frame. The peer runs the real handler against the simulator's copy of
     /// the payload, so neither end can see the other's buffer except through the reply.
     #[allow(clippy::too_many_arguments)]
-    fn deliver(&mut self, from: Who, to: u32, read: bool, lba: u64, back: u64, len: u32, tries: u32) {
+    fn deliver(
+        &mut self,
+        from: Who,
+        to: u32,
+        read: bool,
+        lba: u64,
+        back: u64,
+        len: u32,
+        tries: u32,
+    ) {
         // The command was cancelled — by its link timeout, or because its node went
         // away. A cancelled command's buffer is the initiator's again, so nothing may
         // be read out of it.
         if !self.s.live.borrow().contains(&from) {
             return;
         }
-        let Some(i) = self.nodes.iter().position(|n| n.id == to) else { return };
+        let Some(i) = self.nodes.iter().position(|n| n.id == to) else {
+            return;
+        };
         if self.nodes[i].workers.is_none() {
             return; // down; the sender's link timeout answers for it
         }
@@ -1124,7 +1266,15 @@ impl Sim {
             // The peer is saturated. Retry, but not forever: past this the sender's
             // timeout is the honest answer.
             if tries < 64 {
-                let e = What::Send { from, to, read, lba, back, len, tries: tries + 1 };
+                let e = What::Send {
+                    from,
+                    to,
+                    read,
+                    lba,
+                    back,
+                    len,
+                    tries: tries + 1,
+                };
                 self.s.at(LATENCY_US, e);
             }
             return;
@@ -1135,10 +1285,27 @@ impl Sim {
         self.s.still_ours(&from, back, "a frame");
         let mut wire = self.take_buf(len as usize);
         // SAFETY: the op is live, so `back` names a buffer of ours that is still alive.
-        wire.copy_from_slice(unsafe { std::slice::from_raw_parts(back as *const u8, len as usize) });
+        wire.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(back as *const u8, len as usize)
+        });
         let b = sim_buf(0, wire.as_mut_ptr() as u64, len);
-        let u = Use::Frame { origin: from, read, wire, back };
-        self.start(i, core, u, Request { vol: 0, op, lba, buf: b });
+        let u = Use::Frame {
+            origin: from,
+            read,
+            wire,
+            back,
+        };
+        self.start(
+            i,
+            core,
+            u,
+            Request {
+                vol: 0,
+                op,
+                lba,
+                buf: b,
+            },
+        );
     }
 }
 

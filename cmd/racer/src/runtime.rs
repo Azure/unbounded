@@ -109,7 +109,13 @@ impl Request {
         #[cfg(feature = "sim")]
         return crate::sim::copy_req(self.buf, off, dst.as_mut_ptr(), dst.len(), false);
         #[cfg(not(feature = "sim"))]
-        worker::copy_req(self.buf.index as u32, off, dst.as_mut_ptr(), dst.len(), false)
+        worker::copy_req(
+            self.buf.index as u32,
+            off,
+            dst.as_mut_ptr(),
+            dst.len(),
+            false,
+        )
     }
 
     /// Copy `src` into a read request's payload at `off`. The mirror of [`load`].
@@ -119,7 +125,13 @@ impl Request {
         #[cfg(feature = "sim")]
         return crate::sim::copy_req(self.buf, off, src.as_ptr() as *mut u8, src.len(), true);
         #[cfg(not(feature = "sim"))]
-        worker::copy_req(self.buf.index as u32, off, src.as_ptr() as *mut u8, src.len(), true)
+        worker::copy_req(
+            self.buf.index as u32,
+            off,
+            src.as_ptr() as *mut u8,
+            src.len(),
+            true,
+        )
     }
 }
 
@@ -658,9 +670,12 @@ impl<C: Sync + 'static> Runtime<C> {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
         let (tx, rx) = channel();
-        post(&self.inner, Box::new(move |ctx| {
-            let _ = tx.send(reconcile(ctx, build));
-        }))?;
+        post(
+            &self.inner,
+            Box::new(move |ctx| {
+                let _ = tx.send(reconcile(ctx, build));
+            }),
+        )?;
         rx.recv()
             .map_err(|_| std::io::Error::from_raw_os_error(libc::EPIPE))?
     }
@@ -696,9 +711,12 @@ fn stop<C>(inner: &Inner<C>) -> std::io::Result<()> {
         return Ok(());
     }
     let (tx, rx) = channel();
-    let posted = post(inner, Box::new(move |ctx| {
-        let _ = tx.send(teardown(ctx));
-    }));
+    let posted = post(
+        inner,
+        Box::new(move |ctx| {
+            let _ = tx.send(teardown(ctx));
+        }),
+    );
     let r = match posted {
         Ok(()) => rx
             .recv()
@@ -1091,7 +1109,9 @@ mod tests {
                     if i == 1 {
                         sleep(Duration::from_millis(2)).await;
                     }
-                    Ok::<u64, Errno>(SEEN.with(|m| *m.borrow_mut().entry(lba).or_insert(lba * 4096)))
+                    Ok::<u64, Errno>(
+                        SEEN.with(|m| *m.borrow_mut().entry(lba).or_insert(lba * 4096)),
+                    )
                 })
             });
             let off = quorum(legs, 1)
@@ -1268,7 +1288,10 @@ mod tests {
         let n = NCORES.load(Ordering::Relaxed) as u32;
         let want = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         let got = TICKED.load(Ordering::Relaxed);
-        assert_eq!(got, want, "idle workers missed their tick: {got:#x} of {want:#x}");
+        assert_eq!(
+            got, want,
+            "idle workers missed their tick: {got:#x} of {want:#x}"
+        );
 
         rt.shutdown().expect("shutdown");
 

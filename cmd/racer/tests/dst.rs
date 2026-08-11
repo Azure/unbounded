@@ -90,7 +90,9 @@ fn get_eventually(sim: &mut Sim, node: usize, lba: u64) -> u8 {
 }
 
 fn put_eventually(sim: &mut Sim, node: usize, lba: u64, fill: u8) {
-    eventually(sim, &format!("write to page {lba}"), |s| s.write(node, lba, fill));
+    eventually(sim, &format!("write to page {lba}"), |s| {
+        s.write(node, lba, fill)
+    });
 }
 
 fn assert_page(sim: &mut Sim, node: usize, lba: u64, want: u8) {
@@ -103,7 +105,9 @@ fn assert_page(sim: &mut Sim, node: usize, lba: u64, want: u8) {
 }
 
 fn put_huge(sim: &mut Sim, node: usize, page: u64, fill: u8) {
-    eventually(sim, &format!("huge write to page {page}"), |s| s.write_huge(node, page, fill));
+    eventually(sim, &format!("huge write to page {page}"), |s| {
+        s.write_huge(node, page, fill)
+    });
 }
 
 /// A whole 4 MiB page, checked byte for byte: the immutable class carries no checksum,
@@ -153,14 +157,22 @@ fn uniform_huge(sim: &mut Sim, node: usize, page: u64) -> u8 {
 
 #[test]
 fn a_write_is_read_back() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
     put_eventually(&mut sim, 0, 7, 0xab);
     assert_page(&mut sim, 0, 7, 0xab);
 }
 
 #[test]
 fn every_node_serves_every_page() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
     for lba in 0..24u64 {
         put_eventually(&mut sim, lba as usize % 3, lba, 0x40 + lba as u8);
     }
@@ -173,7 +185,11 @@ fn every_node_serves_every_page() {
 
 #[test]
 fn a_trimmed_page_reads_as_a_hole() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
     put_eventually(&mut sim, 0, 11, 0x77);
     assert_page(&mut sim, 0, 11, 0x77);
     // Settle anti-entropy first, so the single trim attempt cannot meet a member that
@@ -188,14 +204,21 @@ fn a_trimmed_page_reads_as_a_hole() {
 
 #[test]
 fn a_huge_page_round_trips() {
-    let mut sim =
-        cluster(Options { nodes: 3, pages: 256, huge_pages: 4, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 256,
+        huge_pages: 4,
+        ..Options::default()
+    });
     eventually(&mut sim, "huge write", |s| s.write_huge(0, 2, 0xcd));
     for node in 0..3 {
         let r = sim.read_huge(node, 2);
         settled(&mut sim, r).expect("huge read");
         let p = sim.payload(r).unwrap();
-        assert!(p.iter().all(|&b| b == 0xcd), "huge page differs on node {node}");
+        assert!(
+            p.iter().all(|&b| b == 0xcd),
+            "huge page differs on node {node}"
+        );
     }
     // An unwritten immutable page is a hole, not an error.
     let r = sim.read_huge(1, 3);
@@ -268,7 +291,10 @@ fn a_page_that_arrives_in_pieces_is_never_served_half_written() {
     warm(&mut sim);
 
     // Half of every command's pieces go missing, and a member restarts underneath one.
-    sim.faults(Faults { drop: 500, ..Faults::default() });
+    sim.faults(Faults {
+        drop: 500,
+        ..Faults::default()
+    });
     for round in 0..4u8 {
         let w = sim.write_huge(0, 0, 0xb0 + round);
         if round == 1 {
@@ -285,14 +311,20 @@ fn a_page_that_arrives_in_pieces_is_never_served_half_written() {
 
     // Whichever write won, every node serves one whole page of it.
     let fill = uniform_huge(&mut sim, 0, 0);
-    assert!(fill == 0xaa || (0xb0..0xb4).contains(&fill), "page 0 holds {fill:#x}, which nobody wrote");
+    assert!(
+        fill == 0xaa || (0xb0..0xb4).contains(&fill),
+        "page 0 holds {fill:#x}, which nobody wrote"
+    );
     for node in 0..3 {
         assert_huge_page(&mut sim, node, 0, fill);
     }
 
     // More half-arrived pages than a core will hold assemblies for, so the reservations
     // the abandoned ones sit on have to come back or the class runs out of slots.
-    sim.faults(Faults { drop: 500, ..Faults::default() });
+    sim.faults(Faults {
+        drop: 500,
+        ..Faults::default()
+    });
     for page in 1..24u64 {
         let w = sim.write_huge(0, page, 0xc0 + page as u8);
         let _ = settled(&mut sim, w);
@@ -316,7 +348,10 @@ fn a_straggling_replica_gets_the_page_it_was_sent() {
         nodes: 3,
         pages: 256,
         huge_pages: 8,
-        faults: Faults { slow: [(1, 3)].into_iter().collect(), ..Faults::default() },
+        faults: Faults {
+            slow: [(1, 3)].into_iter().collect(),
+            ..Faults::default()
+        },
         ..Options::default()
     });
     for page in 0..4u64 {
@@ -335,7 +370,11 @@ fn a_straggling_replica_gets_the_page_it_was_sent() {
 
 #[test]
 fn a_crash_does_not_lose_an_acknowledged_write() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
     for lba in 0..8u64 {
         put_eventually(&mut sim, 0, lba, 0xa0 + lba as u8);
     }
@@ -361,7 +400,11 @@ fn a_crash_does_not_lose_an_acknowledged_write() {
 
 #[test]
 fn a_partition_keeps_a_quorum_serving() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
 
     // Nodes 1 and 2 cannot hear each other, but node 0 reaches both, so either of them
     // still has a quorum and writes keep landing from either side.
@@ -383,7 +426,11 @@ fn a_partition_keeps_a_quorum_serving() {
 
 #[test]
 fn an_asymmetric_partition_converges() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
     // One direction only: node 1 hears node 2, node 2 never hears node 1.
     sim.cut(1, 2, true);
     for lba in 0..8u64 {
@@ -403,7 +450,10 @@ fn lost_frames_do_not_lose_a_write() {
     let mut sim = cluster(Options {
         nodes: 3,
         pages: 1024,
-        faults: Faults { drop: 250, ..Faults::default() },
+        faults: Faults {
+            drop: 250,
+            ..Faults::default()
+        },
         ..Options::default()
     });
     for lba in 0..12u64 {
@@ -420,15 +470,25 @@ fn lost_frames_do_not_lose_a_write() {
 
 #[test]
 fn disk_errors_are_reported_not_swallowed() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
-    sim.faults(Faults { io_error: 300, ..Faults::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
+    sim.faults(Faults {
+        io_error: 300,
+        ..Faults::default()
+    });
     let mut failed = 0;
     for lba in 0..24u64 {
         if put(&mut sim, 0, lba, 0xe1).is_err() {
             failed += 1;
         }
     }
-    assert!(failed > 0, "a device that fails 30% of its writes reported no errors");
+    assert!(
+        failed > 0,
+        "a device that fails 30% of its writes reported no errors"
+    );
 
     // Recovering the medium is enough: every page is writable and readable again.
     sim.faults(Faults::default());
@@ -454,8 +514,12 @@ const CAP: u64 = 64;
 /// failure a pacer this deep in the write path would actually have.
 #[test]
 fn a_rate_budget_is_kept_and_the_cluster_still_commits() {
-    let mut sim =
-        cluster(Options { nodes: 3, pages: 1024, device_iops: CAP, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        device_iops: CAP,
+        ..Options::default()
+    });
     let start = sim.now();
     let before: Vec<u64> = (0..3).map(|n| sim.device_ops(n)).collect();
 
@@ -469,22 +533,35 @@ fn a_rate_budget_is_kept_and_the_cluster_still_commits() {
     let elapsed = (sim.now() - start).as_secs_f64();
     for (n, before) in before.iter().enumerate() {
         let ops = sim.device_ops(n) - before;
-        assert!(ops > CAP, "node {n} issued only {ops} transfers; the cap was never reached");
+        assert!(
+            ops > CAP,
+            "node {n} issued only {ops} transfers; the cap was never reached"
+        );
         let rate = ops as f64 / elapsed;
-        assert!(rate <= CAP as f64 * 1.2, "node {n} ran at {rate:.0}/s against a cap of {CAP}");
+        assert!(
+            rate <= CAP as f64 * 1.2,
+            "node {n} ran at {rate:.0}/s against a cap of {CAP}"
+        );
     }
 }
 
 #[test]
 fn corruption_never_reaches_the_client() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
     for lba in 0..24u64 {
         put_eventually(&mut sim, 0, lba, 0x30 + lba as u8);
     }
     warm(&mut sim);
 
     // Bit rot on every device at once: a read may fail, it may never lie.
-    sim.faults(Faults { corrupt: 200, ..Faults::default() });
+    sim.faults(Faults {
+        corrupt: 200,
+        ..Faults::default()
+    });
     let mut answered = 0;
     for round in 0..4 {
         for lba in 0..24u64 {
@@ -505,24 +582,40 @@ fn corruption_never_reaches_the_client() {
 
 #[test]
 fn persistent_corruption_is_repaired_from_a_peer() {
-    let mut sim = cluster(Options { nodes: 3, pages: 1024, ..Options::default() });
+    let mut sim = cluster(Options {
+        nodes: 3,
+        pages: 1024,
+        ..Options::default()
+    });
 
     for (lba, replica, fill) in [(31, 0, 0x91), (47, 2, 0xa7)] {
         put_eventually(&mut sim, 0, lba, fill);
         warm(&mut sim);
         for i in 0..3 {
-            assert!(sim.small_replica_valid(lba, i), "page {lba} replica {i} was not valid");
+            assert!(
+                sim.small_replica_valid(lba, i),
+                "page {lba} replica {i} was not valid"
+            );
         }
 
         let node = sim.corrupt_small_replica(lba, replica);
-        assert!(!sim.small_replica_valid(lba, replica), "page {lba} was not corrupted");
+        assert!(
+            !sim.small_replica_valid(lba, replica),
+            "page {lba} was not corrupted"
+        );
         assert_page(&mut sim, node, lba, fill);
-        assert!(sim.small_replica_valid(lba, replica), "page {lba} was not repaired");
+        assert!(
+            sim.small_replica_valid(lba, replica),
+            "page {lba} was not repaired"
+        );
 
         sim.crash(node);
         sim.restart(node).expect("restart repaired node");
         warm(&mut sim);
-        assert!(sim.small_replica_valid(lba, replica), "page {lba} repair was not durable");
+        assert!(
+            sim.small_replica_valid(lba, replica),
+            "page {lba} repair was not durable"
+        );
         assert_page(&mut sim, node, lba, fill);
     }
 }
@@ -634,7 +727,13 @@ fn linearizable(seed: u64) {
         nodes: 3,
         pages: 1024,
         seed,
-        faults: Faults { drop: 60, io_error: 40, corrupt: 40, jitter_us: 400, ..Faults::default() },
+        faults: Faults {
+            drop: 60,
+            io_error: 40,
+            corrupt: 40,
+            jitter_us: 400,
+            ..Faults::default()
+        },
         ..Options::default()
     });
     let mut rng = Rng(0x5eed ^ seed);
@@ -657,8 +756,11 @@ fn linearizable(seed: u64) {
                 writes.push((lba, fill, sim.write(node, lba, fill)));
             }
         }
-        let ids: Vec<u64> =
-            writes.iter().map(|w| w.2).chain(reads.iter().map(|r| r.1)).collect();
+        let ids: Vec<u64> = writes
+            .iter()
+            .map(|w| w.2)
+            .chain(reads.iter().map(|r| r.1))
+            .collect();
         churn(&mut sim, &mut rng, &mut hurt);
         settle_all(&mut sim, &ids);
 
@@ -701,7 +803,10 @@ fn linearizable(seed: u64) {
         let mut agreed: Option<u8> = None;
         for node in 0..3 {
             let got = get_eventually(&mut sim, node, lba);
-            assert!(p.allows(got), "seed {seed} page {lba} holds {got:#x}, which no write could explain");
+            assert!(
+                p.allows(got),
+                "seed {seed} page {lba} holds {got:#x}, which no write could explain"
+            );
             match agreed {
                 None => agreed = Some(got),
                 Some(v) => assert_eq!(got, v, "seed {seed} page {lba} disagrees on node {node}"),
