@@ -40,9 +40,12 @@ func serviceAccountObject(name string) *unstructured.Unstructured {
 	return objectOfKind(schema.GroupVersionKind{Version: "v1", Kind: "ServiceAccount"}, name)
 }
 
-// applyEnv returns an Env that records every apply and fails the ones named in
-// broken, so a test can pin both the order operations ran in and which were
-// never attempted.
+// applyEnv returns an Env that records every apply and delete and fails the
+// ones named in broken, so a test can pin both the order operations ran in and
+// which were never attempted.
+//
+// Applies are keyed "Kind/name" and deletes "delete Kind/name", matching the
+// summaries these tests assert on.
 func applyEnv(t *testing.T, broken map[string]error) (*Env, *[]string) {
 	t.Helper()
 
@@ -62,6 +65,12 @@ func applyEnv(t *testing.T, broken map[string]error) (*Env, *[]string) {
 				}
 
 				name := named.GetKind() + "/" + named.GetName()
+				attempted = append(attempted, name)
+
+				return broken[name]
+			},
+			Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				name := "delete " + obj.GetObjectKind().GroupVersionKind().Kind + "/" + obj.GetName()
 				attempted = append(attempted, name)
 
 				return broken[name]
@@ -402,5 +411,199 @@ func TestCombineResultReportsSkippedWithoutFailing(t *testing.T) {
 
 	if !strings.Contains(res.Message, "DaemonSet/ns/agent") {
 		t.Fatalf("message = %q, want it to name what was not written", res.Message)
+	}
+}
+
+func webhookObject(name string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingWebhookConfiguration",
+	})
+	obj.SetName(name)
+
+	return obj
+}
+
+func policyObject(name string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingAdmissionPolicy",
+	})
+	obj.SetName(name)
+
+	return obj
+}
+
+func serviceObject(name string) *unstructured.Unstructured {
+	return objectOfKind(schema.GroupVersionKind{Version: "v1", Kind: "Service"}, name)
+}
+
+// TestExecuteRegistersAdmissionAfterItsBackend is a regression test.
+//
+// Admission and aggregation registration points at a backend, so it has to
+// follow that backend. An earlier revision treated webhook configurations as
+// schema and ran them near the front, which reversed the order the manifests
+// had always used. Both net webhooks are failurePolicy: Ignore, so the window
+// between registering them and starting the Deployment behind them is a window
+// where they silently enforce nothing.
+func TestExecuteRegistersAdmissionAfterItsBackend(t *testing.T) {
+	env, attempted := applyEnv(t, nil)
+
+	// Planned in the order that used to be produced: registration first.
+	plan := NewPlan()
+	plan.Add(
+		Operation{Kind: OpApply, Object: webhookObject("net-validating"), Component: "net"},
+		Operation{Kind: OpApply, Object: policyObject("net-create-restriction"), Component: "net"},
+		Operation{Kind: OpApply, Object: serviceObject("net-controller"), Component: "net"},
+		Operation{Kind: OpApply, Object: daemonSetObject("net-node"), Component: "net"},
+	)
+
+	if _, err := env.Execute(t.Context(), plan); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	assertCalls(t, *attempted, []string{
+		"Service/net-controller",
+		"DaemonSet/net-node",
+		"ValidatingWebhookConfiguration/net-validating",
+		"ValidatingAdmissionPolicy/net-create-restriction",
+	})
+}
+
+// TestExecuteFailedRegistrationGatesNothing pins the other half of that
+// decision. Registration runs last, so nothing depends on it, and a cluster
+// that rejects an admission policy still gets its workloads. The operation
+// still fails, so the component reports the failure rather than hiding it.
+func TestExecuteFailedRegistrationGatesNothing(t *testing.T) {
+	env, attempted := applyEnv(t, map[string]error{
+		"ValidatingAdmissionPolicy/net-create-restriction": errors.New("no matches for kind"),
+	})
+
+	plan := NewPlan()
+	plan.Add(
+		Operation{Kind: OpApply, Object: policyObject("net-create-restriction"), Component: "net"},
+		Operation{Kind: OpApply, Object: webhookObject("net-validating"), Component: "net"},
+		Operation{Kind: OpApply, Object: daemonSetObject("net-node"), Component: "net"},
+	)
+
+	result, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// Everything was attempted, including the sibling registration.
+	assertCalls(t, *attempted, []string{
+		"DaemonSet/net-node",
+		"ValidatingAdmissionPolicy/net-create-restriction",
+		"ValidatingWebhookConfiguration/net-validating",
+	})
+
+	if got := len(result.Skipped()); got != 0 {
+		t.Fatalf("skipped %d operations, want none: registration is last so nothing depends on it", got)
+	}
+
+	// It is still reported, so the component does not claim success.
+	if len(result.Failed()) != 1 {
+		t.Fatalf("failed = %v, want the policy reported", result.Failed())
+	}
+}
+
+// TestExecuteRemovesInReverseOrder is a regression test.
+//
+// Removals used to share one rank, so a failed workload delete did not stop the
+// delete of the ConfigMap that workload was still mounting. Cleanup could take
+// the configuration out from under a surviving pod.
+func TestExecuteRemovesInReverseOrder(t *testing.T) {
+	env, attempted := applyEnv(t, nil)
+
+	plan := NewPlan()
+	plan.Add(
+		Operation{Kind: OpDelete, Object: configMapObject("agent-config"), Component: "storage", Site: "east"},
+		Operation{Kind: OpDelete, Object: serviceAccountObject("agent"), Component: "storage", Site: "east"},
+		Operation{Kind: OpDelete, Object: daemonSetObject("agent"), Component: "storage", Site: "east"},
+	)
+
+	if _, err := env.Execute(t.Context(), plan); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// The workload goes first, then what it consumed.
+	assertCalls(t, *attempted, []string{
+		"delete DaemonSet/agent",
+		"delete ConfigMap/agent-config",
+		"delete ServiceAccount/agent",
+	})
+}
+
+// TestExecuteFailedWorkloadDeleteGatesItsConfigDelete is the failure half of
+// the same property.
+func TestExecuteFailedWorkloadDeleteGatesItsConfigDelete(t *testing.T) {
+	env, attempted := applyEnv(t, map[string]error{
+		"delete DaemonSet/agent": errors.New("apiserver said no"),
+	})
+
+	plan := NewPlan()
+	plan.Add(
+		Operation{Kind: OpDelete, Object: daemonSetObject("agent"), Component: "storage", Site: "east"},
+		Operation{Kind: OpDelete, Object: configMapObject("agent-config"), Component: "storage", Site: "east"},
+	)
+
+	result, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	assertCalls(t, *attempted, []string{"delete DaemonSet/agent"})
+
+	skipped := result.Skipped()
+	if len(skipped) != 1 || skipped[0].Ref.Name != "agent-config" {
+		t.Fatalf("skipped = %v, want the ConfigMap the surviving workload still mounts", skipped)
+	}
+}
+
+// TestExecuteSharedFailureGatesEveryContributingSite is a regression test.
+//
+// metalman and storage plan identical support RBAC for every Site, and it is
+// deduplicated so the write happens once. The failure was recorded against the
+// retained operation's Site alone, so every other Site went on to apply
+// workloads referencing a ServiceAccount that had never been created.
+func TestExecuteSharedFailureGatesEveryContributingSite(t *testing.T) {
+	env, attempted := applyEnv(t, map[string]error{
+		"ServiceAccount/shared": errors.New("apiserver said no"),
+	})
+
+	shared := func(site string) Operation {
+		return Operation{
+			Kind:      OpApply,
+			Object:    serviceAccountObject("shared"),
+			Component: "storage",
+			Site:      site,
+			SharedKey: "storage/shared/sa",
+		}
+	}
+
+	plan := NewPlan()
+	plan.Add(
+		shared("east"),
+		shared("west"),
+		Operation{Kind: OpApply, Object: daemonSetObject("agent-east"), Component: "storage", Site: "east"},
+		Operation{Kind: OpApply, Object: daemonSetObject("agent-west"), Component: "storage", Site: "west"},
+	)
+
+	result, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// The ServiceAccount was attempted once, and neither workload followed it.
+	assertCalls(t, *attempted, []string{"ServiceAccount/shared"})
+
+	skipped := map[string]bool{}
+	for _, r := range result.Skipped() {
+		skipped[r.Ref.Name] = true
+	}
+
+	if !skipped["agent-east"] || !skipped["agent-west"] {
+		t.Fatalf("skipped = %v, want both Sites gated by the one shared failure", result.Skipped())
 	}
 }

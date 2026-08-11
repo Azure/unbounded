@@ -142,7 +142,7 @@ func (e *Env) Execute(ctx context.Context, plan *Plan) (ExecutionResult, error) 
 		return ExecutionResult{}, err
 	}
 
-	ordered, err := orderByDependency(byTier(deduped))
+	ordered, err := orderByDependency(byRank(deduped))
 	if err != nil {
 		return ExecutionResult{}, err
 	}
@@ -214,7 +214,7 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 		result    ExecutionResult
 		brokenRef = map[ObjectRef]bool{}
 		brokenNS  = map[string]bool{}
-		brokenSub = map[subject]tier{}
+		brokenSub = map[subject]failure{}
 	)
 
 	record := func(op plannedOp, status OpStatus, err error) {
@@ -240,17 +240,24 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 	}
 
 	fail := func(op plannedOp, status OpStatus, err error) {
-		at := tierOf(op.Operation)
+		broke := failure{rank: rankOf(op.Operation), what: describeRank(op.Operation)}
 
 		brokenRef[op.Ref()] = true
 
-		// Operations run in tier order, so the first failure recorded for a
-		// subject is its earliest failed tier and later ones do not lower it.
-		if _, seen := brokenSub[op.subject()]; !seen {
-			brokenSub[op.subject()] = at
+		// Every contributor to a deduplicated operation is gated, not only the
+		// one whose copy was retained. Storage and metalman plan identical
+		// support RBAC for every Site and it is written once; recording the
+		// failure against the retained Site alone left every other Site free to
+		// apply workloads referencing a ServiceAccount that was never created.
+		for _, at := range append([]subject{op.subject()}, op.aliasSubjects()...) {
+			// Operations run in rank order, so the first failure recorded for a
+			// subject is its earliest and later ones do not lower it.
+			if _, seen := brokenSub[at]; !seen {
+				brokenSub[at] = broke
+			}
 		}
 
-		if at == tierNamespace {
+		if op.Kind != OpDelete && tierOf(op.Operation) == tierNamespace {
 			brokenNS[op.Object.GetName()] = true
 		}
 
@@ -292,9 +299,27 @@ func (o plannedOp) subject() subject {
 	return subject{Component: o.Component, Site: o.Site}
 }
 
+// aliasSubjects returns the contributors that were deduplicated into this
+// operation, so a failure gates every one of them.
+func (o plannedOp) aliasSubjects() []subject {
+	out := make([]subject, 0, len(o.aliases))
+	for _, alias := range o.aliases {
+		out = append(out, subject{Component: alias.Component, Site: alias.Site})
+	}
+
+	return out
+}
+
+// failure records what a subject last failed at, so later operations for that
+// subject can be gated and the skip explained.
+type failure struct {
+	rank int
+	what string
+}
+
 // blockedBy reports why an operation must not be attempted, or false when it
 // may run.
-func blockedBy(op plannedOp, brokenRef map[ObjectRef]bool, brokenNS map[string]bool, brokenSub map[subject]tier) (string, bool) {
+func blockedBy(op plannedOp, brokenRef map[ObjectRef]bool, brokenNS map[string]bool, brokenSub map[subject]failure) (string, bool) {
 	for _, dep := range op.DependsOn {
 		if dep != op.Ref() && brokenRef[dep] {
 			return fmt.Sprintf("dependency %s did not complete", dep), true
@@ -309,9 +334,9 @@ func blockedBy(op plannedOp, brokenRef map[ObjectRef]bool, brokenNS map[string]b
 		return fmt.Sprintf("namespace %s could not be written", ns), true
 	}
 
-	if failed, ok := brokenSub[op.subject()]; ok && failed < tierOf(op.Operation) {
-		return fmt.Sprintf("%s did not write its %s successfully",
-			describeContributor(op.Operation), failed), true
+	if failed, ok := brokenSub[op.subject()]; ok && failed.rank < rankOf(op.Operation) {
+		return fmt.Sprintf("%s did not complete its %s successfully",
+			describeContributor(op.Operation), failed.what), true
 	}
 
 	return "", false
@@ -454,16 +479,17 @@ func describeContributor(op Operation) string {
 	return op.Component + " (site " + op.Site + ")"
 }
 
-// byTier orders operations by the stage inferred from what they write, so that
+// byRank orders operations by the stage inferred from what they write, so that
 // namespaces precede the objects in them, RBAC and config precede the workloads
-// that consume them, and removals happen first.
+// that consume them, admission and API registration follows the backends it
+// points at, and removals happen first in the reverse of all that.
 //
-// The sort is stable, so within a tier the deterministic order established by
+// The sort is stable, so within a rank the deterministic order established by
 // sortOperations survives: components are grouped in registry order and each
 // component's own emission order is preserved.
-func byTier(ops []plannedOp) []plannedOp {
+func byRank(ops []plannedOp) []plannedOp {
 	sort.SliceStable(ops, func(i, j int) bool {
-		return tierOf(ops[i].Operation) < tierOf(ops[j].Operation)
+		return rankOf(ops[i].Operation) < rankOf(ops[j].Operation)
 	})
 
 	return ops
