@@ -21,7 +21,7 @@ unbounded-operator generates and reconciles.
 11. [Drift visibility and observability](#11-drift-visibility-and-observability)
 12. [CLI](#12-cli)
 13. [Operational notes](#13-operational-notes)
-14. [Implementation plan](#14-implementation-plan)
+14. [Implementation](#14-implementation)
 15. [Testing](#15-testing)
 16. [Prior art](#16-prior-art)
 17. [Open questions](#17-open-questions)
@@ -346,7 +346,7 @@ With the grant removed, no component ServiceAccount can create or modify the
 overrides ConfigMap. Write access is then held only by principals a cluster
 administrator has granted it to, which is the posture
 [§4.3](#43-required-posture-for-cluster-operators) requires. This is a blocking
-prerequisite ([§14](#14-implementation-plan)), because the feature widens an
+prerequisite ([§14](#14-implementation)), because the feature widens an
 exposure that removing the grant eliminates.
 
 **Verification is required before deletion.** Removing RBAC fails at runtime,
@@ -1138,17 +1138,43 @@ Site, because enablement for the singletons is resolved as "any Site enables it"
 
 ```go
 type ClusterPlanner interface {
-    Plan(ctx context.Context, env *Env, sites []unboundedv1alpha3.Site) (*Plan, error)
+    Plan(ctx context.Context, env *Env, sites []unboundedv1alpha3.Site) (*Plan, Result, error)
 }
 
 type SitePlanner interface {
-    Plan(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) (*Plan, error)
+    Plan(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) (*Plan, Result, error)
+    CleanupPlan(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) (*Plan, Result, error)
 }
 ```
+
+Each returns a `Result` alongside the plan, because planning reaches verdicts
+execution cannot: `Disabled` when no Site enables a component, `NoSites` when
+net is retained with none, and the retained-singleton decisions. `(*Plan, error)`
+alone had nowhere to carry them, and they are the conditions users
+`kubectl wait` on. The driver folds execution outcomes into the verdict, so a
+component that planned successfully but failed to write reports failure.
 
 Planning may **read** cluster state, since decisions like machina's retention
 check (`machina.go:57-69`) and storage's create-versus-adopt branch
 (`storage.go:115-154`) depend on it. It may not write.
+
+**Config hashes are computed at plan time**, from either the observed ConfigMap
+or the embedded default about to be created, with the create-or-patch emitted as
+a separate operation in the same plan. Four of the five components stamp a hash
+into a pod template that they derive from a ConfigMap they may also be creating,
+so this is what lets planning stay side-effect free.
+
+The consequence is a bounded race: if another writer creates a different payload
+between planning and execution, `OpCreateIfAbsent` correctly declines to
+overwrite it, and the workload briefly carries a hash for content that is not
+there. The config watch fires on that create and the next pass corrects it.
+
+**Within a component, operations execute in the order the component planned
+them.** An earlier draft sorted by kind and name, which would have silently
+reordered deliberate sequencing: gantry removes its legacy node config before
+applying anything, and storage writes a ConfigMap before the DaemonSet that
+carries its hash. Components plan deterministically by walking sorted manifest
+lists, so preserving their order is still stable across passes.
 
 `metalman` satisfies this by converting its typed `appsv1.Deployment`
 (`metalman.go:98-196`) to unstructured, so both generation paths
@@ -1161,7 +1187,8 @@ Mapping the existing behaviour onto operation kinds:
 |---|---|
 | `ApplyManifestFS` per object | `OpApply` |
 | `ensureConfig` create branch (`storage.go:136`, `net.go:174`) | `OpCreateIfAbsent` |
-| `adoptConfig` (`storage.go:156-170`) | `OpAdoptOwnerRef` |
+| `ensureConfig` endpoint merge (`machina.go:155-205`) | `OpMergePatch` |
+| `adoptConfig` (`storage.go:156-170`) | `OpMergePatch` |
 | `Cleanup` (`storage.go:78-90`) | `OpDelete` |
 | `cleanupLegacyNodeConfig` (`gantry.go:170-178`) | `OpDelete` |
 | metalman support RBAC (`metalman.go:45`) | `OpApply` with `SharedKey` |
@@ -1376,6 +1403,11 @@ Aggregation is per Site, not per component, because the ConfigMap is
 cluster-scoped and a single document routinely targets several components.
 Component-level detail stays in the existing conditions.
 
+Cluster-singleton workloads carry no Site but are reported on **every** Site,
+because every Site depends on `net`, `machina` and `gantry`. Filtering them out
+would hide the most likely case, an override of `net`, from `kubectl get site`
+entirely.
+
 `Ready` on a component condition still means the apply succeeded, not that the
 workload is healthy. `Phase: Applied` likewise means the override merged and was
 written, not that the resulting pods run.
@@ -1552,29 +1584,61 @@ nothing about override behaviour.
 and before or after the components it patches. Unmatched entries are inert and
 reported ([§6.3](#63-resolution)).
 
-## 14. Implementation plan
+## 14. Implementation
 
-| PR | Scope | Depends on |
-|---|---|---|
-| 1 | This design document | - |
-| 2 | **Security hardening**, blocking. Delete the unused ConfigMap grant from the `machina-controller` Role (`deploy/machina/02-rbac.yaml.tmpl:15-17`). Verified by an `e2e/` run against a live cluster, not by code inspection, because RBAC removal fails at runtime ([§4.4](#44-residual-risk-and-how-it-is-closed)). | 1 |
-| 3 | **Operation plan refactor.** Introduce `Plan`, `Operation`, `OpKind`, `ClusterPlanner` and `SitePlanner`; convert all five components to plan-then-execute; split `ensureConfig` into a read-only hash computation and an `OpCreateIfAbsent` operation; add dependency ordering and shared-key deduplication. Behaviour-preserving, verified by golden-plan and golden-object tests. Prerequisite for preflight atomicity ([§9.1](#91-preflight-atomicity-not-transactional-apply)). | 1 |
-| 4 | **Override engine**: `internal/operator/component/override.go`. Snapshot handling, parsing rules, document validation, allowlist, resolution, `addContainers` intent, normalized-operation composition and conflict detection, strategic merge, Cartesian affinity, protected-path re-stamp, GVK lockdown, per-workload hashing. Pure functions plus unit tests; no reconciler changes. | 1 |
-| 5 | **Wiring**: pass structure, `Env.ForComponent`, execution semantics (ordering, continuation, no rollback, attribution), skip-`Overridable`-on-invalid, synchronous fan-out with explicit `MaxConcurrentReconciles: 1`, `SiteStatus.Overrides`, `EventRecorder` on both Site and the overrides ConfigMap, printer column. | 3, 4 |
-| 6 | `kubectl unbounded overrides validate` (offline syntax), `status` and `list` (read persisted state, no recomputation) | 5 |
-| 7 | Documentation: new reference page under `docs/content/reference/`, amend `architecture.md:189`, amend the `SiteComponentSpec` comment at `site_types.go:141-143`, update `cli.md`, add `deploy/unbounded-operator/examples/component-overrides.example.yaml` as a plain `.yaml` so neither `render-manifests` nor `go:embed` picks it up. The access-control guidance in [§4.3](#43-required-posture-for-cluster-operators) is part of this, not an afterthought. | 5, 6 |
+The design and the implementation land on one branch, so this section records
+what was built rather than a plan for building it. Commits, in order:
 
-PR 5 requires `make generate` for `SiteStatus.Overrides` and the printer column.
-Nothing else changes the CRD schema, and there is no API version churn.
+| Commit | Scope |
+|---|---|
+| `aa4c2b3c` | **Security hardening.** Delete the unused ConfigMap grant from the `machina-controller` Role. Verified against the controller's actual API calls and its cache configuration, not by inspection alone ([§4.4](#44-residual-risk-and-how-it-is-closed)). |
+| `abfc49ea` | **Operation plan and executor.** `Plan`, `Operation`, `OpKind`, dependency ordering, continuation, shared-key deduplication. No component changes. |
+| `8139c1e7` | **Plan-then-execute conversion** of all five components, with golden plan tests pinning the exact operations each produces. Behaviour-preserving. |
+| `570587b4` | Golden plan ordering fix for gantry. |
+| `832cb381` | **Override schema, parsing and validation.** Everything that is a pure function of the document. |
+| `9d4082e7` | **Resolution, merge and hashing.** Everything that needs the rendered workload. |
+| `af17e680` | **Pass wiring.** Snapshot, preflight, skip-on-invalid, ConfigMap watch, explicit `MaxConcurrentReconciles: 1`. |
+| `f5da47e1` | **Status reporting.** `SiteStatus.Overrides`, printer column, `EventRecorder`. |
+| `e718dfe5` | **Fan-out**, so per-Site components see override changes. |
+| `e0434f4e` | **CLI**: `overrides validate`, `list`, `status`. |
+| `19876112` | **Real-API-server e2e** ([§15](#15-testing)). |
 
-PRs 2, 3 and 4 are independent of one another and can land in parallel. PR 3 is
-the largest and touches all five components; it is worth landing early and on
-its own merits, since plan-then-execute makes components testable without a
-client irrespective of overrides.
+Only the status commit changes the CRD schema, through
+`go generate ./api/machina/...`. There is no API version churn.
 
-Filed separately, not part of this work: the documented Kubernetes baseline of
-1.24+ is already stale because the operator installs `09-vap.yaml.tmpl`
-unconditionally ([§4.4](#44-residual-risk-and-how-it-is-closed)).
+### What implementation changed about this design
+
+Five things were wrong or missing, and are corrected above rather than left for
+a reader to discover:
+
+- `OpAdoptOwnerRef` was too narrow. machina merges config **content**, not just
+  an owner reference, so the operation is `OpMergePatch` carrying observed and
+  desired state.
+- `Plan` returning `(*Plan, error)` had nowhere to carry `Disabled`, `NoSites`
+  or the retained-singleton verdicts, which are the conditions users
+  `kubectl wait` on. It returns a `Result` too.
+- Config-hash timing was unspecified. Hashes are computed at plan time, with a
+  bounded self-healing race documented in [§10.1](#101-the-operation-plan).
+- Within-component operation order has to be preserved rather than sorted, or
+  gantry's legacy cleanup and storage's ConfigMap-before-DaemonSet sequencing
+  silently reorder.
+- The testing section assumed envtest, which does not exist in this repository.
+  Coverage extends the existing kind harness instead ([§15](#15-testing)).
+
+Four defects were found by tests rather than by review, which is recorded here
+because it is evidence about where the risk in this feature actually sits:
+
+- Sorting operations by kind and name inside a component reordered deliberate
+  sequencing.
+- The reserved `unbounded-cloud.io/` prefix check ran against the parent path,
+  so a permitted subtree let label keys through: a patch could have forged a
+  config hash the reaper gates on.
+- `Client.Get` strips TypeMeta, so converting a fetched object to unstructured
+  produced no GVK and an opaque apiserver error. The executor now rejects such
+  an operation by name.
+- yaml.v3 decodes whole numbers as `int` while apimachinery accepts only
+  `int64` and **panics** otherwise, so the first user to write `spec.replicas`
+  would have crashed the operator. Parsing normalizes decoded values.
 
 ## 15. Testing
 
@@ -1682,11 +1746,21 @@ and its output says so. `overrides status` issues no rendering or hashing calls,
 asserted by fake-client call counting, so a version-skewed plugin cannot
 misreport.
 
-**Integration (envtest, real API server).** Override applied through SSA and
-observable in `managedFields`; ConfigMap deleted and the default restored, with
-the revert scope in [§2](#2-goals-and-non-goals) asserted against real managed
-fields rather than assumed; a field owned by a competing field manager surviving
-override removal, documenting the limit.
+**Integration (real API server, kind).** There is no envtest in this repository
+and adding it would introduce a second real-API-server mechanism alongside the
+kind harness `e2e/operator/` already provides, so this coverage extends that
+suite instead. It is guarded by `//go:build e2e` and runs in CI through the
+existing `operator-e2e-kind` workflow, whose path filters already cover
+`internal/operator` and `e2e/operator`.
+
+It covers what the fake client cannot, because its Apply is a stub while
+server-side apply ownership and `managedFields` are real apiserver behaviour:
+an override applied and then removed restoring the operator's own value, with
+the operator asserted present in `managedFields` since that ownership is the
+mechanism the revert guarantee rests on; an invalid document leaving a running
+workload byte-identical rather than reverting it; and a field owned by a
+competing field manager surviving override removal, documenting the limit of
+the guarantee.
 
 **End to end (`e2e/operator/`).** A resources override rolls the target
 DaemonSet; removing it reverts; an image override sets `version-drift` and moves
@@ -1743,8 +1817,19 @@ directly applicable for users who want full control.
 
 ## 17. Open questions
 
-Three questions carried by earlier revisions are now **resolved** and are
-recorded here so the reasoning is not lost:
+Implementation settled several of these. They are recorded rather than deleted,
+so the reasoning survives:
+
+- *Operation taxonomy, hash timing and planning verdicts.* All three were gaps
+  found while implementing and are corrected in
+  [§10.1](#101-the-operation-plan) and [§14](#14-implementation).
+- *envtest.* Not present in this repository; coverage extends the existing kind
+  harness ([§15](#15-testing)).
+- *Where singleton override state is reported.* On every Site, since every Site
+  depends on the singletons ([§11](#11-drift-visibility-and-observability)).
+
+Three questions carried by earlier revisions were **resolved** before
+implementation began:
 
 - *Dedicated resource type instead of a ConfigMap.* Resolved in favour of the
   ConfigMap. The argument rested on RBAC being unable to scope `create` by name.
