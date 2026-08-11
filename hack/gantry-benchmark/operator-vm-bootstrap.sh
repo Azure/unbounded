@@ -126,9 +126,16 @@ require_private_resolution() {
   done
 }
 
+for lifecycle_service in gantry-benchmark-operator.service gantry-benchmark-image-prepare.service gantry-benchmark-image-builder.service; do
+  if systemctl is-active --quiet "$lifecycle_service"; then
+    echo "$lifecycle_service is active; finish it before refreshing the operator checkout" >&2
+    exit 1
+  fi
+done
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl e2fsprogs git gnupg jq make podman golang-go
+apt-get install -y ca-certificates curl e2fsprogs git gnupg jq make openssh-server podman golang-go
 
 if ! command -v az >/dev/null 2>&1; then
   curl -sL https://aka.ms/InstallAzureCLIDeb | bash
@@ -193,12 +200,6 @@ require_private_resolution "$gantry_acr_name.$gantry_location.data.azurecr.io" "
 
 repo_root="$build_mount/unbounded"
 source_description="$repo_url ($repo_branch)"
-for lifecycle_service in gantry-benchmark-operator.service gantry-benchmark-image-builder.service; do
-  if systemctl is-active --quiet "$lifecycle_service"; then
-    echo "$lifecycle_service is active; finish it before refreshing the operator checkout" >&2
-    exit 1
-  fi
-done
 if [[ -n "$source_image" ]]; then
   gantry_login_server=$(az acr show -g "$resource_group" -n "$gantry_acr_name" --query loginServer -o tsv)
   source_token=$(acr_access_token "$gantry_acr_name")
@@ -231,6 +232,7 @@ else
 fi
 
 chmod +x "$repo_root"/hack/gantry-benchmark/operator-vm-*.sh
+"$repo_root/hack/gantry-benchmark/operator-vm-configure-sshd.sh"
 
 podman_graph_root=$(podman info --format '{{.Store.GraphRoot}}')
 [[ "$podman_graph_root" == "$build_mount/containers" ]] || {
@@ -346,6 +348,28 @@ TimeoutStopSec=45min
 WantedBy=multi-user.target
 UNIT
 
+cat >/etc/systemd/system/gantry-benchmark-image-prepare.service <<UNIT
+[Unit]
+Description=Gantry dual-ACR benchmark image preparation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=$repo_root
+Environment=GANTRY_BENCHMARK_CONFIG=/etc/gantry-benchmark/env
+Environment=BENCHMARK_PREPARE_ONLY=true
+ExecStart=$repo_root/hack/gantry-benchmark/operator-vm-run.sh
+StandardOutput=append:/var/log/gantry-benchmark/service.log
+StandardError=append:/var/log/gantry-benchmark/service.log
+TimeoutStartSec=0
+TimeoutStopSec=45min
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 cat >/etc/systemd/system/gantry-benchmark-image-builder.service <<UNIT
 [Unit]
 Description=Gantry reusable benchmark image pool builder
@@ -402,5 +426,6 @@ build mount: $build_mount
 Podman graph root: $podman_graph_root
 config: /etc/gantry-benchmark/env
 service: gantry-benchmark-operator.service
+image preparation service: gantry-benchmark-image-prepare.service
 artifacts: /var/lib/gantry-benchmark/artifacts
 SUMMARY

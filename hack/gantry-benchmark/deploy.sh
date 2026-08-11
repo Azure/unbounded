@@ -6,6 +6,7 @@ set -Eeuo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
+. "$script_dir/operator-vm-ssh-common.sh"
 
 usage() {
   cat <<'USAGE'
@@ -101,12 +102,16 @@ OPERATOR_BUILD_DISK_GB=${OPERATOR_BUILD_DISK_GB:-512}
 OPERATOR_BUILD_DISK_SKU=${OPERATOR_BUILD_DISK_SKU:-PremiumV2_LRS}
 OPERATOR_BUILD_DISK_IOPS=${OPERATOR_BUILD_DISK_IOPS:-20000}
 OPERATOR_BUILD_DISK_MBPS=${OPERATOR_BUILD_DISK_MBPS:-750}
+OPERATOR_SSH_PORT=${OPERATOR_SSH_PORT:-50001}
+OPERATOR_SSH_PUBLIC_IP_NAME=${OPERATOR_SSH_PUBLIC_IP_NAME:-gantry-benchmark-operator-ssh}
+OPERATOR_SSH_NSG_RULE_NAME=${OPERATOR_SSH_NSG_RULE_NAME:-allow-operator-ssh-50001}
+OPERATOR_SSH_SOURCE_CIDR=${OPERATOR_SSH_SOURCE_CIDR:-}
+OPERATOR_SSH_HOST_ALIAS=${OPERATOR_SSH_HOST_ALIAS:-$OPERATOR_VM_NAME}
 
 START_BENCHMARK=${START_BENCHMARK:-false}
 DEPLOY_CONFIRM=${DEPLOY_CONFIRM:-}
 DEPLOY_STATE_DIR=${DEPLOY_STATE_DIR:-$repo_root/tmp/$DEPLOYMENT_NAME}
 KUBECONFIG=${DEPLOY_KUBECONFIG:-$DEPLOY_STATE_DIR/kubeconfig}
-OPERATOR_RUN_COMMAND_LOCK=${OPERATOR_RUN_COMMAND_LOCK:-${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.run-command.lock}
 
 BASELINE_PRIVATE_ENDPOINT_NAME=${BASELINE_PRIVATE_ENDPOINT_NAME:-${DEPLOYMENT_NAME}-baseline-acr-pe}
 GANTRY_PRIVATE_ENDPOINT_NAME=${GANTRY_PRIVATE_ENDPOINT_NAME:-${DEPLOYMENT_NAME}-gantry-acr-pe}
@@ -140,6 +145,10 @@ for acr_name in "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME"; do
 done
 [[ "$START_BENCHMARK" == true || "$START_BENCHMARK" == false ]] || {
   echo "START_BENCHMARK must be true or false" >&2
+  exit 2
+}
+[[ "$OPERATOR_SSH_PORT" == 50001 ]] || {
+  echo "OPERATOR_SSH_PORT=$OPERATOR_SSH_PORT is unsupported; the operator contract requires 50001" >&2
   exit 2
 }
 valid_adopted_image() {
@@ -239,6 +248,7 @@ Network
   service CIDR:        $SERVICE_CIDR
   PE subnet:           $PRIVATE_ENDPOINT_SUBNET_NAME $PRIVATE_ENDPOINT_SUBNET_CIDR
   operator subnet:     $OPERATOR_SUBNET_NAME $OPERATOR_SUBNET_CIDR
+  operator SSH:        public TCP $OPERATOR_SSH_PORT, source ${OPERATOR_SSH_SOURCE_CIDR:-deploying workstation IPv4/32}
 
 Registries
   baseline:            $BASELINE_ACR_LOGIN_SERVER
@@ -263,7 +273,7 @@ if [[ "$action" == plan ]]; then
   exit 0
 fi
 
-for command in az jq kubectl helm git make sha256sum timeout; do
+for command in az curl jq kubectl helm git make sha256sum ssh ssh-keygen ssh-keyscan timeout; do
   require_command "$command"
 done
 
@@ -946,6 +956,8 @@ provision_operator() {
   export AZURE_LOCATION OPERATOR_VM_NAME OPERATOR_VM_SIZE OPERATOR_VM_ZONE
   export OPERATOR_OS_DISK_GB OPERATOR_BUILD_DISK_GB OPERATOR_BUILD_DISK_SKU
   export OPERATOR_BUILD_DISK_IOPS OPERATOR_BUILD_DISK_MBPS OPERATOR_SUBNET_NAME OPERATOR_SUBNET_CIDR
+  export OPERATOR_SSH_PORT OPERATOR_SSH_PUBLIC_IP_NAME OPERATOR_SSH_NSG_RULE_NAME
+  export OPERATOR_SSH_SOURCE_CIDR OPERATOR_SSH_HOST_ALIAS
   export BENCHMARK_SOURCE_IMAGE=$SOURCE_IMAGE BENCHMARK_SOURCE_REVISION=$source_revision
   export BENCHMARK_NODE_COUNT BENCHMARK_IMAGE_SIZE_MIB BENCHMARK_IMAGE_LAYERS
   export BENCHMARK_AZURE_TELEMETRY=true BENCHMARK_MINIMUM_BYTE_REDUCTION BENCHMARK_MAXIMUM_LATENCY_RATIO
@@ -960,10 +972,17 @@ provision_operator() {
   assert_equal "operator VM size" \
     "$(az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" --query hardwareProfile.vmSize -o tsv)" \
     "$OPERATOR_VM_SIZE"
-  local public_ip_id
-  public_ip_id=$(az vm nic list -g "$AZURE_RESOURCE_GROUP" --vm-name "$OPERATOR_VM_NAME" \
-    --query '[].ipConfigurations[].publicIPAddress.id | [0]' -o tsv)
-  [[ -z "$public_ip_id" ]] || { echo "operator VM unexpectedly has public IP resource $public_ip_id" >&2; exit 1; }
+  local operator_nic_id public_ip_id expected_public_ip_id
+  operator_nic_id=$(az vm show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
+    --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+  public_ip_id=$(az network nic show --ids "$operator_nic_id" \
+    --query 'ipConfigurations[0].publicIPAddress.id' -o tsv)
+  expected_public_ip_id=$(az network public-ip show -g "$AZURE_RESOURCE_GROUP" \
+    -n "$OPERATOR_SSH_PUBLIC_IP_NAME" --query id -o tsv)
+  assert_equal "operator SSH public IP" "$public_ip_id" "$expected_public_ip_id"
+  assert_equal "operator SSH NSG port" \
+    "$(az network nsg rule show -g "$AZURE_RESOURCE_GROUP" --nsg-name "${OPERATOR_NSG_NAME:-gantry-benchmark-operator-nsg}" \
+      -n "$OPERATOR_SSH_NSG_RULE_NAME" --query destinationPortRange -o tsv)" "$OPERATOR_SSH_PORT"
   local build_disk_name
   build_disk_name=${OPERATOR_BUILD_DISK_NAME:-${OPERATOR_VM_NAME}-build}
   assert_equal "operator build disk size" \
@@ -977,12 +996,11 @@ provision_operator() {
 build_operator_images() {
   log "building Gantry and pull-probe images inside the private operator VM"
   local output
-  output=$(az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
-    --command-id RunShellScript \
-    --scripts @"$repo_root/hack/gantry-benchmark/operator-vm-build-images.sh" \
-    --parameters "$AZURE_SUBSCRIPTION_ID" "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME" \
-      "$source_revision" "$source_short" \
-    --query 'value[0].message' -o tsv)
+  operator_ssh_init
+  output=$(operator_ssh sudo -n bash -s -- \
+    "$AZURE_SUBSCRIPTION_ID" "$BASELINE_ACR_NAME" "$GANTRY_ACR_NAME" \
+    "$source_revision" "$source_short" \
+    <"$repo_root/hack/gantry-benchmark/operator-vm-build-images.sh")
   local result_json
   result_json=$(tr -d '\r' <<<"$output" | sed -n 's/^DEPLOYMENT_IMAGES_JSON=//p' | tail -1)
   jq -e 'type == "object" and (.gantry_image | type == "string") and (.baseline_probe_image | type == "string")' \
@@ -1000,17 +1018,6 @@ build_operator_images() {
     echo "operator did not return an immutable baseline probe image" >&2
     return 1
   }
-}
-
-acquire_operator_run_command_lock() {
-  log "waiting for exclusive operator VM Run Command access"
-  exec {operator_run_command_lock_fd}>"$OPERATOR_RUN_COMMAND_LOCK"
-  flock "$operator_run_command_lock_fd"
-}
-
-release_operator_run_command_lock() {
-  flock -u "$operator_run_command_lock_fd"
-  exec {operator_run_command_lock_fd}>&-
 }
 
 guard_active_benchmark
@@ -1036,10 +1043,8 @@ install_monitoring
 
 set_acrs_private
 
-acquire_operator_run_command_lock
 provision_operator
 build_operator_images
-release_operator_run_command_lock
 verify_private_baseline_pull
 deploy_gantry
 
@@ -1060,12 +1065,7 @@ done
 
 if [[ "$START_BENCHMARK" == true ]]; then
   log "starting benchmark operator service"
-  acquire_operator_run_command_lock
-  az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_VM_NAME" \
-    --command-id RunShellScript \
-    --scripts 'systemctl reset-failed gantry-benchmark-operator.service; systemctl start --no-block gantry-benchmark-operator.service' \
-    --only-show-errors -o none
-  release_operator_run_command_lock
+  "$repo_root/hack/gantry-benchmark/operator-vm-start.sh"
 fi
 
 trap - EXIT INT TERM

@@ -19,7 +19,7 @@ The script is idempotent and rejects existing resources whose topology differs
 from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
 dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch
 images, containerd settings, deterministic node-side ACR routing, bounded
-Prometheus discovery, Gantry, and the private operator VM. It leaves the stack
+Prometheus discovery, Gantry, and the operator VM. It leaves the stack
 preflight-ready by default; set `START_BENCHMARK=true` in `deploy.env` only when
 the same invocation should start the benchmark after every deployment gate
 passes.
@@ -31,7 +31,7 @@ The workstation needs one valid Azure management-plane login before invoking
 `deploy.sh`; the script never invokes `az login`, `az acr login`, or workstation
 Podman. It publishes only the revision-labelled source carrier through an ACR
 Task, creates Private Endpoints and disables public registry access, then
-bootstraps the private operator VM. Gantry and pull-probe images are built and
+bootstraps the operator VM. Gantry and pull-probe images are built and
 pushed from that VM with its managed identity over Private Link.
 
 The sections below document benchmark behavior and direct lifecycle control.
@@ -52,7 +52,7 @@ When invoking the benchmark tool directly, it expects:
   The managed node template in this repository configures both. Preflight
   refuses to run without a containerd scrape from every target node, and the
   node-observer DaemonSet fails if effective containerd log level is not debug.
-- A private operator VM in the AKS VNet. The VM runs every benchmark command,
+- An operator VM in the AKS VNet. The VM runs every benchmark command,
   builds and pushes both images, queries Azure telemetry, and stores artifacts.
 - Cluster permission to create privileged hostPath DaemonSets. Proxy mode also
   patches the Gantry ConfigMap.
@@ -167,10 +167,12 @@ containerd unpack logs, host resource use, and workload startup latency.
 ## Lifecycle
 
 All lifecycle commands run on the operator VM under its system-assigned managed
-identity. The admin workstation only provisions the VM and uses Azure Run
-Command to start or inspect its systemd service. The VM has no public IP or
-inbound NSG rules; a subnet NAT gateway supplies outbound package, GitHub, and
-Azure API access.
+identity. The admin workstation provisions the VM and uses repository targets
+to start or inspect its systemd service. The VM has one static public IP for
+key-only SSH on TCP 50001. Its NSG limits that port to
+`OPERATOR_SSH_SOURCE_CIDR`, which defaults to the deploying workstation's
+current public IPv4 `/32`. A separate subnet NAT gateway supplies outbound
+package, GitHub, and Azure API access.
 
 Bootstrap writes the VM-only configuration to `/etc/gantry-benchmark/env` and
 fetches an admin kubeconfig using managed identity. The service executes:
@@ -185,26 +187,50 @@ Provision/bootstrap from the admin workstation:
 make -C hack/gantry-benchmark operator-vm-provision
 ```
 
-Start the full VM lifecycle with Azure Run Command:
+Provisioning regenerates `tmp/<resource-group>/ssh-config`, pins the current VM
+host key, and verifies a real SSH connection. Open a shell without editing
+`~/.ssh/config`:
 
 ```bash
-az vm run-command invoke -g "$AZURE_RESOURCE_GROUP" \
-  -n "${OPERATOR_VM_NAME:-gantry-benchmark-operator}" \
-  --command-id RunShellScript \
-  --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
+make -C hack/gantry-benchmark operator-vm-ssh
+```
+
+If the workstation's public IPv4 changes while the Azure stack remains in
+place, refresh the NSG source, authorized key, host key, and local config with:
+
+```bash
+make -C hack/gantry-benchmark operator-vm-ssh-configure
+```
+
+Start the full VM lifecycle over SSH:
+
+```bash
+make -C hack/gantry-benchmark operator-vm-start
 ```
 
 Follow progress from the workstation in a separate terminal:
 
 ```bash
-export AZURE_RESOURCE_GROUP="<resource-group>"
-export OPERATOR_VM_NAME="gantry-benchmark-operator"
 make -C hack/gantry-benchmark operator-vm-watch
 ```
 
-The full-stack deployment gives the operator VM no public IP. Azure Run Command
-is the default status transport. SSH is optional only when the operator has
-deliberately provided private network connectivity to the VM.
+All post-bootstrap lifecycle and status targets use SSH on TCP 50001. Azure Run
+Command is reserved for initial bootstrap and explicit SSH recovery. Bootstrap
+disables the port-22 socket and fails unless sshd's effective configuration
+contains only port 50001.
+
+To build and push a fresh 40 GiB/40-layer image pair without running either
+pull phase, start the image-only lifecycle from the workstation:
+
+```bash
+make -C hack/gantry-benchmark operator-vm-prepare
+make -C hack/gantry-benchmark operator-vm-watch
+```
+
+The dedicated operator service runs `enable`, `prepare`, and `disable`. Payload
+generation, both image builds, and both ACR pushes happen on the private
+operator VM. It exits before `preflight`, never creates a pull Job, and retains
+the digest-pinned image references and shared payload SHA in the run artifacts.
 
 The live view reports the lifecycle stage and start time, immutable run shape,
 payload files/bytes/percentage, each baseline and Gantry-cold image reference,
@@ -213,7 +239,7 @@ operation and elapsed time, per-phase Kubernetes Job completion, Gantry
 readiness, recent logs, and the final report. Podman 4.9 does not expose a
 machine-readable live push byte percentage, so the view reports that limitation
 instead of estimating it. Use `operator-vm-status` for a single snapshot.
-Override the refresh cadence with `WATCH_INTERVAL_SECONDS` (default 30).
+Override the refresh cadence with `WATCH_INTERVAL_SECONDS` (default 5).
 
 For the Gantry pull phase, use the dedicated live monitor from the workstation:
 

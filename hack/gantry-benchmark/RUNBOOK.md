@@ -6,8 +6,8 @@ Use this runbook only for manual benchmark lifecycle control or diagnosis after
 from the individual commands below.
 
 This workflow is for a dedicated test cluster. The benchmark itself runs only
-on a private VM in the AKS VNet. Run the provisioning and Azure Run Command
-commands below from the Unbounded repository root on an admin workstation.
+on the operator VM in the AKS VNet. Run the repository targets below from the
+Unbounded repository root on an admin workstation.
 
 ## 1. Provision The Operator VM
 
@@ -61,8 +61,9 @@ export BENCHMARK_SOURCE_REVISION="$SOURCE_REVISION"
 
 Provisioning creates:
 
-- A private `gantry-benchmark-operator` VM with no public IP.
-- A dedicated operator subnet with no inbound NSG rules.
+- A `gantry-benchmark-operator` VM with a static SSH public IP.
+- A dedicated operator subnet with key-only SSH on TCP 50001, restricted to
+   `OPERATOR_SSH_SOURCE_CIDR` or the deploying workstation's detected IPv4 `/32`.
 - A NAT gateway for package, GitHub, Go toolchain, and Azure API egress.
 - A 128 GiB Premium OS disk for the operating system and durable artifacts.
 - A dedicated 512 GiB Premium SSD v2 build disk, configured for 20,000 IOPS
@@ -73,6 +74,8 @@ Provisioning creates:
 - A system-assigned managed identity with `AcrPush` on both ACRs, AKS cluster
    admin credential access, resource-group `Reader`, and Log Analytics Reader.
 - The repository, tools, VM-only configuration, kubeconfig, and systemd unit.
+- A generated `tmp/<resource-group>/ssh-config` with the current public address,
+  port, identity file, and pinned host key.
 
 No ACR password, kubeconfig, or benchmark payload is copied from the admin
 workstation. The VM obtains tokens and cluster credentials using managed
@@ -103,13 +106,7 @@ kubectl -n gantry-system rollout status \
 ```
 
 ```bash
-export OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
-
-az vm run-command invoke \
-   -g "$AZURE_RESOURCE_GROUP" \
-   -n "$OPERATOR_VM_NAME" \
-   --command-id RunShellScript \
-   --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
+make -C hack/gantry-benchmark operator-vm-start
 ```
 
 The service performs `enable`, `prepare`, `preflight`, `run`, and `disable` from
@@ -120,14 +117,11 @@ the VM. Cleanup runs on success, failure, or interruption.
 Use the repository progress dashboard while the service is running:
 
 ```bash
-export AZURE_RESOURCE_GROUP="<resource-group>"
-export OPERATOR_VM_NAME="gantry-benchmark-operator"
-
 # One snapshot:
 make -C hack/gantry-benchmark operator-vm-status
 
 # Continuously refresh until completion or failure:
-WATCH_INTERVAL_SECONDS=30 make -C hack/gantry-benchmark operator-vm-watch
+make -C hack/gantry-benchmark operator-vm-watch
 ```
 
 The dashboard combines lifecycle heartbeat, build progress, Podman storage,
@@ -135,21 +129,19 @@ VM disk, active image command, Kubernetes Jobs, Gantry DaemonSet status, and
 recent logs. During a running lifecycle it never displays a previous run's
 comparison as if it were current.
 
-The full-stack operator VM has no public IP. Azure Run Command is the default
-monitoring transport. SSH is optional only over deliberately provided private
-network connectivity.
+All post-bootstrap controls and monitoring use the managed SSH endpoint on TCP
+50001. Azure Run Command is reserved for initial bootstrap and explicit SSH
+recovery. To open an interactive shell, use:
 
 ```bash
-az vm run-command invoke \
-   -g "$AZURE_RESOURCE_GROUP" \
-   -n "$OPERATOR_VM_NAME" \
-   --command-id RunShellScript \
-   --scripts \
-      'systemctl status gantry-benchmark-operator.service --no-pager || true' \
-      'tail -100 /var/log/gantry-benchmark/service.log' \
-      'cat /var/lib/gantry-benchmark/artifacts/last-run.json 2>/dev/null || true' \
-      'cat /var/lib/gantry-benchmark/artifacts/latest/comparison.md 2>/dev/null || true'
+make -C hack/gantry-benchmark operator-vm-ssh
 ```
+
+Run `make -C hack/gantry-benchmark operator-vm-ssh-configure` to reconcile an
+existing VM or refresh the source `/32` after the workstation public IP changes.
+
+Inside that shell, inspect `systemctl status gantry-benchmark-operator.service`
+or `/var/log/gantry-benchmark/service.log` for direct diagnosis.
 
 Complete artifacts stay on the VM under
 `/var/lib/gantry-benchmark/artifacts/<run-id>/`. The remaining sections describe

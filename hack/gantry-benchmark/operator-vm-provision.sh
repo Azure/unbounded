@@ -32,6 +32,10 @@ OPERATOR_SUBNET_CIDR="${OPERATOR_SUBNET_CIDR:-10.236.0.0/24}"
 OPERATOR_NSG_NAME="${OPERATOR_NSG_NAME:-gantry-benchmark-operator-nsg}"
 OPERATOR_NAT_NAME="${OPERATOR_NAT_NAME:-gantry-benchmark-operator-nat}"
 OPERATOR_NAT_PUBLIC_IP_NAME="${OPERATOR_NAT_PUBLIC_IP_NAME:-gantry-benchmark-operator-egress}"
+OPERATOR_SSH_PORT="${OPERATOR_SSH_PORT:-50001}"
+OPERATOR_SSH_PUBLIC_IP_NAME="${OPERATOR_SSH_PUBLIC_IP_NAME:-gantry-benchmark-operator-ssh}"
+OPERATOR_SSH_NSG_RULE_NAME="${OPERATOR_SSH_NSG_RULE_NAME:-allow-operator-ssh-50001}"
+OPERATOR_SSH_SOURCE_CIDR="${OPERATOR_SSH_SOURCE_CIDR:-}"
 BENCHMARK_REPO_URL="${BENCHMARK_REPO_URL:-https://github.com/Azure/unbounded.git}"
 BENCHMARK_REPO_BRANCH="${BENCHMARK_REPO_BRANCH:-private/gantry-benchmark-hardening}"
 BENCHMARK_SOURCE_IMAGE="${BENCHMARK_SOURCE_IMAGE:-}"
@@ -49,7 +53,14 @@ START_BENCHMARK="${START_BENCHMARK:-false}"
 
 repo_root=$(git rev-parse --show-toplevel)
 bootstrap_script="$repo_root/hack/gantry-benchmark/operator-vm-bootstrap.sh"
+ssh_configure_script="$repo_root/hack/gantry-benchmark/operator-vm-ssh-configure.sh"
 key_path="$repo_root/tmp/gantry-benchmark-operator-key"
+
+[[ "$OPERATOR_SSH_PORT" == 50001 ]] || {
+  echo "OPERATOR_SSH_PORT=$OPERATOR_SSH_PORT is unsupported; the operator contract requires 50001" >&2
+  exit 2
+}
+[[ -x "$ssh_configure_script" ]] || { echo "missing executable SSH reconciler: $ssh_configure_script" >&2; exit 1; }
 
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 
@@ -190,6 +201,7 @@ assign_role AcrPush "$gantry_acr_id"
 assign_role Reader "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP"
 assign_role "Log Analytics Reader" "$workspace_id"
 
+# Initial bootstrap is the one provisioning operation that precedes usable SSH.
 az vm run-command invoke \
   -g "$AZURE_RESOURCE_GROUP" \
   -n "$OPERATOR_VM_NAME" \
@@ -222,14 +234,19 @@ az vm run-command invoke \
   --only-show-errors \
   -o json
 
+AZURE_LOCATION="$AZURE_LOCATION" \
+OPERATOR_VM_NAME="$OPERATOR_VM_NAME" \
+OPERATOR_VM_ZONE="$OPERATOR_VM_ZONE" \
+OPERATOR_NSG_NAME="$OPERATOR_NSG_NAME" \
+OPERATOR_SSH_PORT="$OPERATOR_SSH_PORT" \
+OPERATOR_SSH_PUBLIC_IP_NAME="$OPERATOR_SSH_PUBLIC_IP_NAME" \
+OPERATOR_SSH_NSG_RULE_NAME="$OPERATOR_SSH_NSG_RULE_NAME" \
+OPERATOR_SSH_SOURCE_CIDR="$OPERATOR_SSH_SOURCE_CIDR" \
+OPERATOR_SSH_HOST_ALIAS="$OPERATOR_SSH_HOST_ALIAS" \
+  "$ssh_configure_script"
+
 if [[ "$START_BENCHMARK" == true ]]; then
-  az vm run-command invoke \
-    -g "$AZURE_RESOURCE_GROUP" \
-    -n "$OPERATOR_VM_NAME" \
-    --command-id RunShellScript \
-    --scripts 'systemctl start --no-block gantry-benchmark-operator.service' \
-    --only-show-errors \
-    -o none
+  "$repo_root/hack/gantry-benchmark/operator-vm-start.sh"
 fi
 
 cat <<SUMMARY
@@ -241,7 +258,7 @@ build mount: $OPERATOR_BUILD_MOUNT
 benchmark service: gantry-benchmark-operator.service
 image pool service: gantry-benchmark-image-builder.service
 start command:
-  az vm run-command invoke -g $AZURE_RESOURCE_GROUP -n $OPERATOR_VM_NAME --command-id RunShellScript --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-start
 status command:
   AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-status
 watch command:

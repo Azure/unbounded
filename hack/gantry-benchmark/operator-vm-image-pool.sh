@@ -4,9 +4,11 @@
 
 set -Eeuo pipefail
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$script_dir/operator-vm-ssh-common.sh"
+
 AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-}"
 OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
-OPERATOR_RUN_COMMAND_LOCK="${OPERATOR_RUN_COMMAND_LOCK:-${TMPDIR:-/tmp}/gantry-benchmark-${AZURE_RESOURCE_GROUP}-${OPERATOR_VM_NAME}.run-command.lock}"
 
 usage() {
   cat <<'USAGE'
@@ -40,14 +42,7 @@ gantry_benchmark_remote_status=\$?
 printf '${remote_status_marker}%s\\n' \"\$gantry_benchmark_remote_status\"
 exit 0"
 
-  if output=$(az vm run-command invoke \
-    -g "$AZURE_RESOURCE_GROUP" \
-    -n "$OPERATOR_VM_NAME" \
-    --command-id RunShellScript \
-    --scripts "$wrapped_script" \
-    --only-show-errors \
-    --query 'value[0].message' \
-    -o tsv); then
+  if output=$(operator_ssh sudo -n bash -s <<<"$wrapped_script"); then
     :
   else
     transport_status=$?
@@ -78,10 +73,7 @@ action=$1
 shift
 
 : "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP}"
-
-exec {run_command_lock_fd}>"$OPERATOR_RUN_COMMAND_LOCK"
-flock "$run_command_lock_fd"
-trap 'flock -u "$run_command_lock_fd"' EXIT
+operator_ssh_init
 
 case "$action" in
   start)

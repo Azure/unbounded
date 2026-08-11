@@ -23,9 +23,10 @@ GANTRY_NS="${GANTRY_NAMESPACE:-gantry-system}"
 
 export HOME KUBECONFIG
 
-service_state=$(systemctl is-active gantry-benchmark-operator.service 2>/dev/null || true)
-service_state=${service_state:-unknown}
-service_started=$(systemctl show gantry-benchmark-operator.service --property=ActiveEnterTimestamp --value 2>/dev/null || true)
+service_unit=gantry-benchmark-operator.service
+service_mode=benchmark
+benchmark_service_state=$(systemctl is-active gantry-benchmark-operator.service 2>/dev/null || true)
+prepare_service_state=$(systemctl is-active gantry-benchmark-image-prepare.service 2>/dev/null || true)
 
 state_json=""
 if [[ -f "$KUBECONFIG" ]]; then
@@ -37,6 +38,17 @@ progress_json=""
 if [[ -f "$ARTIFACT_ROOT/progress.json" ]]; then
   progress_json=$(cat "$ARTIFACT_ROOT/progress.json")
 fi
+
+progress_mode=$(jq -r '.mode // empty' <<<"${progress_json:-{}}" 2>/dev/null || true)
+if [[ "$benchmark_service_state" == active || "$benchmark_service_state" == activating || "$benchmark_service_state" == deactivating ]]; then
+  :
+elif [[ "$prepare_service_state" == active || "$prepare_service_state" == activating || "$prepare_service_state" == deactivating || "$prepare_service_state" == failed || "$progress_mode" == image-prepare ]]; then
+  service_unit=gantry-benchmark-image-prepare.service
+  service_mode=image-prepare
+fi
+service_state=$(systemctl is-active "$service_unit" 2>/dev/null || true)
+service_state=${service_state:-unknown}
+service_started=$(systemctl show "$service_unit" --property=ActiveEnterTimestamp --value 2>/dev/null || true)
 
 last_run_json=""
 if [[ -f "$ARTIFACT_ROOT/last-run.json" ]]; then
@@ -116,6 +128,8 @@ print_prepared_image_status() {
 printf '=== Gantry benchmark operator ===\n'
 printf 'time: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'service: %s\n' "$service_state"
+printf 'service unit: %s\n' "$service_unit"
+printf 'service mode: %s\n' "$service_mode"
 printf 'service started: %s\n' "${service_started:-unknown}"
 printf 'run ID: %s\n' "${run_id:-none}"
 
@@ -212,4 +226,9 @@ if [[ "$service_state" != active && "$service_state" != activating && -n "$lates
 fi
 
 printf '\n=== Recent log ===\n'
-tail -n "$LOG_LINES" /var/log/gantry-benchmark/service.log 2>/dev/null || true
+service_output=$(systemctl show "$service_unit" --property=StandardOutput --value 2>/dev/null || true)
+if [[ "$service_output" == journal* ]]; then
+  journalctl --unit "$service_unit" --lines "$LOG_LINES" --no-pager --output cat 2>/dev/null || true
+else
+  tail -n "$LOG_LINES" /var/log/gantry-benchmark/service.log 2>/dev/null || true
+fi

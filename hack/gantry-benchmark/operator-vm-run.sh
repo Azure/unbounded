@@ -12,6 +12,13 @@ set -a
 # shellcheck source=/dev/null
 . "$CONFIG_FILE"
 set +a
+RUN_CONFIG_FILE="${GANTRY_BENCHMARK_RUN_CONFIG:-}"
+if [[ -n "$RUN_CONFIG_FILE" && -f "$RUN_CONFIG_FILE" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$RUN_CONFIG_FILE"
+  set +a
+fi
 export ENV_FILE=/dev/null
 
 : "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID}"
@@ -23,6 +30,14 @@ export ENV_FILE=/dev/null
 : "${GANTRY_ACR_LOGIN_SERVER:?Set GANTRY_ACR_LOGIN_SERVER}"
 : "${BENCHMARK_REPO_ROOT:?Set BENCHMARK_REPO_ROOT}"
 : "${BENCHMARK_ARTIFACT_ROOT:?Set BENCHMARK_ARTIFACT_ROOT}"
+
+BENCHMARK_PREPARE_ONLY="${BENCHMARK_PREPARE_ONLY:-false}"
+[[ "$BENCHMARK_PREPARE_ONLY" == true || "$BENCHMARK_PREPARE_ONLY" == false ]] || {
+  echo "BENCHMARK_PREPARE_ONLY must be true or false" >&2
+  exit 2
+}
+lifecycle_mode=benchmark
+[[ "$BENCHMARK_PREPARE_ONLY" != true ]] || lifecycle_mode=image-prepare
 
 export HOME="${BENCHMARK_OPERATOR_HOME:-/var/lib/gantry-benchmark}"
 export KUBECONFIG="${KUBECONFIG:-$HOME/kubeconfig}"
@@ -52,10 +67,11 @@ write_progress() {
 
   jq -n \
     --arg run_id "$run_id" \
+    --arg mode "$lifecycle_mode" \
     --arg stage "$stage" \
     --arg message "$message" \
     --arg stage_started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{run_id:$run_id,stage:$stage,message:$message,stage_started_at:$stage_started_at}' \
+    '{run_id:$run_id,mode:$mode,stage:$stage,message:$message,stage_started_at:$stage_started_at}' \
     >"$temporary"
   mv "$temporary" "$BENCHMARK_ARTIFACT_ROOT/progress.json"
 }
@@ -101,9 +117,17 @@ cleanup() {
     >"$BENCHMARK_ARTIFACT_ROOT/last-run.json"
 
   if ((original_status == 0)); then
-    write_progress "completed" "benchmark lifecycle completed successfully"
+    if [[ "$BENCHMARK_PREPARE_ONLY" == true ]]; then
+      write_progress "completed" "benchmark images prepared successfully"
+    else
+      write_progress "completed" "benchmark lifecycle completed successfully"
+    fi
   else
-    write_progress "failed" "benchmark lifecycle exited with code $original_status"
+    if [[ "$BENCHMARK_PREPARE_ONLY" == true ]]; then
+      write_progress "failed" "benchmark image preparation exited with code $original_status"
+    else
+      write_progress "failed" "benchmark lifecycle exited with code $original_status"
+    fi
   fi
 
   return "$original_status"
@@ -151,6 +175,16 @@ if [[ -n "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]]; then
   [[ -z "${GANTRY_ONLY_PREPARED_RUN_ID:-}" ]] || ((preparation_modes += 1))
   ((preparation_modes <= 1)) || {
     echo "set only one of GANTRY_ONLY_ADOPT_IMAGE, GANTRY_ONLY_USE_IMAGE_POOL, GANTRY_ONLY_FRESH_IMAGE, or GANTRY_ONLY_PREPARED_RUN_ID" >&2
+    exit 2
+  }
+fi
+if [[ "$BENCHMARK_PREPARE_ONLY" == true ]]; then
+  [[ -z "${GANTRY_ONLY_BASELINE_RUN_ID:-}" ]] || {
+    echo "BENCHMARK_PREPARE_ONLY cannot be combined with a Gantry-only run" >&2
+    exit 2
+  }
+  [[ -z "${ADOPT_BASELINE_IMAGE:-}" && -z "${ADOPT_GANTRY_IMAGE:-}" && -z "${ADOPT_PAYLOAD_SHA256:-}" ]] || {
+    echo "BENCHMARK_PREPARE_ONLY requires fresh images rather than adopted images" >&2
     exit 2
   }
 fi
@@ -270,6 +304,11 @@ fi
 unset BASELINE_ACR_PASSWORD GANTRY_ACR_PASSWORD baseline_refresh_token gantry_refresh_token
 podman logout "$BASELINE_ACR_LOGIN_SERVER" >/dev/null 2>&1 || true
 podman logout "$GANTRY_ACR_LOGIN_SERVER" >/dev/null 2>&1 || true
+
+if [[ "$BENCHMARK_PREPARE_ONLY" == true ]]; then
+  write_progress "prepared" "both benchmark images were pushed; preparing cleanup"
+  exit 0
+fi
 
 write_progress "preflight" "validating nodes, Gantry, monitoring, ACRs, and telemetry"
 make -C hack/gantry-benchmark preflight
