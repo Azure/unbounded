@@ -556,3 +556,101 @@ func planWithApplied(hashes map[string]string) *component.Plan {
 
 	return plan
 }
+
+// perSiteCluster is a SiteComponent that plans one overridable per-Site
+// workload, so fan-out can be observed reaching it.
+type perSiteStorage struct{}
+
+func (perSiteStorage) Name() string                         { return "storage" }
+func (perSiteStorage) ConditionType() string                { return "StorageReady" }
+func (perSiteStorage) Enabled(*unboundedv1alpha3.Site) bool { return true }
+
+func (c perSiteStorage) Plan(_ context.Context, _ *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	workload := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata":   map[string]any{"name": "unbounded-storage-supervisor-" + site.Name, "namespace": component.DefaultNamespace},
+		"spec": map[string]any{
+			"selector": map[string]any{"matchLabels": map[string]any{"app": "storage"}},
+			"template": map[string]any{
+				"metadata": map[string]any{"labels": map[string]any{"app": "storage"}},
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{"name": "run", "image": "storage:v1", "args": []any{"--config"}},
+					},
+				},
+			},
+		},
+	}}
+
+	plan := component.NewPlan()
+	plan.Add(component.Operation{
+		Kind:        component.OpApply,
+		Object:      workload,
+		Component:   c.Name(),
+		Site:        site.Name,
+		Overridable: true,
+	})
+
+	return plan, component.Reconciled(), nil
+}
+
+func (perSiteStorage) CleanupPlan(context.Context, *component.Env, *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	return component.NewPlan(), component.Disabled("component disabled"), nil
+}
+
+// TestOverridesReachPerSiteComponentsViaFanOut is the end-to-end proof that the
+// fan-out does its job.
+//
+// The overrides ConfigMap watch enqueues only the singleton request. Without
+// the Site-less pass reconciling every Site, an override targeting storage or
+// metalman would sit in the ConfigMap and never take effect.
+func TestOverridesReachPerSiteComponentsViaFanOut(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+
+	alpha := siteFor("alpha")
+	bravo := siteFor("bravo")
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(alpha, bravo, overridesConfigMap(map[string]string{
+			"overrides.yaml": `apiVersion: ` + override.APIVersion + `
+overrides:
+  - component: storage
+    kind: DaemonSet
+    sites: [bravo]
+    extraArgs:
+      run: ["--only-bravo"]
+`,
+		})).
+		WithStatusSubresource(alpha, bravo).
+		Build()
+
+	r := &SiteReconciler{
+		Client:   cl,
+		Scheme:   scheme,
+		Registry: &component.Registry{Site: []component.SiteComponent{perSiteStorage{}}},
+	}
+
+	// A singleton request, exactly what the ConfigMap watch enqueues.
+	if _, err := r.Reconcile(t.Context(), singletonRequest()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// bravo received the override.
+	got := appliedDaemonSet(t, cl, "unbounded-storage-supervisor-bravo")
+	if args := got.Spec.Template.Spec.Containers[0].Args; len(args) != 2 || args[1] != "--only-bravo" {
+		t.Fatalf("bravo args = %v, want the override appended", args)
+	}
+
+	// alpha was reconciled by the same pass but not selected, so it keeps the
+	// operator's arguments untouched.
+	untouched := appliedDaemonSet(t, cl, "unbounded-storage-supervisor-alpha")
+	if args := untouched.Spec.Template.Spec.Containers[0].Args; len(args) != 1 {
+		t.Fatalf("alpha args = %v, want the operator's only", args)
+	}
+
+	if untouched.Annotations[override.HashAnnotation] != "" {
+		t.Fatal("an unselected Site's workload must carry no override hash")
+	}
+}

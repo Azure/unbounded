@@ -75,6 +75,27 @@ func (f fakeSite) CleanupPlan(context.Context, *component.Env, *unboundedv1alpha
 	return component.NewPlan(), component.Disabled("component disabled"), nil
 }
 
+// countingSite is a SiteComponent that counts how many Sites it planned for.
+type countingSite struct {
+	name      string
+	condition string
+	runs      *int
+}
+
+func (c countingSite) Name() string                       { return c.name }
+func (c countingSite) ConditionType() string              { return c.condition }
+func (countingSite) Enabled(*unboundedv1alpha3.Site) bool { return true }
+
+func (c countingSite) Plan(context.Context, *component.Env, *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	*c.runs++
+
+	return component.NewPlan(), component.Reconciled(), nil
+}
+
+func (countingSite) CleanupPlan(context.Context, *component.Env, *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	return component.NewPlan(), component.Disabled("component disabled"), nil
+}
+
 // statefulCluster is a pointer-receiver ClusterComponent that counts how many
 // times it planned, used to prove the driver reuses a single registry
 // instance instead of rebuilding it each pass.
@@ -216,7 +237,7 @@ func TestReconcileJoinsStatusPatchError(t *testing.T) {
 	}
 }
 
-func TestReconcileSiteLessPassRunsClusterComponentsOnly(t *testing.T) {
+func TestReconcileSiteLessPassWithNoSitesRunsClusterComponentsOnly(t *testing.T) {
 	scheme := newReconcilerTestScheme(t)
 
 	clusterRan := false
@@ -246,8 +267,63 @@ func TestReconcileSiteLessPassRunsClusterComponentsOnly(t *testing.T) {
 		t.Fatal("cluster component did not run on the Site-less pass")
 	}
 
+	// With no Sites there is nothing to fan out to, and nowhere to publish
+	// conditions.
 	if siteReconciled || siteCleaned {
-		t.Fatalf("site component ran on the Site-less pass: reconciled=%t cleaned=%t", siteReconciled, siteCleaned)
+		t.Fatalf("site component ran with no Sites: reconciled=%t cleaned=%t", siteReconciled, siteCleaned)
+	}
+}
+
+// TestReconcileSiteLessPassFansOutToEverySite covers why the fan-out exists.
+//
+// The overrides ConfigMap watch enqueues only the synthetic singleton request,
+// because a handler that listed Sites at event-delivery time would consume the
+// event and lose the fan-out permanently whenever that List failed. Without
+// fanning out here, per-Site components would never see an override change.
+func TestReconcileSiteLessPassFansOutToEverySite(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+
+	var reconciled int
+
+	registry := &component.Registry{
+		Cluster: []component.ClusterComponent{
+			fakeCluster{name: "net", condition: "NetReady", result: component.Reconciled()},
+		},
+		Site: []component.SiteComponent{
+			countingSite{name: "storage", condition: "StorageReady", runs: &reconciled},
+		},
+	}
+
+	alpha := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "alpha"}}
+	bravo := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "bravo"}}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(alpha, bravo).
+		WithStatusSubresource(alpha, bravo).
+		Build()
+
+	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: component.SingletonRequestName}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if reconciled != 2 {
+		t.Fatalf("site component ran %d times, want once per Site", reconciled)
+	}
+
+	// Conditions must be published on every Site the pass touched, or a
+	// fanned-out failure would be invisible.
+	for _, name := range []string{"alpha", "bravo"} {
+		var got unboundedv1alpha3.Site
+		if err := cl.Get(t.Context(), client.ObjectKey{Name: name}, &got); err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+
+		if len(got.Status.Conditions) == 0 {
+			t.Fatalf("Site %s received no conditions from the fan-out", name)
+		}
 	}
 }
 

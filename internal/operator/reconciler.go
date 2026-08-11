@@ -156,11 +156,13 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		return ctrl.Result{}, err
 	}
 
-	// Capture the status baseline before any component mutates conditions so the
-	// merge patch carries exactly the condition changes.
-	var patch client.Patch
-	if site != nil {
-		patch = client.MergeFrom(site.DeepCopy())
+	targets := fanOutTargets(site, sites)
+
+	// Capture each target's status baseline before any component mutates
+	// conditions, so the merge patch carries exactly the condition changes.
+	baselines := make(map[string]client.Patch, len(targets))
+	for _, target := range targets {
+		baselines[target.Name] = client.MergeFrom(target.DeepCopy())
 	}
 
 	// Read and validate overrides once, before anything is planned. Parsing and
@@ -171,8 +173,9 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 
 	// Plan every component before executing any of it. Planning performs no
 	// writes, so a planning failure leaves the cluster untouched, and the
-	// merged plan is what lets shared operations deduplicate across components.
-	planned, plan := planComponents(ctx, env, reg, sites, site)
+	// merged plan is what lets shared operations deduplicate across components
+	// and across Sites.
+	clusterOutcomes, siteOutcomes, plan := planComponents(ctx, env, reg, sites, targets)
 
 	report, overrideErr := applyOverrides(logger, plan, snapshot, sites)
 
@@ -194,12 +197,12 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		reconcileErrs = append(reconcileErrs, fmt.Errorf("execute plan: %w", execErr))
 	}
 
-	for _, outcome := range planned {
+	record := func(target *unboundedv1alpha3.Site, outcome componentOutcome) {
 		res := component.CombineResult(outcome.name, outcome.result, exec)
 
 		switch {
-		case site != nil:
-			if err := setComponentResult(logger, site, outcome.name, outcome.conditionType, res); err != nil {
+		case target != nil:
+			if err := setComponentResult(logger, target, outcome.name, outcome.conditionType, res); err != nil {
 				reconcileErrs = append(reconcileErrs, err)
 			}
 		case res.Err != nil:
@@ -209,13 +212,31 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		requeueAfter = nextRequeue(requeueAfter, res.RequeueAfter)
 	}
 
-	if site != nil {
-		pruneStaleConditions(site, reg)
+	// With no Sites there is nowhere to publish conditions, so cluster outcomes
+	// surface only as errors and requeue requests.
+	if len(targets) == 0 {
+		for _, outcome := range clusterOutcomes {
+			record(nil, outcome)
+		}
 
-		r.publishOverrideStatus(ctx, site, snapshot, report, plan)
+		return ctrl.Result{RequeueAfter: requeueAfter}, errors.Join(reconcileErrs...)
+	}
 
-		if err := r.Status().Patch(ctx, site, patch); err != nil {
-			reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status: %w", err))
+	for _, target := range targets {
+		for _, outcome := range clusterOutcomes {
+			record(target, outcome)
+		}
+
+		for _, outcome := range siteOutcomes[target.Name] {
+			record(target, outcome)
+		}
+
+		pruneStaleConditions(target, reg)
+
+		r.publishOverrideStatus(ctx, target, snapshot, report, plan)
+
+		if err := r.Status().Patch(ctx, target, baselines[target.Name]); err != nil {
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status for %s: %w", target.Name, err))
 		}
 	}
 
@@ -287,9 +308,10 @@ func planComponents(
 	env *component.Env,
 	reg *component.Registry,
 	sites []unboundedv1alpha3.Site,
-	site *unboundedv1alpha3.Site,
-) ([]componentOutcome, *component.Plan) {
-	outcomes := make([]componentOutcome, 0, len(reg.Cluster)+len(reg.Site))
+	targets []*unboundedv1alpha3.Site,
+) ([]componentOutcome, map[string][]componentOutcome, *component.Plan) {
+	cluster := make([]componentOutcome, 0, len(reg.Cluster))
+	perSite := make(map[string][]componentOutcome, len(targets))
 	plan := component.NewPlan()
 
 	for _, c := range reg.Cluster {
@@ -300,25 +322,53 @@ func planComponents(
 			plan.Merge(componentPlan)
 		}
 
-		outcomes = append(outcomes, componentOutcome{name: c.Name(), conditionType: c.ConditionType(), result: res})
+		cluster = append(cluster, componentOutcome{name: c.Name(), conditionType: c.ConditionType(), result: res})
 	}
 
-	if site == nil {
-		return outcomes, plan
-	}
+	for _, target := range targets {
+		outcomes := make([]componentOutcome, 0, len(reg.Site))
 
-	for _, c := range reg.Site {
-		componentPlan, res, err := planSiteComponent(ctx, env, c, site)
-		if err != nil {
-			res = component.Failed(err)
-		} else {
-			plan.Merge(componentPlan)
+		for _, c := range reg.Site {
+			componentPlan, res, err := planSiteComponent(ctx, env, c, target)
+			if err != nil {
+				res = component.Failed(err)
+			} else {
+				plan.Merge(componentPlan)
+			}
+
+			outcomes = append(outcomes, componentOutcome{name: c.Name(), conditionType: c.ConditionType(), result: res})
 		}
 
-		outcomes = append(outcomes, componentOutcome{name: c.Name(), conditionType: c.ConditionType(), result: res})
+		perSite[target.Name] = outcomes
 	}
 
-	return outcomes, plan
+	return cluster, perSite, plan
+}
+
+// fanOutTargets returns the Sites whose per-Site components this pass runs.
+//
+// A Site-scoped request reconciles just that Site. The Site-less pass, which a
+// singleton request uses, reconciles every Site.
+//
+// That fan-out is why it exists. The overrides ConfigMap watch enqueues only
+// the singleton request, so without it metalman and storage would never see an
+// override change. Doing the fan-out here rather than in the watch handler is
+// what makes it retryable: a handler that listed Sites at event-delivery time
+// would consume the event and lose the fan-out permanently if that List failed.
+//
+// It is bounded by Site count, which is per-location and small, and every
+// operation is idempotent, so re-running costs an apply rather than a change.
+func fanOutTargets(site *unboundedv1alpha3.Site, sites []unboundedv1alpha3.Site) []*unboundedv1alpha3.Site {
+	if site != nil {
+		return []*unboundedv1alpha3.Site{site}
+	}
+
+	targets := make([]*unboundedv1alpha3.Site, 0, len(sites))
+	for i := range sites {
+		targets = append(targets, &sites[i])
+	}
+
+	return targets
 }
 
 // planSiteComponent owns the enable/disable branch: an enabled component plans
