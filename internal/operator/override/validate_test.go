@@ -644,3 +644,117 @@ func TestValidateRejectsNonStringLabelValues(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateRejectsTheWrongShape is a regression test for a silent
+// corruption.
+//
+// Strategic merge does not police the JSON type of a field. A patch writing
+// `containers` as a mapping rather than a list, which is one missing `-` and
+// the most ordinary YAML mistake there is, merged cleanly and produced an
+// object whose containers field was no longer an array. The override was
+// hashed, the Site reported Applied, and the apiserver rejected the workload
+// with "cannot unmarshal object into Go struct field PodSpec.containers of type
+// []v1.Container", which says nothing about the line the user got wrong.
+func TestValidateRejectsTheWrongShape(t *testing.T) {
+	cases := map[string]struct {
+		patch string
+		want  string
+	}{
+		"containers as a mapping": {
+			patch: "  spec:\n    template:\n      spec:\n        containers:\n          name: agent\n          image: x\n",
+			want:  "spec.template.spec.containers must be a list",
+		},
+		"env as a mapping": {
+			patch: "  spec:\n    template:\n      spec:\n        containers:\n          - name: agent\n            env:\n              name: A\n              value: B\n",
+			want:  "spec.template.spec.containers.*.env must be a list",
+		},
+		"args as a scalar": {
+			patch: "  spec:\n    template:\n      spec:\n        containers:\n          - name: agent\n            args: --one --two\n",
+			want:  "spec.template.spec.containers.*.args must be a list",
+		},
+		"labels as a list": {
+			patch: "  metadata:\n    labels:\n      - a=b\n",
+			want:  "metadata.labels must be a mapping",
+		},
+		"nodeSelector as a list": {
+			patch: "  spec:\n    template:\n      spec:\n        nodeSelector:\n          - disktype=ssd\n",
+			want:  "spec.template.spec.nodeSelector must be a mapping",
+		},
+		"resources as a list": {
+			patch: "  spec:\n    template:\n      spec:\n        containers:\n          - name: agent\n            resources:\n              - cpu: 1\n",
+			want:  "spec.template.spec.containers.*.resources must be a mapping",
+		},
+		"tolerations as a mapping": {
+			patch: "  spec:\n    template:\n      spec:\n        tolerations:\n          key: edge\n          operator: Exists\n",
+			want:  "spec.template.spec.tolerations must be a list",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := validateFragment(t, "component: net\nkind: DaemonSet\npatch:\n"+tc.patch)
+			if err == nil {
+				t.Fatal("a value of the wrong type must be rejected")
+			}
+
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to contain %q", err, tc.want)
+			}
+
+			if !strings.Contains(err.Error(), "indentation") {
+				t.Fatalf("error = %q, want it to point at the likely cause", err)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsTheRightShape confirms the check is not simply refusing
+// everything structural.
+func TestValidateAcceptsTheRightShape(t *testing.T) {
+	err := validateFragment(t, `
+component: net
+kind: DaemonSet
+patch:
+  metadata:
+    labels:
+      team: infra
+  spec:
+    template:
+      spec:
+        nodeSelector:
+          disktype: ssd
+        tolerations:
+          - key: edge
+            operator: Exists
+        containers:
+          - name: node
+            args:
+              - --one
+            env:
+              - name: A
+                value: B
+            resources:
+              requests:
+                cpu: 100m
+`)
+	if err != nil {
+		t.Fatalf("a correctly shaped patch must be accepted: %v", err)
+	}
+}
+
+// TestValidateReportsOneProblemPerWrongShape checks that a shape error stops
+// the walk into the value. Walking into a mapping that should have been a list
+// produces a cascade of complaints about paths that only exist because the
+// shape is wrong, burying the one message that matters.
+func TestValidateReportsOneProblemPerWrongShape(t *testing.T) {
+	err := validateFragment(t,
+		"component: net\nkind: DaemonSet\npatch:\n  spec:\n    template:\n      spec:\n"+
+			"        containers:\n          name: agent\n          image: x\n          nonsense: y\n")
+	if err == nil {
+		t.Fatal("expected a shape error")
+	}
+
+	if got := strings.Count(err.Error(), "\n"); got > 1 {
+		t.Fatalf("error reports %d lines, want the single shape problem:\n%s", got, err)
+	}
+}

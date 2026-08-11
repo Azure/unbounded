@@ -171,10 +171,16 @@ does not depend on the check being exhaustive:
 | `spec.template.spec.serviceAccountName` | Retargeting borrows another identity's API permissions. |
 | `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. |
 | Labels and annotations under `unbounded-cloud.io/` | They carry config hashes, Site scoping and override visibility. |
-| Operator-declared volumes and mounts | Mount identity is `(container, mountPath)`, because `volumeMounts` merge on `mountPath` rather than on name. |
+| Operator-declared mounts | Mount identity is `(container, mountPath)`, because `volumeMounts` merge on `mountPath` rather than on name, so protecting them by name would be bypassable. |
+| Operator-declared volumes | `volumes` merge on `name`, so redefining one repoints every mount that uses it without naming a `mountPath` anywhere. Adding volumes under new names is fine. |
 
 Strategic merge directives (any `$`-prefixed key) and explicit `null` values are
 rejected everywhere, because both can delete operator-managed content.
+
+Values are checked against the type Kubernetes requires. Writing `containers:`
+as a mapping rather than a list, or `nodeSelector:` as a list rather than a
+mapping, is reported against the field rather than merged into a workload the
+API server will later refuse.
 
 Anything not listed as overridable is rejected. Within a permitted subtree such
 as `resources` or `securityContext`, fields added by future Kubernetes releases

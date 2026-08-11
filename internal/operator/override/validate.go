@@ -297,6 +297,13 @@ func walkPatchMap(value map[string]any, path string, node *pathNode, report func
 			reportNonStringValues(value[key], childPath, report)
 		}
 
+		if !reportShape(value[key], childPath, report) {
+			// The value is the wrong type, so walking into it would produce a
+			// cascade of misleading messages about paths that only exist
+			// because the shape is wrong.
+			continue
+		}
+
 		reportMergeKeyTypes(value[key], childPath, report)
 
 		if child.subtree {
@@ -381,6 +388,33 @@ func walkSubtree(value any, path string, report func(string)) {
 			walkSubtree(element, path, report)
 		}
 	}
+}
+
+// reportShape rejects a value whose JSON type the Kubernetes schema fixes,
+// reporting whether the value may be walked into.
+//
+// Strategic merge does not police this. A patch writing `containers` as a
+// mapping rather than a list merged cleanly and produced an object whose
+// containers field was no longer an array; the override was hashed and reported
+// Applied, and the apiserver rejected the workload with a decoding error naming
+// a Go type. One missing `-` in the YAML is the most ordinary mistake a user
+// can make here, and it deserves to be named.
+func reportShape(value any, path string, report func(string)) bool {
+	// An explicit null is a deletion attempt, which has its own message and a
+	// far more important reason for being refused.
+	if value == nil {
+		return true
+	}
+
+	want := shapeOf(path)
+	if want == shapeAny || matchesShape(value, want) {
+		return true
+	}
+
+	report(fmt.Sprintf("%s must be %s, but the patch has %s; check the indentation",
+		path, want, describeValueShape(value)))
+
+	return false
 }
 
 // reportReservedKeys rejects label or annotation keys under the operator's own

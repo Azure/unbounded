@@ -69,7 +69,11 @@ var permittedPaths = []struct {
 	{path: "spec.template.spec.containers.*.terminationMessagePolicy"},
 	{path: "spec.template.spec.containers.*.workingDir"},
 
-	// Init containers accept the same surface.
+	// Init containers accept the same surface. Kubernetes uses the identical
+	// Container type for both, and a native sidecar (an init container with
+	// restartPolicy: Always) runs for the life of the pod, so it needs probes,
+	// lifecycle hooks and ports exactly as an ordinary container does. The
+	// parity is enforced by a test rather than left to whoever edits this list.
 	{path: "spec.template.spec.initContainers.*.name"},
 	{path: "spec.template.spec.initContainers.*.image"},
 	{path: "spec.template.spec.initContainers.*.imagePullPolicy"},
@@ -80,6 +84,18 @@ var permittedPaths = []struct {
 	{path: "spec.template.spec.initContainers.*.resources", subtree: true},
 	{path: "spec.template.spec.initContainers.*.volumeMounts", subtree: true},
 	{path: "spec.template.spec.initContainers.*.securityContext", subtree: true},
+	{path: "spec.template.spec.initContainers.*.livenessProbe", subtree: true},
+	{path: "spec.template.spec.initContainers.*.readinessProbe", subtree: true},
+	{path: "spec.template.spec.initContainers.*.startupProbe", subtree: true},
+	{path: "spec.template.spec.initContainers.*.lifecycle", subtree: true},
+	{path: "spec.template.spec.initContainers.*.ports", subtree: true},
+	{path: "spec.template.spec.initContainers.*.terminationMessagePath"},
+	{path: "spec.template.spec.initContainers.*.terminationMessagePolicy"},
+	{path: "spec.template.spec.initContainers.*.workingDir"},
+
+	// restartPolicy is the one asymmetry, and it is deliberate: on an init
+	// container it is what declares a native sidecar, and Kubernetes rejects
+	// it on an ordinary container.
 	{path: "spec.template.spec.initContainers.*.restartPolicy"},
 
 	// Pod spec.
@@ -153,6 +169,7 @@ var mergeKeyTypes = map[string]struct {
 	"spec.template.spec.initContainers.*.volumeMounts": {field: "mountPath", kind: "string"},
 	"spec.template.spec.containers.*.ports":            {field: "containerPort", kind: "number"},
 	"spec.template.spec.initContainers.*.ports":        {field: "containerPort", kind: "number"},
+	"spec.template.spec.topologySpreadConstraints":     {field: "topologyKey", kind: "string"},
 	"spec.template.spec.tolerations":                   {field: "", kind: ""},
 }
 
@@ -168,6 +185,127 @@ var stringValuedPaths = map[string]bool{
 	"spec.template.metadata.labels":      true,
 	"spec.template.metadata.annotations": true,
 	"spec.template.spec.nodeSelector":    true,
+}
+
+// shape is the JSON type the Kubernetes schema fixes for a path.
+type shape int
+
+const (
+	// shapeAny marks a path whose type is not constrained here, either because
+	// it is a scalar leaf or because the value below it is free-form.
+	shapeAny shape = iota
+
+	// shapeList marks a path that must hold a JSON array.
+	shapeList
+
+	// shapeMap marks a path that must hold a JSON object.
+	shapeMap
+)
+
+func (s shape) String() string {
+	switch s {
+	case shapeList:
+		return "a list"
+	case shapeMap:
+		return "a mapping"
+	default:
+		return "any type"
+	}
+}
+
+// pathShapes fixes the JSON type of every structural path a patch can reach.
+//
+// Without this a patch could write the wrong shape and the merge would report
+// success. `containers:` written as a mapping rather than a list (one missing
+// `-`, the most ordinary YAML mistake there is) merged cleanly, produced an
+// object whose containers field was no longer an array, stamped the override
+// hash on it and reported Applied. The apiserver then rejected the workload
+// with a JSON decoding error naming a Go type, which tells the user nothing
+// about the line they got wrong.
+//
+// A test requires an entry here for every path that is a permitted subtree or
+// has a wildcard child, so this cannot fall behind permittedPaths.
+var pathShapes = buildPathShapes()
+
+// buildPathShapes assembles the table, expanding the container field shapes
+// over both containers and initContainers so the two cannot drift apart.
+func buildPathShapes() map[string]shape {
+	shapes := map[string]shape{
+		"metadata.labels":                    shapeMap,
+		"metadata.annotations":               shapeMap,
+		"spec.strategy":                      shapeMap,
+		"spec.updateStrategy":                shapeMap,
+		"spec.template.metadata.labels":      shapeMap,
+		"spec.template.metadata.annotations": shapeMap,
+
+		"spec.template.spec.containers":     shapeList,
+		"spec.template.spec.initContainers": shapeList,
+
+		"spec.template.spec.volumes":                   shapeList,
+		"spec.template.spec.imagePullSecrets":          shapeList,
+		"spec.template.spec.nodeSelector":              shapeMap,
+		"spec.template.spec.tolerations":               shapeList,
+		"spec.template.spec.affinity":                  shapeMap,
+		"spec.template.spec.topologySpreadConstraints": shapeList,
+		"spec.template.spec.dnsConfig":                 shapeMap,
+		"spec.template.spec.securityContext":           shapeMap,
+	}
+
+	for _, field := range []string{"containers", "initContainers"} {
+		for name, want := range containerShapes {
+			shapes["spec.template.spec."+field+".*."+name] = want
+		}
+	}
+
+	return shapes
+}
+
+// containerShapes fixes the type of the fields on a container, applied to both
+// containers and initContainers so the two cannot drift apart.
+var containerShapes = map[string]shape{
+	"args":            shapeList,
+	"command":         shapeList,
+	"env":             shapeList,
+	"envFrom":         shapeList,
+	"volumeMounts":    shapeList,
+	"ports":           shapeList,
+	"resources":       shapeMap,
+	"securityContext": shapeMap,
+	"livenessProbe":   shapeMap,
+	"readinessProbe":  shapeMap,
+	"startupProbe":    shapeMap,
+	"lifecycle":       shapeMap,
+}
+
+// shapeOf returns the type a path must hold.
+func shapeOf(path string) shape { return pathShapes[path] }
+
+// matchesShape reports whether a value has the required type.
+func matchesShape(value any, want shape) bool {
+	switch want {
+	case shapeList:
+		_, ok := value.([]any)
+
+		return ok
+	case shapeMap:
+		_, ok := value.(map[string]any)
+
+		return ok
+	default:
+		return true
+	}
+}
+
+// describeValueShape names a value's JSON type for an error message.
+func describeValueShape(value any) string {
+	switch value.(type) {
+	case []any:
+		return "a list"
+	case map[string]any:
+		return "a mapping"
+	default:
+		return "a scalar"
+	}
 }
 
 // pathNode is one node in the allowlist trie.
