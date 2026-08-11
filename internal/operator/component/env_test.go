@@ -4,8 +4,6 @@
 package component
 
 import (
-	"context"
-	"errors"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -16,9 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/workqueue"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -320,42 +316,40 @@ func TestManagedWorkloadPredicate(t *testing.T) {
 	}
 }
 
-func TestSingletonRequestBuilders(t *testing.T) {
+// TestSingletonRequestIsTheOnlyFanOut pins the shape of the cluster-component
+// watches.
+//
+// A ConfigMap change used to enqueue the singleton request plus one request per
+// Site. The singleton pass already reconciles every Site, so those were N
+// redundant full passes for a single edit, each re-planning and re-applying
+// every component for a Site the singleton pass had just covered.
+//
+// The helper that produced them also listed Sites at event-delivery time and,
+// when the List failed, logged and returned only the singleton, silently
+// dropping the fan-out with no retry. Keeping the fan-out inside Reconcile
+// means a failure is returned and retried with backoff instead.
+func TestSingletonRequestIsTheOnlyFanOut(t *testing.T) {
 	env := &Env{Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
 		&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}},
 		&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "cluster"}},
 	).Build()}
 
-	if got := env.singletonRequest(); len(got) != 1 || got[0].Name != SingletonRequestName {
-		t.Fatalf("singletonRequest = %#v", got)
+	queue := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+	defer queue.ShutDown()
+
+	changed := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "unbounded-system", Name: "net-config"}}
+
+	env.RequestSingleton().Create(t.Context(), event.CreateEvent{Object: changed}, queue)
+
+	// Two Sites exist, and neither may produce a request of its own.
+	if got := queue.Len(); got != 1 {
+		t.Fatalf("one ConfigMap change enqueued %d requests, want only the singleton", got)
 	}
 
-	requests := env.singletonAndAllSiteRequests(t.Context())
-
-	names := map[string]bool{}
-	for _, request := range requests {
-		names[request.Name] = true
-	}
-
-	if len(requests) != 3 || !names[SingletonRequestName] || !names["edge"] || !names["cluster"] {
-		t.Fatalf("singletonAndAllSiteRequests = %#v, want singleton, edge, cluster", requests)
-	}
-}
-
-func TestSingletonAndAllSiteRequestsPreservesSingletonOnListError(t *testing.T) {
-	listErr := errors.New("Site list failed")
-	env := &Env{Client: fake.NewClientBuilder().
-		WithScheme(testScheme(t)).
-		WithInterceptorFuncs(interceptor.Funcs{
-			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-				return listErr
-			},
-		}).
-		Build()}
-
-	requests := env.singletonAndAllSiteRequests(t.Context())
-	if len(requests) != 1 || requests[0].Name != SingletonRequestName {
-		t.Fatalf("singletonAndAllSiteRequests = %#v, want singleton after list failure", requests)
+	request, _ := queue.Get()
+	if request.Name != SingletonRequestName {
+		t.Fatalf("request = %q, want %q", request.Name, SingletonRequestName)
 	}
 }
 

@@ -12,7 +12,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -27,32 +26,6 @@ func (e *Env) RequestSingleton() handler.EventHandler {
 
 func (e *Env) singletonRequest() []ctrl.Request {
 	return []ctrl.Request{{NamespacedName: client.ObjectKey{Name: SingletonRequestName}}}
-}
-
-// RequestSingletonAndAllSites enqueues the singleton request plus every Site, so
-// a change to a shared cluster config re-reconciles cluster state and refreshes
-// each Site's status conditions.
-func (e *Env) RequestSingletonAndAllSites() handler.EventHandler {
-	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []ctrl.Request {
-		return e.singletonAndAllSiteRequests(ctx)
-	})
-}
-
-func (e *Env) singletonAndAllSiteRequests(ctx context.Context) []ctrl.Request {
-	requests := e.singletonRequest()
-
-	sites, err := e.ListSites(ctx)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "list Sites after managed config change")
-
-		return requests
-	}
-
-	for i := range sites {
-		requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKey{Name: sites[i].Name}})
-	}
-
-	return requests
 }
 
 // InNamespaceNamed returns a matcher for objects in the operator namespace whose

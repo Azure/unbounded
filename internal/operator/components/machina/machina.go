@@ -110,7 +110,10 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 // SetupWatches reconciles machina on changes to its config payload and on
 // create/delete/generation changes of its controller Deployment.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
-	b.Watches(&corev1.ConfigMap{}, env.RequestSingletonAndAllSites(),
+	// The singleton request already fans out to every Site, so enqueuing
+	// the Sites as well would run one redundant pass per Site for a single
+	// ConfigMap edit.
+	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName))))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
