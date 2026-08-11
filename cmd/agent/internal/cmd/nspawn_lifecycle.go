@@ -7,13 +7,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"runtime"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
+	"github.com/Azure/unbounded/pkg/agent/nspawnlifecycle"
 )
 
 func newCmdNSpawnLifecycle(cmdCtx *CommandContext) *cobra.Command {
@@ -54,68 +53,48 @@ func newCmdNSpawnLifecyclePhase(
 	}
 }
 
-func runNSpawnLifecycleReconcile(ctx context.Context, log *slog.Logger, machineName string) error {
-	return phases.ExecuteTask(ctx, log, nodestart.ReconcileNSpawnLifecycle(log, machineName))
+func newNSpawnLifecycle(log *slog.Logger) (*nspawnlifecycle.Lifecycle, error) {
+	return nspawnlifecycle.New(log, nspawnlifecycle.Hooks{
+		LoadConfig: func(_ context.Context, machineName string) (*config.AgentConfig, bool, error) {
+			return loadAppliedConfig(
+				log,
+				goalstates.AppliedConfigPath(machineName),
+				goalstates.AppliedConfigChecksumPath(machineName),
+			)
+		},
+	})
 }
 
-type (
-	waitForLifecycleMachineFunc func(context.Context, *slog.Logger, string) error
-	reconcileNVIDIATaskFunc     func(*slog.Logger, *goalstates.NodeStart) phases.Task
-	resolveNVIDIAHostFunc       func(string) (goalstates.NvidiaHost, error)
-)
+func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineName string) error {
+	lifecycle, err := newNSpawnLifecycle(log)
+	if err != nil {
+		return err
+	}
+
+	return lifecycle.PreStart(ctx, machineName)
+}
 
 func runNSpawnLifecyclePostStart(ctx context.Context, log *slog.Logger, machineName string) error {
-	return nspawnLifecyclePostStart(
-		ctx,
-		log,
-		machineName,
-		goalstates.ResolveNvidiaHost,
-		nodestart.WaitForMachine,
-		nodestart.ReconcileNVIDIA,
-		phases.ExecuteTask,
-	)
+	lifecycle, err := newNSpawnLifecycle(log)
+	if err != nil {
+		return err
+	}
+
+	return lifecycle.PostStart(ctx, machineName)
 }
 
-func nspawnLifecyclePostStart(
-	ctx context.Context,
-	log *slog.Logger,
-	machineName string,
-	resolveNVIDIA resolveNVIDIAHostFunc,
-	waitForMachine waitForLifecycleMachineFunc,
-	reconcileNVIDIA reconcileNVIDIATaskFunc,
-	executeTask executeLifecycleTaskFunc,
-) error {
-	nvidia, err := resolveNVIDIA(runtime.GOARCH)
+func runNSpawnLifecycleReconcile(ctx context.Context, log *slog.Logger, machineName string) error {
+	lifecycle, err := newNSpawnLifecycle(log)
 	if err != nil {
-		return fmt.Errorf("resolve NVIDIA host state: %w", err)
+		return err
 	}
 
-	if len(nvidia.GPUDevicePaths) == 0 {
-		log.Info("no NVIDIA devices discovered; skipping post-start rewiring", "machine", machineName)
+	return lifecycle.Reconcile(ctx, machineName)
+}
 
-		return nil
-	}
-
-	if !goalstates.NVIDIAStateAvailable(nvidia) {
-		return fmt.Errorf("%w for machine %s", goalstates.ErrNVIDIAStateUnavailable, machineName)
-	}
-
-	nvidia.Required = true
-
-	if err := waitForMachine(ctx, log, machineName); err != nil {
-		return fmt.Errorf("wait for machine %s: %w", machineName, err)
-	}
-
-	containerd := goalstates.ResolveContainerd(goalstates.ContainerdOptions{NvidiaRequired: true})
-	nodeStart := &goalstates.NodeStart{
-		MachineName: machineName,
-		MachineDir:  "/var/lib/machines/" + machineName,
-		Containerd:  containerd,
-		Nvidia:      nvidia,
-	}
-
-	if err := executeTask(ctx, log, reconcileNVIDIA(log, nodeStart)); err != nil {
-		return fmt.Errorf("reconcile NVIDIA state for %s: %w", machineName, err)
+func validateNSpawnMachine(machineName string) error {
+	if machineName != goalstates.NSpawnMachineKube1 && machineName != goalstates.NSpawnMachineKube2 {
+		return fmt.Errorf("unknown nspawn machine %q", machineName)
 	}
 
 	return nil
