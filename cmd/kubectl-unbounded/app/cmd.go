@@ -26,6 +26,7 @@ func Run() {
 	root.AddCommand(siteCommandGroup())
 	root.AddCommand(machineCommandGroup())
 	root.AddCommand(netcmd.Command())
+	root.AddCommand(overridesCommandGroup())
 	root.AddCommand(installCommand())
 	root.AddCommand(version.Command())
 

@@ -1,0 +1,194 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package app
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+
+	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/cli-runtime/pkg/printers"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/operator/override"
+	"github.com/Azure/unbounded/internal/unbounded"
+)
+
+func overridesListCommand() *cobra.Command {
+	var namespace string
+
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List the override entries the operator reads",
+		Long: `List the override entries in the unbounded-component-overrides ConfigMap,
+as authored.
+
+This shows what was asked for. To see what the operator actually did with it,
+use 'kubectl unbounded overrides status'.
+
+Example:
+  kubectl unbounded overrides list`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := ctrl.SetupSignalHandler()
+
+			c, err := newMachineClient()
+			if err != nil {
+				return err
+			}
+
+			return runOverridesList(ctx, c, namespace, cmd.OutOrStdout())
+		},
+	}
+
+	cmd.Flags().StringVar(&namespace, "namespace", unbounded.SystemNamespace(),
+		"Namespace holding the overrides ConfigMap")
+
+	return cmd
+}
+
+func runOverridesList(ctx context.Context, c client.Client, namespace string, out io.Writer) error {
+	configMap, found, err := getOverridesConfigMap(ctx, c, namespace)
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		fprintln(out, "No overrides ConfigMap found; the operator applies its default manifests.")
+
+		return nil
+	}
+
+	entries, err := override.Parse(configMap.Data)
+	if err != nil {
+		return err
+	}
+
+	if len(entries) == 0 {
+		fprintln(out, "The overrides ConfigMap exists but declares no entries.")
+
+		return nil
+	}
+
+	var sites v1alpha3.SiteList
+	if err := c.List(ctx, &sites); err != nil {
+		return fmt.Errorf("list Sites: %w", err)
+	}
+
+	table := &metav1.Table{
+		ColumnDefinitions: []metav1.TableColumnDefinition{
+			{Name: "Source", Type: "string"},
+			{Name: "Component", Type: "string"},
+			{Name: "Kind", Type: "string"},
+			{Name: "Sites", Type: "string"},
+			{Name: "Changes", Type: "string"},
+		},
+	}
+
+	for _, entry := range entries {
+		table.Rows = append(table.Rows, metav1.TableRow{Cells: []any{
+			entry.Source.String(),
+			entry.Entry.Component,
+			entry.Entry.Kind,
+			describeSiteSelector(entry.Entry.Sites),
+			describeChanges(entry.Entry),
+		}})
+	}
+
+	if err := printers.NewTablePrinter(printers.PrintOptions{}).PrintObj(table, out); err != nil {
+		return fmt.Errorf("print overrides: %w", err)
+	}
+
+	reportUnknownSites(entries, sites.Items, out)
+
+	fprintf(out, "\nObserved ConfigMap resourceVersion: %s\n", configMap.ResourceVersion)
+	fprintln(out, "Run 'kubectl unbounded overrides status' to see what the operator applied.")
+
+	return nil
+}
+
+// describeSiteSelector renders a Site selector, distinguishing an absent
+// selector from a listed one because the two mean different things.
+func describeSiteSelector(sites []string) string {
+	if sites == nil {
+		return "(all)"
+	}
+
+	return strings.Join(sites, ",")
+}
+
+// describeChanges summarizes what an entry changes, so the table is useful
+// without dumping whole patches.
+func describeChanges(entry override.Entry) string {
+	var parts []string
+
+	if len(entry.Patch) > 0 {
+		parts = append(parts, "patch")
+	}
+
+	if len(entry.ExtraArgs) > 0 {
+		containers := make([]string, 0, len(entry.ExtraArgs))
+		for name := range entry.ExtraArgs {
+			containers = append(containers, name)
+		}
+
+		sort.Strings(containers)
+
+		parts = append(parts, "extraArgs("+strings.Join(containers, ",")+")")
+	}
+
+	if len(entry.AddContainers) > 0 {
+		parts = append(parts, "add("+strings.Join(entry.AddContainers, ",")+")")
+	}
+
+	if len(entry.AddInitContainers) > 0 {
+		parts = append(parts, "addInit("+strings.Join(entry.AddInitContainers, ",")+")")
+	}
+
+	return joinNonEmpty(parts, " ")
+}
+
+// reportUnknownSites warns about Site names that match nothing.
+//
+// These are inert rather than an error: a document may legitimately be written
+// before its Site exists, and deleting a Site must not retroactively invalidate
+// an unrelated override. Saying so is still useful, because the other
+// explanation is a typo.
+func reportUnknownSites(entries []override.SourcedEntry, sites []v1alpha3.Site, out io.Writer) {
+	known := make(map[string]bool, len(sites))
+	for i := range sites {
+		known[sites[i].Name] = true
+	}
+
+	seen := map[string]bool{}
+
+	var unknown []string
+
+	for _, entry := range entries {
+		for _, site := range entry.Entry.Sites {
+			if known[site] || seen[site] {
+				continue
+			}
+
+			seen[site] = true
+
+			unknown = append(unknown, site)
+		}
+	}
+
+	if len(unknown) == 0 {
+		return
+	}
+
+	sort.Strings(unknown)
+
+	fprintf(out, "\nWarning: these Site names match no Site and are inert: %s\n", strings.Join(unknown, ", "))
+	fprintln(out, "         This is expected if the Site has not been created yet.")
+}
