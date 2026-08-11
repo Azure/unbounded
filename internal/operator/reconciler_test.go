@@ -11,9 +11,12 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -582,4 +585,107 @@ func TestPlanHasExactlyOneNamespaceOperation(t *testing.T) {
 	if got := namespaces[0]; got != component.NamespaceOwner+" Apply Namespace/"+component.DefaultNamespace {
 		t.Fatalf("namespace operation = %q, want it owned by the operator", got)
 	}
+}
+
+// TestReconcileRetriesWhenTheStatusWriteLosesARace is a regression test.
+//
+// Conditions are a list, and a merge patch replaces a list wholesale, so two
+// passes writing the same Site concurrently did not merge their updates: the
+// later write silently dropped whatever the earlier one recorded. Passes do
+// race, because the Site-less fan-out pass writes every Site's status while a
+// per-Site pass may be writing one of them.
+//
+// The write now takes an optimistic lock. Losing is not a failure and must not
+// go through error backoff or produce an error log; the pass simply re-runs
+// against the winner's state.
+func TestReconcileRetriesWhenTheStatusWriteLosesARace(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+
+	registry := &component.Registry{
+		Cluster: []component.ClusterComponent{
+			fakeCluster{name: "net", condition: "NetReady", result: component.Reconciled()},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(site).
+		WithStatusSubresource(site).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(
+				_ context.Context, _ client.Client, _ string,
+				obj client.Object, _ client.Patch, _ ...client.SubResourcePatchOption,
+			) error {
+				return apierrors.NewConflict(
+					schema.GroupResource{Group: "unbounded-cloud.io", Resource: "sites"},
+					obj.GetName(), errors.New("someone else wrote first"))
+			},
+		}).
+		Build()
+
+	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
+
+	res, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)})
+	if err != nil {
+		t.Fatalf("losing a status write is not a reconcile error: %v", err)
+	}
+
+	if res.RequeueAfter <= 0 {
+		t.Fatal("a lost status write must schedule another pass")
+	}
+}
+
+// TestReconcileReplansWhenAnObjectAppearsMidPass covers the other half of the
+// same idea: an object the plan expected to create already existed, so what the
+// pass computed from its earlier read no longer describes the cluster.
+func TestReconcileReplansWhenAnObjectAppearsMidPass(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: "raced-config"},
+	}
+
+	registry := &component.Registry{
+		Cluster: []component.ClusterComponent{creatingCluster{}},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(site, existing).
+		WithStatusSubresource(site).
+		Build()
+
+	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
+
+	res, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if res.RequeueAfter <= 0 {
+		t.Fatal("a plan computed from stale state must schedule another pass")
+	}
+}
+
+// creatingCluster plans a CreateIfAbsent for an object the test has already
+// placed in the cluster, standing in for losing the create race.
+type creatingCluster struct{}
+
+func (creatingCluster) Name() string          { return "racer" }
+func (creatingCluster) ConditionType() string { return "RacerReady" }
+
+func (creatingCluster) Plan(
+	context.Context, *component.Env, []unboundedv1alpha3.Site,
+) (*component.Plan, component.Result, error) {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"})
+	obj.SetNamespace(component.DefaultNamespace)
+	obj.SetName("raced-config")
+
+	plan := component.NewPlan()
+	plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Object: obj, Component: "racer"})
+
+	return plan, component.Reconciled(), nil
 }

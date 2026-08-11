@@ -64,6 +64,12 @@ type OperationResult struct {
 // ExecutionResult is the outcome of executing a whole plan.
 type ExecutionResult struct {
 	Results []OperationResult
+
+	// Stale names the objects that were written successfully but against a
+	// cluster state the plan did not anticipate, so the pass should run again
+	// from an accurate read. The operations themselves succeeded and are
+	// reported as such; this is a request to re-plan, not a failure.
+	Stale []ObjectRef
 }
 
 // Err joins every failure into a single error, or returns nil when the plan
@@ -258,13 +264,18 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 			continue
 		}
 
-		if err := e.execute(ctx, op.Operation); err != nil {
+		err := e.execute(ctx, op.Operation)
+
+		switch {
+		case errors.Is(err, errStale):
+			result.Stale = append(result.Stale, op.Ref())
+
+			record(op, OpSucceeded, nil)
+		case err != nil:
 			fail(op, OpFailed, err)
-
-			continue
+		default:
+			record(op, OpSucceeded, nil)
 		}
-
-		record(op, OpSucceeded, nil)
 	}
 
 	return result
@@ -313,13 +324,7 @@ func (e *Env) execute(ctx context.Context, op Operation) error {
 		return e.ApplyObject(ctx, op.Object)
 
 	case OpCreateIfAbsent:
-		// AlreadyExists is success: the payload belongs to whoever won, and
-		// this operation exists precisely so an existing payload survives.
-		if err := e.Client.Create(ctx, op.Object); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create %s: %w", op.Ref(), err)
-		}
-
-		return nil
+		return e.createIfAbsent(ctx, op)
 
 	case OpMergePatch:
 		if op.Base == nil {
@@ -340,6 +345,42 @@ func (e *Env) execute(ctx context.Context, op Operation) error {
 		return fmt.Errorf("unknown operation kind %s for %s", op.Kind, op.Ref())
 	}
 }
+
+// createIfAbsent creates an object, treating an existing one as authoritative.
+//
+// AlreadyExists is not a failure: the payload belongs to whoever won, and this
+// operation exists precisely so an existing payload survives. It is not plain
+// success either. Planning read the object and found nothing, so everything
+// else the pass computed from that read is wrong: the operator hashes a
+// ConfigMap's payload and stamps that hash on the workload that mounts it, so
+// losing this race stamps the hash of a payload the cluster does not have. The
+// workload rolls to a hash matching nothing, and rolls again once a later pass
+// reads the real payload.
+//
+// The object is refreshed from the cluster so anything reading it back in this
+// pass sees what is actually there rather than what the operator proposed, and
+// the operation is reported stale so the pass runs again from an accurate read.
+func (e *Env) createIfAbsent(ctx context.Context, op Operation) error {
+	err := e.Client.Create(ctx, op.Object)
+
+	switch {
+	case err == nil:
+		return nil
+	case !apierrors.IsAlreadyExists(err):
+		return fmt.Errorf("create %s: %w", op.Ref(), err)
+	}
+
+	if err := e.Client.Get(ctx, client.ObjectKeyFromObject(op.Object), op.Object); err != nil {
+		return fmt.Errorf("read %s after losing a create race: %w", op.Ref(), err)
+	}
+
+	return errStale
+}
+
+// errStale marks an operation that succeeded against a cluster state the plan
+// did not anticipate. It is not reported as a failure, but the pass is asked to
+// run again.
+var errStale = errors.New("plan was computed from stale state")
 
 // dedupeShared collapses operations carrying the same SharedKey.
 //

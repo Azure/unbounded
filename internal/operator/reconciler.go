@@ -168,9 +168,17 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 
 	// Capture each target's status baseline before any component mutates
 	// conditions, so the merge patch carries exactly the condition changes.
+	//
+	// The patch takes an optimistic lock. Conditions are a list, and a merge
+	// patch replaces a list wholesale, so two passes writing the same Site
+	// concurrently do not merge their condition updates: the later write drops
+	// whatever the earlier one recorded. Passes do race, because the Site-less
+	// fan-out pass writes every Site's status while a per-Site pass may be
+	// writing one of them. With the lock the loser is told, and retries against
+	// the winner's state.
 	baselines := make(map[string]client.Patch, len(targets))
 	for _, target := range targets {
-		baselines[target.Name] = client.MergeFrom(target.DeepCopy())
+		baselines[target.Name] = client.MergeFromWithOptions(target.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	}
 
 	// Read and validate overrides once, before anything is planned. Parsing and
@@ -201,6 +209,17 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 
 	if overrideErr != nil {
 		reconcileErrs = append(reconcileErrs, overrideErr)
+	}
+
+	if len(exec.Stale) > 0 {
+		// Something was created out from under this pass, so what it computed
+		// from the earlier read no longer describes the cluster. Re-planning is
+		// cheap and idempotent; leaving a workload stamped with the hash of a
+		// payload that is not there is not.
+		logger.V(1).Info("plan was computed from stale state; re-planning",
+			"objects", len(exec.Stale))
+
+		requeueAfter = nextRequeue(requeueAfter, stalePlanRequeue)
 	}
 
 	if execErr != nil {
@@ -256,12 +275,36 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		r.publishOverrideStatus(target, snapshot, report, plan, exec)
 
 		if err := r.Status().Patch(ctx, target, baselines[target.Name]); err != nil {
+			// A conflict means someone else wrote this Site's status while the
+			// pass was running. That is not a failure and does not deserve an
+			// error log or backoff: the pass simply lost, and re-running it
+			// against the winner's state is the whole point of the lock.
+			if apierrors.IsConflict(err) {
+				logger.V(1).Info("site status changed during the pass; retrying",
+					"site", target.Name)
+
+				requeueAfter = nextRequeue(requeueAfter, statusConflictRequeue)
+
+				continue
+			}
+
 			reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status for %s: %w", target.Name, err))
 		}
 	}
 
 	return ctrl.Result{RequeueAfter: requeueAfter}, errors.Join(reconcileErrs...)
 }
+
+// stalePlanRequeue is how soon a pass re-plans after discovering that an object
+// it expected to create already existed. Like a status conflict this is not a
+// failure, so it does not go through error backoff.
+const stalePlanRequeue = time.Second
+
+// statusConflictRequeue is how soon a pass retries after losing a status write
+// to a concurrent one. It is short because the conflict is not a failure and
+// nothing needs to settle: the winner's write has already landed, and the next
+// pass only has to observe it.
+const statusConflictRequeue = time.Second
 
 // applyOverrides merges user-supplied overrides into a plan, or removes the
 // workloads they would have targeted when the document cannot be used.

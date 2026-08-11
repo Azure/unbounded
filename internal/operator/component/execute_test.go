@@ -694,3 +694,73 @@ func assertCalls(t *testing.T, got, want []string) {
 		}
 	}
 }
+
+// TestCreateIfAbsentReportsLosingTheRaceAsStale is a regression test.
+//
+// AlreadyExists was treated as plain success. It is not: planning read the
+// object and found nothing, so everything the pass computed from that read is
+// wrong. The operator hashes a ConfigMap's payload and stamps that hash on the
+// workload mounting it, so losing this race stamped the hash of a payload the
+// cluster does not have. The workload rolled to a hash matching nothing, and
+// rolled again when a later pass finally read the real payload.
+func TestCreateIfAbsentReportsLosingTheRaceAsStale(t *testing.T) {
+	winner := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: DefaultNamespace, Name: "config"},
+		Data:       map[string]string{"payload": "the winner's"},
+	}
+
+	env, _ := recordingEnv(t, winner)
+
+	desired := configMapObject("config")
+	if err := unstructured.SetNestedStringMap(desired.Object,
+		map[string]string{"payload": "the operator's"}, "data"); err != nil {
+		t.Fatalf("build desired ConfigMap: %v", err)
+	}
+
+	plan := NewPlan()
+	plan.Add(Operation{Kind: OpCreateIfAbsent, Object: desired, Component: "a"})
+
+	result, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// The operation succeeded: the existing payload surviving is the whole
+	// point of CreateIfAbsent, and nothing failed.
+	if err := result.Err(); err != nil {
+		t.Fatalf("losing the race is not a failure: %v", err)
+	}
+
+	if len(result.Stale) != 1 || result.Stale[0].Name != "config" {
+		t.Fatalf("stale = %v, want the ConfigMap that already existed", result.Stale)
+	}
+
+	// The object now describes the cluster rather than the proposal, so
+	// anything reading it back in this pass sees the truth.
+	payload, _, err := unstructured.NestedString(desired.Object, "data", "payload")
+	if err != nil {
+		t.Fatalf("read back payload: %v", err)
+	}
+
+	if payload != "the winner's" {
+		t.Fatalf("payload = %q, want the object refreshed from the cluster", payload)
+	}
+}
+
+// TestCreateIfAbsentIsNotStaleWhenItWins confirms the ordinary path is quiet:
+// creating the object is not a reason to re-plan.
+func TestCreateIfAbsentIsNotStaleWhenItWins(t *testing.T) {
+	env, _ := recordingEnv(t)
+
+	plan := NewPlan()
+	plan.Add(Operation{Kind: OpCreateIfAbsent, Object: configMapObject("config"), Component: "a"})
+
+	result, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(result.Stale) != 0 {
+		t.Fatalf("stale = %v, want none when the create succeeded", result.Stale)
+	}
+}

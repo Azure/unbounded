@@ -193,8 +193,87 @@ func checkResolvable(entry Entry, source Source, workload *unstructured.Unstruct
 
 	problems = append(problems, checkExtraArgsTargets(entry, source, workload)...)
 	problems = append(problems, checkMountCollisions(entry, source, workload)...)
+	problems = append(problems, checkVolumeCollisions(entry, source, workload)...)
 
 	return problems
+}
+
+// checkVolumeCollisions rejects a patch that would redefine an
+// operator-declared volume.
+//
+// This is the other half of the mount protection, and without it that
+// protection is bypassable. Mounts are protected on (container, mountPath)
+// because that is the key strategic merge uses for volumeMounts, so a patch
+// cannot repoint an operator mount at a different volume. But volumes
+// themselves merge on name, so a patch can leave every mount untouched and
+// instead redefine what the volume is:
+//
+//	volumes:
+//	  - name: host-run
+//	    hostPath: {path: /etc/kubernetes}
+//
+// Every container mounting host-run now reads a different host directory, with
+// nothing in the patch naming a mountPath at all. On workloads that are already
+// privileged and host-networked, silently repointing a hostPath is the most
+// consequential edit an override can make.
+//
+// Adding new volumes remains the point of the field: a sidecar needs somewhere
+// to write. Only names the operator already declares are refused.
+func checkVolumeCollisions(entry Entry, source Source, workload *unstructured.Unstructured) []error {
+	if len(entry.Patch) == 0 {
+		return nil
+	}
+
+	operatorVolumes := volumeNames(workload)
+	if len(operatorVolumes) == 0 {
+		return nil
+	}
+
+	var problems []error
+
+	for _, raw := range nestedSlice(entry.Patch, "spec", "template", "spec", "volumes") {
+		volume, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, _ := volume["name"].(string) //nolint:errcheck // absent means unnamed
+		if name == "" || !operatorVolumes[name] {
+			continue
+		}
+
+		// An entry carrying nothing but the name changes nothing, so it is not
+		// worth failing a document over.
+		if len(volume) == 1 {
+			continue
+		}
+
+		problems = append(problems, fmt.Errorf(
+			"%s: patch redefines volume %q, which the operator declares; "+
+				"volumes merge on name, so this would repoint every mount that uses it "+
+				"without naming a mountPath; add a volume under a different name instead",
+			source, name))
+	}
+
+	return problems
+}
+
+// volumeNames returns the names of the volumes a workload declares.
+func volumeNames(workload *unstructured.Unstructured) map[string]bool {
+	out := map[string]bool{}
+
+	for _, raw := range nestedSlice(workload.Object, "spec", "template", "spec", "volumes") {
+		volume, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if name, ok := volume["name"].(string); ok && name != "" {
+			out[name] = true
+		}
+	}
+
+	return out
 }
 
 func checkContainerNames(entry Entry, source Source, workload *unstructured.Unstructured, field string, declared []string) []error {
