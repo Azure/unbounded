@@ -6,13 +6,16 @@ package rootfs
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/template"
+	"time"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
 	"github.com/Azure/unbounded/pkg/agent/artifactsource"
@@ -194,7 +197,9 @@ func (c *configureLocalDNS) installCoreDNS(ctx context.Context) error {
 		return fmt.Errorf("download CoreDNS binary: %w", err)
 	}
 
-	output, err := exec.CommandContext(ctx, destination, "-plugins").CombinedOutput()
+	output, err := coreDNSPlugins(ctx, destination, func(ctx context.Context, path string) ([]byte, error) {
+		return exec.CommandContext(ctx, path, "-plugins").CombinedOutput()
+	})
 	if err != nil {
 		return fmt.Errorf("list CoreDNS plugins: %w", err)
 	}
@@ -213,6 +218,33 @@ func (c *configureLocalDNS) installCoreDNS(ctx context.Context) error {
 	c.log.Info("installed CoreDNS", "version", c.goalState.LocalDNS.CoreDNSVersion)
 
 	return nil
+}
+
+type coreDNSPluginsRunner func(context.Context, string) ([]byte, error)
+
+func coreDNSPlugins(ctx context.Context, path string, run coreDNSPluginsRunner) ([]byte, error) {
+	const (
+		retryInterval = 100 * time.Millisecond
+		retryTimeout  = 5 * time.Second
+	)
+
+	deadline := time.Now().Add(retryTimeout)
+
+	for {
+		output, err := run(ctx, path)
+		if err == nil || !errors.Is(err, syscall.ETXTBSY) || time.Now().After(deadline) {
+			return output, err
+		}
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func localDNSResolvConf(original []byte, listener string) []byte {
