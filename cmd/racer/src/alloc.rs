@@ -233,15 +233,15 @@ impl Allocator {
         self.shard(runtime::core()).pressure()
     }
 
-    /// Whether the device's rate budget is committed far enough ahead that optional work
+    /// Whether the store's rate budget is committed far enough ahead that optional work
     /// should stand down. A separate axis from `pressure`, which is about free space:
-    /// the device can be nearly empty and still have nothing left to give this second.
-    pub fn device_pressed(&self) -> bool {
+    /// the store can be nearly empty and still have nothing left to give this second.
+    pub fn store_pressed(&self) -> bool {
         self.disk.pressed()
     }
 
     /// Total time transfers have been held back by the rate budget, in microseconds.
-    pub fn device_waited_us(&self) -> u64 {
+    pub fn store_waited_us(&self) -> u64 {
         self.disk.waited_us()
     }
 
@@ -1285,8 +1285,8 @@ pub fn open(
     let geo = layout::read_geometry(path)?;
     let boot = layout::read_consensus(path)?;
     let limit = std::sync::Arc::new(runtime::Limiter::new(
-        cfg.node.device_max_iops,
-        cfg.node.device_max_bytes_per_sec,
+        cfg.node.store_max_iops,
+        cfg.node.store_max_bytes_per_sec,
     ));
     let scans = scan(path, &geo, cores, &limit)?;
 
@@ -1446,7 +1446,7 @@ fn scan_range(
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1460,7 +1460,11 @@ mod tests {
     use crate::runtime::{self, Cfg, Errno, Handler, PoolBuf, Request};
 
     const IMG: &str = "racer-alloc.img";
-    const DEV_BYTES: u64 = 1 << 30;
+    /// Just what the base config plans, so the runs the grown config appends have to be
+    /// paid for with a larger store rather than absorbed by slack.
+    const DEV_BYTES: u64 = 528 << 20;
+    /// What the store has to be told to be before the appended runs fit in it.
+    const GROWN_BYTES: u64 = 1068 << 20;
     const SMALL: usize = 4096;
     const HUGE: usize = 4 << 20;
 
@@ -1526,7 +1530,7 @@ mod tests {
         let cfg = Config::parse(text).unwrap();
         let rt = runtime::start(&DRIVER).expect("start");
         rt.reload(move |c| {
-            let path = PathBuf::from(&cfg.node.device);
+            let path = cfg.node.store.clone();
             let disk = c.disk(&path, None, None)?;
             let cores = c.cores();
             let alloc = super::open(&path, disk, cfg, cores)?;
@@ -1924,24 +1928,30 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // device
+    // store
     // ---------------------------------------------------------------------------
 
     /// Eight groups so addresses spread over the workers and the cross-core write path
-    /// is exercised rather than short-circuited.
+    /// is exercised rather than short-circuited. Every group names the same three nodes:
+    /// this node has to own every address it is asked for, and an equal share of eight
+    /// groups over a wider zone would leave it holding more of the zone than the rest.
     fn config_text(dev: &Path) -> String {
+        sized(dev, DEV_BYTES)
+    }
+
+    fn sized(dev: &Path, bytes: u64) -> String {
         format!(
             "
             generation 1
-            node id=1 zone=1 device={}
+            node id=1 zone=1 store={} size={bytes}
             group 1 2 3
-            group 4 5 6
-            group 7 8 9
-            group 10 11 12
-            group 13 14 15
-            group 16 17 18
-            group 19 20 21
-            group 22 23 24
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
             volume 1 slot=0
               extent pages=4096 kind=lww zone=1
             volume 2 slot=1
@@ -1994,9 +2004,14 @@ mod tests {
         )
     }
 
-    /// Two more volumes than the device was formatted for, one per class, so `grow`
-    /// has to append a run to each.
+    /// Two more volumes than the store was formatted for, one per class, so `grow` has
+    /// to append a run to each. They do not fit in what the store was first told to be,
+    /// so the size has to rise with them.
     fn config_grown(dev: &Path) -> String {
+        grown_at(dev, GROWN_BYTES)
+    }
+
+    fn grown_at(dev: &Path, bytes: u64) -> String {
         format!(
             "{}
             volume 5 slot=4
@@ -2004,7 +2019,7 @@ mod tests {
             volume 6 slot=5
               extent pages=200 kind=immutable_4m zone=1
             ",
-            config_text(dev)
+            sized(dev, bytes)
         )
     }
 
@@ -2077,25 +2092,37 @@ mod tests {
             return;
         }
         let dev = std::env::temp_dir().join(IMG);
-        {
-            let f = std::fs::File::create(&dev).unwrap();
-            f.set_len(DEV_BYTES).unwrap();
-        }
+        let _ = std::fs::remove_file(&dev);
         let cfg = Config::parse(&config_text(&dev)).unwrap();
         cfg.validate().unwrap();
+        layout::size_if_needed(&dev, &cfg).unwrap();
+        assert_eq!(std::fs::metadata(&dev).unwrap().len(), DEV_BYTES);
         layout::format(&dev, &cfg).unwrap();
 
         run(&dev, 0);
         run(&dev, 1);
 
-        // Add capacity the device was not formatted for, the way `serve` does, then come
+        // The same extra capacity without room in the store for it: the config is
+        // valid, and it is the layout that refuses, naming what the store was told to
+        // be. Nothing is written, so the store is still the one the next step grows.
+        let cramped = Config::parse(&grown_at(&dev, DEV_BYTES)).unwrap();
+        cramped.validate().unwrap();
+        let e = layout::grow_if_needed(&dev, &cramped).expect_err("no room to append");
+        assert!(
+            e.to_string().contains("node.store.size_bytes"),
+            "says what ran out: {e}"
+        );
+
+        // Add capacity the store was not formatted for, the way `serve` does, then come
         // back up on the larger config.
         let grown_cfg = Config::parse(&config_grown(&dev)).unwrap();
         grown_cfg.validate().unwrap();
         layout::grow_if_needed(&dev, &grown_cfg).unwrap();
+        assert_eq!(std::fs::metadata(&dev).unwrap().len(), GROWN_BYTES);
         run_with(&dev, 2, &config_grown(&dev));
         // Asking again for what it already has is a no-op.
         layout::grow_if_needed(&dev, &grown_cfg).unwrap();
+        assert_eq!(std::fs::metadata(&dev).unwrap().len(), GROWN_BYTES);
 
         // Rot one byte of one page in each class, then bring it back up.
         let geo = layout::read_geometry(&dev).unwrap();

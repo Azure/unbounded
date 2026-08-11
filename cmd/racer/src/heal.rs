@@ -564,7 +564,7 @@ impl Heal {
         {
             return;
         }
-        if self.alloc().device_pressed() {
+        if self.alloc().store_pressed() {
             return;
         }
         c.last.set(Some(now));

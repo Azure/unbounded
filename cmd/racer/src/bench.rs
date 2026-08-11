@@ -183,9 +183,11 @@ fn e2e(a: Args) {
             small_pages: a.pages,
             ..Plan::default()
         };
-        // Provision the ram disks before anything opens one: `brd` cannot be reloaded
-        // while a disk is in use, and the baseline row below opens one.
-        let devices = cluster::ram_disks(nodes as usize).expect("ram disks");
+        // Provision the stores before anything opens a ram disk: `brd` cannot be
+        // reloaded while a disk is in use, and the baseline row below opens one. The
+        // cluster lays them down again when it starts, so the row cannot leave anything
+        // behind that a node would then adopt.
+        let stores = cluster::stores(nodes as usize).expect("stores");
         // Clients take the logical CPUs above the node processes' cores, spread over the
         // whole remaining range: blk-mq picks a device queue from the submitting CPU, so
         // bunched clients all land on one worker and the node looks single-threaded.
@@ -196,10 +198,11 @@ fn e2e(a: Args) {
             .collect();
 
         if nodes == 1 {
-            // A ram disk allocates a page on first write, so reading sectors nobody
-            // wrote measures a zero fill rather than a copy. Touch the whole span first.
+            // A ram disk allocates a page on first write and the image file is sparse,
+            // so reading blocks nobody wrote measures a zero fill rather than a copy.
+            // Touch the whole span first.
             let span = plan.small_bytes().max(plan.huge_bytes());
-            let mut j = Job::new(&devices[..1], HUGE, span);
+            let mut j = Job::new(&stores[..1], HUGE, span);
             j.depth = 4;
             j.cpus = vec![cpus[0]];
             j.write = true;
@@ -208,25 +211,25 @@ fn e2e(a: Args) {
             j.run = Duration::from_secs(600);
             load::run(&j).expect("baseline fill");
 
-            // The raw device the nodes are about to use, same generator, same block
-            // layer. Every row below is read against this one.
-            let mut j = Job::new(&devices[..1], 4096, plan.small_bytes());
+            // The store file the nodes are about to use, same generator, same file
+            // system and block layer. Every row below is read against this one.
+            let mut j = Job::new(&stores[..1], 4096, plan.small_bytes());
             j.depth = a.depth;
             j.cpus = cpus.clone();
             j.run = run;
-            report(&a, "ram disk", "4k randread", &plan, &j);
+            report(&a, "ext4 file", "4k randread", &plan, &j);
             j.write = true;
-            report(&a, "ram disk", "4k randwrite", &plan, &j);
-            let mut j = Job::new(&devices[..1], HUGE, plan.huge_bytes());
+            report(&a, "ext4 file", "4k randwrite", &plan, &j);
+            let mut j = Job::new(&stores[..1], HUGE, plan.huge_bytes());
             j.depth = 4.min(a.depth);
             j.cpus = cpus.clone();
             j.run = run;
-            report(&a, "ram disk", "4m randread", &plan, &j);
-            let mut j = Job::new(&devices[..1], 4096, plan.small_bytes());
+            report(&a, "ext4 file", "4m randread", &plan, &j);
+            let mut j = Job::new(&stores[..1], 4096, plan.small_bytes());
             j.depth = 1;
             j.cpus = vec![cpus[0]];
             j.run = run;
-            report(&a, "ram disk", "4k read  qd1", &plan, &j);
+            report(&a, "ext4 file", "4k read  qd1", &plan, &j);
         }
 
         let c = Cluster::start(&plan).expect("cluster");

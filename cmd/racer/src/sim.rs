@@ -24,8 +24,9 @@ use crate::server::{self, SERVER};
 /// Block size of every simulated device. Frames and mblocks are 4 KiB, so nothing
 /// smaller is ever addressed.
 const BLOCK: usize = 4096;
-/// Nominal device size. Sparse, so only written blocks cost anything.
-const DEVICE_BYTES: u64 = 64 << 30;
+/// The size every simulated node asks for its store. Sparse, so only written blocks
+/// cost anything.
+const STORE_BYTES: u64 = 64 << 30;
 /// One-way message and disk latency, before jitter.
 const LATENCY_US: u64 = 50;
 /// What a straggling link adds one way. Long enough that it always loses a quorum
@@ -64,6 +65,9 @@ struct Device {
     node: u32,
     fabric: bool,
     blocks: BTreeMap<u64, Box<[u8; BLOCK]>>,
+    /// What the store has been sized to. Starts at zero, like a file that is not there
+    /// yet, and only `resize` moves it. Unused on a fabric handle.
+    len: u64,
     /// Transfers submitted through the runtime, which are the ones a rate budget meters.
     ops: u64,
 }
@@ -297,14 +301,31 @@ pub(crate) fn device(path: &Path) -> std::io::Result<u32> {
         node,
         fabric,
         blocks: BTreeMap::new(),
+        len: 0,
         ops: 0,
     });
     s.paths.borrow_mut().insert(path.to_path_buf(), id);
     Ok(id)
 }
 
-pub(crate) fn device_bytes(_dev: u32) -> std::io::Result<u64> {
-    Ok(DEVICE_BYTES)
+/// Grow the simulated store to `want`, the way `layout::size_if_needed` grows a file.
+/// Shrinking is refused here for the same reason it is refused there: the offsets in
+/// the layout are absolute, so a smaller store loses pages rather than moving them.
+pub(crate) fn resize(dev: u32, want: u64) -> std::io::Result<()> {
+    let s = shared();
+    let mut devs = s.devs.borrow_mut();
+    let d = &mut devs[dev as usize];
+    if d.len > want {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "store is {} B, node.store.size_bytes is {want} B; a store cannot shrink",
+                d.len
+            ),
+        ));
+    }
+    d.len = want;
+    Ok(())
 }
 
 /// Simulated time, for the few places that need a clock rather than a timer.
@@ -612,12 +633,13 @@ impl Sim {
                 assert_eq!(
                     (cfg.small_pages(), cfg.huge_pages()),
                     (first.cfg.small_pages(), first.cfg.huge_pages()),
-                    "node {} plans a different device to node 1",
+                    "node {} plans a different store to node 1",
                     i + 1
                 );
             }
 
-            crate::layout::format(Path::new(&cfg.node.device), &cfg)?;
+            crate::layout::size_if_needed(&cfg.node.store, &cfg)?;
+            crate::layout::format(&cfg.node.store, &cfg)?;
             sim.nodes.push(NodeState {
                 id: i + 1,
                 cfg,
@@ -664,7 +686,7 @@ impl Sim {
         let mut t = String::new();
         t.push_str("generation 1\n");
         t.push_str(&format!(
-            "node id={id} site=0 zone=1 cohort=0 device=/sim/n{id}/store cache_4k=0 cache_4m=0 max_iops={}\n",
+            "node id={id} site=0 zone=1 cohort=0 store=/sim/n{id}/store size={STORE_BYTES} cache_4k=0 cache_4m=0 max_iops={}\n",
             o.device_iops
         ));
         for p in self.peers_of(id) {
@@ -795,7 +817,7 @@ impl Sim {
     /// Transfers a node has submitted to its own store since boot. Counts what a rate
     /// budget meters, so a test can check the budget was actually held to.
     pub fn device_ops(&self, node: usize) -> u64 {
-        let path = Path::new(&self.nodes[node].cfg.node.device);
+        let path = self.nodes[node].cfg.node.store.as_path();
         let dev = *self.s.paths.borrow().get(path).expect("store device");
         self.s.devs.borrow()[dev as usize].ops
     }
@@ -806,7 +828,7 @@ impl Sim {
         let (node, geo, slot, _) = self
             .small_replica_location(lba, replica)
             .unwrap_or_else(|| panic!("small page {lba} is not live on replica {replica}"));
-        let path = Path::new(&self.nodes[node].cfg.node.device);
+        let path = self.nodes[node].cfg.node.store.as_path();
         let dev = *self.s.paths.borrow().get(path).expect("store device");
         let off = geo.slot_off(Class::Small, slot);
         let mut devs = self.s.devs.borrow_mut();
@@ -823,7 +845,7 @@ impl Sim {
         let Some((node, geo, slot, entry)) = self.small_replica_location(lba, replica) else {
             return false;
         };
-        let path = Path::new(&self.nodes[node].cfg.node.device);
+        let path = self.nodes[node].cfg.node.store.as_path();
         let Some(&dev) = self.s.paths.borrow().get(path) else {
             return false;
         };
@@ -843,7 +865,7 @@ impl Sim {
         let group = cfg.group(addr.0) as usize;
         let member = *cfg.topology.catalog.get(group)?.get(replica)?;
         let node = self.nodes.iter().position(|n| n.id == member)?;
-        let path = Path::new(&self.nodes[node].cfg.node.device);
+        let path = self.nodes[node].cfg.node.store.as_path();
         let geo = layout::read_geometry(path).ok()?;
         let dev = *self.s.paths.borrow().get(path)?;
         let mut raw = [0u8; BLOCK];

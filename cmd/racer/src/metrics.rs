@@ -88,7 +88,7 @@ metrics! {
     cache_admits:            "racer_cache_admit_total"            ""                           Counter "Pages admitted to the cache.",
     cache_evictions:         "racer_cache_evict_total"            ""                           Counter "Pages evicted from the cache.",
     cache_stale:             "racer_cache_stale_total"            ""                           Counter "Cache hits that confirmation found stale.",
-    cache_shed:              "racer_cache_shed_total"             ""                           Counter "Cache work declined because the device was under pressure.",
+    cache_shed:              "racer_cache_shed_total"             ""                           Counter "Cache work declined because the store was under pressure.",
 
     // allocator
     alloc_slots_small:       "racer_alloc_slots"                  r#"{class="small"}"#         Gauge   "Page slots on this node, by slab class.",
@@ -98,10 +98,10 @@ metrics! {
     alloc_pressure_low:      "racer_alloc_cores_pressured"        r#"{level="low"}"#           Gauge   "Workers whose shards are short of free slots, by watermark.",
     alloc_pressure_critical: "racer_alloc_cores_pressured"        r#"{level="critical"}"#      Gauge   "Workers whose shards are short of free slots, by watermark.",
     alloc_quarantined:       "racer_alloc_quarantined_blocks"     ""                           Gauge   "Metadata blocks that failed both copies at startup.",
-    alloc_unbacked:          "racer_alloc_unbacked_pages"         ""                           Gauge   "Pages the configuration asks for that the device has no slots for. Nonzero until a restart grows the device.",
+    alloc_unbacked:          "racer_alloc_unbacked_pages"         ""                           Gauge   "Pages the configuration asks for that the store has no slots for. Nonzero until a restart grows the store.",
 
-    // device rate budget
-    device_throttle_us:      "racer_device_throttle_us_total"     ""                           Counter "Time transfers were held back to keep the device within its configured rate.",
+    // store rate budget
+    store_throttle_us:       "racer_store_throttle_us_total"     ""                           Counter "Time transfers were held back to keep the store within its configured rate.",
 
     // node and configuration
     config_generation:       "racer_config_generation"            ""                           Gauge   "Generation of the configuration in force.",

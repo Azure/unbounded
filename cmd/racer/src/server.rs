@@ -85,18 +85,18 @@ impl Node {
         Node::default()
     }
 
-    /// Build a configuration: open the device, install `cfg`, and attach a ublk device
+    /// Build a configuration: open the store, install `cfg`, and attach a ublk device
     /// per volume plus the fabric device.
     ///
     /// Declare-or-not: the runtime keeps a device that is re-declared, tears down one
     /// that is not, and never disturbs a live registration, so adding or removing a
     /// volume or a peer is just a different set of calls this time round. Re-placing an
-    /// extent touches no device at all — the new config carries it.
+    /// extent touches no device at all - the new config carries it.
     pub fn attach(&self, c: &Configurator, cfg: Config) -> std::io::Result<Dataplane> {
-        let dev = std::path::PathBuf::from(&cfg.node.device);
+        let store = cfg.node.store.clone();
         let limit =
-            runtime::Limiter::new(cfg.node.device_max_iops, cfg.node.device_max_bytes_per_sec);
-        let disk = c.disk(&dev, None, Some(limit))?;
+            runtime::Limiter::new(cfg.node.store_max_iops, cfg.node.store_max_bytes_per_sec);
+        let disk = c.disk(&store, None, Some(limit))?;
         let cores = c.cores();
         // Declare everything the new config asks for *before* publishing it anywhere. A
         // failure below is a rejected config: the runtime discards the build, so the
@@ -134,7 +134,7 @@ impl Node {
                 p
             }
             None => {
-                let alloc = alloc::open(&dev, disk, cfg, cores)?;
+                let alloc = alloc::open(&store, disk, cfg, cores)?;
                 // One metric row per worker: this is the first point where the worker
                 // count is settled.
                 metrics::init(cores);
@@ -248,7 +248,7 @@ fn sample(d: &Dataplane) {
         // silent ENOSPC once the free lists run down.
         s.alloc_unbacked = layout::shortfall(&a.geometry(), cfg);
         // Device-wide rather than per core, so only one worker reports it.
-        s.device_throttle_us = a.device_waited_us();
+        s.store_throttle_us = a.store_waited_us();
         s.config_generation = cfg.generation;
         s.config_rejected = config::rejected();
         s.topology_epoch = cfg.topology.epoch as u64;
@@ -908,20 +908,22 @@ mod tests {
     /// This node is a member of every group. It has to be: consensus routes a page to
     /// the group that owns it, and with no peers declared a group we are not in has no
     /// reachable member at all. A single node is member index 0 everywhere, so its
-    /// quorum is one and a local accept is a decision.
+    /// quorum is one and a local accept is a decision. Being in every group also pins
+    /// the zone to three nodes, since an equal share of eight groups over anything wider
+    /// would leave us holding more of the zone than the rest.
     fn config_text(dev: &Path) -> String {
         format!(
             "
             generation 1
-            node id=1 zone=1 device={}
+            node id=1 zone=1 store={} size={DEV_BYTES}
             group 1 2 3
-            group 1 4 5
-            group 1 6 7
-            group 1 8 9
-            group 1 10 11
-            group 1 12 13
-            group 1 14 15
-            group 1 16 17
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
+            group 1 2 3
             zone id=2 entry=2,3,4
             volume 1 slot=5
               extent pages=4096 kind=lww zone=1
@@ -1090,12 +1092,10 @@ mod tests {
             return;
         }
         let dev = img();
-        {
-            let f = std::fs::File::create(&dev).unwrap();
-            f.set_len(DEV_BYTES).unwrap();
-        }
+        let _ = std::fs::remove_file(&dev);
         let cfg = Config::parse(&config_text(&dev)).unwrap();
         cfg.validate().unwrap();
+        layout::size_if_needed(&dev, &cfg).unwrap();
         layout::format(&dev, &cfg).unwrap();
 
         let small = pattern(0xa5, 4096);

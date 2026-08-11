@@ -1,8 +1,9 @@
 //! A racer cluster, brought up for measurement and torn down after.
 //!
 //! Every node is a separate process, as in production and in `tests/cluster.rs`, and its
-//! device is a ram disk: storage at memory speed leaves the CPU as the only thing that
-//! can be the limit, which is the question being asked.
+//! store is an image file on an ext4 file system of its own, on a ram disk: storage at
+//! memory speed leaves the CPU as the only thing that can be the limit, which is the
+//! question being asked.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
@@ -83,7 +84,7 @@ pub struct Cluster {
 pub struct Node {
     pub id: u32,
     dir: PathBuf,
-    device: PathBuf,
+    store: PathBuf,
     child: Option<Child>,
     out: Option<BufReader<ChildStdout>>,
     volumes: Vec<(u32, PathBuf)>,
@@ -104,7 +105,7 @@ impl Node {
 }
 
 impl Cluster {
-    /// Wipe the devices, start the nodes and wire them to each other.
+    /// Lay down fresh stores, start the nodes and wire them to each other.
     pub fn start(plan: &Plan) -> std::io::Result<Cluster> {
         let racer = racer_bin();
         // A run killed before its `Drop` leaves nodes spinning on the ram disks, which
@@ -112,20 +113,19 @@ impl Cluster {
         let _ = Command::new("pkill")
             .args(["-9", "-f", &format!("racer serve {ROOT}/")])
             .status();
-        let devices = ram_disks(plan.nodes as usize)?;
-        let _ = std::fs::remove_dir_all(ROOT);
-        std::fs::create_dir_all(ROOT)?;
+        // A fresh file system per node, so every run formats a blank store rather than
+        // finding one an earlier run left behind.
+        let images = stores(plan.nodes as usize)?;
 
         let mut nodes = Vec::new();
-        for (i, device) in devices.into_iter().enumerate() {
+        for (i, store) in images.into_iter().enumerate() {
             let id = i as u32 + 1;
             let dir = PathBuf::from(ROOT).join(format!("n{id}"));
             std::fs::create_dir_all(&dir)?;
-            wipe(&device)?;
             nodes.push(Node {
                 id,
                 dir,
-                device,
+                store,
                 child: None,
                 out: None,
                 volumes: Vec::new(),
@@ -172,6 +172,9 @@ impl Node {
         cmd.arg("serve")
             .arg(self.dir.join("node.pb"))
             .env("METRICS_ADDR", "127.0.0.1:0")
+            // The store's path is this process's own, so it is passed in rather than
+            // named in a generation every node shares.
+            .env(racer::config::STORE_PATH_ENV, &self.store)
             .stdout(Stdio::piped());
         unsafe {
             cmd.pre_exec(move || {
@@ -253,10 +256,9 @@ impl Drop for Cluster {
 /// volume already measures.
 fn text(plan: &Plan, n: &Node, peers: &[(u32, PathBuf)], generation: u32) -> String {
     let mut s = format!(
-        "generation {generation}\nnode id={} zone=1 cohort={} device={} cache_4k={} cache_4m={}\n",
+        "generation {generation}\nnode id={} zone=1 cohort={} size={STORE_BYTES} cache_4k={} cache_4m={}\n",
         n.id,
         (n.id - 1) % 3,
-        n.device.display(),
         plan.cache_4k,
         plan.cache_4m
     );
@@ -300,14 +302,88 @@ fn install(n: &Node, text: &str) -> std::io::Result<()> {
 // backing store
 // ---------------------------------------------------------------------------
 
-/// Bytes per ram disk: room for the default plan's volumes plus the metadata and
-/// over-provisioning around them. `brd` allocates a page only when written, so an unused
-/// tail costs nothing.
+/// Bytes per ram disk: room for a node's file system and the store image on it. `brd`
+/// allocates a page only when written, so an unused tail costs nothing.
 const RD_BYTES: u64 = 8 << 30;
 
-/// `n` ram disks, loading `brd` if it is missing or the wrong size. Call this before
-/// anything opens one: `brd` cannot be reloaded while a disk is in use.
-pub fn ram_disks(n: usize) -> std::io::Result<Vec<PathBuf>> {
+/// Bytes of the store image on each node's file system: the default plan's volumes plus
+/// the metadata and over-provisioning around them, with the rest of the ram disk left to
+/// ext4 for its inode table, journal and group metadata.
+pub const STORE_BYTES: u64 = RD_BYTES - (1 << 30);
+
+/// One backing store per node: a fresh ext4 file system on each ram disk, with an empty
+/// image file of `STORE_BYTES` already reserved on it. Call this before anything opens a
+/// ram disk: `brd` cannot be reloaded while a disk is in use.
+///
+/// The file systems are made again on every call, which is how a run is guaranteed a
+/// blank store. A node reformats only a store whose superblock region reads as zeros, so
+/// anything left over would be adopted, index and all.
+pub fn stores(n: usize) -> std::io::Result<Vec<PathBuf>> {
+    // An earlier run's mounts pin both the ram disk under them and the directory tree
+    // above, so they are the first thing to go. More than this run needs, because the
+    // previous one may have been larger.
+    for i in 0..n.max(4) {
+        unmount(&mount_dir(i));
+    }
+    let devices = ram_disks(n)?;
+    let _ = std::fs::remove_dir_all(ROOT);
+    std::fs::create_dir_all(ROOT)?;
+
+    let mut images = Vec::new();
+    for (i, dev) in devices.iter().enumerate() {
+        let mnt = mount_dir(i);
+        std::fs::create_dir_all(&mnt)?;
+        mkfs(dev)?;
+        mount(dev, &mnt)?;
+        let img = mnt.join("store.img");
+        // Reserved rather than written: the file is sparse until racer formats it, and
+        // a ram disk only spends a page once one is stored in it.
+        std::fs::File::create(&img)?.set_len(STORE_BYTES)?;
+        images.push(img);
+    }
+    Ok(images)
+}
+
+fn mount_dir(i: usize) -> PathBuf {
+    PathBuf::from(ROOT).join(format!("fs{i}"))
+}
+
+fn mkfs(dev: &Path) -> std::io::Result<()> {
+    // One 4 KiB block, few inodes and no journal: the file system holds a single large
+    // file opened with O_DIRECT, and everything else on it is waste.
+    let rc = Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-b", "4096", "-N", "64", "-O", "^has_journal"])
+        .arg(dev)
+        .status()?;
+    assert!(rc.success(), "mkfs.ext4 {} failed", dev.display());
+    Ok(())
+}
+
+fn mount(dev: &Path, at: &Path) -> std::io::Result<()> {
+    let rc = Command::new("mount")
+        .args(["-t", "ext4", "-o", "noatime"])
+        .arg(dev)
+        .arg(at)
+        .status()?;
+    assert!(
+        rc.success(),
+        "mount {} at {} failed",
+        dev.display(),
+        at.display()
+    );
+    Ok(())
+}
+
+/// Detach `at` if it is a mount point, and say nothing if it is not: this is called on
+/// paths that may never have existed.
+fn unmount(at: &Path) {
+    if at.exists() {
+        let _ = Command::new("umount").arg("-l").arg(at).status();
+    }
+}
+
+/// `n` ram disks, loading `brd` if it is missing or the wrong size.
+fn ram_disks(n: usize) -> std::io::Result<Vec<PathBuf>> {
     let paths: Vec<PathBuf> = (0..n)
         .map(|i| PathBuf::from(format!("/dev/ram{i}")))
         .collect();
@@ -346,18 +422,6 @@ fn size_of(p: &Path) -> Option<u64> {
     // BLKGETSIZE64
     let rc = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&f), 0x8008_1272, &mut n) };
     if rc == 0 { Some(n) } else { None }
-}
-
-/// Zero the superblock and metadata region: a node reformats only a device whose
-/// superblock region is blank, so a stale one would be reused, index and all.
-fn wipe(dev: &Path) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().write(true).open(dev)?;
-    let zero = vec![0u8; 1 << 20];
-    for _ in 0..64 {
-        f.write_all(&zero)?;
-    }
-    f.flush()
 }
 
 // ---------------------------------------------------------------------------

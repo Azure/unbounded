@@ -9,10 +9,10 @@
 //! `Live` makes reload cheap: a pointer the control thread swaps and every worker reads
 //! without a lock.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
@@ -38,6 +38,26 @@ static REJECTED: AtomicU64 = AtomicU64::new(0);
 /// Configs refused since boot.
 pub fn rejected() -> u64 {
     REJECTED.load(Ordering::Relaxed)
+}
+
+/// Where the backing store file lives. Not in the config file on purpose: the path is a
+/// property of how this node was deployed, and the control plane describes a cluster.
+pub const STORE_PATH_ENV: &str = "RACER_STORE";
+/// Used when `RACER_STORE` is unset or empty.
+pub const DEFAULT_STORE_PATH: &str = "/var/lib/racer/store.img";
+
+/// The backing store's path for this process.
+pub fn store_path() -> PathBuf {
+    path_from(std::env::var_os(STORE_PATH_ENV))
+}
+
+/// Split out from [`store_path`] so the defaulting is testable without touching the
+/// process environment, which no test can do without racing every other thread.
+fn path_from(v: Option<OsString>) -> PathBuf {
+    match v {
+        Some(s) if !s.is_empty() => PathBuf::from(s),
+        _ => PathBuf::from(DEFAULT_STORE_PATH),
+    }
 }
 
 fn bad(msg: impl Into<String>) -> io::Error {
@@ -245,14 +265,17 @@ pub struct Node {
     pub(crate) zone: u32,
     /// 0..2, the catalog column that is our cache cohort (cache.rs).
     pub(crate) cohort: u8,
-    /// Backing NVMe namespace this node owns outright.
-    pub device: String,
+    /// The backing store file this node owns outright. From `RACER_STORE`, not from the
+    /// config file, so it is filled in by `load`/`parse` rather than by `from_pb`.
+    pub store: PathBuf,
+    /// The length that file is held at. Grown to on start, never shrunk.
+    pub(crate) store_bytes: u64,
     pub(crate) cache_bytes_4k: u64,
     pub(crate) cache_bytes_4m: u64,
-    /// The rate we are willing to drive the device at, zero for unmetered. Read once
+    /// The rate we are willing to drive the store at, zero for unmetered. Read once
     /// per IO, and only at startup can it change.
-    pub(crate) device_max_iops: u64,
-    pub(crate) device_max_bytes_per_sec: u64,
+    pub(crate) store_max_iops: u64,
+    pub(crate) store_max_bytes_per_sec: u64,
     /// Nodes this one can reach directly, site crossings included.
     pub(crate) peers: Vec<Peer>,
 }
@@ -343,9 +366,13 @@ impl Config {
         Config::decode(&std::fs::read(path)?)
     }
 
+    /// The wire form carries the store's size but not its path: the path is this
+    /// process's own, so it comes from the environment on every decode.
     fn decode(bytes: &[u8]) -> io::Result<Config> {
         let pb = pb::NodeConfig::decode(bytes).map_err(|e| bad(format!("protobuf: {e}")))?;
-        Config::from_pb(pb)
+        let mut cfg = Config::from_pb(pb)?;
+        cfg.node.store = store_path();
+        Ok(cfg)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -541,8 +568,19 @@ impl Config {
         if self.node.id == 0 {
             return Err(bad("node.id is required"));
         }
-        if self.node.device.is_empty() {
-            return Err(bad("node.device is required"));
+        if self.node.store.as_os_str().is_empty() {
+            return Err(bad("node.store path is required"));
+        }
+        // Zero is not "size it for me": the store is the one resource nothing else can
+        // infer, and a node that guessed would format itself differently to its peers.
+        if self.node.store_bytes == 0 {
+            return Err(bad("node.store.size_bytes is required"));
+        }
+        if !self.node.store_bytes.is_multiple_of(SMALL_PAGE) {
+            return Err(bad(format!(
+                "node.store.size_bytes {} is not a multiple of {SMALL_PAGE}",
+                self.node.store_bytes
+            )));
         }
         // A volume's site is the top 8 bits of its id, so a wider site names no volume
         // and would make every volume here look foreign.
@@ -743,6 +781,15 @@ impl Config {
                 self.generation, prev.generation
             )));
         }
+        // The store grows and never shrinks: its contents are addressed by absolute
+        // offset, so there is nothing that could move a page out of the tail a smaller
+        // file would drop. A raise is taken here and acted on at the next start.
+        if self.node.store_bytes < prev.node.store_bytes {
+            return Err(bad(format!(
+                "node.store.size_bytes {} is below the {} in force; the store cannot shrink",
+                self.node.store_bytes, prev.node.store_bytes
+            )));
+        }
         // The catalog's length is frozen for the life of the zone. It is the only thing
         // that maps a slot to the group owning its addresses, and that group is also the
         // key the allocator shards on and the key anti-entropy accumulates digests
@@ -891,7 +938,7 @@ impl Config {
         let cohort = n.cohort.ok_or_else(|| bad("node names no cohort"))?;
         let cohort = pb::Cohort::try_from(cohort)
             .map_err(|_| bad(format!("unknown cohort {cohort}")))? as u8;
-        let dev = n.device.unwrap_or_default();
+        let store = n.store.unwrap_or_default();
         let policy = p.policy.map_or_else(Policy::default, |q| Policy {
             max_index_bytes: q
                 .max_index_bytes
@@ -909,11 +956,13 @@ impl Config {
                 site: n.site,
                 zone: n.zone,
                 cohort,
-                device: dev.path,
-                cache_bytes_4k: dev.cache_bytes_4k,
-                cache_bytes_4m: dev.cache_bytes_4m,
-                device_max_iops: dev.max_iops,
-                device_max_bytes_per_sec: dev.max_bytes_per_sec,
+                // Filled in by `load` or `parse`: the path is not on the wire.
+                store: PathBuf::new(),
+                store_bytes: store.size_bytes,
+                cache_bytes_4k: store.cache_bytes_4k,
+                cache_bytes_4m: store.cache_bytes_4m,
+                store_max_iops: store.max_iops,
+                store_max_bytes_per_sec: store.max_bytes_per_sec,
                 peers,
             },
             topology: Topology {
@@ -952,12 +1001,12 @@ impl Config {
                         gateway_for: p.gateway_for.clone(),
                     })
                     .collect(),
-                device: Some(pb::Device {
-                    path: self.node.device.clone(),
+                store: Some(pb::Store {
+                    size_bytes: self.node.store_bytes,
                     cache_bytes_4k: self.node.cache_bytes_4k,
                     cache_bytes_4m: self.node.cache_bytes_4m,
-                    max_iops: self.node.device_max_iops,
-                    max_bytes_per_sec: self.node.device_max_bytes_per_sec,
+                    max_iops: self.node.store_max_iops,
+                    max_bytes_per_sec: self.node.store_max_bytes_per_sec,
                 }),
             }),
             topology: Some(pb::Topology {
@@ -1010,7 +1059,7 @@ impl Config {
     ///
     /// ```text
     /// generation 7
-    /// node id=1 site=0 zone=1 cohort=1 device=/dev/nvme1n1 cache_4k=0 cache_4m=0
+    /// node id=1 site=0 zone=1 cohort=1 size=68719476736 cache_4k=0 cache_4m=0
     /// peer id=2 device=/dev/nvme2n1
     /// peer id=9 device=/dev/nvme9n1 gateway_for=2
     /// peer id=40 device=/dev/nvme4n1 site=3
@@ -1024,7 +1073,11 @@ impl Config {
     ///
     /// A peer with `site` is our own crossing into that site; a peer with `gateway_for`
     /// is one we hand foreign addresses to. Either is an ordinary peer otherwise.
+    ///
+    /// `store=` on the `node` line has no wire field behind it: it stands in for
+    /// `RACER_STORE`, which one process cannot vary per node, and defaults to it.
     pub fn parse(text: &str) -> io::Result<Config> {
+        let mut store: Option<PathBuf> = None;
         let mut p = pb::NodeConfig::default();
         let mut node = pb::Node::default();
         let mut topo = pb::Topology::default();
@@ -1045,8 +1098,8 @@ impl Config {
                     let f = only(
                         &f,
                         &[
-                            "id", "site", "zone", "cohort", "device", "cache_4k", "cache_4m",
-                            "max_iops", "max_bps",
+                            "id", "site", "zone", "cohort", "store", "size", "cache_4k",
+                            "cache_4m", "max_iops", "max_bps",
                         ],
                     )
                     .map_err(at)?;
@@ -1054,8 +1107,14 @@ impl Config {
                     node.site = get_or(f, "site", 0).map_err(at)? as u32;
                     node.zone = get_or(f, "zone", 0).map_err(at)? as u32;
                     node.cohort = Some(get_or(f, "cohort", 0).map_err(at)? as i32);
-                    node.device = Some(pb::Device {
-                        path: text_field(f, "device").map_err(at)?,
+                    // The one key that is not a wire field: it stands in for the
+                    // environment, so a harness can give each of its nodes a store.
+                    store = f
+                        .iter()
+                        .find(|(k, _)| *k == "store")
+                        .map(|(_, v)| PathBuf::from(*v));
+                    node.store = Some(pb::Store {
+                        size_bytes: get(f, "size").map_err(at)?,
                         cache_bytes_4k: get_or(f, "cache_4k", 0).map_err(at)?,
                         cache_bytes_4m: get_or(f, "cache_4m", 0).map_err(at)?,
                         max_iops: get_or(f, "max_iops", 0).map_err(at)?,
@@ -1134,7 +1193,10 @@ impl Config {
         p.node = Some(node);
         p.topology = Some(topo);
         p.policy = Some(policy);
-        Config::from_pb(p)
+        Config::from_pb(p).map(|mut c| {
+            c.node.store = store.unwrap_or_else(store_path);
+            c
+        })
     }
 }
 
@@ -1454,7 +1516,7 @@ mod tests {
 
     const SAMPLE: &str = "
         generation 7
-        node id=1 zone=1 device=/dev/nvme1n1 cache_4k=1048576
+        node id=1 zone=1 size=68719476736 cache_4k=1048576
         peer id=2 device=/dev/nvme2n1
         group 1 2 3
         group 4 5 6
@@ -1476,7 +1538,8 @@ mod tests {
     fn parses_and_validates() {
         let c = sample();
         assert_eq!(c.generation, 7);
-        assert_eq!(c.node.device, "/dev/nvme1n1");
+        assert_eq!(c.node.store, store_path());
+        assert_eq!(c.node.store_bytes, 64 << 30);
         assert_eq!(c.node.cohort, 0);
         assert_eq!(c.topology.zones[0].entry, [4, 5, 6]);
         // Six nodes over two groups, so three replicas of the zone split six ways.
@@ -1503,12 +1566,90 @@ mod tests {
         assert!(dup.validate().is_err());
     }
 
+    /// The store's path is deployment, not cluster: the file names the size and the
+    /// environment names the place. A missing or empty variable is the default rather
+    /// than an error, so a node with nothing set still starts.
+    #[test]
+    fn the_store_path_comes_from_the_environment() {
+        assert_eq!(path_from(None), Path::new(DEFAULT_STORE_PATH));
+        assert_eq!(
+            path_from(Some(OsString::new())),
+            Path::new(DEFAULT_STORE_PATH)
+        );
+        assert_eq!(
+            path_from(Some(OsString::from("/mnt/d/racer.img"))),
+            Path::new("/mnt/d/racer.img")
+        );
+
+        // And it survives the wire: the size is encoded, the path is resolved again.
+        let a = sample();
+        let b = Config::decode(&a.encode()).unwrap();
+        assert_eq!(b.node.store, store_path());
+        assert_eq!(b.node.store_bytes, a.node.store_bytes);
+    }
+
+    /// The size is what the layout is planned against, so it has to be there, has to be
+    /// a whole page, and has to be somewhere a file can be put.
+    #[test]
+    fn a_store_needs_a_size_and_a_path() {
+        let text = |extra: &str| {
+            format!(
+                "node id=1 zone=1 {extra}
+                 group 1 2 3
+                 volume 1 slot=0
+                   extent pages=1 kind=lww zone=1"
+            )
+        };
+        // `size` is not optional, and the parser says so rather than defaulting to zero.
+        assert!(Config::parse(&text("")).is_err());
+        Config::parse(&text("size=4096"))
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        // A size that is not a whole page cannot be laid out.
+        let c = Config::parse(&text("size=5000")).unwrap();
+        assert!(c.validate().is_err());
+        // Nor can a zero one.
+        let c = Config::parse(&text("size=0")).unwrap();
+        assert!(c.validate().is_err());
+
+        // An empty path is only reachable by hand, but `validate` is what the rest of
+        // the process trusts, so it checks anyway.
+        let mut c = Config::parse(&text("size=4096")).unwrap();
+        c.node.store = PathBuf::new();
+        assert!(c.validate().is_err());
+    }
+
+    /// The store grows and never shrinks: the layout hands out offsets past the old end
+    /// and nothing moves back. A config that lowers the size is refused at reload rather
+    /// than accepted and ignored.
+    #[test]
+    fn a_store_may_grow_but_never_shrink() {
+        let a = sample();
+        let mut b = a.clone();
+        b.generation = 8;
+        b.node.store_bytes = a.node.store_bytes * 2;
+        b.validate().unwrap();
+        b.validate_against(&a).unwrap();
+
+        // Unchanged is fine; the common case is that nothing about the store moves.
+        let mut c = a.clone();
+        c.generation = 8;
+        c.validate_against(&a).unwrap();
+
+        let mut d = a.clone();
+        d.generation = 8;
+        d.node.store_bytes = a.node.store_bytes - SMALL_PAGE;
+        assert!(d.validate_against(&a).is_err());
+    }
+
     /// The page size rides on the extent kind, so a volume that names both spellings of
     /// Immutable has no page size at all. The model cannot hold the mixture, so it is
     /// refused on the way in rather than in `validate`.
     #[test]
     fn a_volume_is_all_one_page_size() {
-        let mixed = "node id=1 zone=1 device=/dev/x
+        let mixed = "node id=1 zone=1 size=4096
              group 1 2 3
              volume 1 slot=0
                extent pages=8 kind=immutable_4m zone=1
@@ -1552,7 +1693,7 @@ mod tests {
         let c = Config::parse(&format!(
             "
             generation 1
-            node id=1 site=1 zone=1 device=/dev/nvme1n1
+            node id=1 site=1 zone=1 size=68719476736
             peer id=2 device=/dev/nvme2n1
             peer id=9 device=/dev/nvme9n1 gateway_for=2
             peer id=10 device=/dev/nvme10n1 gateway_for=2
@@ -1597,7 +1738,7 @@ mod tests {
         let wan = Config::parse(&format!(
             "
             generation 1
-            node id=9 site=1 zone=1 device=/dev/nvme1n1
+            node id=9 site=1 zone=1 size=68719476736
             peer id=40 device=/dev/nvme9n1 site=2
             group 2 3 4
             volume {} slot=0
@@ -1636,7 +1777,7 @@ mod tests {
         let c = Config::parse(&format!(
             "
             generation 1
-            node id=1 site=1 zone=1 cohort=2 device=/dev/nvme1n1
+            node id=1 site=1 zone=1 cohort=2 size=68719476736
             peer id=2 device=/dev/nvme2n1 site=2
             peer id=3 device=/dev/nvme3n1 gateway_for=2
             group 1 4 5
@@ -1715,7 +1856,7 @@ mod tests {
     fn placement_is_intra_site() {
         // Zone 5 is not this node's zone and not a listed zone.
         let c = Config::parse(
-            "node id=1 zone=1 device=/dev/x
+            "node id=1 zone=1 size=4096
              group 1 2 3
              volume 1 slot=0
                extent pages=1 kind=lww zone=5",
@@ -1724,7 +1865,7 @@ mod tests {
         assert!(c.validate().is_err());
         // A volume whose id does not name this node's site.
         let c = Config::parse(
-            "node id=1 zone=1 site=2 device=/dev/x
+            "node id=1 zone=1 site=2 size=4096
              group 1 2 3
              volume 1 slot=0
                extent pages=1 kind=lww zone=1",
