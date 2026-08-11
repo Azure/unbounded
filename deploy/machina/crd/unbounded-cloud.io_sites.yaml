@@ -41,6 +41,10 @@ spec:
       name: Gantry
       priority: 1
       type: boolean
+    - jsonPath: .status.overrides.phase
+      name: Overrides
+      priority: 1
+      type: string
     - jsonPath: .status.nodeCount
       name: Nodes
       type: integer
@@ -346,6 +350,80 @@ spec:
                 description: NodeCount is the number of nodes matched to this site
                   by unbounded-net.
                 type: integer
+              overrides:
+                description: |-
+                  Overrides summarizes user-supplied workload overrides affecting this
+                  Site. It is absent when no override targets any of the Site's workloads.
+                properties:
+                  message:
+                    description: |-
+                      Message explains a Degraded phase, naming the ConfigMap key and entry
+                      index at fault. Empty otherwise.
+                    type: string
+                  observedResourceVersion:
+                    description: |-
+                      ObservedResourceVersion is the resourceVersion of the overrides ConfigMap
+                      this status was computed from, so a result is traceable to a specific
+                      input version. Empty when no overrides ConfigMap exists.
+                    type: string
+                  phase:
+                    description: |-
+                      Phase is the aggregate state of override processing for this Site.
+
+                      Applied means every resolved workload carries the hash that was desired.
+                      It reports that the override merged and was written, not that the
+                      resulting pods are healthy.
+                    enum:
+                    - None
+                    - Applied
+                    - Degraded
+                    type: string
+                  workloads:
+                    description: |-
+                      Workloads carries the desired and applied hash for each overridden
+                      workload.
+
+                      Both are per workload because contributors differ per workload: a
+                      Site-wide desired hash would not be comparable to any of them whenever a
+                      document targets more than one.
+                    items:
+                      description: OverriddenWorkload reports the override state of
+                        one workload.
+                      properties:
+                        appliedHash:
+                          type: string
+                        desiredHash:
+                          description: |-
+                            DesiredHash is computed by the operator from the observed ConfigMap.
+                            AppliedHash is what the workload actually carries. They match when the
+                            override is in effect and differ when it could not be applied.
+                          type: string
+                        kind:
+                          description: |-
+                            Kind and Name identify the workload. Name alone is not unique, because a
+                            Deployment and a DaemonSet may share one.
+                          type: string
+                        name:
+                          type: string
+                        versionDrift:
+                          description: |-
+                            VersionDrift is set when an override changed a container image, formatted
+                            as `<container>=<image>`. Such a component is no longer version-matched to
+                            the operator, and the pin survives operator upgrades, which makes it the
+                            likeliest cause of an install behaving unlike its reported version.
+                          type: string
+                      required:
+                      - kind
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - kind
+                    - name
+                    x-kubernetes-list-type: map
+                required:
+                - phase
+                type: object
               sliceCount:
                 description: SliceCount is the number of SiteNodeSlice objects for
                   this site.

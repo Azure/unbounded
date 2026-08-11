@@ -32,6 +32,9 @@ const (
 type WorkloadResult struct {
 	Ref component.ObjectRef
 
+	// Site is the Site the workload belongs to, empty for cluster singletons.
+	Site string
+
 	// Hash is the contributor hash merged into the object.
 	Hash string
 
@@ -125,7 +128,7 @@ func Apply(plan *component.Plan, entries []SourcedEntry, knownSites []string) Re
 // applyTarget applies one workload's contributors, leaving the operation
 // untouched if anything fails.
 func applyTarget(plan *component.Plan, target Target) WorkloadResult {
-	result := WorkloadResult{Ref: target.Ref}
+	result := WorkloadResult{Ref: target.Ref, Site: target.Site}
 
 	for _, contributor := range target.Contributors {
 		result.Sources = append(result.Sources, contributor.Source)

@@ -21,6 +21,10 @@ type Target struct {
 	// Ref identifies the workload, for messages and status.
 	Ref component.ObjectRef
 
+	// Site is the Site the workload belongs to, empty for cluster singletons.
+	// Status is published per Site, so results have to carry it.
+	Site string
+
 	// Contributors are the entries resolving to this workload, ordered by
 	// sorted ConfigMap key then position within that key's document.
 	Contributors []SourcedEntry
@@ -67,7 +71,7 @@ func Resolve(plan *component.Plan, entries []SourcedEntry, knownSites []string) 
 
 			target, ok := byIndex[i]
 			if !ok {
-				target = &Target{Index: i, Ref: op.Ref()}
+				target = &Target{Index: i, Ref: op.Ref(), Site: op.Site}
 				byIndex[i] = target
 			}
 

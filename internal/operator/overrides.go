@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -150,4 +151,101 @@ func siteNames(sites []unboundedv1alpha3.Site) []string {
 	}
 
 	return names
+}
+
+// overrideStatusFor builds the Site status for one Site from an override
+// report.
+//
+// Desired hashes come from what the operator computed this pass; applied hashes
+// are read back from the objects the plan carries, so the two are comparable by
+// construction rather than by convention.
+func overrideStatusFor(
+	site string,
+	snapshot overrideSnapshot,
+	report *override.Report,
+	plan *component.Plan,
+) *unboundedv1alpha3.OverrideStatus {
+	status := &unboundedv1alpha3.OverrideStatus{
+		Phase:                   unboundedv1alpha3.OverridePhaseNone,
+		ObservedResourceVersion: snapshot.resourceVersion,
+	}
+
+	if snapshot.blocksWorkloads() {
+		status.Phase = unboundedv1alpha3.OverridePhaseDegraded
+		status.Message = snapshot.err.Error()
+
+		return status
+	}
+
+	if report == nil {
+		return status
+	}
+
+	applied := appliedHashes(plan)
+
+	for _, workload := range report.Workloads {
+		// Cluster singletons carry no Site but every Site depends on them, so
+		// their override state is reported on all of them. Filtering them out
+		// would hide the common case, an override of net or machina, from
+		// `kubectl get site` entirely.
+		if workload.Site != "" && workload.Site != site {
+			continue
+		}
+
+		entry := unboundedv1alpha3.OverriddenWorkload{
+			Kind:         workload.Ref.GVK.Kind,
+			Name:         workload.Ref.Name,
+			DesiredHash:  workload.Hash,
+			AppliedHash:  applied[workload.Ref],
+			VersionDrift: workload.VersionDrift,
+		}
+
+		status.Workloads = append(status.Workloads, entry)
+
+		switch {
+		case workload.Err != nil:
+			status.Phase = unboundedv1alpha3.OverridePhaseDegraded
+
+			if status.Message == "" {
+				status.Message = workload.Err.Error()
+			}
+		case entry.AppliedHash != entry.DesiredHash:
+			status.Phase = unboundedv1alpha3.OverridePhaseDegraded
+
+			if status.Message == "" {
+				status.Message = "override was not written to " + workload.Ref.String()
+			}
+		case status.Phase == unboundedv1alpha3.OverridePhaseNone:
+			status.Phase = unboundedv1alpha3.OverridePhaseApplied
+		}
+	}
+
+	sort.Slice(status.Workloads, func(i, j int) bool {
+		if status.Workloads[i].Kind != status.Workloads[j].Kind {
+			return status.Workloads[i].Kind < status.Workloads[j].Kind
+		}
+
+		return status.Workloads[i].Name < status.Workloads[j].Name
+	})
+
+	return status
+}
+
+// appliedHashes reads back the override hash each surviving operation carries.
+//
+// An operation dropped because its overrides could not be applied is absent
+// here, so its applied hash is empty and does not match the desired one, which
+// is exactly the divergence the status is meant to report.
+func appliedHashes(plan *component.Plan) map[component.ObjectRef]string {
+	out := map[component.ObjectRef]string{}
+
+	for _, op := range plan.Operations {
+		if !op.Overridable {
+			continue
+		}
+
+		out[op.Ref()] = op.Object.GetAnnotations()[override.HashAnnotation]
+	}
+
+	return out
 }

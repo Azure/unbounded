@@ -420,3 +420,139 @@ func unstructuredOf(apiVersion, kind, name string) *unstructured.Unstructured {
 		"metadata":   map[string]any{"name": name, "namespace": component.DefaultNamespace},
 	}}
 }
+
+// siteFor builds a Site the reconciler can publish status onto.
+func siteFor(name string) *unboundedv1alpha3.Site {
+	return &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: name}}
+}
+
+// TestOverrideStatusReportsApplied covers the observability contract: a Site
+// carries the desired and applied hash per workload, and they match when the
+// override is in effect.
+func TestOverrideStatusReportsApplied(t *testing.T) {
+	site := siteFor("edge")
+
+	r, _, cl := overrideTestEnv(t, site, overridesConfigMap(map[string]string{
+		"overrides.yaml": `apiVersion: ` + override.APIVersion + `
+overrides:
+  - component: net
+    kind: DaemonSet
+    extraArgs:
+      node: ["--verbose"]
+`,
+	}))
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got unboundedv1alpha3.Site
+	if err := cl.Get(t.Context(), client.ObjectKey{Name: "edge"}, &got); err != nil {
+		t.Fatalf("get site: %v", err)
+	}
+
+	status := got.Status.Overrides
+	if status == nil {
+		t.Fatal("Site carries no override status")
+	}
+
+	if status.Phase != unboundedv1alpha3.OverridePhaseApplied {
+		t.Fatalf("phase = %q, want Applied (message=%q)", status.Phase, status.Message)
+	}
+
+	if status.ObservedResourceVersion == "" {
+		t.Fatal("status must record the resourceVersion it was computed from")
+	}
+
+	if len(status.Workloads) != 1 {
+		t.Fatalf("workloads = %+v, want one", status.Workloads)
+	}
+
+	workload := status.Workloads[0]
+	if workload.DesiredHash == "" || workload.DesiredHash != workload.AppliedHash {
+		t.Fatalf("desired = %q applied = %q, want equal and non-empty", workload.DesiredHash, workload.AppliedHash)
+	}
+}
+
+// TestOverrideStatusReportsDegraded covers the other half: an unusable document
+// is visible on the Site rather than only in logs.
+func TestOverrideStatusReportsDegraded(t *testing.T) {
+	site := siteFor("edge")
+
+	r, _, cl := overrideTestEnv(t, site, overridesConfigMap(map[string]string{
+		"overrides.yaml": "apiVersion: " + override.APIVersion + "\noverrides:\n  - component: net\n    kind: DaemonSet\n    patch:\n      metadata:\n        name: renamed\n",
+	}))
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err == nil {
+		t.Fatal("expected the invalid document to fail the pass")
+	}
+
+	var got unboundedv1alpha3.Site
+	if err := cl.Get(t.Context(), client.ObjectKey{Name: "edge"}, &got); err != nil {
+		t.Fatalf("get site: %v", err)
+	}
+
+	status := got.Status.Overrides
+	if status == nil || status.Phase != unboundedv1alpha3.OverridePhaseDegraded {
+		t.Fatalf("status = %+v, want Degraded", status)
+	}
+
+	if status.Message == "" {
+		t.Fatal("a degraded status must explain itself")
+	}
+}
+
+// TestOverrideStatusHashesAreComparable is a regression test for a specific
+// defect: pairing one Site-wide desired hash against many per-workload applied
+// hashes made them differ whenever a document targeted more than one workload,
+// so the divergence signal was permanently on.
+func TestOverrideStatusHashesAreComparable(t *testing.T) {
+	status := overrideStatusFor("edge",
+		overrideSnapshot{state: overridesValid, resourceVersion: "7"},
+		&override.Report{Workloads: []override.WorkloadResult{
+			{Ref: component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "a")), Site: "edge", Hash: "h1"},
+			{Ref: component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "b")), Site: "edge", Hash: "h2"},
+		}},
+		planWithApplied(map[string]string{"a": "h1", "b": "h2"}),
+	)
+
+	if status.Phase != unboundedv1alpha3.OverridePhaseApplied {
+		t.Fatalf("phase = %q, want Applied; per-workload hashes must be comparable", status.Phase)
+	}
+
+	for _, workload := range status.Workloads {
+		if workload.DesiredHash != workload.AppliedHash {
+			t.Fatalf("workload %s: desired %q != applied %q", workload.Name, workload.DesiredHash, workload.AppliedHash)
+		}
+	}
+}
+
+// TestOverrideStatusDetectsDivergence confirms the signal is not merely always
+// off either: a workload that did not receive its override is Degraded.
+func TestOverrideStatusDetectsDivergence(t *testing.T) {
+	status := overrideStatusFor("edge",
+		overrideSnapshot{state: overridesValid, resourceVersion: "7"},
+		&override.Report{Workloads: []override.WorkloadResult{
+			{Ref: component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "a")), Site: "edge", Hash: "desired"},
+		}},
+		planWithApplied(map[string]string{"a": "stale"}),
+	)
+
+	if status.Phase != unboundedv1alpha3.OverridePhaseDegraded {
+		t.Fatalf("phase = %q, want Degraded when applied differs from desired", status.Phase)
+	}
+}
+
+// planWithApplied builds a plan whose workloads carry the given hashes.
+func planWithApplied(hashes map[string]string) *component.Plan {
+	plan := component.NewPlan()
+
+	for name, hash := range hashes {
+		obj := unstructuredOf("apps/v1", "DaemonSet", name)
+		obj.SetAnnotations(map[string]string{override.HashAnnotation: hash})
+
+		plan.Add(component.Operation{Kind: component.OpApply, Object: obj, Component: "net", Site: "edge", Overridable: true})
+	}
+
+	return plan
+}

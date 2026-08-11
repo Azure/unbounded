@@ -22,6 +22,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
+	"k8s.io/client-go/tools/events"
+
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/components/gantry"
@@ -61,6 +63,10 @@ type SiteReconciler struct {
 	// Registry is the set of components to reconcile. When nil it defaults to
 	// DefaultRegistry.
 	Registry *component.Registry
+
+	// Recorder, when set, receives Events for override state changes. Optional
+	// so unit tests can construct a reconciler without one.
+	Recorder events.EventRecorder
 }
 
 // DefaultRegistry returns the built-in component registry: the net and machina
@@ -168,7 +174,7 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 	// merged plan is what lets shared operations deduplicate across components.
 	planned, plan := planComponents(ctx, env, reg, sites, site)
 
-	overrideErr := applyOverrides(logger, plan, snapshot, sites)
+	report, overrideErr := applyOverrides(logger, plan, snapshot, sites)
 
 	exec, execErr := env.Execute(ctx, plan)
 
@@ -206,6 +212,8 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 	if site != nil {
 		pruneStaleConditions(site, reg)
 
+		r.publishOverrideStatus(ctx, site, snapshot, report, plan)
+
 		if err := r.Status().Patch(ctx, site, patch); err != nil {
 			reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status: %w", err))
 		}
@@ -221,7 +229,7 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 // single component: the overrides ConfigMap is cluster-scoped and one document
 // routinely targets several components, so a document-level failure belongs to
 // the pass rather than to whichever component happened to be planned first.
-func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideSnapshot, sites []unboundedv1alpha3.Site) error {
+func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideSnapshot, sites []unboundedv1alpha3.Site) (*override.Report, error) {
 	if snapshot.blocksWorkloads() {
 		skipped := dropOverridableOperations(plan)
 
@@ -230,11 +238,11 @@ func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideS
 			"skippedWorkloads", len(skipped),
 			"resourceVersion", snapshot.resourceVersion)
 
-		return fmt.Errorf("overrides unusable, %d workloads left unchanged: %w", len(skipped), snapshot.err)
+		return nil, fmt.Errorf("overrides unusable, %d workloads left unchanged: %w", len(skipped), snapshot.err)
 	}
 
 	if !snapshot.usable() || len(snapshot.entries) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	report := override.Apply(plan, snapshot.entries, siteNames(sites))
@@ -256,10 +264,10 @@ func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideS
 	}
 
 	if report.Failed() {
-		return fmt.Errorf("overrides could not be applied to some workloads: %w", report.Err())
+		return &report, fmt.Errorf("overrides could not be applied to some workloads: %w", report.Err())
 	}
 
-	return nil
+	return &report, nil
 }
 
 // componentOutcome is a component's planning verdict, held until execution
@@ -451,4 +459,60 @@ func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return b.Complete(r)
+}
+
+// publishOverrideStatus records the Site's override state and emits an Event
+// when it changes.
+//
+// Events fire on a change of hash or phase rather than on every reconcile, so
+// a steady state is quiet. They are emitted against the Site here; the
+// overrides ConfigMap gets its own Events for failures that no Site can carry,
+// including the case where no Site exists at all.
+func (r *SiteReconciler) publishOverrideStatus(
+	_ context.Context,
+	site *unboundedv1alpha3.Site,
+	snapshot overrideSnapshot,
+	report *override.Report,
+	plan *component.Plan,
+) {
+	status := overrideStatusFor(site.Name, snapshot, report, plan)
+
+	previous := site.Status.Overrides
+	site.Status.Overrides = status
+
+	if r.Recorder == nil || !overrideStatusChanged(previous, status) {
+		return
+	}
+
+	switch status.Phase {
+	case unboundedv1alpha3.OverridePhaseDegraded:
+		r.Recorder.Eventf(site, nil, corev1.EventTypeWarning,
+			"OverridesDegraded", "ApplyOverrides", "%s", status.Message)
+	case unboundedv1alpha3.OverridePhaseApplied:
+		r.Recorder.Eventf(site, nil, corev1.EventTypeNormal,
+			"OverridesApplied", "ApplyOverrides", "%d workload(s) overridden", len(status.Workloads))
+	}
+}
+
+// overrideStatusChanged reports whether anything worth an Event changed.
+func overrideStatusChanged(previous, current *unboundedv1alpha3.OverrideStatus) bool {
+	if previous == nil {
+		return current != nil && current.Phase != unboundedv1alpha3.OverridePhaseNone
+	}
+
+	if current == nil {
+		return true
+	}
+
+	if previous.Phase != current.Phase || len(previous.Workloads) != len(current.Workloads) {
+		return true
+	}
+
+	for i := range current.Workloads {
+		if previous.Workloads[i] != current.Workloads[i] {
+			return true
+		}
+	}
+
+	return false
 }

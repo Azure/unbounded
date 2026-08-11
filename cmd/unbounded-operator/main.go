@@ -202,6 +202,7 @@ func run(ctx context.Context, cfg config) error {
 		Scheme:    scheme,
 		Namespace: namespace,
 		Registry:  operator.DefaultRegistry(),
+		Recorder:  mgr.GetEventRecorder("unbounded-operator"),
 		Config: operator.Config{
 			ImageRegistry:     cfg.imageRegistry,
 			ImageTag:          version.Version,
