@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -20,9 +21,11 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -1500,5 +1503,73 @@ func TestApplyDefaultsFiltersDefaultTargetWhenTargetEmpty(t *testing.T) {
 			t.Fatalf("defaulted target %q must be filtered out, got %#v",
 				legacyNetNamespace, r.LegacyNamespaces)
 		}
+	}
+}
+
+// addOnlyManager satisfies ctrl.Manager by embedding it, and implements only
+// the one method SetupWithManager calls. Any other call panics, which is the
+// point: it pins what setup is allowed to touch.
+type addOnlyManager struct {
+	ctrl.Manager
+
+	added []manager.Runnable
+}
+
+func (m *addOnlyManager) Add(r manager.Runnable) error {
+	m.added = append(m.added, r)
+
+	return nil
+}
+
+// TestReaperSetupRequiresAnAPIReader guards the fallback in liveReader.
+//
+// Every read the reaper makes targets a legacy namespace, and the operator
+// scopes its manager cache to its own namespace. liveReader falls back to the
+// cached client when APIReader is nil, which is harmless in a unit test against
+// a fake client and is not harmless under a manager: those reads would fail
+// deep inside a migration that deletes things.
+//
+// Failing at startup is the difference between a pod that will not start and a
+// pod that half-migrates a cluster.
+func TestReaperSetupRequiresAnAPIReader(t *testing.T) {
+	reaper := &LegacyReaper{
+		Client:          fake.NewClientBuilder().WithScheme(reaperScheme(t)).Build(),
+		TargetNamespace: "unbounded-system",
+	}
+
+	// The check runs before the manager is touched, so a nil manager is safe
+	// here and proves the check comes first.
+	err := reaper.SetupWithManager(nil)
+	if err == nil {
+		t.Fatal("a reaper with no APIReader must be refused at setup")
+	}
+
+	if !strings.Contains(err.Error(), "APIReader") {
+		t.Fatalf("error = %q, want it to name the missing field", err)
+	}
+
+	if !strings.Contains(err.Error(), "cache") {
+		t.Fatalf("error = %q, want it to say why the cache makes this necessary", err)
+	}
+}
+
+// TestReaperSetupAcceptsAnAPIReader confirms the guard is not simply refusing
+// everything, and that a correctly wired reaper is registered as a runnable.
+func TestReaperSetupAcceptsAnAPIReader(t *testing.T) {
+	cl := fake.NewClientBuilder().WithScheme(reaperScheme(t)).Build()
+
+	reaper := &LegacyReaper{
+		Client:          cl,
+		APIReader:       cl,
+		TargetNamespace: "unbounded-system",
+	}
+
+	mgr := &addOnlyManager{}
+	if err := reaper.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager: %v", err)
+	}
+
+	if len(mgr.added) != 1 {
+		t.Fatalf("added %d runnables, want the reaper itself", len(mgr.added))
 	}
 }

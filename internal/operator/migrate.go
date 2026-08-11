@@ -5,6 +5,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -192,9 +193,16 @@ func clusterScopedSecretRewrites() []secretNamespaceRewrite {
 // operator-owned resources (and the now-empty legacy namespaces) left behind.
 type LegacyReaper struct {
 	client.Client
-	// APIReader bypasses the manager cache for migration inventory, copy sources,
-	// target existence checks, and safety gates. It falls back to Client for
-	// direct construction in unit tests.
+
+	// APIReader bypasses the manager cache for migration inventory, copy
+	// sources, target existence checks, and safety gates. Every one of those
+	// reads targets a legacy namespace, which is outside the operator's scoped
+	// cache, so they must not go through it.
+	//
+	// It falls back to Client when nil, which exists only for unit tests that
+	// construct the reaper directly against a fake client. SetupWithManager
+	// rejects a nil APIReader so that fallback can never be reached in a
+	// running operator.
 	APIReader client.Reader
 
 	// TargetNamespace is the unified namespace components are consolidated into.
@@ -2068,6 +2076,10 @@ func (r *LegacyReaper) namespaceExists(ctx context.Context, name string) (bool, 
 	return false, err
 }
 
+// liveReader returns the reader every read in this file must use.
+//
+// See APIReader: the fallback is for direct construction in unit tests, and
+// SetupWithManager refuses a nil APIReader so a running operator never takes it.
 func (r *LegacyReaper) liveReader() client.Reader {
 	if r.APIReader != nil {
 		return r.APIReader
@@ -2334,6 +2346,19 @@ func storageDaemonSetReady(ds *appsv1.DaemonSet) bool {
 }
 
 // SetupWithManager registers the reaper as a leader-elected manager runnable.
+//
+// A nil APIReader is refused rather than tolerated. liveReader falls back to the
+// cached client, which is fine in a unit test constructing the reaper directly,
+// and is not fine under a manager: the operator scopes its cache to its own
+// namespace, and every read the reaper makes is aimed at a legacy namespace
+// outside it. Those reads would fail, and they would fail deep inside a
+// migration that deletes things. Failing at startup instead is the difference
+// between a pod that will not start and a pod that half-migrates a cluster.
 func (r *LegacyReaper) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		return errors.New("legacy reaper requires an APIReader: its reads target namespaces " +
+			"outside the operator's scoped cache, so they must bypass it (use mgr.GetAPIReader())")
+	}
+
 	return mgr.Add(r)
 }

@@ -298,6 +298,18 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 }
 
 // ListSites returns every Site in the cluster.
+//
+// This is an unscoped list, and it has to be: every pass fans out over the
+// result, and a component decides whether it is enabled by inspecting it.
+//
+// It is correct only because Site is cluster-scoped. The operator runs with its
+// cache scoped to its own namespace, and controller-runtime's multi-namespace
+// cache routes cluster-scoped kinds to a separate cluster-wide cache. Were Site
+// ever made namespaced, this same call would return only the Sites in the
+// operator's namespace and would report no error at all: every other Site would
+// silently lose its per-Site workloads, and the cluster components would
+// conclude they were disabled. TestSiteMustBeClusterScopedForTheScopedCache
+// pins that invariant to this call site.
 func (e *Env) ListSites(ctx context.Context) ([]unboundedv1alpha3.Site, error) {
 	var sites unboundedv1alpha3.SiteList
 	if err := e.Client.List(ctx, &sites); err != nil {
