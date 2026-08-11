@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -27,6 +29,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
 	"github.com/Azure/unbounded/internal/operator/components/storage"
+	"github.com/Azure/unbounded/internal/operator/override"
 )
 
 // FieldOwner is the server-side apply field manager the operator uses. It is
@@ -154,10 +157,18 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		patch = client.MergeFrom(site.DeepCopy())
 	}
 
+	// Read and validate overrides once, before anything is planned. Parsing and
+	// validation are pure functions of the payload, so a failure here means
+	// nothing has been written and nothing will be for any workload an override
+	// could target.
+	snapshot := loadOverrides(ctx, env)
+
 	// Plan every component before executing any of it. Planning performs no
 	// writes, so a planning failure leaves the cluster untouched, and the
 	// merged plan is what lets shared operations deduplicate across components.
 	planned, plan := planComponents(ctx, env, reg, sites, site)
+
+	overrideErr := applyOverrides(logger, plan, snapshot, sites)
 
 	exec, execErr := env.Execute(ctx, plan)
 
@@ -165,6 +176,10 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		reconcileErrs []error
 		requeueAfter  time.Duration
 	)
+
+	if overrideErr != nil {
+		reconcileErrs = append(reconcileErrs, overrideErr)
+	}
 
 	if execErr != nil {
 		// A plan the executor refuses to run (a dependency cycle, or
@@ -197,6 +212,54 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 	}
 
 	return ctrl.Result{RequeueAfter: requeueAfter}, errors.Join(reconcileErrs...)
+}
+
+// applyOverrides merges user-supplied overrides into a plan, or removes the
+// workloads they would have targeted when the document cannot be used.
+//
+// The returned error requeues the pass. It is deliberately not attributed to a
+// single component: the overrides ConfigMap is cluster-scoped and one document
+// routinely targets several components, so a document-level failure belongs to
+// the pass rather than to whichever component happened to be planned first.
+func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideSnapshot, sites []unboundedv1alpha3.Site) error {
+	if snapshot.blocksWorkloads() {
+		skipped := dropOverridableOperations(plan)
+
+		logger.Error(snapshot.err, "overrides could not be used; leaving managed workloads unchanged",
+			"configMap", override.ConfigMapName,
+			"skippedWorkloads", len(skipped),
+			"resourceVersion", snapshot.resourceVersion)
+
+		return fmt.Errorf("overrides unusable, %d workloads left unchanged: %w", len(skipped), snapshot.err)
+	}
+
+	if !snapshot.usable() || len(snapshot.entries) == 0 {
+		return nil
+	}
+
+	report := override.Apply(plan, snapshot.entries, siteNames(sites))
+
+	for _, unmatched := range report.UnmatchedSites {
+		logger.Info("override names a Site that does not exist; it is inert until the Site is created",
+			"site", unmatched, "configMap", override.ConfigMapName)
+	}
+
+	for _, workload := range report.Workloads {
+		if workload.Err != nil {
+			continue
+		}
+
+		if workload.VersionDrift != "" {
+			logger.Info("override changed a container image; this component is no longer version-matched to the operator",
+				"workload", workload.Ref.String(), "drift", workload.VersionDrift)
+		}
+	}
+
+	if report.Failed() {
+		return fmt.Errorf("overrides could not be applied to some workloads: %w", report.Err())
+	}
+
+	return nil
 }
 
 // componentOutcome is a component's planning verdict, held until execution
@@ -354,7 +417,26 @@ func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// changes (Create/Delete still pass) so component reconcile is driven by
 	// intent, not status noise.
 	b := ctrl.NewControllerManagedBy(mgr).
+		// Pin the worker count rather than inherit controller-runtime's default.
+		// A pass reads the overrides ConfigMap once and derives everything from
+		// that snapshot, and single-threading is what makes two passes unable to
+		// interleave writes to the same workload. It says nothing about external
+		// writers: users and other controllers still edit these objects
+		// concurrently, which the snapshot model handles instead.
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		For(&unboundedv1alpha3.Site{}, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
+
+	// The overrides ConfigMap spans components, so it is watched here rather
+	// than by any one of them.
+	//
+	// It deliberately does not use RequestSingletonAndAllSites: that handler
+	// lists Sites at event-delivery time and, when the List fails, logs and
+	// returns only the singleton request. The event is consumed and the per-Site
+	// fan-out is lost permanently, with no retry. Enqueuing the singleton
+	// request alone keeps the fan-out inside Reconcile, where a failure can be
+	// returned and retried with backoff.
+	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
+		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(override.ConfigMapName))))
 
 	for _, c := range reg.Cluster {
 		if wp, ok := c.(component.WatchProvider); ok {

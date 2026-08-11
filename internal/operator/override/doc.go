@@ -26,6 +26,13 @@
 // another identity's API permissions.
 package override
 
+// ConfigMapName is the ConfigMap the operator reads overrides from.
+//
+// The operator only ever reads it: it is never created, never seeded and never
+// written, so an absent ConfigMap unambiguously means "no overrides" rather
+// than "not yet initialized".
+const ConfigMapName = "unbounded-component-overrides"
+
 // APIVersion is the only document version this release accepts. It gates the
 // schema so the format can evolve without silently reinterpreting documents
 // written against an older shape.
