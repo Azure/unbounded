@@ -414,6 +414,25 @@ fn write_lww(dev: &Dev, off: u64, page: &[u8]) {
     panic!("write at {off}: still EAGAIN after 64 tries");
 }
 
+/// An OCC write that must land, re-observing on `EAGAIN`. A refusal is the register's
+/// only answer for every kind of conflict, and a background repair round produces one
+/// with no competing writer at all — a term the group raised under a sweep outranks the
+/// proposal even when the version never moved. Reading again and retrying is what an OCC
+/// client does. The refusals this test asserts stay plain `write` calls.
+fn write_occ(dev: &Dev, off: u64, page: &[u8]) {
+    for _ in 0..64 {
+        match dev.write(off, page) {
+            Ok(()) => return,
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                dev.read(off, page.len()).unwrap();
+            }
+            Err(e) => panic!("write at {off}: {e}"),
+        }
+    }
+    panic!("write at {off}: still EAGAIN after 64 tries");
+}
+
 // ---------------------------------------------------------------------------
 // configuration
 // ---------------------------------------------------------------------------
@@ -638,10 +657,10 @@ fn six_node_cluster() {
         assert_eq!(a.read(p * 4096, PAGE).unwrap(), vec![0u8; PAGE], "hole must read as zeroes");
         assert_eq!(b.read(p * 4096, PAGE).unwrap(), vec![0u8; PAGE], "hole must read as zeroes");
 
-        a.write(p * 4096, &pattern(1, PAGE)).unwrap();
+        write_lww(&a, p * 4096, &pattern(1, PAGE));
         assert_eq!(b.read(p * 4096, PAGE).unwrap(), pattern(1, PAGE), "write must be visible");
         // Both the member and the non-member drive a round for this page.
-        b.write(p * 4096, &pattern(2, PAGE)).unwrap();
+        write_lww(&b, p * 4096, &pattern(2, PAGE));
         assert_eq!(a.read(p * 4096, PAGE).unwrap(), pattern(2, PAGE), "last write must win");
     }
 
@@ -652,13 +671,13 @@ fn six_node_cluster() {
     for _ in 0..64 {
         assert_eq!(a.read(remote * 4096, PAGE).unwrap(), pattern(2, PAGE), "a hot read");
     }
-    b.write(remote * 4096, &pattern(9, PAGE)).unwrap();
+    write_lww(&b, remote * 4096, &pattern(9, PAGE));
     assert_eq!(
         a.read(remote * 4096, PAGE).unwrap(),
         pattern(9, PAGE),
         "a cached copy that lost its version is dropped, not served"
     );
-    b.write(remote * 4096, &pattern(2, PAGE)).unwrap();
+    write_lww(&b, remote * 4096, &pattern(2, PAGE));
 
     // ---- OCC: a write is refused unless this node read the current version ---------
     let occ_page = page_in(&cfg, OCC, 1);
@@ -669,7 +688,7 @@ fn six_node_cluster() {
         "OCC write with no prior read must be refused"
     );
     oa.read(occ_page * 4096, PAGE).unwrap();
-    oa.write(occ_page * 4096, &pattern(3, PAGE)).unwrap();
+    write_occ(&oa, occ_page * 4096, &pattern(3, PAGE));
     assert!(
         oa.write(occ_page * 4096, &pattern(4, PAGE)).is_err(),
         "OCC write on a stale observation must be refused"
@@ -677,7 +696,7 @@ fn six_node_cluster() {
     // Both nodes read the same version; the second writer loses.
     oa.read(occ_page * 4096, PAGE).unwrap();
     assert_eq!(ob.read(occ_page * 4096, PAGE).unwrap(), pattern(3, PAGE));
-    oa.write(occ_page * 4096, &pattern(5, PAGE)).unwrap();
+    write_occ(&oa, occ_page * 4096, &pattern(5, PAGE));
     assert!(
         ob.write(occ_page * 4096, &pattern(6, PAGE)).is_err(),
         "OCC must reject a write whose read was overtaken"
@@ -791,7 +810,7 @@ fn six_node_cluster() {
     wire_without(&mut nodes, 4, &[0], &[5, 6]);
     let a = nodes[0].dev(LWW);
     assert_eq!(a.read(remote * 4096, PAGE).unwrap(), pattern(2, PAGE), "read via a forward");
-    a.write(remote * 4096, &pattern(11, PAGE)).unwrap();
+    write_lww(&a, remote * 4096, &pattern(11, PAGE));
     assert_eq!(a.read(remote * 4096, PAGE).unwrap(), pattern(11, PAGE), "write via a forward");
     assert_eq!(
         nodes[5].dev(LWW).read(remote * 4096, PAGE).unwrap(),

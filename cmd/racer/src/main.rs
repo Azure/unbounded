@@ -89,7 +89,12 @@ fn serve(cfg: Config, path: String, metrics: String) -> std::io::Result<()> {
             Ok(())
         };
         if let Err(e) = config::watch(Path::new(&path), cfg, apply) {
+            // A node that can no longer see the file is one the control plane has lost:
+            // it would serve the generation it happens to hold and ignore every later
+            // one, silently. Leaving says so — the supervisor restarts it, and a start
+            // reads the file again.
             eprintln!("racer: config watch stopped: {e}");
+            std::process::exit(1);
         }
     })?;
 

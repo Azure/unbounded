@@ -1284,6 +1284,29 @@ impl Watch {
         Ok(w)
     }
 
+    /// Consume whatever is already queued, without blocking.
+    fn drain(&self) -> io::Result<()> {
+        let mut buf = [0u64; 512];
+        loop {
+            let mut p = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            let ready = unsafe { libc::poll(&mut p, 1, 0) };
+            let n = match ready {
+                0 => return Ok(()),
+                r if r > 0 => unsafe {
+                    libc::read(self.fd, buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf))
+                },
+                _ => -1,
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
     /// Block until the watched file may have changed. Events for other names in the
     /// directory are consumed and ignored.
     fn wait(&self) -> io::Result<()> {
@@ -1342,6 +1365,31 @@ pub fn watch(
     mut apply: impl FnMut(Config) -> io::Result<()>,
 ) -> io::Result<()> {
     let w = Watch::new(path)?;
+    // inotify reports nothing that happened before the watch existed, and the caller
+    // loaded `current` before this thread ran: a config published in that window would
+    // be lost until someone published another one. So read the file here instead of
+    // waiting for it. Draining before every read is what keeps the two in step — an
+    // event dropped here can only announce a file this read is about to see, and a
+    // publication this read misses is still queued for the loop below. Finding the
+    // config already running is the ordinary case and is not a refusal.
+    loop {
+        w.drain()?;
+        let Ok(next) = Config::load(path) else { break };
+        if next.generation <= current.generation {
+            break;
+        }
+        if let Err(e) = next.validate().and_then(|()| next.validate_against(&current)) {
+            reject(path, e);
+            break;
+        }
+        match apply(next.clone()) {
+            Ok(()) => current = next,
+            Err(e) => {
+                reject(path, e);
+                break;
+            }
+        }
+    }
     loop {
         w.wait()?;
         let next = match Config::load(path) {
