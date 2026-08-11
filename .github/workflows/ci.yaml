@@ -28,6 +28,63 @@ env:
   CNI_PLUGINS_VERSION: v1.9.1
 
 jobs:
+  # ---------- Change Detection ----------
+  # Computes which self-contained job groups actually need to run for
+  # this event. Jobs gated on these outputs report as "skipped" when
+  # their sources are untouched, and GitHub counts a skipped job as
+  # passing for required status checks, so gating here is safe for
+  # branch protection and the merge queue in a way that a workflow-level
+  # `paths:` filter is not (a workflow that never runs never reports).
+  #
+  # Anything we cannot diff confidently (workflow_dispatch, branch
+  # creation, force push to a pruned sha) falls back to running the
+  # gated jobs. Only add a filter here for a component that is genuinely
+  # standalone; anything reachable from the Go module graph must keep
+  # running unconditionally.
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      racer: ${{ steps.filter.outputs.racer }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Filter changed paths
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE_SHA" ;;
+            merge_group) base="$MERGE_GROUP_BASE_SHA" ;;
+            push) base="$PUSH_BEFORE_SHA" ;;
+            *) base="" ;;
+          esac
+
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "No usable base ref for event '$EVENT_NAME'; running all gated jobs."
+            echo "racer=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$base"...HEAD)"
+          echo "Changed files vs $base:"
+          echo "$changed"
+
+          if echo "$changed" | grep -qE '^(cmd/racer/|\.github/workflows/ci\.yaml$)'; then
+            echo "racer=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "racer=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # ---------- Frontend ----------
   frontend:
     name: Build Frontend
@@ -130,6 +187,64 @@ jobs:
           path: coverage.out
           retention-days: 7
           if-no-files-found: ignore
+
+  # ---------- Racer (Rust) ----------
+  # Format, lint, and test the RACER crate under both the default and
+  # `sim` (deterministic simulation) feature sets. Lives here rather
+  # than in a dedicated workflow so it is covered by the merge queue
+  # (merge_group) alongside the Go jobs, while the `changes` gate keeps
+  # it off PRs that do not touch the crate. The crate is standalone (its
+  # own Cargo.lock, no Makefile targets) and does not consume the
+  # frontend dist, so `changes` is its only dependency.
+  racer:
+    name: Racer
+    needs: [changes]
+    if: needs.changes.outputs.racer == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential liburing-dev protobuf-compiler
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cmd/racer/target
+          key: cargo-racer-${{ runner.os }}-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/Cargo.toml', 'cmd/racer/build.rs', 'cmd/racer/proto/config.proto') }}
+          restore-keys: |
+            cargo-racer-${{ runner.os }}-
+
+      - name: Check formatting
+        working-directory: cmd/racer
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        working-directory: cmd/racer
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --features sim -- -D warnings
+
+      - name: Test
+        working-directory: cmd/racer
+        run: cargo test --locked --all-targets
+
+      - name: Test deterministic simulation
+        working-directory: cmd/racer
+        run: cargo test --locked --all-targets --features sim
 
   # ---------- Orca Integration Tests ----------
   # Spins up Garage and Azurite via testcontainers-go and runs the
