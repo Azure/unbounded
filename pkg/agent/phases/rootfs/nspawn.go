@@ -7,12 +7,16 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"text/template"
+
+	"github.com/google/renameio/v2"
+	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -226,15 +230,70 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	return nil
 }
 
-// writeNSpawnHostFile writes the final named path directly so SELinux applies
-// and preserves the path-specific label. Atomic temp-file replacement can be
-// denied when the hidden temp name receives a different label.
+// writeNSpawnHostFile atomically updates an existing host config while copying
+// its SELinux label to the temporary file. New files are written directly so
+// SELinux applies the path-specific label for the final name.
 func writeNSpawnHostFile(path string, data []byte, perm os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
 
-	return os.WriteFile(path, data, perm)
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return os.WriteFile(path, data, perm)
+	} else if err != nil {
+		return err
+	}
+
+	return replaceNSpawnHostFile(path, perm, func(file *os.File) error {
+		_, err := file.Write(data)
+
+		return err
+	})
+}
+
+func replaceNSpawnHostFile(path string, perm os.FileMode, write func(*os.File) error) (retErr error) {
+	pending, err := renameio.NewPendingFile(
+		path,
+		renameio.WithPermissions(perm),
+		renameio.WithTempDir(filepath.Dir(path)),
+	)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		retErr = errors.Join(retErr, pending.Cleanup())
+	}()
+
+	if err := copySELinuxLabel(path, pending.Name()); err != nil {
+		return fmt.Errorf("copy SELinux label to temporary file: %w", err)
+	}
+
+	if err := write(pending.File); err != nil {
+		return err
+	}
+
+	return pending.CloseAtomicallyReplace()
+}
+
+func copySELinuxLabel(source, destination string) error {
+	const labelName = "security.selinux"
+
+	size, err := unix.Getxattr(source, labelName, nil)
+	if errors.Is(err, unix.ENODATA) || errors.Is(err, unix.ENOTSUP) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	label := make([]byte, size)
+	if _, err := unix.Getxattr(source, labelName, label); err != nil {
+		return err
+	}
+
+	return unix.Setxattr(destination, labelName, label, 0)
 }
 
 func nvidiaHostBinDir(nvidia goalstates.NvidiaHost) string {
