@@ -273,7 +273,7 @@ if [[ "$action" == plan ]]; then
   exit 0
 fi
 
-for command in az curl jq kubectl helm git make sha256sum ssh ssh-keygen ssh-keyscan timeout; do
+for command in az curl jq kubectl helm git make sha256sum ssh ssh-keygen ssh-keyscan tar timeout; do
   require_command "$command"
 done
 
@@ -289,6 +289,12 @@ if [[ "$action" == status ]]; then
     --query '{state:provisioningState,version:kubernetesVersion,nodeResourceGroup:nodeResourceGroup}' -o json
   az acr list -g "$AZURE_RESOURCE_GROUP" \
     --query '[].{name:name,publicNetworkAccess:publicNetworkAccess,dataEndpointEnabled:dataEndpointEnabled}' -o json
+  az network public-ip show -g "$AZURE_RESOURCE_GROUP" -n "$OPERATOR_SSH_PUBLIC_IP_NAME" \
+    --query '{name:name,address:ipAddress,allocation:publicIPAllocationMethod,sku:sku.name,state:provisioningState}' -o json
+  az network nsg rule show -g "$AZURE_RESOURCE_GROUP" \
+    --nsg-name "${OPERATOR_NSG_NAME:-gantry-benchmark-operator-nsg}" \
+    -n "$OPERATOR_SSH_NSG_RULE_NAME" \
+    --query '{name:name,access:access,protocol:protocol,source:sourceAddressPrefix,port:destinationPortRange}' -o json
   mkdir -p "$(dirname "$KUBECONFIG")"
   az aks get-credentials -g "$AZURE_RESOURCE_GROUP" -n "$AZURE_AKS_CLUSTER_NAME" \
     --admin --file "$KUBECONFIG" --overwrite-existing --only-show-errors
@@ -433,6 +439,11 @@ build_source_image() {
   log "publishing private source carrier from $source_revision"
   SOURCE_IMAGE=$GANTRY_ACR_LOGIN_SERVER/gantry-benchmark-source:$source_revision
 
+  local source_context=$DEPLOY_STATE_DIR/source-context-$source_short
+  rm -rf "$source_context"
+  mkdir -p "$source_context"
+  git -C "$repo_root" archive --format=tar "$source_revision" | tar -xf - -C "$source_context"
+
   public_restore_needed=true
   az acr update -g "$AZURE_RESOURCE_GROUP" -n "$GANTRY_ACR_NAME" \
     --default-action Allow --public-network-enabled true --only-show-errors -o none
@@ -446,9 +457,9 @@ build_source_image() {
     if az acr build \
       --registry "$GANTRY_ACR_NAME" \
       --image "gantry-benchmark-source:$source_revision" \
-      --file "$repo_root/images/gantry-benchmark-source/Containerfile" \
+      --file "$source_context/images/gantry-benchmark-source/Containerfile" \
       --build-arg "SOURCE_REVISION=$source_revision" \
-      "$repo_root" --only-show-errors -o none >"$build_log" 2>&1; then
+      "$source_context" --only-show-errors -o none >"$build_log" 2>&1; then
       built=true
       break
     fi
@@ -460,6 +471,7 @@ build_source_image() {
     return 1
   fi
   cat "$build_log"
+  rm -rf "$source_context"
 
   set_acrs_private
   public_restore_needed=false
@@ -1062,6 +1074,9 @@ for daemonset in gantry-benchmark-containerd-config gantry-acr-private-dns-guard
   ready=$(kubectl -n "$namespace" get daemonset "$daemonset" -o jsonpath='{.status.numberReady}')
   assert_equal "$daemonset readiness" "$ready" "$desired"
 done
+
+operator_ssh_init
+operator_ssh true
 
 if [[ "$START_BENCHMARK" == true ]]; then
   log "starting benchmark operator service"

@@ -9,6 +9,7 @@ command -v /usr/sbin/sshd >/dev/null 2>&1 || {
   exit 1
 }
 
+install -d -m 0755 /run/sshd
 install -d -m 0755 /etc/ssh/sshd_config.d
 cat >/etc/ssh/sshd_config.d/00-gantry-benchmark.conf <<'SSH'
 Port 50001

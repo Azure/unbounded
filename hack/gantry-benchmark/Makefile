@@ -75,6 +75,7 @@ operator-vm-check:
 	grep -Fq 'Port 50001' operator-vm-configure-sshd.sh
 	! grep -Eq '^[[:space:]]*Port 22([[:space:]]|$$)' operator-vm-configure-sshd.sh
 	! grep -Fq 'az vm run-command invoke' deploy.sh operator-vm-start.sh operator-vm-watch.sh operator-vm-prepare.sh operator-vm-image-pool.sh
+	grep -Fq 'git -C "$$repo_root" archive --format=tar "$$source_revision"' deploy.sh
 
 deploy: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh deploy "$(DEPLOY_CONFIG)"

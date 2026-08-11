@@ -15,6 +15,12 @@ make -C hack/gantry-benchmark deploy
 make -C hack/gantry-benchmark deploy-status
 ```
 
+Run these targets from the current clean checkout. `deploy` creates a small
+source-carrier context from the exact committed revision with `git archive`, so
+do not create or reuse a detached deployment worktree. This avoids uploading
+local `tmp/` caches and ensures infrastructure uses the same deployment code as
+the current commit.
+
 The script is idempotent and rejects existing resources whose topology differs
 from the config. It owns the VNet/subnets, 1000-node AKS shape, two Premium ACRs,
 dedicated data endpoints, Private Endpoints/DNS, diagnostics, immutable branch
