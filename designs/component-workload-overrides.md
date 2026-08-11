@@ -2023,8 +2023,11 @@ directly applicable for users who want full control.
 
 ## 17. Open questions
 
-Implementation settled several of these. They are recorded rather than deleted,
-so the reasoning survives:
+Almost all of these are now settled. They are recorded rather than deleted, so
+the reasoning survives and a future reader can tell a decision from an
+oversight.
+
+### Settled during implementation
 
 - *Operation taxonomy, hash timing and planning verdicts.* All three were gaps
   found while implementing and are corrected in
@@ -2033,15 +2036,11 @@ so the reasoning survives:
   harness ([§15](#15-testing)).
 - *Where singleton override state is reported.* On every Site, since every Site
   depends on the singletons ([§11](#11-drift-visibility-and-observability)).
-
-Three questions carried by earlier revisions were **resolved** before
-implementation began:
-
 - *Dedicated resource type instead of a ConfigMap.* Resolved in favour of the
   ConfigMap. The argument rested on RBAC being unable to scope `create` by name.
   Admission policy can, the repository already relies on it, and in the one case
-  that mattered no `create` grant needs to exist at all. See
-  [§4.4](#44-residual-risk-and-how-it-is-closed).
+  that mattered no `create` grant needs to exist at all
+  ([§4.4](#44-residual-risk-and-how-it-is-closed)).
 - *Last-known-good across restarts.* No longer applicable. The failure model
   holds no in-memory state
   ([§9.3](#93-invalid-overrides-skip-they-do-not-revert)).
@@ -2049,53 +2048,103 @@ implementation began:
   it would have constrained is unused and is deleted instead, which also avoids
   raising the Kubernetes baseline to 1.30.
 
-Remaining:
+### Settled during review
 
-1. **Admission-time validation, scoped realistically.** An earlier revision
-   claimed a `ValidatingAdmissionPolicy` could reject schema errors, protected
-   paths, `$` directives, and nulls in the overrides ConfigMap. That was
-   overstated: CEL has no YAML parser, so a VAP cannot inspect structure inside
-   `ConfigMap.data`. It **can** enforce writer identity, restrict `create` by
-   name, cap `data` size, and constrain key naming. Deeper validation needs a
-   webhook, which is a new serving path and certificate to maintain. Is the
-   shallow coverage worth an installed policy, given `overrides validate` covers
-   syntax offline?
-2. **Operator-side dry-run.** [§12.1](#121-why-there-is-no-overrides-diff)
-   rejects a client-side `diff` on version-skew grounds, and
-   [§12](#12-cli) scopes `validate` to syntax for the same reason. An
-   operator-side dry-run would close the resolution gap authoritatively, and the
-   operation plan makes it cheap: plan, merge, report, do not execute. Worth a
-   surface?
-3. **`spec.replicas` and `metalman.replicas`.** `Site` already has a typed,
-   supported `spec.components.metalman.replicas` (`site_types.go:167`). An
-   override can also set `spec.replicas`. Should the typed field win, the
-   override win, or should overrides reject `spec.replicas` on `metalman`?
-4. **`siteSelector`.** Label-based Site matching would express "all edge sites"
-   without enumeration. Deferred because it needs a `Site` labelling convention
-   that does not exist today. It can be added alongside `sites` later with a
-   documented precedence.
-5. **ServiceAccount annotations.** `serviceAccountName` is protected
-   ([§8.3](#83-protected)), but workload identity integrations normally require
-   annotating the ServiceAccount. The operator applies component ServiceAccounts
-   with `ForceOwnership`, so user annotations on them are reverted. This is a
-   real gap that neither this mechanism nor the existing ConfigMap escape hatch
-   covers.
-6. **SSA field disownership as a complement.** For letting VPA own `resources`,
-   having the operator stop declaring that path is more correct than patching it
-   to a fixed value. Offer as a separate opt-in?
-7. **Reserved container names.** `addContainers`
-   ([§8.2](#82-adding-containers-requires-explicit-intent)) stops a typo becoming
-   a sidecar, but not a user-added sidecar colliding with a container a future
-   release introduces. A documented naming convention is probably sufficient.
-8. **Scaling assumptions.** Synchronous fan-out
-   ([§10.3](#103-watch-and-fan-out)) is O(Sites) per override change and
-   `MaxConcurrentReconciles` is now pinned to 1 explicitly. Both are recorded
-   assumptions rather than permanent choices; `source.Channel` with explicit
-   backpressure is the fallback if Site counts grow past the low hundreds or the
-   controller is parallelized.
-9. **Retention of overrides for deleted Sites.** Per-Site components clean up on
-   Site deletion (`storage.go:78-90`), but an override entry naming a deleted
-   Site becomes inert and is merely reported
-   ([§6.3](#63-resolution)). Should stale entries be surfaced more strongly, for
-   example as a Degraded condition after some period, or is inert-and-reported
-   the right behaviour?
+**Typed Site fields win over overrides.** `Site.spec` is the supported
+customization surface and an override is the escape hatch for what it does not
+cover, so where both describe the same thing the typed field decides. Until this
+was settled the override won: `spec.replicas` on metalman beat
+`spec.components.metalman.replicas`, so a user editing the supported field saw
+nothing happen. The path is now rejected at validation, naming the field to set
+instead, and re-stamped after the merge on the same defence-in-depth grounds as
+identity ([§8.1](#81-permitted)).
+
+One case is documented rather than enforced: `dhcpAutoInterface` adds a
+command-line flag and `extraArgs` appends flags, so an override can append a
+contradicting one. Detecting that means the operator understanding each
+component's flag semantics, which is a far larger commitment than a path table.
+
+**ServiceAccount annotations are not a gap.** The premise was wrong; see
+[§8.6](#86-what-server-side-apply-leaves-to-the-user).
+
+**No admission policy for the overrides ConfigMap.** A `ValidatingAdmissionPolicy`
+could enforce four things, and three are already covered: writer identity by
+RBAC, `data` size by the apiserver's own ~1MiB ConfigMap limit, and key naming
+is cosmetic. The fourth, restricting `create` by name, is genuinely impossible
+in RBAC, but it buys less than it appears: anyone with `create configmaps` in
+`unbounded-system` can equally create or replace `machina-config`,
+`unbounded-net-config` and `gantry-config`, which are documented escape hatches
+feeding the same privileged workloads. The boundary is already conceded at
+namespace granularity, so a policy on one ConfigMap narrows one path among
+several equivalents, at the cost of a moving part and a 1.30 baseline. The
+control that matches the threat model is the RBAC guidance in
+[§4.3](#43-required-posture-for-cluster-operators).
+
+**`siteSelector` stays deferred.** Label-based Site matching would express "all
+edge sites" without enumeration, but it needs a Site labelling convention that
+does not exist. It can be added alongside `sites` later with a documented
+precedence.
+
+**SSA field disownership is accepted as a future complement**, not an
+alternative ([§5.3](#53-why-not-ssa-field-disownership)).
+
+**Sidecar names colliding with a future release already error.** `addContainers`
+naming a container that now exists is a resolution failure, so the entry is
+refused rather than merged into the operator's container, the workload keeps the
+spec it had, and the Site reports `Degraded` naming the file, entry and
+container. The collision cannot be detected when the override is authored,
+because the operator's container does not exist yet, so erroring on the upgrade
+that introduces it is the earliest possible point. Documented rather than
+changed.
+
+**Stale entries for deleted Sites stay inert and reported.** A document may
+legitimately be written before its Site exists, and deleting a Site must not
+retroactively invalidate an unrelated override
+([§6.3](#63-resolution)).
+
+**Scaling assumptions are recorded, not resolved.** Synchronous fan-out is
+O(Sites) per override change and `MaxConcurrentReconciles` is pinned to 1. The
+watch amplification that made this worse is gone: component watches enqueue the
+singleton request alone, since the singleton pass already reconciles every Site
+([§10.3](#103-watch-and-fan-out)). `source.Channel` with explicit backpressure
+remains the fallback if Site counts grow past the low hundreds or the controller
+is parallelized.
+
+### Genuinely open
+
+**Operator-side dry-run.** [§12.1](#121-why-there-is-no-overrides-diff) rejects a
+client-side `diff` on version-skew grounds, and [§12](#12-cli) scopes `validate`
+to syntax for the same reason. A dry-run in the operator closes that gap
+authoritatively, and it is now cheap: the third objection in §12.1, that
+rendering was not separable from side effects, was removed by plan-then-execute,
+and `override.Report` already carries most of the answer.
+
+It would show the five things `validate` structurally cannot:
+
+1. Which workloads each entry resolves to, per Site.
+2. Entries that resolve to nothing, distinguishing "matched nothing" from
+   "applied nothing".
+3. Container, volume and `mountPath` resolution against the workload this
+   operator version actually renders.
+4. Conflicts between contributors.
+5. The combined scheduling result. Affinity is a Cartesian product with the
+   operator's own terms, so it is genuinely hard to predict, and
+   `kubectl patch --type=strategic` shows a *more* destructive result than the
+   operator produces. Nothing else can show a user what they will get.
+
+Two decisions are open, and they are the reason this is not simply built:
+
+- **Where the result lands.** Site status means new API surface and duplicating
+  one cluster-scoped result across every Site. A result ConfigMap is one output
+  for one input and needs no CRD change, but introduces the operator writing a
+  user-facing ConfigMap, with its own lifecycle and cleanup.
+- **The round trip is asynchronous.** Any operator-side answer is write input,
+  reconcile, read result. The CLI has to detect a result computed from an older
+  input, which means stamping the input's `resourceVersion` on the output and
+  polling until it matches.
+
+Worth noting for whoever picks this up: a dry-run document is never executed, so
+writing one is **not** privileged in the way writing the live document is
+([§4.2](#42-the-allowlist-is-an-integrity-control-not-a-security-control)). That
+is an argument for a separate object over a `dryRun: true` flag inside the live
+document, which would conflate two privilege levels in one place.
