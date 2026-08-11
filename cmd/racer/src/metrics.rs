@@ -108,8 +108,6 @@ metrics! {
     config_rejected:         "racer_config_rejected_total"        ""                           Counter "Configurations rejected since start.",
     topology_epoch:          "racer_topology_epoch"               ""                           Gauge   "Epoch of the topology in force.",
     node_id:                 "racer_node_id"                      ""                           Gauge   "This node's id.",
-    share_slots:             "racer_share_slots"                  ""                           Gauge   "Hash slots this node holds a replica of, out of 16384 in the zone. This node's share of the zone's capacity.",
-    max_share_slots:         "racer_max_share_slots"              ""                           Gauge   "Largest share this node's device was sized for. A configuration asking for more is refused.",
     workers:                 "racer_workers"                      ""                           Gauge   "Worker threads, one per physical core.",
     volumes:                 "racer_volumes"                      ""                           Gauge   "Volumes this node exports.",
     peers:                   "racer_peers"                        ""                           Gauge   "Peers this node holds a fabric link to.",

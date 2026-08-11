@@ -1905,13 +1905,9 @@ impl Paxos {
     pub async fn seal_extent(&'static self, addr: GlobalAddr, id: ShardId) -> Result<(), Status> {
         let cfg = self.alloc.config();
         let term = cfg.topology.epoch;
-        let mut nodes: Vec<u32> = cfg.topology.catalog.iter().flatten().copied().collect();
-        nodes.sort_unstable();
-        nodes.dedup();
+        let mut nodes: Vec<u32> = cfg.zone_nodes();
+        nodes.retain(|&n| n != cfg.node.id);
         for n in nodes {
-            if n == cfg.node.id {
-                continue;
-            }
             if let Some(link) = self.link_of(n) {
                 let r = Route {
                     link,

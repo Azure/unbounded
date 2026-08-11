@@ -457,8 +457,9 @@ const REPAIRS_PER_JOB: usize = 64;
 /// per address is not avoidable: a register held by one member alone was not
 /// necessarily chosen, and copying it here would give it a second acceptor.
 ///
-/// The one budget here the operator sets, because it is the rate a rebalance runs at and
-/// the length of the window a group spends two of three: `Policy::repairs_per_replay`.
+/// The one budget here the operator sets, because it is the rate a member replacement
+/// runs at and the length of the window a group spends two of three, and the rate an
+/// extent is handed to another zone at: `Policy::repairs_per_replay`.
 fn repairs_per_replay(cfg: &Config) -> usize {
     cfg.policy.repairs_per_replay as usize
 }
@@ -522,13 +523,13 @@ impl Heal {
         *self.cores[runtime::core()].stats.borrow()
     }
 
-    /// The two halves of a rebalance still in flight on this core: groups being replayed
-    /// into, and groups still holding registers they have been moved out of.
+    /// The two halves of a member replacement still in flight on this core: groups being
+    /// replayed into, and groups still holding registers they have been moved out of.
     ///
-    /// The control plane's only completion signal. It moves one group at a time and must
-    /// not move the next until this reads zero across the zone — a second group in flight
-    /// puts two of them at two of three at once, and a node that has not finished
-    /// shedding has not returned the space the next move needs.
+    /// The control plane's only completion signal. It replaces one node at a time and
+    /// must not replace the next until this reads zero across the zone: a second node in
+    /// flight puts more groups at two of three at once, and a node that has not finished
+    /// shedding has not returned the space the next replacement needs.
     pub fn outstanding(&'static self) -> (u64, u64) {
         let replaying = self.paxos.replaying_here().len() as u64;
         let shedding = [false, true]
@@ -604,7 +605,7 @@ impl Heal {
         // are both local wherever the shard count reached the core count.
         //
         // A group already replaying goes first. Round-robin alone gives a joining group
-        // one budget every `groups / cores` intervals, which is how long a rebalance
+        // one budget every `groups / cores` intervals, which is how long a replacement
         // would take per group; jumping the queue for it costs the settled groups a
         // digest exchange they would only have found equal.
         let cores = self.cores.len() as u32;
@@ -734,9 +735,9 @@ impl Heal {
 
     /// Whether this node has a slab of the class at all: no slots, no cursor to open.
     ///
-    /// The device's geometry rather than the configuration's page count, because a node
-    /// whose share has gone to zero asks for no pages and is exactly the node with the
-    /// most left to shed.
+    /// The device's geometry rather than the configuration's page count, because the
+    /// geometry is what was actually formatted, and a node draining after the catalog
+    /// stopped naming it still has to open a cursor over everything it holds.
     fn serves(&self, huge: bool) -> bool {
         let c = if huge { Class::Huge } else { Class::Small };
         self.alloc().geometry().slots(c) > 0
@@ -746,10 +747,11 @@ impl Heal {
 
     /// Give back the registers of groups this node is no longer in the catalog for.
     ///
-    /// Moving a group to another node is how capacity moves: the node joining replays
-    /// the group, and the node leaving is left holding every register it ever accepted,
-    /// because nothing on the write path revisits a page once it is placed. Without this
-    /// a node only ever grows and a rebalance frees nothing.
+    /// Replacing a node is how a zone's membership moves: the node joining takes the
+    /// departing node's groups and replays them, and the node leaving is left holding
+    /// every register it ever accepted, because nothing on the write path revisits a
+    /// page once it is placed. Without this a node only ever grows and a decommission
+    /// frees nothing.
     ///
     /// The digest map names the work exactly. A group we hold no register for was never
     /// inserted into it, so the groups it lists minus the ones the catalog still names

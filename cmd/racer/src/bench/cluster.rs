@@ -280,7 +280,6 @@ fn text(plan: &Plan, n: &Node, peers: &[(u32, PathBuf)], generation: u32) -> Str
         let g = ORDER[i % ORDER.len()];
         s += &format!("group {} {} {}\n", g[0], g[1], g[2]);
     }
-    s += "slots round_robin\n";
     s += &format!(
         "volume {LWW} slot=1\n  extent pages={} kind=lww zone=1\n\
          volume {BIG} slot=2\n  extent pages={} kind=immutable_4m zone=1\n",
