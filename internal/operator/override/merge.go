@@ -6,6 +6,7 @@ package override
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,14 +30,16 @@ var schedulingPaths = [][]string{
 //  2. strategic-merge every contributor's patch, minus scheduling
 //  3. combine scheduling additively, so operator constraints survive
 //  4. append extraArgs
-//  5. re-stamp identity, so correctness does not depend on validation being
-//     exhaustive
+//  5. re-stamp identity and the paths a typed Site field owns, so correctness
+//     does not depend on validation being exhaustive
 //
 // Step 5 is what makes the group, version and kind unbreakable rather than
 // merely rejected, which matters because apply is GVK-directed and the operator
-// holds escalate and bind on ClusterRoleBindings.
+// holds escalate and bind on ClusterRoleBindings. The same re-stamp keeps a
+// typed Site field authoritative over anything a patch says about it.
 func merge(workload *unstructured.Unstructured, contributors []SourcedEntry) error {
 	identity := captureIdentity(workload)
+	typed := captureTypedFields(workload, contributorComponent(contributors))
 
 	operatorScheduling := captureScheduling(workload)
 	userScheduling := newSchedulingSet()
@@ -68,7 +71,68 @@ func merge(workload *unstructured.Unstructured, contributors []SourcedEntry) err
 		return err
 	}
 
+	if err := restoreTypedFields(workload, typed); err != nil {
+		return err
+	}
+
 	return restoreIdentity(workload, identity)
+}
+
+// contributorComponent returns the component every contributor to a workload
+// belongs to. Resolution matches entries on component, so they cannot disagree.
+func contributorComponent(contributors []SourcedEntry) string {
+	if len(contributors) == 0 {
+		return ""
+	}
+
+	return contributors[0].Entry.Component
+}
+
+// captureTypedFields snapshots the values of paths a typed Site field owns.
+//
+// Validation rejects a patch that sets one of these, so in practice nothing
+// here changes. It is captured anyway for the same reason identity is: the
+// typed field staying authoritative should not depend on the validator being
+// exhaustive, and a future path added to the table is then protected whether or
+// not the validator was updated with it.
+func captureTypedFields(workload *unstructured.Unstructured, component string) map[string]any {
+	owned, ok := typedFieldOwners[component]
+	if !ok {
+		return nil
+	}
+
+	captured := make(map[string]any, len(owned))
+
+	for path := range owned {
+		value, found, err := unstructured.NestedFieldNoCopy(workload.Object, strings.Split(path, ".")...)
+		if err != nil || !found {
+			// A DaemonSet has no spec.replicas, and a component may not set
+			// every path in its table on every workload.
+			continue
+		}
+
+		captured[path] = deepCopyValue(value)
+	}
+
+	return captured
+}
+
+// restoreTypedFields puts back what the operator computed from the Site.
+func restoreTypedFields(workload *unstructured.Unstructured, captured map[string]any) error {
+	paths := make([]string, 0, len(captured))
+	for path := range captured {
+		paths = append(paths, path)
+	}
+
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		if err := unstructured.SetNestedField(workload.Object, captured[path], strings.Split(path, ".")...); err != nil {
+			return fmt.Errorf("restore %s: %w", path, err)
+		}
+	}
+
+	return nil
 }
 
 // strategicMerge merges a patch using the schema of the workload's own type, so

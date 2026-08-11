@@ -147,6 +147,27 @@ var protectedPaths = []struct {
 	{path: "status", reason: "status is owned by the workload controller, not by the operator"},
 }
 
+// typedFieldOwners names the paths a component's typed Site field owns, mapped
+// to the field that owns them.
+//
+// Site.spec is a first-class, supported customization surface, and an override
+// is an escape hatch for everything it does not cover. Where the two describe
+// the same thing the typed field wins, so the supported surface stays the one
+// that decides.
+//
+// Letting the override win quietly was the alternative and is worse in both
+// directions: the user edits the typed field and nothing happens, or the
+// operator recomputes the typed value on the next pass and fights the override
+// forever. Rejecting the path says which field to use instead.
+//
+// Only paths a Site field actually sets belong here. spec.replicas stays
+// available on net and machina, whose Deployments have no typed replica count.
+var typedFieldOwners = map[string]map[string]string{
+	"metalman": {
+		"spec.replicas": "spec.components.metalman.replicas",
+	},
+}
+
 // mergeKeyTypes names the field each merge-keyed list is identified by, and the
 // type strategic merge requires it to hold.
 //

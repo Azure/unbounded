@@ -99,8 +99,53 @@ func validateEntry(sourced SourcedEntry) []string {
 	problems = append(problems, validateAddNames(at, "addContainers", entry.AddContainers)...)
 	problems = append(problems, validateAddNames(at, "addInitContainers", entry.AddInitContainers)...)
 	problems = append(problems, validatePatch(at, entry.Patch)...)
+	problems = append(problems, reportTypedFieldConflicts(at, entry)...)
 
 	return problems
+}
+
+// reportTypedFieldConflicts rejects a patch that sets something a typed Site
+// field already owns.
+//
+// Site.spec is the supported customization surface and an override is the
+// escape hatch for what it does not cover, so where both describe the same
+// thing the typed field decides. Accepting the patch instead would leave the
+// user editing the typed field to no effect, or the operator recomputing it
+// every pass and fighting the override forever. Naming the field to use makes
+// the precedence discoverable at the point it matters.
+func reportTypedFieldConflicts(at string, entry Entry) []string {
+	owned, ok := typedFieldOwners[entry.Component]
+	if !ok || len(entry.Patch) == 0 {
+		return nil
+	}
+
+	paths := make([]string, 0, len(owned))
+	for path := range owned {
+		paths = append(paths, path)
+	}
+
+	sort.Strings(paths)
+
+	var problems []string
+
+	for _, path := range paths {
+		if !patchSets(entry.Patch, path) {
+			continue
+		}
+
+		problems = append(problems, fmt.Sprintf(
+			"%s: %s is owned by %s on the Site and cannot be overridden; set that field instead",
+			at, path, owned[path]))
+	}
+
+	return problems
+}
+
+// patchSets reports whether a patch assigns a value at a dotted path.
+func patchSets(patch map[string]any, path string) bool {
+	_, found, err := unstructured.NestedFieldNoCopy(patch, strings.Split(path, ".")...)
+
+	return err == nil && found
 }
 
 // validateSites checks the Site selector, which is meaningful only for per-Site

@@ -607,3 +607,114 @@ func TestApplyTopologySpreadIsAdditive(t *testing.T) {
 		t.Fatalf("constraints = %d, want the operator's and the user's", len(spec.TopologySpreadConstraints))
 	}
 }
+
+// TestMergeRestampsPathsATypedSiteFieldOwns is the defence-in-depth half of the
+// precedence rule.
+//
+// Validation rejects a patch that sets an owned path, so in a running operator
+// the merge never sees one. It re-stamps anyway, for the same reason identity
+// is re-stamped: the typed Site field staying authoritative must not depend on
+// the validator being exhaustive, and a path added to the table later is then
+// protected whether or not the validator was updated to match.
+//
+// The entries here bypass Validate deliberately, which is the only way to
+// exercise this.
+func TestMergeRestampsPathsATypedSiteFieldOwns(t *testing.T) {
+	workload := metalmanDeployment(2)
+
+	entries, err := Parse(map[string]string{"overrides.yaml": doc(`  - component: metalman
+    kind: Deployment
+    patch:
+      spec:
+        replicas: 9
+        minReadySeconds: 5
+`)})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	plan := planWith(workload, "metalman", "rack-a")
+
+	report := Apply(plan, entries, []string{"rack-a"})
+	if report.Failed() {
+		t.Fatalf("Apply: %v", report.Err())
+	}
+
+	merged := plan.Operations[0].Object
+
+	replicas, found, err := unstructured.NestedInt64(merged.Object, "spec", "replicas")
+	if err != nil || !found {
+		t.Fatalf("read replicas: found=%v err=%v", found, err)
+	}
+
+	if replicas != 2 {
+		t.Fatalf("replicas = %d, want the Site's 2; the typed field must survive the merge", replicas)
+	}
+
+	// The rest of the same patch still applies, so the re-stamp is scoped to
+	// the owned path rather than discarding the entry.
+	seconds, found, err := unstructured.NestedInt64(merged.Object, "spec", "minReadySeconds")
+	if err != nil || !found || seconds != 5 {
+		t.Fatalf("minReadySeconds = %d (found=%v err=%v), want the patch applied", seconds, found, err)
+	}
+}
+
+// TestMergeLeavesUnownedPathsAlone confirms the re-stamp does not reach beyond
+// the component that owns the path.
+func TestMergeLeavesUnownedPathsAlone(t *testing.T) {
+	workload := metalmanDeployment(2)
+	workload.SetName("unbounded-net-controller")
+
+	entries, err := Parse(map[string]string{"overrides.yaml": doc(`  - component: net
+    kind: Deployment
+    patch:
+      spec:
+        replicas: 9
+`)})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	plan := planWith(workload, "net", "")
+
+	report := Apply(plan, entries, nil)
+	if report.Failed() {
+		t.Fatalf("Apply: %v", report.Err())
+	}
+
+	replicas, _, err := unstructured.NestedInt64(plan.Operations[0].Object.Object, "spec", "replicas")
+	if err != nil {
+		t.Fatalf("read replicas: %v", err)
+	}
+
+	if replicas != 9 {
+		t.Fatalf("replicas = %d, want the override's 9; no Site field owns net's replica count", replicas)
+	}
+}
+
+// metalmanDeployment builds a Deployment shaped like the one metalman plans,
+// with the replica count the Site asked for.
+func metalmanDeployment(replicas int64) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata": map[string]any{
+			"name":      "metalman-controller-rack-a",
+			"namespace": "unbounded-system",
+		},
+		"spec": map[string]any{
+			"replicas": replicas,
+			"selector": map[string]any{
+				"matchLabels": map[string]any{"app": "unbounded-pxe"},
+			},
+			"template": map[string]any{
+				"metadata": map[string]any{"labels": map[string]any{"app": "unbounded-pxe"}},
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{"name": "metalman", "image": "metalman:v1"},
+					},
+				},
+			},
+		},
+	}}
+}

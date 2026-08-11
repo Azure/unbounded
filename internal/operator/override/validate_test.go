@@ -758,3 +758,66 @@ func TestValidateReportsOneProblemPerWrongShape(t *testing.T) {
 		t.Fatalf("error reports %d lines, want the single shape problem:\n%s", got, err)
 	}
 }
+
+// TestValidateRejectsPathsATypedSiteFieldOwns pins the precedence between the
+// two customization surfaces.
+//
+// Site.spec is the supported surface and an override is the escape hatch for
+// what it does not cover, so where both describe the same thing the typed field
+// decides. Before this, an override setting spec.replicas on metalman simply
+// beat spec.components.metalman.replicas: a user editing the supported field
+// would see nothing happen, with no indication why.
+//
+// Accepting the patch and quietly re-stamping the typed value would be no
+// better. It is the silent no-op this package rejects everywhere else, and the
+// user would be told the override was Applied.
+func TestValidateRejectsPathsATypedSiteFieldOwns(t *testing.T) {
+	err := validateFragment(t, `
+component: metalman
+kind: Deployment
+patch:
+  spec:
+    replicas: 3
+`)
+	if err == nil {
+		t.Fatal("spec.replicas on metalman must be rejected; the Site field owns it")
+	}
+
+	if !strings.Contains(err.Error(), "spec.components.metalman.replicas") {
+		t.Fatalf("error = %q, want it to name the field to use instead", err)
+	}
+}
+
+// TestValidateAllowsReplicasWhereNoTypedFieldOwnsIt keeps the rule narrow. Only
+// paths a Site field actually sets are refused, and neither the net nor the
+// machina Deployment has a typed replica count.
+func TestValidateAllowsReplicasWhereNoTypedFieldOwnsIt(t *testing.T) {
+	for _, component := range []string{"net", "machina"} {
+		t.Run(component, func(t *testing.T) {
+			err := validateFragment(t, "component: "+component+"\nkind: Deployment\npatch:\n  spec:\n    replicas: 3\n")
+			if err != nil {
+				t.Fatalf("spec.replicas must stay available on %s: %v", component, err)
+			}
+		})
+	}
+}
+
+// TestValidateAllowsOtherMetalmanPaths confirms the rule is scoped to the owned
+// path rather than to the component.
+func TestValidateAllowsOtherMetalmanPaths(t *testing.T) {
+	err := validateFragment(t, `
+component: metalman
+kind: Deployment
+patch:
+  spec:
+    minReadySeconds: 5
+    template:
+      spec:
+        containers:
+          - name: metalman
+            imagePullPolicy: Always
+`)
+	if err != nil {
+		t.Fatalf("only the owned path is refused: %v", err)
+	}
+}

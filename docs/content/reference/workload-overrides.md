@@ -171,6 +171,7 @@ does not depend on the check being exhaustive:
 | `spec.template.spec.serviceAccountName` | Retargeting borrows another identity's API permissions. |
 | `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. |
 | Labels and annotations under `unbounded-cloud.io/` | They carry config hashes, Site scoping and override visibility. |
+| `spec.replicas` on `metalman` | The Site owns it: set `spec.components.metalman.replicas`. See below. |
 | Operator-declared mounts | Mount identity is `(container, mountPath)`, because `volumeMounts` merge on `mountPath` rather than on name, so protecting them by name would be bypassable. |
 | Operator-declared volumes | `volumes` merge on `name`, so redefining one repoints every mount that uses it without naming a `mountPath` anywhere. Adding volumes under new names is fine. |
 
@@ -181,6 +182,28 @@ Values are checked against the type Kubernetes requires. Writing `containers:`
 as a mapping rather than a list, or `nodeSelector:` as a list rather than a
 mapping, is reported against the field rather than merged into a workload the
 API server will later refuse.
+
+### Typed Site fields win
+
+`Site.spec` is the supported customization surface. Overrides are the escape
+hatch for everything it does not cover, so where the two describe the same
+thing, the typed field decides and the override is rejected with the name of
+the field to use instead.
+
+Today there is one such field:
+
+| Override path | Set this instead |
+|---|---|
+| `spec.replicas` on `metalman` | `spec.components.metalman.replicas` |
+
+`spec.replicas` remains available on `net` and `machina`, whose Deployments have
+no typed replica count.
+
+One case is **not** enforced. `spec.components.metalman.dhcpAutoInterface` adds
+a command-line flag, and `extraArgs` appends flags, so an override can append
+one that contradicts it. Detecting that would mean the operator understanding
+each component's flag semantics. If you use `dhcpAutoInterface`, do not also
+pass DHCP interface flags through `extraArgs`.
 
 Anything not listed as overridable is rejected. Within a permitted subtree such
 as `resources` or `securityContext`, fields added by future Kubernetes releases
