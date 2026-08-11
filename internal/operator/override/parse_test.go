@@ -191,3 +191,59 @@ func TestParseErrorsNameTheKey(t *testing.T) {
 		t.Fatalf("error = %q, want it to name bad.yaml", err)
 	}
 }
+
+// TestParseNormalizesIntegers is a regression test for a crash.
+//
+// yaml.v3 decodes whole numbers as int, but apimachinery's DeepCopyJSONValue
+// accepts only int64 and panics on anything else. Before normalization the
+// first user to write spec.replicas, a container port, or an affinity weight
+// would crash the operator rather than get an error.
+func TestParseNormalizesIntegers(t *testing.T) {
+	entries, err := Parse(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
+overrides:
+  - component: machina
+    kind: Deployment
+    patch:
+      spec:
+        replicas: 2
+        template:
+          spec:
+            terminationGracePeriodSeconds: 30
+            containers:
+              - name: machina-controller
+                ports:
+                  - containerPort: 8080
+`})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	patch := entries[0].Entry.Patch
+
+	if got, ok := patch["spec"].(map[string]any)["replicas"].(int64); !ok || got != 2 {
+		t.Fatalf("replicas = %#v, want int64(2)", patch["spec"].(map[string]any)["replicas"])
+	}
+
+	// Every numeric value anywhere in the tree must be int64, or the
+	// unstructured helpers panic when the merge touches it.
+	assertNoPlainInts(t, patch, "patch")
+}
+
+func assertNoPlainInts(t *testing.T, value any, path string) {
+	t.Helper()
+
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, element := range typed {
+			assertNoPlainInts(t, element, path+"."+key)
+		}
+	case []any:
+		for i, element := range typed {
+			assertNoPlainInts(t, element, path)
+
+			_ = i
+		}
+	case int, int8, int16, int32, uint, uint8, uint16, uint32, uint64, float32:
+		t.Fatalf("%s holds %T, which apimachinery cannot deep copy", path, value)
+	}
+}

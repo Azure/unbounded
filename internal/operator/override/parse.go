@@ -78,6 +78,14 @@ func Parse(data map[string]string) ([]SourcedEntry, error) {
 		}
 
 		for i, entry := range doc.Overrides {
+			// normalizeJSON always returns the same shape it was given, and a
+			// patch is always a map, so this assertion cannot fail.
+			normalized, ok := normalizeJSON(entry.Patch).(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("overrides key %q: entry %d has a malformed patch", key, i)
+			}
+
+			entry.Patch = normalized
 			entries = append(entries, SourcedEntry{Entry: entry, Source: Source{Key: key, Index: i}})
 		}
 	}
@@ -177,4 +185,68 @@ func walkNode(n *yaml.Node, visit func(*yaml.Node) error) error {
 	}
 
 	return nil
+}
+
+// normalizeJSON converts decoded YAML values to the types the unstructured
+// helpers accept.
+//
+// yaml.v3 decodes whole numbers as int, but k8s.io/apimachinery's
+// DeepCopyJSONValue accepts only int64 and panics on anything else. Without
+// this, the first user to write a patch containing an integer, such as
+// spec.replicas or a container port, would crash the operator rather than get
+// an error.
+//
+// Normalizing here rather than at each use keeps every downstream consumer,
+// including validation, merging and hashing, working on one representation.
+func normalizeJSON(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, element := range typed {
+			out[key] = normalizeJSON(element)
+		}
+
+		return out
+
+	case map[any]any:
+		// Defensive: a nested decode into an untyped map yields this shape.
+		out := make(map[string]any, len(typed))
+		for key, element := range typed {
+			out[fmt.Sprintf("%v", key)] = normalizeJSON(element)
+		}
+
+		return out
+
+	case []any:
+		out := make([]any, len(typed))
+		for i, element := range typed {
+			out[i] = normalizeJSON(element)
+		}
+
+		return out
+
+	case int:
+		return int64(typed)
+	case int8:
+		return int64(typed)
+	case int16:
+		return int64(typed)
+	case int32:
+		return int64(typed)
+	case uint:
+		return int64(typed)
+	case uint8:
+		return int64(typed)
+	case uint16:
+		return int64(typed)
+	case uint32:
+		return int64(typed)
+	case uint64:
+		return int64(typed)
+	case float32:
+		return float64(typed)
+
+	default:
+		return value
+	}
 }
