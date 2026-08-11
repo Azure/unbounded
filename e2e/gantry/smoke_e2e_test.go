@@ -18,6 +18,7 @@ func TestMain(m *testing.M) {
 		os.Stderr.WriteString("e2e: " + err.Error() + "\n")
 		os.Exit(2)
 	}
+
 	os.Exit(m.Run())
 }
 
@@ -50,6 +51,7 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 		// may already be cancelled by a Fatal.
 		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer tdCancel()
+
 		h.teardown(tdCtx)
 	})
 
@@ -105,6 +107,7 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	t.Cleanup(func() {
 		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer tdCancel()
+
 		h.teardown(tdCtx)
 	})
 
@@ -168,18 +171,22 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 	// any digest, two pods will both have served the same digest and
 	// the intersection is non-empty.
 	servedA := h.pleasePullServedDigests(ctx, gantryA, 500)
+
 	servedB := h.pleasePullServedDigests(ctx, gantryB, 500)
 	if total := len(servedA) + len(servedB); total == 0 {
 		h.dumpDiagnostics(ctx)
 		t.Fatalf("origin pulls observed (A=%.0f B=%.0f) but no 'please_pull served' log lines on either pod - metric and log disagree",
 			deltaA, deltaB)
 	}
+
 	var duplicated []string
+
 	for d := range servedA {
 		if _, ok := servedB[d]; ok {
 			duplicated = append(duplicated, d)
 		}
 	}
+
 	if len(duplicated) > 0 {
 		h.dumpDiagnostics(ctx)
 		t.Fatalf("HRW per-digest invariant violated: digests served by both pods (A=%s, B=%s): %v",
@@ -214,6 +221,7 @@ func TestE2E_EvictionRecovery(t *testing.T) {
 	t.Cleanup(func() {
 		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer tdCancel()
+
 		h.teardown(tdCtx)
 	})
 
@@ -264,6 +272,7 @@ func TestE2E_EvictionRecovery(t *testing.T) {
 	// taken the peer-then-stale path or the stale provider was never
 	// even consulted, which means DHT advertisement failed upstream.
 	peerNotFoundAfter := h.metricSum(ctx, "p2p_peer_fetch_total", `outcome="notfound"`)
+
 	staleFilteredAfter := h.metricSum(ctx, "gantry_stale_provider_filtered_total")
 	if peerNotFoundAfter == peerNotFoundBefore && staleFilteredAfter == staleFilteredBefore {
 		h.dumpDiagnostics(ctx)
@@ -292,6 +301,7 @@ func TestE2E_ContainerdSocketAccess(t *testing.T) {
 	t.Cleanup(func() {
 		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer tdCancel()
+
 		h.teardown(tdCtx)
 	})
 

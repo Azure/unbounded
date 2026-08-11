@@ -44,6 +44,7 @@ func TestE2E_Hardening(t *testing.T) {
 	t.Cleanup(func() {
 		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer tdCancel()
+
 		h.teardown(tdCtx)
 	})
 
@@ -73,6 +74,7 @@ func TestE2E_Hardening(t *testing.T) {
 	if err := h.run(ctx, "kubectl", "-n", namespace, "rollout", "restart", "daemonset/"+dsName); err != nil {
 		t.Fatalf("rollout restart: %v", err)
 	}
+
 	h.waitForRollout(ctx)
 	h.checkReadyz(ctx)
 
@@ -86,11 +88,13 @@ func TestE2E_Hardening(t *testing.T) {
 // share a single /16 (typically 172.18.0.0/16) so we just return that.
 func (h *harness) discoverNodeCIDR(ctx context.Context) string {
 	h.t.Helper()
+
 	out, err := h.runOut(ctx, "kubectl", "get", "nodes",
 		"-o", "jsonpath={range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\"\\n\"}{end}")
 	if err != nil {
 		h.t.Fatalf("get node IPs: %v", err)
 	}
+
 	for _, line := range strings.Split(out, "\n") {
 		ip := strings.TrimSpace(line)
 		if ip == "" {
@@ -104,7 +108,9 @@ func (h *harness) discoverNodeCIDR(ctx context.Context) string {
 			return fmt.Sprintf("%s.%s.0.0/16", parts[0], parts[1])
 		}
 	}
+
 	h.t.Fatalf("no node InternalIP found; cannot compute node CIDR")
+
 	return "" // unreachable
 }
 
