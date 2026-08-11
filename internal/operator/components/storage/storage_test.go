@@ -384,7 +384,6 @@ func TestPlanGolden(t *testing.T) {
 	}
 
 	want := `CreateIfAbsent ConfigMap/unbounded-system/unbounded-storage-config-rack-a
-Apply Namespace/unbounded-system [shared]
 Apply ServiceAccount/unbounded-system/unbounded-storage-supervisor [shared]
 Apply ClusterRole/unbounded-storage-supervisor [shared]
 Apply ClusterRoleBinding/unbounded-storage-supervisor [shared]

@@ -36,6 +36,10 @@ const (
 	// them during reconcile.
 	CRDKind = "CustomResourceDefinition"
 
+	// NamespaceKind is the Kind of a Namespace object in the embedded
+	// component manifests. Components never write it; see NamespaceOperation.
+	NamespaceKind = "Namespace"
+
 	// SiteLabelKey is the canonical node label for site membership
 	// (unbounded-cloud.io/site). Per-site components node-select on it.
 	SiteLabelKey = unboundedv1alpha3.MachineSiteLabelKey
@@ -233,6 +237,18 @@ func (e *Env) decodeManifestData(data []byte, mutate func(*unstructured.Unstruct
 		}
 
 		if obj.Object == nil {
+			continue
+		}
+
+		// Every component's manifests carry the Namespace, because each set is
+		// also installable on its own with kubectl. Letting each component
+		// apply it made them fight: net labels it app.kubernetes.io/name=
+		// unbounded-net and gantry labels it gantry, both under the same field
+		// owner, so the label flipped on every pass depending on which
+		// component was planned last. The namespace has one owner instead, and
+		// dropping it here rather than in each mutator means a component
+		// cannot opt back into the fight by accident.
+		if obj.GetKind() == NamespaceKind {
 			continue
 		}
 

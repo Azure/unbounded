@@ -527,7 +527,6 @@ func TestPlanGolden(t *testing.T) {
 Delete ConfigMap/unbounded-system/gantry-containerd-hosts
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
 Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
-Apply Namespace/unbounded-system` + after + `
 Apply ServiceAccount/unbounded-system/gantry` + after + `
 Apply ClusterRole/gantry-agent` + after + `
 Apply ClusterRoleBinding/gantry-agent` + after + `

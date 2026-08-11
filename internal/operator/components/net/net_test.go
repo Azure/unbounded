@@ -332,7 +332,6 @@ func TestPlanGolden(t *testing.T) {
 	}
 
 	want := `CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
-Apply Namespace/unbounded-system
 Apply ServiceAccount/unbounded-system/unbounded-net-controller
 Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
 Apply ClusterRole/unbounded-net-controller

@@ -475,7 +475,6 @@ func TestPlanGolden(t *testing.T) {
 	}
 
 	want := `CreateIfAbsent ConfigMap/unbounded-system/machina-config
-Apply Namespace/unbounded-system
 Apply ServiceAccount/unbounded-system/machina-controller
 Apply Role/unbounded-system/machina-controller
 Apply RoleBinding/unbounded-system/machina-controller

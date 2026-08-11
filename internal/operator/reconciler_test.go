@@ -538,3 +538,48 @@ func TestRegistryMaterializedOnceAndInstanceReused(t *testing.T) {
 		t.Fatalf("stateful component runs = %d, want 2 (instance not reused across reconciles)", stateful.runs)
 	}
 }
+
+// TestPlanHasExactlyOneNamespaceOperation is a regression test over the real
+// registry.
+//
+// Every component's manifests ship the Namespace so each set stays installable
+// on its own, and every component used to reconcile the one it shipped: once
+// per cluster component, and once per Site for the per-Site ones. They do not
+// agree on its labels and all apply under one field owner, so the label flipped
+// on every pass depending on which component was planned last. Under
+// server-side apply that is a write loop, because an owner that stops declaring
+// a field removes it.
+//
+// Asserting over DefaultRegistry rather than a fake is the point: the failure
+// mode is a component shipping a Namespace nobody remembered about.
+func TestPlanHasExactlyOneNamespaceOperation(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+
+	sites := []unboundedv1alpha3.Site{
+		{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "rack-b"}},
+	}
+
+	targets := []*unboundedv1alpha3.Site{&sites[0], &sites[1]}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
+
+	_, _, plan := planComponents(t.Context(), env, DefaultRegistry(), sites, targets)
+
+	var namespaces []string
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() == component.NamespaceKind {
+			namespaces = append(namespaces, op.Component+" "+op.Kind.String()+" "+op.Ref().String())
+		}
+	}
+
+	if len(namespaces) != 1 {
+		t.Fatalf("plan holds %d namespace operations, want exactly one: %v", len(namespaces), namespaces)
+	}
+
+	if got := namespaces[0]; got != component.NamespaceOwner+" Apply Namespace/"+component.DefaultNamespace {
+		t.Fatalf("namespace operation = %q, want it owned by the operator", got)
+	}
+}

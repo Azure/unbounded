@@ -321,6 +321,14 @@ func planComponents(
 	perSite := make(map[string][]componentOutcome, len(targets))
 	plan := component.NewPlan()
 
+	// The namespace has one owner rather than one per component. It is planned
+	// here rather than by any component because no component owns it: they all
+	// ship it, they do not agree on its labels, and applying it under a single
+	// field owner from several places made the labels flip on every pass. The
+	// executor orders it ahead of everything namespaced regardless of where it
+	// appears in the plan.
+	plan.Add(component.NamespaceOperation(env.Namespace))
+
 	for _, c := range reg.Cluster {
 		componentPlan, res, err := c.Plan(ctx, env, sites)
 		if err != nil {
