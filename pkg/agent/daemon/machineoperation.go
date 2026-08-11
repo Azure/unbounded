@@ -29,6 +29,7 @@ type MachineOperationHandlers map[machinav1alpha3.OperationKind]MachineOperation
 // operations, and dispatches non-terminal operations to kind-specific targets.
 type MachinaMachineOperationReconciler struct {
 	client      client.Client
+	reader      client.Reader
 	machineName string
 	nodeName    string
 	handlers    MachineOperationHandlers
@@ -42,8 +43,24 @@ func NewMachinaMachineOperationReconciler(
 	nodeName string,
 	handlers MachineOperationHandlers,
 ) (*MachinaMachineOperationReconciler, error) {
+	return NewMachinaMachineOperationReconcilerWithReader(c, c, machineName, nodeName, handlers)
+}
+
+// NewMachinaMachineOperationReconcilerWithReader configures an uncached reader
+// for terminal-state checks while retaining the client for status writes.
+func NewMachinaMachineOperationReconcilerWithReader(
+	c client.Client,
+	reader client.Reader,
+	machineName string,
+	nodeName string,
+	handlers MachineOperationHandlers,
+) (*MachinaMachineOperationReconciler, error) {
 	if c == nil {
 		return nil, fmt.Errorf("client is required")
+	}
+
+	if reader == nil {
+		return nil, fmt.Errorf("reader is required")
 	}
 
 	if machineName == "" {
@@ -64,7 +81,7 @@ func NewMachinaMachineOperationReconciler(
 		}
 	}
 
-	return &MachinaMachineOperationReconciler{client: c, machineName: machineName, nodeName: nodeName, handlers: handlers}, nil
+	return &MachinaMachineOperationReconciler{client: c, reader: reader, machineName: machineName, nodeName: nodeName, handlers: handlers}, nil
 }
 
 // SetupController registers the MachineOperation watch for this reconciler.
@@ -81,7 +98,7 @@ func (r *MachinaMachineOperationReconciler) ReconcileMachineOperation(
 	name string,
 ) (ctrl.Result, error) {
 	var op machinav1alpha3.MachineOperation
-	if err := r.client.Get(ctx, client.ObjectKey{Name: name}, &op); err != nil {
+	if err := r.reader.Get(ctx, client.ObjectKey{Name: name}, &op); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 

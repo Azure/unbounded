@@ -74,8 +74,9 @@ func runController(
 		nodeOperator: nodeOperator,
 	}
 
-	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconciler(
+	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconcilerWithReader(
 		c,
+		mgr.GetAPIReader(),
 		machineName,
 		nodeName,
 		daemon.MachineOperationHandlers{
