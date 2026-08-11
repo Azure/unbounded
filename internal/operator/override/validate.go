@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // knownComponents are the components that generate workloads an override can
@@ -166,11 +168,60 @@ func validatePatch(at string, patch map[string]any) []string {
 
 	var problems []string
 
-	walkPatch(patch, "", compiledAllowlist.root, func(problem string) {
+	report := func(problem string) {
 		problems = append(problems, at+": "+problem)
-	})
+	}
+
+	walkPatch(patch, "", compiledAllowlist.root, report)
+	reportAffinityTerms(patch, report)
 
 	return problems
+}
+
+// reportAffinityTerms rejects required node affinity that cannot mean anything.
+//
+// Required terms are ORed, so the operator's terms and the user's are combined
+// with a Cartesian product. That product has two degenerate inputs worth
+// catching here rather than letting them through:
+//
+// An empty nodeSelectorTerms list is rejected by the API server anyway ("must
+// have at least one node selector term"), but it would first pass through the
+// product as an identity, silently leaving the operator's own constraint as
+// the entire result. The user would see their affinity accepted and the Site
+// report Applied, with nothing having changed.
+//
+// A term that is not a mapping cannot be combined with anything, and would
+// otherwise be dropped from the product without comment.
+func reportAffinityTerms(patch map[string]any, report func(string)) {
+	const at = "spec.template.spec.affinity.nodeAffinity." +
+		"requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms"
+
+	path := append([]string{"spec", "template", "spec", "affinity"}, requiredTermsPath...)
+
+	value, found, err := unstructured.NestedFieldNoCopy(patch, path...)
+	if err != nil || !found {
+		return
+	}
+
+	terms, ok := value.([]any)
+	if !ok {
+		report(fmt.Sprintf("%s must be a list, but holds %T", at, value))
+
+		return
+	}
+
+	if len(terms) == 0 {
+		report(at + " is empty; an empty term list matches nothing and is rejected by the API server, so " +
+			"remove the field instead of setting it to an empty list")
+
+		return
+	}
+
+	for i, term := range terms {
+		if _, ok := term.(map[string]any); !ok {
+			report(fmt.Sprintf("%s[%d] must be a mapping, but holds %T", at, i, term))
+		}
+	}
 }
 
 // walkPatch descends a patch value alongside the allowlist trie, reporting

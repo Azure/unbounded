@@ -35,7 +35,11 @@ var requiredTermsPath = []string{
 // preference or pod affinity rather than a hard constraint the operator relies
 // on.
 func applyAffinity(workload *unstructured.Unstructured, operator, user *schedulingSet) error {
-	combined := combineAffinities(append(append([]map[string]any{}, operator.affinity...), user.affinity...))
+	combined, err := combineAffinities(append(append([]map[string]any{}, operator.affinity...), user.affinity...))
+	if err != nil {
+		return err
+	}
+
 	if combined == nil {
 		return nil
 	}
@@ -47,8 +51,24 @@ func applyAffinity(workload *unstructured.Unstructured, operator, user *scheduli
 	return nil
 }
 
+// maxRequiredTerms bounds the Cartesian product of required node affinity
+// terms.
+//
+// The product is multiplicative: three contributors with four terms each
+// produce sixty-four, and there is no natural ceiling because any number of
+// override documents can target the same workload. An unbounded product is a
+// denial of service against the API server and etcd rather than a merely large
+// object, and the resulting affinity would be incomprehensible to anyone
+// debugging a scheduling failure.
+//
+// The operator itself contributes at most two terms (SiteNodeAffinity emits
+// the canonical and the deprecated Site label), so this leaves room for
+// genuinely complex user constraints while staying far below the point where
+// the object becomes a problem.
+const maxRequiredTerms = 128
+
 // combineAffinities folds a list of affinity blocks into one.
-func combineAffinities(blocks []map[string]any) map[string]any {
+func combineAffinities(blocks []map[string]any) (map[string]any, error) {
 	var (
 		combined  map[string]any
 		haveTerms bool
@@ -79,22 +99,25 @@ func combineAffinities(blocks []map[string]any) map[string]any {
 			continue
 		}
 
-		terms = cartesianTerms(terms, blockTerms)
+		next, err := cartesianTerms(terms, blockTerms)
+		if err != nil {
+			return nil, err
+		}
+
+		terms = next
 	}
 
 	if combined == nil {
-		return nil
+		return nil, nil
 	}
 
 	if haveTerms {
 		if err := setNestedSlice(combined, terms, requiredTermsPath...); err != nil {
-			// The terms came out of the same tree, so this cannot fail in
-			// practice; returning the uncombined block is still safe.
-			return combined
+			return nil, fmt.Errorf("set required node affinity terms: %w", err)
 		}
 	}
 
-	return combined
+	return combined, nil
 }
 
 // mergeAffinityExtras concatenates the affinity sections that are not required
@@ -126,13 +149,22 @@ func mergeAffinityExtras(into, from map[string]any) {
 // Each product term carries the concatenation of both sides' matchExpressions
 // and both sides' matchFields. Dropping matchFields would silently discard a
 // user constraint, since NodeSelectorTerm carries both.
-func cartesianTerms(left, right []any) []any {
-	if len(left) == 0 {
-		return right
+// A term list that is empty, or that holds a non-mapping, is an error rather
+// than an identity or a silent skip. Treating an empty list as the identity
+// would quietly resolve to whichever side was non-empty, which is the opposite
+// of the AND the user asked for.
+func cartesianTerms(left, right []any) ([]any, error) {
+	if len(left) == 0 || len(right) == 0 {
+		return nil, fmt.Errorf("required node affinity has an empty nodeSelectorTerms list; "+
+			"an empty list matches nothing, so it cannot be combined with the %d term(s) on the other side",
+			max(len(left), len(right)))
 	}
 
-	if len(right) == 0 {
-		return left
+	if size := len(left) * len(right); size > maxRequiredTerms {
+		return nil, fmt.Errorf("combining %d and %d required node affinity terms would produce %d terms, "+
+			"more than the limit of %d; required terms are ORed, so combining them is a product rather than "+
+			"a concatenation, and fewer, broader terms are needed here",
+			len(left), len(right), size, maxRequiredTerms)
 	}
 
 	product := make([]any, 0, len(left)*len(right))
@@ -140,24 +172,20 @@ func cartesianTerms(left, right []any) []any {
 	for _, l := range left {
 		leftTerm, ok := l.(map[string]any)
 		if !ok {
-			continue
+			return nil, fmt.Errorf("required node affinity term must be a mapping, but holds %T", l)
 		}
 
 		for _, r := range right {
 			rightTerm, ok := r.(map[string]any)
 			if !ok {
-				continue
+				return nil, fmt.Errorf("required node affinity term must be a mapping, but holds %T", r)
 			}
 
 			product = append(product, combineTerms(leftTerm, rightTerm))
 		}
 	}
 
-	if len(product) == 0 {
-		return left
-	}
-
-	return product
+	return product, nil
 }
 
 func combineTerms(left, right map[string]any) map[string]any {
