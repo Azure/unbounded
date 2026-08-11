@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -507,13 +509,16 @@ func TestOverrideStatusReportsDegraded(t *testing.T) {
 // hashes made them differ whenever a document targeted more than one workload,
 // so the divergence signal was permanently on.
 func TestOverrideStatusHashesAreComparable(t *testing.T) {
+	plan := planWithApplied(map[string]string{"a": "h1", "b": "h2"})
+
 	status := overrideStatusFor("edge",
 		overrideSnapshot{state: overridesValid, resourceVersion: "7"},
 		&override.Report{Workloads: []override.WorkloadResult{
 			{Ref: component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "a")), Site: "edge", Hash: "h1"},
 			{Ref: component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "b")), Site: "edge", Hash: "h2"},
 		}},
-		planWithApplied(map[string]string{"a": "h1", "b": "h2"}),
+		plan,
+		allSucceeded(plan),
 	)
 
 	if status.Phase != unboundedv1alpha3.OverridePhaseApplied {
@@ -530,17 +535,38 @@ func TestOverrideStatusHashesAreComparable(t *testing.T) {
 // TestOverrideStatusDetectsDivergence confirms the signal is not merely always
 // off either: a workload that did not receive its override is Degraded.
 func TestOverrideStatusDetectsDivergence(t *testing.T) {
+	plan := planWithApplied(map[string]string{"a": "stale"})
+
 	status := overrideStatusFor("edge",
 		overrideSnapshot{state: overridesValid, resourceVersion: "7"},
 		&override.Report{Workloads: []override.WorkloadResult{
 			{Ref: component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "a")), Site: "edge", Hash: "desired"},
 		}},
-		planWithApplied(map[string]string{"a": "stale"}),
+		plan,
+		allSucceeded(plan),
 	)
 
 	if status.Phase != unboundedv1alpha3.OverridePhaseDegraded {
 		t.Fatalf("phase = %q, want Degraded when applied differs from desired", status.Phase)
 	}
+}
+
+// allSucceeded is the execution result of a plan that ran cleanly, which is
+// what most status tests want to hold constant while they vary the hashes.
+func allSucceeded(plan *component.Plan) component.ExecutionResult {
+	var exec component.ExecutionResult
+
+	for _, op := range plan.Operations {
+		exec.Results = append(exec.Results, component.OperationResult{
+			Ref:       op.Ref(),
+			Kind:      op.Kind,
+			Component: op.Component,
+			Site:      op.Site,
+			Status:    component.OpSucceeded,
+		})
+	}
+
+	return exec
 }
 
 // planWithApplied builds a plan whose workloads carry the given hashes.
@@ -653,4 +679,161 @@ overrides:
 	if untouched.Annotations[override.HashAnnotation] != "" {
 		t.Fatal("an unselected Site's workload must carry no override hash")
 	}
+}
+
+// TestOverrideStatusReportsWhatWasWrittenNotWhatWasPlanned is a regression test.
+//
+// Applied hashes were read from the plan alone, so they described intent. A
+// workload whose apply the API server rejected, or that the executor skipped
+// because something it depends on failed, still had its desired hash reported
+// as applied: the Site said Applied for an override that had never reached the
+// cluster, which is the one thing this status exists to catch.
+func TestOverrideStatusReportsWhatWasWrittenNotWhatWasPlanned(t *testing.T) {
+	plan := planWithApplied(map[string]string{"a": "desired"})
+
+	report := &override.Report{Workloads: []override.WorkloadResult{
+		{Ref: component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "a")), Site: "edge", Hash: "desired"},
+	}}
+
+	for name, exec := range map[string]component.ExecutionResult{
+		"the write failed": {Results: []component.OperationResult{{
+			Ref:    component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "a")),
+			Kind:   component.OpApply,
+			Status: component.OpFailed,
+			Err:    errors.New("apiserver said no"),
+		}}},
+		"the write was skipped": {Results: []component.OperationResult{{
+			Ref:    component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "a")),
+			Kind:   component.OpApply,
+			Status: component.OpSkipped,
+			Err:    errors.New("dependency did not complete"),
+		}}},
+		"the plan never executed": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			status := overrideStatusFor("edge",
+				overrideSnapshot{state: overridesValid, resourceVersion: "7"}, report, plan, exec)
+
+			if status.Phase != unboundedv1alpha3.OverridePhaseDegraded {
+				t.Fatalf("phase = %q, want Degraded: the override did not reach the cluster", status.Phase)
+			}
+
+			if got := status.Workloads[0].AppliedHash; got != "" {
+				t.Fatalf("applied hash = %q, want empty for a workload that was never written", got)
+			}
+		})
+	}
+}
+
+// TestOverrideConfigMapEventsAreRecordedOnTheConfigMap is a regression test.
+//
+// A rejected document was reported only on Site conditions and in the operator
+// log. The overrides ConfigMap is cluster-scoped and one document routinely
+// targets several components, so no single Site owns the failure; and with no
+// Site yet created there was no Site to carry it at all. A user who mistyped a
+// patch got no signal on the object they edited.
+func TestOverrideConfigMapEventsAreRecordedOnTheConfigMap(t *testing.T) {
+	site := siteFor("edge")
+
+	r, _, _ := overrideTestEnv(t, site, overridesConfigMap(map[string]string{
+		"overrides.yaml": "apiVersion: " + override.APIVersion +
+			"\noverrides:\n  - component: net\n    kind: DaemonSet\n    patch:\n      metadata:\n        name: renamed\n",
+	}))
+
+	recorder := &recordingEventSink{}
+	r.Recorder = recorder
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err == nil {
+		t.Fatal("expected the invalid document to fail the pass")
+	}
+
+	event, found := recorder.on(override.ConfigMapName)
+	if !found {
+		t.Fatalf("no Event recorded against %s; events = %+v", override.ConfigMapName, recorder.events)
+	}
+
+	if event.eventType != corev1.EventTypeWarning {
+		t.Fatalf("event type = %q, want Warning", event.eventType)
+	}
+
+	if !strings.Contains(event.note, "left unchanged") {
+		t.Fatalf("note = %q, want it to say the workloads were left alone", event.note)
+	}
+}
+
+// TestOverrideConfigMapEventsAreNotRepeatedPerPass checks the Event does not
+// fire on every reconcile. A rejected document requeues the pass, so an
+// unconditional Event would produce one per retry for as long as the document
+// stays broken.
+func TestOverrideConfigMapEventsAreNotRepeatedPerPass(t *testing.T) {
+	site := siteFor("edge")
+
+	r, _, _ := overrideTestEnv(t, site, overridesConfigMap(map[string]string{
+		"overrides.yaml": "apiVersion: " + override.APIVersion +
+			"\noverrides:\n  - component: net\n    kind: DaemonSet\n    patch:\n      metadata:\n        name: renamed\n",
+	}))
+
+	recorder := &recordingEventSink{}
+	r.Recorder = recorder
+
+	for range 3 {
+		//nolint:errcheck // the pass is expected to fail; the Events are what matter
+		r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}})
+	}
+
+	var count int
+
+	for _, event := range recorder.events {
+		if event.name == override.ConfigMapName {
+			count++
+		}
+	}
+
+	if count != 1 {
+		t.Fatalf("recorded %d Events for one unchanged document, want 1", count)
+	}
+}
+
+// recordedEvent is one Event captured by recordingEventSink.
+type recordedEvent struct {
+	name      string
+	eventType string
+	reason    string
+	note      string
+}
+
+// recordingEventSink captures Events so tests can assert what the operator told
+// the user and where it told them.
+type recordingEventSink struct {
+	events []recordedEvent
+}
+
+func (s *recordingEventSink) Eventf(
+	regarding runtime.Object,
+	_ runtime.Object,
+	eventType, reason, _, note string,
+	args ...any,
+) {
+	name := ""
+	if accessor, err := apimeta.Accessor(regarding); err == nil {
+		name = accessor.GetName()
+	}
+
+	s.events = append(s.events, recordedEvent{
+		name:      name,
+		eventType: eventType,
+		reason:    reason,
+		note:      fmt.Sprintf(note, args...),
+	})
+}
+
+// on returns the first Event recorded against the named object.
+func (s *recordingEventSink) on(name string) (recordedEvent, bool) {
+	for _, event := range s.events {
+		if event.name == name {
+			return event, true
+		}
+	}
+
+	return recordedEvent{}, false
 }

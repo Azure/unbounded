@@ -52,6 +52,12 @@ type overrideSnapshot struct {
 	entries         []override.SourcedEntry
 	resourceVersion string
 	err             error
+
+	// configMap is the object the snapshot was read from, kept so Events can
+	// be recorded against the thing the user actually edited. It is nil when
+	// no ConfigMap exists or the read failed, which is exactly when there is
+	// nothing to attach an Event to.
+	configMap *corev1.ConfigMap
 }
 
 // usable reports whether overrides can be merged this pass.
@@ -94,7 +100,10 @@ func loadOverrides(ctx context.Context, env *component.Env) overrideSnapshot {
 		}
 	}
 
-	snapshot := overrideSnapshot{resourceVersion: configMap.ResourceVersion}
+	snapshot := overrideSnapshot{
+		resourceVersion: configMap.ResourceVersion,
+		configMap:       configMap.DeepCopy(),
+	}
 
 	entries, err := override.Parse(configMap.Data)
 	if err != nil {
@@ -156,14 +165,16 @@ func siteNames(sites []unboundedv1alpha3.Site) []string {
 // overrideStatusFor builds the Site status for one Site from an override
 // report.
 //
-// Desired hashes come from what the operator computed this pass; applied hashes
-// are read back from the objects the plan carries, so the two are comparable by
-// construction rather than by convention.
+// Desired hashes come from what the operator computed this pass. Applied hashes
+// come from the objects the plan carries, but only for operations the executor
+// actually completed, so the status reports what reached the cluster rather
+// than what the operator meant to write.
 func overrideStatusFor(
 	site string,
 	snapshot overrideSnapshot,
 	report *override.Report,
 	plan *component.Plan,
+	exec component.ExecutionResult,
 ) *unboundedv1alpha3.OverrideStatus {
 	status := &unboundedv1alpha3.OverrideStatus{
 		Phase:                   unboundedv1alpha3.OverridePhaseNone,
@@ -181,7 +192,7 @@ func overrideStatusFor(
 		return status
 	}
 
-	applied := appliedHashes(plan)
+	applied := appliedHashes(plan, exec)
 
 	for _, workload := range report.Workloads {
 		// Cluster singletons carry no Site but every Site depends on them, so
@@ -231,16 +242,32 @@ func overrideStatusFor(
 	return status
 }
 
-// appliedHashes reads back the override hash each surviving operation carries.
+// appliedHashes reads back the override hash of every overridable workload the
+// executor successfully wrote.
 //
-// An operation dropped because its overrides could not be applied is absent
-// here, so its applied hash is empty and does not match the desired one, which
-// is exactly the divergence the status is meant to report.
-func appliedHashes(plan *component.Plan) map[component.ObjectRef]string {
+// The hash is read from the plan, because that is the only place the merged
+// object exists, but a hash is only reported when the operation carrying it
+// completed. Reading the plan alone described intent: a DaemonSet whose apply
+// was rejected by the API server, or skipped because its ConfigMap failed,
+// still had its desired hash reported as applied, so the Site said Applied for
+// an override that had never reached the cluster. That is precisely the
+// divergence this status exists to surface.
+//
+// An operation dropped because its overrides could not be used is absent from
+// the plan entirely, and so is absent here too, with the same effect.
+func appliedHashes(plan *component.Plan, exec component.ExecutionResult) map[component.ObjectRef]string {
+	written := map[component.ObjectRef]bool{}
+
+	for _, result := range exec.Results {
+		if result.Status == component.OpSucceeded {
+			written[result.Ref] = true
+		}
+	}
+
 	out := map[component.ObjectRef]string{}
 
 	for _, op := range plan.Operations {
-		if !op.Overridable {
+		if !op.Overridable || !written[op.Ref()] {
 			continue
 		}
 

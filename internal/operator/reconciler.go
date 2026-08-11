@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -67,6 +68,13 @@ type SiteReconciler struct {
 	// Recorder, when set, receives Events for override state changes. Optional
 	// so unit tests can construct a reconciler without one.
 	Recorder events.EventRecorder
+
+	// overrideEventMu guards lastOverrideEvent, which records the verdict
+	// already reported against the overrides ConfigMap so a document that
+	// keeps requeueing does not produce an Event per pass. Reconciles can run
+	// concurrently when MaxConcurrentReconciles is raised.
+	overrideEventMu   sync.Mutex
+	lastOverrideEvent string
 }
 
 // DefaultRegistry returns the built-in component registry: the net and machina
@@ -181,6 +189,11 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 
 	exec, execErr := env.Execute(ctx, plan)
 
+	// The document's fate is reported against the ConfigMap once per pass
+	// rather than once per Site, because that is what it is: one cluster-scoped
+	// document, whose failures are not any single Site's.
+	r.publishOverrideConfigMapEvent(snapshot, report)
+
 	var (
 		reconcileErrs []error
 		requeueAfter  time.Duration
@@ -240,7 +253,7 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 
 		pruneStaleConditions(target, reg)
 
-		r.publishOverrideStatus(ctx, target, snapshot, report, plan)
+		r.publishOverrideStatus(target, snapshot, report, plan, exec)
 
 		if err := r.Status().Patch(ctx, target, baselines[target.Name]); err != nil {
 			reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status for %s: %w", target.Name, err))
@@ -534,13 +547,13 @@ func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // overrides ConfigMap gets its own Events for failures that no Site can carry,
 // including the case where no Site exists at all.
 func (r *SiteReconciler) publishOverrideStatus(
-	_ context.Context,
 	site *unboundedv1alpha3.Site,
 	snapshot overrideSnapshot,
 	report *override.Report,
 	plan *component.Plan,
+	exec component.ExecutionResult,
 ) {
-	status := overrideStatusFor(site.Name, snapshot, report, plan)
+	status := overrideStatusFor(site.Name, snapshot, report, plan, exec)
 
 	previous := site.Status.Overrides
 	site.Status.Overrides = status
@@ -580,4 +593,70 @@ func overrideStatusChanged(previous, current *unboundedv1alpha3.OverrideStatus) 
 	}
 
 	return false
+}
+
+// publishOverrideConfigMapEvent records the fate of the overrides document
+// against the ConfigMap itself.
+//
+// Site conditions are the wrong and sometimes the only wrong place for this.
+// The overrides ConfigMap is cluster-scoped and one document routinely targets
+// several components, so a document-level failure does not belong to any one
+// Site; worse, when no Site exists yet there is no Site to carry it at all, and
+// a user who mistyped a patch would get nothing but an operator log line. The
+// object the user edited is where they will look, and where `kubectl describe`
+// will show it.
+//
+// Events fire only when the observed resourceVersion or the verdict changes, so
+// a broken document that keeps requeueing does not produce an Event per pass.
+func (r *SiteReconciler) publishOverrideConfigMapEvent(snapshot overrideSnapshot, report *override.Report) {
+	if r.Recorder == nil || snapshot.configMap == nil {
+		return
+	}
+
+	eventType, reason, note := overrideConfigMapEvent(snapshot, report)
+	if reason == "" {
+		return
+	}
+
+	if !r.overrideEventIsNew(snapshot.resourceVersion, reason) {
+		return
+	}
+
+	r.Recorder.Eventf(snapshot.configMap, nil, eventType, reason, "ApplyOverrides", "%s", note)
+}
+
+// overrideConfigMapEvent chooses the Event for a snapshot, or returns an empty
+// reason when the document deserves no Event.
+func overrideConfigMapEvent(snapshot overrideSnapshot, report *override.Report) (eventType, reason, note string) {
+	if snapshot.blocksWorkloads() {
+		return corev1.EventTypeWarning, "OverridesRejected",
+			fmt.Sprintf("overrides were not applied and managed workloads were left unchanged: %v", snapshot.err)
+	}
+
+	if report == nil {
+		return "", "", ""
+	}
+
+	if err := report.Err(); err != nil {
+		return corev1.EventTypeWarning, "OverridesPartiallyApplied", err.Error()
+	}
+
+	return corev1.EventTypeNormal, "OverridesApplied",
+		fmt.Sprintf("%d workload(s) overridden", len(report.Workloads))
+}
+
+// overrideEventIsNew reports whether this verdict has already been recorded for
+// this version of the document, and remembers it when it has not.
+func (r *SiteReconciler) overrideEventIsNew(resourceVersion, reason string) bool {
+	r.overrideEventMu.Lock()
+	defer r.overrideEventMu.Unlock()
+
+	current := resourceVersion + "/" + reason
+	if r.lastOverrideEvent == current {
+		return false
+	}
+
+	r.lastOverrideEvent = current
+
+	return true
 }
