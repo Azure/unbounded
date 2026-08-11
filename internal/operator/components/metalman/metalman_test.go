@@ -320,7 +320,7 @@ func reconcile(t *testing.T, env *component.Env, site *unboundedv1alpha3.Site) c
 		return component.Failed(err)
 	}
 
-	return component.CombineResult(c.Name(), res, exec)
+	return component.CombineResult(c.Name(), site.Name, res, exec)
 }
 
 // TestPlanGolden pins the complete set of operations the metalman component

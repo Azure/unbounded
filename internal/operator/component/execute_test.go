@@ -143,13 +143,14 @@ func TestExecuteRunsEachOperationKind(t *testing.T) {
 		t.Fatalf("execution errors: %v", err)
 	}
 
-	// Within a component, operations execute in the order the component
-	// planned them; the executor does not reorder absent a declared dependency.
+	// Removals run first, so a component's cleanup cannot undo something it
+	// writes later in the same pass. Within a tier, operations execute in the
+	// order the component planned them.
 	want := []string{
+		"delete ConfigMap/doomed",
 		"apply ConfigMap/applied",
 		"create ConfigMap/created",
 		"patch ConfigMap/adopt-me",
-		"delete ConfigMap/doomed",
 	}
 
 	assertCalls(t, *calls, want)

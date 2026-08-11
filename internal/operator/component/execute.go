@@ -131,17 +131,32 @@ func (e *Env) Execute(ctx context.Context, plan *Plan) (ExecutionResult, error) 
 	copy(ops, plan.Operations)
 	sortOperations(ops)
 
-	deduped, aliases, err := dedupeShared(ops)
+	deduped, err := dedupeShared(ops)
 	if err != nil {
 		return ExecutionResult{}, err
 	}
 
-	ordered, err := orderByDependency(deduped)
+	ordered, err := orderByDependency(byTier(deduped))
 	if err != nil {
 		return ExecutionResult{}, err
 	}
 
-	return e.run(ctx, ordered, aliases), nil
+	return e.run(ctx, ordered), nil
+}
+
+// plannedOp is one operation the executor will run, together with the extra
+// contributors that were deduplicated into it.
+//
+// The aliases travel on the operation rather than in a map keyed by ObjectRef,
+// because an ObjectRef does not identify an operation. A plan legitimately
+// holds more than one operation on the same object: a ConfigMap is created if
+// absent and then merge-patched to add operator-owned keys. Keyed by ref, the
+// second operation inherited the first one's contributors and reported results
+// for Sites that had nothing to do with it.
+type plannedOp struct {
+	Operation
+
+	aliases []Operation
 }
 
 // validatePlan rejects operations the executor cannot route.
@@ -167,16 +182,36 @@ func validatePlan(plan *Plan) error {
 	return nil
 }
 
-// run executes ordered operations, tracking which refs failed so dependents can
-// be skipped. aliases maps a deduplicated operation's ref to the extra
-// contributors that must receive the same result.
-func (e *Env) run(ctx context.Context, ordered []Operation, aliases map[ObjectRef][]Operation) ExecutionResult {
+// run executes ordered operations, tracking what failed so dependents are
+// skipped rather than attempted.
+//
+// Three things gate an operation, and only the first is declared by the
+// component that planned it:
+//
+//   - a declared DependsOn that failed
+//   - an earlier operation on the same object that failed, since patching an
+//     object whose creation failed only produces a second, more confusing error
+//   - an earlier tier that failed for the same component and Site, which is the
+//     inferred form: a component's workload is not attempted when that
+//     component's own ConfigMap, RBAC or Namespace did not get written
+//
+// The inferred gate is scoped to one component and Site deliberately. Skipping
+// every workload in the cluster because one component's ConfigMap failed would
+// turn a contained failure into an outage; skipping only the component that
+// owns the missing dependency keeps the blast radius where the failure is.
+//
+// A failed Namespace is the exception and gates every namespaced object in it,
+// whichever component planned it, because nothing can be written into a
+// namespace that does not exist.
+func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 	var (
-		result ExecutionResult
-		broken = map[ObjectRef]bool{}
+		result    ExecutionResult
+		brokenRef = map[ObjectRef]bool{}
+		brokenNS  = map[string]bool{}
+		brokenSub = map[subject]tier{}
 	)
 
-	record := func(op Operation, status OpStatus, err error) {
+	record := func(op plannedOp, status OpStatus, err error) {
 		result.Results = append(result.Results, OperationResult{
 			Ref:       op.Ref(),
 			Kind:      op.Kind,
@@ -186,7 +221,7 @@ func (e *Env) run(ctx context.Context, ordered []Operation, aliases map[ObjectRe
 			Err:       err,
 		})
 
-		for _, alias := range aliases[op.Ref()] {
+		for _, alias := range op.aliases {
 			result.Results = append(result.Results, OperationResult{
 				Ref:       op.Ref(),
 				Kind:      op.Kind,
@@ -198,19 +233,33 @@ func (e *Env) run(ctx context.Context, ordered []Operation, aliases map[ObjectRe
 		}
 	}
 
-	for _, op := range ordered {
-		if blocker, blocked := firstBrokenDependency(op, broken); blocked {
-			broken[op.Ref()] = true
+	fail := func(op plannedOp, status OpStatus, err error) {
+		at := tierOf(op.Operation)
 
-			record(op, OpSkipped, fmt.Errorf("dependency %s did not complete", blocker))
+		brokenRef[op.Ref()] = true
+
+		// Operations run in tier order, so the first failure recorded for a
+		// subject is its earliest failed tier and later ones do not lower it.
+		if _, seen := brokenSub[op.subject()]; !seen {
+			brokenSub[op.subject()] = at
+		}
+
+		if at == tierNamespace {
+			brokenNS[op.Object.GetName()] = true
+		}
+
+		record(op, status, err)
+	}
+
+	for _, op := range ordered {
+		if reason, blocked := blockedBy(op, brokenRef, brokenNS, brokenSub); blocked {
+			fail(op, OpSkipped, errors.New(reason))
 
 			continue
 		}
 
-		if err := e.execute(ctx, op); err != nil {
-			broken[op.Ref()] = true
-
-			record(op, OpFailed, err)
+		if err := e.execute(ctx, op.Operation); err != nil {
+			fail(op, OpFailed, err)
 
 			continue
 		}
@@ -221,17 +270,40 @@ func (e *Env) run(ctx context.Context, ordered []Operation, aliases map[ObjectRe
 	return result
 }
 
-// firstBrokenDependency reports the first declared dependency that failed or
-// was skipped. Dependencies not present in the plan are treated as satisfied:
-// they may be objects another component owns, or objects that already exist.
-func firstBrokenDependency(op Operation, broken map[ObjectRef]bool) (ObjectRef, bool) {
+// subject identifies the component and Site an operation was planned for, which
+// is the scope the inferred tier gate applies to.
+type subject struct {
+	Component string
+	Site      string
+}
+
+func (o plannedOp) subject() subject {
+	return subject{Component: o.Component, Site: o.Site}
+}
+
+// blockedBy reports why an operation must not be attempted, or false when it
+// may run.
+func blockedBy(op plannedOp, brokenRef map[ObjectRef]bool, brokenNS map[string]bool, brokenSub map[subject]tier) (string, bool) {
 	for _, dep := range op.DependsOn {
-		if broken[dep] {
-			return dep, true
+		if dep != op.Ref() && brokenRef[dep] {
+			return fmt.Sprintf("dependency %s did not complete", dep), true
 		}
 	}
 
-	return ObjectRef{}, false
+	if brokenRef[op.Ref()] {
+		return fmt.Sprintf("an earlier operation on %s did not complete", op.Ref()), true
+	}
+
+	if ns := op.Object.GetNamespace(); ns != "" && brokenNS[ns] {
+		return fmt.Sprintf("namespace %s could not be written", ns), true
+	}
+
+	if failed, ok := brokenSub[op.subject()]; ok && failed < tierOf(op.Operation) {
+		return fmt.Sprintf("%s did not write its %s successfully",
+			describeContributor(op.Operation), failed), true
+	}
+
+	return "", false
 }
 
 // execute performs a single operation.
@@ -278,37 +350,36 @@ func (e *Env) execute(ctx context.Context, op Operation) error {
 // Unequal operations sharing a key are rejected rather than resolved by letting
 // the last one win, because that would make the result depend on Site iteration
 // order. A shared object that differs by Site is a planning bug.
-func dedupeShared(ops []Operation) ([]Operation, map[ObjectRef][]Operation, error) {
+func dedupeShared(ops []Operation) ([]plannedOp, error) {
 	var (
-		out     []Operation
-		aliases = map[ObjectRef][]Operation{}
-		first   = map[string]Operation{}
+		out   []plannedOp
+		first = map[string]int{}
 	)
 
 	for _, op := range ops {
 		if op.SharedKey == "" {
-			out = append(out, op)
+			out = append(out, plannedOp{Operation: op})
 
 			continue
 		}
 
-		existing, seen := first[op.SharedKey]
+		at, seen := first[op.SharedKey]
 		if !seen {
-			first[op.SharedKey] = op
+			first[op.SharedKey] = len(out)
 
-			out = append(out, op)
+			out = append(out, plannedOp{Operation: op})
 
 			continue
 		}
 
-		if err := sharedOperationsEqual(existing, op); err != nil {
-			return nil, nil, err
+		if err := sharedOperationsEqual(out[at].Operation, op); err != nil {
+			return nil, err
 		}
 
-		aliases[existing.Ref()] = append(aliases[existing.Ref()], op)
+		out[at].aliases = append(out[at].aliases, op)
 	}
 
-	return out, aliases, nil
+	return out, nil
 }
 
 // sharedOperationsEqual reports whether two operations sharing a key describe
@@ -342,33 +413,48 @@ func describeContributor(op Operation) string {
 	return op.Component + " (site " + op.Site + ")"
 }
 
+// byTier orders operations by the stage inferred from what they write, so that
+// namespaces precede the objects in them, RBAC and config precede the workloads
+// that consume them, and removals happen first.
+//
+// The sort is stable, so within a tier the deterministic order established by
+// sortOperations survives: components are grouped in registry order and each
+// component's own emission order is preserved.
+func byTier(ops []plannedOp) []plannedOp {
+	sort.SliceStable(ops, func(i, j int) bool {
+		return tierOf(ops[i].Operation) < tierOf(ops[j].Operation)
+	})
+
+	return ops
+}
+
 // orderByDependency returns operations in an order where every declared
 // dependency present in the plan precedes its dependents.
 //
-// The input is already deterministically sorted, and the algorithm preserves
-// that order among operations whose dependencies are equally satisfied, so a
-// plan executes identically on every pass. Dependencies not present in the plan
-// are treated as satisfied.
-func orderByDependency(ops []Operation) ([]Operation, error) {
+// The input is already ordered by tier, and the algorithm preserves that order
+// among operations whose dependencies are equally satisfied, so a plan executes
+// identically on every pass. Dependencies not present in the plan are treated
+// as satisfied.
+func orderByDependency(ops []plannedOp) ([]plannedOp, error) {
 	produced := map[ObjectRef]bool{}
 	for _, op := range ops {
 		produced[op.Ref()] = true
 	}
 
 	var (
-		ordered  = make([]Operation, 0, len(ops))
+		ordered  = make([]plannedOp, 0, len(ops))
 		done     = map[ObjectRef]bool{}
 		remained = ops
 	)
 
 	for len(remained) > 0 {
 		var (
-			ready   []Operation
-			waiting []Operation
+			ready   []plannedOp
+			waiting []plannedOp
 		)
 
 		for _, op := range remained {
-			if dependenciesSatisfied(op, produced, done) {
+			if dependenciesSatisfied(op.Operation, produced, done) {
 				ready = append(ready, op)
 
 				continue
@@ -410,7 +496,7 @@ func dependenciesSatisfied(op Operation, produced, done map[ObjectRef]bool) bool
 
 // refList renders the refs of a set of operations for a cycle error, sorted so
 // the message is stable.
-func refList(ops []Operation) string {
+func refList(ops []plannedOp) string {
 	refs := make([]string, 0, len(ops))
 	for _, op := range ops {
 		refs = append(refs, op.Ref().String())
@@ -421,34 +507,74 @@ func refList(ops []Operation) string {
 	return strings.Join(refs, ", ")
 }
 
-// CombineResult folds a component's execution outcomes into its planning
-// verdict.
+// CombineResult folds a component's execution outcomes for one Site into its
+// planning verdict.
 //
 // Planning reaches verdicts execution cannot, such as Disabled or NoSites, so
 // those survive when there was nothing to execute. When operations did run, a
 // failure replaces the planning verdict, because a component that planned
 // successfully but failed to write is not reconciled.
 //
-// Skipped operations do not by themselves produce a failure: the dependency
-// that caused them already reported the underlying error.
-func CombineResult(componentName string, planned Result, exec ExecutionResult) Result {
-	var errs []error
+// Results are matched on both component and Site. A cluster component is
+// recorded on every Site's status, and a per-Site component plans separately
+// for each Site, so without the Site filter a failure writing one Site's
+// DaemonSet appeared as a reconcile error on every other Site as well: every
+// Site went NotReady and the condition message named an object belonging to a
+// Site the reader was not looking at. Operations with no Site are cluster
+// scoped and count towards every Site.
+//
+// Skipped operations do not produce a failure, because the dependency that
+// caused them already reported the underlying error and repeating it here would
+// bury the real cause. They do prevent a Ready verdict: the component did not
+// write what it planned, and reporting Reconciled would claim otherwise.
+func CombineResult(componentName, site string, planned Result, exec ExecutionResult) Result {
+	var (
+		errs    []error
+		skipped []OperationResult
+	)
 
 	for _, result := range exec.Results {
 		if result.Component != componentName {
 			continue
 		}
 
-		if result.Status != OpFailed || result.Err == nil {
+		if result.Site != "" && result.Site != site {
 			continue
 		}
 
-		errs = append(errs, fmt.Errorf("%s %s: %w", result.Kind, result.Ref, result.Err))
+		switch {
+		case result.Status == OpFailed && result.Err != nil:
+			errs = append(errs, fmt.Errorf("%s %s: %w", result.Kind, result.Ref, result.Err))
+		case result.Status == OpSkipped:
+			skipped = append(skipped, result)
+		}
 	}
 
 	if len(errs) > 0 {
 		return Failed(errors.Join(errs...))
 	}
 
+	if len(skipped) > 0 {
+		return NotReady(ReasonDependencyNotWritten, describeSkipped(skipped))
+	}
+
 	return planned
+}
+
+// describeSkipped explains what was not written, naming the first object and
+// the reason it was gated so the condition points at something actionable.
+func describeSkipped(skipped []OperationResult) string {
+	first := skipped[0]
+
+	reason := "a dependency did not complete"
+	if first.Err != nil {
+		reason = first.Err.Error()
+	}
+
+	if len(skipped) == 1 {
+		return fmt.Sprintf("%s was not written: %s", first.Ref, reason)
+	}
+
+	return fmt.Sprintf("%s and %d other object(s) were not written: %s",
+		first.Ref, len(skipped)-1, reason)
 }

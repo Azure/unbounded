@@ -198,7 +198,14 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 	}
 
 	record := func(target *unboundedv1alpha3.Site, outcome componentOutcome) {
-		res := component.CombineResult(outcome.name, outcome.result, exec)
+		// A Site-less pass has no Site to attribute results to, so it takes
+		// the cluster-scoped operations only.
+		var siteName string
+		if target != nil {
+			siteName = target.Name
+		}
+
+		res := component.CombineResult(outcome.name, siteName, outcome.result, exec)
 
 		switch {
 		case target != nil:

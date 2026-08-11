@@ -302,7 +302,9 @@ func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site)
 		return component.Failed(err)
 	}
 
-	return component.CombineResult(c.Name(), res, exec)
+	// net is a cluster component and plans no per-Site operations, so there is
+	// no Site to attribute results to.
+	return component.CombineResult(c.Name(), "", res, exec)
 }
 
 // TestPlanGolden pins the complete set of operations the net component plans.

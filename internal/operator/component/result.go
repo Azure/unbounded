@@ -20,6 +20,12 @@ const (
 	ReasonDisabled       = "Disabled"
 	ReasonNoSites        = "NoSites"
 	ReasonReconcileError = "ReconcileError"
+
+	// ReasonDependencyNotWritten marks a component whose operations were never
+	// attempted because something they depend on failed. It is deliberately
+	// distinct from ReconcileError: the component itself did not fail, and the
+	// component that did already reports the underlying error.
+	ReasonDependencyNotWritten = "DependencyNotWritten"
 )
 
 // Result is the outcome of reconciling a single component for one pass. The
