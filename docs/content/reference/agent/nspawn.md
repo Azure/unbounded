@@ -162,10 +162,13 @@ steps by restarting the managed nspawn unit. Managed `NodeReboot` operations
 invoke the same reconcile flow.
 
 Each lifecycle refresh discovers NVIDIA devices and driver libraries from the
-current host. Complete GPU discovery enables the NVIDIA runtime and post-start
-rewiring; no devices produces CPU-only configuration, while devices with
-incomplete driver state cause the start to retry. Post-start rewiring refreshes
-the driver root and CDI state after every machine start.
+current host. On a node provisioned with the NVIDIA-capable rootfs, complete GPU
+discovery runs post-start rewiring, while incomplete driver state causes the
+start to retry. Adding a GPU to a node provisioned with the CPU rootfs is not an
+in-place migration path: that rootfs does not contain the required NVIDIA tools
+or containerd runtime configuration. Reinitialize or repave the node with the
+NVIDIA-capable rootfs image instead. Post-start rewiring refreshes the driver
+root and CDI state after every machine start.
 
 When an upgraded daemon starts for a machine created by an older agent, it
 idempotently installs the host lifecycle hooks without restarting the running
