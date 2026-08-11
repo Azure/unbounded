@@ -30,8 +30,9 @@ The checked configuration describes:
   and rate ceilings — plus peers. A peer may name the foreign site it lives in,
   making that link a site crossing, and may name the sites it will carry traffic
   to on our behalf. Nodes are otherwise alike; there is no gateway role.
-- A topology epoch, catalog of three distinct acceptors per group, 16,384 hash
-  slots mapping addresses to groups, and remote-zone entries.
+- A topology epoch, a balanced catalog of three distinct acceptors per group,
+  and remote-zone entries. An address's 16,384-way hash slot folds over the
+  catalog to name its group, so the catalog is the whole of the placement map.
 - Volumes and ordered extents. A global page address is a 32-bit volume ID plus
   a 32-bit page offset; the volume ID's high byte is its site. A six-bit volume
   slot is used on the fabric. Extents specify LWW, OCC, Immutable, or
@@ -46,11 +47,20 @@ has complete group information for its zone and entry nodes for other zones,
 rather than a global connection graph. Reaching another site takes only a peer
 that says it can, so no node holds the far site's shape.
 
+The nodes of a zone are homogeneous. The catalog must give every node it names
+the same number of groups, so every node holds the same share of the zone and
+sizes its device for that same share: the zone's pages, times three replicas,
+divided by the number of nodes. There is no way to declare one node larger than
+another. A node the catalog does not name holds nothing; it is either a spare
+about to join, or a member being decommissioned, or a node that only routes.
+
 The watcher uses inotify on the configuration's parent directory and reacts to
 close-write and rename-into-place. Generations must increase; a volume's
 tombstone epoch may not decrease, though it may jump by any amount; existing
-volume slots and extent shapes cannot change; and catalog/migration changes are
-bounded. Parse, validation, and build failures leave the previous runtime
+volume slots and extent shapes cannot change; the catalog keeps its length for
+the life of the zone, since that length is what folds a slot onto a group; and
+catalog membership moves one node at a time, as migration changes do. Parse,
+validation, and build failures leave the previous runtime
 configuration active and increment a metric. Reconciliation can still fail
 after publication and partially apply a generation.
 
@@ -137,11 +147,14 @@ bounded consensus promises and migration seals. The remaining regions are:
 4. Out-of-place small and huge data slabs, with the huge slab aligned.
 5. Separate fixed-size small and huge cache regions.
 
-Capacity includes spare data slots and is checked whenever `serve` starts. A
-configuration that has outgrown the device is satisfied by appending an extent
-per class: a fresh run of metadata blocks and the data slots they name, placed
-past the end of everything already written, recorded in a growth table in the
-superblock, and never moving a byte that already exists. Regular files are
+Capacity includes spare data slots and is checked whenever `serve` starts. The
+share a node is sized for is the zone's mean rather than a declared ceiling, so
+the overprovision above it, five percent plus a per-class floor, is also what
+absorbs the variance in how many pages actually hash into the groups a node
+holds. A configuration that has outgrown the device is satisfied by appending an
+extent per class: a fresh run of metadata blocks and the data slots they name,
+placed past the end of everything already written, recorded in a growth table in
+the superblock, and never moving a byte that already exists. Regular files are
 extended in place; a block device must be enlarged by the operator first, and
 `serve` refuses to start naming the shortfall. Growth happens only at startup,
 before shards are sized; a reload that asks for more publishes the shortfall as
@@ -257,6 +270,17 @@ non-cryptographic XOR digests. Differing buckets are enumerated through bounded
 snapshot cursors with a 30-second idle expiry; cursors return only address and
 register, and page bytes are reconciled through ordinary Paxos repair. Cursor
 count, buckets, and repairs are budgeted, with larger budgets during replay.
+
+A node whose digests are empty where its peers' are not is replaying, and is
+excluded from quorum until it has caught up. That covers both a member wiped and
+restarted under its own id and a node the catalog has just named for the first
+time. Membership moves by replacement, one node at a time: the joining node
+inherits the departing node's groups and replays them, and the departing node,
+which the new configuration no longer names, walks what it still holds, confirms
+the new members have each version, then drops its registers and frees the slots.
+Since the member count is unchanged, no node's share moves. There is no way to
+give one node more of the zone than another, so there is nothing else to
+rebalance.
 
 For migration, a source asks directly linked catalog nodes to seal, ignores
 failed sends, persists its own seal, then repeatedly walks the extent and sends

@@ -18,16 +18,12 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 
 use racer::config::Config;
 
-const NODES: u32 = 6;
+const NODES: u32 = 7;
 const ROOT: &str = "/tmp/racer-e2e";
 const FS_BYTES: u64 = 2 << 30;
 const IMG_BYTES: u64 = 1 << 30;
 const PAGE: usize = 4096;
 const HUGE: usize = 4 << 20;
-
-/// Hash slots in a zone, and the ceiling the smaller half of the cluster declares.
-const SLOTS: u64 = 16384;
-const SMALL_SHARE: u64 = SLOTS * 3 / 4;
 
 /// Volume ids, in config order.
 const LWW: u32 = 1;
@@ -473,19 +469,19 @@ fn write_occ(dev: &Dev, off: u64, page: &[u8]) {
 // configuration
 // ---------------------------------------------------------------------------
 
-/// Two groups over six nodes, one member per cohort. Every node exports every volume,
-/// so any page is reachable through any node — and for half of them that node is not in
-/// the owning group, which is what the forwarding rules exist for.
+/// Two groups over six members, with node 7 spare. Every node exports every volume, so
+/// any page is reachable through any node - and for half of them that node is not in the
+/// owning group, which is what the forwarding rules exist for.
 ///
-/// Nodes 1..3 declare a ceiling of three quarters of the zone and 4..6 the whole of it,
-/// so their devices are formatted to different sizes off one set of volumes.
+/// The catalog is balanced, as a zone's catalog must be: each of the six members holds
+/// one of the six seats, so every device is formatted to the same size off one set of
+/// volumes. Node 7 holds nothing yet and sizes itself for the share it would inherit.
 fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     let mut s = format!(
-        "generation {generation}\nnode id={} zone=1 cohort={} device={} cache_4k=16777216 cache_4m=33554432 max_share={}\n",
+        "generation {generation}\nnode id={} zone=1 cohort={} device={} cache_4k=16777216 cache_4m=33554432\n",
         n.id,
         (n.id - 1) % 3,
         n.img.display(),
-        if n.id <= 3 { SMALL_SHARE } else { SLOTS },
     );
     for (id, dev) in peers {
         s += &format!("peer id={id} device={}\n", dev.display());
@@ -497,8 +493,7 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     for g in catalog() {
         s += &format!("group {} {} {}\n", g[0], g[1], g[2]);
     }
-    s += "slots round_robin\n\
-          volume 1 slot=1\n\
+    s += "volume 1 slot=1\n\
             extent pages=4096 kind=lww zone=1\n\
           volume 2 slot=2\n\
             extent pages=512 kind=occ zone=1\n\
@@ -509,8 +504,9 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     s
 }
 
-/// The catalog every generation is written with. A rebalance rewrites it, so it is state
-/// the control plane holds rather than a constant, and the test is its control plane.
+/// The catalog every generation is written with. Replacing a member rewrites it, so it is
+/// state the control plane holds rather than a constant, and the test is its control
+/// plane.
 static CATALOG: std::sync::Mutex<Vec<[u32; 3]>> = std::sync::Mutex::new(Vec::new());
 
 fn catalog() -> Vec<[u32; 3]> {
@@ -673,7 +669,7 @@ fn six_node_cluster() {
     std::fs::create_dir_all(ROOT).unwrap();
     set_catalog(&[[1, 2, 3], [4, 5, 6]]);
 
-    // ---- bring six nodes up with no peers: their fabric devices do not exist yet ----
+    // ---- bring seven nodes up with no peers: their fabric devices do not exist yet ----
     let mut nodes: Vec<Node> = (1..=NODES).map(build_node).collect();
     for n in &mut nodes {
         let text = config_text(1, n, &[]);
@@ -685,8 +681,9 @@ fn six_node_cluster() {
     wire(&mut nodes, 2, &(0..NODES as usize).collect::<Vec<_>>());
 
     let cfg = Config::parse(&config_text(2, &nodes[0], &[])).unwrap();
-    // Node 1 is in group 0 and node 6 in group 1, so for each of these pages one holds
-    // the register and the other must go through the fabric.
+    // Node 1 is in group 0 and node 6 in group 1, so for each of these pages one of them
+    // holds the register and the other must go through the fabric. Node 7 is spare and
+    // holds neither.
     let held = page_in(&cfg, LWW, 0);
     let remote = page_in(&cfg, LWW, 1);
 
@@ -852,21 +849,19 @@ fn six_node_cluster() {
         "nothing rejected yet"
     );
 
-    // ---- capacity: a device is sized from its declared ceiling, not the namespace ----
-    // Both nodes are in one group of two, so both serve half the zone; node 1 declared a
-    // ceiling of three quarters and node 4 the whole of it, and the slabs follow.
-    assert_eq!(m.get("racer_share_slots"), SLOTS / 2, "one group of two");
-    assert_eq!(m.get("racer_max_share_slots"), SMALL_SHARE);
-    let big = scrape(&nodes[3]);
-    assert_eq!(big.get("racer_share_slots"), SLOTS / 2, "the same share");
-    assert_eq!(big.get("racer_max_share_slots"), SLOTS);
-    let big_slots = big.get("racer_alloc_slots{class=\"small\"}");
-    let ratio = slots * 100 / big_slots;
-    assert!(
-        (70..=80).contains(&ratio),
-        "a three-quarter ceiling must give roughly three quarters of the slots: \
-         {slots} against {big_slots}"
-    );
+    // ---- capacity: the nodes of a zone are homogeneous, so every device is the same --
+    // Off one set of volumes, an equal share means an identical slab on every node,
+    // members and spare alike: the spare is sized for the share it would inherit, which
+    // is what lets it stand in for any member without reformatting.
+    for (i, n) in nodes.iter().enumerate() {
+        let their_slots = scrape(n).get("racer_alloc_slots{class=\"small\"}");
+        assert_eq!(
+            their_slots,
+            slots,
+            "node {} formatted {their_slots} small slots against node 1's {slots}",
+            i + 1
+        );
+    }
 
     // A config the node must refuse: it parses and validates on its own and is wrong
     // only against the generation already running. Nobody is left to return an error to,
@@ -996,52 +991,52 @@ fn six_node_cluster() {
         "rebuilding one group must not touch another"
     );
 
-    // ---- rebalance: a share moves by moving catalog membership -------------------
-    // The ceiling is enforced, not advisory. Putting node 1 in both groups would give it
-    // the whole zone, which is more than its device was formatted for.
-    set_catalog(&[[1, 2, 3], [1, 5, 6]]);
-    let over = Config::parse(&config_text(generation + 1, &nodes[0], &[])).unwrap();
+    // ---- replacement: a member is swapped for the spare, at the same share ---------
+    // Balance is enforced, not advisory. Handing node 1 the seat node 6 held leaves it
+    // with two of the six and five nodes to share them, which no equal split fits, so
+    // the zone's nodes would no longer be interchangeable.
+    set_catalog(&[[1, 2, 3], [4, 5, 1]]);
+    let skewed = Config::parse(&config_text(generation + 1, &nodes[0], &[])).unwrap();
     assert!(
-        over.validate().is_err(),
-        "a share above the device's ceiling must be refused"
+        skewed.validate().is_err(),
+        "an unbalanced catalog must be refused"
     );
 
-    // Node 1 hands group 0 to node 4, which is formatted for the whole zone. Slots are
-    // untouched — the group keeps every address it had, and only its members change.
+    // Node 7 takes over from node 1 wholesale: every seat node 1 held, and no others, so
+    // the zone stays balanced at one seat each. The catalog keeps its length, so the
+    // groups keep every address they had and only their members change.
     let before = scrape(&nodes[0]).get("racer_alloc_free_slots{class=\"small\"}");
-    set_catalog(&[[4, 2, 3], [4, 5, 6]]);
+    set_catalog(&[[7, 2, 3], [4, 5, 6]]);
     generation += 1;
     wire(
         &mut nodes,
         generation,
         &(0..NODES as usize).collect::<Vec<_>>(),
     );
+    // The share never moved: it is the member count that sets it, and a swap leaves that
+    // alone. Neither node has to reformat to trade places.
     assert_eq!(
-        scrape(&nodes[0]).get("racer_share_slots"),
-        0,
-        "node 1 holds none of the zone"
-    );
-    assert_eq!(
-        scrape(&nodes[3]).get("racer_share_slots"),
-        SLOTS,
-        "node 4 holds all of it"
+        scrape(&nodes[6]).get("racer_alloc_slots{class=\"small\"}"),
+        slots,
+        "a replacement must not resize the zone"
     );
 
-    // Node 4 replays the group from 2 and 3; node 1 gives up only what it can see all
-    // three of the new members holding, so the two halves finish in that order.
+    // Node 7 replays group 0 from its surviving members; node 1 gives up only what it can
+    // see all three of the group's new members holding, so the two halves finish in that
+    // order.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         let out = scrape(&nodes[0]);
         let dropped = out.get("racer_heal_dropped_total");
         let shedding = out.get("racer_heal_groups_shedding");
-        let replaying = scrape(&nodes[3]).get("racer_heal_groups_replaying");
+        let replaying = scrape(&nodes[6]).get("racer_heal_groups_replaying");
         if dropped > 0 && shedding == 0 && replaying == 0 {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "rebalance stalled: node 1 dropped {dropped} with {shedding} groups left, \
-             node 4 replaying {replaying}"
+            "replacement stalled: node 1 dropped {dropped} with {shedding} groups left, \
+             node 7 replaying {replaying}"
         );
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
@@ -1058,7 +1053,7 @@ fn six_node_cluster() {
         assert_eq!(
             &outside.read(p * 4096, PAGE).unwrap(),
             v,
-            "page {p} lost in the rebalance"
+            "page {p} lost in the replacement"
         );
         // And the node that gave its share away still serves the pages, by forwarding.
         assert_eq!(

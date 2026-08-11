@@ -62,9 +62,8 @@ message Node {
   // crossing into their site.
   uint32 site = 2;
 
-  // The fault domain within the site, ~300 nodes. `Topology.catalog` and
-  // `Topology.group_slots` describe this zone and no other. Must not also appear in
-  // `Topology.zones`.
+  // The fault domain within the site, ~300 nodes. `Topology.catalog` describes this
+  // zone and no other. Must not also appear in `Topology.zones`.
   uint32 zone = 3;
 
   // The column of every catalog group that is our cooperative-cache roster: cohort `c`
@@ -150,18 +149,6 @@ message Device {
   // the whole of what is left.
   uint64 max_iops          = 4;
   uint64 max_bytes_per_sec = 5;
-
-  // The largest share of this zone this node will ever be given, out of 16384 slots. A
-  // node's live share is how many slots hash into a catalog group it belongs to, and
-  // the device is sized from this ceiling rather than that share: slots are appended
-  // only at startup, so sizing that tracked the live share would leave a node short
-  // until it was restarted every time the control plane moved a group to it.
-  //
-  // A config whose live share exceeds this is refused. The control plane owes each zone
-  // `sum(max_share_slots) >= 3 * 16384` across its nodes, which is not checkable here —
-  // no node sees another's device. Raising this is what makes a restart append slots,
-  // and on a block device the operator must enlarge the namespace first.
-  uint32 max_share_slots = 6;
 }
 
 // ---- topology ---------------------------------------------------------------------
@@ -176,31 +163,31 @@ message Topology {
   // The consensus groups of this zone; an entry's index is its group id. Each is three
   // distinct, non-zero nodes. ~300 entries.
   //
-  // At most one group may differ between consecutive generations, counting a change in
-  // length: the catalog moves one node at a time. A node that has missed generations is
-  // held to no such step — it is being handed a settled state, not a transient.
-  //
-  // This is also where capacity lives. A node's share of the zone is the fraction of
-  // slots pointing at a group it belongs to, so a small device is given fewer groups
-  // and a large one more; the granularity is one group. Sizing a device for that share
-  // is the only capacity model there is, and a node whose share exceeds the ceiling in
-  // its own `Device` refuses the config.
-  repeated Trio catalog = 2;
-
-  // Exactly 16384 entries, each a valid index into `catalog`. An address is hashed to a
-  // slot with a fixed function, and this table says which group owns that slot.
-  //
-  // Fixed for the life of the zone, and a reload that changes it is refused. The hash
-  // cannot move, because every node must land on the same slot for the same address
-  // without exchanging tables, and the slot rather than the group is what travels on
-  // the wire. Neither can the table: the group a slot names also selects the core that
+  // An address is hashed to one of 16384 slots with a fixed function, and the slot
+  // rather than the group is what travels on the wire; the group that owns it is
+  // `slot % len(catalog)`. So the length is fixed for the life of the zone and a reload
+  // that changes it is refused: the group a slot lands on also selects the core that
   // serves the address and the key anti-entropy accumulates digests under, and nothing
   // moves pages between groups. Ownership moves by changing a group's members instead,
   // which every one of those derivations survives.
   //
-  // In practice: a flat round robin over the catalog, laid down once when the zone is
-  // created. Its length sets the granularity of every capacity decision afterwards.
-  repeated uint32 group_slots = 3;
+  // The nodes of a zone are homogeneous, so the catalog must be balanced: every node it
+  // names appears in exactly `3 * len(catalog) / n` groups, where `n` is the number of
+  // distinct nodes named, and `n` must divide `3 * len(catalog)`. A catalog that gives
+  // one node more groups than another is refused. There is no other capacity model: a
+  // node sizes its device from that equal share, so every node of a zone formats
+  // identically and any of them can be replaced by any other.
+  //
+  // Between consecutive generations the set of members may differ by at most one id:
+  // the catalog replaces one node at a time. The newcomer inherits the departing node's
+  // groups, replays them from its peers, and the departing node drops what it held once
+  // the new members confirm they have it. A node that has missed generations is held to
+  // no such step, since it is being handed a settled state rather than a transient.
+  //
+  // A node this catalog does not name is not a member of the zone. It is either being
+  // decommissioned, and runs the config that drops it in order to drain, or it only
+  // routes for others.
+  repeated Trio catalog = 2;
 
   // The other zones in this site, with their entry nodes. Exactly the set an extent's
   // `zone` and `next_zone` may name besides our own, which keeps placement intra-site
@@ -351,10 +338,11 @@ message Policy {
   // it will push per extent while handing one to another zone. Absent means the default,
   // 4096. Zero is refused.
   //
-  // This is the rate a rebalance runs at. A group being replayed is a group running two
-  // of three with no fault tolerance left, so the window wants to be short; against that,
-  // every register costs a prepare round at the whole group, and the members sourcing it
-  // are serving clients. Raise it to drain a campaign faster on a cluster with headroom,
-  // lower it to keep a rebalance out of the way of the write path.
+  // This is the rate a member replacement runs at. A group being replayed is a group
+  // running two of three with no fault tolerance left, so the window wants to be short;
+  // against that, every register costs a prepare round at the whole group, and the
+  // members sourcing it are serving clients. Raise it to finish a replacement or an
+  // extent handover faster on a cluster with headroom, lower it to keep either out of
+  // the way of the write path.
   optional uint32 repairs_per_replay = 4;
 }

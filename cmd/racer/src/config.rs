@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use prost::Message as _;
 
-/// Consensus group slots; `group_slots` has exactly this many entries.
+/// Consensus slots an address may hash to. The group that owns a slot is
+/// `slot % catalog.len()`, so this is the granularity every address is placed at.
 const SLOTS: usize = 16384;
 /// Volumes this node may export at once, and the ceiling on a volume's fabric slot.
 pub(crate) const MAX_VOLUMES: usize = 60;
@@ -237,7 +238,7 @@ impl Volume {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Node {
     pub(crate) id: u32,
     pub(crate) site: u32,
@@ -252,33 +253,8 @@ pub struct Node {
     /// per IO, and only at startup can it change.
     pub(crate) device_max_iops: u64,
     pub(crate) device_max_bytes_per_sec: u64,
-    /// The largest share of this zone this node may be given, out of `SLOTS`. The
-    /// device is sized from this rather than from the live share, because slots are
-    /// appended only at startup: a node whose slabs tracked its share would run short
-    /// every time the control plane moved a group to it, until it was restarted.
-    pub(crate) max_share_slots: u32,
     /// Nodes this one can reach directly, site crossings included.
     pub(crate) peers: Vec<Peer>,
-}
-
-impl Default for Node {
-    fn default() -> Node {
-        // An unset ceiling is the whole zone: a control plane that omits the field gets
-        // a node sized for every page in it, which is wasteful but never short.
-        Node {
-            id: 0,
-            site: 0,
-            zone: 0,
-            cohort: 0,
-            device: String::new(),
-            cache_bytes_4k: 0,
-            cache_bytes_4m: 0,
-            device_max_iops: 0,
-            device_max_bytes_per_sec: 0,
-            max_share_slots: SLOTS as u32,
-            peers: Vec::new(),
-        }
-    }
 }
 
 /// One end of a fabric link. There is no address, port or NQN here on purpose: the
@@ -311,10 +287,9 @@ pub(crate) struct Topology {
     /// trailer of every routed write (paxos.rs).
     pub(crate) epoch: u32,
     /// Index is the group id. Each entry is exactly three distinct node ids, ordered by
-    /// paxos member index, which is also the cohort column.
+    /// paxos member index, which is also the cohort column. Balanced: every node it
+    /// names holds the same number of groups, so the nodes of a zone are homogeneous.
     pub(crate) catalog: Vec<[u32; 3]>,
-    /// `SLOTS` entries, each an index into `catalog`.
-    group_slots: Vec<u32>,
     /// The other zones in this site. Placement is intra-site, so this plus our own is
     /// the set an extent's `zone` and `next_zone` may name.
     zones: Vec<Zone>,
@@ -332,7 +307,8 @@ pub(crate) struct Policy {
     /// The cache's `τ`, in requests per decay interval. Zero disables the cache.
     pub(crate) cache_target_rate: u32,
     /// Registers one anti-entropy sweep pulls while replaying a group, and pushes per
-    /// extent while handing one over. The rate a rebalance runs at (heal.rs).
+    /// extent while handing one over. The rate a member replacement and an extent
+    /// handover run at (heal.rs).
     pub(crate) repairs_per_replay: u32,
 }
 
@@ -396,17 +372,13 @@ impl Config {
         self.count_pages(true)
     }
 
-    /// This node's share of its zone, by class. A page is stored by the three members
-    /// of the group its slot points at, so what a node holds is the zone's pages scaled
-    /// by the fraction of slots that land on a group it belongs to.
-    ///
-    /// Scaled by the ceiling rather than the live share: see `Node::max_share_slots`.
-    /// The two agree on a node whose ceiling the control plane has filled.
+    /// This node's share of its zone, by class. The nodes of a zone are homogeneous, so
+    /// the zone's pages times three replicas, split evenly across the nodes the catalog
+    /// names. Identical on every node of the zone, which is what lets any of them stand
+    /// in for any other, and it does not move when the catalog swaps a member.
     fn count_pages(&self, huge: bool) -> u64 {
-        let share = self.node.max_share_slots.min(SLOTS as u32) as u64;
-        self.zone_pages(huge)
-            .saturating_mul(share)
-            .div_ceil(SLOTS as u64)
+        let nodes = self.zone_nodes().len().max(1) as u64;
+        self.zone_pages(huge).saturating_mul(3).div_ceil(nodes)
     }
 
     /// Pages this zone is responsible for, by class: extents homed here, plus those
@@ -426,31 +398,24 @@ impl Config {
             .sum()
     }
 
-    /// Slots of this zone that hash into a catalog group this node belongs to: its
-    /// share of the zone, out of `SLOTS`. Every slot is held by three nodes, so a
-    /// zone's shares sum to `3 * SLOTS`.
-    ///
-    /// This is the whole of the capacity model. A node is given less of the zone by
-    /// being put in fewer groups, which leaves `group_slots` alone and so leaves both
-    /// the allocator's core mapping and the digest key alone: a group never moves, only
-    /// its membership does.
-    pub(crate) fn share_slots(&self) -> u32 {
-        let t = &self.topology;
-        let mine: Vec<bool> = t
-            .catalog
-            .iter()
-            .map(|g| g.contains(&self.node.id))
-            .collect();
-        t.group_slots
-            .iter()
-            .filter(|&&g| *mine.get(g as usize).unwrap_or(&false))
-            .count() as u32
+    /// The nodes of this zone, sorted and deduplicated: exactly the ids the catalog
+    /// names, each of which holds the same number of groups. Our own id is among them
+    /// unless we are being decommissioned, in which case we are draining what we hold
+    /// to the members that replaced us.
+    pub(crate) fn zone_nodes(&self) -> Vec<u32> {
+        let mut nodes: Vec<u32> = self.topology.catalog.iter().flatten().copied().collect();
+
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
     }
 
-    /// The consensus group owning `addr`: the slot the address hashes into names it.
-    /// The group also picks the core that serves the address (alloc.rs).
+    /// The consensus group owning `addr`: the slot the address hashes into, folded over
+    /// the catalog. Nothing but the catalog's length enters into it, which is why that
+    /// length is frozen for the life of the zone. The group also picks the core that
+    /// serves the address (alloc.rs).
     pub fn group(&self, addr: u64) -> u32 {
-        self.topology.group_slots[self.slot_of(addr) as usize]
+        u32::from(self.slot_of(addr)) % self.topology.catalog.len().max(1) as u32
     }
 
     fn slot_of(&self, addr: u64) -> u16 {
@@ -545,16 +510,6 @@ impl Config {
         self.check_node()?;
         self.check_topology()?;
         self.check_volumes()?;
-        // The share is what the device was sized for, so a config that hands this node
-        // more of the zone than it declared room for is refused outright: taking it
-        // would mean joining groups whose pages there are no slots to hold.
-        let share = self.share_slots();
-        if share > self.node.max_share_slots {
-            return Err(bad(format!(
-                "share of {share} slots is over max_share_slots {}",
-                self.node.max_share_slots
-            )));
-        }
         // Refuse a working set we cannot index, rather than OOM. This and the volume
         // cap are the only checks that can fail on an internally consistent config, so
         // both name the limit they exceeded.
@@ -649,18 +604,28 @@ impl Config {
                 return Err(bad(format!("group {i} names node 0")));
             }
         }
-        if t.group_slots.len() != SLOTS {
+        // The nodes of a zone are homogeneous, so the catalog has to spread its groups
+        // evenly over them: each of the `n` nodes it names holds `3 * len / n`. Anything
+        // else is a control plane handing one node more of the zone than another, and
+        // there is no capacity model for that - every node here sizes its device for the
+        // same equal share, and any of them may replace any other.
+        let nodes = self.zone_nodes();
+        let seats = 3 * t.catalog.len();
+        if !seats.is_multiple_of(nodes.len()) {
             return Err(bad(format!(
-                "group_slots has {} entries, not {SLOTS}",
-                t.group_slots.len()
+                "{} groups do not divide evenly over {} nodes",
+                t.catalog.len(),
+                nodes.len()
             )));
         }
-        if let Some(&s) = t
-            .group_slots
-            .iter()
-            .find(|&&s| s as usize >= t.catalog.len())
-        {
-            return Err(bad(format!("group slot {s} is not in the catalog")));
+        let each = seats / nodes.len();
+        for id in nodes {
+            let held = t.catalog.iter().filter(|g| g.contains(&id)).count();
+            if held != each {
+                return Err(bad(format!(
+                    "node {id} holds {held} groups, not the {each} of an equal share"
+                )));
+            }
         }
         for z in &t.zones {
             if z.id == 0 {
@@ -778,40 +743,37 @@ impl Config {
                 self.generation, prev.generation
             )));
         }
-        // The slot table is frozen for the life of the zone. A slot names the group that
-        // owns its addresses, and that group is also the key the allocator shards on and
-        // the key anti-entropy accumulates digests under: repointing one would strand
-        // the pages in a core's stripe that no longer claims them and corrupt both
-        // groups' digests, and there is no mover between groups to repair it with.
-        // Capacity moves by changing who is *in* a group, which leaves all three alone.
-        if self.topology.group_slots != prev.topology.group_slots {
-            return Err(bad(
-                "group slots changed; the slot table is fixed for the zone",
-            ));
-        }
-        // The catalog moves one node at a time, so at most one group may differ; a
-        // larger step would put two groups in flux at once.
-        //
-        // Only between adjacent generations. A node that was down for a rebalance
-        // campaign is being handed the state that settled while it was away, not a
-        // transient, and holding it to a one-group step would make it reject every
-        // config from then on.
-        let adjacent = self.generation == prev.generation + 1;
-        let changed = self
-            .topology
-            .catalog
-            .iter()
-            .zip(&prev.topology.catalog)
-            .filter(|(a, b)| a != b)
-            .count()
-            + self
-                .topology
-                .catalog
-                .len()
-                .abs_diff(prev.topology.catalog.len());
-        if adjacent && changed > 1 {
+        // The catalog's length is frozen for the life of the zone. It is the only thing
+        // that maps a slot to the group owning its addresses, and that group is also the
+        // key the allocator shards on and the key anti-entropy accumulates digests
+        // under: refolding the slots would strand pages in a core's stripe that no
+        // longer claims them and corrupt both groups' digests, and there is no mover
+        // between groups to repair it with. Membership moves instead, which leaves all
+        // three alone.
+        if self.topology.catalog.len() != prev.topology.catalog.len() {
             return Err(bad(format!(
-                "{changed} catalog groups differ; at most one may change"
+                "catalog has {} groups, not the {} fixed for this zone",
+                self.topology.catalog.len(),
+                prev.topology.catalog.len()
+            )));
+        }
+        // One node at a time: the member set may gain at most one id and lose at most
+        // one. The newcomer inherits the departing node's groups, replays them, and the
+        // departing node drops what it held once the new members confirm it. A larger
+        // step would put the whole zone in flux at once.
+        //
+        // Only between adjacent generations. A node that was down while members were
+        // replaced is being handed the state that settled while it was away, not a
+        // transient, and holding it to a one-node step would make it reject every config
+        // from then on.
+        let adjacent = self.generation == prev.generation + 1;
+        let now = self.zone_nodes();
+        let was = prev.zone_nodes();
+        let joined = now.iter().filter(|id| !was.contains(id)).count();
+        let left = was.iter().filter(|id| !now.contains(id)).count();
+        if adjacent && (joined > 1 || left > 1) {
+            return Err(bad(format!(
+                "{joined} nodes join and {left} leave the catalog; at most one of each"
             )));
         }
         for old in &prev.volumes {
@@ -952,19 +914,11 @@ impl Config {
                 cache_bytes_4m: dev.cache_bytes_4m,
                 device_max_iops: dev.max_iops,
                 device_max_bytes_per_sec: dev.max_bytes_per_sec,
-                // Unset is the whole zone: a forgotten field over-sizes the device,
-                // where a literal zero would size it for nothing.
-                max_share_slots: if dev.max_share_slots == 0 {
-                    SLOTS as u32
-                } else {
-                    dev.max_share_slots
-                },
                 peers,
             },
             topology: Topology {
                 epoch: t.epoch,
                 catalog,
-                group_slots: t.group_slots,
                 zones: t
                     .zones
                     .into_iter()
@@ -1004,13 +958,11 @@ impl Config {
                     cache_bytes_4m: self.node.cache_bytes_4m,
                     max_iops: self.node.device_max_iops,
                     max_bytes_per_sec: self.node.device_max_bytes_per_sec,
-                    max_share_slots: self.node.max_share_slots,
                 }),
             }),
             topology: Some(pb::Topology {
                 epoch: self.topology.epoch,
                 catalog: self.topology.catalog.iter().map(pb_trio).collect(),
-                group_slots: self.topology.group_slots.clone(),
                 zones: self
                     .topology
                     .zones
@@ -1064,7 +1016,6 @@ impl Config {
     /// peer id=40 device=/dev/nvme4n1 site=3
     /// topology epoch=3
     /// group 1 2 3
-    /// slots round_robin
     /// zone id=2 entry=4,5,6
     /// policy max_index_bytes=8589934592
     /// volume 1 slot=0 tombstone_epoch=0
@@ -1078,7 +1029,6 @@ impl Config {
         let mut node = pb::Node::default();
         let mut topo = pb::Topology::default();
         let mut policy = pb::Policy::default();
-        let mut slots: Option<Vec<u32>> = None;
         for (n, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap().trim();
             if line.is_empty() {
@@ -1095,16 +1045,8 @@ impl Config {
                     let f = only(
                         &f,
                         &[
-                            "id",
-                            "site",
-                            "zone",
-                            "cohort",
-                            "device",
-                            "cache_4k",
-                            "cache_4m",
-                            "max_iops",
-                            "max_bps",
-                            "max_share",
+                            "id", "site", "zone", "cohort", "device", "cache_4k", "cache_4m",
+                            "max_iops", "max_bps",
                         ],
                     )
                     .map_err(at)?;
@@ -1118,7 +1060,6 @@ impl Config {
                         cache_bytes_4m: get_or(f, "cache_4m", 0).map_err(at)?,
                         max_iops: get_or(f, "max_iops", 0).map_err(at)?,
                         max_bytes_per_sec: get_or(f, "max_bps", 0).map_err(at)?,
-                        max_share_slots: get_or(f, "max_share", 0).map_err(at)? as u32,
                     });
                 }
                 "peer" => {
@@ -1140,13 +1081,6 @@ impl Config {
                     topo.zones.push(pb::Zone {
                         id: get(f, "id").map_err(at)? as u32,
                         entry: Some(list(f, "entry").and_then(as_trio).map_err(at)?),
-                    });
-                }
-                "slots" => {
-                    slots = Some(if rest.first() == Some(&"round_robin") {
-                        Vec::new() // filled below, once the catalog is complete
-                    } else {
-                        ids(&rest).map_err(at)?
                     });
                 }
                 "policy" => {
@@ -1197,11 +1131,6 @@ impl Config {
                 other => return Err(bad(format!("line {}: unknown key {other}", n + 1))),
             }
         }
-        let n_groups = topo.catalog.len().max(1);
-        topo.group_slots = match slots {
-            Some(s) if !s.is_empty() => s,
-            _ => (0..SLOTS).map(|i| (i % n_groups) as u32).collect(),
-        };
         p.node = Some(node);
         p.topology = Some(topo);
         p.policy = Some(policy);
@@ -1529,7 +1458,6 @@ mod tests {
         peer id=2 device=/dev/nvme2n1
         group 1 2 3
         group 4 5 6
-        slots round_robin
         zone id=2 entry=4,5,6
         volume 1 slot=0
           extent pages=100 kind=lww zone=1
@@ -1550,10 +1478,10 @@ mod tests {
         assert_eq!(c.generation, 7);
         assert_eq!(c.node.device, "/dev/nvme1n1");
         assert_eq!(c.node.cohort, 0);
-        assert_eq!(c.topology.group_slots.len(), SLOTS);
         assert_eq!(c.topology.zones[0].entry, [4, 5, 6]);
-        assert_eq!(c.small_pages(), 150);
-        assert_eq!(c.huge_pages(), 8);
+        // Six nodes over two groups, so three replicas of the zone split six ways.
+        assert_eq!(c.small_pages(), 75);
+        assert_eq!(c.huge_pages(), 4);
 
         let v = c.volume(1).unwrap();
         assert_eq!(v.pages(), 150);
@@ -1629,7 +1557,6 @@ mod tests {
             peer id=9 device=/dev/nvme9n1 gateway_for=2
             peer id=10 device=/dev/nvme10n1 gateway_for=2
             group 2 3 4
-            slots round_robin
             volume {} slot=0
               extent pages=64 kind=lww zone=1
             ",
@@ -1673,7 +1600,6 @@ mod tests {
             node id=9 site=1 zone=1 device=/dev/nvme1n1
             peer id=40 device=/dev/nvme9n1 site=2
             group 2 3 4
-            slots round_robin
             volume {} slot=0
               extent pages=64 kind=lww zone=1
             ",
@@ -1714,7 +1640,6 @@ mod tests {
             peer id=2 device=/dev/nvme2n1 site=2
             peer id=3 device=/dev/nvme3n1 gateway_for=2
             group 1 4 5
-            slots round_robin
             volume {} slot=0
               extent pages=64 kind=lww zone=1
             ",
@@ -1767,7 +1692,6 @@ mod tests {
         let b = Config::decode(&a.encode()).unwrap();
         b.validate().unwrap();
         assert_eq!(format!("{:?}", a.node), format!("{:?}", b.node));
-        assert_eq!(a.topology.group_slots, b.topology.group_slots);
         assert_eq!(a.topology.catalog, b.topology.catalog);
         assert_eq!(a.volumes[0].extents, b.volumes[0].extents);
         assert_eq!(a.policy.max_index_bytes, b.policy.max_index_bytes);
@@ -1784,7 +1708,6 @@ mod tests {
         c.topology.catalog = (0..300)
             .map(|i| [3 * i + 1, 3 * i + 2, 3 * i + 3])
             .collect();
-        c.topology.group_slots = (0..SLOTS).map(|i| (i % 300) as u32).collect();
         assert!(c.encode().len() < 100 << 10, "{} B", c.encode().len());
     }
 
@@ -1856,63 +1779,95 @@ mod tests {
         assert!(d.validate_against(&a).is_err());
     }
 
+    /// Membership moves one node at a time, and the catalog's length never moves at
+    /// all.
     #[test]
-    fn catalog_moves_one_group_at_a_time() {
+    fn catalog_moves_one_node_at_a_time() {
         let a = sample();
+        // Node 7 takes node 1's group: one id in, one id out, and the shares stay even.
         let mut b = a.clone();
         b.generation = 8;
-        b.topology.catalog[0] = [1, 2, 7];
+        b.topology.catalog[0] = [7, 2, 3];
+        b.validate().unwrap();
         b.validate_against(&a).unwrap();
-        b.topology.catalog[1] = [4, 5, 8];
-        assert!(b.validate_against(&a).is_err());
+
+        // Two nodes swapped at once puts the whole zone in flux, however even the
+        // result is.
+        let mut c = b.clone();
+        c.topology.catalog[1] = [8, 5, 6];
+        c.validate().unwrap();
+        assert!(c.validate_against(&a).is_err());
 
         // Between adjacent generations only. A node that was down for a campaign is
         // being handed a settled state, not a transient, and refusing every file after
         // the gap would strand it for good.
-        b.generation = 12;
-        b.validate_against(&a).unwrap();
+        c.generation = 12;
+        c.validate_against(&a).unwrap();
 
-        // The slot table is not one of the things that ever moves. A repointed slot
-        // sends its addresses to a different allocator shard and a different digest,
-        // with nothing to carry the registers across.
-        let mut c = a.clone();
-        c.generation = 8;
-        c.topology.group_slots[0] = 1 - c.topology.group_slots[0];
-        assert!(c.validate_against(&a).is_err());
-        c.generation = 99;
+        // The catalog's length is not one of the things that ever moves. It is the whole
+        // of the map from a slot to the group that owns it, so refolding it sends
+        // addresses to a different allocator shard and a different digest, with nothing
+        // to carry the registers across.
+        let mut d = a.clone();
+        d.generation = 8;
+        d.topology.catalog.push([7, 8, 9]);
+        d.validate().unwrap();
+        assert!(d.validate_against(&a).is_err());
+        d.generation = 99;
         assert!(
-            c.validate_against(&a).is_err(),
+            d.validate_against(&a).is_err(),
             "a gap is not a licence to rehash"
         );
     }
 
-    /// A node's capacity is the share of its zone's slots that point at a group it is a
-    /// member of, and its device is sized from the ceiling that share may ever reach.
+    /// The nodes of a zone are homogeneous: each holds the same number of groups and
+    /// sizes its device for the same share, three replicas of the zone split evenly.
     #[test]
-    fn capacity_is_a_share_of_the_zones_slots() {
-        let mut c = sample();
-        // Two groups, flat round robin, and this node is in one of them.
-        assert_eq!(c.share_slots(), (SLOTS / 2) as u32);
-        // An unset ceiling is the whole zone, so this node provisions for all of it.
-        assert_eq!(c.node.max_share_slots, SLOTS as u32);
-        assert_eq!(c.small_pages(), 150);
-
-        // Halve the ceiling and it provisions for half.
-        c.node.max_share_slots = (SLOTS / 2) as u32;
-        c.validate().unwrap();
+    fn capacity_is_an_equal_share_of_the_zone() {
+        let c = sample();
+        assert_eq!(c.zone_nodes(), vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(c.small_pages(), 75);
         assert_eq!(c.huge_pages(), 4);
 
-        // A share above the ceiling is refused rather than served until the device
-        // fills: the slots were never formatted for.
+        // The share does not depend on which node reads the config, which is what lets
+        // any member stand in for any other.
+        let mut d = c.clone();
+        d.node.id = 4;
+        assert_eq!(d.small_pages(), c.small_pages());
+        // Nor on being a member at all: a node draining after the catalog stopped naming
+        // it holds the same share it was formatted for.
+        d.node.id = 9;
+        assert_eq!(d.small_pages(), c.small_pages());
+
+        // Three nodes over one group each hold the whole zone.
+        let mut e = sample();
+        e.topology.catalog = vec![[1, 2, 3]];
+        e.validate().unwrap();
+        assert_eq!(e.small_pages(), 150);
+        assert_eq!(e.huge_pages(), 8);
+    }
+
+    /// A catalog that gives one node more groups than another is a control plane trying
+    /// to weight the zone. There is no capacity model for it: every node sizes its device
+    /// for the same equal share, so a share it cannot hold has nowhere to go.
+    #[test]
+    fn an_unbalanced_catalog_is_refused() {
+        // Node 1 in both groups and node 4 in neither: five nodes cannot split six seats
+        // evenly however they are arranged.
+        let mut c = sample();
         c.topology.catalog[1] = [1, 5, 6];
-        assert_eq!(c.share_slots(), SLOTS as u32);
         assert!(c.validate().is_err());
 
-        // A group this node is not in contributes nothing to its share.
+        // Evenly divisible and still lopsided: node 1 holds three of the twelve seats
+        // where an equal share is two.
         let mut d = sample();
-        d.topology.catalog[0] = [7, 2, 3];
-        assert_eq!(d.share_slots(), 0);
+        d.topology.catalog = vec![[1, 2, 3], [1, 2, 3], [4, 5, 6], [1, 5, 6]];
+        assert!(d.validate().is_err());
+
+        // The same twelve seats spread evenly are fine.
+        let mut e = sample();
+        e.topology.catalog = vec![[1, 2, 3], [4, 5, 6], [1, 2, 4], [3, 5, 6]];
+        e.validate().unwrap();
     }
 
     #[test]

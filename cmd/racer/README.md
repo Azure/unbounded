@@ -27,7 +27,7 @@ It allocates and replicates 4KB and 4MB pages striped across large (100k+ node) 
 ## Cluster Architecture
 
 - __Sites__: map to Unbounded sites e.g. routing boundaries
-- __Zones__: groups of ~1000 nodes within a single site
+- __Zones__: groups of ~1000 homogeneous nodes within a single site
 - __Groups__: consensus groups of 3 nodes within the same zone
 
 ### Sites
@@ -39,6 +39,8 @@ Sites communicate through ordinary nodes that hold a link into another site, sim
 Nodes within a particular zone __always__ share a direct connection, typically using RDMA.
 Across zones, there is no guarantee of direct connectivity - clients may need to jump through an additional neighbor.
 These additional hops are actually important: they fan out read capacity for hot pages, since intermediate nodes can cache the values that they proxy.
+
+Nodes within a zone are __homogeneous__. Every node belongs to the same number of groups, so every node stores the same share of the zone.
 
 ### Groups
 

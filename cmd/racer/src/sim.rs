@@ -605,6 +605,18 @@ impl Sim {
         for i in 0..opts.nodes {
             let cfg = Config::parse(&sim.config_text(i + 1))?;
             cfg.validate()?;
+            // The nodes of a zone are homogeneous, so every one of them plans the same
+            // device. A simulation that drifted off that would be exercising a cluster
+            // the schema cannot describe.
+            if let Some(first) = sim.nodes.first() {
+                assert_eq!(
+                    (cfg.small_pages(), cfg.huge_pages()),
+                    (first.cfg.small_pages(), first.cfg.huge_pages()),
+                    "node {} plans a different device to node 1",
+                    i + 1
+                );
+            }
+
             crate::layout::format(Path::new(&cfg.node.device), &cfg)?;
             sim.nodes.push(NodeState {
                 id: i + 1,
@@ -623,7 +635,8 @@ impl Sim {
     // ---------------------------------------------------------------- topology
 
     /// Consensus groups: every window of three consecutive nodes, so each node sits in
-    /// three groups and no group repeats a member.
+    /// three groups and no group repeats a member. One group per node, which is what
+    /// makes the catalog balanced: `3 * n` seats spread three apiece.
     fn group(&self, g: u32) -> [u32; 3] {
         let n = self.opts.nodes;
         [g % n + 1, (g + 1) % n + 1, (g + 2) % n + 1]
@@ -662,7 +675,6 @@ impl Sim {
             let m = self.group(g);
             t.push_str(&format!("group {} {} {}\n", m[0], m[1], m[2]));
         }
-        t.push_str("slots round_robin\n");
         // The index ceiling is a real check; give it room for the volume we declare.
         let idx = o.pages * crate::alloc::INDEX_BYTES_PER_PAGE + (1 << 20);
         t.push_str(&format!(

@@ -1942,7 +1942,6 @@ mod tests {
             group 16 17 18
             group 19 20 21
             group 22 23 24
-            slots round_robin
             volume 1 slot=0
               extent pages=4096 kind=lww zone=1
             volume 2 slot=1

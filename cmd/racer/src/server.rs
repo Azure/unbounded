@@ -38,10 +38,6 @@ pub struct Dataplane {
     heal: &'static Heal,
     volumes: Vec<Volume>,
     fabric: Volume,
-    /// This node's share of its zone's slots. Counting it is a scan of the whole slot
-    /// table and the answer only moves when a configuration is installed, so it is
-    /// taken once here rather than on every metrics tick.
-    share_slots: u32,
 }
 
 impl Dataplane {
@@ -102,7 +98,6 @@ impl Node {
             runtime::Limiter::new(cfg.node.device_max_iops, cfg.node.device_max_bytes_per_sec);
         let disk = c.disk(&dev, None, Some(limit))?;
         let cores = c.cores();
-        let share_slots = cfg.share_slots();
         // Declare everything the new config asks for *before* publishing it anywhere. A
         // failure below is a rejected config: the runtime discards the build, so the
         // allocator must still be reading the config that is actually running.
@@ -162,7 +157,6 @@ impl Node {
             heal,
             volumes,
             fabric,
-            share_slots,
         })
     }
 }
@@ -259,10 +253,6 @@ fn sample(d: &Dataplane) {
         s.config_rejected = config::rejected();
         s.topology_epoch = cfg.topology.epoch as u64;
         s.node_id = cfg.node.id as u64;
-        // What the control plane sizes a rebalance against: the share it has given this
-        // node, and the ceiling the device was formatted for.
-        s.share_slots = d.share_slots as u64;
-        s.max_share_slots = cfg.node.max_share_slots as u64;
         s.workers = a.cores() as u64;
         s.volumes = cfg.volumes.len() as u64;
         s.peers = cfg.node.peers.len() as u64;
@@ -932,7 +922,6 @@ mod tests {
             group 1 12 13
             group 1 14 15
             group 1 16 17
-            slots round_robin
             zone id=2 entry=2,3,4
             volume 1 slot=5
               extent pages=4096 kind=lww zone=1
