@@ -140,6 +140,14 @@ Entries are therefore modify-only unless you name the addition:
                     image: fluent/fluent-bit:3.1
 ```
 
+If a later release adds an operator container with the same name as your
+sidecar, the entry starts failing on upgrade: `addContainers` names something
+that now exists, which is an error rather than a silent merge into the
+operator's container. The workload keeps the spec it had, and the Site reports
+`Degraded` naming the file, entry index and container. Rename your sidecar and
+it reconciles again. Prefixing sidecar names with something of your own is the
+cheapest way to never meet this.
+
 ### Scheduling is added to, not replaced
 
 `nodeSelector`, `tolerations` and `affinity` are combined with the operator's own
@@ -208,6 +216,31 @@ pass DHCP interface flags through `extraArgs`.
 Anything not listed as overridable is rejected. Within a permitted subtree such
 as `resources` or `securityContext`, fields added by future Kubernetes releases
 are accepted.
+
+## Annotating a ServiceAccount
+
+Overrides reach Deployments and DaemonSets only, so they cannot annotate a
+ServiceAccount. You do not need them to: **annotations you add to a component
+ServiceAccount are preserved.**
+
+```bash
+kubectl annotate serviceaccount -n unbounded-system unbounded-net-controller \
+  azure.workload.identity/client-id=00000000-0000-0000-0000-000000000000
+```
+
+This is what workload identity needs on every cloud
+(`azure.workload.identity/client-id`, `eks.amazonaws.com/role-arn`,
+`iam.gke.io/gcp-service-account`), and it survives every reconcile.
+
+The mechanism is worth knowing, because it tells you where the boundary is. The
+operator applies its ServiceAccounts with server-side apply and declares a name,
+a namespace and labels. It declares **no annotations**, so it owns no key in
+that map, and an apply cannot remove a field it does not declare. Your
+annotation is owned by whatever wrote it and is left alone.
+
+The same reasoning says what is *not* safe: a label the operator declares is
+reverted, because it owns that key. This guarantee is covered by an end-to-end
+test against a real API server, so a future release cannot quietly take it away.
 
 ## Checking your work
 

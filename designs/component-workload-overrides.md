@@ -473,8 +473,21 @@ Having the operator stop declaring selected paths so another field manager can
 own them is elegant, requires no new API, and is the correct answer to "let VPA
 manage resources". It is not a general mechanism: it cannot add a sidecar or a
 volume, it requires users to understand field managers, and it makes the
-operator's declared field set the configuration surface. It remains a good
-complement and is listed in [§17](#17-open-questions).
+operator's declared field set the configuration surface.
+
+It is **accepted as a future complement** rather than an alternative, and the
+shape is already visible in the implementation. The operator's ServiceAccounts
+demonstrate it working by accident: they declare a name, a namespace and labels
+and no annotations, so a user annotation for workload identity is owned by
+whoever wrote it and survives every reconcile
+([§8.6](#86-what-server-side-apply-leaves-to-the-user)). Doing the same
+deliberately for `containers[*].resources` would let VPA own them, with no
+override document at all.
+
+What that needs, and does not have yet, is a way to say which paths are
+disowned. It cannot be inferred: the operator has to stop emitting them, which
+is a per-component decision, and a disowned path that nobody claims leaves the
+field unset rather than defaulted.
 
 ### 5.4 Why not user-supplied mutating admission
 
@@ -946,6 +959,37 @@ Three layers for one property is deliberate. GVK escape is the difference
 between a damaged workload and a cluster-admin binding
 ([§4.2](#42-the-allowlist-is-an-integrity-control-not-a-security-control)), so
 it should not depend on any single check being correct.
+
+### 8.6 What server-side apply leaves to the user
+
+An earlier revision of this document listed ServiceAccount annotations as a gap,
+on the premise that the operator applies component ServiceAccounts with
+`ForceOwnership` and therefore reverts them. **That premise was wrong**, and it
+is worth correcting rather than deleting, because the reasoning generalises.
+
+`ForceOwnership` resolves conflicts on fields the applier **declares**. It
+cannot remove a field the applier never mentions. The component ServiceAccounts
+declare a name, a namespace and labels; not one of the eight declares
+`metadata.annotations`. Annotations are a granular map under server-side apply,
+so ownership is per key, and the operator owns none of them.
+
+A user annotating a component ServiceAccount for workload identity
+(`azure.workload.identity/client-id`, `eks.amazonaws.com/role-arn`,
+`iam.gke.io/gcp-service-account`) therefore keeps that annotation across every
+reconcile. This works today and needs no mechanism.
+
+The same rule draws the boundary in both directions, which is why it is stated
+here rather than treated as a curiosity:
+
+| | Outcome |
+|---|---|
+| A field the operator declares | Reclaimed on the next pass, which is what makes override removal revert ([§9.3](#93-invalid-overrides-skip-they-do-not-revert)) |
+| A field the operator does not declare | Left to whoever wrote it |
+
+It is asserted end to end against a real API server rather than left as
+reasoning, because it is exactly the kind of property that stays true until
+someone adds an annotation to a component manifest, and the user documentation
+makes a promise on the strength of it.
 
 ## 9. Failure and update semantics
 

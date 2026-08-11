@@ -57,6 +57,7 @@ const (
 	overrideSite     = "rack-a"
 	overrideWorkload = "override-e2e-agent"
 	overrideConfig   = "override-e2e-config"
+	overrideAccount  = "override-e2e-agent"
 )
 
 // overrideTestComponent plans a ConfigMap and an overridable DaemonSet,
@@ -87,9 +88,29 @@ func (c overrideTestComponent) Plan(
 			Object:    overrideTestConfigMap(env.Namespace),
 			Component: c.Name(),
 		},
+		component.Operation{
+			Kind:      component.OpApply,
+			Object:    overrideTestServiceAccount(env.Namespace),
+			Component: c.Name(),
+		},
 	)
 
 	return plan, component.Reconciled(), nil
+}
+
+// overrideTestServiceAccount mirrors the component ServiceAccounts the operator
+// really applies: labels, no annotations. The absence of annotations is the
+// whole point, so it is asserted rather than assumed.
+func overrideTestServiceAccount(namespace string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ServiceAccount",
+		"metadata": map[string]any{
+			"name":      overrideAccount,
+			"namespace": namespace,
+			"labels":    map[string]any{"app.kubernetes.io/name": "override-e2e"},
+		},
+	}}
 }
 
 func overrideTestWorkload(namespace string) *unstructured.Unstructured {
@@ -237,6 +258,10 @@ func TestOverridesAgainstRealAPIServer(t *testing.T) {
 
 	t.Run("competing field manager survives override removal", func(t *testing.T) {
 		assertCompetingManagerSurvives(ctx, t, fixture)
+	})
+
+	t.Run("user annotations on a ServiceAccount survive", func(t *testing.T) {
+		assertServiceAccountAnnotationsSurvive(ctx, t, fixture)
 	})
 }
 
@@ -551,6 +576,75 @@ func assertCompetingManagerSurvives(ctx context.Context, t *testing.T, f *overri
 	got := f.getDaemonSet(ctx, t)
 	if got.Labels["owned-by"] != "another-controller" {
 		t.Fatalf("labels = %v, want the competing manager's field preserved; the operator only reclaims what it declares", got.Labels)
+	}
+}
+
+// assertServiceAccountAnnotationsSurvive covers workload identity.
+//
+// Every cloud's workload identity integration works by annotating the
+// ServiceAccount: azure.workload.identity/client-id, eks.amazonaws.com/role-arn,
+// iam.gke.io/gcp-service-account. Overrides cannot reach ServiceAccounts, which
+// are not Deployments or DaemonSets, so whether this works at all rests
+// entirely on server-side apply semantics.
+//
+// It does work, and for a precise reason: the operator declares labels on its
+// ServiceAccounts and never declares annotations, so it owns no key in that
+// map. ForceOwnership resolves conflicts on declared fields; it cannot remove a
+// field the applier never mentions.
+//
+// That reasoning is exactly the kind that is right until someone adds an
+// annotation to a component manifest, so it is asserted against a real
+// apiserver rather than left as a comment. The documentation makes a promise to
+// users on the strength of this test.
+func assertServiceAccountAnnotationsSurvive(ctx context.Context, t *testing.T, f *overrideFixture) {
+	t.Helper()
+
+	f.reconcile(ctx, t)
+
+	key := client.ObjectKey{Namespace: overridesNamespace, Name: overrideAccount}
+
+	var account corev1.ServiceAccount
+	if err := f.client.Get(ctx, key, &account); err != nil {
+		t.Fatalf("get ServiceAccount: %v", err)
+	}
+
+	// The operator must not be declaring annotations, or the guarantee below
+	// rests on nothing.
+	if len(account.Annotations) != 0 {
+		t.Fatalf("the operator declares annotations %v on its ServiceAccount; "+
+			"user annotations are only safe while it declares none", account.Annotations)
+	}
+
+	// A user annotates it, as any workload identity setup instructs.
+	if account.Annotations == nil {
+		account.Annotations = map[string]string{}
+	}
+
+	account.Annotations["azure.workload.identity/client-id"] = "00000000-0000-0000-0000-000000000000"
+
+	if err := f.client.Update(ctx, &account); err != nil {
+		t.Fatalf("annotate ServiceAccount: %v", err)
+	}
+
+	// Several passes, because a single one could pass by luck of timing.
+	for range 3 {
+		f.reconcile(ctx, t)
+	}
+
+	var after corev1.ServiceAccount
+	if err := f.client.Get(ctx, key, &after); err != nil {
+		t.Fatalf("get ServiceAccount after reconcile: %v", err)
+	}
+
+	if after.Annotations["azure.workload.identity/client-id"] == "" {
+		t.Fatalf("the operator removed a user annotation it never declared; "+
+			"annotations = %v", after.Annotations)
+	}
+
+	// The operator's own field is still reconciled, so this is not simply the
+	// operator having stopped managing the object.
+	if after.Labels["app.kubernetes.io/name"] != "override-e2e" {
+		t.Fatalf("labels = %v, want the operator's own field still owned", after.Labels)
 	}
 }
 
