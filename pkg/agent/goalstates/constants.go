@@ -34,6 +34,7 @@ const (
 	NSpawnLifecycleBinaryPath    = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
 	DaemonRecoveryScriptPath     = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
+	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
 
 	EnvDaemonBinary                 = "UNBOUNDED_AGENT_DAEMON_BINARY"
 	EnvDaemonBinaryBlue             = "UNBOUNDED_AGENT_DAEMON_BINARY_BLUE"

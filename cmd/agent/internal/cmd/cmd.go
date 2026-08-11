@@ -31,6 +31,7 @@ func Run() {
 		newCmdReset(cmdCtx),
 		newCmdVersion(),
 		newCmdNSpawnLifecycle(cmdCtx),
+		newCmdHostAgentUpgrade(cmdCtx),
 		newCmdRecordAgentUpgradeFailureSignal(),
 	)
 

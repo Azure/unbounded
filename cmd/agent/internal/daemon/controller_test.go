@@ -22,6 +22,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -135,11 +136,28 @@ func fakeStatusClient(objs ...client.Object) client.Client {
 func newTestMachinaMachineOperationReconciler(t *testing.T, c client.Client, op nodeOperator) *daemon.MachinaMachineOperationReconciler {
 	t.Helper()
 
+	return newTestMachinaMachineOperationReconcilerWithLockPath(
+		t,
+		c,
+		op,
+		filepath.Join(t.TempDir(), "agent-upgrade.lock"),
+	)
+}
+
+func newTestMachinaMachineOperationReconcilerWithLockPath(
+	t *testing.T,
+	c client.Client,
+	op nodeOperator,
+	lockPath string,
+) *daemon.MachinaMachineOperationReconciler {
+	t.Helper()
+
 	target := &machineOperationTarget{
-		Client:       c,
-		log:          discardLogger(),
-		machineName:  "test-machine",
-		nodeOperator: op,
+		Client:               c,
+		log:                  discardLogger(),
+		machineName:          "test-machine",
+		nodeOperator:         op,
+		agentUpgradeLockPath: lockPath,
 	}
 
 	reconciler, err := daemon.NewMachinaMachineOperationReconciler(
@@ -291,6 +309,40 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 	require.NotNil(t, updated.Status.StartedAt)
 	require.NotNil(t, updated.Status.CompletedAt)
 	assert.NoFileExists(t, signalPath)
+}
+
+func TestReconcileAgentUpgrade_WaitsForActivationLock(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "agent-upgrade.lock")
+	lock, err := agentbinary.AcquireHostActivationLock(lockPath)
+	require.NoError(t, err)
+
+	defer lock.Close() //nolint:errcheck // test cleanup
+
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
+	machineOp := &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+			Parameters: map[string]string{
+				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+			},
+		},
+	}
+
+	op := &fakeNodeOperator{}
+	c := fakeStatusClient(machine, machineOp)
+	reconciler := newTestMachinaMachineOperationReconcilerWithLockPath(t, c, op, lockPath)
+
+	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
+	require.NoError(t, err)
+	assert.Equal(t, agentUpgradeLockRetryDelay, result.RequeueAfter)
+	assert.False(t, op.stageUpgradeCalled)
+	assert.False(t, op.restartAgentCalled)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	assert.Empty(t, updated.Status.Phase)
 }
 
 func TestReconcileAgentUpgrade_MissingDownloadURL(t *testing.T) {
