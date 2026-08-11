@@ -509,3 +509,138 @@ func TestPermittedAndProtectedPathsAreExported(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateRejectsYAMLTimestamps is a regression test for a crash.
+//
+// yaml.v3 resolves unquoted dates to time.Time, and apimachinery's
+// DeepCopyJSONValue panics on it exactly as it does on a plain int. A
+// nodeSelector value such as 2026-08-11 would therefore have taken the operator
+// down rather than produced an error.
+//
+// The timestamp is rejected rather than coerced: rewriting it to RFC3339 would
+// silently produce a value the user did not write.
+func TestValidateRejectsYAMLTimestamps(t *testing.T) {
+	_, err := Parse(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
+overrides:
+  - component: net
+    kind: DaemonSet
+    patch:
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              example.com/date: 2026-08-11
+`})
+	if err == nil {
+		t.Fatal("an unquoted YAML timestamp must be rejected, not passed through to panic later")
+	}
+
+	if !strings.Contains(err.Error(), "quote it") {
+		t.Fatalf("error = %q, want it to tell the user to quote the value", err)
+	}
+
+	// The quoted form is what the user meant, and must be accepted.
+	if _, err := Parse(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
+overrides:
+  - component: net
+    kind: DaemonSet
+    patch:
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              example.com/date: "2026-08-11"
+`}); err != nil {
+		t.Fatalf("a quoted date must be accepted: %v", err)
+	}
+}
+
+// TestValidateRejectsUncomparableMergeKeys is a regression test for a crash.
+//
+// strategicpatch compares merge keys with Go's == operator, which panics at
+// runtime on an uncomparable type. A patch containing
+// `env: [{name: [oops], value: x}]` reached that comparison and crash-looped
+// the operator, because containers[*].env is a permitted subtree and nothing
+// checked the type of the key itself.
+func TestValidateRejectsUncomparableMergeKeys(t *testing.T) {
+	cases := map[string]string{
+		"env name is a list": `
+component: net
+kind: DaemonSet
+patch:
+  spec:
+    template:
+      spec:
+        containers:
+          - name: node
+            env:
+              - name: [oops]
+                value: x
+`,
+		"container name is a map": `
+component: net
+kind: DaemonSet
+patch:
+  spec:
+    template:
+      spec:
+        containers:
+          - name: {oops: true}
+            image: x
+`,
+		"volumeMount mountPath is a list": `
+component: net
+kind: DaemonSet
+patch:
+  spec:
+    template:
+      spec:
+        containers:
+          - name: node
+            volumeMounts:
+              - name: v
+                mountPath: [oops]
+`,
+	}
+
+	for name, fragment := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := validateFragment(t, fragment)
+			if err == nil {
+				t.Fatal("an uncomparable merge key must be rejected before it reaches strategic merge")
+			}
+
+			if !strings.Contains(err.Error(), "strategic merge compares this value") {
+				t.Fatalf("error = %q, want it to explain why the type matters", err)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsNonStringLabelValues guards against a silent data loss.
+//
+// unstructured's GetAnnotations returns nil for a map holding any non-string
+// value, so after merging an integer annotation the operator would replace
+// every annotation on the object with its own bookkeeping rather than merging
+// into them.
+func TestValidateRejectsNonStringLabelValues(t *testing.T) {
+	cases := map[string]string{
+		"integer annotation":   "patch:\n  metadata:\n    annotations:\n      revision: 3\n",
+		"boolean label":        "patch:\n  metadata:\n    labels:\n      managed: true\n",
+		"integer nodeSelector": "patch:\n  spec:\n    template:\n      spec:\n        nodeSelector:\n          rack: 7\n",
+		"pod template label":   "patch:\n  spec:\n    template:\n      metadata:\n        labels:\n          tier: 2\n",
+	}
+
+	for name, patch := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := validateFragment(t, "component: net\nkind: DaemonSet\n"+patch)
+			if err == nil {
+				t.Fatal("a non-string label or annotation value must be rejected")
+			}
+
+			if !strings.Contains(err.Error(), "must be a string") {
+				t.Fatalf("error = %q", err)
+			}
+		})
+	}
+}

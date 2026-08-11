@@ -18,6 +18,7 @@ var schedulingPaths = [][]string{
 	{"spec", "template", "spec", "affinity"},
 	{"spec", "template", "spec", "tolerations"},
 	{"spec", "template", "spec", "nodeSelector"},
+	{"spec", "template", "spec", "topologySpreadConstraints"},
 }
 
 // merge applies a workload's contributors to it, in place.
@@ -42,7 +43,10 @@ func merge(workload *unstructured.Unstructured, contributors []SourcedEntry) err
 
 	for _, contributor := range contributors {
 		patch := deepCopyMap(contributor.Entry.Patch)
-		userScheduling.absorb(patch)
+
+		if err := userScheduling.absorb(patch); err != nil {
+			return fmt.Errorf("%s: %w", contributor.Source, err)
+		}
 
 		if len(patch) == 0 {
 			continue
@@ -189,9 +193,10 @@ func setOrClearSlice(workload *unstructured.Unstructured, value []any, fields ..
 
 // schedulingSet accumulates the scheduling constraints contributors ask for.
 type schedulingSet struct {
-	affinity     []map[string]any
-	tolerations  []any
-	nodeSelector map[string]any
+	affinity       []map[string]any
+	tolerations    []any
+	topologySpread []any
+	nodeSelector   map[string]any
 }
 
 func newSchedulingSet() *schedulingSet {
@@ -205,28 +210,52 @@ func newSchedulingSet() *schedulingSet {
 // carries no patchMergeKey, so a merge would replace the operator's terms
 // outright. metalman and storage rely on a mandatory per-Site node affinity, so
 // replacing it would let two Sites' workloads schedule onto the same nodes.
-func (s *schedulingSet) absorb(patch map[string]any) {
+func (s *schedulingSet) absorb(patch map[string]any) error {
 	for _, path := range schedulingPaths {
 		value, found, err := unstructured.NestedFieldNoCopy(patch, path...)
 		if err != nil || !found {
 			continue
 		}
 
-		switch path[len(path)-1] {
+		field := path[len(path)-1]
+
+		// A wrongly typed value is rejected rather than dropped. Removing it
+		// from the patch and failing the type assertion would leave the
+		// override hashed, reported Applied, and doing nothing at all.
+		switch field {
 		case "affinity":
-			if affinity, ok := value.(map[string]any); ok {
-				s.affinity = append(s.affinity, affinity)
+			affinity, ok := value.(map[string]any)
+			if !ok {
+				return fmt.Errorf("spec.template.spec.affinity must be a mapping, but holds %T", value)
 			}
+
+			s.affinity = append(s.affinity, affinity)
+
 		case "tolerations":
-			if tolerations, ok := value.([]any); ok {
-				s.tolerations = append(s.tolerations, tolerations...)
+			tolerations, ok := value.([]any)
+			if !ok {
+				return fmt.Errorf("spec.template.spec.tolerations must be a list, but holds %T", value)
 			}
+
+			s.tolerations = append(s.tolerations, tolerations...)
+
 		case "nodeSelector":
-			if selector, ok := value.(map[string]any); ok {
-				for key, entry := range selector {
-					s.nodeSelector[key] = entry
-				}
+			selector, ok := value.(map[string]any)
+			if !ok {
+				return fmt.Errorf("spec.template.spec.nodeSelector must be a mapping, but holds %T", value)
 			}
+
+			for key, entry := range selector {
+				s.nodeSelector[key] = entry
+			}
+
+		case "topologySpreadConstraints":
+			constraints, ok := value.([]any)
+			if !ok {
+				return fmt.Errorf("spec.template.spec.topologySpreadConstraints must be a list, but holds %T", value)
+			}
+
+			s.topologySpread = append(s.topologySpread, constraints...)
 		}
 
 		unstructured.RemoveNestedField(patch, path...)
@@ -235,6 +264,8 @@ func (s *schedulingSet) absorb(patch map[string]any) {
 	prune(patch, []string{"spec", "template", "spec"})
 	prune(patch, []string{"spec", "template"})
 	prune(patch, []string{"spec"})
+
+	return nil
 }
 
 // prune removes a map that became empty after scheduling was lifted out, so an
@@ -259,6 +290,7 @@ func captureScheduling(workload *unstructured.Unstructured) *schedulingSet {
 	}
 
 	captured.tolerations = nestedSlice(workload.Object, "spec", "template", "spec", "tolerations")
+	captured.topologySpread = nestedSlice(workload.Object, "spec", "template", "spec", "topologySpreadConstraints")
 
 	if selector := nestedMap(workload.Object, "spec", "template", "spec", "nodeSelector"); selector != nil {
 		captured.nodeSelector = selector
@@ -278,6 +310,17 @@ func applyScheduling(workload *unstructured.Unstructured, operator, user *schedu
 	if len(tolerations) > 0 {
 		if err := setNestedSlice(workload.Object, tolerations, "spec", "template", "spec", "tolerations"); err != nil {
 			return fmt.Errorf("set tolerations: %w", err)
+		}
+	}
+
+	// topologySpreadConstraints is treated as additive by conflict detection,
+	// so it has to actually be additive here. Leaving it to strategic merge
+	// would let two contributors sharing a topologyKey overwrite each other
+	// while conflict detection reported no disagreement.
+	spread := append(append([]any{}, operator.topologySpread...), user.topologySpread...)
+	if len(spread) > 0 {
+		if err := setNestedSlice(workload.Object, spread, "spec", "template", "spec", "topologySpreadConstraints"); err != nil {
+			return fmt.Errorf("set topologySpreadConstraints: %w", err)
 		}
 	}
 

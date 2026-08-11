@@ -523,3 +523,87 @@ func TestApplyExtraArgsFollowReplacedArgs(t *testing.T) {
 		t.Fatalf("args = %v, want %v", spec.Containers[0].Args, want)
 	}
 }
+
+// TestApplyRejectsMalformedScheduling guards against a silent no-op.
+//
+// Scheduling is lifted out of the patch before the strategic merge. An earlier
+// version removed it whether or not the type assertion succeeded, so a wrongly
+// typed affinity was dropped, the override was still hashed, and the Site
+// reported Applied for something that did nothing.
+func TestApplyRejectsMalformedScheduling(t *testing.T) {
+	cases := map[string]string{
+		"affinity is a string":     "            affinity: \"everywhere\"\n",
+		"tolerations is a mapping": "            tolerations:\n              key: edge\n",
+		"nodeSelector is a list":   "            nodeSelector:\n              - disktype=ssd\n",
+	}
+
+	for name, fragment := range cases {
+		t.Run(name, func(t *testing.T) {
+			workload := testWorkload("rack-a")
+			plan := planWith(workload, "storage", "rack-a")
+
+			entries, err := Parse(map[string]string{"overrides.yaml": doc(`  - component: storage
+    kind: DaemonSet
+    patch:
+      spec:
+        template:
+          spec:
+` + fragment)})
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+
+			report := Apply(plan, entries, []string{"rack-a"})
+			if !report.Failed() {
+				t.Fatal("malformed scheduling must fail rather than silently do nothing")
+			}
+		})
+	}
+}
+
+// TestApplyTopologySpreadIsAdditive closes a gap between two tables: conflict
+// detection exempted topologySpreadConstraints as additive, but the merge left
+// it to strategic merge, so two contributors sharing a topologyKey overwrote
+// each other while conflict detection reported no disagreement.
+func TestApplyTopologySpreadIsAdditive(t *testing.T) {
+	workload := testWorkload("rack-a")
+
+	_ = unstructured.SetNestedSlice(workload.Object, []any{
+		map[string]any{
+			"maxSkew":           int64(1),
+			"topologyKey":       "kubernetes.io/hostname",
+			"whenUnsatisfiable": "DoNotSchedule",
+		},
+	}, "spec", "template", "spec", "topologySpreadConstraints")
+
+	plan := planWith(workload, "storage", "rack-a")
+
+	constraint := func(key string) string {
+		return doc(`  - component: storage
+    kind: DaemonSet
+    patch:
+      spec:
+        template:
+          spec:
+            topologySpreadConstraints:
+              - maxSkew: 2
+                topologyKey: ` + key + `
+                whenUnsatisfiable: ScheduleAnyway
+`)
+	}
+
+	entries, err := Parse(map[string]string{"a.yaml": constraint("topology.kubernetes.io/zone")})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	report := Apply(plan, entries, []string{"rack-a"})
+	if report.Failed() {
+		t.Fatalf("Apply: %v", report.Err())
+	}
+
+	spec := podSpec(t, plan.Operations[0].Object)
+	if len(spec.TopologySpreadConstraints) != 2 {
+		t.Fatalf("constraints = %d, want the operator's and the user's", len(spec.TopologySpreadConstraints))
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -78,14 +79,17 @@ func Parse(data map[string]string) ([]SourcedEntry, error) {
 		}
 
 		for i, entry := range doc.Overrides {
-			// normalizeJSON always returns the same shape it was given, and a
-			// patch is always a map, so this assertion cannot fail.
-			normalized, ok := normalizeJSON(entry.Patch).(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("overrides key %q: entry %d has a malformed patch", key, i)
+			normalized, err := normalizeJSON(entry.Patch, "patch")
+			if err != nil {
+				return nil, fmt.Errorf("overrides key %q, entry %d: %w", key, i, err)
 			}
 
-			entry.Patch = normalized
+			patch, ok := normalized.(map[string]any)
+			if !ok && normalized != nil {
+				return nil, fmt.Errorf("overrides key %q, entry %d: patch must be a mapping", key, i)
+			}
+
+			entry.Patch = patch
 			entries = append(entries, SourcedEntry{Entry: entry, Source: Source{Key: key, Index: i}})
 		}
 	}
@@ -187,66 +191,103 @@ func walkNode(n *yaml.Node, visit func(*yaml.Node) error) error {
 	return nil
 }
 
-// normalizeJSON converts decoded YAML values to the types the unstructured
-// helpers accept.
+// normalizeJSON converts decoded YAML values to the types the Kubernetes
+// helpers accept, and rejects anything that cannot be represented.
 //
-// yaml.v3 decodes whole numbers as int, but k8s.io/apimachinery's
-// DeepCopyJSONValue accepts only int64 and panics on anything else. Without
-// this, the first user to write a patch containing an integer, such as
-// spec.replicas or a container port, would crash the operator rather than get
-// an error.
+// Two things make this necessary rather than pedantic. yaml.v3 decodes whole
+// numbers as int, but k8s.io/apimachinery's DeepCopyJSONValue accepts only
+// int64 and panics on anything else. It also resolves unquoted dates to
+// time.Time, which panics the same way, so `nodeSelector: {k: 2026-08-11}`
+// would take the operator down rather than produce an error.
 //
-// Normalizing here rather than at each use keeps every downstream consumer,
-// including validation, merging and hashing, working on one representation.
-func normalizeJSON(value any) any {
+// Timestamps are rejected rather than coerced. Rewriting one to RFC3339 would
+// silently produce a value the user did not write; almost always they meant a
+// string and forgot to quote it, and saying so is more useful than guessing.
+//
+// Normalizing here rather than at each use keeps validation, merging and
+// hashing working on one representation.
+func normalizeJSON(value any, path string) (any, error) {
 	switch typed := value.(type) {
+	case nil:
+		// Explicit nulls are rejected later, with a message that explains why
+		// deletion is not available.
+		return nil, nil
+
 	case map[string]any:
 		out := make(map[string]any, len(typed))
+
 		for key, element := range typed {
-			out[key] = normalizeJSON(element)
+			normalized, err := normalizeJSON(element, joinPath(path, key))
+			if err != nil {
+				return nil, err
+			}
+
+			out[key] = normalized
 		}
 
-		return out
+		return out, nil
 
 	case map[any]any:
-		// Defensive: a nested decode into an untyped map yields this shape.
+		// Defensive: a decode into an untyped map can yield this shape.
 		out := make(map[string]any, len(typed))
+
 		for key, element := range typed {
-			out[fmt.Sprintf("%v", key)] = normalizeJSON(element)
+			name := fmt.Sprintf("%v", key)
+
+			normalized, err := normalizeJSON(element, joinPath(path, name))
+			if err != nil {
+				return nil, err
+			}
+
+			out[name] = normalized
 		}
 
-		return out
+		return out, nil
 
 	case []any:
 		out := make([]any, len(typed))
+
 		for i, element := range typed {
-			out[i] = normalizeJSON(element)
+			normalized, err := normalizeJSON(element, path)
+			if err != nil {
+				return nil, err
+			}
+
+			out[i] = normalized
 		}
 
-		return out
+		return out, nil
+
+	case string, bool, int64, float64:
+		return value, nil
 
 	case int:
-		return int64(typed)
+		return int64(typed), nil
 	case int8:
-		return int64(typed)
+		return int64(typed), nil
 	case int16:
-		return int64(typed)
+		return int64(typed), nil
 	case int32:
-		return int64(typed)
+		return int64(typed), nil
 	case uint:
-		return int64(typed)
+		return int64(typed), nil
 	case uint8:
-		return int64(typed)
+		return int64(typed), nil
 	case uint16:
-		return int64(typed)
+		return int64(typed), nil
 	case uint32:
-		return int64(typed)
+		return int64(typed), nil
 	case uint64:
-		return int64(typed)
+		return int64(typed), nil
 	case float32:
-		return float64(typed)
+		return float64(typed), nil
+
+	case time.Time:
+		return nil, fmt.Errorf(
+			"%s holds a YAML timestamp (%s); quote it if you meant the string %q",
+			describePath(path), typed.Format(time.RFC3339), typed.Format("2006-01-02"))
 
 	default:
-		return value
+		return nil, fmt.Errorf("%s holds an unsupported YAML type %T", describePath(path), value)
 	}
 }

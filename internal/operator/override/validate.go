@@ -242,6 +242,12 @@ func walkPatchMap(value map[string]any, path string, node *pathNode, report func
 			reportReservedKeys(value[key], childPath, report)
 		}
 
+		if stringValuedPaths[childPath] {
+			reportNonStringValues(value[key], childPath, report)
+		}
+
+		reportMergeKeyTypes(value[key], childPath, report)
+
 		if child.subtree {
 			// Everything below a subtree is permitted, but nulls and directives
 			// still are not.
@@ -268,8 +274,14 @@ func walkPatchList(value []any, path string, node *pathNode, report func(string)
 		return
 	}
 
+	// Descend with an explicit wildcard segment so paths below a list read as
+	// spec.template.spec.containers.*.env, matching how the allowlist and the
+	// merge-key table are written. Without it the path collapses to
+	// containers.env and neither table matches.
+	elementPath := joinPath(path, wildcard)
+
 	for _, element := range value {
-		walkPatch(element, path, child, report)
+		walkPatch(element, elementPath, child, report)
 	}
 }
 
@@ -343,6 +355,90 @@ func reportReservedKeys(value any, path string, report func(string)) {
 			report(fmt.Sprintf("%s is reserved; the %s prefix carries operator config hashes, Site scoping and override visibility",
 				joinPath(path, key), ReservedPrefix))
 		}
+	}
+}
+
+// reportNonStringValues rejects non-string values in maps Kubernetes requires
+// to hold strings.
+//
+// Beyond being invalid, a single non-string makes unstructured's GetAnnotations
+// return nil for the whole map, so the operator would replace every annotation
+// with its own bookkeeping instead of merging into them.
+func reportNonStringValues(value any, path string, report func(string)) {
+	values, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		if _, isString := values[key].(string); isString || values[key] == nil {
+			continue
+		}
+
+		report(fmt.Sprintf("%s must be a string, but holds %T; quote the value",
+			joinPath(path, key), values[key]))
+	}
+}
+
+// reportMergeKeyTypes rejects a merge key of the wrong type.
+//
+// strategicpatch compares merge keys with Go's == operator, which panics on an
+// uncomparable type, so a list element whose key holds a slice or a map would
+// crash the operator during the merge rather than fail validation.
+func reportMergeKeyTypes(value any, path string, report func(string)) {
+	elements, ok := value.([]any)
+	if !ok {
+		return
+	}
+
+	spec, keyed := mergeKeyTypes[mergeKeyPathFor(path)]
+	if !keyed || spec.field == "" {
+		return
+	}
+
+	for _, element := range elements {
+		mapped, ok := element.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		raw, present := mapped[spec.field]
+		if !present {
+			report(fmt.Sprintf("%s has an entry with no %s; strategic merge needs it to identify the entry",
+				path, spec.field))
+
+			continue
+		}
+
+		if !matchesMergeKeyType(raw, spec.kind) {
+			report(fmt.Sprintf("%s entry has %s of type %T, want a %s; strategic merge compares this value and cannot handle other types",
+				path, spec.field, raw, spec.kind))
+		}
+	}
+}
+
+func matchesMergeKeyType(value any, kind string) bool {
+	switch kind {
+	case "string":
+		_, ok := value.(string)
+
+		return ok
+	case "number":
+		switch value.(type) {
+		case int64, float64:
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
 	}
 }
 

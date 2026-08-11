@@ -131,6 +131,45 @@ var protectedPaths = []struct {
 	{path: "status", reason: "status is owned by the workload controller, not by the operator"},
 }
 
+// mergeKeyTypes names the field each merge-keyed list is identified by, and the
+// type strategic merge requires it to hold.
+//
+// This is not cosmetic. strategicpatch compares merge keys with Go's ==
+// operator (patch.go:955, and findMapInSliceBasedOnKeyValue), which panics at
+// runtime on an uncomparable type. A patch containing
+// `env: [{name: [oops], value: x}]` would therefore crash-loop the operator
+// rather than be rejected, so the type is checked before the merge ever runs.
+var mergeKeyTypes = map[string]struct {
+	field string
+	kind  string
+}{
+	"spec.template.spec.containers":                    {field: "name", kind: "string"},
+	"spec.template.spec.initContainers":                {field: "name", kind: "string"},
+	"spec.template.spec.volumes":                       {field: "name", kind: "string"},
+	"spec.template.spec.imagePullSecrets":              {field: "name", kind: "string"},
+	"spec.template.spec.containers.*.env":              {field: "name", kind: "string"},
+	"spec.template.spec.initContainers.*.env":          {field: "name", kind: "string"},
+	"spec.template.spec.containers.*.volumeMounts":     {field: "mountPath", kind: "string"},
+	"spec.template.spec.initContainers.*.volumeMounts": {field: "mountPath", kind: "string"},
+	"spec.template.spec.containers.*.ports":            {field: "containerPort", kind: "number"},
+	"spec.template.spec.initContainers.*.ports":        {field: "containerPort", kind: "number"},
+	"spec.template.spec.tolerations":                   {field: "", kind: ""},
+}
+
+// stringValuedPaths are maps whose values Kubernetes requires to be strings.
+//
+// A non-string here is not merely invalid: unstructured's GetAnnotations and
+// GetLabels return nil for a map containing one, so the operator would silently
+// replace every annotation on the object with its own bookkeeping rather than
+// merging into them.
+var stringValuedPaths = map[string]bool{
+	"metadata.labels":                    true,
+	"metadata.annotations":               true,
+	"spec.template.metadata.labels":      true,
+	"spec.template.metadata.annotations": true,
+	"spec.template.spec.nodeSelector":    true,
+}
+
 // pathNode is one node in the allowlist trie.
 type pathNode struct {
 	children map[string]*pathNode
