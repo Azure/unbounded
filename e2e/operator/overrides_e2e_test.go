@@ -30,6 +30,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilwait "k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,6 +59,9 @@ const (
 	overrideWorkload = "override-e2e-agent"
 	overrideConfig   = "override-e2e-config"
 	overrideAccount  = "override-e2e-agent"
+
+	registrationWorkload = "registration-e2e-agent"
+	registrationWebhook  = "registration-e2e.unbounded-cloud.io"
 )
 
 // overrideTestComponent plans a ConfigMap and an overridable DaemonSet,
@@ -208,6 +212,51 @@ func (c orderingTestComponent) Plan(
 	return plan, component.Reconciled(), nil
 }
 
+// registrationTestComponent plans a webhook configuration before the workload
+// that backs it, with no DependsOn, which is the order the manifests are
+// written in and the order an earlier revision of the executor preserved.
+type registrationTestComponent struct{}
+
+func (registrationTestComponent) Name() string          { return "registration" }
+func (registrationTestComponent) ConditionType() string { return "RegistrationReady" }
+
+func (c registrationTestComponent) Plan(
+	_ context.Context, _ *component.Env, _ []unboundedv1alpha3.Site,
+) (*component.Plan, component.Result, error) {
+	webhook := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "admissionregistration.k8s.io/v1",
+		"kind":       "ValidatingWebhookConfiguration",
+		"metadata":   map[string]any{"name": registrationWebhook},
+		"webhooks": []any{map[string]any{
+			"name":                    "never.invoked.example.com",
+			"admissionReviewVersions": []any{"v1"},
+			"sideEffects":             "None",
+			"failurePolicy":           "Ignore",
+			"clientConfig": map[string]any{"service": map[string]any{
+				"name": registrationWorkload, "namespace": overridesNamespace, "path": "/validate",
+			}},
+			"rules": []any{map[string]any{
+				"apiGroups":   []any{""},
+				"apiVersions": []any{"v1"},
+				"operations":  []any{"CREATE"},
+				"resources":   []any{"configmaps"},
+				"scope":       "Namespaced",
+			}},
+		}},
+	}}
+
+	workload := overrideTestWorkload(overridesNamespace)
+	workload.SetName(registrationWorkload)
+
+	plan := component.NewPlan()
+	plan.Add(
+		component.Operation{Kind: component.OpApply, Object: webhook, Component: c.Name()},
+		component.Operation{Kind: component.OpApply, Object: workload, Component: c.Name()},
+	)
+
+	return plan, component.Reconciled(), nil
+}
+
 // TestOverridesAgainstRealAPIServer covers the behaviour only a real apiserver
 // exhibits, in one cluster to keep the suite's runtime reasonable.
 func TestOverridesAgainstRealAPIServer(t *testing.T) {
@@ -242,6 +291,10 @@ func TestOverridesAgainstRealAPIServer(t *testing.T) {
 
 	t.Run("execution order is inferred from the kind", func(t *testing.T) {
 		assertOrderIsInferredFromKind(ctx, t, cl)
+	})
+
+	t.Run("admission registration follows its backend", func(t *testing.T) {
+		assertRegistrationFollowsItsBackend(ctx, t, cl)
 	})
 
 	t.Run("override applies and reverts", func(t *testing.T) {
@@ -326,6 +379,59 @@ func assertOrderIsInferredFromKind(ctx context.Context, t *testing.T, cl client.
 	key := client.ObjectKey{Namespace: overridesOrderingNamespace, Name: overrideWorkload}
 	if err := cl.Get(ctx, key, &workload); err != nil {
 		t.Fatalf("get DaemonSet %s: %v", key, err)
+	}
+}
+
+// assertRegistrationFollowsItsBackend proves that admission registration is
+// written after the workload it points at.
+//
+// A webhook configuration naming a Service that does not exist is accepted by
+// the API server, so this cannot be caught by watching for an error. It is
+// caught by observing that the apiserver assigned the Deployment an earlier
+// creation timestamp than the webhook, which is only true if the operator
+// ordered them that way.
+//
+// The ordering matters because net's webhooks are failurePolicy: Ignore: the
+// window between registering one and starting its backend is a window in which
+// it silently enforces nothing.
+func assertRegistrationFollowsItsBackend(ctx context.Context, t *testing.T, cl client.Client) {
+	t.Helper()
+
+	reconciler := &operator.SiteReconciler{
+		Client:    cl,
+		Scheme:    cl.Scheme(),
+		Namespace: overridesNamespace,
+		Registry: &component.Registry{
+			Cluster: []component.ClusterComponent{registrationTestComponent{}},
+		},
+	}
+
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{
+		NamespacedName: client.ObjectKey{Name: overrideSite},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var workload appsv1.DaemonSet
+	if err := cl.Get(ctx, client.ObjectKey{
+		Namespace: overridesNamespace, Name: registrationWorkload,
+	}, &workload); err != nil {
+		t.Fatalf("get backend DaemonSet: %v", err)
+	}
+
+	webhook := &unstructured.Unstructured{}
+	webhook.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingWebhookConfiguration",
+	})
+
+	if err := cl.Get(ctx, client.ObjectKey{Name: registrationWebhook}, webhook); err != nil {
+		t.Fatalf("get webhook configuration: %v", err)
+	}
+
+	registered := webhook.GetCreationTimestamp()
+	if registered.Before(&workload.CreationTimestamp) {
+		t.Fatalf("webhook created at %s, before its backend at %s; registration must follow the workload it points at",
+			registered, workload.CreationTimestamp)
 	}
 }
 

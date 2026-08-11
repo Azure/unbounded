@@ -492,3 +492,44 @@ Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
 		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
 	}
 }
+
+// TestExecutionOrderGolden pins what the executor runs, as distinct from what
+// the component emits. Summary renders emission order; the executor sorts a
+// copy, so nothing pinned the order the cluster actually sees until this
+// existed, and it was changed twice without a test noticing.
+func TestExecutionOrderGolden(t *testing.T) {
+	env := &component.Env{
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteEnabling("edge")})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	got, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	// Identity, then the config the Deployment mounts, then the Deployment,
+	// then the Service that fronts it.
+	want := `Apply ServiceAccount/unbounded-system/machina-controller
+Apply Role/unbounded-system/machina-controller
+Apply RoleBinding/unbounded-system/machina-controller
+Apply ClusterRole/machina-controller
+Apply ClusterRoleBinding/machina-controller
+Apply ClusterRole/unbounded-daemon-controller-machine
+Apply ClusterRoleBinding/unbounded-daemon-controller-machine
+Apply ClusterRoleBinding/unbounded-bootstrapper-node
+Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
+CreateIfAbsent ConfigMap/unbounded-system/machina-config
+Apply Service/unbounded-system/machina-controller
+Apply Deployment/unbounded-system/machina-controller
+`
+
+	if got != want {
+		t.Fatalf("execution order =\n%s\nwant\n%s", got, want)
+	}
+}

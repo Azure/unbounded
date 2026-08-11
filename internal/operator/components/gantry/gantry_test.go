@@ -539,3 +539,39 @@ Apply PriorityClass/gantry-low` + after + `
 		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
 	}
 }
+
+// TestExecutionOrderGolden pins what the executor runs, as distinct from what
+// the component emits.
+//
+// Gantry is the component where removal order matters: the legacy node-config
+// DaemonSet is deleted before the ConfigMap it mounted, so a failure to remove
+// the workload cannot strip the configuration out from under it.
+func TestExecutionOrderGolden(t *testing.T) {
+	env := testEnv(t)
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	got, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
+Delete ConfigMap/unbounded-system/gantry-containerd-hosts
+CreateIfAbsent ConfigMap/unbounded-system/gantry-config
+Apply PriorityClass/gantry-low
+Apply ServiceAccount/unbounded-system/gantry
+Apply ClusterRole/gantry-agent
+Apply ClusterRoleBinding/gantry-agent
+Apply Role/unbounded-system/gantry-agent
+Apply RoleBinding/unbounded-system/gantry-agent
+Apply DaemonSet/unbounded-system/gantry
+`
+
+	if got != want {
+		t.Fatalf("execution order =\n%s\nwant\n%s", got, want)
+	}
+}

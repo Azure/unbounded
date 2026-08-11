@@ -466,3 +466,33 @@ func TestReconcileAppliesPlannedObjects(t *testing.T) {
 		t.Fatalf("per-site ConfigMap was planned but never created: %v", err)
 	}
 }
+
+// TestExecutionOrderGolden pins what the executor runs, as distinct from what
+// the component emits. Storage shares its ServiceAccount and RBAC across every
+// Site, so those are written once ahead of any per-Site workload.
+func TestExecutionOrderGolden(t *testing.T) {
+	env := testEnv(t)
+
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "uid-a"}}
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, site)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	got, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	want := `Apply ServiceAccount/unbounded-system/unbounded-storage-supervisor
+Apply ClusterRole/unbounded-storage-supervisor
+Apply ClusterRoleBinding/unbounded-storage-supervisor
+CreateIfAbsent ConfigMap/unbounded-system/unbounded-storage-config-rack-a
+Apply DaemonSet/unbounded-system/unbounded-storage-supervisor-rack-a
+`
+
+	if got != want {
+		t.Fatalf("execution order =\n%s\nwant\n%s", got, want)
+	}
+}

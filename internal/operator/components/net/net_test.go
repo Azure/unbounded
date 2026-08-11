@@ -361,3 +361,62 @@ Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigM
 		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
 	}
 }
+
+// TestExecutionOrderGolden pins the order the executor runs net's plan in, as
+// distinct from the order the component emits it.
+//
+// Summary, which TestPlanGolden asserts on, renders emission order. The
+// executor sorts a copy, so for a long time nothing pinned what the cluster
+// actually sees, and execution order was changed twice without a single test
+// noticing.
+//
+// Two properties here are load-bearing rather than incidental. The ConfigMap
+// and Service precede both workloads, because pods mount one and resolve the
+// other. Admission registration and the APIService come last, because each
+// points at the controller Deployment: registering a failurePolicy: Ignore
+// webhook before its backend exists is a window in which it silently enforces
+// nothing.
+func TestExecutionOrderGolden(t *testing.T) {
+	env := testEnv(t)
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{site})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	want := `Apply ServiceAccount/unbounded-system/unbounded-net-controller
+Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
+Apply ClusterRole/unbounded-net-controller
+Apply ClusterRoleBinding/unbounded-net-kube-proxy
+Apply ClusterRoleBinding/unbounded-net-controller
+Apply Role/unbounded-system/unbounded-net-controller
+Apply RoleBinding/unbounded-system/unbounded-net-controller
+Apply Role/kube-system/unbounded-net-controller
+Apply RoleBinding/kube-system/unbounded-net-controller
+Apply ClusterRole/unbounded-net-status-viewer
+Apply ServiceAccount/unbounded-system/unbounded-net-node
+Apply ClusterRole/unbounded-net-node
+Apply ClusterRoleBinding/unbounded-net-node
+CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
+Apply Service/unbounded-system/unbounded-net-controller
+Apply Deployment/unbounded-system/unbounded-net-controller
+Apply DaemonSet/unbounded-system/unbounded-net-node
+Apply ValidatingWebhookConfiguration/unbounded-net-validating-webhook
+Apply APIService/v1alpha1.status.net.unbounded-cloud.io
+Apply MutatingWebhookConfiguration/unbounded-net-mutating-webhook
+Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+`
+
+	got, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	if got != want {
+		t.Fatalf("execution order =\n%s\nwant\n%s", got, want)
+	}
+}

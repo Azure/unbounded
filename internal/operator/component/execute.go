@@ -495,13 +495,20 @@ func byRank(ops []plannedOp) []plannedOp {
 	return ops
 }
 
-// orderByDependency returns operations in an order where every declared
-// dependency present in the plan precedes its dependents.
+// orderByDependency returns operations in rank order, deferring any whose
+// declared dependencies are not yet satisfied.
 //
-// The input is already ordered by tier, and the algorithm preserves that order
-// among operations whose dependencies are equally satisfied, so a plan executes
-// identically on every pass. Dependencies not present in the plan are treated
-// as satisfied.
+// Rank is the primary order and a dependency only ever pushes an operation
+// later. An earlier revision batched every ready operation together, which
+// discarded the rank order entirely: net's admission registration declares no
+// dependency and was therefore ready immediately, while the Deployment it
+// points at waits on the ConfigMap it mounts, so registration was emitted
+// first even though it ranks last. Sorting by rank before a batching sort does
+// not survive the batching.
+//
+// Selection is greedy and deterministic: among the operations whose
+// dependencies are satisfied, the lowest rank wins, and ties keep the input
+// order. Dependencies not present in the plan are treated as satisfied.
 func orderByDependency(ops []plannedOp) ([]plannedOp, error) {
 	produced := map[ObjectRef]bool{}
 	for _, op := range ops {
@@ -509,37 +516,35 @@ func orderByDependency(ops []plannedOp) ([]plannedOp, error) {
 	}
 
 	var (
-		ordered  = make([]plannedOp, 0, len(ops))
-		done     = map[ObjectRef]bool{}
-		remained = ops
+		ordered   = make([]plannedOp, 0, len(ops))
+		done      = map[ObjectRef]bool{}
+		remaining = make([]plannedOp, len(ops))
 	)
 
-	for len(remained) > 0 {
-		var (
-			ready   []plannedOp
-			waiting []plannedOp
-		)
+	copy(remaining, ops)
 
-		for _, op := range remained {
-			if dependenciesSatisfied(op.Operation, produced, done) {
-				ready = append(ready, op)
+	for len(remaining) > 0 {
+		pick := -1
 
+		for i, op := range remaining {
+			if !dependenciesSatisfied(op.Operation, produced, done) {
 				continue
 			}
 
-			waiting = append(waiting, op)
+			if pick < 0 || rankOf(op.Operation) < rankOf(remaining[pick].Operation) {
+				pick = i
+			}
 		}
 
-		if len(ready) == 0 {
-			return nil, fmt.Errorf("operation plan has a dependency cycle among %s", refList(waiting))
+		if pick < 0 {
+			return nil, fmt.Errorf("operation plan has a dependency cycle among %s", refList(remaining))
 		}
 
-		for _, op := range ready {
-			done[op.Ref()] = true
-		}
+		chosen := remaining[pick]
 
-		ordered = append(ordered, ready...)
-		remained = waiting
+		done[chosen.Ref()] = true
+		ordered = append(ordered, chosen)
+		remaining = append(remaining[:pick], remaining[pick+1:]...)
 	}
 
 	return ordered, nil

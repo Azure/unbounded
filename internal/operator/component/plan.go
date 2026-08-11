@@ -162,6 +162,45 @@ func (p *Plan) Len() int {
 // NewPlan returns an empty plan.
 func NewPlan() *Plan { return &Plan{} }
 
+// ExecutionOrder renders the order the executor will run this plan in, one
+// operation per line, without running any of it.
+//
+// Summary renders the order components emitted their operations in; this
+// renders what actually happens. The distinction cost real defects: execution
+// order was changed while every golden plan test kept passing, because the
+// executor sorts a copy and Summary reads the original. Components pin what
+// they intend to write with Summary; this pins what the cluster sees.
+func (p *Plan) ExecutionOrder() (string, error) {
+	if p.Len() == 0 {
+		return "", nil
+	}
+
+	ops := make([]Operation, len(p.Operations))
+	copy(ops, p.Operations)
+	sortOperations(ops)
+
+	deduped, err := dedupeShared(ops)
+	if err != nil {
+		return "", err
+	}
+
+	ordered, err := orderByDependency(byRank(deduped))
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+
+	for _, op := range ordered {
+		b.WriteString(op.Kind.String())
+		b.WriteString(" ")
+		b.WriteString(op.Ref().String())
+		b.WriteString("\n")
+	}
+
+	return b.String(), nil
+}
+
 // Summary renders the plan as one line per operation, in plan order.
 //
 // It exists so tests can pin exactly what a component intends to write, and so
