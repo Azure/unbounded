@@ -1,0 +1,360 @@
+// The node configuration: the only input the control plane gives the dataplane.
+//
+// This file is the contract between the Go control plane and the Rust dataplane, and
+// the source of both. Neither side hand-writes these types.
+//
+// Delivery. The control plane rename(2)s a complete new file into the watched
+// directory; the node watches the directory, not the file. Every push is the whole
+// configuration — no partial updates, no per-field patches.
+//
+// Applying. A new file is validated in full, then validated again against the config
+// the node is already running. Either failure rejects the entire file: the node keeps
+// running what it has, nothing is partially applied, and the only signal is the
+// rejected-configs counter in the node's metrics. A control plane that pushes a config
+// the node refuses gets no other feedback, so watch that counter.
+//
+// Zero is reserved. No node, zone or volume id may be zero, so zero always reads as
+// "none" and never as a name: `Extent.next_zone = 0` is "not migrating" and nothing
+// else. Sites are the exception — a site is the top 8 bits of a volume id, so 0 is an
+// ordinary site and the single-site case is site 0 throughout.
+//
+// What a reload can and cannot change is structural here. Everything in `Node.device`
+// is baked into the device superblock at format time or read once at startup, so a
+// change to it is accepted and does nothing until the device is reformatted and the
+// process restarted. An existing volume's `slot`, extent count, and each extent's
+// `pages` and `kind` are frozen for the life of the volume. Every other field
+// is hot.
+
+syntax = "proto3";
+
+package racer.config;
+
+message NodeConfig {
+  // Strictly increasing per node: a value equal to or below the running one is
+  // rejected, so bump it on every push. It is also echoed in the node's PING, so a peer
+  // that redirected us on a stale topology can tell whether we have yet picked up the
+  // file it expects us to have. The value itself is opaque; nothing compares
+  // generations across nodes.
+  uint64 generation = 1;
+
+  Node     node     = 2;
+  Topology topology = 3;
+
+  // The volumes this node exports. Adding and removing volumes is free; changing an
+  // existing one is heavily restricted (see Volume and Extent). At most 60, and the
+  // fabric device consumes one of the same 60 runtime slots, so 59 is the real ceiling.
+  repeated Volume volumes = 4;
+
+  // Optional; absent means every default below.
+  Policy policy = 5;
+}
+
+// ---- identity ---------------------------------------------------------------------
+
+message Node {
+  // NodeId, non-zero. This node's identity to its peers, and the value matched against
+  // a catalog group to find our position in it.
+  uint32 id = 1;
+
+  // The site this node lives in, 0..255. A volume's site is the top 8 bits of its id
+  // rather than a field, so a larger value matches no volume and would make every
+  // volume look foreign. Foreign volumes are reached through a peer that holds a
+  // crossing into their site.
+  uint32 site = 2;
+
+  // The fault domain within the site, ~300 nodes. `Topology.catalog` and
+  // `Topology.group_slots` describe this zone and no other. Must not also appear in
+  // `Topology.zones`.
+  uint32 zone = 3;
+
+  // The column of every catalog group that is our cooperative-cache roster: cohort `c`
+  // takes column `c` of the whole catalog, which is why member order in a group is
+  // normative. Required: a config that names no cohort is refused, so a control plane
+  // that forgets the field cannot silently ship cohort 0.
+  optional Cohort cohort = 4;
+
+  // One NVMe link per entry, to nodes of this zone, to an entry node of another, or
+  // across a site boundary. Fully hot: a peer whose device path is unchanged keeps its
+  // open fd across a reload, and a dropped peer is torn down only after the previous
+  // generation retires.
+  //
+  // A node with no peers is its own quorum of one — deliberate isolation, not a
+  // degraded mode. Do not ship an empty peer list to a node meant to be replicated.
+  repeated Peer peers = 5;
+
+  // The local namespace this node owns outright, and what is carved out of it.
+  Device device = 6;
+}
+
+enum Cohort {
+  COHORT_0 = 0;
+  COHORT_1 = 1;
+  COHORT_2 = 2;
+}
+
+// One end of a fabric link. No address, port or NQN here on purpose: connecting is the
+// control plane's job, and by the time the dataplane sees this the link is just a local
+// file to open.
+message Peer {
+  // The remote node's id. Non-zero, not our own, and unique across `Node.peers`. This is
+  // what turns a catalog group member into a link.
+  uint32 id = 1;
+
+  // Local path to the peer's namespace, already attached by the control plane.
+  string device = 2;
+
+  // The site this peer is in, when it is not ours. The link is then a site crossing:
+  // the one hop that refreshes a frame's budget instead of spending it. 0..255, never
+  // our own; absent means an ordinary link inside this site.
+  optional uint32 site = 3;
+
+  // Sites this peer will carry traffic to on our behalf, because it holds a crossing to
+  // each. Empty on almost every peer. This is the whole of the gateway concept — a node
+  // the control plane chose to hand foreign addresses to, and nothing else. May not name
+  // our own site.
+  repeated uint32 gateway_for = 4;
+}
+
+// The local NVMe namespace this node owns outright. Nothing in here is on an IO path:
+// every field is written into the superblock when the device is formatted, read once at
+// startup, or checked when a config is validated, so a change is accepted and takes
+// effect on the next restart.
+message Device {
+  // e.g. /dev/nvme0n1.
+  string path = 1;
+
+  // Bytes reserved for the read cache, per page class. Rounded down to a whole page and
+  // carved at format time after the data slabs. Zero means no cache region for that
+  // class.
+  //
+  // A separate address space from the allocator's slabs, deliberately, so cache
+  // pressure can never reach the allocator's watermarks and the allocator can never
+  // reclaim cache space. The device must hold the slabs plus both cache regions.
+  uint64 cache_bytes_4k = 2;
+  uint64 cache_bytes_4m = 3;
+
+  // The rate this node will drive its own device at. Storage that meters a client and
+  // then delays or fails whatever exceeds the meter is better served by staying under
+  // it: pacing our own submissions costs a bounded wait, overshooting costs an
+  // unbounded one applied to whichever IO happens to be in flight. Set these below what
+  // the device will actually take, not at it.
+  //
+  // Both are enforced at once and either can bind first — small writes exhaust
+  // operations while the byte budget idles, and a 4 MiB page does the reverse. A
+  // transfer larger than 256 KiB is charged as several operations, matching how such
+  // devices are usually metered. Zero leaves that resource unmetered; zero on both is a
+  // free path with nothing to account.
+  //
+  // When the budget is committed far enough ahead, work that can be dropped is dropped
+  // — cache admission and anti-entropy stand down so that guest IO and consensus keep
+  // the whole of what is left.
+  uint64 max_iops          = 4;
+  uint64 max_bytes_per_sec = 5;
+
+  // The largest share of this zone this node will ever be given, out of 16384 slots. A
+  // node's live share is how many slots hash into a catalog group it belongs to, and
+  // the device is sized from this ceiling rather than that share: slots are appended
+  // only at startup, so sizing that tracked the live share would leave a node short
+  // until it was restarted every time the control plane moved a group to it.
+  //
+  // A config whose live share exceeds this is refused. The control plane owes each zone
+  // `sum(max_share_slots) >= 3 * 16384` across its nodes, which is not checkable here —
+  // no node sees another's device. Raising this is what makes a restart append slots,
+  // and on a block device the operator must enlarge the namespace first.
+  uint32 max_share_slots = 6;
+}
+
+// ---- topology ---------------------------------------------------------------------
+
+message Topology {
+  // Bumped by the control plane whenever this zone's topology changes. It rides in the
+  // trailer of every routed write and is the term used when a shard is sealed, which is
+  // persisted to the device. Treat it as monotonic: nothing enforces that, and a
+  // decrease silently walks seal terms backwards.
+  uint32 epoch = 1;
+
+  // The consensus groups of this zone; an entry's index is its group id. Each is three
+  // distinct, non-zero nodes. ~300 entries.
+  //
+  // At most one group may differ between consecutive generations, counting a change in
+  // length: the catalog moves one node at a time. A node that has missed generations is
+  // held to no such step — it is being handed a settled state, not a transient.
+  //
+  // This is also where capacity lives. A node's share of the zone is the fraction of
+  // slots pointing at a group it belongs to, so a small device is given fewer groups
+  // and a large one more; the granularity is one group. Sizing a device for that share
+  // is the only capacity model there is, and a node whose share exceeds the ceiling in
+  // its own `Device` refuses the config.
+  repeated Trio catalog = 2;
+
+  // Exactly 16384 entries, each a valid index into `catalog`. An address is hashed to a
+  // slot with a fixed function, and this table says which group owns that slot.
+  //
+  // Fixed for the life of the zone, and a reload that changes it is refused. The hash
+  // cannot move, because every node must land on the same slot for the same address
+  // without exchanging tables, and the slot rather than the group is what travels on
+  // the wire. Neither can the table: the group a slot names also selects the core that
+  // serves the address and the key anti-entropy accumulates digests under, and nothing
+  // moves pages between groups. Ownership moves by changing a group's members instead,
+  // which every one of those derivations survives.
+  //
+  // In practice: a flat round robin over the catalog, laid down once when the zone is
+  // created. Its length sets the granularity of every capacity decision afterwards.
+  repeated uint32 group_slots = 3;
+
+  // The other zones in this site, with their entry nodes. Exactly the set an extent's
+  // `zone` and `next_zone` may name besides our own, which keeps placement intra-site
+  // and this message O(zones) rather than O(cluster). Must not list our own zone, and
+  // ids must be unique.
+  repeated Zone zones = 4;
+}
+
+
+// Three node ids in cohort order. Position is normative in both of its uses: in a
+// catalog group it is the paxos member index, with quorum 2 of 3, and in a zone it is
+// that cohort's entry node. A permuted trio is a different trio.
+message Trio {
+  uint32 cohort_0 = 1;
+  uint32 cohort_1 = 2;
+  uint32 cohort_2 = 3;
+}
+
+// A peer zone in this site. The sender picks an entry node by hashing the address, so
+// cross-zone load spreads over all three cohorts and both ends agree without
+// negotiating.
+message Zone {
+  uint32 id    = 1;
+  Trio   entry = 2;
+}
+
+// ---- volumes ----------------------------------------------------------------------
+
+message Volume {
+  // Globally unique and never reused, non-zero. The top 8 bits are the site, so a
+  // volume's home is a property of its id and needs no lookup. Zero is reserved: a zero
+  // address means "free" in the on-device index.
+  uint32 id = 1;
+
+  // The volume's six-bit name on the fabric, assigned by the control plane, 0..59. Not
+  // derived from position or id order: two nodes exporting different subsets of the same
+  // volumes would then decode the same LBA to different pages. A volume keeps its slot
+  // for life, and deleting a volume frees its slot without renumbering any survivor.
+  uint32 slot = 2;
+
+  // Ordered; extent N begins where N-1 ended. An extent has no offset field because its
+  // index *is* its offset, and also its consensus shard id.
+  //
+  // Every extent must be the same page size, which is to say IMMUTABLE_4M is all or
+  // nothing across the list. Uniformity is what lets the exported block device advertise
+  // one page as both its max and its chunk size, making every request exactly one page.
+  //
+  // Once a volume exists this list is frozen: the extent count may not change, and no
+  // extent's `pages` or `kind` may change. Grow capacity by adding a volume, not by
+  // extending one. The total is at most 2^32 pages.
+  repeated Extent extents = 3;
+
+  // The most load-bearing scalar in this file, and scoped to this volume alone. Page
+  // versions in it are `3*epoch + state`: `3e` empty, `3e+1` live, `3e+2` trimmed.
+  // Advancing it does three things at once with no consensus round — the volume's
+  // tombstones from every earlier epoch become reclaimable, every cached immutable page
+  // in the volume is invalidated, and the guard an immutable write to it must present
+  // moves to `3*epoch`. Other volumes are untouched, so one volume's collection never
+  // waits on another's.
+  //
+  // It may never decrease: that would put the fill point below entries the volume
+  // already holds, and every later write to them would conflict forever. Any forward
+  // step is legal — nothing in the dataplane observes the size of one, so a node down
+  // for several generations adopts the current value rather than refusing the whole
+  // file.
+  //
+  // Advancing is destructive, not just a collection: every page still live below the new
+  // epoch becomes unreadable and its slot is never reclaimed. Advance only once every
+  // node reports `racer_volume_live_pages{volume=...} == 0` at the current epoch;
+  // afterwards `racer_volume_tombstones{volume=...}` draining to zero is the sweep
+  // finishing.
+  uint32 tombstone_epoch = 4;
+}
+
+message Extent {
+  // Length in pages, not bytes, so a misaligned extent is unrepresentable. Non-zero.
+  // Summed across all volumes this sizes the device at format time and is what the index
+  // budget is checked against, so it cannot change once the volume exists.
+  uint32 pages = 1;
+
+  // Frozen once the volume exists. Determines the guard a write must present and the
+  // page size, and nothing else — the kinds share one code path. Every extent in a
+  // volume must be the same page size, so IMMUTABLE_4M is all or nothing across
+  // `Volume.extents`.
+  Kind kind = 2;
+
+  // Home zone: where these bytes live. Must be our own zone or one listed in
+  // `Topology.zones` — placement is strictly intra-site.
+  uint32 zone = 3;
+
+  // 0 = not migrating; else the zone the bytes are being pulled to. Must differ from
+  // `zone` and must also be a known zone.
+  //
+  // Setting this starts a migration: the source zone seals the extent and pushes it, and
+  // the destination treats incoming writes for it as local. It keeps pushing until the
+  // control plane declares the move done by setting `zone` to this value and clearing
+  // this field to 0. That flip is the only completion signal there is — the dataplane
+  // never decides a migration has finished. A home zone may only move to the value
+  // `next_zone` previously held.
+  uint32 next_zone = 4;
+}
+
+enum Kind {
+  // Last writer wins: the guard is the page's current version, so a write always lands.
+  LWW = 0;
+  // Optimistic concurrency: the guard is the version *this node* last read, so a write
+  // with no prior read here conflicts. Acceptors keep no read state, which is what makes
+  // the check cluster-wide rather than per-replica.
+  OCC = 1;
+  // Write-once per tombstone epoch, in 4 KiB pages: the guard is
+  // `3 * Volume.tombstone_epoch`, which every replica derives from this file
+  // identically. The only guard needing no bits on the wire.
+  IMMUTABLE = 2;
+  // The same guard, in 4 MiB pages. The only kind at that size, and the reason the
+  // guard being derived matters: a 4 MiB frame is all payload, with no room to carry
+  // one on the wire.
+  IMMUTABLE_4M = 3;
+}
+
+// ---- policy -----------------------------------------------------------------------
+
+message Policy {
+  // DRAM ceiling for the 4 KiB index, in bytes. Checked once when a config is loaded:
+  // the total 4 KiB page count times 52 B must fit, or the config is refused by name
+  // rather than allowed to OOM later. 4 MiB pages are not counted. Absent means the
+  // default, 8 GiB. An admission check only — nothing enforces it at runtime — and
+  // lowering it below the current working set rejects the whole file.
+  optional uint64 max_index_bytes = 1;
+
+  // DRAM ceiling for the OCC read pool, in bytes. Split evenly across cores at 48 B per
+  // record, minimum one record per core. Absent means the default, 256 MiB.
+  //
+  // Genuinely hot: shrinking it evicts on the next tick. Too small only turns would-be
+  // successful OCC writes into conflicts the client retries — never a wrong answer.
+  optional uint64 occ_bytes = 2;
+
+  // tau, the cooperative cache's target rate, in *requests per 250 ms decay interval* —
+  // not IOPS. The underlying counter saturates at 15 per interval, so the range is 1..15
+  // and anything above is rejected rather than quietly clamped.
+  //
+  // 0, the default, disables the cooperative cache entirely; a node that has not been
+  // told a target rate does not guess one. Otherwise a page is replicated to
+  // `ceil(observed rate / tau)` peers, capped at the cohort size or 64, whichever is
+  // smaller. Lower tau means wider replication of more pages.
+  uint32 cache_target_rate = 3;
+
+  // Registers one anti-entropy sweep will pull while replaying a group, and the number
+  // it will push per extent while handing one to another zone. Absent means the default,
+  // 4096. Zero is refused.
+  //
+  // This is the rate a rebalance runs at. A group being replayed is a group running two
+  // of three with no fault tolerance left, so the window wants to be short; against that,
+  // every register costs a prepare round at the whole group, and the members sourcing it
+  // are serving clients. Raise it to drain a campaign faster on a cluster with headroom,
+  // lower it to keep a rebalance out of the way of the write path.
+  optional uint32 repairs_per_replay = 4;
+}
