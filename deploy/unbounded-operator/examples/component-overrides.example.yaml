@@ -1,0 +1,96 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Example component workload overrides.
+#
+# This file is an example, not something the operator installs. It is a plain
+# .yaml rather than a .yaml.tmpl so neither render-manifests nor go:embed picks
+# it up. Copy what you need; do not apply it as-is.
+#
+# SECURITY: write access to this ConfigMap is equivalent to root on every node
+# in every affected Site, and therefore to cluster-admin. The workloads it
+# patches already run privileged and host-networked, so changing an image, its
+# arguments, or adding a sidecar is arbitrary code execution. Grant it to
+# cluster administrators only and audit it like an RBAC change.
+#
+# Check a document before applying it:
+#   kubectl unbounded overrides validate -f this-file.yaml
+#
+# See docs/content/reference/workload-overrides.md for the full reference.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-component-overrides
+  namespace: unbounded-system
+data:
+  # Every key is parsed as an independent document, so concerns or teams can be
+  # split across keys.
+  resources.yaml: |
+    apiVersion: overrides.unbounded-cloud.io/v1alpha1
+    overrides:
+      # Raise the memory limit on the storage supervisor, on two Sites only.
+      # Omit `sites` entirely to match every Site.
+      - component: storage
+        kind: DaemonSet
+        sites: [edge-west, edge-east]
+        patch:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: run
+                    resources:
+                      limits:
+                        memory: 512Mi
+
+  scheduling.yaml: |
+    apiVersion: overrides.unbounded-cloud.io/v1alpha1
+    overrides:
+      # Scheduling is added to the operator's own constraints, never replacing
+      # them: metalman and storage rely on a mandatory per-Site node affinity.
+      #
+      # Note that `kubectl patch --type=strategic` would replace where the
+      # operator appends, so rehearsing a scheduling patch that way shows a more
+      # destructive result than you get. Use `overrides validate` instead.
+      - component: storage
+        kind: DaemonSet
+        patch:
+          spec:
+            template:
+              spec:
+                tolerations:
+                  - key: edge
+                    operator: Exists
+
+  arguments.yaml: |
+    apiVersion: overrides.unbounded-cloud.io/v1alpha1
+    overrides:
+      # Always add arguments with extraArgs. A patch that sets `args` replaces
+      # the whole list, dropping every argument the operator injected and never
+      # picking up new ones on upgrade. metalman would stop starting entirely,
+      # because its args begin with the `serve-pxe` subcommand.
+      - component: machina
+        kind: Deployment
+        extraArgs:
+          machina-controller: ["--max-concurrent-reconciles=20"]
+
+  sidecar.yaml: |
+    apiVersion: overrides.unbounded-cloud.io/v1alpha1
+    overrides:
+      # Adding a container requires saying so. Strategic merge cannot tell a
+      # sidecar from a typo, so without addContainers a misspelled name would
+      # silently create an image-less container instead of failing.
+      - component: gantry
+        kind: DaemonSet
+        addContainers: [log-shipper]
+        patch:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: log-shipper
+                    image: fluent/fluent-bit:3.1
+                    resources:
+                      limits:
+                        memory: 128Mi

@@ -440,6 +440,29 @@ These commands do not create `MachineOperation` resources.
 
 ---
 
+### `kubectl unbounded overrides`
+
+Inspect the component workload overrides the operator reads from the
+`unbounded-component-overrides` ConfigMap. See
+**[Workload Overrides]({{< relref "reference/workload-overrides" >}})** for the
+document format and the security model.
+
+| Command | Description |
+|----------|-------------|
+| `overrides validate [-f FILE]` | Check syntax, schema, and the allowlist. Offline, so its answer is correct regardless of which operator version is running. Deliberately does not resolve container or volume names, which depend on the workloads the operator renders. |
+| `overrides list` | Show the entries the ConfigMap declares, and warn about Site names that match no Site. |
+| `overrides status` | Show what the operator actually applied, including any container image drift. Reads persisted state only; performs no rendering or hashing of its own. |
+
+```bash
+# Check a document before applying it.
+kubectl unbounded overrides validate -f overrides.yaml
+
+# Confirm the operator resolved and applied it.
+kubectl unbounded overrides status
+```
+
+---
+
 ## Environment Variables
 
 | Variable | Description |
@@ -452,5 +475,7 @@ These commands do not create `MachineOperation` resources.
   through `site init` and `machine register` step by step.
 - **[SSH Guide]({{< relref "guides/ssh" >}})** -- Detailed SSH provisioning
   walkthrough with examples.
+- **[Workload Overrides]({{< relref "reference/workload-overrides" >}})** --
+  Customizing the Deployments and DaemonSets the operator generates.
 - **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Full Machine
   and Image API specification.

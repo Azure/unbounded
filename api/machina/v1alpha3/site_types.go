@@ -141,7 +141,14 @@ type SiteComponents struct {
 
 // SiteComponentSpec contains common component configuration. Components install
 // into the unbounded-system namespace at the operator's own version, so neither
-// namespace nor image is configurable per component.
+// namespace nor image is configurable here.
+//
+// The generated Deployments and DaemonSets can be customized through workload
+// overrides, a cluster-scoped ConfigMap the operator reads. That surface is
+// deliberately separate from this one: it is cluster-scoped because the net,
+// machina and gantry singletons are shared across Sites, and write access to it
+// is equivalent to cluster-admin. See
+// docs/content/reference/workload-overrides.md.
 type SiteComponentSpec struct {
 	// Enabled controls whether the component is reconciled.
 	// +optional
