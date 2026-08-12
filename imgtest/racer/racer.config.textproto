@@ -1,0 +1,146 @@
+# Single-node RACER configuration exporting image-block storage.
+generation: 1
+node {
+  id: 1
+  zone: 1
+  cohort: COHORT_0
+  store {
+    size_bytes: 3221225472
+  }
+}
+universes {
+  id: 1
+  epoch: 1
+  # Match the 24 RACER workers so address ownership spans every allocator shard.
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  catalog {
+    cohort_0: 1
+    cohort_1: 2
+    cohort_2: 3
+  }
+  extents {
+    id: 1
+    base_lba: 0
+    pages: 524288
+    kind: LWW
+    zone: 1
+  }
+}
+devices {
+  id: 1
+  extents: 1
+}
