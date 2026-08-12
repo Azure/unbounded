@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -762,5 +763,123 @@ func TestCreateIfAbsentIsNotStaleWhenItWins(t *testing.T) {
 
 	if len(result.Stale) != 0 {
 		t.Fatalf("stale = %v, want none when the create succeeded", result.Stale)
+	}
+}
+
+// TestConflictDefersRatherThanFails pins that losing an optimistic lock is the
+// mechanism working, not a failure.
+//
+// OpMergePatch takes an optimistic lock precisely so a concurrent edit produces
+// a conflict instead of a silent clobber. Reporting that conflict as a failure
+// gated the component's later tiers, turned every Site's condition False, and
+// put the pass into error backoff, all for a race that the very next pass
+// resolves. Machina merges the operator-resolved apiServerEndpoint into
+// user-owned config content, so any edit to machina-config triggers it.
+func TestConflictDefersRatherThanFails(t *testing.T) {
+	base := configMapObject("cfg")
+	base.SetResourceVersion("1")
+
+	scheme := testScheme(t)
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+				return apierrors.NewConflict(
+					schema.GroupResource{Resource: "configmaps"}, "cfg", errors.New("concurrent edit"))
+			},
+		}).
+		Build()
+
+	env := &Env{Client: cl, Scheme: scheme, Namespace: DefaultNamespace}
+
+	desired := configMapObject("cfg")
+	desired.SetResourceVersion("1")
+
+	plan := NewPlan()
+	plan.Add(Operation{
+		Kind: OpMergePatch, Object: desired, Base: base,
+		Component: "machina",
+	})
+
+	// A workload for the same component in a later tier. It must still be
+	// attempted: nothing failed, so nothing is gated.
+	plan.Add(Operation{Kind: OpApply, Object: daemonSetObject("node"), Component: "machina"})
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if err := exec.Err(); err != nil {
+		t.Fatalf("a lost optimistic lock must not be a pass error: %v", err)
+	}
+
+	if len(exec.Deferred) != 1 {
+		t.Fatalf("deferred = %v, want the conflicted patch", exec.Deferred)
+	}
+
+	if skipped := exec.Skipped(); len(skipped) != 0 {
+		t.Fatalf("skipped = %+v, want nothing gated by a deferral", skipped)
+	}
+
+	// The planning verdict survives, so the Site condition does not flap for
+	// the second it takes to re-plan.
+	result := CombineResult("machina", "", Reconciled(), exec)
+	if !result.Ready {
+		t.Fatalf("result = %+v, want the planning verdict to survive a deferral", result)
+	}
+}
+
+// TestStaleCreateDefersItsDependents is a regression test.
+//
+// createIfAbsent reports errStale when it loses a create race, because
+// everything the pass computed from "this object does not exist" is now wrong.
+// The dependents were applied anyway: storage stamps the hash of the ConfigMap
+// payload it read onto the DaemonSet that mounts it, so the DaemonSet rolled to
+// a hash matching nothing and rolled again once a later pass read the real
+// payload. Two rollouts of a host-networked DaemonSet for one lost race.
+func TestStaleCreateDefersItsDependents(t *testing.T) {
+	existing := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: DefaultNamespace},
+		Data:       map[string]string{"config.yaml": "written by someone else"},
+	}
+
+	env, calls := recordingEnv(t, existing)
+
+	config := configMapObject("cfg")
+
+	workload := daemonSetObject("node")
+	workload.SetAnnotations(map[string]string{"unbounded-cloud.io/config-hash": "hash-of-a-payload-that-is-not-there"})
+
+	plan := NewPlan()
+	plan.Add(
+		Operation{Kind: OpCreateIfAbsent, Object: config, Component: "storage", Site: "edge"},
+		Operation{
+			Kind: OpApply, Object: workload, Component: "storage", Site: "edge",
+			DependsOn: []ObjectRef{RefOf(config)},
+		},
+	)
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(exec.Stale) != 1 {
+		t.Fatalf("stale = %v, want the lost create race recorded", exec.Stale)
+	}
+
+	if len(exec.Deferred) != 1 || exec.Deferred[0].Name != "node" {
+		t.Fatalf("deferred = %v, want the dependent workload deferred", exec.Deferred)
+	}
+
+	for _, call := range *calls {
+		if strings.Contains(call, "DaemonSet") && strings.HasPrefix(call, "apply") {
+			t.Fatalf("the workload was applied with a hash for a payload the cluster does not have: %v", *calls)
+		}
+	}
+
+	if err := exec.Err(); err != nil {
+		t.Fatalf("a lost create race is not a failure: %v", err)
 	}
 }

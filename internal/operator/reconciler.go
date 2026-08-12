@@ -242,6 +242,16 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		requeueAfter = nextRequeue(requeueAfter, stalePlanRequeue)
 	}
 
+	if len(exec.Deferred) > 0 {
+		// An operation lost an optimistic lock, or depended on something that
+		// had moved. Neither is a failure, so neither goes through error
+		// backoff; the pass simply runs again against what is actually there.
+		logger.V(1).Info("operations were deferred to the next pass",
+			"objects", len(exec.Deferred))
+
+		requeueAfter = nextRequeue(requeueAfter, statusConflictRequeue)
+	}
+
 	if execErr != nil {
 		// A plan the executor refuses to run (a dependency cycle, or
 		// contradictory shared operations) is a programming error, not a
@@ -871,6 +881,11 @@ func unwrittenOverrides(report *override.Report, exec component.ExecutionResult)
 		switch {
 		case !ran:
 			unwritten = append(unwritten, workload.Ref.String()+" (never executed)")
+		case result.Status == component.OpDeferred:
+			// Transient by construction: the pass requeues and the next one
+			// writes it. Warning about a race that resolves in a second would
+			// train users to ignore this Event.
+			continue
 		case result.Status != component.OpSucceeded:
 			reason := result.Status.String()
 			if result.Err != nil {

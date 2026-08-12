@@ -31,6 +31,21 @@ const (
 	// mount, which is worse than not writing the workload at all.
 	OpSkipped
 
+	// OpDeferred means the operation was not written this pass, was not a
+	// failure, and will be attempted again shortly.
+	//
+	// Two things produce it, and they share a shape: the cluster moved under a
+	// pass that had already read it. An optimistic-lock conflict means another
+	// writer won the object, and a dependency that turned out to already exist
+	// means the plan was computed from a read that is no longer true. Neither
+	// is a fault of the component, neither is worth an error, and both are
+	// resolved by re-planning against what is actually there.
+	//
+	// It is distinct from OpSkipped because a skip means something failed, and
+	// reporting a lost race as a dependency failure flapped a Site condition to
+	// False for the second it took to re-plan.
+	OpDeferred
+
 	// OpDropped means the operation was removed from the plan before execution,
 	// because the overrides that would have shaped it could not be used. The
 	// executor never sees it, so it is recorded by whatever removed it.
@@ -52,6 +67,8 @@ func (s OpStatus) String() string {
 		return "Failed"
 	case OpSkipped:
 		return "Skipped"
+	case OpDeferred:
+		return "Deferred"
 	case OpDropped:
 		return "Dropped"
 	default:
@@ -83,6 +100,11 @@ type ExecutionResult struct {
 	// from an accurate read. The operations themselves succeeded and are
 	// reported as such; this is a request to re-plan, not a failure.
 	Stale []ObjectRef
+
+	// Deferred names the objects that were not written this pass because the
+	// cluster moved under it. Like Stale this asks for a short requeue rather
+	// than reporting a failure.
+	Deferred []ObjectRef
 }
 
 // Err joins every failure into a single error, or returns nil when the plan
@@ -117,6 +139,12 @@ func (r ExecutionResult) Skipped() []OperationResult {
 // Dropped returns the operations removed from the plan before execution.
 func (r ExecutionResult) Dropped() []OperationResult {
 	return r.withStatus(OpDropped)
+}
+
+// DeferredResults returns the operations that were not written this pass
+// because the cluster moved under it.
+func (r ExecutionResult) DeferredResults() []OperationResult {
+	return r.withStatus(OpDeferred)
 }
 
 func (r ExecutionResult) withStatus(status OpStatus) []OperationResult {
@@ -233,6 +261,7 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 		brokenRef = map[ObjectRef]bool{}
 		brokenNS  = map[string]bool{}
 		brokenSub = map[subject]failure{}
+		staleRef  = map[ObjectRef]bool{}
 	)
 
 	record := func(op plannedOp, status OpStatus, err error) {
@@ -282,9 +311,33 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 		record(op, status, err)
 	}
 
+	defer_ := func(op plannedOp, err error) {
+		result.Deferred = append(result.Deferred, op.Ref())
+
+		// A deferred operation gates nothing. It is recorded so its dependents
+		// can be deferred too, but it contributes to neither brokenRef nor
+		// brokenSub, because nothing failed.
+		staleRef[op.Ref()] = true
+
+		record(op, OpDeferred, err)
+	}
+
 	for _, op := range ordered {
 		if reason, blocked := blockedBy(op, brokenRef, brokenNS, brokenSub); blocked {
 			fail(op, OpSkipped, errors.New(reason))
+
+			continue
+		}
+
+		// A dependency that moved under this pass makes everything computed
+		// from it suspect. Storage stamps the hash of the ConfigMap payload it
+		// read onto the DaemonSet that mounts it, so applying the DaemonSet
+		// after losing the create race stamps the hash of a payload the cluster
+		// does not have: the pods roll to a hash matching nothing, and roll
+		// again once a later pass reads the real payload.
+		if dep, stale := dependsOnStale(op, staleRef); stale {
+			defer_(op, fmt.Errorf(
+				"%s was created by another writer, so this pass planned from stale state", dep))
 
 			continue
 		}
@@ -294,8 +347,15 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 		switch {
 		case errors.Is(err, errStale):
 			result.Stale = append(result.Stale, op.Ref())
+			staleRef[op.Ref()] = true
 
 			record(op, OpSucceeded, nil)
+		case apierrors.IsConflict(err):
+			// Another writer held the object between the read this plan was
+			// computed from and this write. The optimistic lock did its job;
+			// losing it is the mechanism working, not a failure, so it must not
+			// gate the component's later tiers or turn a Site condition False.
+			defer_(op, err)
 		case err != nil:
 			fail(op, OpFailed, err)
 		default:
@@ -304,6 +364,18 @@ func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 	}
 
 	return result
+}
+
+// dependsOnStale reports whether any dependency of op was deferred or turned
+// out to already exist, naming the first such dependency.
+func dependsOnStale(op plannedOp, staleRef map[ObjectRef]bool) (ObjectRef, bool) {
+	for _, dep := range op.DependsOn {
+		if dep != op.Ref() && staleRef[dep] {
+			return dep, true
+		}
+	}
+
+	return ObjectRef{}, false
 }
 
 // subject identifies the component and Site an operation was planned for, which
@@ -617,6 +689,11 @@ func refList(ops []plannedOp) string {
 // caused them already reported the underlying error and repeating it here would
 // bury the real cause. They do prevent a Ready verdict: the component did not
 // write what it planned, and reporting Reconciled would claim otherwise.
+//
+// Deferred operations do neither. Nothing failed and nothing is wrong; the
+// cluster moved under the pass and the next one, a second later, writes what
+// this one planned. Reporting that as not-Ready would flap a Site condition on
+// every lost race, which is noise rather than signal.
 func CombineResult(componentName, site string, planned Result, exec ExecutionResult) Result {
 	var (
 		errs    []error

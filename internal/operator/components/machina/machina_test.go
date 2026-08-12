@@ -218,7 +218,7 @@ func TestEnsureConfigUpdatesEndpointAndPreservesData(t *testing.T) {
 		Config:    component.Config{APIServerEndpoint: "https://new.example:6443"},
 	}
 
-	hash, err := ensureConfig(t, env)
+	hash, _, err := ensureConfig(t, env)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -282,11 +282,24 @@ func TestEnsureConfigOptimisticConflictReloadsFreshState(t *testing.T) {
 	})
 	env := &component.Env{Client: cl, Namespace: component.DefaultNamespace, Config: component.Config{APIServerEndpoint: "https://new.example:6443"}}
 
-	if _, err := ensureConfig(t, env); !apierrors.IsConflict(err) {
-		t.Fatalf("first ensureConfig error = %v, want conflict", err)
+	// Losing the optimistic lock is the mechanism working, not a failure. The
+	// pass defers the write and asks to run again; reporting it as an error
+	// would gate the component's later tiers and turn every Site's condition
+	// False for the second it takes to re-plan.
+	_, exec, err := ensureConfig(t, env)
+	if err != nil {
+		t.Fatalf("a lost optimistic lock must not be a reconcile error: %v", err)
 	}
 
-	if _, err := ensureConfig(t, env); err != nil {
+	if len(exec.Deferred) != 1 {
+		t.Fatalf("deferred = %v, want the conflicted patch deferred to the next pass", exec.Deferred)
+	}
+
+	if deferred := exec.DeferredResults(); len(deferred) != 1 || !apierrors.IsConflict(deferred[0].Err) {
+		t.Fatalf("deferred results = %+v, want one carrying the conflict", deferred)
+	}
+
+	if _, _, err := ensureConfig(t, env); err != nil {
 		t.Fatalf("retry ensureConfig: %v", err)
 	}
 
@@ -407,16 +420,16 @@ func retainedEnv(t *testing.T, objects ...client.Object) (*component.Env, map[st
 // ensureConfig plans and executes the machina config operation, mirroring what
 // the reconciler does so these tests exercise the production path, including
 // the optimistic-lock conflict the merge patch can produce.
-func ensureConfig(t *testing.T, env *component.Env) (string, error) {
+func ensureConfig(t *testing.T, env *component.Env) (string, component.ExecutionResult, error) {
 	t.Helper()
 
 	hash, op, err := planConfig(t.Context(), env)
 	if err != nil {
-		return "", err
+		return "", component.ExecutionResult{}, err
 	}
 
 	if op == nil {
-		return hash, nil
+		return hash, component.ExecutionResult{}, nil
 	}
 
 	plan := component.NewPlan()
@@ -424,10 +437,10 @@ func ensureConfig(t *testing.T, env *component.Env) (string, error) {
 
 	exec, err := env.Execute(t.Context(), plan)
 	if err != nil {
-		return "", err
+		return "", component.ExecutionResult{}, err
 	}
 
-	return hash, exec.Err()
+	return hash, exec, exec.Err()
 }
 
 // reconcile plans and executes the component, mirroring the reconciler.
