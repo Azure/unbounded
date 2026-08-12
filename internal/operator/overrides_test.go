@@ -914,3 +914,155 @@ func TestOverrideStatusMessageIsBounded(t *testing.T) {
 		t.Fatal("a truncated message must say so, and say where the rest is")
 	}
 }
+
+// validOverrideDocument is a document that resolves and merges cleanly.
+func validOverrideDocument() string {
+	return `apiVersion: ` + override.APIVersion + `
+overrides:
+  - component: net
+    kind: DaemonSet
+    patch:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: node
+                imagePullPolicy: Always
+`
+}
+
+// TestConfigMapEventReportsExecutionOutcome is a regression test.
+//
+// The ConfigMap Event was chosen from the merge result alone, so a document
+// that merged cleanly produced a Normal success Event even when the writes were
+// rejected by admission, failed against the API server, or were skipped because
+// something they depend on failed. With no Sites this Event is the only verdict
+// a user gets.
+func TestConfigMapEventReportsExecutionOutcome(t *testing.T) {
+	ref := component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "node"))
+
+	report := &override.Report{Workloads: []override.WorkloadResult{
+		{Ref: ref, Site: "edge", Hash: "h1"},
+	}}
+
+	snapshot := overrideSnapshot{state: overridesValid, resourceVersion: "7"}
+
+	t.Run("the write failed", func(t *testing.T) {
+		exec := component.ExecutionResult{Results: []component.OperationResult{{
+			Ref: ref, Kind: component.OpApply, Status: component.OpFailed,
+			Err: errors.New("admission webhook denied the request"),
+		}}}
+
+		eventType, reason, note := overrideConfigMapEvent(snapshot, report, exec)
+
+		if eventType != corev1.EventTypeWarning {
+			t.Fatalf("event type = %q, want Warning; the override never reached the cluster", eventType)
+		}
+
+		if reason != "OverridesNotWritten" {
+			t.Fatalf("reason = %q", reason)
+		}
+
+		if !strings.Contains(note, "admission webhook denied") {
+			t.Fatalf("note = %q, want the underlying reason", note)
+		}
+	})
+
+	t.Run("the write was skipped", func(t *testing.T) {
+		exec := component.ExecutionResult{Results: []component.OperationResult{{
+			Ref: ref, Kind: component.OpApply, Status: component.OpSkipped,
+			Err: errors.New("net did not complete its config successfully"),
+		}}}
+
+		if eventType, _, _ := overrideConfigMapEvent(snapshot, report, exec); eventType != corev1.EventTypeWarning {
+			t.Fatalf("event type = %q, want Warning", eventType)
+		}
+	})
+
+	t.Run("the plan never executed", func(t *testing.T) {
+		eventType, _, note := overrideConfigMapEvent(snapshot, report, component.ExecutionResult{})
+
+		if eventType != corev1.EventTypeWarning {
+			t.Fatalf("event type = %q, want Warning", eventType)
+		}
+
+		if !strings.Contains(note, "never executed") {
+			t.Fatalf("note = %q", note)
+		}
+	})
+
+	t.Run("the write succeeded", func(t *testing.T) {
+		exec := component.ExecutionResult{Results: []component.OperationResult{{
+			Ref: ref, Kind: component.OpApply, Status: component.OpSucceeded,
+		}}}
+
+		eventType, reason, _ := overrideConfigMapEvent(snapshot, report, exec)
+
+		if eventType != corev1.EventTypeNormal || reason != "OverridesApplied" {
+			t.Fatalf("event = %s/%s, want a Normal OverridesApplied", eventType, reason)
+		}
+	})
+}
+
+// TestConfigMapEventDedupeKeepsScopeApart is a regression test.
+//
+// A pass for one Site resolves overrides against that Site alone, so its
+// verdict describes part of the document. Deduplicating on the document version
+// and verdict alone let the first such pass claim "1 workload overridden" for a
+// two-Site document, then suppress the complete fan-out verdict that followed,
+// because both were Normal OverridesApplied at the same resourceVersion.
+func TestConfigMapEventDedupeKeepsScopeApart(t *testing.T) {
+	r := &SiteReconciler{}
+
+	if !r.overrideEventIsNew("7", "OverridesApplied", "site/alpha", "1 workload(s) overridden") {
+		t.Fatal("the first verdict must be emitted")
+	}
+
+	if r.overrideEventIsNew("7", "OverridesApplied", "site/alpha", "1 workload(s) overridden") {
+		t.Fatal("an identical repeat must be suppressed")
+	}
+
+	if !r.overrideEventIsNew("7", "OverridesApplied", "all-sites", "2 workload(s) overridden") {
+		t.Fatal("the complete fan-out verdict must not be suppressed by a single-Site one")
+	}
+}
+
+// TestSiteEventFollowsStatusPersistence is a regression test.
+//
+// The Event describes a status transition, so emitting it before the patch left
+// users with an Event for a state the Site never reached when the patch lost an
+// optimistic lock or failed outright, and the retry emitted it again.
+func TestSiteEventFollowsStatusPersistence(t *testing.T) {
+	site := siteFor("edge")
+
+	r, _, _ := overrideTestEnv(t, site, overridesConfigMap(map[string]string{
+		"overrides.yaml": validOverrideDocument(),
+	}))
+
+	recorder := &recordingEventSink{}
+	r.Recorder = recorder
+
+	// Every status patch fails, so no transition is ever committed.
+	scheme := newReconcilerTestScheme(t)
+	r.Client = fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(site, overridesConfigMap(map[string]string{"overrides.yaml": validOverrideDocument()})).
+		WithStatusSubresource(&unboundedv1alpha3.Site{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(
+				context.Context, client.Client, string, client.Object, client.Patch, ...client.SubResourcePatchOption,
+			) error {
+				return errors.New("status patch rejected")
+			},
+		}).
+		Build()
+
+	//nolint:errcheck // the pass is expected to fail; the Events are what matter
+	r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}})
+
+	for _, event := range recorder.events {
+		if event.name == "edge" {
+			t.Fatalf("an Event described a Site status transition that was never committed: %+v", event)
+		}
+	}
+}
