@@ -108,19 +108,15 @@ message Store {
   // are addressed by absolute offset and there is nothing that could move them.
   //
   // Everything the node holds comes out of this: the superblocks, the metadata region,
-  // the data slabs sized from every universe's extents, and both cache regions below. A
-  // configuration that does not fit is refused at startup, naming this field.
-  uint64 size_bytes = 1;
-
-  // Bytes reserved for the read cache, per page class. Rounded down to a whole page and
-  // carved at format time after the data slabs. Zero means no cache region for that
-  // class.
+  // and the data slabs sized from every universe's extents. A configuration that does
+  // not fit is refused at startup, naming this field.
   //
-  // A separate address space from the allocator's slabs, deliberately, so cache
-  // pressure can never reach the allocator's watermarks and the allocator can never
-  // reclaim cache space. The store must hold the slabs plus both cache regions.
-  uint64 cache_bytes_4k = 2;
-  uint64 cache_bytes_4m = 3;
+  // Whatever is left over is the read cache. There is nothing to configure: every 4 MiB
+  // the slabs did not claim is handed to the cache, which gives it back if a later
+  // config grows the slabs into it. Raising this field is therefore how a node is given
+  // more cache as well as more capacity, and `policy.cache_index_bytes` is what bounds
+  // the DRAM that cache costs.
+  uint64 size_bytes = 1;
 
   // The rate this node will drive its own storage at. Storage that meters a client and
   // then delays or fails whatever exceeds the meter is better served by staying under
@@ -137,8 +133,8 @@ message Store {
   // When the budget is committed far enough ahead, work that can be dropped is dropped:
   // cache admission and anti-entropy stand down so that guest IO and consensus keep the
   // whole of what is left.
-  uint64 max_iops          = 4;
-  uint64 max_bytes_per_sec = 5;
+  uint64 max_iops          = 2;
+  uint64 max_bytes_per_sec = 3;
 }
 
 // ---- universes ---------------------------------------------------------------------
@@ -408,4 +404,17 @@ message Policy {
   // extent handover faster on a cluster with headroom, lower it to keep either out of
   // the way of the write path.
   optional uint32 repairs_per_replay = 4;
+
+  // DRAM ceiling for the read cache's index, in bytes, across every core and both page
+  // classes. Absent means the default, 1 GiB; zero disables the cache by leaving it no
+  // slots to hold.
+  //
+  // This is what bounds the cache, because the media no longer does: the cache is given
+  // every 4 MiB the slabs did not claim, and on a large store that is more space than
+  // any sane amount of DRAM can index. One resident page costs 48 B here, so a 4 MiB
+  // chunk costs 48 B as one huge page and 48 KiB as 1024 small ones - the small class is
+  // 1024 times more expensive per byte of media, and this ceiling is why a node full of
+  // small cache does not OOM. Unlike max_index_bytes this is not an admission check: the
+  // cache sizes itself to fit and simply holds less.
+  optional uint64 cache_index_bytes = 5;
 }

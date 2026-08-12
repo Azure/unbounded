@@ -4,7 +4,8 @@ Racer is a Linux-only userspace distributed block dataplane. A process exports
 one ublk device per configured block device and one sparse ublk "fabric" device
 per universe, used by that universe's peers. It stores authoritative pages in one fixed-length local file opened
 with `O_DIRECT`, replicates page registers through fixed three-member consensus
-groups, and can use separate regions of that file as a cooperative read cache.
+groups, and uses whatever of that file the slabs did not claim as a cooperative
+read cache.
 
 The process does not establish its peer network. An external control plane
 publishes each node's fabric ublk device through NVMe-oF and attaches remote
@@ -32,8 +33,8 @@ types, requiring `protoc` at build time.
 The checked configuration describes:
 
 - A generation.
-- The local node: id, zone, and cohort, plus its store - size, cache sizes, and
-  rate ceilings. Nodes are otherwise alike; there is no gateway role.
+- The local node: id, zone, and cohort, plus its store - size and rate ceilings.
+  Nodes are otherwise alike; there is no gateway role.
 - Universes. A universe is one flat, sparse address space counted in 4 KiB
   blocks, and everything about placement inside it: its own epoch, its own
   balanced catalog of three distinct acceptors per group, its own remote-zone
@@ -173,16 +174,22 @@ On the first `serve` of a blank store, formatting fixes all offsets and
 capacities. Four CRC32C-protected 4 KiB superblocks contain geometry plus
 bounded consensus promises and migration seals. A promise is a universe, a
 group index within it, and a term; a seal is an extent id and a term, since
-extent ids are unique across universes. The format version is 3, and versions 1
-and 2, which addressed pages as a volume and an offset within it, are refused
-rather than reinterpreted: nothing in the bytes distinguishes the two layouts,
-so an older store has to be reformatted. The remaining regions are:
+extent ids are unique across universes. The format version is 5, and earlier
+versions are refused rather than reinterpreted: nothing in the bytes
+distinguishes the layouts, so an older store has to be reformatted. The
+remaining regions are:
 
 1. A 4 MiB zero page.
 2. A/B copies of 4 KiB-page metadata.
 3. A/B copies of 4 MiB-page metadata.
 4. Out-of-place small and huge data slabs, with the huge slab aligned.
-5. Separate fixed-size small and huge cache regions.
+
+Everything past the last of those, rounded up to 4 MiB, is the tail, and the tail
+is the cache. It is not recorded in the superblock and is not a region in the
+same sense as the others. It is derived at every start from where the slabs end
+and how long the file is, which is sound only because the cache is volatile:
+nothing points at a cache page across a restart, so the cache may sit wherever
+the layout is not looking this boot.
 
 Capacity comes from one number, the configured `size_bytes`, and includes spare
 data slots. It is checked whenever `serve` starts. The share a node is sized for
@@ -192,7 +199,9 @@ many pages actually hash into the groups a node holds. A configuration that has
 outgrown the layout is satisfied by appending a growth run per class: a fresh run of
 metadata blocks and the data slots they name, placed past the end of everything
 already written, recorded in a growth table in the superblock, and never moving a
-byte that already exists. The file is reserved out to `size_bytes` first, with
+byte that already exists. A growth run therefore lands in what was tail, and the
+next start simply derives a shorter one. The file is reserved out to `size_bytes`
+first, with
 `fallocate` where the file system supports it and a plain extension where it does
 not, so the space a growth run lands in is space the store already owns. If the
 appended runs would still not fit within `size_bytes`, `serve` refuses to
@@ -293,8 +302,27 @@ buffer.
 The cache is advisory and divided per core. A periodically halved count-min
 sketch estimates popularity. A configured target request rate determines a
 bounded replica width; rendezvous ranking selects nested replicas without a
-directory. TinyLFU-style admission and CLOCK replacement manage a fixed set of
-slots in the store's cache regions.
+directory. TinyLFU-style admission and CLOCK replacement manage the slots the
+cache currently holds.
+
+Media comes in 4 MiB chunks carved from the tail. A chunk is the unit of
+everything: what a class is given, what one class takes from the other, and what
+the allocator lends. Each class is striped only over the cores its lookups can
+reach, which is the same core mapping the allocator uses, so a chunk placed
+anywhere else would be unreachable rather than merely cold. Core zero holds the
+chunks no class has taken and once a second moves media toward whichever class
+is both evicting and earning more confirmed hits per byte, drawing from that
+pool first, then from free 4 MiB slab slots the allocator will lend, then from
+the other class. A borrowed slab slot is given back synchronously, on the core
+that owns it, as soon as the allocator runs low; the allocator counts a loan as
+free, so lending never moves its own watermarks.
+
+The tail is media, not memory, so what bounds the cache is DRAM:
+`policy.cache_index_bytes` caps resident slot records at 48 bytes each. That
+makes the 4 KiB class a thousand times more expensive per byte of media than the
+4 MiB class, and the cap therefore binds the small class first. It is not an
+admission check: the cache sizes itself to fit and grows toward the cap rather
+than being refused for exceeding it.
 
 Writes are in-place and non-durable, and cache metadata is not recovered after
 restart. A hit carries its claimed register, which consensus metadata must
@@ -359,7 +387,11 @@ process-lifetime and are not explicitly joined or reclaimed.
 Workers periodically publish per-core counters to atomic rows; scrapes sum the
 rows. Per-extent live-page and tombstone counts are published as
 `racer_extent_live_pages` and `racer_extent_tombstones`, labelled by universe
-and extent, alongside `racer_universes`, `racer_devices`, and `racer_extents`. The metrics server is blocking, handles one HTTP/1.1 connection at a time,
+and extent, alongside `racer_universes`, `racer_devices`, and `racer_extents`.
+Cache counters carry a `class` label of `small` or `huge`, and
+`racer_cache_bytes`, `racer_cache_borrowed_bytes`, `racer_cache_tail_bytes`, and
+`racer_cache_unused_bytes` report how the tail is currently divided. The metrics
+server is blocking, handles one HTTP/1.1 connection at a time,
 and exposes unauthenticated plaintext `GET /metrics` with five-second
 socket timeouts.
 
@@ -389,6 +421,9 @@ Important implementation boundaries are:
 - Empty peer links select quorum one. Promise changes can remain only in memory,
   and observed higher ballot terms are not persisted before a crash.
 - Huge authoritative and all cached data lack data checksums.
+- The cache takes whatever the slabs did not, so a store sized close to its
+  configuration caches almost nothing, and a growth run at the next start takes
+  media back from the cache without warning.
 
 ## Verification Architecture
 

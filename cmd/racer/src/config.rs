@@ -423,8 +423,6 @@ pub struct Node {
     pub store: PathBuf,
     /// The length that file is held at. Grown to on start, never shrunk.
     pub(crate) store_bytes: u64,
-    pub(crate) cache_bytes_4k: u64,
-    pub(crate) cache_bytes_4m: u64,
     /// The rate we are willing to drive the store at, zero for unmetered. Read once
     /// per IO, and only at startup can it change.
     pub(crate) store_max_iops: u64,
@@ -460,6 +458,11 @@ pub(crate) struct Policy {
     pub(crate) occ_bytes: u64,
     /// The cache's target rate, in requests per decay interval. Zero disables the cache.
     pub(crate) cache_target_rate: u32,
+    /// DRAM ceiling for the read cache's index across every core and both classes. What
+    /// bounds the cache, since the media it is handed is whatever the slabs left over.
+    /// Not an admission check: the cache holds fewer chunks rather than refusing to
+    /// start.
+    pub(crate) cache_index_bytes: u64,
     /// Registers one anti-entropy sweep pulls while replaying a group, and pushes per
     /// extent while handing one over. The rate a member replacement and an extent
     /// handover run at (heal.rs).
@@ -472,6 +475,7 @@ impl Default for Policy {
             max_index_bytes: 8 << 30,
             occ_bytes: 256 << 20,
             cache_target_rate: 0,
+            cache_index_bytes: 1 << 30,
             repairs_per_replay: 4096,
         }
     }
@@ -997,8 +1001,6 @@ impl Config {
             cohort: n.cohort.ok_or_else(|| bad("node names no cohort"))? as u8,
             store: PathBuf::new(),
             store_bytes: n.store.as_ref().map_or(0, |s| s.size_bytes),
-            cache_bytes_4k: n.store.as_ref().map_or(0, |s| s.cache_bytes_4k),
-            cache_bytes_4m: n.store.as_ref().map_or(0, |s| s.cache_bytes_4m),
             store_max_iops: n.store.as_ref().map_or(0, |s| s.max_iops),
             store_max_bytes_per_sec: n.store.as_ref().map_or(0, |s| s.max_bytes_per_sec),
         };
@@ -1099,6 +1101,9 @@ impl Config {
                 .unwrap_or(Policy::default().max_index_bytes),
             occ_bytes: p.occ_bytes.unwrap_or(Policy::default().occ_bytes),
             cache_target_rate: p.cache_target_rate,
+            cache_index_bytes: p
+                .cache_index_bytes
+                .unwrap_or(Policy::default().cache_index_bytes),
             repairs_per_replay: p
                 .repairs_per_replay
                 .unwrap_or(Policy::default().repairs_per_replay),
@@ -1122,8 +1127,6 @@ impl Config {
                 cohort: Some(self.node.cohort as i32),
                 store: Some(pb::Store {
                     size_bytes: self.node.store_bytes,
-                    cache_bytes_4k: self.node.cache_bytes_4k,
-                    cache_bytes_4m: self.node.cache_bytes_4m,
                     max_iops: self.node.store_max_iops,
                     max_bytes_per_sec: self.node.store_max_bytes_per_sec,
                 }),
@@ -1178,6 +1181,7 @@ impl Config {
                 max_index_bytes: Some(self.policy.max_index_bytes),
                 occ_bytes: Some(self.policy.occ_bytes),
                 cache_target_rate: self.policy.cache_target_rate,
+                cache_index_bytes: Some(self.policy.cache_index_bytes),
                 repairs_per_replay: Some(self.policy.repairs_per_replay),
             }),
         }
@@ -1216,8 +1220,7 @@ impl Config {
                     let f = only(
                         &f,
                         &[
-                            "id", "zone", "cohort", "store", "size", "cache_4k", "cache_4m",
-                            "max_iops", "max_bps",
+                            "id", "zone", "cohort", "store", "size", "max_iops", "max_bps",
                         ],
                     )
                     .map_err(at)?;
@@ -1230,8 +1233,6 @@ impl Config {
                         cohort: Some(get_or(f, "cohort", 0).map_err(at)? as i32),
                         store: Some(pb::Store {
                             size_bytes: get(f, "size").map_err(at)?,
-                            cache_bytes_4k: get_or(f, "cache_4k", 0).map_err(at)?,
-                            cache_bytes_4m: get_or(f, "cache_4m", 0).map_err(at)?,
                             max_iops: get_or(f, "max_iops", 0).map_err(at)?,
                             max_bytes_per_sec: get_or(f, "max_bps", 0).map_err(at)?,
                         }),
@@ -1304,6 +1305,7 @@ impl Config {
                             "max_index_bytes",
                             "occ_bytes",
                             "cache_target_rate",
+                            "cache_index_bytes",
                             "repairs_per_replay",
                         ],
                     )
@@ -1312,6 +1314,7 @@ impl Config {
                         max_index_bytes: opt(f, "max_index_bytes").map_err(at)?,
                         occ_bytes: opt(f, "occ_bytes").map_err(at)?,
                         cache_target_rate: get_or(f, "cache_target_rate", 0).map_err(at)? as u32,
+                        cache_index_bytes: opt(f, "cache_index_bytes").map_err(at)?,
                         repairs_per_replay: opt(f, "repairs_per_replay")
                             .map_err(at)?
                             .map(|v| v as u32),
@@ -1643,7 +1646,7 @@ mod tests {
     const SAMPLE: &str = "\
 # the node itself
 generation 7
-node id=1 zone=1 cohort=0 store=/var/lib/racer/store.img size=68719476736 cache_4k=1048576
+node id=1 zone=1 cohort=0 store=/var/lib/racer/store.img size=68719476736
 
 universe 1 epoch=3
   peer id=2 device=/dev/nvme1n1

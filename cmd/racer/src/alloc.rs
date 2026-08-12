@@ -15,12 +15,13 @@
 
 mod shard;
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
+use crate::cache::Cache;
 use crate::config::{Config, GroupId, Kind, Live};
 use crate::heal::{self, Tuple};
 use crate::layout::{self, Class, Geometry, MBLOCK};
@@ -60,6 +61,15 @@ pub struct Pending {
 /// `config::validate` refuses a config whose small working set exceeds
 /// `policy.max_index_bytes` rather than letting the node OOM later.
 pub const INDEX_BYTES_PER_PAGE: u64 = 52;
+
+/// A slab lends only while more than `1/LEND_CEILING` of its stripe is genuinely free,
+/// and calls loans back below `1/LEND_FLOOR`. Two different fractions so the two are
+/// not fighting over the same slot: between them the slab neither lends nor reclaims.
+pub(super) const LEND_CEILING: u64 = 4;
+const LEND_FLOOR: u64 = 8;
+/// Loans recalled per reservation. Enough to stay ahead of a single allocating core,
+/// small enough that no one write pays for a whole refill.
+const LEND_BATCH: u64 = 8;
 
 /// DRAM cost of one OCC read record: the map entry, its share of the table, and its
 /// position in the pool's order.
@@ -123,6 +133,9 @@ pub struct Allocator {
     boot: layout::Consensus,
     /// Metadata blocks lost at startup, surfaced as a health metric.
     pub quarantined: usize,
+    /// The cache, once it exists. Only so the allocator can call in a loan of a free
+    /// 4 MiB slot without waiting for the cache to notice; see [`Allocator::top_up`].
+    cache: OnceCell<&'static Cache>,
 }
 
 // Sound because shard `i` is only ever borrowed from the worker pinned to core `i`,
@@ -231,13 +244,21 @@ impl Allocator {
         Ok(self.owner(addr, class))
     }
 
-    /// The registered device. Shared with the cache, which lives in its own statically
-    /// carved region of the same namespace.
+    /// Cores an address of `class` can hop to, which is the only set of cores the cache
+    /// may put slots of that class on: `owner_core` routes every lookup through this, so
+    /// a slot on any other core is unreachable.
+    pub fn shards_for(&self, class: Class) -> usize {
+        shards_for(self.cores, &self.geo, class)
+    }
+
+    /// The registered device. Shared with the cache, which holds the tail of the same
+    /// namespace.
     pub fn disk(&self) -> Disk {
         self.disk.clone()
     }
 
-    /// Where the cache region sits, for a caller that owns no `Geometry` of its own.
+    /// Where the layout ends and the cache tail begins, for a caller that owns no
+    /// `Geometry` of its own.
     pub fn geometry(&self) -> Geometry {
         self.geo
     }
@@ -277,6 +298,66 @@ impl Allocator {
         self.cores
     }
 
+    // ------------------------------------------------------------------------- loans
+
+    /// Give the allocator a way back to the cache. Called once at startup, after the
+    /// cache exists, before any worker runs.
+    pub fn attach(&self, cache: &'static Cache) {
+        let _ = self.cache.set(cache);
+    }
+
+    /// Lend the cache one free 4 MiB data slot from this core's stripe, as a byte
+    /// offset into the store.
+    ///
+    /// The allocator goes on counting a lent slot as free, so a loan cannot move the
+    /// watermarks that lending is gated on, and it takes the slot back the moment it
+    /// wants it. What the cache wrote there is unreachable after a restart either way:
+    /// the mblock entry naming the slot still says free.
+    pub fn lend(&self) -> Option<u64> {
+        let slot = self.shard(runtime::core()).lend()?;
+        Some(self.geo.slot_off(Class::Huge, slot))
+    }
+
+    /// Call loans back until this core's 4 MiB stripe has a real free reserve again.
+    ///
+    /// Synchronous and same-core because `Shard::reserve` cannot await: a loan has to
+    /// be recoverable from inside the reservation that needs it. The cache holds each
+    /// 4 MiB loan on the core that lent it, and a core owning a stripe of the 4 MiB
+    /// slab owns a stripe of the 4 MiB cache too, so no hop is needed.
+    ///
+    /// Nothing happens in the common case. A slab lends only above `1/LEND_CEILING`
+    /// free and reclaims below `1/LEND_FLOOR`, so this is reached long before a write
+    /// could fail for want of a slot, and the two fractions keep it from oscillating.
+    fn top_up(&self, class: Class) {
+        if class != Class::Huge {
+            return;
+        }
+        let Some(cache) = self.cache.get() else {
+            return;
+        };
+        let core = runtime::core();
+        // Close the borrow before calling into the cache: `give_back` is synchronous
+        // and must not find this core's shard already borrowed.
+        let want = {
+            let sh = self.shard(core);
+            let (free, total) = sh.capacity()[Class::Huge as usize];
+            let lent = sh.lent();
+            (total / LEND_FLOOR)
+                .saturating_sub(free.saturating_sub(lent))
+                .min(lent)
+                .min(LEND_BATCH)
+        };
+        for _ in 0..want {
+            let Some(off) = cache.give_back(core) else {
+                break;
+            };
+            let Some(slot) = self.geo.slot_at(Class::Huge, off) else {
+                continue;
+            };
+            self.shard(core).reclaim(slot);
+        }
+    }
+
     // ------------------------------------------------------------------ reservations
 
     /// Guard check plus free-list pop, all on the owning core. Synchronous: no IO has
@@ -294,6 +375,7 @@ impl Allocator {
         ballot: Ballot,
     ) -> Result<Ticket, Status> {
         let epoch = self.config().tombstone_epoch_of(addr.0);
+        self.top_up(class);
         self.shard(runtime::core())
             .reserve(addr, kind, class, guard, ballot, epoch)
     }
@@ -880,6 +962,7 @@ impl Allocator {
     ) -> Result<Option<Ticket>, Status> {
         let (kind, _, epoch) = self.extent(addr).ok_or(Status::Unmapped)?;
         runtime::on_core(self.owner(addr, class), move || async move {
+            self.top_up(class);
             self.shard(runtime::core()).reserve_unguarded(
                 addr,
                 kind,
@@ -1331,6 +1414,7 @@ pub fn open(
         shards,
         boot,
         quarantined,
+        cache: OnceCell::new(),
     })))
 }
 
