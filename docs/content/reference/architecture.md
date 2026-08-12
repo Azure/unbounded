@@ -192,8 +192,8 @@ applied by hand.
 
 To customize the generated Deployments and DaemonSets, use
 [workload overrides]({{< relref "reference/workload-overrides" >}}) rather than
-editing them directly: the operator applies with server-side apply and reverts
-out-of-band changes on the next reconcile.
+editing them directly: the operator applies with server-side apply and reclaims
+every field it declares on the next reconcile.
 
 | Directory | Contents |
 |-----------|----------|

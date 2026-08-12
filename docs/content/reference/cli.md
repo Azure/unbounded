@@ -450,9 +450,17 @@ document format and the security model.
 
 | Command | Description |
 |----------|-------------|
-| `overrides validate [-f FILE]` | Check syntax, schema, and the allowlist. Offline, so its answer is correct regardless of which operator version is running. Deliberately does not resolve container or volume names, which depend on the workloads the operator renders. |
-| `overrides list` | Show the entries the ConfigMap declares, and warn about Site names that match no Site. |
-| `overrides status` | Show what the operator actually applied, including any container image drift. Reads persisted state only; performs no rendering or hashing of its own. |
+| `overrides validate [-f FILE]` | Check syntax, schema, and the allowlist. The checks are offline, so their answer is correct regardless of which operator version is running; they deliberately do not resolve container or volume names, which depend on the workloads the operator renders. With no `-f` it reads the live ConfigMap, so the default invocation needs a cluster. |
+| `overrides list` | Show the entries the ConfigMap declares, warn about Site names that match no Site, and report any validation failure. |
+| `overrides status` | Show what the operator actually applied, including any container image drift. Reads persisted state only; performs no rendering or hashing of its own. Exits non-zero when any Site reports overrides `Degraded`, so it can gate a post-apply check. |
+
+#### Optional Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `-f`, `--filename` | string | `validate` only. Document to check, or `-` for standard input. Repeatable. Accepts a bare overrides document or the ConfigMap manifest you would apply. |
+| `--namespace` | string | Namespace holding the overrides ConfigMap. Defaults to `unbounded-system`; pass it if the operator is installed elsewhere. |
+| `--kubeconfig` | string | Path to kubeconfig file. |
 
 ```bash
 # Check a document before applying it.

@@ -630,7 +630,7 @@ they are combined:
 | Scalar set (`image`, `replicas`, `priorityClassName`, a `resources` leaf) | Last writer would win | Two contributors set the same path to **different** values. Identical values do not conflict. |
 | Map merge (`nodeSelector`, labels, annotations) | Keys union | Two contributors set the same key to different values |
 | List append (`tolerations`, `topologySpreadConstraints`) | Concatenate in contributor order | Never. Duplicates are permitted; the scheduler treats them as idempotent. |
-| `extraArgs` | Concatenate per container in contributor order | Never |
+| `extraArgs` | Concatenate per container in contributor order | Two contributors supply `extraArgs` for the **same container**, identical or not. Appending the same argument twice is not idempotent, and which of two conflicting flags a component honours would otherwise be decided by ConfigMap key names. |
 | Cartesian affinity ([§8.4](#84-additive-only-scheduling)) | Product of all contributors' term lists with the operator's | Never. The product is associative and order-independent. |
 | Merge-by-key list entry (`containers[name]`, `volumes[name]`, `env[name]`, `volumeMounts[mountPath]`) | Recurse into the entry and apply the rules above | Per the nested rule that applies |
 | `addContainers` / `addInitContainers` | Union of names | Two contributors declare the same name with **non-identical** container definitions |
@@ -1135,10 +1135,11 @@ rollout, one log line, and a Site still reporting `Ready=True`.
 
 | Failure | Scope | Result |
 |---|---|---|
-| Parse: malformed YAML, duplicate keys, multiple documents, trailing content, merge keys ([§6.2](#62-parsing-rules)) | Whole snapshot | Preflight fails. Every `Overridable` operation dropped, every component Degraded. |
-| Missing or unknown `apiVersion`, schema violation | Whole snapshot | As above |
-| Path outside the allowlist, protected path, `$` directive, explicit null | Whole snapshot | As above |
-| Resolution: container absent and not in `addContainers`, name in `addContainers` that already exists, `mountPath` collision | That object only | That object's operation dropped; every other operation executes |
+| Parse: malformed YAML, duplicate keys, multiple documents, trailing content, merge keys ([§6.2](#62-parsing-rules)) | That ConfigMap key, and every `Overridable` operation | The key's entries were never read, so nothing is known about what they would have changed. Other keys still contribute their entries. |
+| Missing or unknown `apiVersion` | That ConfigMap key, and every `Overridable` operation | As above: the document was rejected before its entries were read. |
+| Schema violation, path outside the allowlist, protected path, `$` directive, explicit null | That entry's `component`, `kind` and `sites` | The entry is dropped from the merge and the workloads it could have resolved to are withheld. Every other workload applies with its own overrides. |
+| Any of the above on an entry naming no recognised `component` | Nothing | The entry could never have resolved to a workload, since resolution matches on component. |
+| Resolution: container absent and not in `addContainers`, name in `addContainers` that already exists, `mountPath` collision, selector-label rewrite | That object only | That object's operation dropped; every other operation executes |
 | Conflict between contributors ([§6.5](#65-what-counts-as-a-conflict)) | That object only | As above |
 | `sites` naming a Site that does not exist | Nothing | Inert, reported ([§6.3](#63-resolution)) |
 | API or admission error during execution | That operation, its declared dependents, later operations on the same object, and that component's later tiers for that Site | Per [§9.2](#92-execution-semantics). A failed Namespace additionally gates every namespaced object in it. |
@@ -1147,10 +1148,25 @@ rollout, one log line, and a Site still reporting `Ready=True`.
 | The executor refuses the plan outright (dependency cycle, contradictory shared operations) | The whole pass | Nothing is written, so every component reports `PlanRejected`. No planning verdict describes the cluster. |
 | An operation no component owns fails, such as the Namespace | The whole pass | Collected as a pass error, which requeues. Nothing publishing per-component conditions can report it, and a failed Namespace skips every namespaced operation, so without this the pass returned success having done nothing and no watch would have triggered another. |
 
-Preflight failures are snapshot-wide because a document that does not parse
-cannot be attributed to a component. Resolution and conflict failures are
-object-scoped because step 4 knows exactly which object failed before anything
-is written.
+The scope of a preflight failure is decided by how much can be known about it,
+and the distinction is load-bearing rather than cosmetic. A key that does not
+parse held entries nobody read, so every workload an override could reach is in
+doubt. An entry that fails validation has already decoded its `component`,
+`kind` and `sites`, so exactly the workloads it could have resolved to are in
+doubt and no others.
+
+Conflating the two made one mis-indented line in one key withhold every
+overridable workload of every component on every Site, and discard the entries
+in the other keys while doing it. The format is one document per key so that a
+document can be split by concern or by team; that is only useful if a mistake in
+one key is contained to it.
+
+A workload with one good contributor and one bad one is withheld entirely. The
+alternative is applying a partial merge, which is a state the user never asked
+for and cannot see.
+
+Resolution and conflict failures remain object-scoped because step 4 knows
+exactly which object failed before anything is written.
 
 ### 9.6 Snapshot and consistency
 
@@ -1801,14 +1817,19 @@ because it is evidence about where the risk in this feature actually sits:
   an operation by name.
 - yaml.v3 decodes whole numbers as `int` while apimachinery accepts only
   `int64` and **panics** otherwise, so the first user to write `spec.replicas`
-  would have crashed the operator. Parsing normalizes decoded values.
+  would have taken the reconcile down. controller-runtime recovers a panic in
+  Reconcile into an error rather than crashing the process, so the symptom is a
+  permanent reconcile error with a stack trace and no progress on any Site.
+  Parsing normalizes decoded values.
 
 ### What review changed after implementation
 
 A review of the implemented feature raised twenty-five findings. The sections
 above are corrected rather than annotated, so this is only a record of where the
-remaining risk turned out to sit. Two of them crashed the operator from a
-document that passed validation, and both were reproduced before being fixed:
+remaining risk turned out to sit. Two of them panicked the reconcile from a
+document that passed validation, and both were reproduced before being fixed.
+controller-runtime recovers such a panic into a reconcile error, so neither
+crashed the process; both stopped the operator making progress on any Site:
 
 - yaml.v3 resolves an unquoted date to `time.Time`, which apimachinery's
   `DeepCopyJSONValue` panics on exactly as it does on a plain `int`. The

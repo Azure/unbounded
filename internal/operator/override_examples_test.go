@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -530,4 +531,119 @@ func sortedKeys(set map[string]bool) string {
 	sort.Strings(keys)
 
 	return strings.Join(keys, ", ")
+}
+
+// TestDocumentedPathsMatchTheAllowlist holds the reference documentation
+// against the allowlist the operator compiles.
+//
+// The doc tells users that anything not listed is rejected, which is only
+// useful if the list is right. PermittedPaths and ProtectedPaths are exported
+// for exactly this, and nothing consumed them, so the doc listed nothing at all
+// and a user's only way to learn the surface was to trip over errors.
+//
+// The comparison runs in both directions: a path added to the allowlist and not
+// to the doc is undiscoverable, and a path in the doc and not the allowlist is
+// a promise the operator does not keep.
+func TestDocumentedPathsMatchTheAllowlist(t *testing.T) {
+	doc := filepath.Join(repoRootForExamples(t), "docs", "content", "reference", "workload-overrides.md")
+
+	contents, err := os.ReadFile(doc)
+	if err != nil {
+		t.Fatalf("read %s: %v", doc, err)
+	}
+
+	for _, section := range []struct {
+		name     string
+		declared []string
+	}{
+		{name: "permitted paths", declared: override.PermittedPaths()},
+		{name: "protected paths", declared: override.ProtectedPaths()},
+	} {
+		t.Run(section.name, func(t *testing.T) {
+			documented := documentedPaths(t, string(contents), section.name)
+
+			if !slices.Equal(documented, section.declared) {
+				t.Errorf("the %s section of workload-overrides.md is out of date.\n documented: %v\n allowlist:  %v\n\n"+
+					"Regenerate the list between the BEGIN and END markers from override.PermittedPaths and "+
+					"override.ProtectedPaths.", section.name, documented, section.declared)
+			}
+		})
+	}
+}
+
+// documentedPaths extracts the bulleted paths from a generated block, so the
+// prose around them can change freely without breaking the comparison.
+func documentedPaths(t *testing.T, contents, section string) []string {
+	t.Helper()
+
+	var (
+		begin = "<!-- BEGIN GENERATED: " + section + " -->"
+		end   = "<!-- END GENERATED: " + section + " -->"
+	)
+
+	from := strings.Index(contents, begin)
+	to := strings.Index(contents, end)
+
+	if from < 0 || to < 0 || to < from {
+		t.Fatalf("workload-overrides.md has no %q block; the generated markers must not be removed", section)
+	}
+
+	var paths []string
+
+	for _, line := range strings.Split(contents[from+len(begin):to], "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "- `") || !strings.HasSuffix(line, "`") {
+			continue
+		}
+
+		paths = append(paths, strings.TrimSuffix(strings.TrimPrefix(line, "- `"), "`"))
+	}
+
+	return paths
+}
+
+// TestDocumentedComponentKindsMatchTheTable holds the component/kind table in
+// the reference documentation against what validation actually accepts. Seven
+// of the ten pairs the two lists once accepted between them could never match
+// anything, which is the mistake this table exists to prevent users repeating.
+func TestDocumentedComponentKindsMatchTheTable(t *testing.T) {
+	doc := filepath.Join(repoRootForExamples(t), "docs", "content", "reference", "workload-overrides.md")
+
+	contents, err := os.ReadFile(doc)
+	if err != nil {
+		t.Fatalf("read %s: %v", doc, err)
+	}
+
+	for _, component := range []string{"net", "machina", "gantry", "metalman", "storage"} {
+		kinds := override.ComponentKinds(component)
+		if len(kinds) == 0 {
+			t.Fatalf("override.ComponentKinds(%q) is empty; the test is looking at the wrong names", component)
+		}
+
+		row := "| `" + component + "` | "
+
+		line, found := findLine(string(contents), row)
+		if !found {
+			t.Errorf("workload-overrides.md has no component table row for %q", component)
+
+			continue
+		}
+
+		for _, kind := range kinds {
+			if !strings.Contains(line, "`"+kind+"`") {
+				t.Errorf("the component table says %q emits %s, but validation accepts %v",
+					component, line, kinds)
+			}
+		}
+	}
+}
+
+func findLine(contents, prefix string) (string, bool) {
+	for _, line := range strings.Split(contents, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line, true
+		}
+	}
+
+	return "", false
 }
