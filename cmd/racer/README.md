@@ -64,7 +64,7 @@ Each extent has a specific type:
 - __OCC__ (optimistic concurrency control): RACER tracks the revision of a page when it is read. Writes cause a conflict error if another consumer has modified the same page since the previous read.
 - __Immutable__: write once, free once. Useful for implementing [CORFU](https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final30.pdf). Sparse allocated, supports the full block device address space.
 
-Only immutable extents support wide (e.g. 4MB) pages. Others are strictly 4KB. A device may not mix the two page sizes.
+Only immutable extents support wide (e.g. 4MB) pages. Others are strictly 4KB. A device may concatenate both: the page size belongs to the extent, so a device exports 4KB logical blocks throughout, and a write or a discard landing in a wide extent has to cover one whole aligned wide page.
 
 ## Control Plane
 

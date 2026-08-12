@@ -940,12 +940,21 @@ func (x *Extent) GetWarmZones() []uint32 {
 // where N-1's ended. Nothing here is stored, since a device is a view; the same extent may
 // appear in devices on several nodes, in different positions, alongside different
 // neighbours. A device may not name the same extent twice, which would alias two offsets
-// onto one page, and every extent in it must have the same page size, since the exported
-// device advertises one page as both its maximum transfer and its chunk size.
+// onto one page.
+//
+// Page size belongs to the extent, not to the device, so one device may concatenate both
+// sizes. It is exported in 4 KiB logical blocks either way, and takes requests of up to
+// 4 MiB. Where it is backed by 4 MiB pages a write or a discard must cover one whole
+// aligned page, since that is the unit the page is replicated and freed in; a read of such
+// a page may be any 4 KiB-aligned part of it. A request that spans several pages is served
+// as one operation per page and is refused whole if any of them would be partial.
 type Device struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Non-zero and unique in this file. Names the exported ublk device for its life; a device
-	// that keeps its id and its extent list across a reload keeps its open handles.
+	// Non-zero and unique in this file, counting the fabric device of every universe. It is
+	// the ublk minor the node asks the kernel for, so the device is at `/dev/ublkb<id>` and
+	// the control plane can publish the path before the node is up. Names the exported ublk
+	// device for its life; a device that keeps its id and its extent list across a reload
+	// keeps its open handles.
 	Id uint32 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
 	// Extent ids, in the order they are concatenated. Non-empty, no duplicates, and every id
 	// must name an extent of some universe in this file. Extents from different universes may
