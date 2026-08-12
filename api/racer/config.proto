@@ -1,36 +1,28 @@
 // The node configuration: the only input the control plane gives the dataplane.
 //
-// This file is the contract between the Go control plane and the Rust dataplane, and
-// the source of both. Neither side hand-writes these types.
+// This file is the contract between the Go control plane and the Rust dataplane and
+// generates both, so neither side hand-writes these types.
 //
-// Delivery. The control plane rename(2)s a complete new file into the watched
-// directory; the node watches the directory, not the file. Every push is the whole
-// configuration - no partial updates, no per-field patches.
-//
-// Applying. A new file is validated in full, then validated again against the config
-// the node is already running. Either failure rejects the entire file: the node keeps
-// running what it has, nothing is partially applied, and the only signal is the
-// rejected-configs counter in the node's metrics. A control plane that pushes a config
-// the node refuses gets no other feedback, so watch that counter.
+// Delivery. The control plane rename(2)s a complete new file into the watched directory;
+// the node watches the directory, not the file. Every push is the whole configuration,
+// never a patch. A new file is validated in full, then against the config already running;
+// either failure rejects the whole file and the node keeps what it has. The only signal is
+// the rejected-configs counter in the node's metrics, so watch it.
 //
 // Zero is reserved. No node, zone, universe, extent or device id may be zero, so zero
-// always reads as "none" and never as a name: `Extent.next_zone = 0` is "not migrating"
-// and nothing else.
+// always means "none": `Extent.next_zone = 0` is "not migrating" and nothing else.
 //
-// The shape of the model. A *universe* is a flat, sparse address space in 4 KiB units
-// that spans a set of nodes, and simultaneously the transport that reaches them, the
-// security boundary around them, and the consensus domain they agree in. An *extent* is
-// a contiguous run of that space with one page size, one kind, one home zone and one
-// tombstone epoch: the unit of placement, sealing, migration and accounting. A *device*
-// is a local block device this node exports, composed of whole extents in whatever
-// order this node wants them. Two nodes may compose entirely different devices out of
-// the same extents, and a node may hold extents it exports through no device at all.
+// The model. A *universe* is a flat, sparse address space in 4 KiB units spanning a set of
+// nodes, and at once the transport reaching them, the security boundary around them and the
+// consensus domain they agree in. An *extent* is a contiguous run of that space with one
+// page size, kind, home zone and tombstone epoch: the unit of placement, sealing, migration
+// and accounting. A *device* is a local block device this node exports, composed of whole
+// extents in any order; two nodes may compose different devices from the same extents, and
+// a node may hold extents no device exports.
 //
-// What a reload can and cannot change is structural here. Everything in `Node.store` is
-// baked into the store's superblock at format time or read once at startup, so a change
-// to it is accepted and does nothing until the process restarts. An existing extent's
-// `base_lba`, `pages` and `kind` are frozen for its life, and an existing device's
-// extent list is frozen for its life. Every other field is hot.
+// Reloads. `Node.store` is read at format time or startup, so changing it does nothing
+// until the process restarts. An existing extent's `base_lba`, `pages` and `kind` are
+// frozen for its life, as is an existing device's extent list. Every other field is hot.
 
 syntax = "proto3";
 
@@ -39,22 +31,20 @@ package racer.config;
 option go_package = "github.com/Azure/unbounded/api/racer;racerconfig";
 
 message NodeConfig {
-  // Strictly increasing per node: a value equal to or below the running one is
-  // rejected, so bump it on every push. It is also echoed in the node's PING, so a peer
-  // that redirected us on a stale topology can tell whether we have yet picked up the
-  // file it expects us to have. The value itself is opaque; nothing compares
-  // generations across nodes.
+  // Strictly increasing per node; a value at or below the running one is rejected. Echoed
+  // in the node's PING so a peer that redirected us on a stale topology can tell whether we
+  // have the file yet. Opaque, and never compared across nodes.
   uint64 generation = 1;
 
   Node node = 2;
 
-  // The universes this node participates in. Each one costs a ublk device and an
-  // exported namespace, and each device below costs another; the two together are
-  // capped by the node's device budget (256).
+  // The universes this node participates in. Each costs a ublk device and an exported
+  // namespace, as does each device below; together they are capped by the node's device
+  // budget (256).
   repeated Universe universes = 3;
 
-  // The block devices this node exports. Adding and removing devices is free; an
-  // existing device's extent list is frozen (see Device).
+  // The block devices this node exports. Adding and removing devices is free; an existing
+  // device's extent list is frozen (see Device).
   repeated Device devices = 4;
 
   // Optional; absent means every default below.
@@ -64,25 +54,22 @@ message NodeConfig {
 // ---- identity ---------------------------------------------------------------------
 
 message Node {
-  // NodeId, non-zero. This node's identity to its peers, and the value matched against
-  // a catalog group to find our position in it. One identity across every universe: a
-  // node is the same node wherever it is admitted.
+  // NodeId, non-zero. This node's identity to its peers, and the value matched against a
+  // catalog group to find our position in it. One identity across every universe.
   uint32 id = 1;
 
-  // The fault domain, ~300 nodes. Each universe's `catalog` describes this zone and no
-  // other, and must not also appear in that universe's `zones`.
+  // The fault domain, ~300 nodes. Each universe's `catalog` describes this zone only, and
+  // this zone must not also appear in that universe's `zones`.
   uint32 zone = 2;
 
   // The column of every catalog group that is our cooperative-cache roster: cohort `c`
   // takes column `c` of the whole catalog, which is why member order in a group is
-  // normative. One column across every universe, because it is a property of this node
-  // and not of any one address space. Required: a config that names no cohort is
-  // refused, so a control plane that forgets the field cannot silently ship cohort 0.
+  // normative. One column across every universe. Required, so that forgetting the field
+  // cannot silently ship cohort 0.
   optional Cohort cohort = 3;
 
-  // The local backing store this node owns outright, and what is carved out of it. One
-  // store behind every universe: partitioning is enforced above it, in what this node is
-  // admitted to and what it will answer for, not by giving each universe its own file.
+  // The local backing store this node owns outright. One store behind every universe:
+  // partitioning is enforced by what this node is admitted to, not by separate files.
   Store store = 4;
 }
 
@@ -92,154 +79,126 @@ enum Cohort {
   COHORT_2 = 2;
 }
 
-// The local backing store this node owns outright: one regular file, of exactly the
-// length named here. Nothing in this message is on an IO path: every field is written
-// into the superblock when the store is formatted, read once at startup, or checked when
-// a config is validated, so a change is accepted and takes effect on the next restart.
-//
-// The path is deliberately absent. Where the file lives is a property of how the node
-// was deployed, not of the cluster the control plane describes, so it comes from the
-// `RACER_STORE` environment variable instead (default /var/lib/racer/store.img).
+// The local backing store this node owns outright: one regular file of exactly the length
+// named here. Nothing here is on an IO path; every field goes into the superblock at format
+// time, is read once at startup, or is checked at validation, so a change takes effect on
+// the next restart. The path is deliberately absent, since where the file lives is a
+// property of the deployment rather than of the cluster: it comes from the `RACER_STORE`
+// environment variable (default /var/lib/racer/store.img).
 message Store {
   // The length the backing file is held at, in bytes. Non-zero and a multiple of 4096.
-  // The file is created at this length on first start and extended to it on a later one,
-  // so raising this value and restarting is how a node is given more capacity.
+  // Created at this length on first start and extended to it later, so raising this and
+  // restarting is how a node gains capacity. It may never be lowered: a config asking for
+  // less than the file already has is rejected, as is a start that finds a longer file,
+  // because the store is addressed by absolute offset and nothing could move its contents.
   //
-  // It may never be lowered: a config that asks for less than the file already has is
-  // rejected, and so is a start that finds a file longer than this. The store's contents
-  // are addressed by absolute offset and there is nothing that could move them.
-  //
-  // Everything the node holds comes out of this: the superblocks, the metadata region,
-  // and the data slabs sized from every universe's extents. A configuration that does
-  // not fit is refused at startup, naming this field.
-  //
-  // Whatever is left over is the read cache. There is nothing to configure: every 4 MiB
-  // the slabs did not claim is handed to the cache, which gives it back if a later
-  // config grows the slabs into it. Raising this field is therefore how a node is given
-  // more cache as well as more capacity, and `policy.cache_index_bytes` is what bounds
-  // the DRAM that cache costs.
+  // Everything comes out of this: superblocks, the metadata region, and the data slabs
+  // sized from every universe's extents. A configuration that does not fit is refused at
+  // startup, naming this field. Whatever is left over is the read cache, with nothing to
+  // configure: every 4 MiB the slabs did not claim goes to the cache, which gives it back
+  // if a later config grows the slabs into it. `policy.cache_index_bytes` bounds the DRAM
+  // that cache costs.
   uint64 size_bytes = 1;
 
-  // The rate this node will drive its own storage at. Storage that meters a client and
-  // then delays or fails whatever exceeds the meter is better served by staying under
-  // it: pacing our own submissions costs a bounded wait, overshooting costs an
-  // unbounded one applied to whichever IO happens to be in flight. Set these below what
-  // the device under the file will actually take, not at it.
+  // The rate this node will drive its own storage at. Set these below what the device under
+  // the file will actually take, not at it: pacing our own submissions costs a bounded
+  // wait, while overshooting storage that then delays or fails the excess costs an
+  // unbounded one applied to whichever IO is in flight.
   //
-  // Both are enforced at once and either can bind first - small writes exhaust
-  // operations while the byte budget idles, and a 4 MiB page does the reverse. A
-  // transfer larger than 256 KiB is charged as several operations, matching how such
-  // devices are usually metered. Zero leaves that resource unmetered; zero on both is a
-  // free path with nothing to account.
-  //
-  // When the budget is committed far enough ahead, work that can be dropped is dropped:
-  // cache admission and anti-entropy stand down so that guest IO and consensus keep the
-  // whole of what is left.
+  // Both are enforced at once and either can bind first: small writes exhaust operations
+  // while the byte budget idles, and a 4 MiB page does the reverse. A transfer larger than
+  // 256 KiB is charged as several operations. Zero leaves that resource unmetered. When the
+  // budget is committed far enough ahead, cache admission and anti-entropy stand down so
+  // guest IO and consensus keep the rest.
   uint64 max_iops          = 2;
   uint64 max_bytes_per_sec = 3;
 }
 
 // ---- universes ---------------------------------------------------------------------
 
-// A universe: one flat address space, one transport, one security boundary, one
-// consensus domain.
+// A universe: one flat address space, one transport, one security boundary, one consensus
+// domain. Universes share this node's store, cores and cache and nothing else; each has its
+// own topology epoch, catalog, peer zones and links, and no address, group, seal or
+// migration crosses between them.
 //
-// The dataplane exports one ublk device per universe and the control plane publishes it
-// as a namespace to that universe's members and to nobody else. A frame's universe is
-// therefore not a field on the wire - it is which namespace the frame arrived on - and
-// partitioning is enforced by the transport rather than by a check the dataplane could
-// get wrong. A node not admitted to a universe cannot address it at all.
-//
-// Universes share this node's store, its cores and its cache; they share nothing else.
-// Each carries its own topology epoch, its own catalog, its own peer zones and its own
-// links, and no address, group, seal or migration ever crosses from one to another.
+// The dataplane exports one ublk device per universe and the control plane publishes it as
+// a namespace to that universe's members alone. A frame's universe is not a field on the
+// wire, it is which namespace the frame arrived on, so the transport enforces partitioning
+// rather than a check the dataplane could get wrong.
 message Universe {
-  // Globally unique and never reused, non-zero, below 2^26. It is the high 26 bits of
-  // every address in this universe: an address is `universe:26 | lba:38`, so a universe
-  // spans 2^38 4 KiB blocks, or 1 PiB. Zero is reserved because a zero address means
-  // "free" in the on-device index.
+  // Globally unique, never reused, non-zero, below 2^26. It is the high 26 bits of every
+  // address here: an address is `universe:26 | lba:38`, so a universe spans 2^38 4 KiB
+  // blocks, or 1 PiB. Zero is reserved because a zero address means "free" on device.
   uint32 id = 1;
 
-  // Bumped by the control plane whenever this universe's topology changes. It rides in
-  // the trailer of every routed write and is the term used when an extent is sealed,
-  // which is persisted to the device. Treat it as monotonic: nothing enforces that, and
-  // a decrease silently walks seal terms backwards. Per universe, so churn in one is
-  // invisible to the rest.
+  // Bumped by the control plane whenever this universe's topology changes. It rides in the
+  // trailer of every routed write and is the term used when an extent is sealed, which is
+  // persisted. Treat it as monotonic: nothing enforces that, and a decrease silently walks
+  // seal terms backwards.
   uint32 epoch = 2;
 
-  // The consensus groups of this zone within this universe; an entry's index is its
-  // group index. Each is three distinct, non-zero nodes. ~300 entries.
+  // The consensus groups of this zone within this universe; an entry's index is its group
+  // index. Each is three distinct, non-zero nodes. ~300 entries.
   //
-  // An address is hashed to one of 16384 slots with a fixed function, and the slot
-  // rather than the group is what travels on the wire; the group that owns it is
-  // `slot % len(catalog)`. So the length is fixed for the life of the zone and a reload
-  // that changes it is refused: the group a slot lands on also selects the core that
-  // serves the address and the key anti-entropy accumulates digests under, and nothing
-  // moves pages between groups. Ownership moves by changing a group's members instead,
-  // which every one of those derivations survives.
+  // An address hashes to one of 16384 slots, and the slot rather than the group travels on
+  // the wire; the owning group is `slot % len(catalog)`. The length is therefore fixed for
+  // the life of the zone and a reload that changes it is refused: the group also selects
+  // the core that serves the address and the key anti-entropy accumulates digests under,
+  // and nothing moves pages between groups. Ownership moves by changing a group's members.
   //
-  // The nodes of a zone are homogeneous, so the catalog must be balanced: every node it
-  // names appears in exactly `3 * len(catalog) / n` groups, where `n` is the number of
-  // distinct nodes named, and `n` must divide `3 * len(catalog)`. A catalog that gives
-  // one node more groups than another is refused. There is no other capacity model: a
-  // node sizes its store from that equal share in each universe it joins, so every node
-  // of a zone formats identically and any of them can be replaced by any other.
+  // The catalog must be balanced, because the nodes of a zone are homogeneous: every node
+  // it names appears in exactly `3 * len(catalog) / n` groups, where `n` is the number of
+  // distinct nodes named, and `n` must divide `3 * len(catalog)`. An unbalanced catalog is
+  // refused. This is the only capacity model: a node sizes its store from that equal share
+  // in each universe it joins, so every node of a zone formats identically.
   //
-  // Between consecutive generations the set of members may differ by at most one id:
-  // the catalog replaces one node at a time. The newcomer inherits the departing node's
-  // groups, replays them from its peers, and the departing node drops what it held once
-  // the new members confirm they have it. A node that has missed generations is held to
-  // no such step, since it is being handed a settled state rather than a transient.
+  // Consecutive generations may differ by at most one member id. The newcomer inherits the
+  // departing node's groups and replays them from its peers; the departing node drops what
+  // it held once the new members confirm they have it. A node that has missed generations
+  // is held to no such step, since it is handed a settled state rather than a transient.
   //
-  // A node this catalog does not name is not a member of this zone in this universe. It
-  // is either being decommissioned, and runs the config that drops it in order to drain,
-  // or it only routes for others.
+  // A node this catalog does not name is not a member of this zone in this universe: it is
+  // either draining under the config that dropped it, or it only routes for others.
   repeated Trio catalog = 3;
 
-  // The other zones of this universe, with their gateway nodes. Exactly the set an
-  // extent's `zone`, `next_zone` and `warm_zones` may name besides our own, which keeps
-  // this message O(zones) rather than O(cluster). Must not list our own zone, and ids
-  // must be unique.
+  // The other zones of this universe, with their gateway nodes. Exactly the set an extent's
+  // `zone`, `next_zone` and `warm_zones` may name besides our own, which keeps this message
+  // O(zones) rather than O(cluster). Must not list our own zone; ids must be unique.
   repeated Zone zones = 4;
 
   // One NVMe link per entry, each to this universe's namespace on the named node. A peer
-  // reached in two universes appears once in each, with a different device path, and the
-  // two links are unrelated: a frame is answered in the universe it arrived on.
+  // reached in two universes appears once in each with a different path, and the two links
+  // are unrelated: a frame is answered in the universe it arrived on. Fully hot: an
+  // unchanged device path keeps its open fd across a reload, and a dropped peer is torn
+  // down only after the previous generation retires.
   //
-  // Fully hot: a peer whose device path is unchanged keeps its open fd across a reload,
-  // and a dropped peer is torn down only after the previous generation retires.
-  //
-  // A universe with no peers is its own quorum of one - deliberate isolation, not a
-  // degraded mode. Do not ship an empty peer list for a universe meant to be replicated.
+  // A universe with no peers is its own quorum of one: deliberate isolation, not a degraded
+  // mode. Do not ship an empty peer list for a universe meant to be replicated.
   repeated Peer peers = 5;
 
-  // The extents of this universe that this node has been told about, sorted by
-  // `base_lba` and non-overlapping. This is the control plane's map of the universe's
-  // address space, and it is what makes an address meaningful: an address outside every
-  // extent is unmapped and every operation on it is refused.
-  //
-  // A node is told about the extents it stores, the extents it exports, and the extents
-  // it routes for. It need not be told about the rest of the universe.
+  // The extents of this universe this node has been told about, sorted by `base_lba` and
+  // non-overlapping. This is the control plane's map of the address space and what makes an
+  // address meaningful: an address outside every extent is unmapped and every operation on
+  // it is refused. A node is told about the extents it stores, exports or routes for, and
+  // need not be told about the rest of the universe.
   repeated Extent extents = 6;
 
-  // The ublk minor this node exports this universe's fabric namespace on, so the path
-  // is `/dev/ublkb<fabric_device_id>` and the control plane knows it before the node
-  // starts. Non-zero, unique on this node against every other universe's value and
-  // against every `Device.id`, and counted against the same 256 export budget.
-  //
-  // The control plane publishes this device as an NVMe-oF namespace to exactly this
-  // universe's members, and the paths it hands back are the `Peer.device` entries the
-  // members open. Frozen for the life of the universe on this node: changing it moves
-  // every peer's path and drops every open fd.
+  // The ublk minor this node exports this universe's fabric namespace on, so the path is
+  // `/dev/ublkb<fabric_device_id>` and the control plane knows it before the node starts.
+  // Non-zero, unique on this node against every other universe's value and every
+  // `Device.id`, and counted against the same 256 export budget. The control plane
+  // publishes this device as an NVMe-oF namespace to exactly this universe's members, and
+  // the paths it hands back are the `Peer.device` entries they open. Frozen for the life of
+  // the universe here: changing it moves every peer's path and drops every open fd.
   uint32 fabric_device_id = 7;
 }
 
-// One end of a fabric link, within one universe. No address, port or NQN here on
-// purpose: connecting is the control plane's job, and by the time the dataplane sees
-// this the link is just a local file to open.
+// One end of a fabric link, within one universe. No address, port or NQN here on purpose:
+// connecting is the control plane's job, and by the time the dataplane sees this the link
+// is just a local file to open.
 message Peer {
-  // The remote node's id. Non-zero, not our own, and unique within this universe's peer
-  // list. This is what turns a catalog group member into a link.
+  // The remote node's id. Non-zero, not our own, unique within this universe's peer list.
+  // This is what turns a catalog group member into a link.
   uint32 id = 1;
 
   // Local path to this peer's namespace *for this universe*, already attached by the
@@ -247,9 +206,8 @@ message Peer {
   string device = 2;
 }
 
-// Three node ids in cohort order. Position is normative: in a catalog group it is the
-// paxos member index, with quorum 2 of 3, and the column is the cooperative-cache
-// cohort. A permuted trio is a different trio.
+// Three node ids in cohort order. Position is normative: in a catalog group it is the paxos
+// member index, with quorum 2 of 3, and the column is the cooperative-cache cohort.
 message Trio {
   uint32 cohort_0 = 1;
   uint32 cohort_1 = 2;
@@ -258,166 +216,137 @@ message Trio {
 
 // A peer zone of this universe, and the nodes of it that accept traffic from outside.
 //
-// A sender ranks the gateways by rendezvous hash on the address and takes the highest
-// it holds a link to, so load spreads over the whole set without negotiating and a
-// gateway that is gone is skipped rather than fatal. The set is therefore a capacity
-// and availability knob: widen it to spread cross-zone traffic over more of the zone's
-// edge, and size it so that losing one node still leaves a reachable gateway.
-//
-// Unlike the cooperative cache's ring, this one promotes: a skipped gateway hands its
-// share to the next, because any gateway can resolve any address in its zone and there
-// is no counterparty that has to agree on the choice.
+// A sender ranks the gateways by rendezvous hash on the address and takes the highest it
+// holds a link to, so load spreads over the whole set without negotiating and a gateway
+// that is gone is skipped rather than fatal. Widen the set to spread cross-zone traffic
+// over more of the zone's edge; size it so losing one node still leaves a reachable
+// gateway. Unlike the cooperative cache's ring this one promotes, handing a skipped
+// gateway's share to the next, because any gateway can resolve any address in its zone and
+// no counterparty has to agree on the choice.
 message Zone {
   uint32 id = 1;
 
   // Non-empty, non-zero, unique, and not this node. At most 64. At least one must also
-  // appear in this universe's `peers`, since a zone we hold no link into is a zone we
-  // cannot route to; a config that names an unreachable zone is refused rather than
-  // discovered at the first request.
+  // appear in this universe's `peers`: a zone we hold no link into is a zone we cannot
+  // route to, and a config naming an unreachable zone is refused up front.
   repeated uint32 gateways = 2;
 }
 
 // ---- extents ----------------------------------------------------------------------
 
 message Extent {
-  // Non-zero, and unique across every universe in this file, not merely within its own.
-  // The dataplane keys seals, the census and the per-extent metrics by this id alone,
-  // and a device names its extents by it, so control planes should allocate extent ids
-  // from one space. Never reused.
+  // Non-zero, and unique across every universe in this file, not merely within its own: the
+  // dataplane keys seals, the census and the per-extent metrics by this id alone, and a
+  // device names its extents by it. Allocate extent ids from one space. Never reused.
   uint32 id = 1;
 
-  // Where this extent starts in its universe's address space, in 4 KiB blocks. Frozen
-  // for the extent's life: the address of a page is `universe | base_lba + offset`, and
-  // there is nothing that could move stored pages to a new address.
-  //
-  // The control plane places extents; the dataplane never picks a base. For an
-  // IMMUTABLE_4M extent this must be a multiple of 1024, since each of its pages spans
-  // 1024 blocks. `base_lba` plus the extent's span must fit in 2^38.
+  // Where this extent starts in its universe's address space, in 4 KiB blocks. Frozen for
+  // the extent's life, since a page's address is `universe | base_lba + offset` and nothing
+  // could move stored pages. The control plane places extents; the dataplane never picks a
+  // base. For an IMMUTABLE_4M extent this must be a multiple of 1024, since each of its
+  // pages spans 1024 blocks. `base_lba` plus the extent's span must fit in 2^38.
   uint64 base_lba = 2;
 
   // Length in *pages* of this extent's kind, not in blocks and not in bytes, so a
-  // misaligned extent is unrepresentable. Non-zero. Summed across every universe this
-  // sizes the store at format time and is what the index budget is checked against, so
-  // it cannot change once the extent exists. Grow capacity by adding an extent, not by
-  // extending one.
+  // misaligned extent is unrepresentable. Non-zero. Summed across every universe this sizes
+  // the store at format time and is what the index budget is checked against, so it cannot
+  // change once the extent exists. Grow capacity by adding an extent, not by extending one.
   uint64 pages = 3;
 
-  // Frozen for the extent's life. Determines the guard a write must present and the page
-  // size, and nothing else - the kinds share one code path.
+  // Frozen for the extent's life. Sets the guard a write must present and the page size,
+  // and nothing else; the kinds share one code path.
   Kind kind = 4;
 
   // Home zone: where these bytes live. Must be our own zone or one listed in this
   // universe's `zones`.
   uint32 zone = 5;
 
-  // 0 = not migrating; else the zone the bytes are being pulled to. Must differ from
-  // `zone` and must also be a zone known to this universe.
-  //
-  // Setting this starts a migration: the source zone seals the extent and pushes it, and
-  // the destination treats incoming writes for it as local. It keeps pushing until the
-  // control plane declares the move done by setting `zone` to this value and clearing
-  // this field to 0. That flip is the only completion signal there is - the dataplane
-  // never decides a migration has finished. A home zone may only move to the value
-  // `next_zone` previously held.
-  //
-  // A migration moves an extent between zones of one universe. Nothing moves an extent
-  // between universes; that is what the boundary means.
+  // 0 = not migrating; else the zone the bytes are being pulled to. Must differ from `zone`
+  // and be a zone this universe knows. Setting it starts a migration: the source zone seals
+  // the extent and pushes it, and the destination treats incoming writes for it as local.
+  // It keeps pushing until the control plane sets `zone` to this value and clears this
+  // field to 0. That flip is the only completion signal there is; the dataplane never
+  // decides a migration has finished, and a home zone may only move to the value
+  // `next_zone` previously held. Nothing moves an extent between universes.
   uint32 next_zone = 6;
 
-  // The most load-bearing scalar in this file, and scoped to this extent alone. Page
-  // versions in it are `3*epoch + state`: `3e` empty, `3e+1` live, `3e+2` trimmed.
-  // Advancing it does three things at once with no consensus round - the extent's
-  // tombstones from every earlier epoch become reclaimable, every cached immutable page
-  // in it is invalidated, and the guard an immutable write to it must present moves to
-  // `3*epoch`. Other extents are untouched, so one extent's collection never waits on
-  // another's.
+  // The most load-bearing scalar in this file, scoped to this extent alone. Page versions
+  // in it are `3*epoch + state`: `3e` empty, `3e+1` live, `3e+2` trimmed. Advancing it does
+  // three things at once with no consensus round: the extent's tombstones from every
+  // earlier epoch become reclaimable, every cached immutable page in it is invalidated, and
+  // the guard an immutable write must present moves to `3*epoch`. Other extents are
+  // untouched.
   //
-  // It may never decrease: that would put the fill point below entries the extent
-  // already holds, and every later write to them would conflict forever. Any forward
-  // step is legal - nothing in the dataplane observes the size of one, so a node down
-  // for several generations adopts the current value rather than refusing the whole
-  // file.
+  // It may never decrease, which would put the fill point below entries the extent already
+  // holds and make every later write to them conflict forever. Any forward step is legal,
+  // so a node down for several generations adopts the current value rather than refusing
+  // the whole file.
   //
   // Advancing is destructive, not just a collection: every page still live below the new
-  // epoch becomes unreadable and its slot is never reclaimed. Advance only once every
-  // node reports `racer_extent_live_pages{extent=...} == 0` at the current epoch;
-  // afterwards `racer_extent_tombstones{extent=...}` draining to zero is the sweep
-  // finishing.
+  // epoch becomes unreadable and its slot is never reclaimed. Advance only once every node
+  // reports `racer_extent_live_pages{extent=...} == 0` at the current epoch; afterwards
+  // `racer_extent_tombstones{extent=...}` draining to zero is the sweep finishing.
   uint32 tombstone_epoch = 7;
 
-  // Cache admission for this extent, and the only knob that decides whether a page of it
-  // may enter a node's cache at all:
+  // Cache admission for this extent, and the only knob deciding whether a page of it may
+  // enter a node's cache at all:
   //
   //   0       never; pages of this extent are not cached, and are not even counted
   //   1       admit on first sight
   //   2..=15  admit once the frequency estimate reaches this value
   //
-  // The estimate is requests per 250 ms decay interval, not an IOPS rate, and it
-  // saturates at 15, so larger values are strictly stricter and 15 is "almost never".
-  // Pick 1 for a working set that fits and is read repeatedly, a small value like 2 or 3
-  // for a mixed stream where one-hit wonders would otherwise churn the cache, and 0 for
-  // an extent that is scanned once - a backup source, a cold tier - where every admission
-  // would be pure loss.
+  // The estimate is requests per 250 ms decay interval, not an IOPS rate, and it saturates
+  // at 15, so larger values are strictly stricter. Use 1 for a working set that fits and is
+  // read repeatedly, 2 or 3 where one-hit wonders would churn the cache, and 0 for an
+  // extent scanned once, such as a backup source.
   //
-  // This is an admission threshold and nothing more. It does not reserve capacity and it
-  // does not rank extents: once admitted, a page competes for slots against every other
-  // resident page purely on measured frequency, so a hot page of one extent displaces a
-  // cold page of another whatever their thresholds were. Raising it does not evict what
-  // is already resident; those pages simply lose later contests as their estimates decay.
-  //
-  // Changing it is legal on any reload. Dropping to 0 stops admission immediately.
+  // It is an admission threshold and nothing more: it reserves no capacity and does not
+  // rank extents. Once admitted, a page competes for slots purely on measured frequency, so
+  // a hot page of one extent displaces a cold page of another whatever their thresholds
+  // were. Raising it evicts nothing already resident. Changing it is legal on any reload,
+  // and dropping to 0 stops admission immediately.
   uint32 cache_admit = 8;
 
-  // Zones whose caches are filled with pages of this extent as they are committed,
-  // rather than on first demand. Read symmetrically by both ends: a node in the home
-  // `zone` pushes toward every zone named here, and a node whose own zone is named is a
-  // warm destination. Each must be a zone this universe knows, and none may be `zone`
-  // or `next_zone`. At most 16.
+  // Zones whose caches are filled with pages of this extent as they are committed, rather
+  // than on first demand. Read symmetrically: a node in the home `zone` pushes toward every
+  // zone named here, and a node whose own zone is named is a warm destination. Each must be
+  // a zone this universe knows, and none may be `zone` or `next_zone`. At most 16. Use it
+  // for pages another zone will certainly read soon after they are written; the cooperative
+  // cache is otherwise demand-filled, so its first read of a key is always a miss, and
+  // warming pays that miss out of the writer's latency budget rather than the reader's.
   //
-  // This is for pages another zone will certainly read shortly after they are written,
-  // where waiting for the first reader to miss over the WAN is a cost with no upside.
-  // The cooperative cache is otherwise demand-filled, and its first read of a key is
-  // always a miss by construction; warming is how that first miss is paid in advance,
-  // out of the writer's own latency budget rather than the reader's.
-  //
-  // Only an IMMUTABLE or IMMUTABLE_4M extent may name zones here; anything else is
-  // refused. A warmed page is served to a local reader without a confirmation round,
-  // because confirming it would cost the fabric crossing the warming exists to avoid,
-  // and only an immutable page can be believed on sight: its version is a function of
-  // `tombstone_epoch`, so a copy either carries the live version or is recognisably not
-  // the value, and one epoch bump invalidates every zone's copies at once with no
-  // message. A mutable page carries no such self-check, and a remote reader trusting one
+  // Only an IMMUTABLE or IMMUTABLE_4M extent may name zones here; anything else is refused.
+  // A warmed page is served locally with no confirmation round, which would cost the fabric
+  // crossing warming exists to avoid, and only an immutable page can be believed on sight:
+  // its version is a function of `tombstone_epoch`, so a copy either carries the live
+  // version or is recognisably not the value, and one epoch bump invalidates every zone's
+  // copies at once. A mutable page has no such self-check, and a remote reader trusting one
   // would serve bytes its group had already replaced.
   //
-  // Advisory in every direction. A warm push is a hint that may be dropped at the
-  // source under pressure, lost on the wire, or declined at the destination, and
-  // nothing observes whether it arrived. It never affects correctness: a destination
-  // that was not warmed simply reads across the WAN as it does today.
+  // Advisory in every direction: a push may be dropped at the source under pressure, lost
+  // on the wire, or declined at the destination, and nothing observes whether it arrived. A
+  // destination that was not warmed simply reads across the WAN.
   //
-  // `cache_admit` still governs the destination. Zero vetoes warming there as it vetoes
-  // everything else, which is the kill switch. A threshold of `2..=15` is *bypassed*:
-  // it measures demand, and a page that has just been warmed has none yet by definition.
-  //
-  // Costs one page transfer per cohort per named zone on every commit - three WAN
-  // transfers per zone, one landing on each cohort's rendezvous winner there. That is
-  // the price of a write, paid whether or not anyone in that zone ever reads the page.
+  // `cache_admit` still governs the destination: 0 vetoes warming, and a threshold of
+  // `2..=15` is *bypassed*, since it measures demand and a page just warmed has none yet.
+  // Costs one page transfer per cohort per named zone on every commit, so three WAN
+  // transfers per zone, paid whether or not anyone there ever reads the page.
   repeated uint32 warm_zones = 9;
 }
 
 enum Kind {
   // Last writer wins: the guard is the page's current version, so a write always lands.
   LWW = 0;
-  // Optimistic concurrency: the guard is the version *this node* last read, so a write
-  // with no prior read here conflicts. Acceptors keep no read state, which is what makes
-  // the check cluster-wide rather than per-replica.
+  // Optimistic concurrency: the guard is the version *this node* last read, so a write with
+  // no prior read here conflicts. Acceptors keep no read state, which makes the check
+  // cluster-wide rather than per-replica.
   OCC = 1;
   // Write-once per tombstone epoch, in 4 KiB pages: the guard is
-  // `3 * Extent.tombstone_epoch`, which every replica derives from this file
-  // identically. The only guard needing no bits on the wire.
+  // `3 * Extent.tombstone_epoch`, which every replica derives from this file identically.
+  // The only guard needing no bits on the wire.
   IMMUTABLE = 2;
-  // The same guard, in 4 MiB pages. The only kind at that size, and the reason the
-  // guard being derived matters: a 4 MiB frame is all payload, with no room to carry
-  // one on the wire.
+  // The same guard, in 4 MiB pages. The only kind at that size, and why a derived guard
+  // matters: a 4 MiB frame is all payload, with no room to carry one on the wire.
   IMMUTABLE_4M = 3;
 }
 
@@ -425,59 +354,52 @@ enum Kind {
 
 // A block device this node exports, assembled from whole extents.
 //
-// The device is the concatenation of `extents` in the order given: extent N's pages
-// begin where N-1's ended. Nothing here is stored - a device is a view, and the same
-// extent may appear in devices on several nodes, in different positions, alongside
-// different neighbours. What a device may not do is name the same extent twice, which
-// would alias two offsets onto one page.
-//
-// Every extent in the list must have the same page size, since the exported device
-// advertises one page as both its maximum transfer and its chunk size. Mixing 4 KiB and
-// 4 MiB extents in one device is refused.
+// The device is the concatenation of `extents` in the order given: extent N's pages begin
+// where N-1's ended. Nothing here is stored, since a device is a view; the same extent may
+// appear in devices on several nodes, in different positions, alongside different
+// neighbours. A device may not name the same extent twice, which would alias two offsets
+// onto one page, and every extent in it must have the same page size, since the exported
+// device advertises one page as both its maximum transfer and its chunk size.
 message Device {
-  // Non-zero and unique in this file. Names the exported ublk device for its life; a
-  // device that keeps its id and its extent list across a reload keeps its identity and
-  // its open handles.
+  // Non-zero and unique in this file. Names the exported ublk device for its life; a device
+  // that keeps its id and its extent list across a reload keeps its open handles.
   uint32 id = 1;
 
-  // Extent ids, in the order they are concatenated. Non-empty, no duplicates, and every
-  // id must name an extent of some universe in this file. Extents from different
-  // universes may share a device: composing is a local act and the boundary is about who
-  // may address a universe, not about which of a node's own devices its bytes appear in.
+  // Extent ids, in the order they are concatenated. Non-empty, no duplicates, and every id
+  // must name an extent of some universe in this file. Extents from different universes may
+  // share a device: composing is a local act, and the boundary is about who may address a
+  // universe, not about which of a node's own devices its bytes appear in.
   //
-  // Frozen for the device's life: a guest that has the device open is addressing
-  // positions in it, and reordering or resizing under it would silently redirect every
-  // offset past the change. Publish a new device id instead.
+  // Frozen for the device's life: a guest that has the device open is addressing positions
+  // in it, and reordering or resizing under it would silently redirect every offset past
+  // the change. Publish a new device id instead.
   repeated uint32 extents = 2;
 }
 
 // ---- policy -----------------------------------------------------------------------
 
 message Policy {
-  // DRAM ceiling for the 4 KiB index, in bytes. Checked once when a config is loaded:
-  // the total 4 KiB page count times 52 B must fit, or the config is refused by name
-  // rather than allowed to OOM later. 4 MiB pages are not counted. Absent means the
-  // default, 8 GiB. An admission check only - nothing enforces it at runtime - and
-  // lowering it below the current working set rejects the whole file.
+  // DRAM ceiling for the 4 KiB index, in bytes. Checked once when a config is loaded: the
+  // total 4 KiB page count times 52 B must fit, or the config is refused by name rather
+  // than allowed to OOM later. 4 MiB pages are not counted. Absent means the default, 8
+  // GiB. An admission check only, so nothing enforces it at runtime.
   optional uint64 max_index_bytes = 1;
 
   // DRAM ceiling for the OCC read pool, in bytes. Split evenly across cores at 48 B per
-  // record, minimum one record per core. Absent means the default, 256 MiB.
-  //
-  // Genuinely hot: shrinking it evicts on the next tick. Too small only turns would-be
-  // successful OCC writes into conflicts the client retries - never a wrong answer.
+  // record, minimum one record per core. Absent means the default, 256 MiB. Genuinely hot:
+  // shrinking it evicts on the next tick. Too small only turns would-be successful OCC
+  // writes into conflicts the client retries, never a wrong answer.
   optional uint64 occ_bytes = 2;
 
-  // Registers one anti-entropy sweep will pull while replaying a group, and the number
-  // it will push per extent while handing one to another zone. Absent means the default,
-  // 4096. Zero is refused.
+  // Registers one anti-entropy sweep will pull while replaying a group, and the number it
+  // will push per extent while handing one to another zone. Absent means the default, 4096.
+  // Zero is refused.
   //
-  // This is the rate a member replacement runs at. A group being replayed is a group
-  // running two of three with no fault tolerance left, so the window wants to be short;
-  // against that, every register costs a prepare round at the whole group, and the
-  // members sourcing it are serving clients. Raise it to finish a replacement or an
-  // extent handover faster on a cluster with headroom, lower it to keep either out of
-  // the way of the write path.
+  // This is the rate a member replacement runs at. A group being replayed is running two of
+  // three with no fault tolerance left, so the window wants to be short; against that,
+  // every register costs a prepare round at the whole group and the members sourcing it are
+  // serving clients. Raise it to finish faster on a cluster with headroom, lower it to keep
+  // replacement out of the way of the write path.
   optional uint32 repairs_per_replay = 4;
 
   // DRAM ceiling for the read cache's index, in bytes, across every core and both page
@@ -485,11 +407,10 @@ message Policy {
   // slots to hold.
   //
   // This is what bounds the cache, because the media no longer does: the cache is given
-  // every 4 MiB the slabs did not claim, and on a large store that is more space than
-  // any sane amount of DRAM can index. One resident page costs 48 B here, so a 4 MiB
-  // chunk costs 48 B as one huge page and 48 KiB as 1024 small ones - the small class is
-  // 1024 times more expensive per byte of media, and this ceiling is why a node full of
-  // small cache does not OOM. Unlike max_index_bytes this is not an admission check: the
+  // every 4 MiB the slabs did not claim, which on a large store is more space than any sane
+  // amount of DRAM can index. One resident page costs 48 B here, so a 4 MiB chunk costs
+  // 48 B as one huge page and 48 KiB as 1024 small ones; the small class is 1024 times more
+  // expensive per byte of media. Unlike max_index_bytes this is not an admission check: the
   // cache sizes itself to fit and simply holds less.
   optional uint64 cache_index_bytes = 5;
 }
