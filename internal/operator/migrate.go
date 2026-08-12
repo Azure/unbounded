@@ -1247,6 +1247,9 @@ func (r *LegacyReaper) netTargetsPresent(ctx context.Context, target string) (bo
 		return false, err
 	}
 
+	// Deliberately a presence-and-config check rather than a readiness one: the
+	// new net workloads cannot become Ready until the legacy ones are removed,
+	// because the two contend for the same host ports. See componentReady.
 	if deploy.Spec.Template.Annotations[netConfigHashAnnotation] != wantHash {
 		return false, nil
 	}
@@ -2296,19 +2299,46 @@ func copyObjectMeta(src metav1.ObjectMeta, namespace string) metav1.ObjectMeta {
 	}
 }
 
-func deploymentAvailable(deploy *appsv1.Deployment) bool {
+// desiredReplicas returns a Deployment's requested replica count, and whether
+// that count can ever satisfy a migration gate.
+//
+// Zero cannot. These gates decide whether the replacement controller is
+// healthy enough for the reaper to delete the legacy one, and they were written
+// as equality against the desired count, so a Deployment scaled to zero
+// satisfied every one of them: nothing updated, nothing running, nothing
+// available, all equal to nothing desired. The reaper then deleted a working
+// legacy controller and left the cluster with neither.
+//
+// This became reachable when overrides gained spec.replicas. A Site cannot
+// scale these controllers to zero through its typed fields, but an override
+// can, and it is exactly the sort of thing someone does while debugging.
+//
+// The DaemonSet equivalent is deliberately not treated the same way: a
+// DaemonSet with no desired pods is usually scheduling rather than
+// configuration, and daemonSetReady tolerates it on purpose. See
+// storageDaemonSetReady for the stricter variant used where it must not.
+func desiredReplicas(deploy *appsv1.Deployment) (int32, bool) {
 	desired := int32(1)
 	if deploy.Spec.Replicas != nil {
 		desired = *deploy.Spec.Replicas
+	}
+
+	return desired, desired >= 1
+}
+
+func deploymentAvailable(deploy *appsv1.Deployment) bool {
+	desired, canSatisfy := desiredReplicas(deploy)
+	if !canSatisfy {
+		return false
 	}
 
 	return deploy.Status.ObservedGeneration >= deploy.Generation && deploy.Status.AvailableReplicas >= desired
 }
 
 func deploymentRolloutComplete(deploy *appsv1.Deployment) bool {
-	desired := int32(1)
-	if deploy.Spec.Replicas != nil {
-		desired = *deploy.Spec.Replicas
+	desired, canSatisfy := desiredReplicas(deploy)
+	if !canSatisfy {
+		return false
 	}
 
 	return deploy.Status.ObservedGeneration >= deploy.Generation &&

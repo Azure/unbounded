@@ -1573,3 +1573,104 @@ func TestReaperSetupAcceptsAnAPIReader(t *testing.T) {
 		t.Fatalf("added %d runnables, want the reaper itself", len(mgr.added))
 	}
 }
+
+// TestMigrationGatesRejectZeroReplicas is a regression test for the most
+// destructive defect in this series.
+//
+// These gates decide whether the replacement controller is healthy enough for
+// the reaper to delete the legacy one. They were written as equality against
+// the desired replica count, so a Deployment scaled to zero satisfied every
+// one of them: nothing updated, nothing running, nothing available, all equal
+// to nothing desired. The reaper then deleted a working legacy controller and
+// left the cluster with neither.
+//
+// It became reachable when overrides gained spec.replicas. A Site cannot scale
+// these controllers to zero through its typed fields, but an override can, and
+// it is exactly the sort of thing someone does while debugging.
+func TestMigrationGatesRejectZeroReplicas(t *testing.T) {
+	scaledToZero := func() *appsv1.Deployment {
+		zero := int32(0)
+
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "unbounded-system", Name: "machina-controller", Generation: 3},
+			Spec:       appsv1.DeploymentSpec{Replicas: &zero},
+			Status: appsv1.DeploymentStatus{
+				ObservedGeneration: 3,
+				// Every count agrees with the desired zero, which is exactly
+				// what made the equality checks pass.
+				UpdatedReplicas:   0,
+				Replicas:          0,
+				AvailableReplicas: 0,
+			},
+		}
+	}
+
+	if deploymentAvailable(scaledToZero()) {
+		t.Fatal("a Deployment running no pods must not be reported available")
+	}
+
+	if deploymentRolloutComplete(scaledToZero()) {
+		t.Fatal("a Deployment running no pods must not be reported rolled out")
+	}
+}
+
+// TestMigrationGatesAcceptRunningReplicas confirms the check is a floor on the
+// desired count rather than a blanket refusal.
+func TestMigrationGatesAcceptRunningReplicas(t *testing.T) {
+	two := int32(2)
+	healthy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "unbounded-system", Name: "machina-controller", Generation: 3},
+		Spec:       appsv1.DeploymentSpec{Replicas: &two},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration: 3,
+			UpdatedReplicas:    2,
+			Replicas:           2,
+			AvailableReplicas:  2,
+		},
+	}
+
+	if !deploymentAvailable(healthy) {
+		t.Fatal("a Deployment with all replicas available must be reported available")
+	}
+
+	if !deploymentRolloutComplete(healthy) {
+		t.Fatal("a fully rolled out Deployment must be reported complete")
+	}
+}
+
+// TestMachinaGateRejectsZeroReplicaTarget drives the same defect through the
+// gate that actually authorises the delete, rather than the helper alone.
+func TestMachinaGateRejectsZeroReplicaTarget(t *testing.T) {
+	const target = "unbounded-system"
+
+	zero := int32(0)
+
+	config := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: target, Name: "machina-config"},
+		Data:       map[string]string{"config.yaml": "apiServerEndpoint: https://example:6443"},
+	}
+
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: target, Name: "machina-controller", Generation: 1},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &zero,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{machinaConfigHashAnnotation: configMapPayloadHash(config)},
+				},
+			},
+		},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 1},
+	}
+
+	r := newReaper(t, config, deploy)
+
+	ready, err := r.machinaTargetReady(t.Context(), target)
+	if err != nil {
+		t.Fatalf("machinaTargetReady: %v", err)
+	}
+
+	if ready {
+		t.Fatal("machina must not be reported ready to reap while its replacement runs no pods")
+	}
+}
