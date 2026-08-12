@@ -537,8 +537,9 @@ pub struct Options {
     pub pages: u64,
     /// 4 MiB pages in the immutable extent, or zero for none.
     pub huge_pages: u64,
-    /// `τ`, the cache's target rate. Zero disables the cache entirely.
-    pub cache_rate: u32,
+    /// `cache_admit` for every extent the sim declares: 0 caches nothing, 1 caches on
+    /// first sight, `n` caches once a page has been read `n` times in a decay interval.
+    pub cache_admit: u32,
     /// The rate the backing device is willing to be driven at, or zero for unmetered.
     pub device_iops: u64,
     /// Whether every node opens every other. `false` keeps only the nodes it shares a
@@ -558,7 +559,7 @@ impl Default for Options {
             seed: 1,
             pages: 4096,
             huge_pages: 0,
-            cache_rate: 0,
+            cache_admit: 0,
             device_iops: 0,
             clique: true,
             mdts: 0,
@@ -707,9 +708,8 @@ impl Sim {
         // The index ceiling is a real check; give it room for the extents we declare.
         let idx = o.pages * crate::alloc::INDEX_BYTES_PER_PAGE + (1 << 20);
         t.push_str(&format!(
-            "policy max_index_bytes={idx} occ_bytes={} cache_target_rate={}\n",
-            1 << 20,
-            o.cache_rate
+            "policy max_index_bytes={idx} occ_bytes={}\n",
+            1 << 20
         ));
         t.push_str(&format!("universe {UNIVERSE} epoch=1\n"));
         for p in self.peers_of(id) {
@@ -720,15 +720,16 @@ impl Sim {
             t.push_str(&format!("group {} {} {}\n", m[0], m[1], m[2]));
         }
         t.push_str(&format!(
-            "extent id=1 base={SMALL_BASE} pages={} kind=lww zone=1\n",
-            o.pages
+            "extent id=1 base={SMALL_BASE} pages={} kind=lww zone=1 cache_admit={}\n",
+            o.pages, o.cache_admit
         ));
         t.push_str(&format!("device {SMALL} extents=1\n"));
         if o.huge_pages > 0 {
             t.push_str(&format!(
-                "extent id=2 base={} pages={} kind=immutable_4m zone=1\n",
+                "extent id=2 base={} pages={} kind=immutable_4m zone=1 cache_admit={}\n",
                 huge_base(o.pages),
-                o.huge_pages
+                o.huge_pages,
+                o.cache_admit
             ));
             t.push_str(&format!("device {HUGE} extents=2\n"));
         }

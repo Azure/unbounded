@@ -41,8 +41,9 @@ pub struct Plan {
     /// DRAM the cache may spend on slot records. The cache takes whatever the slabs
     /// left in the store either way, so this is what actually sizes it.
     pub cache_index_bytes: u64,
-    /// Zero disables the cooperative cache, which is what a member-only read wants.
-    pub cache_target_rate: u32,
+    /// `cache_admit` for both extents. Zero caches nothing, which is what a member-only
+    /// read wants; one caches on first sight.
+    pub cache_admit: u32,
 }
 
 impl Default for Plan {
@@ -55,7 +56,7 @@ impl Default for Plan {
             huge_pages: 512,
             groups: 12,
             cache_index_bytes: 1 << 30,
-            cache_target_rate: 0,
+            cache_admit: 0,
         }
     }
 }
@@ -262,10 +263,7 @@ fn text(plan: &Plan, n: &Node, peers: &[(u32, PathBuf)], generation: u32) -> Str
         n.id,
         (n.id - 1) % 3,
     );
-    s += &format!(
-        "policy cache_target_rate={} cache_index_bytes={}\n",
-        plan.cache_target_rate, plan.cache_index_bytes
-    );
+    s += &format!("policy cache_index_bytes={}\n", plan.cache_index_bytes);
     s += "universe 1 epoch=1\n";
     for (id, dev) in peers {
         s += &format!("peer id={id} device={}\n", dev.display());
@@ -289,10 +287,12 @@ fn text(plan: &Plan, n: &Node, peers: &[(u32, PathBuf)], generation: u32) -> Str
     // 1024 blocks of the universe's flat address space.
     let huge_base = plan.small_pages.next_multiple_of(1024);
     s += &format!(
-        "extent id=1 base=0 pages={} kind=lww zone=1\n\
-         extent id=2 base={huge_base} pages={} kind=immutable_4m zone=1\n\
+        "extent id=1 base=0 pages={} kind=lww zone=1 cache_admit={admit}\n\
+         extent id=2 base={huge_base} pages={} kind=immutable_4m zone=1 cache_admit={admit}\n\
          device {LWW} extents=1\ndevice {BIG} extents=2\n",
-        plan.small_pages, plan.huge_pages
+        plan.small_pages,
+        plan.huge_pages,
+        admit = plan.cache_admit
     );
     s
 }

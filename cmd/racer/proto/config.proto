@@ -317,6 +317,29 @@ message Extent {
   // afterwards `racer_extent_tombstones{extent=...}` draining to zero is the sweep
   // finishing.
   uint32 tombstone_epoch = 7;
+
+  // Cache admission for this extent, and the only knob that decides whether a page of it
+  // may enter a node's cache at all:
+  //
+  //   0       never; pages of this extent are not cached, and are not even counted
+  //   1       admit on first sight
+  //   2..=15  admit once the frequency estimate reaches this value
+  //
+  // The estimate is requests per 250 ms decay interval, not an IOPS rate, and it
+  // saturates at 15, so larger values are strictly stricter and 15 is "almost never".
+  // Pick 1 for a working set that fits and is read repeatedly, a small value like 2 or 3
+  // for a mixed stream where one-hit wonders would otherwise churn the cache, and 0 for
+  // an extent that is scanned once - a backup source, a cold tier - where every admission
+  // would be pure loss.
+  //
+  // This is an admission threshold and nothing more. It does not reserve capacity and it
+  // does not rank extents: once admitted, a page competes for slots against every other
+  // resident page purely on measured frequency, so a hot page of one extent displaces a
+  // cold page of another whatever their thresholds were. Raising it does not evict what
+  // is already resident; those pages simply lose later contests as their estimates decay.
+  //
+  // Changing it is legal on any reload. Dropping to 0 stops admission immediately.
+  uint32 cache_admit = 8;
 }
 
 enum Kind {
@@ -382,16 +405,6 @@ message Policy {
   // Genuinely hot: shrinking it evicts on the next tick. Too small only turns would-be
   // successful OCC writes into conflicts the client retries - never a wrong answer.
   optional uint64 occ_bytes = 2;
-
-  // tau, the cooperative cache's target rate, in *requests per 250 ms decay interval* -
-  // not IOPS. The underlying counter saturates at 15 per interval, so the range is 1..15
-  // and anything above is rejected rather than quietly clamped.
-  //
-  // 0, the default, disables the cooperative cache entirely; a node that has not been
-  // told a target rate does not guess one. Otherwise a page is replicated to
-  // `ceil(observed rate / tau)` peers, capped at the cohort size or 64, whichever is
-  // smaller. Lower tau means wider replication of more pages.
-  uint32 cache_target_rate = 3;
 
   // Registers one anti-entropy sweep will pull while replaying a group, and the number
   // it will push per extent while handing one to another zone. Absent means the default,

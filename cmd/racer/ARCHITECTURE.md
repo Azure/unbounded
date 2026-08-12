@@ -46,17 +46,17 @@ The checked configuration describes:
   about any other.
 - Extents. An extent is a range of a universe's address space: a base block, a
   length in pages, LWW, OCC, Immutable, or Immutable-4M semantics, its home and
-  next zones, and its own tombstone epoch, so one extent can reclaim while
-  another lags. The kind carries the page size, and 4 MiB exists only as
-  immutable, which is why a 4 MiB extent's base is 1024-block aligned and each
-  of its pages spans 1024 blocks. Extents may not overlap, and their ids are
-  unique across every universe the node holds, which is what lets a seal name
-  one with a bare 32-bit id.
+  next zones, its own tombstone epoch, so one extent can reclaim while another
+  lags, and its cache admission policy. The kind carries the page size, and
+  4 MiB exists only as immutable, which is why a 4 MiB extent's base is
+  1024-block aligned and each of its pages spans 1024 blocks. Extents may not
+  overlap, and their ids are unique across every universe the node holds, which
+  is what lets a seal name one with a bare 32-bit id.
 - Devices. A device is a local ublk block device: an ordered list of whole
   extents, concatenated. A device may not mix the two page sizes, but it is
   otherwise free, so two hosts may map the same extents in different orders and
   combinations and no page's address moves when they do.
-- Runtime and cache policy.
+- Runtime policy. Cache admission is per extent, not here.
 
 An address hashes to a fixed slot, which names its consensus group within its
 own universe. Each node has complete group information for its zone in each
@@ -300,10 +300,29 @@ buffer.
 ## Cooperative Cache
 
 The cache is advisory and divided per core. A periodically halved count-min
-sketch estimates popularity. A configured target request rate determines a
-bounded replica width; rendezvous ranking selects nested replicas without a
-directory. TinyLFU-style admission and CLOCK replacement manage the slots the
-cache currently holds.
+sketch estimates popularity, and the estimate drives a bounded replica width;
+rendezvous ranking selects nested replicas without a directory. CLOCK
+replacement manages the slots the cache currently holds.
+
+Admission is per extent. `Extent.cache_admit` is zero to keep an extent out of
+the cache entirely, one to admit on first sight, or a threshold in `2..=15` that
+the sketch estimate must reach first. It is decided where the signal is, on the
+node computing the width, which for a 4 KiB page is a group member rather than
+the node that would do the caching: the nodes that cache a small page are by
+construction not in its group, so their own sketches never see the reads that
+matter. A width of zero is the veto, and every downstream placement check
+already honours it, so the decision reaches the caching node in the reply it was
+already going to send.
+
+Admission reserves no capacity and ranks no extents. Priority is global: when
+CLOCK finds a candidate victim, the incumbent keeps its slot if the sketch makes
+it strictly hotter than the arriving page, and the admission ends rather than
+sweeping on. Ties go to the arrival, so a scan churns only entries as cold as
+itself. That contest is what lets one extent admit everything without its scan
+sweeping the rest of the cache away, and it is what keeps the hottest key first
+regardless of which extent it came from. Lowering an extent to zero stops
+admission immediately but strands nothing: what is already resident stays until
+it loses a contest, which it will as soon as its estimate decays.
 
 Media comes in 4 MiB chunks carved from the tail. A chunk is the unit of
 everything: what a class is given, what one class takes from the other, and what
@@ -390,7 +409,10 @@ rows. Per-extent live-page and tombstone counts are published as
 and extent, alongside `racer_universes`, `racer_devices`, and `racer_extents`.
 Cache counters carry a `class` label of `small` or `huge`, and
 `racer_cache_bytes`, `racer_cache_borrowed_bytes`, `racer_cache_tail_bytes`, and
-`racer_cache_unused_bytes` report how the tail is currently divided. The metrics
+`racer_cache_unused_bytes` report how the tail is currently divided.
+`racer_cache_reject_total` splits refused admissions by `reason`: `policy` for
+an extent that asked for a higher threshold than the page has reached, `victim`
+for a page that lost the contest to a hotter incumbent. The metrics
 server is blocking, handles one HTTP/1.1 connection at a time,
 and exposes unauthenticated plaintext `GET /metrics` with five-second
 socket timeouts.
