@@ -197,6 +197,13 @@ does not depend on the check being exhaustive:
 Strategic merge directives (any `$`-prefixed key) and explicit `null` values are
 rejected everywhere, because both can delete operator-managed content.
 
+**An override can only add, never remove.** Where Kubernetes says two fields may
+not both be set, adding one is not enough, so the change cannot be expressed at
+all. Two cases are detected and reported rather than left to fail at apply time:
+setting `value` on an env variable the operator defines with `valueFrom` (or the
+reverse), and setting `spec.strategy.type: Recreate` on a Deployment whose
+`rollingUpdate` block the operator sets.
+
 Values are checked against the type Kubernetes requires. Writing `containers:`
 as a mapping rather than a list, or `nodeSelector:` as a list rather than a
 mapping, is reported against the field rather than merged into a workload the

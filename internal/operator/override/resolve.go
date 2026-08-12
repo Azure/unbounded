@@ -194,8 +194,172 @@ func checkResolvable(entry Entry, source Source, workload *unstructured.Unstruct
 	problems = append(problems, checkExtraArgsTargets(entry, source, workload)...)
 	problems = append(problems, checkMountCollisions(entry, source, workload)...)
 	problems = append(problems, checkVolumeCollisions(entry, source, workload)...)
+	problems = append(problems, checkExclusiveFields(entry, source, workload)...)
 
 	return problems
+}
+
+// checkExclusiveFields rejects a patch that would leave two mutually exclusive
+// Kubernetes fields set at once.
+//
+// This class exists because an override cannot delete anything: explicit null
+// is refused everywhere, since strategic merge treats it as deletion and that
+// is how operator-managed content would be removed. A patch can therefore only
+// add to what is already there, and where the schema says two fields may not
+// both be present, adding one is not enough.
+//
+// The two reachable cases are checked by name rather than by consulting the
+// Kubernetes schema, which is not a dependency of this repository and would be
+// a disproportionate one for two rules. Both are caught here, at resolution,
+// because both depend on what the operator's own workload already contains.
+func checkExclusiveFields(entry Entry, source Source, workload *unstructured.Unstructured) []error {
+	if len(entry.Patch) == 0 {
+		return nil
+	}
+
+	var problems []error
+
+	problems = append(problems, checkEnvValueSources(entry, source, workload)...)
+	problems = append(problems, checkStrategyExclusivity(entry, source, workload)...)
+
+	return problems
+}
+
+// checkEnvValueSources rejects setting value on an env entry the operator
+// defines with valueFrom, or the reverse. Kubernetes permits exactly one.
+func checkEnvValueSources(entry Entry, source Source, workload *unstructured.Unstructured) []error {
+	var problems []error
+
+	for _, field := range []string{"containers", "initContainers"} {
+		existing := containerEnvFields(workload, field)
+
+		for _, patched := range patchedContainers(entry.Patch, field) {
+			name, _ := patched["name"].(string) //nolint:errcheck // absent means unnamed
+
+			envs, ok := patched["env"].([]any)
+			if !ok {
+				continue
+			}
+
+			for _, raw := range envs {
+				env, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				variable, _ := env["name"].(string) //nolint:errcheck // absent means unnamed
+				if variable == "" {
+					continue
+				}
+
+				current, known := existing[containerEnv{container: name, variable: variable}]
+				if !known {
+					continue
+				}
+
+				for _, pair := range []struct{ set, conflicts string }{
+					{set: "value", conflicts: "valueFrom"},
+					{set: "valueFrom", conflicts: "value"},
+				} {
+					if _, sets := env[pair.set]; sets && current[pair.conflicts] {
+						problems = append(problems, fmt.Errorf(
+							"%s: env %q in container %q sets %s, but the operator defines it with %s, and Kubernetes "+
+								"permits only one; an override cannot remove the other, so this cannot be expressed",
+							source, variable, name, pair.set, pair.conflicts))
+					}
+				}
+			}
+		}
+	}
+
+	return problems
+}
+
+// checkStrategyExclusivity rejects switching a Deployment to Recreate while the
+// operator's rollingUpdate block is still present, which the API server refuses.
+func checkStrategyExclusivity(entry Entry, source Source, workload *unstructured.Unstructured) []error {
+	strategyType, _, err := unstructured.NestedString(entry.Patch, "spec", "strategy", "type")
+	if err != nil || strategyType != "Recreate" {
+		return nil
+	}
+
+	// A patch supplying its own rollingUpdate alongside Recreate is rejected by
+	// the same API server rule, whether or not the operator set one.
+	patched, err := hasRollingUpdate(entry.Patch)
+	if err != nil {
+		return []error{fmt.Errorf("%s: read spec.strategy.rollingUpdate from the patch: %w", source, err)}
+	}
+
+	if patched {
+		return []error{fmt.Errorf(
+			"%s: spec.strategy sets type Recreate and rollingUpdate together, which Kubernetes rejects", source)}
+	}
+
+	present, err := hasRollingUpdate(workload.Object)
+	if err != nil || !present {
+		return nil
+	}
+
+	return []error{fmt.Errorf(
+		"%s: spec.strategy.type is set to Recreate, but the operator defines spec.strategy.rollingUpdate and "+
+			"Kubernetes rejects a Deployment carrying both; an override cannot remove it, so this cannot be expressed",
+		source)}
+}
+
+// hasRollingUpdate reports whether an object carries a rollingUpdate block.
+func hasRollingUpdate(object map[string]any) (bool, error) {
+	_, present, err := unstructured.NestedMap(object, "spec", "strategy", "rollingUpdate")
+
+	return present, err
+}
+
+type containerEnv struct {
+	container string
+	variable  string
+}
+
+// containerEnvFields indexes which of value and valueFrom the workload's own
+// env entries set.
+func containerEnvFields(workload *unstructured.Unstructured, field string) map[containerEnv]map[string]bool {
+	out := map[containerEnv]map[string]bool{}
+
+	for _, raw := range nestedSlice(workload.Object, "spec", "template", "spec", field) {
+		container, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, _ := container["name"].(string) //nolint:errcheck // absent means unnamed
+
+		envs, ok := container["env"].([]any)
+		if !ok {
+			continue
+		}
+
+		for _, rawEnv := range envs {
+			env, ok := rawEnv.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			variable, _ := env["name"].(string) //nolint:errcheck // absent means unnamed
+			if variable == "" {
+				continue
+			}
+
+			set := map[string]bool{}
+
+			for _, key := range []string{"value", "valueFrom"} {
+				if _, present := env[key]; present {
+					set[key] = true
+				}
+			}
+
+			out[containerEnv{container: name, variable: variable}] = set
+		}
+	}
+
+	return out
 }
 
 // checkVolumeCollisions rejects a patch that would redefine an

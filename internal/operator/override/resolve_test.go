@@ -122,3 +122,160 @@ func patchWithVolumes(fragment string) map[string]any {
 
 	return normalized.(map[string]any)
 }
+
+// TestCheckExclusiveFieldsRejectsWhatCannotBeExpressed covers the class of
+// mistake created by refusing explicit null.
+//
+// An override cannot delete anything, because strategic merge treats null as
+// deletion and that is how operator-managed content would be removed. A patch
+// can therefore only add to what is already there, and where the Kubernetes
+// schema says two fields may not both be present, adding one is not enough:
+// the result is an object the API server refuses, discovered at apply time as
+// an error about a field the user never wrote.
+func TestCheckExclusiveFieldsRejectsWhatCannotBeExpressed(t *testing.T) {
+	t.Run("value over an operator valueFrom", func(t *testing.T) {
+		workload := workloadWithEnv("agent", "SECRET", map[string]any{
+			"valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": "s", "key": "k"}},
+		})
+
+		problems := checkResolvable(Entry{Patch: patchWithEnv("agent", "SECRET", "value: literal")},
+			Source{Key: "a.yaml"}, workload)
+
+		if len(problems) != 1 {
+			t.Fatalf("problems = %v, want the exclusivity rejected", problems)
+		}
+
+		if !strings.Contains(problems[0].Error(), "only one") {
+			t.Fatalf("problem = %q, want it to explain the constraint", problems[0])
+		}
+	})
+
+	t.Run("valueFrom over an operator value", func(t *testing.T) {
+		workload := workloadWithEnv("agent", "LEVEL", map[string]any{"value": "info"})
+
+		problems := checkResolvable(
+			Entry{Patch: patchWithEnv("agent", "LEVEL", "valueFrom:\n                      configMapKeyRef:\n                        name: c\n                        key: k")},
+			Source{Key: "a.yaml"}, workload)
+
+		if len(problems) != 1 {
+			t.Fatalf("problems = %v, want the exclusivity rejected", problems)
+		}
+	})
+
+	t.Run("changing the value of a plain env is fine", func(t *testing.T) {
+		workload := workloadWithEnv("agent", "LEVEL", map[string]any{"value": "info"})
+
+		problems := checkResolvable(Entry{Patch: patchWithEnv("agent", "LEVEL", "value: debug")},
+			Source{Key: "a.yaml"}, workload)
+
+		if len(problems) != 0 {
+			t.Fatalf("problems = %v, want none: this is the ordinary case", problems)
+		}
+	})
+
+	t.Run("a new env variable is fine", func(t *testing.T) {
+		workload := workloadWithEnv("agent", "LEVEL", map[string]any{"value": "info"})
+
+		problems := checkResolvable(Entry{Patch: patchWithEnv("agent", "NEW", "value: x")},
+			Source{Key: "a.yaml"}, workload)
+
+		if len(problems) != 0 {
+			t.Fatalf("problems = %v, want none: the operator defines no NEW", problems)
+		}
+	})
+}
+
+// TestCheckStrategyExclusivity covers the second reachable case: Recreate
+// cannot coexist with a rollingUpdate block, and the override cannot remove the
+// operator's.
+func TestCheckStrategyExclusivity(t *testing.T) {
+	withRollingUpdate := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "controller"},
+		"spec": map[string]any{
+			"strategy": map[string]any{
+				"type":          "RollingUpdate",
+				"rollingUpdate": map[string]any{"maxSurge": int64(0)},
+			},
+		},
+	}}
+
+	problems := checkResolvable(
+		Entry{Patch: map[string]any{"spec": map[string]any{"strategy": map[string]any{"type": "Recreate"}}}},
+		Source{Key: "a.yaml"}, withRollingUpdate)
+
+	if len(problems) != 1 {
+		t.Fatalf("problems = %v, want Recreate rejected against an operator rollingUpdate", problems)
+	}
+
+	// Without an operator rollingUpdate there is nothing to conflict with.
+	plain := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1", "kind": "Deployment",
+		"metadata": map[string]any{"name": "controller"},
+		"spec":     map[string]any{"strategy": map[string]any{"type": "RollingUpdate"}},
+	}}
+
+	if problems := checkResolvable(
+		Entry{Patch: map[string]any{"spec": map[string]any{"strategy": map[string]any{"type": "Recreate"}}}},
+		Source{Key: "a.yaml"}, plain); len(problems) != 0 {
+		t.Fatalf("problems = %v, want none when the operator sets no rollingUpdate", problems)
+	}
+}
+
+// workloadWithEnv builds a workload whose container defines one env variable.
+func workloadWithEnv(container, variable string, definition map[string]any) *unstructured.Unstructured {
+	env := map[string]any{"name": variable}
+	for key, value := range definition {
+		env[key] = value
+	}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata":   map[string]any{"name": "agent"},
+	}}
+
+	if err := unstructured.SetNestedSlice(obj.Object, []any{
+		map[string]any{"name": container, "env": []any{env}},
+	}, "spec", "template", "spec", "containers"); err != nil {
+		panic(err)
+	}
+
+	return obj
+}
+
+// patchWithEnv builds a patch setting one env entry on one container.
+func patchWithEnv(container, variable, definition string) map[string]any {
+	return patchFromYAML(`
+patch:
+  spec:
+    template:
+      spec:
+        containers:
+          - name: ` + container + `
+            env:
+              - name: ` + variable + `
+                ` + definition + `
+`)
+}
+
+// patchFromYAML parses a `patch:` document into a normalized patch map.
+func patchFromYAML(doc string) map[string]any {
+	var parsed struct {
+		Patch map[string]any `yaml:"patch"`
+	}
+
+	if err := yaml.Unmarshal([]byte(doc), &parsed); err != nil {
+		panic(err)
+	}
+
+	normalized, err := normalizeJSON(parsed.Patch, "patch")
+	if err != nil {
+		panic(err)
+	}
+
+	out, _ := normalized.(map[string]any)
+
+	return out
+}
