@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::config::Class;
 pub(crate) use io::{Buf, Disk, Durability, Export, PoolBuf, sleep};
 pub(crate) use limit::Limiter;
 pub(crate) use worker::core;
@@ -311,6 +312,10 @@ struct DiskEntry {
 struct VolEntry {
     key: u64,
     size: u64,
+    /// The ublk minor asked for, which the config froze along with the size.
+    minor: u32,
+    /// The geometry the export was created with, frozen for the same reason.
+    params: ublk::Params,
     slot: u16,
     dev_id: u32,
     /// Hardware queues each worker serves, indexed by worker.
@@ -426,33 +431,48 @@ impl Configurator {
 
     /// A block device this node exports.
     ///
-    /// `key` is stable identity: re-declaring it keeps the same `/dev/ublkbN` and never
-    /// interrupts IO. `size` is in bytes, a nonzero multiple of the request unit, and may
-    /// never change. `huge` sets that unit to 4 MiB instead of 4 KiB.
-    pub(crate) fn device(&self, key: u64, size: u64, huge: bool) -> std::io::Result<Export> {
-        let unit = if huge { 4 << 20 } else { 4096 };
+    /// `key` is stable identity: re-declaring it keeps the same device and never
+    /// interrupts IO. `minor` is the ublk device number asked of the kernel, so the export
+    /// appears at `/dev/ublkb<minor>` and peers and mounts find it where the control plane
+    /// said they would. `size` is in bytes, a nonzero multiple of 4 KiB, and neither it
+    /// nor the minor nor `class` may change while the export lives.
+    pub(crate) fn device(
+        &self,
+        key: u64,
+        minor: u32,
+        size: u64,
+        class: Class,
+    ) -> std::io::Result<Export> {
+        let unit = if class == Class::Huge { 4 << 20 } else { 4096 };
         if !size.is_multiple_of(unit) || size == 0 {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
-        self.declare(key, size, ublk::params_for(size, huge))
+        self.declare(key, minor, size, ublk::params_for(size, class))
     }
 
     /// The node's fabric device: the one namespace peers issue against.
     /// Same machinery as [`Configurator::device`], different geometry: a fabric frame is
     /// 1 to 1024 blocks depending on the opcode, so it is not split on page boundaries.
-    pub(crate) fn fabric(&self, key: u64, size: u64) -> std::io::Result<Export> {
+    pub(crate) fn fabric(&self, key: u64, minor: u32, size: u64) -> std::io::Result<Export> {
         if !size.is_multiple_of(4096) || size == 0 {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
-        self.declare(key, size, ublk::params_for_fabric(size))
+        self.declare(key, minor, size, ublk::params_for_fabric(size))
     }
 
-    fn declare(&self, key: u64, size: u64, params: ublk::Params) -> std::io::Result<Export> {
+    fn declare(
+        &self,
+        key: u64,
+        minor: u32,
+        size: u64,
+        params: ublk::Params,
+    ) -> std::io::Result<Export> {
         let mut c = self.core.borrow_mut();
         c.declared_vols.push(key);
         if let Some(v) = c.vols.iter().find(|v| v.key == key) {
-            // Exports are immutable once created; a resize is a config error.
-            if v.size != size {
+            // Exports are immutable once created: a resize, a move to another minor or a
+            // change of geometry is a config error, not a live device to reshape.
+            if v.size != size || v.minor != minor || v.params != params {
                 return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             if let Some(inner) = v.weak.upgrade() {
@@ -465,24 +485,23 @@ impl Configurator {
 
         // A simulated export is only a name: no kernel in between, so no device to create.
         #[cfg(feature = "sim")]
-        let (dev_id, q_ids, path) = {
-            let _ = params;
-            (0u32, Vec::new(), PathBuf::from(format!("/sim/dev/{key}")))
-        };
+        let (dev_id, q_ids, path) = (
+            minor,
+            Vec::new(),
+            PathBuf::from(format!("/sim/dev/{minor}")),
+        );
         #[cfg(not(feature = "sim"))]
         let (dev_id, q_ids, path) = {
             // One hardware queue per logical CPU we own; blk-mq maps each to a core we
             // run on.
             let nq = c.workers.len() * QUEUES_PER_WORKER;
             let mut info = ublk::DevInfo::new(
+                minor,
                 nq as u16,
                 QUEUE_DEPTH,
                 ublk::F_AUTO_BUF_REG | ublk::F_USER_COPY | ublk::F_CMD_IOCTL_ENCODE,
             );
-            c.ctl().add_dev(&mut info).map_err(|e| {
-                let held = c.dev_used.iter().filter(|u| **u).count();
-                ublks_max_hint(e, held)
-            })?;
+            add_dev(&mut c, &mut info)?;
             let dev_id = info.dev_id;
             let setup = c
                 .ctl()
@@ -504,6 +523,8 @@ impl Configurator {
         c.vols.push(VolEntry {
             key,
             size,
+            minor,
+            params,
             slot,
             dev_id,
             q_ids,
@@ -512,6 +533,44 @@ impl Configurator {
         });
         Ok(Export::from_inner(inner))
     }
+}
+
+/// Create the export at the minor it was named. The minor is not ours to choose: the
+/// control plane published `/dev/ublkb<minor>` to whoever consumes it, so a device left at
+/// that number by an instance of us that died is reclaimed rather than worked around. One
+/// still being served is not: some other program has the number, and stopping it to take
+/// the number would be worse than not exporting.
+#[cfg(not(feature = "sim"))]
+fn add_dev(c: &mut Core, info: &mut ublk::DevInfo) -> std::io::Result<()> {
+    let held = c.dev_used.iter().filter(|u| **u).count();
+    let minor = info.dev_id;
+    let taken = match c.ctl().add_dev(info) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => e,
+        Err(e) => return Err(ublks_max_hint(e, held)),
+    };
+    // A dead device reports the pid that used to serve it, or none at all.
+    let pid = c.ctl().dev_info(minor).map(|d| d.ublksrv_pid).unwrap_or(0);
+    if pid > 0 && serving(pid) {
+        return Err(std::io::Error::other(format!(
+            "device {minor} is already exported by pid {pid}: {taken}"
+        )));
+    }
+    c.ctl().del_dev(minor).map_err(|e| {
+        std::io::Error::other(format!(
+            "device {minor} is held by a dead export that will not go away: {e}"
+        ))
+    })?;
+    c.ctl().add_dev(info).map_err(|e| ublks_max_hint(e, held))?;
+    Ok(())
+}
+
+/// Whether a pid is still around. `EPERM` counts: the process exists, it is simply not
+/// ours to signal.
+#[cfg(not(feature = "sim"))]
+fn serving(pid: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing and only tests for the process.
+    unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() == libc::EPERM }
 }
 
 /// `ADD_DEV` fails once `ublk_drv.ublks_max` devices exist and the bare errno hides which
@@ -1089,6 +1148,11 @@ mod tests {
         assert!(std::panic::catch_unwind(core).is_err());
     }
 
+    /// The minor this test asks for. Minors are host-wide, so every test that reaches
+    /// the kernel owns a block of them the rest of the suite stays off.
+    #[cfg(not(feature = "sim"))]
+    const MINOR: u32 = 110;
+
     /// Needs the real kernel seams: under `sim` only a `Sim` drives the clock, so a
     /// boot outside one hangs.
     #[cfg(not(feature = "sim"))]
@@ -1111,11 +1175,11 @@ mod tests {
         assert!(start(&HANDLER).is_err());
 
         let path = backing.clone();
-        // The kernel picks the device id, so the config reports back where it landed.
+        // The minor is asked for, not handed out, so the path is known before the reload.
         let found = Arc::new(Mutex::new(None));
         let out = found.clone();
         rt.reload(move |c| {
-            let dev = c.device(1, 32 << 20, false)?;
+            let dev = c.device(1, MINOR, 32 << 20, Class::Small)?;
             *out.lock().unwrap() = Some(dev.path().to_path_buf());
             Ok(Conf {
                 store: c.disk(&path, None, None)?,
@@ -1134,6 +1198,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(dev.exists(), "no ublk block device appeared");
+        assert_eq!(
+            dev,
+            PathBuf::from(format!("/dev/ublkb{MINOR}")),
+            "the export landed on a minor other than the one asked for"
+        );
 
         let mut f = std::fs::OpenOptions::new()
             .read(true)
@@ -1198,7 +1267,34 @@ mod tests {
                 Ok(Conf {
                     store: c.disk(&path, None, None)?,
                     cores: c.cores(),
-                    dev: c.device(1, 16 << 20, false)?,
+                    dev: c.device(1, MINOR, 16 << 20, Class::Small)?,
+                })
+            })
+            .is_err()
+        );
+
+        // So is moving it to another minor: the path is published, and a live export
+        // cannot follow it.
+        let path = backing.clone();
+        assert!(
+            rt.reload(move |c| {
+                Ok(Conf {
+                    store: c.disk(&path, None, None)?,
+                    cores: c.cores(),
+                    dev: c.device(1, MINOR + 2, 32 << 20, Class::Small)?,
+                })
+            })
+            .is_err()
+        );
+
+        // And so is reshaping it: the block layer was told these limits once.
+        let path = backing.clone();
+        assert!(
+            rt.reload(move |c| {
+                Ok(Conf {
+                    store: c.disk(&path, None, None)?,
+                    cores: c.cores(),
+                    dev: c.device(1, MINOR, 32 << 20, Class::Mixed)?,
                 })
             })
             .is_err()
@@ -1210,7 +1306,7 @@ mod tests {
             Ok(Conf {
                 store: c.disk(&path, None, None)?,
                 cores: c.cores(),
-                dev: c.device(2, 8 << 20, false)?,
+                dev: c.device(2, MINOR + 1, 8 << 20, Class::Small)?,
             })
         })
         .expect("second reload");
@@ -1233,6 +1329,65 @@ mod tests {
         // A runtime can be started again once the previous one is down.
         let rt = start(&HANDLER).expect("restart");
         rt.shutdown().expect("shutdown again");
+        let _ = std::fs::remove_file(&backing);
+    }
+
+    /// A crash leaves the minor behind: the kernel keeps the device, nothing serves it,
+    /// and the control plane goes on publishing that number to consumers. Taking it back
+    /// is the only way home short of a reboot, and it stops at a number some other
+    /// program is still serving.
+    #[cfg(not(feature = "sim"))]
+    #[test]
+    fn an_abandoned_minor_is_taken_back() {
+        let _only = exclusive();
+        if !privileged() {
+            eprintln!("skipping: /dev/ublk-control is unavailable");
+            return;
+        }
+        const LEFT: u32 = MINOR + 4;
+
+        // What a crash leaves behind: a device the kernel holds and nobody serves.
+        let mut ctl = ublk::Control::open().expect("control");
+        let mut info = ublk::DevInfo::new(LEFT, 1, 8, ublk::F_CMD_IOCTL_ENCODE);
+        ctl.add_dev(&mut info).expect("abandon a device");
+        drop(ctl);
+
+        let backing = std::env::temp_dir().join("racer-minor.img");
+        {
+            let f = std::fs::File::create(&backing).unwrap();
+            f.set_len(16 << 20).unwrap();
+        }
+
+        let rt = start(&HANDLER).expect("start");
+        let path = backing.clone();
+        rt.reload(move |c| {
+            Ok(Conf {
+                store: c.disk(&path, None, None)?,
+                cores: c.cores(),
+                dev: c.device(1, LEFT, 8 << 20, Class::Small)?,
+            })
+        })
+        .expect("an abandoned minor is the node's own to retake");
+
+        // Not so while it is being served: this process holds it now, so an export that
+        // asks for the same number is refused, and told who has it.
+        let path = backing.clone();
+        let err = rt
+            .reload(move |c| {
+                Ok(Conf {
+                    store: c.disk(&path, None, None)?,
+                    cores: c.cores(),
+                    dev: c.device(2, LEFT, 8 << 20, Class::Small)?,
+                })
+            })
+            .expect_err("a live export keeps its minor");
+        assert!(
+            err.to_string()
+                .contains(&format!("pid {}", std::process::id())),
+            "a refusal has to name the holder: {err}"
+        );
+
+        rt.shutdown().expect("shutdown");
         let _ = std::fs::remove_file(&backing);
     }
 }

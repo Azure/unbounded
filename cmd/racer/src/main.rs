@@ -67,8 +67,8 @@ fn serve(cfg: Config, path: String, metrics: String) -> std::io::Result<()> {
         for (id, p) in d.devices() {
             println!("device {} -> {}", id, p.display());
         }
-        // The control plane publishes these through nvmet, and the kernel picks the
-        // ublk minor, so it has to be told which device is which universe's.
+        // Both are at the minor the config named, so these lines confirm what the control
+        // plane already published rather than announcing anything new.
         for (id, p) in d.fabrics() {
             println!("universe {} fabric -> {}", id, p.display());
         }
