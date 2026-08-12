@@ -45,7 +45,7 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, goalState *goalstates.M
 
 // CheckAPIServerReachable returns a non-mutating checker that validates the
 // cluster CA data and configured Kubernetes API server reachability. The
-// checker redacts the configured endpoint from result messages.
+// checker includes the configured endpoint in connectivity error messages.
 func CheckAPIServerReachable(log *slog.Logger, cfg config.AgentConfig) preflight.Checker {
 	return apiServerReachableChecker{log: log, config: cfg}
 }
@@ -79,7 +79,17 @@ func (c apiServerReachableChecker) Check(ctx context.Context) []preflight.Result
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return preflight.ResultsError(checkAPIServerReachableName, "cluster API server", "API server is not reachable")
+		if urlErr, ok := err.(*url.Error); ok {
+			err = urlErr.Err
+		}
+
+		return preflight.ResultsError(
+			checkAPIServerReachableName,
+			"cluster API server",
+			"API server %q is not reachable: %v",
+			apiServer,
+			err,
+		)
 	}
 	defer resp.Body.Close() //nolint:errcheck // best effort close
 

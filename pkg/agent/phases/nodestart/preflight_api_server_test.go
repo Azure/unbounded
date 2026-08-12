@@ -5,6 +5,7 @@ package nodestart
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -37,14 +38,20 @@ func TestCheckAPIServerReachableInvalidEndpoint(t *testing.T) {
 	assert.Equal(t, "API server endpoint is invalid", results[0].Message)
 }
 
-func TestCheckAPIServerReachableRequestFailureIsRedacted(t *testing.T) {
-	const endpoint = "https://127.0.0.1:1"
+func TestCheckAPIServerReachableRequestFailureIncludesEndpointAndNetworkError(t *testing.T) {
+	const endpoint = "https://api.example.com:6443"
+	networkErr := errors.New("DNS resolution failed")
+	checker := apiServerReachableChecker{
+		config: apiServerPreflightConfig(endpoint),
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, networkErr
+		})},
+	}
 
-	results := CheckAPIServerReachable(slog.New(slog.DiscardHandler), apiServerPreflightConfig(endpoint)).Check(context.Background())
+	results := checker.Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
-	assert.Equal(t, "API server is not reachable", results[0].Message)
-	assert.NotContains(t, results[0].Message, endpoint)
+	assert.Equal(t, `API server "https://api.example.com:6443" is not reachable: DNS resolution failed`, results[0].Message)
 }
 
 func TestCheckAPIServerReachableServerError(t *testing.T) {
