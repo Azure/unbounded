@@ -70,20 +70,31 @@ func runOverridesList(ctx context.Context, c client.Client, namespace string, ou
 		return nil
 	}
 
-	entries, err := override.Parse(configMap.Data)
+	entries, problems, err := override.Parse(configMap.Data)
 	if err != nil {
 		return err
 	}
 
-	if len(entries) == 0 {
+	problems = append(problems, override.Validate(entries)...)
+
+	if len(entries) == 0 && len(problems) == 0 {
 		fprintln(out, "The overrides ConfigMap exists but declares no entries.")
 
 		return nil
 	}
 
-	var sites v1alpha3.SiteList
+	// A Site list failure must not cost the user the table. The Sites are only
+	// needed for an advisory warning about selectors that match nothing, so
+	// saying the check could not run is better than printing nothing at all.
+	var (
+		sites     v1alpha3.SiteList
+		sitesRead = true
+	)
+
 	if err := c.List(ctx, &sites); err != nil {
-		return fmt.Errorf("list Sites: %w", err)
+		sitesRead = false
+
+		fprintf(out, "Warning: could not list Sites, so Site selectors were not checked: %v\n\n", err)
 	}
 
 	table := &metav1.Table{
@@ -110,10 +121,22 @@ func runOverridesList(ctx context.Context, c client.Client, namespace string, ou
 		return fmt.Errorf("print overrides: %w", err)
 	}
 
-	reportUnknownSites(entries, sites.Items, out)
+	if sitesRead {
+		reportUnknownSites(entries, sites.Items, out)
+	}
 
 	fprintf(out, "\nObserved ConfigMap resourceVersion: %s\n", configMap.ResourceVersion)
 	fprintln(out, "Run 'kubectl unbounded overrides status' to see what the operator applied.")
+
+	// Listing what a document declares is not the same as saying it works.
+	// Parsing alone accepted a document the operator rejects outright, so this
+	// printed a clean table while the operator was Degraded and had stopped
+	// reconciling the workloads the document names.
+	if len(problems) > 0 {
+		fprintln(out, "")
+
+		return override.ProblemsError(problems)
+	}
 
 	return nil
 }
@@ -165,33 +188,20 @@ func describeChanges(entry override.Entry) string {
 // before its Site exists, and deleting a Site must not retroactively invalidate
 // an unrelated override. Saying so is still useful, because the other
 // explanation is a typo.
+//
+// The matching itself comes from the override package rather than being
+// repeated here, so the CLI and the operator cannot disagree about what a Site
+// selector means.
 func reportUnknownSites(entries []override.SourcedEntry, sites []v1alpha3.Site, out io.Writer) {
-	known := make(map[string]bool, len(sites))
+	known := make([]string, 0, len(sites))
 	for i := range sites {
-		known[sites[i].Name] = true
+		known = append(known, sites[i].Name)
 	}
 
-	seen := map[string]bool{}
-
-	var unknown []string
-
-	for _, entry := range entries {
-		for _, site := range entry.Entry.Sites {
-			if known[site] || seen[site] {
-				continue
-			}
-
-			seen[site] = true
-
-			unknown = append(unknown, site)
-		}
-	}
-
+	unknown := override.UnmatchedSites(entries, known)
 	if len(unknown) == 0 {
 		return
 	}
-
-	sort.Strings(unknown)
 
 	fprintf(out, "\nWarning: these Site names match no Site and are inert: %s\n", strings.Join(unknown, ", "))
 	fprintln(out, "         This is expected if the Site has not been created yet.")

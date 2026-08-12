@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/validation"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -73,8 +74,9 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringSliceVarP(&files, "filename", "f", nil,
-		"Override document to validate. Repeatable. Reads the cluster ConfigMap when omitted.")
+	cmd.Flags().StringArrayVarP(&files, "filename", "f", nil,
+		"Override document to validate, or - for standard input. Repeatable. "+
+			"Reads the cluster ConfigMap when omitted.")
 	cmd.Flags().StringVar(&namespace, "namespace", unbounded.SystemNamespace(),
 		"Namespace holding the overrides ConfigMap")
 	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
@@ -124,9 +126,9 @@ func loadOverrideFiles(files []string) (map[string]string, error) {
 	}
 
 	for _, file := range files {
-		contents, err := os.ReadFile(file)
+		contents, err := readOverrideFile(file)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", file, err)
+			return nil, err
 		}
 
 		wrapped, isConfigMap, err := unwrapConfigMap(contents)
@@ -135,7 +137,21 @@ func loadOverrideFiles(files []string) (map[string]string, error) {
 		}
 
 		if !isConfigMap {
-			if err := add(filepath.Base(file), string(contents), file); err != nil {
+			key := filepath.Base(file)
+			if file == "-" {
+				key = "stdin.yaml"
+			}
+
+			// The key is what this content would become inside the ConfigMap,
+			// and the duplicate check below is built on that premise, so it has
+			// to be a key a ConfigMap can actually hold.
+			if problems := validation.IsConfigMapKey(key); len(problems) > 0 {
+				return nil, fmt.Errorf(
+					"%s: %q is not a valid ConfigMap key (%s); rename the file, or wrap the document in a ConfigMap manifest",
+					file, key, strings.Join(problems, "; "))
+			}
+
+			if err := add(key, string(contents), file); err != nil {
 				return nil, err
 			}
 
@@ -152,6 +168,53 @@ func loadOverrideFiles(files []string) (map[string]string, error) {
 	return data, nil
 }
 
+// maxOverrideFileBytes bounds a single input file.
+//
+// The operator's own limits are enforced by override.Parse, but they apply to
+// the ConfigMap payload, not to the manifest wrapping it. Without a bound here
+// the whole file is read and fully YAML-parsed before Parse ever sees it, so
+// `-f /dev/zero` allocates until it is killed. The bound is generous relative
+// to the 1 MiB the operator will accept, so it only ever catches a mistake.
+const maxOverrideFileBytes = 4 << 20
+
+// readOverrideFile reads one input, accepting `-` for stdin as every other
+// kubectl `-f` does, and refusing input too large to be a plausible document.
+func readOverrideFile(file string) ([]byte, error) {
+	if file == "-" {
+		contents, err := io.ReadAll(io.LimitReader(os.Stdin, maxOverrideFileBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("read standard input: %w", err)
+		}
+
+		if len(contents) > maxOverrideFileBytes {
+			return nil, fmt.Errorf("standard input is over the %d byte limit", maxOverrideFileBytes)
+		}
+
+		return contents, nil
+	}
+
+	info, err := os.Stat(file)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", file, err)
+	}
+
+	if info.IsDir() {
+		return nil, fmt.Errorf("read %s: is a directory; name the override documents individually", file)
+	}
+
+	if info.Size() > maxOverrideFileBytes {
+		return nil, fmt.Errorf("read %s: file is %d bytes, over the %d byte limit",
+			file, info.Size(), maxOverrideFileBytes)
+	}
+
+	contents, err := os.ReadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", file, err)
+	}
+
+	return contents, nil
+}
+
 // unwrapConfigMap returns the data of a ConfigMap manifest, reporting whether
 // the input was one at all.
 //
@@ -160,36 +223,44 @@ func loadOverrideFiles(files []string) (map[string]string, error) {
 // half-read, because silently skipping the part that did not fit is how a
 // document goes unvalidated while the command prints ok.
 func unwrapConfigMap(contents []byte) (map[string]string, bool, error) {
-	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(contents), 4096)
-
 	var (
 		data      map[string]string
 		found     int
 		documents int
 	)
 
-	for {
-		var configMap corev1.ConfigMap
-
-		if err := decoder.Decode(&configMap); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-
-			// The document is not a ConfigMap. That is the bare-document case,
-			// which the override parser reports on properly.
-			return nil, false, nil
-		}
-
-		if configMap.Kind == "" && configMap.APIVersion == "" && configMap.Data == nil {
+	for _, raw := range splitYAMLDocuments(contents) {
+		if isBlankDocument(raw) {
 			// An empty document, produced by a leading --- or a comment block.
 			continue
 		}
 
 		documents++
 
+		var configMap corev1.ConfigMap
+
+		// A decode failure here is not evidence of a bare overrides document.
+		// Treating it as one discarded the real error and handed the file to
+		// the override parser, which then complained that `kind`, `metadata`
+		// and `data` are not fields of an internal Go type: exactly the
+		// diagnostic this function exists to remove. Only a document that
+		// decodes and is not a ConfigMap is the bare-document case.
+		if err := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), 4096).Decode(&configMap); err != nil {
+			if isConfigMapDocument(raw) {
+				return nil, false, fmt.Errorf("document %d is a ConfigMap but did not decode: %w", documents, err)
+			}
+
+			return nil, false, nil
+		}
+
 		if configMap.Kind != "ConfigMap" {
 			continue
+		}
+
+		if configMap.APIVersion != "" && configMap.APIVersion != "v1" {
+			return nil, false, fmt.Errorf(
+				"document %d has kind ConfigMap with apiVersion %q; the operator reads a core v1 ConfigMap",
+				documents, configMap.APIVersion)
 		}
 
 		found++
@@ -236,6 +307,64 @@ func sortedKeys(data map[string]string) []string {
 	return keys
 }
 
+// splitYAMLDocuments splits a stream on `---` separators so each document can
+// be decoded, and failed against, on its own.
+//
+// Decoding the stream with one decoder cannot do this: a failure part-way
+// through gives no way to say which document failed, and no way to tell a
+// document that is not a ConfigMap from one that is malformed.
+func splitYAMLDocuments(contents []byte) [][]byte {
+	var (
+		documents [][]byte
+		current   []byte
+	)
+
+	for _, line := range bytes.Split(contents, []byte("\n")) {
+		trimmed := bytes.TrimRight(line, " \t\r")
+
+		if bytes.Equal(trimmed, []byte("---")) {
+			documents = append(documents, current)
+			current = nil
+
+			continue
+		}
+
+		current = append(current, line...)
+		current = append(current, '\n')
+	}
+
+	return append(documents, current)
+}
+
+// isBlankDocument reports whether a document carries nothing but whitespace and
+// comments, which is what a leading `---` or a licence header produces.
+func isBlankDocument(raw []byte) bool {
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 && trimmed[0] != '#' {
+			return false
+		}
+	}
+
+	return true
+}
+
+// isConfigMapDocument reports whether a document claims to be a ConfigMap, used
+// to decide whether a decode failure is a broken ConfigMap or simply a document
+// of another shape.
+//
+// It reads the raw text rather than the decoded object precisely because the
+// decode is what failed.
+func isConfigMapDocument(raw []byte) bool {
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		if bytes.Equal(bytes.TrimSpace(line), []byte("kind: ConfigMap")) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func runOverridesValidateCluster(ctx context.Context, c client.Client, namespace string, out io.Writer) error {
 	configMap, found, err := getOverridesConfigMap(ctx, c, namespace)
 	if err != nil {
@@ -252,13 +381,22 @@ func runOverridesValidateCluster(ctx context.Context, c client.Client, namespace
 }
 
 func reportValidation(data map[string]string, out io.Writer) error {
-	entries, err := override.Parse(data)
+	entries, problems, err := override.Parse(data)
 	if err != nil {
 		return err
 	}
 
-	if err := override.Validate(entries); err != nil {
-		return err
+	problems = append(problems, override.Validate(entries)...)
+
+	if len(problems) > 0 {
+		return override.ProblemsError(problems)
+	}
+
+	// Reporting ok for input nothing was read from is a false positive: the
+	// user named a file, and "0 entries" is far likelier to mean the content
+	// did not arrive than that they meant to declare nothing.
+	if len(entries) == 0 {
+		return errors.New("no override entries found; the input declares nothing to apply")
 	}
 
 	fprintf(out, "ok: %d entr%s, syntax and allowlist valid\n", len(entries), plural(len(entries)))

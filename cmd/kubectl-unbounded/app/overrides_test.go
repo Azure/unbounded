@@ -6,6 +6,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -621,5 +622,152 @@ data:
 
 	if !strings.Contains(out.String(), "2 entries") {
 		t.Fatalf("output = %q, want both documents validated", out.String())
+	}
+}
+
+// TestOverridesListValidates is a regression test.
+//
+// list parsed but never validated, so a document the operator rejects outright
+// printed a clean table and exited zero. The operator was meanwhile Degraded
+// and had stopped reconciling the workloads the document names. It was also
+// internally inconsistent: a syntax error aborted list, a semantic one was
+// ignored.
+func TestOverridesListValidates(t *testing.T) {
+	// machina emits no DaemonSet, so this entry can never match anything.
+	document := `apiVersion: ` + override.APIVersion + `
+overrides:
+  - component: machina
+    kind: DaemonSet
+    extraArgs:
+      machina-controller: ["--x"]
+`
+
+	cl := fake.NewClientBuilder().
+		WithScheme(overridesScheme(t)).
+		WithObjects(overridesConfigMapFor(map[string]string{"overrides.yaml": document})).
+		Build()
+
+	var out bytes.Buffer
+
+	err := runOverridesList(t.Context(), cl, overridesNamespace, &out)
+	if err == nil {
+		t.Fatal("list must report a document the operator rejects")
+	}
+
+	if !strings.Contains(err.Error(), "emits no DaemonSet") {
+		t.Fatalf("error = %v, want the validation failure", err)
+	}
+
+	// The table is still the useful part and must survive the failure.
+	if !strings.Contains(out.String(), "overrides.yaml[0]") {
+		t.Fatalf("output = %q, want the table to be printed alongside the failure", out.String())
+	}
+}
+
+// TestOverridesListSurvivesASiteListFailure pins that a user who can read the
+// ConfigMap but not Sites still gets the table. The Sites are needed only for
+// an advisory warning.
+func TestOverridesListSurvivesASiteListFailure(t *testing.T) {
+	cl := fake.NewClientBuilder().
+		WithScheme(overridesScheme(t)).
+		WithObjects(overridesConfigMapFor(map[string]string{"overrides.yaml": validOverridesDocument()})).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return errors.New("sites is forbidden")
+			},
+		}).
+		Build()
+
+	var out bytes.Buffer
+	if err := runOverridesList(t.Context(), cl, overridesNamespace, &out); err != nil {
+		t.Fatalf("a Site list failure must not cost the user the table: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "overrides.yaml[0]") {
+		t.Fatalf("output = %q, want the table", out.String())
+	}
+
+	if !strings.Contains(out.String(), "Site selectors were not checked") {
+		t.Fatalf("output = %q, want it to say the check did not run", out.String())
+	}
+}
+
+// TestOverridesValidateReportsBrokenConfigMaps is a regression test.
+//
+// A decode failure was read as "this must be a bare overrides document", and
+// the real error was discarded. The commonest authoring mistake there is,
+// forgetting the block scalar so a data value is a mapping, then produced three
+// complaints about fields missing from an internal Go type: verbatim the
+// diagnostic unwrapConfigMap exists to remove.
+func TestOverridesValidateReportsBrokenConfigMaps(t *testing.T) {
+	// data holds a mapping rather than a string, because the `|` is missing.
+	manifest := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-component-overrides
+data:
+  overrides.yaml:
+    apiVersion: ` + override.APIVersion + `
+    overrides:
+      - component: net
+        kind: DaemonSet
+        extraArgs:
+          node: ["--x"]
+`
+
+	path := filepath.Join(t.TempDir(), "cm.yaml")
+	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var out bytes.Buffer
+
+	err := runOverridesValidateFiles([]string{path}, &out)
+	if err == nil {
+		t.Fatal("a ConfigMap that does not decode must be reported")
+	}
+
+	if strings.Contains(err.Error(), "override.Document") {
+		t.Fatalf("error = %v, want it to name the ConfigMap rather than an internal Go type", err)
+	}
+
+	if !strings.Contains(err.Error(), "ConfigMap") {
+		t.Fatalf("error = %v, want it to say the ConfigMap did not decode", err)
+	}
+}
+
+// TestOverridesValidateRejectsEmptyInput pins that reporting ok for input
+// nothing was read from is a false positive.
+func TestOverridesValidateRejectsEmptyInput(t *testing.T) {
+	for name, contents := range map[string]string{
+		"empty file": "",
+		"configmap with no data": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-component-overrides
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "input.yaml")
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+
+			var out bytes.Buffer
+			if err := runOverridesValidateFiles([]string{path}, &out); err == nil {
+				t.Fatalf("validate reported ok for input declaring nothing: %q", out.String())
+			}
+		})
+	}
+}
+
+// TestOverridesValidateRejectsADirectory covers the other half of accepting
+// `-f`: a directory used to surface as a bare read error.
+func TestOverridesValidateRejectsADirectory(t *testing.T) {
+	var out bytes.Buffer
+
+	err := runOverridesValidateFiles([]string{t.TempDir()}, &out)
+	if err == nil || !strings.Contains(err.Error(), "is a directory") {
+		t.Fatalf("error = %v, want a clear directory error", err)
 	}
 }
