@@ -42,7 +42,7 @@ Example:
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := ctrl.SetupSignalHandler()
 
-			c, err := newMachineClientWithKubeconfig(getKubeconfigPath(kubeconfig))
+			c, err := newMachineClientWithKubeconfig(kubeconfig)
 			if err != nil {
 				return err
 			}
@@ -65,7 +65,8 @@ func runOverridesList(ctx context.Context, c client.Client, namespace string, ou
 	}
 
 	if !found {
-		fprintln(out, "No overrides ConfigMap found; the operator applies its default manifests.")
+		fprintf(out, "No overrides ConfigMap found in namespace %q.\n", namespace)
+		fprintln(out, "If the operator is installed elsewhere, pass --namespace.")
 
 		return nil
 	}
