@@ -167,6 +167,34 @@ type Env struct {
 	Scheme    *runtime.Scheme
 	Namespace string
 	Config    Config
+
+	// APIReader reads straight from the apiserver, bypassing the manager
+	// cache.
+	//
+	// Readiness gating asks whether a workload the same pass just applied is
+	// actually running. The cache is populated by a watch, so immediately after
+	// an apply it still holds the previous generation, and a gate reading it
+	// would see the *old* Deployment as available and act on that. It also
+	// keeps the operator from caching every Endpoints and EndpointSlice in the
+	// cluster merely to answer whether one Service has a backend.
+	//
+	// It may be nil in unit tests that do not need it; LiveReader falls back to
+	// the cached client so a component never has to nil-check it.
+	APIReader client.Reader
+}
+
+// LiveReader returns the reader to use for state a pass has just written, or
+// is about to make a decision on.
+//
+// See Env.APIReader for why the cache is the wrong source for those reads. The
+// fallback exists so tests that construct an Env directly keep working; a
+// running operator always sets APIReader from mgr.GetAPIReader().
+func (e *Env) LiveReader() client.Reader {
+	if e.APIReader != nil {
+		return e.APIReader
+	}
+
+	return e.Client
 }
 
 // ApplyManifestFS server-side applies every YAML object in the manifest

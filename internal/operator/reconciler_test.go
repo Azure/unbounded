@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -452,5 +453,62 @@ func TestRegistryMaterializedOnceAndInstanceReused(t *testing.T) {
 
 	if stateful.runs != 2 {
 		t.Fatalf("stateful component runs = %d, want 2 (instance not reused across reconciles)", stateful.runs)
+	}
+}
+
+// TestSiteReconcilerSetupRequiresAnAPIReader guards the fallback in
+// Env.LiveReader, for the same reason the reaper guards its own.
+//
+// LiveReader falls back to the cached client when APIReader is nil, which is
+// harmless in a unit test against a fake client and is not harmless under a
+// manager. The cache is populated by a watch, so immediately after an apply it
+// still holds the previous generation: a readiness gate reading it would see
+// the workload it just changed as already running. That failure is silent and
+// produces a confident wrong answer, so the wiring is checked at startup
+// instead.
+func TestSiteReconcilerSetupRequiresAnAPIReader(t *testing.T) {
+	r := &SiteReconciler{
+		Client: fake.NewClientBuilder().WithScheme(newReconcilerTestScheme(t)).Build(),
+	}
+
+	// The check runs before the manager is touched, so a nil manager is safe
+	// here and proves the check comes first.
+	err := r.SetupWithManager(nil)
+	if err == nil {
+		t.Fatal("a reconciler with no APIReader must be refused at setup")
+	}
+
+	if !strings.Contains(err.Error(), "APIReader") {
+		t.Fatalf("error = %q, want it to name the missing field", err)
+	}
+
+	if !strings.Contains(err.Error(), "cache") {
+		t.Fatalf("error = %q, want it to say why the cache makes this necessary", err)
+	}
+}
+
+// TestEnvLiveReaderPrefersTheAPIReader pins which reader components get, since
+// the whole point of the field is that the two disagree.
+func TestEnvLiveReaderPrefersTheAPIReader(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+	live := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	r := &SiteReconciler{Client: cached, Scheme: scheme, APIReader: live}
+
+	env := r.env()
+	if env.APIReader == nil {
+		t.Fatal("env() dropped the APIReader; every live read would silently use the cache")
+	}
+
+	if env.LiveReader() != client.Reader(live) {
+		t.Fatal("LiveReader returned the cached client while an APIReader was set")
+	}
+
+	// The fallback exists for tests that construct an Env directly, and must
+	// not be mistaken for the wired case.
+	bare := &component.Env{Client: cached}
+	if bare.LiveReader() != client.Reader(cached) {
+		t.Fatal("LiveReader must fall back to the cached client when no APIReader is set")
 	}
 }

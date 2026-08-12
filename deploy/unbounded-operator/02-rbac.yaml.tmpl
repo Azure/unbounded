@@ -42,6 +42,24 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "replicationcontrollers", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch"]
+  # Read-only, and only ever read: a component that registers admission
+  # webhooks or an aggregated API points them at a Service, and a registration
+  # whose backend is not serving is worse than none. Endpoints answer whether
+  # anything is actually behind that Service. The net controller Service has no
+  # selector - its leader pod writes these itself - so there is no other way to
+  # tell a running backend from a Deployment that merely exists.
+  #
+  # The verbs are exactly what the reads need and no more. These go through
+  # Env.LiveReader, which bypasses the manager cache: Endpoints is fetched by
+  # the Service's own name, so get suffices, while EndpointSlices carry
+  # generated names and have to be listed by their service-name label. Neither
+  # is watched, which is the point of reading them live.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
   - apiGroups: ["apps"]
     resources: ["deployments", "daemonsets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
