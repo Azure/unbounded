@@ -12,7 +12,8 @@
 //!     so any reader computes the replica set locally.
 //!   * **No per-key state.** Hotness is a count-min sketch, width is arithmetic on it,
 //!     and the reader's width hint is a direct-mapped byte array. Nothing grows with
-//!     the key space and nothing allocates after `open`.
+//!     the key space and nothing allocates after `open`. The victim contest reads that
+//!     same sketch rather than adding a counter to the slot.
 //!   * **No durability.** The map is volatile, writes are in place and `Buffered`, and
 //!     the region is carved at format time. A torn cache page is unreachable after a
 //!     restart because nothing points at it, so the allocator's out-of-place discipline
@@ -24,8 +25,14 @@
 //!     computability and `R(k,w) ⊂ R(k,w+1)` matter.
 //!   * A shedding replica answers `MISSING` rather than a busy status of its own, since
 //!     only four errnos survive nvmet. The reader's fallback is identical either way.
-//!   * `τ` is requests per decay interval, not an IOPS rate: it is clamped to the
-//!     sketch's ceiling of 15 per interval, so an IOPS-scale value yields `w ≤ 1`.
+//!   * Admission is per extent, not per node: `Extent::cache_admit` is the demand a page
+//!     must show before it may enter, in requests per decay interval rather than IOPS,
+//!     so it is bounded by the sketch's ceiling of 15. It is a threshold and nothing
+//!     more - it reserves no capacity and ranks no extents.
+//!   * Priority, by contrast, is global. A candidate must out-rank the entry the clock
+//!     hand is pointing at, on measured demand alone, so the hottest key wins whatever
+//!     extent either came from. That contest is what lets an extent admit everything
+//!     without its scan sweeping the rest of the cache away.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -234,6 +241,12 @@ struct Roster {
     me: u32,
     /// Sorted by universe id.
     cohorts: Box<[(u32, Box<[u32]>)]>,
+    /// Whether any extent asks to be cached at all. Admission is per extent and so is
+    /// decided per address, but a config where nobody opts in turns the whole cache off,
+    /// and that is worth knowing before the address is even looked at: it is the
+    /// difference between a lookup that early-returns and one that hops to another core
+    /// to search a store that is guaranteed empty.
+    admits: bool,
 }
 
 impl Roster {
@@ -253,6 +266,10 @@ impl Roster {
         Roster {
             me: cfg.node.id,
             cohorts: cohorts.into_boxed_slice(),
+            admits: cfg
+                .universes()
+                .iter()
+                .any(|u| u.extents.iter().any(|e| e.cache_admit > 0)),
         }
     }
 
@@ -295,6 +312,17 @@ struct Slot {
     /// A write is in flight into this slot. CLOCK steps over it rather than handing
     /// the same media out twice.
     busy: bool,
+}
+
+/// Why a claim found no slot. Both are ordinary outcomes, but only one is a policy
+/// decision, and the metrics keep them apart: `Colder` is the cache working as intended
+/// under pressure, `Busy` is transient and self-clearing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Decline {
+    /// Every slot the hand could reach is being written into, or the class holds none.
+    Busy,
+    /// The entry at the hand is in more demand than the candidate, so it keeps its slot.
+    Colder,
 }
 
 /// One 4 MiB piece of media the cache holds.
@@ -464,16 +492,25 @@ impl Store {
     }
 
     /// Claim a slot for `addr`, evicting by CLOCK if need be, and mark it busy for the
-    /// duration of the write. `None` when the slot holding `addr` is already being
-    /// written, or every slot is: a reason to decline and never a reason to wait.
-    fn claim(&mut self, addr: u64, reg: Register) -> Option<u32> {
+    /// duration of the write. Never a reason to wait: both declines mean take the
+    /// ordinary read path.
+    ///
+    /// `hotter(victim)` decides the contest at the hand, and is asked only about a live
+    /// entry that has already spent its second chance. An empty slot is taken without
+    /// one.
+    fn claim(
+        &mut self,
+        addr: u64,
+        reg: Register,
+        hotter: impl Fn(u64) -> bool,
+    ) -> Result<u32, Decline> {
         if self.slots.is_empty() {
-            return None;
+            return Err(Decline::Busy);
         }
         let i = match self.map.get(&addr) {
             Some(&i) if !self.slots[i as usize].busy => i,
-            Some(_) => return None,
-            None => self.evict()?,
+            Some(_) => return Err(Decline::Busy),
+            None => self.evict(hotter)?,
         };
         self.map.insert(addr, i);
         // A fresh entry starts with a clear reference bit: it already passed admission,
@@ -486,12 +523,18 @@ impl Store {
             live: false,
             busy: true,
         };
-        Some(i)
+        Ok(i)
     }
 
     /// The CLOCK hand. Two sweeps at most: the first clears reference bits, the second
     /// is guaranteed to find one clear unless every slot is busy.
-    fn evict(&mut self) -> Option<u32> {
+    ///
+    /// The first clear live entry the hand reaches is the one candidate is measured
+    /// against, and losing to it ends the admission rather than moving the hand on to
+    /// look for a weaker victim. Sweeping on would turn one contest into a search for
+    /// whatever the cache holds that is coldest, which is both O(slots) per admission
+    /// and a guarantee that a scan always finds something to displace.
+    fn evict(&mut self, hotter: impl Fn(u64) -> bool) -> Result<u32, Decline> {
         let n = self.slots.len() as u32;
         for _ in 0..2 * n {
             let i = self.hand;
@@ -501,19 +544,22 @@ impl Store {
                 continue;
             }
             if !s.live {
-                return Some(i);
+                return Ok(i);
             }
             if s.used {
                 s.used = false;
                 continue;
             }
             let old = s.addr;
-            s.live = false;
+            if hotter(old) {
+                return Err(Decline::Colder);
+            }
+            self.slots[i as usize].live = false;
             self.map.remove(&old);
             self.evicted += 1;
-            return Some(i);
+            return Ok(i);
         }
-        None
+        Err(Decline::Busy)
     }
 
     fn finish(&mut self, i: u32, ok: bool) {
@@ -564,6 +610,17 @@ pub struct ClassStats {
     pub dropped: u64,
     pub stale: u64,
     pub shed: u64,
+    /// Admissions refused because the extent's `cache_admit` said no: either the extent
+    /// caches nothing, or the page had not yet shown the demand the extent asks for.
+    ///
+    /// Counted where the decision is made, which for 4 KiB pages is the group member
+    /// computing the width rather than the node that would have done the caching. A
+    /// client seeing few admits and no rejections here is being vetoed elsewhere.
+    pub rejected_policy: u64,
+    /// Admissions refused because the entry at the clock hand was in more demand. Rising
+    /// with a full cache is the contest doing its job; rising with a cache that is not
+    /// full means the class is short of slots, not short of demand.
+    pub rejected_victim: u64,
     /// Media this class holds on this core, and the part of it that is on loan from the
     /// allocator's free list rather than the store's own tail.
     pub bytes: u64,
@@ -780,15 +837,6 @@ fn wants(served: [u64; 2], evicted: [u64; 2], missed: [u64; 2], bytes: [u64; 2])
     }
 }
 
-/// The controller: `w(k) = min(ceil(q̂(k) / τ), W_max)`. Width proportional to the
-/// measured rate is what makes zipf work — the head gets wide, the long tail gets zero,
-/// and the total replica count stays sublinear in the key space.
-fn width(q: u8, tau: u8, cap: u8) -> u8 {
-    u8::try_from((q as u32).div_ceil(tau as u32))
-        .unwrap_or(u8::MAX)
-        .min(cap)
-}
-
 /// Hysteresis: raise fast, lower one step at a time. Rendezvous nesting means a one-step
 /// change churns only the boundary replica, so damping the descent is the whole of the
 /// anti-oscillation story.
@@ -818,16 +866,14 @@ impl Cache {
         self.roster.install(Roster::of(cfg));
     }
 
-    /// `τ`, in requests per decay interval. Zero disables the cache entirely and is the
-    /// default: a node that has not been told a target rate has no business guessing
-    /// one. Clamped to `COUNTER_MAX`, above which the sketch cannot reach `τ` anyway.
-    fn tau(&self) -> u8 {
-        let t = self.alloc.config().policy.cache_target_rate;
-        t.clamp(0, COUNTER_MAX as u32) as u8
-    }
-
+    /// Whether this node can cache at all. Structural only, and deliberately cheap: a
+    /// cohort of nobody leaves no peer to place a replica on, and a config where no
+    /// extent opts in leaves nothing to place. Both are properties of the config rather
+    /// than of the address, so a lookup can be refused before it costs a hop. Whether a
+    /// particular page should be cached is per extent and lives in `observe_local`.
     fn enabled(&self) -> bool {
-        self.tau() > 0 && self.roster.get().widest() > 0
+        let r = self.roster.get();
+        r.admits && r.widest() > 0
     }
 
     /// Sheds while the allocator is short of free space, or while the store's rate
@@ -865,18 +911,49 @@ impl Cache {
 
     // ----------------------------------------------------------------- hotness
 
-    /// Record one read of `addr` and return the width its owner should advertise.
+    /// Record one read of `addr` and return the width its owner should advertise, which
+    /// is zero unless the extent's `cache_admit` is satisfied.
     ///
-    /// Must run on the core owning the address's group, where paxos already handles the
-    /// metadata round, so the owner keeps observing the whole read stream even for pages
-    /// it no longer serves itself.
+    /// This is where admission is decided, because this is where the signal is. Must run
+    /// on the core owning the address's group, where paxos already handles the metadata
+    /// round, so the owner keeps observing the whole read stream even for pages it no
+    /// longer serves itself - and for a 4 KiB page the owner is the *only* node that
+    /// sees every read, since the nodes that would cache it are by construction not
+    /// members of its group.
+    ///
+    /// A width of zero is the veto: `holds` refuses it, `replica` refuses it, and the
+    /// reader's `offer` never even calls `admit`. So the threshold needs no wire field
+    /// and no extra round - it rides back in the reply trailer that already carries `w`.
     pub fn observe_local(&self, addr: GlobalAddr) -> u8 {
-        let tau = self.tau();
-        if tau == 0 {
+        // Nothing to advertise a width to, so nothing to count either: a node whose
+        // cache is off by config would otherwise report every read as a rejection.
+        if !self.enabled() {
+            return 0;
+        }
+        // One lookup for both the class and the threshold; an address in no extent of
+        // ours is not a rejection, it is nothing to reject.
+        let Some((huge, n)) = self
+            .alloc
+            .config()
+            .extent_at(addr.0)
+            .map(|e| (e.huge, e.cache_admit))
+        else {
+            return 0;
+        };
+        if n == 0 {
+            self.stat(huge, |s| s.rejected_policy += 1);
             return 0;
         }
         let cap = self.w_max();
-        width(self.local().sketch.observe(addr.0), tau, cap)
+        // Observe before testing, so a page below the threshold still accumulates the
+        // demand that would carry it over. `n == 1` therefore always passes, since the
+        // sketch never answers below one for a key it has just seen.
+        let q = self.local().sketch.observe(addr.0);
+        if q < n {
+            self.stat(huge, |s| s.rejected_policy += 1);
+            return 0;
+        }
+        q.min(cap)
     }
 
     /// `observe_local` with a hop of its own, for the 4 MiB path: an immutable hit takes
@@ -897,13 +974,6 @@ impl Cache {
         u8::try_from(self.roster.get().widest())
             .unwrap_or(W_CAP)
             .min(W_CAP)
-    }
-
-    /// Admission filter: the same sketch used TinyLFU-style, so a one-hit wonder never
-    /// enters and never evicts anything that earned its slot.
-    fn hot_enough(&self, addr: GlobalAddr) -> bool {
-        let tau = self.tau();
-        tau > 0 && self.local().sketch.estimate(addr.0) >= tau
     }
 
     // ------------------------------------------------------------------- hints
@@ -1081,6 +1151,14 @@ impl Cache {
             self.stat(huge, |s| s.misses += 1);
             return None;
         };
+        // A hit is a read too, and for a 4 KiB page this is the only place this node
+        // learns of one: the group members see the metadata round, but a hit served from
+        // here never reaches them. Without it a resident entry's estimate would only
+        // decay, and it would lose the contest to the first candidate that walked past.
+        // The 4 MiB path counted this read in `cache_width` already.
+        if !huge {
+            self.local().sketch.observe(addr.0);
+        }
         Some((self.local().stores[k].off(slot), reg))
     }
 
@@ -1129,6 +1207,13 @@ impl Cache {
         .await;
     }
 
+    /// Take a slot for `addr` on the owning core, or decline.
+    ///
+    /// The threshold is not rechecked here - `observe_local` already applied it, and the
+    /// zero width it returns on a veto never reaches this function. What is rechecked is
+    /// the kill switch, because that has to bite the moment the config lands rather than
+    /// after the reader's damped width hint has drained; it costs one extent lookup and
+    /// no sketch.
     fn claim_here(&self, addr: GlobalAddr, huge: bool, reg: Register) -> Option<(u32, u64)> {
         let k = Cache::class(huge);
         if self.local().stores[k].current(addr.0, reg) {
@@ -1138,15 +1223,34 @@ impl Cache {
             self.stat(huge, |s| s.shed += 1);
             return None;
         }
-        // The one-hit-wonder filter, but only where this node's sketch is the signal. A
-        // 4 MiB page has no owner round to carry a width, so the reader's own estimate
-        // is all there is; a 4 KiB page arrives with the width its owner computed from
-        // the whole read stream.
-        if huge && !self.hot_enough(addr) {
+        if self.alloc.config().cache_admit_of(addr.0) == 0 {
+            self.stat(huge, |s| s.rejected_policy += 1);
             return None;
         }
         let mut l = self.local();
-        let slot = l.stores[k].claim(addr.0, reg)?;
+        // Count the read this node is about to serve from its own cache. The 4 MiB path
+        // already did so in `cache_width` before the read, on this same core; the 4 KiB
+        // path has not, because for a small page `observe_local` runs on a group member
+        // and this node is not one. Without this the local sketch would answer zero for
+        // every small page and the contest below would be a coin toss it always won.
+        let cand = if huge {
+            l.sketch.estimate(addr.0)
+        } else {
+            l.sketch.observe(addr.0)
+        };
+        let l = &mut *l;
+        let (sketch, store) = (&l.sketch, &mut l.stores[k]);
+        // The contest, and the only place hotness reaches victim selection. Ties go to
+        // the candidate, so a cold scan at an estimate of one churns other cold entries
+        // and leaves anything at two or more alone.
+        let slot = match store.claim(addr.0, reg, |victim| sketch.estimate(victim) > cand) {
+            Ok(slot) => slot,
+            Err(Decline::Colder) => {
+                l.stats.per[k].rejected_victim += 1;
+                return None;
+            }
+            Err(Decline::Busy) => return None,
+        };
         Some((slot, l.stores[k].off(slot)))
     }
 
@@ -1513,6 +1617,14 @@ mod tests {
         }
     }
 
+    impl Store {
+        /// `claim` with no contest. Every test below is about CLOCK, capacity or chunk
+        /// bookkeeping rather than about hotness; the contest has tests of its own.
+        fn claim_uncontested(&mut self, addr: u64, reg: Register) -> Result<u32, Decline> {
+            self.claim(addr, reg, |_| false)
+        }
+    }
+
     /// A store holding `n` chunks of tail, laid out end to end from a plausible base.
     fn store(class: Class, n: u64) -> Store {
         let mut st = Store::new(class);
@@ -1530,14 +1642,14 @@ mod tests {
         // One slot per chunk, so two chunks are exactly the two slots this needs.
         let mut st = store(Class::Huge, 2);
         let r = Register::default();
-        let a = st.claim(1, r).unwrap();
+        let a = st.claim_uncontested(1, r).unwrap();
         st.finish(a, true);
-        let b = st.claim(2, r).unwrap();
+        let b = st.claim_uncontested(2, r).unwrap();
         st.finish(b, true);
 
         // Touch 1 so it carries a reference bit, then admit a third page.
         assert!(st.find(1).is_some());
-        let c = st.claim(3, r).unwrap();
+        let c = st.claim_uncontested(3, r).unwrap();
         st.finish(c, true);
 
         assert!(st.find(1).is_some(), "referenced entry must survive");
@@ -1549,19 +1661,22 @@ mod tests {
     fn store_never_hands_out_a_busy_slot() {
         let mut st = store(Class::Huge, 1);
         let r = Register::default();
-        let i = st.claim(1, r).unwrap();
+        let i = st.claim_uncontested(1, r).unwrap();
         // The single slot is in flight, so there is nothing to hand out.
-        assert!(st.claim(2, r).is_none());
+        assert_eq!(st.claim_uncontested(2, r), Err(Decline::Busy));
         st.finish(i, false);
         // A failed write leaves no entry behind.
         assert!(st.find(1).is_none());
-        assert!(st.claim(2, r).is_some());
+        assert!(st.claim_uncontested(2, r).is_ok());
     }
 
     #[test]
     fn empty_store_declines() {
         let mut st = store(Class::Huge, 0);
-        assert!(st.claim(1, Register::default()).is_none());
+        assert_eq!(
+            st.claim_uncontested(1, Register::default()),
+            Err(Decline::Busy)
+        );
         assert!(st.find(1).is_none());
     }
 
@@ -1587,7 +1702,7 @@ mod tests {
         let mut st = store(Class::Huge, 3);
         let r = Register::default();
         for a in 1..=3u64 {
-            let i = st.claim(a, r).unwrap();
+            let i = st.claim_uncontested(a, r).unwrap();
             st.finish(i, true);
         }
         // Chunk 0 holds address 1. Removing it swaps the last chunk into the hole, so
@@ -1610,12 +1725,12 @@ mod tests {
     fn a_busy_chunk_is_not_given_back() {
         let mut st = store(Class::Huge, 2);
         let r = Register::default();
-        let a = st.claim(1, r).unwrap();
+        let a = st.claim_uncontested(1, r).unwrap();
         st.finish(a, true);
         // The reference bit sends the hand past slot `a`, so the second claim lands on
         // the other chunk and leaves an IO in flight there.
         assert!(st.find(1).is_some());
-        let b = st.claim(2, r).unwrap();
+        let b = st.claim_uncontested(2, r).unwrap();
         assert_ne!(a, b);
         assert!(st.remove_chunk(b as usize).is_none(), "busy itself");
         let (first, last) = (a.min(b) as usize, a.max(b) as usize);
@@ -1647,16 +1762,72 @@ mod tests {
         assert_eq!(st.give(false), None);
     }
 
+    /// An empty slot is taken without asking, which is what keeps a cold cache filling
+    /// at full speed no matter how hot the contest would say the candidate is not.
     #[test]
-    fn width_tracks_rate_and_clamps() {
-        // Zero only at zero count, then one replica per multiple of the target rate.
-        assert_eq!(width(0, 4, 8), 0);
-        assert_eq!(width(1, 4, 8), 1);
-        assert_eq!(width(4, 4, 8), 1);
-        assert_eq!(width(5, 4, 8), 2);
-        // W_max binds above the rate; a τ larger than the count still yields one.
-        assert_eq!(width(15, 1, 8), 8);
-        assert_eq!(width(15, 0xff, 8), 1);
+    fn an_empty_slot_holds_no_contest() {
+        let mut st = store(Class::Huge, 1);
+        let i = st.claim(1, Register::default(), |_| true).unwrap();
+        st.finish(i, true);
+        assert!(st.find(1).is_some());
+        assert_eq!(st.evicted, 0);
+    }
+
+    /// The contest, and the property the whole per-extent policy rests on: a resident
+    /// page in more demand than the candidate keeps its slot, so an extent that admits
+    /// everything cannot scan the rest of the cache away.
+    #[test]
+    fn a_hotter_incumbent_keeps_its_slot() {
+        let mut st = store(Class::Huge, 1);
+        let r = Register::default();
+        let i = st.claim_uncontested(1, r).unwrap();
+        st.finish(i, true);
+
+        // The incumbent's reference bit is clear - a fresh entry starts that way - so
+        // the hand reaches the contest on the first sweep rather than the second.
+        assert_eq!(st.claim(2, r, |v| v == 1), Err(Decline::Colder));
+        assert!(st.find(1).is_some(), "the incumbent must survive");
+        assert!(!st.map.contains_key(&2), "the candidate must not be mapped");
+        assert_eq!(st.evicted, 0, "a refused admission is not an eviction");
+    }
+
+    /// Ties go to the candidate, so a scan at an estimate of one displaces other pages
+    /// at one and nothing above it. Without this a cache full of cold entries would
+    /// never turn over.
+    #[test]
+    fn a_tie_goes_to_the_candidate() {
+        let mut st = store(Class::Huge, 1);
+        let r = Register::default();
+        let i = st.claim_uncontested(1, r).unwrap();
+        st.finish(i, true);
+
+        // `hotter` is strict, so equal demand answers false.
+        let j = st.claim(2, r, |_| false).unwrap();
+        st.finish(j, true);
+        assert!(st.find(2).is_some());
+        assert!(st.find(1).is_none());
+        assert_eq!(st.evicted, 1);
+    }
+
+    /// A lost contest ends the admission rather than moving the hand on to hunt for a
+    /// weaker victim, so one refusal costs one slot's worth of work and a hot cache
+    /// cannot be walked into giving something up.
+    #[test]
+    fn a_lost_contest_does_not_keep_sweeping() {
+        let mut st = store(Class::Huge, 4);
+        let r = Register::default();
+        for a in 1..=4 {
+            let i = st.claim_uncontested(a, r).unwrap();
+            st.finish(i, true);
+        }
+        // Only the entry the hand happens to reach is consulted, and it wins.
+        let hand = st.hand;
+        let at = st.slots[hand as usize].addr;
+        assert_eq!(st.claim(9, r, |v| v == at), Err(Decline::Colder));
+        for a in 1..=4 {
+            assert!(st.find(a).is_some(), "entry {a} must survive");
+        }
+        assert_eq!(st.evicted, 0);
     }
 
     #[test]
@@ -1697,6 +1868,32 @@ mod tests {
         // And a universe we hold no catalog for is nobody, which reads as caching off.
         assert!(r.cohort(3).is_empty());
         assert_eq!(r.widest(), 2);
+    }
+
+    #[test]
+    fn a_config_nobody_opts_into_turns_the_cache_off() {
+        // A cohort exists, so the roster is structurally able to cache. Whether it
+        // should is the extents' call, and here none of them asks to be.
+        let text = |admit: &str| {
+            format!(
+                "node id=5 zone=1 cohort=0 store=/x size=4096
+                 universe 1
+                   group 5 6 7
+                   extent id=1 base=0   pages=16 kind=lww zone=1 {admit}
+                   extent id=2 base=16  pages=16 kind=occ zone=1"
+            )
+        };
+        let off = crate::config::Config::parse(&text("")).unwrap();
+        let r = Roster::of(&off);
+        assert!(
+            r.widest() > 0,
+            "the cohort is what makes this worth testing"
+        );
+        assert!(!r.admits);
+
+        // One extent opting in is enough to make the lookup worth its hop.
+        let on = crate::config::Config::parse(&text("cache_admit=1")).unwrap();
+        assert!(Roster::of(&on).admits);
     }
 
     #[test]

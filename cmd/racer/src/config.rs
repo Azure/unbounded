@@ -24,9 +24,9 @@ const SLOTS: usize = 16384;
 const SMALL_PAGE: u64 = 4096;
 const HUGE_PAGE: u64 = 4 << 20;
 
-/// The largest `Policy::cache_target_rate` worth asking for: the cache's demand counter
-/// is four bits wide (cache.rs), so it never observes a rate above this.
-pub(crate) const CACHE_MAX_RATE: u32 = 15;
+/// The largest `Extent::cache_admit` worth asking for: the cache's demand counter is
+/// four bits wide (cache.rs), so it never observes a rate above this.
+pub(crate) const CACHE_MAX_ADMIT: u32 = 15;
 
 /// Configs the watcher refused. A rejection is not actionable, so it is counted and
 /// dropped; it surfaces as `racer_config_rejected_total` (metrics.rs), an operator's
@@ -253,6 +253,10 @@ pub(crate) struct Extent {
     /// Page versions are `3*epoch + state`: `3e` empty, `3e+1` live, `3e+2` trimmed.
     /// Never decreases; advancing it destroys every page written under the old one.
     pub(crate) tombstone_epoch: u64,
+    /// Cache admission threshold for pages of this extent (cache.rs): 0 never admits,
+    /// 1 admits on first sight, and `n` admits once the demand estimate reaches `n`.
+    /// Not frozen - a reload may raise or lower it.
+    pub(crate) cache_admit: u8,
 }
 
 impl Extent {
@@ -456,8 +460,6 @@ pub(crate) struct Policy {
     /// record can only turn a would-be success into a conflict, so this bounds
     /// memory without bounding correctness.
     pub(crate) occ_bytes: u64,
-    /// The cache's target rate, in requests per decay interval. Zero disables the cache.
-    pub(crate) cache_target_rate: u32,
     /// DRAM ceiling for the read cache's index across every core and both classes. What
     /// bounds the cache, since the media it is handed is whatever the slabs left over.
     /// Not an admission check: the cache holds fewer chunks rather than refusing to
@@ -474,7 +476,6 @@ impl Default for Policy {
         Policy {
             max_index_bytes: 8 << 30,
             occ_bytes: 256 << 20,
-            cache_target_rate: 0,
             cache_index_bytes: 1 << 30,
             repairs_per_replay: 4096,
         }
@@ -640,6 +641,16 @@ impl Config {
         self.extent_at(addr).map_or(0, |e| e.tombstone_epoch)
     }
 
+    /// The cache admission threshold of `addr`'s extent (cache.rs): 0 never admits, 1
+    /// admits on first sight, and `n` admits once the demand estimate reaches `n`.
+    ///
+    /// An address in no extent of ours is never cached. That is not a special case for
+    /// the cache's benefit - there is nothing here to hold - but it does mean an extent
+    /// leaving this node's config stops admission for its pages at once.
+    pub(crate) fn cache_admit_of(&self, addr: u64) -> u8 {
+        self.extent_at(addr).map_or(0, |e| e.cache_admit)
+    }
+
     /// The id of `addr`'s extent, which is what the census is keyed by.
     pub(crate) fn extent_id_of(&self, addr: u64) -> Option<u32> {
         self.extent_at(addr).map(|e| e.id)
@@ -674,12 +685,6 @@ impl Config {
             return Err(bad(format!(
                 "the 4 KiB index would need {index_bytes} bytes, over the {} allowed",
                 self.policy.max_index_bytes
-            )));
-        }
-        if self.policy.cache_target_rate > CACHE_MAX_RATE {
-            return Err(bad(format!(
-                "cache_target_rate {} is above the {CACHE_MAX_RATE} the cache can observe",
-                self.policy.cache_target_rate
             )));
         }
         if self.policy.repairs_per_replay == 0 {
@@ -1011,6 +1016,12 @@ impl Config {
                 let k = pb::Kind::try_from(e.kind)
                     .map_err(|_| bad(format!("extent {} has unknown kind {}", e.id, e.kind)))?;
                 let (kind, huge) = split_kind(k);
+                if e.cache_admit > CACHE_MAX_ADMIT {
+                    return Err(bad(format!(
+                        "extent {} asks for cache_admit {}, above the {CACHE_MAX_ADMIT} the cache can observe",
+                        e.id, e.cache_admit
+                    )));
+                }
                 extents.push(Extent {
                     id: e.id,
                     base_lba: e.base_lba,
@@ -1020,6 +1031,7 @@ impl Config {
                     zone: e.zone,
                     next_zone: e.next_zone,
                     tombstone_epoch: e.tombstone_epoch as u64,
+                    cache_admit: e.cache_admit as u8,
                 });
             }
             extents.sort_by_key(|e| e.base_lba);
@@ -1100,7 +1112,6 @@ impl Config {
                 .max_index_bytes
                 .unwrap_or(Policy::default().max_index_bytes),
             occ_bytes: p.occ_bytes.unwrap_or(Policy::default().occ_bytes),
-            cache_target_rate: p.cache_target_rate,
             cache_index_bytes: p
                 .cache_index_bytes
                 .unwrap_or(Policy::default().cache_index_bytes),
@@ -1165,6 +1176,7 @@ impl Config {
                             zone: e.zone,
                             next_zone: e.next_zone,
                             tombstone_epoch: e.tombstone_epoch as u32,
+                            cache_admit: e.cache_admit as u32,
                         })
                         .collect(),
                 })
@@ -1180,7 +1192,6 @@ impl Config {
             policy: Some(pb::Policy {
                 max_index_bytes: Some(self.policy.max_index_bytes),
                 occ_bytes: Some(self.policy.occ_bytes),
-                cache_target_rate: self.policy.cache_target_rate,
                 cache_index_bytes: Some(self.policy.cache_index_bytes),
                 repairs_per_replay: Some(self.policy.repairs_per_replay),
             }),
@@ -1198,7 +1209,7 @@ impl Config {
     ///   peer id=2 device=/dev/nvme1n1
     ///   group 1 2 3
     ///   zone id=2 entry=4,5,6
-    ///   extent id=10 base=0    pages=4096 kind=lww zone=1
+    ///   extent id=10 base=0    pages=4096 kind=lww zone=1 cache_admit=2
     ///   extent id=11 base=4096 pages=512  kind=occ zone=1
     /// device 1 extents=10,11
     /// ```
@@ -1277,6 +1288,7 @@ impl Config {
                             "zone",
                             "next_zone",
                             "tombstone_epoch",
+                            "cache_admit",
                         ],
                     )
                     .map_err(at)?;
@@ -1288,6 +1300,7 @@ impl Config {
                         zone: get(f, "zone").map_err(at)? as u32,
                         next_zone: get_or(f, "next_zone", 0).map_err(at)? as u32,
                         tombstone_epoch: get_or(f, "tombstone_epoch", 0).map_err(at)? as u32,
+                        cache_admit: get_or(f, "cache_admit", 0).map_err(at)? as u32,
                     };
                     last(&mut p, key).map_err(at)?.extents.push(e);
                 }
@@ -1304,7 +1317,6 @@ impl Config {
                         &[
                             "max_index_bytes",
                             "occ_bytes",
-                            "cache_target_rate",
                             "cache_index_bytes",
                             "repairs_per_replay",
                         ],
@@ -1313,7 +1325,6 @@ impl Config {
                     p.policy = Some(pb::Policy {
                         max_index_bytes: opt(f, "max_index_bytes").map_err(at)?,
                         occ_bytes: opt(f, "occ_bytes").map_err(at)?,
-                        cache_target_rate: get_or(f, "cache_target_rate", 0).map_err(at)? as u32,
                         cache_index_bytes: opt(f, "cache_index_bytes").map_err(at)?,
                         repairs_per_replay: opt(f, "repairs_per_replay")
                             .map_err(at)?
@@ -1653,9 +1664,9 @@ universe 1 epoch=3
   group 1 2 3
   group 4 5 6
   zone id=2 entry=4,5,6
-  extent id=10 base=0     pages=100 kind=lww           zone=1
+  extent id=10 base=0     pages=100 kind=lww           zone=1 cache_admit=3
   extent id=11 base=100   pages=50  kind=occ           zone=1
-  extent id=12 base=1024  pages=8   kind=immutable_4m  zone=1
+  extent id=12 base=1024  pages=8   kind=immutable_4m  zone=1 cache_admit=1
   extent id=13 base=16384 pages=4   kind=lww           zone=2
 
 device 1 extents=10,11
@@ -2075,6 +2086,45 @@ universe 1 epoch=1
             c.validate_against(&b).is_err(),
             "a decrease strands every live page"
         );
+    }
+
+    /// Admission is a property of the extent, so two extents in one universe answer
+    /// differently and an address in no extent of ours answers zero.
+    #[test]
+    fn cache_admission_is_per_extent() {
+        let c = sample();
+        assert_eq!(c.cache_admit_of(at(1, 0)), 3);
+        assert_eq!(c.cache_admit_of(at(1, 99)), 3);
+        assert_eq!(c.cache_admit_of(at(1, 100)), 0, "the occ extent opts out");
+        assert_eq!(
+            c.cache_admit_of(at(1, 1024)),
+            1,
+            "the 4 MiB extent admits all"
+        );
+        assert_eq!(c.cache_admit_of(at(1, 150)), 0, "the gap is unmapped");
+        assert_eq!(c.cache_admit_of(at(2, 0)), 0, "universe 2 does not exist");
+    }
+
+    /// The threshold is compared against a 4-bit sketch counter, so it has to fit in one.
+    #[test]
+    fn cache_admission_fits_the_counter() {
+        for (n, ok) in [(0, true), (1, true), (7, true), (15, true), (16, false)] {
+            let s = SAMPLE.replace("cache_admit=3", &format!("cache_admit={n}"));
+            assert_eq!(Config::parse(&s).is_ok(), ok, "cache_admit={n}");
+        }
+    }
+
+    /// Admission is a policy knob, not part of the frozen shape: the control plane may
+    /// move it in either direction on any reload, including down to zero.
+    #[test]
+    fn cache_admission_may_change_on_a_reload() {
+        let b = sample();
+        for n in [0u8, 1, 15] {
+            let mut c = sample();
+            c.generation = 8;
+            c.universes[0].extents[0].cache_admit = n;
+            c.validate_against(&b).unwrap();
+        }
     }
 
     #[test]

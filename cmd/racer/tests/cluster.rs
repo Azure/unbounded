@@ -539,20 +539,20 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
         (n.id - 1) % 3,
         n.store_bytes,
     );
-    // A nonzero target rate is what turns the cache on at all. Low, so a handful of
-    // reads makes a page hot.
-    s += "policy cache_target_rate=1\n\
-          universe 1 epoch=1\n";
+    s += "universe 1 epoch=1\n";
     for (id, dev) in peers {
         s += &format!("peer id={id} device={}\n", dev.display());
     }
     for g in catalog() {
         s += &format!("group {} {} {}\n", g[0], g[1], g[2]);
     }
-    s += "extent id=1 base=0    pages=4096 kind=lww          zone=1\n\
-          extent id=2 base=4096 pages=512  kind=occ          zone=1\n\
+    // Admission is per extent. Extent 1 asks for one, which admits on first sight, so a
+    // single read is enough to make a page cacheable. Extent 3 asks for none at all and
+    // must never reach the cache however hot it gets.
+    s += "extent id=1 base=0    pages=4096 kind=lww          zone=1 cache_admit=1\n\
+          extent id=2 base=4096 pages=512  kind=occ          zone=1 cache_admit=1\n\
           extent id=3 base=4608 pages=512  kind=immutable    zone=1\n\
-          extent id=4 base=5120 pages=4    kind=immutable_4m zone=1\n\
+          extent id=4 base=5120 pages=4    kind=immutable_4m zone=1 cache_admit=1\n\
           device 1 extents=1\n\
           device 2 extents=2\n\
           device 3 extents=3\n\
@@ -823,6 +823,52 @@ fn six_node_cluster() {
     );
     write_lww(&b, remote * 4096, &pattern(2, PAGE));
 
+    // ---- cache: an extent that opts out is never admitted, however hot it gets ------
+    // Extent 3 asks for no admission at all. The page below is one node 1 does not hold,
+    // so every other rule would have it cached by now; the only thing keeping it out is
+    // its extent. The veto lands on whichever node computes the width, which for a 4 KiB
+    // page is a group member rather than the reader, so the count is cluster-wide.
+    let cold = page_in(&cfg, IMM_BASE, 1);
+    // Workers publish their counters from a tick, so a scrape taken straight after the
+    // work lags it. Settling first is what makes the equality below a statement about
+    // admission rather than about publication.
+    let totals = |nodes: &[Node]| -> (u64, u64) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        nodes
+            .iter()
+            .map(|n| {
+                let m = scrape(n);
+                (
+                    m.get("racer_cache_reject_total{class=\"small\",reason=\"policy\"}"),
+                    m.get("racer_cache_admit_total{class=\"small\"}"),
+                )
+            })
+            .fold((0, 0), |(r, a), (dr, da)| (r + dr, a + da))
+    };
+    nodes[5]
+        .dev(IMM)
+        .write(cold * 4096, &pattern(0x21, PAGE))
+        .unwrap();
+    let (was_rejected, was_admitted) = totals(&nodes);
+    let ca = nodes[0].dev(IMM);
+    for _ in 0..64 {
+        assert_eq!(
+            ca.read(cold * 4096, PAGE).unwrap(),
+            pattern(0x21, PAGE),
+            "opting out of the cache must not change what a read returns"
+        );
+    }
+    drop(ca);
+    let (rejected, admitted) = totals(&nodes);
+    assert!(
+        rejected > was_rejected,
+        "64 reads of an opted-out extent counted no policy rejection"
+    );
+    assert_eq!(
+        admitted, was_admitted,
+        "a page from an opted-out extent was admitted anyway"
+    );
+
     // ---- OCC: a write is refused unless this node read the current version ---------
     let occ_page = page_in(&cfg, OCC_BASE, 1);
     let oa = nodes[0].dev(OCC);
@@ -932,7 +978,7 @@ fn six_node_cluster() {
         "no accepts counted"
     );
     assert!(
-        m.get("racer_cache_lookup_total{result=\"hit\"}") > 0,
+        m.get("racer_cache_lookup_total{class=\"small\",result=\"hit\"}") > 0,
         "no cache hits counted"
     );
     let slots = m.get("racer_alloc_slots{class=\"small\"}");
