@@ -7,13 +7,16 @@
 #![cfg(not(feature = "sim"))]
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::Command;
 
+use harness::last_error;
 use racer::config::Config;
+
+#[path = "../src/harness.rs"]
+mod harness;
 
 const NODES: u32 = 7;
 const ROOT: &str = "/tmp/racer-e2e";
@@ -39,126 +42,32 @@ const LWW_BASE: u64 = 0;
 const OCC_BASE: u64 = 4096;
 const IMM_BASE: u64 = 4608;
 
-const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4c82;
-const LOOP_SET_FD: libc::c_ulong = 0x4c00;
-const LOOP_CLR_FD: libc::c_ulong = 0x4c01;
-const LOOP_SET_BLOCK_SIZE: libc::c_ulong = 0x4c09;
-
 // --- the cluster ---
 
 struct Node {
-    id: u32,
-    dir: PathBuf,
-    img: PathBuf,
-    mnt: PathBuf,
-    /// Declared before `_memfd` so the loop device detaches before its backing file closes.
-    loop_dev: Option<OwnedFd>,
-    _loop_path: String,
-    _memfd: OwnedFd,
-    child: Option<Child>,
-    out: Option<BufReader<ChildStdout>>,
-    devices: Vec<(u32, PathBuf)>,
-    fabric: PathBuf,
+    /// Declared before the backing store: the process must be gone before its store is
+    /// unmounted, and fields drop in order.
+    proc: harness::Proc,
+    _backing: harness::Backing,
     /// Store size the generations for this node ask for; raising it grows the file.
     store_bytes: u64,
-    /// Where this node's prometheus endpoint landed; the port is ephemeral.
-    metrics: String,
 }
 
 impl Node {
-    /// Start `racer serve` and read back the devices it published.
-    fn serve(&mut self) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_racer"))
-            .arg("serve")
-            .arg(self.dir.join("node.pb"))
-            .env("METRICS_ADDR", "127.0.0.1:0")
-            // The store path is process-local, never in a generation: racer sizes it.
-            .env(racer::config::STORE_PATH_ENV, &self.img)
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn racer serve");
-        let mut out = BufReader::new(child.stdout.take().unwrap());
-        self.devices.clear();
-        loop {
-            let line = next_line(&mut out, self.id);
-            if let Some(rest) = line.strip_prefix("metrics -> ") {
-                self.metrics = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("device ") {
-                let (id, path) = rest.split_once(" -> ").expect("device line");
-                self.devices
-                    .push((id.parse().unwrap(), PathBuf::from(path)));
-            } else if let Some(rest) = line.strip_prefix("universe ") {
-                // One universe: its fabric device ends the banner and peers attach to it.
-                let (_, path) = rest.split_once(" fabric -> ").expect("universe line");
-                self.fabric = PathBuf::from(path);
-                break;
-            }
-        }
-        for (_, p) in &self.devices {
-            wait_for(p);
-        }
-        wait_for(&self.fabric);
-        self.child = Some(child);
-        self.out = Some(out);
-    }
-
-    fn signal(&mut self, sig: i32) {
-        if let Some(c) = &self.child {
-            unsafe { libc::kill(c.id() as i32, sig) };
-        }
-    }
-
-    fn reap(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.wait();
-        }
-        self.out = None;
-    }
-
-    /// Install a generation the way the control plane does: write, then rename atomically.
-    fn install(&self, text: &str) {
-        let cfg = Config::parse(text).expect("parse config");
-        cfg.validate().expect("validate config");
-        let tmp = self.dir.join("node.next");
-        std::fs::write(&tmp, cfg.encode()).unwrap();
-        std::fs::rename(&tmp, self.dir.join("node.pb")).unwrap();
-    }
-
-    fn await_reload(&mut self) {
-        let out = self.out.as_mut().unwrap();
-        loop {
-            if next_line(out, self.id) == "racer: configuration applied" {
-                return;
-            }
-        }
-    }
-
     fn dev(&self, device: u32) -> Dev {
-        let p = self
-            .devices
-            .iter()
-            .find(|(id, _)| *id == device)
-            .expect("device")
-            .1
-            .clone();
-        Dev::open(&p)
-    }
-
-    /// Bytes the store holds, which is what `size=` asked for at this node's last start.
-    fn store_len(&self) -> u64 {
-        std::fs::metadata(&self.img).expect("stat the store").len()
+        Dev::open(self.proc.device(device))
     }
 
     /// Start `racer serve` on a config it must refuse and return stderr. Node must be down.
     fn serve_refuses(&self, text: &str) -> String {
         let cfg = Config::parse(text).expect("parse config");
-        let path = self.dir.join("node.refused");
+        let path = self.proc.dir.join("node.refused");
         std::fs::write(&path, cfg.encode()).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_racer"))
+        let out = Command::new(self.proc.exe())
             .arg("serve")
             .arg(&path)
             .env("METRICS_ADDR", "127.0.0.1:0")
-            .env(racer::config::STORE_PATH_ENV, &self.img)
+            .env(racer::config::STORE_PATH_ENV, &self.proc.store)
             .output()
             .expect("spawn racer serve");
         assert!(
@@ -169,51 +78,9 @@ impl Node {
     }
 }
 
-impl Drop for Node {
-    fn drop(&mut self) {
-        self.signal(libc::SIGKILL);
-        self.reap();
-        unsafe { libc::umount2(cstr(&self.mnt).as_ptr(), libc::MNT_DETACH) };
-        if let Some(d) = self.loop_dev.take() {
-            unsafe { libc::ioctl(d.as_raw_fd(), LOOP_CLR_FD) };
-        }
-    }
-}
-
 /// Stop the cluster together: a ublk device cannot be torn down while a peer holds it open.
 fn shutdown(nodes: &mut [Node]) {
-    for n in nodes.iter_mut() {
-        n.signal(libc::SIGTERM);
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    for n in nodes.iter_mut() {
-        while std::time::Instant::now() < deadline {
-            match n.child.as_mut().map(|c| c.try_wait().unwrap()) {
-                None | Some(Some(_)) => break,
-                Some(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            }
-        }
-        n.signal(libc::SIGKILL);
-        n.reap();
-    }
-}
-
-/// One line of a node's stdout, or a panic if it died.
-fn next_line(out: &mut BufReader<ChildStdout>, id: u32) -> String {
-    let mut s = String::new();
-    let n = out.read_line(&mut s).expect("read node stdout");
-    assert!(n > 0, "node {id} exited before publishing its devices");
-    s.trim_end().to_string()
-}
-
-fn wait_for(p: &Path) {
-    for _ in 0..500 {
-        if p.exists() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    panic!("{} never appeared", p.display());
+    harness::shutdown(nodes.iter_mut().map(|n| &mut n.proc));
 }
 
 // --- metrics ---
@@ -282,8 +149,12 @@ impl Exposition {
 }
 
 fn scrape(n: &Node) -> Exposition {
-    let (status, body) = http_get(&n.metrics, "/metrics");
-    assert_eq!(status, "HTTP/1.1 200 OK", "scrape of node {} failed", n.id);
+    let (status, body) = http_get(&n.proc.metrics, "/metrics");
+    assert_eq!(
+        status, "HTTP/1.1 200 OK",
+        "scrape of node {} failed",
+        n.proc.id
+    );
     Exposition::parse(&body)
 }
 
@@ -291,80 +162,15 @@ fn scrape(n: &Node) -> Exposition {
 
 fn build_node(id: u32) -> Node {
     let dir = PathBuf::from(ROOT).join(format!("n{id}"));
-    let mnt = dir.join("mnt");
-    std::fs::create_dir_all(&mnt).unwrap();
-
-    let name = cstr(Path::new(&format!("racer-{id}")));
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
-    assert!(fd >= 0, "memfd_create: {}", last_error());
-    let memfd = unsafe { OwnedFd::from_raw_fd(fd) };
-    assert_eq!(
-        unsafe { libc::ftruncate(fd, FS_BYTES as i64) },
-        0,
-        "ftruncate: {}",
-        last_error()
-    );
-
-    let (loop_dev, loop_path) = loop_attach(fd);
-    let ok = Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-b", "4096", &loop_path])
-        .status()
-        .expect("mkfs.ext4");
-    assert!(ok.success(), "mkfs.ext4 failed on {loop_path}");
-    let rc = unsafe {
-        libc::mount(
-            cstr(Path::new(&loop_path)).as_ptr(),
-            cstr(&mnt).as_ptr(),
-            c"ext4".as_ptr(),
-            0,
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(rc, 0, "mount {loop_path}: {}", last_error());
-
+    let backing = harness::Backing::new(&dir.join("mnt"), FS_BYTES, &id.to_string());
     // Deliberately not created: racer places and sizes its own store.
-    let img = mnt.join("store.img");
+    let store = backing.path("store.img");
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_racer"));
     Node {
-        id,
-        dir,
-        img,
-        mnt,
-        loop_dev: Some(loop_dev),
-        _loop_path: loop_path,
-        _memfd: memfd,
-        child: None,
-        out: None,
-        devices: Vec::new(),
-        fabric: PathBuf::new(),
+        proc: harness::Proc::new(id, dir, store, exe),
+        _backing: backing,
         store_bytes: IMG_BYTES,
-        metrics: String::new(),
     }
-}
-
-/// Bind a free loop device to `backing`. udev creates the node a moment later.
-fn loop_attach(backing: RawFd) -> (OwnedFd, String) {
-    let ctl = File::open("/dev/loop-control").expect("/dev/loop-control");
-    let n = unsafe { libc::ioctl(ctl.as_raw_fd(), LOOP_CTL_GET_FREE) };
-    assert!(n >= 0, "LOOP_CTL_GET_FREE: {}", last_error());
-    let path = format!("/dev/loop{n}");
-    wait_for(Path::new(&path));
-    let dev = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .expect("open loop device");
-    let rc = unsafe { libc::ioctl(dev.as_raw_fd(), LOOP_SET_FD, backing) };
-    assert_eq!(rc, 0, "LOOP_SET_FD: {}", last_error());
-    unsafe { libc::ioctl(dev.as_raw_fd(), LOOP_SET_BLOCK_SIZE, 4096) };
-    (OwnedFd::from(dev), path)
-}
-
-fn cstr(p: &Path) -> std::ffi::CString {
-    std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap()
-}
-
-fn last_error() -> std::io::Error {
-    std::io::Error::last_os_error()
 }
 
 // --- client IO ---
@@ -497,8 +303,8 @@ fn write_occ(dev: &Dev, off: u64, page: &[u8]) {
 fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     let mut s = format!(
         "generation {generation}\nnode id={} zone=1 cohort={} size={}\n",
-        n.id,
-        (n.id - 1) % 3,
+        n.proc.id,
+        (n.proc.id - 1) % 3,
         n.store_bytes,
     );
     s += "universe 1 epoch=1\n";
@@ -536,8 +342,8 @@ fn set_catalog(groups: &[[u32; 3]]) {
 fn peers_of(nodes: &[Node], id: u32) -> Vec<(u32, PathBuf)> {
     nodes
         .iter()
-        .filter(|n| n.id != id)
-        .map(|n| (n.id, n.fabric.clone()))
+        .filter(|n| n.proc.id != id)
+        .map(|n| (n.proc.id, n.proc.fabric.clone()))
         .collect()
 }
 
@@ -548,17 +354,20 @@ fn wire(nodes: &mut [Node], generation: u32, who: &[usize]) {
 
 /// As [`wire`], but `who` is told nothing of the peers in `omit` and must route via others.
 fn wire_without(nodes: &mut [Node], generation: u32, who: &[usize], omit: &[u32]) {
-    let fabrics: Vec<(u32, PathBuf)> = nodes.iter().map(|n| (n.id, n.fabric.clone())).collect();
+    let fabrics: Vec<(u32, PathBuf)> = nodes
+        .iter()
+        .map(|n| (n.proc.id, n.proc.fabric.clone()))
+        .collect();
     for &i in who {
         let n = &mut nodes[i];
         let peers: Vec<(u32, PathBuf)> = fabrics
             .iter()
-            .filter(|(id, _)| *id != n.id && !omit.contains(id))
+            .filter(|(id, _)| *id != n.proc.id && !omit.contains(id))
             .cloned()
             .collect();
         let text = config_text(generation, n, &peers);
-        n.install(&text);
-        n.await_reload();
+        n.proc.install(&text);
+        n.proc.await_reload();
     }
 }
 
@@ -586,8 +395,8 @@ fn group(index: u32) -> racer::config::GroupId {
 fn isolate(nodes: &mut [Node], i: usize, generation: &mut u32) {
     *generation += 1;
     let text = config_text(*generation, &nodes[i], &[]);
-    nodes[i].install(&text);
-    nodes[i].await_reload();
+    nodes[i].proc.install(&text);
+    nodes[i].proc.await_reload();
 }
 
 /// Undo [`isolate`].
@@ -607,16 +416,16 @@ fn rebuild(
     want: &mut [(u64, Vec<u8>)],
     mark: u8,
 ) {
-    let id = nodes[i].id;
+    let id = nodes[i].proc.id;
     let all: Vec<usize> = (0..nodes.len()).collect();
 
     // Remove the whole backing file, not just metadata: the restart places a blank store.
-    nodes[i].signal(libc::SIGKILL);
-    nodes[i].reap();
-    std::fs::remove_file(&nodes[i].img).expect("remove the store");
-    nodes[i].serve();
+    nodes[i].proc.signal(libc::SIGKILL);
+    nodes[i].proc.reap();
+    std::fs::remove_file(&nodes[i].proc.store).expect("remove the store");
+    nodes[i].proc.serve();
     assert_eq!(
-        nodes[i].store_len(),
+        nodes[i].proc.store_len(),
         nodes[i].store_bytes,
         "a start must place a missing store at the configured size"
     );
@@ -692,16 +501,16 @@ fn six_node_cluster() {
     let mut nodes: Vec<Node> = (1..=NODES).map(build_node).collect();
     for n in &mut nodes {
         let text = config_text(1, n, &[]);
-        n.install(&text);
-        n.serve();
+        n.proc.install(&text);
+        n.proc.serve();
     }
     // Nothing created the store beforehand, and `size=` is all that sets its size.
     for n in &nodes {
         assert_eq!(
-            n.store_len(),
+            n.proc.store_len(),
             IMG_BYTES,
             "node {} did not place its own store",
-            n.id
+            n.proc.id
         );
     }
 
@@ -925,7 +734,7 @@ fn six_node_cluster() {
         2,
         "the generation in force"
     );
-    assert_eq!(m.get("racer_node_id"), nodes[0].id as u64);
+    assert_eq!(m.get("racer_node_id"), nodes[0].proc.id as u64);
     assert_eq!(m.get("racer_universes"), 1);
     assert_eq!(m.get("racer_devices"), 5);
     assert_eq!(m.get("racer_extents"), 4);
@@ -950,7 +759,7 @@ fn six_node_cluster() {
 
     // A config the node must refuse: valid on its own, wrong only against the generation
     // already running. There is no caller to fail, so it surfaces as a metric or nowhere.
-    nodes[0].install(&config_text(1, &nodes[0], &[]));
+    nodes[0].proc.install(&config_text(1, &nodes[0], &[]));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while scrape(&nodes[0]).get("racer_config_rejected_total") != 1 {
         assert!(
@@ -965,7 +774,7 @@ fn six_node_cluster() {
         "refusing changed nothing"
     );
 
-    let (status, _) = http_get(&nodes[0].metrics, "/nope");
+    let (status, _) = http_get(&nodes[0].proc.metrics, "/nope");
     assert_eq!(status, "HTTP/1.1 404 Not Found", "only /metrics is served");
 
     // This node restarts below, so leave it a config it can boot from; the others rewire
@@ -974,8 +783,8 @@ fn six_node_cluster() {
 
     // ---- crash a node: the survivors serve on, and the node comes back -------------
     drop((a, b, oa, ob, ia, ib, ba, bb));
-    nodes[0].signal(libc::SIGKILL);
-    nodes[0].reap();
+    nodes[0].proc.signal(libc::SIGKILL);
+    nodes[0].proc.reap();
     // Group 0 is {1,2,3}, so two of the three members are still up.
     assert_eq!(
         nodes[1].dev(LWW).read(held * 4096, PAGE).unwrap(),
@@ -985,9 +794,13 @@ fn six_node_cluster() {
     // ---- the store grows on the way up, and never the other way --------------------
     // The control plane raises this node's share while it is down. A start reserves the
     // difference in place and leaves existing pages put; a lower `size=` is refused.
-    assert_eq!(nodes[0].store_len(), IMG_BYTES, "formatted at its share");
+    assert_eq!(
+        nodes[0].proc.store_len(),
+        IMG_BYTES,
+        "formatted at its share"
+    );
     {
-        let peers = peers_of(&nodes, nodes[0].id);
+        let peers = peers_of(&nodes, nodes[0].proc.id);
         nodes[0].store_bytes = IMG_BYTES - PAGE as u64;
         let said = nodes[0].serve_refuses(&config_text(3, &nodes[0], &peers));
         assert!(
@@ -996,17 +809,17 @@ fn six_node_cluster() {
             "a refused shrink must name both sizes: {said}"
         );
         assert_eq!(
-            nodes[0].store_len(),
+            nodes[0].proc.store_len(),
             IMG_BYTES,
             "a refused start must leave the store alone"
         );
 
         nodes[0].store_bytes = GROWN_BYTES;
-        nodes[0].install(&config_text(3, &nodes[0], &peers));
+        nodes[0].proc.install(&config_text(3, &nodes[0], &peers));
     }
-    nodes[0].serve();
+    nodes[0].proc.serve();
     assert_eq!(
-        nodes[0].store_len(),
+        nodes[0].proc.store_len(),
         GROWN_BYTES,
         "a raised size= must be reserved at the next start"
     );

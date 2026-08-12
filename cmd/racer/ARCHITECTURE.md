@@ -26,7 +26,9 @@ rather than truncated, so a store never shrinks. A blank store is then formatted
 automatically. An existing valid layout is left untouched, and invalid nonblank
 superblocks are rejected rather than overwritten.
 
-`racer-bench` contains a checksum/copy benchmark and an end-to-end load driver.
+`racer-bench e2e` is an end-to-end load driver: it brings up a real cluster on the
+same memfd-backed storage `tests/cluster.rs` uses, by way of the shared harness in
+`src/harness.rs`, and drives its ublk devices. It needs root and is not run by CI.
 The configuration schema is `api/racer/config.proto`, shared verbatim with the Go
 control plane; `build.rs` generates Prost types, requiring `protoc` at build time.
 
