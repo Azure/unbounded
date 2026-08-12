@@ -201,6 +201,12 @@ func kubeletVersionMatch(ctx context.Context, log *slog.Logger, destDir, expecte
 
 	output, err := executil.OutputCmd(ctx, log, kubeletPath, "--version")
 	if err != nil {
+		// Treated as "not the expected version", which triggers a
+		// re-download. Saying why matters: without this an infrastructure
+		// failure is indistinguishable from a genuine version mismatch.
+		log.Warn("could not read the installed kubelet version; assuming it needs reinstalling",
+			"path", kubeletPath, "error", err)
+
 		return false
 	}
 
@@ -224,6 +230,12 @@ func crictlVersionMatch(ctx context.Context, log *slog.Logger, destDir, expected
 
 	output, err := executil.OutputCmd(ctx, log, crictlPath, "--version")
 	if err != nil {
+		// Treated as "not the expected version", which triggers a
+		// re-download. Saying why matters: without this an infrastructure
+		// failure is indistinguishable from a genuine version mismatch.
+		log.Warn("could not read the installed crictl version; assuming it needs reinstalling",
+			"path", crictlPath, "error", err)
+
 		return false
 	}
 

@@ -135,6 +135,12 @@ func containerdVersionMatch(ctx context.Context, log *slog.Logger, destDir, expe
 
 	output, err := executil.OutputCmd(ctx, log, containerdPath, "--version")
 	if err != nil {
+		// Treated as "not the expected version", which triggers a
+		// re-download. Saying why matters: without this an infrastructure
+		// failure is indistinguishable from a genuine version mismatch.
+		log.Warn("could not read the installed containerd version; assuming it needs reinstalling",
+			"path", containerdPath, "error", err)
+
 		return false
 	}
 
@@ -150,6 +156,12 @@ func runcVersionMatch(ctx context.Context, log *slog.Logger, destDir, expectedVe
 
 	output, err := executil.OutputCmd(ctx, log, runcPath, "--version")
 	if err != nil {
+		// Treated as "not the expected version", which triggers a
+		// re-download. Saying why matters: without this an infrastructure
+		// failure is indistinguishable from a genuine version mismatch.
+		log.Warn("could not read the installed runc version; assuming it needs reinstalling",
+			"path", runcPath, "error", err)
+
 		return false
 	}
 
