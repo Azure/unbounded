@@ -36,6 +36,8 @@ syntax = "proto3";
 
 package racer.config;
 
+option go_package = "github.com/Azure/unbounded/api/racer;racerconfig";
+
 message NodeConfig {
   // Strictly increasing per node: a value equal to or below the running one is
   // rejected, so bump it on every push. It is also echoed in the node's PING, so a peer
@@ -219,6 +221,17 @@ message Universe {
   // A node is told about the extents it stores, the extents it exports, and the extents
   // it routes for. It need not be told about the rest of the universe.
   repeated Extent extents = 6;
+
+  // The ublk minor this node exports this universe's fabric namespace on, so the path
+  // is `/dev/ublkb<fabric_device_id>` and the control plane knows it before the node
+  // starts. Non-zero, unique on this node against every other universe's value and
+  // against every `Device.id`, and counted against the same 256 export budget.
+  //
+  // The control plane publishes this device as an NVMe-oF namespace to exactly this
+  // universe's members, and the paths it hands back are the `Peer.device` entries the
+  // members open. Frozen for the life of the universe on this node: changing it moves
+  // every peer's path and drops every open fd.
+  uint32 fabric_device_id = 7;
 }
 
 // One end of a fabric link, within one universe. No address, port or NQN here on
