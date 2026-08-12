@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use crate::alloc::{self, Allocator, GlobalAddr, Pressure, Status};
 use crate::cache::{self, Cache};
 use crate::config::{self, Config, Device};
-use crate::fabric::{self, Frame, Link, Part, status};
+use crate::fabric::{
+    self, Class, Cmd, Footer, GroupIx, Link, PageRef, Put, Source, To, Want, status,
+};
 use crate::heal::{self, Heal};
 use crate::layout;
 use crate::metrics;
@@ -504,91 +506,77 @@ async fn huge_read(d: &Dataplane, addr: GlobalAddr, off: usize, buf: Buf) -> Res
 
 // --- fabric target ---
 
-/// Serve one fabric frame.
+/// Serve one fabric command.
 ///
 /// The LBA is the request, so decoding it is all of parsing and happens before anything
-/// touches allocator state. `Frame::decode` is total: an unknown frame is a status, not a
-/// fault. A frame need not land on the core owning its consensus group (queue-to-core
-/// mapping is nvmet's business); the allocator's own hop shards by group hash, so no hop
-/// is added here.
+/// touches allocator state. [`Cmd::decode`] is total: an unknown or malformed frame is a
+/// status, not a fault, and what comes back out is typed, so no handler below reads a
+/// field the opcode does not define. A command need not land on the core owning its
+/// consensus group (queue-to-core mapping is nvmet's business); the allocator's own hop
+/// shards by group hash, so no hop is added here.
 async fn dispatch(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errno> {
-    let (f, part) = Frame::decode(req.lba, req.buf.len())?;
+    // The block layer never inverts direction, so the direction is part of the request:
+    // a command that disagrees with its opcode was built for another address than the
+    // peer meant.
+    let cmd = Cmd::decode(req.lba, req.buf.len(), req.op == Op::Read)?;
 
-    // The block layer never inverts direction, so a mismatch is a frame built for another
-    // address than the peer meant.
-    if f.op.is_read() != (req.op == Op::Read) {
-        return Err(status::BAD);
-    }
-
-    // Routing is decided before the opcode. A page op names its addressee in `imm`;
+    // Routing is decided before the opcode. A routable command names its addressee;
     // everything else is ours by construction, addressed by the sender's choice of link.
-    if let Some(addr) = routed(d, universe, f)?
-        && !d.paxos.serves(f.op, addr, f.imm)
-    {
-        return relay(d, f, addr, req).await;
-    }
-
-    match f.op {
-        fabric::Op::Get => get(d, universe, f, part, req).await,
-        fabric::Op::Trim => trim(d, universe, f, part, req).await,
-        fabric::Op::Ping => ping(d, universe, part, req).await,
-        fabric::Op::Accept => accept(d, universe, f, part, req).await,
-        fabric::Op::GetMeta => get_meta(d, universe, f, part, req).await,
-        fabric::Op::Prepare => prepare(d, universe, f, part, req).await,
-        fabric::Op::Learn => learn(d, universe, f, part, req).await,
-        fabric::Op::Seal => seal(d, universe, part, req).await,
-        fabric::Op::Merkle => merkle(d, universe, f, part, req).await,
-        fabric::Op::SnapOpen => snap_open(d, universe, f, part, req).await,
-        fabric::Op::SnapNext => snap_next(d, universe, f, part, req).await,
-        fabric::Op::Term => term(d, universe, f, part, req).await,
-        fabric::Op::Warm => warm(d, universe, f, part, req).await,
-    }
-}
-
-/// The page a frame is addressed to, if it is one this node might have to forward.
-///
-/// Group ops name a group and arrive by the sender's choice of link, so they are always
-/// ours. `CACHE_ONLY` and `WARM` are excluded: their addressee (a cohort replica, a zone
-/// gateway) is generally not in the page's group, so relaying by group would misroute.
-fn routed(d: &Dataplane, universe: u32, f: Frame) -> Result<Option<GlobalAddr>, Errno> {
-    use fabric::Op::*;
-    match f.op {
-        Get | Trim | Accept | GetMeta | Prepare | Learn | Seal
-            if f.flags & fabric::CACHE_ONLY == 0 =>
-        {
-            Ok(Some(addr_of(d, universe, f)?))
+    if let Some((page, via)) = cmd.routing() {
+        let addr = addr_of(d, universe, page)?;
+        if !d.paxos.serves(cmd.op(), addr, via.to) {
+            return relay(d, cmd, addr, req).await;
         }
-        _ => Ok(None),
+    }
+
+    match cmd {
+        Cmd::Get { page, from, want } => get(d, universe, page, from, want, req).await,
+        Cmd::GetMeta { page, from } => get_meta(d, universe, page, from, req).await,
+        Cmd::Prepare { page, .. } => prepare(d, universe, page, req).await,
+        Cmd::Accept { page, via, put } => accept(d, universe, page, via.to, put, req).await,
+        Cmd::Trim { page, via } => trim(d, universe, page, via.to, req).await,
+        Cmd::Learn { page, .. } => learn(d, universe, page, req).await,
+        Cmd::Seal { .. } => seal(d, universe, req).await,
+        Cmd::Warm { page } => warm(d, universe, page, req).await,
+        Cmd::Merkle { group, class } => merkle(d, universe, group, class, req).await,
+        Cmd::SnapOpen {
+            group,
+            class,
+            bucket,
+        } => snap_open(d, universe, group, class, bucket, req).await,
+        Cmd::SnapNext { cursor, seq } => snap_next(d, universe, cursor, seq, req).await,
+        Cmd::Term { group } => term(d, universe, group, req).await,
+        Cmd::Ping => ping(d, universe, req).await,
     }
 }
 
-/// Frame address to allocator address.
+/// Page reference to allocator address.
 ///
-/// The universe is the namespace the frame arrived on, never anything the sender wrote,
+/// The universe is the namespace the command arrived on, never anything the sender wrote,
 /// so a peer given one universe's namespace cannot name a page in another. The extent
 /// lookup is the bounds check: an address no extent covers is a bad frame, not a misrouted
 /// one (routing happens above), and so is one whose page class disagrees with the
 /// extent's, which would otherwise read a 4 MiB page as a 4 KiB one.
-fn addr_of(d: &Dataplane, universe: u32, f: Frame) -> Result<GlobalAddr, Errno> {
-    let addr = config::addr_of(universe, f.lba());
+fn addr_of(d: &Dataplane, universe: u32, page: PageRef) -> Result<GlobalAddr, Errno> {
+    let addr = config::addr_of(universe, page.lba());
     let e = d.alloc().config().extent_at(addr).ok_or(status::BAD)?;
-    if e.huge != f.huge {
+    if Class::of(e.huge) != page.class() {
         return Err(status::BAD);
     }
     Ok(GlobalAddr(addr))
 }
 
-/// The consensus group a group-addressed frame names, checked against its universe.
+/// The consensus group a group-addressed command names, checked against its universe.
 ///
 /// The wire carries only an index into the universe's catalog and the universe half comes
 /// from the namespace, so a group id cannot be forged across the boundary. An index past
 /// the catalog is a bad frame.
-fn group_of(d: &Dataplane, universe: u32, index: u32) -> Result<config::GroupId, Errno> {
+fn group_of(d: &Dataplane, universe: u32, group: GroupIx) -> Result<config::GroupId, Errno> {
     let u = d.alloc().config().universe(universe).ok_or(status::BAD)?;
-    if index as usize >= u.catalog.len() {
+    if group.get() as usize >= u.catalog.len() {
         return Err(status::BAD);
     }
-    Ok(config::GroupId::new(universe, index))
+    Ok(config::GroupId::new(universe, group.get()))
 }
 
 /// Allocator outcome to fabric status.
@@ -605,29 +593,45 @@ fn wire(s: Status) -> Errno {
     }
 }
 
+/// Store a reply trailer at `off` in the request buffer. The only way a footer reaches
+/// the wire: it is encoded into a zeroed block, so no slot the record does not define
+/// carries anything.
+async fn reply(req: &Request, off: usize, f: &impl Footer) -> Result<(), Errno> {
+    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
+    f.encode(&mut t)?;
+    req.store(off, &t)
+}
+
+/// Load and decode a request trailer. A malformed record is [`status::BAD`], and nothing
+/// downstream ever sees the bytes.
+async fn footer<F: Footer>(req: &Request) -> Result<F, Errno> {
+    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
+    req.load(0, &mut t)?;
+    F::decode(&t)
+}
+
 /// `GET`: the reply *is* the payload.
 async fn get(
     d: &Dataplane,
     universe: u32,
-    f: Frame,
-    part: Part,
+    page: PageRef,
+    from: Source,
+    want: Want,
     req: Request,
 ) -> Result<(), Errno> {
     let a = d.alloc();
-    let addr = addr_of(d, universe, f)?;
-    // `CACHE_ONLY` never reaches the allocator; declining costs the reader one `GET`.
-    if f.flags & fabric::CACHE_ONLY != 0 {
-        return cache_get(d, f, part, addr, req).await;
+    let addr = addr_of(d, universe, page)?;
+    // A cached read never reaches the allocator; declining costs the reader one `GET`.
+    let via = match from {
+        Source::Cache => return cache_get(d, page.class(), want, addr, req).await,
+        Source::Group(via) => via,
+    };
+    // `To::Owner` is a reader that resolved only our zone, so it wants the group's
+    // answer. 4 KiB only: the 4 MiB class takes no round and arrives MDTS-split.
+    if via.to == To::Owner && page.class() == Class::Small {
+        return get_confirmed(d, want, addr, req).await;
     }
-    // `imm == 0` is a reader that resolved only our zone, so it wants the group's answer.
-    // 4 KiB only: the 4 MiB class takes no round and arrives MDTS-split.
-    if f.imm == 0 && !f.huge {
-        return get_confirmed(d, part, addr, req).await;
-    }
-    if f.huge {
-        let Part::Payload { off } = part else {
-            return Err(status::BAD);
-        };
+    if let Want::Piece { off } = want {
         // A hole here is not zeroes: answer that this member lacks the page, and let
         // consensus heal from another.
         return match a.read_huge(addr, off, req.buf).await {
@@ -635,58 +639,54 @@ async fn get(
             r => r.map(|_| ()).map_err(wire),
         };
     }
-    if !matches!(part, Part::Payload { off: 0 } | Part::Both) {
-        return Err(status::BAD);
-    }
-    let mut page = PoolBuf::alloc(4096).await;
-    let reg = a.read_small(addr, &mut page).await.map_err(wire)?;
-    req.store(0, &page)?;
-    if part == Part::Both {
+    let mut p = PoolBuf::alloc(fabric::BLOCK).await;
+    let reg = a.read_small(addr, &mut p).await.map_err(wire)?;
+    req.store(0, &p)?;
+    if want == Want::Gather {
         // The register rides along, so no separate `GETMETA`; the width hint costs a byte.
-        d.paxos.gathered(addr, reg, &mut page).await.map_err(wire)?;
-        req.store(4096, &page)?;
+        let meta = d.paxos.gathered(addr, reg).await.map_err(wire)?;
+        return reply(&req, fabric::BLOCK, &meta).await;
     }
     Ok(())
 }
 
-/// `GET` with `imm == 0`: answer for the group rather than for ourselves.
+/// `GET` addressed to the owner: answer for the group rather than for ourselves.
 ///
 /// A reader in another zone resolves only the zone and cannot fan out a hedged read, so
 /// the round runs here: one round trip instead of three, metadata legs inside the zone.
 async fn get_confirmed(
     d: &Dataplane,
-    part: Part,
+    want: Want,
     addr: GlobalAddr,
     req: Request,
 ) -> Result<(), Errno> {
-    if !matches!(part, Part::Payload { off: 0 } | Part::Both) {
-        return Err(status::BAD);
-    }
-    let mut page = PoolBuf::alloc(4096).await;
+    let mut page = PoolBuf::alloc(fabric::BLOCK).await;
     let r = d
         .paxos
         .read_for(addr, Sink::Small(&mut page))
         .await
         .map_err(wire)?;
     req.store(0, &page)?;
-    if part == Part::Both {
-        // The round confirmed this register. No width: the hint belongs to the sketch's
-        // owner.
-        let mut t = [0u8; fabric::BLOCK];
-        paxos::put_register(&mut t, r, 0);
-        req.store(4096, &t)?;
+    if want == Want::Gather {
+        // The round confirmed this register. No width and no state: the hint belongs to
+        // the sketch's owner and the reader has the value itself.
+        let meta = fabric::MetaReply {
+            reg: r.into(),
+            ..Default::default()
+        };
+        return reply(&req, fabric::BLOCK, &meta).await;
     }
     Ok(())
 }
 
-/// `GET` under [`fabric::CACHE_ONLY`].
+/// `GET` from [`Source::Cache`].
 ///
 /// Whatever this node holds as a cohort replica. There must be no fallback: a miss is
 /// cheap and lands back at the reader, which then asks the group.
 async fn cache_get(
     d: &Dataplane,
-    f: Frame,
-    part: Part,
+    class: Class,
+    want: Want,
     addr: GlobalAddr,
     req: Request,
 ) -> Result<(), Errno> {
@@ -695,10 +695,7 @@ async fn cache_get(
     if d.cache.shedding() {
         return Err(status::MISSING);
     }
-    if f.huge {
-        let Part::Payload { off } = part else {
-            return Err(status::BAD);
-        };
+    if let Want::Piece { off } = want {
         // The reader confirms this against the group. We owe a single entry, so the
         // version filter matches the paired `GETMETA`: no two different fills of a page.
         return match d.cache.load_immutable(addr, true, off, req.buf).await {
@@ -706,11 +703,13 @@ async fn cache_get(
             None => Err(status::MISSING),
         };
     }
-    if part != Part::Both {
+    // A 4 KiB cached read must gather: the register the copy claims has nowhere else to
+    // ride, and the reader may not use the bytes without it.
+    if want != Want::Gather || class != Class::Small {
         return Err(status::BAD);
     }
     let mut page = PoolBuf::alloc(2 * fabric::BLOCK).await;
-    let buf = page.buf().slice(0, 4096);
+    let buf = page.buf().slice(0, fabric::BLOCK);
     let r = d
         .cache
         .load(addr, false, 0, buf)
@@ -718,7 +717,11 @@ async fn cache_get(
         .ok_or(status::MISSING)?;
     // The entry's claimed register travels with it; the reader confirms it against the
     // quorum and drops the entry on mismatch. No width: we are a replica, not the owner.
-    paxos::put_register(&mut page[fabric::BLOCK..], r, 0);
+    let meta = fabric::MetaReply {
+        reg: r.into(),
+        ..Default::default()
+    };
+    meta.encode(&mut page[fabric::BLOCK..])?;
     req.store(0, &page)
 }
 
@@ -726,226 +729,173 @@ async fn cache_get(
 async fn trim(
     d: &Dataplane,
     universe: u32,
-    f: Frame,
-    part: Part,
+    page: PageRef,
+    to: To,
     req: Request,
 ) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let addr = addr_of(d, universe, f)?;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    req.load(0, &mut t)?;
-    d.paxos.accept_trim(addr, f.imm, &t).await.map_err(wire)
+    let addr = addr_of(d, universe, page)?;
+    let t: fabric::TrimReq = footer(&req).await?;
+    d.paxos.accept_trim(addr, to, t).await.map_err(wire)
 }
 
-/// `ACCEPT`: apply a page under a ballot. A 4 KiB frame gathers guard and ballot into a
-/// trailer beside the page; a 4 MiB frame is all payload, so the acceptor derives both.
+/// `ACCEPT`: apply a page under a ballot. A 4 KiB command gathers guard and ballot into a
+/// trailer beside the page; a 4 MiB one is all payload, so the acceptor derives both.
 /// Legal only because 4 MiB pages are Immutable, whose guard comes from the config alone.
 async fn accept(
     d: &Dataplane,
     universe: u32,
-    f: Frame,
-    part: Part,
+    page: PageRef,
+    to: To,
+    put: Put,
     req: Request,
 ) -> Result<(), Errno> {
-    let addr = addr_of(d, universe, f)?;
-    if !paxos::accept_parts(f.huge, part) {
-        return Err(status::BAD);
-    }
-    if f.huge {
-        let Part::Payload { off } = part else {
-            return Err(status::BAD);
-        };
+    let addr = addr_of(d, universe, page)?;
+    if let Put::Piece { off } = put {
         // A transport splits a 4 MiB command at MDTS, so the page can arrive in pieces.
         if off == 0 && req.buf.len() as u64 == layout::HUGE_PAGE {
             return d
                 .paxos
-                .accept(addr, f.imm, None, Page::Huge(req.buf))
+                .accept(addr, to, None, Page::Huge(req.buf))
                 .await
                 .map_err(wire);
         }
         return d
             .paxos
-            .accept_part(addr, f.imm, off as u32, req.buf)
+            .accept_part(addr, to, off as u32, req.buf)
             .await
             .map_err(wire);
     }
     let mut both = PoolBuf::alloc(2 * fabric::BLOCK).await;
     req.load(0, &mut both)?;
     let (page, trailer) = both.split_at(fabric::BLOCK);
+    let t = fabric::AcceptReq::decode(trailer)?;
     // Staged into our own memory so the checksum covers stable bytes, as `serve` does.
     let mut p = PoolBuf::alloc(fabric::BLOCK).await;
     p.copy_from_slice(page);
-    let t = trailer.to_vec();
     d.paxos
-        .accept(addr, f.imm, Some(&t), Page::Small(&p))
+        .accept(addr, to, Some(t), Page::Small(&p))
         .await
         .map_err(wire)
 }
 
 /// `GETMETA`: the metadata half of a hedged read: a register, and no page bytes.
 ///
-/// Under [`fabric::CACHE_ONLY`] it answers for our cached copy instead: the 4 MiB class
-/// has no trailer to gather a register into, so it rides a second command beside the page.
+/// From [`Source::Cache`] it answers for our cached copy instead: the 4 MiB class has no
+/// trailer to gather a register into, so it rides a second command beside the page.
 async fn get_meta(
     d: &Dataplane,
     universe: u32,
-    f: Frame,
-    part: Part,
+    page: PageRef,
+    from: Source,
     req: Request,
 ) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let addr = addr_of(d, universe, f)?;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    if f.flags & fabric::CACHE_ONLY != 0 {
+    let addr = addr_of(d, universe, page)?;
+    if from == Source::Cache {
         if d.cache.shedding() {
             return Err(status::MISSING);
         }
         let r = d
             .cache
-            .peek_immutable(addr, f.huge)
+            .peek_immutable(addr, page.class() == Class::Huge)
             .await
             .ok_or(status::MISSING)?;
         // No width: we are a replica here, not the owner.
-        paxos::put_register(&mut t, r, 0);
-        return req.store(0, &t);
+        let meta = fabric::MetaReply {
+            reg: r.into(),
+            ..Default::default()
+        };
+        return reply(&req, 0, &meta).await;
     }
-    d.paxos.get_meta(addr, &mut t).await.map_err(wire)?;
-    req.store(0, &t)
+    let meta = d.paxos.get_meta(addr).await.map_err(wire)?;
+    reply(&req, 0, &meta).await
 }
 
 /// `PREPARE`: raise this group's promise and report what we hold. A read carries no body,
 /// so the term is not on the wire: raise ours by one, the preparer takes the maximum.
-async fn prepare(
-    d: &Dataplane,
-    universe: u32,
-    f: Frame,
-    part: Part,
-    req: Request,
-) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let addr = addr_of(d, universe, f)?;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    d.paxos.prepare(addr, &mut t).await.map_err(wire)?;
-    req.store(0, &t)
+async fn prepare(d: &Dataplane, universe: u32, page: PageRef, req: Request) -> Result<(), Errno> {
+    let addr = addr_of(d, universe, page)?;
+    let p = d.paxos.prepare(addr).await.map_err(wire)?;
+    reply(&req, 0, &p).await
 }
 
 /// `LEARN`: a value we may be behind on, and the member holding it. Apply-if-newer, so
 /// a repeat is free and the repair and migration streams commute.
-async fn learn(
-    d: &Dataplane,
-    universe: u32,
-    f: Frame,
-    part: Part,
-    req: Request,
-) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let addr = addr_of(d, universe, f)?;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    req.load(0, &mut t)?;
-    let (r, from, repair) = paxos::learn_trailer(&t);
-    d.paxos.learn(addr, r, from, repair).await.map_err(wire)
+async fn learn(d: &Dataplane, universe: u32, page: PageRef, req: Request) -> Result<(), Errno> {
+    let addr = addr_of(d, universe, page)?;
+    let l: fabric::LearnReq = footer(&req).await?;
+    d.paxos
+        .learn(addr, l.reg.into(), l.from.index(), l.repair)
+        .await
+        .map_err(wire)
 }
 
 /// `WARM`: another zone wrote a page this zone asked to keep warm.
 ///
 /// Advisory in both directions, so it always succeeds; the sender has already moved on.
-async fn warm(
-    d: &Dataplane,
-    universe: u32,
-    f: Frame,
-    part: Part,
-    req: Request,
-) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let addr = addr_of(d, universe, f)?;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    req.load(0, &mut t)?;
-    let (version, stage) = paxos::warm_trailer(&t);
-    d.paxos.warm(addr, version, stage).await;
+async fn warm(d: &Dataplane, universe: u32, page: PageRef, req: Request) -> Result<(), Errno> {
+    let addr = addr_of(d, universe, page)?;
+    let w: fabric::WarmReq = footer(&req).await?;
+    d.paxos.warm(addr, w.version, w.stage).await;
     Ok(())
 }
 
 /// `SEAL`: freeze a shard at its source group. An ordinary accept over a shard.
-async fn seal(d: &Dataplane, universe: u32, part: Part, req: Request) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    req.load(0, &mut t)?;
-    let (extent, term) = paxos::seal_trailer(&t);
+///
+/// The command's page is a routing anchor only; the shard it names is in the footer.
+async fn seal(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errno> {
+    let s: fabric::SealReq = footer(&req).await?;
     // An extent id is unique across universes, so it names the shard alone; this check
     // stops a peer sealing a shard outside its own partition.
     let ours = d
         .alloc()
         .config()
-        .extent_by_id(extent)
+        .extent_by_id(s.extent)
         .is_some_and(|(u, _)| u.id == universe);
     if !ours {
         return Err(status::BAD);
     }
-    d.paxos.seal(extent, term).await.map_err(wire)
+    d.paxos.seal(s.extent, s.term).await.map_err(wire)
 }
 
 /// `MERKLE`: our digest vector for one group and class.
 ///
 /// The three anti-entropy ops name a consensus group, not a page, so `addr_of` is off
-/// these paths and `dev`/`offset` mean what `heal.rs` says. A group we hold nothing for
-/// answers zeroes, the digest of an empty set, not an error.
+/// these paths. A group we hold nothing for answers zeroes, the digest of an empty set,
+/// not an error.
 async fn merkle(
     d: &Dataplane,
     universe: u32,
-    f: Frame,
-    part: Part,
+    group: GroupIx,
+    class: Class,
     req: Request,
 ) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let group = group_of(d, universe, f.offset as u32)?;
-    let v = d.alloc().digests(group, f.imm & 1 == 1).await;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    heal::put_digests(&mut t, &v);
-    req.store(0, &t)
+    let group = group_of(d, universe, group)?;
+    let v = d.alloc().digests(group, class == Class::Huge).await;
+    reply(&req, 0, &fabric::MerkleReply(v)).await
 }
 
 /// `SNAPOPEN`: begin enumerating a group's registers, optionally filtered to one digest
-/// bucket. Reply slot 0 is the cursor id, which is self-describing so `SNAPNEXT` needs
+/// bucket. The reply is the cursor id, which is self-describing so `SNAPNEXT` needs
 /// nothing else. `NOSPC` means this slab already holds as many cursors as it will.
 async fn snap_open(
     d: &Dataplane,
     universe: u32,
-    f: Frame,
-    part: Part,
+    group: GroupIx,
+    class: Class,
+    bucket: Option<fabric::Bucket>,
     req: Request,
 ) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let (index, huge, bucket) = heal::snap_open_parts(&f);
-    let group = group_of(d, universe, index)?;
+    let group = group_of(d, universe, group)?;
+    let filter = bucket.map_or(heal::Filter::All, |b| heal::Filter::Bucket(b.get()));
     let id = d
         .alloc()
-        .snap_open(
-            group,
-            huge,
-            bucket.map_or(heal::Filter::All, heal::Filter::Bucket),
-        )
+        .snap_open(group, class == Class::Huge, filter)
         .await
         .map_err(wire)?;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    t.fill(0);
-    fabric::put(&mut t, 0, id as u64);
-    req.store(0, &t)
+    let r = fabric::SnapOpenReply {
+        cursor: fabric::Cursor::new(id),
+    };
+    reply(&req, 0, &r).await
 }
 
 /// `SNAPNEXT`: the next chunk of `(address, version, ballot)`, and no page bytes.
@@ -956,83 +906,72 @@ async fn snap_open(
 async fn snap_next(
     d: &Dataplane,
     universe: u32,
-    f: Frame,
-    part: Part,
+    cursor: fabric::Cursor,
+    seq: fabric::Seq,
     req: Request,
 ) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let (id, seq) = heal::snap_next_parts(&f);
+    let id = cursor.get();
     // Cursor ids are small integers, so check the opening universe against the caller's.
     let (tuples, done) = d
         .alloc()
-        .snap_next(id, Some(seq), Some(universe))
+        .snap_next(id, Some(seq.get()), Some(universe))
         .await
         .map_err(wire)?;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    t.fill(0);
-    heal::put_tuples(&mut t, &tuples, done);
+    let tuples = tuples
+        .iter()
+        .map(|&(addr, r)| fabric::SnapTuple {
+            addr,
+            reg: r.into(),
+        })
+        .collect();
+    // The allocator is asked for at most a chunk's worth, so a longer run is a bug here
+    // rather than something to truncate onto the wire.
+    let r = fabric::SnapNextReply::new(done, tuples).ok_or(status::BAD)?;
     if done {
         d.alloc().snap_release(id).await;
     }
-    req.store(0, &t)
+    reply(&req, 0, &r).await
 }
 
-/// `TERM`: the promise we hold for one group, for a member rebuilding its own. Trailer
-/// slot 2. A group we hold nothing for answers zero, which cannot lower the max taken.
-async fn term(
-    d: &Dataplane,
-    universe: u32,
-    f: Frame,
-    part: Part,
-    req: Request,
-) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let group = group_of(d, universe, f.offset as u32)?;
-    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-    d.paxos.term(group, &mut t).await.map_err(wire)?;
-    req.store(0, &t)
+/// `TERM`: the promise we hold for one group, for a member rebuilding its own. A group we
+/// hold nothing for answers zero, which cannot lower the max taken.
+async fn term(d: &Dataplane, universe: u32, group: GroupIx, req: Request) -> Result<(), Errno> {
+    let group = group_of(d, universe, group)?;
+    let t = d.paxos.term(group).await.map_err(wire)?;
+    reply(&req, 0, &t).await
 }
 
-/// `PING`: liveness plus the geometry that dates an answer. Trailer slots: 0 node id,
-/// 1 config generation, 2 topology epoch. The epoch is the arriving universe's; a caller
-/// has no business learning another's.
-async fn ping(d: &Dataplane, universe: u32, part: Part, req: Request) -> Result<(), Errno> {
-    if part != Part::Trailer {
-        return Err(status::BAD);
-    }
-    let mut t = PoolBuf::alloc(4096).await;
-    t.fill(0);
+/// `PING`: liveness plus the geometry that dates an answer. The epoch is the arriving
+/// universe's; a caller has no business learning another's.
+async fn ping(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errno> {
     let c = d.alloc().config();
-    fabric::put(&mut t, 0, c.node.id as u64);
-    fabric::put(&mut t, 1, c.generation);
-    let epoch = c.universe(universe).map_or(0, |u| u.epoch);
-    fabric::put(&mut t, 2, epoch as u64);
-    req.store(0, &t)
+    let p = fabric::PingReply {
+        node: c.node.id,
+        generation: c.generation,
+        epoch: c.universe(universe).map_or(0, |u| u.epoch),
+    };
+    reply(&req, 0, &p).await
 }
 
-/// A frame that is not ours: reissue it on our own link and complete when it does.
+/// A command that is not ours: reissue it on our own link and complete when it does.
 ///
-/// We hold only the in-flight future: no session, no buffering, no copy. The frame keeps
-/// its shape, so one registered buffer serves both hops; if we die the outer command fails
-/// and the originator reads a timeout. The budget terminates the recursion: each hop
-/// spends one and a foreign frame with none left is refused, which also bounds a migration
-/// forward chain. The link picked is one of the arriving universe's, so a relay stays in
-/// that universe.
-async fn relay(d: &Dataplane, f: Frame, addr: GlobalAddr, req: Request) -> Result<(), Errno> {
-    // No budget or no link to the member: the originator has our placement wrong, so send
-    // it back to its config rather than report the page missing.
-    if fabric::hops(f.flags) == 0 {
-        return Err(status::STALE);
-    }
+/// We hold only the in-flight future: no session, no buffering, no copy. The command
+/// keeps its shape, so one registered buffer serves both hops; if we die the outer command
+/// fails and the originator reads a timeout. The budget terminates the recursion: each hop
+/// spends one and a foreign command with none left is refused, which also bounds a
+/// migration forward chain. Only an already-decoded command may be relayed, so a
+/// forwarder passes on nothing it could not itself have parsed. The link picked is one of
+/// the arriving universe's, so a relay stays in that universe.
+async fn relay(d: &Dataplane, cmd: Cmd, addr: GlobalAddr, req: Request) -> Result<(), Errno> {
+    // No link to the member: the originator has our placement wrong, so send it back to
+    // its config rather than report the page missing. `Link::relay` does the same for an
+    // exhausted budget.
+    let (_, via) = cmd.routing().ok_or(status::BAD)?;
     let link = d
         .paxos
-        .forward_link(f.op, addr, f.imm)
+        .forward_link(cmd.op(), addr, via.to)
         .ok_or(status::STALE)?;
-    link.send(f.forwarded(), req.buf).await
+    link.relay(cmd, req.buf).await
 }
 
 // --- Tests ---
@@ -1054,7 +993,7 @@ mod tests {
     use super::{self as server, SERVER};
     use crate::alloc::GlobalAddr;
     use crate::config::Config;
-    use crate::fabric;
+    use crate::fabric::{self, Footer};
     use crate::heal;
     use crate::layout::{self, Class, State};
     use crate::runtime;
@@ -1228,18 +1167,45 @@ mod tests {
             .collect()
     }
 
-    /// A frame issued against our own fabric device, as a peer's link would: the peer's
+    /// A command issued against our own fabric device, as a peer's link would: the peer's
     /// namespace is this block device, so this exercises all but the transport itself.
-    fn frame_read(f: &layout::Dev, fr: fabric::Frame, len: usize) -> std::io::Result<Vec<u8>> {
+    /// The command and the length together name the LBA, exactly as [`fabric::Link`]
+    /// does, so a test cannot phrase a shape the wire has no room for.
+    fn frame_read(f: &layout::Dev, cmd: fabric::Cmd, len: usize) -> std::io::Result<Vec<u8>> {
         let mut buf = layout::Aligned::new(len);
-        layout::read_at(f, buf.as_mut(), fr.encode() * 4096)?;
+        let lba = cmd.encode(len).expect("a shape this op allows");
+        layout::read_at(f, buf.as_mut(), lba * 4096)?;
         Ok(buf.as_ref().to_vec())
     }
 
-    fn frame_write(f: &layout::Dev, fr: fabric::Frame, data: &[u8]) -> std::io::Result<()> {
+    fn frame_write(f: &layout::Dev, cmd: fabric::Cmd, data: &[u8]) -> std::io::Result<()> {
         let mut buf = layout::Aligned::new(data.len());
         buf.as_mut().copy_from_slice(data);
-        layout::write_at(f, buf.as_ref(), fr.encode() * 4096)
+        let lba = cmd.encode(data.len()).expect("a shape this op allows");
+        layout::write_at(f, buf.as_ref(), lba * 4096)
+    }
+
+    /// The page a small or huge command names. Panics on an address the fabric cannot
+    /// phrase, which in a test is a bug in the test.
+    fn page_of(class: Class, lba: u64) -> fabric::PageRef {
+        fabric::PageRef::new(class, lba).expect("an addressable page")
+    }
+
+    /// The ordinary "you own this" route: no addressee and no forwarding budget.
+    fn owner() -> fabric::Via {
+        fabric::Via::direct(fabric::To::Owner)
+    }
+
+    /// A group index the catalog may or may not contain; bounds are the target's business.
+    fn group_ix(i: u32) -> fabric::GroupIx {
+        fabric::GroupIx::new(i).expect("a representable group")
+    }
+
+    /// Fold one `SNAPNEXT` reply into `out`, answering whether the cursor is finished.
+    fn tuples(t: &[u8], out: &mut std::collections::BTreeMap<u64, fabric::Reg>) -> bool {
+        let chunk = fabric::SnapNextReply::decode(t).expect("a well-formed chunk");
+        out.extend(chunk.tuples().iter().map(|t| (t.addr, t.reg)));
+        chunk.done
     }
 
     fn errno(e: std::io::Error) -> i32 {
@@ -1414,7 +1380,13 @@ mod tests {
         write_at(&mut mixed, TAIL, &huge);
         let part: [u64; 2] = [TAIL, 4096];
         assert_ne!(
-            unsafe { libc::ioctl(mixed.as_raw_fd(), 0x1277 /* BLKDISCARD */, part.as_ptr()) },
+            unsafe {
+                libc::ioctl(
+                    mixed.as_raw_fd(),
+                    0x1277, /* BLKDISCARD */
+                    part.as_ptr(),
+                )
+            },
             0,
             "a 4 KiB discard may not free a 4 MiB page"
         );
@@ -1454,23 +1426,34 @@ mod tests {
         write_at(&mut lww, 7 * 4096, &small);
 
         // ---- GET, bare: the reply is the payload -------------------------------
-        let get7 = fabric::Frame::page(fabric::Op::Get, false, LWW + 7);
+        let page7 = page_of(Class::Small, LWW + 7);
+        let get7 = fabric::Cmd::Get {
+            page: page7,
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Page,
+        };
         assert_eq!(frame_read(&fab, get7, 4096).unwrap(), small);
 
         // ---- GET, gather: page then trailer, one command ------------------------
         // The trailer is the register the page was chosen at: value and proof in one cmd.
-        let both = frame_read(&fab, get7, 8192).unwrap();
+        let gather7 = fabric::Cmd::Get {
+            page: page7,
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Gather,
+        };
+        let both = frame_read(&fab, gather7, 8192).unwrap();
         assert_eq!(&both[..4096], &small[..]);
-        let v7 = fabric::get(&both[4096..], 0);
+        let meta = fabric::MetaReply::decode(&both[4096..]).expect("a well-formed register");
+        let v7 = meta.reg.version;
         assert_ne!(v7, 0, "a page that exists was written at some version");
-        assert_ne!(
-            fabric::get(&both[4096..], 1),
-            0,
-            "and at the ballot that chose it"
-        );
+        assert_ne!(meta.reg.ballot, 0, "and at the ballot that chose it");
 
         // ---- A page this member does not have is not zeroes, it is MISSING ------
-        let gone = fabric::Frame::page(fabric::Op::Get, false, LWW + 999);
+        let gone = fabric::Cmd::Get {
+            page: page_of(Class::Small, LWW + 999),
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Page,
+        };
         let e = frame_read(&fab, gone, 4096).unwrap_err();
         assert_eq!(
             errno(e),
@@ -1486,28 +1469,46 @@ mod tests {
         // ---- Addressing: unmapped block, and the wrong page class ---------------
         // The address space is sparse: a gap between extents is as unmapped as an offset
         // past every extent, and neither is a hole.
-        let gap = fabric::Frame::page(fabric::Op::Get, false, GAP);
+        let gap = fabric::Cmd::Get {
+            page: page_of(Class::Small, GAP),
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Page,
+        };
         assert_eq!(
             errno(frame_read(&fab, gap, 4096).unwrap_err()),
             libc::EOPNOTSUPP
         );
-        let beyond = fabric::Frame::page(fabric::Op::Get, false, 1 << 30);
+        let beyond = fabric::Cmd::Get {
+            page: page_of(Class::Small, 1 << 30),
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Page,
+        };
         assert_eq!(
             errno(frame_read(&fab, beyond, 4096).unwrap_err()),
             libc::EOPNOTSUPP
         );
-        let miscl = fabric::Frame::page(fabric::Op::Get, true, LWW);
+        let miscl = fabric::Cmd::Get {
+            page: page_of(Class::Huge, LWW),
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Piece { off: 0 },
+        };
         assert_eq!(
             errno(frame_read(&fab, miscl, 4096).unwrap_err()),
             libc::EOPNOTSUPP
         );
 
         // ---- GET, 4 MiB: whole, and in the pieces an MDTS split would produce ----
-        let geth = fabric::Frame::page(fabric::Op::Get, true, IMM);
+        let pageh = page_of(Class::Huge, IMM);
+        let piece = |off: usize| fabric::Cmd::Get {
+            page: pageh,
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Piece { off },
+        };
+        let geth = piece(0);
         assert_eq!(frame_read(&fab, geth, 4 << 20).unwrap(), huge);
         for (block, len) in [(0usize, 256 << 10), (64, 256 << 10), (1023, 4096)] {
             let mut b = layout::Aligned::new(len);
-            let off = (geth.encode() + block as u64) * 4096;
+            let off = piece(block * 4096).encode(len).unwrap() * 4096;
             layout::read_at(&fab, b.as_mut(), off).unwrap();
             assert_eq!(
                 b.as_ref(),
@@ -1517,32 +1518,39 @@ mod tests {
         }
 
         // ---- PING: liveness and the geometry that dates an answer ---------------
-        let ping = fabric::Frame::raw(fabric::Op::Ping, false, 0);
+        let ping = fabric::Cmd::Ping;
         let t = frame_read(&fab, ping, 4096).unwrap();
-        assert_eq!(fabric::get(&t, 0), 1, "node id");
-        assert_eq!(fabric::get(&t, 1), 1, "config generation");
-        assert_eq!(fabric::get(&t, 2), 0, "topology epoch");
-        // Control ops are exactly one block.
-        assert!(frame_read(&fab, ping, 8192).is_err());
+        let pong = fabric::PingReply::decode(&t).expect("a well-formed ping reply");
+        assert_eq!(pong.node, 1, "node id");
+        assert_eq!(pong.generation, 1, "config generation");
+        assert_eq!(pong.epoch, 0, "topology epoch");
+        // Control ops are exactly one block, which the encoder will not even phrase.
+        assert!(ping.encode(8192).is_err());
 
         // A small ACCEPT must gather page and trailer into one command; a page alone is bad.
-        let acc7 = fabric::Frame::page(fabric::Op::Accept, false, LWW + 7);
-        assert_eq!(
-            errno(frame_write(&fab, acc7, &small).unwrap_err()),
-            libc::EOPNOTSUPP
+        let acc7 = fabric::Cmd::Accept {
+            page: page7,
+            via: owner(),
+            put: fabric::Put::Gather,
+        };
+        assert!(
+            acc7.encode(4096).is_err(),
+            "a bare page is not an accept the wire can carry"
         );
 
         // ---- GETMETA: the register, and not one byte of the page -----------------
-        let meta7 = fabric::Frame::page(fabric::Op::GetMeta, false, LWW + 7);
+        let meta7 = fabric::Cmd::GetMeta {
+            page: page7,
+            from: fabric::Source::Group(owner()),
+        };
         let t = frame_read(&fab, meta7, 4096).unwrap();
+        let m = fabric::MetaReply::decode(&t).expect("a well-formed register");
         assert_eq!(
-            fabric::get(&t, 0),
-            v7,
+            m.reg.version, v7,
             "the metadata read and the gathered trailer agree"
         );
         assert_ne!(
-            fabric::get(&t, 1),
-            0,
+            m.reg.ballot, 0,
             "a chosen value carries the ballot that chose it"
         );
 
@@ -1552,7 +1560,13 @@ mod tests {
         let next = pattern(0x11, 4096);
         let mut cmd = vec![0u8; 8192];
         cmd[..4096].copy_from_slice(&next);
-        fabric::put(&mut cmd[4096..], 0, v7);
+        fabric::AcceptReq {
+            guard: fabric::Guard::At(v7),
+            ballot: 0,
+            epoch: 0,
+        }
+        .encode(&mut cmd[4096..])
+        .unwrap();
         frame_write(&fab, acc7, &cmd).expect("an accept at the version we hold");
         // Read back over the fabric: the block device fd is buffered.
         assert_eq!(frame_read(&fab, get7, 4096).unwrap(), next);
@@ -1563,26 +1577,43 @@ mod tests {
             "a guard that no longer matches is refused, not applied"
         );
         let t = frame_read(&fab, meta7, 4096).unwrap();
-        assert_eq!(fabric::get(&t, 0), v7 + 1, "the loser left no trace");
+        assert_eq!(
+            fabric::MetaReply::decode(&t).unwrap().reg.version,
+            v7 + 1,
+            "the loser left no trace"
+        );
 
         // ---- PREPARE: raises this group's promise and reports the register -------
-        let prep7 = fabric::Frame::page(fabric::Op::Prepare, false, LWW + 7);
+        let prep7 = fabric::Cmd::Prepare {
+            page: page7,
+            via: owner(),
+        };
         let t = frame_read(&fab, prep7, 4096).unwrap();
-        assert_eq!(
-            fabric::get(&t, 0),
-            v7 + 1,
-            "prepare reports, it does not write"
-        );
-        let term1 = fabric::get(&t, 2);
+        let p = fabric::PrepareReply::decode(&t).expect("a well-formed prepare reply");
+        assert_eq!(p.reg.version, v7 + 1, "prepare reports, it does not write");
+        let term1 = p.term;
         assert!(term1 >= 1, "a prepare that raised nothing granted nothing");
         let t = frame_read(&fab, prep7, 4096).unwrap();
-        let term2 = fabric::get(&t, 2);
+        let term2 = fabric::PrepareReply::decode(&t).unwrap().term;
         assert!(term2 > term1, "every prepare raises the promise");
 
         // ---- LEARN: apply-if-newer, so one we are ahead of costs nothing ---------
-        let learn7 = fabric::Frame::page(fabric::Op::Learn, false, LWW + 7);
+        let learn7 = fabric::Cmd::Learn {
+            page: page7,
+            via: owner(),
+        };
         let mut lt = vec![0u8; 4096];
-        fabric::put(&mut lt, 0, 1); // version 1: older than what we hold
+        // Version 1: older than what we hold.
+        fabric::LearnReq {
+            reg: fabric::Reg {
+                version: 1,
+                ballot: 0,
+            },
+            from: fabric::Member::new(0).unwrap(),
+            repair: false,
+        }
+        .encode(&mut lt)
+        .unwrap();
         frame_write(&fab, learn7, &lt).expect("a learn we are ahead of is a no-op");
         assert_eq!(frame_read(&fab, get7, 4096).unwrap(), next);
 
@@ -1593,23 +1624,32 @@ mod tests {
         let bucket = heal::bucket_of(addr7.0);
         let groups = cfg.universe(1).unwrap().catalog.len() as u32;
 
-        let tree = heal::get_digests(
-            &frame_read(&fab, heal::merkle_frame(group.index(), false), 4096).unwrap(),
-        );
+        let merkle = |class| fabric::Cmd::Merkle {
+            group: group_ix(group.index()),
+            class,
+        };
+        let tree =
+            fabric::MerkleReply::decode(&frame_read(&fab, merkle(Class::Small), 4096).unwrap())
+                .expect("a well-formed digest vector")
+                .0;
         assert_ne!(
             tree[bucket as usize], 0,
             "the digest is under the address's own bucket"
         );
         // The classes are separate trees, so the small page is not in the huge one.
-        let huge_tree = heal::get_digests(
-            &frame_read(&fab, heal::merkle_frame(group.index(), true), 4096).unwrap(),
-        );
+        let huge_tree =
+            fabric::MerkleReply::decode(&frame_read(&fab, merkle(Class::Huge), 4096).unwrap())
+                .expect("a well-formed digest vector")
+                .0;
         assert_eq!(
             huge_tree[bucket as usize], 0,
             "a class is not the other class"
         );
         // A group outside the catalog is a foreign topology, not an empty group.
-        let no_group = heal::merkle_frame(groups, false);
+        let no_group = fabric::Cmd::Merkle {
+            group: group_ix(groups),
+            class: Class::Small,
+        };
         assert_eq!(
             errno(frame_read(&fab, no_group, 4096).unwrap_err()),
             libc::EOPNOTSUPP
@@ -1617,13 +1657,20 @@ mod tests {
 
         // The filtered cursor names the page and the register GETMETA reported, and says
         // it is done in the same reply.
-        let open = heal::snap_open_frame(group.index(), false, Some(bucket));
-        let id = fabric::get(&frame_read(&fab, open, 4096).unwrap(), 0) as u32;
+        let open = fabric::Cmd::SnapOpen {
+            group: group_ix(group.index()),
+            class: Class::Small,
+            bucket: Some(fabric::Bucket::new(bucket).unwrap()),
+        };
+        let cursor = fabric::SnapOpenReply::decode(&frame_read(&fab, open, 4096).unwrap())
+            .expect("a well-formed cursor")
+            .cursor;
+        let chunk_at = |seq: u8| fabric::Cmd::SnapNext {
+            cursor,
+            seq: fabric::Seq::wrap(seq),
+        };
         let mut seen = std::collections::BTreeMap::new();
-        let done = heal::get_tuples(
-            &frame_read(&fab, heal::snap_next_frame(id, 0), 4096).unwrap(),
-            &mut seen,
-        );
+        let done = tuples(&frame_read(&fab, chunk_at(0), 4096).unwrap(), &mut seen);
         assert!(done, "one bucket of one group fits in one chunk");
         assert!(
             seen.keys().all(|a| heal::bucket_of(*a) == bucket),
@@ -1635,18 +1682,28 @@ mod tests {
             "the cursor and the register agree"
         );
         assert_eq!(
-            errno(frame_read(&fab, heal::snap_next_frame(id, 0), 4096).unwrap_err()),
+            errno(frame_read(&fab, chunk_at(0), 4096).unwrap_err()),
             libc::EOPNOTSUPP,
             "a cursor that finished is gone, not stale"
         );
         // The filter narrows the walk without changing what the walk is over.
-        let all = heal::snap_open_frame(group.index(), false, None);
-        let id = fabric::get(&frame_read(&fab, all, 4096).unwrap(), 0) as u32;
+        let all = fabric::Cmd::SnapOpen {
+            group: group_ix(group.index()),
+            class: Class::Small,
+            bucket: None,
+        };
+        let cursor = fabric::SnapOpenReply::decode(&frame_read(&fab, all, 4096).unwrap())
+            .expect("a well-formed cursor")
+            .cursor;
         let mut every = std::collections::BTreeMap::new();
         let mut seq = 0u8;
         while seq < 64 {
-            let t = frame_read(&fab, heal::snap_next_frame(id, seq), 4096).unwrap();
-            if heal::get_tuples(&t, &mut every) {
+            let chunk = fabric::Cmd::SnapNext {
+                cursor,
+                seq: fabric::Seq::wrap(seq),
+            };
+            let t = frame_read(&fab, chunk, 4096).unwrap();
+            if tuples(&t, &mut every) {
                 break;
             }
             seq += 1;
@@ -1664,48 +1721,69 @@ mod tests {
         // `imm` names the addressee: `k + 1` is member index `k`, `0` means "you resolve
         // it". This node is index 0 of every group here, so anything else is forwarded,
         // and the config has no peers, so every forward is EREMOTEIO.
-        let mut fwd = fabric::Frame::page(fabric::Op::Get, false, LWW + 7);
-        fwd.imm = 2;
-        fwd.flags = 1;
+        let elsewhere = fabric::Via::new(
+            fabric::To::Member(fabric::Member::new(1).unwrap()),
+            fabric::Hops::ONE,
+        );
+        let fwd = fabric::Cmd::Get {
+            page: page7,
+            from: fabric::Source::Group(elsewhere),
+            want: fabric::Want::Page,
+        };
         assert_eq!(
             errno(frame_read(&fab, fwd, 4096).unwrap_err()),
             libc::EREMOTEIO,
             "no link to the named member is, to the originator, a placement it has wrong"
         );
         // A control read forwards the same way, and so does a write.
-        let mut meta_fwd = fabric::Frame::page(fabric::Op::GetMeta, false, LWW + 7);
-        meta_fwd.imm = 2;
-        meta_fwd.flags = 1;
+        let meta_fwd = fabric::Cmd::GetMeta {
+            page: page7,
+            from: fabric::Source::Group(elsewhere),
+        };
         assert_eq!(
             errno(frame_read(&fab, meta_fwd, 4096).unwrap_err()),
             libc::EREMOTEIO
         );
-        let mut trim_fwd = fabric::Frame::page(fabric::Op::Trim, false, LWW + 7);
-        trim_fwd.imm = 2;
-        trim_fwd.flags = 1;
+        let trim_fwd = fabric::Cmd::Trim {
+            page: page7,
+            via: elsewhere,
+        };
         assert_eq!(
             errno(frame_write(&fab, trim_fwd, &[0u8; 4096]).unwrap_err()),
             libc::EREMOTEIO
         );
         // A frame for someone else with no budget left is refused, not passed on.
-        let mut spent = fabric::Frame::page(fabric::Op::Get, false, LWW + 7);
-        spent.imm = 2;
-        assert_eq!(fabric::hops(spent.flags), 0);
+        let spent = fabric::Cmd::Get {
+            page: page7,
+            from: fabric::Source::Group(fabric::Via::direct(fabric::To::Member(
+                fabric::Member::new(1).unwrap(),
+            ))),
+            want: fabric::Want::Page,
+        };
+        assert!(spent.forwarded().is_none(), "no budget is no budget");
         assert_eq!(
             errno(frame_read(&fab, spent, 4096).unwrap_err()),
             libc::EREMOTEIO
         );
         // Addressed to us, either by name or by `imm == 0`, and served normally.
-        let mut mine = fabric::Frame::page(fabric::Op::Get, false, LWW + 7);
-        mine.imm = 1;
+        let mine = fabric::Cmd::Get {
+            page: page7,
+            from: fabric::Source::Group(fabric::Via::direct(fabric::To::Member(
+                fabric::Member::new(0).unwrap(),
+            ))),
+            want: fabric::Want::Page,
+        };
         assert_eq!(frame_read(&fab, mine, 4096).unwrap(), next);
-        let resolve = fabric::Frame::page(fabric::Op::Get, false, LWW + 7);
-        assert_eq!(frame_read(&fab, resolve, 4096).unwrap(), next);
+        assert_eq!(frame_read(&fab, get7, 4096).unwrap(), next);
 
         // ---- Cross-zone: homed elsewhere, so routed and never resolved here ------
         // Extent 4 lives in zone 2. Our slot table describes our own zone only, so
         // resolving it here would name the wrong group, and we hold no link to zone 2.
-        let away = fabric::Frame::page(fabric::Op::Get, false, AWAY);
+        let away = fabric::Cmd::Get {
+            page: page_of(Class::Small, AWAY),
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Page,
+        };
         assert_eq!(
             errno(frame_read(&fab, away, 4096).unwrap_err()),
             libc::EREMOTEIO,
@@ -1720,7 +1798,10 @@ mod tests {
         }
 
         // ---- TRIM: last, because it destroys the page it names -------------------
-        let trim = fabric::Frame::page(fabric::Op::Trim, true, IMM);
+        let trim = fabric::Cmd::Trim {
+            page: pageh,
+            via: owner(),
+        };
         frame_write(&fab, trim, &[0u8; 4096]).expect("trim");
         assert_eq!(
             errno(frame_read(&fab, geth, 4 << 20).unwrap_err()),
@@ -1734,10 +1815,17 @@ mod tests {
         // window is empty rather than merely safe; reads keep working since a frozen copy
         // is final. The trailer names the extent by control-plane id, the only shard id
         // on the wire.
-        let seal = fabric::Frame::page(fabric::Op::Seal, false, LWW + 7);
+        let seal = fabric::Cmd::Seal {
+            anchor: page7,
+            via: owner(),
+        };
         let mut st = vec![0u8; 4096];
-        fabric::put(&mut st, 1, term2 + 1);
-        fabric::put(&mut st, 2, 1);
+        fabric::SealReq {
+            term: term2 + 1,
+            extent: 1,
+        }
+        .encode(&mut st)
+        .unwrap();
         frame_write(&fab, seal, &st).expect("seal");
         assert_eq!(
             errno(frame_write(&fab, acc7, &cmd).unwrap_err()),
@@ -1756,11 +1844,23 @@ mod tests {
         // `EREMOTEIO` is "refused". The seal is redundant (the sweep seals an extent with
         // `next_zone` set of its own accord) and is here only so the assertion does not
         // race the tick.
-        let acc_away = fabric::Frame::page(fabric::Op::Accept, false, GOING + 3);
-        let seal_away = fabric::Frame::page(fabric::Op::Seal, false, GOING + 3);
+        let going = page_of(Class::Small, GOING + 3);
+        let acc_away = fabric::Cmd::Accept {
+            page: going,
+            via: owner(),
+            put: fabric::Put::Gather,
+        };
+        let seal_away = fabric::Cmd::Seal {
+            anchor: going,
+            via: owner(),
+        };
         let mut sta = vec![0u8; 4096];
-        fabric::put(&mut sta, 1, term2 + 1);
-        fabric::put(&mut sta, 2, 5);
+        fabric::SealReq {
+            term: term2 + 1,
+            extent: 5,
+        }
+        .encode(&mut sta)
+        .unwrap();
         frame_write(&fab, seal_away, &sta).expect("seal");
         assert_eq!(
             errno(frame_write(&fab, acc_away, &vec![0u8; 8192]).unwrap_err()),

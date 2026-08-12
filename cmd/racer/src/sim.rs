@@ -1695,8 +1695,8 @@ impl Sim {
             self.s.hit(Hit::Crossing);
             self.nodes[i].crossings += 1;
         }
-        if let Ok((f, _)) = crate::fabric::Frame::decode(lba, len as usize)
-            && f.op == crate::fabric::Op::Warm
+        if let Ok(cmd) = crate::fabric::Cmd::decode(lba, len as usize, read)
+            && matches!(cmd, crate::fabric::Cmd::Warm { .. })
         {
             self.s.hit(Hit::Warm);
             self.nodes[i].warms += 1;

@@ -291,11 +291,17 @@ checksum to detect a half-written one.
 
 Read-like commands return payload and/or trailer; imperative commands are
 durable block writes. Operations cover get and metadata, prepare, accept, trim,
-learn, seal, Merkle digest, snapshot open/next, term, and ping. Decoding and
-dispatch validate range, alignment, transfer shape, direction, page class, and
-address. NVMe status preserves only stale (`EREMOTEIO`), absent (`ENODATA`),
-unsupported (`EOPNOTSUPP`), and space (`ENOSPC`); other failures collapse to
-transport `EIO`.
+learn, seal, Merkle digest, snapshot open/next, term, and ping. `fabric.rs` owns
+the whole wire schema: an LBA header decodes into one typed command per
+operation, carrying only the fields that operation may have, and each trailer is
+a named record with its own codec. Nothing above the fabric sees an opcode bit,
+a flag, an addressee byte, or a trailer slot index. Encoders zero-fill and
+decoders are strict: range, alignment, transfer shape, direction, page class,
+addressee, narrowing, enumerations, booleans, and reserved or padding bytes are
+all checked, and anything malformed is refused rather than defaulted. NVMe
+status preserves only stale (`EREMOTEIO`), absent (`ENODATA`), unsupported
+(`EOPNOTSUPP`), and space (`ENOSPC`); other failures collapse to transport
+`EIO`.
 
 Routing has two tiers, both inside one universe. Local-zone traffic resolves
 directly or through another member; traffic for another zone goes to one of that
