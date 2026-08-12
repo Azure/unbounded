@@ -24,6 +24,8 @@ func TestCursorsRoundTrip(t *testing.T) {
 		NextNodeID:     1,
 		NextZoneID:     1,
 		Zones:          map[string]uint32{},
+		ZoneDefs:       map[uint32]ZoneDef{},
+		ZoneBuckets:    map[uint32]map[string]uint32{},
 	}, cursors)
 
 	universe, err := cursors.AllocateUniverseID()
@@ -50,6 +52,47 @@ func TestCursorsRoundTrip(t *testing.T) {
 	back, err := ParseCursors(cursors.Data())
 	require.NoError(t, err)
 	assert.Equal(t, cursors, back)
+}
+
+func TestZoneCursorsRoundTrip(t *testing.T) {
+	cursors, err := ParseCursors(nil)
+	require.NoError(t, err)
+
+	zone, err := cursors.AllocateZoneID()
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), zone)
+
+	cursors.DefineZone(zone, ZoneDef{Site: "edge-1", Fabric: "rail a"})
+
+	// A zone's definition is written once. A second call is what a requeue
+	// looks like and must not repoint the zone at a different site.
+	cursors.DefineZone(zone, ZoneDef{Site: "somewhere else"})
+	assert.Equal(t, ZoneDef{Site: "edge-1", Fabric: "rail a"}, cursors.ZoneDefs[zone])
+
+	cursors.ZoneBuckets[zone] = map[string]uint32{"westus2-1": 0, "westus2 2": 2}
+	cursors.ZoneTarget = 250
+
+	data := cursors.Data()
+
+	// The zone keys must not collide with the name interning prefix, which is
+	// parsed over the whole ConfigMap.
+	assert.NotContains(t, data, ZoneKeyPrefix+"target")
+
+	back, err := ParseCursors(data)
+	require.NoError(t, err)
+	assert.Equal(t, cursors, back)
+}
+
+func TestCursorsRejectAnOutOfRangeBucket(t *testing.T) {
+	_, err := ParseCursors(map[string]string{ZoneBucketsKeyPrefix + "1": "westus2-1=3"})
+	assert.Error(t, err)
+}
+
+func TestCursorsRefuseExhaustedZoneSpace(t *testing.T) {
+	cursors := Cursors{NextZoneID: uint32(MaxZones) + 1}
+
+	_, err := cursors.AllocateZoneID()
+	assert.Error(t, err)
 }
 
 func TestCursorsNeverHandOutZero(t *testing.T) {

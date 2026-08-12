@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -80,6 +82,12 @@ type Agent struct {
 	volumeLister  corelisters.PersistentVolumeLister
 	classLister   storagelisters.StorageClassLister
 	informersSync []cache.InformerSynced
+
+	// memberLister watches the membership ConfigMaps of this node's own zone
+	// and nothing else. It cannot be part of the factory above because the
+	// selector needs the zone id, and the zone is only known once the operator
+	// has stamped it on the Node object. Guarded by mu.
+	memberLister corelisters.ConfigMapLister
 
 	// signal is a capacity-one channel used as a coalescing "something
 	// changed" flag. A full channel already means a reconcile is pending, so a
@@ -281,15 +289,27 @@ func (a *Agent) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("list storage classes: %w", err)
 	}
 
-	cluster := BuildClusterState(nodes, classes, volumes, a.log)
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	identity, err := FindSelf(cluster, a.cfg.NodeName)
+	// The zone has to be resolved before the memberships can be listed, since
+	// the informer that holds them is selected on it.
+	nodeStates := buildNodeStates(nodes, a.log)
+
+	identity, err := FindSelf(racerctrl.ClusterState{Nodes: nodeStates}, a.cfg.NodeName)
 	if err != nil {
 		return err
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	memberships, err := a.memberships(ctx, identity.Zone)
+	if err != nil {
+		return err
+	}
+
+	cluster := racerctrl.ClusterState{
+		Nodes:     nodeStates,
+		Universes: buildUniverseStates(classes, volumes, memberships, a.log),
+	}
 
 	// Identity comes from the Node object; status comes from memory. The
 	// in-memory copy is authoritative for the status half because a volume
@@ -299,6 +319,12 @@ func (a *Agent) Reconcile(ctx context.Context) error {
 	a.self.ID = identity.ID
 	a.self.Cohort = identity.Cohort
 	a.self.Zone = identity.Zone
+
+	// Fabric identity and RDMA address are declared by an administrator on the
+	// Node and never written back, so they are copied in every pass rather
+	// than latched: recabling a node is an annotation edit, not a restart.
+	a.self.FabricID = identity.FabricID
+	a.self.RDMAAddr = identity.RDMAAddr
 
 	if err := a.assignFabricMinors(cluster); err != nil {
 		return err
@@ -361,6 +387,8 @@ func (a *Agent) reconcileFabric(cluster racerctrl.ClusterState) {
 	if a.fabric == nil {
 		a.fabric = NewFabric(a.cfg, a.self.ID, nil)
 	}
+
+	a.fabric.SetRDMAAddr(a.self.RDMAAddr)
 
 	plan := PlanFabric(a.fabric, cluster, a.self)
 
@@ -601,7 +629,60 @@ func (a *Agent) clusterSnapshot() racerctrl.ClusterState {
 	volumes, _ := a.volumeLister.List(labelsEverything()) //nolint:errcheck
 	classes, _ := a.classLister.List(labelsEverything())  //nolint:errcheck
 
-	return withSelf(BuildClusterState(nodes, classes, volumes, a.log), a.self)
+	var memberships []*corev1.ConfigMap
+	if a.memberLister != nil {
+		memberships, _ = a.memberLister.List(labelsEverything()) //nolint:errcheck
+	}
+
+	return withSelf(BuildClusterState(nodes, classes, volumes, memberships, a.log), a.self)
+}
+
+// memberships lists this node's zone's membership ConfigMaps, starting the
+// informer that watches them on the first call.
+//
+// The watch is narrowed to one namespace and one zone label. A zone's
+// membership is its entire catalog, up to a thousand node ids, and there may be
+// sixty-four zones: handing every node all of them would put megabytes through
+// every agent's watch to deliver the one list it can actually use. What a node
+// needs of the other zones is their gateways, and those are small enough to
+// stay on the StorageClass.
+//
+// The caller holds the lock.
+func (a *Agent) memberships(ctx context.Context, zone uint32) ([]*corev1.ConfigMap, error) {
+	if a.memberLister == nil {
+		selector := labels.SelectorFromSet(labels.Set{
+			racerctrl.MembershipZoneLabel: strconv.FormatUint(uint64(zone), 10),
+		}).String()
+
+		factory := informers.NewSharedInformerFactoryWithOptions(a.client, informerResync,
+			informers.WithNamespace(a.cfg.Namespace),
+			informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+				opts.LabelSelector = selector
+			}))
+
+		maps := factory.Core().V1().ConfigMaps()
+
+		//nolint:errcheck // the handler registration only fails on a stopped informer
+		_, _ = maps.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    func(any) { a.Trigger() },
+			UpdateFunc: func(any, any) { a.Trigger() },
+			DeleteFunc: func(any) { a.Trigger() },
+		})
+
+		factory.Start(ctx.Done())
+
+		syncCtx, cancel := context.WithTimeout(ctx, cacheSyncTimeout)
+		defer cancel()
+
+		if !cache.WaitForCacheSync(syncCtx.Done(), maps.Informer().HasSynced) {
+			return nil, fmt.Errorf("timed out waiting for the membership cache in namespace %s to sync; "+
+				"check the racer-ctrl ClusterRole", a.cfg.Namespace)
+		}
+
+		a.memberLister = maps.Lister()
+	}
+
+	return a.memberLister.List(labelsEverything())
 }
 
 // withSelf replaces this node's entry in a snapshot with the agent's in-memory

@@ -63,6 +63,10 @@ type pass struct {
 	nodes     []nodeView
 	universes []universeView
 
+	// memberships is every per-zone membership ConfigMap in the namespace,
+	// keyed by the universe and zone it belongs to.
+	memberships map[membershipKey]*corev1.ConfigMap
+
 	// waiting collects the reasons a sequence has not finished, which become
 	// the not-ready condition's message.
 	waiting []string
@@ -111,11 +115,96 @@ func loadState(ctx context.Context, env *component.Env) (*pass, error) {
 		return nil, err
 	}
 
+	if err := p.loadMemberships(ctx); err != nil {
+		return nil, err
+	}
+
 	if err := p.loadUniverses(ctx); err != nil {
 		return nil, err
 	}
 
 	return p, nil
+}
+
+// membershipKey identifies one zone's membership within one universe.
+type membershipKey struct {
+	universe uint32
+	zone     uint32
+}
+
+// loadMemberships reads every per-zone membership ConfigMap in the operator
+// namespace.
+//
+// They are listed by label rather than fetched by name because the operator has
+// no other record of which zones a universe has published: the zone cursor says
+// which ids exist, not which of them ever got a catalog.
+func (p *pass) loadMemberships(ctx context.Context) error {
+	maps := &corev1.ConfigMapList{}
+	if err := p.env.Client.List(ctx, maps, client.InNamespace(p.env.Namespace),
+		client.HasLabels{racerctrl.MembershipUniverseLabel}); err != nil {
+		return fmt.Errorf("list membership config maps: %w", err)
+	}
+
+	p.memberships = make(map[membershipKey]*corev1.ConfigMap, len(maps.Items))
+
+	for i := range maps.Items {
+		item := &maps.Items[i]
+
+		universe, zone, ok := racerctrl.ParseMembershipLabels(item.Labels)
+		if !ok {
+			continue
+		}
+
+		p.memberships[membershipKey{universe: universe, zone: zone}] = item
+	}
+
+	return nil
+}
+
+// writeMembership publishes a zone's membership, creating the ConfigMap the
+// first time the zone gets a catalog.
+func (p *pass) writeMembership(ctx context.Context, universe, zone uint32, members racerctrl.Membership) error {
+	key := membershipKey{universe: universe, zone: zone}
+
+	desired := racerctrl.FormatMembership(members)
+
+	if item, ok := p.memberships[key]; ok {
+		if item.Data[racerctrl.MembershipDataKey] == desired {
+			return nil
+		}
+
+		updated := item.DeepCopy()
+		if updated.Data == nil {
+			updated.Data = map[string]string{}
+		}
+
+		updated.Data[racerctrl.MembershipDataKey] = desired
+
+		if err := p.env.Client.Update(ctx, updated); err != nil {
+			return fmt.Errorf("update %s/%s: %w", updated.Namespace, updated.Name, err)
+		}
+
+		p.memberships[key] = updated
+
+		return nil
+	}
+
+	item := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: p.env.Namespace,
+			Name:      racerctrl.MembershipConfigMapName(universe, zone),
+			Labels:    racerctrl.MembershipLabels(universe, zone),
+		},
+		Data: map[string]string{racerctrl.MembershipDataKey: desired},
+	}
+
+	if err := p.env.Client.Create(ctx, item); err != nil {
+		return fmt.Errorf("create %s/%s: %w", item.Namespace, item.Name, err)
+	}
+
+	p.memberships[key] = item
+
+	return nil
 }
 
 func (p *pass) loadNodes(ctx context.Context) error {
@@ -166,7 +255,33 @@ func (p *pass) loadUniverses(ctx context.Context) error {
 		}
 
 		p.universes = append(p.universes, universeView{class: class, state: state})
-		byName[class.Name] = &p.universes[len(p.universes)-1]
+	}
+
+	// Indexed after every class is appended, not during: taking a pointer into
+	// a slice that is still growing hands out addresses into a backing array
+	// the next append may replace.
+	for i := range p.universes {
+		view := &p.universes[i]
+		byName[view.class.Name] = view
+
+		if view.state.ID == 0 {
+			continue
+		}
+
+		// Membership is not in the class's annotations. It lives in one
+		// ConfigMap per zone, so it is joined in here.
+		for key, item := range p.memberships {
+			if key.universe != view.state.ID {
+				continue
+			}
+
+			members, err := racerctrl.ParseMembership(item.Data[racerctrl.MembershipDataKey])
+			if err != nil {
+				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
+			}
+
+			view.state.Members[key.zone] = members
+		}
 	}
 
 	volumes := &corev1.PersistentVolumeList{}
@@ -346,8 +461,11 @@ func (p *pass) patchClass(ctx context.Context, view *universeView, annotations m
 	view.state.ID = state.ID
 	view.state.Epoch = state.Epoch
 	view.state.CatalogSize = state.CatalogSize
-	view.state.Members = state.Members
+	view.state.GatewayCount = state.GatewayCount
 	view.state.Gateways = state.Gateways
+
+	// Members is deliberately not copied: it was joined in from the per-zone
+	// ConfigMaps and the class's annotations no longer carry it.
 
 	return nil
 }

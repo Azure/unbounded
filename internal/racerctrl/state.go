@@ -48,6 +48,7 @@ const (
 	fabricDeviceKey = "device"
 	fabricNQNKey    = "nqn"
 	fabricAddrKey   = "addr"
+	fabricRDMAKey   = "rdma"
 )
 
 // ParseNodeState reads one node's published state out of its annotations. A node
@@ -74,6 +75,12 @@ func ParseNodeState(name string, annotations map[string]string) (NodeState, erro
 	if state.Cohort >= Cohorts && annotations[NodeCohortAnnotation] != "" {
 		return NodeState{}, fmt.Errorf("node %q: cohort %d is out of range", name, state.Cohort)
 	}
+
+	// Placement inputs. Both are free-form strings a user wrote, so neither can
+	// fail to parse; an unset one is the empty string, which is a distinct and
+	// meaningful value ("no fabric", "no RDMA address") rather than an error.
+	state.FabricID = annotations[NodeFabricIDAnnotation]
+	state.RDMAAddr = annotations[NodeRDMAAddrAnnotation]
 
 	if raw := annotations[NodeStoreBytesAnnotation]; raw != "" {
 		if state.StoreBytes, err = ParseUint64(raw); err != nil {
@@ -197,6 +204,10 @@ func FormatFabricExports(exports []FabricExport) string {
 			values.Set(fabricAddrKey, export.Addr)
 		}
 
+		if export.RDMAAddr != "" {
+			values.Set(fabricRDMAKey, export.RDMAAddr)
+		}
+
 		entries = append(entries, ListEntry{
 			Item:   strconv.FormatUint(uint64(export.UniverseID), 10),
 			Values: values,
@@ -248,6 +259,7 @@ func ParseFabricExports(raw string) ([]FabricExport, error) {
 			DeviceID:   device,
 			NQN:        entry.Values.Get(fabricNQNKey),
 			Addr:       entry.Values.Get(fabricAddrKey),
+			RDMAAddr:   entry.Values.Get(fabricRDMAKey),
 		})
 	}
 
@@ -412,33 +424,29 @@ func ParseUniverseState(class string, annotations map[string]string) (UniverseSt
 
 	state.CatalogSize = int(size)
 
+	if state.GatewayCount, err = optionalUint32Annotation(annotations, GatewayCountAnnotation); err != nil {
+		return UniverseState{}, fmt.Errorf("storage class %q: %w", class, err)
+	}
+
+	// Membership is not here. It lives in one ConfigMap per zone, because a
+	// thousand-node zone is fourteen kilobytes and sixty-four of them do not fit
+	// in one object's annotations. The caller fills Members in from those maps.
 	for key, value := range annotations {
-		switch {
-		case strings.HasPrefix(key, MembersAnnotationPrefix):
-			zone, err := ParseUint32(strings.TrimPrefix(key, MembersAnnotationPrefix))
-			if err != nil {
-				return UniverseState{}, fmt.Errorf("storage class %q: %s: %w", class, key, err)
-			}
-
-			members, err := ParseMembership(value)
-			if err != nil {
-				return UniverseState{}, fmt.Errorf("storage class %q: %s: %w", class, key, err)
-			}
-
-			state.Members[zone] = members
-		case strings.HasPrefix(key, GatewaysAnnotationPrefix):
-			zone, err := ParseUint32(strings.TrimPrefix(key, GatewaysAnnotationPrefix))
-			if err != nil {
-				return UniverseState{}, fmt.Errorf("storage class %q: %s: %w", class, key, err)
-			}
-
-			gateways, err := ParseUint32List(value)
-			if err != nil {
-				return UniverseState{}, fmt.Errorf("storage class %q: %s: %w", class, key, err)
-			}
-
-			state.Gateways[zone] = gateways
+		if !strings.HasPrefix(key, GatewaysAnnotationPrefix) {
+			continue
 		}
+
+		zone, err := ParseUint32(strings.TrimPrefix(key, GatewaysAnnotationPrefix))
+		if err != nil {
+			return UniverseState{}, fmt.Errorf("storage class %q: %s: %w", class, key, err)
+		}
+
+		gateways, err := ParseUint32List(value)
+		if err != nil {
+			return UniverseState{}, fmt.Errorf("storage class %q: %s: %w", class, key, err)
+		}
+
+		state.Gateways[zone] = gateways
 	}
 
 	return state, nil
@@ -452,11 +460,6 @@ func NextLBA(annotations map[string]string) (uint64, error) {
 	}
 
 	return ParseUint64(raw)
-}
-
-// MembersAnnotation is the annotation key holding a zone's catalog membership.
-func MembersAnnotation(zone uint32) string {
-	return MembersAnnotationPrefix + strconv.FormatUint(uint64(zone), 10)
 }
 
 // GatewaysAnnotation is the annotation key holding a zone's gateway node ids.

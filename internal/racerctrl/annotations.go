@@ -56,6 +56,40 @@ const (
 	NodeZoneAnnotation = AnnotationDomain + "zone"
 )
 
+// Node placement annotations. These are the only racer annotations a user or a
+// higher-level controller writes. All three are optional, all three are inputs
+// to placement rather than results of it, and all three are read only while a
+// node is being placed: once the operator has stamped a zone and a cohort,
+// changing one of these does not move the node. Drift is reported, never acted
+// on, because moving a placed node means rewriting a catalog.
+const (
+	// NodeFabricIDAnnotation names the node's RDMA fabric. Two nodes carrying the
+	// same value are assumed to be able to reach each other over RDMA; two nodes
+	// carrying different values, or none at all, are assumed to need TCP.
+	//
+	// Placement treats it as a strong preference rather than a partition: a
+	// quorum group inside one fabric is worth a lot, but a zone that could not
+	// be formed without crossing one is better than no zone.
+	NodeFabricIDAnnotation = AnnotationDomain + "fabric-id"
+
+	// NodeRDMAAddrAnnotation is the address peers dial to reach this node's NVMe
+	// target over RDMA, as `host` or `host:port`. It is supplied rather than
+	// discovered because the RDMA-capable interface is rarely the one the
+	// kubelet reports as the node address, and guessing wrong means a fabric
+	// that silently falls back to TCP.
+	//
+	// Empty means this node does not serve RDMA, whatever fabric it names.
+	NodeRDMAAddrAnnotation = AnnotationDomain + "rdma-addr"
+
+	// NodeZoneNameAnnotation pins the node to a named zone, overriding automatic
+	// placement. It takes precedence over everything: an operator who has
+	// reasoned about a blast radius gets the blast radius they asked for.
+	//
+	// The name is interned to a numeric zone id exactly as the topology label
+	// used to be, so two nodes naming the same zone land in the same catalog.
+	NodeZoneNameAnnotation = AnnotationDomain + "zone-name"
+)
+
 // Node status annotations. The node agent is the single writer of these on its
 // own Node; the operator and the node's peers only read them.
 const (
@@ -107,15 +141,22 @@ const (
 	// id and its placement safe to freeze for life.
 	NextLBAAnnotation = AnnotationDomain + "next-lba"
 
-	// MembersAnnotationPrefix is followed by a zone id. The value is that zone's
-	// agreed catalog membership, as `<nodeID>?cohort=<c>` entries in catalog
-	// order. Trios are derived from it, so every node reaches the same catalog
-	// without agreeing on anything else.
-	MembersAnnotationPrefix = AnnotationDomain + "members-zone-"
+	// GatewayCountAnnotation is how many of each zone's members other zones may
+	// route through. Optional; DefaultGatewayCount when unset or unparseable as
+	// a positive number. Capped at MaxGateways.
+	//
+	// It is the overlap knob: a wider list spreads cross-zone traffic over more
+	// of a zone's edge and survives more gateway failures, at the cost of one
+	// NVMe-oF controller per gateway per foreign zone on every node.
+	GatewayCountAnnotation = AnnotationDomain + "gateway-count"
 
 	// GatewaysAnnotationPrefix is followed by a zone id. The value is that zone's
 	// gateway node ids, comma separated. A universe publishes each foreign zone's
 	// gateways so cross-zone reads have somewhere to go.
+	//
+	// Gateways stay on the StorageClass while membership does not: a gateway list
+	// is capped at MaxGateways entries per zone, so all 64 zones together are a
+	// few kilobytes, whereas a single zone's membership is not.
 	GatewaysAnnotationPrefix = AnnotationDomain + "gateways-zone-"
 )
 

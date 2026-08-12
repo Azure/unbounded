@@ -42,6 +42,7 @@ import (
 // so the DaemonSet manifest is the single place a knob is set.
 const (
 	EnvNodeName      = "NODE_NAME"
+	EnvNamespace     = "POD_NAMESPACE"
 	EnvConfigDir     = "RACER_CONFIG_DIR"
 	EnvStorePath     = "RACER_STORE"
 	EnvMetricsURL    = "RACER_METRICS_URL"
@@ -50,6 +51,7 @@ const (
 	EnvNvmetRoot     = "RACER_NVMET_ROOT"
 	EnvFabricAddr    = "RACER_FABRIC_ADDR"
 	EnvFabricPort    = "RACER_FABRIC_PORT"
+	EnvRDMAPort      = "RACER_RDMA_PORT"
 	EnvNQNPrefix     = "RACER_NQN_PREFIX"
 	EnvStageTimeout  = "RACER_STAGE_TIMEOUT"
 	EnvSkipPreflight = "RACER_SKIP_PREFLIGHT"
@@ -75,8 +77,17 @@ const (
 	// DefaultNvmetRoot is the kernel configfs mount point for the NVMe target.
 	DefaultNvmetRoot = "/sys/kernel/config/nvmet"
 
+	// DefaultNamespace is where the operator keeps the membership ConfigMaps.
+	DefaultNamespace = "unbounded-system"
+
 	// DefaultFabricPort is the NVMe/TCP discovery port.
 	DefaultFabricPort = 4420
+
+	// DefaultRDMAPort is the service port of the RDMA nvmet port. It is
+	// distinct from the TCP one because a node publishes both at once: the
+	// subsystem is linked into two nvmet ports, and a port is identified by
+	// its transport and address, of which the service id is part.
+	DefaultRDMAPort = 4421
 
 	// DefaultNQNPrefix is the stem every racer subsystem NQN is built from.
 	DefaultNQNPrefix = "nqn.2024-01.io.unbounded-cloud:racer"
@@ -91,6 +102,10 @@ const (
 type Config struct {
 	// NodeName is the Node object this agent owns. Required.
 	NodeName string
+
+	// Namespace is the operator's namespace, where the per-zone membership
+	// ConfigMaps live. The agent reads them and writes nothing there.
+	Namespace string
 
 	// ConfigDir is the directory racer watches for its config file.
 	ConfigDir string
@@ -119,6 +134,10 @@ type Config struct {
 	// FabricPort is the NVMe/TCP service port.
 	FabricPort int
 
+	// RDMAPort is the service port of the RDMA nvmet port, used only when this
+	// node publishes an RDMA address.
+	RDMAPort int
+
 	// NQNPrefix is the subsystem NQN stem.
 	NQNPrefix string
 
@@ -145,6 +164,7 @@ func (c Config) FabricEnabled() bool {
 func LoadConfig() (Config, error) {
 	cfg := Config{
 		NodeName:      os.Getenv(EnvNodeName),
+		Namespace:     envOr(EnvNamespace, DefaultNamespace),
 		ConfigDir:     envOr(EnvConfigDir, DefaultConfigDir),
 		StorePath:     envOr(EnvStorePath, DefaultStorePath),
 		MetricsURL:    envOr(EnvMetricsURL, DefaultMetricsURL),
@@ -153,6 +173,7 @@ func LoadConfig() (Config, error) {
 		NvmetRoot:     envOr(EnvNvmetRoot, DefaultNvmetRoot),
 		FabricAddr:    strings.TrimSpace(os.Getenv(EnvFabricAddr)),
 		FabricPort:    DefaultFabricPort,
+		RDMAPort:      DefaultRDMAPort,
 		NQNPrefix:     envOr(EnvNQNPrefix, DefaultNQNPrefix),
 		StageTimeout:  DefaultStageTimeout,
 		SkipPreflight: truthy(os.Getenv(EnvSkipPreflight)),
@@ -169,6 +190,15 @@ func LoadConfig() (Config, error) {
 		}
 
 		cfg.FabricPort = port
+	}
+
+	if raw := os.Getenv(EnvRDMAPort); raw != "" {
+		port, err := strconv.Atoi(raw)
+		if err != nil || port <= 0 || port > 65535 {
+			return Config{}, fmt.Errorf("%s: %q is not a valid service port", EnvRDMAPort, raw)
+		}
+
+		cfg.RDMAPort = port
 	}
 
 	if raw := os.Getenv(EnvStageTimeout); raw != "" {

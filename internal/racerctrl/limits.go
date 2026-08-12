@@ -58,7 +58,45 @@ const Cohorts = 3
 // DefaultCatalogSize is the catalog length a zone is pinned to when its universe
 // is first published. It is fixed for the life of the zone, and the number of
 // nodes per cohort must divide it, so the useful property is having many
-// divisors rather than being large: 360 admits cohort sizes 1, 2, 3, 4, 5, 6, 8,
-// 9, 10, 12, 15, 18, 20, 24, 30, 36, 40, 45, 60, 72, 90, 120, 180 and 360, which
-// is 3 to 1080 nodes in a zone.
-const DefaultCatalogSize = 360
+// divisors rather than being large.
+//
+// 2520 is 2^3 * 3^2 * 5 * 7, which has 48 divisors. The ones that matter are the
+// large ones: a zone filling toward the 1000-node target admits cohort sizes 280,
+// 315 and 360, so it wastes at most a handful of nodes on the way up rather than
+// the 46% that 360's jump from 180 to 360 costs. At full stretch it is 2520 nodes
+// per cohort, well past the zone target.
+//
+// A larger catalog means more consensus groups per node, and the dataplane's
+// superblock only records the promised term of 128 of them (MAX_TERMS in
+// cmd/racer/src/layout.rs). That table is a cache, not a ledger: paxos::persist
+// truncates it silently, a group missing from it starts at term zero, and the
+// real term is recovered from the group's peers on first use. Partial coverage
+// is already the case at 360, so this does not change in kind.
+const DefaultCatalogSize = 2520
+
+// Placement tuning. None of these are dataplane limits; they are the knobs the
+// operator uses to decide which zone a node lands in and how much two zones
+// overlap.
+const (
+	// DefaultZoneTarget is how many nodes a zone is filled to before a new one
+	// is minted. A zone is a single catalog, a single anti-entropy domain and a
+	// single blast radius, so it is sized for the failure the operator wants to
+	// survive rather than for the largest catalog that would fit.
+	DefaultZoneTarget = 1000
+
+	// MinZoneSeed is how many unplaced nodes must share a fabric before that
+	// fabric is worth a zone of its own. Below it the nodes join an existing
+	// zone instead, because a zone of one or two nodes cannot form a trio and
+	// would hold no groups at all.
+	MinZoneSeed = 3
+
+	// DefaultGatewayCount is how many of a zone's members other zones may route
+	// through, and so how much two zones overlap.
+	//
+	// Six because the dataplane walks at most three gateways before calling a
+	// zone unavailable (GATEWAY_TRIES in cmd/racer/src/paxos.rs), so three is
+	// the useful width and six leaves headroom for half the list being
+	// unreachable. Wider is not free: every node holds an NVMe-oF controller per
+	// gateway per foreign zone, so the cost is (zones-1) * count per node.
+	DefaultGatewayCount = 6
+)

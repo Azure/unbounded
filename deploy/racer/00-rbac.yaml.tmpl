@@ -49,7 +49,7 @@ rules:
     verbs: ["get", "list", "watch", "patch"]
   # A StorageClass whose provisioner is racer.unbounded-cloud.io is a racer
   # universe; its annotations carry the universe id, catalog size, epoch and
-  # per-zone membership. Read-only: the operator is the single writer.
+  # each zone's gateways. Read-only: the operator is the single writer.
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
@@ -64,6 +64,40 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+---
+# A zone's catalog membership is up to a thousand node ids, far past what an
+# annotation may hold once a cluster has more than a handful of zones, so it
+# lives in one ConfigMap per universe per zone in the operator's namespace.
+# This is a namespaced Role rather than part of the ClusterRole above because
+# that is the only namespace the agent ever reads a ConfigMap from, and the
+# informer that does it is additionally selected down to this node's own zone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: racer-ctrl-membership
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: racer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: racer-ctrl-membership
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: racer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: racer-ctrl-membership
+subjects:
+  - kind: ServiceAccount
+    name: racer-ctrl
+    namespace: {{ default "unbounded-system" .Namespace }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

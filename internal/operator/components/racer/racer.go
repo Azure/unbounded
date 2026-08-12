@@ -10,9 +10,12 @@
 // node answers to - has to be decided somewhere else, exactly once, by one
 // writer. This component is that writer.
 //
-// It owns four pieces of cluster state and nothing else owns any of them:
+// It owns five pieces of cluster state and nothing else owns any of them:
 //
-//   - the racer-allocations ConfigMap, holding the never-reused id cursors;
+//   - the racer-allocations ConfigMap, holding the never-reused id cursors and
+//     the zone definitions automatic placement decides from;
+//   - one ConfigMap per universe per zone, holding that zone's catalog
+//     membership;
 //   - StorageClass annotations, because a StorageClass with racer's provisioner
 //     is a universe;
 //   - PersistentVolume annotations, because a PV bound to such a class is a
@@ -20,7 +23,7 @@
 //     frozen;
 //   - Node identity annotations (node-id, cohort, zone).
 //
-// The node agent (racer-ctrl) reads all four and writes only its own node's
+// The node agent (racer-ctrl) reads all five and writes only its own node's
 // status. Nothing else in the cluster writes any of them. That single-writer
 // property is what makes the allocation safe without a lease of its own: the
 // operator is already leader-elected, so there is exactly one of it.
@@ -47,6 +50,7 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racermanifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/racerctrl"
 )
 
 const (
@@ -72,10 +76,11 @@ const (
 	// that label.
 	EnrollmentLabel = "racer.unbounded-cloud.io/enabled"
 
-	// ZoneLabel is the failure domain racer's zone ids are derived from. It is
-	// the standard Kubernetes topology label rather than one of our own,
-	// because a racer zone is exactly the blast radius the cluster already
-	// believes in.
+	// ZoneLabel is the availability zone a node sits in, the standard
+	// Kubernetes topology label. It is not a racer zone: a racer zone is a
+	// catalog and spans several availability zones on purpose, because a trio
+	// takes one node from each cohort and a cohort is an availability zone.
+	// This is the input placement balances a zone's cohorts against.
 	ZoneLabel = corev1.LabelTopologyZone
 
 	// requeueInterval is how long to wait before looking again while a sequence
@@ -156,7 +161,10 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName))))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(allocationsName))))
+		builder.WithPredicates(env.ManagedConfigPredicate(func(obj client.Object) bool {
+			return env.InNamespaceNamed(allocationsName)(obj) ||
+				env.InNamespaceWithPrefix(racerctrl.MembershipConfigMapPrefix)(obj)
+		})))
 	b.Watches(&corev1.Node{}, env.RequestSingleton())
 	b.Watches(&corev1.PersistentVolume{}, env.RequestSingleton())
 }

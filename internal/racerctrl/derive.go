@@ -38,6 +38,15 @@ type NodeState struct {
 	Cohort uint32
 	Zone   uint32
 
+	// FabricID is the RDMA fabric the node declared, and RDMAAddr the address
+	// peers reach it on over that fabric. Both are user-supplied and both are
+	// optional. They are inputs to placement and to transport selection, never
+	// results of either: the operator reads FabricID once when it places the
+	// node, and every node reads its peers' pair to decide whether a link can
+	// be RDMA or has to be TCP.
+	FabricID string
+	RDMAAddr string
+
 	// StoreBytes is the store size the node has already formatted for.
 	StoreBytes uint64
 
@@ -82,8 +91,14 @@ type FabricExport struct {
 	// NQN is the subsystem NQN peers attach.
 	NQN string
 
-	// Addr is the transport address, host:port, peers connect to.
+	// Addr is the transport address, host:port, peers connect to over TCP.
 	Addr string
+
+	// RDMAAddr is the address, host:port, peers on the same fabric connect to
+	// over RDMA. Empty when this node publishes no RDMA port, which is what a
+	// peer reads as "dial me over TCP": it is advertised only once the port is
+	// actually listening, so a node never invites traffic it cannot serve.
+	RDMAAddr string
 }
 
 // Health is the subset of racer's metrics the control plane acts on.
@@ -138,7 +153,15 @@ type UniverseState struct {
 	// published and fixed for the life of that zone.
 	CatalogSize int
 
-	// Members is each zone's catalog membership, keyed by zone id.
+	// GatewayCount is how many gateways each zone of this universe publishes,
+	// which is how much a zone's edge overlaps with its neighbours. Zero means
+	// DefaultGatewayCount.
+	GatewayCount uint32
+
+	// Members is each zone's catalog membership, keyed by zone id. It is filled
+	// from one ConfigMap per zone rather than from the class's annotations: a
+	// thousand-node zone is fourteen kilobytes and sixty-four of them do not fit
+	// in one object.
 	Members map[uint32]Membership
 
 	// Gateways is each zone's gateway node ids, keyed by zone id. A zone with no
@@ -298,11 +321,18 @@ func (d *Derivation) deriveUniverse(state *UniverseState, fabricIDs map[uint32]u
 // deriveZones lists the universe's other zones with their gateways. Our own zone
 // is deliberately absent: racer reaches it through the catalog, not through a
 // gateway.
+//
+// The zones are enumerated from the published gateway lists rather than from
+// the memberships, because a node only ever holds its own zone's membership: a
+// zone's members are its whole catalog and shipping every zone's to every node
+// is what the per-zone ConfigMaps exist to avoid. A zone with no gateways is
+// unreachable, so a zone that is missing here is a zone racer could not have
+// routed to anyway.
 func (d *Derivation) deriveZones(state *UniverseState) []*racerconfig.Zone {
-	ids := make([]uint32, 0, len(state.Members))
+	ids := make([]uint32, 0, len(state.Gateways))
 
-	for zone, members := range state.Members {
-		if zone == d.Self.Zone || len(members) == 0 {
+	for zone, gateways := range state.Gateways {
+		if zone == d.Self.Zone || len(gateways) == 0 {
 			continue
 		}
 
@@ -314,14 +344,7 @@ func (d *Derivation) deriveZones(state *UniverseState) []*racerconfig.Zone {
 	zones := make([]*racerconfig.Zone, 0, len(ids))
 
 	for _, id := range ids {
-		gateways := state.Gateways[id]
-		if len(gateways) == 0 {
-			// A zone that has published no gateway list is reachable through any
-			// of its members. That is the same set, just less selective.
-			gateways = state.Members[id].NodeIDs()
-		}
-
-		gateways = dedupeSorted(gateways)
+		gateways := dedupeSorted(state.Gateways[id])
 		if len(gateways) > MaxGateways {
 			gateways = gateways[:MaxGateways]
 		}

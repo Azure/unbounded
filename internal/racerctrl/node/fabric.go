@@ -6,11 +6,13 @@ package node
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/Azure/unbounded/internal/racerctrl"
 )
@@ -51,6 +53,19 @@ type Fabric struct {
 	nqnPrefix string
 	addr      string
 	port      int
+
+	// rdmaAddr is the address peers on this node's fabric reach it on over
+	// RDMA, empty when the node declares no fabric. It comes from a node
+	// annotation rather than the environment because the RDMA NIC is not the
+	// interface the kubelet reports, and because it changes without the pod
+	// restarting.
+	rdmaAddr string
+	rdmaPort int
+
+	// rdmaLive records whether the RDMA port came up in the last pass. It
+	// gates what is advertised to peers, so a node only invites RDMA traffic
+	// it can actually serve.
+	rdmaLive bool
 }
 
 // Connector abstracts the initiator side of NVMe-oF.
@@ -94,6 +109,12 @@ type FabricImportRequest struct {
 	PeerNodeID uint32
 	NQN        string
 	Addr       string
+
+	// Trtype is the transport to dial the peer over, "tcp" or "rdma". The
+	// planner picks it from whether the two nodes declare the same fabric,
+	// and the address above is the one that transport listens on, so the two
+	// always travel together.
+	Trtype string
 }
 
 // FabricPlan is the complete desired fabric state for this node. Like the
@@ -116,13 +137,20 @@ type FabricState struct {
 	Attachments map[racerctrl.Attachment]string
 }
 
-// Fixed nvmet transport settings. racer's fabric traffic is ordinary NVMe/TCP:
-// RDMA would be faster but TCP is the one transport available on every node the
-// project targets, and the fabric is not on the latency-critical path for
-// anything but cross-node repair.
+// Transports racer's fabric traffic may take.
+//
+// TCP is the floor: it is available on every node the project targets and needs
+// nothing of the network but reachability. RDMA is offered alongside it rather
+// than instead of it, because reachability over RDMA is a property of the
+// physical fabric a node is cabled into and not of the cluster. A node that
+// declares a fabric publishes both, and a peer on the same fabric dials the
+// RDMA one; everyone else dials TCP and is none the wiser.
 const (
-	fabricTrtype = "tcp"
-	fabricAdrfam = "ipv4"
+	fabricTrtypeTCP  = "tcp"
+	fabricTrtypeRDMA = "rdma"
+
+	adrfamIPv4 = "ipv4"
+	adrfamIPv6 = "ipv6"
 
 	// fabricNamespaceID is the namespace number inside each subsystem. Each
 	// subsystem carries exactly one namespace (one universe's fabric device),
@@ -144,7 +172,20 @@ func NewFabric(cfg Config, nodeID uint32, connector Connector) *Fabric {
 		nqnPrefix:    cfg.NQNPrefix,
 		addr:         cfg.FabricAddr,
 		port:         cfg.FabricPort,
+		rdmaPort:     cfg.RDMAPort,
 	}
+}
+
+// SetRDMAAddr declares the address this node's RDMA target listens on, or
+// clears it when empty.
+//
+// It is a setter rather than a constructor argument because the address lives
+// in a node annotation the operator or an administrator may change at any time,
+// while the fabric manager is built once at startup. Calling it with the same
+// value twice is free; changing it republishes the RDMA port on the next
+// reconcile.
+func (f *Fabric) SetRDMAAddr(addr string) {
+	f.rdmaAddr = addr
 }
 
 // SubsystemNQN is the NQN a node publishes a universe under.
@@ -163,9 +204,25 @@ func (f *Fabric) HostNQN(node uint32) string {
 	return fmt.Sprintf("%s.host.n%d", f.nqnPrefix, node)
 }
 
-// Address is the transport address peers dial to reach this node's target.
+// Address is the transport address peers dial to reach this node's TCP target.
 func (f *Fabric) Address() string {
-	return fmt.Sprintf("%s:%d", f.addr, f.port)
+	return net.JoinHostPort(f.addr, strconv.Itoa(f.port))
+}
+
+// RDMAAddress normalises an rdma-addr annotation into the address to dial.
+//
+// A bare host is completed with this node's RDMA service id rather than the
+// peer's, which is unknowable from here. That is sound because the service id
+// is a cluster-wide setting: an administrator who moves it moves it everywhere,
+// and one who does not never sees it.
+func (f *Fabric) RDMAAddress(addr string) string {
+	if addr == "" {
+		return ""
+	}
+
+	host, port := splitRDMAAddr(addr, f.rdmaPort)
+
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // Reconcile drives the fabric to the plan and reports what it achieved.
@@ -182,6 +239,12 @@ func (f *Fabric) Reconcile(plan FabricPlan) (FabricState, error) {
 
 	var problems []error
 
+	// Ports first: they are shared by every subsystem, and whether RDMA came
+	// up decides what the exports below advertise.
+	if err := f.ensurePorts(); err != nil {
+		problems = append(problems, err)
+	}
+
 	for _, export := range plan.Exports {
 		nqn := f.SubsystemNQN(export.UniverseID, f.nodeID)
 
@@ -195,6 +258,7 @@ func (f *Fabric) Reconcile(plan FabricPlan) (FabricState, error) {
 			DeviceID:   export.DeviceID,
 			NQN:        nqn,
 			Addr:       f.Address(),
+			RDMAAddr:   f.AdvertisedRDMAAddr(),
 		})
 	}
 
@@ -229,6 +293,16 @@ func (f *Fabric) publish(nqn string, export FabricExportRequest) error {
 		return err
 	}
 
+	// configfs materializes these when the subsystem is created, so the mkdirs
+	// below are no-ops there. They are here so that the tree this code needs is
+	// stated rather than assumed, and so it can be driven against an ordinary
+	// directory.
+	for _, child := range []string{"allowed_hosts", "namespaces"} {
+		if err := ensureDir(filepath.Join(subsystem, child)); err != nil {
+			return err
+		}
+	}
+
 	// Deny by default before the namespace is enabled, so there is no window
 	// in which the device is reachable by anything that asks.
 	if err := writeAttr(filepath.Join(subsystem, "attr_allow_any_host"), "0"); err != nil {
@@ -243,7 +317,7 @@ func (f *Fabric) publish(nqn string, export FabricExportRequest) error {
 		return err
 	}
 
-	return f.ensurePortLink(nqn)
+	return f.linkSubsystem(nqn)
 }
 
 // ensureAllowedHosts makes the subsystem's allowed_hosts exactly the given node
@@ -340,14 +414,124 @@ func (f *Fabric) ensureNamespace(subsystem, devicePath string) error {
 	return writeAttr(filepath.Join(ns, "enable"), "1")
 }
 
-// ensurePortLink exposes the subsystem on this node's transport port, creating
-// the port if it is not there. All of racer's subsystems share one port: they
-// differ by NQN, not by address, and a per-subsystem port would burn one
-// listening socket per universe for no benefit.
-func (f *Fabric) ensurePortLink(nqn string) error {
-	port := filepath.Join(f.nvmetRoot, "ports", strconv.Itoa(f.port))
+// fabricPort is one nvmet listening port: a transport and the address it
+// answers on.
+type fabricPort struct {
+	// id is the configfs port directory name. nvmet identifies a port by a
+	// small integer, so the service port number doubles as the id: it is
+	// already unique per transport here, and it makes the configfs tree
+	// readable next to an `ss -lnt`.
+	id int
+
+	trtype  string
+	adrfam  string
+	traddr  string
+	trsvcid string
+}
+
+// tcpPort is the port every node publishes on, the floor every peer can reach.
+func (f *Fabric) tcpPort() fabricPort {
+	return fabricPort{
+		id:      f.port,
+		trtype:  fabricTrtypeTCP,
+		adrfam:  adrfamOf(f.addr),
+		traddr:  f.addr,
+		trsvcid: strconv.Itoa(f.port),
+	}
+}
+
+// rdmaPortSpec is the RDMA port this node publishes, if it declares one.
+func (f *Fabric) rdmaPortSpec() (fabricPort, bool) {
+	if f.rdmaAddr == "" {
+		return fabricPort{}, false
+	}
+
+	host, port := splitRDMAAddr(f.rdmaAddr, f.rdmaPort)
+
+	return fabricPort{
+		id:      port,
+		trtype:  fabricTrtypeRDMA,
+		adrfam:  adrfamOf(host),
+		traddr:  host,
+		trsvcid: strconv.Itoa(port),
+	}, true
+}
+
+// livePorts lists the ports subsystems are linked into this pass.
+func (f *Fabric) livePorts() []fabricPort {
+	ports := []fabricPort{f.tcpPort()}
+
+	if spec, ok := f.rdmaPortSpec(); ok && f.rdmaLive {
+		ports = append(ports, spec)
+	}
+
+	return ports
+}
+
+// AdvertisedRDMAAddr is the RDMA address to publish for peers, empty until the
+// RDMA port is actually listening.
+//
+// Advertising only what was achieved is what makes a missing or broken RDMA
+// setup cost latency rather than connectivity: a peer selects RDMA on the
+// strength of this address, so a node that could not bring its port up is
+// simply dialled over TCP, and starts being dialled over RDMA the moment a
+// later pass succeeds.
+func (f *Fabric) AdvertisedRDMAAddr() string {
+	if !f.rdmaLive {
+		return ""
+	}
+
+	spec, ok := f.rdmaPortSpec()
+	if !ok {
+		return ""
+	}
+
+	return net.JoinHostPort(spec.traddr, spec.trsvcid)
+}
+
+// ensurePorts creates this node's listening ports and reports whether RDMA came
+// up. A TCP failure is fatal to the pass; an RDMA failure is not, because TCP
+// alone is a working fabric.
+func (f *Fabric) ensurePorts() error {
+	f.rdmaLive = false
+
+	if err := f.ensurePort(f.tcpPort()); err != nil {
+		return err
+	}
+
+	spec, ok := f.rdmaPortSpec()
+	if !ok {
+		return nil
+	}
+
+	if err := f.ensurePort(spec); err != nil {
+		return fmt.Errorf(
+			"publish rdma port %d (continuing over tcp): %w: "+
+				"load the RDMA target and host modules (modprobe nvmet_rdma nvme_rdma) "+
+				"and check that %s is an address on an RDMA-capable interface",
+			spec.id, err, spec.traddr)
+	}
+
+	f.rdmaLive = true
+
+	return nil
+}
+
+// ensurePort creates one nvmet port and sets its transport attributes.
+//
+// All of racer's subsystems share a port per transport: they differ by NQN, not
+// by address, and a per-subsystem port would burn one listening socket per
+// universe for no benefit.
+func (f *Fabric) ensurePort(spec fabricPort) error {
+	port := filepath.Join(f.nvmetRoot, "ports", strconv.Itoa(spec.id))
 
 	if err := ensureDir(port); err != nil {
+		return err
+	}
+
+	// As with a subsystem's children: configfs creates this, and saying so
+	// costs one tolerated EEXIST.
+	if err := ensureDir(filepath.Join(port, "subsystems")); err != nil {
 		return err
 	}
 
@@ -359,24 +543,35 @@ func (f *Fabric) ensurePortLink(nqn string) error {
 		return fmt.Errorf("read %s/subsystems: %w", port, err)
 	}
 
-	if len(links) == 0 {
-		for attr, value := range map[string]string{
-			"addr_trtype":  fabricTrtype,
-			"addr_adrfam":  fabricAdrfam,
-			"addr_traddr":  f.addr,
-			"addr_trsvcid": strconv.Itoa(f.port),
-		} {
-			if err := writeAttr(filepath.Join(port, attr), value); err != nil {
-				return err
-			}
+	if len(links) > 0 {
+		return nil
+	}
+
+	for attr, value := range map[string]string{
+		"addr_trtype":  spec.trtype,
+		"addr_adrfam":  spec.adrfam,
+		"addr_traddr":  spec.traddr,
+		"addr_trsvcid": spec.trsvcid,
+	} {
+		if err := writeAttr(filepath.Join(port, attr), value); err != nil {
+			return err
 		}
 	}
 
-	link := filepath.Join(port, "subsystems", nqn)
+	return nil
+}
+
+// linkSubsystem exposes one subsystem on every port that came up, so a single
+// namespace answers on both transports at once.
+func (f *Fabric) linkSubsystem(nqn string) error {
 	target := filepath.Join(f.nvmetRoot, "subsystems", nqn)
 
-	if err := os.Symlink(target, link); err != nil && !errors.Is(err, os.ErrExist) {
-		return fmt.Errorf("link %s into port: %w", nqn, err)
+	for _, spec := range f.livePorts() {
+		link := filepath.Join(f.nvmetRoot, "ports", strconv.Itoa(spec.id), "subsystems", nqn)
+
+		if err := os.Symlink(target, link); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("link %s into port %d: %w", nqn, spec.id, err)
+		}
 	}
 
 	return nil
@@ -430,14 +625,24 @@ func (f *Fabric) pruneSubsystems(plan FabricPlan) error {
 }
 
 // removeSubsystem tears one subsystem down in the order configfs requires:
-// unlink from the port, revoke every host, disable and drop the namespace, then
-// remove the subsystem itself.
+// unlink from every port, revoke every host, disable and drop the namespace,
+// then remove the subsystem itself.
 func (f *Fabric) removeSubsystem(nqn string) error {
 	subsystem := filepath.Join(f.nvmetRoot, "subsystems", nqn)
 
-	if err := os.Remove(filepath.Join(f.nvmetRoot, "ports", strconv.Itoa(f.port), "subsystems", nqn)); err != nil &&
-		!errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("unlink %s from port: %w", nqn, err)
+	// Every port this node could have linked it into, not just the ones it
+	// publishes now: an RDMA address that was withdrawn must still have its
+	// link cleaned up, or configfs refuses to remove the subsystem.
+	ports, err := os.ReadDir(filepath.Join(f.nvmetRoot, "ports"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read %s/ports: %w", f.nvmetRoot, err)
+	}
+
+	for _, port := range ports {
+		link := filepath.Join(f.nvmetRoot, "ports", port.Name(), "subsystems", nqn)
+		if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("unlink %s from port %s: %w", nqn, port.Name(), err)
+		}
 	}
 
 	allowed := filepath.Join(subsystem, "allowed_hosts")
@@ -460,16 +665,61 @@ func (f *Fabric) removeSubsystem(nqn string) error {
 			return err
 		}
 
-		if err := os.Remove(ns); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeObject(ns); err != nil {
 			return fmt.Errorf("remove namespace of %s: %w", nqn, err)
 		}
 	}
 
-	if err := os.Remove(subsystem); err != nil && !errors.Is(err, os.ErrNotExist) {
+	for _, child := range []string{"allowed_hosts", "namespaces"} {
+		if err := removeObject(filepath.Join(subsystem, child)); err != nil {
+			return fmt.Errorf("remove %s of %s: %w", child, nqn, err)
+		}
+	}
+
+	if err := removeObject(subsystem); err != nil {
 		return fmt.Errorf("remove subsystem %s: %w", nqn, err)
 	}
 
 	return nil
+}
+
+// removeObject removes a configfs object directory.
+//
+// configfs lets an object's directory be removed while its attribute files are
+// still there, and refuses to let those files be unlinked on their own, so the
+// plain rmdir is the whole operation there. The retry exists so the same code
+// drives an ordinary directory, where the attributes this file wrote are real
+// files and do hold the directory open. Directories and symlinks are never
+// swept: a namespace that is still linked into a port must fail loudly rather
+// than be forced.
+func removeObject(path string) error {
+	err := os.Remove(path)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if !errors.Is(err, syscall.ENOTEMPTY) {
+		return err
+	}
+
+	entries, readErr := os.ReadDir(path)
+	if readErr != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			return err
+		}
+	}
+
+	for _, entry := range entries {
+		if removeErr := os.Remove(filepath.Join(path, entry.Name())); removeErr != nil {
+			return err
+		}
+	}
+
+	return os.Remove(path)
 }
 
 // attach connects one remote namespace and reports the local device path it
@@ -491,6 +741,11 @@ func (f *Fabric) attach(imp FabricImportRequest) (string, error) {
 		return "", err
 	}
 
+	trtype := imp.Trtype
+	if trtype == "" {
+		trtype = fabricTrtypeTCP
+	}
+
 	if controller, ok, err := f.findController(imp.NQN); err != nil {
 		return "", err
 	} else if ok {
@@ -502,8 +757,8 @@ func (f *Fabric) attach(imp FabricImportRequest) (string, error) {
 		HostNQN: f.HostNQN(f.nodeID),
 		Traddr:  host,
 		Trsvcid: port,
-		Trtype:  fabricTrtype,
-		Adrfam:  fabricAdrfam,
+		Trtype:  trtype,
+		Adrfam:  adrfamOf(host),
 	})
 	if err != nil {
 		return "", err
@@ -674,13 +929,51 @@ func (c fabricsConnector) Disconnect(controller string) error {
 	return nil
 }
 
+// splitFabricAddr splits a published "host:port" into its parts.
+//
+// net.SplitHostPort rather than a cut on the last colon because an IPv6
+// literal is written [fd00::1]:4420 and a naive split would hand the kernel
+// half an address.
 func splitFabricAddr(addr string) (string, string, error) {
-	host, port, ok := strings.Cut(addr, ":")
-	if !ok || host == "" || port == "" {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || port == "" {
 		return "", "", fmt.Errorf("peer address %q is not host:port", addr)
 	}
 
 	return host, port, nil
+}
+
+// splitRDMAAddr reads an operator-supplied RDMA address, which may name a port
+// or leave it to the cluster default.
+//
+// The bare form is the common one: an administrator knows the IP of the node's
+// RDMA NIC and has no reason to care which service id nvmet listens on, and
+// leaving it out keeps every node in the cluster on the same one, which is what
+// lets a peer dial without being told.
+func splitRDMAAddr(addr string, fallback int) (string, int) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return strings.Trim(addr, "[]"), fallback
+	}
+
+	value, err := strconv.Atoi(port)
+	if err != nil || value <= 0 {
+		return host, fallback
+	}
+
+	return host, value
+}
+
+// adrfamOf is the nvmet address family of a transport address. Anything that
+// does not parse as an IP is reported as IPv4, which is what a hostname in a
+// v4 cluster resolves to and what nvmet will reject loudly if it is wrong.
+func adrfamOf(host string) string {
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip != nil && ip.To4() == nil {
+		return adrfamIPv6
+	}
+
+	return adrfamIPv4
 }
 
 // ensureDir creates a configfs directory, treating an existing one as success.

@@ -34,11 +34,12 @@ func BuildClusterState(
 	nodes []*corev1.Node,
 	classes []*storagev1.StorageClass,
 	volumes []*corev1.PersistentVolume,
+	memberships []*corev1.ConfigMap,
 	log *slog.Logger,
 ) racerctrl.ClusterState {
 	state := racerctrl.ClusterState{
 		Nodes:     buildNodeStates(nodes, log),
-		Universes: buildUniverseStates(classes, volumes, log),
+		Universes: buildUniverseStates(classes, volumes, memberships, log),
 	}
 
 	return state
@@ -74,6 +75,7 @@ func buildNodeStates(nodes []*corev1.Node, log *slog.Logger) []racerctrl.NodeSta
 func buildUniverseStates(
 	classes []*storagev1.StorageClass,
 	volumes []*corev1.PersistentVolume,
+	memberships []*corev1.ConfigMap,
 	log *slog.Logger,
 ) []racerctrl.UniverseState {
 	byClass := make(map[string]*racerctrl.UniverseState, len(classes))
@@ -103,8 +105,35 @@ func buildUniverseStates(
 
 	sort.Slice(states, func(i, j int) bool { return states[i].ID < states[j].ID })
 
+	byID := make(map[uint32]*racerctrl.UniverseState, len(states))
+
 	for i := range states {
 		byClass[states[i].Class] = &states[i]
+		byID[states[i].ID] = &states[i]
+	}
+
+	for _, membership := range memberships {
+		universeID, zone, ok := racerctrl.ParseMembershipLabels(membership.Labels)
+		if !ok {
+			continue
+		}
+
+		universe, ok := byID[universeID]
+		if !ok {
+			// A membership for a universe this node cannot see. Either the
+			// class was deleted or the informer caught the ConfigMap first.
+			continue
+		}
+
+		members, err := racerctrl.ParseMembership(membership.Data[racerctrl.MembershipDataKey])
+		if err != nil {
+			log.Warn("ignoring unreadable membership",
+				"configMap", membership.Name, "error", err)
+
+			continue
+		}
+
+		universe.Members[zone] = members
 	}
 
 	for _, volume := range volumes {
@@ -228,17 +257,48 @@ func PlanFabric(
 					continue
 				}
 
+				trtype, addr := transportTo(fabric, self, peer, export)
+
 				plan.Imports = append(plan.Imports, FabricImportRequest{
 					UniverseID: universe.ID,
 					PeerNodeID: peerID,
 					NQN:        export.NQN,
-					Addr:       export.Addr,
+					Addr:       addr,
+					Trtype:     trtype,
 				})
 			}
 		}
 	}
 
 	return plan
+}
+
+// transportTo picks how to dial one peer, and the address to dial.
+//
+// RDMA when both ends declare the same fabric and the peer has advertised a
+// listening RDMA port, TCP otherwise. Fabric identity is the first test: RDMA
+// reachability is a property of the physical network a node is cabled into,
+// which nothing in Kubernetes knows and no probe from here could establish
+// cheaply, so it is declared. The peer's advertisement is the second: it
+// appears only once that node's nvmet RDMA port is actually up, which makes
+// bring-up the same two-round handshake the NQN and TCP address already use,
+// and keeps a half-configured node reachable rather than isolated.
+func transportTo(
+	fabric *Fabric,
+	self, peer racerctrl.NodeState,
+	export racerctrl.FabricExport,
+) (string, string) {
+	sameFabric := self.FabricID != "" && self.FabricID == peer.FabricID
+	if !sameFabric || self.RDMAAddr == "" || export.RDMAAddr == "" {
+		return fabricTrtypeTCP, export.Addr
+	}
+
+	addr := fabric.RDMAAddress(export.RDMAAddr)
+	if addr == "" {
+		return fabricTrtypeTCP, export.Addr
+	}
+
+	return fabricTrtypeRDMA, addr
 }
 
 // universeJoinsNode reports whether this node has any business in a universe:

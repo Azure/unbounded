@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -56,6 +57,40 @@ func enrolledNode(name, zone string, annotations map[string]string) *corev1.Node
 			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
 		},
 	}
+}
+
+// membershipMap builds the per-zone membership ConfigMap the operator writes
+// and the node agents read.
+func membershipMap(universe, zone uint32, members string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      racerctrl.MembershipConfigMapName(universe, zone),
+			Namespace: component.DefaultNamespace,
+			Labels:    racerctrl.MembershipLabels(universe, zone),
+		},
+		Data: map[string]string{racerctrl.MembershipDataKey: members},
+	}
+}
+
+// zoneMembership reads a zone's published membership back out of its ConfigMap.
+func zoneMembership(ctx context.Context, t *testing.T, env *component.Env, universe, zone uint32) string {
+	t.Helper()
+
+	found := &corev1.ConfigMap{}
+	key := client.ObjectKey{
+		Namespace: env.Namespace,
+		Name:      racerctrl.MembershipConfigMapName(universe, zone),
+	}
+
+	if err := env.Client.Get(ctx, key, found); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ""
+		}
+
+		t.Fatalf("get membership configmap: %v", err)
+	}
+
+	return found.Data[racerctrl.MembershipDataKey]
 }
 
 func racerClass(name string, annotations map[string]string) *storagev1.StorageClass {
@@ -415,8 +450,8 @@ func TestPlaceVolumeStampsCompositionAndFinalizer(t *testing.T) {
 			racerctrl.CatalogSizeAnnotation: "3",
 			racerctrl.EpochAnnotation:       "1",
 			racerctrl.NextLBAAnnotation:     "0",
-			racerctrl.MembersAnnotation(1):  "1?cohort=0,2?cohort=1,3?cohort=2",
 		}),
+		membershipMap(1, 1, "1?cohort=0,2?cohort=1,3?cohort=2"),
 		racerVolume("pv-a", "fast", "68Mi", map[string]string{
 			racerctrl.AttrMutableBytes:      "4Mi",
 			racerctrl.AttrMutableKind:       "OCC",
@@ -507,8 +542,8 @@ func TestPlaceVolumeIsIdempotent(t *testing.T) {
 			racerctrl.CatalogSizeAnnotation: "3",
 			racerctrl.EpochAnnotation:       "1",
 			racerctrl.NextLBAAnnotation:     "0",
-			racerctrl.MembersAnnotation(1):  "1?cohort=0,2?cohort=1,3?cohort=2",
 		}),
+		membershipMap(1, 1, "1?cohort=0,2?cohort=1,3?cohort=2"),
 		racerVolume("pv-a", "fast", "64Mi", nil),
 	}
 
@@ -592,14 +627,9 @@ func TestReconcileMembershipPublishesABalancedZone(t *testing.T) {
 		t.Fatalf("reconcile membership: %v", err)
 	}
 
-	class := &storagev1.StorageClass{}
-	if err := env.Client.Get(ctx, client.ObjectKey{Name: "fast"}, class); err != nil {
-		t.Fatalf("get class: %v", err)
-	}
-
-	raw := class.Annotations[racerctrl.MembersAnnotation(1)]
+	raw := zoneMembership(ctx, t, env, 1, 1)
 	if raw == "" {
-		t.Fatalf("zone 1 has no membership: %v (waiting: %v)", class.Annotations, p.waiting)
+		t.Fatalf("zone 1 has no membership (waiting: %v)", p.waiting)
 	}
 
 	members, err := racerctrl.ParseMembership(raw)
@@ -695,12 +725,7 @@ func TestReconcileMembershipWaitsWhileHealing(t *testing.T) {
 		t.Fatalf("reconcile membership: %v", err)
 	}
 
-	class := &storagev1.StorageClass{}
-	if err := env.Client.Get(ctx, client.ObjectKey{Name: "fast"}, class); err != nil {
-		t.Fatalf("get class: %v", err)
-	}
-
-	if class.Annotations[racerctrl.MembersAnnotation(1)] != "" {
+	if zoneMembership(ctx, t, env, 1, 1) != "" {
 		t.Fatal("membership was published while a node was still replaying")
 	}
 
@@ -712,8 +737,9 @@ func TestReconcileMembershipWaitsWhileHealing(t *testing.T) {
 func TestReconcileStateReportsBlockedGatesAsNotReady(t *testing.T) {
 	ctx := context.Background()
 
-	// An enrolled node with no zone label cannot be given an identity, so the
-	// pass has something to wait on.
+	// A lone enrolled node cannot form a balanced membership, and the pass has
+	// to create the default storage class before it can do anything at all, so
+	// there is something to wait on.
 	node := enrolledNode("n1", "", nil)
 	delete(node.Labels, ZoneLabel)
 
@@ -742,9 +768,9 @@ func TestReconcileStateIsReadyWhenSettled(t *testing.T) {
 			racerctrl.CatalogSizeAnnotation: "3",
 			racerctrl.EpochAnnotation:       "1",
 			racerctrl.NextLBAAnnotation:     "0",
-			racerctrl.MembersAnnotation(1):  "1?cohort=0,2?cohort=1,3?cohort=2",
 			racerctrl.GatewaysAnnotation(1): "1,2,3",
 		}),
+		membershipMap(1, 1, "1?cohort=0,2?cohort=1,3?cohort=2"),
 	}
 
 	for i, name := range []string{"n1", "n2", "n3"} {

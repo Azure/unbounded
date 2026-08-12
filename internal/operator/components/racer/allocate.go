@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/racerctrl"
 )
 
@@ -98,7 +99,15 @@ func (p *pass) ensureDefaultClass(ctx context.Context) error {
 // claiming concurrently would each patch a different Node object and both would
 // succeed, which is how you end up with two machines answering to the same id
 // and a replication group that silently has two copies instead of three.
+//
+// The zone and the cohort are worked out by racerctrl.NewPlacer unless the node
+// named a zone itself, in which case that wins. Placement is a function of the
+// cursors and of what is already placed, and the cursors are committed before
+// any node is stamped, so a crash in the middle leaks ids rather than placing a
+// node twice.
 func (p *pass) allocateNodeIdentities(ctx context.Context) error {
+	placer := racerctrl.NewPlacer(&p.cursors, p.placedNodes(), p.unplacedNodes())
+
 	for i := range p.nodes {
 		view := &p.nodes[i]
 
@@ -106,19 +115,9 @@ func (p *pass) allocateNodeIdentities(ctx context.Context) error {
 			continue
 		}
 
-		zoneName := view.node.Labels[ZoneLabel]
-		if zoneName == "" {
-			// A racer zone is a failure domain, and inventing one for a node
-			// that has not declared one would put it in a catalog whose blast
-			// radius nobody has reasoned about.
-			p.wait("node %s has no %s label", view.node.Name, ZoneLabel)
-
-			continue
-		}
-
-		zone, err := p.cursors.ZoneID(zoneName)
+		placement, err := placer.Place(p.placementNode(view))
 		if err != nil {
-			return fmt.Errorf("allocate zone id for %s: %w", zoneName, err)
+			return err
 		}
 
 		id, err := p.cursors.AllocateNodeID()
@@ -126,52 +125,118 @@ func (p *pass) allocateNodeIdentities(ctx context.Context) error {
 			return fmt.Errorf("allocate node id for %s: %w", view.node.Name, err)
 		}
 
-		cohort := p.leastLoadedCohort(zone)
-
+		// Committed before the node is stamped, always. A crash in between
+		// leaks a zone id and a node id, both of which were never reusable
+		// anyway; the other order would hand the same id to two machines.
 		if err := p.commitCursors(ctx); err != nil {
 			return err
 		}
 
 		err = p.patchNode(ctx, view, map[string]string{
 			racerctrl.NodeIDAnnotation:     formatUint(uint64(id)),
-			racerctrl.NodeZoneAnnotation:   formatUint(uint64(zone)),
-			racerctrl.NodeCohortAnnotation: formatUint(uint64(cohort)),
+			racerctrl.NodeZoneAnnotation:   formatUint(uint64(placement.Zone)),
+			racerctrl.NodeCohortAnnotation: formatUint(uint64(placement.Cohort)),
 		})
 		if err != nil {
 			return err
 		}
 	}
 
+	p.reportPlacementDrift()
+
 	return nil
 }
 
-// leastLoadedCohort picks the cohort a new node in a zone should join.
-//
-// A trio takes one node from each cohort, so a zone's catalog can only be
-// balanced when its three cohorts are the same size. Filling the smallest cohort
-// first is what keeps them level as nodes arrive one at a time.
-func (p *pass) leastLoadedCohort(zone uint32) uint32 {
-	var counts [racerctrl.Cohorts]int
+// placementNode reads the inputs placement takes off a Node object.
+func (p *pass) placementNode(view *nodeView) racerctrl.PlacementNode {
+	return racerctrl.PlacementNode{
+		Name:     view.node.Name,
+		Site:     nodeSite(view.node),
+		AZ:       view.node.Labels[ZoneLabel],
+		Fabric:   view.node.Annotations[racerctrl.NodeFabricIDAnnotation],
+		ZoneName: view.node.Annotations[racerctrl.NodeZoneNameAnnotation],
+	}
+}
+
+// placedNodes is the census placement balances against: every node that already
+// holds an identity, whether or not it is still enrolled. A node on its way out
+// still occupies its cohort until the catalog has let go of it.
+func (p *pass) placedNodes() []racerctrl.PlacedNode {
+	placed := make([]racerctrl.PlacedNode, 0, len(p.nodes))
 
 	for _, view := range p.nodes {
-		if view.state.ID == 0 || view.state.Zone != zone {
+		if view.state.ID == 0 {
 			continue
 		}
 
-		if int(view.state.Cohort) < racerctrl.Cohorts {
-			counts[view.state.Cohort]++
-		}
+		placed = append(placed, racerctrl.PlacedNode{
+			Zone:   view.state.Zone,
+			Cohort: view.state.Cohort,
+			AZ:     view.node.Labels[ZoneLabel],
+			Fabric: view.state.FabricID,
+		})
 	}
 
-	best := 0
+	return placed
+}
 
-	for cohort := 1; cohort < racerctrl.Cohorts; cohort++ {
-		if counts[cohort] < counts[best] {
-			best = cohort
+// unplacedNodes is every enrolled node still waiting for an identity. It is
+// what decides whether a fabric has enough nodes waiting to be worth a zone of
+// its own, so it has to be the whole batch rather than the one node in hand.
+func (p *pass) unplacedNodes() []racerctrl.PlacementNode {
+	unplaced := make([]racerctrl.PlacementNode, 0, len(p.nodes))
+
+	for i := range p.nodes {
+		view := &p.nodes[i]
+		if !view.enrolled || view.state.ID != 0 {
+			continue
 		}
+
+		unplaced = append(unplaced, p.placementNode(view))
 	}
 
-	return uint32(best)
+	return unplaced
+}
+
+// reportPlacementDrift notes nodes whose site or availability zone no longer
+// matches where they were placed.
+//
+// Nothing is done about it. A zone and a cohort are frozen once stamped: a
+// cohort is the node's column in every trio it holds, and a zone is the catalog
+// it is a member of, which moves one node at a time. Moving a live node would
+// be a decommission and a re-enrolment, which is an operator's decision.
+func (p *pass) reportPlacementDrift() {
+	for i := range p.nodes {
+		view := &p.nodes[i]
+		if view.state.ID == 0 || view.state.Zone == 0 {
+			continue
+		}
+
+		def, ok := p.cursors.ZoneDefs[view.state.Zone]
+		if !ok {
+			continue
+		}
+
+		placement := racerctrl.Placement{Zone: view.state.Zone, Cohort: view.state.Cohort}
+
+		drift := racerctrl.PlacementDrift(p.placementNode(view), placement, def,
+			p.cursors.ZoneBuckets[view.state.Zone])
+		if drift != "" {
+			p.wait("%s", drift)
+		}
+	}
+}
+
+// nodeSite is the unbounded site a node belongs to. The deprecated label is
+// still read because per-site components are mid-migration onto the canonical
+// one, and placement must not split a site across two zones because half its
+// nodes carry the old key.
+func nodeSite(node *corev1.Node) string {
+	if site := node.Labels[component.SiteLabelKey]; site != "" {
+		return site
+	}
+
+	return node.Labels[component.DeprecatedSiteLabelKey]
 }
 
 // allocateUniverses stamps the fields that make a StorageClass a universe.
@@ -273,16 +338,22 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 		return p.reconcileGateways(ctx, view, zone, current)
 	}
 
-	annotations := map[string]string{
-		racerctrl.MembersAnnotation(zone): racerctrl.FormatMembership(step.Next),
-		// Every membership change is a new configuration of the universe, and
-		// the epoch is what orders those configurations. It moves with the
-		// membership rather than on its own schedule so a node can tell a stale
-		// catalog from a current one without comparing the catalogs themselves.
-		racerctrl.EpochAnnotation: formatUint(uint64(view.state.Epoch) + 1),
+	// The membership itself goes in the zone's own ConfigMap; only the epoch is
+	// on the class. Every membership change is a new configuration of the
+	// universe, and the epoch is what orders those configurations. It moves
+	// with the membership rather than on its own schedule so a node can tell a
+	// stale catalog from a current one without comparing the catalogs
+	// themselves.
+	if err := p.writeMembership(ctx, view.state.ID, zone, step.Next); err != nil {
+		return err
 	}
 
-	if err := p.patchClass(ctx, view, annotations); err != nil {
+	view.state.Members[zone] = step.Next
+
+	err = p.patchClass(ctx, view, map[string]string{
+		racerctrl.EpochAnnotation: formatUint(uint64(view.state.Epoch) + 1),
+	})
+	if err != nil {
 		return err
 	}
 
@@ -294,14 +365,18 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 // reconcileGateways publishes the nodes other zones may route through.
 //
 // A zone needs at least one gateway that is also a peer or its neighbours cannot
-// reach it at all, and the schema caps the list at 64. Publishing the whole
-// membership up to that cap spreads cross-zone traffic instead of funnelling it
-// through whichever node happened to be listed first.
+// reach it at all, and the schema caps the list at 64. How many below that cap
+// is the knob that decides how much two zones overlap: every node in every
+// other zone holds an NVMe-oF controller per gateway, so a wide list costs
+// controllers everywhere, and a narrow one funnels cross-zone traffic through
+// fewer machines.
+//
+// Which members are chosen is racerctrl.SelectGateways: bridge nodes first,
+// because a member sitting on another zone's fabric reaches that zone without
+// leaving RDMA, then round-robin across cohorts so an availability zone going
+// down does not take the whole gateway list with it.
 func (p *pass) reconcileGateways(ctx context.Context, view *universeView, zone uint32, members racerctrl.Membership) error {
-	ids := members.NodeIDs()
-	if len(ids) > racerctrl.MaxGateways {
-		ids = ids[:racerctrl.MaxGateways]
-	}
+	ids := racerctrl.SelectGateways(members, p.bridgeNodes(zone), int(view.state.GatewayCount))
 
 	desired := racerctrl.FormatUint32List(ids)
 	if view.class.Annotations[racerctrl.GatewaysAnnotation(zone)] == desired {
@@ -309,6 +384,32 @@ func (p *pass) reconcileGateways(ctx context.Context, view *universeView, zone u
 	}
 
 	return p.patchClass(ctx, view, map[string]string{racerctrl.GatewaysAnnotation(zone): desired})
+}
+
+// bridgeNodes is the set of node ids in a zone whose fabric is not the zone's
+// own. Those are the nodes another zone can reach over RDMA, which is what
+// makes them the gateways worth having.
+func (p *pass) bridgeNodes(zone uint32) map[uint32]bool {
+	def, ok := p.cursors.ZoneDefs[zone]
+	if !ok {
+		return nil
+	}
+
+	bridges := map[uint32]bool{}
+
+	for _, view := range p.nodes {
+		if view.state.ID == 0 || view.state.Zone != zone {
+			continue
+		}
+
+		// A node with no fabric at all bridges nothing: there is no other
+		// fabric it is closer to than anyone else is.
+		if view.state.FabricID != "" && view.state.FabricID != def.Fabric {
+			bridges[view.state.ID] = true
+		}
+	}
+
+	return bridges
 }
 
 // zones returns every zone that has at least one node with an identity, lowest

@@ -41,16 +41,53 @@ const (
 	// NextZoneIDKey holds the next zone id to hand out.
 	NextZoneIDKey = "next-zone-id"
 
-	// ZoneKeyPrefix prefixes one key per known failure domain, mapping the
-	// Kubernetes zone name to the numeric zone id the schema uses. The mapping
+	// ZoneKeyPrefix prefixes one key per declared failure domain, mapping the
+	// name a node asked for to the numeric zone id the schema uses. The mapping
 	// is recorded rather than derived because a zone id appears in every node's
 	// config and in every extent's home, so a hash change or a renamed label
 	// would silently repartition the cluster.
 	ZoneKeyPrefix = "zone-"
+
+	// ZoneDefKeyPrefix prefixes one key per zone recording the site and fabric
+	// it was minted for, as `site=<s>&fabric=<f>`. Placement needs a zone's site
+	// to refuse to cross one and its fabric to prefer staying on one, and
+	// neither can be recovered from the nodes: the last node of a zone may leave
+	// and the zone still exists.
+	//
+	// The prefix deliberately does not begin with ZoneKeyPrefix, which is parsed
+	// as a name mapping over the whole ConfigMap.
+	ZoneDefKeyPrefix = "zonedef-"
+
+	// ZoneBucketsKeyPrefix prefixes one key per zone mapping an availability
+	// zone to the cohort bucket its nodes join, as `<az>=<0|1|2>&...`. The map
+	// is append-only: a trio takes one node from each cohort, so a cohort that
+	// is one availability zone makes every trio span three of them, and moving
+	// an existing entry would change a node's cohort, which is frozen for life.
+	ZoneBucketsKeyPrefix = "zonebuckets-"
+
+	// ZoneTargetKey holds how many nodes a zone is filled to before placement
+	// mints a new one. Absent means DefaultZoneTarget. It is a key rather than a
+	// constant so an operator can retune it without a rebuild.
+	//
+	// Named so that it does not begin with ZoneKeyPrefix.
+	ZoneTargetKey = "target-zone-size"
 )
 
 // AllocationsConfigMapName is the ConfigMap holding the cluster-wide cursors.
 const AllocationsConfigMapName = "racer-allocations"
+
+// ZoneDef is what a zone was minted for. Placement never crosses a site and
+// prefers to stay on a fabric, and both facts have to outlive the nodes that
+// caused them.
+type ZoneDef struct {
+	// Site is the unbounded site the zone belongs to. A zone never spans two.
+	Site string
+
+	// Fabric is the fabric the zone was seeded on, empty for a zone that was
+	// minted without one. Nodes on other fabrics may still join; it is a
+	// preference and the identity of the zone's "home" fabric, not a filter.
+	Fabric string
+}
 
 // Cursors is the parsed content of the allocations ConfigMap. The zero value is
 // the state of a cluster that has never allocated anything; every cursor is
@@ -61,8 +98,19 @@ type Cursors struct {
 	NextNodeID     uint32
 	NextZoneID     uint32
 
-	// Zones maps a Kubernetes failure-domain name to its numeric zone id.
+	// Zones maps a declared zone name to its numeric zone id.
 	Zones map[string]uint32
+
+	// ZoneDefs records what each zone was minted for, keyed by zone id.
+	ZoneDefs map[uint32]ZoneDef
+
+	// ZoneBuckets maps an availability zone to a cohort bucket, per zone id.
+	// Append-only: an entry is never moved once written.
+	ZoneBuckets map[uint32]map[string]uint32
+
+	// ZoneTarget is how many nodes a zone is filled to before a new one is
+	// minted. Zero means DefaultZoneTarget.
+	ZoneTarget uint32
 }
 
 // ParseCursors reads the cursors out of a ConfigMap's data. Missing keys start
@@ -74,6 +122,8 @@ func ParseCursors(data map[string]string) (Cursors, error) {
 		NextNodeID:     1,
 		NextZoneID:     1,
 		Zones:          map[string]uint32{},
+		ZoneDefs:       map[uint32]ZoneDef{},
+		ZoneBuckets:    map[uint32]map[string]uint32{},
 	}
 
 	scalars := []struct {
@@ -84,6 +134,7 @@ func ParseCursors(data map[string]string) (Cursors, error) {
 		{key: NextExtentIDKey, target: &cursors.NextExtentID},
 		{key: NextNodeIDKey, target: &cursors.NextNodeID},
 		{key: NextZoneIDKey, target: &cursors.NextZoneID},
+		{key: ZoneTargetKey, target: &cursors.ZoneTarget},
 	}
 
 	for _, scalar := range scalars {
@@ -103,24 +154,95 @@ func ParseCursors(data map[string]string) (Cursors, error) {
 	}
 
 	for key, raw := range data {
-		name, ok := strings.CutPrefix(key, ZoneKeyPrefix)
-		if !ok || name == "" {
-			continue
-		}
+		switch {
+		case strings.HasPrefix(key, ZoneDefKeyPrefix):
+			zone, err := ParseUint32(strings.TrimPrefix(key, ZoneDefKeyPrefix))
+			if err != nil || zone == 0 {
+				return Cursors{}, fmt.Errorf("%s: zone id must be a non-zero number", key)
+			}
 
-		value, err := ParseUint32(raw)
-		if err != nil {
-			return Cursors{}, fmt.Errorf("%s: %w", key, err)
-		}
+			values, err := url.ParseQuery(raw)
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
 
-		if value == 0 {
-			return Cursors{}, fmt.Errorf("%s: zone id must not be zero", key)
-		}
+			cursors.ZoneDefs[zone] = ZoneDef{
+				Site:   values.Get(zoneDefSiteKey),
+				Fabric: values.Get(zoneDefFabricKey),
+			}
+		case strings.HasPrefix(key, ZoneBucketsKeyPrefix):
+			zone, err := ParseUint32(strings.TrimPrefix(key, ZoneBucketsKeyPrefix))
+			if err != nil || zone == 0 {
+				return Cursors{}, fmt.Errorf("%s: zone id must be a non-zero number", key)
+			}
 
-		cursors.Zones[name] = value
+			buckets, err := parseZoneBuckets(raw)
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			cursors.ZoneBuckets[zone] = buckets
+		case strings.HasPrefix(key, ZoneKeyPrefix):
+			name := strings.TrimPrefix(key, ZoneKeyPrefix)
+			if name == "" {
+				continue
+			}
+
+			value, err := ParseUint32(raw)
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			if value == 0 {
+				return Cursors{}, fmt.Errorf("%s: zone id must not be zero", key)
+			}
+
+			cursors.Zones[name] = value
+		}
 	}
 
 	return cursors, nil
+}
+
+// Zone bucket and definition query keys.
+const (
+	zoneDefSiteKey   = "site"
+	zoneDefFabricKey = "fabric"
+)
+
+// parseZoneBuckets reads an availability zone to cohort bucket map.
+func parseZoneBuckets(raw string) (map[string]uint32, error) {
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	buckets := make(map[string]uint32, len(values))
+
+	for az := range values {
+		bucket, err := ParseUint32(values.Get(az))
+		if err != nil {
+			return nil, fmt.Errorf("availability zone %q: %w", az, err)
+		}
+
+		if bucket >= Cohorts {
+			return nil, fmt.Errorf("availability zone %q has bucket %d, want 0, 1 or 2", az, bucket)
+		}
+
+		buckets[az] = bucket
+	}
+
+	return buckets, nil
+}
+
+// formatZoneBuckets renders an availability zone to cohort bucket map.
+func formatZoneBuckets(buckets map[string]uint32) string {
+	values := make(url.Values, len(buckets))
+	for az, bucket := range buckets {
+		values.Set(az, strconv.FormatUint(uint64(bucket), 10))
+	}
+
+	return FormatValues(values)
 }
 
 // Data renders the cursors back into ConfigMap data.
@@ -134,6 +256,28 @@ func (c Cursors) Data() map[string]string {
 
 	for name, id := range c.Zones {
 		data[ZoneKeyPrefix+name] = strconv.FormatUint(uint64(id), 10)
+	}
+
+	for zone, def := range c.ZoneDefs {
+		values := url.Values{}
+		values.Set(zoneDefSiteKey, def.Site)
+		values.Set(zoneDefFabricKey, def.Fabric)
+
+		data[ZoneDefKeyPrefix+strconv.FormatUint(uint64(zone), 10)] = FormatValues(values)
+	}
+
+	for zone, buckets := range c.ZoneBuckets {
+		if len(buckets) == 0 {
+			continue
+		}
+
+		data[ZoneBucketsKeyPrefix+strconv.FormatUint(uint64(zone), 10)] = formatZoneBuckets(buckets)
+	}
+
+	// Only written once retuned, so an untouched cluster's ConfigMap stays as
+	// small as it was and the default can change with the code.
+	if c.ZoneTarget != 0 {
+		data[ZoneTargetKey] = strconv.FormatUint(uint64(c.ZoneTarget), 10)
 	}
 
 	return data
@@ -156,6 +300,19 @@ func (c *Cursors) ZoneID(name string) (uint32, error) {
 		return id, nil
 	}
 
+	id, err := c.AllocateZoneID()
+	if err != nil {
+		return 0, err
+	}
+
+	c.Zones[name] = id
+
+	return id, nil
+}
+
+// AllocateZoneID takes the next zone id and advances the cursor, without
+// binding it to a name. Automatic placement mints zones nobody has named.
+func (c *Cursors) AllocateZoneID() (uint32, error) {
 	if c.NextZoneID == 0 {
 		c.NextZoneID = 1
 	}
@@ -166,9 +323,22 @@ func (c *Cursors) ZoneID(name string) (uint32, error) {
 
 	id := c.NextZoneID
 	c.NextZoneID = id + 1
-	c.Zones[name] = id
 
 	return id, nil
+}
+
+// DefineZone records what a zone was minted for. Called once, when the zone is
+// first created; a zone's site and fabric never change.
+func (c *Cursors) DefineZone(zone uint32, def ZoneDef) {
+	if c.ZoneDefs == nil {
+		c.ZoneDefs = map[uint32]ZoneDef{}
+	}
+
+	if _, ok := c.ZoneDefs[zone]; ok {
+		return
+	}
+
+	c.ZoneDefs[zone] = def
 }
 
 // AllocateNodeID takes the next node id and advances the cursor. Node ids are
