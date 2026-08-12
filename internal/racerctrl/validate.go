@@ -691,6 +691,44 @@ func validateMembershipStep(old, next *racerconfig.Universe) error {
 	return nil
 }
 
+// TransitionStride is how far a node's generation has to advance to get from
+// prev to next.
+//
+// Consecutive generations are a step, and a step is held to R6's one-in-one-out
+// rule because the dataplane heals a step by handing one node's groups to one
+// other node. A wider change is not a transient it can reason about, so it is
+// delivered as a settled state instead, by skipping a generation: a node that
+// missed a generation is being told where the universe ended up rather than how
+// it got there.
+//
+// A catalog resize is the case that needs it. Its move is one node per cohort,
+// which is three joins and three departures at once, and publishing that at the
+// next generation is rejected by both this package and the dataplane, so the
+// catalog would never resize at all.
+//
+// The decision is made by asking the step validator, so the stride and the rule
+// it exists to satisfy cannot drift apart.
+func TransitionStride(prev, next *racerconfig.NodeConfig) uint64 {
+	if prev == nil {
+		return 1
+	}
+
+	before := indexUniverses(prev)
+
+	for _, universe := range next.GetUniverses() {
+		old, ok := before[universe.GetId()]
+		if !ok {
+			continue
+		}
+
+		if validateMembershipStep(old, universe) != nil {
+			return 2
+		}
+	}
+
+	return 1
+}
+
 func validateExtentTransitions(old, next *racerconfig.Universe) error {
 	before := make(map[uint32]*racerconfig.Extent, len(old.GetExtents()))
 	for _, extent := range old.GetExtents() {

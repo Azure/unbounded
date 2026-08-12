@@ -435,7 +435,12 @@ func (a *Agent) render() error {
 		return nil
 	}
 
-	candidate.Generation = a.generation + 1
+	// A membership change wider than one node per catalog cannot be published as
+	// a step, so it takes the generation the schema reserves for a settled
+	// state. Deriving the stride here rather than carrying it from the operator
+	// keeps it correct across a restart: it is a fact about the two configs,
+	// and the node has both.
+	candidate.Generation = a.generation + racerctrl.TransitionStride(a.published, candidate)
 
 	changed, err := racerctrl.Publish(a.cfg.ConfigPath(), a.published, candidate)
 	if err != nil {

@@ -266,18 +266,14 @@ func largestDivisorAtMost(n, limit int) int {
 	return 0
 }
 
-// MembershipStep is one move toward a desired membership, with the generation
-// stride the move needs.
+// MembershipStep is one move toward a desired membership.
+//
+// How far a node's generation advances to take the move is not decided here:
+// the nodes derive it from the configs themselves with TransitionStride, which
+// is a fact each node can work out for itself and get right after a restart.
 type MembershipStep struct {
 	// Next is the membership to publish.
 	Next Membership
-
-	// Stride is how far the node generation must advance for the dataplane to
-	// accept the move. A single swap is an incremental handoff and takes one
-	// generation. Anything larger is not a transient the dataplane can reason
-	// about, so it is delivered as a settled state by skipping a generation,
-	// which is the escape hatch the schema names.
-	Stride uint64
 
 	// Done reports that Next already is the desired membership.
 	Done bool
@@ -302,15 +298,15 @@ func NextMembership(current, desired Membership, catalogSize int) (MembershipSte
 	// No usable current membership: this universe has not been published to this
 	// zone before, so there is no handoff to be incremental about.
 	if currentErr != nil || currentPer == 0 {
-		return MembershipStep{Next: desired.Normalized(), Stride: 1}, nil
+		return MembershipStep{Next: desired.Normalized()}, nil
 	}
 
 	if sameMembership(current, desired) {
-		return MembershipStep{Next: current.Normalized(), Stride: 0, Done: true}, nil
+		return MembershipStep{Next: current.Normalized(), Done: true}, nil
 	}
 
 	if currentPer != desiredPer {
-		return MembershipStep{Next: desired.Normalized(), Stride: 2}, nil
+		return MembershipStep{Next: desired.Normalized()}, nil
 	}
 
 	// Same size, different members: swap exactly one node, keeping cohorts intact
@@ -336,10 +332,10 @@ func NextMembership(current, desired Membership, catalogSize int) (MembershipSte
 			next = append(next, member)
 		}
 
-		return MembershipStep{Next: next.Normalized(), Stride: 1}, nil
+		return MembershipStep{Next: next.Normalized()}, nil
 	}
 
-	return MembershipStep{Next: current.Normalized(), Stride: 0, Done: true}, nil
+	return MembershipStep{Next: current.Normalized(), Done: true}, nil
 }
 
 // firstDifference finds the lowest id in current that is absent from desired,

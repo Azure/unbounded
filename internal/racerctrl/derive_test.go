@@ -4,6 +4,8 @@
 package racerctrl
 
 import (
+	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -173,6 +175,37 @@ func TestEpochForFallsBackToTheClassEpoch(t *testing.T) {
 	assert.Equal(t, uint32(4), undated.EpochFor(1))
 }
 
+// The whole point of the stride is that a resized catalog gets installed. This
+// walks the path a node walks: derive, work out how far the generation has to
+// move for the transition to be legal, and publish.
+func TestPublishInstallsAResizedCatalog(t *testing.T) {
+	d := attachedDerivation()
+	d.Cluster.Universes[0].CatalogSize = 2
+
+	previous, err := Derive(d)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "racer.binpb")
+
+	changed, err := Publish(path, nil, previous)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	grown := resizedDerivation()
+	grown.Cluster.Universes[0].CatalogSize = 2
+
+	next, err := Derive(grown)
+	require.NoError(t, err)
+
+	next.Generation = previous.GetGeneration() + TransitionStride(previous, next)
+
+	changed, err = Publish(path, previous, next)
+	require.NoError(t, err, "a resize the node cannot publish is a catalog that can never grow")
+	assert.True(t, changed)
+	assert.Equal(t, previous.GetGeneration()+2, next.GetGeneration(),
+		"the resize is delivered as a settled state, not as a step")
+}
+
 // bootstrapDerivation is a three node zone with one volume where nothing has
 // been attached yet, which is what every node sees on a cold cluster.
 func bootstrapDerivation() Derivation {
@@ -215,6 +248,26 @@ func attachedDerivation() Derivation {
 	d.Attachments = map[Attachment]string{
 		{Universe: 1, Peer: 2}: "/dev/nvme1n1",
 		{Universe: 1, Peer: 3}: "/dev/nvme2n1",
+	}
+
+	return d
+}
+
+// resizedDerivation is the same zone after three more nodes joined its catalog,
+// which is a move of one node per cohort at once.
+func resizedDerivation() Derivation {
+	d := attachedDerivation()
+	d.Cluster.Universes[0].Members[1] = Membership{
+		{NodeID: 1, Cohort: 0},
+		{NodeID: 4, Cohort: 0},
+		{NodeID: 2, Cohort: 1},
+		{NodeID: 5, Cohort: 1},
+		{NodeID: 3, Cohort: 2},
+		{NodeID: 6, Cohort: 2},
+	}
+
+	for peer := uint32(2); peer <= 6; peer++ {
+		d.Attachments[Attachment{Universe: 1, Peer: peer}] = fmt.Sprintf("/dev/nvme%dn1", peer)
 	}
 
 	return d
