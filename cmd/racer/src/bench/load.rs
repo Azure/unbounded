@@ -3,8 +3,8 @@
 //! One io_uring per thread, `O_DIRECT`, registered file and registered buffers, `depth`
 //! requests in flight and a new page issued the moment one completes.
 //!
-//! It lives here so the same generator drives both a raw device and a racer volume —
-//! the only honest way to say how much of the cost is ours.
+//! It lives here so the same generator drives both a raw device and a racer one, which
+//! is the only honest way to say how much of the cost is ours.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -19,7 +19,7 @@ const MAX_DEPTH: usize = 512;
 /// What to run against one device.
 #[derive(Clone)]
 pub struct Job {
-    /// Devices exporting the same volume; thread `i` takes path `i % len`, since every
+    /// Devices exporting the same extents; thread `i` takes path `i % len`, since every
     /// node of a group is an equal gateway to the same pages.
     pub paths: Vec<PathBuf>,
     /// Request size; also the alignment of every offset.
@@ -32,7 +32,7 @@ pub struct Job {
     pub span: u64,
     pub write: bool,
     /// Walk the pages in order, each thread taking its own stripe, and stop when the
-    /// stripe ends. A one-shot fill of an immutable volume needs this: a page may be
+    /// stripe ends. A one-shot fill of an immutable extent needs this: a page may be
     /// written once.
     pub sequential: bool,
     pub warmup: Duration,

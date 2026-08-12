@@ -526,15 +526,16 @@ struct Pending {
     node: usize,
 }
 
-/// How a cluster is shaped. Groups, peers and volumes are all derived from these.
+/// How a cluster is shaped. Groups, peers, extents and devices are all derived from
+/// these.
 #[derive(Clone)]
 pub struct Options {
     pub nodes: u32,
     pub cores: usize,
     pub seed: u64,
-    /// 4 KiB pages in the small volume.
+    /// 4 KiB pages in the small extent.
     pub pages: u64,
-    /// 4 MiB pages in the immutable volume, or zero for none.
+    /// 4 MiB pages in the immutable extent, or zero for none.
     pub huge_pages: u64,
     /// `τ`, the cache's target rate. Zero disables the cache entirely.
     pub cache_rate: u32,
@@ -566,9 +567,23 @@ impl Default for Options {
     }
 }
 
-/// Volume ids the simulator declares. Zero is the fabric and is reserved.
+/// The one universe every simulated node shares. A single universe is enough here: the
+/// partitioning it enforces is a property of which namespaces the control plane hands
+/// out, and there is no control plane below this line to get it wrong.
+pub const UNIVERSE: u32 = 1;
+
+/// Device ids the simulator declares, each mapping the one extent of its class.
 pub const SMALL: u64 = 1;
 pub const HUGE: u64 = 2;
+
+/// Where the small extent sits in the universe. The huge one follows it, rounded up to
+/// the 4 MiB boundary a 4 MiB extent has to start on.
+const SMALL_BASE: u64 = 0;
+
+/// The first 4 MiB boundary past a small extent of `pages` pages.
+fn huge_base(pages: u64) -> u64 {
+    (SMALL_BASE + pages).next_multiple_of(crate::config::HUGE_BLOCKS)
+}
 
 pub struct Sim {
     s: Rc<Shared>,
@@ -686,32 +701,36 @@ impl Sim {
         let mut t = String::new();
         t.push_str("generation 1\n");
         t.push_str(&format!(
-            "node id={id} site=0 zone=1 cohort=0 store=/sim/n{id}/store size={STORE_BYTES} cache_4k=0 cache_4m=0 max_iops={}\n",
+            "node id={id} zone=1 cohort=0 store=/sim/n{id}/store size={STORE_BYTES} cache_4k=0 cache_4m=0 max_iops={}\n",
             o.device_iops
         ));
-        for p in self.peers_of(id) {
-            t.push_str(&format!("peer id={p} device=/sim/n{p}/fabric\n"));
-        }
-        t.push_str("topology epoch=1\n");
-        for g in 0..o.nodes {
-            let m = self.group(g);
-            t.push_str(&format!("group {} {} {}\n", m[0], m[1], m[2]));
-        }
-        // The index ceiling is a real check; give it room for the volume we declare.
+        // The index ceiling is a real check; give it room for the extents we declare.
         let idx = o.pages * crate::alloc::INDEX_BYTES_PER_PAGE + (1 << 20);
         t.push_str(&format!(
             "policy max_index_bytes={idx} occ_bytes={} cache_target_rate={}\n",
             1 << 20,
             o.cache_rate
         ));
-        t.push_str(&format!("volume {SMALL} slot=1\n"));
-        t.push_str(&format!("extent pages={} kind=lww zone=1\n", o.pages));
+        t.push_str(&format!("universe {UNIVERSE} epoch=1\n"));
+        for p in self.peers_of(id) {
+            t.push_str(&format!("peer id={p} device=/sim/n{p}/fabric\n"));
+        }
+        for g in 0..o.nodes {
+            let m = self.group(g);
+            t.push_str(&format!("group {} {} {}\n", m[0], m[1], m[2]));
+        }
+        t.push_str(&format!(
+            "extent id=1 base={SMALL_BASE} pages={} kind=lww zone=1\n",
+            o.pages
+        ));
+        t.push_str(&format!("device {SMALL} extents=1\n"));
         if o.huge_pages > 0 {
-            t.push_str(&format!("volume {HUGE} slot=2\n"));
             t.push_str(&format!(
-                "extent pages={} kind=immutable_4m zone=1\n",
+                "extent id=2 base={} pages={} kind=immutable_4m zone=1\n",
+                huge_base(o.pages),
                 o.huge_pages
             ));
+            t.push_str(&format!("device {HUGE} extents=2\n"));
         }
         t
     }
@@ -860,10 +879,11 @@ impl Sim {
         lba: u64,
         replica: usize,
     ) -> Option<(usize, Geometry, u32, Entry)> {
-        let addr = crate::alloc::GlobalAddr::new(SMALL as u32, u32::try_from(lba).ok()?);
+        let addr = crate::alloc::GlobalAddr::new(UNIVERSE, SMALL_BASE + lba);
         let cfg = &self.nodes.first()?.cfg;
-        let group = cfg.group(addr.0) as usize;
-        let member = *cfg.topology.catalog.get(group)?.get(replica)?;
+        let group = cfg.group(addr.0);
+        let u = cfg.universe(group.universe())?;
+        let member = *u.catalog.get(group.index() as usize)?.get(replica)?;
         let node = self.nodes.iter().position(|n| n.id == member)?;
         let path = self.nodes[node].cfg.node.store.as_path();
         let geo = layout::read_geometry(path).ok()?;
@@ -924,10 +944,10 @@ impl Sim {
     }
 
     /// Issue a request against a node. Returns the id its result will arrive under.
-    fn submit(&mut self, i: usize, vol: u64, op: Op, lba: u64, data: Option<&[u8]>) -> u64 {
+    fn submit(&mut self, i: usize, dev: u64, op: Op, lba: u64, data: Option<&[u8]>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let huge = vol == HUGE;
+        let huge = dev == HUGE;
         let len = if huge { 4 << 20 } else { BLOCK };
         let mut buf = self.take_buf(len);
         if let Some(d) = data {
@@ -945,7 +965,7 @@ impl Sim {
             core,
             Use::Client(id),
             Request {
-                vol,
+                dev,
                 op,
                 lba,
                 buf: b,
@@ -1334,7 +1354,9 @@ impl Sim {
             core,
             u,
             Request {
-                vol: 0,
+                // A frame arrives on the universe's own fabric device, which is the
+                // only thing on the wire that names the universe.
+                dev: server::fabric_key(UNIVERSE),
                 op,
                 lba,
                 buf: b,

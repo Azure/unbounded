@@ -18,15 +18,15 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::alloc::{Allocator, GlobalAddr, Pressure, Status};
-use crate::config::{self, Config};
+use crate::config::{self, Config, GroupId};
 use crate::fabric::{self, Frame, Link, Op};
 use crate::layout::{Class, Entry};
-use crate::paxos::{self, Ballot, Paxos, Register};
+use crate::paxos::{Ballot, Paxos, Register};
 use crate::runtime::{self, PoolBuf};
 
 /// Maps a page address to its consensus group. The allocator's slab holds no config, so
 /// every call that disturbs a register passes the mapping in.
-pub(crate) type Groups<'a> = dyn Fn(u64) -> u32 + 'a;
+pub(crate) type Groups<'a> = dyn Fn(u64) -> GroupId + 'a;
 
 // -------------------------------------------------------------------------- shape
 
@@ -66,11 +66,12 @@ pub(crate) enum Filter {
     All,
     /// One digest bucket: the anti-entropy comparison.
     Bucket(u16),
-    /// One extent: the unit a migration hands between zones.
-    Extent {
-        volume: u32,
-        lo: u32,
-        hi: u32,
+    /// A half-open span of the flat address space, `lo..hi`. One extent is one such
+    /// span - universe and base concatenate into the address - so the unit a migration
+    /// hands between zones needs no field of its own here.
+    Range {
+        lo: u64,
+        hi: u64,
     },
 }
 
@@ -79,11 +80,30 @@ impl Filter {
         match *self {
             Filter::All => true,
             Filter::Bucket(b) => bucket_of(addr) == b,
-            Filter::Extent { volume, lo, hi } => {
-                (addr >> 32) as u32 == volume && (addr as u32) >= lo && (addr as u32) < hi
-            }
+            Filter::Range { lo, hi } => addr >= lo && addr < hi,
         }
     }
+}
+
+/// Consensus groups across every universe this node is in.
+fn total_groups(cfg: &Config) -> u32 {
+    cfg.universes().iter().map(|u| u.catalog.len() as u32).sum()
+}
+
+/// The `n`th group in that flat sequence, universes in id order.
+///
+/// One cursor over one sequence rather than a cursor per universe: a node in two
+/// universes then splits the same sweep budget between them in proportion to how many
+/// groups each gave it, which is the share of the data it holds for each.
+fn group_at(cfg: &Config, mut n: u32) -> Option<GroupId> {
+    for u in cfg.universes() {
+        let len = u.catalog.len() as u32;
+        if n < len {
+            return Some(GroupId::new(u.id, n));
+        }
+        n -= len;
+    }
+    None
 }
 
 /// The leaf tuple. Not cryptographic: a digest match is a hint that the backlog is
@@ -102,13 +122,13 @@ fn leaf(addr: u64, version: u64, ballot: u64, crc: u32) -> u64 {
 /// which tree they were comparing, whereas the class is in the frame.
 #[derive(Default)]
 pub(crate) struct Digests {
-    groups: BTreeMap<u32, Box<[u64; BUCKETS]>>,
+    groups: BTreeMap<GroupId, Box<[u64; BUCKETS]>>,
 }
 
 impl Digests {
     /// Take a register out or put one in; XOR is its own inverse. `data_crc` is zero on
     /// 4 MiB entries, which carry no checksum, so one tuple shape serves both classes.
-    pub(crate) fn toggle(&mut self, group: u32, e: &Entry) {
+    pub(crate) fn toggle(&mut self, group: GroupId, e: &Entry) {
         let v = self
             .groups
             .entry(group)
@@ -118,7 +138,7 @@ impl Digests {
 
     /// A group we hold nothing for reads as all zeroes — the digest of the empty set —
     /// so it compares equal to a peer that also holds nothing.
-    pub(crate) fn vector(&self, group: u32) -> Box<[u64; BUCKETS]> {
+    pub(crate) fn vector(&self, group: GroupId) -> Box<[u64; BUCKETS]> {
         self.groups
             .get(&group)
             .cloned()
@@ -128,14 +148,14 @@ impl Digests {
     /// Groups this node holds registers for. A group it never held one for was never
     /// inserted, so the set of groups it has been moved out of but is still carrying is
     /// exactly this list minus the catalog's — a map walk rather than a slab scan.
-    pub(crate) fn held(&self) -> Vec<u32> {
+    pub(crate) fn held(&self) -> Vec<GroupId> {
         self.groups.keys().copied().collect()
     }
 
     /// Drop a group whose accumulator has gone back to zero. `toggle` never prunes —
     /// noticing on the hot path would cost a scan of the vector — so the shed that
     /// emptied the group says so here, and `held` stops offering it.
-    pub(crate) fn forget(&mut self, group: u32) {
+    pub(crate) fn forget(&mut self, group: GroupId) {
         if self
             .groups
             .get(&group)
@@ -180,7 +200,7 @@ pub(crate) fn snap_parts(id: u32) -> (usize, bool, usize, u32) {
 
 /// One open enumeration of a group's registers on one slab.
 struct Snap {
-    group: u32,
+    group: GroupId,
     filter: Filter,
     era: u32,
     /// Next local entry index. Monotone, so the walk is one slab pass however many
@@ -247,7 +267,7 @@ impl Snaps {
         &mut self,
         core: usize,
         huge: bool,
-        group: u32,
+        group: GroupId,
         filter: Filter,
         now: Instant,
     ) -> Option<u32> {
@@ -271,10 +291,16 @@ impl Snaps {
 
     /// Next chunk. A repeated `seq` re-answers the previous chunk, anything else
     /// advances; `None` is the local caller, which has no wire to lose a reply on.
+    ///
+    /// `universe` is the namespace the request arrived on, `None` for a local caller. A
+    /// cursor id is a small integer a peer could guess, so the universe it was opened in
+    /// is checked against the one asking: partitioning has to hold for a cursor exactly
+    /// as it holds for a page.
     pub(crate) fn next(
         &mut self,
         id: u32,
         seq: Option<u8>,
+        universe: Option<u32>,
         entries: &[Entry],
         gof: &Groups,
         now: Instant,
@@ -288,6 +314,9 @@ impl Snaps {
             Some(Some(s)) if s.era == era => s,
             _ => return Err(Status::Unmapped),
         };
+        if universe.is_some_and(|u| u != s.group.universe()) {
+            return Err(Status::Unmapped);
+        }
         s.touched = now;
         if seq.is_some_and(|q| q == s.seq) {
             return Ok((s.last.clone(), s.last_done));
@@ -363,46 +392,49 @@ impl Snaps {
 
 // -------------------------------------------------------------------------- the wire
 
-/// Frame conventions for the three ops below. They name a *group*, not a page, so `vol`
-/// and `offset` mean something different here than in every other op and
-/// `server::addr_of` is deliberately not on their path.
+/// Frame conventions for the three ops below. They name a *group*, not a page, so
+/// `offset` means something different here than in every other op and `server::addr_of`
+/// is deliberately not on their path.
+///
+/// A group index alone is not a group: the universe is the namespace the frame arrived
+/// on, so the target rebuilds the [`GroupId`] from its own side of the link and a peer
+/// cannot name a group in a universe it was never given a namespace for.
 ///
 /// All three encode with `Frame::huge = false` whatever class they ask about: the huge
-/// frame shape has nine fewer offset bits and these need the room. MERKLE and SNAPOPEN
+/// frame shape has ten fewer offset bits and these need the room. MERKLE and SNAPOPEN
 /// carry the class in `imm` bit 0; SNAPNEXT carries it inside the cursor id.
 ///
-///   MERKLE    offset = group                      -> 512 digests, the whole trailer
-///   SNAPOPEN  offset = group << 9 | bucket        -> slot 0: cursor id
-///             vol bit 0 = 1 to filter to `bucket`
-///   SNAPNEXT  offset = cursor id                  -> slot 0: count, slot 1: done
-///             vol 6 bits | imm 2 bits = chunk seq    then 3 slots per tuple
+///   MERKLE    offset = group                       -> 512 digests, the whole trailer
+///   SNAPOPEN  offset = group << 10 | one << 9 | b  -> slot 0: cursor id
+///             `one` set means filter to bucket `b`
+///   SNAPNEXT  offset = cursor id << 6 | chunk seq  -> slot 0: count, slot 1: done
+///                                                     then 3 slots per tuple
 pub(crate) fn merkle_frame(group: u32, huge: bool) -> Frame {
-    let mut f = Frame::new(Op::Merkle, false, 0, group);
+    let mut f = Frame::raw(Op::Merkle, false, group as u64);
     f.imm = huge as u8;
     f
 }
 
 pub(crate) fn snap_open_frame(group: u32, huge: bool, bucket: Option<u16>) -> Frame {
-    let b = bucket.unwrap_or(0) as u32 & (BUCKETS as u32 - 1);
-    let mut f = Frame::new(Op::SnapOpen, false, bucket.is_some() as u8, group << 9 | b);
+    let b = bucket.unwrap_or(0) as u64 & (BUCKETS as u64 - 1);
+    let off = (group as u64) << 10 | (bucket.is_some() as u64) << 9 | b;
+    let mut f = Frame::raw(Op::SnapOpen, false, off);
     f.imm = huge as u8;
     f
 }
 
 pub(crate) fn snap_next_frame(id: u32, seq: u8) -> Frame {
-    let mut f = Frame::new(Op::SnapNext, false, seq & 0x3f, id);
-    f.imm = seq >> 6;
-    f
+    Frame::raw(Op::SnapNext, false, (id as u64) << 6 | (seq & 0x3f) as u64)
 }
 
 /// The request side of the two cursor ops, as the target reads them back.
 pub(crate) fn snap_open_parts(f: &Frame) -> (u32, bool, Option<u16>) {
-    let bucket = (f.vol & 1 == 1).then(|| (f.offset & (BUCKETS as u32 - 1)) as u16);
-    (f.offset >> 9, f.imm & 1 == 1, bucket)
+    let bucket = (f.offset >> 9 & 1 == 1).then(|| (f.offset & (BUCKETS as u64 - 1)) as u16);
+    ((f.offset >> 10) as u32, f.imm & 1 == 1, bucket)
 }
 
 pub(crate) fn snap_next_parts(f: &Frame) -> (u32, u8) {
-    (f.offset, (f.vol & 0x3f) | (f.imm & 3) << 6)
+    ((f.offset >> 6) as u32, (f.offset & 0x3f) as u8)
 }
 
 /// Digest vector into a trailer and back. Exactly full, so there is no count.
@@ -584,7 +616,7 @@ impl Heal {
         let core = runtime::core();
         let c = &self.cores[core];
         let cfg = self.alloc().config();
-        let groups = cfg.topology.catalog.len() as u32;
+        let groups = total_groups(cfg);
         if groups == 0 {
             return Ok(());
         }
@@ -608,8 +640,8 @@ impl Heal {
         // one budget every `groups / cores` intervals, which is how long a replacement
         // would take per group; jumping the queue for it costs the settled groups a
         // digest exchange they would only have found equal.
-        let cores = self.cores.len() as u32;
-        let mut g = c.next.get();
+        let cores = self.cores.len();
+        let g;
         match self
             .paxos
             .replaying_here()
@@ -618,17 +650,25 @@ impl Heal {
         {
             Some(r) => g = r,
             None => {
-                let start = g;
+                let start = c.next.get();
+                let mut n = start;
                 loop {
-                    if g as usize % cores as usize == core && self.paxos.members(g).is_some() {
-                        break;
+                    match group_at(cfg, n) {
+                        Some(cand)
+                            if cand.index() as usize % cores == core
+                                && self.paxos.members(cand).is_some() =>
+                        {
+                            g = cand;
+                            break;
+                        }
+                        _ => {}
                     }
-                    g = (g + 1) % groups;
-                    if g == start {
+                    n = (n + 1) % groups;
+                    if n == start {
                         return Ok(());
                     }
                 }
-                c.next.set((g + 1) % groups);
+                c.next.set((n + 1) % groups);
             }
         }
 
@@ -677,34 +717,29 @@ impl Heal {
     /// Pushing repeats until the control plane flips `zone` and clears `next_zone`, the
     /// only completion signal there is. Repetition is harmless and is what makes a
     /// destination that was down for the first pass converge anyway.
-    async fn hand_over(&'static self, cfg: &Config, group: u32) {
-        for v in &cfg.volumes {
-            for (e, ext) in v.extents.iter().enumerate() {
-                if ext.zone != cfg.node.zone || ext.next_zone == 0 {
-                    continue;
-                }
-                let Some((lo, hi)) = v.extent_range(e) else {
-                    continue;
-                };
-                let addr = (v.id as u64) << 32 | lo;
-                let id = paxos::ShardId {
-                    volume: v.id,
-                    extent: e as u32,
-                };
-                if !self.paxos.sealed(id).await {
-                    // Push on the next tick: a seal only just chosen may not have
-                    // reached the members whose copies we are about to walk.
-                    let _ = self.paxos.seal_extent(GlobalAddr(addr), id).await;
-                    continue;
-                }
-                let filter = Filter::Extent {
-                    volume: v.id,
-                    lo: lo as u32,
-                    hi: hi as u32,
-                };
-                // One stuck extent must not stop the others; the next tick retries it.
-                let _ = self.push_extent(group, v.huge, filter, ext.next_zone).await;
+    async fn hand_over(&'static self, cfg: &Config, group: GroupId) {
+        // Only this group's own universe: a group holds registers for nothing else, so
+        // the other universes' extents are somebody else's sweep.
+        let Some(u) = cfg.universe(group.universe()) else {
+            return;
+        };
+        for ext in &u.extents {
+            if ext.zone != cfg.node.zone || ext.next_zone == 0 {
+                continue;
             }
+            let lo = GlobalAddr::new(u.id, ext.base_lba);
+            let hi = GlobalAddr::new(u.id, ext.end_lba());
+            if !self.paxos.sealed(ext.id).await {
+                // Push on the next tick: a seal only just chosen may not have reached
+                // the members whose copies we are about to walk.
+                let _ = self.paxos.seal_extent(lo, ext.id).await;
+                continue;
+            }
+            // One stuck extent must not stop the others; the next tick retries it.
+            let filter = Filter::Range { lo: lo.0, hi: hi.0 };
+            let _ = self
+                .push_extent(group, ext.huge, filter, ext.next_zone)
+                .await;
         }
     }
 
@@ -712,7 +747,7 @@ impl Heal {
     /// the config's replay budget per call.
     async fn push_extent(
         &'static self,
-        group: u32,
+        group: GroupId,
         huge: bool,
         filter: Filter,
         zone: u32,
@@ -720,7 +755,7 @@ impl Heal {
         let id = self.alloc().snap_open(group, huge, filter).await?;
         let mut sent = 0usize;
         loop {
-            let (tuples, done) = self.alloc().snap_next(id, None).await?;
+            let (tuples, done) = self.alloc().snap_next(id, None, None).await?;
             for (addr, r) in tuples {
                 let _ = self.paxos.push(GlobalAddr(addr), r, zone).await;
                 sent += 1;
@@ -757,7 +792,7 @@ impl Heal {
     /// inserted into it, so the groups it lists minus the ones the catalog still names
     /// us in is the whole of the set, found without a slab scan.
     async fn shed(&'static self, huge: bool) {
-        let orphans: Vec<u32> = self
+        let orphans: Vec<GroupId> = self
             .alloc()
             .held_groups(huge)
             .into_iter()
@@ -786,14 +821,14 @@ impl Heal {
     /// the value.
     async fn drain(
         &'static self,
-        group: u32,
+        group: GroupId,
         huge: bool,
         budget: &mut usize,
     ) -> Result<(), Status> {
         let id = self.alloc().snap_open(group, huge, Filter::All).await?;
         let mut walked = false;
         while *budget > 0 {
-            let (tuples, done) = self.alloc().snap_next(id, None).await?;
+            let (tuples, done) = self.alloc().snap_next(id, None, None).await?;
             for (addr, r) in tuples {
                 if *budget == 0 {
                     break;
@@ -824,7 +859,7 @@ impl Heal {
     async fn compare(
         &'static self,
         cfg: &Config,
-        group: u32,
+        group: GroupId,
         huge: bool,
         was: bool,
     ) -> Result<bool, Status> {
@@ -833,12 +868,15 @@ impl Heal {
         // The partner offset alternates with group parity, spreading a node's own
         // comparisons over both peers; within one group the three members between them
         // walk all three edges of the triangle.
-        let from = ((me as u32 + 1 + group % 2) % 3) as u8;
-        let link = self.paxos.link_of(m[from as usize]).ok_or(Status::Io)?;
+        let from = ((me as u32 + 1 + group.index() % 2) % 3) as u8;
+        let link = self
+            .paxos
+            .link_of(group.universe(), m[from as usize])
+            .ok_or(Status::Io)?;
 
         let mine = self.alloc().digests(group, huge).await;
         let t = PoolBuf::alloc(fabric::BLOCK).await;
-        link.send(merkle_frame(group, huge), t.buf())
+        link.send(merkle_frame(group.index(), huge), t.buf())
             .await
             .map_err(Status::from_wire)?;
         let theirs = get_digests(&t);
@@ -886,7 +924,7 @@ impl Heal {
     async fn reconcile(
         &'static self,
         cfg: &Config,
-        group: u32,
+        group: GroupId,
         huge: bool,
         link: &Link,
         bucket: u16,
@@ -924,9 +962,9 @@ impl Heal {
     }
 
     async fn repair(&'static self, cfg: &Config, addr: GlobalAddr) {
-        // A page whose volume left the config between the cursor and here is not a
+        // A page whose extent left the config between the cursor and here is not a
         // divergence, it is a page that no longer exists.
-        if cfg.volume(addr.volume()).is_none() {
+        if cfg.extent_at(addr.0).is_none() {
             return;
         }
         match self.paxos.repair(addr).await {
@@ -941,12 +979,12 @@ impl Heal {
     async fn remote_bucket(
         &'static self,
         link: &Link,
-        group: u32,
+        group: GroupId,
         huge: bool,
         bucket: u16,
     ) -> Result<Option<BTreeMap<u64, Register>>, Status> {
         let t = PoolBuf::alloc(fabric::BLOCK).await;
-        let f = snap_open_frame(group, huge, Some(bucket));
+        let f = snap_open_frame(group.index(), huge, Some(bucket));
         link.send(f, t.buf()).await.map_err(Status::from_wire)?;
         let id = fabric::get(&t, 0) as u32;
 
@@ -967,7 +1005,7 @@ impl Heal {
 
     async fn local_bucket(
         &'static self,
-        group: u32,
+        group: GroupId,
         huge: bool,
         bucket: u16,
     ) -> Result<Option<BTreeMap<u64, Register>>, Status> {
@@ -978,7 +1016,7 @@ impl Heal {
         let mut out = BTreeMap::new();
         let mut over = false;
         loop {
-            let (tuples, done) = self.alloc().snap_next(id, None).await?;
+            let (tuples, done) = self.alloc().snap_next(id, None, None).await?;
             for (addr, r) in tuples {
                 out.insert(addr, r);
             }
@@ -1014,40 +1052,50 @@ mod tests {
     /// changed and changed back leaves no trace and arrival order cannot matter.
     #[test]
     fn digests_are_a_set_not_a_history() {
+        let g = |i: u32| GroupId::new(1, i);
         let (mut a, mut b) = (Digests::default(), Digests::default());
         let (x, y) = (entry(11, 1), entry(22, 5));
-        a.toggle(0, &x);
-        a.toggle(0, &y);
-        b.toggle(0, &y);
-        b.toggle(0, &x);
-        assert_eq!(a.vector(0), b.vector(0), "order is not part of the answer");
-
-        a.toggle(0, &y);
-        a.toggle(0, &y);
+        a.toggle(g(0), &x);
+        a.toggle(g(0), &y);
+        b.toggle(g(0), &y);
+        b.toggle(g(0), &x);
         assert_eq!(
-            a.vector(0),
-            b.vector(0),
+            a.vector(g(0)),
+            b.vector(g(0)),
+            "order is not part of the answer"
+        );
+
+        a.toggle(g(0), &y);
+        a.toggle(g(0), &y);
+        assert_eq!(
+            a.vector(g(0)),
+            b.vector(g(0)),
             "toggling twice is toggling not at all"
         );
 
         // A version change is a difference, which is the only property the sweep needs.
-        a.toggle(0, &y);
-        a.toggle(0, &entry(22, 6));
-        assert_ne!(a.vector(0), b.vector(0));
+        a.toggle(g(0), &y);
+        a.toggle(g(0), &entry(22, 6));
+        assert_ne!(a.vector(g(0)), b.vector(g(0)));
         // And a group nobody has touched is the digest of the empty set.
-        assert_eq!(*b.vector(7), [0u64; BUCKETS]);
+        assert_eq!(*b.vector(g(7)), [0u64; BUCKETS]);
+        // Nor has the same index in another universe: partitioning reaches the
+        // accumulators, so two universes never compare trees with each other.
+        a.toggle(GroupId::new(2, 0), &x);
+        assert_ne!(a.vector(GroupId::new(2, 0)), a.vector(g(0)));
     }
 
-    /// A migration names an extent by the page range it covers, which every node can
+    /// A migration names an extent by the address range it covers, which every node can
     /// evaluate for itself: the filter lets one zone walk exactly the pages it is
-    /// handing over, without the destination naming a slot table it does not hold.
+    /// handing over, without the destination naming a table it does not hold. Universe
+    /// and block index concatenate, so one span is one comparison and a neighbouring
+    /// universe cannot fall inside it.
     #[test]
     fn a_filter_narrows_to_exactly_its_unit() {
-        let addr = |v: u64, off: u64| v << 32 | off;
-        let f = Filter::Extent {
-            volume: 3,
-            lo: 10,
-            hi: 20,
+        let addr = |u: u32, lba: u64| config::addr_of(u, lba);
+        let f = Filter::Range {
+            lo: addr(3, 10),
+            hi: addr(3, 20),
         };
         assert!(
             f.keeps(addr(3, 10)) && f.keeps(addr(3, 19)),
@@ -1058,8 +1106,8 @@ mod tests {
             "and it is exclusive at the top"
         );
         assert!(
-            !f.keeps(addr(4, 15)),
-            "a page of another volume is not this extent's"
+            !f.keeps(addr(4, 15)) && !f.keeps(addr(2, 15)),
+            "the same block in another universe is a different page"
         );
 
         assert!(
@@ -1071,8 +1119,8 @@ mod tests {
         assert!(!Filter::Bucket(b ^ 1).keeps(addr(1, 1)));
     }
 
-    /// The three group-addressed frames survive the wire, including the `vol` and `imm`
-    /// fields they borrow for meanings no other opcode gives them.
+    /// The three group-addressed frames survive the wire, including the `offset` and
+    /// `imm` fields they borrow for meanings no other opcode gives them.
     #[test]
     fn group_frames_survive_encoding() {
         let round = |f: Frame| {
@@ -1086,10 +1134,13 @@ mod tests {
             let f = round(snap_open_frame(300, false, bucket));
             assert_eq!(snap_open_parts(&f), (300, false, bucket));
         }
-        for seq in [0u8, 63, 64, 255] {
+        // Six bits of sequence: enough that no two consecutive chunks collide, which is
+        // all a retry needs to tell apart.
+        for seq in [0u8, 1, 62, 63] {
             let f = round(snap_next_frame(0x0dedbeef, seq));
             assert_eq!(snap_next_parts(&f), (0x0dedbeef, seq));
         }
+        assert_eq!(snap_next_parts(&round(snap_next_frame(7, 64))).1, 0);
     }
 
     /// Cursor atomicity: a page overwritten ahead of the walk is still reported with
@@ -1100,18 +1151,23 @@ mod tests {
     fn an_open_cursor_sees_the_group_it_opened_on() {
         let n = TUPLES + 30;
         let mut entries: Vec<Entry> = (0..n).map(|i| entry(i as u64 + 1, 1)).collect();
-        let gof: &Groups = &|_| 0;
+        let gof: &Groups = &|_| GroupId::default();
         let now = Instant::now();
         let mut free = Vec::new();
         let mut s = Snaps::default();
 
-        let id = s.start(0, false, 0, Filter::All, now).unwrap();
-        let (first, done) = s.next(id, Some(0), &entries, gof, now).unwrap();
+        let id = s
+            .start(0, false, GroupId::default(), Filter::All, now)
+            .unwrap();
+        let (first, done) = s.next(id, Some(0), None, &entries, gof, now).unwrap();
         assert_eq!((first.len(), done), (TUPLES, false));
         // A retry is the same chunk, not the next one. A cursor that skipped would
         // under-report a difference, which is silent and so the worst failure this
         // stream has.
-        assert_eq!(s.next(id, Some(0), &entries, gof, now).unwrap().0, first);
+        assert_eq!(
+            s.next(id, Some(0), None, &entries, gof, now).unwrap().0,
+            first
+        );
 
         // Now free an entry the walk has not reached yet, the way `Slab::set` does.
         let victim = n - 1;
@@ -1126,7 +1182,7 @@ mod tests {
         let mut seen: Vec<u64> = first.iter().map(|t| t.0).collect();
         let mut seq = 1;
         loop {
-            let (chunk, done) = s.next(id, Some(seq), &entries, gof, now).unwrap();
+            let (chunk, done) = s.next(id, Some(seq), None, &entries, gof, now).unwrap();
             seen.extend(chunk.iter().map(|t| t.0));
             if done {
                 break;
@@ -1149,28 +1205,52 @@ mod tests {
         );
     }
 
+    /// A cursor id is a small integer, so guessing one is trivial. What stops a peer in
+    /// one universe reading another's pages through a guessed id is that the cursor
+    /// remembers the universe it was opened for and refuses every other.
+    #[test]
+    fn a_cursor_answers_only_its_own_universe() {
+        let entries = [entry(1, 1)];
+        let gof: &Groups = &|_| GroupId::new(7, 0);
+        let now = Instant::now();
+        let mut s = Snaps::default();
+
+        let id = s
+            .start(0, false, GroupId::new(7, 0), Filter::All, now)
+            .unwrap();
+        assert!(s.next(id, Some(0), Some(7), &entries, gof, now).is_ok());
+        assert!(s.next(id, Some(0), Some(8), &entries, gof, now).is_err());
+        // A local sweep names no universe and is answered either way.
+        assert!(s.next(id, Some(0), None, &entries, gof, now).is_ok());
+    }
+
     /// A cursor whose peer stopped asking must not pin the device forever, and the id
     /// it held is not answerable afterwards.
     #[test]
     fn a_cursor_nobody_advances_expires() {
         let entries = [entry(1, 1)];
-        let gof: &Groups = &|_| 0;
+        let gof: &Groups = &|_| GroupId::default();
         let now = Instant::now();
         let mut free = Vec::new();
         let mut s = Snaps::default();
 
-        let id = s.start(0, false, 0, Filter::All, now).unwrap();
+        let id = s
+            .start(0, false, GroupId::default(), Filter::All, now)
+            .unwrap();
         s.retain(&entries[0]);
         s.park(&mut free, 0);
         s.expire(now + SNAP_TTL + Duration::from_secs(1), &mut free);
         assert_eq!(free, vec![0]);
-        assert!(s.next(id, Some(0), &entries, gof, now).is_err());
+        assert!(s.next(id, Some(0), None, &entries, gof, now).is_err());
 
         // And the slab refuses more cursors than it will hold rather than growing.
         let ids: Vec<u32> = (0..MAX_SNAPS)
-            .filter_map(|_| s.start(0, false, 0, Filter::All, now))
+            .filter_map(|_| s.start(0, false, GroupId::default(), Filter::All, now))
             .collect();
         assert_eq!(ids.len(), MAX_SNAPS);
-        assert!(s.start(0, false, 0, Filter::All, now).is_none());
+        assert!(
+            s.start(0, false, GroupId::default(), Filter::All, now)
+                .is_none()
+        );
     }
 }

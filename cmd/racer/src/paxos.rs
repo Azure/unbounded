@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 
 use crate::alloc::{Allocator, GlobalAddr, Pending, Status};
 use crate::cache::Cache;
-use crate::config::{Kind, Live};
+use crate::config::{GroupId, Kind, Live};
 use crate::fabric::{self, Frame, Link, Op, Part};
 use crate::layout;
 use crate::runtime::{self, Buf, PoolBuf};
@@ -165,15 +165,6 @@ enum Gate {
     Away(u32),
 }
 
-/// A shard: the unit a migration hands between groups. An extent, not a slot within
-/// one — the seal table is a bounded superblock record and one row per slot would not
-/// fit, so a migration moves a whole extent at once.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct ShardId {
-    pub volume: u32,
-    pub extent: u32,
-}
-
 // ---------------------------------------------------------------------------
 // per-core state
 // ---------------------------------------------------------------------------
@@ -222,15 +213,18 @@ pub struct Stats {
 /// every field is reached through `on_core`.
 #[derive(Default)]
 struct Local {
-    terms: BTreeMap<u32, Term>,
-    seals: BTreeMap<ShardId, u32>,
+    terms: BTreeMap<GroupId, Term>,
+    /// Extents sealed here, and the term the seal was taken at. Keyed by extent id
+    /// alone: those are unique across every universe, so no other field distinguishes
+    /// one shard from another.
+    seals: BTreeMap<u32, u32>,
     /// Addresses with a proposal in flight. The one-value-per-ballot rule, and the
     /// write path's per-key serialisation, are the same table.
     inflight: BTreeSet<u64>,
     /// Groups we are still replaying. Set by the anti-entropy sweep when it finds our
     /// whole side of a group empty against a peer that has data, cleared when the
     /// digests agree.
-    replaying: BTreeSet<u32>,
+    replaying: BTreeSet<GroupId>,
     stats: Stats,
 }
 
@@ -294,18 +288,14 @@ pub fn open(alloc: &'static Allocator, cache: &'static Cache, cores: usize) -> &
     // of it happens.
     let boot = alloc.boot_consensus();
     for &(group, value) in &boot.terms {
-        let l = &mut state[group as usize % cores].get_mut().terms;
+        let l = &mut state[group.index() as usize % cores].get_mut().terms;
         l.insert(group, Term::new(value));
     }
     // A seal covers a whole extent, whose pages are spread over every core, so unlike
     // a term it is replicated rather than placed.
     for s in &boot.seals {
-        let id = ShardId {
-            volume: s.volume,
-            extent: s.extent,
-        };
         for l in state.iter_mut() {
-            l.get_mut().seals.insert(id, s.term);
+            l.get_mut().seals.insert(s.extent, s.term);
         }
     }
     Box::leak(Box::new(Paxos {
@@ -327,23 +317,27 @@ impl Paxos {
         self.cache
     }
 
-    pub(crate) fn group(&self, addr: GlobalAddr) -> u32 {
+    pub(crate) fn group(&self, addr: GlobalAddr) -> GroupId {
         self.alloc.config().group(addr.0)
     }
 
     /// The core holding a group's consensus state. In any real deployment this is the
-    /// same core the allocator shards the page to: both are the group id modulo a shard
-    /// count that saturates at the core count.
-    fn core_of(&self, group: u32) -> usize {
-        group as usize % self.state.len()
+    /// same core the allocator shards the page to: both are the group index modulo a
+    /// shard count that saturates at the core count. The index alone, so universes
+    /// share one core layout rather than each crowding onto the low cores.
+    fn core_of(&self, group: GroupId) -> usize {
+        group.index() as usize % self.state.len()
     }
 
-    pub(crate) fn members(&self, group: u32) -> Option<[u32; 3]> {
+    /// The three acceptors, out of the catalog of the group's own universe. A group in
+    /// a universe we hold no configuration for has no members here, which is what stops
+    /// a frame naming one.
+    pub(crate) fn members(&self, group: GroupId) -> Option<[u32; 3]> {
         self.alloc
             .config()
-            .topology
+            .universe(group.universe())?
             .catalog
-            .get(group as usize)
+            .get(group.index() as usize)
             .copied()
     }
 
@@ -368,8 +362,15 @@ impl Paxos {
         self.links.install(Links(links.into_boxed_slice()));
     }
 
-    pub(crate) fn link_of(&self, node: u32) -> Option<&Link> {
-        self.links.get().0.iter().find(|l| l.peer() == node)
+    /// The link to `node` in `universe`. A link is per pair: the same peer in two
+    /// universes publishes two namespaces and we hold two of these, and asking without
+    /// naming the universe would let a frame leave the one it arrived on.
+    pub(crate) fn link_of(&self, universe: u32, node: u32) -> Option<&Link> {
+        self.links
+            .get()
+            .0
+            .iter()
+            .find(|l| l.universe() == universe && l.peer() == node)
     }
 
     /// Where a frame we will not serve goes next. `imm` names a member of `addr`'s
@@ -378,30 +379,24 @@ impl Paxos {
     ///
     /// Zero is the sender saying it could not name a member — it routed by zone alone —
     /// so we do the lookup it could not and pick a member we can reach; whoever lands on
-    /// it owns the operation. The second value is whether the forward crosses a site
-    /// boundary, the one hop that restores the budget instead of spending it.
+    /// it owns the operation.
+    ///
+    /// The link is always inside the address's own universe, so a relay cannot carry a
+    /// frame out of the partition it arrived in however the sender addressed it.
     ///
     /// `None` for a foreign address we cannot route: nothing here describes it, and the
     /// originator is sent back to its config.
-    pub fn forward_link(&self, op: Op, addr: GlobalAddr, imm: u8) -> Option<(&Link, bool)> {
+    pub fn forward_link(&self, op: Op, addr: GlobalAddr, imm: u8) -> Option<&Link> {
         // Homed elsewhere: pass it toward that place, which resolves the group itself.
         // The frame is unchanged, so this is the same forward as any other.
         if !self.local_for(op, addr) {
-            return self.away(addr).ok().flatten().map(|r| {
-                // Whether this hop is a crossing is a fact about the link we chose, not
-                // about us: it is one iff it is our own way into the address's site.
-                let crossing = self
-                    .offsite(addr)
-                    .is_some_and(|s| self.alloc.config().crossing_to(s) == Some(r.link.peer()));
-                (r.link, crossing)
-            });
+            return self.away(addr).ok().flatten().map(|r| r.link);
         }
         let m = self.members(self.group(addr))?;
-        let link = match imm {
-            0 => self.close(&m).map(|(l, _)| l),
-            k => self.link_of(*m.get(k as usize - 1)?),
-        };
-        link.map(|l| (l, false))
+        match imm {
+            0 => self.close(addr.universe(), &m).map(|(l, _)| l),
+            k => self.link_of(addr.universe(), *m.get(k as usize - 1)?),
+        }
     }
 
     /// Whether a frame addressed to `imm` is ours to answer or one we must pass on.
@@ -421,19 +416,12 @@ impl Paxos {
         }
     }
 
-    /// Whether `addr` is homed somewhere this node does not describe: another zone of
-    /// this site, or another site. Our slot table covers only our own zone, so a foreign
-    /// address has no group here and nothing about it may be resolved locally.
+    /// Whether `addr` is homed in a zone this node does not describe. A universe's
+    /// catalog covers only our own zone of it, so a foreign address has no group here
+    /// and nothing about it may be resolved locally.
     fn foreign(&self, addr: GlobalAddr) -> bool {
         let cfg = self.alloc.config();
-        self.offsite(addr).is_some() || cfg.zone_of(addr.0).is_some_and(|z| z != cfg.node.zone)
-    }
-
-    /// The site `addr` is homed in, when it is not ours. Derived from the volume id, so
-    /// it needs nothing of the far site.
-    fn offsite(&self, addr: GlobalAddr) -> Option<u32> {
-        let cfg = self.alloc.config();
-        cfg.site_of(addr.0).filter(|&s| s != cfg.node.site)
+        cfg.zone_of(addr.0).is_some_and(|z| z != cfg.node.zone)
     }
 
     /// The zone still answering for `addr` while its extent is being pulled into ours.
@@ -454,16 +442,13 @@ impl Paxos {
     /// The route out of this zone, if `addr` is not homed here.
     ///
     /// We resolve only the zone and express it by which peer we send to; the entry node
-    /// holds that zone's slot table and catalog and does the rest. `imm` is zero because
-    /// we cannot name a member, and the budget is two: one hop to reach a member, one
-    /// spare for a shard mid-migration at the far end.
+    /// holds that zone's catalog and does the rest. `imm` is zero because we cannot name
+    /// a member, and the budget is two: one hop to reach a member, one spare for a shard
+    /// mid-migration at the far end.
     ///
     /// A foreign address we cannot route is an error rather than a fallback: resolving
-    /// it against our own slot table would name a group in the wrong zone.
+    /// it against our own catalog would name a group in the wrong zone.
     fn away(&self, addr: GlobalAddr) -> Result<Option<Route<'_>>, Status> {
-        if let Some(site) = self.offsite(addr) {
-            return self.across(site, addr).map(Some);
-        }
         if !self.foreign(addr) {
             return Ok(None);
         }
@@ -475,24 +460,6 @@ impl Paxos {
         self.toward(zone, addr).map(Some)
     }
 
-    /// A route toward another site. We take our own crossing when we hold one; otherwise
-    /// we hand the address to a peer that does, and know nothing further.
-    fn across(&self, site: u32, addr: GlobalAddr) -> Result<Route<'_>, Status> {
-        let cfg = self.alloc.config();
-        let mine = cfg.crossing_to(site);
-        let node = mine
-            .or_else(|| cfg.gateway_to(site, addr.0))
-            .ok_or(Status::Unmapped)?;
-        let link = self.link_of(node).ok_or(Status::Io)?;
-        // Crossing here means the far site funds its own hops, as a relayed crossing does
-        // by refreshing; handing off locally leaves that to the peer we hand to.
-        Ok(Route {
-            link,
-            hops: if mine.is_some() { 3 } else { 2 },
-            imm: 0,
-        })
-    }
-
     /// A route into `zone`, through the entry node that zone's directory names for this
     /// address. Two hops: one to reach a member of the group, one spare for a shard the
     /// far side is in the middle of handing on.
@@ -502,7 +469,7 @@ impl Paxos {
             .config()
             .entry_of(zone, addr.0)
             .ok_or(Status::Unmapped)?;
-        let link = self.link_of(entry).ok_or(Status::Io)?;
+        let link = self.link_of(addr.universe(), entry).ok_or(Status::Io)?;
         Ok(Route {
             link,
             hops: 2,
@@ -518,7 +485,7 @@ impl Paxos {
             return false;
         };
         let me = self.self_index(&m);
-        (0..3u8).any(|i| Some(i) != me && self.route(&m, i).is_some())
+        (0..3u8).any(|i| Some(i) != me && self.route(addr.universe(), &m, i).is_some())
     }
 
     /// How many acceptors must apply a value for it to be chosen: a majority of the
@@ -527,20 +494,23 @@ impl Paxos {
     /// other two carry. A quorum that shrank to what we could see would let an isolated
     /// node decide alone.
     ///
-    /// The exception is a configuration that names no peers at all: a single-node
-    /// deployment rather than a degraded three, with nobody to route through and no
-    /// second acceptor to wait for, so a local accept is a decision.
-    fn quorum(&self) -> usize {
-        if self.links.get().0.is_empty() { 1 } else { 2 }
+    /// The exception is a universe that names no peers at all: a single-node deployment
+    /// rather than a degraded three, with nobody to route through and no second acceptor
+    /// to wait for, so a local accept is a decision. Per universe, because one universe
+    /// being a lone node says nothing about another.
+    fn quorum(&self, universe: u32) -> usize {
+        if self.links.get().0.iter().any(|l| l.universe() == universe) {
+            2
+        } else {
+            1
+        }
     }
 
+    /// The frame naming `addr`. Only the block offset goes on the wire: the universe is
+    /// the namespace we are about to send on, and the extent is the control plane's
+    /// business, not the protocol's.
     fn frame(&self, op: Op, addr: GlobalAddr, huge: bool) -> Result<Frame, Status> {
-        let v = self
-            .alloc
-            .config()
-            .volume(addr.volume())
-            .ok_or(Status::Unmapped)?;
-        Ok(Frame::new(op, huge, v.slot, addr.offset()))
+        Ok(Frame::page(op, huge, addr.lba()))
     }
 
     fn stat(&self, f: impl FnOnce(&mut Stats)) {
@@ -676,9 +646,9 @@ impl Paxos {
             Some(k) => {
                 let term = self.term_for(group, addr).await?;
                 let b = Ballot::new(term, k);
-                let need = self.quorum();
+                let need = self.quorum(addr.universe());
                 let local = self.alloc.accept_trim(addr, guard, b);
-                let mut peers = self.peers(&m, Some(k));
+                let mut peers = self.peers(addr.universe(), &m, Some(k));
                 self.fan_out(local, &mut peers, need, |r| {
                     self.send_trim(r, addr, guard, b)
                 })
@@ -688,8 +658,10 @@ impl Paxos {
             }
             None => {
                 // `imm` zero: the close member picks the ballot and fans out.
-                self.delegate(&m, |r| self.send_trim(r, addr, guard, Ballot::ZERO))
-                    .await
+                self.delegate(addr.universe(), &m, |r| {
+                    self.send_trim(r, addr, guard, Ballot::ZERO)
+                })
+                .await
             }
         }
     }
@@ -700,43 +672,43 @@ impl Paxos {
     /// in one zone and are mutually adjacent, so the forward is a fallback rather than
     /// the common case; [`Self::fan_out`] and [`Self::fan_peers`] refuse rather than
     /// ack short when even that is not available.
-    fn peers(&self, m: &[u32; 3], me: Option<u8>) -> Vec<Route<'_>> {
+    fn peers(&self, u: u32, m: &[u32; 3], me: Option<u8>) -> Vec<Route<'_>> {
         (0..3u8)
             .filter(|i| Some(*i) != me)
-            .filter_map(|i| self.route(m, i))
+            .filter_map(|i| self.route(u, m, i))
             .collect()
     }
 
     /// Members we hold a direct link to, in member order. The first is the one we
     /// delegate to; the rest are the failover order for when it does not answer.
-    fn candidates(&self, m: &[u32; 3]) -> impl Iterator<Item = (&Link, u8)> {
+    fn candidates(&self, u: u32, m: &[u32; 3]) -> impl Iterator<Item = (&Link, u8)> {
         let m = *m;
-        (0..3u8).filter_map(move |i| self.link_of(m[i as usize]).map(|l| (l, i)))
+        (0..3u8).filter_map(move |i| self.link_of(u, m[i as usize]).map(|l| (l, i)))
     }
 
     /// The first member we hold a link to, plus its index.
-    fn close(&self, m: &[u32; 3]) -> Option<(&Link, u8)> {
-        self.candidates(m).next()
+    fn close(&self, u: u32, m: &[u32; 3]) -> Option<(&Link, u8)> {
+        self.candidates(u, m).next()
     }
 
     /// Member indices for the data leg, adjacent ones first. The value is the only part
     /// of a read big enough to care which way it travels: a `GET` routed through a
     /// neighbour crosses the wire twice and lands the page on a node with no use for it.
     /// Metadata legs are a trailer each and route freely.
-    fn nearest_first(&self, m: &[u32; 3]) -> [u8; 3] {
-        nearest_first(m, |n| self.link_of(n).is_some())
+    fn nearest_first(&self, u: u32, m: &[u32; 3]) -> [u8; 3] {
+        nearest_first(m, |n| self.link_of(u, n).is_some())
     }
 
     /// How to reach member `k`: directly if we hold a link, otherwise forwarded through
     /// a member we do.
-    fn route(&self, m: &[u32; 3], k: u8) -> Option<Route<'_>> {
-        match self.link_of(*m.get(k as usize)?) {
+    fn route(&self, u: u32, m: &[u32; 3], k: u8) -> Option<Route<'_>> {
+        match self.link_of(u, *m.get(k as usize)?) {
             Some(link) => Some(Route {
                 link,
                 hops: 0,
                 imm: k + 1,
             }),
-            None => self.close(m).map(|(link, _)| Route {
+            None => self.close(u, m).map(|(link, _)| Route {
                 link,
                 hops: 1,
                 imm: k + 1,
@@ -750,7 +722,7 @@ impl Paxos {
     async fn drive(
         &'static self,
         addr: GlobalAddr,
-        group: u32,
+        group: GroupId,
         m: [u32; 3],
         k: u8,
         guard: u64,
@@ -758,9 +730,9 @@ impl Paxos {
     ) -> Result<u64, Status> {
         let term = self.term_for(group, addr).await?;
         let b = Ballot::new(term, k);
-        let need = self.quorum();
+        let need = self.quorum(addr.universe());
         self.claim(addr, group).await?;
-        let mut peers = self.peers(&m, Some(k));
+        let mut peers = self.peers(addr.universe(), &m, Some(k));
         let r = self.round(addr, &mut peers, need, guard, b, page).await;
         self.release(addr, group).await;
         match r {
@@ -829,8 +801,10 @@ impl Paxos {
         guard: Option<u64>,
         page: Page<'_>,
     ) -> Result<u64, Status> {
-        self.delegate(&m, |r| self.send_accept(r, addr, guard, Ballot::ZERO, page))
-            .await?;
+        self.delegate(addr.universe(), &m, |r| {
+            self.send_accept(r, addr, guard, Ballot::ZERO, page)
+        })
+        .await?;
         // A guard left to the acceptor leaves us without the new version. Nothing on the
         // ublk path reads it, and an `ACCEPT` has no reply body to carry it back.
         Ok(guard.map_or(0, |g| g + 1))
@@ -840,12 +814,12 @@ impl Paxos {
     /// not the group's answer: the next candidate is tried, and only a group with nobody
     /// home is unavailable. Anything other than a transport failure is the group's
     /// verdict and is returned as it stands.
-    async fn delegate<'a, S, F>(&'a self, m: &[u32; 3], mut send: S) -> Result<(), Status>
+    async fn delegate<'a, S, F>(&'a self, u: u32, m: &[u32; 3], mut send: S) -> Result<(), Status>
     where
         S: FnMut(Route<'a>) -> F,
         F: Future<Output = Result<(), Status>>,
     {
-        for (link, _) in self.candidates(m) {
+        for (link, _) in self.candidates(u, m) {
             match send(Route {
                 link,
                 hops: 0,
@@ -901,7 +875,7 @@ impl Paxos {
                 let tr = &mut t[fabric::BLOCK..];
                 fabric::put(tr, T_GUARD, guard.unwrap_or(DERIVED));
                 fabric::put(tr, T_BALLOT, b.raw() as u64);
-                fabric::put(tr, T_EPOCH, self.alloc.config().topology.epoch as u64);
+                fabric::put(tr, T_EPOCH, self.alloc.config().epoch_of(addr.0) as u64);
                 r.send(f, t.buf()).await
             }
         }
@@ -920,7 +894,7 @@ impl Paxos {
         t.fill(0);
         fabric::put(&mut t, T_GUARD, guard);
         fabric::put(&mut t, T_BALLOT, b.raw() as u64);
-        fabric::put(&mut t, T_EPOCH, self.alloc.config().topology.epoch as u64);
+        fabric::put(&mut t, T_EPOCH, self.alloc.config().epoch_of(addr.0) as u64);
         r.send(f, t.buf()).await
     }
 
@@ -1034,7 +1008,7 @@ impl Paxos {
     /// same-key proposals rather than letting them race and both lose. It is also the
     /// one-value-per-ballot rule: a second attempt at one version would have to reuse a
     /// ballot, which repair could then use to resurrect a value that was never chosen.
-    async fn claim(&'static self, addr: GlobalAddr, group: u32) -> Result<(), Status> {
+    async fn claim(&'static self, addr: GlobalAddr, group: GroupId) -> Result<(), Status> {
         let core = self.core_of(group);
         runtime::on_core(core, move || async move {
             if self.state[core].borrow_mut().inflight.insert(addr.0) {
@@ -1046,7 +1020,7 @@ impl Paxos {
         .await
     }
 
-    async fn release(&'static self, addr: GlobalAddr, group: u32) {
+    async fn release(&'static self, addr: GlobalAddr, group: GroupId) {
         let core = self.core_of(group);
         runtime::on_core(core, move || async move {
             self.state[core].borrow_mut().inflight.remove(&addr.0);
@@ -1106,7 +1080,7 @@ impl Paxos {
         let group = self.group(addr);
         let m = self.members(group).ok_or(Status::Unmapped)?;
         let me = self.self_index(&m);
-        let need = self.quorum();
+        let need = self.quorum(addr.universe());
         let (kind, _) = self.alloc.kind_of(addr)?;
 
         // A group member holds the authoritative page, so it is never a cache client;
@@ -1225,7 +1199,7 @@ impl Paxos {
         // The entry was stale or absent. The metadata round is already done, so only the
         // data leg is left: one extra round trip on a rare path.
         self.stat(|s| s.read_remote_match += 1);
-        let route = self.route(m, idx).ok_or(Status::Io)?;
+        let route = self.route(addr.universe(), m, idx).ok_or(Status::Io)?;
         self.pull_from(route, addr, sink.reborrow()).await?;
         self.offer(addr, &sink, r).await;
         Ok(Some(r))
@@ -1244,8 +1218,10 @@ impl Paxos {
         if self.cache.holds(addr, w) {
             return self.cache.load(addr, false, 0, sink.buf()).await;
         }
-        let node = self.cache.replica(addr, w, |n| self.link_of(n).is_some())?;
-        let link = self.link_of(node)?;
+        let node = self
+            .cache
+            .replica(addr, w, |n| self.link_of(addr.universe(), n).is_some())?;
+        let link = self.link_of(addr.universe(), node)?;
         let Sink::Small(p) = sink else { return None };
         // Gather mode: the peer's page and the register it claims arrive in one command.
         // A miss, or a replica that is shedding, answers `MISSING` and we fall back to
@@ -1287,7 +1263,8 @@ impl Paxos {
         )
         .await;
         let Some(r) = cached else { return false };
-        if self.quorum() > 1 && !matches!(matching(&others), Some((q, _)) if q.version == r.version)
+        if self.quorum(addr.universe()) > 1
+            && !matches!(matching(&others), Some((q, _)) if q.version == r.version)
         {
             // Stale, or never chosen. Dropping it keeps a mis-cached page from costing
             // this round again on the next read.
@@ -1321,8 +1298,10 @@ impl Paxos {
         {
             return None;
         }
-        let node = self.cache.replica(addr, w, |n| self.link_of(n).is_some())?;
-        let link = self.link_of(node)?;
+        let node = self
+            .cache
+            .replica(addr, w, |n| self.link_of(addr.universe(), n).is_some())?;
+        let link = self.link_of(addr.universe(), node)?;
         let mut f = self.frame(Op::Get, addr, true).ok()?;
         f.flags |= fabric::CACHE_ONLY;
         let mut meta = self.frame(Op::GetMeta, addr, true).ok()?;
@@ -1352,7 +1331,7 @@ impl Paxos {
         let Some(m) = self.members(self.group(addr)) else {
             return;
         };
-        if self.quorum() > 1 {
+        if self.quorum(addr.universe()) > 1 {
             let others = self.metas(addr, &m, self.self_index(&m), None).await;
             if !matches!(matching(&others), Some((q, _)) if q.version == version) {
                 return;
@@ -1395,8 +1374,8 @@ impl Paxos {
             return Ok((Some(k), r));
         }
         let mut last = Status::Io;
-        for i in self.nearest_first(m) {
-            let Some(route) = self.route(m, i) else {
+        for i in self.nearest_first(addr.universe(), m) {
+            let Some(route) = self.route(addr.universe(), m, i) else {
                 continue;
             };
             match self.pull_from(route, addr, sink.reborrow()).await {
@@ -1412,13 +1391,32 @@ impl Paxos {
     /// a hit, but a non-member never had a copy to hit: its local miss is not the group's
     /// answer, and repair heals acceptors rather than putting the page in front of a
     /// reader that is not one.
+    ///
+    /// A member with nothing answers `MISSING`, which is not a vote: the wire cannot
+    /// distinguish a page nobody ever wrote from a copy that never landed. Repair is
+    /// what settles the difference, and only an empty register afterwards makes this a
+    /// hole the reader may see as zeroes.
     pub async fn pull_huge(&'static self, addr: GlobalAddr, buf: Buf) -> Result<Register, Status> {
         if let Some(r) = self.away(addr)? {
             return self.pull_from(r, addr, Sink::Huge(buf)).await;
         }
         let m = self.members(self.group(addr)).ok_or(Status::Unmapped)?;
-        let (_, r) = self.fetch(addr, &m, None, Sink::Huge(buf)).await?;
-        Ok(r)
+        let mut sink = Sink::Huge(buf);
+        match self.fetch(addr, &m, None, sink.reborrow()).await {
+            Ok((_, r)) => Ok(r),
+            Err(e @ (Status::Hole | Status::Missing)) => {
+                if self.quorum(addr.universe()) <= 1 {
+                    return Err(e);
+                }
+                let (kind, _) = self.alloc.kind_of(addr)?;
+                let best = self.repair(addr).await?;
+                if empty(kind, best.version) {
+                    return Err(Status::Hole);
+                }
+                self.pull_best(addr, &m, None, best, sink).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn read_local(
@@ -1504,7 +1502,7 @@ impl Paxos {
             if Some(i) == me || regs[i as usize] != Some(want) {
                 continue;
             }
-            let Some(route) = self.route(m, i) else {
+            let Some(route) = self.route(addr.universe(), m, i) else {
                 continue;
             };
             match self.pull_from(route, addr, sink.reborrow()).await {
@@ -1540,7 +1538,7 @@ impl Paxos {
                 // member's own client reads feed the sketch too: the cache rests on the
                 // owner seeing the whole read stream, not just the fabric's share.
                 out[i as usize] = self.register_and_width(addr).await.ok().map(|(r, _)| r);
-            } else if let Some(r) = self.route(m, i) {
+            } else if let Some(r) = self.route(addr.universe(), m, i) {
                 pending.push((i as usize, r));
             }
         }
@@ -1811,7 +1809,7 @@ impl Paxos {
     /// The member side of `TERM`: the promise we hold for a group. Unlike `PREPARE` it
     /// raises nothing. Read by a member recovering a promise it lost, which needs the
     /// floor we already refuse below, not a new round.
-    pub async fn term(&'static self, group: u32, out: &mut [u8]) -> Result<(), Status> {
+    pub async fn term(&'static self, group: GroupId, out: &mut [u8]) -> Result<(), Status> {
         let term = self.held_term(group).await;
         out.fill(0);
         fabric::put(out, T_TERM, term as u64);
@@ -1871,7 +1869,7 @@ impl Paxos {
             Some(z) => self.toward(z, addr)?,
             None => {
                 let m = self.members(group).ok_or(Status::Unmapped)?;
-                self.route(&m, from).ok_or(Status::Io)?
+                self.route(addr.universe(), &m, from).ok_or(Status::Io)?
             }
         };
         if huge {
@@ -1888,9 +1886,9 @@ impl Paxos {
     }
 
     /// Whether this extent has already been frozen here.
-    pub async fn sealed(&'static self, id: ShardId) -> bool {
+    pub async fn sealed(&'static self, extent: u32) -> bool {
         runtime::on_core(0, move || async move {
-            self.state[0].borrow().seals.contains_key(&id)
+            self.state[0].borrow().seals.contains_key(&extent)
         })
         .await
     }
@@ -1900,39 +1898,42 @@ impl Paxos {
     /// quorum. It is idempotent — a seal already held is re-observed — so each source
     /// node driving its own fan-out is merely redundant.
     ///
-    /// The term is the topology epoch: a number every node in the zone already agrees
-    /// on, and monotone, which is all the seal table asks of it.
-    pub async fn seal_extent(&'static self, addr: GlobalAddr, id: ShardId) -> Result<(), Status> {
+    /// The term is the universe's topology epoch: a number every node in the zone
+    /// already agrees on, and monotone, which is all the seal table asks of it.
+    pub async fn seal_extent(&'static self, addr: GlobalAddr, extent: u32) -> Result<(), Status> {
         let cfg = self.alloc.config();
-        let term = cfg.topology.epoch;
-        let mut nodes: Vec<u32> = cfg.zone_nodes();
+        // The catalog to fan out over is the one for this address's universe: a node in
+        // another universe holds no register of this extent and no seal table row for it.
+        let u = cfg.universe(addr.universe()).ok_or(Status::Unmapped)?;
+        let term = u.epoch;
+        let mut nodes: Vec<u32> = u.zone_nodes();
         nodes.retain(|&n| n != cfg.node.id);
         for n in nodes {
-            if let Some(link) = self.link_of(n) {
+            if let Some(link) = self.link_of(u.id, n) {
                 let r = Route {
                     link,
                     hops: 0,
                     imm: 0,
                 };
-                let _ = self.send_seal(r, addr, id, term).await;
+                let _ = self.send_seal(r, addr, extent, term).await;
             }
         }
         // Ours last: while it is absent this node keeps driving the fan-out, so a partial
         // round is retried rather than forgotten.
-        self.seal(id, term).await
+        self.seal(extent, term).await
     }
 
     async fn send_seal(
         &self,
         r: Route<'_>,
         addr: GlobalAddr,
-        id: ShardId,
+        extent: u32,
         term: u32,
     ) -> Result<(), Status> {
         let f = self.frame(Op::Seal, addr, false)?;
         let mut t = PoolBuf::alloc(fabric::BLOCK).await;
         t.fill(0);
-        fabric::put(&mut t, T_EXTENT, id.extent as u64);
+        fabric::put(&mut t, T_EXTENT, extent as u64);
         fabric::put(&mut t, T_SEAL_TERM, term as u64);
         r.send(f, t.buf()).await
     }
@@ -1971,13 +1972,13 @@ impl Paxos {
 
     /// The member side of `SEAL`: this node refuses every later accept for any address
     /// in the shard. Idempotent, and monotone in `term`.
-    pub async fn seal(&'static self, id: ShardId, term: u32) -> Result<(), Status> {
+    pub async fn seal(&'static self, extent: u32, term: u32) -> Result<(), Status> {
         // An extent's pages are spread over every core, so the refusal has to be too.
         for core in 0..self.state.len() {
             runtime::on_core(core, move || async move {
                 let mut l = self.state[core].borrow_mut();
                 l.stats.seals += 1;
-                let e = l.seals.entry(id).or_insert(term);
+                let e = l.seals.entry(extent).or_insert(term);
                 *e = (*e).max(term);
             })
             .await;
@@ -1994,7 +1995,7 @@ impl Paxos {
     /// proposer — it says only that this node must not run the round, so the caller
     /// hands it to a member that is caught up. To an acceptor it is one, and
     /// [`Self::gate_accept`] is where that decision lives.
-    async fn gate(&'static self, addr: GlobalAddr, group: u32) -> Result<Gate, Status> {
+    async fn gate(&'static self, addr: GlobalAddr, group: GroupId) -> Result<Gate, Status> {
         let cfg = self.alloc.config();
         let core = self.core_of(group);
         let id = self.shard_of(addr);
@@ -2018,18 +2019,13 @@ impl Paxos {
     }
 
     /// The extent `addr` falls in, as the seal table names it.
-    fn shard_of(&self, addr: GlobalAddr) -> Option<ShardId> {
-        let v = self.alloc.config().volume(addr.volume())?;
-        let ext = v.extent_index(addr.offset() as u64)?;
-        Some(ShardId {
-            volume: v.id,
-            extent: ext as u32,
-        })
+    fn shard_of(&self, addr: GlobalAddr) -> Option<u32> {
+        self.alloc.config().extent_id_of(addr.0)
     }
 
     /// [`Self::gate`] for the acceptor half of a round, which may not proceed while we
     /// are replaying.
-    async fn gate_accept(&'static self, addr: GlobalAddr, group: u32) -> Result<(), Status> {
+    async fn gate_accept(&'static self, addr: GlobalAddr, group: GroupId) -> Result<(), Status> {
         match self.gate(addr, group).await? {
             Gate::Serve { replaying: true } => Err(Status::Io),
             _ => Ok(()),
@@ -2052,7 +2048,7 @@ impl Paxos {
     /// and — since a replay ends only when a comparison finds nothing left to repair,
     /// and repairing is a prepare round — would leave the group with no way out of the
     /// replay at all.
-    pub(crate) async fn replaying(&'static self, group: u32) -> bool {
+    pub(crate) async fn replaying(&'static self, group: GroupId) -> bool {
         let core = self.core_of(group);
         runtime::on_core(core, move || async move {
             self.state[core].borrow().replaying.contains(&group)
@@ -2063,7 +2059,7 @@ impl Paxos {
     /// The groups this core is replaying. `core_of` is the group modulo the core count,
     /// so a core's own replay set is exactly the candidates the sweep picks from, and
     /// asking is a borrow rather than a hop per group.
-    pub fn replaying_here(&self) -> Vec<u32> {
+    pub fn replaying_here(&self) -> Vec<GroupId> {
         self.state[runtime::core()]
             .borrow()
             .replaying
@@ -2088,7 +2084,7 @@ impl Paxos {
     /// promises at that term or above. Both have to answer, because hearing from one
     /// could miss precisely that member — and losing a second member while a third
     /// replays is outside what a group of three survives anyway.
-    pub async fn rejoin(&'static self, group: u32) -> Result<(), Status> {
+    pub async fn rejoin(&'static self, group: GroupId) -> Result<(), Status> {
         let m = self.members(group).ok_or(Status::Unmapped)?;
         let me = self.self_index(&m).ok_or(Status::Unmapped)?;
         let mut term = 0;
@@ -2096,10 +2092,12 @@ impl Paxos {
             if i == me {
                 continue;
             }
-            let link = self.link_of(m[i as usize]).ok_or(Status::Io)?;
+            let link = self
+                .link_of(group.universe(), m[i as usize])
+                .ok_or(Status::Io)?;
             // Group-addressed, like the anti-entropy ops: `offset` is the group and the
             // reply is a trailer whose `T_TERM` slot is the promise.
-            let f = Frame::new(Op::Term, false, 0, group);
+            let f = Frame::raw(Op::Term, false, group.index() as u64);
             let t = PoolBuf::alloc(fabric::BLOCK).await;
             link.send(f, t.buf()).await.map_err(Status::from_wire)?;
             term = term.max(fabric::get(&t, T_TERM) as u32);
@@ -2114,7 +2112,7 @@ impl Paxos {
 
     /// Mark a group as still replaying, or caught up. Driven by the anti-entropy
     /// sweep.
-    pub async fn set_replaying(&'static self, group: u32, on: bool) {
+    pub async fn set_replaying(&'static self, group: GroupId, on: bool) {
         let core = self.core_of(group);
         runtime::on_core(core, move || async move {
             let mut l = self.state[core].borrow_mut();
@@ -2146,7 +2144,7 @@ impl Paxos {
     /// The term this node may issue one-shot accepts at. A term read back from the
     /// superblock is not held until it has been raised once, so a restart costs one
     /// prepare per group and never a stale ballot.
-    async fn term_for(&'static self, group: u32, addr: GlobalAddr) -> Result<u32, Status> {
+    async fn term_for(&'static self, group: GroupId, addr: GlobalAddr) -> Result<u32, Status> {
         let core = self.core_of(group);
         // One prepare per group at a time. Every prepare raises both peers' promises by
         // one, so letting concurrent writes to the same group each run their own turns a
@@ -2190,7 +2188,7 @@ impl Paxos {
 
     /// The term we currently promise, without raising it. Used where a ballot has to
     /// be derived rather than sent.
-    async fn held_term(&'static self, group: u32) -> u32 {
+    async fn held_term(&'static self, group: GroupId) -> u32 {
         let core = self.core_of(group);
         runtime::on_core(core, move || async move {
             self.state[core]
@@ -2205,7 +2203,7 @@ impl Paxos {
     /// Give up the right to issue one-shot accepts at the term we hold, so the next
     /// `term_for` runs a prepare round. The promise itself is untouched: durable, and
     /// only ever rising.
-    async fn refresh(&'static self, group: u32) {
+    async fn refresh(&'static self, group: GroupId) {
         let core = self.core_of(group);
         runtime::on_core(core, move || async move {
             if let Some(t) = self.state[core].borrow_mut().terms.get_mut(&group) {
@@ -2223,7 +2221,7 @@ impl Paxos {
     /// there measured worse: an acceptor that has just raised its promise is the
     /// cheapest proposer in the group, and making it prepare again to learn a term it
     /// already knows costs a round trip on every write.
-    async fn bump(&'static self, group: u32) -> Result<u32, Status> {
+    async fn bump(&'static self, group: GroupId) -> Result<u32, Status> {
         let core = self.core_of(group);
         let t = runtime::on_core(core, move || async move {
             let mut l = self.state[core].borrow_mut();
@@ -2244,7 +2242,7 @@ impl Paxos {
     /// term, where another member's ballot is higher at the same term, and every accept
     /// is refused as a ballot regression forever. The prepare `term_for` then runs is
     /// how a member refreshes after a rejected accept.
-    async fn observe(&'static self, group: u32, term: u32) {
+    async fn observe(&'static self, group: GroupId, term: u32) {
         let core = self.core_of(group);
         runtime::on_core(core, move || async move {
             let mut l = self.state[core].borrow_mut();
@@ -2293,7 +2291,7 @@ impl Paxos {
         let group = self.group(addr);
         let m = self.members(group).ok_or(Status::Unmapped)?;
         let me = self.self_index(&m);
-        let need = self.quorum();
+        let need = self.quorum(addr.universe());
 
         let mut regs: [Option<Register>; 3] = [None; 3];
         let mut terms: Vec<u32> = Vec::new();
@@ -2319,7 +2317,7 @@ impl Paxos {
         // timeout for the round, not one apiece.
         let mut pending: Vec<(usize, Route<'_>)> = (0..3u8)
             .filter(|i| Some(*i) != me)
-            .filter_map(|i| self.route(&m, i).map(|r| (i as usize, r)))
+            .filter_map(|i| self.route(addr.universe(), &m, i).map(|r| (i as usize, r)))
             .collect();
         let mut take = |i: usize, r: Result<(Register, u32), Status>| {
             if let Ok((reg, t)) = r {
@@ -2522,7 +2520,7 @@ impl Paxos {
         )
         .await;
         held += x as usize + y as usize;
-        if held < self.quorum() {
+        if held < self.quorum(addr.universe()) {
             self.stat(|s| s.groups_unavailable += 1);
             return Err(Status::Io);
         }
@@ -2543,7 +2541,7 @@ impl Paxos {
     ) -> bool {
         if Some(i) == me {
             self.learn(addr, best, src, true).await.is_ok()
-        } else if let Some(r) = self.route(m, i) {
+        } else if let Some(r) = self.route(addr.universe(), m, i) {
             self.send_learn(r, addr, best, src, true).await.is_ok()
         } else {
             false
@@ -2595,7 +2593,7 @@ impl Paxos {
                 }
                 let got = if Some(i) == me {
                     self.read_local(addr, Sink::Huge(page.buf())).await
-                } else if let Some(route) = self.route(m, i) {
+                } else if let Some(route) = self.route(addr.universe(), m, i) {
                     self.pull_from(route, addr, Sink::Huge(page.buf())).await
                 } else {
                     Err(Status::Io)
@@ -2614,7 +2612,7 @@ impl Paxos {
                 }
                 let got = if Some(i) == me {
                     self.read_local(addr, Sink::Small(&mut page)).await
-                } else if let Some(route) = self.route(m, i) {
+                } else if let Some(route) = self.route(addr.universe(), m, i) {
                     self.pull_from(route, addr, Sink::Small(&mut page)).await
                 } else {
                     Err(Status::Io)
@@ -2637,8 +2635,8 @@ impl Paxos {
         for i in 0..self.state.len() {
             let (terms, seals) = runtime::on_core(i, move || async move {
                 let l = self.state[i].borrow();
-                let t: Vec<(u32, u32)> = l.terms.iter().map(|(&g, x)| (g, x.value)).collect();
-                let s: Vec<(ShardId, u32)> = if i == 0 {
+                let t: Vec<(GroupId, u32)> = l.terms.iter().map(|(&g, x)| (g, x.value)).collect();
+                let s: Vec<(u32, u32)> = if i == 0 {
                     l.seals.iter().map(|(&k, &v)| (k, v)).collect()
                 } else {
                     Vec::new()
@@ -2647,12 +2645,11 @@ impl Paxos {
             })
             .await;
             c.terms.extend(terms);
-            c.seals
-                .extend(seals.into_iter().map(|(k, term)| layout::Seal {
-                    volume: k.volume,
-                    extent: k.extent,
-                    term,
-                }));
+            c.seals.extend(
+                seals
+                    .into_iter()
+                    .map(|(extent, term)| layout::Seal { extent, term }),
+            );
         }
         c.terms.sort_unstable();
         c.terms.truncate(layout::MAX_TERMS);
@@ -2763,14 +2760,14 @@ pub fn learn_trailer(t: &[u8]) -> (Register, u8, bool) {
     )
 }
 
-/// A `SEAL` trailer: which shard, and the term the source group sealed it at. The
-/// volume comes from the frame, which names one already.
-pub fn seal_trailer(volume: u32, t: &[u8]) -> (ShardId, u32) {
-    let id = ShardId {
-        volume,
-        extent: fabric::get(t, T_EXTENT) as u32,
-    };
-    (id, fabric::get(t, T_SEAL_TERM) as u32)
+/// A `SEAL` trailer: which extent, and the term the source group sealed it at. The
+/// frame names no page, so the whole address is here: an extent id is unique across
+/// every universe, and the caller checks it belongs to the one the frame arrived on.
+pub fn seal_trailer(t: &[u8]) -> (u32, u32) {
+    (
+        fabric::get(t, T_EXTENT) as u32,
+        fabric::get(t, T_SEAL_TERM) as u32,
+    )
 }
 
 /// Frame shapes the target accepts for an `ACCEPT`. Exposed so `server` and this file

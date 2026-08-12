@@ -21,15 +21,32 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
-use crate::config::{Config, Kind, Live};
+use crate::config::{Config, GroupId, Kind, Live};
 use crate::heal::{self, Tuple};
 use crate::layout::{self, Class, Geometry, MBLOCK};
 use crate::paxos::{Ballot, Register};
 use crate::runtime::{self, Buf, Disk, Durability, PoolBuf};
 
 use shard::Ticket;
-use shard::{Act, Lookup, Shape, Shard, Staged};
+use shard::{Act, Lookup, Maps, Shape, Shard, Staged};
 pub use shard::{GlobalAddr, Pressure, Status};
+
+/// Bind the two config lookups a shard mutation needs and bundle them as `$m`.
+///
+/// A macro rather than a function because the closures borrow the configuration and the
+/// bundle borrows the closures, so nothing here can be returned: the bindings have to
+/// land in the caller's own scope.
+macro_rules! maps {
+    ($cfg:expr, $m:ident) => {
+        let cfg = $cfg;
+        let gof = |a: u64| cfg.group(a);
+        let xof = |a: u64| cfg.extent_at(a).map(|e| (e.id, e.tombstone_epoch as u32));
+        let $m = Maps {
+            gof: &gof,
+            xof: &xof,
+        };
+    };
+}
 
 /// A reservation whose page is durable but whose entry is not installed yet. Opaque
 /// on purpose: the ticket inside never leaves the allocator.
@@ -173,7 +190,7 @@ impl Allocator {
     /// Reuses the consensus group mapping so the allocator lookup rides the hop the
     /// consensus layer already makes.
     fn owner(&self, addr: GlobalAddr, class: Class) -> usize {
-        self.config().group(addr.0) as usize % shards_for(self.cores, &self.geo, class)
+        self.config().group(addr.0).index() as usize % shards_for(self.cores, &self.geo, class)
     }
 
     /// The configuration currently in force. Reads are a single load: the control
@@ -189,17 +206,15 @@ impl Allocator {
         self.cfg.install(cfg);
     }
 
-    /// The extent's page kind and class, and its volume's tombstone epoch. All three
-    /// come out of one volume lookup because every caller that needs the epoch already
-    /// needs the kind. The class is the volume's, not the extent's: page size is uniform
-    /// across a volume.
+    /// The extent's page kind and class, and its tombstone epoch. All three come out of
+    /// one lookup because every caller that needs the epoch already needs the kind, and
+    /// the extent is now where all three live.
     fn extent(&self, addr: GlobalAddr) -> Option<(Kind, Class, u64)> {
-        let v = self.config().volume(addr.volume())?;
-        let e = v.extent_at(addr.offset() as u64)?;
+        let e = self.config().extent_at(addr.0)?;
         Some((
             e.kind,
-            if v.huge { Class::Huge } else { Class::Small },
-            v.tombstone_epoch,
+            if e.huge { Class::Huge } else { Class::Small },
+            e.tombstone_epoch,
         ))
     }
 
@@ -251,8 +266,8 @@ impl Allocator {
         self.shard(runtime::core()).capacity()
     }
 
-    /// Live and tombstoned pages per volume in this core's shards,
-    /// `(volume, live, tombstones)`. Per core for the same reason as `capacity`; the
+    /// Live and tombstoned pages per extent in this core's shards,
+    /// `(extent, live, tombstones)`. Per core for the same reason as `capacity`; the
     /// exporter sums them.
     pub fn census(&self) -> Vec<(u32, u64, u64)> {
         self.shard(runtime::core()).census()
@@ -294,17 +309,15 @@ impl Allocator {
         crc: u32,
     ) -> Result<Option<Staged>, Status> {
         let kind = self.extent(addr).ok_or(Status::Unmapped)?.0;
-        let cfg = self.config();
-        let gof = |a: u64| cfg.group(a);
+        maps!(self.config(), m);
         self.shard(runtime::core())
-            .stage(addr, kind, class, t, crc, &gof)
+            .stage(addr, kind, class, t, crc, &m)
     }
 
     /// Undo a reservation whose data write failed, so the slot is not leaked.
     fn unreserve(&self, class: Class, t: Ticket) {
-        let cfg = self.config();
-        let gof = |a: u64| cfg.group(a);
-        self.shard(runtime::core()).unreserve(class, t, &gof);
+        maps!(self.config(), m);
+        self.shard(runtime::core()).unreserve(class, t, &m);
     }
 
     // ------------------------------------------------------------------- group commit
@@ -894,9 +907,8 @@ impl Allocator {
         self.flush_until(class, st.li, st.seq).await?;
         // Only now is it safe to give the address's previous slot back.
         if let Some(old) = st.stale {
-            let cfg = self.config();
-            let gof = |a: u64| cfg.group(a);
-            self.shard(runtime::core()).release(class, old, &gof);
+            maps!(self.config(), m);
+            self.shard(runtime::core()).release(class, old, &m);
         }
         Ok(true)
     }
@@ -919,9 +931,8 @@ impl Allocator {
         };
         let holder = (slot / class.k() % self.cores as u32) as usize;
         let retire = move || async move {
-            let cfg = self.config();
-            let gof = |a: u64| cfg.group(a);
-            let flush = self.shard(runtime::core()).release(class, slot, &gof);
+            maps!(self.config(), m);
+            let flush = self.shard(runtime::core()).release(class, slot, &m);
             if let Some((li, seq)) = flush {
                 self.flush_until(class, li, seq).await?;
             }
@@ -1047,11 +1058,10 @@ impl Allocator {
         guard: Option<u64>,
         ballot: Ballot,
     ) -> Result<Option<(u32, u64)>, Status> {
-        let cfg = self.config();
-        let epoch = cfg.tombstone_epoch_of(addr.0);
-        let gof = |a: u64| cfg.group(a);
+        let epoch = self.config().tombstone_epoch_of(addr.0);
+        maps!(self.config(), m);
         self.shard(runtime::core())
-            .trim(addr, kind, class, guard, ballot, epoch, &gof)
+            .trim(addr, kind, class, guard, ballot, epoch, &m)
     }
 
     // -------------------------------------------------------- consensus side state
@@ -1092,13 +1102,17 @@ impl Allocator {
     // ------------------------------------------------------------------- anti-entropy
 
     /// The core that holds a group's registers, and so its digest and its cursors.
-    fn owner_of(&self, group: u32, class: Class) -> usize {
-        group as usize % shards_for(self.cores, &self.geo, class)
+    ///
+    /// The index alone, not the whole id: universes reuse the same core layout, which
+    /// keeps this in step with `owner` and so keeps a page's allocator shard and its
+    /// consensus group on the one core.
+    fn owner_of(&self, group: GroupId, class: Class) -> usize {
+        group.index() as usize % shards_for(self.cores, &self.geo, class)
     }
 
     /// This node's digest vector for one group and class. Boxed because it crosses a
     /// core boundary and the runtime's reply payload is small.
-    pub async fn digests(&'static self, group: u32, huge: bool) -> Box<[u64; heal::BUCKETS]> {
+    pub async fn digests(&'static self, group: GroupId, huge: bool) -> Box<[u64; heal::BUCKETS]> {
         let class = class_of(huge);
         runtime::on_core(self.owner_of(group, class), move || async move {
             self.shard(runtime::core()).digest_vector(class, group)
@@ -1109,7 +1123,7 @@ impl Allocator {
     /// Open an enumeration of a group's registers, narrowed by `filter`.
     pub async fn snap_open(
         &'static self,
-        group: u32,
+        group: GroupId,
         huge: bool,
         filter: heal::Filter,
     ) -> Result<u32, Status> {
@@ -1126,10 +1140,14 @@ impl Allocator {
 
     /// Next chunk. Bounded by entries scanned as well as tuples produced, so a sparse
     /// filter costs more frames but never a long stall on the owning core.
+    ///
+    /// `universe` is the namespace the request came in on, `None` for a local caller;
+    /// a cursor opened in one universe will not answer another.
     pub async fn snap_next(
         &'static self,
         id: u32,
         seq: Option<u8>,
+        universe: Option<u32>,
     ) -> Result<(Vec<Tuple>, bool), Status> {
         let (core, huge, _, _) = heal::snap_parts(id);
         if core >= self.cores {
@@ -1138,10 +1156,9 @@ impl Allocator {
         let class = class_of(huge);
         runtime::on_core(core, move || async move {
             let now = Instant::now();
-            let cfg = self.config();
-            let gof = |a: u64| cfg.group(a);
+            maps!(self.config(), m);
             self.shard(runtime::core())
-                .snap_next(class, id, seq, &gof, now)
+                .snap_next(class, id, seq, universe, &m, now)
         })
         .await
     }
@@ -1164,13 +1181,13 @@ impl Allocator {
     /// Groups this core still holds registers for, in one class. Per core, like
     /// `census`: the digests live where the registers do, and a group's registers are
     /// all on the one core its id maps to.
-    pub fn held_groups(&self, huge: bool) -> Vec<u32> {
+    pub fn held_groups(&self, huge: bool) -> Vec<GroupId> {
         self.shard(runtime::core()).held_groups(class_of(huge))
     }
 
     /// Forget a group this core has been drained of, so it stops turning up in
     /// `held_groups`.
-    pub async fn forget_group(&'static self, group: u32, huge: bool) {
+    pub async fn forget_group(&'static self, group: GroupId, huge: bool) {
         let class = class_of(huge);
         runtime::on_core(self.owner_of(group, class), move || async move {
             self.shard(runtime::core()).forget_group(class, group);
@@ -1187,13 +1204,12 @@ impl Allocator {
         let owner = self.owner(addr, class);
         // The mblock index is the owner's, so the flush has to happen there too.
         runtime::on_core(owner, move || async move {
-            let cfg = self.config();
-            let gof = |a: u64| cfg.group(a);
+            maps!(self.config(), m);
             // Bound before the match: a temporary in the scrutinee would hold the
             // shard borrow across the flush's await.
             let hit = self
                 .shard(runtime::core())
-                .discard(addr, class, version, &gof);
+                .discard(addr, class, version, &m);
             match hit {
                 Some((li, need)) => self.flush_until(class, li, need).await,
                 None => Ok(()),
@@ -1211,12 +1227,8 @@ impl Allocator {
     pub fn tick(&self, now: Instant) {
         let core = runtime::core();
         let cfg = self.config();
-        let gof = |a: u64| cfg.group(a);
-        // The epoch is the address's volume's, so the sweep resolves it per tombstone
-        // rather than being handed one scalar. Bounded by `check_volume`, so the narrow
-        // is lossless.
-        let eof = |a: u64| cfg.tombstone_epoch_of(a) as u32;
-        // Nothing to reclaim until some volume has collected at least once.
+        maps!(cfg, m);
+        // Nothing to reclaim until some extent has collected at least once.
         let collecting = cfg.collecting();
         let mut c = self.core_of(core);
         for class in [Class::Small, Class::Huge] {
@@ -1225,12 +1237,12 @@ impl Allocator {
             }
             c.shard.snap_expire(class, now);
             if collecting {
-                c.shard.sweep(class, &eof, &gof);
+                c.shard.sweep(class, &m);
             }
         }
         c.shard
             .set_occ(occ_per_core(cfg.policy.occ_bytes, self.cores));
-        c.shard.set_recoverable(!cfg.node.peers.is_empty());
+        c.shard.set_recoverable(cfg.peer_count() > 0);
     }
 }
 
@@ -1291,11 +1303,11 @@ pub fn open(
     let scans = scan(path, &geo, cores, &limit)?;
 
     // Nothing to heal a lost mblock from without peers, so a miss there stays a hole.
-    let recoverable = !cfg.node.peers.is_empty();
-    // Scoped so the group closure's borrow of `cfg` ends before `cfg` is handed over.
+    let recoverable = cfg.peer_count() > 0;
+    // Scoped so the lookup closures' borrow of `cfg` ends before `cfg` is handed over.
     let (shards, quarantined) = {
-        let gof = |a: u64| cfg.group(a);
-        shard::rebuild(&shape_of(&geo, &cfg, cores), cores, scans, &gof)
+        maps!(&cfg, m);
+        shard::rebuild(&shape_of(&geo, &cfg, cores), cores, scans, &m)
     };
     let shards = shards
         .into_iter()
@@ -1583,17 +1595,34 @@ mod tests {
         };
     }
 
-    const LWW: u32 = 1;
-    const OCC: u32 = 2;
-    const IMM: u32 = 3;
-    const BIG: u32 = 4;
+    /// One universe holds every extent here: nothing in the allocator is about
+    /// partitioning, and a second universe would only make the addresses longer.
+    const UNIVERSE: u32 = 1;
+
+    /// Extent bases in that universe's LBA space, in the order `config_text` lays them
+    /// out. The huge extents are 1024-aligned because a 4 MiB page spans 1024 blocks.
+    const LWW: u64 = 0;
+    const OCC: u64 = 4096;
+    const IMM: u64 = 4352;
+    const BIG: u64 = 5120;
     /// Only exists once the device has been grown for it.
-    const GREW: u32 = 5;
-    const GREW_BIG: u32 = 6;
+    const GREW: u64 = 7168;
+    const GREW_BIG: u64 = 15360;
 
     /// The LWW page whose bytes phase 2 rots. Its checksum never comes back, so every
     /// later phase has to leave it out of what it expects to be served.
-    const ROTTED: u32 = 1;
+    const ROTTED: u64 = 1;
+
+    /// Page `p` of the 4 KiB extent based at `base`.
+    fn at(base: u64, p: u64) -> GlobalAddr {
+        GlobalAddr::new(UNIVERSE, base + p)
+    }
+
+    /// Page `p` of the 4 MiB extent based at `base`. A huge page is named by the first
+    /// of the 1024 blocks it covers.
+    fn big_at(base: u64, p: u64) -> GlobalAddr {
+        GlobalAddr::new(UNIVERSE, base + p * crate::config::HUGE_BLOCKS)
+    }
 
     async fn script(a: &'static Allocator, phase: usize) -> Result<(), Fail> {
         match phase {
@@ -1608,11 +1637,11 @@ mod tests {
 
     async fn first_boot(a: &'static Allocator) -> Result<(), Fail> {
         // Spread over enough pages that several groups, and so several cores, are hit.
-        for p in 0..64u32 {
-            put_small(a, GlobalAddr::new(LWW, p), &pattern(p as u8, SMALL)).await?;
+        for p in 0..64u64 {
+            put_small(a, at(LWW, p), &pattern(p as u8, SMALL)).await?;
         }
-        for p in 0..64u32 {
-            let got = get_small(a, GlobalAddr::new(LWW, p)).await?;
+        for p in 0..64u64 {
+            let got = get_small(a, at(LWW, p)).await?;
             check!(
                 got == pattern(p as u8, SMALL),
                 "lww page {p} read back wrong"
@@ -1620,7 +1649,7 @@ mod tests {
         }
 
         // A page never written is a hole, which is distinct from a page that fails to read.
-        let r = get_small(a, GlobalAddr::new(LWW, 1000)).await;
+        let r = get_small(a, at(LWW, 1000)).await;
         check!(
             r == Err(Status::Hole),
             "unwritten page should be a hole, got {}",
@@ -1628,14 +1657,14 @@ mod tests {
         );
 
         // Overwriting bumps the version; the page itself moves to a new slot underneath.
-        let v0 = put_small(a, GlobalAddr::new(LWW, 0), &pattern(0xa5, SMALL)).await?;
-        let v1 = put_small(a, GlobalAddr::new(LWW, 0), &pattern(0x5a, SMALL)).await?;
+        let v0 = put_small(a, at(LWW, 0), &pattern(0xa5, SMALL)).await?;
+        let v1 = put_small(a, at(LWW, 0), &pattern(0x5a, SMALL)).await?;
         check!(v1 > v0, "lww version must advance: {v0} then {v1}");
-        let got = get_small(a, GlobalAddr::new(LWW, 0)).await?;
+        let got = get_small(a, at(LWW, 0)).await?;
         check!(got == pattern(0x5a, SMALL), "lww overwrite lost");
 
         // OCC: a write is accepted only against a version this node has read.
-        let addr = GlobalAddr::new(OCC, 7);
+        let addr = at(OCC, 7);
         let r = put_small(a, addr, &pattern(1, SMALL)).await;
         check!(
             matches!(r, Err(Status::Conflict { .. })),
@@ -1660,7 +1689,7 @@ mod tests {
         check!(got == pattern(2, SMALL), "occ overwrite lost");
 
         // Immutable, 4 KiB: fill once, refuse the second.
-        let addr = GlobalAddr::new(IMM, 3);
+        let addr = at(IMM, 3);
         put_small(a, addr, &pattern(9, SMALL)).await?;
         let r = put_small(a, addr, &pattern(10, SMALL)).await;
         check!(
@@ -1669,7 +1698,7 @@ mod tests {
         );
         // A trim leaves a tombstone, which reads as a hole but is not the same thing:
         // the entry survives so a refill still conflicts.
-        let dead = GlobalAddr::new(IMM, 4);
+        let dead = at(IMM, 4);
         put_small(a, dead, &pattern(11, SMALL)).await?;
         a.accept_trim(
             dead,
@@ -1690,7 +1719,7 @@ mod tests {
         );
 
         // Immutable, 4 MiB: the unchecksummed class, written whole.
-        let addr = GlobalAddr::new(BIG, 0);
+        let addr = big_at(BIG, 0);
         put_huge(a, addr, &pattern(0x33, HUGE)).await?;
         let got = get_huge(a, addr).await?;
         check!(got == pattern(0x33, HUGE), "huge page read back wrong");
@@ -1699,7 +1728,7 @@ mod tests {
             matches!(r, Err(Status::Conflict { .. })),
             "huge refill must conflict, got {r:?}"
         );
-        let r = get_huge(a, GlobalAddr::new(BIG, 1)).await;
+        let r = get_huge(a, big_at(BIG, 1)).await;
         check!(
             r == Err(Status::Hole),
             "unwritten huge page is a hole, got {}",
@@ -1718,32 +1747,32 @@ mod tests {
         // Before anything here reads and records a fresh observation: the OCC ring is
         // volatile, so every OCC write after a restart conflicts until the page is
         // read again.
-        let r = put_small(a, GlobalAddr::new(OCC, 7), &pattern(3, SMALL)).await;
+        let r = put_small(a, at(OCC, 7), &pattern(3, SMALL)).await;
         check!(
             matches!(r, Err(Status::Conflict { .. })),
             "occ pool must come up empty, got {r:?}"
         );
 
         // No journal, no replay: everything below came back from the metadata scan alone.
-        let got = get_small(a, GlobalAddr::new(LWW, 0)).await?;
+        let got = get_small(a, at(LWW, 0)).await?;
         check!(
             got == pattern(0x5a, SMALL),
             "lww page 0 lost across restart"
         );
-        for p in 1..64u32 {
-            let got = get_small(a, GlobalAddr::new(LWW, p)).await?;
+        for p in 1..64u64 {
+            let got = get_small(a, at(LWW, p)).await?;
             check!(got == pattern(p as u8, SMALL), "lww page {p} lost");
         }
-        let got = get_small(a, GlobalAddr::new(OCC, 7)).await?;
+        let got = get_small(a, at(OCC, 7)).await?;
         check!(got == pattern(2, SMALL), "occ page lost");
-        let got = get_small(a, GlobalAddr::new(IMM, 3)).await?;
+        let got = get_small(a, at(IMM, 3)).await?;
         check!(got == pattern(9, SMALL), "immutable page lost");
-        let got = get_huge(a, GlobalAddr::new(BIG, 0)).await?;
+        let got = get_huge(a, big_at(BIG, 0)).await?;
         check!(got == pattern(0x33, HUGE), "huge page lost");
 
         // The tombstone survived too, so the distinction between a hole and a trim is
         // durable and not just a property of the running process.
-        let dead = GlobalAddr::new(IMM, 4);
+        let dead = at(IMM, 4);
         let r = get_small(a, dead).await;
         check!(
             r == Err(Status::Hole),
@@ -1770,17 +1799,17 @@ mod tests {
 
         // Both appended runs hand out slots like any other, including the huge class,
         // whose data has to stay 4 MiB aligned across the join.
-        for p in 0..64u32 {
-            put_small(a, GlobalAddr::new(GREW, p), &pattern(p as u8 ^ 0x77, SMALL)).await?;
+        for p in 0..64u64 {
+            put_small(a, at(GREW, p), &pattern(p as u8 ^ 0x77, SMALL)).await?;
         }
-        for p in 0..64u32 {
-            let got = get_small(a, GlobalAddr::new(GREW, p)).await?;
+        for p in 0..64u64 {
+            let got = get_small(a, at(GREW, p)).await?;
             check!(
                 got == pattern(p as u8 ^ 0x77, SMALL),
                 "grown page {p} read back wrong"
             );
         }
-        let big = GlobalAddr::new(GREW_BIG, 0);
+        let big = big_at(GREW_BIG, 0);
         put_huge(a, big, &pattern(0x44, HUGE)).await?;
         let got = get_huge(a, big).await?;
         check!(
@@ -1792,7 +1821,7 @@ mod tests {
 
     async fn corrupted(a: &'static Allocator) -> Result<(), Fail> {
         // The asymmetry: the 4 KiB page is refused outright...
-        let r = get_small(a, GlobalAddr::new(LWW, ROTTED)).await;
+        let r = get_small(a, at(LWW, ROTTED)).await;
         check!(
             r == Err(Status::Missing),
             "a 4 KiB page failing its checksum must never be served, got {}",
@@ -1800,16 +1829,16 @@ mod tests {
         );
         // ...and the 4 MiB page is handed back wrong, silently: this class carries no
         // checksum by design.
-        let got = get_huge(a, GlobalAddr::new(BIG, 0)).await?;
+        let got = get_huge(a, big_at(BIG, 0)).await?;
         check!(
             got != pattern(0x33, HUGE),
             "the huge page was supposed to be damaged"
         );
 
         // Damage is contained to the page: its neighbours are untouched.
-        let got = get_small(a, GlobalAddr::new(LWW, 0)).await?;
+        let got = get_small(a, at(LWW, 0)).await?;
         check!(got == pattern(0x5a, SMALL), "neighbour page damaged");
-        let got = get_small(a, GlobalAddr::new(LWW, 2)).await?;
+        let got = get_small(a, at(LWW, 2)).await?;
         check!(got == pattern(2, SMALL), "neighbour page damaged");
         Ok(())
     }
@@ -1837,8 +1866,8 @@ mod tests {
         // Damage is contained. Every page the scan still indexes reads back, whatever
         // shard it is on, and the other class is untouched.
         let mut served = 0;
-        for p in 0..64u32 {
-            let addr = GlobalAddr::new(LWW, p);
+        for p in 0..64u64 {
+            let addr = at(LWW, p);
             if p == ROTTED || lost.contains(&addr.0) {
                 continue;
             }
@@ -1852,7 +1881,7 @@ mod tests {
             served += 1;
         }
         check!(served > 0, "no page survived");
-        let got = get_huge(a, GlobalAddr::new(BIG, 0)).await;
+        let got = get_huge(a, big_at(BIG, 0)).await;
         check!(
             got.is_ok(),
             "the huge class shares nothing with the small one"
@@ -1862,8 +1891,8 @@ mod tests {
         // in the block we lost, so on the affected shard it degrades with it. Spread
         // wide enough that at least one address lands there.
         let mut degraded = 0;
-        for p in 2000..2064u32 {
-            let r = get_small(a, GlobalAddr::new(LWW, p)).await;
+        for p in 2000..2064u64 {
+            let r = get_small(a, at(LWW, p)).await;
             check!(
                 matches!(r, Err(Status::Hole) | Err(Status::Missing)),
                 "unwritten page {p} served bytes, got {}",
@@ -1944,6 +1973,7 @@ mod tests {
             "
             generation 1
             node id=1 zone=1 store={} size={bytes}
+            universe 1
             group 1 2 3
             group 1 2 3
             group 1 2 3
@@ -1952,14 +1982,10 @@ mod tests {
             group 1 2 3
             group 1 2 3
             group 1 2 3
-            volume 1 slot=0
-              extent pages=4096 kind=lww zone=1
-            volume 2 slot=1
-              extent pages=256 kind=occ zone=1
-            volume 3 slot=2
-              extent pages=256 kind=immutable zone=1
-            volume 4 slot=3
-              extent pages=2 kind=immutable_4m zone=1
+            extent id=1 base=0 pages=4096 kind=lww zone=1
+            extent id=2 base=4096 pages=256 kind=occ zone=1
+            extent id=3 base=4352 pages=256 kind=immutable zone=1
+            extent id=4 base=5120 pages=2 kind=immutable_4m zone=1
             ",
             dev.display()
         )
@@ -2004,7 +2030,7 @@ mod tests {
         )
     }
 
-    /// Two more volumes than the store was formatted for, one per class, so `grow` has
+    /// Two more extents than the store was formatted for, one per class, so `grow` has
     /// to append a run to each. They do not fit in what the store was first told to be,
     /// so the size has to rise with them.
     fn config_grown(dev: &Path) -> String {
@@ -2014,10 +2040,8 @@ mod tests {
     fn grown_at(dev: &Path, bytes: u64) -> String {
         format!(
             "{}
-            volume 5 slot=4
-              extent pages=8192 kind=lww zone=1
-            volume 6 slot=5
-              extent pages=200 kind=immutable_4m zone=1
+            extent id=5 base=7168 pages=8192 kind=lww zone=1
+            extent id=6 base=15360 pages=200 kind=immutable_4m zone=1
             ",
             sized(dev, bytes)
         )
@@ -2126,17 +2150,21 @@ mod tests {
 
         // Rot one byte of one page in each class, then bring it back up.
         let geo = layout::read_geometry(&dev).unwrap();
-        let s =
-            slot_of(&dev, Class::Small, GlobalAddr::new(LWW, ROTTED)).expect("small page placed");
-        let h = slot_of(&dev, Class::Huge, GlobalAddr::new(BIG, 0)).expect("huge page placed");
+        let s = slot_of(&dev, Class::Small, at(LWW, ROTTED)).expect("small page placed");
+        let h = slot_of(&dev, Class::Huge, big_at(BIG, 0)).expect("huge page placed");
         flip_byte(&dev, geo.slot_off(Class::Small, s) + 17);
         flip_byte(&dev, geo.slot_off(Class::Huge, h) + 17);
         run(&dev, 3);
 
         // Now lose a whole metadata block: both copies, so the entries it held are
         // unrecoverable locally and the pages they named have no other record.
-        let (id, live) = mblock_of(&dev, Class::Small, GlobalAddr::new(LWW, 0)).expect("mblock");
-        *LOST.lock().unwrap() = live.into_iter().filter(|a| a >> 32 == LWW as u64).collect();
+        let (id, live) = mblock_of(&dev, Class::Small, at(LWW, 0)).expect("mblock");
+        *LOST.lock().unwrap() = live
+            .into_iter()
+            .filter(|a| {
+                crate::config::universe_of(*a) == UNIVERSE && crate::config::lba_of(*a) < 4096
+            })
+            .collect();
         wreck_mblock(&dev, Class::Small, id);
         run(&dev, 4);
         run_with(&dev, 5, &config_peered(&dev));

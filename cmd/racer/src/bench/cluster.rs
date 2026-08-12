@@ -13,7 +13,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use racer::config::Config;
 
 pub const ROOT: &str = "/tmp/racer-bench";
-/// Volume ids, in config order.
+/// Device ids, in config order. Each maps one extent of the universe.
 pub const LWW: u32 = 1;
 pub const BIG: u32 = 2;
 
@@ -21,7 +21,7 @@ pub const BIG: u32 = 2;
 /// and `small_pages` from its flags and takes the rest from here.
 #[derive(Clone)]
 pub struct Plan {
-    /// 1 for a node alone — no peers, so quorum is one and nothing crosses the fabric —
+    /// 1 for a node alone (no peers, so quorum is one and nothing crosses the fabric)
     /// or 3 for a real consensus group.
     pub nodes: u32,
     /// Physical cores per node process. The runtime runs one worker per physical core in
@@ -30,9 +30,9 @@ pub struct Plan {
     /// The first physical core to hand out. Nodes take `cores` each from here in order,
     /// and the load generator takes the ones above them.
     pub first_core: usize,
-    /// 4 KiB pages in the LWW volume.
+    /// 4 KiB pages in the LWW extent.
     pub small_pages: u64,
-    /// 4 MiB pages in the immutable volume.
+    /// 4 MiB pages in the immutable extent.
     pub huge_pages: u64,
     /// Consensus groups in the catalog. A group's allocator index shard and its
     /// consensus state both live on core `group % cores`, so fewer groups than cores
@@ -61,8 +61,8 @@ impl Default for Plan {
 }
 
 impl Plan {
-    /// The bytes of each volume a workload touches — three quarters of it, so
-    /// out-of-place writes always have free slots: slabs carry only 5% spare.
+    /// The bytes of each extent a workload touches: three quarters of it, so
+    /// out-of-place writes always have free slots, since slabs carry only 5% spare.
     pub fn small_bytes(&self) -> u64 {
         self.small_pages / 4 * 3 * 4096
     }
@@ -71,7 +71,7 @@ impl Plan {
         self.huge_pages / 4 * 3 * (4 << 20)
     }
 
-    /// The first core above the node processes' — the client's.
+    /// The first core above the node processes', which is the client's.
     pub fn client_first_core(&self) -> usize {
         self.first_core + self.nodes as usize * self.cores
     }
@@ -87,19 +87,19 @@ pub struct Node {
     store: PathBuf,
     child: Option<Child>,
     out: Option<BufReader<ChildStdout>>,
-    volumes: Vec<(u32, PathBuf)>,
+    devices: Vec<(u32, PathBuf)>,
     fabric: PathBuf,
     pub metrics: String,
 }
 
 impl Node {
-    /// This node's block device for volume `id`.
-    pub fn volume(&self, id: u32) -> &Path {
+    /// This node's block device `id`.
+    pub fn device(&self, id: u32) -> &Path {
         &self
-            .volumes
+            .devices
             .iter()
             .find(|(v, _)| *v == id)
-            .expect("volume")
+            .expect("device")
             .1
     }
 }
@@ -128,7 +128,7 @@ impl Cluster {
                 store,
                 child: None,
                 out: None,
-                volumes: Vec::new(),
+                devices: Vec::new(),
                 fabric: PathBuf::new(),
                 metrics: String::new(),
             });
@@ -189,21 +189,23 @@ impl Node {
         };
         let mut child = cmd.spawn()?;
         let mut out = BufReader::new(child.stdout.take().unwrap());
-        self.volumes.clear();
+        self.devices.clear();
         loop {
             let line = next_line(&mut out, self.id);
             if let Some(rest) = line.strip_prefix("metrics -> ") {
                 self.metrics = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("volume ") {
-                let (id, path) = rest.split_once(" -> ").expect("volume line");
-                self.volumes
+            } else if let Some(rest) = line.strip_prefix("device ") {
+                let (id, path) = rest.split_once(" -> ").expect("device line");
+                self.devices
                     .push((id.parse().unwrap(), PathBuf::from(path)));
-            } else if let Some(rest) = line.strip_prefix("fabric -> ") {
-                self.fabric = PathBuf::from(rest);
+            } else if let Some(rest) = line.strip_prefix("universe ") {
+                // One universe here, and its fabric device is the last line printed.
+                let (_, path) = rest.split_once(" fabric -> ").expect("universe line");
+                self.fabric = PathBuf::from(path);
                 break;
             }
         }
-        for (_, p) in &self.volumes {
+        for (_, p) in &self.devices {
             wait_for(p);
         }
         wait_for(&self.fabric);
@@ -251,9 +253,9 @@ impl Drop for Cluster {
 // configuration
 // ---------------------------------------------------------------------------
 
-/// One LWW volume of 4 KiB pages and one immutable volume of 4 MiB ones: the two page
-/// classes. OCC is left out because its cost is the read it requires, which the LWW
-/// volume already measures.
+/// One universe holding an LWW extent of 4 KiB pages and an immutable extent of 4 MiB
+/// ones: the two page classes, one device each. OCC is left out because its cost is the
+/// read it requires, which the LWW extent already measures.
 fn text(plan: &Plan, n: &Node, peers: &[(u32, PathBuf)], generation: u32) -> String {
     let mut s = format!(
         "generation {generation}\nnode id={} zone=1 cohort={} size={STORE_BYTES} cache_4k={} cache_4m={}\n",
@@ -262,11 +264,11 @@ fn text(plan: &Plan, n: &Node, peers: &[(u32, PathBuf)], generation: u32) -> Str
         plan.cache_4k,
         plan.cache_4m
     );
+    s += &format!("policy cache_target_rate={}\n", plan.cache_target_rate);
+    s += "universe 1 epoch=1\n";
     for (id, dev) in peers {
         s += &format!("peer id={id} device={}\n", dev.display());
     }
-    s += &format!("policy cache_target_rate={}\n", plan.cache_target_rate);
-    s += "topology epoch=1\n";
     // Every group is the same three nodes in a different order: one replica set, many
     // groups sharing it. A lone node is a member of all of them and, having no peers,
     // proposes and reads by itself at quorum one.
@@ -282,9 +284,13 @@ fn text(plan: &Plan, n: &Node, peers: &[(u32, PathBuf)], generation: u32) -> Str
         let g = ORDER[i % ORDER.len()];
         s += &format!("group {} {} {}\n", g[0], g[1], g[2]);
     }
+    // The huge extent starts on a 4 MiB boundary above the small one: a 4 MiB page is
+    // 1024 blocks of the universe's flat address space.
+    let huge_base = plan.small_pages.next_multiple_of(1024);
     s += &format!(
-        "volume {LWW} slot=1\n  extent pages={} kind=lww zone=1\n\
-         volume {BIG} slot=2\n  extent pages={} kind=immutable_4m zone=1\n",
+        "extent id=1 base=0 pages={} kind=lww zone=1\n\
+         extent id=2 base={huge_base} pages={} kind=immutable_4m zone=1\n\
+         device {LWW} extents=1\ndevice {BIG} extents=2\n",
         plan.small_pages, plan.huge_pages
     );
     s
@@ -306,7 +312,7 @@ fn install(n: &Node, text: &str) -> std::io::Result<()> {
 /// allocates a page only when written, so an unused tail costs nothing.
 const RD_BYTES: u64 = 8 << 30;
 
-/// Bytes of the store image on each node's file system: the default plan's volumes plus
+/// Bytes of the store image on each node's file system: the default plan's extents plus
 /// the metadata and over-provisioning around them, with the rest of the ram disk left to
 /// ext4 for its inode table, journal and group metadata.
 pub const STORE_BYTES: u64 = RD_BYTES - (1 << 30);

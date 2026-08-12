@@ -29,11 +29,21 @@ const GROWN_BYTES: u64 = IMG_BYTES + (256 << 20);
 const PAGE: usize = 4096;
 const HUGE: usize = 4 << 20;
 
-/// Volume ids, in config order.
+/// The one universe every node shares, and the device ids the test opens. Device `n`
+/// is composed of extent `n` alone, so a device page and its extent page are the same
+/// number; `MIX` is the exception, and exists to prove they need not be.
+const UNIVERSE: u32 = 1;
 const LWW: u32 = 1;
 const OCC: u32 = 2;
 const IMM: u32 = 3;
 const BIG: u32 = 4;
+const MIX: u32 = 5;
+
+/// Where each extent sits in the universe's address space. The control plane places
+/// them; nothing about the layout is derived from the device that maps them.
+const LWW_BASE: u64 = 0;
+const OCC_BASE: u64 = 4096;
+const IMM_BASE: u64 = 4608;
 
 const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4c82;
 const LOOP_SET_FD: libc::c_ulong = 0x4c00;
@@ -56,7 +66,7 @@ struct Node {
     _memfd: OwnedFd,
     child: Option<Child>,
     out: Option<BufReader<ChildStdout>>,
-    volumes: Vec<(u32, PathBuf)>,
+    devices: Vec<(u32, PathBuf)>,
     fabric: PathBuf,
     /// What the generations written for this node say its store must be. The control
     /// plane's to raise, one node at a time, which is how the test asks for a bigger
@@ -80,21 +90,24 @@ impl Node {
             .spawn()
             .expect("spawn racer serve");
         let mut out = BufReader::new(child.stdout.take().unwrap());
-        self.volumes.clear();
+        self.devices.clear();
         loop {
             let line = next_line(&mut out, self.id);
             if let Some(rest) = line.strip_prefix("metrics -> ") {
                 self.metrics = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("volume ") {
-                let (id, path) = rest.split_once(" -> ").expect("volume line");
-                self.volumes
+            } else if let Some(rest) = line.strip_prefix("device ") {
+                let (id, path) = rest.split_once(" -> ").expect("device line");
+                self.devices
                     .push((id.parse().unwrap(), PathBuf::from(path)));
-            } else if let Some(rest) = line.strip_prefix("fabric -> ") {
-                self.fabric = PathBuf::from(rest);
+            } else if let Some(rest) = line.strip_prefix("universe ") {
+                // One universe here, so its fabric device is the last line of the
+                // banner and the one the peers attach to.
+                let (_, path) = rest.split_once(" fabric -> ").expect("universe line");
+                self.fabric = PathBuf::from(path);
                 break;
             }
         }
-        for (_, p) in &self.volumes {
+        for (_, p) in &self.devices {
             wait_for(p);
         }
         wait_for(&self.fabric);
@@ -134,12 +147,12 @@ impl Node {
         }
     }
 
-    fn dev(&self, volume: u32) -> Dev {
+    fn dev(&self, device: u32) -> Dev {
         let p = self
-            .volumes
+            .devices
             .iter()
-            .find(|(id, _)| *id == volume)
-            .expect("volume")
+            .find(|(id, _)| *id == device)
+            .expect("device")
             .1
             .clone();
         Dev::open(&p)
@@ -344,7 +357,7 @@ fn build_node(id: u32) -> Node {
         _memfd: memfd,
         child: None,
         out: None,
-        volumes: Vec::new(),
+        devices: Vec::new(),
         fabric: PathBuf::new(),
         store_bytes: IMG_BYTES,
         metrics: String::new(),
@@ -382,7 +395,7 @@ fn last_error() -> std::io::Error {
 // client IO
 // ---------------------------------------------------------------------------
 
-/// A consumer volume opened as a consumer would: `O_DIRECT`, so one request is one page
+/// A consumer device opened as a consumer would: `O_DIRECT`, so one request is one page
 /// and an error reaches the call that caused it.
 struct Dev(File);
 
@@ -508,13 +521,17 @@ fn write_occ(dev: &Dev, off: u64, page: &[u8]) {
 // configuration
 // ---------------------------------------------------------------------------
 
-/// Two groups over six members, with node 7 spare. Every node exports every volume, so
-/// any page is reachable through any node - and for half of them that node is not in the
+/// Two groups over six members, with node 7 spare. Every node maps every extent, so any
+/// page is reachable through any node - and for half of them that node is not in the
 /// owning group, which is what the forwarding rules exist for.
 ///
 /// The catalog is balanced, as a zone's catalog must be: each of the six members holds
 /// one of the six seats, so every store is formatted to the same size off one set of
-/// volumes. Node 7 holds nothing yet and sizes itself for the share it would inherit.
+/// extents. Node 7 holds nothing yet and sizes itself for the share it would inherit.
+///
+/// Device `MIX` maps the same two extents device `OCC` and device `LWW` do, in the other
+/// order: an extent is a member of the universe, not of a device, so mapping it twice
+/// over is the control plane's business and changes nothing about the address.
 fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     let mut s = format!(
         "generation {generation}\nnode id={} zone=1 cohort={} size={} cache_4k=16777216 cache_4m=33554432\n",
@@ -522,24 +539,25 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
         (n.id - 1) % 3,
         n.store_bytes,
     );
-    for (id, dev) in peers {
-        s += &format!("peer id={id} device={}\n", dev.display());
-    }
     // A nonzero target rate is what turns the cache on at all. Low, so a handful of
     // reads makes a page hot.
     s += "policy cache_target_rate=1\n\
-          topology epoch=1\n";
+          universe 1 epoch=1\n";
+    for (id, dev) in peers {
+        s += &format!("peer id={id} device={}\n", dev.display());
+    }
     for g in catalog() {
         s += &format!("group {} {} {}\n", g[0], g[1], g[2]);
     }
-    s += "volume 1 slot=1\n\
-            extent pages=4096 kind=lww zone=1\n\
-          volume 2 slot=2\n\
-            extent pages=512 kind=occ zone=1\n\
-          volume 3 slot=3\n\
-            extent pages=512 kind=immutable zone=1\n\
-          volume 4 slot=4\n\
-            extent pages=4 kind=immutable_4m zone=1\n";
+    s += "extent id=1 base=0    pages=4096 kind=lww          zone=1\n\
+          extent id=2 base=4096 pages=512  kind=occ          zone=1\n\
+          extent id=3 base=4608 pages=512  kind=immutable    zone=1\n\
+          extent id=4 base=5120 pages=4    kind=immutable_4m zone=1\n\
+          device 1 extents=1\n\
+          device 2 extents=2\n\
+          device 3 extents=3\n\
+          device 4 extents=4\n\
+          device 5 extents=2,1\n";
     s
 }
 
@@ -588,12 +606,22 @@ fn wire_without(nodes: &mut [Node], generation: u32, who: &[usize], omit: &[u32]
     }
 }
 
-/// The first page of `volume` that group `want` owns, so "a node that holds it" and
-/// "a node that does not" are exact below.
-fn page_in(cfg: &Config, volume: u32, want: u32) -> u64 {
+/// The first page of the extent at `base` that group `want` owns, so "a node that holds
+/// it" and "a node that does not" are exact below.
+fn page_in(cfg: &Config, base: u64, want: u32) -> u64 {
     (0..512)
-        .find(|off| cfg.group((volume as u64) << 32 | *off) == want)
+        .find(|off| cfg.group(addr(base + off)) == group(want))
         .expect("some page hashes to every group")
+}
+
+/// A page's address in the universe every node here shares.
+fn addr(lba: u64) -> u64 {
+    racer::config::addr_of(UNIVERSE, lba)
+}
+
+/// A group of that universe, by index into its catalog.
+fn group(index: u32) -> racer::config::GroupId {
+    racer::config::GroupId::new(UNIVERSE, index)
 }
 
 // ---------------------------------------------------------------------------
@@ -743,8 +771,8 @@ fn six_node_cluster() {
     // Node 1 is in group 0 and node 6 in group 1, so for each of these pages one of them
     // holds the register and the other must go through the fabric. Node 7 is spare and
     // holds neither.
-    let held = page_in(&cfg, LWW, 0);
-    let remote = page_in(&cfg, LWW, 1);
+    let held = page_in(&cfg, LWW_BASE, 0);
+    let remote = page_in(&cfg, LWW_BASE, 1);
 
     // ---- LWW: last write wins, from any node, and a hole reads as zeroes ----------
     let a = nodes[0].dev(LWW);
@@ -796,7 +824,7 @@ fn six_node_cluster() {
     write_lww(&b, remote * 4096, &pattern(2, PAGE));
 
     // ---- OCC: a write is refused unless this node read the current version ---------
-    let occ_page = page_in(&cfg, OCC, 1);
+    let occ_page = page_in(&cfg, OCC_BASE, 1);
     let oa = nodes[0].dev(OCC);
     let ob = nodes[5].dev(OCC);
     assert!(
@@ -820,7 +848,7 @@ fn six_node_cluster() {
     assert_eq!(ob.read(occ_page * 4096, PAGE).unwrap(), pattern(5, PAGE));
 
     // ---- immutable: filled once, trimmed once, not refilled until the epoch moves ---
-    let imm_page = page_in(&cfg, IMM, 0);
+    let imm_page = page_in(&cfg, IMM_BASE, 0);
     let ia = nodes[0].dev(IMM);
     let ib = nodes[5].dev(IMM);
     ib.write(imm_page * 4096, &pattern(7, PAGE)).unwrap();
@@ -874,6 +902,27 @@ fn six_node_cluster() {
         "an unfilled 4 MiB page reads as zeroes"
     );
 
+    // ---- one extent, two devices --------------------------------------------------
+    // Device MIX concatenates extents 2 and 1 in that order, so its page 512 is the
+    // page device LWW calls page 0. An address belongs to its extent, so which device a
+    // request arrives through, and in what order that device stacked its extents, are
+    // invisible to everything below the block layer.
+    let mix = nodes[3].dev(MIX);
+    let both = 4000;
+    let shared = pattern(0x3c, PAGE);
+    write_lww(&mix, (512 + both) * 4096, &shared);
+    assert_eq!(
+        nodes[0].dev(LWW).read(both * 4096, PAGE).unwrap(),
+        shared,
+        "an extent is one page space however a device concatenates it"
+    );
+    assert_eq!(
+        mix.read(occ_page * 4096, PAGE).unwrap(),
+        nodes[0].dev(OCC).read(occ_page * 4096, PAGE).unwrap(),
+        "and the extent a device leads with is the same extent"
+    );
+    drop(mix);
+
     // ---- metrics: what the work above did, as a scraper sees it -------------------
     // Node 1 has by now proposed, read, cached and served a page it does not hold, so
     // its counters cover the whole dataplane.
@@ -900,7 +949,9 @@ fn six_node_cluster() {
         "the generation in force"
     );
     assert_eq!(m.get("racer_node_id"), nodes[0].id as u64);
-    assert_eq!(m.get("racer_volumes"), 4);
+    assert_eq!(m.get("racer_universes"), 1);
+    assert_eq!(m.get("racer_devices"), 5);
+    assert_eq!(m.get("racer_extents"), 4);
     assert_eq!(m.get("racer_peers"), NODES as u64 - 1);
     assert_eq!(
         m.get("racer_config_rejected_total"),
@@ -909,7 +960,7 @@ fn six_node_cluster() {
     );
 
     // ---- capacity: the nodes of a zone are homogeneous, so every device is the same --
-    // Off one set of volumes, an equal share means an identical slab on every node,
+    // Off one set of extents, an equal share means an identical slab on every node,
     // members and spare alike: the spare is sized for the share it would inherit, which
     // is what lets it stand in for any member without reformatting.
     for (i, n) in nodes.iter().enumerate() {
@@ -1042,7 +1093,7 @@ fn six_node_cluster() {
     // walks in the window below: the test is that the whole group moves at once, not
     // that anti-entropy eventually gets there.
     let mut want: Vec<(u64, Vec<u8>)> = (0..4096)
-        .filter(|off| cfg.group((LWW as u64) << 32 | *off) == 0)
+        .filter(|off| cfg.group(addr(LWW_BASE + *off)) == group(0))
         .take(128)
         .enumerate()
         .map(|(i, p)| (p, pattern(0x20u8.wrapping_add(i as u8), PAGE)))

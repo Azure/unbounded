@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-pub(crate) use io::{Buf, Disk, Durability, PoolBuf, Volume, sleep};
+pub(crate) use io::{Buf, Disk, Durability, Export, PoolBuf, sleep};
 pub(crate) use limit::Limiter;
 pub(crate) use worker::core;
 
@@ -43,19 +43,31 @@ pub(crate) fn sim_slots() -> u32 {
 #[cfg(feature = "sim")]
 pub(crate) use worker::sim::{SimNode, SimWorker};
 
-use io::{DiskInner, VolumeInner};
+use io::{DiskInner, ExportInner};
 use worker::{Ack, Ctl, Doorbell};
 
 /// Tags per ublk queue: in-flight requests per device per queue.
+///
+/// The device budget and the queue depth trade against each other: registered buffer
+/// indices are dense over `(dev_slot, local_queue, tag)`, so their product is what the
+/// kernel's `IORING_MAX_REG_BUFFERS` (16384) bounds. 256 devices at depth 16 costs
+/// 8192 slots, the same order as the 60 devices at depth 64 it replaces, and leaves
+/// room for the buffer pool on top. Depth is per queue and a worker serves two, so a
+/// device still has 32 requests in flight per worker.
 #[cfg(not(feature = "sim"))]
-const QUEUE_DEPTH: u16 = 64;
+const QUEUE_DEPTH: u16 = 16;
 /// A worker owns a physical core, so it serves both SMT siblings' hardware queues.
 const QUEUES_PER_WORKER: usize = 2;
 /// Registered buffer indices are dense over `(dev_slot, local_queue, tag)`.
 const TAGS_PER_DEV: u32 = QUEUES_PER_WORKER as u32 * QUEUE_DEPTH as u32;
-/// 60 devices keeps the registered buffer table inside the kernel's limit.
+/// Exported devices: one fabric device per universe plus one block device per
+/// configured device. A node in many universes needs headroom, and the cost of a slot
+/// is one `DevSlot` row per worker plus `TAGS_PER_DEV` registered buffer indices.
+///
+/// The kernel refuses to create more than `ublk_drv.ublks_max` devices, which defaults
+/// to 64, so a node exporting more than that needs the module parameter raised.
 #[cfg(not(feature = "sim"))]
-const MAX_DEVICES: u16 = 60;
+const MAX_DEVICES: u16 = 256;
 
 // Simulated dimensions: hundreds of nodes share one address space, so per-worker
 // tables shrink to the smallest size the protocol still fits in. These are counts,
@@ -63,16 +75,16 @@ const MAX_DEVICES: u16 = 60;
 #[cfg(feature = "sim")]
 const QUEUE_DEPTH: u16 = 4;
 #[cfg(feature = "sim")]
-const MAX_DEVICES: u16 = 8;
+const MAX_DEVICES: u16 = 16;
 
 /// Largest single request the block layer may send: one 4 MiB page, so an immutable
 /// huge page is always filled by exactly one request.
 const MAX_IO_BYTES: usize = 4 << 20;
 /// Registered file table: `0..MAX_DEVICES` are ublk char devices, the rest are disks.
 #[cfg(not(feature = "sim"))]
-const FILE_SLOTS: u32 = 512;
+const FILE_SLOTS: u32 = 1024;
 #[cfg(feature = "sim")]
-const FILE_SLOTS: u32 = 32;
+const FILE_SLOTS: u32 = 64;
 const DISK_FILE_BASE: u32 = MAX_DEVICES as u32;
 const REQ_BUF_SLOTS: u32 = MAX_DEVICES as u32 * TAGS_PER_DEV;
 const POOL_BUF_BASE: u32 = REQ_BUF_SLOTS;
@@ -85,12 +97,12 @@ pub(crate) enum Op {
     Discard,
 }
 
-/// One block-layer request. `vol` is the volume's declared key, `lba` is in 4 KiB
+/// One block-layer request. `dev` is the exported device's declared key, `lba` is in 4 KiB
 /// units, and `buf` is the guest's own pages, already registered with io_uring, so IO
 /// against it never copies.
 #[derive(Copy, Clone, Debug)]
 pub struct Request {
-    pub(crate) vol: u64,
+    pub(crate) dev: u64,
     pub(crate) op: Op,
     pub(crate) lba: u64,
     pub(crate) buf: Buf,
@@ -212,7 +224,7 @@ impl<C> Drop for Cfg<C> {
 
 /// The dataplane. One instance, shared by every core, for the life of the process.
 pub trait Handler: Sync + 'static {
-    /// Everything the handler needs that the runtime must keep alive: disks, volumes,
+    /// Everything the handler needs that the runtime must keep alive: disks, devices,
     /// peer tables. Built by you inside [`Runtime::reload`].
     type Config: Sync + 'static;
 
@@ -344,7 +356,7 @@ struct VolEntry {
     dev_id: u32,
     /// Hardware queues each worker serves, indexed by worker.
     q_ids: Vec<Vec<u16>>,
-    weak: Weak<VolumeInner>,
+    weak: Weak<ExportInner>,
     /// The char device stays open for the life of the device: ublk cancels every
     /// outstanding fetch as soon as the last reference to it goes away.
     cdev: Option<std::os::fd::OwnedFd>,
@@ -381,7 +393,7 @@ pub struct Configurator {
 #[cfg(feature = "sim")]
 impl Configurator {
     /// A configurator with no kernel behind it: disks resolve against the simulator's
-    /// device table and a volume is only a name.
+    /// device table and an export is only a name.
     pub(crate) fn sim(cores: usize) -> Configurator {
         Configurator {
             core: std::cell::RefCell::new(Core {
@@ -469,10 +481,10 @@ impl Configurator {
     /// IO. `size` is in bytes, must be a nonzero multiple of the request unit below,
     /// and may never change.
     ///
-    /// `huge` picks that unit: a huge volume is served in 4 MiB requests and a small
+    /// `huge` picks that unit: a huge device is served in 4 MiB requests and a small
     /// one in 4 KiB, so the handler always sees exactly one page per request and never
     /// has to split or gather.
-    pub(crate) fn volume(&self, key: u64, size: u64, huge: bool) -> std::io::Result<Volume> {
+    pub(crate) fn device(&self, key: u64, size: u64, huge: bool) -> std::io::Result<Export> {
         let unit = if huge { 4 << 20 } else { 4096 };
         if !size.is_multiple_of(unit) || size == 0 {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
@@ -482,40 +494,40 @@ impl Configurator {
 
     /// The node's fabric device: the one namespace peers issue against.
     ///
-    /// Same machinery as [`volume`], different geometry. A fabric frame is 1, 2 or up
+    /// Same machinery as [`device`], different geometry. A fabric frame is 1, 2 or up
     /// to 1024 blocks depending on the opcode, so this device must not be split onto
-    /// page boundaries the way a volume is.
+    /// page boundaries the way a device is.
     ///
-    /// [`volume`]: Configurator::volume
-    pub(crate) fn fabric(&self, key: u64, size: u64) -> std::io::Result<Volume> {
+    /// [`device`]: Configurator::device
+    pub(crate) fn fabric(&self, key: u64, size: u64) -> std::io::Result<Export> {
         if !size.is_multiple_of(4096) || size == 0 {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
         self.declare(key, size, ublk::params_for_fabric(size))
     }
 
-    fn declare(&self, key: u64, size: u64, params: ublk::Params) -> std::io::Result<Volume> {
+    fn declare(&self, key: u64, size: u64, params: ublk::Params) -> std::io::Result<Export> {
         let mut c = self.core.borrow_mut();
         c.declared_vols.push(key);
         if let Some(v) = c.vols.iter().find(|v| v.key == key) {
-            // Volumes are immutable once created; a resize is a config error.
+            // Exports are immutable once created; a resize is a config error.
             if v.size != size {
                 return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             if let Some(inner) = v.weak.upgrade() {
-                return Ok(Volume::from_inner(inner));
+                return Ok(Export::from_inner(inner));
             }
         }
         let slot = (0..MAX_DEVICES)
             .find(|s| !c.dev_used[*s as usize])
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOSPC))?;
 
-        // A simulated volume is a name and nothing else: requests reach the handler
+        // A simulated export is a name and nothing else: requests reach the handler
         // with no kernel in between, so there is no device to create.
         #[cfg(feature = "sim")]
         let (dev_id, q_ids, path) = {
             let _ = params;
-            (0u32, Vec::new(), PathBuf::from(format!("/sim/vol/{key}")))
+            (0u32, Vec::new(), PathBuf::from(format!("/sim/dev/{key}")))
         };
         #[cfg(not(feature = "sim"))]
         let (dev_id, q_ids, path) = {
@@ -527,7 +539,10 @@ impl Configurator {
                 QUEUE_DEPTH,
                 ublk::F_AUTO_BUF_REG | ublk::F_USER_COPY | ublk::F_CMD_IOCTL_ENCODE,
             );
-            c.ctl().add_dev(&mut info)?;
+            c.ctl().add_dev(&mut info).map_err(|e| {
+                let held = c.dev_used.iter().filter(|u| **u).count();
+                ublks_max_hint(e, held)
+            })?;
             let dev_id = info.dev_id;
             let setup = c
                 .ctl()
@@ -544,7 +559,7 @@ impl Configurator {
         c.dev_used[slot as usize] = true;
         c.new_devs.push(slot);
 
-        let inner = Arc::new(VolumeInner { path });
+        let inner = Arc::new(ExportInner { path });
         c.vols.retain(|v| v.key != key);
         c.vols.push(VolEntry {
             key,
@@ -555,7 +570,26 @@ impl Configurator {
             weak: Arc::downgrade(&inner),
             cdev: None,
         });
-        Ok(Volume::from_inner(inner))
+        Ok(Export::from_inner(inner))
+    }
+}
+
+/// The kernel refuses `ADD_DEV` once `ublk_drv.ublks_max` devices exist, and the bare
+/// errno says nothing about which limit was hit. Name the parameter instead: a node in
+/// many universes is the ordinary case now, and the module default of 64 is well below
+/// what [`MAX_DEVICES`] allows.
+#[cfg(not(feature = "sim"))]
+fn ublks_max_hint(e: std::io::Error, held: usize) -> std::io::Error {
+    const PARAM: &str = "/sys/module/ublk_drv/parameters/ublks_max";
+    let max = std::fs::read_to_string(PARAM)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    match max {
+        Some(m) => std::io::Error::other(format!(
+            "ublk ADD_DEV failed with {held} devices already exported: {e}; {PARAM} is {m}, \
+             raise it (ublk_drv.ublks_max=) to export more"
+        )),
+        None => e,
     }
 }
 
@@ -659,7 +693,7 @@ impl<C: Sync + 'static> Runtime<C> {
     /// Install a new configuration, blocking until every core has cut over.
     ///
     /// `build` runs on the runtime's control thread. Declare every disk, peer and
-    /// volume you need; anything you do not re-declare is torn down once the previous
+    /// device you need; anything you do not re-declare is torn down once the previous
     /// configuration is retired, which happens only after the last request that could
     /// still see it has completed.
     pub fn reload<F>(&self, build: F) -> std::io::Result<()>
@@ -894,7 +928,7 @@ where
     }
 
     // 3. Devices that are going away stop accepting IO now; in-flight requests keep
-    //    running against the old config, which still holds their `Volume`.
+    //    running against the old config, which still holds their `Export`.
     for (slot, dev_id) in &retiring {
         let _ = ctx.cfgr.core.borrow_mut().ctl().stop_dev(*dev_id);
         ctx.hub
@@ -918,7 +952,7 @@ where
     // 5. Arm and start the new devices. The first request can only arrive after the
     //    config that describes it is already live on every core.
     for slot in &new_devs {
-        let (dev_id, vol, q_ids, cpath) = {
+        let (dev_id, dev, q_ids, cpath) = {
             let c = ctx.cfgr.core.borrow();
             let v = c.vols.iter().find(|v| v.slot == *slot).unwrap();
             (
@@ -932,7 +966,7 @@ where
         let raw = cdev.as_raw_fd();
         ctx.hub.broadcast(|i, ack| Ctl::StartQueue {
             slot: *slot,
-            vol,
+            dev,
             cfd: raw,
             depth: QUEUE_DEPTH,
             q_ids: q_ids[i].clone(),
@@ -1077,7 +1111,7 @@ mod tests {
         cores: usize,
         /// Never read: holding it is what keeps the device attached.
         #[allow(dead_code)]
-        vol: Volume,
+        dev: Export,
     }
 
     // The block map lives on the core that owns each lba, as the allocator's index
@@ -1177,18 +1211,18 @@ mod tests {
         let found = Arc::new(Mutex::new(None));
         let out = found.clone();
         rt.reload(move |c| {
-            let vol = c.volume(1, 32 << 20, false)?;
-            *out.lock().unwrap() = Some(vol.path().to_path_buf());
+            let dev = c.device(1, 32 << 20, false)?;
+            *out.lock().unwrap() = Some(dev.path().to_path_buf());
             Ok(Conf {
                 store: c.disk(&path, None, None)?,
                 cores: c.cores(),
-                vol,
+                dev,
             })
         })
         .expect("reload");
 
         // The device node appears as soon as START_DEV returns, but udev may lag.
-        let dev = found.lock().unwrap().clone().expect("no volume declared");
+        let dev = found.lock().unwrap().clone().expect("no device declared");
         for _ in 0..100 {
             if dev.exists() {
                 break;
@@ -1254,26 +1288,26 @@ mod tests {
         );
         drop(f);
 
-        // Resizing a declared volume is a config error, and leaves the old one alone.
+        // Resizing a declared device is a config error, and leaves the old one alone.
         let path = backing.clone();
         assert!(
             rt.reload(move |c| {
                 Ok(Conf {
                     store: c.disk(&path, None, None)?,
                     cores: c.cores(),
-                    vol: c.volume(1, 16 << 20, false)?,
+                    dev: c.device(1, 16 << 20, false)?,
                 })
             })
             .is_err()
         );
 
-        // Reload that drops the volume: drives stop, drain, retire and DEL_DEV.
+        // Reload that drops the device: drives stop, drain, retire and DEL_DEV.
         let path = backing.clone();
         rt.reload(move |c| {
             Ok(Conf {
                 store: c.disk(&path, None, None)?,
                 cores: c.cores(),
-                vol: c.volume(2, 8 << 20, false)?,
+                dev: c.device(2, 8 << 20, false)?,
             })
         })
         .expect("second reload");

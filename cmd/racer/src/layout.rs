@@ -19,6 +19,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::config::GroupId;
 use crate::runtime::Limiter;
 
 pub(crate) const MBLOCK: usize = 4096;
@@ -36,12 +37,18 @@ pub(crate) const HUGE_PAGE: u64 = 4 << 20;
 
 const SB_MAGIC: u32 = 0x5243_5342; // "RCSB"
 const MB_MAGIC: u32 = 0x524d_4232; // "RMB2"
-/// The layout the format shipped with: one run of mblocks per class.
-const FMT_VER: u16 = 1;
+/// One run of mblocks per class.
+///
+/// Version 3 is the universe address space: an entry's address is `universe:26 |
+/// lba:38` where 1 and 2 held `volume:32 | offset:32`, and a seal names a globally
+/// unique extent id where it used to name a volume and a position within it. Nothing
+/// about either is detectable from the bytes, so the version is the only guard and a
+/// store written by an older build has to be reformatted.
+const FMT_VER: u16 = 3;
 /// A layout `grow` has appended to. A build that predates growth must not open one, so
 /// it gets its own version rather than a flag: that build would read extent 0's block
 /// count as the whole class and put copy B of every block at the wrong offset.
-const FMT_VER_EXT: u16 = 2;
+const FMT_VER_EXT: u16 = 4;
 const SB_COPIES: u64 = 4;
 const SB_REGION: u64 = SB_COPIES * MBLOCK as u64;
 const ZERO_BYTES: u64 = HUGE_PAGE;
@@ -104,7 +111,7 @@ pub(crate) enum State {
 /// read-modify-write.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) struct Entry {
-    /// The page in this slot. Zero means free, which is why volume id 0 is reserved.
+    /// The page in this slot. Zero means free, which is why universe id 0 is reserved.
     pub(crate) addr: u64,
     pub(crate) version: u64,
     /// CASPaxos accepted ballot (`paxos::Ballot`), in the low 32 bits.
@@ -623,11 +630,11 @@ fn wanted(cfg: &crate::config::Config) -> [u64; 2] {
 
 // -------------------------------------------------------------- consensus side state
 
-/// One row of the seal table: a shard this node's group has frozen as a migration
-/// source. `extent` is the extent's index in its volume's list.
+/// One row of the seal table: an extent this node's group has frozen as a migration
+/// source. Extent ids are unique across every universe the node is in, so the id alone
+/// names the shard and the row needs nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Seal {
-    pub(crate) volume: u32,
     pub(crate) extent: u32,
     pub(crate) term: u32,
 }
@@ -640,16 +647,17 @@ pub(crate) struct Seal {
 /// could then be written in two zones — so it gets the superblock's fourfold redundancy.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Consensus {
-    /// `(group, promised_term)`, sorted by group.
-    pub(crate) terms: Vec<(u32, u32)>,
+    /// `(group, promised_term)`, sorted by group. A group is a universe and an index
+    /// within that universe's catalog, so the row carries both.
+    pub(crate) terms: Vec<(GroupId, u32)>,
     pub(crate) seals: Vec<Seal>,
 }
 
 const CS_MAGIC: u32 = 0x5250_5831; // "RPX1"
 const CS_OFF: usize = 1024;
 const CS_HDR: usize = 16;
-const TERM_BYTES: usize = 8;
-const SEAL_BYTES: usize = 16;
+const TERM_BYTES: usize = 12;
+const SEAL_BYTES: usize = 8;
 /// Bounded by what fits beside the geometry in one 4 KiB block, well above the groups
 /// a node joins and the shards it can be migrating at once.
 pub(crate) const MAX_TERMS: usize = 128;
@@ -671,14 +679,14 @@ impl Consensus {
         h[8..10].copy_from_slice(&(self.seals.len() as u16).to_le_bytes());
         let mut at = CS_OFF + CS_HDR;
         for (g, t) in &self.terms {
-            b[at..at + 4].copy_from_slice(&g.to_le_bytes());
-            b[at + 4..at + 8].copy_from_slice(&t.to_le_bytes());
+            b[at..at + 4].copy_from_slice(&g.universe().to_le_bytes());
+            b[at + 4..at + 8].copy_from_slice(&g.index().to_le_bytes());
+            b[at + 8..at + 12].copy_from_slice(&t.to_le_bytes());
             at += TERM_BYTES;
         }
         for s in &self.seals {
-            b[at..at + 4].copy_from_slice(&s.volume.to_le_bytes());
-            b[at + 4..at + 8].copy_from_slice(&s.extent.to_le_bytes());
-            b[at + 12..at + 16].copy_from_slice(&s.term.to_le_bytes());
+            b[at..at + 4].copy_from_slice(&s.extent.to_le_bytes());
+            b[at + 4..at + 8].copy_from_slice(&s.term.to_le_bytes());
             at += SEAL_BYTES;
         }
         let crc = crc32c(&b[..MBLOCK - 4]);
@@ -697,14 +705,16 @@ impl Consensus {
         let ns = (u16(&b[CS_OFF + 8..]) as usize).min(MAX_SEALS);
         let mut at = CS_OFF + CS_HDR;
         for _ in 0..nt {
-            c.terms.push((u32(&b[at..]), u32(&b[at + 4..])));
+            c.terms.push((
+                GroupId::new(u32(&b[at..]), u32(&b[at + 4..])),
+                u32(&b[at + 8..]),
+            ));
             at += TERM_BYTES;
         }
         for _ in 0..ns {
             c.seals.push(Seal {
-                volume: u32(&b[at..]),
-                extent: u32(&b[at + 4..]),
-                term: u32(&b[at + 12..]),
+                extent: u32(&b[at..]),
+                term: u32(&b[at + 4..]),
             });
             at += SEAL_BYTES;
         }
@@ -1441,11 +1451,12 @@ mod tests {
     fn test_config() -> crate::config::Config {
         crate::config::Config::parse(
             "node id=1 zone=1 store=/dev/x size=68719476736 cache_4k=4194304 cache_4m=8388608
-             group 1 2 3
-             volume 1 slot=0
-               extent pages=5000 kind=lww zone=1
-             volume 2 slot=1
-               extent pages=3 kind=immutable_4m zone=1",
+             universe 1
+               group 1 2 3
+               extent id=1 base=0 pages=5000 kind=lww zone=1
+               extent id=2 base=8192 pages=3 kind=immutable_4m zone=1
+             device 1 extents=1
+             device 2 extents=2",
         )
         .unwrap()
     }
@@ -1546,14 +1557,14 @@ mod tests {
 
         // Patching a live superblock leaves the consensus record alone.
         let c = Consensus {
-            terms: vec![(7, 9)],
+            terms: vec![(GroupId::new(4, 7), 9)],
             ..Consensus::default()
         };
         c.patch(&mut b);
         g.append(Class::Huge, 1).unwrap();
         g.patch(&mut b);
         assert_eq!(Geometry::decode(&b).unwrap(), g);
-        assert_eq!(Consensus::decode(&b).terms, vec![(7, 9)]);
+        assert_eq!(Consensus::decode(&b).terms, vec![(GroupId::new(4, 7), 9)]);
     }
 
     #[test]

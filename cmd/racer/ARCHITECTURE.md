@@ -1,8 +1,8 @@
 # Architecture
 
 Racer is a Linux-only userspace distributed block dataplane. A process exports
-one ublk device per configured volume and one sparse ublk "fabric" device used
-by peers. It stores authoritative pages in one fixed-length local file opened
+one ublk device per configured block device and one sparse ublk "fabric" device
+per universe, used by that universe's peers. It stores authoritative pages in one fixed-length local file opened
 with `O_DIRECT`, replicates page registers through fixed three-member consensus
 groups, and can use separate regions of that file as a cooperative read cache.
 
@@ -32,41 +32,59 @@ types, requiring `protoc` at build time.
 The checked configuration describes:
 
 - A generation.
-- The local node: id, site, zone, and cohort. Its store - size, cache sizes,
-  and rate ceilings - plus peers. A peer may name the foreign site it lives in,
-  making that link a site crossing, and may name the sites it will carry traffic
-  to on our behalf. Nodes are otherwise alike; there is no gateway role.
-- A topology epoch, a balanced catalog of three distinct acceptors per group,
-  and remote-zone entries. An address's 16,384-way hash slot folds over the
-  catalog to name its group, so the catalog is the whole of the placement map.
-- Volumes and ordered extents. A global page address is a 32-bit volume ID plus
-  a 32-bit page offset; the volume ID's high byte is its site. A six-bit volume
-  slot is used on the fabric. Extents specify LWW, OCC, Immutable, or
-  Immutable-4M semantics and their home and next zones. The kind carries the
-  page size: 4 MiB exists only as immutable, and a volume's extents must all
-  name the same size. Each volume also carries its own tombstone epoch, so one
-  volume can reclaim while another lags.
+- The local node: id, zone, and cohort, plus its store - size, cache sizes, and
+  rate ceilings. Nodes are otherwise alike; there is no gateway role.
+- Universes. A universe is one flat, sparse address space counted in 4 KiB
+  blocks, and everything about placement inside it: its own epoch, its own
+  balanced catalog of three distinct acceptors per group, its own remote-zone
+  entries, its own peers, and its own extents. A global page address is
+  `universe:26 | lba:38`, so a universe spans 1 PiB and universe id 0 is
+  reserved to keep a zero address meaning "free slot" on disk. An address's
+  16,384-way hash slot folds over that universe's catalog to name its group, so
+  a catalog is the whole of the placement map for one universe and says nothing
+  about any other.
+- Extents. An extent is a range of a universe's address space: a base block, a
+  length in pages, LWW, OCC, Immutable, or Immutable-4M semantics, its home and
+  next zones, and its own tombstone epoch, so one extent can reclaim while
+  another lags. The kind carries the page size, and 4 MiB exists only as
+  immutable, which is why a 4 MiB extent's base is 1024-block aligned and each
+  of its pages spans 1024 blocks. Extents may not overlap, and their ids are
+  unique across every universe the node holds, which is what lets a seal name
+  one with a bare 32-bit id.
+- Devices. A device is a local ublk block device: an ordered list of whole
+  extents, concatenated. A device may not mix the two page sizes, but it is
+  otherwise free, so two hosts may map the same extents in different orders and
+  combinations and no page's address moves when they do.
 - Runtime and cache policy.
 
-An address hashes to a fixed slot, which names its consensus group. Each node
-has complete group information for its zone and entry nodes for other zones,
-rather than a global connection graph. Reaching another site takes only a peer
-that says it can, so no node holds the far site's shape.
+An address hashes to a fixed slot, which names its consensus group within its
+own universe. Each node has complete group information for its zone in each
+universe it belongs to, and entry nodes for that universe's other zones, rather
+than a global connection graph.
 
-The nodes of a zone are homogeneous. The catalog must give every node it names
-the same number of groups, so every node holds the same share of the zone and
-sizes its store for that same share: the zone's pages, times three replicas,
-divided by the number of nodes. There is no way to declare one node larger than
+A universe is also the security boundary. The control plane publishes one fabric
+namespace per universe and attaches it only to that universe's members, so a
+node that was never given the namespace cannot address the universe at all.
+Nothing on the wire names a universe: the namespace a frame arrives on is the
+universe, and the receiver rebuilds every address, group and extent id from its
+own side of the link.
+
+The nodes of a zone are homogeneous. Each universe's catalog must give every
+node it names the same number of groups, so every node holds the same share of
+that universe's zone and sizes its store for the sum of those shares: per
+universe, the zone's pages, times three replicas, divided by the number of
+nodes. There is no way to declare one node larger than
 another. A node the catalog does not name holds nothing; it is either a spare
 about to join, or a member being decommissioned, or a node that only routes.
 
 The watcher uses inotify on the configuration's parent directory and reacts to
-close-write and rename-into-place. Generations must increase; a volume's
+close-write and rename-into-place. Generations must increase; an extent's
 tombstone epoch may not decrease, though it may jump by any amount; the store's
-size may rise but never fall; existing volume slots and extent shapes cannot
-change; the catalog keeps its length for the life of the zone, since that length
-is what folds a slot onto a group; and catalog membership moves one node at a
-time, as migration changes do. Parse, validation, and build failures leave the
+size may rise but never fall; a surviving extent keeps its universe, its base,
+its length and its kind, and a surviving device keeps its ordered list of
+extents; each universe's catalog keeps its length for the life of the zone,
+since that length is what folds a slot onto a group; and catalog membership
+moves one node at a time, as migration changes do. Parse, validation, and build failures leave the
 previous runtime configuration active and increment a metric. Reconciliation can
 still fail after publication and partially apply a generation.
 
@@ -117,15 +135,22 @@ kernel has already rebound to another request.
 
 ## ublk and Request Handling
 
-The runtime has 60 exported-device slots, one of which the fabric consumes, so
-at most 59 volumes are usable even though validation accepts 60. Queues are
+The runtime has 256 exported-device slots, shared between the fabric device each
+universe consumes and the block devices. Two queues of depth 16 per device give
+32 tags each, so the registered request buffers come to 8192 slots and the pool
+brings the total to 9306, inside the kernel's 16384 registered-buffer ceiling.
+The kernel imposes a second, lower limit of its own: `ublk_drv.ublks_max`
+defaults to 64, so exporting more than that needs the parameter raised, and a
+failed ADD_DEV names it rather than reporting a bare errno. Queues are
 distributed across physical-core workers. For each request a worker fetches the
 ublk descriptor, invokes `Server::handle`, commits its result, and rearms the
 tag. At high operation-slab occupancy it delays completion and tag reuse,
 applying block-layer backpressure. The sparse fabric device has a logical size
 of 4 EiB to provide an LBA address space for protocol frames.
 
-Volume geometry prevents a request from crossing an allocator page:
+A device maps a request to a page by walking its extents, so a request that
+lands outside every extent is refused. Extent geometry then prevents a request
+from crossing an allocator page:
 
 - A 4 KiB request is copied between the ublk guest buffer and a registered
   pool buffer so Racer can checksum it.
@@ -137,15 +162,21 @@ Volume geometry prevents a request from crossing an allocator page:
   region because opaque guest buffers cannot be cleared directly.
 - Discard becomes a consensus trim.
 
-Fabric requests enter through device key zero. Their LBA is decoded, validated,
-routed if necessary, and dispatched to consensus, allocator, cache, snapshot,
+Fabric requests enter through a device key tagged with their universe, which is
+the only place a universe is ever named. Their LBA is decoded, validated against
+that universe alone, routed if necessary, and dispatched to consensus, allocator, cache, snapshot,
 healing, migration, or liveness operations.
 
 ## Persistent Layout and Allocator
 
 On the first `serve` of a blank store, formatting fixes all offsets and
 capacities. Four CRC32C-protected 4 KiB superblocks contain geometry plus
-bounded consensus promises and migration seals. The remaining regions are:
+bounded consensus promises and migration seals. A promise is a universe, a
+group index within it, and a term; a seal is an extent id and a term, since
+extent ids are unique across universes. The format version is 3, and versions 1
+and 2, which addressed pages as a volume and an offset within it, are refused
+rather than reinterpreted: nothing in the bytes distinguishes the two layouts,
+so an older store has to be reformatted. The remaining regions are:
 
 1. A 4 MiB zero page.
 2. A/B copies of 4 KiB-page metadata.
@@ -158,13 +189,13 @@ data slots. It is checked whenever `serve` starts. The share a node is sized for
 is the zone's mean rather than a declared ceiling, so the overprovision above it,
 five percent plus a per-class floor, is also what absorbs the variance in how
 many pages actually hash into the groups a node holds. A configuration that has
-outgrown the layout is satisfied by appending an extent per class: a fresh run of
+outgrown the layout is satisfied by appending a growth run per class: a fresh run of
 metadata blocks and the data slots they name, placed past the end of everything
 already written, recorded in a growth table in the superblock, and never moving a
 byte that already exists. The file is reserved out to `size_bytes` first, with
 `fallocate` where the file system supports it and a plain extension where it does
 not, so the space a growth run lands in is space the store already owns. If the
-appended extents would still not fit within `size_bytes`, `serve` refuses to
+appended runs would still not fit within `size_bytes`, `serve` refuses to
 start and names the shortfall. Growth happens only at startup, before shards are
 sized; a reload that asks for more publishes the shortfall as
 `racer_alloc_unbacked_pages` and runs short until the next restart.
@@ -193,7 +224,7 @@ writes and suppress cache admission and healing.
 
 Small authoritative reads verify CRC32C seeded by address and version. Huge
 pages have no data checksum. Mutable trim releases storage. Immutable versions
-encode unwritten/live/tombstone within the volume's tombstone epoch, so an
+encode unwritten/live/tombstone within the extent's tombstone epoch, so an
 immutable trim remains persisted until epoch reclamation.
 
 ## Consensus and Page Semantics
@@ -205,7 +236,7 @@ with no peer links is treated as single-node mode and requires one.
 
 LWW writes read/guard the current version and retry bounded conflicts. OCC
 writes require a bounded, volatile prior-read record on the client-facing
-node. Immutable writes derive their version from the volume's tombstone epoch.
+node. Immutable writes derive their version from the extent's tombstone epoch.
 Requests
 originating on a nonmember are handed to a group member.
 
@@ -229,11 +260,13 @@ sealing support repair and migration.
 
 ## Fabric and Routing
 
-A `fabric::Link` is an `O_DIRECT` local block-device handle plus a peer ID. Each
-operation has a linked two-second timeout, or a quarter-second one when it puts
-a 4 MiB guest buffer on the wire. The protocol encodes RPC metadata in
-the LBA rather than a packet header: opcode, hop/cache flags, member addressee,
-six-bit volume slot, and page offset. Small frames separate payload and trailer;
+A `fabric::Link` is an `O_DIRECT` local block-device handle plus the universe
+and peer it reaches; a peer shared by two universes publishes two namespaces and
+is two links. Each operation has a linked two-second timeout, or a
+quarter-second one when it puts a 4 MiB guest buffer on the wire. The protocol
+encodes RPC metadata in the LBA rather than a packet header: opcode, hop/cache
+flags, member addressee, and page offset, with the offset spanning the whole of
+a universe. Nothing names the universe, because the namespace already does. Small frames separate payload and trailer;
 huge frames reserve a contiguous 4 MiB payload range. A transport splits a huge
 command at its transfer limit, so the target sees consecutive pieces of one
 frame. Partial huge reads are served by offset; huge writes reserve a slot on
@@ -249,12 +282,11 @@ address. NVMe status preserves only stale (`EREMOTEIO`), absent (`ENODATA`),
 unsupported (`EOPNOTSUPP`), and space (`ENOSPC`); other failures collapse to
 transport `EIO`.
 
-Local-zone traffic resolves directly or through another member. Cross-zone
-traffic selects one of three entry nodes by address. Cross-site traffic takes
-our own crossing when we hold one, and is otherwise handed to a peer that does,
-picked by address so the load spreads. A frame normally has a two-forwarding-hop
-budget; the single site crossing leaves it at three, so the far site funds its
-own hops. Relays reuse the same registered data buffer.
+Routing has two tiers, both inside one universe. Local-zone traffic resolves
+directly or through another member; traffic for another zone selects one of that
+zone's three entry nodes by address. A frame has a two-forwarding-hop budget and
+never leaves the universe it arrived on. Relays reuse the same registered data
+buffer.
 
 ## Cooperative Cache
 
@@ -274,7 +306,8 @@ corruption. A zero target rate disables caching.
 ## Healing and Migration
 
 Under normal allocator pressure each core starts at most one detached healing
-sweep per second. For each group and page class, peers compare 512-bucket
+sweep per second, drawn round-robin from every group of every universe the node
+belongs to. For each group and page class, peers compare 512-bucket
 non-cryptographic XOR digests. Differing buckets are enumerated through bounded
 snapshot cursors with a 30-second idle expiry; cursors return only address and
 register, and page bytes are reconciled through ordinary Paxos repair. Cursor
@@ -300,14 +333,14 @@ configuration that changes the home zone and clears the next zone.
 
 ## Reload and Shutdown
 
-`Node::attach` declaratively builds a dataplane: the backing store, volume
-devices, fabric device, peer links, and process-lifetime
-allocator/Paxos/cache/healing
-objects. Reconciliation registers new fixed files on all workers, stops and
+`Node::attach` declaratively builds a dataplane: the backing store, one ublk
+device per configured device, one fabric device per universe, one peer link per
+universe and peer, and process-lifetime allocator/Paxos/cache/healing objects. Reconciliation registers new fixed files on all workers, stops and
 drains removed devices, publishes a new raw configuration pointer, starts new
 ublk devices, waits for every old per-worker configuration guard to drain, then
-unregisters and deletes unreferenced resources. Stable paths and volume keys
-reuse handles and ublk identities; an existing volume cannot change size.
+unregisters and deletes unreferenced resources. Stable paths and device keys
+reuse handles and ublk identities; an existing device cannot change size, which
+is why a device's list of extents is frozen once it exists.
 
 Subsystem link/topology views are installed during dataplane construction,
 before the worker configuration-pointer broadcast. Old guarded requests can
@@ -324,7 +357,9 @@ process-lifetime and are not explicitly joined or reclaimed.
 ## Observability, Trust, and Limits
 
 Workers periodically publish per-core counters to atomic rows; scrapes sum the
-rows. The metrics server is blocking, handles one HTTP/1.1 connection at a time,
+rows. Per-extent live-page and tombstone counts are published as
+`racer_extent_live_pages` and `racer_extent_tombstones`, labelled by universe
+and extent, alongside `racer_universes`, `racer_devices`, and `racer_extents`. The metrics server is blocking, handles one HTTP/1.1 connection at a time,
 and exposes unauthenticated plaintext `GET /metrics` with five-second
 socket timeouts.
 
@@ -348,7 +383,8 @@ Important implementation boundaries are:
   guards. Topology epoch accompanies small writes but is not enforced by
   receivers.
 - Reload validation does not make all identity, peer, topology-epoch, or hash
-  slot changes immutable. A reload that outgrows the store is accepted and runs
+  slot changes immutable. It does not prevent an extent from being unmapped and
+  its pages orphaned in the store until a restart. A reload that outgrows the store is accepted and runs
   short until a restart grows it.
 - Empty peer links select quorum one. Promise changes can remain only in memory,
   and observed higher ballot terms are not persisted before a crash.
@@ -369,6 +405,6 @@ and seeded linearizability checks.
 anti-entropy; `alloc/shard.rs` model-checks the actual allocator transitions.
 Privileged integration tests exercise real ublk with multiple processes,
 reload, intra-zone routing, cache, restart, and wiped-member replay, but skip
-when kernel facilities are absent. Cross-zone/site routing, production
+when kernel facilities are absent. Cross-zone routing, production
 migration, NVMe status translation, and real NVMe-oF are not
 covered end to end.

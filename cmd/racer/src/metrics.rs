@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::config::MAX_VOLUMES;
+use crate::config::MAX_EXTENTS;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -106,10 +106,12 @@ metrics! {
     // node and configuration
     config_generation:       "racer_config_generation"            ""                           Gauge   "Generation of the configuration in force.",
     config_rejected:         "racer_config_rejected_total"        ""                           Counter "Configurations rejected since start.",
-    topology_epoch:          "racer_topology_epoch"               ""                           Gauge   "Epoch of the topology in force.",
+    topology_epoch:          "racer_topology_epoch"               ""                           Gauge   "Highest topology epoch in force across this node's universes.",
     node_id:                 "racer_node_id"                      ""                           Gauge   "This node's id.",
     workers:                 "racer_workers"                      ""                           Gauge   "Worker threads, one per physical core.",
-    volumes:                 "racer_volumes"                      ""                           Gauge   "Volumes this node exports.",
+    universes:               "racer_universes"                    ""                           Gauge   "Universes this node participates in.",
+    devices:                 "racer_devices"                      ""                           Gauge   "Block devices this node exports.",
+    extents:                 "racer_extents"                      ""                           Gauge   "Extents this node's configuration names.",
     peers:                   "racer_peers"                        ""                           Gauge   "Peers this node holds a fabric link to.",
 }
 
@@ -128,10 +130,10 @@ pub(crate) fn init(cores: usize) {
         .map(|_| Row(std::array::from_fn(|_| AtomicU64::new(0))))
         .collect();
     let _ = ROWS.set(rows);
-    let vols = (0..cores)
-        .map(|_| VolRow(std::array::from_fn(|_| AtomicU64::new(0))))
+    let exts = (0..cores)
+        .map(|_| ExtRow(std::array::from_fn(|_| AtomicU64::new(0))))
         .collect();
-    let _ = VOLS.set(vols);
+    let _ = EXTS.set(exts);
 }
 
 /// Publish this worker's row. Relaxed: a scrape catching a row mid-update mixes two
@@ -169,70 +171,93 @@ fn encode() -> String {
         }
         let _ = writeln!(out, "{name}{labels} {v}");
     }
-    encode_volumes(&mut out);
+    encode_extents(&mut out);
     out
 }
 
-// ------------------------------------------------------------------------ per volume
+// ------------------------------------------------------------------------ per extent
 
-/// The per-volume series, beside the fixed table rather than in it because a volume
-/// exists only once a configuration names it and its fabric slot is what indexes the
-/// rows. Both sum across cores like everything else.
-const VOL_SERIES: [(&str, &str); 2] = [
+/// The per-extent series, beside the fixed table rather than in it because an extent
+/// exists only once a configuration names it. Both sum across cores like everything
+/// else.
+const EXT_SERIES: [(&str, &str); 2] = [
     (
-        "racer_volume_live_pages",
-        "Immutable pages still live in the volume, by volume.",
+        "racer_extent_live_pages",
+        "Immutable pages still live in the extent, by extent.",
     ),
     (
-        "racer_volume_tombstones",
-        "Trimmed pages awaiting the volume's next epoch, by volume.",
+        "racer_extent_tombstones",
+        "Trimmed pages awaiting the extent's next epoch, by extent.",
     ),
 ];
 
-/// Volume ids by fabric slot, 0 when unused. Every core writes the same configuration's
-/// value, so this one does not sum.
-static VOL_IDS: [AtomicU64; MAX_VOLUMES] = [const { AtomicU64::new(0) }; MAX_VOLUMES];
+/// The `(universe, extent)` each row stands for, `(0, 0)` when unused.
+///
+/// An extent id is assigned by the control plane and is not a small dense number, so the
+/// row index is the extent's position in the configuration instead. Every core walks the
+/// same configuration in the same order, so every core agrees on that position without
+/// coordinating; these two do not sum, and only core 0 writes them.
+static EXT_IDS: [(AtomicU64, AtomicU64); MAX_EXTENTS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; MAX_EXTENTS];
 
 #[repr(align(64))]
-struct VolRow([AtomicU64; MAX_VOLUMES * VOL_SERIES.len()]);
+struct ExtRow([AtomicU64; MAX_EXTENTS * EXT_SERIES.len()]);
 
-static VOLS: OnceLock<Box<[VolRow]>> = OnceLock::new();
+static EXTS: OnceLock<Box<[ExtRow]>> = OnceLock::new();
 
-/// Publish this worker's per-volume counts: `(slot, id, live, tombstones)`. Unnamed
-/// slots are zeroed, so a volume this core holds nothing for stops contributing rather
-/// than sticking at its last value.
-pub(crate) fn publish_volumes(core: usize, rows: &[(u8, u32, u64, u64)]) {
-    let Some(row) = VOLS.get().and_then(|r| r.get(core)) else {
+/// Publish this worker's per-extent counts: `(universe, extent, live, tombstones)`, in
+/// configuration order. Rows past the end are zeroed, so an extent this core holds
+/// nothing for stops contributing rather than sticking at its last value.
+///
+/// The names are core 0's alone. A core holding no page of an extent still lists it, but
+/// a core that has not caught up to a reload would otherwise retire a series the others
+/// are still filling.
+pub(crate) fn publish_extents(core: usize, rows: &[(u32, u32, u64, u64)]) {
+    let Some(row) = EXTS.get().and_then(|r| r.get(core)) else {
         return;
     };
     for slot in row.0.iter() {
         slot.store(0, Ordering::Relaxed);
     }
-    for &(slot, id, live, tombs) in rows {
-        let s = slot as usize;
-        if s >= MAX_VOLUMES {
-            continue;
+    for (s, &(universe, extent, live, tombs)) in rows.iter().enumerate() {
+        if s >= MAX_EXTENTS {
+            break;
         }
-        VOL_IDS[s].store(id as u64, Ordering::Relaxed);
+        if core == 0 {
+            EXT_IDS[s].0.store(universe as u64, Ordering::Relaxed);
+            EXT_IDS[s].1.store(extent as u64, Ordering::Relaxed);
+        }
         row.0[s].store(live, Ordering::Relaxed);
-        row.0[MAX_VOLUMES + s].store(tombs, Ordering::Relaxed);
+        row.0[MAX_EXTENTS + s].store(tombs, Ordering::Relaxed);
+    }
+    // A configuration that dropped an extent leaves its old row named but empty, which
+    // would keep a stale series alive; clearing the names past the end retires it.
+    if core == 0 {
+        for slot in EXT_IDS.iter().skip(rows.len().min(MAX_EXTENTS)) {
+            slot.0.store(0, Ordering::Relaxed);
+            slot.1.store(0, Ordering::Relaxed);
+        }
     }
 }
 
-fn encode_volumes(out: &mut String) {
-    for (i, (name, help)) in VOL_SERIES.iter().enumerate() {
+fn encode_extents(out: &mut String) {
+    for (i, (name, help)) in EXT_SERIES.iter().enumerate() {
         let _ = writeln!(out, "# HELP {name} {help}");
         let _ = writeln!(out, "# TYPE {name} gauge");
-        for (slot, id) in VOL_IDS.iter().enumerate() {
-            let id = id.load(Ordering::Relaxed);
-            if id == 0 {
+        for (slot, (universe, extent)) in EXT_IDS.iter().enumerate() {
+            let extent = extent.load(Ordering::Relaxed);
+            if extent == 0 {
                 continue;
             }
+            let universe = universe.load(Ordering::Relaxed);
             let mut v = 0u64;
-            for row in VOLS.get().map(|r| &r[..]).unwrap_or(&[]) {
-                v = v.saturating_add(row.0[i * MAX_VOLUMES + slot].load(Ordering::Relaxed));
+            for row in EXTS.get().map(|r| &r[..]).unwrap_or(&[]) {
+                v = v.saturating_add(row.0[i * MAX_EXTENTS + slot].load(Ordering::Relaxed));
             }
-            let _ = writeln!(out, "{name}{{volume=\"{id}\"}} {v}");
+            let _ = writeln!(
+                out,
+                "{name}{{universe=\"{universe}\",extent=\"{extent}\"}} {v}"
+            );
         }
     }
 }
@@ -366,28 +391,41 @@ mod tests {
         }
     }
 
-    /// The per-volume block is the only view the control plane has of a volume's epoch
+    /// The per-extent block is the only view the control plane has of an extent's epoch
     /// readiness, and the one place a row is both dynamic and summed.
     #[test]
-    fn volume_rows_sum_and_skip_empty_slots() {
+    fn extent_rows_sum_and_skip_unnamed_slots() {
         init(2);
-        publish_volumes(0, &[(0, 7, 3, 1), (5, 9, 0, 0)]);
-        publish_volumes(1, &[(0, 7, 4, 6)]);
+        publish_extents(0, &[(1, 7, 3, 1), (2, 9, 0, 0)]);
+        publish_extents(1, &[(1, 7, 4, 6), (2, 9, 0, 0)]);
         let text = encode();
         assert!(
-            text.contains("\nracer_volume_live_pages{volume=\"7\"} 7\n"),
+            text.contains("\nracer_extent_live_pages{universe=\"1\",extent=\"7\"} 7\n"),
             "{text}"
         );
         assert!(
-            text.contains("\nracer_volume_tombstones{volume=\"7\"} 7\n"),
+            text.contains("\nracer_extent_tombstones{universe=\"1\",extent=\"7\"} 7\n"),
             "{text}"
         );
-        // Named by one core only, so it is present but contributes nothing.
+        // Named but held by neither core, so it is present and contributes nothing.
         assert!(
-            text.contains("\nracer_volume_live_pages{volume=\"9\"} 0\n"),
+            text.contains("\nracer_extent_live_pages{universe=\"2\",extent=\"9\"} 0\n"),
             "{text}"
         );
         // A slot no configuration has named is not a series at all.
-        assert!(!text.contains("volume=\"0\""), "{text}");
+        assert!(!text.contains("extent=\"0\""), "{text}");
+
+        // The same extent id in two universes is two series: the label pair is what
+        // identifies a row, and partitioning reaches the metrics too.
+        publish_extents(0, &[(1, 7, 1, 0), (5, 7, 2, 0)]);
+        publish_extents(1, &[]);
+        let text = encode();
+        assert!(
+            text.contains("\nracer_extent_live_pages{universe=\"5\",extent=\"7\"} 2\n"),
+            "{text}"
+        );
+        // A configuration that dropped an extent retires its series rather than
+        // freezing it at its last value.
+        assert!(!text.contains("universe=\"2\""), "{text}");
     }
 }

@@ -1,4 +1,4 @@
-//! The IO surface handlers touch: `Buf`, `PoolBuf`, `Disk`, `Volume`, and the op slab
+//! The IO surface handlers touch: `Buf`, `PoolBuf`, `Disk`, `Export`, and the op slab
 //! that tracks every SQE outstanding.
 
 use std::cell::{Cell, RefCell};
@@ -568,7 +568,7 @@ impl Drop for OpFuture {
 }
 
 // ---------------------------------------------------------------------------
-// Disk / Volume
+// Disk / Export
 // ---------------------------------------------------------------------------
 
 pub(super) struct DiskInner {
@@ -795,23 +795,23 @@ async fn submit_op(
     fut.await
 }
 
-pub(super) struct VolumeInner {
+pub(super) struct ExportInner {
     pub(super) path: PathBuf,
 }
 
 /// A live ublk block device. Holding one keeps the device attached.
-pub(crate) struct Volume {
-    pub(super) inner: Arc<VolumeInner>,
+pub(crate) struct Export {
+    pub(super) inner: Arc<ExportInner>,
     pub(super) _nosend: PhantomData<*const ()>,
 }
 
-// SAFETY: `VolumeInner` is immutable and `Arc`-shared; only the `!Send` marker makes
+// SAFETY: `ExportInner` is immutable and `Arc`-shared; only the `!Send` marker makes
 // this impl necessary.
-unsafe impl Sync for Volume {}
+unsafe impl Sync for Export {}
 
-impl Volume {
-    pub(super) fn from_inner(inner: Arc<VolumeInner>) -> Volume {
-        Volume {
+impl Export {
+    pub(super) fn from_inner(inner: Arc<ExportInner>) -> Export {
+        Export {
             inner,
             _nosend: PhantomData,
         }

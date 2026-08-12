@@ -146,7 +146,7 @@ pub(super) enum Ctl {
     /// Take ownership of this worker's ublk queues for a device and arm their fetches.
     StartQueue {
         slot: u16,
-        vol: u64,
+        dev: u64,
         cfd: RawFd,
         depth: u16,
         q_ids: Vec<u16>,
@@ -243,7 +243,7 @@ impl Queue {
 struct DevSlot {
     active: bool,
     stopping: bool,
-    vol: u64,
+    dev: u64,
     /// `/dev/ublkcN`, for `USER_COPY` payload transfers. Owned by the control thread;
     /// valid for as long as the device is active.
     cfd: RawFd,
@@ -882,11 +882,11 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
 
     fn start_request(&mut self, id: u32) {
         let (slot, lq, tag) = tag_parts(id);
-        let (desc, vol) = {
+        let (desc, dev) = {
             let devs = self.l.devs.borrow();
             let d = &devs[slot as usize];
             match d.queues[lq].as_ref() {
-                Some(q) => (q.desc(tag), d.vol),
+                Some(q) => (q.desc(tag), d.dev),
                 None => return,
             }
         };
@@ -898,10 +898,10 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             return;
         }
         self.l.with_queue(id, |q| q.tag_state[tag as usize] = T_RUN);
-        self.dispatch(id, vol, desc);
+        self.dispatch(id, dev, desc);
     }
 
-    fn dispatch(&mut self, id: u32, vol: u64, desc: ublk::IoDesc) {
+    fn dispatch(&mut self, id: u32, dev: u64, desc: ublk::IoDesc) {
         let (_, _, tag) = tag_parts(id);
         let bytes = desc.nr_sectors * 512;
         debug_assert!(bytes as usize <= MAX_IO_BYTES);
@@ -917,7 +917,7 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             _ => return self.finish_request(id, Err(Errno::EOPNOTSUPP)),
         };
         let req = Request {
-            vol,
+            dev,
             op,
             lba: desc.start_sector / 8,
             buf: super::io::req_buf(id as u16, bytes),
@@ -947,16 +947,16 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             self.l.commit(id, res);
             return;
         }
-        let (desc, vol) = {
+        let (desc, dev) = {
             let devs = self.l.devs.borrow();
             let d = &devs[slot as usize];
             match d.queues[lq].as_ref() {
-                Some(q) => (q.desc(tag), d.vol),
+                Some(q) => (q.desc(tag), d.dev),
                 None => return,
             }
         };
         self.l.with_queue(id, |q| q.tag_state[tag as usize] = T_RUN);
-        self.dispatch(id, vol, desc);
+        self.dispatch(id, dev, desc);
     }
 
     fn finish_request(&mut self, id: u32, res: Result<(), Errno>) {
@@ -1087,13 +1087,13 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             }
             Ctl::StartQueue {
                 slot,
-                vol,
+                dev,
                 cfd,
                 depth,
                 q_ids,
                 ack,
             } => {
-                self.start_queues(slot, vol, cfd, depth, &q_ids);
+                self.start_queues(slot, dev, cfd, depth, &q_ids);
                 let _ = ack.send(());
             }
             Ctl::StopQueue { slot, ack } => {
@@ -1115,7 +1115,7 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
         }
     }
 
-    fn start_queues(&mut self, slot: u16, vol: u64, cfd: RawFd, depth: u16, q_ids: &[u16]) {
+    fn start_queues(&mut self, slot: u16, dev: u64, cfd: RawFd, depth: u16, q_ids: &[u16]) {
         let l = self.l;
         if let Err(e) = l
             .ring
@@ -1142,7 +1142,7 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             let d = &mut devs[slot as usize];
             d.active = true;
             d.stopping = false;
-            d.vol = vol;
+            d.dev = dev;
             d.cfd = cfd;
             d.queues[lq] = Some(Queue {
                 q_id,

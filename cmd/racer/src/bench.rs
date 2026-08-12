@@ -237,20 +237,20 @@ fn e2e(a: Args) {
         for n in &c.nodes {
             println!("  # node {} metrics {}", n.id, n.metrics);
         }
-        // Every node exports the volume and is a member of every group, so load is
+        // Every node exports the device and is a member of every group, so load is
         // spread over all of them; driving a single gateway would measure that node.
         let small: Vec<_> = c
             .nodes
             .iter()
-            .map(|n| n.volume(LWW).to_path_buf())
+            .map(|n| n.device(LWW).to_path_buf())
             .collect();
         let big: Vec<_> = c
             .nodes
             .iter()
-            .map(|n| n.volume(BIG).to_path_buf())
+            .map(|n| n.device(BIG).to_path_buf())
             .collect();
 
-        // Fill the 4 KiB volume once, so reads find pages and writes overwrite rather
+        // Fill the 4 KiB extent once, so reads find pages and writes overwrite rather
         // than allocate: a hole and a filled page are different amounts of work.
         let mut fill = Job::new(&small, 4096, plan.small_bytes());
         fill.depth = a.depth;
@@ -262,7 +262,7 @@ fn e2e(a: Args) {
         let f = load::run(&fill).expect("fill");
         assert_eq!(
             f.errors, 0,
-            "filling the 4 KiB volume failed with errno {}",
+            "filling the 4 KiB extent failed with errno {}",
             f.errno
         );
         emit(tag, "4k fill (seq)", &plan, &f);
@@ -276,7 +276,7 @@ fn e2e(a: Args) {
         report(&a, tag, "4k randwrite", &plan, &j);
 
         // An immutable 4 MiB page may be filled once per epoch, so its write row is a
-        // single pass over the volume rather than a timed window.
+        // single pass over the extent rather than a timed window.
         let mut j = Job::new(&big, HUGE, plan.huge_bytes());
         j.depth = 4.min(a.depth);
         j.cpus = cpus.clone();

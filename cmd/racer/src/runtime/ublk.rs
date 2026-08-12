@@ -277,8 +277,9 @@ pub(super) fn params_for(size_bytes: u64, huge: bool) -> Params {
     }
 }
 
-/// The fabric device. Not a volume: a request covers 1, 2, or up to 1024 blocks
-/// depending on the op, so it must not be split on page boundaries the way a volume is.
+/// The fabric device. Not a consumer device: a request covers 1, 2, or up to 1024
+/// blocks depending on the op, so it must not be split on page boundaries the way a
+/// consumer device is.
 /// `chunk_sectors` is one 4 MiB page, the largest frame there is and its own alignment,
 /// so no request ever spans two frames.
 ///
