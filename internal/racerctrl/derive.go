@@ -197,6 +197,12 @@ type Derivation struct {
 	// keeps its open fd across a reload.
 	Attachments map[Attachment]string
 
+	// Established names the universes this node already serves in full, so a
+	// universe that has been published with peers is never demoted back to its
+	// bootstrap shape. Callers build it from the config they last published;
+	// see EstablishedUniverses.
+	Established map[uint32]bool
+
 	// Generation is the generation to stamp. R1 requires it to strictly increase
 	// per node, so callers pass the previous generation plus one.
 	Generation uint64
@@ -220,7 +226,7 @@ func Derive(d Derivation) (*racerconfig.NodeConfig, error) {
 	volumes := d.Self.volumesByName()
 	fabricIDs := d.Self.fabricDeviceIDs()
 
-	universes := make([]*racerconfig.Universe, 0, len(d.Cluster.Universes))
+	full := make([]*racerconfig.Universe, 0, len(d.Cluster.Universes))
 
 	for i := range d.Cluster.Universes {
 		state := &d.Cluster.Universes[i]
@@ -239,18 +245,25 @@ func Derive(d Derivation) (*racerconfig.NodeConfig, error) {
 			return nil, fmt.Errorf("universe %q: %w", state.Class, err)
 		}
 
-		universes = append(universes, universe)
+		full = append(full, universe)
 	}
 
-	sort.Slice(universes, func(i, j int) bool { return universes[i].GetId() < universes[j].GetId() })
+	sort.Slice(full, func(i, j int) bool { return full[i].GetId() < full[j].GetId() })
 
-	devices, err := d.deriveDevices(universes)
+	universes, bootstrapping := d.publishable(full)
+
+	devices, err := d.deriveDevices(universes, bootstrapping)
 	if err != nil {
 		return nil, err
 	}
 
 	cohort := racerconfig.Cohort(d.Self.Cohort)
-	pages := CountStorePages(d.Self.Zone, universes)
+
+	// Sizing is computed from the full shape even when a universe is published
+	// in its bootstrap shape. The store is cold - racer formats it at startup
+	// and only a restart picks up a larger one - so sizing it to the inert
+	// config would mean every bootstrap ended in a restart to grow it back.
+	pages := CountStorePages(d.Self.Zone, full)
 
 	return &racerconfig.NodeConfig{
 		Generation: d.Generation,
@@ -264,8 +277,102 @@ func Derive(d Derivation) (*racerconfig.NodeConfig, error) {
 		},
 		Universes: universes,
 		Devices:   devices,
-		Policy:    derivePolicy(universes),
+		Policy:    derivePolicy(full),
 	}, nil
+}
+
+// EstablishedUniverses names the universes a config already serves in full.
+// Callers pass it back through Derivation.Established so that a universe which
+// has once been published with peers is never demoted to its bootstrap shape.
+func EstablishedUniverses(cfg *racerconfig.NodeConfig) map[uint32]bool {
+	universes := cfg.GetUniverses()
+
+	established := make(map[uint32]bool, len(universes))
+
+	for _, universe := range universes {
+		if len(universe.GetPeers()) > 0 || len(universe.GetZones()) > 0 || len(universe.GetExtents()) > 0 {
+			established[universe.GetId()] = true
+		}
+	}
+
+	return established
+}
+
+// publishable replaces a universe this node cannot serve yet with the inert
+// shape that lets racer create its fabric device, and reports which universes
+// were replaced.
+//
+// This is the bootstrap half of R7, and it exists because the fabric is
+// circular on a cold cluster. A peer link is an NVMe-oF namespace backed by
+// /dev/ublkb<fabric_device_id>, and racer creates that device only once it has
+// accepted a config naming the universe. A first config that insisted on peers
+// could therefore never be accepted: nothing would have created the devices its
+// peers are attached from, and every node would sit waiting for the others. So
+// the first config a node publishes for a universe names the catalog and the
+// fabric device id and nothing else - no zones, no peers, no extents - which
+// carries no data and answers no reads. It exists only to bring the fabric
+// devices up. Once the attachments land, the next derivation publishes the
+// universe in full.
+//
+// Only a universe this node has never served in full is demoted. An established
+// one keeps its full shape and renders degraded when a peer drops, which is
+// what racer expects of a live group; quietly dropping its extents instead
+// would take data away from a node that is serving it.
+func (d *Derivation) publishable(universes []*racerconfig.Universe) ([]*racerconfig.Universe, map[uint32]bool) {
+	out := make([]*racerconfig.Universe, 0, len(universes))
+	bootstrapping := make(map[uint32]bool)
+
+	for _, universe := range universes {
+		if d.Established[universe.GetId()] || fabricSatisfied(universe) {
+			out = append(out, universe)
+
+			continue
+		}
+
+		bootstrapping[universe.GetId()] = true
+
+		out = append(out, &racerconfig.Universe{
+			Id:             universe.GetId(),
+			Epoch:          universe.GetEpoch(),
+			Catalog:        universe.GetCatalog(),
+			FabricDeviceId: universe.GetFabricDeviceId(),
+		})
+	}
+
+	return out, bootstrapping
+}
+
+// fabricSatisfied reports whether every fabric link a universe's full shape
+// depends on has been attached. It mirrors the two rules validation applies to
+// a universe that carries data: a replicated catalog needs peers, and every
+// remote zone needs a gateway this node holds a link to.
+func fabricSatisfied(universe *racerconfig.Universe) bool {
+	peers := make(map[uint32]struct{}, len(universe.GetPeers()))
+	for _, peer := range universe.GetPeers() {
+		peers[peer.GetId()] = struct{}{}
+	}
+
+	if len(peers) == 0 && catalogNodeCount(universe.GetCatalog()) > 1 {
+		return false
+	}
+
+	for _, zone := range universe.GetZones() {
+		reachable := false
+
+		for _, gateway := range zone.GetGateways() {
+			if _, ok := peers[gateway]; ok {
+				reachable = true
+
+				break
+			}
+		}
+
+		if !reachable {
+			return false
+		}
+	}
+
+	return true
 }
 
 // joins reports whether this node takes part in a universe at all. A node joins
@@ -470,19 +577,22 @@ func warmZonesFor(volume *VolumeState) []uint32 {
 	return warm
 }
 
-func (d *Derivation) deriveDevices(universes []*racerconfig.Universe) ([]*racerconfig.Device, error) {
+func (d *Derivation) deriveDevices(
+	universes []*racerconfig.Universe,
+	bootstrapping map[uint32]bool,
+) ([]*racerconfig.Device, error) {
 	if len(d.Self.Devices) == 0 {
 		return nil, nil
 	}
 
 	compositions := make(map[string]Composition)
-	classOf := make(map[string]string)
+	universeOf := make(map[string]uint32)
 
 	for i := range d.Cluster.Universes {
 		state := &d.Cluster.Universes[i]
 		for j := range state.Volumes {
 			compositions[state.Volumes[j].Name] = state.Volumes[j].Composition
-			classOf[state.Volumes[j].Name] = state.Class
+			universeOf[state.Volumes[j].Name] = state.ID
 		}
 	}
 
@@ -500,6 +610,16 @@ func (d *Derivation) deriveDevices(universes []*racerconfig.Universe) ([]*racerc
 	devices := make([]*racerconfig.Device, 0, len(bindings))
 
 	for _, binding := range bindings {
+		// The volume's universe is still bringing its fabric device up, so this
+		// config carries none of its extents yet. Leave the device unexported
+		// rather than failing the render: failing would take the bootstrap
+		// config down with it, and the bootstrap config is what creates the
+		// fabric device this volume is waiting on. The derivation that
+		// publishes the universe in full picks the binding up.
+		if bootstrapping[universeOf[binding.Volume]] {
+			continue
+		}
+
 		composition, ok := compositions[binding.Volume]
 		if !ok {
 			return nil, fmt.Errorf(

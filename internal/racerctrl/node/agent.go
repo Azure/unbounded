@@ -420,6 +420,7 @@ func (a *Agent) render() error {
 		Cluster:     a.clusterSnapshot(),
 		Self:        a.self,
 		Attachments: a.attachments,
+		Established: racerctrl.EstablishedUniverses(a.published),
 		Generation:  a.generation,
 	})
 	if err != nil {

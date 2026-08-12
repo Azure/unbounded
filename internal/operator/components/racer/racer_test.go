@@ -691,9 +691,76 @@ func TestReconcileMembershipAdvancesTheEpoch(t *testing.T) {
 	}
 }
 
-// Replacement is one node at a time and only while nothing is healing. A node
+// Replacement is one node at a time and only while nothing is healing. A member
 // still replaying must hold the next step, or two groups lose a replica at once.
 func TestReconcileMembershipWaitsWhileHealing(t *testing.T) {
+	ctx := context.Background()
+
+	const seeded = "1?cohort=0,2?cohort=1,3?cohort=2"
+
+	env := testEnv(t, replacementObjects(seeded, map[string]string{
+		"n2": "generation=1&replaying=2",
+	})...)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileMembership(ctx); err != nil {
+		t.Fatalf("reconcile membership: %v", err)
+	}
+
+	if got := zoneMembership(ctx, t, env, 1, 1); got != seeded {
+		t.Fatalf("membership became %q while a member was still replaying", got)
+	}
+
+	if len(p.waiting) == 0 {
+		t.Fatal("healing gate did not record a reason to wait")
+	}
+}
+
+// The healing gate is a question about the nodes holding groups. A candidate has
+// no health to report until a membership names it and something hands it a
+// config, so gating on the candidate's silence would make it impossible to ever
+// add a node.
+func TestReconcileMembershipAddsANodeThatHasNeverReported(t *testing.T) {
+	ctx := context.Background()
+
+	const seeded = "1?cohort=0,2?cohort=1,3?cohort=2"
+
+	// n4 carries no health annotation at all, which is what a node that has
+	// never run racer looks like.
+	env := testEnv(t, replacementObjects(seeded, nil)...)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileMembership(ctx); err != nil {
+		t.Fatalf("reconcile membership: %v", err)
+	}
+
+	raw := zoneMembership(ctx, t, env, 1, 1)
+	if raw == seeded {
+		t.Fatalf("membership is still %q; the candidate blocked its own addition (waiting: %v)", raw, p.waiting)
+	}
+
+	members, err := racerctrl.ParseMembership(raw)
+	if err != nil {
+		t.Fatalf("parse membership %q: %v", raw, err)
+	}
+
+	if !members.Contains(4) {
+		t.Fatalf("membership %q does not name the candidate", raw)
+	}
+}
+
+// A cluster where nothing has ever run racer has to be able to publish its first
+// membership: until one exists no node has a config, and until a node has a
+// config none of them can report any health at all.
+func TestReconcileMembershipBootstrapsWithNoHealthReported(t *testing.T) {
 	ctx := context.Background()
 
 	objects := []client.Object{
@@ -710,7 +777,6 @@ func TestReconcileMembershipWaitsWhileHealing(t *testing.T) {
 			racerctrl.NodeIDAnnotation:     formatUint(uint64(i) + 1),
 			racerctrl.NodeZoneAnnotation:   "1",
 			racerctrl.NodeCohortAnnotation: formatUint(uint64(i)),
-			racerctrl.NodeHealthAnnotation: "generation=1&replaying=2",
 		}))
 	}
 
@@ -725,13 +791,52 @@ func TestReconcileMembershipWaitsWhileHealing(t *testing.T) {
 		t.Fatalf("reconcile membership: %v", err)
 	}
 
-	if zoneMembership(ctx, t, env, 1, 1) != "" {
-		t.Fatal("membership was published while a node was still replaying")
+	if zoneMembership(ctx, t, env, 1, 1) == "" {
+		t.Fatalf("no first membership was published (waiting: %v)", p.waiting)
+	}
+}
+
+// replacementObjects builds a zone whose membership is already published and
+// whose first member has gone away, so exactly one swap is wanted. health names
+// the health annotation each node reports; a node absent from it reports none.
+func replacementObjects(seeded string, health map[string]string) []client.Object {
+	objects := []client.Object{
+		racerClass("fast", map[string]string{
+			racerctrl.UniverseIDAnnotation:  "1",
+			racerctrl.CatalogSizeAnnotation: "3",
+			racerctrl.EpochAnnotation:       "1",
+			racerctrl.NextLBAAnnotation:     "0",
+		}),
+		membershipMap(1, 1, seeded),
 	}
 
-	if len(p.waiting) == 0 {
-		t.Fatal("healing gate did not record a reason to wait")
+	// n1 holds cohort 0 and is no longer Ready, so n4 is the only candidate for
+	// its slot and the desired membership differs from the published one by
+	// exactly that id.
+	for i, name := range []string{"n1", "n2", "n3", "n4"} {
+		annotations := map[string]string{
+			racerctrl.NodeIDAnnotation:     formatUint(uint64(i) + 1),
+			racerctrl.NodeZoneAnnotation:   "1",
+			racerctrl.NodeCohortAnnotation: formatUint(uint64(i) % 3),
+		}
+
+		if value, ok := health[name]; ok {
+			annotations[racerctrl.NodeHealthAnnotation] = value
+		} else if name != "n4" {
+			annotations[racerctrl.NodeHealthAnnotation] = "generation=1"
+		}
+
+		node := enrolledNode(name, "east", annotations)
+		if name == "n1" {
+			node.Status.Conditions = []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionFalse},
+			}
+		}
+
+		objects = append(objects, node)
 	}
+
+	return objects
 }
 
 func TestReconcileStateReportsBlockedGatesAsNotReady(t *testing.T) {

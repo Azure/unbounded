@@ -294,8 +294,17 @@ func validatePeers(node *racerconfig.Node, universe *racerconfig.Universe) error
 	// R5: a universe meant to be replicated has non-empty peers. A catalog with
 	// more than one distinct node means this node cannot serve every group
 	// alone, so with no peers every group it does not hold is unavailable.
+	//
+	// The exception is a universe that carries nothing: no zones to route to and
+	// no extents to serve. That is the bootstrap shape a node publishes to get
+	// racer to create the universe's fabric device, which is the device its
+	// peers are attached from and so the thing that has to exist before there
+	// can be any peers at all. It answers no reads, so there is nothing for a
+	// missing peer to make unavailable.
 	if nodes := catalogNodeCount(universe.GetCatalog()); len(seen) == 0 && nodes > 1 {
-		return fmt.Errorf("catalog names %d nodes but the universe has no peers", nodes)
+		if len(universe.GetExtents()) > 0 || len(universe.GetZones()) > 0 {
+			return fmt.Errorf("catalog names %d nodes but the universe has no peers", nodes)
+		}
 	}
 
 	return nil

@@ -237,11 +237,33 @@ func PlanMembership(current, candidates Membership, catalogSize int, nodes []Nod
 		return step, Allow(), nil
 	}
 
-	if gate := HealingQuiesced(nodes); !gate.OK {
+	if gate := HealingQuiesced(currentMembers(current, nodes)); !gate.OK {
 		return MembershipStep{}, gate, nil
 	}
 
 	return step, Allow(), nil
+}
+
+// currentMembers picks out the nodes a membership names.
+//
+// The healing gate asks whether the last membership change has settled, which
+// is a question about the nodes that hold groups. Asking it of every node in
+// the cluster instead would let a node that has never run racer block the very
+// step that would put it to work: a candidate's health generation is zero until
+// something gives it a config, and nothing gives it a config until a membership
+// names it. A node already in the catalog is a different matter - it holds
+// groups now, and stepping while it is still replaying is exactly what R6
+// forbids - so those are still gated on.
+func currentMembers(current Membership, nodes []NodeState) []NodeState {
+	members := make([]NodeState, 0, len(current))
+
+	for _, node := range nodes {
+		if current.Contains(node.ID) {
+			members = append(members, node)
+		}
+	}
+
+	return members
 }
 
 // livePagesInZone sums an extent's live pages across the nodes of one zone. The
