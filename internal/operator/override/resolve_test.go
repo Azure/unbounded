@@ -4,6 +4,7 @@
 package override
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"testing"
@@ -278,4 +279,58 @@ func patchFromYAML(doc string) map[string]any {
 	out, _ := normalized.(map[string]any)
 
 	return out
+}
+
+// TestCheckResolvableRejectsSelectorLabelRewrites is a regression test.
+//
+// spec.selector is protected, but spec.template.metadata.labels is a permitted
+// subtree, so a patch changing a selector-matched label validated, merged, and
+// was then silently restamped by restoreIdentity. The user got no error and no
+// effect, which is the silent-no-op class this feature exists to avoid.
+func TestCheckResolvableRejectsSelectorLabelRewrites(t *testing.T) {
+	workload := testWorkload("rack-a")
+
+	patch := map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"metadata": map[string]any{
+					"labels": map[string]any{"app.kubernetes.io/name": "mine"},
+				},
+			},
+		},
+	}
+
+	problems := checkResolvable(Entry{Patch: patch}, Source{Key: "a.yaml"}, workload)
+	if len(problems) == 0 {
+		t.Fatal("rewriting a selector-matched template label must be rejected, not silently restored")
+	}
+
+	if !strings.Contains(errors.Join(problems...).Error(), "selector matches") {
+		t.Fatalf("problems = %v, want the selector named", problems)
+	}
+}
+
+// TestCheckResolvableAllowsUnrelatedTemplateLabels pins that adding a label the
+// selector does not match is still the supported thing to do.
+func TestCheckResolvableAllowsUnrelatedTemplateLabels(t *testing.T) {
+	workload := testWorkload("rack-a")
+
+	patch := map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"metadata": map[string]any{
+					"labels": map[string]any{
+						"team": "platform",
+						// Restating a selector label with the value it already
+						// has changes nothing and must not be refused.
+						"app.kubernetes.io/name": "storage",
+					},
+				},
+			},
+		},
+	}
+
+	if problems := checkResolvable(Entry{Patch: patch}, Source{Key: "a.yaml"}, workload); len(problems) != 0 {
+		t.Fatalf("problems = %v, want none", problems)
+	}
 }

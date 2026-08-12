@@ -58,11 +58,18 @@ func Resolve(plan *component.Plan, entries []SourcedEntry, knownSites []string) 
 
 	byIndex := map[int]*Target{}
 
+	// The Sites this plan actually covers, which for a Site-scoped pass is one
+	// of them. An entry selecting a different Site did not fail to match; it
+	// was simply out of scope for this pass.
+	planned := map[string]bool{}
+
 	for i := range plan.Operations {
 		op := plan.Operations[i]
 		if !op.Overridable {
 			continue
 		}
+
+		planned[op.Site] = true
 
 		for _, sourced := range entries {
 			if !matches(sourced.Entry, op) {
@@ -91,7 +98,7 @@ func Resolve(plan *component.Plan, entries []SourcedEntry, knownSites []string) 
 	}
 
 	resolution.UnmatchedSites = UnmatchedSites(entries, knownSites)
-	resolution.InertEntries = inertEntries(entries, byIndex)
+	resolution.InertEntries = inertEntries(entries, byIndex, planned, knownSites)
 
 	return resolution
 }
@@ -154,7 +161,16 @@ func UnmatchedSites(entries []SourcedEntry, knownSites []string) []string {
 	return unmatched
 }
 
-func inertEntries(entries []SourcedEntry, byIndex map[int]*Target) []Source {
+// inertEntries returns the entries that matched no workload, excluding those
+// that were merely out of this pass's scope.
+//
+// A Site-scoped pass plans per-Site components for one Site, so every entry
+// selecting a different Site resolves to nothing in it. Reporting those as
+// inert produced a log line per entry per pass and, worse, a Normal Event on
+// the ConfigMap announcing that entries "matched nothing" when they had simply
+// not been looked at. Inert has to mean "this entry matches nothing anywhere",
+// which is the only reading a user can act on.
+func inertEntries(entries []SourcedEntry, byIndex map[int]*Target, planned map[string]bool, knownSites []string) []Source {
 	used := map[string]bool{}
 
 	for _, target := range byIndex {
@@ -166,12 +182,43 @@ func inertEntries(entries []SourcedEntry, byIndex map[int]*Target) []Source {
 	var inert []Source
 
 	for _, sourced := range entries {
-		if !used[sourced.Source.String()] {
-			inert = append(inert, sourced.Source)
+		if used[sourced.Source.String()] {
+			continue
 		}
+
+		if outOfScope(sourced.Entry, planned, knownSites) {
+			continue
+		}
+
+		inert = append(inert, sourced.Source)
 	}
 
 	return inert
+}
+
+// outOfScope reports whether an entry names a Site that exists but that this
+// pass did not plan for, which is the difference between "matches nothing" and
+// "was not looked at".
+func outOfScope(entry Entry, planned map[string]bool, knownSites []string) bool {
+	if len(entry.Sites) == 0 {
+		return false
+	}
+
+	known := make(map[string]bool, len(knownSites))
+	for _, site := range knownSites {
+		known[site] = true
+	}
+
+	for _, site := range entry.Sites {
+		// A Site that does not exist is reported through UnmatchedSites, and a
+		// Site this pass planned for is genuinely unmatched, so neither puts
+		// the entry out of scope.
+		if !known[site] || planned[site] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // checkResolvable verifies an entry's container references against the workload
@@ -205,6 +252,70 @@ func checkResolvable(entry Entry, source Source, workload *unstructured.Unstruct
 	problems = append(problems, checkMountCollisions(entry, source, workload)...)
 	problems = append(problems, checkVolumeCollisions(entry, source, workload)...)
 	problems = append(problems, checkExclusiveFields(entry, source, workload)...)
+	problems = append(problems, checkSelectorLabels(entry, source, workload)...)
+
+	return problems
+}
+
+// checkSelectorLabels rejects a patch that rewrites a template label the
+// workload's selector matches.
+//
+// spec.selector is protected, but spec.template.metadata.labels is a permitted
+// subtree, so a patch changing a selector-matched label validated, merged, and
+// was then silently restamped by restoreIdentity: the user got no error and no
+// effect. Restamping is still the backstop, because a template that stops
+// satisfying its selector is rejected outright by the API server and that must
+// not depend on this check being exhaustive. Saying so here is what turns a
+// silent no-op into an answer.
+//
+// Setting the label to the value it already has is permitted. It changes
+// nothing and refusing it would fail a patch that merely restates the workload.
+func checkSelectorLabels(entry Entry, source Source, workload *unstructured.Unstructured) []error {
+	if len(entry.Patch) == 0 {
+		return nil
+	}
+
+	matchLabels := nestedStringMap(workload.Object, "spec", "selector", "matchLabels")
+	if len(matchLabels) == 0 {
+		return nil
+	}
+
+	patched, found, err := unstructured.NestedFieldNoCopy(
+		entry.Patch, "spec", "template", "metadata", "labels")
+	if err != nil || !found {
+		return nil
+	}
+
+	labels, ok := patched.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	var problems []error
+
+	for _, key := range keys {
+		current, selects := matchLabels[key]
+		if !selects {
+			continue
+		}
+
+		if value, ok := labels[key].(string); ok && value == current {
+			continue
+		}
+
+		problems = append(problems, fmt.Errorf(
+			"%s: patch sets template label %q, which the workload selector matches; "+
+				"a template that stops satisfying its selector is rejected by the API server, "+
+				"so the operator restores it and the change would do nothing. Add a label under a different key instead",
+			source, key))
+	}
 
 	return problems
 }

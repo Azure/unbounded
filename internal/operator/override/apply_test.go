@@ -859,3 +859,47 @@ overrides:
 		}
 	})
 }
+
+// TestInertEntriesIgnoreOutOfScopeSites is a regression test.
+//
+// A Site-scoped pass plans per-Site components for one Site, so every entry
+// selecting a different Site resolves to nothing in it. Those were reported as
+// inert, which produced a log line per entry per pass and a Normal Event on the
+// ConfigMap announcing that entries "matched nothing" when they had simply not
+// been looked at. Inert has to mean "matches nothing anywhere".
+func TestInertEntriesIgnoreOutOfScopeSites(t *testing.T) {
+	// A pass for rack-a alone: rack-b's workload is not in this plan.
+	plan := multiSitePlan("rack-a")
+
+	entry := func(site string) string {
+		return `apiVersion: ` + APIVersion + `
+overrides:
+  - component: storage
+    kind: DaemonSet
+    sites: [` + site + `]
+    extraArgs:
+      run: ["--x"]
+`
+	}
+
+	entries, err := parseAll(map[string]string{
+		"a.yaml": entry("rack-a"),
+		"b.yaml": entry("rack-b"),
+		"c.yaml": entry("ghost"),
+	})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	resolution := Resolve(plan, entries, []string{"rack-a", "rack-b"})
+
+	// rack-b exists and simply was not part of this pass. Only the entry naming
+	// a Site that does not exist at all is genuinely inert.
+	if len(resolution.InertEntries) != 1 || resolution.InertEntries[0].Key != "c.yaml" {
+		t.Fatalf("inert = %+v, want only the entry naming a Site that does not exist", resolution.InertEntries)
+	}
+
+	if len(resolution.UnmatchedSites) != 1 || resolution.UnmatchedSites[0] != "ghost" {
+		t.Fatalf("unmatched = %v, want [ghost]", resolution.UnmatchedSites)
+	}
+}
