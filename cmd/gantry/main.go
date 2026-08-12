@@ -80,6 +80,8 @@ func run(args []string) error {
 		return nil
 	case "agent":
 		return runAgent(args[1:])
+	case "node-config":
+		return runNodeConfig(args[1:])
 	case "help", "-h", "-help", "--help":
 		return runHelp(args[1:])
 	default:
@@ -94,6 +96,7 @@ func printUsage(w *os.File) {
 
 Subcommands:
   agent      run the Gantry P2P agent
+	node-config reconcile standalone containerd registry routes
   version    print build information
   help       print help for the agent subcommand`)
 }

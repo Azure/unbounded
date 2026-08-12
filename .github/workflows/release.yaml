@@ -1037,6 +1037,7 @@ jobs:
           # Upload the additional artifacts to the draft release that
           # GoReleaser created.
           gh release upload "${TAG}" \
+            hack/install-gantry.sh \
             dist/unbounded.yaml \
             dist/unbounded-manifests-*.tar.gz \
             dist/unbounded-manifests-*.tar.gz.bundle.json \

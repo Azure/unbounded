@@ -22,6 +22,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
+	gantryconfig "github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -97,6 +98,32 @@ func TestEnsureConfigCreatesDefaultOnlyWhenAbsent(t *testing.T) {
 
 	if got.Data["config.yaml"] == "" || hash != component.ConfigMapPayloadHash(&got) {
 		t.Fatalf("default gantry config/hash missing: hash=%q data=%#v", hash, got.Data)
+	}
+}
+
+func TestOperatorConfigKeepsRegistryRequirement(t *testing.T) {
+	env := testEnv(t)
+	if _, err := ensureConfig(t.Context(), env); err != nil {
+		t.Fatalf("ensureConfig: %v", err)
+	}
+
+	var configMap corev1.ConfigMap
+	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: component.DefaultNamespace, Name: configName}, &configMap); err != nil {
+		t.Fatalf("get default gantry config: %v", err)
+	}
+
+	config := gantryconfig.NewDefault()
+	if err := config.LoadYAML(strings.NewReader(configMap.Data["config.yaml"])); err != nil {
+		t.Fatalf("load operator Gantry config: %v", err)
+	}
+
+	if config.AllowNoUpstreamRegistries {
+		t.Fatal("operator Gantry config enabled standalone empty-registry mode")
+	}
+
+	config.UpstreamRegistries = nil
+	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "upstream_registries") {
+		t.Fatalf("operator config no longer requires an upstream registry: %v", err)
 	}
 }
 

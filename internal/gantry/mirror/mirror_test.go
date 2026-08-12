@@ -146,6 +146,45 @@ type authorizationCapturingOrigin struct {
 	seen chan string
 }
 
+type modeCapturingOrigin struct {
+	authorizationCapturingOrigin
+	challengeCalls atomic.Int32
+}
+
+type tagFetchingOrigin struct {
+	authorizationCapturingOrigin
+	methods []string
+}
+
+func (o *tagFetchingOrigin) FetchManifest(_ context.Context, method, registry, repository, reference string) (*http.Response, error) {
+	o.methods = append(o.methods, method)
+
+	if registry != "reg.example.com" || repository != "repo" || reference != "v1" {
+		return nil, fmt.Errorf("unexpected manifest request: %s/%s:%s", registry, repository, reference)
+	}
+
+	body := io.NopCloser(bytes.NewReader(o.body))
+	if method == http.MethodHead {
+		body = io.NopCloser(bytes.NewReader(nil))
+	}
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":          []string{"application/vnd.oci.image.manifest.v1+json"},
+			"Content-Length":        []string{fmt.Sprint(len(o.body))},
+			"Docker-Content-Digest": []string{"sha256:" + strings.Repeat("a", 64)},
+		},
+		Body: body,
+	}, nil
+}
+
+func (o *modeCapturingOrigin) AuthenticationChallenge(context.Context, string) (string, bool, error) {
+	o.challengeCalls.Add(1)
+
+	return `Bearer realm="https://auth.example/token"`, true, nil
+}
+
 type authorizationRejectingOrigin struct{}
 
 func (authorizationRejectingOrigin) Pull(_ context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
@@ -196,6 +235,130 @@ func TestMirror_CapturesInboundAuthorizationForOrigin(t *testing.T) {
 
 	if got := <-origin.seen; got != "Bearer requester-token" {
 		t.Fatalf("origin authorization = %q, want requester token", got)
+	}
+}
+
+func TestMirror_ExplicitNonDelegatedModesSuppressRequesterAuthorization(t *testing.T) {
+	for _, mode := range []string{config.UpstreamAuthAnonymous, config.UpstreamAuthShared} {
+		t.Run(mode, func(t *testing.T) {
+			body := []byte("origin bytes")
+			d := digestOf(body)
+			origin := &modeCapturingOrigin{authorizationCapturingOrigin: authorizationCapturingOrigin{
+				body: body,
+				seen: make(chan string, 1),
+			}}
+			cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{
+				Name: "reg.example.com", Endpoint: "https://reg.example.com", AuthMode: mode,
+			}}}
+
+			server := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), origin).Handler())
+			defer server.Close()
+
+			request, err := http.NewRequest(http.MethodGet, server.URL+"/v2/repo/blobs/"+d.String(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			request.Header.Set("Authorization", "Bearer requester-token")
+
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", response.StatusCode)
+			}
+
+			if got := <-origin.seen; got != "" {
+				t.Fatalf("origin authorization = %q, want empty", got)
+			}
+
+			if got := origin.challengeCalls.Load(); got != 0 {
+				t.Fatalf("authentication challenge calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestMirror_SharedAuthIgnoresMalformedRequesterAuthorization(t *testing.T) {
+	body := []byte("origin bytes")
+	d := digestOf(body)
+	origin := &authorizationCapturingOrigin{body: body, seen: make(chan string, 1)}
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{
+		Name: "reg.example.com", Endpoint: "https://reg.example.com", AuthMode: config.UpstreamAuthShared,
+	}}}
+
+	server := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), origin).Handler())
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/v2/repo/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request.Header.Set("Authorization", "Bearer two tokens")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+
+	if got := <-origin.seen; got != "" {
+		t.Fatalf("origin authorization = %q, want empty", got)
+	}
+}
+
+func TestMirror_SharedAuthProxiesTagManifest(t *testing.T) {
+	body := []byte(`{"schemaVersion":2}`)
+	origin := &tagFetchingOrigin{authorizationCapturingOrigin: authorizationCapturingOrigin{body: body, seen: make(chan string, 1)}}
+	config := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{
+		Name: "reg.example.com", Endpoint: "https://reg.example.com", AuthMode: config.UpstreamAuthShared,
+	}}}
+
+	server := httptest.NewServer(mirror.New(config, fakes.NewCache(), origin).Handler())
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v2/repo/manifests/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := io.ReadAll(response.Body)
+	response.Body.Close()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if response.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
+		t.Fatalf("GET status/body = %d/%q", response.StatusCode, got)
+	}
+
+	if response.Header.Get("Docker-Content-Digest") == "" {
+		t.Fatal("GET Docker-Content-Digest header missing")
+	}
+
+	request, err := http.NewRequest(http.MethodHead, server.URL+"/v2/repo/manifests/v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response.Body.Close()
+
+	if response.StatusCode != http.StatusOK || len(origin.methods) != 2 || origin.methods[0] != http.MethodGet || origin.methods[1] != http.MethodHead {
+		t.Fatalf("HEAD status/methods = %d/%v", response.StatusCode, origin.methods)
 	}
 }
 

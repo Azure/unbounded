@@ -38,6 +38,17 @@ var repositoryNameRe = func() *regexp.Regexp {
 	return regexp.MustCompile(`^` + component + `(?:/` + component + `)*$`)
 }()
 
+var tagRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+
+// ValidateTag reports whether tag matches the OCI/Docker tag grammar.
+func ValidateTag(tag string) error {
+	if !tagRe.MatchString(tag) {
+		return fmt.Errorf("oci: invalid tag %q", tag)
+	}
+
+	return nil
+}
+
 // ValidateRepositoryName reports whether repo is a well-formed OCI
 // Distribution-spec repository name. It rejects empty values, empty path
 // components, names over MaxRepositoryNameLength, and any value outside

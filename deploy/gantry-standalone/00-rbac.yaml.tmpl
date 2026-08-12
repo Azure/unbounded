@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/part-of: gantry-standalone
+    app.kubernetes.io/managed-by: gantryctl
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gantry-standalone
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/managed-by: gantryctl
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gantry-standalone-agent
+  labels:
+    app.kubernetes.io/managed-by: gantryctl
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gantry-standalone-agent
+  labels:
+    app.kubernetes.io/managed-by: gantryctl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gantry-standalone-agent
+subjects:
+  - kind: ServiceAccount
+    name: gantry-standalone
+    namespace: {{ .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gantry-standalone-agent
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: gantryctl
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gantry-standalone-agent
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: gantryctl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gantry-standalone-agent
+subjects:
+  - kind: ServiceAccount
+    name: gantry-standalone
+    namespace: {{ .Namespace }}

@@ -28,6 +28,23 @@ builds:
       - amd64
       - arm64
 
+  - id: gantryctl
+    main: ./cmd/gantryctl
+    binary: gantryctl
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/Azure/unbounded/internal/version.Version={{ .Version }}
+      - -X github.com/Azure/unbounded/internal/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/Azure/unbounded/internal/version.BuildTime={{ .Date }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
   - id: unbounded-agent
     main: ./cmd/agent
     binary: unbounded-agent
@@ -64,6 +81,13 @@ archives:
     formats:
       - tar.gz
     name_template: "kubectl-unbounded-{{ .Os }}-{{ .Arch }}"
+
+  - id: gantryctl
+    ids:
+      - gantryctl
+    formats:
+      - tar.gz
+    name_template: "gantryctl-{{ .Os }}-{{ .Arch }}"
 
   - id: unbounded-agent
     ids:

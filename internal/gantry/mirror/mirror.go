@@ -62,6 +62,10 @@ type AuthenticationChallenger interface {
 	AuthenticationChallenge(ctx context.Context, registry string) (challenge string, required bool, err error)
 }
 
+type tagManifestFetcher interface {
+	FetchManifest(ctx context.Context, method, registry, repository, reference string) (*http.Response, error)
+}
+
 // Server is the mirror HTTP handler.
 type Server struct {
 	cfg     *config.Config
@@ -731,13 +735,6 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	rawAuthorization := strings.TrimSpace(r.Header.Get("Authorization"))
 
 	authorization := registryauth.Normalize(rawAuthorization)
-	if rawAuthorization != "" && authorization == "" {
-		http.Error(w, "unsupported registry authorization", http.StatusServiceUnavailable)
-
-		return
-	}
-
-	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
 
 	path := r.URL.Path
 	if path == "/v2/" || path == "/v2" {
@@ -776,10 +773,32 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	upstreamConfig, found := s.cfg.ResolveUpstream(upstream)
+	if !found {
+		http.Error(w, "registry configuration unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	authMode := upstreamConfig.EffectiveAuthMode()
+	if authMode == config.UpstreamAuthAnonymous || authMode == config.UpstreamAuthShared {
+		authorization = ""
+	} else if rawAuthorization != "" && authorization == "" {
+		http.Error(w, "unsupported registry authorization", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
+
 	if !isDigestRef(ref) {
+		if authMode == config.UpstreamAuthShared {
+			s.serveSharedTagManifest(w, r, upstream, repo, ref)
+			return
+		}
 		// Tag request (the design doc) - fall through to origin via hosts.toml.
 		// 503 (not 404) so containerd retries against the next mirror.
 		w.WriteHeader(http.StatusServiceUnavailable)
+
 		return
 	}
 
@@ -789,7 +808,7 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if authorization == "" && s.auth != nil {
+	if authorization == "" && s.auth != nil && authMode == config.UpstreamAuthDelegated {
 		challengeCtx, cancel := context.WithTimeout(r.Context(), authenticationChallengeTimeout)
 		challenge, required, challengeErr := s.auth.AuthenticationChallenge(challengeCtx, upstream)
 
@@ -814,6 +833,38 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.serveDigest(w, r, upstream, repo, d, kind)
+}
+
+func (s *Server) serveSharedTagManifest(w http.ResponseWriter, r *http.Request, registry, repository, reference string) {
+	fetcher, ok := s.origin.(tagManifestFetcher)
+	if !ok {
+		http.Error(w, "shared registry manifest resolution unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	resp, err := fetcher.FetchManifest(r.Context(), r.Method, registry, repository, reference)
+	if err != nil {
+		writeOriginError(w, err, s.logger)
+		return
+	}
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+	for _, header := range []string{"Content-Type", "Content-Length", "Docker-Content-Digest", "ETag"} {
+		if value := resp.Header.Get(header); value != "" {
+			w.Header().Set(header, value)
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		s.logger.Warn("mirror: shared-auth tag manifest stream failed", slog.Any("err", err))
+	}
 }
 
 func (s *Server) resolveUpstream(r *http.Request) (string, error) {

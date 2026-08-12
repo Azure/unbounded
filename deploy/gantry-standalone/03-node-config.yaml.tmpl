@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-standalone-node-config
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry-standalone-node-config
+    app.kubernetes.io/component: node-config
+    app.kubernetes.io/managed-by: gantryctl
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry-standalone-node-config
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry-standalone-node-config
+        app.kubernetes.io/component: node-config
+        app.kubernetes.io/managed-by: gantryctl
+    spec:
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: configure
+          image: {{ .Image }}
+          imagePullPolicy: IfNotPresent
+          args: ["node-config", "reconcile"]
+          readinessProbe:
+            exec:
+              command: ["gantry", "node-config", "check"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: desired
+              mountPath: /etc/gantry-node-config
+              readOnly: true
+            - name: host-certs
+              mountPath: /host-certs
+            - name: host-containerd-config
+              mountPath: /host-containerd-config
+              readOnly: true
+            - name: host-state
+              mountPath: /host-state
+      volumes:
+        - name: desired
+          configMap:
+            name: gantry-standalone-node-routes
+        - name: host-certs
+          hostPath:
+            path: /etc/containerd/certs.d
+            type: DirectoryOrCreate
+        - name: host-containerd-config
+          hostPath:
+            path: /etc/containerd
+            type: Directory
+        - name: host-state
+          hostPath:
+            path: /var/lib/gantry-standalone/node-config
+            type: DirectoryOrCreate
