@@ -1371,17 +1371,17 @@ def host_image() -> HostImage:
             write_files=ubuntu_netplan_write_files(),
             pre_marker_commands=["netplan apply"],
         )
-    if HOST_BASE_OS == "fedora":
+    if HOST_BASE_OS == "almalinux":
         return HostImage(
             url=HOST_IMAGE_URL
-            or "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2",
-            file_name="fedora-cloud-amd64.qcow2",
+            or "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-latest.x86_64.qcow2",
+            file_name="almalinux-cloud-amd64.qcow2",
             backing_format="qcow2",
             sudo_group="wheel",
             packages=["curl", "jq", "ca-certificates", "net-tools"],
         )
 
-    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or fedora")
+    die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or almalinux")
 
 
 def ubuntu_netplan_write_files() -> str:

@@ -64,10 +64,10 @@ jobs:
         include:
           - host-base-os: ubuntu2404
             nspawn-base-os: ubuntu2404
-          # Fedora covers the RPM host path for Azure Linux nspawn testing.
+          # AlmaLinux covers the RPM host path for Azure Linux nspawn testing.
           # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
           # e2e can boot directly as the host VM.
-          - host-base-os: fedora
+          - host-base-os: almalinux
             nspawn-base-os: azlinux3
           - host-base-os: ubuntu2604
             nspawn-base-os: ubuntu2604
