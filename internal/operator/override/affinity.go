@@ -181,27 +181,59 @@ func cartesianTerms(left, right []any) ([]any, error) {
 				return nil, fmt.Errorf("required node affinity term must be a mapping, but holds %T", r)
 			}
 
-			product = append(product, combineTerms(leftTerm, rightTerm))
+			term, err := combineTerms(leftTerm, rightTerm)
+			if err != nil {
+				return nil, err
+			}
+
+			product = append(product, term)
 		}
 	}
 
 	return product, nil
 }
 
-func combineTerms(left, right map[string]any) map[string]any {
+// combineTerms merges the expressions of two node selector terms.
+//
+// A present-but-wrongly-typed list is an error rather than an omission. The
+// assertion used to be discarded, which silently dropped the user's constraint;
+// and if every field of a term was malformed the product term came out empty,
+// which matches every node, so a constraint meant to narrow scheduling widened
+// it instead. Validation rejects this shape, so reaching the error here means
+// validation was bypassed.
+func combineTerms(left, right map[string]any) (map[string]any, error) {
 	combined := map[string]any{}
 
 	for _, field := range []string{"matchExpressions", "matchFields"} {
-		leftValues, _ := left[field].([]any)   //nolint:errcheck // absent means no expressions
-		rightValues, _ := right[field].([]any) //nolint:errcheck // absent means no expressions
+		var joined []any
 
-		joined := append(append([]any{}, leftValues...), rightValues...)
+		for _, side := range []map[string]any{left, right} {
+			value, present := side[field]
+			if !present {
+				continue
+			}
+
+			values, ok := value.([]any)
+			if !ok {
+				return nil, fmt.Errorf(
+					"required node affinity term has %s of type %T, want a list", field, value)
+			}
+
+			joined = append(joined, values...)
+		}
+
 		if len(joined) > 0 {
 			combined[field] = joined
 		}
 	}
 
-	return combined
+	if len(combined) == 0 {
+		return nil, fmt.Errorf(
+			"combining required node affinity terms produced a term with no constraints, " +
+				"which matches every node; this would widen scheduling rather than narrow it")
+	}
+
+	return combined, nil
 }
 
 // deepCopyMap copies a decoded YAML or JSON map so callers can mutate freely.

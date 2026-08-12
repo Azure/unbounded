@@ -821,3 +821,149 @@ patch:
 		t.Fatalf("only the owned path is refused: %v", err)
 	}
 }
+
+// TestValidateRejectsKindsAComponentNeverEmits is a regression test.
+//
+// Component and kind were validated against separate lists, so seven of the ten
+// pairs they accepted between them could not resolve to anything: machina emits
+// no DaemonSet, gantry no Deployment. Such an entry validated, matched nothing,
+// and the ConfigMap received a success Event saying zero workloads were
+// overridden. Naming the mistake is the whole job of validation.
+func TestValidateRejectsKindsAComponentNeverEmits(t *testing.T) {
+	impossible := map[string]string{
+		"machina has no DaemonSet":  "component: machina\nkind: DaemonSet\n",
+		"gantry has no Deployment":  "component: gantry\nkind: Deployment\n",
+		"metalman has no DaemonSet": "component: metalman\nkind: DaemonSet\nsites: [edge]\n",
+		"storage has no Deployment": "component: storage\nkind: Deployment\nsites: [edge]\n",
+	}
+
+	for name, header := range impossible {
+		t.Run(name, func(t *testing.T) {
+			err := validateFragment(t, header+"patch:\n  spec:\n    minReadySeconds: 5\n")
+			if err == nil {
+				t.Fatal("an entry that can never match anything must be rejected")
+			}
+
+			if !strings.Contains(err.Error(), "can never match") {
+				t.Fatalf("error = %q, want it to say the entry cannot match", err)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsKindsAComponentDoesEmit keeps the rule from being a
+// blanket refusal. net is the one component emitting both kinds.
+func TestValidateAcceptsKindsAComponentDoesEmit(t *testing.T) {
+	for _, header := range []string{
+		"component: net\nkind: Deployment\n",
+		"component: net\nkind: DaemonSet\n",
+		"component: machina\nkind: Deployment\n",
+		"component: gantry\nkind: DaemonSet\n",
+		"component: storage\nkind: DaemonSet\nsites: [edge]\n",
+	} {
+		if err := validateFragment(t, header+"patch:\n  spec:\n    minReadySeconds: 5\n"); err != nil {
+			t.Fatalf("%s must be accepted: %v", header, err)
+		}
+	}
+}
+
+// TestValidateRejectsMalformedAffinityExpressions is a regression test.
+//
+// affinity is a permitted subtree, so the allowlist walker does not descend
+// into it and no shape check applied. Combining terms then asserted these were
+// lists and discarded the failure, so the user's constraint vanished while the
+// override was hashed and reported Applied. A term whose only field was
+// malformed became an empty term, which matches every node, so a constraint
+// meant to narrow scheduling widened it instead.
+func TestValidateRejectsMalformedAffinityExpressions(t *testing.T) {
+	fragment := func(expressions string) string {
+		return `
+component: net
+kind: DaemonSet
+patch:
+  spec:
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - ` + expressions + `
+`
+	}
+
+	cases := map[string]string{
+		"matchExpressions as a mapping": "matchExpressions:\n                    key: disktype",
+		"matchExpressions as a scalar":  "matchExpressions: disktype",
+		"matchFields as a scalar":       "matchFields: nope",
+		"expression entry not a map":    "matchExpressions:\n                    - disktype=ssd",
+	}
+
+	for name, expressions := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := validateFragment(t, fragment(expressions))
+			if err == nil {
+				t.Fatal("a malformed affinity expression must be rejected, not silently discarded")
+			}
+		})
+	}
+
+	// The well-formed shape is still accepted.
+	if err := validateFragment(t, fragment(
+		"matchExpressions:\n                    - key: disktype\n                      operator: In\n                      values: [ssd]")); err != nil {
+		t.Fatalf("a well-formed term must be accepted: %v", err)
+	}
+}
+
+// TestValidateRejectsUndeliverableContainerAdditions is a regression test.
+//
+// A name in addContainers with no matching container in the patch creates
+// nothing, and extraArgs targeting it was accepted too, because extraArgs
+// validates against declarations rather than definitions. The entry passed
+// validation, passed resolution, merged cleanly, was hashed, and did nothing.
+func TestValidateRejectsUndeliverableContainerAdditions(t *testing.T) {
+	err := validateFragment(t, `
+component: gantry
+kind: DaemonSet
+addContainers: [log-shipper]
+extraArgs:
+  log-shipper: ["--verbose"]
+`)
+	if err == nil {
+		t.Fatal("a declared addition with no definition must be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "nothing would be created") {
+		t.Fatalf("error = %q, want it to say the container is never created", err)
+	}
+}
+
+// TestValidateRejectsNameInBothContainerLists covers the collision Kubernetes
+// itself rejects. Each list was checked for duplicates on its own, so a name in
+// both was never seen and the apiserver refused the pod after the override had
+// been applied and reported.
+func TestValidateRejectsNameInBothContainerLists(t *testing.T) {
+	err := validateFragment(t, `
+component: gantry
+kind: DaemonSet
+addContainers: [helper]
+addInitContainers: [helper]
+patch:
+  spec:
+    template:
+      spec:
+        containers:
+          - name: helper
+            image: busybox
+        initContainers:
+          - name: helper
+            image: busybox
+`)
+	if err == nil {
+		t.Fatal("a name in both container lists must be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "unique across both lists") {
+		t.Fatalf("error = %q, want it to explain the Kubernetes constraint", err)
+	}
+}

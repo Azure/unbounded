@@ -5,6 +5,7 @@ package override
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -12,20 +13,46 @@ import (
 )
 
 // knownComponents are the components that generate workloads an override can
-// target. Cluster components are not per-Site, so an entry naming one may not
-// carry a sites selector.
-var knownComponents = map[string]struct{ perSite bool }{
-	"net":      {perSite: false},
-	"machina":  {perSite: false},
-	"gantry":   {perSite: false},
-	"metalman": {perSite: true},
-	"storage":  {perSite: true},
+// target, and the kinds each one actually emits.
+//
+// Component and kind used to be validated against separate lists, so seven of
+// the ten pairs they accepted between them could not resolve to anything:
+// machina emits no DaemonSet, gantry no Deployment. Such an entry validated,
+// matched nothing, and was reported as a successfully applied document that
+// overrode zero workloads. Naming the mistake is the whole job of validation.
+//
+// Cluster components are not per-Site, so an entry naming one may not carry a
+// sites selector. TestOverrideKindsMatchWhatComponentsPlan holds this table
+// against what the components actually mark overridable.
+var knownComponents = map[string]struct {
+	perSite bool
+	kinds   []string
+}{
+	"net":      {perSite: false, kinds: []string{"DaemonSet", "Deployment"}},
+	"machina":  {perSite: false, kinds: []string{"Deployment"}},
+	"gantry":   {perSite: false, kinds: []string{"DaemonSet"}},
+	"metalman": {perSite: true, kinds: []string{"Deployment"}},
+	"storage":  {perSite: true, kinds: []string{"DaemonSet"}},
 }
 
-// knownKinds are the workload kinds the operator emits.
+// knownKinds are the workload kinds the operator emits at all.
 var knownKinds = map[string]struct{}{
 	"Deployment": {},
 	"DaemonSet":  {},
+}
+
+// ComponentKinds returns the kinds a component emits, for the CLI, the
+// documentation and cross-package tests to read rather than restate.
+func ComponentKinds(component string) []string {
+	known, ok := knownComponents[component]
+	if !ok {
+		return nil
+	}
+
+	out := append([]string(nil), known.kinds...)
+	sort.Strings(out)
+
+	return out
 }
 
 // Validate checks every entry against the schema and the allowlist.
@@ -77,6 +104,10 @@ func validateEntry(sourced SourcedEntry) []string {
 	default:
 		if _, ok := knownKinds[entry.Kind]; !ok {
 			problems = append(problems, fmt.Sprintf("%s: unsupported kind %q, want Deployment or DaemonSet", at, entry.Kind))
+		} else if known && !slices.Contains(component.kinds, entry.Kind) {
+			problems = append(problems, fmt.Sprintf(
+				"%s: component %q emits no %s, so this entry can never match anything; it emits %s",
+				at, entry.Component, entry.Kind, strings.Join(ComponentKinds(entry.Component), " and ")))
 		}
 	}
 
@@ -98,6 +129,7 @@ func validateEntry(sourced SourcedEntry) []string {
 
 	problems = append(problems, validateAddNames(at, "addContainers", entry.AddContainers)...)
 	problems = append(problems, validateAddNames(at, "addInitContainers", entry.AddInitContainers)...)
+	problems = append(problems, reportAddedContainers(at, entry)...)
 	problems = append(problems, validatePatch(at, entry.Patch)...)
 	problems = append(problems, reportTypedFieldConflicts(at, entry)...)
 
@@ -146,6 +178,60 @@ func patchSets(patch map[string]any, path string) bool {
 	_, found, err := unstructured.NestedFieldNoCopy(patch, strings.Split(path, ".")...)
 
 	return err == nil && found
+}
+
+// reportAddedContainers checks that declared additions can actually be created.
+//
+// A name in addContainers with no matching container in the patch creates
+// nothing. That was accepted, and extraArgs targeting it was accepted too,
+// because extraArgs validates against declarations rather than definitions. The
+// entry passed validation, passed resolution, merged cleanly, was hashed, and
+// did nothing at all.
+//
+// A name in both addContainers and addInitContainers is rejected because
+// Kubernetes requires container names to be unique across the two lists. Each
+// list was checked for duplicates on its own, so the collision between them was
+// never seen and the apiserver refused the pod after the override had been
+// applied and reported.
+func reportAddedContainers(at string, entry Entry) []string {
+	var problems []string
+
+	for _, declaration := range []struct {
+		field string
+		patch string
+		names []string
+	}{
+		{field: "addContainers", patch: "containers", names: entry.AddContainers},
+		{field: "addInitContainers", patch: "initContainers", names: entry.AddInitContainers},
+	} {
+		present := map[string]bool{}
+		for _, name := range patchedContainerNames(entry.Patch, declaration.patch) {
+			present[name] = true
+		}
+
+		for _, name := range declaration.names {
+			if !present[name] {
+				problems = append(problems, fmt.Sprintf(
+					"%s: %s declares %q, but the patch defines no %s with that name, so nothing would be created",
+					at, declaration.field, name, singular(declaration.patch)))
+			}
+		}
+	}
+
+	initNames := map[string]bool{}
+	for _, name := range entry.AddInitContainers {
+		initNames[name] = true
+	}
+
+	for _, name := range entry.AddContainers {
+		if initNames[name] {
+			problems = append(problems, fmt.Sprintf(
+				"%s: %q is declared in both addContainers and addInitContainers; "+
+					"Kubernetes requires container names to be unique across both lists", at, name))
+		}
+	}
+
+	return problems
 }
 
 // validateSites checks the Site selector, which is meaningful only for per-Site
@@ -263,8 +349,44 @@ func reportAffinityTerms(patch map[string]any, report func(string)) {
 	}
 
 	for i, term := range terms {
-		if _, ok := term.(map[string]any); !ok {
+		mapping, ok := term.(map[string]any)
+		if !ok {
 			report(fmt.Sprintf("%s[%d] must be a mapping, but holds %T", at, i, term))
+
+			continue
+		}
+
+		reportTermExpressions(mapping, fmt.Sprintf("%s[%d]", at, i), report)
+	}
+}
+
+// reportTermExpressions checks the two lists inside a node selector term.
+//
+// affinity is a permitted subtree, so the allowlist walker does not descend
+// into it and no shape check applies. Combining terms then asserted these were
+// lists and ignored the failure, so a malformed matchExpressions was discarded
+// silently: the user's constraint vanished, the override was hashed, and the
+// Site reported Applied. Worse, a term whose only field was malformed became an
+// empty term, which matches every node, so a constraint meant to narrow
+// scheduling widened it instead.
+func reportTermExpressions(term map[string]any, at string, report func(string)) {
+	for _, field := range []string{"matchExpressions", "matchFields"} {
+		value, present := term[field]
+		if !present {
+			continue
+		}
+
+		items, ok := value.([]any)
+		if !ok {
+			report(fmt.Sprintf("%s.%s must be a list, but holds %T", at, field, value))
+
+			continue
+		}
+
+		for i, item := range items {
+			if _, ok := item.(map[string]any); !ok {
+				report(fmt.Sprintf("%s.%s[%d] must be a mapping, but holds %T", at, field, i, item))
+			}
 		}
 	}
 }

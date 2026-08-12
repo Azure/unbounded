@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -388,6 +389,15 @@ func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideS
 			"site", unmatched, "configMap", override.ConfigMapName)
 	}
 
+	// An entry that resolved to nothing is not an error: its component may be
+	// disabled, or its Site may not exist yet. It is worth saying so, because
+	// otherwise "applied" and "applied to nothing" look identical from the
+	// outside.
+	for _, inert := range report.InertEntries {
+		logger.Info("override entry matched no workload in this pass",
+			"entry", inert.String(), "configMap", override.ConfigMapName)
+	}
+
 	for _, workload := range report.Workloads {
 		if workload.Err != nil {
 			continue
@@ -736,8 +746,36 @@ func overrideConfigMapEvent(snapshot overrideSnapshot, report *override.Report) 
 		return corev1.EventTypeWarning, "OverridesPartiallyApplied", err.Error()
 	}
 
+	if len(report.InertEntries) > 0 {
+		return corev1.EventTypeNormal, "OverridesApplied",
+			fmt.Sprintf("%d workload(s) overridden; %d entr%s matched nothing (%s)",
+				len(report.Workloads), len(report.InertEntries),
+				map[bool]string{true: "y", false: "ies"}[len(report.InertEntries) == 1],
+				describeSources(report.InertEntries))
+	}
+
 	return corev1.EventTypeNormal, "OverridesApplied",
 		fmt.Sprintf("%d workload(s) overridden", len(report.Workloads))
+}
+
+// describeSources renders entry sources for a message, capped so one Event
+// cannot carry an unbounded list.
+func describeSources(sources []override.Source) string {
+	const max = 5
+
+	rendered := make([]string, 0, max)
+
+	for i, source := range sources {
+		if i == max {
+			rendered = append(rendered, fmt.Sprintf("+%d more", len(sources)-max))
+
+			break
+		}
+
+		rendered = append(rendered, source.String())
+	}
+
+	return strings.Join(rendered, ", ")
 }
 
 // overrideEventIsNew reports whether this verdict has already been recorded for

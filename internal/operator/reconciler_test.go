@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/override"
 )
 
 // fakeCluster is a configurable ClusterComponent that records whether it ran.
@@ -809,4 +811,76 @@ func TestReconcileReportsPlanRejectionOnEveryComponent(t *testing.T) {
 			t.Fatalf("%s reason = %q, want %q", conditionType, condition.Reason, component.ReasonPlanRejected)
 		}
 	}
+}
+
+// TestOverrideKindsMatchWhatComponentsPlan holds the override validator's
+// component-to-kind table against the components themselves.
+//
+// The table exists so an entry naming a kind its component never emits is
+// rejected rather than silently matching nothing. That only works while the
+// table agrees with reality, and the two live in different packages, so the
+// agreement is asserted here rather than left to whoever edits either side.
+func TestOverrideKindsMatchWhatComponentsPlan(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+
+	sites := []unboundedv1alpha3.Site{{
+		ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+		Spec: unboundedv1alpha3.SiteSpec{
+			Components: unboundedv1alpha3.SiteComponents{
+				Machina:  &unboundedv1alpha3.MachinaComponentSpec{SiteComponentSpec: enabled()},
+				Metalman: &unboundedv1alpha3.MetalmanComponentSpec{SiteComponentSpec: enabled()},
+				Storage:  &unboundedv1alpha3.StorageComponentSpec{SiteComponentSpec: enabled()},
+				Gantry:   &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: enabled()},
+			},
+		},
+	}}
+
+	targets := []*unboundedv1alpha3.Site{&sites[0]}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
+
+	_, _, plan := planComponents(t.Context(), env, DefaultRegistry(), sites, targets)
+
+	planned := map[string]map[string]bool{}
+
+	for _, op := range plan.Operations {
+		if !op.Overridable {
+			continue
+		}
+
+		if planned[op.Component] == nil {
+			planned[op.Component] = map[string]bool{}
+		}
+
+		planned[op.Component][op.Object.GetKind()] = true
+	}
+
+	if len(planned) == 0 {
+		t.Fatal("no overridable operations were planned; the assertion below would be vacuous")
+	}
+
+	for name, kinds := range planned {
+		declared := override.ComponentKinds(name)
+
+		for kind := range kinds {
+			if !slices.Contains(declared, kind) {
+				t.Errorf("component %q plans an overridable %s, but the override table does not list it; "+
+					"an override targeting it would be rejected", name, kind)
+			}
+		}
+
+		for _, kind := range declared {
+			if !kinds[kind] {
+				t.Errorf("the override table says component %q emits a %s, but it plans none; "+
+					"an entry naming it would validate and then match nothing", name, kind)
+			}
+		}
+	}
+}
+
+func enabled() unboundedv1alpha3.SiteComponentSpec {
+	on := true
+
+	return unboundedv1alpha3.SiteComponentSpec{Enabled: &on}
 }

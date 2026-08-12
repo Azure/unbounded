@@ -90,7 +90,15 @@ data:
 | Field | Required | Meaning |
 |---|---|---|
 | `component` | yes | `net`, `machina`, `gantry`, `metalman` or `storage` |
-| `kind` | yes | `Deployment` or `DaemonSet`. With `component` this identifies every workload the operator emits, so you never write a derived per-Site name. |
+| `kind` | yes | The kind that component emits. With `component` this identifies every workload the operator emits, so you never write a derived per-Site name. A pair the component cannot produce, such as `machina`/`DaemonSet`, is rejected rather than left to match nothing. |
+
+Each component emits one kind, except `net`:
+
+| Component | Kinds |
+|---|---|
+| `net` | `Deployment` and `DaemonSet` |
+| `machina`, `metalman` | `Deployment` |
+| `gantry`, `storage` | `DaemonSet` |
 | `sites` | no | Per-Site components only. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
 | `patch` | no | A strategic merge patch against the whole workload object, so `metadata`, `spec.replicas` and the pod template are all reachable. |
 | `extraArgs` | no | Arguments to append, keyed by container name. See below. |
@@ -125,7 +133,10 @@ patch meaning to raise a limit on `machina-controller` but spelling it
 `machina-contoller` would add an image-less container and leave the real limit
 untouched.
 
-Entries are therefore modify-only unless you name the addition:
+Entries are therefore modify-only unless you name the addition. The name must
+also be defined in the same patch, or nothing would be created, and a name
+cannot appear in both `addContainers` and `addInitContainers`, because
+Kubernetes requires container names to be unique across the two lists:
 
 ```yaml
       - component: gantry
