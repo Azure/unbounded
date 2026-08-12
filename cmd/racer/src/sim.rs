@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::layout::{self, Class, Entry, Geometry, State};
-use crate::runtime::{Buf, Durability, Errno, Op, Request, SimNode, SimWorker, sim_addr, sim_buf};
+use crate::runtime::{Buf, Errno, Op, Request, SimNode, SimWorker, sim_addr, sim_buf};
 use crate::server::{self, SERVER};
 
 /// Block size of every simulated device. Frames and mblocks are 4 KiB, so nothing
@@ -45,8 +45,7 @@ const SETTLE_LIMIT: usize = 1 << 20;
 /// Which side of a transfer an op is. Mirrors the two `Disk` methods.
 pub(crate) enum Kind {
     Read,
-    #[allow(dead_code)]
-    Write(Durability),
+    Write,
 }
 
 /// The op a completion belongs to. The slab recycles indices, so `seq` is part of the

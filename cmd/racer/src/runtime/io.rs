@@ -651,7 +651,12 @@ impl Disk {
     pub(crate) async fn write(&self, off: u64, buf: Buf, d: Durability) -> Result<(), Errno> {
         self.pace(buf.len).await;
         #[cfg(feature = "sim")]
-        return self.sim(off, buf, crate::sim::Kind::Write(d)).await;
+        {
+            // The model has no write-back cache, so every write it acknowledges is
+            // already stable and the flag has nothing to select.
+            let _ = d;
+            return self.sim(off, buf, crate::sim::Kind::Write).await;
+        }
         #[cfg(not(feature = "sim"))]
         let e = opcode::WriteFixed::new(
             types::Fixed(self.inner.slot),
