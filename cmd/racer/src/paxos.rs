@@ -634,6 +634,11 @@ impl Paxos {
         self.links.install(Links(links.into_boxed_slice()));
     }
 
+    /// Close links replaced by the configuration whose runtime guards have now drained.
+    pub(crate) fn retire_links(&self) {
+        self.links.retire();
+    }
+
     /// The link to `node` in `universe`. Per pair: the same peer in two universes publishes
     /// two namespaces, and asking without naming the universe would let a frame leave the one
     /// it arrived on.
