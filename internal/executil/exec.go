@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,7 +15,76 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
+
+// A binary this process has just written can be transiently unexecutable.
+//
+// fork() duplicates the writing file descriptor into the child, and O_CLOEXEC
+// only closes it at execve, so between the fork and the exec the child holds
+// the inode open for writing. Linux then refuses to execute it: execve returns
+// ETXTBSY, "text file busy". Any concurrent fork anywhere in the process is
+// enough, so installing a binary and running it is unsafe whenever anything
+// else in the process might be starting a command. See golang.org/issue/22315.
+//
+// The agent does exactly this in several places: it downloads kubelet,
+// containerd, runc, the CNI plugins and CoreDNS and immediately runs each one
+// to check its version, and those installers run concurrently with each other
+// under phases.Parallel.
+//
+// Retrying is safe because the error comes from execve, before the process
+// exists: nothing has run and nothing has taken effect. The window is the
+// lifetime of somebody else's fork, so it closes in well under a millisecond;
+// the budget below is generous against a loaded machine rather than sized to
+// any real expectation.
+const (
+	textBusyRetryBudget  = time.Second
+	textBusyInitialDelay = 10 * time.Millisecond
+	textBusyMaxDelay     = 100 * time.Millisecond
+)
+
+// IsTextFileBusy reports whether an error is the transient ETXTBSY described
+// above, so callers doing their own exec can make the same allowance.
+func IsTextFileBusy(err error) bool {
+	return errors.Is(err, syscall.ETXTBSY)
+}
+
+// RetryWhileTextFileBusy runs attempt until it does not fail with ETXTBSY.
+//
+// attempt must build a fresh exec.Cmd each time it is called: an exec.Cmd
+// cannot be reused once started, and any pipes it created must be released
+// before the next attempt.
+func RetryWhileTextFileBusy(ctx context.Context, logger *slog.Logger, path string, attempt func() error) error {
+	deadline := time.Now().Add(textBusyRetryBudget)
+	delay := textBusyInitialDelay
+
+	for {
+		err := attempt()
+		if !IsTextFileBusy(err) {
+			return err
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s was still being written after %s: %w", path, textBusyRetryBudget, err)
+		}
+
+		if logger != nil {
+			logger.Debug("executable is still open for writing; retrying",
+				"path", path, "delay", delay)
+		}
+
+		select {
+		case <-ctx.Done():
+			return errors.Join(ctx.Err(), err)
+		case <-time.After(delay):
+		}
+
+		if delay *= 2; delay > textBusyMaxDelay {
+			delay = textBusyMaxDelay
+		}
+	}
+}
 
 // RunCmd creates a command from the given factory, appends args, streams stdout
 // at Debug and stderr at Info, and waits for it to finish.
@@ -26,6 +96,14 @@ func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Contex
 // Use a lower level (e.g. Debug) when stderr output is known to be benign or
 // when a failure is expected and already handled by the caller.
 func RunCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, newCmd func(context.Context) *exec.Cmd, args ...string) error {
+	// The command is rebuilt on every attempt. An exec.Cmd is single use, and
+	// appending args to a reused one would duplicate them.
+	return RetryWhileTextFileBusy(ctx, logger, newCmd(ctx).Path, func() error {
+		return runCmdOnce(ctx, logger, stderrLevel, newCmd, args...)
+	})
+}
+
+func runCmdOnce(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, newCmd func(context.Context) *exec.Cmd, args ...string) error {
 	cmd := newCmd(ctx)
 	cmd.Args = append(cmd.Args, args...)
 
@@ -40,6 +118,10 @@ func RunCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, 
 	}
 
 	if err := cmd.Start(); err != nil {
+		// The pipes were created before the start failed, so they are closed
+		// here rather than leaked once this attempt is retried.
+		closeAll(stdout, stderr)
+
 		return fmt.Errorf("failed to start %s: %w", cmd.Path, err)
 	}
 
@@ -79,6 +161,20 @@ func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...st
 // Info. Use a lower level (e.g. Debug) when stderr output is known to be
 // benign or an error exit is expected and already handled by the caller.
 func OutputCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, name string, args ...string) (string, error) {
+	var output string
+
+	err := RetryWhileTextFileBusy(ctx, logger, name, func() error {
+		var attemptErr error
+
+		output, attemptErr = outputCmdOnce(ctx, logger, stderrLevel, name, args...)
+
+		return attemptErr
+	})
+
+	return output, err
+}
+
+func outputCmdOnce(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -92,6 +188,10 @@ func OutputCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Leve
 	}
 
 	if err := cmd.Start(); err != nil {
+		// The pipes were created before the start failed, so they are closed
+		// here rather than leaked once this attempt is retried.
+		closeAll(stdout, stderr)
+
 		return "", fmt.Errorf("failed to start %s: %w", cmd.Path, err)
 	}
 
@@ -134,6 +234,13 @@ func MachineRun(ctx context.Context, log *slog.Logger, machine string, args ...s
 }
 
 // streamLogs reads lines from reader and logs each one at the given level.
+// closeAll releases pipes belonging to a command that never started.
+func closeAll(closers ...io.Closer) {
+	for _, closer := range closers {
+		_ = closer.Close() //nolint:errcheck // nothing can be done about a pipe from a command that never ran
+	}
+}
+
 func streamLogs(ctx context.Context, logger *slog.Logger, reader io.Reader, level slog.Level) {
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {

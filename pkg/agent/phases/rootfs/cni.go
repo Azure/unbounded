@@ -100,7 +100,13 @@ func cniPluginsVersionMatch(ctx context.Context, log *slog.Logger, cniBinPath, e
 
 	output, err := executil.OutputCmd(ctx, log, loopbackPath, "--version")
 	if err != nil {
-		// Some CNI plugin versions don't support --version; treat as not matching.
+		// Some CNI plugin versions do not support --version, so an error here
+		// is expected and is treated as "not matching". It is logged at Debug
+		// rather than Warn for that reason, but it is logged: without it an
+		// infrastructure failure looks exactly like an old plugin.
+		log.Debug("could not read the installed CNI plugin version; assuming it needs reinstalling",
+			"path", loopbackPath, "error", err)
+
 		return false
 	}
 

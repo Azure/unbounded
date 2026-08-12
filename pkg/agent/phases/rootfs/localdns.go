@@ -15,6 +15,7 @@ import (
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/agentartifacts"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -194,13 +195,24 @@ func (c *configureLocalDNS) installCoreDNS(ctx context.Context) error {
 		return fmt.Errorf("download CoreDNS binary: %w", err)
 	}
 
-	output, err := exec.CommandContext(ctx, destination, "-plugins").CombinedOutput()
+	// CoreDNS was written moments ago, so this exec can transiently fail with
+	// ETXTBSY if anything else in the process forked while it was being
+	// written. ConfigureLocalDNS runs under phases.Parallel alongside five
+	// other tasks that fork constantly, so that is not hypothetical.
+	var output string
+
+	err = executil.RetryWhileTextFileBusy(ctx, c.log, destination, func() error {
+		raw, runErr := exec.CommandContext(ctx, destination, "-plugins").CombinedOutput()
+		output = string(raw)
+
+		return runErr
+	})
 	if err != nil {
 		return fmt.Errorf("list CoreDNS plugins: %w", err)
 	}
 
 	plugins := map[string]struct{}{}
-	for _, field := range strings.Fields(string(output)) {
+	for _, field := range strings.Fields(output) {
 		plugins[strings.TrimPrefix(field, "dns.")] = struct{}{}
 	}
 
