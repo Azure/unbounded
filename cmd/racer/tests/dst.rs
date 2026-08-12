@@ -13,6 +13,9 @@ use racer::sim::{Faults, Options, Sim};
 /// timed out against, so every attempt through it pays the fabric's two seconds.
 const PATIENCE: usize = 60_000;
 
+/// Seeds the linearizability sweep covers. Each one is an independent cluster.
+const SEEDS: u64 = 32;
+
 /// Long enough for anti-entropy to pass over every group twice: it sweeps one group per
 /// core per second, and the simulator declares one group per node.
 fn convergence(sim: &Sim) -> Duration {
@@ -716,9 +719,44 @@ fn a_page_is_linearizable_under_faults() {
         linearizable(s.to_string_lossy().parse().unwrap());
         return;
     }
-    for seed in 1..=32 {
-        linearizable(seed);
-    }
+    // A seed is a whole cluster in one thread and shares nothing with the next, so the
+    // sweep is as wide as the machine rather than as long as the seed count. Failures
+    // still name their seed, and `DST_SEED` still replays one on its own.
+    spread(1..=SEEDS, linearizable);
+}
+
+/// Run `f` over `work`, on as many threads as the machine has, and fail if any of them
+/// does. The panic message a seed raised is already on stderr by then; this only has to
+/// make sure the test does not pass around it.
+fn spread<W>(work: W, f: fn(u64))
+where
+    W: IntoIterator<Item = u64>,
+{
+    let queue: Vec<u64> = work.into_iter().collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(queue.len().max(1));
+    let failed = std::sync::atomic::AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&item) = queue.get(i) else { return };
+                    if std::panic::catch_unwind(move || f(item)).is_err() {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+
+    assert!(
+        !failed.load(std::sync::atomic::Ordering::Relaxed),
+        "a seed failed; re-run it alone with DST_SEED=<seed>"
+    );
 }
 
 fn linearizable(seed: u64) {

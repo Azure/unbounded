@@ -143,40 +143,94 @@ const N: usize = TABLE.len();
 #[repr(align(64))]
 struct Row([AtomicU64; N]);
 
-static ROWS: OnceLock<Box<[Row]>> = OnceLock::new();
+#[repr(align(64))]
+struct ExtRow([AtomicU64; MAX_EXTENTS * EXT_SERIES.len()]);
+
+/// Everything a scrape sums, in one place. A node has exactly one of these.
+struct Tables {
+    rows: OnceLock<Box<[Row]>>,
+    exts: OnceLock<Box<[ExtRow]>>,
+    /// The `(universe, extent)` each per-extent row stands for, `(0, 0)` when unused.
+    ///
+    /// An extent id is assigned by the control plane and is not a small dense number, so
+    /// the row index is the extent's position in the configuration instead. Every core
+    /// walks the same configuration in the same order, so every core agrees on that
+    /// position without coordinating; these two do not sum, and only core 0 writes them.
+    ext_ids: [(AtomicU64, AtomicU64); MAX_EXTENTS],
+}
+
+impl Tables {
+    const fn new() -> Tables {
+        Tables {
+            rows: OnceLock::new(),
+            exts: OnceLock::new(),
+            ext_ids: [const { (AtomicU64::new(0), AtomicU64::new(0)) }; MAX_EXTENTS],
+        }
+    }
+}
+
+/// This node's tables. One process is one node, so they are process-wide.
+#[cfg(not(feature = "sim"))]
+fn tables<R>(f: impl FnOnce(&Tables) -> R) -> R {
+    static TABLES: Tables = Tables::new();
+    f(&TABLES)
+}
+
+/// This node's tables, under simulation.
+///
+/// The simulator puts a whole cluster in one thread, and a test may run several of them
+/// side by side. A process-wide table would then be one set of rows written by every
+/// simulated core of every simulated node in the process: the counts would be a sum over
+/// clusters that have nothing to do with each other, and the line they share would
+/// bounce between every thread on the machine on every tick. One set per thread keeps a
+/// simulated node's counters its own and keeps the seams `sim` replaces from turning
+/// independent runs into contended ones.
+#[cfg(feature = "sim")]
+fn tables<R>(f: impl FnOnce(&Tables) -> R) -> R {
+    thread_local! {
+        static TABLES: Tables = const { Tables::new() };
+    }
+    TABLES.with(|t| f(t))
+}
 
 /// One row per worker in both tables. Called once, from the first configuration.
 pub(crate) fn init(cores: usize) {
-    let rows = (0..cores)
-        .map(|_| Row(std::array::from_fn(|_| AtomicU64::new(0))))
-        .collect();
-    let _ = ROWS.set(rows);
-    let exts = (0..cores)
-        .map(|_| ExtRow(std::array::from_fn(|_| AtomicU64::new(0))))
-        .collect();
-    let _ = EXTS.set(exts);
+    tables(|t| {
+        let rows = (0..cores)
+            .map(|_| Row(std::array::from_fn(|_| AtomicU64::new(0))))
+            .collect();
+        let _ = t.rows.set(rows);
+        let exts = (0..cores)
+            .map(|_| ExtRow(std::array::from_fn(|_| AtomicU64::new(0))))
+            .collect();
+        let _ = t.exts.set(exts);
+    })
 }
 
 /// Publish this worker's row. Relaxed: a scrape catching a row mid-update mixes two
 /// adjacent ticks, indistinguishable from scraping a moment earlier and not worth a
 /// fence per worker per millisecond.
 pub(crate) fn publish(core: usize, s: &Sample) {
-    let Some(row) = ROWS.get().and_then(|r| r.get(core)) else {
-        return;
-    };
-    for (slot, v) in row.0.iter().zip(s.as_array()) {
-        slot.store(v, Ordering::Relaxed);
-    }
+    tables(|t| {
+        let Some(row) = t.rows.get().and_then(|r| r.get(core)) else {
+            return;
+        };
+        for (slot, v) in row.0.iter().zip(s.as_array()) {
+            slot.store(v, Ordering::Relaxed);
+        }
+    })
 }
 
 fn collect() -> [u64; N] {
-    let mut out = [0u64; N];
-    for row in ROWS.get().map(|r| &r[..]).unwrap_or(&[]) {
-        for (o, slot) in out.iter_mut().zip(row.0.iter()) {
-            *o = o.saturating_add(slot.load(Ordering::Relaxed));
+    tables(|t| {
+        let mut out = [0u64; N];
+        for row in t.rows.get().map(|r| &r[..]).unwrap_or(&[]) {
+            for (o, slot) in out.iter_mut().zip(row.0.iter()) {
+                *o = o.saturating_add(slot.load(Ordering::Relaxed));
+            }
         }
-    }
-    out
+        out
+    })
 }
 
 /// The prometheus text exposition format, version 0.0.4.
@@ -212,20 +266,6 @@ const EXT_SERIES: [(&str, &str); 2] = [
     ),
 ];
 
-/// The `(universe, extent)` each row stands for, `(0, 0)` when unused.
-///
-/// An extent id is assigned by the control plane and is not a small dense number, so the
-/// row index is the extent's position in the configuration instead. Every core walks the
-/// same configuration in the same order, so every core agrees on that position without
-/// coordinating; these two do not sum, and only core 0 writes them.
-static EXT_IDS: [(AtomicU64, AtomicU64); MAX_EXTENTS] =
-    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; MAX_EXTENTS];
-
-#[repr(align(64))]
-struct ExtRow([AtomicU64; MAX_EXTENTS * EXT_SERIES.len()]);
-
-static EXTS: OnceLock<Box<[ExtRow]>> = OnceLock::new();
-
 /// Publish this worker's per-extent counts: `(universe, extent, live, tombstones)`, in
 /// configuration order. Rows past the end are zeroed, so an extent this core holds
 /// nothing for stops contributing rather than sticking at its last value.
@@ -234,53 +274,58 @@ static EXTS: OnceLock<Box<[ExtRow]>> = OnceLock::new();
 /// a core that has not caught up to a reload would otherwise retire a series the others
 /// are still filling.
 pub(crate) fn publish_extents(core: usize, rows: &[(u32, u32, u64, u64)]) {
-    let Some(row) = EXTS.get().and_then(|r| r.get(core)) else {
-        return;
-    };
-    for slot in row.0.iter() {
-        slot.store(0, Ordering::Relaxed);
-    }
-    for (s, &(universe, extent, live, tombs)) in rows.iter().enumerate() {
-        if s >= MAX_EXTENTS {
-            break;
+    tables(|t| {
+        let Some(row) = t.exts.get().and_then(|r| r.get(core)) else {
+            return;
+        };
+        for slot in row.0.iter() {
+            slot.store(0, Ordering::Relaxed);
         }
+        for (s, &(universe, extent, live, tombs)) in rows.iter().enumerate() {
+            if s >= MAX_EXTENTS {
+                break;
+            }
+            if core == 0 {
+                t.ext_ids[s].0.store(universe as u64, Ordering::Relaxed);
+                t.ext_ids[s].1.store(extent as u64, Ordering::Relaxed);
+            }
+            row.0[s].store(live, Ordering::Relaxed);
+            row.0[MAX_EXTENTS + s].store(tombs, Ordering::Relaxed);
+        }
+        // A configuration that dropped an extent leaves its old row named but empty,
+        // which would keep a stale series alive; clearing the names past the end retires
+        // it.
         if core == 0 {
-            EXT_IDS[s].0.store(universe as u64, Ordering::Relaxed);
-            EXT_IDS[s].1.store(extent as u64, Ordering::Relaxed);
+            for slot in t.ext_ids.iter().skip(rows.len().min(MAX_EXTENTS)) {
+                slot.0.store(0, Ordering::Relaxed);
+                slot.1.store(0, Ordering::Relaxed);
+            }
         }
-        row.0[s].store(live, Ordering::Relaxed);
-        row.0[MAX_EXTENTS + s].store(tombs, Ordering::Relaxed);
-    }
-    // A configuration that dropped an extent leaves its old row named but empty, which
-    // would keep a stale series alive; clearing the names past the end retires it.
-    if core == 0 {
-        for slot in EXT_IDS.iter().skip(rows.len().min(MAX_EXTENTS)) {
-            slot.0.store(0, Ordering::Relaxed);
-            slot.1.store(0, Ordering::Relaxed);
-        }
-    }
+    })
 }
 
 fn encode_extents(out: &mut String) {
-    for (i, (name, help)) in EXT_SERIES.iter().enumerate() {
-        let _ = writeln!(out, "# HELP {name} {help}");
-        let _ = writeln!(out, "# TYPE {name} gauge");
-        for (slot, (universe, extent)) in EXT_IDS.iter().enumerate() {
-            let extent = extent.load(Ordering::Relaxed);
-            if extent == 0 {
-                continue;
+    tables(|t| {
+        for (i, (name, help)) in EXT_SERIES.iter().enumerate() {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} gauge");
+            for (slot, (universe, extent)) in t.ext_ids.iter().enumerate() {
+                let extent = extent.load(Ordering::Relaxed);
+                if extent == 0 {
+                    continue;
+                }
+                let universe = universe.load(Ordering::Relaxed);
+                let mut v = 0u64;
+                for row in t.exts.get().map(|r| &r[..]).unwrap_or(&[]) {
+                    v = v.saturating_add(row.0[i * MAX_EXTENTS + slot].load(Ordering::Relaxed));
+                }
+                let _ = writeln!(
+                    out,
+                    "{name}{{universe=\"{universe}\",extent=\"{extent}\"}} {v}"
+                );
             }
-            let universe = universe.load(Ordering::Relaxed);
-            let mut v = 0u64;
-            for row in EXTS.get().map(|r| &r[..]).unwrap_or(&[]) {
-                v = v.saturating_add(row.0[i * MAX_EXTENTS + slot].load(Ordering::Relaxed));
-            }
-            let _ = writeln!(
-                out,
-                "{name}{{universe=\"{universe}\",extent=\"{extent}\"}} {v}"
-            );
         }
-    }
+    })
 }
 
 // ------------------------------------------------------------------------------- http
