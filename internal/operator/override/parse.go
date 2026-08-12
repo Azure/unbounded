@@ -66,6 +66,16 @@ func Parse(data map[string]string) ([]SourcedEntry, error) {
 
 	sort.Strings(keys)
 
+	total := 0
+	for _, key := range keys {
+		total += len(data[key])
+	}
+
+	if total > maxTotalBytes {
+		return nil, fmt.Errorf(
+			"overrides are %d bytes in total, over the %d byte limit", total, maxTotalBytes)
+	}
+
 	var entries []SourcedEntry
 
 	for _, key := range keys {
@@ -76,6 +86,11 @@ func Parse(data map[string]string) ([]SourcedEntry, error) {
 		doc, err := parseDocument(key, data[key])
 		if err != nil {
 			return nil, err
+		}
+
+		if len(doc.Overrides) > maxEntries {
+			return nil, fmt.Errorf("overrides key %q: %d entries, over the %d entry limit",
+				key, len(doc.Overrides), maxEntries)
 		}
 
 		for i, entry := range doc.Overrides {
@@ -97,9 +112,57 @@ func Parse(data map[string]string) ([]SourcedEntry, error) {
 	return entries, nil
 }
 
+// Limits on what a single pass will parse.
+//
+// These are not arbitrary. yaml.v3 checks for duplicate mapping keys with a
+// nested loop over every pair (decode.go, d.mapping), and that check is on by
+// default. The cost is quadratic in the number of keys in one mapping, and the
+// operator reconciles with a single worker, so a document that is legal in
+// every other respect can pin the whole controller.
+//
+// Measured with yaml.v3 v3.0.1, decoding one mapping of N annotation keys:
+//
+//	N=1,000   30 KB     4ms
+//	N=4,000   123 KB   37ms
+//	N=16,000  501 KB  498ms
+//	N=40,000  1.2 MB  4.1s
+//
+// The apiserver's own ~1 MiB ConfigMap limit is therefore not a bound on the
+// work: it permits several seconds of CPU per pass, repeated on every pass.
+// Parsing into a yaml.Node does not run that check and stays linear (58ms for
+// the 1.2 MB case), which is why the structural limits below are enforced on
+// the node tree before the strict decode is allowed to run.
+const (
+	// maxDocumentBytes bounds one ConfigMap value.
+	maxDocumentBytes = 256 << 10
+
+	// maxTotalBytes bounds every value in the ConfigMap together.
+	maxTotalBytes = 1 << 20
+
+	// maxEntries bounds the overrides list in one document.
+	maxEntries = 256
+
+	// maxMappingKeys bounds one mapping, which is what the quadratic check
+	// runs over. At this size the check costs single-digit milliseconds.
+	maxMappingKeys = 1024
+
+	// maxNodes bounds the whole document, so many small mappings cannot add up
+	// to the same cost that one large mapping is forbidden from reaching.
+	maxNodes = 20000
+
+	// maxDepth bounds nesting, which recursive walks in this package descend.
+	maxDepth = 32
+)
+
 // parseDocument parses one ConfigMap value.
 func parseDocument(key, raw string) (Document, error) {
-	if err := rejectMergeKeys(key, raw); err != nil {
+	if len(raw) > maxDocumentBytes {
+		return Document{}, fmt.Errorf(
+			"overrides key %q: document is %d bytes, over the %d byte limit; split it across ConfigMap keys",
+			key, len(raw), maxDocumentBytes)
+	}
+
+	if err := checkStructure(key, raw); err != nil {
 		return Document{}, err
 	}
 
@@ -142,12 +205,16 @@ func parseDocument(key, raw string) (Document, error) {
 	return doc, nil
 }
 
-// rejectMergeKeys walks the raw YAML node tree looking for merge keys.
+// checkStructure walks the raw YAML node tree, rejecting merge keys and
+// anything past the structural limits.
 //
-// yaml.v3 expands them silently, which would let content reach the merge that
-// the allowlist walker never inspected, because it only ever sees the expanded
-// result rather than the alias that produced it.
-func rejectMergeKeys(key, raw string) error {
+// Parsing into a yaml.Node is linear, so this runs before the strict decode
+// and is what keeps that decode's quadratic duplicate-key check bounded.
+//
+// Merge keys are rejected because yaml.v3 expands them silently, which would
+// let content reach the merge that the allowlist walker never inspected: it
+// only ever sees the expanded result rather than the alias that produced it.
+func checkStructure(key, raw string) error {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(raw), &root); err != nil {
 		// A parse error here will be reported with better context by the strict
@@ -155,9 +222,31 @@ func rejectMergeKeys(key, raw string) error {
 		return nil //nolint:nilerr // deliberate: defer to the strict decoder
 	}
 
-	return walkNode(&root, func(n *yaml.Node) error {
+	nodes := 0
+
+	return walkNodeDepth(&root, 0, func(n *yaml.Node, depth int) error {
+		nodes++
+
+		if nodes > maxNodes {
+			return fmt.Errorf(
+				"overrides key %q: document has more than %d nodes; split it across ConfigMap keys",
+				key, maxNodes)
+		}
+
+		if depth > maxDepth {
+			return fmt.Errorf("overrides key %q: document nests deeper than %d levels at line %d",
+				key, maxDepth, n.Line)
+		}
+
 		if n.Kind != yaml.MappingNode {
 			return nil
+		}
+
+		if keys := len(n.Content) / 2; keys > maxMappingKeys {
+			return fmt.Errorf(
+				"overrides key %q: mapping at line %d has %d keys, over the %d key limit; "+
+					"duplicate-key checking is quadratic, so one large mapping can stall reconciliation",
+				key, n.Line, keys, maxMappingKeys)
 		}
 
 		for i := 0; i+1 < len(n.Content); i += 2 {
@@ -173,17 +262,17 @@ func rejectMergeKeys(key, raw string) error {
 }
 
 // walkNode visits every node in a YAML tree.
-func walkNode(n *yaml.Node, visit func(*yaml.Node) error) error {
+func walkNodeDepth(n *yaml.Node, depth int, visit func(*yaml.Node, int) error) error {
 	if n == nil {
 		return nil
 	}
 
-	if err := visit(n); err != nil {
+	if err := visit(n, depth); err != nil {
 		return err
 	}
 
 	for _, child := range n.Content {
-		if err := walkNode(child, visit); err != nil {
+		if err := walkNodeDepth(child, depth+1, visit); err != nil {
 			return err
 		}
 	}

@@ -112,12 +112,32 @@ func contributorHash(contributors []SourcedEntry) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// maxSourceAnnotation bounds the rendered contributor list. Kubernetes allows
+// 256 KiB across every annotation on an object; this leaves that budget to the
+// operator's other annotations and to the user's.
+const maxSourceAnnotation = 8 << 10
+
 // contributorSources renders the contributor list for the source annotation, so
 // an operator reading a live workload can find the entries that shaped it.
 func contributorSources(contributors []SourcedEntry) string {
 	out := make([]string, 0, len(contributors))
-	for _, contributor := range contributors {
-		out = append(out, contributor.Source.String())
+
+	for i, contributor := range contributors {
+		next := contributor.Source.String()
+
+		// Kubernetes caps all annotations on an object at 256 KiB, and a
+		// ConfigMap key may be 253 characters, so the rendered sources grow
+		// several times faster than the document that produced them. Left
+		// unbounded, enough contributors to one workload made every apply of
+		// that workload fail with an opaque size rejection. The hash
+		// annotation is the authoritative record; this one is a convenience,
+		// so it is the one that gives way.
+		if len(strings.Join(out, ","))+len(next)+1 > maxSourceAnnotation {
+			return strings.Join(out, ",") +
+				fmt.Sprintf(",+%d more (see %s)", len(contributors)-i, ConfigMapName)
+		}
+
+		out = append(out, next)
 	}
 
 	return strings.Join(out, ",")

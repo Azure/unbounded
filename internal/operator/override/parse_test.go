@@ -4,6 +4,7 @@
 package override
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -245,5 +246,113 @@ func assertNoPlainInts(t *testing.T, value any, path string) {
 		}
 	case int, int8, int16, int32, uint, uint8, uint16, uint32, uint64, float32:
 		t.Fatalf("%s holds %T, which apimachinery cannot deep copy", path, value)
+	}
+}
+
+// TestParseRejectsDocumentsThatWouldStallTheOperator is a regression test for a
+// denial of service reachable with an entirely legal document.
+//
+// yaml.v3 checks for duplicate mapping keys with a nested loop over every pair,
+// on by default, so decoding is quadratic in the number of keys in one mapping.
+// The operator reconciles with a single worker and re-parses on every pass.
+// Measured with yaml.v3 v3.0.1, one mapping of 40,000 annotation keys in 1.2 MB
+// took 4.1 seconds to decode; the apiserver's own ~1 MiB ConfigMap limit is
+// therefore not a bound on the work.
+//
+// An earlier revision of the design argued no size limit was needed for exactly
+// that reason. It assumed parsing cost was linear in the payload.
+func TestParseRejectsDocumentsThatWouldStallTheOperator(t *testing.T) {
+	annotations := func(n int) string {
+		var b strings.Builder
+
+		b.WriteString("apiVersion: " + APIVersion + `
+overrides:
+  - component: net
+    kind: DaemonSet
+    patch:
+      metadata:
+        annotations:
+`)
+
+		for i := range n {
+			fmt.Fprintf(&b, "          example.com/k%d: v\n", i)
+		}
+
+		return b.String()
+	}
+
+	// Comfortably under the limit: still accepted, so the cap is not simply
+	// refusing realistic documents.
+	if _, err := Parse(map[string]string{"overrides.yaml": annotations(200)}); err != nil {
+		t.Fatalf("a 200-key mapping must be accepted: %v", err)
+	}
+
+	_, err := Parse(map[string]string{"overrides.yaml": annotations(maxMappingKeys + 1)})
+	if err == nil {
+		t.Fatal("a mapping over the key limit must be rejected before the quadratic decode runs")
+	}
+
+	if !strings.Contains(err.Error(), "quadratic") {
+		t.Fatalf("error = %q, want it to say why the limit exists", err)
+	}
+}
+
+// TestParseRejectsOversizedInput covers the byte and entry limits, which bound
+// the work that many small mappings can add up to.
+func TestParseRejectsOversizedInput(t *testing.T) {
+	entry := `  - component: net
+    kind: DaemonSet
+    patch:
+      spec:
+        minReadySeconds: 1
+`
+
+	t.Run("one document over the byte limit", func(t *testing.T) {
+		doc := "apiVersion: " + APIVersion + "\noverrides:\n" +
+			strings.Repeat(entry, 1+maxDocumentBytes/len(entry))
+
+		if _, err := Parse(map[string]string{"overrides.yaml": doc}); err == nil {
+			t.Fatal("an oversized document must be rejected")
+		}
+	})
+
+	t.Run("keys that are individually fine but oversized together", func(t *testing.T) {
+		one := "apiVersion: " + APIVersion + "\noverrides:\n" +
+			strings.Repeat(entry, (maxDocumentBytes/len(entry))-10)
+
+		data := map[string]string{}
+		for i := range 1 + maxTotalBytes/len(one) {
+			data[fmt.Sprintf("part-%02d.yaml", i)] = one
+		}
+
+		if _, err := Parse(data); err == nil {
+			t.Fatal("keys under the per-document limit must still be bounded in total")
+		}
+	})
+
+	t.Run("too many entries", func(t *testing.T) {
+		doc := "apiVersion: " + APIVersion + "\noverrides:\n" + strings.Repeat(entry, maxEntries+1)
+
+		if _, err := Parse(map[string]string{"overrides.yaml": doc}); err == nil {
+			t.Fatal("a document over the entry limit must be rejected")
+		}
+	})
+}
+
+// TestParseRejectsExcessiveNesting bounds the depth every recursive walk in
+// this package descends.
+func TestParseRejectsExcessiveNesting(t *testing.T) {
+	var b strings.Builder
+
+	b.WriteString("apiVersion: " + APIVersion + "\noverrides:\n  - component: net\n    kind: DaemonSet\n    patch:\n")
+
+	for i := range maxDepth + 4 {
+		b.WriteString(strings.Repeat(" ", 6+i*2) + fmt.Sprintf("k%d:\n", i))
+	}
+
+	b.WriteString(strings.Repeat(" ", 6+(maxDepth+4)*2) + "leaf: v\n")
+
+	if _, err := Parse(map[string]string{"overrides.yaml": b.String()}); err == nil {
+		t.Fatal("a document nested past the limit must be rejected")
 	}
 }

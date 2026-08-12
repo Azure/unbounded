@@ -891,3 +891,26 @@ func TestInvalidDocumentLeavesComponentsNotReady(t *testing.T) {
 
 	t.Fatalf("NetReady = True while overrides are Degraded; the component withheld its workload and cannot be reconciled")
 }
+
+// TestOverrideStatusMessageIsBounded is a regression test.
+//
+// Validation reports every problem it finds rather than only the first, which
+// is right for a user fixing a document and wrong for a status field: the
+// joined error grows with the document and is copied into every Site. A large
+// enough document produced a status patch past the API server's request limit,
+// which fails, and retries forever without ever recording why.
+func TestOverrideStatusMessageIsBounded(t *testing.T) {
+	huge := strings.Repeat("this document is deeply and repetitively wrong. ", 200000)
+
+	status := overrideStatusFor("edge",
+		overrideSnapshot{state: overridesInvalid, err: errors.New(huge), resourceVersion: "7"},
+		nil, component.NewPlan(), component.ExecutionResult{})
+
+	if len(status.Message) > maxStatusMessage {
+		t.Fatalf("message is %d bytes, over the %d byte cap", len(status.Message), maxStatusMessage)
+	}
+
+	if !strings.Contains(status.Message, "truncated") {
+		t.Fatal("a truncated message must say so, and say where the rest is")
+	}
+}

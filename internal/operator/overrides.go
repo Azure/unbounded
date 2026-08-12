@@ -208,7 +208,7 @@ func overrideStatusFor(
 
 	if snapshot.blocksWorkloads() {
 		status.Phase = unboundedv1alpha3.OverridePhaseDegraded
-		status.Message = snapshot.err.Error()
+		status.Message = truncateMessage(snapshot.err.Error())
 
 		return status
 	}
@@ -243,7 +243,7 @@ func overrideStatusFor(
 			status.Phase = unboundedv1alpha3.OverridePhaseDegraded
 
 			if status.Message == "" {
-				status.Message = workload.Err.Error()
+				status.Message = truncateMessage(workload.Err.Error())
 			}
 		case entry.AppliedHash != entry.DesiredHash:
 			status.Phase = unboundedv1alpha3.OverridePhaseDegraded
@@ -265,6 +265,27 @@ func overrideStatusFor(
 	})
 
 	return status
+}
+
+// maxStatusMessage bounds the message copied into every Site's status.
+//
+// Validation reports every problem it finds rather than only the first, which
+// is right for a user fixing a document and wrong for a status field: the
+// joined error grows with the document, and it is written to every Site. A
+// large enough document produced a status patch past the API server's request
+// limit, which fails, and retries forever without ever recording why.
+const maxStatusMessage = 2048
+
+// truncateMessage bounds a status message, saying plainly that it was cut and
+// where the rest is.
+func truncateMessage(message string) string {
+	if len(message) <= maxStatusMessage {
+		return message
+	}
+
+	const notice = "\n[truncated; see the operator log and the Events on the " + override.ConfigMapName + " ConfigMap for the rest]"
+
+	return message[:maxStatusMessage-len(notice)] + notice
 }
 
 // appliedHashes reads back the override hash of every overridable workload the
