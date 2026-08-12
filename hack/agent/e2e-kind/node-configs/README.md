@@ -15,6 +15,8 @@ JSON file can be passed to `e2e.py` with `--node-config`.
 | `blockExternalNetwork` | boolean | Optional. When true, the e2e installs required host packages, then blocks VM egress outside local e2e networks before running bootstrap. This is intended for offline bootstrap validation. The offline artifact bundle includes kube-system images needed for node readiness plus the e2e workload image. |
 | `localDNS` | boolean | Enables the nspawn-local CoreDNS cache and validates service health, resolver wiring, metrics, listener addresses, and NOTRACK rules. The scenario must also provide `nodeIP` so metrics bind to the Node InternalIP. |
 | `additionalHostMounts` | array of objects | Optional extra host bind-mounts for the nspawn machine. Each entry has a required string `source` (clean absolute host path), optional string `target` (defaults to `source`), and optional bool `readOnly`. The e2e passes each entry as `--additional-host-mount` to `manual-bootstrap` and validates the resulting `Bind=` / `BindReadOnly=` directives in the nspawn config. |
+| `additionalHostDevices` | array of strings | Optional host device paths or systemd device-group specifiers passed through `--additional-host-device`. The e2e validates generated `Bind=` and `DeviceAllow=` directives for device paths. |
+| `validateDeviceRefreshAfterHostReboot` | boolean | Creates a synthetic device during the next VM host boot and verifies nspawn regeneration makes the device accessible inside the machine. |
 
 The `validate-node-configs` parent process prepares OCI refs once, then passes the
 local refs to each child `e2e.py` invocation with

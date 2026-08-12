@@ -84,7 +84,7 @@ func (s *startNSpawnMachine) Do(ctx context.Context) error {
 		return err
 	}
 
-	if err := waitForMachine(ctx, s.log, name); err != nil {
+	if err := WaitForMachine(ctx, s.log, name); err != nil {
 		return fmt.Errorf("wait for machine %s: %w", name, err)
 	}
 
@@ -172,10 +172,10 @@ func isAlreadyExistsErr(err error) bool {
 	return strings.Contains(msg, "already exists") || strings.Contains(msg, "file exists")
 }
 
-// waitForMachine polls the machine until it is responsive to systemd-run
+// WaitForMachine polls the machine until it is responsive to systemd-run
 // commands. machinectl start returns before D-Bus is ready, so phases that use
 // executil.MachineRun() would fail without this gate.
-func waitForMachine(ctx context.Context, log *slog.Logger, machine string) error {
+func WaitForMachine(ctx context.Context, log *slog.Logger, machine string) error {
 	const (
 		pollInterval = 500 * time.Millisecond
 		timeout      = 30 * time.Second

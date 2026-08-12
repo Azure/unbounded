@@ -32,6 +32,8 @@
 # maps, but each nspawn machine should get its own pinned-object namespace.
 
 [Unit]
+Requires=unbounded-agent-regenerate-config@kube2.service
+After=unbounded-agent-regenerate-config@kube2.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -40,6 +42,7 @@ RestartSec=10s
 ExecStartPre=-/usr/bin/machinectl terminate kube2
 ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube2
 ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube2 || /usr/bin/mount -t bpf bpf /run/bpffs/kube2'
+ExecStartPost=/usr/local/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube2
 Environment=SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
 Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=network
 

@@ -11,6 +11,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNVIDIAStateAvailable(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, NVIDIAStateAvailable(NvidiaHost{}))
+	require.True(t, NVIDIAStateAvailable(NvidiaHost{
+		GPUDevicePaths: []string{"/dev/nvidia0"},
+		LibMappings:    []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
+		DriverVersion:  "580.1",
+	}))
+}
+
 func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	t.Parallel()
 

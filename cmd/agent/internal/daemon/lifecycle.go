@@ -230,6 +230,7 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 		goalstates.DaemonBinaryGreenPath,
 		goalstates.DaemonBinaryCurrentPath,
 		goalstates.DaemonBinaryLastGoodPath,
+		goalstates.NSpawnLifecycleBinaryPath,
 		goalstates.DaemonRecoveryScriptPath,
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
