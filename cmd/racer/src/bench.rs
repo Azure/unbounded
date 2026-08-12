@@ -180,12 +180,12 @@ fn e2e(a: Args) {
         let small: Vec<_> = c
             .nodes
             .iter()
-            .map(|n| n.proc.device(LWW).to_path_buf())
+            .map(|n| n.proc.device(minor(n.proc.id, LWW)).to_path_buf())
             .collect();
         let big: Vec<_> = c
             .nodes
             .iter()
-            .map(|n| n.proc.device(BIG).to_path_buf())
+            .map(|n| n.proc.device(minor(n.proc.id, BIG)).to_path_buf())
             .collect();
 
         // Fill the 4 KiB extent once, so reads find pages and writes overwrite rather
@@ -285,9 +285,18 @@ fn emit(target: &str, name: &str, plan: &Plan, r: &Report) {
 
 const ROOT: &str = "/tmp/racer-bench";
 
-/// Device ids, in config order. Each maps one extent of the universe.
+/// Export roles: one device per extent of the universe, plus the fabric namespace. A role
+/// is not an id. An id is a ublk minor, minors are host-wide, and these nodes share a host,
+/// so the id a node asks for has to carry the node in it (see [`minor`]).
 const LWW: u32 = 1;
 const BIG: u32 = 2;
+const FABRIC: u32 = 3;
+
+/// The ublk minor node `id` exports `role` as. The block is above anything the tests ask
+/// for, so a benchmark and a test suite may run at once.
+fn minor(id: u32, role: u32) -> u32 {
+    200 + 10 * id + role
+}
 
 /// Bytes of file system per node: room for the store image and the ext4 metadata around
 /// it. Memory is spent only on what is written, so the slack costs nothing.
@@ -478,7 +487,10 @@ fn text(plan: &Plan, id: u32, peers: &[(u32, PathBuf)], generation: u32) -> Stri
         (id - 1) % 3,
     );
     s += &format!("policy cache_index_bytes={}\n", plan.cache_index_bytes);
-    s += "universe 1 epoch=1\n";
+    s += &format!(
+        "universe 1 epoch=1 fabric_device_id={}\n",
+        minor(id, FABRIC)
+    );
     for (id, dev) in peers {
         s += &format!("peer id={id} device={}\n", dev.display());
     }
@@ -503,10 +515,12 @@ fn text(plan: &Plan, id: u32, peers: &[(u32, PathBuf)], generation: u32) -> Stri
     s += &format!(
         "extent id=1 base=0 pages={} kind=lww zone=1 cache_admit={admit}\n\
          extent id=2 base={huge_base} pages={} kind=immutable_4m zone=1 cache_admit={admit}\n\
-         device {LWW} extents=1\ndevice {BIG} extents=2\n",
+         device {lww} extents=1\ndevice {big} extents=2\n",
         plan.small_pages,
         plan.huge_pages,
-        admit = plan.cache_admit
+        admit = plan.cache_admit,
+        lww = minor(id, LWW),
+        big = minor(id, BIG),
     );
     s
 }

@@ -1359,7 +1359,7 @@ mod tests {
     fn test_config() -> crate::config::Config {
         crate::config::Config::parse(
             "node id=1 zone=1 store=/dev/x size=68719476736
-             universe 1
+             universe 1 fabric_device_id=9
                group 1 2 3
                extent id=1 base=0 pages=5000 kind=lww zone=1
                extent id=2 base=8192 pages=3 kind=immutable_4m zone=1

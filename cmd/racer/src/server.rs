@@ -979,7 +979,7 @@ mod tests {
             "
             generation 1
             node id=1 zone=1 store={} size={DEV_BYTES}
-            universe 1
+            universe 1 fabric_device_id=7
             group 1 2 3
             group 1 2 3
             group 1 2 3

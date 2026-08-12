@@ -28,14 +28,24 @@ const GROWN_BYTES: u64 = IMG_BYTES + (256 << 20);
 const PAGE: usize = 4096;
 const HUGE: usize = 4 << 20;
 
-/// The shared universe and the device ids the test opens. Device `n` maps extent `n`
-/// alone, so device page and extent page match; `MIX` proves they need not.
+/// The shared universe and the roles the test opens. Extent `n` is mapped by the device in
+/// role `n` alone, so device page and extent page match; `MIX` proves they need not.
+/// A role is not an id: an id is a ublk minor, and every node in this test is on one host,
+/// so each takes a block of its own out of [`minor`].
 const UNIVERSE: u32 = 1;
 const LWW: u32 = 1;
 const OCC: u32 = 2;
 const IMM: u32 = 3;
 const BIG: u32 = 4;
 const MIX: u32 = 5;
+/// The universe's fabric namespace, which is an export like any other.
+const FABRIC: u32 = 6;
+
+/// The ublk minor node `id` exports `role` as. Minors are host-wide, and a real node owns
+/// its host; these seven share one, so the id a node asks for has to carry the node in it.
+fn minor(id: u32, role: u32) -> u32 {
+    10 * id + role
+}
 
 /// Extent bases in the universe address space, placed by the control plane, not by devices.
 const LWW_BASE: u64 = 0;
@@ -54,8 +64,10 @@ struct Node {
 }
 
 impl Node {
-    fn dev(&self, device: u32) -> Dev {
-        Dev::open(self.proc.device(device))
+    /// The device this node exports in `role`, opened. The banner names it by minor, which
+    /// is this node's, so the role has to be resolved against the node holding it.
+    fn dev(&self, role: u32) -> Dev {
+        Dev::open(self.proc.device(minor(self.proc.id, role)))
     }
 
     /// Start `racer serve` on a config it must refuse and return stderr. Node must be down.
@@ -307,7 +319,10 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
         (n.proc.id - 1) % 3,
         n.store_bytes,
     );
-    s += "universe 1 epoch=1\n";
+    s += &format!(
+        "universe 1 epoch=1 fabric_device_id={}\n",
+        minor(n.proc.id, FABRIC)
+    );
     for (id, dev) in peers {
         s += &format!("peer id={id} device={}\n", dev.display());
     }
@@ -318,12 +333,20 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     s += "extent id=1 base=0    pages=4096 kind=lww          zone=1 cache_admit=1\n\
           extent id=2 base=4096 pages=512  kind=occ          zone=1 cache_admit=1\n\
           extent id=3 base=4608 pages=512  kind=immutable    zone=1\n\
-          extent id=4 base=5120 pages=4    kind=immutable_4m zone=1 cache_admit=1\n\
-          device 1 extents=1\n\
-          device 2 extents=2\n\
-          device 3 extents=3\n\
-          device 4 extents=4\n\
-          device 5 extents=2,1\n";
+          extent id=4 base=5120 pages=4    kind=immutable_4m zone=1 cache_admit=1\n";
+    let id = n.proc.id;
+    s += &format!(
+        "device {} extents=1\n\
+         device {} extents=2\n\
+         device {} extents=3\n\
+         device {} extents=4\n\
+         device {} extents=2,1\n",
+        minor(id, LWW),
+        minor(id, OCC),
+        minor(id, IMM),
+        minor(id, BIG),
+        minor(id, MIX),
+    );
     s
 }
 
@@ -429,7 +452,8 @@ fn rebuild(
         nodes[i].store_bytes,
         "a start must place a missing store at the configured size"
     );
-    // The restarted node's fabric device is a fresh minor, so its peers need telling.
+    // The fabric device is back at the same minor, but the export behind it is new, so
+    // the peers holding the old one have to reopen their links.
     *generation += 1;
     wire(nodes, *generation, &all);
 
@@ -823,7 +847,8 @@ fn six_node_cluster() {
         GROWN_BYTES,
         "a raised size= must be reserved at the next start"
     );
-    // The restarted node's fabric device is a fresh minor, so its peers need telling.
+    // The fabric device is back at the same minor, but the export behind it is new, so
+    // the peers holding the old one have to reopen their links.
     wire(&mut nodes, 3, &(1..NODES as usize).collect::<Vec<_>>());
     let a = nodes[0].dev(LWW);
     assert_eq!(
