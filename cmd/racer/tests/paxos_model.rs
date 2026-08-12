@@ -10,7 +10,23 @@
 //!
 //! Pure state machines with no IO, so they need neither root nor a device.
 
-use stateright::{Checker, Model, Property};
+use stateright::{Checker, HasDiscoveries, Model, Property};
+
+// A proof that enumerates the whole reachable space visits the same states in either
+// order, so it uses `spawn_dfs`: breadth first has to hold the entire frontier, and each
+// queued item carries a cloned state plus the action path that reached it. Depth first
+// holds one path at a time. Checks that assert a counterexample stay on `spawn_bfs`,
+// which is the only search that returns the shortest one, and they assert on its length.
+
+/// Stop the search the moment `name` has a counterexample.
+///
+/// A check that asserts a discovery has found its answer as soon as that one property
+/// fails; the checker's default is to keep going until every property has a discovery,
+/// which for a `sometimes` property that never fires means enumerating the whole state
+/// space for nothing. BFS still hands back the shortest path to the failure.
+fn until(name: &'static str) -> HasDiscoveries {
+    HasDiscoveries::AnyOf([name].into_iter().collect())
+}
 
 // ---------------------------------------------------------------------------
 // The register
@@ -467,7 +483,7 @@ fn guarded_accepts_agree_on_one_value_per_version() {
     }
     .checker()
     .threads(num_threads())
-    .spawn_bfs()
+    .spawn_dfs()
     .join()
     .assert_properties();
 }
@@ -487,6 +503,7 @@ fn choosing_by_ballot_alone_resurrects_a_losing_proposal() {
     }
     .checker()
     .threads(num_threads())
+    .finish_when(until("one value per version"))
     .spawn_bfs()
     .join()
     .assert_any_discovery("one value per version");
@@ -541,7 +558,7 @@ fn a_replaying_acceptor_is_not_counted_toward_quorum() {
     }
     .checker()
     .threads(num_threads())
-    .spawn_bfs()
+    .spawn_dfs()
     .join()
     .assert_properties();
 }
@@ -562,6 +579,7 @@ fn counting_a_replaying_acceptor_undoes_an_acknowledged_write() {
     }
     .checker()
     .threads(num_threads())
+    .finish_when(until("one value per version"))
     .spawn_bfs()
     .join()
     .assert_any_discovery("one value per version");
@@ -583,7 +601,7 @@ fn a_rejoining_acceptor_recovers_its_promise() {
     }
     .checker()
     .threads(num_threads())
-    .spawn_bfs()
+    .spawn_dfs()
     .join()
     .assert_properties();
 }
@@ -604,6 +622,7 @@ fn rejoining_without_the_promise_undoes_an_acknowledged_write() {
     }
     .checker()
     .threads(num_threads())
+    .finish_when(until("one value per version"))
     .spawn_bfs()
     .join()
     .assert_any_discovery("one value per version");
@@ -849,7 +868,7 @@ fn a_proposer_never_builds_on_a_version_of_its_own() {
     }
     .checker()
     .threads(num_threads())
-    .spawn_bfs()
+    .spawn_dfs()
     .join()
     .assert_properties();
 }
@@ -866,6 +885,7 @@ fn committing_beside_the_fan_out_resurrects_a_failed_write() {
     }
     .checker()
     .threads(num_threads())
+    .finish_when(until("a write is not undone"))
     .spawn_bfs()
     .join()
     .assert_any_discovery("a write is not undone");
@@ -1111,7 +1131,7 @@ fn sealed_handover_preserves_acknowledged_writes() {
     }
     .checker()
     .threads(num_threads())
-    .spawn_bfs()
+    .spawn_dfs()
     .join()
     .assert_properties();
 }
@@ -1127,6 +1147,7 @@ fn installing_on_the_seal_alone_rolls_a_write_back() {
     }
     .checker()
     .threads(num_threads())
+    .finish_when(until("acknowledged versions increase"))
     .spawn_bfs()
     .join()
     .assert_any_discovery("acknowledged versions increase");
@@ -1310,7 +1331,7 @@ fn the_sweep_heals_a_gap_without_undoing_a_write() {
     Sweep { rule: Anti::Repair }
         .checker()
         .threads(num_threads())
-        .spawn_bfs()
+        .spawn_dfs()
         .join()
         .assert_properties();
 }
@@ -1325,6 +1346,7 @@ fn reconciling_the_compared_pair_instead_of_the_group_loses_a_write() {
     }
     .checker()
     .threads(num_threads())
+    .finish_when(until("one value per version"))
     .spawn_bfs()
     .join()
     .assert_any_discovery("one value per version");

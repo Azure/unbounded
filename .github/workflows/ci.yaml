@@ -201,6 +201,10 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.racer == 'true'
     runs-on: ubuntu-latest
+    # A wedged model check or simulation hangs rather than fails, and
+    # libtest has no per-test deadline, so the two test steps carry their
+    # own tighter caps. This one is the backstop for the rest of the job.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -240,10 +244,12 @@ jobs:
 
       - name: Test
         working-directory: cmd/racer
+        timeout-minutes: 15
         run: cargo test --locked --all-targets
 
       - name: Test deterministic simulation
         working-directory: cmd/racer
+        timeout-minutes: 15
         run: cargo test --locked --all-targets --features sim
 
   # ---------- Orca Integration Tests ----------

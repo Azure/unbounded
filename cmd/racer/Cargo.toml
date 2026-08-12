@@ -33,3 +33,16 @@ prost-build = "0.14"
 # Line tables only: `perf` needs them to attribute a hot loop to a source line, and they
 # cost nothing at run time.
 debug = 1
+
+[profile.test]
+# The suite is compute bound: the DSTs run whole clusters in one process and the model
+# checkers enumerate millions of states. Unoptimized that costs well over an order of
+# magnitude in wall clock, for a few seconds of extra codegen. Debug assertions and
+# overflow checks stay on, so the tests still check everything they did before.
+opt-level = 2
+# Line tables only, so a panic still names the line that raised it.
+debug = 1
+
+[profile.test.package."*"]
+# The model checker is a dependency, and it is on the hot path of every proof.
+opt-level = 3

@@ -1539,7 +1539,7 @@ mod cmp {
 #[cfg(test)]
 mod model {
     use super::*;
-    use stateright::{Checker, Model, Property};
+    use stateright::{Checker, HasDiscoveries, Model, Property};
     use std::collections::BTreeSet;
 
     const K: u32 = 2;
@@ -2398,11 +2398,28 @@ mod model {
     }
 
     // ------------------------------------------------------------------------ checks
+    //
+    // A proof that enumerates the whole reachable space visits the same states in either
+    // order, so it uses `spawn_dfs`: breadth first has to hold the entire frontier, and
+    // each queued item carries a cloned state plus the action path that reached it, which
+    // for the register models is tens of gigabytes of live heap. Depth first holds one
+    // path at a time. Checks that assert a counterexample stay on `spawn_bfs`, which is
+    // the only search that returns the shortest one, and they assert on its length.
 
     fn threads() -> usize {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
+    }
+
+    /// Stop the search the moment `name` has a counterexample.
+    ///
+    /// A check that asserts a discovery has its answer as soon as that one property
+    /// fails; the checker's default is to keep going until every property has a
+    /// discovery, which for a `sometimes` property that never fires means enumerating
+    /// the whole state space for nothing. BFS still hands back the shortest path.
+    fn until(name: &'static str) -> HasDiscoveries {
+        HasDiscoveries::AnyOf([name].into_iter().collect())
     }
 
     #[test]
@@ -2428,19 +2445,34 @@ mod model {
         assert_eq!(r.seen.len(), 1);
     }
 
-    #[test]
-    fn register_semantics() {
-        for kind in [Kind::Lww, Kind::Occ, Kind::Immutable] {
-            RegModel {
-                kind,
-                commit: Commit::Checked,
-            }
-            .checker()
-            .threads(threads())
-            .spawn_bfs()
-            .join()
-            .assert_properties();
+    /// The three page kinds are three separate state spaces, and enumerating one says
+    /// nothing about the next. One test each, so the harness runs them side by side
+    /// instead of adding their run times up.
+    fn register_semantics(kind: Kind) {
+        RegModel {
+            kind,
+            commit: Commit::Checked,
         }
+        .checker()
+        .threads(threads())
+        .spawn_dfs()
+        .join()
+        .assert_properties();
+    }
+
+    #[test]
+    fn lww_register_semantics() {
+        register_semantics(Kind::Lww);
+    }
+
+    #[test]
+    fn occ_register_semantics() {
+        register_semantics(Kind::Occ);
+    }
+
+    #[test]
+    fn immutable_register_semantics() {
+        register_semantics(Kind::Immutable);
     }
 
     #[test]
@@ -2452,7 +2484,7 @@ mod model {
         }
         .checker()
         .threads(threads())
-        .spawn_bfs()
+        .spawn_dfs()
         .join()
         .assert_properties();
     }
@@ -2470,6 +2502,7 @@ mod model {
         }
         .checker()
         .threads(threads())
+        .finish_when(until("acknowledged writes survive"))
         .spawn_bfs()
         .join()
         .assert_any_discovery("acknowledged writes survive");
@@ -2488,6 +2521,7 @@ mod model {
         }
         .checker()
         .threads(threads())
+        .finish_when(until("acknowledged writes survive"))
         .spawn_bfs()
         .join()
         .assert_any_discovery("acknowledged writes survive");
@@ -2506,6 +2540,7 @@ mod model {
         }
         .checker()
         .threads(threads())
+        .finish_when(until("acknowledged writes survive"))
         .spawn_bfs()
         .join()
         .assert_any_discovery("acknowledged writes survive");

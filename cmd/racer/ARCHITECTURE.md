@@ -465,3 +465,26 @@ reload, intra-zone routing, cache, restart, and wiped-member replay, but skip
 when kernel facilities are absent. Cross-zone routing, production
 migration, NVMe status translation, and real NVMe-oF are not
 covered end to end.
+
+Both suites run from `cmd/racer`:
+
+```
+timeout 15m cargo test --locked --all-targets
+timeout 15m cargo test --locked --all-targets --features sim
+```
+
+The wrapper is deliberate. A simulation or a model check that wedges does not
+fail, it hangs, and `libtest` has no per-test deadline, so an outer clock is
+the only thing that turns a deadlock into a report. CI applies the same cap per
+step. The individual tests already bound themselves from the inside: the
+simulations stop after `PATIENCE` scheduler steps and the ublk integration test
+carries explicit deadlines, so a timeout at this level means something is stuck
+below those guards.
+
+`tests/dst.rs` sweeps `SEEDS` linearizability seeds in parallel. When one
+fails, replay it alone with `DST_SEED=<seed>`; the run is deterministic.
+
+Tests build under `[profile.test]` with optimizations on and debug assertions
+left enabled. The simulations drive whole clusters in one process and the model
+checkers enumerate millions of states, which is more than an order of magnitude
+of wall clock for a few seconds of extra codegen.

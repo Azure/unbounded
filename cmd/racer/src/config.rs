@@ -708,7 +708,7 @@ impl Config {
         if self.node.store_bytes == 0 {
             return Err(bad("node store size is zero"));
         }
-        if self.node.store_bytes % SMALL_PAGE != 0 {
+        if !self.node.store_bytes.is_multiple_of(SMALL_PAGE) {
             return Err(bad(format!(
                 "node store size {} is not a multiple of {SMALL_PAGE}",
                 self.node.store_bytes
@@ -756,7 +756,7 @@ impl Config {
             return Err(bad(format!("universe {id} has an empty catalog")));
         }
         for (g, m) in u.catalog.iter().enumerate() {
-            if m.iter().any(|&n| n == 0) {
+            if m.contains(&0) {
                 return Err(bad(format!("universe {id} group {g} names node 0")));
             }
             if m[0] == m[1] || m[0] == m[2] || m[1] == m[2] {
@@ -770,7 +770,7 @@ impl Config {
         // that each may size its store from the zone's total and the node count alone.
         let nodes = u.zone_nodes();
         let slots = 3 * u.catalog.len();
-        if slots % nodes.len() != 0 {
+        if !slots.is_multiple_of(nodes.len()) {
             return Err(bad(format!(
                 "universe {id} spreads {slots} group slots over {} nodes, which cannot be even",
                 nodes.len()
