@@ -216,6 +216,15 @@ type SiteStatus struct {
 }
 
 // Override phases reported in OverrideStatus.Phase.
+//
+// These are deliberately not declared as a schema enum. The operator is the
+// only writer and the values come from these constants, so validation could
+// only catch a bug the compiler already prevents. What it would add is a
+// failure mode: a newer operator writing a value an older CRD's enum does not
+// list has its whole status patch rejected, taking every condition on the Site
+// with it, where an unrecognised value would otherwise simply be pruned. Every
+// enum elsewhere in this API is on a spec field, where the input is
+// user-supplied and rejecting it is the point.
 const (
 	// OverridePhaseNone means no override resolves to any workload for the Site.
 	OverridePhaseNone = "None"
@@ -230,18 +239,40 @@ const (
 	OverridePhaseDegraded = "Degraded"
 )
 
+// Override states reported in OverriddenWorkload.State. See the note above on
+// why these are not a schema enum either.
+const (
+	// OverrideStateApplied means the merged workload was written and carries
+	// the hash that was desired.
+	OverrideStateApplied = "Applied"
+
+	// OverrideStatePending means the write was deferred to the next pass
+	// because the cluster moved under this one. Nothing is wrong and no action
+	// is needed.
+	OverrideStatePending = "Pending"
+
+	// OverrideStateWithheld means the operator declined to write the workload
+	// because an override that could have shaped it could not be used. The
+	// running workload is untouched, which is the point.
+	OverrideStateWithheld = "Withheld"
+
+	// OverrideStateFailed means the override could not be resolved, merged, or
+	// written.
+	OverrideStateFailed = "Failed"
+)
+
 // OverrideStatus summarizes user-supplied workload overrides for one Site.
 //
 // Overrides live in a cluster-scoped ConfigMap and one document routinely
 // targets several components, so this is aggregated per Site rather than per
 // component; component-level detail stays in Conditions.
 type OverrideStatus struct {
-	// Phase is the aggregate state of override processing for this Site.
+	// Phase is the aggregate state of override processing for this Site: one of
+	// None, Applied or Degraded.
 	//
 	// Applied means every resolved workload carries the hash that was desired.
 	// It reports that the override merged and was written, not that the
 	// resulting pods are healthy.
-	// +kubebuilder:validation:Enum=None;Applied;Degraded
 	Phase string `json:"phase"`
 
 	// ObservedResourceVersion is the resourceVersion of the overrides ConfigMap
@@ -289,6 +320,21 @@ type OverriddenWorkload struct {
 	// likeliest cause of an install behaving unlike its reported version.
 	// +optional
 	VersionDrift string `json:"versionDrift,omitempty"`
+
+	// State is what happened to this workload's override in the last pass: one
+	// of Applied, Pending, Withheld or Failed.
+	//
+	// The hashes alone cannot express it. A workload the operator declined to
+	// write has no applied hash, and neither does one whose write was deferred
+	// for a second, and neither does one whose merge failed; reading an empty
+	// applied hash as "not applied" reported all three identically, and a
+	// withheld workload appeared in status not at all.
+	//
+	// It may be empty when the operator that wrote this status predates the
+	// field, or when a CRD older than the operator pruned it. Consumers should
+	// fall back to comparing the hashes.
+	// +optional
+	State string `json:"state,omitempty"`
 }
 
 // ComponentEnabled reports whether a component spec enables a component.
