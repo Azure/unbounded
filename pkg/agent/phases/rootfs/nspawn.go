@@ -21,11 +21,11 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs/oci"
 )
 
-//go:embed assets/nspawn.conf assets/service-override.conf
+//go:embed assets/nspawn.conf assets/config-regeneration.service assets/service-override.conf
 var nspawnAssets embed.FS
 
 var nspawnTemplates = template.Must(
-	template.New("nspawn").ParseFS(nspawnAssets, "assets/nspawn.conf", "assets/service-override.conf"),
+	template.New("nspawn").ParseFS(nspawnAssets, "assets/nspawn.conf", "assets/config-regeneration.service", "assets/service-override.conf"),
 )
 
 type ensureNSpawnWorkspace struct {
@@ -66,12 +66,33 @@ func EnsureNSpawnWorkspace(log *slog.Logger, goalState *goalstates.RootFS) phase
 
 func (e *ensureNSpawnWorkspace) Name() string { return "ensure-nspawn-workspace" }
 
+type ensureNSpawnConfig struct {
+	log       *slog.Logger
+	goalState *goalstates.RootFS
+}
+
+// EnsureNSpawnConfig returns a task that only writes the host-side
+// systemd-nspawn configuration files for a machine.
+func EnsureNSpawnConfig(log *slog.Logger, goalState *goalstates.RootFS) phases.Task {
+	return &ensureNSpawnConfig{log: log, goalState: goalState}
+}
+
+func (e *ensureNSpawnConfig) Name() string { return "ensure-nspawn-config" }
+
+func (e *ensureNSpawnConfig) Do(_ context.Context) error {
+	return writeNSpawnConfigs(e.log, e.goalState)
+}
+
 func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 	if err := e.bootstrapWorkspace(ctx); err != nil {
 		return fmt.Errorf("bootstrap machine directory %s: %w", e.goalState.MachineDir, err)
 	}
 
-	if err := e.writeNSpawnConfigs(); err != nil {
+	if err := phases.ExecuteTask(ctx, e.log, EnsureNSpawnLifecycleHelper()); err != nil {
+		return fmt.Errorf("install nspawn lifecycle helper: %w", err)
+	}
+
+	if err := writeNSpawnConfigs(e.log, e.goalState); err != nil {
 		return err
 	}
 
@@ -103,23 +124,25 @@ type nspawnTemplateData struct {
 	NvidiaBinDir           string
 	AMDGPUDevicePaths      []string
 	AMDSysFSPaths          []string
+	ConfigRegenerationUnit string
+	AgentBinaryPath        string
 }
 
 // TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
 // and AMDGPUDevicePaths to structured bind/device-allow targets in a follow-up PR.
 
-// writeNSpawnConfigs renders the nspawn and service-override templates with
-// device and GPU data (when present) and writes them to their configured paths.
-func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
+// writeNSpawnConfigs renders the nspawn-related templates with device and GPU
+// data (when present) and writes them to their configured paths.
+func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	// MachineName is the basename of MachineDir (e.g. "kube1" from
 	// "/var/lib/machines/kube1"); nspawn always names the machine after that
 	// directory.
-	machineName := filepath.Base(e.goalState.MachineDir)
-	hostDevicePaths := e.goalState.HostDevices.Paths()
-	hostDeviceGroupSpecifiers := e.goalState.HostDevices.DeviceGroupSpecifiers()
-	amdGPUDevicePaths := pathsExcluding(e.goalState.AMD.GPUDevicePaths, e.goalState.Nvidia.GPUDevicePaths)
+	machineName := filepath.Base(goalState.MachineDir)
+	hostDevicePaths := goalState.HostDevices.Paths()
+	hostDeviceGroupSpecifiers := goalState.HostDevices.DeviceGroupSpecifiers()
+	amdGPUDevicePaths := pathsExcluding(goalState.AMD.GPUDevicePaths, goalState.Nvidia.GPUDevicePaths)
 
-	archiveDir := filepath.Join(e.goalState.MachineDir, strings.TrimPrefix(goalstates.ContainerImageArchiveDir, "/"))
+	archiveDir := filepath.Join(goalState.MachineDir, strings.TrimPrefix(goalstates.ContainerImageArchiveDir, "/"))
 	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
 		return fmt.Errorf("create container image archive mount point: %w", err)
 	}
@@ -131,37 +154,39 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		HostDevicePaths:              hostDevicePaths,
 		HostDeviceGroupSpecifiers:    hostDeviceGroupSpecifiers,
-		AdditionalHostMounts:         e.goalState.AdditionalHostMounts,
-		NvidiaDeviceTargets:          nvidiaNSpawnDeviceTargets(e.goalState.Nvidia.GPUDevicePaths),
-		NvidiaLibDirMounts:           e.goalState.Nvidia.LibDirMounts,
-		NvidiaI386LibDirMounts:       e.goalState.Nvidia.I386LibDirMounts,
-		NvidiaBinDir:                 nvidiaHostBinDir(e.goalState.Nvidia),
+		AdditionalHostMounts:         goalState.AdditionalHostMounts,
+		NvidiaDeviceTargets:          nvidiaNSpawnDeviceTargets(goalState.Nvidia.GPUDevicePaths),
+		NvidiaLibDirMounts:           goalState.Nvidia.LibDirMounts,
+		NvidiaI386LibDirMounts:       goalState.Nvidia.I386LibDirMounts,
+		NvidiaBinDir:                 nvidiaHostBinDir(goalState.Nvidia),
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
-		AMDSysFSPaths:                e.goalState.AMD.SysFSPaths,
+		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
+		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
+		AgentBinaryPath:              goalstates.NSpawnLifecycleBinaryPath,
 	}
 
 	if len(hostDevicePaths) > 0 {
-		e.log.Info("host devices detected, configuring nspawn bind-mounts",
+		log.Info("host devices detected, configuring nspawn bind-mounts",
 			"total", len(hostDevicePaths),
-			"kvm", len(e.goalState.HostDevices.KVM),
-			"network", len(e.goalState.HostDevices.Network),
-			"block", len(e.goalState.HostDevices.Block),
-			"infiniband", len(e.goalState.HostDevices.Infiniband),
-			"additional", len(e.goalState.HostDevices.Additional))
+			"kvm", len(goalState.HostDevices.KVM),
+			"network", len(goalState.HostDevices.Network),
+			"block", len(goalState.HostDevices.Block),
+			"infiniband", len(goalState.HostDevices.Infiniband),
+			"additional", len(goalState.HostDevices.Additional))
 	}
 
-	if len(e.goalState.AdditionalHostMounts) > 0 {
-		e.log.Info("additional host mounts configured",
-			"count", len(e.goalState.AdditionalHostMounts))
+	if len(goalState.AdditionalHostMounts) > 0 {
+		log.Info("additional host mounts configured",
+			"count", len(goalState.AdditionalHostMounts))
 	}
 
-	if len(e.goalState.Nvidia.GPUDevicePaths) > 0 {
-		e.log.Info("GPU devices detected, configuring nspawn bind-mounts",
-			"count", len(e.goalState.Nvidia.GPUDevicePaths))
+	if len(goalState.Nvidia.GPUDevicePaths) > 0 {
+		log.Info("GPU devices detected, configuring nspawn bind-mounts",
+			"count", len(goalState.Nvidia.GPUDevicePaths))
 	}
 
 	if len(amdGPUDevicePaths) > 0 {
-		e.log.Info("AMD GPU devices detected, configuring nspawn bind-mounts",
+		log.Info("AMD GPU devices detected, configuring nspawn bind-mounts",
 			"count", len(amdGPUDevicePaths))
 	}
 
@@ -171,8 +196,8 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		return fmt.Errorf("render nspawn config template: %w", err)
 	}
 
-	if err := utilio.WriteFile(e.goalState.NSpawnConfigFile, nspawnBuf.Bytes(), 0o644); err != nil {
-		return fmt.Errorf("write nspawn config %s: %w", e.goalState.NSpawnConfigFile, err)
+	if err := utilio.WriteFile(goalState.NSpawnConfigFile, nspawnBuf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("write nspawn config %s: %w", goalState.NSpawnConfigFile, err)
 	}
 
 	// Render and write the systemd service override drop-in.
@@ -181,8 +206,22 @@ func (e *ensureNSpawnWorkspace) writeNSpawnConfigs() error {
 		return fmt.Errorf("render service override template: %w", err)
 	}
 
-	if err := utilio.WriteFile(e.goalState.ServiceOverrideFile, overrideBuf.Bytes(), 0o644); err != nil {
-		return fmt.Errorf("write service override %s: %w", e.goalState.ServiceOverrideFile, err)
+	if err := utilio.WriteFile(goalState.ServiceOverrideFile, overrideBuf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("write service override %s: %w", goalState.ServiceOverrideFile, err)
+	}
+
+	unitFile := goalState.ConfigRegenerationFile
+	if unitFile == "" {
+		unitFile = filepath.Join(goalstates.SystemdSystemDir, templateData.ConfigRegenerationUnit)
+	}
+
+	unitBuf := &bytes.Buffer{}
+	if err := nspawnTemplates.ExecuteTemplate(unitBuf, "config-regeneration.service", templateData); err != nil {
+		return fmt.Errorf("render config regeneration unit template: %w", err)
+	}
+
+	if err := utilio.WriteFile(unitFile, unitBuf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("write config regeneration unit %s: %w", unitFile, err)
 	}
 
 	return nil

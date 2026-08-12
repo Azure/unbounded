@@ -27,7 +27,6 @@ var assets embed.FS
 var assetsTemplate = template.Must(template.New("assets").ParseFS(assets, "assets/*"))
 
 const (
-	nvidiaRuntimeDropInName  = "99-nvidia-runtime.toml"
 	gantryHostsManagedMarker = "# Managed by unbounded-agent for Gantry."
 	gantryHostsConfig        = gantryHostsManagedMarker + `
 [host."http://127.0.0.1:5000"]
@@ -148,7 +147,7 @@ func (c *configureContainerd) ensureGPUDropInConfigs() error {
 
 	return ensureDropInConfig(
 		c.goalState.MachineDir,
-		nvidiaRuntimeDropInName,
+		filepath.Base(goalstates.NvidiaRuntimeDropInPath),
 		nvidia.Enabled,
 		map[string]any{
 			"RuntimePath":                nvidia.RuntimePath,

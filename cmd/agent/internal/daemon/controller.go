@@ -76,8 +76,9 @@ func runController(
 		agentUpgradeLockPath: goalstates.DaemonAgentUpgradeLockPath,
 	}
 
-	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconciler(
+	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconcilerWithReader(
 		c,
+		mgr.GetAPIReader(),
 		machineName,
 		nodeName,
 		daemon.MachineOperationHandlers{

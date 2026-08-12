@@ -51,9 +51,14 @@ func SetupNVIDIA(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task 
 func (s *setupNVIDIA) Name() string { return "setup-nvidia" }
 
 func (s *setupNVIDIA) Do(ctx context.Context) error {
-	if !s.goalState.Containerd.NvidiaRuntime.Enabled || len(s.goalState.Nvidia.LibMappings) == 0 {
-		s.log.Info("NVIDIA runtime not enabled or no host libraries found, skipping")
+	if !s.goalState.Nvidia.Required {
+		s.log.Info("NVIDIA was not provisioned for this machine, skipping")
+
 		return nil
+	}
+
+	if !s.goalState.Containerd.NvidiaRuntime.Enabled || !goalstates.NVIDIAStateAvailable(s.goalState.Nvidia) {
+		return fmt.Errorf("NVIDIA is required but resolved setup state is incomplete")
 	}
 
 	if err := s.setupLibraries(ctx); err != nil {

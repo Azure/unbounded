@@ -20,6 +20,62 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
+func TestResolveNSpawnConfigDoesNotResolveLocalDNS(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.AgentConfig{
+		LocalDNS: &config.AgentLocalDNSConfig{Enabled: true},
+	}
+
+	got, err := ResolveNSpawnConfig(cfg, NSpawnMachineKube1)
+	require.NoError(t, err)
+	require.Equal(t, "/var/lib/machines/kube1", got.MachineDir)
+	require.Equal(t, "/etc/systemd/nspawn/kube1.nspawn", got.NSpawnConfigFile)
+}
+
+func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
+	t.Parallel()
+
+	t.Run("complete GPU discovery enables NVIDIA", func(t *testing.T) {
+		gs, err := resolveMachine(
+			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
+		)
+		require.NoError(t, err)
+		require.True(t, gs.RootFS.Nvidia.Required)
+		require.True(t, gs.NodeStart.Nvidia.Required)
+		require.True(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
+	})
+
+	t.Run("empty discovery produces CPU state", func(t *testing.T) {
+		gs, err := resolveMachine(
+			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
+		)
+		require.NoError(t, err)
+		require.False(t, gs.RootFS.Nvidia.Required)
+		require.False(t, gs.NodeStart.Containerd.NvidiaRuntime.Enabled)
+	})
+
+	t.Run("incomplete GPU discovery fails", func(t *testing.T) {
+		_, err := resolveMachine(
+			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) {
+				return NvidiaHost{GPUDevicePaths: []string{"/dev/nvidia0"}}, nil
+			},
+		)
+		require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
+	})
+}
+
+func completeResolvedNVIDIA() NvidiaHost {
+	return NvidiaHost{
+		GPUDevicePaths: []string{"/dev/nvidia0"},
+		LibMappings:    []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
+		DriverVersion:  "580.1",
+	}
+}
+
 func TestResolveOCIImage_ConfigImageTakesPrecedence(t *testing.T) {
 	// Even when env vars and GPU are present, configImage wins.
 	t.Setenv("AGENT_OCI_IMAGE", "env-image:latest")

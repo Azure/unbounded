@@ -1,5 +1,6 @@
 {
   "name": "additional-host-mounts",
+  "validateDeviceRefreshAfterHostReboot": true,
   "nodeLabels": {
     "e2e.unbounded-cloud.io/config": "additional-host-mounts"
   },

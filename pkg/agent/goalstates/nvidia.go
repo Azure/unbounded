@@ -6,6 +6,7 @@ package goalstates
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,10 +36,18 @@ import (
 //     multiarch library path pointing into the bind mounts and run ldconfig
 //     to update the linker cache.
 
+// ErrNVIDIAStateUnavailable indicates that discovered NVIDIA devices do not
+// have the complete host state needed for safe startup.
+var ErrNVIDIAStateUnavailable = errors.New("required NVIDIA host state is unavailable")
+
 // NvidiaHost aggregates all NVIDIA-related host state discovered at agent
 // startup: GPU device paths, driver library mappings, and the derived
 // bind-mount specifications for the nspawn container.
 type NvidiaHost struct {
+	// Required records whether NVIDIA capability was selected when the machine
+	// was provisioned. Discovery refreshes must preserve this value.
+	Required bool
+
 	// GPUDevicePaths lists NVIDIA GPU device paths discovered on the host
 	// (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-caps,
 	// /dev/nvidia-caps-imex-channels, /dev/dri/*).
@@ -142,12 +151,17 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	}, nil
 }
 
-// resolveNvidiaRuntime returns the NVIDIA container runtime goal state.
-// When GPU devices are present the runtime is enabled with default paths;
-// otherwise it is disabled.
-func resolveNvidiaRuntime() NvidiaRuntime {
+// NVIDIAStateAvailable reports whether discovery produced all host state needed
+// to render mounts and perform in-machine setup.
+func NVIDIAStateAvailable(nvidia NvidiaHost) bool {
+	return len(nvidia.GPUDevicePaths) > 0 && len(nvidia.LibMappings) > 0 && nvidia.DriverVersion != ""
+}
+
+// resolveNvidiaRuntime returns the NVIDIA container runtime goal state using
+// the caller-selected provisioned capability.
+func resolveNvidiaRuntime(enabled bool) NvidiaRuntime {
 	return NvidiaRuntime{
-		Enabled:                    len(discoverNVIDIADevices()) > 0,
+		Enabled:                    enabled,
 		RuntimeClassName:           NvidiaRuntimeClassName,
 		RuntimePath:                NvidiaContainerRuntimePath,
 		DisableSetAsDefaultRuntime: false,
