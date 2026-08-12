@@ -517,8 +517,24 @@ still construct io_uring instances, and a few subsystem paths use host time.
 `tests/dst.rs` drives this stack through crashes, restarts, partitions, dropped
 frames, disk errors, corruption, straggling links, transport-split huge writes,
 and seeded linearizability checks.
-`tests/paxos_model.rs` model-checks abstract consensus, replay, handover, and
-anti-entropy; `alloc/shard.rs` model-checks the actual allocator transitions.
+There is no separate model of the protocol. `paxos.rs` and `alloc/shard.rs`
+each carry their own model checker, and both drive the production transitions:
+the guard rule, the promise rule, the prepare selection, apply-if-newer, the
+quorum count, the deferred local commit, promise recovery and the seal gate are
+single functions that the dataplane calls on the write path and that the
+checker calls from `Model::next_state`. The checker supplies only what a
+process cannot enumerate from the inside: which messages arrive, which members
+can hear each other, and when a disk is lost. So a counterexample is a
+counterexample in the shipped code, and the rule cannot drift away from its
+proof without the proof failing to compile.
+
+The migration check is weaker than the rest, and deliberately so. RACER has no
+quorum barrier proving every source acceptor sealed and no durable gate proving
+the destination drained; a control plane outside RACER repoints the address. The
+model states that precondition as an explicit assumption and offers the cutover
+only where it holds, so what it verifies is that the seal and the apply-if-newer
+stream suffice *given* the assumption, not that RACER enforces it.
+
 Privileged integration tests exercise real ublk with multiple processes,
 reload, intra-zone routing, cache, restart, and wiped-member replay, but skip
 when kernel facilities are absent. The simulator builds multi-zone clusters, so

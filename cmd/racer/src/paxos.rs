@@ -106,7 +106,10 @@ impl Ballot {
 
 /// What an acceptor holds for one page. Both fields live in the mblock entry, and an
 /// Immutable page's state derives from the version, so this is the whole durable state.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+///
+/// The derived order is [`Register::key`], the apply-if-newer one, because a ballot compares
+/// as its packed `u32`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct Register {
     pub version: u64,
     pub ballot: Ballot,
@@ -115,8 +118,206 @@ pub struct Register {
 impl Register {
     /// The apply-if-newer order. Ballot breaks ties at one version, which is what two racing
     /// one-shot proposals produce.
-    fn key(self) -> (u64, u32) {
+    pub(crate) fn key(self) -> (u64, u32) {
         (self.version, self.ballot.raw())
+    }
+
+    /// The register a guarded accept installs: one past the version it guarded on, stamped
+    /// with the proposer's ballot. Versions count accepts, which is what makes the guard a
+    /// collision detector rather than a hint.
+    pub(crate) fn accepted(guard: u64, ballot: Ballot) -> Register {
+        Register {
+            version: guard + 1,
+            ballot,
+        }
+    }
+}
+
+// --- the protocol's rules ---
+//
+// The decisions a round is made of, apart from the IO that carries them. Everything below is
+// pure and total, so the model checker at the foot of this file can drive the same code the
+// dataplane runs rather than a paraphrase of it.
+
+/// The guarded acceptance rule, the whole of what an acceptor decides about an `ACCEPT`.
+///
+/// `current` is the version the acceptor effectively holds and `held` the ballot behind it,
+/// absent when the acceptor holds no entry for the address at all.
+///
+/// An acceptor refuses only a guard it is already past: that is the collision. Sitting behind
+/// the guard is a gap this accept closes, letting a node that missed a round rejoin without
+/// waiting for the sweep. At the guard itself the ballot may not regress, so a stale retry
+/// cannot overwrite a newer value at the same version.
+pub(crate) fn admits(current: u64, held: Option<Ballot>, guard: u64, ballot: Ballot) -> bool {
+    current < guard || (current == guard && held.is_none_or(|h| ballot >= h))
+}
+
+/// The first conjunct of the acceptance rule: a ballot below our promise is a proposer that
+/// missed a term bump, and it refreshes on the rejection. A ballot at or above the promise is
+/// one we adopt, which lets one member's prepare grant the whole group its new term.
+pub(crate) fn promised(promise: u32, b: Ballot) -> bool {
+    b.term() >= promise
+}
+
+/// The apply-if-newer rule behind repair, `LEARN` and both migration streams. False means
+/// what we hold is at least as new, which is what makes the two streams commute and a
+/// repeated repair free.
+///
+/// `equal` admits an exactly equal register, so a repair can reinstall bytes that failed
+/// their checksum without the entry itself having moved.
+pub(crate) fn supersedes(held: (u64, u32), r: Register, equal: bool) -> bool {
+    held < r.key() || (held == r.key() && equal)
+}
+
+/// Whether a proposer's own leg plus `peers` peer accepts carry the round. The local leg is
+/// staged and not committed until this holds: a proposer that installed its value regardless
+/// would sit a version ahead of a group that never agreed to it, every retry would guard on
+/// that version, and no apply-if-newer repair could pull the fork back.
+pub(crate) fn carried(peers: usize, need: usize) -> bool {
+    peers + 1 >= need
+}
+
+/// The promise a member recovers from the rest of its group after a reformat: the highest the
+/// others hold.
+///
+/// Exactly enough: every chosen value was accepted by two members, and an acceptor adopts the
+/// term of the ballot it accepts, so at least one member that is not us still promises at that
+/// term or above. Both must answer, since hearing from one could miss precisely that member.
+pub(crate) fn recovered_term(peers: [u32; 2]) -> u32 {
+    peers[0].max(peers[1])
+}
+
+/// The seal table's rule: idempotent, and monotone in `term`.
+pub(crate) fn sealed_at(held: Option<u32>, term: u32) -> u32 {
+    held.map_or(term, |h| h.max(term))
+}
+
+/// What a prepare round made of the registers it heard back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Choice {
+    /// A value a quorum could already stand behind. It has to be preserved.
+    Chosen(Register),
+    /// Nothing was chosen, so the newest register still on offer is a free choice.
+    Free(Register),
+    /// Two values at one version, and no silent member left to tell them apart. Not a
+    /// decision this round can make.
+    Ambiguous,
+    /// No responder offered anything usable.
+    Missing,
+}
+
+/// Decide which reported register was chosen.
+///
+/// The classical rule "highest version, ties on ballot" is not enough: a losing one-shot can
+/// sit on a single acceptor at the same version as the chosen value with a higher ballot, and
+/// picking it would resurrect a value that never reached a quorum. So a `(version, ballot)`
+/// held by a majority wins outright; a three-way split at one version means nothing was
+/// chosen and the highest ballot is a free choice; and two responses that disagree at the top
+/// version are unresolvable in this round.
+///
+/// `answered` is how many of the three members replied, so `3 - answered` is how many could
+/// still be carrying a value nobody here has seen. `below` narrows a free choice when the
+/// caller has already found the newer ones unusable.
+pub(crate) fn choose(
+    regs: &[Option<Register>; 3],
+    answered: usize,
+    need: usize,
+    kind: Kind,
+    below: Option<Register>,
+) -> Choice {
+    // A value at a version can still be chosen only if the acceptors we did not hear from
+    // could carry it to a quorum, so count each distinct value's votes plus the silent
+    // members. Exactly one candidate must be preserved; two means the acceptor that decides
+    // between them stayed silent.
+    //
+    // None at all means nothing was chosen *at that version*, which is not the same as
+    // nothing having been chosen: a one-shot that reached a single acceptor leaves it a
+    // version ahead of a value two others agreed on, and taking it because it sits on top
+    // would drop an acknowledged write. So walk the versions downwards and answer with the
+    // first one a quorum could stand behind.
+    let unseen = 3 - answered;
+    let mut vers: Vec<u64> = regs.iter().flatten().map(|r| r.version).collect();
+    vers.sort_unstable_by(|a, b| b.cmp(a));
+    vers.dedup();
+    let mut chosen = None;
+    // A value chosen at some version left a quorum standing at or above it, and registers only
+    // advance, so the highest version a quorum could still stand at is a floor. Answering
+    // below it would replace whatever was chosen there with something older, even when every
+    // copy of it has been overwritten.
+    let floor = vers
+        .iter()
+        .copied()
+        .find(|v| regs.iter().flatten().filter(|r| r.version >= *v).count() + unseen >= need)
+        .unwrap_or_default();
+    for v in vers.iter().copied() {
+        if v < floor {
+            break;
+        }
+        // A quorum holding nothing is not a decision to hold nothing: no value has been chosen
+        // yet, which leaves the choice free. Stopping here would answer with a register no
+        // member can supply the bytes for, and a proposer already a version above it would be
+        // stuck guarding against one nobody else will ever reach.
+        if unwritten(kind, v) {
+            continue;
+        }
+        let at: Vec<Register> = regs
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|r| r.version == v)
+            .collect();
+        // A member past this version says nothing about it: its answer has been overwritten,
+        // so it counts with the silent rather than against. Only a member still below is a
+        // real denial.
+        let above = regs.iter().flatten().filter(|r| r.version > v).count();
+        let mut cands: Vec<Register> = Vec::new();
+        // A quorum of answers holding the same value is proof rather than possibility, and
+        // there can be only one such. Proof settles the version outright: without it two
+        // values that merely *could* have been chosen are indistinguishable.
+        let mut sure = None;
+        for r in at.iter().copied() {
+            let exact = at.iter().filter(|x| **x == r).count();
+            if exact >= need {
+                sure = Some(r);
+            }
+            if !cands.contains(&r) && exact + unseen + above >= need {
+                cands.push(r);
+            }
+        }
+        if sure.is_some() {
+            chosen = sure;
+            break;
+        }
+        match cands.len() {
+            1 => {
+                chosen = Some(cands[0]);
+                break;
+            }
+            0 => continue,
+            // Two values that could each have been chosen, and no silent member left to tell
+            // them apart. Whoever moved past this version built on one of them, so the
+            // register above supersedes both.
+            _ if unseen == 0 => {
+                chosen = regs.iter().flatten().copied().max_by_key(|r| r.key());
+                break;
+            }
+            _ => return Choice::Ambiguous,
+        }
+    }
+    // Nothing at or above the floor could have reached a quorum, so every register still on
+    // offer there is a free choice; take the newest, the one a writer would build on. `below`
+    // is how a value whose only copy is unreadable stops being an answer nobody can act on.
+    // Deliberately ignored once something *was* chosen: then the value is the group's,
+    // readable or not.
+    match chosen {
+        Some(r) => Choice::Chosen(r),
+        None => regs
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|r| r.version >= floor && below.is_none_or(|b| r.key() < b.key()))
+            .max_by_key(|r| r.key())
+            .map_or(Choice::Missing, Choice::Free),
     }
 }
 
@@ -166,12 +367,40 @@ enum Gate {
     Away(u32),
 }
 
+impl Gate {
+    /// The gate's rule, apart from the hop that reads the two tables.
+    ///
+    /// A sealed shard is `Away`: this group accepts nothing further for it, so the write
+    /// belongs to the zone it is handed to. `next` is that zone, absent once the config has
+    /// caught up and this node is no longer meant to see the address at all.
+    fn decide(sealed: bool, replaying: bool, next: Option<u32>) -> Result<Gate, Status> {
+        if !sealed {
+            return Ok(Gate::Serve { replaying });
+        }
+        // Sealed and still here: the config has not caught up, so forward to the destination
+        // the extent names rather than refusing.
+        match next {
+            Some(z) => Ok(Gate::Away(z)),
+            None => Err(Status::Conflict { current: 0 }),
+        }
+    }
+
+    /// The acceptor half of a round, which may not proceed while we are replaying. To a
+    /// proposer that is no error, only a statement that this node must not run the round.
+    fn accepts(self) -> Result<(), Status> {
+        match self {
+            Gate::Serve { replaying: true } => Err(Status::Io),
+            _ => Ok(()),
+        }
+    }
+}
+
 // --- per-core state ---
 
 /// A group's standing promise. `held` is false for a term read back from the superblock: a
 /// restarting node raises the term before proposing, because the in-flight table enforcing
 /// one value per ballot is volatile.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Term {
     value: u32,
     held: bool,
@@ -186,6 +415,44 @@ impl Term {
             held: false,
             preparing: false,
         }
+    }
+
+    /// Raise the promise by one and return it.
+    ///
+    /// The bump also takes the right to issue one-shot accepts at the new term, on the
+    /// acceptor side of someone else's `PREPARE` as much as on our own. Withholding it there
+    /// measured worse: making an acceptor that has just raised its promise prepare again
+    /// costs a round trip on every write.
+    fn raise(&mut self) -> u32 {
+        self.value = self.value.saturating_add(1) & 0x3fff_ffff;
+        self.held = true;
+        self.value
+    }
+
+    /// Record a term another member reported. Never marks it held: only our own `raise`
+    /// grants the right to issue one-shot accepts at it, so a term that rises under us takes
+    /// the right away again. Without that a proposer keeps issuing at the raised term, where
+    /// another member's ballot is higher at the same term, and every accept is refused as a
+    /// ballot regression forever.
+    fn adopt(&mut self, term: u32) {
+        if term > self.value {
+            self.value = term;
+            self.held = false;
+        }
+    }
+
+    /// Take the promise the rest of the group still holds for us, and hold nothing at it.
+    ///
+    /// A member that lost its disk restarts this counter at zero, and the peers' `PREPARE`s
+    /// raise it one at a time, each `raise` handing back the right to issue at the new term.
+    /// That climb walks straight back onto a term this member already issued a ballot at
+    /// before the loss, and `adopt` alone does not take the right away again because the
+    /// recovered promise is not above where the climb has already arrived. Two values under
+    /// one ballot is the single thing a register's identity cannot survive, so recovery ends
+    /// holding nothing and the next write pays for a term this member raised itself.
+    fn recover(&mut self, peers: [u32; 2]) {
+        self.adopt(recovered_term(peers));
+        self.held = false;
     }
 }
 
@@ -968,7 +1235,7 @@ impl Paxos {
     {
         // A quorum we cannot reach means the group is unavailable, not smaller: acking on
         // the local write alone would let an isolated member decide.
-        if peers.len() + 1 < need {
+        if !carried(peers.len(), need) {
             self.stat(|s| s.groups_unavailable += 1);
             return Err(Status::Io);
         }
@@ -986,7 +1253,7 @@ impl Paxos {
                     runtime::quorum([send(a), send(b)], want).await
                 };
                 let ok = q.iter().flatten().filter(|r| r.is_ok()).count();
-                if ok >= want {
+                if carried(ok, need) {
                     Ok(())
                 } else {
                     // Prefer a refusal (the group's verdict) over a peer we could not reach,
@@ -1018,7 +1285,7 @@ impl Paxos {
     {
         // A quorum we cannot reach means the group is unavailable, not smaller: acking on
         // the local write alone would let an isolated member decide.
-        if peers.len() + 1 < need {
+        if !carried(peers.len(), need) {
             self.stat(|s| s.groups_unavailable += 1);
             return Err(Status::Io);
         }
@@ -1033,7 +1300,7 @@ impl Paxos {
                 let want = need.saturating_sub(1);
                 let (l, q) = join2(local, runtime::quorum([send(a), send(b)], want)).await;
                 let ok = q.iter().flatten().filter(|r| r.is_ok()).count();
-                if ok >= want {
+                if carried(ok, need) {
                     // The local write makes this node an acceptor of the value it chose,
                     // so its failure is still a failure.
                     l
@@ -1711,7 +1978,7 @@ impl Paxos {
                 // proposer that missed a term bump; it refreshes on the rejection. A ballot
                 // above it is a promise we adopt, which lets one member's prepare grant the
                 // whole group its new term.
-                if b.term() < self.held_term(group).await {
+                if !promised(self.held_term(group).await, b) {
                     self.stat(|s| s.accept_rejected += 1);
                     return Err(Status::Conflict { current: 0 });
                 }
@@ -1894,9 +2161,10 @@ impl Paxos {
             Err(Status::Missing) => Register::default(),
             Err(e) => return Err(e),
         };
-        if held.key() > r.key()
-            || (held.key() == r.key() && (!repair || huge || empty(kind, r.version)))
-        {
+        // A repaired small page may need reinstalling at a register that has not moved: our
+        // entry matches but our bytes fail their checksum, which metadata alone cannot see.
+        let equal = repair && !huge && !empty(kind, r.version);
+        if !supersedes(held.key(), r, equal) {
             self.stat(|s| s.learn_stale += 1);
             return Ok(());
         }
@@ -2034,7 +2302,7 @@ impl Paxos {
                 let mut l = self.state[core].borrow_mut();
                 l.stats.seals += 1;
                 let e = l.seals.entry(extent).or_insert(term);
-                *e = (*e).max(term);
+                *e = sealed_at(Some(*e), term);
             })
             .await;
         }
@@ -2042,12 +2310,8 @@ impl Paxos {
     }
 
     /// The seal's refusal, and the replay flag, in one hop to the group's own core. Both
-    /// tables are empty on the common path, so this is two predictable branches.
-    ///
-    /// A sealed shard is `Away`: this group accepts nothing further for it, so the write
-    /// belongs to the zone it is handed to. Replaying is not an error to a proposer, only a
-    /// statement that this node must not run the round, so the caller hands it to a member
-    /// that is caught up. To an acceptor it is an error; see [`Self::gate_accept`].
+    /// tables are empty on the common path, so this is two predictable branches. The rule
+    /// itself is [`Gate::decide`].
     async fn gate(&'static self, addr: GlobalAddr, group: GroupId) -> Result<Gate, Status> {
         let cfg = self.alloc.config();
         let core = self.core_of(group);
@@ -2060,15 +2324,8 @@ impl Paxos {
             )
         })
         .await;
-        if !sealed {
-            return Ok(Gate::Serve { replaying });
-        }
-        // Sealed and still here: the config has not caught up, so forward to the
-        // destination the extent names rather than refusing.
-        match cfg.next_zone_of(addr.0) {
-            Some(z) if z != cfg.node.zone => Ok(Gate::Away(z)),
-            _ => Err(Status::Conflict { current: 0 }),
-        }
+        let next = cfg.next_zone_of(addr.0).filter(|z| *z != cfg.node.zone);
+        Gate::decide(sealed, replaying, next)
     }
 
     /// The extent `addr` falls in, as the seal table names it.
@@ -2076,13 +2333,9 @@ impl Paxos {
         self.alloc.config().extent_id_of(addr.0)
     }
 
-    /// [`Self::gate`] for the acceptor half of a round, which may not proceed while we
-    /// are replaying.
+    /// [`Self::gate`] for the acceptor half of a round; see [`Gate::accepts`].
     async fn gate_accept(&'static self, addr: GlobalAddr, group: GroupId) -> Result<(), Status> {
-        match self.gate(addr, group).await? {
-            Gate::Serve { replaying: true } => Err(Status::Io),
-            _ => Ok(()),
-        }
+        self.gate(addr, group).await?.accepts()
     }
 
     /// Whether this node is still replaying `group`, and so must not be counted toward a
@@ -2127,14 +2380,12 @@ impl Paxos {
     /// guard and any ballot pass. There the promise is the only thing between a stale accept
     /// and a value some round had already fixed.
     ///
-    /// The highest promise the others hold is exactly enough: every chosen value was accepted
-    /// by two members, and an acceptor adopts the term of the ballot it accepts, so at least
-    /// one member that is not us still promises at that term or above. Both must answer,
-    /// since hearing from one could miss precisely that member.
+    /// The promise to recover is [`recovered_term`].
     pub async fn rejoin(&'static self, group: GroupId) -> Result<(), Status> {
         let m = self.members(group).ok_or(Status::Unmapped)?;
         let me = self.self_index(&m).ok_or(Status::Unmapped)?;
-        let mut term = 0;
+        let mut peers = [0u32; 2];
+        let mut n = 0;
         for i in 0..3u8 {
             if i == me {
                 continue;
@@ -2147,11 +2398,12 @@ impl Paxos {
             let f = Frame::raw(Op::Term, false, group.index() as u64);
             let t = PoolBuf::alloc(fabric::BLOCK).await;
             link.send(f, t.buf()).await.map_err(Status::from_wire)?;
-            term = term.max(fabric::get(&t, T_TERM) as u32);
+            peers[n] = fabric::get(&t, T_TERM) as u32;
+            n += 1;
         }
         // Durable before use, as in `bump`: a promise lost to a restart was never a
         // promise.
-        self.observe(group, term).await;
+        self.recover(group, peers).await;
         self.persist().await?;
         self.set_replaying(group, false).await;
         Ok(())
@@ -2259,41 +2511,36 @@ impl Paxos {
     }
 
     /// Raise this group's promise by one and return it. Durable before use, so a promise
-    /// never dies with the process.
-    ///
-    /// The bump also takes the right to issue one-shot accepts at the new term, on the
-    /// acceptor side of someone else's `PREPARE` as much as on our own. Withholding it there
-    /// measured worse: making an acceptor that has just raised its promise prepare again
-    /// costs a round trip on every write.
+    /// never dies with the process. The rule itself is [`Term::raise`].
     async fn bump(&'static self, group: GroupId) -> Result<u32, Status> {
         let core = self.core_of(group);
         let t = runtime::on_core(core, move || async move {
             let mut l = self.state[core].borrow_mut();
             l.stats.term_bumps += 1;
-            let e = l.terms.entry(group).or_insert(Term::new(0));
-            e.value = e.value.saturating_add(1) & 0x3fff_ffff;
-            e.held = true;
-            e.value
+            l.terms.entry(group).or_insert(Term::new(0)).raise()
         })
         .await;
         self.persist().await?;
         Ok(t)
     }
 
-    /// Record a term another member reported. Never marks it held: only our own `bump`
-    /// grants the right to issue one-shot accepts at it, so a term that rises under us takes
-    /// the right away again. Without that a proposer keeps issuing at the raised term, where
-    /// another member's ballot is higher at the same term, and every accept is refused as a
-    /// ballot regression forever.
+    /// Record a term another member reported; see [`Term::adopt`].
     async fn observe(&'static self, group: GroupId, term: u32) {
         let core = self.core_of(group);
         runtime::on_core(core, move || async move {
             let mut l = self.state[core].borrow_mut();
-            let e = l.terms.entry(group).or_insert(Term::new(term));
-            if term > e.value {
-                e.value = term;
-                e.held = false;
-            }
+            l.terms.entry(group).or_insert(Term::new(term)).adopt(term);
+        })
+        .await;
+    }
+
+    /// Take a group's promise back from its other members, holding nothing at it. The rule is
+    /// [`Term::recover`]; the callers are [`Paxos::rejoin`] and nothing else.
+    async fn recover(&'static self, group: GroupId, peers: [u32; 2]) {
+        let core = self.core_of(group);
+        runtime::on_core(core, move || async move {
+            let mut l = self.state[core].borrow_mut();
+            l.terms.entry(group).or_insert(Term::new(0)).recover(peers);
         })
         .await;
     }
@@ -2398,93 +2645,16 @@ impl Paxos {
         // version ahead of a value two others agreed on, and taking it because it sits on
         // top would drop an acknowledged write. So walk the versions downwards and answer
         // with the first one a quorum could stand behind.
-        let unseen = 3 - answered;
-        let mut vers: Vec<u64> = regs.iter().flatten().map(|r| r.version).collect();
-        vers.sort_unstable_by(|a, b| b.cmp(a));
-        vers.dedup();
-        let mut chosen = None;
         let kind = self.alloc.kind_of(addr)?.0;
-        // A value chosen at some version left a quorum standing at or above it, and
-        // registers only advance, so the highest version a quorum could still stand at is a
-        // floor. Answering below it would replace whatever was chosen there with something
-        // older, even when every copy of it has been overwritten.
-        let floor = vers
-            .iter()
-            .copied()
-            .find(|v| regs.iter().flatten().filter(|r| r.version >= *v).count() + unseen >= need)
-            .unwrap_or_default();
-        for v in vers.iter().copied() {
-            if v < floor {
-                break;
-            }
-            // A quorum holding nothing is not a decision to hold nothing: no value has been
-            // chosen yet, which leaves the choice free. Stopping here would answer with a
-            // register no member can supply the bytes for, and a proposer already a version
-            // above it would be stuck guarding against one nobody else will ever reach.
-            if unwritten(kind, v) {
-                continue;
-            }
-            let at: Vec<Register> = regs
-                .iter()
-                .flatten()
-                .copied()
-                .filter(|r| r.version == v)
-                .collect();
-            // A member past this version says nothing about it: its answer has been
-            // overwritten, so it counts with the silent rather than against. Only a member
-            // still below is a real denial.
-            let above = regs.iter().flatten().filter(|r| r.version > v).count();
-            let mut cands: Vec<Register> = Vec::new();
-            // A quorum of answers holding the same value is proof rather than possibility,
-            // and there can be only one such. Proof settles the version outright: without it
-            // two values that merely *could* have been chosen are indistinguishable.
-            let mut sure = None;
-            for r in at.iter().copied() {
-                let exact = at.iter().filter(|x| **x == r).count();
-                if exact >= need {
-                    sure = Some(r);
-                }
-                if !cands.contains(&r) && exact + unseen + above >= need {
-                    cands.push(r);
-                }
-            }
-            if sure.is_some() {
-                chosen = sure;
-                break;
-            }
-            match cands.len() {
-                1 => {
-                    chosen = Some(cands[0]);
-                    break;
-                }
-                0 => continue,
-                // Two values that could each have been chosen, and no silent member left to
-                // tell them apart. Whoever moved past this version built on one of them, so
-                // the register above supersedes both.
-                _ if unseen == 0 => {
-                    chosen = regs.iter().flatten().copied().max_by_key(|r| r.key());
-                    break;
-                }
-                _ => return Err(Status::Conflict { current: 0 }),
-            }
+        match choose(&regs, answered, need, kind, below) {
+            Choice::Chosen(r) => Ok((term, r, false)),
+            Choice::Free(r) => Ok((term, r, true)),
+            // An unresolvable top version is a race, not the client's `Conflict`:
+            // `prepare_round` retries here so the only `Conflict` a caller sees is a guard
+            // mismatch.
+            Choice::Ambiguous => Err(Status::Conflict { current: 0 }),
+            Choice::Missing => Err(Status::Missing),
         }
-        // Nothing at or above the floor could have reached a quorum, so every register still
-        // on offer there is a free choice; take the newest, the one a writer would build on.
-        // `below` narrows that choice when the caller has already found the newer ones
-        // unusable, which is how a value whose only copy is unreadable stops being an answer
-        // nobody can act on. Deliberately ignored once something *was* chosen: then the
-        // value is the group's, readable or not.
-        let best = match chosen {
-            Some(r) => r,
-            None => regs
-                .iter()
-                .flatten()
-                .copied()
-                .filter(|r| r.version >= floor && below.is_none_or(|b| r.key() < b.key()))
-                .max_by_key(|r| r.key())
-                .ok_or(Status::Missing)?,
-        };
-        Ok((term, best, chosen.is_none()))
     }
 
     async fn send_prepare(
@@ -2546,15 +2716,13 @@ impl Paxos {
         // acceptor carries would let the next round (which need not reach that acceptor)
         // settle on a different one, and a client told the first would then see the second.
         // A member already past `best` counts: it built what it holds on top.
-        let mut held = 1;
         let rest: Vec<u8> = (0..3u8).filter(|i| *i != src).collect();
         let (x, y) = join2(
             self.hand(addr, best, src, &m, me, rest[0]),
             self.hand(addr, best, src, &m, me, rest[1]),
         )
         .await;
-        held += x as usize + y as usize;
-        if held < self.quorum(addr.universe()) {
+        if !carried(x as usize + y as usize, self.quorum(addr.universe())) {
             self.stat(|s| s.groups_unavailable += 1);
             return Err(Status::Io);
         }
@@ -3043,5 +3211,639 @@ mod tests {
         let mut seen = o;
         seen.sort_unstable();
         assert_eq!(seen, [0, 1, 2], "the failover order still covers the group");
+    }
+}
+
+/// A model checker over the protocol itself.
+///
+/// Every decision below is the production one. [`admits`], [`promised`], [`supersedes`],
+/// [`carried`], [`choose`], [`recovered_term`], [`sealed_at`], [`Register::accepted`],
+/// [`Term::raise`], [`Term::adopt`] and [`Gate::decide`] are the same functions the dataplane
+/// calls; `Paxos` is the IO that carries them and `Shard` the store they decide about. What
+/// the model supplies is only the part that cannot be enumerated from inside a process: which
+/// messages arrive, which members can hear each other, and when a disk is lost. So a
+/// counterexample here is a counterexample in the shipped code.
+///
+/// The shape is the smallest that can still hold a disagreement: three members, a quorum of
+/// two, one LWW address, two rounds, two terms. Two values are enough to disagree about, and
+/// a value that survives one contested round survives any.
+#[cfg(test)]
+mod model {
+    use super::*;
+    use stateright::{Checker, Model, Property};
+    use std::collections::BTreeSet;
+
+    /// Members in a group and the quorum. Three and two everywhere in RACER.
+    const N: usize = 3;
+    const NEED: usize = 2;
+    /// LWW guards on the version the acceptor holds, so its whole acceptor state is the
+    /// register and one address is a whole model.
+    const KIND: Kind = Kind::Lww;
+    const MAX_ROUNDS: u8 = 2;
+    const MAX_TERM: u32 = 2;
+    const GUARDS: [u64; 2] = [0, 1];
+
+    /// The apply-if-newer key of a member that may be holding nothing.
+    fn key(r: Option<Register>) -> (u64, u32) {
+        r.map_or((0, 0), |r| r.key())
+    }
+
+    /// The version an LWW acceptor guards on: the one it holds.
+    fn current(r: Option<Register>) -> u64 {
+        r.map_or(0, |r| r.version)
+    }
+
+    /// A one-shot accept on the wire.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    struct Flight {
+        /// The register it installs if the round carries.
+        r: Register,
+        /// Which payload it is carrying. Production keeps this in the page's bytes, not in
+        /// the register, so the model has to keep it alongside to see two rounds landing
+        /// under one name.
+        val: u8,
+        /// The version it guarded on. It rides on the wire, so an acceptor checks the
+        /// proposer's guard rather than deriving one of its own.
+        guard: u64,
+        by: u8,
+        /// Peers that took it.
+        at: [bool; N],
+        /// Peers that answered at all, a refusal included, or that we gave up waiting on.
+        seen: [bool; N],
+    }
+
+    /// One consensus group over one address.
+    #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+    struct Group {
+        /// What each member durably holds. `None` is a member with no entry for the address
+        /// at all, which every guard and every ballot passes.
+        regs: [Option<Register>; N],
+        /// The payload behind each member's register, where it holds one. Not part of the
+        /// protocol: production carries it in the page and the checksum, and no decision
+        /// below reads it. It is here so the model can tell two values apart when the
+        /// protocol has given them the same name.
+        vals: [u8; N],
+        /// Each member's durable promise.
+        terms: [Term; N],
+        /// Members whose disk was lost and that have not caught up.
+        replaying: [bool; N],
+        flight: Option<Flight>,
+        /// What a client was told had been written, as `(register, payload)`.
+        acked: BTreeSet<(Register, u8)>,
+        /// What a prepare round reported as the group's value, as `(register, payload)`.
+        answered: BTreeSet<(Register, u8)>,
+        rounds: u8,
+        /// A round that failed to reach a quorum, and a member that lost its disk and came
+        /// back: witnesses that the interesting paths are reached rather than pruned.
+        lost: bool,
+        rejoined: bool,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+    enum Act {
+        /// `by` runs a one-shot at `guard`, staging its own leg without committing it.
+        Propose { by: u8, guard: u64 },
+        /// The accept in flight reaches `to`, or does not: `up` false is a peer we cannot
+        /// hear from, which a proposer must treat as a refusal.
+        Deliver { to: u8, up: bool },
+        /// The proposer counts what landed and either commits its staged leg or drops it.
+        Settle,
+        /// `by` prepares against the members in the `reach` mask and repairs to them. This
+        /// is both the write path's fallback and the anti-entropy sweep, which repairs a
+        /// discrepancy by running exactly this round.
+        Repair { by: u8, reach: u8 },
+        /// `at` loses its disk: registers and promise both.
+        Wipe { at: u8 },
+        /// `at` recovers its promise from the rest of the group and rejoins.
+        Rejoin { at: u8 },
+    }
+
+    /// Whether the model may destroy a member's disk. Off for the agreement checks, which
+    /// then afford a wider search; on for the promise-recovery check.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Consensus {
+        loss: bool,
+    }
+
+    impl Consensus {
+        /// The members `reach` names, `by` always among them.
+        fn reached(by: u8, reach: u8) -> Vec<u8> {
+            (0..N as u8)
+                .filter(|i| *i == by || reach & (1 << i) != 0)
+                .collect()
+        }
+    }
+
+    impl Model for Consensus {
+        type State = Group;
+        type Action = Act;
+
+        fn init_states(&self) -> Vec<Group> {
+            vec![Group {
+                regs: [None; N],
+                vals: [0; N],
+                terms: [Term::new(0); N],
+                replaying: [false; N],
+                flight: None,
+                acked: BTreeSet::new(),
+                answered: BTreeSet::new(),
+                rounds: 0,
+                lost: false,
+                rejoined: false,
+            }]
+        }
+
+        fn actions(&self, s: &Group, out: &mut Vec<Act>) {
+            match s.flight {
+                Some(f) => {
+                    for to in 0..N as u8 {
+                        if to != f.by && !f.seen[to as usize] {
+                            out.push(Act::Deliver { to, up: true });
+                            out.push(Act::Deliver { to, up: false });
+                        }
+                    }
+                    // Production awaits every leg it dispatched, so a round settles once each
+                    // peer has answered or been given up on.
+                    if (0..N).all(|i| i == f.by as usize || f.seen[i]) {
+                        out.push(Act::Settle);
+                    }
+                }
+                None if s.rounds < MAX_ROUNDS => {
+                    for by in 0..N as u8 {
+                        for guard in GUARDS {
+                            out.push(Act::Propose { by, guard });
+                        }
+                    }
+                }
+                None => {}
+            }
+            for by in 0..N as u8 {
+                for reach in 0..(1u8 << N) {
+                    out.push(Act::Repair { by, reach });
+                }
+            }
+            if self.loss {
+                for at in 0..N as u8 {
+                    out.push(Act::Wipe { at });
+                    out.push(Act::Rejoin { at });
+                }
+            }
+        }
+
+        fn next_state(&self, s: &Group, act: Act) -> Option<Group> {
+            let mut n = s.clone();
+            match act {
+                Act::Propose { by, guard } => {
+                    let i = by as usize;
+                    // A replaying member runs no round of its own, and a one-shot needs a
+                    // term this node raised itself: a term merely observed is one another
+                    // proposer may already be issuing higher ballots at.
+                    if s.flight.is_some() || s.replaying[i] || !s.terms[i].held {
+                        return None;
+                    }
+                    let b = Ballot::new(s.terms[i].value, by);
+                    let r = Register::accepted(guard, b);
+                    // The proposer is an acceptor too, and `stage_local` runs the same guard
+                    // check before anything goes on the wire.
+                    if !admits(current(s.regs[i]), s.regs[i].map(|r| r.ballot), guard, b) {
+                        return None;
+                    }
+                    n.rounds += 1;
+                    n.flight = Some(Flight {
+                        r,
+                        val: s.rounds,
+                        guard,
+                        by,
+                        at: [false; N],
+                        seen: [false; N],
+                    });
+                }
+                Act::Deliver { to, up } => {
+                    let mut f = s.flight?;
+                    let i = to as usize;
+                    if to == f.by || f.seen[i] {
+                        return None;
+                    }
+                    f.seen[i] = true;
+                    n.flight = Some(f);
+                    if !up {
+                        return Some(n);
+                    }
+                    // The gate first: a replaying member takes no part in a round, as
+                    // proposer or as acceptor.
+                    if Gate::decide(false, s.replaying[i], None)
+                        .and_then(Gate::accepts)
+                        .is_err()
+                    {
+                        return Some(n);
+                    }
+                    if !promised(s.terms[i].value, f.r.ballot) {
+                        return Some(n);
+                    }
+                    n.terms[i].adopt(f.r.ballot.term());
+                    if admits(
+                        current(s.regs[i]),
+                        s.regs[i].map(|r| r.ballot),
+                        f.guard,
+                        f.r.ballot,
+                    ) {
+                        n.regs[i] = Some(f.r);
+                        n.vals[i] = f.val;
+                        f.at[i] = true;
+                        n.flight = Some(f);
+                    }
+                }
+                Act::Settle => {
+                    let f = s.flight?;
+                    if (0..N).any(|i| i != f.by as usize && !f.seen[i]) {
+                        return None;
+                    }
+                    n.flight = None;
+                    let peers = f.at.iter().filter(|x| **x).count();
+                    if carried(peers, NEED) {
+                        // Only now does the staged local leg commit. A proposer that
+                        // installed regardless would sit a version ahead of a group that
+                        // never agreed, and every retry would guard on that version.
+                        n.regs[f.by as usize] = Some(f.r);
+                        n.vals[f.by as usize] = f.val;
+                        n.acked.insert((f.r, f.val));
+                    } else {
+                        // Production's `refresh`: a lost round gives up the right to issue
+                        // one-shots, so the retry prepares instead of reusing the ballot.
+                        n.terms[f.by as usize].held = false;
+                        n.lost = true;
+                    }
+                }
+                Act::Repair { by, reach } => {
+                    let who = Consensus::reached(by, reach);
+                    if s.replaying[by as usize] || who.len() < NEED {
+                        return None;
+                    }
+                    // Bounded by the term ceiling: a prepare raises the promise of every
+                    // member it reaches, so the search cannot run rounds forever.
+                    if who.iter().any(|i| s.terms[*i as usize].value >= MAX_TERM) {
+                        return None;
+                    }
+                    let mut regs = [None; N];
+                    let mut term = 0;
+                    for i in who.iter().map(|i| *i as usize) {
+                        term = term.max(n.terms[i].raise());
+                        regs[i] = s.regs[i];
+                    }
+                    n.terms[by as usize].adopt(term);
+                    // A member that did not answer and a member holding nothing look the
+                    // same in `regs`; `answered` is what tells them apart.
+                    let best = match choose(&regs, who.len(), NEED, KIND, None) {
+                        Choice::Chosen(r) | Choice::Free(r) => r,
+                        Choice::Ambiguous | Choice::Missing => return Some(n),
+                    };
+                    // Selecting a value is not deciding it. It becomes the group's answer
+                    // once a quorum holds it, so count the members that end at or above it.
+                    // The bytes travel with the register, so the copy carries the payload
+                    // of whichever member the selection came from.
+                    let val = match who
+                        .iter()
+                        .map(|i| *i as usize)
+                        .find(|i| s.regs[*i] == Some(best))
+                    {
+                        Some(i) => s.vals[i],
+                        None => return Some(n),
+                    };
+                    let mut held = 0;
+                    for i in who.iter().map(|i| *i as usize) {
+                        if supersedes(key(s.regs[i]), best, false) {
+                            n.regs[i] = Some(best);
+                            n.vals[i] = val;
+                        }
+                        held += (key(n.regs[i]) >= best.key()) as usize;
+                    }
+                    if carried(held.saturating_sub(1), NEED) {
+                        n.answered.insert((best, val));
+                    }
+                }
+                Act::Wipe { at } => {
+                    let i = at as usize;
+                    // One at a time, and never under a round. Losing a disk takes with it a
+                    // vote the proposer has already counted, and a second loss before the
+                    // sweep has put that value back is two thirds of the group gone, which
+                    // no quorum protocol survives. RACER assumes the sweep runs between
+                    // losses, and this is that assumption written down.
+                    if s.flight.is_some() || s.replaying.iter().any(|x| *x) {
+                        return None;
+                    }
+                    n.regs[i] = None;
+                    n.vals[i] = 0;
+                    n.terms[i] = Term::new(0);
+                    n.replaying[i] = true;
+                }
+                Act::Rejoin { at } => {
+                    let i = at as usize;
+                    // The sweep repairs first and rejoins only once the comparison comes
+                    // back clean, which for one address is this member holding the newest
+                    // register in the group.
+                    if !s.replaying[i] || (0..N).any(|j| key(s.regs[j]) > key(s.regs[i])) {
+                        return None;
+                    }
+                    let mut peers = [0u32; 2];
+                    for (k, j) in (0..N).filter(|j| *j != i).enumerate() {
+                        peers[k] = s.terms[j].value;
+                    }
+                    n.terms[i].recover(peers);
+                    n.replaying[i] = false;
+                    n.rejoined = true;
+                }
+            }
+            (n != *s).then_some(n)
+        }
+
+        fn properties(&self) -> Vec<Property<Self>> {
+            let mut props = vec![
+                // A register names exactly one value. Everything downstream of a write
+                // reads the register and trusts it: apply-if-newer skips an equal one, a
+                // prepare counts equal ones as agreement. Two payloads under one name and
+                // that arithmetic is comparing things that are not the same.
+                Property::<Self>::always("one register names one value", |_, s: &Group| {
+                    let mut seen: BTreeSet<(Register, u8)> = (0..N)
+                        .filter_map(|i| s.regs[i].map(|r| (r, s.vals[i])))
+                        .collect();
+                    seen.extend(s.acked.iter().chain(s.answered.iter()));
+                    seen.iter()
+                        .all(|(r, v)| !seen.iter().any(|(q, u)| q == r && u != v))
+                }),
+                // Consensus itself. Once a version has an acknowledged value, no round may
+                // answer with a different one at that version: a client told the first would
+                // otherwise read back the second.
+                Property::<Self>::always("one value per version", |_, s: &Group| {
+                    s.acked.iter().all(|(a, u)| {
+                        s.acked
+                            .iter()
+                            .chain(s.answered.iter())
+                            .all(|(r, v)| r.version != a.version || v == u)
+                    })
+                }),
+                // An acknowledged value is never dropped: some member that is not replaying
+                // still holds it or something built on top of it. That is what makes the next
+                // round's prepare find it.
+                Property::<Self>::always("an acknowledged value survives", |_, s: &Group| {
+                    s.acked
+                        .iter()
+                        .all(|(a, _)| (0..N).any(|i| !s.replaying[i] && key(s.regs[i]) >= a.key()))
+                }),
+                Property::<Self>::sometimes("a value is acknowledged", |_, s: &Group| {
+                    !s.acked.is_empty()
+                }),
+                Property::<Self>::sometimes("a round loses its quorum", |_, s: &Group| s.lost),
+                Property::<Self>::sometimes("a repair answers a value", |_, s: &Group| {
+                    !s.answered.is_empty()
+                }),
+            ];
+
+            // Without disk loss nothing is ever wiped, so the witness for a rejoin would go
+            // undiscovered and fail a run that is otherwise correct.
+            if self.loss {
+                props.push(Property::<Self>::sometimes(
+                    "a wiped member rejoins",
+                    |_, s: &Group| s.rejoined && !s.acked.is_empty(),
+                ));
+            }
+
+            props
+        }
+    }
+
+    /// A shard moving from one group to another.
+    ///
+    /// The source seals, then streams what it holds to the destination, and a control plane
+    /// outside RACER repoints the address once it is satisfied. There is no quorum barrier in
+    /// the protocol proving every source acceptor sealed, and no durable gate on the
+    /// destination proving it drained: [`MoveModel::drained`] is that precondition written
+    /// down, and `Cut` is only offered where it holds. So what follows verifies that the seal
+    /// and the apply-if-newer stream are enough *given* that precondition, not that RACER
+    /// enforces it.
+    #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+    struct Move {
+        /// The source group's registers and its seal table, keyed by member.
+        src: [Option<Register>; N],
+        sealed: [u32; N],
+        /// The destination group's registers.
+        dst: [Option<Register>; N],
+        /// Registers the source acknowledged, and every register it ever held.
+        acked: BTreeSet<Register>,
+        origin: BTreeSet<Register>,
+        /// The control plane has repointed the address at the destination.
+        cut: bool,
+        /// A write that carried while a quorum of the source was already sealed.
+        late: bool,
+        writes: u8,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+    enum MoveAct {
+        /// A round on the source at `guard`, run by `by` against the members in `reach`.
+        Write { by: u8, guard: u64, reach: u8 },
+        /// The seal reaches source member `at`. Production sends it to every member of the
+        /// destination zone's catalog and seals locally last, so the model lets them land in
+        /// any order and lets the handover stall part way.
+        Seal { at: u8 },
+        /// Source member `from` streams its own snapshot to destination member `to`.
+        Push { from: u8, to: u8 },
+        /// The control plane repoints the address at the destination.
+        Cut,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct MoveModel;
+
+    impl MoveModel {
+        /// The precondition the control plane is trusted to wait for: every source member
+        /// sealed, so the source can acknowledge nothing further, and every destination member
+        /// holding what the source ended at.
+        fn drained(s: &Move) -> bool {
+            let top = s.src.iter().copied().map(key).max().unwrap_or_default();
+            s.sealed.iter().all(|t| *t > 0) && s.dst.iter().copied().all(|r| key(r) >= top)
+        }
+    }
+
+    impl Model for MoveModel {
+        type State = Move;
+        type Action = MoveAct;
+
+        fn init_states(&self) -> Vec<Move> {
+            vec![Move {
+                src: [None; N],
+                sealed: [0; N],
+                dst: [None; N],
+                acked: BTreeSet::new(),
+                origin: BTreeSet::new(),
+                cut: false,
+                late: false,
+                writes: 0,
+            }]
+        }
+
+        fn actions(&self, s: &Move, out: &mut Vec<MoveAct>) {
+            if s.writes < MAX_ROUNDS {
+                for by in 0..N as u8 {
+                    for guard in GUARDS {
+                        for reach in 0..(1u8 << N) {
+                            out.push(MoveAct::Write { by, guard, reach });
+                        }
+                    }
+                }
+            }
+            for at in 0..N as u8 {
+                out.push(MoveAct::Seal { at });
+            }
+            for from in 0..N as u8 {
+                for to in 0..N as u8 {
+                    out.push(MoveAct::Push { from, to });
+                }
+            }
+            if !s.cut {
+                out.push(MoveAct::Cut);
+            }
+        }
+
+        fn next_state(&self, s: &Move, act: MoveAct) -> Option<Move> {
+            let mut n = s.clone();
+            match act {
+                MoveAct::Write { by, guard, reach } => {
+                    let who = Consensus::reached(by, reach);
+                    // The proposer is the one whose gate decides the write: sealed here means
+                    // the address belongs to the destination now, so the round never starts.
+                    let next = (s.sealed[by as usize] > 0).then_some(1);
+                    if Gate::decide(s.sealed[by as usize] > 0, false, next).is_err()
+                        || !matches!(
+                            Gate::decide(s.sealed[by as usize] > 0, false, next),
+                            Ok(Gate::Serve { .. })
+                        )
+                    {
+                        return None;
+                    }
+                    let b = Ballot::new(1, by);
+                    let r = Register::accepted(guard, b);
+                    let mut took = Vec::new();
+                    for i in who.iter().map(|i| *i as usize) {
+                        // A sealed acceptor is `Away`, so it takes nothing further.
+                        if Gate::decide(s.sealed[i] > 0, false, Some(1))
+                            .and_then(Gate::accepts)
+                            .is_err()
+                            || matches!(
+                                Gate::decide(s.sealed[i] > 0, false, Some(1)),
+                                Ok(Gate::Away(_))
+                            )
+                        {
+                            continue;
+                        }
+                        if admits(current(s.src[i]), s.src[i].map(|x| x.ballot), guard, b) {
+                            took.push(i);
+                        }
+                    }
+                    if !took.contains(&(by as usize))
+                        || !carried(took.len().saturating_sub(1), NEED)
+                    {
+                        return None;
+                    }
+                    for i in took {
+                        n.src[i] = Some(r);
+                    }
+                    n.acked.insert(r);
+                    n.origin.insert(r);
+                    n.writes += 1;
+                    n.late |= s.sealed.iter().filter(|t| **t > 0).count() >= NEED;
+                }
+                MoveAct::Seal { at } => {
+                    let i = at as usize;
+                    let held = (s.sealed[i] > 0).then_some(s.sealed[i]);
+                    n.sealed[i] = sealed_at(held, 1);
+                }
+                MoveAct::Push { from, to } => {
+                    let (f, t) = (from as usize, to as usize);
+                    // Production seals before it streams, so nothing the destination takes can
+                    // be superseded on the source afterwards.
+                    let r = s.src[f].filter(|_| s.sealed[f] > 0)?;
+                    if !supersedes(key(s.dst[t]), r, false) {
+                        return None;
+                    }
+                    n.dst[t] = Some(r);
+                }
+                MoveAct::Cut => {
+                    if s.cut || !MoveModel::drained(s) {
+                        return None;
+                    }
+                    n.cut = true;
+                }
+            }
+            (n != *s).then_some(n)
+        }
+
+        fn properties(&self) -> Vec<Property<Self>> {
+            vec![
+                // The seal is the write path's stop: once a quorum of the source holds it, no
+                // further value can carry, whatever order the seals landed in.
+                Property::<Self>::always("a sealed quorum ends the writes", |_, s: &Move| !s.late),
+                // Apply-if-newer, so the two streams commute and a repeated push is free. The
+                // destination invents nothing.
+                Property::<Self>::always(
+                    "the destination holds only source values",
+                    |_, s: &Move| s.dst.iter().flatten().all(|r| s.origin.contains(r)),
+                ),
+                // What the control plane's precondition buys: after the cutover every
+                // destination member is at or above every value the source acknowledged, so no
+                // reader at the destination can miss one.
+                Property::<Self>::always(
+                    "a cutover carries the acknowledged values",
+                    |_, s: &Move| {
+                        !s.cut
+                            || s.acked
+                                .iter()
+                                .all(|a| (0..N).all(|i| key(s.dst[i]) >= a.key()))
+                    },
+                ),
+                Property::<Self>::sometimes("the handover completes", |_, s: &Move| {
+                    s.cut && !s.acked.is_empty()
+                }),
+            ]
+        }
+    }
+
+    fn threads() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+
+    /// Guarded accepts, the prepare selection, the deferred local commit and the anti-entropy
+    /// repair, all driving the production rules.
+    #[test]
+    fn the_group_agrees_on_one_value_per_version() {
+        Consensus { loss: false }
+            .checker()
+            .threads(threads())
+            .spawn_dfs()
+            .join()
+            .assert_properties();
+    }
+
+    /// The same, with a member losing its disk and recovering its promise from the group.
+    #[test]
+    fn a_wiped_member_rejoins_without_forgetting_a_promise() {
+        Consensus { loss: true }
+            .checker()
+            .threads(threads())
+            .spawn_dfs()
+            .join()
+            .assert_properties();
+    }
+
+    /// The seal and the snapshot stream, given the control plane's cutover precondition.
+    #[test]
+    fn a_handover_carries_every_acknowledged_value() {
+        MoveModel
+            .checker()
+            .threads(threads())
+            .spawn_dfs()
+            .join()
+            .assert_properties();
     }
 }
