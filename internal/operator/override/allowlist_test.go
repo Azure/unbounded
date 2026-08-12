@@ -4,8 +4,13 @@
 package override
 
 import (
+	"slices"
+	"sort"
 	"strings"
 	"testing"
+
+	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 )
 
 // TestEveryStructuralPathDeclaresAShape stops pathShapes falling behind
@@ -127,4 +132,85 @@ func TestNoPermittedPathIsBuriedUnderASubtree(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestEveryReachableMergeKeyedListIsTypeChecked pins the invariant that keeps
+// the operator from panicking on a validated document.
+//
+// strategicpatch compares merge keys with Go's == operator
+// (findMapInSliceBasedOnKeyValue), which panics at runtime on an uncomparable
+// type, so a list element whose key holds a slice or a map crashes the merge.
+// mergeKeyTypes exists to reject that before the merge runs.
+//
+// TestMergeKeyTypesAreReachable checks the other direction, that every entry in
+// the table is reachable. That one catches a stale entry. This one catches the
+// dangerous case: a merge-keyed list a patch can reach with no entry in the
+// table at all. Adding spec.template.spec.hostAliases or volumeDevices to the
+// allowlist would reintroduce the panic, and nothing else would notice.
+func TestEveryReachableMergeKeyedListIsTypeChecked(t *testing.T) {
+	for _, target := range []any{&appsv1.Deployment{}, &appsv1.DaemonSet{}} {
+		schema, err := strategicpatch.NewPatchMetaFromStruct(target)
+		if err != nil {
+			t.Fatalf("load patch schema: %v", err)
+		}
+
+		walkMergeKeyedLists(t, schema, compiledAllowlist.root, "")
+	}
+}
+
+// walkMergeKeyedLists descends the strategic-merge schema alongside the
+// allowlist, visiting only what a patch can actually reach.
+func walkMergeKeyedLists(t *testing.T, schema strategicpatch.LookupPatchMeta, node *pathNode, path string) {
+	t.Helper()
+
+	if node == nil || path != "" && strings.Count(path, ".") > 12 {
+		return
+	}
+
+	for _, name := range childNames(node) {
+		child := node.lookup(name)
+		childPath := joinPath(path, name)
+
+		fieldSchema, meta, err := schema.LookupPatchMetadataForStruct(name)
+		if err != nil {
+			// Not a struct field: a map key such as a label name, or a
+			// wildcard standing for a list index. Neither is a merge-keyed
+			// list of its own.
+			continue
+		}
+
+		if slices.Contains(meta.GetPatchStrategies(), "merge") {
+			if _, checked := mergeKeyTypes[childPath]; !checked {
+				t.Errorf("%s is a merge-keyed list (key %q) that a patch can reach, but mergeKeyTypes has no entry for it; "+
+					"strategicpatch compares that key with == and panics on an uncomparable value",
+					childPath, meta.GetPatchMergeKey())
+			}
+		}
+
+		// Descend through the list-element wildcard when there is one, so
+		// containers.*.env is reached as the allowlist writes it.
+		elementSchema, _, elementErr := schema.LookupPatchMetadataForSlice(name)
+		if elementErr == nil && child.lookup(wildcard) != nil {
+			walkMergeKeyedLists(t, elementSchema, child.lookup(wildcard), joinPath(childPath, wildcard))
+
+			continue
+		}
+
+		walkMergeKeyedLists(t, fieldSchema, child, childPath)
+	}
+}
+
+// childNames returns a node's children in a stable order, expanding a subtree
+// into the schema fields below it so fail-open subtrees are still walked.
+func childNames(node *pathNode) []string {
+	names := make([]string, 0, len(node.children))
+	for name := range node.children {
+		if name != wildcard {
+			names = append(names, name)
+		}
+	}
+
+	sort.Strings(names)
+
+	return names
 }
