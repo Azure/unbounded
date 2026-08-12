@@ -1,0 +1,256 @@
+# racer - the node DaemonSet.
+#
+# One pod per node, three containers, and the whole design of the control
+# plane is visible in how they are wired together:
+#
+#   racer          The dataplane. It reads exactly one file, is handed no
+#                  cluster credentials, and knows nothing about Kubernetes,
+#                  NVMe-oF or its own topology.
+#   racer-ctrl     The control plane for this node. It writes that one file
+#                  and nothing else on the host except the nvmet configfs
+#                  tree, and it serves the CSI Identity and Node services.
+#   registrar      The stock kubelet plugin registrar.
+#
+# The config file lives in an emptyDir shared by racer-ctrl and racer.
+# racer-ctrl installs it by rename(2) into that directory and racer watches
+# the directory, so racer never observes a partial write. An emptyDir and not
+# a hostPath: the config is a pure function of cluster state plus this node's
+# own device bindings, so there is nothing in it worth surviving the pod, and
+# a stale file left on the host after an uninstall would be a config racer
+# would happily serve on the next install.
+#
+# Order matters on startup. racer-ctrl publishes generation 1 as soon as its
+# informers sync; racer refuses to start without a config file. So racer's
+# command waits for the file to appear rather than crash-looping, which keeps
+# the restart count meaningful.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: racer
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: racer
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: racer
+      app.kubernetes.io/component: node
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One node at a time. Rolling a racer pod tears down every ublk device
+      # on that node, and the group replication protocol needs the other two
+      # members of each trio up to keep serving.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: racer
+        app.kubernetes.io/component: node
+    spec:
+      serviceAccountName: racer-ctrl
+      # The kubelet must be able to reach the plugin socket and the driver
+      # must be able to create device nodes, so this pod is host-scoped in
+      # every dimension that matters. hostNetwork is on because the NVMe-oF
+      # target binds a host address that peers dial directly.
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      # racer is storage for whatever runs on the node, so it has to be able
+      # to run wherever the node lets anything run.
+      tolerations:
+        - operator: Exists
+      # Only nodes that opt in. A node without the label has no racer
+      # identity annotations either, so a pod scheduled there would sit in a
+      # loop reporting that the operator has not assigned it an id.
+      nodeSelector:
+        racer.unbounded-cloud.io/enabled: "true"
+      initContainers:
+        # R9: verify the host can actually run racer before anything tries.
+        # Failing here is a clear, one-line CrashLoopBackOff on a container
+        # named "preflight" rather than an obscure ublk ioctl error inside the
+        # dataplane twenty seconds later.
+        - name: preflight
+          image: {{ .Image }}
+          imagePullPolicy: IfNotPresent
+          args: ["preflight"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RACER_STORE
+              value: /var/lib/racer/store.img
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+            - name: store
+              mountPath: /var/lib/racer
+            - name: sys
+              mountPath: /sys
+            - name: configfs
+              mountPath: /sys/kernel/config
+      containers:
+        - name: racer-ctrl
+          image: {{ .Image }}
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The address peers dial to reach this node's NVMe-oF target.
+            # hostNetwork means status.hostIP is the address racer-ctrl binds.
+            - name: RACER_FABRIC_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: RACER_CONFIG_DIR
+              value: /etc/racer
+            - name: RACER_STORE
+              value: /var/lib/racer/store.img
+            - name: RACER_METRICS_URL
+              value: http://127.0.0.1:9090/metrics
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            # Preflight already ran as an init container; running it again
+            # here would only duplicate the failure.
+            - name: RACER_SKIP_PREFLIGHT
+              value: "true"
+          securityContext:
+            # nvmet lives in configfs and attaching a remote namespace goes
+            # through /dev/nvme-fabrics; both need real root on the host.
+            privileged: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/racer
+            - name: dev
+              mountPath: /dev
+            - name: store
+              mountPath: /var/lib/racer
+            - name: sys
+              mountPath: /sys
+            - name: configfs
+              mountPath: /sys/kernel/config
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet/pods
+              # Bidirectional: NodePublishVolume bind-mounts the block device
+              # into the pod's volume directory, and that mount has to be
+              # visible to the kubelet's namespace, not just this container's.
+              mountPropagation: Bidirectional
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+        - name: racer
+          image: {{ .RacerImage }}
+          imagePullPolicy: IfNotPresent
+          # racer refuses to start without a config, and racer-ctrl needs its
+          # informers to sync before it can write one. Waiting is not a
+          # workaround for a race: it is the correct behaviour, because a
+          # config written before the cache is warm would be a config that
+          # omits half the cluster.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              while [ ! -s /etc/racer/racer.binpb ]; do
+                echo "waiting for racer-ctrl to publish /etc/racer/racer.binpb"
+                sleep 2
+              done
+              exec racer serve /etc/racer/racer.binpb
+          env:
+            - name: RACER_STORE
+              value: /var/lib/racer/store.img
+            # Loopback only. The metrics endpoint is unauthenticated plaintext
+            # and serves one connection at a time, so it is the node's own
+            # business and nobody else's; racer-ctrl scrapes it over the pod's
+            # loopback.
+            - name: METRICS_ADDR
+              value: 127.0.0.1:9090
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/racer
+              readOnly: true
+            - name: dev
+              mountPath: /dev
+            - name: store
+              mountPath: /var/lib/racer
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+        - name: registrar
+          image: {{ .RegistrarImage }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/racer.unbounded-cloud.io/csi.sock
+            - --v=2
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        # The config channel. Shared by racer-ctrl (writer) and racer
+        # (reader); deliberately not a hostPath, see the header comment.
+        - name: config
+          emptyDir: {}
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        # nvmet's control plane. racer-ctrl creates one subsystem per
+        # (universe, node) here and links the exporting node's fabric ublk
+        # device into it as namespace 1.
+        - name: configfs
+          hostPath:
+            path: /sys/kernel/config
+            type: Directory
+        # The backing store. This is the only racer state that survives the
+        # pod, and it is cold: Store.size_bytes changes take effect on the
+        # next process start, never in place.
+        - name: store
+          hostPath:
+            path: /var/lib/racer
+            type: DirectoryOrCreate
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/racer.unbounded-cloud.io
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory

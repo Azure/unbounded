@@ -28,6 +28,7 @@ func init() {
 // +kubebuilder:printcolumn:name="Metalman",type=boolean,JSONPath=".spec.components.metalman.enabled",priority=1
 // +kubebuilder:printcolumn:name="Storage",type=boolean,JSONPath=".spec.components.storage.enabled",priority=1
 // +kubebuilder:printcolumn:name="Gantry",type=boolean,JSONPath=".spec.components.gantry.enabled",priority=1
+// +kubebuilder:printcolumn:name="Racer",type=boolean,JSONPath=".spec.components.racer.enabled",priority=1
 // +kubebuilder:printcolumn:name="Nodes",type=integer,JSONPath=".status.nodeCount"
 // +kubebuilder:printcolumn:name="Slices",type=integer,JSONPath=".status.sliceCount"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
@@ -136,6 +137,13 @@ type SiteComponents struct {
 	// +optional
 	// +kubebuilder:default={enabled: true}
 	Gantry *GantryComponentSpec `json:"gantry,omitempty"`
+
+	// Racer configures the racer distributed block device for this site. Racer
+	// defaults to disabled: it exports block devices and claims a store file on
+	// every node enrolled with the racer.unbounded-cloud.io/enabled label, which
+	// is not something to switch on by omission.
+	// +optional
+	Racer *RacerComponentSpec `json:"racer,omitempty"`
 }
 
 // SiteComponentSpec contains common component configuration. Components install
@@ -180,6 +188,13 @@ type StorageComponentSpec struct {
 // components, defaults to enabled: it is reconciled unless a site explicitly
 // sets enabled to false.
 type GantryComponentSpec struct {
+	SiteComponentSpec `json:",inline"`
+}
+
+// RacerComponentSpec configures racer for a site. Racer holds data, so the
+// operator never uninstalls it automatically: disabling it stops reconciliation
+// but leaves the node agents and their stores in place.
+type RacerComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
 }
 

@@ -27,8 +27,8 @@ automatically. An existing valid layout is left untouched, and invalid nonblank
 superblocks are rejected rather than overwritten.
 
 `racer-bench` contains a checksum/copy benchmark and an end-to-end load driver.
-The configuration schema is `proto/config.proto`; `build.rs` generates Prost
-types, requiring `protoc` at build time.
+The configuration schema is `api/racer/config.proto`, shared verbatim with the Go
+control plane; `build.rs` generates Prost types, requiring `protoc` at build time.
 
 The checked configuration describes:
 

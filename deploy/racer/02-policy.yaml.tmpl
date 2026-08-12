@@ -1,0 +1,151 @@
+# Admission policies that enforce the two invariants racer cannot enforce
+# itself: that an allocated volume is immutable, and that a ublk block device
+# never reaches a pod that was not granted it.
+#
+# Both are ValidatingAdmissionPolicies rather than a webhook because neither
+# needs to see anything outside the request, and a webhook would put a
+# failure-prone network hop in front of every pod creation in the cluster.
+---
+# An extent's identity is its (base_lba, pages, kind) triple inside a
+# universe's address space, and the dataplane's own validator refuses to load
+# a config that changes any of the three for an extent it already knows. The
+# operator allocates that triple once, at first sight of the PersistentVolume,
+# and records it in the composition annotation.
+#
+# Everything downstream reads composition, so editing it after the fact does
+# not move data - it makes some node believe the data is somewhere it is not.
+# The most likely way for that to happen is well-intentioned: a user edits
+# capacity or mutableBytes on a bound PV expecting a resize. This policy turns
+# that into a rejected update instead of a silently corrupt volume.
+#
+# The geometry attributes are frozen for the same reason one step earlier:
+# composition is derived from them, so an edit that survived here would be
+# reconciled into a composition change on the next allocation pass.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-volume-immutability
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["persistentvolumes"]
+  # Only racer volumes. A PV with no csi block, or one belonging to another
+  # driver, is none of this policy's business.
+  matchConditions:
+    - name: is-racer-volume
+      expression: >-
+        has(oldObject.spec.csi) &&
+        oldObject.spec.csi.driver == 'racer.unbounded-cloud.io'
+  validations:
+    - expression: >-
+        has(object.spec.csi) &&
+        object.spec.csi.driver == oldObject.spec.csi.driver
+      message: "the CSI driver of a bound racer volume cannot be changed"
+      reason: Forbidden
+    - expression: >-
+        (has(object.spec.csi.volumeAttributes) ? object.spec.csi.volumeAttributes : {}) ==
+        (has(oldObject.spec.csi.volumeAttributes) ? oldObject.spec.csi.volumeAttributes : {})
+      message: >-
+        racer volume geometry (mutableBytes, mutableKind, immutablePageSize)
+        is frozen once the volume is created; extent base_lba, pages and kind
+        cannot move, so there is no resize. Create a new volume instead.
+      reason: Forbidden
+    - expression: >-
+        object.spec.capacity == oldObject.spec.capacity
+      message: >-
+        racer volume capacity is frozen once the volume is created; the
+        immutable tail extends to the end of the device and its extent size is
+        part of the universe address space.
+      reason: Forbidden
+    - expression: >-
+        !has(oldObject.metadata.annotations) ||
+        !('racer.unbounded-cloud.io/composition' in oldObject.metadata.annotations) ||
+        (has(object.metadata.annotations) &&
+         'racer.unbounded-cloud.io/composition' in object.metadata.annotations &&
+         object.metadata.annotations['racer.unbounded-cloud.io/composition'] ==
+           oldObject.metadata.annotations['racer.unbounded-cloud.io/composition'])
+      message: >-
+        the racer.unbounded-cloud.io/composition annotation records an extent
+        allocation that has already been handed to the dataplane; it is
+        stamped once by unbounded-operator and is not editable.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-volume-immutability
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  policyName: racer-volume-immutability
+  validationActions: ["Deny"]
+---
+# racer exports each volume as a ublk block device, /dev/ublkb<minor>, and the
+# only thing standing between a pod and every page in a universe is that the
+# device node is not in the pod's /dev. The CSI driver hands out exactly one
+# device per volume, bind-mounted at the volume's target path.
+#
+# A pod that hostPath-mounts /dev bypasses all of that: it gets every racer
+# device on the node, including volumes belonging to other namespaces, plus
+# /dev/ublk-control, which is enough to create and destroy devices. This
+# policy denies that mount outside the namespace racer itself runs in.
+#
+# Be clear about what this does NOT do. A pod with `privileged: true` gets a
+# full /dev regardless of its volume list, and this policy does not look at
+# securityContext, because denying privileged pods cluster-wide is a policy
+# decision that belongs to whoever runs the cluster, not to a storage driver.
+# If you run untrusted workloads, pair this with a Pod Security Admission
+# `restricted` or `baseline` label on their namespaces, which is what actually
+# forbids privileged. This policy closes the specific hole that PSA does not:
+# a `baseline` pod may still hostPath-mount whatever it likes.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-device-isolation
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+    # racer-ctrl and its racer sidecar need exactly the mount this policy
+    # denies, so the namespace they run in is excluded. Nothing else should be
+    # deployed there.
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [{{ default "unbounded-system" .Namespace | quote }}]
+  validations:
+    - expression: >-
+        !object.spec.volumes.exists(v,
+          has(v.hostPath) && (
+            v.hostPath.path == '/dev' ||
+            v.hostPath.path.startsWith('/dev/ublk')
+          ))
+      message: >-
+        hostPath mounts of /dev or /dev/ublk* are denied: they expose every
+        racer block device on the node, and every page of every universe those
+        devices belong to, to this pod. Request a racer volume through a
+        PersistentVolumeClaim instead.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-device-isolation
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  policyName: racer-device-isolation
+  validationActions: ["Deny"]

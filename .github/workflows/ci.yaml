@@ -228,7 +228,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             cmd/racer/target
-          key: cargo-racer-${{ runner.os }}-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/Cargo.toml', 'cmd/racer/build.rs', 'cmd/racer/proto/config.proto') }}
+          key: cargo-racer-${{ runner.os }}-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/Cargo.toml', 'cmd/racer/build.rs', 'api/racer/config.proto') }}
           restore-keys: |
             cargo-racer-${{ runner.os }}-
 
