@@ -1277,19 +1277,6 @@ pub(crate) mod sim {
             work += self.w.maintenance(now);
             work
         }
-
-        /// Requests still in the slab. The simulator's quiescence test.
-        pub(crate) fn live(&self) -> usize {
-            self.w.exec.live_count()
-        }
-
-        pub(crate) fn pending_hops(&self) -> usize {
-            self.l.hops.borrow().live() + self.l.hop_out.borrow().len() + self.l.ready.len()
-        }
-
-        pub(crate) fn inflight(&self) -> u32 {
-            self.l.ops.inflight()
-        }
     }
 
     /// One node's workers, and the hop fabric that joins them.
