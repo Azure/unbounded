@@ -774,3 +774,88 @@ func TestApplyPreservesPodAntiAffinity(t *testing.T) {
 	}
 }
 
+// TestApplyRejectsTwoContributorsAppendingToOneContainer pins that extraArgs
+// does not resolve disagreement by ConfigMap key ordering.
+//
+// Unlike a patch leaf, extraArgs concatenates, so two contributors do not
+// overwrite one another: both lists land, ordered by sorted ConfigMap key. Two
+// teams appending --log-level=debug and --log-level=warn both got their way,
+// and which one the component honoured was decided by its own flag parsing.
+// That is exactly the silent precedence the deterministic ordering exists to
+// avoid rather than to provide.
+func TestApplyRejectsTwoContributorsAppendingToOneContainer(t *testing.T) {
+	args := func(value string) string {
+		return `apiVersion: ` + APIVersion + `
+overrides:
+  - component: storage
+    kind: DaemonSet
+    extraArgs:
+      run: ["--log-level=` + value + `"]
+`
+	}
+
+	t.Run("differing arguments conflict", func(t *testing.T) {
+		plan := multiSitePlan("rack-a")
+
+		entries, err := parseAll(map[string]string{"a.yaml": args("debug"), "b.yaml": args("warn")})
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		report := Apply(plan, entries, []string{"rack-a"})
+		if !report.Failed() {
+			t.Fatal("two contributors appending to one container must conflict")
+		}
+
+		if !strings.Contains(report.Err().Error(), "both append extraArgs to container") {
+			t.Fatalf("error = %v", report.Err())
+		}
+	})
+
+	// Identical lists conflict too, which is where this differs from the
+	// identical-values rule for patch leaves. Setting one value twice is the
+	// same as setting it once; appending the same argument twice is not.
+	t.Run("identical arguments also conflict", func(t *testing.T) {
+		plan := multiSitePlan("rack-a")
+
+		entries, err := parseAll(map[string]string{"a.yaml": args("debug"), "b.yaml": args("debug")})
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if report := Apply(plan, entries, []string{"rack-a"}); !report.Failed() {
+			t.Fatal("appending the same argument twice is not idempotent and must conflict")
+		}
+	})
+
+	// The rule is per container, not per workload: splitting arguments across
+	// keys by container is exactly the ownership split the format exists for.
+	t.Run("different containers compose", func(t *testing.T) {
+		plan := multiSitePlan("rack-a")
+
+		sidecar := `apiVersion: ` + APIVersion + `
+overrides:
+  - component: storage
+    kind: DaemonSet
+    addContainers: [log-shipper]
+    extraArgs:
+      log-shipper: ["--verbose"]
+    patch:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: log-shipper
+                image: fluent/fluent-bit:3.1
+`
+
+		entries, err := parseAll(map[string]string{"a.yaml": args("debug"), "b.yaml": sidecar})
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if report := Apply(plan, entries, []string{"rack-a"}); report.Failed() {
+			t.Fatalf("entries targeting different containers must compose: %v", report.Err())
+		}
+	})
+}

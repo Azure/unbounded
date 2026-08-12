@@ -71,6 +71,57 @@ func checkConflicts(contributors []SourcedEntry) []error {
 
 	problems = append(problems, patchConflicts(contributors)...)
 	problems = append(problems, addContainerConflicts(contributors)...)
+	problems = append(problems, extraArgsConflicts(contributors)...)
+
+	return problems
+}
+
+// extraArgsConflicts rejects two contributors appending arguments to the same
+// container.
+//
+// Unlike a patch leaf, extraArgs concatenates, so two contributors do not
+// overwrite one another: both lists land, in sorted ConfigMap key order. That
+// makes the outcome depend on what the keys happen to be called, which is
+// exactly the silent precedence the deterministic ordering exists to avoid
+// rather than to provide. Two teams appending --log-level=debug and
+// --log-level=warn both get their way, and which one the component honours is
+// decided by its own flag parsing.
+//
+// Identical lists are rejected too, which is where this differs from the
+// identical-values rule for patch leaves. Setting one value twice is the same
+// as setting it once; appending the same argument twice is not.
+func extraArgsConflicts(contributors []SourcedEntry) []error {
+	type claimant struct {
+		source Source
+	}
+
+	claimed := map[string]claimant{}
+
+	var problems []error
+
+	for _, contributor := range contributors {
+		names := make([]string, 0, len(contributor.Entry.ExtraArgs))
+		for name := range contributor.Entry.ExtraArgs {
+			names = append(names, name)
+		}
+
+		sort.Strings(names)
+
+		for _, name := range names {
+			existing, seen := claimed[name]
+			if !seen {
+				claimed[name] = claimant{source: contributor.Source}
+
+				continue
+			}
+
+			problems = append(problems, fmt.Errorf(
+				"%s and %s both append extraArgs to container %q; arguments concatenate rather than "+
+					"overwrite, so the result would depend on ConfigMap key ordering. "+
+					"Put every argument for one container in one entry",
+				existing.source, contributor.Source, name))
+		}
+	}
 
 	return problems
 }
