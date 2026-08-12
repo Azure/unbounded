@@ -14,12 +14,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 func TestConfigImage(t *testing.T) {
@@ -568,5 +570,96 @@ func TestIsRBACObject(t *testing.T) {
 		if got := IsRBACObject(tc.obj, "metalman"); got != tc.want {
 			t.Fatalf("IsRBACObject(%s/%s) = %v, want %v", tc.obj.GetKind(), tc.obj.GetName(), got, tc.want)
 		}
+	}
+}
+
+// TestWorkloadPredicateFiresOnOperatorMetadataDrift is a regression test.
+//
+// Kubernetes increments generation for spec changes only, so removing the
+// override hash annotation, or editing a label the operator set, produced no
+// event and therefore no pass. Server-side apply would have repaired it, but
+// nothing was going to ask the operator to look, so a Site could report Applied
+// indefinitely for an object carrying no sign of an override.
+func TestWorkloadPredicateFiresOnOperatorMetadataDrift(t *testing.T) {
+	env := &Env{Namespace: DefaultNamespace}
+	predicate := env.ManagedWorkloadPredicate(func(client.Object) bool { return true })
+
+	withAnnotations := func(generation int64, annotations map[string]string) *appsv1.DaemonSet {
+		return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+			Namespace:   DefaultNamespace,
+			Name:        "agent",
+			Generation:  generation,
+			Annotations: annotations,
+		}}
+	}
+
+	hash := map[string]string{unbounded.ReservedPrefix + "override-hash": "h1"}
+
+	cases := map[string]struct {
+		old, updated *appsv1.DaemonSet
+		want         bool
+	}{
+		"override hash removed": {
+			old:     withAnnotations(1, hash),
+			updated: withAnnotations(1, nil),
+			want:    true,
+		},
+		"override hash changed": {
+			old:     withAnnotations(1, hash),
+			updated: withAnnotations(1, map[string]string{unbounded.ReservedPrefix + "override-hash": "h2"}),
+			want:    true,
+		},
+		"override hash added": {
+			old:     withAnnotations(1, nil),
+			updated: withAnnotations(1, hash),
+			want:    true,
+		},
+		"spec changed": {
+			old:     withAnnotations(1, hash),
+			updated: withAnnotations(2, hash),
+			want:    true,
+		},
+		// The Deployment controller writes this on every rollout, and kubectl
+		// writes its own. Firing on them would be the churn the predicate
+		// exists to suppress.
+		"unrelated annotation churn": {
+			old: withAnnotations(1, hash),
+			updated: withAnnotations(1, map[string]string{
+				unbounded.ReservedPrefix + "override-hash": "h1",
+				"deployment.kubernetes.io/revision":        "7",
+			}),
+			want: false,
+		},
+		"nothing changed": {
+			old:     withAnnotations(1, hash),
+			updated: withAnnotations(1, hash),
+			want:    false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := predicate.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.updated})
+			if got != tc.want {
+				t.Fatalf("predicate fired = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOwnedWorkloadPredicateSharesTheSameRule confirms the per-Site components,
+// which use Owns() rather than a named watch, get the same drift detection.
+func TestOwnedWorkloadPredicateSharesTheSameRule(t *testing.T) {
+	env := &Env{Namespace: DefaultNamespace}
+	predicate := env.OwnedWorkloadPredicate()
+
+	older := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+		Generation:  1,
+		Annotations: map[string]string{unbounded.ReservedPrefix + "override-hash": "h1"},
+	}}
+	newer := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+
+	if !predicate.Update(event.UpdateEvent{ObjectOld: older, ObjectNew: newer}) {
+		t.Fatal("an owned workload losing its override hash must trigger a pass")
 	}
 }

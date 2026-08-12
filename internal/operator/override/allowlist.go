@@ -6,12 +6,17 @@ package override
 import (
 	"sort"
 	"strings"
+
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 // ReservedPrefix marks labels and annotations the operator owns. They carry
 // config hashes, Site scoping and override visibility, so a patch that wrote
 // them could hide the fact that an override is in effect.
-const ReservedPrefix = "unbounded-cloud.io/"
+//
+// The definition lives in internal/unbounded so the workload watch predicates
+// can share it without an import cycle.
+const ReservedPrefix = unbounded.ReservedPrefix
 
 // wildcard matches any single path element: a list index, or an arbitrary
 // user-chosen map key such as a label name.
