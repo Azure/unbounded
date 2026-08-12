@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use crate::config::{self, GroupId, Kind};
 use crate::heal::{self, Digests, Groups, Snaps, Tuple};
 use crate::layout::{Class, Entry, Header, State};
-use crate::paxos::{Ballot, Register};
+use crate::paxos::{self, Ballot, Register};
 use crate::runtime::Errno;
 
 /// Local mblocks the tombstone sweep examines per `tick`, per class.
@@ -713,12 +713,9 @@ impl Shard {
                 Kind::Immutable => 3 * epoch,
             },
         };
-        // An acceptor refuses only a guard it is already past: that is the collision.
-        // Sitting behind the guard is a gap this accept closes, letting a node that
-        // missed a round rejoin without waiting for the sweep. At the guard itself the
-        // ballot may not regress, so a stale retry cannot overwrite a newer value at the
-        // same version.
-        if current > g || (current == g && old.is_some_and(|e| ballot.raw() < e.ballot as u32)) {
+        // The protocol's own rule, shared with the model checker that proves it.
+        let held = old.map(|e| Ballot::from_raw(e.ballot as u32));
+        if !paxos::admits(current, held, g, ballot) {
             return Err(Status::Conflict { current });
         }
         let sl = self.slab(class);
@@ -726,10 +723,11 @@ impl Shard {
             return Err(Status::NoSpace);
         }
         let local = sl.free.pop().ok_or(Status::NoSpace)?;
+        let next = Register::accepted(g, ballot);
         Ok(Ticket {
             slot: sl.global_of(local),
-            version: g + 1,
-            ballot,
+            version: next.version,
+            ballot: next.ballot,
             prior: old.map(|e| (e.version, e.ballot)),
         })
     }
@@ -752,9 +750,8 @@ impl Shard {
         let equal_live = e.is_some_and(|x| {
             x.state == State::Live && x.version == r.version && x.ballot as u32 == r.ballot.raw()
         });
-        if held > (r.version, r.ballot.raw())
-            || (held == (r.version, r.ballot.raw()) && !(replace_equal && equal_live))
-        {
+        // The protocol's own rule, shared with the model checker that proves it.
+        if !paxos::supersedes(held, r, replace_equal && equal_live) {
             return Ok(None);
         }
         let sl = self.slab(class);
