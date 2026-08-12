@@ -1027,7 +1027,7 @@ outcomes are predictable rather than arbitrary:
 
 | Property | Behaviour |
 |---|---|
-| **Ordering** | Order is **inferred from the kind**, not declared: removals, then namespaces, schema (CRDs, priority and storage classes, webhooks), identity (ServiceAccounts and RBAC), config (ConfigMaps, Secrets, Services), custom resources, and workloads last. Declared `DependsOn` is honoured on top, for orderings that do not follow from the kinds involved. Within a tier the order is deterministic: component registry order, then the order that component emitted its operations. |
+| **Ordering** | Order is **inferred from the kind**, not declared. Writes ascend: namespaces, schema (CRDs, priority and storage classes), identity (ServiceAccounts and RBAC), config (ConfigMaps, Secrets, Services), custom resources, workloads, and **admission and API registration last**. Removals descend the same list, so a workload is deleted before the config it mounts. Declared `DependsOn` is honoured on top and can only push an operation later. Within a rank the order is deterministic: component registry order, then the order that component emitted its operations. |
 | **Continuation** | A failed operation does not abort the pass. Operations that do not depend on it still execute. Dependents are **skipped**, not attempted, so a failure does not cascade into a half-configured workload. |
 | **Gating** | Three things gate an operation, and only the first is declared: a failed `DependsOn`; a failed earlier operation on the same object; and a failed earlier tier **for the same component and Site**. The last is scoped deliberately, because skipping every workload in the cluster over one component's ConfigMap would turn a contained failure into an outage. A failed Namespace is the one exception and gates everything in it, whichever component planned it, since nothing can be written into a namespace that does not exist. |
 | **No rollback** | Completed operations are never undone. There is no compensating action, and none is attempted. |
@@ -1041,9 +1041,28 @@ correctness requirement on every component author in a place where getting it
 wrong is invisible. A DaemonSet applied before its ConfigMap exists **succeeds**;
 nothing fails and nothing is reported, and the symptom is a crash-looping pod
 that cannot mount, until some later pass happens to order the two the other way.
-The dependencies are a property of the Kubernetes object model rather than of
-any component, so inferring them makes the ordering correct by construction for
-every component, including ones that never consider it.
+
+An earlier revision of this section justified the tier list by saying the
+dependencies are a property of the Kubernetes object model, so inferring them is
+correct by construction. That was overstated, and the overstatement produced two
+defects.
+
+For namespaces, RBAC and config it holds. For **admission and aggregation
+registration it is inverted**: a `ValidatingWebhookConfiguration`, an admission
+policy and an `APIService` all point at a backend, so they must follow it rather
+than precede it. Treating webhook configurations as schema put them near the
+front and reversed the order the manifests had always used, leaving a window in
+which net's two `failurePolicy: Ignore` webhooks silently enforced nothing.
+`tierActivation` exists to say that out loud, and nothing follows it, so a
+failure there gates nothing while still being reported.
+
+**Removals are the same list read backwards**, which the first version did not
+express either: every removal shared one rank, so a failed workload delete did
+not stop the delete of the ConfigMap that workload was still mounting.
+
+The general lesson is recorded because it applies to the next tier added: a tier
+list encodes *dependency direction*, and direction is not always "more
+fundamental first". Anything that routes traffic to a backend inverts it.
 
 A pass that fails partway is a normal, recoverable state: the next reconcile
 recomputes the plan from current cluster state and re-executes it.
@@ -1119,6 +1138,9 @@ rollout, one log line, and a Site still reporting `Ready=True`.
 | `sites` naming a Site that does not exist | Nothing | Inert, reported ([§6.3](#63-resolution)) |
 | API or admission error during execution | That operation, its declared dependents, later operations on the same object, and that component's later tiers for that Site | Per [§9.2](#92-execution-semantics). A failed Namespace additionally gates every namespaced object in it. |
 | An object the plan expected to create already exists | That pass | The write succeeds, since an existing payload surviving is the point of `OpCreateIfAbsent`, but the object is refreshed from the cluster and the pass re-plans: everything computed from the earlier read is stale, including the config hash stamped on the workload that mounts it. |
+| A workload withheld because its overrides could not be used | That component and Site | The running workload is untouched, and the component reports `OverrideNotApplied` rather than the verdict it planned with. "Removed from the plan" and "never planned" are different, and only the first must stop a component claiming it reconciled. |
+| The executor refuses the plan outright (dependency cycle, contradictory shared operations) | The whole pass | Nothing is written, so every component reports `PlanRejected`. No planning verdict describes the cluster. |
+| An operation no component owns fails, such as the Namespace | The whole pass | Collected as a pass error, which requeues. Nothing publishing per-component conditions can report it, and a failed Namespace skips every namespaced operation, so without this the pass returned success having done nothing and no watch would have triggered another. |
 
 Preflight failures are snapshot-wide because a document that does not parse
 cannot be attributed to a component. Resolution and conflict failures are
@@ -1756,7 +1778,7 @@ a reader to discover:
 - Within-component operation order has to be preserved rather than sorted, or
   gantry's legacy cleanup and storage's ConfigMap-before-DaemonSet sequencing
   silently reorder. (Superseded in part: order is now inferred from the kind,
-  and emission order is preserved *within* a tier. See
+  and emission order is preserved *within* a rank. See
   [§9.2](#92-execution-semantics).)
 - The testing section assumed envtest, which does not exist in this repository.
   Coverage extends the existing kind harness instead ([§15](#15-testing)).
@@ -2109,6 +2131,38 @@ singleton request alone, since the singleton pass already reconciles every Site
 ([§10.3](#103-watch-and-fan-out)). `source.Channel` with explicit backpressure
 remains the fallback if Site counts grow past the low hundreds or the controller
 is parallelized.
+
+### Settled by the second review round
+
+A review of the implemented feature raised twenty-two further findings, all
+confirmed. They are recorded here by theme rather than individually, because the
+themes are the reusable part:
+
+- **A tier list encodes dependency direction, and the direction is not always
+  "more fundamental first".** Admission and aggregation registration inverts it.
+  See [§9.2](#92-execution-semantics).
+- **Nothing pinned execution order.** `Summary` renders emission order and the
+  executor sorts a copy, so ordering was changed twice with every test passing.
+  `Plan.ExecutionOrder` now has a golden per component
+  ([§15](#15-testing)).
+- **Work that never ran still has to be reported.** Withheld workloads, rejected
+  plans and failures owned by no component were all silently absent from the
+  status path ([§9.5](#95-failure-scope)).
+- **Legal input can be unbounded work.** yaml.v3's duplicate-key check is
+  quadratic and on by default, so a 1 MiB document cost seconds of the single
+  reconcile worker. The earlier claim that the API server's ConfigMap limit made
+  a size cap unnecessary assumed linear parsing
+  ([§6.2](#62-parsing-rules)).
+- **A gate written as equality against a desired count treats zero as
+  satisfied.** `replicas: 0` made the migration gates report a controller
+  running no pods as healthy, and the reaper then deleted the working legacy
+  one.
+- **Validation must reject what cannot work, not only what is malformed.**
+  Component and kind were checked separately, so seven of the ten pairs accepted
+  could never match anything ([§8.1](#81-permitted)).
+- **An override can only add, never remove**, so any pair of mutually exclusive
+  Kubernetes fields is unreachable rather than merely awkward
+  ([§8.1](#81-permitted)).
 
 ### Genuinely open
 
