@@ -261,6 +261,10 @@ pub(crate) struct Universe {
     /// This universe's topology epoch: the term a shard is sealed with, and it rides the
     /// trailer of every routed write (paxos.rs).
     pub(crate) epoch: u32,
+    /// The ublk minor this universe's fabric namespace is exported as, so peers find it at
+    /// `/dev/ublkb<id>` without being told. Non-zero, distinct from every other export this
+    /// node makes, and frozen for the life of the universe: the path is in peer configs.
+    pub(crate) fabric_device_id: u32,
     /// Index is the group index; each entry is three distinct node ids in paxos member
     /// order, which is also the cohort column. Balanced: every node named holds the same
     /// number of groups.
@@ -651,13 +655,7 @@ impl Config {
         self.check_node()?;
         self.check_universes()?;
         self.check_devices()?;
-        if self.universes.len() + self.devices.len() > MAX_EXPORTS {
-            return Err(bad(format!(
-                "{} universes plus {} devices is more than the {MAX_EXPORTS} this node can export",
-                self.universes.len(),
-                self.devices.len()
-            )));
-        }
+        self.check_exports()?;
         if self.index.len() > MAX_EXTENTS {
             return Err(bad(format!(
                 "{} extents, more than the {MAX_EXTENTS} this node can hold",
@@ -941,6 +939,42 @@ impl Config {
         Ok(())
     }
 
+    /// The minors this node asks the kernel for. Every universe exports its fabric
+    /// namespace and every device exports itself, each as the ublk device named by the id
+    /// given here, so the paths follow from the config alone. Two exports asking for one
+    /// minor is caught now rather than half way through attaching.
+    fn check_exports(&self) -> io::Result<()> {
+        let mut ids: Vec<(u32, String)> =
+            Vec::with_capacity(self.universes.len() + self.devices.len());
+        for u in &self.universes {
+            if u.fabric_device_id == 0 {
+                return Err(bad(format!(
+                    "universe {} names no device for its fabric namespace",
+                    u.id
+                )));
+            }
+            ids.push((u.fabric_device_id, format!("universe {} fabric", u.id)));
+        }
+        for d in &self.devices {
+            ids.push((d.id, format!("device {}", d.id)));
+        }
+        ids.sort();
+        if let Some(w) = ids.windows(2).find(|w| w[0].0 == w[1].0) {
+            return Err(bad(format!(
+                "{} and {} both ask to be device {}",
+                w[0].1, w[1].1, w[0].0
+            )));
+        }
+        if ids.len() > MAX_EXPORTS {
+            return Err(bad(format!(
+                "{} universes plus {} devices is more than the {MAX_EXPORTS} this node can export",
+                self.universes.len(),
+                self.devices.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// The checks that need the configuration this one replaces. Everything frozen here
     /// is frozen because the dataplane has already built something around it.
     fn validate_against(&self, prev: &Config) -> io::Result<()> {
@@ -966,6 +1000,14 @@ impl Config {
                     u.id,
                     pu.catalog.len(),
                     u.catalog.len()
+                )));
+            }
+            // The fabric namespace is already exported at this minor and peers hold the
+            // path, so moving it would strand every link into this universe.
+            if u.fabric_device_id != pu.fabric_device_id {
+                return Err(bad(format!(
+                    "universe {} moves its fabric from device {} to {}",
+                    u.id, pu.fabric_device_id, u.fabric_device_id
                 )));
             }
             // Only across one generation: a node that missed a push cannot tell how many
@@ -1090,6 +1132,7 @@ impl Config {
             universes.push(Universe {
                 id: u.id,
                 epoch: u.epoch,
+                fabric_device_id: u.fabric_device_id,
                 catalog: u.catalog.iter().map(trio).collect(),
                 zones: u
                     .zones
@@ -1200,6 +1243,7 @@ impl Config {
                 .map(|u| pb::Universe {
                     id: u.id,
                     epoch: u.epoch,
+                    fabric_device_id: u.fabric_device_id,
                     catalog: u.catalog.iter().map(pb_trio).collect(),
                     zones: u
                         .zones
@@ -1257,7 +1301,7 @@ impl Config {
     /// ```text
     /// generation 7
     /// node id=1 zone=1 cohort=0 store=/var/lib/racer/store.img size=68719476736
-    /// universe 1 epoch=3
+    /// universe 1 epoch=3 fabric_device_id=9
     ///   peer id=2 device=/dev/nvme1n1
     ///   group 1 2 3
     ///   zone id=2 gateways=4,5,6
@@ -1301,10 +1345,11 @@ impl Config {
                     });
                 }
                 "universe" => {
-                    let f = only(&f, &["epoch"]).map_err(at)?;
+                    let f = only(&f, &["epoch", "fabric_device_id"]).map_err(at)?;
                     p.universes.push(pb::Universe {
                         id: num(rest, 0).map_err(at)? as u32,
                         epoch: get_or(f, "epoch", 0).map_err(at)? as u32,
+                        fabric_device_id: get_or(f, "fabric_device_id", 0).map_err(at)? as u32,
                         ..Default::default()
                     });
                 }
@@ -1740,7 +1785,7 @@ mod tests {
 generation 7
 node id=1 zone=1 cohort=0 store=/var/lib/racer/store.img size=68719476736
 
-universe 1 epoch=3
+universe 1 epoch=3 fabric_device_id=9
   peer id=2 device=/dev/nvme1n1
   peer id=7 device=/dev/nvme3n1
   group 1 2 3
@@ -1845,6 +1890,82 @@ device 2 extents=12
         assert!(format!("{e}").contains("unknown extent"), "{e}");
     }
 
+    /// Every export is a ublk device the node asks the kernel for by minor, so the fabric
+    /// namespace needs one as much as a local device does.
+    #[test]
+    fn a_universe_names_the_device_its_fabric_is_exported_as() {
+        let c = sample();
+        assert_eq!(c.universes[0].fabric_device_id, 9);
+
+        let mut c = sample();
+        c.universes[0].fabric_device_id = 0;
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e}").contains("no device"), "{e}");
+    }
+
+    /// Minors are unique per node, whoever is asking: two fabrics, or a fabric and a local
+    /// device, wanting one is a config the kernel would only refuse half way through.
+    #[test]
+    fn two_exports_may_not_ask_for_one_device() {
+        let mut text = SAMPLE.to_string();
+        text.push_str(
+            "universe 2 epoch=1 fabric_device_id=9
+  group 1 2 3
+  extent id=20 base=0 pages=8 kind=lww zone=1
+",
+        );
+        let e = Config::parse(&text).unwrap().validate().unwrap_err();
+        assert!(
+            format!("{e}").contains("universe 1 fabric and universe 2 fabric"),
+            "{e}"
+        );
+
+        let mut c = sample();
+        c.universes[0].fabric_device_id = 2;
+        let e = c.validate().unwrap_err();
+        assert!(
+            format!("{e}").contains("device 2 and universe 1 fabric"),
+            "{e}"
+        );
+    }
+
+    /// Peers hold the path of our fabric device, so where it is exported is frozen for as
+    /// long as the universe is here.
+    #[test]
+    fn a_fabric_device_does_not_move() {
+        let b = sample();
+        let mut c = sample();
+        c.generation = 8;
+        c.universes[0].fabric_device_id = 30;
+        let e = c.validate_against(&b).unwrap_err();
+        assert!(format!("{e}").contains("moves its fabric"), "{e}");
+
+        // A universe that is gone takes its fabric with it, and a new one may have any.
+        let mut c = sample();
+        c.generation = 8;
+        c.universes.clear();
+        c.validate_against(&b).unwrap();
+    }
+
+    /// Fabric devices come out of the same budget as local ones: both are ublk devices.
+    #[test]
+    fn exports_are_counted_together() {
+        let mut c = sample();
+        let one = c.devices[0].clone();
+        for id in 100..100 + (MAX_EXPORTS as u32 - 3) {
+            c.devices.push(Device { id, ..one.clone() });
+        }
+        c.devices.sort_by_key(|d| d.id);
+        c.validate().unwrap();
+
+        c.devices.push(Device {
+            id: 1000,
+            ..one.clone()
+        });
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e}").contains("more than the 256"), "{e}");
+    }
+
     /// Extents share one flat space per universe, so overlap is a fatal placement mistake.
     #[test]
     fn extents_may_not_overlap() {
@@ -1859,7 +1980,7 @@ device 2 extents=12
     #[test]
     fn an_extent_id_names_one_extent() {
         let mut text = SAMPLE.to_string();
-        text.push_str("universe 2 epoch=1\n  group 1 2 3\n");
+        text.push_str("universe 2 epoch=1 fabric_device_id=10\n  group 1 2 3\n");
         text.push_str("  extent id=10 base=0 pages=8 kind=lww zone=1\n");
         let e = Config::parse(&text).unwrap_err();
         assert!(format!("{e}").contains("used twice"), "{e}");
@@ -1870,7 +1991,7 @@ device 2 extents=12
     fn universes_partition_everything() {
         let mut text = SAMPLE.to_string();
         text.push_str(
-            "universe 2 epoch=1
+            "universe 2 epoch=1 fabric_device_id=10
   peer id=9 device=/dev/nvme2n1
   group 1 8 9
   extent id=20 base=0 pages=100 kind=lww zone=1
@@ -1907,7 +2028,7 @@ device 3 extents=20
     fn a_namespace_belongs_to_one_universe() {
         let mut text = SAMPLE.to_string();
         text.push_str(
-            "universe 2 epoch=1
+            "universe 2 epoch=1 fabric_device_id=10
   peer id=2 device=/dev/nvme1n1
   group 1 2 3
   extent id=20 base=0 pages=8 kind=lww zone=1
@@ -2128,7 +2249,7 @@ device 3 extents=20
         let t = "\
 generation 7
 node id=20 zone=2 cohort=0 store=/var/lib/racer/store.img size=68719476736
-universe 1 epoch=3
+universe 1 epoch=3 fabric_device_id=9
   peer id=21 device=/dev/nvme1n1
   group 20 21 22
   zone id=1 gateways=21,22
@@ -2293,7 +2414,7 @@ device 2 extents=12
         let c = Config::parse(
             "generation 1
 node id=1 zone=1 cohort=0 store=/x size=1048576
-universe 1 epoch=1
+universe 1 epoch=1 fabric_device_id=9
   group 1 2 3
   extent id=1 base=0 pages=300 kind=lww zone=1
 ",
