@@ -40,6 +40,8 @@ const BIG: u32 = 4;
 const MIX: u32 = 5;
 /// The universe's fabric namespace, which is an export like any other.
 const FABRIC: u32 = 6;
+/// The extent handed out after the store was formatted; only one node is given it.
+const LATE: u32 = 7;
 
 /// The ublk minor node `id` exports `role` as. Minors are host-wide, and a real node owns
 /// its host; these seven share one, so the id a node asks for has to carry the node in it.
@@ -51,6 +53,8 @@ fn minor(id: u32, role: u32) -> u32 {
 const LWW_BASE: u64 = 0;
 const OCC_BASE: u64 = 4096;
 const IMM_BASE: u64 = 4608;
+/// Past extent 4, which is 4 pages of 4 MiB from 5120.
+const LATE_BASE: u64 = 9216;
 
 // --- the cluster ---
 
@@ -61,6 +65,9 @@ struct Node {
     _backing: harness::Backing,
     /// Store size the generations for this node ask for; raising it grows the file.
     store_bytes: u64,
+    /// Whether the generations for this node carry the late extent, which is more than the
+    /// store was formatted for. Set with `store_bytes` to watch a start make room for it.
+    late_extent: bool,
 }
 
 impl Node {
@@ -182,6 +189,7 @@ fn build_node(id: u32) -> Node {
         proc: harness::Proc::new(id, dir, store, exe),
         _backing: backing,
         store_bytes: IMG_BYTES,
+        late_extent: false,
     }
 }
 
@@ -334,6 +342,11 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
           extent id=2 base=4096 pages=512  kind=occ          zone=1 cache_admit=1\n\
           extent id=3 base=4608 pages=512  kind=immutable    zone=1\n\
           extent id=4 base=5120 pages=4    kind=immutable_4m zone=1 cache_admit=1\n";
+    // Handed out after the store was formatted, so it is more than the store backs until a
+    // start reserves the room the raised `size=` asks for.
+    if n.late_extent {
+        s += &format!("extent id=5 base={LATE_BASE} pages=8192 kind=lww zone=1\n");
+    }
     let id = n.proc.id;
     s += &format!(
         "device {} extents=1\n\
@@ -347,6 +360,9 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
         minor(id, BIG),
         minor(id, MIX),
     );
+    if n.late_extent {
+        s += &format!("device {} extents=5\n", minor(id, LATE));
+    }
     s
 }
 
@@ -805,6 +821,33 @@ fn six_node_cluster() {
     // at 3 separately, keeping generations monotonic per node.
     wire(&mut nodes, 3, &[0]);
 
+    // ---- a store short of its config says so, and stays the size it is --------------
+    // The control plane hands this node an extent the formatted store has no room for,
+    // together with the room for it. A serving node will not move the file under itself:
+    // it takes the generation, reports how far short it is, and serves on with what it
+    // has. Only the start below makes the difference real.
+    {
+        let peers = peers_of(&nodes, nodes[0].proc.id);
+        nodes[0].late_extent = true;
+        nodes[0].store_bytes = GROWN_BYTES;
+        nodes[0].proc.install(&config_text(4, &nodes[0], &peers));
+        nodes[0].proc.await_reload();
+        assert_eq!(
+            nodes[0].proc.store_len(),
+            IMG_BYTES,
+            "a reload must not resize the store under a serving node"
+        );
+        assert!(
+            scrape(&nodes[0]).get("racer_alloc_unbacked_pages") > 0,
+            "a store short of its config must say by how much"
+        );
+        assert_eq!(
+            nodes[0].dev(LWW).read(held * 4096, PAGE).unwrap(),
+            pattern(2, PAGE),
+            "an extent with nowhere to go does not disturb the pages that have one"
+        );
+    }
+
     // ---- crash a node: the survivors serve on, and the node comes back -------------
     drop((a, b, oa, ob, ia, ib, ba, bb));
     nodes[0].proc.signal(libc::SIGKILL);
@@ -815,9 +858,17 @@ fn six_node_cluster() {
         pattern(2, PAGE),
         "a quorum keeps serving after a member dies"
     );
+    // The dead node's fabric device keeps its minor for as long as anyone holds the
+    // export the crash left behind, and a link is only let go when the peer it names
+    // leaves the configuration. So the survivors are told to forget it before it is
+    // started again, which is what the control plane does when a node goes away.
+    let survivors: Vec<usize> = (1..NODES as usize).collect();
+    let dead = nodes[0].proc.id;
+    wire_without(&mut nodes, 3, &survivors, &[dead]);
     // ---- the store grows on the way up, and never the other way --------------------
-    // The control plane raises this node's share while it is down. A start reserves the
-    // difference in place and leaves existing pages put; a lower `size=` is refused.
+    // The start is what makes room for the extent the reload could only report. It
+    // reserves the difference in place and leaves existing pages put; a lower `size=` is
+    // refused before anything is touched.
     assert_eq!(
         nodes[0].proc.store_len(),
         IMG_BYTES,
@@ -847,9 +898,14 @@ fn six_node_cluster() {
         GROWN_BYTES,
         "a raised size= must be reserved at the next start"
     );
+    assert_eq!(
+        scrape(&nodes[0]).get("racer_alloc_unbacked_pages"),
+        0,
+        "a start that took the room must back the whole config"
+    );
     // The fabric device is back at the same minor, but the export behind it is new, so
-    // the peers holding the old one have to reopen their links.
-    wire(&mut nodes, 3, &(1..NODES as usize).collect::<Vec<_>>());
+    // naming the node again is what makes the survivors open it.
+    wire(&mut nodes, 4, &survivors);
     let a = nodes[0].dev(LWW);
     assert_eq!(
         a.read(held * 4096, PAGE).unwrap(),
