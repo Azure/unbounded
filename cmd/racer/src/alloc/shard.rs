@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use crate::config::Kind;
+use crate::config::{self, GroupId, Kind};
 use crate::heal::{self, Digests, Groups, Snaps, Tuple};
 use crate::layout::{Class, Entry, Header, State};
 use crate::paxos::{Ballot, Register};
@@ -24,29 +24,52 @@ use crate::runtime::Errno;
 /// Local mblocks the tombstone sweep examines per `tick`, per class.
 const SWEEP_PER_TICK: u32 = 64;
 
-/// Maps a page address to its volume's tombstone epoch. Passed in for the same reason
-/// as [`Groups`]: the slab holds no config, and the epoch is per volume.
-pub(crate) type Epochs<'a> = dyn Fn(u64) -> u32 + 'a;
+/// Resolves a page address to the extent covering it: its id and its tombstone epoch.
+///
+/// Passed in for the same reason as [`Groups`]: the slab holds no config. One closure
+/// serves both callers because both need the same lookup - the census keys rows by
+/// extent, and the sweep needs that extent's epoch - and resolving twice would be the
+/// same binary search twice. `None` means the address is no longer covered by any
+/// extent, which a shard treats as "nothing to say about it".
+pub(crate) type Extents<'a> = dyn Fn(u64) -> Option<(u32, u32)> + 'a;
+
+/// The two config lookups a slab mutation needs, bundled because every one of them
+/// needs both: the digest is keyed by group and the census by extent, and a caller that
+/// had to pass them separately would thread two arguments through the same dozen
+/// signatures.
+pub(crate) struct Maps<'a> {
+    pub(crate) gof: &'a Groups<'a>,
+    pub(crate) xof: &'a Extents<'a>,
+}
 
 // ---------------------------------------------------------------------------- address
 
-/// A page address in the flat address space: `volume:32 | offset:32`, the offset in
-/// pages of the extent's own size. Volume id 0 is reserved so that a zero address in an
+/// A page address: `universe:26 | lba:38`.
+///
+/// The low field is a block index in the universe's own flat 4 KiB address space, the
+/// same space the control plane places extents in, so an address is the concatenation
+/// of the two things that locate a page and nothing else. A 4 MiB page is named by the
+/// first of its 1024 blocks. Universe id 0 is reserved so that a zero address in an
 /// mblock entry unambiguously means "free slot".
+///
+/// Nothing about the extent is in the address. An extent may be remapped into a
+/// different device, at a different position, on every node that mounts it, and the
+/// address does not move; equally, the class is the extent's, resolved through the
+/// config, not a bit a peer could flip.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct GlobalAddr(pub u64);
 
 impl GlobalAddr {
-    pub fn new(volume: u32, offset: u32) -> GlobalAddr {
-        GlobalAddr((volume as u64) << 32 | offset as u64)
+    pub fn new(universe: u32, lba: u64) -> GlobalAddr {
+        GlobalAddr(config::addr_of(universe, lba))
     }
 
-    pub fn volume(self) -> u32 {
-        (self.0 >> 32) as u32
+    pub fn universe(self) -> u32 {
+        config::universe_of(self.0)
     }
 
-    pub fn offset(self) -> u32 {
-        self.0 as u32
+    pub fn lba(self) -> u64 {
+        config::lba_of(self.0)
     }
 }
 
@@ -292,10 +315,10 @@ struct Slab {
     /// Anti-entropy accumulators over this slab's registers, keyed by consensus group.
     /// Seeded once by `rebuild`, then maintained incrementally by `set`.
     digests: Digests,
-    /// Live and tombstoned entries per volume, sorted by volume id. Maintained by
+    /// Live and tombstoned entries per extent, sorted by extent id. Maintained by
     /// `set` alongside the digests and seeded by `rebuild` in the same pass, because
-    /// the control plane cannot advance a volume's epoch without knowing whether
-    /// anything in it is still live. Bounded by `MAX_VOLUMES`.
+    /// the control plane cannot advance an extent's epoch without knowing whether
+    /// anything in it is still live. Bounded by `config::MAX_EXTENTS`.
     census: Vec<(u32, u32, u32)>,
     /// Open enumerations and the reclamation they hold back.
     snaps: Snaps,
@@ -367,33 +390,37 @@ impl Slab {
     /// Entries in `foreign` are outside all of this on purpose: they exist only until
     /// the page relocates on its next write, and a repair is such a write, so excluding
     /// them makes the divergence they cause self-clearing.
-    fn set(&mut self, local: u32, e: Entry, gof: &Groups) {
+    fn set(&mut self, local: u32, e: Entry, m: &Maps) {
         let old = std::mem::replace(&mut self.entries[local as usize], e);
         if old.addr != 0 {
             self.snaps.retain(&old);
-            self.digests.toggle(gof(old.addr), &old);
-            self.count(old, -1);
+            self.digests.toggle((m.gof)(old.addr), &old);
+            self.count(old, -1, m);
         }
         if e.addr != 0 {
-            self.digests.toggle(gof(e.addr), &e);
-            self.count(e, 1);
+            self.digests.toggle((m.gof)(e.addr), &e);
+            self.count(e, 1, m);
         }
     }
 
-    /// Move an entry into or out of its volume's census row. Rows appear on the first
-    /// entry for a volume and go away when it holds nothing, so a deleted volume leaves
-    /// no series behind.
-    fn count(&mut self, e: Entry, by: i32) {
+    /// Move an entry into or out of its extent's census row. Rows appear on the first
+    /// entry for an extent and go away when it holds nothing, so a deleted extent
+    /// leaves no series behind.
+    fn count(&mut self, e: Entry, by: i32, m: &Maps) {
         let (live, tomb) = match e.state {
             State::Live => (by, 0),
             State::Tombstone => (0, by),
             State::Empty => return,
         };
-        let v = (e.addr >> 32) as u32;
-        let i = match self.census.binary_search_by_key(&v, |r| r.0) {
+        // A page whose extent has left the config is counted for nothing: the row it
+        // would land in is one the control plane has already stopped asking about.
+        let Some((x, _)) = (m.xof)(e.addr) else {
+            return;
+        };
+        let i = match self.census.binary_search_by_key(&x, |r| r.0) {
             Ok(i) => i,
             Err(i) => {
-                self.census.insert(i, (v, 0, 0));
+                self.census.insert(i, (x, 0, 0));
                 i
             }
         };
@@ -412,12 +439,12 @@ impl Slab {
 
     /// Return a slot to the free list. A no-op for a slot outside this core's stripe;
     /// callers in `alloc.rs` hop to the holding core first.
-    fn release(&mut self, slot: u32, gof: &Groups) {
+    fn release(&mut self, slot: u32, m: &Maps) {
         let Some(l) = self.local_of(slot) else { return };
         if self.entries[l as usize].addr == 0 {
             return;
         }
-        self.set(l, Entry::default(), gof);
+        self.set(l, Entry::default(), m);
         self.recycle(l);
         self.dirty(l / self.k);
     }
@@ -618,19 +645,19 @@ impl Shard {
         [self.slabs[0].capacity(), self.slabs[1].capacity()]
     }
 
-    /// Live and tombstoned entries per volume, `(volume, live, tombstones)` sorted by
-    /// volume. Summed across cores this is the whole node, which is what the control
-    /// plane needs before it dares advance a volume's tombstone epoch.
+    /// Live and tombstoned entries per extent, `(extent, live, tombstones)` sorted by
+    /// extent. Summed across cores this is the whole node, which is what the control
+    /// plane needs before it dares advance an extent's tombstone epoch.
     pub(super) fn census(&self) -> Vec<(u32, u64, u64)> {
         let mut out: Vec<(u32, u64, u64)> = Vec::new();
         for sl in &self.slabs {
-            for &(v, live, tomb) in &sl.census {
-                match out.binary_search_by_key(&v, |r| r.0) {
+            for &(x, live, tomb) in &sl.census {
+                match out.binary_search_by_key(&x, |r| r.0) {
                     Ok(i) => {
                         out[i].1 += live as u64;
                         out[i].2 += tomb as u64;
                     }
-                    Err(i) => out.insert(i, (v, live as u64, tomb as u64)),
+                    Err(i) => out.insert(i, (x, live as u64, tomb as u64)),
                 }
             }
         }
@@ -738,7 +765,7 @@ impl Shard {
         class: Class,
         t: Ticket,
         crc: u32,
-        gof: &Groups,
+        m: &Maps,
     ) -> Result<Option<Staged>, Status> {
         let state = state_of(kind, t.version);
         let recheck = self.recheck;
@@ -771,7 +798,7 @@ impl Shard {
             state,
             flags: 0,
         };
-        sl.set(local, e, gof);
+        sl.set(local, e, m);
         let stale = match sl.index.insert(addr.0, t.slot) {
             Some(old) if old != t.slot => Some(old),
             _ => None,
@@ -788,18 +815,18 @@ impl Shard {
     /// Retire the slot a commit displaced, once its replacement is durable. Returns the
     /// mblock and sequence that retirement needs flushed to, or `None` if the slot is
     /// outside this core's stripe.
-    pub(super) fn release(&mut self, class: Class, slot: u32, gof: &Groups) -> Option<(u32, u64)> {
+    pub(super) fn release(&mut self, class: Class, slot: u32, m: &Maps) -> Option<(u32, u64)> {
         let sl = self.slab(class);
         let local = sl.local_of(slot)?;
-        sl.release(slot, gof);
+        sl.release(slot, m);
         Some((local / sl.k, sl.commit_seq[(local / sl.k) as usize]))
     }
 
     /// Undo a reservation whose data write failed, so the slot is not leaked.
-    pub(super) fn unreserve(&mut self, class: Class, t: Ticket, gof: &Groups) {
+    pub(super) fn unreserve(&mut self, class: Class, t: Ticket, m: &Maps) {
         let sl = self.slab(class);
         if let Some(l) = sl.local_of(t.slot) {
-            sl.set(l, Entry::default(), gof);
+            sl.set(l, Entry::default(), m);
             sl.recycle(l);
         }
     }
@@ -896,7 +923,7 @@ impl Shard {
         guard: Option<u64>,
         ballot: Ballot,
         epoch: u64,
-        gof: &Groups,
+        m: &Maps,
     ) -> Result<Option<(u32, u64)>, Status> {
         let sl = self.slab(class);
         let Some((slot, e)) = sl.entry_of(addr.0) else {
@@ -923,10 +950,10 @@ impl Shard {
                 state: State::Tombstone,
                 flags: 0,
             };
-            sl.set(local, t, gof);
+            sl.set(local, t, m);
         } else {
             sl.index.remove(addr.0);
-            sl.set(local, Entry::default(), gof);
+            sl.set(local, Entry::default(), m);
             sl.recycle(local);
         }
         let li = local / sl.k;
@@ -988,10 +1015,10 @@ impl Shard {
     /// One tick's worth of tombstone reclamation on one class. The only garbage
     /// collection in the system: metadata only, bounded, and on no critical path.
     ///
-    /// `eof` is resolved per tombstone rather than once per sweep, because the epoch is
-    /// the volume's: one volume may collect while every other one stands still. The
-    /// lookup only runs for entries already known to be tombstones.
-    pub(super) fn sweep(&mut self, class: Class, eof: &Epochs, gof: &Groups) {
+    /// The extent is resolved per tombstone rather than once per sweep, because the
+    /// epoch is the extent's: one extent may collect while every other one stands
+    /// still. The lookup only runs for entries already known to be tombstones.
+    pub(super) fn sweep(&mut self, class: Class, m: &Maps) {
         let sl = self.slab(class);
         if sl.local == 0 {
             return;
@@ -1004,8 +1031,11 @@ impl Shard {
             for j in 0..k {
                 let l = li as usize * k + j;
                 let e = sl.entries[l];
-                if e.state == State::Tombstone && e.epoch < eof(e.addr) {
-                    sl.set(l as u32, Entry::default(), gof);
+                if e.state == State::Tombstone
+                    && let Some((_, epoch)) = (m.xof)(e.addr)
+                    && e.epoch < epoch
+                {
+                    sl.set(l as u32, Entry::default(), m);
                     sl.index.remove(e.addr);
                     sl.recycle(l as u32);
                     hit = true;
@@ -1021,17 +1051,21 @@ impl Shard {
 
     // ------------------------------------------------------------------- anti-entropy
 
-    pub(super) fn digest_vector(&mut self, class: Class, group: u32) -> Box<[u64; heal::BUCKETS]> {
+    pub(super) fn digest_vector(
+        &mut self,
+        class: Class,
+        group: GroupId,
+    ) -> Box<[u64; heal::BUCKETS]> {
         self.slab(class).digests.vector(group)
     }
 
     /// Groups this shard holds registers for, and the forget that prunes one it has
     /// been drained of. Together these are how the shed finds work without scanning.
-    pub(super) fn held_groups(&mut self, class: Class) -> Vec<u32> {
+    pub(super) fn held_groups(&mut self, class: Class) -> Vec<GroupId> {
         self.slab(class).digests.held()
     }
 
-    pub(super) fn forget_group(&mut self, class: Class, group: u32) {
+    pub(super) fn forget_group(&mut self, class: Class, group: GroupId) {
         self.slab(class).digests.forget(group);
     }
 
@@ -1044,7 +1078,7 @@ impl Shard {
         addr: GlobalAddr,
         class: Class,
         version: u64,
-        gof: &Groups,
+        m: &Maps,
     ) -> Option<(u32, u64)> {
         let sl = self.slab(class);
         let (slot, e) = sl.entry_of(addr.0)?;
@@ -1054,7 +1088,7 @@ impl Shard {
             return None;
         }
         sl.index.remove(addr.0);
-        sl.set(local, Entry::default(), gof);
+        sl.set(local, Entry::default(), m);
         sl.recycle(local);
         let li = local / sl.k;
         Some((li, sl.dirty(li)))
@@ -1065,7 +1099,7 @@ impl Shard {
         class: Class,
         core: usize,
         huge: bool,
-        group: u32,
+        group: GroupId,
         filter: heal::Filter,
         now: std::time::Instant,
     ) -> Option<u32> {
@@ -1077,13 +1111,14 @@ impl Shard {
         class: Class,
         id: u32,
         seq: Option<u8>,
-        gof: &Groups,
+        universe: Option<u32>,
+        m: &Maps,
         now: std::time::Instant,
     ) -> Result<(Vec<Tuple>, bool), Status> {
         let sl = self.slab(class);
         // Split the borrow: the walk reads `entries` while the cursor advances.
         let (snaps, entries) = (&mut sl.snaps, &sl.entries);
-        snaps.next(id, seq, entries, gof, now)
+        snaps.next(id, seq, universe, entries, m.gof, now)
     }
 
     pub(super) fn snap_stop(&mut self, class: Class, id: u32) {
@@ -1135,7 +1170,7 @@ pub(super) fn rebuild(
     shape: &Shape,
     cores: usize,
     scans: Vec<Scanned>,
-    gof: &Groups,
+    m: &Maps,
 ) -> (Vec<Shard>, usize) {
     let mut shards: Vec<Shard> = (0..cores).map(|c| Shard::new(c as u32, shape)).collect();
 
@@ -1201,7 +1236,7 @@ pub(super) fn rebuild(
     // slot; when they differ the entry is copied into the small `foreign` side map and
     // the page relocates on its next write.
     for (addr, (class, slot, _)) in &winner {
-        let owner = gof(*addr) as usize % shape.shards_for[*class as usize];
+        let owner = (m.gof)(*addr).index() as usize % shape.shards_for[*class as usize];
         let holder = (*slot / shape.k[*class as usize] % cores as u32) as usize;
         // Read the holder before touching the owner: they may be the same shard.
         let e = if holder == owner {
@@ -1230,14 +1265,14 @@ pub(super) fn rebuild(
                     sl.free.push(l as u32);
                 }
             }
-            // Seed the anti-entropy accumulators and the per-volume census from what
+            // Seed the anti-entropy accumulators and the per-extent census from what
             // survived the scan: the only full pass either gets, every later change
             // goes through `set`.
             for l in 0..sl.entries.len() {
                 let e = sl.entries[l];
                 if e.addr != 0 {
-                    sl.digests.toggle(gof(e.addr), &e);
-                    sl.count(e, 1);
+                    sl.digests.toggle((m.gof)(e.addr), &e);
+                    sl.count(e, 1, m);
                 }
             }
         }
@@ -1453,11 +1488,14 @@ mod model {
     const MAX_WRITES: u8 = 3;
     const MAX_PENDING: usize = 2;
 
-    /// One address in each of two volumes, in different consensus groups so that a
+    /// One address in each of two extents, in different consensus groups so that a
     /// change of core count can separate an index shard from a slot's owner. Separate
-    /// volumes because the tombstone epoch is per volume, and the point of the sweep
-    /// properties below is that one volume's epoch says nothing about the other's.
-    const ADDRS: [u64; 2] = [1 << 32, (2 << 32) | 1];
+    /// extents because the tombstone epoch is per extent, and the point of the sweep
+    /// properties below is that one extent's epoch says nothing about the other's.
+    ///
+    /// Both sit in universe 1: partitioning is the configuration's business, and a
+    /// second universe here would only make the addresses longer.
+    const ADDRS: [u64; 2] = [1 << config::LBA_BITS, (1 << config::LBA_BITS) | 1];
     const GUARDS: [Option<u64>; 4] = [None, Some(0), Some(1), Some(3)];
     /// Trims are guarded too, but only the fill points (`3*epoch + 1`) are interesting.
     const TGUARDS: [Option<u64>; 3] = [None, Some(1), Some(4)];
@@ -1472,13 +1510,37 @@ mod model {
     /// mblock, the commit sequence it needs, and the slot it displaced.
     type Waiting = (u64, u64, u32, u32, u32, u64, Option<u32>);
 
-    fn group_of(a: u64) -> u32 {
-        (a & 1) as u32
+    fn group_of(a: u64) -> GroupId {
+        GroupId::new(1, (a & 1) as u32)
     }
 
-    /// Volume ids are 1 and 2, one address each, so a volume id indexes the epochs.
-    fn vol_of(addr: u64) -> usize {
-        ((addr >> 32) as usize).saturating_sub(1) % ADDRS.len()
+    /// The two extents hold one address each, so the low bit of an address indexes both
+    /// the epochs and the extent ids.
+    fn ext_of(addr: u64) -> usize {
+        (addr & 1) as usize
+    }
+
+    /// Extent ids are one-based, so a census row is never keyed by zero.
+    fn ext_id(addr: u64) -> u32 {
+        ext_of(addr) as u32 + 1
+    }
+
+    /// Bind the lookups a slab mutation needs and bundle them as `$m`, the way
+    /// `alloc::maps!` does for the real allocator. A macro for the same reason: the
+    /// bundle borrows the closures, so nothing here can be returned.
+    macro_rules! maps {
+        ($epochs:expr, $m:ident) => {
+            let epochs = $epochs;
+            let gof = group_of;
+            let xof = move |a: u64| Some((ext_id(a), epochs[ext_of(a)] as u32));
+            let $m = Maps {
+                gof: &gof,
+                xof: &xof,
+            };
+        };
+        ($m:ident) => {
+            maps!([0u64; ADDRS.len()], $m)
+        };
     }
 
     /// The census a slab should be holding, recomputed the slow way.
@@ -1490,7 +1552,7 @@ mod model {
                 State::Tombstone => (0, 1),
                 State::Empty => continue,
             };
-            let v = (e.addr >> 32) as u32;
+            let v = ext_id(e.addr);
             match out.binary_search_by_key(&v, |r| r.0) {
                 Ok(i) => {
                     out[i].1 += live;
@@ -1552,7 +1614,8 @@ mod model {
                 }
             })
             .collect();
-        rebuild(&shape(cores, recheck), cores as usize, scans, &group_of)
+        maps!(m);
+        rebuild(&shape(cores, recheck), cores as usize, scans, &m)
     }
 
     fn formatted() -> Vec<Copies> {
@@ -1637,9 +1700,9 @@ mod model {
         seen: BTreeSet<(u64, u64)>,
         /// Guards the ring actually let through on the derived path.
         used: BTreeSet<(u64, u64)>,
-        /// One per volume, because that is the scope the control plane advances.
+        /// One per extent, because that is the scope the control plane advances.
         epoch: [u64; ADDRS.len()],
-        /// Set for a volume whose tombstone the sweep has actually reclaimed.
+        /// Set for an extent whose tombstone the sweep has actually reclaimed.
         reaped: [bool; ADDRS.len()],
         writes: u8,
         /// Reservations dropped without `unreserve`: the slot is not returned until the
@@ -1730,7 +1793,7 @@ mod model {
                 out.push(RegAct::Unreserve(p));
             }
             for v in 0..ADDRS.len() as u8 {
-                // Each volume's epoch moves on its own. One step is enough: nothing in
+                // Each extent's epoch moves on its own. One step is enough: nothing in
                 // the dataplane branches on the size of the jump, only on the ordering.
                 if s.epoch[v as usize] == 0 {
                     out.push(RegAct::AdvanceEpoch(v));
@@ -1800,12 +1863,11 @@ mod model {
                     // `Ok(None)` is a commit that lost the race and gave its slot back:
                     // the caller sees success but nothing was written, so nothing is
                     // acknowledged as this address's value.
-                    if let Ok(Some(st)) =
-                        s.sh.stage(GlobalAddr(addr), kind, cls, t, value, &group_of)
-                    {
+                    maps!(m);
+                    if let Ok(Some(st)) = s.sh.stage(GlobalAddr(addr), kind, cls, t, value, &m) {
                         s.acked.insert((addr, t.version, t.ballot.raw(), value));
                         if let Some(old) = st.stale {
-                            s.sh.release(cls, old, &group_of);
+                            s.sh.release(cls, old, &m);
                         }
                     }
                 }
@@ -1815,11 +1877,13 @@ mod model {
                 }
                 RegAct::Unreserve(p) => {
                     let (_, t, _) = s.pending.remove(p as usize);
-                    s.sh.unreserve(cls, t, &group_of);
+                    maps!(m);
+                    s.sh.unreserve(cls, t, &m);
                 }
                 RegAct::Trim { a, g } => {
                     let ad = GlobalAddr(ADDRS[a as usize]);
                     let ballot = Ballot::new(2, 0);
+                    maps!(m);
                     let r = s.sh.trim(
                         ad,
                         kind,
@@ -1827,7 +1891,7 @@ mod model {
                         TGUARDS[g as usize],
                         ballot,
                         s.epoch[a as usize],
-                        &group_of,
+                        &m,
                     );
                     // A mutable trim destroys the register rather than tombstoning it,
                     // so versions restart from zero and the history before it is no
@@ -1841,18 +1905,18 @@ mod model {
                 RegAct::AdvanceEpoch(v) => s.epoch[v as usize] += 1,
                 RegAct::Sweep => {
                     // Which tombstones the sweep took, and whose. That is the whole
-                    // claim: a volume the control plane has not advanced loses nothing.
+                    // claim: an extent the control plane has not advanced loses nothing.
                     let before: Vec<u64> = s.sh.slabs[0]
                         .entries
                         .iter()
                         .filter(|e| e.state == State::Tombstone)
                         .map(|e| e.addr)
                         .collect();
-                    let epochs = s.epoch;
-                    s.sh.sweep(cls, &|a: u64| epochs[vol_of(a)] as u32, &group_of);
+                    maps!(s.epoch, m);
+                    s.sh.sweep(cls, &m);
                     for a in before {
                         if find(std::slice::from_ref(&s.sh), a).is_none() {
-                            s.reaped[vol_of(a)] = true;
+                            s.reaped[ext_of(a)] = true;
                         }
                     }
                 }
@@ -1882,7 +1946,7 @@ mod model {
                     s.acked.iter().all(|&(a, v, b, _)| {
                         let e = find(std::slice::from_ref(&s.sh), a);
                         let held = (
-                            effective(e, m.kind, s.epoch[vol_of(a)]),
+                            effective(e, m.kind, s.epoch[ext_of(a)]),
                             e.map_or(0, |x| x.ballot as u32),
                         );
                         held >= (v, b)
@@ -1918,7 +1982,7 @@ mod model {
                 Property::<Self>::always("occ accepts were observed", |_, s| {
                     s.used.is_subset(&s.seen)
                 }),
-                // The per-volume census is maintained one entry at a time, in `set`.
+                // The per-extent census is maintained one entry at a time, in `set`.
                 // This is the only thing that says it still agrees with the slab, and
                 // the control plane's epoch decision rests on it.
                 Property::<Self>::always("the census matches the slab", |_, s| {
@@ -1947,10 +2011,10 @@ mod model {
                         },
                     ));
                     // The only garbage collection in the system, and it is scoped to one
-                    // volume. A volume whose epoch still sits at zero keeps every
-                    // tombstone it has, however far ahead the other volume runs.
+                    // extent. An extent whose epoch still sits at zero keeps every
+                    // tombstone it has, however far ahead the other extent runs.
                     ps.push(Property::<Self>::always(
-                        "the sweep stays inside its volume",
+                        "the sweep stays inside its extent",
                         |_, s| (0..ADDRS.len()).all(|v| s.epoch[v] > 0 || !s.reaped[v]),
                     ));
                     ps.push(Property::<Self>::sometimes(
@@ -1958,22 +2022,22 @@ mod model {
                         |_, s| {
                             s.acked.iter().any(|&(a, v, _, _)| {
                                 v == 2
-                                    && s.epoch[vol_of(a)] > 0
+                                    && s.epoch[ext_of(a)] > 0
                                     && find(std::slice::from_ref(&s.sh), a).is_none()
                             })
                         },
                     ));
-                    // The point of the rescope: one volume collects while the other,
+                    // The point of the rescope: one extent collects while the other,
                     // still lagging, keeps its own tombstone.
                     ps.push(Property::<Self>::sometimes(
-                        "one volume collects alone",
+                        "one extent collects alone",
                         |_, s| {
                             s.reaped[0]
                                 && s.epoch[1] == 0
                                 && s.sh.slabs[0]
                                     .entries
                                     .iter()
-                                    .any(|e| e.state == State::Tombstone && vol_of(e.addr) == 1)
+                                    .any(|e| e.state == State::Tombstone && ext_of(e.addr) == 1)
                         },
                     ));
                 }
@@ -2072,8 +2136,9 @@ mod model {
                     true
                 }
             });
+            maps!(m);
             for slot in stale {
-                s.shards[0].release(Class::Small, slot, &group_of);
+                s.shards[0].release(Class::Small, slot, &m);
             }
         }
     }
@@ -2144,14 +2209,15 @@ mod model {
                 DiskAct::Stage(p) => {
                     let (addr, t) = s.pending.remove(p as usize);
                     let value = t.ballot.raw();
+                    maps!(m);
                     let st = s.shards[0]
-                        .stage(GlobalAddr(addr), Kind::Lww, cls, t, value, &group_of)
+                        .stage(GlobalAddr(addr), Kind::Lww, cls, t, value, &m)
                         .ok()??;
                     match self.ack {
                         Ack::Staged => {
                             s.acked.insert((addr, t.version, t.ballot.raw(), value));
                             if let Some(old) = st.stale {
-                                s.shards[0].release(cls, old, &group_of);
+                                s.shards[0].release(cls, old, &m);
                             }
                         }
                         Ack::Durable => s.waiting.push((

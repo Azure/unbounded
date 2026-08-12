@@ -65,11 +65,13 @@ fn serve(cfg: Config, path: String, metrics: String) -> std::io::Result<()> {
             eprintln!("racer: {} metadata blocks quarantined", d.quarantined());
         }
         for (id, p) in d.devices() {
-            println!("volume {} -> {}", id, p.display());
+            println!("device {} -> {}", id, p.display());
         }
-        // The control plane publishes this one through nvmet, and the kernel picks the
-        // ublk minor, so it has to be told which device it is.
-        println!("fabric -> {}", d.fabric().display());
+        // The control plane publishes these through nvmet, and the kernel picks the
+        // ublk minor, so it has to be told which device is which universe's.
+        for (id, p) in d.fabrics() {
+            println!("universe {} fabric -> {}", id, p.display());
+        }
         Ok(d)
     })?;
 

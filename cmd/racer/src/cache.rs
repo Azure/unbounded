@@ -158,35 +158,65 @@ impl Sketch {
 // placement
 // ---------------------------------------------------------------------------
 
-/// This node's cohort, as the config implies it.
+/// This node's cohort, as the config implies it — one roster per universe.
 ///
 /// There is no cohort roster in the schema. `Node.cohort` names a catalog column, so a
-/// cohort is the projection of `topology.catalog` onto that column. Every node claiming
-/// column `c` sees the same catalog and derives the same roster, which is what local
-/// computation of `R` requires. The schema does not check that a node actually occupies
-/// its column in every group — a catalog may permute members to spread the paxos member
-/// index — so the cohort is the label the control plane assigns, not one derived here.
+/// cohort is the projection of a universe's catalog onto that column. Every node
+/// claiming column `c` sees the same catalog and derives the same roster, which is what
+/// local computation of `R` requires. The schema does not check that a node actually
+/// occupies its column in every group — a catalog may permute members to spread the
+/// paxos member index — so the cohort is the label the control plane assigns, not one
+/// derived here.
+///
+/// Per universe, because a cache replica is reached over the universe's own namespace: a
+/// node in some other universe cannot serve a page it was never given an address for,
+/// and a roster that pooled every universe's column would rank it as though it could.
+/// The column index is shared, since the node holds one cohort label whatever universe
+/// it is looking at.
 #[derive(Default)]
 struct Roster {
     me: u32,
-    nodes: Box<[u32]>,
+    /// Sorted by universe id.
+    cohorts: Box<[(u32, Box<[u32]>)]>,
 }
 
 impl Roster {
     fn of(cfg: &Config) -> Roster {
         let c = cfg.node.cohort as usize;
-        let mut nodes: Vec<u32> = cfg.topology.catalog.iter().map(|g| g[c]).collect();
-        nodes.push(cfg.node.id);
-        nodes.sort_unstable();
-        nodes.dedup();
+        let cohorts = cfg
+            .universes()
+            .iter()
+            .map(|u| {
+                let mut nodes: Vec<u32> = u.catalog.iter().map(|g| g[c]).collect();
+                nodes.push(cfg.node.id);
+                nodes.sort_unstable();
+                nodes.dedup();
+                (u.id, nodes.into_boxed_slice())
+            })
+            .collect::<Vec<_>>();
         Roster {
             me: cfg.node.id,
-            nodes: nodes.into_boxed_slice(),
+            cohorts: cohorts.into_boxed_slice(),
         }
+    }
+
+    /// The cohort in one universe. Empty for a universe we hold no catalog for, which
+    /// is the same answer as caching being off there.
+    fn cohort(&self, universe: u32) -> &[u32] {
+        match self.cohorts.binary_search_by_key(&universe, |(id, _)| *id) {
+            Ok(i) => &self.cohorts[i].1,
+            Err(_) => &[],
+        }
+    }
+
+    /// The widest cohort we are in. `W_max` is a ceiling, and one taken before the
+    /// address is known, so the largest is the right one to take it from.
+    fn widest(&self) -> usize {
+        self.cohorts.iter().map(|(_, n)| n.len()).max().unwrap_or(0)
     }
 }
 
-/// The rendezvous score. Nesting — `R(k,w) ⊂ R(k,w+1)` — is automatic: the ranking is a
+/// The rendezvous score. Nesting (`R(k,w) ⊂ R(k,w+1)`) is automatic: the ranking is a
 /// total order independent of `w`, so raising the width only appends.
 fn rank(addr: u64, node: u32) -> u64 {
     config::mix(addr ^ config::mix(node as u64))
@@ -454,7 +484,7 @@ impl Cache {
     }
 
     fn enabled(&self) -> bool {
-        self.tau() > 0 && !self.roster.get().nodes.is_empty()
+        self.tau() > 0 && self.roster.get().widest() > 0
     }
 
     /// Sheds while the allocator is short of free space, or while the store's rate
@@ -516,7 +546,7 @@ impl Cache {
 
     /// `W_max = min(cohort_size, 64)`.
     fn w_max(&self) -> u8 {
-        u8::try_from(self.roster.get().nodes.len())
+        u8::try_from(self.roster.get().widest())
             .unwrap_or(W_CAP)
             .min(W_CAP)
     }
@@ -557,22 +587,24 @@ impl Cache {
     /// that outrank us is below the width.
     pub fn holds(&self, addr: GlobalAddr, w: u8) -> bool {
         let r = self.roster.get();
-        if w == 0 || r.nodes.is_empty() {
+        let nodes = r.cohort(addr.universe());
+        if w == 0 || nodes.is_empty() {
             return false;
         }
         let mine = rank(addr.0, r.me);
-        r.nodes.iter().filter(|&&n| rank(addr.0, n) > mine).count() < w as usize
+        nodes.iter().filter(|&&n| rank(addr.0, n) > mine).count() < w as usize
     }
 
     /// The highest-ranked live member of `R`, excluding ourselves. `ok` is the
     /// reachability test: a cohort peer we hold no link to is not a candidate.
     pub fn replica(&self, addr: GlobalAddr, w: u8, ok: impl Fn(u32) -> bool) -> Option<u32> {
         let r = self.roster.get();
+        let nodes = r.cohort(addr.universe());
         if w == 0 {
             return None;
         }
         let mut best: Option<(u64, u32)> = None;
-        for &n in &r.nodes {
+        for &n in nodes {
             if n == r.me || !ok(n) {
                 continue;
             }
@@ -582,7 +614,7 @@ impl Cache {
             }
         }
         let (score, node) = best?;
-        let ahead = r.nodes.iter().filter(|&&n| rank(addr.0, n) > score).count();
+        let ahead = nodes.iter().filter(|&&n| rank(addr.0, n) > score).count();
         (ahead < w as usize).then_some(node)
     }
 
@@ -790,7 +822,7 @@ impl Cache {
 
     // -------------------------------------------------------------- immutable
 
-    /// The version an Immutable page holds while it is live at its volume's epoch.
+    /// The version an Immutable page holds while it is live at its extent's epoch.
     ///
     /// Only quorum-confirmed values are admitted for this class, and one version has
     /// exactly one such value, so a version is a complete identity for a cached 4 MiB
@@ -964,17 +996,27 @@ mod tests {
     }
 
     #[test]
-    fn roster_is_this_node_s_cohort_column() {
-        let mut cfg = crate::config::Config::default();
-        cfg.node.id = 5;
-        cfg.node.cohort = 1;
+    fn roster_is_this_node_s_cohort_column_in_each_universe() {
         // Member index is the cohort index, so column 1 is ours.
-        cfg.topology.catalog = vec![[1, 5, 9], [2, 5, 10], [3, 7, 11]];
+        let cfg = crate::config::Config::parse(
+            "node id=5 zone=1 cohort=1 store=/x size=4096
+             universe 1
+               group 1 5 9
+               group 2 5 10
+               group 3 7 11
+             universe 2
+               group 4 5 12",
+        )
+        .unwrap();
         let r = Roster::of(&cfg);
         assert_eq!(r.me, 5);
-        let mut nodes = r.nodes.to_vec();
-        nodes.sort_unstable();
-        assert_eq!(nodes, vec![5, 7]);
+        assert_eq!(r.cohort(1), &[5, 7]);
+        // A second universe is a second cohort, not more of the first: caching never
+        // ranks a peer we share no address space with.
+        assert_eq!(r.cohort(2), &[5]);
+        // And a universe we hold no catalog for is nobody, which reads as caching off.
+        assert!(r.cohort(3).is_empty());
+        assert_eq!(r.widest(), 2);
     }
 
     #[test]

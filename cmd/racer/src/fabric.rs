@@ -27,7 +27,7 @@
 //! 5. **Gather copies the 4 KiB payload.** `ReadvFixed`/`WritevFixed` take a *single*
 //!    `buf_index`, so a guest's ublk page and a pooled trailer cannot share one vectored
 //!    fixed SQE; gather is instead one contiguous registered buffer of page plus
-//!    trailer. Still one command and one round trip, and the volume path already stages
+//!    trailer. Still one command and one round trip, and the device path already stages
 //!    every 4 KiB page through a pool buffer. 4 MiB pages never gather, and stay zero
 //!    copy.
 //! 6. **One entry point.** Direction follows the opcode and shape follows the length, so
@@ -73,7 +73,7 @@ use crate::runtime::{Buf, Configurator, Disk, Durability, Errno};
 /// - **Already written** (Immutable, `EEXIST`). A CORFU fill loser has to `GET` the
 ///   winner regardless, so the follow-up command recovers the distinction.
 /// - **Overloaded** (`EAGAIN`). Backpressure *delays* the completion instead, as the
-///   volume path does at `Pressure::Low`: holding the ublk tag makes queue depth bound
+///   device path does at `Pressure::Low`: holding the ublk tag makes queue depth bound
 ///   the kernel, which a status cannot.
 ///
 /// Statuses classify, they do not explain: [`STALE`] says the caller's model of a page
@@ -200,9 +200,11 @@ impl Op {
 /// forward.
 ///
 /// The field holds three; `paxos::Route` grants at most two, enough for a cross-zone
-/// entry node forwarding to a group member whose shard is mid-migration and must
-/// forward again. A node that must forward with no budget left answers
-/// [`status::STALE`], which sends the originator back to its config.
+/// entry node forwarding to a group member whose extent is mid-migration and must
+/// forward again. Two is now also the ceiling: routing is flat inside a universe, and
+/// a frame never leaves the universe it arrived on. A node that must forward with no
+/// budget left answers [`status::STALE`], which sends the originator back to its
+/// config.
 const HOPS: u8 = 0b11;
 /// Serve this `GET` from the cache region only, never from the allocator.
 ///
@@ -226,25 +228,28 @@ pub(crate) const CACHE_ONLY: u8 = 1 << 2;
 // blocks rather than a scatter of sub-frames:
 //
 //   small   lba = frame * 2                 frame < 2^48   block 0 payload, 1 trailer
-//   huge    lba = HUGE_BASE + frame * 1024  frame < 2^39   blocks 0..1023 payload
+//   huge    lba = HUGE_BASE + frame * 1024  frame < 2^38   blocks 0..1023 payload
 //
 // A frame id packs, from the low bit up:
 //
-//   | offset (32 small / 23 huge) | vol 6 | imm 2 | flags 3 | opcode 5 |
+//   | offset (38 small / 28 huge) | imm 2 | flags 3 | opcode 5 |
 //
-// `vol` is the volume's fabric slot from the config (config.rs), not its id: an id is
-// 32 bits and six are all a frame can spare. The control plane assigns the slot and it
-// is frozen for the volume's life, so it cannot be derived from position or id order —
-// anything derived would shift the moment two nodes list their volumes differently or
-// one volume is deleted, silently repointing every frame in flight. `offset` is the
-// page index within that volume, so both classes share one space without either paying
-// for the other's granularity.
+// There is no address-space field. A frame names no universe because the *namespace it
+// arrived on* is the universe: the control plane publishes one fabric device per
+// universe and attaches it only to that universe's members, so partitioning is enforced
+// by the transport rather than by a number a peer could choose. That is what makes a
+// universe a security boundary and not just a naming convention, and it is why the six
+// bits a per-frame device name would cost go to `offset` instead.
+//
+// `offset` is a page index in the universe's own flat LBA space: 4 KiB pages count
+// blocks directly, 4 MiB pages count 1024-block groups. Both regions therefore address
+// exactly `config::MAX_LBA` blocks, so any address the control plane may legally hand
+// out is reachable, and neither class pays for the other's granularity.
 const OP_BITS: u32 = 5;
 const FLAG_BITS: u32 = 3;
 const IMM_BITS: u32 = 2;
-const VOL_BITS: u32 = 6;
-const SMALL_OFF_BITS: u32 = 32;
-const HUGE_OFF_BITS: u32 = 23;
+const SMALL_OFF_BITS: u32 = 38;
+const HUGE_OFF_BITS: u32 = 28;
 
 const SMALL_SHIFT: u32 = 1;
 const HUGE_SHIFT: u32 = 10;
@@ -252,8 +257,7 @@ const HUGE_SHIFT: u32 = 10;
 const HUGE_BLOCKS: u64 = 1 << HUGE_SHIFT;
 
 /// First LBA of the 4 MiB region. Also the size of the 4 KiB region.
-const HUGE_BASE_LBA: u64 =
-    1 << (SMALL_OFF_BITS + VOL_BITS + IMM_BITS + FLAG_BITS + OP_BITS + SMALL_SHIFT);
+const HUGE_BASE_LBA: u64 = 1 << (SMALL_OFF_BITS + IMM_BITS + FLAG_BITS + OP_BITS + SMALL_SHIFT);
 const MAX_LBA: u64 = HUGE_BASE_LBA * 2;
 
 /// Size the fabric device must be declared with: 4 EiB, entirely sparse. It is an
@@ -265,10 +269,10 @@ pub(crate) const DEVICE_SIZE: u64 = MAX_LBA * BLOCK as u64;
 /// page-aligned and RDMA-friendly.
 pub(crate) const BLOCK: usize = 4096;
 
-/// Pages a 4 KiB volume may hold and still be reachable over the fabric.
-pub(crate) const MAX_SMALL_PAGES: u64 = 1 << SMALL_OFF_BITS;
-/// Pages a 4 MiB volume may hold and still be reachable over the fabric.
-pub(crate) const MAX_HUGE_PAGES: u64 = 1 << HUGE_OFF_BITS;
+// Both regions cover a whole universe, so config validation's `base_lba + blocks <=
+// MAX_LBA` is the only bound a page address needs; the fabric adds none of its own.
+const _: () = assert!(1u64 << SMALL_OFF_BITS == crate::config::MAX_LBA);
+const _: () = assert!((1u64 << HUGE_OFF_BITS) * HUGE_BLOCKS == crate::config::MAX_LBA);
 
 const fn mask(bits: u32) -> u64 {
     (1u64 << bits) - 1
@@ -307,29 +311,49 @@ pub(crate) struct Frame {
     ///
     /// This generalises `ACCEPT`'s encoding, where zero means "you are the proposer,
     /// pick a ballot". On a `GET` it means "give me the linearizable value", which lets
-    /// a node holding neither the slot table nor the catalog for a remote zone still
+    /// a node holding neither the extent table nor the catalog for a remote zone still
     /// take a confirmed read: it hands the whole round to the entry node, where the
     /// members are.
+    ///
+    /// The group-addressed ops borrow it for the page class instead; see `heal.rs`.
     ///
     /// A receiver that is not the addressee forwards, if [`HOPS`] allows.
     pub(crate) imm: u8,
     /// Whether `offset` counts 4 MiB pages rather than 4 KiB ones. Selects the region.
     pub(crate) huge: bool,
-    /// The volume's fabric slot, assigned by the control plane. Not its id.
-    pub(crate) vol: u8,
-    /// Page index within the volume.
-    pub(crate) offset: u32,
+    /// Page index in the universe for a page op; op-specific for the group-addressed
+    /// ops, which name no page at all.
+    pub(crate) offset: u64,
 }
 
 impl Frame {
-    pub(crate) fn new(op: Op, huge: bool, vol: u8, offset: u32) -> Frame {
+    /// A frame naming the page at `lba` in the arriving universe's address space.
+    ///
+    /// `lba` counts 4 KiB blocks whatever the class, because that is the unit the
+    /// control plane places extents in; a 4 MiB page's `lba` is the first of its 1024.
+    pub(crate) fn page(op: Op, huge: bool, lba: u64) -> Frame {
+        Frame::raw(op, huge, if huge { lba / HUGE_BLOCKS } else { lba })
+    }
+
+    /// A frame whose `offset` is not a page index: the anti-entropy and `TERM` ops,
+    /// which name a consensus group. See `heal.rs` for the packing.
+    pub(crate) fn raw(op: Op, huge: bool, offset: u64) -> Frame {
         Frame {
             op,
             flags: 0,
             imm: 0,
             huge,
-            vol,
             offset,
+        }
+    }
+
+    /// The block this frame's page starts at, in the universe's address space. The
+    /// inverse of [`Frame::page`], and meaningless on a group-addressed frame.
+    pub(crate) fn lba(&self) -> u64 {
+        if self.huge {
+            self.offset * HUGE_BLOCKS
+        } else {
+            self.offset
         }
     }
 
@@ -345,11 +369,10 @@ impl Frame {
         } else {
             (SMALL_OFF_BITS, 0, SMALL_SHIFT)
         };
-        let mut id = self.offset as u64 & mask(off_bits);
-        id |= (self.vol as u64 & mask(VOL_BITS)) << off_bits;
-        id |= (self.imm as u64 & mask(IMM_BITS)) << (off_bits + VOL_BITS);
-        id |= (self.flags as u64 & mask(FLAG_BITS)) << (off_bits + VOL_BITS + IMM_BITS);
-        id |= (self.op as u64) << (off_bits + VOL_BITS + IMM_BITS + FLAG_BITS);
+        let mut id = self.offset & mask(off_bits);
+        id |= (self.imm as u64 & mask(IMM_BITS)) << off_bits;
+        id |= (self.flags as u64 & mask(FLAG_BITS)) << (off_bits + IMM_BITS);
+        id |= (self.op as u64) << (off_bits + IMM_BITS + FLAG_BITS);
         base + (id << shift)
     }
 
@@ -369,8 +392,7 @@ impl Frame {
         } else {
             (false, SMALL_OFF_BITS, lba >> SMALL_SHIFT, lba & 1)
         };
-        let vol_sh = off_bits;
-        let imm_sh = vol_sh + VOL_BITS;
+        let imm_sh = off_bits;
         let flag_sh = imm_sh + IMM_BITS;
         let op_sh = flag_sh + FLAG_BITS;
         let op = Op::from_bits(((id >> op_sh) & mask(OP_BITS)) as u8).ok_or(status::BAD)?;
@@ -379,8 +401,7 @@ impl Frame {
             flags: ((id >> flag_sh) & mask(FLAG_BITS)) as u8,
             imm: ((id >> imm_sh) & mask(IMM_BITS)) as u8,
             huge,
-            vol: ((id >> vol_sh) & mask(VOL_BITS)) as u8,
-            offset: (id & mask(off_bits)) as u32,
+            offset: id & mask(off_bits),
         };
         let part = if op.is_control() {
             if block != 0 || blocks != 1 {
@@ -411,16 +432,6 @@ impl Frame {
             ..*self
         }
     }
-
-    /// The frame as it leaves a site, with its budget restored. A crossing is bounded
-    /// by the address rather than by the budget: past it the address is site-local, so
-    /// a second crossing is unreachable and exactly one is possible.
-    pub(crate) fn refreshed(&self) -> Frame {
-        Frame {
-            flags: self.flags | HOPS,
-            ..*self
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -445,15 +456,16 @@ impl Frame {
 //   SNAPNEXT 0 count     1 done     then 3 slots per page (reply)
 //
 // `LEARN`'s slot 3 marks a repair rather than a migration push, which also admits the
-// equal-register case: our entry matches but our bytes fail their checksum. Slot 0 is
-// empty on `SEAL`, whose volume comes from the frame, and on `TERM`, whose group does.
+// equal-register case: our entry matches but our bytes fail their checksum. `SEAL`
+// names an extent rather than a page, so its address is in the trailer and not in the
+// frame; `TERM` names a group, which is in the frame.
 //
 // `MERKLE`, `SNAPOPEN` and `SNAPNEXT` are the anti-entropy ops (`heal.rs`); they and
-// `TERM` name a consensus group rather than a page, so `vol` and `offset` carry
-// something else entirely there. A digest vector fills the block exactly, which is why
-// it is 512 wide and one level deep instead of a tree. `SNAPNEXT` ships
-// `(address, version, ballot)` and no page bytes; the reader pulls what it wants with
-// an ordinary `GET`, so there is one data path and not two.
+// `TERM` name a consensus group rather than a page, so `offset` carries something else
+// entirely there. A digest vector fills the block exactly, which is why it is 512 wide
+// and one level deep instead of a tree. `SNAPNEXT` ships `(address, version, ballot)`
+// and no page bytes; the reader pulls what it wants with an ordinary `GET`, so there is
+// one data path and not two.
 //
 // A 4 MiB `ACCEPT` has no trailer, because a huge frame's whole stride is payload and
 // a ublk request buffer has no address a vectored SQE could gather beside. Its guard
@@ -504,34 +516,48 @@ const HUGE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A peer link. A handle and nothing more: an fd and the peer's id, no per-op state.
 ///
+/// A link is per `(universe, peer)`, not per peer: a peer we share two universes with
+/// publishes two namespaces and we hold two links, one to each. That is the whole of
+/// the partitioning enforcement on the client side - there is no way to phrase a frame
+/// for a universe you hold no namespace of.
+///
 /// `!Send`, like the [`Disk`] it wraps. The runtime registers the file on every core,
 /// so a submission never crosses cores even though one `Link` serves them all.
 pub(crate) struct Link {
     disk: Disk,
     /// The same device on the shorter deadline a 4 MiB command is held to.
     huge: Disk,
+    universe: u32,
     peer: u32,
 }
 
 impl Link {
-    /// Open a link to `p`. The control plane has already attached the peer's fabric
-    /// namespace locally, so this is an `open(2)` and nothing more.
+    /// Open a link to `p` in `universe`. The control plane has already attached the
+    /// peer's fabric namespace for that universe locally, so this is an `open(2)` and
+    /// nothing more.
     ///
     /// Links are opened when a configuration is built and closed when it retires;
     /// re-declaring the same path across a reload keeps the registration, so a live
     /// peer's fd is never disturbed.
-    pub(crate) fn open(c: &Configurator, p: &Peer) -> io::Result<Link> {
+    pub(crate) fn open(c: &Configurator, universe: u32, p: &Peer) -> io::Result<Link> {
         let disk = c.disk(Path::new(&p.device), Some(TIMEOUT), None)?;
         let huge = disk.by(HUGE_TIMEOUT);
         Ok(Link {
             disk,
             huge,
+            universe,
             peer: p.id,
         })
     }
 
     pub(crate) fn peer(&self) -> u32 {
         self.peer
+    }
+
+    /// The universe this namespace belongs to. Every frame sent here is in its address
+    /// space, and no other.
+    pub(crate) fn universe(&self) -> u32 {
+        self.universe
     }
 
     /// Issue one frame. This is the whole client API.
@@ -592,13 +618,12 @@ mod tests {
                 for flags in 0..8u8 {
                     for imm in 0..4u8 {
                         // Alternating bits, so a field landing at the wrong shift shows.
-                        let offset = if huge { 0x55_5555 } else { 0x5555_5555 };
+                        let offset = if huge { 0x555_5555 } else { 0x15_5555_5555 };
                         let f = Frame {
                             op,
                             flags,
                             imm,
                             huge,
-                            vol: 0b101010,
                             offset,
                         };
                         let (g, _) = Frame::decode(f.encode(), BLOCK).unwrap();
@@ -616,16 +641,14 @@ mod tests {
             flags: 7,
             imm: 3,
             huge: false,
-            vol: 63,
-            offset: u32::MAX,
+            offset: mask(SMALL_OFF_BITS),
         };
         let huge = Frame {
             op: Op::Ping,
             flags: 7,
             imm: 3,
             huge: true,
-            vol: 63,
-            offset: (MAX_HUGE_PAGES - 1) as u32,
+            offset: mask(HUGE_OFF_BITS),
         };
         assert!(small.encode() < HUGE_BASE_LBA);
         assert!(huge.encode() >= HUGE_BASE_LBA);
@@ -635,9 +658,25 @@ mod tests {
         assert!(DEVICE_SIZE < i64::MAX as u64);
     }
 
+    /// Every address the control plane may hand out is nameable in both classes, which
+    /// is what lets an extent sit anywhere in its universe's space.
+    #[test]
+    fn a_frame_reaches_the_whole_universe() {
+        let last = crate::config::MAX_LBA - 1;
+        let f = Frame::page(Op::Get, false, last);
+        assert_eq!(Frame::decode(f.encode(), BLOCK).unwrap().0.lba(), last);
+
+        let last_huge = crate::config::MAX_LBA - HUGE_BLOCKS;
+        let g = Frame::page(Op::Get, true, last_huge);
+        assert_eq!(
+            Frame::decode(g.encode(), BLOCK * 1024).unwrap().0.lba(),
+            last_huge
+        );
+    }
+
     #[test]
     fn classifies_frame_shape() {
-        let get = Frame::new(Op::Get, false, 1, 7);
+        let get = Frame::page(Op::Get, false, 7);
         assert_eq!(
             Frame::decode(get.encode(), BLOCK).unwrap().1,
             Part::Payload { off: 0 }
@@ -651,7 +690,7 @@ mod tests {
         // Three blocks is not a shape a 4 KiB frame has.
         assert!(Frame::decode(get.encode(), 3 * BLOCK).is_err());
 
-        let ping = Frame::new(Op::Ping, false, 0, 0);
+        let ping = Frame::page(Op::Ping, false, 0);
         assert_eq!(
             Frame::decode(ping.encode(), BLOCK).unwrap().1,
             Part::Trailer
@@ -659,7 +698,8 @@ mod tests {
         assert!(Frame::decode(ping.encode(), 2 * BLOCK).is_err());
 
         // A 4 MiB page arrives in whatever pieces the peer's MDTS produced.
-        let huge = Frame::new(Op::Get, true, 2, 9);
+        let huge = Frame::page(Op::Get, true, 9 * HUGE_BLOCKS);
+        assert_eq!(huge.offset, 9);
         for (block, blocks) in [(0u64, 1024u64), (0, 256), (256, 256), (1023, 1)] {
             let (g, p) = Frame::decode(huge.encode() + block, blocks as usize * BLOCK).unwrap();
             assert_eq!(g, huge);
@@ -673,7 +713,7 @@ mod tests {
         // Never past the end of the page.
         assert!(Frame::decode(huge.encode() + 1, 1024 * BLOCK).is_err());
         // A 4 MiB TRIM is a control frame and stays one block.
-        let trim = Frame::new(Op::Trim, true, 2, 9);
+        let trim = Frame::page(Op::Trim, true, 9 * HUGE_BLOCKS);
         assert_eq!(
             Frame::decode(trim.encode(), BLOCK).unwrap().1,
             Part::Trailer
@@ -706,7 +746,7 @@ mod tests {
         // Opcodes 12..31 are unassigned; a peer running a newer build must not be able
         // to make us do something by accident.
         for raw in 12..32u64 {
-            let sh = SMALL_OFF_BITS + VOL_BITS + IMM_BITS + FLAG_BITS;
+            let sh = SMALL_OFF_BITS + IMM_BITS + FLAG_BITS;
             assert_eq!(
                 Frame::decode((raw << sh) << SMALL_SHIFT, BLOCK),
                 Err(status::BAD)
@@ -718,7 +758,7 @@ mod tests {
     fn forwarding_preserves_the_request() {
         // A forward changes nothing but how far the frame may still go, which is what
         // makes it work in both directions and at either frame shape.
-        let mut f = Frame::new(Op::GetMeta, false, 3, 9);
+        let mut f = Frame::page(Op::GetMeta, false, 9);
         f.flags = 2 | CACHE_ONLY;
         f.imm = 2;
         let g = f.forwarded();
