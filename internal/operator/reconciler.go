@@ -368,32 +368,56 @@ const stalePlanRequeue = time.Second
 // pass only has to observe it.
 const statusConflictRequeue = time.Second
 
-// applyOverrides merges user-supplied overrides into a plan, or removes the
-// workloads they would have targeted when the document cannot be used.
+// applyOverrides merges user-supplied overrides into a plan, and removes the
+// workloads whose overrides could not be used.
+//
+// The two halves are independent, which is the point. A document with one bad
+// entry still applies every other entry; only the workloads the bad entry could
+// have targeted are withheld. A key that failed to parse names nothing, so
+// every overridable workload is withheld, because there is no way to know what
+// it would have changed.
 //
 // The returned error requeues the pass. It is deliberately not attributed to a
 // single component: the overrides ConfigMap is cluster-scoped and one document
 // routinely targets several components, so a document-level failure belongs to
 // the pass rather than to whichever component happened to be planned first.
 func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideSnapshot, sites []unboundedv1alpha3.Site) (*override.Report, error) {
-	if snapshot.blocksWorkloads() {
-		withheld := dropOverridableOperations(plan, snapshot.err)
+	withheld := dropOverridableOperations(plan, snapshot.quarantine())
 
-		logger.Error(snapshot.err, "overrides could not be used; leaving managed workloads unchanged",
+	if len(withheld) > 0 {
+		logger.Error(snapshot.failure(), "overrides could not be used; leaving the affected workloads unchanged",
 			"configMap", override.ConfigMapName,
 			"withheldWorkloads", len(withheld),
 			"resourceVersion", snapshot.resourceVersion)
-
-		return &override.Report{Withheld: withheld},
-			fmt.Errorf("overrides unusable, %d workloads left unchanged: %w", len(withheld), snapshot.err)
 	}
 
-	if !snapshot.usable() || len(snapshot.entries) == 0 {
-		return nil, nil
+	var report *override.Report
+
+	if snapshot.usable() && len(snapshot.entries) > 0 {
+		applied := override.Apply(plan, snapshot.entries, siteNames(sites))
+		report = &applied
+
+		logOverrideReport(logger, applied)
+	} else {
+		report = &override.Report{}
 	}
 
-	report := override.Apply(plan, snapshot.entries, siteNames(sites))
+	report.Withheld = append(report.Withheld, withheld...)
 
+	switch {
+	case report.Failed():
+		return report, fmt.Errorf("overrides could not be applied to some workloads: %w", report.Err())
+	case len(withheld) > 0:
+		return report, fmt.Errorf("overrides unusable, %d workload(s) left unchanged: %w",
+			len(withheld), snapshot.failure())
+	}
+
+	return report, nil
+}
+
+// logOverrideReport records the outcomes that are worth saying out loud but are
+// not failures.
+func logOverrideReport(logger logr.Logger, report override.Report) {
 	for _, unmatched := range report.UnmatchedSites {
 		logger.Info("override names a Site that does not exist; it is inert until the Site is created",
 			"site", unmatched, "configMap", override.ConfigMapName)
@@ -418,12 +442,6 @@ func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideS
 				"workload", workload.Ref.String(), "drift", workload.VersionDrift)
 		}
 	}
-
-	if report.Failed() {
-		return &report, fmt.Errorf("overrides could not be applied to some workloads: %w", report.Err())
-	}
-
-	return &report, nil
 }
 
 // componentOutcome is a component's planning verdict, held until execution
@@ -774,13 +792,31 @@ func overrideConfigMapEvent(
 	report *override.Report,
 	exec component.ExecutionResult,
 ) (eventType, reason, note string) {
-	if snapshot.blocksWorkloads() {
-		return corev1.EventTypeWarning, "OverridesRejected",
-			fmt.Sprintf("overrides were not applied and managed workloads were left unchanged: %v", snapshot.err)
-	}
-
 	if report == nil {
 		return "", "", ""
+	}
+
+	// A ConfigMap that exists but asks for nothing deserves no Event. Without
+	// this, a document with no entries would produce a Normal "0 workload(s)
+	// overridden" every time its resourceVersion changed.
+	if len(report.Withheld) == 0 && len(report.Workloads) == 0 && len(report.InertEntries) == 0 {
+		return "", "", ""
+	}
+
+	// Withheld workloads outrank everything below: the user asked for something
+	// the operator refused to write, and saying how many and why is the most
+	// useful thing this Event can carry.
+	if len(report.Withheld) > 0 {
+		reason := "OverridesRejected"
+		if len(report.Workloads) > 0 {
+			// Some entries did apply, so calling the whole document rejected
+			// would misdescribe what happened to the rest of it.
+			reason = "OverridesPartiallyRejected"
+		}
+
+		return corev1.EventTypeWarning, reason,
+			fmt.Sprintf("%d workload(s) were left unchanged because their overrides could not be used: %v",
+				len(report.Withheld), snapshot.failure())
 	}
 
 	if err := report.Err(); err != nil {

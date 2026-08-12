@@ -5,6 +5,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -19,8 +20,8 @@ import (
 
 // overrideState is what a pass found when it read the overrides ConfigMap.
 //
-// The four states are distinguished because conflating them turns a typo into
-// an uninstall: removing overrides is a deliberate request for defaults, while
+// The states are distinguished because conflating them turns a typo into an
+// uninstall: removing overrides is a deliberate request for defaults, while
 // breaking the document is not.
 type overrideState int
 
@@ -29,10 +30,16 @@ const (
 	// the requested outcome.
 	overridesAbsent overrideState = iota
 
-	// overridesValid means the document parsed and validated.
+	// overridesValid means every key parsed and every entry validated.
 	overridesValid
 
-	// overridesInvalid means the document exists but could not be used.
+	// overridesPartial means some entries are usable and some are not. The
+	// usable ones are merged; the workloads the unusable ones could have
+	// targeted are withheld.
+	overridesPartial
+
+	// overridesInvalid means nothing usable could be read: the payload failed
+	// as a whole, or every key failed to parse.
 	overridesInvalid
 
 	// overridesUnreadable means the API read failed. Treated as invalid for
@@ -51,7 +58,15 @@ type overrideSnapshot struct {
 	state           overrideState
 	entries         []override.SourcedEntry
 	resourceVersion string
-	err             error
+
+	// problems are the parse and validation failures, each carrying what it
+	// could have targeted so the withholding can be scoped to those workloads.
+	problems []override.Problem
+
+	// err is set only for a failure of the payload as a whole: an API read that
+	// failed, or a limit that applies across every key. A per-key or per-entry
+	// failure is in problems instead, because it can be attributed.
+	err error
 
 	// configMap is the object the snapshot was read from, kept so Events can
 	// be recorded against the thing the user actually edited. It is nil when
@@ -60,29 +75,169 @@ type overrideSnapshot struct {
 	configMap *corev1.ConfigMap
 }
 
-// usable reports whether overrides can be merged this pass.
+// usable reports whether any override can be merged this pass.
 func (s overrideSnapshot) usable() bool {
-	return s.state == overridesValid
+	return s.state == overridesValid || s.state == overridesPartial
 }
 
-// blocksWorkloads reports whether workload operations must be skipped.
+// failure renders everything wrong with the document as one error, for the pass
+// error and for the Event on the ConfigMap.
+func (s overrideSnapshot) failure() error {
+	if s.err != nil {
+		return s.err
+	}
+
+	return override.ProblemsError(s.problems)
+}
+
+// quarantine returns the workloads this pass must not write.
 //
-// Skipping rather than reverting is the core of the failure model. Applying
-// vanilla manifests on invalid input is not a safe fallback, because defaults
-// are not the current state: falling back rewrites running infrastructure, and
-// a single mis-indented line would strip resources, tolerations, sidecars and
-// pinned images from every component at once and roll all of them, including a
-// zero-available window on the two host-networked workloads that use
+// Withholding rather than reverting is the core of the failure model. Applying
+// vanilla manifests over a workload whose override could not be read is not a
+// safe fallback, because defaults are not the current state: falling back
+// rewrites running infrastructure, and a single mis-indented line would strip
+// resources, tolerations, sidecars and pinned images and roll the workload,
+// including a zero-available window on the host-networked workloads that use
 // maxSurge: 0.
-func (s overrideSnapshot) blocksWorkloads() bool {
-	return s.state == overridesInvalid || s.state == overridesUnreadable
+//
+// The scope of the withholding is what changed. A failure whose targets are
+// knowable withholds only those; one whose targets are not knowable withholds
+// everything an override could reach.
+func (s overrideSnapshot) quarantine() overrideQuarantine {
+	switch s.state {
+	case overridesAbsent, overridesValid:
+		return overrideQuarantine{}
+	case overridesUnreadable:
+		return overrideQuarantine{all: true, cause: s.err}
+	}
+
+	if s.err != nil {
+		// A payload-level failure: no key is at fault and none could be read.
+		return overrideQuarantine{all: true, cause: s.err}
+	}
+
+	return quarantineFor(s.problems)
+}
+
+// overrideQuarantine is the set of workloads a pass must not write because the
+// overrides that would have shaped them could not be used.
+type overrideQuarantine struct {
+	// all withholds every overridable workload. It is set for a failure whose
+	// targets cannot be known: a key that did not parse, so the entries it held
+	// were never read, or a payload that could not be read at all.
+	all bool
+
+	// cause explains an `all` quarantine, which belongs to no single entry.
+	cause error
+
+	// targets withhold specific workloads.
+	targets []quarantineTarget
+}
+
+// quarantineTarget is one component's workloads put in doubt by one problem.
+type quarantineTarget struct {
+	component string
+
+	// kind is empty when the offending entry named no usable kind, in which
+	// case every kind the component emits is in doubt.
+	kind string
+
+	// sites is nil when every Site is in doubt, which is what an absent or
+	// empty selector means.
+	sites map[string]bool
+
+	problem override.Problem
+}
+
+// quarantineFor works out what a set of problems puts in doubt.
+//
+// An entry naming no component is skipped entirely rather than treated as
+// unknowable. Resolution matches on component, so such an entry could never
+// have resolved to a workload and withholding anything for it would punish the
+// rest of the document for a typo that changed nothing.
+func quarantineFor(problems []override.Problem) overrideQuarantine {
+	var q overrideQuarantine
+
+	for _, problem := range problems {
+		if problem.KeyLevel() {
+			q.all = true
+			q.cause = override.ProblemsError(problems)
+
+			return q
+		}
+
+		if problem.Component == "" {
+			continue
+		}
+
+		q.targets = append(q.targets, quarantineTarget{
+			component: problem.Component,
+			kind:      problem.Kind,
+			sites:     siteSet(problem.Sites),
+			problem:   problem,
+		})
+	}
+
+	return q
+}
+
+// siteSet turns a Site selector into a lookup, treating both an absent and an
+// empty selector as every Site. An entry that named no Site could have meant
+// any of them, so the conservative reading is the safe one.
+func siteSet(sites []string) map[string]bool {
+	if len(sites) == 0 {
+		return nil
+	}
+
+	out := make(map[string]bool, len(sites))
+	for _, site := range sites {
+		out[site] = true
+	}
+
+	return out
+}
+
+// empty reports whether the quarantine withholds nothing.
+func (q overrideQuarantine) empty() bool {
+	return !q.all && len(q.targets) == 0
+}
+
+// covers reports whether an operation must be withheld, and why.
+func (q overrideQuarantine) covers(op component.Operation) (error, bool) {
+	if !op.Overridable {
+		return nil, false
+	}
+
+	if q.all {
+		return q.cause, true
+	}
+
+	for _, target := range q.targets {
+		if target.component != op.Component {
+			continue
+		}
+
+		if target.kind != "" && target.kind != op.Object.GetKind() {
+			continue
+		}
+
+		// A cluster singleton carries no Site and is withheld by any entry
+		// naming its component, whatever that entry said about Sites.
+		if target.sites != nil && op.Site != "" && !target.sites[op.Site] {
+			continue
+		}
+
+		return errors.New(target.problem.String()), true
+	}
+
+	return nil, false
 }
 
 // loadOverrides reads and validates the overrides ConfigMap once per pass.
 //
 // Parsing and validation are pure functions of the payload, so this is the
 // atomic part of the pass: if it fails, nothing has been written, and nothing
-// will be for any workload an override could target.
+// will be for any workload the failure puts in doubt.
 func loadOverrides(ctx context.Context, env *component.Env) overrideSnapshot {
 	key := client.ObjectKey{Namespace: env.Namespace, Name: override.ConfigMapName}
 
@@ -105,7 +260,7 @@ func loadOverrides(ctx context.Context, env *component.Env) overrideSnapshot {
 		configMap:       configMap.DeepCopy(),
 	}
 
-	entries, err := override.Parse(configMap.Data)
+	entries, problems, err := override.Parse(configMap.Data)
 	if err != nil {
 		snapshot.state = overridesInvalid
 		snapshot.err = err
@@ -113,43 +268,88 @@ func loadOverrides(ctx context.Context, env *component.Env) overrideSnapshot {
 		return snapshot
 	}
 
-	if err := override.Validate(entries); err != nil {
-		snapshot.state = overridesInvalid
-		snapshot.err = err
+	// Validation runs on the entries that parsed. An entry that failed to parse
+	// is already accounted for and cannot be validated.
+	problems = append(problems, override.Validate(entries)...)
 
-		return snapshot
+	// Entries that themselves failed validation must not be merged, even though
+	// they parsed. Their workloads are withheld by the quarantine; leaving the
+	// entry in would apply a patch that was just declared invalid.
+	entries = usableEntries(entries, problems)
+
+	switch {
+	case len(problems) == 0:
+		snapshot.state = overridesValid
+	case len(entries) == 0:
+		snapshot.state = overridesInvalid
+	default:
+		snapshot.state = overridesPartial
 	}
 
-	snapshot.state = overridesValid
 	snapshot.entries = entries
+	snapshot.problems = problems
 
 	return snapshot
 }
 
-// dropOverridableOperations removes every workload an override could target.
+// usableEntries drops the entries that any problem names, so a document with
+// one bad entry still applies the rest.
+func usableEntries(entries []override.SourcedEntry, problems []override.Problem) []override.SourcedEntry {
+	if len(problems) == 0 {
+		return entries
+	}
+
+	rejected := make(map[override.Source]bool, len(problems))
+
+	for _, problem := range problems {
+		if problem.Source != nil {
+			rejected[*problem.Source] = true
+		}
+	}
+
+	kept := make([]override.SourcedEntry, 0, len(entries))
+
+	for _, entry := range entries {
+		if rejected[entry.Source] {
+			continue
+		}
+
+		kept = append(kept, entry)
+	}
+
+	return kept
+}
+
+// dropOverridableOperations removes the workloads a quarantine covers.
 //
-// Only Overridable operations are dropped. RBAC, Services, component
+// Only Overridable operations are candidates. RBAC, Services, component
 // ConfigMaps, adoptions and deletes all still execute, so an override typo does
 // not stop the operator doing its other work. The cost, which is deliberate, is
-// that drift on those workloads is not corrected until the document is fixed.
-func dropOverridableOperations(plan *component.Plan, cause error) []override.WithheldOperation {
+// that drift on the withheld workloads is not corrected until the document is
+// fixed.
+func dropOverridableOperations(plan *component.Plan, q overrideQuarantine) []override.WithheldOperation {
+	if q.empty() {
+		return nil
+	}
+
 	kept := make([]component.Operation, 0, len(plan.Operations))
 
 	var withheld []override.WithheldOperation
 
 	for _, op := range plan.Operations {
-		if op.Overridable {
-			withheld = append(withheld, override.WithheldOperation{
-				Ref:       op.Ref(),
-				Component: op.Component,
-				Site:      op.Site,
-				Err:       cause,
-			})
+		cause, covered := q.covers(op)
+		if !covered {
+			kept = append(kept, op)
 
 			continue
 		}
 
-		kept = append(kept, op)
+		withheld = append(withheld, override.WithheldOperation{
+			Ref:       op.Ref(),
+			Component: op.Component,
+			Site:      op.Site,
+			Err:       cause,
+		})
 	}
 
 	plan.Operations = kept
@@ -206,15 +406,23 @@ func overrideStatusFor(
 		ObservedResourceVersion: snapshot.resourceVersion,
 	}
 
-	if snapshot.blocksWorkloads() {
-		status.Phase = unboundedv1alpha3.OverridePhaseDegraded
-		status.Message = truncateMessage(snapshot.err.Error())
-
+	if report == nil {
 		return status
 	}
 
-	if report == nil {
-		return status
+	// A withheld workload belonging to this Site makes it Degraded, whether or
+	// not any other workload merged cleanly. Reporting Applied because the
+	// entries that did work worked would hide the one that did not.
+	for _, withheld := range report.Withheld {
+		if withheld.Site != "" && withheld.Site != site {
+			continue
+		}
+
+		status.Phase = unboundedv1alpha3.OverridePhaseDegraded
+
+		if status.Message == "" && withheld.Err != nil {
+			status.Message = truncateMessage(withheld.Err.Error())
+		}
 	}
 
 	applied := appliedHashes(plan, exec)

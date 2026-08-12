@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
@@ -73,6 +74,55 @@ func (c overridableCluster) Plan(context.Context, *component.Env, []unboundedv1a
 	return plan, component.Reconciled(), nil
 }
 
+// overridableSite is a SiteComponent that plans one overridable per-Site
+// workload, so tests can assert that a failure naming one component leaves the
+// others reconciling.
+type overridableSite struct{}
+
+func (overridableSite) Name() string          { return "metalman" }
+func (overridableSite) ConditionType() string { return "MetalmanReady" }
+
+func (overridableSite) Enabled(site *unboundedv1alpha3.Site) bool {
+	return site.Spec.Components.Metalman != nil &&
+		unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Metalman.SiteComponentSpec)
+}
+
+func (c overridableSite) Plan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	workload := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "metalman-controller-" + site.Name, "namespace": env.Namespace},
+		"spec": map[string]any{
+			"replicas": int64(1),
+			"selector": map[string]any{"matchLabels": map[string]any{"app": "metalman"}},
+			"template": map[string]any{
+				"metadata": map[string]any{"labels": map[string]any{"app": "metalman"}},
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{
+							"name":  "metalman",
+							"image": "ghcr.io/azure/metalman:v1",
+							"args":  []any{"serve-pxe", "--site=" + site.Name},
+						},
+					},
+				},
+			},
+		},
+	}}
+
+	plan := component.NewPlan()
+	plan.Add(component.Operation{
+		Kind: component.OpApply, Object: workload,
+		Component: c.Name(), Site: site.Name, Overridable: true,
+	})
+
+	return plan, component.Reconciled(), nil
+}
+
+func (c overridableSite) CleanupPlan(context.Context, *component.Env, *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	return component.NewPlan(), component.Disabled("component disabled"), nil
+}
+
 // overrideTestEnv builds a reconciler whose applies are recorded, so tests can
 // assert exactly which objects reached the cluster.
 func overrideTestEnv(t *testing.T, objects ...client.Object) (*SiteReconciler, *[]string, client.Client) {
@@ -110,6 +160,7 @@ func overrideTestEnv(t *testing.T, objects ...client.Object) (*SiteReconciler, *
 		Scheme: scheme,
 		Registry: &component.Registry{
 			Cluster: []component.ClusterComponent{overridableCluster{}},
+			Site:    []component.SiteComponent{overridableSite{}},
 		},
 	}, &applied, cl
 }
@@ -350,8 +401,8 @@ func TestOverrideSnapshotStates(t *testing.T) {
 		}
 
 		snapshot := loadOverrides(t.Context(), env)
-		if snapshot.state != overridesAbsent || snapshot.blocksWorkloads() {
-			t.Fatalf("snapshot = %+v, want absent and non-blocking", snapshot)
+		if snapshot.state != overridesAbsent || !snapshot.quarantine().empty() {
+			t.Fatalf("snapshot = %+v, want absent and withholding nothing", snapshot)
 		}
 	})
 
@@ -373,7 +424,7 @@ func TestOverrideSnapshotStates(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid blocks workloads", func(t *testing.T) {
+	t.Run("a key that does not parse withholds everything", func(t *testing.T) {
 		env := &component.Env{
 			Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(overridesConfigMap(map[string]string{
 				"a.yaml": "overrides: []\n",
@@ -382,8 +433,14 @@ func TestOverrideSnapshotStates(t *testing.T) {
 		}
 
 		snapshot := loadOverrides(t.Context(), env)
-		if snapshot.usable() || !snapshot.blocksWorkloads() {
-			t.Fatalf("snapshot = %+v, want invalid and blocking", snapshot)
+		if snapshot.usable() {
+			t.Fatalf("snapshot = %+v, want unusable", snapshot)
+		}
+
+		// The key held no readable entries, so there is no way to know what it
+		// would have changed and every overridable workload is in doubt.
+		if q := snapshot.quarantine(); !q.all {
+			t.Fatalf("quarantine = %+v, want everything withheld", q)
 		}
 	})
 }
@@ -398,7 +455,10 @@ func TestDropOverridableOperationsKeepsEverythingElse(t *testing.T) {
 		component.Operation{Kind: component.OpDelete, Object: unstructuredOf("apps/v1", "DaemonSet", "legacy"), Component: "gantry"},
 	)
 
-	withheld := dropOverridableOperations(plan, errors.New("document is unusable"))
+	withheld := dropOverridableOperations(plan, overrideQuarantine{
+		all:   true,
+		cause: errors.New("document is unusable"),
+	})
 
 	if len(withheld) != 1 {
 		t.Fatalf("withheld = %d, want 1", len(withheld))
@@ -902,9 +962,21 @@ func TestInvalidDocumentLeavesComponentsNotReady(t *testing.T) {
 func TestOverrideStatusMessageIsBounded(t *testing.T) {
 	huge := strings.Repeat("this document is deeply and repetitively wrong. ", 200000)
 
+	report := &override.Report{
+		Withheld: []override.WithheldOperation{{
+			Ref:       component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "node")),
+			Component: "net",
+			Err:       errors.New(huge),
+		}},
+	}
+
 	status := overrideStatusFor("edge",
 		overrideSnapshot{state: overridesInvalid, err: errors.New(huge), resourceVersion: "7"},
-		nil, component.NewPlan(), component.ExecutionResult{})
+		report, component.NewPlan(), component.ExecutionResult{})
+
+	if status.Phase != unboundedv1alpha3.OverridePhaseDegraded {
+		t.Fatalf("phase = %q, want Degraded", status.Phase)
+	}
 
 	if len(status.Message) > maxStatusMessage {
 		t.Fatalf("message is %d bytes, over the %d byte cap", len(status.Message), maxStatusMessage)
@@ -1063,6 +1135,240 @@ func TestSiteEventFollowsStatusPersistence(t *testing.T) {
 	for _, event := range recorder.events {
 		if event.name == "edge" {
 			t.Fatalf("an Event described a Site status transition that was never committed: %+v", event)
+		}
+	}
+}
+
+// TestQuarantineScopesWithholdingToWhatIsActuallyInDoubt is the regression test
+// for the blast radius of a broken document.
+//
+// One typo used to withhold every overridable workload of every component on
+// every Site, and discard the entries in every other ConfigMap key while doing
+// it. The format is one document per key so a document can be split by concern
+// or by team, and that is only useful if a mistake in one key is contained.
+func TestQuarantineScopesWithholdingToWhatIsActuallyInDoubt(t *testing.T) {
+	planFor := func() *component.Plan {
+		plan := component.NewPlan()
+		plan.Add(
+			component.Operation{
+				Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", "unbounded-net-node"),
+				Component: "net", Overridable: true,
+			},
+			component.Operation{
+				Kind: component.OpApply, Object: unstructuredOf("apps/v1", "Deployment", "machina-controller"),
+				Component: "machina", Overridable: true,
+			},
+			component.Operation{
+				Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", "storage-west"),
+				Component: "storage", Site: "edge-west", Overridable: true,
+			},
+			component.Operation{
+				Kind: component.OpApply, Object: unstructuredOf("apps/v1", "DaemonSet", "storage-east"),
+				Component: "storage", Site: "edge-east", Overridable: true,
+			},
+			component.Operation{
+				Kind: component.OpApply, Object: unstructuredOf("v1", "ConfigMap", "cfg"),
+				Component: "net",
+			},
+		)
+
+		return plan
+	}
+
+	withheldNames := func(withheld []override.WithheldOperation) []string {
+		names := make([]string, 0, len(withheld))
+		for _, op := range withheld {
+			names = append(names, op.Ref.Name)
+		}
+
+		sort.Strings(names)
+
+		return names
+	}
+
+	t.Run("an entry naming a component and Site withholds only that workload", func(t *testing.T) {
+		source := override.Source{Key: "a.yaml", Index: 0}
+		q := quarantineFor([]override.Problem{{
+			Key: "a.yaml", Source: &source,
+			Component: "storage", Kind: "DaemonSet", Sites: []string{"edge-west"},
+			Err: errors.New("nope"),
+		}})
+
+		plan := planFor()
+
+		got := withheldNames(dropOverridableOperations(plan, q))
+		if len(got) != 1 || got[0] != "storage-west" {
+			t.Fatalf("withheld = %v, want only storage-west", got)
+		}
+
+		if len(plan.Operations) != 4 {
+			t.Fatalf("remaining = %d, want everything else to keep reconciling", len(plan.Operations))
+		}
+	})
+
+	t.Run("an entry naming no kind withholds every kind that component emits", func(t *testing.T) {
+		source := override.Source{Key: "a.yaml", Index: 0}
+		q := quarantineFor([]override.Problem{{
+			Key: "a.yaml", Source: &source, Component: "storage", Err: errors.New("nope"),
+		}})
+
+		got := withheldNames(dropOverridableOperations(planFor(), q))
+		if len(got) != 2 {
+			t.Fatalf("withheld = %v, want both Sites' storage workloads", got)
+		}
+	})
+
+	// Resolution matches on component, so an entry naming none could never have
+	// resolved to a workload. Withholding anything for it would punish the rest
+	// of the document for a typo that changed nothing.
+	t.Run("an entry naming no component withholds nothing", func(t *testing.T) {
+		source := override.Source{Key: "a.yaml", Index: 0}
+		q := quarantineFor([]override.Problem{{
+			Key: "a.yaml", Source: &source, Err: errors.New("component is required"),
+		}})
+
+		if !q.empty() {
+			t.Fatalf("quarantine = %+v, want nothing withheld", q)
+		}
+	})
+
+	// A key that did not parse held entries nobody read, so there is no way to
+	// know what it would have changed.
+	t.Run("a key that did not parse withholds everything", func(t *testing.T) {
+		q := quarantineFor([]override.Problem{{Key: "a.yaml", Err: errors.New("broken")}})
+
+		plan := planFor()
+
+		got := withheldNames(dropOverridableOperations(plan, q))
+		if len(got) != 4 {
+			t.Fatalf("withheld = %v, want every overridable workload", got)
+		}
+
+		// Even then, only the workloads. RBAC, Services and ConfigMaps must
+		// keep reconciling, or an override typo becomes an outage.
+		if len(plan.Operations) != 1 || plan.Operations[0].Object.GetKind() != "ConfigMap" {
+			t.Fatalf("remaining = %+v, want the non-overridable operations untouched", plan.Operations)
+		}
+	})
+}
+
+// TestLoadOverridesKeepsUsableEntriesAlongsideBrokenOnes pins that a document
+// with one bad entry still applies the rest of itself.
+func TestLoadOverridesKeepsUsableEntriesAlongsideBrokenOnes(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+
+	good := `apiVersion: ` + override.APIVersion + `
+overrides:
+  - component: net
+    kind: DaemonSet
+    extraArgs:
+      node: [--flag]
+`
+
+	// machina emits no DaemonSet, so this entry can never match anything.
+	bad := `apiVersion: ` + override.APIVersion + `
+overrides:
+  - component: machina
+    kind: DaemonSet
+    extraArgs:
+      machina-controller: [--flag]
+`
+
+	env := &component.Env{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(overridesConfigMap(map[string]string{
+			"good.yaml": good,
+			"bad.yaml":  bad,
+		})).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	snapshot := loadOverrides(t.Context(), env)
+
+	if snapshot.state != overridesPartial {
+		t.Fatalf("state = %v, want partial", snapshot.state)
+	}
+
+	if len(snapshot.entries) != 1 || snapshot.entries[0].Entry.Component != "net" {
+		t.Fatalf("entries = %+v, want the net entry to survive", snapshot.entries)
+	}
+
+	// The entry that failed validation must not be merged even though it
+	// parsed: applying a patch just declared invalid is worse than not applying
+	// it.
+	for _, entry := range snapshot.entries {
+		if entry.Source.Key == "bad.yaml" {
+			t.Fatal("an entry that failed validation must not be merged")
+		}
+	}
+
+	q := snapshot.quarantine()
+	if q.all {
+		t.Fatal("a per-entry failure must not withhold every workload")
+	}
+
+	if len(q.targets) != 1 || q.targets[0].component != "machina" {
+		t.Fatalf("quarantine targets = %+v, want machina alone", q.targets)
+	}
+}
+
+// TestBadEntryLeavesUnrelatedComponentsReady is the end-to-end form of the
+// blast-radius fix.
+//
+// An entry that fails validation used to withhold every overridable workload of
+// every component on every Site, so one typo turned NetReady, MachinaReady,
+// GantryReady, MetalmanReady and StorageReady False everywhere at once. Any
+// automation gating on `kubectl wait --for=condition=NetReady` broke on a
+// mistake in an unrelated part of the document.
+func TestBadEntryLeavesUnrelatedComponentsReady(t *testing.T) {
+	enabled := true
+	site := siteFor("edge")
+	site.Spec.Components.Metalman = &unboundedv1alpha3.MetalmanComponentSpec{
+		SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled},
+	}
+
+	// spec.replicas on metalman is owned by spec.components.metalman.replicas,
+	// so this entry is rejected. Nothing about it concerns net.
+	document := "apiVersion: " + override.APIVersion + `
+overrides:
+  - component: metalman
+    kind: Deployment
+    patch:
+      spec:
+        replicas: 3
+`
+
+	r, _, cl := overrideTestEnv(t, site, overridesConfigMap(map[string]string{"overrides.yaml": document}))
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err == nil {
+		t.Fatal("a rejected entry must still fail the pass, so it requeues and is logged")
+	}
+
+	var got unboundedv1alpha3.Site
+	if err := cl.Get(t.Context(), client.ObjectKey{Name: "edge"}, &got); err != nil {
+		t.Fatalf("get site: %v", err)
+	}
+
+	// The component the entry named did not write what it planned.
+	metalmanReady := apimeta.FindStatusCondition(got.Status.Conditions, "MetalmanReady")
+	if metalmanReady == nil || metalmanReady.Status != metav1.ConditionFalse {
+		t.Fatalf("MetalmanReady = %+v, want False", metalmanReady)
+	}
+
+	if metalmanReady.Reason != component.ReasonOverrideNotApplied {
+		t.Fatalf("MetalmanReady reason = %q, want %q", metalmanReady.Reason, component.ReasonOverrideNotApplied)
+	}
+
+	// Every other component is untouched by a metalman entry and must still be
+	// reconciling.
+	for _, conditionType := range []string{"NetReady"} {
+		condition := apimeta.FindStatusCondition(got.Status.Conditions, conditionType)
+		if condition == nil {
+			t.Fatalf("%s condition not found", conditionType)
+		}
+
+		if condition.Status != metav1.ConditionTrue {
+			t.Fatalf("%s = %s (%s: %s), want True: a metalman entry puts no other component in doubt",
+				conditionType, condition.Status, condition.Reason, condition.Message)
 		}
 	}
 }
