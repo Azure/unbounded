@@ -1,10 +1,7 @@
-//! Six nodes, six processes, one cluster: everything a client can observe. Every
-//! assertion goes through a ublk device, half of them through a node that does not hold
-//! the page. Separate processes because only one runtime may exist per process.
-//!
-//! Each node's store is a file on its own ext4, on a loop device backed by a memfd, so
-//! the test never touches real storage. Peers are wired straight to each other's fabric
-//! block device, so only the nvme-of transport is left out.
+//! Six-node cluster end-to-end. Every assertion goes through a ublk device, half through a
+//! node that does not hold the page; one process per node, since only one runtime may exist
+//! per process. Each store is a file on ext4 over a loop device on a memfd, so no real
+//! storage is used. Peers attach to each other's fabric device; only nvme-of is untested.
 
 // Real processes over real kernel interfaces; `sim` replaces them with an event queue.
 #![cfg(not(feature = "sim"))]
@@ -20,8 +17,7 @@ use racer::config::Config;
 
 const NODES: u32 = 7;
 const ROOT: &str = "/tmp/racer-e2e";
-/// Room for the store twice over: a rebuild lays a fresh one down before the file
-/// system has finished accounting for the one it just removed.
+/// Room for two stores: a rebuild lays a fresh one down before the fs frees the old one.
 const FS_BYTES: u64 = 3 << 30;
 const IMG_BYTES: u64 = 1 << 30;
 /// What the store is raised to partway through, to watch a start reserve the difference.
@@ -29,9 +25,8 @@ const GROWN_BYTES: u64 = IMG_BYTES + (256 << 20);
 const PAGE: usize = 4096;
 const HUGE: usize = 4 << 20;
 
-/// The one universe every node shares, and the device ids the test opens. Device `n`
-/// is composed of extent `n` alone, so a device page and its extent page are the same
-/// number; `MIX` is the exception, and exists to prove they need not be.
+/// The shared universe and the device ids the test opens. Device `n` maps extent `n`
+/// alone, so device page and extent page match; `MIX` proves they need not.
 const UNIVERSE: u32 = 1;
 const LWW: u32 = 1;
 const OCC: u32 = 2;
@@ -39,8 +34,7 @@ const IMM: u32 = 3;
 const BIG: u32 = 4;
 const MIX: u32 = 5;
 
-/// Where each extent sits in the universe's address space. The control plane places
-/// them; nothing about the layout is derived from the device that maps them.
+/// Extent bases in the universe address space, placed by the control plane, not by devices.
 const LWW_BASE: u64 = 0;
 const OCC_BASE: u64 = 4096;
 const IMM_BASE: u64 = 4608;
@@ -50,17 +44,14 @@ const LOOP_SET_FD: libc::c_ulong = 0x4c00;
 const LOOP_CLR_FD: libc::c_ulong = 0x4c01;
 const LOOP_SET_BLOCK_SIZE: libc::c_ulong = 0x4c09;
 
-// ---------------------------------------------------------------------------
-// the cluster
-// ---------------------------------------------------------------------------
+// --- the cluster ---
 
 struct Node {
     id: u32,
     dir: PathBuf,
     img: PathBuf,
     mnt: PathBuf,
-    /// Declared before `_memfd`, so the loop device detaches before its backing file
-    /// closes.
+    /// Declared before `_memfd` so the loop device detaches before its backing file closes.
     loop_dev: Option<OwnedFd>,
     _loop_path: String,
     _memfd: OwnedFd,
@@ -68,9 +59,7 @@ struct Node {
     out: Option<BufReader<ChildStdout>>,
     devices: Vec<(u32, PathBuf)>,
     fabric: PathBuf,
-    /// What the generations written for this node say its store must be. The control
-    /// plane's to raise, one node at a time, which is how the test asks for a bigger
-    /// file.
+    /// Store size the generations for this node ask for; raising it grows the file.
     store_bytes: u64,
     /// Where this node's prometheus endpoint landed; the port is ephemeral.
     metrics: String,
@@ -83,8 +72,7 @@ impl Node {
             .arg("serve")
             .arg(self.dir.join("node.pb"))
             .env("METRICS_ADDR", "127.0.0.1:0")
-            // The store's path is this process's own, so it never appears in a
-            // generation: the control plane places the file, racer sizes it.
+            // The store path is process-local, never in a generation: racer sizes it.
             .env(racer::config::STORE_PATH_ENV, &self.img)
             .stdout(Stdio::piped())
             .spawn()
@@ -100,8 +88,7 @@ impl Node {
                 self.devices
                     .push((id.parse().unwrap(), PathBuf::from(path)));
             } else if let Some(rest) = line.strip_prefix("universe ") {
-                // One universe here, so its fabric device is the last line of the
-                // banner and the one the peers attach to.
+                // One universe: its fabric device ends the banner and peers attach to it.
                 let (_, path) = rest.split_once(" fabric -> ").expect("universe line");
                 self.fabric = PathBuf::from(path);
                 break;
@@ -128,8 +115,7 @@ impl Node {
         self.out = None;
     }
 
-    /// Install a generation as the control plane does: write beside the live file and
-    /// rename over it, so the watcher sees one atomic replacement.
+    /// Install a generation the way the control plane does: write, then rename atomically.
     fn install(&self, text: &str) {
         let cfg = Config::parse(text).expect("parse config");
         cfg.validate().expect("validate config");
@@ -158,14 +144,12 @@ impl Node {
         Dev::open(&p)
     }
 
-    /// How much of the filesystem the store is holding, which is what `size=` asked for
-    /// the last time this node started.
+    /// Bytes the store holds, which is what `size=` asked for at this node's last start.
     fn store_len(&self) -> u64 {
         std::fs::metadata(&self.img).expect("stat the store").len()
     }
 
-    /// Start `racer serve` on a configuration it must refuse and return what it said on
-    /// the way out. The node has to be down: this is the same store.
+    /// Start `racer serve` on a config it must refuse and return stderr. Node must be down.
     fn serve_refuses(&self, text: &str) -> String {
         let cfg = Config::parse(text).expect("parse config");
         let path = self.dir.join("node.refused");
@@ -196,8 +180,7 @@ impl Drop for Node {
     }
 }
 
-/// Stop the cluster. Every node holds its peers' fabric devices open and a ublk device
-/// cannot be torn down while open, so the nodes go down together.
+/// Stop the cluster together: a ublk device cannot be torn down while a peer holds it open.
 fn shutdown(nodes: &mut [Node]) {
     for n in nodes.iter_mut() {
         n.signal(libc::SIGTERM);
@@ -233,9 +216,7 @@ fn wait_for(p: &Path) {
     panic!("{} never appeared", p.display());
 }
 
-// ---------------------------------------------------------------------------
-// metrics
-// ---------------------------------------------------------------------------
+// --- metrics ---
 
 /// One request, one connection, no keep-alive. Returns the status line and the body.
 fn http_get(addr: &str, path: &str) -> (String, String) {
@@ -254,8 +235,7 @@ fn http_get(addr: &str, path: &str) -> (String, String) {
     (head.lines().next().unwrap().to_string(), body.to_string())
 }
 
-/// A parsed exposition. Parsing is the assertion: help before type before samples, no
-/// duplicate series, so every scrape checks the shape and the tests only read numbers.
+/// A parsed exposition. Parsing is the assertion: help, then type, then samples, no dupes.
 struct Exposition {
     samples: Vec<(String, u64)>,
 }
@@ -307,9 +287,7 @@ fn scrape(n: &Node) -> Exposition {
     Exposition::parse(&body)
 }
 
-// ---------------------------------------------------------------------------
-// backing store: memfd -> loop -> ext4
-// ---------------------------------------------------------------------------
+// --- backing store: memfd -> loop -> ext4 ---
 
 fn build_node(id: u32) -> Node {
     let dir = PathBuf::from(ROOT).join(format!("n{id}"));
@@ -344,8 +322,7 @@ fn build_node(id: u32) -> Node {
     };
     assert_eq!(rc, 0, "mount {loop_path}: {}", last_error());
 
-    // Deliberately not created: racer places and sizes its own store, and the first
-    // start of the cluster is where that is proved.
+    // Deliberately not created: racer places and sizes its own store.
     let img = mnt.join("store.img");
     Node {
         id,
@@ -364,8 +341,7 @@ fn build_node(id: u32) -> Node {
     }
 }
 
-/// Bind a free loop device to `backing`. The kernel picks the minor and udev creates
-/// the node a moment later.
+/// Bind a free loop device to `backing`. udev creates the node a moment later.
 fn loop_attach(backing: RawFd) -> (OwnedFd, String) {
     let ctl = File::open("/dev/loop-control").expect("/dev/loop-control");
     let n = unsafe { libc::ioctl(ctl.as_raw_fd(), LOOP_CTL_GET_FREE) };
@@ -391,12 +367,9 @@ fn last_error() -> std::io::Error {
     std::io::Error::last_os_error()
 }
 
-// ---------------------------------------------------------------------------
-// client IO
-// ---------------------------------------------------------------------------
+// --- client IO ---
 
-/// A consumer device opened as a consumer would: `O_DIRECT`, so one request is one page
-/// and an error reaches the call that caused it.
+/// A consumer device opened `O_DIRECT`: one request is one page, errors reach the caller.
 struct Dev(File);
 
 impl Dev {
@@ -482,9 +455,7 @@ fn pattern(seed: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Write, retrying `EAGAIN`. A bulk write races the anti-entropy sweep for the same
-/// pages, and an LWW round that exhausts its internal retries surfaces that conflict as
-/// `EAGAIN`: ordinary here, not a failure.
+/// Write, retrying `EAGAIN`, which is what an LWW round says when it loses to the sweep.
 fn write_lww(dev: &Dev, off: u64, page: &[u8]) {
     for _ in 0..64 {
         match dev.write(off, page) {
@@ -498,11 +469,9 @@ fn write_lww(dev: &Dev, off: u64, page: &[u8]) {
     panic!("write at {off}: still EAGAIN after 64 tries");
 }
 
-/// An OCC write that must land, re-observing on `EAGAIN`. A refusal is the register's
-/// only answer for every kind of conflict, and a background repair round produces one
-/// with no competing writer at all — a term the group raised under a sweep outranks the
-/// proposal even when the version never moved. Reading again and retrying is what an OCC
-/// client does. The refusals this test asserts stay plain `write` calls.
+/// An OCC write that must land, re-observing on `EAGAIN`. Refusal is the register's only
+/// answer to any conflict, and a repair round can raise the term and refuse a proposal with
+/// no competing writer, so the client re-reads and retries. Asserted refusals use `write`.
 fn write_occ(dev: &Dev, off: u64, page: &[u8]) {
     for _ in 0..64 {
         match dev.write(off, page) {
@@ -517,21 +486,14 @@ fn write_occ(dev: &Dev, off: u64, page: &[u8]) {
     panic!("write at {off}: still EAGAIN after 64 tries");
 }
 
-// ---------------------------------------------------------------------------
-// configuration
-// ---------------------------------------------------------------------------
+// --- configuration ---
 
-/// Two groups over six members, with node 7 spare. Every node maps every extent, so any
-/// page is reachable through any node - and for half of them that node is not in the
-/// owning group, which is what the forwarding rules exist for.
-///
-/// The catalog is balanced, as a zone's catalog must be: each of the six members holds
-/// one of the six seats, so every store is formatted to the same size off one set of
-/// extents. Node 7 holds nothing yet and sizes itself for the share it would inherit.
-///
-/// Device `MIX` maps the same two extents device `OCC` and device `LWW` do, in the other
-/// order: an extent is a member of the universe, not of a device, so mapping it twice
-/// over is the control plane's business and changes nothing about the address.
+/// Two groups over six members, node 7 spare. Every node maps every extent, so any page is
+/// reachable through any node; for half of them that node is outside the owning group,
+/// which exercises forwarding. The catalog is balanced: each of the six members holds one
+/// of the six seats, so every store formats to the same size. Node 7 holds nothing and
+/// sizes itself for the share it would inherit. Device `MIX` maps the extents of `OCC` and
+/// `LWW` in the other order: an extent belongs to the universe, not to a device.
 fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     let mut s = format!(
         "generation {generation}\nnode id={} zone=1 cohort={} size={}\n",
@@ -546,9 +508,7 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     for g in catalog() {
         s += &format!("group {} {} {}\n", g[0], g[1], g[2]);
     }
-    // Admission is per extent. Extent 1 asks for one, which admits on first sight, so a
-    // single read is enough to make a page cacheable. Extent 3 asks for none at all and
-    // must never reach the cache however hot it gets.
+    // Admission is per extent: extent 1 admits on first sight, extent 3 never admits.
     s += "extent id=1 base=0    pages=4096 kind=lww          zone=1 cache_admit=1\n\
           extent id=2 base=4096 pages=512  kind=occ          zone=1 cache_admit=1\n\
           extent id=3 base=4608 pages=512  kind=immutable    zone=1\n\
@@ -561,9 +521,7 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     s
 }
 
-/// The catalog every generation is written with. Replacing a member rewrites it, so it is
-/// state the control plane holds rather than a constant, and the test is its control
-/// plane.
+/// The catalog every generation is written with; replacing a member rewrites it.
 static CATALOG: std::sync::Mutex<Vec<[u32; 3]>> = std::sync::Mutex::new(Vec::new());
 
 fn catalog() -> Vec<[u32; 3]> {
@@ -583,14 +541,12 @@ fn peers_of(nodes: &[Node], id: u32) -> Vec<(u32, PathBuf)> {
         .collect()
 }
 
-/// Tell the nodes at `who` where everyone's fabric device currently lives, as the
-/// control plane would: a new generation, dropped in atomically.
+/// Tell the nodes at `who` where every fabric device now lives, as a new generation.
 fn wire(nodes: &mut [Node], generation: u32, who: &[usize]) {
     wire_without(nodes, generation, who, &[]);
 }
 
-/// As [`wire`], but the nodes at `who` are told nothing about the peers in `omit`. A
-/// group member a node cannot name is one it has to reach through another.
+/// As [`wire`], but `who` is told nothing of the peers in `omit` and must route via others.
 fn wire_without(nodes: &mut [Node], generation: u32, who: &[usize], omit: &[u32]) {
     let fabrics: Vec<(u32, PathBuf)> = nodes.iter().map(|n| (n.id, n.fabric.clone())).collect();
     for &i in who {
@@ -606,15 +562,14 @@ fn wire_without(nodes: &mut [Node], generation: u32, who: &[usize], omit: &[u32]
     }
 }
 
-/// The first page of the extent at `base` that group `want` owns, so "a node that holds
-/// it" and "a node that does not" are exact below.
+/// First page of the extent at `base` that group `want` owns, so "holds it" is exact below.
 fn page_in(cfg: &Config, base: u64, want: u32) -> u64 {
     (0..512)
         .find(|off| cfg.group(addr(base + off)) == group(want))
         .expect("some page hashes to every group")
 }
 
-/// A page's address in the universe every node here shares.
+/// A page's address in the shared universe.
 fn addr(lba: u64) -> u64 {
     racer::config::addr_of(UNIVERSE, lba)
 }
@@ -624,13 +579,10 @@ fn group(index: u32) -> racer::config::GroupId {
     racer::config::GroupId::new(UNIVERSE, index)
 }
 
-// ---------------------------------------------------------------------------
-// rebuilding a member
-// ---------------------------------------------------------------------------
+// --- rebuilding a member ---
 
-/// Cut every link to node `i`. With no peers its quorum is one, so a read is answered
-/// from its own slab — the only way from outside to tell "holds the value" from "can go
-/// and fetch it".
+/// Cut every link to node `i`. With no peers its quorum is one, so reads come from its own
+/// slab: the only way from outside to tell "holds the value" from "can go and fetch it".
 fn isolate(nodes: &mut [Node], i: usize, generation: &mut u32) {
     *generation += 1;
     let text = config_text(*generation, &nodes[i], &[]);
@@ -646,10 +598,8 @@ fn rejoin(nodes: &mut [Node], i: usize, generation: &mut u32) {
 
 /// Destroy node `i` and prove the group puts it back.
 ///
-/// The node keeps its id and its place in the catalog but loses everything else, so its
-/// digests for the group come up empty while its peers' do not. The sweep reads that as
-/// a node joining and replays every bucket instead of the handful a steady-state sweep
-/// walks. `want` is the group's contents, updated here for the writes this makes.
+/// The node keeps its id and catalog seat but loses its data, so its empty digests make the
+/// sweep replay every bucket. `want` is the group's contents, updated for the writes here.
 fn rebuild(
     nodes: &mut [Node],
     i: usize,
@@ -660,8 +610,7 @@ fn rebuild(
     let id = nodes[i].id;
     let all: Vec<usize> = (0..nodes.len()).collect();
 
-    // Remove the whole backing file, not just the metadata region a reformat would
-    // rewrite: what comes back is a blank store, placed and sized by the restart.
+    // Remove the whole backing file, not just metadata: the restart places a blank store.
     nodes[i].signal(libc::SIGKILL);
     nodes[i].reap();
     std::fs::remove_file(&nodes[i].img).expect("remove the store");
@@ -675,9 +624,7 @@ fn rebuild(
     *generation += 1;
     wire(nodes, *generation, &all);
 
-    // Write to the group while the join is still in flight, through a member other than
-    // the wiped one. Replay and ordinary traffic must merge by version rather than one
-    // clobbering the other, and this is the window where that is decided.
+    // Write through another member mid-join: replay and traffic must merge by version.
     {
         let d = nodes[(i + 1) % 3].dev(LWW);
         for (p, v) in want.iter_mut().take(8) {
@@ -686,10 +633,9 @@ fn rebuild(
         }
     }
 
-    // Now wait, sending nothing: what puts the data back must be the sweep, not a client
-    // read tripping over a hole. Each probe isolates the node (quorum one, so it answers
-    // from its own slab and cannot repair) and costs two reloads, so back off rather than
-    // poll — `Live` keeps only one previous generation for a sweep to still hold.
+    // Wait without sending: the sweep must restore the data, not a client read hitting a
+    // hole. Each probe isolates the node (quorum one, so it cannot repair) and costs two
+    // reloads, so back off rather than poll: `Live` keeps only one previous generation.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut wait = std::time::Duration::from_secs(5);
     loop {
@@ -713,9 +659,7 @@ fn rebuild(
         wait = std::time::Duration::from_secs(10);
     }
 
-    // Holding the data is not the same as being a member again: a node still replaying
-    // forwards proposals instead of making them. Write at the rebuilt node, read back
-    // from a node outside the group.
+    // Holding the data is not membership: a replaying node forwards instead of proposing.
     let (p, v) = want.last_mut().expect("some pages");
     *v = pattern(!mark, PAGE);
     write_lww(&nodes[i].dev(LWW), *p * 4096, v);
@@ -732,9 +676,7 @@ fn privileged() -> bool {
         && File::open("/dev/loop-control").is_ok()
 }
 
-// ---------------------------------------------------------------------------
-// the test
-// ---------------------------------------------------------------------------
+// --- the test ---
 
 #[test]
 fn six_node_cluster() {
@@ -753,8 +695,7 @@ fn six_node_cluster() {
         n.install(&text);
         n.serve();
     }
-    // Nothing created the store: the file did not exist before the start that formatted
-    // it, and `size=` is the whole of what says how big it is.
+    // Nothing created the store beforehand, and `size=` is all that sets its size.
     for n in &nodes {
         assert_eq!(
             n.store_len(),
@@ -768,9 +709,8 @@ fn six_node_cluster() {
     wire(&mut nodes, 2, &(0..NODES as usize).collect::<Vec<_>>());
 
     let cfg = Config::parse(&config_text(2, &nodes[0], &[])).unwrap();
-    // Node 1 is in group 0 and node 6 in group 1, so for each of these pages one of them
-    // holds the register and the other must go through the fabric. Node 7 is spare and
-    // holds neither.
+    // Node 1 is in group 0, node 6 in group 1: for each page one holds the register and
+    // the other must go through the fabric. Node 7 is spare and holds neither.
     let held = page_in(&cfg, LWW_BASE, 0);
     let remote = page_in(&cfg, LWW_BASE, 1);
 
@@ -805,9 +745,8 @@ fn six_node_cluster() {
     }
 
     // ---- cache: a hot page is cached, and a cached read is never stale ------------
-    // Node 1 is not in group 1, so `remote` is a page it may cache. Repeated reads raise
-    // the width past one and admit it locally; the mandatory metadata round confirms
-    // every hit on `(version, ballot)`, which is the whole invalidation protocol.
+    // Node 1 is not in group 1, so it may cache `remote`. Repeated reads raise the width
+    // past one and admit it; a metadata round confirms every hit on `(version, ballot)`.
     for _ in 0..64 {
         assert_eq!(
             a.read(remote * 4096, PAGE).unwrap(),
@@ -824,14 +763,10 @@ fn six_node_cluster() {
     write_lww(&b, remote * 4096, &pattern(2, PAGE));
 
     // ---- cache: an extent that opts out is never admitted, however hot it gets ------
-    // Extent 3 asks for no admission at all. The page below is one node 1 does not hold,
-    // so every other rule would have it cached by now; the only thing keeping it out is
-    // its extent. The veto lands on whichever node computes the width, which for a 4 KiB
-    // page is a group member rather than the reader, so the count is cluster-wide.
+    // Extent 3 opts out of admission, and node 1 does not hold this page, so every other
+    // rule would cache it. A group member computes the width, so sum the counts everywhere.
     let cold = page_in(&cfg, IMM_BASE, 1);
-    // Workers publish their counters from a tick, so a scrape taken straight after the
-    // work lags it. Settling first is what makes the equality below a statement about
-    // admission rather than about publication.
+    // Workers publish counters on a tick, so settle first or the scrape lags the work.
     let totals = |nodes: &[Node]| -> (u64, u64) {
         std::thread::sleep(std::time::Duration::from_millis(250));
         nodes
@@ -949,10 +884,8 @@ fn six_node_cluster() {
     );
 
     // ---- one extent, two devices --------------------------------------------------
-    // Device MIX concatenates extents 2 and 1 in that order, so its page 512 is the
-    // page device LWW calls page 0. An address belongs to its extent, so which device a
-    // request arrives through, and in what order that device stacked its extents, are
-    // invisible to everything below the block layer.
+    // Device MIX concatenates extents 2 and 1, so its page 512 is device LWW's page 0. An
+    // address belongs to its extent, so the device and its extent order do not matter.
     let mix = nodes[3].dev(MIX);
     let both = 4000;
     let shared = pattern(0x3c, PAGE);
@@ -970,8 +903,7 @@ fn six_node_cluster() {
     drop(mix);
 
     // ---- metrics: what the work above did, as a scraper sees it -------------------
-    // Node 1 has by now proposed, read, cached and served a page it does not hold, so
-    // its counters cover the whole dataplane.
+    // Node 1 has proposed, read, cached and served a remote page, so its counters cover it.
     let m = scrape(&nodes[0]);
     assert!(
         m.get("racer_paxos_accept_total{result=\"ok\"}") > 0,
@@ -987,8 +919,7 @@ fn six_node_cluster() {
         m.get("racer_alloc_free_slots{class=\"small\"}") <= slots,
         "more free than there is"
     );
-    // Written by core 0 alone, so these also prove the single-writer rule: a second core
-    // publishing them would multiply each by the worker count.
+    // Written by core 0 alone; a second publisher would multiply each by the worker count.
     assert_eq!(
         m.get("racer_config_generation"),
         2,
@@ -1006,9 +937,7 @@ fn six_node_cluster() {
     );
 
     // ---- capacity: the nodes of a zone are homogeneous, so every device is the same --
-    // Off one set of extents, an equal share means an identical slab on every node,
-    // members and spare alike: the spare is sized for the share it would inherit, which
-    // is what lets it stand in for any member without reformatting.
+    // An equal share means identical slabs everywhere, so the spare needs no reformat.
     for (i, n) in nodes.iter().enumerate() {
         let their_slots = scrape(n).get("racer_alloc_slots{class=\"small\"}");
         assert_eq!(
@@ -1019,9 +948,8 @@ fn six_node_cluster() {
         );
     }
 
-    // A config the node must refuse: it parses and validates on its own and is wrong
-    // only against the generation already running. Nobody is left to return an error to,
-    // so it surfaces as a metric or not at all.
+    // A config the node must refuse: valid on its own, wrong only against the generation
+    // already running. There is no caller to fail, so it surfaces as a metric or nowhere.
     nodes[0].install(&config_text(1, &nodes[0], &[]));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while scrape(&nodes[0]).get("racer_config_rejected_total") != 1 {
@@ -1040,9 +968,8 @@ fn six_node_cluster() {
     let (status, _) = http_get(&nodes[0].metrics, "/nope");
     assert_eq!(status, "HTTP/1.1 404 Not Found", "only /metrics is served");
 
-    // The refused file is still on disk and this node is killed and restarted below, so
-    // leave it one it can boot from. The others are rewired at 3 in a moment without
-    // this one, so generations stay monotonic per node.
+    // This node restarts below, so leave it a config it can boot from; the others rewire
+    // at 3 separately, keeping generations monotonic per node.
     wire(&mut nodes, 3, &[0]);
 
     // ---- crash a node: the survivors serve on, and the node comes back -------------
@@ -1056,10 +983,8 @@ fn six_node_cluster() {
         "a quorum keeps serving after a member dies"
     );
     // ---- the store grows on the way up, and never the other way --------------------
-    // While the node is down, the control plane raises its share. A start reserves the
-    // difference in place; the pages already in the file stay where they were, which the
-    // reads below check. A start on a lower `size=` than the file already holds is the
-    // one case racer refuses outright: shrinking would cut the slabs off at the end.
+    // The control plane raises this node's share while it is down. A start reserves the
+    // difference in place and leaves existing pages put; a lower `size=` is refused.
     assert_eq!(nodes[0].store_len(), IMG_BYTES, "formatted at its share");
     {
         let peers = peers_of(&nodes, nodes[0].id);
@@ -1105,9 +1030,8 @@ fn six_node_cluster() {
     drop(a);
 
     // ---- partial mesh: a member we cannot name is one we route through -----------
-    // Group 1 is {4,5,6}. Node 1 keeps only its link to 4, so the other two legs of a
-    // read of a group-1 page are forwarded through it. Without the forward the read has
-    // one answer, never a matching pair, and cannot complete.
+    // Group 1 is {4,5,6}. Node 1 keeps only its link to 4, so the other two legs of a read
+    // are forwarded through it. Without the forward a read gets one answer, never a pair.
     wire_without(&mut nodes, 4, &[0], &[5, 6]);
     let a = nodes[0].dev(LWW);
     assert_eq!(
@@ -1135,9 +1059,7 @@ fn six_node_cluster() {
         generation,
         &(0..NODES as usize).collect::<Vec<_>>(),
     );
-    // Enough pages to spread over far more digest buckets than a steady-state sweep
-    // walks in the window below: the test is that the whole group moves at once, not
-    // that anti-entropy eventually gets there.
+    // Far more digest buckets than a steady-state sweep walks: the whole group must move.
     let mut want: Vec<(u64, Vec<u8>)> = (0..4096)
         .filter(|off| cfg.group(addr(LWW_BASE + *off)) == group(0))
         .take(128)
@@ -1151,10 +1073,8 @@ fn six_node_cluster() {
         }
     }
 
-    // All three members of group 0, one at a time. By the end every node that answered
-    // the writes above has been destroyed and rebuilt, so no surviving original copy
-    // explains the data still being there. One at a time is the point: wiping two
-    // together leaves no quorum holding a value, and losing it then would be correct.
+    // All three members of group 0, one at a time, so no original copy survives to explain
+    // the data. Two at once would leave no quorum, and losing the value then is correct.
     for i in 0..3 {
         rebuild(&mut nodes, i, &mut generation, &mut want, 0x40 + i as u8);
         // The client-visible property, read through a node outside the group.
@@ -1177,9 +1097,7 @@ fn six_node_cluster() {
     );
 
     // ---- replacement: a member is swapped for the spare, at the same share ---------
-    // Balance is enforced, not advisory. Handing node 1 the seat node 6 held leaves it
-    // with two of the six and five nodes to share them, which no equal split fits, so
-    // the zone's nodes would no longer be interchangeable.
+    // Balance is enforced: two of the six seats across five nodes fits no equal split.
     set_catalog(&[[1, 2, 3], [4, 5, 1]]);
     let skewed = Config::parse(&config_text(generation + 1, &nodes[0], &[])).unwrap();
     assert!(
@@ -1187,9 +1105,8 @@ fn six_node_cluster() {
         "an unbalanced catalog must be refused"
     );
 
-    // Node 7 takes over from node 1 wholesale: every seat node 1 held, and no others, so
-    // the zone stays balanced at one seat each. The catalog keeps its length, so the
-    // groups keep every address they had and only their members change.
+    // Node 7 takes every seat node 1 held and no others, so the zone stays balanced. The
+    // catalog keeps its length, so groups keep their addresses and only members change.
     let before = scrape(&nodes[0]).get("racer_alloc_free_slots{class=\"small\"}");
     set_catalog(&[[7, 2, 3], [4, 5, 6]]);
     generation += 1;
@@ -1198,17 +1115,15 @@ fn six_node_cluster() {
         generation,
         &(0..NODES as usize).collect::<Vec<_>>(),
     );
-    // The share never moved: it is the member count that sets it, and a swap leaves that
-    // alone. Neither node has to reformat to trade places.
+    // The member count sets the share, so a swap needs no reformat on either node.
     assert_eq!(
         scrape(&nodes[6]).get("racer_alloc_slots{class=\"small\"}"),
         slots,
         "a replacement must not resize the zone"
     );
 
-    // Node 7 replays group 0 from its surviving members; node 1 gives up only what it can
-    // see all three of the group's new members holding, so the two halves finish in that
-    // order.
+    // Node 7 replays group 0 from the surviving members; node 1 sheds only what it can see
+    // all three new members holding, so the two halves finish in that order.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         let out = scrape(&nodes[0]);

@@ -1,13 +1,9 @@
 //! The prometheus endpoint.
 //!
-//! Counters live where the work happens: per-core state, plain `u64` adds, no atomics
-//! and no shared lines. A worker cannot read another worker's state, so the flow is
-//! inverted — each publishes its own row of `AtomicU64` from `Handler::tick` and the
-//! scrape thread only sums rows. The HTTP thread never touches the runtime, so it can
-//! neither block a worker nor deadlock at shutdown.
-//!
-//! One aggregation rule: **every slot sums**. A process-wide value is therefore written
-//! by core 0 alone (server.rs), so its sum is the value itself.
+//! Counters are per-core plain `u64` adds, no atomics. Each worker publishes its own row
+//! of `AtomicU64` from `Handler::tick`; the scrape thread only sums rows and never touches
+//! the runtime, so it cannot block a worker or deadlock at shutdown. Every slot sums, so
+//! core 0 alone writes process-wide values (server.rs).
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -33,9 +29,8 @@ impl Kind {
     }
 }
 
-/// The metric table: the fields a worker fills in and the exposition text they map to.
-/// Rows sharing a name must stay adjacent, so the encoder can emit one `# HELP`/`# TYPE`
-/// pair per metric while the label sets differ.
+/// The metric table. Rows sharing a name must stay adjacent, so the encoder emits one
+/// `# HELP`/`# TYPE` pair per metric while the label sets differ.
 macro_rules! metrics {
     ($($field:ident: $name:literal $labels:literal $kind:ident $help:literal,)*) => {
         /// One worker's counters, filled in each tick (server.rs).
@@ -86,9 +81,8 @@ metrics! {
     heal_replaying:          "racer_heal_groups_replaying"        ""                           Gauge   "Groups this node is replaying into. Nonzero means a group is running two of three.",
     heal_shedding:           "racer_heal_groups_shedding"         ""                           Gauge   "Groups this node still holds registers for but is no longer a member of.",
 
-    // cooperative cache. Split by page class throughout: the two differ by three orders
-    // of magnitude in bytes per entry, so an unlabelled hit rate or byte count says
-    // nothing about which of them is earning the space.
+    // cooperative cache. Split by page class throughout: the two classes differ by three
+    // orders of magnitude in bytes per entry, so unlabelled totals say nothing.
     cache_hits_small:        "racer_cache_lookup_total"           r#"{class="small",result="hit"}"#   Counter "Cache lookups, by class and outcome.",
     cache_hits_huge:         "racer_cache_lookup_total"           r#"{class="huge",result="hit"}"#    Counter "Cache lookups, by class and outcome.",
     cache_misses_small:      "racer_cache_lookup_total"           r#"{class="small",result="miss"}"#  Counter "Cache lookups, by class and outcome.",
@@ -143,8 +137,7 @@ metrics! {
 
 const N: usize = TABLE.len();
 
-/// One worker's slots, padded so no two workers share a cacheline. A worker only ever
-/// stores into its own row, so nothing is contended and no counter needs a `fetch_add`.
+/// One worker's slots, cacheline padded; only its owner stores, so no `fetch_add`.
 #[repr(align(64))]
 struct Row([AtomicU64; N]);
 
@@ -156,11 +149,8 @@ struct Tables {
     rows: OnceLock<Box<[Row]>>,
     exts: OnceLock<Box<[ExtRow]>>,
     /// The `(universe, extent)` each per-extent row stands for, `(0, 0)` when unused.
-    ///
-    /// An extent id is assigned by the control plane and is not a small dense number, so
-    /// the row index is the extent's position in the configuration instead. Every core
-    /// walks the same configuration in the same order, so every core agrees on that
-    /// position without coordinating; these two do not sum, and only core 0 writes them.
+    /// Extent ids are not dense, so a row index is the extent's configuration position,
+    /// which every core agrees on. These do not sum; only core 0 writes them.
     ext_ids: [(AtomicU64, AtomicU64); MAX_EXTENTS],
 }
 
@@ -181,15 +171,9 @@ fn tables<R>(f: impl FnOnce(&Tables) -> R) -> R {
     f(&TABLES)
 }
 
-/// This node's tables, under simulation.
-///
-/// The simulator puts a whole cluster in one thread, and a test may run several of them
-/// side by side. A process-wide table would then be one set of rows written by every
-/// simulated core of every simulated node in the process: the counts would be a sum over
-/// clusters that have nothing to do with each other, and the line they share would
-/// bounce between every thread on the machine on every tick. One set per thread keeps a
-/// simulated node's counters its own and keeps the seams `sim` replaces from turning
-/// independent runs into contended ones.
+/// This node's tables, under simulation. The simulator runs a whole cluster in one thread
+/// and a test may run several side by side, so process-wide tables would sum unrelated
+/// clusters and contend on one line.
 #[cfg(feature = "sim")]
 fn tables<R>(f: impl FnOnce(&Tables) -> R) -> R {
     thread_local! {
@@ -212,9 +196,7 @@ pub(crate) fn init(cores: usize) {
     })
 }
 
-/// Publish this worker's row. Relaxed: a scrape catching a row mid-update mixes two
-/// adjacent ticks, indistinguishable from scraping a moment earlier and not worth a
-/// fence per worker per millisecond.
+/// Publish this worker's row. Relaxed: a mid-update scrape mixes two adjacent ticks.
 pub(crate) fn publish(core: usize, s: &Sample) {
     tables(|t| {
         let Some(row) = t.rows.get().and_then(|r| r.get(core)) else {
@@ -257,9 +239,7 @@ fn encode() -> String {
 
 // ------------------------------------------------------------------------ per extent
 
-/// The per-extent series, beside the fixed table rather than in it because an extent
-/// exists only once a configuration names it. Both sum across cores like everything
-/// else.
+/// Per-extent series, outside the fixed table because an extent exists only once named.
 const EXT_SERIES: [(&str, &str); 2] = [
     (
         "racer_extent_live_pages",
@@ -272,12 +252,8 @@ const EXT_SERIES: [(&str, &str); 2] = [
 ];
 
 /// Publish this worker's per-extent counts: `(universe, extent, live, tombstones)`, in
-/// configuration order. Rows past the end are zeroed, so an extent this core holds
-/// nothing for stops contributing rather than sticking at its last value.
-///
-/// The names are core 0's alone. A core holding no page of an extent still lists it, but
-/// a core that has not caught up to a reload would otherwise retire a series the others
-/// are still filling.
+/// configuration order. Rows past the end are zeroed so a stale count stops contributing.
+/// Only core 0 writes the names; a core behind on a reload would otherwise retire a series.
 pub(crate) fn publish_extents(core: usize, rows: &[(u32, u32, u64, u64)]) {
     tables(|t| {
         let Some(row) = t.exts.get().and_then(|r| r.get(core)) else {
@@ -297,9 +273,7 @@ pub(crate) fn publish_extents(core: usize, rows: &[(u32, u32, u64, u64)]) {
             row.0[s].store(live, Ordering::Relaxed);
             row.0[MAX_EXTENTS + s].store(tombs, Ordering::Relaxed);
         }
-        // A configuration that dropped an extent leaves its old row named but empty,
-        // which would keep a stale series alive; clearing the names past the end retires
-        // it.
+        // Clearing names past the end retires an extent the configuration dropped.
         if core == 0 {
             for slot in t.ext_ids.iter().skip(rows.len().min(MAX_EXTENTS)) {
                 slot.0.store(0, Ordering::Relaxed);
@@ -343,9 +317,8 @@ const MAX_HEAD: usize = 8 << 10;
 const EXPOSITION: &str = "text/plain; version=0.0.4; charset=utf-8";
 const PLAIN: &str = "text/plain; charset=utf-8";
 
-/// Bind the endpoint. Separate from [`serve`] so a bad address fails at startup, and so
-/// early scrapes queue in the backlog rather than being refused before the dataplane is
-/// up.
+/// Bind the endpoint. Separate from [`serve`] so a bad address fails at startup and early
+/// scrapes queue in the backlog instead of being refused.
 pub fn listen(addr: &str) -> std::io::Result<TcpListener> {
     match addr.strip_prefix(':') {
         Some(port) => TcpListener::bind(format!("0.0.0.0:{port}")),
@@ -353,15 +326,12 @@ pub fn listen(addr: &str) -> std::io::Result<TcpListener> {
     }
 }
 
-/// The `racer-metrics` thread. One connection at a time: a scrape is a sum over a few
-/// hundred atomics per worker and prometheus opens a fresh connection each time, so
-/// concurrency wins nothing.
+/// The `racer-metrics` thread. One connection at a time; prometheus reconnects per scrape.
 pub fn serve(l: TcpListener) -> ! {
     loop {
         match l.accept() {
             Ok((s, _)) => handle(s),
-            // Descriptor exhaustion is transient: back off rather than spin on it, and
-            // never lose the endpoint.
+            // Descriptor exhaustion is transient: back off, never leave the loop.
             Err(e) if e.kind() != std::io::ErrorKind::Interrupted => {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -374,8 +344,7 @@ fn handle(mut s: TcpStream) {
     let _ = s.set_read_timeout(Some(TIMEOUT));
     let _ = s.set_write_timeout(Some(TIMEOUT));
 
-    // Read the whole head before answering, so the peer is never writing into a socket
-    // we have already closed.
+    // Read the whole head before answering, so the peer never writes into a closed socket.
     let mut head = Vec::new();
     let mut buf = [0u8; 1024];
     loop {
@@ -427,8 +396,7 @@ mod tests {
         assert!(listener.local_addr().unwrap().ip().is_unspecified());
     }
 
-    /// Every row must be reachable and same-named rows contiguous: the encoder emits
-    /// `# HELP`/`# TYPE` only when the name changes.
+    /// Same-named rows must be contiguous: `# HELP`/`# TYPE` is emitted on name change.
     #[test]
     fn table_is_grouped_by_name() {
         let mut seen: Vec<&str> = Vec::new();
@@ -462,8 +430,7 @@ mod tests {
         }
     }
 
-    /// The per-extent block is the only view the control plane has of an extent's epoch
-    /// readiness, and the one place a row is both dynamic and summed.
+    /// The control plane's only view of extent epoch readiness; the one dynamic summed row.
     #[test]
     fn extent_rows_sum_and_skip_unnamed_slots() {
         init(2);
@@ -486,8 +453,7 @@ mod tests {
         // A slot no configuration has named is not a series at all.
         assert!(!text.contains("extent=\"0\""), "{text}");
 
-        // The same extent id in two universes is two series: the label pair is what
-        // identifies a row, and partitioning reaches the metrics too.
+        // Same extent id in two universes is two series: the label pair identifies a row.
         publish_extents(0, &[(1, 7, 1, 0), (5, 7, 2, 0)]);
         publish_extents(1, &[]);
         let text = encode();
@@ -495,8 +461,7 @@ mod tests {
             text.contains("\nracer_extent_live_pages{universe=\"5\",extent=\"7\"} 2\n"),
             "{text}"
         );
-        // A configuration that dropped an extent retires its series rather than
-        // freezing it at its last value.
+        // A dropped extent retires its series rather than freezing at its last value.
         assert!(!text.contains("universe=\"2\""), "{text}");
     }
 }

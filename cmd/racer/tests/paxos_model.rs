@@ -1,36 +1,24 @@
-//! Model checks for four state machines that are not obviously correct by inspection:
-//! the guarded one-shot accept with its prepare and repair fallback, when the
-//! proposer's own copy of that accept may land, the shard handover between disjoint
-//! memberships, and the anti-entropy sweep healing needs (`heal.rs`).
+//! Model checks for four state machines: the guarded one-shot accept with its prepare
+//! and repair fallback, when the proposer's own copy of that accept may land, the shard
+//! handover between disjoint memberships, and the anti-entropy sweep (`heal.rs`).
 //!
-//! Every mechanism under test is a parameter, so the checks come in pairs: the rule the
-//! implementation uses must hold, the simpler rule it replaced must fail. A model that
-//! only ever does the right thing proves little; these prove the extra rule is
-//! load-bearing.
-//!
-//! Pure state machines with no IO, so they need neither root nor a device.
+//! Each mechanism is a parameter, so the checks come in pairs: the rule the
+//! implementation uses must hold, the simpler rule it replaced must fail. Pure state
+//! machines with no IO, so they need neither root nor a device.
 
 use stateright::{Checker, HasDiscoveries, Model, Property};
 
-// A proof that enumerates the whole reachable space visits the same states in either
-// order, so it uses `spawn_dfs`: breadth first has to hold the entire frontier, and each
-// queued item carries a cloned state plus the action path that reached it. Depth first
-// holds one path at a time. Checks that assert a counterexample stay on `spawn_bfs`,
-// which is the only search that returns the shortest one, and they assert on its length.
+// Full-space proofs use `spawn_dfs`; DFS holds one path at a time, BFS the whole
+// frontier. Checks that assert a counterexample use `spawn_bfs`, the only shortest-path
+// search, and assert on the path length.
 
-/// Stop the search the moment `name` has a counterexample.
-///
-/// A check that asserts a discovery has found its answer as soon as that one property
-/// fails; the checker's default is to keep going until every property has a discovery,
-/// which for a `sometimes` property that never fires means enumerating the whole state
-/// space for nothing. BFS still hands back the shortest path to the failure.
+/// Stop the search the moment `name` has a counterexample. The default runs until every
+/// property has a discovery, enumerating the whole space when a `sometimes` never fires.
 fn until(name: &'static str) -> HasDiscoveries {
     HasDiscoveries::AnyOf([name].into_iter().collect())
 }
 
-// ---------------------------------------------------------------------------
-// The register
-// ---------------------------------------------------------------------------
+// --- The register ---
 
 const N: usize = 3;
 const NEED: usize = 2;
@@ -41,8 +29,7 @@ const MAX_TERM: u8 = 2;
 const MAX_REPAIRS: u8 = 1;
 const MAX_WIPES: u8 = 1;
 
-/// One acceptor's register. `value` stands in for the page bytes; `(version, ballot)`
-/// is what the real entry carries and what apply-if-newer orders.
+/// One acceptor's register. `value` is the page bytes; `(version, ballot)` orders it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, PartialOrd, Ord)]
 struct Reg {
     version: u8,
@@ -56,8 +43,7 @@ impl Reg {
     }
 }
 
-/// `term << 2 | member`, the packing `paxos::Ballot` uses, so numeric comparison is the
-/// whole ordering.
+/// `term << 2 | member`, the packing `paxos::Ballot` uses, so numeric comparison orders.
 fn ballot(term: u8, member: u8) -> u8 {
     term << 2 | member
 }
@@ -66,16 +52,12 @@ fn term_of(b: u8) -> u8 {
     b >> 2
 }
 
-/// What a prepare round concludes from its replies, version by version from the top
-/// down. A value is still a candidate at a version if the silent acceptors plus those
-/// that have moved past it could carry it to a quorum; only an acceptor still *below*
-/// is a denial. A quorum holding one value is proof rather than possibility and settles
-/// the version. One candidate wins; none continues the descent; two with a silent
-/// acceptor left means that acceptor decides, so the round retries.
-///
-/// The descent stops at the floor, the highest version a quorum could still be standing
-/// at: what was chosen there survives even when every reply has overwritten it, so
-/// answering below it would replace it with something older.
+/// What a prepare round concludes from its replies, walking versions from the top down.
+/// A value is still a candidate at a version if the silent acceptors plus those past it
+/// could carry it to a quorum; only an acceptor below is a denial. One candidate wins,
+/// none continues the descent, two with a silent acceptor left retries. The descent stops
+/// at the floor, the highest version a quorum could still hold; answering below it would
+/// roll back what was chosen there.
 fn choose(replies: &[Reg], floored: bool) -> Option<Reg> {
     let unseen = N - replies.len();
     let mut vers: Vec<u8> = replies.iter().map(|r| r.version).collect();
@@ -107,14 +89,12 @@ fn choose(replies: &[Reg], floored: bool) -> Option<Reg> {
         match cands.len() {
             1 => return Some(cands[0]),
             0 => continue,
-            // Nothing silent is left to tell them apart, and whoever moved past this
-            // version built on one of them, so the register above supersedes both.
+            // Whoever moved past this version built on one of them, so it supersedes both.
             _ if unseen == 0 => return replies.iter().copied().max_by_key(|r| key(*r)),
             _ => return None,
         }
     }
-    // Nothing at or above the floor could have reached a quorum, so every register still
-    // on offer there is a free choice; take the newest, the one a writer would build on.
+    // Nothing at or above the floor reached a quorum, so take the newest on offer there.
     replies
         .iter()
         .copied()
@@ -127,8 +107,7 @@ fn key(r: Reg) -> (u8, u8) {
     (r.version, r.ballot)
 }
 
-/// A one-shot accept in flight. `left[i]` is an acceptor it has not reached yet, so the
-/// checker picks every delivery order and every partial delivery.
+/// A one-shot accept in flight; `left[i]` is unreached, so every delivery order is tried.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct Proposal {
     guard: u8,
@@ -137,8 +116,7 @@ struct Proposal {
     left: [bool; N],
 }
 
-/// The write phase of a repair in flight. One at a time, and `MAX_REPAIRS` in all: a
-/// second repair is another proposer, and every proposer and guard is already tried.
+/// The write phase of a repair in flight. One at a time, `MAX_REPAIRS` in all.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct Repair {
     pick: Reg,
@@ -165,26 +143,22 @@ struct RegisterState {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum RegisterAction {
-    /// A member issues a one-shot accept at its current term.
     Propose { member: u8, guard: u8 },
     /// The accept reaches one acceptor. Losing a leg is modelled by never taking this.
     Deliver { p: usize, a: u8 },
-    /// The prepare phase of a repair at the responding subset.
     Prepare { respond: [bool; N] },
     /// The write phase of a repair reaches one acceptor.
     Learn { a: u8 },
     /// An acceptor's device is reformatted: it keeps its identity, loses its state.
     Wipe { a: u8 },
-    /// A replaying acceptor has refilled and takes its place in the group again.
     Rejoin { a: u8 },
 }
 
 /// Which rule `prepare_round` uses to decide what was chosen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Rule {
-    /// What the implementation does: walk the versions down from the top, stop at the
-    /// highest one a quorum could still be standing at, and keep the value that could
-    /// still have been chosen there.
+    /// What the implementation does: walk versions down to the floor, keeping the value
+    /// that could still have been chosen there.
     Majority,
     /// The simpler rule: highest version, ties on ballot.
     HighestBallot,
@@ -193,8 +167,7 @@ enum Rule {
 /// What a round does with an acceptor that is still replaying.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Replay {
-    /// What the implementation does: a replaying node neither proposes nor accepts, so
-    /// here it takes no part in a round and the group runs on the two members left.
+    /// What the implementation does: a replaying node neither proposes nor accepts.
     Excluded,
     /// Treating it as an ordinary acceptor.
     Counted,
@@ -203,8 +176,7 @@ enum Replay {
 /// What a replaying acceptor carries back into the group with it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Recover {
-    /// What the implementation does (`Paxos::rejoin`): the highest promise the other two
-    /// members hold becomes ours before we answer anything again.
+    /// What the implementation does (`Paxos::rejoin`): adopt the peers' highest promise.
     FromPeers,
     /// Refilling the registers and nothing else.
     Nothing,
@@ -213,20 +185,16 @@ enum Recover {
 struct Register {
     rule: Rule,
     replay: Replay,
-    /// Whether an acceptor may be wiped at all. The two checks on `rule` have nothing to
-    /// say about replay, and leaving it out keeps their state space as it was.
+    /// Whether an acceptor may be wiped. Off for the `rule` checks, keeping their space.
     wipe: bool,
-    /// How many one-shots may be issued. The wipe checks buy their extra state with one
-    /// fewer, and the write a wipe can undo is the second.
+    /// How many one-shots may be issued. Wipe checks use one fewer; the second is undone.
     proposals: u8,
     /// What a wiped acceptor brings back with it, or `None` for one that never returns.
     recover: Option<Recover>,
 }
 
 impl Register {
-    /// Fold the replica set into the chosen set: a register two acceptors agree on has
-    /// reached a quorum, and a quorum of accepts is the decision. Only acceptors that
-    /// take part in rounds count — one nobody may ask is holding nothing.
+    /// Fold the replica set into the chosen set. Only acceptors that take part count.
     fn observe(&self, s: &mut RegisterState) {
         for i in 0..N {
             if s.reg[i].version == 0 || !self.votes(s, i) {
@@ -242,8 +210,7 @@ impl Register {
         }
     }
 
-    /// The decision `prepare_round` reaches from a set of prepare replies. `None` is
-    /// the round that gives up and retries.
+    /// The decision `prepare_round` reaches from prepare replies. `None` retries.
     fn pick(&self, replies: &[Reg]) -> Option<Reg> {
         if self.rule == Rule::HighestBallot {
             let top = replies.iter().map(|r| r.version).max()?;
@@ -256,7 +223,6 @@ impl Register {
         choose(replies, true)
     }
 
-    /// Whether `a` may take part in a round right now.
     fn votes(&self, s: &RegisterState, a: usize) -> bool {
         self.replay == Replay::Counted || !s.replaying[a]
     }
@@ -299,8 +265,7 @@ impl Model for Register {
         if s.repair.is_none() && s.repairs < MAX_REPAIRS {
             for mask in 1..8u8 {
                 let respond = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
-                // A replaying acceptor cannot promise, so a round takes its quorum from
-                // the members that are left.
+                // A replaying acceptor cannot promise, so the quorum comes from the rest.
                 if respond
                     .iter()
                     .enumerate()
@@ -330,9 +295,8 @@ impl Model for Register {
         if self.recover.is_some() {
             for a in 0..N as u8 {
                 let i = a as usize;
-                // Refilled: no member holds a register we lack, which is what the sweep
-                // sees when digests agree. Vacuously true of a group holding nothing —
-                // the case worth checking, since there only the promise speaks.
+                // Refilled: no member holds a register we lack. Vacuously true of an empty
+                // group, where only the promise speaks; that case is worth checking.
                 if s.replaying[i] && (0..N).all(|j| !s.reg[j].newer_than(&s.reg[i])) {
                     out.push(RegisterAction::Rejoin { a });
                 }
@@ -356,10 +320,8 @@ impl Model for Register {
                 let prop = s.proposals.get(p)?.clone();
                 s.proposals[p].left[a as usize] = false;
                 let i = a as usize;
-                // The guard, in order. An acceptor refuses only a version it is already
-                // past — the collision quorum intersection has to catch — and a member
-                // behind the guard is a gap this accept closes. At the guard itself the
-                // ballot may not regress.
+                // The guard, in order: refuse a version we are past, fill a gap below the
+                // guard, refuse a regressing ballot at the guard.
                 let behind = s.reg[i].version < prop.guard;
                 let at = s.reg[i].version == prop.guard && prop.ballot >= s.reg[i].ballot;
                 if self.votes(&s, i) && term_of(prop.ballot) >= s.term[i] {
@@ -376,9 +338,8 @@ impl Model for Register {
                 self.observe(&mut s);
             }
             RegisterAction::Prepare { respond } => {
-                // Every responder raises its own promise. A round whose responders land
-                // on different terms is dropped rather than modelled; the implementation
-                // proposes at the highest of them instead.
+                // Every responder raises its promise. A round whose responders land on
+                // different terms is dropped; the implementation proposes at the highest.
                 let mut terms = Vec::new();
                 for (i, r) in respond.iter().enumerate() {
                     if *r {
@@ -397,9 +358,8 @@ impl Model for Register {
                 if let Some(pick) = self.pick(&replies)
                     && pick.version > 0
                 {
-                    // A value chosen at some version left a quorum standing at or above
-                    // it, so an older answer replaces it with something the group has
-                    // already moved past. Nothing but a wipe makes that legal.
+                    // A chosen value left a quorum standing at or above its version, so
+                    // an older answer is a rollback. Only a wipe makes that legal.
                     s.rolled |= s.chosen.iter().any(|c| c.newer_than(&pick));
                     s.repair = Some(Repair {
                         pick,
@@ -410,8 +370,7 @@ impl Model for Register {
             RegisterAction::Learn { a } => {
                 let r = s.repair.clone()?;
                 let i = a as usize;
-                // The write phase of a repair is apply-if-newer rather than an unguarded
-                // write, so it can never regress a version.
+                // The repair write is apply-if-newer, so it never regresses a version.
                 if r.pick.newer_than(&s.reg[i]) {
                     s.reg[i] = r.pick;
                 }
@@ -423,8 +382,7 @@ impl Model for Register {
                 self.observe(&mut s);
             }
             RegisterAction::Wipe { a } => {
-                // The reformat takes the promised term with the register. What is left is
-                // a member that answers and knows nothing.
+                // The reformat takes the term too: a member that answers knowing nothing.
                 let i = a as usize;
                 s.wipes += 1;
                 s.replaying[i] = true;
@@ -446,8 +404,7 @@ impl Model for Register {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            // The safety claim: a version is a decision point, and only one value can
-            // ever be decided at it.
+            // Safety: a version is a decision point, and only one value is decided at it.
             Property::<Self>::always("one value per version", |_, s| {
                 s.chosen.iter().all(|a| {
                     s.chosen
@@ -456,8 +413,7 @@ impl Model for Register {
                 })
             }),
             Property::<Self>::always("a repair never answers below a chosen version", |m, s| {
-                // A wipe destroys a copy the argument rests on, so only a group that
-                // keeps what it accepted owes this.
+                // A wipe destroys the copy this rests on; only a wipe-free group owes it.
                 m.wipe || !s.rolled
             }),
             Property::<Self>::sometimes("a write is chosen", |_, s| !s.chosen.is_empty()),
@@ -490,10 +446,8 @@ fn guarded_accepts_agree_on_one_value_per_version() {
 
 #[test]
 fn choosing_by_ballot_alone_resurrects_a_losing_proposal() {
-    // The simpler rule picks the highest ballot at the top version. A losing one-shot
-    // sits on one acceptor at the same version as the chosen value, and nothing stops
-    // its ballot from being the higher one, so the repair that was meant to heal the
-    // split promotes the loser to a quorum instead.
+    // The simpler rule picks the highest ballot at the top version, so a losing one-shot
+    // at the chosen value's version with a higher ballot is promoted to a quorum.
     let path = Register {
         rule: Rule::HighestBallot,
         replay: Replay::Excluded,
@@ -512,10 +466,9 @@ fn choosing_by_ballot_alone_resurrects_a_losing_proposal() {
 
 #[test]
 fn descending_past_the_floor_answers_with_a_rolled_back_write() {
-    // A value can be chosen and then stop being nameable: chosen at version 2 by the two
-    // acceptors that have since moved to version 3, each on a proposal that reached
-    // nobody else, and the third never had it. No reply names it, so an unfloored
-    // descent walks down to a register from before the write and hands that back.
+    // Counterexample: a value chosen at version 2 by the two acceptors that have since
+    // moved to version 3, each on a proposal nobody else saw, and the third never had it.
+    // No reply names it, so an unfloored descent hands back a register from before it.
     let replies = [
         Reg {
             version: 1,
@@ -534,19 +487,13 @@ fn descending_past_the_floor_answers_with_a_rolled_back_write() {
         },
     ];
     assert_eq!(choose(&replies, false).map(|r| r.version), Some(1));
-    // The floor is the highest version a quorum could still be standing at, and the
-    // answer has to come from there whether or not anyone can still name it.
+    // The answer must come from the floor whether or not anyone can still name it.
     assert_eq!(choose(&replies, true), Some(replies[1]));
 }
 
-/// A node that lost what it had accepted is not one that is merely behind: it answers,
-/// and it answers with nothing. The four checks below all start from a wipe and let the
-/// group run around it — the first two for what the flag means once set, the last two
-/// for what it costs to clear.
-///
-/// How a wipe comes to be noticed stays outside: the implementation approximates it as
-/// our whole side of a group being empty against a peer that has data, and the
-/// approximation is not the property.
+/// A wiped acceptor is not merely behind: it answers, and it answers with nothing. The
+/// four checks below start from a wipe and let the group run around it. How a wipe comes
+/// to be noticed stays outside the model and is not the property under test.
 #[test]
 fn a_replaying_acceptor_is_not_counted_toward_quorum() {
     Register {
@@ -565,11 +512,8 @@ fn a_replaying_acceptor_is_not_counted_toward_quorum() {
 
 #[test]
 fn counting_a_replaying_acceptor_undoes_an_acknowledged_write() {
-    // Quorum intersection is all that holds a decision in place, and a wiped acceptor
-    // breaks it while still answering. A write acked by it and one other member survives
-    // on that member alone; the wiped one then guards at the version it no longer has,
-    // so a second write is accepted at the same version and reaches a quorum of its own.
-    // Two values at one version, and the first was acknowledged.
+    // A wiped acceptor breaks quorum intersection while still answering: it guards at the
+    // version it lost, so a second write takes that version and reaches its own quorum.
     let path = Register {
         rule: Rule::Majority,
         replay: Replay::Counted,
@@ -608,11 +552,8 @@ fn a_rejoining_acceptor_recovers_its_promise() {
 
 #[test]
 fn rejoining_without_the_promise_undoes_an_acknowledged_write() {
-    // The registers a replay pulls back are a floor wherever the group holds one — a
-    // lower ballot is refused as a regression — and no floor at all where it holds
-    // nothing, which is exactly where a round the wiped member promised to is still
-    // deciding. It comes back knowing nothing, accepts a ballot it had already refused,
-    // and carries it to a quorum beside the value the round chose.
+    // Replayed registers are a floor only where the group holds one; where it holds
+    // nothing, a member back without its promise accepts a ballot it had refused.
     let path = Register {
         rule: Rule::Majority,
         replay: Replay::Excluded,
@@ -633,28 +574,22 @@ fn rejoining_without_the_promise_undoes_an_acknowledged_write() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// When the proposer's own copy lands
-// ---------------------------------------------------------------------------
+// --- When the proposer's own copy lands ---
 
-/// One-shots this model may issue. The check above lets the checker pick any guard,
-/// right for the acceptor rule and wrong here: this guard is the proposer's own
-/// register, as `alloc.guard` returns it, and the question is when it may move.
+/// One-shots this model may issue. Unlike the check above, the guard here is the
+/// proposer's own register, as `alloc.guard` returns it; the question is when it may move.
 const MAX_ORDER: u8 = 3;
 
 /// When the proposer's own leg is installed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Commit {
-    /// What the implementation does: stage the page, install the register only once
-    /// enough peers have accepted to make a quorum, and give the slot back otherwise.
+    /// What the implementation does: install the register only once peers make a quorum.
     Deferred,
-    /// The simpler rule: the local accept runs beside the fan-out and stands whatever
-    /// the fan-out returns.
+    /// The simpler rule: the local accept runs beside the fan-out and stands regardless.
     Eager,
 }
 
-/// A one-shot in flight. Peers are delivered or lost one at a time; the proposer's own
-/// leg is settled by `Finish` once none are left.
+/// A one-shot in flight. Peers resolve one at a time; `Finish` settles the proposer's.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct Shot {
     by: u8,
@@ -677,12 +612,10 @@ struct CommitState {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum CommitAction {
-    /// A member proposes at the version it holds. Ballots rise with the proposal order,
-    /// as a prepare before each round would give.
+    /// A member proposes at the version it holds. Ballots rise with the proposal order.
     Propose {
         by: u8,
     },
-    /// The accept reaches a peer, or is lost on the way to one.
     Deliver {
         p: usize,
         a: u8,
@@ -706,8 +639,7 @@ struct CommitModel {
     commit: Commit,
 }
 
-/// Fold the replica set into the chosen history: a register two acceptors agree on has
-/// reached a quorum, and that is the decision.
+/// Fold the replica set into the chosen history: a register a quorum holds is decided.
 fn settle(s: &mut CommitState) {
     for i in 0..N {
         let r = s.reg[i];
@@ -720,8 +652,7 @@ fn settle(s: &mut CommitState) {
     }
 }
 
-/// The acceptor rule, shared by every leg: refuse only a version we are already past,
-/// and at the version itself refuse a ballot that regresses.
+/// The acceptor rule for every leg: refuse a version we are past or a regressing ballot.
 fn take(reg: &mut Reg, sh: &Shot) -> bool {
     if reg.version > sh.guard || (reg.version == sh.guard && sh.ballot < reg.ballot) {
         return false;
@@ -815,9 +746,8 @@ impl Model for CommitModel {
             }
             CommitAction::Finish { p } => {
                 let sh = s.shots.get(p)?.clone();
-                // The whole rule: without the peer accepts a quorum needs, the staged
-                // page is thrown away and this member's register stays where the group
-                // left it, so no version exists that a quorum never stood behind.
+                // Without the peer accepts a quorum needs the staged page is dropped, so
+                // no version exists that a quorum never stood behind.
                 if self.commit == Commit::Deferred && sh.votes as usize >= NEED - 1 {
                     take(&mut s.reg[sh.by as usize], &sh);
                 }
@@ -843,10 +773,7 @@ impl Model for CommitModel {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            // A blind write may land in any order against another, but a value that has
-            // been read puts the ones proposed before it in the past. A later chosen
-            // value with an earlier proposal order is a write the group had moved on
-            // from coming back.
+            // A later chosen value with an earlier proposal order is a write coming back.
             Property::<Self>::always("a write is not undone", |_, s: &CommitState| {
                 s.chosen.windows(2).all(|w| w[0] < w[1])
             }),
@@ -875,11 +802,9 @@ fn a_proposer_never_builds_on_a_version_of_its_own() {
 
 #[test]
 fn committing_beside_the_fan_out_resurrects_a_failed_write() {
-    // The local accept stands even when nothing agreed to it, so every retry leaves this
-    // member a version further ahead of a group that never saw those rounds. A later
-    // prepare hearing from two of three finds that private top version uncontested — one
-    // holder plus one silent member is a quorum's worth — and spreads it over a value
-    // the group had chosen meanwhile.
+    // The local accept stands even when nothing agreed to it, so each retry leaves this
+    // member a version ahead of a group that never saw those rounds. A later prepare
+    // hearing from two of three finds that private version uncontested and spreads it.
     let path = CommitModel {
         commit: Commit::Eager,
     }
@@ -896,14 +821,12 @@ fn committing_beside_the_fan_out_resurrects_a_failed_write() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Shard handover between disjoint memberships
-// ---------------------------------------------------------------------------
+// --- Shard handover between disjoint memberships ---
 
 const MAX_WRITES: u8 = 3;
 
-/// One page, replicated in the source group `a` and the destination group `b`. The
-/// groups share no member, so only the handover ordering keeps them from both accepting.
+/// One page, replicated in source group `a` and destination group `b`. The groups share
+/// no member, so only the handover ordering keeps them from both accepting.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct HandoverState {
     a: [Reg; N],
@@ -912,8 +835,7 @@ struct HandoverState {
     sealed: [bool; N],
     /// The destination has recorded the coming handover; nothing may be sealed first.
     pending: bool,
-    /// Versions the source committed and may still forward. Fire-and-forget, so the
-    /// checker is free never to deliver them.
+    /// Versions the source committed and may still forward. Fire-and-forget, may be lost.
     forwards: Vec<Reg>,
     live: bool,
     /// Every write acknowledged to a client, in the order it was acknowledged.
@@ -1080,8 +1002,7 @@ impl Model for Handover {
             HandoverAction::SealPending => s.pending = true,
             HandoverAction::Seal { a } => s.sealed[a as usize] = true,
             HandoverAction::Drain => {
-                // The source is frozen, so the remaining difference is finite and one
-                // pass closes it.
+                // The source is frozen, so one pass closes the remaining difference.
                 if let Some(top) = quorum_reg(&s.a) {
                     for i in 0..N {
                         if top.newer_than(&s.b[i]) {
@@ -1102,8 +1023,7 @@ impl Model for Handover {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            // Version monotonicity per page survives the change of membership only
-            // because of the drain.
+            // Per-page version monotonicity survives the membership change only by drain.
             Property::<Self>::always("acknowledged versions increase", |_, s| {
                 s.history.windows(2).all(|w| w[0].version < w[1].version)
             }),
@@ -1138,10 +1058,8 @@ fn sealed_handover_preserves_acknowledged_writes() {
 
 #[test]
 fn installing_on_the_seal_alone_rolls_a_write_back() {
-    // Live replication is fire-and-forget, so at the seal the destination may be missing
-    // pages the source committed and acknowledged. Going live without draining serves
-    // them at an older version, and the destination's next write is then chosen at a
-    // version the source already used.
+    // At the seal the destination may be missing acknowledged pages, since live
+    // replication is fire-and-forget. Going live without draining reuses a version.
     Handover {
         install: Install::OnSeal,
     }
@@ -1153,9 +1071,7 @@ fn installing_on_the_seal_alone_rolls_a_write_back() {
     .assert_any_discovery("acknowledged versions increase");
 }
 
-// ---------------------------------------------------------------------------
-// Healing: the anti-entropy sweep
-// ---------------------------------------------------------------------------
+// --- Healing: the anti-entropy sweep ---
 
 const MAX_ACCEPTS: u8 = 2;
 const MAX_SWEEPS: u8 = 2;
@@ -1163,11 +1079,9 @@ const MAX_SWEEPS: u8 = 2;
 /// How the sweep closes a difference it found in the digests (`heal.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Anti {
-    /// What the implementation does: the pair comparison only *finds* the address, and
-    /// closing it is an ordinary repair against the whole group.
+    /// The implementation: the comparison finds the address, a group repair closes it.
     Repair,
-    /// The tempting shortcut: the cursor already handed us both registers, so reconcile
-    /// the two that were compared and skip the round trip.
+    /// The tempting shortcut: reconcile the two compared registers, skipping the round.
     Propagate,
 }
 
@@ -1177,16 +1091,13 @@ struct SweepState {
     chosen: Vec<Reg>,
     accepts: u8,
     sweeps: u8,
-    /// A comparison that started with the two replicas disagreeing and ended with the
-    /// whole group agreeing: the outcome healing asks for.
+    /// A comparison that began with two replicas disagreeing and ended with all agreeing.
     healed: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum SweepAction {
-    /// A one-shot accept that reached `set` and no further. A `set` below a quorum is
-    /// the divergence anti-entropy exists to find, and one nobody reads is noticed no
-    /// other way.
+    /// A one-shot accept reaching `set` and no further; below a quorum it is divergence.
     Accept {
         member: u8,
         guard: u8,
@@ -1255,9 +1166,8 @@ impl Model for Sweep {
         let mut s = last.clone();
         match action {
             SweepAction::Accept { member, guard, set } => {
-                // One term for everyone: within a term the guard is what orders writers,
-                // and two proposers on one version with different ballots is precisely
-                // the state the sweep has to survive.
+                // One term for everyone: within a term the guard orders writers, and two
+                // proposers on one version with different ballots is what the sweep faces.
                 let b = ballot(1, member);
                 let v = Reg {
                     version: guard + 1,
@@ -1274,8 +1184,7 @@ impl Model for Sweep {
             }
             SweepAction::Compare { a, b } => {
                 let (a, b) = (a as usize, b as usize);
-                // Equal digests, nothing to do: the sweep does no work where the
-                // replicas already agree.
+                // Equal digests: the sweep does no work where replicas already agree.
                 if s.reg[a] == s.reg[b] {
                     return None;
                 }
@@ -1312,8 +1221,7 @@ impl Model for Sweep {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            // The sweep touches registers nobody asked for, so it is the one place a
-            // background job could quietly undo a decision.
+            // The sweep touches registers nobody asked for, so it could undo a decision.
             Property::<Self>::always("one value per version", |_, s| {
                 s.chosen.iter().all(|a| {
                     s.chosen
@@ -1338,9 +1246,8 @@ fn the_sweep_heals_a_gap_without_undoing_a_write() {
 
 #[test]
 fn reconciling_the_compared_pair_instead_of_the_group_loses_a_write() {
-    // The cursor hands the sweep both registers, which makes "keep the newer one" look
-    // free. It is not: the newer of two is not the chosen of three, and copying it onto
-    // the pair is enough to give a losing proposal its second acceptor.
+    // The newer of two is not the chosen of three: copying it onto the compared pair is
+    // enough to give a losing proposal its second acceptor.
     Sweep {
         rule: Anti::Propagate,
     }

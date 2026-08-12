@@ -1,6 +1,5 @@
-//! On-disk formats: pure codec and arithmetic, no state or runtime. The exception is
-//! the format/read-back path at the bottom, which runs on the control thread with
-//! plain syscalls.
+//! On-disk formats: codec and arithmetic, plus the format and read-back path at the
+//! bottom, which runs on the control thread with plain syscalls.
 //!
 //! ```text
 //! +-----------+--------+-----------------------------+-------------------------+-------------+
@@ -11,16 +10,11 @@
 //!                                                                    alloc_end -^
 //! ```
 //!
-//! The 4 MiB of zeroes belongs to no region: it is the source a read of a never-written
-//! page DMAs from.
+//! The 4 MiB of zeroes belongs to no region. A read of a never-written page DMAs from it.
 //!
-//! The tail is everything between `alloc_end` and the end of the store. It is not
-//! carved, not named by any superblock word, and not persisted: [`Geometry::tail`]
-//! derives it at every open from `alloc_end` and the configured size. The cache lives
-//! there, and it can because the cache is volatile: nothing points at those bytes
-//! after a restart, so their placement need not be stable across one. `grow` places at
-//! `alloc_end`, so added capacity eats into the tail and the next boot simply derives a
-//! smaller one; no durable byte ever moves.
+//! The tail is everything between `alloc_end` and the end of the store: derived by
+//! [`Geometry::tail`] at every open, named by no superblock word, never persisted. The
+//! cache lives there and is volatile, so `grow` shrinks the tail without moving a byte.
 
 use std::io;
 #[cfg(not(feature = "sim"))]
@@ -33,8 +27,7 @@ use crate::runtime::Limiter;
 
 pub(crate) const MBLOCK: usize = 4096;
 const MB_HDR: usize = 64;
-/// Entry widths. Only the 4 KiB entry carries `data_crc`; 4 MiB pages are not
-/// checksummed.
+/// Entry widths. Only the 4 KiB entry carries `data_crc`; 4 MiB pages are unchecksummed.
 const ENTRY_SMALL: usize = 36;
 const ENTRY_HUGE: usize = 32;
 /// Slots per mblock. Both are exact fits: 64 + 112*36 = 64 + 126*32 = 4096.
@@ -46,26 +39,18 @@ pub(crate) const HUGE_PAGE: u64 = 4 << 20;
 
 const SB_MAGIC: u32 = 0x5243_5342; // "RCSB"
 const MB_MAGIC: u32 = 0x524d_4232; // "RMB2"
-/// One run of mblocks per class.
-///
-/// Version 5 moved the cache out of a statically carved region and into the derived
-/// tail, which dropped four geometry words and shifted the growth table. Version 3 was
-/// the universe address space: an entry's address is `universe:26 | lba:38` where 1 and
-/// 2 held `volume:32 | offset:32`, and a seal names a globally unique extent id where it
-/// used to name a volume and a position within it. Version 4 marked a grown layout.
-/// Nothing about any of it is detectable from the bytes, so the version is the only
-/// guard and a store written by an older build has to be reformatted.
+/// On-disk format version and the only compatibility guard: no older format is detectable
+/// from the bytes, so an older store must be reformatted. v3 brought the
+/// `universe:26 | lba:38` address and extent-id seals, v4 a grown layout, v5 the tail.
 const FMT_VER: u16 = 5;
 const SB_COPIES: u64 = 4;
 const SB_REGION: u64 = SB_COPIES * MBLOCK as u64;
 const ZERO_BYTES: u64 = HUGE_PAGE;
-/// Superblock tail reserved for the consensus record (`promised_term` and the seal
-/// table); the geometry words and the growth table must not reach into it.
+/// Superblock tail reserved for the consensus record; geometry must not reach into it.
 const SB_RESERVED: usize = 3072;
 
-/// The unit the tail is carved into and the unit the cache moves between classes. One
-/// 4 MiB chunk is 1024 slots of the small class or exactly one slot of the huge class,
-/// and being 4 MiB aligned it satisfies O_DIRECT for either.
+/// The unit the tail is carved into and that the cache moves between classes: 1024 small
+/// slots or exactly one huge slot, 4 MiB aligned so it satisfies O_DIRECT for either.
 pub(crate) const CHUNK_BYTES: u64 = HUGE_PAGE;
 
 /// Both classes in the order their ids are tagged with on disk.
@@ -75,8 +60,7 @@ fn ver_ok(v: u16) -> bool {
     v == FMT_VER
 }
 
-/// Which slab a page lives in. This, not the extent's type, decides whether the page
-/// is checksummed.
+/// Which slab a page lives in. This, not the extent's type, decides if it is checksummed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Class {
     Small,
@@ -84,7 +68,7 @@ pub(crate) enum Class {
 }
 
 impl Class {
-    /// The class the `huge` flag that rides every request names.
+    /// The class named by the `huge` flag that rides every request.
     pub(crate) fn of(huge: bool) -> Class {
         if huge { Class::Huge } else { Class::Small }
     }
@@ -118,14 +102,12 @@ pub(crate) enum State {
     #[default]
     Empty = 0,
     Live = 1,
-    /// Immutable page written and then trimmed. The entry survives so a reader can tell
-    /// a trimmed page from a hole (CORFU).
+    /// Written then trimmed; the entry survives to tell a trim from a hole (CORFU).
     Tombstone = 2,
 }
 
-/// One mblock entry, decoded. Also the in-DRAM slot record: the mblock image is kept in
-/// memory as the authoritative copy, so a metadata write is a full-block rewrite with no
-/// read-modify-write.
+/// One decoded mblock entry, and the in-DRAM slot record. The image is authoritative in
+/// memory, so a metadata write is a full-block rewrite, never RMW.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) struct Entry {
     /// The page in this slot. Zero means free, which is why universe id 0 is reserved.
@@ -133,8 +115,7 @@ pub(crate) struct Entry {
     pub(crate) version: u64,
     /// CASPaxos accepted ballot (`paxos::Ballot`), in the low 32 bits.
     pub(crate) ballot: u64,
-    /// CRC32C of the page bytes seeded with `(addr, version)`. Meaningful only when
-    /// `state == Live` and the class is `Small`.
+    /// CRC32C of the page seeded with `(addr, version)`; only for `Live` `Small` entries.
     pub(crate) data_crc: u32,
     /// Tombstone epoch, for the tombstone sweep.
     pub(crate) epoch: u32,
@@ -188,8 +169,7 @@ impl Entry {
 
 // ---------------------------------------------------------------------------- mblock
 
-/// Header of a decoded mblock. `mblock_id` and the class fix which run of slots this
-/// block describes, so a slot's index is positional and never stored.
+/// Decoded mblock header; a slot index is positional, fixed by `mblock_id` and the class.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Header {
     pub(crate) mblock_id: u32,
@@ -220,9 +200,7 @@ pub(crate) fn put_mblock(buf: &mut [u8], h: Header, entries: &[Entry]) {
     buf[CRC_OFF..CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
-/// Validate and decode an mblock header. `None` means this copy is unusable: wrong
-/// magic, wrong format, or a failed CRC. The caller falls back to the other copy and
-/// quarantines the block if both fail.
+/// Validate and decode an mblock header. `None` on wrong magic, wrong format, or bad CRC.
 pub(crate) fn get_header(buf: &[u8]) -> Option<Header> {
     if buf.len() != MBLOCK
         || u32(&buf[0..]) != MB_MAGIC
@@ -256,10 +234,8 @@ fn mblock_crc(buf: &[u8]) -> u32 {
 
 // ------------------------------------------------------------------------- superblock
 
-/// One contiguous run of mblocks for a single class: copy A of its metadata, copy B a
-/// whole run later, and the data slots those blocks name. Extent 0 is what `format`
-/// laid down; `grow` appends the rest past the end of everything, which is what lets
-/// capacity be added without moving a byte that is already there.
+/// One contiguous run of mblocks for one class: metadata copy A, copy B a whole run later,
+/// and the data slots they name. `grow` appends past the end, so nothing there moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 struct Extent {
     meta: u64,
@@ -267,21 +243,15 @@ struct Extent {
     mblocks: u64,
 }
 
-/// Extents per class, extent 0 included. Each one at least doubles the class, so eight
-/// is past any store that could be built.
+/// Extents per class, extent 0 included; each at least doubles the class, so 8 is ample.
 const MAX_EXT: usize = 8;
 
-/// Where every region starts and how big it is. Computed at format time from the config
-/// and carried in the superblock; `grow` appends to it, and nothing else recomputes it
-/// at runtime.
-///
-/// The cache is deliberately absent. It lives in the tail past `alloc_end`, which
-/// [`Geometry::tail`] derives from the configured store size at every open.
+/// Where every region starts and how big it is. Set at format time, carried in the
+/// superblock, changed only by `grow`. The cache is absent: see [`Geometry::tail`].
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Geometry {
     pub(crate) zero_base: u64,
-    /// First byte past everything the layout owns. `grow` places from here, and the
-    /// cache tail starts at the next 4 MiB boundary at or after it.
+    /// First byte past everything the layout owns; `grow` places from here.
     alloc_end: u64,
     small: [Extent; MAX_EXT],
     huge: [Extent; MAX_EXT],
@@ -290,9 +260,7 @@ pub struct Geometry {
 }
 
 /// Spare slots beyond the config's page count, for in-flight out-of-place writes and
-/// tombstones awaiting an epoch advance. 5% plus a per-class `floor` that keeps tiny
-/// configs workable; per class because 64 spare huge slots would be a quarter of a
-/// gigabyte.
+/// tombstones: 5% plus a per-class `floor`, per class because 64 huge slots is 256 MiB.
 fn overprovision(pages: u64, floor: u64) -> u64 {
     if pages == 0 {
         0
@@ -307,8 +275,7 @@ fn align_up(x: u64, a: u64) -> u64 {
 
 /// The geometry words: extent 0 of each class, and where the layout ends.
 const WORDS: usize = 10;
-/// The growth table, between the geometry words and the consensus record. A flat list
-/// of the extents `grow` appended, tagged with their class.
+/// The growth table, between the geometry words and the consensus record.
 const GT_MAGIC: u32 = 0x5247_5854; // "RGXT"
 const GT_OFF: usize = 16 + WORDS * 8;
 const GT_HDR: usize = 16;
@@ -325,8 +292,7 @@ impl Geometry {
         let mut at = SB_REGION;
         g.zero_base = at;
         at += ZERO_BYTES;
-        // Both classes' metadata, then both classes' data, so the two metadata regions
-        // sit together at the head of the store.
+        // Both metadata regions together at the head of the store, then both data regions.
         let meta = [at, at + want[0] * 2 * MBLOCK as u64];
         at = meta[1] + want[1] * 2 * MBLOCK as u64;
         for (i, class) in CLASSES.into_iter().enumerate() {
@@ -345,7 +311,6 @@ impl Geometry {
         Ok(g)
     }
 
-    /// The runs of mblocks this class is made of, in id order.
     fn extents(&self, class: Class) -> &[Extent] {
         match class {
             Class::Small => &self.small[..self.n_small as usize],
@@ -364,10 +329,8 @@ impl Geometry {
         Some(())
     }
 
-    /// Place a run of `n` more mblocks past the end of everything, taking the layout out
-    /// to its new end. The only code that decides where a grown extent goes, and it
-    /// reads nothing but the layout itself: a growth cut short by a crash is placed at
-    /// the same offsets and rewritten on the next boot.
+    /// Place `n` more mblocks past the end of everything and move `alloc_end`. Reads
+    /// nothing but the layout, so a growth cut short by a crash is re-placed identically.
     fn append(&mut self, class: Class, n: u64) -> io::Result<()> {
         let meta = self.alloc_end;
         let data = align_up(meta + n * 2 * MBLOCK as u64, class.bytes());
@@ -408,8 +371,7 @@ impl Geometry {
         self.mblocks(class) * class.k() as u64
     }
 
-    /// The first mblock id past the run holding `id`. A batched read of the metadata
-    /// region stops here: the next run's blocks are elsewhere on the store.
+    /// The first mblock id past the run holding `id`; a batched metadata read stops here.
     pub(crate) fn ext_end(&self, class: Class, id: u64) -> u64 {
         self.ext_of(class, id)
             .map_or(id, |(e, first)| first + e.mblocks)
@@ -429,15 +391,8 @@ impl Geometry {
         self.alloc_end
     }
 
-    /// The cache tail: base offset and length, in whole 4 MiB chunks, of everything
-    /// between the end of the layout and the end of the store.
-    ///
-    /// Derived at every open and never written down. That is sound only because the
-    /// cache is volatile: nothing points at these bytes after a restart, so a growth
-    /// that moves `alloc_end` up simply yields a shorter tail next boot, and the bytes
-    /// the new extent lands on were cache and are now slab. The alternative, carving
-    /// the cache at format time, is what froze it at a size chosen before anyone knew
-    /// how big the store would get.
+    /// The cache tail: base offset and length, in whole 4 MiB chunks, between the end of
+    /// the layout and the end of the store. Derived at every open, never written down.
     pub(crate) fn tail(&self, store_bytes: u64) -> (u64, u64) {
         let base = align_up(self.alloc_end(), CHUNK_BYTES);
         let end = store_bytes / CHUNK_BYTES * CHUNK_BYTES;
@@ -449,9 +404,9 @@ impl Geometry {
         self.tail(store_bytes).1 / CHUNK_BYTES
     }
 
-    /// The slot a data-region offset belongs to, the inverse of [`Self::slot_off`].
-    /// `None` when the offset is not the start of a slot of this class, which is how
-    /// the allocator checks that a chunk the cache hands back is one it lent out.
+    /// The slot a data-region offset belongs to, the inverse of [`Self::slot_off`]. `None`
+    /// unless the offset starts a slot of this class, which is how the allocator checks a
+    /// chunk the cache returns.
     pub(crate) fn slot_at(&self, class: Class, off: u64) -> Option<u32> {
         let k = class.k() as u64;
         let mut first = 0;
@@ -469,9 +424,8 @@ impl Geometry {
         None
     }
 
-    /// Byte offset of one copy of an mblock. Copies A and B sit a whole run apart
-    /// rather than adjacent, so one bad neighbourhood of the store cannot take both
-    /// copies of a block.
+    /// Byte offset of one copy of an mblock. Copies A and B sit a whole run apart, not
+    /// adjacent, so one bad neighbourhood cannot take both copies of a block.
     pub(crate) fn mblock_off(&self, class: Class, id: u32, copy: u8) -> u64 {
         let (e, first) = self
             .ext_of(class, id as u64)
@@ -490,8 +444,7 @@ impl Geometry {
                 ),
             ));
         }
-        // Slot and mblock ids are u32 everywhere: on the wire, in the free lists, and in
-        // the mblock header. Reachable on a large store only after several growths.
+        // Slot and mblock ids are u32 everywhere: wire, free lists, and mblock header.
         for class in CLASSES {
             if self.slots(class) > u32::MAX as u64 {
                 return Err(io::Error::new(
@@ -506,9 +459,7 @@ impl Geometry {
         Ok(())
     }
 
-    /// Write the geometry into a superblock image the caller has already read, leaving
-    /// the consensus record alone and refreshing the block CRC. `grow` rewrites a live
-    /// superblock this way; `format` has nothing to preserve and uses `encode`.
+    /// Write the geometry into a read superblock image, keeping consensus, refreshing CRC.
     fn patch(&self, b: &mut [u8]) {
         b[..CS_OFF].fill(0);
         b[0..4].copy_from_slice(&SB_MAGIC.to_le_bytes());
@@ -539,9 +490,7 @@ impl Geometry {
             return None;
         }
         let w: [u64; WORDS] = std::array::from_fn(|i| u64f(&b[16 + i * 8..]));
-        // Words 7 and 8 are extent 0's slot counts, which are its block count times the
-        // class's k. Redundant, and kept because the first version of the format wrote
-        // them: checked here rather than trusted.
+        // Words 7 and 8 are extent 0's slot counts, redundant with 3 and 4; check them.
         if w[7] != w[3] * K_SMALL as u64 || w[8] != w[4] * K_HUGE as u64 {
             return None;
         }
@@ -570,8 +519,7 @@ impl Geometry {
         Some(g)
     }
 
-    /// Extent 0 of each class, plus where the layout ends. Everything `grow` added is
-    /// in the growth table below rather than here.
+    /// Extent 0 of each class plus where the layout ends; grown extents go in the table.
     fn words(&self) -> [u64; WORDS] {
         let (s, h) = (self.small[0], self.huge[0]);
         [
@@ -588,9 +536,7 @@ impl Geometry {
         ]
     }
 
-    /// The extents `grow` appended, in id order within each class. Always written, even
-    /// when empty: the header is what a reader checks, so there is one shape of
-    /// superblock rather than two.
+    /// The extents `grow` appended, in id order per class. Always written, even when empty.
     fn save_growth(&self, b: &mut [u8]) {
         let mut at = GT_OFF + GT_HDR;
         let mut n = 0u16;
@@ -630,8 +576,7 @@ impl Geometry {
     }
 }
 
-/// Mblocks each class needs for `cfg`, the same rounding `plan` and `grow` both work
-/// from so that a config which fits stays fitting.
+/// Mblocks each class needs for `cfg`; `plan` and `grow` share this rounding.
 fn wanted(cfg: &crate::config::Config) -> [u64; 2] {
     [
         overprovision(cfg.small_pages(), 64).div_ceil(K_SMALL as u64),
@@ -641,25 +586,19 @@ fn wanted(cfg: &crate::config::Config) -> [u64; 2] {
 
 // -------------------------------------------------------------- consensus side state
 
-/// One row of the seal table: an extent this node's group has frozen as a migration
-/// source. Extent ids are unique across every universe the node is in, so the id alone
-/// names the shard and the row needs nothing else.
+/// One seal-table row: an extent frozen as a migration source, named by its unique id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Seal {
     pub(crate) extent: u32,
     pub(crate) term: u32,
 }
 
-/// The two things consensus keeps that are not page registers: `promised_term` per
-/// group, and the seal table. Both live in the superblock rather than an mblock
-/// because neither is addressed by page.
-///
-/// Losing a seal is the one metadata loss that is not self-healing — it is a shard that
-/// could then be written in two zones — so it gets the superblock's fourfold redundancy.
+/// Consensus state that is not a page register: `promised_term` per group and the seal
+/// table, both in the superblock because neither is addressed by page. Losing a seal is the
+/// one metadata loss that is not self-healing, so it gets fourfold redundancy.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Consensus {
-    /// `(group, promised_term)`, sorted by group. A group is a universe and an index
-    /// within that universe's catalog, so the row carries both.
+    /// `(group, promised_term)` sorted by group; a group is a universe and a catalog index.
     pub(crate) terms: Vec<(GroupId, u32)>,
     pub(crate) seals: Vec<Seal>,
 }
@@ -669,8 +608,7 @@ const CS_OFF: usize = 1024;
 const CS_HDR: usize = 16;
 const TERM_BYTES: usize = 12;
 const SEAL_BYTES: usize = 8;
-/// Bounded by what fits beside the geometry in one 4 KiB block, well above the groups
-/// a node joins and the shards it can be migrating at once.
+/// Bounded by what fits beside the geometry in one 4 KiB block.
 pub(crate) const MAX_TERMS: usize = 128;
 pub(crate) const MAX_SEALS: usize = 96;
 const _: () =
@@ -678,8 +616,7 @@ const _: () =
 const _: () = assert!(CS_OFF == MBLOCK - SB_RESERVED);
 
 impl Consensus {
-    /// Patch this state into a superblock image the caller has already read, leaving the
-    /// geometry words alone and refreshing the block CRC.
+    /// Patch this state into a read superblock image, keeping geometry, refreshing the CRC.
     pub(crate) fn patch(&self, b: &mut [u8]) {
         assert!(self.terms.len() <= MAX_TERMS && self.seals.len() <= MAX_SEALS);
         b[CS_OFF..MBLOCK - 4].fill(0);
@@ -704,9 +641,7 @@ impl Consensus {
         b[MBLOCK - 4..].copy_from_slice(&crc.to_le_bytes());
     }
 
-    /// Decode from a superblock image whose CRC the caller has already checked. A block
-    /// written before this record existed has no magic and reads as empty, the correct
-    /// state for a store that has never run consensus.
+    /// Decode from a superblock image whose CRC the caller checked; no magic means empty.
     fn decode(b: &[u8]) -> Consensus {
         let mut c = Consensus::default();
         if b.len() != MBLOCK || u32(&b[CS_OFF..]) != CS_MAGIC || u16(&b[CS_OFF + 4..]) != FMT_VER {
@@ -733,8 +668,7 @@ impl Consensus {
     }
 }
 
-/// Byte offset of superblock copy `i`. Consensus state is rewritten through every
-/// copy; it is off every hot path.
+/// Byte offset of superblock copy `i`. Consensus state is rewritten through every copy.
 pub(crate) fn sb_off(i: u64) -> u64 {
     i * MBLOCK as u64
 }
@@ -768,8 +702,7 @@ pub(crate) fn read_consensus(path: &Path) -> io::Result<Consensus> {
 
 // ------------------------------------------------------------------------------- CRC
 
-/// CRC32C (Castagnoli). `seed` is a previous result, so
-/// `crc32c_with(crc32c(a), b) == crc32c(a ++ b)`.
+/// CRC32C (Castagnoli), seeded so `crc32c_with(crc32c(a), b) == crc32c(a ++ b)`.
 fn crc32c_with(seed: u32, data: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("sse4.2") {
@@ -783,9 +716,8 @@ pub fn crc32c(data: &[u8]) -> u32 {
     crc32c_with(0, data)
 }
 
-/// The page checksum, seeded with the address and version so that a misdirected read,
-/// or a page left over from a lost metadata write, fails the check even though its
-/// bytes are internally consistent.
+/// Page checksum seeded with address and version, so a misdirected read or a page left by
+/// a lost metadata write fails despite consistent bytes.
 pub fn page_crc(addr: u64, version: u64, page: &[u8]) -> u32 {
     let mut seed = [0u8; 16];
     seed[0..8].copy_from_slice(&addr.to_le_bytes());
@@ -793,11 +725,9 @@ pub fn page_crc(addr: u64, version: u64, page: &[u8]) -> u32 {
     crc32c_with(crc32c(&seed), page)
 }
 
-// The CRC32 instruction has three cycles of latency and issues one per cycle, so a
-// single accumulator runs the pipeline a third full. Three interleaved chains fill it;
-// they are folded back into one by advancing the earlier chains over the bytes the
-// later ones covered. That advance is a fixed linear map over GF(2), so it is a
-// constant matrix per chunk length.
+// The CRC32 instruction has three cycles of latency and issues one per cycle, so one
+// accumulator runs the pipeline a third full. Three interleaved chains fill it and fold
+// back by advancing earlier chains over later bytes: a constant GF(2) matrix per length.
 #[cfg(target_arch = "x86_64")]
 const LONG: usize = 1024;
 #[cfg(target_arch = "x86_64")]
@@ -873,8 +803,7 @@ const fn apply(m: &[u32; 32], mut v: u32) -> u32 {
     sum
 }
 
-/// A matrix flattened to one table per input byte, so a fold is four loads and three
-/// XORs rather than a data-dependent walk over 32 columns.
+/// A matrix flattened to one table per input byte: a fold is four loads and three XORs.
 #[cfg(target_arch = "x86_64")]
 type Shift = [[u32; 256]; 4];
 
@@ -976,19 +905,16 @@ fn crc32c_sw(seed: u32, data: &[u8]) -> u32 {
 
 // ----------------------------------------------------------------------------- format
 
-/// Lay the store out for `cfg`: superblocks, the zero region, and an empty mblock for
-/// every slot. Destroys whatever was there.
+/// Lay the store out for `cfg`, destroying whatever was there.
 pub fn format(path: &Path, cfg: &crate::config::Config) -> io::Result<Geometry> {
-    // Writing every mblock is the heaviest run of IO the store ever sees, and it is
-    // metered the same as anything else.
+    // Writing every mblock is the heaviest IO the store sees; meter it like the rest.
     let f = open_direct(path, true)?.meter(Arc::new(Limiter::new(
         cfg.node.store_max_iops,
         cfg.node.store_max_bytes_per_sec,
     )));
     let g = Geometry::plan(cfg.node.store_bytes, cfg)?;
 
-    // One aligned staging buffer, reused. 4 MiB is both the zero-region unit and a
-    // 1024-mblock batch.
+    // One reused staging buffer. 4 MiB is the zero-region unit and a 1024-mblock batch.
     let mut buf = Aligned::new(HUGE_PAGE as usize);
 
     buf.as_mut().fill(0);
@@ -1000,8 +926,7 @@ pub fn format(path: &Path, cfg: &crate::config::Config) -> io::Result<Geometry> 
         write_empty(&f, &g, class, 0, g.mblocks(class), &mut buf)?;
     }
 
-    // Superblocks last, and only once every block they name is on the store: until
-    // they land the store is not formatted.
+    // Superblocks last: until they land, the store is not formatted.
     sync(&f)?;
     g.encode(&mut buf.as_mut()[..MBLOCK]);
     for i in 0..SB_COPIES {
@@ -1011,8 +936,7 @@ pub fn format(path: &Path, cfg: &crate::config::Config) -> io::Result<Geometry> 
     Ok(g)
 }
 
-/// Write empty mblocks for `n` blocks of `class` from `first`, both copies, batching a
-/// whole huge page at a time through the caller's staging buffer.
+/// Write empty mblocks for `n` blocks of `class` from `first`, both copies, batched.
 fn write_empty(
     f: &Dev,
     g: &Geometry,
@@ -1030,8 +954,8 @@ fn write_empty(
         for i in 0..batch {
             let h = Header {
                 mblock_id: (id + i) as u32,
-                // Both copies start equal; the A/B resolver breaks the tie toward A,
-                // and the first real write lands on B at generation 1.
+                // Both copies start equal; the resolver breaks ties toward A, so the first
+                // real write lands on B at generation 1.
                 generation: 0,
                 class,
                 live: 0,
@@ -1071,14 +995,9 @@ pub fn format_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<
     }
 }
 
-/// Give `cfg` the slots the store was not formatted for, without disturbing what is
-/// already on it. Everything new goes past the end of the layout, so no existing offset
-/// moves and no existing byte is read or rewritten; the pages already stored survive
-/// untouched, which is the whole point.
-///
-/// Called at startup, before the allocator opens: the shards are sized from the geometry
-/// and the free lists are rebuilt from the scan, so appending blocks is only free
-/// between one boot and the next.
+/// Give `cfg` the slots the store was not formatted for. Everything new goes past the end
+/// of the layout, so no existing offset moves and no existing byte is read or rewritten.
+/// Called at startup before the allocator opens, which sizes shards from the geometry.
 pub fn grow_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()> {
     size_if_needed(path, cfg)?;
     let mut g = read_geometry(path)?;
@@ -1091,36 +1010,30 @@ pub fn grow_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()
         cfg.node.store_max_bytes_per_sec,
     )));
     if add != [0, 0] {
-        // Place both runs before writing anything, so the size the store has to reach
-        // is known up front and a store too small for it costs no IO.
+        // Place both runs before writing, so a store too small for the result costs no IO.
         for (i, class) in CLASSES.into_iter().enumerate() {
             if add[i] > 0 {
                 g.append(class, add[i])?;
             }
         }
 
-        // The file is already at `size_bytes`, so this is the config's own bound: raise
-        // `node.store.size_bytes` and restart to make room.
+        // The file is already at `size_bytes`, so this is the config's own bound.
         g.check(cfg.node.store_bytes)?;
 
         let mut buf = Aligned::new(HUGE_PAGE as usize);
         for (i, class) in CLASSES.into_iter().enumerate() {
             write_empty(&f, &g, class, have[i], add[i], &mut buf)?;
         }
-        // The blocks are on the store before a superblock names them; a run that got
-        // this far and then lost power is simply not part of the store, and the next
-        // boot places the same extent at the same offsets and writes it again.
+        // Blocks land before a superblock names them, so an interrupted run is no part of
+        // the store and is rewritten at the same offsets next boot.
         sync(&f)?;
     }
     save_geometry(&f, &g)
 }
 
-/// Write `g` through every superblock copy that does not already carry it, preserving
-/// each copy's consensus record.
-///
-/// Copy 0 first, because a reader takes the first copy that decodes: a run cut short
-/// leaves the newer geometry in front of the older ones, and calling this on every boot
-/// is what finishes the job.
+/// Write `g` through every superblock copy that does not already carry it, preserving each
+/// copy's consensus record. Copy 0 first, because a reader takes the first copy that
+/// decodes, so a run cut short leaves the newer geometry in front.
 fn save_geometry(f: &Dev, g: &Geometry) -> io::Result<()> {
     let mut sb = Aligned::new(MBLOCK);
     let mut wrote = false;
@@ -1129,8 +1042,7 @@ fn save_geometry(f: &Dev, g: &Geometry) -> io::Result<()> {
         if Geometry::decode(sb.as_ref()).as_ref() == Some(g) {
             continue;
         }
-        // A copy too damaged to patch is rebuilt whole. It loses that copy's consensus
-        // record, which was unreadable anyway and which the next save restores.
+        // A copy too damaged to patch is rebuilt whole; the next save restores its record.
         if !sb_valid(sb.as_ref()) {
             sb.as_mut().fill(0);
         }
@@ -1141,8 +1053,7 @@ fn save_geometry(f: &Dev, g: &Geometry) -> io::Result<()> {
     if wrote { sync(f) } else { Ok(()) }
 }
 
-/// How far short of `cfg` this geometry is, in pages, for the metric that says a restart
-/// would grow the store. Zero when the config fits.
+/// Pages this geometry falls short of `cfg`, for the restart-grows metric; 0 if it fits.
 pub fn shortfall(g: &Geometry, cfg: &crate::config::Config) -> u64 {
     let want = wanted(cfg);
     CLASSES
@@ -1202,11 +1113,9 @@ impl Drop for Aligned {
     }
 }
 
-/// An open store, used only by control-plane paths: format, the superblock reads, and
-/// the startup scan. The hot path goes through the runtime's `Disk` instead. Under
-/// simulation this names an entry in the simulator's device table, so those paths run
-/// unchanged against an in-memory image. The limiter, when present, is shared: the scan
-/// drives one store from several threads and they meter against one budget between them.
+/// An open store, for control-plane paths only: format, superblock reads, the startup
+/// scan. The hot path uses the runtime's `Disk`. Under simulation this names an entry in
+/// the device table. A limiter, when present, is shared across the scan's threads.
 #[cfg(not(feature = "sim"))]
 pub(crate) struct Dev(std::fs::File, Option<Arc<Limiter>>);
 
@@ -1219,10 +1128,8 @@ impl Dev {
         Dev(self.0, Some(limit))
     }
 
-    /// Wait out whatever the budget owes before a transfer of `len` bytes. Blocking,
-    /// which is what these callers want: they have a whole thread to themselves. Under
-    /// simulation it is a no-op: the clock there only moves when the event loop runs,
-    /// and these paths run before it does.
+    /// Wait out what the budget owes before a transfer of `len` bytes. Blocking; each
+    /// caller has a thread. No-op under simulation, which runs these before the clock.
     fn pace(&self, len: usize) {
         #[cfg(feature = "sim")]
         let _ = (&self.1, len);
@@ -1252,17 +1159,13 @@ pub(crate) fn open_direct(path: &Path, _write: bool) -> io::Result<Dev> {
 }
 
 /// Hold the backing store at `node.store.size_bytes`, creating the file and its parent
-/// directory the first time. Called before every `format` and every `grow`, so a node
-/// whose config was raised picks the new size up on its next start.
+/// directory the first time. Called before every `format` and every `grow`.
 ///
-/// Grow only, and deliberately: every offset in the layout is absolute, so a page that
-/// lives past a smaller end would not move, it would vanish. A file already longer than
-/// the config asks for is a config that went backwards, and both sizes are named.
-///
-/// The space is reserved with `fallocate`, not just declared with `ftruncate`: a store
-/// that discovers halfway through a write that its filesystem is full has no way to
-/// report that to the guest which already had the write acknowledged. Filesystems
-/// without it fall back to a plain length change.
+/// Grow only: every layout offset is absolute, so a page past a smaller end would vanish
+/// rather than move; a longer file is refused, naming both sizes. Space is reserved with
+/// `fallocate`, not just declared with `ftruncate`, because a store that finds the
+/// filesystem full mid-write cannot report it to a guest whose write was acknowledged.
+/// Filesystems without it fall back to a plain length change.
 #[cfg(not(feature = "sim"))]
 pub fn size_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1275,8 +1178,7 @@ pub fn size_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()
         .read(true)
         .write(true)
         .create(true)
-        // Never: an existing store is the thing being measured, not something to
-        // replace.
+        // Never truncate: an existing store is being measured, not replaced.
         .truncate(false)
         .mode(0o600)
         .open(path)?;
@@ -1302,8 +1204,7 @@ pub fn size_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()
             _ => return Err(e),
         }
     }
-    // The length is metadata, and the superblock about to be written is addressed
-    // relative to it. Land it first.
+    // The length is metadata the superblock is addressed relative to, so land it first.
     if unsafe { libc::fdatasync(f.as_raw_fd()) } < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1315,9 +1216,8 @@ pub fn size_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()
     crate::sim::resize(crate::sim::device(path)?, cfg.node.store_bytes)
 }
 
-/// Put everything written so far on stable storage. Both `format` and `grow` depend on
-/// the order: a superblock naming blocks the store has not got yet is a store that
-/// cannot be opened.
+/// Put everything written so far on stable storage; `format` and `grow` need this order,
+/// since a superblock naming blocks the store lacks cannot be opened.
 #[cfg(not(feature = "sim"))]
 fn sync(d: &Dev) -> io::Result<()> {
     if unsafe { libc::fdatasync(d.0.as_raw_fd()) } < 0 {
@@ -1326,8 +1226,7 @@ fn sync(d: &Dev) -> io::Result<()> {
     Ok(())
 }
 
-/// The simulator's device table is itself the stable copy; a crash there drops nothing
-/// that a real `fdatasync` would have saved.
+/// The simulator's device table is itself the stable copy.
 #[cfg(feature = "sim")]
 fn sync(_d: &Dev) -> io::Result<()> {
     Ok(())
@@ -1405,14 +1304,12 @@ mod tests {
             crc32c(b"The quick brown fox jumps over the lazy dog"),
             0x22620404
         );
-        // The software and hardware paths must agree. The hardware path has two
-        // interleaved block sizes, a u64 loop and a byte tail, so sweep lengths across
-        // all of them.
+        // Software and hardware paths must agree at every length: both interleaved sizes,
+        // the u64 loop, and the byte tail.
         let data: Vec<u8> = (0..9000u32).map(|i| (i * 7) as u8).collect();
         for n in (0..data.len()).step_by(7) {
             assert_eq!(crc32c_sw(0, &data[..n]), crc32c(&data[..n]), "len {n}");
         }
-        // Seeding composes.
         assert_eq!(crc32c_with(crc32c(&data[..37]), &data[37..]), crc32c(&data));
     }
 
@@ -1450,7 +1347,7 @@ mod tests {
             assert_eq!(get_entry(&b, class, 3), want);
             assert_eq!(get_entry(&b, class, 4), Entry::default());
 
-            // A single flipped bit anywhere in the block is caught.
+            // Any single flipped bit is caught.
             b[MBLOCK - 1] ^= 1;
             assert!(get_header(&b).is_none());
             b[MBLOCK - 1] ^= 1;
@@ -1490,22 +1387,18 @@ mod tests {
         b[100] ^= 1;
         assert!(Geometry::decode(&b).is_none());
 
-        // Too small a store is refused rather than laid out short.
         assert!(Geometry::plan(1 << 20, &cfg).is_err());
     }
 
-    /// Every byte range a layout hands out, so growth can be checked for overlap without
-    /// enumerating millions of slots.
+    /// Every byte range a layout hands out, for overlap checks without enumerating slots.
     fn ranges(g: &Geometry) -> Vec<(u64, u64)> {
         let mut v = vec![(0, SB_REGION), (g.zero_base, g.zero_base + ZERO_BYTES)];
         for class in CLASSES {
             let mut first = 0;
             for e in g.extents(class) {
-                // Both copies, and the slots those blocks name.
                 v.push((e.meta, e.meta + 2 * e.mblocks * MBLOCK as u64));
                 let slots = e.mblocks * class.k() as u64;
                 v.push((e.data, e.data + slots * class.bytes()));
-                // The accessors agree with the extent's own bounds.
                 if e.mblocks > 0 {
                     let last = (first + e.mblocks - 1) as u32;
                     assert_eq!(g.mblock_off(class, first as u32, 0), e.meta);
@@ -1533,12 +1426,10 @@ mod tests {
         g.append(Class::Huge, 2).unwrap();
         g.append(Class::Small, 7).unwrap();
 
-        // Nothing that was already placed moved, so the pages on the device are still
-        // where their entries say they are.
+        // Nothing already placed moved.
         assert_eq!(g.extents(Class::Small)[0], g0.extents(Class::Small)[0]);
         assert_eq!(g.extents(Class::Huge)[0], g0.extents(Class::Huge)[0]);
         assert_eq!(g.zero_base, g0.zero_base);
-        // Growth only ever eats into the tail, from the front.
         assert!(g.alloc_end() > g0.alloc_end());
 
         // Ids simply continue, and every range is disjoint and on the device.
@@ -1569,9 +1460,7 @@ mod tests {
         assert_eq!(Consensus::decode(&b).terms, vec![(GroupId::new(4, 7), 9)]);
     }
 
-    /// The tail is whatever the layout did not claim, in whole chunks, and growth takes
-    /// it back from the front. Nothing durable moves when it shrinks, which is the whole
-    /// reason it can be derived instead of written down.
+    /// The tail is whatever the layout did not claim; growth takes it back from the front.
     #[test]
     fn the_tail_is_what_the_layout_did_not_claim() {
         let cfg = test_config();
@@ -1594,15 +1483,13 @@ mod tests {
         assert!(grown_len < len);
         assert_eq!(grown_base + grown_len, base + len);
 
-        // A store with no room past its slabs has no tail, and says so rather than
-        // wrapping.
+        // No room past the slabs means no tail, reported rather than wrapped.
         let tight = Geometry::plan(SIZE, &cfg).unwrap();
         assert_eq!(tight.tail(tight.alloc_end()).1, 0);
         assert_eq!(tight.tail_chunks(0), 0);
     }
 
-    /// `slot_at` is `slot_off` backwards, which is how the allocator checks that a chunk
-    /// the cache hands back is one it lent out.
+    /// `slot_at` is `slot_off` backwards, which the allocator relies on for cache loans.
     #[test]
     fn a_data_offset_names_the_slot_it_starts() {
         let g = Geometry::plan(64 << 30, &test_config()).unwrap();
@@ -1610,13 +1497,11 @@ mod tests {
             for slot in [0u32, 1, 7, (g.slots(class) - 1) as u32] {
                 assert_eq!(g.slot_at(class, g.slot_off(class, slot)), Some(slot));
             }
-            // Not the start of a slot, and past the last one.
             assert_eq!(g.slot_at(class, g.slot_off(class, 3) + 1), None);
             assert_eq!(g.slot_at(class, g.extents(class)[0].data - 1), None);
             assert_eq!(g.slot_at(class, g.slot_off(class, 0) - class.bytes()), None);
         }
-        // A tail offset belongs to no slot: a cache chunk carved out of the tail can
-        // never be mistaken for a loan.
+        // A tail offset belongs to no slot, so a cache chunk cannot be mistaken for a loan.
         let (base, _) = g.tail(64 << 30);
         assert_eq!(g.slot_at(Class::Huge, base), None);
     }
@@ -1636,8 +1521,7 @@ mod tests {
         assert!(g.check(u64::MAX).is_err());
     }
 
-    /// The store is a file this process owns end to end: it makes it, it holds it at the
-    /// size the config names, and it never gives length back.
+    /// The store file is created, held at the configured size, and never shrunk.
     #[cfg(not(feature = "sim"))]
     #[test]
     fn the_store_is_created_and_only_ever_grows() {
@@ -1653,18 +1537,18 @@ mod tests {
             c
         };
 
-        // Nothing there: the directory and the file are both created, at the full size.
+        // Nothing there: directory and file are both created, at the full size.
         size_if_needed(&path, &sized(8 << 20)).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 << 20);
-        // And with nothing readable by anyone else, since it holds guest data.
+        // Mode 0600, since it holds guest data.
         let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&path).unwrap());
         assert_eq!(mode & 0o777, 0o600);
 
-        // Asking for what it already is touches nothing.
+        // Asking for the size it already is touches nothing.
         size_if_needed(&path, &sized(8 << 20)).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 << 20);
 
-        // A raised size is taken, and what was already written stays where it was.
+        // A raised size is taken, and what was already written stays put.
         let f = open_direct(&path, true).unwrap();
         let mut buf = Aligned::new(MBLOCK);
         buf.as_mut().fill(0xa5);

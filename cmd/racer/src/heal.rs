@@ -1,17 +1,12 @@
-//! Anti-entropy: per-group digests over this node's registers, the wire encoding of the
-//! three group-addressed control ops, and the sweep that drives them.
+//! Anti-entropy: per-group digests, the wire encoding of the three group-addressed
+//! control ops, and the sweep that drives them. Join replay and periodic digest
+//! exchange are one mechanism: enumerate a group's registers and hand the differences
+//! to `paxos::repair`.
 //!
-//! Join replay and periodic digest exchange are one mechanism: enumerate a group's
-//! registers and hand the differences to `paxos::repair`.
-//!
-//! The stream carries no page bytes. A cursor emits `(addr, version, ballot)` and the
-//! receiver pulls the page with an ordinary `GET`, as `LEARN` already does. So there is
-//! no second data path, no CRC to re-verify in transit (the `GET` verifies at the
-//! source), and a page that changes mid-stream arrives as a newer value rather than a
-//! torn one.
-//!
-//! The "tree" is one flat level of 512 buckets: 512 digests are exactly one 4 KiB
-//! trailer, and a root would only add a round trip.
+//! The stream carries no page bytes: a cursor emits `(addr, version, ballot)` and the
+//! receiver pulls the page with a `GET`, which verifies its CRC at the source, so a page
+//! changing mid-stream arrives newer, not torn. The tree is one flat level of 512
+//! buckets, one 4 KiB trailer, so a root would only add a round trip.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -24,51 +19,43 @@ use crate::layout::{Class, Entry};
 use crate::paxos::{Ballot, Paxos, Register};
 use crate::runtime::{self, PoolBuf};
 
-/// Maps a page address to its consensus group. The allocator's slab holds no config, so
-/// every call that disturbs a register passes the mapping in.
+/// Maps a page address to its consensus group; the slab holds no config to do it with.
 pub(crate) type Groups<'a> = dyn Fn(u64) -> GroupId + 'a;
 
-// -------------------------------------------------------------------------- shape
+// --- shape ---
 
-/// Buckets per group. 512 u64 is exactly one 4 KiB trailer, so a comparison is one
-/// round trip and there is no reason for a second tree level.
+/// Buckets per group. 512 u64 fills one 4 KiB trailer, so a comparison is one round trip.
 pub(crate) const BUCKETS: usize = 512;
 
 /// `(addr, version, ballot)` triples in one chunk. Two header slots, three per tuple.
 const TUPLES: usize = (fabric::BLOCK / 8 - 2) / 3;
 
-/// Concurrent cursors one slab will hold open. A cursor pins freed slots, so this also
-/// bounds how much reclamation anti-entropy can defer.
+/// Concurrent cursors one slab holds open; also bounds deferred reclamation.
 const MAX_SNAPS: usize = 8;
 
-/// Entries one `snap_next` may scan before answering with what it has, so a sparse
-/// filter cannot walk the whole shard in one frame.
+/// Entries one `snap_next` may scan per frame, so a sparse filter cannot walk a shard.
 const SNAP_SCAN: u32 = 1 << 20;
 
-/// Registers one slab holds against reclamation before failing its cursors. Retention
-/// grows as `write_rate × cursor_lifetime`; past this, failing beats pinning the device.
+/// Registers one slab retains before failing its cursors; past this, failing beats
+/// pinning the device. Retention grows as `write_rate x cursor_lifetime`.
 const MAX_RETAINED: usize = 1 << 16;
 
 /// A cursor nobody has advanced for this long is abandoned and its slots released.
 const SNAP_TTL: Duration = Duration::from_secs(30);
 
-/// The bucket a page's digest lands in. `config::slot_of` takes bits 0..14 of the same
-/// hash and this takes 14..23, so a group's pages spread over all buckets instead of
-/// piling into the few its slots select.
+/// The bucket a page's digest lands in: hash bits 14..23, vs 0..14 for `config::slot_of`,
+/// so a group's pages spread over all buckets.
 pub(crate) fn bucket_of(addr: u64) -> u16 {
     ((config::mix(addr) >> 14) & (BUCKETS as u64 - 1)) as u16
 }
 
-/// What a cursor emits, within the group it opened on. Applied as a predicate during
-/// the walk, not an index, so a narrow filter still costs a full slab pass.
+/// What a cursor emits. A predicate during the walk, not an index, so it costs a full pass.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Filter {
     All,
     /// One digest bucket: the anti-entropy comparison.
     Bucket(u16),
-    /// A half-open span of the flat address space, `lo..hi`. One extent is one such
-    /// span - universe and base concatenate into the address - so the unit a migration
-    /// hands between zones needs no field of its own here.
+    /// A half-open span `lo..hi`; universe and base concatenate, so one extent is one span.
     Range {
         lo: u64,
         hi: u64,
@@ -90,11 +77,8 @@ fn total_groups(cfg: &Config) -> u32 {
     cfg.universes().iter().map(|u| u.catalog.len() as u32).sum()
 }
 
-/// The `n`th group in that flat sequence, universes in id order.
-///
-/// One cursor over one sequence rather than a cursor per universe: a node in two
-/// universes then splits the same sweep budget between them in proportion to how many
-/// groups each gave it, which is the share of the data it holds for each.
+/// The `n`th group in that flat sequence, universes in id order. One sequence, not one
+/// per universe, so a node in two universes splits the budget by groups held.
 fn group_at(cfg: &Config, mut n: u32) -> Option<GroupId> {
     for u in cfg.universes() {
         let len = u.catalog.len() as u32;
@@ -106,20 +90,16 @@ fn group_at(cfg: &Config, mut n: u32) -> Option<GroupId> {
     None
 }
 
-/// The leaf tuple. Not cryptographic: a digest match is a hint that the backlog is
-/// small, never proof of equality.
+/// The leaf tuple. Not cryptographic: a digest match is a hint, never proof of equality.
 fn leaf(addr: u64, version: u64, ballot: u64, crc: u32) -> u64 {
     config::mix(addr ^ config::mix(version ^ config::mix(ballot ^ crc as u64)))
 }
 
-// -------------------------------------------------------------------------- digests
+// --- digests ---
 
-/// Per-group XOR accumulators over the registers this node owns.
-///
-/// XOR makes an update two calls with nothing to recompute and no ordering to preserve.
-/// Keyed by `(group, class)` — one `Digests` per slab — rather than by shard: the shard
-/// a page lands on depends on the local core count, so two nodes would not agree on
-/// which tree they were comparing, whereas the class is in the frame.
+/// Per-group XOR accumulators over the registers this node owns. XOR updates in two
+/// calls with no ordering to preserve. Keyed by `(group, class)`, one per slab, not by
+/// shard: the shard depends on the local core count, so two nodes would disagree on it.
 #[derive(Default)]
 pub(crate) struct Digests {
     groups: BTreeMap<GroupId, Box<[u64; BUCKETS]>>,
@@ -136,8 +116,7 @@ impl Digests {
         v[bucket_of(e.addr) as usize] ^= leaf(e.addr, e.version, e.ballot, e.data_crc);
     }
 
-    /// A group we hold nothing for reads as all zeroes — the digest of the empty set —
-    /// so it compares equal to a peer that also holds nothing.
+    /// Digest vector for a group; all zeroes if we hold nothing for it.
     pub(crate) fn vector(&self, group: GroupId) -> Box<[u64; BUCKETS]> {
         self.groups
             .get(&group)
@@ -145,16 +124,13 @@ impl Digests {
             .unwrap_or_else(|| Box::new([0; BUCKETS]))
     }
 
-    /// Groups this node holds registers for. A group it never held one for was never
-    /// inserted, so the set of groups it has been moved out of but is still carrying is
-    /// exactly this list minus the catalog's — a map walk rather than a slab scan.
+    /// Groups this node holds registers for; minus the catalog's, exactly what to shed.
     pub(crate) fn held(&self) -> Vec<GroupId> {
         self.groups.keys().copied().collect()
     }
 
-    /// Drop a group whose accumulator has gone back to zero. `toggle` never prunes —
-    /// noticing on the hot path would cost a scan of the vector — so the shed that
-    /// emptied the group says so here, and `held` stops offering it.
+    /// Drop a group whose accumulator is back to zero; `toggle` never prunes, since that
+    /// would cost a scan of the vector on the hot path.
     pub(crate) fn forget(&mut self, group: GroupId) {
         if self
             .groups
@@ -166,11 +142,9 @@ impl Digests {
     }
 }
 
-// -------------------------------------------------------------------------- cursors
+// --- cursors ---
 
-/// A register as the cursor emits it. No page bytes: the receiver pulls those with an
-/// ordinary `GET`, so a page that changed since the cursor opened arrives newer rather
-/// than torn.
+/// A register as the cursor emits it; no page bytes, the receiver pulls those with `GET`.
 pub(crate) type Tuple = (u64, Register);
 
 fn tuple(e: &Entry) -> Tuple {
@@ -183,8 +157,7 @@ fn tuple(e: &Entry) -> Tuple {
     )
 }
 
-/// A cursor id, self-describing so `SNAPNEXT` needs nothing but the id to find the slab
-/// that owns it: `generation | core | class | slot`.
+/// A cursor id: `generation | core | class | slot`, so `SNAPNEXT` needs only the id.
 fn snap_id(core: usize, huge: bool, slot: usize, era: u32) -> u32 {
     era << 14 | (core as u32 & 0x3ff) << 4 | (huge as u32) << 3 | slot as u32 & 7
 }
@@ -203,8 +176,7 @@ struct Snap {
     group: GroupId,
     filter: Filter,
     era: u32,
-    /// Next local entry index. Monotone, so the walk is one slab pass however many
-    /// chunks it takes.
+    /// Next local entry index. Monotone, so the walk is one slab pass.
     cursor: u32,
     /// Where this cursor's view of `retained` begins: everything freed after it opened.
     drained: usize,
@@ -215,22 +187,17 @@ struct Snap {
     touched: Instant,
 }
 
-/// The open cursors on one slab, plus the reclamation they hold back.
-///
-/// Deferral is a cursor's atomicity: a slot freed under an open cursor is neither
-/// reused nor forgotten, so a page overwritten mid-walk is still emitted with the value
-/// it had when the cursor opened. Without it, a page whose slot got recycled ahead of
-/// the cursor would vanish from the stream entirely.
+/// The open cursors on one slab, plus the reclamation they hold back. Deferral is a
+/// cursor's atomicity: a slot freed under an open cursor is neither reused nor
+/// forgotten, so a page overwritten mid-walk still reports its value at open.
 #[derive(Default)]
 pub(crate) struct Snaps {
     open: [Option<Snap>; MAX_SNAPS],
     live: usize,
     era: u32,
-    /// Local slot ids freed while a cursor was open; returned to the free list when the
-    /// last one closes.
+    /// Local slot ids freed while a cursor was open; freed for real when the last closes.
     deferred: Vec<u32>,
-    /// Registers of those freed entries, in release order. A cursor emits the tail of
-    /// this list that appeared after it opened.
+    /// Registers of freed entries in release order; a cursor emits the tail after open.
     retained: Vec<Tuple>,
     /// Retention blew past `MAX_RETAINED`; every open cursor is void and says so.
     void: bool,
@@ -253,8 +220,8 @@ impl Snaps {
         self.retained.push(tuple(e));
     }
 
-    /// A freed slot is parked while a cursor is open, freed otherwise. Void cursors hold
-    /// nothing back.
+    /// A freed slot is parked while a cursor is open, freed otherwise; void cursors park
+    /// none.
     pub(crate) fn park(&mut self, free: &mut Vec<u32>, local: u32) {
         if self.busy() && !self.void {
             self.deferred.push(local);
@@ -289,13 +256,9 @@ impl Snaps {
         Some(snap_id(core, huge, slot, self.era))
     }
 
-    /// Next chunk. A repeated `seq` re-answers the previous chunk, anything else
-    /// advances; `None` is the local caller, which has no wire to lose a reply on.
-    ///
-    /// `universe` is the namespace the request arrived on, `None` for a local caller. A
-    /// cursor id is a small integer a peer could guess, so the universe it was opened in
-    /// is checked against the one asking: partitioning has to hold for a cursor exactly
-    /// as it holds for a page.
+    /// Next chunk; a repeated `seq` re-answers the previous one. `universe` is the
+    /// namespace the request arrived on, `None` locally: ids are guessable, so a cursor
+    /// answers only its own universe.
     pub(crate) fn next(
         &mut self,
         id: u32,
@@ -334,8 +297,7 @@ impl Snaps {
                 out.push(tuple(e));
             }
         }
-        // Retained values drain last: they are older than whatever the live table now
-        // holds at the same address, and the receiver merges apply-if-newer.
+        // Retained values drain last; they are older and the receiver applies if newer.
         let walked = s.cursor as usize >= entries.len();
         if walked {
             while s.drained < retained.len() && out.len() < TUPLES {
@@ -364,9 +326,7 @@ impl Snaps {
         }
     }
 
-    /// Abandon cursors nobody has advanced. A peer that died mid-stream must not hold
-    /// reclamation forever; the TTL is all that stands between a lost reply and a
-    /// pinned device.
+    /// Abandon cursors nobody has advanced, so a dead peer cannot pin reclamation.
     pub(crate) fn expire(&mut self, now: Instant, free: &mut Vec<u32>) {
         for s in self.open.iter_mut() {
             if s.as_ref()
@@ -390,19 +350,16 @@ impl Snaps {
     }
 }
 
-// -------------------------------------------------------------------------- the wire
+// --- the wire ---
 
 /// Frame conventions for the three ops below. They name a *group*, not a page, so
-/// `offset` means something different here than in every other op and `server::addr_of`
-/// is deliberately not on their path.
+/// `offset` differs from every other op and `server::addr_of` is not on their path. The
+/// universe is the namespace the frame arrived on, so the target rebuilds the
+/// [`GroupId`] locally.
 ///
-/// A group index alone is not a group: the universe is the namespace the frame arrived
-/// on, so the target rebuilds the [`GroupId`] from its own side of the link and a peer
-/// cannot name a group in a universe it was never given a namespace for.
-///
-/// All three encode with `Frame::huge = false` whatever class they ask about: the huge
-/// frame shape has ten fewer offset bits and these need the room. MERKLE and SNAPOPEN
-/// carry the class in `imm` bit 0; SNAPNEXT carries it inside the cursor id.
+/// All three encode with `Frame::huge = false` whatever class they ask about; the huge
+/// frame has ten fewer offset bits. MERKLE and SNAPOPEN carry the class in `imm` bit 0,
+/// SNAPNEXT inside the cursor id.
 ///
 ///   MERKLE    offset = group                       -> 512 digests, the whole trailer
 ///   SNAPOPEN  offset = group << 10 | one << 9 | b  -> slot 0: cursor id
@@ -473,40 +430,32 @@ pub(crate) fn get_tuples(t: &[u8], out: &mut BTreeMap<u64, Register>) -> bool {
     fabric::get(t, 1) != 0
 }
 
-// -------------------------------------------------------------------------- the sweep
+// --- the sweep ---
 
-/// Differing buckets one sweep reconciles before moving on. What it skips is left for
-/// the next pass; convergence does not depend on any single sweep finishing.
+/// Differing buckets one sweep reconciles; the rest waits for the next pass.
 const BUCKETS_PER_JOB: usize = 8;
 
-/// Repairs one sweep will issue. A repair is a full prepare round against the whole
-/// group, so this keeps a large divergence from starving the write path.
+/// Repairs one sweep will issue; each is a full prepare round against the whole group.
 const REPAIRS_PER_JOB: usize = 64;
 
 /// Repair budget while replaying, and the per-call push budget in `push_extent`. A
 /// joining node has the whole group to fetch and, since it neither proposes nor accepts
-/// until it is caught up, no client write path of its own to protect. The prepare round
-/// per address is not avoidable: a register held by one member alone was not
-/// necessarily chosen, and copying it here would give it a second acceptor.
-///
-/// The one budget here the operator sets, because it is the rate a member replacement
-/// runs at and the length of the window a group spends two of three, and the rate an
-/// extent is handed to another zone at: `Policy::repairs_per_replay`.
+/// until caught up, no write path to protect. The prepare round per address is not
+/// avoidable: a register held by one member alone was not necessarily chosen. This is
+/// the one budget the operator sets (`Policy::repairs_per_replay`): the rate a member
+/// replacement runs at, the window a group spends at two of three, and the rate an
+/// extent moves zones.
 fn repairs_per_replay(cfg: &Config) -> usize {
     cfg.policy.repairs_per_replay as usize
 }
 
-/// Tuples one side of a bucket comparison will buffer. A bucket past this is a group
-/// too large for the fanout; it is skipped and counted rather than allowed to grow a
-/// map without limit.
+/// Tuples one side of a bucket comparison will buffer; a larger bucket is skipped.
 const MAX_BUCKET: usize = 1 << 16;
 
 /// Shortest gap between sweeps on one core.
 const INTERVAL: Duration = Duration::from_secs(1);
 
-/// Registers one sweep will offer back before moving on. Each costs a `GETMETA` at all
-/// three of the group's new members, so this is the same kind of budget as
-/// `REPAIRS_PER_JOB` and is set the same way.
+/// Registers one sweep offers back; each costs a `GETMETA` at all three new members.
 const DROPS_PER_JOB: usize = 64;
 
 #[derive(Clone, Copy, Default)]
@@ -521,12 +470,10 @@ pub struct Stats {
 
 #[derive(Default)]
 struct Core {
-    /// One sweep at a time per core: a job still running declines the next tick, which
-    /// paces `tick` without a queue.
+    /// One sweep at a time per core: a job still running declines the next tick.
     busy: Cell<bool>,
     last: Cell<Option<Instant>>,
-    /// Round-robin over the groups this core owns, so no group is starved by a noisy
-    /// neighbour and a long divergence is amortised over many passes.
+    /// Round-robin over the groups this core owns, so no group is starved.
     next: Cell<u32>,
     stats: RefCell<Stats>,
 }
@@ -536,8 +483,8 @@ pub struct Heal {
     cores: Box<[Core]>,
 }
 
-// SAFETY: as `Paxos`. Every cell is touched only by the core that owns it, which is
-// the core `tick` ran on and the core the spawned job stays on.
+// SAFETY: as `Paxos`. Every cell is touched only by the core that owns it: the core
+// `tick` ran on, which is the core the spawned job stays on.
 unsafe impl Sync for Heal {}
 
 pub fn open(paxos: &'static Paxos, cores: usize) -> &'static Heal {
@@ -555,13 +502,10 @@ impl Heal {
         *self.cores[runtime::core()].stats.borrow()
     }
 
-    /// The two halves of a member replacement still in flight on this core: groups being
-    /// replayed into, and groups still holding registers they have been moved out of.
-    ///
-    /// The control plane's only completion signal. It replaces one node at a time and
-    /// must not replace the next until this reads zero across the zone: a second node in
-    /// flight puts more groups at two of three at once, and a node that has not finished
-    /// shedding has not returned the space the next replacement needs.
+    /// Groups being replayed into, and groups still holding registers they were moved out
+    /// of, on this core. The control plane's only completion signal: it replaces one node
+    /// at a time and must not start the next until this reads zero across the zone, or
+    /// more groups sit at two of three and the space the next replacement needs is held.
     pub fn outstanding(&'static self) -> (u64, u64) {
         let replaying = self.paxos.replaying_here().len() as u64;
         let shedding = [false, true]
@@ -581,12 +525,9 @@ impl Heal {
         f(&mut self.cores[runtime::core()].stats.borrow_mut());
     }
 
-    /// Called from `Handler::tick`, which is synchronous, so the sweep is spawned.
-    /// Declines under rate pressure: the device's budget is the write path's budget too.
-    ///
-    /// Free-space pressure does not decline here, though it once did. Shedding is where
-    /// space comes back from, and the node that is full is the node that needs it most,
-    /// so the sweep runs and skips its anti-entropy half instead.
+    /// Spawns a sweep; `Handler::tick` is synchronous. Declines under rate pressure, since
+    /// the device budget is the write path's too. Free-space pressure does not decline:
+    /// shedding is where space comes back from, so the sweep runs and skips anti-entropy.
     pub fn tick(&'static self, now: Instant) {
         let c = &self.cores[runtime::core()];
         if c.busy.get()
@@ -609,9 +550,8 @@ impl Heal {
         }
     }
 
-    /// One group per sweep, both classes, one peer. Everything past the first frame is
-    /// conditional on a digest that did not match, so a converged cluster pays one
-    /// MERKLE per group and class per interval and nothing else.
+    /// One group per sweep, both classes, one peer. Everything past the first frame needs
+    /// a digest mismatch, so a converged cluster pays one MERKLE per group and class.
     async fn sweep(&'static self) -> Result<(), Status> {
         let core = runtime::core();
         let c = &self.cores[core];
@@ -621,9 +561,7 @@ impl Heal {
             return Ok(());
         }
 
-        // Shedding comes first and runs regardless of free space: under pressure it is
-        // the only half worth running, and everything below competes for the space it
-        // is trying to return.
+        // Shedding first, regardless of free space: everything below competes for it.
         for huge in [false, true] {
             if self.serves(huge) {
                 self.shed(huge).await;
@@ -634,12 +572,8 @@ impl Heal {
         }
 
         // Pick a group whose paxos core is this one, so `repair` and the allocator shard
-        // are both local wherever the shard count reached the core count.
-        //
-        // A group already replaying goes first. Round-robin alone gives a joining group
-        // one budget every `groups / cores` intervals, which is how long a replacement
-        // would take per group; jumping the queue for it costs the settled groups a
-        // digest exchange they would only have found equal.
+        // are local. A group already replaying goes first; round-robin alone would give
+        // it one budget every `groups / cores` intervals.
         let cores = self.cores.len();
         let g;
         match self
@@ -673,10 +607,8 @@ impl Heal {
         }
 
         self.stat(|s| s.sweeps += 1);
-        // Replay is sticky: one repaired bucket already makes our side non-empty while
-        // the rest of the group is still missing, so re-detecting it each sweep would
-        // clear the flag after one pass. Only a comparison with nothing left to repair
-        // ends it.
+        // Replay is sticky: one repaired bucket makes our side non-empty, so re-detection
+        // would clear the flag early. Only a comparison with no repairs left ends it.
         let was = self.paxos.replaying(g).await;
         let mut replaying = false;
         let mut checked = true;
@@ -698,28 +630,22 @@ impl Heal {
         if still {
             self.paxos.set_replaying(g, true).await;
         } else if was && self.paxos.rejoin(g).await.is_err() {
-            // Leaving a replay means recovering the promise that went with the registers
-            // first. Until that lands we stay out; the next sweep retries.
+            // Leaving a replay needs the promise recovered first; the next sweep retries.
             self.stat(|s| s.failed += 1);
         }
         self.hand_over(cfg, g).await;
         Ok(())
     }
 
-    /// The source side of an extent migration. The destination cannot pull: it holds
-    /// neither this zone's slot table nor its catalog, so the zone handing the extent
-    /// over is the one that pushes. Every member pushes its own copy and the stream is
-    /// apply-if-newer, so the duplicate streams need no ordering against each other.
-    ///
-    /// The seal comes first and freezes the extent here, so a page pushed after it
-    /// cannot be overtaken by a write we accept.
-    ///
-    /// Pushing repeats until the control plane flips `zone` and clears `next_zone`, the
-    /// only completion signal there is. Repetition is harmless and is what makes a
-    /// destination that was down for the first pass converge anyway.
+    /// The source side of an extent migration; the zone handing the extent over pushes,
+    /// because the destination holds neither this zone's slot table nor its catalog. Every
+    /// member pushes its own copy and the stream is apply-if-newer, so the copies need no
+    /// ordering. The seal comes first and freezes the extent here, so a page pushed after
+    /// it cannot be overtaken by a write we accept. Pushing repeats until the control
+    /// plane flips `zone` and clears `next_zone`, the only completion signal, so a
+    /// destination down for the first pass still converges.
     async fn hand_over(&'static self, cfg: &Config, group: GroupId) {
-        // Only this group's own universe: a group holds registers for nothing else, so
-        // the other universes' extents are somebody else's sweep.
+        // Only this group's own universe: a group holds registers for nothing else.
         let Some(u) = cfg.universe(group.universe()) else {
             return;
         };
@@ -730,8 +656,8 @@ impl Heal {
             let lo = GlobalAddr::new(u.id, ext.base_lba);
             let hi = GlobalAddr::new(u.id, ext.end_lba());
             if !self.paxos.sealed(ext.id).await {
-                // Push on the next tick: a seal only just chosen may not have reached
-                // the members whose copies we are about to walk.
+                // Push next tick: a seal only just chosen may not have reached the members
+                // whose copies we are about to walk.
                 let _ = self.paxos.seal_extent(lo, ext.id).await;
                 continue;
             }
@@ -743,8 +669,7 @@ impl Heal {
         }
     }
 
-    /// Push this group's registers for one extent to the zone taking it over, at most
-    /// the config's replay budget per call.
+    /// Push this group's registers for one extent to the zone taking it over.
     async fn push_extent(
         &'static self,
         group: GroupId,
@@ -768,29 +693,18 @@ impl Heal {
         Ok(())
     }
 
-    /// Whether this node has a slab of the class at all: no slots, no cursor to open.
-    ///
-    /// The device's geometry rather than the configuration's page count, because the
-    /// geometry is what was actually formatted, and a node draining after the catalog
-    /// stopped naming it still has to open a cursor over everything it holds.
+    /// Whether this node has a slab of the class, by device geometry rather than config.
     fn serves(&self, huge: bool) -> bool {
         let c = if huge { Class::Huge } else { Class::Small };
         self.alloc().geometry().slots(c) > 0
     }
 
-    // ---------------------------------------------------------------------- the shed
+    // --- the shed ---
 
-    /// Give back the registers of groups this node is no longer in the catalog for.
-    ///
-    /// Replacing a node is how a zone's membership moves: the node joining takes the
-    /// departing node's groups and replays them, and the node leaving is left holding
-    /// every register it ever accepted, because nothing on the write path revisits a
-    /// page once it is placed. Without this a node only ever grows and a decommission
-    /// frees nothing.
-    ///
-    /// The digest map names the work exactly. A group we hold no register for was never
-    /// inserted into it, so the groups it lists minus the ones the catalog still names
-    /// us in is the whole of the set, found without a slab scan.
+    /// Give back the registers of groups this node is no longer in the catalog for. The
+    /// leaving node holds every register it ever accepted, since nothing on the write path
+    /// revisits a page once placed; without this a node only ever grows. The digest map
+    /// names the work: its groups minus the ones the catalog still names us in.
     async fn shed(&'static self, huge: bool) {
         let orphans: Vec<GroupId> = self
             .alloc()
@@ -807,8 +721,7 @@ impl Heal {
             if budget == 0 {
                 return;
             }
-            // One group that will not drain must not block the others; the next sweep
-            // comes back to it.
+            // One group that will not drain must not block the others.
             if self.drain(g, huge, &mut budget).await.is_err() {
                 self.stat(|s| s.failed += 1);
             }
@@ -816,9 +729,8 @@ impl Heal {
     }
 
     /// Walk one orphaned group and forget every register its new members can be shown to
-    /// hold. A register nobody confirmed stays, so the degraded window between the
-    /// catalog naming a new member and that member catching up costs availability, never
-    /// the value.
+    /// hold. A register nobody confirmed stays, so a degraded window costs availability,
+    /// not the value.
     async fn drain(
         &'static self,
         group: GroupId,
@@ -854,8 +766,7 @@ impl Heal {
         Ok(())
     }
 
-    /// Returns whether this group is still being replayed. `was` is the flag we came in
-    /// with, which only a comparison with nothing left to repair may clear.
+    /// Whether this group is still replaying; only a clean comparison clears `was`.
     async fn compare(
         &'static self,
         cfg: &Config,
@@ -865,9 +776,7 @@ impl Heal {
     ) -> Result<bool, Status> {
         let m = self.paxos.members(group).ok_or(Status::Unmapped)?;
         let me = self.paxos.self_index(&m).ok_or(Status::Unmapped)?;
-        // The partner offset alternates with group parity, spreading a node's own
-        // comparisons over both peers; within one group the three members between them
-        // walk all three edges of the triangle.
+        // The partner alternates with group parity, so the group walks all three edges.
         let from = ((me as u32 + 1 + group.index() % 2) % 3) as u8;
         let link = self
             .paxos
@@ -881,10 +790,8 @@ impl Heal {
             .map_err(Status::from_wire)?;
         let theirs = get_digests(&t);
 
-        // Our whole side of the group empty against a peer that has data is a node
-        // joining, not a divergence. The work is the same — every bucket, repaired —
-        // but the budgets are not, and this node refuses accepts for the group until
-        // the digests agree.
+        // Our side empty against a peer with data is a node joining, not a divergence:
+        // same work, different budget, and we refuse accepts until the digests agree.
         let replay = was || (mine.iter().all(|&d| d == 0) && theirs.iter().any(|&d| d != 0));
         if replay {
             self.paxos.set_replaying(group, true).await;
@@ -896,8 +803,7 @@ impl Heal {
             .take(if replay { BUCKETS } else { BUCKETS_PER_JOB })
             .collect();
         if diff.is_empty() {
-            // Nothing either side holds that the other does not: the only thing that
-            // ends a replay.
+            // Nothing on either side the other lacks: the only thing that ends a replay.
             return Ok(false);
         }
         self.stat(|s| s.buckets_diff += diff.len() as u64);
@@ -917,10 +823,10 @@ impl Heal {
         Ok(replay)
     }
 
-    /// Enumerate one bucket on both sides and repair every address the two do not agree
-    /// on, in either direction. The registers are only a difference test — `repair`
-    /// re-derives the truth with a prepare round, so a cursor that raced a write costs
-    /// an extra repair and never a wrong one.
+    /// Enumerate one bucket on both sides and repair every address they disagree on, in
+    /// either direction. The registers are only a difference test: `repair` re-derives
+    /// the truth with a prepare round, so a cursor that raced a write costs an extra
+    /// repair, not a wrong one.
     async fn reconcile(
         &'static self,
         cfg: &Config,
@@ -952,7 +858,6 @@ impl Heal {
             if *budget == 0 {
                 return Ok(());
             }
-            // Addresses we hold and they do not; the loop above never saw these.
             if !theirs.contains_key(addr) {
                 *budget -= 1;
                 self.repair(cfg, GlobalAddr(*addr)).await;
@@ -962,8 +867,7 @@ impl Heal {
     }
 
     async fn repair(&'static self, cfg: &Config, addr: GlobalAddr) {
-        // A page whose extent left the config between the cursor and here is not a
-        // divergence, it is a page that no longer exists.
+        // A page whose extent left the config no longer exists; not a divergence.
         if cfg.extent_at(addr.0).is_none() {
             return;
         }
@@ -973,9 +877,8 @@ impl Heal {
         }
     }
 
-    /// A cursor abandoned here — the peer went away mid-walk, or the bucket turned out
-    /// larger than we will buffer — is not released; only the TTL in `Snaps::expire`
-    /// reclaims it. A finished cursor is released by the server on the last chunk.
+    /// Pull one bucket from a peer. A cursor abandoned here is left to the TTL in
+    /// `Snaps::expire`; a finished one is released by the server on the last chunk.
     async fn remote_bucket(
         &'static self,
         link: &Link,
@@ -1048,8 +951,8 @@ mod tests {
         }
     }
 
-    /// Putting a tuple in and taking it out are the same operation, so an entry that
-    /// changed and changed back leaves no trace and arrival order cannot matter.
+    /// Toggle is its own inverse, so order does not matter and a change undone leaves
+    /// nothing behind.
     #[test]
     fn digests_are_a_set_not_a_history() {
         let g = |i: u32| GroupId::new(1, i);
@@ -1073,23 +976,17 @@ mod tests {
             "toggling twice is toggling not at all"
         );
 
-        // A version change is a difference, which is the only property the sweep needs.
+        // A version change is a difference, which is all the sweep needs.
         a.toggle(g(0), &y);
         a.toggle(g(0), &entry(22, 6));
         assert_ne!(a.vector(g(0)), b.vector(g(0)));
-        // And a group nobody has touched is the digest of the empty set.
         assert_eq!(*b.vector(g(7)), [0u64; BUCKETS]);
-        // Nor has the same index in another universe: partitioning reaches the
-        // accumulators, so two universes never compare trees with each other.
+        // Partitioning reaches the accumulators: another universe is another tree.
         a.toggle(GroupId::new(2, 0), &x);
         assert_ne!(a.vector(GroupId::new(2, 0)), a.vector(g(0)));
     }
 
-    /// A migration names an extent by the address range it covers, which every node can
-    /// evaluate for itself: the filter lets one zone walk exactly the pages it is
-    /// handing over, without the destination naming a table it does not hold. Universe
-    /// and block index concatenate, so one span is one comparison and a neighbouring
-    /// universe cannot fall inside it.
+    /// A range filter selects exactly one extent's pages and excludes other universes.
     #[test]
     fn a_filter_narrows_to_exactly_its_unit() {
         let addr = |u: u32, lba: u64| config::addr_of(u, lba);
@@ -1119,8 +1016,7 @@ mod tests {
         assert!(!Filter::Bucket(b ^ 1).keeps(addr(1, 1)));
     }
 
-    /// The three group-addressed frames survive the wire, including the `offset` and
-    /// `imm` fields they borrow for meanings no other opcode gives them.
+    /// The three group-addressed frames survive the wire, `offset` and `imm` included.
     #[test]
     fn group_frames_survive_encoding() {
         let round = |f: Frame| {
@@ -1134,8 +1030,7 @@ mod tests {
             let f = round(snap_open_frame(300, false, bucket));
             assert_eq!(snap_open_parts(&f), (300, false, bucket));
         }
-        // Six bits of sequence: enough that no two consecutive chunks collide, which is
-        // all a retry needs to tell apart.
+        // Six bits of sequence: enough that no two consecutive chunks collide.
         for seq in [0u8, 1, 62, 63] {
             let f = round(snap_next_frame(0x0dedbeef, seq));
             assert_eq!(snap_next_parts(&f), (0x0dedbeef, seq));
@@ -1143,10 +1038,8 @@ mod tests {
         assert_eq!(snap_next_parts(&round(snap_next_frame(7, 64))).1, 0);
     }
 
-    /// Cursor atomicity: a page overwritten ahead of the walk is still reported with
-    /// the value it had when the cursor opened, and its slot is not handed out until
-    /// the cursor is gone. Without that, a page whose slot got recycled ahead of the
-    /// cursor would vanish from the stream and read as agreement.
+    /// Cursor atomicity: a page overwritten ahead of the walk still reports its value at
+    /// open, and its slot is not reused until the cursor is gone.
     #[test]
     fn an_open_cursor_sees_the_group_it_opened_on() {
         let n = TUPLES + 30;
@@ -1161,15 +1054,13 @@ mod tests {
             .unwrap();
         let (first, done) = s.next(id, Some(0), None, &entries, gof, now).unwrap();
         assert_eq!((first.len(), done), (TUPLES, false));
-        // A retry is the same chunk, not the next one. A cursor that skipped would
-        // under-report a difference, which is silent and so the worst failure this
-        // stream has.
+        // A retry re-answers the same chunk; skipping would silently under-report.
         assert_eq!(
             s.next(id, Some(0), None, &entries, gof, now).unwrap().0,
             first
         );
 
-        // Now free an entry the walk has not reached yet, the way `Slab::set` does.
+        // Free an entry the walk has not reached yet, the way `Slab::set` does.
         let victim = n - 1;
         s.retain(&entries[victim]);
         entries[victim] = Entry::default();
@@ -1205,9 +1096,7 @@ mod tests {
         );
     }
 
-    /// A cursor id is a small integer, so guessing one is trivial. What stops a peer in
-    /// one universe reading another's pages through a guessed id is that the cursor
-    /// remembers the universe it was opened for and refuses every other.
+    /// A cursor answers only the universe it was opened for; ids are guessable.
     #[test]
     fn a_cursor_answers_only_its_own_universe() {
         let entries = [entry(1, 1)];
@@ -1224,8 +1113,7 @@ mod tests {
         assert!(s.next(id, Some(0), None, &entries, gof, now).is_ok());
     }
 
-    /// A cursor whose peer stopped asking must not pin the device forever, and the id
-    /// it held is not answerable afterwards.
+    /// A cursor whose peer stopped asking expires, and its id is not answerable after.
     #[test]
     fn a_cursor_nobody_advances_expires() {
         let entries = [entry(1, 1)];
@@ -1243,7 +1131,7 @@ mod tests {
         assert_eq!(free, vec![0]);
         assert!(s.next(id, Some(0), None, &entries, gof, now).is_err());
 
-        // And the slab refuses more cursors than it will hold rather than growing.
+        // The slab refuses more cursors than it will hold rather than growing.
         let ids: Vec<u32> = (0..MAX_SNAPS)
             .filter_map(|_| s.start(0, false, GroupId::default(), Filter::All, now))
             .collect();

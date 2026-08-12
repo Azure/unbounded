@@ -1,38 +1,25 @@
 //! Node-to-node transport: a stateless codec and nothing else.
 //!
-//! A logical operation becomes a plain NVMe read or write against a peer's namespace,
-//! because read and write are the only verbs nvme-of gives us. No session, no sequence
-//! number, no per-operation memory beyond the in-flight SQE: everything an operation
-//! needs is in the LBA or in a 4 KiB trailer beside the payload. Retries, quorum,
-//! caching and placement live above this file.
-//!
-//! The trick is that **the LBA is the RPC**. A read whose LBA encodes `(GET, addr)`
-//! returns the page, DMA'd straight into the initiator's registered buffer; a write
-//! encoding `(TRIM, addr)` returns only a status. The initiator drives everything, so
-//! anything needing a rich reply has to be a read.
+//! An operation is a plain NVMe read or write against a peer's namespace: read and write
+//! are the only verbs nvme-of gives us. Nothing is kept per operation beyond the
+//! in-flight SQE; everything is in the LBA or in a 4 KiB trailer beside the payload. The
+//! LBA is the RPC, and only a read can carry a rich reply. Retries, quorum, caching and
+//! placement live above this file.
 //!
 //! # What the kernel forces
 //!
-//! 1. **Two address regions, not sub-frames.** `imm` sits inside the frame id, so
-//!    `imm`-selected sub-frames of a 4 MiB page would land at unrelated LBAs. Each
-//!    region has its own stride instead: one command goes out, the nvme layer splits it
-//!    at the peer's MDTS, and the target reassembles by LBA offset.
-//! 2. **48-bit frame ids.** A frame id times its stride is a byte offset, which must
-//!    fit `loff_t`.
-//! 3. **Four statuses.** The nvmet target erases the rest to `EIO`; see [`status`].
-//! 4. **Relaying is a flag, not an opcode.** A read carries no data *to* the target, so
-//!    an inner frame cannot ride an outer one's trailer — and the motivating case,
-//!    relaying a metadata read, is a read. The outer frame *is* the inner frame; see
-//!    [`HOPS`].
-//! 5. **Gather copies the 4 KiB payload.** `ReadvFixed`/`WritevFixed` take a *single*
-//!    `buf_index`, so a guest's ublk page and a pooled trailer cannot share one vectored
-//!    fixed SQE; gather is instead one contiguous registered buffer of page plus
-//!    trailer. Still one command and one round trip, and the device path already stages
-//!    every 4 KiB page through a pool buffer. 4 MiB pages never gather, and stay zero
-//!    copy.
-//! 6. **One entry point.** Direction follows the opcode and shape follows the length, so
-//!    the client API is [`Link::send`] plus [`Frame::decode`]; what a frame *means* is
-//!    decided above this file.
+//! 1. Two address regions, not sub-frames, because `imm` sits inside the frame id. Each
+//!    region has its own stride; a 4 MiB command is split at the peer's MDTS and
+//!    reassembled by LBA offset.
+//! 2. 48-bit frame ids: id times stride is a byte offset and must fit `loff_t`.
+//! 3. Four statuses; nvmet erases the rest to `EIO`. See [`status`].
+//! 4. Relaying is a flag ([`HOPS`]), not an opcode: a read carries no data to the target,
+//!    so an inner frame cannot ride an outer one's trailer.
+//! 5. Gather copies the 4 KiB payload: `ReadvFixed`/`WritevFixed` take a single
+//!    `buf_index`, so a guest ublk page and a pooled trailer cannot share one vectored
+//!    fixed SQE. 4 MiB pages never gather and stay zero copy.
+//! 6. Direction follows the opcode and shape follows the length, so the client API is
+//!    [`Link::send`] plus [`Frame::decode`].
 
 use std::io;
 use std::path::Path;
@@ -41,19 +28,15 @@ use std::time::Duration;
 use crate::config::Peer;
 use crate::runtime::{Buf, Configurator, Disk, Durability, Errno};
 
-// ---------------------------------------------------------------------------
-// status
-// ---------------------------------------------------------------------------
+// --- status ---
 
 /// The status alphabet, as it survives the wire.
 ///
 /// The `ublk -> BLK_STS_* -> NVMe status -> nvme initiator -> errno` pipeline preserves
-/// **four** values. The narrow point is nvmet's `blk_to_nvme_status()`, which has arms
-/// for exactly `BLK_STS_{NOSPC,TARGET,NOTSUPP,MEDIUM}` and sends the rest as
-/// `NVME_SC_INTERNAL`, which the initiator's `nvme_error_status()` turns back into
-/// `EIO`. So `EBADE`, `EILSEQ`, `EAGAIN`, `ENOLINK`, `EINVAL` all arrive as a bare
-/// `EIO`, which the rule "any unrecognised status is a transport failure" escalates
-/// into a spurious path failover.
+/// four values: nvmet's `blk_to_nvme_status()` has arms for exactly
+/// `BLK_STS_{NOSPC,TARGET,NOTSUPP,MEDIUM}` and sends the rest as `NVME_SC_INTERNAL`,
+/// which the initiator turns back into `EIO`. A bare `EIO` reads as a transport failure
+/// and escalates into a path failover.
 ///
 /// | here | NVMe status | initiator errno | `DNR` |
 /// |------|-------------|-----------------|-------|
@@ -64,26 +47,16 @@ use crate::runtime::{Buf, Configurator, Disk, Durability, Errno};
 ///
 /// A status without `NVME_STATUS_DNR` is retried by the initiator up to
 /// `nvme_max_retries` (5) before delivery, per `nvme_decide_disposition()`. Only
-/// [`MISSING`] lacks it: safe, since every op is replay-safe, and useful for a briefly
-/// quarantined page, but it is why a lost ballot is *not* reported as `MISSING` —
-/// consensus would pay six round trips for it.
-///
-/// Two further outcomes need no code of their own:
-///
-/// - **Already written** (Immutable, `EEXIST`). A CORFU fill loser has to `GET` the
-///   winner regardless, so the follow-up command recovers the distinction.
-/// - **Overloaded** (`EAGAIN`). Backpressure *delays* the completion instead, as the
-///   device path does at `Pressure::Low`: holding the ublk tag makes queue depth bound
-///   the kernel, which a status cannot.
-///
-/// Statuses classify, they do not explain: [`STALE`] says the caller's model of a page
-/// is wrong, not what the right one is, and learning that costs a second command.
+/// [`MISSING`] lacks it, which is safe because every op is replay-safe, and is why a
+/// lost ballot is not reported as [`MISSING`]: consensus would pay six round trips.
+/// `EEXIST` and `EAGAIN` need no code of their own; a CORFU fill loser's follow-up `GET`
+/// recovers the first, and backpressure delays the completion rather than reporting the
+/// second, so queue depth bounds the kernel.
 pub(crate) mod status {
     use crate::runtime::Errno;
 
-    /// Your model of this page is stale: wrong ballot, version or placement. Both
-    /// recoveries start by asking — `PREPARE` or `GETMETA` — and re-read the config if
-    /// the page is not here at all.
+    /// Wrong ballot, version or placement: recover by asking (`PREPARE` or `GETMETA`),
+    /// and re-read the config if the page is not here at all.
     pub(crate) const STALE: Errno = Errno::EREMOTEIO;
     /// Page missing or quarantined. Heal from another group member.
     pub(crate) const MISSING: Errno = Errno::ENODATA;
@@ -93,9 +66,7 @@ pub(crate) mod status {
     pub(crate) const NOSPC: Errno = Errno::ENOSPC;
 }
 
-// ---------------------------------------------------------------------------
-// opcodes
-// ---------------------------------------------------------------------------
+// --- opcodes ---
 
 /// `GET` and `ACCEPT` are the hot path; everything else is rare by construction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -105,8 +76,7 @@ pub(crate) enum Op {
     Get = 0,
     /// Read the register: version, ballot, state, width hint. The hedged-read path.
     GetMeta = 1,
-    /// Raise this group's promise and report `(version, ballot, term)`. A read, because
-    /// the reply is rich.
+    /// Raise this group's promise and report `(version, ballot, term)`. A read.
     Prepare = 2,
     /// Write a page under a ballot. Reply is a status.
     Accept = 3,
@@ -119,7 +89,7 @@ pub(crate) enum Op {
     /// Bucket digests for anti-entropy.
     Merkle = 7,
     /// Tell a peer its register is stale: it pulls the page and applies it if newer.
-    /// Both repair and the migration learn use this.
+    /// Used by repair and by the migration learn.
     Learn = 8,
     /// Freeze a shard at its source group.
     Seal = 9,
@@ -127,9 +97,8 @@ pub(crate) enum Op {
     Ping = 10,
     /// A group's standing promise. Names a group, not a page.
     Term = 11,
-    /// Tell another zone a page it asked to keep warm has a new value, so its cohort
-    /// pulls the page before anyone there reads it. Advisory in both directions: the
-    /// sender does not wait on the result and the receiver may decline.
+    /// Tell another zone that a page it keeps warm has a new value. Advisory both ways:
+    /// the sender does not wait and the receiver may decline.
     Warm = 12,
 }
 
@@ -153,9 +122,8 @@ impl Op {
         })
     }
 
-    /// Whether the command is an NVMe read. Every interrogative op is a read, the only
-    /// direction a rich reply can travel; every imperative op is a write with a small
-    /// status alphabet.
+    /// Whether the command is an NVMe read. Interrogative ops are reads, the only
+    /// direction a rich reply travels; imperative ops are writes returning a status.
     pub(crate) fn is_read(self) -> bool {
         matches!(
             self,
@@ -170,13 +138,10 @@ impl Op {
         )
     }
 
-    /// Whether the op moves no page. Its single block is the trailer.
-    ///
-    /// `LEARN` is here rather than with the page-moving ops: a 4 MiB frame has no room
-    /// for a trailer (see the wire format below), but a repair must carry an exact
-    /// `(version, ballot)`. So it names the value and the member holding it, and the
-    /// receiver pulls the page with an ordinary `GET` — repair is the cold path, so the
-    /// extra hop is free where it is spent.
+    /// Whether the op moves no page. Its single block is the trailer. `LEARN` is here
+    /// because a 4 MiB frame has no room for a trailer but a repair must carry an exact
+    /// `(version, ballot)`: it names the value and its holder, and the receiver pulls
+    /// the page with an ordinary `GET`.
     fn is_control(self) -> bool {
         matches!(
             self,
@@ -197,38 +162,26 @@ impl Op {
 
 /// Forwarding hops this frame may still take, in flag bits 0..1.
 ///
-/// A budget, not an instruction: the *receiver* decides whether the frame is its to
-/// serve — [`Frame::imm`] says who it is addressed to — and spends a hop when it is
-/// not. It forwards the *same* frame with the budget one smaller and completes the
-/// outer command when the inner one does. Because the outer frame is the inner frame,
-/// a forward works in either direction and needs no trailer: a forwarded `GET` streams
-/// the page back through the buffer it arrived in, a forwarded `ACCEPT` streams it
-/// forward.
-///
-/// The field holds three; `paxos::Route` grants at most two, enough for a cross-zone
-/// gateway forwarding to a group member whose extent is mid-migration and must
-/// forward again. Two is now also the ceiling: routing is flat inside a universe, and
-/// a frame never leaves the universe it arrived on. A node that must forward with no
-/// budget left answers [`status::STALE`], which sends the originator back to its
-/// config.
+/// A budget, not an instruction: a receiver that is not the addressee ([`Frame::imm`])
+/// spends a hop, forwards the *same* frame with the budget one smaller, and completes
+/// the outer command when the inner one does. The outer frame is the inner frame, so a
+/// forward works in either direction and needs no trailer. The field holds three;
+/// `paxos::Route` grants at most two, since routing is flat inside a universe and a
+/// frame never leaves the universe it arrived on. Forwarding with no budget left answers
+/// [`status::STALE`], which sends the originator back to its config.
 const HOPS: u8 = 0b11;
 /// Serve this `GET` from the cache region only, never from the allocator.
 ///
-/// The one fabric change the cache requires, and a modifier on `GET` (and the `GETMETA`
-/// paired with a 4 MiB one) alone: a reader that believes a cohort peer holds a replica
-/// asks it directly, concurrently with the mandatory metadata round. A miss, or a
-/// replica that is shedding, answers [`status::MISSING`] and the reader falls back to
-/// the group, so this frame is never a correctness dependency and declining it is
-/// always safe.
-///
-/// A 4 KiB reply is gather mode: the register the copy claims rides the trailer beside
-/// the page. A 4 MiB reply has no trailer, so that register rides the paired `GETMETA`.
-/// Neither carries a width hint — a replica does not own the sketch.
+/// A modifier on `GET` and on the `GETMETA` paired with a 4 MiB one: a reader that
+/// believes a cohort peer holds a replica asks it directly, concurrently with the
+/// mandatory metadata round. A miss or a shedding replica answers [`status::MISSING`]
+/// and the reader falls back to the group, so declining is always safe. A 4 KiB reply
+/// puts the register the copy claims in the trailer beside the page; a 4 MiB reply has
+/// no trailer, so that register rides the paired `GETMETA`. Neither carries a width
+/// hint, because a replica does not own the sketch.
 pub(crate) const CACHE_ONLY: u8 = 1 << 2;
 
-// ---------------------------------------------------------------------------
-// wire format
-// ---------------------------------------------------------------------------
+// --- wire format ---
 
 // Two regions, each with its own stride, so a 4 MiB payload is one contiguous run of
 // blocks rather than a scatter of sub-frames:
@@ -240,17 +193,15 @@ pub(crate) const CACHE_ONLY: u8 = 1 << 2;
 //
 //   | offset (38 small / 28 huge) | imm 2 | flags 3 | opcode 5 |
 //
-// There is no address-space field. A frame names no universe because the *namespace it
-// arrived on* is the universe: the control plane publishes one fabric device per
-// universe and attaches it only to that universe's members, so partitioning is enforced
-// by the transport rather than by a number a peer could choose. That is what makes a
-// universe a security boundary and not just a naming convention, and it is why the six
-// bits a per-frame device name would cost go to `offset` instead.
+// There is no address-space field: the namespace a frame arrived on is the universe. The
+// control plane publishes one device per universe and attaches it only to that universe's
+// members, so partitioning is enforced by the transport rather than by a number a peer
+// could choose, which is what makes a universe a security boundary.
 //
 // `offset` is a page index in the universe's own flat LBA space: 4 KiB pages count
-// blocks directly, 4 MiB pages count 1024-block groups. Both regions therefore address
-// exactly `config::MAX_LBA` blocks, so any address the control plane may legally hand
-// out is reachable, and neither class pays for the other's granularity.
+// blocks directly, 4 MiB pages count 1024-block groups. Both regions address exactly
+// `config::MAX_LBA` blocks, so any address the control plane may legally hand out is
+// reachable.
 const OP_BITS: u32 = 5;
 const FLAG_BITS: u32 = 3;
 const IMM_BITS: u32 = 2;
@@ -266,13 +217,13 @@ const HUGE_BLOCKS: u64 = 1 << HUGE_SHIFT;
 const HUGE_BASE_LBA: u64 = 1 << (SMALL_OFF_BITS + IMM_BITS + FLAG_BITS + OP_BITS + SMALL_SHIFT);
 const MAX_LBA: u64 = HUGE_BASE_LBA * 2;
 
-/// Size the fabric device must be declared with: 4 EiB, entirely sparse. It is an
-/// address space, not storage — nothing is ever laid out in it.
+/// Size the fabric device must be declared with: 4 EiB of sparse address space, never
+/// storage.
 pub(crate) const DEVICE_SIZE: u64 = MAX_LBA * BLOCK as u64;
 
-/// The logical block, and so the trailer size. Deliberately oversized: it never reaches
-/// media, it exists only to spare a second round trip, and 4 KiB keeps every buffer
-/// page-aligned and RDMA-friendly.
+/// The logical block, and so the trailer size. Oversized on purpose: it never reaches
+/// media, it only spares a second round trip, and 4 KiB keeps every buffer page-aligned
+/// and RDMA-friendly.
 pub(crate) const BLOCK: usize = 4096;
 
 // Both regions cover a whole universe, so config validation's `base_lba + blocks <=
@@ -292,9 +243,8 @@ pub(crate) fn hops(flags: u8) -> u8 {
 /// Which blocks of a frame a request covers, and so what the payload means.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Part {
-    /// Bare mode: page bytes only, starting `off` into the page. `off` is always 0 for
-    /// a 4 KiB page, and is how a 4 MiB transfer reassembles after the nvme layer has
-    /// split it at the peer's MDTS.
+    /// Bare mode: page bytes only, starting `off` into the page. `off` is 0 for a 4 KiB
+    /// page; on a 4 MiB transfer it is how the MDTS-split pieces reassemble.
     Payload { off: usize },
     /// Control mode: one trailer block, no page.
     Trailer,
@@ -302,8 +252,8 @@ pub(crate) enum Part {
     Both,
 }
 
-/// A decoded LBA. Pure data — construct one, hand it to [`Link::send`], and it is a
-/// command; get one back from [`Frame::decode`], and it is a request.
+/// A decoded LBA. Pure data: hand one to [`Link::send`] and it is a command, get one
+/// back from [`Frame::decode`] and it is a request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Frame {
     pub(crate) op: Op,
@@ -312,18 +262,12 @@ pub(crate) struct Frame {
     /// Who this frame is addressed to, in two bits, uniformly across every page op.
     ///
     /// Zero means "you own this operation": resolve the address yourself and answer
-    /// authoritatively rather than from your own copy. `k + 1` names member index `k`
-    /// of the address's group — two bits hold both, because a group is three wide.
-    ///
-    /// This generalises `ACCEPT`'s encoding, where zero means "you are the proposer,
-    /// pick a ballot". On a `GET` it means "give me the linearizable value", which lets
-    /// a node holding neither the extent table nor the catalog for a remote zone still
-    /// take a confirmed read: it hands the whole round to the gateway, where the
-    /// members are.
-    ///
-    /// The group-addressed ops borrow it for the page class instead; see `heal.rs`.
-    ///
-    /// A receiver that is not the addressee forwards, if [`HOPS`] allows.
+    /// authoritatively rather than from your own copy, which is how a node holding
+    /// neither the extent table nor the catalog for a remote zone still takes a confirmed
+    /// read. On `ACCEPT` it means "you are the proposer, pick a ballot". `k + 1` names
+    /// member index `k` of the address's group; two bits hold both, because a group is
+    /// three wide. The group-addressed ops borrow it for the page class instead; see
+    /// `heal.rs`. A receiver that is not the addressee forwards, if [`HOPS`] allows.
     pub(crate) imm: u8,
     /// Whether `offset` counts 4 MiB pages rather than 4 KiB ones. Selects the region.
     pub(crate) huge: bool,
@@ -333,10 +277,9 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-    /// A frame naming the page at `lba` in the arriving universe's address space.
-    ///
-    /// `lba` counts 4 KiB blocks whatever the class, because that is the unit the
-    /// control plane places extents in; a 4 MiB page's `lba` is the first of its 1024.
+    /// A frame naming the page at `lba` in the arriving universe's address space. `lba`
+    /// counts 4 KiB blocks whatever the class, because that is the unit the control plane
+    /// places extents in; a 4 MiB page's `lba` is the first of its 1024.
     pub(crate) fn page(op: Op, huge: bool, lba: u64) -> Frame {
         Frame::raw(op, huge, if huge { lba / HUGE_BLOCKS } else { lba })
     }
@@ -363,12 +306,9 @@ impl Frame {
         }
     }
 
-    /// The frame's base LBA — block 0 of its footprint.
-    ///
-    /// Total: out-of-range fields are masked, not rejected. Every caller has already
-    /// validated its address against the config, and a panicking encoder on the hot
-    /// path would be worse than a frame the far end refuses — a masked frame decodes to
-    /// a different address, which fails its own bounds check there.
+    /// The frame's base LBA, block 0 of its footprint. Total: out-of-range fields are
+    /// masked, not rejected, because every caller has already validated its address
+    /// against the config and a masked frame just fails its bounds check at the far end.
     pub(crate) fn encode(&self) -> u64 {
         let (off_bits, base, shift) = if self.huge {
             (HUGE_OFF_BITS, HUGE_BASE_LBA, HUGE_SHIFT)
@@ -382,11 +322,9 @@ impl Frame {
         base + (id << shift)
     }
 
-    /// The inverse, plus the frame shape implied by the transfer length.
-    ///
-    /// Pure and total: any `(lba, len)` at all either decodes or is [`status::BAD`],
-    /// and none of them panics. This runs on the target before anything else, on bytes
-    /// a peer chose, so being total is a safety property here rather than a nicety.
+    /// The inverse, plus the frame shape implied by the transfer length. Pure and total:
+    /// any `(lba, len)` either decodes or is [`status::BAD`], and none panics. The target
+    /// runs this on bytes a peer chose, so totality is a safety property here.
     pub(crate) fn decode(lba: u64, len: usize) -> Result<(Frame, Part), Errno> {
         if lba >= MAX_LBA || len == 0 || !len.is_multiple_of(BLOCK) {
             return Err(status::BAD);
@@ -440,13 +378,11 @@ impl Frame {
     }
 }
 
-// ---------------------------------------------------------------------------
-// trailers
-// ---------------------------------------------------------------------------
+// --- trailers ---
 
-// A trailer is one block of little-endian `u64` slots. There is deliberately no type
-// per record: the records that exist today are two to four fields wide. The slot
-// indices live in `paxos.rs` (`T_*`) and `heal.rs`; this is the per-op table.
+// A trailer is one block of little-endian `u64` slots, with no type per record: the
+// records today are two to four fields wide. Slot indices live in `paxos.rs` (`T_*`) and
+// `heal.rs`; this is the per-op table.
 //
 //   PING     0 node id   1 config generation  2 topology epoch
 //   GETMETA  0 version   1 ballot   2 state              3 cache width
@@ -463,32 +399,26 @@ impl Frame {
 //   SNAPNEXT 0 count     1 done     then 3 slots per page (reply)
 //
 // `LEARN`'s slot 3 marks a repair rather than a migration push, which also admits the
-// equal-register case: our entry matches but our bytes fail their checksum. `WARM`
-// borrows `LEARN`'s shape but not its meaning: it names no ballot and no holder,
-// because the receiver reads the page through the ordinary cross-zone path and takes
-// whatever the owning group agrees on. Its stage says how far the frame has come -
-// zero from the writing zone, one relayed by a gateway to the cohort member that will
-// hold the copy - which is what stops a warm from being relayed forever. `SEAL`
-// names an extent rather than a page, so its address is in the trailer and not in the
-// frame; `TERM` names a group, which is in the frame.
+// equal-register case: our entry matches but our bytes fail their checksum. `WARM` names
+// no ballot and no holder, because the receiver reads the page through the ordinary
+// cross-zone path; its stage (zero from the writing zone, one relayed by a gateway to the
+// cohort member that will hold the copy) stops a warm being relayed forever. `SEAL` names
+// an extent, so its address is in the trailer and not in the frame; `TERM` names a group,
+// which is in the frame.
 //
-// `MERKLE`, `SNAPOPEN` and `SNAPNEXT` are the anti-entropy ops (`heal.rs`); they and
-// `TERM` name a consensus group rather than a page, so `offset` carries something else
-// entirely there. A digest vector fills the block exactly, which is why it is 512 wide
-// and one level deep instead of a tree. `SNAPNEXT` ships `(address, version, ballot)`
-// and no page bytes; the reader pulls what it wants with an ordinary `GET`, so there is
-// one data path and not two.
+// A digest vector fills the block exactly, which is why `MERKLE` is 512 wide and one
+// level deep instead of a tree. `SNAPNEXT` ships `(address, version, ballot)` and no page
+// bytes; the reader pulls what it wants with an ordinary `GET`.
 //
-// A 4 MiB `ACCEPT` has no trailer, because a huge frame's whole stride is payload and
-// a ublk request buffer has no address a vectored SQE could gather beside. Its guard
-// and ballot are derived by the acceptor instead: see `paxos::accept`.
+// A 4 MiB `ACCEPT` has no trailer, because a huge frame's whole stride is payload and a
+// ublk request buffer has no address a vectored SQE could gather beside. Its guard and
+// ballot are derived by the acceptor instead: see `paxos::accept`.
 //
-// The topology epoch rides the trailer of every routed write and of no bare read: a
-// read served from a stale epoch is absorbed by the quorum, so gathering to carry it
-// would tax the hot path to defend the path that needs no defending.
+// The topology epoch rides the trailer of every routed write and of no bare read: a read
+// served from a stale epoch is absorbed by the quorum.
 
-/// Write slot `i` of a trailer. Out of range is a no-op: a trailer arrives from a
-/// peer, so nothing here may panic on its contents.
+/// Write slot `i` of a trailer. Out of range is a no-op: a trailer arrives from a peer,
+/// so nothing here may panic on its contents.
 pub(crate) fn put(dst: &mut [u8], i: usize, v: u64) {
     if let Some(c) = slot(dst.len(), i).and_then(|r| dst.get_mut(r)) {
         c.copy_from_slice(&v.to_le_bytes());
@@ -508,33 +438,26 @@ fn slot(len: usize, i: usize) -> Option<std::ops::Range<usize>> {
     (b <= len).then_some(a..b)
 }
 
-// ---------------------------------------------------------------------------
-// links
-// ---------------------------------------------------------------------------
+// --- links ---
 
-/// How long a fabric command may take before it is a path failure.
-///
-/// The fabric never retries. Expiry surfaces as `ETIME`, consensus treats the replica
-/// as non-responding, and the other two members carry the quorum.
+/// How long a fabric command may take before it is a path failure. The fabric never
+/// retries: expiry surfaces as `ETIME`, consensus treats the replica as non-responding,
+/// and the other two members carry the quorum.
 const TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long a 4 MiB payload may take before it is a path failure.
-///
-/// Shorter than [`TIMEOUT`] because the buffer such a command puts on the wire is the
-/// guest's own, and the write cannot be answered until every replica leg is done with
-/// it: this is what a peer that stops answering costs a 4 MiB write. A transfer that
-/// size has either landed in a fraction of a second or is not going to.
+/// How long a 4 MiB payload may take before it is a path failure. Shorter than
+/// [`TIMEOUT`] because such a command puts the guest's own buffer on the wire and the
+/// write cannot be answered until every replica leg is done with it.
 const HUGE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// A peer link. A handle and nothing more: an fd and the peer's id, no per-op state.
+/// A peer link: an fd and the peer's id, no per-op state.
 ///
 /// A link is per `(universe, peer)`, not per peer: a peer we share two universes with
-/// publishes two namespaces and we hold two links, one to each. That is the whole of
-/// the partitioning enforcement on the client side - there is no way to phrase a frame
-/// for a universe you hold no namespace of.
-///
-/// `!Send`, like the [`Disk`] it wraps. The runtime registers the file on every core,
-/// so a submission never crosses cores even though one `Link` serves them all.
+/// publishes two namespaces and we hold two links. That is the partitioning enforcement
+/// on the client side, since there is no way to phrase a frame for a universe you hold
+/// no namespace of. `!Send`, like the [`Disk`] it wraps: the runtime registers the file
+/// on every core, so a submission never crosses cores even though one `Link` serves them
+/// all.
 pub(crate) struct Link {
     disk: Disk,
     /// The same device on the shorter deadline a 4 MiB command is held to.
@@ -544,13 +467,11 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    /// Open a link to `p` in `universe`. The control plane has already attached the
-    /// peer's fabric namespace for that universe locally, so this is an `open(2)` and
-    /// nothing more.
-    ///
-    /// Links are opened when a configuration is built and closed when it retires;
-    /// re-declaring the same path across a reload keeps the registration, so a live
-    /// peer's fd is never disturbed.
+    /// Open a link to `p` in `universe`; the control plane has already attached the
+    /// peer's fabric namespace locally, so this is just an `open(2)`. Links are opened
+    /// when a configuration is built and closed when it retires; re-declaring the same
+    /// path across a reload keeps the registration, so a live peer's fd is never
+    /// disturbed.
     pub(crate) fn open(c: &Configurator, universe: u32, p: &Peer) -> io::Result<Link> {
         let disk = c.disk(Path::new(&p.device), Some(TIMEOUT), None)?;
         let huge = disk.by(HUGE_TIMEOUT);
@@ -574,15 +495,13 @@ impl Link {
 
     /// Issue one frame. This is the whole client API.
     ///
-    /// `buf` is the payload, the trailer, or both, and its length is what tells the
-    /// target which; the shape is checked here so a malformed command is refused before
-    /// it costs a round trip. Nothing is copied: `buf` is registered memory, which for
-    /// a 4 MiB page is the guest's own pages.
-    ///
-    /// A 4 MiB transfer goes out as one command and the nvme layer splits it at the
+    /// `buf` is the payload, the trailer, or both; its length tells the target which, and
+    /// the shape is checked here so a malformed command costs no round trip. Nothing is
+    /// copied: `buf` is registered memory, which for a 4 MiB page is the guest's own
+    /// pages. A 4 MiB transfer goes out as one command that the nvme layer splits at the
     /// peer's MDTS; the target sees the pieces as separate requests at consecutive LBAs
-    /// inside the frame's footprint and reassembles them by offset. There is no chunk
-    /// index and no partial-failure case, because there is one completion.
+    /// inside the frame's footprint. There is no chunk index and no partial-failure case,
+    /// because there is one completion.
     pub(crate) async fn send(&self, f: Frame, buf: Buf) -> Result<(), Errno> {
         let lba = f.encode();
         Frame::decode(lba, buf.len())?;
@@ -590,20 +509,18 @@ impl Link {
         if f.op.is_read() {
             self.disk.read(off, buf).await
         } else {
-            // Durable: a fabric write is only acked once the peer has it, and the
-            // ublk device advertises no volatile cache, so there is no flush to pair.
+            // Durable: a fabric write is only acked once the peer has it, and the ublk
+            // device advertises no volatile cache, so there is no flush to pair.
             let d = if f.huge { &self.huge } else { &self.disk };
             d.write(off, buf, Durability::Durable).await
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests ---
 
-/// The codec only: pure and total, so no device, no root and no peer. The paths that
-/// need those are exercised end to end in `server`.
+/// The codec only: pure and total, so no device, no root and no peer. Those paths are
+/// exercised end to end in `server`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,7 +589,7 @@ mod tests {
     }
 
     /// Every address the control plane may hand out is nameable in both classes, which
-    /// is what lets an extent sit anywhere in its universe's space.
+    /// lets an extent sit anywhere in its universe's space.
     #[test]
     fn a_frame_reaches_the_whole_universe() {
         let last = crate::config::MAX_LBA - 1;
@@ -700,7 +617,6 @@ mod tests {
         );
         // Block 1 alone is the trailer half of a gather frame; it is not addressable.
         assert!(Frame::decode(get.encode() + 1, BLOCK).is_err());
-        // Three blocks is not a shape a 4 KiB frame has.
         assert!(Frame::decode(get.encode(), 3 * BLOCK).is_err());
 
         let ping = Frame::page(Op::Ping, false, 0);
@@ -769,8 +685,8 @@ mod tests {
 
     #[test]
     fn forwarding_preserves_the_request() {
-        // A forward changes nothing but how far the frame may still go, which is what
-        // makes it work in both directions and at either frame shape.
+        // A forward changes only how far the frame may still go, so it works in both
+        // directions and at either frame shape.
         let mut f = Frame::page(Op::GetMeta, false, 9);
         f.flags = 2 | CACHE_ONLY;
         f.imm = 2;

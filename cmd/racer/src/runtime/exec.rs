@@ -1,5 +1,4 @@
-//! The executor: request futures stored in place, a ready FIFO, and wakers that are
-//! nothing but a task id. Serving a request allocates nothing.
+//! The executor: futures stored in place, a ready FIFO, id-only wakers, no allocation.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -11,8 +10,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use super::worker;
 use super::{Cfg, Errno, Handler, Request};
 
-/// Task ids are `slot | kind`. Two kinds share one FIFO: ublk request futures, and the
-/// hop slab's tasks (remote jobs and detached spawns).
+/// Task ids are `slot | kind`: one FIFO for ublk request futures and hop slab tasks.
 pub(super) const KIND_HOP: u32 = 1 << 31;
 
 pub(super) fn is_hop(id: u32) -> bool {
@@ -47,9 +45,7 @@ impl Ready {
     }
 }
 
-// ---------------------------------------------------------------------------
-// wakers
-// ---------------------------------------------------------------------------
+// --- wakers ---
 
 static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_w, wake_w, wake_w, drop_w);
 
@@ -64,28 +60,23 @@ unsafe fn wake_w(p: *const ()) {
 
 unsafe fn drop_w(_: *const ()) {}
 
-/// A waker is nothing but the task id: every future in this runtime is polled by the
-/// worker that created it, so there is no state to share and nothing to refcount.
+/// A waker is just the task id; every future is polled by the worker that created it.
 pub(super) fn waker_for(id: u32) -> Waker {
-    // SAFETY: the vtable never dereferences its data pointer — it is the id — so clone
-    // and drop are no-ops and the `RawWaker` contract holds.
+    // SAFETY: the vtable never dereferences its data pointer (it is the id), so clone and
+    // drop are no-ops and the `RawWaker` contract holds.
     unsafe { Waker::from_raw(RawWaker::new(id as usize as *const (), &VTABLE)) }
 }
 
-// ---------------------------------------------------------------------------
-// request slab
-// ---------------------------------------------------------------------------
+// --- request slab ---
 
 struct ReqSlot<F> {
     used: bool,
     fut: MaybeUninit<F>,
 }
 
-/// The per-worker request executor.
-///
-/// Generic over the handler's future type so each future lives in place in the slab;
-/// `F` is inferred from the `H::handle` function item, which is why this type is
-/// constructed in the worker loop rather than stored in the shared `Local`.
+/// The per-worker request executor. Generic over the handler's future type so futures
+/// live in place in the slab; `F` is inferred from `H::handle`, so this type is built in
+/// the worker loop rather than stored in the shared `Local`.
 pub(super) struct Exec<H: Handler, F> {
     handler: &'static H,
     make: fn(&'static H, Cfg<H::Config>, Request) -> F,
@@ -121,8 +112,7 @@ where
         self.handler
     }
 
-    /// Starts a request. The slot index is fixed by (device, queue, tag), so there is
-    /// no allocation and no free list.
+    /// Starts a request. The slot index is fixed by (device, queue, tag): no free list.
     pub(super) fn start(
         &mut self,
         id: u32,
@@ -137,8 +127,7 @@ where
         self.poll(id)
     }
 
-    /// Polls one request future. `Some(result)` means the request is finished and the
-    /// caller must commit it.
+    /// Polls one request future. `Some` means finished and the caller must commit it.
     pub(super) fn poll(&mut self, id: u32) -> Option<Result<(), Errno>> {
         let s = &mut self.slots[id as usize];
         if !s.used {
@@ -172,8 +161,7 @@ where
 
 impl<H: Handler, F> Drop for Exec<H, F> {
     fn drop(&mut self) {
-        // Abandoned requests still own `Cfg` guards and hop cells; drop them in place
-        // while the worker's thread-local is still live.
+        // Abandoned futures own `Cfg` guards and hop cells; drop while thread-local lives.
         for s in self.slots.iter_mut().filter(|s| s.used) {
             s.used = false;
             unsafe { s.fut.assume_init_drop() };

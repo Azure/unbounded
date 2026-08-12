@@ -1,13 +1,8 @@
 //! Cross-core hops.
 //!
-//! Workers share no mutable state: to touch another core's data you send it a closure
-//! and get a value back. The transport is an n² matrix of SPSC rings of fixed 128-byte
-//! messages, each carrying an inline payload plus the one function pointer that knows
-//! how to interpret it.
-//!
-//! Calls and replies are the same message; a reply lands in the caller's rendezvous
-//! cell. That cell lives in the caller's own per-core slab, so completing, abandoning
-//! and polling a hop are all single-threaded on the caller's core.
+//! Workers share no mutable state: to touch another core's data you send a closure over an
+//! n^2 matrix of SPSC rings of fixed 128-byte messages and get a value back. Replies land
+//! in a rendezvous cell in the caller's own per-core slab, so hops stay single-threaded.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -30,8 +25,7 @@ const RING_SLOTS: usize = 256;
 const RING_SLOTS: usize = 32;
 /// Inline bytes in a message: a closure's captures or a returned value.
 const PAYLOAD_BYTES: usize = 96;
-/// Bytes reserved per in-flight remote future. The largest is the allocator's metadata
-/// commit: a stage, a group-commit wait and the mblock write it may issue.
+/// Bytes per in-flight remote future; the largest is the allocator's metadata commit.
 const HOP_TASK_BYTES: usize = 576;
 /// Remote futures a worker can host at once.
 #[cfg(not(feature = "sim"))]
@@ -45,12 +39,9 @@ const HOP_TASKS: u32 = 64;
 #[cfg(feature = "sim")]
 const HOP_CELLS: u32 = 64;
 
-// ---------------------------------------------------------------------------
-// messages and rings
-// ---------------------------------------------------------------------------
+// --- messages and rings ---
 
-/// One ring slot. `run` is the only thing that knows what `payload` holds, so calls
-/// and replies need no discriminant.
+/// One ring slot. `run` knows what `payload` holds, so messages need no discriminant.
 #[repr(C, align(64))]
 pub(super) struct Msg {
     payload: [u8; PAYLOAD_BYTES],
@@ -73,13 +64,11 @@ impl Msg {
         }
     }
 
-    /// Writes `v` into the inline payload. The paired `run` must read the same type
-    /// back out.
+    /// Writes `v` into the inline payload. The paired `run` must read the same type back.
     fn put<T>(&mut self, v: T) {
         const { assert!(size_of::<T>() <= PAYLOAD_BYTES) };
         const { assert!(align_of::<T>() <= 64) };
-        // SAFETY: `payload` is at offset 0 of a 64-aligned struct and the const
-        // asserts above bound `T`'s size and alignment.
+        // SAFETY: `payload` is at offset 0 of a 64-aligned struct; const asserts bound `T`.
         unsafe { (self.payload.as_mut_ptr() as *mut T).write(v) };
     }
 
@@ -101,23 +90,21 @@ struct Ring {
 const STATE_RUNNING: u8 = 0;
 const STATE_SLEEPING: u8 = 1;
 
-/// Per-worker liveness and ring fd, so any thread can tell whether a doorbell is
-/// needed and which ring to ring.
+/// Per-worker liveness and ring fd, so any thread can tell whether a doorbell is needed.
 #[repr(C, align(64))]
 struct WorkerState {
     state: AtomicU8,
     ring_fd: AtomicU32,
 }
 
-/// The hop transport: n² rings in one region plus n worker states.
+/// The hop transport: n^2 rings in one region plus n worker states.
 pub(super) struct Fabric {
     region: Region,
     states: Vec<WorkerState>,
     n: usize,
 }
 
-// SAFETY: every field is an atomic or is reached only through the SPSC protocol
-// below, which is what makes cross-thread access sound.
+// SAFETY: every field is an atomic or is reached only through the SPSC protocol below.
 unsafe impl Send for Fabric {}
 unsafe impl Sync for Fabric {}
 
@@ -158,7 +145,6 @@ impl Fabric {
         None
     }
 
-    /// Runs every message addressed to `me`; returns how many were handled.
     pub(super) fn drain(&self, me: usize) -> usize {
         let mut done = 0;
         for src in 0..self.n {
@@ -215,16 +201,13 @@ impl Fabric {
     }
 }
 
-// ---------------------------------------------------------------------------
-// rendezvous cells (caller side)
-// ---------------------------------------------------------------------------
+// --- rendezvous cells (caller side) ---
 
 const CELL_EMPTY: u8 = 0;
 const CELL_FULL: u8 = 1;
 const CELL_ABANDONED: u8 = 2;
 
-/// Where a hop's result lands. Owned by the caller's core and touched only there — the
-/// reply trampoline runs on the caller's own worker loop — so no atomics.
+/// Where a hop's result lands. Owned and touched only by the caller's core, so no atomics.
 #[repr(C, align(64))]
 struct CellSlot {
     data: [u8; PAYLOAD_BYTES],
@@ -273,8 +256,7 @@ impl Cells {
     }
 }
 
-/// Reply side, on the caller's core: land `T` in the caller's cell, or drop it if the
-/// caller walked away.
+/// Reply side, on the caller's core: lands `T` in the cell, or drops it if abandoned.
 unsafe fn reply_trampoline<T>(msg: &mut Msg) {
     let id = msg.cell;
     let waker = worker::with_local(|l| {
@@ -286,8 +268,7 @@ unsafe fn reply_trampoline<T>(msg: &mut Msg) {
             cells.release(id);
             return None;
         }
-        // SAFETY: `data` is at offset 0 of a 64-aligned struct and `T` fit the
-        // payload on the way out.
+        // SAFETY: `data` is at offset 0 of a 64-aligned struct and `T` fit the payload.
         unsafe { (s.data.as_mut_ptr() as *mut T).write(msg.take::<T>()) };
         s.state = CELL_FULL;
         s.waker.take()
@@ -297,18 +278,14 @@ unsafe fn reply_trampoline<T>(msg: &mut Msg) {
     }
 }
 
-/// Sends a finished remote future's value home.
 fn reply<T>(src: u16, cell: u32, v: T) {
     let mut msg = Msg::new(reply_trampoline::<T>, cell, src);
     msg.put(v);
     worker::send_hop(src as usize, msg);
 }
 
-// ---------------------------------------------------------------------------
-// remote futures (callee side)
-// ---------------------------------------------------------------------------
+// --- remote futures (callee side) ---
 
-/// A remote future plus where to send its value. Lives in the callee's task slab.
 struct HopJob<Fut, T> {
     fut: Fut,
     cell: u32,
@@ -391,8 +368,7 @@ impl HopTasks {
         self.slots[id as usize].data.as_ptr() as *mut u8
     }
 
-    /// `None` once the slot has been handed back: a task can be woken more than once
-    /// before it is polled, so a wake can outlive the task it names.
+    /// `None` once the slot is released: a wake can outlive the task it names.
     pub(super) fn vt(&self, id: u32) -> Option<&'static HopVt> {
         self.slots[id as usize].vt
     }
@@ -411,12 +387,9 @@ impl HopVt {
     }
 }
 
-// ---------------------------------------------------------------------------
-// detached local tasks
-// ---------------------------------------------------------------------------
+// --- detached local tasks ---
 
-/// A future with nowhere to send its value. Shares the remote futures' slab because it
-/// needs the same thing: somewhere to live between polls that is not the caller's stack.
+/// A future with nowhere to send its value. Shares the remote futures' task slab.
 type Detached = Pin<Box<dyn Future<Output = ()>>>;
 
 unsafe fn detached_poll(p: *mut u8, cx: &mut Context) -> Poll<()> {
@@ -433,12 +406,9 @@ static DETACHED_VT: HopVt = HopVt {
     drop: detached_drop,
 };
 
-/// Runs `fut` on this core until it finishes, with no handle to await it. Boxing keeps
-/// the slot size independent of what the future captures.
-///
-/// Returns false when the slab is full, having dropped the future unpolled. The runtime
-/// counts live tasks to decide it has quiesced, so a task that cannot start must not be
-/// queued for later; every caller would rather skip a round than wait.
+/// Runs `fut` on this core with no handle to await it; boxing keeps the slot size
+/// independent of the captures. Returns false when the slab is full, having dropped the
+/// future unpolled: live task count drives quiescence, so it must not be queued for later.
 pub(super) fn spawn(fut: impl Future<Output = ()> + 'static) -> bool {
     let job: Detached = Box::pin(fut);
     let Some(id) = worker::with_local(|l| {
@@ -455,8 +425,7 @@ pub(super) fn spawn(fut: impl Future<Output = ()> + 'static) -> bool {
     true
 }
 
-/// Call side, on the destination core: rebuild the closure, run it, and park the
-/// resulting future in the task slab.
+/// Call side, on the destination core: rebuilds the closure, runs it, parks the future.
 unsafe fn call_trampoline<F, Fut, T>(msg: &mut Msg)
 where
     F: FnOnce() -> Fut,
@@ -488,21 +457,17 @@ where
     worker::poll_hop_task(id);
 }
 
-// ---------------------------------------------------------------------------
-// the caller's future
-// ---------------------------------------------------------------------------
+// --- the caller's future ---
 
 enum Stage<F, Fut> {
     Init(F),
-    /// Destination is this core: no message, run it inline.
     Here(Fut),
     Sent,
     Done,
 }
 
-/// Awaiting this runs `f` on `dst` and brings its value back. Dropping it before it
-/// resolves abandons the rendezvous: the remote future still runs to completion, but
-/// its value is discarded when it arrives. That is what makes quorum fan-in cheap.
+/// Awaiting this runs `f` on `dst` and returns its value. Dropping it before it resolves
+/// abandons the rendezvous: the remote future still runs, but its value is discarded.
 pub(super) struct Hop<F, Fut, T> {
     dst: usize,
     cell: u32,
@@ -602,8 +567,7 @@ impl<F, Fut, T> Drop for Hop<F, Fut, T> {
         if !matches!(self.stage, Stage::Sent) {
             return;
         }
-        // Abandon: if the reply already landed, drop it here; otherwise the cell
-        // outlives us and the reply trampoline frees it.
+        // If the reply landed, drop it here; otherwise the trampoline frees the cell.
         let id = self.cell;
         worker::with_local(|l| {
             let mut cells = l.cells.borrow_mut();
@@ -620,6 +584,6 @@ impl<F, Fut, T> Drop for Hop<F, Fut, T> {
     }
 }
 
-/// Messages a worker could not push because the destination ring was full. Drained by
-/// the worker loop so no send path can fail or block.
+/// Messages rejected by a full destination ring. Drained by the worker loop, so no send
+/// path can fail or block.
 pub(super) type Outbox = RefCell<VecDeque<(u16, Msg)>>;
