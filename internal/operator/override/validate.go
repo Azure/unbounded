@@ -481,8 +481,8 @@ func walkPatchMap(value map[string]any, path string, node *pathNode, report func
 		childPath := joinPath(path, key)
 
 		if strings.HasPrefix(key, "$") {
-			report(fmt.Sprintf("%s uses the strategic merge directive %q; directives can delete operator-managed content and are not accepted",
-				describePath(path), key))
+			report(fmt.Sprintf("%s is a strategic merge directive; directives can delete operator-managed content and are not accepted",
+				describePath(childPath)))
 
 			continue
 		}
@@ -590,8 +590,8 @@ func walkSubtree(value any, path string, report func(string)) {
 
 		for _, key := range keys {
 			if strings.HasPrefix(key, "$") {
-				report(fmt.Sprintf("%s uses the strategic merge directive %q; directives can delete operator-managed content and are not accepted",
-					describePath(path), key))
+				report(fmt.Sprintf("%s is a strategic merge directive; directives can delete operator-managed content and are not accepted",
+					describePath(joinPath(path, key))))
 
 				continue
 			}
@@ -599,8 +599,10 @@ func walkSubtree(value any, path string, report func(string)) {
 			walkSubtree(typed[key], joinPath(path, key), report)
 		}
 	case []any:
-		for _, element := range typed {
-			walkSubtree(element, path, report)
+		// Carry the index, so a problem several levels inside a list can be
+		// found. Without it every element reported against the same path.
+		for i, element := range typed {
+			walkSubtree(element, fmt.Sprintf("%s[%d]", path, i), report)
 		}
 	}
 }

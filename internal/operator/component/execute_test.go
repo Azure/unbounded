@@ -883,3 +883,60 @@ func TestStaleCreateDefersItsDependents(t *testing.T) {
 		t.Fatalf("a lost create race is not a failure: %v", err)
 	}
 }
+
+// TestDependencyWaitsForEveryOperationOnTheObject pins that a ref is not
+// treated as ready after only the first of several operations on it.
+//
+// A plan legitimately holds more than one operation on an object: a ConfigMap
+// is created if absent and then merge-patched to add operator-owned keys.
+// Ordering marked the ref done after the first, so a dependent whose own rank
+// is lower than the second operation's became eligible early and was emitted
+// between the two, observing a half-built object.
+//
+// Rank is the primary order, so this only bites when the dependent ranks below
+// its dependency. A ConfigMap waiting on a workload is the shape that does it.
+func TestDependencyWaitsForEveryOperationOnTheObject(t *testing.T) {
+	workload := daemonSetObject("node")
+
+	base := daemonSetObject("node")
+	base.SetResourceVersion("1")
+
+	patched := daemonSetObject("node")
+	patched.SetResourceVersion("1")
+
+	plan := NewPlan()
+	plan.Add(
+		Operation{Kind: OpApply, Object: workload, Component: "test"},
+		Operation{Kind: OpMergePatch, Object: patched, Base: base, Component: "test"},
+		Operation{
+			Kind: OpApply, Object: configMapObject("after"), Component: "test",
+			DependsOn: []ObjectRef{RefOf(workload)},
+		},
+	)
+
+	order, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(order), "\n")
+
+	patchAt, dependentAt := -1, -1
+
+	for i, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "MergePatch") && strings.Contains(line, "node"):
+			patchAt = i
+		case strings.Contains(line, "ConfigMap") && strings.Contains(line, "after"):
+			dependentAt = i
+		}
+	}
+
+	if patchAt < 0 || dependentAt < 0 {
+		t.Fatalf("order =\n%s\nwant both the patch and the dependent", order)
+	}
+
+	if dependentAt < patchAt {
+		t.Fatalf("the dependent ran before the second operation on its dependency:\n%s", order)
+	}
+}

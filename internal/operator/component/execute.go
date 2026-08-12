@@ -600,14 +600,17 @@ func byRank(ops []plannedOp) []plannedOp {
 // dependencies are satisfied, the lowest rank wins, and ties keep the input
 // order. Dependencies not present in the plan are treated as satisfied.
 func orderByDependency(ops []plannedOp) ([]plannedOp, error) {
-	produced := map[ObjectRef]bool{}
+	// Counted rather than a set of refs, because a plan legitimately holds more
+	// than one operation on the same object: a ConfigMap is created if absent
+	// and then merge-patched to add operator-owned keys. Marking the ref done
+	// after the first would let a dependent run between the two.
+	pending := map[ObjectRef]int{}
 	for _, op := range ops {
-		produced[op.Ref()] = true
+		pending[op.Ref()]++
 	}
 
 	var (
 		ordered   = make([]plannedOp, 0, len(ops))
-		done      = map[ObjectRef]bool{}
 		remaining = make([]plannedOp, len(ops))
 	)
 
@@ -617,7 +620,7 @@ func orderByDependency(ops []plannedOp) ([]plannedOp, error) {
 		pick := -1
 
 		for i, op := range remaining {
-			if !dependenciesSatisfied(op.Operation, produced, done) {
+			if !dependenciesSatisfied(op.Operation, pending) {
 				continue
 			}
 
@@ -632,7 +635,7 @@ func orderByDependency(ops []plannedOp) ([]plannedOp, error) {
 
 		chosen := remaining[pick]
 
-		done[chosen.Ref()] = true
+		pending[chosen.Ref()]--
 		ordered = append(ordered, chosen)
 		remaining = append(remaining[:pick], remaining[pick+1:]...)
 	}
@@ -640,15 +643,19 @@ func orderByDependency(ops []plannedOp) ([]plannedOp, error) {
 	return ordered, nil
 }
 
-// dependenciesSatisfied reports whether every dependency of op that the plan
-// actually produces has already been ordered.
-func dependenciesSatisfied(op Operation, produced, done map[ObjectRef]bool) bool {
+// dependenciesSatisfied reports whether every operation the plan holds on each
+// of op's dependencies has already been ordered.
+//
+// Dependencies the plan does not produce are treated as satisfied: a component
+// may declare one on an object another component owns and did not plan this
+// pass, and waiting for it would deadlock.
+func dependenciesSatisfied(op Operation, pending map[ObjectRef]int) bool {
 	for _, dep := range op.DependsOn {
 		if dep == op.Ref() {
 			continue
 		}
 
-		if produced[dep] && !done[dep] {
+		if pending[dep] > 0 {
 			return false
 		}
 	}

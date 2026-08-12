@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -517,7 +518,15 @@ func truncateMessage(message string) string {
 
 	const notice = "\n[truncated; see the operator log and the Events on the " + override.ConfigMapName + " ConfigMap for the rest]"
 
-	return message[:maxStatusMessage-len(notice)] + notice
+	// Cut on a rune boundary. A byte-offset slice can split a multi-byte rune
+	// and produce a status field that is not valid UTF-8, which the API server
+	// rejects.
+	cut := maxStatusMessage - len(notice)
+	for cut > 0 && !utf8.ValidString(message[:cut]) {
+		cut--
+	}
+
+	return message[:cut] + notice
 }
 
 // deferredRefs indexes the objects whose write was deferred to the next pass,
@@ -545,12 +554,23 @@ func deferredRefs(exec component.ExecutionResult) map[component.ObjectRef]bool {
 // An operation dropped because its overrides could not be used is absent from
 // the plan entirely, and so is absent here too, with the same effect.
 func appliedHashes(plan *component.Plan, exec component.ExecutionResult) map[component.ObjectRef]string {
+	// A plan may hold more than one operation on an object, so a ref counts as
+	// written only when every operation on it succeeded. Setting it from any
+	// success and never clearing it would report an applied hash for an object
+	// a later operation failed to finish, which is the divergence this status
+	// exists to surface. unwrittenOverrides already reads it this way.
 	written := map[component.ObjectRef]bool{}
 
 	for _, result := range exec.Results {
 		if result.Status == component.OpSucceeded {
-			written[result.Ref] = true
+			if _, seen := written[result.Ref]; !seen {
+				written[result.Ref] = true
+			}
+
+			continue
 		}
+
+		written[result.Ref] = false
 	}
 
 	out := map[component.ObjectRef]string{}

@@ -332,6 +332,15 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 				continue
 			}
 
+			// The Site was deleted while the pass was running. There is nothing
+			// to write the status to and nothing to retry: its owned objects
+			// are garbage-collected by owner reference.
+			if apierrors.IsNotFound(err) {
+				logger.V(1).Info("site was deleted during the pass", "site", target.Name)
+
+				continue
+			}
+
 			reconcileErrs = append(reconcileErrs, fmt.Errorf("patch site status for %s: %w", target.Name, err))
 
 			continue

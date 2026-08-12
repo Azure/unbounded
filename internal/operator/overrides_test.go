@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 
@@ -1468,5 +1469,53 @@ func TestOverrideStatusDoesNotDegradeOnADeferredWrite(t *testing.T) {
 
 	if status.Phase == unboundedv1alpha3.OverridePhaseDegraded {
 		t.Fatal("a write deferred to the next pass is not a degradation")
+	}
+}
+
+// TestAppliedHashesRequireEveryOperationToSucceed pins that a ref is not
+// reported as written when another operation on the same object failed.
+//
+// The map was set from any success and never cleared, so an object whose later
+// operation failed still reported an applied hash: precisely the divergence
+// this status exists to surface. unwrittenOverrides already read it this way.
+func TestAppliedHashesRequireEveryOperationToSucceed(t *testing.T) {
+	workload := unstructuredOf("apps/v1", "DaemonSet", "node")
+	workload.SetAnnotations(map[string]string{override.HashAnnotation: "deadbeef"})
+
+	ref := component.RefOf(workload)
+
+	plan := component.NewPlan()
+	plan.Add(component.Operation{
+		Kind: component.OpApply, Object: workload, Component: "net", Overridable: true,
+	})
+
+	exec := component.ExecutionResult{Results: []component.OperationResult{
+		{Ref: ref, Kind: component.OpApply, Component: "net", Status: component.OpSucceeded},
+		{Ref: ref, Kind: component.OpMergePatch, Component: "net", Status: component.OpFailed, Err: errors.New("nope")},
+	}}
+
+	if got := appliedHashes(plan, exec)[ref]; got != "" {
+		t.Fatalf("applied hash = %q, want none: a later operation on the object failed", got)
+	}
+}
+
+// TestTruncateMessageCutsOnARuneBoundary pins that a status message stays valid
+// UTF-8. A byte-offset slice can split a multi-byte rune, and the API server
+// rejects a string field that is not valid UTF-8.
+func TestTruncateMessageCutsOnARuneBoundary(t *testing.T) {
+	// Three-byte runes, so almost every byte offset lands mid-rune.
+	message := strings.Repeat("☃", maxStatusMessage)
+
+	got := truncateMessage(message)
+	if !utf8.ValidString(got) {
+		t.Fatal("a truncated message must remain valid UTF-8")
+	}
+
+	if len(got) > maxStatusMessage {
+		t.Fatalf("message is %d bytes, over the %d byte cap", len(got), maxStatusMessage)
+	}
+
+	if !strings.Contains(got, "truncated") {
+		t.Fatal("a truncated message must say so")
 	}
 }
