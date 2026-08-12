@@ -70,6 +70,11 @@ metrics! {
     paxos_learn_stale:       "racer_paxos_learn_stale_total"      ""                           Counter "Learn frames dropped as older than the local value.",
     paxos_seals:             "racer_paxos_seal_total"             ""                           Counter "Shards sealed for handover.",
     paxos_groups_unavailable: "racer_paxos_groups_unavailable"    ""                           Counter "Rounds abandoned because no quorum was reachable.",
+    paxos_gateway_retries:   "racer_gateway_fallback_total"       r#"{reason="retry"}"#        Counter "Cross-zone operations that fell through the gateway ring, by outcome. A retry went on to an answer; unavailable means no gateway of the zone answered.",
+    paxos_zones_unavailable: "racer_gateway_fallback_total"       r#"{reason="unavailable"}"#  Counter "Cross-zone operations that fell through the gateway ring, by outcome.",
+    paxos_warms_sent:        "racer_warm_total"                   r#"{result="sent"}"#         Counter "Cross-zone cache warming frames, by outcome. Sent counts what a commit fanned out, taken what a receiver acted on, dropped what it declined.",
+    paxos_warms_taken:       "racer_warm_total"                   r#"{result="taken"}"#        Counter "Cross-zone cache warming frames, by outcome.",
+    paxos_warms_dropped:     "racer_warm_total"                   r#"{result="dropped"}"#      Counter "Cross-zone cache warming frames, by outcome.",
 
     // anti-entropy
     heal_sweeps:             "racer_heal_sweep_total"             ""                           Counter "Anti-entropy sweeps started.",

@@ -127,6 +127,10 @@ pub(crate) enum Op {
     Ping = 10,
     /// A group's standing promise. Names a group, not a page.
     Term = 11,
+    /// Tell another zone a page it asked to keep warm has a new value, so its cohort
+    /// pulls the page before anyone there reads it. Advisory in both directions: the
+    /// sender does not wait on the result and the receiver may decline.
+    Warm = 12,
 }
 
 impl Op {
@@ -144,6 +148,7 @@ impl Op {
             9 => Op::Seal,
             10 => Op::Ping,
             11 => Op::Term,
+            12 => Op::Warm,
             _ => return None,
         })
     }
@@ -185,6 +190,7 @@ impl Op {
                 | Op::Seal
                 | Op::Ping
                 | Op::Term
+                | Op::Warm
         )
     }
 }
@@ -200,7 +206,7 @@ impl Op {
 /// forward.
 ///
 /// The field holds three; `paxos::Route` grants at most two, enough for a cross-zone
-/// entry node forwarding to a group member whose extent is mid-migration and must
+/// gateway forwarding to a group member whose extent is mid-migration and must
 /// forward again. Two is now also the ceiling: routing is flat inside a universe, and
 /// a frame never leaves the universe it arrived on. A node that must forward with no
 /// budget left answers [`status::STALE`], which sends the originator back to its
@@ -312,7 +318,7 @@ pub(crate) struct Frame {
     /// This generalises `ACCEPT`'s encoding, where zero means "you are the proposer,
     /// pick a ballot". On a `GET` it means "give me the linearizable value", which lets
     /// a node holding neither the extent table nor the catalog for a remote zone still
-    /// take a confirmed read: it hands the whole round to the entry node, where the
+    /// take a confirmed read: it hands the whole round to the gateway, where the
     /// members are.
     ///
     /// The group-addressed ops borrow it for the page class instead; see `heal.rs`.
@@ -449,6 +455,7 @@ impl Frame {
 //   ACCEPT   0 guard     1 ballot   2 topology epoch     (4 KiB only)
 //   TRIM     0 guard     1 ballot   2 topology epoch
 //   LEARN    0 version   1 ballot   2 member holding it  3 repair
+//   WARM     0 version              2 stage
 //   SEAL                 1 term     2 extent
 //   TERM                            2 promised term      (reply)
 //   MERKLE   0..511 digests                              (reply, fills the block)
@@ -456,7 +463,12 @@ impl Frame {
 //   SNAPNEXT 0 count     1 done     then 3 slots per page (reply)
 //
 // `LEARN`'s slot 3 marks a repair rather than a migration push, which also admits the
-// equal-register case: our entry matches but our bytes fail their checksum. `SEAL`
+// equal-register case: our entry matches but our bytes fail their checksum. `WARM`
+// borrows `LEARN`'s shape but not its meaning: it names no ballot and no holder,
+// because the receiver reads the page through the ordinary cross-zone path and takes
+// whatever the owning group agrees on. Its stage says how far the frame has come -
+// zero from the writing zone, one relayed by a gateway to the cohort member that will
+// hold the copy - which is what stops a warm from being relayed forever. `SEAL`
 // names an extent rather than a page, so its address is in the trailer and not in the
 // frame; `TERM` names a group, which is in the frame.
 //
@@ -596,7 +608,7 @@ impl Link {
 mod tests {
     use super::*;
 
-    const ALL: [Op; 12] = [
+    const ALL: [Op; 13] = [
         Op::Get,
         Op::GetMeta,
         Op::Prepare,
@@ -609,6 +621,7 @@ mod tests {
         Op::Seal,
         Op::Ping,
         Op::Term,
+        Op::Warm,
     ];
 
     #[test]
@@ -743,9 +756,9 @@ mod tests {
 
     #[test]
     fn unknown_opcode_is_refused() {
-        // Opcodes 12..31 are unassigned; a peer running a newer build must not be able
+        // Opcodes 13..31 are unassigned; a peer running a newer build must not be able
         // to make us do something by accident.
-        for raw in 12..32u64 {
+        for raw in 13..32u64 {
             let sh = SMALL_OFF_BITS + IMM_BITS + FLAG_BITS;
             assert_eq!(
                 Frame::decode((raw << sh) << SMALL_SHIFT, BLOCK),

@@ -60,8 +60,8 @@ The checked configuration describes:
 
 An address hashes to a fixed slot, which names its consensus group within its
 own universe. Each node has complete group information for its zone in each
-universe it belongs to, and entry nodes for that universe's other zones, rather
-than a global connection graph.
+universe it belongs to, and the gateway list of that universe's other zones,
+rather than a global connection graph.
 
 A universe is also the security boundary. The control plane publishes one fabric
 namespace per universe and attaches it only to that universe's members, so a
@@ -292,10 +292,24 @@ unsupported (`EOPNOTSUPP`), and space (`ENOSPC`); other failures collapse to
 transport `EIO`.
 
 Routing has two tiers, both inside one universe. Local-zone traffic resolves
-directly or through another member; traffic for another zone selects one of that
-zone's three entry nodes by address. A frame has a two-forwarding-hop budget and
-never leaves the universe it arrived on. Relays reuse the same registered data
-buffer.
+directly or through another member; traffic for another zone goes to one of that
+zone's gateways, which holds that zone's catalog and resolves the group itself.
+
+`Zone.gateways` is a list of any length rather than one node per cohort. Which
+gateway a frame takes is a rendezvous hash of the page address, the same
+`rank` the cache places replicas with, so load spreads evenly over the list and
+both ends agree without negotiating. Unlike the cache's ring this one promotes:
+a gateway we hold no link to is skipped and the next in rank order takes its
+place, because any gateway can resolve any address of its zone, so the order is
+load spreading rather than placement and no two nodes need to agree on it. An
+operation that can be retried walks the ring until one gateway answers something
+other than a transport failure, bounded at three tries so a zone that is
+genuinely gone costs three timeouts rather than the length of its list. Every
+zone is assumed reachable from every other, so a frame is never relayed through
+a third zone.
+
+A frame has a two-forwarding-hop budget and never leaves the universe it arrived
+on. Relays reuse the same registered data buffer.
 
 ## Cooperative Cache
 
@@ -323,6 +337,43 @@ sweeping the rest of the cache away, and it is what keeps the hottest key first
 regardless of which extent it came from. Lowering an extent to zero stops
 admission immediately but strands nothing: what is already resident stays until
 it loses a contest, which it will as soon as its estimate decays.
+
+### Warming another zone
+
+`cache_admit` is demand-driven, and demand is a poor guide when the reader is in
+another zone: the first read of a page there is always a miss, and the miss
+costs a fabric crossing. `Extent.warm_zones` names the zones that will read an
+extent, and every commit of one of its pages is followed by an advisory push
+into each of them, so the page is local before anyone asks for it.
+
+Only an immutable extent may name zones here; anything else is refused at
+validation. A warmed copy is served without a confirmation round, because
+confirming it would cost the crossing the warming exists to avoid, and only an
+immutable page carries a version a remote reader can believe on sight: it is a
+function of the extent's tombstone epoch, so a copy either holds the live
+version or is recognisably not the value, and one epoch bump invalidates every
+zone's copies at once with no message. A mutable page has no such self-check.
+
+The push is two-staged. The writing member, having decided the value, spawns a
+detached task that sends one `WARM` per warmed zone through that zone's gateway
+ring. A `WARM` is a control frame carrying the version and which stage it is at;
+it names no ballot and no holder, because the receiver fetches the page itself
+rather than being handed it. The gateway that takes it holds its own zone's
+whole catalog, so it can compute the rendezvous winner of every cohort column,
+which its own cache roster - one column - could not; it forwards a second-stage
+`WARM` to each of those three nodes. Each of them reads the page across the
+fabric once and admits it at width one, which is exactly the width its own
+readers will look at, because the gateway sent it precisely to the node that
+ranking names.
+
+Every step may decline. The fan-out is detached, so a write never waits on
+another zone; it is skipped entirely under shedding; a full task slab drops it;
+a lost frame is not retried. The reader's fallback is the ordinary cross-zone
+read it would have done regardless. A cross-zone read of a warmed extent
+consults the cohort first and crosses the fabric on a miss; for an unwarmed
+extent nothing changes, and the group-confirmation paths are bypassed for a
+foreign address because this node's catalog describes only its own zone and
+would name the wrong three members.
 
 Media comes in 4 MiB chunks carved from the tail. A chunk is the unit of
 everything: what a class is given, what one class takes from the other, and what
@@ -412,7 +463,11 @@ Cache counters carry a `class` label of `small` or `huge`, and
 `racer_cache_unused_bytes` report how the tail is currently divided.
 `racer_cache_reject_total` splits refused admissions by `reason`: `policy` for
 an extent that asked for a higher threshold than the page has reached, `victim`
-for a page that lost the contest to a hotter incumbent. The metrics
+for a page that lost the contest to a hotter incumbent.
+`racer_gateway_fallback_total` counts how often a zone's gateway ring had to
+promote past a gateway (`reason="retry"`) or ran out of them
+(`reason="unavailable"`), and `racer_warm_total` counts warms `sent`, `taken`,
+and `dropped`. The metrics
 server is blocking, handles one HTTP/1.1 connection at a time,
 and exposes unauthenticated plaintext `GET /metrics` with five-second
 socket timeouts.
@@ -443,6 +498,10 @@ Important implementation boundaries are:
 - Empty peer links select quorum one. Promise changes can remain only in memory,
   and observed higher ballot terms are not persisted before a crash.
 - Huge authoritative and all cached data lack data checksums.
+- Warming is advisory in every direction and is never retried. A `WARM` that is
+  dropped, declined under shedding, or refused for want of a task slot leaves
+  the destination zone reading across the fabric, which is what it would have
+  done anyway. Nothing detects that a zone stopped being warmed.
 - The cache takes whatever the slabs did not, so a store sized close to its
   configuration caches almost nothing, and a growth run at the next start takes
   media back from the cache without warning.
@@ -462,9 +521,10 @@ and seeded linearizability checks.
 anti-entropy; `alloc/shard.rs` model-checks the actual allocator transitions.
 Privileged integration tests exercise real ublk with multiple processes,
 reload, intra-zone routing, cache, restart, and wiped-member replay, but skip
-when kernel facilities are absent. Cross-zone routing, production
-migration, NVMe status translation, and real NVMe-oF are not
-covered end to end.
+when kernel facilities are absent. The simulator builds multi-zone clusters, so
+cross-zone routing through the gateway ring, warming, and cross-zone
+linearizability under gateway failure are covered there. Production migration,
+NVMe status translation, and real NVMe-oF are not covered end to end.
 
 Both suites run from `cmd/racer`:
 

@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::alloc::{Allocator, GlobalAddr, Pressure};
-use crate::config::{self, Config};
+use crate::config::{self, Config, rank};
 use crate::layout::{self, Class};
 use crate::paxos::Register;
 use crate::runtime::{self, Buf, Disk, Durability};
@@ -312,12 +312,6 @@ impl Roster {
     fn widest(&self) -> usize {
         self.cohorts.iter().map(|(_, n)| n.len()).max().unwrap_or(0)
     }
-}
-
-/// The rendezvous score. Nesting (`R(k,w) ⊂ R(k,w+1)`) is automatic: the ranking is a
-/// total order independent of `w`, so raising the width only appends.
-fn rank(addr: u64, node: u32) -> u64 {
-    config::mix(addr ^ config::mix(node as u64))
 }
 
 // ---------------------------------------------------------------------------

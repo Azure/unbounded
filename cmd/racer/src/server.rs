@@ -224,6 +224,11 @@ fn sample(d: &Dataplane) {
         paxos_learn_stale: p.learn_stale,
         paxos_seals: p.seals,
         paxos_groups_unavailable: p.groups_unavailable,
+        paxos_gateway_retries: p.gateway_retries,
+        paxos_zones_unavailable: p.zones_unavailable,
+        paxos_warms_sent: p.warms_sent,
+        paxos_warms_taken: p.warms_taken,
+        paxos_warms_dropped: p.warms_dropped,
         heal_sweeps: h.sweeps,
         heal_buckets_diff: h.buckets_diff,
         heal_repairs: h.repairs,
@@ -477,6 +482,7 @@ async fn dispatch(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errn
         fabric::Op::SnapOpen => snap_open(d, universe, f, part, req).await,
         fabric::Op::SnapNext => snap_next(d, universe, f, part, req).await,
         fabric::Op::Term => term(d, universe, f, part, req).await,
+        fabric::Op::Warm => warm(d, universe, f, part, req).await,
     }
 }
 
@@ -485,7 +491,10 @@ async fn dispatch(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errn
 /// Group ops name a group rather than a page and arrive by the sender's choice of link,
 /// so they are always ours. `CACHE_ONLY` is excluded for the same reason: it asks
 /// whoever holds a cached copy, which is a cohort replica and usually not a member of
-/// the group at all.
+/// the group at all. `WARM` is excluded for that reason too: it is addressed to a
+/// gateway of this zone, or to the cohort member that will hold the copy, and neither
+/// is generally a member of the page's group, so relaying it by group would send it
+/// somewhere with nothing to do with caching the page.
 fn routed(d: &Dataplane, universe: u32, f: Frame) -> Result<Option<GlobalAddr>, Errno> {
     use fabric::Op::*;
     match f.op {
@@ -816,6 +825,28 @@ async fn learn(
     d.paxos.learn(addr, r, from, repair).await.map_err(wire)
 }
 
+/// `WARM`: another zone wrote a page this zone asked to keep warm.
+///
+/// Advisory in both directions, so it always succeeds: what the receiver does with it
+/// is its own configuration's business, and the sender has already moved on.
+async fn warm(
+    d: &Dataplane,
+    universe: u32,
+    f: Frame,
+    part: Part,
+    req: Request,
+) -> Result<(), Errno> {
+    if part != Part::Trailer {
+        return Err(status::BAD);
+    }
+    let addr = addr_of(d, universe, f)?;
+    let mut t = PoolBuf::alloc(fabric::BLOCK).await;
+    req.load(0, &mut t)?;
+    let (version, stage) = paxos::warm_trailer(&t);
+    d.paxos.warm(addr, version, stage).await;
+    Ok(())
+}
+
 /// `SEAL`: freeze a shard at its source group. An ordinary accept whose value happens
 /// to be a shard rather than a page.
 async fn seal(d: &Dataplane, universe: u32, part: Part, req: Request) -> Result<(), Errno> {
@@ -1061,7 +1092,7 @@ mod tests {
             group 1 2 3
             group 1 2 3
             group 1 2 3
-            zone id=2 entry=2,3,4
+            zone id=2 gateways=2,3,4
             extent id=1 base=0 pages=4096 kind=lww zone=1
             extent id=2 base=4096 pages=256 kind=occ zone=1
             extent id=3 base=5120 pages=2 kind=immutable_4m zone=1
@@ -1604,7 +1635,7 @@ mod tests {
         // ---- Cross-zone: homed elsewhere, so routed and never resolved here ------
         // Extent 4 lives in zone 2. Our slot table describes our own zone only, so
         // resolving one of its addresses against it would name a group in the wrong
-        // zone; with no link to zone 2's entry nodes there is nowhere to send it.
+        // zone; with no link to zone 2's gateways there is nowhere to send it.
         let away = fabric::Frame::page(fabric::Op::Get, false, AWAY);
         assert_eq!(
             errno(frame_read(&fab, away, 4096).unwrap_err()),
@@ -1653,7 +1684,7 @@ mod tests {
         );
 
         // A shard on its way somewhere forwards instead of refusing, so a client holding
-        // a config from before the flip still gets an answer. Zone 2's entry node is not
+        // a config from before the flip still gets an answer. Zone 2's gateway is not
         // a peer of ours, so the forward fails at the link rather than at the gate —
         // that is the distinction asserted: `EIO` is "routed and unreachable",
         // `EREMOTEIO` is "refused".

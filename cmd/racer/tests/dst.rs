@@ -852,3 +852,218 @@ fn linearizable(seed: u64) {
         }
     }
 }
+
+// ------------------------------------------------------------------------ zones
+
+#[test]
+fn a_second_zone_reads_the_first_zones_pages() {
+    let mut sim = cluster(Options {
+        nodes: 6,
+        zones: 2,
+        pages: 1024,
+        ..Options::default()
+    });
+    put_eventually(&mut sim, 0, 5, 0x5a);
+    for node in 3..6 {
+        assert_page(&mut sim, node, 5, 0x5a);
+    }
+}
+
+/// Frames zone one has been sent from outside it. Zone one owns every extent, so this
+/// is exactly the traffic a consuming zone's reads generate.
+fn crossings_into_home(sim: &Sim) -> u64 {
+    (0..3).map(|n| sim.crossings(n)).sum()
+}
+
+fn two_zones(warm: bool) -> Options {
+    Options {
+        nodes: 6,
+        zones: 2,
+        warm,
+        pages: 256,
+        huge_pages: 4,
+        cache_admit: 1,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn warming_reaches_the_consuming_zone_before_it_reads() {
+    let mut sim = cluster(two_zones(true));
+    put_huge(&mut sim, 0, 1, 0x91);
+    // The warm is detached from the write, so it lands after the client was answered.
+    warm(&mut sim);
+    // One `WARM` reaches zone two's gateway. What it relays from there depends on the
+    // shape of the catalog: the simulator gives every node cohort zero, so all three
+    // cohort columns name the same rendezvous winner and the fan-out collapses to one
+    // holder, which is often the gateway itself.
+    let warmed: u64 = (3..6).map(|n| sim.warms(n)).sum();
+    assert!(warmed >= 1, "the write warmed zone two {warmed} times");
+
+    // Every reader in the consuming zone is served locally or from the one cohort
+    // member the warm placed the page on, so nothing crosses back to zone one.
+    let before = crossings_into_home(&sim);
+    for node in 3..6 {
+        assert_huge_page(&mut sim, node, 1, 0x91);
+    }
+    assert_eq!(
+        crossings_into_home(&sim),
+        before,
+        "a warmed read still crossed to the home zone"
+    );
+}
+
+#[test]
+fn an_unwarmed_page_is_read_across_the_fabric() {
+    // The control for the test above: the same cluster with the extent asking for
+    // nothing keeps working, and pays a crossing for every read.
+    let mut sim = cluster(two_zones(false));
+    put_huge(&mut sim, 0, 1, 0x37);
+    warm(&mut sim);
+    assert_eq!(
+        (3..6).map(|n| sim.warms(n)).sum::<u64>(),
+        0,
+        "an extent that asked for nothing was warmed anyway"
+    );
+
+    let before = crossings_into_home(&sim);
+    for node in 3..6 {
+        assert_huge_page(&mut sim, node, 1, 0x37);
+    }
+    assert!(
+        crossings_into_home(&sim) > before,
+        "an unwarmed cross-zone read never left the zone"
+    );
+}
+
+/// The gate on the gateway ring. Every page is homed in zone one and every client is in
+/// zone two, so every operation is routed through a gateway, while one zone-one node at a
+/// time is down. Each read must still be explainable by some serialisation of the writes.
+///
+/// A gateway is also a consensus member here, so crashing one costs the group a replica
+/// as well as the ring an entry: what survives is a quorum of two reached through
+/// whichever gateway the ring promotes.
+#[test]
+fn a_cross_zone_page_is_linearizable_while_gateways_fail() {
+    const PAGES: u64 = 8;
+    let seed = 0x9a7e;
+    let mut sim = cluster(Options {
+        nodes: 6,
+        zones: 2,
+        pages: 1024,
+        seed,
+        faults: Faults {
+            drop: 40,
+            jitter_us: 400,
+            ..Faults::default()
+        },
+        ..Options::default()
+    });
+    let mut rng = Rng(seed);
+    let mut pages: Vec<Page> = (0..PAGES).map(|_| Page::default()).collect();
+    let mut fill = 1u8;
+    let mut down: Option<usize> = None;
+
+    for round in 0..24 {
+        let mut writes = Vec::new();
+        let mut reads = Vec::new();
+        for lba in 0..PAGES {
+            // Zone two only: nothing here owns a page, so every request crosses.
+            let node = 3 + rng.below(3) as usize;
+            if rng.below(3) == 0 {
+                reads.push((lba, sim.read(node, lba)));
+            } else {
+                fill = fill.wrapping_add(1).max(1);
+                pages[lba as usize].writes.push(fill);
+                writes.push((lba, fill, sim.write(node, lba, fill)));
+            }
+        }
+        let ids: Vec<u64> = writes
+            .iter()
+            .map(|w| w.2)
+            .chain(reads.iter().map(|r| r.1))
+            .collect();
+        // One zone-one node at a time, so a quorum and at least one gateway always
+        // remain. Held for a round or two, since a break that heals at once is never met.
+        if down.is_none() || rng.below(3) == 0 {
+            match down.take() {
+                Some(i) => sim.restart(i).expect("restart"),
+                None => {
+                    let i = rng.below(3) as usize;
+                    sim.crash(i);
+                    down = Some(i);
+                }
+            }
+        }
+        settle_all(&mut sim, &ids);
+
+        for (lba, fill, id) in writes {
+            if sim.result(id).unwrap().is_ok() {
+                let p = &mut pages[lba as usize];
+                let i = p.writes.iter().rposition(|&v| v == fill).unwrap();
+                p.settled = Some(i);
+            }
+        }
+        for (lba, id) in reads {
+            if sim.result(id).unwrap().is_ok() {
+                let got = sim.payload(id).unwrap()[0];
+                let p = &mut pages[lba as usize];
+                assert!(
+                    p.allows(got),
+                    "round {round} page {lba} returned {got:#x}, which no write could explain"
+                );
+                p.observe(got);
+            }
+        }
+    }
+
+    // The run is only evidence if the cluster was actually serving through it.
+    let landed = pages.iter().filter(|p| p.settled.is_some()).count();
+    assert_eq!(
+        landed, PAGES as usize,
+        "only {landed} of {PAGES} pages ever took a write"
+    );
+
+    if let Some(i) = down.take() {
+        sim.restart(i).expect("restart");
+    }
+    sim.faults(Faults::default());
+    warm(&mut sim);
+    warm(&mut sim);
+    for lba in 0..PAGES {
+        if pages[lba as usize].settled.is_none() {
+            continue;
+        }
+        for node in 3..6 {
+            let got = get_eventually(&mut sim, node, lba);
+            assert!(
+                pages[lba as usize].allows(got),
+                "page {lba} holds {got:#x} on node {node}, which no write could explain"
+            );
+        }
+    }
+}
+
+/// Warming is advisory in every direction, so a fabric that loses most of it must not
+/// change what a reader sees — only how far it had to go to see it.
+#[test]
+fn a_warm_that_never_arrives_costs_only_a_crossing() {
+    let mut sim = cluster(Options {
+        faults: Faults {
+            drop: 300,
+            jitter_us: 400,
+            ..Faults::default()
+        },
+        ..two_zones(true)
+    });
+    for page in 0..3u64 {
+        put_huge(&mut sim, 0, page, 0xa0 + page as u8);
+    }
+    sim.faults(Faults::default());
+    warm(&mut sim);
+    for page in 0..3u64 {
+        for node in 3..6 {
+            assert_huge_page(&mut sim, node, page, 0xa0 + page as u8);
+        }
+    }
+}
