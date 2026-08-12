@@ -79,6 +79,19 @@ func membershipMap(universe, zone uint32, members string) *corev1.ConfigMap {
 func zoneMembership(ctx context.Context, t *testing.T, env *component.Env, universe, zone uint32) string {
 	t.Helper()
 
+	return membershipData(ctx, t, env, universe, zone)[racerctrl.MembershipDataKey]
+}
+
+// zoneMembershipEpoch reads the epoch a zone's membership was published at.
+func zoneMembershipEpoch(ctx context.Context, t *testing.T, env *component.Env, universe, zone uint32) string {
+	t.Helper()
+
+	return membershipData(ctx, t, env, universe, zone)[racerctrl.MembershipEpochKey]
+}
+
+func membershipData(ctx context.Context, t *testing.T, env *component.Env, universe, zone uint32) map[string]string {
+	t.Helper()
+
 	found := &corev1.ConfigMap{}
 	key := client.ObjectKey{
 		Namespace: env.Namespace,
@@ -87,13 +100,13 @@ func zoneMembership(ctx context.Context, t *testing.T, env *component.Env, unive
 
 	if err := env.Client.Get(ctx, key, found); err != nil {
 		if apierrors.IsNotFound(err) {
-			return ""
+			return nil
 		}
 
 		t.Fatalf("get membership configmap: %v", err)
 	}
 
-	return found.Data[racerctrl.MembershipDataKey]
+	return found.Data
 }
 
 func racerClass(name string, annotations map[string]string) *storagev1.StorageClass {
@@ -840,6 +853,148 @@ func replacementObjects(seeded string, health map[string]string) []client.Object
 	}
 
 	return objects
+}
+
+// settledObjects is a zone whose published membership is already the one the
+// planner wants, so nothing steps and only the epoch bookkeeping runs.
+func settledObjects(classEpoch string, membership *corev1.ConfigMap) []client.Object {
+	objects := []client.Object{
+		racerClass("fast", map[string]string{
+			racerctrl.UniverseIDAnnotation:  "1",
+			racerctrl.CatalogSizeAnnotation: "3",
+			racerctrl.EpochAnnotation:       classEpoch,
+			racerctrl.NextLBAAnnotation:     "0",
+		}),
+		membership,
+	}
+
+	for i, name := range []string{"n1", "n2", "n3"} {
+		objects = append(objects, enrolledNode(name, "east", map[string]string{
+			racerctrl.NodeIDAnnotation:     formatUint(uint64(i) + 1),
+			racerctrl.NodeZoneAnnotation:   "1",
+			racerctrl.NodeCohortAnnotation: formatUint(uint64(i)),
+			racerctrl.NodeHealthAnnotation: "generation=1",
+		}))
+	}
+
+	return objects
+}
+
+// datedMembershipMap is a membership published with the epoch that names it.
+func datedMembershipMap(universe, zone uint32, members, epoch string) *corev1.ConfigMap {
+	item := membershipMap(universe, zone, members)
+	item.Data[racerctrl.MembershipEpochKey] = epoch
+
+	return item
+}
+
+// A new catalog and the epoch that names it are one write. Publishing the
+// catalog and leaving the epoch to a second write that may never land would
+// leave a configuration the cluster cannot tell apart from the one before it.
+func TestReconcileMembershipPublishesTheEpochWithTheMembership(t *testing.T) {
+	ctx := context.Background()
+
+	env := testEnv(t, replacementObjects("1?cohort=0,2?cohort=1,3?cohort=2", nil)...)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileMembership(ctx); err != nil {
+		t.Fatalf("reconcile membership: %v", err)
+	}
+
+	if got := zoneMembership(ctx, t, env, 1, 1); !strings.Contains(got, "4?cohort=0") {
+		t.Fatalf("membership is %q, want node 4 to have taken the slot", got)
+	}
+
+	if got := zoneMembershipEpoch(ctx, t, env, 1, 1); got != "2" {
+		t.Fatalf("membership was published at epoch %q, want 2", got)
+	}
+
+	class := &storagev1.StorageClass{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: "fast"}, class); err != nil {
+		t.Fatalf("get class: %v", err)
+	}
+
+	if got := class.Annotations[racerctrl.EpochAnnotation]; got != "2" {
+		t.Fatalf("epoch cursor is %q, want the 2 it handed out", got)
+	}
+}
+
+// The cursor moves after the catalog, so a crash in between leaves a catalog
+// dated ahead of the class. The catalog is the published one and the nodes are
+// already running it, so the cursor catches up rather than the catalog being
+// rewritten: a cursor that lagged would hand the same epoch out twice.
+func TestReconcileMembershipRecoversALostEpochCursor(t *testing.T) {
+	ctx := context.Background()
+
+	const seeded = "1?cohort=0,2?cohort=1,3?cohort=2"
+
+	env := testEnv(t, settledObjects("1", datedMembershipMap(1, 1, seeded, "2"))...)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileMembership(ctx); err != nil {
+		t.Fatalf("reconcile membership: %v", err)
+	}
+
+	class := &storagev1.StorageClass{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: "fast"}, class); err != nil {
+		t.Fatalf("get class: %v", err)
+	}
+
+	if got := class.Annotations[racerctrl.EpochAnnotation]; got != "2" {
+		t.Fatalf("epoch cursor is %q, want it caught up to the published 2", got)
+	}
+
+	if got := zoneMembership(ctx, t, env, 1, 1); got != seeded {
+		t.Fatalf("membership became %q, want the published catalog left alone", got)
+	}
+
+	if got := zoneMembershipEpoch(ctx, t, env, 1, 1); got != "2" {
+		t.Fatalf("membership epoch became %q, want the 2 it was published at", got)
+	}
+}
+
+// A membership written before the epoch travelled with it is stamped with the
+// class's epoch, which is the epoch the nodes reading it are already running.
+func TestReconcileMembershipDatesAnUndatedMembership(t *testing.T) {
+	ctx := context.Background()
+
+	const seeded = "1?cohort=0,2?cohort=1,3?cohort=2"
+
+	env := testEnv(t, settledObjects("4", membershipMap(1, 1, seeded))...)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileMembership(ctx); err != nil {
+		t.Fatalf("reconcile membership: %v", err)
+	}
+
+	if got := zoneMembershipEpoch(ctx, t, env, 1, 1); got != "4" {
+		t.Fatalf("membership epoch is %q, want the class's 4", got)
+	}
+
+	if got := zoneMembership(ctx, t, env, 1, 1); got != seeded {
+		t.Fatalf("membership became %q, want stamping to change nothing else", got)
+	}
+
+	class := &storagev1.StorageClass{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: "fast"}, class); err != nil {
+		t.Fatalf("get class: %v", err)
+	}
+
+	if got := class.Annotations[racerctrl.EpochAnnotation]; got != "4" {
+		t.Fatalf("epoch cursor moved to %q, want stamping to spend no epoch", got)
+	}
 }
 
 func TestReconcileStateReportsBlockedGatesAsNotReady(t *testing.T) {

@@ -133,7 +133,19 @@ func buildUniverseStates(
 			continue
 		}
 
+		// The epoch rides in the same object as the catalog, so this node runs
+		// the catalog it just read at the epoch that catalog was published at,
+		// never at one some other zone's change happened to bump.
+		epoch, err := racerctrl.ParseMembershipEpoch(membership.Data)
+		if err != nil {
+			log.Warn("ignoring unreadable membership",
+				"configMap", membership.Name, "error", err)
+
+			continue
+		}
+
 		universe.Members[zone] = members
+		universe.MemberEpochs[zone] = epoch
 	}
 
 	for _, volume := range volumes {

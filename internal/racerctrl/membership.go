@@ -27,6 +27,23 @@ const (
 	// the same `<nodeID>?cohort=<c>` form the annotation used.
 	MembershipDataKey = "members"
 
+	// MembershipEpochKey is the ConfigMap key holding the universe topology
+	// epoch this membership was published at.
+	//
+	// The epoch orders configurations, so a catalog and the epoch that names it
+	// have to change together. They cannot both live on the StorageClass (a
+	// zone's membership does not fit in an annotation) and Kubernetes has no
+	// transaction across two objects, so the epoch travels with the membership
+	// instead: one ConfigMap write publishes both, and a reader can never see a
+	// new catalog carrying the epoch of the old one.
+	//
+	// The class's own epoch annotation is then a cursor rather than a value the
+	// nodes consume: it is the highest epoch handed out, which is what the next
+	// step increments. A membership without this key is from before the epoch
+	// moved here; the operator stamps it with the class's epoch, which is the
+	// value those nodes were already using.
+	MembershipEpochKey = "epoch"
+
 	// MembershipUniverseLabel carries the universe id, so the operator can list
 	// a universe's membership maps without knowing which zones exist.
 	MembershipUniverseLabel = AnnotationDomain + "universe-id"
@@ -74,4 +91,21 @@ func ParseMembershipLabels(labels map[string]string) (universe, zone uint32, ok 
 	}
 
 	return universe, zone, true
+}
+
+// ParseMembershipEpoch reads the topology epoch a membership was published at.
+// Zero means the ConfigMap predates the epoch moving here, and the caller falls
+// back to the universe's class annotation.
+func ParseMembershipEpoch(data map[string]string) (uint32, error) {
+	raw := data[MembershipEpochKey]
+	if raw == "" {
+		return 0, nil
+	}
+
+	epoch, err := ParseUint32(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", MembershipEpochKey, err)
+	}
+
+	return epoch, nil
 }

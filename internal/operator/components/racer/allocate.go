@@ -305,11 +305,67 @@ func (p *pass) reconcileMembership(ctx context.Context) error {
 			continue
 		}
 
+		if err := p.reconcileMembershipEpochs(ctx, view); err != nil {
+			return err
+		}
+
 		for _, zone := range p.zones() {
 			if err := p.reconcileZoneMembership(ctx, view, zone, states); err != nil {
 				return err
 			}
 		}
+	}
+
+	return nil
+}
+
+// reconcileMembershipEpochs repairs the relationship between a universe's epoch
+// cursor and the epochs its published memberships carry.
+//
+// A step publishes the membership first and moves the cursor second, so a crash
+// between the two leaves a catalog dated ahead of the class. The catalog is the
+// published one and nodes are already running it, so the repair is to move the
+// cursor up to it rather than to rewrite the catalog: the cursor's only job is
+// to say which epochs have been handed out, and one that lags would hand the
+// same epoch to a second zone.
+//
+// A membership with no epoch at all predates the epoch travelling with it. It is
+// stamped with the cursor, which is the epoch the nodes reading it are already
+// running, so the stamp changes nothing about the configuration.
+func (p *pass) reconcileMembershipEpochs(ctx context.Context, view *universeView) error {
+	highest := view.state.Epoch
+
+	for _, epoch := range view.state.MemberEpochs {
+		if epoch > highest {
+			highest = epoch
+		}
+	}
+
+	if highest > view.state.Epoch {
+		err := p.patchClass(ctx, view, map[string]string{
+			racerctrl.EpochAnnotation: formatUint(uint64(highest)),
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	if view.state.Epoch == 0 {
+		// The universe has not been allocated an epoch yet, so there is nothing
+		// to stamp a legacy membership with.
+		return nil
+	}
+
+	for zone, members := range view.state.Members {
+		if view.state.MemberEpochs[zone] != 0 {
+			continue
+		}
+
+		if err := p.writeMembership(ctx, view.state.ID, zone, members, view.state.Epoch); err != nil {
+			return err
+		}
+
+		view.state.MemberEpochs[zone] = view.state.Epoch
 	}
 
 	return nil
@@ -338,20 +394,25 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 		return p.reconcileGateways(ctx, view, zone, current)
 	}
 
-	// The membership itself goes in the zone's own ConfigMap; only the epoch is
-	// on the class. Every membership change is a new configuration of the
-	// universe, and the epoch is what orders those configurations. It moves
-	// with the membership rather than on its own schedule so a node can tell a
-	// stale catalog from a current one without comparing the catalogs
-	// themselves.
-	if err := p.writeMembership(ctx, view.state.ID, zone, step.Next); err != nil {
+	// The membership itself goes in the zone's own ConfigMap; only the epoch
+	// cursor is on the class. Every membership change is a new configuration of
+	// the universe, and the epoch is what orders those configurations, so the
+	// new epoch is written with the new catalog in a single object update. The
+	// cursor moves afterwards to record that this epoch has been handed out; if
+	// that write is lost, reconcileMembershipEpochs catches the cursor up on the
+	// next pass rather than leaving the catalog stranded at an epoch the
+	// universe does not know it has spent.
+	epoch := view.state.Epoch + 1
+
+	if err := p.writeMembership(ctx, view.state.ID, zone, step.Next, epoch); err != nil {
 		return err
 	}
 
 	view.state.Members[zone] = step.Next
+	view.state.MemberEpochs[zone] = epoch
 
 	err = p.patchClass(ctx, view, map[string]string{
-		racerctrl.EpochAnnotation: formatUint(uint64(view.state.Epoch) + 1),
+		racerctrl.EpochAnnotation: formatUint(uint64(epoch)),
 	})
 	if err != nil {
 		return err

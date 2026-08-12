@@ -165,15 +165,25 @@ func (p *pass) loadMemberships(ctx context.Context) error {
 	return nil
 }
 
-// writeMembership publishes a zone's membership, creating the ConfigMap the
-// first time the zone gets a catalog.
-func (p *pass) writeMembership(ctx context.Context, universe, zone uint32, members racerctrl.Membership) error {
+// writeMembership publishes a zone's membership together with the topology
+// epoch that names it, creating the ConfigMap the first time the zone gets a
+// catalog.
+//
+// The two go in one object because they have to change together and Kubernetes
+// has no transaction spanning two. A catalog published by itself, with the
+// epoch left to a second write that may never happen, is a configuration the
+// cluster cannot tell apart from the one before it.
+func (p *pass) writeMembership(ctx context.Context, universe, zone uint32, members racerctrl.Membership, epoch uint32) error {
 	key := membershipKey{universe: universe, zone: zone}
 
-	desired := racerctrl.FormatMembership(members)
+	desired := map[string]string{
+		racerctrl.MembershipDataKey:  racerctrl.FormatMembership(members),
+		racerctrl.MembershipEpochKey: formatUint(uint64(epoch)),
+	}
 
 	if item, ok := p.memberships[key]; ok {
-		if item.Data[racerctrl.MembershipDataKey] == desired {
+		if item.Data[racerctrl.MembershipDataKey] == desired[racerctrl.MembershipDataKey] &&
+			item.Data[racerctrl.MembershipEpochKey] == desired[racerctrl.MembershipEpochKey] {
 			return nil
 		}
 
@@ -182,7 +192,9 @@ func (p *pass) writeMembership(ctx context.Context, universe, zone uint32, membe
 			updated.Data = map[string]string{}
 		}
 
-		updated.Data[racerctrl.MembershipDataKey] = desired
+		for name, value := range desired {
+			updated.Data[name] = value
+		}
 
 		if err := p.env.Client.Update(ctx, updated); err != nil {
 			return fmt.Errorf("update %s/%s: %w", updated.Namespace, updated.Name, err)
@@ -199,7 +211,7 @@ func (p *pass) writeMembership(ctx context.Context, universe, zone uint32, membe
 			Name:      racerctrl.MembershipConfigMapName(universe, zone),
 			Labels:    racerctrl.MembershipLabels(universe, zone),
 		},
-		Data: map[string]string{racerctrl.MembershipDataKey: desired},
+		Data: desired,
 	}
 
 	if err := p.env.Client.Create(ctx, item); err != nil {
@@ -287,7 +299,13 @@ func (p *pass) loadUniverses(ctx context.Context) error {
 				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
 			}
 
+			epoch, err := racerctrl.ParseMembershipEpoch(item.Data)
+			if err != nil {
+				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
+			}
+
 			view.state.Members[key.zone] = members
+			view.state.MemberEpochs[key.zone] = epoch
 		}
 	}
 
@@ -531,7 +549,8 @@ func (p *pass) patchClass(ctx context.Context, view *universeView, annotations m
 	view.state.Gateways = state.Gateways
 
 	// Members is deliberately not copied: it was joined in from the per-zone
-	// ConfigMaps and the class's annotations no longer carry it.
+	// ConfigMaps and the class's annotations no longer carry it. Neither are
+	// MemberEpochs, which come from the same maps.
 
 	return nil
 }

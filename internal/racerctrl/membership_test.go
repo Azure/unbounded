@@ -57,3 +57,24 @@ func TestParseMembershipLabelsRejectsOtherConfigMaps(t *testing.T) {
 		})
 	}
 }
+
+func TestParseMembershipEpoch(t *testing.T) {
+	epoch, err := ParseMembershipEpoch(map[string]string{MembershipEpochKey: "12"})
+	if err != nil {
+		t.Fatalf("parse epoch: %v", err)
+	}
+
+	if epoch != 12 {
+		t.Fatalf("epoch %d, want 12", epoch)
+	}
+
+	// A map written before the epoch travelled with the membership reads as
+	// zero, which is what tells the caller to fall back to the class.
+	if epoch, err := ParseMembershipEpoch(map[string]string{MembershipDataKey: "1"}); err != nil || epoch != 0 {
+		t.Fatalf("undated membership read as %d (%v), want 0 and no error", epoch, err)
+	}
+
+	if _, err := ParseMembershipEpoch(map[string]string{MembershipEpochKey: "later"}); err == nil {
+		t.Fatal("an unparseable epoch was accepted")
+	}
+}

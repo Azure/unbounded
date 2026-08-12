@@ -402,9 +402,10 @@ func ParseLive(raw string) (map[uint32]LiveExtent, error) {
 // The universe id is zero on a class the operator has not yet admitted.
 func ParseUniverseState(class string, annotations map[string]string) (UniverseState, error) {
 	state := UniverseState{
-		Class:    class,
-		Members:  map[uint32]Membership{},
-		Gateways: map[uint32][]uint32{},
+		Class:        class,
+		Members:      map[uint32]Membership{},
+		MemberEpochs: map[uint32]uint32{},
+		Gateways:     map[uint32][]uint32{},
 	}
 
 	var err error

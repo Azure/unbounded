@@ -4,7 +4,13 @@
 package node
 
 import (
+	"io"
+	"log/slog"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/Azure/unbounded/internal/racerctrl"
 )
@@ -76,5 +82,58 @@ func TestTransportTo(t *testing.T) {
 				t.Fatalf("selected %s %s, want %s %s", trtype, addr, test.trtype, test.addr)
 			}
 		})
+	}
+}
+
+// The catalog and the epoch that names it are published in one ConfigMap, so a
+// node reads them together and never pairs a new catalog with the old epoch.
+func TestBuildClusterStateDatesAMembership(t *testing.T) {
+	class := &storagev1.StorageClass{
+		ObjectMeta:  metav1.ObjectMeta{Name: "fast"},
+		Provisioner: racerctrl.DriverName,
+	}
+	class.Annotations = map[string]string{
+		racerctrl.UniverseIDAnnotation:  "1",
+		racerctrl.CatalogSizeAnnotation: "3",
+		racerctrl.EpochAnnotation:       "4",
+	}
+
+	membership := func(zone uint32, data map[string]string) *corev1.ConfigMap {
+		return &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   racerctrl.MembershipConfigMapName(1, zone),
+				Labels: racerctrl.MembershipLabels(1, zone),
+			},
+			Data: data,
+		}
+	}
+
+	state := BuildClusterState(nil,
+		[]*storagev1.StorageClass{class},
+		nil,
+		[]*corev1.ConfigMap{
+			membership(1, map[string]string{
+				racerctrl.MembershipDataKey:  "1?cohort=0,2?cohort=1,3?cohort=2",
+				racerctrl.MembershipEpochKey: "7",
+			}),
+			// Written before the epoch travelled with the membership.
+			membership(2, map[string]string{
+				racerctrl.MembershipDataKey: "4?cohort=0,5?cohort=1,6?cohort=2",
+			}),
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if len(state.Universes) != 1 {
+		t.Fatalf("expected one universe, got %d", len(state.Universes))
+	}
+
+	universe := &state.Universes[0]
+
+	if got := universe.EpochFor(1); got != 7 {
+		t.Fatalf("zone 1 runs at epoch %d, want the 7 its catalog was published with", got)
+	}
+
+	if got := universe.EpochFor(2); got != 4 {
+		t.Fatalf("an undated membership runs at epoch %d, want the class's 4", got)
 	}
 }

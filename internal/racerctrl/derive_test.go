@@ -143,6 +143,36 @@ func TestDeriveRejectsADeviceForAnUnknownVolume(t *testing.T) {
 	require.Error(t, err)
 }
 
+// The epoch has to be the one the catalog was published with. Taking it from the
+// class would let a node run a catalog under an epoch that was bumped for some
+// other zone, and then run the next catalog under that same epoch.
+func TestDeriveTakesTheEpochFromTheZoneMembership(t *testing.T) {
+	d := attachedDerivation()
+	d.Cluster.Universes[0].MemberEpochs = map[uint32]uint32{1: 9}
+
+	cfg, err := Derive(d)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(9), cfg.GetUniverses()[0].GetEpoch(),
+		"the epoch published with the catalog is the epoch the catalog runs at")
+}
+
+// A membership written before the epoch travelled with it dates from whatever
+// the class said, so that is what those nodes keep running until the operator
+// stamps the map.
+func TestEpochForFallsBackToTheClassEpoch(t *testing.T) {
+	state := UniverseState{
+		Epoch:        4,
+		MemberEpochs: map[uint32]uint32{2: 7},
+	}
+
+	assert.Equal(t, uint32(7), state.EpochFor(2))
+	assert.Equal(t, uint32(4), state.EpochFor(1), "a zone with no dated membership uses the class epoch")
+
+	undated := UniverseState{Epoch: 4}
+	assert.Equal(t, uint32(4), undated.EpochFor(1))
+}
+
 // bootstrapDerivation is a three node zone with one volume where nothing has
 // been attached yet, which is what every node sees on a cold cluster.
 func bootstrapDerivation() Derivation {

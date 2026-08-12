@@ -164,12 +164,35 @@ type UniverseState struct {
 	// in one object.
 	Members map[uint32]Membership
 
+	// MemberEpochs is the topology epoch each zone's membership was published
+	// at, keyed by zone id, taken from the same ConfigMap as the membership
+	// itself. A zone with no entry has no published membership, or one from
+	// before the epoch travelled with it; either way Epoch stands in.
+	MemberEpochs map[uint32]uint32
+
 	// Gateways is each zone's gateway node ids, keyed by zone id. A zone with no
 	// entry falls back to its membership.
 	Gateways map[uint32][]uint32
 
 	// Volumes are the universe's volumes.
 	Volumes []VolumeState
+}
+
+// EpochFor is the topology epoch a node in the given zone runs this universe
+// at: the epoch published alongside that zone's catalog, or the class's epoch
+// when the zone has no membership of its own to date it.
+//
+// The epoch has to come from wherever the catalog came from. Taking it from the
+// class instead would let a node pair a catalog it has just read with an epoch
+// that was bumped for a different zone's change, and then read the next catalog
+// under that same epoch: two topologies, one term, which is exactly what the
+// epoch exists to prevent.
+func (s *UniverseState) EpochFor(zone uint32) uint32 {
+	if epoch := s.MemberEpochs[zone]; epoch != 0 {
+		return epoch
+	}
+
+	return s.Epoch
 }
 
 // ClusterState is everything the operator has published, as any node sees it.
@@ -416,7 +439,7 @@ func (d *Derivation) deriveUniverse(state *UniverseState, fabricIDs map[uint32]u
 
 	return &racerconfig.Universe{
 		Id:             state.ID,
-		Epoch:          state.Epoch,
+		Epoch:          state.EpochFor(d.Self.Zone),
 		Catalog:        catalog,
 		Zones:          zones,
 		Peers:          d.derivePeers(state, catalog, zones),
