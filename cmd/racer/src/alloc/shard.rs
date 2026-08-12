@@ -1284,6 +1284,88 @@ pub(super) fn rebuild(
     (shards, quarantined)
 }
 
+// ------------------------------------------------------------- invariants, for the sim
+
+/// What the model proves exhaustively over a tiny geometry, checked instead against a
+/// running node's real slabs.
+///
+/// The model can only afford a handful of slots and a handful of steps. A simulated
+/// cluster runs the same code over the real geometry for millions of virtual
+/// microseconds, so the same properties are worth restating where they can be sampled
+/// after every action a fuzzer takes.
+#[cfg(feature = "sim")]
+impl Shard {
+    pub(crate) fn invariants(&self) -> Result<(), String> {
+        for (c, sl) in self.slabs.iter().enumerate() {
+            let class = if c == 0 { "small" } else { "huge" };
+            // A slot is free or occupied, never both and never twice.
+            let mut seen = vec![false; sl.entries.len()];
+            for &l in sl.free.iter() {
+                let l = l as usize;
+                if l >= seen.len() {
+                    return Err(format!("{class}: free slot {l} is out of range"));
+                }
+                if seen[l] {
+                    return Err(format!("{class}: slot {l} is free twice"));
+                }
+                if sl.entries[l].addr != 0 {
+                    return Err(format!("{class}: slot {l} is free but holds an address"));
+                }
+                seen[l] = true;
+            }
+            // A lent slot is out on loan, which is not the same as being free to hand to
+            // a write. Counting one as both would hand the same page to two owners.
+            for l in sl.lent.iter() {
+                let Some(l) = sl.local_of(*l) else {
+                    return Err(format!("{class}: lent slot {l} is not in this stripe"));
+                };
+                if seen[l as usize] {
+                    return Err(format!("{class}: slot {l} is both free and lent"));
+                }
+            }
+            // Reads go through the index, so an index key naming a slot that holds some
+            // other address is a page served as another page.
+            for &(k, v) in sl.index.slots.iter() {
+                if k == 0 {
+                    continue;
+                }
+                if let Some(l) = sl.local_of(v)
+                    && sl.entries[l as usize].addr != k
+                {
+                    return Err(format!(
+                        "{class}: the index sends {k:#x} to a slot holding {:#x}",
+                        sl.entries[l as usize].addr
+                    ));
+                }
+            }
+            // A live entry with no version was never accepted by anyone.
+            for e in sl.entries.iter() {
+                if e.addr != 0 && e.state == State::Live && e.version == 0 {
+                    return Err(format!("{class}: {:#x} is live at version 0", e.addr));
+                }
+            }
+            // The census is what capacity and pressure are answered from, so a census
+            // that has drifted from the slab is a wrong answer to every sizing question.
+            let held = sl
+                .entries
+                .iter()
+                .filter(|e| e.addr != 0 && e.state != State::Empty)
+                .count() as u64;
+            let counted: u64 = sl
+                .census
+                .iter()
+                .map(|&(_, live, tomb)| (live + tomb) as u64)
+                .sum();
+            if counted != held {
+                return Err(format!(
+                    "{class}: the census counts {counted} entries, the slab holds {held}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 // ------------------------------------------------------- comparability, for the model
 
 /// `stateright` has to clone, compare and hash whatever it explores, and the types above

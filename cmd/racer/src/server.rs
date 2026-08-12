@@ -75,6 +75,19 @@ impl Dataplane {
     pub fn quarantined(&self) -> usize {
         self.alloc().quarantined
     }
+
+    /// What must hold of this node's internal state whatever has been done to it. The
+    /// simulator samples this after every action; nothing else calls it.
+    #[cfg(feature = "sim")]
+    pub fn invariants(&self) -> Result<(), String> {
+        self.alloc().invariants()
+    }
+
+    /// Pages part-way through arriving from the fabric.
+    #[cfg(feature = "sim")]
+    pub fn assemblies(&self) -> usize {
+        self.alloc().assemblies()
+    }
 }
 
 /// The consensus layer, and through it the allocator, for one node.

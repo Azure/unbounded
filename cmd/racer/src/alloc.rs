@@ -1127,7 +1127,7 @@ impl Allocator {
         let class = class_of(huge);
         let core = self.owner_of(group, class);
         runtime::on_core(core, move || async move {
-            let now = Instant::now();
+            let now = runtime::now();
             self.shard(runtime::core())
                 .snap_start(class, core, huge, group, filter, now)
                 .ok_or(Status::NoSpace)
@@ -1150,7 +1150,7 @@ impl Allocator {
         }
         let class = class_of(huge);
         runtime::on_core(core, move || async move {
-            let now = Instant::now();
+            let now = runtime::now();
             maps!(self.config(), m);
             self.shard(runtime::core())
                 .snap_next(class, id, seq, universe, &m, now)
@@ -1427,6 +1427,60 @@ fn scan_range(
         at += n;
     }
     Ok(out)
+}
+
+// --- Invariants, for the sim ---
+
+/// What must be true of the allocator between actions, whatever the fabric is doing to
+/// it. Sampled by the simulator after every step a fuzzer takes, so a violation is
+/// caught at the action that caused it rather than at the read that eventually noticed.
+#[cfg(feature = "sim")]
+impl Allocator {
+    pub(crate) fn invariants(&self) -> Result<(), String> {
+        for (i, c) in self.shards.iter().enumerate() {
+            // A borrow held here means a worker is mid-mutation, which only happens if
+            // this was called from inside the runtime. Say so rather than panicking.
+            let Ok(c) = c.try_borrow() else {
+                return Err(format!("core {i}: the shard is borrowed"));
+            };
+            c.shard.invariants().map_err(|e| format!("core {i}: {e}"))?;
+            if c.parts.len() > HUGE_PARTS {
+                return Err(format!(
+                    "core {i}: {} assemblies, past the {HUGE_PARTS} the table holds",
+                    c.parts.len()
+                ));
+            }
+            for (j, p) in c.parts.iter().enumerate() {
+                if p.blocks > HUGE_BLOCKS {
+                    return Err(format!(
+                        "core {i}: assembly {j} claims {} blocks of a {HUGE_BLOCKS} block page",
+                        p.blocks
+                    ));
+                }
+                // Two commands for one address may be in flight at once, but never two
+                // for the same command: their pieces would land in each other's slot.
+                if c.parts[..j]
+                    .iter()
+                    .any(|q| q.addr == p.addr && q.key == p.key)
+                {
+                    return Err(format!(
+                        "core {i}: two assemblies for {:#x} under one command",
+                        p.addr.0
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pages part-way through arriving. A reservation outlives the command that opened it
+    /// only until the assembly is evicted, so a cluster left to settle holds none.
+    pub(crate) fn assemblies(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|c| c.try_borrow().map(|c| c.parts.len()).unwrap_or(0))
+            .sum()
+    }
 }
 
 // --- Tests ---
