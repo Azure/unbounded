@@ -68,12 +68,18 @@ data:
     overrides:
       # Always add arguments with extraArgs. A patch that sets `args` replaces
       # the whole list, dropping every argument the operator injected and never
-      # picking up new ones on upgrade. metalman would stop starting entirely,
-      # because its args begin with the `serve-pxe` subcommand.
-      - component: machina
+      # picking up new ones on upgrade. metalman makes that concrete: its args
+      # begin with the `serve-pxe` subcommand, so a replacing patch stops the
+      # container starting at all.
+      #
+      # The operator cannot tell whether a component accepts a flag. These
+      # components exit non-zero on an unrecognised one, so a typo here is a
+      # CrashLoopBackOff rather than a validation error. Check the component's
+      # --help before adding anything.
+      - component: metalman
         kind: Deployment
         extraArgs:
-          machina-controller: ["--max-concurrent-reconciles=20"]
+          metalman: ["--operation-max-concurrent-machines=20"]
 
   sidecar.yaml: |
     apiVersion: overrides.unbounded-cloud.io/v1alpha1

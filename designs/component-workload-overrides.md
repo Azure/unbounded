@@ -528,8 +528,6 @@ overrides:
   - component: storage
     kind: DaemonSet
     sites: [edge-west, edge-east]
-    extraArgs:
-      run: ["--verbose"]
     patch:
       spec:
         template:
@@ -713,11 +711,18 @@ to a list of arguments, appended to that container's `args` **after** the patch
 merges:
 
 ```yaml
-- component: machina
+- component: metalman
   kind: Deployment
   extraArgs:
-    machina-controller: ["--max-concurrent-reconciles=20"]
+    metalman: ["--operation-max-concurrent-machines=20"]
 ```
+
+Nothing validates that the component accepts the flag. The operator knows
+nothing about any component's command line, and every one of them exits
+non-zero on an unrecognised flag, so a wrong flag here is a `CrashLoopBackOff`
+rather than a rejected document. This is documented rather than enforced for
+the same reason `dhcpAutoInterface` is: enforcing it would mean the operator
+understanding each component's flag semantics.
 
 Precedence is defined and documented: if an entry sets both `patch` (replacing
 `args`) and `extraArgs` for the same container, the result is the replaced list

@@ -116,11 +116,18 @@ its arguments begin with the `serve-pxe` subcommand, so a replacing patch stops
 the container starting at all.
 
 ```yaml
-      - component: machina
+      - component: metalman
         kind: Deployment
         extraArgs:
-          machina-controller: ["--max-concurrent-reconciles=20"]
+          metalman: ["--operation-max-concurrent-machines=20"]
 ```
+
+**The operator cannot check that a component accepts a flag.** It knows nothing
+about any component's command line, and these components exit non-zero on an
+unrecognised flag, so a typo here is a `CrashLoopBackOff` rather than a
+validation error. Check the component's `--help` before adding anything, and
+note that a setting exposed in a component's config file is often not exposed as
+a flag at all.
 
 `extraArgs` appends after any patch, so if you do both, the result is the
 replaced list followed by the appended arguments.

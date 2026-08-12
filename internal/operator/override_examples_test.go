@@ -13,24 +13,114 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/yaml"
 
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
 	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
+	"github.com/Azure/unbounded/internal/metalman/commands"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
 
 // componentManifests maps a component name to the manifest set it renders from.
+//
+// metalman is deliberately absent. Its Deployment is built in Go rather than
+// decoded from a manifest, and pointing it at the machina manifest set (which
+// is where its RBAC ships) resolved its container names against the machina
+// controller instead: the map claimed metalman's container was
+// machina-controller. See componentContainerNames.
 var componentManifests = map[string]fs.FS{
-	"net":      netmanifests.Manifests,
-	"machina":  machinamanifests.Manifests,
-	"gantry":   gantrymanifests.Manifests,
-	"metalman": machinamanifests.Manifests,
-	"storage":  storagemanifests.Manifests,
+	"net":     netmanifests.Manifests,
+	"machina": machinamanifests.Manifests,
+	"gantry":  gantrymanifests.Manifests,
+	"storage": storagemanifests.Manifests,
+}
+
+// componentContainerNames returns the container names an example may refer to
+// for a component, taken from what that component actually plans.
+//
+// Most components decode their workloads from embedded manifests, so reading
+// the manifests is reading the truth. metalman constructs its Deployment in Go,
+// so the only honest source is the component itself.
+func componentContainerNames(t *testing.T, componentName, kind string) map[string]bool {
+	t.Helper()
+
+	if componentName == "metalman" {
+		return metalmanContainerNames(t)
+	}
+
+	manifests, known := componentManifests[componentName]
+	if !known {
+		t.Fatalf("example targets unknown component %q", componentName)
+	}
+
+	return manifestContainerNames(t, manifests, kind)
+}
+
+// metalmanContainerNames plans the metalman component and reads the container
+// names off the Deployment it produces. Planning needs no client: it decodes
+// the shared RBAC from the machina manifests and builds the Deployment from the
+// Site.
+func metalmanContainerNames(t *testing.T) map[string]bool {
+	t.Helper()
+
+	enabled := true
+	site := &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", UID: "example-uid"},
+		Spec: unboundedv1alpha3.SiteSpec{
+			Components: unboundedv1alpha3.SiteComponents{
+				Metalman: &unboundedv1alpha3.MetalmanComponentSpec{
+					SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &enabled},
+				},
+			},
+		},
+	}
+
+	env := &component.Env{Namespace: component.DefaultNamespace}
+
+	plan, _, err := metalman.New().Plan(t.Context(), env, site)
+	if err != nil {
+		t.Fatalf("plan metalman: %v", err)
+	}
+
+	names := map[string]bool{}
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() != "Deployment" {
+			continue
+		}
+
+		for _, field := range []string{"containers", "initContainers"} {
+			containers, _, err := unstructured.NestedSlice(op.Object.Object, "spec", "template", "spec", field)
+			if err != nil {
+				t.Fatalf("read metalman %s: %v", field, err)
+			}
+
+			for _, raw := range containers {
+				container, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				if name, ok := container["name"].(string); ok && name != "" {
+					names[name] = true
+				}
+			}
+		}
+	}
+
+	if len(names) == 0 {
+		t.Fatal("metalman planned no containers; the resolver is broken")
+	}
+
+	return names
 }
 
 // TestDocumentedOverrideExamplesResolve validates every override example the
@@ -52,17 +142,22 @@ func TestDocumentedOverrideExamplesResolve(t *testing.T) {
 
 	for _, example := range examples {
 		t.Run(example.source, func(t *testing.T) {
-			entries, err := override.Parse(map[string]string{example.source: example.document})
+			entries, problems, err := override.Parse(map[string]string{example.source: example.document})
 			if err != nil {
 				t.Fatalf("example does not parse: %v", err)
 			}
 
-			if err := override.Validate(entries); err != nil {
+			if err := override.ProblemsError(problems); err != nil {
+				t.Fatalf("example does not parse: %v", err)
+			}
+
+			if err := override.ValidateErr(entries); err != nil {
 				t.Fatalf("example does not validate: %v", err)
 			}
 
 			for _, entry := range entries {
 				assertExampleContainersExist(t, entry)
+				assertExampleExtraArgsResolve(t, example, entry)
 			}
 		})
 	}
@@ -74,12 +169,7 @@ func TestDocumentedOverrideExamplesResolve(t *testing.T) {
 func assertExampleContainersExist(t *testing.T, entry override.SourcedEntry) {
 	t.Helper()
 
-	manifests, known := componentManifests[entry.Entry.Component]
-	if !known {
-		t.Fatalf("example targets unknown component %q", entry.Entry.Component)
-	}
-
-	existing := manifestContainerNames(t, manifests, entry.Entry.Kind)
+	existing := componentContainerNames(t, entry.Entry.Component, entry.Entry.Kind)
 
 	added := map[string]bool{}
 	for _, name := range append(append([]string{}, entry.Entry.AddContainers...), entry.Entry.AddInitContainers...) {
@@ -101,6 +191,101 @@ func assertExampleContainersExist(t *testing.T, entry override.SourcedEntry) {
 			}
 		}
 	}
+}
+
+// componentFlagSets maps a component to the command whose flags its container
+// actually parses, for the components this package can reach.
+//
+// Only metalman qualifies today: its command is built in internal/, so this
+// package may import it. machina, net, gantry and storage all define their
+// flags in cmd/ packages, which internal/ must not import (see AGENTS.md), so
+// an extraArgs example naming one of those cannot be checked here.
+var componentFlagSets = map[string]func() *cobra.Command{
+	"metalman": commands.ServePXECmd,
+}
+
+// unverifiableExampleFlags records the extraArgs flags in shipped examples that
+// componentFlagSets cannot check, so each is a deliberate, reviewed entry
+// rather than an accident.
+//
+// It is deliberately empty. Both user-facing surfaces, the reference doc and
+// the example ConfigMap, use a component this package can verify. Adding an
+// entry here means someone has read the component's flag registration by hand
+// and is asserting the flag exists; the review of that assertion is the point.
+//
+// The rule exists because the alternative is what shipped: the documentation
+// and the example both told users to append --max-concurrent-reconciles to
+// machina-controller, which registers exactly one flag (--config) and exits
+// non-zero on anything else. A user following the documented "safe way to add
+// arguments" would have crash-looped the machina controller.
+var unverifiableExampleFlags = map[string]bool{}
+
+// assertExampleExtraArgsResolve checks that every flag an example appends is a
+// flag the component actually accepts.
+//
+// Container names being right is not enough. These components are cobra and
+// clap programs, and every one of them exits non-zero on an unrecognised flag,
+// so a wrong flag in a documented example is a CrashLoopBackOff for anyone who
+// copies it. The operator cannot check this at runtime, which is exactly why
+// the examples have to be checked here.
+func assertExampleExtraArgsResolve(t *testing.T, example overrideExample, entry override.SourcedEntry) {
+	t.Helper()
+
+	if len(entry.Entry.ExtraArgs) == 0 {
+		return
+	}
+
+	build, verifiable := componentFlagSets[entry.Entry.Component]
+
+	containers := make([]string, 0, len(entry.Entry.ExtraArgs))
+	for name := range entry.Entry.ExtraArgs {
+		containers = append(containers, name)
+	}
+
+	sort.Strings(containers)
+
+	for _, container := range containers {
+		for _, arg := range entry.Entry.ExtraArgs[container] {
+			name := flagName(arg)
+			if name == "" {
+				continue
+			}
+
+			if !verifiable {
+				if unverifiableExampleFlags[entry.Entry.Component+" "+name] {
+					continue
+				}
+
+				t.Errorf("%s appends %q to component %q, whose flags this package cannot reach "+
+					"(its command is defined under cmd/). Either use a component in componentFlagSets, "+
+					"or record %q in unverifiableExampleFlags after checking the flag by hand.",
+					example.source, arg, entry.Entry.Component, entry.Entry.Component+" "+name)
+
+				continue
+			}
+
+			if build().Flags().Lookup(name) == nil {
+				t.Errorf("%s appends %q, but %s registers no --%s flag; "+
+					"an unrecognised flag makes the component exit non-zero",
+					example.source, arg, entry.Entry.Component, name)
+			}
+		}
+	}
+}
+
+// flagName extracts the long flag name from an argument, or an empty string
+// when the argument is not a long flag and so cannot be checked this way.
+func flagName(arg string) string {
+	if !strings.HasPrefix(arg, "--") {
+		return ""
+	}
+
+	name := strings.TrimPrefix(arg, "--")
+	if equals := strings.Index(name, "="); equals >= 0 {
+		name = name[:equals]
+	}
+
+	return name
 }
 
 // manifestContainerNames collects the container names of every workload of a
