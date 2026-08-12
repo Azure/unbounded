@@ -312,6 +312,7 @@ func validatePatch(patch map[string]any) []string {
 
 	walkPatch(patch, "", compiledAllowlist.root, report)
 	reportAffinityTerms(patch, report)
+	reportAffinityExtras(patch, report)
 
 	return problems
 }
@@ -364,6 +365,46 @@ func reportAffinityTerms(patch map[string]any, report func(string)) {
 		}
 
 		reportTermExpressions(mapping, fmt.Sprintf("%s[%d]", at, i), report)
+	}
+}
+
+// reportAffinityExtras checks the shape of the affinity sections that are
+// concatenated rather than combined into a product.
+//
+// affinity is a permitted subtree, so the allowlist walker does not descend
+// into it and no shape check applies. Only required node affinity was checked,
+// so a preference or a pod affinity rule written as a mapping rather than a
+// list reached the merge, where it was dropped without comment on any workload
+// that already had operator affinity to merge into. Catching it here means the
+// user is told which line is wrong rather than discovering the constraint
+// silently did nothing.
+func reportAffinityExtras(patch map[string]any, report func(string)) {
+	const prefix = "spec.template.spec.affinity."
+
+	base := []string{"spec", "template", "spec", "affinity"}
+
+	for _, section := range affinityExtraSections {
+		path := append(append([]string{}, base...), section...)
+
+		value, found, err := unstructured.NestedFieldNoCopy(patch, path...)
+		if err != nil || !found {
+			continue
+		}
+
+		at := prefix + strings.Join(section, ".")
+
+		items, ok := value.([]any)
+		if !ok {
+			report(fmt.Sprintf("%s must be a list, but holds %T", at, value))
+
+			continue
+		}
+
+		for i, item := range items {
+			if _, ok := item.(map[string]any); !ok {
+				report(fmt.Sprintf("%s[%d] must be a mapping, but holds %T", at, i, item))
+			}
+		}
 	}
 }
 

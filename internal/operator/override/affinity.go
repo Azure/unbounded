@@ -5,6 +5,7 @@ package override
 
 import (
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -84,8 +85,8 @@ func combineAffinities(blocks []map[string]any) (map[string]any, error) {
 
 		if combined == nil {
 			combined = deepCopyMap(block)
-		} else {
-			mergeAffinityExtras(combined, block)
+		} else if err := mergeAffinityExtras(combined, block); err != nil {
+			return nil, err
 		}
 
 		if blockTerms == nil {
@@ -120,28 +121,51 @@ func combineAffinities(blocks []map[string]any) (map[string]any, error) {
 	return combined, nil
 }
 
+// affinityExtraSections are the affinity sections that are not required node
+// affinity: preferences, and pod affinity in both directions. They concatenate
+// rather than taking a product, because none of them is a hard constraint the
+// operator relies on.
+var affinityExtraSections = [][]string{
+	{"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution"},
+	{"podAffinity", "requiredDuringSchedulingIgnoredDuringExecution"},
+	{"podAffinity", "preferredDuringSchedulingIgnoredDuringExecution"},
+	{"podAntiAffinity", "requiredDuringSchedulingIgnoredDuringExecution"},
+	{"podAntiAffinity", "preferredDuringSchedulingIgnoredDuringExecution"},
+}
+
 // mergeAffinityExtras concatenates the affinity sections that are not required
-// node affinity: preferences and pod affinity.
-func mergeAffinityExtras(into, from map[string]any) {
-	for _, section := range []struct {
-		path []string
-	}{
-		{path: []string{"nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution"}},
-		{path: []string{"podAffinity", "requiredDuringSchedulingIgnoredDuringExecution"}},
-		{path: []string{"podAffinity", "preferredDuringSchedulingIgnoredDuringExecution"}},
-		{path: []string{"podAntiAffinity", "requiredDuringSchedulingIgnoredDuringExecution"}},
-		{path: []string{"podAntiAffinity", "preferredDuringSchedulingIgnoredDuringExecution"}},
-	} {
-		addition := nestedSlice(from, section.path...)
-		if addition == nil {
+// node affinity.
+//
+// A section of the wrong type is an error rather than an omission, and so is a
+// write that fails. Both used to be swallowed, and the result was the worst
+// shape a failure can take here: the user's constraint disappeared, the merge
+// carried on, the override was hashed, and the Site reported Applied.
+//
+// It was also inconsistent. With no operator affinity to merge into, a single
+// user block is copied wholesale and the API server rejects the malformed
+// section loudly; with operator affinity present, which is every per-Site
+// workload, the same document was silently dropped instead.
+func mergeAffinityExtras(into, from map[string]any) error {
+	for _, path := range affinityExtraSections {
+		value, found, err := unstructured.NestedFieldNoCopy(from, path...)
+		if err != nil || !found {
 			continue
 		}
 
-		existing := nestedSlice(into, section.path...)
-		if err := setNestedSlice(into, append(existing, addition...), section.path...); err != nil {
-			continue
+		addition, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("spec.template.spec.affinity.%s must be a list, but holds %T",
+				strings.Join(path, "."), value)
+		}
+
+		existing := nestedSlice(into, path...)
+		if err := setNestedSlice(into, append(existing, addition...), path...); err != nil {
+			return fmt.Errorf("combine spec.template.spec.affinity.%s: %w",
+				strings.Join(path, "."), err)
 		}
 	}
+
+	return nil
 }
 
 // cartesianTerms returns the product of two required-term lists.

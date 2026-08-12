@@ -968,3 +968,71 @@ patch:
 	}
 }
 
+// TestValidateRejectsMalformedAffinityExtras pins the offline half of the
+// malformed-affinity fix.
+//
+// affinity is a permitted subtree, so the allowlist walker does not descend
+// into it and no shape check applied. Only required node affinity was checked,
+// which left every preference and both pod-affinity sections able to reach the
+// merge in a shape the merge would silently drop.
+func TestValidateRejectsMalformedAffinityExtras(t *testing.T) {
+	fragment := func(parent, section string) string {
+		return `
+component: storage
+kind: DaemonSet
+patch:
+  spec:
+    template:
+      spec:
+        affinity:
+          ` + parent + `:
+            ` + section + `:
+              weight: 1
+`
+	}
+
+	for _, tc := range []struct {
+		name    string
+		parent  string
+		section string
+	}{
+		{name: "node preference", parent: "nodeAffinity", section: "preferredDuringSchedulingIgnoredDuringExecution"},
+		{name: "pod affinity", parent: "podAffinity", section: "requiredDuringSchedulingIgnoredDuringExecution"},
+		{name: "pod anti-affinity", parent: "podAntiAffinity", section: "preferredDuringSchedulingIgnoredDuringExecution"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateFragment(t, fragment(tc.parent, tc.section))
+			if err == nil {
+				t.Fatal("a mapping where Kubernetes requires a list must be rejected")
+			}
+
+			if !strings.Contains(err.Error(), tc.section) {
+				t.Fatalf("error = %v, want it to name %s", err, tc.section)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsWellFormedAffinityExtras guards against the shape check
+// rejecting the shape it exists to permit.
+func TestValidateAcceptsWellFormedAffinityExtras(t *testing.T) {
+	if err := validateFragment(t, `
+component: storage
+kind: DaemonSet
+patch:
+  spec:
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 1
+                preference:
+                  matchExpressions:
+                    - key: disk
+                      operator: In
+                      values: [ssd]
+`); err != nil {
+		t.Fatalf("a well-formed preference must be accepted: %v", err)
+	}
+}

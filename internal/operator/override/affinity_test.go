@@ -106,3 +106,80 @@ patch:
 		t.Fatalf("error = %q, want it to explain what an empty list means", err)
 	}
 }
+
+// TestCombineAffinitiesRejectsMalformedExtras is a regression test.
+//
+// Everything other than required node affinity was concatenated by reading it
+// with a helper that returns nil for both "absent" and "present but the wrong
+// type", and the write that followed discarded its error. A preference written
+// as a mapping rather than a list therefore vanished: the user's constraint was
+// dropped, the merge carried on, the override was hashed, and the Site reported
+// Applied.
+//
+// It was also inconsistent, which is what made it hard to spot. With no
+// operator affinity to merge into, the single user block is copied wholesale
+// and the API server rejects it loudly. With operator affinity present, which
+// is every per-Site workload, the same document was silently dropped.
+func TestCombineAffinitiesRejectsMalformedExtras(t *testing.T) {
+	operator := map[string]any{
+		"nodeAffinity": map[string]any{
+			"requiredDuringSchedulingIgnoredDuringExecution": map[string]any{
+				"nodeSelectorTerms": []any{
+					map[string]any{"matchExpressions": []any{
+						map[string]any{"key": "site", "operator": "In", "values": []any{"edge"}},
+					}},
+				},
+			},
+		},
+	}
+
+	for _, tc := range []struct {
+		name    string
+		section string
+		parent  string
+	}{
+		{name: "node preference", parent: "nodeAffinity", section: "preferredDuringSchedulingIgnoredDuringExecution"},
+		{name: "pod affinity", parent: "podAffinity", section: "requiredDuringSchedulingIgnoredDuringExecution"},
+		{name: "pod anti-affinity", parent: "podAntiAffinity", section: "preferredDuringSchedulingIgnoredDuringExecution"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := map[string]any{
+				// A mapping where Kubernetes requires a list: one missing "-".
+				tc.parent: map[string]any{tc.section: map[string]any{"weight": int64(1)}},
+			}
+
+			_, err := combineAffinities([]map[string]any{operator, user})
+			if err == nil {
+				t.Fatal("a malformed affinity section must be rejected, not dropped")
+			}
+
+			if !strings.Contains(err.Error(), tc.section) {
+				t.Fatalf("error = %v, want it to name %s", err, tc.section)
+			}
+		})
+	}
+}
+
+// TestCombineAffinitiesConcatenatesExtras pins that the well-formed case still
+// appends rather than replacing, so the operator's own preferences survive.
+func TestCombineAffinitiesConcatenatesExtras(t *testing.T) {
+	block := func(weight int64) map[string]any {
+		return map[string]any{
+			"nodeAffinity": map[string]any{
+				"preferredDuringSchedulingIgnoredDuringExecution": []any{
+					map[string]any{"weight": weight, "preference": map[string]any{}},
+				},
+			},
+		}
+	}
+
+	combined, err := combineAffinities([]map[string]any{block(1), block(2)})
+	if err != nil {
+		t.Fatalf("combineAffinities: %v", err)
+	}
+
+	preferences := nestedSlice(combined, "nodeAffinity", "preferredDuringSchedulingIgnoredDuringExecution")
+	if len(preferences) != 2 {
+		t.Fatalf("preferences = %v, want both contributors' terms", preferences)
+	}
+}
