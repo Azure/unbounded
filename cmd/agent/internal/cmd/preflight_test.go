@@ -132,7 +132,7 @@ func TestPreflightTextOutputError(t *testing.T) {
 	err := h.execute(ctx)
 	require.Error(t, err)
 	assert.Contains(t, out.String(), "[ERROR api-server-reachable]")
-	assert.NotContains(t, out.String(), "127.0.0.1")
+	assert.Contains(t, out.String(), `API server "https://127.0.0.1:1" is not reachable:`)
 }
 
 func TestPreflightTextOutputIncludesOK(t *testing.T) {
