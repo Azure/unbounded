@@ -1,13 +1,10 @@
 //! Deterministic simulation.
 //!
-//! The whole cluster runs in one thread. Every node is a real worker — same op slab,
-//! pool and hop fabric — with only the kernel seams replaced: disk submission, the
-//! timer, the clock, raw device IO and the guest copy. `server`, `paxos`, `alloc`,
-//! `cache`, `heal` and `fabric` run unmodified above that line.
-//!
-//! Two substitutions carry the design. A device is a sparse block map, so a node's
-//! store and its handle on a peer are the same kind of object. A buffer is ordinary
-//! process memory, so a transfer is a memcpy the simulator does by address.
+//! The whole cluster runs in one thread. Every node is a real worker; only the kernel
+//! seams are replaced: disk submission, timer, clock, raw device IO and the guest copy.
+//! `server`, `paxos`, `alloc`, `cache`, `heal` and `fabric` run unmodified. A device is a
+//! sparse block map, so a node's store and its handle on a peer are the same object. A
+//! buffer is process memory, so a transfer is a memcpy done by address.
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
@@ -21,26 +18,20 @@ use crate::layout::{self, Class, Entry, Geometry, State};
 use crate::runtime::{Buf, Errno, Op, Request, SimNode, SimWorker, sim_addr, sim_buf};
 use crate::server::{self, SERVER};
 
-/// Block size of every simulated device. Frames and mblocks are 4 KiB, so nothing
-/// smaller is ever addressed.
+/// Block size of every simulated device. Frames and mblocks are 4 KiB.
 const BLOCK: usize = 4096;
-/// The size every simulated node asks for its store. Sparse, so only written blocks
-/// cost anything.
+/// Store size every simulated node asks for. Sparse, so only written blocks cost.
 const STORE_BYTES: u64 = 64 << 30;
 /// One-way message and disk latency, before jitter.
 const LATENCY_US: u64 = 50;
-/// What a straggling link adds one way. Long enough that it always loses a quorum
-/// race, short enough that the frame still arrives before the link times out.
+/// Delay a straggler adds one way: loses every quorum race, still beats the link timeout.
 const SLOW_US: u64 = 200_000;
-/// Virtual time between ticks. Matches the runtime's maintenance interval, so
-/// `Handler::tick` keeps its cadence.
+/// Virtual time between ticks, matching the runtime interval that paces `Handler::tick`.
 const TICK_US: u64 = 1_000;
 /// Settle passes that may keep finding work before we call it a livelock.
 const SETTLE_LIMIT: usize = 1 << 20;
 
-// ---------------------------------------------------------------------------
-// The ambient half: what handler code reaches through `crate::sim::*`
-// ---------------------------------------------------------------------------
+// --- the ambient half: what handler code reaches through `crate::sim::*` ---
 
 /// Which side of a transfer an op is. Mirrors the two `Disk` methods.
 pub(crate) enum Kind {
@@ -58,14 +49,13 @@ struct Who {
     seq: u16,
 }
 
-/// One node's store, or a handle on a peer (which holds no blocks: `submit` turns
-/// writes to it into frames). Absent blocks read as zero and all-zero writes are erased.
+/// One node's store, or a handle on a peer (which holds no blocks: `submit` turns writes
+/// to it into frames). Absent blocks read as zero and all-zero writes are erased.
 struct Device {
     node: u32,
     fabric: bool,
     blocks: BTreeMap<u64, Box<[u8; BLOCK]>>,
-    /// What the store has been sized to. Starts at zero, like a file that is not there
-    /// yet, and only `resize` moves it. Unused on a fabric handle.
+    /// Store size, zero until `resize`. Unused on a fabric handle.
     len: u64,
     /// Transfers submitted through the runtime, which are the ones a rate budget meters.
     ops: u64,
@@ -90,11 +80,9 @@ impl Device {
     }
 }
 
-/// Everything a scheduled event can be. The simulator owns the workers, so an event
-/// never touches one itself; it is popped and acted on by [`Sim::fire`].
+/// Everything a scheduled event can be. Events are popped and acted on by [`Sim::fire`].
 enum What {
-    /// A storage transfer, performed at completion time so overlapping IO to one block
-    /// interleaves the way the device would.
+    /// A storage transfer, performed at completion time so overlapping IO interleaves.
     Disk {
         who: Who,
         dev: u32,
@@ -103,9 +91,8 @@ enum What {
         addr: u64,
         len: u32,
     },
-    /// A frame arriving at a peer. The payload is read out of the sender's buffer at
-    /// delivery, not at submission, because that is when the transport reads it: a
-    /// sender that recycles the buffer first puts whatever is there now on the wire.
+    /// A frame at a peer. Payload is read from the sender's buffer at delivery, not
+    /// submission, which is when the transport reads it.
     Send {
         from: Who,
         to: u32,
@@ -124,7 +111,7 @@ enum What {
     },
     /// A `sleep` expiring, or a link timeout firing.
     Wake { who: Who, res: i32 },
-    /// Nothing but a step of virtual time, so an idle cluster still runs maintenance.
+    /// A step of virtual time, so an idle cluster still runs maintenance.
     Tick,
 }
 
@@ -134,8 +121,7 @@ struct Ev {
     what: What,
 }
 
-// Ordered by (time, submission order): a total order, so the heap's own tie-breaking
-// cannot affect a run.
+// Ordered by (time, submission order): total, so heap tie-breaking cannot affect a run.
 impl PartialEq for Ev {
     fn eq(&self, o: &Ev) -> bool {
         (self.at, self.seq) == (o.at, o.seq)
@@ -166,8 +152,8 @@ pub struct Faults {
     pub jitter_us: u64,
     /// Directed cuts. `(a, b)` present means nothing `a` sends reaches `b`.
     pub cut: BTreeSet<(u32, u32)>,
-    /// Directed stragglers. `(a, b)` present means everything `a` sends to `b` still
-    /// arrives, just far too late to win a quorum race.
+    /// Directed stragglers. `(a, b)` present means everything `a` sends to `b` arrives
+    /// too late to win a quorum race.
     pub slow: BTreeSet<(u32, u32)>,
 }
 
@@ -191,20 +177,19 @@ struct Shared {
     paths: RefCell<BTreeMap<PathBuf, u32>>,
     evs: RefCell<BinaryHeap<Reverse<Ev>>>,
     seq: Cell<u64>,
-    /// Ops accepted and not yet completed. The slab must be told exactly once, so
-    /// every completion path checks in here first.
+    /// Ops accepted and not yet completed. The slab must be told exactly once, so every
+    /// completion path checks in here first.
     live: RefCell<BTreeSet<Who>>,
-    /// Pieces still owed to a split transfer, with the length its one completion
-    /// reports. Absent for the ordinary single-piece case.
+    /// Pieces still owed to a split transfer, with the length its one completion reports.
+    /// Absent for the ordinary single-piece case.
     owed: RefCell<BTreeMap<Who, (u32, i32)>>,
-    /// Every buffer the simulator hands to a request, by base address: its length and
-    /// how many times that allocation has been handed out. A worker recycles a ublk
-    /// tag's registered pages the moment the request completes, so a transfer that
-    /// still reads or writes one after the count moved on is touching another
-    /// request's memory.
+    /// Every buffer the simulator hands to a request, by base address: its length and how
+    /// many times that allocation has been handed out. A worker recycles a ublk tag's
+    /// registered pages as soon as the request completes, so a transfer touching one
+    /// after the count moved on is touching another request's memory.
     bufs: RefCell<BTreeMap<u64, (usize, u64)>>,
-    /// The generation each live op was submitted against, so a late transfer can be
-    /// told apart from a timely one.
+    /// The generation each live op was submitted against, so a late transfer can be told
+    /// apart from a timely one.
     held: RefCell<BTreeMap<Who, u64>>,
     /// The peer's maximum data transfer size, or zero for a transport that never splits.
     mdts: Cell<u32>,
@@ -250,8 +235,8 @@ impl Shared {
         }));
     }
 
-    /// How many times the allocation holding `addr` has been handed out. Zero for
-    /// memory the simulator did not lend, which is every buffer the node owns itself.
+    /// How many times the allocation holding `addr` has been handed out. Zero for memory
+    /// the simulator did not lend, which is every buffer the node owns itself.
     fn generation(&self, addr: u64) -> u64 {
         let b = self.bufs.borrow();
         match b.range(..=addr).next_back() {
@@ -260,8 +245,8 @@ impl Shared {
         }
     }
 
-    /// The invariant that makes an abandoned transfer visible: whatever it touches must
-    /// still belong to the request that submitted it.
+    /// Assert that whatever a transfer touches still belongs to the request that
+    /// submitted it. This is what makes an abandoned transfer visible.
     fn still_ours(&self, who: &Who, addr: u64, what: &str) {
         let then = self.held.borrow().get(who).copied().unwrap_or(0);
         let now = self.generation(addr);
@@ -273,12 +258,9 @@ impl Shared {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The seams the runtime calls
-// ---------------------------------------------------------------------------
+// --- the seams the runtime calls ---
 
-/// Resolve a device path, creating it on first sight. The node id is carried in the
-/// path, so nothing has to track which node is being built.
+/// Resolve a device path, creating it on first sight. The node id is carried in the path.
 pub(crate) fn device(path: &Path) -> std::io::Result<u32> {
     let s = shared();
     if let Some(&id) = s.paths.borrow().get(path) {
@@ -307,9 +289,9 @@ pub(crate) fn device(path: &Path) -> std::io::Result<u32> {
     Ok(id)
 }
 
-/// Grow the simulated store to `want`, the way `layout::size_if_needed` grows a file.
-/// Shrinking is refused here for the same reason it is refused there: the offsets in
-/// the layout are absolute, so a smaller store loses pages rather than moving them.
+/// Grow the simulated store to `want`, like `layout::size_if_needed`. Shrinking is
+/// refused for the same reason it is there: layout offsets are absolute, so a smaller
+/// store loses pages rather than moving them.
 pub(crate) fn resize(dev: u32, want: u64) -> std::io::Result<()> {
     let s = shared();
     let mut devs = s.devs.borrow_mut();
@@ -436,7 +418,7 @@ pub(crate) fn submit(
     let lat = s.latency();
     if fabric {
         if s.faults.borrow().cut(node, peer) {
-            // Lost: only the timeout can finish this op now, which is the point.
+            // Lost: only the timeout can finish this op now.
             return;
         }
         let lat = lat
@@ -490,9 +472,7 @@ pub(crate) fn submit(
     }
 }
 
-// ---------------------------------------------------------------------------
-// The simulator
-// ---------------------------------------------------------------------------
+// --- the simulator ---
 
 /// What a request slot is being used for, so a finished future can be routed.
 enum Use {
@@ -517,10 +497,9 @@ struct NodeState {
     dp: *const (),
     free: Vec<VecDeque<u32>>,
     slots: Vec<Vec<Option<Use>>>,
-    /// Frames a node of another zone has sent this one. Cross-zone traffic is what
-    /// warming exists to remove, so a test measures it rather than a cache counter:
-    /// it is the cost the client actually pays, and it survives a restart of how the
-    /// cache accounts for itself.
+    /// Frames a node of another zone has sent this one. Warming exists to remove
+    /// cross-zone traffic, so a test measures this rather than a cache counter: it is the
+    /// cost the client actually pays.
     crossings: u64,
     /// `WARM` frames this node has been sent, at either stage.
     warms: u64,
@@ -532,8 +511,7 @@ struct Pending {
     node: usize,
 }
 
-/// How a cluster is shaped. Groups, peers, extents and devices are all derived from
-/// these.
+/// How a cluster is shaped. Groups, peers, extents and devices derive from these.
 #[derive(Clone)]
 pub struct Options {
     pub nodes: u32,
@@ -549,8 +527,8 @@ pub struct Options {
     /// The rate the backing device is willing to be driven at, or zero for unmetered.
     pub device_iops: u64,
     /// Whether every node opens every other. `false` keeps only the nodes it shares a
-    /// group with, plus the gateways of every other zone, which is what makes hundreds
-    /// of nodes affordable.
+    /// group with, plus the gateways of every other zone, which is what makes hundreds of
+    /// nodes affordable.
     pub clique: bool,
     /// How many zones the nodes are split into. `nodes` must divide evenly by this and
     /// leave at least three per zone, since a zone's catalog is built from its own
@@ -585,9 +563,9 @@ impl Default for Options {
     }
 }
 
-/// The one universe every simulated node shares. A single universe is enough here: the
-/// partitioning it enforces is a property of which namespaces the control plane hands
-/// out, and there is no control plane below this line to get it wrong.
+/// The one universe every simulated node shares. One is enough: the partitioning it
+/// enforces is a property of which namespaces the control plane hands out, and there is
+/// no control plane below this line.
 pub const UNIVERSE: u32 = 1;
 
 /// Device ids the simulator declares, each mapping the one extent of its class.
@@ -612,10 +590,10 @@ pub struct Sim {
     results: BTreeMap<u64, Result<(), i32>>,
     next_id: u64,
     done: Vec<(u32, Result<(), Errno>)>,
-    /// Retired request buffers, by length. A finished request's memory goes straight
-    /// back into service, the way ublk re-arms a tag onto the next request's pages, so
-    /// anything still pointing at it sees the next request's bytes rather than its own.
-    /// Nothing is ever freed: an op that outlives its buffer is a bug, not a crash.
+    /// Retired request buffers, by length. A finished request's memory goes straight back
+    /// into service, the way ublk re-arms a tag onto the next request's pages, so
+    /// anything still pointing at it sees the next request's bytes. Nothing is ever
+    /// freed: an op that outlives its buffer is a bug, not a crash.
     spare: BTreeMap<usize, Vec<Box<[u8]>>>,
 }
 
@@ -668,10 +646,9 @@ impl Sim {
         for i in 0..opts.nodes {
             let cfg = Config::parse(&sim.config_text(i + 1))?;
             cfg.validate()?;
-            // The nodes of a zone are homogeneous, so every one of them plans the same
-            // device. A simulation that drifted off that would be exercising a cluster
-            // the schema cannot describe. Across zones they legitimately differ: a zone
-            // that owns no extent plans nothing and reads everything.
+            // Nodes of a zone are homogeneous, so every one plans the same device. Across
+            // zones they legitimately differ: a zone that owns no extent plans nothing
+            // and reads everything.
             if let Some(first) = sim.nodes.iter().find(|n| n.cfg.node.zone == cfg.node.zone) {
                 assert_eq!(
                     (cfg.small_pages(), cfg.huge_pages()),
@@ -700,7 +677,7 @@ impl Sim {
         Ok(sim)
     }
 
-    // ---------------------------------------------------------------- topology
+    // --- topology ---
 
     /// Nodes per zone. Ids are handed out in contiguous blocks, so zone `z` holds
     /// `(z - 1) * per .. z * per`, one-based.
@@ -718,17 +695,15 @@ impl Sim {
         ((zone - 1) * per + 1..=zone * per).collect()
     }
 
-    /// Consensus groups of one zone: every window of three consecutive members of that
-    /// zone, so each sits in three groups and no group repeats a member. One group per
-    /// member, which is what makes the catalog balanced: `3 * k` seats spread three
-    /// apiece.
+    /// Consensus groups of one zone: every window of three consecutive members, so each
+    /// sits in three groups and no group repeats a member. One group per member, which
+    /// keeps the catalog balanced: `3 * k` seats spread three apiece.
     ///
-    /// Every column of this catalog therefore contains every node of the zone, which is
-    /// why the simulator gives every node cohort zero: the cohort is the catalog column,
-    /// and here all three columns are the same set. A warm push consequently places one
-    /// copy per zone rather than three, and every reader in that zone agrees on which
-    /// node holds it, which is the property that matters. Three genuinely disjoint
-    /// cohorts are covered by the config unit tests instead.
+    /// Every column of this catalog holds every node of the zone, which is why the
+    /// simulator gives every node cohort zero: the cohort is the catalog column, and here
+    /// all three columns are the same set. A warm push therefore places one copy per zone
+    /// rather than three, and every reader in that zone agrees on which node holds it.
+    /// Three genuinely disjoint cohorts are covered by the config unit tests.
     fn group(&self, zone: u32, g: u32) -> [u32; 3] {
         let m = self.zone_nodes(zone);
         let k = m.len() as u32;
@@ -739,7 +714,7 @@ impl Sim {
         ]
     }
 
-    /// The nodes of `zone` that answer for traffic from outside it. Three is enough to
+    /// The nodes of `zone` that answer traffic from outside it. Three is enough to
     /// exercise the ring's fall-through without making the peer set quadratic.
     fn gateways_of(&self, zone: u32) -> Vec<u32> {
         let mut m = self.zone_nodes(zone);
@@ -753,7 +728,7 @@ impl Sim {
             return (1..=n).filter(|&p| p != id).collect();
         }
         // Only the nodes this one shares a group with, plus the way out of its own zone:
-        // a clique is O(n²) links, and every link is a registered device.
+        // a clique is O(n^2) links, and every link is a registered device.
         let zone = self.zone_of(id);
         let mut out = BTreeSet::new();
         for g in 0..self.per_zone() {
@@ -826,7 +801,7 @@ impl Sim {
         t
     }
 
-    // ---------------------------------------------------------------- lifecycle
+    // --- lifecycle ---
 
     /// Bring a node up against whatever its device already holds. Restart is the same
     /// call, which is the whole of the recovery test.
@@ -836,8 +811,8 @@ impl Sim {
         let workers = SimNode::<server::Server>::new(cores, &SERVER, self.base)?;
         let node = Box::new(server::Node::new());
         let cfgr = crate::runtime::Configurator::sim(cores);
-        // `attach` runs on the control thread in production and touches no worker
-        // state, so it needs no `Local`.
+        // `attach` runs on the control thread in production and touches no worker state,
+        // so it needs no `Local`.
         let dp: *const () = Box::leak(Box::new(node.attach(&cfgr, cfg)?)) as *const _ as *const ();
         let n = &mut self.nodes[i];
         for c in 0..cores {
@@ -862,7 +837,7 @@ impl Sim {
         self.nodes[i].workers = None;
         self.nodes[i].node = None;
         self.nodes[i].free.clear();
-        // Its in-flight frame buffers go back into service rather than away: a scheduled
+        // In-flight frame buffers go back into service rather than away: a scheduled
         // event may still name one, and reading recycled memory is the honest outcome.
         for core in std::mem::take(&mut self.nodes[i].slots) {
             for u in core.into_iter().flatten() {
@@ -925,7 +900,7 @@ impl Sim {
     }
 
     /// Transfers a node has submitted to its own store since boot. Counts what a rate
-    /// budget meters, so a test can check the budget was actually held to.
+    /// budget meters, so a test can check the budget was held to.
     pub fn device_ops(&self, node: usize) -> u64 {
         let path = self.nodes[node].cfg.node.store.as_path();
         let dev = *self.s.paths.borrow().get(path).expect("store device");
@@ -934,15 +909,14 @@ impl Sim {
 
     /// Frames this node has been sent from a node in another zone since boot.
     ///
-    /// The point of warming is that a reader in a consuming zone stops crossing to the
-    /// home zone, so the honest measure is how much crossing there is. Counted at
-    /// delivery, which is where the simulator plays the transport.
+    /// Warming aims to stop a reader in a consuming zone crossing to the home zone, so
+    /// the honest measure is how much crossing there is. Counted at delivery.
     pub fn crossings(&self, node: usize) -> u64 {
         self.nodes[node].crossings
     }
 
-    /// `WARM` frames this node has been sent since boot, counting both the one a
-    /// writing zone sends its gateway and the one that gateway relays to a holder.
+    /// `WARM` frames this node has been sent since boot, counting both the one a writing
+    /// zone sends its gateway and the one that gateway relays to a holder.
     pub fn warms(&self, node: usize) -> u64 {
         self.nodes[node].warms
     }
@@ -1024,7 +998,7 @@ impl Sim {
         None
     }
 
-    // ---------------------------------------------------------------- client IO
+    // --- client IO ---
 
     /// A buffer to serve a request out of, poisoned so that reading one before it has
     /// been filled, or after it has been handed on, is visible rather than plausible.
@@ -1036,7 +1010,7 @@ impl Sim {
             }
             None => vec![0xa5u8; len].into_boxed_slice(),
         };
-        // Handing it out is what invalidates whatever still points at it.
+        // Handing it out invalidates whatever still points at it.
         let base = b.as_mut_ptr() as u64;
         let mut bufs = self.s.bufs.borrow_mut();
         let e = bufs.entry(base).or_insert((len, 0));
@@ -1120,8 +1094,8 @@ impl Sim {
         Some((lba as usize) % w.cores())
     }
 
-    /// Hand a request to a worker, recording what its slot is owed to. Returns false
-    /// if the worker has no slot free.
+    /// Hand a request to a worker, recording what its slot is owed to. Returns false if
+    /// the worker has no slot free.
     fn start(&mut self, i: usize, core: usize, u: Use, req: Request) -> bool {
         let Some(slot) = self.nodes[i].free[core].pop_front() else {
             match u {
@@ -1206,7 +1180,7 @@ impl Sim {
         );
     }
 
-    // ---------------------------------------------------------------- the loop
+    // --- the loop ---
 
     /// Advance virtual time by `d`, running everything that falls inside it.
     pub fn run(&mut self, d: Duration) {
@@ -1262,8 +1236,8 @@ impl Sim {
         self.done = done;
     }
 
-    /// Claim an op, so it is completed exactly once. A late timeout, or a reply that
-    /// lost a race with one, finds it gone.
+    /// Claim an op, so it is completed exactly once. A late timeout, or a reply that lost
+    /// a race with one, finds it gone.
     fn take(&self, who: Who) -> bool {
         let took = self.s.live.borrow_mut().remove(&who);
         if took {
@@ -1313,8 +1287,8 @@ impl Sim {
                     let dst = unsafe { std::slice::from_raw_parts_mut(back as *mut u8, w.len()) };
                     dst.copy_from_slice(&w);
                 }
-                // A split transfer still has one completion: the last piece home ends
-                // it, and any failed piece ends it early with that failure.
+                // A split transfer still has one completion: the last piece home ends it,
+                // and any failed piece ends it early with that failure.
                 let whole = if res < 0 {
                     Some(res)
                 } else {
@@ -1361,8 +1335,7 @@ impl Sim {
         }
     }
 
-    /// Perform a storage transfer, injecting failure at the point the device would
-    /// have reported it.
+    /// Perform a storage transfer, injecting failure where the device would report it.
     fn transfer(&self, dev: u32, read: bool, off: u64, addr: u64, len: u32) -> i32 {
         let (bad, rot) = {
             let f = self.s.faults.borrow();
@@ -1406,9 +1379,9 @@ impl Sim {
         len: u32,
         tries: u32,
     ) {
-        // The command was cancelled — by its link timeout, or because its node went
-        // away. A cancelled command's buffer is the initiator's again, so nothing may
-        // be read out of it.
+        // The command was cancelled, by its link timeout or because its node went away.
+        // A cancelled command's buffer is the initiator's again, so nothing may be read
+        // out of it.
         if !self.s.live.borrow().contains(&from) {
             return;
         }
@@ -1440,8 +1413,7 @@ impl Sim {
             return;
         }
         // Counted here rather than at submission: this is the point the frame is
-        // certainly being served, so a delivery the simulator retried for want of a
-        // slot is counted once.
+        // certainly being served, so a delivery retried for want of a slot counts once.
         if self.zone_of(from.node) != self.zone_of(to) {
             self.nodes[i].crossings += 1;
         }
@@ -1471,8 +1443,8 @@ impl Sim {
             core,
             u,
             Request {
-                // A frame arrives on the universe's own fabric device, which is the
-                // only thing on the wire that names the universe.
+                // A frame arrives on the universe's own fabric device, the only thing on
+                // the wire that names the universe.
                 dev: server::fabric_key(UNIVERSE),
                 op,
                 lba,
@@ -1494,8 +1466,8 @@ fn raise_files() {
     }
 }
 
-/// One request slot per (device, tag) the runtime would have armed. The simulator
-/// hands them out itself, so this is only a ceiling.
+/// One request slot per (device, tag) the runtime would have armed. The simulator hands
+/// them out itself, so this is only a ceiling.
 fn slots_per_worker() -> u32 {
     crate::runtime::sim_slots()
 }

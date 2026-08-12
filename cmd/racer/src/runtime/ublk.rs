@@ -1,8 +1,7 @@
 //! ublk uapi and the control-plane ring.
 //!
 //! Hand-written bindings for `include/uapi/linux/ublk_cmd.h`. Control commands are
-//! `uring_cmd`s carrying a 32-byte `ublksrv_ctrl_cmd`, hence the 128-byte SQEs. Each
-//! is synchronous: submit and wait.
+//! `uring_cmd`s carrying a 32-byte `ublksrv_ctrl_cmd` in 128-byte SQEs, each synchronous.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -12,9 +11,7 @@ use io_uring::{IoUring, cqueue, opcode, squeue, types};
 
 use super::sys;
 
-// ---------------------------------------------------------------------------
-// ioctl encoding
-// ---------------------------------------------------------------------------
+// --- ioctl encoding ---
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -52,22 +49,17 @@ pub(super) const IO_COMMIT_AND_FETCH_REQ: u32 = iowr(0x21, IO_SZ);
 pub(super) const IO_REGISTER_IO_BUF: u32 = iowr(0x23, IO_SZ);
 pub(super) const IO_UNREGISTER_IO_BUF: u32 = iowr(0x24, IO_SZ);
 
-// ---------------------------------------------------------------------------
-// feature flags, states, ops
-// ---------------------------------------------------------------------------
+// --- feature flags, states, ops ---
 
 /// `UBLK_F_CMD_IOCTL_ENCODE`: commands are the ioctl encodings above, not bare numbers.
 pub(super) const F_CMD_IOCTL_ENCODE: u64 = 1 << 6;
-/// `UBLK_F_USER_COPY`: the request payload is also reachable by `pread`/`pwrite` on
-/// `/dev/ublkcN` at the offset [`buf_offset`] computes. Independent of the buffer-mode
-/// flag below and *not* mutually exclusive with it: `ublk_need_map_io()` stays false and
-/// `ublk_check_and_get_req()` gates on this bit alone. We set both and pick per request
-/// — zero copy for 4 MiB pages, a copy for the 4 KiB pages the allocator must checksum.
+/// `UBLK_F_USER_COPY`: the payload is also reachable by `pread`/`pwrite` on `/dev/ublkcN`
+/// at [`buf_offset`]. Not exclusive with `F_AUTO_BUF_REG`: `ublk_need_map_io()` stays
+/// false and `ublk_check_and_get_req()` gates on this bit alone. We set both and pick per
+/// request: zero copy for 4 MiB pages, a copy for the 4 KiB pages the allocator checksums.
 pub(super) const F_USER_COPY: u64 = 1 << 7;
-/// `UBLK_F_AUTO_BUF_REG`: the kernel registers the request buffer into our ring as
-/// part of FETCH, so the data never leaves the ring. A different bit from
-/// `UBLK_F_SUPPORT_ZERO_COPY` (1 << 0) and better: manual REGISTER/UNREGISTER costs
-/// two extra uring_cmds per IO.
+/// `UBLK_F_AUTO_BUF_REG`: the kernel registers the request buffer into our ring as part of
+/// FETCH. Unlike `UBLK_F_SUPPORT_ZERO_COPY` (1 << 0), it costs no extra uring_cmds per IO.
 pub(super) const F_AUTO_BUF_REG: u64 = 1 << 11;
 
 pub(super) const IO_RES_OK: i32 = 0;
@@ -98,9 +90,7 @@ pub(super) fn cmd_buf_size() -> usize {
     (MAX_QUEUE_DEPTH as usize * size_of::<IoDesc>()).next_multiple_of(sys::page_size())
 }
 
-// ---------------------------------------------------------------------------
-// structs
-// ---------------------------------------------------------------------------
+// --- structs ---
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -222,8 +212,7 @@ pub(super) struct Params {
     pub(super) types: u32,
     pub(super) basic: ParamBasic,
     pub(super) discard: ParamDiscard,
-    /// `devt` (read-only) and `zoned`; we never set their type bits, but the struct
-    /// must keep its uapi layout.
+    /// `devt` (read-only) and `zoned`: type bits never set, but keep the uapi layout.
     devt_zoned: [u8; 48],
     pub(super) dma: ParamDmaAlign,
     /// `seg`; the defaults are fine, so we never set `UBLK_PARAM_TYPE_SEGMENT`.
@@ -234,16 +223,12 @@ const PARAM_TYPE_BASIC: u32 = 1 << 0;
 const PARAM_TYPE_DISCARD: u32 = 1 << 1;
 const PARAM_TYPE_DMA_ALIGN: u32 = 1 << 4;
 
-/// `UBLK_ATTR_FUA`. We deliberately never advertise `UBLK_ATTR_VOLATILE_CACHE`, so the
-/// block layer issues no FLUSH and treats a completed write as durable; nothing here
-/// ever has to look at `UBLK_IO_F_FUA`.
+/// `UBLK_ATTR_FUA`. No `UBLK_ATTR_VOLATILE_CACHE`: no FLUSH from the block layer, a
+/// completed write is durable, and `UBLK_IO_F_FUA` never matters here.
 const ATTR_FUA: u32 = 1 << 3;
 
-/// Device parameters. 4 KiB logical blocks, discard advertised, write-zeroes left to
-/// the block layer to emulate as writes so the handler never sees the op.
-///
-/// `max_sectors` and `chunk_sectors` are both one allocator page, so the block layer
-/// splits and aligns every request onto a single page: the handler never fans out.
+/// Device parameters: 4 KiB logical blocks, discard advertised, write-zeroes emulated as
+/// writes. `max_sectors` and `chunk_sectors` are one allocator page: requests fit a page.
 pub(super) fn params_for(size_bytes: u64, huge: bool) -> Params {
     let page_sectors: u32 = if huge { 8192 } else { 8 };
     Params {
@@ -277,14 +262,9 @@ pub(super) fn params_for(size_bytes: u64, huge: bool) -> Params {
     }
 }
 
-/// The fabric device. Not a consumer device: a request covers 1, 2, or up to 1024
-/// blocks depending on the op, so it must not be split on page boundaries the way a
-/// consumer device is.
-/// `chunk_sectors` is one 4 MiB page, the largest frame there is and its own alignment,
-/// so no request ever spans two frames.
-///
-/// No discard is advertised: a fabric delete is the `TRIM` opcode, not a block discard,
-/// and nothing at this layer would give a discard address meaning.
+/// The fabric device. A request covers 1, 2, or up to 1024 blocks depending on the op, so
+/// it must not be split on page boundaries; `chunk_sectors` is one 4 MiB page, the largest
+/// frame and its own alignment, so no request spans two. No discard: a delete is `TRIM`.
 pub(super) fn params_for_fabric(size_bytes: u64) -> Params {
     const HUGE_SECTORS: u32 = 8192;
     Params {
@@ -311,9 +291,7 @@ pub(super) fn params_for_fabric(size_bytes: u64) -> Params {
     }
 }
 
-// ---------------------------------------------------------------------------
-// control ring
-// ---------------------------------------------------------------------------
+// --- control ring ---
 /// Synchronous owner of `/dev/ublk-control`. Lives on the control thread only.
 pub(super) struct Control {
     ring: IoUring<squeue::Entry128, cqueue::Entry>,
@@ -373,7 +351,6 @@ impl Control {
         Ok(out)
     }
 
-    /// Probe for what we need, never version-check.
     pub(super) fn require(&self, want: u64) -> io::Result<()> {
         let missing = want & !self.features;
         if missing != 0 {
@@ -408,8 +385,7 @@ impl Control {
         self.exec(CMD_SET_PARAMS, &cmd).map(|_| ())
     }
 
-    /// The CPUs blk-mq bound hardware queue `q` to. The queue index rides in `data[0]`
-    /// and the kernel copies a raw `cpumask` of `len` bytes into `addr`.
+    /// CPUs bound to queue `q`. Index in `data[0]`, `cpumask` of `len` bytes into `addr`.
     pub(super) fn queue_affinity(&mut self, dev_id: u32, q: u16) -> io::Result<Vec<usize>> {
         let mut mask = [0u64; 16];
         let cmd = CtrlCmd {

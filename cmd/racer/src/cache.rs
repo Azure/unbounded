@@ -1,38 +1,27 @@
-//! Cooperative caching: which nodes keep a copy of which page, so reads of a hot page
-//! do not all land on the three that own it.
+//! Cooperative caching: which nodes keep a copy of which page, so reads of a hot page do not
+//! all land on the three that own it.
 //!
-//! No consistency of its own. Every cached read is confirmed by the mandatory metadata
-//! round, so staleness is self-correcting and there is no invalidation protocol. Never
-//! a correctness dependency: every entry point may decline, at the cost of one ordinary
-//! read.
+//! No consistency of its own: every cached read is confirmed by the mandatory metadata round,
+//! so staleness is self-correcting and there is no invalidation protocol. Never a correctness
+//! dependency; every entry point may decline, costing one ordinary read.
 //!
-//! Three properties keep this file small:
+//!   * **No directory.** Placement is a rendezvous hash over the reader's own cohort, so
+//!     any reader computes the replica set locally.
+//!   * **No per-key state.** Hotness is a count-min sketch, width is arithmetic on it, the
+//!     width hint is a direct-mapped byte array, and the victim contest reads that same
+//!     sketch. Nothing grows with the key space; nothing allocates after `open`.
+//!   * **No durability.** The map is volatile, writes are in place and `Buffered`, and the
+//!     region is carved at format time. A torn cache page is unreachable after a restart
+//!     because nothing points at it, so the allocator's out-of-place rule does not apply.
 //!
-//!   * **No directory.** Placement is a rendezvous hash over the reader's own cohort,
-//!     so any reader computes the replica set locally.
-//!   * **No per-key state.** Hotness is a count-min sketch, width is arithmetic on it,
-//!     and the reader's width hint is a direct-mapped byte array. Nothing grows with
-//!     the key space and nothing allocates after `open`. The victim contest reads that
-//!     same sketch rather than adding a counter to the slot.
-//!   * **No durability.** The map is volatile, writes are in place and `Buffered`, and
-//!     the region is carved at format time. A torn cache page is unreachable after a
-//!     restart because nothing points at it, so the allocator's out-of-place discipline
-//!     does not apply here.
-//!
-//! Choices worth naming:
-//!
-//!   * The rendezvous hash is [`config::mix`]. It is never on the wire; only local
-//!     computability and `R(k,w) ⊂ R(k,w+1)` matter.
-//!   * A shedding replica answers `MISSING` rather than a busy status of its own, since
-//!     only four errnos survive nvmet. The reader's fallback is identical either way.
-//!   * Admission is per extent, not per node: `Extent::cache_admit` is the demand a page
-//!     must show before it may enter, in requests per decay interval rather than IOPS,
-//!     so it is bounded by the sketch's ceiling of 15. It is a threshold and nothing
-//!     more - it reserves no capacity and ranks no extents.
-//!   * Priority, by contrast, is global. A candidate must out-rank the entry the clock
-//!     hand is pointing at, on measured demand alone, so the hottest key wins whatever
-//!     extent either came from. That contest is what lets an extent admit everything
-//!     without its scan sweeping the rest of the cache away.
+//! The rendezvous hash is [`config::mix`]; never on the wire, so only local computability and
+//! `R(k,w)` being a prefix of `R(k,w+1)` matter. A shedding replica answers `MISSING` rather
+//! than its own busy status, since only four errnos survive nvmet and the reader's fallback is
+//! identical either way. Admission is per extent: `Extent::cache_admit` is the demand a page
+//! must show to enter, in requests per decay interval, so it is bounded by the sketch ceiling
+//! of 15; it reserves no capacity and ranks no extents. Priority is global: a candidate must
+//! out-rank the entry at the clock hand on measured demand alone, which lets an extent admit
+//! everything without its scan sweeping the cache away.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -44,46 +33,38 @@ use crate::layout::{self, Class};
 use crate::paxos::Register;
 use crate::runtime::{self, Buf, Disk, Durability};
 
-// ---------------------------------------------------------------------------
-// tunables
-// ---------------------------------------------------------------------------
+// --- tunables ---
 //
-// Not configuration. Sketch geometry, decay interval and width cap are deliberately
-// absent from the config file: they are correctness-independent, so a node picks them
-// without the control plane knowing anything.
+// Not configuration. Sketch geometry, decay interval and width cap are correctness-
+// independent, so a node picks them without the control plane knowing anything.
 
 /// Count-min rows. Four is where the collision rate stops mattering next to the 4-bit
 /// saturation.
 const ROWS: usize = 4;
-/// Counters per row when this core holds no slots at all, and the floor everywhere. A
-/// power of two so the index is a mask; as packed nibbles that is 128 KiB of sketch,
-/// which is L2-resident.
+/// Counters per row when this core holds no slots, and the floor everywhere. A power of two so
+/// the index is a mask; as packed nibbles that is 128 KiB, which is L2-resident.
 #[cfg(not(feature = "sim"))]
 const COLS_MIN: usize = 1 << 16;
 #[cfg(feature = "sim")]
 const COLS_MIN: usize = 1 << 10;
-/// Counters per row at the ceiling. The sketch has to grow with the cache or a store
-/// whose tail holds millions of slots would filter admissions off a sketch sized for
-/// tens of thousands, and every cold page would look hot. It must not grow without
-/// bound either: at 128 KiB the sketch is L2-resident, a property worth most of what a
-/// bigger one buys, so the cap is where it is still comfortably L3-resident.
+/// Counters per row at the ceiling. The sketch must scale with the cache, or a store whose
+/// tail holds millions of slots filters admissions off a sketch sized for tens of thousands
+/// and every cold page looks hot. The cap keeps it L3-resident.
 #[cfg(not(feature = "sim"))]
 const COLS_MAX: usize = 1 << 21;
 #[cfg(feature = "sim")]
 const COLS_MAX: usize = 1 << 12;
 /// A nibble saturates here.
 const COUNTER_MAX: u8 = 15;
-/// Halvings that take a saturated counter to zero: `15 -> 7 -> 3 -> 1 -> 0`. A sketch
-/// that has been halved this many times without anything being recorded is all zeroes,
-/// and halving it again cannot change it.
+/// Halvings that take a saturated counter to zero: `15 -> 7 -> 3 -> 1 -> 0`.
 const ZEROED_AFTER: u32 = COUNTER_MAX.ilog2() + 1;
 /// Halving at this interval turns the sketch into an exponentially weighted rate.
 const DECAY: Duration = Duration::from_millis(250);
 /// `W_max` before the cohort size caps it.
 const W_CAP: u8 = 64;
-/// Reader-side width hints, direct mapped, sized like the sketch and for the same
-/// reason. A collision mis-hints one address, costing one `MISSING` and a fallback, so
-/// there is nothing to resolve.
+/// Reader-side width hints, direct mapped, sized like the sketch and for the same reason. A
+/// collision mis-hints one address, costing one `MISSING` and a fallback, so there is nothing
+/// to resolve.
 #[cfg(not(feature = "sim"))]
 const HINTS_MIN: usize = 1 << 16;
 #[cfg(feature = "sim")]
@@ -94,31 +75,24 @@ const HINTS_MAX: usize = 1 << 22;
 const HINTS_MAX: usize = 1 << 13;
 
 /// DRAM a resident cache slot costs: the [`Slot`] record plus its share of the map.
-/// `policy.cache_index_bytes` divided by this is how many slots a node may hold, which
-/// is what stops a large tail from turning into an OOM.
+/// `policy.cache_index_bytes` divided by this bounds slots per node, which stops a large tail
+/// from turning into an OOM.
 pub const BYTES_PER_SLOT: u64 = 48;
 
 /// How often core 0 reconsiders the split between the classes.
 const REBALANCE: Duration = Duration::from_secs(1);
-/// How far ahead one class has to be, in confirmed hits per byte it holds, before a
-/// chunk moves to it. A chunk move costs whatever the chunk held, so the controller
-/// should follow a change in the workload and not one interval's noise.
+/// How far ahead one class must be, in confirmed hits per byte held, before a chunk moves to
+/// it. A move costs whatever the chunk held, so this follows a workload change and not one
+/// interval's noise.
 const REBALANCE_MARGIN: u64 = 2;
-/// The share of `policy.cache_index_bytes` the cache builds before it has served a
-/// single read.
-///
-/// The policy is a ceiling, not an allocation. A node whose peers never read through it
-/// should not pay the whole ceiling in DRAM, and a node that starts cold should not pay
-/// it in startup latency either: at the default ceiling the whole budget is twenty-odd
-/// million slot records to zero before the first request arrives. The rebalance grows
-/// the cache out of the pool as it earns it.
+/// The share of `policy.cache_index_bytes` the cache builds before serving a read. The policy
+/// is a ceiling, not an allocation, and paying it up front costs DRAM and startup latency: at
+/// the default that is twenty-odd million slot records to zero before the first request. The
+/// rebalance grows the cache out of the pool instead.
 const OPEN_SHARE: u64 = 64;
-/// The most a class may grow out of the pool in one interval, as a fraction of what it
-/// already holds.
-///
-/// Proportional so that growth is geometric: drawing on the pool costs the other class
-/// nothing, and a cache that had to earn a large tail one chunk a second would still be
-/// warming up an hour later. It stops the moment the class stops evicting.
+/// The most a class may grow out of the pool in one interval, as a fraction of what it already
+/// holds. Proportional so growth is geometric, since drawing on the pool costs the other class
+/// nothing; it stops the moment the class stops evicting.
 const GROWTH_SHARE: u64 = 4;
 
 /// Per-row salt, so the rows are independent hashes of the same address.
@@ -129,33 +103,28 @@ const SALT: [u64; ROWS] = [
     0xff51_afd7_ed55_8ccd,
 ];
 
-/// A power of two in `[lo, hi]` covering `want` entries. Both bounds are powers of two,
-/// so the result indexes with a mask.
+/// A power of two in `[lo, hi]` covering `want` entries. Both bounds are powers of two, so the
+/// result indexes with a mask.
 fn table_len(want: u64, lo: usize, hi: usize) -> usize {
     want.checked_next_power_of_two()
         .unwrap_or(hi as u64)
         .clamp(lo as u64, hi as u64) as usize
 }
 
-// ---------------------------------------------------------------------------
-// sketch
-// ---------------------------------------------------------------------------
+// --- sketch ---
 
-/// Count-min with conservative update and periodic halving.
-///
-/// Conservative update makes the estimator one-sided: it may over-count but never
-/// under-counts. An over-estimate only over-replicates a page, which `W_max` bounds and
-/// the next decay corrects.
+/// Count-min with conservative update and periodic halving. Conservative update makes the
+/// estimator one-sided: it may over-count but never under-count, and over-counting only
+/// over-replicates a page, which `W_max` bounds and the next decay corrects.
 struct Sketch {
     /// One packed nibble array per row.
     rows: [Box<[u8]>; ROWS],
-    /// `cols - 1`, the index mask. Held rather than a const because the sketch is sized
-    /// from the slots this core ended up with.
+    /// `cols - 1`, the index mask. Held rather than a const because the sketch is sized from
+    /// the slots this core ended up with.
     mask: usize,
-    /// Halvings since a counter was last made non-zero. At `ZEROED_AFTER` every counter
-    /// is zero and decay has nothing left to do, which is what keeps a core nothing
-    /// routes to - or a whole node whose cache is off - from walking megabytes of
-    /// zeroes four times a second forever.
+    /// Halvings since a counter was last made non-zero. At `ZEROED_AFTER` every counter is
+    /// zero and decay has nothing left to do, which keeps an idle core, or a node whose cache
+    /// is off, from walking megabytes of zeroes four times a second forever.
     since: u32,
 }
 
@@ -185,7 +154,7 @@ impl Sketch {
         self.since = 0;
     }
 
-    /// The rate estimate `q̂(k)`, in counts since the last halving.
+    /// The rate estimate `q(k)`, in counts since the last halving.
     fn estimate(&self, addr: u64) -> u8 {
         (0..ROWS)
             .map(|r| self.get(r, self.cell(r, addr)))
@@ -211,17 +180,13 @@ impl Sketch {
 
     /// Halve every counter `n` times.
     ///
-    /// Halving a nibble `n` times is one shift and one mask, because the only bits a
-    /// wider shift gets wrong are the `n` that fall out of the high nibble into the low
-    /// one, and `(0x0F >> n) * 0x11` is exactly the pattern that clears them. At
-    /// `ZEROED_AFTER` the mask is zero, so a saturating step needs no special case. Two
-    /// nibbles ride in a byte and eight bytes ride in a word, so this runs a word at a
-    /// time; shifting the word contaminates only the top `n` bits of each nibble, which
-    /// the replicated mask clears just the same.
+    /// One shift and one mask: the only bits a wider shift gets wrong are the `n` falling out
+    /// of the high nibble into the low one, and `(0x0F >> n) * 0x11` clears exactly those. At
+    /// `ZEROED_AFTER` the mask is zero, so a saturating step needs no special case. Runs a
+    /// word at a time; the replicated mask cleans up the same.
     fn halve(&mut self, n: u32) {
-        // Zeroes halve to zeroes. Skipping this is the difference between a node whose
-        // cache is off costing nothing and it walking its whole sketch four times a
-        // second for the life of the process.
+        // Zeroes halve to zeroes. Skipping this keeps a node whose cache is off from walking
+        // its whole sketch four times a second for the life of the process.
         if n == 0 || self.since >= ZEROED_AFTER {
             return;
         }
@@ -242,35 +207,26 @@ impl Sketch {
     }
 }
 
-// ---------------------------------------------------------------------------
-// placement
-// ---------------------------------------------------------------------------
+// --- placement ---
 
-/// This node's cohort, as the config implies it — one roster per universe.
+/// This node's cohort, as the config implies it: one roster per universe.
 ///
-/// There is no cohort roster in the schema. `Node.cohort` names a catalog column, so a
-/// cohort is the projection of a universe's catalog onto that column. Every node
-/// claiming column `c` sees the same catalog and derives the same roster, which is what
-/// local computation of `R` requires. The schema does not check that a node actually
-/// occupies its column in every group — a catalog may permute members to spread the
-/// paxos member index — so the cohort is the label the control plane assigns, not one
-/// derived here.
-///
-/// Per universe, because a cache replica is reached over the universe's own namespace: a
-/// node in some other universe cannot serve a page it was never given an address for,
-/// and a roster that pooled every universe's column would rank it as though it could.
-/// The column index is shared, since the node holds one cohort label whatever universe
-/// it is looking at.
+/// There is no cohort roster in the schema. `Node.cohort` names a catalog column, so a cohort
+/// is the projection of a universe's catalog onto that column, and every node claiming column
+/// `c` derives the same roster, which local computation of `R` requires. The schema does not
+/// check that a node occupies its column in every group (a catalog may permute members to
+/// spread the paxos member index), so the cohort is the control plane's label, not one derived
+/// here. Per universe, because a replica is reached over the universe's own namespace and a
+/// node elsewhere has no address for the page; the column index is shared, since a node holds
+/// one cohort label everywhere.
 #[derive(Default)]
 struct Roster {
     me: u32,
     /// Sorted by universe id.
     cohorts: Box<[(u32, Box<[u32]>)]>,
-    /// Whether any extent asks to be cached at all. Admission is per extent and so is
-    /// decided per address, but a config where nobody opts in turns the whole cache off,
-    /// and that is worth knowing before the address is even looked at: it is the
-    /// difference between a lookup that early-returns and one that hops to another core
-    /// to search a store that is guaranteed empty.
+    /// Whether any extent asks to be cached at all. A config where nobody opts in turns the
+    /// whole cache off, and knowing that before the address is looked at saves a hop to
+    /// another core to search an empty store.
     admits: bool,
 }
 
@@ -298,8 +254,8 @@ impl Roster {
         }
     }
 
-    /// The cohort in one universe. Empty for a universe we hold no catalog for, which
-    /// is the same answer as caching being off there.
+    /// The cohort in one universe. Empty for a universe we hold no catalog for, the same
+    /// answer as caching being off there.
     fn cohort(&self, universe: u32) -> &[u32] {
         match self.cohorts.binary_search_by_key(&universe, |(id, _)| *id) {
             Ok(i) => &self.cohorts[i].1,
@@ -307,20 +263,18 @@ impl Roster {
         }
     }
 
-    /// The widest cohort we are in. `W_max` is a ceiling, and one taken before the
-    /// address is known, so the largest is the right one to take it from.
+    /// The widest cohort we are in. `W_max` is a ceiling taken before the address is known, so
+    /// the largest cohort is the right one to take it from.
     fn widest(&self) -> usize {
         self.cohorts.iter().map(|(_, n)| n.len()).max().unwrap_or(0)
     }
 }
 
-// ---------------------------------------------------------------------------
-// store
-// ---------------------------------------------------------------------------
+// --- store ---
 
-/// One cache slot. Subtractive next to an allocator entry: no CRC, no generation, no
-/// A/B copy, no group commit. The register is here only so a hit can be confirmed
-/// against the quorum; nothing here survives a restart.
+/// One cache slot. Subtractive next to an allocator entry: no CRC, no generation, no A/B copy,
+/// no group commit. The register is here only so a hit can be confirmed against the quorum;
+/// nothing here survives a restart.
 #[derive(Clone, Copy, Default)]
 struct Slot {
     addr: u64,
@@ -328,14 +282,13 @@ struct Slot {
     /// CLOCK reference bit.
     used: bool,
     live: bool,
-    /// A write is in flight into this slot. CLOCK steps over it rather than handing
-    /// the same media out twice.
+    /// A write is in flight into this slot. CLOCK steps over it rather than handing the same
+    /// media out twice.
     busy: bool,
 }
 
-/// Why a claim found no slot. Both are ordinary outcomes, but only one is a policy
-/// decision, and the metrics keep them apart: `Colder` is the cache working as intended
-/// under pressure, `Busy` is transient and self-clearing.
+/// Why a claim found no slot. The metrics keep them apart: `Colder` is the cache working as
+/// intended under pressure, `Busy` is transient and self-clearing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Decline {
     /// Every slot the hand could reach is being written into, or the class holds none.
@@ -344,47 +297,42 @@ enum Decline {
     Colder,
 }
 
-/// One 4 MiB piece of media the cache holds.
-///
-/// Either a chunk of the store's tail, which is the cache's own space and always
-/// available, or a free 4 MiB data slot borrowed from the allocator, which is on loan
-/// and has to go back the moment the slab needs it.
+/// One 4 MiB piece of media the cache holds: either a chunk of the store's tail, which is the
+/// cache's own space, or a free 4 MiB data slot on loan from the allocator, which has to go
+/// back the moment the slab needs it.
 #[derive(Clone, Copy)]
 struct Chunk {
     off: u64,
     borrowed: bool,
 }
 
-/// Slots one 4 MiB chunk holds for a class: 1024 of the small class, exactly one of the
-/// huge class. The asymmetry is the whole reason the two classes cost such different
-/// amounts of DRAM per byte of cache.
+/// Slots one 4 MiB chunk holds for a class: 1024 small, exactly one huge. The asymmetry is why
+/// the classes cost such different amounts of DRAM per byte of cache.
 fn chunk_slots(class: Class) -> usize {
     (layout::CHUNK_BYTES / class.bytes()) as usize
 }
 
 /// This core's share of one class's cache, as a set of 4 MiB chunks.
 ///
-/// Chunks rather than a contiguous stripe because the cache no longer owns a region
-/// carved at format time. It is handed whatever the tail has spare, and it gives pieces
-/// back: to the other class when hotness moves, and to the allocator when a borrowed
-/// slot is wanted for real data. A chunk is the unit of all three.
+/// Chunks rather than a contiguous stripe because the cache does not own a region carved at
+/// format time. It is handed whatever the tail has spare, and it gives pieces back: to the
+/// other class when hotness moves, and to the allocator when a borrowed slot is wanted for
+/// real data. A chunk is the unit of all three.
 struct Store {
     class: Class,
     chunks: Vec<Chunk>,
     /// Slot `i` lives in `chunks[i / chunk_slots]`, at `i % chunk_slots` within it.
     slots: Vec<Slot>,
-    /// `GlobalAddr -> local slot`. Grows only when a chunk is added, never on the hot
-    /// path.
+    /// `GlobalAddr -> local slot`. Grows only when a chunk is added, never on the hot path.
     map: HashMap<u64, u32>,
     hand: u32,
     evicted: u64,
-    /// Entries lost because their chunk went back to the other class or the allocator.
-    /// Kept apart from `evicted` because the rebalance reads evictions as demand, and
-    /// counting its own displacement as demand would make it chase itself.
+    /// Entries lost because their chunk went back to the other class or the allocator. Kept
+    /// apart from `evicted` because the rebalance reads evictions as demand, and counting its
+    /// own displacement would make it chase itself.
     dropped: u64,
-    /// How many of `chunks` are on loan from the allocator. A running count rather than
-    /// a scan: metrics read it on every tick, and `chunks` is as long as the tail is
-    /// wide.
+    /// How many of `chunks` are on loan from the allocator. A running count rather than a
+    /// scan: metrics read it on every tick, and `chunks` is as long as the tail is wide.
     borrowed: usize,
 }
 
@@ -409,8 +357,8 @@ impl Store {
         self.chunks[c].off + k as u64 * self.class.bytes()
     }
 
-    /// Take on another 4 MiB. The slots arrive free, so the only cost is the record and
-    /// the map's share of it, which is what `BYTES_PER_SLOT` is an estimate of.
+    /// Take on another 4 MiB. The slots arrive free, so the only cost is the record and the
+    /// map's share of it, which `BYTES_PER_SLOT` estimates.
     fn push_chunk(&mut self, c: Chunk) {
         let cs = chunk_slots(self.class);
         self.borrowed += c.borrowed as usize;
@@ -425,10 +373,9 @@ impl Store {
         ci * cs..(ci + 1) * cs
     }
 
-    /// Hand back chunk `ci`, dropping whatever it held. `None` while any slot in it, or
-    /// in the chunk that will be moved into its place, is being written into: a busy
-    /// slot has an IO in flight against those exact bytes, and giving them away would
-    /// let that write land on someone else's page.
+    /// Hand back chunk `ci`, dropping whatever it held. `None` while any slot in it, or in the
+    /// chunk moved into its place, is being written into: a busy slot has an IO in flight
+    /// against those exact bytes, so the write could land on someone else's page.
     fn remove_chunk(&mut self, ci: usize) -> Option<u64> {
         let last = self.chunks.len().checked_sub(1)?;
         if self.busy(ci) || self.busy(last) {
@@ -443,9 +390,9 @@ impl Store {
                 }
             }
         }
-        // Swap the last chunk into the hole rather than shifting: a slot index is a
-        // position within `chunks`, so the two have to move together, and moving one
-        // chunk's worth of map entries beats moving every chunk after the hole.
+        // Swap the last chunk into the hole rather than shifting: a slot index is a position
+        // within `chunks`, so the two move together, and moving one chunk's worth of map
+        // entries beats moving every chunk after the hole.
         if ci != last {
             let (from, to) = (self.range(last), self.range(ci));
             for (a, b) in from.zip(to) {
@@ -470,8 +417,8 @@ impl Store {
         self.range(ci).any(|i| self.slots[i].busy)
     }
 
-    /// Give back one chunk, preferring `borrowed` ones. Used both by the reclaim path,
-    /// which must have a borrowed one, and by the rebalance, which must not.
+    /// Give back one chunk, preferring `borrowed` ones. Used by the reclaim path, which must
+    /// have a borrowed one, and by the rebalance, which must not.
     fn give(&mut self, borrowed: bool) -> Option<u64> {
         let mut ci = self.chunks.len();
         while ci > 0 {
@@ -485,8 +432,8 @@ impl Store {
         None
     }
 
-    /// Whether `addr` is already cached at exactly `reg`; re-admitting it would rewrite
-    /// bytes that are already there.
+    /// Whether `addr` is already cached at exactly `reg`; re-admitting it would rewrite bytes
+    /// already there.
     fn current(&self, addr: u64, reg: Register) -> bool {
         self.map.get(&addr).is_some_and(|&i| {
             let s = &self.slots[i as usize];
@@ -511,12 +458,11 @@ impl Store {
     }
 
     /// Claim a slot for `addr`, evicting by CLOCK if need be, and mark it busy for the
-    /// duration of the write. Never a reason to wait: both declines mean take the
-    /// ordinary read path.
+    /// duration of the write. Never a reason to wait: both declines mean take the ordinary
+    /// read path.
     ///
-    /// `hotter(victim)` decides the contest at the hand, and is asked only about a live
-    /// entry that has already spent its second chance. An empty slot is taken without
-    /// one.
+    /// `hotter(victim)` decides the contest at the hand, and is asked only about a live entry
+    /// that has already spent its second chance. An empty slot is taken without one.
     fn claim(
         &mut self,
         addr: u64,
@@ -532,9 +478,8 @@ impl Store {
             None => self.evict(hotter)?,
         };
         self.map.insert(addr, i);
-        // A fresh entry starts with a clear reference bit: it already passed admission,
-        // and a grace period would make the hand step over genuinely hot entries to
-        // reach it.
+        // A fresh entry starts with a clear reference bit: it already passed admission, and a
+        // grace period would make the hand step over genuinely hot entries.
         self.slots[i as usize] = Slot {
             addr,
             reg,
@@ -545,14 +490,12 @@ impl Store {
         Ok(i)
     }
 
-    /// The CLOCK hand. Two sweeps at most: the first clears reference bits, the second
-    /// is guaranteed to find one clear unless every slot is busy.
+    /// The CLOCK hand. Two sweeps at most: the first clears reference bits, the second is
+    /// guaranteed to find one clear unless every slot is busy.
     ///
-    /// The first clear live entry the hand reaches is the one candidate is measured
-    /// against, and losing to it ends the admission rather than moving the hand on to
-    /// look for a weaker victim. Sweeping on would turn one contest into a search for
-    /// whatever the cache holds that is coldest, which is both O(slots) per admission
-    /// and a guarantee that a scan always finds something to displace.
+    /// The candidate is measured against the first clear live entry the hand reaches, and
+    /// losing to it ends the admission rather than sweeping on for a weaker victim, which
+    /// would be O(slots) per admission and would let a scan always find a victim.
     fn evict(&mut self, hotter: impl Fn(u64) -> bool) -> Result<u32, Decline> {
         let n = self.slots.len() as u32;
         for _ in 0..2 * n {
@@ -591,18 +534,14 @@ impl Store {
     }
 }
 
-// ---------------------------------------------------------------------------
-// per-core state
-// ---------------------------------------------------------------------------
+// --- per-core state ---
 
 /// Everything the cache keeps on one core.
 ///
-/// Two different shardings meet here. The sketch and the stores are reached on the core
-/// owning the address's consensus group, so they ride the hop the round is already
-/// taking and the sketch sees the whole read stream. The hints are reached on whatever
-/// core handles the request, because that is where the reply trailer carrying the width
-/// lands and where the decision to take a cached leg is made; a hint is advisory, so a
-/// per-core view of it is preferable anyway.
+/// Two shardings meet here. The sketch and the stores are reached on the core owning the
+/// address's consensus group, so they ride the hop the round already takes and the sketch sees
+/// the whole read stream. The hints are reached on whatever core handles the request, where
+/// the reply trailer carrying the width lands; a hint is advisory, so per-core is fine.
 struct Local {
     sketch: Sketch,
     stores: [Store; 2],
@@ -613,14 +552,13 @@ struct Local {
     stats: Stats,
 }
 
-/// Per-core, per-class counters, read by [`Cache::local_stats`]; the exporter sums
-/// across cores.
+/// Per-core, per-class counters, read by [`Cache::local_stats`]; the exporter sums cores.
 #[derive(Clone, Copy, Default)]
 pub struct ClassStats {
     pub hits: u64,
     pub misses: u64,
-    /// Hits that then passed confirmation against the quorum. The gap between this and
-    /// `hits` is what staleness costs.
+    /// Hits that then passed confirmation against the quorum. The gap against `hits` is what
+    /// staleness costs.
     pub served: u64,
     pub admits: u64,
     pub evictions: u64,
@@ -629,50 +567,42 @@ pub struct ClassStats {
     pub dropped: u64,
     pub stale: u64,
     pub shed: u64,
-    /// Admissions refused because the extent's `cache_admit` said no: either the extent
-    /// caches nothing, or the page had not yet shown the demand the extent asks for.
-    ///
-    /// Counted where the decision is made, which for 4 KiB pages is the group member
-    /// computing the width rather than the node that would have done the caching. A
-    /// client seeing few admits and no rejections here is being vetoed elsewhere.
+    /// Admissions refused because the extent's `cache_admit` said no: the extent caches
+    /// nothing, or the page had not shown the demand it asks for. Counted where the decision
+    /// is made, which for 4 KiB pages is the group member computing the width rather than the
+    /// node that would have cached. A client seeing few admits and no rejections here is being
+    /// vetoed elsewhere.
     pub rejected_policy: u64,
-    /// Admissions refused because the entry at the clock hand was in more demand. Rising
-    /// with a full cache is the contest doing its job; rising with a cache that is not
-    /// full means the class is short of slots, not short of demand.
+    /// Admissions refused because the entry at the clock hand was in more demand. Rising with
+    /// a full cache is the contest doing its job; rising with a cache that is not full means
+    /// the class is short of slots, not short of demand.
     pub rejected_victim: u64,
-    /// Media this class holds on this core, and the part of it that is on loan from the
-    /// allocator's free list rather than the store's own tail.
+    /// Media this class holds on this core, and the part on loan from the allocator's free
+    /// list rather than the store's own tail.
     pub bytes: u64,
     pub borrowed_bytes: u64,
 }
 
-/// Counters split by page class. The two classes differ by three orders of magnitude in
-/// bytes per slot, so a single number for either hit rate or capacity says nothing
-/// useful about the mix, and the rebalance reads exactly these to decide which class
-/// earns more per byte.
+/// Counters split by page class. The classes differ by three orders of magnitude in bytes per
+/// slot, so one number for hit rate or capacity says nothing about the mix, and the rebalance
+/// reads exactly these to decide which class earns more per byte.
 #[derive(Clone, Copy, Default)]
 pub struct Stats {
     pub per: [ClassStats; 2],
 }
 
-// ---------------------------------------------------------------------------
-// Cache
-// ---------------------------------------------------------------------------
+// --- Cache ---
 
-/// The tail chunks nobody is holding, plus the bookkeeping the rebalance needs.
-///
-/// Core 0 only. The rebalance runs there as a spawned task and is the only writer;
-/// `Cache::tick` on any other core never touches it.
+/// The tail chunks nobody is holding, plus the bookkeeping the rebalance needs. Core 0 only:
+/// the rebalance runs there as a spawned task and is the only writer, and `Cache::tick` on any
+/// other core never touches it.
 #[derive(Default)]
 struct Pool {
-    /// Free tail chunks. Non-empty when the DRAM budget, not the disk, is what bounds
-    /// the cache.
+    /// Free tail chunks. Non-empty when the DRAM budget, not the disk, bounds the cache.
     free: Vec<u64>,
-    /// `served` at the last sample, per class, for differencing.
+    /// Per-class counters at the last sample, for differencing.
     served: [u64; 2],
-    /// `evictions` at the last sample, per class.
     evicted: [u64; 2],
-    /// `misses` at the last sample, per class.
     missed: [u64; 2],
     /// When the last sample was taken.
     sampled: Option<Instant>,
@@ -693,50 +623,45 @@ struct Census {
 pub struct Cache {
     alloc: &'static Allocator,
     disk: Disk,
-    /// The tail this cache was handed at open: base and chunk count. Fixed for the life
-    /// of the process, because the layout it is derived from is.
+    /// The tail this cache was handed at open: base and chunk count. Fixed for the life of the
+    /// process, because the layout it comes from is.
     tail: (u64, u64),
-    /// Cores that can own an address of each class, which is how many of them the cache
-    /// may put slots on.
+    /// Cores that can own an address of each class, so how many may hold slots for it.
     shards: [usize; 2],
-    /// Slots the node may hold across every core and class, from
-    /// `policy.cache_index_bytes`.
+    /// Slots the node may hold across all cores and classes, from `policy.cache_index_bytes`.
     budget: u64,
     roster: config::Live<Roster>,
     state: Box<[RefCell<Local>]>,
     pool: RefCell<Pool>,
 }
 
-// Sound because every `Local` is only ever borrowed from the worker that owns it, and
-// never across an await. Same argument as `Allocator` and `Paxos`. `pool` is core 0's
-// by the same convention.
+// Sound because every `Local` is only ever borrowed from the worker that owns it, and never
+// across an await. Same argument as `Allocator` and `Paxos`. `pool` is core 0's by the same
+// convention.
 unsafe impl Sync for Cache {}
 
 /// Build the cache and leak it: hop closures must be `Send + 'static`.
 ///
-/// The cache is entitled to the whole tail, every 4 MiB the layout did not claim,
-/// subject to what `policy.cache_index_bytes` will pay for in slot records. It does not
-/// take it all at open: it starts on `OPEN_SHARE` of the budget and the rebalance hands
-/// out the rest as the classes earn it. A store with no room past its slabs, or a config
-/// no extent opts into, produces a cache with no slots, which declines everything at no
-/// cost.
+/// The cache is entitled to the whole tail, every 4 MiB the layout did not claim, subject to
+/// what `policy.cache_index_bytes` will pay for in slot records. A store with no room past its
+/// slabs, or a config no extent opts into, produces a cache with no slots, which declines
+/// everything at no cost.
 pub fn open(alloc: &'static Allocator, cores: usize) -> &'static Cache {
     let cfg = alloc.config();
     let geo = alloc.geometry();
     let (base, _) = geo.tail(cfg.node.store_bytes);
     let chunks = geo.tail_chunks(cfg.node.store_bytes);
     let budget = cfg.policy.cache_index_bytes / BYTES_PER_SLOT;
-    // Only cores an address of this class can hop to. `owner_core` routes every lookup
-    // through `shards_for`, so slots placed on a core past that are slots nothing can
-    // ever reach, which is the shape the fixed cache region used to be striped into.
+    // Only cores an address of this class can hop to. `owner_core` routes every lookup through
+    // `shards_for`, so slots placed on a core past that are unreachable.
     let shards = [Class::Small, Class::Huge].map(|c| alloc.shards_for(c).min(cores).max(1));
 
     let want = plan_chunks(chunks, budget / OPEN_SHARE, cfg);
     let now = Instant::now();
     let mut next = [0u64, want[0]];
-    // Sized from what a core may end up holding, not from what it starts with: both
-    // tables are approximations whose error is what they cost, and resizing either one
-    // would throw away the history that makes them worth keeping.
+    // Sized from what a core may end up holding, not from what it starts with: both tables are
+    // approximations whose error is what they cost, and resizing either would throw away the
+    // history that makes them worth keeping.
     let share = (budget / cores as u64).max(1);
     let (cols, hints) = (
         table_len(share, COLS_MIN, COLS_MAX),
@@ -792,17 +717,13 @@ pub fn open(alloc: &'static Allocator, cores: usize) -> &'static Cache {
 
 /// How many of `chunks` each class starts with.
 ///
-/// The split is the node's own byte mix, on the theory that a node holding mostly 4 MiB
-/// pages has peers reading mostly 4 MiB pages; a node holding neither, a pure cache
-/// client, which is the role the cooperative cache exists for, splits evenly. Either
-/// way the rebalance moves chunks toward whichever class is actually earning hits, so
-/// this only has to be a decent prior rather than a decision.
-///
-/// `budget` then binds the small class and effectively never the huge one: a 4 MiB
-/// chunk is 1024 small slots or one huge slot, so small cache costs 1024 times the DRAM
-/// per byte of media. Chunks the budget cannot pay for are left in the pool rather than
-/// handed to the huge class, so that a later shift toward small has somewhere to draw
-/// from without first taking media away from huge.
+/// The split is the node's own byte mix, on the theory that a node holding mostly 4 MiB pages
+/// has peers reading mostly 4 MiB pages; a pure cache client, holding neither, splits evenly.
+/// The rebalance then moves chunks toward whichever class earns hits, so this only has to be a
+/// decent prior. `budget` binds the small class and effectively never the huge one: a 4 MiB
+/// chunk is 1024 small slots or one huge slot. Chunks the budget cannot pay for stay in the
+/// pool rather than going to huge, so a later shift toward small can draw on them without
+/// taking media from huge.
 fn plan_chunks(chunks: u64, budget: u64, cfg: &Config) -> [u64; 2] {
     if chunks == 0 {
         return [0, 0];
@@ -820,22 +741,20 @@ fn plan_chunks(chunks: u64, budget: u64, cfg: &Config) -> [u64; 2] {
 
 /// Which class the next chunk should go to, if either.
 ///
-/// Two signals, both measured over one interval. Evictions are demand: a class that has
-/// not had to reuse a slot has no use for more media however well it is doing, so it
-/// never asks. Confirmed hits per byte held is value, per byte rather than per slot
-/// because bytes are the currency being handed out. `REBALANCE_MARGIN` is the
-/// hysteresis that keeps the split from chasing noise.
+/// Two signals, both over one interval. Evictions are demand: a class that has not had to
+/// reuse a slot never asks. Confirmed hits per byte held is value, per byte because bytes are
+/// the currency handed out. `REBALANCE_MARGIN` is the hysteresis against noise.
 fn wants(served: [u64; 2], evicted: [u64; 2], missed: [u64; 2], bytes: [u64; 2]) -> Option<usize> {
-    // A class holding nothing cannot evict, so its misses stand in for its demand.
-    // Without this a class that started empty could never be given anything.
+    // A class holding nothing cannot evict, so its misses stand in for its demand. Without
+    // this a class that started empty could never be given anything.
     let short = |k: usize| evicted[k] > 0 || (bytes[k] == 0 && missed[k] > 0);
     match (short(0), short(1)) {
         (false, false) => None,
         (true, false) => Some(0),
         (false, true) => Some(1),
         (true, true) => {
-            // A class holding nothing has no measured yield and takes the tie: one
-            // chunk is what it costs to find out whether it deserves more.
+            // A class holding nothing has no measured yield and takes the tie: one chunk is
+            // what it costs to find out whether it deserves more.
             if bytes[0] == 0 {
                 return Some(0);
             }
@@ -857,7 +776,7 @@ fn wants(served: [u64; 2], evicted: [u64; 2], missed: [u64; 2], bytes: [u64; 2])
 }
 
 /// Hysteresis: raise fast, lower one step at a time. Rendezvous nesting means a one-step
-/// change churns only the boundary replica, so damping the descent is the whole of the
+/// change churns only the boundary replica, so damping the descent is the whole
 /// anti-oscillation story.
 fn damp(cur: u8, w: u8) -> u8 {
     if w >= cur {
@@ -867,22 +786,18 @@ fn damp(cur: u8, w: u8) -> u8 {
     }
 }
 
-/// Core `c`'s contiguous share of `total` chunks, as `(first, count)`. Contiguous rather
-/// than round-robin so a CLOCK sweep walks the device in order.
+/// Core `c`'s contiguous share of `total` chunks, as `(first, count)`. Contiguous rather than
+/// round-robin so a CLOCK sweep walks the device in order.
 fn stripe(total: u64, cores: usize, c: usize) -> (u64, u64) {
     let lo = total * c as u64 / cores as u64;
     let hi = total * (c + 1) as u64 / cores as u64;
     (lo, hi - lo)
 }
 
-/// Where in the decay interval core `c` does its halving.
-///
-/// Every core is handed the same start instant and thereafter advances its own clock in
-/// whole `DECAY` steps, so without an offset they all halve on the same boundary and a
-/// node walks `cores` whole sketches at one instant, four times a second. Spreading them
-/// across the interval costs nothing and keeps one core's decay out of the others' way in
-/// the shared cache. The offset is added rather than subtracted so it cannot underflow an
-/// `Instant` on a machine that has only just booted.
+/// Where in the decay interval core `c` does its halving. Every core is handed the same start
+/// instant and then advances in whole `DECAY` steps, so without an offset they all halve on
+/// the same boundary and a node walks `cores` whole sketches at once. The offset is added
+/// rather than subtracted so it cannot underflow an `Instant` after a fresh boot.
 fn phase(c: usize, cores: usize) -> Duration {
     DECAY * c as u32 / cores.max(1) as u32
 }
@@ -897,21 +812,20 @@ impl Cache {
         self.roster.install(Roster::of(cfg));
     }
 
-    /// Whether this node can cache at all. Structural only, and deliberately cheap: a
-    /// cohort of nobody leaves no peer to place a replica on, and a config where no
-    /// extent opts in leaves nothing to place. Both are properties of the config rather
-    /// than of the address, so a lookup can be refused before it costs a hop. Whether a
-    /// particular page should be cached is per extent and lives in `observe_local`.
+    /// Whether this node can cache at all. Structural only, and deliberately cheap: a cohort
+    /// of nobody leaves no peer to place a replica on, and a config where no extent opts in
+    /// leaves nothing to place. Both are properties of the config rather than the address, so
+    /// a lookup can be refused before it costs a hop. Whether a particular page should be
+    /// cached is per extent and lives in `observe_local`.
     fn enabled(&self) -> bool {
         let r = self.roster.get();
         r.admits && r.widest() > 0
     }
 
-    /// Sheds while the allocator is short of free space, or while the store's rate
-    /// budget is already committed ahead. Cache space is statically separate from the
-    /// allocator's but store bandwidth is not, so the cache stops admitting before
-    /// anything authoritative slows down. An inbound extent migration reaches the cache
-    /// through this and nothing else.
+    /// Sheds while the allocator is short of free space, or while the store's rate budget is
+    /// committed ahead. Cache space is statically separate from the allocator's but store
+    /// bandwidth is not, so the cache stops admitting before anything authoritative slows
+    /// down. An inbound extent migration reaches the cache through this alone.
     pub fn shedding(&self) -> bool {
         self.alloc.pressure() != Pressure::Normal || self.alloc.store_pressed()
     }
@@ -920,8 +834,8 @@ impl Cache {
         f(&mut self.local().stats.per[Cache::class(huge)]);
     }
 
-    /// This core's counters. Evictions, capacity and the borrowed share are the stores'
-    /// own state rather than separate counters.
+    /// This core's counters. Evictions, capacity and the borrowed share are the stores' own
+    /// state rather than separate counters.
     pub fn local_stats(&self) -> Stats {
         let l = self.local();
         let mut s = l.stats;
@@ -934,35 +848,32 @@ impl Cache {
         s
     }
 
-    /// Count a cached page that passed confirmation. The one counter the cache cannot
-    /// keep itself, because confirmation happens inside the consensus round.
+    /// Count a cached page that passed confirmation. The one counter the cache cannot keep
+    /// itself, because confirmation happens inside the consensus round.
     pub fn served(&self, huge: bool) {
         self.stat(huge, |s| s.served += 1);
     }
 
-    // ----------------------------------------------------------------- hotness
+    // --- hotness ---
 
-    /// Record one read of `addr` and return the width its owner should advertise, which
-    /// is zero unless the extent's `cache_admit` is satisfied.
+    /// Record one read of `addr` and return the width its owner should advertise, zero unless
+    /// the extent's `cache_admit` is satisfied.
     ///
-    /// This is where admission is decided, because this is where the signal is. Must run
-    /// on the core owning the address's group, where paxos already handles the metadata
-    /// round, so the owner keeps observing the whole read stream even for pages it no
-    /// longer serves itself - and for a 4 KiB page the owner is the *only* node that
-    /// sees every read, since the nodes that would cache it are by construction not
-    /// members of its group.
-    ///
-    /// A width of zero is the veto: `holds` refuses it, `replica` refuses it, and the
-    /// reader's `offer` never even calls `admit`. So the threshold needs no wire field
-    /// and no extra round - it rides back in the reply trailer that already carries `w`.
+    /// Must run on the core owning the address's group: paxos already handles the metadata
+    /// round there, so the owner observes the whole read stream even for pages it no longer
+    /// serves, and for a 4 KiB page it is the *only* node that sees every read, because the
+    /// nodes that would cache it are by construction not group members. Zero width is the
+    /// veto: `holds` and `replica` refuse it and the reader's `offer` never calls `admit`, so
+    /// the threshold needs no wire field and no extra round; it rides in the reply trailer
+    /// that carries `w`.
     pub fn observe_local(&self, addr: GlobalAddr) -> u8 {
-        // Nothing to advertise a width to, so nothing to count either: a node whose
-        // cache is off by config would otherwise report every read as a rejection.
+        // Nothing to advertise a width to, so nothing to count either: a node whose cache is
+        // off by config would otherwise report every read as a rejection.
         if !self.enabled() {
             return 0;
         }
-        // One lookup for both the class and the threshold; an address in no extent of
-        // ours is not a rejection, it is nothing to reject.
+        // One lookup for both the class and the threshold; an address in no extent of ours is
+        // not a rejection, it is nothing to reject.
         let Some((huge, n)) = self
             .alloc
             .config()
@@ -976,9 +887,9 @@ impl Cache {
             return 0;
         }
         let cap = self.w_max();
-        // Observe before testing, so a page below the threshold still accumulates the
-        // demand that would carry it over. `n == 1` therefore always passes, since the
-        // sketch never answers below one for a key it has just seen.
+        // Observe before testing, so a page below the threshold still accumulates the demand
+        // that would carry it over. `n == 1` therefore always passes: the sketch never answers
+        // below one for a key it has just seen.
         let q = self.local().sketch.observe(addr.0);
         if q < n {
             self.stat(huge, |s| s.rejected_policy += 1);
@@ -987,9 +898,9 @@ impl Cache {
         q.min(cap)
     }
 
-    /// `observe_local` with a hop of its own, for the 4 MiB path: an immutable hit takes
-    /// no metadata round, so there is no owner reply to carry a width and the reader's
-    /// own read stream is the only signal.
+    /// `observe_local` with a hop of its own, for the 4 MiB path: an immutable hit takes no
+    /// metadata round, so no owner reply carries a width and the reader's own read stream is
+    /// the only signal.
     pub async fn observe(&'static self, addr: GlobalAddr) -> u8 {
         if !self.enabled() {
             return 0;
@@ -1007,14 +918,12 @@ impl Cache {
             .min(W_CAP)
     }
 
-    // ------------------------------------------------------------------- hints
+    // --- hints ---
 
-    /// The width last advertised for `addr`, as this core remembers it.
-    ///
-    /// The cached leg and the metadata round are issued together, but `w` arrives *in*
-    /// that round's reply, so the leg can only be taken on a width learned from an
-    /// earlier read. The first read of a key is therefore always uncached, which is also
-    /// what the admission filter wants.
+    /// The width last advertised for `addr`, as this core remembers it. The cached leg and the
+    /// metadata round are issued together, but `w` arrives *in* that round's reply, so the leg
+    /// can only be taken on a width learned from an earlier read. The first read of a key is
+    /// therefore always uncached, which is what the admission filter wants.
     pub fn hint(&self, addr: GlobalAddr) -> u8 {
         let l = self.local();
         l.hints[config::mix(addr.0) as usize & l.hint_mask]
@@ -1027,10 +936,10 @@ impl Cache {
         l.hints[i] = damp(l.hints[i], w);
     }
 
-    // --------------------------------------------------------------- placement
+    // --- placement ---
 
-    /// Whether we are one of the `w` replicas for `addr`: the number of cohort peers
-    /// that outrank us is below the width.
+    /// Whether we are one of the `w` replicas for `addr`: the number of cohort peers that
+    /// outrank us is below the width.
     pub fn holds(&self, addr: GlobalAddr, w: u8) -> bool {
         let r = self.roster.get();
         let nodes = r.cohort(addr.universe());
@@ -1041,8 +950,8 @@ impl Cache {
         nodes.iter().filter(|&&n| rank(addr.0, n) > mine).count() < w as usize
     }
 
-    /// The highest-ranked live member of `R`, excluding ourselves. `ok` is the
-    /// reachability test: a cohort peer we hold no link to is not a candidate.
+    /// The highest-ranked live member of `R`, excluding ourselves. `ok` is the reachability
+    /// test: a cohort peer we hold no link to is not a candidate.
     pub fn replica(&self, addr: GlobalAddr, w: u8, ok: impl Fn(u32) -> bool) -> Option<u32> {
         let r = self.roster.get();
         let nodes = r.cohort(addr.universe());
@@ -1064,18 +973,16 @@ impl Cache {
         (ahead < w as usize).then_some(node)
     }
 
-    // ------------------------------------------------------------------- store
+    // --- store ---
 
     fn class(huge: bool) -> usize {
         usize::from(huge)
     }
 
-    /// Read `addr` out of the local cache region into `buf`, returning the register the
-    /// entry claims. The caller confirms that register against the quorum; this makes no
-    /// claim about freshness.
-    ///
-    /// `off` is a byte offset into the page, for the 4 MiB class where one page is many
-    /// block requests.
+    /// Read `addr` out of the local cache region into `buf`, returning the register the entry
+    /// claims. The caller confirms that register against the quorum; this makes no claim about
+    /// freshness. `off` is a byte offset into the page, for the 4 MiB class where one page is
+    /// many block requests.
     pub async fn load(
         &'static self,
         addr: GlobalAddr,
@@ -1086,12 +993,11 @@ impl Cache {
         self.load_at(addr, huge, off, buf, None).await
     }
 
-    /// The cached 4 MiB path. An entry is servable only while it carries the current
-    /// epoch's live version, so an epoch bump invalidates every immutable entry with one
-    /// comparison — the whole of the invalidation protocol. The register comes back so
-    /// the caller can confirm it against the group: this class has no per-page checksum
-    /// and a 4 MiB frame has no trailer, so the version is the only handle on which
-    /// value these bytes are.
+    /// The cached 4 MiB path. An entry is servable only while it carries the current epoch's
+    /// live version, so an epoch bump invalidates every immutable entry with one comparison;
+    /// that is the whole invalidation protocol. The register comes back for the caller to
+    /// confirm against the group: this class has no per-page checksum and a 4 MiB frame has no
+    /// trailer, so the version is the only handle on these bytes.
     pub async fn load_immutable(
         &'static self,
         addr: GlobalAddr,
@@ -1106,10 +1012,9 @@ impl Cache {
             .await
     }
 
-    /// What our cached copy of `addr` claims, with no bytes moved: the register half of
-    /// a 4 MiB cache hit, whose frame has no trailer to gather one into. Filtered
-    /// exactly as [`Self::load_immutable`] filters, so the two agree on which entry they
-    /// mean.
+    /// What our cached copy of `addr` claims, with no bytes moved: the register half of a 4
+    /// MiB cache hit, whose frame has no trailer to gather one into. Filtered exactly as
+    /// [`Self::load_immutable`] filters, so the two agree on which entry they mean.
     pub async fn peek_immutable(&'static self, addr: GlobalAddr, huge: bool) -> Option<Register> {
         if !self.enabled() {
             return None;
@@ -1124,12 +1029,10 @@ impl Cache {
 
     /// Look the entry up on the core that owns it, then read the bytes here.
     ///
-    /// The lookup has to hop and the IO must not: a registered buffer's index is
-    /// meaningful only on the ring it was registered on, so `buf` may only be handed to
-    /// the disk from the core the request arrived on. Same shape as the allocator's
-    /// reserve-here, write-there split.
-    ///
-    /// `want` filters on the version *before* any IO, so a stale immutable entry never
+    /// The lookup has to hop and the IO must not: a registered buffer's index is meaningful
+    /// only on the ring it was registered on, so `buf` may only be handed to the disk from the
+    /// core the request arrived on. Same shape as the allocator's reserve-here, write-there
+    /// split. `want` filters on the version *before* any IO, so a stale immutable entry never
     /// puts bytes in the caller's buffer.
     async fn load_at(
         &'static self,
@@ -1150,9 +1053,9 @@ impl Cache {
             return None;
         }
         if self.disk.read(at + off as u64, buf).await.is_err() {
-            // A cache page we cannot read is one we do not have. Silent rot is invisible
-            // here — confirmation covers the register, not the bytes — but a hard read
-            // error means the entry is gone.
+            // A cache page we cannot read is one we do not have. Silent rot is invisible here
+            // (confirmation covers the register, not the bytes), but a hard read error means
+            // the entry is gone.
             runtime::on_core(owner, move || async move {
                 self.local().stores[Cache::class(huge)].forget(addr.0);
                 self.stat(huge, |s| s.misses += 1);
@@ -1164,10 +1067,10 @@ impl Cache {
         Some(reg)
     }
 
-    /// The absolute byte offset of `addr`'s entry, resolved on the owning core because
-    /// only that core knows which chunks its store currently holds. The caller does the
-    /// IO, so it gets an offset and not a slot: by the time the bytes move, the slot
-    /// number could mean a different chunk.
+    /// The absolute byte offset of `addr`'s entry, resolved on the owning core because only
+    /// that core knows which chunks its store holds. The caller does the IO, so it gets an
+    /// offset and not a slot: by the time the bytes move, the slot number could mean a
+    /// different chunk.
     fn find_here(
         &self,
         addr: GlobalAddr,
@@ -1175,29 +1078,27 @@ impl Cache {
         want: Option<u64>,
     ) -> Option<(u64, Register)> {
         let k = Cache::class(huge);
-        // Bind before the borrow ends: a scrutinee's borrow lives as long as the arms,
-        // and the miss arm reaches for the same cell again.
+        // Bind before the borrow ends: a scrutinee's borrow lives as long as the arms, and the
+        // miss arm reaches for the same cell again.
         let found = self.local().stores[k].find(addr.0);
         let Some((slot, reg)) = found.filter(|v| want.is_none_or(|w| v.1.version == w)) else {
             self.stat(huge, |s| s.misses += 1);
             return None;
         };
-        // A hit is a read too, and for a 4 KiB page this is the only place this node
-        // learns of one: the group members see the metadata round, but a hit served from
-        // here never reaches them. Without it a resident entry's estimate would only
-        // decay, and it would lose the contest to the first candidate that walked past.
-        // The 4 MiB path counted this read in `cache_width` already.
+        // A hit is a read too, and for a 4 KiB page this is the only place this node learns of
+        // one: group members see the metadata round, but a hit served from here never reaches
+        // them, so a resident entry's estimate would only decay and lose the contest to the
+        // first candidate walking past. The 4 MiB path counted this read in `cache_width`
+        // already.
         if !huge {
             self.local().sketch.observe(addr.0);
         }
         Some((self.local().stores[k].off(slot), reg))
     }
 
-    /// Offer `buf` to the cache as the value of `addr` at `reg`, given the width `w` its
-    /// owner last advertised.
-    ///
-    /// Declines silently — not one of the `w` replicas, not hot enough, device under
-    /// pressure, or every slot being written. The cache never fails a write, it declines
+    /// Offer `buf` to the cache as the value of `addr` at `reg`, given the width `w` its owner
+    /// last advertised. Declines silently: not one of the `w` replicas, not hot enough, device
+    /// under pressure, or every slot being written. The cache never fails a write, it declines
     /// one.
     pub async fn admit(
         &'static self,
@@ -1213,8 +1114,8 @@ impl Cache {
         let Ok(owner) = self.alloc.owner_core(addr) else {
             return;
         };
-        // Claim on the owning core, write here, then report back: the buffer's
-        // registration belongs to this core's ring and cannot travel (see `load_at`).
+        // Claim on the owning core, write here, then report back: the buffer's registration
+        // belongs to this core's ring and cannot travel (see `load_at`).
         let Some((slot, at)) =
             runtime::on_core(
                 owner,
@@ -1224,9 +1125,9 @@ impl Cache {
         else {
             return;
         };
-        // One IO, in place, `Buffered`: no torn-write hazard, because nothing points at
-        // these bytes after a restart. The slot stays busy across it, which is also what
-        // stops its chunk from being handed away underneath the write.
+        // One IO, in place, `Buffered`: no torn-write hazard, because nothing points at these
+        // bytes after a restart. The slot stays busy across it, which also stops its chunk
+        // from being handed away underneath the write.
         let ok = buf.len() as u64 == Class::of(huge).bytes()
             && self.disk.write(at, buf, Durability::Buffered).await.is_ok();
         runtime::on_core(owner, move || async move {
@@ -1240,11 +1141,10 @@ impl Cache {
 
     /// Take a slot for `addr` on the owning core, or decline.
     ///
-    /// The threshold is not rechecked here - `observe_local` already applied it, and the
-    /// zero width it returns on a veto never reaches this function. What is rechecked is
-    /// the kill switch, because that has to bite the moment the config lands rather than
-    /// after the reader's damped width hint has drained; it costs one extent lookup and
-    /// no sketch.
+    /// The threshold is not rechecked here: `observe_local` already applied it, and the zero
+    /// width it returns on a veto never reaches this function. The kill switch is rechecked,
+    /// because it has to bite the moment the config lands rather than after the reader's
+    /// damped width hint drains; it costs one extent lookup and no sketch.
     fn claim_here(&self, addr: GlobalAddr, huge: bool, reg: Register) -> Option<(u32, u64)> {
         let k = Cache::class(huge);
         if self.local().stores[k].current(addr.0, reg) {
@@ -1260,10 +1160,10 @@ impl Cache {
         }
         let mut l = self.local();
         // Count the read this node is about to serve from its own cache. The 4 MiB path
-        // already did so in `cache_width` before the read, on this same core; the 4 KiB
-        // path has not, because for a small page `observe_local` runs on a group member
-        // and this node is not one. Without this the local sketch would answer zero for
-        // every small page and the contest below would be a coin toss it always won.
+        // already did so in `cache_width`, on this same core; the 4 KiB path has not, because
+        // for a small page `observe_local` runs on a group member and this node is not one.
+        // Otherwise the local sketch answers zero for every small page and the contest below
+        // is a coin toss it always wins.
         let cand = if huge {
             l.sketch.estimate(addr.0)
         } else {
@@ -1271,9 +1171,9 @@ impl Cache {
         };
         let l = &mut *l;
         let (sketch, store) = (&l.sketch, &mut l.stores[k]);
-        // The contest, and the only place hotness reaches victim selection. Ties go to
-        // the candidate, so a cold scan at an estimate of one churns other cold entries
-        // and leaves anything at two or more alone.
+        // The contest, and the only place hotness reaches victim selection. Ties go to the
+        // candidate, so a cold scan at an estimate of one churns other cold entries and leaves
+        // anything at two or more alone.
         let slot = match store.claim(addr.0, reg, |victim| sketch.estimate(victim) > cand) {
             Ok(slot) => slot,
             Err(Decline::Colder) => {
@@ -1298,25 +1198,21 @@ impl Cache {
         .await;
     }
 
-    // -------------------------------------------------------------- immutable
+    // --- immutable ---
 
-    /// The version an Immutable page holds while it is live at its extent's epoch.
-    ///
-    /// Only quorum-confirmed values are admitted for this class, and one version has
-    /// exactly one such value, so a version is a complete identity for a cached 4 MiB
-    /// page — no ballot beside it, which matters because a 4 MiB frame has no trailer to
-    /// carry one in.
+    /// The version an Immutable page holds while it is live at its extent's epoch. Only
+    /// quorum-confirmed values are admitted for this class, and one version has exactly one
+    /// such value, so a version is a complete identity for a cached 4 MiB page. No ballot
+    /// beside it, which matters because a 4 MiB frame has no trailer.
     fn live_version(&self, addr: GlobalAddr) -> u64 {
         3 * self.alloc.config().tombstone_epoch_of(addr.0) + 1
     }
 
-    // ------------------------------------------------------------------- tick
+    // --- tick ---
 
-    /// The decay, and on core 0 the rebalance.
-    ///
-    /// Driven from `Handler::tick`, which is a poll and not a timer: an idle worker
-    /// takes no ticks, so the halving count comes from elapsed time rather than being
-    /// assumed to be one.
+    /// The decay, and on core 0 the rebalance. Driven from `Handler::tick`, which is a poll
+    /// and not a timer: an idle worker takes no ticks, so the halving count comes from elapsed
+    /// time rather than assumed to be one.
     pub fn tick(&'static self, now: Instant) {
         {
             let mut l = self.local();
@@ -1327,9 +1223,8 @@ impl Cache {
                 l.sketch.halve(steps);
             }
         }
-        // The rebalance has to see every core, so it hops, so it cannot run from a
-        // synchronous tick. Core 0 spawns it and the flag keeps a slow one from being
-        // started twice.
+        // The rebalance has to see every core, so it hops and cannot run from a synchronous
+        // tick. Core 0 spawns it; the flag keeps a slow one from being started twice.
         if runtime::core() != 0 {
             return;
         }
@@ -1352,13 +1247,12 @@ impl Cache {
         }
     }
 
-    // -------------------------------------------------------------- rebalance
+    // --- rebalance ---
 
-    /// The tail this cache was given, and the part of it no class is holding.
-    ///
-    /// Core 0 only, where the pool of unheld chunks lives. Unheld bytes are media the
-    /// store has and `policy.cache_index_bytes` would not pay to index, which is the
-    /// one number that says whether raising that policy would buy anything.
+    /// The tail this cache was given, and the part of it no class is holding. Core 0 only,
+    /// where the pool of unheld chunks lives. Unheld bytes are media the store has and
+    /// `policy.cache_index_bytes` would not pay to index, so this says whether raising that
+    /// policy would buy anything.
     pub fn tail_bytes(&self) -> (u64, u64) {
         let idle = self.pool.borrow().free.len() as u64;
         (
@@ -1379,15 +1273,13 @@ impl Cache {
         })
     }
 
-    /// Move media toward whichever class is earning more with what it has.
+    /// Move media toward whichever class is earning more with what it has. Core 0 only,
+    /// spawned from `tick`.
     ///
-    /// Free chunks from the pool are handed out in batches, because nothing is lost by
-    /// filling space no one holds and a node with a large tail would otherwise take
-    /// hours to warm. Taking media *from* the other class is one chunk at a time: a
-    /// steal drops whatever that chunk held, so a fast controller loses more entries
-    /// than a slow one gains in fit.
-    ///
-    /// Core 0 only, spawned from `tick`.
+    /// Free chunks from the pool go out in batches, because nothing is lost by filling space
+    /// no one holds and a large tail would otherwise take hours to warm. Taking media *from*
+    /// the other class is one chunk at a time: a steal drops whatever that chunk held, so a
+    /// fast controller loses more entries than a slow one gains in fit.
     async fn rebalance(&'static self) {
         let cores = self.state.len();
         let mut sum = [Census::default(); 2];
@@ -1406,8 +1298,8 @@ impl Cache {
             }
         }
 
-        // Counters are cumulative; what the classes did with what they hold *now* is
-        // the difference against the last sample.
+        // Counters are cumulative; what the classes did with what they hold *now* is the
+        // difference against the last sample.
         let (served, evicted, missed) = {
             let mut p = self.pool.borrow_mut();
             let d = |now: [u64; 2], then: &mut [u64; 2]| -> [u64; 2] {
@@ -1433,9 +1325,8 @@ impl Cache {
         let refund = chunk_slots(Class::of(other == 1)) as u64;
         let held = sum[0].slots + sum[1].slots;
 
-        // Tail nobody holds costs no class anything, so it goes first, and in a batch:
-        // the cache opens on a fraction of its budget and this is how it earns the
-        // rest, which one chunk an interval would never do.
+        // Tail nobody holds costs no class anything, so it goes first, and in a batch: the
+        // cache opens on a fraction of its budget and this is how it earns the rest.
         if held + cost <= self.budget {
             let room = (self.budget - held) / cost;
             let grow = (chunks[k].iter().sum::<u64>() / GROWTH_SHARE)
@@ -1461,15 +1352,15 @@ impl Cache {
                 return;
             }
         }
-        // Then a free 4 MiB data slot on loan from the allocator. Huge only: a borrowed
-        // chunk is one huge entry, so giving it back drops one page, where a borrowed
-        // small chunk would drop 1024 at once.
+        // Then a free 4 MiB data slot on loan from the allocator. Huge only: a borrowed chunk
+        // is one huge entry, so giving it back drops one page, where a borrowed small chunk
+        // would drop 1024 at once.
         if k == 1 && held + cost <= self.budget && self.borrow(&mut chunks[1]).await {
             return;
         }
-        // Last, take one from the other class. This is also the only way the small
-        // class grows once the DRAM budget is spent, since a 4 MiB chunk of huge frees
-        // one slot and a chunk of small costs 1024.
+        // Last, take one from the other class. This is also the only way the small class grows
+        // once the DRAM budget is spent, since a 4 MiB chunk of huge frees one slot and a
+        // chunk of small costs 1024.
         if held.saturating_sub(refund) + cost <= self.budget
             && let Some(off) = self.take(other, &mut chunks[other]).await
         {
@@ -1485,10 +1376,10 @@ impl Cache {
         }
     }
 
-    /// Cores that can own an address of class `k`, ordered by how many chunks of it
-    /// they hold: fewest first when `most` is false. Placement evens the classes out
-    /// across cores, which matters because group hashing spreads addresses evenly and
-    /// an unbalanced core would evict while its neighbour idled.
+    /// Cores that can own an address of class `k`, ordered by how many chunks of it they hold:
+    /// fewest first when `most` is false. Evening the classes out across cores matters because
+    /// group hashing spreads addresses evenly, and an unbalanced core would evict while its
+    /// neighbour idled.
     fn order(&self, k: usize, chunks: &[u64], most: bool) -> Vec<usize> {
         let mut v: Vec<usize> = (0..self.shards[k]).collect();
         v.sort_by_key(|&c| {
@@ -1498,8 +1389,8 @@ impl Cache {
         v
     }
 
-    /// Give a chunk to the class's store on the core holding the fewest of them, and
-    /// record it, so that a batch spreads instead of piling onto one core.
+    /// Give a chunk to the class's store on the core holding the fewest, and record it, so a
+    /// batch spreads instead of piling onto one core.
     async fn place(&'static self, k: usize, chunks: &mut [u64], c: Chunk) {
         let order = self.order(k, chunks, false);
         let Some(&core) = order.first() else {
@@ -1512,8 +1403,8 @@ impl Cache {
         chunks[core] += 1;
     }
 
-    /// Take one chunk back from a class, from the core holding the most that will part
-    /// with one. `None` when every chunk it holds is borrowed or has a write in flight.
+    /// Take one chunk back from a class, from the core holding the most that will part with
+    /// one. `None` when every chunk it holds is borrowed or has a write in flight.
     async fn take(&'static self, k: usize, chunks: &mut [u64]) -> Option<u64> {
         for core in self.order(k, chunks, true) {
             let got = runtime::on_core(
@@ -1529,16 +1420,13 @@ impl Cache {
         None
     }
 
-    /// Borrow one free 4 MiB data slot and give it to the huge store on the core that
-    /// lent it.
-    ///
-    /// The same core on purpose. The allocator takes a loan back synchronously, from
-    /// inside a reservation that cannot await, so the store holding the loan has to be
-    /// one its shard can reach without a hop. That works out: a core owning a stripe of
-    /// the 4 MiB slab owns a stripe of the 4 MiB cache too, because both are
-    /// `mblock % cores` over the same mblocks.
-    ///
+    /// Borrow one free 4 MiB data slot and give it to the huge store on the core that lent it.
     /// The lend and the push happen in one hop, so a slot is never on loan to nobody.
+    ///
+    /// The same core on purpose: the allocator takes a loan back synchronously, from inside a
+    /// reservation that cannot await, so the loan must sit where its shard can reach it
+    /// without a hop. That works out, because a core owning a stripe of the 4 MiB slab owns a
+    /// stripe of the 4 MiB cache too: both are `mblock % cores` over the same mblocks.
     async fn borrow(&'static self, chunks: &mut [u64]) -> bool {
         for core in self.order(1, chunks, false) {
             let got = runtime::on_core(core, move || async move {
@@ -1558,20 +1446,18 @@ impl Cache {
         false
     }
 
-    /// Hand one borrowed chunk back, dropping the page it held. `None` when this core
-    /// holds no loan it can part with.
+    /// Hand one borrowed chunk back, dropping the page it held. `None` when this core holds no
+    /// loan it can part with.
     ///
     /// Called synchronously by the allocator, on the core that lent it, from inside a
-    /// reservation. Touches this core's huge store and nothing else: no config, no
-    /// pressure test, no hop, because the allocator has state borrowed around the call.
+    /// reservation. Touches this core's huge store and nothing else: no config, no pressure
+    /// test, no hop, because the allocator has state borrowed around the call.
     pub fn give_back(&self, core: usize) -> Option<u64> {
         self.state[core].borrow_mut().stores[1].give(true)
     }
 }
 
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
+// --- tests ---
 
 #[cfg(test)]
 mod tests {
@@ -1612,8 +1498,8 @@ mod tests {
 
     #[test]
     fn halve_matches_repeated_halving() {
-        // One shift and one mask, a word at a time, has to agree with the obvious loop
-        // everywhere, including past the point where a counter has nothing left to give.
+        // The word-at-a-time shift and mask must match the obvious loop everywhere, including
+        // past the point where a counter has nothing left to give.
         for n in 0..=6u32 {
             let (mut fast, mut slow) = (Sketch::new(COLS_MIN), Sketch::new(COLS_MIN));
             for i in 0..64usize {
@@ -1637,8 +1523,7 @@ mod tests {
 
     #[test]
     fn a_short_row_still_halves_its_tail() {
-        // Four bytes to a row, so the word loop never runs at all and every counter
-        // has to be reached by the remainder.
+        // Four bytes to a row, so the word loop never runs and only the remainder is used.
         let mut s = Sketch::new(8);
         for i in 0..8 {
             s.set(0, i, (i * 2) as u8);
@@ -1663,8 +1548,7 @@ mod tests {
         }
         assert_eq!(s.estimate(7), 0);
 
-        // Provably all zeroes now, so further decay is refused rather than walked. This
-        // is what an idle core, or a whole node whose cache is off, costs.
+        // Provably all zeroes now, so further decay is refused rather than walked.
         s.halve(1);
         assert_eq!(s.since, ZEROED_AFTER);
     }
@@ -1677,9 +1561,9 @@ mod tests {
         }
         assert_eq!(s.estimate(9), COUNTER_MAX);
 
-        // A key at the ceiling stops raising counters, so the reads keeping it hot no
-        // longer refresh the zero check. Decay must still reach it: the check can only
-        // trip after a full run of halvings, by which point the counter is gone anyway.
+        // A key at the ceiling stops raising counters, so the reads keeping it hot no longer
+        // refresh the zero check. Decay must still reach it: the check can only trip after a
+        // full run of halvings, by which point the counter is gone anyway.
         for _ in 0..8 {
             s.observe(9);
         }
@@ -1691,8 +1575,8 @@ mod tests {
 
     #[test]
     fn cores_decay_on_their_own_phase() {
-        // Core zero keeps the boundary it would have had, and the rest are spread
-        // across the interval so a node does not walk every sketch it owns at once.
+        // Core zero keeps its boundary; the rest spread across the interval so a node does not
+        // walk every sketch it owns at once.
         let cores = 6;
         let mut last = Duration::ZERO;
         for c in 0..cores {
@@ -1745,8 +1629,7 @@ mod tests {
     }
 
     impl Store {
-        /// `claim` with no contest. Every test below is about CLOCK, capacity or chunk
-        /// bookkeeping rather than about hotness; the contest has tests of its own.
+        /// `claim` with no contest; the contest has tests of its own.
         fn claim_uncontested(&mut self, addr: u64, reg: Register) -> Result<u32, Decline> {
             self.claim(addr, reg, |_| false)
         }
@@ -1822,8 +1705,8 @@ mod tests {
         assert_eq!(st.off(cs), 17 * layout::CHUNK_BYTES);
     }
 
-    /// Handing a chunk back drops exactly its own entries and leaves every other
-    /// entry findable at its new index.
+    /// Handing a chunk back drops its own entries and leaves the rest findable at their new
+    /// indexes.
     #[test]
     fn giving_a_chunk_back_keeps_the_rest_findable() {
         let mut st = store(Class::Huge, 3);
@@ -1832,8 +1715,8 @@ mod tests {
             let i = st.claim_uncontested(a, r).unwrap();
             st.finish(i, true);
         }
-        // Chunk 0 holds address 1. Removing it swaps the last chunk into the hole, so
-        // address 3 changes index without changing identity.
+        // Chunk 0 holds address 1. Removing it swaps the last chunk into the hole, so address
+        // 3 changes index without changing identity.
         let off = st.remove_chunk(0).unwrap();
         assert_eq!(off, 16 * layout::CHUNK_BYTES);
         assert_eq!(st.chunks.len(), 2);
@@ -1846,16 +1729,15 @@ mod tests {
         assert_eq!(st.evicted, 0);
     }
 
-    /// A slot with an IO in flight against it pins its chunk, and the chunk that would
-    /// be moved into its place.
+    /// A slot with an IO in flight pins its chunk, and the chunk moved into its place.
     #[test]
     fn a_busy_chunk_is_not_given_back() {
         let mut st = store(Class::Huge, 2);
         let r = Register::default();
         let a = st.claim_uncontested(1, r).unwrap();
         st.finish(a, true);
-        // The reference bit sends the hand past slot `a`, so the second claim lands on
-        // the other chunk and leaves an IO in flight there.
+        // The reference bit sends the hand past slot `a`, so the second claim lands on the
+        // other chunk and leaves an IO in flight there.
         assert!(st.find(1).is_some());
         let b = st.claim_uncontested(2, r).unwrap();
         assert_ne!(a, b);
@@ -1870,8 +1752,8 @@ mod tests {
         assert!(st.remove_chunk(first).is_some());
     }
 
-    /// The reclaim path must return a borrowed chunk and the rebalance must not, so
-    /// `give` is asked for one kind and never answers with the other.
+    /// `give` answers only with the kind it was asked for: the reclaim path must get a
+    /// borrowed chunk and the rebalance must not.
     #[test]
     fn give_returns_only_the_kind_asked_for() {
         let mut st = Store::new(Class::Huge);
@@ -1889,8 +1771,7 @@ mod tests {
         assert_eq!(st.give(false), None);
     }
 
-    /// An empty slot is taken without asking, which is what keeps a cold cache filling
-    /// at full speed no matter how hot the contest would say the candidate is not.
+    /// An empty slot is taken without asking, so a cold cache fills at full speed.
     #[test]
     fn an_empty_slot_holds_no_contest() {
         let mut st = store(Class::Huge, 1);
@@ -1900,9 +1781,9 @@ mod tests {
         assert_eq!(st.evicted, 0);
     }
 
-    /// The contest, and the property the whole per-extent policy rests on: a resident
-    /// page in more demand than the candidate keeps its slot, so an extent that admits
-    /// everything cannot scan the rest of the cache away.
+    /// The contest, and the property the per-extent policy rests on: a resident page in more
+    /// demand keeps its slot, so an extent that admits everything cannot scan the rest of the
+    /// cache away.
     #[test]
     fn a_hotter_incumbent_keeps_its_slot() {
         let mut st = store(Class::Huge, 1);
@@ -1910,17 +1791,16 @@ mod tests {
         let i = st.claim_uncontested(1, r).unwrap();
         st.finish(i, true);
 
-        // The incumbent's reference bit is clear - a fresh entry starts that way - so
-        // the hand reaches the contest on the first sweep rather than the second.
+        // The incumbent's reference bit is clear (a fresh entry starts that way), so the hand
+        // reaches the contest on the first sweep rather than the second.
         assert_eq!(st.claim(2, r, |v| v == 1), Err(Decline::Colder));
         assert!(st.find(1).is_some(), "the incumbent must survive");
         assert!(!st.map.contains_key(&2), "the candidate must not be mapped");
         assert_eq!(st.evicted, 0, "a refused admission is not an eviction");
     }
 
-    /// Ties go to the candidate, so a scan at an estimate of one displaces other pages
-    /// at one and nothing above it. Without this a cache full of cold entries would
-    /// never turn over.
+    /// Ties go to the candidate, so a scan at an estimate of one displaces other pages at one
+    /// and nothing above it. Without this a cache of cold entries never turns over.
     #[test]
     fn a_tie_goes_to_the_candidate() {
         let mut st = store(Class::Huge, 1);
@@ -1936,9 +1816,9 @@ mod tests {
         assert_eq!(st.evicted, 1);
     }
 
-    /// A lost contest ends the admission rather than moving the hand on to hunt for a
-    /// weaker victim, so one refusal costs one slot's worth of work and a hot cache
-    /// cannot be walked into giving something up.
+    /// A lost contest ends the admission rather than sweeping on for a weaker victim, so one
+    /// refusal costs one slot's work and a hot cache cannot be walked into giving something
+    /// up.
     #[test]
     fn a_lost_contest_does_not_keep_sweeping() {
         let mut st = store(Class::Huge, 4);
@@ -1989,18 +1869,18 @@ mod tests {
         let r = Roster::of(&cfg);
         assert_eq!(r.me, 5);
         assert_eq!(r.cohort(1), &[5, 7]);
-        // A second universe is a second cohort, not more of the first: caching never
-        // ranks a peer we share no address space with.
+        // A second universe is a second cohort, not more of the first: caching never ranks a
+        // peer we share no address space with.
         assert_eq!(r.cohort(2), &[5]);
-        // And a universe we hold no catalog for is nobody, which reads as caching off.
+        // A universe we hold no catalog for is nobody, which reads as caching off.
         assert!(r.cohort(3).is_empty());
         assert_eq!(r.widest(), 2);
     }
 
     #[test]
     fn a_config_nobody_opts_into_turns_the_cache_off() {
-        // A cohort exists, so the roster is structurally able to cache. Whether it
-        // should is the extents' call, and here none of them asks to be.
+        // A cohort exists, so the roster is structurally able to cache. Whether it should is
+        // the extents' call, and here none of them asks to be.
         let text = |admit: &str| {
             format!(
                 "node id=5 zone=1 cohort=0 store=/x size=4096
@@ -2036,17 +1916,16 @@ mod tests {
         }
     }
 
-    /// The cache may only put slots on cores the allocator will route that class to.
-    /// A node with a single shard of a class must therefore pile that class onto core
-    /// 0 rather than spreading it where nothing will ever look.
+    /// The cache may only put slots on cores the allocator routes that class to, so a node
+    /// with a single shard piles the class onto core 0.
     #[test]
     fn a_single_shard_takes_the_whole_class() {
         let (base, len) = stripe(9, 1, 0);
         assert_eq!((base, len), (0, 9));
     }
 
-    /// A node in a three node zone, holding `small` 4 KiB pages and `huge` 4 MiB ones:
-    /// three replicas over three nodes is one share each.
+    /// A node in a three node zone, holding `small` 4 KiB pages and `huge` 4 MiB ones: three
+    /// replicas over three nodes is one share each.
     fn pages(small: u64, huge: u64) -> crate::config::Config {
         let mut s = String::from(
             "node id=1 zone=1 cohort=1 store=/x size=1099511627776
@@ -2077,29 +1956,29 @@ mod tests {
         let c = pages(1024, 0);
         assert_eq!(plan_chunks(1000, u64::MAX, &c), [1000, 0]);
 
-        // Bytes, not pages: 1024 small pages are 4 MiB against 1024 huge pages' 4 GiB,
-        // so the huge class takes essentially all of it.
+        // Bytes, not pages: 1024 small pages are 4 MiB against 1024 huge pages' 4 GiB, so the
+        // huge class takes essentially all of it.
         let c = pages(1024, 1024);
         let w = plan_chunks(1000, u64::MAX, &c);
         assert_eq!(w[0] + w[1], 1000);
         assert!(w[1] > w[0] * 100, "got {w:?}");
 
-        // A node hosting neither splits down the middle: it is a pure cache client and
-        // has no page mix of its own to go on.
+        // A node hosting neither splits down the middle: a pure cache client has no page mix
+        // of its own to go on.
         let c = pages(0, 0);
         assert_eq!(plan_chunks(1000, u64::MAX, &c), [500, 500]);
     }
 
-    /// The DRAM ceiling binds the small class long before the media does, and what the
-    /// small class cannot pay for is not simply lost.
+    /// The DRAM ceiling binds the small class long before the media does, and what small
+    /// cannot pay for is not lost.
     #[test]
     fn the_index_budget_caps_the_small_class_first() {
         let c = pages(1024, 0);
         // Room for 4096 slots is four small chunks, however much media there is.
         let w = plan_chunks(1000, 4096, &c);
         assert_eq!(w[0], 4);
-        // The rest stays in the pool rather than being forced onto a class that the
-        // node does not host: the rebalance hands it out when demand shows up.
+        // The rest stays in the pool rather than being forced onto a class the node does not
+        // host: the rebalance hands it out when demand shows up.
         assert!(w[0] + w[1] <= 1000);
     }
 
@@ -2130,15 +2009,15 @@ mod tests {
         );
     }
 
-    /// A class the plan gave nothing can never evict, so eviction alone would starve
-    /// it forever. A miss against an empty class is the signal instead.
+    /// A class the plan gave nothing can never evict, so eviction alone would starve it
+    /// forever; a miss against an empty class is the signal instead.
     #[test]
     fn a_class_holding_nothing_asks_with_misses() {
         assert_eq!(wants([0, 500], [0, 0], [7, 0], [0, 1 << 30]), Some(0));
         // But only if something is actually asking for it.
         assert_eq!(wants([0, 500], [0, 0], [0, 0], [0, 1 << 30]), None);
-        // And an empty class beats a measured one outright: one chunk is the cost of
-        // finding out whether it deserves more.
+        // An empty class beats a measured one outright: one chunk is the cost of finding out
+        // whether it deserves more.
         assert_eq!(wants([0, 500], [0, 1], [7, 0], [0, 1 << 30]), Some(0));
     }
 }

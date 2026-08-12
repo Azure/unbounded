@@ -1,13 +1,10 @@
-//! The node configuration: the only input the control plane gives the dataplane, one
-//! protobuf file per node, replaced whole and applied all or nothing.
+//! Node configuration: the only input the control plane gives the dataplane, one protobuf
+//! file per node, replaced whole and applied all or nothing.
 //!
-//! Three layers, in order: `pb` is the wire schema, tag for tag; [`Config`] is the
-//! validated model, and building one from `pb` is where every structural check happens;
-//! `Watch`/[`watch`] are delivery, since the control plane renames a new file over the
-//! old one and inotify reports it.
-//!
-//! `Live` makes reload cheap: a pointer the control thread swaps and every worker reads
-//! without a lock.
+//! `pb` is the wire schema, tag for tag. [`Config`] is the validated model, and building
+//! one from `pb` is where every structural check happens. `Watch`/[`watch`] are delivery,
+//! driven by inotify because the control plane renames a new file over the old one.
+//! `Live` makes reload cheap: a pointer the control thread swaps, read without a lock.
 
 use std::ffi::{CString, OsString};
 use std::io;
@@ -18,28 +15,21 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use prost::Message as _;
 
-/// Consensus slots an address may hash to. The group that owns a slot is
-/// `slot % catalog.len()`, so this is the granularity every address is placed at.
+/// Consensus slots an address may hash to. The owning group is `slot % catalog.len()`.
 const SLOTS: usize = 16384;
 const SMALL_PAGE: u64 = 4096;
 const HUGE_PAGE: u64 = 4 << 20;
 
-/// The largest `Extent::cache_admit` worth asking for: the cache's demand counter is
-/// four bits wide (cache.rs), so it never observes a rate above this.
+/// Largest useful `Extent::cache_admit`: the cache's demand counter is 4 bits (cache.rs).
 pub(crate) const CACHE_MAX_ADMIT: u32 = 15;
 
-/// Gateways one zone may name. A bound rather than a shape: the point of the list is
-/// that this message stays `O(zones)` and not `O(cluster)`, and a zone that needs more
-/// than this many nodes taking cross-zone traffic wants more zones.
+/// Gateways one zone may name. Keeps this message `O(zones)` rather than `O(cluster)`.
 const MAX_GATEWAYS: usize = 64;
 
-/// Zones one extent may warm. Each costs a page transfer per cohort on every commit, so
-/// the bound is really a reminder that this multiplies write cost.
+/// Zones one extent may warm. Each costs a page transfer per cohort on every commit.
 const MAX_WARM_ZONES: usize = 16;
 
-/// Configs the watcher refused. A rejection is not actionable, so it is counted and
-/// dropped; it surfaces as `racer_config_rejected_total` (metrics.rs), an operator's
-/// signal that the control plane is writing a config this node will not take.
+/// Refused configs, counted and dropped: `racer_config_rejected_total` in metrics.rs.
 static REJECTED: AtomicU64 = AtomicU64::new(0);
 
 /// Configs refused since boot.
@@ -47,8 +37,7 @@ pub fn rejected() -> u64 {
     REJECTED.load(Ordering::Relaxed)
 }
 
-/// Where the backing store file lives. Not in the config file on purpose: the path is a
-/// property of how this node was deployed, and the control plane describes a cluster.
+/// Where the backing store lives. Not in the config file: a deployment, not cluster, fact.
 pub const STORE_PATH_ENV: &str = "RACER_STORE";
 /// Used when `RACER_STORE` is unset or empty.
 pub const DEFAULT_STORE_PATH: &str = "/var/lib/racer/store.img";
@@ -58,8 +47,7 @@ pub fn store_path() -> PathBuf {
     path_from(std::env::var_os(STORE_PATH_ENV))
 }
 
-/// Split out from [`store_path`] so the defaulting is testable without touching the
-/// process environment, which no test can do without racing every other thread.
+/// Split out from [`store_path`] so defaulting is testable without racing the process env.
 fn path_from(v: Option<OsString>) -> PathBuf {
     match v {
         Some(s) if !s.is_empty() => PathBuf::from(s),
@@ -71,16 +59,12 @@ fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-// ---------------------------------------------------------------------------
-// Live: the reload primitive
-// ---------------------------------------------------------------------------
+// --- Live: the reload primitive ---
 
-/// A value the control thread replaces and every worker reads without a lock.
-///
-/// A read is a single acquire load, sound because the replaced value stays alive one
-/// more generation: [`Runtime::reload`] blocks until every core has cut over and the
-/// previous value has been retired, so no worker can still be reading what a second
-/// install retires. Callers must not hold the returned reference across a reload.
+/// A value the control thread replaces and every worker reads without a lock. A read is a
+/// single acquire load; the replaced value lives one more generation, since
+/// [`Runtime::reload`] blocks until every core cut over and the previous value retired, so
+/// a second install cannot retire a value in use. Do not hold the reference across reload.
 ///
 /// [`Runtime::reload`]: crate::runtime::Runtime::reload
 pub(crate) struct Live<T> {
@@ -106,9 +90,7 @@ impl<T> Live<T> {
     pub(crate) fn install(&self, v: T) {
         let old = self.cur.swap(Box::into_raw(Box::new(v)), Ordering::AcqRel);
         let mut prev = self.prev.lock().unwrap();
-        // `old` may still be in the hands of a request in flight against the outgoing
-        // runtime version; whatever `prev` held was retired by the previous reload, so
-        // dropping it here is safe.
+        // `old` may still be held by an in-flight request; `prev` was retired last reload.
         *prev = Some(unsafe { Box::from_raw(old) });
     }
 }
@@ -119,24 +101,18 @@ impl<T> Drop for Live<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wire schema
-// ---------------------------------------------------------------------------
+// --- Wire schema ---
 
-/// The file as it is written and read, generated from `proto/config.proto`: the schema
-/// shared verbatim with the Go control plane, where the tags are the compatibility
-/// contract.
-///
-/// Every field is optional and unvalidated on the wire, so nothing outside this module
-/// reads `pb`: [`Config`] is the checked form.
+/// The file as written and read, generated from `proto/config.proto` and shared verbatim
+/// with the Go control plane, where tags are the compatibility contract. Wire fields are
+/// optional and unvalidated, so nothing outside reads `pb`; [`Config`] is the checked form.
 mod pb {
     include!(concat!(env!("OUT_DIR"), "/racer.config.rs"));
 }
 
-/// What guard a write to an extent must present. Narrower than the wire enum, which
-/// also spells the page size: `IMMUTABLE_4M` is the 4 MiB spelling of [`Kind::Immutable`]
-/// and carries the same guard. Width is a property of the extent everywhere below this
-/// module, so the two are split apart on the way in and rejoined on the way out.
+/// What guard a write to an extent must present. Narrower than the wire enum, which also
+/// spells the page size: `IMMUTABLE_4M` is [`Kind::Immutable`] at 4 MiB, same guard. Width
+/// is a property of the extent below here, so the two split on the way in and rejoin out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     Lww,
@@ -154,8 +130,7 @@ fn split_kind(k: pb::Kind) -> (Kind, bool) {
     }
 }
 
-/// The inverse of [`split_kind`]. Only Immutable has a 4 MiB spelling, so the other two
-/// ignore the width their extent cannot have.
+/// The inverse of [`split_kind`]. Only Immutable has a 4 MiB spelling.
 fn join_kind(k: Kind, huge: bool) -> pb::Kind {
     match k {
         Kind::Lww => pb::Kind::Lww,
@@ -164,9 +139,7 @@ fn join_kind(k: Kind, huge: bool) -> pb::Kind {
         Kind::Immutable => pb::Kind::Immutable,
     }
 }
-// ---------------------------------------------------------------------------
-// Addressing
-// ---------------------------------------------------------------------------
+// --- Addressing ---
 
 /// Bits of a page address naming the universe the page lives in.
 pub const UNIVERSE_BITS: u32 = 26;
@@ -177,17 +150,14 @@ pub const MAX_LBA: u64 = 1 << LBA_BITS;
 /// One past the last universe id. Zero is reserved so that a zero address in an mblock
 /// entry unambiguously means "free slot" (layout.rs), which leaves `1..MAX_UNIVERSE`.
 pub const MAX_UNIVERSE: u32 = 1 << UNIVERSE_BITS;
-/// Blocks one 4 MiB page spans in its universe's address space. A huge page is named by
-/// the first of them, so a 4 KiB and a 4 MiB extent can share one flat space.
+/// Blocks one 4 MiB page spans; it is named by the first, so both sizes share one space.
 pub const HUGE_BLOCKS: u64 = HUGE_PAGE / SMALL_PAGE;
 
 /// Fabric namespaces plus local block devices this node may export at once. One ublk
-/// device is spent per universe and one per configured device, and `runtime::MAX_DEVICES`
-/// is the ceiling on the sum.
+/// device per universe and one per configured device; `runtime::MAX_DEVICES` caps the sum.
 pub(crate) const MAX_EXPORTS: usize = 256;
 
-/// Extents this node may be told about. The per-extent metrics table is statically sized
-/// to this, and it is the only reason there is a bound at all.
+/// Extents this node may be told about; the per-extent metrics table is sized to this.
 pub(crate) const MAX_EXTENTS: usize = 1024;
 
 /// The universe a page address belongs to.
@@ -200,18 +170,14 @@ pub fn lba_of(addr: u64) -> u64 {
     addr & (MAX_LBA - 1)
 }
 
-/// The two halves joined. Out-of-range inputs are masked rather than refused; every
-/// caller is downstream of validation.
+/// The two halves joined. Out-of-range inputs are masked; every caller is post-validation.
 pub fn addr_of(universe: u32, lba: u64) -> u64 {
     ((universe as u64 & (MAX_UNIVERSE as u64 - 1)) << LBA_BITS) | (lba & (MAX_LBA - 1))
 }
 
-/// A consensus group: a universe and an index into that universe's catalog.
-///
-/// Groups are per universe because catalogs are. Two universes may name the same index
-/// and mean unrelated sets of nodes, so nothing may carry a bare index across a universe
-/// boundary; the fabric frames that do carry one are answered on a namespace that says
-/// which universe they meant.
+/// A consensus group: a universe and an index into that universe's catalog. Catalogs are
+/// per universe, so the same index means unrelated node sets elsewhere; a bare index may
+/// never cross a universe boundary, and frames carrying one name a universe's namespace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GroupId(u64);
 
@@ -229,25 +195,16 @@ impl GroupId {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The model
-// ---------------------------------------------------------------------------
+// --- The model ---
 
-/// A contiguous run of pages placed by the control plane at a fixed offset in its
-/// universe's address space.
-///
-/// The extent is the unit of everything below this module: page kind and size, zone
-/// affinity, tombstone epoch, sealing, migration, census and device composition all hang
-/// off one of these. Position is explicit rather than implied by list order, so the same
-/// extent may be mounted by different hosts in different combinations without any of
-/// them agreeing on an ordering.
+/// A contiguous run of pages at a fixed offset in its universe's address space: the unit
+/// of page kind and size, zone affinity, tombstone epoch, sealing, migration, census and
+/// device composition. Position is explicit, not list order, so hosts may differ on it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Extent {
-    /// Unique across this node's whole configuration and never reused. Names the extent
-    /// on the wire when a shard is sealed, and labels its metrics.
+    /// Unique node-wide and never reused. Names the extent in a SEAL, and labels metrics.
     pub(crate) id: u32,
-    /// First block of the extent in its universe. Frozen for the extent's life, and a
-    /// multiple of [`HUGE_BLOCKS`] when the pages are 4 MiB.
+    /// First block in its universe. Frozen, and a multiple of [`HUGE_BLOCKS`] for 4 MiB.
     pub(crate) base_lba: u64,
     /// Length in pages of this extent's own size, not in blocks. Frozen.
     pages: u64,
@@ -262,14 +219,12 @@ pub(crate) struct Extent {
     /// Page versions are `3*epoch + state`: `3e` empty, `3e+1` live, `3e+2` trimmed.
     /// Never decreases; advancing it destroys every page written under the old one.
     pub(crate) tombstone_epoch: u64,
-    /// Cache admission threshold for pages of this extent (cache.rs): 0 never admits,
-    /// 1 admits on first sight, and `n` admits once the demand estimate reaches `n`.
-    /// Not frozen - a reload may raise or lower it.
+    /// Cache admission threshold (cache.rs): 0 never admits, 1 admits on first sight, `n`
+    /// admits once the demand estimate reaches `n`. Not frozen: a reload may change it.
     pub(crate) cache_admit: u8,
-    /// Zones whose caches are filled with these pages as they commit, rather than on
-    /// first demand (paxos.rs). Read from both ends: the home zone pushes toward each of
-    /// these, and a node whose own zone appears here is a warm destination. Sorted, and
-    /// never naming `zone` or `next_zone`. Not frozen.
+    /// Zones whose caches are filled with these pages as they commit, not on first demand
+    /// (paxos.rs). Read from both ends: the home zone pushes to each, and a node seeing its
+    /// own zone here is a warm destination. Sorted, never `zone`/`next_zone`. Not frozen.
     pub(crate) warm_zones: Box<[u32]>,
 }
 
@@ -279,7 +234,7 @@ impl Extent {
         if self.huge { HUGE_BLOCKS } else { 1 }
     }
 
-    /// Length in blocks, which is what the extent actually reserves in the universe.
+    /// Length in blocks, which is what the extent reserves in the universe.
     pub(crate) fn blocks(&self) -> u64 {
         self.pages * self.blocks_per_page()
     }
@@ -294,15 +249,11 @@ impl Extent {
     }
 }
 
-/// A shared LBA space spanning a set of nodes: an address space, a transport, a
-/// consensus domain and a security boundary, all the same object.
-///
-/// Every universe has its own fabric namespace, so a node holds a link into a universe
-/// only if the control plane published one to it, and nothing on the wire has to name a
-/// universe. Everything a universe needs to route and replicate within itself - epoch,
-/// catalog, other zones, peers - is here rather than on the node, which is what makes
-/// the partition strict: a node in two universes runs two independent topologies and can
-/// carry nothing from one into the other.
+/// A shared LBA space spanning a set of nodes: an address space, a transport, a consensus
+/// domain and a security boundary, all the same object. Each universe has its own fabric
+/// namespace, so nothing on the wire names a universe and a node holds a link only where
+/// the control plane published one. Epoch, catalog, zones and peers live here, not on the
+/// node, so two universes on one node stay independent.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Universe {
     /// Non-zero, below [`MAX_UNIVERSE`], never reused.
@@ -310,9 +261,9 @@ pub(crate) struct Universe {
     /// This universe's topology epoch: the term a shard is sealed with, and it rides the
     /// trailer of every routed write (paxos.rs).
     pub(crate) epoch: u32,
-    /// Index is the group index. Each entry is exactly three distinct node ids, ordered
-    /// by paxos member index, which is also the cohort column. Balanced: every node it
-    /// names holds the same number of groups.
+    /// Index is the group index; each entry is three distinct node ids in paxos member
+    /// order, which is also the cohort column. Balanced: every node named holds the same
+    /// number of groups.
     pub(crate) catalog: Vec<[u32; 3]>,
     /// The other zones of this universe, with their gateway nodes.
     zones: Vec<Zone>,
@@ -342,8 +293,8 @@ impl Universe {
         zone == ours || self.zones.iter().any(|z| z.id == zone)
     }
 
-    /// The nodes of `zone` that accept traffic from outside it. Empty when the zone is
-    /// not one we were told about, which reads the same as having nowhere to send.
+    /// The nodes of `zone` taking traffic from outside. Empty for a zone we were not told
+    /// of, which reads the same as having nowhere to send.
     pub(crate) fn gateways_of(&self, zone: u32) -> &[u32] {
         match self.zones.iter().find(|z| z.id == zone) {
             Some(z) => &z.gateways,
@@ -351,25 +302,19 @@ impl Universe {
         }
     }
 
-    /// `zone`'s gateways in the order a sender should try them for `addr`: rendezvous on
-    /// the address, so consecutive addresses spread over the whole set, and a sender that
-    /// skips one because it holds no link falls through to the next.
-    ///
-    /// Promotion is safe here in a way it is not for the cache's ring (cache.rs): any
-    /// gateway can resolve any address in its zone, so there is no second party who has
-    /// to arrive at the same answer.
+    /// `zone`'s gateways in the order to try them for `addr`: rendezvous on the address,
+    /// so addresses spread over the set and a sender with no link to one falls through.
+    /// Promotion is safe here but not for the cache's ring (cache.rs): any gateway resolves
+    /// any address in its zone, so no second party has to agree.
     pub(crate) fn gateways_for(&self, zone: u32, addr: u64) -> impl Iterator<Item = u32> {
         ranked(self.gateways_of(zone), addr)
     }
 
-    /// The node of cohort `c` that a warm copy of `addr` belongs on: the top of this
-    /// zone's cohort `c` under the same rendezvous ranking the cache itself uses.
-    ///
-    /// The catalog column is the cohort, so this is computable for *every* cohort from
-    /// one node's config, which `cache::Roster` is not - a roster projects only the
-    /// column its own node occupies. That asymmetry is the whole reason a warm push
-    /// fans out in two stages: the source zone holds no catalog for the destination, and
-    /// the destination's gateway holds all three of its columns.
+    /// The node of cohort `c` a warm copy of `addr` belongs on: the top of this zone's
+    /// cohort `c` under the rendezvous ranking the cache uses. The catalog column is the
+    /// cohort, so *every* cohort is computable from one config, unlike `cache::Roster`,
+    /// which projects only its own column. Hence the two-stage warm push: the source zone
+    /// has no catalog for the destination, whose gateway has all three columns.
     pub(crate) fn cohort_winner(&self, addr: u64, c: usize) -> Option<u32> {
         let mut best: Option<(u64, u32)> = None;
         for g in &self.catalog {
@@ -402,18 +347,14 @@ pub(crate) struct Span {
     pages: u64,
 }
 
-/// A local ublk block device: an ordered list of whole extents, concatenated.
-///
-/// Nothing about a device is shared. Two hosts may build different devices out of the
-/// same extents in different orders, or mount an extent twice, or not at all; the device
-/// is a local view and the extent is the thing the cluster agrees on. It follows that a
-/// device may span universes, which is a mount-time convenience and not a hole in the
-/// boundary: each page is still reached over its own universe's fabric.
+/// A local ublk block device: an ordered list of whole extents, concatenated. Nothing is
+/// shared: hosts may build different devices from the same extents in different orders,
+/// mount one twice, or not at all. A device may span universes; each page is still reached
+/// over its own universe's fabric.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Device {
     pub(crate) id: u32,
-    /// 4 MiB pages. Uniform across the device, so one request can never straddle two
-    /// page sizes.
+    /// 4 MiB pages. Uniform across the device, so no request straddles two page sizes.
     pub(crate) huge: bool,
     spans: Vec<Span>,
     /// Prefix sums in pages, `spans.len() + 1` long.
@@ -466,23 +407,21 @@ impl Device {
 pub struct Node {
     pub(crate) id: u32,
     pub(crate) zone: u32,
-    /// 0..2, the catalog column that is our cache cohort (cache.rs). One column across
-    /// every universe: it is a label the control plane assigns to the node.
+    /// 0..2, our cache cohort (cache.rs): the same catalog column in every universe.
     pub(crate) cohort: u8,
-    /// The backing store file this node owns outright. From `RACER_STORE`, not from the
-    /// config file, so it is filled in by `load`/`parse` rather than by `from_pb`.
+    /// The store file this node owns. From `RACER_STORE`: `load`/`parse` fill it in, not
+    /// `from_pb`.
     pub store: PathBuf,
     /// The length that file is held at. Grown to on start, never shrunk.
     pub(crate) store_bytes: u64,
-    /// The rate we are willing to drive the store at, zero for unmetered. Read once
-    /// per IO, and only at startup can it change.
+    /// The rate we drive the store at, zero for unmetered. Read once per IO; fixed after
+    /// start.
     pub(crate) store_max_iops: u64,
     pub(crate) store_max_bytes_per_sec: u64,
 }
 
-/// One end of a fabric link, inside one universe. There is no address, port or NQN here
-/// on purpose: the control plane owns the nvmet target and initiator configuration, so
-/// by the time we see a peer it is already a local device path.
+/// One end of a fabric link, inside one universe. No address, port or NQN: the control
+/// plane owns the nvmet target and initiator config, so a peer is already a local path.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Peer {
     pub(crate) id: u32,
@@ -494,28 +433,23 @@ pub(crate) struct Peer {
 #[derive(Clone, Debug, PartialEq)]
 struct Zone {
     id: u32,
-    /// Non-empty. Ranked per address rather than indexed, so the count is a capacity
-    /// and availability choice and not a shape the protocol depends on.
+    /// Non-empty. Ranked per address, so the count is a capacity choice, not a protocol
+    /// shape.
     gateways: Box<[u32]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Policy {
-    /// DRAM ceiling for the 4 KiB index. A config whose small-page working set would
-    /// exceed this is refused rather than allowed to OOM later.
+    /// DRAM ceiling for the 4 KiB index. A config needing more is refused, not left to OOM.
     max_index_bytes: u64,
-    /// DRAM ceiling for the OCC read pool across the whole node. Evicting a read
-    /// record can only turn a would-be success into a conflict, so this bounds
-    /// memory without bounding correctness.
+    /// DRAM ceiling for the OCC read pool across the whole node. Evicting a read record
+    /// can only turn a success into a conflict, so this bounds memory, not correctness.
     pub(crate) occ_bytes: u64,
-    /// DRAM ceiling for the read cache's index across every core and both classes. What
-    /// bounds the cache, since the media it is handed is whatever the slabs left over.
-    /// Not an admission check: the cache holds fewer chunks rather than refusing to
-    /// start.
+    /// DRAM ceiling for the read cache index across all cores and classes; its media is
+    /// whatever the slabs left over. Not an admission check: the cache holds fewer chunks.
     pub(crate) cache_index_bytes: u64,
-    /// Registers one anti-entropy sweep pulls while replaying a group, and pushes per
-    /// extent while handing one over. The rate a member replacement and an extent
-    /// handover run at (heal.rs).
+    /// Registers one anti-entropy sweep pulls per group replay, and pushes per extent while
+    /// handing one over: the rate of member replacement and handover (heal.rs).
     pub(crate) repairs_per_replay: u32,
 }
 
@@ -532,9 +466,9 @@ impl Default for Policy {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
-    /// Strictly increasing; a non-advancing value is rejected. Echoed in this node's
-    /// PING (server.rs), so a node redirected on a stale topology epoch can tell
-    /// whether it holds the file it was told to fetch.
+    /// Strictly increasing; non-advancing is rejected. Echoed in this node's PING
+    /// (server.rs), so a node redirected on a stale epoch can tell if it holds the file it
+    /// was told to fetch.
     pub(crate) generation: u64,
     pub node: Node,
     /// Sorted by id, so `universe` is a binary search.
@@ -542,21 +476,18 @@ pub struct Config {
     /// Sorted by id.
     devices: Vec<Device>,
     pub(crate) policy: Policy,
-    /// `(extent id, universe index, extent index)`, sorted by extent id. Extent ids are
-    /// unique across the whole file, so one flat index serves both the wire - a SEAL
-    /// carries a bare id - and device composition.
+    /// `(extent id, universe index, extent index)`, sorted by extent id. Ids are unique
+    /// file-wide, so one flat index serves the wire (a SEAL carries a bare id) and devices.
     index: Vec<(u32, u32, u32)>,
 }
 
 impl Config {
-    /// Read and decode the file the control plane renamed into place. Validation is
-    /// separate; see `validate`.
+    /// Read and decode the file the control plane renamed into place. See `validate`.
     pub fn load(path: &Path) -> io::Result<Config> {
         Config::decode(&std::fs::read(path)?)
     }
 
-    /// The wire form carries the store's size but not its path: the path is this
-    /// process's own, so it comes from the environment on every decode.
+    /// The wire carries the store's size but not its path, so the path comes from the env.
     fn decode(bytes: &[u8]) -> io::Result<Config> {
         let pb = pb::NodeConfig::decode(bytes).map_err(|e| bad(format!("protobuf: {e}")))?;
         let mut cfg = Config::from_pb(pb)?;
@@ -591,8 +522,7 @@ impl Config {
         self.devices.get(i)
     }
 
-    /// The extent covering `addr`, or `None` if no extent is mapped there. "Not mapped"
-    /// is the ordinary answer for an address in a universe we hold no extent of.
+    /// The extent covering `addr`; `None` is ordinary for an address we hold no extent of.
     pub(crate) fn extent_at(&self, addr: u64) -> Option<&Extent> {
         self.universe_at(addr)?.extent_at(lba_of(addr))
     }
@@ -637,12 +567,8 @@ impl Config {
         self.count_pages(true)
     }
 
-    /// This node's share of one page class, summed over the universes it is in.
-    ///
-    /// Within a universe the nodes of a zone are homogeneous - the catalog is balanced -
-    /// so each holds an equal share of three replicas of everything the zone answers
-    /// for. Across universes the shares simply add: a node in two universes stores for
-    /// both.
+    /// This node's share of one page class over all its universes. The catalog is balanced,
+    /// so each node of a zone holds an equal share of three replicas; shares add up.
     fn count_pages(&self, huge: bool) -> u64 {
         self.universes
             .iter()
@@ -681,8 +607,7 @@ impl Config {
             .flatten()
     }
 
-    /// The topology epoch of `addr`'s universe. Zero for an address in no universe of
-    /// ours, which no routed write can be.
+    /// The topology epoch of `addr`'s universe, zero for an address in no universe of ours.
     pub(crate) fn epoch_of(&self, addr: u64) -> u32 {
         self.universe_at(addr).map_or(0, |u| u.epoch)
     }
@@ -692,29 +617,21 @@ impl Config {
         self.extent_at(addr).map_or(0, |e| e.tombstone_epoch)
     }
 
-    /// The cache admission threshold of `addr`'s extent (cache.rs): 0 never admits, 1
-    /// admits on first sight, and `n` admits once the demand estimate reaches `n`.
-    ///
-    /// An address in no extent of ours is never cached. That is not a special case for
-    /// the cache's benefit - there is nothing here to hold - but it does mean an extent
-    /// leaving this node's config stops admission for its pages at once.
+    /// The cache admission threshold of `addr`'s extent (cache.rs): 0 never admits, 1 on
+    /// first sight, `n` once the demand estimate reaches `n`. An address in no extent of
+    /// ours is never cached, so an extent leaving this config stops admission at once.
     pub(crate) fn cache_admit_of(&self, addr: u64) -> u8 {
         self.extent_at(addr).map_or(0, |e| e.cache_admit)
     }
 
     /// The zones `addr`'s extent asks to have warmed as it commits (paxos.rs). Empty for
-    /// an unmapped address, and empty on every node whose zone is not the home zone,
-    /// since only the home zone commits.
+    /// an unmapped address, and on every node outside the home zone, which alone commits.
     pub(crate) fn warm_zones_of(&self, addr: u64) -> &[u32] {
         self.extent_at(addr).map_or(&[][..], |e| &e.warm_zones)
     }
 
-    /// Whether *our* zone is a warm destination for `addr`.
-    ///
-    /// This is the reader-side half of the same field: it says a page of this extent may
-    /// already be in this zone's cohort caches, so a cross-zone read should look there
-    /// before crossing. False everywhere the extent is not warmed here, which leaves the
-    /// cross-zone read path exactly as it was.
+    /// Whether *our* zone is a warm destination for `addr`: a page of this extent may
+    /// already be in this zone's cohort caches, so a cross-zone read looks there first.
     pub(crate) fn warmed_here(&self, addr: u64) -> bool {
         self.warm_zones_of(addr).contains(&self.node.zone)
     }
@@ -724,8 +641,7 @@ impl Config {
         self.extent_at(addr).map(|e| e.id)
     }
 
-    /// Whether any extent has ever collected, which is what makes a tombstone sweep
-    /// worth running at all.
+    /// Whether any extent has ever collected; if not, a tombstone sweep is pointless.
     pub(crate) fn collecting(&self) -> bool {
         self.extents().any(|(_, e)| e.tombstone_epoch != 0)
     }
@@ -834,8 +750,8 @@ impl Config {
                 )));
             }
         }
-        // Homogeneity: every node the catalog names holds the same number of groups, so
-        // that each may size its store from the zone's total and the node count alone.
+        // Homogeneity: each named node holds the same number of groups, so it can size its
+        // store from the zone's total and the node count alone.
         let nodes = u.zone_nodes();
         let slots = 3 * u.catalog.len();
         if !slots.is_multiple_of(nodes.len()) {
@@ -866,11 +782,9 @@ impl Config {
             if u.zones[..i].iter().any(|o| o.id == z.id) {
                 return Err(bad(format!("universe {id} names zone {} twice", z.id)));
             }
-            // Not checked here: whether we hold a link to any of them. A node may be
-            // told about a zone before the control plane attaches its namespaces, and a
-            // node that only routes may never hold one at all. Both are runtime answers
-            // - the request fails with `EIO`, "routed and unreachable" - rather than a
-            // config this node should refuse to run.
+            // Not checked: whether we hold a link to any of them. A node may hear of a zone
+            // before its namespaces are attached, and a routing-only node never holds one;
+            // both fail at runtime with `EIO`.
             if z.gateways.is_empty() {
                 return Err(bad(format!(
                     "universe {id} zone {} names no gateways, so nothing can reach it",
@@ -945,12 +859,9 @@ impl Config {
                     e.id, e.next_zone
                 )));
             }
-            // A warmed copy is read without a confirmation round, because a cross-zone
-            // confirmation is the round trip the warming exists to avoid. Only an
-            // immutable page can be believed on sight: its version is a function of the
-            // extent's tombstone epoch, so a copy either carries the live version or is
-            // recognisably not the value. A mutable page has no such self-check, and a
-            // remote reader that trusted one could serve bytes the group replaced.
+            // A warmed copy is read without a confirmation round, the round trip warming
+            // exists to avoid. Only an immutable page can be believed on sight: its version
+            // is a function of the tombstone epoch, so a copy is live or visibly not.
             if !e.warm_zones.is_empty() && e.kind != Kind::Immutable {
                 return Err(bad(format!(
                     "extent {} asks to warm other zones, which only an immutable extent may: \
@@ -972,10 +883,8 @@ impl Config {
                         e.id
                     )));
                 }
-                // Warming the home zone is a contradiction: that zone holds the pages
-                // authoritatively. Warming the destination of a migration is one too -
-                // the migration is already sending every page there, and it is about to
-                // become the home zone.
+                // The home zone holds the pages already, and a migration destination is
+                // being sent every page and is about to become the home.
                 if w == e.zone || w == e.next_zone {
                     return Err(bad(format!(
                         "extent {} warms zone {w}, which already holds its pages",
@@ -1060,7 +969,7 @@ impl Config {
                 )));
             }
             // Only across one generation: a node that missed a push cannot tell how many
-            // steps a catalog took, and refusing to guess is the safe answer.
+            // steps a catalog took, so it refuses to guess.
             if self.generation == prev.generation + 1 {
                 let (was, now) = (pu.zone_nodes(), u.zone_nodes());
                 let joined = now.iter().filter(|n| !was.contains(n)).count();
@@ -1101,9 +1010,8 @@ impl Config {
         Ok(())
     }
 
-    /// What one extent may change into. Shape is frozen because the allocator has
-    /// already placed pages by it; placement may move, but only along the migration the
-    /// previous config declared.
+    /// What one extent may change into. Shape is frozen because the allocator placed pages
+    /// by it; placement may move only along the migration the previous config declared.
     fn check_replacement(&self, old: &Extent, new: &Extent) -> io::Result<()> {
         if new.base_lba != old.base_lba {
             return Err(bad(format!(
@@ -1140,8 +1048,7 @@ impl Config {
         Ok(())
     }
 
-    /// The structural checks: everything a `Config` cannot represent at all, as opposed
-    /// to what `validate` refuses to run.
+    /// The structural checks: what a `Config` cannot represent at all, unlike `validate`.
     fn from_pb(p: pb::NodeConfig) -> io::Result<Config> {
         let n = p.node.unwrap_or_default();
         let node = Node {
@@ -1204,8 +1111,8 @@ impl Config {
             });
         }
         universes.sort_by_key(|u| u.id);
-        // The flat extent index, and with it the one uniqueness the wire cannot express:
-        // an id names one extent in one universe, everywhere on this node.
+        // The flat extent index, and the uniqueness the wire cannot express: one id names
+        // one extent in one universe, everywhere on this node.
         let mut index: Vec<(u32, u32, u32)> = universes
             .iter()
             .enumerate()
@@ -1344,16 +1251,14 @@ impl Config {
         }
     }
 
-    /// A human-writable spelling of the same schema, for tests and for anyone who has to
-    /// read a config by eye. Line-oriented; `peer`, `group`, `zone` and `extent` bind to
-    /// the `universe` above them.
+    /// A human-writable spelling of the same schema, for tests and reading by eye.
+    /// Line-oriented; `peer`, `group`, `zone` and `extent` bind to the `universe` above.
     ///
     /// ```text
     /// generation 7
     /// node id=1 zone=1 cohort=0 store=/var/lib/racer/store.img size=68719476736
     /// universe 1 epoch=3
     ///   peer id=2 device=/dev/nvme1n1
-    ///   peer id=4 device=/dev/nvme2n1
     ///   group 1 2 3
     ///   zone id=2 gateways=4,5,6
     ///   extent id=10 base=0    pages=4096 kind=lww zone=1 cache_admit=2
@@ -1382,8 +1287,7 @@ impl Config {
                         ],
                     )
                     .map_err(at)?;
-                    // Absent is not empty: with no `store=` the path falls back to the
-                    // environment, which is where a real deployment always carries it.
+                    // Absent is not empty: with no `store=` the path falls back to the env.
                     store = text_field(f, "store").ok().map(PathBuf::from);
                     p.node = Some(pb::Node {
                         id: get(f, "id").map_err(at)? as u32,
@@ -1507,9 +1411,8 @@ fn fields<'a>(rest: &[&'a str]) -> Vec<(&'a str, &'a str)> {
     rest.iter().filter_map(|s| s.split_once('=')).collect()
 }
 
-/// Reject a field this line has no use for, rather than ignoring it. A typo that
-/// silently defaults is the worst failure this format can have: the node runs, and runs
-/// on something other than what was written.
+/// Reject an unknown field rather than ignoring it: a silent default would mis-run the
+/// node.
 fn only<'a, 'b>(
     f: &'b [(&'a str, &'a str)],
     allowed: &[&str],
@@ -1526,9 +1429,8 @@ fn ids(rest: &[&str]) -> io::Result<Vec<u32>> {
         .collect()
 }
 
-/// A catalog group, which is the one place three is still the shape: position is the
-/// paxos member index and the cohort column, so "not three" is not a state the model
-/// has to consider.
+/// A catalog group, the one place three is still the shape: position is the paxos member
+/// index and the cohort column, so "not three" is not a state the model considers.
 fn as_trio(v: Vec<u32>) -> io::Result<pb::Trio> {
     let a: [u32; 3] = v
         .as_slice()
@@ -1561,8 +1463,7 @@ fn opt(f: &[(&str, &str)], k: &str) -> io::Result<Option<u64>> {
     }
 }
 
-/// An enum by name, case-insensitively; `from` is the lookup `prost` generated from
-/// `config.proto`, so the two can never drift.
+/// An enum by name, case-insensitively; `from` is prost's lookup, so the two cannot drift.
 fn named<T>(
     f: &[(&str, &str)],
     k: &str,
@@ -1591,14 +1492,13 @@ fn list_or(f: &[(&str, &str)], k: &str) -> io::Result<Vec<u32>> {
     }
 }
 
-/// The group slot an address hashes into. A pure function of the address, so a slot is
-/// a name two zones agree on without either holding the other's slot table.
+/// The group slot an address hashes into. A pure function of the address, so two zones
+/// agree on it without sharing a slot table.
 fn slot_of(addr: u64) -> u16 {
     (mix(addr) % SLOTS as u64) as u16
 }
 
-/// Three node ids in cohort order. Named fields on the wire, so "not three" is not a
-/// state the model has to consider.
+/// Three node ids in cohort order; named fields on the wire, so "not three" cannot occur.
 fn trio(t: &pb::Trio) -> [u32; 3] {
     [t.cohort_0, t.cohort_1, t.cohort_2]
 }
@@ -1611,9 +1511,8 @@ fn pb_trio(t: &[u32; 3]) -> pb::Trio {
     }
 }
 
-/// A cheap avalanche so that adjacent addresses land in unrelated slots. Any fixed
-/// permutation works, but every node must agree and cache.rs and heal.rs derive from
-/// it too, so it may never change.
+/// A cheap avalanche so adjacent addresses land in unrelated slots. Any fixed permutation
+/// works, but every node must agree and cache.rs and heal.rs derive from it: never change.
 pub(crate) fn mix(mut x: u64) -> u64 {
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -1623,22 +1522,17 @@ pub(crate) fn mix(mut x: u64) -> u64 {
 }
 
 /// The rendezvous score of `node` for `addr`: the one ranking function this crate has.
-///
-/// Independent of how many nodes the caller intends to take, which is what makes every
-/// ring built on it nest - a wider selection appends and never reorders - and what lets
-/// two nodes agree on a placement without exchanging anything. Shared by the cooperative
-/// cache's cohort ring (cache.rs) and a zone's gateway ring, so that "highest ranked" is
-/// one idea rather than two that could drift.
+/// Independent of how many nodes the caller takes, so rings built on it nest (a wider
+/// selection appends, never reorders) and two nodes agree without exchanging anything.
+/// Shared by the cache's cohort ring (cache.rs) and a zone's gateway ring.
 pub(crate) fn rank(addr: u64, node: u32) -> u64 {
     mix(addr ^ mix(node as u64))
 }
 
-/// `nodes` in descending rank order for `addr`, lazily.
-///
-/// Selection by successive maximum rather than a sort: the lists this walks are tens of
-/// entries at most and callers usually stop at the first, so this trades an allocation
-/// on every cross-zone operation for a linear scan per item taken. The node id breaks a
-/// score tie, so the order is total and identical everywhere.
+/// `nodes` in descending rank order for `addr`, lazily. Successive maximum rather than a
+/// sort: the lists are tens of entries and callers stop at the first, trading an allocation
+/// per cross-zone operation for a linear scan per item taken. The node id breaks a score
+/// tie, so the order is total and the same everywhere.
 pub(crate) fn ranked(nodes: &[u32], addr: u64) -> impl Iterator<Item = u32> {
     let mut last: Option<(u64, u32)> = None;
     std::iter::from_fn(move || {
@@ -1657,15 +1551,12 @@ pub(crate) fn ranked(nodes: &[u32], addr: u64) -> impl Iterator<Item = u32> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Delivery
-// ---------------------------------------------------------------------------
+// --- Delivery ---
 
-/// An inotify watch on the *directory* holding the config file.
-///
-/// The directory, not the file, because delivery is a `rename(2)` over the path: a
-/// watch on the file would hold the old inode and go deaf after the first push.
-/// `IN_MOVED_TO` is the rename landing, `IN_CLOSE_WRITE` an operator editing in place.
+/// An inotify watch on the *directory* holding the config file: delivery is a `rename(2)`
+/// over the path, and a watch on the file would hold the old inode and go deaf after the
+/// first push. `IN_MOVED_TO` is the rename landing, `IN_CLOSE_WRITE` an operator editing
+/// in place.
 struct Watch {
     fd: libc::c_int,
     name: Vec<u8>,
@@ -1759,9 +1650,9 @@ impl Watch {
                 hit |= name == self.name;
                 off += hdr + ev.len as usize;
             }
-            // The whole read is consumed before returning: an event left in the buffer
-            // would never be reported again, and may be the only notice of a write that
-            // lands after the caller has already reloaded the file.
+            // The whole read is consumed before returning: a leftover event is never
+            // reported again, and may be the only notice of a write that lands after the
+            // caller reloaded.
             if hit {
                 return Ok(());
             }
@@ -1775,25 +1666,21 @@ impl Drop for Watch {
     }
 }
 
-/// Watch `path` and hand every accepted configuration to `apply`. Never returns while
-/// the watch is healthy.
-///
-/// A config that fails validation is rejected wholesale and counted; the node keeps
-/// running the one it has. `apply` failing is the same case - the runtime has already
-/// rolled its own build back - so `current` only advances once the new config is live.
+/// Watch `path` and hand each accepted configuration to `apply`; never returns if healthy.
+/// A config failing validation is rejected wholesale and counted; the node keeps the one it
+/// has. `apply` failing is the same case, since the runtime rolled its own build back, so
+/// `current` only advances once the new config is live.
 pub fn watch(
     path: &Path,
     mut current: Config,
     mut apply: impl FnMut(Config) -> io::Result<()>,
 ) -> io::Result<()> {
     let w = Watch::new(path)?;
-    // inotify reports nothing that happened before the watch existed, and the caller
-    // loaded `current` before this thread ran: a config published in that window would
-    // be lost until someone published another one. So read the file here instead of
-    // waiting for it. Draining before every read is what keeps the two in step - an
-    // event dropped here can only announce a file this read is about to see, and a
-    // publication this read misses is still queued for the loop below. Finding the
-    // config already running is the ordinary case and is not a refusal.
+    // inotify reports nothing from before the watch existed, and the caller loaded
+    // `current` before this thread ran, so a config published in that window would be lost.
+    // Read the file here instead. Draining before every read keeps the two in step: a
+    // dropped event can only announce a file this read is about to see, and one this read
+    // misses is still queued for the loop below.
     loop {
         w.drain()?;
         let Ok(next) = Config::load(path) else { break };
@@ -1847,8 +1734,7 @@ fn reject(path: &Path, e: io::Error) {
 mod tests {
     use super::*;
 
-    /// One node in two universes: the first is the one everything is measured against,
-    /// the second exists to prove that two universes share nothing but this node.
+    /// One node in two universes: the second proves they share nothing but this node.
     const SAMPLE: &str = "\
 # the node itself
 generation 7
@@ -1902,8 +1788,7 @@ device 2 extents=12
         assert!(c.extent_by_id(99).is_none());
     }
 
-    /// A device is a concatenation of whole extents, and its own page numbering has
-    /// nothing to do with where those extents sit in the universe.
+    /// A device concatenates whole extents; its page numbering is its own.
     #[test]
     fn a_device_concatenates_whole_extents() {
         let c = sample();
@@ -1930,8 +1815,7 @@ device 2 extents=12
         assert_eq!(h.map(8), None);
     }
 
-    /// The whole point of dropping volumes: two hosts may compose the same extents into
-    /// different devices, in different orders, and one extent may appear in both.
+    /// The same extents may compose into different devices, in any order, and repeat.
     #[test]
     fn extents_compose_in_any_order_and_combination() {
         let c = Config::parse(&format!("{SAMPLE}device 3 extents=11,10\n")).unwrap();
@@ -1961,8 +1845,7 @@ device 2 extents=12
         assert!(format!("{e}").contains("unknown extent"), "{e}");
     }
 
-    /// Extents are placed by the control plane into one flat space per universe, so
-    /// overlap is the one placement mistake nothing downstream could survive.
+    /// Extents share one flat space per universe, so overlap is a fatal placement mistake.
     #[test]
     fn extents_may_not_overlap() {
         let mut c = sample();
@@ -1982,8 +1865,7 @@ device 2 extents=12
         assert!(format!("{e}").contains("used twice"), "{e}");
     }
 
-    /// Two universes are two address spaces, two catalogs and two sets of links. Nothing
-    /// but the node itself is shared, which is what makes the partition a boundary.
+    /// Two universes share nothing but the node: separate address spaces, catalogs, links.
     #[test]
     fn universes_partition_everything() {
         let mut text = SAMPLE.to_string();
@@ -2020,8 +1902,7 @@ device 3 extents=20
         assert_eq!(c.small_pages(), 75 + 100);
     }
 
-    /// A namespace is a universe's, so the same device path in two universes would be a
-    /// hole straight through the boundary.
+    /// A namespace belongs to one universe; the same path in two would breach the boundary.
     #[test]
     fn a_namespace_belongs_to_one_universe() {
         let mut text = SAMPLE.to_string();
@@ -2049,8 +1930,8 @@ device 3 extents=20
             PathBuf::from("/mnt/x.img")
         );
 
-        // A generation carries the store's size but not its path, so a text config
-        // without `store=` has to reach the same fallback rather than an empty path.
+        // A config carries the store's size but not its path, so `store=` absent must fall
+        // back to the environment rather than an empty path.
         let text = SAMPLE.replace(" store=/var/lib/racer/store.img", "");
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.node.store, store_path());
@@ -2109,8 +1990,7 @@ device 3 extents=20
         assert_eq!(c.gateways_for(1, at(1, 0)).count(), 0);
     }
 
-    /// Unlike the cache's ring, this one promotes: a sender that cannot use the first
-    /// gateway falls through to the second, and every sender sees the same order.
+    /// Unlike the cache's ring this one promotes: senders fall through in a shared order.
     #[test]
     fn the_gateway_ring_spreads_and_falls_through() {
         let c = sample();
@@ -2130,16 +2010,15 @@ device 3 extents=20
         );
     }
 
-    /// The order is a function of the address and the ids alone, so a node that holds a
-    /// different subset of links still walks the same sequence.
+    /// The order is a function of the address and ids alone, not of which links a node
+    /// holds.
     #[test]
     fn the_gateway_order_is_stable_under_reordering() {
         let a = ranked(&[7, 8, 9, 10], 42).collect::<Vec<_>>();
         let b = ranked(&[10, 9, 8, 7], 42).collect::<Vec<_>>();
         assert_eq!(a, b);
         assert_eq!(a.len(), 4);
-        // Dropping one leaves the rest in the same relative order: the skipped gateway
-        // is replaced by the next, which is what makes the fall-through cheap.
+        // Dropping one leaves the rest in relative order, which makes fall-through cheap.
         let without = ranked(&[7, 9, 10], 42).collect::<Vec<_>>();
         let expect: Vec<u32> = a.iter().copied().filter(|&n| n != 8).collect();
         assert_eq!(without, expect);
@@ -2216,8 +2095,7 @@ device 3 extents=20
         );
     }
 
-    /// A warm copy is believed without a confirmation round, which only an immutable
-    /// version can carry.
+    /// A warm copy is believed on sight, which only an immutable version supports.
     #[test]
     fn only_an_immutable_extent_may_be_warmed() {
         for kind in ["lww", "occ"] {
@@ -2263,8 +2141,8 @@ device 2 extents=12
         assert_eq!(c.zone_of(at(1, 1024)), Some(1), "still homed there");
     }
 
-    /// One node's config names the rendezvous winner of every cohort of its own zone,
-    /// which is what lets a gateway fan a warm out across all three.
+    /// One config names the rendezvous winner of every cohort of its own zone, so a
+    /// gateway can fan a warm out across all three.
     #[test]
     fn a_catalog_names_a_winner_in_every_cohort() {
         let c = sample();
@@ -2326,8 +2204,7 @@ device 2 extents=12
         back.validate().unwrap_err(); // no store path: `decode` fills that in, `from_pb` does not
     }
 
-    /// The config is pushed whole on every change, so its size is a property of the
-    /// control plane's write amplification.
+    /// The config is pushed whole on every change, so its size is control-plane write cost.
     #[test]
     fn stays_small() {
         let mut c = sample();
@@ -2355,8 +2232,7 @@ device 2 extents=12
         }
     }
 
-    /// An extent that is not in the new config at all is not a violation: the control
-    /// plane may unmap one. Only a surviving id has to keep its shape.
+    /// An extent may be dropped from the new config; only a surviving id must keep shape.
     #[test]
     fn an_extent_may_be_unmapped() {
         let b = sample();
@@ -2468,8 +2344,7 @@ universe 1 epoch=1
         );
     }
 
-    /// Admission is a property of the extent, so two extents in one universe answer
-    /// differently and an address in no extent of ours answers zero.
+    /// Admission is per extent: two in one universe differ, and an unmapped address is 0.
     #[test]
     fn cache_admission_is_per_extent() {
         let c = sample();
@@ -2494,8 +2369,7 @@ universe 1 epoch=1
         }
     }
 
-    /// Admission is a policy knob, not part of the frozen shape: the control plane may
-    /// move it in either direction on any reload, including down to zero.
+    /// Admission is a policy knob, not frozen shape: any reload may move it either way.
     #[test]
     fn cache_admission_may_change_on_a_reload() {
         let b = sample();
@@ -2536,8 +2410,7 @@ universe 1 epoch=1
         assert_eq!(live.get().generation, 9);
     }
 
-    /// Delivery is a rename over the path, so the watch has to survive the inode
-    /// changing underneath it.
+    /// Delivery is a rename, so the watch must survive the inode changing underneath it.
     #[test]
     fn watch_sees_a_rename() {
         let dir = std::env::temp_dir().join(format!("racer-cfg-{}", std::process::id()));
@@ -2559,8 +2432,8 @@ universe 1 epoch=1
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The whole of delivery on one path: a good generation is applied, a bad one is
-    /// refused without disturbing what is running, and the next good one still lands.
+    /// Delivery end to end: a good generation applies, a bad one is refused without
+    /// disturbing what runs, and the next good one still lands.
     #[test]
     fn watch_applies_and_refuses() {
         let dir = std::env::temp_dir().join(format!("racer-apply-{}", std::process::id()));
@@ -2585,9 +2458,8 @@ universe 1 epoch=1
             std::fs::write(&tmp, c.encode()).unwrap();
             std::fs::rename(&tmp, &path).unwrap();
         };
-        // The watch is created on the other thread, so a rename can land before it
-        // exists: announce until it answers. And inotify reports that the file changed,
-        // not how often, so each step must be seen before the next is made.
+        // The watch starts on the other thread, so announce until it answers. inotify
+        // reports that the file changed, not how often, so each step must be seen first.
         let took = std::time::Duration::from_secs(10);
         let beat = std::time::Duration::from_millis(20);
         let mut applied = None;
@@ -2600,8 +2472,8 @@ universe 1 epoch=1
         }
         assert_eq!(applied, Some(8));
 
-        // A duplicate announcement is refused, so wait for the count to stop moving
-        // before taking the baseline this test measures against.
+        // A duplicate announcement is refused, so wait for the count to settle before
+        // taking the baseline.
         let mut before = rejected();
         loop {
             std::thread::sleep(beat);

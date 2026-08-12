@@ -1,16 +1,12 @@
 //! The allocator: page placement, IO, and the cross-core hops into shard state.
 //!
-//! Durable formats live in `layout.rs`, the decisions in `shard.rs`; this file is the
-//! running state around them. One `Shard` per worker core, no locks, no atomics, no
-//! background threads. A page is placed by a free-list pop, written out of place, and
-//! its metadata rides a group-committed 4 KiB mblock write.
-//!
-//! The two classes differ deliberately. `Small` (4 KiB) carries a CRC in its mblock
-//! entry, verified on every read, so a page that does not match is never served; `Huge`
-//! (4 MiB) carries none, so ordering is its only defence against a torn or lost data
-//! write. Both write data before the entry naming it, but only the huge class needs
-//! that for the bytes' sake — `finish_small` gives the small class's own reason.
-//!
+//! Durable formats live in `layout.rs`, the decisions in `shard.rs`. One `Shard` per
+//! worker core, no locks, no atomics, no background threads. A page is placed by a
+//! free-list pop, written out of place, and its metadata rides a group-committed 4 KiB
+//! mblock write. `Small` (4 KiB) carries a CRC in its mblock entry, verified on every
+//! read; a page that does not match is never served. `Huge` (4 MiB) carries none, so
+//! ordering is its only defence against a torn or lost data write. Both write data
+//! before the entry naming it; `finish_small` gives the small class's own reason.
 //! Policy lives elsewhere: anti-entropy in `heal.rs`, CASPaxos in `paxos.rs`.
 
 mod shard;
@@ -32,11 +28,8 @@ use shard::Ticket;
 use shard::{Act, Lookup, Maps, Shape, Shard, Staged};
 pub use shard::{GlobalAddr, Pressure, Status};
 
-/// Bind the two config lookups a shard mutation needs and bundle them as `$m`.
-///
-/// A macro rather than a function because the closures borrow the configuration and the
-/// bundle borrows the closures, so nothing here can be returned: the bindings have to
-/// land in the caller's own scope.
+/// Bind the two config lookups a shard mutation needs as `$m`. A macro because the
+/// bindings borrow the config and so must land in the caller's own scope.
 macro_rules! maps {
     ($cfg:expr, $m:ident) => {
         let cfg = $cfg;
@@ -49,63 +42,51 @@ macro_rules! maps {
     };
 }
 
-/// A reservation whose page is durable but whose entry is not installed yet. Opaque
-/// on purpose: the ticket inside never leaves the allocator.
+/// A durable page whose entry is not installed yet; the ticket never leaves the allocator.
 pub struct Pending {
     class: Class,
     ticket: Ticket,
     crc: u32,
 }
 
-/// DRAM cost of one resident small page: the mblock entry plus its share of the index.
-/// `config::validate` refuses a config whose small working set exceeds
-/// `policy.max_index_bytes` rather than letting the node OOM later.
+/// DRAM cost of one resident small page: mblock entry plus its share of the index.
+/// `config::validate` refuses a working set over `policy.max_index_bytes`, avoiding OOM.
 pub const INDEX_BYTES_PER_PAGE: u64 = 52;
 
 /// A slab lends only while more than `1/LEND_CEILING` of its stripe is genuinely free,
-/// and calls loans back below `1/LEND_FLOOR`. Two different fractions so the two are
-/// not fighting over the same slot: between them the slab neither lends nor reclaims.
+/// and recalls loans below `1/LEND_FLOOR`. Between the two it neither lends nor reclaims.
 pub(super) const LEND_CEILING: u64 = 4;
 const LEND_FLOOR: u64 = 8;
-/// Loans recalled per reservation. Enough to stay ahead of a single allocating core,
-/// small enough that no one write pays for a whole refill.
+/// Loans recalled per reservation: ahead of one allocating core, less than a full refill.
 const LEND_BATCH: u64 = 8;
 
-/// DRAM cost of one OCC read record: the map entry, its share of the table, and its
-/// position in the pool's order.
+/// DRAM cost of one OCC read record: map entry, share of the table, place in pool order.
 const OCC_BYTES_PER_RECORD: u64 = 48;
 
 // ------------------------------------------------------------------------- allocator
 
-/// One worker core's state. The decisions live in `Shard` (`shard.rs`); what is left
-/// here is the two things that cannot cross into a model — the registered staging
-/// buffers and the wakers of parked committers.
+/// One worker core's state; the decisions live in `Shard` (`shard.rs`).
 struct Core {
     shard: Shard,
-    /// Woken by every flush completion on this core. Waiters re-check their own
-    /// condition, so a spurious wake costs one poll.
+    /// Woken by every flush completion on this core; waiters re-check their own condition.
     waiters: Vec<Waker>,
-    /// 4 KiB mblock serialisation buffer per class, pre-held by `tick` so the flush
-    /// path never has to await one.
+    /// 4 KiB mblock serialisation buffer per class, pre-held by `tick` so flush never awaits.
     staging: [Option<PoolBuf>; 2],
     /// 4 MiB pages being reassembled from the pieces a transport split them into.
     parts: Vec<Parts>,
 }
 
-/// One 4 MiB page arriving in pieces. The slot is reserved by the first piece so the
-/// rest land where the page will live, and `have` says which blocks are durable —
-/// the class carries no checksum, so a hole must be caught before the entry that
-/// names the page is written, never after.
+/// One 4 MiB page arriving in pieces. The first piece reserves the slot so the rest
+/// land where the page will live. `have` tracks durable blocks: the class carries no
+/// checksum, so a hole must be caught before the entry naming the page is written.
 struct Parts {
     addr: GlobalAddr,
-    /// The command the pieces belong to. Two commands for one address can be in
-    /// flight at once — a member's accept and a non-member's proposal — and their
-    /// bytes must never be mixed into a page nothing checksums.
+    /// The command the pieces belong to. Two commands for one address can be in flight
+    /// at once (member accept, non-member proposal); their bytes must never mix.
     key: PartsKey,
     ticket: Ticket,
-    /// Pieces whose write is still in flight. An assembly is only evicted while this
-    /// is zero: giving the slot back under a write in flight would hand it to another
-    /// page and let the two overwrite each other.
+    /// Pieces whose write is in flight; an assembly is evicted only at zero, else its slot
+    /// would go to another page mid-write.
     busy: u32,
     have: [u64; (layout::HUGE_PAGE / layout::SMALL_PAGE / 64) as usize],
     blocks: u32,
@@ -114,9 +95,8 @@ struct Parts {
 /// Guard, ballot and proposer index: what makes two pieces parts of one page.
 type PartsKey = (u64, u32, u8);
 
-/// Assemblies one core will hold at once. A transfer that stops halfway leaves its
-/// slot reserved until the eighth assembly after it needs the room, which is the
-/// whole of the reclamation story: bounded, and no timer to get wrong.
+/// Assemblies one core will hold at once. A transfer that stops halfway holds its slot
+/// until the eighth assembly after it needs the room: bounded reclamation, no timer.
 const HUGE_PARTS: usize = 8;
 
 /// Blocks in a 4 MiB page.
@@ -143,28 +123,22 @@ pub struct Allocator {
 // must be `Send + 'static`, can carry a reference to it.
 unsafe impl Sync for Allocator {}
 
-/// Cores that participate in a class's index sharding.
-///
-/// Mblocks are striped `id % cores` and a core allocates only from its own stripe, so
-/// capping the shard width at the mblock count keeps every owning core able to
-/// allocate. It matters for the huge class: one mblock covers 504 MiB, so a modest
-/// huge slab has fewer mblocks than the machine has workers.
+/// Cores that participate in a class's index sharding. Mblocks are striped `id % cores`
+/// and a core allocates only from its own stripe, so capping the width at the mblock
+/// count keeps every owning core able to allocate. One mblock covers 504 MiB, so a
+/// modest huge slab has fewer mblocks than workers.
 fn shards_for(cores: usize, geo: &Geometry, class: Class) -> usize {
     cores.min(geo.mblocks(class).max(1) as usize)
 }
 
-/// This core's share of the OCC pool.
-///
-/// Partitioned per core because a record is only touched by the core that owns its
-/// address, and a shared pool would need a lock on the hot path. The cost is eviction
-/// order: a core can drop a record another would have kept, which turns a would-be
-/// success into a conflict — a retry, never a wrong answer.
+/// This core's share of the OCC pool. Per core because a record is only touched by its
+/// owning core and a shared pool would need a hot-path lock. Cost: a dropped record
+/// turns a success into a conflict, which is a retry, never a wrong answer.
 fn occ_per_core(bytes: u64, cores: usize) -> usize {
     (bytes / OCC_BYTES_PER_RECORD / cores.max(1) as u64).max(1) as usize
 }
 
-/// The shape the device's geometry implies. The only place production numbers meet
-/// the shard code; `shard::model` supplies its own.
+/// The shape the device's geometry implies; `shard::model` supplies its own numbers.
 fn shape_of(geo: &Geometry, cfg: &Config, cores: usize) -> Shape {
     Shape {
         cores: cores as u32,
@@ -192,36 +166,30 @@ impl Allocator {
         self.shards[core].borrow_mut()
     }
 
-    /// The decision-making half of this core's state. Every caller here closes the
-    /// borrow before its next await, which is the invariant `unsafe impl Sync` rests
-    /// on.
+    /// The decision-making half of this core's state. Every caller closes the borrow
+    /// before its next await, the invariant `unsafe impl Sync` rests on.
     fn shard(&self, core: usize) -> std::cell::RefMut<'_, Shard> {
         std::cell::RefMut::map(self.shards[core].borrow_mut(), |c| &mut c.shard)
     }
 
-    /// The core that owns an address's index shard, and therefore allocates for it.
-    /// Reuses the consensus group mapping so the allocator lookup rides the hop the
-    /// consensus layer already makes.
+    /// The core that owns an address's index shard, and so allocates for it. Reuses the
+    /// consensus group mapping so the lookup rides the hop consensus already makes.
     fn owner(&self, addr: GlobalAddr, class: Class) -> usize {
         self.config().group(addr.0).index() as usize % shards_for(self.cores, &self.geo, class)
     }
 
-    /// The configuration currently in force. Reads are a single load: the control
-    /// thread swaps a new one in during a reload and the previous generation stays
-    /// alive until the one after that.
+    /// The configuration currently in force. A read is a single load; the control thread
+    /// swaps on reload and the previous generation lives until the reload after that.
     pub fn config(&self) -> &Config {
         self.cfg.get()
     }
 
-    /// Adopt a new configuration. Control thread only, inside the build step of a
-    /// reload, once the file has passed every check.
+    /// Adopt a new configuration. Control thread only, in a reload's build step, post-check.
     pub fn install(&self, cfg: Config) {
         self.cfg.install(cfg);
     }
 
-    /// The extent's page kind and class, and its tombstone epoch. All three come out of
-    /// one lookup because every caller that needs the epoch already needs the kind, and
-    /// the extent is now where all three live.
+    /// The extent's page kind, class and tombstone epoch, from one lookup.
     fn extent(&self, addr: GlobalAddr) -> Option<(Kind, Class, u64)> {
         let e = self.config().extent_at(addr.0)?;
         Some((
@@ -237,41 +205,35 @@ impl Allocator {
         Ok((kind, class == Class::Huge))
     }
 
-    /// The core owning an address, for a caller that wants to ride the same hop. The
-    /// cache shards itself by this exact function so its lookups cost nothing extra.
+    /// The core owning an address. The cache shards by this too, so its lookups are free.
     pub fn owner_core(&self, addr: GlobalAddr) -> Result<usize, Status> {
         let (_, class, _) = self.extent(addr).ok_or(Status::Unmapped)?;
         Ok(self.owner(addr, class))
     }
 
-    /// Cores an address of `class` can hop to, which is the only set of cores the cache
-    /// may put slots of that class on: `owner_core` routes every lookup through this, so
-    /// a slot on any other core is unreachable.
+    /// Cores an address of `class` can hop to, and so the only cores the cache may hold
+    /// slots of that class on: a slot anywhere else is unreachable via `owner_core`.
     pub fn shards_for(&self, class: Class) -> usize {
         shards_for(self.cores, &self.geo, class)
     }
 
-    /// The registered device. Shared with the cache, which holds the tail of the same
-    /// namespace.
+    /// The registered device, shared with the cache, which holds the tail of the namespace.
     pub fn disk(&self) -> Disk {
         self.disk.clone()
     }
 
-    /// Where the layout ends and the cache tail begins, for a caller that owns no
-    /// `Geometry` of its own.
+    /// Where the layout ends and the cache tail begins.
     pub fn geometry(&self) -> Geometry {
         self.geo
     }
 
-    /// Free-space state of this core's shards. Group hashing spreads addresses
-    /// uniformly, so the local view is representative of the device.
+    /// Free-space state of this core's shards; group hashing makes it representative.
     pub fn pressure(&self) -> Pressure {
         self.shard(runtime::core()).pressure()
     }
 
     /// Whether the store's rate budget is committed far enough ahead that optional work
-    /// should stand down. A separate axis from `pressure`, which is about free space:
-    /// the store can be nearly empty and still have nothing left to give this second.
+    /// should stand down. A separate axis from `pressure`, which is about free space.
     pub fn store_pressed(&self) -> bool {
         self.disk.pressed()
     }
@@ -288,8 +250,7 @@ impl Allocator {
     }
 
     /// Live and tombstoned pages per extent in this core's shards,
-    /// `(extent, live, tombstones)`. Per core for the same reason as `capacity`; the
-    /// exporter sums them.
+    /// `(extent, live, tombstones)`. Per core like `capacity`; the exporter sums them.
     pub fn census(&self) -> Vec<(u32, u64, u64)> {
         self.shard(runtime::core()).census()
     }
@@ -300,34 +261,24 @@ impl Allocator {
 
     // ------------------------------------------------------------------------- loans
 
-    /// Give the allocator a way back to the cache. Called once at startup, after the
-    /// cache exists, before any worker runs.
+    /// Give the allocator a way back to the cache. Once at startup, before any worker runs.
     pub fn attach(&self, cache: &'static Cache) {
         let _ = self.cache.set(cache);
     }
 
-    /// Lend the cache one free 4 MiB data slot from this core's stripe, as a byte
-    /// offset into the store.
-    ///
-    /// The allocator goes on counting a lent slot as free, so a loan cannot move the
-    /// watermarks that lending is gated on, and it takes the slot back the moment it
-    /// wants it. What the cache wrote there is unreachable after a restart either way:
-    /// the mblock entry naming the slot still says free.
+    /// Lend the cache one free 4 MiB data slot from this core's stripe, as a byte offset.
+    /// A lent slot still counts as free, so a loan cannot move the watermarks lending is
+    /// gated on. What the cache wrote is unreachable after a restart: the entry says free.
     pub fn lend(&self) -> Option<u64> {
         let slot = self.shard(runtime::core()).lend()?;
         Some(self.geo.slot_off(Class::Huge, slot))
     }
 
     /// Call loans back until this core's 4 MiB stripe has a real free reserve again.
-    ///
-    /// Synchronous and same-core because `Shard::reserve` cannot await: a loan has to
-    /// be recoverable from inside the reservation that needs it. The cache holds each
-    /// 4 MiB loan on the core that lent it, and a core owning a stripe of the 4 MiB
-    /// slab owns a stripe of the 4 MiB cache too, so no hop is needed.
-    ///
-    /// Nothing happens in the common case. A slab lends only above `1/LEND_CEILING`
-    /// free and reclaims below `1/LEND_FLOOR`, so this is reached long before a write
-    /// could fail for want of a slot, and the two fractions keep it from oscillating.
+    /// Synchronous and same-core because `Shard::reserve` cannot await: a loan must be
+    /// recoverable inside the reservation that needs it, and the cache holds each loan on
+    /// the lending core, which owns the matching cache stripe. Usually a no-op: lending
+    /// stops above `1/LEND_CEILING` free, reclaim starts below `1/LEND_FLOOR`.
     fn top_up(&self, class: Class) {
         if class != Class::Huge {
             return;
@@ -336,8 +287,8 @@ impl Allocator {
             return;
         };
         let core = runtime::core();
-        // Close the borrow before calling into the cache: `give_back` is synchronous
-        // and must not find this core's shard already borrowed.
+        // Close the borrow before calling into the cache: `give_back` is synchronous and
+        // must not find this core's shard already borrowed.
         let want = {
             let sh = self.shard(core);
             let (free, total) = sh.capacity()[Class::Huge as usize];
@@ -360,12 +311,10 @@ impl Allocator {
 
     // ------------------------------------------------------------------ reservations
 
-    /// Guard check plus free-list pop, all on the owning core. Synchronous: no IO has
-    /// been issued when this returns, so a refusal costs nothing.
-    ///
-    /// A present `guard` is the collision detector and the whole of the type check:
-    /// LWW, OCC and Immutable differ only in which version the proposer presented.
-    /// `None` asks the shard to derive it from the local row instead.
+    /// Guard check plus free-list pop, all on the owning core. Synchronous: no IO is
+    /// issued, so a refusal costs nothing. A present `guard` is the collision detector
+    /// and the whole type check: LWW, OCC and Immutable differ only in which version the
+    /// proposer presented. `None` asks the shard to derive it from the local row.
     fn reserve(
         &self,
         addr: GlobalAddr,
@@ -380,9 +329,8 @@ impl Allocator {
             .reserve(addr, kind, class, guard, ballot, epoch)
     }
 
-    /// The owning core's half of a commit: install the entry, retire the address's
-    /// previous slot, and mark the mblock dirty. Returns what `flush_until` must reach
-    /// for this commit to be durable.
+    /// The owning core's half of a commit: install the entry, retire the previous slot,
+    /// mark the mblock dirty. Returns what `flush_until` must reach for durability.
     fn stage(
         &self,
         addr: GlobalAddr,
@@ -404,9 +352,8 @@ impl Allocator {
 
     // ------------------------------------------------------------------- group commit
 
-    /// Wait until mblock `li` is durable at or past `need`. The first arrival issues
-    /// the write immediately with no timer; everyone who commits while it is in flight
-    /// rides the next one.
+    /// Wait until mblock `li` is durable at or past `need`. The first arrival issues the
+    /// write at once with no timer; commits made while it is in flight ride the next one.
     async fn flush_until(&'static self, class: Class, li: u32, need: u64) -> Result<(), Status> {
         let core = runtime::core();
         loop {
@@ -420,8 +367,8 @@ impl Allocator {
         }
     }
 
-    /// Serialise one mblock from its DRAM image and write the copy that is not
-    /// current. Always a whole 4 KiB block: there is nothing to read first.
+    /// Serialise one mblock from DRAM to the copy that is not current: a whole 4 KiB
+    /// block, so there is nothing to read first.
     async fn flush(&'static self, class: Class, li: u32) -> Result<(), Status> {
         let core = runtime::core();
         // Staging is normally pre-held by `tick`; awaiting here is the cold path.
@@ -454,9 +401,8 @@ impl Allocator {
 
     // -------------------------------------------------------------------- write paths
 
-    /// The proposer's own leg of an accept, stopped one step short of the register.
-    /// The page is durable and the slot is held, but this node still reads as it did
-    /// before, so a proposal that never reaches a quorum leaves no trace here.
+    /// The proposer's own leg of an accept, stopped short of the register: page durable,
+    /// slot held, but the node reads as before, so a lost proposal leaves no trace here.
     pub async fn begin_small(
         &'static self,
         addr: GlobalAddr,
@@ -547,9 +493,8 @@ impl Allocator {
         })
     }
 
-    /// Install a staged entry, now that a quorum holds the value. A refusal means our
-    /// row moved while the peers were answering, so the version we would report is
-    /// not ours to give.
+    /// Install a staged entry, now that a quorum holds the value. A refusal means our row
+    /// moved while the peers were answering, so the version is not ours to report.
     pub async fn finish(&'static self, addr: GlobalAddr, p: Pending) -> Result<u64, Status> {
         let (class, t, crc) = (p.class, p.ticket, p.crc);
         let owner = self.owner(addr, class);
@@ -571,9 +516,8 @@ impl Allocator {
         runtime::on_core(owner, move || async move { self.unreserve(class, t) }).await;
     }
 
-    /// The member side of consensus: apply this page iff the guard still matches. An
-    /// error here leaves the register untouched, which is what lets a recovery read a
-    /// version off two acceptors and know the bytes behind it exist.
+    /// The member side of consensus: apply this page iff the guard matches. An error
+    /// leaves the register untouched, so a version read off two acceptors has bytes.
     pub async fn accept_small(
         &'static self,
         addr: GlobalAddr,
@@ -607,13 +551,10 @@ impl Allocator {
         self.finish_small(addr, class, t, page).await
     }
 
-    /// Data first, then the entry that names it. Shared by the guarded and unguarded
-    /// paths: once a ticket exists they are the same write.
-    ///
-    /// The ordering is not about torn reads — the checksum catches those — but about
-    /// the register: an acceptor that answered no must still read as it did before, or
-    /// two acceptors whose data writes failed leave a version behind that looks chosen
-    /// to every later recovery and that nobody can ever serve.
+    /// Data first, then the entry that names it; the guarded and unguarded paths share
+    /// this. The ordering is about the register, not torn reads (the checksum catches
+    /// those): an acceptor that answered no must still read as before, or two failed data
+    /// writes leave a version that looks chosen to later recoveries and nobody can serve.
     async fn finish_small(
         &'static self,
         addr: GlobalAddr,
@@ -630,9 +571,8 @@ impl Allocator {
         Ok(done.then_some(t.version))
     }
 
-    /// The 4 MiB member side. With no checksum the only defence against a torn or
-    /// lost data write is ordering, so the data must be durable before the entry that
-    /// names it is issued.
+    /// The 4 MiB member side. With no checksum, ordering is the only defence against a
+    /// torn or lost data write: data must be durable before the entry naming it.
     pub async fn accept_huge(
         &'static self,
         addr: GlobalAddr,
@@ -689,13 +629,10 @@ impl Allocator {
         Ok(done.then_some(t.version))
     }
 
-    /// One piece of a 4 MiB page a transport split on the way here. Pieces are written
-    /// straight into the slot the page will occupy, from whichever core received them,
-    /// so nothing copies and nothing has to cross a core.
-    ///
-    /// Returns the staged page once the last piece is durable, and `None` while any
-    /// block is still owed: with no checksum on the class, a page must not reach the
-    /// register until every byte of it is on the device.
+    /// One piece of a 4 MiB page a transport split. Pieces go straight into the slot the
+    /// page will occupy, on whichever core received them, so nothing copies or crosses a
+    /// core. Returns the staged page once the last piece is durable, `None` while a block
+    /// is owed: no checksum on this class, so a page must not reach the register short.
     pub async fn put_huge_part(
         &'static self,
         addr: GlobalAddr,
@@ -724,8 +661,7 @@ impl Allocator {
         .await?;
         let at = self.geo.slot_off(class, t.slot) + off as u64;
         if self.disk.write(at, buf, Durability::Durable).await.is_err() {
-            // The assembly is dropped rather than left short: the initiator retries the
-            // whole command, and a slot held for a page nobody will finish is waste.
+            // Dropped rather than left short: the initiator retries the whole command.
             runtime::on_core(owner, move || async move { self.drop_parts(addr, key) }).await;
             return Err(Status::Io);
         }
@@ -742,15 +678,13 @@ impl Allocator {
         }))
     }
 
-    /// Read a staged page back. The proxied path needs the bytes it assembled in order
-    /// to propose them, and the slot is the only place they exist as a whole page.
+    /// Read a staged page back: the slot alone holds the proxied bytes as a whole page.
     pub async fn read_pending(&'static self, p: &Pending, buf: Buf) -> Result<(), Status> {
         let off = self.geo.slot_off(p.class, p.ticket.slot);
         self.disk.read(off, buf).await.map_err(|_| Status::Io)
     }
 
-    /// Find or start an assembly, and count the piece about to be written into it.
-    /// Owner core only.
+    /// Find or start an assembly, counting the piece about to be written. Owner core only.
     fn open_parts(
         &self,
         addr: GlobalAddr,
@@ -793,8 +727,7 @@ impl Allocator {
         Ok(t)
     }
 
-    /// Record blocks now durable, and take the assembly out once the page is whole.
-    /// Owner core only.
+    /// Record blocks now durable, and take the assembly out once whole. Owner core only.
     fn mark_parts(&self, addr: GlobalAddr, key: PartsKey, first: u32, n: u32) -> Option<Ticket> {
         let core = runtime::core();
         let i = self.find_parts(core, addr, key)?;
@@ -811,10 +744,8 @@ impl Allocator {
         (p.blocks == HUGE_BLOCKS && p.busy == 0).then(|| c.parts.remove(i).ticket)
     }
 
-    /// Drop an assembly and give its slot back. A sibling piece may still be writing
-    /// into the slot, so the last piece out is the one that releases it; the blocks the
-    /// failed piece owed are never marked, so the page can no longer complete either
-    /// way. Owner core only.
+    /// Drop an assembly; the last piece out gives the slot back, as a sibling may still
+    /// be writing. Owed blocks stay unmarked, so the page cannot complete. Owner core only.
     fn drop_parts(&self, addr: GlobalAddr, key: PartsKey) {
         let core = runtime::core();
         let Some(i) = self.find_parts(core, addr, key) else {
@@ -839,18 +770,16 @@ impl Allocator {
 
     // -------------------------------------------------------------- consensus surface
 
-    /// The register as this node holds it, with no data read. A page we have never
-    /// seen is not an error: it sits at version zero, or at `3 * epoch` for an
-    /// Immutable extent, and consensus needs that to be a vote. Only a page we are
-    /// supposed to hold and cannot serve reports `Missing`, which is not a vote.
+    /// The register as this node holds it, with no data read. A page never seen sits at
+    /// version zero, or `3 * epoch` for an Immutable extent, and consensus needs that as
+    /// a vote. A page we should hold but cannot serve reports `Missing`, not a vote.
     pub async fn register(&'static self, addr: GlobalAddr) -> Result<Register, Status> {
         let owner = self.owner_core(addr)?;
         runtime::on_core(owner, move || async move { self.register_local(addr) }).await
     }
 
-    /// [`register`](Self::register) without the hop, for a caller already standing on
-    /// the owning core. `paxos` uses it to bump the cache's sketch and read the
-    /// register in one hop rather than two.
+    /// [`register`](Self::register) without the hop, for a caller already on the owning
+    /// core. `paxos` uses it to bump the cache's sketch and read the register in one hop.
     pub fn register_local(&self, addr: GlobalAddr) -> Result<Register, Status> {
         let (kind, class, epoch) = self.extent(addr).ok_or(Status::Unmapped)?;
         debug_assert_eq!(runtime::core(), self.owner(addr, class));
@@ -869,8 +798,8 @@ impl Allocator {
         .await
     }
 
-    /// Record a read this node's own ublk device served, which is the only thing that
-    /// feeds the OCC ring. Serving a peer is not a read of ours.
+    /// Record a read this node's own ublk device served: the only thing feeding the OCC
+    /// ring. Serving a peer is not a read of ours.
     pub async fn observed(&'static self, addr: GlobalAddr, version: u64) {
         let Some((kind, class, _)) = self.extent(addr) else {
             return;
@@ -881,14 +810,11 @@ impl Allocator {
         .await
     }
 
-    /// The unguarded apply-if-newer write: the repair step and `learn`, which are the
-    /// same operation with different provenance. Legal only underneath a prepare, or
-    /// into a migration destination. `Ok(false)` means what we already hold is at least
-    /// as new, which makes the two migration streams commutative and a repeated repair
-    /// free.
-    ///
-    /// `replace_equal` also rewrites a row we already hold at exactly `r`, which is how
-    /// a repair replaces bytes that failed their checksum under an unchanged register.
+    /// The unguarded apply-if-newer write: repair and `learn`, one operation with two
+    /// provenances. Legal only underneath a prepare, or into a migration destination.
+    /// `Ok(false)` means what we hold is at least as new, which makes migration streams
+    /// commutative and a repeated repair free. `replace_equal` also rewrites a row held
+    /// at exactly `r`: how a repair replaces bytes that failed checksum at that register.
     pub async fn learn_small(
         &'static self,
         addr: GlobalAddr,
@@ -917,10 +843,8 @@ impl Allocator {
         Ok(self.finish_small(addr, class, t, page).await?.is_some())
     }
 
-    /// Learn a register with no bytes behind it: an Immutable tombstone. Nothing can
-    /// be pulled for one — no member holds a page to serve — so the register is the
-    /// whole of the value, and a replica that never saw the trim would otherwise sit at
-    /// the fill point and diverge from its group for good.
+    /// Learn a register with no bytes: an Immutable tombstone. No member has a page to
+    /// serve, so the register is the value; a replica missing it diverges at the fill point.
     pub async fn learn_tombstone(
         &'static self,
         addr: GlobalAddr,
@@ -988,7 +912,7 @@ impl Allocator {
             return Ok(false);
         };
         self.flush_until(class, st.li, st.seq).await?;
-        // Only now is it safe to give the address's previous slot back.
+        // Only now is it safe to give the previous slot back.
         if let Some(old) = st.stale {
             maps!(self.config(), m);
             self.shard(runtime::core()).release(class, old, &m);
@@ -1031,8 +955,7 @@ impl Allocator {
 
     // --------------------------------------------------------------------- read paths
 
-    /// 4 KiB read. Verified in place against the entry's seeded CRC; a page that does
-    /// not match is never served.
+    /// 4 KiB read, verified against the entry's seeded CRC; a mismatch is never served.
     pub async fn read_small(
         &'static self,
         addr: GlobalAddr,
@@ -1056,8 +979,7 @@ impl Allocator {
         Ok(Self::reg_of(&l))
     }
 
-    /// 4 MiB read, straight into the caller's buffer, which may be the guest's own
-    /// pages. Not verified: this class has no checksum by design.
+    /// 4 MiB read into the caller's buffer, which may be guest pages. No checksum here.
     pub async fn read_huge(
         &'static self,
         addr: GlobalAddr,
@@ -1076,8 +998,7 @@ impl Allocator {
         Ok(Self::reg_of(&l))
     }
 
-    /// Serve a hole by reading the format-time zero region: one device read, and the
-    /// CPU never memsets the buffer.
+    /// Serve a hole by reading the format-time zero region: one device read, no memset.
     pub async fn read_zeroes(&'static self, buf: Buf) -> Result<(), Status> {
         self.disk
             .read(self.geo.zero_base, buf)
@@ -1085,9 +1006,8 @@ impl Allocator {
             .map_err(|_| Status::Io)
     }
 
-    /// The register the bytes we just read belong to. Reading it apart from them lets
-    /// an accept land in between, and a value would then travel under a version it was
-    /// never written at.
+    /// The register the bytes just read belong to. Read separately, an accept could land
+    /// in between and a value travel under a version it was never written at.
     fn reg_of(l: &Lookup) -> Register {
         Register {
             version: l.version,
@@ -1101,11 +1021,9 @@ impl Allocator {
 
     // ----------------------------------------------------------------------- discard
 
-    /// The member side of a trim proposal. An immutable page becomes a tombstone so a
-    /// reader can still tell a hole from a trim, and the entry is reclaimed once the
-    /// control plane advances the epoch past it; a mutable page is released outright.
-    /// The immutable guard is the page's fill version, `3*epoch + 1`; a repeat is `Ok`
-    /// rather than a conflict.
+    /// The member side of a trim proposal. An immutable page becomes a tombstone, so a
+    /// reader can tell a hole from a trim, reclaimed once the control plane advances the
+    /// epoch past it; a mutable page is released. Guard is `3*epoch + 1`; a repeat is `Ok`.
     pub async fn accept_trim(
         &'static self,
         addr: GlobalAddr,
@@ -1155,11 +1073,9 @@ impl Allocator {
     }
 
     /// Rewrite the consensus side state through every superblock copy, preserving the
-    /// geometry words. Read-modify-write, and deliberately not batched: terms bump on
-    /// repair, restart and reconfiguration only, never on the hot path.
-    ///
-    /// A seal that is acked and then lost is a shard that can be written in two zones,
-    /// which is why this gets fourfold redundancy rather than the mblocks' A/B scheme.
+    /// geometry words. Read-modify-write, not batched: terms bump on repair, restart and
+    /// reconfiguration only, never on the hot path. An acked seal that is then lost is a
+    /// shard writable in two zones, hence fourfold redundancy, not the mblocks' A/B.
     pub async fn save_consensus(&'static self, c: &layout::Consensus) -> Result<(), Status> {
         let mut b = PoolBuf::alloc(MBLOCK).await;
         let mut found = false;
@@ -1184,11 +1100,9 @@ impl Allocator {
 
     // ------------------------------------------------------------------- anti-entropy
 
-    /// The core that holds a group's registers, and so its digest and its cursors.
-    ///
-    /// The index alone, not the whole id: universes reuse the same core layout, which
-    /// keeps this in step with `owner` and so keeps a page's allocator shard and its
-    /// consensus group on the one core.
+    /// The core that holds a group's registers, and so its digest and cursors. The index
+    /// alone, not the whole id: universes reuse the same core layout, keeping this in
+    /// step with `owner` and a page's shard on the same core as its consensus group.
     fn owner_of(&self, group: GroupId, class: Class) -> usize {
         group.index() as usize % shards_for(self.cores, &self.geo, class)
     }
@@ -1222,10 +1136,8 @@ impl Allocator {
     }
 
     /// Next chunk. Bounded by entries scanned as well as tuples produced, so a sparse
-    /// filter costs more frames but never a long stall on the owning core.
-    ///
-    /// `universe` is the namespace the request came in on, `None` for a local caller;
-    /// a cursor opened in one universe will not answer another.
+    /// filter costs more frames but never a long stall on the owning core. `universe` is
+    /// the request's namespace, `None` for a local caller; a cursor answers only its own.
     pub async fn snap_next(
         &'static self,
         id: u32,
@@ -1261,15 +1173,13 @@ impl Allocator {
 
     // ------------------------------------------------------------------------- shed
 
-    /// Groups this core still holds registers for, in one class. Per core, like
-    /// `census`: the digests live where the registers do, and a group's registers are
-    /// all on the one core its id maps to.
+    /// Groups this core still holds registers for, in one class. Per core like `census`:
+    /// a group's registers, and its digests, all live on the one core its id maps to.
     pub fn held_groups(&self, huge: bool) -> Vec<GroupId> {
         self.shard(runtime::core()).held_groups(class_of(huge))
     }
 
-    /// Forget a group this core has been drained of, so it stops turning up in
-    /// `held_groups`.
+    /// Forget a group this core has been drained of, so it drops out of `held_groups`.
     pub async fn forget_group(&'static self, group: GroupId, huge: bool) {
         let class = class_of(huge);
         runtime::on_core(self.owner_of(group, class), move || async move {
@@ -1278,18 +1188,16 @@ impl Allocator {
         .await
     }
 
-    /// Drop a register this node is no longer responsible for. Nothing here checks
-    /// that: the caller has confirmed the value is held by every node that now is, and
-    /// this only refuses if the register moved since, which makes the confirmation
-    /// stale.
+    /// Drop a register this node no longer owns. Nothing checks that: the caller has
+    /// confirmed the new holders. Refuses if the register moved, making that stale.
     pub async fn discard(&'static self, addr: GlobalAddr, version: u64) -> Result<(), Status> {
         let (_, class, _) = self.extent(addr).ok_or(Status::Unmapped)?;
         let owner = self.owner(addr, class);
         // The mblock index is the owner's, so the flush has to happen there too.
         runtime::on_core(owner, move || async move {
             maps!(self.config(), m);
-            // Bound before the match: a temporary in the scrutinee would hold the
-            // shard borrow across the flush's await.
+            // Bound before the match: a temporary in the scrutinee would hold the shard
+            // borrow across the flush's await.
             let hit = self
                 .shard(runtime::core())
                 .discard(addr, class, version, &m);
@@ -1303,10 +1211,9 @@ impl Allocator {
 
     // -------------------------------------------------------------------- maintenance
 
-    /// Cooperative maintenance, called from the runtime's tick on every worker. Takes
-    /// the mblock staging buffers once, then sweeps a bounded slice of this core's
-    /// tombstones — the only garbage collection in the system: metadata only, and on
-    /// no critical path.
+    /// Cooperative maintenance, called from the runtime's tick on every worker. Takes the
+    /// mblock staging buffers once, then sweeps a bounded slice of this core's tombstones:
+    /// the only garbage collection in the system, metadata only, off any critical path.
     pub fn tick(&self, now: Instant) {
         let core = runtime::core();
         let cfg = self.config();
@@ -1363,14 +1270,11 @@ impl Future for Park {
 
 // --------------------------------------------------------------------------- startup
 
-/// Open a formatted device: validate the superblock, rebuild every shard by scanning
-/// the metadata region, and hand back an allocator that never needs a journal replay.
-///
-/// Runs on the control thread, before any worker sees traffic, so the scan can use
-/// plain threads and blocking reads. They meter against one budget between them:
-/// several threads reading flat out is exactly the case a budget exists for. The
-/// returned reference is leaked deliberately: the allocator lives for the process, and
-/// cross-core hop closures must be `'static`.
+/// Open a formatted device: validate the superblock, rebuild every shard by scanning the
+/// metadata region, and hand back an allocator that never needs a journal replay.
+/// Runs on the control thread before any worker sees traffic, so the scan can use plain
+/// threads and blocking reads metered against one shared budget. The returned reference
+/// is leaked: the allocator lives for the process and hop closures must be `'static`.
 pub fn open(
     path: &std::path::Path,
     disk: Disk,
@@ -1419,8 +1323,7 @@ pub fn open(
 }
 
 /// Read the whole metadata region and resolve each mblock's A/B copies. Split into
-/// contiguous ranges rather than by owning core so every thread reads sequentially;
-/// placement into stripes is pure memory work afterwards.
+/// contiguous ranges, not by owning core, so threads read sequentially; striping after.
 fn scan(
     path: &std::path::Path,
     geo: &Geometry,
@@ -1476,8 +1379,8 @@ fn scan_range(
     let mut b = layout::Aligned::new(BATCH as usize * MBLOCK);
     let mut at = lo;
     while at < hi {
-        // One batch never crosses an extent boundary: the blocks past it are somewhere
-        // else on the device, and both copies are only contiguous within a run.
+        // One batch never crosses an extent boundary: the blocks past it live elsewhere
+        // on the device, and both copies are only contiguous within a run.
         let n = BATCH.min(hi - at).min(geo.ext_end(class, at) - at);
         let len = n as usize * MBLOCK;
         layout::read_at(
@@ -1526,19 +1429,13 @@ fn scan_range(
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests ---
 
-/// The allocator on its own, without ublk.
-///
-/// Pins the guarantees: durability across a restart with no journal, the three type
-/// semantics, and the deliberate asymmetry where a corrupted 4 KiB page is refused and
-/// a corrupted 4 MiB page is not.
-///
-/// In-crate rather than in `tests/` so that the allocator's whole surface and the raw
-/// disk helpers in `layout` can stay crate-private. It needs root only because the
-/// runtime reads the ublk feature set at startup; no device is created.
+/// The allocator on its own, without ublk. Pins durability across a restart with no
+/// journal, the three type semantics, and the asymmetry where a corrupted 4 KiB page is
+/// refused and a corrupted 4 MiB page is not. In-crate so the allocator's surface and
+/// `layout`'s raw disk helpers stay crate-private. Needs root only because the runtime
+/// reads the ublk feature set; no device is created.
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -1556,17 +1453,14 @@ mod tests {
     use crate::runtime::{self, Cfg, Errno, Handler, PoolBuf, Request};
 
     const IMG: &str = "racer-alloc.img";
-    /// Just what the base config plans, so the runs the grown config appends have to be
-    /// paid for with a larger store rather than absorbed by slack.
+    /// Just what the base config plans, so appended runs need a larger store, not slack.
     const DEV_BYTES: u64 = 528 << 20;
     /// What the store has to be told to be before the appended runs fit in it.
     const GROWN_BYTES: u64 = 1068 << 20;
     const SMALL: usize = 4096;
     const HUGE: usize = 4 << 20;
 
-    // ---------------------------------------------------------------------------
-    // harness
-    // ---------------------------------------------------------------------------
+    // --- harness ---
 
     struct Driver;
     static DRIVER: Driver = Driver;
@@ -1590,10 +1484,9 @@ mod tests {
 
         fn tick(&'static self, cfg: Cfg<Harness>, now: Instant) {
             cfg.alloc.tick(now);
-            // Launch the script once, from core 0, onto core 1, so the cross-core path
-            // is exercised. `runtime::spawn` is core-local, so the hop is what carries
-            // a task elsewhere: polling it once sends the message, and dropping it
-            // afterwards abandons only the reply, which we do not want anyway.
+            // Launch the script once, from core 0 onto core 1, to exercise the cross-core
+            // path. `runtime::spawn` is core-local, so only a hop carries a task
+            // elsewhere: polling once sends the message, dropping it abandons the reply.
             if runtime::core() != 0 || STARTED.swap(1, Ordering::SeqCst) == 1 {
                 return;
             }
@@ -1605,8 +1498,7 @@ mod tests {
         }
     }
 
-    /// Boxed so the hop's payload and task-slot size limits see a fat pointer, not the
-    /// whole script.
+    /// Boxed so the hop's payload and task-slot size limits see a fat pointer.
     fn boxed(a: &'static Allocator, phase: usize) -> Pin<Box<dyn Future<Output = ()>>> {
         Box::pin(async move {
             let r = script(a, phase).await.map_err(|f| f.0);
@@ -1649,9 +1541,7 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // the script
-    // ---------------------------------------------------------------------------
+    // --- the script ---
 
     /// Anything that goes wrong becomes a message the main thread can panic with.
     struct Fail(String);
@@ -1662,8 +1552,7 @@ mod tests {
         }
     }
 
-    /// Report a read by length rather than dumping thousands of bytes into a panic
-    /// message.
+    /// Report a read by length rather than dumping thousands of bytes into a panic.
     fn brief(r: &Result<Vec<u8>, Status>) -> String {
         match r {
             Ok(v) => format!("Ok({} bytes)", v.len()),
@@ -1679,8 +1568,7 @@ mod tests {
         };
     }
 
-    /// One universe holds every extent here: nothing in the allocator is about
-    /// partitioning, and a second universe would only make the addresses longer.
+    /// One universe holds every extent here; the allocator is not about partitioning.
     const UNIVERSE: u32 = 1;
 
     /// Extent bases in that universe's LBA space, in the order `config_text` lays them
@@ -1693,8 +1581,7 @@ mod tests {
     const GREW: u64 = 7168;
     const GREW_BIG: u64 = 15360;
 
-    /// The LWW page whose bytes phase 2 rots. Its checksum never comes back, so every
-    /// later phase has to leave it out of what it expects to be served.
+    /// The LWW page whose bytes phase 2 rots; later phases must not expect it served.
     const ROTTED: u64 = 1;
 
     /// Page `p` of the 4 KiB extent based at `base`.
@@ -1702,8 +1589,7 @@ mod tests {
         GlobalAddr::new(UNIVERSE, base + p)
     }
 
-    /// Page `p` of the 4 MiB extent based at `base`. A huge page is named by the first
-    /// of the 1024 blocks it covers.
+    /// Page `p` of the 4 MiB extent at `base`, named by the first of its 1024 blocks.
     fn big_at(base: u64, p: u64) -> GlobalAddr {
         GlobalAddr::new(UNIVERSE, base + p * crate::config::HUGE_BLOCKS)
     }
@@ -1732,7 +1618,7 @@ mod tests {
             );
         }
 
-        // A page never written is a hole, which is distinct from a page that fails to read.
+        // A page never written is a hole, which is not a page that fails to read.
         let r = get_small(a, at(LWW, 1000)).await;
         check!(
             r == Err(Status::Hole),
@@ -1780,8 +1666,8 @@ mod tests {
             matches!(r, Err(Status::Conflict { .. })),
             "immutable refill must conflict, got {r:?}"
         );
-        // A trim leaves a tombstone, which reads as a hole but is not the same thing:
-        // the entry survives so a refill still conflicts.
+        // A trim leaves a tombstone: reads as a hole, but the entry survives and blocks
+        // a refill.
         let dead = at(IMM, 4);
         put_small(a, dead, &pattern(11, SMALL)).await?;
         a.accept_trim(
@@ -1828,9 +1714,8 @@ mod tests {
     }
 
     async fn restart(a: &'static Allocator) -> Result<(), Fail> {
-        // Before anything here reads and records a fresh observation: the OCC ring is
-        // volatile, so every OCC write after a restart conflicts until the page is
-        // read again.
+        // Before any read here: the OCC ring is volatile, so a write conflicts until
+        // the page is reread.
         let r = put_small(a, at(OCC, 7), &pattern(3, SMALL)).await;
         check!(
             matches!(r, Err(Status::Conflict { .. })),
@@ -1854,8 +1739,7 @@ mod tests {
         let got = get_huge(a, big_at(BIG, 0)).await?;
         check!(got == pattern(0x33, HUGE), "huge page lost");
 
-        // The tombstone survived too, so the distinction between a hole and a trim is
-        // durable and not just a property of the running process.
+        // The tombstone survived too: hole versus trim is durable, not just in-process.
         let dead = at(IMM, 4);
         let r = get_small(a, dead).await;
         check!(
@@ -1871,9 +1755,8 @@ mod tests {
         Ok(())
     }
 
-    /// The device grew under the allocator between the last boot and this one. The whole
-    /// point is that nothing already on it moved, so this re-runs the durability checks
-    /// unchanged and then uses the slots that were appended.
+    /// The device grew under the allocator between boots. Nothing already on it moved, so
+    /// this re-runs the durability checks and then uses the appended slots.
     async fn grown(a: &'static Allocator) -> Result<(), Fail> {
         restart(a).await?;
 
@@ -1911,8 +1794,7 @@ mod tests {
             "a 4 KiB page failing its checksum must never be served, got {}",
             brief(&r)
         );
-        // ...and the 4 MiB page is handed back wrong, silently: this class carries no
-        // checksum by design.
+        // ...and the 4 MiB page is handed back wrong, silently: no checksum by design.
         let got = get_huge(a, big_at(BIG, 0)).await?;
         check!(
             got != pattern(0x33, HUGE),
@@ -1927,13 +1809,10 @@ mod tests {
         Ok(())
     }
 
-    /// Both copies of one metadata block are gone, so the entries it held are gone with
-    /// them and nothing on the device names the pages they described.
-    ///
-    /// `peers` says whether the config gives consensus somewhere to heal from. With
-    /// peers a miss on that shard is `Missing` — never served, never a vote. Without
-    /// them a miss stays a hole and the loss is silent: the single-node limitation,
-    /// asserted here so it stays a decision rather than a surprise.
+    /// Both copies of one metadata block are gone, so its entries are gone and nothing
+    /// names the pages they described. `peers` says whether consensus has somewhere to
+    /// heal from: with peers a miss on that shard is `Missing`, never served and never a
+    /// vote; without them it stays a silent hole, the single-node limitation.
     async fn quarantined(a: &'static Allocator, peers: bool) -> Result<(), Fail> {
         let want = if peers { Status::Missing } else { Status::Hole };
         let lost = LOST.lock().unwrap().clone();
@@ -1971,9 +1850,8 @@ mod tests {
             "the huge class shares nothing with the small one"
         );
 
-        // A page that was never written is indistinguishable from one whose entry was
-        // in the block we lost, so on the affected shard it degrades with it. Spread
-        // wide enough that at least one address lands there.
+        // A page never written is indistinguishable from one whose entry was in the lost
+        // block, so it degrades with it. Spread wide enough to hit the affected shard.
         let mut degraded = 0;
         for p in 2000..2064u64 {
             let r = get_small(a, at(LWW, p)).await;
@@ -1991,9 +1869,7 @@ mod tests {
         Ok(())
     }
 
-    // ---------------------------------------------------------------------------
-    // page helpers
-    // ---------------------------------------------------------------------------
+    // --- page helpers ---
 
     async fn put_small(
         a: &'static Allocator,
@@ -2009,9 +1885,8 @@ mod tests {
     async fn get_small(a: &'static Allocator, addr: GlobalAddr) -> Result<Vec<u8>, Status> {
         let mut pb = PoolBuf::alloc(SMALL).await;
         let v = a.read_small(addr, &mut pb).await;
-        // Only the node whose device served a read may record the OCC observation, so
-        // the allocator never records one itself: `Paxos::read` does it in the running
-        // system, and here it is the caller's job.
+        // Only the node whose device served a read may record the OCC observation, so the
+        // allocator never does: `Paxos::read` records in production, the caller here.
         match v {
             Ok(r) => a.observed(addr, r.version).await,
             Err(Status::Hole) => a.observed(addr, 0).await,
@@ -2040,14 +1915,11 @@ mod tests {
             .collect()
     }
 
-    // ---------------------------------------------------------------------------
-    // store
-    // ---------------------------------------------------------------------------
+    // --- store ---
 
-    /// Eight groups so addresses spread over the workers and the cross-core write path
-    /// is exercised rather than short-circuited. Every group names the same three nodes:
-    /// this node has to own every address it is asked for, and an equal share of eight
-    /// groups over a wider zone would leave it holding more of the zone than the rest.
+    /// Eight groups so addresses spread over workers and exercise the cross-core write
+    /// path. All name the same three nodes because this node must own every address it is
+    /// asked for; a wider zone would leave it an uneven share.
     fn config_text(dev: &Path) -> String {
         sized(dev, DEV_BYTES)
     }
@@ -2075,8 +1947,8 @@ mod tests {
         )
     }
 
-    /// Where the allocator put a page, read straight out of the metadata region, so the
-    /// test can damage exactly one page's bytes behind its back.
+    /// Where the allocator put a page, read from the metadata region, so the test can rot
+    /// one page's bytes behind its back.
     fn slot_of(dev: &Path, class: Class, addr: GlobalAddr) -> Option<u32> {
         let geo = layout::read_geometry(dev).unwrap();
         let f = layout::open_direct(dev, false).unwrap();
@@ -2114,9 +1986,8 @@ mod tests {
         )
     }
 
-    /// Two more extents than the store was formatted for, one per class, so `grow` has
-    /// to append a run to each. They do not fit in what the store was first told to be,
-    /// so the size has to rise with them.
+    /// Two more extents than the store was formatted for, one per class, so `grow` must
+    /// append a run to each; they do not fit the first size, so that rises too.
     fn config_grown(dev: &Path) -> String {
         grown_at(dev, GROWN_BYTES)
     }
@@ -2131,16 +2002,14 @@ mod tests {
         )
     }
 
-    /// The mblock holding `addr`'s entry, and every live address in it — what the test
-    /// is about to make unnameable.
+    /// The mblock holding `addr`'s entry and every live address in it, about to be lost.
     fn mblock_of(dev: &Path, class: Class, addr: GlobalAddr) -> Option<(u32, Vec<u64>)> {
         let geo = layout::read_geometry(dev).unwrap();
         let f = layout::open_direct(dev, false).unwrap();
         let mut buf = layout::Aligned::new(layout::MBLOCK);
         for id in 0..geo.mblocks(class) as u32 {
             // Take whichever copy is current, as startup does: the stale copy names a
-            // different set of pages, and wrecking the block loses the current set
-            // whatever the older copy says.
+            // different set of pages, and wrecking the block loses the current set anyway.
             let mut best: Option<(u64, [u8; layout::MBLOCK])> = None;
             for copy in 0..2u8 {
                 layout::read_at(&f, buf.as_mut(), geo.mblock_off(class, id, copy)).unwrap();
@@ -2165,8 +2034,8 @@ mod tests {
         None
     }
 
-    /// Rot both copies, which is the only thing that quarantines: one bad copy is a
-    /// lost write and the scan falls back to the other.
+    /// Rot both copies, the only thing that quarantines: one bad copy is a lost write and
+    /// the scan falls back to the other.
     fn wreck_mblock(dev: &Path, class: Class, id: u32) {
         let geo = layout::read_geometry(dev).unwrap();
         for copy in 0..2u8 {
@@ -2188,8 +2057,8 @@ mod tests {
     #[test]
     fn allocator() {
         let _only = runtime::exclusive();
-        // The runtime needs the ublk control node, which requires both root and a
-        // kernel carrying `ublk_drv`; probing the node covers both conditions.
+        // The runtime needs the ublk control node, which requires both root and a kernel
+        // carrying `ublk_drv`; probing the node covers both conditions.
         if std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2210,9 +2079,8 @@ mod tests {
         run(&dev, 0);
         run(&dev, 1);
 
-        // The same extra capacity without room in the store for it: the config is
-        // valid, and it is the layout that refuses, naming what the store was told to
-        // be. Nothing is written, so the store is still the one the next step grows.
+        // The same extra capacity with no room in the store: valid config, and the layout
+        // refuses, naming the store size. Nothing written, so the next step grows it.
         let cramped = Config::parse(&grown_at(&dev, DEV_BYTES)).unwrap();
         cramped.validate().unwrap();
         let e = layout::grow_if_needed(&dev, &cramped).expect_err("no room to append");
@@ -2221,8 +2089,7 @@ mod tests {
             "says what ran out: {e}"
         );
 
-        // Add capacity the store was not formatted for, the way `serve` does, then come
-        // back up on the larger config.
+        // Add capacity the store was not formatted for, as `serve` does, then come back up.
         let grown_cfg = Config::parse(&config_grown(&dev)).unwrap();
         grown_cfg.validate().unwrap();
         layout::grow_if_needed(&dev, &grown_cfg).unwrap();

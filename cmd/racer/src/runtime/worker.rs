@@ -1,12 +1,9 @@
 //! The worker: one io_uring per physical core, one thread, no locks on the hot path.
 //!
-//! A worker owns both of its SMT siblings' ublk hardware queues, so per-tag identifiers
-//! are `(dev slot, local queue, tag)` flattened into one dense `tag id` that is at once
-//! the registered buffer index, the request-slab index and the `user_data` payload.
-//!
-//! Everything a running future can reach lives in `Local`, non-generic so it can sit in
-//! a thread-local. The request slab is generic over the handler's future type, so it
-//! lives in `Worker` on `worker_main`'s frame instead.
+//! A worker owns both SMT siblings' ublk hardware queues. `(dev slot, local queue, tag)`
+//! flattens into one dense `tag id`: the registered buffer index, the request-slab index
+//! and the `user_data` payload. `Local` is non-generic so it fits in a thread-local; the
+//! request slab is generic over the handler's future, so it lives in `Worker` instead.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -32,36 +29,29 @@ use super::{
     QUEUES_PER_WORKER, Request, TAGS_PER_DEV, TOTAL_BUF_SLOTS,
 };
 
-/// SQ sizing; the CQ is four times this (`Local::new`) so completion bursts never
-/// overflow.
+/// SQ entries; the CQ is 4x this (`Local::new`) so completion bursts never overflow.
 #[cfg(not(feature = "sim"))]
 const SQ_ENTRIES: u32 = 4096;
-/// Sized minimally: the simulator builds a ring so `Local` needs no second shape, but
-/// never submits to it.
+/// Minimal: the simulator builds a ring so `Local` has one shape, but never submits.
 #[cfg(feature = "sim")]
 const SQ_ENTRIES: u32 = 32;
 
-/// `IORING_ENTER_GETEVENTS`. The io-uring crate's `submit()` omits this flag, so under
-/// `DEFER_TASKRUN` completions would never be surfaced; we call `enter` ourselves.
+/// `IORING_ENTER_GETEVENTS`; the crate's `submit()` omits it, so under `DEFER_TASKRUN`
+/// completions would never be surfaced.
 const ENTER_GETEVENTS: u32 = 1;
 
 const SPIN_BUDGET: Duration = Duration::from_micros(50);
 const POLL_BUDGET: Duration = Duration::from_micros(500);
 /// How often `Handler::tick` fires on a busy worker.
 const TICK_INTERVAL: Duration = Duration::from_millis(1);
-/// A parked worker still owes the handler its maintenance slot: background repair (1 s
-/// interval) and cache decay must progress on a cluster nobody is talking to. Coarse on
-/// purpose — those jobs self-throttle, so this only supplies the wakeup.
+/// Coarse wakeup so a parked worker still runs maintenance: repair (1 s) and cache decay.
 const PARK_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Op-slab utilisation above which completed requests are held back from
-/// `COMMIT_AND_FETCH_REQ`, throttling new arrivals.
+/// Op-slab utilisation above which completed requests are held back, throttling arrivals.
 const COMMIT_DELAY_HIGH: f32 = 0.85;
 const COMMIT_DELAY_LOW: f32 = 0.60;
 
-// ---------------------------------------------------------------------------
-// user_data codec: class:4 | seq:16 | slot:20 | payload:24
-// ---------------------------------------------------------------------------
+// --- user_data codec: class:4 | seq:16 | slot:20 | payload:24 ---
 
 const CLASS_OP: u64 = 0;
 const CLASS_LINK: u64 = 1;
@@ -102,9 +92,7 @@ fn ud_payload(u: u64) -> u32 {
     (u & 0xFF_FFFF) as u32
 }
 
-// ---------------------------------------------------------------------------
-// tag identity
-// ---------------------------------------------------------------------------
+// --- tag identity ---
 
 /// Flattens `(dev slot, local queue, tag)`. Also the registered buffer index.
 fn tag_id(slot: u16, lq: usize, tag: u16) -> u32 {
@@ -119,12 +107,9 @@ fn tag_parts(id: u32) -> (u16, usize, u16) {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Control-plane messages
-// ---------------------------------------------------------------------------
+// --- Control-plane messages ---
 
-/// The control thread blocks on every broadcast until each worker acks by sending `()`.
-/// Dropping the sender unacked unblocks it too, so a dead worker cannot hang it.
+/// The control thread blocks on a broadcast until every worker acks or drops its ack.
 pub(super) type Ack = Sender<()>;
 
 pub(super) enum Ctl {
@@ -160,12 +145,10 @@ pub(super) enum Ctl {
     Shutdown(Ack),
 }
 
-// SAFETY: the only non-Send field is `Publish`'s config pointer; only the receiving
-// worker dereferences it, and the config outlives the `Retire` that revokes it.
+// SAFETY: only the receiving worker derefs `Publish`'s ptr; the config outlives `Retire`.
 unsafe impl Send for Ctl {}
 
-/// The control thread's side channel for waking a worker that is blocked in
-/// `io_uring_enter`. Workers publish their ring fd into the fabric on startup.
+/// The control thread's channel for waking a worker blocked in `io_uring_enter`.
 pub(super) struct Doorbell {
     ring: IoUring,
     fabric: Arc<Fabric>,
@@ -205,17 +188,14 @@ fn push_doorbell(ring: &IoUring, fabric: &Fabric, dst: usize) -> bool {
     unsafe { sq.push(&e) }.is_ok()
 }
 
-// ---------------------------------------------------------------------------
-// Per-device state owned by a worker
-// ---------------------------------------------------------------------------
+// --- Per-device state owned by a worker ---
 
 const T_IDLE: u8 = 0;
 const T_REG: u8 = 1;
 const T_RUN: u8 = 2;
 const T_UNREG: u8 = 3;
 
-/// One ublk hardware queue. A worker owns the queues blk-mq bound to either of its
-/// SMT siblings, so up to `QUEUES_PER_WORKER` of these per device.
+/// One ublk hardware queue; a worker owns up to `QUEUES_PER_WORKER` of these per device.
 struct Queue {
     q_id: u16,
     descs: Mapping,
@@ -225,16 +205,15 @@ struct Queue {
     inflight: u32,
     tag_state: Vec<u8>,
     tag_res: Vec<i32>,
-    /// Byte count of each running request, captured at dispatch so completion never
-    /// has to re-read the kernel's volatile descriptor.
+    /// Request bytes captured at dispatch, so completion never re-reads the kernel desc.
     tag_bytes: Vec<u32>,
 }
 
 impl Queue {
     fn desc(&self, tag: u16) -> ublk::IoDesc {
         let base = self.descs.as_ptr() as *const ublk::IoDesc;
-        // SAFETY: `descs` maps `depth` descriptors and `tag < depth`. The kernel
-        // writes them from another context, so read once, volatile.
+        // SAFETY: `descs` maps `depth` descriptors and `tag < depth`. The kernel writes
+        // them from another context, so read once, volatile.
         unsafe { std::ptr::read_volatile(base.add(tag as usize)) }
     }
 }
@@ -244,8 +223,7 @@ struct DevSlot {
     active: bool,
     stopping: bool,
     dev: u64,
-    /// `/dev/ublkcN`, for `USER_COPY` payload transfers. Owned by the control thread;
-    /// valid for as long as the device is active.
+    /// `/dev/ublkcN` for `USER_COPY` transfers. Control thread owns it; valid while active.
     cfd: RawFd,
     queues: [Option<Queue>; QUEUES_PER_WORKER],
     stop_ack: Option<Ack>,
@@ -260,9 +238,7 @@ impl DevSlot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Local: the non-generic worker context reachable from any running future
-// ---------------------------------------------------------------------------
+// --- Local: the non-generic worker context reachable from any running future ---
 
 pub(super) struct Local {
     pub(super) core: usize,
@@ -273,15 +249,13 @@ pub(super) struct Local {
     pub(super) ready: exec::Ready,
     pub(super) hops: RefCell<hop::HopTasks>,
     pub(super) cells: RefCell<hop::Cells>,
-    /// Hop messages a full destination ring rejected; retried by the loop so no send
-    /// path ever fails.
+    /// Hop messages rejected by a full destination ring; retried so no send ever fails.
     pub(super) hop_out: hop::Outbox,
     deferred: RefCell<VecDeque<Deferred>>,
     devs: RefCell<Vec<DevSlot>>,
     cfg_ptr: Cell<*const ()>,
     cfg_ver: Cell<u32>,
-    /// One counter per live config version. `reconcile` retires every older version
-    /// each time it publishes, so at most two are live and four never wraps.
+    /// One counter per config version; `reconcile` retires older ones, so four never wraps.
     guards: [Cell<u32>; 4],
     stop: Cell<bool>,
     /// Completed requests waiting for op-slab pressure to fall.
@@ -321,9 +295,8 @@ pub(super) fn send_hop(dst: usize, msg: hop::Msg) {
 
 /// Move one request's payload between the guest and our own memory (ublk USER_COPY).
 ///
-/// Synchronous by necessity: io_uring rejects a registered buffer against the ublk
-/// char device and would punt a plain one to io-wq. The kernel side is a bounded
-/// `memcpy` over already-pinned pages, so this never blocks.
+/// Synchronous: io_uring rejects a registered buffer against the ublk char device and
+/// punts a plain one to io-wq. The kernel `memcpy` over pinned pages never blocks.
 pub(super) fn copy_req(
     id: u32,
     off: usize,
@@ -362,8 +335,7 @@ pub(super) fn copy_req(
 }
 
 pub(super) fn poll_hop_task(id: u32) {
-    // The slab is preallocated, so these pointers stay valid while the job runs and
-    // possibly starts further hops.
+    // The slab is preallocated, so these pointers stay valid while the job runs.
     let Some((vt, data)) = with_local(|l| {
         let h = l.hops.borrow();
         h.vt(id).map(|vt| (vt, h.data_ptr(id)))
@@ -374,7 +346,7 @@ pub(super) fn poll_hop_task(id: u32) {
     let w = exec::waker_for(exec::KIND_HOP | id);
     let mut cx = Context::from_waker(&w);
     if unsafe { vt.poll(data, &mut cx) }.is_ready() {
-        // The reply, if the job had one, is already posted; drop it and free the slot.
+        // The reply, if any, is already posted.
         unsafe { vt.drop_in_place(data) };
         with_local(|l| l.hops.borrow_mut().release(id));
     }
@@ -391,8 +363,7 @@ impl Local {
             .build(SQ_ENTRIES)?;
 
         let pool = Pool::new()?;
-        // Registering pins every pool page: unaffordable across hundreds of simulated
-        // nodes, and pointless there since the simulator never submits an SQE.
+        // Registering pins every pool page: too costly in sim, which never submits SQEs.
         #[cfg(not(feature = "sim"))]
         {
             let s = ring.submitter();
@@ -435,8 +406,7 @@ impl Local {
         }
     }
 
-    /// A linked pair must land in the same submission or the kernel severs the link,
-    /// so either both entries go in now or both are deferred together.
+    /// A linked pair must land in one submission or the kernel severs the link; defer both.
     pub(super) fn push_linked(&self, a: squeue::Entry, b: squeue::Entry) {
         let mut sq = unsafe { self.ring.submission_shared() };
         if sq.capacity() - sq.len() >= 2 {
@@ -478,8 +448,7 @@ impl Local {
     }
 
     fn submit(&self) {
-        // An empty submission still costs a full `io_uring_enter`, and this loop turns
-        // many times per request, so only enter when there are SQEs to give.
+        // An empty submission still costs a full `io_uring_enter`; only enter with SQEs.
         if unsafe { self.ring.submission_shared() }.is_empty() {
             return;
         }
@@ -564,9 +533,8 @@ impl Local {
         devs[slot as usize].queues[lq].as_mut().map(f)
     }
 
-    /// Arm one tag: `FETCH_REQ` for a fresh tag, `COMMIT_AND_FETCH_REQ` to complete a
-    /// request and immediately take the next one. Both carry the auto-buf-reg index so
-    /// the request's bio pages appear in our registered buffer table.
+    /// Arm one tag: `FETCH_REQ` for a fresh tag, `COMMIT_AND_FETCH_REQ` to complete and
+    /// take the next. Both carry the auto-buf-reg index so bio pages appear in our table.
     fn arm(&self, id: u32, cmd_op: u32, result: i32) {
         let (slot, lq, tag) = tag_parts(id);
         let q_id = {
@@ -595,8 +563,7 @@ impl Local {
         self.push(e);
     }
 
-    /// `UBLK_IO_F_NEED_REG_BUF` fallback: auto buffer registration failed, so register
-    /// (or, once the request is done, unregister) the request buffer by hand.
+    /// `UBLK_IO_F_NEED_REG_BUF` fallback: register or unregister the buffer by hand.
     fn buf_reg(&self, id: u32, unreg: bool) {
         let (slot, _, tag) = tag_parts(id);
         let Some(q_id) = self.with_queue(id, |q| q.q_id) else {
@@ -622,9 +589,7 @@ impl Local {
 
     /// Hand a finished request back to the kernel, subject to the commit delay.
     fn commit(&self, id: u32, res: i32) {
-        // The commit hands the request's buffer back to the kernel and rearms the tag
-        // on the next request's pages, so an op that still names it would read or write
-        // memory that has moved on.
+        // Commit rearms the tag on the next request's pages; a live op would go stale.
         debug_assert!(
             !self.ops.tag_busy(id),
             "racer: committing tag {id} while an op still references its buffer"
@@ -660,9 +625,7 @@ impl Local {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The loop
-// ---------------------------------------------------------------------------
+// --- The loop ---
 
 pub(super) struct WorkerArgs {
     pub(super) core: usize,
@@ -672,8 +635,7 @@ pub(super) struct WorkerArgs {
     pub(super) ready: Ack,
 }
 
-/// A worker that panics has left the ring, the op slab and the ublk queue in an unknown
-/// state, and the kernel still owns buffers it registered; there is no safe way on.
+/// A panicking worker leaves the ring, op slab and ublk queue unrecoverable, so abort.
 struct AbortOnPanic(usize);
 
 impl Drop for AbortOnPanic {
@@ -708,8 +670,7 @@ pub(super) fn worker_main<H: Handler>(args: WorkerArgs, handler: &'static H) {
     args.fabric.publish(args.core, l.ring.as_raw_fd());
     LOCAL.with(|c| c.set(&l as *const Local));
 
-    // `F` is the anonymous future type of `H::handle`; inferring it here is what lets
-    // request futures live in the slab with no allocation.
+    // Inferring `F`, the anonymous `H::handle` future type, keeps request futures unboxed.
     let mut w = Worker {
         l: &l,
         exec: Exec::new(
@@ -732,8 +693,7 @@ pub(super) fn worker_main<H: Handler>(args: WorkerArgs, handler: &'static H) {
 
     w.run();
 
-    // The slab must die while the thread-local is still valid: dropping a request
-    // future drops its `Cfg` guards, which reach back into `Local`.
+    // The slab must die before the thread-local: futures drop `Cfg` guards into `Local`.
     drop(w);
     LOCAL.with(|c| c.set(std::ptr::null()));
 }
@@ -749,7 +709,6 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             let l = self.l;
             let mut work = 0usize;
 
-            // 1. reap
             cqes.clear();
             l.reap(&mut cqes);
             work += cqes.len();
@@ -757,11 +716,9 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
                 self.handle_cqe(cqe);
             }
 
-            // 2. hop inbox and outbox
             work += l.fabric.drain(l.core);
             work += l.flush_hops();
 
-            // 3. ready tasks
             while let Some(id) = l.ready.pop() {
                 work += 1;
                 if exec::is_hop(id) {
@@ -771,24 +728,19 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
                 }
             }
 
-            // 4. deferred SQEs and throttled commits
             work += l.flush_deferred();
             l.update_throttle();
             work += l.drain_commit_backlog();
 
-            // 5. control messages and the handler's maintenance slot
             work += self.maintenance(clock);
 
-            // 6. submit
             l.submit();
 
             if l.stop.get() && self.quiesced() {
                 break;
             }
 
-            // 7. idle policy. Reading the clock is a vdso call and this loop turns
-            // millions of times a second, so re-read it only on a turn that did work
-            // or every 64th idle turn — still far finer than the budgets below.
+            // Reading the clock is a vdso call: re-read only after work or every 64th turn.
             turn = turn.wrapping_add(1);
             if work > 0 || turn.is_multiple_of(64) {
                 clock = Instant::now();
@@ -820,11 +772,9 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             && self.staged.is_empty()
     }
 
-    /// Dekker-style park: publish `Sleeping`, re-check every inbox, then block in the
-    /// kernel until a completion arrives or `PARK_TIMEOUT` expires. A producer that
-    /// missed our state change has already enqueued, so the re-check sees it; one that
-    /// sees `Sleeping` rings a doorbell. The deadline keeps `maintenance`, and with it
-    /// `Handler::tick`, running on an idle core; `ETIME` just means go round again.
+    /// Dekker-style park: publish `Sleeping`, re-check every inbox, then block until a
+    /// completion or `PARK_TIMEOUT`. A producer that missed the change already enqueued,
+    /// so the re-check sees it; one that sees `Sleeping` rings a doorbell. `ETIME` retries.
     fn park(&mut self) {
         let l = self.l;
         l.fabric.set_sleeping(l.core);
@@ -872,8 +822,7 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             };
             q.armed -= 1;
             if res != ublk::IO_RES_OK || d.stopping {
-                // -ENODEV on stop, or any other terminal condition: the tag is ours
-                // again and we do not re-arm it.
+                // -ENODEV on stop or any terminal error: the tag is ours again, no re-arm.
                 return;
             }
         }
@@ -891,7 +840,7 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             }
         };
 
-        // Auto buffer registration failed for this request; register it by hand first.
+        // Auto buffer registration failed; register by hand before dispatching.
         if desc.flags() & ublk::IO_F_NEED_REG_BUF != 0 {
             self.l.with_queue(id, |q| q.tag_state[tag as usize] = T_REG);
             self.l.buf_reg(id, false);
@@ -1002,8 +951,6 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
         }
 
         // Parked retirements: ack once nothing on this core still holds the version.
-        // This and the drain scan below are rare but the loop turns millions of times a
-        // second, so each sits behind a test that costs nothing when idle.
         if !l.pending_retire.borrow().is_empty() {
             l.pending_retire.borrow_mut().retain(|(ver, ack)| {
                 if l.guards[(*ver % 4) as usize].get() == 0 {
@@ -1044,7 +991,6 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             l.draining.set(left);
         }
 
-        // The handler's cooperative maintenance slot.
         if l.have_cfg() && now.saturating_duration_since(self.last_tick) >= TICK_INTERVAL {
             self.last_tick = now;
             H::tick(self.exec.handler(), l.cfg::<H::Config>(), now);
@@ -1073,9 +1019,8 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
                 let _ = ack.send(());
             }
             Ctl::Retire { ver, ack } => {
-                // The control thread is about to drop this version, so stop handing it
-                // out: otherwise the maintenance tick would keep calling the handler
-                // with a pointer into freed memory.
+                // The control thread is about to drop this version; stop handing it out
+                // or the maintenance tick would call the handler with a freed pointer.
                 if l.cfg_ver.get() == ver {
                     l.cfg_ptr.set(std::ptr::null());
                 }
@@ -1163,19 +1108,12 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Simulation
-// ---------------------------------------------------------------------------
+// --- Simulation ---
 
 /// A worker the simulator owns and steps by hand.
 ///
-/// It is the real worker: the same `Local`, op slab, hop rings and request slab, driven
-/// by the same three phases as the poll loop. Missing is everything that touches the
-/// kernel — reaping, submitting, parking — since nothing is ever submitted here.
-///
-/// The one substitution is the request future, boxed rather than stored in place: the
-/// host infers `F` from `H::handle`, but `SimWorker` must name the type and cannot
-/// write down an anonymous one.
+/// Same state as the real worker, minus reaping, submitting and parking. The request
+/// future is boxed: `SimWorker` cannot name the anonymous `H::handle` future type.
 #[cfg(feature = "sim")]
 pub(crate) mod sim {
     use super::*;
@@ -1187,12 +1125,10 @@ pub(crate) mod sim {
     }
 
     pub(crate) struct SimWorker<H: Handler> {
-        /// Declared before `l` so it dies first: dropping a request future drops its
-        /// `Cfg` guards, which reach back into `Local`.
+        /// Declared before `l` so it dies first: futures drop `Cfg` guards into `Local`.
         w: Worker<'static, H, Boxed>,
         l: Box<Local>,
-        /// Held so the inbox never reports itself disconnected. The simulator drives
-        /// configuration by publishing straight into `Local`.
+        /// Held so the inbox never reports itself disconnected.
         _ctl: SyncSender<Ctl>,
     }
 
@@ -1204,8 +1140,7 @@ pub(crate) mod sim {
             now: Instant,
         ) -> io::Result<SimWorker<H>> {
             let l = Box::new(Local::new(core, fabric)?);
-            // SAFETY: `l` is boxed, so its address is stable, and `w` is declared
-            // first, so it is dropped before `l`.
+            // SAFETY: `l` is boxed so its address is stable, and `w` drops before `l`.
             let lr: &'static Local = unsafe { &*(&*l as *const Local) };
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let w = Worker {
@@ -1226,8 +1161,8 @@ pub(crate) mod sim {
             self.l.ring.as_raw_fd()
         }
 
-        /// Makes this worker the one `with_local` finds; every call into handler code
-        /// must be bracketed by this and [`leave`].
+        /// Makes this worker the one `with_local` finds; bracket handler calls with
+        /// [`leave`].
         ///
         /// [`leave`]: SimWorker::leave
         pub(crate) fn enter(&self) {
@@ -1238,25 +1173,21 @@ pub(crate) mod sim {
             LOCAL.with(|c| c.set(std::ptr::null()));
         }
 
-        /// Publishes a configuration, standing in for the `Ctl::Publish` the control
-        /// thread would broadcast.
+        /// Publishes a configuration, standing in for `Ctl::Publish`.
         pub(crate) fn publish(&self, ver: u32, ptr: *const ()) {
             self.l.cfg_ptr.set(ptr);
             self.l.cfg_ver.set(ver);
         }
 
-        /// Starts a request in slot `id`. Returns a result only if it finished without
-        /// suspending.
+        /// Starts a request in slot `id`; returns a result only if it finished inline.
         pub(crate) fn start(&mut self, id: u32, req: Request) -> Option<Result<(), Errno>> {
             let cfg = self.w.l.cfg::<H::Config>();
             self.w.exec.start(id, cfg, req)
         }
 
-        /// One turn: hops, ready tasks, maintenance. Finished requests are appended to
-        /// `done` rather than committed to a ublk queue that does not exist.
-        ///
-        /// Returns the work done, so the simulator can tell a worker with nothing left
-        /// to do from one that is merely between messages.
+        /// One turn: hops, ready tasks, maintenance. Finished requests go to `done`, not
+        /// a ublk queue. Returns work done, so an idle worker is distinguishable from one
+        /// between messages.
         pub(crate) fn step(
             &mut self,
             now: Instant,
@@ -1319,8 +1250,7 @@ pub(crate) mod sim {
 
     impl<H: Handler> Drop for SimWorker<H> {
         fn drop(&mut self) {
-            // Point the thread-local at us: the slab about to be dropped reaches back
-            // into `Local` to release its `Cfg` guards, as in `worker_main`.
+            // The slab drops next and reaches back into `Local` to release `Cfg` guards.
             self.enter();
         }
     }

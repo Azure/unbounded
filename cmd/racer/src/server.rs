@@ -1,15 +1,12 @@
 //! Maps ublk requests onto allocator pages.
 //!
 //! The runtime sizes each device so one request is at most one page and never straddles
-//! two, and the allocator owns placement, versioning and integrity. What is left is
-//! address arithmetic and two rules: a hole reads as zeroes (the block layer's), and a
-//! 4 MiB page is written whole or not at all (out-of-place placement's).
-//!
-//! A node exports a block device per configured device, which consumers mount, and one
-//! *fabric* device per universe, which that universe's peers issue against. Both use the
-//! same per-core workers and the same zero-copy path; they differ only in the LBA. On a
-//! consumer device it is an offset into a concatenation of extents; on a fabric device it
-//! is the request itself.
+//! two; the allocator owns placement, versioning and integrity. What is left is address
+//! arithmetic and two rules: a hole reads as zeroes (block layer), and a 4 MiB page is
+//! written whole or not at all (out-of-place placement). A node exports one block device
+//! per configured device and one *fabric* device per universe for its peers; both share
+//! the per-core workers and zero-copy path and differ only in the LBA, an offset into a
+//! concatenation of extents or the frame itself.
 
 use std::time::{Duration, Instant};
 
@@ -30,11 +27,8 @@ pub static SERVER: Server = Server;
 
 /// Tag bit separating the two kinds of device key the runtime sees.
 ///
-/// A consumer device is keyed by its configured id and a universe's fabric device by its
-/// universe id, and both are 32-bit and independently assigned, so one bit above them
-/// says which namespace an arriving request came in on. That bit is also the whole of
-/// the demultiplex in [`Handler::handle`]: nothing else has to be looked up to know
-/// whether a request is a mounted block device's or a peer's.
+/// Consumer keys are configured device ids, fabric keys are universe ids; both are 32-bit
+/// and independently assigned. This bit is the whole demultiplex in [`Handler::handle`].
 pub(crate) const FABRIC_TAG: u64 = 1 << 32;
 
 /// The runtime device key of a universe's fabric device.
@@ -66,10 +60,10 @@ impl Dataplane {
             .collect()
     }
 
-    /// Universe id and the device that universe's peers issue fabric frames against. The
-    /// control plane publishes each through nvmet, to that universe's members and to
-    /// nobody else: the partition is the set of nodes holding the namespace. They are not
-    /// consumer devices and hold no bytes of their own.
+    /// Universe id and the device that universe's peers issue fabric frames against.
+    ///
+    /// Published through nvmet to that universe's members only: the partition is the set
+    /// of nodes holding the namespace. Holds no bytes of its own.
     pub fn fabrics(&self) -> Vec<(u32, std::path::PathBuf)> {
         self.universes
             .iter()
@@ -77,8 +71,7 @@ impl Dataplane {
             .collect()
     }
 
-    /// Metadata blocks whose two copies both failed at startup and were taken out of
-    /// service.
+    /// Metadata blocks whose two copies both failed at startup and were taken out of use.
     pub fn quarantined(&self) -> usize {
         self.alloc().quarantined
     }
@@ -86,13 +79,9 @@ impl Dataplane {
 
 /// The consensus layer, and through it the allocator, for one node.
 ///
-/// Built on the first configuration and reused by every later one: allocator geometry is
-/// fixed at format time and its shards are sized for the worker count, so a reload swaps
-/// the config it reads rather than rebuilding it from the device.
-///
-/// A host has one and it lives as long as the process; the simulator holds one per
-/// simulated node, which is the only reason this is a value rather than a pair of
-/// statics.
+/// Built once and reused by every later configuration: allocator geometry is fixed at
+/// format time and its shards are sized for the worker count, so a reload only swaps the
+/// config it reads. A value rather than statics because the simulator holds one per node.
 #[derive(Default)]
 pub struct Node {
     paxos: std::sync::OnceLock<&'static Paxos>,
@@ -104,29 +93,23 @@ impl Node {
         Node::default()
     }
 
-    /// Build a configuration: open the store, install `cfg`, and attach a ublk device
-    /// per configured device plus one fabric device per universe.
-    ///
-    /// Declare-or-not: the runtime keeps a device that is re-declared, tears down one
-    /// that is not, and never disturbs a live registration, so adding or removing a
-    /// device, a universe or a peer is just a different set of calls this time round.
-    /// Re-placing an extent touches no device at all - the new config carries it.
+    /// Build a configuration: open the store, install `cfg`, and attach a ublk device per
+    /// configured device plus one fabric device per universe. A re-declared device is
+    /// kept, one that is not is torn down, and a live registration is never disturbed;
+    /// re-placing an extent touches no device, since the new config carries it.
     pub fn attach(&self, c: &Configurator, cfg: Config) -> std::io::Result<Dataplane> {
         let store = cfg.node.store.clone();
         let limit =
             runtime::Limiter::new(cfg.node.store_max_iops, cfg.node.store_max_bytes_per_sec);
         let disk = c.disk(&store, None, Some(limit))?;
         let cores = c.cores();
-        // Declare everything the new config asks for *before* publishing it anywhere. A
-        // failure below is a rejected config: the runtime discards the build, so the
-        // allocator must still be reading the config that is actually running.
+        // Declare everything the new config asks for before publishing it: a failure
+        // below is a rejected config, so the allocator must still read the running one.
         let mut devices = Vec::new();
         for dev in cfg.devices() {
             devices.push((dev.id, c.device(dev.id as u64, dev.bytes(), dev.huge)?));
         }
-        // Sparse by construction: a fabric device is an address space, not storage. One
-        // per universe, because the namespace a frame arrives on is the only thing that
-        // says which universe it is in.
+        // Sparse: a fabric device is an address space, not storage. One per universe.
         let mut universes = Vec::new();
         for u in cfg.universes() {
             universes.push((u.id, c.fabric(fabric_key(u.id), fabric::DEVICE_SIZE)?));
@@ -144,14 +127,12 @@ impl Node {
             }
             None => {
                 let alloc = alloc::open(&store, disk, cfg, cores)?;
-                // One metric row per worker: this is the first point where the worker
-                // count is settled.
+                // One metric row per worker; the worker count is settled here.
                 metrics::init(cores);
-                // Consensus is leaked for the same reason the allocator is: a hop closure
-                // must be `'static`, and both live as long as the process anyway.
+                // Leaked like the allocator: a hop closure must be `'static`.
                 let cache = cache::open(alloc, cores);
-                // The allocator calls loans of free 4 MiB slots back through this, from
-                // inside a reservation. Installed before any worker runs.
+                // The allocator loans free 4 MiB slots back through this from inside a
+                // reservation. Installed before any worker runs.
                 alloc.attach(cache);
                 let p = paxos::open(alloc, cache, cores);
                 let _ = self.paxos.set(p);
@@ -160,8 +141,7 @@ impl Node {
             }
         };
         paxos.install_links(links);
-        // The cohort roster is derived from each universe's catalog, so it is re-derived
-        // beside the allocator's own config swap.
+        // The cohort roster derives from each universe's catalog: re-derive on a swap.
         paxos.cache().install(paxos.alloc().config());
         let heal = *self.heal.get().expect("set beside paxos");
         Ok(Dataplane {
@@ -179,8 +159,8 @@ impl Handler for Server {
 
     async fn handle(&'static self, cfg: Cfg<Dataplane>, req: Request) -> Result<(), Errno> {
         if req.dev & FABRIC_TAG != 0 {
-            // Boxed: this future is much larger than a consumer request's, and every
-            // worker preallocates one slot per tag sized for the larger of the two.
+            // Boxed: each worker preallocates one slot per tag sized for the larger of a
+            // fabric and a consumer future, and this one is much larger.
             let universe = req.dev as u32;
             return Box::pin(dispatch(&cfg, universe, req)).await;
         }
@@ -189,19 +169,17 @@ impl Handler for Server {
 
     fn tick(&'static self, cfg: Cfg<Dataplane>, now: Instant) {
         cfg.alloc().tick(now);
-        // Sketch decay. A parked worker takes no ticks, so it is halved by elapsed time
-        // rather than once per tick.
+        // Sketch decay: by elapsed time, not per tick, since a parked worker takes none.
         cfg.cache.tick(now);
-        // The sweep is asynchronous and `tick` is not, so this only decides whether to
-        // start one; the job runs as a detached task on this core.
+        // `tick` is not async, so this only starts a sweep; it runs detached on this core.
         cfg.heal.tick(now);
         sample(&cfg);
     }
 }
 
-/// Publish this core's counters. Every worker owns one row and writes only its own, so
-/// a scrape is a sum and never a lock. Node-wide values come from core 0 alone, or the
-/// sum would multiply them by the worker count.
+/// Publish this core's counters. Each worker owns one row and writes only its own, so a
+/// scrape is a sum, never a lock. Core 0 alone reports node-wide values, which the sum
+/// would otherwise multiply by the worker count.
 fn sample(d: &Dataplane) {
     let core = runtime::core();
     let a = d.alloc();
@@ -269,8 +247,7 @@ fn sample(d: &Dataplane) {
     let (replaying, shedding) = d.heal.outstanding();
     s.heal_replaying = replaying;
     s.heal_shedding = shedding;
-    // A pressure level is not summable, so each core contributes a vote and the series
-    // counts how many cores are in that state.
+    // Pressure is not summable: each core votes, so the series counts cores in that state.
     match a.pressure() {
         Pressure::Low => s.alloc_pressure_low = 1,
         Pressure::Critical => s.alloc_pressure_critical = 1,
@@ -279,13 +256,11 @@ fn sample(d: &Dataplane) {
     if core == 0 {
         let cfg = a.config();
         s.alloc_quarantined = a.quarantined as u64;
-        // A reload can add an extent the formatted store has no slots for. Growing needs
-        // a restart, so until then the shortfall is a number to alert on rather than a
-        // silent ENOSPC once the free lists run down.
+        // A reload can add an extent the store has no slots for; growing needs a restart,
+        // so report the shortfall instead of a silent ENOSPC when the free lists run down.
         s.alloc_unbacked = layout::shortfall(&a.geometry(), cfg);
-        // The tail and the part of it nobody holds. Both are node-wide, and the second
-        // is the one to watch: a large gap means the store has cache space that
-        // `policy.cache_index_bytes` will not pay to index.
+        // Tail bytes and the part nobody holds, both node-wide. A large gap means cache
+        // space that `policy.cache_index_bytes` will not pay to index.
         let (tail, unused) = d.cache.tail_bytes();
         s.cache_tail_bytes = tail;
         s.cache_unused_bytes = unused;
@@ -293,9 +268,7 @@ fn sample(d: &Dataplane) {
         s.store_throttle_us = a.store_waited_us();
         s.config_generation = cfg.generation;
         s.config_rejected = config::rejected();
-        // An epoch is per universe now, so the node-wide gauge is the largest one: a
-        // scalar cannot carry more than that, and the per-universe value a control plane
-        // needs it already knows, having published it.
+        // Epochs are per universe; a scalar gauge can only carry the largest.
         s.topology_epoch = cfg.universes().iter().map(|u| u.epoch).max().unwrap_or(0) as u64;
         s.node_id = cfg.node.id as u64;
         s.workers = a.cores() as u64;
@@ -305,10 +278,9 @@ fn sample(d: &Dataplane) {
         s.peers = cfg.peer_count() as u64;
     }
     metrics::publish(core, &s);
-    // Per extent, and outside `Sample` because the rows exist only for extents a
-    // configuration names. Every named extent gets a row even when this core holds
-    // nothing for it: the control plane gates an epoch advance on a zero, and a series
-    // that never appeared is not one.
+    // Per extent, outside `Sample` because rows exist only for extents the config names.
+    // Every named extent gets a row even when this core holds nothing: the control plane
+    // gates an epoch advance on a zero, and a missing series is not a zero.
     let cfg = a.config();
     let census = a.census();
     let rows: Vec<(u32, u32, u64, u64)> = cfg
@@ -321,19 +293,16 @@ fn sample(d: &Dataplane) {
     metrics::publish_extents(core, &rows);
 }
 
-/// The consumer path. Every mutation is a guarded accept and every read is a quorum
-/// read; consensus owns the guard, the ballot and the fan-out, leaving address
-/// arithmetic and the two rules.
+/// The consumer path: every mutation is a guarded accept, every read a quorum read.
+/// Consensus owns the guard, the ballot and the fan-out, leaving address arithmetic.
 async fn serve(d: &Dataplane, req: Request) -> Result<(), Status> {
     let a = d.alloc();
     let px = d.paxos;
     let cfg = a.config();
     let dev = cfg.device(req.dev as u32).ok_or(Status::Unmapped)?;
     let huge = dev.huge;
-    // A device is a concatenation of whole extents, so the page it hands us is a
-    // position in that concatenation and this is where it becomes an address. Nothing
-    // else in the stack knows the order the extents were mounted in, which is what lets
-    // two hosts mount the same extents differently.
+    // A device is a concatenation of whole extents, so its page number becomes an address
+    // here. Nothing else knows the mount order, which lets two hosts mount differently.
     let page = if huge { req.lba / 1024 } else { req.lba };
     let addr = GlobalAddr(dev.map(page).ok_or(Status::Unmapped)?);
 
@@ -348,8 +317,8 @@ async fn serve(d: &Dataplane, req: Request) -> Result<(), Status> {
         match req.op {
             Op::Read => huge_read(d, addr, off, req).await,
             Op::Write => {
-                // Out-of-place placement would make a partial write read the rest of
-                // the page back first, and this class does not do that.
+                // A partial write would need a read-modify-write, which this class
+                // does not do.
                 if off != 0 || req.buf.len() as u64 != layout::HUGE_PAGE {
                     return Err(Status::Unmapped);
                 }
@@ -359,8 +328,7 @@ async fn serve(d: &Dataplane, req: Request) -> Result<(), Status> {
         }
     } else {
         match req.op {
-            // Small pages are staged through our own registered memory, so the page
-            // checksum covers bytes nobody else can change.
+            // Staged through registered memory so the checksum covers stable bytes.
             Op::Read => {
                 let mut page = PoolBuf::alloc(4096).await;
                 match px.read(addr, Sink::Small(&mut page)).await {
@@ -382,15 +350,10 @@ async fn serve(d: &Dataplane, req: Request) -> Result<(), Status> {
 
 /// The 4 MiB read path.
 ///
-/// The class is Immutable-only (config validation enforces it) and a Live immutable page
-/// is terminal within its epoch, so it needs no round: a miss is served locally where it
-/// can be, which is also the only way a partial read can be served at all — a `GET` names
-/// a page, not a byte range within one.
-///
-/// A cache hit is the exception: a cached copy is a claim about a version, not a value
-/// this node owns, so it takes a confirming round. The round runs beside the cached read
-/// rather than after it, so a hit still costs one round trip and no 4 MiB page crosses
-/// the wire from the owning group.
+/// Immutable-only (enforced by config validation) and a Live immutable page is terminal
+/// within its epoch, so it needs no round. A partial read is served locally only: a `GET`
+/// names a page, not a byte range. A cache hit takes a confirming round, run beside the
+/// cached read, so a hit costs one round trip and no 4 MiB page crosses the wire.
 async fn huge_read(
     d: &Dataplane,
     addr: GlobalAddr,
@@ -399,19 +362,15 @@ async fn huge_read(
 ) -> Result<(), Status> {
     let a = d.alloc();
     let px = d.paxos;
-    // A whole page is the only thing the cache can move between nodes for this class: a
-    // `GET` addresses a page and there is no trailer to carry an offset, so a partial
-    // read can only come out of our own region.
+    // The cache can only move whole pages: a `GET` has no trailer to carry an offset.
     let whole = off == 0 && req.buf.len() as u64 == layout::HUGE_PAGE;
     let w = if whole { px.cache_width(addr).await } else { 0 };
     if px.cached_huge(addr, off, w, req.buf).await {
         return Ok(());
     }
     let r = match a.read_huge(addr, off, req.buf).await {
-        // We are not an acceptor for this page, so a local miss says nothing about
-        // whether it exists: the bytes live in the group and repair would only heal
-        // the members. A partial read cannot take this path — a `GET` names a page
-        // rather than a range within one.
+        // Not an acceptor, so a local miss says nothing about existence: the bytes live
+        // in the group and repair would only heal the members. Whole pages only.
         Err(Status::Hole | Status::Missing) if whole && !px.member_of(addr) => {
             match px.pull_huge(addr, req.buf).await {
                 Err(Status::Hole) => return a.read_zeroes(req.buf).await,
@@ -425,8 +384,8 @@ async fn huge_read(
                 r => r?,
             }
         }
-        // A hole reads as zeroes, and we may not touch the guest's pages, so the
-        // zeroes come off the device's format-time zero region.
+        // A hole reads as zeroes, and we may not touch the guest's pages, so they come
+        // from the device's format-time zero region.
         Err(Status::Hole) => return a.read_zeroes(req.buf).await,
         r => r?,
     };
@@ -436,33 +395,26 @@ async fn huge_read(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// fabric target
-// ---------------------------------------------------------------------------
+// --- fabric target ---
 
 /// Serve one fabric frame.
 ///
-/// The LBA is the request, so decoding it is the whole of parsing, and it happens before
-/// anything else touches allocator state. `Frame::decode` is total, so a peer cannot
-/// reach a panic from here; a frame we do not understand is a status, not a fault.
-///
-/// The kernel maps an initiator's submission from core *i* onto hardware queue *i*, but
-/// the target's queue-to-core mapping is nvmet's business, so an arriving frame generally
-/// does not land on the core owning its consensus group. The allocator's own hop fixes
-/// that — it shards its index by the group hash — so it is paid below, not repeated here.
+/// The LBA is the request, so decoding it is all of parsing and happens before anything
+/// touches allocator state. `Frame::decode` is total: an unknown frame is a status, not a
+/// fault. A frame need not land on the core owning its consensus group (queue-to-core
+/// mapping is nvmet's business); the allocator's own hop shards by group hash, so no hop
+/// is added here.
 async fn dispatch(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errno> {
     let (f, part) = Frame::decode(req.lba, req.buf.len())?;
 
-    // The block layer will not hand us a write where the opcode wants a read, or the
-    // reverse; a peer that gets the direction wrong has built a frame for a different
-    // address than it meant to.
+    // The block layer never inverts direction, so a mismatch is a frame built for another
+    // address than the peer meant.
     if f.op.is_read() != (req.op == Op::Read) {
         return Err(status::BAD);
     }
 
-    // Whether a frame is ours to answer is decided before the opcode is. A page op names
-    // its addressee in `imm`; everything else is addressed to this node by the sender's
-    // choice of link, and is ours by construction.
+    // Routing is decided before the opcode. A page op names its addressee in `imm`;
+    // everything else is ours by construction, addressed by the sender's choice of link.
     if let Some(addr) = routed(d, universe, f)?
         && !d.paxos.serves(f.op, addr, f.imm)
     {
@@ -488,13 +440,9 @@ async fn dispatch(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errn
 
 /// The page a frame is addressed to, if it is one this node might have to forward.
 ///
-/// Group ops name a group rather than a page and arrive by the sender's choice of link,
-/// so they are always ours. `CACHE_ONLY` is excluded for the same reason: it asks
-/// whoever holds a cached copy, which is a cohort replica and usually not a member of
-/// the group at all. `WARM` is excluded for that reason too: it is addressed to a
-/// gateway of this zone, or to the cohort member that will hold the copy, and neither
-/// is generally a member of the page's group, so relaying it by group would send it
-/// somewhere with nothing to do with caching the page.
+/// Group ops name a group and arrive by the sender's choice of link, so they are always
+/// ours. `CACHE_ONLY` and `WARM` are excluded: their addressee (a cohort replica, a zone
+/// gateway) is generally not in the page's group, so relaying by group would misroute.
 fn routed(d: &Dataplane, universe: u32, f: Frame) -> Result<Option<GlobalAddr>, Errno> {
     use fabric::Op::*;
     match f.op {
@@ -509,14 +457,11 @@ fn routed(d: &Dataplane, universe: u32, f: Frame) -> Result<Option<GlobalAddr>, 
 
 /// Frame address to allocator address.
 ///
-/// The universe is the namespace the frame arrived on and never anything the sender
-/// wrote, so this is where partitioning becomes an address: a peer given one universe's
-/// namespace cannot name a page in another however it builds its frame.
-///
-/// Within the universe the extent lookup is the bounds check. An address no extent
-/// covers is a bad frame, not a misrouted one - routing happens above this - and so is
-/// one whose page class disagrees with the extent's, which would otherwise read a 4 MiB
-/// page as a 4 KiB one.
+/// The universe is the namespace the frame arrived on, never anything the sender wrote,
+/// so a peer given one universe's namespace cannot name a page in another. The extent
+/// lookup is the bounds check: an address no extent covers is a bad frame, not a misrouted
+/// one (routing happens above), and so is one whose page class disagrees with the
+/// extent's, which would otherwise read a 4 MiB page as a 4 KiB one.
 fn addr_of(d: &Dataplane, universe: u32, f: Frame) -> Result<GlobalAddr, Errno> {
     let addr = config::addr_of(universe, f.lba());
     let e = d.alloc().config().extent_at(addr).ok_or(status::BAD)?;
@@ -526,12 +471,11 @@ fn addr_of(d: &Dataplane, universe: u32, f: Frame) -> Result<GlobalAddr, Errno> 
     Ok(GlobalAddr(addr))
 }
 
-/// The consensus group a group-addressed frame names, checked against the universe it
-/// arrived on.
+/// The consensus group a group-addressed frame names, checked against its universe.
 ///
-/// The wire carries only an index into that universe's catalog, so a group id cannot be
-/// forged across the boundary: the universe half is supplied here from the namespace.
-/// An index past the catalog is a bad frame.
+/// The wire carries only an index into the universe's catalog and the universe half comes
+/// from the namespace, so a group id cannot be forged across the boundary. An index past
+/// the catalog is a bad frame.
 fn group_of(d: &Dataplane, universe: u32, index: u32) -> Result<config::GroupId, Errno> {
     let u = d.alloc().config().universe(universe).ok_or(status::BAD)?;
     if index as usize >= u.catalog.len() {
@@ -542,9 +486,8 @@ fn group_of(d: &Dataplane, universe: u32, index: u32) -> Result<config::GroupId,
 
 /// Allocator outcome to fabric status.
 ///
-/// `Conflict` covers both a CAS conflict and an Immutable page that is already written.
-/// The distinction is not on the wire — only four statuses survive nvmet — and would not
-/// help the caller: either way it lost a race and should look again.
+/// `Conflict` covers a CAS conflict and an already-written Immutable page alike; only four
+/// statuses survive nvmet and the caller lost a race either way.
 fn wire(s: Status) -> Errno {
     match s {
         Status::Hole | Status::Missing => status::MISSING,
@@ -565,16 +508,12 @@ async fn get(
 ) -> Result<(), Errno> {
     let a = d.alloc();
     let addr = addr_of(d, universe, f)?;
-    // `CACHE_ONLY` asks for our *cached* copy and nothing else. It never reaches the
-    // allocator, so answering costs the group nothing and declining costs the reader
-    // one ordinary `GET` at the group.
+    // `CACHE_ONLY` never reaches the allocator; declining costs the reader one `GET`.
     if f.flags & fabric::CACHE_ONLY != 0 {
         return cache_get(d, f, part, addr, req).await;
     }
-    // `imm == 0` is a reader that could not name a member — it resolved our zone and
-    // left the group to us — so it wants the group's answer, not this member's copy.
-    // Only the 4 KiB class: the 4 MiB one is Immutable-only and takes no round at all,
-    // and it arrives MDTS-split, which a round could not answer anyway.
+    // `imm == 0` is a reader that resolved only our zone, so it wants the group's answer.
+    // 4 KiB only: the 4 MiB class takes no round and arrives MDTS-split.
     if f.imm == 0 && !f.huge {
         return get_confirmed(d, part, addr, req).await;
     }
@@ -582,10 +521,8 @@ async fn get(
         let Part::Payload { off } = part else {
             return Err(status::BAD);
         };
-        // Unlike the consumer path, a hole is not zeroes here. A consumer reading an
-        // unwritten page must see zeroes because the block layer says so; a peer is
-        // asking group state a question, and the honest answer is that this member does
-        // not have the page. Consensus then heals from another.
+        // A hole here is not zeroes: answer that this member lacks the page, and let
+        // consensus heal from another.
         return match a.read_huge(addr, off, req.buf).await {
             Err(Status::Hole) => Err(status::MISSING),
             r => r.map(|_| ()).map_err(wire),
@@ -598,9 +535,7 @@ async fn get(
     let reg = a.read_small(addr, &mut page).await.map_err(wire)?;
     req.store(0, &page)?;
     if part == Part::Both {
-        // A gathered reply carries the page's register, so the reader's hedged read
-        // needs no separate `GETMETA` at this member, and the cache's width hint beside
-        // it costs one byte and no command.
+        // The register rides along, so no separate `GETMETA`; the width hint costs a byte.
         d.paxos.gathered(addr, reg, &mut page).await.map_err(wire)?;
         req.store(4096, &page)?;
     }
@@ -609,9 +544,8 @@ async fn get(
 
 /// `GET` with `imm == 0`: answer for the group rather than for ourselves.
 ///
-/// A reader in another zone resolves only the zone and so cannot fan a hedged read out
-/// itself. Running the round here costs it one round trip instead of three and keeps the
-/// metadata legs inside the zone that owns the page.
+/// A reader in another zone resolves only the zone and cannot fan out a hedged read, so
+/// the round runs here: one round trip instead of three, metadata legs inside the zone.
 async fn get_confirmed(
     d: &Dataplane,
     part: Part,
@@ -629,8 +563,8 @@ async fn get_confirmed(
         .map_err(wire)?;
     req.store(0, &page)?;
     if part == Part::Both {
-        // The round already confirmed this register, so the reader needs no metadata leg
-        // of its own. No width: the hint belongs to whoever owns the sketch.
+        // The round confirmed this register. No width: the hint belongs to the sketch's
+        // owner.
         let mut t = [0u8; fabric::BLOCK];
         paxos::put_register(&mut t, r, 0);
         req.store(4096, &t)?;
@@ -640,9 +574,8 @@ async fn get_confirmed(
 
 /// `GET` under [`fabric::CACHE_ONLY`].
 ///
-/// The reply is whatever this node happens to be holding as a cohort replica. There is
-/// no fallback here and there must not be: the point of the flag is that a miss is cheap
-/// and lands back at the reader, which then asks the group.
+/// Whatever this node holds as a cohort replica. There must be no fallback: a miss is
+/// cheap and lands back at the reader, which then asks the group.
 async fn cache_get(
     d: &Dataplane,
     f: Frame,
@@ -650,10 +583,8 @@ async fn cache_get(
     addr: GlobalAddr,
     req: Request,
 ) -> Result<(), Errno> {
-    // A shedding replica owes the reader an `EAGAIN`. Only four errnos survive nvmet, so
-    // it answers `MISSING` instead — indistinguishable from a miss on the wire, and the
-    // reader's fallback is the same either way. Shedding is always safe: the cache has
-    // no correctness role at all.
+    // A shedding replica owes an `EAGAIN`, but only four errnos survive nvmet, so answer
+    // `MISSING`; the reader's fallback is the same. The cache has no correctness role.
     if d.cache.shedding() {
         return Err(status::MISSING);
     }
@@ -661,9 +592,8 @@ async fn cache_get(
         let Part::Payload { off } = part else {
             return Err(status::BAD);
         };
-        // The reader confirms what we hand back against the group, so we need not; but
-        // we owe it a single entry, so the version filter here is the one the paired
-        // `GETMETA` applies and the two cannot name different fills of the page.
+        // The reader confirms this against the group. We owe a single entry, so the
+        // version filter matches the paired `GETMETA`: no two different fills of a page.
         return match d.cache.load_immutable(addr, true, off, req.buf).await {
             Some(_) => Ok(()),
             None => Err(status::MISSING),
@@ -679,15 +609,13 @@ async fn cache_get(
         .load(addr, false, 0, buf)
         .await
         .ok_or(status::MISSING)?;
-    // The register the entry claims travels with it; the reader confirms it against the
-    // quorum and drops the entry if it does not match. No width: we are a replica here,
-    // not the owner, and have no business advertising one.
+    // The entry's claimed register travels with it; the reader confirms it against the
+    // quorum and drops the entry on mismatch. No width: we are a replica, not the owner.
     paxos::put_register(&mut page[fabric::BLOCK..], r, 0);
     req.store(0, &page)
 }
 
-/// `TRIM`: delete a page. A guarded accept whose value is a tombstone, so a repeat says
-/// nothing new.
+/// `TRIM`: delete a page. A guarded accept with a tombstone value, so repeats are free.
 async fn trim(
     d: &Dataplane,
     universe: u32,
@@ -704,10 +632,9 @@ async fn trim(
     d.paxos.accept_trim(addr, f.imm, &t).await.map_err(wire)
 }
 
-/// `ACCEPT`: apply a page under a ballot. A 4 KiB frame gathers its guard and ballot
-/// into a trailer beside the page; a 4 MiB frame is all payload and has neither, so the
-/// acceptor derives both — legal only because the 4 MiB class is Immutable, whose guard
-/// every replica computes from the config alone.
+/// `ACCEPT`: apply a page under a ballot. A 4 KiB frame gathers guard and ballot into a
+/// trailer beside the page; a 4 MiB frame is all payload, so the acceptor derives both.
+/// Legal only because 4 MiB pages are Immutable, whose guard comes from the config alone.
 async fn accept(
     d: &Dataplane,
     universe: u32,
@@ -723,8 +650,7 @@ async fn accept(
         let Part::Payload { off } = part else {
             return Err(status::BAD);
         };
-        // A transport splits a 4 MiB command at its MDTS, so the page can arrive as
-        // consecutive pieces. One whole page still takes the path it always did.
+        // A transport splits a 4 MiB command at MDTS, so the page can arrive in pieces.
         if off == 0 && req.buf.len() as u64 == layout::HUGE_PAGE {
             return d
                 .paxos
@@ -741,8 +667,7 @@ async fn accept(
     let mut both = PoolBuf::alloc(2 * fabric::BLOCK).await;
     req.load(0, &mut both)?;
     let (page, trailer) = both.split_at(fabric::BLOCK);
-    // Staged into our own memory so the checksum covers bytes nobody else can change,
-    // as the consumer path does.
+    // Staged into our own memory so the checksum covers stable bytes, as `serve` does.
     let mut p = PoolBuf::alloc(fabric::BLOCK).await;
     p.copy_from_slice(page);
     let t = trailer.to_vec();
@@ -752,12 +677,10 @@ async fn accept(
         .map_err(wire)
 }
 
-/// `GETMETA`: the metadata half of a hedged read. No page moves, and the answer is a
-/// register the owning core already holds.
+/// `GETMETA`: the metadata half of a hedged read: a register, and no page bytes.
 ///
-/// Under [`fabric::CACHE_ONLY`] it answers for our *cached* copy instead: the register
-/// half of a 4 MiB cache hit, whose class has no trailer to gather one into, so it rides
-/// a second command beside the page.
+/// Under [`fabric::CACHE_ONLY`] it answers for our cached copy instead: the 4 MiB class
+/// has no trailer to gather a register into, so it rides a second command beside the page.
 async fn get_meta(
     d: &Dataplane,
     universe: u32,
@@ -787,9 +710,8 @@ async fn get_meta(
     req.store(0, &t)
 }
 
-/// `PREPARE`: raise this group's promise and report what we hold. A read carries no
-/// request body, so the term is not on the wire: we raise our own by one and the
-/// preparer takes the maximum it hears back.
+/// `PREPARE`: raise this group's promise and report what we hold. A read carries no body,
+/// so the term is not on the wire: raise ours by one, the preparer takes the maximum.
 async fn prepare(
     d: &Dataplane,
     universe: u32,
@@ -827,8 +749,7 @@ async fn learn(
 
 /// `WARM`: another zone wrote a page this zone asked to keep warm.
 ///
-/// Advisory in both directions, so it always succeeds: what the receiver does with it
-/// is its own configuration's business, and the sender has already moved on.
+/// Advisory in both directions, so it always succeeds; the sender has already moved on.
 async fn warm(
     d: &Dataplane,
     universe: u32,
@@ -847,8 +768,7 @@ async fn warm(
     Ok(())
 }
 
-/// `SEAL`: freeze a shard at its source group. An ordinary accept whose value happens
-/// to be a shard rather than a page.
+/// `SEAL`: freeze a shard at its source group. An ordinary accept over a shard.
 async fn seal(d: &Dataplane, universe: u32, part: Part, req: Request) -> Result<(), Errno> {
     if part != Part::Trailer {
         return Err(status::BAD);
@@ -856,9 +776,8 @@ async fn seal(d: &Dataplane, universe: u32, part: Part, req: Request) -> Result<
     let mut t = PoolBuf::alloc(fabric::BLOCK).await;
     req.load(0, &mut t)?;
     let (extent, term) = paxos::seal_trailer(&t);
-    // An extent id is unique across every universe, so it names the shard on its own;
-    // that also means the id alone would let a peer seal a shard outside its own
-    // partition, and this is the check that stops it.
+    // An extent id is unique across universes, so it names the shard alone; this check
+    // stops a peer sealing a shard outside its own partition.
     let ours = d
         .alloc()
         .config()
@@ -870,13 +789,11 @@ async fn seal(d: &Dataplane, universe: u32, part: Part, req: Request) -> Result<
     d.paxos.seal(extent, term).await.map_err(wire)
 }
 
-/// The three anti-entropy ops. Their frames name a *consensus group*, not a page, so
-/// `addr_of` is deliberately off these paths and `dev`/`offset` mean what `heal.rs` says
-/// they mean rather than what the frame layout says.
+/// `MERKLE`: our digest vector for one group and class.
 ///
-/// `MERKLE`: our digest vector for one group and class. A group we hold nothing for
-/// answers all zeroes rather than an error — the correct digest of an empty set, which a
-/// peer that also holds nothing has to agree with.
+/// The three anti-entropy ops name a consensus group, not a page, so `addr_of` is off
+/// these paths and `dev`/`offset` mean what `heal.rs` says. A group we hold nothing for
+/// answers zeroes, the digest of an empty set, not an error.
 async fn merkle(
     d: &Dataplane,
     universe: u32,
@@ -924,13 +841,11 @@ async fn snap_open(
     req.store(0, &t)
 }
 
-/// `SNAPNEXT`: the next chunk of `(address, version, ballot)`, and no page bytes. The
-/// sequence number in the frame makes a retry idempotent, which matters because a cursor
-/// that skipped a chunk would silently under-report a difference.
+/// `SNAPNEXT`: the next chunk of `(address, version, ballot)`, and no page bytes.
 ///
-/// The last chunk closes the cursor: there is no explicit close on the wire and a
-/// finished cursor holds reclamation for nothing. So a lost final reply is not retryable
-/// — the reader sees a bad frame and repeats the bucket next pass.
+/// The sequence number makes a retry idempotent; a cursor that skipped a chunk would
+/// under-report a difference. The last chunk closes the cursor (no close on the wire), so
+/// a lost final reply is not retryable: the reader repeats the bucket next pass.
 async fn snap_next(
     d: &Dataplane,
     universe: u32,
@@ -942,8 +857,7 @@ async fn snap_next(
         return Err(status::BAD);
     }
     let (id, seq) = heal::snap_next_parts(&f);
-    // A cursor id is a small integer, so the universe it was opened in is checked
-    // against the one asking rather than trusted from the frame.
+    // Cursor ids are small integers, so check the opening universe against the caller's.
     let (tuples, done) = d
         .alloc()
         .snap_next(id, Some(seq), Some(universe))
@@ -959,8 +873,7 @@ async fn snap_next(
 }
 
 /// `TERM`: the promise we hold for one group, for a member rebuilding its own. Trailer
-/// slot 2. A group we hold nothing for answers zero, which cannot lower the maximum the
-/// caller is taking.
+/// slot 2. A group we hold nothing for answers zero, which cannot lower the max taken.
 async fn term(
     d: &Dataplane,
     universe: u32,
@@ -977,11 +890,9 @@ async fn term(
     req.store(0, &t)
 }
 
-/// `PING`: liveness, and the geometry a caller needs to tell a stale answer from a
-/// current one. Trailer slots: 0 node id, 1 config generation, 2 topology epoch.
-///
-/// The epoch is the arriving universe's: a caller in one universe has no business
-/// learning another's, and would not know what to do with it if it did.
+/// `PING`: liveness plus the geometry that dates an answer. Trailer slots: 0 node id,
+/// 1 config generation, 2 topology epoch. The epoch is the arriving universe's; a caller
+/// has no business learning another's.
 async fn ping(d: &Dataplane, universe: u32, part: Part, req: Request) -> Result<(), Errno> {
     if part != Part::Trailer {
         return Err(status::BAD);
@@ -998,21 +909,15 @@ async fn ping(d: &Dataplane, universe: u32, part: Part, req: Request) -> Result<
 
 /// A frame that is not ours: reissue it on our own link and complete when it does.
 ///
-/// We hold only the in-flight future — no session, no buffering, no copy. The frame keeps
-/// its shape, so the same registered buffer serves both hops: a forwarded read DMAs the
-/// page back through it, a forwarded write pushes the page forward through it. If we die
-/// the outer command fails, which the originator reads as a timeout.
-///
-/// The budget terminates the recursion: each hop spends one, and a frame that is not ours
-/// with none left is refused. That also bounds a migration forward: one that would chain
-/// past the budget sends the originator back to its config.
-///
-/// A relay never leaves the universe: the link it picks is one of that universe's, so a
-/// forwarded frame is still inside the partition it arrived in.
+/// We hold only the in-flight future: no session, no buffering, no copy. The frame keeps
+/// its shape, so one registered buffer serves both hops; if we die the outer command fails
+/// and the originator reads a timeout. The budget terminates the recursion: each hop
+/// spends one and a foreign frame with none left is refused, which also bounds a migration
+/// forward chain. The link picked is one of the arriving universe's, so a relay stays in
+/// that universe.
 async fn relay(d: &Dataplane, f: Frame, addr: GlobalAddr, req: Request) -> Result<(), Errno> {
-    // No budget, or a member we hold no link to: either way the originator has our
-    // placement wrong, so it is sent back to its config rather than told the page is
-    // missing.
+    // No budget or no link to the member: the originator has our placement wrong, so send
+    // it back to its config rather than report the page missing.
     if fabric::hops(f.flags) == 0 {
         return Err(status::STALE);
     }
@@ -1023,19 +928,15 @@ async fn relay(d: &Dataplane, f: Frame, addr: GlobalAddr, req: Request) -> Resul
     link.send(f.forwarded(), req.buf).await
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// --- Tests ---
 
-/// The whole stack through a real ublk block device: format, serve, write, read,
-/// discard, most fabric frames (`TERM` is not exercised), and the corruption asymmetry
-/// as seen by the block layer.
+/// The whole stack through a real ublk block device: format, serve, write, read, discard,
+/// most fabric frames (`TERM` is not exercised), and the corruption asymmetry as seen by
+/// the block layer.
 ///
-/// In the crate rather than in `tests/` so the allocator can stay private. Needs root,
-/// and needs a working ublk subsystem: it creates and destroys devices.
-///
-/// One dataplane, one process, one boot: a restart is a real process restart or it is
-/// nothing, and `tests/cluster.rs` restarts a real process.
+/// In the crate rather than `tests/` so the allocator can stay private. Needs root and a
+/// working ublk subsystem: it creates and destroys devices. One dataplane, one process,
+/// one boot; `tests/cluster.rs` restarts a real process.
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -1055,28 +956,23 @@ mod tests {
     const DEV_BYTES: u64 = 1 << 30;
 
     /// One universe, laid out by hand: extent 1 is LWW, extent 2 is OCC, extent 3 is
-    /// immutable 4 MiB. Eight groups so addresses spread over the workers and the
-    /// cross-core paths are used.
-    ///
-    /// Extent 4 is homed in zone 2, which this node is not in and holds no link to, so
-    /// routing a foreign address is exercised rather than resolved. Extent 5 is homed
-    /// here but on its way to zone 2, so it serves locally until it is sealed and
-    /// forwards afterwards.
-    ///
-    /// The gap between extent 2 and extent 3 is deliberate: an LBA in it belongs to no
-    /// extent, which is what a frame addressing past the end of anything has to hit.
+    /// immutable 4 MiB. Eight groups so addresses spread over workers and the cross-core
+    /// paths are used. Extent 4 is homed in zone 2, which this node is not in and holds
+    /// no link to, so a foreign address is routed rather than resolved. Extent 5 is homed
+    /// here but on its way to zone 2, so it serves locally until sealed and forwards
+    /// afterwards. The gap between extents 2 and 3 is deliberate: an LBA in it belongs to
+    /// no extent, which is what a frame addressing past the end of anything has to hit.
     /// Extent 3 starts 1024-aligned because a 4 MiB page covers 1024 blocks.
     ///
-    /// Devices 1 to 5 each export one extent. Device 6 exports extents 2 and 1, in that
+    /// Devices 1 to 5 each export one extent. Device 6 exports extents 2 and 1 in that
     /// order: a device is an arbitrary ordered set of extents, so the same extent may be
-    /// mounted twice, at a different offset, and the address it resolves to is the
-    /// extent's, not the device's.
+    /// mounted twice at a different offset, and the address resolves to the extent's, not
+    /// the device's.
     ///
-    /// This node is a member of every group. It has to be: consensus routes a page to
-    /// the group that owns it, and with no peers declared a group we are not in has no
-    /// reachable member at all. A single node is member index 0 everywhere, so its
-    /// quorum is one and a local accept is a decision. Being in every group also pins
-    /// the zone to three nodes, since an equal share of eight groups over anything wider
+    /// This node is a member of every group; with no peers declared, a group we are not
+    /// in has no reachable member. A single node is member index 0 everywhere, so its
+    /// quorum is one and a local accept is a decision. Being in every group also pins the
+    /// zone to three nodes, since an equal share of eight groups over anything wider
     /// would leave us holding more of the zone than the rest.
     fn config_text(dev: &Path) -> String {
         format!(
@@ -1109,9 +1005,8 @@ mod tests {
         )
     }
 
-    /// The precondition is not "am I root" but "can the runtime bring a ublk device up":
-    /// a kernel built without `ublk_drv` refuses these tests however privileged we are,
-    /// so probe the control node itself.
+    /// Probe the control node: a kernel built without `ublk_drv` refuses these tests
+    /// however privileged we are, so "am I root" is not the precondition.
     fn privileged() -> bool {
         std::fs::OpenOptions::new()
             .read(true)
@@ -1124,8 +1019,8 @@ mod tests {
         std::env::temp_dir().join(IMG)
     }
 
-    /// Where the allocator put a page, read straight out of the metadata region. Used to
-    /// corrupt a specific page's bytes behind the allocator's back.
+    /// Where the allocator put a page, read straight out of the metadata region, so a
+    /// page's bytes can be corrupted behind the allocator's back.
     fn slot_of(dev: &Path, class: Class, addr: GlobalAddr) -> Option<u32> {
         let geo = layout::read_geometry(dev).unwrap();
         let f = layout::open_direct(dev, false).unwrap();
@@ -1222,9 +1117,8 @@ mod tests {
             .collect()
     }
 
-    /// A frame issued against our own fabric device, which is what a peer's link would
-    /// do: the peer's namespace *is* this block device, so driving it locally exercises
-    /// every line the remote path would except the transport itself.
+    /// A frame issued against our own fabric device, as a peer's link would: the peer's
+    /// namespace is this block device, so this exercises all but the transport itself.
     fn frame_read(f: &layout::Dev, fr: fabric::Frame, len: usize) -> std::io::Result<Vec<u8>> {
         let mut buf = layout::Aligned::new(len);
         layout::read_at(f, buf.as_mut(), fr.encode() * 4096)?;
@@ -1241,8 +1135,8 @@ mod tests {
         e.raw_os_error().unwrap_or(0)
     }
 
-    /// A read that has to reach the device. The block layer would otherwise answer a
-    /// buffered read from bytes it fetched before we corrupted the disk underneath it.
+    /// A read that has to reach the device; a buffered read would answer from bytes
+    /// fetched before the disk underneath was corrupted.
     fn direct_read(p: &Path, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
         let f = layout::open_direct(p, false)?;
         let mut b = layout::Aligned::new(len);
@@ -1250,9 +1144,8 @@ mod tests {
         Ok(b.as_ref().to_vec())
     }
 
-    /// One boot, three layers: what a block client sees, what a peer sees over the
-    /// fabric, and what a disk that has gone wrong looks like from both. Needs the real
-    /// kernel seams, which `sim` replaces.
+    /// One boot, three layers: the block client's view, a peer's view over the fabric, and
+    /// a disk gone wrong from both. Needs the real kernel seams, which `sim` replaces.
     #[cfg(not(feature = "sim"))]
     #[test]
     fn dataplane_end_to_end() {
@@ -1298,8 +1191,7 @@ mod tests {
         write_at(&mut lww, 0, &small);
         assert_eq!(read_at(&mut lww, 0, 4096).unwrap(), small);
 
-        // Discard is a trim, and a trimmed page is one the extent no longer has: to a
-        // block client that is indistinguishable from one never written.
+        // Discard is a trim; to a block client a trimmed page looks like one never written.
         let range = [63 * 4096u64, 4096u64];
         let rc = unsafe {
             libc::ioctl(
@@ -1324,47 +1216,39 @@ mod tests {
         );
 
         // ---- devices are compositions, not owners -------------------------------
-        // Device 6 is extents 2 and 1 concatenated, so its page 256 is extent 1's page
-        // 0: the same bytes as device 1's page 0, reached at a different offset through
-        // a different device. An address belongs to an extent, and a device is only an
-        // order the control plane put some extents in.
+        // Device 6 is extents 2 and 1 concatenated, so its page 256 is extent 1's page 0,
+        // the same bytes device 1 shows at page 0. An address belongs to an extent; a
+        // device is only an order of extents.
         let mut both_ext = open_dev(&paths[5]);
         assert_eq!(read_at(&mut both_ext, 0, 4096).unwrap(), vec![0u8; 4096]);
         assert_eq!(
             read_at(&mut both_ext, (256 + 2) * 4096, 4096).unwrap(),
             pattern(2, 4096)
         );
-        // And it is one page, not two copies of one: a write through the second mapping
-        // is visible through the first.
+        // One page, not two copies: a write via the second mapping shows in the first.
         let shared = pattern(0xc3, 4096);
         write_at(&mut both_ext, (256 + 8) * 4096, &shared);
         assert_eq!(direct_read(&paths[0], 8 * 4096, 4096).unwrap(), shared);
         drop(both_ext);
 
         // ---- the fabric, against itself -----------------------------------------
-        // The node's own fabric device, opened as if it were a peer's. Everything but
-        // the two nvme hops is real — the same decode, dispatch and allocator. There is
-        // no nvmet here, but nvme-of is transparent by construction: the peer's
-        // namespace *is* this block device.
+        // The node's own fabric device, opened as if it were a peer's. Everything but the
+        // two nvme hops is real: the same decode, dispatch and allocator. nvme-of is
+        // transparent by construction, since the peer's namespace is this block device.
         //
-        // The one thing loopback cannot check is the status alphabet, and it fails in
-        // the *permissive* direction, so the assertions below are deliberately narrow.
-        // A loopback error goes `ublk -> BLK_STS_* -> errno` and keeps roughly a dozen
-        // values; a real one goes on through `nvmet -> NVMe -> initiator` and keeps
-        // four. So a code this test observes is not necessarily one a peer would
-        // observe, and only the four in `fabric::status` may be asserted on.
-        //
-        // A frame carries no extent and no device, only a block offset in the
-        // universe's own LBA space: the namespace it arrives on is the universe, and
-        // which extent covers that offset is the control plane's business.
+        // Loopback cannot check the status alphabet and fails permissively, so the
+        // assertions below are narrow: a loopback error goes `ublk -> BLK_STS_* -> errno`
+        // and keeps roughly a dozen values, a real one goes on through
+        // `nvmet -> NVMe -> initiator` and keeps four. Only the four in `fabric::status`
+        // may be asserted on. A frame carries no extent and no device, only a block offset
+        // in the universe's LBA space; which extent covers it is the control plane's.
         const LWW: u64 = 0; // extent 1
         const IMM: u64 = 5120; // extent 3, 1024-aligned because it is 4 MiB
         const AWAY: u64 = 7168; // extent 4, zone 2
         const GOING: u64 = 7232; // extent 5, zone 1 -> zone 2
         const GAP: u64 = 4500; // between extent 2 and extent 3: no extent at all
 
-        // O_DIRECT so every frame is a real command: a frame is a request, not an
-        // address, and a cached reply would answer a different question.
+        // O_DIRECT so every frame is a real command, not a cached reply to another one.
         let fab = layout::open_direct(&fab_path, true).unwrap();
         write_at(&mut lww, 7 * 4096, &small);
 
@@ -1373,8 +1257,7 @@ mod tests {
         assert_eq!(frame_read(&fab, get7, 4096).unwrap(), small);
 
         // ---- GET, gather: page then trailer, one command ------------------------
-        // The trailer is the register the page was chosen at: value and proof in one
-        // command.
+        // The trailer is the register the page was chosen at: value and proof in one cmd.
         let both = frame_read(&fab, get7, 8192).unwrap();
         assert_eq!(&both[..4096], &small[..]);
         let v7 = fabric::get(&both[4096..], 0);
@@ -1393,16 +1276,14 @@ mod tests {
             libc::ENODATA,
             "a hole is a hole, not a page of zeroes"
         );
-        // The same page over the block device still reads as zeroes: that is what the
-        // block layer requires of a consumer.
+        // Over the block device the same page still reads as zeroes, as a consumer needs.
         assert_eq!(
             read_at(&mut lww, 999 * 4096, 4096).unwrap(),
             vec![0u8; 4096]
         );
 
         // ---- Addressing: unmapped block, and the wrong page class ---------------
-        // The universe's address space is sparse, so an offset is answerable only where
-        // an extent covers it. A gap between two extents is as unmapped as an offset
+        // The address space is sparse: a gap between extents is as unmapped as an offset
         // past every extent, and neither is a hole.
         let gap = fabric::Frame::page(fabric::Op::Get, false, GAP);
         assert_eq!(
@@ -1443,8 +1324,7 @@ mod tests {
         // Control ops are exactly one block.
         assert!(frame_read(&fab, ping, 8192).is_err());
 
-        // A small ACCEPT must gather page and trailer into one command; a page on its
-        // own is a bad frame.
+        // A small ACCEPT must gather page and trailer into one command; a page alone is bad.
         let acc7 = fabric::Frame::page(fabric::Op::Accept, false, LWW + 7);
         assert_eq!(
             errno(frame_write(&fab, acc7, &small).unwrap_err()),
@@ -1466,19 +1346,16 @@ mod tests {
         );
 
         // ---- ACCEPT: one round trip, and the guard is the collision detector ------
-        // The page and the trailer travel together, so a whole proposal is one command:
-        // `imm` zero says the sender is not a member and we are the proposer.
+        // Page and trailer travel together, so a proposal is one command; `imm` zero says
+        // the sender is not a member and we are the proposer.
         let next = pattern(0x11, 4096);
         let mut cmd = vec![0u8; 8192];
         cmd[..4096].copy_from_slice(&next);
         fabric::put(&mut cmd[4096..], 0, v7);
         frame_write(&fab, acc7, &cmd).expect("an accept at the version we hold");
-        // Read back over the fabric, not the block device: that fd is buffered and
-        // would answer from its own cache without asking us.
+        // Read back over the fabric: the block device fd is buffered.
         assert_eq!(frame_read(&fab, get7, 4096).unwrap(), next);
 
-        // The same guard a second time is a proposal that lost its race: refused rather
-        // than reordered, which is the whole of the acceptance rule.
         assert_eq!(
             errno(frame_write(&fab, acc7, &cmd).unwrap_err()),
             libc::EREMOTEIO,
@@ -1509,14 +1386,12 @@ mod tests {
         assert_eq!(frame_read(&fab, get7, 4096).unwrap(), next);
 
         // ---- MERKLE and the cursor: healing --------------------------------------
-        // Both carry registers and never page bytes, so a digest and a chunk of a
-        // snapshot each ride the trailer of one control block.
+        // Both carry registers and never page bytes, each riding one control block trailer.
         let addr7 = GlobalAddr::new(1, LWW + 7);
         let group = cfg.group(addr7.0);
         let bucket = heal::bucket_of(addr7.0);
         let groups = cfg.universe(1).unwrap().catalog.len() as u32;
 
-        // The page is filed under the group and the bucket its address hashes to.
         let tree = heal::get_digests(
             &frame_read(&fab, heal::merkle_frame(group.index(), false), 4096).unwrap(),
         );
@@ -1525,7 +1400,6 @@ mod tests {
             "the digest is under the address's own bucket"
         );
         // The classes are separate trees, so the small page is not in the huge one.
-        // Zeroes are the digest of the empty set, not a refusal.
         let huge_tree = heal::get_digests(
             &frame_read(&fab, heal::merkle_frame(group.index(), true), 4096).unwrap(),
         );
@@ -1533,16 +1407,15 @@ mod tests {
             huge_tree[bucket as usize], 0,
             "a class is not the other class"
         );
-        // A group outside the catalog is a frame built against a topology we do not
-        // share, which is not the same as a group that happens to be empty.
+        // A group outside the catalog is a foreign topology, not an empty group.
         let no_group = heal::merkle_frame(groups, false);
         assert_eq!(
             errno(frame_read(&fab, no_group, 4096).unwrap_err()),
             libc::EOPNOTSUPP
         );
 
-        // The bucket-filtered cursor names the page and the register GETMETA reported,
-        // and says it is finished in the same reply.
+        // The filtered cursor names the page and the register GETMETA reported, and says
+        // it is done in the same reply.
         let open = heal::snap_open_frame(group.index(), false, Some(bucket));
         let id = fabric::get(&frame_read(&fab, open, 4096).unwrap(), 0) as u32;
         let mut seen = std::collections::BTreeMap::new();
@@ -1560,7 +1433,6 @@ mod tests {
             v7 + 1,
             "the cursor and the register agree"
         );
-        // The last chunk closes the cursor: there is no close on the wire.
         assert_eq!(
             errno(frame_read(&fab, heal::snap_next_frame(id, 0), 4096).unwrap_err()),
             libc::EOPNOTSUPP,
@@ -1581,18 +1453,16 @@ mod tests {
         assert!(every.len() >= seen.len() && every.contains_key(&addr7.0));
 
         // ---- Direction is part of the frame -------------------------------------
-        // GET is interrogative and so must be a read; writing one is writing to a
-        // different address, not a smaller mistake.
+        // GET must be a read; writing one addresses a different frame entirely.
         assert_eq!(
             errno(frame_write(&fab, get7, &small).unwrap_err()),
             libc::EOPNOTSUPP
         );
 
         // ---- Forwarding: addressed elsewhere, and no link is EREMOTEIO -----------
-        // `imm` names the addressee — `k + 1` is member index `k`, and `0` is "you
-        // resolve it". This node is index 0 of every group here, so anything else is
-        // a frame to pass on, and the config has no peers, so every forward is
-        // EREMOTEIO.
+        // `imm` names the addressee: `k + 1` is member index `k`, `0` means "you resolve
+        // it". This node is index 0 of every group here, so anything else is forwarded,
+        // and the config has no peers, so every forward is EREMOTEIO.
         let mut fwd = fabric::Frame::page(fabric::Op::Get, false, LWW + 7);
         fwd.imm = 2;
         fwd.flags = 1;
@@ -1616,8 +1486,7 @@ mod tests {
             errno(frame_write(&fab, trim_fwd, &[0u8; 4096]).unwrap_err()),
             libc::EREMOTEIO
         );
-        // A frame for someone else with no budget left is refused rather than passed
-        // on: the budget terminates the recursion.
+        // A frame for someone else with no budget left is refused, not passed on.
         let mut spent = fabric::Frame::page(fabric::Op::Get, false, LWW + 7);
         spent.imm = 2;
         assert_eq!(fabric::hops(spent.flags), 0);
@@ -1625,7 +1494,7 @@ mod tests {
             errno(frame_read(&fab, spent, 4096).unwrap_err()),
             libc::EREMOTEIO
         );
-        // Addressed to us — either by name or by `imm == 0` — and served normally.
+        // Addressed to us, either by name or by `imm == 0`, and served normally.
         let mut mine = fabric::Frame::page(fabric::Op::Get, false, LWW + 7);
         mine.imm = 1;
         assert_eq!(frame_read(&fab, mine, 4096).unwrap(), next);
@@ -1634,8 +1503,7 @@ mod tests {
 
         // ---- Cross-zone: homed elsewhere, so routed and never resolved here ------
         // Extent 4 lives in zone 2. Our slot table describes our own zone only, so
-        // resolving one of its addresses against it would name a group in the wrong
-        // zone; with no link to zone 2's gateways there is nowhere to send it.
+        // resolving it here would name the wrong group, and we hold no link to zone 2.
         let away = fabric::Frame::page(fabric::Op::Get, false, AWAY);
         assert_eq!(
             errno(frame_read(&fab, away, 4096).unwrap_err()),
@@ -1658,15 +1526,13 @@ mod tests {
             libc::ENODATA,
             "a trimmed page is missing, not empty"
         );
-        // Idempotent: a tombstone is a state, so saying it twice says nothing new.
         frame_write(&fab, trim, &[0u8; 4096]).expect("trim is idempotent");
 
         // ---- SEAL: the shard stops accepting, and goes on serving reads ----------
-        // Migration's exclusion: the source is driven to a state where it accepts
-        // nothing further, which makes the two-writer window empty rather than merely
-        // safe. Reads keep working, because a frozen copy is a final one.
-        // The frame names a page; the trailer names the extent being frozen, by the id
-        // the control plane gave it. Nothing else on the wire identifies a shard.
+        // Migration's exclusion: the source accepts nothing further, so the two-writer
+        // window is empty rather than merely safe; reads keep working since a frozen copy
+        // is final. The trailer names the extent by control-plane id, the only shard id
+        // on the wire.
         let seal = fabric::Frame::page(fabric::Op::Seal, false, LWW + 7);
         let mut st = vec![0u8; 4096];
         fabric::put(&mut st, 1, term2 + 1);
@@ -1683,14 +1549,12 @@ mod tests {
             "a seal does not stop reads"
         );
 
-        // A shard on its way somewhere forwards instead of refusing, so a client holding
-        // a config from before the flip still gets an answer. Zone 2's gateway is not
-        // a peer of ours, so the forward fails at the link rather than at the gate —
-        // that is the distinction asserted: `EIO` is "routed and unreachable",
-        // `EREMOTEIO` is "refused".
-        //
-        // The seal is redundant — the sweep seals an extent with `next_zone` set of its
-        // own accord — and is here only so the assertion does not race the tick.
+        // A shard on its way somewhere forwards instead of refusing, so a client with a
+        // pre-flip config still gets an answer. Zone 2's gateway is not a peer of ours, so
+        // the forward fails at the link, not the gate: `EIO` is "routed and unreachable",
+        // `EREMOTEIO` is "refused". The seal is redundant (the sweep seals an extent with
+        // `next_zone` set of its own accord) and is here only so the assertion does not
+        // race the tick.
         let acc_away = fabric::Frame::page(fabric::Op::Accept, false, GOING + 3);
         let seal_away = fabric::Frame::page(fabric::Op::Seal, false, GOING + 3);
         let mut sta = vec![0u8; 4096];
@@ -1704,9 +1568,8 @@ mod tests {
         );
 
         // ---- a corrupted 4 KiB page is refused, a corrupted 4 MiB page is not ----------
-        // Page bytes are read from disk on every read, so damage can be done underneath
-        // a running dataplane; the reads must be direct or the block layer answers them
-        // out of its own cache.
+        // Page bytes are read from disk on every read, so damage can be done under a
+        // running dataplane. Reads must be direct or the block layer answers from cache.
         write_at(&mut imm, 4 << 20, &huge);
         let small_addr = GlobalAddr::new(1, LWW + 1);
         let huge_addr = GlobalAddr::new(1, IMM + crate::config::HUGE_BLOCKS);
@@ -1720,8 +1583,8 @@ mod tests {
             direct_read(&paths[0], 4096, 4096).is_err(),
             "a 4 KiB page that fails its checksum must never be served"
         );
-        // Deliberate: this class carries no checksum, so the damage is invisible to us
-        // and the wrong bytes come back as a successful read.
+        // Deliberate: this class carries no checksum, so the damage is invisible and wrong
+        // bytes come back as a successful read.
         assert_ne!(direct_read(&paths[2], 4 << 20, 4 << 20).unwrap(), huge);
 
         // Damage is contained: neighbours are unaffected.
@@ -1731,8 +1594,7 @@ mod tests {
             pattern(2, 4096)
         );
 
-        // A ublk device cannot be deleted while a client still holds it open, so the
-        // client always lets go first.
+        // A ublk device cannot be deleted while a client holds it open, so drop first.
         drop((lww, imm, fab));
         rt.shutdown().unwrap();
         let _ = std::fs::remove_file(&dev);

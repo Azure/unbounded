@@ -1,18 +1,13 @@
-//! Memory and CPU topology.
-//!
-//! Process-wide setup: which CPUs we run workers on, how we pin to them, and how we
-//! get large, node-local memory.
+//! Memory and CPU topology: worker CPU selection, pinning, and large node-local memory.
 
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
-/// Logical CPUs this process is allowed to run on, one per *physical* core.
-///
-/// Derived, never configured: `sched_getaffinity` gives the permitted set and the
-/// sysfs sibling list folds SMT pairs down to their lowest allowed member. Operators
-/// narrow the worker set with `taskset` or a cgroup cpuset, not a config field.
+/// Logical CPUs this process is allowed to run on, one per *physical* core: the
+/// `sched_getaffinity` set, with the sysfs sibling list folding SMT pairs to their lowest
+/// allowed member. Never configured; narrow it with `taskset` or a cgroup cpuset.
 pub(super) fn worker_cpus() -> io::Result<Vec<usize>> {
     let allowed = affinity()?;
     let mut out = Vec::new();
@@ -87,11 +82,8 @@ pub(super) fn pin(cpu: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// An anonymous mapping backed by huge pages where the kernel allows it.
-///
-/// `MAP_HUGETLB` first, which needs a reserved hugetlb pool, else a normal mapping plus
-/// `MADV_HUGEPAGE` so THP can still back it. Every page is then touched by the
-/// constructing thread so the memory lands on that thread's NUMA node.
+/// Anonymous mapping backed by huge pages: `MAP_HUGETLB` first (needs a reserved pool),
+/// else `MADV_HUGEPAGE`. The constructing thread first-touches it, fixing the NUMA node.
 pub(super) struct Region {
     ptr: *mut u8,
     len: usize,
@@ -106,9 +98,7 @@ impl Region {
         let len = len.next_multiple_of(2 << 20);
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let base = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-        // A simulated worker wants the mapping and none of the residency: hundreds of
-        // them share one address space and barely touch a region. No huge pages and no
-        // first-touch pass there.
+        // Simulated workers barely touch a region: no huge pages and no first-touch pass.
         let want_huge = !cfg!(feature = "sim");
         let mut ptr = libc::MAP_FAILED;
         if want_huge {
@@ -134,7 +124,6 @@ impl Region {
             if !huge {
                 unsafe { libc::madvise(ptr, len, libc::MADV_HUGEPAGE) };
             }
-            // First touch here, so the pages land on this thread's NUMA node.
             unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, len) };
             huge = true;
         }

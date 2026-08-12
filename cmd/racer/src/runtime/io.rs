@@ -1,5 +1,4 @@
-//! The IO surface handlers touch: `Buf`, `PoolBuf`, `Disk`, `Export`, and the op slab
-//! that tracks every SQE outstanding.
+//! IO surface: `Buf`, `PoolBuf`, `Disk`, `Export`, and the op slab of outstanding SQEs.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -23,23 +22,16 @@ use super::{Errno, POOL_BUF_BASE};
 /// In-flight SQE-backed operations a worker can own at once.
 #[cfg(not(feature = "sim"))]
 const OPS_PER_WORKER: u32 = 4096;
-/// Hundreds of simulated workers share one address space, so every per-worker table
-/// shrinks to the smallest size the protocol still fits in. A 4 MiB command split at
-/// the peer's transfer limit arrives as one request per piece, and each piece writes,
-/// so the floor is one operation per piece of a whole page.
+/// Simulated workers share one address space, so per-worker tables shrink to the protocol
+/// floor: one op per piece of a whole page.
 #[cfg(feature = "sim")]
 const OPS_PER_WORKER: u32 = 256;
 
-// ---------------------------------------------------------------------------
-// Buf
-// ---------------------------------------------------------------------------
+// --- Buf ---
 
-/// An opaque handle to registered memory.
-///
-/// Deliberately offers no way to read or write the bytes: a `Buf` may be the guest's
-/// bio pages, which this process must never touch, so the type system enforces zero
-/// copy. The SQE carries `addr`, which io_uring resolves against the registered buffer
-/// at `index` — base 0 for ublk request buffers, the real pointer for our pool memory.
+/// An opaque handle to registered memory, never readable: it may be guest bio pages, so
+/// the type system enforces zero copy. io_uring resolves the SQE `addr` against registered
+/// buffer `index`: base 0 for ublk request buffers, the real pointer for pool memory.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Buf {
     pub(super) index: u16,
@@ -54,15 +46,12 @@ impl Buf {
         self.len as usize
     }
 
-    /// The pool index behind this handle, or `None` for a guest request buffer. Only
-    /// pool memory is refcounted against in-flight ops.
+    /// Pool index, or `None` for a guest request buffer; only pool memory is refcounted.
     fn pool_index(&self) -> Option<u16> {
         (self.index as u32 >= POOL_BUF_BASE).then(|| self.index - POOL_BUF_BASE as u16)
     }
 
-    /// What an operation on this buffer has to keep alive: a pool buffer is held for
-    /// the operation's lifetime, a guest request buffer is only counted, because the
-    /// request it belongs to may not be answered while an operation still names it.
+    /// What an op keeps alive: pool buffer for its lifetime, request buffer only counted.
     fn holds(&self) -> (Option<u16>, Option<u16>) {
         match self.pool_index() {
             Some(h) => (Some(h), None),
@@ -82,18 +71,13 @@ impl Buf {
     }
 }
 
-// ---------------------------------------------------------------------------
-// pool
-// ---------------------------------------------------------------------------
+// --- pool ---
 
-/// Power-of-two size classes. Class 0 is the 4 KiB block the allocator checksums and
-/// stages metadata through, so it gets the most buffers. The top class is a whole huge
-/// page, for staging one that did not come from a guest request (repair, learner apply).
+/// Power-of-two size classes; class 0 (4 KiB) is the metadata block, so it gets the most.
 #[cfg(not(feature = "sim"))]
 const CLASSES: [(usize, usize); 7] = [
     (4 << 10, 512),
-    // A fabric accept carries a page plus a 4 KiB trailer, so 8 KiB is as hot as the
-    // page class: one per in-flight replica leg.
+    // A fabric accept is a page plus a 4 KiB trailer, so 8 KiB is as hot as the page class.
     (8 << 10, 512),
     (16 << 10, 64),
     (64 << 10, 16),
@@ -102,9 +86,7 @@ const CLASSES: [(usize, usize); 7] = [
     (4 << 20, 2),
 ];
 
-/// The same classes, counted for a simulated worker. The huge class keeps one buffer
-/// because huge-page repair stages a whole page through it; the mapping is untouched
-/// unless that path runs, so it costs address space only.
+/// The same classes for a simulated worker; its lone huge buffer stages huge-page repair.
 #[cfg(feature = "sim")]
 const CLASSES: [(usize, usize); 4] = [(4 << 10, 32), (8 << 10, 32), (16 << 10, 8), (4 << 20, 1)];
 
@@ -124,17 +106,16 @@ struct Class {
     waiters: RefCell<VecDeque<Waker>>,
 }
 
-/// Per-worker registered DRAM: buffers for everything that is not a guest request
-/// buffer (metadata blocks, peer traffic staging).
+/// Per-worker registered DRAM for everything that is not a guest request buffer.
 pub(super) struct Pool {
-    /// Never read: it owns the mapping the registered buffers point into.
+    /// Never read: owns the mapping the registered buffers point into.
     #[allow(dead_code)]
     region: Region,
     classes: Vec<Class>,
     /// Address of each pool buffer; its registered index is `POOL_BUF_BASE + i`.
     addrs: Vec<u64>,
     sizes: Vec<usize>,
-    /// In-flight operations still reading or writing each buffer.
+    /// In-flight ops still reading or writing each buffer.
     users: RefCell<Vec<u16>>,
     /// Buffers whose `PoolBuf` is gone but whose last CQE has not arrived.
     orphan: RefCell<Vec<bool>>,
@@ -199,14 +180,12 @@ impl Pool {
         self.classes.iter().position(|c| c.size == size).unwrap()
     }
 
-    /// An operation has been submitted against `idx`; the kernel owns the memory
-    /// until its CQE lands, whatever the submitter does with its `PoolBuf`.
+    /// An op was submitted against `idx`; the kernel owns the memory until its CQE lands.
     pub(super) fn hold(&self, idx: u16) {
         self.users.borrow_mut()[idx as usize] += 1;
     }
 
-    /// The kernel is done with one operation against `idx`. Frees the buffer if its
-    /// owner dropped it while it was still in flight.
+    /// One op against `idx` is done. Frees the buffer if its owner dropped it in flight.
     pub(super) fn unhold(&self, idx: u16) {
         let mut users = self.users.borrow_mut();
         users[idx as usize] -= 1;
@@ -219,9 +198,8 @@ impl Pool {
         }
     }
 
-    /// Abandoning a losing quorum leg drops its `PoolBuf` with IO still in flight, so a
-    /// buffer is reusable only once nobody is reading it. Deferring here is what makes
-    /// dropping an `OpFuture` safe rather than a use-after-free.
+    /// Frees `idx`, or orphans it if ops still read it; this is what makes dropping an
+    /// `OpFuture` safe rather than a use-after-free.
     fn release(&self, idx: u16) {
         if self.users.borrow()[idx as usize] != 0 {
             self.orphan.borrow_mut()[idx as usize] = true;
@@ -233,10 +211,8 @@ impl Pool {
     fn free(&self, idx: u16) {
         let c = self.class_index_of(idx);
         self.classes[c].free.borrow_mut().push(idx);
-        // Wake every waiter, not just the first: one since dropped (an abandoned quorum
-        // leg) would swallow the wakeup and strand the queue forever. Losers re-queue.
-        // Pop singly so the borrow is never held across `wake`, which may re-enter the
-        // pool, and so the common empty case costs no allocation.
+        // Wake all waiters, not just the first: a since-dropped one swallows the wakeup
+        // and strands the queue; losers re-queue. Pop singly: `wake` re-enters the pool.
         loop {
             let next = self.classes[c].waiters.borrow_mut().pop_front();
             match next {
@@ -247,10 +223,8 @@ impl Pool {
     }
 }
 
-/// Registered scratch memory owned by the current worker.
-///
-/// Unlike [`Buf`] this *is* readable and writable: it is our own memory, not the
-/// guest's. Returns to the worker's pool on drop; `!Send`, so it never escapes.
+/// Registered scratch memory owned by the current worker. Readable and writable, unlike
+/// [`Buf`]. Returns to the worker's pool on drop; `!Send`, so it never escapes.
 pub(crate) struct PoolBuf {
     index: u16,
     len: usize,
@@ -259,8 +233,7 @@ pub(crate) struct PoolBuf {
 }
 
 impl PoolBuf {
-    /// Waits for a buffer of at least `len` bytes. Never fails; under starvation it
-    /// parks until another task drops one.
+    /// Waits for a buffer of at least `len` bytes. Never fails; parks under starvation.
     pub(crate) async fn alloc(len: usize) -> PoolBuf {
         std::future::poll_fn(|cx| {
             worker::with_local(|l| {
@@ -284,10 +257,8 @@ impl PoolBuf {
         .await
     }
 
-    /// A buffer of at least `len` bytes if one is free right now.
-    ///
-    /// For callers that cannot await: the allocator takes its mblock staging buffers
-    /// this way from `Handler::tick` and holds them across flushes.
+    /// A buffer of at least `len` bytes if one is free right now, for callers that cannot
+    /// await (`Handler::tick` takes mblock staging buffers this way, held across flushes).
     pub(crate) fn try_alloc(len: usize) -> Option<PoolBuf> {
         worker::with_local(|l| {
             let pool = &l.pool;
@@ -315,8 +286,8 @@ impl PoolBuf {
 impl std::ops::Deref for PoolBuf {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        // SAFETY: `addr`/`len` name this buffer's own pool region, mapped for the life
-        // of the worker and held exclusively by this `PoolBuf`.
+        // SAFETY: `addr`/`len` name this buffer's own pool region, mapped for the life of
+        // the worker and held exclusively by this `PoolBuf`.
         unsafe { std::slice::from_raw_parts(self.addr as *const u8, self.len) }
     }
 }
@@ -334,9 +305,7 @@ impl Drop for PoolBuf {
     }
 }
 
-// ---------------------------------------------------------------------------
-// op slab
-// ---------------------------------------------------------------------------
+// --- op slab ---
 
 const OP_FREE: u8 = 0;
 const OP_ARMED: u8 = 1;
@@ -356,13 +325,12 @@ struct OpSlot {
     pub(super) ts: types::Timespec,
     /// Pool buffer this op reads or writes, held alive until its last CQE.
     pub(super) hold: Option<u16>,
-    /// Request buffer this op reads or writes. Not ours to keep alive — it is the
-    /// kernel's, lent for the length of one ublk request — so it is only counted, and
-    /// the count is what forbids answering that request while an op still names it.
+    /// Request buffer this op names. Owned by the kernel for one ublk request, so it is
+    /// only counted; the count forbids answering that request while an op still names it.
     pub(super) tag: Option<u16>,
 }
 
-/// Fixed-size slab of in-flight operations, one per worker.
+/// Fixed-size slab of in-flight ops, one per worker.
 pub(super) struct OpSlab {
     slots: RefCell<Vec<OpSlot>>,
     free: RefCell<Vec<u32>>,
@@ -449,7 +417,6 @@ impl OpSlab {
         self.inflight.set(self.inflight.get() - 1);
     }
 
-    /// The kernel is done with whatever the op named.
     fn drop_buf(&self, pool: &Pool, hold: Option<u16>, tag: Option<u16>) {
         if let Some(b) = hold {
             pool.unhold(b);
@@ -479,7 +446,6 @@ impl OpSlab {
             return;
         }
         if s.state == OP_DETACHED {
-            // The waiter is gone; the slot was only held to absorb this CQE.
             drop(slots);
             self.release(pool, idx);
             return;
@@ -488,9 +454,8 @@ impl OpSlab {
         if s.timed_out {
             s.res = -libc::ETIME;
         }
-        // Every CQE has landed, so the kernel is done with the buffer even though the
-        // slot lives on until the waiter polls it. Release both outside the borrow:
-        // `unhold` re-enters the pool and `wake` re-enters the executor.
+        // All CQEs have landed, so the kernel is done with the buffer though the slot lives
+        // until the waiter polls. Release outside the borrow: `unhold` and `wake` re-enter.
         let hold = s.hold.take();
         let tag = s.tag.take();
         let waker = s.waker.take();
@@ -501,8 +466,8 @@ impl OpSlab {
         }
     }
 
-    /// Give up on an in-flight op. The slot stays reserved until every CQE it is owed
-    /// has arrived, so a late completion can never land on a recycled index.
+    /// Give up on an in-flight op. The slot stays reserved until every CQE it is owed has
+    /// arrived, so a late completion can never land on a recycled index.
     fn detach(&self, idx: u32, seq: u16) {
         let mut slots = self.slots.borrow_mut();
         let s = &mut slots[idx as usize];
@@ -533,12 +498,8 @@ impl OpSlab {
     }
 }
 
-/// Awaits one operation.
-///
-/// The op slot owns the in-flight IO, not this future: dropping it detaches the slot
-/// rather than cancelling anything, so abandoning a losing quorum leg is free. The
-/// kernel writes into the buffer until the op completes, so the slot keeps a
-/// `Pool::hold` on a pool buffer until its last CQE; a request buffer its ublk tag pins.
+/// Awaits one operation. Dropping it detaches the slot rather than cancelling, so
+/// abandoning a quorum leg is free; the slot holds its buffer or tag until the last CQE.
 struct OpFuture {
     idx: u32,
     seq: u16,
@@ -567,41 +528,32 @@ impl Drop for OpFuture {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Disk / Export
-// ---------------------------------------------------------------------------
+// --- Disk / Export ---
 
 pub(super) struct DiskInner {
     pub(super) slot: u32,
     pub(super) timeout: Option<Duration>,
-    /// The rate this device is willing to be driven at. Shared by every worker, so the
-    /// budget is the device's rather than a slice of it handed to each core.
+    /// Device rate budget, shared by every worker rather than sliced per core.
     pub(super) limit: Limiter,
-    /// Never read: the registered file table names the slot, and this keeps the
-    /// description alive until every worker has unregistered it. The simulator has no
-    /// file to hold open: `slot` names a device in its own table instead.
+    /// Never read: keeps the description alive until every worker unregisters the slot.
     #[cfg(not(feature = "sim"))]
     #[allow(dead_code)]
     pub(super) fd: OwnedFd,
 }
 
-/// A registered file or block device.
-///
-/// Holding one is the proof that it is registered on every worker: the file slot is
-/// unregistered only after the last `Disk` naming it has been dropped. `!Send` keeps IO
-/// on the worker that issued it (cross-core work goes through `on_core`) and prevents
-/// stashing a clone in a `static`, which would pin the resource forever.
+/// A registered file or block device; holding one proves registration on every worker. The
+/// slot is unregistered only after the last `Disk` drops. `!Send` keeps IO on the issuing
+/// worker (cross-core via `on_core`) and bars stashing a clone in a `static`.
 #[derive(Clone)]
 pub(crate) struct Disk {
     pub(super) inner: Arc<DiskInner>,
-    /// A deadline this handle keeps instead of the device's own. It rides on the handle
-    /// rather than on every call so that a future holding an operation does not grow.
+    /// Per-handle deadline overriding the device's; on the handle so op futures stay small.
     pub(super) over: Option<Duration>,
     pub(super) _nosend: PhantomData<*const ()>,
 }
 
-// SAFETY: every worker registers an identical file table at identical slots, so a
-// shared reference is meaningful from any worker.
+// SAFETY: every worker registers an identical file table at identical slots, so a shared
+// reference means the same thing on any worker.
 unsafe impl Sync for Disk {}
 
 impl Disk {
@@ -613,9 +565,8 @@ impl Disk {
         }
     }
 
-    /// The same device on a deadline of the caller's choosing. Used where a transfer
-    /// that has not landed by some earlier point is a failed path, and where waiting for
-    /// the device's own deadline would pin something the caller needs back.
+    /// The same device on a caller-chosen deadline, used where a late transfer is a
+    /// failed path, or where the device's own deadline pins something too long.
     pub(crate) fn by(&self, d: Duration) -> Disk {
         Disk {
             inner: self.inner.clone(),
@@ -645,15 +596,13 @@ impl Disk {
         self.run(e, buf.len, buf.holds()).await
     }
 
-    /// `Durability::Durable` adds `RWF_DSYNC`, which on an `O_DIRECT` block device is
-    /// per-write FUA: the data is on stable media when the CQE lands. There is no
-    /// separate flush operation because we are never buffered.
+    /// `Durability::Durable` adds `RWF_DSYNC`: on an `O_DIRECT` block device this is
+    /// per-write FUA, stable media when the CQE lands. No flush op; never buffered.
     pub(crate) async fn write(&self, off: u64, buf: Buf, d: Durability) -> Result<(), Errno> {
         self.pace(buf.len).await;
         #[cfg(feature = "sim")]
         {
-            // The model has no write-back cache, so every write it acknowledges is
-            // already stable and the flag has nothing to select.
+            // The model has no write-back cache, so acknowledged writes are already stable.
             let _ = d;
             return self.sim(off, buf, crate::sim::Kind::Write).await;
         }
@@ -674,16 +623,14 @@ impl Disk {
         self.run(e, buf.len, buf.holds()).await
     }
 
-    /// Hold a transfer back until the device's budget has room for it. The wait happens
-    /// before the op slot is taken, so pacing costs a timer rather than an op.
+    /// Waits for device budget. Runs before an op slot is taken, so pacing costs a timer.
     async fn pace(&self, len: u32) {
         if let Some(d) = self.inner.limit.admit(len) {
             sleep(d).await;
         }
     }
 
-    /// Whether the device's budget is committed far enough ahead that work which can be
-    /// dropped should be. Foreground IO ignores this and waits its turn.
+    /// Whether the budget is committed far enough ahead that droppable work should drop.
     pub(crate) fn pressed(&self) -> bool {
         self.inner.limit.pressed()
     }
@@ -693,9 +640,8 @@ impl Disk {
         self.inner.limit.waited_us()
     }
 
-    /// The simulated device. Same contract as the real one — one completion, a short
-    /// transfer is `EIO` — but the transfer happens when the completion is delivered
-    /// rather than now, so overlapping IO to a block interleaves as a real device would.
+    /// The simulated device. Same contract as the real one (one completion, short transfer
+    /// is `EIO`), but the transfer happens at completion, so overlapping IO interleaves.
     #[cfg(feature = "sim")]
     async fn sim(&self, off: u64, buf: Buf, kind: crate::sim::Kind) -> Result<(), Errno> {
         let len = buf.len;
@@ -741,8 +687,7 @@ impl Disk {
         if res < 0 {
             return Err(Errno(-res));
         }
-        // A short transfer on an O_DIRECT device is a failure, not a partial success:
-        // we never retry the remainder, so EIO is the honest answer.
+        // A short transfer on an O_DIRECT device is a failure; we never retry the rest.
         if res as u32 != len {
             return Err(Errno::EIO);
         }
@@ -810,8 +755,7 @@ pub(crate) struct Export {
     pub(super) _nosend: PhantomData<*const ()>,
 }
 
-// SAFETY: `ExportInner` is immutable and `Arc`-shared; only the `!Send` marker makes
-// this impl necessary.
+// SAFETY: `ExportInner` is immutable and `Arc`-shared; only the `!Send` marker needs this.
 unsafe impl Sync for Export {}
 
 impl Export {
@@ -828,8 +772,7 @@ impl Export {
     }
 }
 
-/// Sleeps on this worker's ring. Timers are ordinary operations, so a sleeping task
-/// costs one SQE and no thread.
+/// Sleeps on this worker's ring. Timers are ordinary ops: one SQE, no thread.
 pub(crate) async fn sleep(d: Duration) {
     let fut = worker::with_local(|l| {
         let (idx, seq) = l
@@ -863,15 +806,13 @@ pub(crate) fn sim_complete(idx: u32, seq: u16, res: i32) {
     worker::with_local(|l| l.ops.complete(&l.pool, idx, seq, res, false));
 }
 
-/// Builds a `Buf` naming memory the simulator owns, standing in for the guest pages a
-/// ublk request would have carried.
+/// Builds a `Buf` naming simulator-owned memory, standing in for guest ublk request pages.
 #[cfg(feature = "sim")]
 pub(crate) fn sim_buf(index: u16, addr: u64, len: u32) -> Buf {
     Buf { index, addr, len }
 }
 
-/// The address a `Buf` names. Meaningful only in the simulator, where every buffer is
-/// ordinary process memory rather than a registered index the kernel resolves.
+/// The address a `Buf` names. Simulator only: buffers there are ordinary process memory.
 #[cfg(feature = "sim")]
 pub(crate) fn sim_addr(b: Buf) -> u64 {
     b.addr

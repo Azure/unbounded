@@ -1,17 +1,9 @@
 //! The allocator's core state machine.
 //!
-//! Everything here is synchronous and touches no device, no runtime and no clock:
-//! `alloc.rs` owns the IO and the cross-core hops, this file owns the decisions those
-//! hops carry. A refusal costs nothing because no IO has been issued yet.
-//!
-//! That split is also what makes the state machine checkable: `mod model` at the foot
-//! of this file drives these types with `stateright` at a slot count small enough to
-//! enumerate, so the guard rules, slot accounting and startup reconciliation are
-//! checked as production code rather than as a paraphrase.
-//!
-//! Not modelled: the anti-entropy accumulators and snapshot cursors. They hang off
-//! `Slab` because they must sit next to `entries`, but their policy lives in `heal.rs`
-//! and they are excluded from shard equality — see `mod cmp`.
+//! Synchronous: no device, no runtime, no clock. `alloc.rs` owns the IO and cross-core
+//! hops, so a refusal here costs nothing. `mod model` below drives these types with
+//! `stateright` at an enumerable slot count; the anti-entropy accumulators and snapshot
+//! cursors are not modelled and are excluded from shard equality (`mod cmp`, `heal.rs`).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -26,17 +18,11 @@ const SWEEP_PER_TICK: u32 = 64;
 
 /// Resolves a page address to the extent covering it: its id and its tombstone epoch.
 ///
-/// Passed in for the same reason as [`Groups`]: the slab holds no config. One closure
-/// serves both callers because both need the same lookup - the census keys rows by
-/// extent, and the sweep needs that extent's epoch - and resolving twice would be the
-/// same binary search twice. `None` means the address is no longer covered by any
-/// extent, which a shard treats as "nothing to say about it".
+/// Passed in like [`Groups`] because the slab holds no config; serves both the census
+/// (keyed by extent) and the sweep (needs the epoch). `None` means no extent covers it.
 pub(crate) type Extents<'a> = dyn Fn(u64) -> Option<(u32, u32)> + 'a;
 
-/// The two config lookups a slab mutation needs, bundled because every one of them
-/// needs both: the digest is keyed by group and the census by extent, and a caller that
-/// had to pass them separately would thread two arguments through the same dozen
-/// signatures.
+/// The two config lookups a slab mutation needs: digest by group, census by extent.
 pub(crate) struct Maps<'a> {
     pub(crate) gof: &'a Groups<'a>,
     pub(crate) xof: &'a Extents<'a>,
@@ -46,16 +32,11 @@ pub(crate) struct Maps<'a> {
 
 /// A page address: `universe:26 | lba:38`.
 ///
-/// The low field is a block index in the universe's own flat 4 KiB address space, the
-/// same space the control plane places extents in, so an address is the concatenation
-/// of the two things that locate a page and nothing else. A 4 MiB page is named by the
-/// first of its 1024 blocks. Universe id 0 is reserved so that a zero address in an
-/// mblock entry unambiguously means "free slot".
-///
-/// Nothing about the extent is in the address. An extent may be remapped into a
-/// different device, at a different position, on every node that mounts it, and the
-/// address does not move; equally, the class is the extent's, resolved through the
-/// config, not a bit a peer could flip.
+/// The lba is a block index in the universe's flat 4 KiB address space, the space the
+/// control plane places extents in. A 4 MiB page is named by the first of its 1024
+/// blocks. Universe id 0 is reserved so a zero address in an mblock entry means "free
+/// slot". Nothing about the extent is in the address: an extent may be remapped per
+/// node, and the class comes from the config.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct GlobalAddr(pub u64);
 
@@ -73,14 +54,14 @@ impl GlobalAddr {
     }
 }
 
-/// Why a request could not be served. The block layer must tell these apart: a hole
-/// reads as zeroes, everything else is an error.
+/// Why a request could not be served. A hole reads as zeroes, everything else is an
+/// error; the block layer must tell them apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Status {
     /// Never written, or trimmed. Reads as zeroes.
     Hole,
-    /// We are supposed to hold this page and cannot serve it: failed checksum, or its
-    /// metadata is quarantined. Never served; healed from peers.
+    /// We should hold this page and cannot serve it: failed checksum, or quarantined
+    /// metadata. Never served; healed from peers.
     Missing,
     /// Kind semantics refused the write. `current` is the version we hold.
     Conflict {
@@ -105,8 +86,8 @@ impl Status {
         }
     }
 
-    /// A peer's error, back to a status. Anything unrecognised is `Io`: a remote error
-    /// we cannot name is not one we should act on.
+    /// A peer's error, back to a status. Unrecognised means `Io`: a remote error we
+    /// cannot name is not one to act on.
     pub fn from_wire(e: Errno) -> Status {
         match e {
             crate::fabric::status::MISSING => Status::Missing,
@@ -129,8 +110,8 @@ pub enum Pressure {
 // ------------------------------------------------------------------------- hash index
 
 /// `GlobalAddr -> global slot id`, open addressed with linear probing. Sized once at
-/// startup; an insert that would push the table past 7/8 full fails rather than
-/// growing, because nothing may allocate on the hot path.
+/// startup; an insert past 7/8 full fails rather than growing, since nothing may
+/// allocate on the hot path.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct HashIndex {
     /// Key and value share a slot: a lookup is one cache line, not two.
@@ -183,8 +164,8 @@ impl HashIndex {
             }
         }
         if self.len + 1 > self.slots.len() - self.slots.len() / 8 {
-            // Sized from the slab's slot count, so this means the group hash is far
-            // more skewed than uniform. Refuse rather than probe forever.
+            // Sized from the slab's slot count, so this means the group hash is far more
+            // skewed than uniform. Refuse rather than probe forever.
             return None;
         }
         self.slots[i] = (key, val);
@@ -222,12 +203,9 @@ impl HashIndex {
 
 /// Volatile record of what this node last read for an OCC page. `guard_of` refuses an
 /// address with no record, so an empty ring after restart conflicts every in-flight OCC
-/// write.
-///
-/// Ordered by observation, not insertion: re-reading a page pushes a fresh position, so
-/// a hot page is never evicted ahead of a cold one. Superseded positions are left in
-/// `fifo` and skipped when they reach the front, which keeps `observe` O(1) at the cost
-/// of holding fewer than `cap` live records for a while.
+/// write. Ordered by observation, so a hot page is never evicted ahead of a cold one;
+/// superseded positions stay in `fifo` and are skipped at the front, keeping `observe`
+/// O(1) at the cost of fewer than `cap` live records for a while.
 #[derive(Clone)]
 struct OccRing {
     seen: HashMap<u64, (u64, u64)>,
@@ -253,8 +231,8 @@ impl OccRing {
         self.trim();
     }
 
-    /// Drop from the front until the pool is back within `cap`. A position whose address
-    /// has since been re-read is stale and costs nothing to discard.
+    /// Drop from the front until the pool is within `cap`. A position whose address was
+    /// re-read since is stale and cheap to discard.
     fn trim(&mut self) {
         while self.fifo.len() > self.cap
             && let Some((addr, seq)) = self.fifo.pop_front()
@@ -282,10 +260,9 @@ impl OccRing {
 /// One slab class on one core.
 ///
 /// Slot ids are global within the class. This core owns mblock `m` iff
-/// `m % cores == core`, so `local = (m / cores) * k + i` is pure arithmetic and no
-/// ownership table is needed. `entries` is not a cache of the on-disk mblocks: it *is*
-/// their content, which is what makes a metadata write a full-block rewrite with no
-/// read-modify-write.
+/// `m % cores == core`, so `local = (m / cores) * k + i` is pure arithmetic and needs no
+/// ownership table. `entries` is not a cache of the on-disk mblocks: it *is* their
+/// content, so a metadata write is a full-block rewrite with no read-modify-write.
 struct Slab {
     core: u32,
     cores: u32,
@@ -296,22 +273,22 @@ struct Slab {
     pub(super) generation: Box<[u64]>,
     /// Both copies failed their CRC at startup: never allocated, never read.
     pub(super) quarantined: Box<[bool]>,
-    /// Any mblock in this stripe was quarantined, so an index miss here could be a
-    /// page whose entry was in the block we lost. Derived from `quarantined`, cached
-    /// because every miss asks.
+    /// Any mblock in this stripe was quarantined, so an index miss here could be a page
+    /// whose entry was in the lost block. Derived from `quarantined`, cached because
+    /// every miss asks.
     lost: bool,
     index: HashIndex,
-    /// Entries for indexed pages whose slot is in another core's stripe. Empty unless
-    /// the index shard width changed since the last boot.
+    /// Entries for indexed pages whose slot is in another core's stripe. Empty unless the
+    /// index shard width changed since the last boot.
     foreign: HashMap<u64, Entry>,
-    /// Free *local* slot ids, popped from the back. Built in descending order at
-    /// startup so pops ascend and consecutive allocations share an mblock, which is
-    /// all an "open mblock" needs to be.
+    /// Free *local* slot ids, popped from the back. Built descending at startup so pops
+    /// ascend and consecutive allocations share an mblock, which is all an "open mblock"
+    /// needs to be.
     free: Vec<u32>,
-    /// Free slots on loan to the cache. Still free as far as `pressure` and `capacity`
-    /// are concerned, because a loan is recallable and must not be able to move the
-    /// watermarks that lending is gated on. Never persisted: nothing on disk points at
-    /// a cached page, so a slot that was on loan at a crash comes back free.
+    /// Free slots on loan to the cache. Still free for `pressure` and `capacity`: a loan
+    /// is recallable and must not move the watermarks lending is gated on. Never
+    /// persisted, since nothing on disk points at a cached page, so a slot on loan at a
+    /// crash comes back free.
     lent: HashSet<u32>,
     commit_seq: Box<[u64]>,
     durable_seq: Box<[u64]>,
@@ -320,10 +297,9 @@ struct Slab {
     /// Anti-entropy accumulators over this slab's registers, keyed by consensus group.
     /// Seeded once by `rebuild`, then maintained incrementally by `set`.
     digests: Digests,
-    /// Live and tombstoned entries per extent, sorted by extent id. Maintained by
-    /// `set` alongside the digests and seeded by `rebuild` in the same pass, because
-    /// the control plane cannot advance an extent's epoch without knowing whether
-    /// anything in it is still live. Bounded by `config::MAX_EXTENTS`.
+    /// Live and tombstoned entries per extent, sorted by extent id. Maintained by `set`,
+    /// seeded by `rebuild`: the control plane cannot advance an extent's epoch without
+    /// knowing whether anything in it is live. Bounded by `config::MAX_EXTENTS`.
     census: Vec<(u32, u32, u32)>,
     /// Open enumerations and the reclamation they hold back.
     snaps: Snaps,
@@ -388,14 +364,11 @@ impl Slab {
         self.commit_seq[li as usize]
     }
 
-    /// The one place an entry changes after startup. Routing every mutation through
-    /// here is what lets the digest be maintained incrementally — XOR is its own
-    /// inverse, so one call takes the old register out and puts the new one in — and
-    /// what lets an open cursor see every register exactly once.
-    ///
-    /// Entries in `foreign` are outside all of this on purpose: they exist only until
-    /// the page relocates on its next write, and a repair is such a write, so excluding
-    /// them makes the divergence they cause self-clearing.
+    /// The one place an entry changes after startup. Routing every mutation through here
+    /// keeps the digest incremental (XOR is its own inverse) and lets an open cursor see
+    /// every register once. `foreign` entries are excluded: they exist only until the
+    /// page relocates on its next write, and a repair is such a write, so the divergence
+    /// is self-clearing.
     fn set(&mut self, local: u32, e: Entry, m: &Maps) {
         let old = std::mem::replace(&mut self.entries[local as usize], e);
         if old.addr != 0 {
@@ -409,17 +382,15 @@ impl Slab {
         }
     }
 
-    /// Move an entry into or out of its extent's census row. Rows appear on the first
-    /// entry for an extent and go away when it holds nothing, so a deleted extent
-    /// leaves no series behind.
+    /// Move an entry into or out of its extent's census row. Rows appear on the extent's
+    /// first entry and go when it holds nothing, so a deleted extent leaves no series.
     fn count(&mut self, e: Entry, by: i32, m: &Maps) {
         let (live, tomb) = match e.state {
             State::Live => (by, 0),
             State::Tombstone => (0, by),
             State::Empty => return,
         };
-        // A page whose extent has left the config is counted for nothing: the row it
-        // would land in is one the control plane has already stopped asking about.
+        // A page whose extent has left the config is counted for nothing.
         let Some((x, _)) = (m.xof)(e.addr) else {
             return;
         };
@@ -470,8 +441,8 @@ impl Slab {
         }
     }
 
-    /// Free and total slots in this core's stripe. Loans count as free: the allocator
-    /// can have any of them back within a reservation, so a loan is not a commitment.
+    /// Free and total slots in this core's stripe. Loans count as free: the allocator can
+    /// recall any of them within a reservation.
     fn capacity(&self) -> (u64, u64) {
         (
             (self.free.len() + self.lent.len()) as u64,
@@ -479,12 +450,10 @@ impl Slab {
         )
     }
 
-    /// Hand one free slot to the cache.
-    ///
-    /// Only out of a slab that is genuinely idle: a quarter of the stripe stays unlent,
-    /// so [`Slab::reclaim`] is never what stands between an ordinary write and a slot.
-    /// The pressure test is measured on `free + lent`, which is why lending cannot walk
-    /// itself past its own gate.
+    /// Hand one free slot to the cache, only out of a genuinely idle slab: a quarter of
+    /// the stripe stays unlent, so [`Slab::reclaim`] never stands between an ordinary
+    /// write and a slot. The pressure test measures `free + lent`, so lending cannot walk
+    /// past its own gate.
     fn lend(&mut self) -> Option<u32> {
         if self.pressure() != Pressure::Normal
             || (self.free.len() as u64) * super::LEND_CEILING <= self.entries.len() as u64
@@ -496,8 +465,8 @@ impl Slab {
         Some(l)
     }
 
-    /// Take a loan back. `false` if the slot was not on loan, which makes a reclaim of
-    /// a stale offset a no-op rather than a double free.
+    /// Take a loan back. `false` if the slot was not on loan, so reclaiming a stale offset
+    /// is a no-op rather than a double free.
     fn reclaim(&mut self, local: u32) -> bool {
         if !self.lent.remove(&local) {
             return false;
@@ -515,9 +484,8 @@ pub(super) struct Ticket {
     pub(super) slot: u32,
     pub(super) version: u64,
     pub(super) ballot: Ballot,
-    /// The row this reservation was issued against, `None` for an absent address.
-    /// `stage` refuses if it has moved, which is what makes the window between the
-    /// two safe.
+    /// The row this reservation was issued against, `None` for an absent address. `stage`
+    /// refuses if it has moved, which makes the window safe.
     pub(super) prior: Option<(u64, u64)>,
 }
 
@@ -530,8 +498,8 @@ pub(super) struct Lookup {
     pub(super) crc: u32,
 }
 
-/// What `flush_until` should do next. Splitting the decision out of the wait loop keeps
-/// the loop's only shard borrow synchronous and closed before its await.
+/// What `flush_until` should do next. Split out of the wait loop so the loop's only shard
+/// borrow is synchronous and closed before its await.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Act {
     /// Already durable at or past the sequence asked for.
@@ -542,11 +510,10 @@ pub(super) enum Act {
     Go,
 }
 
-/// The version a page effectively holds, which is not always the version in its entry.
-/// An `Immutable` page with no entry, or with one left behind by an older epoch, is
-/// empty at the *current* epoch and so sits at `3 * epoch`. That is what lets an epoch
-/// advance take no consensus round: every replica computes the same number from the
-/// entry and the control-plane epoch alone.
+/// The version a page effectively holds, not always the version in its entry. An
+/// `Immutable` page with no entry, or one left by an older epoch, is empty at the
+/// *current* epoch and sits at `3 * epoch`, so an epoch advance takes no consensus round:
+/// every replica computes the same number from the entry and epoch.
 fn effective(e: Option<Entry>, kind: Kind, epoch: u64) -> u64 {
     match (e, kind) {
         (Some(e), Kind::Immutable) if e.version / 3 < epoch => 3 * epoch,
@@ -557,8 +524,8 @@ fn effective(e: Option<Entry>, kind: Kind, epoch: u64) -> u64 {
 }
 
 /// The state a freshly accepted version implies. Ordinal 2 of `Immutable`'s
-/// `3*epoch + ordinal` encoding is a tombstone, so a trim needs no opcode inside the
-/// allocator: it is an accept whose version happens to be one past the fill point.
+/// `3*epoch + ordinal` encoding is a tombstone, so a trim needs no opcode here: it is an
+/// accept one past the fill point.
 fn state_of(kind: Kind, version: u64) -> State {
     match kind {
         Kind::Immutable if version % 3 == 2 => State::Tombstone,
@@ -568,11 +535,11 @@ fn state_of(kind: Kind, version: u64) -> State {
 
 // ----------------------------------------------------------------------------- shard
 
-/// What a commit still owes: the mblock it must make durable, and the slot the address
-/// used to occupy. The stale slot is only released once the new one is durable — free
-/// it eagerly and a crash between the two mblock writes leaves the address in neither,
-/// which is a lost acknowledged write. Crashing with both slots live is fine: startup
-/// resolves the duplicate by `(version, ballot)`.
+/// What a commit still owes: the mblock to make durable, and the slot the address used
+/// to occupy. The stale slot is released only once the new one is durable; freeing it
+/// eagerly would let a crash between the two mblock writes leave the address in neither,
+/// losing an acknowledged write. Both slots live at a crash is fine: startup resolves the
+/// duplicate by `(version, ballot)`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) struct Staged {
     pub li: u32,
@@ -580,9 +547,8 @@ pub(super) struct Staged {
     pub stale: Option<u32>,
 }
 
-/// The shape a shard is built to. Production fills this from the device geometry; the
-/// model fills it with a handful of slots so the state space can be enumerated. Every
-/// dimension the code reads is here, so the two differ in numbers and nothing else.
+/// The shape a shard is built to. Production fills it from the device geometry, the
+/// model with a handful of slots so the state space can be enumerated.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Shape {
     pub cores: u32,
@@ -601,8 +567,7 @@ pub(super) struct Shape {
 }
 
 /// One worker core's slice of the allocator: both slab classes plus the OCC ring they
-/// share. Holds no buffers and no wakers — those live in `alloc.rs`, which is what
-/// keeps this type comparable and therefore checkable.
+/// share. No buffers and no wakers (those live in `alloc.rs`), so it stays comparable.
 pub(super) struct Shard {
     slabs: [Slab; 2],
     recheck: bool,
@@ -642,19 +607,15 @@ impl Shard {
         self.occ.set_cap(cap);
     }
 
-    /// Whether this node has peers to heal a lost page from. A config reload can add
-    /// the first one, so it is not fixed at startup.
+    /// Whether this node has peers to heal a lost page from; a config reload can add the
+    /// first, so it is not fixed at startup.
     pub(super) fn set_recoverable(&mut self, yes: bool) {
         self.recoverable = yes;
     }
 
-    /// What an index miss means in this class.
-    ///
-    /// A shard that lost an mblock cannot tell a page that was never written from one
-    /// whose entry was in the block it lost: the entries *are* what named them. So
-    /// while there is somewhere to heal from, both answer `Missing` — never served,
-    /// never a vote. Serving zeroes for a page this node accepted is the one wrong
-    /// answer; a hole costing a consensus round is the price of not giving it.
+    /// What an index miss means in this class. A shard that lost an mblock cannot tell a
+    /// never-written page from one whose entry was in the lost block, so while there is
+    /// somewhere to heal from both answer `Missing`: never served, never a vote.
     fn miss(&self, class: Class) -> Status {
         if self.recoverable && self.slabs[class as usize].lost {
             Status::Missing
@@ -684,7 +645,7 @@ impl Shard {
 
     /// Lend the cache one free 4 MiB slot, as a local slot id. Small pages are never
     /// lent: 4 MiB of the small slab is 1024 slots, so a reclaim would drop 1024 cached
-    /// pages at once, and the DRAM to index them costs more than the media is worth.
+    /// pages at once and the DRAM to index them costs more than the media is worth.
     pub(super) fn lend(&mut self) -> Option<u32> {
         let l = self.slab(Class::Huge).lend()?;
         Some(self.slab(Class::Huge).global_of(l))
@@ -704,8 +665,8 @@ impl Shard {
     }
 
     /// Live and tombstoned entries per extent, `(extent, live, tombstones)` sorted by
-    /// extent. Summed across cores this is the whole node, which is what the control
-    /// plane needs before it dares advance an extent's tombstone epoch.
+    /// extent. Summed across cores this is the whole node, which the control plane needs
+    /// before advancing an extent's tombstone epoch.
     pub(super) fn census(&self) -> Vec<(u32, u64, u64)> {
         let mut out: Vec<(u32, u64, u64)> = Vec::new();
         for sl in &self.slabs {
@@ -724,13 +685,10 @@ impl Shard {
 
     // ------------------------------------------------------------------ reservations
 
-    /// Guard check plus free-list pop. Synchronous: no IO has been issued when this
-    /// returns, so a refusal costs nothing.
-    ///
-    /// `guard` absent means "derive it here" from the type's own rule; every
-    /// production caller supplies one. The guard is the collision detector and the
-    /// whole of the type check: LWW, OCC and Immutable differ only in which version
-    /// the proposer presented.
+    /// Guard check plus free-list pop. Synchronous, so a refusal costs no IO. `guard`
+    /// absent derives it from the type's own rule; every production caller supplies one.
+    /// The guard is the collision detector and the whole type check: LWW, OCC and
+    /// Immutable differ only in which version the proposer presented.
     pub(super) fn reserve(
         &mut self,
         addr: GlobalAddr,
@@ -744,8 +702,8 @@ impl Shard {
         let current = effective(old, kind, epoch);
         let g = match guard {
             Some(g) => g,
-            // The same rules the type table states: the version we hold for LWW, the
-            // last read version for OCC, the epoch's fill point for Immutable.
+            // The type table's rules: the version we hold for LWW, the last read version
+            // for OCC, the epoch's fill point for Immutable.
             None => match kind {
                 Kind::Lww => current,
                 Kind::Occ => self
@@ -756,10 +714,10 @@ impl Shard {
             },
         };
         // An acceptor refuses only a guard it is already past: that is the collision.
-        // Sitting behind the guard is a gap this accept closes, which lets a node that
+        // Sitting behind the guard is a gap this accept closes, letting a node that
         // missed a round rejoin without waiting for the sweep. At the guard itself the
-        // ballot may not regress, which keeps a stale retry from overwriting a newer
-        // value at the same version.
+        // ballot may not regress, so a stale retry cannot overwrite a newer value at the
+        // same version.
         if current > g || (current == g && old.is_some_and(|e| ballot.raw() < e.ballot as u32)) {
             return Err(Status::Conflict { current });
         }
@@ -777,10 +735,9 @@ impl Shard {
     }
 
     /// The unguarded apply-if-newer reservation behind repair and `learn`. `None` means
-    /// what we already hold is at least as new, which makes the two migration streams
-    /// commutative and a repeated repair free. `replace_equal` additionally admits an
-    /// exactly equal live register, so repair can reinstall bytes that failed their
-    /// checksum.
+    /// what we hold is at least as new, making the two migration streams commutative and a
+    /// repeated repair free. `replace_equal` also admits an exactly equal live register,
+    /// so repair can reinstall bytes that failed their checksum.
     pub(super) fn reserve_unguarded(
         &mut self,
         addr: GlobalAddr,
@@ -813,9 +770,9 @@ impl Shard {
         }))
     }
 
-    /// Install the entry, retire the address's previous slot, and mark the mblock
-    /// dirty. Returns the mblock and the sequence number a flush must reach for this
-    /// commit to be durable.
+    /// Install the entry, retire the address's previous slot, mark the mblock dirty.
+    /// Returns the mblock and the sequence a flush must reach to make this commit
+    /// durable.
     pub(super) fn stage(
         &mut self,
         addr: GlobalAddr,
@@ -830,14 +787,13 @@ impl Shard {
         let sl = self.slab(class);
         let local = sl.local_of(t.slot).ok_or(Status::Io)?;
         // A reservation and its commit are separated by the data write, so another
-        // accept, learn or trim for this address can land in between. The guard was
-        // checked against the row `reserve` saw, so it only still holds if that row has
-        // not moved; a trim in the window would otherwise let this stale accept
-        // resurrect a deleted value at a version someone else has already bound.
-        // Comparing the raw row rather than `effective` keeps epoch out of it: an epoch
-        // advance touches no row, and an Immutable accept from the old epoch lands
-        // below the new fill point and so reads as superseded anyway. Giving the slot
-        // back and reporting success is right, because something newer won.
+        // accept, learn or trim can land in between. The guard was checked against the
+        // row `reserve` saw, so it holds only if that row has not moved; a trim in the
+        // window would otherwise let this stale accept resurrect a deleted value at a
+        // version someone else has bound. Comparing the raw row rather than `effective`
+        // keeps epoch out of it: an epoch advance touches no row, and an Immutable accept
+        // from the old epoch reads as superseded anyway. Giving the slot back and
+        // reporting success is right: something newer won.
         let seen = sl.entry_of(addr.0).map(|(_, e)| (e.version, e.ballot));
         if recheck && seen != t.prior {
             sl.recycle(local);
@@ -871,8 +827,7 @@ impl Shard {
     }
 
     /// Retire the slot a commit displaced, once its replacement is durable. Returns the
-    /// mblock and sequence that retirement needs flushed to, or `None` if the slot is
-    /// outside this core's stripe.
+    /// mblock and sequence to flush to, or `None` if the slot is outside this stripe.
     pub(super) fn release(&mut self, class: Class, slot: u32, m: &Maps) -> Option<(u32, u64)> {
         let sl = self.slab(class);
         let local = sl.local_of(slot)?;
@@ -891,9 +846,9 @@ impl Shard {
 
     // -------------------------------------------------------------- consensus surface
 
-    /// The register as this node holds it, with no data read. A page we have never
-    /// seen is not an error: it sits at version zero, or at `3 * epoch` for an
-    /// Immutable extent, and consensus needs that to be a vote.
+    /// The register as this node holds it, with no data read. An unseen page is not an
+    /// error: it sits at version zero, or `3 * epoch` for an Immutable extent, and
+    /// consensus needs that to be a vote.
     pub(super) fn register_of(
         &mut self,
         addr: GlobalAddr,
@@ -912,9 +867,9 @@ impl Shard {
         })
     }
 
-    /// Record what a read this node's *own* ublk device served returned. Answering a
-    /// peer deliberately does not land here: an acceptor keeps no read-tracking state,
-    /// which is what makes the OCC check cluster-wide.
+    /// Record what a read this node's *own* ublk device served returned. Answering a peer
+    /// deliberately does not land here: an acceptor keeps no read-tracking state, which
+    /// makes the OCC check cluster-wide.
     pub(super) fn observed(&mut self, addr: GlobalAddr, kind: Kind, version: u64) {
         if kind == Kind::Occ {
             self.occ.observe(addr.0, version);
@@ -933,18 +888,18 @@ impl Shard {
         let current = effective(e, kind, epoch);
         match kind {
             Kind::Lww => Ok(current),
-            // The version this node read, whatever the local slab holds — on a
-            // non-member it holds nothing at all. The acceptor compares it against the
-            // register and that comparison *is* the OCC check, so a write with no prior
-            // read here cannot be checked and conflicts.
+            // The version this node read, whatever the local slab holds; a non-member
+            // holds nothing. The acceptor's comparison of it against the register *is*
+            // the OCC check, so a write with no prior read here cannot be checked and
+            // conflicts.
             Kind::Occ => self.occ.version(addr.0).ok_or(Status::Conflict { current }),
             Kind::Immutable => Ok(3 * epoch),
         }
     }
 
-    /// The OCC observation is *not* recorded here: this same path serves a peer's
-    /// `GET`, and only the node whose ublk device answered the client may record a
-    /// read. `Paxos::read` does that instead.
+    /// The OCC observation is *not* recorded here: this path also serves a peer's `GET`,
+    /// and only the node whose ublk device answered the client may record a read, which
+    /// `Paxos::read` does.
     pub(super) fn lookup(
         &mut self,
         addr: GlobalAddr,
@@ -968,10 +923,9 @@ impl Shard {
     // ----------------------------------------------------------------------- discard
 
     /// The member side of a trim proposal. An immutable page becomes a tombstone so
-    /// readers can still tell a hole from a trim, and the entry is reclaimed when the
-    /// control plane advances the epoch past it; a mutable page is simply released.
-    /// The immutable case guards on `3*epoch + 1` and is idempotent, so a repeat is
-    /// `Ok` rather than a conflict.
+    /// readers can tell a hole from a trim, and is reclaimed when the control plane
+    /// advances the epoch past it; a mutable page is released. The immutable case guards
+    /// on `3*epoch + 1` and is idempotent, so a repeat is `Ok`.
     #[allow(clippy::too_many_arguments)] // type, class and epoch all ride in
     pub(super) fn trim(
         &mut self,
@@ -1033,10 +987,9 @@ impl Shard {
         }
     }
 
-    /// Snapshot one mblock for serialisation: the sequence this write will make
-    /// durable, the header to stamp on it, and the rows themselves. The generation is
-    /// bumped here, before the write is issued, so the copy this lands in is
-    /// `generation % 2`.
+    /// Snapshot one mblock: the sequence this write makes durable, the header to stamp on
+    /// it, and the rows. The generation is bumped here, before the write is issued, so
+    /// the copy this lands in is `generation % 2`.
     pub(super) fn begin_flush(&mut self, class: Class, li: u32) -> (u64, Header, &[Entry]) {
         let sl = &mut self.slabs[class as usize];
         let seq = sl.commit_seq[li as usize];
@@ -1058,8 +1011,8 @@ impl Shard {
         )
     }
 
-    /// Retire the flush. `durable_seq` only ever moves forward, and only on success:
-    /// that is the predicate every committer waits on.
+    /// Retire the flush. `durable_seq` only moves forward, and only on success: that is
+    /// the predicate every committer waits on.
     pub(super) fn end_flush(&mut self, class: Class, li: u32, seq: u64, ok: bool) {
         let sl = self.slab(class);
         sl.flushing = false;
@@ -1070,12 +1023,10 @@ impl Shard {
 
     // -------------------------------------------------------------------- maintenance
 
-    /// One tick's worth of tombstone reclamation on one class. The only garbage
-    /// collection in the system: metadata only, bounded, and on no critical path.
-    ///
-    /// The extent is resolved per tombstone rather than once per sweep, because the
-    /// epoch is the extent's: one extent may collect while every other one stands
-    /// still. The lookup only runs for entries already known to be tombstones.
+    /// One tick's worth of tombstone reclamation on one class. The only garbage collection
+    /// in the system: metadata only, bounded, off the critical path. The extent is
+    /// resolved per tombstone because the epoch is the extent's (one extent may collect
+    /// while others stand still), and only for entries already known to be tombstones.
     pub(super) fn sweep(&mut self, class: Class, m: &Maps) {
         let sl = self.slab(class);
         if sl.local == 0 {
@@ -1101,7 +1052,7 @@ impl Shard {
             }
             if hit {
                 // Persisted by whichever commit next lands on this mblock; a tombstone
-                // that outlives its epoch costs nothing but an entry.
+                // outliving its epoch costs only an entry.
                 sl.dirty(li);
             }
         }
@@ -1117,8 +1068,8 @@ impl Shard {
         self.slab(class).digests.vector(group)
     }
 
-    /// Groups this shard holds registers for, and the forget that prunes one it has
-    /// been drained of. Together these are how the shed finds work without scanning.
+    /// Groups this shard holds registers for. With `forget_group`, how the shed finds
+    /// work without scanning.
     pub(super) fn held_groups(&mut self, class: Class) -> Vec<GroupId> {
         self.slab(class).digests.held()
     }
@@ -1127,10 +1078,10 @@ impl Shard {
         self.slab(class).digests.forget(group);
     }
 
-    /// Forget a register outright, leaving no tombstone: the page is not being deleted,
-    /// it is being left to the members that now own it, and a tombstone here would be a
-    /// deletion for them to replay. Conditional on the version the caller confirmed
-    /// those members hold, so a write that raced the confirmation is kept.
+    /// Forget a register outright, leaving no tombstone: the page is not deleted but left
+    /// to the members that now own it, and a tombstone would be a deletion for them to
+    /// replay. Conditional on the version the caller confirmed those members hold, so a
+    /// write that raced the confirmation is kept.
     pub(super) fn discard(
         &mut self,
         addr: GlobalAddr,
@@ -1206,10 +1157,9 @@ pub(super) struct Scanned {
     pub entries: Vec<Entry>,
 }
 
-/// Which of an mblock's two copies to believe. Highest generation with a valid CRC
-/// wins; if the newer copy is bad we fall back to the older one, which is a lost write
-/// and not corruption. Neither valid is the only case that quarantines. The flag names
-/// the copy chosen.
+/// Which of an mblock's two copies to believe. Highest generation with a valid CRC wins;
+/// falling back to the older copy is a lost write, not corruption. Neither valid is the
+/// only case that quarantines. The flag names the copy.
 pub(super) fn pick_ab(ha: Option<Header>, hb: Option<Header>) -> Option<(Header, bool)> {
     match (ha, hb) {
         (Some(x), Some(y)) if y.generation > x.generation => Some((y, true)),
@@ -1219,11 +1169,9 @@ pub(super) fn pick_ab(ha: Option<Header>, hb: Option<Header>) -> Option<(Header,
     }
 }
 
-/// Rebuild every shard from a scan of the metadata region. There is no journal and
-/// nothing to replay, so whatever the scan found *is* the state; the only work is
-/// deciding who owns what.
-///
-/// Returns the shards and the number of mblocks that were quarantined.
+/// Rebuild every shard from a scan of the metadata region. There is no journal to replay,
+/// so whatever the scan found *is* the state; the only work is deciding who owns what.
+/// Returns the shards and the count of quarantined mblocks.
 pub(super) fn rebuild(
     shape: &Shape,
     cores: usize,
@@ -1262,11 +1210,11 @@ pub(super) fn rebuild(
     drop(scans);
 
     // Two slots can claim one address after a crash between the metadata write and the
-    // old slot's release. The higher version is the one that was acked, and the ballot
-    // breaks the tie: two accepts can share a version, and choosing between them any
-    // other way would let a restart resurrect the ballot that lost while the node was
-    // up. A `BTreeMap` so the loop below fills the index and the foreign map in key
-    // order: a rebuild must land on the same layout every time it sees the same device.
+    // old slot's release. The higher version was the acked one; the ballot breaks ties,
+    // since two accepts can share a version and any other tiebreak would let a restart
+    // resurrect the ballot that lost while the node was up. A `BTreeMap` so the loop below
+    // fills the index and the foreign map in key order: a rebuild must land on the same
+    // layout every time it sees the same device.
     let mut winner: BTreeMap<u64, (Class, u32, (u64, u32))> = BTreeMap::new();
     let mut losers: Vec<(Class, u32)> = Vec::new();
     for (addr, class, slot, version) in found {
@@ -1290,9 +1238,9 @@ pub(super) fn rebuild(
         }
     }
 
-    // The index shards by consensus group, which need not be the core that owns the
-    // slot; when they differ the entry is copied into the small `foreign` side map and
-    // the page relocates on its next write.
+    // The index shards by consensus group, which need not be the core owning the slot;
+    // when they differ the entry goes into the `foreign` side map and the page relocates
+    // on its next write.
     for (addr, (class, slot, _)) in &winner {
         let owner = (m.gof)(*addr).index() as usize % shape.shards_for[*class as usize];
         let holder = (*slot / shape.k[*class as usize] % cores as u32) as usize;
@@ -1324,7 +1272,7 @@ pub(super) fn rebuild(
                 }
             }
             // Seed the anti-entropy accumulators and the per-extent census from what
-            // survived the scan: the only full pass either gets, every later change
+            // survived the scan: the only full pass either gets, since every later change
             // goes through `set`.
             for l in 0..sl.entries.len() {
                 let e = sl.entries[l];
@@ -1341,21 +1289,20 @@ pub(super) fn rebuild(
 
 // ------------------------------------------------------- comparability, for the model
 
-/// `stateright` has to clone, compare and hash whatever it explores, and the types
-/// above are ordinary owned data apart from two fields.
+/// `stateright` has to clone, compare and hash whatever it explores, and the types above
+/// are ordinary owned data apart from two fields.
 ///
-/// `digests` and `snaps` are excluded: the first is 4 KiB per consensus group, which
-/// has no business in a state space; the second holds wall-clock deadlines, which are
-/// not state at all. Both belong to `heal.rs` and are checked there. The impls are
-/// `cfg(test)` so no production path can pick up a `Clone` that silently drops them.
+/// `digests` and `snaps` are excluded: the first is 4 KiB per consensus group, the second
+/// holds wall-clock deadlines. Both belong to `heal.rs` and are checked there. The impls
+/// are `cfg(test)` so no production path picks up a `Clone` that silently drops them.
 #[cfg(test)]
 mod cmp {
     use super::*;
     use std::hash::{Hash, Hasher};
 
     /// The OCC ring as a state. Its sequence numbers count up for ever and only their
-    /// ordering and equality are ever read, so renumbering them by rank loses nothing
-    /// and keeps the state space finite.
+    /// ordering and equality are read, so renumbering by rank loses nothing and keeps
+    /// the state space finite.
     type Ring = (Vec<(u64, u64)>, Vec<(u64, u64, u64)>);
 
     fn ring(r: &OccRing) -> Ring {
@@ -1395,9 +1342,9 @@ mod cmp {
     }
 
     impl Slab {
-        /// The sweep cursor counts up for ever but is only ever read modulo the stripe
-        /// length, so that is what a state is. Without this the state space is infinite
-        /// for no behavioural reason.
+        /// The sweep cursor counts up for ever but is only read modulo the stripe length,
+        /// so that is what a state is. Without this the state space is infinite for no
+        /// behavioural reason.
         fn cursor(&self) -> u32 {
             self.sweep % self.local.max(1)
         }
@@ -1524,16 +1471,13 @@ mod cmp {
 
 /// Model checks over the code above, with `stateright`.
 ///
-/// These drive the real `Shard` — the same `reserve`, `stage`, `trim`, `sweep`,
-/// `flush_act`/`begin_flush`/`end_flush` and `rebuild` that production calls — at a
-/// shape small enough to enumerate: two slots per mblock, two mblocks, two addresses.
-/// That is what `Shape` is for. A model that paraphrased the rules would only prove the
-/// paraphrase.
+/// These drive the real `Shard`, the same `reserve`, `stage`, `trim`, `sweep`,
+/// `flush_act`/`begin_flush`/`end_flush` and `rebuild` that production calls, at a shape
+/// small enough to enumerate: two slots per mblock, two mblocks, two addresses.
 ///
 /// The rule under test is a parameter wherever the design had a choice, so each check
 /// runs twice: once with the rule the code uses, which must hold, and once with the
-/// weaker rule, which must fail. A mechanism no counterexample can distinguish is a
-/// mechanism nobody needs.
+/// weaker rule, which must fail.
 ///
 /// No IO, no runtime, no device: these run without root.
 #[cfg(test)]
@@ -1548,13 +1492,9 @@ mod model {
     const MAX_WRITES: u8 = 3;
     const MAX_PENDING: usize = 2;
 
-    /// One address in each of two extents, in different consensus groups so that a
-    /// change of core count can separate an index shard from a slot's owner. Separate
-    /// extents because the tombstone epoch is per extent, and the point of the sweep
-    /// properties below is that one extent's epoch says nothing about the other's.
-    ///
-    /// Both sit in universe 1: partitioning is the configuration's business, and a
-    /// second universe here would only make the addresses longer.
+    /// One address in each of two extents, in different consensus groups so a change of
+    /// core count can separate an index shard from a slot's owner. Separate extents
+    /// because the tombstone epoch is per extent. Both sit in universe 1.
     const ADDRS: [u64; 2] = [1 << config::LBA_BITS, (1 << config::LBA_BITS) | 1];
     const GUARDS: [Option<u64>; 4] = [None, Some(0), Some(1), Some(3)];
     /// Trims are guarded too, but only the fill points (`3*epoch + 1`) are interesting.
@@ -1563,7 +1503,7 @@ mod model {
     const MAX_FLUSHES: u8 = 4;
 
     /// One mblock's two on-disk copies, each `(generation, rows)`. `None` is a copy that
-    /// will not decode, which is what a torn or failed write leaves behind.
+    /// will not decode, which a torn or failed write leaves behind.
     type Copies = [Option<(u64, Vec<Entry>)>; 2];
 
     /// A commit that has staged but is not yet durable: address, version, ballot, value,
@@ -1585,9 +1525,9 @@ mod model {
         ext_of(addr) as u32 + 1
     }
 
-    /// Bind the lookups a slab mutation needs and bundle them as `$m`, the way
-    /// `alloc::maps!` does for the real allocator. A macro for the same reason: the
-    /// bundle borrows the closures, so nothing here can be returned.
+    /// Bind the lookups a slab mutation needs and bundle them as `$m`, like
+    /// `alloc::maps!` does for the real allocator. A macro because the bundle borrows the
+    /// closures, so nothing here can be returned.
     macro_rules! maps {
         ($epochs:expr, $m:ident) => {
             let epochs = $epochs;
@@ -1633,8 +1573,7 @@ mod model {
             expect: [8, 8],
             shards_for: [cores as usize, 1],
             // One record: eviction is unreachable at the production size, and the claim
-            // that eviction can only turn a success into a conflict is what wants
-            // checking.
+            // that eviction only turns a success into a conflict is what wants checking.
             occ: 1,
         }
     }
@@ -1643,8 +1582,8 @@ mod model {
         vec![Entry::default(); K as usize]
     }
 
-    /// Every shard is built the way `open` builds one, because the free lists are not
-    /// persisted and only `rebuild` knows how to derive them.
+    /// Every shard is built the way `open` builds one: free lists are not persisted and
+    /// only `rebuild` knows how to derive them.
     fn boot(cores: u32, recheck: bool, image: &[Copies]) -> (Vec<Shard>, usize) {
         let scans = (0..MBLOCKS as usize)
             .map(|id| {
@@ -1684,9 +1623,8 @@ mod model {
             .collect()
     }
 
-    /// The free list and the index are where a leak or a dangling read would show up. A
-    /// slot is free or occupied, never both and never twice; and every key in the index
-    /// names a slot that really does hold that address.
+    /// Where a leak or a dangling read would show up: a slot is free or occupied, never
+    /// both and never twice, and every index key names a slot that holds that address.
     fn sound(shards: &[Shard]) -> bool {
         for sh in shards {
             let sl = &sh.slabs[0];
@@ -1699,8 +1637,8 @@ mod model {
                 seen[l] = true;
             }
             for &(k, v) in sl.index.slots.iter() {
-                // A key whose slot sits in another core's stripe is a foreign entry,
-                // which this slab holds no row for.
+                // A key whose slot sits in another core's stripe is a foreign entry, which
+                // this slab holds no row for.
                 if k != 0
                     && let Some(l) = sl.local_of(v)
                     && sl.entries[l as usize].addr != k
@@ -1712,20 +1650,20 @@ mod model {
         true
     }
 
-    /// What a reader sees. Reads go through the index, never by scanning slots, and
-    /// once a displaced slot is retired late (`Staged::stale`) that distinction matters:
-    /// two slots may hold one address, but only one is reachable.
+    /// What a reader sees. Reads go through the index, never by scanning slots, so with a
+    /// displaced slot retired late (`Staged::stale`) two slots may hold one address but
+    /// only one is reachable.
     fn find(shards: &[Shard], addr: u64) -> Option<Entry> {
         shards
             .iter()
             .find_map(|sh| sh.slabs[0].entry_of(addr).map(|(_, e)| e))
     }
 
-    /// Every slot beyond the one the index names must be a stale slot some commit is
-    /// still holding on to. Anything else is a leak.
+    /// Every slot beyond the one the index names must be a stale slot some commit still
+    /// holds. Anything else is a leak.
     fn duplicates_are_owned(shards: &[Shard], held: &BTreeSet<u32>) -> bool {
-        // The index that names a row need not live on the core that holds it: the index
-        // shards by consensus group and the slots by core.
+        // The index naming a row need not live on the core holding it: the index shards
+        // by consensus group and the slots by core.
         let mut named: BTreeSet<u32> = BTreeSet::new();
         for sh in shards {
             let sl = &sh.slabs[0];
@@ -1747,7 +1685,7 @@ mod model {
     // -------------------------------------------------------------- register semantics
 
     /// One core, no IO. Everything a page's type semantics decide happens here, so this
-    /// model is where the type table and the guard rule are pinned.
+    /// is where the type table and the guard rule are pinned.
     #[derive(Clone, PartialEq, Hash, Debug)]
     struct Reg {
         sh: Shard,
@@ -1760,7 +1698,7 @@ mod model {
         seen: BTreeSet<(u64, u64)>,
         /// Guards the ring actually let through on the derived path.
         used: BTreeSet<(u64, u64)>,
-        /// One per extent, because that is the scope the control plane advances.
+        /// One per extent, the scope the control plane advances.
         epoch: [u64; ADDRS.len()],
         /// Set for an extent whose tombstone the sweep has actually reclaimed.
         reaped: [bool; ADDRS.len()],
@@ -1770,9 +1708,9 @@ mod model {
         leaked: u8,
         /// Successful mutable trims, so the model can prove the path is reached.
         trimmed: u8,
-        /// Set if an Immutable accept presenting the epoch's fill point ever came back
-        /// at a version that is not `3*epoch + 1`. Learns are excluded: a repair stream
-        /// carries whatever version it was given, and apply-if-newer is its only rule.
+        /// Set if an Immutable accept presenting the epoch's fill point came back at a
+        /// version that is not `3*epoch + 1`. Learns are excluded: a repair stream carries
+        /// whatever version it was given, and apply-if-newer is its only rule.
         offbeat: bool,
     }
 
@@ -1793,9 +1731,9 @@ mod model {
 
     struct RegModel {
         kind: Kind,
-        /// `Commit::Checked` is what the allocator does. `Commit::Blind` installs
-        /// whatever the ticket says without re-reading the entry the reservation was
-        /// granted against.
+        /// `Commit::Checked` is what the allocator does. `Commit::Blind` installs whatever
+        /// the ticket says without re-reading the entry the reservation was granted
+        /// against.
         commit: Commit,
     }
 
@@ -1853,8 +1791,8 @@ mod model {
                 out.push(RegAct::Unreserve(p));
             }
             for v in 0..ADDRS.len() as u8 {
-                // Each extent's epoch moves on its own. One step is enough: nothing in
-                // the dataplane branches on the size of the jump, only on the ordering.
+                // Each extent's epoch moves on its own. One step is enough: nothing in the
+                // dataplane branches on the size of the jump, only on the ordering.
                 if s.epoch[v as usize] == 0 {
                     out.push(RegAct::AdvanceEpoch(v));
                 }
@@ -1901,10 +1839,10 @@ mod model {
                     if let Ok(t) =
                         s.sh.reserve(ad, kind, cls, guard, ballot, s.epoch[a as usize])
                     {
-                        // Only the guards a real proposer can present: `guard_of`
-                        // returns the epoch's fill point for Immutable, so an accept
-                        // either derives it or carries that same number. An arbitrary
-                        // guard is a different test, covered by the conflict rules.
+                        // Only the guards a real proposer can present: `guard_of` returns
+                        // the epoch's fill point for Immutable, so an accept either
+                        // derives it or carries that number. An arbitrary guard is covered
+                        // by the conflict rules instead.
                         let fill = guard.is_none_or(|g| g == 3 * s.epoch[a as usize]);
                         s.offbeat |= kind == Kind::Immutable && fill && t.version % 3 != 1;
                         // A derived guard is the one the OCC ring vouched for.
@@ -1922,7 +1860,7 @@ mod model {
                     let value = t.ballot.raw();
                     // `Ok(None)` is a commit that lost the race and gave its slot back:
                     // the caller sees success but nothing was written, so nothing is
-                    // acknowledged as this address's value.
+                    // acknowledged.
                     maps!(m);
                     if let Ok(Some(st)) = s.sh.stage(GlobalAddr(addr), kind, cls, t, value, &m) {
                         s.acked.insert((addr, t.version, t.ballot.raw(), value));
@@ -1953,10 +1891,10 @@ mod model {
                         s.epoch[a as usize],
                         &m,
                     );
-                    // A mutable trim destroys the register rather than tombstoning it,
-                    // so versions restart from zero and the history before it is no
-                    // longer a claim about the same incarnation. Forgetting it here
-                    // scopes the register property to "between trims".
+                    // A mutable trim destroys the register rather than tombstoning it, so
+                    // versions restart from zero and the history before it is no longer a
+                    // claim about the same incarnation. Forgetting it scopes the register
+                    // property to "between trims".
                     if kind != Kind::Immutable && matches!(r, Ok(Some(_))) {
                         s.acked.retain(|&(x, _, _, _)| x != ad.0);
                         s.trimmed += 1;
@@ -1964,8 +1902,8 @@ mod model {
                 }
                 RegAct::AdvanceEpoch(v) => s.epoch[v as usize] += 1,
                 RegAct::Sweep => {
-                    // Which tombstones the sweep took, and whose. That is the whole
-                    // claim: an extent the control plane has not advanced loses nothing.
+                    // Which tombstones the sweep took, and whose: an extent the control
+                    // plane has not advanced loses nothing.
                     let before: Vec<u64> = s.sh.slabs[0]
                         .entries
                         .iter()
@@ -1986,10 +1924,9 @@ mod model {
 
         fn properties(&self) -> Vec<Property<Self>> {
             let mut ps = vec![
-                // A ballot names one value at one version, once and for all. Two values
-                // at one *version* is legal and expected — two proposers may propose at
-                // one version with different ballots, and only one is ever chosen — so
-                // the key is the pair.
+                // A ballot names one value at one version, once and for all. Two values at
+                // one *version* is legal: two proposers may propose at one version with
+                // different ballots and only one is chosen, so the key is the pair.
                 Property::<Self>::always("one value per ballot", |_, s| {
                     let mut v: Vec<(u64, u64, u32)> =
                         s.acked.iter().map(|&(a, x, b, _)| (a, x, b)).collect();
@@ -1997,11 +1934,9 @@ mod model {
                     v.dedup();
                     v.len() == s.acked.len()
                 }),
-                // The register never goes backwards: what the node holds must be at
-                // least the newest thing it ever acknowledged. Compared through
-                // `effective`, because an epoch advance legitimately carries an
-                // Immutable address forward past a tombstone the sweep has since
-                // reclaimed.
+                // The register never goes backwards. Compared through `effective`, because
+                // an epoch advance legitimately carries an Immutable address forward past
+                // a tombstone the sweep has since reclaimed.
                 Property::<Self>::always("the register never regresses", |m: &Self, s: &Reg| {
                     s.acked.iter().all(|&(a, v, b, _)| {
                         let e = find(std::slice::from_ref(&s.sh), a);
@@ -2037,14 +1972,14 @@ mod model {
                     sl.free.len() + live + s.pending.len() + s.leaked as usize == SLOTS
                 }),
                 // An accept on the derived path is only ever licensed by a version this
-                // node really read. Eviction may drop a record, turning a would-be
-                // success into a conflict; it may never manufacture one.
+                // node really read. Eviction may drop a record, turning a success into a
+                // conflict; it may never manufacture one.
                 Property::<Self>::always("occ accepts were observed", |_, s| {
                     s.used.is_subset(&s.seen)
                 }),
-                // The per-extent census is maintained one entry at a time, in `set`.
-                // This is the only thing that says it still agrees with the slab, and
-                // the control plane's epoch decision rests on it.
+                // The census is maintained one entry at a time in `set`; this is the only
+                // check that it still agrees with the slab, and the control plane's epoch
+                // decision rests on it.
                 Property::<Self>::always("the census matches the slab", |_, s| {
                     s.sh.slabs[0].census == recount(&s.sh.slabs[0])
                 }),
@@ -2070,9 +2005,8 @@ mod model {
                                 .any(|e| e.state == State::Tombstone)
                         },
                     ));
-                    // The only garbage collection in the system, and it is scoped to one
-                    // extent. An extent whose epoch still sits at zero keeps every
-                    // tombstone it has, however far ahead the other extent runs.
+                    // The sweep is scoped to one extent: an extent whose epoch still sits
+                    // at zero keeps every tombstone, however far ahead the other runs.
                     ps.push(Property::<Self>::always(
                         "the sweep stays inside its extent",
                         |_, s| (0..ADDRS.len()).all(|v| s.epoch[v] > 0 || !s.reaped[v]),
@@ -2087,8 +2021,8 @@ mod model {
                             })
                         },
                     ));
-                    // The point of the rescope: one extent collects while the other,
-                    // still lagging, keeps its own tombstone.
+                    // One extent collects while the other, still lagging, keeps its own
+                    // tombstone.
                     ps.push(Property::<Self>::sometimes(
                         "one extent collects alone",
                         |_, s| {
@@ -2102,8 +2036,8 @@ mod model {
                     ));
                 }
                 _ => {
-                    // A mutable trim does not tombstone: it drops the entry and hands
-                    // the slot straight back.
+                    // A mutable trim does not tombstone: it drops the entry and hands the
+                    // slot straight back.
                     ps.push(Property::<Self>::sometimes(
                         "a trim frees a slot",
                         |_, s| {
@@ -2120,8 +2054,8 @@ mod model {
 
     // ------------------------------------------------------------------- durability
 
-    /// Where a flush lands. Alternating is the A/B ping-pong; fixed is the obvious
-    /// alternative, in which a failed write destroys the only copy there was.
+    /// Where a flush lands. Alternating is the A/B ping-pong; fixed is the alternative in
+    /// which a failed write destroys the only copy there was.
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Ab {
         Alternating,
@@ -2136,25 +2070,23 @@ mod model {
         Staged,
     }
 
-    /// Group commit, the A/B copies, and the startup scan that has to make sense of
-    /// whatever a crash left behind. There is no journal, so `rebuild` is the entire
-    /// recovery procedure and this is the only thing that checks it.
+    /// Group commit, the A/B copies, and the startup scan. There is no journal, so
+    /// `rebuild` is the entire recovery procedure and this is the only check on it.
     #[derive(Clone, PartialEq, Hash, Debug)]
     struct Disk {
         shards: Vec<Shard>,
         /// Both copies of every mblock. `None` is a copy a failed write destroyed.
         image: Vec<Copies>,
         pending: Vec<(u64, Ticket)>,
-        /// Staged but not durable: what to report once `durable_seq` catches up, which
-        /// is exactly what `flush_until` waits on.
+        /// Staged but not durable: what to report once `durable_seq` catches up, exactly
+        /// what `flush_until` waits on.
         waiting: Vec<Waiting>,
         acked: BTreeSet<(u64, u64, u32, u32)>,
-        /// The flush in flight: mblock, the sequence it makes durable, its generation
-        /// and the rows it carries.
+        /// The flush in flight: mblock, the sequence it makes durable, its generation and
+        /// the rows it carries.
         flight: Option<(u32, u64, u64, Vec<Entry>)>,
-        /// Both copies of one mblock died. That is genuine media loss, which the node
-        /// answers with `Missing` rather than with a lie, and it is sticky: a later
-        /// successful write refills a copy but does not bring the lost rows back.
+        /// Both copies of one mblock died: genuine media loss, answered with `Missing`.
+        /// Sticky, since a later successful write refills a copy but not the lost rows.
         lost: bool,
         writes: u8,
         flushes: u8,
@@ -2178,8 +2110,8 @@ mod model {
     }
 
     impl DiskModel {
-        /// Move everything whose mblock has reached its sequence into `acked`:
-        /// `flush_until`'s predicate and nothing else.
+        /// Move everything whose mblock has reached its sequence into `acked`, which is
+        /// `flush_until`'s predicate.
         fn promote(&self, s: &mut Disk) {
             if self.ack == Ack::Staged {
                 return;
@@ -2225,8 +2157,8 @@ mod model {
         }
 
         fn actions(&self, s: &Disk, out: &mut Vec<DiskAct>) {
-            // The model drives core 0 only, so writes stop once a restart has spread
-            // the shards wider. That restart is there for `rebuild`, not for traffic.
+            // The model drives core 0 only, so writes stop once a restart has spread the
+            // shards wider. That restart is there for `rebuild`, not for traffic.
             if s.cores == 1 && s.writes < MAX_WRITES && s.pending.len() < MAX_PENDING {
                 for a in 0..ADDRS.len() as u8 {
                     for b in 0..2u8 {
@@ -2307,8 +2239,8 @@ mod model {
                         Ab::Alternating => (g % 2) as usize,
                         Ab::Fixed => 0,
                     };
-                    // A write that fails leaves the copy it aimed at unreadable, which
-                    // is the whole reason there are two of them.
+                    // A failed write leaves the copy it aimed at unreadable, which is why
+                    // there are two.
                     s.image[li as usize][copy] = if ok { Some((g, rows)) } else { None };
                     s.lost |= s.image[li as usize].iter().all(|c| c.is_none());
                     s.shards[0].end_flush(cls, li, seq, ok);
@@ -2330,17 +2262,15 @@ mod model {
 
         fn properties(&self) -> Vec<Property<Self>> {
             vec![
-                // The one that matters: what was reported done is still there. An
-                // mblock whose copies both died is genuine media loss, which the node
-                // answers with `Missing` rather than with a lie, so it is exempt.
+                // What was reported done is still there. An mblock whose copies both died
+                // is genuine media loss, answered with `Missing`, so it is exempt.
                 Property::<Self>::always("acknowledged writes survive", |_, s: &Disk| {
                     if s.lost {
                         return true;
                     }
-                    // Two ballots may legitimately hold one version and the higher one
-                    // wins, so the test is on `(version, ballot)` order rather than on
-                    // the value: never lost, never regressed, and equal keys must agree
-                    // on the bytes.
+                    // Two ballots may legitimately hold one version and the higher wins,
+                    // so the test is on `(version, ballot)` order rather than the value:
+                    // never lost, never regressed, and equal keys must agree on the bytes.
                     s.acked
                         .iter()
                         .all(|&(a, v, b, val)| match find(&s.shards, a) {
@@ -2352,17 +2282,16 @@ mod model {
                         })
                 }),
                 Property::<Self>::always("slots are accounted for", |_, s: &Disk| sound(&s.shards)),
-                // `rebuild` seeds the census in one pass and `set` keeps it from there.
-                // A restart is the only thing that exercises the seeding.
+                // `rebuild` seeds the census in one pass and `set` keeps it from there. A
+                // restart is the only thing that exercises the seeding.
                 Property::<Self>::always("the census matches the slabs", |_, s: &Disk| {
                     s.shards
                         .iter()
                         .all(|sh| sh.slabs[0].census == recount(&sh.slabs[0]))
                 }),
                 // A displaced slot is retired only once its replacement is durable, so
-                // until then one address legitimately occupies two slots. Every such
-                // extra slot must be one a commit is still holding; otherwise it is a
-                // slot nothing will ever give back.
+                // until then one address legitimately occupies two slots. Every extra slot
+                // must be one a commit still holds; otherwise nothing gives it back.
                 Property::<Self>::always("displaced slots are owned", |_, s: &Disk| {
                     let held = s.waiting.iter().filter_map(|w| w.6).collect();
                     duplicates_are_owned(&s.shards, &held)
@@ -2370,13 +2299,13 @@ mod model {
                 Property::<Self>::sometimes("a write survives a restart", |_, s: &Disk| {
                     s.restarts > 0 && !s.acked.is_empty() && find(&s.shards, ADDRS[0]).is_some()
                 }),
-                // The older copy is readable exactly when the newer one is not, which
-                // is a lost write rather than corruption.
+                // The older copy is readable exactly when the newer one is not, which is a
+                // lost write rather than corruption.
                 Property::<Self>::sometimes("the older copy is used", |_, s: &Disk| {
                     s.image.iter().any(|c| c[0].is_none() != c[1].is_none())
                 }),
-                // Two slots claiming one address, which is what a crash between the
-                // metadata write and the old slot's release leaves behind.
+                // Two slots claiming one address, what a crash between the metadata write
+                // and the old slot's release leaves behind.
                 Property::<Self>::sometimes("a duplicate is resolved at startup", |_, s: &Disk| {
                     s.restarts > 0
                         && s.image
@@ -2388,8 +2317,8 @@ mod model {
                             > 1
                         && find(&s.shards, ADDRS[0]).is_some()
                 }),
-                // The index shards by consensus group, the slots by core, and after a
-                // core count change those need not agree.
+                // The index shards by consensus group, the slots by core, and after a core
+                // count change those need not agree.
                 Property::<Self>::sometimes("a foreign entry appears", |_, s: &Disk| {
                     s.shards.iter().any(|sh| !sh.slabs[0].foreign.is_empty())
                 }),
@@ -2397,14 +2326,13 @@ mod model {
         }
     }
 
-    // ------------------------------------------------------------------------ checks
+    // --- checks ---
     //
-    // A proof that enumerates the whole reachable space visits the same states in either
-    // order, so it uses `spawn_dfs`: breadth first has to hold the entire frontier, and
-    // each queued item carries a cloned state plus the action path that reached it, which
-    // for the register models is tens of gigabytes of live heap. Depth first holds one
-    // path at a time. Checks that assert a counterexample stay on `spawn_bfs`, which is
-    // the only search that returns the shortest one, and they assert on its length.
+    // Full-enumeration proofs use `spawn_dfs`: breadth first holds the entire frontier,
+    // and each queued item carries a cloned state plus its action path, which for the
+    // register models is tens of gigabytes of live heap. Checks that assert a
+    // counterexample stay on `spawn_bfs`, the only search that returns the shortest one,
+    // and they assert on its length.
 
     fn threads() -> usize {
         std::thread::available_parallelism()
@@ -2412,12 +2340,10 @@ mod model {
             .unwrap_or(1)
     }
 
-    /// Stop the search the moment `name` has a counterexample.
-    ///
-    /// A check that asserts a discovery has its answer as soon as that one property
-    /// fails; the checker's default is to keep going until every property has a
-    /// discovery, which for a `sometimes` property that never fires means enumerating
-    /// the whole state space for nothing. BFS still hands back the shortest path.
+    /// Stop the search the moment `name` has a counterexample. The checker's default is
+    /// to keep going until every property has a discovery, which for a `sometimes`
+    /// property that never fires means enumerating the whole state space for nothing. BFS
+    /// still hands back the shortest path.
     fn until(name: &'static str) -> HasDiscoveries {
         HasDiscoveries::AnyOf([name].into_iter().collect())
     }
@@ -2445,9 +2371,8 @@ mod model {
         assert_eq!(r.seen.len(), 1);
     }
 
-    /// The three page kinds are three separate state spaces, and enumerating one says
-    /// nothing about the next. One test each, so the harness runs them side by side
-    /// instead of adding their run times up.
+    /// The three page kinds are three separate state spaces. One test each, so the
+    /// harness runs them side by side.
     fn register_semantics(kind: Kind) {
         RegModel {
             kind,
@@ -2490,9 +2415,9 @@ mod model {
     }
 
     /// A reservation and its commit are separated by the data write, so a second accept
-    /// for the same address can be granted and committed in between. Installing the
-    /// ticket without re-reading the entry lets the loser of that race land last and
-    /// pull the register back to an older ballot. This is the check `stage` makes.
+    /// for the same address can be granted and committed in between. Installing the ticket
+    /// without re-reading the entry lets the loser of that race land last and pull the
+    /// register back to an older ballot. This is the check `stage` makes.
     #[test]
     fn blind_commit_regresses_a_register() {
         let path = DiskModel {
@@ -2509,9 +2434,8 @@ mod model {
         assert!(path.into_actions().len() >= 4);
     }
 
-    /// Acknowledging a commit the moment it is staged is the mistake group commit
-    /// exists to avoid: the entry is in DRAM, the mblock is not on the device, and a
-    /// crash takes it.
+    /// Acknowledging a commit the moment it is staged is the mistake group commit exists
+    /// to avoid: the entry is in DRAM, the mblock is not on the device, a crash takes it.
     #[test]
     fn staged_is_not_durable() {
         let path = DiskModel {
@@ -2529,8 +2453,8 @@ mod model {
     }
 
     /// Writing every generation to the same copy makes a failed metadata write
-    /// destructive: the previous contents are gone, and with them an acknowledged
-    /// value that had nothing to do with the write that failed.
+    /// destructive: the previous contents are gone, and with them an acknowledged value
+    /// unrelated to the write that failed.
     #[test]
     fn one_copy_is_not_enough() {
         let path = DiskModel {
@@ -2559,9 +2483,8 @@ mod lending {
         sl
     }
 
-    /// A loan is not a commitment: the allocator can have any lent slot back inside a
-    /// reservation, so lending must not move the watermarks that decide whether an
-    /// ordinary write is delayed or refused.
+    /// A loan is not a commitment: the allocator can recall any lent slot inside a
+    /// reservation, so lending must not move the pressure watermarks.
     #[test]
     fn a_loan_still_counts_as_free() {
         let mut sl = slab(100);
@@ -2574,9 +2497,9 @@ mod lending {
         assert_eq!(sl.pressure(), Pressure::Normal);
     }
 
-    /// Lending stops well short of the slab, so reclaim is never what stands between an
-    /// ordinary write and a slot. The gate reads `free`, not `free + lent`, which is
-    /// what keeps lending from walking itself past its own limit.
+    /// Lending stops well short of the slab, so reclaim never stands between an ordinary
+    /// write and a slot. The gate reads `free`, not `free + lent`, which keeps lending
+    /// from walking past its own limit.
     #[test]
     fn lending_stops_at_a_quarter_of_the_stripe() {
         let mut sl = slab(100);
@@ -2607,8 +2530,8 @@ mod lending {
         assert!(sl.reclaim(l));
         assert!(sl.free.contains(&l));
         assert_eq!(sl.free.len(), 100);
-        // A repeat is a no-op rather than a double free: the cache is free to hand back
-        // an offset for a chunk it has already given up.
+        // A repeat is a no-op rather than a double free: the cache may hand back an
+        // offset for a chunk it has already given up.
         assert!(!sl.reclaim(l));
         assert_eq!(sl.free.len(), 100);
     }
