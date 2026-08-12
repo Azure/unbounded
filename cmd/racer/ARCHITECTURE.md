@@ -348,7 +348,7 @@ restart. A hit carries its claimed register, which consensus metadata must
 confirm; stale entries are discarded. Huge immutable admission also requires a
 quorum-confirmed version. Cache bytes have no checksum, so register confirmation
 establishes identity and freshness but cannot detect silent cache-media
-corruption. A zero target rate disables caching.
+corruption. An extent whose `cache_admit` is zero is never cached at all.
 
 ## Healing and Migration
 

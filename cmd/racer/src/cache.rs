@@ -73,6 +73,10 @@ const COLS_MAX: usize = 1 << 21;
 const COLS_MAX: usize = 1 << 12;
 /// A nibble saturates here.
 const COUNTER_MAX: u8 = 15;
+/// Halvings that take a saturated counter to zero: `15 -> 7 -> 3 -> 1 -> 0`. A sketch
+/// that has been halved this many times without anything being recorded is all zeroes,
+/// and halving it again cannot change it.
+const ZEROED_AFTER: u32 = COUNTER_MAX.ilog2() + 1;
 /// Halving at this interval turns the sketch into an exponentially weighted rate.
 const DECAY: Duration = Duration::from_millis(250);
 /// `W_max` before the cohort size caps it.
@@ -148,6 +152,11 @@ struct Sketch {
     /// `cols - 1`, the index mask. Held rather than a const because the sketch is sized
     /// from the slots this core ended up with.
     mask: usize,
+    /// Halvings since a counter was last made non-zero. At `ZEROED_AFTER` every counter
+    /// is zero and decay has nothing left to do, which is what keeps a core nothing
+    /// routes to - or a whole node whose cache is off - from walking megabytes of
+    /// zeroes four times a second forever.
+    since: u32,
 }
 
 impl Sketch {
@@ -156,6 +165,8 @@ impl Sketch {
         Sketch {
             rows: std::array::from_fn(|_| vec![0u8; cols / 2].into_boxed_slice()),
             mask: cols - 1,
+            // Born zero, so it is already as decayed as it can get.
+            since: ZEROED_AFTER,
         }
     }
 
@@ -171,6 +182,7 @@ impl Sketch {
         let b = &mut self.rows[row][i >> 1];
         let sh = (i & 1) * 4;
         *b = (*b & !(0xf << sh)) | (v << sh);
+        self.since = 0;
     }
 
     /// The rate estimate `q̂(k)`, in counts since the last halving.
@@ -197,21 +209,34 @@ impl Sketch {
         min + 1
     }
 
-    /// Halve every counter `n` times. Masking with `0x77` after each shift drops the
-    /// bit that would otherwise fall out of the high nibble into the low one.
+    /// Halve every counter `n` times.
+    ///
+    /// Halving a nibble `n` times is one shift and one mask, because the only bits a
+    /// wider shift gets wrong are the `n` that fall out of the high nibble into the low
+    /// one, and `(0x0F >> n) * 0x11` is exactly the pattern that clears them. At
+    /// `ZEROED_AFTER` the mask is zero, so a saturating step needs no special case. Two
+    /// nibbles ride in a byte and eight bytes ride in a word, so this runs a word at a
+    /// time; shifting the word contaminates only the top `n` bits of each nibble, which
+    /// the replicated mask clears just the same.
     fn halve(&mut self, n: u32) {
-        if n == 0 {
+        // Zeroes halve to zeroes. Skipping this is the difference between a node whose
+        // cache is off costing nothing and it walking its whole sketch four times a
+        // second for the life of the process.
+        if n == 0 || self.since >= ZEROED_AFTER {
             return;
         }
+        self.since = self.since.saturating_add(n);
+        let n = n.min(ZEROED_AFTER);
+        let m = (0x0f_u8 >> n) * 0x11;
+        let w = u64::from(m) * 0x0101_0101_0101_0101;
         for row in &mut self.rows {
-            if n >= 4 {
-                row.fill(0);
-            } else {
-                for b in row.iter_mut() {
-                    for _ in 0..n {
-                        *b = (*b >> 1) & 0x77;
-                    }
-                }
+            let mut words = row.chunks_exact_mut(8);
+            for c in &mut words {
+                let v = (u64::from_le_bytes(c.try_into().unwrap()) >> n) & w;
+                c.copy_from_slice(&v.to_le_bytes());
+            }
+            for b in words.into_remainder() {
+                *b = (*b >> n) & m;
             }
         }
     }
@@ -698,8 +723,8 @@ unsafe impl Sync for Cache {}
 /// The cache is entitled to the whole tail, every 4 MiB the layout did not claim,
 /// subject to what `policy.cache_index_bytes` will pay for in slot records. It does not
 /// take it all at open: it starts on `OPEN_SHARE` of the budget and the rebalance hands
-/// out the rest as the classes earn it. A store with no room past its slabs, or a policy
-/// with no target rate, produces a cache with no slots, which declines everything at no
+/// out the rest as the classes earn it. A store with no room past its slabs, or a config
+/// no extent opts into, produces a cache with no slots, which declines everything at no
 /// cost.
 pub fn open(alloc: &'static Allocator, cores: usize) -> &'static Cache {
     let cfg = alloc.config();
@@ -745,7 +770,7 @@ pub fn open(alloc: &'static Allocator, cores: usize) -> &'static Cache {
                 hints: vec![0u8; hints].into_boxed_slice(),
                 hint_mask: hints - 1,
                 stores,
-                decayed: now,
+                decayed: now + phase(c, cores),
                 stats: Stats::default(),
             })
         })
@@ -854,6 +879,18 @@ fn stripe(total: u64, cores: usize, c: usize) -> (u64, u64) {
     let lo = total * c as u64 / cores as u64;
     let hi = total * (c + 1) as u64 / cores as u64;
     (lo, hi - lo)
+}
+
+/// Where in the decay interval core `c` does its halving.
+///
+/// Every core is handed the same start instant and thereafter advances its own clock in
+/// whole `DECAY` steps, so without an offset they all halve on the same boundary and a
+/// node walks `cores` whole sketches at one instant, four times a second. Spreading them
+/// across the interval costs nothing and keeps one core's decay out of the others' way in
+/// the shared cache. The offset is added rather than subtracted so it cannot underflow an
+/// `Instant` on a machine that has only just booted.
+fn phase(c: usize, cores: usize) -> Duration {
+    DECAY * c as u32 / cores.max(1) as u32
 }
 
 impl Cache {
@@ -1577,6 +1614,102 @@ mod tests {
         s.halve(1);
         assert_eq!(s.get(0, 0), 7);
         assert_eq!(s.get(0, 1), 0);
+    }
+
+    #[test]
+    fn halve_matches_repeated_halving() {
+        // One shift and one mask, a word at a time, has to agree with the obvious loop
+        // everywhere, including past the point where a counter has nothing left to give.
+        for n in 0..=6u32 {
+            let (mut fast, mut slow) = (Sketch::new(COLS_MIN), Sketch::new(COLS_MIN));
+            for i in 0..64usize {
+                for r in 0..ROWS {
+                    let v = ((i + r) % 16) as u8;
+                    fast.set(r, i, v);
+                    slow.set(r, i, v);
+                }
+            }
+            fast.halve(n);
+            for row in &mut slow.rows {
+                for b in row.iter_mut() {
+                    for _ in 0..n {
+                        *b = (*b >> 1) & 0x77;
+                    }
+                }
+            }
+            assert_eq!(fast.rows, slow.rows, "n={n}");
+        }
+    }
+
+    #[test]
+    fn a_short_row_still_halves_its_tail() {
+        // Four bytes to a row, so the word loop never runs at all and every counter
+        // has to be reached by the remainder.
+        let mut s = Sketch::new(8);
+        for i in 0..8 {
+            s.set(0, i, (i * 2) as u8);
+        }
+        s.halve(1);
+        for i in 0..8 {
+            assert_eq!(s.get(0, i), i as u8);
+        }
+    }
+
+    #[test]
+    fn a_sketch_nobody_observes_stops_decaying() {
+        let mut s = Sketch::new(COLS_MIN);
+        for _ in 0..100 {
+            s.observe(7);
+        }
+        assert_eq!(s.estimate(7), COUNTER_MAX);
+
+        for i in 1..=ZEROED_AFTER {
+            s.halve(1);
+            assert_eq!(s.since, i);
+        }
+        assert_eq!(s.estimate(7), 0);
+
+        // Provably all zeroes now, so further decay is refused rather than walked. This
+        // is what an idle core, or a whole node whose cache is off, costs.
+        s.halve(1);
+        assert_eq!(s.since, ZEROED_AFTER);
+    }
+
+    #[test]
+    fn a_saturated_key_keeps_decaying() {
+        let mut s = Sketch::new(COLS_MIN);
+        for _ in 0..100 {
+            s.observe(9);
+        }
+        assert_eq!(s.estimate(9), COUNTER_MAX);
+
+        // A key at the ceiling stops raising counters, so the reads keeping it hot no
+        // longer refresh the zero check. Decay must still reach it: the check can only
+        // trip after a full run of halvings, by which point the counter is gone anyway.
+        for _ in 0..8 {
+            s.observe(9);
+        }
+        for want in [7, 3, 1, 0] {
+            s.halve(1);
+            assert_eq!(s.estimate(9), want);
+        }
+    }
+
+    #[test]
+    fn cores_decay_on_their_own_phase() {
+        // Core zero keeps the boundary it would have had, and the rest are spread
+        // across the interval so a node does not walk every sketch it owns at once.
+        let cores = 6;
+        let mut last = Duration::ZERO;
+        for c in 0..cores {
+            let p = phase(c, cores);
+            assert!(p < DECAY, "c={c}");
+            assert!(c == 0 || p > last, "c={c}");
+            last = p;
+        }
+        assert_eq!(phase(0, cores), Duration::ZERO);
+        // One core has nobody to spread away from, and no divisor to trip over.
+        assert_eq!(phase(0, 0), Duration::ZERO);
     }
 
     /// Widening the replica set only ever appends to it.
