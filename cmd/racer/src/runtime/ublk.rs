@@ -10,6 +10,7 @@ use std::path::Path;
 use io_uring::{IoUring, cqueue, opcode, squeue, types};
 
 use super::sys;
+use crate::config::Class;
 
 // --- ioctl encoding ---
 
@@ -37,6 +38,7 @@ const CTRL_SZ: u32 = size_of::<CtrlCmd>() as u32;
 const IO_SZ: u32 = size_of::<IoCmd>() as u32;
 
 const CMD_GET_QUEUE_AFFINITY: u32 = ior(0x01, CTRL_SZ);
+const CMD_GET_DEV_INFO: u32 = ior(0x02, CTRL_SZ);
 const CMD_ADD_DEV: u32 = iowr(0x04, CTRL_SZ);
 const CMD_DEL_DEV: u32 = iowr(0x05, CTRL_SZ);
 const CMD_START_DEV: u32 = iowr(0x06, CTRL_SZ);
@@ -106,12 +108,14 @@ pub(super) struct CtrlCmd {
 }
 
 impl DevInfo {
-    /// A fresh device request: the kernel allocates `dev_id` on ADD_DEV.
-    pub(super) fn new(nr_hw_queues: u16, queue_depth: u16, flags: u64) -> DevInfo {
+    /// A device request at the minor `dev_id`. The node asks for the number rather than
+    /// taking what the kernel hands out: the path is `/dev/ublkb<dev_id>`, and the control
+    /// plane published it before this process started.
+    pub(super) fn new(dev_id: u32, nr_hw_queues: u16, queue_depth: u16, flags: u64) -> DevInfo {
         DevInfo {
             nr_hw_queues,
             queue_depth,
-            dev_id: u32::MAX,
+            dev_id,
             max_io_buf_bytes: super::MAX_IO_BYTES as u32,
             flags,
             ..Default::default()
@@ -174,7 +178,7 @@ impl IoCmd {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ParamBasic {
     pub(super) attrs: u32,
     pub(super) logical_bs_shift: u8,
@@ -188,7 +192,7 @@ pub(super) struct ParamBasic {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ParamDiscard {
     pub(super) discard_alignment: u32,
     pub(super) discard_granularity: u32,
@@ -199,14 +203,14 @@ pub(super) struct ParamDiscard {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ParamDmaAlign {
     pub(super) alignment: u32,
     pub(super) pad: [u8; 4],
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Params {
     pub(super) len: u32,
     pub(super) types: u32,
@@ -228,9 +232,22 @@ const PARAM_TYPE_DMA_ALIGN: u32 = 1 << 4;
 const ATTR_FUA: u32 = 1 << 3;
 
 /// Device parameters: 4 KiB logical blocks, discard advertised, write-zeroes emulated as
-/// writes. `max_sectors` and `chunk_sectors` are one allocator page: requests fit a page.
-pub(super) fn params_for(size_bytes: u64, huge: bool) -> Params {
+/// writes.
+///
+/// Transfer limits follow the allocator pages behind the device. With one page size,
+/// `max_sectors` and `chunk_sectors` are that page, so the block layer hands over one
+/// whole page at a time and never straddles two. A device built from both cannot state a
+/// single alignment, so it takes the largest transfer and no chunk at all, and the
+/// consumer path cuts each request on the pages it actually crosses. Discard is a page as
+/// well, except when mixed: a granularity of 4 MiB would swallow every 4 KiB trim, so the
+/// smaller one is advertised and a partial trim of a 4 MiB page is refused instead.
+pub(super) fn params_for(size_bytes: u64, class: Class) -> Params {
+    let huge = class == Class::Huge;
     let page_sectors: u32 = if huge { 8192 } else { 8 };
+    let (max_sectors, chunk_sectors) = match class {
+        Class::Mixed => (8192, 0),
+        _ => (page_sectors, page_sectors),
+    };
     Params {
         len: size_of::<Params>() as u32,
         types: PARAM_TYPE_BASIC | PARAM_TYPE_DISCARD | PARAM_TYPE_DMA_ALIGN,
@@ -240,15 +257,15 @@ pub(super) fn params_for(size_bytes: u64, huge: bool) -> Params {
             physical_bs_shift: 12,
             io_opt_shift: if huge { 22 } else { 12 },
             io_min_shift: 12,
-            max_sectors: page_sectors,
-            chunk_sectors: page_sectors,
+            max_sectors,
+            chunk_sectors,
             dev_sectors: size_bytes / 512,
             virt_boundary_mask: 0,
         },
         discard: ParamDiscard {
             discard_alignment: 0,
             discard_granularity: page_sectors * 512,
-            max_discard_sectors: page_sectors,
+            max_discard_sectors: max_sectors,
             max_write_zeroes_sectors: 0,
             max_discard_segments: 1,
             reserved0: 0,
@@ -428,6 +445,21 @@ impl Control {
             ..Default::default()
         };
         self.exec(CMD_DEL_DEV, &cmd).map(|_| ())
+    }
+
+    /// What the kernel holds at `dev_id`, whoever put it there. `ENODEV` if the minor is
+    /// free.
+    pub(super) fn dev_info(&mut self, dev_id: u32) -> io::Result<DevInfo> {
+        let mut info = DevInfo::default();
+        let cmd = CtrlCmd {
+            dev_id,
+            queue_id: u16::MAX,
+            len: size_of::<DevInfo>() as u16,
+            addr: &mut info as *mut DevInfo as u64,
+            ..Default::default()
+        };
+        self.exec(CMD_GET_DEV_INFO, &cmd)?;
+        Ok(info)
     }
 }
 

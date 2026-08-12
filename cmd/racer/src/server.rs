@@ -12,14 +12,14 @@ use std::time::{Duration, Instant};
 
 use crate::alloc::{self, Allocator, GlobalAddr, Pressure, Status};
 use crate::cache::{self, Cache};
-use crate::config::{self, Config};
+use crate::config::{self, Config, Device};
 use crate::fabric::{self, Frame, Link, Part, status};
 use crate::heal::{self, Heal};
 use crate::layout;
 use crate::metrics;
 use crate::paxos::{self, Page, Paxos, Sink};
 use crate::runtime::{
-    self, Cfg, Configurator, Errno, Export, Handler, Op, PoolBuf, Request, sleep,
+    self, Buf, Cfg, Configurator, Errno, Export, Handler, Op, PoolBuf, Request, sleep,
 };
 
 pub struct Server;
@@ -107,12 +107,15 @@ impl Node {
         // below is a rejected config, so the allocator must still read the running one.
         let mut devices = Vec::new();
         for dev in cfg.devices() {
-            devices.push((dev.id, c.device(dev.id as u64, dev.bytes(), dev.huge)?));
+            let e = c.device(dev.id as u64, dev.id, dev.bytes(), dev.class())?;
+            devices.push((dev.id, e));
         }
-        // Sparse: a fabric device is an address space, not storage. One per universe.
+        // Sparse: a fabric device is an address space, not storage. One per universe, and
+        // the minor is the universe's, not the routing key: peers open it by path.
         let mut universes = Vec::new();
         for u in cfg.universes() {
-            universes.push((u.id, c.fabric(fabric_key(u.id), fabric::DEVICE_SIZE)?));
+            let e = c.fabric(fabric_key(u.id), u.fabric_device_id, fabric::DEVICE_SIZE)?;
+            universes.push((u.id, e));
         }
         let mut links = Vec::new();
         for (universe, p) in cfg.peers() {
@@ -295,16 +298,21 @@ fn sample(d: &Dataplane) {
 
 /// The consumer path: every mutation is a guarded accept, every read a quorum read.
 /// Consensus owns the guard, the ballot and the fan-out, leaving address arithmetic.
+///
+/// A device is a concatenation of whole extents, so its block number becomes an address
+/// here. Nothing else knows the mount order, which lets two hosts mount differently.
+/// Extents carry their own page size, so one request may cross pages of both classes; it
+/// is cut on the pages it covers and each piece is one operation. The whole cut is checked
+/// before any of it runs, so a request that is not serviceable everywhere changes nothing.
 async fn serve(d: &Dataplane, req: Request) -> Result<(), Status> {
     let a = d.alloc();
     let px = d.paxos;
     let cfg = a.config();
     let dev = cfg.device(req.dev as u32).ok_or(Status::Unmapped)?;
-    let huge = dev.huge;
-    // A device is a concatenation of whole extents, so its page number becomes an address
-    // here. Nothing else knows the mount order, which lets two hosts mount differently.
-    let page = if huge { req.lba / 1024 } else { req.lba };
-    let addr = GlobalAddr(dev.map(page).ok_or(Status::Unmapped)?);
+    let mut check = Segments::new(dev, &req);
+    while let Some(s) = check.next() {
+        s?.serviceable(req.op)?;
+    }
 
     // At the low watermark we slow completions instead of failing. The tag stays
     // outstanding, so blk-mq's queue depth bounds what the kernel hands us next.
@@ -312,39 +320,124 @@ async fn serve(d: &Dataplane, req: Request) -> Result<(), Status> {
         sleep(Duration::from_micros(200)).await;
     }
 
-    if huge {
-        let off = (req.lba % 1024) as usize * 4096;
-        match req.op {
-            Op::Read => huge_read(d, addr, off, req).await,
-            Op::Write => {
-                // A partial write would need a read-modify-write, which this class
-                // does not do.
-                if off != 0 || req.buf.len() as u64 != layout::HUGE_PAGE {
-                    return Err(Status::Unmapped);
+    // Sequential: pieces of one request share nothing, but a 4 MiB run of 4 KiB pages is
+    // 1024 rounds, and letting them all go at once would deepen every queue below.
+    let mut segs = Segments::new(dev, &req);
+    while let Some(s) = segs.next() {
+        let s = s?;
+        let addr = GlobalAddr(s.addr);
+        if s.huge {
+            match req.op {
+                Op::Read => huge_read(d, addr, s.off, req.buf.slice(s.at, s.len)).await?,
+                // A partial write would need a read-modify-write, which this class does
+                // not do, and `serviceable` already refused one.
+                Op::Write => px
+                    .write(addr, Page::Huge(req.buf.slice(s.at, s.len)))
+                    .await
+                    .map(drop)?,
+                Op::Discard => px.trim(addr).await?,
+            }
+        } else {
+            match req.op {
+                // Staged through registered memory so the checksum covers stable bytes.
+                Op::Read => {
+                    let mut page = PoolBuf::alloc(4096).await;
+                    match px.read(addr, Sink::Small(&mut page)).await {
+                        Ok(_) => {}
+                        Err(Status::Hole) => page.fill(0),
+                        Err(e) => return Err(e),
+                    }
+                    req.store(s.at, &page).map_err(|_| Status::Io)?;
                 }
-                px.write(addr, Page::Huge(req.buf)).await.map(|_| ())
-            }
-            Op::Discard => px.trim(addr).await,
-        }
-    } else {
-        match req.op {
-            // Staged through registered memory so the checksum covers stable bytes.
-            Op::Read => {
-                let mut page = PoolBuf::alloc(4096).await;
-                match px.read(addr, Sink::Small(&mut page)).await {
-                    Ok(_) => {}
-                    Err(Status::Hole) => page.fill(0),
-                    Err(e) => return Err(e),
+                Op::Write => {
+                    let mut page = PoolBuf::alloc(4096).await;
+                    req.load(s.at, &mut page).map_err(|_| Status::Io)?;
+                    px.write(addr, Page::Small(&page)).await.map(drop)?;
                 }
-                req.store(0, &page).map_err(|_| Status::Io)
+                Op::Discard => px.trim(addr).await?,
             }
-            Op::Write => {
-                let mut page = PoolBuf::alloc(4096).await;
-                req.load(0, &mut page).map_err(|_| Status::Io)?;
-                px.write(addr, Page::Small(&page)).await.map(|_| ())
-            }
-            Op::Discard => px.trim(addr).await,
         }
+    }
+    Ok(())
+}
+
+/// One piece of a request: all of it that falls in a single page.
+struct Seg {
+    /// The page's global address.
+    addr: u64,
+    /// A 4 MiB page.
+    huge: bool,
+    /// Byte offset of this piece within its page.
+    off: usize,
+    /// Byte offset of this piece within the request buffer.
+    at: usize,
+    len: usize,
+}
+
+impl Seg {
+    /// Whether this piece is something the page under it can be asked to do. A 4 MiB page
+    /// is written and trimmed whole or not at all: there is no read-modify-write in that
+    /// class, and a trim frees the whole allocator page whatever range was handed to it.
+    /// Reads are free to take a piece, since a `GET` serves one locally.
+    fn serviceable(&self, op: Op) -> Result<(), Status> {
+        let whole = self.off == 0 && self.len as u64 == layout::HUGE_PAGE;
+        match op {
+            Op::Read => Ok(()),
+            _ if !self.huge || whole => Ok(()),
+            _ => Err(Status::Unmapped),
+        }
+    }
+}
+
+/// Cuts a request into [`Seg`]s. The block layer is told a chunk size only where every
+/// page of the device is the same, so on a mixed device this is the only thing that knows
+/// where the boundaries are.
+struct Segments<'a> {
+    dev: &'a Device,
+    lba: u64,
+    at: usize,
+    len: usize,
+}
+
+impl<'a> Segments<'a> {
+    fn new(dev: &'a Device, req: &Request) -> Segments<'a> {
+        Segments {
+            dev,
+            lba: req.lba,
+            at: 0,
+            len: req.buf.len(),
+        }
+    }
+
+    // Not `Iterator`: it is consumed inside an `async` block, where a `for` over a
+    // fallible iterator would have to collect first.
+    #[allow(clippy::should_implement_trait)]
+    fn next(&mut self) -> Option<Result<Seg, Status>> {
+        if self.at >= self.len {
+            return None;
+        }
+        // A device is addressed in 4 KiB blocks, so anything else is a request the kernel
+        // should never have built out of the geometry we published.
+        if !(self.len - self.at).is_multiple_of(4096) {
+            return Some(Err(Status::Unmapped));
+        }
+        let Some(p) = self.dev.map(self.lba) else {
+            return Some(Err(Status::Unmapped));
+        };
+        // A discard carries no payload to slice: it is a byte range like any other, but
+        // the pages it names are freed whole.
+        let run = (p.run() * 4096) as usize;
+        let len = run.min(self.len - self.at);
+        let seg = Seg {
+            addr: p.addr,
+            huge: p.huge,
+            off: p.byte_off(),
+            at: self.at,
+            len,
+        };
+        self.lba += (len / 4096) as u64;
+        self.at += len;
+        Some(Ok(seg))
     }
 }
 
@@ -354,43 +447,38 @@ async fn serve(d: &Dataplane, req: Request) -> Result<(), Status> {
 /// within its epoch, so it needs no round. A partial read is served locally only: a `GET`
 /// names a page, not a byte range. A cache hit takes a confirming round, run beside the
 /// cached read, so a hit costs one round trip and no 4 MiB page crosses the wire.
-async fn huge_read(
-    d: &Dataplane,
-    addr: GlobalAddr,
-    off: usize,
-    req: Request,
-) -> Result<(), Status> {
+async fn huge_read(d: &Dataplane, addr: GlobalAddr, off: usize, buf: Buf) -> Result<(), Status> {
     let a = d.alloc();
     let px = d.paxos;
     // The cache can only move whole pages: a `GET` has no trailer to carry an offset.
-    let whole = off == 0 && req.buf.len() as u64 == layout::HUGE_PAGE;
+    let whole = off == 0 && buf.len() as u64 == layout::HUGE_PAGE;
     let w = if whole { px.cache_width(addr).await } else { 0 };
-    if px.cached_huge(addr, off, w, req.buf).await {
+    if px.cached_huge(addr, off, w, buf).await {
         return Ok(());
     }
-    let r = match a.read_huge(addr, off, req.buf).await {
+    let r = match a.read_huge(addr, off, buf).await {
         // Not an acceptor, so a local miss says nothing about existence: the bytes live
         // in the group and repair would only heal the members. Whole pages only.
         Err(Status::Hole | Status::Missing) if whole && !px.member_of(addr) => {
-            match px.pull_huge(addr, req.buf).await {
-                Err(Status::Hole) => return a.read_zeroes(req.buf).await,
+            match px.pull_huge(addr, buf).await {
+                Err(Status::Hole) => return a.read_zeroes(buf).await,
                 r => r?,
             }
         }
         Err(Status::Hole | Status::Missing) if px.healable(addr) => {
             px.repair(addr).await?;
-            match a.read_huge(addr, off, req.buf).await {
-                Err(Status::Hole) => return a.read_zeroes(req.buf).await,
+            match a.read_huge(addr, off, buf).await {
+                Err(Status::Hole) => return a.read_zeroes(buf).await,
                 r => r?,
             }
         }
         // A hole reads as zeroes, and we may not touch the guest's pages, so they come
         // from the device's format-time zero region.
-        Err(Status::Hole) => return a.read_zeroes(req.buf).await,
+        Err(Status::Hole) => return a.read_zeroes(buf).await,
         r => r?,
     };
     if whole {
-        px.offer_huge(addr, w, req.buf, r.version).await;
+        px.offer_huge(addr, w, buf, r.version).await;
     }
     Ok(())
 }
@@ -967,7 +1055,9 @@ mod tests {
     /// Devices 1 to 5 each export one extent. Device 6 exports extents 2 and 1 in that
     /// order: a device is an arbitrary ordered set of extents, so the same extent may be
     /// mounted twice at a different offset, and the address resolves to the extent's, not
-    /// the device's.
+    /// the device's. Device 7 puts a 4 KiB extent and a 4 MiB one behind one export, so
+    /// the page size of a request is decided by where in the device it lands. Extent 6 is
+    /// its own so the whole-page fills below do not collide with extent 3's.
     ///
     /// This node is a member of every group; with no peers declared, a group we are not
     /// in has no reachable member. A single node is member index 0 everywhere, so its
@@ -979,7 +1069,7 @@ mod tests {
             "
             generation 1
             node id=1 zone=1 store={} size={DEV_BYTES}
-            universe 1 fabric_device_id=7
+            universe 1 fabric_device_id=8
             group 1 2 3
             group 1 2 3
             group 1 2 3
@@ -994,12 +1084,14 @@ mod tests {
             extent id=3 base=5120 pages=2 kind=immutable_4m zone=1
             extent id=4 base=7168 pages=64 kind=lww zone=2
             extent id=5 base=7232 pages=64 kind=lww zone=1 next_zone=2
+            extent id=6 base=8192 pages=2 kind=immutable_4m zone=1
             device 1 extents=1
             device 2 extents=2
             device 3 extents=3
             device 4 extents=4
             device 5 extents=5
             device 6 extents=2,1
+            device 7 extents=1,6
             ",
             dev.display()
         )
@@ -1144,6 +1236,15 @@ mod tests {
         Ok(b.as_ref().to_vec())
     }
 
+    /// A write of exactly this shape: buffered writeback is free to cut a large write into
+    /// whatever requests it likes, and where a 4 MiB page begins and ends is the point.
+    fn direct_write(p: &Path, off: u64, data: &[u8]) -> std::io::Result<()> {
+        let f = layout::open_direct(p, true)?;
+        let mut b = layout::Aligned::new(data.len());
+        b.as_mut().copy_from_slice(data);
+        layout::write_at(&f, b.as_ref(), off)
+    }
+
     /// One boot, three layers: the block client's view, a peer's view over the fabric, and
     /// a disk gone wrong from both. Needs the real kernel seams, which `sim` replaces.
     #[cfg(not(feature = "sim"))]
@@ -1230,6 +1331,87 @@ mod tests {
         write_at(&mut both_ext, (256 + 8) * 4096, &shared);
         assert_eq!(direct_read(&paths[0], 8 * 4096, 4096).unwrap(), shared);
         drop(both_ext);
+
+        // ---- mixed page sizes: the class belongs to the request, not the device --
+        // Device 7 is extent 1, of 4 KiB pages, followed by extent 6, of 4 MiB ones. Where
+        // a request lands decides what it may be: anything 4 KiB aligned in the head, and
+        // in the tail a read of any part of a page it has but a fill or a trim of the
+        // whole page, since a 4 MiB page is allocated and freed as one.
+        const SEAM: u64 = 4096 * 4096; // extent 1 is 4096 small pages
+        const TAIL: u64 = SEAM + (4 << 20); // the second 4 MiB page of extent 6
+        let mut mixed = open_dev(&paths[6]);
+        assert_eq!(
+            mixed.seek(SeekFrom::End(0)).unwrap(),
+            SEAM + 2 * (4 << 20),
+            "a device is as large as the extents behind it, whatever their pages"
+        );
+
+        // Nothing stops the block layer merging small pages, so a run of them arrives as
+        // one request and becomes one operation each.
+        let run = pattern(0x11, 16 * 4096);
+        write_at(&mut mixed, 100 * 4096, &run);
+        assert_eq!(direct_read(&paths[6], 100 * 4096, 16 * 4096).unwrap(), run);
+        assert_eq!(
+            direct_read(&paths[0], 107 * 4096, 4096).unwrap(),
+            run[7 * 4096..8 * 4096].to_vec(),
+            "the head is extent 1, whichever device reaches it"
+        );
+
+        // The tail is 4 MiB pages: a fill is the whole page or nothing, a read is free.
+        write_at(&mut mixed, SEAM, &huge);
+        assert_eq!(direct_read(&paths[6], SEAM, 4 << 20).unwrap(), huge);
+        assert_eq!(
+            direct_read(&paths[6], SEAM + 8 * 4096, 4096).unwrap(),
+            huge[8 * 4096..9 * 4096].to_vec(),
+            "a read may take any part of a page that is already there"
+        );
+        assert!(
+            direct_write(&paths[6], TAIL, &small).is_err(),
+            "4 KiB fills nothing of a 4 MiB page"
+        );
+        assert!(
+            direct_write(&paths[6], TAIL, &huge[..2 << 20]).is_err(),
+            "and neither does most of one"
+        );
+
+        // A request may cross the seam. Reads compose, because each piece is legal on its
+        // own; a write does not, and is refused whole rather than half applied.
+        let last = pattern(0x22, 4096);
+        write_at(&mut mixed, SEAM - 4096, &last);
+        let seam = direct_read(&paths[6], SEAM - 4096, 2 * 4096).unwrap();
+        assert_eq!(seam[..4096].to_vec(), last);
+        assert_eq!(seam[4096..].to_vec(), huge[..4096].to_vec());
+        assert!(
+            direct_write(&paths[6], SEAM - 4096, &pattern(0x33, 2 * 4096)).is_err(),
+            "a write across the seam would fill a 4 MiB page with 4 KiB"
+        );
+        assert_eq!(
+            direct_read(&paths[6], SEAM - 4096, 4096).unwrap(),
+            last,
+            "and the piece of it that was legal did not land either"
+        );
+
+        // Trim frees the page it names, so in the tail it too is a whole page or nothing.
+        write_at(&mut mixed, TAIL, &huge);
+        let part: [u64; 2] = [TAIL, 4096];
+        assert_ne!(
+            unsafe { libc::ioctl(mixed.as_raw_fd(), 0x1277 /* BLKDISCARD */, part.as_ptr()) },
+            0,
+            "a 4 KiB discard may not free a 4 MiB page"
+        );
+        assert_eq!(
+            direct_read(&paths[6], TAIL, 4096).unwrap(),
+            huge[..4096].to_vec()
+        );
+        let whole: [u64; 2] = [TAIL, 4 << 20];
+        let rc = unsafe { libc::ioctl(mixed.as_raw_fd(), 0x1277, whole.as_ptr()) };
+        assert_eq!(rc, 0, "discard: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            direct_read(&paths[6], TAIL, 4096).unwrap(),
+            vec![0u8; 4096],
+            "a trimmed page reads as one never written"
+        );
+        drop(mixed);
 
         // ---- the fabric, against itself -----------------------------------------
         // The node's own fabric device, opened as if it were a peer's. Everything but the

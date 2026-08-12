@@ -349,61 +349,118 @@ pub(crate) struct Span {
     pub(crate) extent: u32,
     base_lba: u64,
     pages: u64,
+    /// 4 MiB pages, taken from the extent: page size is a property of the span, not of
+    /// the device around it.
+    huge: bool,
+}
+
+impl Span {
+    fn blocks(&self) -> u64 {
+        self.pages * if self.huge { HUGE_BLOCKS } else { 1 }
+    }
+}
+
+/// What page sizes a device is built from, which is all the kernel needs to know about
+/// its shape: it fixes the transfer and discard limits the block layer works to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// 4 KiB pages only, so every request is one page.
+    Small,
+    /// 4 MiB pages only, so the block layer can be told to align to them.
+    Huge,
+    /// Both, so no single alignment holds and the cuts are ours to make.
+    Mixed,
+}
+
+/// Where one block of a device lands: the page holding it, that page's size, and how far
+/// into the page it is. A request is served one page at a time, so this is also where it
+/// gets cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Place {
+    /// The page's global address, which is what consensus names.
+    pub(crate) addr: u64,
+    /// A 4 MiB page: whole-page writes only, and reads may take a piece of it.
+    pub(crate) huge: bool,
+    /// Blocks from the start of the page to this one.
+    pub(crate) off: u64,
+}
+
+impl Place {
+    /// Blocks from this one to the end of its page: the most of a request one operation
+    /// may take.
+    pub(crate) fn run(&self) -> u64 {
+        (if self.huge { HUGE_BLOCKS } else { 1 }) - self.off
+    }
+
+    /// Bytes from the start of the page to this block.
+    pub(crate) fn byte_off(&self) -> usize {
+        (self.off * SMALL_PAGE) as usize
+    }
 }
 
 /// A local ublk block device: an ordered list of whole extents, concatenated. Nothing is
 /// shared: hosts may build different devices from the same extents in different orders,
 /// mount one twice, or not at all. A device may span universes; each page is still reached
 /// over its own universe's fabric.
+///
+/// Page size varies within a device, so everything here counts in 4 KiB blocks, which is
+/// also the logical block size the device is exported with. A 4 MiB extent is 1024 blocks
+/// of one page, not one block.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Device {
     pub(crate) id: u32,
-    /// 4 MiB pages. Uniform across the device, so no request straddles two page sizes.
-    pub(crate) huge: bool,
     spans: Vec<Span>,
-    /// Prefix sums in pages, `spans.len() + 1` long.
+    /// Prefix sums in blocks, `spans.len() + 1` long.
     starts: Vec<u64>,
 }
 
 impl Device {
-    fn new(id: u32, huge: bool, spans: Vec<Span>) -> Device {
+    fn new(id: u32, spans: Vec<Span>) -> Device {
         let mut starts = Vec::with_capacity(spans.len() + 1);
         let mut at = 0;
         starts.push(0);
         for s in &spans {
-            at += s.pages;
+            at += s.blocks();
             starts.push(at);
         }
-        Device {
-            id,
-            huge,
-            spans,
-            starts,
-        }
+        Device { id, spans, starts }
     }
 
-    pub(crate) fn pages(&self) -> u64 {
+    /// Length in 4 KiB blocks.
+    pub(crate) fn blocks(&self) -> u64 {
         self.starts.last().copied().unwrap_or(0)
     }
 
-    pub(crate) fn page_bytes(&self) -> u64 {
-        if self.huge { HUGE_PAGE } else { SMALL_PAGE }
-    }
-
     pub(crate) fn bytes(&self) -> u64 {
-        self.pages() * self.page_bytes()
+        self.blocks() * SMALL_PAGE
     }
 
-    /// The page address `page` of this device stands for, or `None` past the end.
-    pub(crate) fn map(&self, page: u64) -> Option<u64> {
-        if page >= self.pages() {
+    /// The page sizes this device is built from.
+    pub(crate) fn class(&self) -> Class {
+        let huge = self.spans.iter().any(|s| s.huge);
+        let small = self.spans.iter().any(|s| !s.huge);
+        match (huge, small) {
+            (true, true) => Class::Mixed,
+            (true, false) => Class::Huge,
+            // An empty device has no huge page to align to, so it is small by default.
+            (false, _) => Class::Small,
+        }
+    }
+
+    /// Where block `lba` of this device lands, or `None` past the end.
+    pub(crate) fn map(&self, lba: u64) -> Option<Place> {
+        if lba >= self.blocks() {
             return None;
         }
-        let i = self.starts.partition_point(|&s| s <= page) - 1;
+        let i = self.starts.partition_point(|&s| s <= lba) - 1;
         let s = &self.spans[i];
-        let off = page - self.starts[i];
-        let bpp = if self.huge { HUGE_BLOCKS } else { 1 };
-        Some(addr_of(s.universe, s.base_lba + off * bpp))
+        let off = lba - self.starts[i];
+        let bpp = if s.huge { HUGE_BLOCKS } else { 1 };
+        Some(Place {
+            addr: addr_of(s.universe, s.base_lba + off / bpp * bpp),
+            huge: s.huge,
+            off: off % bpp,
+        })
     }
 }
 
@@ -1179,27 +1236,18 @@ impl Config {
         let mut devices = Vec::with_capacity(p.devices.len());
         for d in &p.devices {
             let mut spans = Vec::with_capacity(d.extents.len());
-            let mut huge = None;
             for &id in &d.extents {
                 let (u, e) = find(id)
                     .ok_or_else(|| bad(format!("device {} maps unknown extent {id}", d.id)))?;
-                match huge {
-                    Some(h) if h != e.huge => {
-                        return Err(bad(format!(
-                            "device {} mixes 4 KiB and 4 MiB extents",
-                            d.id
-                        )));
-                    }
-                    _ => huge = Some(e.huge),
-                }
                 spans.push(Span {
                     universe: u.id,
                     extent: e.id,
                     base_lba: e.base_lba,
                     pages: e.pages,
+                    huge: e.huge,
                 });
             }
-            devices.push(Device::new(d.id, huge.unwrap_or(false), spans));
+            devices.push(Device::new(d.id, spans));
         }
         devices.sort_by_key(|d| d.id);
         let policy = p.policy.map(|p| Policy {
@@ -1809,6 +1857,24 @@ device 2 extents=12
         addr_of(u, lba)
     }
 
+    /// The 4 KiB page at `lba`, landed on exactly.
+    fn small(u: u32, lba: u64) -> Place {
+        Place {
+            addr: at(u, lba),
+            huge: false,
+            off: 0,
+        }
+    }
+
+    /// Block `off` of the 4 MiB page based at `lba`.
+    fn huge(u: u32, lba: u64, off: u64) -> Place {
+        Place {
+            addr: at(u, lba),
+            huge: true,
+            off,
+        }
+    }
+
     #[test]
     fn parses_and_validates() {
         let c = sample();
@@ -1833,31 +1899,37 @@ device 2 extents=12
         assert!(c.extent_by_id(99).is_none());
     }
 
-    /// A device concatenates whole extents; its page numbering is its own.
+    /// A device concatenates whole extents; its block numbering is its own.
     #[test]
     fn a_device_concatenates_whole_extents() {
         let c = sample();
         let d = c.devices.iter().find(|d| d.id == 1).unwrap();
-        assert_eq!(d.pages(), 150);
+        assert_eq!(d.blocks(), 150);
         assert_eq!(d.bytes(), 150 * 4096);
-        assert!(!d.huge);
-        assert_eq!(d.map(0), Some(at(1, 0)));
-        assert_eq!(d.map(99), Some(at(1, 99)));
+        assert_eq!(d.class(), Class::Small);
+        assert_eq!(d.map(0), Some(small(1, 0)));
+        assert_eq!(d.map(99), Some(small(1, 99)));
         assert_eq!(
             d.map(100),
-            Some(at(1, 100)),
+            Some(small(1, 100)),
             "the second extent starts here"
         );
-        assert_eq!(d.map(149), Some(at(1, 149)));
+        assert_eq!(d.map(149), Some(small(1, 149)));
         assert_eq!(d.map(150), None);
 
         let h = c.devices.iter().find(|d| d.id == 2).unwrap();
-        assert!(h.huge);
-        assert_eq!(h.pages(), 8);
+        assert_eq!(h.class(), Class::Huge);
+        // Eight 4 MiB pages, addressed in 4 KiB blocks like every other device.
+        assert_eq!(h.blocks(), 8 * 1024);
         assert_eq!(h.bytes(), 8 * (4 << 20));
-        // A 4 MiB page is named by the first of the 1024 blocks it covers.
-        assert_eq!(h.map(1), Some(at(1, 1024 + 1024)));
-        assert_eq!(h.map(8), None);
+        assert_eq!(h.map(0), Some(huge(1, 1024, 0)));
+        assert_eq!(
+            h.map(1),
+            Some(huge(1, 1024, 1)),
+            "still the first page, one block in"
+        );
+        assert_eq!(h.map(1024), Some(huge(1, 1024 + 1024, 0)));
+        assert_eq!(h.map(8 * 1024), None);
     }
 
     /// The same extents may compose into different devices, in any order, and repeat.
@@ -1866,16 +1938,48 @@ device 2 extents=12
         let c = Config::parse(&format!("{SAMPLE}device 3 extents=11,10\n")).unwrap();
         c.validate().unwrap();
         let d = c.devices.iter().find(|d| d.id == 3).unwrap();
-        assert_eq!(d.pages(), 150);
-        assert_eq!(d.map(0), Some(at(1, 100)), "extent 11 is mounted first");
-        assert_eq!(d.map(50), Some(at(1, 0)));
-        assert_eq!(d.map(149), Some(at(1, 99)));
+        assert_eq!(d.blocks(), 150);
+        assert_eq!(d.map(0), Some(small(1, 100)), "extent 11 is mounted first");
+        assert_eq!(d.map(50), Some(small(1, 0)));
+        assert_eq!(d.map(149), Some(small(1, 99)));
     }
 
+    /// Page size belongs to the extent, so a device may hold both. The device is exported
+    /// in 4 KiB blocks either way; what changes is where a request may be cut.
     #[test]
-    fn a_device_is_all_one_page_size() {
-        let e = Config::parse(&format!("{SAMPLE}device 3 extents=10,12\n")).unwrap_err();
-        assert!(format!("{e}").contains("mixes"), "{e}");
+    fn a_device_may_mix_page_sizes() {
+        let c = Config::parse(&format!("{SAMPLE}device 3 extents=10,12,11\n")).unwrap();
+        c.validate().unwrap();
+        let d = c.devices.iter().find(|d| d.id == 3).unwrap();
+        assert_eq!(d.class(), Class::Mixed);
+        assert_eq!(d.blocks(), 100 + 8 * 1024 + 50);
+        assert_eq!(d.bytes(), (100 + 8 * 1024 + 50) * 4096);
+
+        assert_eq!(d.map(99), Some(small(1, 99)), "the last small block");
+        assert_eq!(d.map(100), Some(huge(1, 1024, 0)), "the huge extent starts");
+        assert_eq!(d.map(100 + 1023), Some(huge(1, 1024, 1023)));
+        assert_eq!(d.map(100 + 1024), Some(huge(1, 2048, 0)), "the next page");
+        assert_eq!(
+            d.map(100 + 8 * 1024),
+            Some(small(1, 100)),
+            "back to 4 KiB pages after the huge extent"
+        );
+        assert_eq!(d.map(100 + 8 * 1024 + 49), Some(small(1, 149)));
+        assert_eq!(d.map(100 + 8 * 1024 + 50), None);
+    }
+
+    /// A request may only be served one page at a time, so the run left in the page is
+    /// what tells the consumer path where to cut.
+    #[test]
+    fn a_place_bounds_what_one_operation_may_take() {
+        let c = Config::parse(&format!("{SAMPLE}device 3 extents=10,12\n")).unwrap();
+        let d = c.devices.iter().find(|d| d.id == 3).unwrap();
+        assert_eq!(d.map(0).unwrap().run(), 1, "a 4 KiB page holds one block");
+        assert_eq!(d.map(0).unwrap().byte_off(), 0);
+        assert_eq!(d.map(100).unwrap().run(), 1024);
+        assert_eq!(d.map(100 + 8).unwrap().run(), 1016);
+        assert_eq!(d.map(100 + 8).unwrap().byte_off(), 8 * 4096);
+        assert_eq!(d.map(100 + 1023).unwrap().run(), 1);
     }
 
     #[test]
