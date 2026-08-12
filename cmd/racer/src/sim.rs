@@ -518,6 +518,13 @@ struct NodeState {
     dp: *const (),
     free: Vec<VecDeque<u32>>,
     slots: Vec<Vec<Option<Use>>>,
+    /// Frames a node of another zone has sent this one. Cross-zone traffic is what
+    /// warming exists to remove, so a test measures it rather than a cache counter:
+    /// it is the cost the client actually pays, and it survives a restart of how the
+    /// cache accounts for itself.
+    crossings: u64,
+    /// `WARM` frames this node has been sent, at either stage.
+    warms: u64,
 }
 
 /// A client request's buffer, which must outlive the request, and the node serving it.
@@ -543,8 +550,17 @@ pub struct Options {
     /// The rate the backing device is willing to be driven at, or zero for unmetered.
     pub device_iops: u64,
     /// Whether every node opens every other. `false` keeps only the nodes it shares a
-    /// group with, which is what makes hundreds of nodes affordable.
+    /// group with, plus the gateways of every other zone, which is what makes hundreds
+    /// of nodes affordable.
     pub clique: bool,
+    /// How many zones the nodes are split into. `nodes` must divide evenly by this and
+    /// leave at least three per zone, since a zone's catalog is built from its own
+    /// members. Zone 1 owns every extent; the rest read across the fabric.
+    pub zones: u32,
+    /// Whether zone 1's immutable extent asks the other zones to be kept warm. Needs
+    /// `zones > 1` and `huge_pages > 0` to mean anything, and `cache_admit` non-zero at
+    /// the destination for a warm arrival to be admitted.
+    pub warm: bool,
     /// The peers' maximum data transfer size in bytes, or zero for a transport that
     /// delivers any transfer whole. Must be a multiple of the block size.
     pub mdts: u32,
@@ -562,6 +578,8 @@ impl Default for Options {
             cache_admit: 0,
             device_iops: 0,
             clique: true,
+            zones: 1,
+            warm: false,
             mdts: 0,
             faults: Faults::default(),
         }
@@ -605,6 +623,15 @@ pub struct Sim {
 impl Sim {
     pub fn new(opts: Options) -> std::io::Result<Sim> {
         assert!(opts.nodes >= 3, "consensus needs three nodes");
+        assert!(opts.zones >= 1, "there is always at least one zone");
+        assert!(
+            opts.nodes.is_multiple_of(opts.zones),
+            "zones are homogeneous, so the nodes must divide evenly between them"
+        );
+        assert!(
+            opts.nodes / opts.zones >= 3,
+            "a zone builds its catalog from its own members, so it needs three"
+        );
         assert!(
             (opts.mdts as usize).is_multiple_of(BLOCK),
             "mdts must be a whole number of blocks"
@@ -644,13 +671,15 @@ impl Sim {
             cfg.validate()?;
             // The nodes of a zone are homogeneous, so every one of them plans the same
             // device. A simulation that drifted off that would be exercising a cluster
-            // the schema cannot describe.
-            if let Some(first) = sim.nodes.first() {
+            // the schema cannot describe. Across zones they legitimately differ: a zone
+            // that owns no extent plans nothing and reads everything.
+            if let Some(first) = sim.nodes.iter().find(|n| n.cfg.node.zone == cfg.node.zone) {
                 assert_eq!(
                     (cfg.small_pages(), cfg.huge_pages()),
                     (first.cfg.small_pages(), first.cfg.huge_pages()),
-                    "node {} plans a different store to node 1",
-                    i + 1
+                    "node {} plans a different store to node {}",
+                    i + 1,
+                    first.id
                 );
             }
 
@@ -664,6 +693,8 @@ impl Sim {
                 dp: std::ptr::null(),
                 free: Vec::new(),
                 slots: Vec::new(),
+                crossings: 0,
+                warms: 0,
             });
             sim.boot(i as usize)?;
         }
@@ -672,12 +703,49 @@ impl Sim {
 
     // ---------------------------------------------------------------- topology
 
-    /// Consensus groups: every window of three consecutive nodes, so each node sits in
-    /// three groups and no group repeats a member. One group per node, which is what
-    /// makes the catalog balanced: `3 * n` seats spread three apiece.
-    fn group(&self, g: u32) -> [u32; 3] {
-        let n = self.opts.nodes;
-        [g % n + 1, (g + 1) % n + 1, (g + 2) % n + 1]
+    /// Nodes per zone. Ids are handed out in contiguous blocks, so zone `z` holds
+    /// `(z - 1) * per .. z * per`, one-based.
+    fn per_zone(&self) -> u32 {
+        self.opts.nodes / self.opts.zones
+    }
+
+    fn zone_of(&self, id: u32) -> u32 {
+        (id - 1) / self.per_zone() + 1
+    }
+
+    /// The nodes of `zone`, in id order.
+    fn zone_nodes(&self, zone: u32) -> Vec<u32> {
+        let per = self.per_zone();
+        ((zone - 1) * per + 1..=zone * per).collect()
+    }
+
+    /// Consensus groups of one zone: every window of three consecutive members of that
+    /// zone, so each sits in three groups and no group repeats a member. One group per
+    /// member, which is what makes the catalog balanced: `3 * k` seats spread three
+    /// apiece.
+    ///
+    /// Every column of this catalog therefore contains every node of the zone, which is
+    /// why the simulator gives every node cohort zero: the cohort is the catalog column,
+    /// and here all three columns are the same set. A warm push consequently places one
+    /// copy per zone rather than three, and every reader in that zone agrees on which
+    /// node holds it, which is the property that matters. Three genuinely disjoint
+    /// cohorts are covered by the config unit tests instead.
+    fn group(&self, zone: u32, g: u32) -> [u32; 3] {
+        let m = self.zone_nodes(zone);
+        let k = m.len() as u32;
+        [
+            m[(g % k) as usize],
+            m[((g + 1) % k) as usize],
+            m[((g + 2) % k) as usize],
+        ]
+    }
+
+    /// The nodes of `zone` that answer for traffic from outside it. Three is enough to
+    /// exercise the ring's fall-through without making the peer set quadratic.
+    fn gateways_of(&self, zone: u32) -> Vec<u32> {
+        let mut m = self.zone_nodes(zone);
+        m.truncate(3);
+        m
     }
 
     fn peers_of(&self, id: u32) -> Vec<u32> {
@@ -685,13 +753,19 @@ impl Sim {
         if self.opts.clique {
             return (1..=n).filter(|&p| p != id).collect();
         }
-        // Only the nodes this one shares a group with: a clique is O(n²) links, and
-        // every link is a registered device.
+        // Only the nodes this one shares a group with, plus the way out of its own zone:
+        // a clique is O(n²) links, and every link is a registered device.
+        let zone = self.zone_of(id);
         let mut out = BTreeSet::new();
-        for g in 0..n {
-            let m = self.group(g);
+        for g in 0..self.per_zone() {
+            let m = self.group(zone, g);
             if m.contains(&id) {
                 out.extend(m.iter().copied().filter(|&p| p != id));
+            }
+        }
+        for z in 1..=self.opts.zones {
+            if z != zone {
+                out.extend(self.gateways_of(z));
             }
         }
         out.into_iter().collect()
@@ -701,8 +775,9 @@ impl Sim {
         let o = &self.opts;
         let mut t = String::new();
         t.push_str("generation 1\n");
+        let zone = self.zone_of(id);
         t.push_str(&format!(
-            "node id={id} zone=1 cohort=0 store=/sim/n{id}/store size={STORE_BYTES} max_iops={}\n",
+            "node id={id} zone={zone} cohort=0 store=/sim/n{id}/store size={STORE_BYTES} max_iops={}\n",
             o.device_iops
         ));
         // The index ceiling is a real check; give it room for the extents we declare.
@@ -715,18 +790,34 @@ impl Sim {
         for p in self.peers_of(id) {
             t.push_str(&format!("peer id={p} device=/sim/n{p}/fabric\n"));
         }
-        for g in 0..o.nodes {
-            let m = self.group(g);
+        // A catalog describes this node's own zone and no other.
+        for g in 0..self.per_zone() {
+            let m = self.group(zone, g);
             t.push_str(&format!("group {} {} {}\n", m[0], m[1], m[2]));
         }
+        for z in 1..=o.zones {
+            if z != zone {
+                let gw: Vec<String> = self.gateways_of(z).iter().map(u32::to_string).collect();
+                t.push_str(&format!("zone id={z} gateways={}\n", gw.join(",")));
+            }
+        }
+        // Every extent is homed in zone 1. The other zones map the same devices, so a
+        // read there is a cross-zone read of the same page.
         t.push_str(&format!(
             "extent id=1 base={SMALL_BASE} pages={} kind=lww zone=1 cache_admit={}\n",
             o.pages, o.cache_admit
         ));
         t.push_str(&format!("device {SMALL} extents=1\n"));
         if o.huge_pages > 0 {
+            let warm: String = match o.warm {
+                true if o.zones > 1 => {
+                    let z: Vec<String> = (2..=o.zones).map(|z| z.to_string()).collect();
+                    format!(" warm_zones={}", z.join(","))
+                }
+                _ => String::new(),
+            };
             t.push_str(&format!(
-                "extent id=2 base={} pages={} kind=immutable_4m zone=1 cache_admit={}\n",
+                "extent id=2 base={} pages={} kind=immutable_4m zone=1 cache_admit={}{warm}\n",
                 huge_base(o.pages),
                 o.huge_pages,
                 o.cache_admit
@@ -840,6 +931,21 @@ impl Sim {
         let path = self.nodes[node].cfg.node.store.as_path();
         let dev = *self.s.paths.borrow().get(path).expect("store device");
         self.s.devs.borrow()[dev as usize].ops
+    }
+
+    /// Frames this node has been sent from a node in another zone since boot.
+    ///
+    /// The point of warming is that a reader in a consuming zone stops crossing to the
+    /// home zone, so the honest measure is how much crossing there is. Counted at
+    /// delivery, which is where the simulator plays the transport.
+    pub fn crossings(&self, node: usize) -> u64 {
+        self.nodes[node].crossings
+    }
+
+    /// `WARM` frames this node has been sent since boot, counting both the one a
+    /// writing zone sends its gateway and the one that gateway relays to a holder.
+    pub fn warms(&self, node: usize) -> u64 {
+        self.nodes[node].warms
     }
 
     /// Damage the persisted bytes of one replica of a small page. `replica` is a
@@ -1333,6 +1439,17 @@ impl Sim {
                 self.s.at(LATENCY_US, e);
             }
             return;
+        }
+        // Counted here rather than at submission: this is the point the frame is
+        // certainly being served, so a delivery the simulator retried for want of a
+        // slot is counted once.
+        if self.zone_of(from.node) != self.zone_of(to) {
+            self.nodes[i].crossings += 1;
+        }
+        if let Ok((f, _)) = crate::fabric::Frame::decode(lba, len as usize)
+            && f.op == crate::fabric::Op::Warm
+        {
+            self.nodes[i].warms += 1;
         }
         let op = if read { Op::Read } else { Op::Write };
         // The wire is read out of the sender's buffer now, at the instant the transport

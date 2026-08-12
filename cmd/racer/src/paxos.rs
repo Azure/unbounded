@@ -41,11 +41,25 @@ const T_EXTENT: usize = 2;
 const T_WIDTH: usize = 3;
 /// `LEARN` must validate or replace an equal-register small page.
 const T_REPAIR: usize = 3;
+/// How far a `WARM` has come. Shares `LEARN`'s slot 2, which names a source there too.
+const T_STAGE: usize = 2;
+
+/// A `WARM` straight from the zone that wrote the page, arriving at a gateway of a zone
+/// the extent asks to keep warm. The gateway resolves the cohort and relays.
+const WARM_INBOUND: u64 = 0;
+/// A `WARM` relayed by our own gateway to the cohort member that will hold the copy.
+const WARM_HOLDER: u64 = 1;
 
 /// How many times a LWW proposal re-derives its guard before giving up. A mismatch is
 /// retried here rather than reported, so the client only ever sees last-write-wins;
 /// the bound keeps a pathologically hot page from spinning.
 const LWW_RETRIES: u32 = 4;
+
+/// How many of a zone's gateways one operation will try before calling the zone
+/// unavailable. Each try costs the fabric's full timeout, so the bound is what keeps a
+/// zone that is genuinely gone from stalling a request for the length of its gateway
+/// list; three is a quorum's worth of evidence.
+const GATEWAY_TRIES: usize = 3;
 
 /// The `T_GUARD` value that means "you derive it". Sent by a non-member forwarding a
 /// LWW write, which has no observation of its own to guard on.
@@ -207,6 +221,21 @@ pub struct Stats {
     pub learn_stale: u64,
     pub seals: u64,
     pub groups_unavailable: u64,
+    /// Cross-zone operations that fell through to a lower-ranked gateway because the
+    /// one the ring named did not answer. Retries, not failures: the operation went on
+    /// to succeed or to get a verdict from the far zone.
+    pub gateway_retries: u64,
+    /// Cross-zone operations abandoned because no gateway of the target zone answered,
+    /// or because we hold a link to none of them.
+    pub zones_unavailable: u64,
+    /// `WARM` frames sent toward a zone an extent asks to keep warm.
+    pub warms_sent: u64,
+    /// `WARM` frames this node acted on, either by relaying to the cohort winners or by
+    /// pulling the page into its own cache.
+    pub warms_taken: u64,
+    /// `WARM` frames dropped without being acted on: no core capacity, allocator
+    /// pressure, a cache that declined, or a pull that did not land.
+    pub warms_dropped: u64,
 }
 
 /// Consensus state for the groups that hash to this core. No locks and nothing shared:
@@ -390,7 +419,8 @@ impl Paxos {
         // Homed elsewhere: pass it toward that place, which resolves the group itself.
         // The frame is unchanged, so this is the same forward as any other.
         if !self.local_for(op, addr) {
-            return self.away(addr).ok().flatten().map(|r| r.link);
+            let z = self.away(addr).ok().flatten()?;
+            return self.toward(z, addr).ok().map(|r| r.link);
         }
         let m = self.members(self.group(addr))?;
         match imm {
@@ -439,42 +469,128 @@ impl Paxos {
         !self.foreign(addr) || (op == Op::Learn && self.inbound(addr).is_some())
     }
 
-    /// The route out of this zone, if `addr` is not homed here.
+    /// The zone to send `addr` to, if it is not homed here.
     ///
-    /// We resolve only the zone and express it by which peer we send to; the entry node
-    /// holds that zone's catalog and does the rest. `imm` is zero because we cannot name
-    /// a member, and the budget is two: one hop to reach a member, one spare for a shard
-    /// mid-migration at the far end.
+    /// We resolve only the zone and express it by which peer we send to; the gateway we
+    /// reach holds that zone's catalog and does the rest. `imm` is zero on the way out
+    /// because we cannot name a member, and the budget is two: one hop to reach a
+    /// member, one spare for a shard mid-migration at the far end.
     ///
     /// A foreign address we cannot route is an error rather than a fallback: resolving
     /// it against our own catalog would name a group in the wrong zone.
-    fn away(&self, addr: GlobalAddr) -> Result<Option<Route<'_>>, Status> {
+    fn away(&self, addr: GlobalAddr) -> Result<Option<u32>, Status> {
         if !self.foreign(addr) {
             return Ok(None);
         }
-        let zone = self
-            .alloc
+        self.alloc
             .config()
             .zone_of(addr.0)
-            .ok_or(Status::Unmapped)?;
-        self.toward(zone, addr).map(Some)
+            .ok_or(Status::Unmapped)
+            .map(Some)
     }
 
-    /// A route into `zone`, through the entry node that zone's directory names for this
-    /// address. Two hops: one to reach a member of the group, one spare for a shard the
-    /// far side is in the middle of handing on.
+    /// Routes into `zone` for `addr`, best-ranked gateway first.
+    ///
+    /// The zone publishes a list of gateways rather than one node per cohort, and the
+    /// ring over it is the same rendezvous hash the cache uses, so every sender picks
+    /// the same order for the same address without negotiating and the load spreads by
+    /// address rather than by sender.
+    ///
+    /// Unlike the cache's ring this one *promotes*: a gateway we hold no link to is
+    /// skipped and the next takes its place, rather than the address having nowhere to
+    /// go. That is sound because any gateway resolves any address of its zone - it
+    /// holds the whole catalog - so the ring is load spreading and not placement, and
+    /// two senders disagreeing about which gateway is up costs nothing.
+    ///
+    /// Capped at [`GATEWAY_TRIES`]: a zone that is genuinely gone should be reported
+    /// as such after a bounded wait, not after a walk of every gateway it declares.
+    fn gateways(&self, zone: u32, addr: GlobalAddr) -> Vec<Route<'_>> {
+        let cfg = self.alloc.config();
+        let mut out = Vec::new();
+        for g in cfg.gateways_for(zone, addr.0) {
+            let Some(link) = self.link_of(addr.universe(), g) else {
+                continue;
+            };
+            out.push(Route {
+                link,
+                hops: 2,
+                imm: 0,
+            });
+            if out.len() == GATEWAY_TRIES {
+                break;
+            }
+        }
+        out
+    }
+
+    /// A route into `zone`, through the best-ranked gateway we hold a link to. Two
+    /// hops: one to reach a member of the group, one spare for a shard the far side is
+    /// in the middle of handing on.
+    ///
+    /// One shot, for the paths that cannot retry - a relay owns no buffer it could send
+    /// twice. Everything that can retry goes through [`Self::via`].
     fn toward(&self, zone: u32, addr: GlobalAddr) -> Result<Route<'_>, Status> {
-        let entry = self
-            .alloc
-            .config()
-            .entry_of(zone, addr.0)
-            .ok_or(Status::Unmapped)?;
-        let link = self.link_of(addr.universe(), entry).ok_or(Status::Io)?;
-        Ok(Route {
-            link,
-            hops: 2,
-            imm: 0,
-        })
+        self.gateways(zone, addr)
+            .into_iter()
+            .next()
+            .ok_or(Status::Io)
+    }
+
+    /// Run `send` against `zone`'s gateways in ring order until one answers.
+    ///
+    /// A gateway that does not answer is not the zone's answer, exactly as a member
+    /// that does not answer is not the group's: the next gateway is tried, and only a
+    /// zone with nobody home is unavailable. Anything other than a transport failure is
+    /// the far zone's verdict and is returned as it stands.
+    async fn via<'a, S, F, T>(
+        &'a self,
+        zone: u32,
+        addr: GlobalAddr,
+        mut send: S,
+    ) -> Result<T, Status>
+    where
+        S: FnMut(Route<'a>) -> F,
+        F: Future<Output = Result<T, Status>>,
+    {
+        let routes = self.gateways(zone, addr);
+        if routes.is_empty() {
+            self.stat(|s| s.zones_unavailable += 1);
+            return Err(Status::Io);
+        }
+        let last = routes.len() - 1;
+        for (i, r) in routes.into_iter().enumerate() {
+            match send(r).await {
+                Err(Status::Io) if i < last => self.stat(|s| s.gateway_retries += 1),
+                r => return r,
+            }
+        }
+        self.stat(|s| s.zones_unavailable += 1);
+        Err(Status::Io)
+    }
+
+    /// [`Self::via`] for a read: the sink cannot be moved into a closure, so the ring is
+    /// walked here instead. A gateway that does not answer is retried against the next;
+    /// a page the far zone refuses is the far zone's answer and is returned.
+    async fn pull_away(
+        &self,
+        zone: u32,
+        addr: GlobalAddr,
+        mut sink: Sink<'_>,
+    ) -> Result<Register, Status> {
+        let routes = self.gateways(zone, addr);
+        if routes.is_empty() {
+            self.stat(|s| s.zones_unavailable += 1);
+            return Err(Status::Io);
+        }
+        let last = routes.len() - 1;
+        for (i, r) in routes.into_iter().enumerate() {
+            match self.pull_from(r, addr, sink.reborrow()).await {
+                Err(Status::Io) if i < last => self.stat(|s| s.gateway_retries += 1),
+                r => return r,
+            }
+        }
+        self.stat(|s| s.zones_unavailable += 1);
+        Err(Status::Io)
     }
 
     /// Whether this page has a peer that could heal it. Everything that escalates a miss
@@ -538,10 +654,13 @@ impl Paxos {
         page: Page<'_>,
     ) -> Result<u64, Status> {
         // An address homed in another zone is not in our slot table, so there is no
-        // group here to resolve. The entry node resolves it and the member it reaches
+        // group here to resolve. The gateway resolves it and the member it reaches
         // proposes, exactly as the close member does at home.
-        if let Some(r) = self.away(addr)? {
-            self.send_accept(r, addr, guard, Ballot::ZERO, page).await?;
+        if let Some(z) = self.away(addr)? {
+            self.via(z, addr, |r| {
+                self.send_accept(r, addr, guard, Ballot::ZERO, page)
+            })
+            .await?;
             return Ok(guard.map_or(0, |g| g + 1));
         }
         let group = self.group(addr);
@@ -549,8 +668,10 @@ impl Paxos {
             Gate::Serve { replaying } => replaying,
             // Sealed here and the config has not caught up: hand it to the destination.
             Gate::Away(z) => {
-                let r = self.toward(z, addr)?;
-                self.send_accept(r, addr, guard, Ballot::ZERO, page).await?;
+                self.via(z, addr, |r| {
+                    self.send_accept(r, addr, guard, Ballot::ZERO, page)
+                })
+                .await?;
                 return Ok(guard.map_or(0, |g| g + 1));
             }
         };
@@ -621,16 +742,18 @@ impl Paxos {
         let epoch = self.alloc.config().tombstone_epoch_of(addr.0);
         // A live page sits at `3e + 1`; that is what a trim guards on.
         let guard = 3 * epoch + 1;
-        // Homed elsewhere: the entry node resolves the group.
-        if let Some(r) = self.away(addr)? {
-            return self.send_trim(r, addr, guard, Ballot::ZERO).await;
+        // Homed elsewhere: the gateway resolves the group.
+        if let Some(z) = self.away(addr)? {
+            return self
+                .via(z, addr, |r| self.send_trim(r, addr, guard, Ballot::ZERO))
+                .await;
         }
         let group = self.group(addr);
         let replaying = match self.gate(addr, group).await? {
             Gate::Serve { replaying } => replaying,
             Gate::Away(z) => {
                 return self
-                    .send_trim(self.toward(z, addr)?, addr, guard, Ballot::ZERO)
+                    .via(z, addr, |r| self.send_trim(r, addr, guard, Ballot::ZERO))
                     .await;
             }
         };
@@ -741,6 +864,10 @@ impl Paxos {
                     s.one_shot += 1;
                     s.accept_ok += 1;
                 });
+                // The value is chosen, so the zones that asked to keep this extent warm
+                // can be told. Detached and after the decision: warming is an
+                // optimisation, and a write must not wait on another zone to answer it.
+                self.fan_warm(addr, guard + 1);
                 Ok(guard + 1)
             }
             Err(e) => {
@@ -1071,11 +1198,14 @@ impl Paxos {
         addr: GlobalAddr,
         mut sink: Sink<'_>,
     ) -> Result<Register, Status> {
-        // Homed in another zone: the entry node resolves the group and the member it
+        // Homed in another zone: the gateway resolves the group and the member it
         // reaches runs the round, so this costs one round trip rather than three and
         // the metadata legs stay inside the zone that owns the page.
-        if let Some(r) = self.away(addr)? {
-            return self.pull_from(r, addr, sink).await;
+        if let Some(z) = self.away(addr)? {
+            if let Some(r) = self.warmed_leg(addr, sink.reborrow()).await {
+                return Ok(r);
+            }
+            return self.pull_away(z, addr, sink).await;
         }
         let group = self.group(addr);
         let m = self.members(group).ok_or(Status::Unmapped)?;
@@ -1154,6 +1284,36 @@ impl Paxos {
                     return Err(Status::Hole);
                 }
                 self.pull_best(addr, &m, me, best, sink).await
+            }
+        }
+    }
+
+    /// The cross-zone read's cache leg: our own copy, or a cohort peer's.
+    ///
+    /// `None` unless the extent named this zone in `warm_zones`, so nothing about an
+    /// ordinary cross-zone read changes: a page nobody warmed is not looked for.
+    ///
+    /// No confirmation round, which is the whole point - confirming would cost the
+    /// fabric crossing this exists to avoid. It is sound because only an immutable
+    /// extent may be warmed: the cache filters on the extent's live version, which is a
+    /// function of the tombstone epoch, so an entry either carries the value or is
+    /// recognisably not it. A trim, or an epoch advance, invalidates every copy in
+    /// every zone at once and without a message.
+    ///
+    /// Width one: the warm placed exactly one copy per cohort, at the rendezvous winner
+    /// of each column, which is where `holds` and `replica` look at width one.
+    async fn warmed_leg(&'static self, addr: GlobalAddr, sink: Sink<'_>) -> Option<Register> {
+        if !self.alloc.config().warmed_here(addr.0) {
+            return None;
+        }
+        match sink {
+            Sink::Huge(buf) => self.cached_huge_leg(addr, 0, 1, buf).await,
+            Sink::Small(_) => {
+                let (_, huge) = self.alloc.kind_of(addr).ok()?;
+                if self.cache.holds(addr, 1) {
+                    return self.cache.load_immutable(addr, huge, 0, sink.buf()).await;
+                }
+                self.cached_leg(addr, 1, sink).await
             }
         }
     }
@@ -1253,6 +1413,14 @@ impl Paxos {
     /// quorum-confirmed value is ever admitted (see [`Self::offer_huge`]), and at one
     /// version there is exactly one such value.
     pub async fn cached_huge(&'static self, addr: GlobalAddr, off: usize, w: u8, buf: Buf) -> bool {
+        // An address homed in another zone resolves to no group here — our catalog
+        // describes our own zone and nothing else — so the confirmation round below
+        // would ask the wrong three nodes, disbelieve a perfectly good entry, and
+        // evict it. A warmed extent is read through [`Self::warmed_leg`] instead,
+        // which needs no confirmation because only an immutable extent may be warmed.
+        if self.foreign(addr) {
+            return false;
+        }
         let Some(m) = self.members(self.group(addr)) else {
             return false;
         };
@@ -1397,8 +1565,12 @@ impl Paxos {
     /// what settles the difference, and only an empty register afterwards makes this a
     /// hole the reader may see as zeroes.
     pub async fn pull_huge(&'static self, addr: GlobalAddr, buf: Buf) -> Result<Register, Status> {
-        if let Some(r) = self.away(addr)? {
-            return self.pull_from(r, addr, Sink::Huge(buf)).await;
+        if let Some(z) = self.away(addr)? {
+            let mut sink = Sink::Huge(buf);
+            if let Some(r) = self.warmed_leg(addr, sink.reborrow()).await {
+                return Ok(r);
+            }
+            return self.pull_away(z, addr, sink).await;
         }
         let m = self.members(self.group(addr)).ok_or(Status::Unmapped)?;
         let mut sink = Sink::Huge(buf);
@@ -1865,7 +2037,10 @@ impl Paxos {
         }
         let route = match self.inbound(addr) {
             // A migration's bulk stream: the value is in the zone handing the extent
-            // over, and no member of our own group has a copy to name.
+            // over, and no member of our own group has a copy to name. One gateway
+            // only, unlike the client paths: the sweep that drove this `LEARN` will
+            // drive it again next round, so a gateway that timed out costs a retry
+            // interval rather than a lost page.
             Some(z) => self.toward(z, addr)?,
             None => {
                 let m = self.members(group).ok_or(Status::Unmapped)?;
@@ -1946,7 +2121,7 @@ impl Paxos {
         r: Register,
         zone: u32,
     ) -> Result<(), Status> {
-        self.send_learn(self.toward(zone, addr)?, addr, r, 0, false)
+        self.via(zone, addr, |g| self.send_learn(g, addr, r, 0, false))
             .await
     }
 
@@ -2548,6 +2723,189 @@ impl Paxos {
         }
     }
 
+    // ------------------------------------------------------------------- warming
+
+    /// Tell every zone this extent asks to keep warm that `addr` has a new value.
+    ///
+    /// Called from the proposer once the round is decided, so nothing on the write path
+    /// waits: the fan-out is a detached task and its failures are counted, not
+    /// returned. A zone that hears nothing simply reads across the fabric as it always
+    /// did, which is what makes every part of this droppable.
+    ///
+    /// Declines under pressure. A node with no room to cache is a node whose peers
+    /// probably have none either, and a warm arriving into a full store would evict
+    /// something demand actually asked for.
+    fn fan_warm(&'static self, addr: GlobalAddr, version: u64) {
+        let zones: Vec<u32> = {
+            let cfg = self.alloc.config();
+            let z = cfg.warm_zones_of(addr.0);
+            if z.is_empty() {
+                return;
+            }
+            z.to_vec()
+        };
+        if self.cache.shedding() {
+            self.stat(|s| s.warms_dropped += zones.len() as u64);
+            return;
+        }
+        let spawned = runtime::spawn(async move {
+            for z in zones {
+                let sent = self
+                    .via(z, addr, |r| self.send_warm(r, addr, version, WARM_INBOUND))
+                    .await;
+                self.stat(|s| match sent {
+                    Ok(()) => s.warms_sent += 1,
+                    Err(_) => s.warms_dropped += 1,
+                });
+            }
+        });
+        if !spawned {
+            self.stat(|s| s.warms_dropped += 1);
+        }
+    }
+
+    async fn send_warm(
+        &self,
+        route: Route<'_>,
+        addr: GlobalAddr,
+        version: u64,
+        stage: u64,
+    ) -> Result<(), Status> {
+        let (_, huge) = self.alloc.kind_of(addr)?;
+        let f = self.frame(Op::Warm, addr, huge)?;
+        let mut t = PoolBuf::alloc(fabric::BLOCK).await;
+        t.fill(0);
+        fabric::put(&mut t, T_VERSION, version);
+        fabric::put(&mut t, T_STAGE, stage);
+        route.send(f, t.buf()).await
+    }
+
+    /// A `WARM` arriving here, from either stage.
+    ///
+    /// Answers as soon as the frame is understood: the work it starts is detached, so
+    /// the sender's command does not stay open for a fan-out, and at the holder it does
+    /// not stay open for the cross-zone read that follows. Every refusal is `Ok`, since
+    /// declining to warm is not an error the sender could do anything about.
+    ///
+    /// Our own configuration decides, not the sender's: an extent that does not name
+    /// this zone, or that vetoes caching here, is dropped whatever arrived.
+    pub async fn warm(&'static self, addr: GlobalAddr, version: u64, stage: u64) {
+        let (wanted, me, universe) = {
+            let cfg = self.alloc.config();
+            (
+                cfg.warmed_here(addr.0) && cfg.cache_admit_of(addr.0) != 0,
+                cfg.node.id,
+                addr.universe(),
+            )
+        };
+        if !wanted || self.cache.shedding() {
+            self.stat(|s| s.warms_dropped += 1);
+            return;
+        }
+        if stage != WARM_INBOUND {
+            self.take_warm(addr, version);
+            return;
+        }
+        // A gateway holds its whole zone's catalog, so it can name the rendezvous winner
+        // of every cohort column even though its own cache roster is only one of them.
+        // That is why the fan-out is two stages rather than one: the writing zone knows
+        // nothing about this zone's catalog, and each of the three copies must be placed
+        // where a reader of that cohort will look for it.
+        let mut winners = [0u32; 3];
+        {
+            let cfg = self.alloc.config();
+            let Some(u) = cfg.universe(universe) else {
+                self.stat(|s| s.warms_dropped += 1);
+                return;
+            };
+            for (c, w) in winners.iter_mut().enumerate() {
+                *w = u.cohort_winner(addr.0, c).unwrap_or(0);
+            }
+        }
+        self.stat(|s| s.warms_taken += 1);
+        for (i, n) in winners.into_iter().enumerate() {
+            if n == 0 || winners[..i].contains(&n) {
+                continue;
+            }
+            if n == me {
+                self.take_warm(addr, version);
+                continue;
+            }
+            // Intra-zone and addressed to a node rather than a member, so no budget and
+            // no `imm`: the holder is not a member of the page's group, and a frame it
+            // could forward would be forwarded to the wrong place.
+            let Some(link) = self.link_of(universe, n) else {
+                self.stat(|s| s.warms_dropped += 1);
+                continue;
+            };
+            let route = Route {
+                link,
+                hops: 0,
+                imm: 0,
+            };
+            if self
+                .send_warm(route, addr, version, WARM_HOLDER)
+                .await
+                .is_err()
+            {
+                self.stat(|s| s.warms_dropped += 1);
+            }
+        }
+    }
+
+    /// Pull `addr` across the fabric and put it in our cache, detached.
+    ///
+    /// Width one, and no demand estimate: the gateway sent this frame precisely because
+    /// we are the rendezvous winner of our cohort column for this address, so `holds` is
+    /// true by construction and the extent's admission threshold has nothing to measure
+    /// yet. The zero veto is still honoured, in `claim_here` as ever.
+    fn take_warm(&'static self, addr: GlobalAddr, version: u64) {
+        if !runtime::spawn(async move {
+            if self.pull_warm(addr, version).await.is_none() {
+                self.stat(|s| s.warms_dropped += 1);
+            }
+        }) {
+            self.stat(|s| s.warms_dropped += 1);
+        }
+    }
+
+    async fn pull_warm(&'static self, addr: GlobalAddr, version: u64) -> Option<()> {
+        let (_, huge) = self.alloc.kind_of(addr).ok()?;
+        let zone = self.away(addr).ok().flatten()?;
+        // Already here. A warmed extent is immutable, so a cached copy at this version
+        // is the value and there is nothing to replace; this is what makes a repeated
+        // warm - a retried write, or two gateways both relaying - cost one check.
+        if self
+            .cache
+            .peek_immutable(addr, huge)
+            .await
+            .is_some_and(|r| r.version >= version)
+        {
+            return Some(());
+        }
+        if huge {
+            let buf = PoolBuf::alloc(layout::HUGE_PAGE as usize).await;
+            let r = self
+                .pull_away(zone, addr, Sink::Huge(buf.buf()))
+                .await
+                .ok()?;
+            self.cache.admit(addr, true, buf.buf(), r, 1).await;
+        } else {
+            let mut buf = PoolBuf::alloc(fabric::BLOCK).await;
+            let r = self
+                .pull_away(zone, addr, Sink::Small(&mut buf))
+                .await
+                .ok()?;
+            self.cache.admit(addr, false, buf.buf(), r, 1).await;
+        }
+        // Whatever the group agreed on is what we cached, which may be newer than the
+        // version we were told about if the warm raced a later write. The cache filters
+        // on the extent's live version at every read, so an entry that is not the value
+        // is not served.
+        self.stat(|s| s.warms_taken += 1);
+        Some(())
+    }
+
     async fn send_learn(
         &self,
         route: Route<'_>,
@@ -2758,6 +3116,11 @@ pub fn learn_trailer(t: &[u8]) -> (Register, u8, bool) {
         fabric::get(t, T_SOURCE) as u8,
         fabric::get(t, T_REPAIR) != 0,
     )
+}
+
+/// A `WARM` trailer: the version that prompted it, and how far the frame has come.
+pub fn warm_trailer(t: &[u8]) -> (u64, u64) {
+    (fabric::get(t, T_VERSION), fabric::get(t, T_STAGE))
 }
 
 /// A `SEAL` trailer: which extent, and the term the source group sealed it at. The

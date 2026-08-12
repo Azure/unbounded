@@ -194,9 +194,10 @@ message Universe {
   // or it only routes for others.
   repeated Trio catalog = 3;
 
-  // The other zones of this universe, with their entry nodes. Exactly the set an
-  // extent's `zone` and `next_zone` may name besides our own, which keeps this message
-  // O(zones) rather than O(cluster). Must not list our own zone, and ids must be unique.
+  // The other zones of this universe, with their gateway nodes. Exactly the set an
+  // extent's `zone`, `next_zone` and `warm_zones` may name besides our own, which keeps
+  // this message O(zones) rather than O(cluster). Must not list our own zone, and ids
+  // must be unique.
   repeated Zone zones = 4;
 
   // One NVMe link per entry, each to this universe's namespace on the named node. A peer
@@ -233,21 +234,34 @@ message Peer {
   string device = 2;
 }
 
-// Three node ids in cohort order. Position is normative in both of its uses: in a
-// catalog group it is the paxos member index, with quorum 2 of 3, and in a zone it is
-// that cohort's entry node. A permuted trio is a different trio.
+// Three node ids in cohort order. Position is normative: in a catalog group it is the
+// paxos member index, with quorum 2 of 3, and the column is the cooperative-cache
+// cohort. A permuted trio is a different trio.
 message Trio {
   uint32 cohort_0 = 1;
   uint32 cohort_1 = 2;
   uint32 cohort_2 = 3;
 }
 
-// A peer zone of this universe. The sender picks an entry node by hashing the address,
-// so cross-zone load spreads over all three cohorts and both ends agree without
-// negotiating.
+// A peer zone of this universe, and the nodes of it that accept traffic from outside.
+//
+// A sender ranks the gateways by rendezvous hash on the address and takes the highest
+// it holds a link to, so load spreads over the whole set without negotiating and a
+// gateway that is gone is skipped rather than fatal. The set is therefore a capacity
+// and availability knob: widen it to spread cross-zone traffic over more of the zone's
+// edge, and size it so that losing one node still leaves a reachable gateway.
+//
+// Unlike the cooperative cache's ring, this one promotes: a skipped gateway hands its
+// share to the next, because any gateway can resolve any address in its zone and there
+// is no counterparty that has to agree on the choice.
 message Zone {
-  uint32 id    = 1;
-  Trio   entry = 2;
+  uint32 id = 1;
+
+  // Non-empty, non-zero, unique, and not this node. At most 64. At least one must also
+  // appear in this universe's `peers`, since a zone we hold no link into is a zone we
+  // cannot route to; a config that names an unreachable zone is refused rather than
+  // discovered at the first request.
+  repeated uint32 gateways = 2;
 }
 
 // ---- extents ----------------------------------------------------------------------
@@ -340,6 +354,41 @@ message Extent {
   //
   // Changing it is legal on any reload. Dropping to 0 stops admission immediately.
   uint32 cache_admit = 8;
+
+  // Zones whose caches are filled with pages of this extent as they are committed,
+  // rather than on first demand. Read symmetrically by both ends: a node in the home
+  // `zone` pushes toward every zone named here, and a node whose own zone is named is a
+  // warm destination. Each must be a zone this universe knows, and none may be `zone`
+  // or `next_zone`. At most 16.
+  //
+  // This is for pages another zone will certainly read shortly after they are written,
+  // where waiting for the first reader to miss over the WAN is a cost with no upside.
+  // The cooperative cache is otherwise demand-filled, and its first read of a key is
+  // always a miss by construction; warming is how that first miss is paid in advance,
+  // out of the writer's own latency budget rather than the reader's.
+  //
+  // Only an IMMUTABLE or IMMUTABLE_4M extent may name zones here; anything else is
+  // refused. A warmed page is served to a local reader without a confirmation round,
+  // because confirming it would cost the fabric crossing the warming exists to avoid,
+  // and only an immutable page can be believed on sight: its version is a function of
+  // `tombstone_epoch`, so a copy either carries the live version or is recognisably not
+  // the value, and one epoch bump invalidates every zone's copies at once with no
+  // message. A mutable page carries no such self-check, and a remote reader trusting one
+  // would serve bytes its group had already replaced.
+  //
+  // Advisory in every direction. A warm push is a hint that may be dropped at the
+  // source under pressure, lost on the wire, or declined at the destination, and
+  // nothing observes whether it arrived. It never affects correctness: a destination
+  // that was not warmed simply reads across the WAN as it does today.
+  //
+  // `cache_admit` still governs the destination. Zero vetoes warming there as it vetoes
+  // everything else, which is the kill switch. A threshold of `2..=15` is *bypassed*:
+  // it measures demand, and a page that has just been warmed has none yet by definition.
+  //
+  // Costs one page transfer per cohort per named zone on every commit - three WAN
+  // transfers per zone, one landing on each cohort's rendezvous winner there. That is
+  // the price of a write, paid whether or not anyone in that zone ever reads the page.
+  repeated uint32 warm_zones = 9;
 }
 
 enum Kind {

@@ -28,6 +28,15 @@ const HUGE_PAGE: u64 = 4 << 20;
 /// four bits wide (cache.rs), so it never observes a rate above this.
 pub(crate) const CACHE_MAX_ADMIT: u32 = 15;
 
+/// Gateways one zone may name. A bound rather than a shape: the point of the list is
+/// that this message stays `O(zones)` and not `O(cluster)`, and a zone that needs more
+/// than this many nodes taking cross-zone traffic wants more zones.
+const MAX_GATEWAYS: usize = 64;
+
+/// Zones one extent may warm. Each costs a page transfer per cohort on every commit, so
+/// the bound is really a reminder that this multiplies write cost.
+const MAX_WARM_ZONES: usize = 16;
+
 /// Configs the watcher refused. A rejection is not actionable, so it is counted and
 /// dropped; it surfaces as `racer_config_rejected_total` (metrics.rs), an operator's
 /// signal that the control plane is writing a config this node will not take.
@@ -257,6 +266,11 @@ pub(crate) struct Extent {
     /// 1 admits on first sight, and `n` admits once the demand estimate reaches `n`.
     /// Not frozen - a reload may raise or lower it.
     pub(crate) cache_admit: u8,
+    /// Zones whose caches are filled with these pages as they commit, rather than on
+    /// first demand (paxos.rs). Read from both ends: the home zone pushes toward each of
+    /// these, and a node whose own zone appears here is a warm destination. Sorted, and
+    /// never naming `zone` or `next_zone`. Not frozen.
+    pub(crate) warm_zones: Box<[u32]>,
 }
 
 impl Extent {
@@ -300,7 +314,7 @@ pub(crate) struct Universe {
     /// by paxos member index, which is also the cohort column. Balanced: every node it
     /// names holds the same number of groups.
     pub(crate) catalog: Vec<[u32; 3]>,
-    /// The other zones of this universe, with their entry nodes.
+    /// The other zones of this universe, with their gateway nodes.
     zones: Vec<Zone>,
     /// Nodes we hold a link to in this universe. One namespace per entry.
     pub(crate) peers: Vec<Peer>,
@@ -328,11 +342,44 @@ impl Universe {
         zone == ours || self.zones.iter().any(|z| z.id == zone)
     }
 
-    /// The node in `zone` that answers for `addr`, one of three so that entry traffic
-    /// spreads. `None` when the zone is not one we were told about.
-    pub(crate) fn entry_of(&self, zone: u32, addr: u64) -> Option<u32> {
-        let z = self.zones.iter().find(|z| z.id == zone)?;
-        Some(z.entry[(mix(addr) % 3) as usize])
+    /// The nodes of `zone` that accept traffic from outside it. Empty when the zone is
+    /// not one we were told about, which reads the same as having nowhere to send.
+    pub(crate) fn gateways_of(&self, zone: u32) -> &[u32] {
+        match self.zones.iter().find(|z| z.id == zone) {
+            Some(z) => &z.gateways,
+            None => &[],
+        }
+    }
+
+    /// `zone`'s gateways in the order a sender should try them for `addr`: rendezvous on
+    /// the address, so consecutive addresses spread over the whole set, and a sender that
+    /// skips one because it holds no link falls through to the next.
+    ///
+    /// Promotion is safe here in a way it is not for the cache's ring (cache.rs): any
+    /// gateway can resolve any address in its zone, so there is no second party who has
+    /// to arrive at the same answer.
+    pub(crate) fn gateways_for(&self, zone: u32, addr: u64) -> impl Iterator<Item = u32> {
+        ranked(self.gateways_of(zone), addr)
+    }
+
+    /// The node of cohort `c` that a warm copy of `addr` belongs on: the top of this
+    /// zone's cohort `c` under the same rendezvous ranking the cache itself uses.
+    ///
+    /// The catalog column is the cohort, so this is computable for *every* cohort from
+    /// one node's config, which `cache::Roster` is not - a roster projects only the
+    /// column its own node occupies. That asymmetry is the whole reason a warm push
+    /// fans out in two stages: the source zone holds no catalog for the destination, and
+    /// the destination's gateway holds all three of its columns.
+    pub(crate) fn cohort_winner(&self, addr: u64, c: usize) -> Option<u32> {
+        let mut best: Option<(u64, u32)> = None;
+        for g in &self.catalog {
+            let n = *g.get(c)?;
+            let k = (rank(addr, n), n);
+            if best.is_none_or(|b| k > b) {
+                best = Some(k);
+            }
+        }
+        best.map(|(_, n)| n)
     }
 
     /// Pages of one class this universe places in `ours`, counting an extent on its way
@@ -443,12 +490,13 @@ pub(crate) struct Peer {
     pub(crate) device: String,
 }
 
-/// Another zone of a universe, and the entry node of each cohort in it.
+/// Another zone of a universe, and the nodes of it that take traffic from outside.
 #[derive(Clone, Debug, PartialEq)]
 struct Zone {
     id: u32,
-    /// Three entry nodes, one per cohort.
-    entry: [u32; 3],
+    /// Non-empty. Ranked per address rather than indexed, so the count is a capacity
+    /// and availability choice and not a shape the protocol depends on.
+    gateways: Box<[u32]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -625,9 +673,12 @@ impl Config {
             .filter(|&z| z != 0)
     }
 
-    /// The node in `zone` of `addr`'s universe that answers for it.
-    pub(crate) fn entry_of(&self, zone: u32, addr: u64) -> Option<u32> {
-        self.universe_at(addr)?.entry_of(zone, addr)
+    /// `zone`'s gateways in `addr`'s universe, in the order to try them for `addr`.
+    pub(crate) fn gateways_for(&self, zone: u32, addr: u64) -> impl Iterator<Item = u32> {
+        self.universe_at(addr)
+            .map(|u| u.gateways_for(zone, addr))
+            .into_iter()
+            .flatten()
     }
 
     /// The topology epoch of `addr`'s universe. Zero for an address in no universe of
@@ -649,6 +700,23 @@ impl Config {
     /// leaving this node's config stops admission for its pages at once.
     pub(crate) fn cache_admit_of(&self, addr: u64) -> u8 {
         self.extent_at(addr).map_or(0, |e| e.cache_admit)
+    }
+
+    /// The zones `addr`'s extent asks to have warmed as it commits (paxos.rs). Empty for
+    /// an unmapped address, and empty on every node whose zone is not the home zone,
+    /// since only the home zone commits.
+    pub(crate) fn warm_zones_of(&self, addr: u64) -> &[u32] {
+        self.extent_at(addr).map_or(&[][..], |e| &e.warm_zones)
+    }
+
+    /// Whether *our* zone is a warm destination for `addr`.
+    ///
+    /// This is the reader-side half of the same field: it says a page of this extent may
+    /// already be in this zone's cohort caches, so a cross-zone read should look there
+    /// before crossing. False everywhere the extent is not warmed here, which leaves the
+    /// cross-zone read path exactly as it was.
+    pub(crate) fn warmed_here(&self, addr: u64) -> bool {
+        self.warm_zones_of(addr).contains(&self.node.zone)
     }
 
     /// The id of `addr`'s extent, which is what the census is keyed by.
@@ -798,6 +866,41 @@ impl Config {
             if u.zones[..i].iter().any(|o| o.id == z.id) {
                 return Err(bad(format!("universe {id} names zone {} twice", z.id)));
             }
+            // Not checked here: whether we hold a link to any of them. A node may be
+            // told about a zone before the control plane attaches its namespaces, and a
+            // node that only routes may never hold one at all. Both are runtime answers
+            // - the request fails with `EIO`, "routed and unreachable" - rather than a
+            // config this node should refuse to run.
+            if z.gateways.is_empty() {
+                return Err(bad(format!(
+                    "universe {id} zone {} names no gateways, so nothing can reach it",
+                    z.id
+                )));
+            }
+            if z.gateways.len() > MAX_GATEWAYS {
+                return Err(bad(format!(
+                    "universe {id} zone {} names {} gateways, above the {MAX_GATEWAYS} allowed",
+                    z.id,
+                    z.gateways.len()
+                )));
+            }
+            for (j, &g) in z.gateways.iter().enumerate() {
+                if g == 0 {
+                    return Err(bad(format!("universe {id} zone {} names gateway 0", z.id)));
+                }
+                if g == self.node.id {
+                    return Err(bad(format!(
+                        "universe {id} zone {} names this node as one of its gateways",
+                        z.id
+                    )));
+                }
+                if z.gateways[..j].contains(&g) {
+                    return Err(bad(format!(
+                        "universe {id} zone {} names gateway {g} twice",
+                        z.id
+                    )));
+                }
+            }
         }
         for (i, p) in u.peers.iter().enumerate() {
             if p.id == 0 {
@@ -841,6 +944,47 @@ impl Config {
                     "extent {} is migrating to zone {}, which universe {id} does not name",
                     e.id, e.next_zone
                 )));
+            }
+            // A warmed copy is read without a confirmation round, because a cross-zone
+            // confirmation is the round trip the warming exists to avoid. Only an
+            // immutable page can be believed on sight: its version is a function of the
+            // extent's tombstone epoch, so a copy either carries the live version or is
+            // recognisably not the value. A mutable page has no such self-check, and a
+            // remote reader that trusted one could serve bytes the group replaced.
+            if !e.warm_zones.is_empty() && e.kind != Kind::Immutable {
+                return Err(bad(format!(
+                    "extent {} asks to warm other zones, which only an immutable extent may: \
+                     a {:?} page carries no version a remote reader could trust on sight",
+                    e.id, e.kind
+                )));
+            }
+            if e.warm_zones.len() > MAX_WARM_ZONES {
+                return Err(bad(format!(
+                    "extent {} warms {} zones, above the {MAX_WARM_ZONES} allowed",
+                    e.id,
+                    e.warm_zones.len()
+                )));
+            }
+            for (j, &w) in e.warm_zones.iter().enumerate() {
+                if !u.known_zone(w, self.node.zone) {
+                    return Err(bad(format!(
+                        "extent {} warms zone {w}, which universe {id} does not name",
+                        e.id
+                    )));
+                }
+                // Warming the home zone is a contradiction: that zone holds the pages
+                // authoritatively. Warming the destination of a migration is one too -
+                // the migration is already sending every page there, and it is about to
+                // become the home zone.
+                if w == e.zone || w == e.next_zone {
+                    return Err(bad(format!(
+                        "extent {} warms zone {w}, which already holds its pages",
+                        e.id
+                    )));
+                }
+                if e.warm_zones[..j].contains(&w) {
+                    return Err(bad(format!("extent {} warms zone {w} twice", e.id)));
+                }
             }
             if e.huge && e.base_lba % HUGE_BLOCKS != 0 {
                 return Err(bad(format!(
@@ -1032,6 +1176,7 @@ impl Config {
                     next_zone: e.next_zone,
                     tombstone_epoch: e.tombstone_epoch as u64,
                     cache_admit: e.cache_admit as u8,
+                    warm_zones: e.warm_zones.into_boxed_slice(),
                 });
             }
             extents.sort_by_key(|e| e.base_lba);
@@ -1044,7 +1189,7 @@ impl Config {
                     .iter()
                     .map(|z| Zone {
                         id: z.id,
-                        entry: z.entry.as_ref().map(trio).unwrap_or_default(),
+                        gateways: z.gateways.clone().into_boxed_slice(),
                     })
                     .collect(),
                 peers: u
@@ -1154,7 +1299,7 @@ impl Config {
                         .iter()
                         .map(|z| pb::Zone {
                             id: z.id,
-                            entry: Some(pb_trio(&z.entry)),
+                            gateways: z.gateways.to_vec(),
                         })
                         .collect(),
                     peers: u
@@ -1177,6 +1322,7 @@ impl Config {
                             next_zone: e.next_zone,
                             tombstone_epoch: e.tombstone_epoch as u32,
                             cache_admit: e.cache_admit as u32,
+                            warm_zones: e.warm_zones.to_vec(),
                         })
                         .collect(),
                 })
@@ -1207,8 +1353,9 @@ impl Config {
     /// node id=1 zone=1 cohort=0 store=/var/lib/racer/store.img size=68719476736
     /// universe 1 epoch=3
     ///   peer id=2 device=/dev/nvme1n1
+    ///   peer id=4 device=/dev/nvme2n1
     ///   group 1 2 3
-    ///   zone id=2 entry=4,5,6
+    ///   zone id=2 gateways=4,5,6
     ///   extent id=10 base=0    pages=4096 kind=lww zone=1 cache_admit=2
     ///   extent id=11 base=4096 pages=512  kind=occ zone=1
     /// device 1 extents=10,11
@@ -1270,10 +1417,10 @@ impl Config {
                     last(&mut p, key).map_err(at)?.catalog.push(t);
                 }
                 "zone" => {
-                    let f = only(&f, &["id", "entry"]).map_err(at)?;
+                    let f = only(&f, &["id", "gateways"]).map_err(at)?;
                     let z = pb::Zone {
                         id: get(f, "id").map_err(at)? as u32,
-                        entry: Some(list(f, "entry").and_then(as_trio).map_err(at)?),
+                        gateways: list(f, "gateways").map_err(at)?,
                     };
                     last(&mut p, key).map_err(at)?.zones.push(z);
                 }
@@ -1289,6 +1436,7 @@ impl Config {
                             "next_zone",
                             "tombstone_epoch",
                             "cache_admit",
+                            "warm_zones",
                         ],
                     )
                     .map_err(at)?;
@@ -1301,6 +1449,7 @@ impl Config {
                         next_zone: get_or(f, "next_zone", 0).map_err(at)? as u32,
                         tombstone_epoch: get_or(f, "tombstone_epoch", 0).map_err(at)? as u32,
                         cache_admit: get_or(f, "cache_admit", 0).map_err(at)? as u32,
+                        warm_zones: list_or(f, "warm_zones").map_err(at)?,
                     };
                     last(&mut p, key).map_err(at)?.extents.push(e);
                 }
@@ -1377,6 +1526,9 @@ fn ids(rest: &[&str]) -> io::Result<Vec<u32>> {
         .collect()
 }
 
+/// A catalog group, which is the one place three is still the shape: position is the
+/// paxos member index and the cohort column, so "not three" is not a state the model
+/// has to consider.
 fn as_trio(v: Vec<u32>) -> io::Result<pb::Trio> {
     let a: [u32; 3] = v
         .as_slice()
@@ -1431,6 +1583,14 @@ fn list(f: &[(&str, &str)], k: &str) -> io::Result<Vec<u32>> {
         .collect()
 }
 
+/// [`list`], but an absent field is an empty list rather than an error.
+fn list_or(f: &[(&str, &str)], k: &str) -> io::Result<Vec<u32>> {
+    match f.iter().any(|(a, _)| *a == k) {
+        true => list(f, k),
+        false => Ok(Vec::new()),
+    }
+}
+
 /// The group slot an address hashes into. A pure function of the address, so a slot is
 /// a name two zones agree on without either holding the other's slot table.
 fn slot_of(addr: u64) -> u16 {
@@ -1460,6 +1620,41 @@ pub(crate) fn mix(mut x: u64) -> u64 {
     x ^= x >> 33;
     x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     x ^ (x >> 33)
+}
+
+/// The rendezvous score of `node` for `addr`: the one ranking function this crate has.
+///
+/// Independent of how many nodes the caller intends to take, which is what makes every
+/// ring built on it nest - a wider selection appends and never reorders - and what lets
+/// two nodes agree on a placement without exchanging anything. Shared by the cooperative
+/// cache's cohort ring (cache.rs) and a zone's gateway ring, so that "highest ranked" is
+/// one idea rather than two that could drift.
+pub(crate) fn rank(addr: u64, node: u32) -> u64 {
+    mix(addr ^ mix(node as u64))
+}
+
+/// `nodes` in descending rank order for `addr`, lazily.
+///
+/// Selection by successive maximum rather than a sort: the lists this walks are tens of
+/// entries at most and callers usually stop at the first, so this trades an allocation
+/// on every cross-zone operation for a linear scan per item taken. The node id breaks a
+/// score tie, so the order is total and identical everywhere.
+pub(crate) fn ranked(nodes: &[u32], addr: u64) -> impl Iterator<Item = u32> {
+    let mut last: Option<(u64, u32)> = None;
+    std::iter::from_fn(move || {
+        let mut best: Option<(u64, u32)> = None;
+        for &n in nodes {
+            let k = (rank(addr, n), n);
+            if last.is_some_and(|l| k >= l) {
+                continue;
+            }
+            if best.is_none_or(|b| k > b) {
+                best = Some(k);
+            }
+        }
+        last = best;
+        best.map(|(_, n)| n)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,12 +1856,13 @@ node id=1 zone=1 cohort=0 store=/var/lib/racer/store.img size=68719476736
 
 universe 1 epoch=3
   peer id=2 device=/dev/nvme1n1
+  peer id=7 device=/dev/nvme3n1
   group 1 2 3
   group 4 5 6
-  zone id=2 entry=4,5,6
+  zone id=2 gateways=7,8,9,10
   extent id=10 base=0     pages=100 kind=lww           zone=1 cache_admit=3
   extent id=11 base=100   pages=50  kind=occ           zone=1
-  extent id=12 base=1024  pages=8   kind=immutable_4m  zone=1 cache_admit=1
+  extent id=12 base=1024  pages=8   kind=immutable_4m  zone=1 cache_admit=1 warm_zones=2
   extent id=13 base=16384 pages=4   kind=lww           zone=2
 
 device 1 extents=10,11
@@ -1690,7 +1886,7 @@ device 2 extents=12
         assert_eq!(c.node.id, 1);
         assert_eq!(c.node.store, PathBuf::from("/var/lib/racer/store.img"));
         assert_eq!(c.universes.len(), 1);
-        assert_eq!(c.peer_count(), 1);
+        assert_eq!(c.peer_count(), 2);
         assert_eq!(c.extent_count(), 4);
         // 150 small pages and 8 huge ones in our zone, three replicas over six nodes.
         assert_eq!(c.small_pages(), 75);
@@ -1815,10 +2011,10 @@ device 3 extents=20
         // Catalogs are per universe, so a member of one is not a member of the other.
         assert_eq!(c.universe(1).unwrap().zone_nodes(), vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(c.universe(2).unwrap().zone_nodes(), vec![1, 8, 9]);
-        assert_eq!(c.peer_count(), 2);
+        assert_eq!(c.peer_count(), 3);
         assert_eq!(
             c.peers().map(|(u, p)| (u, p.id)).collect::<Vec<_>>(),
-            vec![(1, 2), (2, 9)]
+            vec![(1, 2), (1, 7), (2, 9)]
         );
         // Storage is the sum of our share of each: 75 from universe 1, 100*3/3 from 2.
         assert_eq!(c.small_pages(), 75 + 100);
@@ -1891,18 +2087,202 @@ device 3 extents=20
     }
 
     #[test]
-    fn addresses_resolve_to_a_zone_and_an_entry_node() {
+    fn addresses_resolve_to_a_zone_and_a_gateway() {
         let c = sample();
         assert_eq!(c.zone_of(at(1, 0)), Some(1));
         assert_eq!(c.zone_of(at(1, 16384)), Some(2), "extent 13 is foreign");
         assert_eq!(c.zone_of(at(1, 150)), None);
         assert_eq!(c.epoch_of(at(1, 0)), 3);
 
-        let e = c.entry_of(2, at(1, 16384)).unwrap();
-        assert!([4, 5, 6].contains(&e), "one of zone 2's three entry nodes");
-        assert_eq!(c.entry_of(3, at(1, 0)), None, "zone 3 was never named");
-        // Our own zone has no entry node: we are already in it.
-        assert_eq!(c.entry_of(1, at(1, 0)), None);
+        let ring: Vec<u32> = c.gateways_for(2, at(1, 16384)).collect();
+        assert_eq!(ring.len(), 4, "every gateway is offered, in order");
+        let mut sorted = ring.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![7, 8, 9, 10]);
+
+        assert_eq!(
+            c.gateways_for(3, at(1, 0)).count(),
+            0,
+            "zone 3 was never named"
+        );
+        // Our own zone has no gateways: we are already in it.
+        assert_eq!(c.gateways_for(1, at(1, 0)).count(), 0);
+    }
+
+    /// Unlike the cache's ring, this one promotes: a sender that cannot use the first
+    /// gateway falls through to the second, and every sender sees the same order.
+    #[test]
+    fn the_gateway_ring_spreads_and_falls_through() {
+        let c = sample();
+        let mut first = std::collections::BTreeSet::new();
+        for lba in 16384..16388 {
+            let ring: Vec<u32> = c.gateways_for(2, at(1, lba)).collect();
+            assert_eq!(ring.len(), 4);
+            // A total order: no repeats, and the same address always gives the same one.
+            let uniq: std::collections::BTreeSet<u32> = ring.iter().copied().collect();
+            assert_eq!(uniq.len(), 4);
+            assert_eq!(ring, c.gateways_for(2, at(1, lba)).collect::<Vec<_>>());
+            first.insert(ring[0]);
+        }
+        assert!(
+            first.len() > 1,
+            "consecutive addresses do not all pick one gateway"
+        );
+    }
+
+    /// The order is a function of the address and the ids alone, so a node that holds a
+    /// different subset of links still walks the same sequence.
+    #[test]
+    fn the_gateway_order_is_stable_under_reordering() {
+        let a = ranked(&[7, 8, 9, 10], 42).collect::<Vec<_>>();
+        let b = ranked(&[10, 9, 8, 7], 42).collect::<Vec<_>>();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 4);
+        // Dropping one leaves the rest in the same relative order: the skipped gateway
+        // is replaced by the next, which is what makes the fall-through cheap.
+        let without = ranked(&[7, 9, 10], 42).collect::<Vec<_>>();
+        let expect: Vec<u32> = a.iter().copied().filter(|&n| n != 8).collect();
+        assert_eq!(without, expect);
+    }
+
+    #[test]
+    fn a_zone_names_gateways_that_could_be_nodes() {
+        let bad_zone = |line: &str| {
+            let t = SAMPLE.replace("zone id=2 gateways=7,8,9,10", line);
+            Config::parse(&t).and_then(|c| c.validate())
+        };
+        assert!(bad_zone("zone id=2 gateways=7").is_ok());
+        assert!(
+            bad_zone("zone id=2 gateways=8,9").is_ok(),
+            "a gateway we hold no link to is a runtime answer, not a bad config"
+        );
+        assert!(
+            bad_zone("zone id=2 gateways=0,7").is_err(),
+            "node 0 is not a node"
+        );
+        assert!(bad_zone("zone id=2 gateways=7,7").is_err(), "named twice");
+        assert!(bad_zone("zone id=2 gateways=1,7").is_err(), "that is us");
+        let many: Vec<String> = (7..7 + MAX_GATEWAYS as u32 + 1)
+            .map(|n| n.to_string())
+            .collect();
+        assert!(
+            bad_zone(&format!("zone id=2 gateways={}", many.join(","))).is_err(),
+            "above the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_zone_with_no_gateways_is_refused() {
+        // The parser will not accept an empty list, and neither will validation.
+        let t = SAMPLE.replace("zone id=2 gateways=7,8,9,10", "zone id=2 gateways=");
+        assert!(Config::parse(&t).and_then(|c| c.validate()).is_err());
+    }
+
+    #[test]
+    fn warming_names_zones_that_do_not_already_hold_the_pages() {
+        let warm = |line: &str| {
+            let t = SAMPLE.replace(
+                "extent id=12 base=1024  pages=8   kind=immutable_4m  zone=1 cache_admit=1 warm_zones=2",
+                line,
+            );
+            assert_ne!(t, SAMPLE, "the fixture line moved");
+            Config::parse(&t).and_then(|c| c.validate())
+        };
+        let base = "extent id=12 base=1024 pages=8 kind=immutable_4m zone=1 cache_admit=1";
+        assert!(warm(&format!("{base} warm_zones=2")).is_ok());
+        assert!(warm(base).is_ok(), "warming nobody is the default");
+        assert!(
+            warm(&format!("{base} warm_zones=3")).is_err(),
+            "zone 3 is unknown"
+        );
+        assert!(
+            warm(&format!("{base} warm_zones=1")).is_err(),
+            "that is the home zone"
+        );
+        assert!(
+            warm(&format!("{base} warm_zones=2,2")).is_err(),
+            "named twice"
+        );
+        assert!(
+            warm(&format!("{base} next_zone=2 warm_zones=2")).is_err(),
+            "the destination will hold them outright"
+        );
+        let many: Vec<String> = (2..2 + MAX_WARM_ZONES as u32 + 1)
+            .map(|n| n.to_string())
+            .collect();
+        assert!(
+            warm(&format!("{base} warm_zones={}", many.join(","))).is_err(),
+            "above the ceiling"
+        );
+    }
+
+    /// A warm copy is believed without a confirmation round, which only an immutable
+    /// version can carry.
+    #[test]
+    fn only_an_immutable_extent_may_be_warmed() {
+        for kind in ["lww", "occ"] {
+            let t = SAMPLE.replace(
+                "extent id=10 base=0     pages=100 kind=lww           zone=1 cache_admit=3",
+                &format!(
+                    "extent id=10 base=0 pages=100 kind={kind} zone=1 cache_admit=3 warm_zones=2"
+                ),
+            );
+            assert_ne!(t, SAMPLE, "the fixture line moved");
+            assert!(
+                Config::parse(&t).and_then(|c| c.validate()).is_err(),
+                "{kind} pages carry no version a remote reader could trust"
+            );
+        }
+    }
+
+    #[test]
+    fn warming_is_read_from_both_ends() {
+        let c = sample();
+        // Extent 12 is ours and asks for zone 2 to be warmed.
+        assert_eq!(c.warm_zones_of(at(1, 1024)), &[2]);
+        // We are zone 1, so nothing here is warmed *for us*.
+        assert!(!c.warmed_here(at(1, 1024)));
+        assert!(c.warm_zones_of(at(1, 0)).is_empty());
+        assert!(c.warm_zones_of(at(1, 150)).is_empty(), "unmapped");
+
+        // The same extent, in the file a node of the warmed zone runs: the extent is
+        // still homed in zone 1, and this node's own zone is the one it names.
+        let t = "\
+generation 7
+node id=20 zone=2 cohort=0 store=/var/lib/racer/store.img size=68719476736
+universe 1 epoch=3
+  peer id=21 device=/dev/nvme1n1
+  group 20 21 22
+  zone id=1 gateways=21,22
+  extent id=12 base=1024 pages=8 kind=immutable_4m zone=1 cache_admit=1 warm_zones=2
+device 2 extents=12
+";
+        let c = Config::parse(t).unwrap();
+        c.validate().unwrap();
+        assert!(c.warmed_here(at(1, 1024)), "our zone is named");
+        assert_eq!(c.zone_of(at(1, 1024)), Some(1), "still homed there");
+    }
+
+    /// One node's config names the rendezvous winner of every cohort of its own zone,
+    /// which is what lets a gateway fan a warm out across all three.
+    #[test]
+    fn a_catalog_names_a_winner_in_every_cohort() {
+        let c = sample();
+        let u = c.universe(1).unwrap();
+        // The sample catalog is `1 2 3` and `4 5 6`, so column `c` is `{1+c, 4+c}`.
+        for col in 0..3usize {
+            let w = u.cohort_winner(at(1, 0), col).unwrap();
+            assert!(
+                w == 1 + col as u32 || w == 4 + col as u32,
+                "cohort {col} winner {w} is not in that column"
+            );
+            assert_eq!(w, u.cohort_winner(at(1, 0), col).unwrap(), "stable");
+        }
+        assert_eq!(
+            u.cohort_winner(at(1, 0), 3),
+            None,
+            "there is no fourth cohort"
+        );
     }
 
     #[test]

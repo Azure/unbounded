@@ -34,13 +34,15 @@ It allocates and replicates 4KB and 4MB pages striped across large (100k+ node) 
 
 A universe is one flat, sparse address space measured in 4KB blocks, spanning every node that participates in it. It is also the unit of partitioning: the control plane publishes one NVMe-oF namespace per universe and attaches it only to that universe's members, so a node that was never given the namespace cannot address the universe at all. Nothing on the wire names a universe - the namespace a frame arrives on is the universe - which is what makes the boundary a transport property rather than a check the data plane could get wrong.
 
-Each universe carries its own topology: its own catalog of consensus groups, its own zones and entry nodes, its own peers and its own epoch. A node may belong to several universes at once and shares nothing between them but its store.
+Each universe carries its own topology: its own catalog of consensus groups, its own zones and their gateways, its own peers and its own epoch. A node may belong to several universes at once and shares nothing between them but its store.
 
 ### Zones
 
 Nodes within a particular zone __always__ share a direct connection, typically using RDMA.
-Across zones within a universe, there is no guarantee of direct connectivity - clients may need to jump through an additional neighbor.
+Across zones, every zone can reach every other zone, but not every node can: a zone publishes a list of __gateways__, and traffic for a page homed elsewhere goes to one of that zone's gateways, which resolves the group and forwards. Which gateway is a rendezvous hash of the page address, so load spreads evenly and both ends agree without negotiating; a gateway this node holds no link to is skipped and the next one takes its place.
 These additional hops are actually important: they fan out read capacity for hot pages, since intermediate nodes can cache the values that they proxy.
+
+A consuming zone does not have to wait for a reader to discover a page. An immutable extent may name the zones that will read it, and every commit is followed by an advisory push into each of them: the writing zone tells a gateway there, and that gateway hands the page to the one node per cohort its readers will look on. By the time anyone in that zone reads, the page is already local. Nothing waits on it and nothing depends on it - a warm that is lost costs one ordinary cross-zone read.
 
 Nodes within a zone are __homogeneous__. Every node belongs to the same number of groups, so every node stores the same share of the zone. A node in several universes stores the sum of its shares.
 
@@ -52,7 +54,7 @@ This helps handle cases where hot pages are evicted before a spike in demand, an
 
 ## API
 
-An __extent__ is a range of a universe's address space, placed there by the control plane. It carries its own page kind, its home zone, the zone it is migrating to, and its own tombstone epoch. Extents are the unit of placement, sealing, migration and accounting.
+An __extent__ is a range of a universe's address space, placed there by the control plane. It carries its own page kind, its home zone, the zone it is migrating to, its own tombstone epoch, its cache admission policy, and the zones it wants kept warm. Extents are the unit of placement, sealing, migration and accounting.
 
 A local block __device__ is an ordered list of whole extents, concatenated. Nothing binds an extent to one device: two hosts may map the same extents in different orders and combinations, and the address a page has does not change when they do.
 
