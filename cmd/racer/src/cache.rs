@@ -657,7 +657,7 @@ pub fn open(alloc: &'static Allocator, cores: usize) -> &'static Cache {
     let shards = [Class::Small, Class::Huge].map(|c| alloc.shards_for(c).min(cores).max(1));
 
     let want = plan_chunks(chunks, budget / OPEN_SHARE, cfg);
-    let now = Instant::now();
+    let now = crate::runtime::now();
     let mut next = [0u64, want[0]];
     // Sized from what a core may end up holding, not from what it starts with: both tables are
     // approximations whose error is what they cost, and resizing either would throw away the

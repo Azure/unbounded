@@ -41,6 +41,22 @@ pub(crate) fn sim_slots() -> u32 {
 #[cfg(feature = "sim")]
 pub(crate) use worker::sim::{SimNode, SimWorker};
 
+/// The clock, which under simulation is virtual.
+///
+/// Anything that reads a clock outside a worker's own timing loop has to come through
+/// here. A deadline set on the host clock and expired against virtual time is a
+/// deadline that fires at whatever moment the simulation happens to have reached.
+pub(crate) fn now() -> Instant {
+    #[cfg(feature = "sim")]
+    {
+        crate::sim::clock()
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        Instant::now()
+    }
+}
+
 use io::{DiskInner, ExportInner};
 use worker::{Ack, Ctl, Doorbell};
 

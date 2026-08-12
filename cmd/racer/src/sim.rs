@@ -31,6 +31,83 @@ const TICK_US: u64 = 1_000;
 /// Settle passes that may keep finding work before we call it a livelock.
 const SETTLE_LIMIT: usize = 1 << 20;
 
+/// A path through the system worth proving a campaign reached.
+///
+/// A fuzzer that stopped splitting transfers, or stopped losing a frame, would go on
+/// passing every invariant while testing less and less. These counters are what a
+/// campaign asserts against, so a branch falling out of reach is a failure rather than a
+/// silent loss of coverage.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Hit {
+    /// A frame piece was dropped on the way out.
+    Drop,
+    /// A storage transfer was failed with EIO.
+    IoError,
+    /// A storage read flipped a byte on the way back.
+    Corrupt,
+    /// A command was refused at submission because its link was cut.
+    CutSubmit,
+    /// A frame in flight was discarded because its link was cut under it.
+    CutDeliver,
+    /// A reply was discarded because the return path was cut.
+    CutReply,
+    /// A frame took a straggler's path.
+    Slow,
+    /// A command was split by the peer's MDTS.
+    Split,
+    /// A piece of a split command was delivered.
+    Piece,
+    /// A frame found the target with no request slot free.
+    Saturated,
+    /// A `WARM` frame was delivered.
+    Warm,
+    /// A frame crossed a zone boundary.
+    Crossing,
+    /// A node was crashed.
+    Crash,
+    /// A node was restarted.
+    Restart,
+}
+
+impl Hit {
+    /// Every path, in order, so a campaign can name the one it never reached.
+    pub const ALL: [Hit; 14] = [
+        Hit::Drop,
+        Hit::IoError,
+        Hit::Corrupt,
+        Hit::CutSubmit,
+        Hit::CutDeliver,
+        Hit::CutReply,
+        Hit::Slow,
+        Hit::Split,
+        Hit::Piece,
+        Hit::Saturated,
+        Hit::Warm,
+        Hit::Crossing,
+        Hit::Crash,
+        Hit::Restart,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Hit::Drop => "a frame was dropped",
+            Hit::IoError => "a storage transfer failed",
+            Hit::Corrupt => "a storage read was corrupted",
+            Hit::CutSubmit => "a command met a cut link",
+            Hit::CutDeliver => "a frame met a cut link",
+            Hit::CutReply => "a reply met a cut link",
+            Hit::Slow => "a frame took a straggler's path",
+            Hit::Split => "a command was split by MDTS",
+            Hit::Piece => "a piece of a split command arrived",
+            Hit::Saturated => "a target had no slot free",
+            Hit::Warm => "a warm frame arrived",
+            Hit::Crossing => "a frame crossed a zone",
+            Hit::Crash => "a node crashed",
+            Hit::Restart => "a node restarted",
+        }
+    }
+}
+
 // --- the ambient half: what handler code reaches through `crate::sim::*` ---
 
 /// Which side of a transfer an op is. Mirrors the two `Disk` methods.
@@ -104,6 +181,7 @@ enum What {
     },
     /// A result travelling back to the op's submitter, with the payload for a read.
     Reply {
+        from: u32,
         who: Who,
         res: i32,
         back: u64,
@@ -171,6 +249,9 @@ impl Faults {
 /// `Disk::read` happens while `Sim::run` is already on the stack.
 struct Shared {
     now: Cell<u64>,
+    /// The host instant virtual time is measured from. Every clock the runtime reads is
+    /// this plus `now`, so nothing in the system can tell the two apart.
+    base: Instant,
     /// Which (node, core) is executing, so a submission needs no arguments naming it.
     here: Cell<(u32, u32)>,
     devs: RefCell<Vec<Device>>,
@@ -195,6 +276,10 @@ struct Shared {
     mdts: Cell<u32>,
     rng: Cell<u64>,
     faults: RefCell<Faults>,
+    /// How many times each [`Hit`] has been reached, so a campaign can prove it got
+    /// there. Counted here rather than in the tests because most of these are decisions
+    /// only the simulator sees.
+    hits: Cell<[u64; Hit::ALL.len()]>,
 }
 
 thread_local! {
@@ -206,6 +291,14 @@ fn shared() -> Rc<Shared> {
 }
 
 impl Shared {
+    /// Record that a path was taken. Saturating, since a campaign only ever asks whether
+    /// a count is non-zero or how one compares with another.
+    fn hit(&self, h: Hit) {
+        let mut c = self.hits.get();
+        c[h as usize] = c[h as usize].saturating_add(1);
+        self.hits.set(c);
+    }
+
     fn rand(&self) -> u64 {
         // xorshift64*: the seed is the whole of a run's nondeterminism.
         let mut x = self.rng.get();
@@ -314,6 +407,19 @@ pub(crate) fn now_us() -> u64 {
     shared().now.get()
 }
 
+/// The clock the whole system reads, virtual time expressed as a host `Instant` so that
+/// nothing below this line needs to know it is being simulated. Falls back to the host
+/// clock off a simulated thread, which is where the ordinary unit tests run.
+pub(crate) fn clock() -> Instant {
+    SHARED
+        .with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|s| s.base + Duration::from_micros(s.now.get()))
+        })
+        .unwrap_or_else(Instant::now)
+}
+
 /// Raw device access, for `format` and the allocator's startup scan. Neither runs on a
 /// worker, so neither goes through the op slab.
 pub(crate) fn raw_read(dev: u32, off: u64, out: &mut [u8]) -> std::io::Result<()> {
@@ -419,14 +525,16 @@ pub(crate) fn submit(
     if fabric {
         if s.faults.borrow().cut(node, peer) {
             // Lost: only the timeout can finish this op now.
+            s.hit(Hit::CutSubmit);
             return;
         }
-        let lat = lat
-            + if s.faults.borrow().slow(node, peer) {
-                SLOW_US
-            } else {
-                0
-            };
+        // A straggler is slow in everything it sends, not just the first piece it sends.
+        let slow = if s.faults.borrow().slow(node, peer) {
+            s.hit(Hit::Slow);
+            SLOW_US
+        } else {
+            0
+        };
         let lba = off / BLOCK as u64;
         // The transport splits anything above the peer's MDTS. The target sees the
         // pieces as separate requests at consecutive LBAs inside the frame's footprint,
@@ -437,13 +545,15 @@ pub(crate) fn submit(
         };
         let pieces = len.div_ceil(mdts);
         if pieces > 1 {
+            s.hit(Hit::Split);
             s.owed.borrow_mut().insert(who, (pieces, len as i32));
         }
         for p in 0..pieces {
             let at = p * mdts;
             let n = mdts.min(len - at);
-            let delay = if p == 0 { lat } else { s.latency() };
+            let delay = slow + if p == 0 { lat } else { s.latency() };
             if s.chance(s.faults.borrow().drop) {
+                s.hit(Hit::Drop);
                 continue;
             }
             let e = What::Send {
@@ -505,10 +615,40 @@ struct NodeState {
     warms: u64,
 }
 
+/// What the cluster still owes, so a test can wait for quiet rather than for a duration
+/// it guessed. A run that has drained is the only place a claim about convergence, or
+/// about a resource having been given back, means anything.
+#[derive(Copy, Clone, Debug)]
+pub struct Status {
+    /// Client requests submitted and not yet answered.
+    pub clients: usize,
+    /// Operations the runtime is still carrying.
+    pub ops: usize,
+    /// Scheduled events other than the maintenance tick. A cluster left alone still
+    /// sweeps its groups and still arms the next timer, so this counts what is on the
+    /// calendar rather than what is outstanding, and quiet does not require it to be zero.
+    pub events: usize,
+    /// Commands with pieces still owed to them.
+    pub split: usize,
+}
+
+impl Status {
+    /// Nothing is in flight: no client is waiting, no operation is being carried, and no
+    /// command is short of pieces. Anti-entropy never stops, so this is the gap between
+    /// its sweeps rather than the end of all activity.
+    pub fn idle(&self) -> bool {
+        self.clients == 0 && self.ops == 0 && self.split == 0
+    }
+}
+
 /// A client request's buffer, which must outlive the request, and the node serving it.
 struct Pending {
     buf: Box<[u8]>,
     node: usize,
+    /// Whether the request is still in flight. A completed request keeps its buffer so
+    /// the caller can read what came back, but it is no longer the node's to fail: a
+    /// crash must not rewrite a result someone has already been told.
+    live: bool,
 }
 
 /// How a cluster is shaped. Groups, peers, extents and devices derive from these.
@@ -614,8 +754,10 @@ impl Sim {
             "mdts must be a whole number of blocks"
         );
         raise_files();
+        let base = Instant::now();
         let s = Rc::new(Shared {
             now: Cell::new(0),
+            base,
             here: Cell::new((0, 0)),
             devs: RefCell::new(Vec::new()),
             paths: RefCell::new(BTreeMap::new()),
@@ -628,13 +770,14 @@ impl Sim {
             mdts: Cell::new(opts.mdts),
             rng: Cell::new(opts.seed | 1),
             faults: RefCell::new(opts.faults.clone()),
+            hits: Cell::new([0; Hit::ALL.len()]),
         });
         SHARED.with(|c| *c.borrow_mut() = Some(s.clone()));
         s.at(TICK_US, What::Tick);
 
         let mut sim = Sim {
             s,
-            base: Instant::now(),
+            base,
             opts: opts.clone(),
             nodes: Vec::new(),
             pending: BTreeMap::new(),
@@ -760,7 +903,9 @@ impl Sim {
             "policy max_index_bytes={idx} occ_bytes={}\n",
             1 << 20
         ));
-        t.push_str(&format!("universe {UNIVERSE} epoch=1\n"));
+        // The fabric namespace exports as a ublk minor of its own, which has to differ from
+        // every device minor this node asks for. The devices are 1 and 2.
+        t.push_str(&format!("universe {UNIVERSE} epoch=1 fabric_device_id=9\n"));
         for p in self.peers_of(id) {
             t.push_str(&format!("peer id={p} device=/sim/n{p}/fabric\n"));
         }
@@ -851,11 +996,13 @@ impl Sim {
         self.s.live.borrow_mut().retain(|w| w.node != id);
         self.s.owed.borrow_mut().retain(|w, _| w.node != id);
         self.s.held.borrow_mut().retain(|w, _| w.node != id);
-        // Its in-flight client requests can never complete, so fail them now.
+        // Its in-flight client requests can never complete, so fail them now. A request
+        // that already finished keeps both its result and its payload: the caller may
+        // have been told, and a crash cannot un-tell them.
         let lost: Vec<u64> = self
             .pending
             .iter()
-            .filter(|(_, p)| p.node == i)
+            .filter(|(_, p)| p.node == i && p.live)
             .map(|(&k, _)| k)
             .collect();
         for k in lost {
@@ -864,10 +1011,12 @@ impl Sim {
             }
             self.results.insert(k, Err(libc::EIO));
         }
+        self.s.hit(Hit::Crash);
     }
 
     pub fn restart(&mut self, i: usize) -> std::io::Result<()> {
         assert!(self.nodes[i].workers.is_none(), "node is already up");
+        self.s.hit(Hit::Restart);
         self.boot(i)
     }
 
@@ -921,6 +1070,78 @@ impl Sim {
         self.nodes[node].warms
     }
 
+    /// How many times the cluster has reached a given path since the simulation began.
+    ///
+    /// A campaign asserts against these: an invariant nothing reaches passes for the
+    /// wrong reason, so the paths a run took are part of what it proved.
+    pub fn hits(&self, h: Hit) -> u64 {
+        self.s.hits.get()[h as usize]
+    }
+
+    /// What is still owed to whoever asked for it.
+    pub fn status(&self) -> Status {
+        let evs = self.s.evs.borrow();
+        Status {
+            clients: self.pending.values().filter(|p| p.live).count(),
+            ops: self.s.live.borrow().len(),
+            // The maintenance tick never stops, so it is not work; everything else is.
+            events: evs
+                .iter()
+                .filter(|Reverse(e)| !matches!(e.what, What::Tick))
+                .count(),
+            split: self.s.owed.borrow().len(),
+        }
+    }
+
+    /// Check every up node's internal state. The cheapest place to catch a bug is the
+    /// action that caused it, not the read that eventually noticed.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.workers.is_none() {
+                continue;
+            }
+            // SAFETY: `dp` is leaked at boot and dropped only when the node crashes,
+            // which is exactly when `workers` becomes `None`.
+            let dp = unsafe { &*(n.dp as *const server::Dataplane) };
+            dp.invariants().map_err(|e| format!("node {i}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Pages part-way through arriving, across every up node.
+    pub fn assemblies(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| n.workers.is_some())
+            // SAFETY: as `check_invariants`.
+            .map(|n| unsafe { &*(n.dp as *const server::Dataplane) }.assemblies())
+            .sum()
+    }
+
+    /// The node indices holding a small page's consensus group. What makes a write to
+    /// any other node a non-member's, which is a different path through the server.
+    pub fn small_members(&self, lba: u64) -> Vec<usize> {
+        self.members(SMALL_BASE + lba)
+    }
+
+    /// As [`Sim::small_members`], for a huge page.
+    pub fn huge_members(&self, page: u64) -> Vec<usize> {
+        self.members(huge_base(self.opts.pages) + page * crate::config::HUGE_BLOCKS)
+    }
+
+    fn members(&self, addr: u64) -> Vec<usize> {
+        let addr = crate::alloc::GlobalAddr::new(UNIVERSE, addr);
+        let cfg = &self.nodes[0].cfg;
+        let group = cfg.group(addr.0);
+        let Some(u) = cfg.universe(group.universe()) else {
+            return Vec::new();
+        };
+        u.catalog[group.index() as usize]
+            .iter()
+            .filter_map(|m| self.nodes.iter().position(|n| n.id == *m))
+            .collect()
+    }
+
     /// Damage the persisted bytes of one replica of a small page. `replica` is a
     /// position in the page's consensus group; the return value is that node's index.
     pub fn corrupt_small_replica(&mut self, lba: u64, replica: usize) -> usize {
@@ -937,6 +1158,12 @@ impl Sim {
         block[17] ^= 0xff;
         d.write(off / BLOCK as u64, &block);
         node
+    }
+
+    /// Whether a replica is holding a small page at all, which is what makes it
+    /// something a campaign can damage and expect to see repaired.
+    pub fn small_replica_live(&self, lba: u64, replica: usize) -> bool {
+        self.small_replica_location(lba, replica).is_some()
     }
 
     /// Whether a replica's persisted page still matches its mblock entry's `data_crc`.
@@ -1039,7 +1266,14 @@ impl Sim {
             return id;
         };
         let b = sim_buf(0, buf.as_ptr() as u64, len as u32);
-        self.pending.insert(id, Pending { buf, node: i });
+        self.pending.insert(
+            id,
+            Pending {
+                buf,
+                node: i,
+                live: true,
+            },
+        );
         self.start(
             i,
             core,
@@ -1059,6 +1293,14 @@ impl Sim {
         self.submit(i, SMALL, Op::Write, lba, Some(&page))
     }
 
+    /// Write a page of arbitrary bytes rather than one repeated byte. A single fill has
+    /// only 256 values, so a long run reuses them and a read can no longer say which
+    /// write it came from; a pattern names its write.
+    pub fn write_with(&mut self, i: usize, lba: u64, page: &[u8]) -> u64 {
+        assert_eq!(page.len(), BLOCK, "a small write is one page");
+        self.submit(i, SMALL, Op::Write, lba, Some(page))
+    }
+
     pub fn read(&mut self, i: usize, lba: u64) -> u64 {
         self.submit(i, SMALL, Op::Read, lba, None)
     }
@@ -1074,6 +1316,12 @@ impl Sim {
         self.submit(i, HUGE, Op::Write, page * 1024, Some(&buf))
     }
 
+    /// As [`Sim::write_with`], for the immutable class.
+    pub fn write_huge_with(&mut self, i: usize, page: u64, buf: &[u8]) -> u64 {
+        assert_eq!(buf.len(), 4 << 20, "a huge write is one whole page");
+        self.submit(i, HUGE, Op::Write, page * 1024, Some(buf))
+    }
+
     pub fn read_huge(&mut self, i: usize, page: u64) -> u64 {
         self.submit(i, HUGE, Op::Read, page * 1024, None)
     }
@@ -1082,7 +1330,7 @@ impl Sim {
         self.results.get(&id).copied()
     }
 
-    /// The bytes a finished read returned. `None` once its node has crashed.
+    /// The bytes a finished read returned. `None` once its node has crashed under it.
     pub fn payload(&self, id: u64) -> Option<&[u8]> {
         self.pending.get(&id).map(|p| &p.buf[..])
     }
@@ -1138,6 +1386,7 @@ impl Sim {
                 if let Some(p) = self.pending.get_mut(&id) {
                     let copy = p.buf.to_vec().into_boxed_slice();
                     let old = std::mem::replace(&mut p.buf, copy);
+                    p.live = false;
                     self.put_buf(old);
                 }
             }
@@ -1166,12 +1415,22 @@ impl Sim {
     /// asymmetric partition expressible.
     fn reply(&self, from: u32, origin: Who, res: i32, back: u64, wire: Option<Vec<u8>>) {
         if self.s.faults.borrow().cut(from, origin.node) {
+            self.s.hit(Hit::CutReply);
             return;
         }
-        let lat = self.s.latency();
+        // A straggler is slow on the way back too, which is what makes a reply arrive
+        // after the requester has given up and reused the memory it named.
+        let slow = if self.s.faults.borrow().slow(from, origin.node) {
+            self.s.hit(Hit::Slow);
+            SLOW_US
+        } else {
+            0
+        };
+        let lat = slow + self.s.latency();
         self.s.at(
             lat,
             What::Reply {
+                from,
                 who: origin,
                 res,
                 back,
@@ -1273,12 +1532,20 @@ impl Sim {
                 }
             }
             What::Reply {
+                from,
                 who,
                 res,
                 back,
                 wire,
             } => {
                 if !self.s.live.borrow().contains(&who) {
+                    return;
+                }
+                // A partition that opened while this was in flight swallows it here. A
+                // cut that only refused new sends would let a reply cross a link that is
+                // supposed to be down.
+                if self.s.faults.borrow().cut(from, who.node) {
+                    self.s.hit(Hit::CutReply);
                     return;
                 }
                 // SAFETY: the op was still live, so the buffer it named is alive.
@@ -1342,6 +1609,7 @@ impl Sim {
             (f.io_error, f.corrupt)
         };
         if self.s.chance(bad) {
+            self.s.hit(Hit::IoError);
             return -libc::EIO;
         }
         let n = len as usize;
@@ -1358,6 +1626,7 @@ impl Sim {
             }
         }
         if read && self.s.chance(rot) {
+            self.s.hit(Hit::Corrupt);
             // Silent corruption on the way back: caught by the small class's page
             // checksum and, by design, not by the huge class's.
             let at = (self.s.rand() as usize) % n;
@@ -1385,6 +1654,12 @@ impl Sim {
         if !self.s.live.borrow().contains(&from) {
             return;
         }
+        // The link went down while this was in flight. Judging a cut only at submission
+        // would let a frame cross a partition that opened behind it.
+        if self.s.faults.borrow().cut(from.node, to) {
+            self.s.hit(Hit::CutDeliver);
+            return;
+        }
         let Some(i) = self.nodes.iter().position(|n| n.id == to) else {
             return;
         };
@@ -1398,6 +1673,7 @@ impl Sim {
         if self.nodes[i].free[core].is_empty() {
             // The peer is saturated. Retry, but not forever: past this the sender's
             // timeout is the honest answer.
+            self.s.hit(Hit::Saturated);
             if tries < 64 {
                 let e = What::Send {
                     from,
@@ -1414,12 +1690,15 @@ impl Sim {
         }
         // Counted here rather than at submission: this is the point the frame is
         // certainly being served, so a delivery retried for want of a slot counts once.
+        self.s.hit(Hit::Piece);
         if self.zone_of(from.node) != self.zone_of(to) {
+            self.s.hit(Hit::Crossing);
             self.nodes[i].crossings += 1;
         }
         if let Ok((f, _)) = crate::fabric::Frame::decode(lba, len as usize)
             && f.op == crate::fabric::Op::Warm
         {
+            self.s.hit(Hit::Warm);
             self.nodes[i].warms += 1;
         }
         let op = if read { Op::Read } else { Op::Write };

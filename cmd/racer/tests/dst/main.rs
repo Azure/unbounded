@@ -5,9 +5,18 @@
 
 #![cfg(feature = "sim")]
 
+mod coverage;
+mod invariants;
+mod model;
+mod plan;
+mod world;
+
 use std::time::Duration;
 
 use racer::sim::{Faults, Options, Sim};
+
+use crate::coverage::{Coverage, Reach};
+use crate::world::World;
 
 /// Virtual milliseconds to wait on a request. A down member is never detected, only
 /// timed out against, so every attempt through it pays the fabric's two seconds.
@@ -1066,4 +1075,126 @@ fn a_warm_that_never_arrives_costs_only_a_crossing() {
             assert_huge_page(&mut sim, node, page, 0xa0 + page as u8);
         }
     }
+}
+
+// --- The campaign ---
+
+/// The gate on the whole system.
+///
+/// Every seed builds a differently shaped cluster, throws a generated stream of client
+/// operations, crashes, partitions, slow links, weather and deliberate damage at it, and
+/// checks the invariants after every one of them. Nothing here is a scenario: the tests
+/// are the invariants, and the obligations at the end are what keeps the generator honest
+/// about still reaching the paths those invariants defend.
+#[test]
+fn system_invariants_hold_under_fuzz() {
+    // One seed is a whole cluster, a whole workload and a whole fault stream, so a
+    // failing seed replays alone with `DST_SEED`. Coverage is a claim about the campaign
+    // rather than about any one seed, so replaying one does not owe it.
+    if let Some(s) = std::env::var_os("DST_SEED") {
+        let seed = s
+            .to_string_lossy()
+            .parse()
+            .expect("DST_SEED should be a number");
+
+        if let Err(e) = seed_holds(seed) {
+            panic!("seed {seed} ({}): {e}", plan::profile(seed).name);
+        }
+
+        return;
+    }
+
+    let cov = std::sync::Mutex::new(Coverage::default());
+    let queue: Vec<u64> = (1..=SEEDS).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(queue.len());
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&seed) = queue.get(i) else { return };
+
+                    match seed_holds(seed) {
+                        Ok(seen) => cov.lock().unwrap().merge(&seen),
+                        Err(e) => {
+                            eprintln!("seed {seed} ({}): {e}", plan::profile(seed).name);
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    assert!(
+        !failed.load(std::sync::atomic::Ordering::Relaxed),
+        "a seed failed; re-run it alone with DST_SEED=<seed>"
+    );
+
+    let cov = cov.into_inner().unwrap();
+
+    println!("{}", cov.report());
+
+    let missing = cov.missing(plan::STRATA);
+
+    assert!(
+        missing.is_empty(),
+        "the campaign no longer reaches, so the invariants above no longer defend:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// Runs one seed to the end, and says where it has been.
+fn seed_holds(seed: u64) -> Result<Coverage, String> {
+    let mut w = World::new(plan::profile(seed))?;
+
+    match drive(&mut w) {
+        Ok(()) => {
+            w.collect();
+
+            Ok(w.cov.clone())
+        }
+        Err(e) => Err(format!("{e}\n\nwhat led here:\n{}", w.history())),
+    }
+}
+
+/// The run itself: a generated stream of actions with safety checked after each one, then
+/// a healed and drained cluster with everything else checked once.
+fn drive(w: &mut World) -> Result<(), String> {
+    for step in 0..w.profile.steps {
+        // How much the campaign is willing to break at once. While it holds back a
+        // quorum the cluster owes progress; while it does not, only safety is owed. Both
+        // regimes have to happen, so the run moves between them rather than picking one.
+        if step % 48 == 0 {
+            w.hostile = w.rng.chance(350);
+
+            if w.hostile {
+                w.cov.reach(Reach::Hostile);
+            }
+        }
+
+        let a = plan::choose(w);
+
+        w.apply(a)?;
+        w.reap()?;
+        w.settle()?;
+        invariants::always(w)?;
+    }
+
+    // Everything past here is owed only by a cluster that has been left alone.
+    w.hostile = false;
+
+    w.quiesce()?;
+    invariants::always(w)?;
+    invariants::idle(w)?;
+    invariants::converged(w)?;
+    invariants::repaired(w)?;
+    invariants::envelope(w)?;
+    invariants::locality(w)?;
+    invariants::always(w)
 }
