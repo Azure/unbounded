@@ -81,6 +81,16 @@ func (s overrideSnapshot) usable() bool {
 	return s.state == overridesValid || s.state == overridesPartial
 }
 
+// rejected reports whether any part of the document could not be used.
+//
+// It is deliberately not the same question as "was anything withheld". An entry
+// naming a component that is disabled, or not installed on this cluster,
+// resolves to no workload, so withholding has nothing to withhold; the document
+// is still wrong and the user still needs to hear so.
+func (s overrideSnapshot) rejected() bool {
+	return s.err != nil || len(s.problems) > 0
+}
+
 // failure renders everything wrong with the document as one error, for the pass
 // error and for the Event on the ConfigMap.
 func (s overrideSnapshot) failure() error {

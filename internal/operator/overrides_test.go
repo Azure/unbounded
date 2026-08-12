@@ -272,8 +272,8 @@ func TestOverridesInvalidSkipWorkloadsButNotThePass(t *testing.T) {
 		t.Fatal("an invalid override document must fail the pass so it requeues")
 	}
 
-	if !strings.Contains(err.Error(), "overrides unusable") {
-		t.Fatalf("error = %v, want it to say overrides were unusable", err)
+	if !strings.Contains(err.Error(), "overrides were rejected") {
+		t.Fatalf("error = %v, want it to say the overrides were rejected", err)
 	}
 
 	if appliedContains(*applied, "DaemonSet/unbounded-net-node") {
@@ -1517,5 +1517,37 @@ func TestTruncateMessageCutsOnARuneBoundary(t *testing.T) {
 
 	if !strings.Contains(got, "truncated") {
 		t.Fatal("a truncated message must say so")
+	}
+}
+
+// TestRejectedEntryFailsThePassEvenWhenNothingIsWithheld pins that reporting is
+// not conditional on withholding.
+//
+// The quarantine decides what the operator declines to write. It does not
+// decide whether the user is told their document is wrong. An entry naming a
+// component that is disabled, or not installed on this cluster, resolves to no
+// workload and so withholds nothing, and it is still a document that does not
+// say what its author meant.
+func TestRejectedEntryFailsThePassEvenWhenNothingIsWithheld(t *testing.T) {
+	// The test registry publishes net and metalman. An entry naming gantry can
+	// therefore withhold nothing at all, and is still invalid: gantry emits no
+	// Deployment.
+	r, applied, _ := overrideTestEnv(t, overridesConfigMap(map[string]string{
+		"overrides.yaml": "apiVersion: " + override.APIVersion +
+			"\noverrides:\n  - component: gantry\n    kind: Deployment\n    extraArgs:\n      gantry: [--x]\n",
+	}))
+
+	_, err := r.Reconcile(t.Context(), singletonRequest())
+	if err == nil {
+		t.Fatal("a rejected entry must fail the pass even when it withholds nothing")
+	}
+
+	if !strings.Contains(err.Error(), "0 workload(s) left unchanged") {
+		t.Fatalf("error = %v, want it to report that nothing was withheld", err)
+	}
+
+	// Nothing was in doubt, so everything still reconciles.
+	if !appliedContains(*applied, "DaemonSet/unbounded-net-node") {
+		t.Fatalf("applied = %v, want unaffected workloads to reconcile", *applied)
 	}
 }

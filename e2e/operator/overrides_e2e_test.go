@@ -309,6 +309,10 @@ func TestOverridesAgainstRealAPIServer(t *testing.T) {
 		assertRejectedWriteIsNotReportedAsApplied(ctx, t, fixture)
 	})
 
+	t.Run("a broken key does not discard the keys that work", func(t *testing.T) {
+		assertOneBrokenKeyDoesNotDiscardTheOthers(ctx, t, fixture)
+	})
+
 	t.Run("competing field manager survives override removal", func(t *testing.T) {
 		assertCompetingManagerSurvives(ctx, t, fixture)
 	})
@@ -649,6 +653,61 @@ func assertRejectedWriteIsNotReportedAsApplied(ctx context.Context, t *testing.T
 	f.reconcile(ctx, t)
 }
 
+// assertOneBrokenKeyDoesNotDiscardTheOthers proves the blast radius of a
+// broken document against a real apiserver.
+//
+// The format is one document per ConfigMap key so that a document can be split
+// by concern or by team. Parse used to return on the first key that failed, so
+// a mistake in one key discarded the entries in every other key and withheld
+// every overridable workload in the cluster. Splitting by key was therefore no
+// isolation at all.
+//
+// A key that fails to *parse* still withholds everything, because its entries
+// were never read. This asserts the other half: an entry that fails
+// *validation* is contained to the workloads it could have targeted, and the
+// keys that work still apply.
+func assertOneBrokenKeyDoesNotDiscardTheOthers(ctx context.Context, t *testing.T, f *overrideFixture) {
+	t.Helper()
+
+	f.writeOverrideKeys(ctx, t, map[string]string{
+		// Valid, and targets the DaemonSet this fixture owns.
+		"good.yaml": `
+  - component: net
+    kind: DaemonSet
+    extraArgs:
+      agent: ["--from-the-good-key"]
+`,
+		// Rejected: machina emits no DaemonSet, so this entry can never match
+		// anything. It names a component the fixture does not even register.
+		"bad.yaml": `
+  - component: machina
+    kind: DaemonSet
+    extraArgs:
+      machina-controller: ["--nope"]
+`,
+	})
+
+	// The pass still reports an error, so the broken entry is not silently
+	// tolerated and the document keeps being retried.
+	if err := f.reconcileExpectingError(ctx, t); err == nil {
+		t.Fatal("a rejected entry must fail the pass so it requeues")
+	}
+
+	after := f.getDaemonSet(ctx, t)
+
+	gotArgs := after.Spec.Template.Spec.Containers[0].Args
+	if len(gotArgs) != 2 || gotArgs[1] != "--from-the-good-key" {
+		t.Fatalf("args = %v, want the working key to have applied despite the broken one", gotArgs)
+	}
+
+	if after.Annotations[override.HashAnnotation] == "" {
+		t.Fatal("the overridden workload carries no hash; the working key did not apply")
+	}
+
+	f.deleteOverrides(ctx, t)
+	f.reconcile(ctx, t)
+}
+
 // assertCompetingManagerSurvives documents the limit of the revert guarantee.
 //
 // Server-side apply only reclaims fields the operator still declares and still
@@ -805,8 +864,17 @@ func (f *overrideFixture) overrideStatus(ctx context.Context, t *testing.T) *unb
 func (f *overrideFixture) writeOverrides(ctx context.Context, t *testing.T, overrides string) {
 	t.Helper()
 
-	data := map[string]string{
-		"overrides.yaml": "apiVersion: " + override.APIVersion + "\noverrides:" + overrides,
+	f.writeOverrideKeys(ctx, t, map[string]string{"overrides.yaml": overrides})
+}
+
+// writeOverrideKeys writes several documents, one per ConfigMap key, which is
+// the shape the isolation guarantee is about.
+func (f *overrideFixture) writeOverrideKeys(ctx context.Context, t *testing.T, keys map[string]string) {
+	t.Helper()
+
+	data := make(map[string]string, len(keys))
+	for key, overrides := range keys {
+		data[key] = "apiVersion: " + override.APIVersion + "\noverrides:" + overrides
 	}
 
 	configMap := &corev1.ConfigMap{

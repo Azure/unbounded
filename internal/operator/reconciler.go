@@ -426,8 +426,14 @@ func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideS
 	switch {
 	case report.Failed():
 		return report, fmt.Errorf("overrides could not be applied to some workloads: %w", report.Err())
-	case len(withheld) > 0:
-		return report, fmt.Errorf("overrides unusable, %d workload(s) left unchanged: %w",
+
+	case snapshot.rejected():
+		// Reported whether or not anything was withheld. The quarantine decides
+		// what the operator declines to write; it does not decide whether the
+		// user is told their document is wrong. An entry naming a component
+		// that is disabled, or not installed, withholds nothing and is still a
+		// document that does not say what its author meant.
+		return report, fmt.Errorf("overrides were rejected, %d workload(s) left unchanged: %w",
 			len(withheld), snapshot.failure())
 	}
 
@@ -822,10 +828,11 @@ func overrideConfigMapEvent(
 		return "", "", ""
 	}
 
-	// Withheld workloads outrank everything below: the user asked for something
-	// the operator refused to write, and saying how many and why is the most
-	// useful thing this Event can carry.
-	if len(report.Withheld) > 0 {
+	// A rejected document outranks everything below. This Event is the only
+	// verdict a user gets when no Site exists, and the ConfigMap is the object
+	// they edited, so it has to say plainly that the document is wrong even
+	// when nothing was withheld.
+	if snapshot.rejected() {
 		reason := "OverridesRejected"
 		if len(report.Workloads) > 0 {
 			// Some entries did apply, so calling the whole document rejected
@@ -834,8 +841,7 @@ func overrideConfigMapEvent(
 		}
 
 		return corev1.EventTypeWarning, reason,
-			fmt.Sprintf("%d workload(s) were left unchanged because their overrides could not be used: %v",
-				len(report.Withheld), snapshot.failure())
+			fmt.Sprintf("%d workload(s) were left unchanged: %v", len(report.Withheld), snapshot.failure())
 	}
 
 	if err := report.Err(); err != nil {
