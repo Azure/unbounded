@@ -5,6 +5,9 @@ package racer
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -850,7 +853,12 @@ func TestReconcileStateReportsBlockedGatesAsNotReady(t *testing.T) {
 
 	env := testEnv(t, node)
 
-	result := reconcileState(ctx, env)
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	result := p.reconcileState(ctx)
 	if result.Ready {
 		t.Fatalf("expected not ready, got %+v", result)
 	}
@@ -889,8 +897,200 @@ func TestReconcileStateIsReadyWhenSettled(t *testing.T) {
 
 	env := testEnv(t, objects...)
 
-	result := reconcileState(ctx, env)
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	result := p.reconcileState(ctx)
 	if !result.Ready {
 		t.Fatalf("expected ready, got %+v", result)
+	}
+}
+
+// nodeLabels reads a node's labels back from the API server.
+func nodeLabels(ctx context.Context, t *testing.T, env *component.Env, name string) map[string]string {
+	t.Helper()
+
+	found := &corev1.Node{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: name}, found); err != nil {
+		t.Fatalf("get node %s: %v", name, err)
+	}
+
+	return found.Labels
+}
+
+// decommissioningNode is a node that has been un-enrolled but still holds the
+// identity it was allocated, which is what every node in the middle of a
+// decommission looks like.
+func decommissioningNode(name string, id uint32) *corev1.Node {
+	node := enrolledNode(name, "east", map[string]string{
+		racerctrl.NodeIDAnnotation:     formatUint(uint64(id)),
+		racerctrl.NodeZoneAnnotation:   "1",
+		racerctrl.NodeCohortAnnotation: "0",
+		racerctrl.NodeHealthAnnotation: "generation=4",
+	})
+
+	delete(node.Labels, EnrollmentLabel)
+	node.Labels[WorkloadLabel] = "true"
+
+	return node
+}
+
+func TestWorkloadLabelIsAddedToEnrolledNodes(t *testing.T) {
+	ctx := context.Background()
+
+	env := testEnv(t, enrolledNode("n1", "east", nil))
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileWorkloadLabels(ctx); err != nil {
+		t.Fatalf("reconcile workload labels: %v", err)
+	}
+
+	if labels := nodeLabels(ctx, t, env, "n1"); labels[WorkloadLabel] != "true" {
+		t.Fatalf("enrolled node is not labelled for the workload: %v", labels)
+	}
+}
+
+// Un-enrolling is a request to decommission, not an instruction to stop. The
+// node has to keep running racer to accept the configs that step it out of each
+// catalog and to shed what it holds, so the label the DaemonSet selects on has
+// to outlive the enrollment label.
+func TestWorkloadLabelSurvivesUnenrollment(t *testing.T) {
+	ctx := context.Background()
+
+	objects := []client.Object{
+		racerClass("fast", map[string]string{
+			racerctrl.UniverseIDAnnotation:  "1",
+			racerctrl.CatalogSizeAnnotation: "3",
+			racerctrl.EpochAnnotation:       "1",
+			racerctrl.NextLBAAnnotation:     "0",
+		}),
+		membershipMap(1, 1, "1?cohort=0,2?cohort=1,3?cohort=2"),
+		decommissioningNode("n1", 1),
+	}
+
+	for i, name := range []string{"n2", "n3"} {
+		objects = append(objects, enrolledNode(name, "east", map[string]string{
+			racerctrl.NodeIDAnnotation:     formatUint(uint64(i) + 2),
+			racerctrl.NodeZoneAnnotation:   "1",
+			racerctrl.NodeCohortAnnotation: formatUint(uint64(i) + 1),
+			racerctrl.NodeHealthAnnotation: "generation=4",
+			WorkloadLabel:                  "true",
+		}))
+	}
+
+	env := testEnv(t, objects...)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileWorkloadLabels(ctx); err != nil {
+		t.Fatalf("reconcile workload labels: %v", err)
+	}
+
+	if err := p.sequence(ctx); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+
+	labels := nodeLabels(ctx, t, env, "n1")
+	if labels[WorkloadLabel] != "true" {
+		t.Fatalf("the departing node lost its workload label while the catalog still holds it: %v", labels)
+	}
+
+	found := &corev1.Node{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: "n1"}, found); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	if found.Annotations[racerctrl.NodeIDAnnotation] != "1" {
+		t.Fatalf("the departing node lost its identity while the catalog still holds it: %v", found.Annotations)
+	}
+}
+
+// Retirement is the first moment there is nothing left for the node to serve, so
+// it is the first moment the pod can go, and the identity and the label go
+// together.
+func TestRetirementDropsTheWorkloadLabelWithTheIdentity(t *testing.T) {
+	ctx := context.Background()
+
+	env := testEnv(t, decommissioningNode("n1", 7))
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileWorkloadLabels(ctx); err != nil {
+		t.Fatalf("reconcile workload labels: %v", err)
+	}
+
+	if err := p.sequence(ctx); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+
+	found := &corev1.Node{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: "n1"}, found); err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	if _, ok := found.Annotations[racerctrl.NodeIDAnnotation]; ok {
+		t.Fatalf("retired node kept its id: %v", found.Annotations)
+	}
+
+	if _, ok := found.Labels[WorkloadLabel]; ok {
+		t.Fatalf("retired node is still selected by the DaemonSet: %v", found.Labels)
+	}
+}
+
+// A node that is neither enrolled nor holds an identity has no business running
+// racer, however its label got there.
+func TestWorkloadLabelIsRemovedFromStrayNodes(t *testing.T) {
+	ctx := context.Background()
+
+	stray := enrolledNode("n1", "east", nil)
+	delete(stray.Labels, EnrollmentLabel)
+	stray.Labels[WorkloadLabel] = "true"
+
+	env := testEnv(t, stray)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.reconcileWorkloadLabels(ctx); err != nil {
+		t.Fatalf("reconcile workload labels: %v", err)
+	}
+
+	if _, ok := nodeLabels(ctx, t, env, "n1")[WorkloadLabel]; ok {
+		t.Fatalf("a node with no enrollment and no identity is still labelled for the workload")
+	}
+}
+
+// The DaemonSet must select on the operator-owned label rather than on
+// enrollment. This reads the template rather than the rendered output because
+// the rendered tree is generated and gitignored, and the template is the source
+// of truth either way.
+func TestDaemonSetSelectsTheWorkloadLabel(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "deploy", "racer", "03-daemonset.yaml.tmpl"))
+	if err != nil {
+		t.Fatalf("read daemonset template: %v", err)
+	}
+
+	manifest := string(raw)
+
+	if !strings.Contains(manifest, WorkloadLabel+`: "true"`) {
+		t.Fatalf("the daemonset does not select on %s", WorkloadLabel)
+	}
+
+	if strings.Contains(manifest, EnrollmentLabel+`: "true"`) {
+		t.Fatalf("the daemonset still selects on %s, so un-enrolling a node would delete its pod", EnrollmentLabel)
 	}
 }

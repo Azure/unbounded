@@ -63,11 +63,13 @@ spec:
       # to run wherever the node lets anything run.
       tolerations:
         - operator: Exists
-      # Only nodes that opt in. A node without the label has no racer
-      # identity annotations either, so a pod scheduled there would sit in a
-      # loop reporting that the operator has not assigned it an id.
+      # The operator owns this label and puts it on every node that either
+      # opted in or still holds a racer identity. It is deliberately not the
+      # enrollment label: un-enrolling a node starts a decommission, and the
+      # node has to keep running racer through it to shed the groups it holds.
+      # The operator removes this label only once the node holds nothing.
       nodeSelector:
-        racer.unbounded-cloud.io/enabled: "true"
+        racer.unbounded-cloud.io/active: "true"
       initContainers:
         # R9: verify the host can actually run racer before anything tries.
         # Failing here is a clear, one-line CrashLoopBackOff on a container

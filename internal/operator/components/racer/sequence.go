@@ -167,6 +167,11 @@ func (p *pass) collectVolume(ctx context.Context, view *universeView, volume *vo
 // to forget who it was; doing it earlier would strand whatever it had not handed
 // over yet, and R6 is explicit that we keep serving the config that removes the
 // node until it has shed.
+//
+// The workload label goes in the same write. Up to this point the node has been
+// running racer precisely so it could shed; this is the first moment at which
+// there is nothing left for it to serve, so it is also the first moment at which
+// the pod can go.
 func (p *pass) retireDecommissionedNodes(ctx context.Context) error {
 	for i := range p.nodes {
 		view := &p.nodes[i]
@@ -193,7 +198,9 @@ func (p *pass) retireDecommissionedNodes(ctx context.Context) error {
 			racerctrl.NodeCohortAnnotation: "",
 		}
 
-		if err := p.patchNode(ctx, view, annotations); err != nil {
+		labels := map[string]string{WorkloadLabel: ""}
+
+		if err := p.patchNodeMeta(ctx, view, annotations, labels); err != nil {
 			return fmt.Errorf("retire node %s: %w", view.node.Name, err)
 		}
 	}

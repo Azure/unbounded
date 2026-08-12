@@ -70,11 +70,24 @@ const (
 	ctrlImageRepository  = "racer-ctrl"
 	racerImageRepository = "racer"
 
-	// EnrollmentLabel opts a node into racer. The DaemonSet selects on it and
-	// this component allocates identity only for nodes that carry it, so
-	// enrolling a node is a single label and decommissioning it is removing
-	// that label.
+	// EnrollmentLabel opts a node into racer. This component allocates identity
+	// only for nodes that carry it, so enrolling a node is a single label and
+	// decommissioning it is removing that label.
 	EnrollmentLabel = "racer.unbounded-cloud.io/enabled"
+
+	// WorkloadLabel is what the DaemonSet selects on, and this component is its
+	// only writer.
+	//
+	// It exists because enrollment and "should be running racer" are not the
+	// same thing. Removing the enrollment label asks for a decommission, and
+	// R6's decommission needs the node to keep serving the configs that step it
+	// out of each catalog, shed the groups it holds, and report that it holds
+	// nothing. Selecting the pod on the enrollment label would delete the pod
+	// the moment the request was made, stranding whatever the node had not
+	// handed over. So the operator adds this label to every node that is
+	// enrolled or still holds an identity, and takes it off only once the node
+	// has been retired.
+	WorkloadLabel = "racer.unbounded-cloud.io/active"
 
 	// ZoneLabel is the availability zone a node sits in, the standard
 	// Kubernetes topology label. It is not a racer zone: a racer zone is a
@@ -121,6 +134,12 @@ func EnabledFor(site *unboundedv1alpha3.Site) bool {
 // cluster gets its agents running and reporting before the allocator starts
 // making decisions that depend on what they report; a gate that has never heard
 // from a node blocks, which is the correct answer rather than a stall.
+//
+// The workload labels are the exception, and they are written before the
+// manifests are applied. The DaemonSet selects on a label this component owns,
+// so applying the DaemonSet before that label exists on the nodes that should
+// be running it would evict every running pod for as long as it took the rest
+// of the pass to put the labels back.
 func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
 	enabled := false
 
@@ -146,12 +165,21 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		}
 	}
 
+	pass, err := loadState(ctx, env)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	if err := pass.reconcileWorkloadLabels(ctx); err != nil {
+		return component.Failed(err)
+	}
+
 	mutate := applyMutator(env.Config.Image(ctrlImageRepository), env.Config.Image(racerImageRepository))
 	if err := env.ApplyManifestFS(ctx, racermanifests.Manifests, mutate); err != nil {
 		return component.Failed(err)
 	}
 
-	return reconcileState(ctx, env)
+	return pass.reconcileState(ctx)
 }
 
 // SetupWatches reconciles racer on changes to the objects that carry its state.
@@ -175,22 +203,17 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 // A blocked gate is not an error. It is the system telling us that the previous
 // step has not landed yet, which is exactly what R6 asks us to wait for, so it
 // becomes a not-ready condition with a requeue rather than a failure.
-func reconcileState(ctx context.Context, env *component.Env) component.Result {
-	pass, err := loadState(ctx, env)
-	if err != nil {
+func (p *pass) reconcileState(ctx context.Context) component.Result {
+	if err := p.allocate(ctx); err != nil {
 		return component.Failed(err)
 	}
 
-	if err := pass.allocate(ctx); err != nil {
+	if err := p.sequence(ctx); err != nil {
 		return component.Failed(err)
 	}
 
-	if err := pass.sequence(ctx); err != nil {
-		return component.Failed(err)
-	}
-
-	if len(pass.waiting) > 0 {
-		return component.NotReadyAfter("Sequencing", strings.Join(pass.waiting, "; "), requeueInterval)
+	if len(p.waiting) > 0 {
+		return component.NotReadyAfter("Sequencing", strings.Join(p.waiting, "; "), requeueInterval)
 	}
 
 	return component.Reconciled()

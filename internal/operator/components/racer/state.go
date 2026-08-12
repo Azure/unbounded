@@ -34,6 +34,10 @@ type nodeView struct {
 	// that has identity but is no longer enrolled is being decommissioned.
 	enrolled bool
 
+	// active is whether the node carries the workload label, which is what the
+	// DaemonSet selects on and what this component writes.
+	active bool
+
 	state racerctrl.NodeState
 }
 
@@ -222,12 +226,15 @@ func (p *pass) loadNodes(ctx context.Context) error {
 		}
 
 		enrolled := node.Labels[EnrollmentLabel] == "true"
-		if !enrolled && state.ID == 0 {
-			// Never enrolled and never allocated: not our business at all.
+		active := node.Labels[WorkloadLabel] == "true"
+
+		if !enrolled && !active && state.ID == 0 {
+			// Never enrolled, never allocated, and not running the workload:
+			// not our business at all.
 			continue
 		}
 
-		p.nodes = append(p.nodes, nodeView{node: node, enrolled: enrolled, state: state})
+		p.nodes = append(p.nodes, nodeView{node: node, enrolled: enrolled, active: active, state: state})
 	}
 
 	sort.Slice(p.nodes, func(i, j int) bool { return p.nodes[i].node.Name < p.nodes[j].node.Name })
@@ -401,6 +408,17 @@ func (p *pass) commitCursors(ctx context.Context) error {
 // patchNode merge-patches annotations onto a Node and keeps the in-memory view
 // in step, so later passes in the same reconcile see what earlier ones wrote.
 func (p *pass) patchNode(ctx context.Context, view *nodeView, annotations map[string]string) error {
+	return p.patchNodeMeta(ctx, view, annotations, nil)
+}
+
+// patchNodeMeta merge-patches annotations and labels onto a Node in one write.
+//
+// Retirement needs both in the same patch: the identity annotations say the node
+// is nobody, and the workload label says the pod should stop. Split across two
+// writes, a crash between them leaves either a pod with no identity or an
+// identity with no pod, and one of those two is a node that can never finish
+// leaving.
+func (p *pass) patchNodeMeta(ctx context.Context, view *nodeView, annotations, labels map[string]string) error {
 	patch := client.MergeFrom(view.node.DeepCopy())
 	updated := view.node.DeepCopy()
 
@@ -416,6 +434,18 @@ func (p *pass) patchNode(ctx context.Context, view *nodeView, annotations map[st
 		}
 	}
 
+	if len(labels) > 0 && updated.Labels == nil {
+		updated.Labels = map[string]string{}
+	}
+
+	for key, value := range labels {
+		if value == "" {
+			delete(updated.Labels, key)
+		} else {
+			updated.Labels[key] = value
+		}
+	}
+
 	if err := p.env.Client.Patch(ctx, updated, patch); err != nil {
 		return fmt.Errorf("patch node %s: %w", updated.Name, err)
 	}
@@ -427,6 +457,42 @@ func (p *pass) patchNode(ctx context.Context, view *nodeView, annotations map[st
 
 	view.node = updated
 	view.state = state
+	view.enrolled = updated.Labels[EnrollmentLabel] == "true"
+	view.active = updated.Labels[WorkloadLabel] == "true"
+
+	return nil
+}
+
+// reconcileWorkloadLabels keeps the label the DaemonSet selects on in step with
+// racer's lifecycle rather than with the operator's opinion of it.
+//
+// A node runs racer while it is enrolled and, after it stops being enrolled, for
+// as long as it still holds an identity. That trailing window is the whole
+// decommission: the node is out of the candidate set, the membership sequencer
+// is stepping it out of each catalog one universe at a time, and it has to be
+// running to accept those configs, shed what it holds and say so. Retirement is
+// what takes the label away again, in the same write that takes the identity.
+func (p *pass) reconcileWorkloadLabels(ctx context.Context) error {
+	for i := range p.nodes {
+		view := &p.nodes[i]
+
+		wanted := view.enrolled || view.state.ID != 0
+		if wanted == view.active {
+			continue
+		}
+
+		value := "true"
+		if !wanted {
+			// A stray label: the node was retired and re-labelled by hand, or a
+			// patch landed and the one that was meant to follow it did not.
+			// Either way nothing here should be running.
+			value = ""
+		}
+
+		if err := p.patchNodeMeta(ctx, view, nil, map[string]string{WorkloadLabel: value}); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
