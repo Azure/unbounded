@@ -1344,6 +1344,7 @@ class HostImage:
     backing_format: str
     sudo_group: str
     packages: list[str]
+    network_interface: str = "ens3"
     write_files: str = ""
     pre_marker_commands: list[str] | None = None
 
@@ -1379,6 +1380,7 @@ def host_image() -> HostImage:
             backing_format="qcow2",
             sudo_group="wheel",
             packages=["curl", "jq", "ca-certificates", "net-tools"],
+            network_interface="eth0",
         )
 
     die(f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; expected ubuntu2404, ubuntu2604, or almalinux")
@@ -1443,6 +1445,21 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
     )
 
 
+def _cloud_init_network_config(image: HostImage) -> str:
+    return textwrap.dedent(f"""\
+        version: 2
+        ethernets:
+          {image.network_interface}:
+            addresses:
+              - {VM_IP}/24
+            gateway4: {VM_GATEWAY}
+            nameservers:
+              addresses:
+                - 8.8.8.8
+                - 8.8.4.4
+    """)
+
+
 
 def _launch_vm(ssh_pub_key: str) -> None:
     """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
@@ -1479,18 +1496,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     """))
 
     network_config = VM_DIR / "network-config"
-    network_config.write_text(textwrap.dedent(f"""\
-        version: 2
-        ethernets:
-          ens3:
-            addresses:
-              - {VM_IP}/24
-            gateway4: {VM_GATEWAY}
-            nameservers:
-              addresses:
-                - 8.8.8.8
-                - 8.8.4.4
-    """))
+    network_config.write_text(_cloud_init_network_config(image))
 
     # Build cloud-init seed ISO
     seed_iso = VM_DIR / f"{VM_NAME}-seed.iso"
