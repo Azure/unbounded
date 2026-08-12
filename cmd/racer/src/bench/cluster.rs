@@ -38,8 +38,9 @@ pub struct Plan {
     /// consensus state both live on core `group % cores`, so fewer groups than cores
     /// leaves cores with nothing to do.
     pub groups: usize,
-    pub cache_4k: u64,
-    pub cache_4m: u64,
+    /// DRAM the cache may spend on slot records. The cache takes whatever the slabs
+    /// left in the store either way, so this is what actually sizes it.
+    pub cache_index_bytes: u64,
     /// Zero disables the cooperative cache, which is what a member-only read wants.
     pub cache_target_rate: u32,
 }
@@ -53,8 +54,7 @@ impl Default for Plan {
             small_pages: 262_144,
             huge_pages: 512,
             groups: 12,
-            cache_4k: 0,
-            cache_4m: 0,
+            cache_index_bytes: 1 << 30,
             cache_target_rate: 0,
         }
     }
@@ -258,13 +258,14 @@ impl Drop for Cluster {
 /// read it requires, which the LWW extent already measures.
 fn text(plan: &Plan, n: &Node, peers: &[(u32, PathBuf)], generation: u32) -> String {
     let mut s = format!(
-        "generation {generation}\nnode id={} zone=1 cohort={} size={STORE_BYTES} cache_4k={} cache_4m={}\n",
+        "generation {generation}\nnode id={} zone=1 cohort={} size={STORE_BYTES}\n",
         n.id,
         (n.id - 1) % 3,
-        plan.cache_4k,
-        plan.cache_4m
     );
-    s += &format!("policy cache_target_rate={}\n", plan.cache_target_rate);
+    s += &format!(
+        "policy cache_target_rate={} cache_index_bytes={}\n",
+        plan.cache_target_rate, plan.cache_index_bytes
+    );
     s += "universe 1 epoch=1\n";
     for (id, dev) in peers {
         s += &format!("peer id={id} device={}\n", dev.display());

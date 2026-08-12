@@ -13,7 +13,7 @@
 //! `Slab` because they must sit next to `entries`, but their policy lives in `heal.rs`
 //! and they are excluded from shard equality — see `mod cmp`.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::config::{self, GroupId, Kind};
 use crate::heal::{self, Digests, Groups, Snaps, Tuple};
@@ -308,6 +308,11 @@ struct Slab {
     /// startup so pops ascend and consecutive allocations share an mblock, which is
     /// all an "open mblock" needs to be.
     free: Vec<u32>,
+    /// Free slots on loan to the cache. Still free as far as `pressure` and `capacity`
+    /// are concerned, because a loan is recallable and must not be able to move the
+    /// watermarks that lending is gated on. Never persisted: nothing on disk points at
+    /// a cached page, so a slot that was on loan at a crash comes back free.
+    lent: HashSet<u32>,
     commit_seq: Box<[u64]>,
     durable_seq: Box<[u64]>,
     flushing: bool,
@@ -345,6 +350,7 @@ impl Slab {
             index: HashIndex::new(expect_pages),
             foreign: HashMap::new(),
             free: Vec::with_capacity(n),
+            lent: HashSet::new(),
             commit_seq: vec![0u64; local as usize].into_boxed_slice(),
             durable_seq: vec![0u64; local as usize].into_boxed_slice(),
             flushing: false,
@@ -454,7 +460,7 @@ impl Slab {
         if total == 0 {
             return Pressure::Normal;
         }
-        let free = self.free.len();
+        let free = self.free.len() + self.lent.len();
         if free * 200 < total {
             Pressure::Critical
         } else if free * 50 < total {
@@ -464,9 +470,40 @@ impl Slab {
         }
     }
 
-    /// Free and total slots in this core's stripe.
+    /// Free and total slots in this core's stripe. Loans count as free: the allocator
+    /// can have any of them back within a reservation, so a loan is not a commitment.
     fn capacity(&self) -> (u64, u64) {
-        (self.free.len() as u64, self.entries.len() as u64)
+        (
+            (self.free.len() + self.lent.len()) as u64,
+            self.entries.len() as u64,
+        )
+    }
+
+    /// Hand one free slot to the cache.
+    ///
+    /// Only out of a slab that is genuinely idle: a quarter of the stripe stays unlent,
+    /// so [`Slab::reclaim`] is never what stands between an ordinary write and a slot.
+    /// The pressure test is measured on `free + lent`, which is why lending cannot walk
+    /// itself past its own gate.
+    fn lend(&mut self) -> Option<u32> {
+        if self.pressure() != Pressure::Normal
+            || (self.free.len() as u64) * super::LEND_CEILING <= self.entries.len() as u64
+        {
+            return None;
+        }
+        let l = self.free.pop()?;
+        self.lent.insert(l);
+        Some(l)
+    }
+
+    /// Take a loan back. `false` if the slot was not on loan, which makes a reclaim of
+    /// a stale offset a no-op rather than a double free.
+    fn reclaim(&mut self, local: u32) -> bool {
+        if !self.lent.remove(&local) {
+            return false;
+        }
+        self.free.push(local);
+        true
     }
 }
 
@@ -643,6 +680,27 @@ impl Shard {
     /// whole device, because the stripes partition it.
     pub(super) fn capacity(&self) -> [(u64, u64); 2] {
         [self.slabs[0].capacity(), self.slabs[1].capacity()]
+    }
+
+    /// Lend the cache one free 4 MiB slot, as a local slot id. Small pages are never
+    /// lent: 4 MiB of the small slab is 1024 slots, so a reclaim would drop 1024 cached
+    /// pages at once, and the DRAM to index them costs more than the media is worth.
+    pub(super) fn lend(&mut self) -> Option<u32> {
+        let l = self.slab(Class::Huge).lend()?;
+        Some(self.slab(Class::Huge).global_of(l))
+    }
+
+    /// Take back a lent 4 MiB slot, named by its global slot id.
+    pub(super) fn reclaim(&mut self, slot: u32) -> bool {
+        let Some(l) = self.slab(Class::Huge).local_of(slot) else {
+            return false;
+        };
+        self.slab(Class::Huge).reclaim(l)
+    }
+
+    /// Slots on loan in this core's 4 MiB stripe, which `capacity` is counting as free.
+    pub(super) fn lent(&self) -> u64 {
+        self.slabs[Class::Huge as usize].lent.len() as u64
     }
 
     /// Live and tombstoned entries per extent, `(extent, live, tombstones)` sorted by
@@ -1359,6 +1417,7 @@ mod cmp {
                 index: self.index.clone(),
                 foreign: self.foreign.clone(),
                 free: self.free.clone(),
+                lent: self.lent.clone(),
                 commit_seq: self.commit_seq.clone(),
                 durable_seq: self.durable_seq.clone(),
                 flushing: self.flushing,
@@ -1379,6 +1438,7 @@ mod cmp {
                 && self.quarantined == o.quarantined
                 && self.index == o.index
                 && self.free == o.free
+                && self.lent == o.lent
                 && self.commit_seq == o.commit_seq
                 && self.durable_seq == o.durable_seq
                 && self.flushing == o.flushing
@@ -2450,5 +2510,71 @@ mod model {
         .join()
         .assert_any_discovery("acknowledged writes survive");
         assert!(path.into_actions().len() >= 3);
+    }
+}
+
+#[cfg(test)]
+mod lending {
+    use super::*;
+
+    /// A slab of `n` slots, every one of them free.
+    fn slab(n: u32) -> Slab {
+        let mut sl = Slab::new(0, 1, n, 1, n as u64);
+        sl.free = (0..n).rev().collect();
+        sl
+    }
+
+    /// A loan is not a commitment: the allocator can have any lent slot back inside a
+    /// reservation, so lending must not move the watermarks that decide whether an
+    /// ordinary write is delayed or refused.
+    #[test]
+    fn a_loan_still_counts_as_free() {
+        let mut sl = slab(100);
+        assert_eq!(sl.capacity(), (100, 100));
+        for _ in 0..10 {
+            assert!(sl.lend().is_some());
+        }
+        assert_eq!(sl.free.len(), 90);
+        assert_eq!(sl.capacity(), (100, 100), "a loan is still free capacity");
+        assert_eq!(sl.pressure(), Pressure::Normal);
+    }
+
+    /// Lending stops well short of the slab, so reclaim is never what stands between an
+    /// ordinary write and a slot. The gate reads `free`, not `free + lent`, which is
+    /// what keeps lending from walking itself past its own limit.
+    #[test]
+    fn lending_stops_at_a_quarter_of_the_stripe() {
+        let mut sl = slab(100);
+        let mut n = 0;
+        while sl.lend().is_some() {
+            n += 1;
+            assert!(n <= 100, "lending must terminate");
+        }
+        assert_eq!(n, 75);
+        assert_eq!(sl.free.len(), 25);
+        assert_eq!(sl.pressure(), Pressure::Normal);
+    }
+
+    /// A slab that is already short lends nothing at all.
+    #[test]
+    fn a_pressed_slab_lends_nothing() {
+        let mut sl = slab(100);
+        sl.free.truncate(1);
+        assert_eq!(sl.pressure(), Pressure::Low);
+        assert!(sl.lend().is_none());
+    }
+
+    #[test]
+    fn reclaim_takes_back_exactly_what_was_lent() {
+        let mut sl = slab(100);
+        let l = sl.lend().unwrap();
+        assert!(!sl.free.contains(&l));
+        assert!(sl.reclaim(l));
+        assert!(sl.free.contains(&l));
+        assert_eq!(sl.free.len(), 100);
+        // A repeat is a no-op rather than a double free: the cache is free to hand back
+        // an offset for a chunk it has already given up.
+        assert!(!sl.reclaim(l));
+        assert_eq!(sl.free.len(), 100);
     }
 }

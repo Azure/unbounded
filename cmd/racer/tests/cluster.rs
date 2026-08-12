@@ -534,7 +534,7 @@ fn write_occ(dev: &Dev, off: u64, page: &[u8]) {
 /// over is the control plane's business and changes nothing about the address.
 fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
     let mut s = format!(
-        "generation {generation}\nnode id={} zone=1 cohort={} size={} cache_4k=16777216 cache_4m=33554432\n",
+        "generation {generation}\nnode id={} zone=1 cohort={} size={}\n",
         n.id,
         (n.id - 1) % 3,
         n.store_bytes,

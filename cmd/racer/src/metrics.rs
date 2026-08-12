@@ -81,14 +81,31 @@ metrics! {
     heal_replaying:          "racer_heal_groups_replaying"        ""                           Gauge   "Groups this node is replaying into. Nonzero means a group is running two of three.",
     heal_shedding:           "racer_heal_groups_shedding"         ""                           Gauge   "Groups this node still holds registers for but is no longer a member of.",
 
-    // cooperative cache
-    cache_hits:              "racer_cache_lookup_total"           r#"{result="hit"}"#          Counter "Cache lookups, by outcome.",
-    cache_misses:            "racer_cache_lookup_total"           r#"{result="miss"}"#         Counter "Cache lookups, by outcome.",
-    cache_served:            "racer_cache_served_total"           ""                           Counter "Cache hits that then passed confirmation against the quorum.",
-    cache_admits:            "racer_cache_admit_total"            ""                           Counter "Pages admitted to the cache.",
-    cache_evictions:         "racer_cache_evict_total"            ""                           Counter "Pages evicted from the cache.",
-    cache_stale:             "racer_cache_stale_total"            ""                           Counter "Cache hits that confirmation found stale.",
-    cache_shed:              "racer_cache_shed_total"             ""                           Counter "Cache work declined because the store was under pressure.",
+    // cooperative cache. Split by page class throughout: the two differ by three orders
+    // of magnitude in bytes per entry, so an unlabelled hit rate or byte count says
+    // nothing about which of them is earning the space.
+    cache_hits_small:        "racer_cache_lookup_total"           r#"{class="small",result="hit"}"#   Counter "Cache lookups, by class and outcome.",
+    cache_hits_huge:         "racer_cache_lookup_total"           r#"{class="huge",result="hit"}"#    Counter "Cache lookups, by class and outcome.",
+    cache_misses_small:      "racer_cache_lookup_total"           r#"{class="small",result="miss"}"#  Counter "Cache lookups, by class and outcome.",
+    cache_misses_huge:       "racer_cache_lookup_total"           r#"{class="huge",result="miss"}"#   Counter "Cache lookups, by class and outcome.",
+    cache_served_small:      "racer_cache_served_total"           r#"{class="small"}"#         Counter "Cache hits that then passed confirmation against the quorum, by class.",
+    cache_served_huge:       "racer_cache_served_total"           r#"{class="huge"}"#          Counter "Cache hits that then passed confirmation against the quorum, by class.",
+    cache_admits_small:      "racer_cache_admit_total"            r#"{class="small"}"#         Counter "Pages admitted to the cache, by class.",
+    cache_admits_huge:       "racer_cache_admit_total"            r#"{class="huge"}"#          Counter "Pages admitted to the cache, by class.",
+    cache_evictions_small:   "racer_cache_evict_total"            r#"{class="small"}"#         Counter "Pages evicted from the cache to make room for a hotter one, by class.",
+    cache_evictions_huge:    "racer_cache_evict_total"            r#"{class="huge"}"#          Counter "Pages evicted from the cache to make room for a hotter one, by class.",
+    cache_dropped_small:     "racer_cache_dropped_total"          r#"{class="small"}"#         Counter "Pages lost because their chunk went to the other class or back to the allocator, by class.",
+    cache_dropped_huge:      "racer_cache_dropped_total"          r#"{class="huge"}"#          Counter "Pages lost because their chunk went to the other class or back to the allocator, by class.",
+    cache_stale_small:       "racer_cache_stale_total"            r#"{class="small"}"#         Counter "Cache hits that confirmation found stale, by class.",
+    cache_stale_huge:        "racer_cache_stale_total"            r#"{class="huge"}"#          Counter "Cache hits that confirmation found stale, by class.",
+    cache_shed_small:        "racer_cache_shed_total"             r#"{class="small"}"#         Counter "Cache work declined because the store was under pressure, by class.",
+    cache_shed_huge:         "racer_cache_shed_total"             r#"{class="huge"}"#          Counter "Cache work declined because the store was under pressure, by class.",
+    cache_bytes_small:       "racer_cache_bytes"                  r#"{class="small"}"#         Gauge   "Media the cache holds, by class.",
+    cache_bytes_huge:        "racer_cache_bytes"                  r#"{class="huge"}"#          Gauge   "Media the cache holds, by class.",
+    cache_borrowed_small:    "racer_cache_borrowed_bytes"         r#"{class="small"}"#         Gauge   "Cache media on loan from the allocator's free list rather than the store's tail, by class.",
+    cache_borrowed_huge:     "racer_cache_borrowed_bytes"         r#"{class="huge"}"#          Gauge   "Cache media on loan from the allocator's free list rather than the store's tail, by class.",
+    cache_tail_bytes:        "racer_cache_tail_bytes"             ""                           Gauge   "Store bytes past the end of the layout, the space the cache is carved from.",
+    cache_unused_bytes:      "racer_cache_unused_bytes"           ""                           Gauge   "Tail the cache is not holding because policy.cache_index_bytes will not pay to index it.",
 
     // allocator
     alloc_slots_small:       "racer_alloc_slots"                  r#"{class="small"}"#         Gauge   "Page slots on this node, by slab class.",

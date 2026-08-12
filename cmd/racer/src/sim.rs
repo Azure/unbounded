@@ -701,7 +701,7 @@ impl Sim {
         let mut t = String::new();
         t.push_str("generation 1\n");
         t.push_str(&format!(
-            "node id={id} zone=1 cohort=0 store=/sim/n{id}/store size={STORE_BYTES} cache_4k=0 cache_4m=0 max_iops={}\n",
+            "node id={id} zone=1 cohort=0 store=/sim/n{id}/store size={STORE_BYTES} max_iops={}\n",
             o.device_iops
         ));
         // The index ceiling is a real check; give it room for the extents we declare.

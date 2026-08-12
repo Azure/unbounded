@@ -1186,7 +1186,7 @@ impl Paxos {
         if let Some((r, _)) = agreed
             && cached == Some(r)
         {
-            self.cache.served();
+            self.cache.served(sink.huge());
             self.stat(|s| s.read_matched += 1);
             return Ok(Some(r));
         }
@@ -1271,7 +1271,7 @@ impl Paxos {
             self.cache.forget(addr, true).await;
             return false;
         }
-        self.cache.served();
+        self.cache.served(true);
         self.stat(|s| s.read_matched += 1);
         true
     }

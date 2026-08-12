@@ -4,14 +4,23 @@
 //!
 //! ```text
 //! +-----------+--------+-----------------------------+-------------------------+-------------+
-//! | Superblk  | zeroes |      Metadata region        |       Data region       |    Cache    |
-//! | x4 copies |  4 MiB | small A|B | huge A|B        | 4 KiB slab | 4 MiB slab | 4k  |  4m   |
+//! | Superblk  | zeroes |      Metadata region        |       Data region       |    Tail     |
+//! | x4 copies |  4 MiB | small A|B | huge A|B        | 4 KiB slab | 4 MiB slab | 4 MiB chunks|
 //! +-----------+--------+-----------------------------+-------------------------+-------------+
 //!                       <---------- authoritative, mblock-backed -------------> <-no metadata->
+//!                                                                    alloc_end -^
 //! ```
 //!
 //! The 4 MiB of zeroes belongs to no region: it is the source a read of a never-written
 //! page DMAs from.
+//!
+//! The tail is everything between `alloc_end` and the end of the store. It is not
+//! carved, not named by any superblock word, and not persisted: [`Geometry::tail`]
+//! derives it at every open from `alloc_end` and the configured size. The cache lives
+//! there, and it can because the cache is volatile: nothing points at those bytes
+//! after a restart, so their placement need not be stable across one. `grow` places at
+//! `alloc_end`, so added capacity eats into the tail and the next boot simply derives a
+//! smaller one; no durable byte ever moves.
 
 use std::io;
 #[cfg(not(feature = "sim"))]
@@ -39,16 +48,14 @@ const SB_MAGIC: u32 = 0x5243_5342; // "RCSB"
 const MB_MAGIC: u32 = 0x524d_4232; // "RMB2"
 /// One run of mblocks per class.
 ///
-/// Version 3 is the universe address space: an entry's address is `universe:26 |
-/// lba:38` where 1 and 2 held `volume:32 | offset:32`, and a seal names a globally
-/// unique extent id where it used to name a volume and a position within it. Nothing
-/// about either is detectable from the bytes, so the version is the only guard and a
-/// store written by an older build has to be reformatted.
-const FMT_VER: u16 = 3;
-/// A layout `grow` has appended to. A build that predates growth must not open one, so
-/// it gets its own version rather than a flag: that build would read extent 0's block
-/// count as the whole class and put copy B of every block at the wrong offset.
-const FMT_VER_EXT: u16 = 4;
+/// Version 5 moved the cache out of a statically carved region and into the derived
+/// tail, which dropped four geometry words and shifted the growth table. Version 3 was
+/// the universe address space: an entry's address is `universe:26 | lba:38` where 1 and
+/// 2 held `volume:32 | offset:32`, and a seal names a globally unique extent id where it
+/// used to name a volume and a position within it. Version 4 marked a grown layout.
+/// Nothing about any of it is detectable from the bytes, so the version is the only
+/// guard and a store written by an older build has to be reformatted.
+const FMT_VER: u16 = 5;
 const SB_COPIES: u64 = 4;
 const SB_REGION: u64 = SB_COPIES * MBLOCK as u64;
 const ZERO_BYTES: u64 = HUGE_PAGE;
@@ -56,11 +63,16 @@ const ZERO_BYTES: u64 = HUGE_PAGE;
 /// table); the geometry words and the growth table must not reach into it.
 const SB_RESERVED: usize = 3072;
 
+/// The unit the tail is carved into and the unit the cache moves between classes. One
+/// 4 MiB chunk is 1024 slots of the small class or exactly one slot of the huge class,
+/// and being 4 MiB aligned it satisfies O_DIRECT for either.
+pub(crate) const CHUNK_BYTES: u64 = HUGE_PAGE;
+
 /// Both classes in the order their ids are tagged with on disk.
 const CLASSES: [Class; 2] = [Class::Small, Class::Huge];
 
 fn ver_ok(v: u16) -> bool {
-    v == FMT_VER || v == FMT_VER_EXT
+    v == FMT_VER
 }
 
 /// Which slab a page lives in. This, not the extent's type, decides whether the page
@@ -72,6 +84,11 @@ pub(crate) enum Class {
 }
 
 impl Class {
+    /// The class the `huge` flag that rides every request names.
+    pub(crate) fn of(huge: bool) -> Class {
+        if huge { Class::Huge } else { Class::Small }
+    }
+
     pub(crate) fn bytes(self) -> u64 {
         match self {
             Class::Small => SMALL_PAGE,
@@ -257,15 +274,15 @@ const MAX_EXT: usize = 8;
 /// Where every region starts and how big it is. Computed at format time from the config
 /// and carried in the superblock; `grow` appends to it, and nothing else recomputes it
 /// at runtime.
+///
+/// The cache is deliberately absent. It lives in the tail past `alloc_end`, which
+/// [`Geometry::tail`] derives from the configured store size at every open.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Geometry {
     pub(crate) zero_base: u64,
-    pub(crate) cache_small: u64,
-    pub(crate) cache_small_bytes: u64,
-    pub(crate) cache_huge: u64,
-    pub(crate) cache_huge_bytes: u64,
-    /// First byte past everything the layout uses. `grow` places from here.
-    total: u64,
+    /// First byte past everything the layout owns. `grow` places from here, and the
+    /// cache tail starts at the next 4 MiB boundary at or after it.
+    alloc_end: u64,
     small: [Extent; MAX_EXT],
     huge: [Extent; MAX_EXT],
     n_small: u8,
@@ -288,8 +305,8 @@ fn align_up(x: u64, a: u64) -> u64 {
     x.div_ceil(a) * a
 }
 
-/// The geometry words: extent 0 of each class and the regions growth never moves.
-const WORDS: usize = 14;
+/// The geometry words: extent 0 of each class, and where the layout ends.
+const WORDS: usize = 10;
 /// The growth table, between the geometry words and the consensus record. A flat list
 /// of the extents `grow` appended, tagged with their class.
 const GT_MAGIC: u32 = 0x5247_5854; // "RGXT"
@@ -322,14 +339,7 @@ impl Geometry {
             at += e.mblocks * class.k() as u64 * class.bytes();
             g.push(class, e).expect("first extent of an empty geometry");
         }
-        g.cache_small = at;
-        g.cache_small_bytes = cfg.node.cache_bytes_4k / SMALL_PAGE * SMALL_PAGE;
-        at += g.cache_small_bytes;
-        at = align_up(at, HUGE_PAGE);
-        g.cache_huge = at;
-        g.cache_huge_bytes = cfg.node.cache_bytes_4m / HUGE_PAGE * HUGE_PAGE;
-        at += g.cache_huge_bytes;
-        g.total = at;
+        g.alloc_end = at;
 
         g.check(store_bytes)?;
         Ok(g)
@@ -359,9 +369,9 @@ impl Geometry {
     /// reads nothing but the layout itself: a growth cut short by a crash is placed at
     /// the same offsets and rewritten on the next boot.
     fn append(&mut self, class: Class, n: u64) -> io::Result<()> {
-        let meta = self.total;
+        let meta = self.alloc_end;
         let data = align_up(meta + n * 2 * MBLOCK as u64, class.bytes());
-        self.total = data + n * class.k() as u64 * class.bytes();
+        self.alloc_end = data + n * class.k() as u64 * class.bytes();
         self.push(
             class,
             Extent {
@@ -414,27 +424,49 @@ impl Geometry {
         e.data + (slot as u64 - first * k) * class.bytes()
     }
 
-    /// Slots in a class's cache region. The region is statically carved, so this is a
-    /// division and not an accounting question: the cache has no free list. It is also
-    /// the one region growth leaves alone.
-    pub(crate) fn cache_slots(&self, class: Class) -> u64 {
-        match class {
-            Class::Small => self.cache_small_bytes,
-            Class::Huge => self.cache_huge_bytes,
-        }
-        .checked_div(class.bytes())
-        .unwrap_or(0)
+    /// First byte past everything the layout owns.
+    pub(crate) fn alloc_end(&self) -> u64 {
+        self.alloc_end
     }
 
-    /// Byte offset of a cache slot. A space separate from `slot_off`: cache pressure
-    /// can never reach the allocator's watermarks, and the allocator can never reclaim
-    /// cache space.
-    pub(crate) fn cache_off(&self, class: Class, slot: u32) -> u64 {
-        let base = match class {
-            Class::Small => self.cache_small,
-            Class::Huge => self.cache_huge,
-        };
-        base + slot as u64 * class.bytes()
+    /// The cache tail: base offset and length, in whole 4 MiB chunks, of everything
+    /// between the end of the layout and the end of the store.
+    ///
+    /// Derived at every open and never written down. That is sound only because the
+    /// cache is volatile: nothing points at these bytes after a restart, so a growth
+    /// that moves `alloc_end` up simply yields a shorter tail next boot, and the bytes
+    /// the new extent lands on were cache and are now slab. The alternative, carving
+    /// the cache at format time, is what froze it at a size chosen before anyone knew
+    /// how big the store would get.
+    pub(crate) fn tail(&self, store_bytes: u64) -> (u64, u64) {
+        let base = align_up(self.alloc_end(), CHUNK_BYTES);
+        let end = store_bytes / CHUNK_BYTES * CHUNK_BYTES;
+        (base, end.saturating_sub(base))
+    }
+
+    /// 4 MiB chunks the tail holds.
+    pub(crate) fn tail_chunks(&self, store_bytes: u64) -> u64 {
+        self.tail(store_bytes).1 / CHUNK_BYTES
+    }
+
+    /// The slot a data-region offset belongs to, the inverse of [`Self::slot_off`].
+    /// `None` when the offset is not the start of a slot of this class, which is how
+    /// the allocator checks that a chunk the cache hands back is one it lent out.
+    pub(crate) fn slot_at(&self, class: Class, off: u64) -> Option<u32> {
+        let k = class.k() as u64;
+        let mut first = 0;
+        for e in self.extents(class) {
+            let len = e.mblocks * k * class.bytes();
+            if off >= e.data && off < e.data + len {
+                let rel = off - e.data;
+                if !rel.is_multiple_of(class.bytes()) {
+                    return None;
+                }
+                return u32::try_from(first * k + rel / class.bytes()).ok();
+            }
+            first += e.mblocks;
+        }
+        None
     }
 
     /// Byte offset of one copy of an mblock. Copies A and B sit a whole run apart
@@ -447,21 +479,14 @@ impl Geometry {
         e.meta + (copy as u64 * e.mblocks + (id as u64 - first)) * MBLOCK as u64
     }
 
-    /// Whether this layout has been grown. A grown store is written at a format version
-    /// an older build refuses, because that build would read extent 0's block count as
-    /// the whole class and address copy B of every block at the wrong offset.
-    fn grown(&self) -> bool {
-        self.n_small > 1 || self.n_huge > 1
-    }
-
     /// The two limits a layout has to stay inside, checked wherever one is built.
     fn check(&self, store_bytes: u64) -> io::Result<()> {
-        if self.total > store_bytes {
+        if self.alloc_end > store_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "config needs {} B, node.store.size_bytes is {store_bytes} B",
-                    self.total
+                    self.alloc_end
                 ),
             ));
         }
@@ -487,7 +512,7 @@ impl Geometry {
     fn patch(&self, b: &mut [u8]) {
         b[..CS_OFF].fill(0);
         b[0..4].copy_from_slice(&SB_MAGIC.to_le_bytes());
-        b[4..6].copy_from_slice(&if self.grown() { FMT_VER_EXT } else { FMT_VER }.to_le_bytes());
+        b[4..6].copy_from_slice(&FMT_VER.to_le_bytes());
         b[6..8].copy_from_slice(&(K_SMALL as u16).to_le_bytes());
         b[8..10].copy_from_slice(&(K_HUGE as u16).to_le_bytes());
         for (i, v) in self.words().iter().enumerate() {
@@ -522,11 +547,7 @@ impl Geometry {
         }
         let mut g = Geometry {
             zero_base: w[0],
-            cache_small: w[9],
-            cache_small_bytes: w[10],
-            cache_huge: w[11],
-            cache_huge_bytes: w[12],
-            total: w[13],
+            alloc_end: w[9],
             ..Geometry::default()
         };
         g.push(
@@ -549,9 +570,8 @@ impl Geometry {
         Some(g)
     }
 
-    /// Extent 0 of each class, plus the regions growth never touches. This is the layout
-    /// the first version of the format had, kept word for word so a store written by it
-    /// still opens.
+    /// Extent 0 of each class, plus where the layout ends. Everything `grow` added is
+    /// in the growth table below rather than here.
     fn words(&self) -> [u64; WORDS] {
         let (s, h) = (self.small[0], self.huge[0]);
         [
@@ -564,20 +584,14 @@ impl Geometry {
             h.data,
             s.mblocks * K_SMALL as u64,
             h.mblocks * K_HUGE as u64,
-            self.cache_small,
-            self.cache_small_bytes,
-            self.cache_huge,
-            self.cache_huge_bytes,
-            self.total,
+            self.alloc_end,
         ]
     }
 
-    /// The extents `grow` appended, in id order within each class. Absent on a store
-    /// that has never grown, and on one formatted before this table existed.
+    /// The extents `grow` appended, in id order within each class. Always written, even
+    /// when empty: the header is what a reader checks, so there is one shape of
+    /// superblock rather than two.
     fn save_growth(&self, b: &mut [u8]) {
-        if !self.grown() {
-            return;
-        }
         let mut at = GT_OFF + GT_HDR;
         let mut n = 0u16;
         for (tag, class) in CLASSES.into_iter().enumerate() {
@@ -591,16 +605,13 @@ impl Geometry {
             }
         }
         b[GT_OFF..GT_OFF + 4].copy_from_slice(&GT_MAGIC.to_le_bytes());
-        b[GT_OFF + 4..GT_OFF + 6].copy_from_slice(&FMT_VER_EXT.to_le_bytes());
+        b[GT_OFF + 4..GT_OFF + 6].copy_from_slice(&FMT_VER.to_le_bytes());
         b[GT_OFF + 6..GT_OFF + 8].copy_from_slice(&n.to_le_bytes());
     }
 
     fn load_growth(&mut self, b: &[u8]) -> Option<()> {
-        if u32(&b[GT_OFF..]) != GT_MAGIC {
-            return Some(());
-        }
         let n = u16(&b[GT_OFF + 6..]) as usize;
-        if u16(&b[GT_OFF + 4..]) != FMT_VER_EXT || n > GT_ROWS {
+        if u32(&b[GT_OFF..]) != GT_MAGIC || u16(&b[GT_OFF + 4..]) != FMT_VER || n > GT_ROWS {
             return None;
         }
         for i in 0..n {
@@ -1450,7 +1461,7 @@ mod tests {
 
     fn test_config() -> crate::config::Config {
         crate::config::Config::parse(
-            "node id=1 zone=1 store=/dev/x size=68719476736 cache_4k=4194304 cache_4m=8388608
+            "node id=1 zone=1 store=/dev/x size=68719476736
              universe 1
                group 1 2 3
                extent id=1 base=0 pages=5000 kind=lww zone=1
@@ -1486,12 +1497,7 @@ mod tests {
     /// Every byte range a layout hands out, so growth can be checked for overlap without
     /// enumerating millions of slots.
     fn ranges(g: &Geometry) -> Vec<(u64, u64)> {
-        let mut v = vec![
-            (0, SB_REGION),
-            (g.zero_base, g.zero_base + ZERO_BYTES),
-            (g.cache_small, g.cache_small + g.cache_small_bytes),
-            (g.cache_huge, g.cache_huge + g.cache_huge_bytes),
-        ];
+        let mut v = vec![(0, SB_REGION), (g.zero_base, g.zero_base + ZERO_BYTES)];
         for class in CLASSES {
             let mut first = 0;
             for e in g.extents(class) {
@@ -1531,28 +1537,24 @@ mod tests {
         // where their entries say they are.
         assert_eq!(g.extents(Class::Small)[0], g0.extents(Class::Small)[0]);
         assert_eq!(g.extents(Class::Huge)[0], g0.extents(Class::Huge)[0]);
-        assert_eq!(
-            (g.zero_base, g.cache_small, g.cache_huge),
-            (g0.zero_base, g0.cache_small, g0.cache_huge)
-        );
-        assert!(g.total > g0.total);
+        assert_eq!(g.zero_base, g0.zero_base);
+        // Growth only ever eats into the tail, from the front.
+        assert!(g.alloc_end() > g0.alloc_end());
 
         // Ids simply continue, and every range is disjoint and on the device.
         assert_eq!(g.mblocks(Class::Small), g0.mblocks(Class::Small) + 47);
         assert_eq!(g.mblocks(Class::Huge), g0.mblocks(Class::Huge) + 2);
         let v = ranges(&g);
         for (i, a) in v.iter().enumerate() {
-            assert!(a.1 <= g.total, "{a:?} runs past the end");
+            assert!(a.1 <= g.alloc_end(), "{a:?} runs past the end");
             for b in &v[i + 1..] {
                 assert!(a.1 <= b.0 || b.1 <= a.0, "{a:?} overlaps {b:?}");
             }
         }
 
-        // A grown layout is written at its own version, so a build without this code
-        // refuses the device instead of misreading it.
         let mut b = vec![0u8; MBLOCK];
         g.encode(&mut b);
-        assert_eq!(u16(&b[4..]), FMT_VER_EXT);
+        assert_eq!(u16(&b[4..]), FMT_VER);
         assert_eq!(Geometry::decode(&b).unwrap(), g);
 
         // Patching a live superblock leaves the consensus record alone.
@@ -1565,6 +1567,58 @@ mod tests {
         g.patch(&mut b);
         assert_eq!(Geometry::decode(&b).unwrap(), g);
         assert_eq!(Consensus::decode(&b).terms, vec![(GroupId::new(4, 7), 9)]);
+    }
+
+    /// The tail is whatever the layout did not claim, in whole chunks, and growth takes
+    /// it back from the front. Nothing durable moves when it shrinks, which is the whole
+    /// reason it can be derived instead of written down.
+    #[test]
+    fn the_tail_is_what_the_layout_did_not_claim() {
+        let cfg = test_config();
+        const SIZE: u64 = 64 << 30;
+        let g0 = Geometry::plan(SIZE, &cfg).unwrap();
+
+        let (base, len) = g0.tail(SIZE);
+        assert_eq!(base % CHUNK_BYTES, 0);
+        assert!(base >= g0.alloc_end());
+        assert!(base - g0.alloc_end() < CHUNK_BYTES);
+        assert_eq!(len % CHUNK_BYTES, 0);
+        assert_eq!(base + len, SIZE / CHUNK_BYTES * CHUNK_BYTES);
+        assert_eq!(g0.tail_chunks(SIZE), len / CHUNK_BYTES);
+
+        // Growing the layout takes chunks off the front of the tail and moves nothing.
+        let mut g = g0;
+        g.append(Class::Huge, 2).unwrap();
+        let (grown_base, grown_len) = g.tail(SIZE);
+        assert!(grown_base > base);
+        assert!(grown_len < len);
+        assert_eq!(grown_base + grown_len, base + len);
+
+        // A store with no room past its slabs has no tail, and says so rather than
+        // wrapping.
+        let tight = Geometry::plan(SIZE, &cfg).unwrap();
+        assert_eq!(tight.tail(tight.alloc_end()).1, 0);
+        assert_eq!(tight.tail_chunks(0), 0);
+    }
+
+    /// `slot_at` is `slot_off` backwards, which is how the allocator checks that a chunk
+    /// the cache hands back is one it lent out.
+    #[test]
+    fn a_data_offset_names_the_slot_it_starts() {
+        let g = Geometry::plan(64 << 30, &test_config()).unwrap();
+        for class in CLASSES {
+            for slot in [0u32, 1, 7, (g.slots(class) - 1) as u32] {
+                assert_eq!(g.slot_at(class, g.slot_off(class, slot)), Some(slot));
+            }
+            // Not the start of a slot, and past the last one.
+            assert_eq!(g.slot_at(class, g.slot_off(class, 3) + 1), None);
+            assert_eq!(g.slot_at(class, g.extents(class)[0].data - 1), None);
+            assert_eq!(g.slot_at(class, g.slot_off(class, 0) - class.bytes()), None);
+        }
+        // A tail offset belongs to no slot: a cache chunk carved out of the tail can
+        // never be mistaken for a loan.
+        let (base, _) = g.tail(64 << 30);
+        assert_eq!(g.slot_at(Class::Huge, base), None);
     }
 
     #[test]

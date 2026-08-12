@@ -149,7 +149,11 @@ impl Node {
                 metrics::init(cores);
                 // Consensus is leaked for the same reason the allocator is: a hop closure
                 // must be `'static`, and both live as long as the process anyway.
-                let p = paxos::open(alloc, cache::open(alloc, cores), cores);
+                let cache = cache::open(alloc, cores);
+                // The allocator calls loans of free 4 MiB slots back through this, from
+                // inside a reservation. Installed before any worker runs.
+                alloc.attach(cache);
+                let p = paxos::open(alloc, cache, cores);
                 let _ = self.paxos.set(p);
                 let _ = self.heal.set(heal::open(p, cores));
                 p
@@ -226,13 +230,26 @@ fn sample(d: &Dataplane) {
         heal_failed: h.failed,
         heal_oversized: h.oversized,
         heal_dropped: h.dropped,
-        cache_hits: c.hits,
-        cache_misses: c.misses,
-        cache_served: c.served,
-        cache_admits: c.admits,
-        cache_evictions: c.evictions,
-        cache_stale: c.stale,
-        cache_shed: c.shed,
+        cache_hits_small: c.per[0].hits,
+        cache_hits_huge: c.per[1].hits,
+        cache_misses_small: c.per[0].misses,
+        cache_misses_huge: c.per[1].misses,
+        cache_served_small: c.per[0].served,
+        cache_served_huge: c.per[1].served,
+        cache_admits_small: c.per[0].admits,
+        cache_admits_huge: c.per[1].admits,
+        cache_evictions_small: c.per[0].evictions,
+        cache_evictions_huge: c.per[1].evictions,
+        cache_dropped_small: c.per[0].dropped,
+        cache_dropped_huge: c.per[1].dropped,
+        cache_stale_small: c.per[0].stale,
+        cache_stale_huge: c.per[1].stale,
+        cache_shed_small: c.per[0].shed,
+        cache_shed_huge: c.per[1].shed,
+        cache_bytes_small: c.per[0].bytes,
+        cache_bytes_huge: c.per[1].bytes,
+        cache_borrowed_small: c.per[0].borrowed_bytes,
+        cache_borrowed_huge: c.per[1].borrowed_bytes,
         alloc_slots_small: small.1,
         alloc_slots_huge: huge.1,
         alloc_free_small: small.0,
@@ -257,6 +274,12 @@ fn sample(d: &Dataplane) {
         // a restart, so until then the shortfall is a number to alert on rather than a
         // silent ENOSPC once the free lists run down.
         s.alloc_unbacked = layout::shortfall(&a.geometry(), cfg);
+        // The tail and the part of it nobody holds. Both are node-wide, and the second
+        // is the one to watch: a large gap means the store has cache space that
+        // `policy.cache_index_bytes` will not pay to index.
+        let (tail, unused) = d.cache.tail_bytes();
+        s.cache_tail_bytes = tail;
+        s.cache_unused_bytes = unused;
         // Device-wide rather than per core, so only one worker reports it.
         s.store_throttle_us = a.store_waited_us();
         s.config_generation = cfg.generation;
