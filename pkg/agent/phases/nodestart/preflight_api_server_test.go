@@ -40,6 +40,7 @@ func TestCheckAPIServerReachableInvalidEndpoint(t *testing.T) {
 
 func TestCheckAPIServerReachableRequestFailureIncludesEndpointAndNetworkError(t *testing.T) {
 	const endpoint = "https://api.example.com:6443"
+
 	networkErr := errors.New("DNS resolution failed")
 	checker := apiServerReachableChecker{
 		config: apiServerPreflightConfig(endpoint),
