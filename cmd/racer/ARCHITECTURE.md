@@ -55,9 +55,10 @@ The checked configuration describes:
   overlap, and their ids are unique across every universe the node holds, which
   is what lets a seal name one with a bare 32-bit id.
 - Devices. A device is a local ublk block device: an ordered list of whole
-  extents, concatenated. A device may not mix the two page sizes, but it is
-  otherwise free, so two hosts may map the same extents in different orders and
-  combinations and no page's address moves when they do.
+  extents, concatenated, exported at the minor its id names. Page size belongs
+  to the extent, so a device may concatenate both; it is otherwise free, so two
+  hosts may map the same extents in different orders and combinations and no
+  page's address moves when they do.
 - Runtime policy. Cache admission is per extent, not here.
 
 An address hashes to a fixed slot, which names its consensus group within its
@@ -152,18 +153,21 @@ applying block-layer backpressure. The sparse fabric device has a logical size
 of 4 EiB to provide an LBA address space for protocol frames.
 
 A device maps a request to a page by walking its extents, so a request that
-lands outside every extent is refused. Extent geometry then prevents a request
-from crossing an allocator page:
+lands outside every extent is refused. A device exports 4 KiB logical blocks and
+takes requests of up to 4 MiB, so a request may cover several pages and, where a
+device concatenates both page sizes, pages of either kind. The whole request is
+cut into per-page pieces and checked before any of it is applied, so a request
+with one impossible piece changes nothing:
 
-- A 4 KiB request is copied between the ublk guest buffer and a registered
-  pool buffer so Racer can checksum it.
-- A 4 MiB request uses its registered guest buffer directly. Writes must cover
+- A 4 KiB piece is copied between the ublk guest buffer and a registered pool
+  buffer so Racer can checksum it.
+- A 4 MiB piece uses its registered guest buffer directly. Writes must cover
   exactly one page. Reads may be partial, including remote and local-cache
   reads; remote admission and repair still transfer whole pages, though a
   transport may deliver one in pieces.
 - Reads of holes return zeroes. Huge holes are filled from a format-time zero
   region because opaque guest buffers cannot be cleared directly.
-- Discard becomes a consensus trim.
+- Discard becomes a consensus trim, and so must also cover a whole 4 MiB page.
 
 Fabric requests enter through a device key tagged with their universe, which is
 the only place a universe is ever named. Their LBA is decoded, validated against
