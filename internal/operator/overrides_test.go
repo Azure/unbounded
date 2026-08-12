@@ -398,10 +398,16 @@ func TestDropOverridableOperationsKeepsEverythingElse(t *testing.T) {
 		component.Operation{Kind: component.OpDelete, Object: unstructuredOf("apps/v1", "DaemonSet", "legacy"), Component: "gantry"},
 	)
 
-	skipped := dropOverridableOperations(plan)
+	withheld := dropOverridableOperations(plan, errors.New("document is unusable"))
 
-	if len(skipped) != 1 {
-		t.Fatalf("skipped = %d, want 1", len(skipped))
+	if len(withheld) != 1 {
+		t.Fatalf("withheld = %d, want 1", len(withheld))
+	}
+
+	// The component and Site travel with it, or the status path cannot
+	// attribute the withheld workload to anything.
+	if withheld[0].Component != "net" {
+		t.Fatalf("withheld component = %q, want net", withheld[0].Component)
 	}
 
 	if len(plan.Operations) != 2 {
@@ -836,4 +842,52 @@ func (s *recordingEventSink) on(name string) (recordedEvent, bool) {
 	}
 
 	return recordedEvent{}, false
+}
+
+// TestInvalidDocumentLeavesComponentsNotReady is a regression test.
+//
+// An unusable document removes every overridable workload from the plan before
+// execution. Because those operations never ran, they produced no result, and
+// CombineResult had nothing to look at, so each component reported the
+// Reconciled verdict it had planned with. The Site simultaneously said
+// overrides were Degraded and that every component was Ready, about the same
+// objects.
+//
+// Leaving the running workload untouched is the point; claiming it was
+// reconciled is not.
+func TestInvalidDocumentLeavesComponentsNotReady(t *testing.T) {
+	site := siteFor("edge")
+
+	r, _, cl := overrideTestEnv(t, site, overridesConfigMap(map[string]string{
+		"overrides.yaml": "apiVersion: " + override.APIVersion +
+			"\noverrides:\n  - component: net\n    kind: DaemonSet\n    patch:\n      metadata:\n        name: renamed\n",
+	}))
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKey{Name: "edge"}}); err == nil {
+		t.Fatal("an unusable document must fail the pass")
+	}
+
+	var got unboundedv1alpha3.Site
+	if err := cl.Get(t.Context(), client.ObjectKey{Name: "edge"}, &got); err != nil {
+		t.Fatalf("get site: %v", err)
+	}
+
+	if got.Status.Overrides == nil || got.Status.Overrides.Phase != unboundedv1alpha3.OverridePhaseDegraded {
+		t.Fatalf("override status = %+v, want Degraded", got.Status.Overrides)
+	}
+
+	condition := apimeta.FindStatusCondition(got.Status.Conditions, "NetReady")
+	if condition == nil {
+		t.Fatal("NetReady condition not found")
+	}
+
+	if condition.Status != metav1.ConditionTrue {
+		if condition.Reason != component.ReasonOverrideNotApplied {
+			t.Fatalf("NetReady reason = %q, want %q", condition.Reason, component.ReasonOverrideNotApplied)
+		}
+
+		return
+	}
+
+	t.Fatalf("NetReady = True while overrides are Degraded; the component withheld its workload and cannot be reconciled")
 }

@@ -689,3 +689,124 @@ func (creatingCluster) Plan(
 
 	return plan, component.Reconciled(), nil
 }
+
+// failingCluster plans one operation that always fails, so tests can drive the
+// executor's failure paths through the real reconciler.
+type failingCluster struct {
+	name      string
+	condition string
+	object    *unstructured.Unstructured
+}
+
+func (f failingCluster) Name() string          { return f.name }
+func (f failingCluster) ConditionType() string { return f.condition }
+
+func (f failingCluster) Plan(
+	context.Context, *component.Env, []unboundedv1alpha3.Site,
+) (*component.Plan, component.Result, error) {
+	plan := component.NewPlan()
+	plan.Add(component.Operation{Kind: component.OpApply, Object: f.object, Component: f.name})
+
+	return plan, component.Reconciled(), nil
+}
+
+// TestReconcileSurfacesFailuresNoComponentOwns is a regression test for a
+// permanent stall.
+//
+// The namespace every component installs into is planned by the operator, not
+// by any component, so its results carry a name the registry does not know.
+// Nothing computing per-component conditions could report it. A failed
+// namespace skips every namespaced operation, and skipped operations carry no
+// error and no requeue, so the pass returned success, no work had been done,
+// and nothing was going to trigger another attempt.
+func TestReconcileSurfacesFailuresNoComponentOwns(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+
+	registry := &component.Registry{
+		Cluster: []component.ClusterComponent{
+			fakeCluster{name: "net", condition: "NetReady", result: component.Reconciled()},
+		},
+	}
+
+	denied := errors.New("quota exceeded")
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(site).
+		WithStatusSubresource(site).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				named, ok := obj.(interface{ GetKind() string })
+				if ok && named.GetKind() == component.NamespaceKind {
+					return denied
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)})
+	if err == nil {
+		t.Fatal("a failed namespace must fail the pass; nothing else will trigger another one")
+	}
+
+	if !errors.Is(err, denied) {
+		t.Fatalf("error = %v, want it to carry the underlying failure", err)
+	}
+}
+
+// TestReconcileReportsPlanRejectionOnEveryComponent is a regression test.
+//
+// A plan the executor refuses outright, for a dependency cycle or contradictory
+// shared operations, writes nothing at all. The error was returned, but every
+// component condition was still computed from its planning verdict, so all of
+// them reported Reconciled for a plan that never ran.
+func TestReconcileReportsPlanRejectionOnEveryComponent(t *testing.T) {
+	scheme := newReconcilerTestScheme(t)
+	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}
+
+	// An object with no GVK is one the executor refuses to route, which
+	// rejects the whole plan before anything is written.
+	broken := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "no-gvk", "namespace": component.DefaultNamespace},
+	}}
+
+	registry := &component.Registry{
+		Cluster: []component.ClusterComponent{
+			fakeCluster{name: "net", condition: "NetReady", result: component.Reconciled()},
+			failingCluster{name: "machina", condition: "MachinaReady", object: broken},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(site).WithStatusSubresource(site).Build()
+	r := &SiteReconciler{Client: cl, Scheme: scheme, Registry: registry}
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(site)}); err == nil {
+		t.Fatal("a rejected plan must fail the pass")
+	}
+
+	var got unboundedv1alpha3.Site
+	if err := cl.Get(t.Context(), client.ObjectKeyFromObject(site), &got); err != nil {
+		t.Fatalf("get site: %v", err)
+	}
+
+	// Every component, including the one that planned perfectly good work.
+	for _, conditionType := range []string{"NetReady", "MachinaReady"} {
+		condition := apimeta.FindStatusCondition(got.Status.Conditions, conditionType)
+		if condition == nil {
+			t.Fatalf("condition %q not found", conditionType)
+		}
+
+		if condition.Status != metav1.ConditionFalse {
+			t.Fatalf("%s = %s, want False: nothing in this pass was written", conditionType, condition.Status)
+		}
+
+		if condition.Reason != component.ReasonPlanRejected {
+			t.Fatalf("%s reason = %q, want %q", conditionType, condition.Reason, component.ReasonPlanRejected)
+		}
+	}
+}

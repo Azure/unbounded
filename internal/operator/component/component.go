@@ -95,6 +95,28 @@ type Registry struct {
 	Site    []SiteComponent
 }
 
+// Knows reports whether a component name belongs to this registry.
+//
+// The executor also runs operations no component owns, such as the namespace
+// every component installs into. Their results are attributed to a name the
+// registry does not know, so nothing publishing per-component conditions can
+// report them, and without this the reconciler had no way to notice.
+func (r *Registry) Knows(name string) bool {
+	for _, c := range r.Cluster {
+		if c.Name() == name {
+			return true
+		}
+	}
+
+	for _, c := range r.Site {
+		if c.Name() == name {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Validate rejects an empty registry and duplicate Name or ConditionType values
 // across both lists, so a misconfigured registry fails fast at startup rather
 // than silently dropping or double-publishing a condition.

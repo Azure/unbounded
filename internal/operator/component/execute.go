@@ -30,6 +30,17 @@ const (
 	// workload whose ConfigMap failed to write would produce a pod that cannot
 	// mount, which is worse than not writing the workload at all.
 	OpSkipped
+
+	// OpDropped means the operation was removed from the plan before execution,
+	// because the overrides that would have shaped it could not be used. The
+	// executor never sees it, so it is recorded by whatever removed it.
+	//
+	// It exists because "removed from the plan" and "never planned" are
+	// different, and only the first should stop a component reporting itself
+	// reconciled. Without it a component whose workload was withheld still
+	// reported Reconciled from its planning verdict, while the Site's override
+	// status said Degraded about the very same object.
+	OpDropped
 )
 
 // String renders an OpStatus for error messages and test failures.
@@ -41,6 +52,8 @@ func (s OpStatus) String() string {
 		return "Failed"
 	case OpSkipped:
 		return "Skipped"
+	case OpDropped:
+		return "Dropped"
 	default:
 		return fmt.Sprintf("OpStatus(%d)", int(s))
 	}
@@ -99,6 +112,11 @@ func (r ExecutionResult) Failed() []OperationResult {
 // dependency failed.
 func (r ExecutionResult) Skipped() []OperationResult {
 	return r.withStatus(OpSkipped)
+}
+
+// Dropped returns the operations removed from the plan before execution.
+func (r ExecutionResult) Dropped() []OperationResult {
+	return r.withStatus(OpDropped)
 }
 
 func (r ExecutionResult) withStatus(status OpStatus) []OperationResult {
@@ -603,6 +621,7 @@ func CombineResult(componentName, site string, planned Result, exec ExecutionRes
 	var (
 		errs    []error
 		skipped []OperationResult
+		dropped []OperationResult
 	)
 
 	for _, result := range exec.Results {
@@ -619,6 +638,8 @@ func CombineResult(componentName, site string, planned Result, exec ExecutionRes
 			errs = append(errs, fmt.Errorf("%s %s: %w", result.Kind, result.Ref, result.Err))
 		case result.Status == OpSkipped:
 			skipped = append(skipped, result)
+		case result.Status == OpDropped:
+			dropped = append(dropped, result)
 		}
 	}
 
@@ -626,11 +647,32 @@ func CombineResult(componentName, site string, planned Result, exec ExecutionRes
 		return Failed(errors.Join(errs...))
 	}
 
+	if len(dropped) > 0 {
+		return NotReady(ReasonOverrideNotApplied, describeWithheld(dropped))
+	}
+
 	if len(skipped) > 0 {
 		return NotReady(ReasonDependencyNotWritten, describeSkipped(skipped))
 	}
 
 	return planned
+}
+
+// describeWithheld explains what was removed from the plan and why.
+func describeWithheld(dropped []OperationResult) string {
+	first := dropped[0]
+
+	reason := "its overrides could not be used"
+	if first.Err != nil {
+		reason = first.Err.Error()
+	}
+
+	if len(dropped) == 1 {
+		return fmt.Sprintf("%s was left unchanged: %s", first.Ref, reason)
+	}
+
+	return fmt.Sprintf("%s and %d other object(s) were left unchanged: %s",
+		first.Ref, len(dropped)-1, reason)
 }
 
 // describeSkipped explains what was not written, naming the first object and

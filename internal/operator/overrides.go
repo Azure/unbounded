@@ -132,14 +132,19 @@ func loadOverrides(ctx context.Context, env *component.Env) overrideSnapshot {
 // ConfigMaps, adoptions and deletes all still execute, so an override typo does
 // not stop the operator doing its other work. The cost, which is deliberate, is
 // that drift on those workloads is not corrected until the document is fixed.
-func dropOverridableOperations(plan *component.Plan) []component.ObjectRef {
+func dropOverridableOperations(plan *component.Plan, cause error) []override.WithheldOperation {
 	kept := make([]component.Operation, 0, len(plan.Operations))
 
-	var skipped []component.ObjectRef
+	var withheld []override.WithheldOperation
 
 	for _, op := range plan.Operations {
 		if op.Overridable {
-			skipped = append(skipped, op.Ref())
+			withheld = append(withheld, override.WithheldOperation{
+				Ref:       op.Ref(),
+				Component: op.Component,
+				Site:      op.Site,
+				Err:       cause,
+			})
 
 			continue
 		}
@@ -149,7 +154,27 @@ func dropOverridableOperations(plan *component.Plan) []component.ObjectRef {
 
 	plan.Operations = kept
 
-	return skipped
+	return withheld
+}
+
+// withheldResults renders withheld operations as execution results, so a
+// component that had work removed before execution reaches the same status
+// path as one whose work failed during it.
+func withheldResults(withheld []override.WithheldOperation) []component.OperationResult {
+	out := make([]component.OperationResult, 0, len(withheld))
+
+	for _, op := range withheld {
+		out = append(out, component.OperationResult{
+			Ref:       op.Ref,
+			Kind:      component.OpApply,
+			Component: op.Component,
+			Site:      op.Site,
+			Status:    component.OpDropped,
+			Err:       op.Err,
+		})
+	}
+
+	return out
 }
 
 // siteNames returns the names of every Site, for resolving Site selectors.

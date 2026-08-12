@@ -197,6 +197,22 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 
 	exec, execErr := env.Execute(ctx, plan)
 
+	// Work removed before execution reaches the same status path as work that
+	// failed during it. Without this a component whose workload was withheld
+	// reported Reconciled from its planning verdict, while the Site's override
+	// status said Degraded about that very object.
+	if report != nil {
+		exec.Results = append(exec.Results, withheldResults(report.Withheld)...)
+	}
+
+	// Operations the registry does not own, such as the namespace every
+	// component installs into, are attributed to a name no component
+	// publishes. Nothing computing per-component conditions can report them,
+	// so they are collected here. A failed namespace skips every namespaced
+	// operation, and without this the pass returned no error and no requeue:
+	// reconciliation stopped and nothing was ever going to restart it.
+	unowned := unownedFailures(reg, exec)
+
 	// The document's fate is reported against the ConfigMap once per pass
 	// rather than once per Site, because that is what it is: one cluster-scoped
 	// document, whose failures are not any single Site's.
@@ -210,6 +226,8 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 	if overrideErr != nil {
 		reconcileErrs = append(reconcileErrs, overrideErr)
 	}
+
+	reconcileErrs = append(reconcileErrs, unowned...)
 
 	if len(exec.Stale) > 0 {
 		// Something was created out from under this pass, so what it computed
@@ -238,6 +256,15 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 		}
 
 		res := component.CombineResult(outcome.name, siteName, outcome.result, exec)
+
+		// A plan the executor refused outright wrote nothing at all, so no
+		// component's planning verdict describes the cluster. Reporting each
+		// of them Reconciled from a plan that never ran was the one case where
+		// every condition could be simultaneously green and wrong.
+		if execErr != nil {
+			res = component.NotReady(component.ReasonPlanRejected,
+				"the operation plan was rejected before execution: "+execErr.Error())
+		}
 
 		switch {
 		case target != nil:
@@ -295,6 +322,30 @@ func (r *SiteReconciler) runComponents(ctx context.Context, logger logr.Logger, 
 	return ctrl.Result{RequeueAfter: requeueAfter}, errors.Join(reconcileErrs...)
 }
 
+// unownedFailures returns the errors from operations no registered component
+// owns, so they surface as pass errors rather than vanishing.
+//
+// Skipped operations are deliberately excluded: the operation that caused them
+// is in this list already, and repeating its error once per dependent would
+// bury the cause.
+func unownedFailures(reg *component.Registry, exec component.ExecutionResult) []error {
+	var errs []error
+
+	for _, result := range exec.Results {
+		if result.Status != component.OpFailed || result.Err == nil {
+			continue
+		}
+
+		if reg.Knows(result.Component) {
+			continue
+		}
+
+		errs = append(errs, fmt.Errorf("%s %s: %w", result.Kind, result.Ref, result.Err))
+	}
+
+	return errs
+}
+
 // stalePlanRequeue is how soon a pass re-plans after discovering that an object
 // it expected to create already existed. Like a status conflict this is not a
 // failure, so it does not go through error backoff.
@@ -315,14 +366,15 @@ const statusConflictRequeue = time.Second
 // the pass rather than to whichever component happened to be planned first.
 func applyOverrides(logger logr.Logger, plan *component.Plan, snapshot overrideSnapshot, sites []unboundedv1alpha3.Site) (*override.Report, error) {
 	if snapshot.blocksWorkloads() {
-		skipped := dropOverridableOperations(plan)
+		withheld := dropOverridableOperations(plan, snapshot.err)
 
 		logger.Error(snapshot.err, "overrides could not be used; leaving managed workloads unchanged",
 			"configMap", override.ConfigMapName,
-			"skippedWorkloads", len(skipped),
+			"withheldWorkloads", len(withheld),
 			"resourceVersion", snapshot.resourceVersion)
 
-		return nil, fmt.Errorf("overrides unusable, %d workloads left unchanged: %w", len(skipped), snapshot.err)
+		return &override.Report{Withheld: withheld},
+			fmt.Errorf("overrides unusable, %d workloads left unchanged: %w", len(withheld), snapshot.err)
 	}
 
 	if !snapshot.usable() || len(snapshot.entries) == 0 {

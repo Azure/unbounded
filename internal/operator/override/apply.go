@@ -62,6 +62,24 @@ type Report struct {
 
 	// InertEntries are entries that matched no workload in this pass.
 	InertEntries []Source
+
+	// Withheld names the operations removed from the plan because their
+	// overrides could not be used, attributed to the component and Site that
+	// planned them.
+	//
+	// The running workload is deliberately left as it is, but the component
+	// did not write what it planned, so it must not report itself reconciled.
+	// Without this the object was simply absent from the plan and nothing
+	// downstream could tell that from "never planned".
+	Withheld []WithheldOperation
+}
+
+// WithheldOperation is one operation removed from a plan before execution.
+type WithheldOperation struct {
+	Ref       component.ObjectRef
+	Component string
+	Site      string
+	Err       error
 }
 
 // Failed reports whether any workload failed to have its overrides applied.
@@ -115,6 +133,14 @@ func Apply(plan *component.Plan, entries []SourcedEntry, knownSites []string) Re
 
 		if result.Err != nil {
 			drop = append(drop, target.Index)
+
+			op := plan.Operations[target.Index]
+			report.Withheld = append(report.Withheld, WithheldOperation{
+				Ref:       op.Ref(),
+				Component: op.Component,
+				Site:      op.Site,
+				Err:       result.Err,
+			})
 		}
 	}
 
