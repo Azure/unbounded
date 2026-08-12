@@ -22,7 +22,10 @@ import (
 )
 
 func overridesListCommand() *cobra.Command {
-	var namespace string
+	var (
+		namespace  string
+		kubeconfig string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -39,7 +42,7 @@ Example:
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := ctrl.SetupSignalHandler()
 
-			c, err := newMachineClient()
+			c, err := newMachineClientWithKubeconfig(getKubeconfigPath(kubeconfig))
 			if err != nil {
 				return err
 			}
@@ -50,6 +53,7 @@ Example:
 
 	cmd.Flags().StringVar(&namespace, "namespace", unbounded.SystemNamespace(),
 		"Namespace holding the overrides ConfigMap")
+	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 
 	return cmd
 }

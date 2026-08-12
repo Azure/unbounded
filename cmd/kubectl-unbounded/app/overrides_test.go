@@ -514,3 +514,112 @@ func indentBlock(block, indent string) string {
 
 	return strings.Join(lines, "\n")
 }
+
+// TestOverridesCommandsAcceptKubeconfig is a regression test.
+//
+// The CLI reference documents --kubeconfig as accepted by every command that
+// talks to a cluster, and every other such command in this plugin registers it.
+// The overrides commands did not, and built their client through
+// ctrl.GetConfigOrDie, which reads a flag registered on the standard library's
+// flag.CommandLine that cobra never parses. So the documented flag was rejected
+// outright and only the ambient KUBECONFIG was ever honoured.
+func TestOverridesCommandsAcceptKubeconfig(t *testing.T) {
+	for _, name := range []string{"list", "status", "validate"} {
+		t.Run(name, func(t *testing.T) {
+			var found bool
+
+			for _, cmd := range overridesCommandGroup().Commands() {
+				if cmd.Name() != name {
+					continue
+				}
+
+				found = true
+
+				if cmd.Flags().Lookup("kubeconfig") == nil {
+					t.Fatalf("overrides %s does not accept --kubeconfig, which the CLI reference documents", name)
+				}
+			}
+
+			if !found {
+				t.Fatalf("overrides %s command not found", name)
+			}
+		})
+	}
+}
+
+// TestOverridesValidateRejectsDuplicateKeysWithinOneFile is a regression test.
+//
+// A file may hold several ConfigMap documents. Their data maps were merged
+// last-write-wins, so two documents naming the same key silently collapsed to
+// the later one and the earlier document was never validated, while the command
+// printed ok. The cross-file check cannot catch this: by the time it runs the
+// duplicate no longer exists.
+func TestOverridesValidateRejectsDuplicateKeysWithinOneFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "two-configmaps.yaml")
+
+	manifest := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ` + override.ConfigMapName + `
+data:
+  overrides.yaml: |
+` + indentBlock(validOverridesDocument(), "    ") + `
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ` + override.ConfigMapName + `
+data:
+  overrides.yaml: |
+` + indentBlock(validOverridesDocument(), "    ")
+
+	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	var out bytes.Buffer
+
+	err := runOverridesValidateFiles([]string{path}, &out)
+	if err == nil {
+		t.Fatal("two documents supplying the same key must be refused, not silently reduced to one")
+	}
+
+	if !strings.Contains(err.Error(), "overrides.yaml") {
+		t.Fatalf("error = %q, want it to name the colliding key", err)
+	}
+}
+
+// TestOverridesValidateAcceptsDistinctKeysAcrossDocuments keeps multi-document
+// files usable, which is the shape kubectl produces for a whole directory.
+func TestOverridesValidateAcceptsDistinctKeysAcrossDocuments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "two-configmaps.yaml")
+
+	manifest := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ` + override.ConfigMapName + `
+data:
+  resources.yaml: |
+` + indentBlock(validOverridesDocument(), "    ") + `
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ` + override.ConfigMapName + `
+data:
+  scheduling.yaml: |
+` + indentBlock(validOverridesDocument(), "    ")
+
+	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runOverridesValidateFiles([]string{path}, &out); err != nil {
+		t.Fatalf("distinct keys across documents must be accepted: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "2 entries") {
+		t.Fatalf("output = %q, want both documents validated", out.String())
+	}
+}

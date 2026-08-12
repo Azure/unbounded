@@ -19,6 +19,8 @@ import (
 )
 
 func overridesStatusCommand() *cobra.Command {
+	var kubeconfig string
+
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show what the operator did with the overrides",
@@ -36,7 +38,7 @@ Example:
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := ctrl.SetupSignalHandler()
 
-			c, err := newMachineClient()
+			c, err := newMachineClientWithKubeconfig(getKubeconfigPath(kubeconfig))
 			if err != nil {
 				return err
 			}
@@ -44,6 +46,8 @@ Example:
 			return runOverridesStatus(ctx, c, cmd.OutOrStdout())
 		},
 	}
+
+	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 
 	return cmd
 }

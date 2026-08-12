@@ -27,8 +27,9 @@ import (
 
 func overridesValidateCommand() *cobra.Command {
 	var (
-		files     []string
-		namespace string
+		files      []string
+		namespace  string
+		kubeconfig string
 	)
 
 	cmd := &cobra.Command{
@@ -63,7 +64,7 @@ Examples:
 
 			ctx := ctrl.SetupSignalHandler()
 
-			c, err := newMachineClient()
+			c, err := newMachineClientWithKubeconfig(getKubeconfigPath(kubeconfig))
 			if err != nil {
 				return err
 			}
@@ -76,6 +77,7 @@ Examples:
 		"Override document to validate. Repeatable. Reads the cluster ConfigMap when omitted.")
 	cmd.Flags().StringVar(&namespace, "namespace", unbounded.SystemNamespace(),
 		"Namespace holding the overrides ConfigMap")
+	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 
 	return cmd
 }
@@ -196,8 +198,19 @@ func unwrapConfigMap(contents []byte) (map[string]string, bool, error) {
 			data = map[string]string{}
 		}
 
-		for key, value := range configMap.Data {
-			data[key] = value
+		for _, key := range sortedKeys(configMap.Data) {
+			// Two ConfigMap documents in one file can name the same key, and
+			// merging them last-write-wins meant the earlier document was
+			// never validated while the command still printed ok. The
+			// cross-file check below cannot see this, because by the time it
+			// runs the duplicate no longer exists.
+			if _, clash := data[key]; clash {
+				return nil, false, fmt.Errorf(
+					"more than one ConfigMap in this file supplies the key %q; "+
+						"a ConfigMap holds one value per key, so rename one of them", key)
+			}
+
+			data[key] = configMap.Data[key]
 		}
 	}
 
