@@ -45,6 +45,7 @@ const CMD_START_DEV: u32 = iowr(0x06, CTRL_SZ);
 const CMD_STOP_DEV: u32 = iowr(0x07, CTRL_SZ);
 const CMD_SET_PARAMS: u32 = iowr(0x08, CTRL_SZ);
 const CMD_GET_FEATURES: u32 = ior(0x13, CTRL_SZ);
+const CMD_DEL_DEV_ASYNC: u32 = ior(0x14, CTRL_SZ);
 
 pub(super) const IO_FETCH_REQ: u32 = iowr(0x20, IO_SZ);
 pub(super) const IO_COMMIT_AND_FETCH_REQ: u32 = iowr(0x21, IO_SZ);
@@ -445,6 +446,22 @@ impl Control {
             ..Default::default()
         };
         self.exec(CMD_DEL_DEV, &cmd).map(|_| ())
+    }
+
+    /// Ask for `dev_id` to go away without waiting for it.
+    ///
+    /// [`del_dev`](Self::del_dev) does not return until the minor is free, and a minor is
+    /// only free once everyone who opened the block device behind it has closed it. A
+    /// consumer that is still holding a dead export would therefore park this thread in
+    /// the kernel with no way out. This asks for the same removal and comes straight
+    /// back, leaving the minor to be freed whenever the last holder lets go.
+    pub(super) fn del_dev_async(&mut self, dev_id: u32) -> io::Result<()> {
+        let cmd = CtrlCmd {
+            dev_id,
+            queue_id: u16::MAX,
+            ..Default::default()
+        };
+        self.exec(CMD_DEL_DEV_ASYNC, &cmd).map(|_| ())
     }
 
     /// What the kernel holds at `dev_id`, whoever put it there. `ENODEV` if the minor is

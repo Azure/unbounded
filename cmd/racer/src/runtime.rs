@@ -540,6 +540,12 @@ impl Configurator {
 /// that number by an instance of us that died is reclaimed rather than worked around. One
 /// still being served is not: some other program has the number, and stopping it to take
 /// the number would be worse than not exporting.
+///
+/// Reclaiming is a request, not a guarantee. The kernel frees a minor once the last
+/// consumer closes the block device that used to be there, so a peer still holding the
+/// export our predecessor left behind keeps the number for as long as it likes. We ask,
+/// wait [`RECLAIM`] for the holders to let go, and then say plainly that they have not,
+/// rather than parking in the kernel until they do.
 #[cfg(not(feature = "sim"))]
 fn add_dev(c: &mut Core, info: &mut ublk::DevInfo) -> std::io::Result<()> {
     let held = c.dev_used.iter().filter(|u| **u).count();
@@ -556,14 +562,34 @@ fn add_dev(c: &mut Core, info: &mut ublk::DevInfo) -> std::io::Result<()> {
             "device {minor} is already exported by pid {pid}: {taken}"
         )));
     }
-    c.ctl().del_dev(minor).map_err(|e| {
+    c.ctl().del_dev_async(minor).map_err(|e| {
         std::io::Error::other(format!(
             "device {minor} is held by a dead export that will not go away: {e}"
         ))
     })?;
-    c.ctl().add_dev(info).map_err(|e| ublks_max_hint(e, held))?;
-    Ok(())
+    let start = Instant::now();
+    loop {
+        match c.ctl().add_dev(info) {
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) && start.elapsed() < RECLAIM => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                return Err(std::io::Error::other(format!(
+                    "device {minor} is still open by a consumer of the export that died with \
+                     our predecessor; it cannot be exported again until that consumer lets go"
+                )));
+            }
+            Err(e) => return Err(ublks_max_hint(e, held)),
+            Ok(_) => return Ok(()),
+        }
+    }
 }
+
+/// How long a minor left behind by a dead export is waited for. Long enough for the
+/// kernel to finish a removal nobody is holding up, short enough that a start which
+/// cannot have the number says so while the control plane is still watching.
+#[cfg(not(feature = "sim"))]
+const RECLAIM: Duration = Duration::from_secs(5);
 
 /// Whether a pid is still around. `EPERM` counts: the process exists, it is simply not
 /// ours to signal.

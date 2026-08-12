@@ -443,8 +443,18 @@ universe and peer, and process-lifetime allocator/Paxos/cache/healing objects. R
 drains removed devices, publishes a new raw configuration pointer, starts new
 ublk devices, waits for every old per-worker configuration guard to drain, then
 unregisters and deletes unreferenced resources. Stable paths and device keys
-reuse handles and ublk identities; an existing device cannot change size, which
-is why a device's list of extents is frozen once it exists.
+reuse handles and ublk identities; an existing device cannot change size, minor
+or geometry, which is why a device's list of extents is frozen once it exists.
+Every export is asked for at the minor the configuration names, so a device is
+at `/dev/ublkb<id>` and a universe's fabric namespace at
+`/dev/ublkb<fabric_device_id>`, and the control plane can publish both before
+the node comes up. A minor left behind by a node that died is taken back; one
+another live process is serving is not. Taking one back is a request, not a
+right: the kernel holds the number until everyone who opened the old export has
+closed it, so a start whose predecessor's consumers have not let go says so and
+fails rather than waiting in the kernel. A peer holds its link until the peer
+leaves its configuration, which is also what makes it open the new export, so a
+node that comes back is named again by the control plane on both counts.
 
 Subsystem link/topology views are installed during dataplane construction,
 before the worker configuration-pointer broadcast. Old guarded requests can
