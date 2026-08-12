@@ -38,11 +38,26 @@ import (
 // lifetime of somebody else's fork, so it closes in well under a millisecond;
 // the budget below is generous against a loaded machine rather than sized to
 // any real expectation.
-const (
-	textBusyRetryBudget  = time.Second
-	textBusyInitialDelay = 10 * time.Millisecond
-	textBusyMaxDelay     = 100 * time.Millisecond
-)
+//
+// The budget bounds how long this package keeps retrying, not the total wall
+// time of the call. Sleeps are clamped so none runs past the deadline, but the
+// attempt that follows the last sleep is a command execution and is not
+// bounded here; a caller that needs a hard ceiling should impose it on ctx.
+var defaultTextBusyPolicy = retryPolicy{
+	budget:       time.Second,
+	initialDelay: 10 * time.Millisecond,
+	maxDelay:     100 * time.Millisecond,
+}
+
+// retryPolicy is a parameter so tests can pin the clamping behaviour. With the
+// production values the difference clamping makes is at most one maxDelay,
+// which is too small to distinguish from scheduling noise on a loaded machine;
+// a test policy whose delay dwarfs its budget makes it unmistakable.
+type retryPolicy struct {
+	budget       time.Duration
+	initialDelay time.Duration
+	maxDelay     time.Duration
+}
 
 // IsTextFileBusy reports whether an error is the transient ETXTBSY described
 // above, so callers doing their own exec can make the same allowance.
@@ -52,12 +67,22 @@ func IsTextFileBusy(err error) bool {
 
 // RetryWhileTextFileBusy runs attempt until it does not fail with ETXTBSY.
 //
-// attempt must build a fresh exec.Cmd each time it is called: an exec.Cmd
-// cannot be reused once started, and any pipes it created must be released
-// before the next attempt.
-func RetryWhileTextFileBusy(ctx context.Context, logger *slog.Logger, path string, attempt func() error) error {
-	deadline := time.Now().Add(textBusyRetryBudget)
-	delay := textBusyInitialDelay
+// attempt must build everything it needs each time it is called, including the
+// exec.Cmd: an exec.Cmd cannot be reused once started, and any pipes it created
+// must be released before the next attempt. Nothing outside attempt constructs
+// a command, so a caller-supplied command factory is invoked exactly once per
+// attempt and never merely to inspect it.
+//
+// The path of the binary is deliberately not a parameter. Every error this can
+// return already names it, because a failed start is wrapped with the command
+// path and the underlying os.PathError carries it as well.
+func RetryWhileTextFileBusy(ctx context.Context, logger *slog.Logger, attempt func() error) error {
+	return retryWhileTextFileBusy(ctx, logger, defaultTextBusyPolicy, attempt)
+}
+
+func retryWhileTextFileBusy(ctx context.Context, logger *slog.Logger, policy retryPolicy, attempt func() error) error {
+	deadline := time.Now().Add(policy.budget)
+	delay := policy.initialDelay
 
 	for {
 		err := attempt()
@@ -65,13 +90,20 @@ func RetryWhileTextFileBusy(ctx context.Context, logger *slog.Logger, path strin
 			return err
 		}
 
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%s was still being written after %s: %w", path, textBusyRetryBudget, err)
+		// Clamped to what is left, so a sleep cannot run past the deadline and
+		// buy an extra attempt on the far side of it.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("still busy after %s: %w", policy.budget, err)
+		}
+
+		if delay > remaining {
+			delay = remaining
 		}
 
 		if logger != nil {
 			logger.Debug("executable is still open for writing; retrying",
-				"path", path, "delay", delay)
+				"delay", delay, "error", err)
 		}
 
 		select {
@@ -80,8 +112,8 @@ func RetryWhileTextFileBusy(ctx context.Context, logger *slog.Logger, path strin
 		case <-time.After(delay):
 		}
 
-		if delay *= 2; delay > textBusyMaxDelay {
-			delay = textBusyMaxDelay
+		if delay *= 2; delay > policy.maxDelay {
+			delay = policy.maxDelay
 		}
 	}
 }
@@ -96,9 +128,10 @@ func RunCmd(ctx context.Context, logger *slog.Logger, newCmd func(context.Contex
 // Use a lower level (e.g. Debug) when stderr output is known to be benign or
 // when a failure is expected and already handled by the caller.
 func RunCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, newCmd func(context.Context) *exec.Cmd, args ...string) error {
-	// The command is rebuilt on every attempt. An exec.Cmd is single use, and
-	// appending args to a reused one would duplicate them.
-	return RetryWhileTextFileBusy(ctx, logger, newCmd(ctx).Path, func() error {
+	// newCmd is called inside the attempt and nowhere else, so it runs exactly
+	// once per attempt. An exec.Cmd is single use, and appending args to a
+	// reused one would duplicate them.
+	return RetryWhileTextFileBusy(ctx, logger, func() error {
 		return runCmdOnce(ctx, logger, stderrLevel, newCmd, args...)
 	})
 }
@@ -163,7 +196,7 @@ func OutputCmd(ctx context.Context, logger *slog.Logger, name string, args ...st
 func OutputCmdAt(ctx context.Context, logger *slog.Logger, stderrLevel slog.Level, name string, args ...string) (string, error) {
 	var output string
 
-	err := RetryWhileTextFileBusy(ctx, logger, name, func() error {
+	err := RetryWhileTextFileBusy(ctx, logger, func() error {
 		var attemptErr error
 
 		output, attemptErr = outputCmdOnce(ctx, logger, stderrLevel, name, args...)

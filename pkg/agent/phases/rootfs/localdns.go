@@ -201,7 +201,7 @@ func (c *configureLocalDNS) installCoreDNS(ctx context.Context) error {
 	// other tasks that fork constantly, so that is not hypothetical.
 	var output string
 
-	err = executil.RetryWhileTextFileBusy(ctx, c.log, destination, func() error {
+	err = executil.RetryWhileTextFileBusy(ctx, c.log, func() error {
 		raw, runErr := exec.CommandContext(ctx, destination, "-plugins").CombinedOutput()
 		output = string(raw)
 

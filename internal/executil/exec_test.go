@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -131,7 +132,7 @@ func TestRetryWhileTextFileBusyReturnsOtherErrorsImmediately(t *testing.T) {
 
 	start := time.Now()
 
-	err := RetryWhileTextFileBusy(t.Context(), discardLogger(), "/bin/true", func() error {
+	err := RetryWhileTextFileBusy(t.Context(), discardLogger(), func() error {
 		attempts++
 
 		return wanted
@@ -145,7 +146,7 @@ func TestRetryWhileTextFileBusyReturnsOtherErrorsImmediately(t *testing.T) {
 		t.Fatalf("attempts = %d, want 1: only ETXTBSY may be retried", attempts)
 	}
 
-	if elapsed := time.Since(start); elapsed > textBusyRetryBudget {
+	if elapsed := time.Since(start); elapsed > defaultTextBusyPolicy.budget {
 		t.Fatalf("took %s, want an immediate return", elapsed)
 	}
 }
@@ -155,6 +156,8 @@ func TestRetryWhileTextFileBusyReturnsOtherErrorsImmediately(t *testing.T) {
 func TestRetryWhileTextFileBusyGivesUp(t *testing.T) {
 	path, _ := busyScript(t, "echo never reached")
 
+	start := time.Now()
+
 	_, err := OutputCmd(t.Context(), discardLogger(), path)
 	if err == nil {
 		t.Fatal("a file held open for writing must eventually fail rather than retry forever")
@@ -162,6 +165,51 @@ func TestRetryWhileTextFileBusyGivesUp(t *testing.T) {
 
 	if !IsTextFileBusy(err) {
 		t.Fatalf("err = %v, want it to carry the underlying ETXTBSY", err)
+	}
+
+	// Sleeps are clamped to what is left of the budget, so none can run past
+	// the deadline and buy a further attempt on the far side of it. The slack
+	// covers the attempts themselves, which are fast because execve rejects
+	// the file immediately, and a loaded machine.
+	const slack = 500 * time.Millisecond
+
+	if elapsed := time.Since(start); elapsed > defaultTextBusyPolicy.budget+slack {
+		t.Fatalf("gave up after %s, want no more than %s", elapsed, defaultTextBusyPolicy.budget+slack)
+	}
+
+	// The binary is still named, even though the helper no longer takes a path.
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("err = %v, want it to name %s", err, path)
+	}
+}
+
+// TestRunCmdBuildsOneCommandPerAttempt is a regression test.
+//
+// The command factory is caller-supplied and may be stateful: it can allocate,
+// open files or hand back a different command each time. An earlier revision
+// called it an extra time purely to read the path for an error message, which
+// consumed whatever that factory does and could report a path belonging to a
+// command that never ran. Nothing outside the attempt builds a command now.
+func TestRunCmdBuildsOneCommandPerAttempt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "probe")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write probe: %v", err)
+	}
+
+	built := 0
+
+	factory := func(ctx context.Context) *exec.Cmd {
+		built++
+
+		return exec.CommandContext(ctx, path)
+	}
+
+	if err := RunCmd(t.Context(), discardLogger(), factory); err != nil {
+		t.Fatalf("RunCmd: %v", err)
+	}
+
+	if built != 1 {
+		t.Fatalf("factory was called %d times for a command that succeeded first time, want 1", built)
 	}
 }
 
@@ -172,7 +220,7 @@ func TestRetryWhileTextFileBusyHonoursContext(t *testing.T) {
 
 	attempts := 0
 
-	err := RetryWhileTextFileBusy(ctx, discardLogger(), "/bin/true", func() error {
+	err := RetryWhileTextFileBusy(ctx, discardLogger(), func() error {
 		attempts++
 
 		cancel()
@@ -190,5 +238,48 @@ func TestRetryWhileTextFileBusyHonoursContext(t *testing.T) {
 
 	if attempts != 1 {
 		t.Fatalf("attempts = %d, want the loop to stop once the context is done", attempts)
+	}
+}
+
+// TestRetryClampsSleepToRemainingBudget is the regression test for the budget
+// being a bound rather than a suggestion.
+//
+// The deadline is checked before sleeping, so without clamping a sleep started
+// just inside the budget runs its full length past it and buys a further
+// attempt on the far side. With the production values that overshoot is at most
+// one maxDelay, too small to separate from scheduling noise, so this uses a
+// policy whose delay dwarfs its budget: unclamped it would sleep 500ms against
+// a 50ms budget.
+func TestRetryClampsSleepToRemainingBudget(t *testing.T) {
+	policy := retryPolicy{
+		budget:       50 * time.Millisecond,
+		initialDelay: 500 * time.Millisecond,
+		maxDelay:     time.Second,
+	}
+
+	attempts := 0
+
+	start := time.Now()
+
+	err := retryWhileTextFileBusy(t.Context(), discardLogger(), policy, func() error {
+		attempts++
+
+		return syscall.ETXTBSY
+	})
+	if err == nil {
+		t.Fatal("a permanently busy file must eventually give up")
+	}
+
+	elapsed := time.Since(start)
+
+	// Clamped, the single sleep is cut to the 50ms that remain. Unclamped it
+	// would be the full 500ms.
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("gave up after %s, want the sleep clamped to the %s budget", elapsed, policy.budget)
+	}
+
+	// One sleep, so two attempts: the one that failed and the one after it.
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
 	}
 }
