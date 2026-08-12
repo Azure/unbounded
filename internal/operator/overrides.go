@@ -410,13 +410,21 @@ func overrideStatusFor(
 		return status
 	}
 
-	// A withheld workload belonging to this Site makes it Degraded, whether or
-	// not any other workload merged cleanly. Reporting Applied because the
-	// entries that did work worked would hide the one that did not.
+	// A withheld workload gets a row of its own. It never became a resolution
+	// target, because it was dropped from the plan before overrides were
+	// applied, so without this it was absent from status entirely and there was
+	// no way to tell "no override targets this" from "the operator declined to
+	// write it".
 	for _, withheld := range report.Withheld {
 		if withheld.Site != "" && withheld.Site != site {
 			continue
 		}
+
+		status.Workloads = append(status.Workloads, unboundedv1alpha3.OverriddenWorkload{
+			Kind:  withheld.Ref.GVK.Kind,
+			Name:  withheld.Ref.Name,
+			State: unboundedv1alpha3.OverrideStateWithheld,
+		})
 
 		status.Phase = unboundedv1alpha3.OverridePhaseDegraded
 
@@ -426,6 +434,7 @@ func overrideStatusFor(
 	}
 
 	applied := appliedHashes(plan, exec)
+	deferred := deferredRefs(exec)
 
 	for _, workload := range report.Workloads {
 		// Cluster singletons carry no Site but every Site depends on them, so
@@ -444,6 +453,17 @@ func overrideStatusFor(
 			VersionDrift: workload.VersionDrift,
 		}
 
+		switch {
+		case workload.Err != nil:
+			entry.State = unboundedv1alpha3.OverrideStateFailed
+		case deferred[workload.Ref]:
+			entry.State = unboundedv1alpha3.OverrideStatePending
+		case entry.AppliedHash != entry.DesiredHash:
+			entry.State = unboundedv1alpha3.OverrideStateFailed
+		default:
+			entry.State = unboundedv1alpha3.OverrideStateApplied
+		}
+
 		status.Workloads = append(status.Workloads, entry)
 
 		switch {
@@ -453,6 +473,10 @@ func overrideStatusFor(
 			if status.Message == "" {
 				status.Message = truncateMessage(workload.Err.Error())
 			}
+		case entry.State == unboundedv1alpha3.OverrideStatePending:
+			// The cluster moved under this pass and the next one writes it.
+			// Nothing is wrong, so this must not read as Degraded for the
+			// second it takes to re-plan.
 		case entry.AppliedHash != entry.DesiredHash:
 			status.Phase = unboundedv1alpha3.OverridePhaseDegraded
 
@@ -494,6 +518,17 @@ func truncateMessage(message string) string {
 	const notice = "\n[truncated; see the operator log and the Events on the " + override.ConfigMapName + " ConfigMap for the rest]"
 
 	return message[:maxStatusMessage-len(notice)] + notice
+}
+
+// deferredRefs indexes the objects whose write was deferred to the next pass,
+// so a one-second race does not report as a failure.
+func deferredRefs(exec component.ExecutionResult) map[component.ObjectRef]bool {
+	out := make(map[component.ObjectRef]bool, len(exec.Deferred))
+	for _, ref := range exec.Deferred {
+		out[ref] = true
+	}
+
+	return out
 }
 
 // appliedHashes reads back the override hash of every overridable workload the

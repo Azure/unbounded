@@ -259,8 +259,11 @@ func TestOverridesStatusReportsStaleAndDegraded(t *testing.T) {
 		Build()
 
 	var out bytes.Buffer
-	if err := runOverridesStatus(t.Context(), cl, &out); err != nil {
-		t.Fatalf("status: %v", err)
+
+	// A Degraded Site is reported as a non-zero exit so the command can gate a
+	// CI step, which is what the documentation sends users here for.
+	if err := runOverridesStatus(t.Context(), cl, &out); err == nil {
+		t.Fatal("a Degraded Site must make status exit non-zero")
 	}
 
 	for _, want := range []string{"Degraded", "stale", "Degraded Sites:", "leaves the affected workloads"} {
@@ -769,5 +772,197 @@ func TestOverridesValidateRejectsADirectory(t *testing.T) {
 	err := runOverridesValidateFiles([]string{t.TempDir()}, &out)
 	if err == nil || !strings.Contains(err.Error(), "is a directory") {
 		t.Fatalf("error = %v, want a clear directory error", err)
+	}
+}
+
+// TestOverridesStatusLabelsFailedAndWithheld is a regression test.
+//
+// describeApplied inferred its answer from the hashes, so a workload whose
+// override failed, which had neither hash, rendered as "no override": the exact
+// opposite of the truth, on the single most important row the command prints.
+func TestOverridesStatusLabelsFailedAndWithheld(t *testing.T) {
+	cl := fake.NewClientBuilder().
+		WithScheme(overridesScheme(t)).
+		WithObjects(siteWithOverrideStatus("edge", &v1alpha3.OverrideStatus{
+			Phase: v1alpha3.OverridePhaseDegraded,
+			Workloads: []v1alpha3.OverriddenWorkload{
+				{Kind: "DaemonSet", Name: "failed-one", DesiredHash: "abc", State: v1alpha3.OverrideStateFailed},
+				{Kind: "DaemonSet", Name: "withheld-one", State: v1alpha3.OverrideStateWithheld},
+				{Kind: "DaemonSet", Name: "pending-one", DesiredHash: "abc", State: v1alpha3.OverrideStatePending},
+			},
+		})).
+		Build()
+
+	var out bytes.Buffer
+	if err := runOverridesStatus(t.Context(), cl, &out); err == nil {
+		t.Fatal("a Degraded Site must make status exit non-zero")
+	}
+
+	for _, want := range []string{"failed", "withheld", "pending"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output = %q, want it to contain %q", out.String(), want)
+		}
+	}
+
+	if strings.Contains(out.String(), "no override") {
+		t.Fatalf("output = %q, must not label a failed override as absent", out.String())
+	}
+}
+
+// TestOverridesStatusFallsBackWhenStateIsAbsent covers a status written by an
+// operator that predates the state field, or one a lagging CRD pruned it from.
+func TestOverridesStatusFallsBackWhenStateIsAbsent(t *testing.T) {
+	cl := fake.NewClientBuilder().
+		WithScheme(overridesScheme(t)).
+		WithObjects(siteWithOverrideStatus("edge", &v1alpha3.OverrideStatus{
+			Phase: v1alpha3.OverridePhaseApplied,
+			Workloads: []v1alpha3.OverriddenWorkload{
+				{Kind: "DaemonSet", Name: "node", DesiredHash: "abc", AppliedHash: "abc"},
+			},
+		})).
+		Build()
+
+	var out bytes.Buffer
+	if err := runOverridesStatus(t.Context(), cl, &out); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "yes") {
+		t.Fatalf("output = %q, want the hash comparison to still answer", out.String())
+	}
+}
+
+// TestOverridesStatusCollapsesClusterSingletons is a regression test.
+//
+// The operator copies a cluster singleton's row onto every Site on purpose, so
+// `kubectl get site` does not hide the commonest case. In a dedicated command
+// that turned one pinned image into one row per Site, and the drift report's
+// own de-duplication could never fire because its key embedded the Site name.
+func TestOverridesStatusCollapsesClusterSingletons(t *testing.T) {
+	singleton := v1alpha3.OverriddenWorkload{
+		Kind: "DaemonSet", Name: "unbounded-net-node",
+		DesiredHash: "abc", AppliedHash: "abc",
+		VersionDrift: "node=registry.example.com/net:pinned",
+		State:        v1alpha3.OverrideStateApplied,
+	}
+
+	sites := make([]client.Object, 0, 3)
+	for _, name := range []string{"edge-a", "edge-b", "edge-c"} {
+		sites = append(sites, siteWithOverrideStatus(name, &v1alpha3.OverrideStatus{
+			Phase:                   v1alpha3.OverridePhaseApplied,
+			ObservedResourceVersion: "12",
+			Workloads:               []v1alpha3.OverriddenWorkload{singleton},
+		}))
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(overridesScheme(t)).WithObjects(sites...).Build()
+
+	var out bytes.Buffer
+	if err := runOverridesStatus(t.Context(), cl, &out); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+
+	if got := strings.Count(out.String(), "unbounded-net-node"); got != 2 {
+		t.Fatalf("output names the singleton %d times, want 2 (one table row, one drift line):\n%s", got, out.String())
+	}
+
+	if !strings.Contains(out.String(), "(all sites)") {
+		t.Fatalf("output = %q, want the collapsed row labelled", out.String())
+	}
+}
+
+// TestOverridesStatusKeepsDivergentSingletonsApart pins that collapsing is only
+// safe when the rows agree. A singleton that resolved differently per Site is a
+// real divergence and must not be hidden.
+func TestOverridesStatusKeepsDivergentSingletonsApart(t *testing.T) {
+	cl := fake.NewClientBuilder().
+		WithScheme(overridesScheme(t)).
+		WithObjects(
+			siteWithOverrideStatus("edge-a", &v1alpha3.OverrideStatus{
+				Phase: v1alpha3.OverridePhaseApplied,
+				Workloads: []v1alpha3.OverriddenWorkload{{
+					Kind: "DaemonSet", Name: "unbounded-net-node",
+					DesiredHash: "abc", AppliedHash: "abc", State: v1alpha3.OverrideStateApplied,
+				}},
+			}),
+			siteWithOverrideStatus("edge-b", &v1alpha3.OverrideStatus{
+				Phase: v1alpha3.OverridePhaseDegraded,
+				Workloads: []v1alpha3.OverriddenWorkload{{
+					Kind: "DaemonSet", Name: "unbounded-net-node",
+					DesiredHash: "abc", State: v1alpha3.OverrideStateFailed,
+				}},
+			}),
+		).
+		Build()
+
+	var out bytes.Buffer
+	if err := runOverridesStatus(t.Context(), cl, &out); err == nil {
+		t.Fatal("a Degraded Site must make status exit non-zero")
+	}
+
+	if strings.Contains(out.String(), "(all sites)") {
+		t.Fatalf("output = %q, must not collapse rows that disagree", out.String())
+	}
+
+	for _, want := range []string{"edge-a", "edge-b", "failed"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output = %q, want it to contain %q", out.String(), want)
+		}
+	}
+}
+
+// TestOverridesStatusOrdersVersionsNumerically pins that the transient-version
+// note reads correctly. sort.Strings put 100 before 9, and %v of a slice
+// rendered Go syntax.
+func TestOverridesStatusOrdersVersionsNumerically(t *testing.T) {
+	cl := fake.NewClientBuilder().
+		WithScheme(overridesScheme(t)).
+		WithObjects(
+			siteWithOverrideStatus("edge-a", &v1alpha3.OverrideStatus{
+				Phase: v1alpha3.OverridePhaseApplied, ObservedResourceVersion: "9",
+			}),
+			siteWithOverrideStatus("edge-b", &v1alpha3.OverrideStatus{
+				Phase: v1alpha3.OverridePhaseApplied, ObservedResourceVersion: "100",
+			}),
+		).
+		Build()
+
+	var out bytes.Buffer
+	if err := runOverridesStatus(t.Context(), cl, &out); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "(9, 100)") {
+		t.Fatalf("output = %q, want versions in numeric order as a comma list", out.String())
+	}
+}
+
+// TestOverridesStatusReportsOneDegradedMessageOnce pins that a document-level
+// failure, which the operator writes verbatim to every Site, is not repeated
+// once per Site.
+func TestOverridesStatusReportsOneDegradedMessageOnce(t *testing.T) {
+	message := "invalid override document:\n  a.yaml[0]: thing one\n  a.yaml[1]: thing two"
+
+	sites := make([]client.Object, 0, 3)
+	for _, name := range []string{"edge-a", "edge-b", "edge-c"} {
+		sites = append(sites, siteWithOverrideStatus(name, &v1alpha3.OverrideStatus{
+			Phase:   v1alpha3.OverridePhaseDegraded,
+			Message: message,
+		}))
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(overridesScheme(t)).WithObjects(sites...).Build()
+
+	var out bytes.Buffer
+	if err := runOverridesStatus(t.Context(), cl, &out); err == nil {
+		t.Fatal("a Degraded Site must make status exit non-zero")
+	}
+
+	if got := strings.Count(out.String(), "thing one"); got != 1 {
+		t.Fatalf("the shared message appears %d times, want 1:\n%s", got, out.String())
+	}
+
+	if !strings.Contains(out.String(), "all 3 Sites") {
+		t.Fatalf("output = %q, want the shared message attributed to all Sites at once", out.String())
 	}
 }

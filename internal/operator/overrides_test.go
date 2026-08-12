@@ -1372,3 +1372,101 @@ overrides:
 		}
 	}
 }
+
+// TestOverrideStatusReportsWithheldWorkloads is a regression test.
+//
+// A withheld workload is dropped from the plan before overrides are applied, so
+// it never becomes a resolution target and never reached report.Workloads. It
+// therefore had no row in status at all, and nothing could tell "no override
+// targets this workload" from "the operator declined to write it".
+func TestOverrideStatusReportsWithheldWorkloads(t *testing.T) {
+	report := &override.Report{
+		Withheld: []override.WithheldOperation{{
+			Ref:       component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "unbounded-net-node")),
+			Component: "net",
+			Err:       errors.New("overrides.yaml[0]: not an overridable field"),
+		}},
+	}
+
+	status := overrideStatusFor("edge", overrideSnapshot{
+		state: overridesPartial, resourceVersion: "9",
+	}, report, component.NewPlan(), component.ExecutionResult{})
+
+	if status.Phase != unboundedv1alpha3.OverridePhaseDegraded {
+		t.Fatalf("phase = %q, want Degraded", status.Phase)
+	}
+
+	if len(status.Workloads) != 1 {
+		t.Fatalf("workloads = %+v, want the withheld workload reported", status.Workloads)
+	}
+
+	got := status.Workloads[0]
+	if got.State != unboundedv1alpha3.OverrideStateWithheld {
+		t.Fatalf("state = %q, want Withheld", got.State)
+	}
+
+	if got.Name != "unbounded-net-node" {
+		t.Fatalf("name = %q, want the withheld workload named", got.Name)
+	}
+}
+
+// TestOverrideStatusDistinguishesFailedFromUntargeted pins that a workload
+// whose override failed reports a desired hash and a Failed state, so it cannot
+// be mistaken for one no override targets.
+func TestOverrideStatusDistinguishesFailedFromUntargeted(t *testing.T) {
+	ref := component.RefOf(unstructuredOf("apps/v1", "DaemonSet", "unbounded-net-node"))
+
+	report := &override.Report{
+		Workloads: []override.WorkloadResult{{
+			Ref:  ref,
+			Hash: "deadbeef",
+			Err:  errors.New("overrides.yaml[0]: patch targets container \"typo\""),
+		}},
+	}
+
+	status := overrideStatusFor("edge", overrideSnapshot{
+		state: overridesValid, resourceVersion: "9",
+	}, report, component.NewPlan(), component.ExecutionResult{})
+
+	if len(status.Workloads) != 1 {
+		t.Fatalf("workloads = %+v, want one", status.Workloads)
+	}
+
+	got := status.Workloads[0]
+	if got.State != unboundedv1alpha3.OverrideStateFailed {
+		t.Fatalf("state = %q, want Failed", got.State)
+	}
+
+	// The desired hash is what the user asked for, and it is knowable even
+	// though the merge failed. Leaving it empty is what made this row read as
+	// "no override".
+	if got.DesiredHash == "" {
+		t.Fatal("a failed workload must still report the hash that was desired")
+	}
+}
+
+// TestOverrideStatusDoesNotDegradeOnADeferredWrite pins that a lost race reads
+// as pending rather than as a failure.
+func TestOverrideStatusDoesNotDegradeOnADeferredWrite(t *testing.T) {
+	workload := unstructuredOf("apps/v1", "DaemonSet", "unbounded-net-node")
+	ref := component.RefOf(workload)
+
+	plan := component.NewPlan()
+	plan.Add(component.Operation{
+		Kind: component.OpApply, Object: workload, Component: "net", Overridable: true,
+	})
+
+	report := &override.Report{Workloads: []override.WorkloadResult{{Ref: ref, Hash: "deadbeef"}}}
+
+	status := overrideStatusFor("edge", overrideSnapshot{
+		state: overridesValid, resourceVersion: "9",
+	}, report, plan, component.ExecutionResult{Deferred: []component.ObjectRef{ref}})
+
+	if status.Workloads[0].State != unboundedv1alpha3.OverrideStatePending {
+		t.Fatalf("state = %q, want Pending", status.Workloads[0].State)
+	}
+
+	if status.Phase == unboundedv1alpha3.OverridePhaseDegraded {
+		t.Fatal("a write deferred to the next pass is not a degradation")
+	}
+}

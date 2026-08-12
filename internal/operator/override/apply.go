@@ -162,6 +162,20 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 
 	original := plan.Operations[target.Index].Object
 
+	// The hash is computed first, from the contributor set alone, so it is
+	// reported whether or not the merge succeeds. Leaving it empty on failure
+	// made a failed workload indistinguishable in status from one no override
+	// targets at all, and the CLI labelled it "no override": the exact opposite
+	// of the truth, on the single most important row it prints.
+	hash, err := contributorHash(target.Contributors)
+	if err != nil {
+		result.Err = err
+
+		return result
+	}
+
+	result.Hash = hash
+
 	var problems []error
 
 	for _, contributor := range target.Contributors {
@@ -186,14 +200,6 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 		return result
 	}
 
-	hash, err := contributorHash(target.Contributors)
-	if err != nil {
-		result.Err = err
-
-		return result
-	}
-
-	result.Hash = hash
 	result.VersionDrift = imageDrift(original, candidate)
 
 	stampAnnotations(candidate, hash, contributorSources(target.Contributors), result.VersionDrift)
