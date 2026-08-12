@@ -5,21 +5,28 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
+
+const agentUpgradeLockRetryDelay = 2 * time.Second
 
 type machineOperationTarget struct {
 	client.Client
-	log          *slog.Logger
-	machineName  string
-	nodeOperator nodeOperator
+	log                  *slog.Logger
+	machineName          string
+	nodeOperator         nodeOperator
+	agentUpgradeLockPath string
 }
 
 func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
@@ -50,6 +57,27 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 }
 
 func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+	lockPath := t.agentUpgradeLockPath
+	if lockPath == "" {
+		lockPath = goalstates.DaemonAgentUpgradeLockPath
+	}
+
+	lock, err := agentbinary.AcquireHostActivationLock(lockPath)
+	if errors.Is(err, agentbinary.ErrActivationInProgress) {
+		t.log.Info("waiting for host agent activation lock", "operation", op.Name)
+		return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
+	}
+
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("acquire host agent activation lock: %w", err)
+	}
+
+	defer func() {
+		if err := lock.Close(); err != nil {
+			t.log.Warn("failed to release host agent activation lock", "error", err)
+		}
+	}()
+
 	if err := store.MarkInProgress(ctx, op, "staging upgraded host agent binary"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -59,14 +87,14 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 		return ctrl.Result{}, err
 	}
 
-	downloadURL, err := agentUpgradeDownloadURL(op.Parameters)
+	request, err := parseAgentUpgradeRequest(op.Parameters)
 	if err != nil {
 		return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult[int64]{Phase: v1alpha3.OperationPhaseFailed, Reason: "InvalidParameters", Message: err.Error()})
 	}
 
-	t.log.Info("staging AgentUpgrade binary", "operation", op.Name, "url", downloadURL)
+	t.log.Info("staging AgentUpgrade binary", "operation", op.Name)
 
-	if err := t.nodeOperator.StageAgentUpgrade(ctx, t.log, downloadURL); err != nil {
+	if err := t.nodeOperator.StageAgentUpgrade(ctx, t.log, request); err != nil {
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 

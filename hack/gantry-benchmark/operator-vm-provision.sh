@@ -34,12 +34,17 @@ OPERATOR_NAT_NAME="${OPERATOR_NAT_NAME:-gantry-benchmark-operator-nat}"
 OPERATOR_NAT_PUBLIC_IP_NAME="${OPERATOR_NAT_PUBLIC_IP_NAME:-gantry-benchmark-operator-egress}"
 BENCHMARK_REPO_URL="${BENCHMARK_REPO_URL:-https://github.com/Azure/unbounded.git}"
 BENCHMARK_REPO_BRANCH="${BENCHMARK_REPO_BRANCH:-private/gantry-benchmark-hardening}"
+BENCHMARK_SOURCE_IMAGE="${BENCHMARK_SOURCE_IMAGE:-}"
+BENCHMARK_SOURCE_REVISION="${BENCHMARK_SOURCE_REVISION:-}"
 BENCHMARK_NODE_COUNT="${BENCHMARK_NODE_COUNT:-5}"
 BENCHMARK_IMAGE_SIZE_MIB="${BENCHMARK_IMAGE_SIZE_MIB:-128}"
 BENCHMARK_IMAGE_LAYERS="${BENCHMARK_IMAGE_LAYERS:-4}"
 BENCHMARK_AZURE_TELEMETRY="${BENCHMARK_AZURE_TELEMETRY:-true}"
 BENCHMARK_MINIMUM_BYTE_REDUCTION="${BENCHMARK_MINIMUM_BYTE_REDUCTION:-0.70}"
 BENCHMARK_MAXIMUM_LATENCY_RATIO="${BENCHMARK_MAXIMUM_LATENCY_RATIO:-3.0}"
+ADOPT_BASELINE_IMAGE="${ADOPT_BASELINE_IMAGE:-}"
+ADOPT_GANTRY_IMAGE="${ADOPT_GANTRY_IMAGE:-}"
+ADOPT_PAYLOAD_SHA256="${ADOPT_PAYLOAD_SHA256:-}"
 START_BENCHMARK="${START_BENCHMARK:-false}"
 
 repo_root=$(git rev-parse --show-toplevel)
@@ -209,6 +214,11 @@ az vm run-command invoke \
     "$BENCHMARK_MAXIMUM_LATENCY_RATIO" \
     "$OPERATOR_BUILD_DISK_LUN" \
     "$OPERATOR_BUILD_MOUNT" \
+    "$BENCHMARK_SOURCE_IMAGE" \
+    "$BENCHMARK_SOURCE_REVISION" \
+    "${ADOPT_BASELINE_IMAGE:--}" \
+    "${ADOPT_GANTRY_IMAGE:--}" \
+    "${ADOPT_PAYLOAD_SHA256:--}" \
   --only-show-errors \
   -o json
 
@@ -229,10 +239,17 @@ managed identity: $principal_id
 build disk: $build_disk_id ($OPERATOR_BUILD_DISK_IOPS IOPS, $OPERATOR_BUILD_DISK_MBPS MB/s)
 build mount: $OPERATOR_BUILD_MOUNT
 benchmark service: gantry-benchmark-operator.service
+image pool service: gantry-benchmark-image-builder.service
 start command:
   az vm run-command invoke -g $AZURE_RESOURCE_GROUP -n $OPERATOR_VM_NAME --command-id RunShellScript --scripts 'systemctl start --no-block gantry-benchmark-operator.service'
 status command:
   AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-status
 watch command:
   AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-watch
+prebuild command:
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME GANTRY_IMAGE_POOL_COUNT=10 make -C hack/gantry-benchmark operator-vm-prebuild
+run from pool command:
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME GANTRY_ONLY_BASELINE_RUN_ID=<run-id> make -C hack/gantry-benchmark operator-vm-run-pool
+pool status command:
+  AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP OPERATOR_VM_NAME=$OPERATOR_VM_NAME make -C hack/gantry-benchmark operator-vm-image-pool-status
 SUMMARY

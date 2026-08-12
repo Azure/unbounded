@@ -35,6 +35,9 @@ const (
 
 	// CrictlDefaultBaseURL is the upstream base URL for cri-tools releases.
 	CrictlDefaultBaseURL = "https://github.com/kubernetes-sigs/cri-tools/releases/download"
+
+	// CoreDNSDefaultBaseURL is the upstream base URL for CoreDNS releases.
+	CoreDNSDefaultBaseURL = "https://github.com/coredns/coredns/releases/download"
 )
 
 func DefaultContainerImages(kubernetesVersion string) []string {
@@ -128,6 +131,22 @@ func CrictlArchive(override *goalstates.DownloadSource, version, hostOS, hostArc
 	}
 
 	return fmt.Sprintf("%s/v%s/crictl-v%s-%s-%s.tar.gz", base, version, version, hostOS, hostArch)
+}
+
+// CoreDNSArchive resolves the CoreDNS release archive URL.
+func CoreDNSArchive(override *goalstates.DownloadSource, version, arch string) string {
+	if override != nil && override.URL != "" {
+		return fmt.Sprintf(override.URL, version, arch)
+	}
+
+	version = bootstrapartifacts.StripLeadingV(version)
+
+	base := CoreDNSDefaultBaseURL
+	if override != nil && override.BaseURL != "" {
+		base = strings.TrimRight(override.BaseURL, "/")
+	}
+
+	return fmt.Sprintf("%s/v%s/coredns_%s_linux_%s.tgz", base, version, version, arch)
 }
 
 // CrictlVersionForKubernetesVersion returns the cri-tools version for the

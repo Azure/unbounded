@@ -21,6 +21,7 @@ import (
 )
 
 type byteObservation struct {
+	digest digest.Digest
 	kind   string
 	source string
 	bytes  int64
@@ -59,11 +60,14 @@ func TestMirrorByteMetricsCacheSource(t *testing.T) {
 	cache := fakes.NewCache()
 	cache.Put(d, body)
 
-	var served []byteObservation
+	var served, completed []byteObservation
 
 	m := mirror.New(cfg, cache, oc,
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			served = append(served, byteObservation{kind: kind, source: source, bytes: bytes})
+		}),
+		mirror.WithMirrorResponseCompletedHook(func(completedDigest digest.Digest, kind, source string) {
+			completed = append(completed, byteObservation{digest: completedDigest, kind: kind, source: source})
 		}),
 	)
 
@@ -74,6 +78,10 @@ func TestMirrorByteMetricsCacheSource(t *testing.T) {
 	want := byteObservation{kind: "layer", source: "cache", bytes: int64(len(body))}
 	if len(served) != 1 || served[0] != want {
 		t.Fatalf("served observations = %+v, want [%+v]", served, want)
+	}
+
+	if len(completed) != 1 || completed[0].digest != d || completed[0].kind != want.kind || completed[0].source != want.source {
+		t.Fatalf("completed observations = %+v, want digest=%s kind=%s source=%s", completed, d, want.kind, want.source)
 	}
 }
 
@@ -89,7 +97,7 @@ func TestMirrorByteMetricsPeerSource(t *testing.T) {
 	dht := fakes.NewDHT()
 	dht.Inject(d, ifaces.Provider{NodeID: "peer-a", Addr: peerAddr})
 
-	var fetched, served []byteObservation
+	var fetched, served, completed []byteObservation
 
 	peerClient := transfer.NewClient(transfer.WithClientByteMetrics(func(kind string, bytes int64) {
 		fetched = append(fetched, byteObservation{kind: kind, bytes: bytes})
@@ -104,6 +112,9 @@ func TestMirrorByteMetricsPeerSource(t *testing.T) {
 				served = append(served, byteObservation{kind: kind, source: source, bytes: bytes})
 			},
 		),
+		mirror.WithMirrorResponseCompletedHook(func(completedDigest digest.Digest, kind, source string) {
+			completed = append(completed, byteObservation{digest: completedDigest, kind: kind, source: source})
+		}),
 	)
 
 	if got := pullMirrorBody(t, m.Handler(), d); string(got) != string(body) {
@@ -118,6 +129,10 @@ func TestMirrorByteMetricsPeerSource(t *testing.T) {
 	wantServed := byteObservation{kind: "layer", source: "peer", bytes: int64(len(body))}
 	if len(served) != 1 || served[0] != wantServed {
 		t.Fatalf("served observations = %+v, want [%+v]", served, wantServed)
+	}
+
+	if len(completed) != 1 || completed[0].digest != d || completed[0].kind != wantServed.kind || completed[0].source != wantServed.source {
+		t.Fatalf("completed observations = %+v, want digest=%s kind=%s source=%s", completed, d, wantServed.kind, wantServed.source)
 	}
 }
 
@@ -150,12 +165,15 @@ func TestMirrorByteMetricsOriginSource(t *testing.T) {
 		t.Fatalf("origin.New: %v", err)
 	}
 
-	var served []byteObservation
+	var served, completed []byteObservation
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
 		mirror.WithLiveStreamThrough(),
 		mirror.WithByteMetrics(func(kind, source string, bytes int64) {
 			served = append(served, byteObservation{kind: kind, source: source, bytes: bytes})
+		}),
+		mirror.WithMirrorResponseCompletedHook(func(completedDigest digest.Digest, kind, source string) {
+			completed = append(completed, byteObservation{digest: completedDigest, kind: kind, source: source})
 		}),
 	)
 
@@ -171,5 +189,9 @@ func TestMirrorByteMetricsOriginSource(t *testing.T) {
 	wantServed := byteObservation{kind: "layer", source: "origin", bytes: int64(len(body))}
 	if len(served) != 1 || served[0] != wantServed {
 		t.Fatalf("served observations = %+v, want [%+v]", served, wantServed)
+	}
+
+	if len(completed) != 1 || completed[0].digest != d || completed[0].kind != wantServed.kind || completed[0].source != wantServed.source {
+		t.Fatalf("completed observations = %+v, want digest=%s kind=%s source=%s", completed, d, wantServed.kind, wantServed.source)
 	}
 }

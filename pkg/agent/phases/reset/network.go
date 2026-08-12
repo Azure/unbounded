@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -44,9 +47,54 @@ func (t *removeNetworkInterfaces) Name() string { return "remove-network-interfa
 // routing state left by unbounded-net.
 func CleanupNetwork(log *slog.Logger) phases.Task {
 	return phases.Serial(log,
+		CleanupLocalDNSRules(log),
 		RemoveNetworkInterfaces(log),
 		CleanupRoutes(log),
 	)
+}
+
+type cleanupLocalDNSRules struct {
+	log *slog.Logger
+}
+
+// CleanupLocalDNSRules removes raw-table rules owned by LocalDNS.
+func CleanupLocalDNSRules(log *slog.Logger) phases.Task {
+	return &cleanupLocalDNSRules{log: log}
+}
+
+func (t *cleanupLocalDNSRules) Name() string { return "cleanup-localdns-rules" }
+
+func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", "--now", goalstates.LocalDNSNetworkUnit); err != nil {
+		t.log.Debug("LocalDNS network unit was not active", "error", err)
+	}
+
+	if _, err := executil.OutputCmd(ctx, t.log, "nft", "list", "table", "ip", goalstates.LocalDNSNFTTable); err == nil {
+		if err := executil.RunCmd(ctx, t.log, func(ctx context.Context) *exec.Cmd {
+			return exec.CommandContext(ctx, "nft")
+		}, "delete", "table", "ip", goalstates.LocalDNSNFTTable); err != nil {
+			return fmt.Errorf("remove LocalDNS nftables table: %w", err)
+		}
+	}
+
+	if output, err := executil.OutputCmd(ctx, t.log, "ip", "-d", "-o", "link", "show", "dev", goalstates.LocalDNSInterfaceName); err == nil {
+		if !strings.Contains(" "+output+" ", " dummy ") {
+			return fmt.Errorf("refusing to remove non-dummy interface %s", goalstates.LocalDNSInterfaceName)
+		}
+
+		if err := executil.RunCmd(ctx, t.log, executil.Ip(), "link", "delete", goalstates.LocalDNSInterfaceName); err != nil {
+			return fmt.Errorf("remove LocalDNS interface: %w", err)
+		}
+	}
+
+	for _, path := range []string{
+		filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit),
+		"/usr/local/libexec/unbounded-localdns-network",
+	} {
+		removeFileIfExists(t.log, path)
+	}
+
+	return nil
 }
 
 func (t *removeNetworkInterfaces) Do(ctx context.Context) error {

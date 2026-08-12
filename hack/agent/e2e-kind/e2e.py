@@ -41,6 +41,7 @@ Subcommands (called as individual workflow steps):
     delete-machine-cr                  Delete the Machine CR.
     validate-machine-cr-created        Verify agent self-registered a Machine CR.
     validate-node-reboot-operation     Verify NodeReboot MachineOperation restarts the node.
+    validate-host-agent-upgrade        Verify host-driven upgrade adopts a single-binary deployment.
     validate-agent-upgrade-operation   Verify AgentUpgrade switches the host daemon binary.
     validate-agent-upgrade-rollback    Verify AgentUpgrade rollback restores last-known-good.
     validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
@@ -141,6 +142,9 @@ TEST_NS = "e2e-workload-test"
 UNBOUNDED_NS = "unbounded-system"
 E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
+DAEMON_BINARY = "/usr/local/bin/unbounded-agent"
+DAEMON_BINARY_BLUE = "/usr/local/bin/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = "/usr/local/bin/unbounded-agent-green"
 DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
 DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
 BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
@@ -595,6 +599,7 @@ class NodeConfig:
     block_external_network: bool = False
     additional_host_mounts: tuple[dict[str, Any], ...] = ()
     additional_host_devices: tuple[str, ...] = ()
+    local_dns: bool = False
     path: str = ""
 
 
@@ -635,6 +640,7 @@ def load_node_config(
     block_external_network = cfg.get("blockExternalNetwork", False)
     additional_host_mounts = cfg.get("additionalHostMounts", [])
     additional_host_devices = cfg.get("additionalHostDevices", [])
+    local_dns = cfg.get("localDNS", False)
 
     if not isinstance(name, str) or not name:
         die(f"node config {config_path} field 'name' must be a non-empty string")
@@ -668,6 +674,8 @@ def load_node_config(
             f"node config {config_path} field 'additionalHostMounts' must be a list of objects "
             f"with string 'source', optional string 'target', and optional bool 'readOnly'"
         )
+    if not isinstance(local_dns, bool):
+        die(f"node config {config_path} field 'localDNS' must be a boolean")
     if not isinstance(additional_host_devices, list) or not all(
         isinstance(d, str) and d for d in additional_host_devices
     ):
@@ -687,6 +695,7 @@ def load_node_config(
         block_external_network=block_external_network,
         additional_host_mounts=tuple(dict(m) for m in additional_host_mounts),
         additional_host_devices=tuple(additional_host_devices),
+        local_dns=local_dns,
         path=str(config_path),
     )
 
@@ -731,6 +740,8 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
     args: list[str] = []
     if node_config.node_ip:
         args.extend(["--node-ip", expected_node_ip(node_config)])
+    if node_config.local_dns:
+        args.append("--local-dns")
     for key, value in sorted(expected_node_labels(node_config).items()):
         args.extend(["--node-label", f"{key}={value}"])
     for taint in expected_node_taint_strings(node_config):
@@ -1217,6 +1228,7 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
 
     runner_ip = VM_GATEWAY
     agent_url = f"http://{runner_ip}:{SERVE_PORT}/{tarball.name}"
+    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
     log(f"Starting HTTP file server on {runner_ip}:{SERVE_PORT} for {tarball.name}...")
     handler = _make_handler(str(tarball.parent))
     httpd = HTTPServer((runner_ip, SERVE_PORT), handler)
@@ -1225,13 +1237,17 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
     try:
         log(f"Verifying VM can reach agent upgrade URL: {agent_url}")
         ssh_cmd(f"curl -fsSL --connect-timeout 10 -o /dev/null {agent_url}")
+        # Each scenario intentionally restarts or fails the daemon. Isolate its
+        # systemd start-limit budget so the candidate under test gets the
+        # configured retries before recovery runs.
+        ssh_cmd("sudo systemctl reset-failed unbounded-agent-daemon.service")
         run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
                    "--ignore-not-found"], check=False)
         create_machine_operation(
             operation_name,
             AGENT_MACHINE_NAME,
             "AgentUpgrade",
-            parameters={"downloadURL": agent_url},
+            parameters={"downloadURL": agent_url, "sha256": digest},
         )
         if expect_complete:
             return wait_for_machine_operation_complete(operation_name)
@@ -1990,6 +2006,7 @@ def offline_artifact_manifest(kube_version: str, container_images: list[str] | N
             "runc": "1.5.0",
             "cni": "1.5.1",
             "crictl": _crictl_version_for_kubernetes(kube_version),
+            "coredns": "1.12.3",
         },
     }
     if container_images is not None:
@@ -2547,6 +2564,7 @@ def validate_node_config(node_config: NodeConfig) -> None:
     validate_offline_bootstrap_config(node_config)
     validate_additional_host_mounts_config(node_config)
     validate_additional_host_devices_config(node_config)
+    validate_local_dns_config(node_config)
 
     log("============================================")
     log("  Node config validation PASSED")
@@ -2608,6 +2626,66 @@ PY
         die(f"kubelet service does not reference generated config: {service}")
 
     log("Kubelet configuration overlay validated")
+
+
+def validate_local_dns_config(node_config: NodeConfig) -> None:
+    """Verify LocalDNS service, listeners, resolver wiring, metrics, and NOTRACK rules."""
+    if not node_config.local_dns:
+        return
+
+    log("Validating nspawn LocalDNS...")
+    machine = active_nspawn_machine()
+    machine_shell(machine, """
+systemctl is-active --quiet localdns.service
+grep -qx 'nameserver 169.254.10.10' /etc/resolv.conf
+grep -qx 'clusterDNS:' /var/lib/kubelet/config.yaml
+grep -qx -- '- 169.254.10.11' /var/lib/kubelet/config.yaml
+grep -qx 'resolvConf: /etc/unbounded/localdns/resolv.conf' /var/lib/kubelet/config.yaml
+curl --silent --fail --noproxy '*' http://169.254.10.10:8181/ready | grep -q OK
+curl --silent --fail --noproxy '*' http://169.254.10.11:8181/ready | grep -q OK
+""")
+    ssh_cmd(r"""
+python3 - <<'PY'
+import socket
+import struct
+
+
+def query(server, name):
+    qname = b''.join(bytes([len(label)]) + label.encode() for label in name.split('.')) + b'\0'
+    message = struct.pack('!HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0) + qname + struct.pack('!HH', 1, 1)
+    with socket.create_connection((server, 53), timeout=5) as sock:
+        sock.sendall(struct.pack('!H', len(message)) + message)
+        length = struct.unpack('!H', sock.recv(2))[0]
+        response = b''
+        while len(response) < length:
+            response += sock.recv(length - len(response))
+    _, flags, _, answers, _, _ = struct.unpack('!HHHHHH', response[:12])
+    if flags & 0xF:
+        raise SystemExit(f'DNS query {name} through {server} failed: rcode={flags & 0xF}, answers={answers}')
+
+
+query('169.254.10.10', 'health-check.localdns.local')
+query('169.254.10.11', 'health-check.localdns.local')
+PY
+""")
+    ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.10/32'")
+    ssh_cmd("sudo ip address show dev localdns | grep -q '169.254.10.11/32'")
+    ssh_cmd("""
+set -e
+rules=$(sudo nft list table ip unbounded_localdns)
+test "$(printf '%s\\n' "${rules}" | grep -c 'unbounded-localdns: skip conntrack')" -eq 8
+for chain in output prerouting; do
+  chain_rules=$(sudo nft list chain ip unbounded_localdns "${chain}")
+  for address in 169.254.10.10 169.254.10.11; do
+    for protocol in tcp udp; do
+      printf '%s\\n' "${chain_rules}" | grep -Eq \
+        "ip daddr ${address} ${protocol} dport 53 notrack.*unbounded-localdns: skip conntrack"
+    done
+  done
+done
+""")
+    ssh_cmd(f"curl --silent --fail --noproxy '*' http://{expected_node_ip(node_config)}:9253/metrics | grep -q '^coredns_build_info'")
+    log("nspawn LocalDNS validation passed")
 
 
 def validate_offline_bootstrap_config(node_config: NodeConfig) -> None:
@@ -2851,11 +2929,45 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
     ):
         _run_scenario_command(command, node_config, env)
 
-    for command in (
-        "validate-workload",
-        "validate-node-repave-upgrade",
-    ):
-        _run_scenario_command(command, node_config, env)
+    if node_config.local_dns:
+        _run_scenario_command("validate-node-reboot-operation", node_config, env)
+        _run_scenario_command("validate-node-config", node_config, env)
+
+    _run_scenario_command("validate-workload", node_config, env)
+    _run_scenario_command("validate-node-repave-upgrade", node_config, env)
+    if node_config.local_dns:
+        _run_scenario_command("validate-node-config", node_config, env)
+        _run_scenario_command("reset-agent", node_config, env)
+        cleanup_check = (
+            "test ! -e /sys/class/net/localdns && "
+            "! sudo nft list table ip unbounded_localdns >/dev/null 2>&1"
+        )
+        deadline = time.monotonic() + 60
+        scenario_key = Path(env["VM_DIR"]) / "ssh" / "id_ed25519"
+        scenario_target = f"{VM_SSH_USER}@{env['VM_IP']}"
+        while True:
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=10",
+                    "-i", str(scenario_key),
+                    scenario_target,
+                    cleanup_check,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+            if time.monotonic() >= deadline:
+                die(
+                    "LocalDNS host state remained after reset: "
+                    f"rc={result.returncode}, stderr={result.stderr.strip()}"
+                )
+            time.sleep(2)
 
     log(f"Agent config scenario {name!r} passed")
 
@@ -3742,6 +3854,100 @@ def validate_node_reboot_operation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-host-agent-upgrade
+# ---------------------------------------------------------------------------
+def validate_host_agent_upgrade() -> None:
+    """Validate host-driven activation from a single-binary deployment."""
+
+    marker = "e2e-host-agent-upgrade"
+    candidate = VM_DIR / "unbounded-agent-host-upgrade"
+    remote_candidate = "/var/tmp/unbounded-agent-host-upgrade"
+    legacy_copy = "/var/tmp/unbounded-agent-host-upgrade-previous"
+
+    log("Building host-driven agent upgrade candidate...")
+    run([
+        "go", "build",
+        "-ldflags", f"-X github.com/Azure/unbounded/internal/version.Version={marker}",
+        "-o", str(candidate),
+        str(REPO_ROOT / "cmd" / "agent" / "main.go"),
+    ], env={**os.environ, "GOOS": "linux", "GOARCH": "amd64"})
+    scp_cmd(str(candidate), f"{SSH_TARGET}:{remote_candidate}")
+    ssh_cmd(f"sudo chmod 0755 {remote_candidate}")
+
+    operations_before = {
+        item["metadata"]["name"]
+        for item in json.loads(kubectl_capture([
+            "get", _machine_operation_resource(), "-o", "json",
+        ])).get("items", [])
+    }
+
+    before_current = read_daemon_current_target()
+    if not before_current:
+        die("daemon current binary symlink target was empty before host-driven upgrade")
+
+    log(f"Converting managed layout to an existing single-binary deployment from {before_current}...")
+    ssh_cmd(
+        "set -eu; "
+        f"sudo install -m 0755 {before_current} {legacy_copy}; "
+        f"sudo rm -f {DAEMON_BINARY}; "
+        f"sudo install -m 0755 {legacy_copy} {DAEMON_BINARY}; "
+        f"sudo rm -f {DAEMON_BINARY_CURRENT} {DAEMON_BINARY_LAST_GOOD} "
+        f"{DAEMON_BINARY_BLUE} {DAEMON_BINARY_GREEN}"
+    )
+    legacy_digest = ssh_capture(f"sudo sha256sum {DAEMON_BINARY} | awk '{{print $1}}'").strip()
+
+    log("Running host-driven agent upgrade preflight...")
+    preflight = ssh_capture(f"sudo {remote_candidate} agent-upgrade --preflight")
+    print(preflight, flush=True)
+
+    ssh_cmd(
+        "set -eu; "
+        f"test -f {DAEMON_BINARY}; test ! -L {DAEMON_BINARY}; "
+        f"test ! -e {DAEMON_BINARY_CURRENT}; test ! -L {DAEMON_BINARY_CURRENT}; "
+        f"test ! -e {DAEMON_BINARY_LAST_GOOD}; test ! -L {DAEMON_BINARY_LAST_GOOD}; "
+        f"test ! -e {DAEMON_BINARY_BLUE}; test ! -e {DAEMON_BINARY_GREEN}"
+    )
+
+    log("Applying host-driven agent upgrade...")
+    activation = ssh_capture(f"sudo {remote_candidate} agent-upgrade")
+    if "activated host agent daemon" not in activation:
+        die(f"unexpected host-driven activation output: {activation!r}")
+
+    wait_for_daemon_active()
+    after_current = read_daemon_current_target()
+    last_good = read_daemon_last_good_target()
+    if after_current != DAEMON_BINARY_GREEN:
+        die(f"host-driven current target mismatch: got {after_current!r}, expected {DAEMON_BINARY_GREEN!r}")
+    if last_good != DAEMON_BINARY_BLUE:
+        die(f"host-driven last-good target mismatch: got {last_good!r}, expected {DAEMON_BINARY_BLUE!r}")
+
+    preserved_digest = ssh_capture(f"sudo sha256sum {DAEMON_BINARY_BLUE} | awk '{{print $1}}'").strip()
+    if preserved_digest != legacy_digest:
+        die(f"host-driven activation did not preserve the previous binary: {preserved_digest!r} != {legacy_digest!r}")
+
+    version_output = ssh_capture(f"sudo {DAEMON_BINARY_CURRENT} version")
+    if marker not in version_output:
+        die(f"activated host daemon does not contain candidate version marker: {version_output!r}")
+
+    operations_after = {
+        item["metadata"]["name"]
+        for item in json.loads(kubectl_capture([
+            "get", _machine_operation_resource(), "-o", "json",
+        ])).get("items", [])
+    }
+    if operations_after != operations_before:
+        die(
+            "host-driven activation unexpectedly changed MachineOperations: "
+            f"before={sorted(operations_before)!r}, after={sorted(operations_after)!r}"
+        )
+
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+    log("============================================")
+    log("  Host-driven agent upgrade validation PASSED")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # validate-agent-upgrade-operation
 # ---------------------------------------------------------------------------
 def validate_agent_upgrade_operation() -> None:
@@ -4217,6 +4423,7 @@ COMMANDS: dict[str, Command] = {
     "delete-machine-cr": _without_node_config(delete_machine_cr),
     "validate-machine-cr-created": validate_machine_cr_created,
     "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
+    "validate-host-agent-upgrade": _without_node_config(validate_host_agent_upgrade),
     "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,

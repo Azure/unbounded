@@ -2,6 +2,7 @@
 bin/
 !cmd/unbounded-storage/src/bin/
 /gantry
+/gantry-benchmark
 /dist/
 build/
 inventory.db

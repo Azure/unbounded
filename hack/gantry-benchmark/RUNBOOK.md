@@ -1,5 +1,10 @@
 # Gantry ACR benchmark runbook
 
+`deploy.sh` is the authoritative infrastructure and installation entrypoint.
+Use this runbook only for manual benchmark lifecycle control or diagnosis after
+`make -C hack/gantry-benchmark deploy` succeeds. Do not reconstruct deployment
+from the individual commands below.
+
 This workflow is for a dedicated test cluster. The benchmark itself runs only
 on a private VM in the AKS VNet. Run the provisioning and Azure Run Command
 commands below from the Unbounded repository root on an admin workstation.
@@ -18,10 +23,11 @@ export AZURE_GANTRY_ACR_PRIVATE_ENDPOINT_RESOURCE_ID="<gantry-private-endpoint-i
 export OPERATOR_VNET_RESOURCE_GROUP="<vnet-resource-group>"
 export OPERATOR_VNET_NAME="<vnet-name>"
 
-# Optional scale overrides. Defaults are 5 nodes and a 128 MiB / 4-layer image.
-export BENCHMARK_NODE_COUNT="5"
-export BENCHMARK_IMAGE_SIZE_MIB="128"
-export BENCHMARK_IMAGE_LAYERS="4"
+# Explicit 1000-node deployment contract. Smaller values are for isolated
+# development clusters and are not the full-stack benchmark configuration.
+export BENCHMARK_NODE_COUNT="1000"
+export BENCHMARK_IMAGE_SIZE_MIB="40960"
+export BENCHMARK_IMAGE_LAYERS="40"
 
 # Optional operator storage overrides. These are the high-throughput defaults.
 export OPERATOR_VM_SIZE="Standard_D32ds_v5"
@@ -31,7 +37,26 @@ export OPERATOR_BUILD_DISK_SKU="PremiumV2_LRS"
 export OPERATOR_BUILD_DISK_IOPS="20000"
 export OPERATOR_BUILD_DISK_MBPS="750"
 
+# Optional private source delivery. Build this image from the exact local
+# commit and set both values together; bootstrap rejects a revision mismatch.
+export BENCHMARK_SOURCE_IMAGE="<gantry-acr>.azurecr.io/gantry-benchmark-source:<commit>"
+export BENCHMARK_SOURCE_REVISION="<full-commit-sha>"
+
 make -C hack/gantry-benchmark operator-vm-provision
+```
+
+To create the private source image without publishing the branch to GitHub:
+
+```bash
+SOURCE_REVISION=$(git rev-parse HEAD)
+az acr build \
+   --registry "$GANTRY_ACR_NAME" \
+   --image "gantry-benchmark-source:${SOURCE_REVISION}" \
+   --file images/gantry-benchmark-source/Containerfile \
+   --build-arg "SOURCE_REVISION=${SOURCE_REVISION}" \
+   .
+export BENCHMARK_SOURCE_IMAGE="${GANTRY_ACR_NAME}.azurecr.io/gantry-benchmark-source:${SOURCE_REVISION}"
+export BENCHMARK_SOURCE_REVISION="$SOURCE_REVISION"
 ```
 
 Provisioning creates:
@@ -64,6 +89,19 @@ The graphroot must be `/opt/gantry-benchmark/containers`.
 
 ## 2. Start The Full Lifecycle
 
+Before provisioning the operator VM or starting the lifecycle on AKS, apply
+the benchmark containerd configuration and require it to be Ready on every
+target node. This enables debug unpack logs, sets the no-progress timeout to
+15 minutes, and raises transfer-service layer downloads to six. The DaemonSet
+performs one detached containerd restart per configuration hash.
+
+```bash
+kubectl create namespace gantry-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f hack/gantry-benchmark/manifests/containerd.yaml
+kubectl -n gantry-system rollout status \
+   daemonset/gantry-benchmark-containerd-config --timeout=45m
+```
+
 ```bash
 export OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"
 
@@ -84,8 +122,6 @@ Use the repository progress dashboard while the service is running:
 ```bash
 export AZURE_RESOURCE_GROUP="<resource-group>"
 export OPERATOR_VM_NAME="gantry-benchmark-operator"
-export OPERATOR_SSH_HOST="<operator-public-ip>"
-export OPERATOR_SSH_KEY="tmp/gantry-benchmark-ssh-key"
 
 # One snapshot:
 make -C hack/gantry-benchmark operator-vm-status
@@ -99,9 +135,9 @@ VM disk, active image command, Kubernetes Jobs, Gantry DaemonSet status, and
 recent logs. During a running lifecycle it never displays a previous run's
 comparison as if it were current.
 
-Direct SSH is the preferred monitoring transport. Restrict TCP/22 to the admin
-workstation's `/32`; when SSH variables are absent, the command falls back to
-Azure Run Command.
+The full-stack operator VM has no public IP. Azure Run Command is the default
+monitoring transport. SSH is optional only over deliberately provided private
+network connectivity.
 
 ```bash
 az vm run-command invoke \
@@ -146,7 +182,8 @@ make -C hack/gantry-benchmark enable
 `enable` fails unless:
 
 - The confirmed and current kubectl contexts match.
-- Exactly 300 schedulable Ready nodes match `BENCHMARK_IMAGE_PLATFORM`.
+- Exactly `BENCHMARK_NODE_COUNT` schedulable Ready nodes match
+   `BENCHMARK_IMAGE_PLATFORM`.
 - Gantry reports 300 desired, updated, Ready, and available pods.
 - No benchmark state ConfigMap already exists.
 

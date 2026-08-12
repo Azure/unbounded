@@ -48,6 +48,25 @@ func TestDigestToCID_Deterministic(t *testing.T) {
 	}
 }
 
+func TestMergePeerAddrInfoCombinesAddressesByPeer(t *testing.T) {
+	peerID := peer.ID("peer-a")
+	tcp := multiaddr.StringCast("/ip4/10.0.0.1/tcp/4001")
+	quic := multiaddr.StringCast("/ip4/10.0.0.1/udp/4001/quic-v1")
+	pool := []peer.AddrInfo{}
+	positions := map[peer.ID]int{}
+
+	mergePeerAddrInfo(&pool, positions, peer.AddrInfo{ID: peerID, Addrs: []multiaddr.Multiaddr{tcp}})
+	mergePeerAddrInfo(&pool, positions, peer.AddrInfo{ID: peerID, Addrs: []multiaddr.Multiaddr{tcp, quic}})
+
+	if len(pool) != 1 {
+		t.Fatalf("peer count = %d, want 1", len(pool))
+	}
+
+	if len(pool[0].Addrs) != 2 {
+		t.Fatalf("address count = %d, want 2", len(pool[0].Addrs))
+	}
+}
+
 func TestHostBringUpEphemeral(t *testing.T) {
 	// Smoke test: New with an ephemeral identity returns a usable host;
 	// Provide on a fresh DHT errors because there are no peers yet, but

@@ -50,5 +50,5 @@ func TestCleanupNetwork(t *testing.T) {
 
 	task := CleanupNetwork(slog.Default())
 
-	assert.Equal(t, "serial(remove-network-interfaces, cleanup-routes)", task.Name())
+	assert.Equal(t, "serial(cleanup-localdns-rules, remove-network-interfaces, cleanup-routes)", task.Name())
 }

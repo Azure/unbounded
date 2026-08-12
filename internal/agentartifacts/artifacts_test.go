@@ -206,6 +206,29 @@ func TestCNIPluginsArchive(t *testing.T) {
 	}
 }
 
+func TestCoreDNSArchive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		override *goalstates.DownloadSource
+		want     string
+	}{
+		{name: "default", want: "https://github.com/coredns/coredns/releases/download/v1.12.3/coredns_1.12.3_linux_amd64.tgz"},
+		{name: "base URL", override: &goalstates.DownloadSource{BaseURL: "https://mirror.test/coredns/"}, want: "https://mirror.test/coredns/v1.12.3/coredns_1.12.3_linux_amd64.tgz"},
+		{name: "URL", override: &goalstates.DownloadSource{URL: "file:///bundle/coredns/v%s/linux/%s/coredns"}, want: "file:///bundle/coredns/v1.12.3/linux/amd64/coredns"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := CoreDNSArchive(test.override, "1.12.3", "amd64"); got != test.want {
+				t.Fatalf("CoreDNSArchive() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestCrictlArchive(t *testing.T) {
 	t.Parallel()
 

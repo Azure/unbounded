@@ -4,6 +4,7 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -294,6 +295,52 @@ func TestRangeRequest(t *testing.T) {
 	got, _ := io.ReadAll(resp.Body)
 	if string(got) != "2345" {
 		t.Errorf("body = %q, want 2345", got)
+	}
+}
+
+type shortNonSeekerStore struct {
+	digest digest.Digest
+}
+
+func (s shortNonSeekerStore) Has(context.Context, digest.Digest) (bool, error) {
+	return true, nil
+}
+
+func (s shortNonSeekerStore) Open(context.Context, digest.Digest) (io.ReadCloser, int64, error) {
+	return io.NopCloser(bytes.NewReader([]byte("ab"))), 16, nil
+}
+
+func (s shortNonSeekerStore) Writer(context.Context, digest.Digest) (ifaces.ContentWriter, error) {
+	return nil, context.Canceled
+}
+
+func TestRangePositionFailureDoesNotSendPartialContent(t *testing.T) {
+	d := mustDigest([]byte("expected digest identity only"))
+	server := New(shortNonSeekerStore{digest: d})
+	testServer := httptest.NewServer(server.Handler())
+	t.Cleanup(testServer.Close)
+
+	request, err := http.NewRequest(http.MethodGet, testServer.URL+"/v2/r/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	request.Header.Set(MirroredHeader, "1")
+	request.Header.Set("Range", "bytes=4-7")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", response.StatusCode)
+	}
+
+	if got := response.Header.Get("Content-Range"); got != "" {
+		t.Fatalf("Content-Range = %q, want empty", got)
 	}
 }
 

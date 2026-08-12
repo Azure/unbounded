@@ -80,6 +80,9 @@ type manualBootstrapHandler struct {
 	// nodeIP is passed through to kubelet --node-ip.
 	nodeIP string
 
+	// localDNS enables the nspawn-local CoreDNS cache.
+	localDNS bool
+
 	// ociImage is an optional OCI image reference for the agent. When set,
 	// it is included in the AgentConfig JSON so the agent uses a container
 	// image to bootstrap the machine rootfs.
@@ -456,15 +459,12 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		RegisterWithTaints: h.taints,
 	}
 
-	if h.ociImage != "" {
-		machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
+	machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
+	if h.localDNS {
+		machine.Spec.Agent.LocalDNS = &unboundedv1alpha3.LocalDNSSpec{Enabled: true}
 	}
 
 	if downloads := h.buildDownloadsSpec(); downloads != nil {
-		if machine.Spec.Agent == nil {
-			machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{}
-		}
-
 		machine.Spec.Agent.Downloads = downloads
 	}
 
@@ -703,6 +703,7 @@ Examples:
 	cmd.Flags().StringArrayVar(&handler.nodeLabels, "node-label", nil, "Label in key=value format to pass to kubelet (can be repeated)")
 	cmd.Flags().StringArrayVar(&handler.taints, "register-with-taint", nil, "Taint to register on the node (can be repeated)")
 	cmd.Flags().StringVar(&handler.nodeIP, "node-ip", "", "IP address to pass to kubelet")
+	cmd.Flags().BoolVar(&handler.localDNS, "local-dns", false, "Enable the nspawn-local CoreDNS cache")
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image source for the agent rootfs (registry reference, HTTPS OCI layout archive, or oci-layout:// URL)")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")

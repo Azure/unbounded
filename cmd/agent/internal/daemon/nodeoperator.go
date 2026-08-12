@@ -56,7 +56,7 @@ type nodeOperator interface {
 	// not perform Kubernetes eviction or CNI-specific dataplane cleanup itself.
 	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
 	// StageAgentUpgrade stages a new host-side agent binary.
-	StageAgentUpgrade(context.Context, *slog.Logger, string) error
+	StageAgentUpgrade(context.Context, *slog.Logger, agentUpgradeRequest) error
 	// RestartAgentDaemon restarts the host-side agent daemon after an upgrade
 	// operation has been recorded as complete.
 	RestartAgentDaemon(context.Context, *slog.Logger) error
@@ -172,6 +172,10 @@ func hasDrift(applied, desired *provision.AgentConfig) bool {
 		return true
 	}
 
+	if !reflect.DeepEqual(applied.LocalDNS, desired.LocalDNS) {
+		return true
+	}
+
 	return false
 }
 
@@ -260,8 +264,8 @@ func (nspawnNodeOperator) RepaveNode(
 	return nil
 }
 
-func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, downloadURL string) error {
-	return upgradeDaemonBinary(ctx, log, downloadURL)
+func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {
+	return upgradeDaemonBinary(ctx, log, request)
 }
 
 func (nspawnNodeOperator) RestartAgentDaemon(ctx context.Context, log *slog.Logger) error {

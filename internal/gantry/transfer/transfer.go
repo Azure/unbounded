@@ -47,6 +47,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
 
 // MirroredHeader is the OCI-extension header peers MUST include on every
@@ -286,7 +287,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 			return
 		}
 
-		written, err := io.Copy(w, rc)
+		written, err := streamcopy.CopyN(w, rc, size)
 		s.bumpServeBytes(kind, written)
 
 		if err != nil {
@@ -307,28 +308,37 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 	}
 
 	length := end - start + 1
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	w.WriteHeader(http.StatusPartialContent)
 
 	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+		w.WriteHeader(http.StatusPartialContent)
 		s.bumpServe()
+
 		return
 	}
 
 	rs, isSeeker := rc.(io.ReadSeeker)
 	if !isSeeker {
 		// Fall back to discarding the unwanted prefix.
-		if _, err := io.CopyN(io.Discard, rc, start); err != nil {
-			s.logger.Debug("transfer: discard prefix failed", slog.Any("err", err))
+		if _, err := streamcopy.CopyN(io.Discard, rc, start); err != nil {
+			s.logger.Warn("transfer: discard prefix failed", slog.Any("err", err))
+			http.Error(w, "range positioning failed", http.StatusInternalServerError)
+
 			return
 		}
 	} else if _, err := rs.Seek(start, io.SeekStart); err != nil {
-		s.logger.Debug("transfer: seek failed", slog.Any("err", err))
+		s.logger.Warn("transfer: seek failed", slog.Any("err", err))
+		http.Error(w, "range positioning failed", http.StatusInternalServerError)
+
 		return
 	}
 
-	written, err := io.CopyN(w, rc, length)
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.WriteHeader(http.StatusPartialContent)
+
+	written, err := streamcopy.CopyN(w, rc, length)
 	s.bumpServeBytes(kind, written)
 
 	if err != nil {

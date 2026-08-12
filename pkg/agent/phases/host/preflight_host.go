@@ -73,7 +73,7 @@ func (c simpleHostChecker) Check(ctx context.Context) []preflight.Result { retur
 // Preflight returns the standard host environment checks required before
 // provisioning an nspawn machine.
 func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGoalState) []preflight.Checker {
-	return []preflight.Checker{
+	checks := []preflight.Checker{
 		CheckIsPrivilegedUser(log),
 		CheckExistingDeployment(log),
 		checkHostPackages(log, cfg.OfflineArtifactsConfigured(), defaultHostCheckDeps()),
@@ -86,7 +86,10 @@ func Preflight(log *slog.Logger, cfg config.AgentConfig, _ *goalstates.MachineGo
 		CheckDiskSpace(log),
 		CheckCgroups(log),
 		CheckNvidiaDriver(log),
+		checkLocalDNSConntrack(log, cfg, defaultLocalDNSConntrackDeps()),
 	}
+
+	return checks
 }
 
 // CheckIsPrivilegedUser verifies preflight is running as root.

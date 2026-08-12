@@ -130,6 +130,11 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	baselineDiagnosticsBefore, err := b.fetchGantryDiagnosticSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
 	writeAll(b.stdout, fmt.Sprintf("running baseline pull on %d nodes\n", b.config.NodeCount))
 
 	baselineJob, err := b.runPullJob(ctx, state, proxyPhaseBaseline, baselineImage)
@@ -170,7 +175,38 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	baselineDiagnosticsAfter, err := b.fetchGantryDiagnosticSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
+	baselineDiagnosticTimestamps, err := b.fetchGantryDiagnosticTimestamps(ctx, revision, telemetryWindow{
+		StartedAt:  baselineJob.PhaseStartedAt,
+		FinishedAt: baselineJob.PhaseFinishedAt,
+	})
+	if err != nil {
+		return err
+	}
+
+	baselineDiagnostics, err := subtractGantryDiagnosticSnapshots(
+		baselineDiagnosticsBefore,
+		baselineDiagnosticsAfter,
+		baselineDiagnosticTimestamps,
+	)
+	if err != nil {
+		return err
+	}
+
 	baselineBytes, baselineBytesSource := deriveOriginBytes(b.config, proxyPhaseBaseline, baselineProxy, baselineGantry, baselineJob)
+
+	baselinePerformance, err := b.capturePhasePerformanceTelemetry(ctx, proxyPhaseBaseline, baselineJob)
+	if err != nil {
+		return err
+	}
+
+	if err := b.writePerformanceTelemetryArtifact(state.RunID, proxyPhaseBaseline, baselinePerformance); err != nil {
+		return err
+	}
 
 	baselineResult := phaseResult{
 		RunID:                  state.RunID,
@@ -183,14 +219,16 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		Proxy:                  baselineProxy,
 		Gantry:                 baselineGantry,
 		GantryPeer:             baselinePeer,
+		GantryDiagnostics:      baselineDiagnostics,
 		Azure: azurePhaseMeasurement{Window: telemetryWindow{
 			StartedAt:  baselineWindowStart,
 			FinishedAt: baselineWindowFinish,
 		}},
-		Job:               baselineJob,
-		OriginBytes:       baselineBytes,
-		OriginBytesSource: baselineBytesSource,
-		RecordedAt:        time.Now().UTC(),
+		Job:                          baselineJob,
+		OriginBytes:                  baselineBytes,
+		OriginBytesSource:            baselineBytesSource,
+		PerformanceTelemetryArtifact: string(proxyPhaseBaseline) + "-performance.json",
+		RecordedAt:                   time.Now().UTC(),
 	}
 	if err := b.writeJSONArtifact(state.RunID, "baseline.json", baselineResult); err != nil {
 		return err
@@ -227,6 +265,11 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	gantryDiagnosticsBefore, err := b.fetchGantryDiagnosticSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
 	writeAll(b.stdout, fmt.Sprintf("running Gantry cold pull on %d nodes\n", b.config.NodeCount))
 
 	gantryJob, err := b.runPullJob(ctx, state, proxyPhaseGantryCold, gantryImage)
@@ -258,6 +301,32 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		return err
 	}
 
+	gantryDiagnosticsAfter, err := b.fetchGantryDiagnosticSnapshot(ctx, revision)
+	if err != nil {
+		return err
+	}
+
+	gantryDiagnosticTimestamps, err := b.fetchGantryDiagnosticTimestamps(ctx, revision, telemetryWindow{
+		StartedAt:  gantryJob.PhaseStartedAt,
+		FinishedAt: gantryJob.PhaseFinishedAt,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := requireFinalLayerResponseTimestamps(gantryDiagnosticTimestamps, gantryDiagnosticsAfter.PodNodes); err != nil {
+		return err
+	}
+
+	gantryDiagnostics, err := subtractGantryDiagnosticSnapshots(
+		gantryDiagnosticsBefore,
+		gantryDiagnosticsAfter,
+		gantryDiagnosticTimestamps,
+	)
+	if err != nil {
+		return err
+	}
+
 	var gantryProxy proxyPhaseTotals
 
 	if state.usesProxy() {
@@ -268,6 +337,15 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 	}
 
 	gantryBytes, gantryBytesSource := deriveOriginBytes(b.config, proxyPhaseGantryCold, gantryProxy, phaseMetrics, gantryJob)
+
+	gantryPerformance, err := b.capturePhasePerformanceTelemetry(ctx, proxyPhaseGantryCold, gantryJob)
+	if err != nil {
+		return err
+	}
+
+	if err := b.writePerformanceTelemetryArtifact(state.RunID, proxyPhaseGantryCold, gantryPerformance); err != nil {
+		return err
+	}
 
 	gantryResult := phaseResult{
 		RunID:                  state.RunID,
@@ -280,14 +358,16 @@ func (b *benchmark) runBenchmark(ctx context.Context) (returnErr error) {
 		Proxy:                  gantryProxy,
 		Gantry:                 phaseMetrics,
 		GantryPeer:             gantryPeer,
+		GantryDiagnostics:      gantryDiagnostics,
 		Azure: azurePhaseMeasurement{Window: telemetryWindow{
 			StartedAt:  gantryWindowStart,
 			FinishedAt: gantryWindowFinish,
 		}},
-		Job:               gantryJob,
-		OriginBytes:       gantryBytes,
-		OriginBytesSource: gantryBytesSource,
-		RecordedAt:        time.Now().UTC(),
+		Job:                          gantryJob,
+		OriginBytes:                  gantryBytes,
+		OriginBytesSource:            gantryBytesSource,
+		PerformanceTelemetryArtifact: string(proxyPhaseGantryCold) + "-performance.json",
+		RecordedAt:                   time.Now().UTC(),
 	}
 	if err := b.writeJSONArtifact(state.RunID, "gantry-cold.json", gantryResult); err != nil {
 		return err

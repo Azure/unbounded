@@ -91,6 +91,10 @@ func resolveOfflineArtifacts(ctx context.Context, cfg *config.AgentConfig, offli
 		return nil, err
 	}
 
+	if cfg.LocalDNS != nil && cfg.LocalDNS.Enabled && manifest.Versions.CoreDNS == "" {
+		return nil, errors.New("offline artifact manifest versions.coredns is required when LocalDNS is enabled")
+	}
+
 	if err := verifyOfflineFiles(ctx, bundle, manifest); err != nil {
 		return nil, err
 	}
@@ -232,6 +236,10 @@ func downloadOverridesFromOfflineArtifacts(offlineArtifacts *ResolvedOfflineArti
 		Crictl: &DownloadSource{
 			URL:     offlineArtifacts.bundle.ArtifactURL("crictl/v%s/crictl-v%s-%s-%s.tar.gz"),
 			Version: manifest.Versions.Crictl,
+		},
+		CoreDNS: &DownloadSource{
+			URL:     offlineArtifacts.bundle.ArtifactURL("coredns/v%s/bin/linux/%s/coredns"),
+			Version: manifest.Versions.CoreDNS,
 		},
 	}
 

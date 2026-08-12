@@ -14,8 +14,8 @@ import (
 
 func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	c := NewDefault()
-	if c.PeerFetchTimeout != 60*time.Second {
-		t.Fatalf("PeerFetchTimeout = %v, want 60s", c.PeerFetchTimeout)
+	if c.PeerFetchTimeout != 15*time.Minute {
+		t.Fatalf("PeerFetchTimeout = %v, want 15m", c.PeerFetchTimeout)
 	}
 
 	if c.AdvertiseReconcileInterval != time.Minute {
@@ -24,6 +24,18 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 
 	if c.PrefetchPullerFraction != 0 {
 		t.Fatalf("PrefetchPullerFraction = %v, want disabled", c.PrefetchPullerFraction)
+	}
+
+	if c.PrefetchCoordinatorReplicas != 3 {
+		t.Fatalf("PrefetchCoordinatorReplicas = %d, want 3", c.PrefetchCoordinatorReplicas)
+	}
+
+	if c.PrefetchMaxConcurrentGroups != 64 {
+		t.Fatalf("PrefetchMaxConcurrentGroups = %d, want 64", c.PrefetchMaxConcurrentGroups)
+	}
+
+	if c.PrefetchDispatchJitter != time.Second {
+		t.Fatalf("PrefetchDispatchJitter = %v, want 1s", c.PrefetchDispatchJitter)
 	}
 
 	if c.TransferMaxConcurrentServes != 10 {
@@ -88,6 +100,69 @@ func TestValidate_PrefetchPullerFractionBounds(t *testing.T) {
 	}
 }
 
+func TestPrefetchDispatchConfig(t *testing.T) {
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+
+		err := c.LoadEnv(func(key string) string {
+			switch key {
+			case "GANTRY_PREFETCH_COORDINATOR_REPLICAS":
+				return "5"
+			case "GANTRY_PREFETCH_MAX_CONCURRENT_GROUPS":
+				return "32"
+			case "GANTRY_PREFETCH_DISPATCH_JITTER":
+				return "750ms"
+			default:
+				return ""
+			}
+		})
+		if err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.PrefetchCoordinatorReplicas != 5 || c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
+			t.Fatalf("prefetch dispatch config = %d, %d, %v", c.PrefetchCoordinatorReplicas, c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		}
+	})
+
+	t.Run("flags", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--prefetch-coordinator-replicas=5", "--prefetch-max-concurrent-groups=32", "--prefetch-dispatch-jitter=750ms"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.PrefetchCoordinatorReplicas != 5 || c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
+			t.Fatalf("prefetch dispatch config = %d, %d, %v", c.PrefetchCoordinatorReplicas, c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		}
+	})
+}
+
+func TestValidate_PrefetchDispatchBounds(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{name: "zero coordinators", mutate: func(c *Config) { c.PrefetchCoordinatorReplicas = 0 }, want: "prefetch_coordinator_replicas"},
+		{name: "zero groups", mutate: func(c *Config) { c.PrefetchMaxConcurrentGroups = 0 }, want: "prefetch_max_concurrent_groups"},
+		{name: "negative jitter", mutate: func(c *Config) { c.PrefetchDispatchJitter = -time.Second }, want: "prefetch_dispatch_jitter"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			test.mutate(c)
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("want %s error, got %v", test.want, err)
+			}
+		})
+	}
+}
+
 func TestValidate_RequiresUpstream(t *testing.T) {
 	c := NewDefault()
 
@@ -121,6 +196,72 @@ func TestValidate_MirrorListenAllowNonLoopbackOptIn(t *testing.T) {
 	c.MirrorBindAllowNonLoopback = true
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate (opt-in): %v", err)
+	}
+}
+
+func TestPprofListenConfig(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		if got := NewDefault().PprofListen; got != "" {
+			t.Fatalf("PprofListen = %q, want disabled", got)
+		}
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		c := NewDefault()
+		if err := c.LoadEnv(func(key string) string {
+			if key == "GANTRY_PPROF_LISTEN" {
+				return "127.0.0.1:6060"
+			}
+
+			return ""
+		}); err != nil {
+			t.Fatalf("LoadEnv: %v", err)
+		}
+
+		if c.PprofListen != "127.0.0.1:6060" {
+			t.Fatalf("PprofListen = %q", c.PprofListen)
+		}
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		c := NewDefault()
+		flags := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(flags)
+
+		if err := flags.Parse([]string{"--pprof-listen=localhost:6060"}); err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+
+		if c.PprofListen != "localhost:6060" {
+			t.Fatalf("PprofListen = %q", c.PprofListen)
+		}
+	})
+}
+
+func TestValidate_PprofListenMustBeLoopback(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:6060", "10.0.0.1:6060", ":6060", "pod.example:6060", "127.0.0.1:0", "127.0.0.1:70000", "127.0.0.1:http"} {
+		t.Run(address, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			c.PprofListen = address
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), "pprof_listen") {
+				t.Fatalf("want pprof validation error, got %v", err)
+			}
+		})
+	}
+
+	for _, address := range []string{"127.0.0.1:6060", "[::1]:6060", "localhost:6060"} {
+		t.Run(address, func(t *testing.T) {
+			c := NewDefault()
+			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
+			c.PprofListen = address
+
+			if err := c.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
 	}
 }
 

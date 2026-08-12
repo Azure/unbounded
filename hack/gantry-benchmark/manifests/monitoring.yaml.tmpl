@@ -10,6 +10,7 @@ metadata:
   namespace: {{ .Namespace }}
   labels:
     release: {{ .MonitoringLabel }}
+    gantry_benchmark: "true"
     app.kubernetes.io/part-of: gantry-benchmark
 spec:
   namespaceSelector:
@@ -28,7 +29,245 @@ spec:
         - action: keep
           sourceLabels:
             - __name__
-          regex: gantry_storage_mode_info|p2p_dht_health_score|gantry_peer_serve_bytes_total|gantry_origin_bytes_total|p2p_origin_pull_total|p2p_peer_fetch_total|p2p_origin_pull_success_total|p2p_origin_fallback_total|p2p_in_flight_pulls|gantry_peer_fetch_bytes_total|gantry_mirror_bytes_served_total
+          regex: process_cpu_seconds_total|gantry_storage_mode_info|p2p_dht_health_score|p2p_dht_lookup_total|p2p_dht_lookup_duration_seconds_(bucket|sum|count)|gantry_peer_serve_bytes_total|gantry_origin_bytes_total|p2p_origin_pull_total|p2p_peer_fetch_total|gantry_peer_fetch_last_timestamp_seconds|p2p_peer_fetch_duration_seconds_(bucket|sum|count)|p2p_origin_pull_success_total|p2p_origin_fallback_total|p2p_in_flight_pulls|gantry_peer_fetch_bytes_total|gantry_mirror_bytes_served_total|gantry_mirror_response_completed_timestamp_seconds|gantry_layer_download_completed_timestamp_seconds|gantry_containerd_commit_observed_total|gantry_containerd_commit_observed_timestamp_seconds|gantry_containerd_commit_observation_duration_seconds_(bucket|sum|count)|gantry_containerd_commit_latest_observation_duration_seconds|gantry_containerd_commit_missing_after_stream_total|p2p_coord_please_pull_(served|started|declined)_total|p2p_coord_pull_intent_served_total|p2p_prefetch_(batches|digests|groups)_total|p2p_prefetch_pullers_per_manifest_(bucket|sum|count)
+        - action: replace
+          targetLabel: gantry_benchmark
+          replacement: "true"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-benchmark-node-observer
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry-benchmark-node-observer
+    app.kubernetes.io/part-of: gantry-benchmark
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry-benchmark-node-observer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry-benchmark-node-observer
+        app.kubernetes.io/part-of: gantry-benchmark
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/os: {{ .NodeOS }}
+        kubernetes.io/arch: {{ .NodeArch }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-exporter
+          image: quay.io/prometheus/node-exporter:v1.9.1
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+            - --web.listen-address=:29100
+            - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/kubelet/pods/.+)($|/)
+            - --collector.textfile.directory=/textfile
+          ports:
+            - name: node-metrics
+              containerPort: 29100
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+            - name: progress
+              mountPath: /textfile
+              readOnly: true
+        - name: containerd-metrics-target
+          image: mcr.microsoft.com/cbl-mariner/busybox:2.0
+          command: ["sh", "-c", "exec sleep 2147483647"]
+          ports:
+            - name: ctr-metrics
+              containerPort: 10257
+          resources:
+            requests:
+              cpu: 1m
+              memory: 4Mi
+            limits:
+              cpu: 20m
+              memory: 16Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        - name: containerd-journal
+          image: mcr.microsoft.com/cbl-mariner/busybox:2.0
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+
+              textfile="${TEXTFILE_DIR:-/textfile}"
+              current_image_file="${textfile}/current-image"
+              mkdir -p "${textfile}"
+              rm -f "${textfile}"/*.tmp
+
+              containerd_pid="$(chroot /host systemctl show --property MainPID --value containerd)"
+              containerd_bin="$(chroot /host readlink -f "/proc/${containerd_pid}/exe")"
+              if [ -z "${containerd_bin}" ] || ! chroot /host "${containerd_bin}" config dump 2>/dev/null | grep -Eq "^[[:space:]]*level = ['\"]debug['\"]$"; then
+                echo "containerd debug logging is required for unpack timing capture" >&2
+                exit 1
+              fi
+
+              chroot /host journalctl -f -n 0 -u containerd -o cat | while IFS= read -r line; do
+                case "${line}" in
+                  *PullImage*gantry-benchmark-pull*)
+                    image="$(printf '%s\n' "${line}" | sed -n 's/.*image="\([^"]*\)".*/\1/p')"
+                    if [ -n "${image}" ]; then
+                      previous="$(cat "${current_image_file}" 2>/dev/null || true)"
+                      if [ "${previous}" != "${image}" ]; then
+                        rm -f "${textfile}"/layer-*.prom "${textfile}"/image-*.prom
+                        printf '%s\n' "${image}" >"${current_image_file}.tmp"
+                        mv "${current_image_file}.tmp" "${current_image_file}"
+                      fi
+
+                      output="${textfile}/image-start.prom"
+                      if [ ! -f "${output}" ]; then
+                        timestamp="$(date +%s)"
+                        {
+                          echo '# TYPE gantry_benchmark_image_unpack_started_timestamp_seconds gauge'
+                          printf 'gantry_benchmark_image_unpack_started_timestamp_seconds{node="%s",image="%s"} %s\n' "${NODE_NAME}" "${image}" "${timestamp}"
+                        } >"${output}.tmp"
+                        mv "${output}.tmp" "${output}"
+                      fi
+                    fi
+                    printf '%s\n' "${line}"
+                    ;;
+                  *'layer unpacked'*)
+                    digest="$(printf '%s\n' "${line}" | sed -n 's/.*layer=\(sha256:[0-9a-f]*\).*/\1/p')"
+                    image="$(cat "${current_image_file}" 2>/dev/null || true)"
+                    if [ -n "${digest}" ] && [ -n "${image}" ]; then
+                      timestamp="$(date +%s)"
+                      output="${textfile}/layer-${digest#sha256:}.prom"
+                      {
+                        echo '# TYPE gantry_benchmark_layer_unpacked_timestamp_seconds gauge'
+                        printf 'gantry_benchmark_layer_unpacked_timestamp_seconds{node="%s",image="%s",layer_digest="%s"} %s\n' "${NODE_NAME}" "${image}" "${digest}" "${timestamp}"
+                      } >"${output}.tmp"
+                      mv "${output}.tmp" "${output}"
+                    fi
+                    printf '%s\n' "${line}"
+                    ;;
+                  *'image unpacked'*)
+                    image="$(cat "${current_image_file}" 2>/dev/null || true)"
+                    if [ -n "${image}" ]; then
+                      timestamp="$(date +%s)"
+                      output="${textfile}/image-complete.prom"
+                      {
+                        echo '# TYPE gantry_benchmark_image_unpacked_timestamp_seconds gauge'
+                        printf 'gantry_benchmark_image_unpacked_timestamp_seconds{node="%s",image="%s"} %s\n' "${NODE_NAME}" "${image}" "${timestamp}"
+                      } >"${output}.tmp"
+                      mv "${output}.tmp" "${output}"
+                    fi
+                    printf '%s\n' "${line}"
+                    ;;
+                  *'Pulled image'*|*'cancel pulling image'*)
+                    printf '%s\n' "${line}"
+                    ;;
+                esac
+              done
+          resources:
+            requests:
+              cpu: 2m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: host
+              mountPath: /host
+              readOnly: true
+            - name: progress
+              mountPath: /textfile
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: root
+          hostPath:
+            path: /
+            type: Directory
+        - name: host
+          hostPath:
+            path: /
+            type: Directory
+        - name: progress
+          emptyDir: {}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gantry-benchmark-node-observer
+  namespace: {{ .Namespace }}
+  labels:
+    release: {{ .MonitoringLabel }}
+    gantry_benchmark: "true"
+    app.kubernetes.io/part-of: gantry-benchmark
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry-benchmark-node-observer
+  podMetricsEndpoints:
+    - port: node-metrics
+      path: /metrics
+      interval: 10s
+      metricRelabelings:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: node_uname_info|node_cpu_seconds_total|node_memory_(MemAvailable|MemTotal)_bytes|node_disk_(read|written)_bytes_total|node_disk_io_time_seconds_total|node_disk_io_time_weighted_seconds_total|node_disk_reads_completed_total|node_disk_writes_completed_total|node_filesystem_(avail|size)_bytes|node_network_speed_bytes|node_network_(receive|transmit)_(bytes|drop|errs)_total|gantry_benchmark_(image_unpack_started|image_unpacked|layer_unpacked)_timestamp_seconds
+        - action: replace
+          targetLabel: gantry_benchmark
+          replacement: "true"
+    - port: ctr-metrics
+      path: /v1/metrics
+      interval: 10s
+      metricRelabelings:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: containerd_.*|grpc_server_.*|process_(cpu_seconds_total|resident_memory_bytes|virtual_memory_bytes)
         - action: replace
           targetLabel: gantry_benchmark
           replacement: "true"

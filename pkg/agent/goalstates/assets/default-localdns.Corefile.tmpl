@@ -1,0 +1,41 @@
+health-check.localdns.local:53 {
+    bind {{ .NodeListenerIP }} {{ .ClusterListenerIP }}
+    whoami
+}
+
+.:53 {
+    errors
+    bind {{ .NodeListenerIP }}
+    forward . {{ .NodeUpstreamIPsJoined }} {
+        force_tcp
+        policy sequential
+        max_concurrent 1000
+    }
+    ready {{ .NodeListenerIP }}:8181
+    cache 30 {
+        success 9984
+        denial 9984
+        serve_stale 3600s verify
+        servfail 0
+    }
+    loop
+    prometheus {{ .MetricsAddress }}
+}
+
+.:53 {
+    errors
+    bind {{ .ClusterListenerIP }}
+    forward . {{ .ClusterDNSServiceIP }} {
+        force_tcp
+        policy sequential
+        max_concurrent 1000
+    }
+    ready {{ .ClusterListenerIP }}:8181
+    cache 30 {
+        success 9984
+        denial 9984
+        serve_stale 3600s verify
+        servfail 0
+    }
+    loop
+}

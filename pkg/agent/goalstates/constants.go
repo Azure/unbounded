@@ -33,6 +33,7 @@ const (
 	DaemonBinaryLastGoodPath     = "/usr/local/bin/unbounded-agent-last-good"
 	DaemonRecoveryScriptPath     = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
+	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
 
 	EnvDaemonBinary                 = "UNBOUNDED_AGENT_DAEMON_BINARY"
 	EnvDaemonBinaryBlue             = "UNBOUNDED_AGENT_DAEMON_BINARY_BLUE"
@@ -177,4 +178,5 @@ const (
 	KubeletAPIServerCACertPath     = "/etc/kubernetes/pki/apiserver-client-ca.crt"
 	KubeletServiceDropInDir        = "/etc/systemd/system/kubelet.service.d"
 	KubeletStaticPodManifestsDir   = "/etc/kubernetes/manifests"
+	LocalDNSResolvConfPath         = "/etc/unbounded/localdns/resolv.conf"
 )

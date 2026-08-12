@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/Azure/unbounded/internal/gantry/advertise"
@@ -148,6 +150,7 @@ func runAgent(args []string) error {
 	reg.RegisterDefaultCollectors()
 	inst := newPhase1Metrics(reg)
 	p2 := newPhase2Metrics(reg)
+	layerProgress := newLayerProgressTracker(p2.layerCompletedAt, c.NodeName, time.Now)
 	p9 := newPhase9Metrics(reg)
 	// Storage mode info: emit a single time-series at 1 for the
 	// active backend so dashboards can filter by it.
@@ -384,7 +387,7 @@ func runAgent(args []string) error {
 		// annotation (the design doc) which Members reads in Snapshot. This
 		// lets the cluster use stable K8s node names as NodeIDs
 		// while still dialing libp2p RPCs to the right peer.
-		coord.WithPeerIDResolver(membershipPeerIDResolver(memberView, logger)),
+		coord.WithPeerIDResolver(membershipPeerIDResolver(memberView, disco.LibP2P().Peerstore(), logger)),
 	)
 	// pullerPump bridges inbound please_pull RPCs to the local origin
 	// puller (the step 7). The pump itself MUST NOT block the coord
@@ -453,21 +456,24 @@ func runAgent(args []string) error {
 	if hasMultiNodeMembership(memberView) {
 		selfZone := lookupSelfZone(memberView)
 		realResolver := coldstart.New(coldstart.Options{
-			Members:                memberView,
-			Discovery:              disco,
-			Coord:                  coordClient,
-			Inflight:               inflightMap,
-			Logger:                 logger,
-			HrwK:                   c.HRWK,
-			HrwScope:               hrw.ParseScope(c.HRWTopologyScope),
-			SelfZone:               selfZone,
-			LocalIntent:            coordServer,
-			LocalPull:              coordServer,
-			PrefetchPullerReplicas: c.PrefetchPullerReplicas,
-			PrefetchPullerFraction: c.PrefetchPullerFraction,
-			TransientCooldownCap:   c.OriginFailureHonorWindowCap,
-			TopKExpansionFactor:    c.TopKExpansionFactorDegraded,
-			TrustedFailureClasses:  parseTrustedFailureClasses(c.OriginFailureClassesTrustedClusterWide, logger),
+			Members:                     memberView,
+			Discovery:                   disco,
+			Coord:                       coordClient,
+			Inflight:                    inflightMap,
+			Logger:                      logger,
+			HrwK:                        c.HRWK,
+			HrwScope:                    hrw.ParseScope(c.HRWTopologyScope),
+			SelfZone:                    selfZone,
+			LocalIntent:                 coordServer,
+			LocalPull:                   coordServer,
+			PrefetchPullerReplicas:      c.PrefetchPullerReplicas,
+			PrefetchPullerFraction:      c.PrefetchPullerFraction,
+			PrefetchCoordinatorReplicas: c.PrefetchCoordinatorReplicas,
+			PrefetchMaxConcurrentGroups: c.PrefetchMaxConcurrentGroups,
+			PrefetchDispatchJitter:      c.PrefetchDispatchJitter,
+			TransientCooldownCap:        c.OriginFailureHonorWindowCap,
+			TopKExpansionFactor:         c.TopKExpansionFactorDegraded,
+			TrustedFailureClasses:       parseTrustedFailureClasses(c.OriginFailureClassesTrustedClusterWide, logger),
 			Metrics: coldstart.MetricsHooks{
 				OnRankMismatch: func(kindLabel string, _ ifaces.NodeID) {
 					p3.hrwRankMismatch.WithLabelValues(kindLabel).Inc()
@@ -488,16 +494,23 @@ func runAgent(args []string) error {
 					p3.prefetchDigestsTotal.Add(float64(digests))
 					p3.prefetchPullersPerBatch.Observe(float64(pullers))
 				},
+				OnPrefetchGroup: func(target, outcome string) {
+					p3.prefetchGroupsTotal.WithLabelValues(target, outcome).Inc()
+				},
 			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
-		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger)
+		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("cold-start orchestrator wired",
 			slog.Int("hrw_k", c.HRWK),
 			slog.String("hrw_scope", c.HRWTopologyScope),
 		)
 	} else {
 		logger.Info("cold-start orchestrator disabled (single-self membership; no Kubernetes informer)")
+	}
+
+	if layerPrefetcher == nil {
+		layerPrefetcher = newLayerPrefetcher(nil, cstore, logger, layerProgress.observeManifest)
 	}
 
 	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
@@ -563,6 +576,11 @@ func runAgent(args []string) error {
 
 	streamCommitTracker := newStreamCommitTracker(containerdInv, logger,
 		func(n int) { p9.containerdCommitObserved.Add(float64(n)) },
+		func(duration time.Duration) {
+			p9.containerdCommitObserveDur.Observe(duration.Seconds())
+			p9.containerdCommitLatestDur.Set(duration.Seconds())
+			p9.containerdCommitObservedAt.SetToCurrentTime()
+		},
 		func(n int) { p9.commitMissingAfterStream.Add(float64(n)) },
 	)
 
@@ -588,6 +606,10 @@ func runAgent(args []string) error {
 				p2.mirrorServeBytes.WithLabelValues(kind, source).Add(float64(bytes))
 			},
 		),
+		mirror.WithMirrorResponseCompletedHook(func(d digest.Digest, kind, source string) {
+			p2.mirrorCompletedAt.WithLabelValues(kind, source).SetToCurrentTime()
+			layerProgress.completed(d)
+		}),
 		mirror.WithOriginStreamMetrics(
 			func(kind string) { p9.originStreamStarted.WithLabelValues(kind).Inc() },
 			func(kind string) { p9.originStreamCompleted.WithLabelValues(kind).Inc() },
@@ -609,7 +631,13 @@ func runAgent(args []string) error {
 		mirror.WithSelfNodeID(memberView.Self()),
 		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
-			func(outcome string) { p2.peerFetch.WithLabelValues(outcome).Inc() },
+			func(outcome string) {
+				p2.peerFetch.WithLabelValues(outcome).Inc()
+
+				if outcome == "busy" || outcome == "stall" {
+					p2.peerFetchLastAt.WithLabelValues(outcome).SetToCurrentTime()
+				}
+			},
 			func(success bool) {
 				if success {
 					p2.peerDialSuccess.Inc()
@@ -949,7 +977,25 @@ func runAgent(args []string) error {
 	// agent_readiness.go for the full handler wiring.
 	metricsHTTP, metricsErr := startOpsEndpoint(c.MetricsListen, reg, readyCheck, logger)
 
-	// Block until signal or metrics-server crash.
+	var pprofHTTP *http.Server
+
+	if c.PprofListen != "" {
+		startedPprofHTTP, pprofErr, pprofListenErr := startPprofEndpoint(c.PprofListen, logger)
+		if pprofListenErr != nil {
+			logger.Warn("pprof endpoint unavailable", slog.Any("err", pprofListenErr))
+		} else {
+			pprofHTTP = startedPprofHTTP
+
+			go func() {
+				if pprofServeErr, ok := <-pprofErr; ok && pprofServeErr != nil {
+					logger.Warn("pprof endpoint died", slog.Any("err", pprofServeErr))
+				}
+			}()
+		}
+	}
+
+	// Block until signal or an essential background server crashes. Profiling
+	// is diagnostic and never owns data-plane availability.
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
@@ -971,6 +1017,7 @@ func runAgent(args []string) error {
 		coordStop:      func() { coordServer.Unbind(disco.LibP2P()) },
 		pullerPumpGate: pullerPumpGate,
 		metricsHTTP:    metricsHTTP,
+		pprofHTTP:      pprofHTTP,
 		shutdownBudget: 10 * time.Second,
 	})
 	logger.Info("gantry stopped")
@@ -1274,13 +1321,9 @@ func transferPortFromListen(listen string) int {
 	return n
 }
 
-// membershipPeerIDResolver returns a coord.WithPeerIDResolver callback
-// that consults the live members snapshot. NodeID -> Node.PeerID is the
-// fast path; on miss the resolver returns (_, false) so coord.Client
-// falls through to its static teach-cache and finally to
-// peer.Decode(NodeID). The membership view is read on every call (cheap
-// in-memory copy) so newly-joined peers are picked up without restart.
-func membershipPeerIDResolver(mv ifaces.Members, logger *slog.Logger) func(ifaces.NodeID) (peer.ID, bool) {
+// membershipPeerIDResolver also installs the target's Pod-IP addresses before
+// direct coordination RPCs dial it; DHT bootstrap does not populate every peer.
+func membershipPeerIDResolver(mv ifaces.Members, ps peerstore.Peerstore, logger *slog.Logger) func(ifaces.NodeID) (peer.ID, bool) {
 	return func(id ifaces.NodeID) (peer.ID, bool) {
 		for _, n := range mv.Snapshot() {
 			if n.ID != id || n.PeerID == "" {
@@ -1298,6 +1341,42 @@ func membershipPeerIDResolver(mv ifaces.Members, logger *slog.Logger) func(iface
 				}
 
 				return "", false
+			}
+
+			var addrs []multiaddr.Multiaddr
+
+			for _, raw := range n.P2PAddrs {
+				info, err := peer.AddrInfoFromString(raw)
+				if err != nil {
+					if logger != nil {
+						logger.Debug("membership peer address decode failed",
+							slog.String("node_id", string(id)),
+							slog.String("address", raw),
+							slog.Any("err", err),
+						)
+					}
+
+					continue
+				}
+
+				if info.ID != pid {
+					if logger != nil {
+						logger.Warn("membership peer address identity mismatch",
+							slog.String("node_id", string(id)),
+							slog.String("peer_id", pid.String()),
+							slog.String("address_peer_id", info.ID.String()),
+						)
+					}
+
+					continue
+				}
+
+				addrs = append(addrs, info.Addrs...)
+			}
+
+			if ps != nil && len(addrs) > 0 {
+				ps.ClearAddrs(pid)
+				ps.AddAddrs(pid, addrs, peerstore.AddressTTL)
 			}
 
 			return pid, true
@@ -1850,9 +1929,10 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 // The implementation runs in a goroutine spawned by the mirror; it
 // MUST NOT panic. All errors are logged at DEBUG.
 type layerPrefetchAdapter struct {
-	resolver *coldstart.Resolver
-	cache    ifaces.LocalContentStore
-	logger   *slog.Logger
+	resolver   *coldstart.Resolver
+	cache      ifaces.LocalContentStore
+	logger     *slog.Logger
+	onManifest func(digest.Digest, []manifest.TypedChild)
 }
 
 // maxManifestBytes caps the size of a manifest body the prefetcher
@@ -1911,16 +1991,59 @@ func advertiseOnCommit(ctx context.Context, adv *advertise.Advertiser, store ifa
 	}
 }
 
-func newLayerPrefetcher(r *coldstart.Resolver, cache ifaces.LocalContentStore, logger *slog.Logger) mirror.LayerPrefetcher {
+func newLayerPrefetcher(
+	r *coldstart.Resolver,
+	cache ifaces.LocalContentStore,
+	logger *slog.Logger,
+	onManifest func(digest.Digest, []manifest.TypedChild),
+) mirror.LayerPrefetcher {
 	return &layerPrefetchAdapter{
-		resolver: r,
-		cache:    cache,
-		logger:   logger.With(slog.String("subsystem", "prefetch")),
+		resolver:   r,
+		cache:      cache,
+		logger:     logger.With(slog.String("subsystem", "prefetch")),
+		onManifest: onManifest,
 	}
 }
 
+// openManifest reads the manifest body from the shared content store. Under
+// live stream-through the mirror proxies the body straight to containerd, so
+// it only appears once containerd commits it; retry briefly rather than
+// dropping the prefetch and losing cold-start seeding entirely.
+func (p *layerPrefetchAdapter) openManifest(ctx context.Context, d digest.Digest) (io.ReadCloser, error) {
+	const attempts = 8
+
+	delay := 100 * time.Millisecond
+
+	var lastErr error
+
+	for attempt := range attempts {
+		rc, _, err := p.cache.Open(ctx, d)
+		if err == nil {
+			return rc, nil
+		}
+
+		lastErr = err
+
+		if attempt == attempts-1 {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		if delay < time.Second {
+			delay *= 2
+		}
+	}
+
+	return nil, lastErr
+}
+
 func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest) {
-	if p.resolver == nil {
+	if p.resolver == nil && p.onManifest == nil {
 		return
 	}
 	// Use a fresh deadline so the prefetch survives the request
@@ -1929,7 +2052,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	rc, _, err := p.cache.Open(ctx, manifestDigest)
+	rc, err := p.openManifest(ctx, manifestDigest)
 	if err != nil {
 		p.logger.Debug("prefetch: manifest not in cache",
 			slog.String("digest", manifestDigest.String()),
@@ -1971,7 +2094,11 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		return
 	}
 
-	if len(children) == 0 {
+	if p.onManifest != nil {
+		p.onManifest(manifestDigest, children)
+	}
+
+	if len(children) == 0 || p.resolver == nil {
 		// Image index or no children - nothing to fan out.
 		return
 	}
@@ -2001,7 +2128,7 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		return
 	}
 
-	if err := p.resolver.PrefetchChildren(ctx, pending, registry, repository); err != nil {
+	if err := p.resolver.PrefetchManifestChildren(ctx, manifestDigest, pending, registry, repository); err != nil {
 		p.logger.Debug("prefetch: PrefetchChildren reported errors",
 			slog.String("manifest", manifestDigest.String()),
 			slog.Int("children", len(pending)),

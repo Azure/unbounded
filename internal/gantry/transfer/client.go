@@ -32,6 +32,11 @@ type Client struct {
 	onBytesRead func(kind string, bytes int64)
 }
 
+// peerMaxReadFrameSize pairs with streamcopy.BufferSize. Large peer response
+// writes can then cross HTTP/2 in one frame instead of being split into the
+// RFC-default 16 KiB frames. The value is within HTTP/2's 16 KiB-16 MiB range.
+const peerMaxReadFrameSize = 1 << 20
+
 // ClientOption tweaks Client construction.
 type ClientOption func(*clientOptions)
 
@@ -82,7 +87,8 @@ func NewClient(opts ...ClientOption) *Client {
 			d := &net.Dialer{Timeout: o.dialTimeout}
 			return d.Dial(network, addr)
 		},
-		ReadIdleTimeout: o.readIdleTimeout,
+		ReadIdleTimeout:  o.readIdleTimeout,
+		MaxReadFrameSize: peerMaxReadFrameSize,
 	}
 
 	return &Client{

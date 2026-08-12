@@ -193,3 +193,28 @@ func TestCheckAzureTelemetryRejectsPublicGantryACR(t *testing.T) {
 		t.Fatalf("error = %v, want public Gantry ACR rejection", err)
 	}
 }
+
+func TestDecodeAzureDiagnosticSettingsSupportsCLIAndARMShapes(t *testing.T) {
+	const setting = `{
+		"logAnalyticsDestinationType":"Dedicated",
+		"workspaceId":"/subscriptions/s/workspaces/law",
+		"logs":[{"category":"kube-audit-admin","enabled":true}]
+	}`
+
+	for name, raw := range map[string]string{
+		"cli": `[ ` + setting + ` ]`,
+		"arm": `{"value":[{"properties":` + setting + `}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			settings, err := decodeAzureDiagnosticSettings([]byte(raw))
+			if err != nil {
+				t.Fatalf("decodeAzureDiagnosticSettings: %v", err)
+			}
+
+			if len(settings) != 1 || settings[0].WorkspaceID != "/subscriptions/s/workspaces/law" ||
+				len(settings[0].Logs) != 1 || !settings[0].Logs[0].Enabled {
+				t.Fatalf("settings = %+v, want one dedicated audit setting", settings)
+			}
+		})
+	}
+}

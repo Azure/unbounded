@@ -46,6 +46,22 @@ README.md
 
 # Local env files
 .envrc
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+*.kubeconfig
+**/*kubeconfig*
+*.pem
+*.key
+**/id_rsa
+**/id_ed25519
+**/.azure/
+**/.aws/
+**/.config/gcloud/
+hack/gantry-benchmark/env.local
+hack/gantry-benchmark/deploy.env
 
 # OS files
 .DS_Store

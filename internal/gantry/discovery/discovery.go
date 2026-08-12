@@ -278,8 +278,8 @@ func (h *Host) Addrs() []multiaddr.Multiaddr { return h.h.Addrs() }
 // stream handler to the same host that runs the DHT.
 func (h *Host) LibP2P() host.Host { return h.h }
 
-// ConnectPeers dials a set of multiaddr strings in parallel with a 5s
-// per-peer timeout. Used by main.go to seed the DHT routing table from
+// ConnectPeers dials a set of multiaddr strings through the bounded 8/4/32
+// bootstrap cascade. Used by main.go to seed the DHT routing table from
 // the membership view (the design doc): after members.WaitForSync, every Ready
 // peer with a published p2p multiaddr is fed back into the libp2p host
 // so kad-dht has direct-connect seeds even without operator-supplied
@@ -293,6 +293,8 @@ func (h *Host) ConnectPeers(ctx context.Context, multiaddrs []string) int {
 	}
 
 	pool := make([]peer.AddrInfo, 0, len(multiaddrs))
+	positions := make(map[peer.ID]int, len(multiaddrs))
+
 	for _, p := range multiaddrs {
 		ai, err := peer.AddrInfoFromString(p)
 		if err != nil {
@@ -309,14 +311,14 @@ func (h *Host) ConnectPeers(ctx context.Context, multiaddrs []string) int {
 			continue
 		}
 
-		pool = append(pool, *ai)
+		mergePeerAddrInfo(&pool, positions, *ai)
 	}
 
 	if len(pool) == 0 {
 		return 0
 	}
 
-	return h.dialBatch(ctx, pool)
+	return h.dialBootstrapPool(ctx, pool)
 }
 
 // RoutingTableSize returns the current kad-dht routing-table size.
@@ -456,14 +458,10 @@ func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
 		return
 	}
 
-	const (
-		batchSize       = 8
-		successQuorum   = 4
-		totalDialBudget = 32
-	)
-
 	// Parse all peers up-front; drop unparseable ones.
 	pool := make([]peer.AddrInfo, 0, len(peers))
+	positions := make(map[peer.ID]int, len(peers))
+
 	for _, p := range peers {
 		ai, err := peer.AddrInfoFromString(p)
 		if err != nil {
@@ -475,18 +473,58 @@ func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
 			continue
 		}
 
-		pool = append(pool, *ai)
+		if ai.ID == h.h.ID() {
+			continue
+		}
+
+		mergePeerAddrInfo(&pool, positions, *ai)
 	}
 
 	if len(pool) == 0 {
 		return
 	}
 
+	h.dialBootstrapPool(ctx, pool)
+}
+
+func mergePeerAddrInfo(pool *[]peer.AddrInfo, positions map[peer.ID]int, candidate peer.AddrInfo) {
+	if index, ok := positions[candidate.ID]; ok {
+		existing := &(*pool)[index]
+		seen := make(map[string]struct{}, len(existing.Addrs))
+
+		for _, addr := range existing.Addrs {
+			seen[addr.String()] = struct{}{}
+		}
+
+		for _, addr := range candidate.Addrs {
+			if _, ok := seen[addr.String()]; ok {
+				continue
+			}
+
+			existing.Addrs = append(existing.Addrs, addr)
+			seen[addr.String()] = struct{}{}
+		}
+
+		return
+	}
+
+	positions[candidate.ID] = len(*pool)
+	*pool = append(*pool, candidate)
+}
+
+func (h *Host) dialBootstrapPool(ctx context.Context, pool []peer.AddrInfo) int {
+	const (
+		batchSize       = 8
+		successQuorum   = 4
+		totalDialBudget = 32
+	)
+
 	// Fisher–Yates shuffle for unbiased random subsets.
 	rng := newBootstrapRand()
 	rng.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
 
 	dialed := 0
+	connected := 0
 
 	cursor := 0
 	for cursor < len(pool) && dialed < totalDialBudget {
@@ -504,11 +542,14 @@ func (h *Host) dialBootstrap(ctx context.Context, peers []string) {
 
 		successes := h.dialBatch(ctx, batch)
 		dialed += len(batch)
+		connected += successes
 
-		if successes >= successQuorum {
-			return
+		if connected >= successQuorum {
+			return connected
 		}
 	}
+
+	return connected
 }
 
 // dialBatch fans out parallel Connect attempts against batch with a 5s

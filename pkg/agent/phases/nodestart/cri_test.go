@@ -35,6 +35,25 @@ func TestConfigureContainerdWritesGantryHostsConfig(t *testing.T) {
 	require.Equal(t, os.FileMode(0o644), info.Mode().Perm())
 }
 
+func TestConfigureContainerdSetsImagePullProgressTimeout(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	goalState := &goalstates.NodeStart{
+		MachineDir: machineDir,
+		Containerd: goalstates.ResolveContainerd(""),
+	}
+
+	require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
+
+	path := filepath.Join(machineDir, goalstates.ContainerdConfigPath)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "[plugins.\"io.containerd.grpc.v1.cri\"]\n"+
+		"sandbox_image = \""+goalState.Containerd.SandboxImage+"\"\n"+
+		"image_pull_progress_timeout = \"15m\"")
+}
+
 func TestConfigureContainerdUpdatesManagedGantryHostsConfig(t *testing.T) {
 	t.Parallel()
 

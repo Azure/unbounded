@@ -19,6 +19,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/origin"
@@ -371,5 +372,53 @@ func TestMirror_Prefetch_DoesNotFireOnHeadCacheHit(t *testing.T) {
 
 	if n := spy.count(); n != 1 {
 		t.Fatalf("HEAD cache-hit: got %d prefetch calls, want 1 (HEAD must not trigger prefetch)", n)
+	}
+}
+
+// Production wiring always enables live stream-through. Prefetch on the
+// peer-served manifest path was previously gated behind !liveStreamThrough,
+// which silently disabled cold-start seeding for every real deployment.
+func TestMirror_Prefetch_FiresOnPeerServedManifestWithLiveStreamThrough(t *testing.T) {
+	body := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`)
+	d := digestOf(body)
+
+	dialer := newCountingPeerDialer()
+	dialer.Put("10.0.0.1:5001", d, body)
+
+	dht := fakes.NewDHT()
+	dht.Inject(d, ifaces.Provider{NodeID: "peer-a", Addr: "10.0.0.1:5001"})
+
+	cfg, originSrc := newMirrorOriginNotFound(t)
+	spy := newPrefetchSpy()
+
+	m := mirror.New(cfg, &writerSpyCache{}, originSrc,
+		mirror.WithLiveStreamThrough(),
+		mirror.WithDiscovery(dht, dialer),
+		mirror.WithPeerBudgets(time.Second, time.Second, 2),
+		mirror.WithLayerPrefetcher(spy),
+	)
+	ts := httptest.NewServer(m.Handler())
+
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/v2/library/nginx/manifests/" + d.String() + "?ns=reg.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := io.ReadAll(resp.Body) //nolint:errcheck // body compared below
+	_ = resp.Body.Close()           //nolint:errcheck // best-effort close
+
+	if resp.StatusCode != http.StatusOK || string(got) != string(body) {
+		t.Fatalf("peer manifest serve: status=%d body=%q", resp.StatusCode, got)
+	}
+
+	if n := spy.waitForCount(1, 2*time.Second); n != 1 {
+		t.Fatalf("OnManifestServed calls after peer manifest serve = %d, want 1", n)
+	}
+
+	call := spy.snapshot()[0]
+	if call.registry != "reg.example.com" || call.repository != "library/nginx" || call.digest.String() != d.String() {
+		t.Fatalf("prefetch call = %+v", call)
 	}
 }

@@ -51,6 +51,68 @@ if [[ -z "$run_id" ]]; then
   run_id=$(jq -r '.run_id // empty' <<<"${last_run_json:-{}}" 2>/dev/null || true)
 fi
 
+build_process=$(pgrep -af 'podman (pull|build|push|create|cp)' 2>/dev/null || true)
+completed_image_steps=0
+active_image_operation=""
+
+print_prepared_image_status() {
+  local label=$1
+  local phase=$2
+  local target=$3
+  local build_dir=$4
+  local digest_file="$build_dir/push-digest.$phase.txt"
+  local build_state=waiting
+  local push_state=waiting
+  local digest=""
+  local layers="unknown"
+  local image_bytes="unknown"
+  local image_size="unknown"
+  local active_pid=""
+  local elapsed=""
+
+  if podman image exists "$target" 2>/dev/null; then
+    build_state=complete
+    layers=$(podman image inspect --format '{{ len .RootFS.Layers }}' "$target" 2>/dev/null || printf 'unknown')
+    image_bytes=$(podman image inspect --format '{{ .Size }}' "$target" 2>/dev/null || printf 'unknown')
+    if [[ "$image_bytes" =~ ^[0-9]+$ ]]; then
+      image_size=$(numfmt --to=iec-i --suffix=B "$image_bytes" 2>/dev/null || printf '%s bytes' "$image_bytes")
+    fi
+  fi
+  if grep -Fq "podman build" <<<"$build_process" && grep -Fq -- "--tag $target" <<<"$build_process"; then
+    build_state=active
+    active_pid=$(awk -v target="$target" 'index($0, "podman build") && index($0, target) {print $1; exit}' <<<"$build_process")
+    active_image_operation="$label build"
+  fi
+  if grep -Fq "podman push" <<<"$build_process" && grep -Fq "$target" <<<"$build_process"; then
+    build_state=complete
+    push_state=active
+    active_pid=$(awk -v target="$target" 'index($0, "podman push") && index($0, target) {print $1; exit}' <<<"$build_process")
+    active_image_operation="$label push"
+  fi
+  if [[ -s "$digest_file" ]]; then
+    digest=$(tr -d '[:space:]' <"$digest_file")
+    build_state=complete
+    push_state=complete
+  fi
+  if [[ -n "$active_pid" ]]; then
+    elapsed=$(ps -o etime= -p "$active_pid" 2>/dev/null | xargs)
+  fi
+
+  [[ "$build_state" == complete ]] && ((completed_image_steps += 1))
+  [[ "$push_state" == complete ]] && ((completed_image_steps += 1))
+
+  printf '%s image:\n' "$label"
+  printf '  target: %s\n' "$target"
+  printf '  size: %s (%s bytes)\n' "$image_size" "$image_bytes"
+  printf '  build: %s (%s image layers)\n' "$build_state" "$layers"
+  printf '  push: %s' "$push_state"
+  [[ -z "$elapsed" ]] || printf ' (elapsed %s)' "$elapsed"
+  printf '\n'
+  if [[ -n "$digest" ]]; then
+    printf '  digest: %s\n' "$digest"
+  fi
+}
+
 printf '=== Gantry benchmark operator ===\n'
 printf 'time: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'service: %s\n' "$service_state"
@@ -86,10 +148,22 @@ if [[ -n "$run_id" ]]; then
       printf 'payload generation: %d/%s files, %d%% (%s bytes)\n' \
         "$payload_files" "$payload_layers" "$percent" "$payload_bytes"
     fi
+
+    image_tag=${run_id//_/-}
+    workload_repository=${BENCHMARK_WORKLOAD_REPOSITORY:-gantry-benchmark-pull}
+    printf '\n=== Image preparation ===\n'
+    print_prepared_image_status \
+      baseline baseline "$BASELINE_ACR_LOGIN_SERVER/$workload_repository:$image_tag" "$build_dir"
+    print_prepared_image_status \
+      Gantry-cold gantry_cold "$GANTRY_ACR_LOGIN_SERVER/$workload_repository:$image_tag" "$build_dir"
+    printf 'image steps: %d/4 complete\n' "$completed_image_steps"
+    [[ -z "$active_image_operation" ]] || printf 'active image operation: %s\n' "$active_image_operation"
+    if [[ "$active_image_operation" == *" push" ]]; then
+      printf 'push byte progress: unavailable from Podman 4.9; total image size and elapsed time shown above\n'
+    fi
   fi
 fi
 
-build_process=$(pgrep -af 'podman (pull|build|push|create|cp)' 2>/dev/null || true)
 if [[ -n "$build_process" ]]; then
   printf 'image process:\n%s\n' "$build_process"
 fi
@@ -106,9 +180,21 @@ podman system df 2>/dev/null || true
 
 if [[ -f "$KUBECONFIG" ]]; then
   printf '\n=== Kubernetes ===\n'
-  kubectl -n "$NAMESPACE" get jobs \
-    -o custom-columns=NAME:.metadata.name,ACTIVE:.status.active,SUCCEEDED:.status.succeeded,FAILED:.status.failed,COMPLETIONS:.spec.completions \
-    2>/dev/null || true
+  jobs_json=$(kubectl -n "$NAMESPACE" get jobs -o json 2>/dev/null || true)
+  if [[ -n "$jobs_json" ]]; then
+    jq -r --argjson now "$(date -u +%s)" '
+      .items[] |
+      (.spec.completions // 1) as $desired |
+      (.status.succeeded // 0) as $succeeded |
+      (.status.active // 0) as $active |
+      (.status.failed // 0) as $failed |
+      (if $desired > 0 then (($succeeded * 100 / $desired) | floor) else 0 end) as $percent |
+      (if .status.startTime then ($now - (.status.startTime | fromdateiso8601)) else 0 end) as $elapsed |
+      "phase: \(.metadata.name | sub("^gantry-benchmark-"; "") | split("-run-")[0])\n" +
+      "  job: \(.metadata.name)\n" +
+      "  pods: \($succeeded)/\($desired) complete (\($percent)%), \($active) active, \($failed) failed\n" +
+      "  elapsed: \($elapsed)s"' <<<"$jobs_json" 2>/dev/null || true
+  fi
   kubectl -n "$GANTRY_NS" get daemonset gantry \
     -o custom-columns=DESIRED:.status.desiredNumberScheduled,READY:.status.numberReady,UPDATED:.status.updatedNumberScheduled,AVAILABLE:.status.numberAvailable \
     2>/dev/null || true

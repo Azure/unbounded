@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,8 +17,51 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
+	"github.com/Azure/unbounded/internal/gantry/inflight"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
+
+type blockingPrefetchCoord struct {
+	mu        sync.Mutex
+	active    int
+	maxActive int
+	started   chan struct{}
+	release   chan struct{}
+}
+
+func (c *blockingPrefetchCoord) PullIntentQuery(context.Context, ifaces.NodeID, digest.Digest) (ifaces.PullIntent, error) {
+	return ifaces.PullIntent{}, nil
+}
+
+func (c *blockingPrefetchCoord) PleasePull(ctx context.Context, _ ifaces.NodeID, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
+	c.mu.Lock()
+
+	c.active++
+	if c.active > c.maxActive {
+		c.maxActive = c.active
+	}
+	c.mu.Unlock()
+
+	c.started <- struct{}{}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.release:
+	}
+
+	c.mu.Lock()
+	c.active--
+	c.mu.Unlock()
+
+	outcomes := make([]ifaces.PleasePullOutcome, len(digests))
+	for index, d := range digests {
+		outcomes[index] = ifaces.PleasePullOutcome{Digest: d, Outcome: ifaces.PleasePullStarted}
+	}
+
+	return outcomes, nil
+}
 
 // pickHRW0 returns the HRW rank-0 node ID for d across the given
 // cluster. Used by tests to set up "send N digests, expect M batches"
@@ -124,7 +168,7 @@ func TestPrefetchChildren_ReplicatesToTopNPullers(t *testing.T) {
 
 	coord := &stubCoord{}
 	disco := &stubDisco{health: 1.0}
-	r := buildResolverWithReplicas(t, coord, disco, self, cluster, 3)
+	r := buildResolverWithReplicas(t, coord, disco, self, cluster, 3, coldstart.MetricsHooks{})
 
 	children := []coldstart.ChildDigest{{Digest: d, Kind: ifaces.KindBlob}}
 	if err := r.PrefetchChildren(context.Background(), children, "docker.io", "library/nginx"); err != nil {
@@ -143,6 +187,121 @@ func TestPrefetchChildren_ReplicatesToTopNPullers(t *testing.T) {
 
 	if len(coord.pleasePullCalls) != 3 || len(seen) != 3 {
 		t.Fatalf("PleasePull calls: got %v, want 3 distinct pullers (top-3 replication)", coord.pleasePullCalls)
+	}
+}
+
+func TestPrefetchChildren_ReportsRemoteGroupOutcomes(t *testing.T) {
+	cluster := clusterNodes()
+	self := ifaces.NodeID("n3")
+
+	var (
+		d     digest.Digest
+		found bool
+	)
+
+	for i := 0; i < 8192; i++ {
+		candidate := digest.MustParse("sha256:" + digestHex(i))
+
+		top := hrw.TopK(cluster, candidate, 2)
+		if len(top) == 2 && top[0].Node.ID != self && top[1].Node.ID != self {
+			d = candidate
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		t.Fatal("could not find digest with two remote pullers")
+	}
+
+	top := hrw.TopK(cluster, d, 2)
+	coord := &stubCoord{pleasePullErrs: map[ifaces.NodeID]error{
+		top[0].Node.ID: errors.New("dial failed"),
+	}}
+
+	var (
+		mu       sync.Mutex
+		outcomes []string
+	)
+
+	r := buildResolverWithReplicas(t, coord, &stubDisco{health: 1.0}, self, cluster, 2, coldstart.MetricsHooks{
+		OnPrefetchGroup: func(target, outcome string) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			outcomes = append(outcomes, target+":"+outcome)
+		},
+	})
+
+	err := r.PrefetchChildren(context.Background(), []coldstart.ChildDigest{{Digest: d, Kind: ifaces.KindBlob}}, "docker.io", "library/nginx")
+	if !errors.Is(err, coldstart.ErrPrefetchPartial) {
+		t.Fatalf("PrefetchChildren error = %v, want ErrPrefetchPartial", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	sort.Strings(outcomes)
+
+	if got, want := fmt.Sprint(outcomes), "[remote:error remote:success]"; got != want {
+		t.Fatalf("group outcomes = %s, want %s", got, want)
+	}
+}
+
+func TestPrefetchChildren_BoundsRemoteGroupConcurrency(t *testing.T) {
+	nodes := make([]ifaces.Node, 8)
+	for index := range nodes {
+		nodes[index] = ifaces.Node{ID: ifaces.NodeID(fmt.Sprintf("n%d", index))}
+	}
+
+	coord := &blockingPrefetchCoord{
+		started: make(chan struct{}, len(nodes)),
+		release: make(chan struct{}),
+	}
+	resolver := coldstart.New(coldstart.Options{
+		Members:                     fakes.NewMembers("requester", nodes...),
+		Discovery:                   &stubDisco{health: 1.0},
+		Coord:                       coord,
+		Inflight:                    inflight.New(inflight.DefaultStalls(), time.Now),
+		HrwScope:                    hrw.ScopeCluster,
+		PrefetchPullerReplicas:      len(nodes),
+		PrefetchMaxConcurrentGroups: 2,
+		QueryTimeout:                time.Second,
+	})
+
+	d := digest.MustParse("sha256:" + digestHex(9000))
+	done := make(chan error, 1)
+
+	go func() {
+		done <- resolver.PrefetchChildren(context.Background(), []coldstart.ChildDigest{{Digest: d, Kind: ifaces.KindBlob}}, "docker.io", "library/nginx")
+	}()
+
+	for range 2 {
+		select {
+		case <-coord.started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for bounded prefetch workers")
+		}
+	}
+
+	select {
+	case <-coord.started:
+		t.Fatal("a third remote group started while the two slots were occupied")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(coord.release)
+
+	if err := <-done; err != nil {
+		t.Fatalf("PrefetchChildren: %v", err)
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+
+	if coord.maxActive != 2 {
+		t.Fatalf("max active groups = %d, want 2", coord.maxActive)
 	}
 }
 
@@ -514,6 +673,72 @@ func TestPrefetchChildren_PropagatesDelegatedAuthorization(t *testing.T) {
 		if authorization != "Bearer requester-token" {
 			t.Fatalf("PleasePull[%d] authorization = %q, want requester token", i, authorization)
 		}
+	}
+}
+
+func TestPrefetchChildren_RemoteDispatchUsesDeterministicCoordinators(t *testing.T) {
+	cluster := clusterNodes()
+	digests := findManyDigestsForPullers(t, cluster, map[ifaces.NodeID]int{
+		"n0": 1,
+		"n1": 1,
+		"n2": 1,
+		"n3": 1,
+	})
+
+	children := make([]coldstart.ChildDigest, 0, len(digests))
+	for _, d := range digests {
+		children = append(children, coldstart.ChildDigest{Digest: d, Kind: ifaces.KindBlob})
+	}
+
+	callersWithRemoteDispatch := 0
+	totalRemoteGroups := 0
+	totalLocalGroups := 0
+	manifestDigest := digest.MustParse("sha256:" + strings.Repeat("f", 64))
+
+	for _, node := range cluster {
+		coord := &stubCoord{}
+		localPull := &stubLocalPull{}
+		now := time.Now
+		resolver := coldstart.New(coldstart.Options{
+			Members:                     fakes.NewMembers(node.ID, cluster...),
+			Discovery:                   &stubDisco{health: 1.0},
+			Coord:                       coord,
+			Inflight:                    inflight.New(inflight.DefaultStalls(), now),
+			Now:                         now,
+			HrwScope:                    hrw.ScopeCluster,
+			LocalPull:                   localPull,
+			PrefetchCoordinatorReplicas: 1,
+			QueryTimeout:                200 * time.Millisecond,
+		})
+
+		if err := resolver.PrefetchManifestChildren(context.Background(), manifestDigest, children, "docker.io", "library/nginx"); err != nil {
+			t.Fatalf("PrefetchChildren for %s: %v", node.ID, err)
+		}
+
+		coord.mu.Lock()
+		groups := len(coord.pleasePullCalls)
+		coord.mu.Unlock()
+
+		if groups > 0 {
+			callersWithRemoteDispatch++
+			totalRemoteGroups += groups
+		}
+
+		localPull.mu.Lock()
+		totalLocalGroups += len(localPull.digests)
+		localPull.mu.Unlock()
+	}
+
+	if callersWithRemoteDispatch != 1 {
+		t.Fatalf("callers with remote dispatch = %d, want 1", callersWithRemoteDispatch)
+	}
+
+	if totalRemoteGroups != len(cluster)-1 {
+		t.Fatalf("remote groups = %d, want %d", totalRemoteGroups, len(cluster)-1)
+	}
+
+	if totalLocalGroups != len(cluster) {
+		t.Fatalf("local groups = %d, want %d", totalLocalGroups, len(cluster))
 	}
 }
 

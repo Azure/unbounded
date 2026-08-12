@@ -1,0 +1,5 @@
+{
+  "name": "localdns",
+  "nodeIP": "$VM_IP",
+  "localDNS": true
+}
