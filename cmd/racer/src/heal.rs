@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::alloc::{Allocator, GlobalAddr, Pressure, Status};
 use crate::config::{self, Config, GroupId};
-use crate::fabric::{self, Frame, Link, Op};
+use crate::fabric::{self, Bucket, Class as Klass, Cmd, Footer, GroupIx, Link, Seq};
 use crate::layout::{Class, Entry};
 use crate::paxos::{Ballot, Paxos, Register};
 use crate::runtime::{self, PoolBuf};
@@ -24,11 +24,12 @@ pub(crate) type Groups<'a> = dyn Fn(u64) -> GroupId + 'a;
 
 // --- shape ---
 
-/// Buckets per group. 512 u64 fills one 4 KiB trailer, so a comparison is one round trip.
-pub(crate) const BUCKETS: usize = 512;
+/// Buckets per group. 512 u64 fills one 4 KiB trailer, so a comparison is one round
+/// trip. The wire owns the number; this is the name the sweep uses.
+pub(crate) const BUCKETS: usize = fabric::BUCKETS;
 
-/// `(addr, version, ballot)` triples in one chunk. Two header slots, three per tuple.
-const TUPLES: usize = (fabric::BLOCK / 8 - 2) / 3;
+/// `(addr, version, ballot)` triples in one chunk.
+const TUPLES: usize = fabric::SnapNextReply::CAPACITY;
 
 /// Concurrent cursors one slab holds open; also bounds deferred reclamation.
 const MAX_SNAPS: usize = 8;
@@ -352,82 +353,23 @@ impl Snaps {
 
 // --- the wire ---
 
-/// Frame conventions for the three ops below. They name a *group*, not a page, so
-/// `offset` differs from every other op and `server::addr_of` is not on their path. The
-/// universe is the namespace the frame arrived on, so the target rebuilds the
-/// [`GroupId`] locally.
-///
-/// All three encode with `Frame::huge = false` whatever class they ask about; the huge
-/// frame has ten fewer offset bits. MERKLE and SNAPOPEN carry the class in `imm` bit 0,
-/// SNAPNEXT inside the cursor id.
-///
-///   MERKLE    offset = group                       -> 512 digests, the whole trailer
-///   SNAPOPEN  offset = group << 10 | one << 9 | b  -> slot 0: cursor id
-///             `one` set means filter to bucket `b`
-///   SNAPNEXT  offset = cursor id << 6 | chunk seq  -> slot 0: count, slot 1: done
-///                                                     then 3 slots per tuple
-pub(crate) fn merkle_frame(group: u32, huge: bool) -> Frame {
-    let mut f = Frame::raw(Op::Merkle, false, group as u64);
-    f.imm = huge as u8;
-    f
+/// The three group-addressed ops name a *group*, not a page, so `server::addr_of` is not
+/// on their path and the universe is the namespace the frame arrived on: the target
+/// rebuilds the [`GroupId`] locally. Their layout lives in `fabric`; what is here is the
+/// translation between a sweep's own vocabulary and the wire's.
+
+/// The class a group is being swept at, as the wire names it.
+fn klass(huge: bool) -> Klass {
+    Klass::of(huge)
 }
 
-pub(crate) fn snap_open_frame(group: u32, huge: bool, bucket: Option<u16>) -> Frame {
-    let b = bucket.unwrap_or(0) as u64 & (BUCKETS as u64 - 1);
-    let off = (group as u64) << 10 | (bucket.is_some() as u64) << 9 | b;
-    let mut f = Frame::raw(Op::SnapOpen, false, off);
-    f.imm = huge as u8;
-    f
-}
-
-pub(crate) fn snap_next_frame(id: u32, seq: u8) -> Frame {
-    Frame::raw(Op::SnapNext, false, (id as u64) << 6 | (seq & 0x3f) as u64)
-}
-
-/// The request side of the two cursor ops, as the target reads them back.
-pub(crate) fn snap_open_parts(f: &Frame) -> (u32, bool, Option<u16>) {
-    let bucket = (f.offset >> 9 & 1 == 1).then(|| (f.offset & (BUCKETS as u64 - 1)) as u16);
-    ((f.offset >> 10) as u32, f.imm & 1 == 1, bucket)
-}
-
-pub(crate) fn snap_next_parts(f: &Frame) -> (u32, u8) {
-    ((f.offset >> 6) as u32, (f.offset & 0x3f) as u8)
-}
-
-/// Digest vector into a trailer and back. Exactly full, so there is no count.
-pub(crate) fn put_digests(t: &mut [u8], v: &[u64; BUCKETS]) {
-    for (i, d) in v.iter().enumerate() {
-        fabric::put(t, i, *d);
+/// One chunk of a cursor stream, folded into the map being built. Returns whether the
+/// stream is finished.
+fn take(chunk: &fabric::SnapNextReply, out: &mut BTreeMap<u64, Register>) -> bool {
+    for t in chunk.tuples() {
+        out.insert(t.addr, t.reg.into());
     }
-}
-
-pub(crate) fn get_digests(t: &[u8]) -> Box<[u64; BUCKETS]> {
-    let mut v = Box::new([0u64; BUCKETS]);
-    for (i, d) in v.iter_mut().enumerate() {
-        *d = fabric::get(t, i);
-    }
-    v
-}
-
-pub(crate) fn put_tuples(t: &mut [u8], tuples: &[(u64, Register)], done: bool) {
-    fabric::put(t, 0, tuples.len() as u64);
-    fabric::put(t, 1, done as u64);
-    for (i, (addr, r)) in tuples.iter().enumerate() {
-        fabric::put(t, 2 + i * 3, *addr);
-        fabric::put(t, 3 + i * 3, r.version);
-        fabric::put(t, 4 + i * 3, r.ballot.raw() as u64);
-    }
-}
-
-pub(crate) fn get_tuples(t: &[u8], out: &mut BTreeMap<u64, Register>) -> bool {
-    let n = (fabric::get(t, 0) as usize).min(TUPLES);
-    for i in 0..n {
-        let addr = fabric::get(t, 2 + i * 3);
-        let version = fabric::get(t, 3 + i * 3);
-        let ballot = Ballot::from_raw(fabric::get(t, 4 + i * 3) as u32);
-        out.insert(addr, Register { version, ballot });
-    }
-    fabric::get(t, 1) != 0
+    chunk.done
 }
 
 // --- the sweep ---
@@ -785,10 +727,14 @@ impl Heal {
 
         let mine = self.alloc().digests(group, huge).await;
         let t = PoolBuf::alloc(fabric::BLOCK).await;
-        link.send(merkle_frame(group.index(), huge), t.buf())
-            .await
-            .map_err(Status::from_wire)?;
-        let theirs = get_digests(&t);
+        let ask = Cmd::Merkle {
+            group: GroupIx::new(group.index()).ok_or(Status::Unmapped)?,
+            class: klass(huge),
+        };
+        link.send(ask, t.buf()).await.map_err(Status::from_wire)?;
+        let theirs = fabric::MerkleReply::decode(&t)
+            .map_err(Status::from_wire)?
+            .0;
 
         // Our side empty against a peer with data is a node joining, not a divergence:
         // same work, different budget, and we refuse accepts until the digests agree.
@@ -887,16 +833,28 @@ impl Heal {
         bucket: u16,
     ) -> Result<Option<BTreeMap<u64, Register>>, Status> {
         let t = PoolBuf::alloc(fabric::BLOCK).await;
-        let f = snap_open_frame(group.index(), huge, Some(bucket));
-        link.send(f, t.buf()).await.map_err(Status::from_wire)?;
-        let id = fabric::get(&t, 0) as u32;
+        let open = Cmd::SnapOpen {
+            group: GroupIx::new(group.index()).ok_or(Status::Unmapped)?,
+            class: klass(huge),
+            bucket: Some(Bucket::new(bucket).ok_or(Status::Unmapped)?),
+        };
+        link.send(open, t.buf()).await.map_err(Status::from_wire)?;
+        let cursor = fabric::SnapOpenReply::decode(&t)
+            .map_err(Status::from_wire)?
+            .cursor;
 
         let mut out = BTreeMap::new();
+        // The sequence is six bits wide and the walk may need more chunks than that, so
+        // it cycles: it only has to tell a chunk from the one before it and from a retry.
         for seq in 0..=u8::MAX {
             let t = PoolBuf::alloc(fabric::BLOCK).await;
-            let f = snap_next_frame(id, seq);
-            link.send(f, t.buf()).await.map_err(Status::from_wire)?;
-            if get_tuples(&t, &mut out) {
+            let next = Cmd::SnapNext {
+                cursor,
+                seq: Seq::wrap(seq),
+            };
+            link.send(next, t.buf()).await.map_err(Status::from_wire)?;
+            let chunk = fabric::SnapNextReply::decode(&t).map_err(Status::from_wire)?;
+            if take(&chunk, &mut out) {
                 return Ok(Some(out));
             }
             if out.len() > MAX_BUCKET {
@@ -1016,26 +974,15 @@ mod tests {
         assert!(!Filter::Bucket(b ^ 1).keeps(addr(1, 1)));
     }
 
-    /// The three group-addressed frames survive the wire, `offset` and `imm` included.
+    /// A cursor sequence is six bits wide, so the sweep's own counter has to be folded
+    /// into it rather than truncated by accident.
     #[test]
-    fn group_frames_survive_encoding() {
-        let round = |f: Frame| {
-            let e = f.encode();
-            Frame::decode(e, fabric::BLOCK).unwrap().0
-        };
-        let m = round(merkle_frame(1234, true));
-        assert_eq!((m.offset, m.imm & 1 == 1), (1234, true));
-
-        for bucket in [None, Some(0), Some(511u16)] {
-            let f = round(snap_open_frame(300, false, bucket));
-            assert_eq!(snap_open_parts(&f), (300, false, bucket));
-        }
-        // Six bits of sequence: enough that no two consecutive chunks collide.
+    fn a_chunk_sequence_cycles() {
         for seq in [0u8, 1, 62, 63] {
-            let f = round(snap_next_frame(0x0dedbeef, seq));
-            assert_eq!(snap_next_parts(&f), (0x0dedbeef, seq));
+            assert_eq!(Seq::wrap(seq).get(), seq);
         }
-        assert_eq!(snap_next_parts(&round(snap_next_frame(7, 64))).1, 0);
+        assert_eq!(Seq::wrap(64).get(), 0);
+        assert_eq!(Seq::wrap(u8::MAX).get(), 63);
     }
 
     /// Cursor atomicity: a page overwritten ahead of the walk still reports its value at

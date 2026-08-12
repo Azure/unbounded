@@ -18,33 +18,11 @@ use std::task::{Context, Poll};
 use crate::alloc::{Allocator, GlobalAddr, Pending, Status};
 use crate::cache::Cache;
 use crate::config::{GroupId, Kind, Live};
-use crate::fabric::{self, Frame, Link, Op, Part};
-use crate::layout;
+use crate::fabric::{
+    self, Cmd, Footer, GroupIx, Hops, Link, Member, Op, PageRef, Put, Source, To, Via, Want,
+};
+use crate::layout::{self, Class};
 use crate::runtime::{self, Buf, PoolBuf};
-
-/// Trailer slot indices; `fabric.rs` carries the per-op table.
-const T_GUARD: usize = 0;
-const T_VERSION: usize = 0;
-const T_BALLOT: usize = 1;
-const T_EPOCH: usize = 2;
-const T_TERM: usize = 2;
-const T_SOURCE: usize = 2;
-const T_STATE: usize = 2;
-const T_SEAL_TERM: usize = 1;
-const T_EXTENT: usize = 2;
-/// The cache's replication width. Rides a slot of the trailer the metadata round already
-/// carries, so the hint costs no extra command.
-const T_WIDTH: usize = 3;
-/// `LEARN` must validate or replace an equal-register small page.
-const T_REPAIR: usize = 3;
-/// How far a `WARM` has come. Shares `LEARN`'s slot 2, which names a source there too.
-const T_STAGE: usize = 2;
-
-/// A `WARM` from the zone that wrote the page, arriving at a gateway of a zone the extent
-/// asks to keep warm. The gateway resolves the cohort and relays.
-const WARM_INBOUND: u64 = 0;
-/// A `WARM` relayed by our own gateway to the cohort member that will hold the copy.
-const WARM_HOLDER: u64 = 1;
 
 /// How many times a LWW proposal re-derives its guard before giving up. A mismatch is
 /// retried here, not reported, so the client only ever sees last-write-wins.
@@ -53,10 +31,6 @@ const LWW_RETRIES: u32 = 4;
 /// How many of a zone's gateways one operation tries before calling the zone unavailable.
 /// Each try costs the fabric's full timeout.
 const GATEWAY_TRIES: usize = 3;
-
-/// The `T_GUARD` value meaning "you derive it". Sent by a non-member forwarding a LWW
-/// write, which has no observation of its own to guard on.
-const DERIVED: u64 = u64::MAX;
 
 /// How many times a prepare round is re-run when it cannot tell which of two values at the
 /// top version was chosen. The member that would decide the race stayed silent, and another
@@ -522,23 +496,18 @@ struct Links(Box<[Link]>);
 #[derive(Clone, Copy)]
 struct Route<'a> {
     link: &'a Link,
-    /// Forwarding budget: 0 to hand it straight to its addressee.
-    hops: u8,
-    imm: u8,
+    /// Who the command is for and how many forwards it may take.
+    via: Via,
 }
 
 impl Route<'_> {
-    fn stamp(&self, mut f: Frame) -> Frame {
-        f.flags |= self.hops;
-        f.imm = self.imm;
-        f
+    /// The addressing every command sent on this route carries.
+    fn via(&self) -> Via {
+        self.via
     }
 
-    async fn send(&self, f: Frame, buf: Buf) -> Result<(), Status> {
-        self.link
-            .send(self.stamp(f), buf)
-            .await
-            .map_err(Status::from_wire)
+    async fn send(&self, cmd: Cmd, buf: Buf) -> Result<(), Status> {
+        self.link.send(cmd, buf).await.map_err(Status::from_wire)
     }
 }
 
@@ -657,32 +626,32 @@ impl Paxos {
     ///
     /// The link is always inside the address's own universe, so a relay cannot carry a frame
     /// out of the partition it arrived in. `None` for a foreign address we cannot route.
-    pub fn forward_link(&self, op: Op, addr: GlobalAddr, imm: u8) -> Option<&Link> {
+    pub fn forward_link(&self, op: Op, addr: GlobalAddr, to: To) -> Option<&Link> {
         // Homed elsewhere: pass it toward that place, which resolves the group itself.
         if !self.local_for(op, addr) {
             let z = self.away(addr).ok().flatten()?;
             return self.toward(z, addr).ok().map(|r| r.link);
         }
         let m = self.members(self.group(addr))?;
-        match imm {
-            0 => self.close(addr.universe(), &m).map(|(l, _)| l),
-            k => self.link_of(addr.universe(), *m.get(k as usize - 1)?),
+        match to {
+            To::Owner => self.close(addr.universe(), &m).map(|(l, _)| l),
+            To::Member(k) => self.link_of(addr.universe(), *m.get(k.index() as usize)?),
         }
     }
 
     /// Whether a frame addressed to `imm` is ours to answer or one we must pass on. Zero is
     /// "you own this", which only a group member can; `k + 1` names member `k`. An address
     /// homed in another zone is never ours.
-    pub fn serves(&self, op: Op, addr: GlobalAddr, imm: u8) -> bool {
+    pub fn serves(&self, op: Op, addr: GlobalAddr, to: To) -> bool {
         if !self.local_for(op, addr) {
             return false;
         }
         let me = self
             .members(self.group(addr))
             .and_then(|m| self.self_index(&m));
-        match imm {
-            0 => me.is_some(),
-            k => me == Some(k - 1),
+        match to {
+            To::Owner => me.is_some(),
+            To::Member(k) => me == Some(k.index()),
         }
     }
 
@@ -741,8 +710,7 @@ impl Paxos {
             };
             out.push(Route {
                 link,
-                hops: 2,
-                imm: 0,
+                via: Via::new(To::Owner, Hops::TWO),
             });
             if out.len() == GATEWAY_TRIES {
                 break;
@@ -841,10 +809,11 @@ impl Paxos {
         }
     }
 
-    /// The frame naming `addr`. Only the block offset goes on the wire: the universe is the
-    /// namespace we are about to send on, and the extent is the control plane's business.
-    fn frame(&self, op: Op, addr: GlobalAddr, huge: bool) -> Result<Frame, Status> {
-        Ok(Frame::page(op, huge, addr.lba()))
+    /// The page reference naming `addr`. Only the block offset goes on the wire: the
+    /// universe is the namespace we are about to send on, and the extent is the control
+    /// plane's business.
+    fn page_ref(&self, addr: GlobalAddr, huge: bool) -> Result<PageRef, Status> {
+        PageRef::new(Class::of(huge), addr.lba()).ok_or(Status::Unmapped)
     }
 
     fn stat(&self, f: impl FnOnce(&mut Stats)) {
@@ -1028,16 +997,15 @@ impl Paxos {
 
     /// How to reach member `k`: directly if we hold a link, else forwarded through one we do.
     fn route(&self, u: u32, m: &[u32; 3], k: u8) -> Option<Route<'_>> {
+        let to = To::Member(Member::new(k)?);
         match self.link_of(u, *m.get(k as usize)?) {
             Some(link) => Some(Route {
                 link,
-                hops: 0,
-                imm: k + 1,
+                via: Via::new(to, Hops::NONE),
             }),
             None => self.close(u, m).map(|(link, _)| Route {
                 link,
-                hops: 1,
-                imm: k + 1,
+                via: Via::new(to, Hops::ONE),
             }),
         }
     }
@@ -1146,8 +1114,7 @@ impl Paxos {
         for (link, _) in self.candidates(u, m) {
             match send(Route {
                 link,
-                hops: 0,
-                imm: 0,
+                via: Via::direct(To::Owner),
             })
             .await
             {
@@ -1184,23 +1151,40 @@ impl Paxos {
         page: Page<'_>,
     ) -> Result<(), Status> {
         let huge = matches!(page, Page::Huge(_));
-        let f = self.frame(Op::Accept, addr, huge)?;
+        let page_ref = self.page_ref(addr, huge)?;
         match page {
             // A 4 MiB frame is all payload, so the acceptor derives its guard and ballot.
             // Sound only because the class is Immutable, whose guard is a function of the
             // epoch.
-            Page::Huge(buf) => r.send(f, buf).await,
+            Page::Huge(buf) => {
+                let cmd = Cmd::Accept {
+                    page: page_ref,
+                    via: r.via(),
+                    put: Put::Piece { off: 0 },
+                };
+                r.send(cmd, buf).await
+            }
             // A 4 KiB page already pays a copy through registered memory, so gathering its
             // trailer beside it is free.
             Page::Small(p) => {
                 let mut t = PoolBuf::alloc(2 * fabric::BLOCK).await;
                 t[..fabric::BLOCK].copy_from_slice(p);
-                t[fabric::BLOCK..].fill(0);
-                let tr = &mut t[fabric::BLOCK..];
-                fabric::put(tr, T_GUARD, guard.unwrap_or(DERIVED));
-                fabric::put(tr, T_BALLOT, b.raw() as u64);
-                fabric::put(tr, T_EPOCH, self.alloc.config().epoch_of(addr.0) as u64);
-                r.send(f, t.buf()).await
+                let req = fabric::AcceptReq {
+                    guard: match guard {
+                        Some(g) => fabric::Guard::At(g),
+                        None => fabric::Guard::Derived,
+                    },
+                    ballot: b.raw(),
+                    epoch: self.alloc.config().epoch_of(addr.0),
+                };
+                req.encode(&mut t[fabric::BLOCK..])
+                    .map_err(Status::from_wire)?;
+                let cmd = Cmd::Accept {
+                    page: page_ref,
+                    via: r.via(),
+                    put: Put::Gather,
+                };
+                r.send(cmd, t.buf()).await
             }
         }
     }
@@ -1213,13 +1197,15 @@ impl Paxos {
         b: Ballot,
     ) -> Result<(), Status> {
         let (_, huge) = self.alloc.kind_of(addr)?;
-        let f = self.frame(Op::Trim, addr, huge)?;
+        let page = self.page_ref(addr, huge)?;
         let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-        t.fill(0);
-        fabric::put(&mut t, T_GUARD, guard);
-        fabric::put(&mut t, T_BALLOT, b.raw() as u64);
-        fabric::put(&mut t, T_EPOCH, self.alloc.config().epoch_of(addr.0) as u64);
-        r.send(f, t.buf()).await
+        let req = fabric::TrimReq {
+            guard,
+            ballot: b.raw(),
+            epoch: self.alloc.config().epoch_of(addr.0),
+        };
+        req.encode(&mut t).map_err(Status::from_wire)?;
+        r.send(Cmd::Trim { page, via: r.via() }, t.buf()).await
     }
 
     /// However many peer accepts the quorum needs beside our own leg. Losing legs are
@@ -1561,12 +1547,15 @@ impl Paxos {
         let Sink::Small(p) = sink else { return None };
         // Gather mode: the peer's page and the register it claims arrive in one command. A
         // miss, or a shedding replica, answers `MISSING` and we fall back to the group.
-        let mut f = self.frame(Op::Get, addr, false).ok()?;
-        f.flags |= fabric::CACHE_ONLY;
+        let cmd = Cmd::Get {
+            page: self.page_ref(addr, false).ok()?,
+            from: Source::Cache,
+            want: Want::Gather,
+        };
         let t = PoolBuf::alloc(2 * fabric::BLOCK).await;
-        link.send(f, t.buf()).await.ok()?;
+        link.send(cmd, t.buf()).await.ok()?;
         p[..fabric::BLOCK].copy_from_slice(&t[..fabric::BLOCK]);
-        Some(read_register(&t[fabric::BLOCK..]))
+        Some(read_register(&t[fabric::BLOCK..]).ok()?)
     }
 
     /// The width the cache should use for `addr`, from this node's own read stream. The 4
@@ -1639,15 +1628,21 @@ impl Paxos {
             .cache
             .replica(addr, w, |n| self.link_of(addr.universe(), n).is_some())?;
         let link = self.link_of(addr.universe(), node)?;
-        let mut f = self.frame(Op::Get, addr, true).ok()?;
-        f.flags |= fabric::CACHE_ONLY;
-        let mut meta = self.frame(Op::GetMeta, addr, true).ok()?;
-        meta.flags |= fabric::CACHE_ONLY;
+        let page = self.page_ref(addr, true).ok()?;
+        let get = Cmd::Get {
+            page,
+            from: Source::Cache,
+            want: Want::Piece { off: 0 },
+        };
+        let meta = Cmd::GetMeta {
+            page,
+            from: Source::Cache,
+        };
         let t = PoolBuf::alloc(fabric::BLOCK).await;
-        let (d, r) = join2(link.send(f, buf), link.send(meta, t.buf())).await;
+        let (d, r) = join2(link.send(get, buf), link.send(meta, t.buf())).await;
         d.ok()?;
         r.ok()?;
-        Some(read_register(&t))
+        read_register(&t).ok()
     }
 
     /// Admission for the 4 MiB class. The confirming round runs here, not on the read that
@@ -1776,25 +1771,37 @@ impl Paxos {
         addr: GlobalAddr,
         sink: Sink<'_>,
     ) -> Result<Register, Status> {
-        let f = self.frame(Op::Get, addr, sink.huge())?;
+        let page = self.page_ref(addr, sink.huge())?;
+        let from = Source::Group(r.via());
         match sink {
             Sink::Huge(b) => {
                 let t = PoolBuf::alloc(fabric::BLOCK).await;
-                let meta = self.frame(Op::GetMeta, addr, true)?;
-                let (d, m) = join2(r.send(f, b), r.send(meta, t.buf())).await;
+                let get = Cmd::Get {
+                    page,
+                    from,
+                    want: Want::Piece { off: 0 },
+                };
+                let meta = Cmd::GetMeta { page, from };
+                let (d, m) = join2(r.send(get, b), r.send(meta, t.buf())).await;
                 d?;
                 m?;
-                Ok(read_register(&t))
+                read_register(&t)
             }
             Sink::Small(p) => {
                 let t = PoolBuf::alloc(2 * fabric::BLOCK).await;
-                r.send(f, t.buf()).await?;
+                let get = Cmd::Get {
+                    page,
+                    from,
+                    want: Want::Gather,
+                };
+                r.send(get, t.buf()).await?;
                 if p.len() < fabric::BLOCK {
                     return Err(Status::Unmapped);
                 }
                 p[..fabric::BLOCK].copy_from_slice(&t[..fabric::BLOCK]);
-                self.note_width(addr, &t[fabric::BLOCK..]);
-                Ok(read_register(&t[fabric::BLOCK..]))
+                let (reg, width) = read_meta(&t[fabric::BLOCK..])?;
+                self.note_width(addr, width);
+                Ok(reg)
             }
         }
     }
@@ -1892,18 +1899,22 @@ impl Paxos {
     /// One `GETMETA` at a peer: the metadata half of the hedged read.
     async fn ask_meta(&self, r: Route<'_>, addr: GlobalAddr) -> Result<Register, Status> {
         let (_, huge) = self.alloc.kind_of(addr)?;
-        let f = self.frame(Op::GetMeta, addr, huge)?;
+        let cmd = Cmd::GetMeta {
+            page: self.page_ref(addr, huge)?,
+            from: Source::Group(r.via()),
+        };
         let t = PoolBuf::alloc(fabric::BLOCK).await;
-        r.send(f, t.buf()).await?;
-        self.note_width(addr, &t);
-        Ok(read_register(&t))
+        r.send(cmd, t.buf()).await?;
+        let (reg, width) = read_meta(&t)?;
+        self.note_width(addr, width);
+        Ok(reg)
     }
 
-    /// Lift the replication width out of a reply trailer. Every read reply carries it, so the
-    /// reader's hint stays current for free; the damping against oscillation is in the cache.
-    fn note_width(&self, addr: GlobalAddr, t: &[u8]) {
-        self.cache
-            .note_hint(addr, fabric::get(t, T_WIDTH).min(u8::MAX as u64) as u8);
+    /// Record the replication width a reply trailer carried. Every read reply carries it, so
+    /// the reader's hint stays current for free; the damping against oscillation is in the
+    /// cache.
+    fn note_width(&self, addr: GlobalAddr, width: u8) {
+        self.cache.note_hint(addr, width);
     }
 }
 
@@ -1946,39 +1957,38 @@ fn matching(rs: &[Option<Register>; 3]) -> Option<(Register, u8)> {
 // --- acceptor side ---
 
 impl Paxos {
-    /// The member side of an `ACCEPT`, reached from `server::dispatch` after the frame is
-    /// decoded. `imm` zero means the sender is not a member and we are the proposer; else we
-    /// apply at the member index it names.
+    /// The member side of an `ACCEPT`, reached from `server::dispatch` after the command is
+    /// decoded. [`To::Owner`] means the sender is not a member and we are the proposer; else
+    /// we apply at the member index it names.
     pub async fn accept(
         &'static self,
         addr: GlobalAddr,
-        imm: u8,
-        trailer: Option<&[u8]>,
+        to: To,
+        req: Option<fabric::AcceptReq>,
         page: Page<'_>,
     ) -> Result<(), Status> {
         let group = self.group(addr);
-        if imm == 0 {
+        let To::Member(k) = to else {
             // The originator sent the page and the guard; we pick the ballot and drive the
             // round, so the close member proposes rather than relays.
-            let guard = match trailer {
-                // `DERIVED` says the sender is not a member and had nothing to observe, so
-                // the guard is ours; see `write`. A real guard can never reach it: versions
-                // count accepts.
-                Some(t) => match fabric::get(t, T_GUARD) {
-                    DERIVED => None,
-                    g => Some(g),
+            let guard = match req {
+                // `Derived` says the sender is not a member and had nothing to observe, so
+                // the guard is ours; see `write`.
+                Some(r) => match r.guard {
+                    fabric::Guard::Derived => None,
+                    fabric::Guard::At(g) => Some(g),
                 },
                 // A 4 MiB frame carries no guard, so we derive it. Legal because the huge
                 // class is Immutable-only, whose guard is `3 * epoch` on every replica.
                 None => None,
             };
             return self.propose(addr, guard, page).await.map(|_| ());
-        }
+        };
         self.gate_accept(addr, group).await?;
-        let k = imm - 1;
-        let (guard, b) = match trailer {
+        let k = k.index();
+        let (guard, b) = match req {
             Some(t) => {
-                let b = Ballot::from_raw(fabric::get(t, T_BALLOT) as u32);
+                let b = Ballot::from_raw(t.ballot);
                 // First conjunct of the acceptance rule. A ballot below our promise is a
                 // proposer that missed a term bump; it refreshes on the rejection. A ballot
                 // above it is a promise we adopt, which lets one member's prepare grant the
@@ -1988,7 +1998,11 @@ impl Paxos {
                     return Err(Status::Conflict { current: 0 });
                 }
                 self.observe(group, b.term()).await;
-                (fabric::get(t, T_GUARD), b)
+                // A member's own fan-out always states the guard it observed.
+                let fabric::Guard::At(g) = t.guard else {
+                    return Err(Status::Unmapped);
+                };
+                (g, b)
             }
             None => {
                 // Derived on both counts: the guard from the epoch, the term from the
@@ -2023,11 +2037,12 @@ impl Paxos {
     pub async fn accept_part(
         &'static self,
         addr: GlobalAddr,
-        imm: u8,
+        to: To,
         off: u32,
         buf: Buf,
     ) -> Result<(), Status> {
         let group = self.group(addr);
+        let imm = to.imm();
         if imm != 0 {
             self.gate_accept(addr, group).await?;
         }
@@ -2065,25 +2080,23 @@ impl Paxos {
     pub async fn accept_trim(
         &'static self,
         addr: GlobalAddr,
-        imm: u8,
-        trailer: &[u8],
+        to: To,
+        req: fabric::TrimReq,
     ) -> Result<(), Status> {
         let group = self.group(addr);
-        if imm == 0 {
+        if to == To::Owner {
             return self.trim(addr).await;
         }
         self.gate_accept(addr, group).await?;
-        let guard = fabric::get(trailer, T_GUARD);
-        let b = Ballot::from_raw(fabric::get(trailer, T_BALLOT) as u32);
-        self.alloc.accept_trim(addr, guard, b).await
+        let b = Ballot::from_raw(req.ballot);
+        self.alloc.accept_trim(addr, req.guard, b).await
     }
 
     /// The member side of `GETMETA`: the hedged read at a replica, and the hop that feeds
     /// the cache's width estimator.
-    pub async fn get_meta(&'static self, addr: GlobalAddr, out: &mut [u8]) -> Result<(), Status> {
+    pub async fn get_meta(&'static self, addr: GlobalAddr) -> Result<fabric::MetaReply, Status> {
         let (r, w) = self.register_and_width(addr).await?;
-        self.trailer(addr, r, w, out);
-        Ok(())
+        Ok(self.reply(addr, r, w))
     }
 
     /// The trailer a gathered `GET` carries. The register is the one the page was read under,
@@ -2093,16 +2106,17 @@ impl Paxos {
         &'static self,
         addr: GlobalAddr,
         r: Register,
-        out: &mut [u8],
-    ) -> Result<(), Status> {
+    ) -> Result<fabric::MetaReply, Status> {
         let (_, w) = self.register_and_width(addr).await?;
-        self.trailer(addr, r, w, out);
-        Ok(())
+        Ok(self.reply(addr, r, w))
     }
 
-    fn trailer(&'static self, addr: GlobalAddr, r: Register, w: u8, out: &mut [u8]) {
-        put_register(out, r, w);
-        fabric::put(out, T_STATE, state_bits(self.alloc, addr, r.version));
+    fn reply(&'static self, addr: GlobalAddr, r: Register, w: u8) -> fabric::MetaReply {
+        fabric::MetaReply {
+            reg: r.into(),
+            state: state_of(self.alloc, addr, r.version),
+            width: w,
+        }
     }
 
     /// One hop to the core owning the address's group, for both the register and the
@@ -2121,26 +2135,24 @@ impl Paxos {
     /// The member side of `PREPARE`. A read carries no request body, so the requested term
     /// is not on the wire: the acceptor raises its own promise by one and reports it, and
     /// the preparer takes the maximum it hears back.
-    pub async fn prepare(&'static self, addr: GlobalAddr, out: &mut [u8]) -> Result<(), Status> {
+    pub async fn prepare(&'static self, addr: GlobalAddr) -> Result<fabric::PrepareReply, Status> {
         let group = self.group(addr);
         let term = self.bump(group).await?;
         let r = self.alloc.register(addr).await?;
-        out.fill(0);
-        fabric::put(out, T_VERSION, r.version);
-        fabric::put(out, T_BALLOT, r.ballot.raw() as u64);
-        fabric::put(out, T_TERM, term as u64);
         self.stat(|s| s.prepares += 1);
-        Ok(())
+        Ok(fabric::PrepareReply {
+            reg: r.into(),
+            term,
+        })
     }
 
     /// The member side of `TERM`: the promise we hold for a group. Unlike `PREPARE` it raises
     /// nothing. Read by a member recovering a lost promise, which needs the floor we already
     /// refuse below, not a new round.
-    pub async fn term(&'static self, group: GroupId, out: &mut [u8]) -> Result<(), Status> {
-        let term = self.held_term(group).await;
-        out.fill(0);
-        fabric::put(out, T_TERM, term as u64);
-        Ok(())
+    pub async fn term(&'static self, group: GroupId) -> Result<fabric::TermReply, Status> {
+        Ok(fabric::TermReply {
+            term: self.held_term(group).await,
+        })
     }
 
     /// The member side of `LEARN`: a value we may be behind on, and the member holding it.
@@ -2241,8 +2253,7 @@ impl Paxos {
             if let Some(link) = self.link_of(u.id, n) {
                 let r = Route {
                     link,
-                    hops: 0,
-                    imm: 0,
+                    via: Via::direct(To::Owner),
                 };
                 let _ = self.send_seal(r, addr, extent, term).await;
             }
@@ -2259,12 +2270,19 @@ impl Paxos {
         extent: u32,
         term: u32,
     ) -> Result<(), Status> {
-        let f = self.frame(Op::Seal, addr, false)?;
+        let anchor = self.page_ref(addr, false)?;
         let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-        t.fill(0);
-        fabric::put(&mut t, T_EXTENT, extent as u64);
-        fabric::put(&mut t, T_SEAL_TERM, term as u64);
-        r.send(f, t.buf()).await
+        fabric::SealReq { term, extent }
+            .encode(&mut t)
+            .map_err(Status::from_wire)?;
+        r.send(
+            Cmd::Seal {
+                anchor,
+                via: r.via(),
+            },
+            t.buf(),
+        )
+        .await
     }
 
     /// Hand one register to the zone taking an extent over. `LEARN` names the value; the
@@ -2398,12 +2416,16 @@ impl Paxos {
             let link = self
                 .link_of(group.universe(), m[i as usize])
                 .ok_or(Status::Io)?;
-            // Group-addressed, like the anti-entropy ops: `offset` is the group and the
-            // reply trailer's `T_TERM` slot is the promise.
-            let f = Frame::raw(Op::Term, false, group.index() as u64);
+            // Group-addressed, like the anti-entropy ops: the command names the group and
+            // the reply names the promise.
+            let cmd = Cmd::Term {
+                group: GroupIx::new(group.index()).ok_or(Status::Unmapped)?,
+            };
             let t = PoolBuf::alloc(fabric::BLOCK).await;
-            link.send(f, t.buf()).await.map_err(Status::from_wire)?;
-            peers[n] = fabric::get(&t, T_TERM) as u32;
+            link.send(cmd, t.buf()).await.map_err(Status::from_wire)?;
+            peers[n] = fabric::TermReply::decode(&t)
+                .map_err(Status::from_wire)?
+                .term;
             n += 1;
         }
         // Durable before use, as in `bump`: a promise lost to a restart was never a
@@ -2668,10 +2690,11 @@ impl Paxos {
         addr: GlobalAddr,
     ) -> Result<(Register, u32), Status> {
         let (_, huge) = self.alloc.kind_of(addr)?;
-        let f = self.frame(Op::Prepare, addr, huge)?;
+        let page = self.page_ref(addr, huge)?;
         let t = PoolBuf::alloc(fabric::BLOCK).await;
-        r.send(f, t.buf()).await?;
-        Ok((read_register(&t), fabric::get(&t, T_TERM) as u32))
+        r.send(Cmd::Prepare { page, via: r.via() }, t.buf()).await?;
+        let reply = fabric::PrepareReply::decode(&t).map_err(Status::from_wire)?;
+        Ok((reply.reg.into(), reply.term))
     }
 
     /// Prepare, then copy the chosen value to a quorum.
@@ -2782,7 +2805,9 @@ impl Paxos {
         let spawned = runtime::spawn(async move {
             for z in zones {
                 let sent = self
-                    .via(z, addr, |r| self.send_warm(r, addr, version, WARM_INBOUND))
+                    .via(z, addr, |r| {
+                        self.send_warm(r, addr, version, fabric::Stage::Inbound)
+                    })
                     .await;
                 self.stat(|s| match sent {
                     Ok(()) => s.warms_sent += 1,
@@ -2800,15 +2825,21 @@ impl Paxos {
         route: Route<'_>,
         addr: GlobalAddr,
         version: u64,
-        stage: u64,
+        stage: fabric::Stage,
     ) -> Result<(), Status> {
         let (_, huge) = self.alloc.kind_of(addr)?;
-        let f = self.frame(Op::Warm, addr, huge)?;
+        let page = self.page_ref(addr, huge)?;
         let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-        t.fill(0);
-        fabric::put(&mut t, T_VERSION, version);
-        fabric::put(&mut t, T_STAGE, stage);
-        route.send(f, t.buf()).await
+        fabric::WarmReq { version, stage }
+            .encode(&mut t)
+            .map_err(Status::from_wire)?;
+        // Sent on the link rather than through the route: a `WARM` is never forwarded, so
+        // it carries neither an addressee nor a hop budget.
+        route
+            .link
+            .send(Cmd::Warm { page }, t.buf())
+            .await
+            .map_err(Status::from_wire)
     }
 
     /// A `WARM` arriving here, from either stage.
@@ -2820,7 +2851,7 @@ impl Paxos {
     ///
     /// Our own configuration decides, not the sender's: an extent that does not name this
     /// zone, or that vetoes caching here, is dropped whatever arrived.
-    pub async fn warm(&'static self, addr: GlobalAddr, version: u64, stage: u64) {
+    pub async fn warm(&'static self, addr: GlobalAddr, version: u64, stage: fabric::Stage) {
         let (wanted, me, universe) = {
             let cfg = self.alloc.config();
             (
@@ -2833,7 +2864,7 @@ impl Paxos {
             self.stat(|s| s.warms_dropped += 1);
             return;
         }
-        if stage != WARM_INBOUND {
+        if stage != fabric::Stage::Inbound {
             self.take_warm(addr, version);
             return;
         }
@@ -2870,11 +2901,10 @@ impl Paxos {
             };
             let route = Route {
                 link,
-                hops: 0,
-                imm: 0,
+                via: Via::direct(To::Owner),
             };
             if self
-                .send_warm(route, addr, version, WARM_HOLDER)
+                .send_warm(route, addr, version, fabric::Stage::Holder)
                 .await
                 .is_err()
             {
@@ -2944,14 +2974,24 @@ impl Paxos {
         repair: bool,
     ) -> Result<(), Status> {
         let (_, huge) = self.alloc.kind_of(addr)?;
-        let f = self.frame(Op::Learn, addr, huge)?;
+        let page = self.page_ref(addr, huge)?;
         let mut t = PoolBuf::alloc(fabric::BLOCK).await;
-        t.fill(0);
-        fabric::put(&mut t, T_VERSION, r.version);
-        fabric::put(&mut t, T_BALLOT, r.ballot.raw() as u64);
-        fabric::put(&mut t, T_SOURCE, from as u64);
-        fabric::put(&mut t, T_REPAIR, repair as u64);
-        route.send(f, t.buf()).await
+        fabric::LearnReq {
+            reg: r.into(),
+            from: Member::new(from).ok_or(Status::Unmapped)?,
+            repair,
+        }
+        .encode(&mut t)
+        .map_err(Status::from_wire)?;
+        route
+            .send(
+                Cmd::Learn {
+                    page,
+                    via: route.via(),
+                },
+                t.buf(),
+            )
+            .await
     }
 
     async fn repair_source(
@@ -3047,28 +3087,46 @@ impl Paxos {
 
 // --- helpers ---
 
-/// Write a register, and the cache width beside it, into a reply trailer. Here rather than
-/// in `server` because this is where the slot names live.
-pub fn put_register(out: &mut [u8], r: Register, width: u8) {
-    out.fill(0);
-    fabric::put(out, T_VERSION, r.version);
-    fabric::put(out, T_BALLOT, r.ballot.raw() as u64);
-    fabric::put(out, T_WIDTH, width as u64);
-}
-
-fn read_register(t: &[u8]) -> Register {
-    Register {
-        version: fabric::get(t, T_VERSION),
-        ballot: Ballot::from_raw(fabric::get(t, T_BALLOT) as u32),
+/// The register a metadata reply carries. The wire form holds the same two fields as
+/// scalars, because `fabric` owns no consensus types.
+impl From<Register> for fabric::Reg {
+    fn from(r: Register) -> fabric::Reg {
+        fabric::Reg {
+            version: r.version,
+            ballot: r.ballot.raw(),
+        }
     }
 }
 
-/// The `state` slot of a `GETMETA` reply: the Immutable state machine's ordinal, and zero
+impl From<fabric::Reg> for Register {
+    fn from(r: fabric::Reg) -> Register {
+        Register {
+            version: r.version,
+            ballot: Ballot::from_raw(r.ballot),
+        }
+    }
+}
+
+/// The register out of a metadata reply, discarding the width hint. Used where the reader
+/// owns no sketch to feed: the cache legs and the 4 MiB metadata round.
+fn read_register(t: &[u8]) -> Result<Register, Status> {
+    Ok(read_meta(t)?.0)
+}
+
+/// A metadata reply: the register, and the cache width hint riding beside it.
+fn read_meta(t: &[u8]) -> Result<(Register, u8), Status> {
+    let m = fabric::MetaReply::decode(t).map_err(Status::from_wire)?;
+    Ok((m.reg.into(), m.width))
+}
+
+/// The `state` field of a `GETMETA` reply: the Immutable state machine's ordinal, and zero
 /// for the mutable types, which have no state outside the version.
-fn state_bits(a: &'static Allocator, addr: GlobalAddr, version: u64) -> u64 {
+fn state_of(a: &'static Allocator, addr: GlobalAddr, version: u64) -> fabric::State {
     match a.kind_of(addr) {
-        Ok((Kind::Immutable, _)) => version % 3,
-        _ => 0,
+        Ok((Kind::Immutable, _)) => {
+            fabric::State::new((version % 3) as u8).unwrap_or(fabric::State::ZERO)
+        }
+        _ => fabric::State::ZERO,
     }
 }
 
@@ -3129,46 +3187,6 @@ impl<A: Future, B: Future> Future for Join2<A, B> {
         } else {
             Poll::Pending
         }
-    }
-}
-
-/// A `LEARN` trailer: the value, its source, and whether equal bytes need validation.
-pub fn learn_trailer(t: &[u8]) -> (Register, u8, bool) {
-    let r = Register {
-        version: fabric::get(t, T_VERSION),
-        ballot: Ballot::from_raw(fabric::get(t, T_BALLOT) as u32),
-    };
-    (
-        r,
-        fabric::get(t, T_SOURCE) as u8,
-        fabric::get(t, T_REPAIR) != 0,
-    )
-}
-
-/// A `WARM` trailer: the version that prompted it, and how far the frame has come.
-pub fn warm_trailer(t: &[u8]) -> (u64, u64) {
-    (fabric::get(t, T_VERSION), fabric::get(t, T_STAGE))
-}
-
-/// A `SEAL` trailer: which extent, and the term the source group sealed it at. The frame
-/// names no page, so the whole address is here: an extent id is unique across every
-/// universe, and the caller checks it belongs to the one the frame arrived on.
-pub fn seal_trailer(t: &[u8]) -> (u32, u32) {
-    (
-        fabric::get(t, T_EXTENT) as u32,
-        fabric::get(t, T_SEAL_TERM) as u32,
-    )
-}
-
-/// Frame shapes the target accepts for an `ACCEPT`. Exposed so `server` and this file
-/// cannot drift.
-pub fn accept_parts(huge: bool, part: Part) -> bool {
-    if huge {
-        // Any piece of the page: one 4 MiB command is split at the target's MDTS and
-        // arrives as consecutive requests the acceptor reassembles by offset.
-        matches!(part, Part::Payload { .. })
-    } else {
-        part == Part::Both
     }
 }
 
