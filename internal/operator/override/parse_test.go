@@ -25,7 +25,7 @@ overrides:
 `
 
 func TestParseValidDocument(t *testing.T) {
-	entries, err := Parse(map[string]string{"overrides.yaml": validDocument})
+	entries, err := parseAll(map[string]string{"overrides.yaml": validDocument})
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -61,7 +61,7 @@ overrides:
 	data := map[string]string{"zulu.yaml": two, "alpha.yaml": validDocument}
 
 	for range 5 {
-		entries, err := Parse(data)
+		entries, err := parseAll(data)
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
@@ -82,7 +82,7 @@ overrides:
 // TestParseIgnoresEmptyKeys covers `kubectl create configmap --from-file` on an
 // empty file, which is an accident rather than an intent.
 func TestParseIgnoresEmptyKeys(t *testing.T) {
-	entries, err := Parse(map[string]string{
+	entries, err := parseAll(map[string]string{
 		"empty.yaml":     "",
 		"whitespace.yml": "   \n\t\n",
 		"real.yaml":      validDocument,
@@ -165,7 +165,7 @@ overrides:
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Parse(map[string]string{"overrides.yaml": tc.doc})
+			_, err := parseAll(map[string]string{"overrides.yaml": tc.doc})
 			if err == nil {
 				t.Fatal("expected the document to be rejected")
 			}
@@ -180,7 +180,7 @@ overrides:
 // TestParseErrorsNameTheKey matters because a ConfigMap can hold many
 // documents and the user needs to know which one is wrong.
 func TestParseErrorsNameTheKey(t *testing.T) {
-	_, err := Parse(map[string]string{
+	_, err := parseAll(map[string]string{
 		"good.yaml": validDocument,
 		"bad.yaml":  "overrides: []\n",
 	})
@@ -200,7 +200,7 @@ func TestParseErrorsNameTheKey(t *testing.T) {
 // first user to write spec.replicas, a container port, or an affinity weight
 // would crash the operator rather than get an error.
 func TestParseNormalizesIntegers(t *testing.T) {
-	entries, err := Parse(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
+	entries, err := parseAll(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
 overrides:
   - component: machina
     kind: Deployment
@@ -283,11 +283,11 @@ overrides:
 
 	// Comfortably under the limit: still accepted, so the cap is not simply
 	// refusing realistic documents.
-	if _, err := Parse(map[string]string{"overrides.yaml": annotations(200)}); err != nil {
+	if _, err := parseAll(map[string]string{"overrides.yaml": annotations(200)}); err != nil {
 		t.Fatalf("a 200-key mapping must be accepted: %v", err)
 	}
 
-	_, err := Parse(map[string]string{"overrides.yaml": annotations(maxMappingKeys + 1)})
+	_, err := parseAll(map[string]string{"overrides.yaml": annotations(maxMappingKeys + 1)})
 	if err == nil {
 		t.Fatal("a mapping over the key limit must be rejected before the quadratic decode runs")
 	}
@@ -311,7 +311,7 @@ func TestParseRejectsOversizedInput(t *testing.T) {
 		doc := "apiVersion: " + APIVersion + "\noverrides:\n" +
 			strings.Repeat(entry, 1+maxDocumentBytes/len(entry))
 
-		if _, err := Parse(map[string]string{"overrides.yaml": doc}); err == nil {
+		if _, err := parseAll(map[string]string{"overrides.yaml": doc}); err == nil {
 			t.Fatal("an oversized document must be rejected")
 		}
 	})
@@ -325,7 +325,7 @@ func TestParseRejectsOversizedInput(t *testing.T) {
 			data[fmt.Sprintf("part-%02d.yaml", i)] = one
 		}
 
-		if _, err := Parse(data); err == nil {
+		if _, err := parseAll(data); err == nil {
 			t.Fatal("keys under the per-document limit must still be bounded in total")
 		}
 	})
@@ -333,7 +333,7 @@ func TestParseRejectsOversizedInput(t *testing.T) {
 	t.Run("too many entries", func(t *testing.T) {
 		doc := "apiVersion: " + APIVersion + "\noverrides:\n" + strings.Repeat(entry, maxEntries+1)
 
-		if _, err := Parse(map[string]string{"overrides.yaml": doc}); err == nil {
+		if _, err := parseAll(map[string]string{"overrides.yaml": doc}); err == nil {
 			t.Fatal("a document over the entry limit must be rejected")
 		}
 	})
@@ -352,7 +352,110 @@ func TestParseRejectsExcessiveNesting(t *testing.T) {
 
 	b.WriteString(strings.Repeat(" ", 6+(maxDepth+4)*2) + "leaf: v\n")
 
-	if _, err := Parse(map[string]string{"overrides.yaml": b.String()}); err == nil {
+	if _, err := parseAll(map[string]string{"overrides.yaml": b.String()}); err == nil {
 		t.Fatal("a document nested past the limit must be rejected")
+	}
+}
+
+// TestParseIsolatesFailuresToTheKeyThatCausedThem is a regression test.
+//
+// Parse used to return on the first key that failed, so a typo in one ConfigMap
+// key discarded the entries in every other key. The format is one document per
+// key precisely so a document can be split by concern or by team, and that is
+// only useful if a mistake in one key is contained to it.
+func TestParseIsolatesFailuresToTheKeyThatCausedThem(t *testing.T) {
+	good := `apiVersion: ` + APIVersion + `
+overrides:
+  - component: net
+    kind: DaemonSet
+    extraArgs:
+      node: [--flag]
+`
+
+	entries, problems, err := Parse(map[string]string{
+		"a-broken.yaml": "this is not: [a valid document\n",
+		"b-good.yaml":   good,
+	})
+	if err != nil {
+		t.Fatalf("a broken key must not fail the payload as a whole: %v", err)
+	}
+
+	if len(entries) != 1 || entries[0].Source.Key != "b-good.yaml" {
+		t.Fatalf("entries = %+v, want the entry from the key that parsed", entries)
+	}
+
+	if len(problems) != 1 {
+		t.Fatalf("problems = %+v, want exactly one", problems)
+	}
+
+	if !problems[0].KeyLevel() || problems[0].Key != "a-broken.yaml" {
+		t.Fatalf("problem = %+v, want a key-level problem naming a-broken.yaml", problems[0])
+	}
+}
+
+// TestParseAttributesEntryFailuresToTheEntry pins that a bad patch names what
+// it would have touched, so only those workloads need be withheld.
+func TestParseAttributesEntryFailuresToTheEntry(t *testing.T) {
+	// An unquoted date resolves to time.Time, which apimachinery cannot carry.
+	// The component, kind and sites decode before the patch is normalized, so
+	// the failure can still say what it would have changed.
+	doc := `apiVersion: ` + APIVersion + `
+overrides:
+  - component: net
+    kind: DaemonSet
+    extraArgs:
+      node: [--first]
+  - component: storage
+    kind: DaemonSet
+    sites: [edge-west]
+    patch:
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              maintenance: 2026-08-11
+`
+
+	entries, problems, err := Parse(map[string]string{"overrides.yaml": doc})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if len(entries) != 1 || entries[0].Entry.Component != "net" {
+		t.Fatalf("entries = %+v, want the net entry to survive", entries)
+	}
+
+	if len(problems) != 1 {
+		t.Fatalf("problems = %+v, want exactly one", problems)
+	}
+
+	problem := problems[0]
+	if problem.KeyLevel() {
+		t.Fatal("a bad patch is one entry's fault, not the whole key's")
+	}
+
+	if problem.Component != "storage" || problem.Kind != "DaemonSet" {
+		t.Fatalf("problem targets %s/%s, want storage/DaemonSet", problem.Component, problem.Kind)
+	}
+
+	if len(problem.Sites) != 1 || problem.Sites[0] != "edge-west" {
+		t.Fatalf("problem sites = %v, want [edge-west]", problem.Sites)
+	}
+
+	if problem.Source == nil || problem.Source.Index != 1 {
+		t.Fatalf("problem source = %+v, want entry index 1", problem.Source)
+	}
+}
+
+// TestParsePayloadLimitIsNotAttributable pins that the one limit spanning every
+// key is reported as a payload failure rather than blamed on a key.
+func TestParsePayloadLimitIsNotAttributable(t *testing.T) {
+	big := strings.Repeat("x", maxDocumentBytes)
+
+	_, _, err := Parse(map[string]string{
+		"a.yaml": big, "b.yaml": big, "c.yaml": big, "d.yaml": big, "e.yaml": big,
+	})
+	if err == nil {
+		t.Fatal("a payload over the total byte limit must fail as a whole")
 	}
 }

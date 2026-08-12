@@ -90,7 +90,7 @@ func Resolve(plan *component.Plan, entries []SourcedEntry, knownSites []string) 
 		resolution.Targets = append(resolution.Targets, *byIndex[index])
 	}
 
-	resolution.UnmatchedSites = unmatchedSites(entries, knownSites)
+	resolution.UnmatchedSites = UnmatchedSites(entries, knownSites)
 	resolution.InertEntries = inertEntries(entries, byIndex)
 
 	return resolution
@@ -117,7 +117,17 @@ func matches(entry Entry, op component.Operation) bool {
 	return false
 }
 
-func unmatchedSites(entries []SourcedEntry, knownSites []string) []string {
+// UnmatchedSites returns the Site names entries select that do not exist,
+// sorted and deduplicated.
+//
+// It is exported because the CLI reports the same thing before a document is
+// applied, and a second implementation of Site-selector matching is a second
+// place for the semantics to drift.
+//
+// These are reported rather than fatal. A document may legitimately be written
+// before its Site exists, and deleting a Site must not retroactively invalidate
+// an unrelated override.
+func UnmatchedSites(entries []SourcedEntry, knownSites []string) []string {
 	known := make(map[string]bool, len(knownSites))
 	for _, site := range knownSites {
 		known[site] = true

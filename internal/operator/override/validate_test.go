@@ -26,7 +26,7 @@ func entryFrom(t *testing.T, fragment string) SourcedEntry {
 func validateFragment(t *testing.T, fragment string) error {
 	t.Helper()
 
-	return Validate([]SourcedEntry{entryFrom(t, fragment)})
+	return ValidateErr([]SourcedEntry{entryFrom(t, fragment)})
 }
 
 func TestValidateAcceptsRealisticEntries(t *testing.T) {
@@ -472,7 +472,7 @@ func TestValidateReportsEveryProblem(t *testing.T) {
 		{Entry: Entry{Component: "net", Kind: "DaemonSet"}, Source: Source{Key: "b.yaml", Index: 3}},
 	}
 
-	err := Validate(entries)
+	err := ValidateErr(entries)
 	if err == nil {
 		t.Fatal("expected errors")
 	}
@@ -520,7 +520,7 @@ func TestPermittedAndProtectedPathsAreExported(t *testing.T) {
 // The timestamp is rejected rather than coerced: rewriting it to RFC3339 would
 // silently produce a value the user did not write.
 func TestValidateRejectsYAMLTimestamps(t *testing.T) {
-	_, err := Parse(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
+	_, err := parseAll(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
 overrides:
   - component: net
     kind: DaemonSet
@@ -540,7 +540,7 @@ overrides:
 	}
 
 	// The quoted form is what the user meant, and must be accepted.
-	if _, err := Parse(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
+	if _, err := parseAll(map[string]string{"overrides.yaml": `apiVersion: ` + APIVersion + `
 overrides:
   - component: net
     kind: DaemonSet
@@ -967,3 +967,4 @@ patch:
 		t.Fatalf("error = %q, want it to explain the Kubernetes constraint", err)
 	}
 }
+

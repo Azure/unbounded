@@ -4,6 +4,7 @@
 package override
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -64,74 +65,81 @@ func ComponentKinds(component string) []string {
 // renders, and a client cannot answer that correctly under version skew.
 //
 // Every problem found is reported, rather than only the first, so a user fixing
-// a document sees the whole list.
-func Validate(entries []SourcedEntry) error {
-	var problems []string
+// a document sees the whole list. Each is attributed to the entry that caused
+// it and carries what that entry would have targeted, so a caller can withhold
+// those workloads alone rather than every workload an override could reach.
+func Validate(entries []SourcedEntry) []Problem {
+	var problems []Problem
 
 	for _, sourced := range entries {
-		problems = append(problems, validateEntry(sourced)...)
+		for _, message := range validateEntry(sourced) {
+			problems = append(problems, entryProblem(sourced.Source, sourced.Entry, errors.New(message)))
+		}
 	}
 
-	if len(problems) == 0 {
-		return nil
-	}
-
-	sort.Strings(problems)
-
-	return fmt.Errorf("invalid override document:\n  %s", strings.Join(problems, "\n  "))
+	return problems
 }
 
+// ValidateErr reports validation as a single error, for callers that only need
+// a yes or no. Attribution is discarded, so anything deciding what to withhold
+// must use Validate.
+func ValidateErr(entries []SourcedEntry) error {
+	return ProblemsError(Validate(entries))
+}
+
+// validateEntry returns the problems with one entry, unattributed. Validate
+// pairs each with its Source, so the origin is stamped in exactly one place
+// rather than threaded through every helper below.
 func validateEntry(sourced SourcedEntry) []string {
 	var (
 		problems []string
 		entry    = sourced.Entry
-		at       = sourced.Source.String()
 	)
 
 	component, known := knownComponents[entry.Component]
 
 	switch {
 	case entry.Component == "":
-		problems = append(problems, fmt.Sprintf("%s: component is required", at))
+		problems = append(problems, "component is required")
 	case !known:
-		problems = append(problems, fmt.Sprintf("%s: unknown component %q, want one of %s",
-			at, entry.Component, strings.Join(sortedComponents(), ", ")))
+		problems = append(problems, fmt.Sprintf("unknown component %q, want one of %s",
+			entry.Component, strings.Join(sortedComponents(), ", ")))
 	}
 
 	switch entry.Kind {
 	case "":
-		problems = append(problems, fmt.Sprintf("%s: kind is required", at))
+		problems = append(problems, "kind is required")
 	default:
 		if _, ok := knownKinds[entry.Kind]; !ok {
-			problems = append(problems, fmt.Sprintf("%s: unsupported kind %q, want Deployment or DaemonSet", at, entry.Kind))
+			problems = append(problems, fmt.Sprintf("unsupported kind %q, want Deployment or DaemonSet", entry.Kind))
 		} else if known && !slices.Contains(component.kinds, entry.Kind) {
 			problems = append(problems, fmt.Sprintf(
-				"%s: component %q emits no %s, so this entry can never match anything; it emits %s",
-				at, entry.Component, entry.Kind, strings.Join(ComponentKinds(entry.Component), " and ")))
+				"component %q emits no %s, so this entry can never match anything; it emits %s",
+				entry.Component, entry.Kind, strings.Join(ComponentKinds(entry.Component), " and ")))
 		}
 	}
 
-	problems = append(problems, validateSites(at, entry, known, component.perSite)...)
+	problems = append(problems, validateSites(entry, known, component.perSite)...)
 
 	if !entry.HasWork() {
-		problems = append(problems, fmt.Sprintf("%s: entry changes nothing; set patch, extraArgs, or both", at))
+		problems = append(problems, "entry changes nothing; set patch, extraArgs, or both")
 	}
 
 	for container, args := range entry.ExtraArgs {
 		if container == "" {
-			problems = append(problems, fmt.Sprintf("%s: extraArgs has an empty container name", at))
+			problems = append(problems, "extraArgs has an empty container name")
 		}
 
 		if len(args) == 0 {
-			problems = append(problems, fmt.Sprintf("%s: extraArgs for container %q is empty", at, container))
+			problems = append(problems, fmt.Sprintf("extraArgs for container %q is empty", container))
 		}
 	}
 
-	problems = append(problems, validateAddNames(at, "addContainers", entry.AddContainers)...)
-	problems = append(problems, validateAddNames(at, "addInitContainers", entry.AddInitContainers)...)
-	problems = append(problems, reportAddedContainers(at, entry)...)
-	problems = append(problems, validatePatch(at, entry.Patch)...)
-	problems = append(problems, reportTypedFieldConflicts(at, entry)...)
+	problems = append(problems, validateAddNames("addContainers", entry.AddContainers)...)
+	problems = append(problems, validateAddNames("addInitContainers", entry.AddInitContainers)...)
+	problems = append(problems, reportAddedContainers(entry)...)
+	problems = append(problems, validatePatch(entry.Patch)...)
+	problems = append(problems, reportTypedFieldConflicts(entry)...)
 
 	return problems
 }
@@ -145,7 +153,7 @@ func validateEntry(sourced SourcedEntry) []string {
 // user editing the typed field to no effect, or the operator recomputing it
 // every pass and fighting the override forever. Naming the field to use makes
 // the precedence discoverable at the point it matters.
-func reportTypedFieldConflicts(at string, entry Entry) []string {
+func reportTypedFieldConflicts(entry Entry) []string {
 	owned, ok := typedFieldOwners[entry.Component]
 	if !ok || len(entry.Patch) == 0 {
 		return nil
@@ -166,8 +174,8 @@ func reportTypedFieldConflicts(at string, entry Entry) []string {
 		}
 
 		problems = append(problems, fmt.Sprintf(
-			"%s: %s is owned by %s on the Site and cannot be overridden; set that field instead",
-			at, path, owned[path]))
+			"%s is owned by %s on the Site and cannot be overridden; set that field instead",
+			path, owned[path]))
 	}
 
 	return problems
@@ -193,7 +201,7 @@ func patchSets(patch map[string]any, path string) bool {
 // list was checked for duplicates on its own, so the collision between them was
 // never seen and the apiserver refused the pod after the override had been
 // applied and reported.
-func reportAddedContainers(at string, entry Entry) []string {
+func reportAddedContainers(entry Entry) []string {
 	var problems []string
 
 	for _, declaration := range []struct {
@@ -212,8 +220,8 @@ func reportAddedContainers(at string, entry Entry) []string {
 		for _, name := range declaration.names {
 			if !present[name] {
 				problems = append(problems, fmt.Sprintf(
-					"%s: %s declares %q, but the patch defines no %s with that name, so nothing would be created",
-					at, declaration.field, name, singular(declaration.patch)))
+					"%s declares %q, but the patch defines no %s with that name, so nothing would be created",
+					declaration.field, name, singular(declaration.patch)))
 			}
 		}
 	}
@@ -226,8 +234,8 @@ func reportAddedContainers(at string, entry Entry) []string {
 	for _, name := range entry.AddContainers {
 		if initNames[name] {
 			problems = append(problems, fmt.Sprintf(
-				"%s: %q is declared in both addContainers and addInitContainers; "+
-					"Kubernetes requires container names to be unique across both lists", at, name))
+				"%q is declared in both addContainers and addInitContainers; "+
+					"Kubernetes requires container names to be unique across both lists", name))
 		}
 	}
 
@@ -236,7 +244,7 @@ func reportAddedContainers(at string, entry Entry) []string {
 
 // validateSites checks the Site selector, which is meaningful only for per-Site
 // components.
-func validateSites(at string, entry Entry, componentKnown, perSite bool) []string {
+func validateSites(entry Entry, componentKnown, perSite bool) []string {
 	var problems []string
 
 	if entry.Sites == nil {
@@ -244,16 +252,15 @@ func validateSites(at string, entry Entry, componentKnown, perSite bool) []strin
 	}
 
 	if len(entry.Sites) == 0 {
-		problems = append(problems, fmt.Sprintf(
-			"%s: sites is present but empty; omit it to match every Site", at))
+		problems = append(problems, "sites is present but empty; omit it to match every Site")
 
 		return problems
 	}
 
 	if componentKnown && !perSite {
 		problems = append(problems, fmt.Sprintf(
-			"%s: component %q is a cluster singleton and is not per-Site, so sites must be omitted",
-			at, entry.Component))
+			"component %q is a cluster singleton and is not per-Site, so sites must be omitted",
+			entry.Component))
 	}
 
 	seen := map[string]bool{}
@@ -261,9 +268,9 @@ func validateSites(at string, entry Entry, componentKnown, perSite bool) []strin
 	for _, site := range entry.Sites {
 		switch {
 		case site == "":
-			problems = append(problems, fmt.Sprintf("%s: sites contains an empty Site name", at))
+			problems = append(problems, "sites contains an empty Site name")
 		case seen[site]:
-			problems = append(problems, fmt.Sprintf("%s: sites lists %q more than once", at, site))
+			problems = append(problems, fmt.Sprintf("sites lists %q more than once", site))
 		}
 
 		seen[site] = true
@@ -272,7 +279,7 @@ func validateSites(at string, entry Entry, componentKnown, perSite bool) []strin
 	return problems
 }
 
-func validateAddNames(at, field string, names []string) []string {
+func validateAddNames(field string, names []string) []string {
 	var problems []string
 
 	seen := map[string]bool{}
@@ -280,9 +287,9 @@ func validateAddNames(at, field string, names []string) []string {
 	for _, name := range names {
 		switch {
 		case name == "":
-			problems = append(problems, fmt.Sprintf("%s: %s contains an empty container name", at, field))
+			problems = append(problems, fmt.Sprintf("%s contains an empty container name", field))
 		case seen[name]:
-			problems = append(problems, fmt.Sprintf("%s: %s lists %q more than once", at, field, name))
+			problems = append(problems, fmt.Sprintf("%s lists %q more than once", field, name))
 		}
 
 		seen[name] = true
@@ -292,7 +299,7 @@ func validateAddNames(at, field string, names []string) []string {
 }
 
 // validatePatch walks a patch against the allowlist.
-func validatePatch(at string, patch map[string]any) []string {
+func validatePatch(patch map[string]any) []string {
 	if len(patch) == 0 {
 		return nil
 	}
@@ -300,7 +307,7 @@ func validatePatch(at string, patch map[string]any) []string {
 	var problems []string
 
 	report := func(problem string) {
-		problems = append(problems, at+": "+problem)
+		problems = append(problems, problem)
 	}
 
 	walkPatch(patch, "", compiledAllowlist.root, report)

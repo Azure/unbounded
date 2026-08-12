@@ -274,7 +274,7 @@ func TestApplyAcceptsNewMountPath(t *testing.T) {
 func TestApplyComposesDisjointContributors(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries, err := Parse(map[string]string{
+	entries, err := parseAll(map[string]string{
 		"resources.yaml": doc(`  - component: storage
     kind: DaemonSet
     patch:
@@ -302,7 +302,7 @@ func TestApplyComposesDisjointContributors(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	if err := Validate(entries); err != nil {
+	if err := ValidateErr(entries); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
 
@@ -340,7 +340,7 @@ func TestApplyIdenticalValuesDoNotConflict(t *testing.T) {
                     memory: 512Mi
 `)
 
-	entries, err := Parse(map[string]string{"a.yaml": sameLimit, "b.yaml": sameLimit})
+	entries, err := parseAll(map[string]string{"a.yaml": sameLimit, "b.yaml": sameLimit})
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -371,7 +371,7 @@ func TestApplyRejectsTrueConflict(t *testing.T) {
                     memory: ` + memory + "\n")
 	}
 
-	entries, err := Parse(map[string]string{"a.yaml": limit("512Mi"), "b.yaml": limit("1Gi")})
+	entries, err := parseAll(map[string]string{"a.yaml": limit("512Mi"), "b.yaml": limit("1Gi")})
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestApplyRejectsTrueConflict(t *testing.T) {
 func TestApplyConflictIsScopedToOneObject(t *testing.T) {
 	plan := multiSitePlan("rack-a", "rack-b", "rack-c")
 
-	entries, err := Parse(map[string]string{
+	entries, err := parseAll(map[string]string{
 		"a.yaml": doc(`  - component: storage
     kind: DaemonSet
     sites: [rack-a, rack-b]
@@ -644,7 +644,7 @@ func TestApplyAddContainerConflicts(t *testing.T) {
 	t.Run("identical additions compose", func(t *testing.T) {
 		plan := multiSitePlan("rack-a")
 
-		entries, err := Parse(map[string]string{"a.yaml": sidecar("fluent:1"), "b.yaml": sidecar("fluent:1")})
+		entries, err := parseAll(map[string]string{"a.yaml": sidecar("fluent:1"), "b.yaml": sidecar("fluent:1")})
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
@@ -657,7 +657,7 @@ func TestApplyAddContainerConflicts(t *testing.T) {
 	t.Run("differing additions conflict", func(t *testing.T) {
 		plan := multiSitePlan("rack-a")
 
-		entries, err := Parse(map[string]string{"a.yaml": sidecar("fluent:1"), "b.yaml": sidecar("fluent:2")})
+		entries, err := parseAll(map[string]string{"a.yaml": sidecar("fluent:1"), "b.yaml": sidecar("fluent:2")})
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
@@ -773,3 +773,4 @@ func TestApplyPreservesPodAntiAffinity(t *testing.T) {
 		t.Fatalf("node affinity terms = %d, want the operator's two", len(terms))
 	}
 }
+

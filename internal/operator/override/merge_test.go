@@ -123,12 +123,12 @@ func planWith(workload *unstructured.Unstructured, componentName, site string) *
 func entriesFrom(t *testing.T, doc string) []SourcedEntry {
 	t.Helper()
 
-	entries, err := Parse(map[string]string{"overrides.yaml": doc})
+	entries, err := parseAll(map[string]string{"overrides.yaml": doc})
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	if err := Validate(entries); err != nil {
+	if err := ValidateErr(entries); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
 
@@ -542,7 +542,7 @@ func TestApplyRejectsMalformedScheduling(t *testing.T) {
 			workload := testWorkload("rack-a")
 			plan := planWith(workload, "storage", "rack-a")
 
-			entries, err := Parse(map[string]string{"overrides.yaml": doc(`  - component: storage
+			entries, err := parseAll(map[string]string{"overrides.yaml": doc(`  - component: storage
     kind: DaemonSet
     patch:
       spec:
@@ -592,7 +592,7 @@ func TestApplyTopologySpreadIsAdditive(t *testing.T) {
 `)
 	}
 
-	entries, err := Parse(map[string]string{"a.yaml": constraint("topology.kubernetes.io/zone")})
+	entries, err := parseAll(map[string]string{"a.yaml": constraint("topology.kubernetes.io/zone")})
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -622,7 +622,7 @@ func TestApplyTopologySpreadIsAdditive(t *testing.T) {
 func TestMergeRestampsPathsATypedSiteFieldOwns(t *testing.T) {
 	workload := metalmanDeployment(2)
 
-	entries, err := Parse(map[string]string{"overrides.yaml": doc(`  - component: metalman
+	entries, err := parseAll(map[string]string{"overrides.yaml": doc(`  - component: metalman
     kind: Deployment
     patch:
       spec:
@@ -665,7 +665,7 @@ func TestMergeLeavesUnownedPathsAlone(t *testing.T) {
 	workload := metalmanDeployment(2)
 	workload.SetName("unbounded-net-controller")
 
-	entries, err := Parse(map[string]string{"overrides.yaml": doc(`  - component: net
+	entries, err := parseAll(map[string]string{"overrides.yaml": doc(`  - component: net
     kind: Deployment
     patch:
       spec:

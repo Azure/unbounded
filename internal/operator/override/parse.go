@@ -45,6 +45,16 @@ type SourcedEntry struct {
 // document and returns the entries in deterministic order: sorted ConfigMap
 // key, then position within that key's document.
 //
+// Keys are independent, and a key that fails does not stop the others being
+// read. That is the whole reason the format is one document per key: splitting
+// by concern or by team is only useful if a mistake in one key is contained to
+// it. The returned problems say which key or which entry failed, so the caller
+// can withhold the workloads that are actually in doubt rather than all of
+// them.
+//
+// The returned error is reserved for a failure of the payload as a whole, where
+// nothing can be read and no attribution is possible.
+//
 // Parsing is strict by design. The apiVersion gate is only meaningful if the
 // document that passes it is the document the user wrote, so anything
 // ambiguous is rejected rather than interpreted:
@@ -57,7 +67,7 @@ type SourcedEntry struct {
 // An empty or whitespace-only value is ignored rather than rejected, because
 // `kubectl create configmap --from-file` on an empty file is a plausible
 // accident rather than an intent.
-func Parse(data map[string]string) ([]SourcedEntry, error) {
+func Parse(data map[string]string) ([]SourcedEntry, []Problem, error) {
 	keys := make([]string, 0, len(data))
 
 	for key := range data {
@@ -72,11 +82,17 @@ func Parse(data map[string]string) ([]SourcedEntry, error) {
 	}
 
 	if total > maxTotalBytes {
-		return nil, fmt.Errorf(
+		// A payload-level failure, not a key-level one: the limit is on every
+		// value together, so no individual key is at fault and none can be
+		// read in isolation.
+		return nil, nil, fmt.Errorf(
 			"overrides are %d bytes in total, over the %d byte limit", total, maxTotalBytes)
 	}
 
-	var entries []SourcedEntry
+	var (
+		entries  []SourcedEntry
+		problems []Problem
+	)
 
 	for _, key := range keys {
 		if strings.TrimSpace(data[key]) == "" {
@@ -85,32 +101,66 @@ func Parse(data map[string]string) ([]SourcedEntry, error) {
 
 		doc, err := parseDocument(key, data[key])
 		if err != nil {
-			return nil, err
+			problems = append(problems, keyProblem(key, err))
+
+			continue
 		}
 
 		if len(doc.Overrides) > maxEntries {
-			return nil, fmt.Errorf("overrides key %q: %d entries, over the %d entry limit",
-				key, len(doc.Overrides), maxEntries)
+			problems = append(problems, keyProblem(key, fmt.Errorf(
+				"%d entries, over the %d entry limit", len(doc.Overrides), maxEntries)))
+
+			continue
 		}
 
-		for i, entry := range doc.Overrides {
-			normalized, err := normalizeJSON(entry.Patch, "patch")
-			if err != nil {
-				return nil, fmt.Errorf("overrides key %q, entry %d: %w", key, i, err)
-			}
+		keyEntries, keyProblems := parseEntries(key, doc)
 
-			patch, ok := normalized.(map[string]any)
-			if !ok && normalized != nil {
-				return nil, fmt.Errorf("overrides key %q, entry %d: patch must be a mapping", key, i)
-			}
-
-			entry.Patch = patch
-			entries = append(entries, SourcedEntry{Entry: entry, Source: Source{Key: key, Index: i}})
-		}
+		entries = append(entries, keyEntries...)
+		problems = append(problems, keyProblems...)
 	}
 
-	return entries, nil
+	return entries, problems, nil
 }
+
+// parseEntries normalizes one document's entries, attributing a failure to the
+// entry that caused it.
+//
+// A bad patch in entry three does not put entries one and two in doubt: the
+// component, kind and Sites of each decode before the patch is normalized, so
+// the failure can name exactly what it would have touched.
+func parseEntries(key string, doc Document) ([]SourcedEntry, []Problem) {
+	var (
+		entries  []SourcedEntry
+		problems []Problem
+	)
+
+	for i, entry := range doc.Overrides {
+		source := Source{Key: key, Index: i}
+
+		normalized, err := normalizeJSON(entry.Patch, "patch")
+		if err != nil {
+			problems = append(problems, entryProblem(source, entry, err))
+
+			continue
+		}
+
+		patch, ok := normalized.(map[string]any)
+		if !ok && normalized != nil {
+			problems = append(problems, entryProblem(source, entry, errPatchNotAMapping))
+
+			continue
+		}
+
+		entry.Patch = patch
+		entries = append(entries, SourcedEntry{Entry: entry, Source: source})
+	}
+
+	return entries, problems
+}
+
+// errPatchNotAMapping is returned when a patch decodes to something other than
+// a mapping, which no strategic merge patch can be.
+var errPatchNotAMapping = errors.New("patch must be a mapping")
 
 // Limits on what a single pass will parse.
 //
@@ -158,11 +208,11 @@ const (
 func parseDocument(key, raw string) (Document, error) {
 	if len(raw) > maxDocumentBytes {
 		return Document{}, fmt.Errorf(
-			"overrides key %q: document is %d bytes, over the %d byte limit; split it across ConfigMap keys",
-			key, len(raw), maxDocumentBytes)
+			"document is %d bytes, over the %d byte limit; split it across ConfigMap keys",
+			len(raw), maxDocumentBytes)
 	}
 
-	if err := checkStructure(key, raw); err != nil {
+	if err := checkStructure(raw); err != nil {
 		return Document{}, err
 	}
 
@@ -173,10 +223,10 @@ func parseDocument(key, raw string) (Document, error) {
 
 	if err := decoder.Decode(&doc); err != nil {
 		if errors.Is(err, io.EOF) {
-			return Document{}, fmt.Errorf("overrides key %q: document is empty", key)
+			return Document{}, errors.New("document is empty")
 		}
 
-		return Document{}, fmt.Errorf("overrides key %q: %w", key, err)
+		return Document{}, err
 	}
 
 	// A second successful decode means a second document, or trailing content
@@ -185,21 +235,21 @@ func parseDocument(key, raw string) (Document, error) {
 	var extra yaml.Node
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		if err != nil {
-			return Document{}, fmt.Errorf("overrides key %q: %w", key, err)
+			return Document{}, err
 		}
 
-		return Document{}, fmt.Errorf(
-			"overrides key %q: contains more than one YAML document; put one document per key", key)
+		return Document{}, errors.New(
+			"contains more than one YAML document; put one document per key")
 	}
 
 	if doc.APIVersion == "" {
 		return Document{}, fmt.Errorf(
-			"overrides key %q: apiVersion is required and must be %q", key, APIVersion)
+			"apiVersion is required and must be %q", APIVersion)
 	}
 
 	if doc.APIVersion != APIVersion {
 		return Document{}, fmt.Errorf(
-			"overrides key %q: unsupported apiVersion %q, want %q", key, doc.APIVersion, APIVersion)
+			"unsupported apiVersion %q, want %q", doc.APIVersion, APIVersion)
 	}
 
 	return doc, nil
@@ -214,7 +264,7 @@ func parseDocument(key, raw string) (Document, error) {
 // Merge keys are rejected because yaml.v3 expands them silently, which would
 // let content reach the merge that the allowlist walker never inspected: it
 // only ever sees the expanded result rather than the alias that produced it.
-func checkStructure(key, raw string) error {
+func checkStructure(raw string) error {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(raw), &root); err != nil {
 		// A parse error here will be reported with better context by the strict
@@ -229,13 +279,12 @@ func checkStructure(key, raw string) error {
 
 		if nodes > maxNodes {
 			return fmt.Errorf(
-				"overrides key %q: document has more than %d nodes; split it across ConfigMap keys",
-				key, maxNodes)
+				"document has more than %d nodes; split it across ConfigMap keys", maxNodes)
 		}
 
 		if depth > maxDepth {
-			return fmt.Errorf("overrides key %q: document nests deeper than %d levels at line %d",
-				key, maxDepth, n.Line)
+			return fmt.Errorf("document nests deeper than %d levels at line %d",
+				maxDepth, n.Line)
 		}
 
 		if n.Kind != yaml.MappingNode {
@@ -244,16 +293,16 @@ func checkStructure(key, raw string) error {
 
 		if keys := len(n.Content) / 2; keys > maxMappingKeys {
 			return fmt.Errorf(
-				"overrides key %q: mapping at line %d has %d keys, over the %d key limit; "+
+				"mapping at line %d has %d keys, over the %d key limit; "+
 					"duplicate-key checking is quadratic, so one large mapping can stall reconciliation",
-				key, n.Line, keys, maxMappingKeys)
+				n.Line, keys, maxMappingKeys)
 		}
 
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			if n.Content[i].Value == mergeKey || n.Content[i].Tag == "!!merge" {
 				return fmt.Errorf(
-					"overrides key %q: YAML merge keys (%s) are not supported at line %d; write the document out in full",
-					key, mergeKey, n.Content[i].Line)
+					"YAML merge keys (%s) are not supported at line %d; write the document out in full",
+					mergeKey, n.Content[i].Line)
 			}
 		}
 
