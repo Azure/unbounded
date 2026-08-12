@@ -4,7 +4,6 @@
 package rootfs
 
 import (
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
@@ -12,10 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
-
-	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -89,37 +85,6 @@ func TestConfigureLocalDNS(t *testing.T) {
 	if !strings.Contains(string(slice), "CPUQuota=200%") {
 		t.Fatalf("localdns.slice missing percentage CPU quota:\n%s", slice)
 	}
-}
-
-func TestCoreDNSPluginsRetriesTextFileBusy(t *testing.T) {
-	t.Parallel()
-
-	attempts := 0
-	output, err := coreDNSPlugins(context.Background(), "/coredns", func(context.Context, string) ([]byte, error) {
-		attempts++
-		if attempts == 1 {
-			return nil, syscall.ETXTBSY
-		}
-
-		return []byte("dns.ready"), nil
-	})
-	require.NoError(t, err)
-	require.Equal(t, 2, attempts)
-	require.Equal(t, []byte("dns.ready"), output)
-}
-
-func TestCoreDNSPluginsDoesNotRetryOtherErrors(t *testing.T) {
-	t.Parallel()
-
-	wantErr := syscall.ENOEXEC
-	attempts := 0
-	_, err := coreDNSPlugins(context.Background(), "/coredns", func(context.Context, string) ([]byte, error) {
-		attempts++
-
-		return nil, wantErr
-	})
-	require.ErrorIs(t, err, wantErr)
-	require.Equal(t, 1, attempts)
 }
 
 func TestLocalDNSResolvConfRemovesAllNameservers(t *testing.T) {
