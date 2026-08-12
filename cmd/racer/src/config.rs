@@ -62,9 +62,9 @@ fn bad(msg: impl Into<String>) -> io::Error {
 // --- Live: the reload primitive ---
 
 /// A value the control thread replaces and every worker reads without a lock. A read is a
-/// single acquire load; the replaced value lives one more generation, since
-/// [`Runtime::reload`] blocks until every core cut over and the previous value retired, so
-/// a second install cannot retire a value in use. Do not hold the reference across reload.
+/// single acquire load; the replaced value lives until its published configuration retires,
+/// since [`Runtime::reload`] blocks until every core cuts over. Do not hold the reference
+/// across reload.
 ///
 /// [`Runtime::reload`]: crate::runtime::Runtime::reload
 pub(crate) struct Live<T> {
@@ -92,6 +92,11 @@ impl<T> Live<T> {
         let mut prev = self.prev.lock().unwrap();
         // `old` may still be held by an in-flight request; `prev` was retired last reload.
         *prev = Some(unsafe { Box::from_raw(old) });
+    }
+
+    /// Drop the replaced value after the runtime has drained its configuration guards.
+    pub(crate) fn retire(&self) {
+        self.prev.lock().unwrap().take();
     }
 }
 
@@ -2629,6 +2634,9 @@ universe 1 epoch=1 fabric_device_id=9
         next.generation = 8;
         live.install(next);
         assert_eq!(live.get().generation, 8);
+        assert!(live.prev.lock().unwrap().is_some());
+        live.retire();
+        assert!(live.prev.lock().unwrap().is_none());
         let mut third = sample();
         third.generation = 9;
         live.install(third);

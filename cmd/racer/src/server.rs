@@ -47,6 +47,12 @@ pub struct Dataplane {
     devices: Vec<(u32, Export)>,
 }
 
+impl Drop for Dataplane {
+    fn drop(&mut self) {
+        self.paxos.retire_links();
+    }
+}
+
 impl Dataplane {
     fn alloc(&self) -> &'static Allocator {
         self.paxos.alloc()
