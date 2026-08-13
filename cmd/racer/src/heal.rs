@@ -17,8 +17,8 @@ use crate::config::{self, Config, GroupId};
 use crate::fabric::{self, Bucket, Class as Klass, Cmd, Footer, GroupIx, Link, Seq};
 use crate::layout::{Class, Entry};
 use crate::paxos::{Ballot, Paxos, Register};
-use crate::runtime::{self, PoolBuf};
-use crate::server;
+use crate::runtime::{self, CoreId, PoolBuf};
+use crate::server::{self, Server};
 
 /// Maps a page address to its consensus group; the slab holds no config to do it with.
 pub(crate) type Groups<'a> = dyn Fn(u64) -> GroupId + 'a;
@@ -411,8 +411,11 @@ pub struct Stats {
     pub dropped: u64,
 }
 
+/// One worker's share of the sweep: what it is doing, when it last did it, and where it
+/// had got to. Lives in that worker's [`server::CoreState`], so no cell here is ever
+/// reachable from another core and none of it needs to be shared.
 #[derive(Default)]
-struct Core {
+pub(crate) struct Core {
     /// One sweep at a time per core: a job still running declines the next tick.
     busy: Cell<bool>,
     last: Cell<Option<Instant>>,
@@ -423,16 +426,15 @@ struct Core {
 
 pub struct Heal {
     paxos: &'static Paxos,
-    cores: Box<[Core]>,
 }
 
-// SAFETY: as `Paxos`. Every cell is touched only by the core that owns it: the core
-// `tick` ran on, which is the core the spawned job stays on.
-unsafe impl Sync for Heal {}
+pub fn open(paxos: &'static Paxos, _cores: usize) -> &'static Heal {
+    Box::leak(Box::new(Heal { paxos }))
+}
 
-pub fn open(paxos: &'static Paxos, cores: usize) -> &'static Heal {
-    let cores = (0..cores).map(|_| Core::default()).collect();
-    Box::leak(Box::new(Heal { paxos, cores }))
+/// This worker's row, for the length of one synchronous step.
+fn here<T>(f: impl FnOnce(&Core) -> T) -> T {
+    runtime::here::<Server, T>(|ctx| f(&ctx.state().heal))
 }
 
 impl Heal {
@@ -442,7 +444,7 @@ impl Heal {
 
     /// This core's counters; the exporter publishes a row per core and sums them.
     pub fn local_stats(&self) -> Stats {
-        *self.cores[runtime::core()].stats.borrow()
+        here(|c| *c.stats.borrow())
     }
 
     /// Groups being replayed into, and groups still holding registers they were moved out
@@ -465,39 +467,60 @@ impl Heal {
     }
 
     fn stat(&self, f: impl FnOnce(&mut Stats)) {
-        f(&mut self.cores[runtime::core()].stats.borrow_mut());
+        here(|c| f(&mut c.stats.borrow_mut()));
     }
 
     /// Spawns a sweep; `Handler::tick` is synchronous. Declines under rate pressure, since
     /// the device budget is the write path's too. Free-space pressure does not decline:
     /// shedding is where space comes back from, so the sweep runs and skips anti-entropy.
     pub fn tick(&'static self, now: Instant) {
-        let c = &self.cores[runtime::core()];
-        if c.busy.get()
-            || c.last
-                .get()
-                .is_some_and(|t| now.duration_since(t) < INTERVAL)
-        {
+        let due = here(|c| {
+            !c.busy.get()
+                && !c
+                    .last
+                    .get()
+                    .is_some_and(|t| now.duration_since(t) < INTERVAL)
+        });
+        if !due || self.alloc().store_pressed() {
             return;
         }
-        if self.alloc().store_pressed() {
-            return;
-        }
-        c.last.set(Some(now));
-        c.busy.set(true);
+        here(|c| {
+            c.last.set(Some(now));
+            c.busy.set(true);
+        });
+        // The job stays on this core, so it clears the same row it just claimed.
         if !runtime::spawn(async move {
             let _ = self.sweep().await;
-            self.cores[runtime::core()].busy.set(false);
+            here(|c| c.busy.set(false));
         }) {
-            c.busy.set(false);
+            here(|c| c.busy.set(false));
+        }
+    }
+
+    /// The next group `core` owns with live members, advancing that core's cursor past
+    /// it. `None` once the scan comes back around having found none.
+    fn next_group(&self, cfg: &Config, core: CoreId, c: &Core, groups: u32) -> Option<GroupId> {
+        let cores = runtime::cores();
+        let start = c.next.get();
+        let mut n = start;
+        loop {
+            if let Some(cand) = group_at(cfg, n)
+                && cand.index() as usize % cores == core.index()
+                && self.paxos.members(cand).is_some()
+            {
+                c.next.set((n + 1) % groups);
+                return Some(cand);
+            }
+            n = (n + 1) % groups;
+            if n == start {
+                return None;
+            }
         }
     }
 
     /// One group per sweep, both classes, one peer. Everything past the first frame needs
     /// a digest mismatch, so a converged cluster pays one MERKLE per group and class.
     async fn sweep(&'static self) -> Result<(), Status> {
-        let core = runtime::core();
-        let c = &self.cores[core];
         let cfg = server::config();
         let groups = total_groups(&cfg);
         if groups == 0 {
@@ -517,37 +540,25 @@ impl Heal {
         // Pick a group whose paxos core is this one, so `repair` and the allocator shard
         // are local. A group already replaying goes first; round-robin alone would give
         // it one budget every `groups / cores` intervals.
-        let cores = self.cores.len();
-        let g;
-        match self
+        let g = match self
             .paxos
             .replaying_here()
             .into_iter()
             .find(|&g| self.paxos.members(g).is_some())
         {
-            Some(r) => g = r,
+            Some(r) => r,
+            // The cursor is this core's, so finding a group and advancing past it is one
+            // step: two sweeps must not pick up from the same place.
             None => {
-                let start = c.next.get();
-                let mut n = start;
-                loop {
-                    match group_at(&cfg, n) {
-                        Some(cand)
-                            if cand.index() as usize % cores == core
-                                && self.paxos.members(cand).is_some() =>
-                        {
-                            g = cand;
-                            break;
-                        }
-                        _ => {}
-                    }
-                    n = (n + 1) % groups;
-                    if n == start {
-                        return Ok(());
-                    }
+                let picked = runtime::here::<Server, _>(|ctx| {
+                    self.next_group(&cfg, ctx.core(), &ctx.state().heal, groups)
+                });
+                match picked {
+                    Some(g) => g,
+                    None => return Ok(()),
                 }
-                c.next.set((n + 1) % groups);
             }
-        }
+        };
 
         self.stat(|s| s.sweeps += 1);
         // Replay is sticky: one repaired bucket makes our side non-empty, so re-detection

@@ -1029,8 +1029,7 @@ impl Sim {
         // `attach` runs on the control thread in production and touches no worker state,
         // so it needs no `Local`.
         let dp: *const () = Box::leak(Box::new(node.attach(&cfgr, cfg)?)) as *const _ as *const ();
-        // SAFETY: `dp` is the `Dataplane` just leaked above, live for the rest of the run.
-        let rows = SERVER.core_state(unsafe { &*(dp as *const server::Dataplane) }, cores);
+        let rows = cfgr.take_core_state::<server::CoreState>();
         let n = &mut self.nodes[i];
         for (c, row) in rows.into_iter().enumerate() {
             workers.at(c).publish(1, dp);

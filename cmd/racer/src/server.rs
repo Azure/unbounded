@@ -176,6 +176,8 @@ impl Node {
         }
 
         // Point of no return: nothing past here can fail on a reload.
+        // A reload opens nothing, so it offers no rows: a core keeps what it owns
+        // across one.
         let paxos = match self.paxos.get() {
             Some(&p) => p,
             None => {
@@ -190,6 +192,7 @@ impl Node {
                 let p = paxos::open(alloc, cache, cores);
                 let _ = self.paxos.set(p);
                 let _ = self.heal.set(heal::open(p, cores));
+                c.core_state(CoreState::all(cores));
                 p
             }
         };
@@ -221,6 +224,7 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
     metrics::init(cores);
     let cache = cache::open(alloc, &cfg, cores);
     let paxos = paxos::open(alloc, cache, cores);
+    c.core_state(CoreState::all(cores));
     Ok(Dataplane {
         roster: cache::Roster::of(&cfg),
         config: cfg,
@@ -233,19 +237,30 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
 }
 
 /// The state one worker owns outright: shards, cache slots and consensus rows that no
-/// other core may touch. Reached only through `runtime::with_core`, and never swapped, so
-/// a reload replaces what a core reads and not what it owns.
+/// other core may touch. Reached only through [`runtime::with_core`], and never swapped,
+/// so a reload replaces what a core reads and not what it owns.
 ///
-/// Empty for now; the subsystems move their per-core rows in here.
-pub struct CoreState {}
+/// The subsystems are still moving in; what is here needs no lock, no atomic and no
+/// `unsafe impl Sync`, because a `&` to it is only ever handed out by the worker that
+/// owns it, for a transaction that cannot await.
+pub struct CoreState {
+    pub(crate) heal: heal::Core,
+}
+
+impl CoreState {
+    /// One row per worker, in worker order.
+    pub(crate) fn all(cores: usize) -> Vec<CoreState> {
+        (0..cores)
+            .map(|_| CoreState {
+                heal: heal::Core::default(),
+            })
+            .collect()
+    }
+}
 
 impl Handler for Server {
     type Config = Dataplane;
     type CoreState = CoreState;
-
-    fn core_state(&'static self, _cfg: &Dataplane, cores: usize) -> Vec<CoreState> {
-        (0..cores).map(|_| CoreState {}).collect()
-    }
 
     async fn handle(&'static self, cfg: Cfg<Dataplane>, req: Request) -> Result<(), Errno> {
         if req.dev & FABRIC_TAG != 0 {
