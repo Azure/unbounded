@@ -477,8 +477,97 @@ func TestAdoptImageGenerationContinuesTheSequence(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
+	// A restart that finds the same devices has nothing new to say, so it must
+	// not advance the generation: readers treat an advance as "re-read and redo
+	// your work".
+	if got := readSet(t, next.cfg.ImageDevicesPath).Generation; got != 1 {
+		t.Fatalf("generation after an unchanged restart = %d, want 1", got)
+	}
+
+	grown := imageVolumeRoles([]*corev1.PersistentVolume{
+		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
+		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
+		imagePV("gantry-image-segment-1", racerctrl.ImageRoleSegment),
+	})
+
+	next.reconcileImageVolumes(imageCluster(1, 2), grown)
+
+	for _, member := range next.image.members {
+		present(t, member.DeviceID)
+	}
+
+	if err := next.publishImageDevices(); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
 	if got := readSet(t, next.cfg.ImageDevicesPath).Generation; got != 2 {
 		t.Fatalf("generation = %d, want 2", got)
+	}
+}
+
+// A node that loses every image device must say so. The reader keeps serving the
+// last set it loaded when the file disappears, and the minors a stale set names
+// get reused for other volumes, so the retraction has to be published.
+func TestPublishRetractsAMapWhenEveryDeviceGoesAway(t *testing.T) {
+	dir := t.TempDir()
+	agent := newImageAgent(t, dir)
+
+	roles := imageVolumeRoles([]*corev1.PersistentVolume{
+		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
+		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
+	})
+
+	agent.reconcileImageVolumes(imageCluster(1, 1), roles)
+
+	for _, member := range agent.image.members {
+		present(t, member.DeviceID)
+	}
+
+	if err := agent.publishImageDevices(); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if got := readSet(t, agent.cfg.ImageDevicesPath); len(got.Segments) != 1 {
+		t.Fatalf("segments = %d, want 1", len(got.Segments))
+	}
+
+	// The volumes are gone, and so are the devices behind them.
+	for _, member := range agent.image.members {
+		if err := os.Remove(blockDevicePath(member.DeviceID)); err != nil {
+			t.Fatalf("remove device: %v", err)
+		}
+	}
+
+	agent.reconcileImageVolumes(racerctrl.ClusterState{}, nil)
+
+	if err := agent.publishImageDevices(); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	got := readSet(t, agent.cfg.ImageDevicesPath)
+	if got.Generation != 2 {
+		t.Fatalf("generation = %d, want 2", got.Generation)
+	}
+
+	if got.Catalog.Device != "" || len(got.Segments) != 0 {
+		t.Fatalf("map was not retracted: %+v", got)
+	}
+}
+
+// Absence is a better answer than an empty map on a node that never had an image
+// device, so nothing is written until there is something to say.
+func TestPublishWritesNothingBeforeAnyDeviceExists(t *testing.T) {
+	dir := t.TempDir()
+	agent := newImageAgent(t, dir)
+
+	agent.reconcileImageVolumes(racerctrl.ClusterState{}, nil)
+
+	if err := agent.publishImageDevices(); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if _, err := os.Stat(agent.cfg.ImageDevicesPath); !os.IsNotExist(err) {
+		t.Fatalf("stat = %v, want not exist", err)
 	}
 }
 

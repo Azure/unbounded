@@ -1242,6 +1242,10 @@ fn rollback<C>(ctx: &mut Ctx<C>) {
     for slot in new_devs {
         if let Some(pos) = c.vols.iter().position(|v| v.slot == slot) {
             let dev_id = c.vols[pos].dev_id;
+            // Safe to wait here, unlike in `reap` and `teardown`: this build never
+            // reached `start_dev`, so the minor has no gendisk and therefore no consumer
+            // outside this process. Waiting frees the minor now rather than leaving it
+            // pinned until the kernel gets round to it.
             let _ = c.ctl().del_dev(dev_id);
             c.vols.remove(pos);
         }
@@ -1292,12 +1296,16 @@ fn reclaim<C>(ctx: &mut Ctx<C>) {
         .map(|v| (v.slot, v.dev_id))
         .collect();
     for (slot, dev_id) in dead_vols {
-        // DEL_DEV blocks on the last char-device reference; workers dropped theirs on
-        // drain.
+        // Drop our own char-device handle; workers dropped theirs on drain. That is all
+        // we control: the block device may still be open by a consumer outside this
+        // process, and a synchronous DEL_DEV would park the configuration thread in the
+        // kernel until that consumer let go. Nothing here is allowed to wait on someone
+        // else's file descriptor, so ask asynchronously and let the kernel free the
+        // minor whenever the last holder closes.
         if let Some(v) = c.vols.iter_mut().find(|v| v.slot == slot) {
             v.cdev = None;
         }
-        let _ = c.ctl().del_dev(dev_id);
+        let _ = c.ctl().del_dev_async(dev_id);
         c.dev_used[slot as usize] = false;
         c.vols.retain(|v| v.slot != slot);
     }
@@ -1327,12 +1335,15 @@ fn teardown<C>(ctx: &mut Ctx<C>) -> std::io::Result<()> {
     ctx.hub.broadcast(|_, ack| Ctl::Shutdown(ack));
 
     let mut c = ctx.cfgr.core.borrow_mut();
-    // Drop our char-device handles first: DEL_DEV waits for the last reference.
+    // Drop our char-device handles first, then ask for the devices to go away without
+    // waiting: a consumer that still has the block device open would otherwise hold
+    // shutdown open indefinitely, and being killed for it leaves the export in a worse
+    // state than letting the kernel reclaim the minor once that consumer closes.
     for v in c.vols.iter_mut() {
         v.cdev = None;
     }
     for (_, dev_id) in live {
-        let _ = c.ctl().del_dev(dev_id);
+        let _ = c.ctl().del_dev_async(dev_id);
     }
     c.vols.clear();
     c.disks.clear();

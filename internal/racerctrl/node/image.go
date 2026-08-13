@@ -221,6 +221,20 @@ func (a *Agent) adoptImageGeneration() {
 	}
 
 	a.imageGeneration = set.Generation
+
+	// Remember what is on disk, not just how far the sequence got. Without this a
+	// restart cannot tell an unchanged map from one it has never written: it would
+	// burn a generation republishing identical content, and worse, a node that
+	// comes back with no image devices would read its own stale file as "nothing
+	// published yet" and leave it there naming minors that have since been reused.
+	set.Generation = 0
+
+	unstamped, err := json.Marshal(set)
+	if err != nil {
+		return
+	}
+
+	a.imagePublished = unstamped
 }
 
 // imageLoop keeps the published image device map in step with what this node
@@ -281,12 +295,14 @@ func (a *Agent) publishImageDevices() error {
 		}
 	}
 
-	// An empty map is not the same as no map. Publishing one would tell the
-	// snapshotter this cluster has an image volume with nothing in it, which
-	// makes every lookup an error rather than a miss.
-	if set.Catalog.Device == "" && len(set.Segments) == 0 {
-		return nil
-	}
+	// An empty map is not the same as no map, so on a node that has never had an
+	// image device there is nothing to say and creating the file only invents a
+	// worse answer than its absence. Once something has been published the empty
+	// map is the only way to take it back: the reader keeps serving the last set
+	// it loaded when the file disappears, and the minors named in a stale set are
+	// reused for other volumes, so leaving it in place would eventually hand the
+	// snapshotter another volume's bytes as if they were layer data.
+	empty := set.Catalog.Device == "" && len(set.Segments) == 0
 
 	data, err := json.Marshal(set)
 	if err != nil {
@@ -302,6 +318,10 @@ func (a *Agent) publishImageDevices() error {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if empty && a.imagePublished == nil {
+		return nil
+	}
 
 	if string(data) == string(a.imagePublished) {
 		return nil
