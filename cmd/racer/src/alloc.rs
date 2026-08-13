@@ -1188,16 +1188,17 @@ impl Allocator {
         group: GroupId,
         huge: bool,
         filter: heal::Filter,
-    ) -> Result<u32, Status> {
+    ) -> Result<Snapshot, Status> {
         let class = class_of(huge);
         let core = self.owner_of(group, class);
-        at(core, move |c| {
+        let id = at(core, move |c| {
             let now = runtime::now();
             c.shard
                 .snap_start(class, core.index(), huge, group, filter, now)
                 .ok_or(Status::NoSpace)
         })
-        .await
+        .await?;
+        Ok(Snapshot { alloc: self, id })
     }
 
     /// Next chunk. Bounded by entries scanned as well as tuples produced, so a sparse
@@ -1292,6 +1293,52 @@ impl Allocator {
                 .set_occ(occ_per_core(cfg.policy.occ_bytes, self.cores));
             c.shard.set_recoverable(cfg.peer_count() > 0);
         });
+    }
+}
+
+// ------------------------------------------------------------------- enumeration
+
+/// An open walk over a group's registers.
+///
+/// A cursor defers reclamation on the slab it is walking, and a slab holds only so many
+/// at once, so one abandoned part-way costs both until its deadline passes. Every local
+/// reader takes a chunk in a loop and gives up on the first error, which used to leave
+/// the cursor open for a whole timeout each time a peer went quiet mid-walk.
+///
+/// A cursor handed to the wire is a different thing and leaves through
+/// [`into_wire`](Self::into_wire): the peer that asked for it owns it from then on, and
+/// the deadline is what covers a peer that never comes back to close it.
+#[must_use = "an open cursor defers reclamation on its slab until it is closed"]
+pub struct Snapshot {
+    alloc: &'static Allocator,
+    id: u32,
+}
+
+impl Snapshot {
+    /// The next chunk, and whether it was the last.
+    pub async fn next(&self) -> Result<(Vec<Tuple>, bool), Status> {
+        self.alloc.snap_next(self.id, None, None).await
+    }
+
+    /// Close the walk, resuming reclamation once this was the last cursor out.
+    pub async fn close(self) {
+        let me = std::mem::ManuallyDrop::new(self);
+        me.alloc.snap_release(me.id).await;
+    }
+
+    /// Give the cursor to whoever asked for it over the wire, along with the closing.
+    pub fn into_wire(self) -> u32 {
+        let me = std::mem::ManuallyDrop::new(self);
+        me.id
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        let (alloc, id) = (self.alloc, self.id);
+        // Detached, because a destructor cannot await. If the slab has no room the cursor
+        // waits out its deadline, which is what abandoning one did every time before this.
+        let _ = runtime::spawn(async move { alloc.snap_release(id).await });
     }
 }
 

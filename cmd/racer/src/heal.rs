@@ -631,10 +631,10 @@ impl Heal {
         filter: Filter,
         zone: u32,
     ) -> Result<(), Status> {
-        let id = self.alloc().snap_open(group, huge, filter).await?;
+        let snap = self.alloc().snap_open(group, huge, filter).await?;
         let mut sent = 0usize;
         loop {
-            let (tuples, done) = self.alloc().snap_next(id, None, None).await?;
+            let (tuples, done) = snap.next().await?;
             for (addr, r) in tuples {
                 let _ = self.paxos.push(GlobalAddr(addr), r, zone).await;
                 sent += 1;
@@ -643,7 +643,7 @@ impl Heal {
                 break;
             }
         }
-        self.alloc().snap_release(id).await;
+        snap.close().await;
         Ok(())
     }
 
@@ -691,10 +691,10 @@ impl Heal {
         huge: bool,
         budget: &mut usize,
     ) -> Result<(), Status> {
-        let id = self.alloc().snap_open(group, huge, Filter::All).await?;
+        let snap = self.alloc().snap_open(group, huge, Filter::All).await?;
         let mut walked = false;
         while *budget > 0 {
-            let (tuples, done) = self.alloc().snap_next(id, None, None).await?;
+            let (tuples, done) = snap.next().await?;
             for (addr, r) in tuples {
                 if *budget == 0 {
                     break;
@@ -712,7 +712,7 @@ impl Heal {
                 break;
             }
         }
-        self.alloc().snap_release(id).await;
+        snap.close().await;
         // Only a full pass proves the group is empty, and `forget` re-checks anyway.
         if walked {
             self.alloc().forget_group(group, huge).await;
@@ -882,14 +882,14 @@ impl Heal {
         huge: bool,
         bucket: u16,
     ) -> Result<Option<BTreeMap<u64, Register>>, Status> {
-        let id = self
+        let snap = self
             .alloc()
             .snap_open(group, huge, Filter::Bucket(bucket))
             .await?;
         let mut out = BTreeMap::new();
         let mut over = false;
         loop {
-            let (tuples, done) = self.alloc().snap_next(id, None, None).await?;
+            let (tuples, done) = snap.next().await?;
             for (addr, r) in tuples {
                 out.insert(addr, r);
             }
@@ -901,7 +901,7 @@ impl Heal {
                 break;
             }
         }
-        self.alloc().snap_release(id).await;
+        snap.close().await;
         Ok((!over).then_some(out))
     }
 }
