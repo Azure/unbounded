@@ -34,7 +34,6 @@ type healthState struct {
 	leaderElectionName    string
 	isLeader              atomic.Bool
 	controllerReady       atomic.Bool
-	endpointPublished     atomic.Bool
 	podIP                 string // from POD_IP env var, for EndpointSlice management
 	podName               string
 	podUID                types.UID
@@ -159,7 +158,6 @@ func (h *healthState) setLeader(leader bool) {
 	wasLeader := h.isLeader.Swap(leader)
 	if !leader || !wasLeader {
 		h.controllerReady.Store(false)
-		h.endpointPublished.Store(false)
 	}
 
 	if leader {
@@ -203,22 +201,25 @@ func (h *healthState) isHealthy(_ context.Context) bool {
 	return err == nil
 }
 
+// readinessStatus reports whether this process can serve, and why not when it
+// cannot.
+//
+// This is the kubelet readiness probe, so it deliberately answers a
+// process-level question rather than "is this pod the warmed-up leader".
+// Gating it on leadership or on site controller cache sync deadlocks the
+// install: net is deployed before the machina CRDs exist, so the site
+// controller blocks in WaitForCacheSync on sites.unbounded-cloud.io, the pod
+// never turns Ready, and the Deployment rollout never completes. It would also
+// hold every standby replica NotReady forever, since only one pod holds the
+// lease.
+//
+// Whether the controller is functionally ready for admission traffic is
+// answered instead by the Service endpoint, which is published only after the
+// site controller has seeded its allocators (see setControllerReady).
 func (h *healthState) readinessStatus(_ context.Context) (bool, string) {
 	ready, reason := h.tokenAuthStatus()
 	if !ready {
 		return false, fmt.Sprintf("token verifier not ready: %s", reason)
-	}
-
-	if !h.isLeader.Load() {
-		return false, "not the leader"
-	}
-
-	if !h.controllerReady.Load() {
-		return false, "site controller not ready"
-	}
-
-	if !h.endpointPublished.Load() {
-		return false, "service endpoint not published"
 	}
 
 	_, err := h.clientset.Discovery().ServerVersion()
@@ -229,8 +230,7 @@ func (h *healthState) readinessStatus(_ context.Context) (bool, string) {
 	return true, "ok"
 }
 
-// isReady returns true if this instance is the functionally ready leader and
-// auth and Kubernetes API checks pass.
+// isReady returns true if auth and Kubernetes API checks pass.
 func (h *healthState) isReady(ctx context.Context) bool {
 	ready, _ := h.readinessStatus(ctx)
 
@@ -366,14 +366,8 @@ func (h *healthState) publishServiceEndpoints(ctx context.Context) {
 		h.endpointMu.Unlock()
 
 		if err == nil {
-			if ctx.Err() != nil || !h.isLeader.Load() || !h.controllerReady.Load() {
-				return
-			}
-
-			h.endpointPublished.Store(true)
 			klog.V(3).Infof("Updated service endpoints to leader IP %s", h.podIP)
 		} else {
-			h.endpointPublished.Store(false)
 			klog.Errorf("Failed to update service endpoints, retrying: %v", err)
 		}
 

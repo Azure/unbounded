@@ -255,8 +255,6 @@ func TestRegisterProbeHandlers(t *testing.T) {
 		tokenAuth: &tokenAuthenticator{tokenReviewer: k8sfake.NewClientset()},
 	}
 	health.setLeader(true)
-	health.controllerReady.Store(true)
-	health.endpointPublished.Store(true)
 	registerProbeHandlers(mux, health)
 
 	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -275,22 +273,15 @@ func TestRegisterProbeHandlers(t *testing.T) {
 		t.Fatalf("expected /readyz to return 200, got %d body=%q", readyResp.Code, readyResp.Body.String())
 	}
 
+	// A standby replica still has to pass its readiness probe, otherwise the
+	// Deployment could never finish rolling out.
 	health.setLeader(false)
 
 	readyResp = httptest.NewRecorder()
 	mux.ServeHTTP(readyResp, readyReq)
 
-	if readyResp.Code != http.StatusServiceUnavailable || !strings.Contains(readyResp.Body.String(), "not the leader") {
-		t.Fatalf("expected /readyz to report leadership failure, got %d body=%q", readyResp.Code, readyResp.Body.String())
-	}
-
-	health.setLeader(true)
-
-	readyResp = httptest.NewRecorder()
-	mux.ServeHTTP(readyResp, readyReq)
-
-	if readyResp.Code != http.StatusServiceUnavailable || !strings.Contains(readyResp.Body.String(), "site controller not ready") {
-		t.Fatalf("expected /readyz to report controller readiness failure, got %d body=%q", readyResp.Code, readyResp.Body.String())
+	if readyResp.Code != http.StatusOK {
+		t.Fatalf("expected /readyz to return 200 for a non-leader, got %d body=%q", readyResp.Code, readyResp.Body.String())
 	}
 }
 

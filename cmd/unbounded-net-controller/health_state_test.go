@@ -98,8 +98,6 @@ func TestHealthStateHelpersAndLeaderInfo(t *testing.T) {
 	}
 
 	h.setLeader(true)
-	h.controllerReady.Store(true)
-	h.endpointPublished.Store(true)
 
 	if !h.isReady(context.Background()) {
 		t.Fatalf("expected ready with fake discovery server version")
@@ -129,8 +127,6 @@ func TestHealthStateReadinessFailure(t *testing.T) {
 		tokenAuth: &tokenAuthenticator{tokenReviewer: client},
 	}
 	h.setLeader(true)
-	h.controllerReady.Store(true)
-	h.endpointPublished.Store(true)
 
 	if h.isHealthy(context.Background()) {
 		t.Fatalf("expected isHealthy=false when discovery version lookup fails")
@@ -141,34 +137,36 @@ func TestHealthStateReadinessFailure(t *testing.T) {
 	}
 }
 
-func TestHealthStateReadinessRequiresLeaderAndController(t *testing.T) {
+// TestHealthStateReadinessIsIndependentOfLeadership pins the readiness contract
+// that the Deployment rollout depends on.
+//
+// The kubelet readiness probe must not wait for leadership or for the site
+// controller to sync. Net is installed before the machina CRDs exist, so the
+// site controller blocks in WaitForCacheSync on sites.unbounded-cloud.io; if
+// readiness waited on that, the pod would never turn Ready and the controller
+// rollout would time out. Standby replicas would never be Ready either.
+func TestHealthStateReadinessIsIndependentOfLeadership(t *testing.T) {
 	client := k8sfake.NewClientset()
 	h := &healthState{
 		clientset: client,
 		tokenAuth: &tokenAuthenticator{tokenReviewer: client},
 	}
 
-	if ready, reason := h.readinessStatus(context.Background()); ready || reason != "not the leader" {
-		t.Fatalf("expected not-leader readiness failure, got ready=%v reason=%q", ready, reason)
+	// Neither the leader nor functionally ready: still Ready to the kubelet.
+	if ready, reason := h.readinessStatus(context.Background()); !ready || reason != "ok" {
+		t.Fatalf("readinessStatus = %v (%q), want ready before leadership and cache sync", ready, reason)
 	}
 
 	h.setLeader(true)
 
-	if ready, reason := h.readinessStatus(context.Background()); ready || reason != "site controller not ready" {
-		t.Fatalf("expected controller readiness failure, got ready=%v reason=%q", ready, reason)
-	}
-
-	h.controllerReady.Store(true)
-	h.endpointPublished.Store(true)
-
 	if ready, reason := h.readinessStatus(context.Background()); !ready || reason != "ok" {
-		t.Fatalf("expected ready leader, got ready=%v reason=%q", ready, reason)
+		t.Fatalf("readinessStatus = %v (%q), want ready as a leader that has not synced yet", ready, reason)
 	}
 
 	h.setLeader(false)
 
 	if h.controllerReady.Load() {
-		t.Fatalf("expected leadership loss to clear controller readiness")
+		t.Fatal("expected leadership loss to clear controller readiness")
 	}
 }
 
@@ -231,10 +229,6 @@ func TestRunAsLeaderPublishesEndpointsAfterReadyAndRetries(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for createAttempts.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
-	}
-
-	if h.endpointPublished.Load() {
-		t.Fatal("endpoint publication failure made the controller ready")
 	}
 
 	deadline = time.Now().Add(time.Second)
