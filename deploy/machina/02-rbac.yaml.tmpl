@@ -12,9 +12,13 @@ metadata:
   name: machina-controller
   namespace: {{ default "unbounded-system" .Namespace }}
 rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # No ConfigMap rule here on purpose. The machina controller reads exactly one
+  # ConfigMap, kube-root-ca.crt in kube-public (cluster_info.go), through the
+  # uncached clientset, and that is covered by the cluster-wide configmaps get
+  # in the ClusterRole below. machina-config reaches the pod as a volume mount,
+  # which needs no RBAC, and leader election uses Leases. Granting namespaced
+  # ConfigMap write here would let a compromised machina controller write
+  # operator-owned ConfigMaps in this namespace.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

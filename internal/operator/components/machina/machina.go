@@ -13,6 +13,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -44,7 +45,7 @@ func (Component) ConditionType() string { return "MachinaReady" }
 
 // Reconcile deploys the machina controller singleton whenever any Site enables
 // it and keeps an existing installation reconciled when none do.
-func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
+func (c Component) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	enabled := false
 
 	for i := range sites {
@@ -60,30 +61,59 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		// controllers/RBAC; a future explicit uninstall flow should handle it.
 		retained, err := resourcesExist(ctx, env)
 		if err != nil {
-			return component.Failed(err)
+			return nil, component.Result{}, err
 		}
 
 		if !retained {
-			return component.Disabled("no site enables machina; retained")
+			return nil, component.Disabled("no site enables machina; retained"), nil
 		}
 	}
 
-	configHash, err := ensureConfig(ctx, env)
+	configHash, configOp, err := planConfig(ctx, env)
 	if err != nil {
-		return component.Failed(err)
+		return nil, component.Result{}, err
 	}
 
-	if err := env.ApplyManifestFS(ctx, machinamanifests.Manifests, applyMutator(env.Config, configHash)); err != nil {
-		return component.Failed(err)
+	objects, err := env.DecodeManifestFS(machinamanifests.Manifests, applyMutator(env.Config, configHash))
+	if err != nil {
+		return nil, component.Result{}, err
 	}
 
-	return component.Reconciled()
+	plan := component.NewPlan()
+
+	var dependsOn []component.ObjectRef
+
+	if configOp != nil {
+		plan.Add(*configOp)
+
+		dependsOn = []component.ObjectRef{configOp.Ref()}
+	}
+
+	for _, obj := range objects {
+		op := component.Operation{
+			Kind:      component.OpApply,
+			Object:    obj,
+			Component: c.Name(),
+		}
+
+		if obj.GetKind() == "Deployment" && obj.GetName() == controllerName {
+			op.Overridable = true
+			op.DependsOn = dependsOn
+		}
+
+		plan.Add(op)
+	}
+
+	return plan, component.Reconciled(), nil
 }
 
 // SetupWatches reconciles machina on changes to its config payload and on
 // create/delete/generation changes of its controller Deployment.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
-	b.Watches(&corev1.ConfigMap{}, env.RequestSingletonAndAllSites(),
+	// The singleton request already fans out to every Site, so enqueuing
+	// the Sites as well would run one redundant pass per Site for a single
+	// ConfigMap edit.
+	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName))))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
@@ -152,10 +182,18 @@ func applyMutator(cfg component.Config, configHash string) func(*unstructured.Un
 	}
 }
 
-func ensureConfig(ctx context.Context, env *component.Env) (string, error) {
+// planConfig hashes the machina config payload and returns the operation that
+// reconciles it, if one is needed.
+//
+// Machina is the only component that edits an existing payload: it merges the
+// operator-resolved apiServerEndpoint into user-owned config content, leaving
+// every other key untouched. That is a create when nothing exists and an
+// optimistic-lock merge patch when something does, so a concurrent edit
+// produces a conflict and the pass retries rather than clobbering.
+func planConfig(ctx context.Context, env *component.Env) (string, *component.Operation, error) {
 	desired, err := env.DefaultConfigMap(machinamanifests.Manifests, configName, "machina")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	key := client.ObjectKeyFromObject(desired)
@@ -165,41 +203,49 @@ func ensureConfig(ctx context.Context, env *component.Env) (string, error) {
 	if apierrors.IsNotFound(err) {
 		config, mergeErr := SetAPIServerEndpoint(desired.Data["config.yaml"], env.Config.APIServerEndpoint)
 		if mergeErr != nil {
-			return "", mergeErr
+			return "", nil, mergeErr
 		}
 
 		desired.Data["config.yaml"] = config
-		if createErr := env.Client.Create(ctx, desired); createErr != nil {
-			return "", fmt.Errorf("create machina config %s/%s: %w", key.Namespace, key.Name, createErr)
-		}
 
-		return component.ConfigMapPayloadHash(desired), nil
+		return component.ConfigMapPayloadHash(desired), &component.Operation{
+			Kind:      component.OpCreateIfAbsent,
+			Object:    component.ToUnstructured(desired),
+			Component: Component{}.Name(),
+		}, nil
 	}
 
 	if err != nil {
-		return "", fmt.Errorf("get machina config %s/%s: %w", key.Namespace, key.Name, err)
+		return "", nil, fmt.Errorf("get machina config %s/%s: %w", key.Namespace, key.Name, err)
 	}
 
 	config := existing.Data["config.yaml"]
 
 	merged, err := SetAPIServerEndpoint(config, env.Config.APIServerEndpoint)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	if merged != config {
-		before := existing.DeepCopy()
-		if existing.Data == nil {
-			existing.Data = map[string]string{}
-		}
-
-		existing.Data["config.yaml"] = merged
-
-		patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
-		if err := env.Client.Patch(ctx, existing, patch); err != nil {
-			return "", fmt.Errorf("update machina config %s/%s: %w", key.Namespace, key.Name, err)
-		}
+	if merged == config {
+		return component.ConfigMapPayloadHash(existing), nil, nil
 	}
 
-	return component.ConfigMapPayloadHash(existing), nil
+	// Client.Get strips TypeMeta, so restore it before converting to
+	// unstructured; the apiserver needs the GVK to route the patch.
+	existing.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
+
+	before := existing.DeepCopy()
+
+	if existing.Data == nil {
+		existing.Data = map[string]string{}
+	}
+
+	existing.Data["config.yaml"] = merged
+
+	return component.ConfigMapPayloadHash(existing), &component.Operation{
+		Kind:      component.OpMergePatch,
+		Object:    component.ToUnstructured(existing),
+		Base:      component.ToUnstructured(before),
+		Component: Component{}.Name(),
+	}, nil
 }

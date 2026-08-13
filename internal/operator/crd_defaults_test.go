@@ -117,3 +117,40 @@ func findSiteCRD(t *testing.T) *apiextensionsv1.CustomResourceDefinition {
 
 	return nil
 }
+
+// TestSiteMustBeClusterScopedForTheScopedCache pins the invariant that the
+// operator's cache scoping silently depends on.
+//
+// The manager's cache is scoped to the operator's own namespace
+// (cmd/unbounded-operator/main.go), because otherwise it runs informers over
+// every ConfigMap, Deployment and DaemonSet in the cluster to read the handful
+// that live in one namespace.
+//
+// component.Env.ListSites performs an unscoped List, and it has to: every pass
+// fans out over the result and every component decides whether it is enabled by
+// inspecting it. Under a scoped cache, controller-runtime routes that List by
+// the kind's scope. A cluster-scoped kind goes to a separate cluster-wide cache
+// and returns everything. A namespaced kind returns only the scoped namespaces,
+// and crucially returns no error while doing it (see
+// multi_namespace_cache.go: the NamespaceAll path unions namespaceToCache
+// rather than failing).
+//
+// So if Site ever became namespaced, ListSites would quietly return only the
+// Sites in the operator's namespace. Every other Site would lose its per-Site
+// metalman and storage workloads, the cluster components would conclude they
+// were disabled, and nothing anywhere would report a problem. That is a
+// cluster-wide outage produced by a one-line marker change in another package,
+// which is why it is asserted here rather than left to a code comment.
+func TestSiteMustBeClusterScopedForTheScopedCache(t *testing.T) {
+	crd := findSiteCRD(t)
+
+	if crd.Spec.Scope != apiextensionsv1.ClusterScoped {
+		t.Fatalf("sites.unbounded-cloud.io is %q, want %q.\n\n"+
+			"The operator's manager cache is scoped to a single namespace, and "+
+			"component.Env.ListSites lists Sites without a namespace. A namespaced Site "+
+			"makes that list silently return only the Sites in the operator's namespace, "+
+			"with no error, and every other Site loses its per-Site workloads.\n\n"+
+			"If Site must become namespaced, ListSites and the cache scoping have to change together.",
+			crd.Spec.Scope, apiextensionsv1.ClusterScoped)
+	}
+}

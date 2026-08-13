@@ -38,6 +38,16 @@ func SystemNamespace() string {
 	return systemNamespace
 }
 
+// ReservedPrefix marks the labels and annotations the operator owns on the
+// objects it manages. They carry config hashes, Site scoping and override
+// visibility, so a user patch may not write them and a change to one is drift
+// the operator must repair.
+//
+// It lives here rather than beside the override allowlist because both the
+// allowlist and the workload watch predicates need it, and the override package
+// already depends on the component package that holds those predicates.
+const ReservedPrefix = "unbounded-cloud.io/"
+
 const (
 	// LegacyKubeNamespace is where machina, metalman, and storage ran before
 	// the consolidation onto SystemNamespace().

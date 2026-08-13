@@ -37,6 +37,7 @@ func TestE2E_LeaseLifecycle(t *testing.T) {
 	t.Cleanup(func() {
 		tdCtx, tdCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer tdCancel()
+
 		h.teardown(tdCtx)
 	})
 
@@ -74,6 +75,7 @@ func TestE2E_LeaseLifecycle(t *testing.T) {
 			"either ingest never happened (check mirror logs) or the "+
 			"lease creation/labeling path is broken on real containerd", puller)
 	}
+
 	h.waitForPodReady(ctx, "gantry-e2e-lease")
 
 	// Re-list once more and log the observed leases. The leases SHOULD
@@ -87,6 +89,7 @@ func TestE2E_LeaseLifecycle(t *testing.T) {
 		t.Fatalf("gantry leases on %s vanished between observation and pod-ready; "+
 			"this implies an unexpected early release path", puller)
 	}
+
 	t.Logf("observed %d gantry-managed lease(s) on %s after pull (held for TTL by design): %v",
 		len(leases), puller, leases)
 
@@ -113,21 +116,26 @@ func (h *harness) listGantryLeases(ctx context.Context, nodeName string) []strin
 	if err != nil {
 		h.t.Fatalf("list leases on %s: %v", nodeName, err)
 	}
+
 	var ids []string
+
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
 		}
+
 		id := fields[0]
 		if strings.HasPrefix(id, "gantry-") {
 			ids = append(ids, id)
 		}
 	}
+
 	return ids
 }
 
@@ -136,16 +144,19 @@ func (h *harness) listGantryLeases(ctx context.Context, nodeName string) []strin
 // a lease was observed.
 func (h *harness) waitForGantryLease(ctx context.Context, nodeName string, timeout time.Duration) bool {
 	h.t.Helper()
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if leases := h.listGantryLeases(ctx, nodeName); len(leases) > 0 {
 			return true
 		}
+
 		select {
 		case <-ctx.Done():
 			return false
 		case <-time.After(1 * time.Second):
 		}
 	}
+
 	return false
 }

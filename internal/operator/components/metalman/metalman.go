@@ -40,27 +40,57 @@ func (Component) Enabled(site *unboundedv1alpha3.Site) bool {
 	return unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Metalman.SiteComponentSpec)
 }
 
-// Reconcile deploys the per-site metalman PXE controller and its RBAC.
-func (Component) Reconcile(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) component.Result {
-	if err := env.ApplyManifestFS(ctx, machinamanifests.Manifests, mutateSupportObject); err != nil {
-		return component.Failed(err)
+// Plan deploys the per-site metalman PXE controller and its RBAC.
+//
+// The support RBAC ships in the machina manifest set and is identical for every
+// Site, so it carries a shared key and the executor writes it once per pass
+// rather than once per Site.
+func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
+	if err != nil {
+		return nil, component.Result{}, err
 	}
 
-	if err := env.ApplyObject(ctx, deployment(site, env.Namespace, env.Config)); err != nil {
-		return component.Failed(err)
+	plan := component.NewPlan()
+
+	for _, obj := range support {
+		plan.Add(component.Operation{
+			Kind:      component.OpApply,
+			Object:    obj,
+			Component: c.Name(),
+			Site:      site.Name,
+			SharedKey: sharedSupportKey(obj),
+		})
 	}
 
-	return component.Reconciled()
+	plan.Add(component.Operation{
+		Kind:        component.OpApply,
+		Object:      component.ToUnstructured(deployment(site, env.Namespace, env.Config)),
+		Component:   c.Name(),
+		Site:        site.Name,
+		Overridable: true,
+	})
+
+	return plan, component.Reconciled(), nil
 }
 
-// Cleanup removes the per-site metalman Deployment. The shared metalman RBAC is
-// left in place; it is harmless when unreferenced and may still be used by other
-// sites.
-func (Component) Cleanup(ctx context.Context, env *component.Env, site *unboundedv1alpha3.Site) error {
-	return env.DeleteIfExists(ctx, &appsv1.Deployment{
+// CleanupPlan removes the per-site metalman Deployment. The shared metalman
+// RBAC is left in place; it is harmless when unreferenced and may still be used
+// by other sites.
+func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	plan := component.NewPlan()
+	plan.Add(component.DeleteOperation(&appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: DeploymentName(site.Name), Namespace: env.Namespace},
-	})
+	}, c.Name(), site.Name))
+
+	return plan, component.Disabled("component disabled"), nil
+}
+
+// sharedSupportKey identifies a support object across Sites. The objects are
+// byte-identical for every Site, so the key is just their identity.
+func sharedSupportKey(obj *unstructured.Unstructured) string {
+	return "metalman/support/" + component.RefOf(obj).String()
 }
 
 // SetupWatches recreates the per-site Deployment if it is deleted or drifts, via

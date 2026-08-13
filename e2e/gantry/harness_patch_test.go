@@ -36,12 +36,14 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("filepath.Abs: %v", err)
 	}
+
 	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "daemonset.yaml"))
 	if err != nil {
 		t.Fatalf("read daemonset.yaml: %v", err)
 	}
 
 	const e2eTag = "gantry:e2e-test-fixture"
+
 	patched, err := patchDaemonSetForE2E(string(raw), e2eTag)
 	if err != nil {
 		t.Fatalf("patchDaemonSetForE2E: %v", err)
@@ -52,6 +54,7 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 	if !strings.Contains(patched, "image: "+e2eTag) {
 		t.Errorf("patched manifest missing 'image: %s'; gantry container was not retargeted", e2eTag)
 	}
+
 	if strings.Contains(patched, "image: ghcr.io/vpatelsj/gantry:latest") {
 		t.Errorf("patched manifest still contains the production gantry image reference; the swap did not apply to the gantry container")
 	}
@@ -71,9 +74,11 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 	// swap leaked across containers.
 	neverCount := strings.Count(patched, "imagePullPolicy: Never")
 	ifNotPresentCount := strings.Count(patched, "imagePullPolicy: IfNotPresent")
+
 	if neverCount != 1 {
 		t.Errorf("imagePullPolicy=Never count = %d, want exactly 1 (only the gantry container should be Never)", neverCount)
 	}
+
 	if ifNotPresentCount != 1 {
 		t.Errorf("imagePullPolicy=IfNotPresent count = %d, want exactly 1 (the busybox initContainer must keep IfNotPresent so kind can pull it)", ifNotPresentCount)
 	}
@@ -86,6 +91,7 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 	if busyboxIdx < 0 {
 		t.Fatalf("patched: busybox not found")
 	}
+
 	after := patched[busyboxIdx:]
 	// Find the next imagePullPolicy line after the busybox image
 	// line.
@@ -98,6 +104,7 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 	if nl := strings.IndexByte(policyLine, '\n'); nl >= 0 {
 		policyLine = policyLine[:nl]
 	}
+
 	if !strings.Contains(policyLine, "IfNotPresent") {
 		t.Errorf("busybox initContainer policy line = %q, want it to retain 'IfNotPresent' (the previous bug set busybox to Never which fails on kind because busybox is not preloaded)", policyLine)
 	}
@@ -120,6 +127,7 @@ func TestPatchDaemonSetForE2E_FailsLoudWhenAnchorMissing(t *testing.T) {
 	if err == nil {
 		t.Fatalf("patchDaemonSetForE2E returned nil error on a manifest missing the gantry anchor; want a loud error so the harness aborts before kubectl apply")
 	}
+
 	if !strings.Contains(err.Error(), "anchor not found") {
 		t.Errorf("error message = %q, want it to mention 'anchor not found' so the operator knows to update gantryContainerAnchor", err.Error())
 	}
@@ -141,6 +149,7 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("filepath.Abs: %v", err)
 	}
+
 	raw, err := os.ReadFile(filepath.Join(repoRoot, "deploy", "configmap.yaml"))
 	if err != nil {
 		t.Fatalf("read configmap.yaml: %v", err)
@@ -156,6 +165,7 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 	if !strings.Contains(patched, `name: "registry.k8s.io"`) {
 		t.Errorf("patched ConfigMap missing the e2e registry.k8s.io registry entry")
 	}
+
 	if !strings.Contains(patched, `endpoint: "https://registry.k8s.io"`) {
 		t.Errorf("patched ConfigMap missing the registry.k8s.io endpoint")
 	}
@@ -178,6 +188,7 @@ func TestPatchConfigMapForE2E_RewritesUpstreamRegistries(t *testing.T) {
 	if strings.Contains(patched, `# credentials_path: "/etc/gantry/registry/registry.example.com"`) {
 		t.Errorf("patched ConfigMap still contains the commented credentials_path for registry.example.com; the upstream_registries swap did not remove the whole entry")
 	}
+
 	if strings.Contains(patched, `credentials_path: "/etc/gantry/registry/ghcr.io"`) {
 		t.Errorf("patched ConfigMap still contains the credentials_path for ghcr.io; the upstream_registries swap did not remove the whole alternative entry")
 	}
@@ -197,6 +208,7 @@ func TestPatchConfigMapForE2E_FailsLoudWhenAnchorMissing(t *testing.T) {
 	if err == nil {
 		t.Fatalf("patchConfigMapForE2E returned nil error on a manifest missing the upstream_registries anchor; want a loud error so the harness aborts before kubectl apply")
 	}
+
 	if !strings.Contains(err.Error(), "anchor not found") {
 		t.Errorf("error message = %q, want it to mention 'anchor not found' so the operator knows to update configMapUpstreamRegistriesAnchor", err.Error())
 	}

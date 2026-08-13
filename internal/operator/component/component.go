@@ -17,7 +17,7 @@ import (
 // tied to a single Site, so it also runs on the Site-less pass (a Site deletion
 // or a managed singleton-resource event).
 //
-// Reconcile runs on every pass and must be idempotent. A not-ready Result does
+// Plan runs on every pass and must be idempotent. A not-ready Result does
 // not by itself schedule a retry: the driver requeues on Result.Err or after
 // Result.RequeueAfter, otherwise the component only re-runs when one of the
 // watches it registers via WatchProvider fires. On the Site-less pass there is
@@ -33,19 +33,27 @@ type ClusterComponent interface {
 	// unique within a Registry.
 	ConditionType() string
 
-	// Reconcile drives the component to its desired state given every Site and
-	// reports the outcome.
-	Reconcile(ctx context.Context, env *Env, sites []unboundedv1alpha3.Site) Result
+	// Plan computes the operations that would drive the component to its
+	// desired state given every Site, and reports the planning verdict.
+	//
+	// Planning may read cluster state, because decisions like "does this
+	// ConfigMap already exist" and "is this singleton retained" depend on it.
+	// Planning must not write: that is the executor's job, and it is what lets
+	// a pass validate everything before anything is written.
+	//
+	// The Result carries verdicts only planning can reach, such as Disabled or
+	// NoSites. The driver folds execution outcomes into it.
+	Plan(ctx context.Context, env *Env, sites []unboundedv1alpha3.Site) (*Plan, Result, error)
 }
 
 // SiteComponent is a per-Site unit of desired state (for example metalman or
 // storage). The SiteReconciler runs it only when a Site is present, so
-// Reconcile and Cleanup always receive a non-nil Site. The driver owns the
-// enable/disable branch: it calls Reconcile when Enabled reports true and
-// Cleanup when it reports false (or the Site is deleted via owner-reference
+// Plan and CleanupPlan always receive a non-nil Site. The driver owns the
+// enable/disable branch: it calls Plan when Enabled reports true and
+// CleanupPlan when it reports false (or the Site is deleted via owner-reference
 // garbage collection).
 //
-// Reconcile runs on every Site event and must be idempotent. To self-heal owned
+// Plan runs on every Site event and must be idempotent. To self-heal owned
 // resources on drift or deletion, set a controller owner reference (see
 // Env.SiteOwnerReference) and register Owns via WatchProvider; a not-ready
 // Result requeues only through Result.Err or Result.RequeueAfter.
@@ -60,11 +68,14 @@ type SiteComponent interface {
 	// Enabled reports whether the component should run for the Site.
 	Enabled(site *unboundedv1alpha3.Site) bool
 
-	// Reconcile applies the component's desired state for the Site.
-	Reconcile(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) Result
+	// Plan computes the operations that would apply the component's desired
+	// state for the Site. The same read-not-write rule as ClusterComponent.Plan
+	// applies.
+	Plan(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) (*Plan, Result, error)
 
-	// Cleanup removes the component's per-Site resources when it is disabled.
-	Cleanup(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) error
+	// CleanupPlan computes the operations that remove the component's per-Site
+	// resources when it is disabled.
+	CleanupPlan(ctx context.Context, env *Env, site *unboundedv1alpha3.Site) (*Plan, Result, error)
 }
 
 // WatchProvider is implemented by a ClusterComponent or SiteComponent that owns
@@ -82,6 +93,28 @@ type WatchProvider interface {
 type Registry struct {
 	Cluster []ClusterComponent
 	Site    []SiteComponent
+}
+
+// Knows reports whether a component name belongs to this registry.
+//
+// The executor also runs operations no component owns, such as the namespace
+// every component installs into. Their results are attributed to a name the
+// registry does not know, so nothing publishing per-component conditions can
+// report them, and without this the reconciler had no way to notice.
+func (r *Registry) Knows(name string) bool {
+	for _, c := range r.Cluster {
+		if c.Name() == name {
+			return true
+		}
+	}
+
+	for _, c := range r.Site {
+		if c.Name() == name {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Validate rejects an empty registry and duplicate Name or ConditionType values

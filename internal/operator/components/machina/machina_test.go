@@ -218,7 +218,7 @@ func TestEnsureConfigUpdatesEndpointAndPreservesData(t *testing.T) {
 		Config:    component.Config{APIServerEndpoint: "https://new.example:6443"},
 	}
 
-	hash, err := ensureConfig(t.Context(), env)
+	hash, _, err := ensureConfig(t, env)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -282,11 +282,24 @@ func TestEnsureConfigOptimisticConflictReloadsFreshState(t *testing.T) {
 	})
 	env := &component.Env{Client: cl, Namespace: component.DefaultNamespace, Config: component.Config{APIServerEndpoint: "https://new.example:6443"}}
 
-	if _, err := ensureConfig(t.Context(), env); !apierrors.IsConflict(err) {
-		t.Fatalf("first ensureConfig error = %v, want conflict", err)
+	// Losing the optimistic lock is the mechanism working, not a failure. The
+	// pass defers the write and asks to run again; reporting it as an error
+	// would gate the component's later tiers and turn every Site's condition
+	// False for the second it takes to re-plan.
+	_, exec, err := ensureConfig(t, env)
+	if err != nil {
+		t.Fatalf("a lost optimistic lock must not be a reconcile error: %v", err)
 	}
 
-	if _, err := ensureConfig(t.Context(), env); err != nil {
+	if len(exec.Deferred) != 1 {
+		t.Fatalf("deferred = %v, want the conflicted patch deferred to the next pass", exec.Deferred)
+	}
+
+	if deferred := exec.DeferredResults(); len(deferred) != 1 || !apierrors.IsConflict(deferred[0].Err) {
+		t.Fatalf("deferred results = %+v, want one carrying the conflict", deferred)
+	}
+
+	if _, _, err := ensureConfig(t, env); err != nil {
 		t.Fatalf("retry ensureConfig: %v", err)
 	}
 
@@ -310,7 +323,7 @@ func TestReconcileRetainedWithNoEnablingSitesUpdatesConfigAndHash(t *testing.T) 
 	env, appliedHashes := retainedEnv(t, config)
 	env.Config.APIServerEndpoint = "https://new.example:6443"
 
-	res := Component{}.Reconcile(t.Context(), env, nil)
+	res := reconcile(t, env, nil)
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
@@ -334,7 +347,7 @@ func TestReconcileRetainedWithNoEnablingSitesUpdatesConfigAndHash(t *testing.T) 
 func TestReconcileDoesNotCreateFromNothingWithNoEnablingSites(t *testing.T) {
 	env, appliedHashes := retainedEnv(t)
 
-	res := Component{}.Reconcile(t.Context(), env, nil)
+	res := reconcile(t, env, nil)
 	if !res.Ready || res.Reason != component.ReasonDisabled {
 		t.Fatalf("Reconcile = %+v, want ready with Disabled", res)
 	}
@@ -348,7 +361,7 @@ func TestReconcileDoesNotCreateFromNothingWithNoEnablingSites(t *testing.T) {
 func TestReconcileAppliesWhenSiteEnables(t *testing.T) {
 	env, appliedHashes := retainedEnv(t)
 
-	res := Component{}.Reconcile(t.Context(), env, []unboundedv1alpha3.Site{*siteEnabling("edge")})
+	res := reconcile(t, env, []unboundedv1alpha3.Site{*siteEnabling("edge")})
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
@@ -402,4 +415,134 @@ func retainedEnv(t *testing.T, objects ...client.Object) (*component.Env, map[st
 		Build()
 
 	return &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}, appliedHashes
+}
+
+// ensureConfig plans and executes the machina config operation, mirroring what
+// the reconciler does so these tests exercise the production path, including
+// the optimistic-lock conflict the merge patch can produce.
+func ensureConfig(t *testing.T, env *component.Env) (string, component.ExecutionResult, error) {
+	t.Helper()
+
+	hash, op, err := planConfig(t.Context(), env)
+	if err != nil {
+		return "", component.ExecutionResult{}, err
+	}
+
+	if op == nil {
+		return hash, component.ExecutionResult{}, nil
+	}
+
+	plan := component.NewPlan()
+	plan.Add(*op)
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return "", component.ExecutionResult{}, err
+	}
+
+	return hash, exec, exec.Err()
+}
+
+// reconcile plans and executes the component, mirroring the reconciler.
+func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
+	t.Helper()
+
+	c := Component{}
+
+	plan, res, err := c.Plan(t.Context(), env, sites)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	// machina is a cluster component and plans no per-Site operations, so there
+	// is no Site to attribute results to.
+	return component.CombineResult(c.Name(), "", res, exec)
+}
+
+// TestPlanGolden pins the complete set of operations the machina component
+// plans.
+//
+// The metalman RBAC that also ships in the machina manifest set must not appear
+// here: the metalman component owns and applies it. The reaper gates its
+// migration on the controller Deployment's config-hash annotation
+// (internal/operator/migrate.go), so an object or annotation silently
+// appearing, disappearing or being renamed here breaks the upgrade path.
+func TestPlanGolden(t *testing.T) {
+	env := &component.Env{
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteEnabling("edge")})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	want := `CreateIfAbsent ConfigMap/unbounded-system/machina-config
+Apply ServiceAccount/unbounded-system/machina-controller
+Apply Role/unbounded-system/machina-controller
+Apply RoleBinding/unbounded-system/machina-controller
+Apply ClusterRole/machina-controller
+Apply ClusterRoleBinding/machina-controller
+Apply Deployment/unbounded-system/machina-controller [overridable] [after ConfigMap/unbounded-system/machina-config]
+Apply Service/unbounded-system/machina-controller
+Apply ClusterRole/unbounded-daemon-controller-machine
+Apply ClusterRoleBinding/unbounded-daemon-controller-machine
+Apply ClusterRoleBinding/unbounded-bootstrapper-node
+Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestExecutionOrderGolden pins what the executor runs, as distinct from what
+// the component emits. Summary renders emission order; the executor sorts a
+// copy, so nothing pinned the order the cluster actually sees until this
+// existed, and it was changed twice without a test noticing.
+func TestExecutionOrderGolden(t *testing.T) {
+	env := &component.Env{
+		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		Namespace: component.DefaultNamespace,
+	}
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteEnabling("edge")})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	got, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	// Identity, then the config the Deployment mounts, then the Deployment,
+	// then the Service that fronts it.
+	want := `Apply ServiceAccount/unbounded-system/machina-controller
+Apply Role/unbounded-system/machina-controller
+Apply RoleBinding/unbounded-system/machina-controller
+Apply ClusterRole/machina-controller
+Apply ClusterRoleBinding/machina-controller
+Apply ClusterRole/unbounded-daemon-controller-machine
+Apply ClusterRoleBinding/unbounded-daemon-controller-machine
+Apply ClusterRoleBinding/unbounded-bootstrapper-node
+Apply ClusterRoleBinding/unbounded-bootstrapper-node-autoapprove
+CreateIfAbsent ConfigMap/unbounded-system/machina-config
+Apply Service/unbounded-system/machina-controller
+Apply Deployment/unbounded-system/machina-controller
+`
+
+	if got != want {
+		t.Fatalf("execution order =\n%s\nwant\n%s", got, want)
+	}
 }
