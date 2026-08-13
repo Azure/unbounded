@@ -43,8 +43,21 @@ macro_rules! maps {
     };
 }
 
-/// A durable page whose entry is not installed yet; the ticket never leaves the allocator.
+/// A durable page whose entry is not installed yet: a slot held, bytes on the device, and
+/// nothing in the index pointing at either.
+///
+/// It carries the address it was opened for, so the only thing that can be committed or
+/// given back is the thing that was reserved. Passing the address again would let a caller
+/// name a different one, and the failure is silent both ways: the checksum of a 4 KiB page
+/// is seeded with its address, and a 4 MiB page has no checksum to disagree.
+///
+/// Holding one is an obligation. It cannot be copied, so it cannot be settled twice, and
+/// it is `#[must_use]` so dropping one is at least deliberate. Rust cannot make a
+/// destructor await, so the slot behind a dropped token is leaked until restart; the
+/// index model counts that as a leak rather than pretending it cannot happen.
+#[must_use = "a pending page holds a slot until it is committed or given back"]
 pub struct Pending {
+    addr: GlobalAddr,
     class: Class,
     ticket: Ticket,
     crc: u32,
@@ -411,6 +424,7 @@ impl Allocator {
         .await?;
         let crc = self.write_page(addr, class, t, page).await?;
         Ok(Pending {
+            addr,
             class,
             ticket: t,
             crc,
@@ -465,18 +479,17 @@ impl Allocator {
             .await
             .is_err()
         {
-            self.abandon(
+            self.abandon(Pending {
                 addr,
-                Pending {
-                    class,
-                    ticket: t,
-                    crc: 0,
-                },
-            )
+                class,
+                ticket: t,
+                crc: 0,
+            })
             .await;
             return Err(Status::Io);
         }
         Ok(Pending {
+            addr,
             class,
             ticket: t,
             crc: 0,
@@ -485,8 +498,8 @@ impl Allocator {
 
     /// Install a staged entry, now that a quorum holds the value. A refusal means our row
     /// moved while the peers were answering, so the version is not ours to report.
-    pub async fn finish(&'static self, addr: GlobalAddr, p: Pending) -> Result<u64, Status> {
-        let (class, t, crc) = (p.class, p.ticket, p.crc);
+    pub async fn finish(&'static self, p: Pending) -> Result<u64, Status> {
+        let (addr, class, t, crc) = (p.addr, p.class, p.ticket, p.crc);
         let owner = self.owner(addr, class);
         let done = runtime::on_core(owner, move || async move {
             self.commit(addr, class, t, crc).await
@@ -500,8 +513,8 @@ impl Allocator {
     }
 
     /// Give the slot back: this proposal never reached a quorum.
-    pub async fn abandon(&'static self, addr: GlobalAddr, p: Pending) {
-        let (class, t) = (p.class, p.ticket);
+    pub async fn abandon(&'static self, p: Pending) {
+        let (addr, class, t) = (p.addr, p.class, p.ticket);
         let owner = self.owner(addr, class);
         runtime::on_core(owner, move || async move { self.unreserve(class, t) }).await;
     }
@@ -662,6 +675,7 @@ impl Allocator {
         })
         .await;
         Ok(full.map(|ticket| Pending {
+            addr,
             class,
             ticket,
             crc: 0,
