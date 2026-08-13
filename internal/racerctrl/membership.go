@@ -64,6 +64,22 @@ const (
 	// nothing left to shed.
 	MembershipDrainingKey = "draining"
 
+	// MembershipCatalogKey is the ConfigMap key holding the zone's catalog: the
+	// groups themselves, as `c0:c1:c2` trios separated by commas.
+	//
+	// The catalog is published rather than derived from the member list because
+	// membership now moves one group slot at a time. A catalog rebuilt from a
+	// member list is a function of that list alone, so adding one node would
+	// reshuffle every group that node's position touches; publishing it means a
+	// step moves exactly the slots it says it moves and nothing else. At the
+	// default 2520 groups this is around 30 KiB, well inside the ConfigMap
+	// limit.
+	//
+	// A zone published before this key existed has no catalog. The first pass
+	// seeds one from the membership already in force, which reproduces exactly
+	// what every node was deriving for itself, so nothing moves.
+	MembershipCatalogKey = "catalog"
+
 	// MembershipUniverseLabel carries the universe id, so the operator can list
 	// a universe's membership maps without knowing which zones exist.
 	MembershipUniverseLabel = AnnotationDomain + "universe-id"

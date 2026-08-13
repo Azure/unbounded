@@ -5,7 +5,6 @@ package racerctrl
 
 import (
 	"fmt"
-	"sort"
 
 	racerconfig "github.com/Azure/unbounded/api/racer"
 )
@@ -172,36 +171,13 @@ func validateCatalog(universe *racerconfig.Universe) error {
 		}
 	}
 
-	// R3's balance rule. Every named node holds exactly the same share of the
-	// groups, so a lost node costs every survivor the same amount of replay.
-	// Stated as a divisibility requirement because an unbalanced catalog has no
-	// correct answer, only a least-bad one.
-	total := Cohorts * len(catalog)
-	if total%len(counts) != 0 {
-		return fmt.Errorf(
-			"catalog names %d nodes across %d groups; %d does not divide %d",
-			len(counts), len(catalog), len(counts), total,
-		)
-	}
-
-	share := total / len(counts)
-
-	ids := make([]uint32, 0, len(counts))
-	for id := range counts {
-		ids = append(ids, id)
-	}
-
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
-	for _, id := range ids {
-		if counts[id] != share {
-			return fmt.Errorf(
-				"node %d holds %d of %d groups, not the balanced share of %d",
-				id, counts[id], len(catalog), share,
-			)
-		}
-	}
-
+	// Balance is where the planner is going, not a rule about where it may
+	// stand. A zone grows and shrinks by moving one group at a time, so every
+	// state between two balanced catalogs is unbalanced by construction, and
+	// refusing those would mean a zone could only ever change by replacing a
+	// node with another. What matters instead is that a named node holds
+	// something, which is what the loop above already establishes: a node named
+	// nowhere is not in counts, and a node in counts holds at least one group.
 	return nil
 }
 
@@ -630,19 +606,14 @@ func ValidateTransition(prev, next *racerconfig.NodeConfig) error {
 		)
 	}
 
-	// A step is the transition between consecutive generations. Anything wider is
-	// a node that missed generations, and the schema holds such a node to no
-	// per-step rule: it is being handed a settled state, not a step.
-	step := next.GetGeneration() == prev.GetGeneration()+1
-
-	if err := validateUniverseTransitions(prev, next, step); err != nil {
+	if err := validateUniverseTransitions(prev, next); err != nil {
 		return err
 	}
 
 	return validateDeviceTransitions(prev, next)
 }
 
-func validateUniverseTransitions(prev, next *racerconfig.NodeConfig, step bool) error {
+func validateUniverseTransitions(prev, next *racerconfig.NodeConfig) error {
 	before := indexUniverses(prev)
 
 	// Extent identity is global, not per universe: R2 allocates extent ids from
@@ -693,10 +664,8 @@ func validateUniverseTransitions(prev, next *racerconfig.NodeConfig, step bool) 
 			)
 		}
 
-		if step {
-			if err := validateMembershipStep(old, universe); err != nil {
-				return err
-			}
+		if err := validateMembershipStep(old, universe); err != nil {
+			return err
 		}
 
 		if err := validateExtentTransitions(old, universe); err != nil {
@@ -720,28 +689,41 @@ func extentUniverses(cfg *racerconfig.NodeConfig) map[uint32]uint32 {
 	return homes
 }
 
-// validateMembershipStep enforces R6's membership rule: between consecutive
-// generations a catalog's membership changes by at most one id. The dataplane
-// heals by handing one node's groups to one other node; two changes at once
-// would leave a group with no surviving replica to replay from.
+// validateMembershipStep enforces the two rules that bound a membership change.
+//
+// The first is per group: at most one of a group's three nodes may change. The
+// two that stayed hold every version the group ever agreed, so they can serve
+// reads while the newcomer replays from them. A group that changed two nodes is
+// running on one copy. A group that changed all three has no copy at all and,
+// worse, reports itself healthy, because three empty replicas agree with each
+// other and anti-entropy only ever runs between a group's current members.
+//
+// The second is per zone: at most one id joins the catalog and at most one
+// leaves. That is not a durability rule - the first one covers durability - but
+// it bounds how much of the zone is replaying onto a single node at once, and
+// it is what makes a departure something the control plane can wait on.
 func validateMembershipStep(old, next *racerconfig.Universe) error {
-	before := catalogMembers(old)
-	after := catalogMembers(next)
+	before := CatalogOf(old.GetCatalog())
+	after := CatalogOf(next.GetCatalog())
 
-	var joined, left int
+	if len(before) != len(after) {
+		// The caller has already refused a resize; this only guards the index.
+		return fmt.Errorf(
+			"universe %d catalog resized from %d groups to %d; len(catalog) is fixed for the life of a zone",
+			next.GetId(), len(before), len(after),
+		)
+	}
 
-	for id := range after {
-		if _, ok := before[id]; !ok {
-			joined++
+	for i := range after {
+		if survivors := after[i].Survivors(before[i]); survivors < Quorum {
+			return fmt.Errorf(
+				"universe %d group %d kept only %d of its %d nodes; a group must keep a quorum across a generation",
+				next.GetId(), i, survivors, Cohorts,
+			)
 		}
 	}
 
-	for id := range before {
-		if _, ok := after[id]; !ok {
-			left++
-		}
-	}
-
+	joined, left := membershipDelta(before.Members(), after.Members())
 	if joined > 1 || left > 1 {
 		return fmt.Errorf(
 			"universe %d catalog changed by %d joins and %d departures in one generation; at most one of each is allowed",
@@ -752,42 +734,23 @@ func validateMembershipStep(old, next *racerconfig.Universe) error {
 	return nil
 }
 
-// TransitionStride is how far a node's generation has to advance to get from
-// prev to next.
-//
-// Consecutive generations are a step, and a step is held to R6's one-in-one-out
-// rule because the dataplane heals a step by handing one node's groups to one
-// other node. A wider change is not a transient it can reason about, so it is
-// delivered as a settled state instead, by skipping a generation: a node that
-// missed a generation is being told where the universe ended up rather than how
-// it got there.
-//
-// A catalog resize is the case that needs it. Its move is one node per cohort,
-// which is three joins and three departures at once, and publishing that at the
-// next generation is rejected by both this package and the dataplane, so the
-// catalog would never resize at all.
-//
-// The decision is made by asking the step validator, so the stride and the rule
-// it exists to satisfy cannot drift apart.
-func TransitionStride(prev, next *racerconfig.NodeConfig) uint64 {
-	if prev == nil {
-		return 1
-	}
+// membershipDelta counts how many ids one membership gained and lost.
+func membershipDelta(before, after Membership) (int, int) {
+	var joined, left int
 
-	before := indexUniverses(prev)
-
-	for _, universe := range next.GetUniverses() {
-		old, ok := before[universe.GetId()]
-		if !ok {
-			continue
-		}
-
-		if validateMembershipStep(old, universe) != nil {
-			return 2
+	for _, member := range after {
+		if !before.Contains(member.NodeID) {
+			joined++
 		}
 	}
 
-	return 1
+	for _, member := range before {
+		if !after.Contains(member.NodeID) {
+			left++
+		}
+	}
+
+	return joined, left
 }
 
 func validateExtentTransitions(old, next *racerconfig.Universe) error {

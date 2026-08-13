@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	racerconfig "github.com/Azure/unbounded/api/racer"
 )
@@ -266,127 +267,284 @@ func largestDivisorAtMost(n, limit int) int {
 	return 0
 }
 
-// MembershipStep is one move toward a desired membership.
+// MembershipStep is one move toward the membership a zone's nodes describe.
 //
-// How far a node's generation advances to take the move is not decided here:
-// the nodes derive it from the configs themselves with TransitionStride, which
-// is a fact each node can work out for itself and get right after a restart.
+// A step is always exactly one generation. The rule a step has to keep is per
+// group, not per catalog: every group keeps at least two of the three nodes it
+// named, so the two that stayed can serve reads and replay the one that
+// arrived. Moving a whole catalog at once, however few ids it changed, is what
+// leaves a group with nothing to replay from.
 type MembershipStep struct {
-	// Next is the membership to publish.
+	// Next is the membership to publish. It is exactly the set of nodes Catalog
+	// names, with each node's cohort being the column it occupies.
 	Next Membership
 
-	// Done reports that Next already is the desired membership.
+	// Catalog is the group assignment to publish. It is published rather than
+	// derived because deriving it from the member list means every membership
+	// change reshuffles every group, and a reshuffle is exactly what the
+	// per-group rule forbids.
+	Catalog Catalog
+
+	// Done reports that nothing is left to move.
 	Done bool
 
 	// Draining are the nodes the catalog no longer names but which have not yet
 	// handed over what they held. They keep deriving the universe, with
 	// themselves absent from its catalog, because that configuration is what
-	// makes racer shed. PlanMembership fills this; NextMembership does not.
+	// makes racer shed.
 	Draining Membership
+
+	// Reason says what the step is doing, for the operator's wait message.
+	Reason string
+
+	// Seeded reports that Catalog is the catalog the zone's nodes were already
+	// deriving for themselves, written down for the first time. Nothing about
+	// the universe changes, so the step keeps the epoch it is published under
+	// rather than spending a new one.
+	Seeded bool
 }
 
-// NextMembership advances current one step toward desired.
-//
-// Consecutive generations may differ by at most one id, so ordinary churn is a
-// sequence of single swaps: the newcomer inherits the departing node's groups,
-// replays them, and the departing node drops what it held once the new members
-// confirm. Resizing the catalog cannot be expressed that way - it moves three
-// nodes at once, one per cohort - so it is delivered as a whole new settled
-// state, and the caller is expected to have quiesced the universe first.
-func NextMembership(current, desired Membership, catalogSize int) (MembershipStep, error) {
-	currentPer, currentErr := current.PerCohort()
+// Group is one catalog entry: the three nodes that hold a group, one per
+// cohort. Position is normative, so a group is an array and not a set.
+type Group [Cohorts]uint32
 
-	desiredPer, desiredErr := desired.PerCohort()
-	if desiredErr != nil {
-		return MembershipStep{}, fmt.Errorf("desired membership: %w", desiredErr)
+// Contains reports whether a node holds this group.
+func (g Group) Contains(nodeID uint32) bool {
+	for _, id := range g {
+		if id == nodeID {
+			return true
+		}
 	}
 
-	// No usable current membership: this universe has not been published to this
-	// zone before, so there is no handoff to be incremental about.
-	if currentErr != nil || currentPer == 0 {
-		return MembershipStep{Next: desired.Normalized()}, nil
-	}
+	return false
+}
 
-	if sameMembership(current, desired) {
-		return MembershipStep{Next: current.Normalized(), Done: true}, nil
-	}
-
-	if currentPer != desiredPer {
-		return MembershipStep{Next: desired.Normalized()}, nil
-	}
-
-	// Same size, different members: swap exactly one node, keeping cohorts intact
-	// so the catalog stays balanced at every step.
-	currentByCohort := current.Normalized().ByCohort()
-	desiredByCohort := desired.Normalized().ByCohort()
+// Survivors counts how many of a group's nodes are still in another version of
+// the same group. Two is the number that matters: a group that keeps two of
+// three can still reach a quorum and replay the third.
+func (g Group) Survivors(other Group) int {
+	var kept int
 
 	for cohort := range Cohorts {
-		leaving, joining, ok := firstDifference(currentByCohort[cohort], desiredByCohort[cohort])
-		if !ok {
-			continue
+		if g[cohort] != 0 && g[cohort] == other[cohort] {
+			kept++
 		}
+	}
 
-		next := make(Membership, 0, len(current))
+	return kept
+}
 
-		for _, member := range current.Normalized() {
-			if member.NodeID == leaving {
-				next = append(next, Member{NodeID: joining, Cohort: uint32(cohort)})
+// Catalog is a zone's assignment of consensus groups to nodes, published as
+// state rather than derived from the member list.
+//
+// It has to be published. The catalog is what folds a slot onto a group and
+// what every anti-entropy key is drawn from, so recomputing it from a changed
+// member list moves data that had no reason to move, and moves it in every
+// group at once. Published, a membership change is a list of individual slots
+// changing hands, and every group that is not one of them stays exactly where
+// it was.
+type Catalog []Group
 
-				continue
+// Members is the membership a catalog describes: every node it names, in the
+// column it occupies. The column is the cohort, which is why a node may appear
+// in only one of them.
+func (c Catalog) Members() Membership {
+	seen := make(map[uint32]uint32, Cohorts*4)
+
+	for _, group := range c {
+		for cohort := range Cohorts {
+			if group[cohort] != 0 {
+				seen[group[cohort]] = uint32(cohort)
 			}
-
-			next = append(next, member)
 		}
-
-		return MembershipStep{Next: next.Normalized()}, nil
 	}
 
-	return MembershipStep{Next: current.Normalized(), Done: true}, nil
+	members := make(Membership, 0, len(seen))
+	for id, cohort := range seen {
+		members = append(members, Member{NodeID: id, Cohort: cohort})
+	}
+
+	return members.Normalized()
 }
 
-// firstDifference finds the lowest id in current that is absent from desired,
-// paired with the lowest id in desired that is absent from current. Both lists
-// are the same length, so one implies the other.
-func firstDifference(current, desired []uint32) (leaving, joining uint32, ok bool) {
-	inDesired := make(map[uint32]bool, len(desired))
-	for _, id := range desired {
-		inDesired[id] = true
-	}
-
-	inCurrent := make(map[uint32]bool, len(current))
-	for _, id := range current {
-		inCurrent[id] = true
-	}
-
-	for _, id := range current {
-		if !inDesired[id] {
-			leaving = id
-			ok = true
-
-			break
-		}
-	}
-
-	if !ok {
-		return 0, 0, false
-	}
-
-	for _, id := range desired {
-		if !inCurrent[id] {
-			return leaving, id, true
-		}
-	}
-
-	return 0, 0, false
-}
-
-func sameMembership(a, b Membership) bool {
-	if len(a) != len(b) {
+// Equal reports whether two catalogs name the same nodes in the same positions.
+func (c Catalog) Equal(other Catalog) bool {
+	if len(c) != len(other) {
 		return false
 	}
 
-	left := a.Normalized()
-	right := b.Normalized()
+	for i := range c {
+		if c[i] != other[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// Load counts the groups each node holds. This is a node's whole share of the
+// zone: there is no per-node weight anywhere else.
+func (c Catalog) Load() map[uint32]int {
+	load := make(map[uint32]int)
+
+	for _, group := range c {
+		for cohort := range Cohorts {
+			if group[cohort] != 0 {
+				load[group[cohort]]++
+			}
+		}
+	}
+
+	return load
+}
+
+// Column returns the ids holding one cohort's slot in every group, in group
+// order. Rebalancing happens within a column, because a node's cohort is frozen
+// and a column only ever holds nodes of that cohort.
+func (c Catalog) Column(cohort int) []uint32 {
+	ids := make([]uint32, len(c))
+	for i, group := range c {
+		ids[i] = group[cohort]
+	}
+
+	return ids
+}
+
+// Clone returns a copy that can be moved around without disturbing the
+// published one.
+func (c Catalog) Clone() Catalog {
+	out := make(Catalog, len(c))
+	copy(out, c)
+
+	return out
+}
+
+// Trios renders a catalog into the schema's form.
+func (c Catalog) Trios() []*racerconfig.Trio {
+	trios := make([]*racerconfig.Trio, 0, len(c))
+	for _, group := range c {
+		trios = append(trios, &racerconfig.Trio{
+			Cohort_0: group[0],
+			Cohort_1: group[1],
+			Cohort_2: group[2],
+		})
+	}
+
+	return trios
+}
+
+// CatalogOf reads a catalog back out of the schema's form.
+func CatalogOf(trios []*racerconfig.Trio) Catalog {
+	catalog := make(Catalog, 0, len(trios))
+	for _, trio := range trios {
+		catalog = append(catalog, Group{
+			trio.GetCohort_0(), trio.GetCohort_1(), trio.GetCohort_2(),
+		})
+	}
+
+	return catalog
+}
+
+// Validate rejects a catalog racer would refuse: an empty one, a group with a
+// zero id, or a group naming the same node twice.
+func (c Catalog) Validate() error {
+	if len(c) == 0 {
+		return fmt.Errorf("catalog is empty")
+	}
+
+	for i, group := range c {
+		for cohort := range Cohorts {
+			if group[cohort] == 0 {
+				return fmt.Errorf("catalog group %d has no node in cohort %d", i, cohort)
+			}
+		}
+
+		if group[0] == group[1] || group[0] == group[2] || group[1] == group[2] {
+			return fmt.Errorf("catalog group %d names a node twice: %v", i, group)
+		}
+	}
+
+	return nil
+}
+
+// catalogGroupSeparator and catalogNodeSeparator render a catalog compactly:
+// a couple of thousand groups have to fit in one ConfigMap value.
+const (
+	catalogGroupSeparator = ","
+	catalogNodeSeparator  = ":"
+)
+
+// FormatCatalog renders a catalog to its ConfigMap value.
+func FormatCatalog(c Catalog) string {
+	if len(c) == 0 {
+		return ""
+	}
+
+	var builder strings.Builder
+
+	for i, group := range c {
+		if i > 0 {
+			builder.WriteString(catalogGroupSeparator)
+		}
+
+		for cohort := range Cohorts {
+			if cohort > 0 {
+				builder.WriteString(catalogNodeSeparator)
+			}
+
+			builder.WriteString(strconv.FormatUint(uint64(group[cohort]), 10))
+		}
+	}
+
+	return builder.String()
+}
+
+// ParseCatalog reads a catalog back. An empty value is no catalog, not an
+// error: a zone that has never been published has none.
+func ParseCatalog(raw string) (Catalog, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	groups := strings.Split(raw, catalogGroupSeparator)
+	catalog := make(Catalog, 0, len(groups))
+
+	for i, entry := range groups {
+		ids := strings.Split(strings.TrimSpace(entry), catalogNodeSeparator)
+		if len(ids) != Cohorts {
+			return nil, fmt.Errorf("catalog group %d has %d nodes, want %d", i, len(ids), Cohorts)
+		}
+
+		var group Group
+
+		for cohort := range Cohorts {
+			id, err := strconv.ParseUint(strings.TrimSpace(ids[cohort]), 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("catalog group %d cohort %d: %w", i, cohort, err)
+			}
+
+			group[cohort] = uint32(id)
+		}
+
+		catalog = append(catalog, group)
+	}
+
+	if err := catalog.Validate(); err != nil {
+		return nil, err
+	}
+
+	return catalog, nil
+}
+
+// Equal reports whether two memberships name the same nodes in the same
+// cohorts, whatever order they are written in.
+func (m Membership) Equal(other Membership) bool {
+	if len(m) != len(other) {
+		return false
+	}
+
+	left := m.Normalized()
+	right := other.Normalized()
 
 	for i := range left {
 		if left[i] != right[i] {

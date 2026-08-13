@@ -575,12 +575,11 @@ func (a *Agent) render() error {
 		return nil
 	}
 
-	// A membership change wider than one node per catalog cannot be published as
-	// a step, so it takes the generation the schema reserves for a settled
-	// state. Deriving the stride here rather than carrying it from the operator
-	// keeps it correct across a restart: it is a fact about the two configs,
-	// and the node has both.
-	candidate.Generation = a.generation + racerctrl.TransitionStride(a.published, candidate)
+	// Every change the control plane makes is a step, so the generation always
+	// advances by one. Membership moves one group slot at a time and a group
+	// keeps a quorum across a generation, so there is no longer any change too
+	// wide to be published as a transition.
+	candidate.Generation = a.generation + 1
 
 	changed, err := racerctrl.Publish(a.cfg.ConfigPath(), a.published, candidate)
 	if err != nil {

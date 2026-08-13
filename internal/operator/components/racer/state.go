@@ -179,6 +179,7 @@ func (p *pass) writeMembership(
 	ctx context.Context,
 	universe, zone uint32,
 	members, draining racerctrl.Membership,
+	catalog racerctrl.Catalog,
 	epoch uint32,
 ) error {
 	key := membershipKey{universe: universe, zone: zone}
@@ -186,12 +187,14 @@ func (p *pass) writeMembership(
 	desired := map[string]string{
 		racerctrl.MembershipDataKey:     racerctrl.FormatMembership(members),
 		racerctrl.MembershipDrainingKey: racerctrl.FormatMembership(draining),
+		racerctrl.MembershipCatalogKey:  racerctrl.FormatCatalog(catalog),
 		racerctrl.MembershipEpochKey:    formatUint(uint64(epoch)),
 	}
 
 	if item, ok := p.memberships[key]; ok {
 		if item.Data[racerctrl.MembershipDataKey] == desired[racerctrl.MembershipDataKey] &&
 			item.Data[racerctrl.MembershipDrainingKey] == desired[racerctrl.MembershipDrainingKey] &&
+			item.Data[racerctrl.MembershipCatalogKey] == desired[racerctrl.MembershipCatalogKey] &&
 			item.Data[racerctrl.MembershipEpochKey] == desired[racerctrl.MembershipEpochKey] {
 			return nil
 		}
@@ -313,6 +316,11 @@ func (p *pass) loadUniverses(ctx context.Context) error {
 				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
 			}
 
+			catalog, err := racerctrl.ParseCatalog(item.Data[racerctrl.MembershipCatalogKey])
+			if err != nil {
+				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
+			}
+
 			epoch, err := racerctrl.ParseMembershipEpoch(item.Data)
 			if err != nil {
 				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
@@ -320,6 +328,7 @@ func (p *pass) loadUniverses(ctx context.Context) error {
 
 			view.state.Members[key.zone] = members
 			view.state.Draining[key.zone] = draining
+			view.state.Catalogs[key.zone] = catalog
 			view.state.MemberEpochs[key.zone] = epoch
 		}
 	}

@@ -361,7 +361,8 @@ func (p *pass) reconcileMembershipEpochs(ctx context.Context, view *universeView
 			continue
 		}
 
-		err := p.writeMembership(ctx, view.state.ID, zone, members, view.state.Draining[zone], view.state.Epoch)
+		err := p.writeMembership(ctx, view.state.ID, zone, members,
+			view.state.Draining[zone], view.state.Catalogs[zone], view.state.Epoch)
 		if err != nil {
 			return err
 		}
@@ -385,9 +386,11 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 		Universe:    view.state.ID,
 		Epoch:       view.state.EpochFor(zone),
 		CatalogSize: view.state.CatalogSize,
+		Catalog:     view.state.Catalogs[zone],
 		Current:     current,
 		Draining:    draining,
 		Candidates:  candidates,
+		Admissible:  p.admissible(zone),
 		Nodes:       states,
 	})
 	if err != nil {
@@ -398,10 +401,6 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 		p.wait("universe %s zone %d membership: %s", view.class.Name, zone, gate)
 
 		return nil
-	}
-
-	if step.Done {
-		return p.reconcileGateways(ctx, view, zone, current)
 	}
 
 	// The membership itself goes in the zone's own ConfigMap; only the epoch
@@ -418,15 +417,33 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 	// and admit, so dropping an id from it is as much a new configuration as
 	// dropping one from the catalog, and the gate that waits on it needs an
 	// epoch to wait for.
-	epoch := view.state.Epoch + 1
+	//
+	// A pass that only writes down a catalog the zone was already deriving does
+	// not. Nothing about the universe changed, and spending an epoch would make
+	// every zone in the cluster look reconfigured the first time this operator
+	// ran.
+	changed := !step.Next.Equal(current) ||
+		!step.Draining.Equal(draining) ||
+		!step.Catalog.Equal(view.state.Catalogs[zone])
 
-	if err := p.writeMembership(ctx, view.state.ID, zone, step.Next, step.Draining, epoch); err != nil {
+	epoch := view.state.EpochFor(zone)
+	if changed && !step.Seeded {
+		epoch = view.state.Epoch + 1
+	}
+
+	err = p.writeMembership(ctx, view.state.ID, zone, step.Next, step.Draining, step.Catalog, epoch)
+	if err != nil {
 		return err
 	}
 
 	view.state.Members[zone] = step.Next
 	view.state.Draining[zone] = step.Draining
+	view.state.Catalogs[zone] = step.Catalog
 	view.state.MemberEpochs[zone] = epoch
+
+	if !changed || step.Seeded {
+		return p.reconcileGateways(ctx, view, zone, step.Next)
+	}
 
 	err = p.patchClass(ctx, view, map[string]string{
 		racerctrl.EpochAnnotation: formatUint(uint64(epoch)),
@@ -435,8 +452,8 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 		return err
 	}
 
-	p.wait("universe %s zone %d membership stepped to %d nodes, %d draining",
-		view.class.Name, zone, len(step.Next), len(step.Draining))
+	p.wait("universe %s zone %d membership: %s (%d nodes, %d draining)",
+		view.class.Name, zone, step.Reason, len(step.Next), len(step.Draining))
 
 	return p.reconcileGateways(ctx, view, zone, step.Next)
 }
@@ -516,14 +533,35 @@ func (p *pass) zones() []uint32 {
 	return zones
 }
 
-// candidates lists the nodes eligible for a zone's catalog: enrolled, given an
-// identity, and reporting Ready.
+// candidates lists the nodes that belong in a zone: enrolled, and given an
+// identity in it.
 //
-// A NotReady node is excluded so that a machine that has gone away stops being
-// counted, but excluding it only proposes the removal. The removal itself still
-// goes through the one-at-a-time step and the healing gate, so a brief blip
-// cannot evict a node faster than the dataplane can hand its data over.
+// Belonging is not the same question as being healthy. A node that belongs is a
+// node the zone does not take groups away from, and readiness is far too
+// twitchy a signal for that: a node's share of a zone is the groups it holds, so
+// removing one moves data, and a probe that blinks during an upgrade would move
+// a quarter of the zone and then move it back.
 func (p *pass) candidates(zone uint32) racerctrl.Membership {
+	var members racerctrl.Membership
+
+	for _, view := range p.nodes {
+		if !view.enrolled || view.state.ID == 0 || view.state.Zone != zone {
+			continue
+		}
+
+		members = append(members, racerctrl.Member{NodeID: view.state.ID, Cohort: view.state.Cohort})
+	}
+
+	return members.Normalized()
+}
+
+// admissible is the subset of a zone's candidates healthy enough to be handed
+// groups.
+//
+// This is the readiness question, and it only ever withholds work. A node that
+// is not Ready keeps everything it holds and is simply not given more, which is
+// what makes a blip cost nothing.
+func (p *pass) admissible(zone uint32) racerctrl.Membership {
 	var members racerctrl.Membership
 
 	for _, view := range p.nodes {

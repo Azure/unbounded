@@ -566,6 +566,7 @@ func ParseUniverseState(class string, annotations map[string]string) (UniverseSt
 		Members:      map[uint32]Membership{},
 		MemberEpochs: map[uint32]uint32{},
 		Draining:     map[uint32]Membership{},
+		Catalogs:     map[uint32]Catalog{},
 		Gateways:     map[uint32][]uint32{},
 	}
 

@@ -187,22 +187,64 @@ func TestMembershipRoundTrip(t *testing.T) {
 	assert.Equal(t, members.Normalized(), back)
 }
 
-func TestNextMembershipSwapsOneNode(t *testing.T) {
-	current := Membership{{NodeID: 1, Cohort: 0}, {NodeID: 2, Cohort: 1}, {NodeID: 3, Cohort: 2}}
-	desired := Membership{{NodeID: 1, Cohort: 0}, {NodeID: 5, Cohort: 1}, {NodeID: 3, Cohort: 2}}
+func TestCatalogRoundTripsThroughItsConfigMapForm(t *testing.T) {
+	catalog := Catalog{{1, 2, 3}, {4, 2, 3}, {1, 5, 6}}
 
-	step, err := NextMembership(current, desired, 3)
+	back, err := ParseCatalog(FormatCatalog(catalog))
 	require.NoError(t, err)
-	assert.False(t, step.Done)
-	assert.Equal(t, desired.Normalized(), step.Next.Normalized())
+	assert.Equal(t, catalog, back)
 }
 
-func TestNextMembershipDone(t *testing.T) {
-	current := Membership{{NodeID: 1, Cohort: 0}, {NodeID: 2, Cohort: 1}, {NodeID: 3, Cohort: 2}}
-
-	step, err := NextMembership(current, current, 3)
+func TestParseCatalogOfNothingIsNoCatalog(t *testing.T) {
+	catalog, err := ParseCatalog("")
 	require.NoError(t, err)
-	assert.True(t, step.Done)
+	assert.Empty(t, catalog)
+}
+
+func TestParseCatalogRefusesGarbage(t *testing.T) {
+	for name, raw := range map[string]string{
+		"short group":   "1:2",
+		"long group":    "1:2:3:4",
+		"not a number":  "1:2:x",
+		"zero node":     "1:0:3",
+		"node twice":    "1:2:1",
+		"empty group":   "1:2:3,",
+		"negative node": "1:2:-3",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseCatalog(raw)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestCatalogMembersReadsCohortFromColumn(t *testing.T) {
+	catalog := Catalog{{1, 2, 3}, {4, 2, 3}}
+
+	assert.Equal(t, Membership{
+		{NodeID: 1, Cohort: 0},
+		{NodeID: 4, Cohort: 0},
+		{NodeID: 2, Cohort: 1},
+		{NodeID: 3, Cohort: 2},
+	}, catalog.Members())
+}
+
+func TestCatalogLoadIsTheNodeShare(t *testing.T) {
+	catalog := Catalog{{1, 2, 3}, {4, 2, 3}, {4, 2, 3}}
+
+	assert.Equal(t, map[uint32]int{1: 1, 4: 2, 2: 3, 3: 3}, catalog.Load())
+}
+
+func TestGroupSurvivorsCountsPositions(t *testing.T) {
+	before := Group{1, 2, 3}
+
+	assert.Equal(t, 3, before.Survivors(Group{1, 2, 3}))
+	assert.Equal(t, 2, before.Survivors(Group{1, 2, 4}))
+	assert.Equal(t, 0, before.Survivors(Group{4, 5, 6}))
+
+	// Position is normative: the same three ids in different columns is three
+	// different nodes answering for the group.
+	assert.Equal(t, 0, before.Survivors(Group{3, 1, 2}))
 }
 
 func TestDesiredMembershipPicksLargestBalancedSubset(t *testing.T) {

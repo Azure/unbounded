@@ -215,6 +215,16 @@ type UniverseState struct {
 	// held. They keep deriving the universe, so racer keeps shedding.
 	Draining map[uint32]Membership
 
+	// Catalogs is each zone's published catalog, keyed by zone id. It is the
+	// groups themselves rather than the member list they were once built from,
+	// because membership now moves one group slot at a time and a catalog
+	// rebuilt from a member list would reshuffle far more than a step moved.
+	//
+	// A zone with no entry has not published one yet. Deriving falls back to
+	// building the catalog from the membership, which is exactly what the
+	// operator seeds the published one with, so the two agree.
+	Catalogs map[uint32]Catalog
+
 	// Gateways is each zone's gateway node ids, keyed by zone id. A zone with no
 	// entry falls back to its membership.
 	Gateways map[uint32][]uint32
@@ -331,7 +341,7 @@ func Derive(d Derivation) (*racerconfig.NodeConfig, error) {
 	// in its bootstrap shape. The store is cold - racer formats it at startup
 	// and only a restart picks up a larger one - so sizing it to the inert
 	// config would mean every bootstrap ended in a restart to grow it back.
-	pages := CountStorePages(d.Self.Zone, full)
+	pages := CountStorePages(d.Self.ID, d.Self.Zone, full)
 
 	return &racerconfig.NodeConfig{
 		Generation: d.Generation,
@@ -512,13 +522,39 @@ func (d *Derivation) joins(state *UniverseState, volumes map[string]struct{}) (b
 	return false, nil
 }
 
+// catalogFor is the zone's catalog: the published one when there is one, and
+// otherwise one built from the membership.
+//
+// The fallback is what a zone looks like before the operator has seeded its
+// catalog, and what a zone published by an older operator looks like. Building
+// from the membership reproduces exactly the catalog the seed will publish, so a
+// node derives the same groups either side of the seeding.
+func (d *Derivation) catalogFor(state *UniverseState) ([]*racerconfig.Trio, error) {
+	if catalog := state.Catalogs[d.Self.Zone]; len(catalog) > 0 {
+		if err := catalog.Validate(); err != nil {
+			return nil, fmt.Errorf("published catalog: %w", err)
+		}
+
+		if len(catalog) != state.CatalogSize {
+			return nil, fmt.Errorf(
+				"published catalog has %d groups, universe says %d",
+				len(catalog), state.CatalogSize,
+			)
+		}
+
+		return catalog.Trios(), nil
+	}
+
+	return BuildCatalog(state.Members[d.Self.Zone], state.CatalogSize)
+}
+
 func (d *Derivation) deriveUniverse(state *UniverseState, fabricIDs map[uint32]uint32) (*racerconfig.Universe, error) {
 	fabricID, ok := fabricIDs[state.ID]
 	if !ok {
 		return nil, fmt.Errorf("no local fabric device id assigned")
 	}
 
-	catalog, err := BuildCatalog(state.Members[d.Self.Zone], state.CatalogSize)
+	catalog, err := d.catalogFor(state)
 	if err != nil {
 		return nil, err
 	}

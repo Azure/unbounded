@@ -61,18 +61,38 @@ type StorePages struct {
 // CountStorePages computes a node's share of the pages in the universes it has
 // joined.
 //
-// A zone's nodes are homogeneous and its catalog is balanced, so a node's share
-// is simply the zone's pages replicated three ways and split evenly across the
-// nodes named in the catalog. Extents migrating into the zone are counted from
-// the moment the migration starts, because both ends hold the pages until the
-// control plane declares the move complete.
-func CountStorePages(zone uint32, universes []*racerconfig.Universe) StorePages {
+// A node's share is exactly the group slots it holds: the zone's pages are
+// spread evenly over the catalog's groups, each group is stored three times, and
+// a node stores one copy of every group it is named in. Counting slots rather
+// than dividing by the member count is what lets a zone sit at an uneven share
+// while it grows, shrinks or rebalances, which it necessarily does between the
+// generation a node arrives and the generation the column has levelled out.
+//
+// A node the catalog does not name holds nothing, but it is sized as though it
+// held an even share anyway: it is either about to be named, or draining out and
+// still holding what it has not handed over, and the store may never shrink in
+// either case.
+//
+// Extents migrating into the zone are counted from the moment the migration
+// starts, because both ends hold the pages until the control plane declares the
+// move complete.
+func CountStorePages(node, zone uint32, universes []*racerconfig.Universe) StorePages {
 	var total StorePages
 
 	for _, universe := range universes {
-		nodes := catalogNodeCount(universe.GetCatalog())
-		if nodes == 0 {
-			nodes = 1
+		groups := uint64(len(universe.GetCatalog()))
+		if groups == 0 {
+			continue
+		}
+
+		held := catalogSlotsHeld(universe.GetCatalog(), node)
+		if held == 0 {
+			nodes := catalogNodeCount(universe.GetCatalog())
+			if nodes == 0 {
+				nodes = 1
+			}
+
+			held = divCeil(groups*Cohorts, nodes)
 		}
 
 		var small, huge uint64
@@ -91,11 +111,28 @@ func CountStorePages(zone uint32, universes []*racerconfig.Universe) StorePages 
 			small += extent.GetPages()
 		}
 
-		total.Small += divCeil(small*Cohorts, nodes)
-		total.Huge += divCeil(huge*Cohorts, nodes)
+		total.Small += divCeil(small*held, groups)
+		total.Huge += divCeil(huge*held, groups)
 	}
 
 	return total
+}
+
+// catalogSlotsHeld is how many group slots one node is named in.
+func catalogSlotsHeld(catalog []*racerconfig.Trio, node uint32) uint64 {
+	if node == 0 {
+		return 0
+	}
+
+	var held uint64
+
+	for _, trio := range catalog {
+		if trio.GetCohort_0() == node || trio.GetCohort_1() == node || trio.GetCohort_2() == node {
+			held++
+		}
+	}
+
+	return held
 }
 
 // catalogNodeCount is how many distinct nodes a catalog names.

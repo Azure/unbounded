@@ -1262,3 +1262,294 @@ func TestDaemonSetSelectsTheWorkloadLabel(t *testing.T) {
 		t.Fatalf("the daemonset still selects on %s, so un-enrolling a node would delete its pod", EnrollmentLabel)
 	}
 }
+
+// scalingZone drives the membership planner the way the reconciler does: a
+// pass, then every node reporting that it loaded what the pass published. It
+// exists so a test can widen and narrow a zone and watch every catalog the
+// operator publishes on the way.
+type scalingZone struct {
+	t   *testing.T
+	ctx context.Context
+	env *component.Env
+}
+
+// newScalingZone builds a zone of catalogSize groups with seven nodes given
+// identities, of which the first three are enrolled. A node's cohort follows
+// its id, because a cohort is frozen for a node's life.
+func newScalingZone(t *testing.T, ctx context.Context, catalogSize int) *scalingZone {
+	t.Helper()
+
+	objects := []client.Object{
+		racerClass("fast", map[string]string{
+			racerctrl.UniverseIDAnnotation:  "1",
+			racerctrl.CatalogSizeAnnotation: formatUint(uint64(catalogSize)),
+			racerctrl.EpochAnnotation:       "1",
+			racerctrl.NextLBAAnnotation:     "0",
+		}),
+	}
+
+	for id := 1; id <= 7; id++ {
+		node := enrolledNode(scalingName(id), "east", map[string]string{
+			racerctrl.NodeIDAnnotation:      formatUint(uint64(id)),
+			racerctrl.NodeZoneAnnotation:    "1",
+			racerctrl.NodeCohortAnnotation:  formatUint(uint64(id-1) % 3),
+			racerctrl.NodeHealthAnnotation:  "generation=1",
+			racerctrl.NodeAppliedAnnotation: appliedAt(1, 1, 1),
+		})
+
+		if id > 3 {
+			delete(node.Labels, EnrollmentLabel)
+		}
+
+		objects = append(objects, node)
+	}
+
+	return &scalingZone{t: t, ctx: ctx, env: testEnv(t, objects...)}
+}
+
+func scalingName(id int) string {
+	return "n" + formatUint(uint64(id))
+}
+
+// widen enrolls or unenrolls nodes so the zone belongs to exactly width nodes.
+func (z *scalingZone) widen(width int) {
+	z.t.Helper()
+
+	for id := 1; id <= 7; id++ {
+		node := &corev1.Node{}
+		if err := z.env.Client.Get(z.ctx, client.ObjectKey{Name: scalingName(id)}, node); err != nil {
+			z.t.Fatalf("get node: %v", err)
+		}
+
+		if id <= width {
+			node.Labels[EnrollmentLabel] = "true"
+		} else {
+			delete(node.Labels, EnrollmentLabel)
+		}
+
+		if err := z.env.Client.Update(z.ctx, node); err != nil {
+			z.t.Fatalf("update node: %v", err)
+		}
+	}
+}
+
+// settle reconciles until the zone stops asking to be reconciled again,
+// checking every catalog it publishes against the rules on the way.
+func (z *scalingZone) settle() racerctrl.Catalog {
+	z.t.Helper()
+
+	const passes = 60
+
+	for range passes {
+		before := z.catalog()
+		wasMembers := z.members()
+
+		p, err := loadState(z.ctx, z.env)
+		if err != nil {
+			z.t.Fatalf("load state: %v", err)
+		}
+
+		if err := p.reconcileMembership(z.ctx); err != nil {
+			z.t.Fatalf("reconcile membership: %v", err)
+		}
+
+		z.assertStepIsLegal(before, z.catalog(), wasMembers, z.members())
+		z.report()
+
+		if len(p.waiting) == 0 {
+			return z.catalog()
+		}
+	}
+
+	z.t.Fatalf("zone never settled in %d passes, catalog %v", passes, z.catalog())
+
+	return nil
+}
+
+// assertStepIsLegal holds one published step to the two rules: a group keeps a
+// quorum of the nodes it had, and the zone gains at most one id and loses at
+// most one.
+func (z *scalingZone) assertStepIsLegal(before, after racerctrl.Catalog, was, is racerctrl.Membership) {
+	z.t.Helper()
+
+	if len(before) == 0 {
+		return
+	}
+
+	if len(before) != len(after) {
+		z.t.Fatalf("catalog length changed from %d to %d", len(before), len(after))
+	}
+
+	for i := range before {
+		if kept := after[i].Survivors(before[i]); kept < racerctrl.Quorum {
+			z.t.Fatalf("group %d kept only %d of %v, became %v", i, kept, before[i], after[i])
+		}
+	}
+
+	var joins, departures int
+
+	for _, member := range is {
+		if !was.Contains(member.NodeID) {
+			joins++
+		}
+	}
+
+	for _, member := range was {
+		if !is.Contains(member.NodeID) {
+			departures++
+		}
+	}
+
+	if joins > 1 || departures > 1 {
+		z.t.Fatalf("membership changed by %d joins and %d departures in one step", joins, departures)
+	}
+}
+
+// report has every node say it loaded the configuration the last pass
+// published, which is what the gates wait for.
+func (z *scalingZone) report() {
+	z.t.Helper()
+
+	epoch := z.epoch()
+
+	for id := 1; id <= 7; id++ {
+		node := &corev1.Node{}
+		if err := z.env.Client.Get(z.ctx, client.ObjectKey{Name: scalingName(id)}, node); err != nil {
+			z.t.Fatalf("get node: %v", err)
+		}
+
+		node.Annotations[racerctrl.NodeHealthAnnotation] = "generation=" + formatUint(uint64(epoch))
+		node.Annotations[racerctrl.NodeAppliedAnnotation] = appliedAt(uint64(epoch), 1, epoch)
+
+		if err := z.env.Client.Update(z.ctx, node); err != nil {
+			z.t.Fatalf("update node: %v", err)
+		}
+	}
+}
+
+func (z *scalingZone) epoch() uint32 {
+	z.t.Helper()
+
+	raw := zoneMembershipEpoch(z.ctx, z.t, z.env, 1, 1)
+	if raw == "" {
+		return 1
+	}
+
+	epoch, err := racerctrl.ParseMembershipEpoch(map[string]string{racerctrl.MembershipEpochKey: raw})
+	if err != nil {
+		z.t.Fatalf("parse epoch %q: %v", raw, err)
+	}
+
+	return epoch
+}
+
+func (z *scalingZone) catalog() racerctrl.Catalog {
+	z.t.Helper()
+
+	catalog, err := racerctrl.ParseCatalog(membershipData(z.ctx, z.t, z.env, 1, 1)[racerctrl.MembershipCatalogKey])
+	if err != nil {
+		z.t.Fatalf("parse catalog: %v", err)
+	}
+
+	return catalog
+}
+
+func (z *scalingZone) members() racerctrl.Membership {
+	z.t.Helper()
+
+	raw := zoneMembership(z.ctx, z.t, z.env, 1, 1)
+	if raw == "" {
+		return nil
+	}
+
+	members, err := racerctrl.ParseMembership(raw)
+	if err != nil {
+		z.t.Fatalf("parse membership %q: %v", raw, err)
+	}
+
+	return members
+}
+
+func (z *scalingZone) draining() racerctrl.Membership {
+	z.t.Helper()
+
+	raw := membershipData(z.ctx, z.t, z.env, 1, 1)[racerctrl.MembershipDrainingKey]
+	if raw == "" {
+		return nil
+	}
+
+	members, err := racerctrl.ParseMembership(raw)
+	if err != nil {
+		z.t.Fatalf("parse draining %q: %v", raw, err)
+	}
+
+	return members
+}
+
+// balance is the widest gap in groups held between two nodes of one cohort.
+func (z *scalingZone) balance(catalog racerctrl.Catalog) int {
+	load := catalog.Load()
+
+	var widest int
+
+	for cohort := range racerctrl.Cohorts {
+		low, high := -1, 0
+
+		for _, id := range catalog.Column(cohort) {
+			if low < 0 || load[id] < low {
+				low = load[id]
+			}
+
+			if load[id] > high {
+				high = load[id]
+			}
+		}
+
+		if low >= 0 && high-low > widest {
+			widest = high - low
+		}
+	}
+
+	return widest
+}
+
+// A zone is grown and shrunk one group at a time, and every configuration it
+// passes through on the way has to be one racer would accept and one that keeps
+// every group a quorum. This is the whole point of the planner, so it is worth
+// asserting against the operator rather than only against the planner.
+func TestReconcileMembershipGrowsAndShrinksAZone(t *testing.T) {
+	ctx := context.Background()
+
+	zone := newScalingZone(t, ctx, 12)
+
+	seeded := zone.settle()
+	if len(seeded) != 12 {
+		t.Fatalf("seeded catalog has %d groups, want 12", len(seeded))
+	}
+
+	if got := len(zone.members()); got != 3 {
+		t.Fatalf("zone seeded with %d nodes, want 3", got)
+	}
+
+	for _, width := range []int{4, 7, 4, 3} {
+		zone.widen(width)
+
+		catalog := zone.settle()
+
+		if got := len(catalog.Members()); got != width {
+			t.Fatalf("zone holds %d nodes, want %d: %v", got, width, catalog)
+		}
+
+		if got := zone.balance(catalog); got > 1 {
+			t.Fatalf("zone at width %d is out of balance by %d groups: %v", width, got, catalog)
+		}
+
+		if got := zone.draining(); len(got) != 0 {
+			t.Fatalf("zone at width %d still has %v draining", width, got)
+		}
+
+		if err := catalog.Validate(); err != nil {
+			t.Fatalf("zone at width %d published an illegal catalog: %v", width, err)
+		}
+	}
+}

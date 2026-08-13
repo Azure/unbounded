@@ -55,6 +55,11 @@ const (
 // Cohorts is how many cohorts a catalog trio has, one node from each.
 const Cohorts = 3
 
+// Quorum is how many of a group's three nodes have to agree, and so how many
+// have to survive a membership change. Two of three can serve every version the
+// group ever agreed and replay the third from what they hold.
+const Quorum = Cohorts/2 + 1
+
 // DefaultCatalogSize is the catalog length a zone is pinned to when its universe
 // is first published. It is fixed for the life of the zone, and the number of
 // nodes per cohort must divide it, so the useful property is having many

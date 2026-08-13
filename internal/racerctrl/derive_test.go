@@ -175,10 +175,45 @@ func TestEpochForFallsBackToTheClassEpoch(t *testing.T) {
 	assert.Equal(t, uint32(4), undated.EpochFor(1))
 }
 
-// The whole point of the stride is that a resized catalog gets installed. This
-// walks the path a node walks: derive, work out how far the generation has to
-// move for the transition to be legal, and publish.
-func TestPublishInstallsAResizedCatalog(t *testing.T) {
+// Growing a zone is a stream of single slot moves, and this walks the path a
+// node walks for one of them: derive from the catalog the operator published,
+// and publish the next generation.
+func TestPublishInstallsASlotMove(t *testing.T) {
+	d := attachedDerivation()
+	d.Cluster.Universes[0].CatalogSize = 2
+	d.Cluster.Universes[0].Catalogs = map[uint32]Catalog{1: {{1, 2, 3}, {1, 2, 3}}}
+
+	previous, err := Derive(d)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "racer.binpb")
+
+	changed, err := Publish(path, nil, previous)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	moved := resizedDerivation()
+	moved.Cluster.Universes[0].CatalogSize = 2
+	moved.Cluster.Universes[0].Catalogs = map[uint32]Catalog{1: {{1, 2, 3}, {4, 2, 3}}}
+
+	next, err := Derive(moved)
+	require.NoError(t, err)
+
+	next.Generation = previous.GetGeneration() + 1
+
+	changed, err = Publish(path, previous, next)
+	require.NoError(t, err, "a zone that cannot hand one group over cannot grow")
+	assert.True(t, changed)
+
+	assert.Equal(t, uint32(4), next.GetUniverses()[0].GetCatalog()[1].GetCohort_0(),
+		"the second group is what moved")
+}
+
+// The old resize published a whole new membership and skipped a generation to
+// get past the transition rule. Two of the three nodes answering for a group
+// have to survive the change, so a catalog rebuilt wholesale from a wider
+// membership is now refused however far the generation moves.
+func TestPublishRefusesAWholesaleRegrownCatalog(t *testing.T) {
 	d := attachedDerivation()
 	d.Cluster.Universes[0].CatalogSize = 2
 
@@ -197,13 +232,11 @@ func TestPublishInstallsAResizedCatalog(t *testing.T) {
 	next, err := Derive(grown)
 	require.NoError(t, err)
 
-	next.Generation = previous.GetGeneration() + TransitionStride(previous, next)
+	next.Generation = previous.GetGeneration() + 1
 
-	changed, err = Publish(path, previous, next)
-	require.NoError(t, err, "a resize the node cannot publish is a catalog that can never grow")
-	assert.True(t, changed)
-	assert.Equal(t, previous.GetGeneration()+2, next.GetGeneration(),
-		"the resize is delivered as a settled state, not as a step")
+	_, err = Publish(path, previous, next)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "kept only 0 of its 3 nodes")
 }
 
 // A volume with a mutable head and an immutable tail is the shape of every

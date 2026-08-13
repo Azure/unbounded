@@ -152,9 +152,18 @@ func buildUniverseStates(
 			continue
 		}
 
+		catalog, err := racerctrl.ParseCatalog(membership.Data[racerctrl.MembershipCatalogKey])
+		if err != nil {
+			log.Warn("ignoring unreadable membership",
+				"configMap", membership.Name, "error", err)
+
+			continue
+		}
+
 		universe.Members[zone] = members
 		universe.MemberEpochs[zone] = epoch
 		universe.Draining[zone] = draining
+		universe.Catalogs[zone] = catalog
 	}
 
 	for _, volume := range volumes {

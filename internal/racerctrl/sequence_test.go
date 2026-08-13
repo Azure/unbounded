@@ -331,6 +331,7 @@ func zonePlan(current, draining, candidates Membership) MembershipPlan {
 		Current:     current,
 		Draining:    draining,
 		Candidates:  candidates,
+		Admissible:  candidates,
 		Nodes:       nodes,
 	}
 }
