@@ -1128,6 +1128,45 @@ impl Paxos {
     /// We are member `k`: stage the page locally and fan out concurrently, acking as soon as
     /// a quorum is durable. Latency is one remote hop plus the slower of the local write and
     /// one peer accept; the third acceptor is in flight and nobody waits.
+    /// A term to propose at and the address to propose for, in one visit to the group's
+    /// core.
+    ///
+    /// Both live in the same row, and on the path a write normally takes both answers are
+    /// already there: a term this node holds, and an address nobody else is writing.
+    /// Asking for them one after the other made the core answer twice with an integer
+    /// each, for no more than the reading of two fields. Only a write that has to prepare
+    /// pays two visits now, and it is about to pay for a round of messages anyway.
+    async fn lead(&'static self, addr: GlobalAddr, group: GroupId) -> Result<(u32, Claim), Status> {
+        let core = self.core_of(group);
+        // Built on this core, not the group's: a claim gives itself back from a
+        // destructor, and an answer nobody waited for is dropped inside the rendezvous.
+        match at(core, move |l| {
+            match l.terms.entry(group).or_insert(Term::new(0)).issuable() {
+                None => Fast::Prepare,
+                // The address is only taken once there is a term to take it for.
+                Some(t) if l.inflight.insert(addr.0) => Fast::Ready(t),
+                Some(_) => Fast::Busy,
+            }
+        })
+        .await
+        {
+            Fast::Ready(term) => Ok((
+                term,
+                Claim {
+                    paxos: self,
+                    addr,
+                    core,
+                },
+            )),
+            Fast::Busy => Err(Status::Conflict { current: 0 }),
+            Fast::Prepare => {
+                let term = self.term_for(group, addr).await?;
+                let claim = self.claim(addr, group).await?;
+                Ok((term, claim))
+            }
+        }
+    }
+
     async fn drive(
         &'static self,
         addr: GlobalAddr,
@@ -1137,10 +1176,9 @@ impl Paxos {
         guard: u64,
         page: Page<'_>,
     ) -> Result<u64, Status> {
-        let term = self.term_for(group, addr).await?;
+        let (term, claim) = self.lead(addr, group).await?;
         let b = Ballot::new(term, k);
         let need = self.quorum(addr.universe());
-        let claim = self.claim(addr, group).await?;
         let mut peers = self.peers(addr.universe(), &m, Some(k));
         let r = self.round(addr, &mut peers, need, guard, b, page).await;
         claim.release().await;
@@ -1469,6 +1507,17 @@ impl Paxos {
 /// left is the width of the claiming hop itself: a caller that disappears while the owner
 /// is still being asked leaves an address claimed by nobody. That was the shape of the
 /// whole round before, and is now the shape of one message.
+/// What one visit to a group's core can settle before a write commits to anything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fast {
+    /// A term this node may issue at, and the address taken for this write.
+    Ready(u32),
+    /// Another write on this node holds the address.
+    Busy,
+    /// No term to issue at, so the slow path, which is a prepare round.
+    Prepare,
+}
+
 #[must_use = "an unheld claim is released at once, leaving the address open to a racing write"]
 struct Claim {
     paxos: &'static Paxos,
