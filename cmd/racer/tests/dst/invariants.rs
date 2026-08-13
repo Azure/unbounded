@@ -7,7 +7,7 @@
 
 use crate::coverage::Reach;
 use crate::model::Value;
-use crate::world::World;
+use crate::world::{self, World};
 
 /// Checked after every action, while the cluster is still being hurt.
 ///
@@ -74,11 +74,14 @@ pub fn converged(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// Checked once the cluster has drained: nothing may still be held.
+/// Checked once the cluster has drained: no client work may still be owed.
 ///
-/// A page that arrived in pieces and was then abandoned still owns a
-/// reservation until someone gives it back. Nothing is in flight at this
-/// point, so an assembly still standing is one that leaked.
+/// Huge page reservations are deliberately not part of this. An assembly whose
+/// pieces stopped arriving keeps its reservation until something needs the
+/// room, because there is no timer that could safely tell an abandoned
+/// assembly from a slow one (`Allocator::open_parts`). What racer promises is
+/// that the reservation cannot wedge the class, and [`reclaims`] is where that
+/// is checked.
 pub fn idle(w: &World) -> Result<(), String> {
     let s = w.sim.status();
 
@@ -86,14 +89,32 @@ pub fn idle(w: &World) -> Result<(), String> {
         return Err(format!("a drained cluster is still busy: {s:?}"));
     }
 
-    let held = w.sim.assemblies();
+    Ok(())
+}
 
-    if held != 0 {
-        return Err(format!(
-            "a drained cluster is still holding {held} huge page \
-             reservations, which nothing is going to finish"
-        ));
+/// Checked once the cluster has drained: an abandoned assembly gives its room
+/// back under pressure.
+///
+/// Every profile that fills huge pages leaves spare ones the workload never
+/// touches. Filling them here has to work: if a reservation left behind by a
+/// write that never finished could keep the class from taking new pages, this
+/// is where the door stays shut.
+pub fn reclaims(w: &mut World) -> Result<(), String> {
+    let (_, huge) = w.pages();
+
+    if huge == 0 {
+        return Ok(());
     }
+
+    if w.sim.assemblies() > 0 {
+        w.cov.reach(Reach::Abandoned);
+    }
+
+    for page in huge..huge + world::SPARE {
+        w.fill_now(page)?;
+    }
+
+    w.cov.reach(Reach::Reclaimed);
 
     Ok(())
 }

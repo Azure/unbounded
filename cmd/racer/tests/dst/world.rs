@@ -34,6 +34,11 @@ const ALLOWED: [i32; 2] = [libc::EIO, libc::EAGAIN];
 /// running token that the two can never be confused in a failure report.
 const FILL: u32 = 1 << 20;
 
+/// How many huge pages every profile keeps back from the workload. Nothing
+/// names them until the faults stop, when filling them is what proves a
+/// reservation left behind by an abandoned assembly gave its room back.
+pub const SPARE: u64 = 2;
+
 /// One request the cluster has not answered yet.
 struct Flight {
     /// What the simulator calls it.
@@ -81,6 +86,10 @@ pub struct World {
     token: u32,
     /// Replicas damaged on purpose, and left alone by the workload afterwards.
     damaged: BTreeSet<(u64, usize)>,
+    /// Small pages whose trim the cluster has acknowledged. A read of one is not the
+    /// same as a read of a page nobody wrote: the bytes it replaced are still on
+    /// whichever replica missed the trim.
+    trimmed: BTreeSet<u64>,
     /// A page sized buffer to stamp into.
     scratch: Vec<u8>,
     /// What has been done, for the failure message.
@@ -97,7 +106,7 @@ impl World {
 
         let mut w = Self {
             small: (0..profile.small).map(|_| Page::new(Class::Lww)).collect(),
-            huge: (0..profile.huge)
+            huge: (0..profile.huge + SPARE)
                 .map(|_| Page::new(Class::Immutable))
                 .collect(),
             sim,
@@ -112,6 +121,7 @@ impl World {
             clock: 0,
             token: 0,
             damaged: BTreeSet::new(),
+            trimmed: BTreeSet::new(),
             scratch: vec![0; model::HUGE],
             log: Vec::new(),
         };
@@ -215,6 +225,13 @@ impl World {
     /// Where a small page in the working set lives.
     fn lba(&self, page: u64) -> u64 {
         page * STRIDE + 3
+    }
+
+    /// Whether a node sits outside the zone that owns every extent. The simulator homes
+    /// them all in zone 1 and hands out node indices in zone order, so the nodes past the
+    /// first zone's share are the ones whose reads cross the fabric.
+    fn remote(&self, node: usize) -> bool {
+        self.sim.nodes() / self.profile.opts.zones.max(1) as usize <= node
     }
 
     fn tick(&mut self) -> u64 {
@@ -417,7 +434,7 @@ impl World {
             Reach::NonMember
         });
 
-        if self.sim.nodes() / self.profile.opts.zones.max(1) as usize <= node {
+        if self.remote(node) {
             self.cov.reach(Reach::Remote);
         }
 
@@ -538,12 +555,23 @@ impl World {
 
                 saw = Some(v);
 
+                let far = self.remote(f.node);
+
                 self.cov.reach(match (f.huge, v) {
+                    (false, Value::Hole) if self.trimmed.contains(&f.page) => Reach::ReadTrimmed,
                     (false, Value::Hole) => Reach::ReadHole,
                     (false, _) => Reach::Read,
                     (true, Value::Hole) => Reach::ReadHugeHole,
                     (true, _) => Reach::ReadHuge,
                 });
+
+                if far && v == Value::Hole {
+                    self.cov.reach(if f.huge {
+                        Reach::ReadHugeHoleRemote
+                    } else {
+                        Reach::ReadHoleRemote
+                    });
+                }
 
                 if !f.huge && v != Value::Hole {
                     self.cov.reach(Reach::Read);
@@ -554,6 +582,10 @@ impl World {
                     (false, Kind::Write(Value::Hole)) => Reach::Trimmed,
                     (false, _) => Reach::Wrote,
                 });
+
+                if !f.huge && f.kind == Kind::Write(Value::Hole) {
+                    self.trimmed.insert(f.page);
+                }
             }
 
             let page = if f.huge {
@@ -564,6 +596,28 @@ impl World {
 
             page.finish(f.at, end, ok, saw);
             self.answers.insert(f.id, (ok, saw));
+            // What was asked is only half a trace: an ordering that cannot be explained is
+            // explained by the answers, so the log has to carry them too.
+            self.note(format!(
+                "node {} {} {} page {} {}",
+                f.node,
+                match f.kind {
+                    Kind::Read => "read of",
+                    Kind::Write(Value::Hole) => "trim of",
+                    Kind::Write(_) => "write to",
+                },
+                if f.huge { "huge" } else { "small" },
+                f.page,
+                match (&res, saw) {
+                    (Err(e), _) => format!("failed with {e}"),
+                    (Ok(_), Some(v)) => format!("returned {v}"),
+                    (Ok(_), None) => "succeeded".to_string(),
+                }
+            ));
+            // The value is what the campaign keeps; the bytes are not. A run of a few
+            // hundred fills that held on to every 4 MiB page it had read would cost
+            // more memory than the cluster it is testing.
+            self.sim.forget(f.id);
         }
 
         Ok(())
@@ -573,8 +627,7 @@ impl World {
     /// which is where a value that could not have come from anywhere is caught.
     pub fn settle(&mut self) -> Result<(), String> {
         for (i, p) in self.small.iter_mut().enumerate() {
-            p.settle()
-                .map_err(|e| format!("small page {}: {e}", i as u64 * STRIDE + 3))?;
+            p.settle().map_err(|e| format!("small page {i}: {e}"))?;
         }
 
         for (i, p) in self.huge.iter_mut().enumerate() {
@@ -649,10 +702,68 @@ impl World {
             self.sim.run(Duration::from_millis(500));
         }
 
+        let says = self.probe(page, huge)?;
+
         Err(format!(
             "a healed cluster could not answer a read of {} page {page} on node {node}: \
-             it kept answering {why}",
+             it kept answering {why}. asked once more, every node said: {says}",
             if huge { "huge" } else { "small" }
+        ))
+    }
+
+    /// One read of a page from every node, for a failure to point at. Says
+    /// whether a refusal is the page's problem or the node's.
+    fn probe(&mut self, page: u64, huge: bool) -> Result<String, String> {
+        let mut says = Vec::new();
+
+        for node in 0..self.sim.nodes() {
+            if !self.sim.up(node) {
+                says.push(format!("node {node} is down"));
+                continue;
+            }
+
+            let id = self.submit(node, page, huge, Kind::Read)?;
+
+            self.drain()?;
+
+            says.push(match self.answers.get(&id) {
+                Some((true, Some(v))) => format!("node {node} says {v}"),
+                _ => match self.sim.result(id) {
+                    Some(Err(e)) => format!("node {node} says error {e}"),
+                    _ => format!("node {node} said nothing"),
+                },
+            });
+        }
+
+        Ok(says.join(", "))
+    }
+
+    /// Fills a page and waits for it to land, retrying while the cluster is
+    /// still settling. Used once everything has healed, where a refusal is a
+    /// liveness failure rather than a legal outcome.
+    pub fn fill_now(&mut self, page: u64) -> Result<(), String> {
+        let mut why = 0;
+        let node = 0;
+
+        for _ in 0..16 {
+            let id = self.submit(node, page, true, Kind::Write(self.fill_of(page)))?;
+
+            self.drain()?;
+
+            if let Some((true, _)) = self.answers.get(&id) {
+                return Ok(());
+            }
+
+            if let Some(Err(e)) = self.sim.result(id) {
+                why = e;
+            }
+
+            self.sim.run(Duration::from_millis(500));
+        }
+
+        Err(format!(
+            "a healed cluster would not take a fill of huge page {page}: \
+             it kept answering {why}"
         ))
     }
 

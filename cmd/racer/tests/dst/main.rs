@@ -1,6 +1,6 @@
 //! Deterministic simulation tests.
 //!
-//! Each test runs a whole cluster — allocator, consensus, anti-entropy, fabric — in one
+//! Each test runs a whole cluster — allocator, consensus, anti-entropy, fabric - in one
 //! thread against simulated devices, so a seed is the whole of a failure's repro.
 
 #![cfg(feature = "sim")]
@@ -24,6 +24,12 @@ const PATIENCE: usize = 60_000;
 
 /// Seeds the linearizability sweep covers. Each one is an independent cluster.
 const SEEDS: u64 = 32;
+
+/// How many seeds may run at once. Every seed holds a whole cluster, and a cluster that
+/// fills 4 MiB pages holds them on every replica, so this is a memory budget rather than a
+/// speed knob: the campaign is not allowed to take the machine down with it. A seed of the
+/// heaviest stratum peaks at a few hundred megabytes, so this is a couple of gigabytes.
+const SPREAD: usize = 16;
 
 /// Long enough for anti-entropy to pass over every group twice: it sweeps one group per
 /// core per second, and the simulator declares one group per node.
@@ -745,7 +751,8 @@ where
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
-        .min(queue.len().max(1));
+        .min(queue.len().max(1))
+        .min(SPREAD);
     let failed = std::sync::atomic::AtomicBool::new(false);
 
     std::thread::scope(|scope| {
@@ -1110,7 +1117,8 @@ fn system_invariants_hold_under_fuzz() {
     let failed = std::sync::atomic::AtomicBool::new(false);
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
-        .min(queue.len());
+        .min(queue.len())
+        .min(SPREAD);
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -1192,6 +1200,7 @@ fn drive(w: &mut World) -> Result<(), String> {
     w.quiesce()?;
     invariants::always(w)?;
     invariants::idle(w)?;
+    invariants::reclaims(w)?;
     invariants::converged(w)?;
     invariants::repaired(w)?;
     invariants::envelope(w)?;
