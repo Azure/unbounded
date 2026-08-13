@@ -66,6 +66,7 @@ type pass struct {
 
 	nodes     []nodeView
 	universes []universeView
+	orphans   []volumeView
 
 	// memberships is every per-zone membership ConfigMap in the namespace,
 	// keyed by the universe and zone it belongs to.
@@ -285,6 +286,7 @@ func (p *pass) loadUniverses(ctx context.Context) error {
 			return fmt.Errorf("parse racer annotations on storage class %s: %w", class.Name, err)
 		}
 
+		state.Deleting = class.DeletionTimestamp != nil
 		p.universes = append(p.universes, universeView{class: class, state: state})
 	}
 
@@ -344,17 +346,20 @@ func (p *pass) loadUniverses(ctx context.Context) error {
 			continue
 		}
 
-		universe, ok := byName[pv.Spec.StorageClassName]
-		if !ok {
-			// A racer volume whose class has been deleted or never carried our
-			// provisioner. There is no universe to place it in, so leave it
-			// alone rather than guess.
-			continue
-		}
-
 		state, err := racerctrl.ParseVolumeState(pv.Name, pv.Annotations)
 		if err != nil {
 			return fmt.Errorf("parse racer annotations on persistent volume %s: %w", pv.Name, err)
+		}
+
+		universe, ok := byName[pv.Spec.StorageClassName]
+		if !ok {
+			// Without the class there is no universe state from which the
+			// composition can be sequenced. Keep the volume visible so sequence
+			// can report it and release a finalizer that can no longer protect
+			// anything.
+			p.orphans = append(p.orphans, volumeView{pv: pv, state: state})
+
+			continue
 		}
 
 		universe.volumes = append(universe.volumes, volumeView{pv: pv, state: state})
@@ -366,6 +371,8 @@ func (p *pass) loadUniverses(ctx context.Context) error {
 		volumes := p.universes[i].volumes
 		sort.Slice(volumes, func(a, b int) bool { return volumes[a].pv.Name < volumes[b].pv.Name })
 	}
+
+	sort.Slice(p.orphans, func(i, j int) bool { return p.orphans[i].pv.Name < p.orphans[j].pv.Name })
 
 	return nil
 }
@@ -541,10 +548,20 @@ func (p *pass) reconcileWorkloadLabels(ctx context.Context) error {
 
 // patchClass merge-patches annotations onto a StorageClass.
 func (p *pass) patchClass(ctx context.Context, view *universeView, annotations map[string]string) error {
+	return p.patchClassMeta(ctx, view, annotations, nil)
+}
+
+// patchClassMeta merge-patches annotations and finalizers onto a StorageClass.
+func (p *pass) patchClassMeta(
+	ctx context.Context,
+	view *universeView,
+	annotations map[string]string,
+	finalizers []string,
+) error {
 	patch := client.MergeFrom(view.class.DeepCopy())
 	updated := view.class.DeepCopy()
 
-	if updated.Annotations == nil {
+	if annotations != nil && updated.Annotations == nil {
 		updated.Annotations = map[string]string{}
 	}
 
@@ -554,6 +571,10 @@ func (p *pass) patchClass(ctx context.Context, view *universeView, annotations m
 		} else {
 			updated.Annotations[key] = value
 		}
+	}
+
+	if finalizers != nil {
+		updated.Finalizers = finalizers
 	}
 
 	if err := p.env.Client.Patch(ctx, updated, patch); err != nil {

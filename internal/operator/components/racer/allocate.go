@@ -61,8 +61,9 @@ func (p *pass) ensureDefaultClass(ctx context.Context) error {
 
 	class := &storagev1.StorageClass{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   defaultClassName,
-			Labels: map[string]string{"app.kubernetes.io/part-of": "racer"},
+			Name:       defaultClassName,
+			Labels:     map[string]string{"app.kubernetes.io/part-of": "racer"},
+			Finalizers: []string{racerctrl.UniverseFinalizer},
 			Annotations: map[string]string{
 				racerctrl.CatalogSizeAnnotation: formatUint(uint64(racerctrl.DefaultCatalogSize)),
 			},
@@ -247,7 +248,16 @@ func nodeSite(node *corev1.Node) string {
 func (p *pass) allocateUniverses(ctx context.Context) error {
 	for i := range p.universes {
 		view := &p.universes[i]
+		if view.state.Deleting {
+			continue
+		}
+
 		annotations := map[string]string{}
+
+		finalizers := view.class.Finalizers
+		if !hasFinalizer(finalizers, racerctrl.UniverseFinalizer) {
+			finalizers = append(append([]string{}, finalizers...), racerctrl.UniverseFinalizer)
+		}
 
 		if view.state.ID == 0 {
 			id, err := p.cursors.AllocateUniverseID()
@@ -276,11 +286,11 @@ func (p *pass) allocateUniverses(ctx context.Context) error {
 			annotations[racerctrl.NextLBAAnnotation] = "0"
 		}
 
-		if len(annotations) == 0 {
+		if len(annotations) == 0 && len(finalizers) == len(view.class.Finalizers) {
 			continue
 		}
 
-		if err := p.patchClass(ctx, view, annotations); err != nil {
+		if err := p.patchClassMeta(ctx, view, annotations, finalizers); err != nil {
 			return err
 		}
 	}
@@ -301,7 +311,7 @@ func (p *pass) reconcileMembership(ctx context.Context) error {
 
 	for i := range p.universes {
 		view := &p.universes[i]
-		if view.state.ID == 0 || view.state.CatalogSize == 0 {
+		if view.state.Deleting || view.state.ID == 0 || view.state.CatalogSize == 0 {
 			continue
 		}
 
@@ -600,6 +610,17 @@ func (p *pass) allocateVolumes(ctx context.Context) error {
 	for i := range p.universes {
 		view := &p.universes[i]
 		if view.state.ID == 0 {
+			continue
+		}
+
+		if view.state.Deleting {
+			for j := range view.volumes {
+				volume := &view.volumes[j]
+				if volume.pv.DeletionTimestamp == nil && len(volume.state.Composition) == 0 {
+					p.wait("volume %s cannot be placed while universe %s is deleting", volume.pv.Name, view.class.Name)
+				}
+			}
+
 			continue
 		}
 

@@ -185,6 +185,8 @@ type VolumeState struct {
 type UniverseState struct {
 	// Class is the StorageClass name.
 	Class string
+	// Deleting is true while the StorageClass is held for sequenced teardown.
+	Deleting bool
 
 	ID    uint32
 	Epoch uint32

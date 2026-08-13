@@ -43,7 +43,17 @@ func (c *fakeConnector) Connect(req ConnectRequest) error {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(dir, "subsysnqn"), []byte(req.NQN), 0o644)
+	for name, value := range map[string]string{
+		"subsysnqn": req.NQN,
+		"transport": req.Trtype,
+		"address":   "traddr=" + req.Traddr + ",trsvcid=" + req.Trsvcid + ",host_traddr=10.0.0.7",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0o644); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (c *fakeConnector) Disconnect(controller string) error {
@@ -354,6 +364,53 @@ func TestReconcilePublishesBothTransports(t *testing.T) {
 	}
 }
 
+func TestReconcileUnlinksWithdrawnTargetPorts(t *testing.T) {
+	fabric, _ := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+	fabric.SetRDMAAddr("192.168.9.7")
+
+	plan := FabricPlan{
+		Exports: []FabricExportRequest{{UniverseID: 1, DeviceID: 4, AllowedNodes: []uint32{7}}},
+	}
+
+	state, err := fabric.Reconcile(plan)
+	if err != nil {
+		t.Fatalf("publish over both transports: %v", err)
+	}
+
+	nqn := state.Exports[0].NQN
+	if links := portLinks(t, fabric, nqn); len(links) != 2 {
+		t.Fatalf("subsystem linked into ports %v, want both transports", links)
+	}
+
+	fabric.SetRDMAAddr("")
+
+	if _, err := fabric.Reconcile(plan); err != nil {
+		t.Fatalf("withdraw rdma: %v", err)
+	}
+
+	if links := portLinks(t, fabric, nqn); len(links) != 1 || links[0] != strconv.Itoa(DefaultFabricPort) {
+		t.Fatalf("subsystem linked into ports %v after RDMA withdrawal, want only TCP", links)
+	}
+
+	fabric.SetRDMAAddr("192.168.10.7")
+
+	if _, err := fabric.Reconcile(plan); err != nil {
+		t.Fatalf("republish rdma at new address: %v", err)
+	}
+
+	links := portLinks(t, fabric, nqn)
+	if len(links) != 2 {
+		t.Fatalf("subsystem linked into ports %v after RDMA move, want current TCP and RDMA", links)
+	}
+
+	for _, port := range links {
+		if attrs := portAttrs(t, fabric, mustAtoi(t, port)); attrs["addr_trtype"] == fabricTrtypeRDMA &&
+			attrs["addr_traddr"] != "192.168.10.7" {
+			t.Fatalf("subsystem remains linked to stale RDMA port %s: %v", port, attrs)
+		}
+	}
+}
+
 func TestReconcileDegradesToTCPWhenRDMAFails(t *testing.T) {
 	// The RDMA service port is pinned to the last id configfs can hold and
 	// that id is made unusable, so there is nowhere left for the RDMA port to
@@ -510,6 +567,156 @@ func TestAttachSelectsTheRequestedTransport(t *testing.T) {
 	}
 }
 
+func TestAttachReplacesControllerWhenEndpointChanges(t *testing.T) {
+	tests := []struct {
+		name  string
+		first FabricImportRequest
+		next  FabricImportRequest
+	}{
+		{
+			name:  "address",
+			first: FabricImportRequest{UniverseID: 1, PeerNodeID: 8, NQN: "nqn.test.u1.n8", Addr: "10.0.0.8:4420"},
+			next:  FabricImportRequest{UniverseID: 1, PeerNodeID: 8, NQN: "nqn.test.u1.n8", Addr: "10.0.1.8:4420"},
+		},
+		{
+			name:  "rdma to tcp",
+			first: FabricImportRequest{UniverseID: 1, PeerNodeID: 8, NQN: "nqn.test.u1.n8", Addr: "192.168.9.8:4421", Trtype: fabricTrtypeRDMA},
+			next:  FabricImportRequest{UniverseID: 1, PeerNodeID: 8, NQN: "nqn.test.u1.n8", Addr: "10.0.0.8:4420", Trtype: fabricTrtypeTCP},
+		},
+		{
+			name:  "tcp to rdma",
+			first: FabricImportRequest{UniverseID: 1, PeerNodeID: 8, NQN: "nqn.test.u1.n8", Addr: "10.0.0.8:4420", Trtype: fabricTrtypeTCP},
+			next:  FabricImportRequest{UniverseID: 1, PeerNodeID: 8, NQN: "nqn.test.u1.n8", Addr: "[fd00::8]:4421", Trtype: fabricTrtypeRDMA},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fabric, connector := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+			if _, err := fabric.Reconcile(FabricPlan{Imports: []FabricImportRequest{test.first}}); err != nil {
+				t.Fatalf("initial attach: %v", err)
+			}
+
+			state, err := fabric.Reconcile(FabricPlan{Imports: []FabricImportRequest{test.next}})
+			if err != nil {
+				t.Fatalf("replace endpoint: %v", err)
+			}
+
+			if len(connector.disconnected) != 1 || connector.disconnected[0] != "nvme0" {
+				t.Fatalf("disconnected controllers %v, want nvme0", connector.disconnected)
+			}
+
+			if len(connector.requests) != 2 {
+				t.Fatalf("issued %d connects, want initial and replacement", len(connector.requests))
+			}
+
+			wantHost, wantPort, splitErr := splitFabricAddr(test.next.Addr)
+			if splitErr != nil {
+				t.Fatalf("split next endpoint: %v", splitErr)
+			}
+
+			wantTrtype := test.next.Trtype
+			if wantTrtype == "" {
+				wantTrtype = fabricTrtypeTCP
+			}
+
+			request := connector.requests[1]
+			if request.Trtype != wantTrtype || request.Traddr != wantHost || request.Trsvcid != wantPort {
+				t.Fatalf("replacement connect %+v, want %s %s:%s", request, wantTrtype, wantHost, wantPort)
+			}
+
+			if state.Attachments[racerctrl.Attachment{Universe: 1, Peer: 8}] != "/dev/nvme1n1" {
+				t.Fatalf("replacement attachment: %v", state.Attachments)
+			}
+		})
+	}
+}
+
+func TestAttachReusesUnchangedEndpoint(t *testing.T) {
+	fabric, connector := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+	imp := FabricImportRequest{
+		UniverseID: 1,
+		PeerNodeID: 8,
+		NQN:        "nqn.test.u1.n8",
+		Addr:       "[fd00::8]:4421",
+		Trtype:     fabricTrtypeRDMA,
+	}
+
+	if _, err := fabric.Reconcile(FabricPlan{Imports: []FabricImportRequest{imp}}); err != nil {
+		t.Fatalf("initial attach: %v", err)
+	}
+
+	if _, err := fabric.Reconcile(FabricPlan{Imports: []FabricImportRequest{imp}}); err != nil {
+		t.Fatalf("idempotent attach: %v", err)
+	}
+
+	if len(connector.requests) != 1 || len(connector.disconnected) != 0 {
+		t.Fatalf("unchanged endpoint connected %d and disconnected %v", len(connector.requests), connector.disconnected)
+	}
+}
+
+func TestPruneDisconnectsStaleEndpointForDesiredNQN(t *testing.T) {
+	fabric, connector := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+	old := FabricImportRequest{
+		UniverseID: 1,
+		PeerNodeID: 8,
+		NQN:        fabric.SubsystemNQN(1, 8),
+		Addr:       "10.0.0.8:4420",
+	}
+	if _, err := fabric.Reconcile(FabricPlan{Imports: []FabricImportRequest{old}}); err != nil {
+		t.Fatalf("initial attach: %v", err)
+	}
+
+	// Exercise pruning independently of attach: the desired NQN remains, but at
+	// another endpoint.
+	next := FabricPlan{Imports: []FabricImportRequest{{
+		UniverseID: 1,
+		PeerNodeID: 8,
+		NQN:        old.NQN,
+		Addr:       "10.0.1.8:4420",
+	}}}
+	if err := fabric.pruneControllers(next); err != nil {
+		t.Fatalf("prune stale endpoint: %v", err)
+	}
+
+	if len(connector.disconnected) != 1 || connector.disconnected[0] != "nvme0" {
+		t.Fatalf("disconnected controllers %v, want stale nvme0", connector.disconnected)
+	}
+}
+
+func TestPruneMalformedEndpointKeepsItsControllerAndPrunesOthers(t *testing.T) {
+	fabric, connector := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+	first := FabricImportRequest{
+		UniverseID: 1,
+		PeerNodeID: 8,
+		NQN:        fabric.SubsystemNQN(1, 8),
+		Addr:       "10.0.0.8:4420",
+	}
+
+	second := FabricImportRequest{
+		UniverseID: 1,
+		PeerNodeID: 9,
+		NQN:        fabric.SubsystemNQN(1, 9),
+		Addr:       "10.0.0.9:4420",
+	}
+	if _, err := fabric.Reconcile(FabricPlan{Imports: []FabricImportRequest{first, second}}); err != nil {
+		t.Fatalf("initial attach: %v", err)
+	}
+
+	connector.disconnected = nil
+
+	first.Addr = "malformed"
+	if err := fabric.pruneControllers(FabricPlan{Imports: []FabricImportRequest{first}}); err == nil {
+		t.Fatal("malformed endpoint was not reported")
+	}
+
+	if len(connector.disconnected) != 1 || connector.disconnected[0] != "nvme1" {
+		t.Fatalf("disconnected controllers %v, want only obsolete nvme1", connector.disconnected)
+	}
+}
+
 func TestSplitFabricAddr(t *testing.T) {
 	tests := []struct {
 		addr string
@@ -586,6 +793,17 @@ func TestAdrfamOf(t *testing.T) {
 			t.Fatalf("adrfam of %q is %s, want %s", host, got, want)
 		}
 	}
+}
+
+func mustAtoi(t *testing.T, value string) int {
+	t.Helper()
+
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatalf("parse %q: %v", value, err)
+	}
+
+	return n
 }
 
 // Several racer nodes may share one kernel, and one nvmet target is shared by

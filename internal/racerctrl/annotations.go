@@ -210,6 +210,10 @@ const (
 	PhaseAnnotation = AnnotationDomain + "phase"
 )
 
+// UniverseFinalizer holds a StorageClass until all of its volumes and membership
+// state have been retired.
+const UniverseFinalizer = "racer.unbounded-cloud.io/universe"
+
 // VolumeFinalizer holds a PersistentVolume until its extents have been retired.
 // Deleting a volume is not instant: the extents must first stop holding live
 // pages, then the tombstone cursor advances, then the tombstones drain. Dropping

@@ -32,6 +32,14 @@ membership is the one thing too large for an annotation, so it lives in one
 ConfigMap per universe per zone, carrying the topology epoch it was published
 at so a catalog and its epoch can never be read apart.
 
+The operator finalizes every universe StorageClass. Deleting one freezes new
+volume placement and membership changes but keeps the class and its membership
+readable while its existing volumes are retired. Once no volumes remain, the
+operator removes the membership ConfigMaps and releases the class finalizer.
+If a class is removed without that protection, deleting orphan PVs have their
+unusable collection finalizer released and the operator reports the data-loss
+condition rather than leaving the PVs stuck forever.
+
 The node writes `store-bytes`, `devices`, `fabric`, `health` and `live` on its
 own Node object. It reads everything else.
 
@@ -170,10 +178,18 @@ the same pass that adds new ones.
 
 Every node publishes a TCP port (4420 by default). A node that also declares
 `rdma-addr` publishes an RDMA port (4421) and links its subsystems into both.
+A retained subsystem is unlinked from any port that is no longer live, so
+withdrawing or moving an RDMA address does not leave an old listener behind.
 A peer is dialled over RDMA only when both ends declare the same `fabric-id`
 and the peer has advertised an RDMA address, which it does only once its port
 is actually listening; everything else is TCP. A broken RDMA setup therefore
 costs latency, not connectivity.
+
+An initiator controller is matched by host identity, subsystem NQN, transport,
+target address and service port. Transport or endpoint changes replace the
+controller because the kernel's reconnect parameters are fixed when it is
+created; matching by NQN alone would keep retrying an address the peer no longer
+serves.
 
 The plan is whole-state: anything published or attached that the plan does not
 name is torn down, restricted to subsystems and controllers carrying our NQN

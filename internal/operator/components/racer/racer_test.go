@@ -274,6 +274,10 @@ func TestEnsureDefaultClassCreatesOneUniverse(t *testing.T) {
 		t.Fatalf("default class provisioner is %q", class.Provisioner)
 	}
 
+	if !hasFinalizer(class.Finalizers, racerctrl.UniverseFinalizer) {
+		t.Fatalf("default class has no universe finalizer: %v", class.Finalizers)
+	}
+
 	if class.AllowVolumeExpansion == nil || *class.AllowVolumeExpansion {
 		t.Fatal("default class allows expansion; extents are frozen for life")
 	}
@@ -408,6 +412,9 @@ func TestAllocateUniversesStampsCursorsOnce(t *testing.T) {
 
 	for i := range classes.Items {
 		annotations := classes.Items[i].Annotations
+		if !hasFinalizer(classes.Items[i].Finalizers, racerctrl.UniverseFinalizer) {
+			t.Fatalf("class %s has no universe finalizer", classes.Items[i].Name)
+		}
 
 		id := annotations[racerctrl.UniverseIDAnnotation]
 		if id == "" || id == "0" {
@@ -454,6 +461,230 @@ func TestAllocateUniversesStampsCursorsOnce(t *testing.T) {
 		if before[id] != classes.Items[i].Name {
 			t.Fatalf("class %s changed universe id to %s", classes.Items[i].Name, id)
 		}
+	}
+}
+
+func TestAllocateUniversesBackfillsFinalizer(t *testing.T) {
+	ctx := context.Background()
+	class := racerClass("fast", map[string]string{
+		racerctrl.UniverseIDAnnotation:  "1",
+		racerctrl.CatalogSizeAnnotation: "3",
+		racerctrl.EpochAnnotation:       "1",
+		racerctrl.NextLBAAnnotation:     "0",
+	})
+	env := testEnv(t, class)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.allocateUniverses(ctx); err != nil {
+		t.Fatalf("allocate universes: %v", err)
+	}
+
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: class.Name}, class); err != nil {
+		t.Fatalf("get class: %v", err)
+	}
+
+	if !hasFinalizer(class.Finalizers, racerctrl.UniverseFinalizer) {
+		t.Fatalf("existing class did not gain universe finalizer: %v", class.Finalizers)
+	}
+}
+
+func TestDeletingUniverseKeepsVolumesAndMembership(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	class := racerClass("fast", map[string]string{
+		racerctrl.UniverseIDAnnotation:  "1",
+		racerctrl.CatalogSizeAnnotation: "3",
+		racerctrl.EpochAnnotation:       "1",
+		racerctrl.NextLBAAnnotation:     "0",
+	})
+	class.Finalizers = []string{racerctrl.UniverseFinalizer}
+	class.DeletionTimestamp = &now
+	volume := racerVolume("pv-a", "fast", "64Mi", nil)
+	volume.Annotations = map[string]string{
+		racerctrl.CompositionAnnotation: "0?extent=1&baseLba=0&pages=1&kind=OCC",
+		racerctrl.VolumeZoneAnnotation:  "1",
+		racerctrl.PhaseAnnotation:       racerctrl.PhaseActive,
+	}
+	volume.Finalizers = []string{racerctrl.VolumeFinalizer}
+	env := testEnv(t, class, volume, membershipMap(1, 1, "1?cohort=0"))
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if !p.universes[0].state.Deleting {
+		t.Fatal("deleting class was not represented as a deleting universe")
+	}
+
+	if err := p.allocateVolumes(ctx); err != nil {
+		t.Fatalf("allocate volumes: %v", err)
+	}
+
+	if err := p.collectDeletedUniverses(ctx); err != nil {
+		t.Fatalf("collect universes: %v", err)
+	}
+
+	if !strings.Contains(strings.Join(p.waiting, "; "), "pv-a") {
+		t.Fatalf("remaining volume was not reported: %v", p.waiting)
+	}
+
+	found := &storagev1.StorageClass{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: class.Name}, found); err != nil {
+		t.Fatalf("get class: %v", err)
+	}
+
+	if !hasFinalizer(found.Finalizers, racerctrl.UniverseFinalizer) {
+		t.Fatal("class finalizer was released while a volume remains")
+	}
+
+	if zoneMembership(ctx, t, env, 1, 1) == "" {
+		t.Fatal("membership was deleted while a volume remains")
+	}
+}
+
+func TestDeletingUniverseDoesNotPlaceNewVolume(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	class := racerClass("fast", map[string]string{
+		racerctrl.UniverseIDAnnotation:  "1",
+		racerctrl.CatalogSizeAnnotation: "3",
+		racerctrl.EpochAnnotation:       "1",
+		racerctrl.NextLBAAnnotation:     "0",
+	})
+	class.Finalizers = []string{racerctrl.UniverseFinalizer}
+	class.DeletionTimestamp = &now
+	volume := racerVolume("pv-a", "fast", "64Mi", nil)
+	env := testEnv(t, class, volume, membershipMap(1, 1, "1?cohort=0"))
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.allocateVolumes(ctx); err != nil {
+		t.Fatalf("allocate volumes: %v", err)
+	}
+
+	found := &corev1.PersistentVolume{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: volume.Name}, found); err != nil {
+		t.Fatalf("get volume: %v", err)
+	}
+
+	if found.Annotations[racerctrl.CompositionAnnotation] != "" {
+		t.Fatal("volume was placed into a deleting universe")
+	}
+
+	if !strings.Contains(strings.Join(p.waiting, "; "), "cannot be placed") {
+		t.Fatalf("blocked placement was not reported: %v", p.waiting)
+	}
+}
+
+func TestEmptyDeletingUniverseDropsMembershipAndFinalizer(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	class := racerClass("fast", map[string]string{
+		racerctrl.UniverseIDAnnotation:  "1",
+		racerctrl.CatalogSizeAnnotation: "3",
+		racerctrl.EpochAnnotation:       "1",
+		racerctrl.NextLBAAnnotation:     "0",
+	})
+	class.Finalizers = []string{racerctrl.UniverseFinalizer}
+	class.DeletionTimestamp = &now
+	env := testEnv(t, class, membershipMap(1, 1, "1?cohort=0"))
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.collectDeletedUniverses(ctx); err != nil {
+		t.Fatalf("collect universes: %v", err)
+	}
+
+	if data := membershipData(ctx, t, env, 1, 1); data != nil {
+		t.Fatalf("membership remains after universe collection: %v", data)
+	}
+
+	found := &storagev1.StorageClass{}
+
+	err = env.Client.Get(ctx, client.ObjectKey{Name: class.Name}, found)
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("get class: %v", err)
+	}
+
+	if err == nil && hasFinalizer(found.Finalizers, racerctrl.UniverseFinalizer) {
+		t.Fatal("empty universe kept its finalizer")
+	}
+}
+
+func TestOrphanVolumeRecoveryDropsFinalizerAndReports(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	volume := racerVolume("pv-a", "gone", "64Mi", nil)
+	volume.Finalizers = []string{racerctrl.VolumeFinalizer}
+	volume.DeletionTimestamp = &now
+	env := testEnv(t, volume)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if len(p.orphans) != 1 {
+		t.Fatalf("loaded %d orphan volumes, want 1", len(p.orphans))
+	}
+
+	if err := p.recoverOrphanVolumes(ctx); err != nil {
+		t.Fatalf("recover orphan volumes: %v", err)
+	}
+
+	if !strings.Contains(strings.Join(p.waiting, "; "), "released its collection finalizer") {
+		t.Fatalf("orphan recovery was not reported: %v", p.waiting)
+	}
+
+	found := &corev1.PersistentVolume{}
+
+	err = env.Client.Get(ctx, client.ObjectKey{Name: volume.Name}, found)
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("get volume: %v", err)
+	}
+
+	if err == nil && hasFinalizer(found.Finalizers, racerctrl.VolumeFinalizer) {
+		t.Fatal("orphan volume kept its collection finalizer")
+	}
+}
+
+func TestOrphanVolumeRecoveryKeepsLiveVolume(t *testing.T) {
+	ctx := context.Background()
+	volume := racerVolume("pv-a", "gone", "64Mi", nil)
+	volume.Finalizers = []string{racerctrl.VolumeFinalizer}
+	env := testEnv(t, volume)
+
+	p, err := loadState(ctx, env)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if err := p.recoverOrphanVolumes(ctx); err != nil {
+		t.Fatalf("recover orphan volumes: %v", err)
+	}
+
+	if !strings.Contains(strings.Join(p.waiting, "; "), "references missing racer storage class") {
+		t.Fatalf("live orphan was not reported: %v", p.waiting)
+	}
+
+	found := &corev1.PersistentVolume{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: volume.Name}, found); err != nil {
+		t.Fatalf("get volume: %v", err)
+	}
+
+	if !hasFinalizer(found.Finalizers, racerctrl.VolumeFinalizer) {
+		t.Fatal("live orphan lost its collection finalizer")
 	}
 }
 

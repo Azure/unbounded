@@ -829,16 +829,40 @@ func (f *Fabric) writePort(dir string, spec fabricPort) error {
 	return nil
 }
 
-// linkSubsystem exposes one subsystem on every port that came up, so a single
-// namespace answers on both transports at once.
+// linkSubsystem exposes one subsystem on exactly the ports that came up, so a
+// single namespace answers on both transports at once without retaining a link
+// to an address that has been withdrawn.
 func (f *Fabric) linkSubsystem(nqn string) error {
 	target := filepath.Join(f.nvmetRoot, "subsystems", nqn)
+	want := map[string]struct{}{}
 
 	for _, spec := range f.livePorts() {
-		link := filepath.Join(f.nvmetRoot, "ports", strconv.Itoa(spec.id), "subsystems", nqn)
+		port := strconv.Itoa(spec.id)
+		want[port] = struct{}{}
+		link := filepath.Join(f.nvmetRoot, "ports", port, "subsystems", nqn)
 
 		if err := os.Symlink(target, link); err != nil && !errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("link %s into port %d: %w", nqn, spec.id, err)
+		}
+	}
+
+	ports, err := os.ReadDir(filepath.Join(f.nvmetRoot, "ports"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read %s/ports: %w", f.nvmetRoot, err)
+	}
+
+	for _, port := range ports {
+		if !port.IsDir() {
+			continue
+		}
+
+		if _, keep := want[port.Name()]; keep {
+			continue
+		}
+
+		link := filepath.Join(f.nvmetRoot, "ports", port.Name(), "subsystems", nqn)
+		if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("unlink %s from port %s: %w", nqn, port.Name(), err)
 		}
 	}
 
@@ -1014,10 +1038,21 @@ func (f *Fabric) attach(imp FabricImportRequest) (string, error) {
 		trtype = fabricTrtypeTCP
 	}
 
-	if controller, ok, err := f.findController(imp.NQN); err != nil {
+	endpoint := controllerEndpoint{trtype: trtype, traddr: host, trsvcid: port}
+
+	controller, stale, err := f.findController(imp.NQN, endpoint)
+	if err != nil {
 		return "", err
-	} else if ok {
+	}
+
+	if controller != "" {
 		return f.namespacePath(controller)
+	}
+
+	for _, name := range stale {
+		if err := f.connector.Disconnect(name); err != nil {
+			return "", fmt.Errorf("disconnect stale controller %s: %w", name, err)
+		}
 	}
 
 	err = f.connector.Connect(ConnectRequest{
@@ -1033,40 +1068,52 @@ func (f *Fabric) attach(imp FabricImportRequest) (string, error) {
 		return "", err
 	}
 
-	controller, ok, err := f.findController(imp.NQN)
+	controller, _, err = f.findController(imp.NQN, endpoint)
 	if err != nil {
 		return "", err
 	}
 
-	if !ok {
+	if controller == "" {
 		return "", fmt.Errorf("connected to %s but no controller appeared", imp.NQN)
 	}
 
 	return f.namespacePath(controller)
 }
 
-// findController locates a controller this node attached, by the subsystem it
-// carries.
+// controllerEndpoint is the kernel-visible identity of an NVMe-oF connection.
+// The subsystem NQN alone is not enough: changing address or transport requires
+// replacing the controller because its reconnect parameters are immutable.
+type controllerEndpoint struct {
+	trtype  string
+	traddr  string
+	trsvcid string
+}
+
+// findController locates a controller this node attached at the requested
+// endpoint. Controllers for the same subsystem at another endpoint are returned
+// separately so attach can replace them.
 //
 // The host NQN is part of the match, not just the subsystem's. /sys/class/nvme
 // is one namespace for the whole kernel, so a controller reached by a different
 // host identity is not this node's to reuse or to tear down: adopting it would
 // make this node's device path depend on another host's lifetime, and pruning
 // it would cut a link this node never made.
-func (f *Fabric) findController(nqn string) (string, bool, error) {
+func (f *Fabric) findController(nqn string, want controllerEndpoint) (string, []string, error) {
 	entries, err := os.ReadDir(f.sysClassNvme)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", false, nil
+			return "", nil, nil
 		}
 
-		return "", false, fmt.Errorf("read %s: %w", f.sysClassNvme, err)
+		return "", nil, fmt.Errorf("read %s: %w", f.sysClassNvme, err)
 	}
+
+	var stale []string
 
 	for _, entry := range entries {
 		ours, err := f.ownsController(entry.Name())
 		if err != nil {
-			return "", false, err
+			return "", nil, err
 		}
 
 		if !ours {
@@ -1075,15 +1122,58 @@ func (f *Fabric) findController(nqn string) (string, bool, error) {
 
 		subsys, err := readAttr(filepath.Join(f.sysClassNvme, entry.Name(), "subsysnqn"))
 		if err != nil {
-			return "", false, err
+			return "", nil, err
 		}
 
-		if subsys == nqn {
-			return entry.Name(), true, nil
+		if subsys != nqn {
+			continue
+		}
+
+		endpoint, err := f.readControllerEndpoint(entry.Name())
+		if err != nil {
+			return "", nil, err
+		}
+
+		if endpoint == want {
+			return entry.Name(), stale, nil
+		}
+
+		stale = append(stale, entry.Name())
+	}
+
+	return "", stale, nil
+}
+
+// readControllerEndpoint reads the transport and destination from sysfs. The
+// address attribute may also contain source-side fields, which are deliberately
+// ignored because they are not part of the requested target endpoint.
+func (f *Fabric) readControllerEndpoint(controller string) (controllerEndpoint, error) {
+	dir := filepath.Join(f.sysClassNvme, controller)
+
+	transport, err := readAttr(filepath.Join(dir, "transport"))
+	if err != nil {
+		return controllerEndpoint{}, err
+	}
+
+	address, err := readAttr(filepath.Join(dir, "address"))
+	if err != nil {
+		return controllerEndpoint{}, err
+	}
+
+	values := map[string]string{}
+
+	for _, field := range strings.Split(address, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(field), "=")
+		if ok {
+			values[key] = value
 		}
 	}
 
-	return "", false, nil
+	return controllerEndpoint{
+		trtype:  transport,
+		traddr:  values["traddr"],
+		trsvcid: values["trsvcid"],
+	}, nil
 }
 
 // ownsController reports whether a controller was attached by this node.
@@ -1193,15 +1283,39 @@ func namespacesIn(dir, prefix string) ([]string, error) {
 	return found, nil
 }
 
-// pruneControllers disconnects racer subsystems the plan no longer imports.
+// pruneControllers disconnects racer subsystems or endpoints the plan no longer
+// imports.
 // Only controllers this node attached, whose subsystem NQN carries our prefix,
 // are considered: a node that also mounts unrelated NVMe-oF storage keeps it,
 // and a node sharing a kernel with another racer node keeps that node's links.
 func (f *Fabric) pruneControllers(plan FabricPlan) error {
-	keep := make(map[string]struct{}, len(plan.Imports))
+	keep := make(map[string]map[controllerEndpoint]struct{}, len(plan.Imports))
+	keepAll := make(map[string]struct{})
+
+	var problems []error
 
 	for _, imp := range plan.Imports {
-		keep[imp.NQN] = struct{}{}
+		host, port, err := splitFabricAddr(imp.Addr)
+		if err != nil {
+			// Attach already reported the malformed endpoint. Retain any existing
+			// controller for this NQN rather than turning bad input into an
+			// unrelated disconnect, while still pruning the rest of the plan.
+			keepAll[imp.NQN] = struct{}{}
+			problems = append(problems, fmt.Errorf("import %s endpoint: %w", imp.NQN, err))
+
+			continue
+		}
+
+		trtype := imp.Trtype
+		if trtype == "" {
+			trtype = fabricTrtypeTCP
+		}
+
+		if keep[imp.NQN] == nil {
+			keep[imp.NQN] = map[controllerEndpoint]struct{}{}
+		}
+
+		keep[imp.NQN][controllerEndpoint{trtype: trtype, traddr: host, trsvcid: port}] = struct{}{}
 	}
 
 	entries, err := os.ReadDir(f.sysClassNvme)
@@ -1216,8 +1330,6 @@ func (f *Fabric) pruneControllers(plan FabricPlan) error {
 	// A node's own subsystem is attached by that node too: racer reads its own
 	// fabric device through the fabric like any peer's.
 	ours := f.nqnPrefix + ".u"
-
-	var problems []error
 
 	for _, entry := range entries {
 		mine, err := f.ownsController(entry.Name())
@@ -1240,8 +1352,21 @@ func (f *Fabric) pruneControllers(plan FabricPlan) error {
 			continue
 		}
 
-		if _, ok := keep[subsys]; ok {
+		if _, ok := keepAll[subsys]; ok {
 			continue
+		}
+
+		if endpoints := keep[subsys]; len(endpoints) > 0 {
+			endpoint, endpointErr := f.readControllerEndpoint(entry.Name())
+			if endpointErr != nil {
+				problems = append(problems, endpointErr)
+
+				continue
+			}
+
+			if _, ok := endpoints[endpoint]; ok {
+				continue
+			}
 		}
 
 		if err := f.connector.Disconnect(entry.Name()); err != nil {

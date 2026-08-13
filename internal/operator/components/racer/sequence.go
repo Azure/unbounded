@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
 	"github.com/Azure/unbounded/internal/racerctrl"
 )
 
@@ -26,6 +28,14 @@ func (p *pass) sequence(ctx context.Context) error {
 	}
 
 	if err := p.collectDeletedVolumes(ctx); err != nil {
+		return err
+	}
+
+	if err := p.recoverOrphanVolumes(ctx); err != nil {
+		return err
+	}
+
+	if err := p.collectDeletedUniverses(ctx); err != nil {
 		return err
 	}
 
@@ -157,6 +167,76 @@ func (p *pass) collectVolume(ctx context.Context, view *universeView, volume *vo
 	}
 
 	return p.patchVolume(ctx, volume, nil, withoutFinalizer(volume.pv.Finalizers, racerctrl.VolumeFinalizer))
+}
+
+// recoverOrphanVolumes releases finalizers that can no longer protect data.
+//
+// A volume cannot be associated with a universe after its StorageClass is gone:
+// the class was the only object carrying the universe id. Nodes have already
+// stopped deriving that universe, so retaining the finalizer only makes a
+// deleting PV permanent. Non-deleting orphans are left intact and reported.
+func (p *pass) recoverOrphanVolumes(ctx context.Context) error {
+	for i := range p.orphans {
+		volume := &p.orphans[i]
+		if volume.pv.DeletionTimestamp != nil && hasFinalizer(volume.pv.Finalizers, racerctrl.VolumeFinalizer) {
+			if err := p.patchVolume(ctx, volume, nil,
+				withoutFinalizer(volume.pv.Finalizers, racerctrl.VolumeFinalizer)); err != nil {
+				return err
+			}
+
+			p.wait("volume %s lost racer storage class %s; released its collection finalizer",
+				volume.pv.Name, volume.pv.Spec.StorageClassName)
+
+			continue
+		}
+
+		p.wait("volume %s references missing racer storage class %s",
+			volume.pv.Name, volume.pv.Spec.StorageClassName)
+	}
+
+	return nil
+}
+
+// collectDeletedUniverses removes a universe only after every volume is gone.
+// The class finalizer keeps its id, topology, and membership readable until
+// volume collection has completed.
+func (p *pass) collectDeletedUniverses(ctx context.Context) error {
+	for i := range p.universes {
+		view := &p.universes[i]
+		if !view.state.Deleting || !hasFinalizer(view.class.Finalizers, racerctrl.UniverseFinalizer) {
+			continue
+		}
+
+		if len(view.volumes) > 0 {
+			names := make([]string, 0, len(view.volumes))
+			for j := range view.volumes {
+				names = append(names, view.volumes[j].pv.Name)
+			}
+
+			p.wait("universe %s is deleting and still owns volumes: %s", view.class.Name, strings.Join(names, ", "))
+
+			continue
+		}
+
+		for key, membership := range p.memberships {
+			if key.universe != view.state.ID {
+				continue
+			}
+
+			if err := p.env.Client.Delete(ctx, membership); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete membership %s/%s: %w", membership.Namespace, membership.Name, err)
+			}
+
+			delete(p.memberships, key)
+		}
+
+		if err := p.patchClassMeta(ctx, view, nil,
+			withoutFinalizer(view.class.Finalizers, racerctrl.UniverseFinalizer)); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // retireDecommissionedNodes takes a node's identity away once it holds nothing.

@@ -287,7 +287,8 @@ func (h *harness) resetWorkload() {
 // A universe's catalog size is frozen when its zones are seeded, so a class
 // left over from a run that used a different one would quietly keep it. The
 // memberships go with it: they name a universe id that will not be minted
-// again, and nothing collects them once the class that owned them is gone.
+// again. The reset strips the class finalizer rather than waiting for the
+// operator because it also discards the stores and volume finalizers.
 //
 // The node identities are deliberately left alone. They live in annotations on
 // the Node objects and in the operator's allocation cursors, and resetting one
@@ -308,6 +309,12 @@ func (h *harness) resetUniverses(ctx context.Context) {
 
 		if err := h.cli.Delete(ctx, class); err != nil && !apierrors.IsNotFound(err) {
 			h.t.Fatalf("delete storage class %s: %v", class.Name, err)
+		}
+
+		patch := []byte(`{"metadata":{"finalizers":null}}`)
+		if err := h.cli.Patch(ctx, class, client.RawPatch(types.MergePatchType, patch)); err != nil &&
+			!apierrors.IsNotFound(err) {
+			h.t.Fatalf("strip finalizers from storage class %s: %v", class.Name, err)
 		}
 	}
 
