@@ -9,13 +9,13 @@
 //
 // The whole point of the snapshotter is what it does NOT do. When containerd
 // asks to prepare a snapshot for a layer whose chain ID is already published in
-// the cluster catalog, this snapshotter records the committed snapshot straight
-// away and answers ErrAlreadyExists. containerd's unpacker treats that plus a
-// successful Stat as "this layer is done", so the layer blob is never fetched
-// from a registry and never unpacked. On a 40 layer image where every layer is
-// already in the catalog, the node downloads zero layer bytes and runs zero
-// applies; the only work left is mapping each layer's EROFS image out of a
-// RACER segment and mounting it.
+// the cluster catalog, this snapshotter maps the layer onto the node, records
+// the committed snapshot, and answers ErrAlreadyExists. containerd's unpacker
+// treats that plus a successful Stat as "this layer is done", so the layer blob
+// is never fetched from a registry and never unpacked. On a 40 layer image
+// where every layer is already in the catalog, the node downloads zero layer
+// bytes and runs zero applies; the only work left is mapping each layer's EROFS
+// image out of a RACER segment and mounting it.
 //
 // A miss falls back to the ordinary path: an overlayfs active snapshot on local
 // disk, into which containerd applies the layer tar exactly as the built in
@@ -329,8 +329,9 @@ func (s *Snapshotter) workPath(id string) string {
 
 // Prepare creates an active snapshot. When containerd is unpacking an image
 // layer it passes LabelSnapshotRef naming the committed snapshot it wants; if
-// the cluster already has that chain ID, the committed snapshot is created here
-// and ErrAlreadyExists is returned so containerd skips the layer entirely.
+// the cluster already has that chain ID and this node can map it, the committed
+// snapshot is created here and ErrAlreadyExists is returned so containerd skips
+// the layer entirely.
 func (s *Snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	var base snapshots.Info
 	for _, opt := range opts {
@@ -378,6 +379,27 @@ func (s *Snapshotter) adopt(ctx context.Context, key, parent, target string, bas
 	blob, ok := s.resolve(chain)
 	if !ok {
 		return false, nil
+	}
+
+	// Adoption cannot be taken back. Answering ErrAlreadyExists tells
+	// containerd this layer is done, so it neither fetches the blob nor
+	// applies the tar, and nothing revisits that decision afterwards: every
+	// later Prepare for the same chain ID finds the committed snapshot and
+	// gives the same answer. A node that adopts a layer it turns out not to be
+	// able to map has no local copy to fall back on, so every pod that needs
+	// the layer fails to start there until somebody deletes the snapshot by
+	// hand.
+	//
+	// The catalog saying a blob exists is not enough to know this node can
+	// read it. The segment holding it may not be exported here, device mapper
+	// may refuse the target, the EROFS image may not mount. So the layer is
+	// mapped and mounted before the promise is made. That is work the node
+	// would have done at the first container start anyway, Ensure is
+	// idempotent, and Cleanup keeps the mapping for as long as a snapshot
+	// refers to it. If the adoption below then fails, the mapping is left for
+	// Prune, which collects anything no snapshot names.
+	if _, err := s.maps.Ensure(ctx, blob.DiffID, blob.Address); err != nil {
+		return false, fmt.Errorf("map layer %s: %w", blob.DiffID.Short(), err)
 	}
 
 	labels := maps.Clone(base.Labels)

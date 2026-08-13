@@ -338,10 +338,46 @@ func TestPrepareHitSkipsTheLayer(t *testing.T) {
 		t.Fatalf("usage = %d, want %d", usage.Size, addrOf(0).ByteLength)
 	}
 
-	// Nothing was mapped: adoption records metadata only, mounting happens when
-	// a container actually wants the layer.
-	if len(h.m.ensured) != 0 {
-		t.Fatalf("adoption mapped %d layers, want 0", len(h.m.ensured))
+	// The layer was mapped before the promise was made. Adopting a layer this
+	// node cannot read would be unrecoverable, because containerd never
+	// revisits a chain ID it has been told already exists.
+	name := h.m.Name(diffID, addrOf(0))
+	if h.m.ensured[name] != 1 {
+		t.Fatalf("adoption mapped %q %d times, want 1", name, h.m.ensured[name])
+	}
+}
+
+func TestPrepareRefusesToAdoptALayerItCannotMap(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	chain, diffID := digestOf(1), digestOf(2)
+	h.cat.publish(chain, diffID, addrOf(0))
+
+	// The catalog knows the blob, but this node cannot reach it: the segment
+	// holding it is not exported here, or device mapper refuses the target.
+	h.m.err = errors.New("segment 1 is not exported on this node")
+
+	mounts, err := h.sn.Prepare(h.ctx, "extract-0", "", snapshots.WithLabels(map[string]string{
+		LabelSnapshotRef: chain.String(),
+		LabelDiffID:      diffID.String(),
+	}))
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// Falling back to the ordinary unpack path is slow but always works.
+	if len(mounts) == 0 {
+		t.Fatal("expected the ordinary unpack path")
+	}
+
+	if _, err := h.sn.Stat(h.ctx, chain.String()); err == nil {
+		t.Fatal("an unmappable layer must not be adopted: the snapshot would be permanently unstartable")
+	}
+
+	if _, err := h.sn.Stat(h.ctx, "extract-0"); err != nil {
+		t.Fatalf("the active snapshot must exist for containerd to unpack into: %v", err)
 	}
 }
 
@@ -496,9 +532,11 @@ func TestMountsStackClusterLayers(t *testing.T) {
 		t.Fatal("Mounts disagreed with Prepare")
 	}
 
+	// Ensure is idempotent, so the count only records how often it was asked:
+	// once when the layer was adopted, then once per assembled mount.
 	for name, n := range h.m.ensured {
-		if n != 2 {
-			t.Fatalf("layer %s mapped %d times across two calls, want 2", name, n)
+		if n != 3 {
+			t.Fatalf("layer %s mapped %d times, want 3 (adopt, Prepare, Mounts)", name, n)
 		}
 	}
 }
