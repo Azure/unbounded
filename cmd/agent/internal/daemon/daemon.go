@@ -94,6 +94,10 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		"applied_version", active.Config.Cluster.Version,
 	)
 
+	if err := runOpts.NodeOperator.EnsureLifecycleMigration(ctx, log, active); err != nil {
+		return fmt.Errorf("ensure nspawn lifecycle migration: %w", err)
+	}
+
 	controllerCfg, stopControllerCreds, err := daemonControllerCredentials(ctx, log, active.Config, runOpts)
 	if err != nil {
 		return fmt.Errorf("build daemon controller credentials: %w", err)

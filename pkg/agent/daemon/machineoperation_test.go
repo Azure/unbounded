@@ -29,6 +29,10 @@ func TestNewMachinaMachineOperationReconcilerValidatesInputs(t *testing.T) {
 		t.Fatal("NewMachinaMachineOperationReconciler nil client error = nil")
 	}
 
+	if _, err := NewMachinaMachineOperationReconcilerWithReader(c, nil, "machine-1", "node-1", MachineOperationHandlers{machinav1alpha3.OperationNodeReboot: noopMachineOperationTarget}); err == nil {
+		t.Fatal("NewMachinaMachineOperationReconcilerWithReader nil reader error = nil")
+	}
+
 	if _, err := NewMachinaMachineOperationReconciler(c, "", "node-1", MachineOperationHandlers{machinav1alpha3.OperationNodeReboot: noopMachineOperationTarget}); err == nil {
 		t.Fatal("NewMachinaMachineOperationReconciler empty machine name error = nil")
 	}
@@ -83,6 +87,37 @@ func TestMachinaMachineOperationReconcilerDispatchesTarget(t *testing.T) {
 
 	if target.operation.Kind != machinav1alpha3.OperationNodeReboot {
 		t.Fatalf("kind = %v", target.operation.Kind)
+	}
+}
+
+func TestMachinaMachineOperationReconcilerUsesUncachedTerminalState(t *testing.T) {
+	t.Parallel()
+
+	pending := &machinav1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec:       machinav1alpha3.MachineOperationSpec{OperationKind: machinav1alpha3.OperationNodeReboot},
+	}
+	terminal := pending.DeepCopy()
+	terminal.Status.Phase = machinav1alpha3.OperationPhaseComplete
+	target := &recordingMachineOperationTargetState{}
+
+	reconciler, err := NewMachinaMachineOperationReconcilerWithReader(
+		fakeMachineOperationClient(pending),
+		fakeMachineOperationClient(terminal),
+		"machine-1",
+		"node-1",
+		MachineOperationHandlers{machinav1alpha3.OperationNodeReboot: target.reconcile},
+	)
+	if err != nil {
+		t.Fatalf("NewMachinaMachineOperationReconcilerWithReader: %v", err)
+	}
+
+	if _, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1"); err != nil {
+		t.Fatalf("ReconcileMachineOperation: %v", err)
+	}
+
+	if target.called {
+		t.Fatal("terminal operation dispatched from stale cached state")
 	}
 }
 

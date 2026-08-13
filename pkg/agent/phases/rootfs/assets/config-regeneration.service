@@ -1,0 +1,14 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[Unit]
+Description=Regenerate configuration for {{.MachineName}}
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart={{.AgentBinaryPath}} nspawn-lifecycle pre-start {{.MachineName}}
+Restart=on-failure
+RestartMode=direct
+RestartSec=10s

@@ -31,6 +31,7 @@ const (
 	DaemonBinaryGreenPath        = "/usr/local/bin/unbounded-agent-green"
 	DaemonBinaryCurrentPath      = "/usr/local/bin/unbounded-agent-current"
 	DaemonBinaryLastGoodPath     = "/usr/local/bin/unbounded-agent-last-good"
+	NSpawnLifecycleBinaryPath    = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
 	DaemonRecoveryScriptPath     = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
 	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
@@ -73,6 +74,12 @@ func AlternateMachine(current string) string {
 // BPFFSMountPath returns the host-side bpffs mount path for an nspawn machine.
 func BPFFSMountPath(machineName string) string {
 	return fmt.Sprintf("%s/%s", BPFFSMountDir, machineName)
+}
+
+// ConfigRegenerationUnit returns the systemd unit that regenerates host-side
+// configuration before the named machine starts.
+func ConfigRegenerationUnit(machineName string) string {
+	return fmt.Sprintf("unbounded-agent-regenerate-config@%s.service", machineName)
 }
 
 // AppliedConfigPath returns the path to the applied config file for the
@@ -166,6 +173,7 @@ const (
 	SystemdUnitContainerd      = "containerd.service"
 	ContainerdConfigPath       = "/etc/containerd/config.toml"
 	ContainerdConfDropInDir    = "/etc/containerd/conf.d"
+	NvidiaRuntimeDropInPath    = ContainerdConfDropInDir + "/99-nvidia-runtime.toml"
 	ContainerdCertsDir         = "/etc/containerd/certs.d"
 	ContainerdDefaultHostsDir  = ContainerdCertsDir + "/_default"
 	ContainerdDefaultHostsPath = ContainerdDefaultHostsDir + "/hosts.toml"

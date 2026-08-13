@@ -33,7 +33,6 @@ func TestConfigureKubeletWritesHostnameOverride(t *testing.T) {
 			ClusterDNS: "10.0.0.10",
 		},
 	}
-
 	require.NoError(t, ConfigureKubelet(goalState).Do(context.Background()))
 
 	data, err := os.ReadFile(filepath.Join(
@@ -62,7 +61,6 @@ func TestConfigureKubeletOmitsNodeIPWhenEmpty(t *testing.T) {
 			ClusterDNS: "10.0.0.10",
 		},
 	}
-
 	require.NoError(t, ConfigureKubelet(goalState).Do(context.Background()))
 
 	data, err := os.ReadFile(filepath.Join(
@@ -185,6 +183,35 @@ func TestConfigureKubeletWritesConfiguration(t *testing.T) {
 	require.Contains(t, string(service), "--config=/var/lib/kubelet/config.yaml")
 	require.NotContains(t, string(service), "--pod-max-pids=")
 	require.NotContains(t, string(service), "--cluster-dns=")
+}
+
+func TestConfigureKubeletDoesNotInstallLifecycleReadinessGate(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	goalState := &goalstates.NodeStart{
+		MachineDir: machineDir,
+		NodeName:   "worker-1",
+		Nvidia: goalstates.NvidiaHost{
+			Required:       true,
+			GPUDevicePaths: []string{"/dev/nvidia0"},
+			LibMappings:    []goalstates.NvidiaLibMapping{{HostPath: "/usr/lib/libcuda.so.1"}},
+		},
+		Kubelet: goalstates.Kubelet{
+			CACertData: []byte("ca"),
+			ClusterDNS: "10.0.0.10",
+			KubeletAuthInfo: config.KubeletAuthInfo{
+				BootstrapToken: "token",
+			},
+		},
+	}
+	goalState.Containerd.NvidiaRuntime.Enabled = true
+
+	require.NoError(t, ConfigureKubelet(goalState).Do(context.Background()))
+
+	service, err := os.ReadFile(filepath.Join(machineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitKubelet))
+	require.NoError(t, err)
+	require.NotContains(t, string(service), "unbounded-nvidia-ready")
 }
 
 func TestConfigureKubeletWritesImageCredentialProviderFlags(t *testing.T) {

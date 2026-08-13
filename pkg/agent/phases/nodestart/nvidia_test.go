@@ -4,12 +4,33 @@
 package nodestart
 
 import (
+	"context"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
+
+func TestSetupNVIDIAProvisionedCapabilityControlsBehavior(t *testing.T) {
+	t.Parallel()
+
+	log := slog.New(slog.DiscardHandler)
+	require.NoError(t, SetupNVIDIA(log, &goalstates.NodeStart{}).Do(context.Background()))
+
+	err := SetupNVIDIA(log, &goalstates.NodeStart{Nvidia: goalstates.NvidiaHost{Required: true}}).Do(context.Background())
+	require.ErrorContains(t, err, "NVIDIA is required")
+}
+
+func TestReconcileNVIDIANonGPUIsNoop(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, ReconcileNVIDIA(
+		slog.New(slog.DiscardHandler),
+		&goalstates.NodeStart{MachineName: "kube1"},
+	).Do(context.Background()))
+}
 
 func TestRequiredVersionedNVIDIALibraryPaths(t *testing.T) {
 	t.Parallel()
