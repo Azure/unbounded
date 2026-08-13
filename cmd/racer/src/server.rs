@@ -185,14 +185,14 @@ impl Node {
                 // One metric row per worker; the worker count is settled here.
                 metrics::init(cores);
                 // Leaked like the allocator: a hop closure must be `'static`.
-                let cache = cache::open(alloc, &cfg, cores);
+                let (cache, rows) = cache::open(alloc, &cfg, cores);
                 // The allocator loans free 4 MiB slots back through this from inside a
                 // reservation. Installed before any worker runs.
                 alloc.attach(cache);
                 let p = paxos::open(alloc, cache, cores);
                 let _ = self.paxos.set(p);
                 let _ = self.heal.set(heal::open(p, cores));
-                c.core_state(CoreState::all(cores));
+                c.core_state(CoreState::all(rows));
                 p
             }
         };
@@ -222,9 +222,9 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
     let cores = c.cores();
     let alloc = alloc::open(&store, disk, &cfg, cores)?;
     metrics::init(cores);
-    let cache = cache::open(alloc, &cfg, cores);
+    let (cache, rows) = cache::open(alloc, &cfg, cores);
     let paxos = paxos::open(alloc, cache, cores);
-    c.core_state(CoreState::all(cores));
+    c.core_state(CoreState::all(rows));
     Ok(Dataplane {
         roster: cache::Roster::of(&cfg),
         config: cfg,
@@ -244,14 +244,18 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
 /// `unsafe impl Sync`, because a `&` to it is only ever handed out by the worker that
 /// owns it, for a transaction that cannot await.
 pub struct CoreState {
+    pub(crate) cache: cache::Row,
     pub(crate) heal: heal::Core,
 }
 
 impl CoreState {
-    /// One row per worker, in worker order.
-    pub(crate) fn all(cores: usize) -> Vec<CoreState> {
-        (0..cores)
-            .map(|_| CoreState {
+    /// One row per worker, in worker order, from the rows each subsystem built while it
+    /// opened.
+    pub(crate) fn all(cache: Vec<cache::Row>) -> Vec<CoreState> {
+        cache
+            .into_iter()
+            .map(|cache| CoreState {
+                cache,
                 heal: heal::Core::default(),
             })
             .collect()

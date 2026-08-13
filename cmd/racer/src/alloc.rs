@@ -289,7 +289,7 @@ impl Allocator {
                 .min(LEND_BATCH)
         };
         for _ in 0..want {
-            let Some(off) = cache.give_back(core) else {
+            let Some(off) = cache.give_back() else {
                 break;
             };
             let Some(slot) = self.geo.slot_at(Class::Huge, off) else {
