@@ -169,20 +169,29 @@ func (p *pass) loadMemberships(ctx context.Context) error {
 // epoch that names it, creating the ConfigMap the first time the zone gets a
 // catalog.
 //
-// The two go in one object because they have to change together and Kubernetes
-// has no transaction spanning two. A catalog published by itself, with the
-// epoch left to a second write that may never happen, is a configuration the
-// cluster cannot tell apart from the one before it.
-func (p *pass) writeMembership(ctx context.Context, universe, zone uint32, members racerctrl.Membership, epoch uint32) error {
+// The three go in one object because they have to change together and
+// Kubernetes has no transaction spanning two. A catalog published by itself,
+// with the epoch left to a second write that may never happen, is a
+// configuration the cluster cannot tell apart from the one before it; and a
+// catalog that drops an id without naming it as draining is one the dropped
+// node never learns about.
+func (p *pass) writeMembership(
+	ctx context.Context,
+	universe, zone uint32,
+	members, draining racerctrl.Membership,
+	epoch uint32,
+) error {
 	key := membershipKey{universe: universe, zone: zone}
 
 	desired := map[string]string{
-		racerctrl.MembershipDataKey:  racerctrl.FormatMembership(members),
-		racerctrl.MembershipEpochKey: formatUint(uint64(epoch)),
+		racerctrl.MembershipDataKey:     racerctrl.FormatMembership(members),
+		racerctrl.MembershipDrainingKey: racerctrl.FormatMembership(draining),
+		racerctrl.MembershipEpochKey:    formatUint(uint64(epoch)),
 	}
 
 	if item, ok := p.memberships[key]; ok {
 		if item.Data[racerctrl.MembershipDataKey] == desired[racerctrl.MembershipDataKey] &&
+			item.Data[racerctrl.MembershipDrainingKey] == desired[racerctrl.MembershipDrainingKey] &&
 			item.Data[racerctrl.MembershipEpochKey] == desired[racerctrl.MembershipEpochKey] {
 			return nil
 		}
@@ -299,12 +308,18 @@ func (p *pass) loadUniverses(ctx context.Context) error {
 				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
 			}
 
+			draining, err := racerctrl.ParseMembership(item.Data[racerctrl.MembershipDrainingKey])
+			if err != nil {
+				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
+			}
+
 			epoch, err := racerctrl.ParseMembershipEpoch(item.Data)
 			if err != nil {
 				return fmt.Errorf("parse %s/%s: %w", item.Namespace, item.Name, err)
 			}
 
 			view.state.Members[key.zone] = members
+			view.state.Draining[key.zone] = draining
 			view.state.MemberEpochs[key.zone] = epoch
 		}
 	}

@@ -812,6 +812,16 @@ func TestReconcileMembershipBootstrapsWithNoHealthReported(t *testing.T) {
 	}
 }
 
+// appliedAt is the annotation an agent writes to say which generation it
+// installed and which universe epoch that generation carried. Every gate needs
+// it: racer reports only which generation is in force, never what is in it.
+func appliedAt(generation uint64, universe, epoch uint32) string {
+	return racerctrl.FormatApplied(racerctrl.Applied{
+		Generation: generation,
+		Epochs:     map[uint32]uint32{universe: epoch},
+	})
+}
+
 // replacementObjects builds a zone whose membership is already published and
 // whose first member has gone away, so exactly one swap is wanted. health names
 // the health annotation each node reports; a node absent from it reports none.
@@ -838,8 +848,10 @@ func replacementObjects(seeded string, health map[string]string) []client.Object
 
 		if value, ok := health[name]; ok {
 			annotations[racerctrl.NodeHealthAnnotation] = value
+			annotations[racerctrl.NodeAppliedAnnotation] = appliedAt(1, 1, 1)
 		} else if name != "n4" {
 			annotations[racerctrl.NodeHealthAnnotation] = "generation=1"
+			annotations[racerctrl.NodeAppliedAnnotation] = appliedAt(1, 1, 1)
 		}
 
 		node := enrolledNode(name, "east", annotations)
@@ -1080,10 +1092,11 @@ func nodeLabels(ctx context.Context, t *testing.T, env *component.Env, name stri
 // decommission looks like.
 func decommissioningNode(name string, id uint32) *corev1.Node {
 	node := enrolledNode(name, "east", map[string]string{
-		racerctrl.NodeIDAnnotation:     formatUint(uint64(id)),
-		racerctrl.NodeZoneAnnotation:   "1",
-		racerctrl.NodeCohortAnnotation: "0",
-		racerctrl.NodeHealthAnnotation: "generation=4",
+		racerctrl.NodeIDAnnotation:      formatUint(uint64(id)),
+		racerctrl.NodeZoneAnnotation:    "1",
+		racerctrl.NodeCohortAnnotation:  "0",
+		racerctrl.NodeHealthAnnotation:  "generation=4",
+		racerctrl.NodeAppliedAnnotation: appliedAt(4, 1, 4),
 	})
 
 	delete(node.Labels, EnrollmentLabel)

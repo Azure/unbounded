@@ -62,6 +62,46 @@ type NodeState struct {
 
 	// Live is per-extent liveness, keyed by extent id.
 	Live map[uint32]LiveExtent
+
+	// Applied is what the agent last wrote to this node's config file, and the
+	// facts that configuration carried.
+	Applied Applied
+}
+
+// Applied describes the configuration the agent last installed on a node.
+//
+// It exists because Health.Generation, on its own, says only that racer has
+// some configuration in force; it does not say what is in it. Every sequenced
+// operation waits on a fact the control plane put in a configuration - a
+// catalog at an epoch, an extent pointed at a new zone, a tombstone epoch
+// advanced - and the only way to know a node is acting on that fact is to know
+// which generation carried it. The agent knows, because it wrote it.
+//
+// The comparison is therefore: the agent says generation G carried these facts,
+// racer says generation G or later is in force, so racer is acting on them.
+// This always describes the latest configuration written, never a history, so a
+// fact that has since been withdrawn is simply not here.
+type Applied struct {
+	// Generation is the generation of the configuration this describes. Zero
+	// means the agent has not published anything, which every gate reads as no
+	// report rather than as agreement.
+	Generation uint64
+
+	// Epochs is the topology epoch each universe was published at, keyed by
+	// universe id.
+	Epochs map[uint32]uint32
+
+	// Extents carries only the extents in the middle of a sequenced operation:
+	// those with a migration destination or a tombstone epoch. Every other
+	// extent is at rest and nothing waits on it, so carrying them all would
+	// spend the node's annotation budget to say nothing.
+	Extents map[uint32]AppliedExtent
+}
+
+// AppliedExtent is the part of an extent's configuration a sequencer waits on.
+type AppliedExtent struct {
+	NextZone       uint32
+	TombstoneEpoch uint32
 }
 
 // DeviceBinding names a volume this node exports and the ublk minor it exports
@@ -169,6 +209,11 @@ type UniverseState struct {
 	// itself. A zone with no entry has no published membership, or one from
 	// before the epoch travelled with it; either way Epoch stands in.
 	MemberEpochs map[uint32]uint32
+
+	// Draining is each zone's departing nodes, keyed by zone id: nodes the
+	// catalog no longer names but which have not yet handed over what they
+	// held. They keep deriving the universe, so racer keeps shedding.
+	Draining map[uint32]Membership
 
 	// Gateways is each zone's gateway node ids, keyed by zone id. A zone with no
 	// entry falls back to its membership.
@@ -321,6 +366,42 @@ func EstablishedUniverses(cfg *racerconfig.NodeConfig) map[uint32]bool {
 	return established
 }
 
+// AppliedFrom reads back the facts a sequencer waits on out of the
+// configuration that carries them.
+//
+// The agent calls this on the file it has just installed, so that what it
+// publishes about itself describes a configuration that exists rather than one
+// it intends. Only the extents in the middle of an operation are carried: an
+// extent with a migration destination or a tombstone epoch. Everything else is
+// at rest, and a per-extent entry for every extent on a node would spend the
+// whole annotation budget restating that.
+func AppliedFrom(cfg *racerconfig.NodeConfig) Applied {
+	universes := cfg.GetUniverses()
+
+	applied := Applied{
+		Generation: cfg.GetGeneration(),
+		Epochs:     make(map[uint32]uint32, len(universes)),
+		Extents:    map[uint32]AppliedExtent{},
+	}
+
+	for _, universe := range universes {
+		applied.Epochs[universe.GetId()] = universe.GetEpoch()
+
+		for _, extent := range universe.GetExtents() {
+			if extent.GetNextZone() == 0 && extent.GetTombstoneEpoch() == 0 {
+				continue
+			}
+
+			applied.Extents[extent.GetId()] = AppliedExtent{
+				NextZone:       extent.GetNextZone(),
+				TombstoneEpoch: extent.GetTombstoneEpoch(),
+			}
+		}
+	}
+
+	return applied
+}
+
 // publishable replaces a universe this node cannot serve yet with the inert
 // shape that lets racer create its fabric device, and reports which universes
 // were replaced.
@@ -399,14 +480,26 @@ func fabricSatisfied(universe *racerconfig.Universe) bool {
 }
 
 // joins reports whether this node takes part in a universe at all. A node joins
-// either because its zone's catalog names it, or because it exports one of the
+// because its zone's catalog names it, because the catalog has just stopped
+// naming it and it is still draining, or because it exports one of the
 // universe's volumes and so has to route for it.
+//
+// The draining case is the one that is not obvious. A node dropped from a
+// catalog has to keep running that universe, with itself absent from the
+// catalog, because that is the configuration that tells racer the groups it
+// holds are no longer its own. Stop deriving the universe and the node keeps
+// the configuration that still names it, sheds nothing, and holds its registers
+// until the process ends.
 func (d *Derivation) joins(state *UniverseState, volumes map[string]struct{}) (bool, error) {
 	if state.ID == 0 {
 		return false, fmt.Errorf("storage class %q has no universe id yet", state.Class)
 	}
 
 	if state.Members[d.Self.Zone].Contains(d.Self.ID) {
+		return true, nil
+	}
+
+	if state.Draining[d.Self.Zone].Contains(d.Self.ID) {
 		return true, nil
 	}
 

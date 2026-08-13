@@ -137,3 +137,104 @@ func TestBuildClusterStateDatesAMembership(t *testing.T) {
 		t.Fatalf("an undated membership runs at epoch %d, want the class's 4", got)
 	}
 }
+
+// A node the catalog has stopped naming is not finished with the universe: it
+// still holds registers, and it drops one only once it has asked the new
+// members whether they hold that version. Both halves of that conversation need
+// the fabric, so a draining node keeps its export and stays in every survivor's
+// allowed hosts.
+func TestPlanFabricKeepsADrainingNodeConnected(t *testing.T) {
+	self := racerctrl.NodeState{
+		Name: "n1", ID: 1, Zone: 1,
+		Fabric: []racerctrl.FabricExport{{UniverseID: 1, DeviceID: 7}},
+	}
+
+	universe := racerctrl.UniverseState{
+		ID: 1,
+		Members: map[uint32]racerctrl.Membership{1: {
+			{NodeID: 4, Cohort: 0}, {NodeID: 2, Cohort: 1}, {NodeID: 3, Cohort: 2},
+		}},
+		Draining: map[uint32]racerctrl.Membership{1: {{NodeID: 1, Cohort: 0}}},
+	}
+
+	plan := PlanFabric(&Fabric{}, racerctrl.ClusterState{
+		Nodes:     []racerctrl.NodeState{self},
+		Universes: []racerctrl.UniverseState{universe},
+	}, self)
+
+	if len(plan.Exports) != 1 {
+		t.Fatalf("a draining node published %d exports, want the one it is draining through", len(plan.Exports))
+	}
+
+	if got := plan.Exports[0].AllowedNodes; len(got) != 4 {
+		t.Fatalf("allowed hosts %v, want the three new members and itself", got)
+	}
+}
+
+// The survivors have to admit the node handing groups to them, or the query it
+// makes before dropping a register never gets an answer.
+func TestPlanFabricAdmitsTheNodeDrainingIntoUs(t *testing.T) {
+	self := racerctrl.NodeState{
+		Name: "n4", ID: 4, Zone: 1,
+		Fabric: []racerctrl.FabricExport{{UniverseID: 1, DeviceID: 7}},
+	}
+
+	universe := racerctrl.UniverseState{
+		ID: 1,
+		Members: map[uint32]racerctrl.Membership{1: {
+			{NodeID: 4, Cohort: 0}, {NodeID: 2, Cohort: 1}, {NodeID: 3, Cohort: 2},
+		}},
+		Draining: map[uint32]racerctrl.Membership{1: {{NodeID: 1, Cohort: 0}}},
+	}
+
+	plan := PlanFabric(&Fabric{}, racerctrl.ClusterState{
+		Nodes:     []racerctrl.NodeState{self},
+		Universes: []racerctrl.UniverseState{universe},
+	}, self)
+
+	found := false
+
+	for _, id := range plan.Exports[0].AllowedNodes {
+		if id == 1 {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatalf("allowed hosts %v omit the draining node, which can then never hand its groups over", plan.Exports[0].AllowedNodes)
+	}
+}
+
+// The draining set travels with the membership, because it is the same
+// decision: who this zone's nodes link to and admit.
+func TestBuildClusterStateCarriesTheDrainingSet(t *testing.T) {
+	class := &storagev1.StorageClass{
+		ObjectMeta:  metav1.ObjectMeta{Name: "fast"},
+		Provisioner: racerctrl.DriverName,
+	}
+	class.Annotations = map[string]string{
+		racerctrl.UniverseIDAnnotation:  "1",
+		racerctrl.CatalogSizeAnnotation: "3",
+		racerctrl.EpochAnnotation:       "4",
+	}
+
+	state := BuildClusterState(nil,
+		[]*storagev1.StorageClass{class},
+		nil,
+		[]*corev1.ConfigMap{{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   racerctrl.MembershipConfigMapName(1, 1),
+				Labels: racerctrl.MembershipLabels(1, 1),
+			},
+			Data: map[string]string{
+				racerctrl.MembershipDataKey:     "4?cohort=0,2?cohort=1,3?cohort=2",
+				racerctrl.MembershipDrainingKey: "1?cohort=0",
+				racerctrl.MembershipEpochKey:    "7",
+			},
+		}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if !state.Universes[0].Draining[1].Contains(1) {
+		t.Fatalf("draining set %v lost the node it names", state.Universes[0].Draining[1])
+	}
+}

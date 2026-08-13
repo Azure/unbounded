@@ -104,6 +104,10 @@ func ParseNodeState(name string, annotations map[string]string) (NodeState, erro
 		return NodeState{}, fmt.Errorf("node %q: %s: %w", name, NodeLiveAnnotation, err)
 	}
 
+	if state.Applied, err = ParseApplied(annotations[NodeAppliedAnnotation]); err != nil {
+		return NodeState{}, fmt.Errorf("node %q: %s: %w", name, NodeAppliedAnnotation, err)
+	}
+
 	return state, nil
 }
 
@@ -116,7 +120,8 @@ func (n *NodeState) StatusAnnotations() map[string]string {
 		NodeDevicesAnnotation:    FormatDeviceBindings(n.Devices),
 		NodeFabricAnnotation:     FormatFabricExports(n.Fabric),
 		NodeHealthAnnotation:     FormatHealth(n.Health),
-		NodeLiveAnnotation:       FormatLive(n.Live),
+		NodeLiveAnnotation:       FormatLive(n.Live, n.Applied.Extents),
+		NodeAppliedAnnotation:    FormatApplied(n.Applied),
 	}
 }
 
@@ -327,11 +332,30 @@ func ParseHealth(raw string) (Health, error) {
 // FormatLive renders per-extent liveness. Extents with nothing to report are
 // omitted, since the annotation has a 256 KiB ceiling and a node can carry a
 // thousand extents.
-func FormatLive(live map[uint32]LiveExtent) string {
-	ids := make([]uint32, 0, len(live))
+//
+// Required names the extents that must be reported anyway, even at zero: the
+// ones in the middle of a sequenced operation. Omission is otherwise
+// indistinguishable from a count of zero, and every gate that reads this is
+// waiting for a zero, so the compression that keeps the annotation small would
+// otherwise let an extent nobody has said anything about pass for an extent
+// that has drained.
+func FormatLive(live map[uint32]LiveExtent, required map[uint32]AppliedExtent) string {
+	ids := make([]uint32, 0, len(live)+len(required))
+	seen := make(map[uint32]struct{}, len(live)+len(required))
 
 	for id, extent := range live {
 		if extent.Pages == 0 && extent.Tombstones == 0 {
+			if _, ok := required[id]; !ok {
+				continue
+			}
+		}
+
+		ids = append(ids, id)
+		seen[id] = struct{}{}
+	}
+
+	for id := range required {
+		if _, ok := seen[id]; ok {
 			continue
 		}
 
@@ -358,8 +382,8 @@ func FormatLive(live map[uint32]LiveExtent) string {
 	return FormatList(entries)
 }
 
-// ParseLive reads per-extent liveness back. An extent that is absent reads as
-// zero pages and zero tombstones, which is what omitting it meant.
+// ParseLive reads per-extent liveness back. An extent that is absent is absent
+// from the map, which a gate reads as no report rather than as zero.
 func ParseLive(raw string) (map[uint32]LiveExtent, error) {
 	entries, err := ParseList(raw)
 	if err != nil {
@@ -398,6 +422,142 @@ func ParseLive(raw string) (map[uint32]LiveExtent, error) {
 	return live, nil
 }
 
+// Applied annotation keys and item prefixes.
+//
+// Universes and extents share one list, distinguished by a prefix on the item,
+// because they are one fact about one configuration and splitting them over two
+// annotations would let a reader pair the universes of one generation with the
+// extents of another.
+const (
+	appliedGenerationItem = "generation"
+	appliedUniversePrefix = "u"
+	appliedExtentPrefix   = "x"
+
+	appliedAtKey        = "at"
+	appliedEpochKey     = "epoch"
+	appliedNextZoneKey  = "next"
+	appliedTombstoneKey = "tombstone"
+)
+
+// FormatApplied renders what the agent last installed. An Applied with no
+// generation renders empty, which is how a node that has published nothing says
+// so.
+func FormatApplied(applied Applied) string {
+	if applied.Generation == 0 {
+		return ""
+	}
+
+	generation := url.Values{}
+	generation.Set(appliedAtKey, strconv.FormatUint(applied.Generation, 10))
+
+	entries := []ListEntry{{Item: appliedGenerationItem, Values: generation}}
+
+	universes := make([]uint32, 0, len(applied.Epochs))
+	for id := range applied.Epochs {
+		universes = append(universes, id)
+	}
+
+	sort.Slice(universes, func(i, j int) bool { return universes[i] < universes[j] })
+
+	for _, id := range universes {
+		values := url.Values{}
+		values.Set(appliedEpochKey, strconv.FormatUint(uint64(applied.Epochs[id]), 10))
+
+		entries = append(entries, ListEntry{
+			Item:   appliedUniversePrefix + strconv.FormatUint(uint64(id), 10),
+			Values: values,
+		})
+	}
+
+	extents := make([]uint32, 0, len(applied.Extents))
+	for id := range applied.Extents {
+		extents = append(extents, id)
+	}
+
+	sort.Slice(extents, func(i, j int) bool { return extents[i] < extents[j] })
+
+	for _, id := range extents {
+		extent := applied.Extents[id]
+
+		values := url.Values{}
+		values.Set(appliedNextZoneKey, strconv.FormatUint(uint64(extent.NextZone), 10))
+		values.Set(appliedTombstoneKey, strconv.FormatUint(uint64(extent.TombstoneEpoch), 10))
+
+		entries = append(entries, ListEntry{
+			Item:   appliedExtentPrefix + strconv.FormatUint(uint64(id), 10),
+			Values: values,
+		})
+	}
+
+	return FormatList(entries)
+}
+
+// ParseApplied reads it back. An empty annotation is a zero Applied and not an
+// error: the node has simply not published a configuration yet.
+func ParseApplied(raw string) (Applied, error) {
+	if raw == "" {
+		// Nothing installed, or an agent too old to say. Either way the maps
+		// stay nil: reading one is the same, and a gate that wants proof is
+		// looking at the generation.
+		return Applied{}, nil
+	}
+
+	applied := Applied{
+		Epochs:  map[uint32]uint32{},
+		Extents: map[uint32]AppliedExtent{},
+	}
+
+	entries, err := ParseList(raw)
+	if err != nil {
+		return Applied{}, err
+	}
+
+	for _, entry := range entries {
+		switch {
+		case entry.Item == appliedGenerationItem:
+			if applied.Generation, err = optionalUint64Value(entry.Values, appliedAtKey); err != nil {
+				return Applied{}, err
+			}
+
+		case strings.HasPrefix(entry.Item, appliedUniversePrefix):
+			id, err := ParseUint32(strings.TrimPrefix(entry.Item, appliedUniversePrefix))
+			if err != nil {
+				return Applied{}, err
+			}
+
+			epoch, err := optionalUint32Value(entry.Values, appliedEpochKey)
+			if err != nil {
+				return Applied{}, fmt.Errorf("universe %d: %w", id, err)
+			}
+
+			applied.Epochs[id] = epoch
+
+		case strings.HasPrefix(entry.Item, appliedExtentPrefix):
+			id, err := ParseUint32(strings.TrimPrefix(entry.Item, appliedExtentPrefix))
+			if err != nil {
+				return Applied{}, err
+			}
+
+			next, err := optionalUint32Value(entry.Values, appliedNextZoneKey)
+			if err != nil {
+				return Applied{}, fmt.Errorf("extent %d: %w", id, err)
+			}
+
+			tombstone, err := optionalUint32Value(entry.Values, appliedTombstoneKey)
+			if err != nil {
+				return Applied{}, fmt.Errorf("extent %d: %w", id, err)
+			}
+
+			applied.Extents[id] = AppliedExtent{NextZone: next, TombstoneEpoch: tombstone}
+
+		default:
+			return Applied{}, fmt.Errorf("unknown entry %q", entry.Item)
+		}
+	}
+
+	return applied, nil
+}
+
 // ParseUniverseState reads a StorageClass's racer state out of its annotations.
 // The universe id is zero on a class the operator has not yet admitted.
 func ParseUniverseState(class string, annotations map[string]string) (UniverseState, error) {
@@ -405,6 +565,7 @@ func ParseUniverseState(class string, annotations map[string]string) (UniverseSt
 		Class:        class,
 		Members:      map[uint32]Membership{},
 		MemberEpochs: map[uint32]uint32{},
+		Draining:     map[uint32]Membership{},
 		Gateways:     map[uint32][]uint32{},
 	}
 

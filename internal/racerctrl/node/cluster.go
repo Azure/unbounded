@@ -144,8 +144,17 @@ func buildUniverseStates(
 			continue
 		}
 
+		draining, err := racerctrl.ParseMembership(membership.Data[racerctrl.MembershipDrainingKey])
+		if err != nil {
+			log.Warn("ignoring unreadable membership",
+				"configMap", membership.Name, "error", err)
+
+			continue
+		}
+
 		universe.Members[zone] = members
 		universe.MemberEpochs[zone] = epoch
+		universe.Draining[zone] = draining
 	}
 
 	for _, volume := range volumes {
@@ -314,10 +323,22 @@ func transportTo(
 }
 
 // universeJoinsNode reports whether this node has any business in a universe:
-// it is either a member of the universe's catalog in its own zone, or it
-// exports one of the universe's volumes to a local pod.
+// it is a member of the universe's catalog in its own zone, it is draining
+// groups the catalog has stopped naming it for, or it exports one of the
+// universe's volumes to a local pod.
+//
+// The draining case is what makes decommission finish. A node the catalog no
+// longer names still holds registers for the groups it was named for, and the
+// only thing that makes it hand them over is running a configuration that
+// carries the universe with itself absent from its catalog. Dropping the
+// universe here instead would leave it holding those groups forever, with no
+// fabric export and nothing to shed against.
 func universeJoinsNode(universe racerctrl.UniverseState, self racerctrl.NodeState) bool {
 	if universe.Members[self.Zone].Contains(self.ID) {
+		return true
+	}
+
+	if universe.Draining[self.Zone].Contains(self.ID) {
 		return true
 	}
 
@@ -333,12 +354,23 @@ func universeJoinsNode(universe racerctrl.UniverseState, self racerctrl.NodeStat
 }
 
 // universeReach is the set of node ids this node must be able to talk to in a
-// universe: every other member of its own zone's catalog, plus every gateway of
-// every other zone the universe spans.
+// universe: every other member of its own zone's catalog, everything still
+// draining out of it, plus every gateway of every other zone the universe
+// spans.
+//
+// Draining nodes are on both sides of this. A node handing groups over asks the
+// new members whether they hold every version before it drops a register, so it
+// needs links to them; and they are the ones that answer, so they need to admit
+// it. Cutting the link at the moment the catalog stops naming it is what would
+// leave the register undroppable.
 func universeReach(universe racerctrl.UniverseState, self racerctrl.NodeState) []uint32 {
 	seen := map[uint32]struct{}{}
 
 	for _, member := range universe.Members[self.Zone] {
+		seen[member.NodeID] = struct{}{}
+	}
+
+	for _, member := range universe.Draining[self.Zone] {
 		seen[member.NodeID] = struct{}{}
 	}
 

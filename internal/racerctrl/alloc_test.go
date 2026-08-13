@@ -433,3 +433,80 @@ func isConfigMapKey(key string) bool {
 
 	return true
 }
+
+func TestAppliedAnnotationRoundTrip(t *testing.T) {
+	applied := Applied{
+		Generation: 42,
+		Epochs:     map[uint32]uint32{1: 7, 9: 3},
+		Extents: map[uint32]AppliedExtent{
+			5: {NextZone: 2},
+			8: {TombstoneEpoch: 11},
+		},
+	}
+
+	raw := FormatApplied(applied)
+
+	parsed, err := ParseApplied(raw)
+	require.NoError(t, err)
+	require.Equal(t, applied, parsed)
+
+	// Stable ordering, so an unchanged fact does not rewrite the annotation.
+	require.Equal(t, raw, FormatApplied(parsed))
+}
+
+func TestAppliedIsEmptyBeforeAnythingIsInstalled(t *testing.T) {
+	require.Empty(t, FormatApplied(Applied{}))
+
+	parsed, err := ParseApplied("")
+	require.NoError(t, err)
+	require.Zero(t, parsed.Generation)
+}
+
+func TestAppliedRefusesGarbage(t *testing.T) {
+	for _, raw := range []string{"nonsense", "u?epoch=1", "xzz?next=1", "generation?at=x"} {
+		_, err := ParseApplied(raw)
+		require.Error(t, err, "parsed %q", raw)
+	}
+}
+
+// An extent an operation is waiting on has to be reported even when its count is
+// zero. Otherwise a node that has never heard of it and a node that has finished
+// with it look identical, and the destructive half of the sequence acts on the
+// wrong one.
+func TestLiveReportsAnExplicitZeroForExtentsInFlight(t *testing.T) {
+	required := map[uint32]AppliedExtent{7: {TombstoneEpoch: 4}}
+
+	raw := FormatLive(map[uint32]LiveExtent{}, required)
+
+	parsed, err := ParseLive(raw)
+	require.NoError(t, err)
+
+	entry, ok := parsed[7]
+	require.True(t, ok, "extent 7 was omitted from %q", raw)
+	require.Zero(t, entry.Pages)
+	require.Zero(t, entry.Tombstones)
+}
+
+// Everything else that is empty still goes unsaid: a node carries on the order
+// of a thousand extents and the annotation has a 256 KiB ceiling.
+func TestLiveOmitsEmptyExtentsNobodyIsWaitingOn(t *testing.T) {
+	raw := FormatLive(map[uint32]LiveExtent{7: {}, 8: {Pages: 3}}, nil)
+
+	parsed, err := ParseLive(raw)
+	require.NoError(t, err)
+
+	_, ok := parsed[7]
+	require.False(t, ok, "an idle extent nobody asked about was published: %q", raw)
+	require.Equal(t, uint64(3), parsed[8].Pages)
+}
+
+func TestLiveDoesNotDuplicateAnExtentItAlreadyReports(t *testing.T) {
+	raw := FormatLive(
+		map[uint32]LiveExtent{7: {Pages: 3}},
+		map[uint32]AppliedExtent{7: {NextZone: 2}},
+	)
+
+	parsed, err := ParseLive(raw)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), parsed[7].Pages)
+}

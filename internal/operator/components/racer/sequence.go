@@ -209,21 +209,40 @@ func (p *pass) retireDecommissionedNodes(ctx context.Context) error {
 }
 
 // membershipsHolding names the universes whose published membership still lists
-// a node.
+// a node, either as a catalog member or as one still draining out of it.
+//
+// The draining half is what keeps a decommission honest. A node the catalog has
+// stopped naming is still holding registers until it has handed them over, and
+// its identity is what the survivors' allowed hosts and peer lists are written
+// against, so clearing it while the set still names it would cut the links the
+// handover runs over.
 func (p *pass) membershipsHolding(nodeID uint32) []string {
 	var held []string
 
 	for i := range p.universes {
 		view := &p.universes[i]
 
-		for _, members := range view.state.Members {
-			if members.Contains(nodeID) {
-				held = append(held, view.class.Name)
-
-				break
-			}
+		if universeHolds(view.state, nodeID) {
+			held = append(held, view.class.Name)
 		}
 	}
 
 	return held
+}
+
+// universeHolds reports whether any of a universe's zones still names a node.
+func universeHolds(state racerctrl.UniverseState, nodeID uint32) bool {
+	for _, members := range state.Members {
+		if members.Contains(nodeID) {
+			return true
+		}
+	}
+
+	for _, draining := range state.Draining {
+		if draining.Contains(nodeID) {
+			return true
+		}
+	}
+
+	return false
 }

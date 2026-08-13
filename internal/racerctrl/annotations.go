@@ -117,6 +117,20 @@ const (
 	// `<extentID>?pages=<n>&tombstones=<n>`. Tombstone collection and extent
 	// migration are judged from it.
 	NodeLiveAnnotation = AnnotationDomain + "live"
+
+	// NodeAppliedAnnotation says which configuration the agent last installed
+	// and what a sequencer needs to know about it, as
+	// `generation?...` followed by `u<universeID>?epoch=<n>` and
+	// `x<extentID>?next=<zone>&tombstone=<epoch>` entries.
+	//
+	// It is what turns the health annotation's generation into a statement
+	// about content. Racer publishes the generation in force but nothing about
+	// what is in it, so on its own a generation cannot tell the operator that a
+	// node is acting on the catalog, migration or tombstone epoch it is waiting
+	// for. This says generation G carried these facts; the health annotation
+	// says G or later is running; together they are proof rather than
+	// inference.
+	NodeAppliedAnnotation = AnnotationDomain + "applied"
 )
 
 // StorageClass annotations. A StorageClass is a universe. Only the operator
@@ -410,4 +424,14 @@ func optionalUint64Value(values url.Values, key string) (uint64, error) {
 	}
 
 	return ParseUint64(raw)
+}
+
+// optionalUint32Value reads a uint32 that defaults to zero when absent.
+func optionalUint32Value(values url.Values, key string) (uint32, error) {
+	raw := values.Get(key)
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+
+	return ParseUint32(raw)
 }

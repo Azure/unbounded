@@ -277,6 +277,12 @@ type MembershipStep struct {
 
 	// Done reports that Next already is the desired membership.
 	Done bool
+
+	// Draining are the nodes the catalog no longer names but which have not yet
+	// handed over what they held. They keep deriving the universe, with
+	// themselves absent from its catalog, because that configuration is what
+	// makes racer shed. PlanMembership fills this; NextMembership does not.
+	Draining Membership
 }
 
 // NextMembership advances current one step toward desired.

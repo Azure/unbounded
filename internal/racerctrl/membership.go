@@ -44,6 +44,26 @@ const (
 	// value those nodes were already using.
 	MembershipEpochKey = "epoch"
 
+	// MembershipDrainingKey is the ConfigMap key listing the nodes the catalog
+	// no longer names but which have not yet handed over what they held, in the
+	// same form as MembershipDataKey.
+	//
+	// A node that is simply dropped from a catalog never learns it was dropped.
+	// It would derive no universe at all, publish nothing, and sit on the last
+	// configuration that still named it, so racer would never see the catalog
+	// that orphans its groups and would never shed them. Shedding is what walks
+	// a group the node is no longer in, confirms the new members hold every
+	// version, and only then drops the registers, so skipping it either strands
+	// the data or drops it before anyone else has it.
+	//
+	// Naming the node here keeps it deriving that universe, with itself absent
+	// from the catalog, which is exactly the configuration that makes racer
+	// drain. It also keeps the node in every survivor's peer set and allowed
+	// hosts, which it needs because confirming a version is a query it makes
+	// against the new members. The operator drops the id once the node reports
+	// nothing left to shed.
+	MembershipDrainingKey = "draining"
+
 	// MembershipUniverseLabel carries the universe id, so the operator can list
 	// a universe's membership maps without knowing which zones exist.
 	MembershipUniverseLabel = AnnotationDomain + "universe-id"

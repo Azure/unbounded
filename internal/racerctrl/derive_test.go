@@ -332,3 +332,79 @@ func resizedDerivation() Derivation {
 
 	return d
 }
+
+// A node the catalog has stopped naming has to keep deriving the universe, with
+// itself absent from its catalog. That configuration is what makes racer walk
+// the groups it still holds and hand them over; a node that simply lost the
+// universe would hold them forever, with no fabric export and nothing to shed
+// against.
+func TestDeriveKeepsAUniverseTheNodeIsDrainingOutOf(t *testing.T) {
+	derivation := attachedDerivation()
+	state := &derivation.Cluster.Universes[0]
+
+	state.Members[1] = Membership{
+		{NodeID: 4, Cohort: 0}, {NodeID: 2, Cohort: 1}, {NodeID: 3, Cohort: 2},
+	}
+	state.Draining = map[uint32]Membership{1: {{NodeID: 1, Cohort: 0}}}
+	derivation.Attachments[Attachment{Universe: 1, Peer: 4}] = "/dev/nvme3n1"
+
+	cfg, err := Derive(derivation)
+	require.NoError(t, err)
+	require.NoError(t, Validate(cfg))
+
+	require.Len(t, cfg.GetUniverses(), 1, "the draining node lost the universe it still holds")
+
+	for _, group := range cfg.GetUniverses()[0].GetCatalog() {
+		assert.NotContains(t,
+			[]uint32{group.GetCohort_0(), group.GetCohort_1(), group.GetCohort_2()},
+			uint32(1),
+			"a draining node must not be in its own catalog, or it is not draining")
+	}
+
+	assert.NotEmpty(t, cfg.GetUniverses()[0].GetPeers(),
+		"the handover is a query the draining node makes against the new members")
+}
+
+// Once it has drained, the node is in no catalog and no draining set, so there
+// is nothing left to derive. Racer refuses a config naming no universe, so the
+// caller has to recognise this rather than try to publish it.
+func TestDeriveYieldsNothingOnceTheNodeHasDrained(t *testing.T) {
+	derivation := attachedDerivation()
+	state := &derivation.Cluster.Universes[0]
+
+	state.Members[1] = Membership{
+		{NodeID: 4, Cohort: 0}, {NodeID: 2, Cohort: 1}, {NodeID: 3, Cohort: 2},
+	}
+
+	cfg, err := Derive(derivation)
+	require.NoError(t, err)
+	assert.Empty(t, cfg.GetUniverses())
+	assert.Error(t, Validate(cfg), "racer refuses a config that names no universe")
+}
+
+// The agent has to be able to say which facts the generation it installed
+// carries, because racer only ever says which generation is in force.
+func TestAppliedFromCarriesTheFactsGatesWaitOn(t *testing.T) {
+	cfg, err := Derive(attachedDerivation())
+	require.NoError(t, err)
+
+	cfg.Generation = 12
+	cfg.Universes[0].Extents[0].NextZone = 2
+	cfg.Universes[0].Extents[0].TombstoneEpoch = 6
+
+	applied := AppliedFrom(cfg)
+
+	assert.Equal(t, uint64(12), applied.Generation)
+	assert.Equal(t, uint32(1), applied.Epochs[1])
+	assert.Equal(t, AppliedExtent{NextZone: 2, TombstoneEpoch: 6}, applied.Extents[1])
+}
+
+// Only extents an operation is in flight for are carried. A node holds on the
+// order of a thousand, and the annotation this ends up in has a size ceiling.
+func TestAppliedFromOmitsSettledExtents(t *testing.T) {
+	cfg, err := Derive(attachedDerivation())
+	require.NoError(t, err)
+
+	applied := AppliedFrom(cfg)
+	assert.Empty(t, applied.Extents)
+}

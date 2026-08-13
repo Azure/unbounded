@@ -59,6 +59,17 @@ const (
 	// scrapeTimeout bounds one scrape.
 	scrapeTimeout = 5 * time.Second
 
+	// scrapeFailureThreshold is how many consecutive failed scrapes withdraw
+	// this node's health entirely.
+	//
+	// The sequencers have no clock and no notion of a stale reading, so
+	// freshness has to be expressed as presence or absence: counters that are
+	// there, or a node that has said nothing. One failure is a restarting
+	// sidecar and the last reading is still the best answer; several in a row
+	// means nobody knows what the dataplane is doing, and the counters that
+	// would be read as agreement have to go.
+	scrapeFailureThreshold = 3
+
 	// stagePollInterval is how often NodeStageVolume checks for the device.
 	stagePollInterval = 250 * time.Millisecond
 )
@@ -275,6 +286,13 @@ func (a *Agent) adoptExistingState() error {
 
 	a.published = existing
 	a.generation = existing.GetGeneration()
+
+	// The facts this generation carries are a property of the file, not of the
+	// process that wrote it, so a restarted agent can state them again without
+	// republishing anything. Leaving them out would make every gate treat this
+	// node as one that has installed nothing until the next render happened to
+	// change something.
+	a.self.Applied = racerctrl.AppliedFrom(existing)
 
 	a.log.Info("adopted existing racer config",
 		"path", a.cfg.ConfigPath(),
@@ -542,6 +560,21 @@ func (a *Agent) render() error {
 		return nil
 	}
 
+	if len(candidate.GetUniverses()) == 0 {
+		// This node is in no catalog and no draining set: it has handed
+		// everything over and has nothing left to serve. Racer refuses a config
+		// that names no universe, so there is nothing to install; the last one
+		// stays in force, doing nothing, until the operator retires the
+		// identity and the pod goes away. Status keeps being published, which
+		// is what lets the operator see the counters that say it is idle.
+		if a.published != nil {
+			a.log.Info("this node joins no universe; leaving the installed config in force",
+				"generation", a.generation)
+		}
+
+		return nil
+	}
+
 	// A membership change wider than one node per catalog cannot be published as
 	// a step, so it takes the generation the schema reserves for a settled
 	// state. Deriving the stride here rather than carrying it from the operator
@@ -560,6 +593,11 @@ func (a *Agent) render() error {
 
 	a.published = candidate
 	a.generation = candidate.GetGeneration()
+
+	// What racer reports is which generation is in force, never what is in it.
+	// Recording which facts this generation carried is what lets a sequencer
+	// tell a node that has acted on a change from one that has not heard of it.
+	a.self.Applied = racerctrl.AppliedFrom(candidate)
 
 	a.log.Info("installed racer config",
 		"generation", a.generation,
@@ -611,12 +649,22 @@ func (a *Agent) publishStatus(ctx context.Context) error {
 //
 // This is the only feedback channel in the system: racer has no status file and
 // no API, so every sequenced operation the operator runs is gated on numbers
-// that arrive here. A failed scrape leaves the previous values in place, which
-// is the safe direction: stale nonzero values block a destructive sequence,
-// they never unblock one.
+// that arrive here.
+//
+// A failed scrape leaves the previous values in place, because one missed
+// reading is nearly always a restarting sidecar rather than a fact about the
+// dataplane. But leaving them there forever is not safe in the other direction:
+// a zero this node published before its metrics stopped being readable is a
+// zero a destructive sequence will act on, and nothing else would ever
+// contradict it. So after a few consecutive failures the health is withdrawn
+// altogether, which every gate reads as no report rather than as agreement.
+// There is no clock in this: the count of failed scrapes is the measure, so a
+// node whose agent is not running publishes nothing new either way.
 func (a *Agent) scrapeLoop(ctx context.Context) {
 	ticker := time.NewTicker(scrapeInterval)
 	defer ticker.Stop()
+
+	failures := 0
 
 	for {
 		select {
@@ -628,22 +676,60 @@ func (a *Agent) scrapeLoop(ctx context.Context) {
 		samples, err := a.scraper.Scrape(ctx)
 		if err != nil {
 			a.log.Warn("scrape of racer metrics failed", "url", a.cfg.MetricsURL, "error", err)
+
+			failures++
+			if failures < scrapeFailureThreshold {
+				continue
+			}
+
+			if a.forgetHealth() {
+				a.log.Warn("withdrawing this node's health, its metrics have not been readable",
+					"scrapes", failures)
+				a.Trigger()
+			}
+
 			continue
 		}
 
+		failures = 0
 		observation := Digest(samples)
 
 		a.mu.Lock()
-		before := racerctrl.FormatHealth(a.self.Health) + "|" + racerctrl.FormatLive(a.self.Live)
+		before := a.healthDigest()
 		a.self.Health = observation.Health
 		a.self.Live = observation.Live
-		after := racerctrl.FormatHealth(a.self.Health) + "|" + racerctrl.FormatLive(a.self.Live)
+		after := a.healthDigest()
 		a.mu.Unlock()
 
 		if before != after {
 			a.Trigger()
 		}
 	}
+}
+
+// forgetHealth withdraws the counters this node last reported, and says whether
+// there was anything to withdraw. Zeroing Applied.Generation with them is what
+// makes the withdrawal total: a gate reads that as a node whose agent has not
+// installed anything, which is the one state no sequence proceeds from.
+func (a *Agent) forgetHealth() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.self.Health == (racerctrl.Health{}) && len(a.self.Live) == 0 {
+		return false
+	}
+
+	a.self.Health = racerctrl.Health{}
+	a.self.Live = nil
+
+	return true
+}
+
+// healthDigest is a cheap comparable rendering of what the last scrape saw,
+// used only to decide whether the annotations are worth rewriting.
+func (a *Agent) healthDigest() string {
+	return racerctrl.FormatHealth(a.self.Health) + "|" +
+		racerctrl.FormatLive(a.self.Live, a.self.Applied.Extents)
 }
 
 // Stage makes a volume available as a local block device.

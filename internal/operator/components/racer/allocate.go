@@ -361,7 +361,8 @@ func (p *pass) reconcileMembershipEpochs(ctx context.Context, view *universeView
 			continue
 		}
 
-		if err := p.writeMembership(ctx, view.state.ID, zone, members, view.state.Epoch); err != nil {
+		err := p.writeMembership(ctx, view.state.ID, zone, members, view.state.Draining[zone], view.state.Epoch)
+		if err != nil {
 			return err
 		}
 
@@ -374,12 +375,21 @@ func (p *pass) reconcileMembershipEpochs(ctx context.Context, view *universeView
 func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, zone uint32, states []racerctrl.NodeState) error {
 	candidates := p.candidates(zone)
 	current := view.state.Members[zone]
+	draining := view.state.Draining[zone]
 
-	if len(candidates) == 0 && len(current) == 0 {
+	if len(candidates) == 0 && len(current) == 0 && len(draining) == 0 {
 		return nil
 	}
 
-	step, gate, err := racerctrl.PlanMembership(current, candidates, view.state.CatalogSize, states)
+	step, gate, err := racerctrl.PlanMembership(racerctrl.MembershipPlan{
+		Universe:    view.state.ID,
+		Epoch:       view.state.EpochFor(zone),
+		CatalogSize: view.state.CatalogSize,
+		Current:     current,
+		Draining:    draining,
+		Candidates:  candidates,
+		Nodes:       states,
+	})
 	if err != nil {
 		return fmt.Errorf("plan membership for universe %s zone %d: %w", view.class.Name, zone, err)
 	}
@@ -402,13 +412,20 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 	// that write is lost, reconcileMembershipEpochs catches the cursor up on the
 	// next pass rather than leaving the catalog stranded at an epoch the
 	// universe does not know it has spent.
+	//
+	// A pass that only retires a drained node takes an epoch too. The draining
+	// set is part of the universe's shape: it decides who the survivors link to
+	// and admit, so dropping an id from it is as much a new configuration as
+	// dropping one from the catalog, and the gate that waits on it needs an
+	// epoch to wait for.
 	epoch := view.state.Epoch + 1
 
-	if err := p.writeMembership(ctx, view.state.ID, zone, step.Next, epoch); err != nil {
+	if err := p.writeMembership(ctx, view.state.ID, zone, step.Next, step.Draining, epoch); err != nil {
 		return err
 	}
 
 	view.state.Members[zone] = step.Next
+	view.state.Draining[zone] = step.Draining
 	view.state.MemberEpochs[zone] = epoch
 
 	err = p.patchClass(ctx, view, map[string]string{
@@ -418,7 +435,8 @@ func (p *pass) reconcileZoneMembership(ctx context.Context, view *universeView, 
 		return err
 	}
 
-	p.wait("universe %s zone %d membership stepped to %d nodes", view.class.Name, zone, len(step.Next))
+	p.wait("universe %s zone %d membership stepped to %d nodes, %d draining",
+		view.class.Name, zone, len(step.Next), len(step.Draining))
 
 	return p.reconcileGateways(ctx, view, zone, step.Next)
 }

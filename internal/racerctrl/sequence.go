@@ -22,6 +22,24 @@ import (
 // what the cluster currently reports is correct after any restart, including one
 // that happened between the two halves of a step.
 //
+// Two things are load-bearing and easy to lose.
+//
+// The first is that a counter of zero and no counter at all are different
+// facts, and every gate here is waiting for a zero. A node that has not
+// reported, a node whose scrape is failing, and an extent racer has never
+// mentioned all read as zero out of a map, and treating that as agreement is
+// how a destructive step gets taken against a dataplane nobody has heard from.
+// So a gate has to see the report, not the absence of one, which is why
+// FormatLive writes explicit zeros for the extents an operation is waiting on
+// and why the lookups here take the second return value.
+//
+// The second is that a generation is not a fact about content. Racer publishes
+// which generation is in force and nothing about what is in it, so on its own
+// it cannot say a node is acting on the catalog, the migration or the tombstone
+// epoch being waited on. NodeState.Applied closes that: the agent says which
+// generation carried which facts, racer says which generation is running, and
+// the pair is proof. Hence the loaded() check under every gate below.
+//
 // The predicates return a reason as well as a verdict. A stalled sequence is the
 // normal way these fail, and a stall with no explanation is indistinguishable
 // from a bug.
@@ -50,18 +68,62 @@ func (g Gate) String() string {
 	return g.Reason
 }
 
-// HealingQuiesced reports whether every node has finished the healing the last
-// membership change set off.
+// ConfigLoaded reports whether racer on this node is running the configuration
+// its agent last installed.
+//
+// This is the base of every other gate. Applied.Generation is what the agent
+// wrote; Health.Generation is what racer says is in force. Equal or later means
+// racer has accepted it, so whatever the agent put in that file is what the
+// dataplane is acting on. Earlier means the file is not in force yet, either
+// because racer has not got to it or because it refused it - and a refusal is
+// exactly the case where reading the counters as agreement would be worst, so
+// the same check covers both and racer_config_rejected_total needs no separate
+// gate.
+func ConfigLoaded(node NodeState) Gate {
+	if node.Applied.Generation == 0 {
+		return Block("node %s has not published a config yet", node.Name)
+	}
+
+	if node.Health.Generation == 0 {
+		return Block("node %s has not reported yet", node.Name)
+	}
+
+	if node.Health.Generation < node.Applied.Generation {
+		return Block(
+			"node %s is running generation %d, not yet the %d its agent installed",
+			node.Name, node.Health.Generation, node.Applied.Generation,
+		)
+	}
+
+	return Allow()
+}
+
+// HealingQuiesced reports whether every node has loaded a universe's current
+// catalog and finished the healing the last membership change set off.
 //
 // This is R6's membership gate. racer_heal_groups_replaying counts groups
 // pulling state they have just been made responsible for;
 // racer_heal_groups_shedding counts groups handing state away. Starting a second
 // replacement while either is nonzero would ask a node to shed a group it is
 // still replaying, and the group would lose its only complete copy.
-func HealingQuiesced(nodes []NodeState) Gate {
+//
+// The epoch check is what makes the counters mean anything. Both counters are
+// derived from the catalog racer currently holds, so a node still running the
+// catalog from before the last step reports quiet about the wrong topology: it
+// has nothing to replay because it has not been told to. Requiring the node's
+// installed configuration to carry this universe at this epoch, and racer to be
+// running it, is what turns "quiet" into "quiet about the change we made".
+func HealingQuiesced(nodes []NodeState, universe, epoch uint32) Gate {
 	for _, node := range orderedNodes(nodes) {
-		if node.Health.Generation == 0 {
-			return Block("node %s has not reported yet", node.Name)
+		if gate := ConfigLoaded(node); !gate.OK {
+			return gate
+		}
+
+		if applied := node.Applied.Epochs[universe]; applied < epoch {
+			return Block(
+				"node %s is running universe %d at epoch %d, not yet %d",
+				node.Name, universe, applied, epoch,
+			)
 		}
 
 		if node.Health.Replaying > 0 {
@@ -76,29 +138,6 @@ func HealingQuiesced(nodes []NodeState) Gate {
 	return Allow()
 }
 
-// GenerationConverged reports whether every node has loaded at least the given
-// generation, and rejected none.
-//
-// racer_config_rejected_total is the only signal that a node refused a config.
-// A node that rejected ours is running the previous generation, so the cluster
-// is split across two generations and no further step is safe until it is fixed.
-func GenerationConverged(nodes []NodeState, generation uint64) Gate {
-	for _, node := range orderedNodes(nodes) {
-		if node.Health.RejectedTotal > 0 {
-			return Block("node %s has rejected %d configs", node.Name, node.Health.RejectedTotal)
-		}
-
-		if node.Health.Generation < generation {
-			return Block(
-				"node %s is at generation %d, not yet %d",
-				node.Name, node.Health.Generation, generation,
-			)
-		}
-	}
-
-	return Allow()
-}
-
 // MigrationComplete reports whether an extent migration has landed.
 //
 // R6 says to judge from the destination's racer_extent_live_pages against the
@@ -106,14 +145,42 @@ func GenerationConverged(nodes []NodeState, generation uint64) Gate {
 // plus a control plane declaration, and the declaration is only honest once the
 // destination holds everything the source does. Comparing counts rather than
 // waiting for a flag is what makes the decision restartable.
+//
+// Every node on either side of the move has to have loaded a configuration that
+// actually points the extent at the destination, and to have reported that
+// extent by name. Without both, a destination that has never heard of the
+// extent reports the same zero as a destination that has finished, and the
+// comparison declares a migration complete before it has started.
 func MigrationComplete(volume VolumeState, nodes []NodeState) Gate {
 	if volume.NextZone == 0 {
 		return Block("volume %s has no migration in flight", volume.Name)
 	}
 
+	carriers := carriers(volume, nodes)
+
 	for _, segment := range volume.Composition {
-		source := livePagesInZone(nodes, volume.Zone, segment.ExtentID)
-		destination := livePagesInZone(nodes, volume.NextZone, segment.ExtentID)
+		for _, node := range carriers {
+			if gate := ConfigLoaded(node); !gate.OK {
+				return gate
+			}
+
+			if applied := node.Applied.Extents[segment.ExtentID]; applied.NextZone != volume.NextZone {
+				return Block(
+					"node %s is not yet migrating volume %s extent %d to zone %d",
+					node.Name, volume.Name, segment.ExtentID, volume.NextZone,
+				)
+			}
+
+			if _, ok := node.Live[segment.ExtentID]; !ok {
+				return Block(
+					"node %s has not reported volume %s extent %d",
+					node.Name, volume.Name, segment.ExtentID,
+				)
+			}
+		}
+
+		source := livePagesInZone(carriers, volume.Zone, segment.ExtentID)
+		destination := livePagesInZone(carriers, volume.NextZone, segment.ExtentID)
 
 		if destination < source {
 			return Block(
@@ -127,44 +194,54 @@ func MigrationComplete(volume VolumeState, nodes []NodeState) Gate {
 	return Allow()
 }
 
-// CollectionSafe reports whether a volume's tombstone epoch may be advanced.
-//
-// Advancing tombstone_epoch is the one destructive edit in the schema: it tells
-// every node that registers below the new epoch may be dropped. R6 allows it
-// only once every node reports zero live pages for the extent, because a live
-// page under a collected epoch is data that is gone and that nothing will say is
-// gone. The check is over every node, not every node in the home zone: a node
-// that still routes for the extent still holds cached registers.
-func CollectionSafe(volume VolumeState, nodes []NodeState) Gate {
-	for _, segment := range volume.Composition {
-		for _, node := range orderedNodes(nodes) {
-			if node.Health.Generation == 0 {
-				return Block("node %s has not reported yet", node.Name)
-			}
-
-			if live := node.Live[segment.ExtentID]; live.Pages > 0 {
-				return Block(
-					"volume %s extent %d still has %d live pages on node %s",
-					volume.Name, segment.ExtentID, live.Pages, node.Name,
-				)
-			}
-		}
-	}
-
-	return Allow()
-}
-
 // CollectionDrained reports whether the tombstones an advanced epoch released
 // have actually been reclaimed. This is the second half of collection: the epoch
 // bump authorises the drop, and racer_extent_tombstones falling to zero is the
 // evidence it happened. A volume is only safe to forget once both are true.
+//
+// It is the last gate before a PersistentVolume's finalizer comes off, which
+// makes it the most destructive one here: once the object is gone there is
+// nothing left that names the extent, so anything still holding it holds it
+// forever. So it demands the full proof. Every node that carries the extent has
+// to be running a configuration its agent installed, that configuration has to
+// carry the tombstone epoch being collected, and the node has to have reported
+// this extent by name. A node that has not loaded the epoch has not been asked
+// to drop anything, and its zero is the zero of a node that was never told.
 func CollectionDrained(volume VolumeState, nodes []NodeState) Gate {
 	for _, segment := range volume.Composition {
-		for _, node := range orderedNodes(nodes) {
-			if live := node.Live[segment.ExtentID]; live.Tombstones > 0 {
+		for _, node := range carriers(volume, nodes) {
+			if gate := ConfigLoaded(node); !gate.OK {
+				return gate
+			}
+
+			applied, ok := node.Applied.Extents[segment.ExtentID]
+			if !ok || applied.TombstoneEpoch < volume.TombstoneEpoch {
+				return Block(
+					"node %s is running volume %s extent %d at tombstone epoch %d, not yet %d",
+					node.Name, volume.Name, segment.ExtentID,
+					applied.TombstoneEpoch, volume.TombstoneEpoch,
+				)
+			}
+
+			live, ok := node.Live[segment.ExtentID]
+			if !ok {
+				return Block(
+					"node %s has not reported volume %s extent %d",
+					node.Name, volume.Name, segment.ExtentID,
+				)
+			}
+
+			if live.Tombstones > 0 {
 				return Block(
 					"volume %s extent %d still has %d tombstones on node %s",
 					volume.Name, segment.ExtentID, live.Tombstones, node.Name,
+				)
+			}
+
+			if live.Pages > 0 {
+				return Block(
+					"volume %s extent %d still has %d live pages on node %s",
+					volume.Name, segment.ExtentID, live.Pages, node.Name,
 				)
 			}
 		}
@@ -192,13 +269,50 @@ func StoreGrowthNeeded(nodes []NodeState) []string {
 	return needed
 }
 
+// DrainComplete reports whether a node the catalog has stopped naming has
+// finished handing over the groups it held in one universe.
+//
+// A shedding node walks each orphaned group, asks the new members whether they
+// hold every version, and only then drops its registers. The counter reaching
+// zero is the whole of that: it is derived from the catalog racer currently
+// holds, so it means something only once the node is running the catalog that
+// orphaned the groups, which is what the epoch check establishes.
+func DrainComplete(node NodeState, universe, epoch uint32) Gate {
+	if gate := ConfigLoaded(node); !gate.OK {
+		return gate
+	}
+
+	if applied := node.Applied.Epochs[universe]; applied < epoch {
+		return Block(
+			"node %s is running universe %d at epoch %d, not yet the %d that drops it",
+			node.Name, universe, applied, epoch,
+		)
+	}
+
+	if node.Health.Shedding > 0 {
+		return Block("node %s is still shedding %d groups", node.Name, node.Health.Shedding)
+	}
+
+	if node.Health.Replaying > 0 {
+		return Block("node %s is still replaying %d groups", node.Name, node.Health.Replaying)
+	}
+
+	return Allow()
+}
+
 // DecommissionComplete reports whether a node has finished shedding what it
 // held. R6's rule is to keep serving the config that removes the node until it
 // has shed; pulling the node out earlier strands whatever it had not yet handed
 // over.
+//
+// By the time this is asked the node is in no catalog and no draining set, so
+// what it is being asked is the weaker question of whether the node is idle. It
+// still has to be running its own agent's configuration: a node whose agent
+// stopped publishing is a node whose counters describe a topology that no
+// longer exists.
 func DecommissionComplete(node NodeState) Gate {
-	if node.Health.Generation == 0 {
-		return Block("node %s has not reported yet", node.Name)
+	if gate := ConfigLoaded(node); !gate.OK {
+		return gate
 	}
 
 	if node.Health.Shedding > 0 {
@@ -218,33 +332,134 @@ func DecommissionComplete(node NodeState) Gate {
 	return Allow()
 }
 
-// PlanMembership works out a zone's next catalog membership.
-//
-// It is the composition of the two rules that govern membership: R3 wants the
-// balanced set the candidates allow, and R6 wants to get there one id at a time
-// with the dataplane quiet between steps. The gate is checked first so that a
-// cluster in the middle of healing is told to wait rather than handed a step it
-// cannot take.
-func PlanMembership(current, candidates Membership, catalogSize int, nodes []NodeState) (MembershipStep, Gate, error) {
-	desired := DesiredMembership(candidates, catalogSize)
+// MembershipPlan is one zone's membership question: what the catalog names now,
+// who is on the way out, who could be named, and what every node reports.
+type MembershipPlan struct {
+	// Universe and Epoch identify the configuration the current membership was
+	// published as, which is what the quiesce gate proves the nodes are running.
+	Universe uint32
+	Epoch    uint32
 
-	step, err := NextMembership(current, desired, catalogSize)
+	CatalogSize int
+
+	// Current is the published catalog membership.
+	Current Membership
+
+	// Draining are the nodes the catalog no longer names but which have not yet
+	// handed over what they held.
+	Draining Membership
+
+	// Candidates are every node eligible to be named.
+	Candidates Membership
+
+	// Nodes is every node's published state.
+	Nodes []NodeState
+}
+
+// PlanMembership works out a zone's next catalog membership and draining set.
+//
+// It is the composition of the three rules that govern membership: R3 wants the
+// balanced set the candidates allow, R6 wants to get there one id at a time with
+// the dataplane quiet between steps, and R6 also wants the id that just left to
+// keep running the configuration that dropped it until it has drained. The gate
+// is checked first so that a cluster in the middle of healing is told to wait
+// rather than handed a step it cannot take.
+//
+// A node that has finished draining is dropped from the draining set, which is
+// a change worth publishing on its own: it is what finally lets the node stop
+// deriving the universe and lets the operator retire its identity.
+func PlanMembership(plan MembershipPlan) (MembershipStep, Gate, error) {
+	byID := make(map[uint32]NodeState, len(plan.Nodes))
+	for _, node := range plan.Nodes {
+		byID[node.ID] = node
+	}
+
+	// Whoever has finished draining leaves the set. Whoever has not stays, and
+	// is also what the quiesce gate below is asked about: the departing node is
+	// where the shedding is, and leaving it out of the question is how the next
+	// replacement starts on top of the last one.
+	var draining Membership
+
+	for _, member := range plan.Draining.Normalized() {
+		node, ok := byID[member.NodeID]
+		if !ok {
+			// The Node object is gone. Nothing else will ever report on it, so
+			// holding the set open forever would block every later step.
+			continue
+		}
+
+		if gate := DrainComplete(node, plan.Universe, plan.Epoch); gate.OK {
+			continue
+		}
+
+		draining = append(draining, member)
+	}
+
+	// A node on its way out must not be handed back the groups it is in the
+	// middle of giving away.
+	candidates := withoutMembers(plan.Candidates, draining)
+
+	desired := DesiredMembership(candidates, plan.CatalogSize)
+
+	step, err := NextMembership(plan.Current, desired, plan.CatalogSize)
 	if err != nil {
 		return MembershipStep{}, Gate{}, err
 	}
 
-	if step.Done {
+	step.Draining = draining
+
+	if step.Done && sameMembership(draining, plan.Draining) {
 		return step, Allow(), nil
 	}
 
-	if gate := HealingQuiesced(currentMembers(current, nodes)); !gate.OK {
+	holding := append(append(Membership(nil), plan.Current...), draining...)
+
+	if gate := HealingQuiesced(membersOf(holding, plan.Nodes), plan.Universe, plan.Epoch); !gate.OK {
 		return MembershipStep{}, gate, nil
 	}
+
+	if step.Done {
+		// Only the draining set shrank. Publish that and nothing else.
+		step.Next = plan.Current
+		step.Done = false
+
+		return step, Allow(), nil
+	}
+
+	// Whoever the step drops has not drained yet by definition, so it joins the
+	// set the next pass will wait on.
+	step.Draining = append(draining, departed(plan.Current, step.Next)...).Normalized()
 
 	return step, Allow(), nil
 }
 
-// currentMembers picks out the nodes a membership names.
+// departed is the members of before that after no longer names.
+func departed(before, after Membership) Membership {
+	var gone Membership
+
+	for _, member := range before {
+		if !after.Contains(member.NodeID) {
+			gone = append(gone, member)
+		}
+	}
+
+	return gone
+}
+
+// withoutMembers removes a set of ids from a membership.
+func withoutMembers(members, remove Membership) Membership {
+	kept := make(Membership, 0, len(members))
+
+	for _, member := range members {
+		if !remove.Contains(member.NodeID) {
+			kept = append(kept, member)
+		}
+	}
+
+	return kept
+}
+
+// membersOf picks out the nodes a membership names.
 //
 // The healing gate asks whether the last membership change has settled, which
 // is a question about the nodes that hold groups. Asking it of every node in
@@ -253,17 +468,45 @@ func PlanMembership(current, candidates Membership, catalogSize int, nodes []Nod
 // something gives it a config, and nothing gives it a config until a membership
 // names it. A node already in the catalog is a different matter - it holds
 // groups now, and stepping while it is still replaying is exactly what R6
-// forbids - so those are still gated on.
-func currentMembers(current Membership, nodes []NodeState) []NodeState {
-	members := make([]NodeState, 0, len(current))
+// forbids - so those are still gated on, and so is anything still draining.
+func membersOf(members Membership, nodes []NodeState) []NodeState {
+	named := make([]NodeState, 0, len(members))
 
 	for _, node := range nodes {
-		if current.Contains(node.ID) {
-			members = append(members, node)
+		if members.Contains(node.ID) {
+			named = append(named, node)
 		}
 	}
 
-	return members
+	return named
+}
+
+// carriers picks the nodes racer ships a volume's extents to: its home zone,
+// the zone it is migrating to, and whatever exports it.
+//
+// This mirrors deriveExtents exactly, and it has to. A gate that asked the
+// whole cluster would block on nodes that have never been sent the extent and
+// never will be; one that asked only the home zone would miss the destination
+// of a migration and the node exporting the volume to a pod, both of which hold
+// registers for it.
+func carriers(volume VolumeState, nodes []NodeState) []NodeState {
+	var carrying []NodeState
+
+	for _, node := range orderedNodes(nodes) {
+		if node.Zone == volume.Zone || (volume.NextZone != 0 && node.Zone == volume.NextZone) {
+			carrying = append(carrying, node)
+			continue
+		}
+
+		for _, binding := range node.Devices {
+			if binding.Volume == volume.Name {
+				carrying = append(carrying, node)
+				break
+			}
+		}
+	}
+
+	return carrying
 }
 
 // livePagesInZone sums an extent's live pages across the nodes of one zone. The
