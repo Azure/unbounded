@@ -1141,7 +1141,24 @@ where
             .broadcast(|_, ack| Ctl::StopQueue { slot: *slot, ack });
     }
 
-    // 4. Publish: the per-core cutover point.
+    // 4. Core state, if this build offered any.
+    //
+    // It goes in before the configuration rather than after. A core reads the two
+    // together - `with_core_ctx` refuses to run without both - so the only thing
+    // that decides whether a core can serve is which of them arrives last. Publish
+    // first and there is a window between the two broadcasts in which a core holds
+    // a configuration and no row, and the maintenance tick that fires in that
+    // window walks straight into the assertion. State first has no such window:
+    // a row without a configuration is unreachable, because nothing runs on a core
+    // that has not been published to.
+    let offered = ctx.cfgr.core.borrow_mut().core_state.take();
+    if let Some(rows) = offered {
+        let rows = (ctx.core_state)(rows);
+        ctx.hub
+            .broadcast(|i, ack| Ctl::InstallCoreState { ptr: rows[i], ack });
+    }
+
+    // 4b. Publish: the per-core cutover point.
     let ver = ctx.next_ver;
     ctx.next_ver += 1;
     let ptr: *const C = &*cfg;
@@ -1150,15 +1167,6 @@ where
         ptr: ptr as *const (),
         ack,
     });
-
-    // 4b. Core state, if this build offered any: installed under a live configuration,
-    // because a core reads its row through the same transaction that reads one.
-    let offered = ctx.cfgr.core.borrow_mut().core_state.take();
-    if let Some(rows) = offered {
-        let rows = (ctx.core_state)(rows);
-        ctx.hub
-            .broadcast(|i, ack| Ctl::InstallCoreState { ptr: rows[i], ack });
-    }
 
     ctx.versions.push_back(Version { ver, cfg });
     // `retire_old` drains older versions, so a worker's 4-slot guard table cannot wrap.
