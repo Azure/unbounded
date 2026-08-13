@@ -286,6 +286,19 @@ struct Slot {
     /// A write is in flight into this slot. CLOCK steps over it rather than handing the same
     /// media out twice.
     busy: bool,
+    /// Reads in flight out of this slot. Same purpose as `busy` and the same treatment: an IO
+    /// is aimed at these exact bytes, so nothing may take them until it lands. Reads share,
+    /// which is why this counts and `busy` does not.
+    readers: u16,
+}
+
+impl Slot {
+    /// Whether an IO is aimed at this slot's media. Not a question about the entry: a slot
+    /// still filling has no entry yet, and one being read out of may be about to lose the one
+    /// it has. It is a question about the bytes.
+    fn pinned(&self) -> bool {
+        self.busy || self.readers > 0
+    }
 }
 
 /// Why a claim found no slot. The metrics keep them apart: `Colder` is the cache working as
@@ -375,8 +388,12 @@ impl Store {
     }
 
     /// Hand back chunk `ci`, dropping whatever it held. `None` while any slot in it, or in the
-    /// chunk moved into its place, is being written into: a busy slot has an IO in flight
-    /// against those exact bytes, so the write could land on someone else's page.
+    /// chunk moved into its place, has an IO in flight: those are aimed at exact bytes, so a
+    /// write could land on someone else's page and a read could return one.
+    ///
+    /// Refusing on the chunk that moves is also what keeps a slot index meaningful for as long
+    /// as anyone holds one. An index is a position within `chunks`, and the last chunk is
+    /// swapped into the hole, so a pinned slot anywhere in it blocks the move.
     fn remove_chunk(&mut self, ci: usize) -> Option<u64> {
         let last = self.chunks.len().checked_sub(1)?;
         if self.busy(ci) || self.busy(last) {
@@ -415,7 +432,7 @@ impl Store {
     }
 
     fn busy(&self, ci: usize) -> bool {
-        self.range(ci).any(|i| self.slots[i].busy)
+        self.range(ci).any(|i| self.slots[i].pinned())
     }
 
     /// Give back one chunk, preferring `borrowed` ones. Used by the reclaim path, which must
@@ -442,6 +459,8 @@ impl Store {
         })
     }
 
+    /// Look `addr` up and pin its media for the read that follows. The pin is released by
+    /// [`Store::release`], which the lease the caller is handed does for it.
     fn find(&mut self, addr: u64) -> Option<(u32, Register)> {
         let i = *self.map.get(&addr)?;
         let s = &mut self.slots[i as usize];
@@ -449,7 +468,18 @@ impl Store {
             return None;
         }
         s.used = true;
+        // Saturating rather than refusing: a slot with 65535 reads in flight is not a
+        // correctness question, and declining the read would be the worse answer. What matters
+        // is that the count never wraps to zero while a reader is still out.
+        s.readers = s.readers.saturating_add(1);
         Some((i, s.reg))
+    }
+
+    /// Let go of a slot a read was pinning.
+    fn release(&mut self, i: u32) {
+        let s = &mut self.slots[i as usize];
+        debug_assert!(s.readers > 0, "released a slot nothing was reading");
+        s.readers = s.readers.saturating_sub(1);
     }
 
     fn forget(&mut self, addr: u64) {
@@ -491,7 +521,7 @@ impl Store {
             return Err(Decline::Busy);
         }
         let i = match self.map.get(&addr) {
-            Some(&i) if !self.slots[i as usize].busy => i,
+            Some(&i) if !self.slots[i as usize].pinned() => i,
             Some(_) => return Err(Decline::Busy),
             None => self.evict(hotter)?,
         };
@@ -504,12 +534,13 @@ impl Store {
             used: false,
             live: false,
             busy: true,
+            readers: 0,
         };
         Ok(i)
     }
 
     /// The CLOCK hand. Two sweeps at most: the first clears reference bits, the second is
-    /// guaranteed to find one clear unless every slot is busy.
+    /// guaranteed to find one clear unless every slot has an IO in flight.
     ///
     /// The candidate is measured against the first clear live entry the hand reaches, and
     /// losing to it ends the admission rather than sweeping on for a weaker victim, which
@@ -520,7 +551,7 @@ impl Store {
             let i = self.hand;
             self.hand = (self.hand + 1) % n;
             let s = &mut self.slots[i as usize];
-            if s.busy {
+            if s.pinned() {
                 continue;
             }
             if !s.live {
@@ -549,6 +580,43 @@ impl Store {
         if !ok {
             self.map.remove(&s.addr);
         }
+    }
+}
+
+/// A cache entry's media, held still for the length of one read.
+///
+/// The lookup and the read happen on different cores, so between them the entry can be
+/// evicted, the slot re-admitted with another address, and the chunk under it handed to the
+/// other class or given back to the allocator for authoritative data. The offset would still
+/// be a valid place to read from, and the bytes there would be somebody else's. A 4 KiB page
+/// usually survives that on its checksum; a 4 MiB page has none, so it would be returned.
+///
+/// Holding one keeps the media where it is. Releasing consumes the lease, and dropping one
+/// releases it too, because a reader that has gone away is a reader that is finished either
+/// way.
+#[must_use = "a leased slot cannot be reused until the read is done with it"]
+struct Lease {
+    cache: &'static Cache,
+    owner: CoreId,
+    huge: bool,
+    slot: u32,
+}
+
+impl Lease {
+    /// Let the media go.
+    async fn release(self) {
+        let me = std::mem::ManuallyDrop::new(self);
+        me.cache.unpin(me.owner, me.huge, me.slot).await;
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let (cache, owner, huge, slot) = (self.cache, self.owner, self.huge, self.slot);
+        // Detached because a destructor cannot await. A pin that outlives its reader costs a
+        // slot and the chunk holding it, so this is a leak, but a bounded one: the read it was
+        // taken for either landed or was abandoned, and nothing waits on either.
+        let _ = runtime::spawn(async move { cache.unpin(owner, huge, slot).await });
     }
 }
 
@@ -1127,7 +1195,11 @@ impl Cache {
         let want = self.live_version(addr);
         let owner = self.owner_of(addr)?;
         at(owner, move |l| {
-            self.find_in(l, addr, huge, Some(want)).map(|(_, r)| r)
+            // No bytes move, so the pin `find_in` takes has nothing to protect: let it go
+            // before the transaction ends rather than handing a lease across the hop.
+            let (slot, _, reg) = self.find_in(l, addr, huge, Some(want))?;
+            l.stores[Cache::class(huge)].release(slot);
+            Some(reg)
         })
         .await
     }
@@ -1148,12 +1220,23 @@ impl Cache {
         want: Option<u64>,
     ) -> Option<Register> {
         let owner = self.owner_of(addr)?;
-        let (found, reg) = at(owner, move |l| self.find_in(l, addr, huge, want)).await?;
+        let (slot, found, reg) = at(owner, move |l| self.find_in(l, addr, huge, want)).await?;
+        // Built here, from what the transaction answered with, for the same reason the
+        // admission permit is: a value that crosses a hop can be dropped inside the
+        // rendezvous, which is no place for a destructor that wants to hop of its own.
+        let lease = Lease {
+            cache: self,
+            owner,
+            huge,
+            slot,
+        };
         let class = Class::of(huge);
         if off as u64 + buf.len() as u64 > class.bytes() {
             return None;
         }
-        if self.disk.read(found + off as u64, buf).await.is_err() {
+        let read = self.disk.read(found + off as u64, buf).await;
+        lease.release().await;
+        if read.is_err() {
             // A cache page we cannot read is one we do not have. Silent rot is invisible here
             // (confirmation covers the register, not the bytes), but a hard read error means
             // the entry is gone. At `reg`, because the read took a round trip and what is
@@ -1169,17 +1252,20 @@ impl Cache {
         Some(reg)
     }
 
-    /// The absolute byte offset of `addr`'s entry, resolved on the owning core because only
-    /// that core knows which chunks its store holds. The caller does the IO, so it gets an
-    /// offset and not a slot: by the time the bytes move, the slot number could mean a
-    /// different chunk.
+    /// Find `addr`'s entry and pin its media, on the owning core because only that core knows
+    /// which chunks its store holds.
+    ///
+    /// Answers with the offset as well as the slot, because the caller does the IO and an
+    /// offset is what a disk takes. The slot comes too so the pin can be let go of, and the
+    /// pin is what keeps the two agreeing: while it is held the chunk cannot be handed away,
+    /// so neither the offset nor the index can come to mean something else.
     fn find_in(
         &self,
         l: &mut Local,
         addr: GlobalAddr,
         huge: bool,
         want: Option<u64>,
-    ) -> Option<(u64, Register)> {
+    ) -> Option<(u32, u64, Register)> {
         let k = Cache::class(huge);
         let found = l.stores[k].find(addr.0);
         let Some((slot, reg)) = found.filter(|v| want.is_none_or(|w| v.1.version == w)) else {
@@ -1194,7 +1280,7 @@ impl Cache {
         if !huge {
             l.sketch.observe(addr.0);
         }
-        Some((l.stores[k].off(slot), reg))
+        Some((slot, l.stores[k].off(slot), reg))
     }
 
     /// Offer `buf` to the cache as the value of `addr` at `reg`, given the width `w` its owner
@@ -1239,6 +1325,11 @@ impl Cache {
                 .await
                 .is_ok();
         permit.settle(ok).await;
+    }
+
+    /// Let go of a slot a read was pinning. Not called directly: [`Lease`] is the only holder.
+    async fn unpin(&'static self, owner: CoreId, huge: bool, slot: u32) {
+        at(owner, move |l| l.stores[Cache::class(huge)].release(slot)).await;
     }
 
     /// Report an admission back to the core that claimed the slot. Not called directly:
@@ -1869,8 +1960,10 @@ mod tests {
         let a = st.claim_uncontested(1, r).unwrap();
         st.finish(a, true);
         // The reference bit sends the hand past slot `a`, so the second claim lands on the
-        // other chunk and leaves an IO in flight there.
+        // other chunk and leaves an IO in flight there. The lookup's own pin goes first:
+        // this test is about the write.
         assert!(st.find(1).is_some());
+        st.release(a);
         let b = st.claim_uncontested(2, r).unwrap();
         assert_ne!(a, b);
         assert!(st.remove_chunk(b as usize).is_none(), "busy itself");
@@ -1882,6 +1975,74 @@ mod tests {
         );
         st.finish(b, true);
         assert!(st.remove_chunk(first).is_some());
+    }
+
+    /// A read in flight pins its media exactly as a write does: the entry cannot be evicted,
+    /// the slot cannot be re-admitted, and the chunk cannot be handed away.
+    #[test]
+    fn a_read_in_flight_pins_its_slot() {
+        let mut st = store(Class::Huge, 1);
+        let r = Register::default();
+        let a = st.claim_uncontested(1, r).unwrap();
+        st.finish(a, true);
+        assert!(st.find(1).is_some());
+
+        assert!(st.remove_chunk(a as usize).is_none(), "read in flight");
+        // The only slot is pinned, so the hand comes back around with nowhere to go.
+        assert_eq!(st.claim(2, r, |_| false), Err(Decline::Busy));
+        // Not even for the address being read: the write would land under the read.
+        assert_eq!(st.claim(1, r, |_| false), Err(Decline::Busy));
+
+        st.release(a);
+        assert!(st.claim_uncontested(2, r).is_ok());
+    }
+
+    /// Two readers of one entry, and the media stays put until the second is done.
+    #[test]
+    fn pins_are_counted_not_flagged() {
+        let mut st = store(Class::Huge, 1);
+        let r = Register::default();
+        let a = st.claim_uncontested(1, r).unwrap();
+        st.finish(a, true);
+        assert!(st.find(1).is_some());
+        assert!(st.find(1).is_some());
+
+        st.release(a);
+        assert!(
+            st.remove_chunk(a as usize).is_none(),
+            "one reader is still out"
+        );
+        st.release(a);
+        assert!(st.remove_chunk(a as usize).is_some());
+    }
+
+    /// A rejection is about the entry that was read. By the time it comes back a newer one
+    /// may hold the slot, and that one is what the next reader wants.
+    #[test]
+    fn forgetting_stale_spares_a_newer_entry() {
+        let mut st = store(Class::Small, 1);
+        let old = Register {
+            version: 1,
+            ..Register::default()
+        };
+        let new = Register {
+            version: 2,
+            ..Register::default()
+        };
+        let i = st.claim_uncontested(1, old).unwrap();
+        st.finish(i, true);
+
+        // The reader is still holding `old` when the entry is replaced.
+        let j = st.claim_uncontested(1, new).unwrap();
+        st.finish(j, true);
+
+        st.forget_at(1, old);
+        assert!(
+            st.current(1, new),
+            "the newer entry survives a late rejection"
+        );
+        st.forget_at(1, new);
+        assert!(!st.current(1, new));
     }
 
     /// `give` answers only with the kind it was asked for: the reclaim path must get a
