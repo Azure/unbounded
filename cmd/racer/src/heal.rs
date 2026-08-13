@@ -398,6 +398,16 @@ const MAX_BUCKET: usize = 1 << 16;
 /// Shortest gap between sweeps on one core.
 const INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long one sweep may run before it is abandoned.
+///
+/// The sweep holds the configuration it started under for as long as it runs, so a sweep
+/// that never finishes stops the node reconfiguring at all: the retirement of that version
+/// waits on the borrow, and every later generation queues behind it. Every await in here
+/// is a peer that may be gone, a cursor on a slab that may be busy, or a repair round that
+/// may not reach a quorum, and none of them owe an answer. Well past the slowest healthy
+/// sweep, so crossing it means something is wrong, not merely slow.
+const SWEEP_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Registers one sweep offers back; each costs a `GETMETA` at all three new members.
 const DROPS_PER_JOB: usize = 64;
 
@@ -409,6 +419,8 @@ pub struct Stats {
     pub failed: u64,
     pub oversized: u64,
     pub dropped: u64,
+    /// Sweeps abandoned at [`SWEEP_DEADLINE`].
+    pub stalled: u64,
 }
 
 /// One worker's share of the sweep: what it is doing, when it last did it, and where it
@@ -421,6 +433,9 @@ pub(crate) struct Core {
     last: Cell<Option<Instant>>,
     /// Round-robin over the groups this core owns, so no group is starved.
     next: Cell<u32>,
+    /// The step the running sweep last reached, named for the log a stall prints. Only
+    /// ever read by the core that wrote it, and only meaningful while `busy`.
+    phase: Cell<&'static str>,
     stats: RefCell<Stats>,
 }
 
@@ -470,6 +485,11 @@ impl Heal {
         here(|c| f(&mut c.stats.borrow_mut()));
     }
 
+    /// Names the step the sweep is about to await, for the stall log.
+    fn phase(&self, at: &'static str) {
+        here(|c| c.phase.set(at));
+    }
+
     /// Spawns a sweep; `Handler::tick` is synchronous. Declines under rate pressure, since
     /// the device budget is the write path's too. Free-space pressure does not decline:
     /// shedding is where space comes back from, so the sweep runs and skips anti-entropy.
@@ -489,7 +509,13 @@ impl Heal {
         });
         // The job stays on this core, so it clears the same row it just claimed.
         if !runtime::spawn(async move {
-            let _ = self.sweep().await;
+            if runtime::deadline(self.sweep(), SWEEP_DEADLINE).await.is_none() {
+                // Dropping the sweep releases the configuration it borrowed, which is the
+                // point: the node can reconfigure again and the next tick starts over.
+                let phase = here(|c| c.phase.get());
+                self.stat(|s| s.stalled += 1);
+                eprintln!("racer: heal sweep abandoned at {phase}");
+            }
             here(|c| c.busy.set(false));
         }) {
             here(|c| c.busy.set(false));
@@ -529,6 +555,7 @@ impl Heal {
         // Shedding first, regardless of free space: everything below competes for it.
         for huge in [false, true] {
             if self.serves(huge) {
+                self.phase(if huge { "shed(huge)" } else { "shed(small)" });
                 self.shed(huge).await;
             }
         }
@@ -560,6 +587,7 @@ impl Heal {
         };
 
         self.stat(|s| s.sweeps += 1);
+        self.phase("replaying");
         // Replay is sticky: one repaired bucket makes our side non-empty, so re-detection
         // would clear the flag early. Only a comparison with no repairs left ends it.
         let was = self.paxos.replaying(g).await;
@@ -569,6 +597,7 @@ impl Heal {
             if !self.serves(huge) {
                 continue;
             }
+            self.phase(if huge { "compare(huge)" } else { "compare(small)" });
             match self.compare(&cfg, g, huge, was).await {
                 Ok(r) => replaying |= r,
                 Err(e) => {
@@ -580,13 +609,16 @@ impl Heal {
         }
         // A class we could not compare is not evidence of having caught up on it.
         let still = replaying || (was && !checked);
+        self.phase("replay-flag");
         if still {
             self.paxos.set_replaying(g, true).await;
         } else if was && self.paxos.rejoin(g).await.is_err() {
             // Leaving a replay needs the promise recovered first; the next sweep retries.
             self.stat(|s| s.failed += 1);
         }
+        self.phase("hand-over");
         self.hand_over(&cfg, g).await;
+        self.phase("done");
         Ok(())
     }
 

@@ -397,6 +397,26 @@ pub(crate) fn spawn(fut: impl Future<Output = ()> + 'static) -> bool {
     hop::spawn(fut)
 }
 
+/// Run `fut`, giving up after `d`. `None` means it was still running and has been dropped.
+///
+/// Background work must not be able to wait forever. A detached maintenance task holds
+/// whatever it borrowed for as long as it runs, and one of those things is the
+/// configuration itself: a task parked on an await nothing will complete pins the version
+/// it started under, and the reconfiguration that retires that version blocks behind it,
+/// which takes the whole node out of the control plane's hands. Abandoning the task costs
+/// one interval of progress; not abandoning it costs the node.
+pub(crate) async fn deadline<F: Future>(fut: F, d: Duration) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut nap = std::pin::pin!(sleep(d));
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(v));
+        }
+        nap.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
 // --- Fan-out / fan-in ---
 // Futures are held inline (no allocation) and dropped in place, so they may be `!Unpin`.
 
