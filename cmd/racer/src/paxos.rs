@@ -372,23 +372,41 @@ impl Gate {
 
 // --- per-core state ---
 
-/// A group's standing promise. `held` is false for a term read back from the superblock: a
-/// restarting node raises the term before proposing, because the in-flight table enforcing
-/// one value per ballot is volatile.
+/// A group's standing promise, and whether this node may issue at it.
+///
+/// The promise and the right to use it are different facts, and the second is the one that
+/// is easy to get wrong: what a peer is told, what recovery compares against and what a
+/// ballot may be built from are not the same number. Keeping them one field and a flag
+/// meant every reader had to remember which it was asking for, and reading the promise
+/// where the issuable term was meant is exactly how a stale ballot gets sent.
+///
+/// A term read back from the superblock arrives `Unheld`: a restarting node raises it
+/// before proposing, because the in-flight table enforcing one value per ballot is volatile.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct Term {
-    value: u32,
-    held: bool,
-    /// A prepare for this group is already in flight from this node.
-    preparing: bool,
+enum Term {
+    /// Promised, and nothing may be issued at it until it is raised.
+    Unheld(u32),
+    /// Promised, and one-shot accepts at it are ours to send.
+    Held(u32),
 }
 
 impl Term {
     fn new(value: u32) -> Term {
-        Term {
-            value,
-            held: false,
-            preparing: false,
+        Term::Unheld(value)
+    }
+
+    /// What this node promises, held or not. Durable, and only ever rising.
+    fn promise(self) -> u32 {
+        match self {
+            Term::Unheld(v) | Term::Held(v) => v,
+        }
+    }
+
+    /// The term one-shot accepts may be issued at, and `None` while nothing is held.
+    fn issuable(self) -> Option<u32> {
+        match self {
+            Term::Held(v) => Some(v),
+            Term::Unheld(_) => None,
         }
     }
 
@@ -399,21 +417,25 @@ impl Term {
     /// measured worse: making an acceptor that has just raised its promise prepare again
     /// costs a round trip on every write.
     fn raise(&mut self) -> u32 {
-        self.value = self.value.saturating_add(1) & 0x3fff_ffff;
-        self.held = true;
-        self.value
+        let v = self.promise().saturating_add(1) & 0x3fff_ffff;
+        *self = Term::Held(v);
+        v
     }
 
-    /// Record a term another member reported. Never marks it held: only our own `raise`
+    /// Record a term another member reported. Never ends up held: only our own `raise`
     /// grants the right to issue one-shot accepts at it, so a term that rises under us takes
     /// the right away again. Without that a proposer keeps issuing at the raised term, where
     /// another member's ballot is higher at the same term, and every accept is refused as a
     /// ballot regression forever.
     fn adopt(&mut self, term: u32) {
-        if term > self.value {
-            self.value = term;
-            self.held = false;
+        if term > self.promise() {
+            *self = Term::Unheld(term);
         }
+    }
+
+    /// Give up the right to issue, leaving the promise where it is.
+    fn release(&mut self) {
+        *self = Term::Unheld(self.promise());
     }
 
     /// Take the promise the rest of the group still holds for us, and hold nothing at it.
@@ -427,7 +449,7 @@ impl Term {
     /// holding nothing and the next write pays for a term this member raised itself.
     fn recover(&mut self, peers: [u32; 2]) {
         self.adopt(recovered_term(peers));
-        self.held = false;
+        self.release();
     }
 }
 
@@ -477,6 +499,9 @@ pub(crate) struct Local {
     /// Addresses with a proposal in flight. The one-value-per-ballot rule, and the write
     /// path's per-key serialisation, are the same table.
     inflight: BTreeSet<u64>,
+    /// Groups with a prepare round in flight from this node. Held through a [`Prepare`],
+    /// which is what puts a group in here and the only thing that takes it out.
+    preparing: BTreeSet<GroupId>,
     /// Groups we are still replaying. Set by the anti-entropy sweep when it finds our whole
     /// side of a group empty against a peer that has data, cleared when the digests agree.
     replaying: BTreeSet<GroupId>,
@@ -1433,6 +1458,40 @@ impl Drop for Claim {
         // Detached because a destructor cannot await. If the slab has no room the address
         // stays claimed, which is what dropping a claim did every time before this.
         let _ = runtime::spawn(async move { paxos.unclaim(addr, core).await });
+    }
+}
+
+/// The right to run a group's prepare round, held for as long as the round runs.
+///
+/// One prepare per group at a time. Every prepare raises both peers' promises by one, so
+/// concurrent rounds turn a burst of writes into a term escalation the accepts can never
+/// catch: each is refused as stale, refreshes, and prepares again.
+///
+/// This was a flag set by one hop and cleared by another with the whole round in between,
+/// so a writer that gave up in the middle left the group looking busy for the life of the
+/// process, and every later write to it paid the full wait before deciding to ignore it.
+/// The obligation is the same one; a destructor is what discharges it now, and a destructor
+/// runs on every path out.
+#[must_use = "an unheld lease is given up at once, letting a second prepare race this one"]
+struct Prepare {
+    paxos: &'static Paxos,
+    group: GroupId,
+    core: CoreId,
+}
+
+impl Prepare {
+    /// Hand the round back and wait for the owner to hear, so a writer already sleeping on
+    /// this group wakes to the term this round settled rather than to a second round.
+    async fn release(self) {
+        let me = std::mem::ManuallyDrop::new(self);
+        me.paxos.unprepare(me.group, me.core).await;
+    }
+}
+
+impl Drop for Prepare {
+    fn drop(&mut self) {
+        let (paxos, group, core) = (self.paxos, self.group, self.core);
+        let _ = runtime::spawn(async move { paxos.unprepare(group, core).await });
     }
 }
 
@@ -2547,7 +2606,8 @@ impl Paxos {
     }
 }
 
-/// Whether this task runs the group's prepare, waits for one, or already has a term.
+/// Whether this task runs the group's prepare, waits for the one already running, or
+/// already has a term to issue at.
 enum Lead {
     Held(u32),
     Wait,
@@ -2567,20 +2627,14 @@ impl Paxos {
     /// and never a stale ballot.
     async fn term_for(&'static self, group: GroupId, addr: GlobalAddr) -> Result<u32, Status> {
         let core = self.core_of(group);
-        // One prepare per group at a time. Every prepare raises both peers' promises by
-        // one, so concurrent writes each running their own turn a burst into a term
-        // escalation the accepts can never catch: each is refused as stale, refreshes, and
-        // prepares again. Waiting out the leader's round keeps all three members in step.
+        // Waiting out whoever holds the lease keeps all three members in step; see
+        // [`Prepare`] for why running two rounds at once is worse than waiting.
         for _ in 0..PREPARE_WAITS {
             let take = at(core, move |l| {
-                let e = l.terms.entry(group).or_insert(Term::new(0));
-                match (e.held, e.preparing) {
-                    (true, _) => Lead::Held(e.value),
-                    (false, true) => Lead::Wait,
-                    (false, false) => {
-                        e.preparing = true;
-                        Lead::Go
-                    }
+                match l.terms.entry(group).or_insert(Term::new(0)).issuable() {
+                    Some(t) => Lead::Held(t),
+                    None if l.preparing.insert(group) => Lead::Go,
+                    None => Lead::Wait,
                 }
             })
             .await;
@@ -2591,17 +2645,22 @@ impl Paxos {
                     continue;
                 }
                 Lead::Go => {
+                    // Built here rather than on the owner: a reply nobody is waiting for is
+                    // dropped inside the rendezvous, which is no place for a destructor
+                    // that wants to hop.
+                    let lease = Prepare {
+                        paxos: self,
+                        group,
+                        core,
+                    };
                     let r = self.prepare_round(addr, None).await;
-                    at(core, move |l| {
-                        if let Some(t) = l.terms.get_mut(&group) {
-                            t.preparing = false;
-                        }
-                    })
-                    .await;
+                    lease.release().await;
                     return r.map(|(t, ..)| t);
                 }
             }
         }
+        // Waited out a round that never finished. Prepare anyway, without the lease: the
+        // group is no worse off than it was, and a writer that never returns is worse.
         self.prepare_round(addr, None).await.map(|(t, ..)| t)
     }
 
@@ -2609,7 +2668,19 @@ impl Paxos {
     /// derived rather than sent.
     async fn held_term(&'static self, group: GroupId) -> u32 {
         let core = self.core_of(group);
-        at(core, move |l| l.terms.get(&group).map_or(0, |t| t.value)).await
+        at(core, move |l| {
+            l.terms.get(&group).map_or(0, |t| t.promise())
+        })
+        .await
+    }
+
+    /// Hand a group's prepare round back. Not called directly: [`Prepare`] is the only
+    /// holder.
+    async fn unprepare(&'static self, group: GroupId, core: CoreId) {
+        at(core, move |l| {
+            l.preparing.remove(&group);
+        })
+        .await;
     }
 
     /// Give up the right to issue one-shot accepts at the term we hold, so the next
@@ -2619,7 +2690,7 @@ impl Paxos {
         let core = self.core_of(group);
         at(core, move |l| {
             if let Some(t) = l.terms.get_mut(&group) {
-                t.held = false;
+                t.release();
             }
         })
         .await;
@@ -3146,7 +3217,8 @@ impl Paxos {
         let mut c = layout::Consensus::default();
         for i in 0..runtime::cores() {
             let (terms, seals) = at(CoreId::of(i), move |l| {
-                let t: Vec<(GroupId, u32)> = l.terms.iter().map(|(&g, x)| (g, x.value)).collect();
+                let t: Vec<(GroupId, u32)> =
+                    l.terms.iter().map(|(&g, x)| (g, x.promise())).collect();
                 let s: Vec<(u32, u32)> = if i == 0 {
                     l.seals.iter().map(|(&k, &v)| (k, v)).collect()
                 } else {
@@ -3505,10 +3577,10 @@ mod model {
                     // A replaying member runs no round of its own, and a one-shot needs a
                     // term this node raised itself: a term merely observed is one another
                     // proposer may already be issuing higher ballots at.
-                    if s.flight.is_some() || s.replaying[i] || !s.terms[i].held {
+                    if s.flight.is_some() || s.replaying[i] || s.terms[i].issuable().is_none() {
                         return None;
                     }
-                    let b = Ballot::new(s.terms[i].value, by);
+                    let b = Ballot::new(s.terms[i].promise(), by);
                     let r = Register::accepted(guard, b);
                     // The proposer is an acceptor too, and `stage_local` runs the same guard
                     // check before anything goes on the wire.
@@ -3544,7 +3616,7 @@ mod model {
                     {
                         return Some(n);
                     }
-                    if !promised(s.terms[i].value, f.r.ballot) {
+                    if !promised(s.terms[i].promise(), f.r.ballot) {
                         return Some(n);
                     }
                     n.terms[i].adopt(f.r.ballot.term());
@@ -3577,7 +3649,7 @@ mod model {
                     } else {
                         // Production's `refresh`: a lost round gives up the right to issue
                         // one-shots, so the retry prepares instead of reusing the ballot.
-                        n.terms[f.by as usize].held = false;
+                        n.terms[f.by as usize].release();
                         n.lost = true;
                     }
                 }
@@ -3588,7 +3660,10 @@ mod model {
                     }
                     // Bounded by the term ceiling: a prepare raises the promise of every
                     // member it reaches, so the search cannot run rounds forever.
-                    if who.iter().any(|i| s.terms[*i as usize].value >= MAX_TERM) {
+                    if who
+                        .iter()
+                        .any(|i| s.terms[*i as usize].promise() >= MAX_TERM)
+                    {
                         return None;
                     }
                     let mut regs = [None; N];
@@ -3653,7 +3728,7 @@ mod model {
                     }
                     let mut peers = [0u32; 2];
                     for (k, j) in (0..N).filter(|j| *j != i).enumerate() {
-                        peers[k] = s.terms[j].value;
+                        peers[k] = s.terms[j].promise();
                     }
                     n.terms[i].recover(peers);
                     n.replaying[i] = false;
