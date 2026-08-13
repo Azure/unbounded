@@ -164,6 +164,10 @@ type Snapshotter struct {
 
 	syncMu   sync.Mutex
 	lastSync time.Time
+
+	// noAnnotations keeps a static containerd misconfiguration from being
+	// reported once per layer.
+	noAnnotations sync.Once
 }
 
 // New opens or creates a snapshotter rooted at opts.Root.
@@ -506,7 +510,7 @@ func (s *Snapshotter) syncOnMiss() bool {
 func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
 	var (
 		req    ingest.Request
-		submit bool
+		reason ingestReason
 	)
 
 	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
@@ -527,7 +531,7 @@ func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		// The labels are read from the active snapshot because CommitActive
 		// replaces them with whatever the caller passed, which for the CRI is
 		// usually nothing.
-		req, submit = ingestRequest(name, snInfo.Labels)
+		req, reason = ingestRequest(name, snInfo.Labels)
 
 		return nil
 	})
@@ -535,13 +539,33 @@ func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		return err
 	}
 
-	if submit && s.queue != nil {
-		if !s.queue.Submit(req) {
+	switch reason {
+	case reasonIngest:
+		if s.queue != nil && !s.queue.Submit(req) {
 			s.log.Debug("gantry-snapshotter: ingest not queued", "request", req.String())
 		}
+	case reasonNoAnnotations:
+		s.warnNoAnnotations()
+	case reasonSkip:
 	}
 
 	return nil
+}
+
+// warnNoAnnotations reports, once for the life of the process, that containerd
+// is not telling the snapshotter which blob a layer came from.
+//
+// This is worth saying loudly and exactly once. Loudly, because the node keeps
+// working while quietly contributing nothing to the cluster: every image is
+// unpacked locally, no layer is ever published, and every other node pays the
+// same cost forever. Once, because it is a static misconfiguration, and a
+// message per layer would be forty lines per image.
+func (s *Snapshotter) warnNoAnnotations() {
+	s.noAnnotations.Do(func() {
+		s.log.Warn("gantry-snapshotter: containerd is not passing layer annotations, so no layer this node unpacks will ever reach the cluster",
+			"label", LabelLayerDigest,
+			"fix", "set disable_snapshot_annotations = false under [plugins.'io.containerd.cri.v1.images'] and restart containerd")
+	})
 }
 
 // Remove drops a snapshot. Directories are reclaimed by Cleanup.

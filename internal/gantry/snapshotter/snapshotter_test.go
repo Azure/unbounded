@@ -195,12 +195,14 @@ type harness struct {
 	m   *fakeMapper
 	q   *fakeQueue
 	ctx context.Context
+
+	logs *logSink
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
-	h := &harness{cat: newCatalog(), m: newMapper(t), q: newQueue()}
+	h := &harness{cat: newCatalog(), m: newMapper(t), q: newQueue(), logs: &logSink{}}
 
 	sn, err := New(Options{
 		Root:         t.TempDir(),
@@ -208,7 +210,7 @@ func newHarness(t *testing.T) *harness {
 		Mapper:       h.m,
 		Queue:        h.q,
 		MountOptions: []string{"index=off"},
-		Logger:       slog.New(slog.DiscardHandler),
+		Logger:       slog.New(slog.NewTextHandler(h.logs, nil)),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -220,6 +222,28 @@ func newHarness(t *testing.T) *harness {
 	h.ctx = namespaces.WithNamespace(t.Context(), "testing")
 
 	return h
+}
+
+// logSink captures what the snapshotter logs. slog writes from whichever
+// goroutine is logging, so the buffer needs its own lock.
+type logSink struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.buf.Write(p)
+}
+
+// count reports how many times substr appears in everything logged so far.
+func (s *logSink) count(substr string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return strings.Count(s.buf.String(), substr)
 }
 
 // digestOf builds a digest whose every byte is b, plus its string form.
@@ -849,6 +873,38 @@ func TestCommitSkipsIngestWithoutAnnotations(t *testing.T) {
 	}
 }
 
+// A node whose containerd is not passing layer annotations publishes nothing,
+// forever, while looking perfectly healthy. That has to be said out loud, and
+// it has to be said once rather than once per layer of every image.
+func TestCommitWarnsOnceWhenAnnotationsAreOff(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	for i := range 3 {
+		chain, key := digestAt(1, i), fmt.Sprintf("extract-%d", i)
+
+		if _, err := h.sn.Prepare(h.ctx, key, "", snapshots.WithLabels(map[string]string{
+			LabelSnapshotRef: chain.String(),
+			LabelDiffID:      digestAt(2, i).String(),
+		})); err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+
+		if err := h.sn.Commit(h.ctx, chain.String(), key); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+	}
+
+	if got := h.logs.count(LabelLayerDigest); got != 1 {
+		t.Fatalf("warned about the missing annotation %d times, want exactly 1", got)
+	}
+
+	if got := h.logs.count("disable_snapshot_annotations"); got != 1 {
+		t.Fatalf("named the containerd setting %d times, want exactly 1", got)
+	}
+}
+
 func TestCommitOfAContainerLayerIsNotIngested(t *testing.T) {
 	t.Parallel()
 
@@ -864,6 +920,12 @@ func TestCommitOfAContainerLayerIsNotIngested(t *testing.T) {
 
 	if got := len(h.q.all()); got != 0 {
 		t.Fatalf("submitted %d requests, want 0", got)
+	}
+
+	// A container's writable layer is not an image layer, so it is not
+	// evidence of anything being misconfigured.
+	if got := h.logs.count(LabelLayerDigest); got != 0 {
+		t.Fatalf("warned %d times about an ordinary container layer", got)
 	}
 }
 
@@ -1052,7 +1114,7 @@ func TestIngestRequest(t *testing.T) {
 		name   string
 		key    string
 		labels map[string]string
-		want   bool
+		want   ingestReason
 	}{
 		{
 			name: "complete",
@@ -1061,32 +1123,43 @@ func TestIngestRequest(t *testing.T) {
 				LabelDiffID:      diffID.String(),
 				LabelLayerDigest: layer.String(),
 			},
-			want: true,
+			want: reasonIngest,
 		},
 		{
 			name:   "container layer",
 			key:    "committed-container",
 			labels: map[string]string{LabelDiffID: diffID.String(), LabelLayerDigest: layer.String()},
+			want:   reasonSkip,
 		},
 		{
 			name:   "no diff id",
 			key:    chain.String(),
 			labels: map[string]string{LabelLayerDigest: layer.String()},
+			want:   reasonSkip,
 		},
 		{
 			name:   "no layer digest",
 			key:    chain.String(),
 			labels: map[string]string{LabelDiffID: diffID.String()},
+			want:   reasonNoAnnotations,
 		},
 		{
 			name:   "no labels",
 			key:    chain.String(),
 			labels: nil,
+			want:   reasonSkip,
 		},
 		{
 			name:   "bad diff id",
 			key:    chain.String(),
 			labels: map[string]string{LabelDiffID: "sha512:beef", LabelLayerDigest: layer.String()},
+			want:   reasonSkip,
+		},
+		{
+			name:   "unreadable layer digest",
+			key:    chain.String(),
+			labels: map[string]string{LabelDiffID: diffID.String(), LabelLayerDigest: "not-a-digest"},
+			want:   reasonSkip,
 		},
 	}
 
@@ -1094,12 +1167,12 @@ func TestIngestRequest(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			req, ok := ingestRequest(tc.key, tc.labels)
-			if ok != tc.want {
-				t.Fatalf("ok = %v, want %v", ok, tc.want)
+			req, reason := ingestRequest(tc.key, tc.labels)
+			if reason != tc.want {
+				t.Fatalf("reason = %v, want %v", reason, tc.want)
 			}
 
-			if !ok {
+			if reason != reasonIngest {
 				return
 			}
 

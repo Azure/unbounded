@@ -184,3 +184,12 @@ outcome: a wedged agent leaves every pod on the node in `ContainerCreating`
 with nothing to show for it, and a restart either clears the wedge or degrades
 the node to local unpack, both of which beat a black hole. `/healthz` needs
 `--metrics-addr` to be set; without it there is no probe at all.
+
+**The agent says so when containerd is not passing layer annotations.**
+`disable_snapshot_annotations` defaults to true on Linux, and with it on the
+agent still serves every container correctly while publishing absolutely
+nothing: it never learns which blob a layer came from, so no layer it unpacks
+can ever be converted, and every other node keeps paying full price. There is
+no way to detect this other than noticing the label is missing, so the first
+image layer committed without one logs a warning naming the setting. It is
+logged once per process, not once per layer.

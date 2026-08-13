@@ -26,8 +26,26 @@ import (
 // so it cannot inherit a namespace from the caller's context.
 const DefaultNamespace = "k8s.io"
 
-// ingestRequest builds an ingest request for a layer this node just unpacked.
-// It reports false when the layer cannot be ingested, which is not an error:
+// ingestReason says what should happen to a snapshot that was just committed.
+type ingestReason int
+
+const (
+	// reasonIngest means the snapshot is an image layer this node can publish.
+	reasonIngest ingestReason = iota
+	// reasonSkip means the snapshot is not an image layer, or carries a label
+	// that cannot be read. Either way there is nothing to publish and nothing
+	// to complain about.
+	reasonSkip
+	// reasonNoAnnotations means the snapshot is an image layer but containerd
+	// did not say which blob it came from. That only happens when the CRI
+	// plugin is configured with disable_snapshot_annotations, which is a
+	// misconfiguration this snapshotter cannot work around and cannot detect
+	// any other way.
+	reasonNoAnnotations
+)
+
+// ingestRequest builds an ingest request for a layer this node just unpacked,
+// or explains why it cannot:
 //
 //   - a snapshot committed under a name that is not a chain ID is a container
 //     layer, not an image layer;
@@ -36,24 +54,31 @@ const DefaultNamespace = "k8s.io"
 //   - a missing compressed digest means containerd was configured with
 //     disable_snapshot_annotations, so there is no way to find the layer tar in
 //     the content store. The layer still works locally, it just never reaches
-//     the cluster.
-func ingestRequest(name string, labels map[string]string) (ingest.Request, bool) {
+//     the cluster, and neither does any other layer this node ever unpacks.
+func ingestRequest(name string, labels map[string]string) (ingest.Request, ingestReason) {
 	chainID, err := catalog.ParseDigest(name)
 	if err != nil {
-		return ingest.Request{}, false
+		return ingest.Request{}, reasonSkip
 	}
 
 	diffID, err := catalog.ParseDigest(labels[LabelDiffID])
 	if err != nil {
-		return ingest.Request{}, false
+		return ingest.Request{}, reasonSkip
+	}
+
+	// An absent label is the signature of disable_snapshot_annotations. A
+	// label that is present but unreadable is something else entirely, so it
+	// is not worth alarming an operator about the setting they did not change.
+	if labels[LabelLayerDigest] == "" {
+		return ingest.Request{}, reasonNoAnnotations
 	}
 
 	layer, err := digest.Parse(labels[LabelLayerDigest])
 	if err != nil {
-		return ingest.Request{}, false
+		return ingest.Request{}, reasonSkip
 	}
 
-	return ingest.Request{DiffID: diffID, ChainID: chainID, Layer: layer}, true
+	return ingest.Request{DiffID: diffID, ChainID: chainID, Layer: layer}, reasonIngest
 }
 
 // Provider is the part of containerd's content store ingest reads from. It is
