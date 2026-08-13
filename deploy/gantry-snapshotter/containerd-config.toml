@@ -1,27 +1,78 @@
 # containerd registration for gantry-snapshotter (containerd 2.x).
 #
 # Merge these stanzas into /etc/containerd/config.toml on every node
-# running the DaemonSet, then restart containerd. This file is not
-# applied by Kubernetes: containerd reads its configuration at start
-# and a proxy plugin cannot register itself.
+# running the DaemonSet. This file is not applied by Kubernetes:
+# containerd reads its configuration at start and a proxy plugin cannot
+# register itself.
 #
-# Order matters when rolling this out. Start the DaemonSet first, wait
-# for the socket to appear, and only then reconfigure containerd. A
-# containerd configured for a snapshotter whose socket is absent
-# refuses to create containers.
+# Read the ordering notes below before applying any of it. The stanzas
+# are grouped into two phases on purpose and applying phase 2 first
+# leaves the node unable to start any pod, including the one that would
+# fix it.
+#
+# --- why there are two phases ---------------------------------------
+#
+# `snapshotter = "gantry"` under the images plugin is the CRI default
+# for every pod on the node, and the gantry-snapshotter DaemonSet is a
+# pod. It serves the snapshot socket that CRI needs in order to create
+# it, so with a single default the agent cannot be started by the
+# runtime that depends on it. That is survivable at install time (start
+# the DaemonSet, then reconfigure containerd) and fatal afterwards: the
+# socket lives on tmpfs under /run, so the first reboot leaves kubelet
+# asking a socket that no longer exists to create the pod that creates
+# it, forever.
+#
+# The way out is a second runtime handler that is pinned to overlayfs
+# and used by nothing but the agent itself. Phase 1 installs it and is
+# inert: no pod selects the handler until the RuntimeClass and the
+# DaemonSet exist. Phase 2 flips the cluster default and is the only
+# part that depends on the agent already running.
 
 version = 3
 
-# 1. Register the snapshotter as a proxy plugin. The name on the left
-#    ("gantry") is what every other stanza refers to, and what
-#    `ctr --snapshotter gantry` expects.
+# ====================================================================
+# Phase 1 - apply first, restart containerd, and roll it out to every
+# node. Nothing here changes the behaviour of any existing pod.
+# ====================================================================
+
+# 1a. The bootstrap runtime handler. Pinned to overlayfs so that a pod
+#     which selects it never asks the gantry snapshotter for anything.
+#     The gantry-snapshotter DaemonSet selects it through the
+#     `gantry-bootstrap` RuntimeClass; nothing else should.
+#
+#     Copy the options from whatever your default runc handler uses.
+#     They are spelled out rather than inherited because containerd
+#     fills an omitted `options` table with its own defaults rather
+#     than with the default handler's, and a SystemdCgroup that
+#     disagrees with the kubelet's cgroup driver fails at container
+#     start with a cgroup error that says nothing about this file.
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.gantry-bootstrap]
+  runtime_type = "io.containerd.runc.v2"
+  # The point of the handler. Do not remove it, and do not set it to
+  # "gantry": that is the deadlock this exists to avoid.
+  snapshotter = "overlayfs"
+  [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.gantry-bootstrap.options]
+    SystemdCgroup = true
+
+# 1b. Register the snapshotter as a proxy plugin. The name on the left
+#     ("gantry") is what every other stanza refers to, and what
+#     `ctr --snapshotter gantry` expects.
+#
+#     This is safe to apply before the agent exists. containerd dials
+#     the socket lazily, so an absent socket registers a plugin whose
+#     calls fail, and nothing calls it until phase 2.
 [proxy_plugins.gantry]
   type = "snapshot"
   address = "/run/gantry-snapshotter/snapshotter.sock"
 
-# 2. Make CRI use it for pod sandboxes and containers. Without this the
-#    kubelet keeps pulling into overlayfs and the snapshotter sees no
-#    traffic at all.
+# ====================================================================
+# Phase 2 - apply only after the DaemonSet is running and
+# /run/gantry-snapshotter/snapshotter.sock exists on the node.
+# ====================================================================
+
+# 2a. Make CRI use the snapshotter for pod sandboxes and containers.
+#     Without this the kubelet keeps pulling into overlayfs and the
+#     snapshotter sees no traffic at all.
 [plugins.'io.containerd.cri.v1.images']
   snapshotter = "gantry"
   # The snapshotter needs the image reference, the layer digest and the
@@ -36,23 +87,31 @@ version = 3
   # shows up as layers that never make it into RACER.
   discard_unpacked_layers = false
 
-# Optional, and only if you run more than one runtime handler. The
-# snapshotter is selected per handler, and an unset value falls through
-# to the images plugin setting above, so most installs need nothing
-# here. Kata and other VM runtimes should keep their own snapshotter.
+# Optional, and only if you run more than one workload runtime handler.
+# The snapshotter is selected per handler, and an unset value falls
+# through to the images plugin setting above, so most installs need
+# nothing here. Kata and other VM runtimes should keep their own
+# snapshotter, and gantry-bootstrap above must keep overlayfs.
 # [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
 #   snapshotter = "gantry"
 
-# 3. Teach the transfer service to unpack into this snapshotter, so
-#    `ctr image pull` and any non-CRI client take the same path.
+# 2b. Teach the transfer service to unpack into this snapshotter, so
+#     `ctr image pull` and any non-CRI client take the same path.
 [[plugins.'io.containerd.transfer.v1.local'.unpack_config]]
   platform = "linux/amd64"
   snapshotter = "gantry"
 
-# 4. Optional, and unrelated to correctness: with the snapshotter
-#    working, most layers are never downloaded and never unpacked, so
-#    the historic reasons for keeping this low are gone. Raise it so
-#    the cold path (a genuinely new image that nobody has ingested
-#    yet) is not serialized behind a single download.
+# 2c. Optional, and unrelated to correctness: with the snapshotter
+#     working, most layers are never downloaded and never unpacked, so
+#     the historic reasons for keeping this low are gone. Raise it so
+#     the cold path (a genuinely new image that nobody has ingested
+#     yet) is not serialized behind a single download.
 # [plugins.'io.containerd.cri.v1.images']
 #   max_concurrent_downloads = 6
+
+# --- recovering a node that was configured out of order -------------
+#
+# A node whose CRI default is "gantry" and whose agent is not running
+# cannot start the agent. It is recoverable, but only from the host:
+# comment out 2a, restart containerd, let the DaemonSet land, then put
+# it back. Applying phase 1 everywhere first is what avoids needing to.

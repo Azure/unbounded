@@ -16,6 +16,7 @@ This directory is only the deployment.
 | File | Purpose |
 | --- | --- |
 | `serviceaccount.yaml.tmpl` | Namespace, ServiceAccount, RBAC and the PriorityClass |
+| `runtimeclass.yaml.tmpl` | The `gantry-bootstrap` RuntimeClass the agent runs under |
 | `daemonset.yaml.tmpl` | The node agent |
 | `containerd-config.toml` | Stanzas to merge into `/etc/containerd/config.toml` |
 
@@ -30,7 +31,9 @@ Per node:
 - A kernel with `CONFIG_EROFS_FS`, `CONFIG_BLK_DEV_DM` and `CONFIG_OVERLAY_FS`.
 - `racer` and `racer-ctrl` running, with the operator-rendered image device
   description at `/run/racer/image-devices.json`.
-- containerd 2.x.
+- containerd 2.x, with a `gantry-bootstrap` runtime handler pinned to
+  overlayfs. This is not optional; see "Why the agent runs under its own
+  RuntimeClass" below.
 
 In the image: `mkfs.erofs` (erofs-utils) and `dmsetup` (lvm2) on `PATH`.
 
@@ -41,40 +44,69 @@ misses, and containerd unpacks locally exactly as it does today.
 
 ## Install
 
-Order matters. containerd configured for a snapshotter whose socket is absent
-refuses to create containers, so the agent goes first.
+Three phases, in this order. The middle one is the only one that can be done
+from the API server, and the two containerd edits are deliberately separate:
+`snapshotter = "gantry"` is the CRI default for every pod on the node, and the
+agent is a pod.
+
+**1. Install the bootstrap runtime handler on every node.** Merge phase 1 of
+[`containerd-config.toml`](containerd-config.toml) into
+`/etc/containerd/config.toml` and restart containerd. This adds a
+`gantry-bootstrap` runtime handler pinned to overlayfs and registers the proxy
+plugin. Nothing selects either yet, so it changes no pod's behaviour.
+
+```sh
+systemctl restart containerd
+ctr plugin ls | grep gantry
+```
+
+**2. Apply the manifests.** The RuntimeClass has to exist before the DaemonSet
+that selects it, and the handler from phase 1 has to exist before either, or
+the pods stay Pending.
 
 ```sh
 make gantry-snapshotter-manifests
 kubectl apply -f deploy/gantry-snapshotter/rendered/serviceaccount.yaml
+kubectl apply -f deploy/gantry-snapshotter/rendered/runtimeclass.yaml
 kubectl apply -f deploy/gantry-snapshotter/rendered/daemonset.yaml
 kubectl -n unbounded-system rollout status ds/gantry-snapshotter
 ```
 
-Confirm the socket exists on a node, then merge `containerd-config.toml` into
-`/etc/containerd/config.toml` and restart containerd:
+**3. Point CRI at the snapshotter.** Only once the socket exists on the node.
+Merge phase 2 and restart containerd:
 
 ```sh
 ls -l /run/gantry-snapshotter/snapshotter.sock
 systemctl restart containerd
 ```
 
-Verify containerd sees the plugin and that it works end to end:
+Verify it works end to end:
 
 ```sh
-ctr plugin ls | grep gantry
 ctr -n k8s.io image pull --snapshotter gantry docker.io/library/alpine:latest
 ctr -n k8s.io snapshot --snapshotter gantry ls
 ```
+
+### Why the agent runs under its own RuntimeClass
+
+The socket at `/run/gantry-snapshotter/snapshotter.sock` is on tmpfs, so it does
+not survive a reboot. If the agent's pod were created through the default CRI
+snapshotter, then after a reboot kubelet would ask an absent socket to create
+the pod that creates that socket, and the node could never start a pod again.
+`runtimeClassName: gantry-bootstrap` selects a containerd handler pinned to
+overlayfs, which breaks the cycle. Do not remove it, and do not give that
+handler `snapshotter = "gantry"`.
 
 ## Uninstall
 
 Reverse order, for the same reason:
 
 ```sh
-# 1. Remove the containerd stanzas and restart containerd on every node.
+# 1. Remove the phase 2 stanzas and restart containerd on every node.
 # 2. Then, and only then:
 kubectl delete -f deploy/gantry-snapshotter/rendered/daemonset.yaml
+kubectl delete -f deploy/gantry-snapshotter/rendered/runtimeclass.yaml
+# 3. Finally, remove the phase 1 stanzas.
 ```
 
 Snapshots created by this snapshotter are not readable by overlayfs, so any

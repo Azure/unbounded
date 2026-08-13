@@ -44,6 +44,20 @@
 #     mirror, there is no graceful fallback, so the agent must not be
 #     preemptible.
 #
+#   - runtimeClassName: gantry-bootstrap. The most load bearing line in
+#     the file. It selects a containerd runtime handler pinned to
+#     overlayfs, so this pod is the one pod on the node that does not
+#     ask the gantry snapshotter to start it. Without it the agent
+#     depends on a socket only the agent creates: survivable at install
+#     time, fatal at the first reboot, because /run is tmpfs and the
+#     socket is gone while the CRI default still points at it. kubelet
+#     then asks an absent snapshotter to create the pod that would
+#     provide it, and the node cannot start any pod again.
+#
+#     The handler must exist in /etc/containerd/config.toml on every
+#     node before this DaemonSet is applied. See phase 1a of
+#     deploy/gantry-snapshotter/containerd-config.toml.
+#
 #   - GANTRY_SNAPSHOTTER_MEMBERS_SELECTOR turns on the peer view that
 #     ranks ingest work. With it unset every node is an eager ingester:
 #     correct, but every node converts every layer, which wastes CPU
@@ -52,10 +66,13 @@
 #
 # Apply with:
 #   kubectl apply -f deploy/gantry-snapshotter/serviceaccount.yaml
+#   kubectl apply -f deploy/gantry-snapshotter/runtimeclass.yaml
 #   kubectl apply -f deploy/gantry-snapshotter/daemonset.yaml
 #
-# Then register the snapshotter with containerd on each node; see
-# deploy/gantry-snapshotter/containerd-config.toml and the README.
+# The containerd runtime handler the RuntimeClass names has to be in
+# place first, and the CRI snapshotter default has to be flipped after
+# the agent is running. See deploy/gantry-snapshotter/containerd-config.toml
+# and the README.
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -83,6 +100,10 @@ spec:
         app.kubernetes.io/component: snapshotter
     spec:
       serviceAccountName: gantry-snapshotter
+      # Pins this pod to a containerd runtime handler backed by
+      # overlayfs, so the agent is never started through the
+      # snapshotter it provides. See the header.
+      runtimeClassName: gantry-bootstrap
       # The agent talks to the API server for the peer view only. It
       # uses the Pod network for that; nothing dials the agent.
       hostNetwork: false

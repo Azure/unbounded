@@ -1,0 +1,26 @@
+# RuntimeClass for the gantry-snapshotter node agent.
+#
+# The agent serves the snapshot socket that CRI needs in order to create
+# pods. Once containerd's CRI default is `snapshotter = "gantry"`, that
+# includes the agent's own pod, and the socket lives on tmpfs under
+# /run, so it does not survive a reboot. Without this RuntimeClass the
+# first reboot leaves kubelet asking an absent socket to create the pod
+# that creates it, and the node cannot start any pod again.
+#
+# `gantry-bootstrap` names a containerd runtime handler that is pinned
+# to overlayfs. See deploy/gantry-snapshotter/containerd-config.toml,
+# phase 1a. The handler must exist on every node BEFORE this object is
+# applied: a pod that selects a RuntimeClass no node implements stays
+# Pending with a scheduling error rather than failing loudly.
+#
+# Nothing but the gantry-snapshotter DaemonSet should use this class. A
+# workload that selects it silently opts out of the whole point of the
+# snapshotter and unpacks every layer locally.
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gantry-bootstrap
+  labels:
+    app.kubernetes.io/name: gantry-snapshotter
+handler: gantry-bootstrap
