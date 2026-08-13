@@ -181,6 +181,38 @@ pub(crate) enum Choice {
     Missing,
 }
 
+/// What a prepare round settled on: [`Choice`] with the two outcomes that are not errors,
+/// carried out to the caller instead of flattened.
+///
+/// The difference is a licence, not a label. A round that found nothing chosen may step
+/// down to the next register on offer when this one turns out to be unreadable; a round that
+/// found a chosen value may not, because stepping down past one drops an acknowledged write.
+/// That licence used to travel as a `bool` beside the register, where the two could be
+/// separated and either could be passed to something expecting the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Settled {
+    Chosen(Register),
+    Free(Register),
+}
+
+impl Settled {
+    /// The register the round settled on, whichever way it settled.
+    fn register(self) -> Register {
+        match self {
+            Settled::Chosen(r) | Settled::Free(r) => r,
+        }
+    }
+
+    /// The register to search below when this one cannot be served, and `None` when the
+    /// round found a value a quorum could already stand behind.
+    fn step_down(self) -> Option<Register> {
+        match self {
+            Settled::Free(r) => Some(r),
+            Settled::Chosen(_) => None,
+        }
+    }
+}
+
 /// Decide which reported register was chosen.
 ///
 /// The classical rule "highest version, ties on ballot" is not enough: a losing one-shot can
@@ -1159,9 +1191,9 @@ impl Paxos {
             self.send_accept(r, addr, Some(guard), b, page)
         });
         match join2(staged, votes).await {
-            (Ok(p), Ok(())) => self.alloc.finish(p).await.map(|_| ()),
+            (Ok(p), Ok(c)) => p.commit(self, c).await,
             (Ok(p), Err(e)) => {
-                self.alloc.abandon(p).await;
+                p.abandon(self).await;
                 Err(e)
             }
             (Err(e), _) => Err(e),
@@ -1215,11 +1247,12 @@ impl Paxos {
         guard: u64,
         b: Ballot,
         page: Page<'_>,
-    ) -> Result<Pending, Status> {
-        match page {
+    ) -> Result<Proposed, Status> {
+        let p = match page {
             Page::Small(p) => self.alloc.begin_small(addr, guard, b, p).await,
             Page::Huge(buf) => self.alloc.begin_huge(addr, guard, b, buf).await,
-        }
+        };
+        p.map(Proposed)
     }
 
     /// The route's `imm` tells the target whether to apply or propose: it names a member on
@@ -1302,7 +1335,7 @@ impl Paxos {
         need: usize,
         settle: bool,
         mut send: S,
-    ) -> Result<(), Status>
+    ) -> Result<Carried, Status>
     where
         S: FnMut(Route<'p>) -> F,
         F: Future<Output = Result<(), Status>>,
@@ -1315,10 +1348,10 @@ impl Paxos {
         }
         let want = need.saturating_sub(1);
         match (peers.pop(), peers.pop()) {
-            _ if want == 0 => Ok(()),
-            (None, _) => Ok(()),
+            _ if want == 0 => Ok(Carried(())),
+            (None, _) => Ok(Carried(())),
             // Two members and a quorum of two: the one peer must land.
-            (Some(a), None) => send(a).await,
+            (Some(a), None) => send(a).await.map(|()| Carried(())),
             (Some(a), Some(b)) => {
                 let q = if settle {
                     let (x, y) = join2(send(a), send(b)).await;
@@ -1328,7 +1361,7 @@ impl Paxos {
                 };
                 let ok = q.iter().flatten().filter(|r| r.is_ok()).count();
                 if carried(ok, need) {
-                    Ok(())
+                    Ok(Carried(()))
                 } else {
                     // Prefer a refusal (the group's verdict) over a peer we could not reach,
                     // so one member behind on its term does not read as a group that is gone.
@@ -1458,6 +1491,36 @@ impl Drop for Claim {
         // Detached because a destructor cannot await. If the slab has no room the address
         // stays claimed, which is what dropping a claim did every time before this.
         let _ = runtime::spawn(async move { paxos.unclaim(addr, core).await });
+    }
+}
+
+/// A quorum of peers accepted. Nothing else builds one, and there is nothing in it to read:
+/// its whole purpose is to be a thing that had to come from [`Paxos::fan_peers`].
+#[must_use = "a quorum nobody spends is a round that answered without installing anything"]
+struct Carried(());
+
+/// The proposer's own leg of an accept: page durable, slot held, and the register still
+/// reading as it did before.
+///
+/// The proposer must not install its local register until a quorum carries, or a refused
+/// proposal leaves this node a version ahead of the group that refused it. That rule used to
+/// be a shape the code happened to have, an allocator token and a `Result<(), _>` beside it
+/// in one match. Now the token is only settled through here, and committing one takes the
+/// quorum that justifies it, so the wrong order is not something that can be written.
+#[must_use = "a proposal holds a slot until it is committed or given back"]
+struct Proposed(Pending);
+
+impl Proposed {
+    /// Install the register. Takes the quorum by value so a caller cannot hold one round's
+    /// votes and commit the next round's page under them.
+    async fn commit(self, paxos: &'static Paxos, _: Carried) -> Result<(), Status> {
+        paxos.alloc.finish(self.0).await.map(|_| ())
+    }
+
+    /// Give the slot back. The peers that did accept keep what they took: an unchosen value
+    /// on an acceptor is what a later prepare is for.
+    async fn abandon(self, paxos: &'static Paxos) {
+        paxos.alloc.abandon(self.0).await;
     }
 }
 
@@ -2741,7 +2804,7 @@ impl Paxos {
         &'static self,
         addr: GlobalAddr,
         below: Option<Register>,
-    ) -> Result<(u32, Register, bool), Status> {
+    ) -> Result<(u32, Settled), Status> {
         // An unresolvable top version is a race, not the client's `Conflict`: retry here so
         // the only `Conflict` a caller sees is a guard mismatch.
         let mut last = self.prepare_once(addr, below).await;
@@ -2758,7 +2821,7 @@ impl Paxos {
         &'static self,
         addr: GlobalAddr,
         below: Option<Register>,
-    ) -> Result<(u32, Register, bool), Status> {
+    ) -> Result<(u32, Settled), Status> {
         let group = self.group(addr);
         let m = self.members(group).ok_or(Status::Unmapped)?;
         let me = self.self_index(&m);
@@ -2830,8 +2893,8 @@ impl Paxos {
         // with the first one a quorum could stand behind.
         let kind = self.alloc.kind_of(addr)?.0;
         match choose(&regs, answered, need, kind, below) {
-            Choice::Chosen(r) => Ok((term, r, false)),
-            Choice::Free(r) => Ok((term, r, true)),
+            Choice::Chosen(r) => Ok((term, Settled::Chosen(r))),
+            Choice::Free(r) => Ok((term, Settled::Free(r))),
             // An unresolvable top version is a race, not the client's `Conflict`:
             // `prepare_round` retries here so the only `Conflict` a caller sees is a guard
             // mismatch.
@@ -2869,17 +2932,22 @@ impl Paxos {
         let mut below = None;
         let mut last = Err(Status::Io);
         for _ in 0..3 {
-            let (_, best, free) = self.prepare_round(addr, below).await?;
+            let (_, settled) = self.prepare_round(addr, below).await?;
+            let best = settled.register();
             if below.is_some_and(|b: Register| best.key() >= b.key()) {
                 break;
             }
             last = self.settle(addr, best).await;
-            // Only a round that found nothing chosen may step down: `free` is that
-            // certificate. Without it the value is the group's answer, readable or not.
-            if !free || !matches!(last, Err(Status::Missing | Status::Io)) {
+            // Only a round that found nothing chosen may step down, which is the whole
+            // difference `Settled` keeps: a chosen value is the group's answer, readable or
+            // not, and there is no next register to ask for below it.
+            let Some(next) = settled.step_down() else {
+                break;
+            };
+            if !matches!(last, Err(Status::Missing | Status::Io)) {
                 break;
             }
-            below = Some(best);
+            below = Some(next);
         }
         last
     }
