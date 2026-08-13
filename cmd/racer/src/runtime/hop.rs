@@ -17,6 +17,7 @@ use std::task::{Context, Poll, Waker};
 
 use super::sys::Region;
 use super::worker;
+use super::{CoreCtx, Handler};
 
 /// Slots per directed ring. Sized so a burst of hops never spills into the outbox.
 #[cfg(not(feature = "sim"))]
@@ -457,6 +458,54 @@ where
     worker::poll_hop_task(id);
 }
 
+// --- the caller's side of a rendezvous ---
+
+/// Take the reply out of `id`, or park `cx` on it. Shared by [`Hop`] and [`Call`].
+fn take_reply<T>(id: u32, cx: &mut Context) -> Option<T> {
+    worker::with_local(|l| {
+        let mut cells = l.cells.borrow_mut();
+        let s = &mut cells.slots[id as usize];
+        if s.state != CELL_FULL {
+            s.waker = Some(cx.waker().clone());
+            return None;
+        }
+        // SAFETY: the reply trampoline wrote a live `T` here.
+        let v = unsafe { (s.data.as_ptr() as *const T).read() };
+        cells.release(id);
+        Some(v)
+    })
+}
+
+/// Give up on `id`. If the reply landed, drop it here; otherwise the trampoline frees the
+/// cell when it arrives. Shared by [`Hop`] and [`Call`].
+fn abandon_reply<T>(id: u32) {
+    worker::with_local(|l| {
+        let mut cells = l.cells.borrow_mut();
+        let s = &mut cells.slots[id as usize];
+        if s.state == CELL_FULL {
+            // SAFETY: a live `T` landed before we were dropped.
+            unsafe { ptr::drop_in_place(s.data.as_mut_ptr() as *mut T) };
+            cells.release(id);
+        } else {
+            s.state = CELL_ABANDONED;
+            s.waker = None;
+        }
+    });
+}
+
+/// Reserve a rendezvous cell on this core, returning `(cell, this core)`.
+fn open_cell() -> (u32, u16) {
+    worker::with_local(|l| {
+        (
+            l.cells
+                .borrow_mut()
+                .alloc()
+                .expect("hop cell slab exhausted"),
+            l.core as u16,
+        )
+    })
+}
+
 // --- the caller's future ---
 
 enum Stage<F, Fut> {
@@ -473,6 +522,8 @@ pub(super) struct Hop<F, Fut, T> {
     cell: u32,
     stage: Stage<F, Fut>,
     _m: PhantomData<fn() -> T>,
+    /// The cell, the ring and the ambient worker are all this core's.
+    _nosend: PhantomData<*const ()>,
 }
 
 impl<F, Fut, T> Hop<F, Fut, T> {
@@ -482,6 +533,7 @@ impl<F, Fut, T> Hop<F, Fut, T> {
             cell: u32::MAX,
             stage: Stage::Init(f),
             _m: PhantomData,
+            _nosend: PhantomData,
         }
     }
 }
@@ -508,15 +560,7 @@ where
                     }
                     const { assert!(size_of::<F>() <= PAYLOAD_BYTES) };
                     const { assert!(align_of::<F>() <= 64) };
-                    let (cell, src) = worker::with_local(|l| {
-                        (
-                            l.cells
-                                .borrow_mut()
-                                .alloc()
-                                .expect("hop cell slab exhausted"),
-                            l.core as u16,
-                        )
-                    });
+                    let (cell, src) = open_cell();
                     me.cell = cell;
                     let mut msg = Msg::new(call_trampoline::<F, Fut, T>, cell, src);
                     msg.put(f);
@@ -535,20 +579,7 @@ where
                     };
                 }
                 Stage::Sent => {
-                    let id = me.cell;
-                    let out = worker::with_local(|l| {
-                        let mut cells = l.cells.borrow_mut();
-                        let s = &mut cells.slots[id as usize];
-                        if s.state != CELL_FULL {
-                            s.waker = Some(cx.waker().clone());
-                            return None;
-                        }
-                        // SAFETY: the reply trampoline wrote a live `T` here.
-                        let v = unsafe { (s.data.as_ptr() as *const T).read() };
-                        cells.release(id);
-                        Some(v)
-                    });
-                    return match out {
+                    return match take_reply::<T>(me.cell, cx) {
                         Some(v) => {
                             me.stage = Stage::Done;
                             Poll::Ready(v)
@@ -564,23 +595,114 @@ where
 
 impl<F, Fut, T> Drop for Hop<F, Fut, T> {
     fn drop(&mut self) {
-        if !matches!(self.stage, Stage::Sent) {
-            return;
+        if matches!(self.stage, Stage::Sent) {
+            abandon_reply::<T>(self.cell);
         }
-        // If the reply landed, drop it here; otherwise the trampoline frees the cell.
-        let id = self.cell;
-        worker::with_local(|l| {
-            let mut cells = l.cells.borrow_mut();
-            let s = &mut cells.slots[id as usize];
-            if s.state == CELL_FULL {
-                // SAFETY: a live `T` landed before we were dropped.
-                unsafe { ptr::drop_in_place(s.data.as_mut_ptr() as *mut T) };
-                cells.release(id);
-            } else {
-                s.state = CELL_ABANDONED;
-                s.waker = None;
+    }
+}
+
+// --- core transactions ---
+
+/// Runs `f` under the destination's [`CoreCtx`] and replies at once.
+///
+/// `f` cannot await, so unlike [`call_trampoline`] this needs no task-slab slot and no
+/// second visit from the worker loop: the whole transaction happens inside one ring drain.
+///
+/// # Safety
+/// `msg` must have been built by [`Call::poll`] for this same `H`, `F` and `T`.
+#[allow(dead_code)]
+unsafe fn sync_trampoline<H, F, T>(msg: &mut Msg)
+where
+    H: Handler,
+    F: FnOnce(CoreCtx<'_, H>) -> T,
+{
+    // SAFETY: the caller put an `F` here; the vtable slot ties the two together.
+    let f = unsafe { msg.take::<F>() };
+    let (src, cell) = (msg.src, msg.cell);
+    reply(src, cell, worker::with_core_ctx::<H, T>(f));
+}
+
+enum CallStage<F> {
+    Init(F),
+    Sent,
+    Done,
+}
+
+/// Awaiting this runs `f` on `dst` inside a core transaction and returns its value.
+///
+/// Dropping it discards the value. On this core the transaction never started; on another
+/// it has already run, because a transaction is not interruptible once sent.
+pub(super) struct Call<H, F, T> {
+    dst: usize,
+    cell: u32,
+    stage: CallStage<F>,
+    _m: PhantomData<fn() -> (H, T)>,
+    /// The cell, the ring and the ambient worker are all this core's.
+    _nosend: PhantomData<*const ()>,
+}
+
+#[allow(dead_code)]
+impl<H, F, T> Call<H, F, T> {
+    pub(super) fn new(dst: usize, f: F) -> Call<H, F, T> {
+        Call {
+            dst,
+            cell: u32::MAX,
+            stage: CallStage::Init(f),
+            _m: PhantomData,
+            _nosend: PhantomData,
+        }
+    }
+}
+
+impl<H, F, T> Future for Call<H, F, T>
+where
+    H: Handler,
+    F: FnOnce(CoreCtx<'_, H>) -> T,
+{
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<T> {
+        // SAFETY: nothing in `stage` is self-referential and we move out only once.
+        let me = unsafe { self.get_unchecked_mut() };
+        loop {
+            match &mut me.stage {
+                CallStage::Init(_) => {
+                    let CallStage::Init(f) = std::mem::replace(&mut me.stage, CallStage::Done)
+                    else {
+                        unreachable!()
+                    };
+                    if me.dst == worker::core() {
+                        return Poll::Ready(worker::with_core_ctx::<H, T>(f));
+                    }
+                    const { assert!(size_of::<F>() <= PAYLOAD_BYTES) };
+                    const { assert!(align_of::<F>() <= 64) };
+                    let (cell, src) = open_cell();
+                    me.cell = cell;
+                    let mut msg = Msg::new(sync_trampoline::<H, F, T>, cell, src);
+                    msg.put(f);
+                    worker::send_hop(me.dst, msg);
+                    me.stage = CallStage::Sent;
+                }
+                CallStage::Sent => {
+                    return match take_reply::<T>(me.cell, cx) {
+                        Some(v) => {
+                            me.stage = CallStage::Done;
+                            Poll::Ready(v)
+                        }
+                        None => Poll::Pending,
+                    };
+                }
+                CallStage::Done => panic!("core transaction polled after completion"),
             }
-        });
+        }
+    }
+}
+
+impl<H, F, T> Drop for Call<H, F, T> {
+    fn drop(&mut self) {
+        if matches!(self.stage, CallStage::Sent) {
+            abandon_reply::<T>(self.cell);
+        }
     }
 }
 
