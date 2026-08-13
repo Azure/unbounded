@@ -1588,10 +1588,12 @@ impl Cache {
                 return;
             }
         }
-        // Then a free 4 MiB data slot on loan from the allocator. Huge only: a borrowed chunk
-        // is one huge entry, so giving it back drops one page, where a borrowed small chunk
-        // would drop 1024 at once.
-        if k == 1 && held + cost <= self.budget && self.borrow(&mut chunks[1]).await {
+        // Then a free 4 MiB data slot on loan from the allocator. Either class: the layout
+        // claims the whole store, so a loan is the only media the cache has, and a cache the
+        // small class could never reach would be no cache at all for 4 KiB reads. Giving a
+        // small loan back drops 1024 pages where a huge one drops one, which costs a recall
+        // more than it used to and nothing else: the cache is advisory in every direction.
+        if held + cost <= self.budget && self.borrow(k, &mut chunks[k]).await {
             return;
         }
         // Last, take one from the other class. This is also the only way the small class grows
@@ -1644,18 +1646,19 @@ impl Cache {
         None
     }
 
-    /// Borrow one free 4 MiB data slot and give it to the huge store on the core that lent it.
-    /// The lend and the push happen in one hop, so a slot is never on loan to nobody.
+    /// Borrow one free 4 MiB data slot and give it to class `k`'s store on the core that lent
+    /// it. The lend and the push happen in one hop, so a slot is never on loan to nobody.
     ///
     /// The same core on purpose: the allocator takes a loan back synchronously, from inside a
     /// reservation that cannot await, so the loan must sit where its shard can reach it
     /// without a hop. That works out, because a core owning a stripe of the 4 MiB slab owns a
-    /// stripe of the 4 MiB cache too: both are `mblock % cores` over the same mblocks.
-    async fn borrow(&'static self, chunks: &mut [u64]) -> bool {
-        for core in self.order(1, chunks, false) {
+    /// stripe of the cache too: both are `mblock % cores` over the same mblocks. A core that
+    /// owns no 4 MiB stripe simply lends nothing and the next one is tried.
+    async fn borrow(&'static self, k: usize, chunks: &mut [u64]) -> bool {
+        for core in self.order(k, chunks, false) {
             let got = at(core, move |l| {
                 let loan = self.alloc.lend()?;
-                l.stores[1].push_chunk(Chunk {
+                l.stores[k].push_chunk(Chunk {
                     off: loan.offset(),
                     loan: Some(loan),
                 });
@@ -1670,16 +1673,21 @@ impl Cache {
         false
     }
 
-    /// Hand one borrowed chunk back, dropping the page it held. `None` when this core holds no
-    /// loan it can part with.
+    /// Hand one borrowed chunk back, dropping the pages it held. `None` when this core holds
+    /// no loan it can part with.
     ///
     /// Called synchronously by the allocator, on the core that lent it, from inside a
     /// reservation. It takes no core to call: a loan only ever sits in the share of the core
-    /// that made it, which is the core asking. Touches this core's huge store and nothing
-    /// else: no config, no pressure test, no hop, because the allocator has state borrowed
-    /// around the call.
+    /// that made it, which is the core asking. Touches this core's stores and nothing else:
+    /// no config, no pressure test, no hop, because the allocator has state borrowed around
+    /// the call. Huge first, since that is the loan whose return costs one page rather than
+    /// 1024.
     pub fn give_back(&self) -> Option<Loan> {
-        here(|l| l.stores[1].give_loan())
+        here(|l| {
+            l.stores[1]
+                .give_loan()
+                .or_else(|| l.stores[0].give_loan())
+        })
     }
 }
 
@@ -2050,6 +2058,33 @@ mod tests {
 
     /// The two hand-backs answer only with their own kind: the reclaim path must get media
     /// the allocator lent, and the rebalance must get media the cache owns.
+    /// The small class holds loans too, and hands one back whole.
+    ///
+    /// The layout claims the store, so a loan is the only media either class has. Giving one
+    /// back costs the small class 1024 pages where it costs the huge class one, which is the
+    /// price of a cache that 4 KiB reads can reach at all.
+    #[test]
+    fn a_small_chunk_can_be_borrowed_and_given_back() {
+        let mut st = Store::new(Class::Small);
+        st.push_chunk(Chunk {
+            off: 1 << 30,
+            loan: Some(Loan::for_test(1 << 30)),
+        });
+        let r = Register::default();
+        for a in 1..=3u64 {
+            let i = st.claim_uncontested(a, r).unwrap();
+            st.finish(i, true);
+        }
+        let found = st.find(2).map(|(i, _)| i);
+        assert!(found.is_some());
+        st.release(found.unwrap());
+
+        assert_eq!(st.give_loan().map(|l| l.offset()), Some(1 << 30));
+        assert!(st.chunks.is_empty(), "the cache gave the whole chunk back");
+        assert!(st.find(1).is_none());
+        assert_eq!(st.dropped, 3, "every page in the chunk went with it");
+    }
+
     #[test]
     fn give_returns_only_the_kind_asked_for() {
         let mut st = Store::new(Class::Huge);

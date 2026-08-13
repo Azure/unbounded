@@ -305,6 +305,16 @@ impl Universe {
         v
     }
 
+    /// How many of the catalog's group slots one node holds. This is that node's share of
+    /// the zone, and it is not the same for every node: a zone growing, shrinking or
+    /// levelling out moves one group at a time.
+    pub(crate) fn slots_held(&self, node: u32) -> u64 {
+        if node == 0 {
+            return 0;
+        }
+        self.catalog.iter().filter(|g| g.contains(&node)).count() as u64
+    }
+
     fn known_zone(&self, zone: u32, ours: u32) -> bool {
         zone == ours || self.zones.iter().any(|z| z.id == zone)
     }
@@ -640,14 +650,26 @@ impl Config {
         self.count_pages(true)
     }
 
-    /// This node's share of one page class over all its universes. The catalog is balanced,
-    /// so each node of a zone holds an equal share of three replicas; shares add up.
+    /// This node's share of one page class over all its universes. A zone's pages are spread
+    /// over its catalog's groups and each group is stored three times, so a node's share is
+    /// exactly the group slots it holds; shares add up. A node the catalog does not name is
+    /// sized as though it held an even share, because it is either about to be named or
+    /// draining out and still holding what it has not handed over.
     fn count_pages(&self, huge: bool) -> u64 {
         self.universes
             .iter()
             .map(|u| {
-                let n = u.zone_nodes().len().max(1) as u64;
-                (u.zone_pages(huge, self.node.zone) * 3).div_ceil(n)
+                let groups = u.catalog.len() as u64;
+                if groups == 0 {
+                    return 0;
+                }
+                let held = u.slots_held(self.node.id);
+                let share = if held == 0 {
+                    (groups * 3).div_ceil(u.zone_nodes().len().max(1) as u64)
+                } else {
+                    held
+                };
+                (u.zone_pages(huge, self.node.zone) * share).div_ceil(groups)
             })
             .sum()
     }
@@ -817,25 +839,13 @@ impl Config {
                 )));
             }
         }
-        // Homogeneity: each named node holds the same number of groups, so it can size its
-        // store from the zone's total and the node count alone.
-        let nodes = u.zone_nodes();
-        let slots = 3 * u.catalog.len();
-        if !slots.is_multiple_of(nodes.len()) {
-            return Err(bad(format!(
-                "universe {id} spreads {slots} group slots over {} nodes, which cannot be even",
-                nodes.len()
-            )));
-        }
-        let want = slots / nodes.len();
-        for n in &nodes {
-            let held = u.catalog.iter().flatten().filter(|&m| m == n).count();
-            if held != want {
-                return Err(bad(format!(
-                    "universe {id} gives node {n} {held} groups, not the {want} every node holds"
-                )));
-            }
-        }
+        // Not checked: whether the catalog spreads its groups evenly. It used to be, on the
+        // grounds that a node could then size its store from the zone total and the node
+        // count alone. But a zone that is growing, shrinking or levelling out is uneven by
+        // construction: groups move one at a time so that every group keeps two of the three
+        // nodes that held it, and every state between two even catalogs is an odd one. A
+        // node sizes itself from the slots it actually holds instead, which is the same
+        // number when the catalog happens to be even.
         for (i, z) in u.zones.iter().enumerate() {
             if z.id == 0 {
                 return Err(bad(format!("universe {id} names zone 0")));
@@ -1079,9 +1089,28 @@ impl Config {
                     u.id, pu.fabric_device_id, u.fabric_device_id
                 )));
             }
-            // Only across one generation: a node that missed a push cannot tell how many
-            // steps a catalog took, so it refuses to guess.
+            // What makes a membership change safe is per group, not per catalog: a group
+            // that kept two of its three nodes has two replicas holding every version it
+            // ever agreed, so it serves reads while the third replays from them. A group
+            // that changed two runs on one copy, and one that changed all three has no copy
+            // at all and, worse, looks converged, because three empty replicas agree with
+            // each other. The id counts are the second rule: they bound how much of the zone
+            // replays at once and make a departure something the control plane can wait on.
+            //
+            // Only across one generation, because a node that missed a push cannot tell how
+            // many steps a catalog took and two legal steps compose into a group that
+            // changed twice. The control plane holds every transition to this rule whatever
+            // the stride, so a gap here means a push was missed, not that the rule was.
             if self.generation == prev.generation + 1 {
+                for (g, (was, now)) in pu.catalog.iter().zip(u.catalog.iter()).enumerate() {
+                    let kept = (0..3).filter(|&c| was[c] != 0 && was[c] == now[c]).count();
+                    if kept < 2 {
+                        return Err(bad(format!(
+                            "universe {} group {g} keeps only {kept} of {:?}, becoming {:?}",
+                            u.id, was, now
+                        )));
+                    }
+                }
                 let (was, now) = (pu.zone_nodes(), u.zone_nodes());
                 let joined = now.iter().filter(|n| !was.contains(n)).count();
                 let left = was.iter().filter(|n| !now.contains(n)).count();
@@ -2542,13 +2571,47 @@ universe 1 epoch=1 fabric_device_id=9
     }
 
     #[test]
-    fn an_unbalanced_catalog_is_refused() {
+    fn capacity_follows_the_slots_a_node_holds() {
+        // Two groups, and node 3 has handed one of them to node 4. Node 1 still holds both
+        // of its column and sizes for the whole zone; node 3 holds one and sizes for half.
+        let text = "generation 1
+node id=%ID% zone=1 cohort=%COHORT% store=/x size=1048576
+universe 1 epoch=1 fabric_device_id=9
+  group 1 2 3
+  group 1 2 4
+  extent id=1 base=0 pages=300 kind=lww zone=1
+";
+        let held_both = Config::parse(&text.replace("%ID%", "1").replace("%COHORT%", "0")).unwrap();
+        held_both.validate().unwrap();
+        assert_eq!(held_both.small_pages(), 300, "both groups of its column");
+
+        let held_one = Config::parse(&text.replace("%ID%", "3").replace("%COHORT%", "2")).unwrap();
+        held_one.validate().unwrap();
+        assert_eq!(held_one.small_pages(), 150, "one group of two");
+
+        let held_none = Config::parse(&text.replace("%ID%", "9").replace("%COHORT%", "2")).unwrap();
+        held_none.validate().unwrap();
+        assert_eq!(held_none.small_pages(), 300, "six slots over four nodes, rounded up");
+    }
+
+    #[test]
+    fn an_uneven_catalog_is_accepted() {
+        // Node 1 holds both groups of its column and node 4 holds one of node 3's. A zone
+        // moving groups one at a time is uneven for as long as the move takes, and refusing
+        // that would mean refusing every state between two even catalogs.
         let mut c = sample();
         c.universes[0].catalog = vec![[1, 2, 3], [1, 2, 4]];
-        assert!(c.validate().is_err(), "node 3 holds fewer groups than 1");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn a_group_still_needs_three_distinct_nodes() {
         let mut c = sample();
         c.universes[0].catalog = vec![[1, 1, 2]];
         assert!(c.validate().is_err(), "a group needs three distinct nodes");
+        let mut c = sample();
+        c.universes[0].catalog = vec![[1, 0, 2]];
+        assert!(c.validate().is_err(), "a group may not name node 0");
         let mut c = sample();
         c.universes[0].catalog.clear();
         assert!(c.validate().is_err());

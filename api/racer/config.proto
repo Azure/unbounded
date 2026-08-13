@@ -92,12 +92,14 @@ message Store {
   // less than the file already has is rejected, as is a start that finds a longer file,
   // because the store is addressed by absolute offset and nothing could move its contents.
   //
-  // Everything comes out of this: superblocks, the metadata region, and the data slabs
-  // sized from every universe's extents. A configuration that does not fit is refused at
-  // startup, naming this field. Whatever is left over is the read cache, with nothing to
-  // configure: every 4 MiB the slabs did not claim goes to the cache, which gives it back
-  // if a later config grows the slabs into it. `policy.cache_index_bytes` bounds the DRAM
-  // that cache costs.
+  // Everything comes out of this: superblocks, the metadata region, and the data slabs.
+  // The 4 KiB slabs are sized from every universe's extents, because their slots cost DRAM
+  // to index and `policy.cache_index_bytes` bounds that; the 4 MiB slabs take everything
+  // left over, so a zone that grows finds the slots already there rather than waiting for a
+  // restart. A configuration that does not fit is refused at startup, naming this field.
+  // Slots data has not claimed are the read cache, with nothing to configure: the cache
+  // borrows them and gives them back when data wants them. `policy.cache_index_bytes`
+  // bounds the DRAM that cache costs.
   uint64 size_bytes = 1;
 
   // The rate this node will drive its own storage at. Set these below what the device under
@@ -146,16 +148,20 @@ message Universe {
   // the core that serves the address and the key anti-entropy accumulates digests under,
   // and nothing moves pages between groups. Ownership moves by changing a group's members.
   //
-  // The catalog must be balanced, because the nodes of a zone are homogeneous: every node
-  // it names appears in exactly `3 * len(catalog) / n` groups, where `n` is the number of
-  // distinct nodes named, and `n` must divide `3 * len(catalog)`. An unbalanced catalog is
-  // refused. This is the only capacity model: a node sizes its store from that equal share
-  // in each universe it joins, so every node of a zone formats identically.
+  // A node's share of the zone is the groups this catalog names it in, and it sizes its
+  // store from the sum of those shares across the universes it joins. An idle zone is even,
+  // every node holding `3 * len(catalog) / n` groups for `n` distinct nodes named; a zone
+  // that is growing, shrinking or levelling out is uneven while groups move, and an uneven
+  // catalog is accepted, because refusing one would refuse every state between two even
+  // ones.
   //
-  // Consecutive generations may differ by at most one member id. The newcomer inherits the
-  // departing node's groups and replays them from its peers; the departing node drops what
-  // it held once the new members confirm they have it. A node that has missed generations
-  // is held to no such step, since it is handed a settled state rather than a transient.
+  // Consecutive generations may move at most one member of any group, and at most one id
+  // may enter or leave the zone. Two of a group's three nodes therefore survive every
+  // change: they serve reads while the third replays from them, where three new members
+  // would agree with each other about holding nothing. The newcomer inherits the group and
+  // replays it; the node no longer named there drops what it held once the new members
+  // confirm they have it. A node that has missed generations is held to no such step, since
+  // it is handed a settled state rather than a transient.
   //
   // A node this catalog does not name is not a member of this zone in this universe: it is
   // either draining under the config that dropped it, or it only routes for others.

@@ -27,7 +27,7 @@ It allocates and replicates 4KB and 4MB pages striped across large (100k+ node) 
 ## Cluster Architecture
 
 - __Universes__: a shared LBA space, and the security boundary around it
-- __Zones__: groups of ~1000 homogeneous nodes within a single universe
+- __Zones__: groups of ~1000 interchangeable nodes within a single universe
 - __Groups__: consensus groups of 3 nodes within the same zone
 
 ### Universes
@@ -44,7 +44,7 @@ These additional hops are actually important: they fan out read capacity for hot
 
 A consuming zone does not have to wait for a reader to discover a page. An immutable extent may name the zones that will read it, and every commit is followed by an advisory push into each of them: the writing zone tells a gateway there, and that gateway hands the page to the one node per cohort its readers will look on. By the time anyone in that zone reads, the page is already local. Nothing waits on it and nothing depends on it - a warm that is lost costs one ordinary cross-zone read.
 
-Nodes within a zone are __homogeneous__. Every node belongs to the same number of groups, so every node stores the same share of the zone. A node in several universes stores the sum of its shares.
+Nodes within a zone are __interchangeable__. A node stores the share of the zone that its groups add up to, and a node in several universes stores the sum of its shares. An idle zone is even, every node holding the same number of groups; a zone that is growing, shrinking, or taking a node back is uneven while one group at a time moves between nodes.
 
 ### Groups
 
