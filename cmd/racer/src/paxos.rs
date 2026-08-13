@@ -913,9 +913,28 @@ impl Paxos {
         }
     }
 
-    /// Delete an Immutable page: an ordinary guarded accept whose value is a tombstone.
-    /// Idempotent, because the tombstone is a state and not an event.
+    /// Delete a page.
+    ///
+    /// An Immutable page becomes a tombstone: an ordinary guarded accept whose value is a
+    /// state and not an event, so a repeat is free, and the entry itself goes when the
+    /// control plane advances the extent's epoch past it.
+    ///
+    /// A mutable page has no epoch to advance, so there is no barrier that could make
+    /// releasing its register safe. A member that missed the release still holds the old
+    /// value at its old version, a released register reads as version zero, and the next
+    /// repair round picks the higher of the two: bytes a client was told were discarded
+    /// come back. So a mutable discard is an accept of zeroes, which is what a hole reads
+    /// as anyway, and orders against concurrent writes like the write it is. It leaves the
+    /// slot allocated, which a discard is entitled to do: freeing it needs a barrier this
+    /// class does not have.
     pub async fn trim(&'static self, addr: GlobalAddr) -> Result<(), Status> {
+        let (kind, _) = self.alloc.kind_of(addr)?;
+        if kind != Kind::Immutable {
+            let mut zeroes = PoolBuf::alloc(fabric::BLOCK).await;
+            zeroes.fill(0);
+
+            return self.write(addr, Page::Small(&zeroes)).await.map(drop);
+        }
         let epoch = server::config().tombstone_epoch_of(addr.0);
         // A live page sits at `3e + 1`; that is what a trim guards on.
         let guard = 3 * epoch + 1;
