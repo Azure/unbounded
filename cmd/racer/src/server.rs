@@ -1017,11 +1017,14 @@ async fn snap_open(
 ) -> Result<(), Errno> {
     let group = group_of(d, universe, group)?;
     let filter = bucket.map_or(heal::Filter::All, |b| heal::Filter::Bucket(b.get()));
+    // Handed over: the peer that asked owns the cursor now, and closes it by walking it
+    // to the end. A peer that never comes back is what the cursor's deadline is for.
     let id = d
         .alloc()
         .snap_open(group, class == Class::Huge, filter)
         .await
-        .map_err(wire)?;
+        .map_err(wire)?
+        .into_wire();
     let r = fabric::SnapOpenReply {
         cursor: fabric::Cursor::new(id),
     };
