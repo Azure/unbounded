@@ -308,12 +308,21 @@ func (i *Ingester) link(req Request, blob catalog.Blob) (err error) {
 // A failure to abandon is worth more than the failure that caused it, since it
 // is the one that is not local to this node, so it is joined onto the original
 // rather than replacing or hiding it.
+//
+// The exception is a reservation the catalog no longer recognises, which means
+// the node re-attached to a different catalog while this ingest was running.
+// The slots are real but they are not ours to void, and the node that still has
+// that catalog retires them, so there is nothing here worth reporting as a hole.
 func (i *Ingester) abandon(res catalog.Reservation, cause error) error {
 	if cause == nil {
 		return nil
 	}
 
 	if err := i.cat.Abandon(res); err != nil {
+		if errors.Is(err, catalog.ErrForeignReservation) {
+			return cause
+		}
+
 		return errors.Join(cause, fmt.Errorf(
 			"ingest: catalog records %d..%d are a permanent hole, every node stops reading there: %w",
 			res.FirstRecord, res.FirstRecord+uint64(res.RecordCount), err)) //nolint:gosec // record count is small and positive

@@ -370,6 +370,21 @@ type Reservation struct {
 	// Generation is the catalog generation the reservation was taken at, and
 	// is what the records written under it carry.
 	Generation uint64
+
+	// owner is the store that issued this reservation.
+	//
+	// A node's catalog can be replaced underneath an ingest that is already
+	// holding a reservation, because racer-ctrl republishes the device set
+	// and the daemon re-attaches. Page offsets and record slots mean nothing
+	// outside the catalog they were allocated from, so applying one to a
+	// different catalog would publish a blob record naming bytes that belong
+	// to somebody else. Nothing on the read path re-checks a blob's digest,
+	// so that would surface as a container quietly running the wrong layer.
+	//
+	// It is unexported so it cannot be forged, set by a caller, or carried
+	// across a process. A zero owner is unowned and passes every check, which
+	// keeps Reservation usable as a literal in tests.
+	owner *Store
 }
 
 // Address is where the reservation's blob goes.
@@ -380,6 +395,20 @@ func (r Reservation) Address(byteLength uint64) segment.Address {
 		PageCount:  r.PageCount,
 		ByteLength: byteLength,
 	}
+}
+
+// ErrForeignReservation is returned when a reservation is applied to a catalog
+// other than the one that issued it.
+var ErrForeignReservation = errors.New("catalog: reservation belongs to a different catalog")
+
+// checkOwner rejects a reservation issued by a different store.
+func (s *Store) checkOwner(res Reservation) error {
+	if res.owner != nil && res.owner != s {
+		return fmt.Errorf("%w: records %d..%d", ErrForeignReservation,
+			res.FirstRecord, res.FirstRecord+uint64(res.RecordCount)) //nolint:gosec // record count is small and positive
+	}
+
+	return nil
 }
 
 // ReserveRecords claims record slots without claiming any pages.
@@ -414,7 +443,14 @@ func (s *Store) Reserve(pages uint32, records int) (Reservation, error) {
 	// is a log line on the caller's goroutine, and running it under the lock
 	// would let anything that touches the catalog from it deadlock. Deferred
 	// before the unlock so it runs after it.
-	var rolled Roll
+	//
+	// rolls counts attempts rather than reading rolled, because a roll that
+	// lands on a segment another node opened first reports a zero Roll. That
+	// is still a roll, and counting it is what keeps the cap below honest.
+	var (
+		rolled Roll
+		rolls  int
+	)
 
 	defer func() {
 		if rolled.Opened != 0 && s.onRoll != nil {
@@ -446,7 +482,7 @@ func (s *Store) Reserve(pages uint32, records int) (Reservation, error) {
 				// as we roll, and sealing segment after segment to chase
 				// it would empty the volume. Ingest is off the container
 				// start path, so the layer is simply ingested later.
-				if rolled.Opened != 0 {
+				if rolls > 0 {
 					return Reservation{}, fmt.Errorf("%w: open segment %d has %d of %d pages free",
 						ErrFull, sb.OpenSegment, sb.OpenFreePages(), pages)
 				}
@@ -465,7 +501,11 @@ func (s *Store) Reserve(pages uint32, records int) (Reservation, error) {
 					return Reservation{}, err
 				}
 
-				rolled = roll
+				rolls++
+
+				if roll.Opened != 0 {
+					rolled = roll
+				}
 
 				continue
 			}
@@ -485,6 +525,7 @@ func (s *Store) Reserve(pages uint32, records int) (Reservation, error) {
 			FirstRecord: sb.RecordCount,
 			RecordCount: records,
 			Generation:  next.Generation,
+			owner:       s,
 		}
 
 		if pages > 0 {
@@ -542,6 +583,10 @@ func (s *Store) writeSuperblock(sb Superblock) error {
 // Retrying is safe because the retry re-reads the other writer's record and
 // re-places only its own slots.
 func (s *Store) Append(res Reservation, records []Record) error {
+	if err := s.checkOwner(res); err != nil {
+		return err
+	}
+
 	if len(records) != res.RecordCount {
 		return fmt.Errorf("catalog: %d records for a reservation of %d", len(records), res.RecordCount)
 	}
@@ -591,7 +636,16 @@ func (s *Store) Append(res Reservation, records []Record) error {
 //
 // A slot that already holds a real record is left alone. Append can fail after
 // writing some of its blocks, and those records are published and true.
+//
+// A reservation from a catalog this store has since replaced is refused with
+// ErrForeignReservation rather than voided here. Its slots are not this
+// catalog's to write, and the hole it leaves behind belongs to whichever node
+// still has that catalog attached, where Repair retires it.
 func (s *Store) Abandon(res Reservation) error {
+	if err := s.checkOwner(res); err != nil {
+		return err
+	}
+
 	if res.RecordCount <= 0 {
 		return nil
 	}

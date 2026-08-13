@@ -1304,3 +1304,95 @@ func TestAccount(t *testing.T) {
 		t.Fatal("want an error accounting to a segment that is not in the table")
 	}
 }
+
+// A node's catalog can be replaced while an ingest is holding a reservation.
+// Page offsets and record slots mean nothing outside the catalog they came
+// from, and nothing on the read path re-checks a blob's digest, so applying one
+// to the wrong catalog would quietly publish a record naming unrelated bytes.
+func TestForeignReservationIsRefused(t *testing.T) {
+	_, a := ready(t)
+	_, b := ready(t)
+
+	res, err := a.Reserve(1, 2)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	before := b.Superblock()
+
+	segsBefore, err := b.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	addr := res.Address(1234)
+
+	records := []Record{
+		{
+			Type: RecordBlob, Key: digest(1), Ref: digest(0xaa),
+			Segment: addr.Segment, PageOffset: addr.PageOffset,
+			PageCount: addr.PageCount, ByteLength: addr.ByteLength,
+		},
+		{Type: RecordChain, Key: digest(2), Ref: digest(1)},
+	}
+
+	if err := b.Append(res, records); !errors.Is(err, ErrForeignReservation) {
+		t.Fatalf("Append to a foreign catalog = %v, want ErrForeignReservation", err)
+	}
+
+	// Abandon is refused too. The hole is real, but it is in a's catalog, and
+	// a's Repair is what retires it.
+	if err := b.Abandon(res); !errors.Is(err, ErrForeignReservation) {
+		t.Fatalf("Abandon on a foreign catalog = %v, want ErrForeignReservation", err)
+	}
+
+	if got := b.Superblock(); got != before {
+		t.Errorf("superblock moved: %+v, want %+v", got, before)
+	}
+
+	segsAfter, err := b.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	if len(segsAfter) != len(segsBefore) {
+		t.Fatalf("segment count %d, want %d", len(segsAfter), len(segsBefore))
+	}
+
+	for i := range segsAfter {
+		if segsAfter[i] != segsBefore[i] {
+			t.Errorf("segment %d moved: %+v, want %+v", i, segsAfter[i], segsBefore[i])
+		}
+	}
+
+	// The reservation is still good in the catalog that issued it.
+	if err := a.Append(res, records); err != nil {
+		t.Fatalf("Append to the issuing catalog: %v", err)
+	}
+}
+
+// A Reservation literal carries no owner, which is what keeps it usable as a
+// test fixture and as a zero value.
+func TestUnownedReservationIsAccepted(t *testing.T) {
+	_, s := ready(t)
+
+	res, err := s.Reserve(1, 1)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Rebuilt from the exported fields only, as a caller outside the package
+	// can construct it.
+	unowned := Reservation{
+		Segment:     res.Segment,
+		PageOffset:  res.PageOffset,
+		PageCount:   res.PageCount,
+		FirstRecord: res.FirstRecord,
+		RecordCount: res.RecordCount,
+		Generation:  res.Generation,
+	}
+
+	if err := s.Abandon(unowned); err != nil {
+		t.Fatalf("Abandon an unowned reservation: %v", err)
+	}
+}

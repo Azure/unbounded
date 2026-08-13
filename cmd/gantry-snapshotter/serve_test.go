@@ -298,6 +298,125 @@ func TestStopServer(t *testing.T) {
 	}
 }
 
+// blockedTask stands in for the background tasks serve starts. Every one of
+// them returns only on ctx.Done(), which is the whole reason awaitShutdown has
+// to cancel rather than just wait.
+func blockedTask(ctx context.Context) *sync.WaitGroup {
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		<-ctx.Done()
+	}()
+
+	return &wg
+}
+
+// runAwaitShutdown calls awaitShutdown with a deadline, so a regression that
+// reintroduces the wait-without-cancel deadlock fails the test instead of
+// wedging the suite.
+func runAwaitShutdown(t *testing.T, fn func() error) error {
+	t.Helper()
+
+	result := make(chan error, 1)
+
+	go func() { result <- fn() }()
+
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("awaitShutdown did not return: the background tasks were never cancelled")
+
+		return nil
+	}
+}
+
+// A fatal accept error is not a signal, so awaitShutdown has to cancel the
+// background tasks itself before waiting on them.
+func TestAwaitShutdownCancelsBackgroundTasksOnServeError(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	wg := blockedTask(ctx)
+
+	serveErr := make(chan error, 1)
+	serveErr <- errors.New("accept: boom")
+
+	err := runAwaitShutdown(t, func() error {
+		return awaitShutdown(ctx, cancel, grpc.NewServer(), serveErr, time.Second, wg, slog.New(slog.DiscardHandler))
+	})
+	if err == nil {
+		t.Fatal("awaitShutdown() = nil, want the accept error")
+	}
+
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("awaitShutdown() = %v, want it to carry the accept error", err)
+	}
+
+	if ctx.Err() == nil {
+		t.Error("the context was not cancelled, so the background tasks were left running")
+	}
+}
+
+// A server that stopped on its own is not a failure worth reporting.
+func TestAwaitShutdownIgnoresServerStopped(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	wg := blockedTask(ctx)
+
+	serveErr := make(chan error, 1)
+	serveErr <- grpc.ErrServerStopped
+
+	if err := runAwaitShutdown(t, func() error {
+		return awaitShutdown(ctx, cancel, grpc.NewServer(), serveErr, time.Second, wg, slog.New(slog.DiscardHandler))
+	}); err != nil {
+		t.Errorf("awaitShutdown() = %v, want nil", err)
+	}
+}
+
+// The signal path stops the server and drains Serve, so no goroutine outlives
+// the call.
+func TestAwaitShutdownDrainsServeOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	wg := blockedTask(ctx)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	server := grpc.NewServer()
+	serveErr := make(chan error, 1)
+	served := make(chan struct{})
+
+	go func() {
+		defer close(served)
+
+		serveErr <- server.Serve(listener)
+	}()
+
+	cancel()
+
+	if err := runAwaitShutdown(t, func() error {
+		return awaitShutdown(ctx, cancel, server, serveErr, time.Second, wg, slog.New(slog.DiscardHandler))
+	}); err != nil {
+		t.Errorf("awaitShutdown() = %v, want nil", err)
+	}
+
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Error("Serve was never drained")
+	}
+}
+
 func TestCatalogConflictErrnos(t *testing.T) {
 	errnos, err := catalogConflictErrnos(&Config{})
 	if err != nil {

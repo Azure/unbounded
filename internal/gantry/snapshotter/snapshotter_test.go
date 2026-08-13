@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -197,6 +198,17 @@ type harness struct {
 	ctx context.Context
 
 	logs *logSink
+
+	mu      sync.Mutex
+	adopted []AdoptOutcome
+}
+
+// outcomes reports every adoption outcome the snapshotter has reported so far.
+func (h *harness) outcomes() []AdoptOutcome {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]AdoptOutcome(nil), h.adopted...)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -211,6 +223,12 @@ func newHarness(t *testing.T) *harness {
 		Queue:        h.q,
 		MountOptions: []string{"index=off"},
 		Logger:       slog.New(slog.NewTextHandler(h.logs, nil)),
+		Observe: func(outcome AdoptOutcome) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+
+			h.adopted = append(h.adopted, outcome)
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -418,6 +436,89 @@ func TestPrepareRefusesToAdoptALayerItCannotMap(t *testing.T) {
 	}
 }
 
+// The hit rate is the number that says whether the snapshotter is doing
+// anything at all, so the outcome the daemon counts has to be the one Prepare
+// acted on. Classifying it separately from the switch would let the two drift.
+func TestPrepareReportsAdoptionOutcomes(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	chain, diffID := digestOf(1), digestOf(2)
+	labels := snapshots.WithLabels(map[string]string{
+		LabelSnapshotRef: chain.String(),
+		LabelDiffID:      diffID.String(),
+	})
+
+	// A miss: the catalog has never heard of this chain.
+	if _, err := h.sn.Prepare(h.ctx, "extract-0", "", labels); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// A hit: another node published it, and this node adopts it.
+	h.cat.publish(chain, diffID, addrOf(0))
+
+	if _, err := h.sn.Prepare(h.ctx, "extract-1", "", labels); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("Prepare: %v, want AlreadyExists", err)
+	}
+
+	// The chain is now committed locally, so adopting it again collides.
+	if _, err := h.sn.Prepare(h.ctx, "extract-2", "", labels); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("Prepare: %v, want AlreadyExists", err)
+	}
+
+	// A failure: the layer is in the catalog but cannot be mapped here.
+	other, otherDiff := digestOf(3), digestOf(4)
+	h.cat.publish(other, otherDiff, addrOf(1))
+	h.m.err = errors.New("segment 1 is not exported on this node")
+
+	if _, err := h.sn.Prepare(h.ctx, "extract-3", "", snapshots.WithLabels(map[string]string{
+		LabelSnapshotRef: other.String(),
+		LabelDiffID:      otherDiff.String(),
+	})); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	want := []AdoptOutcome{AdoptMiss, AdoptHit, AdoptExists, AdoptFailed}
+	if got := h.outcomes(); !slices.Equal(got, want) {
+		t.Fatalf("outcomes = %v, want %v", got, want)
+	}
+}
+
+// Prepare only consults the observer when it tried to adopt. A ref that cannot
+// be a chain ID, or no ref at all, is containerd doing something else.
+func TestPrepareReportsNothingWhenItDoesNotTryToAdopt(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	if _, err := h.sn.Prepare(h.ctx, "extract-0", ""); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	if got := h.outcomes(); len(got) != 0 {
+		t.Fatalf("outcomes = %v, want none", got)
+	}
+}
+
+func TestAdoptOutcomeString(t *testing.T) {
+	t.Parallel()
+
+	cases := map[AdoptOutcome]string{
+		AdoptMiss:        "miss",
+		AdoptHit:         "hit",
+		AdoptExists:      "exists",
+		AdoptFailed:      "failed",
+		AdoptOutcome(99): "unknown(99)",
+	}
+
+	for outcome, want := range cases {
+		if got := outcome.String(); got != want {
+			t.Errorf("AdoptOutcome(%d).String() = %q, want %q", int(outcome), got, want)
+		}
+	}
+}
+
 func TestPrepareHitOnANonSHA256Ref(t *testing.T) {
 	t.Parallel()
 
@@ -436,6 +537,12 @@ func TestPrepareHitOnANonSHA256Ref(t *testing.T) {
 
 	if h.cat.syncCount() != 0 {
 		t.Fatal("a ref that cannot be a chain ID must not touch the catalog")
+	}
+
+	// Still a miss, not a failure: a ref that cannot be a chain ID is one the
+	// cluster could never have, and there is nothing to alert on.
+	if got := h.outcomes(); !slices.Equal(got, []AdoptOutcome{AdoptMiss}) {
+		t.Fatalf("outcomes = %v, want one miss", got)
 	}
 }
 

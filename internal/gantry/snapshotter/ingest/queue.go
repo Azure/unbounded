@@ -25,10 +25,13 @@ const DefaultRetryDelay = time.Minute
 
 // DefaultQueueDepth bounds the backlog.
 //
-// A full queue drops the oldest waiting request rather than blocking Commit.
-// Dropping is safe: the layer stays in the catalog's miss set, so the next node
-// that starts a pod from that image submits it again. Blocking would put ingest
-// back on the container start path, which is the one thing it must never be on.
+// A full queue rejects the new request rather than blocking Commit. Dropping
+// is safe: the layer stays in the catalog's miss set, so the next node that
+// starts a pod from that image submits it again. Blocking would put ingest back
+// on the container start path, which is the one thing it must never be on.
+// Dropping the new request rather than the oldest waiting one also keeps the
+// backlog in the order the node met the layers, which is the order the images
+// pulling right now need them in.
 const DefaultQueueDepth = 256
 
 // QueueOptions configures a Queue.

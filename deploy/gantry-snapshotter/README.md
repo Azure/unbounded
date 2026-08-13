@@ -167,7 +167,8 @@ can be tuned without changing its `args`. The ones worth knowing:
 | `--ingest-workers` | `1` | Ingest is off the container start path; making it fast buys nothing and competes with the pods the node is trying to run |
 | `--skip-verify` | `false` | RACER's 4 MiB pages carry no data checksum, so the writer reads its blob back before publishing it. Turn this off only if you have measured that it matters |
 | `--conflict-errnos` | unset | The errno the image device reports for a failed optimistic write. See the design doc's open questions |
-| `--metrics-addr` | unset | The DaemonSet sets `:9096`, which also serves `/healthz` and `/debug/pprof` |
+| `--metrics-addr` | unset | The DaemonSet sets `:9096`, which serves `/metrics` and `/healthz` |
+| `--pprof` | `false` | Adds `/debug/pprof` to the metrics listener. That listener is on the pod network, so leave it off outside an investigation |
 
 ## Operating notes
 

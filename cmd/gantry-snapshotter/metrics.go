@@ -14,9 +14,9 @@ import (
 	"net/http/pprof"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
 
+	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
 )
 
@@ -36,7 +36,8 @@ func catalogConflictErrnos(cfg *Config) ([]unix.Errno, error) {
 // It carries no request the daemon's correctness depends on.
 const metricsShutdown = 2 * time.Second
 
-// runMetrics serves Prometheus metrics, pprof and a liveness endpoint.
+// runMetrics serves Prometheus metrics and a liveness endpoint, and pprof when
+// it has been asked for.
 //
 // A failure here is logged and dropped rather than propagated. Losing the
 // ability to scrape a snapshotter is not a reason to stop running containers
@@ -45,19 +46,14 @@ const metricsShutdown = 2 * time.Second
 // health is what /healthz reports. It is a parameter rather than something
 // built here so the endpoint cannot drift back into answering without asking
 // anybody.
-func runMetrics(ctx context.Context, cfg *Config, health func(context.Context) error, log *slog.Logger) {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", healthHandler(health, log))
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+func runMetrics(ctx context.Context, cfg *Config, reg *metrics.Registry, health func(context.Context) error, log *slog.Logger) {
+	if cfg.EnablePprof {
+		log.Warn("pprof enabled on the metrics listener", slog.String("addr", cfg.MetricsAddr))
+	}
 
 	server := &http.Server{
 		Addr:              cfg.MetricsAddr,
-		Handler:           mux,
+		Handler:           metricsMux(cfg, reg, health, log),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -81,6 +77,28 @@ func runMetrics(ctx context.Context, cfg *Config, health func(context.Context) e
 	_ = server.Shutdown(shutdownCtx) //nolint:errcheck // shutdown is best effort
 
 	<-done
+}
+
+// metricsMux builds the observability routes.
+//
+// pprof is opt-in. This listener is on the pod network because the kubelet's
+// probe has to reach it, and pprof over that reach hands out heap contents,
+// command lines and execution traces to anything that can dial the pod. The
+// probe is why the port cannot simply be moved to loopback instead.
+func metricsMux(cfg *Config, reg *metrics.Registry, health func(context.Context) error, log *slog.Logger) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", reg.Handler())
+	mux.HandleFunc("/healthz", healthHandler(health, log))
+
+	if cfg.EnablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+
+	return mux
 }
 
 // healthHandler answers the kubelet's liveness probe.

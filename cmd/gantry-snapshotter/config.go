@@ -159,8 +159,17 @@ type Config struct {
 	// LogFormat is text or json.
 	LogFormat string
 
-	// MetricsAddr serves Prometheus metrics and pprof when set.
+	// MetricsAddr serves Prometheus metrics and the liveness endpoint when
+	// set.
 	MetricsAddr string
+
+	// EnablePprof adds the net/http/pprof handlers to the metrics listener.
+	//
+	// Off by default because that listener is reachable from the pod
+	// network: pprof hands out heap contents and execution traces to
+	// anything that can dial it, and the liveness probe means the port
+	// cannot simply be moved to loopback.
+	EnablePprof bool
 }
 
 // parseConfig builds a Config from the command line, with environment
@@ -209,7 +218,8 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	fs.DurationVar(&c.ShutdownGrace, "shutdown-grace", envDuration("GANTRY_SNAPSHOTTER_SHUTDOWN_GRACE", DefaultShutdownGrace), "graceful shutdown budget")
 	fs.StringVar(&c.LogLevel, "log-level", envOr("GANTRY_SNAPSHOTTER_LOG_LEVEL", "info"), "debug, info, warn or error")
 	fs.StringVar(&c.LogFormat, "log-format", envOr("GANTRY_SNAPSHOTTER_LOG_FORMAT", "text"), "text or json")
-	fs.StringVar(&c.MetricsAddr, "metrics-addr", envOr("GANTRY_SNAPSHOTTER_METRICS_ADDR", ""), "address to serve metrics and pprof on; empty disables it")
+	fs.StringVar(&c.MetricsAddr, "metrics-addr", envOr("GANTRY_SNAPSHOTTER_METRICS_ADDR", ""), "address to serve metrics and the liveness endpoint on; empty disables it")
+	fs.BoolVar(&c.EnablePprof, "pprof", envBool("GANTRY_SNAPSHOTTER_PPROF", false), "expose net/http/pprof on the metrics listener")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err

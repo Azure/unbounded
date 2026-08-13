@@ -128,6 +128,52 @@ type Submitter interface {
 	Submit(req ingest.Request) bool
 }
 
+// AdoptOutcome says what a Prepare carrying a snapshot ref did with it.
+//
+// This is the one number that says whether the daemon is earning its keep: a
+// hit is a layer neither downloaded nor unpacked on this node, and a miss is
+// containerd doing exactly what it would have done without a snapshotter. The
+// two failure outcomes are separated from a miss because they mean something
+// different operationally: a miss is a cold cluster, a failure is a node that
+// cannot reach layers other nodes can.
+type AdoptOutcome int
+
+const (
+	// AdoptMiss means the cluster catalog does not have the chain ID.
+	// containerd unpacks the layer and this node may ingest it afterwards.
+	AdoptMiss AdoptOutcome = iota
+
+	// AdoptHit means the layer was mapped from the cluster's storage and
+	// the fetch and the unpack were both skipped.
+	AdoptHit
+
+	// AdoptExists means the chain ID was already committed here, usually
+	// because a concurrent Prepare adopted it first. containerd gets the
+	// same answer as a hit.
+	AdoptExists
+
+	// AdoptFailed means the catalog had the layer and this node could not
+	// map it. The layer is unpacked locally instead, so it costs bandwidth
+	// rather than availability.
+	AdoptFailed
+)
+
+// String renders an outcome for logs and metric labels.
+func (o AdoptOutcome) String() string {
+	switch o {
+	case AdoptMiss:
+		return "miss"
+	case AdoptHit:
+		return "hit"
+	case AdoptExists:
+		return "exists"
+	case AdoptFailed:
+		return "failed"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(o))
+	}
+}
+
 // Options configures a Snapshotter.
 type Options struct {
 	// Root is the directory holding the metadata database and the local
@@ -146,6 +192,10 @@ type Options struct {
 	MountOptions []string
 	// MissSync overrides DefaultMissSync.
 	MissSync time.Duration
+	// Observe reports the outcome of every Prepare containerd issues while
+	// unpacking an image. Optional. It runs on the Prepare goroutine, so an
+	// implementation that blocks blocks a container start.
+	Observe func(AdoptOutcome)
 	// Logger receives warnings from paths that must not fail the operation.
 	Logger *slog.Logger
 }
@@ -161,6 +211,7 @@ type Snapshotter struct {
 	opts      []string
 	log       *slog.Logger
 	missGap   time.Duration
+	observe   func(AdoptOutcome)
 
 	syncMu   sync.Mutex
 	lastSync time.Time
@@ -229,6 +280,7 @@ func New(opts Options) (*Snapshotter, error) {
 		opts:      mountOpts,
 		log:       logger,
 		missGap:   gap,
+		observe:   opts.Observe,
 	}, nil
 }
 
@@ -363,6 +415,7 @@ func (s *Snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 
 	if target := base.Labels[LabelSnapshotRef]; target != "" {
 		adopted, err := s.adopt(ctx, key, parent, target, base)
+		s.report(adoptOutcome(adopted, err))
 
 		switch {
 		case adopted:
@@ -380,6 +433,30 @@ func (s *Snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 	}
 
 	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+}
+
+// adoptOutcome classifies what adopt did, using the same ordering Prepare
+// does so the two cannot disagree about what happened.
+func adoptOutcome(adopted bool, err error) AdoptOutcome {
+	switch {
+	case adopted:
+		return AdoptHit
+	case errors.Is(err, errdefs.ErrAlreadyExists):
+		return AdoptExists
+	case err != nil:
+		return AdoptFailed
+	default:
+		return AdoptMiss
+	}
+}
+
+// report hands an outcome to the configured observer, which is optional.
+func (s *Snapshotter) report(outcome AdoptOutcome) {
+	if s.observe == nil {
+		return
+	}
+
+	s.observe(outcome)
 }
 
 // View creates a read-only snapshot over the parent.

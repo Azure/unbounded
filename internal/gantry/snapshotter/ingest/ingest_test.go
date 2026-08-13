@@ -1116,3 +1116,75 @@ func TestOutcomeString(t *testing.T) {
 		}
 	}
 }
+
+// foreignAbandon stands in for a catalog the node re-attached away from while
+// an ingest was still holding a reservation.
+type foreignAbandon struct {
+	Catalog
+}
+
+func (foreignAbandon) Abandon(res catalog.Reservation) error {
+	return fmt.Errorf("%w: records %d..%d", catalog.ErrForeignReservation,
+		res.FirstRecord, res.FirstRecord+uint64(res.RecordCount)) //nolint:gosec // small and positive
+}
+
+// Slots in a catalog this node no longer has are not a hole it can do anything
+// about, and dressing one up as "every node stops reading there" buries the
+// failure that actually needs looking at.
+func TestAbandonOnAForeignCatalogReportsOnlyTheCause(t *testing.T) {
+	builder, _ := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+
+	i := newIngester(t, Options{
+		Catalog: foreignAbandon{Catalog: newStore(t, 8)},
+		Locator: fileLocator{path: deviceFile(t, 8)},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	cause := errors.New("mkfs.erofs: boom")
+
+	err := i.abandon(catalog.Reservation{RecordCount: 2}, cause)
+	if !errors.Is(err, cause) {
+		t.Fatalf("abandon() = %v, want it to carry the cause", err)
+	}
+
+	if strings.Contains(err.Error(), "permanent hole") {
+		t.Errorf("abandon() = %v, want no hole report for a foreign catalog", err)
+	}
+
+	if err.Error() != cause.Error() {
+		t.Errorf("abandon() = %q, want exactly the cause %q", err, cause)
+	}
+}
+
+// A catalog that still owns the reservation and fails anyway is the case the
+// hole report exists for.
+type failedAbandon struct {
+	Catalog
+}
+
+func (failedAbandon) Abandon(catalog.Reservation) error {
+	return errors.New("device gone")
+}
+
+func TestAbandonReportsAHoleWhenTheCatalogOwnsTheReservation(t *testing.T) {
+	builder, _ := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+
+	i := newIngester(t, Options{
+		Catalog: failedAbandon{Catalog: newStore(t, 8)},
+		Locator: fileLocator{path: deviceFile(t, 8)},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	cause := errors.New("mkfs.erofs: boom")
+
+	err := i.abandon(catalog.Reservation{RecordCount: 2}, cause)
+	if !errors.Is(err, cause) {
+		t.Fatalf("abandon() = %v, want it to carry the cause", err)
+	}
+
+	if !strings.Contains(err.Error(), "permanent hole") {
+		t.Errorf("abandon() = %v, want the hole report", err)
+	}
+}

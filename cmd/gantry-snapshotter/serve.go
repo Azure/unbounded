@@ -23,6 +23,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/hrw"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/members"
+	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/blockmap"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
@@ -109,17 +110,32 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 
 	ingestLog := log.With(slog.String("subsystem", "ingest"))
 
+	// The registry is built whether or not anything serves it. Wiring the
+	// observers unconditionally keeps the instrumented paths identical on
+	// every node, so a node running without a metrics address is not a node
+	// running different code.
+	reg := metrics.New()
+	reg.RegisterDefaultCollectors()
+
+	daemon := newDaemonMetrics(reg, cat)
+
+	// Set before the reconcile loop starts, which is what makes reading it
+	// from the reservation path safe.
+	cat.roll = daemon.observeRoll
+
 	queue, err := ingest.NewQueue(ingest.QueueOptions{
 		Ingester:   ing,
 		Elector:    elector,
 		Workers:    cfg.IngestWorkers,
 		Depth:      cfg.IngestDepth,
 		RetryDelay: cfg.IngestRetry,
-		Observe:    observer(ingestLog),
+		Observe:    chainObserver(observer(ingestLog), daemon.observeIngest),
 	})
 	if err != nil {
 		return fmt.Errorf("ingest queue: %w", err)
 	}
+
+	daemon.trackQueue(reg, queue)
 
 	sn, err := snapshotter.New(snapshotter.Options{
 		Root:         cfg.Root,
@@ -127,6 +143,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		Mapper:       maps,
 		Queue:        queue,
 		MountOptions: cfg.MountOptions,
+		Observe:      daemon.observeAdopt,
 		Logger:       log,
 	})
 	if err != nil {
@@ -142,6 +159,13 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 
 	server := grpc.NewServer()
 	snapshotsapi.RegisterSnapshotsServer(server, snapshotservice.FromSnapshotter(sn))
+
+	// Every background task below returns only on ctx.Done(), so shutdown
+	// needs a cancel this function controls. The parent context is only
+	// cancelled by a signal, and the serve error path has to be able to
+	// stop the tasks without one.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	var wg sync.WaitGroup
 
@@ -168,7 +192,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		probe := newProber(cfg)
 		defer probe.close() //nolint:errcheck // shutdown
 
-		background("metrics", func() { runMetrics(ctx, cfg, probe.check, log) })
+		background("metrics", func() { runMetrics(ctx, cfg, reg, probe.check, log) })
 	}
 
 	serveErr := make(chan error, 1)
@@ -177,9 +201,30 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 
 	log.Info("serving", slog.String("socket", cfg.Socket))
 
+	return awaitShutdown(ctx, cancel, server, serveErr, cfg.ShutdownGrace, &wg, log)
+}
+
+// awaitShutdown runs until the gRPC server exits or ctx is cancelled, then
+// stops the server and waits for the background tasks to finish.
+//
+// cancel is what releases those tasks: each of them returns only on ctx.Done().
+// The serve error path has to cancel as well as stop the server, because a
+// fatal accept error is not a signal. Without it this would wait forever on a
+// WaitGroup nothing can release, holding the bbolt lock and the catalog device
+// open and skipping every deferred close in serve, until an operator noticed.
+func awaitShutdown(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	server *grpc.Server,
+	serveErr <-chan error,
+	grace time.Duration,
+	wg *sync.WaitGroup,
+	log *slog.Logger,
+) error {
 	select {
 	case err := <-serveErr:
-		stopServer(server, cfg.ShutdownGrace)
+		cancel()
+		stopServer(server, grace)
 		wg.Wait()
 
 		if err != nil && !errors.Is(err, grpc.ErrServerStopped) {
@@ -191,8 +236,11 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	}
 
 	log.Info("shutting down")
-	stopServer(server, cfg.ShutdownGrace)
+	cancel()
+	stopServer(server, grace)
 	wg.Wait()
+	// Serve returns once the listener is closed, which GracefulStop and Stop
+	// both do. Draining it keeps the goroutine from outliving this call.
 	<-serveErr
 
 	return nil

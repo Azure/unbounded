@@ -48,6 +48,11 @@ type holder struct {
 	errnos  []unix.Errno
 	current atomicStore
 
+	// roll is told about every segment rollover, in addition to the log
+	// line. Optional, and set once before the daemon starts reconciling so
+	// that reading it from the reservation path needs no lock.
+	roll func(catalog.Roll)
+
 	// open opens the catalog device. It is a field only so tests can attach
 	// a catalog to an ordinary file: the production path uses O_DIRECT,
 	// which the filesystem a test's temporary directory lives on may not
@@ -221,6 +226,10 @@ func (h *holder) logRoll(roll catalog.Roll) {
 		slog.Uint64("opened", uint64(roll.Opened)),
 		slog.Uint64("opened_pages", uint64(roll.OpenedPages)),
 	)
+
+	if h.roll != nil {
+		h.roll(roll)
+	}
 }
 
 // adoptSegments registers the segments this node can see in the catalog's
@@ -385,6 +394,12 @@ func (h *holder) ReserveRecords(records int) (catalog.Reservation, error) {
 }
 
 // Append implements the ingest write path.
+//
+// The reservation is forwarded to whatever store is attached now, which is not
+// necessarily the one that issued it: racer-ctrl can republish the device set
+// and the daemon re-attaches while an ingest is still running. The store is
+// what catches that, refusing a reservation it did not issue rather than
+// writing a blob record whose address points into somebody else's catalog.
 func (h *holder) Append(res catalog.Reservation, records []catalog.Record) error {
 	store, _ := h.current.load()
 	if store == nil {
@@ -398,8 +413,9 @@ func (h *holder) Append(res catalog.Reservation, records []catalog.Record) error
 //
 // If the store has been swapped out from under an in-flight ingest, the
 // reservation belonged to a catalog this node no longer has, and there is
-// nothing useful to write. Whoever attaches that catalog next inherits the
-// hole; that is the crash case, and the reconcile scan is what covers it.
+// nothing useful to write. The store refuses it, and whoever has that catalog
+// attached inherits the hole; that is the crash case, and Repair is what
+// covers it.
 func (h *holder) Abandon(res catalog.Reservation) error {
 	store, _ := h.current.load()
 	if store == nil {
@@ -427,4 +443,15 @@ func (h *holder) Len() int {
 	}
 
 	return store.Len()
+}
+
+// Hole reports the first unwritten record slot readers are stopped at and how
+// long it has been there, for metrics. A detached catalog has no hole.
+func (h *holder) Hole() (uint64, time.Duration) {
+	store, _ := h.current.load()
+	if store == nil {
+		return 0, 0
+	}
+
+	return store.Hole()
 }

@@ -46,10 +46,14 @@ type BuildOptions struct {
 	// OutPath is where the erofs image is written. Required.
 	OutPath string
 
-	// UUID pins the image's superblock UUID. Two nodes that race to ingest
-	// the same layer then produce byte identical images, which makes a
-	// mismatch between two copies a real corruption signal rather than
-	// expected noise. Optional.
+	// UUID pins the image's superblock UUID, which mkfs.erofs otherwise
+	// generates at random. Two nodes that race to ingest the same layer then
+	// produce images that differ only in the fields mkfs.erofs stamps from
+	// the environment, notably the build timestamp, instead of differing in
+	// a field that appears in every block-level comparison. It does not make
+	// the output bit-for-bit reproducible, and nothing here depends on that:
+	// each node records the sha256 of the image it wrote, so a later verify
+	// compares a copy against its own digest. Optional.
 	UUID string
 }
 
@@ -259,8 +263,9 @@ func Spill(dir, pattern string, r io.Reader, limit uint64) (path string, size ui
 
 // UUIDFor derives a stable RFC 4122 version 5 style UUID from a name.
 //
-// Two nodes that race on the same layer build the same image only if every
-// input to mkfs.erofs is the same, and the superblock UUID is otherwise random.
+// mkfs.erofs generates the superblock UUID at random, so two nodes building
+// the same layer would otherwise disagree on it. Deriving it from the layer
+// digest keeps the one field this code controls the same on every node.
 func UUIDFor(name string) string {
 	sum := sha256.Sum256([]byte("gantry-snapshotter/" + name))
 
