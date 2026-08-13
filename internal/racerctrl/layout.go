@@ -4,6 +4,8 @@
 package racerctrl
 
 import (
+	"math"
+
 	racerconfig "github.com/Azure/unbounded/api/racer"
 )
 
@@ -188,10 +190,23 @@ func divCeil(numerator, denominator uint64) uint64 {
 	return (numerator + denominator - 1) / denominator
 }
 
+// alignUp rounds up to a multiple of alignment, saturating rather than wrapping.
+// A wrap here would turn a value at the top of the range into a small one, and
+// every caller reads the result as an address or a count.
 func alignUp(value, alignment uint64) uint64 {
 	if alignment == 0 {
 		return value
 	}
 
-	return (value + alignment - 1) / alignment * alignment
+	remainder := value % alignment
+	if remainder == 0 {
+		return value
+	}
+
+	padding := alignment - remainder
+	if value > math.MaxUint64-padding {
+		return math.MaxUint64
+	}
+
+	return value + padding
 }

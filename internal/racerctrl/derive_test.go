@@ -206,6 +206,66 @@ func TestPublishInstallsAResizedCatalog(t *testing.T) {
 		"the resize is delivered as a settled state, not as a step")
 }
 
+// A volume with a mutable head and an immutable tail is the shape of every
+// volume that has a mutable head, and racer refuses a whole config that names
+// warm zones on a mutable extent. Applying the volume's warm list to both
+// segments made such a volume unpublishable, which is not a warning: the node
+// keeps running its previous generation and reports a counter.
+func TestDeriveWarmsOnlyTheImmutableSegments(t *testing.T) {
+	d := warmDerivation()
+
+	cfg, err := Derive(d)
+	require.NoError(t, err)
+	require.NoError(t, Validate(cfg), "a mixed volume with warm zones has to be publishable")
+
+	extents := cfg.GetUniverses()[0].GetExtents()
+	require.Len(t, extents, 2)
+
+	byID := map[uint32]*racerconfig.Extent{}
+	for _, extent := range extents {
+		byID[extent.GetId()] = extent
+	}
+
+	assert.Empty(t, byID[1].GetWarmZones(), "the mutable head cannot carry warm zones")
+	assert.Equal(t, []uint32{2}, byID[2].GetWarmZones(), "the immutable tail is what warming is for")
+}
+
+// A warm zone the universe does not name is a rejected config for the same
+// reason, and the zone a volume asks to be warmed into is not necessarily one
+// this node can route to.
+func TestDeriveDropsUnreachableWarmZones(t *testing.T) {
+	d := warmDerivation()
+	d.Cluster.Universes[0].Volumes[0].WarmZones = []uint32{2, 9}
+
+	cfg, err := Derive(d)
+	require.NoError(t, err)
+	require.NoError(t, Validate(cfg))
+
+	for _, extent := range cfg.GetUniverses()[0].GetExtents() {
+		assert.NotContains(t, extent.GetWarmZones(), uint32(9),
+			"zone 9 has no gateways here, so racer could not route a warm to it")
+	}
+}
+
+// warmDerivation is the attached zone with a second zone to warm into and a
+// volume that has both a mutable head and an immutable tail.
+func warmDerivation() Derivation {
+	d := attachedDerivation()
+	d.Cluster.Universes[0].Gateways = map[uint32][]uint32{2: {4}}
+	d.Attachments[Attachment{Universe: 1, Peer: 4}] = "/dev/nvme4n1"
+	d.Cluster.Universes[0].Volumes[0] = VolumeState{
+		Name:      "pv-1",
+		Zone:      1,
+		WarmZones: []uint32{2},
+		Composition: Composition{
+			{ExtentID: 1, BaseLBA: 0, Pages: 16, Kind: racerconfig.Kind_LWW},
+			{ExtentID: 2, BaseLBA: HugeBlocks, Pages: 64, Kind: racerconfig.Kind_IMMUTABLE_4M},
+		},
+	}
+
+	return d
+}
+
 // bootstrapDerivation is a three node zone with one volume where nothing has
 // been attached yet, which is what every node sees on a cold cluster.
 func bootstrapDerivation() Derivation {

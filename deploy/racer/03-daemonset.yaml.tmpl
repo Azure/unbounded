@@ -86,6 +86,16 @@ spec:
                   fieldPath: spec.nodeName
             - name: RACER_STORE
               value: /var/lib/racer/store.img
+            # Preflight only checks the NVMe target when it believes the fabric
+            # is in use, and the runtime container always sets this from
+            # status.hostIP. Leaving it out here skipped the one check that
+            # matters most: a host without nvmet loads its config, comes up,
+            # and then fails every fabric reconcile forever, so no universe on
+            # it ever becomes replicated.
+            - name: RACER_FABRIC_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
           securityContext:
             privileged: true
           volumeMounts:

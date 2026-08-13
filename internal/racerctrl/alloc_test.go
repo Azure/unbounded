@@ -4,8 +4,10 @@
 package racerctrl
 
 import (
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -310,4 +312,124 @@ func fixtureConfig(t *testing.T, generation uint64) *racerconfig.NodeConfig {
 			{Id: 2, Extents: []uint32{1}},
 		},
 	}
+}
+
+// The cursor is read from a ConfigMap annotation and parsed as a full uint64, so
+// a value near the top of the range is a thing an edit can produce. Aligning
+// before bounding wrapped it to a low base that looked perfectly valid, and the
+// extent placed there would overlap live data.
+func TestAllocateLBARefusesACursorThatWouldWrap(t *testing.T) {
+	for name, next := range map[string]uint64{
+		"max uint64":        math.MaxUint64,
+		"one below max":     math.MaxUint64 - 1,
+		"just above maxlba": MaxLBA + 1,
+	} {
+		t.Run(name, func(t *testing.T) {
+			base, advanced, err := AllocateLBA(next, 1)
+			require.Error(t, err)
+			assert.Zero(t, base, "a refused allocation must not hand back an address")
+			assert.Zero(t, advanced)
+		})
+	}
+}
+
+// The same guard on the length: a block count that large cannot fit whatever the
+// cursor is, and adding it first is what overflows.
+func TestAllocateLBARefusesALengthThatWouldWrap(t *testing.T) {
+	_, _, err := AllocateLBA(0, math.MaxUint64)
+	require.Error(t, err)
+
+	_, _, err = AllocateLBA(HugeBlocks, MaxLBA)
+	require.Error(t, err)
+}
+
+// The boundary itself is allocatable: the last block of the universe is a block.
+func TestAllocateLBAFillsTheAddressSpaceExactly(t *testing.T) {
+	base, advanced, err := AllocateLBA(MaxLBA-HugeBlocks, HugeBlocks)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(MaxLBA-HugeBlocks), base)
+	assert.Equal(t, uint64(MaxLBA), advanced)
+
+	_, _, err = AllocateLBA(MaxLBA-HugeBlocks, HugeBlocks+1)
+	require.Error(t, err, "one block past the end is past the end")
+}
+
+// alignUp saturates rather than wrapping, because every caller reads the result
+// as an address or a count and a wrap turns the largest value into a small one.
+func TestAlignUpSaturates(t *testing.T) {
+	assert.Equal(t, uint64(math.MaxUint64), alignUp(math.MaxUint64, HugeBlocks))
+	assert.Equal(t, uint64(math.MaxUint64), alignUp(math.MaxUint64-1, 4))
+	assert.Equal(t, uint64(HugeBlocks), alignUp(1, HugeBlocks))
+	assert.Equal(t, uint64(HugeBlocks), alignUp(HugeBlocks, HugeBlocks))
+	assert.Equal(t, uint64(0), alignUp(0, HugeBlocks))
+	assert.Equal(t, uint64(7), alignUp(7, 0), "no alignment is not a division")
+}
+
+// A declared zone name is an administrator's string joined to a site name, so it
+// routinely is not a legal ConfigMap key. Writing it raw produced a ConfigMap
+// the API server refused, which lost every allocation written alongside it.
+func TestZoneNamesSurviveAConfigMapRoundTrip(t *testing.T) {
+	names := []string{
+		"plain",
+		"site-a|rack-3",
+		"with spaces",
+		"emoji-\u2601",
+		"trailing/slash",
+		".",
+		"..",
+	}
+
+	cursors := Cursors{Zones: map[string]uint32{}}
+	for i, name := range names {
+		cursors.Zones[name] = uint32(i + 1)
+	}
+
+	data := cursors.Data()
+
+	for key := range data {
+		assert.True(t, isConfigMapKey(key), "key %q is not one a ConfigMap accepts", key)
+	}
+
+	parsed, err := ParseCursors(data)
+	require.NoError(t, err)
+
+	for i, name := range names {
+		assert.Equal(t, uint32(i+1), parsed.Zones[name], "zone name %q did not survive", name)
+	}
+}
+
+// A name that is already a legal key stays readable, because an operator reading
+// the ConfigMap is the reason the mapping is recorded rather than hashed.
+func TestKeySafeZoneNamesStayVerbatim(t *testing.T) {
+	data := Cursors{Zones: map[string]uint32{"rack-3": 4}}.Data()
+
+	_, ok := data[ZoneKeyPrefix+"rack-3"]
+	assert.True(t, ok, "a legal name has no reason to be encoded")
+}
+
+// A name too long to record is refused when it is interned, not when the write
+// fails, because by then the rest of the pass has already allocated ids.
+func TestZoneIDRefusesANameTooLongForAKey(t *testing.T) {
+	cursors := Cursors{NextZoneID: 1}
+
+	_, err := cursors.ZoneID(strings.Repeat("a", 256))
+	require.ErrorContains(t, err, "too long")
+}
+
+// isConfigMapKey is the API server's rule for a ConfigMap data key.
+func isConfigMapKey(key string) bool {
+	if key == "" || key == "." || key == ".." || len(key) > maxConfigMapKey {
+		return false
+	}
+
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '.', r == '_':
+		default:
+			return false
+		}
+	}
+
+	return true
 }

@@ -373,7 +373,7 @@ func validateExtents(
 			return err
 		}
 
-		if err := validateExtentPolicy(extent); err != nil {
+		if err := validateExtentPolicy(extent, zones); err != nil {
 			return err
 		}
 	}
@@ -408,7 +408,7 @@ func validateExtentZones(node *racerconfig.Node, extent *racerconfig.Extent, zon
 	return nil
 }
 
-func validateExtentPolicy(extent *racerconfig.Extent) error {
+func validateExtentPolicy(extent *racerconfig.Extent, zones map[uint32]struct{}) error {
 	id := extent.GetId()
 
 	if extent.GetCacheAdmit() > MaxCacheAdmit {
@@ -448,6 +448,14 @@ func validateExtentPolicy(extent *racerconfig.Extent) error {
 
 		if _, dup := seen[zone]; dup {
 			return fmt.Errorf("extent %d names warm zone %d twice", id, zone)
+		}
+
+		// A warm zone is a zone pages are pushed to, so racer has to be able to
+		// route to it. One it does not know is a rejected config, and a
+		// rejected config leaves the node running its previous generation with
+		// a counter as its only complaint.
+		if _, ok := zones[zone]; !ok {
+			return fmt.Errorf("extent %d names warm zone %d, which the universe does not name", id, zone)
 		}
 
 		seen[zone] = struct{}{}
@@ -600,6 +608,18 @@ func ValidateTransition(prev, next *racerconfig.NodeConfig) error {
 		)
 	}
 
+	// R2 freezes the zone with the id and the cohort, and for the same reason:
+	// a node's identity is what every other node's catalog names. Moving a
+	// placed node rewrites a catalog every member of its old zone already
+	// believes in, and racer does not refuse it - it would simply start
+	// answering for groups in a zone that never named it.
+	if next.GetNode().GetZone() != prev.GetNode().GetZone() {
+		return fmt.Errorf(
+			"node zone changed from %d to %d",
+			prev.GetNode().GetZone(), next.GetNode().GetZone(),
+		)
+	}
+
 	// R4: never lower size_bytes. The store is formatted for a size; shrinking it
 	// would strand the allocator's tail.
 	if next.GetNode().GetStore().GetSizeBytes() < prev.GetNode().GetStore().GetSizeBytes() {
@@ -625,7 +645,24 @@ func ValidateTransition(prev, next *racerconfig.NodeConfig) error {
 func validateUniverseTransitions(prev, next *racerconfig.NodeConfig, step bool) error {
 	before := indexUniverses(prev)
 
+	// Extent identity is global, not per universe: R2 allocates extent ids from
+	// one space precisely so that an address names one extent everywhere. A
+	// check scoped to a single universe would let an id vanish from one and
+	// reappear in another, which is the same extent at a different global
+	// address, with every register that ever addressed it now pointing
+	// somewhere else.
+	homes := extentUniverses(prev)
+
 	for _, universe := range next.GetUniverses() {
+		for _, extent := range universe.GetExtents() {
+			if home, ok := homes[extent.GetId()]; ok && home != universe.GetId() {
+				return fmt.Errorf(
+					"extent %d moved from universe %d to universe %d",
+					extent.GetId(), home, universe.GetId(),
+				)
+			}
+		}
+
 		old, ok := before[universe.GetId()]
 		if !ok {
 			continue
@@ -635,6 +672,17 @@ func validateUniverseTransitions(prev, next *racerconfig.NodeConfig, step bool) 
 			return fmt.Errorf(
 				"universe %d epoch went backwards from %d to %d",
 				universe.GetId(), old.GetEpoch(), universe.GetEpoch(),
+			)
+		}
+
+		// The fabric device id is the minor a universe's namespace is published
+		// on, so every peer's attachment is a path to /dev/ublkb<id>. racer
+		// refuses to move a live minor and the peers would be pointing at the
+		// old path either way.
+		if universe.GetFabricDeviceId() != old.GetFabricDeviceId() {
+			return fmt.Errorf(
+				"universe %d fabric_device_id changed from %d to %d",
+				universe.GetId(), old.GetFabricDeviceId(), universe.GetFabricDeviceId(),
 			)
 		}
 
@@ -657,6 +705,19 @@ func validateUniverseTransitions(prev, next *racerconfig.NodeConfig, step bool) 
 	}
 
 	return nil
+}
+
+// extentUniverses maps every extent a config carries to the universe it is in.
+func extentUniverses(cfg *racerconfig.NodeConfig) map[uint32]uint32 {
+	homes := make(map[uint32]uint32)
+
+	for _, universe := range cfg.GetUniverses() {
+		for _, extent := range universe.GetExtents() {
+			homes[extent.GetId()] = universe.GetId()
+		}
+	}
+
+	return homes
 }
 
 // validateMembershipStep enforces R6's membership rule: between consecutive

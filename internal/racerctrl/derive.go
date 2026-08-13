@@ -432,7 +432,7 @@ func (d *Derivation) deriveUniverse(state *UniverseState, fabricIDs map[uint32]u
 
 	zones := d.deriveZones(state)
 
-	extents, err := d.deriveExtents(state)
+	extents, err := d.deriveExtents(state, zones)
 	if err != nil {
 		return nil, err
 	}
@@ -535,9 +535,20 @@ func (d *Derivation) derivePeers(
 // the ones homed in our zone, which we store, and the ones behind a device we
 // export, which we route for. An extent we neither store nor route for would
 // only cost index space.
-func (d *Derivation) deriveExtents(state *UniverseState) ([]*racerconfig.Extent, error) {
+func (d *Derivation) deriveExtents(
+	state *UniverseState,
+	zones []*racerconfig.Zone,
+) ([]*racerconfig.Extent, error) {
 	exported := d.Self.volumesByName()
 	extents := make([]*racerconfig.Extent, 0)
+
+	// A warm zone racer does not know is a rejected config, and a rejected
+	// config leaves the node running the previous generation forever, so the
+	// reachable set is computed once and every extent is filtered through it.
+	reachable := map[uint32]struct{}{d.Self.Zone: {}}
+	for _, zone := range zones {
+		reachable[zone.GetId()] = struct{}{}
+	}
 
 	for i := range state.Volumes {
 		volume := &state.Volumes[i]
@@ -563,7 +574,7 @@ func (d *Derivation) deriveExtents(state *UniverseState) ([]*racerconfig.Extent,
 				NextZone:       volume.NextZone,
 				TombstoneEpoch: volume.TombstoneEpoch,
 				CacheAdmit:     volume.CacheAdmit,
-				WarmZones:      warmZonesFor(volume),
+				WarmZones:      warmZonesFor(volume, segment.Kind, reachable),
 			})
 		}
 	}
@@ -575,11 +586,21 @@ func (d *Derivation) deriveExtents(state *UniverseState) ([]*racerconfig.Extent,
 	return extents, nil
 }
 
-// warmZonesFor drops warm zones from kinds that cannot carry them. Warming
-// copies pages to a zone that does not own them, which is only sound when the
-// pages cannot change under the copy.
-func warmZonesFor(volume *VolumeState) []uint32 {
-	if len(volume.WarmZones) == 0 {
+// warmZonesFor picks the warm zones one segment may carry.
+//
+// Warming copies pages to a zone that does not own them, which is only sound
+// when the pages cannot change under the copy: an immutable page's version is a
+// function of its extent's tombstone epoch, so a remote reader can believe a
+// copy on sight. racer refuses a whole config that names warm zones on any
+// other kind, so a volume with a mutable head and an immutable tail - which is
+// the shape every volume with a mutable head has - would be unpublishable if
+// the volume's warm list were applied to both. The head simply gets none.
+//
+// The zone also has to be one the universe knows, for the same reason: racer
+// refuses the config otherwise, and a rejected config is not a warning, it is a
+// node stuck at its previous generation with no way to say so.
+func warmZonesFor(volume *VolumeState, kind racerconfig.Kind, reachable map[uint32]struct{}) []uint32 {
+	if len(volume.WarmZones) == 0 || !KindIsImmutable(kind) {
 		return nil
 	}
 
@@ -587,6 +608,10 @@ func warmZonesFor(volume *VolumeState) []uint32 {
 
 	for _, zone := range dedupeSorted(volume.WarmZones) {
 		if zone == 0 || zone == volume.Zone || zone == volume.NextZone {
+			continue
+		}
+
+		if _, ok := reachable[zone]; !ok {
 			continue
 		}
 

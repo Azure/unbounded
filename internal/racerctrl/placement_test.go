@@ -6,6 +6,8 @@ package racerctrl
 import (
 	"fmt"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // placeAll runs a whole pass of placement over a set of unplaced nodes, which
@@ -528,4 +530,21 @@ func TestPlacementDrift(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Zones never cross sites, so a declared name is interned per site. Joining the
+// two raw meant a site whose name contained the separator interned to the same
+// key as a differently split pair, and two failure domains sharing a zone id is
+// a silent merge rather than an error.
+func TestDeclaredZoneKeyCannotCollideAcrossSites(t *testing.T) {
+	assert.NotEqual(t,
+		declaredZoneKey("east|rack", "3"),
+		declaredZoneKey("east", "rack|3"),
+	)
+
+	assert.Equal(t, declaredZoneKey("east", "rack-3"), declaredZoneKey("east", "rack-3"),
+		"the same pair still interns to the same key")
+
+	assert.NotEqual(t, declaredZoneKey("east", "rack-3"), declaredZoneKey("west", "rack-3"),
+		"two sites may use the same zone name without being merged")
 }

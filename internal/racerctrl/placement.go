@@ -5,6 +5,7 @@ package racerctrl
 
 import (
 	"fmt"
+	"net/url"
 	"sort"
 )
 
@@ -356,8 +357,12 @@ func leastLoaded(counts [Cohorts]int) uint32 {
 // declaredZoneKey is the name a declared zone is interned under. The site is
 // part of it because zones never cross sites, so two sites may use the same
 // zone names without being merged into one failure domain.
+//
+// The site is escaped rather than joined raw: a site whose name contained the
+// separator would otherwise intern to the same key as a differently split pair,
+// and two failure domains sharing a zone id is a silent merge.
 func declaredZoneKey(site, name string) string {
-	return site + "|" + name
+	return url.QueryEscape(site) + "|" + name
 }
 
 // SelectGateways picks the members of a zone that other zones may route

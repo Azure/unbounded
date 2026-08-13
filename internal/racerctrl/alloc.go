@@ -4,6 +4,7 @@
 package racerctrl
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"sort"
@@ -47,6 +48,17 @@ const (
 	// config and in every extent's home, so a hash change or a renamed label
 	// would silently repartition the cluster.
 	ZoneKeyPrefix = "zone-"
+
+	// ZoneEncodedKeyPrefix prefixes the same mapping for a name that cannot be
+	// a ConfigMap key as it stands. Keys are limited to letters, digits, dots,
+	// dashes and underscores, and a declared zone name is whatever an
+	// administrator wrote on a Node, joined to the site it belongs to. Names
+	// that fit go under ZoneKeyPrefix verbatim, because a readable key is worth
+	// having; the rest are base64url encoded under this one.
+	//
+	// The prefix deliberately does not begin with ZoneKeyPrefix, which is
+	// parsed as a name mapping over the whole ConfigMap.
+	ZoneEncodedKeyPrefix = "zoneenc-"
 
 	// ZoneDefKeyPrefix prefixes one key per zone recording the site and fabric
 	// it was minted for, as `site=<s>&fabric=<f>`. Placement needs a zone's site
@@ -182,6 +194,22 @@ func ParseCursors(data map[string]string) (Cursors, error) {
 			}
 
 			cursors.ZoneBuckets[zone] = buckets
+		case strings.HasPrefix(key, ZoneEncodedKeyPrefix):
+			name, err := decodeZoneName(strings.TrimPrefix(key, ZoneEncodedKeyPrefix))
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			value, err := ParseUint32(raw)
+			if err != nil {
+				return Cursors{}, fmt.Errorf("%s: %w", key, err)
+			}
+
+			if value == 0 {
+				return Cursors{}, fmt.Errorf("%s: zone id must not be zero", key)
+			}
+
+			cursors.Zones[name] = value
 		case strings.HasPrefix(key, ZoneKeyPrefix):
 			name := strings.TrimPrefix(key, ZoneKeyPrefix)
 			if name == "" {
@@ -255,7 +283,7 @@ func (c Cursors) Data() map[string]string {
 	}
 
 	for name, id := range c.Zones {
-		data[ZoneKeyPrefix+name] = strconv.FormatUint(uint64(id), 10)
+		data[zoneNameKey(name)] = strconv.FormatUint(uint64(id), 10)
 	}
 
 	for zone, def := range c.ZoneDefs {
@@ -283,6 +311,58 @@ func (c Cursors) Data() map[string]string {
 	return data
 }
 
+// maxConfigMapKey is the longest key a ConfigMap will accept.
+const maxConfigMapKey = 253
+
+// zoneNameKey is the ConfigMap key a declared zone name is recorded under.
+//
+// ConfigMap keys admit only letters, digits, dots, dashes and underscores, and
+// a declared zone name is an administrator's string joined to a site name, so
+// it routinely is not one. Writing it raw produced a ConfigMap the API server
+// refused, which meant every allocation the placer made alongside it - node
+// ids, extent ids, the LBA cursors - was lost on write.
+func zoneNameKey(name string) string {
+	if zoneNameIsKeySafe(name) {
+		return ZoneKeyPrefix + name
+	}
+
+	return ZoneEncodedKeyPrefix + base64.RawURLEncoding.EncodeToString([]byte(name))
+}
+
+// decodeZoneName reverses the encoded half of zoneNameKey.
+func decodeZoneName(encoded string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("zone name is not base64url: %w", err)
+	}
+
+	if len(raw) == 0 {
+		return "", fmt.Errorf("zone name is empty")
+	}
+
+	return string(raw), nil
+}
+
+// zoneNameIsKeySafe reports whether a name can be a ConfigMap key verbatim.
+// The character set is the API server's, and the two reserved names are its
+// too.
+func zoneNameIsKeySafe(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '.', r == '_':
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
 // ZoneID returns the numeric zone id for a failure-domain name, allocating one
 // the first time the name is seen. A name is never given a second id and an id
 // is never given to a second name, so a zone that empties out and later refills
@@ -290,6 +370,16 @@ func (c Cursors) Data() map[string]string {
 func (c *Cursors) ZoneID(name string) (uint32, error) {
 	if name == "" {
 		return 0, fmt.Errorf("zone name must not be empty")
+	}
+
+	// The name has to survive a round trip through a ConfigMap key, and the
+	// encoded form is the longer of the two, so it is what the limit is
+	// measured against.
+	if longest := len(ZoneEncodedKeyPrefix) + base64.RawURLEncoding.EncodedLen(len(name)); longest > maxConfigMapKey {
+		return 0, fmt.Errorf(
+			"zone name %q is too long to record: it needs a %d character ConfigMap key and the limit is %d",
+			name, longest, maxConfigMapKey,
+		)
 	}
 
 	if c.Zones == nil {
@@ -409,17 +499,28 @@ func AllocateLBA(next, blocks uint64) (base, advanced uint64, err error) {
 		return 0, 0, fmt.Errorf("cannot allocate zero blocks")
 	}
 
+	// Bounds are checked before the alignment, not after. Aligning first would
+	// let a cursor near the top of the range wrap to a low base that looks
+	// perfectly valid, and the extent placed there would overlap live data. The
+	// cursor is read from a ConfigMap annotation and parsed as a full uint64,
+	// so a value that large is a thing an edit can produce.
+	if next > MaxLBA || blocks > MaxLBA {
+		return 0, 0, fmt.Errorf(
+			"universe address space exhausted: cursor %d and %d blocks are both bounded by %d",
+			next, blocks, uint64(MaxLBA),
+		)
+	}
+
 	base = alignUp(next, HugeBlocks)
 
-	end := base + blocks
-	if end > MaxLBA {
+	if base > MaxLBA || blocks > MaxLBA-base {
 		return 0, 0, fmt.Errorf(
 			"universe address space exhausted: %d blocks at base %d exceeds %d",
 			blocks, base, uint64(MaxLBA),
 		)
 	}
 
-	return base, end, nil
+	return base, base + blocks, nil
 }
 
 // Segment is one allocated extent of a volume: a SegmentSpec that has been given

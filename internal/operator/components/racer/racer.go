@@ -42,6 +42,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -184,7 +185,11 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 
 // SetupWatches reconciles racer on changes to the objects that carry its state.
 // Nodes are watched because a node's identity and its published health both
-// live in its annotations, and both feed decisions made here.
+// live in its annotations, and both feed decisions made here. StorageClasses
+// are watched because a StorageClass with racer's provisioner is a universe: it
+// carries the universe id, the catalog size, the per-zone epochs and the LBA
+// cursor. Without the watch, creating one raised no event here and the universe
+// sat unallocated until something unrelated happened to reconcile.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName))))
@@ -195,6 +200,7 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		})))
 	b.Watches(&corev1.Node{}, env.RequestSingleton())
 	b.Watches(&corev1.PersistentVolume{}, env.RequestSingleton())
+	b.Watches(&storagev1.StorageClass{}, env.RequestSingleton())
 }
 
 // reconcileState runs the allocation and sequencing passes and folds their

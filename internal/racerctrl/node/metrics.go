@@ -251,10 +251,14 @@ func extentLabel(s Sample) (uint32, bool) {
 }
 
 // toUint clamps a Prometheus float to a non-negative integer. Every metric the
-// control plane reads is a count, so a negative or infinite value is nonsense
-// and reading it as zero is the conservative choice: zero never unblocks a
-// destructive sequence on its own, it only fails to block one that some other
-// node will block anyway.
+// control plane reads is a count, so a negative or infinite value is nonsense.
+//
+// Zero is not a safe reading. It is what an absent metric looks like, and every
+// gate in internal/racerctrl asks whether a count has reached zero, so a value
+// that failed to parse reads exactly like a sequence that has finished. That is
+// what the gates guard against by requiring the node to have loaded the
+// generation the count is being read against, rather than by trusting any
+// number that arrives here.
 func toUint(v float64) uint64 {
 	if v <= 0 || math.IsInf(v, 0) || math.IsNaN(v) {
 		return 0
