@@ -7,23 +7,6 @@ on every node. Each layer is converted to an uncompressed EROFS image
 target and mounts it read-only as an overlayfs lowerdir. The writable
 container layer stays on local disk.
 
-The full rationale, on-disk formats and failure analysis live in
-[designs/gantry-snapshotter-design.md](../../designs/gantry-snapshotter-design.md).
-This directory is only the deployment.
-
-## Files
-
-| File | Purpose |
-| --- | --- |
-| `serviceaccount.yaml.tmpl` | Namespace, ServiceAccount, RBAC and the PriorityClass |
-| `runtimeclass.yaml.tmpl` | The `gantry-bootstrap` RuntimeClass the agent runs under |
-| `daemonset.yaml.tmpl` | The node agent |
-| `containerd-config.toml` | Stanzas to merge into `/etc/containerd/config.toml` |
-
-Templates are rendered with `make gantry-snapshotter-manifests`, which writes
-plain YAML into `rendered/`. Override the namespace and image with
-`GANTRY_SNAPSHOTTER_NAMESPACE` and `GANTRY_SNAPSHOTTER_IMAGE`.
-
 ## Prerequisites
 
 Per node:
