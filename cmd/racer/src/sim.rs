@@ -126,12 +126,75 @@ struct Who {
     seq: u16,
 }
 
+/// One 4 KiB block's bytes, shared by every store holding that content.
+type Block = Rc<[u8; BLOCK]>;
+
+/// How many interns pass between sweeps of the block pool. Big enough that the walk is
+/// amortised over the writes that caused it, small enough that a run overwriting one page
+/// in a tight loop holds only a bounded number of the versions it has retired.
+const SWEEP: u32 = 4096;
+
+/// The bytes every simulated store is made of, interned by content.
+///
+/// A campaign writes each page to three replicas, warms it into another zone and re-sends
+/// it on every retry, and an immutable page is written once and then read for the rest of
+/// the run. A copy per node per write costs gigabytes over a long campaign and says
+/// nothing the content does not, so a block is stored once and pointed at: the simulation
+/// costs what it wrote, not what it copied. Sharing is safe because a stored block is
+/// never edited in place; a write replaces the pointer.
+#[derive(Default)]
+struct Pool {
+    /// Blocks by content hash. A bucket holds the few blocks that collided, compared in
+    /// full before one is reused, so a collision costs a memcmp and never a wrong read.
+    by_hash: BTreeMap<u64, Vec<Block>>,
+    /// Interns since the last sweep.
+    since: u32,
+}
+
+impl Pool {
+    fn intern(&mut self, src: &[u8]) -> Block {
+        self.since += 1;
+        if self.since >= SWEEP {
+            self.sweep();
+        }
+        let v = self.by_hash.entry(spread(src)).or_default();
+        if let Some(b) = v.iter().find(|b| b[..] == *src) {
+            return Rc::clone(b);
+        }
+        let mut b = [0u8; BLOCK];
+        b.copy_from_slice(src);
+        let b: Block = Rc::new(b);
+        v.push(Rc::clone(&b));
+        b
+    }
+
+    /// Drop the blocks no store points at any more. The pool's own reference is the one
+    /// that has to be discounted, so a count of one means retired.
+    fn sweep(&mut self) {
+        self.since = 0;
+        self.by_hash.retain(|_, v| {
+            v.retain(|b| Rc::strong_count(b) > 1);
+            !v.is_empty()
+        });
+    }
+}
+
+/// FNV-1a a word at a time over a block. Not a checksum: it only has to spread contents
+/// over buckets, and a collision is compared away rather than believed.
+fn spread(b: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for w in b.chunks_exact(8) {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 /// One node's store, or a handle on a peer (which holds no blocks: `submit` turns writes
 /// to it into frames). Absent blocks read as zero and all-zero writes are erased.
 struct Device {
     node: u32,
     fabric: bool,
-    blocks: BTreeMap<u64, Box<[u8; BLOCK]>>,
+    blocks: BTreeMap<u64, Block>,
     /// Store size, zero until `resize`. Unused on a fabric handle.
     len: u64,
     /// Transfers submitted through the runtime, which are the ones a rate budget meters.
@@ -146,14 +209,12 @@ impl Device {
         }
     }
 
-    fn write(&mut self, lba: u64, src: &[u8]) {
+    fn write(&mut self, pool: &mut Pool, lba: u64, src: &[u8]) {
         if src.iter().all(|&b| b == 0) {
             self.blocks.remove(&lba);
             return;
         }
-        let mut b = Box::new([0u8; BLOCK]);
-        b.copy_from_slice(src);
-        self.blocks.insert(lba, b);
+        self.blocks.insert(lba, pool.intern(src));
     }
 }
 
@@ -255,6 +316,8 @@ struct Shared {
     /// Which (node, core) is executing, so a submission needs no arguments naming it.
     here: Cell<(u32, u32)>,
     devs: RefCell<Vec<Device>>,
+    /// The block contents every store in the simulation shares.
+    pool: RefCell<Pool>,
     paths: RefCell<BTreeMap<PathBuf, u32>>,
     evs: RefCell<BinaryHeap<Reverse<Ev>>>,
     seq: Cell<u64>,
@@ -434,8 +497,9 @@ pub(crate) fn raw_read(dev: u32, off: u64, out: &mut [u8]) -> std::io::Result<()
 pub(crate) fn raw_write(dev: u32, off: u64, src: &[u8]) -> std::io::Result<()> {
     let s = shared();
     let mut devs = s.devs.borrow_mut();
+    let mut pool = s.pool.borrow_mut();
     for (i, chunk) in src.chunks(BLOCK).enumerate() {
-        devs[dev as usize].write(off / BLOCK as u64 + i as u64, chunk);
+        devs[dev as usize].write(&mut pool, off / BLOCK as u64 + i as u64, chunk);
     }
     Ok(())
 }
@@ -649,6 +713,11 @@ struct Pending {
     /// the caller can read what came back, but it is no longer the node's to fail: a
     /// crash must not rewrite a result someone has already been told.
     live: bool,
+    /// Whether anything came back in the buffer. Only a read has bytes worth keeping
+    /// once it is done; holding a finished write's page would mean a campaign's memory
+    /// grew with the number of operations it had performed rather than with the number
+    /// it had in flight, which for the 4 MiB class is a gigabyte a few hundred fills in.
+    read: bool,
 }
 
 /// How a cluster is shaped. Groups, peers, extents and devices derive from these.
@@ -760,6 +829,7 @@ impl Sim {
             base,
             here: Cell::new((0, 0)),
             devs: RefCell::new(Vec::new()),
+            pool: RefCell::new(Pool::default()),
             paths: RefCell::new(BTreeMap::new()),
             evs: RefCell::new(BinaryHeap::new()),
             seq: Cell::new(0),
@@ -1156,7 +1226,7 @@ impl Sim {
         let mut block = [0u8; BLOCK];
         d.read(off / BLOCK as u64, &mut block);
         block[17] ^= 0xff;
-        d.write(off / BLOCK as u64, &block);
+        d.write(&mut self.s.pool.borrow_mut(), off / BLOCK as u64, &block);
         node
     }
 
@@ -1272,6 +1342,7 @@ impl Sim {
                 buf,
                 node: i,
                 live: true,
+                read: op == Op::Read,
             },
         );
         self.start(
@@ -1330,9 +1401,22 @@ impl Sim {
         self.results.get(&id).copied()
     }
 
-    /// The bytes a finished read returned. `None` once its node has crashed under it.
+    /// The bytes a finished read returned. `None` once its node has crashed under it,
+    /// or once the caller has done with it.
     pub fn payload(&self, id: u64) -> Option<&[u8]> {
         self.pending.get(&id).map(|p| &p.buf[..])
+    }
+
+    /// Give a finished read's bytes back. The result stays: a caller may still ask what
+    /// it was told long after it has stopped caring what came back. A long campaign has
+    /// to say this, or it holds every page it ever read at once.
+    pub fn forget(&mut self, id: u64) {
+        if let Some(p) = self.pending.get(&id)
+            && !p.live
+            && let Some(p) = self.pending.remove(&id)
+        {
+            self.put_buf(p.buf);
+        }
     }
 
     /// A live worker on `i`, chosen by address so a page always lands on the same one.
@@ -1349,6 +1433,13 @@ impl Sim {
             match u {
                 Use::Client(id) => {
                     self.results.insert(id, Err(libc::EAGAIN));
+                    // Refused before it ever started, so it is not in flight and never
+                    // will be. Leaving it live would mean the cluster could never be
+                    // called quiet again, since nothing later completes a request that
+                    // no worker took.
+                    if let Some(p) = self.pending.remove(&id) {
+                        self.put_buf(p.buf);
+                    }
                 }
                 Use::Frame {
                     origin, back, wire, ..
@@ -1382,12 +1473,18 @@ impl Sim {
             Some(Use::Client(id)) => {
                 self.results.insert(id, res.map_err(|e| e.raw()));
                 // The tag is committed and re-armed here, so the request's memory goes
-                // back into service. What it returned is kept as a copy for `payload`.
+                // back into service. What a read returned is kept as a copy for
+                // `payload`; a write's page is not, since nothing came back in it.
                 if let Some(p) = self.pending.get_mut(&id) {
-                    let copy = p.buf.to_vec().into_boxed_slice();
-                    let old = std::mem::replace(&mut p.buf, copy);
                     p.live = false;
-                    self.put_buf(old);
+
+                    if p.read {
+                        let copy = p.buf.to_vec().into_boxed_slice();
+                        let old = std::mem::replace(&mut p.buf, copy);
+                        self.put_buf(old);
+                    } else if let Some(p) = self.pending.remove(&id) {
+                        self.put_buf(p.buf);
+                    }
                 }
             }
             Some(Use::Frame {
@@ -1617,12 +1714,13 @@ impl Sim {
         let mem = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, n) };
         let base = off / BLOCK as u64;
         let mut devs = self.s.devs.borrow_mut();
+        let mut pool = self.s.pool.borrow_mut();
         let d = &mut devs[dev as usize];
         for (i, chunk) in mem.chunks_mut(BLOCK).enumerate() {
             if read {
                 d.read(base + i as u64, chunk);
             } else {
-                d.write(base + i as u64, chunk);
+                d.write(&mut pool, base + i as u64, chunk);
             }
         }
         if read && self.s.chance(rot) {
