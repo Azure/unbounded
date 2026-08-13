@@ -427,17 +427,18 @@ impl Allocator {
     /// write at once with no timer; commits made while it is in flight ride the next one.
     async fn flush_until(&'static self, class: Class, li: u32, need: u64) -> Result<(), Status> {
         loop {
-            match shard(|sh| sh.flush_act(class, li, need)) {
-                Act::Done => return Ok(()),
-                Act::Wait => Park::new().await,
-                Act::Go => self.flush(class, li).await?,
+            match turn(class, li, need) {
+                Turn::Done => return Ok(()),
+                Turn::Wait => Park::new().await,
+                Turn::Go(mark) => self.flush(li, mark).await?,
             }
         }
     }
 
     /// Serialise one mblock from DRAM to the copy that is not current: a whole 4 KiB
     /// block, so there is nothing to read first.
-    async fn flush(&'static self, class: Class, li: u32) -> Result<(), Status> {
+    async fn flush(&'static self, li: u32, mut mark: Flushing) -> Result<(), Status> {
+        let class = mark.class;
         // Staging is normally pre-held by `tick`; awaiting here is the cold path.
         if here(|c| c.staging[class as usize].is_none()) {
             let b = match PoolBuf::try_alloc(MBLOCK) {
@@ -455,13 +456,9 @@ impl Allocator {
                 .mblock_off(class, h.mblock_id, (h.generation % 2) as u8);
             (seq, off, stage.buf())
         });
+        mark.seq = seq;
         let r = self.disk.write(off, buf, Durability::Durable).await;
-        here(|c| {
-            c.shard.end_flush(class, li, seq, r.is_ok());
-            for w in c.waiters.drain(..) {
-                w.wake();
-            }
-        });
+        mark.settle(r.is_ok());
         r.map_err(|_| Status::Io)
     }
 
@@ -1291,6 +1288,74 @@ impl Allocator {
                 .set_occ(occ_per_core(cfg.policy.occ_bytes, self.cores));
             c.shard.set_recoverable(cfg.peer_count() > 0);
         });
+    }
+}
+
+// -------------------------------------------------------------------- group commit
+
+/// [`Act`] with the claim it hands out.
+///
+/// `Go` is not a fact about the slab so much as a claim on it, so it comes back as the
+/// thing that has to be given up rather than as a word saying it was taken.
+enum Turn {
+    Done,
+    Wait,
+    Go(Flushing),
+}
+
+/// This core's turn at flushing mblock `li`, waiting or nothing if it is not owed one.
+fn turn(class: Class, li: u32, need: u64) -> Turn {
+    match shard(|sh| sh.flush_act(class, li, need)) {
+        Act::Done => Turn::Done,
+        Act::Wait => Turn::Wait,
+        // The slab has just marked itself busy for us, and this is the only thing that
+        // will unmark it. Built here and nowhere else for that reason.
+        Act::Go => Turn::Go(Flushing { class, li, seq: 0 }),
+    }
+}
+
+/// A slab marked busy for one flush, and the obligation to unmark it.
+///
+/// Between taking the mark and retiring it are two awaits: the staging buffer on the cold
+/// path, and the write itself. A future dropped at either of them used to leave the mark
+/// set for the rest of the process: every committer on this core would park behind a
+/// flush that was never going to finish, and no later flush could take the slab either.
+/// Retiring it from a destructor makes the mark last exactly as long as the attempt does,
+/// whether the attempt finishes or is abandoned.
+#[must_use = "an unretired flush leaves the slab busy and every committer behind it parked"]
+struct Flushing {
+    class: Class,
+    li: u32,
+    /// The sequence this write makes durable, known only once `begin_flush` has run.
+    seq: u64,
+}
+
+impl Flushing {
+    /// Retire a flush that ran, recording whether the write landed.
+    fn settle(self, ok: bool) {
+        let me = std::mem::ManuallyDrop::new(self);
+        Flushing::retire(me.class, me.li, me.seq, ok);
+    }
+
+    /// Give the slab back and wake everyone waiting on it. Synchronous, and on this core,
+    /// because the mark is this core's: a destructor cannot await, and here it need not.
+    fn retire(class: Class, li: u32, seq: u64, ok: bool) {
+        here(|c| {
+            c.shard.end_flush(class, li, seq, ok);
+            for w in c.waiters.drain(..) {
+                w.wake();
+            }
+        });
+    }
+}
+
+impl Drop for Flushing {
+    fn drop(&mut self) {
+        // Abandoned part-way, so nothing is claimed durable: the write may have landed or
+        // may never have been issued, and a sequence claimed wrongly is an acknowledged
+        // page lost. The waiters are woken all the same, because what they wait for is a
+        // turn and not this particular write.
+        Flushing::retire(self.class, self.li, self.seq, false);
     }
 }
 
