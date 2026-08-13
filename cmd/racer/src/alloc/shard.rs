@@ -479,7 +479,12 @@ impl Slab {
 // ---------------------------------------------------------------------------- tickets
 
 /// Reserved slot plus the register the page will carry once committed.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// Not `Copy`: a ticket is a slot held, and a second one for the same slot is a second
+/// claim on it. `stage` and `unreserve` each consume one, so a shard sees exactly one
+/// settlement per reservation and the compiler is the thing saying so.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[must_use = "a ticket holds a slot until it is staged or unreserved"]
 pub(super) struct Ticket {
     pub(super) slot: u32,
     pub(super) version: u64,
@@ -540,7 +545,8 @@ fn state_of(kind: Kind, version: u64) -> State {
 /// eagerly would let a crash between the two mblock writes leave the address in neither,
 /// losing an acknowledged write. Both slots live at a crash is fine: startup resolves the
 /// duplicate by `(version, ballot)`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[must_use = "a staged entry owes a flush, and a stale slot its retirement"]
 pub(super) struct Staged {
     pub li: u32,
     pub seq: u64,
@@ -1942,19 +1948,22 @@ mod model {
                     // The value rides in the entry's data checksum, so two proposers at
                     // one version are distinguishable in the durable record.
                     let value = t.ballot.raw();
+                    let (version, ballot) = (t.version, t.ballot.raw());
                     // `Ok(None)` is a commit that lost the race and gave its slot back:
                     // the caller sees success but nothing was written, so nothing is
                     // acknowledged.
                     maps!(m);
                     if let Ok(Some(st)) = s.sh.stage(GlobalAddr(addr), kind, cls, t, value, &m) {
-                        s.acked.insert((addr, t.version, t.ballot.raw(), value));
+                        s.acked.insert((addr, version, ballot, value));
                         if let Some(old) = st.stale {
                             s.sh.release(cls, old, &m);
                         }
                     }
                 }
                 RegAct::Leak(p) => {
-                    s.pending.remove(p as usize);
+                    // Dropped on purpose: this is the caller that was cancelled between
+                    // reserving and settling, and the slot behind the ticket goes with it.
+                    drop(s.pending.remove(p as usize));
                     s.leaked += 1;
                 }
                 RegAct::Unreserve(p) => {
@@ -2292,26 +2301,21 @@ mod model {
                 DiskAct::Stage(p) => {
                     let (addr, t) = s.pending.remove(p as usize);
                     let value = t.ballot.raw();
+                    let (version, ballot) = (t.version, t.ballot.raw());
                     maps!(m);
                     let st = s.shards[0]
                         .stage(GlobalAddr(addr), Kind::Lww, cls, t, value, &m)
                         .ok()??;
                     match self.ack {
                         Ack::Staged => {
-                            s.acked.insert((addr, t.version, t.ballot.raw(), value));
+                            s.acked.insert((addr, version, ballot, value));
                             if let Some(old) = st.stale {
                                 s.shards[0].release(cls, old, &m);
                             }
                         }
-                        Ack::Durable => s.waiting.push((
-                            addr,
-                            t.version,
-                            t.ballot.raw(),
-                            value,
-                            st.li,
-                            st.seq,
-                            st.stale,
-                        )),
+                        Ack::Durable => s
+                            .waiting
+                            .push((addr, version, ballot, value, st.li, st.seq, st.stale)),
                     }
                 }
                 DiskAct::FlushGo(li) => {
