@@ -11,7 +11,7 @@ use std::time::Duration;
 use racer::sim::{Faults, Options};
 
 use crate::coverage::Reach;
-use crate::world::World;
+use crate::world::{self, World};
 
 /// A deterministic stream of choices. Small on purpose: the seed is the whole
 /// reproduction, so the generator must not depend on anything else.
@@ -190,6 +190,13 @@ pub fn profile(seed: u64) -> Profile {
             4,
             240,
         ),
+    };
+
+    // The extent is sized from the workload rather than by hand, so that the
+    // pages held back for the reclamation invariant are always there.
+    let opts = Options {
+        huge_pages: if huge > 0 { huge + world::SPARE } else { 0 },
+        ..opts
     };
 
     Profile {
