@@ -2863,7 +2863,10 @@ for config_path in paths:
     if not config_path.exists():
         continue
     cfg = json.loads(config_path.read_text())
-    devices = cfg.get("AdditionalHostDevices") or []
+    devices = [
+        device["Path"] if isinstance(device, dict) else device
+        for device in cfg.get("AdditionalHostDevices") or []
+    ]
     for want in expected_devices:
         if want not in devices:
             sys.exit(

@@ -1043,6 +1043,16 @@ func TestParseAdditionalHostMount(t *testing.T) {
 			wantMount: config.AdditionalHostMount{Source: "/opt/config", Target: "/etc/config", ReadOnly: true},
 		},
 		{
+			name:      "optional read-only source",
+			input:     "/opt/config:optional:ro",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config", ReadOnly: true, Optional: true},
+		},
+		{
+			name:      "read-only optional source and target",
+			input:     "/opt/config:/etc/config:ro:optional",
+			wantMount: config.AdditionalHostMount{Source: "/opt/config", Target: "/etc/config", ReadOnly: true, Optional: true},
+		},
+		{
 			name:    "empty value",
 			input:   "",
 			wantErr: "mount spec must not be empty",
@@ -1112,23 +1122,28 @@ func TestParseAdditionalHostDevice(t *testing.T) {
 	tests := []struct {
 		name       string
 		input      string
-		wantDevice string
+		wantDevice config.AdditionalHostDevice
 		wantErr    string
 	}{
 		{
 			name:       "absolute /dev path",
 			input:      "/dev/uinput",
-			wantDevice: "/dev/uinput",
+			wantDevice: config.AdditionalHostDevice{Path: "/dev/uinput"},
 		},
 		{
 			name:       "systemd char group specifier",
 			input:      "char-input",
-			wantDevice: "char-input",
+			wantDevice: config.AdditionalHostDevice{Path: "char-input"},
 		},
 		{
 			name:       "systemd block group wildcard",
 			input:      "block-*",
-			wantDevice: "block-*",
+			wantDevice: config.AdditionalHostDevice{Path: "block-*"},
+		},
+		{
+			name:       "optional device path",
+			input:      "/dev/uinput:optional",
+			wantDevice: config.AdditionalHostDevice{Path: "/dev/uinput", Optional: true},
 		},
 		{
 			name:    "empty value",
@@ -1187,5 +1202,8 @@ func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostDevices(t *testin
 	cfg, err := h.buildAgentConfig(context.Background())
 	require.NoError(t, err)
 
-	require.Equal(t, []string{"/dev/uinput", "char-input"}, cfg.AdditionalHostDevices)
+	require.Equal(t, []config.AdditionalHostDevice{
+		{Path: "/dev/uinput"},
+		{Path: "char-input"},
+	}, cfg.AdditionalHostDevices)
 }

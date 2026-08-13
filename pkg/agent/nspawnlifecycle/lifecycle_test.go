@@ -27,7 +27,7 @@ func testLifecycle(t *testing.T, loader ConfigLoader) *Lifecycle {
 func TestPreStartUsesApplicationConfigLoader(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.AgentConfig{AdditionalHostDevices: []string{"/dev/uinput"}}
+	cfg := &config.AgentConfig{AdditionalHostDevices: []config.AdditionalHostDevice{{Path: "/dev/uinput"}}}
 	lifecycle := testLifecycle(t, func(_ context.Context, machine string) (*config.AgentConfig, bool, error) {
 		require.Equal(t, "kube1", machine)
 
