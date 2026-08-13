@@ -171,15 +171,24 @@ spec:
           # No readiness probe on purpose. A Pod that is not Ready is
           # still routed no traffic, which is meaningless here because
           # containerd reaches the agent over a hostPath socket, not a
-          # Service. A liveness probe is what actually matters: if the
-          # metrics listener is gone the process is wedged and pods on
-          # this node are stuck in ContainerCreating.
+          # Service. A liveness probe is what actually matters: pods on a
+          # node whose snapshotter is wedged sit in ContainerCreating
+          # forever, and nothing else notices.
+          #
+          # /healthz does not answer for itself. It dials the snapshotter
+          # socket and asks for a snapshot that cannot exist, so it fails
+          # if the listener stopped accepting, if the gRPC handlers are all
+          # blocked, or if a bbolt transaction is never going to commit.
+          # timeoutSeconds is above the agent's own 5s probe deadline so
+          # the agent gets to report the failure rather than the kubelet
+          # guessing at it.
           livenessProbe:
             httpGet:
               path: /healthz
               port: metrics
             initialDelaySeconds: 15
             periodSeconds: 30
+            timeoutSeconds: 8
             failureThreshold: 3
           resources:
             requests:

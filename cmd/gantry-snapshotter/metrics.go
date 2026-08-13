@@ -41,14 +41,14 @@ const metricsShutdown = 2 * time.Second
 // A failure here is logged and dropped rather than propagated. Losing the
 // ability to scrape a snapshotter is not a reason to stop running containers
 // on the node.
-func runMetrics(ctx context.Context, cfg *Config, log *slog.Logger) {
+//
+// health is what /healthz reports. It is a parameter rather than something
+// built here so the endpoint cannot drift back into answering without asking
+// anybody.
+func runMetrics(ctx context.Context, cfg *Config, health func(context.Context) error, log *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-
-		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best effort
-	})
+	mux.HandleFunc("/healthz", healthHandler(health, log))
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
@@ -81,4 +81,30 @@ func runMetrics(ctx context.Context, cfg *Config, log *slog.Logger) {
 	_ = server.Shutdown(shutdownCtx) //nolint:errcheck // shutdown is best effort
 
 	<-done
+}
+
+// healthHandler answers the kubelet's liveness probe.
+//
+// A failed check is a 503 rather than a log line, because the whole reason this
+// endpoint exists is to get a wedged daemon restarted. The log line is there
+// too: three of these in a row kills the pod, and the operator should be able
+// to find out why afterwards.
+func healthHandler(health func(context.Context) error, log *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if health == nil {
+			http.Error(w, "no health check configured", http.StatusServiceUnavailable)
+			return
+		}
+
+		if err := health(r.Context()); err != nil {
+			log.Warn("liveness check failed", slog.Any("err", err))
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+
+		_, _ = w.Write([]byte("ok")) //nolint:errcheck // best effort
+	}
 }

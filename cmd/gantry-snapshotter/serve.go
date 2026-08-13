@@ -163,7 +163,12 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	background("cleanup", func() { runCleanup(ctx, cfg, sn, log) })
 
 	if cfg.MetricsAddr != "" {
-		background("metrics", func() { runMetrics(ctx, cfg, log) })
+		// The prober talks to the socket bound above, so it exercises the
+		// same path containerd does rather than a copy of it.
+		probe := newProber(cfg)
+		defer probe.close() //nolint:errcheck // shutdown
+
+		background("metrics", func() { runMetrics(ctx, cfg, probe.check, log) })
 	}
 
 	serveErr := make(chan error, 1)

@@ -172,6 +172,15 @@ it is being built. The agent statfs's that filesystem before it fetches
 anything and refuses the layer if the conversion would eat into
 `--work-headroom`. A refusal is logged and is not a failure: the container
 that triggered it is already running on a locally unpacked layer, and some
-other node will publish it. Persistent `not enough room on the work
-filesystem` means the nodes are too small for the images, not that the
-snapshotter is broken.
+other node will publish it. Persistent `not enough room on the work filesystem` means the nodes are too small for the
+images, not that the snapshotter is broken.
+
+**The liveness probe asks the agent a real question.** `/healthz` dials the
+snapshotter's own socket and requests a snapshot that cannot exist, expecting a
+not-found. A daemon whose listener has stopped accepting, whose gRPC handlers
+are all blocked, or whose metadata store is holding a transaction nobody will
+commit fails that request, and three failures kill the pod. That is the right
+outcome: a wedged agent leaves every pod on the node in `ContainerCreating`
+with nothing to show for it, and a restart either clears the wedge or degrades
+the node to local unpack, both of which beat a black hole. `/healthz` needs
+`--metrics-addr` to be set; without it there is no probe at all.
