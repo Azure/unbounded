@@ -153,6 +153,26 @@ func Format(vol Volume, opts FormatOptions) error {
 		return err
 	}
 
+	// A zero superblock is not on its own enough to call the device blank.
+	// Wiping just the superblock is the obvious way to try to force a
+	// reformat by hand, and it leaves every record where it was. Formatting
+	// on top of that produces a catalog that reports zero records and then
+	// collides with the residue on its first append, which reads as
+	// corruption rather than as the operator error it is.
+	//
+	// Records are appended densely from the base block, so residue always
+	// occupies the base block. One read settles it.
+	if _, err := vol.ReadAt(block, int64(sb.RecordBlockBase()*BlockBytes)); err != nil { //nolint:gosec // bounded by the extent size
+		return fmt.Errorf("read first record block: %w", err)
+	}
+
+	if !allZero(block) {
+		return errors.New("catalog: device holds records from a previous catalog; " +
+			"replace the image volume instead of clearing the superblock")
+	}
+
+	block = make([]byte, BlockBytes)
+
 	// The segment table is zeroed before the superblock is published, so a
 	// reader that finds a valid superblock never reads a table left over
 	// from whatever was on the device before.

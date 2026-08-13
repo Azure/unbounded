@@ -5,6 +5,7 @@ package catalog
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,6 +140,44 @@ func TestFormatRefusesForeignData(t *testing.T) {
 
 	if err := Format(dev.client(), FormatOptions{Bytes: testCatalogBytes}); err == nil {
 		t.Fatal("formatting over unrecognized data was allowed")
+	}
+}
+
+// TestFormatRefusesRecordsLeftBehind covers the obvious way to force a
+// reformat by hand: zeroing the superblock. That leaves every record where it
+// was, and the fresh catalog would collide with the residue on its first
+// append.
+func TestFormatRefusesRecordsLeftBehind(t *testing.T) {
+	dev, s := ready(t)
+
+	res, err := s.ReserveRecords(1)
+	if err != nil {
+		t.Fatalf("ReserveRecords: %v", err)
+	}
+
+	if err := s.Append(res, []Record{{Type: RecordChain, Key: digest(2), Ref: digest(1)}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Wipe the superblock the way a hand recovery would.
+	client := dev.client()
+
+	block := make([]byte, BlockBytes)
+	if _, err := client.ReadAt(block, 0); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+
+	if _, err := client.WriteAt(make([]byte, BlockBytes), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	err = Format(dev.client(), FormatOptions{Bytes: testCatalogBytes})
+	if err == nil {
+		t.Fatal("formatting over leftover records was allowed; the next append would collide with them")
+	}
+
+	if !strings.Contains(err.Error(), "records from a previous catalog") {
+		t.Fatalf("error does not name the cause: %v", err)
 	}
 }
 

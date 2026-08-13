@@ -298,3 +298,35 @@ node logging it regularly is a cluster running out of image volume: provision
 more segments before the last one seals. Once no segment can hold a layer,
 ingest logs `catalog: full` and every new layer goes back to being unpacked on
 every node, which costs throughput and nothing else.
+
+## Resetting the layer store
+
+The catalog is the index for every blob in every segment, so it cannot be
+reformatted in place: `Format` refuses a device that already holds a catalog,
+and it refuses one that still holds records even if the superblock has been
+cleared by hand. Clearing the superblock and letting a node reformat on top of
+the leftover records produces a catalog that reports zero records and then
+collides with the residue on its first append.
+
+To start over, replace the image volume and let the operator rebuild it on
+fresh extents:
+
+```sh
+# Nothing may hold the block devices while the volumes go away.
+kubectl -n unbounded-system scale deploy/unbounded-operator --replicas=0
+kubectl -n unbounded-system patch ds/gantry-snapshotter --type=merge \
+  -p '{"spec":{"template":{"spec":{"nodeSelector":{"gantry-snapshotter-quiesced":"true"}}}}}'
+kubectl -n unbounded-system rollout status ds/gantry-snapshotter
+
+kubectl delete pv -l app.kubernetes.io/name=gantry-snapshotter --wait=false
+
+# The operator drops racer's extent finalizer, recreates the volumes, and
+# restores the DaemonSet's node selector on its own.
+kubectl -n unbounded-system scale deploy/unbounded-operator --replicas=1
+kubectl get pv -l app.kubernetes.io/name=gantry-snapshotter \
+  -o custom-columns=NAME:.metadata.name,COMP:'.metadata.annotations.racer\.unbounded-cloud\.io/composition'
+```
+
+Every layer already in the old segments is discarded. Nodes go back to
+unpacking locally until the images are pulled again, which costs throughput and
+nothing else.

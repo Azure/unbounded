@@ -167,8 +167,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # The component label is load-bearing, not decoration. The
+            # node-config DaemonSet carries the same name label, and a
+            # selector that matched it too would put every node in the
+            # peer view twice. RankOf skips self and counts everyone
+            # else, so a duplicated view does not lose a node, it
+            # doubles every node's rank and therefore doubles every
+            # ingest delay.
             - name: GANTRY_SNAPSHOTTER_MEMBERS_SELECTOR
-              value: app.kubernetes.io/name=gantry-snapshotter
+              value: app.kubernetes.io/name=gantry-snapshotter,app.kubernetes.io/component=snapshotter
             # Only one node in the cluster needs to lay down the
             # catalog superblock, and the write is a compare-and-swap
             # on block zero, so it is safe to let every node try.
