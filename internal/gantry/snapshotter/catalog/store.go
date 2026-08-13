@@ -24,8 +24,10 @@ type Volume interface {
 	WriteAt(p []byte, off int64) (int, error)
 }
 
-// ErrFull reports that the catalog has no room left, either for records or in
-// the open segment. Ingest stops; reads are unaffected.
+// ErrFull reports that the catalog has no room left: either its record slots
+// are used up, or no segment can hold the blob. A full open segment is not
+// enough on its own, because a reservation rolls into an empty segment first.
+// Ingest stops; reads are unaffected.
 var ErrFull = errors.New("catalog: full")
 
 // ErrNoOpenSegment reports that no segment is accepting appends. The operator
@@ -86,7 +88,19 @@ type Store struct {
 	// hole and reaches the same conclusion at the same moment; without this
 	// they would all pile onto the same block's compare-and-swap.
 	skew float64
+
+	// onRoll reports segment rollovers, for the daemon's log. It is read
+	// without synchronization, so it has to be set before the store is
+	// handed to anything else and never changed after.
+	onRoll func(Roll)
 }
+
+// SetRollObserver registers a callback for segment rollovers.
+//
+// It must be called before the store is shared with other goroutines. The
+// callback runs on the goroutine that took the reservation, with no catalog
+// lock held, and must not call back into the store.
+func (s *Store) SetRollObserver(fn func(Roll)) { s.onRoll = fn }
 
 // FormatOptions describes a catalog to be created.
 type FormatOptions struct {
@@ -383,12 +397,30 @@ func (s *Store) ReserveRecords(records int) (Reservation, error) {
 // This is the one place allocation is serialized cluster-wide, and it is one
 // block write. On conflict it re-reads and retries with jittered backoff; a
 // conflict means another node reserved first, so retrying is exactly right.
+//
+// A request the open segment cannot hold rolls the catalog into the next empty
+// segment rather than failing. Rolling here rather than from a control loop is
+// what makes it happen at all: the reservation is the only code in the cluster
+// that knows a segment is full, and it knows it while holding the lock that
+// makes moving the cursor safe.
 func (s *Store) Reserve(pages uint32, records int) (Reservation, error) {
 	if records <= 0 {
 		return Reservation{}, errors.New("catalog: reservation of no records")
 	}
 
 	s.io.Lock()
+
+	// Rollovers are reported after the device lock is released: the observer
+	// is a log line on the caller's goroutine, and running it under the lock
+	// would let anything that touches the catalog from it deadlock. Deferred
+	// before the unlock so it runs after it.
+	var rolled Roll
+
+	defer func() {
+		if rolled.Opened != 0 && s.onRoll != nil {
+			s.onRoll(rolled)
+		}
+	}()
 	defer s.io.Unlock()
 
 	var lastErr error
@@ -409,8 +441,33 @@ func (s *Store) Reserve(pages uint32, records int) (Reservation, error) {
 			}
 
 			if sb.OpenFreePages() < pages {
-				return Reservation{}, fmt.Errorf("%w: open segment %d has %d of %d pages free",
-					ErrFull, sb.OpenSegment, sb.OpenFreePages(), pages)
+				// One rollover per reservation. If the segment we just
+				// opened is full too, another node is filling it as fast
+				// as we roll, and sealing segment after segment to chase
+				// it would empty the volume. Ingest is off the container
+				// start path, so the layer is simply ingested later.
+				if rolled.Opened != 0 {
+					return Reservation{}, fmt.Errorf("%w: open segment %d has %d of %d pages free",
+						ErrFull, sb.OpenSegment, sb.OpenFreePages(), pages)
+				}
+
+				roll, err := s.rollOpenSegmentLocked(sb, pages)
+				if err != nil {
+					// Another node moved appends first. Its segment is
+					// almost certainly the one we would have chosen, so
+					// re-read and use it.
+					if errors.Is(err, ErrConflict) {
+						lastErr = err
+
+						continue
+					}
+
+					return Reservation{}, err
+				}
+
+				rolled = roll
+
+				continue
 			}
 		}
 

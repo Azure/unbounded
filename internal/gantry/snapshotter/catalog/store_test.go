@@ -885,6 +885,382 @@ func TestSetOpenSegmentRejects(t *testing.T) {
 	}
 }
 
+func TestReserveRollsIntoTheNextSegment(t *testing.T) {
+	_, s := ready(t)
+
+	var rolls []Roll
+
+	s.SetRollObserver(func(r Roll) { rolls = append(rolls, r) })
+
+	if err := s.AddSegment(2, 32); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	if _, err := s.Reserve(60, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Four pages are left, which is the whole point: the blob does not fit
+	// and the reservation is the only thing that knows it.
+	res, err := s.Reserve(10, 1)
+	if err != nil {
+		t.Fatalf("a full segment did not roll: %v", err)
+	}
+
+	if res.Segment != 2 || res.PageOffset != 0 {
+		t.Fatalf("the reservation did not land in the new segment: %+v", res)
+	}
+
+	// Record slots are catalog wide, so they carry on across the roll.
+	if res.FirstRecord != 1 {
+		t.Fatalf("record numbering restarted: %+v", res)
+	}
+
+	entries, err := s.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	if entries[0].State != SegmentSealed || entries[0].CursorPages != 60 {
+		t.Fatalf("the full segment was not sealed at its cursor: %+v", entries[0])
+	}
+
+	if entries[1].State != SegmentOpen || entries[1].CursorPages != 10 {
+		t.Fatalf("the new segment did not take the reservation: %+v", entries[1])
+	}
+
+	want := Roll{Sealed: 1, SealedPages: 60, Opened: 2, OpenedPages: 32}
+	if len(rolls) != 1 || rolls[0] != want {
+		t.Fatalf("got %+v, want one %+v", rolls, want)
+	}
+
+	// The next reservation fits, so it must not roll again.
+	if _, err := s.Reserve(1, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if len(rolls) != 1 {
+		t.Fatalf("a reservation that fits rolled anyway: %+v", rolls)
+	}
+}
+
+func TestReserveRollsPastASegmentTooSmall(t *testing.T) {
+	_, s := ready(t)
+
+	// A segment that cannot hold the blob is no use to this reservation, and
+	// opening it would seal what is left of segment 1 for nothing.
+	if err := s.AddSegment(2, 4); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	if err := s.AddSegment(3, 64); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	if _, err := s.Reserve(64, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	res, err := s.Reserve(10, 1)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if res.Segment != 3 {
+		t.Fatalf("the reservation landed in segment %d, want 3: %+v", res.Segment, res)
+	}
+
+	entries, err := s.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	if entries[1].State != SegmentEmpty {
+		t.Fatalf("the segment that was skipped was spent anyway: %+v", entries[1])
+	}
+}
+
+func TestReserveFullWhenNoSegmentHoldsTheBlob(t *testing.T) {
+	_, s := ready(t)
+
+	if err := s.AddSegment(2, 4); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	if _, err := s.Reserve(64, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if _, err := s.Reserve(10, 1); !errors.Is(err, ErrFull) {
+		t.Fatalf("got %v, want ErrFull", err)
+	}
+
+	// A blob nothing can hold must not cost the cluster its remaining
+	// capacity, so the failed reservation leaves the segments as they were.
+	if got := s.Superblock().OpenSegment; got != 1 {
+		t.Fatalf("open segment %d, want the full segment 1 still open", got)
+	}
+
+	entries, err := s.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	if entries[1].State != SegmentEmpty {
+		t.Fatalf("the small segment was sealed for a blob it could not hold: %+v", entries[1])
+	}
+
+	res, err := s.Reserve(4, 1)
+	if err != nil {
+		t.Fatalf("a blob that still fits was refused: %v", err)
+	}
+
+	if res.Segment != 2 {
+		t.Fatalf("the reservation landed in segment %d, want 2", res.Segment)
+	}
+}
+
+func TestReserveRecordsDoesNotRoll(t *testing.T) {
+	_, s := ready(t)
+
+	if err := s.AddSegment(2, 32); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	if _, err := s.Reserve(64, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// A record-only claim names no bytes, so a full segment is nothing to it.
+	// Rolling here would spend a segment to write a tombstone.
+	if _, err := s.ReserveRecords(1); err != nil {
+		t.Fatalf("ReserveRecords: %v", err)
+	}
+
+	if got := s.Superblock().OpenSegment; got != 1 {
+		t.Fatalf("a record-only reservation rolled to segment %d", got)
+	}
+}
+
+func TestReserveRollConverges(t *testing.T) {
+	noSleep(t)
+
+	dev, a := ready(t)
+
+	if err := a.AddSegment(2, 32); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	client := dev.client()
+
+	b, err := Open(client)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if _, err := a.Reserve(64, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	var winner Reservation
+
+	// Both nodes see the same full segment at the same instant. A rolls while
+	// B is part way through its own roll, which is the case that must not end
+	// with two sealed segments or a reservation into a segment nobody opened.
+	client.onWrite = func() {
+		var err error
+
+		winner, err = a.Reserve(6, 1)
+		if err != nil {
+			t.Errorf("Reserve: %v", err)
+		}
+	}
+
+	loser, err := b.Reserve(5, 1)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if client.conflicts == 0 {
+		t.Fatal("the test did not actually produce a conflict")
+	}
+
+	if winner.Segment != 2 || loser.Segment != 2 {
+		t.Fatalf("the two nodes rolled apart: winner %+v, loser %+v", winner, loser)
+	}
+
+	if loser.PageOffset != winner.PageOffset+winner.PageCount {
+		t.Fatalf("reservations overlap: winner %+v, loser %+v", winner, loser)
+	}
+
+	entries, err := b.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	// One roll happened, not two: the old segment keeps every page it handed
+	// out and exactly one segment is open.
+	if entries[0].State != SegmentSealed || entries[0].CursorPages != 64 {
+		t.Fatalf("sealing lost pages that were handed out: %+v", entries[0])
+	}
+
+	open := 0
+
+	for _, e := range entries {
+		if e.State == SegmentOpen {
+			open++
+		}
+	}
+
+	if open != 1 {
+		t.Fatalf("%d segments are open: %+v", open, entries)
+	}
+}
+
+func TestReserveRollSealsAtTheTrueCursor(t *testing.T) {
+	noSleep(t)
+
+	dev, a := ready(t)
+
+	if err := a.AddSegment(2, 32); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	client := dev.client()
+
+	b, err := Open(client)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if _, err := a.Reserve(60, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// B decides to roll against a cursor at page 60, and A fills the last four
+	// pages and rolls first. B's seal then lands on a segment another node has
+	// already sealed further along, and writing B's stale cursor back would
+	// hide the pages A handed out: the Account for a blob living in them would
+	// be refused for accounting past the cursor.
+	client.onWrite = func() {
+		if _, err := a.Reserve(4, 1); err != nil {
+			t.Errorf("Reserve: %v", err)
+		}
+
+		if _, err := a.Reserve(10, 1); err != nil {
+			t.Errorf("Reserve: %v", err)
+		}
+	}
+
+	if _, err := b.Reserve(10, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	entries, err := b.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	if entries[0].State != SegmentSealed || entries[0].CursorPages != 64 {
+		t.Fatalf("sealing moved the cursor backwards: %+v", entries[0])
+	}
+
+	// The cursor has to hold up what is accounted against it.
+	if err := b.Account(1, 64*segment.PageBytes, 0); err != nil {
+		t.Fatalf("Account: %v", err)
+	}
+}
+
+func TestSetOpenSegmentResumesAPartialRoll(t *testing.T) {
+	_, s := ready(t)
+
+	if err := s.AddSegment(2, 32); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	// A rollover that died between marking the successor open and publishing
+	// it in the superblock. Refusing the entry would strand the segment's
+	// whole capacity for as long as the catalog lives.
+	block, slot, err := s.Superblock().segmentLocation(2)
+	if err != nil {
+		t.Fatalf("segmentLocation: %v", err)
+	}
+
+	s.io.Lock()
+	err = s.mergeSegmentBlock(block, slot, func(existing SegmentEntry, _ bool) (SegmentEntry, error) {
+		existing.State = SegmentOpen
+
+		return existing, nil
+	})
+	s.io.Unlock()
+
+	if err != nil {
+		t.Fatalf("mergeSegmentBlock: %v", err)
+	}
+
+	if err := s.SetOpenSegment(2); err != nil {
+		t.Fatalf("a half finished rollover stranded segment 2: %v", err)
+	}
+
+	res, err := s.Reserve(1, 1)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if res.Segment != 2 || res.PageOffset != 0 {
+		t.Fatalf("appends did not move to the resumed segment: %+v", res)
+	}
+}
+
+func TestSetOpenSegmentRetriesALostWrite(t *testing.T) {
+	noSleep(t)
+
+	dev, a := ready(t)
+
+	client := dev.client()
+
+	b, err := Open(client)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if err := b.AddSegment(2, 32); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+
+	// Reservations from other nodes land on the superblock all the time, so a
+	// rollover that gave up on the first lost compare-and-swap would rarely
+	// finish on a busy cluster.
+	client.onWrite = func() {
+		if _, err := a.Reserve(3, 1); err != nil {
+			t.Errorf("Reserve: %v", err)
+		}
+	}
+
+	if err := b.SetOpenSegment(2); err != nil {
+		t.Fatalf("SetOpenSegment: %v", err)
+	}
+
+	if client.conflicts == 0 {
+		t.Fatal("the test did not actually produce a conflict")
+	}
+
+	entries, err := b.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	// The reservation that slipped in is sealed into the segment it came
+	// from, not dropped by the roll that read the cursor before it moved.
+	if entries[0].State != SegmentSealed || entries[0].CursorPages != 3 {
+		t.Fatalf("the roll sealed away a reservation: %+v", entries[0])
+	}
+
+	if entries[1].State != SegmentOpen {
+		t.Fatalf("the new segment did not open: %+v", entries[1])
+	}
+}
+
 func TestAccount(t *testing.T) {
 	_, s := ready(t)
 

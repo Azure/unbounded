@@ -47,6 +47,13 @@ func (s *Store) Segments() ([]SegmentEntry, error) {
 		return nil, err
 	}
 
+	return s.segmentsLocked(sb)
+}
+
+// segmentsLocked is Segments against a superblock the caller has already read,
+// with s.io held. Reserve needs the table while it holds the device lock, and
+// the lock is not reentrant.
+func (s *Store) segmentsLocked(sb Superblock) ([]SegmentEntry, error) {
 	var entries []SegmentEntry
 
 	block := make([]byte, BlockBytes)
@@ -114,6 +121,19 @@ func (s *Store) AddSegment(id, totalPages uint32) error {
 	})
 }
 
+// Roll describes a segment rollover: the segment that was sealed because it
+// could not hold the next blob, and the one appends moved to.
+//
+// It exists to be reported. Sealing a segment is the moment a chunk of the
+// image volume stops being writable until the cleaner reclaims it, and an
+// operator watching capacity should not have to infer it from a superblock.
+type Roll struct {
+	Sealed      uint32
+	SealedPages uint32
+	Opened      uint32
+	OpenedPages uint32
+}
+
 // SetOpenSegment makes id the segment reservations append to.
 //
 // The previously open segment is sealed first, and its authoritative cursor is
@@ -128,84 +148,205 @@ func (s *Store) SetOpenSegment(id uint32) error {
 		return err
 	}
 
-	if sb.OpenSegment == id {
-		return nil
-	}
+	_, err = s.openSegmentLocked(sb.OpenSegment, id)
 
-	block, slot, err := sb.segmentLocation(id)
-	if err != nil {
-		return err
-	}
+	return err
+}
 
-	entry, err := s.readSegmentEntry(block, slot)
-	if err != nil {
-		return err
-	}
+// openSegmentLocked seals outgoing and makes id the open segment, with s.io
+// held. Reserve rolls the open segment from inside its own retry loop, which
+// already holds the lock, and the lock is not reentrant.
+//
+// outgoing is the open segment the caller decided to replace, and it is
+// rechecked on every attempt. If another node has moved appends somewhere else
+// in the meantime, the caller's decision was made against a superblock that no
+// longer exists and re-deciding is the caller's job: sealing whatever happens
+// to be open now would throw away a segment another node had just opened.
+//
+// The superblock write is retried like a reservation's is. Rollovers now
+// happen whenever a segment fills rather than once on an empty catalog, and
+// they contend with every reservation in the cluster, so losing the
+// compare-and-swap is ordinary rather than exceptional.
+func (s *Store) openSegmentLocked(outgoing, id uint32) (Roll, error) {
+	var lastErr error
 
-	if entry.ID != id {
-		return fmt.Errorf("catalog: segment %d is not in the table", id)
-	}
-
-	if entry.State != SegmentEmpty {
-		return fmt.Errorf("catalog: segment %d is %s, only an empty segment can be opened",
-			id, entry.State)
-	}
-
-	if entry.CursorPages != 0 {
-		return fmt.Errorf("catalog: segment %d is empty but its cursor is at page %d",
-			id, entry.CursorPages)
-	}
-
-	// Seal the outgoing segment before the superblock stops tracking its
-	// cursor, otherwise the authoritative cursor is lost.
-	if sb.OpenSegment != 0 {
-		oldBlock, oldSlot, err := sb.segmentLocation(sb.OpenSegment)
-		if err != nil {
-			return err
+	for attempt := range s.retries {
+		if attempt > 0 {
+			sleep(backoff(attempt))
 		}
 
-		sealed := sb
+		sb, err := s.readSuperblock()
+		if err != nil {
+			return Roll{}, err
+		}
 
-		err = s.mergeSegmentBlock(oldBlock, oldSlot, func(existing SegmentEntry, present bool) (SegmentEntry, error) {
-			if !present {
-				return SegmentEntry{}, fmt.Errorf("catalog: open segment %d is not in the table", sealed.OpenSegment)
+		if sb.OpenSegment == id {
+			// Already there: either it always was, or another node rolled
+			// to the same segment, or our own write landed and we are
+			// retrying a conflict we did not actually lose.
+			return Roll{}, nil
+		}
+
+		if sb.OpenSegment != outgoing {
+			return Roll{}, fmt.Errorf("%w: segment %d is open for appends, not %d",
+				ErrConflict, sb.OpenSegment, outgoing)
+		}
+
+		entry, block, slot, err := s.successor(sb, id)
+		if err != nil {
+			return Roll{}, err
+		}
+
+		roll := Roll{Opened: id, OpenedPages: entry.TotalPages}
+
+		// Seal the outgoing segment before the superblock stops tracking
+		// its cursor, otherwise the authoritative cursor is lost. On a
+		// retry this runs again against the cursor the superblock holds
+		// now, which is how a reservation that landed in between is not
+		// sealed away.
+		if sb.OpenSegment != 0 {
+			if err := s.sealLocked(sb); err != nil {
+				return Roll{}, err
 			}
 
-			existing.State = SegmentSealed
-			existing.CursorPages = sealed.OpenCursorPages
-			existing.TotalPages = sealed.OpenTotalPages
+			roll.Sealed = sb.OpenSegment
+			roll.SealedPages = sb.OpenCursorPages
+		}
+
+		err = s.mergeSegmentBlock(block, slot, func(existing SegmentEntry, _ bool) (SegmentEntry, error) {
+			existing.State = SegmentOpen
 
 			return existing, nil
 		})
 		if err != nil {
-			return err
+			return Roll{}, err
 		}
+
+		next := sb
+		next.Generation++
+		next.OpenSegment = id
+		next.OpenCursorPages = 0
+		next.OpenTotalPages = entry.TotalPages
+
+		if err := s.writeSuperblock(next); err != nil {
+			if errors.Is(err, ErrConflict) {
+				lastErr = err
+
+				continue
+			}
+
+			return Roll{}, err
+		}
+
+		s.state.Lock()
+		s.sb = next
+		s.state.Unlock()
+
+		return roll, nil
 	}
 
-	err = s.mergeSegmentBlock(block, slot, func(existing SegmentEntry, _ bool) (SegmentEntry, error) {
-		existing.State = SegmentOpen
+	return Roll{}, fmt.Errorf("catalog: opening segment %d lost %d compare-and-swaps: %w",
+		id, s.retries, lastErr)
+}
 
-		return existing, nil
-	})
+// successor reads the table entry of a segment that is about to be opened and
+// checks it can be, returning where the entry lives so the caller can write it
+// back without locating it again.
+func (s *Store) successor(sb Superblock, id uint32) (SegmentEntry, uint64, int, error) {
+	block, slot, err := sb.segmentLocation(id)
+	if err != nil {
+		return SegmentEntry{}, 0, 0, err
+	}
+
+	entry, err := s.readSegmentEntry(block, slot)
+	if err != nil {
+		return SegmentEntry{}, 0, 0, err
+	}
+
+	if entry.ID != id {
+		return SegmentEntry{}, 0, 0, fmt.Errorf("catalog: segment %d is not in the table", id)
+	}
+
+	// An entry marked open that the superblock does not name is a rollover
+	// that died between marking the successor and publishing it. Nothing was
+	// ever appended to it, so it is picked up where it was left rather than
+	// refused: refusing would strand the segment's whole capacity for good,
+	// and a crash between two writes is not rare enough to pay that for.
+	if entry.State != SegmentEmpty && entry.State != SegmentOpen {
+		return SegmentEntry{}, 0, 0, fmt.Errorf(
+			"catalog: segment %d is %s, only an empty segment can be opened", id, entry.State)
+	}
+
+	if entry.CursorPages != 0 {
+		return SegmentEntry{}, 0, 0, fmt.Errorf("catalog: segment %d is %s but its cursor is at page %d",
+			id, entry.State, entry.CursorPages)
+	}
+
+	return entry, block, slot, nil
+}
+
+// sealLocked writes the superblock's authoritative cursor into the open
+// segment's table entry and marks it sealed.
+func (s *Store) sealLocked(sb Superblock) error {
+	block, slot, err := sb.segmentLocation(sb.OpenSegment)
 	if err != nil {
 		return err
 	}
 
-	next := sb
-	next.Generation++
-	next.OpenSegment = id
-	next.OpenCursorPages = 0
-	next.OpenTotalPages = entry.TotalPages
+	return s.mergeSegmentBlock(block, slot, func(existing SegmentEntry, present bool) (SegmentEntry, error) {
+		if !present {
+			return SegmentEntry{}, fmt.Errorf("catalog: open segment %d is not in the table", sb.OpenSegment)
+		}
 
-	if err := s.writeSuperblock(next); err != nil {
-		return err
+		existing.State = SegmentSealed
+		existing.TotalPages = sb.OpenTotalPages
+
+		// A cursor never moves backwards. Two nodes rolling at once both seal,
+		// and the one whose superblock write loses read its cursor earlier than
+		// the one that wins; taking the larger of the two keeps a losing sealer
+		// from hiding pages the winner had already handed out, which would make
+		// the later Account for a blob in those pages fail validation.
+		if sb.OpenCursorPages > existing.CursorPages {
+			existing.CursorPages = sb.OpenCursorPages
+		}
+
+		return existing, nil
+	})
+}
+
+// rollOpenSegmentLocked seals the open segment because it cannot hold pages
+// more, and opens the successor every node would choose.
+//
+// The successor is chosen from the catalog's own segment table rather than
+// from this node's view of which devices it has mapped, so that two nodes
+// rolling at the same instant pick the same segment instead of sealing one
+// each. A segment in the table is part of the shared image volume by
+// definition; a node that cannot map it has a local staging problem, and its
+// own reconcile is what fixes that.
+//
+// A segment too small for the request is skipped rather than opened: moving
+// into it would seal what is left of the open segment and still not fit.
+func (s *Store) rollOpenSegmentLocked(sb Superblock, pages uint32) (Roll, error) {
+	entries, err := s.segmentsLocked(sb)
+	if err != nil {
+		return Roll{}, err
 	}
 
-	s.state.Lock()
-	s.sb = next
-	s.state.Unlock()
+	for _, e := range entries {
+		if e.ID == sb.OpenSegment || e.CursorPages != 0 || e.TotalPages < pages {
+			continue
+		}
 
-	return nil
+		// SegmentOpen here is the partial rollover successor describes.
+		if e.State != SegmentEmpty && e.State != SegmentOpen {
+			continue
+		}
+
+		return s.openSegmentLocked(sb.OpenSegment, e.ID)
+	}
+
+	return Roll{}, fmt.Errorf("%w: open segment %d has %d of its %d pages free and no empty segment holds %d",
+		ErrFull, sb.OpenSegment, sb.OpenFreePages(), sb.OpenTotalPages, pages)
 }
 
 // Account moves bytes between a segment's live and dead columns, which is what

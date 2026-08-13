@@ -176,3 +176,15 @@ can ever be converted, and every other node keeps paying full price. There is
 no way to detect this other than noticing the label is missing, so the first
 image layer committed without one logs a warning naming the setting. It is
 logged once per process, not once per layer.
+
+**Segments fill and roll by themselves, and a roll is a capacity warning.**
+Blobs are appended into one segment at a time. The first reservation that does
+not fit seals that segment and moves appends to the lowest empty one that can
+hold the blob, logging `segment full, ingest rolled to the next one`. No
+restart or reconfiguration is involved, and nodes rolling at the same instant
+converge on the same segment. What the message means is that a chunk of the
+image volume has stopped accepting writes until a cleaner reclaims it, so a
+node logging it regularly is a cluster running out of image volume: provision
+more segments before the last one seals. Once no segment can hold a layer,
+ingest logs `catalog: full` and every new layer goes back to being unpacked on
+every node, which costs throughput and nothing else.

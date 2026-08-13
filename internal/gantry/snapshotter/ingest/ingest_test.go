@@ -67,6 +67,21 @@ func (l fileLocator) Locate(addr segment.Address) (string, uint64, uint64, error
 	return l.path, addr.ByteOffset(), addr.Span(), nil
 }
 
+// segmentLocator gives each segment its own file, which is what a node with
+// more than one segment of the image volume mapped actually has.
+type segmentLocator struct {
+	paths map[uint32]string
+}
+
+func (l segmentLocator) Locate(addr segment.Address) (string, uint64, uint64, error) {
+	path, ok := l.paths[addr.Segment]
+	if !ok {
+		return "", 0, 0, fmt.Errorf("segment %d is not mapped", addr.Segment)
+	}
+
+	return path, addr.ByteOffset(), addr.Span(), nil
+}
+
 // bytesOpener hands back a fixed tar payload.
 type bytesOpener struct {
 	data []byte
@@ -983,6 +998,89 @@ func TestIngestSkipVerifyPublishesAnyway(t *testing.T) {
 
 	if _, ok := store.Resolve(req.ChainID); !ok {
 		t.Fatal("chain did not resolve with verification off")
+	}
+}
+
+func TestIngestRollsIntoTheNextSegment(t *testing.T) {
+	// One page of segment and a one page image, so the second layer arrives
+	// at a segment that is exactly full.
+	store := newStore(t, 1)
+
+	if err := store.AddSegment(2, 4); err != nil {
+		t.Fatalf("add segment: %v", err)
+	}
+
+	devices := segmentLocator{paths: map[uint32]string{
+		1: deviceFile(t, 1),
+		2: deviceFile(t, 4),
+	}}
+
+	image := bytes.Repeat([]byte("erofs"), 100000)
+	builder, _ := fakeBuilder(t, image)
+
+	i := newIngester(t, Options{
+		Catalog: store,
+		Locator: devices,
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	first, err := i.Ingest(t.Context(), Request{DiffID: digestOf(1), ChainID: digestOf(2)})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if first.Blob.Address.Segment != 1 {
+		t.Fatalf("first layer landed in segment %d, want 1", first.Blob.Address.Segment)
+	}
+
+	second, err := i.Ingest(t.Context(), Request{DiffID: digestOf(3), ChainID: digestOf(4)})
+	if err != nil {
+		t.Fatalf("a layer arriving at a full segment was not ingested: %v", err)
+	}
+
+	if second.Blob.Address.Segment != 2 || second.Blob.Address.PageOffset != 0 {
+		t.Fatalf("the second layer did not roll: %+v", second.Blob.Address)
+	}
+
+	// The blob is on the device the roll moved it to, not on the full one.
+	on := make([]byte, len(image))
+
+	f, err := os.Open(devices.paths[2])
+	if err != nil {
+		t.Fatalf("open device: %v", err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.ReadAt(on, int64(second.Blob.Address.ByteOffset())); err != nil {
+		t.Fatalf("read device: %v", err)
+	}
+
+	if !bytes.Equal(on, image) {
+		t.Fatal("device content differs from the image")
+	}
+
+	// Both layers resolve, so nothing the roll did lost the first one.
+	for _, chain := range []catalog.Digest{digestOf(2), digestOf(4)} {
+		if _, ok := store.Resolve(chain); !ok {
+			t.Fatalf("chain %s did not resolve after the roll", chain)
+		}
+	}
+
+	segs, err := store.Segments()
+	if err != nil {
+		t.Fatalf("segments: %v", err)
+	}
+
+	// A segment is accounted for by the pages it hands out, not by the bytes
+	// of the image sitting in them.
+	if segs[0].State != catalog.SegmentSealed || segs[0].LiveBytes != segment.PageBytes {
+		t.Fatalf("the full segment was not sealed with its layer: %+v", segs[0])
+	}
+
+	if segs[1].State != catalog.SegmentOpen || segs[1].LiveBytes != segment.PageBytes {
+		t.Fatalf("the new segment was not accounted for: %+v", segs[1])
 	}
 }
 

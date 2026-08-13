@@ -159,8 +159,23 @@ func (h *holder) reconcile(set *segment.Set) error {
 }
 
 // openStore opens the catalog on dev, formatting it first when it is blank and
-// this node is allowed to.
+// this node is allowed to, and wires up the store's reporting.
 func (h *holder) openStore(dev *catalog.Device, desc segment.Catalog) (*catalog.Store, error) {
+	store, err := h.openOrFormat(dev, desc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Registered before the store is published, which is what makes reading
+	// the callback from the reservation path safe.
+	store.SetRollObserver(h.logRoll)
+
+	return store, nil
+}
+
+// openOrFormat opens the catalog on dev, formatting a blank device first when
+// this node is allowed to.
+func (h *holder) openOrFormat(dev *catalog.Device, desc segment.Catalog) (*catalog.Store, error) {
 	store, err := catalog.Open(dev)
 	if err == nil {
 		return store, nil
@@ -194,6 +209,20 @@ func (h *holder) openStore(dev *catalog.Device, desc segment.Catalog) (*catalog.
 	return catalog.Open(dev)
 }
 
+// logRoll reports a segment rollover.
+//
+// This is a capacity event and it is logged loudly: the sealed segment stops
+// accepting appends for good until the cleaner reclaims it, so a cluster that
+// rolls often is a cluster about to run out of image volume.
+func (h *holder) logRoll(roll catalog.Roll) {
+	h.log.Warn("segment full, ingest rolled to the next one",
+		slog.Uint64("sealed", uint64(roll.Sealed)),
+		slog.Uint64("sealed_pages", uint64(roll.SealedPages)),
+		slog.Uint64("opened", uint64(roll.Opened)),
+		slog.Uint64("opened_pages", uint64(roll.OpenedPages)),
+	)
+}
+
 // adoptSegments registers the segments this node can see in the catalog's
 // segment table and makes sure one of them is open for appends.
 //
@@ -203,6 +232,12 @@ func (h *holder) openStore(dev *catalog.Device, desc segment.Catalog) (*catalog.
 // change a segment it already knows, SetOpenSegment is a no-op when the
 // segment is already open, and both are compare-and-swaps, so the worst
 // outcome of a race is a retry.
+//
+// Opening a segment here only covers the case where nothing is open at all: a
+// catalog nobody has ingested into yet. Moving off a segment that has filled
+// up is not this loop's job, and must not be, because the only code that knows
+// a segment is full is the reservation that could not fit in it. See
+// catalog.Store.Reserve.
 func (h *holder) adoptSegments(store *catalog.Store, set *segment.Set) error {
 	if !h.adopt {
 		return nil
@@ -252,7 +287,17 @@ func (h *holder) adoptSegments(store *catalog.Store, set *segment.Set) error {
 	}
 
 	for _, e := range known {
-		if e.State != catalog.SegmentEmpty || e.FreePages() == 0 {
+		// A segment marked open while the superblock names none is a
+		// rollover that died between marking the segment and publishing
+		// it. Nothing was ever appended to it, so it is a candidate like
+		// any empty segment; skipping it would stand its capacity down for
+		// good. Anything with a cursor is skipped rather than refused, so
+		// one odd entry cannot stop the node attaching.
+		if e.State != catalog.SegmentEmpty && e.State != catalog.SegmentOpen {
+			continue
+		}
+
+		if e.CursorPages != 0 || e.FreePages() == 0 {
 			continue
 		}
 
