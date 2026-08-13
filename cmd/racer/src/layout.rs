@@ -411,26 +411,6 @@ impl Geometry {
         self.tail(store_bytes).1 / CHUNK_BYTES
     }
 
-    /// The slot a data-region offset belongs to, the inverse of [`Self::slot_off`]. `None`
-    /// unless the offset starts a slot of this class, which is how the allocator checks a
-    /// chunk the cache returns.
-    pub(crate) fn slot_at(&self, class: Class, off: u64) -> Option<u32> {
-        let k = class.k() as u64;
-        let mut first = 0;
-        for e in self.extents(class) {
-            let len = e.mblocks * k * class.bytes();
-            if off >= e.data && off < e.data + len {
-                let rel = off - e.data;
-                if !rel.is_multiple_of(class.bytes()) {
-                    return None;
-                }
-                return u32::try_from(first * k + rel / class.bytes()).ok();
-            }
-            first += e.mblocks;
-        }
-        None
-    }
-
     /// Byte offset of one copy of an mblock. Copies A and B sit a whole run apart, not
     /// adjacent, so one bad neighbourhood cannot take both copies of a block.
     pub(crate) fn mblock_off(&self, class: Class, id: u32, copy: u8) -> u64 {
@@ -1510,23 +1490,6 @@ mod tests {
         let tight = Geometry::plan(SIZE, &cfg).unwrap();
         assert_eq!(tight.tail(tight.alloc_end()).1, 0);
         assert_eq!(tight.tail_chunks(0), 0);
-    }
-
-    /// `slot_at` is `slot_off` backwards, which the allocator relies on for cache loans.
-    #[test]
-    fn a_data_offset_names_the_slot_it_starts() {
-        let g = Geometry::plan(64 << 30, &test_config()).unwrap();
-        for class in CLASSES {
-            for slot in [0u32, 1, 7, (g.slots(class) - 1) as u32] {
-                assert_eq!(g.slot_at(class, g.slot_off(class, slot)), Some(slot));
-            }
-            assert_eq!(g.slot_at(class, g.slot_off(class, 3) + 1), None);
-            assert_eq!(g.slot_at(class, g.extents(class)[0].data - 1), None);
-            assert_eq!(g.slot_at(class, g.slot_off(class, 0) - class.bytes()), None);
-        }
-        // A tail offset belongs to no slot, so a cache chunk cannot be mistaken for a loan.
-        let (base, _) = g.tail(64 << 30);
-        assert_eq!(g.slot_at(Class::Huge, base), None);
     }
 
     #[test]

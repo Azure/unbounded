@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::alloc::{Allocator, GlobalAddr, Pressure};
+use crate::alloc::{Allocator, GlobalAddr, Loan, Pressure};
 use crate::config::{self, Config, rank};
 use crate::layout::{self, Class};
 use crate::paxos::Register;
@@ -314,10 +314,13 @@ enum Decline {
 /// One 4 MiB piece of media the cache holds: either a chunk of the store's tail, which is the
 /// cache's own space, or a free 4 MiB data slot on loan from the allocator, which has to go
 /// back the moment the slab needs it.
-#[derive(Clone, Copy)]
+///
+/// A borrowed chunk holds the [`Loan`] itself rather than a flag saying it is borrowed, so
+/// giving one back is handing over the thing the allocator lent rather than an offset it has
+/// to recognise.
 struct Chunk {
     off: u64,
-    borrowed: bool,
+    loan: Option<Loan>,
 }
 
 /// Slots one 4 MiB chunk holds for a class: 1024 small, exactly one huge. The asymmetry is why
@@ -375,7 +378,7 @@ impl Store {
     /// map's share of it, which `BYTES_PER_SLOT` estimates.
     fn push_chunk(&mut self, c: Chunk) {
         let cs = chunk_slots(self.class);
-        self.borrowed += c.borrowed as usize;
+        self.borrowed += c.loan.is_some() as usize;
         self.chunks.push(c);
         self.slots.resize(self.slots.len() + cs, Slot::default());
         self.map.reserve(cs);
@@ -394,7 +397,7 @@ impl Store {
     /// Refusing on the chunk that moves is also what keeps a slot index meaningful for as long
     /// as anyone holds one. An index is a position within `chunks`, and the last chunk is
     /// swapped into the hole, so a pinned slot anywhere in it blocks the move.
-    fn remove_chunk(&mut self, ci: usize) -> Option<u64> {
+    fn remove_chunk(&mut self, ci: usize) -> Option<Chunk> {
         let last = self.chunks.len().checked_sub(1)?;
         if self.busy(ci) || self.busy(last) {
             return None;
@@ -424,27 +427,41 @@ impl Store {
         let cs = chunk_slots(self.class);
         self.slots.truncate(self.slots.len() - cs);
         let gone = self.chunks.swap_remove(ci);
-        self.borrowed -= gone.borrowed as usize;
+        self.borrowed -= gone.loan.is_some() as usize;
         if self.hand as usize >= self.slots.len() {
             self.hand = 0;
         }
-        Some(gone.off)
+        Some(gone)
     }
 
     fn busy(&self, ci: usize) -> bool {
         self.range(ci).any(|i| self.slots[i].pinned())
     }
 
-    /// Give back one chunk, preferring `borrowed` ones. Used by the reclaim path, which must
-    /// have a borrowed one, and by the rebalance, which must not.
-    fn give(&mut self, borrowed: bool) -> Option<u64> {
+    /// Hand one loan back. `None` when this store holds no borrowed chunk it can part with.
+    fn give_loan(&mut self) -> Option<Loan> {
+        self.give(true)?.loan
+    }
+
+    /// Give up one chunk of the cache's own tail, as an offset. `None` when every chunk it
+    /// holds is on loan or has IO in flight.
+    ///
+    /// Kept apart from [`Store::give_loan`] because the two callers want opposite things: the
+    /// reclaim path must return media the allocator lent, and the rebalance must move media
+    /// the cache owns. A shared method taking a flag let either one ask for the wrong kind.
+    fn give_own(&mut self) -> Option<u64> {
+        Some(self.give(false)?.off)
+    }
+
+    /// The newest chunk that is or is not on loan, whichever was asked for, if it can move.
+    fn give(&mut self, borrowed: bool) -> Option<Chunk> {
         let mut ci = self.chunks.len();
         while ci > 0 {
             ci -= 1;
-            if self.chunks[ci].borrowed == borrowed
-                && let Some(off) = self.remove_chunk(ci)
+            if self.chunks[ci].loan.is_some() == borrowed
+                && let Some(c) = self.remove_chunk(ci)
             {
-                return Some(off);
+                return Some(c);
             }
         }
         None
@@ -808,7 +825,7 @@ pub fn open(alloc: &'static Allocator, cfg: &Config, cores: usize) -> (&'static 
                     for i in 0..len {
                         s.push_chunk(Chunk {
                             off: base + (next[k] + lo + i) * layout::CHUNK_BYTES,
-                            borrowed: false,
+                            loan: None,
                         });
                     }
                 }
@@ -1565,15 +1582,8 @@ impl Cache {
             .unwrap_or_default();
             if !idle.is_empty() {
                 for off in idle {
-                    self.place(
-                        k,
-                        &mut chunks[k],
-                        Chunk {
-                            off,
-                            borrowed: false,
-                        },
-                    )
-                    .await;
+                    self.place(k, &mut chunks[k], Chunk { off, loan: None })
+                        .await;
                 }
                 return;
             }
@@ -1590,15 +1600,8 @@ impl Cache {
         if held.saturating_sub(refund) + cost <= self.budget
             && let Some(off) = self.take(other, &mut chunks[other]).await
         {
-            self.place(
-                k,
-                &mut chunks[k],
-                Chunk {
-                    off,
-                    borrowed: false,
-                },
-            )
-            .await;
+            self.place(k, &mut chunks[k], Chunk { off, loan: None })
+                .await;
         }
     }
 
@@ -1632,7 +1635,7 @@ impl Cache {
     /// one. `None` when every chunk it holds is borrowed or has a write in flight.
     async fn take(&'static self, k: usize, chunks: &mut [u64]) -> Option<u64> {
         for core in self.order(k, chunks, true) {
-            let got = at(core, move |l| l.stores[k].give(false)).await;
+            let got = at(core, move |l| l.stores[k].give_own()).await;
             if got.is_some() {
                 chunks[core.index()] -= 1;
                 return got;
@@ -1651,10 +1654,10 @@ impl Cache {
     async fn borrow(&'static self, chunks: &mut [u64]) -> bool {
         for core in self.order(1, chunks, false) {
             let got = at(core, move |l| {
-                let off = self.alloc.lend()?;
+                let loan = self.alloc.lend()?;
                 l.stores[1].push_chunk(Chunk {
-                    off,
-                    borrowed: true,
+                    off: loan.offset(),
+                    loan: Some(loan),
                 });
                 Some(())
             })
@@ -1675,8 +1678,8 @@ impl Cache {
     /// that made it, which is the core asking. Touches this core's huge store and nothing
     /// else: no config, no pressure test, no hop, because the allocator has state borrowed
     /// around the call.
-    pub fn give_back(&self) -> Option<u64> {
-        here(|l| l.stores[1].give(true))
+    pub fn give_back(&self) -> Option<Loan> {
+        here(|l| l.stores[1].give_loan())
     }
 }
 
@@ -1864,7 +1867,7 @@ mod tests {
         for i in 0..n {
             st.push_chunk(Chunk {
                 off: (16 + i) * layout::CHUNK_BYTES,
-                borrowed: false,
+                loan: None,
             });
         }
         st
@@ -1940,8 +1943,8 @@ mod tests {
         }
         // Chunk 0 holds address 1. Removing it swaps the last chunk into the hole, so address
         // 3 changes index without changing identity.
-        let off = st.remove_chunk(0).unwrap();
-        assert_eq!(off, 16 * layout::CHUNK_BYTES);
+        let gone = st.remove_chunk(0).unwrap();
+        assert_eq!(gone.off, 16 * layout::CHUNK_BYTES);
         assert_eq!(st.chunks.len(), 2);
         assert_eq!(st.slots.len(), 2);
         assert!(st.find(1).is_none(), "the dropped chunk's entry is gone");
@@ -2045,23 +2048,23 @@ mod tests {
         assert!(!st.current(1, new));
     }
 
-    /// `give` answers only with the kind it was asked for: the reclaim path must get a
-    /// borrowed chunk and the rebalance must not.
+    /// The two hand-backs answer only with their own kind: the reclaim path must get media
+    /// the allocator lent, and the rebalance must get media the cache owns.
     #[test]
     fn give_returns_only_the_kind_asked_for() {
         let mut st = Store::new(Class::Huge);
         st.push_chunk(Chunk {
             off: 1 << 30,
-            borrowed: false,
+            loan: None,
         });
         st.push_chunk(Chunk {
             off: 2 << 30,
-            borrowed: true,
+            loan: Some(Loan::for_test(2 << 30)),
         });
-        assert_eq!(st.give(true), Some(2 << 30));
-        assert_eq!(st.give(true), None, "nothing borrowed is left");
-        assert_eq!(st.give(false), Some(1 << 30));
-        assert_eq!(st.give(false), None);
+        assert_eq!(st.give_loan().map(|l| l.offset()), Some(2 << 30));
+        assert!(st.give_loan().is_none(), "nothing borrowed is left");
+        assert_eq!(st.give_own(), Some(1 << 30));
+        assert_eq!(st.give_own(), None);
     }
 
     /// An empty slot is taken without asking, so a cold cache fills at full speed.
