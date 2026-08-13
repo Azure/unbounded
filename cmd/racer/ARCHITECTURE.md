@@ -111,17 +111,40 @@ live configuration versions. Each worker owns:
 - Its ublk queues and tag state.
 - Its current configuration pointer and per-version guard counts.
 - Cross-core request, task, and result slots.
+- A `CoreState`: its allocator shard, cache stores, consensus terms, and healing
+  cursor.
 
-The guards delay reclamation of resources referenced by old `Dataplane`s. They
-do not snapshot subsystem configuration: process-lifetime allocator, consensus,
-and cache objects have independently replaced live views.
+There is one configuration mechanism. The guards delay reclamation of resources
+referenced by old `Dataplane`s, and everything a reload replaces lives in the
+`Dataplane`, reached through a guard. Code already handed one narrows it with
+`Cfg::map`; code that is not, such as a closure running on another core,
+re-reads the live one there.
 
-Allocator, consensus, cache, and healing state is split into arrays indexed by
-worker. Mutable hot-path state is worker-local (`Cell`/`RefCell`), not protected
-by shared locks. `runtime::on_core` moves inline closures through an N-by-N
-matrix of SPSC rings. Full rings spill to a local outbox; io_uring `MSG_RING`
-wakes a sleeping destination. Dropping the result future does not prevent the
-destination closure from running.
+`CoreState` is the other half: what a core owns rather than what it reads. It is
+built while the plane is opened, handed to its worker before that worker takes
+traffic, and never swapped, so a reload replaces what a core reads and not what
+it owns. It is reached only through `runtime::with_core`, which runs a
+synchronous closure on the owning worker and hands it a `CoreCtx`. The context
+borrow is invariant and appears in no result type, so nothing borrowed from a
+core can leave the transaction, and because the closure cannot await, the worker
+cannot retire a configuration underneath it. Mutable hot-path state is therefore
+worker-local (`Cell`/`RefCell`) with no shared locks and, apart from the peer
+link table, no `unsafe impl Sync`.
+
+Both forms travel over an N-by-N matrix of SPSC rings. Full rings spill to a
+local outbox; io_uring `MSG_RING` wakes a sleeping destination. A core
+transaction completes inside the ring drain that delivered it, needing no task
+slot and no second visit from the destination's poll loop. `runtime::on_core`,
+for work that must await on the destination, parks a future there instead;
+dropping the result future does not prevent that future from running.
+
+Multi-step work whose steps land on different cores is held together by tokens
+rather than by call order. A reservation, a proposal, a quorum, a claimed cache
+slot, a cache read, a flush, a piece of a split page, an open cursor, a lent
+slot: each is a value that cannot be copied, must be used, and settles itself
+from a destructor if a future is dropped part-way. Where a destructor cannot do
+the work, because it cannot await, the type says so and the leak is bounded and
+documented rather than silent.
 
 Workers reap completions, run cross-core and ready work, process control and
 periodic work, flush submissions/completions, then spin, yield, or park.
@@ -549,6 +572,13 @@ process cannot enumerate from the inside: which messages arrive, which members
 can hear each other, and when a disk is lost. So a counterexample is a
 counterexample in the shipped code, and the rule cannot drift away from its
 proof without the proof failing to compile.
+
+Cancellation is modelled where it can strand something. The allocator's disk
+model takes the action of a flush being abandoned rather than retired, which is
+not the same as one failing: the kernel is not told to stop, so the copy is
+written or destroyed either way while nothing is left to record it. The model
+then asserts that a slab is marked busy exactly while a flush is in flight,
+which is the property the flush token's destructor exists to hold.
 
 The migration check is weaker than the rest, and deliberately so. RACER has no
 quorum barrier proving every source acceptor sealed and no durable gate proving
