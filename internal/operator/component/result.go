@@ -20,6 +20,12 @@ const (
 	ReasonDisabled       = "Disabled"
 	ReasonNoSites        = "NoSites"
 	ReasonReconcileError = "ReconcileError"
+
+	// ReasonBackendNotReady reports that a component withheld objects which
+	// direct apiserver traffic at a backend of its own, because that backend is
+	// not serving yet. The component is otherwise reconciled; what is missing is
+	// state it does not control and can only wait for.
+	ReasonBackendNotReady = "BackendNotReady"
 )
 
 // Result is the outcome of reconciling a single component for one pass. The

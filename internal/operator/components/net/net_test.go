@@ -5,14 +5,22 @@ package net
 
 import (
 	"context"
+	"encoding/base64"
+	"slices"
+	"strings"
 	"testing"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -21,19 +29,74 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-func testEnv(t *testing.T, objects ...client.Object) *component.Env {
+func newNetTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{
+		appsv1.AddToScheme,
+		corev1.AddToScheme,
+		discoveryv1.AddToScheme,
+		admissionregistrationv1.AddToScheme,
+		apiregistrationv1.AddToScheme,
+		unboundedv1alpha3.AddToScheme,
+	} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add to scheme: %v", err)
 		}
 	}
 
+	return scheme
+}
+
+func testEnv(t *testing.T, objects ...client.Object) *component.Env {
+	t.Helper()
+
 	return &component.Env{
-		Client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build(),
+		Client:    fake.NewClientBuilder().WithScheme(newNetTestScheme(t)).WithObjects(objects...).Build(),
 		Namespace: component.DefaultNamespace,
+	}
+}
+
+// testCA is the serving CA fixture. Its exact bytes matter only in that
+// stamping must reproduce them base64-encoded.
+var testCA = []byte("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----")
+
+// servingBackend is the state of a controller that is rolled out and answering.
+func servingBackend() backendState {
+	return backendState{caBundle: testCA, ready: true}
+}
+
+// servingObjects is the cluster state readBackendState reads as serving: a
+// published CA, a Deployment whose current spec has rolled out, and an
+// endpoint behind the Service.
+func servingObjects() []client.Object {
+	return []client.Object{
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: servingCAName},
+			Data:       map[string]string{servingCAKey: string(testCA)},
+		},
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:  component.DefaultNamespace,
+				Name:       controllerName,
+				Generation: 3,
+			},
+			Spec: appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
+			Status: appsv1.DeploymentStatus{
+				ObservedGeneration: 3,
+				UpdatedReplicas:    1,
+				AvailableReplicas:  1,
+			},
+		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: component.DefaultNamespace,
+				Name:      controllerName + "-abcde",
+				Labels:    map[string]string{discoveryv1.LabelServiceName: controllerName},
+			},
+			Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}}},
+		},
 	}
 }
 
@@ -105,7 +168,7 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 				}},
 			}}
 
-			if err := applyMutator(cfg, "net-hash")(obj); err != nil {
+			if err := applyMutator(cfg, "net-hash", servingBackend())(obj); err != nil {
 				t.Fatalf("applyMutator: %v", err)
 			}
 
@@ -131,7 +194,7 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator(cfg, "net-hash")(config); err != nil || config.Object != nil {
+	if err := applyMutator(cfg, "net-hash", servingBackend())(config); err != nil || config.Object != nil {
 		t.Fatalf("embedded net ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
 
@@ -139,7 +202,7 @@ func TestApplyMutatorStampsBothWorkloads(t *testing.T) {
 		"apiVersion": "apiextensions.k8s.io/v1", "kind": component.CRDKind,
 		"metadata": map[string]any{"name": "sites.unbounded-cloud.io"},
 	}}
-	if err := applyMutator(cfg, "net-hash")(crd); err != nil || crd.Object != nil {
+	if err := applyMutator(cfg, "net-hash", servingBackend())(crd); err != nil || crd.Object != nil {
 		t.Fatalf("CRD was not skipped: err=%v object=%#v", err, crd.Object)
 	}
 }
@@ -149,7 +212,9 @@ func TestReconcileRetainedWithNoSites(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: configName},
 		Data:       map[string]string{"config.yaml": "custom: retained"},
 	}
-	env, appliedHashes := retainedEnv(t, config)
+	// Serving, so this stays a test about retaining the config payload rather
+	// than about the registration gate.
+	env, appliedHashes := retainedEnv(t, append(servingObjects(), config)...)
 
 	res := Component{}.Reconcile(t.Context(), env, nil)
 	if !res.Ready || res.Err != nil {
@@ -174,11 +239,10 @@ func TestReconcileRetainedWithNoSites(t *testing.T) {
 }
 
 func TestReconcileRecreatesDeletedRetainedConfigWithNoSites(t *testing.T) {
-	retained := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
-		Namespace: component.DefaultNamespace,
-		Name:      controllerName,
-	}}
-	env, appliedHashes := retainedEnv(t, retained)
+	// servingObjects carries the retained controller Deployment, which is what
+	// makes this a retained installation, and makes it serving so the assertion
+	// stays about the recreated config.
+	env, appliedHashes := retainedEnv(t, servingObjects()...)
 
 	res := Component{}.Reconcile(t.Context(), env, nil)
 	if !res.Ready || res.Err != nil {
@@ -215,12 +279,7 @@ func TestReconcileDoesNotCreateFromNothingWithNoSites(t *testing.T) {
 func retainedEnv(t *testing.T, objects ...client.Object) (*component.Env, map[string]string) {
 	t.Helper()
 
-	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme} {
-		if err := add(scheme); err != nil {
-			t.Fatalf("add to scheme: %v", err)
-		}
-	}
+	scheme := newNetTestScheme(t)
 
 	appliedHashes := map[string]string{}
 	cl := fake.NewClientBuilder().
@@ -259,4 +318,626 @@ func retainedEnv(t *testing.T, objects ...client.Object) (*component.Env, map[st
 		Build()
 
 	return &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}, appliedHashes
+}
+
+// gateEnv records every object a reconcile applies, keyed by Kind/name, so a
+// test can assert on what was withheld as well as on what was written.
+func gateEnv(t *testing.T, objects ...client.Object) (*component.Env, map[string]*unstructured.Unstructured) {
+	t.Helper()
+
+	applied := map[string]*unstructured.Unstructured{}
+	scheme := newNetTestScheme(t)
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				object, ok := obj.(interface {
+					GetName() string
+					GetKind() string
+					UnstructuredContent() map[string]any
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				applied[object.GetKind()+"/"+object.GetName()] = &unstructured.Unstructured{
+					Object: object.UnstructuredContent(),
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	return &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}, applied
+}
+
+// site is the one Site that makes net reconcile at all.
+func site() []unboundedv1alpha3.Site {
+	return []unboundedv1alpha3.Site{{ObjectMeta: metav1.ObjectMeta{Name: "rack-a"}}}
+}
+
+// appliedRegistrations returns the recorded registrations, by name.
+func appliedRegistrations(applied map[string]*unstructured.Unstructured) []string {
+	var names []string
+
+	for key, obj := range applied {
+		if isBackendRegistration(obj) {
+			names = append(names, key)
+		}
+	}
+
+	slices.Sort(names)
+
+	return names
+}
+
+// TestReconcileWithholdsRegistrationsUntilTheBackendServes is the point of the
+// gate.
+//
+// A ValidatingWebhookConfiguration with failurePolicy: Ignore that points at a
+// backend which is not listening does not fail loudly, it silently stops
+// enforcing, and an APIService in the same state makes the aggregated API
+// return errors for a type the cluster believes is served. Neither is
+// detectable from the object itself, so the registration is not written until
+// something is behind the Service.
+func TestReconcileWithholdsRegistrationsUntilTheBackendServes(t *testing.T) {
+	rolledOut := func(mutate func(*appsv1.Deployment)) client.Object {
+		deployment, ok := servingObjects()[1].(*appsv1.Deployment)
+		if !ok {
+			t.Fatal("servingObjects[1] is not the controller Deployment")
+		}
+
+		mutate(deployment)
+
+		return deployment
+	}
+
+	cases := []struct {
+		name       string
+		objects    []client.Object
+		wantReason string
+	}{
+		{
+			name:       "no serving CA published",
+			objects:    nil,
+			wantReason: "has not published its serving CA",
+		},
+		{
+			name: "serving CA ConfigMap is empty",
+			objects: []client.Object{&corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: servingCAName},
+			}},
+			wantReason: "carries no " + servingCAKey,
+		},
+		{
+			name:       "controller Deployment does not exist",
+			objects:    servingObjects()[:1],
+			wantReason: "Deployment does not exist yet",
+		},
+		{
+			name: "controller Deployment is still rolling out",
+			objects: []client.Object{
+				servingObjects()[0],
+				rolledOut(func(d *appsv1.Deployment) { d.Status.UpdatedReplicas = 0 }),
+				servingObjects()[2],
+			},
+			wantReason: "is rolling out",
+		},
+		{
+			name: "controller Deployment has not been observed",
+			objects: []client.Object{
+				servingObjects()[0],
+				rolledOut(func(d *appsv1.Deployment) { d.Status.ObservedGeneration = 1 }),
+				servingObjects()[2],
+			},
+			wantReason: "has not been observed at its current generation",
+		},
+		{
+			name:       "no endpoint behind the Service",
+			objects:    servingObjects()[:2],
+			wantReason: "no endpoint is registered",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env, applied := gateEnv(t, tc.objects...)
+
+			res := Component{}.Reconcile(t.Context(), env, site())
+
+			if res.Ready || res.Err != nil {
+				t.Fatalf("Reconcile = %+v, want not ready without an error", res)
+			}
+
+			if res.Reason != component.ReasonBackendNotReady {
+				t.Fatalf("reason = %q, want %q", res.Reason, component.ReasonBackendNotReady)
+			}
+
+			if !strings.Contains(res.Message, tc.wantReason) {
+				t.Fatalf("message = %q, want it to mention %q", res.Message, tc.wantReason)
+			}
+
+			// Without a requeue the gate would wait for an event that never
+			// comes: readiness lives in Deployment status and Endpoints, and
+			// neither is watched.
+			if res.RequeueAfter != backendPollInterval {
+				t.Fatalf("RequeueAfter = %s, want %s", res.RequeueAfter, backendPollInterval)
+			}
+
+			if got := appliedRegistrations(applied); len(got) != 0 {
+				t.Fatalf("registered against a backend that is not serving: %v", got)
+			}
+
+			// The workloads are still applied: withholding registration must
+			// not withhold the thing that makes the backend come up.
+			for _, key := range []string{"Deployment/" + controllerName, "DaemonSet/" + nodeName} {
+				if applied[key] == nil {
+					t.Fatalf("%s was not applied; the backend can never become ready", key)
+				}
+			}
+		})
+	}
+}
+
+// TestReconcileRegistersAndStampsWhenTheBackendServes covers the other half:
+// once the backend serves, all three registrations go out carrying the CA.
+func TestReconcileRegistersAndStampsWhenTheBackendServes(t *testing.T) {
+	env, applied := gateEnv(t, servingObjects()...)
+
+	res := Component{}.Reconcile(t.Context(), env, site())
+	if !res.Ready || res.Err != nil {
+		t.Fatalf("Reconcile = %+v, want ready", res)
+	}
+
+	got := appliedRegistrations(applied)
+	if len(got) != len(registrations) {
+		t.Fatalf("applied registrations = %v, want %d of them", got, len(registrations))
+	}
+
+	want := base64.StdEncoding.EncodeToString(testCA)
+
+	for _, registration := range registrations {
+		obj := applied[registration.gvk.Kind+"/"+registration.name]
+		if obj == nil {
+			t.Fatalf("%s %s was not applied", registration.gvk.Kind, registration.name)
+		}
+
+		if !hasCABundle(obj) {
+			t.Fatalf("%s went out with an empty caBundle; the apiserver cannot verify the backend", registration.name)
+		}
+
+		for _, bundle := range caBundlesOf(t, obj) {
+			if bundle != want {
+				t.Fatalf("%s caBundle = %q, want the published CA", registration.name, bundle)
+			}
+		}
+	}
+}
+
+// TestReconcileStaysReadyWhenWithholdingChangesNothing pins the reporting rule.
+//
+// The controller is host-networked with maxSurge: 0, so it is briefly
+// unavailable by design on every upgrade. Reporting a withheld registration
+// that is already in place and usable would turn NetReady False on every net
+// rollout, which is noise rather than signal.
+func TestReconcileStaysReadyWhenWithholdingChangesNothing(t *testing.T) {
+	existing := existingRegistrations(t, base64.StdEncoding.EncodeToString(testCA))
+
+	// Serving CA published, but the Deployment is mid-rollout.
+	objects := append(existing, servingObjects()[0])
+
+	env, applied := gateEnv(t, objects...)
+
+	res := Component{}.Reconcile(t.Context(), env, site())
+	if !res.Ready || res.Err != nil {
+		t.Fatalf("Reconcile = %+v, want ready: withholding a registration that is already usable is not a status change", res)
+	}
+
+	if got := appliedRegistrations(applied); len(got) != 0 {
+		t.Fatalf("rewrote registrations while the backend was down: %v", got)
+	}
+}
+
+// TestReconcileReportsARegistrationWithAnEmptyCABundle is the case the no-flap
+// rule must not swallow: a registration that exists but carries no CA is the
+// broken state this gate prevents, and it stays visible until it can be fixed.
+func TestReconcileReportsARegistrationWithAnEmptyCABundle(t *testing.T) {
+	existing := existingRegistrations(t, "")
+
+	env, _ := gateEnv(t, append(existing, servingObjects()[0])...)
+
+	res := Component{}.Reconcile(t.Context(), env, site())
+	if res.Ready {
+		t.Fatal("a registration with an empty caBundle was reported as ready")
+	}
+
+	if res.Reason != component.ReasonBackendNotReady {
+		t.Fatalf("reason = %q, want %q", res.Reason, component.ReasonBackendNotReady)
+	}
+}
+
+// TestReconcileDoesNotGateAdmissionPolicies guards the scope of the gate.
+//
+// ValidatingAdmissionPolicies are evaluated inside the apiserver with no
+// backend to reach, so withholding them while the controller is down would
+// drop enforcement for no reason at all.
+func TestReconcileDoesNotGateAdmissionPolicies(t *testing.T) {
+	env, applied := gateEnv(t)
+
+	if res := (Component{}).Reconcile(t.Context(), env, site()); res.Ready {
+		t.Fatalf("Reconcile = %+v, want not ready with no backend", res)
+	}
+
+	var policies int
+
+	for key := range applied {
+		if strings.HasPrefix(key, "ValidatingAdmissionPolicy") {
+			policies++
+		}
+	}
+
+	if policies == 0 {
+		t.Fatal("admission policies were withheld along with the registrations; they have no backend to wait for")
+	}
+}
+
+// TestRegistrationIdentitiesMatchTheManifests keeps the gate's hardcoded
+// identities honest. The gate looks registrations up in the cluster before it
+// applies anything, so it cannot learn their names from the manifests it is
+// about to apply; this fails if a manifest is renamed out from under it.
+func TestRegistrationIdentitiesMatchTheManifests(t *testing.T) {
+	env, applied := gateEnv(t, servingObjects()...)
+
+	if res := (Component{}).Reconcile(t.Context(), env, site()); !res.Ready {
+		t.Fatalf("Reconcile = %+v, want ready", res)
+	}
+
+	for key, obj := range applied {
+		if !isBackendRegistration(obj) {
+			continue
+		}
+
+		if !slices.ContainsFunc(registrations, func(r struct {
+			gvk  schema.GroupVersionKind
+			name string
+		},
+		) bool {
+			return r.gvk.Kind == obj.GetKind() && r.name == obj.GetName()
+		}) {
+			t.Fatalf("manifest ships registration %s which the gate does not know about; it would never be withheld", key)
+		}
+	}
+
+	if len(appliedRegistrations(applied)) != len(registrations) {
+		t.Fatalf("the gate knows about %d registrations but the manifests ship %d",
+			len(registrations), len(appliedRegistrations(applied)))
+	}
+}
+
+func TestRolloutComplete(t *testing.T) {
+	cases := []struct {
+		name       string
+		deployment appsv1.Deployment
+		wantDone   bool
+		wantReason string
+	}{
+		{
+			name: "rolled out",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, UpdatedReplicas: 1, AvailableReplicas: 1,
+				},
+			},
+			wantDone: true,
+		},
+		{
+			// A Deployment scaled to zero is never going to serve, and its
+			// counters all read as satisfied, so it has to be caught first.
+			name: "scaled to zero",
+			deployment: appsv1.Deployment{
+				Spec:   appsv1.DeploymentSpec{Replicas: ptr.To(int32(0))},
+				Status: appsv1.DeploymentStatus{ObservedGeneration: 1},
+			},
+			wantReason: "scaled to zero",
+		},
+		{
+			name: "status is stale",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 5},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 4, UpdatedReplicas: 1, AvailableReplicas: 1,
+				},
+			},
+			wantReason: "has not been observed",
+		},
+		{
+			// An old replica still being available is the case the gate must
+			// not accept: the CA and Service reference being registered belong
+			// to the new spec.
+			name: "old replica still serving",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, UpdatedReplicas: 0, AvailableReplicas: 1,
+				},
+			},
+			wantReason: "is rolling out",
+		},
+		{
+			name: "updated but not available",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, UpdatedReplicas: 1, AvailableReplicas: 0,
+				},
+			},
+			wantReason: "is rolling out",
+		},
+		{
+			name: "nil replicas defaults to one",
+			deployment: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1, UpdatedReplicas: 1, AvailableReplicas: 1,
+				},
+			},
+			wantDone: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, done := rolloutComplete(&tc.deployment)
+
+			if done != tc.wantDone {
+				t.Fatalf("rolloutComplete = %v (%q), want %v", done, reason, tc.wantDone)
+			}
+
+			if !tc.wantDone && !strings.Contains(reason, tc.wantReason) {
+				t.Fatalf("reason = %q, want it to mention %q", reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestServiceHasEndpointFallsBackToEndpoints covers the legacy path. The
+// controller writes both objects, and an apiserver old enough to resolve an
+// APIService through Endpoints alone is why it still does.
+func TestServiceHasEndpointFallsBackToEndpoints(t *testing.T) {
+	notReady := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: component.DefaultNamespace,
+			Name:      controllerName + "-stale",
+			Labels:    map[string]string{discoveryv1.LabelServiceName: controllerName},
+		},
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{"10.0.0.9"},
+			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(false)},
+		}},
+	}
+
+	endpoints := &corev1.Endpoints{ //nolint:staticcheck // exercising the legacy path on purpose
+		ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: controllerName},
+		Subsets: []corev1.EndpointSubset{{ //nolint:staticcheck // exercising the legacy path on purpose
+			Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+		}},
+	}
+
+	env := testEnv(t, notReady, endpoints)
+
+	serving, err := serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace)
+	if err != nil {
+		t.Fatalf("serviceHasEndpoint: %v", err)
+	}
+
+	if !serving {
+		t.Fatal("a ready legacy Endpoints subset was not recognised as serving")
+	}
+
+	// A not-ready slice with no legacy Endpoints must not count.
+	bare := testEnv(t, notReady)
+
+	serving, err = serviceHasEndpoint(t.Context(), bare.LiveReader(), bare.Namespace)
+	if err != nil {
+		t.Fatalf("serviceHasEndpoint: %v", err)
+	}
+
+	if serving {
+		t.Fatal("an endpoint whose Ready condition is false was counted as serving")
+	}
+}
+
+func TestStampCABundle(t *testing.T) {
+	want := base64.StdEncoding.EncodeToString(testCA)
+
+	apiService := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiregistration.k8s.io/v1", "kind": "APIService",
+		"metadata": map[string]any{"name": "v1alpha1.status.net.unbounded-cloud.io"},
+		"spec":     map[string]any{"group": "status.net.unbounded-cloud.io"},
+	}}
+
+	if err := stampCABundle(apiService, testCA); err != nil {
+		t.Fatalf("stampCABundle: %v", err)
+	}
+
+	if got, _, _ := unstructured.NestedString(apiService.Object, "spec", "caBundle"); got != want {
+		t.Fatalf("APIService caBundle = %q, want %q", got, want)
+	}
+
+	webhook := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingWebhookConfiguration",
+		"metadata": map[string]any{"name": "unbounded-net-validating-webhook"},
+		"webhooks": []any{
+			map[string]any{"name": "a.example.com", "clientConfig": map[string]any{"service": map[string]any{"name": "svc"}}},
+			map[string]any{"name": "b.example.com", "clientConfig": map[string]any{"service": map[string]any{"name": "svc"}}},
+		},
+	}}
+
+	if err := stampCABundle(webhook, testCA); err != nil {
+		t.Fatalf("stampCABundle: %v", err)
+	}
+
+	// Every webhook in the configuration needs it, not just the first.
+	for _, bundle := range caBundlesOf(t, webhook) {
+		if bundle != want {
+			t.Fatalf("webhook caBundle = %q, want %q", bundle, want)
+		}
+	}
+
+	// A registration that declares no webhooks is a manifest bug, and silently
+	// stamping nothing would hide it.
+	empty := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingWebhookConfiguration",
+		"metadata": map[string]any{"name": "broken"},
+	}}
+	if err := stampCABundle(empty, testCA); err == nil {
+		t.Fatal("stamping a configuration with no webhooks must be an error")
+	}
+}
+
+func TestHasCABundle(t *testing.T) {
+	cases := []struct {
+		name string
+		obj  *unstructured.Unstructured
+		want bool
+	}{
+		{
+			name: "APIService with a bundle",
+			obj: &unstructured.Unstructured{Object: map[string]any{
+				"kind": "APIService", "spec": map[string]any{"caBundle": "abc"},
+			}},
+			want: true,
+		},
+		{
+			name: "APIService without one",
+			obj:  &unstructured.Unstructured{Object: map[string]any{"kind": "APIService", "spec": map[string]any{}}},
+		},
+		{
+			name: "webhook configuration with every bundle set",
+			obj: &unstructured.Unstructured{Object: map[string]any{
+				"kind": "ValidatingWebhookConfiguration",
+				"webhooks": []any{
+					map[string]any{"clientConfig": map[string]any{"caBundle": "abc"}},
+					map[string]any{"clientConfig": map[string]any{"caBundle": "abc"}},
+				},
+			}},
+			want: true,
+		},
+		{
+			// One unusable webhook makes the configuration unusable, so the
+			// emptiest bundle decides.
+			name: "webhook configuration with one bundle missing",
+			obj: &unstructured.Unstructured{Object: map[string]any{
+				"kind": "ValidatingWebhookConfiguration",
+				"webhooks": []any{
+					map[string]any{"clientConfig": map[string]any{"caBundle": "abc"}},
+					map[string]any{"clientConfig": map[string]any{}},
+				},
+			}},
+		},
+		{
+			name: "webhook configuration with no webhooks",
+			obj: &unstructured.Unstructured{Object: map[string]any{
+				"kind": "ValidatingWebhookConfiguration",
+			}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasCABundle(tc.obj); got != tc.want {
+				t.Fatalf("hasCABundle = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// existingRegistrations builds the three registrations as they would already
+// exist in a cluster, each carrying the given caBundle.
+func existingRegistrations(t *testing.T, caBundle string) []client.Object {
+	t.Helper()
+
+	decoded, err := base64.StdEncoding.DecodeString(caBundle)
+	if err != nil {
+		t.Fatalf("decode caBundle fixture: %v", err)
+	}
+
+	clientConfig := admissionregistrationv1.WebhookClientConfig{
+		Service:  &admissionregistrationv1.ServiceReference{Namespace: component.DefaultNamespace, Name: controllerName},
+		CABundle: decoded,
+	}
+
+	sideEffects := admissionregistrationv1.SideEffectClassNone
+
+	return []client.Object{
+		&admissionregistrationv1.ValidatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-validating-webhook"},
+			Webhooks: []admissionregistrationv1.ValidatingWebhook{{
+				Name:                    "a.unbounded-cloud.io",
+				ClientConfig:            clientConfig,
+				SideEffects:             &sideEffects,
+				AdmissionReviewVersions: []string{"v1"},
+			}},
+		},
+		&admissionregistrationv1.MutatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{Name: "unbounded-net-mutating-webhook"},
+			Webhooks: []admissionregistrationv1.MutatingWebhook{{
+				Name:                    "b.unbounded-cloud.io",
+				ClientConfig:            clientConfig,
+				SideEffects:             &sideEffects,
+				AdmissionReviewVersions: []string{"v1"},
+			}},
+		},
+		&apiregistrationv1.APIService{
+			ObjectMeta: metav1.ObjectMeta{Name: "v1alpha1.status.net.unbounded-cloud.io"},
+			Spec: apiregistrationv1.APIServiceSpec{
+				Group:    "status.net.unbounded-cloud.io",
+				Version:  "v1alpha1",
+				CABundle: decoded,
+				Service: &apiregistrationv1.ServiceReference{
+					Namespace: component.DefaultNamespace,
+					Name:      controllerName,
+				},
+			},
+		},
+	}
+}
+
+// caBundlesOf returns every CA bundle a registration carries.
+func caBundlesOf(t *testing.T, obj *unstructured.Unstructured) []string {
+	t.Helper()
+
+	if obj.GetKind() == "APIService" {
+		bundle, _, _ := unstructured.NestedString(obj.Object, "spec", "caBundle")
+
+		return []string{bundle}
+	}
+
+	webhooks, _, _ := unstructured.NestedSlice(obj.Object, "webhooks")
+
+	bundles := make([]string, 0, len(webhooks))
+
+	for i := range webhooks {
+		webhook, ok := webhooks[i].(map[string]any)
+		if !ok {
+			t.Fatalf("webhooks[%d] is not an object", i)
+		}
+
+		clientConfig, ok := webhook["clientConfig"].(map[string]any)
+		if !ok {
+			t.Fatalf("webhooks[%d] has no clientConfig", i)
+		}
+
+		bundle, _ := clientConfig["caBundle"].(string)
+		bundles = append(bundles, bundle)
+	}
+
+	return bundles
 }

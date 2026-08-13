@@ -10,6 +10,7 @@ package net
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -66,8 +67,32 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, applyMutator(env.Config, configHash)); err != nil {
+	// The backend state is read once, before anything is applied, so the same
+	// answer decides both what this pass writes and what it reports.
+	backend, err := readBackendState(ctx, env)
+	if err != nil {
 		return component.Failed(err)
+	}
+
+	// Which registrations are worth reporting has to be settled before the
+	// apply, because the apply is what changes them.
+	var pending []string
+
+	if !backend.ready {
+		if pending, err = pendingRegistrations(ctx, env); err != nil {
+			return component.Failed(err)
+		}
+	}
+
+	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, applyMutator(env.Config, configHash, backend)); err != nil {
+		return component.Failed(err)
+	}
+
+	if len(pending) > 0 {
+		return component.NotReadyAfter(component.ReasonBackendNotReady,
+			fmt.Sprintf("holding back %s until the controller is serving: %s",
+				strings.Join(pending, ", "), backend.reason),
+			backendPollInterval)
 	}
 
 	return component.Reconciled()
@@ -76,8 +101,12 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 // SetupWatches reconciles net on changes to its config payload and on
 // create/delete/generation changes of its managed workloads.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
+	// The serving CA is watched alongside the config because the registration
+	// gate cannot proceed without it: when the controller publishes it the
+	// operator should stamp and register straight away rather than wait out
+	// backendPollInterval.
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingletonAndAllSites(),
-		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName))))
+		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, servingCAName))))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
@@ -110,9 +139,11 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 	return false, nil
 }
 
-// applyMutator skips the separately reconciled ConfigMap and stamps its exact
-// payload hash on both net workloads so config changes roll them together.
-func applyMutator(cfg component.Config, configHash string) func(*unstructured.Unstructured) error {
+// applyMutator skips the separately reconciled ConfigMap, stamps its exact
+// payload hash on both net workloads so config changes roll them together, and
+// gates the registrations that point at the controller Service on that
+// controller actually serving.
+func applyMutator(cfg component.Config, configHash string, backend backendState) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
 		if obj.GetKind() == component.CRDKind {
 			obj.Object = nil
@@ -124,6 +155,23 @@ func applyMutator(cfg component.Config, configHash string) func(*unstructured.Un
 			obj.Object = nil
 
 			return nil
+		}
+
+		if isBackendRegistration(obj) {
+			// Withholding is unconditional while the backend is down, whether
+			// or not a registration is already there. There is no CA to stamp,
+			// so an apply could only either change nothing or overwrite a
+			// working registration with one whose caBundle is empty, and an
+			// empty caBundle is exactly the state that makes a webhook stop
+			// enforcing and an APIService fail. Whatever is in the cluster is
+			// left alone until the controller is serving again.
+			if !backend.ready {
+				obj.Object = nil
+
+				return nil
+			}
+
+			return stampCABundle(obj, backend.caBundle)
 		}
 
 		if (obj.GetKind() == "Deployment" && obj.GetName() == controllerName) ||

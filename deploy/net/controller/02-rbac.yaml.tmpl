@@ -71,16 +71,22 @@ rules:
     resources: ["subjectaccessreviews"]
     verbs: ["create"]
   # ValidatingWebhookConfigurations: inject caBundle on startup.
+  #
+  # The operator now stamps the caBundle when it creates these, so on a current
+  # install the controller's own injection finds nothing to change. It is kept
+  # for the upgrade case: a controller running under an operator too old to
+  # stamp still has to inject its own CA, and it is the only writer of the
+  # rotated value.
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["validatingwebhookconfigurations"]
     resourceNames: ["unbounded-net-validating-webhook"]
     verbs: ["get", "update"]
-  # MutatingWebhookConfigurations: inject caBundle on startup.
+  # MutatingWebhookConfigurations: inject caBundle on startup, as above.
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["mutatingwebhookconfigurations"]
     resourceNames: ["unbounded-net-mutating-webhook"]
     verbs: ["get", "update"]
-  # APIServices: inject caBundle on startup.
+  # APIServices: inject caBundle on startup, as above.
   - apiGroups: ["apiregistration.k8s.io"]
     resources: ["apiservices"]
     resourceNames: ["v1alpha1.status.net.unbounded-cloud.io"]
