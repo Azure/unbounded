@@ -78,6 +78,7 @@ metrics! {
     heal_failed:             "racer_heal_repair_total"            r#"{result="failed"}"#       Counter "Pages repaired by anti-entropy, by outcome.",
     heal_oversized:          "racer_heal_oversized_total"         ""                           Counter "Sweeps cut short because the divergence was too large.",
     heal_dropped:            "racer_heal_dropped_total"           ""                           Counter "Registers given back after a group moved off this node.",
+    heal_stalled:            "racer_heal_stalled_total"           ""                           Counter "Anti-entropy sweeps abandoned for running too long. Nonzero means maintenance is waiting on something that never answers.",
     heal_replaying:          "racer_heal_groups_replaying"        ""                           Gauge   "Groups this node is replaying into. Nonzero means a group is running two of three.",
     heal_shedding:           "racer_heal_groups_shedding"         ""                           Gauge   "Groups this node still holds registers for but is no longer a member of.",
 

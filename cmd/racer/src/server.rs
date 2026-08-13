@@ -333,6 +333,7 @@ fn sample(d: &Dataplane) {
         heal_failed: h.failed,
         heal_oversized: h.oversized,
         heal_dropped: h.dropped,
+        heal_stalled: h.stalled,
         cache_hits_small: c.per[0].hits,
         cache_hits_huge: c.per[1].hits,
         cache_misses_small: c.per[0].misses,
