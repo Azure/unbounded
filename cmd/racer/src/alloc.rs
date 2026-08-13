@@ -455,24 +455,29 @@ impl Allocator {
             self.reserve_in(&mut c.shard, addr, kind, class, Some(guard), ballot)
         })
         .await?;
-        let crc = self.write_page(addr, class, t, page).await?;
+        let (ticket, crc) = self.write_page(addr, class, t, page).await?;
         Ok(Pending {
             addr,
             class,
-            ticket: t,
+            ticket,
             crc,
         })
     }
 
-    /// Make the page durable behind a ticket we already hold, giving the slot back if
-    /// the device write fails. Returns the checksum the entry will carry.
+    /// Make the page durable behind a ticket we already hold, handing it back with the
+    /// checksum the entry will carry, or spending it on the slot's return if the device
+    /// write fails.
+    ///
+    /// The ticket goes in and comes out because the two outcomes owe different things: a
+    /// page on the device still owes an entry, and a page that never landed owes the slot.
+    /// Taking it by value is what makes the caller unable to hold one across the failure.
     async fn write_page(
         &'static self,
         addr: GlobalAddr,
         class: Class,
         t: Ticket,
         page: &PoolBuf,
-    ) -> Result<u32, Status> {
+    ) -> Result<(Ticket, u32), Status> {
         let crc = layout::page_crc(addr.0, t.version, page);
         let off = self.geo.slot_off(class, t.slot);
         if self
@@ -485,7 +490,7 @@ impl Allocator {
             at(owner, move |c| self.unreserve_in(&mut c.shard, class, t)).await;
             return Err(Status::Io);
         }
-        Ok(crc)
+        Ok((t, crc))
     }
 
     /// [`begin_small`](Self::begin_small) for the 4 MiB class.
@@ -534,12 +539,13 @@ impl Allocator {
     pub async fn finish(&'static self, p: Pending) -> Result<u64, Status> {
         let (addr, class, t, crc) = (p.addr, p.class, p.ticket, p.crc);
         let owner = self.owner(addr, class);
+        let version = t.version;
         let done = runtime::on_core(owner.index(), move || async move {
             self.commit(addr, class, t, crc).await
         })
         .await?;
         if done {
-            Ok(t.version)
+            Ok(version)
         } else {
             Err(Status::Conflict { current: 0 })
         }
@@ -598,13 +604,14 @@ impl Allocator {
         t: Ticket,
         page: &PoolBuf,
     ) -> Result<Option<u64>, Status> {
-        let crc = self.write_page(addr, class, t, page).await?;
+        let (t, crc) = self.write_page(addr, class, t, page).await?;
         let owner = self.owner(addr, class);
+        let version = t.version;
         let done = runtime::on_core(owner.index(), move || async move {
             self.commit(addr, class, t, crc).await
         })
         .await?;
-        Ok(done.then_some(t.version))
+        Ok(done.then_some(version))
     }
 
     /// The 4 MiB member side. With no checksum, ordering is the only defence against a
@@ -658,11 +665,12 @@ impl Allocator {
             at(owner, move |c| self.unreserve_in(&mut c.shard, class, t)).await;
             return Err(Status::Io);
         }
+        let version = t.version;
         let done = runtime::on_core(owner.index(), move || async move {
             self.commit(addr, class, t, 0).await
         })
         .await?;
-        Ok(done.then_some(t.version))
+        Ok(done.then_some(version))
     }
 
     /// One piece of a 4 MiB page a transport split. Pieces go straight into the slot the
@@ -691,11 +699,11 @@ impl Allocator {
         }
         let key = (guard, ballot.raw(), proposer);
         let owner = self.owner(addr, class);
-        let t = at(owner, move |c| {
+        let slot = at(owner, move |c| {
             self.open_parts(c, addr, kind, class, key, guard, ballot)
         })
         .await?;
-        let dst = self.geo.slot_off(class, t.slot) + off as u64;
+        let dst = self.geo.slot_off(class, slot) + off as u64;
         if self
             .disk
             .write(dst, buf, Durability::Durable)
@@ -727,6 +735,9 @@ impl Allocator {
     }
 
     /// Find or start an assembly, counting the piece about to be written. Owner core only.
+    ///
+    /// Answers with the slot rather than the ticket that holds it: the assembly keeps the
+    /// ticket until it is whole or dropped, and a piece only needs somewhere to land.
     fn open_parts(
         &self,
         c: &mut Core,
@@ -736,11 +747,11 @@ impl Allocator {
         key: PartsKey,
         guard: u64,
         ballot: Ballot,
-    ) -> Result<Ticket, Status> {
+    ) -> Result<u32, Status> {
         if let Some(i) = find_parts(c, addr, key) {
             let p = &mut c.parts[i];
             p.busy += 1;
-            return Ok(p.ticket);
+            return Ok(p.ticket.slot);
         }
         let t = self.reserve_in(&mut c.shard, addr, kind, class, Some(guard), ballot)?;
         if c.parts.len() >= HUGE_PARTS {
@@ -753,6 +764,7 @@ impl Allocator {
             let old = c.parts.remove(i);
             self.unreserve_in(&mut c.shard, class, old.ticket);
         }
+        let slot = t.slot;
         c.parts.push(Parts {
             addr,
             key,
@@ -761,7 +773,7 @@ impl Allocator {
             have: [0; (layout::HUGE_PAGE / layout::SMALL_PAGE / 64) as usize],
             blocks: 0,
         });
-        Ok(t)
+        Ok(slot)
     }
 
     /// Record blocks now durable, and take the assembly out once whole. Owner core only.
@@ -867,7 +879,7 @@ impl Allocator {
             return Ok(false);
         };
         if replace_equal {
-            let crc = self.write_page(addr, class, t, page).await?;
+            let (t, crc) = self.write_page(addr, class, t, page).await?;
             let owner = self.owner(addr, class);
             return runtime::on_core(owner.index(), move || {
                 Box::pin(self.commit_replace_equal(addr, class, t, crc))
