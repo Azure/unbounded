@@ -172,6 +172,66 @@ func TestValidate_RequiresUpstream(t *testing.T) {
 	}
 }
 
+func TestValidate_UpstreamAuthenticationModes(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		registry UpstreamRegistry
+		wantErr  string
+	}{
+		{name: "delegated", registry: UpstreamRegistry{Name: "r", Endpoint: "https://r", AuthMode: UpstreamAuthDelegated}},
+		{name: "anonymous https", registry: UpstreamRegistry{Name: "r", Endpoint: "https://r", AuthMode: UpstreamAuthAnonymous}},
+		{name: "anonymous http", registry: UpstreamRegistry{Name: "r", Endpoint: "http://r", AuthMode: UpstreamAuthAnonymous}},
+		{name: "shared", registry: UpstreamRegistry{Name: "r", Endpoint: "https://r", AuthMode: UpstreamAuthShared, CredentialsPath: "/creds"}},
+		{name: "delegated credentials", registry: UpstreamRegistry{Name: "r", Endpoint: "https://r", AuthMode: UpstreamAuthDelegated, CredentialsPath: "/creds"}, wantErr: "credentials_path"},
+		{name: "shared missing credentials", registry: UpstreamRegistry{Name: "r", Endpoint: "https://r", AuthMode: UpstreamAuthShared}, wantErr: "credentials_path"},
+		{name: "delegated http", registry: UpstreamRegistry{Name: "r", Endpoint: "http://r", AuthMode: UpstreamAuthDelegated}, wantErr: "requires https"},
+		{name: "shared http", registry: UpstreamRegistry{Name: "r", Endpoint: "http://r", AuthMode: UpstreamAuthShared, CredentialsPath: "/creds"}, wantErr: "requires https"},
+		{name: "unknown", registry: UpstreamRegistry{Name: "r", Endpoint: "https://r", AuthMode: "mystery"}, wantErr: "auth_mode"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := NewDefault()
+			config.UpstreamRegistries = []UpstreamRegistry{test.registry}
+
+			err := config.Validate()
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("want %q error, got %v", test.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestValidate_AllowsExplicitlyUnconfiguredAgent(t *testing.T) {
+	c := NewDefault()
+	c.AllowNoUpstreamRegistries = true
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate explicitly unconfigured agent: %v", err)
+	}
+}
+
+func TestAllowNoUpstreamRegistriesIsFlagOnly(t *testing.T) {
+	c := NewDefault()
+	if err := c.LoadYAML(strings.NewReader("allow_no_upstream_registries: true\n")); err == nil {
+		t.Fatal("standalone empty-registry opt-in was accepted from YAML")
+	}
+
+	c = NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--allow-no-upstream-registries=true"}); err != nil {
+		t.Fatalf("parse standalone opt-in: %v", err)
+	}
+
+	if !c.AllowNoUpstreamRegistries {
+		t.Fatal("standalone empty-registry flag did not take effect")
+	}
+}
+
 func TestValidate_MirrorListenMustBeLoopback(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}

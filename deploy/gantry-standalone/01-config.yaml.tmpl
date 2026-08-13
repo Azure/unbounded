@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gantry-standalone-config
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/managed-by: gantryctl
+data:
+  registry-auth.json: "{}"
+  config.yaml: |
+    mirror_listen: "0.0.0.0:5000"
+    mirror_bind_allow_non_loopback: true
+    transfer_listen: "0.0.0.0:5001"
+    metrics_listen: "0.0.0.0:9095"
+    libp2p_listen:
+      - "/ip4/0.0.0.0/tcp/4001"
+      - "/ip4/0.0.0.0/udp/4001/quic-v1"
+    libp2p_identity_path: "/var/lib/gantry-standalone/libp2p/identity.key"
+    members_label_selector: "app.kubernetes.io/name=gantry"
+    storage_mode: "containerd"
+    containerd_socket: "/run/containerd/containerd.sock"
+    containerd_namespace: "k8s.io"
+    upstream_registries: []
+    log_level: "info"
+    log_format: "json"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gantry-standalone-node-routes
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: gantryctl
+data:
+  registries.json: '{"registries":[]}'

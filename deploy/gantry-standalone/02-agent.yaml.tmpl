@@ -1,0 +1,165 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-standalone
+  namespace: {{ .Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/managed-by: gantryctl
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+      app.kubernetes.io/instance: standalone
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry
+        app.kubernetes.io/instance: standalone
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/managed-by: gantryctl
+      annotations:
+        gantryctl.io/config-hash: initial
+    spec:
+      serviceAccountName: gantry-standalone
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: chown-hostpaths
+          image: mcr.microsoft.com/cbl-mariner/busybox:2.0
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "chown -R 65532:65532 /var/lib/gantry-standalone/libp2p && chmod 0700 /var/lib/gantry-standalone/libp2p"]
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: libp2p
+              mountPath: /var/lib/gantry-standalone/libp2p
+      containers:
+        - name: gantry
+          image: {{ .Image }}
+          imagePullPolicy: IfNotPresent
+          args: ["agent", "--config=/etc/gantry/config.yaml", "--allow-no-upstream-registries=true"]
+          env:
+            - name: GANTRY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GANTRY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GANTRY_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: GANTRY_MEMBERS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: mirror
+              containerPort: 5000
+              hostPort: 5000
+              hostIP: 127.0.0.1
+              protocol: TCP
+            - name: transfer
+              containerPort: 5001
+              protocol: TCP
+            - name: libp2p-tcp
+              containerPort: 4001
+              protocol: TCP
+            - name: libp2p-quic
+              containerPort: 4001
+              protocol: UDP
+            - name: metrics
+              containerPort: 9095
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 1Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: libp2p
+              mountPath: /var/lib/gantry-standalone/libp2p
+            - name: config
+              mountPath: /etc/gantry
+              readOnly: true
+            - name: registry-creds
+              mountPath: /etc/gantry/registry
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: containerd-socket
+              mountPath: /run/containerd/containerd.sock
+      volumes:
+        - name: libp2p
+          hostPath:
+            path: /var/lib/gantry-standalone/libp2p
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: gantry-standalone-config
+        - name: registry-creds
+          secret:
+            secretName: gantry-standalone-registry-credentials
+            optional: true
+        - name: tmp
+          emptyDir: {}
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket

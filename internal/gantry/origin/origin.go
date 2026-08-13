@@ -14,9 +14,9 @@
 // credentials, the client discovers the upstream /v2/ challenge for containerd.
 // An optional "username:password" file retains the legacy shared-identity flow.
 // - Failure classification: maps HTTP status and network errors to
-// ifaces.FailureClass for the design doc propagation. Tag-resolution requests are
-// not handled here (the mirror returns 503 on tag manifests so
-// containerd falls through to origin directly - the design doc / the design doc).
+// ifaces.FailureClass for the design doc propagation. Explicit shared-auth
+// registries resolve tag manifests here; delegated and anonymous modes keep
+// containerd's direct-origin tag fallthrough.
 //
 // Out of scope for (lands later):
 //
@@ -118,7 +118,11 @@ func WithByteMetrics(onBytesRead func(kind string, bytes int64)) Option {
 // New builds a Client from the operator config. Returns an error if any
 // upstream credentials file cannot be read.
 func New(cfg *config.Config, opts ...Option) (*Client, error) {
-	if cfg == nil || len(cfg.UpstreamRegistries) == 0 {
+	if cfg == nil {
+		return nil, errors.New("origin: config is nil")
+	}
+
+	if len(cfg.UpstreamRegistries) == 0 && !cfg.AllowNoUpstreamRegistries {
 		return nil, errors.New("origin: at least one upstream registry required")
 	}
 
@@ -306,6 +310,44 @@ func (c *Client) Head(ctx context.Context, ref ifaces.OriginRef) (int64, string,
 	return r.head(ctx, ref)
 }
 
+// FetchManifest fetches a tag-addressed manifest using this registry client's
+// configured identity. It is used only by the mirror's explicit shared-auth
+// mode; delegated and anonymous tag requests continue to fall through to
+// containerd's origin client.
+func (c *Client) FetchManifest(ctx context.Context, method, registryName, repository, reference string) (*http.Response, error) {
+	if method != http.MethodGet && method != http.MethodHead {
+		return nil, fmt.Errorf("origin: unsupported manifest method %q", method)
+	}
+
+	if err := oci.ValidateRepositoryName(repository); err != nil {
+		return nil, &ifaces.OriginError{Ref: ifaces.OriginRef{Registry: registryName, Repository: repository, Kind: ifaces.KindManifest}, Class: ifaces.FailureNotFound, Err: err}
+	}
+
+	if err := oci.ValidateTag(reference); err != nil {
+		return nil, &ifaces.OriginError{Ref: ifaces.OriginRef{Registry: registryName, Repository: repository, Kind: ifaces.KindManifest}, Class: ifaces.FailureNotFound, Err: err}
+	}
+
+	r, ok := c.registries[registryName]
+	if !ok {
+		return nil, &ifaces.OriginError{Ref: ifaces.OriginRef{Registry: registryName, Repository: repository, Kind: ifaces.KindManifest}, Class: ifaces.FailureNotFound, Err: fmt.Errorf("unknown registry %q", registryName)}
+	}
+
+	url := r.base.String() + "/v2/" + repository + "/manifests/" + reference
+
+	resp, err := r.do(ctx, method, url)
+	if err != nil {
+		return nil, &ifaces.OriginError{Ref: ifaces.OriginRef{Registry: registryName, Repository: repository, Kind: ifaces.KindManifest}, Class: classOf(err), Err: err}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+		return nil, r.classify(ifaces.OriginRef{Registry: registryName, Repository: repository, Kind: ifaces.KindManifest}, resp)
+	}
+
+	return resp, nil
+}
+
 // Compile-time check.
 var _ ifaces.OriginPuller = (*Client)(nil)
 
@@ -349,12 +391,14 @@ const (
 )
 
 func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
-	u, err := url.Parse(ur.Endpoint)
+	endpoint := strings.TrimRight(ur.Endpoint, "/")
+
+	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("parse endpoint: %w", err)
 	}
 
-	if u.Scheme != "http" && u.Scheme != "https" {
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("endpoint %q: scheme must be http or https", ur.Endpoint)
 	}
 

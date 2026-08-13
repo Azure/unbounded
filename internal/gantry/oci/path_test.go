@@ -132,6 +132,20 @@ func TestParseV2Path(t *testing.T) {
 	}
 }
 
+func TestValidateTag(t *testing.T) {
+	for _, tag := range []string{"latest", "v1.2.3", "_staging", "UPPER"} {
+		if err := oci.ValidateTag(tag); err != nil {
+			t.Errorf("ValidateTag(%q): %v", tag, err)
+		}
+	}
+
+	for _, tag := range []string{"", ".bad", "bad/tag", strings.Repeat("a", 129)} {
+		if err := oci.ValidateTag(tag); err == nil {
+			t.Errorf("ValidateTag(%q) unexpectedly succeeded", tag)
+		}
+	}
+}
+
 func TestValidateRepositoryName(t *testing.T) {
 	valid := []string{
 		"nginx",

@@ -249,6 +249,11 @@ type Config struct {
 	// one of these once more than one is configured.
 	UpstreamRegistries []UpstreamRegistry `yaml:"upstream_registries"`
 
+	// AllowNoUpstreamRegistries permits an inert agent with no registry routes.
+	// It is command-line-only so operator-managed YAML remains strict;
+	// standalone installations opt in explicitly on their DaemonSet args.
+	AllowNoUpstreamRegistries bool `yaml:"-"`
+
 	// ---------- HRW / coordination ----------
 
 	// HRWK is the top-K size for HRW probe (the step 3 default 3; the design doc
@@ -418,6 +423,12 @@ type UpstreamRegistry struct {
 	// "https://registry.example.com".
 	Endpoint string `yaml:"endpoint"`
 
+	// AuthMode selects how Gantry authenticates origin requests. Empty keeps
+	// backward compatibility: delegated when CredentialsPath is empty and
+	// legacy shared credentials when it is set. New standalone configuration
+	// writes one of "delegated", "anonymous", or "shared" explicitly.
+	AuthMode string `yaml:"auth_mode,omitempty"`
+
 	// CredentialsPath is an optional fallback file containing registry
 	// credentials. Format: "username:password" (or "_json_key:<json>" for
 	// the well-known GCR pattern). A request-scoped Basic/Bearer credential
@@ -430,6 +441,28 @@ type UpstreamRegistry struct {
 	// NSAlias lets containerd's ?ns= use a different name than Name.
 	// Empty means ?ns= must equal Name.
 	NSAlias string `yaml:"ns_alias"`
+}
+
+const (
+	// UpstreamAuthDelegated forwards request-scoped kubelet/containerd credentials.
+	UpstreamAuthDelegated = "delegated"
+	// UpstreamAuthAnonymous suppresses all registry credentials.
+	UpstreamAuthAnonymous = "anonymous"
+	// UpstreamAuthShared uses the registry's configured cluster-wide credential.
+	UpstreamAuthShared = "shared"
+)
+
+// EffectiveAuthMode resolves the backward-compatible empty AuthMode value.
+func (u UpstreamRegistry) EffectiveAuthMode() string {
+	if u.AuthMode != "" {
+		return u.AuthMode
+	}
+
+	if u.CredentialsPath != "" {
+		return UpstreamAuthShared
+	}
+
+	return UpstreamAuthDelegated
 }
 
 // LegacyDeprecatedConfig captures YAML field names that used to live
@@ -681,6 +714,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.ContainerdNamespace, "containerd-namespace", c.ContainerdNamespace, "containerd namespace cdsub watches (default k8s.io)")
 	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest (storage_mode=containerd only)")
 	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
+	fs.BoolVar(&c.AllowNoUpstreamRegistries, "allow-no-upstream-registries", c.AllowNoUpstreamRegistries, "allow an inert agent with no configured upstream registries (standalone bootstrap only)")
 
 	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "HRW top-K size")
 	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "number of HRW-ranked pullers each prefetched layer digest is pulled by (initial seeds); 1 = single puller/tightest dedup, N = N-fold peer fan-out at N origin copies")
@@ -847,7 +881,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if len(c.UpstreamRegistries) == 0 {
+	if len(c.UpstreamRegistries) == 0 && !c.AllowNoUpstreamRegistries {
 		errs = append(errs, errors.New("upstream_registries: at least one entry required"))
 	}
 
@@ -874,6 +908,28 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: required", i))
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint %q: must start with http:// or https://", i, ur.Endpoint))
+		}
+
+		switch ur.AuthMode {
+		case "":
+		case UpstreamAuthDelegated, UpstreamAuthAnonymous:
+			if ur.CredentialsPath != "" {
+				errs = append(errs, fmt.Errorf("upstream_registries[%d].credentials_path: must be empty when auth_mode is %q", i, ur.AuthMode))
+			}
+
+			if ur.AuthMode == UpstreamAuthDelegated && !strings.HasPrefix(ur.Endpoint, "https://") {
+				errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: auth_mode %q requires https", i, ur.AuthMode))
+			}
+		case UpstreamAuthShared:
+			if ur.CredentialsPath == "" {
+				errs = append(errs, fmt.Errorf("upstream_registries[%d].credentials_path: required when auth_mode is %q", i, ur.AuthMode))
+			}
+
+			if !strings.HasPrefix(ur.Endpoint, "https://") {
+				errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: auth_mode %q requires https", i, ur.AuthMode))
+			}
+		default:
+			errs = append(errs, fmt.Errorf("upstream_registries[%d].auth_mode %q: must be %q, %q, or %q", i, ur.AuthMode, UpstreamAuthDelegated, UpstreamAuthAnonymous, UpstreamAuthShared))
 		}
 	}
 

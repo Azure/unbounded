@@ -98,6 +98,9 @@ UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
 KUBECTL_UNBOUNDED_BIN=bin/kubectl-unbounded
 KUBECTL_UNBOUNDED_CMD=./cmd/kubectl-unbounded
 
+GANTRYCTL_BIN=bin/gantryctl
+GANTRYCTL_CMD=./cmd/gantryctl
+
 # Net binaries
 NET_CONTROLLER_BIN=bin/unbounded-net-controller
 NET_CONTROLLER_CMD=./cmd/unbounded-net-controller
@@ -225,6 +228,7 @@ ORCA_DEV_IMAGE ?= ghcr.io/azure/orca:dev
 ORCA_KIND_CLUSTER ?= orca-dev
 
 KUBECTL_UNBOUNDED_LDFLAGS=$(STAMP_LDFLAGS)
+GANTRYCTL_LDFLAGS=$(STAMP_LDFLAGS)
 
 # --- Net (unbounded-net) configuration -------------------------------------
 # Container images for the net controller and node agent.
@@ -264,7 +268,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build gantryctl gantryctl-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -273,7 +277,7 @@ REACT_DEV ?= false
 
 ##@ General
 
-all: kubectl-unbounded forge machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded gantryctl forge machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -300,6 +304,7 @@ help: ## Show this help
 	@echo ""
 	@echo "Build:"
 	@echo "  kubectl-unbounded                Build kubectl-unbounded plugin"
+	@echo "  gantryctl                        Build standalone Gantry management CLI"
 	@echo "  forge                            Build forge dev tool"
 	@echo "  agent-artifacts-builder          Build offline agent artifacts builder"
 	@echo "  agent-artifacts-builder-build    Build offline agent artifacts builder without test"
@@ -557,6 +562,11 @@ kubectl-unbounded-build: machina-manifests net-manifests unbounded-storage-super
 	$(GOBUILD) -ldflags '$(KUBECTL_UNBOUNDED_LDFLAGS)' -o $(KUBECTL_UNBOUNDED_BIN) $(KUBECTL_UNBOUNDED_CMD)/main.go
 
 kubectl-unbounded: test kubectl-unbounded-build ## Build the kubectl-unbounded plugin (implies test)
+
+gantryctl-build: ## Build the standalone Gantry management CLI (no lint/test)
+	$(GOBUILD) -ldflags '$(GANTRYCTL_LDFLAGS)' -o $(GANTRYCTL_BIN) $(GANTRYCTL_CMD)
+
+gantryctl: test gantryctl-build ## Build the standalone Gantry management CLI (implies test)
 
 forge: test ## Build the forge dev tool (implies test)
 	$(GOBUILD) -o $(FORGE_BIN) $(FORGE_CMD)/main.go

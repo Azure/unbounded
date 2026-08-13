@@ -4,6 +4,7 @@
 package origin
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -60,6 +61,28 @@ func newClient(t *testing.T, ur config.UpstreamRegistry) *Client {
 	}
 
 	return c
+}
+
+func TestNewEmptyRegistriesRequiresExplicitOptIn(t *testing.T) {
+	if _, err := New(&config.Config{}); err == nil {
+		t.Fatal("New accepted empty registries without opt-in")
+	}
+	c, err := New(&config.Config{AllowNoUpstreamRegistries: true})
+	if err != nil {
+		t.Fatalf("New with empty-registry opt-in: %v", err)
+	}
+
+	if len(c.registries) != 0 {
+		t.Fatalf("registries = %d, want 0", len(c.registries))
+	}
+}
+
+func TestNewNormalizesEndpointTrailingSlash(t *testing.T) {
+	client := newClient(t, config.UpstreamRegistry{Name: "registry.example.com", Endpoint: "https://registry.example.com/cache/"})
+
+	if got := client.registries["registry.example.com"].base.String(); got != "https://registry.example.com/cache" {
+		t.Fatalf("normalized endpoint = %q", got)
+	}
 }
 
 func TestPullBlob_Success(t *testing.T) {
@@ -978,6 +1001,70 @@ func TestNewRejectsBadCredentialsFile(t *testing.T) {
 	}}
 	if _, err := New(cfg); err == nil {
 		t.Fatal("expected New() to reject malformed credentials")
+	}
+}
+
+func TestFetchManifestByTagUsesSharedCredentials(t *testing.T) {
+	manifest := []byte(`{"schemaVersion":2}`)
+
+	var requests atomic.Int32
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+
+		if r.URL.Path != "/v2/team/image/manifests/v1" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+
+		username, password, ok := r.BasicAuth()
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="registry"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		if username != "reader" || password != "secret" {
+			t.Errorf("credentials = %q/%q", username, password)
+		}
+
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", "sha256:"+strings.Repeat("a", 64))
+		_, _ = w.Write(manifest)
+	}))
+	defer server.Close()
+
+	credentialsPath := filepath.Join(t.TempDir(), "credentials")
+	if err := os.WriteFile(credentialsPath, []byte("reader:secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := New(&config.Config{UpstreamRegistries: []config.UpstreamRegistry{{
+		Name: "registry.example.com", Endpoint: server.URL, AuthMode: config.UpstreamAuthShared, CredentialsPath: credentialsPath,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.registries["registry.example.com"].hc = server.Client()
+
+	response, err := client.FetchManifest(t.Context(), http.MethodGet, "registry.example.com", "team/image", "v1")
+	if err != nil {
+		t.Fatalf("FetchManifest: %v", err)
+	}
+	defer response.Body.Close()
+
+	got, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(got, manifest) || requests.Load() != 2 {
+		t.Fatalf("body/requests = %q/%d", got, requests.Load())
+	}
+
+	if response.Header.Get("Docker-Content-Digest") == "" {
+		t.Fatal("Docker-Content-Digest header missing")
 	}
 }
 
