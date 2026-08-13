@@ -275,10 +275,18 @@ jobs:
   #                                     so it is built with CONTAINER_REGISTRY.
   #   - netboot                       : PXE artifact referenced by metalman
   #   - unbounded-storage-supervisor  : per-Site storage supervisor DaemonSet
+  #   - gantry                        : cluster-wide gantry DaemonSet. The
+  #                                     operator resolves its image as
+  #                                     <registry>/gantry:<operator version>, so
+  #                                     it must be built at the nightly tag or
+  #                                     the DaemonSet stalls in ImagePullBackOff.
   #   - orca                          : deployed separately by the deploy-orca job
   #
   # machine-ops-controller is intentionally omitted: the operator synthesizes
   # metalman per Site instead, so machine-ops is never rolled out here.
+  #
+  # Anything added to internal/operator/reconciler.go's component list needs a
+  # matching entry here and in the deploy job's rollout wait.
   # ---------------------------------------------------------------------------
   component-images:
     needs: resolve
@@ -296,6 +304,8 @@ jobs:
             file: images/unbounded-storage-supervisor/Containerfile
           - name: unbounded-operator
             file: images/unbounded-operator/Containerfile
+          - name: gantry
+            file: images/gantry/Containerfile
           - name: orca
             file: images/orca/Containerfile
     env:
@@ -525,7 +535,8 @@ jobs:
             "deploy unbounded-operator" \
             "deploy unbounded-net-controller" \
             "ds unbounded-net-node" \
-            "deploy machina-controller"; do
+            "deploy machina-controller" \
+            "ds gantry"; do
             set -- $target
             wait_exists "$1" "$2"
             kubectl -n "$NS" rollout status "$1/$2" --timeout=5m
