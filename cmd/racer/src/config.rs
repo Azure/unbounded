@@ -736,9 +736,18 @@ impl Config {
         self.extent_at(addr).map(|e| e.id)
     }
 
-    /// Whether any extent has ever collected; if not, a tombstone sweep is pointless.
-    pub(crate) fn collecting(&self) -> bool {
-        self.extents().any(|(_, e)| e.tombstone_epoch != 0)
+    /// Whether this configuration can retire anything the store still holds; if not, a
+    /// sweep is pointless.
+    ///
+    /// Two things retire a row. An extent that has collected at least once leaves rows
+    /// behind its own epoch. And an extent that has gone from the configuration outright,
+    /// because its volume was deleted or it finished moving to another zone, leaves rows
+    /// no extent covers at all - which is why an empty extent list is not the same as
+    /// nothing to do. That reading is only safe on a full publication, and a
+    /// configuration that names peers is one: the bootstrap shape carries neither peers
+    /// nor extents.
+    pub(crate) fn reclaimable(&self) -> bool {
+        self.extents().any(|(_, e)| e.tombstone_epoch != 0) || self.peer_count() > 0
     }
 
     /// Every check that does not need the previous configuration.
@@ -2591,7 +2600,11 @@ universe 1 epoch=1 fabric_device_id=9
 
         let held_none = Config::parse(&text.replace("%ID%", "9").replace("%COHORT%", "2")).unwrap();
         held_none.validate().unwrap();
-        assert_eq!(held_none.small_pages(), 300, "six slots over four nodes, rounded up");
+        assert_eq!(
+            held_none.small_pages(),
+            300,
+            "six slots over four nodes, rounded up"
+        );
     }
 
     #[test]
@@ -2617,12 +2630,31 @@ universe 1 epoch=1 fabric_device_id=9
         assert!(c.validate().is_err());
     }
 
+    /// The sweep runs on a full publication whether or not an extent is collecting: an
+    /// extent that has left the configuration outright leaves rows behind too. It must not
+    /// run on the bootstrap shape, which names no extents because it names nothing yet.
+    #[test]
+    fn only_a_full_publication_reclaims() {
+        let mut b = sample();
+        assert!(b.reclaimable(), "a config with peers can retire rows");
+
+        b.universes[0].extents.clear();
+        assert!(
+            b.reclaimable(),
+            "an emptied extent list is work, not silence"
+        );
+
+        for u in &mut b.universes {
+            u.peers.clear();
+        }
+        assert!(!b.reclaimable(), "the bootstrap shape retires nothing");
+    }
+
     #[test]
     fn tombstone_epoch_moves_forward_per_extent() {
         let mut b = sample();
         b.universes[0].extents[0].tombstone_epoch = 3;
-        assert!(b.collecting());
-        assert!(!sample().collecting());
+        assert!(b.reclaimable());
         assert_eq!(b.tombstone_epoch_of(at(1, 0)), 3);
         assert_eq!(
             b.tombstone_epoch_of(at(1, 100)),
