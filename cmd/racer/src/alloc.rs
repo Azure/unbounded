@@ -726,11 +726,18 @@ impl Allocator {
         }
         let key = (guard, ballot.raw(), proposer);
         let owner = self.owner(addr, class);
-        let slot = at(owner, move |c| {
+        let piece = at(owner, move |c| {
             self.open_parts(c, addr, kind, class, key, guard, ballot)
         })
-        .await?;
-        let dst = self.geo.slot_off(class, slot) + off as u64;
+        .await
+        .map(|slot| Piece {
+            alloc: self,
+            owner,
+            addr,
+            key,
+            slot,
+        })?;
+        let dst = self.geo.slot_off(class, piece.slot()) + off as u64;
         if self
             .disk
             .write(dst, buf, Durability::Durable)
@@ -738,15 +745,12 @@ impl Allocator {
             .is_err()
         {
             // Dropped rather than left short: the initiator retries the whole command.
-            at(owner, move |c| self.drop_parts(c, addr, key)).await;
+            piece.abandon().await;
             return Err(Status::Io);
         }
         let first = (off as u64 / blk) as u32;
         let n = (len / blk) as u32;
-        let full = at(owner, move |c| {
-            Allocator::mark_parts(c, addr, key, first, n)
-        })
-        .await;
+        let full = piece.mark(first, n).await;
         Ok(full.map(|ticket| Pending {
             addr,
             class,
@@ -1287,6 +1291,64 @@ impl Allocator {
             c.shard
                 .set_occ(occ_per_core(cfg.policy.occ_bytes, self.cores));
             c.shard.set_recoverable(cfg.peer_count() > 0);
+        });
+    }
+}
+
+// ------------------------------------------------------------------ huge assembly
+
+/// One piece of a 4 MiB page, on its way into the slot an assembly holds.
+///
+/// Opening a piece counts a write in flight, which is what stops the assembly being
+/// evicted and its slot reused while a sibling is still landing bytes in it. A future
+/// dropped between opening a piece and reporting it left that count raised for good: the
+/// page could never complete, because completion asks that no write is still in flight,
+/// and the assembly could never be evicted either, so its slot stayed reserved for the
+/// life of the process.
+///
+/// Reporting is the only way to spend one, and there is no way to make a second for the
+/// same write, so the count now comes back down however the piece ends.
+#[must_use = "an unreported piece leaves a write counted in flight for good"]
+struct Piece {
+    alloc: &'static Allocator,
+    owner: CoreId,
+    addr: GlobalAddr,
+    key: PartsKey,
+    slot: u32,
+}
+
+impl Piece {
+    /// The slot these bytes belong in. Every piece of one command shares it.
+    fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    /// Report blocks durable, answering with the ticket once the page is whole.
+    async fn mark(self, first: u32, n: u32) -> Option<Ticket> {
+        let me = std::mem::ManuallyDrop::new(self);
+        let (owner, addr, key) = (me.owner, me.addr, me.key);
+        at(owner, move |c| {
+            Allocator::mark_parts(c, addr, key, first, n)
+        })
+        .await
+    }
+
+    /// Give the piece up. The assembly goes with it once no sibling is still writing.
+    async fn abandon(self) {
+        let me = std::mem::ManuallyDrop::new(self);
+        let (alloc, owner, addr, key) = (me.alloc, me.owner, me.addr, me.key);
+        at(owner, move |c| alloc.drop_parts(c, addr, key)).await;
+    }
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        let (alloc, owner, addr, key) = (self.alloc, self.owner, self.addr, self.key);
+        // Detached, because a destructor cannot await and the assembly may be another
+        // core's. If the slab has no room the count stays raised, which is what dropping
+        // a piece did every time before this.
+        let _ = runtime::spawn(async move {
+            at(owner, move |c| alloc.drop_parts(c, addr, key)).await;
         });
     }
 }
