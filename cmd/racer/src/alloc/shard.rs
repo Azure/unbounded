@@ -2188,6 +2188,8 @@ mod model {
         /// Both copies of one mblock died: genuine media loss, answered with `Missing`.
         /// Sticky, since a later successful write refills a copy but not the lost rows.
         lost: bool,
+        /// A flush was abandoned part-way rather than retired.
+        abandoned: bool,
         writes: u8,
         flushes: u8,
         restarts: u8,
@@ -2196,10 +2198,16 @@ mod model {
 
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum DiskAct {
-        Reserve { a: u8, b: u8 },
+        Reserve {
+            a: u8,
+            b: u8,
+        },
         Stage(u8),
         FlushGo(u8),
         FlushDone(bool),
+        /// The flushing future was dropped. The device still does whatever it was told,
+        /// which is the `bool`, but nothing is left to record it.
+        FlushDropped(bool),
         Restart(u8),
     }
 
@@ -2249,6 +2257,7 @@ mod model {
                 acked: BTreeSet::new(),
                 flight: None,
                 lost: false,
+                abandoned: false,
                 writes: 0,
                 flushes: 0,
                 restarts: 0,
@@ -2278,6 +2287,8 @@ mod model {
             } else {
                 out.push(DiskAct::FlushDone(true));
                 out.push(DiskAct::FlushDone(false));
+                out.push(DiskAct::FlushDropped(true));
+                out.push(DiskAct::FlushDropped(false));
             }
             if s.restarts < 1 {
                 out.push(DiskAct::Restart(1));
@@ -2339,6 +2350,22 @@ mod model {
                     s.image[li as usize][copy] = if ok { Some((g, rows)) } else { None };
                     s.lost |= s.image[li as usize].iter().all(|c| c.is_none());
                     s.shards[0].end_flush(cls, li, seq, ok);
+                    self.promote(&mut s);
+                }
+                DiskAct::FlushDropped(landed) => {
+                    let (li, seq, g, rows) = s.flight.take()?;
+                    let copy = match self.ab {
+                        Ab::Alternating => (g % 2) as usize,
+                        Ab::Fixed => 0,
+                    };
+                    // Kernel work is not cancelled when the future waiting on it goes, so
+                    // the copy this aimed at is written or destroyed either way.
+                    s.image[li as usize][copy] = if landed { Some((g, rows)) } else { None };
+                    s.lost |= s.image[li as usize].iter().all(|c| c.is_none());
+                    // What the destructor does, and all it can do: give the slab back
+                    // without claiming a sequence nobody watched land.
+                    s.shards[0].end_flush(cls, li, seq, false);
+                    s.abandoned = true;
                     self.promote(&mut s);
                 }
                 DiskAct::Restart(cores) => {
@@ -2414,6 +2441,16 @@ mod model {
                 }),
                 // The index shards by consensus group, the slots by core, and after a core
                 // count change those need not agree.
+                // The mark a `Go` hands out lasts exactly as long as the attempt it was
+                // handed to. Were it to outlive one, every committer on the core would
+                // park behind a flush that was never going to finish and no later flush
+                // could take the slab either, which is why abandoning one gives it back.
+                Property::<Self>::always("a slab is busy only while a flush is", |_, s: &Disk| {
+                    s.flight.is_some() == s.shards[0].slabs[0].flushing
+                }),
+                Property::<Self>::sometimes("a flush is abandoned part-way", |_, s: &Disk| {
+                    s.abandoned && !s.acked.is_empty()
+                }),
                 Property::<Self>::sometimes("a foreign entry appears", |_, s: &Disk| {
                     s.shards.iter().any(|sh| !sh.slabs[0].foreign.is_empty())
                 }),
