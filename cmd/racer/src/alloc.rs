@@ -11,9 +11,10 @@
 
 mod shard;
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
@@ -22,8 +23,8 @@ use crate::config::{Config, GroupId, Kind};
 use crate::heal::{self, Tuple};
 use crate::layout::{self, Class, Geometry, MBLOCK};
 use crate::paxos::{Ballot, Register};
-use crate::runtime::{self, Buf, Disk, Durability, PoolBuf};
-use crate::server;
+use crate::runtime::{self, Buf, CoreId, Disk, Durability, PoolBuf};
+use crate::server::{self, Server};
 
 use shard::Ticket;
 use shard::{Act, Lookup, Maps, Shape, Shard, Staged};
@@ -120,21 +121,69 @@ pub struct Allocator {
     disk: Disk,
     geo: Geometry,
     cores: usize,
-    shards: Box<[RefCell<Core>]>,
     /// Consensus side state as the superblock held it at startup: `promised_term` per
     /// group and the seal table. `paxos` takes it from here and owns it thereafter.
     boot: layout::Consensus,
     /// Metadata blocks lost at startup, surfaced as a health metric.
     pub quarantined: usize,
     /// The cache, once it exists. Only so the allocator can call in a loan of a free
-    /// 4 MiB slot without waiting for the cache to notice; see [`Allocator::top_up`].
-    cache: OnceCell<&'static Cache>,
+    /// 4 MiB slot without waiting for the cache to notice; see [`Allocator::top_up_in`].
+    cache: OnceLock<&'static Cache>,
 }
 
-// Sound because shard `i` is only ever borrowed from the worker pinned to core `i`,
-// and never across an await. `open` leaks the allocator so that hop closures, which
-// must be `Send + 'static`, can carry a reference to it.
-unsafe impl Sync for Allocator {}
+/// One worker's share of the allocator, living in that worker's [`server::CoreState`].
+///
+/// A shard is not a partition of one table but a table of its own: it owns a stripe of
+/// the mblocks, allocates only from it, and holds the registers of the groups whose id
+/// maps to this core. So there is nothing here another core has any business reading,
+/// and the borrow that proves it is the one the worker takes on its own row.
+pub(crate) struct Row(RefCell<Core>);
+
+// SAFETY: a row crosses to its worker once, before that worker takes traffic, and what
+// makes `Core` unsendable is the staging buffer: a `PoolBuf` is an index into one ring's
+// registered set and means nothing on another core. `Row::new` is the only constructor
+// and it holds no buffer, and the only code that can put one there is `here` or `at`,
+// which is the owning worker running a transaction. So the value that travels holds
+// nothing that belongs to where it is going.
+unsafe impl Send for Row {}
+
+impl Row {
+    fn new(shard: Shard) -> Row {
+        Row(RefCell::new(Core {
+            shard,
+            waiters: Vec::with_capacity(64),
+            staging: [None, None],
+            parts: Vec::new(),
+        }))
+    }
+}
+
+/// This core's share.
+fn here<T>(f: impl FnOnce(&mut Core) -> T) -> T {
+    runtime::here::<Server, T>(|ctx| f(&mut ctx.state().alloc.0.borrow_mut()))
+}
+
+/// The decision-making half of it, which is most of what callers want.
+fn shard<T>(f: impl FnOnce(&mut Shard) -> T) -> T {
+    here(|c| f(&mut c.shard))
+}
+
+/// `core`'s share, as a transaction that core runs.
+///
+/// Synchronous by construction, which is what makes it a transaction: a reservation, a
+/// lookup or a register read is one visit to the owning worker, resolved inside the drain
+/// that delivered it, rather than a task parked there waiting to be polled again.
+fn find_parts(c: &Core, addr: GlobalAddr, key: PartsKey) -> Option<usize> {
+    c.parts.iter().position(|p| p.addr == addr && p.key == key)
+}
+
+fn at<T, F>(core: CoreId, f: F) -> impl Future<Output = T>
+where
+    F: FnOnce(&mut Core) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    runtime::with_core::<Server, _, _>(core, move |ctx| f(&mut ctx.state().alloc.0.borrow_mut()))
+}
 
 /// Cores that participate in a class's index sharding. Mblocks are striped `id % cores`
 /// and a core allocates only from its own stripe, so capping the width at the mblock
@@ -175,20 +224,12 @@ fn class_of(huge: bool) -> Class {
 }
 
 impl Allocator {
-    fn core_of(&self, core: usize) -> std::cell::RefMut<'_, Core> {
-        self.shards[core].borrow_mut()
-    }
-
-    /// The decision-making half of this core's state. Every caller closes the borrow
-    /// before its next await, the invariant `unsafe impl Sync` rests on.
-    fn shard(&self, core: usize) -> std::cell::RefMut<'_, Shard> {
-        std::cell::RefMut::map(self.shards[core].borrow_mut(), |c| &mut c.shard)
-    }
-
     /// The core that owns an address's index shard, and so allocates for it. Reuses the
     /// consensus group mapping so the lookup rides the hop consensus already makes.
-    fn owner(&self, addr: GlobalAddr, class: Class) -> usize {
-        server::config().group(addr.0).index() as usize % shards_for(self.cores, &self.geo, class)
+    fn owner(&self, addr: GlobalAddr, class: Class) -> CoreId {
+        let i = server::config().group(addr.0).index() as usize
+            % shards_for(self.cores, &self.geo, class);
+        CoreId::of(i)
     }
 
     /// The extent's page kind, class and tombstone epoch, from one lookup.
@@ -209,7 +250,7 @@ impl Allocator {
     }
 
     /// The core owning an address. The cache shards by this too, so its lookups are free.
-    pub fn owner_core(&self, addr: GlobalAddr) -> Result<usize, Status> {
+    pub fn owner_core(&self, addr: GlobalAddr) -> Result<CoreId, Status> {
         let (_, class, _) = self.extent(addr).ok_or(Status::Unmapped)?;
         Ok(self.owner(addr, class))
     }
@@ -232,7 +273,7 @@ impl Allocator {
 
     /// Free-space state of this core's shards; group hashing makes it representative.
     pub fn pressure(&self) -> Pressure {
-        self.shard(runtime::core()).pressure()
+        shard(|sh| sh.pressure())
     }
 
     /// Whether the store's rate budget is committed far enough ahead that optional work
@@ -249,13 +290,13 @@ impl Allocator {
     /// Free and total page slots in this core's shards, small then huge. Per core
     /// because that is where the free lists live; the exporter sums them.
     pub fn capacity(&self) -> [(u64, u64); 2] {
-        self.shard(runtime::core()).capacity()
+        shard(|sh| sh.capacity())
     }
 
     /// Live and tombstoned pages per extent in this core's shards,
     /// `(extent, live, tombstones)`. Per core like `capacity`; the exporter sums them.
     pub fn census(&self) -> Vec<(u32, u64, u64)> {
-        self.shard(runtime::core()).census()
+        shard(|sh| sh.census())
     }
 
     pub fn cores(&self) -> usize {
@@ -273,7 +314,7 @@ impl Allocator {
     /// A lent slot still counts as free, so a loan cannot move the watermarks lending is
     /// gated on. What the cache wrote is unreachable after a restart: the entry says free.
     pub fn lend(&self) -> Option<u64> {
-        let slot = self.shard(runtime::core()).lend()?;
+        let slot = shard(|sh| sh.lend())?;
         Some(self.geo.slot_off(Class::Huge, slot))
     }
 
@@ -282,25 +323,22 @@ impl Allocator {
     /// recoverable inside the reservation that needs it, and the cache holds each loan on
     /// the lending core, which owns the matching cache stripe. Usually a no-op: lending
     /// stops above `1/LEND_CEILING` free, reclaim starts below `1/LEND_FLOOR`.
-    fn top_up(&self, class: Class) {
+    ///
+    /// Takes the shard already open, and keeps it open across the hand-back: what the
+    /// cache gives up is its own share of this same core, a different borrow entirely.
+    fn top_up_in(&self, sh: &mut Shard, class: Class) {
         if class != Class::Huge {
             return;
         }
         let Some(cache) = self.cache.get() else {
             return;
         };
-        let core = runtime::core();
-        // Close the borrow before calling into the cache: `give_back` is synchronous and
-        // must not find this core's shard already borrowed.
-        let want = {
-            let sh = self.shard(core);
-            let (free, total) = sh.capacity()[Class::Huge as usize];
-            let lent = sh.lent();
-            (total / LEND_FLOOR)
-                .saturating_sub(free.saturating_sub(lent))
-                .min(lent)
-                .min(LEND_BATCH)
-        };
+        let (free, total) = sh.capacity()[Class::Huge as usize];
+        let lent = sh.lent();
+        let want = (total / LEND_FLOOR)
+            .saturating_sub(free.saturating_sub(lent))
+            .min(lent)
+            .min(LEND_BATCH);
         for _ in 0..want {
             let Some(off) = cache.give_back() else {
                 break;
@@ -308,7 +346,7 @@ impl Allocator {
             let Some(slot) = self.geo.slot_at(Class::Huge, off) else {
                 continue;
             };
-            self.shard(core).reclaim(slot);
+            sh.reclaim(slot);
         }
     }
 
@@ -318,8 +356,9 @@ impl Allocator {
     /// issued, so a refusal costs nothing. A present `guard` is the collision detector
     /// and the whole type check: LWW, OCC and Immutable differ only in which version the
     /// proposer presented. `None` asks the shard to derive it from the local row.
-    fn reserve(
+    fn reserve_in(
         &self,
+        sh: &mut Shard,
         addr: GlobalAddr,
         kind: Kind,
         class: Class,
@@ -327,15 +366,15 @@ impl Allocator {
         ballot: Ballot,
     ) -> Result<Ticket, Status> {
         let epoch = server::config().tombstone_epoch_of(addr.0);
-        self.top_up(class);
-        self.shard(runtime::core())
-            .reserve(addr, kind, class, guard, ballot, epoch)
+        self.top_up_in(sh, class);
+        sh.reserve(addr, kind, class, guard, ballot, epoch)
     }
 
     /// The owning core's half of a commit: install the entry, retire the previous slot,
     /// mark the mblock dirty. Returns what `flush_until` must reach for durability.
-    fn stage(
+    fn stage_in(
         &self,
+        sh: &mut Shard,
         addr: GlobalAddr,
         class: Class,
         t: Ticket,
@@ -343,14 +382,13 @@ impl Allocator {
     ) -> Result<Option<Staged>, Status> {
         let kind = self.extent(addr).ok_or(Status::Unmapped)?.0;
         maps!(&server::config(), m);
-        self.shard(runtime::core())
-            .stage(addr, kind, class, t, crc, &m)
+        sh.stage(addr, kind, class, t, crc, &m)
     }
 
     /// Undo a reservation whose data write failed, so the slot is not leaked.
-    fn unreserve(&self, class: Class, t: Ticket) {
+    fn unreserve_in(&self, sh: &mut Shard, class: Class, t: Ticket) {
         maps!(&server::config(), m);
-        self.shard(runtime::core()).unreserve(class, t, &m);
+        sh.unreserve(class, t, &m);
     }
 
     // ------------------------------------------------------------------- group commit
@@ -358,13 +396,10 @@ impl Allocator {
     /// Wait until mblock `li` is durable at or past `need`. The first arrival issues the
     /// write at once with no timer; commits made while it is in flight ride the next one.
     async fn flush_until(&'static self, class: Class, li: u32, need: u64) -> Result<(), Status> {
-        let core = runtime::core();
         loop {
-            // Bound the borrow to this statement: it must not survive into the await.
-            let act = self.shard(core).flush_act(class, li, need);
-            match act {
+            match shard(|sh| sh.flush_act(class, li, need)) {
                 Act::Done => return Ok(()),
-                Act::Wait => Park::new(self, core).await,
+                Act::Wait => Park::new().await,
                 Act::Go => self.flush(class, li).await?,
             }
         }
@@ -373,18 +408,15 @@ impl Allocator {
     /// Serialise one mblock from DRAM to the copy that is not current: a whole 4 KiB
     /// block, so there is nothing to read first.
     async fn flush(&'static self, class: Class, li: u32) -> Result<(), Status> {
-        let core = runtime::core();
         // Staging is normally pre-held by `tick`; awaiting here is the cold path.
-        if self.core_of(core).staging[class as usize].is_none() {
+        if here(|c| c.staging[class as usize].is_none()) {
             let b = match PoolBuf::try_alloc(MBLOCK) {
                 Some(b) => b,
                 None => PoolBuf::alloc(MBLOCK).await,
             };
-            self.core_of(core).staging[class as usize] = Some(b);
+            here(|c| c.staging[class as usize] = Some(b));
         }
-        let (seq, off, buf) = {
-            let mut c = self.core_of(core);
-            let c = &mut *c;
+        let (seq, off, buf) = here(|c| {
             let (seq, h, rows) = c.shard.begin_flush(class, li);
             let stage = c.staging[class as usize].as_mut().unwrap();
             layout::put_mblock(stage, h, rows);
@@ -392,13 +424,14 @@ impl Allocator {
                 .geo
                 .mblock_off(class, h.mblock_id, (h.generation % 2) as u8);
             (seq, off, stage.buf())
-        };
+        });
         let r = self.disk.write(off, buf, Durability::Durable).await;
-        let mut c = self.core_of(core);
-        c.shard.end_flush(class, li, seq, r.is_ok());
-        for w in c.waiters.drain(..) {
-            w.wake();
-        }
+        here(|c| {
+            c.shard.end_flush(class, li, seq, r.is_ok());
+            for w in c.waiters.drain(..) {
+                w.wake();
+            }
+        });
         r.map_err(|_| Status::Io)
     }
 
@@ -418,8 +451,8 @@ impl Allocator {
             return Err(Status::Unmapped);
         }
         let owner = self.owner(addr, class);
-        let t = runtime::on_core(owner, move || async move {
-            self.reserve(addr, kind, class, Some(guard), ballot)
+        let t = at(owner, move |c| {
+            self.reserve_in(&mut c.shard, addr, kind, class, Some(guard), ballot)
         })
         .await?;
         let crc = self.write_page(addr, class, t, page).await?;
@@ -449,7 +482,7 @@ impl Allocator {
             .is_err()
         {
             let owner = self.owner(addr, class);
-            runtime::on_core(owner, move || async move { self.unreserve(class, t) }).await;
+            at(owner, move |c| self.unreserve_in(&mut c.shard, class, t)).await;
             return Err(Status::Io);
         }
         Ok(crc)
@@ -468,8 +501,8 @@ impl Allocator {
             return Err(Status::Unmapped);
         }
         let owner = self.owner(addr, class);
-        let t = runtime::on_core(owner, move || async move {
-            self.reserve(addr, kind, class, Some(guard), ballot)
+        let t = at(owner, move |c| {
+            self.reserve_in(&mut c.shard, addr, kind, class, Some(guard), ballot)
         })
         .await?;
         let off = self.geo.slot_off(class, t.slot);
@@ -501,7 +534,7 @@ impl Allocator {
     pub async fn finish(&'static self, p: Pending) -> Result<u64, Status> {
         let (addr, class, t, crc) = (p.addr, p.class, p.ticket, p.crc);
         let owner = self.owner(addr, class);
-        let done = runtime::on_core(owner, move || async move {
+        let done = runtime::on_core(owner.index(), move || async move {
             self.commit(addr, class, t, crc).await
         })
         .await?;
@@ -516,7 +549,7 @@ impl Allocator {
     pub async fn abandon(&'static self, p: Pending) {
         let (addr, class, t) = (p.addr, p.class, p.ticket);
         let owner = self.owner(addr, class);
-        runtime::on_core(owner, move || async move { self.unreserve(class, t) }).await;
+        at(owner, move |c| self.unreserve_in(&mut c.shard, class, t)).await;
     }
 
     /// The member side of consensus: apply this page iff the guard matches. An error
@@ -547,8 +580,8 @@ impl Allocator {
             return Err(Status::Unmapped);
         }
         let owner = self.owner(addr, class);
-        let t = runtime::on_core(owner, move || async move {
-            self.reserve(addr, kind, class, guard, ballot)
+        let t = at(owner, move |c| {
+            self.reserve_in(&mut c.shard, addr, kind, class, guard, ballot)
         })
         .await?;
         self.finish_small(addr, class, t, page).await
@@ -567,7 +600,7 @@ impl Allocator {
     ) -> Result<Option<u64>, Status> {
         let crc = self.write_page(addr, class, t, page).await?;
         let owner = self.owner(addr, class);
-        let done = runtime::on_core(owner, move || async move {
+        let done = runtime::on_core(owner.index(), move || async move {
             self.commit(addr, class, t, crc).await
         })
         .await?;
@@ -600,8 +633,8 @@ impl Allocator {
             return Err(Status::Unmapped);
         }
         let owner = self.owner(addr, class);
-        let t = runtime::on_core(owner, move || async move {
-            self.reserve(addr, kind, class, guard, ballot)
+        let t = at(owner, move |c| {
+            self.reserve_in(&mut c.shard, addr, kind, class, guard, ballot)
         })
         .await?;
         self.finish_huge(addr, class, t, buf).await
@@ -622,10 +655,10 @@ impl Allocator {
             .await
             .is_err()
         {
-            runtime::on_core(owner, move || async move { self.unreserve(class, t) }).await;
+            at(owner, move |c| self.unreserve_in(&mut c.shard, class, t)).await;
             return Err(Status::Io);
         }
-        let done = runtime::on_core(owner, move || async move {
+        let done = runtime::on_core(owner.index(), move || async move {
             self.commit(addr, class, t, 0).await
         })
         .await?;
@@ -658,20 +691,25 @@ impl Allocator {
         }
         let key = (guard, ballot.raw(), proposer);
         let owner = self.owner(addr, class);
-        let t = runtime::on_core(owner, move || async move {
-            self.open_parts(addr, kind, class, key, guard, ballot)
+        let t = at(owner, move |c| {
+            self.open_parts(c, addr, kind, class, key, guard, ballot)
         })
         .await?;
-        let at = self.geo.slot_off(class, t.slot) + off as u64;
-        if self.disk.write(at, buf, Durability::Durable).await.is_err() {
+        let dst = self.geo.slot_off(class, t.slot) + off as u64;
+        if self
+            .disk
+            .write(dst, buf, Durability::Durable)
+            .await
+            .is_err()
+        {
             // Dropped rather than left short: the initiator retries the whole command.
-            runtime::on_core(owner, move || async move { self.drop_parts(addr, key) }).await;
+            at(owner, move |c| self.drop_parts(c, addr, key)).await;
             return Err(Status::Io);
         }
         let first = (off as u64 / blk) as u32;
         let n = (len / blk) as u32;
-        let full = runtime::on_core(owner, move || async move {
-            self.mark_parts(addr, key, first, n)
+        let full = at(owner, move |c| {
+            Allocator::mark_parts(c, addr, key, first, n)
         })
         .await;
         Ok(full.map(|ticket| Pending {
@@ -691,6 +729,7 @@ impl Allocator {
     /// Find or start an assembly, counting the piece about to be written. Owner core only.
     fn open_parts(
         &self,
+        c: &mut Core,
         addr: GlobalAddr,
         kind: Kind,
         class: Class,
@@ -698,27 +737,21 @@ impl Allocator {
         guard: u64,
         ballot: Ballot,
     ) -> Result<Ticket, Status> {
-        let core = runtime::core();
-        if let Some(p) = self.find_parts(core, addr, key) {
-            let mut c = self.core_of(core);
-            let p = &mut c.parts[p];
+        if let Some(i) = find_parts(c, addr, key) {
+            let p = &mut c.parts[i];
             p.busy += 1;
             return Ok(p.ticket);
         }
-        let t = self.reserve(addr, kind, class, Some(guard), ballot)?;
-        let mut c = self.core_of(core);
+        let t = self.reserve_in(&mut c.shard, addr, kind, class, Some(guard), ballot)?;
         if c.parts.len() >= HUGE_PARTS {
             // Idle assemblies first; if every one of them has a write in flight there is
             // no room, and a refusal the initiator retries beats corrupting a page.
             let Some(i) = c.parts.iter().position(|p| p.busy == 0) else {
-                drop(c);
-                self.unreserve(class, t);
+                self.unreserve_in(&mut c.shard, class, t);
                 return Err(Status::Io);
             };
             let old = c.parts.remove(i);
-            drop(c);
-            self.unreserve(class, old.ticket);
-            c = self.core_of(core);
+            self.unreserve_in(&mut c.shard, class, old.ticket);
         }
         c.parts.push(Parts {
             addr,
@@ -732,10 +765,14 @@ impl Allocator {
     }
 
     /// Record blocks now durable, and take the assembly out once whole. Owner core only.
-    fn mark_parts(&self, addr: GlobalAddr, key: PartsKey, first: u32, n: u32) -> Option<Ticket> {
-        let core = runtime::core();
-        let i = self.find_parts(core, addr, key)?;
-        let mut c = self.core_of(core);
+    fn mark_parts(
+        c: &mut Core,
+        addr: GlobalAddr,
+        key: PartsKey,
+        first: u32,
+        n: u32,
+    ) -> Option<Ticket> {
+        let i = find_parts(c, addr, key)?;
         let p = &mut c.parts[i];
         p.busy -= 1;
         for b in first..first + n {
@@ -750,26 +787,16 @@ impl Allocator {
 
     /// Drop an assembly; the last piece out gives the slot back, as a sibling may still
     /// be writing. Owed blocks stay unmarked, so the page cannot complete. Owner core only.
-    fn drop_parts(&self, addr: GlobalAddr, key: PartsKey) {
-        let core = runtime::core();
-        let Some(i) = self.find_parts(core, addr, key) else {
+    fn drop_parts(&self, c: &mut Core, addr: GlobalAddr, key: PartsKey) {
+        let Some(i) = find_parts(c, addr, key) else {
             return;
         };
-        let mut c = self.core_of(core);
         c.parts[i].busy -= 1;
         if c.parts[i].busy != 0 {
             return;
         }
         let p = c.parts.remove(i);
-        drop(c);
-        self.unreserve(Class::Huge, p.ticket);
-    }
-
-    fn find_parts(&self, core: usize, addr: GlobalAddr, key: PartsKey) -> Option<usize> {
-        self.core_of(core)
-            .parts
-            .iter()
-            .position(|p| p.addr == addr && p.key == key)
+        self.unreserve_in(&mut c.shard, Class::Huge, p.ticket);
     }
 
     // -------------------------------------------------------------- consensus surface
@@ -779,25 +806,28 @@ impl Allocator {
     /// a vote. A page we should hold but cannot serve reports `Missing`, not a vote.
     pub async fn register(&'static self, addr: GlobalAddr) -> Result<Register, Status> {
         let owner = self.owner_core(addr)?;
-        runtime::on_core(owner, move || async move { self.register_local(addr) }).await
+        at(owner, move |c| self.register_of(&mut c.shard, addr)).await
     }
 
     /// [`register`](Self::register) without the hop, for a caller already on the owning
     /// core. `paxos` uses it to bump the cache's sketch and read the register in one hop.
     pub fn register_local(&self, addr: GlobalAddr) -> Result<Register, Status> {
+        shard(|sh| self.register_of(sh, addr))
+    }
+
+    /// [`register`](Self::register) against a shard already open.
+    fn register_of(&self, sh: &mut Shard, addr: GlobalAddr) -> Result<Register, Status> {
         let (kind, class, epoch) = self.extent(addr).ok_or(Status::Unmapped)?;
-        debug_assert_eq!(runtime::core(), self.owner(addr, class));
-        self.shard(runtime::core())
-            .register_of(addr, kind, class, epoch)
+        debug_assert_eq!(runtime::core_id(), self.owner(addr, class));
+        sh.register_of(addr, kind, class, epoch)
     }
 
     /// The guard a proposer on this node should present. The OCC read ring is consulted
     /// here, which is why acceptors need no read-tracking state of their own.
     pub async fn guard(&'static self, addr: GlobalAddr) -> Result<u64, Status> {
         let (kind, class, epoch) = self.extent(addr).ok_or(Status::Unmapped)?;
-        runtime::on_core(self.owner(addr, class), move || async move {
-            self.shard(runtime::core())
-                .guard_of(addr, kind, class, epoch)
+        at(self.owner(addr, class), move |c| {
+            c.shard.guard_of(addr, kind, class, epoch)
         })
         .await
     }
@@ -808,8 +838,8 @@ impl Allocator {
         let Some((kind, class, _)) = self.extent(addr) else {
             return;
         };
-        runtime::on_core(self.owner(addr, class), move || async move {
-            self.shard(runtime::core()).observed(addr, kind, version);
+        at(self.owner(addr, class), move |c| {
+            c.shard.observed(addr, kind, version);
         })
         .await
     }
@@ -839,7 +869,7 @@ impl Allocator {
         if replace_equal {
             let crc = self.write_page(addr, class, t, page).await?;
             let owner = self.owner(addr, class);
-            return runtime::on_core(owner, move || {
+            return runtime::on_core(owner.index(), move || {
                 Box::pin(self.commit_replace_equal(addr, class, t, crc))
             })
             .await;
@@ -859,7 +889,7 @@ impl Allocator {
             return Ok(false);
         };
         let owner = self.owner(addr, class);
-        runtime::on_core(owner, move || async move {
+        runtime::on_core(owner.index(), move || async move {
             self.commit(addr, class, t, 0).await
         })
         .await
@@ -889,16 +919,10 @@ impl Allocator {
         replace_equal: bool,
     ) -> Result<Option<Ticket>, Status> {
         let (kind, _, epoch) = self.extent(addr).ok_or(Status::Unmapped)?;
-        runtime::on_core(self.owner(addr, class), move || async move {
-            self.top_up(class);
-            self.shard(runtime::core()).reserve_unguarded(
-                addr,
-                kind,
-                class,
-                r,
-                epoch,
-                replace_equal,
-            )
+        at(self.owner(addr, class), move |c| {
+            self.top_up_in(&mut c.shard, class);
+            c.shard
+                .reserve_unguarded(addr, kind, class, r, epoch, replace_equal)
         })
         .await
     }
@@ -912,14 +936,14 @@ impl Allocator {
     ) -> Result<bool, Status> {
         // `None` means the row moved while our data write was in flight; the slot went
         // back and there is nothing to make durable.
-        let Some(st) = self.stage(addr, class, t, crc)? else {
+        let Some(st) = shard(|sh| self.stage_in(sh, addr, class, t, crc))? else {
             return Ok(false);
         };
         self.flush_until(class, st.li, st.seq).await?;
         // Only now is it safe to give the previous slot back.
         if let Some(old) = st.stale {
             maps!(&server::config(), m);
-            self.shard(runtime::core()).release(class, old, &m);
+            shard(|sh| sh.release(class, old, &m));
         }
         Ok(true)
     }
@@ -933,26 +957,26 @@ impl Allocator {
         t: Ticket,
         crc: u32,
     ) -> Result<bool, Status> {
-        let Some(st) = self.stage(addr, class, t, crc)? else {
+        let Some(st) = shard(|sh| self.stage_in(sh, addr, class, t, crc))? else {
             return Ok(false);
         };
         self.flush_until(class, st.li, st.seq).await?;
         let Some(slot) = st.stale else {
             return Ok(true);
         };
-        let holder = (slot / class.k() % self.cores as u32) as usize;
+        let holder = CoreId::of((slot / class.k() % self.cores as u32) as usize);
         let retire = move || async move {
             maps!(&server::config(), m);
-            let flush = self.shard(runtime::core()).release(class, slot, &m);
+            let flush = shard(|sh| sh.release(class, slot, &m));
             if let Some((li, seq)) = flush {
                 self.flush_until(class, li, seq).await?;
             }
             Ok(())
         };
-        if holder == runtime::core() {
+        if holder == runtime::core_id() {
             retire().await
         } else {
-            runtime::on_core(holder, retire).await
+            runtime::on_core(holder.index(), retire).await
         }?;
         Ok(true)
     }
@@ -970,8 +994,7 @@ impl Allocator {
             return Err(Status::Unmapped);
         }
         let owner = self.owner(addr, class);
-        let l =
-            runtime::on_core(owner, move || async move { self.lookup(addr, kind, class) }).await?;
+        let l = at(owner, move |c| c.shard.lookup(addr, kind, class)).await?;
         let off = self.geo.slot_off(class, l.slot);
         self.disk
             .read(off, page.buf())
@@ -995,10 +1018,9 @@ impl Allocator {
             return Err(Status::Unmapped);
         }
         let owner = self.owner(addr, class);
-        let l =
-            runtime::on_core(owner, move || async move { self.lookup(addr, kind, class) }).await?;
-        let at = self.geo.slot_off(class, l.slot) + off as u64;
-        self.disk.read(at, buf).await.map_err(|_| Status::Io)?;
+        let l = at(owner, move |c| c.shard.lookup(addr, kind, class)).await?;
+        let read = self.geo.slot_off(class, l.slot) + off as u64;
+        self.disk.read(read, buf).await.map_err(|_| Status::Io)?;
         Ok(Self::reg_of(&l))
     }
 
@@ -1017,10 +1039,6 @@ impl Allocator {
             version: l.version,
             ballot: Ballot::from_raw(l.ballot as u32),
         }
-    }
-
-    fn lookup(&self, addr: GlobalAddr, kind: Kind, class: Class) -> Result<Lookup, Status> {
-        self.shard(runtime::core()).lookup(addr, kind, class)
     }
 
     // ----------------------------------------------------------------------- discard
@@ -1047,7 +1065,7 @@ impl Allocator {
         let (kind, class, _) = self.extent(addr).ok_or(Status::Unmapped)?;
         let owner = self.owner(addr, class);
         // The mblock index is the owner's, so the flush has to happen there too.
-        runtime::on_core(owner, move || async move {
+        runtime::on_core(owner.index(), move || async move {
             match self.trim(addr, kind, class, guard, ballot)? {
                 Some((li, need)) => self.flush_until(class, li, need).await,
                 None => Ok(()),
@@ -1066,8 +1084,7 @@ impl Allocator {
     ) -> Result<Option<(u32, u64)>, Status> {
         let epoch = server::config().tombstone_epoch_of(addr.0);
         maps!(&server::config(), m);
-        self.shard(runtime::core())
-            .trim(addr, kind, class, guard, ballot, epoch, &m)
+        shard(|sh| sh.trim(addr, kind, class, guard, ballot, epoch, &m))
     }
 
     // -------------------------------------------------------- consensus side state
@@ -1108,16 +1125,16 @@ impl Allocator {
     /// The core that holds a group's registers, and so its digest and cursors. The index
     /// alone, not the whole id: universes reuse the same core layout, keeping this in
     /// step with `owner` and a page's shard on the same core as its consensus group.
-    fn owner_of(&self, group: GroupId, class: Class) -> usize {
-        group.index() as usize % shards_for(self.cores, &self.geo, class)
+    fn owner_of(&self, group: GroupId, class: Class) -> CoreId {
+        CoreId::of(group.index() as usize % shards_for(self.cores, &self.geo, class))
     }
 
     /// This node's digest vector for one group and class. Boxed because it crosses a
     /// core boundary and the runtime's reply payload is small.
     pub async fn digests(&'static self, group: GroupId, huge: bool) -> Box<[u64; heal::BUCKETS]> {
         let class = class_of(huge);
-        runtime::on_core(self.owner_of(group, class), move || async move {
-            self.shard(runtime::core()).digest_vector(class, group)
+        at(self.owner_of(group, class), move |c| {
+            c.shard.digest_vector(class, group)
         })
         .await
     }
@@ -1131,10 +1148,10 @@ impl Allocator {
     ) -> Result<u32, Status> {
         let class = class_of(huge);
         let core = self.owner_of(group, class);
-        runtime::on_core(core, move || async move {
+        at(core, move |c| {
             let now = runtime::now();
-            self.shard(runtime::core())
-                .snap_start(class, core, huge, group, filter, now)
+            c.shard
+                .snap_start(class, core.index(), huge, group, filter, now)
                 .ok_or(Status::NoSpace)
         })
         .await
@@ -1154,11 +1171,10 @@ impl Allocator {
             return Err(Status::Unmapped);
         }
         let class = class_of(huge);
-        runtime::on_core(core, move || async move {
+        at(CoreId::of(core), move |c| {
             let now = runtime::now();
             maps!(&server::config(), m);
-            self.shard(runtime::core())
-                .snap_next(class, id, seq, universe, &m, now)
+            c.shard.snap_next(class, id, seq, universe, &m, now)
         })
         .await
     }
@@ -1170,10 +1186,7 @@ impl Allocator {
             return;
         }
         let class = class_of(huge);
-        runtime::on_core(core, move || async move {
-            self.shard(runtime::core()).snap_stop(class, id);
-        })
-        .await
+        at(CoreId::of(core), move |c| c.shard.snap_stop(class, id)).await
     }
 
     // ------------------------------------------------------------------------- shed
@@ -1181,14 +1194,14 @@ impl Allocator {
     /// Groups this core still holds registers for, in one class. Per core like `census`:
     /// a group's registers, and its digests, all live on the one core its id maps to.
     pub fn held_groups(&self, huge: bool) -> Vec<GroupId> {
-        self.shard(runtime::core()).held_groups(class_of(huge))
+        shard(|sh| sh.held_groups(class_of(huge)))
     }
 
     /// Forget a group this core has been drained of, so it drops out of `held_groups`.
     pub async fn forget_group(&'static self, group: GroupId, huge: bool) {
         let class = class_of(huge);
-        runtime::on_core(self.owner_of(group, class), move || async move {
-            self.shard(runtime::core()).forget_group(class, group);
+        at(self.owner_of(group, class), move |c| {
+            c.shard.forget_group(class, group);
         })
         .await
     }
@@ -1199,13 +1212,11 @@ impl Allocator {
         let (_, class, _) = self.extent(addr).ok_or(Status::Unmapped)?;
         let owner = self.owner(addr, class);
         // The mblock index is the owner's, so the flush has to happen there too.
-        runtime::on_core(owner, move || async move {
+        runtime::on_core(owner.index(), move || async move {
             maps!(&server::config(), m);
             // Bound before the match: a temporary in the scrutinee would hold the shard
             // borrow across the flush's await.
-            let hit = self
-                .shard(runtime::core())
-                .discard(addr, class, version, &m);
+            let hit = shard(|sh| sh.discard(addr, class, version, &m));
             match hit {
                 Some((li, need)) => self.flush_until(class, li, need).await,
                 None => Ok(()),
@@ -1220,43 +1231,40 @@ impl Allocator {
     /// mblock staging buffers once, then sweeps a bounded slice of this core's tombstones:
     /// the only garbage collection in the system, metadata only, off any critical path.
     pub fn tick(&self, now: Instant) {
-        let core = runtime::core();
         let cfg = server::config();
         maps!(&cfg, m);
         // Nothing to reclaim until some extent has collected at least once.
         let collecting = cfg.collecting();
-        let mut c = self.core_of(core);
-        for class in [Class::Small, Class::Huge] {
-            if c.staging[class as usize].is_none() {
-                c.staging[class as usize] = PoolBuf::try_alloc(MBLOCK);
+        here(|c| {
+            for class in [Class::Small, Class::Huge] {
+                if c.staging[class as usize].is_none() {
+                    c.staging[class as usize] = PoolBuf::try_alloc(MBLOCK);
+                }
+                c.shard.snap_expire(class, now);
+                if collecting {
+                    c.shard.sweep(class, &m);
+                }
             }
-            c.shard.snap_expire(class, now);
-            if collecting {
-                c.shard.sweep(class, &m);
-            }
-        }
-        c.shard
-            .set_occ(occ_per_core(cfg.policy.occ_bytes, self.cores));
-        c.shard.set_recoverable(cfg.peer_count() > 0);
+            c.shard
+                .set_occ(occ_per_core(cfg.policy.occ_bytes, self.cores));
+            c.shard.set_recoverable(cfg.peer_count() > 0);
+        });
     }
 }
 
 // -------------------------------------------------------------------------- futures
 
 /// Yield once and resume when a flush completes on this core.
+///
+/// It names no core: the waker goes into the row of whichever worker polls it, which is
+/// the worker running the commit that is waiting, which is the worker that will flush.
 struct Park {
-    a: &'static Allocator,
-    core: usize,
     armed: bool,
 }
 
 impl Park {
-    fn new(a: &'static Allocator, core: usize) -> Park {
-        Park {
-            a,
-            core,
-            armed: false,
-        }
+    fn new() -> Park {
+        Park { armed: false }
     }
 }
 
@@ -1268,7 +1276,7 @@ impl Future for Park {
             return Poll::Ready(());
         }
         self.armed = true;
-        self.a.core_of(self.core).waiters.push(cx.waker().clone());
+        here(|c| c.waiters.push(cx.waker().clone()));
         Poll::Pending
     }
 }
@@ -1285,7 +1293,7 @@ pub fn open(
     disk: Disk,
     cfg: &Config,
     cores: usize,
-) -> std::io::Result<&'static Allocator> {
+) -> std::io::Result<(&'static Allocator, Vec<Row>)> {
     let geo = layout::read_geometry(path)?;
     let boot = layout::read_consensus(path)?;
     let limit = std::sync::Arc::new(runtime::Limiter::new(
@@ -1300,29 +1308,23 @@ pub fn open(
         maps!(cfg, m);
         shard::rebuild(&shape_of(&geo, cfg, cores), cores, scans, &m)
     };
-    let shards = shards
+    let rows = shards
         .into_iter()
         .map(|mut shard| {
             shard.set_recoverable(recoverable);
-            RefCell::new(Core {
-                shard,
-                waiters: Vec::with_capacity(64),
-                staging: [None, None],
-                parts: Vec::new(),
-            })
+            Row::new(shard)
         })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
+        .collect::<Vec<_>>();
 
-    Ok(Box::leak(Box::new(Allocator {
+    let alloc = Box::leak(Box::new(Allocator {
         disk,
         geo,
         cores,
-        shards,
         boot,
         quarantined,
-        cache: OnceCell::new(),
-    })))
+        cache: OnceLock::new(),
+    }));
+    Ok((alloc, rows))
 }
 
 /// Read the whole metadata region and resolve each mblock's A/B copies. Split into
@@ -1438,39 +1440,39 @@ fn scan_range(
 /// it. Sampled by the simulator after every step a fuzzer takes, so a violation is
 /// caught at the action that caused it rather than at the read that eventually noticed.
 #[cfg(feature = "sim")]
-impl Allocator {
+impl Row {
+    /// What must hold of one core's share whatever has been done to it. The simulator
+    /// samples this between steps; nothing else calls it.
     pub(crate) fn invariants(&self) -> Result<(), String> {
-        for (i, c) in self.shards.iter().enumerate() {
-            // A borrow held here means a worker is mid-mutation, which only happens if
-            // this was called from inside the runtime. Say so rather than panicking.
-            let Ok(c) = c.try_borrow() else {
-                return Err(format!("core {i}: the shard is borrowed"));
-            };
-            c.shard.invariants().map_err(|e| format!("core {i}: {e}"))?;
-            if c.parts.len() > HUGE_PARTS {
+        // A borrow held here means a worker is mid-mutation, which only happens if
+        // this was called from inside the runtime. Say so rather than panicking.
+        let Ok(c) = self.0.try_borrow() else {
+            return Err("the shard is borrowed".into());
+        };
+        c.shard.invariants()?;
+        if c.parts.len() > HUGE_PARTS {
+            return Err(format!(
+                "{} assemblies, past the {HUGE_PARTS} the table holds",
+                c.parts.len()
+            ));
+        }
+        for (j, p) in c.parts.iter().enumerate() {
+            if p.blocks > HUGE_BLOCKS {
                 return Err(format!(
-                    "core {i}: {} assemblies, past the {HUGE_PARTS} the table holds",
-                    c.parts.len()
+                    "assembly {j} claims {} blocks of a {HUGE_BLOCKS} block page",
+                    p.blocks
                 ));
             }
-            for (j, p) in c.parts.iter().enumerate() {
-                if p.blocks > HUGE_BLOCKS {
-                    return Err(format!(
-                        "core {i}: assembly {j} claims {} blocks of a {HUGE_BLOCKS} block page",
-                        p.blocks
-                    ));
-                }
-                // Two commands for one address may be in flight at once, but never two
-                // for the same command: their pieces would land in each other's slot.
-                if c.parts[..j]
-                    .iter()
-                    .any(|q| q.addr == p.addr && q.key == p.key)
-                {
-                    return Err(format!(
-                        "core {i}: two assemblies for {:#x} under one command",
-                        p.addr.0
-                    ));
-                }
+            // Two commands for one address may be in flight at once, but never two
+            // for the same command: their pieces would land in each other's slot.
+            if c.parts[..j]
+                .iter()
+                .any(|q| q.addr == p.addr && q.key == p.key)
+            {
+                return Err(format!(
+                    "two assemblies for {:#x} under one command",
+                    p.addr.0
+                ));
             }
         }
         Ok(())
@@ -1479,10 +1481,7 @@ impl Allocator {
     /// Pages part-way through arriving. A reservation outlives the command that opened it
     /// only until the assembly is evicted, so a cluster left to settle holds none.
     pub(crate) fn assemblies(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|c| c.try_borrow().map(|c| c.parts.len()).unwrap_or(0))
-            .sum()
+        self.0.try_borrow().map(|c| c.parts.len()).unwrap_or(0)
     }
 }
 

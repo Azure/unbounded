@@ -1191,13 +1191,17 @@ impl Sim {
     /// action that caused it, not the read that eventually noticed.
     pub fn check_invariants(&self) -> Result<(), String> {
         for (i, n) in self.nodes.iter().enumerate() {
-            if n.workers.is_none() {
+            let Some(w) = n.workers.as_ref() else {
                 continue;
+            };
+            // Asked of each worker in turn, because each owns its own share: there is no
+            // one place left where a node's state can be read whole.
+            for c in 0..w.cores() {
+                w.at(c)
+                    .core_state()
+                    .invariants()
+                    .map_err(|e| format!("node {i}, core {c}: {e}"))?;
             }
-            // SAFETY: `dp` is leaked at boot and dropped only when the node crashes,
-            // which is exactly when `workers` becomes `None`.
-            let dp = unsafe { &*(n.dp as *const server::Dataplane) };
-            dp.invariants().map_err(|e| format!("node {i}: {e}"))?;
         }
         Ok(())
     }
@@ -1206,9 +1210,12 @@ impl Sim {
     pub fn assemblies(&self) -> usize {
         self.nodes
             .iter()
-            .filter(|n| n.workers.is_some())
-            // SAFETY: as `check_invariants`.
-            .map(|n| unsafe { &*(n.dp as *const server::Dataplane) }.assemblies())
+            .filter_map(|n| n.workers.as_ref())
+            .map(|w| {
+                (0..w.cores())
+                    .map(|c| w.at(c).core_state().assemblies())
+                    .sum::<usize>()
+            })
             .sum()
     }
 

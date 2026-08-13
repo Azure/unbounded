@@ -860,7 +860,7 @@ impl Cache {
     /// The core owning `addr` for its class, named rather than indexed.
     fn owner_of(&self, addr: GlobalAddr) -> Option<CoreId> {
         let c = self.alloc.owner_core(addr).ok()?;
-        Some(CoreId::new(c).expect("an owner is a worker"))
+        Some(c)
     }
 
     /// Whether this node can cache at all. Structural only, and deliberately cheap: a cohort

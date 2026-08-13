@@ -26,8 +26,11 @@ const RING_SLOTS: usize = 256;
 const RING_SLOTS: usize = 32;
 /// Inline bytes in a message: a closure's captures or a returned value.
 const PAYLOAD_BYTES: usize = 96;
-/// Bytes per in-flight remote future; the largest is the allocator's metadata commit.
-const HOP_TASK_BYTES: usize = 576;
+/// Bytes per in-flight remote future; the largest is the allocator's metadata commit,
+/// which at the time of writing is 592 of them. Sized in whole cache lines above that,
+/// because the cost of being wrong is a build that does not compile rather than a bug,
+/// and the const assertion in `call_trampoline` says so with the type that overflowed.
+const HOP_TASK_BYTES: usize = 640;
 /// Remote futures a worker can host at once.
 #[cfg(not(feature = "sim"))]
 const HOP_TASKS: u32 = 1024;
