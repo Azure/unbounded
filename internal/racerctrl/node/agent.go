@@ -110,6 +110,15 @@ type Agent struct {
 	// it is only ever bumped when a genuinely different config is installed.
 	published  *racerconfig.NodeConfig
 	generation uint64
+
+	// adopted names the volumes whose bindings came off disk at startup rather
+	// than from a NodeStageVolume in this process. They are pruned once, on the
+	// first reconcile that sees a synced cache, against the volumes the cluster
+	// actually has: a binding for a volume that has since been deleted would
+	// otherwise fail every render forever. Bindings this process made itself
+	// are never pruned, because a volume staged a moment ago may not have
+	// reached the informer cache yet.
+	adopted map[string]struct{}
 }
 
 // NewAgent builds an agent. It does not touch the cluster or the host.
@@ -165,7 +174,7 @@ func (a *Agent) Trigger() {
 // Run starts the informers and services reconcile requests until the context is
 // cancelled.
 func (a *Agent) Run(ctx context.Context) error {
-	if err := a.adoptExistingConfig(); err != nil {
+	if err := a.adoptExistingState(); err != nil {
 		return err
 	}
 
@@ -232,16 +241,23 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// adoptExistingConfig reads the config left behind by an earlier run so the
-// generation counter continues rather than restarting.
+// adoptExistingState reads what an earlier run of this agent left behind: the
+// config racer is already serving, and the device bindings that say which
+// volume each of its minors carries.
 //
 // R1 requires the generation strictly increase for the life of a node, and a
 // restarted agent that began again at one would have every subsequent config
-// rejected by a racer that had not restarted with it.
-func (a *Agent) adoptExistingConfig() error {
+// rejected by a racer that had not restarted with it. The bindings matter for a
+// blunter reason: racer is a separate container in this pod and does not
+// restart when the agent does, so its exports are still up and still in use.
+// An agent that forgot them would render a config with no devices and take
+// them away from running pods.
+func (a *Agent) adoptExistingState() error {
 	if err := os.MkdirAll(a.cfg.ConfigDir, 0o700); err != nil {
 		return fmt.Errorf("create config directory %s: %w", a.cfg.ConfigDir, err)
 	}
+
+	a.adoptBindings()
 
 	existing, err := racerctrl.ReadConfig(a.cfg.ConfigPath())
 	if err != nil {
@@ -260,16 +276,95 @@ func (a *Agent) adoptExistingConfig() error {
 	a.published = existing
 	a.generation = existing.GetGeneration()
 
-	// Only the generation is adopted, not the device list. The config records
-	// device ids but not the volume names they were staged for, and the
-	// kubelet re-issues NodeStageVolume for every volume a running pod holds
-	// after a plugin restart, so the bindings are rebuilt from those calls.
-	// Until they arrive the node exports nothing, which is correct: nothing is
-	// mounted either.
 	a.log.Info("adopted existing racer config",
-		"path", a.cfg.ConfigPath(), "generation", a.generation)
+		"path", a.cfg.ConfigPath(),
+		"generation", a.generation,
+		"devices", len(a.self.Devices),
+		"fabric", len(a.self.Fabric))
 
 	return nil
+}
+
+// adoptBindings restores the volume-to-minor map from disk.
+//
+// A file that cannot be read is reported and ignored rather than fatal. The
+// alternative, refusing to start, leaves the node with no agent at all: no
+// status, no membership convergence and no way to recover, over a file the
+// next successful stage rewrites. Losing the bindings costs the exports that
+// were up, which is bad, but wedging the node costs everything.
+func (a *Agent) adoptBindings() {
+	stored, err := readBindings(a.cfg.BindingsPath())
+	if err != nil {
+		a.log.Error("ignoring unreadable device bindings; exports staged before this restart will be dropped",
+			"path", a.cfg.BindingsPath(), "error", err)
+
+		return
+	}
+
+	stored.apply(&a.self)
+
+	a.adopted = make(map[string]struct{}, len(stored.Devices))
+	for _, device := range stored.Devices {
+		a.adopted[device.Volume] = struct{}{}
+	}
+}
+
+// saveBindings records the current minors. The caller holds the lock.
+//
+// A failure here is logged rather than returned: the binding is already live in
+// memory and the export it describes is what the pod is using, so refusing the
+// operation would break a working path to protect a restart that may never
+// happen.
+func (a *Agent) saveBindings() {
+	if err := writeBindings(a.cfg.BindingsPath(), a.self); err != nil {
+		a.log.Error("failed to record device bindings; a restart would forget them",
+			"path", a.cfg.BindingsPath(), "error", err)
+	}
+}
+
+// pruneAdoptedBindings drops bindings restored from disk whose volume the
+// cluster no longer has. The caller holds the lock.
+//
+// Without this a volume deleted while the agent was down would fail every
+// render for the life of the pod, because the derivation refuses to build a
+// device for a volume no storage class carries. Only adopted bindings are
+// eligible: one this process made itself may be for a PersistentVolume the
+// informer cache has not seen yet.
+func (a *Agent) pruneAdoptedBindings(cluster racerctrl.ClusterState) {
+	if len(a.adopted) == 0 {
+		return
+	}
+
+	known := make(map[string]struct{})
+
+	for i := range cluster.Universes {
+		for j := range cluster.Universes[i].Volumes {
+			known[cluster.Universes[i].Volumes[j].Name] = struct{}{}
+		}
+	}
+
+	var dropped bool
+
+	for volume := range a.adopted {
+		if _, ok := known[volume]; ok {
+			continue
+		}
+
+		if racerctrl.ReleaseDeviceID(&a.self, volume) {
+			a.log.Warn("dropping a device binding for a volume the cluster no longer has",
+				"volume", volume)
+
+			dropped = true
+		}
+	}
+
+	// One pass only. Every binding that survived it is now as trustworthy as
+	// one this process staged itself.
+	a.adopted = nil
+
+	if dropped {
+		a.saveBindings()
+	}
 }
 
 // Reconcile renders and installs this node's config once.
@@ -310,6 +405,10 @@ func (a *Agent) Reconcile(ctx context.Context) error {
 		Nodes:     nodeStates,
 		Universes: buildUniverseStates(classes, volumes, memberships, a.log),
 	}
+
+	// Bindings restored from disk are checked against the cluster once, now
+	// that there is a synced view to check them against.
+	a.pruneAdoptedBindings(cluster)
 
 	// Identity comes from the Node object; status comes from memory. The
 	// in-memory copy is authoritative for the status half because a volume
@@ -355,6 +454,7 @@ func (a *Agent) Reconcile(ctx context.Context) error {
 // disruptive namespace repoint.
 func (a *Agent) assignFabricMinors(cluster racerctrl.ClusterState) error {
 	joined := map[uint32]struct{}{}
+	changed := false
 
 	for _, universe := range cluster.Universes {
 		if !universeJoinsNode(universe, a.self) {
@@ -363,15 +463,22 @@ func (a *Agent) assignFabricMinors(cluster racerctrl.ClusterState) error {
 
 		joined[universe.ID] = struct{}{}
 
-		if _, _, err := racerctrl.AssignFabricDeviceID(&a.self, universe.ID); err != nil {
+		_, added, err := racerctrl.AssignFabricDeviceID(&a.self, universe.ID)
+		if err != nil {
 			return fmt.Errorf("assign fabric minor for universe %d: %w", universe.ID, err)
 		}
+
+		changed = changed || added
 	}
 
 	for _, export := range append([]racerctrl.FabricExport(nil), a.self.Fabric...) {
 		if _, ok := joined[export.UniverseID]; !ok {
-			racerctrl.ReleaseFabricDeviceID(&a.self, export.UniverseID)
+			changed = racerctrl.ReleaseFabricDeviceID(&a.self, export.UniverseID) || changed
 		}
+	}
+
+	if changed {
+		a.saveBindings()
 	}
 
 	return nil
@@ -549,7 +656,15 @@ func (a *Agent) scrapeLoop(ctx context.Context) {
 // only this node can allocate correctly anyway.
 func (a *Agent) Stage(ctx context.Context, volume string) (string, error) {
 	a.mu.Lock()
-	id, _, err := racerctrl.AssignDeviceID(&a.self, volume)
+
+	id, added, err := racerctrl.AssignDeviceID(&a.self, volume)
+	if err == nil && added {
+		// Recorded before the config that exports it is rendered: a binding
+		// racer is serving but the file does not name is exactly the state
+		// this file exists to prevent.
+		a.saveBindings()
+	}
+
 	a.mu.Unlock()
 
 	if err != nil {
@@ -589,7 +704,13 @@ func (a *Agent) Stage(ctx context.Context, volume string) (string, error) {
 // calling this.
 func (a *Agent) Unstage(volume string) {
 	a.mu.Lock()
+
 	released := racerctrl.ReleaseDeviceID(&a.self, volume)
+	if released {
+		delete(a.adopted, volume)
+		a.saveBindings()
+	}
+
 	a.mu.Unlock()
 
 	if released {
