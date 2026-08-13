@@ -60,11 +60,17 @@ const (
 	// share the config directory and the node's lifetime.
 	daemonSetName = "racer"
 
-	// ctrlContainerName and racerContainerName are the two containers that
-	// carry operator-derived images. The registrar keeps its pinned upstream
-	// image.
-	ctrlContainerName  = "racer-ctrl"
-	racerContainerName = "racer"
+	// The containers that carry operator-derived images. The registrar keeps
+	// its pinned upstream image.
+	//
+	// preflight runs the racer-ctrl binary under a different container name, so
+	// it needs the racer-ctrl image named separately: matching by container
+	// name is what SetNamedContainerImage does, and leaving preflight out means
+	// the init container keeps whatever registry the manifest was rendered
+	// against while the rest of the pod follows the operator.
+	preflightContainerName = "preflight"
+	ctrlContainerName      = "racer-ctrl"
+	racerContainerName     = "racer"
 
 	// ctrlImageRepository and racerImageRepository are version-matched to the
 	// operator through component.Config.Image, like every other component.
@@ -266,6 +272,10 @@ func applyMutator(ctrlImage, racerImage string) func(*unstructured.Unstructured)
 		case "DaemonSet":
 			if obj.GetName() != daemonSetName {
 				return nil
+			}
+
+			if err := component.SetNamedContainerImage(obj, preflightContainerName, ctrlImage); err != nil {
+				return fmt.Errorf("set preflight image: %w", err)
 			}
 
 			if err := component.SetNamedContainerImage(obj, ctrlContainerName, ctrlImage); err != nil {
