@@ -178,8 +178,20 @@ impl Node {
     }
 }
 
+/// The state one worker owns outright: shards, cache slots and consensus rows that no
+/// other core may touch. Reached only through `runtime::with_core`, and never swapped, so
+/// a reload replaces what a core reads and not what it owns.
+///
+/// Empty for now; the subsystems move their per-core rows in here.
+pub struct CoreState {}
+
 impl Handler for Server {
     type Config = Dataplane;
+    type CoreState = CoreState;
+
+    fn core_state(&'static self, _cfg: &Dataplane, cores: usize) -> Vec<CoreState> {
+        (0..cores).map(|_| CoreState {}).collect()
+    }
 
     async fn handle(&'static self, cfg: Cfg<Dataplane>, req: Request) -> Result<(), Errno> {
         if req.dev & FABRIC_TAG != 0 {

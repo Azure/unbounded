@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::layout::{self, Class, Entry, Geometry, State};
-use crate::runtime::{Buf, Errno, Op, Request, SimNode, SimWorker, sim_addr, sim_buf};
+use crate::runtime::{Buf, Errno, Handler, Op, Request, SimNode, SimWorker, sim_addr, sim_buf};
 use crate::server::{self, SERVER};
 
 /// Block size of every simulated device. Frames and mblocks are 4 KiB.
@@ -1029,9 +1029,14 @@ impl Sim {
         // `attach` runs on the control thread in production and touches no worker state,
         // so it needs no `Local`.
         let dp: *const () = Box::leak(Box::new(node.attach(&cfgr, cfg)?)) as *const _ as *const ();
+        // SAFETY: `dp` is the `Dataplane` just leaked above, live for the rest of the run.
+        let rows = SERVER.core_state(unsafe { &*(dp as *const server::Dataplane) }, cores);
         let n = &mut self.nodes[i];
-        for c in 0..cores {
+        for (c, row) in rows.into_iter().enumerate() {
             workers.at(c).publish(1, dp);
+            workers
+                .at(c)
+                .install_core_state(Box::leak(Box::new(row)) as *const _ as *const ());
         }
         n.free = (0..cores)
             .map(|_| (0..slots_per_worker()).collect())

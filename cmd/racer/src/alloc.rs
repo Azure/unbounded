@@ -1531,6 +1531,11 @@ mod tests {
 
     impl Handler for Driver {
         type Config = Harness;
+        type CoreState = ();
+
+        fn core_state(&'static self, _cfg: &Harness, cores: usize) -> Vec<()> {
+            vec![(); cores]
+        }
 
         async fn handle(&'static self, _cfg: Cfg<Harness>, _req: Request) -> Result<(), Errno> {
             Err(Errno::EOPNOTSUPP)

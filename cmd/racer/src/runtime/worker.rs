@@ -25,8 +25,8 @@ use super::io::{OpSlab, Pool};
 use super::sys::{self, Mapping};
 use super::ublk;
 use super::{
-    Cfg, Errno, FILE_SLOTS, Handler, MAX_DEVICES, MAX_IO_BYTES, Op, POOL_BUF_BASE, QUEUE_DEPTH,
-    QUEUES_PER_WORKER, Request, TAGS_PER_DEV, TOTAL_BUF_SLOTS,
+    Cfg, CoreCtx, CoreId, Errno, FILE_SLOTS, Handler, MAX_DEVICES, MAX_IO_BYTES, Op, POOL_BUF_BASE,
+    QUEUE_DEPTH, QUEUES_PER_WORKER, Request, TAGS_PER_DEV, TOTAL_BUF_SLOTS,
 };
 
 /// SQ entries; the CQ is 4x this (`Local::new`) so completion bursts never overflow.
@@ -126,6 +126,12 @@ pub(super) enum Ctl {
     /// Ack once no live task on this worker still holds a guard for `ver`.
     Retire {
         ver: u32,
+        ack: Ack,
+    },
+    /// Hand this worker the state it owns. Sent once, before it takes traffic; unlike
+    /// `Publish` it is never swapped, so the state outlives every reload.
+    InstallCoreState {
+        ptr: *const (),
         ack: Ack,
     },
     /// Take ownership of this worker's ublk queues for a device and arm their fetches.
@@ -255,6 +261,8 @@ pub(super) struct Local {
     devs: RefCell<Vec<DevSlot>>,
     cfg_ptr: Cell<*const ()>,
     cfg_ver: Cell<u32>,
+    /// This worker's `H::CoreState`, installed once before it takes traffic.
+    state_ptr: Cell<*const ()>,
     /// One counter per config version; `reconcile` retires older ones, so four never wraps.
     guards: [Cell<u32>; 4],
     stop: Cell<bool>,
@@ -286,6 +294,37 @@ pub(super) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
 /// Index of the worker running this code.
 pub(crate) fn core() -> usize {
     with_local(|l| l.core)
+}
+
+/// Workers in this runtime.
+#[allow(dead_code)]
+pub(crate) fn cores() -> usize {
+    with_local(|l| l.fabric.cores())
+}
+
+/// Build this worker's [`CoreCtx`] and run `f` under it.
+///
+/// Synchronous by construction: `f` cannot await, so the worker cannot process a `Retire`
+/// while it runs and neither pointer can be pulled out from under it. That is why a core
+/// transaction needs no configuration guard.
+#[allow(dead_code)]
+pub(super) fn with_core_ctx<H: Handler, R>(f: impl FnOnce(CoreCtx<'_, H>) -> R) -> R {
+    with_local(|l| {
+        let cfg = l.cfg_ptr.get();
+        assert!(!cfg.is_null(), "racer: no configuration published");
+        let state = l.state_ptr.get();
+        assert!(!state.is_null(), "racer: no core state installed");
+        // SAFETY: both are published by the control thread ahead of any traffic, and
+        // outlive this body, which cannot yield.
+        let ctx = unsafe {
+            CoreCtx::new(
+                CoreId::of(l.core),
+                &*(cfg as *const H::Config),
+                &*(state as *const H::CoreState),
+            )
+        };
+        f(ctx)
+    })
 }
 
 /// Queues a hop message for `dst`, deferring it if the ring is momentarily full.
@@ -387,6 +426,7 @@ impl Local {
             devs: RefCell::new((0..MAX_DEVICES).map(|_| DevSlot::default()).collect()),
             cfg_ptr: Cell::new(std::ptr::null()),
             cfg_ver: Cell::new(0),
+            state_ptr: Cell::new(std::ptr::null()),
             guards: [const { Cell::new(0) }; 4],
             stop: Cell::new(false),
             commit_backlog: RefCell::new(VecDeque::new()),
@@ -1018,6 +1058,11 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
                 l.cfg_ver.set(ver);
                 let _ = ack.send(());
             }
+            Ctl::InstallCoreState { ptr, ack } => {
+                debug_assert!(l.state_ptr.get().is_null(), "core state installed twice");
+                l.state_ptr.set(ptr);
+                let _ = ack.send(());
+            }
             Ctl::Retire { ver, ack } => {
                 // The control thread is about to drop this version; stop handing it out
                 // or the maintenance tick would call the handler with a freed pointer.
@@ -1177,6 +1222,15 @@ pub(crate) mod sim {
         pub(crate) fn publish(&self, ver: u32, ptr: *const ()) {
             self.l.cfg_ptr.set(ptr);
             self.l.cfg_ver.set(ver);
+        }
+
+        /// Installs this worker's state, standing in for `Ctl::InstallCoreState`.
+        pub(crate) fn install_core_state(&self, ptr: *const ()) {
+            debug_assert!(
+                self.l.state_ptr.get().is_null(),
+                "core state installed twice"
+            );
+            self.l.state_ptr.set(ptr);
         }
 
         /// Starts a request in slot `id`; returns a result only if it finished inline.

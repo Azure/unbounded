@@ -222,6 +222,16 @@ pub trait Handler: Sync + 'static {
     /// [`Runtime::reload`].
     type Config: Sync + 'static;
 
+    /// State one worker owns outright, reachable only through [`with_core`].
+    ///
+    /// Unlike [`Handler::Config`] this is never swapped: a reload replaces what a core
+    /// reads, not the shards, slots and counters it owns.
+    type CoreState: Send + 'static;
+
+    /// Build one row per worker. Called once, on the control thread, after the first
+    /// configuration is published and before any worker takes traffic.
+    fn core_state(&'static self, cfg: &Self::Config, cores: usize) -> Vec<Self::CoreState>;
+
     /// Serve one request. The returned future is stored in a preallocated slot, so it
     /// must be small; put cold paths behind `Box::pin(..).await`.
     fn handle(
@@ -233,6 +243,104 @@ pub trait Handler: Sync + 'static {
     /// Maintenance hook: runs on every core about every millisecond, idle or not, for
     /// per-core state. Runs on the worker thread, so it must not block.
     fn tick(&'static self, _cfg: Cfg<Self::Config>, _now: Instant) {}
+}
+
+/// A worker index, checked once against the runtime's worker count.
+///
+/// The only way to name a core. Holding one is not proof you are running on it:
+/// [`with_core`] is what turns a `CoreId` into access to that core's state.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct CoreId(u16);
+
+// The subsystems still reach their rows through the ambient core; until they move behind
+// `with_core` the only consumer outside the runtime's own tests is the runtime itself.
+#[allow(dead_code)]
+impl CoreId {
+    /// `None` if `i` is not a worker index. Callers derive `i` from an address or a
+    /// consensus group, so this is the one place a mapping bug is caught.
+    pub(crate) fn new(i: usize) -> Option<CoreId> {
+        (i < cores()).then_some(CoreId(i as u16))
+    }
+
+    /// Unchecked: for the runtime naming a worker's own index.
+    pub(crate) fn of(i: usize) -> CoreId {
+        debug_assert!(i <= u16::MAX as usize);
+        CoreId(i as u16)
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// The worker running this code.
+#[allow(dead_code)]
+pub(crate) fn core_id() -> CoreId {
+    CoreId::of(worker::core())
+}
+
+/// Workers in this runtime.
+#[allow(dead_code)]
+pub(crate) fn cores() -> usize {
+    worker::cores()
+}
+
+/// One core's half of the dataplane, for the length of one transaction.
+///
+/// Handed to the closure by [`with_core`] on the core that owns the state; never
+/// constructed by callers. `'b` is invariant and appears in no output type, so a borrow of
+/// a shard or of the configuration cannot outlive the transaction that took it. That is
+/// what makes "the borrow ends before the await" a compile error rather than a comment.
+pub struct CoreCtx<'b, H: Handler> {
+    core: CoreId,
+    cfg: &'b H::Config,
+    state: &'b H::CoreState,
+    _brand: PhantomData<fn(&'b ()) -> &'b ()>,
+    _nosend: PhantomData<*const ()>,
+}
+
+#[allow(dead_code)]
+impl<'b, H: Handler> CoreCtx<'b, H> {
+    pub(crate) fn new(core: CoreId, cfg: &'b H::Config, state: &'b H::CoreState) -> Self {
+        CoreCtx {
+            core,
+            cfg,
+            state,
+            _brand: PhantomData,
+            _nosend: PhantomData,
+        }
+    }
+
+    /// The worker this transaction is running on, and whose state [`Self::state`] is.
+    pub fn core(&self) -> CoreId {
+        self.core
+    }
+
+    pub fn cfg(&self) -> &'b H::Config {
+        self.cfg
+    }
+
+    pub fn state(&self) -> &'b H::CoreState {
+        self.state
+    }
+}
+
+/// Run `f` on the worker that owns `dst`'s state and return its value.
+///
+/// The body is synchronous: it holds `dst`'s state for the whole transaction and cannot
+/// await, so no other task observes a half-applied step and no configuration guard is
+/// needed. On this core it runs inline. Otherwise the closure is copied into the
+/// destination's ring and runs during its next drain, with no task-slab slot.
+///
+/// Dropping the returned future abandons the reply; a transaction already sent still runs.
+#[allow(dead_code)]
+pub(crate) fn with_core<H, F, T>(dst: CoreId, f: F) -> impl Future<Output = T>
+where
+    H: Handler,
+    F: FnOnce(CoreCtx<'_, H>) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    hop::Call::<H, F, T>::new(dst.index(), f)
 }
 
 /// Run `f` on `core` and await its result there.
@@ -688,11 +796,16 @@ impl Hub {
     }
 }
 
+/// Builds one leaked per-core state row per worker, erased so `Ctx` stays free of `H`.
+type CoreStateFn<C> = Box<dyn FnOnce(&C, usize) -> Vec<*const ()> + Send>;
+
 struct Ctx<C> {
     cfgr: Configurator,
     hub: Hub,
     versions: VecDeque<Version<C>>,
     next_ver: u32,
+    /// Taken on first use: core state is installed once and never swapped.
+    core_state: Option<CoreStateFn<C>>,
 }
 
 type Job<C> = Box<dyn FnOnce(&mut Ctx<C>) + Send>;
@@ -889,6 +1002,14 @@ fn boot<H: Handler>(handler: &'static H) -> std::io::Result<Runtime<H::Config>> 
                 hub: Hub { inboxes, doorbell },
                 versions: VecDeque::new(),
                 next_ver: 1,
+                core_state: Some(Box::new(move |cfg: &H::Config, n: usize| {
+                    let rows = handler.core_state(cfg, n);
+                    assert_eq!(rows.len(), n, "one core state row per worker");
+                    // Leaked: a worker holds its row for the life of the process.
+                    rows.into_iter()
+                        .map(|s| Box::into_raw(Box::new(s)) as *const ())
+                        .collect()
+                })),
             };
             // `stop` posts teardown before dropping the sender, so it has run by loop exit.
             while let Ok(job) = rx.recv() {
@@ -961,6 +1082,14 @@ where
         ptr: ptr as *const (),
         ack,
     });
+
+    // 4b. Core state: built once, from the first configuration, and never swapped.
+    if let Some(build) = ctx.core_state.take() {
+        let rows = build(&cfg, ctx.hub.inboxes.len());
+        ctx.hub
+            .broadcast(|i, ack| Ctl::InstallCoreState { ptr: rows[i], ack });
+    }
+
     ctx.versions.push_back(Version { ver, cfg });
     // `retire_old` drains older versions, so a worker's 4-slot guard table cannot wrap.
     debug_assert!(ctx.versions.len() <= 2);
@@ -1124,10 +1253,10 @@ mod tests {
         dev: Export,
     }
 
-    // The block map is sharded by lba: `handle` hops to the owning core, then does IO.
-    thread_local! {
-        static SEEN: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+    // The block map is sharded by lba: each shard is its owner's `CoreState`.
+    #[derive(Default)]
+    struct Blocks {
+        map: std::cell::RefCell<std::collections::HashMap<u64, u64>>,
     }
 
     static HANDLER: Passthrough = Passthrough;
@@ -1139,20 +1268,33 @@ mod tests {
 
     impl Handler for Passthrough {
         type Config = Conf;
+        type CoreState = Blocks;
+
+        fn core_state(&'static self, _cfg: &Conf, cores: usize) -> Vec<Blocks> {
+            (0..cores).map(|_| Blocks::default()).collect()
+        }
 
         async fn handle(&'static self, cfg: Cfg<Conf>, req: Request) -> Result<(), Errno> {
             let lba = req.lba;
             let n = cfg.cores;
             // Fan out to two cores and take the first answer; the slow leg is abandoned.
             let legs: [_; 2] = std::array::from_fn(|i| {
-                let dst = (lba as usize + i) % n;
-                on_core(dst, move || async move {
+                let dst = CoreId::new((lba as usize + i) % n).expect("lba maps to a worker");
+                on_core(dst.index(), move || async move {
                     if i == 1 {
                         sleep(Duration::from_millis(2)).await;
                     }
-                    Ok::<u64, Errno>(
-                        SEEN.with(|m| *m.borrow_mut().entry(lba).or_insert(lba * 4096)),
-                    )
+                    // Already on `dst`, so the transaction resolves inline; the point is
+                    // that the shard is reachable only through one.
+                    let off = with_core::<Passthrough, _, _>(dst, move |ctx| {
+                        *ctx.state()
+                            .map
+                            .borrow_mut()
+                            .entry(lba)
+                            .or_insert(lba * 4096)
+                    })
+                    .await;
+                    Ok::<u64, Errno>(off)
                 })
             });
             let off = quorum(legs, 1)
@@ -1171,7 +1313,7 @@ mod tests {
 
         fn tick(&'static self, cfg: Cfg<Conf>, _now: Instant) {
             TICKS.fetch_add(1, Ordering::Relaxed);
-            TICKED.fetch_or(1 << (core() % 64), Ordering::Relaxed);
+            TICKED.fetch_or(1 << (core_id().index() % 64), Ordering::Relaxed);
             NCORES.store(cfg.cores as u64, Ordering::Relaxed);
         }
     }
