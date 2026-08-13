@@ -121,6 +121,7 @@ can be tuned without changing its `args`. The ones worth knowing:
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--devices` | `/run/racer/image-devices.json` | Re-read on a timer; the agent picks up new segments without a restart |
+| `--work-headroom` | `4Gi` (DaemonSet sets `8Gi`) | Free bytes on the work filesystem an ingest refuses to spend. Raise it above the kubelet's `nodefs` eviction threshold on nodes with small root disks |
 | `--format-catalog` | `false` | The DaemonSet sets it to `true`. Formatting is a compare-and-swap on block zero, so every node may safely try |
 | `--adopt-segments` | `true` | Register newly visible segments and open one for writing if none is open |
 | `--members-selector` | unset | Enables the peer view that ranks ingest work. Unset means every node ingests every layer |
@@ -151,3 +152,14 @@ needs the layer starts with a single overlay mount. They are swept by the
 periodic cleanup, and only when the agent can account for every live
 snapshot; a mapping leaked for one sweep is much cheaper than unmapping a
 layer a running container is reading.
+
+**Ingest needs disk and gives it up first.** Converting a layer writes the
+uncompressed tarball and then the EROFS image beside it under `--work-dir`,
+so a layer costs about twice its own size on the node's root filesystem while
+it is being built. The agent statfs's that filesystem before it fetches
+anything and refuses the layer if the conversion would eat into
+`--work-headroom`. A refusal is logged and is not a failure: the container
+that triggered it is already running on a locally unpacked layer, and some
+other node will publish it. Persistent `not enough room on the work
+filesystem` means the nodes are too small for the images, not that the
+snapshotter is broken.

@@ -136,6 +136,7 @@ func TestMalformedEnvironmentFallsBack(t *testing.T) {
 	t.Setenv("GANTRY_SNAPSHOTTER_SKIP_VERIFY", "perhaps")
 	t.Setenv("GANTRY_SNAPSHOTTER_CATALOG_SYNC", "soon")
 	t.Setenv("GANTRY_SNAPSHOTTER_HOLE_GRACE", "eventually")
+	t.Setenv("GANTRY_SNAPSHOTTER_WORK_HEADROOM", "plenty")
 
 	cfg, err := parseConfig(nil, io.Discard)
 	if err != nil {
@@ -148,6 +149,10 @@ func TestMalformedEnvironmentFallsBack(t *testing.T) {
 
 	if cfg.HoleGrace != catalog.DefaultHoleGrace {
 		t.Errorf("hole grace = %s, want %s", cfg.HoleGrace, catalog.DefaultHoleGrace)
+	}
+
+	if cfg.WorkHeadroom != ingest.DefaultHeadroom {
+		t.Errorf("work headroom = %d, want %d", cfg.WorkHeadroom, uint64(ingest.DefaultHeadroom))
 	}
 }
 

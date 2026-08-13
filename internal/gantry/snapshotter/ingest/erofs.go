@@ -214,7 +214,12 @@ func trim(out []byte) string {
 // make a retry impossible without re-fetching the layer, and the layer is
 // already on local disk in containerd's content store, so a second copy on the
 // same disk is the cheaper trade.
-func Spill(dir, pattern string, r io.Reader) (path string, size uint64, err error) {
+//
+// limit bounds the copy and a zero limit means unbounded. The bound matters
+// because the alternative to refusing a layer here is discovering it is too big
+// when the filesystem returns ENOSPC, and by then the node's disk is full and
+// the kubelet is already evicting pods that had nothing to do with this.
+func Spill(dir, pattern string, r io.Reader, limit uint64) (path string, size uint64, err error) {
 	f, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return "", 0, fmt.Errorf("ingest: create temp: %w", err)
@@ -231,12 +236,25 @@ func Spill(dir, pattern string, r io.Reader) (path string, size uint64, err erro
 		}
 	}()
 
-	n, err := io.Copy(f, r)
+	src := r
+
+	if limit > 0 {
+		// One byte past the limit, so a layer that is exactly at it
+		// still succeeds and anything larger is detectable rather than
+		// silently truncated.
+		src = io.LimitReader(r, int64(limit)+1) //nolint:gosec // limit is derived from a filesystem's free byte count
+	}
+
+	n, err := io.Copy(f, src)
 	if err != nil {
 		return "", 0, fmt.Errorf("ingest: buffer layer: %w", err)
 	}
 
-	return f.Name(), uint64(n), nil
+	if limit > 0 && uint64(n) > limit { //nolint:gosec // io.Copy never returns a negative count
+		return "", 0, fmt.Errorf("%w: layer is larger than the %d bytes this node can spare", ErrNoSpace, limit)
+	}
+
+	return f.Name(), uint64(n), nil //nolint:gosec // io.Copy never returns a negative count
 }
 
 // UUIDFor derives a stable RFC 4122 version 5 style UUID from a name.

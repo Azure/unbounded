@@ -93,6 +93,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		Opener:     opener,
 		Builder:    builder,
 		WorkDir:    cfg.WorkDir,
+		Headroom:   cfg.WorkHeadroom,
 		SkipVerify: cfg.SkipVerify,
 	})
 	if err != nil {

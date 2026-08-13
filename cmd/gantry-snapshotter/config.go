@@ -54,6 +54,12 @@ type Config struct {
 	// image at a time.
 	WorkDir string
 
+	// WorkHeadroom is the free space on WorkDir's filesystem that ingest
+	// refuses to spend. WorkDir is a hostPath shared with every other pod
+	// on the node, so this is what stops a large layer from filling the
+	// node's disk and evicting workloads that have nothing to do with it.
+	WorkHeadroom uint64
+
 	// Devices is the operator-rendered description of this node's image
 	// devices.
 	Devices string
@@ -174,6 +180,7 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	fs.StringVar(&socketMode, "socket-mode", envOr("GANTRY_SNAPSHOTTER_SOCKET_MODE", "0660"), "permission bits on the socket")
 	fs.StringVar(&c.Root, "root", envOr("GANTRY_SNAPSHOTTER_ROOT", DefaultRoot), "directory for snapshot metadata and local layers")
 	fs.StringVar(&c.WorkDir, "work-dir", envOr("GANTRY_SNAPSHOTTER_WORK_DIR", DefaultWorkDir), "scratch directory for ingest")
+	fs.Uint64Var(&c.WorkHeadroom, "work-headroom", envUint64("GANTRY_SNAPSHOTTER_WORK_HEADROOM", ingest.DefaultHeadroom), "free bytes on the work filesystem an ingest will not spend")
 	fs.StringVar(&c.Devices, "devices", envOr("GANTRY_SNAPSHOTTER_DEVICES", DefaultDevices), "operator-rendered image device description")
 	fs.DurationVar(&c.DeviceInterval, "device-interval", envDuration("GANTRY_SNAPSHOTTER_DEVICE_INTERVAL", segment.DefaultWatchInterval), "how often to re-read the device description")
 	fs.BoolVar(&c.FormatCatalog, "format-catalog", envBool("GANTRY_SNAPSHOTTER_FORMAT_CATALOG", false), "format the catalog device when it is blank")
@@ -311,6 +318,20 @@ func envInt(key string, fallback int) int {
 	}
 
 	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+
+	return n
+}
+
+func envUint64(key string, fallback uint64) uint64 {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+
+	n, err := strconv.ParseUint(v, 10, 64)
 	if err != nil {
 		return fallback
 	}

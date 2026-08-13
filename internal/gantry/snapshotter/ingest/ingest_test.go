@@ -207,6 +207,13 @@ func newIngester(t *testing.T, opts Options) *Ingester {
 		opts.Open = openPlain
 	}
 
+	if opts.Free == nil {
+		// These tests are about ingest, not about the disk underneath
+		// them. A fixed generous number keeps them from depending on
+		// how much room the machine running them happens to have.
+		opts.Free = func(string) (uint64, error) { return 1 << 40, nil }
+	}
+
 	i, err := New(opts)
 	if err != nil {
 		t.Fatalf("new ingester: %v", err)
@@ -354,7 +361,7 @@ func TestSpill(t *testing.T) {
 	dir := t.TempDir()
 	payload := bytes.Repeat([]byte("t"), 4097)
 
-	path, size, err := Spill(dir, "l-*.tar", bytes.NewReader(payload))
+	path, size, err := Spill(dir, "l-*.tar", bytes.NewReader(payload), 0)
 	if err != nil {
 		t.Fatalf("spill: %v", err)
 	}
@@ -377,7 +384,7 @@ func TestSpillRemovesTheFileOnError(t *testing.T) {
 	dir := t.TempDir()
 	want := errors.New("boom")
 
-	_, _, err := Spill(dir, "l-*.tar", io.MultiReader(bytes.NewReader([]byte("a")), errReader{want}))
+	_, _, err := Spill(dir, "l-*.tar", io.MultiReader(bytes.NewReader([]byte("a")), errReader{want}), 0)
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
 	}
@@ -797,6 +804,118 @@ func TestIngestFailureLeavesNoHole(t *testing.T) {
 
 	if _, ok := reader.Resolve(digestOf(2)); ok {
 		t.Fatal("the failed ingest published a record")
+	}
+}
+
+// shrinkingFree reports a different number on each call, so a test can put the
+// filesystem under pressure between the two checks an ingest makes.
+type shrinkingFree struct {
+	mu   sync.Mutex
+	vals []uint64
+}
+
+func (s *shrinkingFree) free(string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	v := s.vals[0]
+	if len(s.vals) > 1 {
+		s.vals = s.vals[1:]
+	}
+
+	return v, nil
+}
+
+// noReserve fails the test if anything takes a catalog reservation.
+type noReserve struct {
+	Catalog
+
+	t *testing.T
+}
+
+func (n noReserve) Reserve(pages uint32, records int) (catalog.Reservation, error) {
+	n.t.Helper()
+	n.t.Fatalf("a refused ingest reserved %d pages and %d records", pages, records)
+
+	return catalog.Reservation{}, nil
+}
+
+func TestIngestRefusesALayerTheNodeHasNoRoomFor(t *testing.T) {
+	builder, calls := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+
+	// Less free than the reserve. Nothing may be spent, not even to find
+	// out how big the layer is. A layer this node cannot hold is a local
+	// problem, and taking a reservation for it would make it everyone's.
+	i := newIngester(t, Options{
+		Catalog:  noReserve{Catalog: newStore(t, 8), t: t},
+		Locator:  fileLocator{path: deviceFile(t, 8)},
+		Opener:   &bytesOpener{data: []byte("tar")},
+		Builder:  builder,
+		Headroom: 4 << 30,
+		Free:     func(string) (uint64, error) { return 1 << 30, nil },
+	})
+
+	_, err := i.Ingest(t.Context(), Request{DiffID: digestOf(1), ChainID: digestOf(2)})
+	if !errors.Is(err, ErrNoSpace) {
+		t.Fatalf("err = %v, want %v", err, ErrNoSpace)
+	}
+
+	if *calls != 0 {
+		t.Fatalf("a refused ingest still ran mkfs.erofs %d times", *calls)
+	}
+}
+
+func TestIngestRefusesWhenTheImageWouldNotFit(t *testing.T) {
+	builder, _ := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+
+	// Room to spare when the layer is fetched, almost none by the time it
+	// has landed: another pod on the node took the disk in between.
+	free := &shrinkingFree{vals: []uint64{16 << 20, (4 << 20) + 1024}}
+
+	i := newIngester(t, Options{
+		Catalog:  noReserve{Catalog: newStore(t, 8), t: t},
+		Locator:  fileLocator{path: deviceFile(t, 8)},
+		Opener:   &bytesOpener{data: bytes.Repeat([]byte("t"), 2048)},
+		Builder:  builder,
+		Headroom: 4 << 20,
+		Free:     free.free,
+	})
+
+	_, err := i.Ingest(t.Context(), Request{DiffID: digestOf(1), ChainID: digestOf(2)})
+	if !errors.Is(err, ErrNoSpace) {
+		t.Fatalf("err = %v, want %v", err, ErrNoSpace)
+	}
+}
+
+func TestSpillRefusesAnOversizedLayer(t *testing.T) {
+	dir := t.TempDir()
+
+	_, _, err := Spill(dir, "l-*.tar", bytes.NewReader(bytes.Repeat([]byte("t"), 4096)), 1024)
+	if !errors.Is(err, ErrNoSpace) {
+		t.Fatalf("err = %v, want %v", err, ErrNoSpace)
+	}
+
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		t.Fatalf("read dir: %v", rerr)
+	}
+
+	if len(entries) != 0 {
+		t.Fatalf("the partial tarball survived: %v", entries)
+	}
+}
+
+func TestSpillAcceptsALayerExactlyAtTheLimit(t *testing.T) {
+	dir := t.TempDir()
+	payload := bytes.Repeat([]byte("t"), 1024)
+
+	_, size, err := Spill(dir, "l-*.tar", bytes.NewReader(payload), 1024)
+	if err != nil {
+		t.Fatalf("spill: %v", err)
+	}
+
+	if size != uint64(len(payload)) {
+		t.Fatalf("size = %d, want %d", size, len(payload))
 	}
 }
 

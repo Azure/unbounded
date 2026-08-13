@@ -124,6 +124,15 @@ spec:
             - --socket=/run/gantry-snapshotter/snapshotter.sock
             - --root=/var/lib/gantry-snapshotter
             - --work-dir=/var/lib/gantry-snapshotter/ingest
+            # Free bytes on the work filesystem an ingest refuses to
+            # spend. Converting a layer needs about twice its own size
+            # on disk at once, and the work directory is a hostPath on
+            # the node's root filesystem, so an unbounded ingest evicts
+            # pods that have nothing to do with it. Raise this above the
+            # kubelet's nodefs eviction threshold on nodes with small
+            # root disks; a node that refuses is not broken, it just
+            # lets some other node ingest that layer.
+            - --work-headroom={{ .WorkHeadroom | default "8589934592" }}
             - --devices=/run/racer/image-devices.json
             - --map-root=/run/gantry-snapshotter/l
             - --containerd-socket=/run/containerd/containerd.sock
@@ -169,6 +178,16 @@ spec:
             requests:
               cpu: 100m
               memory: 256Mi
+              # Scratch space for one layer conversion. This is a
+              # request rather than a limit on purpose: the work
+              # directory is a hostPath, and the kubelet charges local
+              # ephemeral storage for emptyDir volumes, container
+              # writable layers and logs, not for hostPath. A limit here
+              # would never fire. The request is still worth setting,
+              # because it takes the space out of the node's allocatable
+              # pool so other pods do not plan on using it. The bound
+              # that actually holds is --work-headroom above.
+              ephemeral-storage: 16Gi
             limits:
               # An erofs build of a large layer is CPU and memory
               # hungry, and it runs while the node is also unpacking.

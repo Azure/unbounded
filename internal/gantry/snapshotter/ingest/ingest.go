@@ -156,6 +156,13 @@ type Options struct {
 	// twice. Required.
 	WorkDir string
 
+	// Headroom is the free space on WorkDir's filesystem an ingest will not
+	// spend. Zero means DefaultHeadroom.
+	Headroom uint64
+
+	// Free reports free space on a filesystem. Defaults to FreeSpace.
+	Free FreeFunc
+
 	// SkipVerify turns off the read-back check after a write. Leave it off:
 	// RACER's 4 MiB pages carry no data checksum, and the cluster trusts
 	// this blob on the strength of one record.
@@ -168,13 +175,15 @@ type Options struct {
 // to the caller, which knows about pod churn and containerd's own concurrency
 // limits; an Ingester is safe for concurrent use and each call is independent.
 type Ingester struct {
-	cat     Catalog
-	loc     Locator
-	opener  Opener
-	builder *Builder
-	open    OpenFunc
-	workDir string
-	verify  bool
+	cat      Catalog
+	loc      Locator
+	opener   Opener
+	builder  *Builder
+	open     OpenFunc
+	free     FreeFunc
+	workDir  string
+	headroom uint64
+	verify   bool
 }
 
 // New builds an Ingester.
@@ -200,13 +209,15 @@ func New(opts Options) (*Ingester, error) {
 	}
 
 	i := &Ingester{
-		cat:     opts.Catalog,
-		loc:     opts.Locator,
-		opener:  opts.Opener,
-		builder: opts.Builder,
-		open:    opts.Open,
-		workDir: opts.WorkDir,
-		verify:  !opts.SkipVerify,
+		cat:      opts.Catalog,
+		loc:      opts.Locator,
+		opener:   opts.Opener,
+		builder:  opts.Builder,
+		open:     opts.Open,
+		free:     opts.Free,
+		workDir:  opts.WorkDir,
+		headroom: opts.Headroom,
+		verify:   !opts.SkipVerify,
 	}
 
 	if i.builder == nil {
@@ -215,6 +226,14 @@ func New(opts Options) (*Ingester, error) {
 
 	if i.open == nil {
 		i.open = OpenDirect
+	}
+
+	if i.free == nil {
+		i.free = FreeSpace
+	}
+
+	if i.headroom == 0 {
+		i.headroom = DefaultHeadroom
 	}
 
 	return i, nil
@@ -395,18 +414,32 @@ func (i *Ingester) build(ctx context.Context, req Request) (blob catalog.Blob, e
 // erofs materialises the layer as an erofs image in dir and returns its path
 // and size.
 func (i *Ingester) erofs(ctx context.Context, dir string, req Request) (string, uint64, error) {
+	// Ask before fetching. A layer this node has no room for is a layer it
+	// must not start streaming to disk, and this runs before the catalog
+	// reservation in build so a refusal costs nothing but a log line.
+	limit, err := i.spillLimit()
+	if err != nil {
+		return "", 0, err
+	}
+
 	rc, err := i.opener.Open(ctx, req)
 	if err != nil {
 		return "", 0, fmt.Errorf("ingest: open layer %s: %w", req.DiffID.Short(), err)
 	}
 
-	tarPath, _, err := Spill(dir, "layer-*.tar", rc)
+	tarPath, tarSize, err := Spill(dir, "layer-*.tar", rc, limit)
 
 	if cerr := rc.Close(); err == nil && cerr != nil {
 		err = fmt.Errorf("ingest: close layer: %w", cerr)
 	}
 
 	if err != nil {
+		return "", 0, err
+	}
+
+	// The image is about the size of the tarball that produced it, and it
+	// is written beside the tarball rather than over it.
+	if err := i.roomFor(tarSize); err != nil {
 		return "", 0, err
 	}
 
