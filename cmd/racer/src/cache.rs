@@ -31,8 +31,8 @@ use crate::alloc::{Allocator, GlobalAddr, Pressure};
 use crate::config::{self, Config, rank};
 use crate::layout::{self, Class};
 use crate::paxos::Register;
-use crate::runtime::{self, Buf, Disk, Durability};
-use crate::server;
+use crate::runtime::{self, Buf, CoreId, Disk, Durability};
+use crate::server::{self, Server};
 
 // --- tunables ---
 //
@@ -543,7 +543,7 @@ impl Store {
 /// address's consensus group, so they ride the hop the round already takes and the sketch sees
 /// the whole read stream. The hints are reached on whatever core handles the request, where
 /// the reply trailer carrying the width lands; a hint is advisory, so per-core is fine.
-struct Local {
+pub(crate) struct Local {
     sketch: Sketch,
     stores: [Store; 2],
     hints: Box<[u8]>,
@@ -551,6 +551,14 @@ struct Local {
     hint_mask: usize,
     decayed: Instant,
     stats: Stats,
+}
+
+impl Local {
+    /// Bump one class's counters on the share already open. Taking the share rather than
+    /// reaching for it is what lets a transaction count what it just did.
+    fn stat(&mut self, huge: bool, f: impl FnOnce(&mut ClassStats)) {
+        f(&mut self.stats.per[Cache::class(huge)]);
+    }
 }
 
 /// Per-core, per-class counters, read by [`Cache::local_stats`]; the exporter sums cores.
@@ -594,11 +602,12 @@ pub struct Stats {
 
 // --- Cache ---
 
-/// The tail chunks nobody is holding, plus the bookkeeping the rebalance needs. Core 0 only:
-/// the rebalance runs there as a spawned task and is the only writer, and `Cache::tick` on any
-/// other core never touches it.
+/// The tail chunks nobody is holding, plus the bookkeeping the rebalance needs. Exactly one
+/// core's [`Row`] has one, and that is the core the rebalance runs on: a core with no pool has
+/// no rebalance to start, so being the only writer is a fact about the state rather than a
+/// rule about who may reach it.
 #[derive(Default)]
-struct Pool {
+pub(crate) struct Pool {
     /// Free tail chunks. Non-empty when the DRAM budget, not the disk, bounds the cache.
     free: Vec<u64>,
     /// Per-class counters at the last sample, for differencing.
@@ -631,22 +640,25 @@ pub struct Cache {
     shards: [usize; 2],
     /// Slots the node may hold across all cores and classes, from `policy.cache_index_bytes`.
     budget: u64,
-    state: Box<[RefCell<Local>]>,
-    pool: RefCell<Pool>,
 }
 
-// Sound because every `Local` is only ever borrowed from the worker that owns it, and never
-// across an await. Same argument as `Allocator` and `Paxos`. `pool` is core 0's by the same
-// convention.
-unsafe impl Sync for Cache {}
+/// One worker's share of the cache, living in that worker's [`server::CoreState`].
+///
+/// `pool` is `Some` on exactly one core. The free tail is one list for the whole node and the
+/// rebalance that drains it is a single task, so rather than a shared list and a rule about
+/// who may touch it, the core that runs the rebalance is the core that has one to run.
+pub(crate) struct Row {
+    pub(crate) local: RefCell<Local>,
+    pub(crate) pool: Option<RefCell<Pool>>,
+}
 
-/// Build the cache and leak it: hop closures must be `Send + 'static`.
+/// Build the cache and leak it, with one row per worker for the runtime to hand out.
 ///
 /// The cache is entitled to the whole tail, every 4 MiB the layout did not claim, subject to
 /// what `policy.cache_index_bytes` will pay for in slot records. A store with no room past its
 /// slabs, or a config no extent opts into, produces a cache with no slots, which declines
 /// everything at no cost.
-pub fn open(alloc: &'static Allocator, cfg: &Config, cores: usize) -> &'static Cache {
+pub fn open(alloc: &'static Allocator, cfg: &Config, cores: usize) -> (&'static Cache, Vec<Row>) {
     let geo = alloc.geometry();
     let (base, _) = geo.tail(cfg.node.store_bytes);
     let chunks = geo.tail_chunks(cfg.node.store_bytes);
@@ -667,7 +679,7 @@ pub fn open(alloc: &'static Allocator, cfg: &Config, cores: usize) -> &'static C
         table_len(share, HINTS_MIN, HINTS_MAX),
     );
 
-    let state: Vec<RefCell<Local>> = (0..cores)
+    let state: Vec<Local> = (0..cores)
         .map(|c| {
             let stores = [Class::Small, Class::Huge].map(|class| {
                 let k = usize::from(class == Class::Huge);
@@ -683,34 +695,48 @@ pub fn open(alloc: &'static Allocator, cfg: &Config, cores: usize) -> &'static C
                 }
                 s
             });
-            RefCell::new(Local {
+            Local {
                 sketch: Sketch::new(cols),
                 hints: vec![0u8; hints].into_boxed_slice(),
                 hint_mask: hints - 1,
                 stores,
                 decayed: now + phase(c, cores),
                 stats: Stats::default(),
-            })
+            }
         })
         .collect();
 
     next[1] += want[1];
-    let free = (next[1]..chunks)
-        .map(|i| base + i * layout::CHUNK_BYTES)
+    let mut free = Some(
+        (next[1]..chunks)
+            .map(|i| base + i * layout::CHUNK_BYTES)
+            .collect(),
+    );
+
+    let rows = state
+        .into_iter()
+        .enumerate()
+        .map(|(c, local)| Row {
+            local: RefCell::new(local),
+            // The rebalance is one task for the node, so exactly one core is handed the pool
+            // it works from; every other core's row simply has none.
+            pool: (c == 0).then(|| {
+                RefCell::new(Pool {
+                    free: free.take().expect("one core holds the pool"),
+                    ..Pool::default()
+                })
+            }),
+        })
         .collect();
 
-    Box::leak(Box::new(Cache {
+    let cache = Box::leak(Box::new(Cache {
         alloc,
         disk: alloc.disk(),
         tail: (base, chunks),
         shards,
         budget,
-        state: state.into(),
-        pool: RefCell::new(Pool {
-            free,
-            ..Pool::default()
-        }),
-    }))
+    }));
+    (cache, rows)
 }
 
 /// How many of `chunks` each class starts with.
@@ -800,9 +826,41 @@ fn phase(c: usize, cores: usize) -> Duration {
     DECAY * c as u32 / cores.max(1) as u32
 }
 
+/// This core's share of the cache.
+fn here<T>(f: impl FnOnce(&mut Local) -> T) -> T {
+    runtime::here::<Server, T>(|ctx| f(&mut ctx.state().cache.local.borrow_mut()))
+}
+
+/// `core`'s share of the cache, as a transaction that core runs.
+///
+/// The whole body is synchronous, which is the point: a lookup, a claim or a hand-back is one
+/// visit to the owning worker rather than a task parked on it.
+fn at<T, F>(core: CoreId, f: F) -> impl Future<Output = T>
+where
+    F: FnOnce(&mut Local) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    runtime::with_core::<Server, _, _>(core, move |ctx| {
+        f(&mut ctx.state().cache.local.borrow_mut())
+    })
+}
+
+/// The free tail, on the one core that has it; `None` anywhere else.
+fn pool<T>(f: impl FnOnce(&mut Pool) -> T) -> Option<T> {
+    runtime::here::<Server, _>(|ctx| {
+        ctx.state()
+            .cache
+            .pool
+            .as_ref()
+            .map(|p| f(&mut p.borrow_mut()))
+    })
+}
+
 impl Cache {
-    fn local(&self) -> std::cell::RefMut<'_, Local> {
-        self.state[runtime::core()].borrow_mut()
+    /// The core owning `addr` for its class, named rather than indexed.
+    fn owner_of(&self, addr: GlobalAddr) -> Option<CoreId> {
+        let c = self.alloc.owner_core(addr).ok()?;
+        Some(CoreId::new(c).expect("an owner is a worker"))
     }
 
     /// Whether this node can cache at all. Structural only, and deliberately cheap: a cohort
@@ -824,21 +882,22 @@ impl Cache {
     }
 
     fn stat(&self, huge: bool, f: impl FnOnce(&mut ClassStats)) {
-        f(&mut self.local().stats.per[Cache::class(huge)]);
+        here(|l| l.stat(huge, f));
     }
 
     /// This core's counters. Evictions, capacity and the borrowed share are the stores' own
     /// state rather than separate counters.
     pub fn local_stats(&self) -> Stats {
-        let l = self.local();
-        let mut s = l.stats;
-        for (k, st) in l.stores.iter().enumerate() {
-            s.per[k].evictions = st.evicted;
-            s.per[k].dropped = st.dropped;
-            s.per[k].bytes = st.chunks.len() as u64 * layout::CHUNK_BYTES;
-            s.per[k].borrowed_bytes = st.borrowed as u64 * layout::CHUNK_BYTES;
-        }
-        s
+        here(|l| {
+            let mut s = l.stats;
+            for (k, st) in l.stores.iter().enumerate() {
+                s.per[k].evictions = st.evicted;
+                s.per[k].dropped = st.dropped;
+                s.per[k].bytes = st.chunks.len() as u64 * layout::CHUNK_BYTES;
+                s.per[k].borrowed_bytes = st.borrowed as u64 * layout::CHUNK_BYTES;
+            }
+            s
+        })
     }
 
     /// Count a cached page that passed confirmation. The one counter the cache cannot keep
@@ -860,6 +919,12 @@ impl Cache {
     /// the threshold needs no wire field and no extra round; it rides in the reply trailer
     /// that carries `w`.
     pub fn observe_local(&self, addr: GlobalAddr) -> u8 {
+        here(|l| self.observe_in(l, addr))
+    }
+
+    /// [`Self::observe_local`] against a share already open, so the counters it bumps and the
+    /// sketch it feeds are the same borrow.
+    fn observe_in(&self, l: &mut Local, addr: GlobalAddr) -> u8 {
         // Nothing to advertise a width to, so nothing to count either: a node whose cache is
         // off by config would otherwise report every read as a rejection.
         if !self.enabled() {
@@ -872,16 +937,16 @@ impl Cache {
             return 0;
         };
         if n == 0 {
-            self.stat(huge, |s| s.rejected_policy += 1);
+            l.stat(huge, |s| s.rejected_policy += 1);
             return 0;
         }
         let cap = self.w_max();
         // Observe before testing, so a page below the threshold still accumulates the demand
         // that would carry it over. `n == 1` therefore always passes: the sketch never answers
         // below one for a key it has just seen.
-        let q = self.local().sketch.observe(addr.0);
+        let q = l.sketch.observe(addr.0);
         if q < n {
-            self.stat(huge, |s| s.rejected_policy += 1);
+            l.stat(huge, |s| s.rejected_policy += 1);
             return 0;
         }
         q.min(cap)
@@ -894,10 +959,10 @@ impl Cache {
         if !self.enabled() {
             return 0;
         }
-        let Ok(owner) = self.alloc.owner_core(addr) else {
+        let Some(owner) = self.owner_of(addr) else {
             return 0;
         };
-        runtime::on_core(owner, move || async move { self.observe_local(addr) }).await
+        at(owner, move |l| self.observe_in(l, addr)).await
     }
 
     /// `W_max = min(cohort_size, 64)`.
@@ -914,15 +979,15 @@ impl Cache {
     /// can only be taken on a width learned from an earlier read. The first read of a key is
     /// therefore always uncached, which is what the admission filter wants.
     pub fn hint(&self, addr: GlobalAddr) -> u8 {
-        let l = self.local();
-        l.hints[config::mix(addr.0) as usize & l.hint_mask]
+        here(|l| l.hints[config::mix(addr.0) as usize & l.hint_mask])
     }
 
     /// Record the width from a reply trailer, damped.
     pub fn note_hint(&self, addr: GlobalAddr, w: u8) {
-        let mut l = self.local();
-        let i = config::mix(addr.0) as usize & l.hint_mask;
-        l.hints[i] = damp(l.hints[i], w);
+        here(|l| {
+            let i = config::mix(addr.0) as usize & l.hint_mask;
+            l.hints[i] = damp(l.hints[i], w);
+        });
     }
 
     // --- placement ---
@@ -1009,9 +1074,9 @@ impl Cache {
             return None;
         }
         let want = self.live_version(addr);
-        let owner = self.alloc.owner_core(addr).ok()?;
-        runtime::on_core(owner, move || async move {
-            self.find_here(addr, huge, Some(want)).map(|(_, r)| r)
+        let owner = self.owner_of(addr)?;
+        at(owner, move |l| {
+            self.find_in(l, addr, huge, Some(want)).map(|(_, r)| r)
         })
         .await
     }
@@ -1031,23 +1096,19 @@ impl Cache {
         buf: Buf,
         want: Option<u64>,
     ) -> Option<Register> {
-        let owner = self.alloc.owner_core(addr).ok()?;
-        let (at, reg) = runtime::on_core(
-            owner,
-            move || async move { self.find_here(addr, huge, want) },
-        )
-        .await?;
+        let owner = self.owner_of(addr)?;
+        let (found, reg) = at(owner, move |l| self.find_in(l, addr, huge, want)).await?;
         let class = Class::of(huge);
         if off as u64 + buf.len() as u64 > class.bytes() {
             return None;
         }
-        if self.disk.read(at + off as u64, buf).await.is_err() {
+        if self.disk.read(found + off as u64, buf).await.is_err() {
             // A cache page we cannot read is one we do not have. Silent rot is invisible here
             // (confirmation covers the register, not the bytes), but a hard read error means
             // the entry is gone.
-            runtime::on_core(owner, move || async move {
-                self.local().stores[Cache::class(huge)].forget(addr.0);
-                self.stat(huge, |s| s.misses += 1);
+            at(owner, move |l| {
+                l.stores[Cache::class(huge)].forget(addr.0);
+                l.stat(huge, |s| s.misses += 1);
             })
             .await;
             return None;
@@ -1060,18 +1121,17 @@ impl Cache {
     /// that core knows which chunks its store holds. The caller does the IO, so it gets an
     /// offset and not a slot: by the time the bytes move, the slot number could mean a
     /// different chunk.
-    fn find_here(
+    fn find_in(
         &self,
+        l: &mut Local,
         addr: GlobalAddr,
         huge: bool,
         want: Option<u64>,
     ) -> Option<(u64, Register)> {
         let k = Cache::class(huge);
-        // Bind before the borrow ends: a scrutinee's borrow lives as long as the arms, and the
-        // miss arm reaches for the same cell again.
-        let found = self.local().stores[k].find(addr.0);
+        let found = l.stores[k].find(addr.0);
         let Some((slot, reg)) = found.filter(|v| want.is_none_or(|w| v.1.version == w)) else {
-            self.stat(huge, |s| s.misses += 1);
+            l.stat(huge, |s| s.misses += 1);
             return None;
         };
         // A hit is a read too, and for a 4 KiB page this is the only place this node learns of
@@ -1080,9 +1140,9 @@ impl Cache {
         // first candidate walking past. The 4 MiB path counted this read in `cache_width`
         // already.
         if !huge {
-            self.local().sketch.observe(addr.0);
+            l.sketch.observe(addr.0);
         }
-        Some((self.local().stores[k].off(slot), reg))
+        Some((l.stores[k].off(slot), reg))
     }
 
     /// Offer `buf` to the cache as the value of `addr` at `reg`, given the width `w` its owner
@@ -1100,29 +1160,27 @@ impl Cache {
         if !self.enabled() || !self.holds(addr, w) {
             return;
         }
-        let Ok(owner) = self.alloc.owner_core(addr) else {
+        let Some(owner) = self.owner_of(addr) else {
             return;
         };
         // Claim on the owning core, write here, then report back: the buffer's registration
         // belongs to this core's ring and cannot travel (see `load_at`).
-        let Some((slot, at)) =
-            runtime::on_core(
-                owner,
-                move || async move { self.claim_here(addr, huge, reg) },
-            )
-            .await
-        else {
+        let Some((slot, dst)) = at(owner, move |l| self.claim_in(l, addr, huge, reg)).await else {
             return;
         };
         // One IO, in place, `Buffered`: no torn-write hazard, because nothing points at these
         // bytes after a restart. The slot stays busy across it, which also stops its chunk
         // from being handed away underneath the write.
         let ok = buf.len() as u64 == Class::of(huge).bytes()
-            && self.disk.write(at, buf, Durability::Buffered).await.is_ok();
-        runtime::on_core(owner, move || async move {
-            self.local().stores[Cache::class(huge)].finish(slot, ok);
+            && self
+                .disk
+                .write(dst, buf, Durability::Buffered)
+                .await
+                .is_ok();
+        at(owner, move |l| {
+            l.stores[Cache::class(huge)].finish(slot, ok);
             if ok {
-                self.stat(huge, |s| s.admits += 1);
+                l.stat(huge, |s| s.admits += 1);
             }
         })
         .await;
@@ -1134,20 +1192,25 @@ impl Cache {
     /// width it returns on a veto never reaches this function. The kill switch is rechecked,
     /// because it has to bite the moment the config lands rather than after the reader's
     /// damped width hint drains; it costs one extent lookup and no sketch.
-    fn claim_here(&self, addr: GlobalAddr, huge: bool, reg: Register) -> Option<(u32, u64)> {
+    fn claim_in(
+        &self,
+        l: &mut Local,
+        addr: GlobalAddr,
+        huge: bool,
+        reg: Register,
+    ) -> Option<(u32, u64)> {
         let k = Cache::class(huge);
-        if self.local().stores[k].current(addr.0, reg) {
+        if l.stores[k].current(addr.0, reg) {
             return None;
         }
         if self.shedding() {
-            self.stat(huge, |s| s.shed += 1);
+            l.stat(huge, |s| s.shed += 1);
             return None;
         }
         if server::config().cache_admit_of(addr.0) == 0 {
-            self.stat(huge, |s| s.rejected_policy += 1);
+            l.stat(huge, |s| s.rejected_policy += 1);
             return None;
         }
-        let mut l = self.local();
         // Count the read this node is about to serve from its own cache. The 4 MiB path
         // already did so in `cache_width`, on this same core; the 4 KiB path has not, because
         // for a small page `observe_local` runs on a group member and this node is not one.
@@ -1158,7 +1221,6 @@ impl Cache {
         } else {
             l.sketch.observe(addr.0)
         };
-        let l = &mut *l;
         let (sketch, store) = (&l.sketch, &mut l.stores[k]);
         // The contest, and the only place hotness reaches victim selection. Ties go to the
         // candidate, so a cold scan at an estimate of one churns other cold entries and leaves
@@ -1176,13 +1238,12 @@ impl Cache {
 
     /// Drop an entry that failed confirmation. Cheap enough to call speculatively.
     pub async fn forget(&'static self, addr: GlobalAddr, huge: bool) {
-        let Ok(owner) = self.alloc.owner_core(addr) else {
+        let Some(owner) = self.owner_of(addr) else {
             return;
         };
-        runtime::on_core(owner, move || async move {
-            let k = Cache::class(huge);
-            self.local().stores[k].forget(addr.0);
-            self.stat(huge, |s| s.stale += 1);
+        at(owner, move |l| {
+            l.stores[Cache::class(huge)].forget(addr.0);
+            l.stat(huge, |s| s.stale += 1);
         })
         .await;
     }
@@ -1199,60 +1260,59 @@ impl Cache {
 
     // --- tick ---
 
-    /// The decay, and on core 0 the rebalance. Driven from `Handler::tick`, which is a poll
-    /// and not a timer: an idle worker takes no ticks, so the halving count comes from elapsed
-    /// time rather than assumed to be one.
+    /// The decay, and where the pool is the rebalance. Driven from `Handler::tick`, which is a
+    /// poll and not a timer: an idle worker takes no ticks, so the halving count comes from
+    /// elapsed time rather than assumed to be one.
     pub fn tick(&'static self, now: Instant) {
-        {
-            let mut l = self.local();
+        here(|l| {
             let elapsed = now.saturating_duration_since(l.decayed);
             let steps = (elapsed.as_nanos() / DECAY.as_nanos()) as u32;
             if steps > 0 {
                 l.decayed += DECAY * steps;
                 l.sketch.halve(steps);
             }
-        }
+        });
         // The rebalance has to see every core, so it hops and cannot run from a synchronous
-        // tick. Core 0 spawns it; the flag keeps a slow one from being started twice.
-        if runtime::core() != 0 {
-            return;
-        }
-        {
-            let mut p = self.pool.borrow_mut();
+        // tick. The core holding the pool spawns it; the flag keeps a slow one from being
+        // started twice. Every other core has no pool, and so nothing here to start.
+        let start = pool(|p| {
             let due = p
                 .sampled
                 .is_none_or(|t| now.saturating_duration_since(t) >= REBALANCE);
             if p.running || !due {
-                return;
+                return false;
             }
             p.sampled = Some(now);
             p.running = true;
+            true
+        });
+        if start != Some(true) {
+            return;
         }
         if !runtime::spawn(async move {
             self.rebalance().await;
-            self.pool.borrow_mut().running = false;
+            pool(|p| p.running = false);
         }) {
-            self.pool.borrow_mut().running = false;
+            pool(|p| p.running = false);
         }
     }
 
     // --- rebalance ---
 
-    /// The tail this cache was given, and the part of it no class is holding. Core 0 only,
-    /// where the pool of unheld chunks lives. Unheld bytes are media the store has and
-    /// `policy.cache_index_bytes` would not pay to index, so this says whether raising that
-    /// policy would buy anything.
+    /// The tail this cache was given, and the part of it no class is holding. Answers on the
+    /// core the pool lives on, and zero unheld elsewhere. Unheld bytes are media the store has
+    /// and `policy.cache_index_bytes` would not pay to index, so this says whether raising
+    /// that policy would buy anything.
     pub fn tail_bytes(&self) -> (u64, u64) {
-        let idle = self.pool.borrow().free.len() as u64;
+        let idle = pool(|p| p.free.len() as u64).unwrap_or(0);
         (
             self.tail.1 * layout::CHUNK_BYTES,
             idle * layout::CHUNK_BYTES,
         )
     }
 
-    /// This core's contribution to the rebalance's view, per class.
-    fn census_here(&self) -> [Census; 2] {
-        let l = self.local();
+    /// One core's contribution to the rebalance's view, per class.
+    fn census_in(l: &Local) -> [Census; 2] {
         std::array::from_fn(|k| Census {
             served: l.stats.per[k].served,
             evicted: l.stores[k].evicted,
@@ -1262,22 +1322,23 @@ impl Cache {
         })
     }
 
-    /// Move media toward whichever class is earning more with what it has. Core 0 only,
-    /// spawned from `tick`.
+    /// Move media toward whichever class is earning more with what it has. Spawned from
+    /// `tick`, on the core holding the pool.
     ///
     /// Free chunks from the pool go out in batches, because nothing is lost by filling space
     /// no one holds and a large tail would otherwise take hours to warm. Taking media *from*
     /// the other class is one chunk at a time: a steal drops whatever that chunk held, so a
     /// fast controller loses more entries than a slow one gains in fit.
     async fn rebalance(&'static self) {
-        let cores = self.state.len();
+        let cores = runtime::cores();
         let mut sum = [Census::default(); 2];
         let mut chunks = [
             Vec::<u64>::with_capacity(cores),
             Vec::<u64>::with_capacity(cores),
         ];
         for c in 0..cores {
-            let row = runtime::on_core(c, move || async move { self.census_here() }).await;
+            let c = CoreId::new(c).expect("a worker index is a worker");
+            let row = at(c, |l| Cache::census_in(l)).await;
             for k in 0..2 {
                 sum[k].served += row[k].served;
                 sum[k].evicted += row[k].evicted;
@@ -1289,8 +1350,7 @@ impl Cache {
 
         // Counters are cumulative; what the classes did with what they hold *now* is the
         // difference against the last sample.
-        let (served, evicted, missed) = {
-            let mut p = self.pool.borrow_mut();
+        let Some((served, evicted, missed)) = pool(|p| {
             let d = |now: [u64; 2], then: &mut [u64; 2]| -> [u64; 2] {
                 let out = std::array::from_fn(|k| now[k].saturating_sub(then[k]));
                 *then = now;
@@ -1302,6 +1362,8 @@ impl Cache {
                 d(now(|c| c.evicted), &mut p.evicted),
                 d(now(|c| c.missed), &mut p.missed),
             )
+        }) else {
+            return;
         };
 
         let bytes: [u64; 2] =
@@ -1318,14 +1380,14 @@ impl Cache {
         // cache opens on a fraction of its budget and this is how it earns the rest.
         if held + cost <= self.budget {
             let room = (self.budget - held) / cost;
-            let grow = (chunks[k].iter().sum::<u64>() / GROWTH_SHARE)
-                .clamp(1, room)
-                .min(self.pool.borrow().free.len() as u64);
-            let idle: Vec<u64> = {
-                let mut p = self.pool.borrow_mut();
+            let idle: Vec<u64> = pool(|p| {
+                let grow = (chunks[k].iter().sum::<u64>() / GROWTH_SHARE)
+                    .clamp(1, room)
+                    .min(p.free.len() as u64);
                 let n = p.free.len() - grow as usize;
                 p.free.split_off(n)
-            };
+            })
+            .unwrap_or_default();
             if !idle.is_empty() {
                 for off in idle {
                     self.place(
@@ -1369,10 +1431,12 @@ impl Cache {
     /// fewest first when `most` is false. Evening the classes out across cores matters because
     /// group hashing spreads addresses evenly, and an unbalanced core would evict while its
     /// neighbour idled.
-    fn order(&self, k: usize, chunks: &[u64], most: bool) -> Vec<usize> {
-        let mut v: Vec<usize> = (0..self.shards[k]).collect();
+    fn order(&self, k: usize, chunks: &[u64], most: bool) -> Vec<CoreId> {
+        let mut v: Vec<CoreId> = (0..self.shards[k])
+            .map(|c| CoreId::new(c).expect("a shard is a worker"))
+            .collect();
         v.sort_by_key(|&c| {
-            let n = chunks.get(c).copied().unwrap_or(0);
+            let n = chunks.get(c.index()).copied().unwrap_or(0);
             if most { u64::MAX - n } else { n }
         });
         v
@@ -1385,24 +1449,17 @@ impl Cache {
         let Some(&core) = order.first() else {
             return;
         };
-        runtime::on_core(core, move || async move {
-            self.local().stores[k].push_chunk(c);
-        })
-        .await;
-        chunks[core] += 1;
+        at(core, move |l| l.stores[k].push_chunk(c)).await;
+        chunks[core.index()] += 1;
     }
 
     /// Take one chunk back from a class, from the core holding the most that will part with
     /// one. `None` when every chunk it holds is borrowed or has a write in flight.
     async fn take(&'static self, k: usize, chunks: &mut [u64]) -> Option<u64> {
         for core in self.order(k, chunks, true) {
-            let got = runtime::on_core(
-                core,
-                move || async move { self.local().stores[k].give(false) },
-            )
-            .await;
+            let got = at(core, move |l| l.stores[k].give(false)).await;
             if got.is_some() {
-                chunks[core] -= 1;
+                chunks[core.index()] -= 1;
                 return got;
             }
         }
@@ -1418,9 +1475,9 @@ impl Cache {
     /// stripe of the 4 MiB cache too: both are `mblock % cores` over the same mblocks.
     async fn borrow(&'static self, chunks: &mut [u64]) -> bool {
         for core in self.order(1, chunks, false) {
-            let got = runtime::on_core(core, move || async move {
+            let got = at(core, move |l| {
                 let off = self.alloc.lend()?;
-                self.local().stores[1].push_chunk(Chunk {
+                l.stores[1].push_chunk(Chunk {
                     off,
                     borrowed: true,
                 });
@@ -1428,7 +1485,7 @@ impl Cache {
             })
             .await;
             if got.is_some() {
-                chunks[core] += 1;
+                chunks[core.index()] += 1;
                 return true;
             }
         }
@@ -1439,10 +1496,12 @@ impl Cache {
     /// loan it can part with.
     ///
     /// Called synchronously by the allocator, on the core that lent it, from inside a
-    /// reservation. Touches this core's huge store and nothing else: no config, no pressure
-    /// test, no hop, because the allocator has state borrowed around the call.
-    pub fn give_back(&self, core: usize) -> Option<u64> {
-        self.state[core].borrow_mut().stores[1].give(true)
+    /// reservation. It takes no core to call: a loan only ever sits in the share of the core
+    /// that made it, which is the core asking. Touches this core's huge store and nothing
+    /// else: no config, no pressure test, no hop, because the allocator has state borrowed
+    /// around the call.
+    pub fn give_back(&self) -> Option<u64> {
+        here(|l| l.stores[1].give(true))
     }
 }
 

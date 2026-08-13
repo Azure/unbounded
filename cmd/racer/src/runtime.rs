@@ -268,8 +268,6 @@ pub struct CoreId(u16);
 impl CoreId {
     /// `None` if `i` is not a worker index. Callers derive `i` from an address or a
     /// consensus group, so this is the one place a mapping bug is caught.
-    // Dead alongside `with_core`: nothing has an owner to name yet.
-    #[allow(dead_code)]
     pub(crate) fn new(i: usize) -> Option<CoreId> {
         (i < cores()).then_some(CoreId(i as u16))
     }
@@ -286,8 +284,8 @@ impl CoreId {
 }
 
 /// The worker running this code.
-// Nothing outside the runtime's own tests needs to name the core it is already on: the
-// subsystems get theirs from the `CoreCtx` they are handed.
+// The subsystems get the core they are on from the `CoreCtx` they are handed, so only
+// the runtime's own tests need to ask for it bare.
 #[allow(dead_code)]
 pub(crate) fn core_id() -> CoreId {
     CoreId::of(worker::core())
@@ -356,9 +354,6 @@ impl<'b, H: Handler> CoreCtx<'b, H> {
 /// destination's ring and runs during its next drain, with no task-slab slot.
 ///
 /// Dropping the returned future abandons the reply; a transaction already sent still runs.
-// Dead until the allocator and consensus rows move behind it: what a core owns today is
-// still reachable from every core, so nothing yet has to ask.
-#[allow(dead_code)]
 pub(crate) fn with_core<H, F, T>(dst: CoreId, f: F) -> impl Future<Output = T>
 where
     H: Handler,
