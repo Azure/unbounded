@@ -1064,6 +1064,18 @@ impl Allocator {
         let l = at(owner, move |c| c.shard.lookup(addr, kind, class)).await?;
         let read = self.geo.slot_off(class, l.slot) + off as u64;
         self.disk.read(read, buf).await.map_err(|_| Status::Io)?;
+        // Nothing held the slot still while those bytes were read. The entry could have
+        // been trimmed, its slot given back, and the slot reserved and written for some
+        // other address, and a 4 MiB page has no checksum to disagree with the result.
+        //
+        // Asking again is enough to rule that out. A version only ever moves forward, so
+        // an entry that answers with the same slot at the same register is an entry that
+        // never left: had the slot been freed, getting back to this address would have
+        // taken a write, and a write would have taken a higher version. The 4 KiB path
+        // gets the same guarantee from a checksum seeded with the address and version.
+        if at(owner, move |c| c.shard.lookup(addr, kind, class)).await? != l {
+            return Err(Status::Missing);
+        }
         Ok(Self::reg_of(&l))
     }
 
