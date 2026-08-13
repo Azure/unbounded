@@ -146,11 +146,17 @@ spec:
               mountPath: /sys/kernel/config
             - name: plugin-dir
               mountPath: /csi
+            - name: kubelet-plugins-dir
+              mountPath: /var/lib/kubelet/plugins
+              # Bidirectional: NodePublishVolume bind-mounts the block device
+              # onto a path the kubelet owns under
+              # plugins/kubernetes.io/csi/volumeDevices/publish, and that mount
+              # has to be visible in the kubelet's namespace, not just this
+              # container's. /var/lib/kubelet/pods is not that path: raw block
+              # volumes are never published under it.
+              mountPropagation: Bidirectional
             - name: pods-mount-dir
               mountPath: /var/lib/kubelet/pods
-              # Bidirectional: NodePublishVolume bind-mounts the block device
-              # into the pod's volume directory, and that mount has to be
-              # visible to the kubelet's namespace, not just this container's.
               mountPropagation: Bidirectional
           resources:
             requests:
@@ -247,6 +253,14 @@ spec:
         - name: plugin-dir
           hostPath:
             path: /var/lib/kubelet/plugins/racer.unbounded-cloud.io
+            type: DirectoryOrCreate
+        # The kubelet's whole plugin tree. Raw block volumes are staged and
+        # published under plugins/kubernetes.io/csi/volumeDevices, so the
+        # narrower per-driver socket directory above is not enough to make a
+        # published device visible to the kubelet.
+        - name: kubelet-plugins-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins
             type: DirectoryOrCreate
         - name: registration-dir
           hostPath:

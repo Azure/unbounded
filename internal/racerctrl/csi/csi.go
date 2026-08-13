@@ -79,6 +79,11 @@ type Driver struct {
 	agent    Stager
 	log      *slog.Logger
 
+	// mount and unmount are the syscalls the publish path makes, indirected so
+	// tests can drive the whole RPC surface without CAP_SYS_ADMIN.
+	mount   func(source, target string, flags uintptr) error
+	unmount func(target string) error
+
 	// mu serializes stage and publish for a single volume. The CSI spec allows
 	// the kubelet to issue calls for different volumes concurrently but
 	// requires the plugin to be safe under retries of the same one, and both
@@ -88,7 +93,17 @@ type Driver struct {
 
 // NewDriver builds the driver.
 func NewDriver(nodeName string, agent Stager, log *slog.Logger) *Driver {
-	return &Driver{nodeName: nodeName, agent: agent, log: log}
+	return &Driver{
+		nodeName: nodeName,
+		agent:    agent,
+		log:      log,
+		mount: func(source, target string, flags uintptr) error {
+			return unix.Mount(source, target, "", flags, "")
+		},
+		unmount: func(target string) error {
+			return unix.Unmount(target, 0)
+		},
+	}
 }
 
 // GetPluginInfo identifies the driver.
@@ -170,10 +185,12 @@ func (d *Driver) NodeGetCapabilities(
 
 // NodeStageVolume exports the volume as a local block device.
 //
-// The staging target path is not used as a mount point: there is nothing to
-// mount, since the volume is raw block. It is used as a marker file holding the
-// device path, so an interrupted publish can be retried and a stale stage can
-// be recognised after a plugin restart.
+// Nothing is written at the staging target path. For a raw block volume the
+// kubelet creates that path as a *directory* before it calls us and removes it
+// after unstage, so writing a marker file there fails with EISDIR and takes
+// every stage on the node with it. There is nothing to mount either: staging a
+// racer volume means telling the node agent to export it on a ublk minor, and
+// the agent owns the durable record of that binding.
 func (d *Driver) NodeStageVolume(
 	ctx context.Context, req *csi.NodeStageVolumeRequest,
 ) (*csi.NodeStageVolumeResponse, error) {
@@ -197,15 +214,10 @@ func (d *Driver) NodeStageVolume(
 		return nil, status.Errorf(codes.Internal, "stage volume %s: %v", req.GetVolumeId(), err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(req.GetStagingTargetPath()), 0o750); err != nil {
+	// The kubelet has already created this directory. Creating it when it is
+	// missing costs nothing and keeps the RPC honest for callers that do not.
+	if err := os.MkdirAll(req.GetStagingTargetPath(), 0o750); err != nil {
 		return nil, status.Errorf(codes.Internal, "create staging directory: %v", err)
-	}
-
-	// 0600 root:root, like the device node itself. Anything that can read this
-	// file learns which minor carries which volume, which is a small but free
-	// piece of information to withhold.
-	if err := os.WriteFile(req.GetStagingTargetPath(), []byte(device), 0o600); err != nil {
-		return nil, status.Errorf(codes.Internal, "record staged device: %v", err)
 	}
 
 	d.log.Info("staged volume", "volume", req.GetVolumeId(), "device", device)
@@ -214,6 +226,10 @@ func (d *Driver) NodeStageVolume(
 }
 
 // NodeUnstageVolume stops exporting the volume.
+//
+// The staging target path is left alone: the kubelet created it and removes it
+// itself, and it is a directory, so the driver removing it would either fail or
+// race the kubelet for no benefit.
 func (d *Driver) NodeUnstageVolume(
 	_ context.Context, req *csi.NodeUnstageVolumeRequest,
 ) (*csi.NodeUnstageVolumeResponse, error) {
@@ -225,12 +241,6 @@ func (d *Driver) NodeUnstageVolume(
 	defer d.mu.Unlock()
 
 	d.agent.Unstage(req.GetVolumeId())
-
-	if path := req.GetStagingTargetPath(); path != "" {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, status.Errorf(codes.Internal, "remove staging marker: %v", err)
-		}
-	}
 
 	d.log.Info("unstaged volume", "volume", req.GetVolumeId())
 
@@ -244,6 +254,12 @@ func (d *Driver) NodeUnstageVolume(
 // bind mount is what keeps the exposure narrow: the pod sees one device node
 // for one volume, not the /dev directory that holds every other volume on the
 // node.
+//
+// That path lives under the kubelet's own plugin tree
+// (/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/publish/...), not
+// under /var/lib/kubelet/pods, so the DaemonSet has to mount the whole plugin
+// directory with bidirectional propagation. Without it the mount lands in this
+// container's namespace and the kubelet never sees the device.
 func (d *Driver) NodePublishVolume(
 	_ context.Context, req *csi.NodePublishVolumeRequest,
 ) (*csi.NodePublishVolumeResponse, error) {
@@ -284,7 +300,7 @@ func (d *Driver) NodePublishVolume(
 		flags |= unix.MS_RDONLY
 	}
 
-	if err := unix.Mount(device, target, "", flags, ""); err != nil {
+	if err := d.mount(device, target, flags); err != nil {
 		if !errors.Is(err, unix.EBUSY) {
 			return nil, status.Errorf(codes.Internal, "bind %s onto %s: %v", device, target, err)
 		}
@@ -295,7 +311,7 @@ func (d *Driver) NodePublishVolume(
 	if req.GetReadonly() {
 		// MS_RDONLY is ignored on the initial bind and has to be applied by a
 		// second remount call.
-		if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+		if err := d.mount("", target, unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY); err != nil {
 			return nil, status.Errorf(codes.Internal, "remount %s read-only: %v", target, err)
 		}
 	}
@@ -317,7 +333,7 @@ func (d *Driver) NodeUnpublishVolume(
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if err := unix.Unmount(target, 0); err != nil &&
+	if err := d.unmount(target); err != nil &&
 		!errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOENT) {
 		return nil, status.Errorf(codes.Internal, "unmount %s: %v", target, err)
 	}
