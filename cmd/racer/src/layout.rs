@@ -286,8 +286,17 @@ const _: () = assert!(GT_OFF + GT_HDR + GT_ROWS * EXT_BYTES <= MBLOCK - SB_RESER
 impl Geometry {
     /// Size every region from the config. Fails if the store is too small.
     fn plan(store_bytes: u64, cfg: &crate::config::Config) -> io::Result<Geometry> {
+        let g = Geometry::place(wanted(cfg));
+
+        g.check(store_bytes)?;
+        Ok(g)
+    }
+
+    /// Where every region goes, given the mblocks each class wants. Reads nothing: the
+    /// layout is a function of the config alone, which is what lets [`store_floor`] answer
+    /// how big a store has to be before there is one.
+    fn place(want: [u64; 2]) -> Geometry {
         let mut g = Geometry::default();
-        let want = wanted(cfg);
 
         let mut at = SB_REGION;
         g.zero_base = at;
@@ -306,9 +315,7 @@ impl Geometry {
             g.push(class, e).expect("first extent of an empty geometry");
         }
         g.alloc_end = at;
-
-        g.check(store_bytes)?;
-        Ok(g)
+        g
     }
 
     fn extents(&self, class: Class) -> &[Extent] {
@@ -582,6 +589,22 @@ fn wanted(cfg: &crate::config::Config) -> [u64; 2] {
         overprovision(cfg.small_pages(), 64).div_ceil(K_SMALL as u64),
         overprovision(cfg.huge_pages(), 4).div_ceil(K_HUGE as u64),
     ]
+}
+
+/// The smallest store a node declaring these page counts can be formatted on.
+///
+/// The layout is a function of the config and the store only has to hold it, so a caller
+/// that sizes a store for itself can ask rather than guess. Note that a data region rounds
+/// up to a whole mblock of slots: one 4 MiB page still asks for the half gigabyte that 126
+/// of them would fill, which a sparse store is welcome to leave unwritten. Only the
+/// simulator sizes its own stores; a real one is whatever the operator handed over.
+#[cfg(feature = "sim")]
+pub(crate) fn store_floor(small_pages: u64, huge_pages: u64) -> u64 {
+    Geometry::place([
+        overprovision(small_pages, 64).div_ceil(K_SMALL as u64),
+        overprovision(huge_pages, 4).div_ceil(K_HUGE as u64),
+    ])
+    .alloc_end()
 }
 
 // -------------------------------------------------------------- consensus side state

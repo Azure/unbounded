@@ -20,8 +20,27 @@ use crate::server::{self, SERVER};
 
 /// Block size of every simulated device. Frames and mblocks are 4 KiB.
 const BLOCK: usize = 4096;
-/// Store size every simulated node asks for. Sparse, so only written blocks cost.
-const STORE_BYTES: u64 = 64 << 30;
+/// Chunks left past the layout for the cache to claim. The cache is entitled to the whole
+/// tail, so this is the only thing bounding the media it holds.
+const TAIL_CHUNKS: u64 = 16;
+/// Cache slot records a node may pay for, in bytes. The cache opens holding a sixty-fourth
+/// of what this buys, which is one 4 MiB chunk of 4 KiB slots: enough that the whole small
+/// extent can sit in cache, which is what the tests are here to exercise. The default is a
+/// gigabyte, sized for a real node; a campaign runs a whole cluster per seed and cannot
+/// afford a production cache index on every one of them.
+const CACHE_INDEX_BYTES: u64 = (1 << 16) * crate::cache::BYTES_PER_SLOT;
+
+/// Store size a node asks for: the layout it is about to declare, plus a tail to cache in.
+///
+/// Sparse, so unwritten blocks cost nothing on the host, but the cache is entitled to
+/// everything the layout does not claim, and a slot record is real memory. A store sized
+/// like a real one would give every simulated node a production cache index, and the
+/// campaign runs as many nodes at once as it has seeds in flight.
+fn store_bytes(o: &Options) -> u64 {
+    let floor = layout::store_floor(o.pages, o.huge_pages);
+
+    floor.next_multiple_of(layout::CHUNK_BYTES) + TAIL_CHUNKS * layout::CHUNK_BYTES
+}
 /// One-way message and disk latency, before jitter.
 const LATENCY_US: u64 = 50;
 /// Delay a straggler adds one way: loses every quorum race, still beats the link timeout.
@@ -964,13 +983,14 @@ impl Sim {
         t.push_str("generation 1\n");
         let zone = self.zone_of(id);
         t.push_str(&format!(
-            "node id={id} zone={zone} cohort=0 store=/sim/n{id}/store size={STORE_BYTES} max_iops={}\n",
+            "node id={id} zone={zone} cohort=0 store=/sim/n{id}/store size={} max_iops={}\n",
+            store_bytes(o),
             o.device_iops
         ));
         // The index ceiling is a real check; give it room for the extents we declare.
         let idx = o.pages * crate::alloc::INDEX_BYTES_PER_PAGE + (1 << 20);
         t.push_str(&format!(
-            "policy max_index_bytes={idx} occ_bytes={}\n",
+            "policy max_index_bytes={idx} occ_bytes={} cache_index_bytes={CACHE_INDEX_BYTES}\n",
             1 << 20
         ));
         // The fabric namespace exports as a ublk minor of its own, which has to differ from
