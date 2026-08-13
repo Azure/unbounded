@@ -138,6 +138,12 @@ type Config struct {
 	// how stale the index gets while nothing is starting.
 	CatalogSync time.Duration
 
+	// HoleGrace is how long a hole in the catalog's record slots has to
+	// persist before this node concludes its writer died and retires it.
+	// Zero disables the repair, which leaves a crashed writer's hole to
+	// block every node's view of the catalog until an operator intervenes.
+	HoleGrace time.Duration
+
 	// ShutdownGrace bounds the graceful stop before connections are cut.
 	ShutdownGrace time.Duration
 
@@ -192,6 +198,7 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	fs.StringVar(&c.MapRoot, "map-root", envOr("GANTRY_SNAPSHOTTER_MAP_ROOT", blockmap.DefaultRoot), "directory layer mounts are placed under")
 	fs.DurationVar(&c.CleanupInterval, "cleanup-interval", envDuration("GANTRY_SNAPSHOTTER_CLEANUP_INTERVAL", DefaultCleanup), "how often to sweep orphan directories and stale mappings")
 	fs.DurationVar(&c.CatalogSync, "catalog-sync", envDuration("GANTRY_SNAPSHOTTER_CATALOG_SYNC", DefaultCatalogSync), "background catalog poll interval")
+	fs.DurationVar(&c.HoleGrace, "hole-grace", envDuration("GANTRY_SNAPSHOTTER_HOLE_GRACE", catalog.DefaultHoleGrace), "how long an unwritten catalog record slot persists before it is retired")
 	fs.DurationVar(&c.ShutdownGrace, "shutdown-grace", envDuration("GANTRY_SNAPSHOTTER_SHUTDOWN_GRACE", DefaultShutdownGrace), "graceful shutdown budget")
 	fs.StringVar(&c.LogLevel, "log-level", envOr("GANTRY_SNAPSHOTTER_LOG_LEVEL", "info"), "debug, info, warn or error")
 	fs.StringVar(&c.LogFormat, "log-format", envOr("GANTRY_SNAPSHOTTER_LOG_FORMAT", "text"), "text or json")

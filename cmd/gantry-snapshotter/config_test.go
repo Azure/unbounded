@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
 )
 
@@ -134,6 +135,7 @@ func TestMalformedEnvironmentFallsBack(t *testing.T) {
 	t.Setenv("GANTRY_SNAPSHOTTER_INGEST_DEPTH", "lots")
 	t.Setenv("GANTRY_SNAPSHOTTER_SKIP_VERIFY", "perhaps")
 	t.Setenv("GANTRY_SNAPSHOTTER_CATALOG_SYNC", "soon")
+	t.Setenv("GANTRY_SNAPSHOTTER_HOLE_GRACE", "eventually")
 
 	cfg, err := parseConfig(nil, io.Discard)
 	if err != nil {
@@ -142,6 +144,10 @@ func TestMalformedEnvironmentFallsBack(t *testing.T) {
 
 	if cfg.IngestDepth != ingest.DefaultQueueDepth || cfg.SkipVerify || cfg.CatalogSync != DefaultCatalogSync {
 		t.Errorf("depth=%d verify=%v sync=%s", cfg.IngestDepth, cfg.SkipVerify, cfg.CatalogSync)
+	}
+
+	if cfg.HoleGrace != catalog.DefaultHoleGrace {
+		t.Errorf("hole grace = %s, want %s", cfg.HoleGrace, catalog.DefaultHoleGrace)
 	}
 }
 

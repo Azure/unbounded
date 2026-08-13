@@ -20,6 +20,18 @@ type occDevice struct {
 	mu       sync.Mutex
 	blocks   map[int64][]byte
 	versions map[int64]uint64
+
+	// written counts writes that landed, so a test can assert that work it
+	// expects to be redundant costs the device nothing.
+	written int
+}
+
+// writes reports how many writes have landed on the device.
+func (d *occDevice) writes() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.written
 }
 
 func newOCCDevice() *occDevice {
@@ -93,6 +105,7 @@ func (c *occClient) WriteAt(p []byte, off int64) (int, error) {
 	copy(block, p)
 	c.dev.blocks[off] = block
 	c.dev.versions[off]++
+	c.dev.written++
 	c.read[off] = c.dev.versions[off]
 
 	return len(p), nil

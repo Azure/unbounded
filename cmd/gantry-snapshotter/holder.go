@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -305,6 +306,17 @@ func (h *holder) Sync() (bool, error) {
 	}
 
 	return store.Sync()
+}
+
+// Repair retires a hole in the catalog's record slots whose writer never came
+// back. See catalog.Store.Repair; this is the crash case Abandon cannot cover.
+func (h *holder) Repair(grace time.Duration) (int, error) {
+	store, _ := h.current.load()
+	if store == nil {
+		return 0, errNotReady
+	}
+
+	return store.Repair(grace)
 }
 
 // Reserve implements the ingest write path.

@@ -177,10 +177,28 @@ func TestRunCatalogSyncIgnoresADetachedCatalog(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
 	defer cancel()
 
-	runCatalogSync(ctx, &Config{CatalogSync: time.Millisecond}, newHolder(t, false, false), log)
+	runCatalogSync(ctx, &Config{CatalogSync: time.Millisecond, HoleGrace: time.Hour}, newHolder(t, false, false), log)
 
 	if strings.Contains(buf.String(), "catalog sync failed") {
 		t.Errorf("logged a sync failure for a detached catalog: %s", buf.String())
+	}
+
+	if strings.Contains(buf.String(), "catalog repair failed") {
+		t.Errorf("logged a repair failure for a detached catalog: %s", buf.String())
+	}
+}
+
+// Repair is off when the grace is zero, so an operator can pin a hole in place
+// while they work out what left it there.
+func TestRepairHoleDisabled(t *testing.T) {
+	var buf syncBuffer
+
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	repairHole(&Config{}, newHolder(t, false, false), log)
+
+	if buf.String() != "" {
+		t.Errorf("a disabled repair logged: %s", buf.String())
 	}
 }
 

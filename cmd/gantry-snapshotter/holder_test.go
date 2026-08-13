@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
@@ -135,6 +136,14 @@ func TestHolderWriteSideReportsNotReady(t *testing.T) {
 
 	if err := h.Account(1, 0, 0); !errors.Is(err, errNotReady) {
 		t.Errorf("Account = %v, want errNotReady", err)
+	}
+
+	if err := h.Abandon(catalog.Reservation{}); !errors.Is(err, errNotReady) {
+		t.Errorf("Abandon = %v, want errNotReady", err)
+	}
+
+	if _, err := h.Repair(time.Hour); !errors.Is(err, errNotReady) {
+		t.Errorf("Repair = %v, want errNotReady", err)
 	}
 }
 

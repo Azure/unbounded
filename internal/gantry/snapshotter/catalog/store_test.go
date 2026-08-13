@@ -494,6 +494,178 @@ func TestAbandonLeavesWrittenRecordsAlone(t *testing.T) {
 	}
 }
 
+// clock replaces time.Now with one the test drives, and returns a function
+// that moves it forward.
+func clock(t *testing.T) func(time.Duration) {
+	t.Helper()
+
+	previous := now
+	at := time.Unix(1700000000, 0)
+	now = func() time.Time { return at }
+
+	t.Cleanup(func() { now = previous })
+
+	return func(d time.Duration) { at = at.Add(d) }
+}
+
+// A node that is evicted or loses power between Reserve and Append never gets
+// to call Abandon. The hole it leaves is the same hole, and every node in the
+// cluster stops at it forever, so the catalog has to heal without an operator.
+func TestRepairRetiresACrashedWritersHole(t *testing.T) {
+	advance := clock(t)
+	dev, a := ready(t)
+
+	b := open(t, dev)
+
+	// The writer takes a reservation and is never heard from again.
+	if _, err := a.Reserve(4, 2); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Another node publishes behind the hole.
+	next, err := a.ReserveRecords(1)
+	if err != nil {
+		t.Fatalf("ReserveRecords: %v", err)
+	}
+
+	if err := a.Append(next, []Record{{Type: RecordChain, Key: digest(7), Ref: digest(8)}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	if _, err := b.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if b.Len() != 0 {
+		t.Fatalf("a reader saw %d keys past an unwritten slot", b.Len())
+	}
+
+	// Before the grace expires the writer is only assumed to be slow.
+	if voided, err := b.Repair(time.Hour); err != nil || voided != 0 {
+		t.Fatalf("Repair before the grace = %d, %v", voided, err)
+	}
+
+	advance(3 * time.Hour)
+
+	voided, err := b.Repair(time.Hour)
+	if err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+
+	if voided != 2 {
+		t.Fatalf("Repair retired %d slots, want 2", voided)
+	}
+
+	if _, err := b.Sync(); err != nil {
+		t.Fatalf("Sync after repair: %v", err)
+	}
+
+	if _, ok := b.index.entries[digest(7)]; !ok {
+		t.Fatal("a record behind the repaired hole is still invisible")
+	}
+
+	// The repair is written through, so every other node sees it too.
+	c := open(t, dev)
+	if _, ok := c.index.entries[digest(7)]; !ok {
+		t.Fatal("a node opening the catalog fresh still stops at the hole")
+	}
+}
+
+// Only the hole observed when the clock started is repaired. Slots reserved
+// after that have not had their grace period, and voiding them would destroy
+// the work of a writer that is behaving perfectly well.
+func TestRepairLeavesLaterReservationsAlone(t *testing.T) {
+	advance := clock(t)
+	dev, a := ready(t)
+
+	b := open(t, dev)
+
+	if _, err := a.Reserve(4, 1); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if _, err := b.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	advance(3 * time.Hour)
+
+	// A second writer starts just before the repair runs.
+	fresh, err := a.Reserve(4, 1)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	voided, err := b.Repair(time.Hour)
+	if err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+
+	if voided != 1 {
+		t.Fatalf("Repair retired %d slots, want only the aged one", voided)
+	}
+
+	// The live writer's slot is untouched, so it can still publish.
+	if err := a.Append(fresh, []Record{{Type: RecordChain, Key: digest(9), Ref: digest(10)}}); err != nil {
+		t.Fatalf("Append after a repair: %v", err)
+	}
+
+	if _, err := b.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if _, ok := b.index.entries[digest(9)]; !ok {
+		t.Fatal("Repair voided a slot a live writer went on to fill")
+	}
+}
+
+// Every node watches the same hole and reaches the same conclusion, so the
+// repair has to be safe to run from all of them. The second one through finds
+// the slots taken and writes nothing.
+func TestRepairIsSafeToRaceAndIdempotent(t *testing.T) {
+	advance := clock(t)
+	dev, a := ready(t)
+
+	b := open(t, dev)
+
+	if _, err := a.Reserve(4, 2); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if _, err := b.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if _, err := a.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	advance(3 * time.Hour)
+
+	if _, err := b.Repair(time.Hour); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+
+	writes := dev.writes()
+
+	if _, err := a.Repair(time.Hour); err != nil {
+		t.Fatalf("a second node repairing the same hole: %v", err)
+	}
+
+	if got := dev.writes(); got != writes {
+		t.Fatalf("a redundant repair wrote %d blocks, want none", got-writes)
+	}
+
+	// And repairing again after the hole is gone is a no-op.
+	if _, err := b.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if voided, err := b.Repair(time.Hour); err != nil || voided != 0 {
+		t.Fatalf("Repair with no hole = %d, %v", voided, err)
+	}
+}
+
 func TestReserveRetriesOnConflict(t *testing.T) {
 	noSleep(t)
 

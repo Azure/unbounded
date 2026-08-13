@@ -36,11 +36,24 @@ var ErrNoOpenSegment = errors.New("catalog: no open segment")
 // spending real time in them.
 var sleep = time.Sleep
 
+// now is time.Now, indirected so tests can age a hole without waiting for it.
+var now = time.Now
+
 // DefaultRetries is how many times an optimistic write is retried before
 // giving up. A caller that exhausts this is contending with many other
 // ingesters, and failing is fine: ingest is off the container start path and
 // the layer is simply ingested later.
 const DefaultRetries = 16
+
+// DefaultHoleGrace is how long a hole in the record slots has to persist
+// before a reader concludes its writer is never coming back and retires it.
+//
+// It is deliberately far longer than any legitimate writer takes. The longest
+// gap between a reservation and its records is a layer build plus a multi-GiB
+// aligned write plus the read-back verify, and voiding a hole that a live
+// writer is about to fill costs that writer its work. Waiting an hour to
+// recover from a crash nobody has noticed yet is the cheaper mistake.
+const DefaultHoleGrace = time.Hour
 
 // Store is the catalog on a device.
 //
@@ -63,6 +76,16 @@ type Store struct {
 	sb      Superblock
 	applied uint64
 	index   *Index
+
+	// hole is where the last Sync stopped short, and since when. See Repair.
+	hole      uint64
+	holeEnd   uint64
+	holeSince time.Time
+
+	// skew spreads repairs out. Every node in the cluster watches the same
+	// hole and reaches the same conclusion at the same moment; without this
+	// they would all pile onto the same block's compare-and-swap.
+	skew float64
 }
 
 // FormatOptions describes a catalog to be created.
@@ -156,7 +179,7 @@ func Format(vol Volume, opts FormatOptions) error {
 
 // Open reads an existing catalog and loads every record into memory.
 func Open(vol Volume) (*Store, error) {
-	s := &Store{vol: vol, retries: DefaultRetries, index: NewIndex()}
+	s := &Store{vol: vol, retries: DefaultRetries, index: NewIndex(), skew: rand.Float64()} //nolint:gosec // scheduling jitter, not a secret
 
 	if _, err := s.Sync(); err != nil {
 		return nil, err
@@ -232,9 +255,31 @@ func (s *Store) Sync() (bool, error) {
 	s.sb = sb
 	s.index.Apply(records...)
 	s.applied = read
+	s.noteHole(read, sb.RecordCount)
 	s.state.Unlock()
 
 	return true, nil
+}
+
+// noteHole records where this Sync stopped short, so Repair can tell a writer
+// that is slow from one that is gone. It runs under s.state held for writing.
+//
+// The end of the hole is pinned at the record count observed the first time it
+// was seen and is never extended. Slots reserved after that have not had their
+// grace period yet, and repairing them early would race a writer that is
+// behaving perfectly well.
+func (s *Store) noteHole(read, count uint64) {
+	if read >= count {
+		s.hole, s.holeEnd, s.holeSince = 0, 0, time.Time{}
+
+		return
+	}
+
+	if s.hole == read && !s.holeSince.IsZero() {
+		return
+	}
+
+	s.hole, s.holeEnd, s.holeSince = read, count, now()
 }
 
 // readRecords reads records [from, sb.RecordCount) and reports how far it got.
@@ -453,7 +498,7 @@ func (s *Store) Append(res Reservation, records []Record) error {
 	defer s.io.Unlock()
 
 	for index, slots := range byBlock {
-		if err := s.mergeRecordBlock(index, slots, false); err != nil {
+		if _, err := s.mergeRecordBlock(index, slots, false); err != nil {
 			return err
 		}
 	}
@@ -507,7 +552,7 @@ func (s *Store) Abandon(res Reservation) error {
 	s.io.Lock()
 
 	for index, slots := range byBlock {
-		if err := s.mergeRecordBlock(index, slots, true); err != nil {
+		if _, err := s.mergeRecordBlock(index, slots, true); err != nil {
 			s.io.Unlock()
 
 			return err
@@ -527,6 +572,96 @@ func (s *Store) Abandon(res Reservation) error {
 	}
 
 	return nil
+}
+
+// Repair retires a hole whose writer never came back, reporting how many
+// slots it voided.
+//
+// Abandon covers a writer that fails and lives to say so. This covers the one
+// that does not: a node that is evicted, OOM-killed, or loses power between
+// taking a reservation and appending to it leaves empty slots that every node
+// in the cluster stops at forever. Nothing appended after them is ever visible
+// again, so the catalog has to be able to heal itself without an operator.
+//
+// The rule is time, not ownership. A hole that has not moved for grace is
+// declared dead and filled with voids, by whichever node notices first; the
+// rest find the slots taken and write nothing. Any node can do this because
+// the repair is a compare-and-swap on the record block and voids resolve to
+// nothing, so the worst case of two nodes agreeing is one wasted read.
+//
+// A writer that comes back after grace and appends its records finds the slots
+// taken and fails, and the pages it wrote are stranded: booked live in the
+// segment with no record naming them. That is why grace is an hour. Stranding
+// a blob costs one layer's worth of space until the cleaner runs; leaving the
+// hole costs the cluster its catalog.
+func (s *Store) Repair(grace time.Duration) (int, error) {
+	s.state.RLock()
+	at, end, since := s.hole, s.holeEnd, s.holeSince
+	skew, generation := s.skew, s.sb.Generation
+	s.state.RUnlock()
+
+	if since.IsZero() || end <= at {
+		return 0, nil
+	}
+
+	// Spread the herd over the second half of the window so a thousand nodes
+	// do not converge on the same block at the same instant.
+	if now().Sub(since) < grace+time.Duration(float64(grace)*skew) {
+		return 0, nil
+	}
+
+	// The voids carry the generation this node last observed. Nothing reads
+	// it, because the index skips voids entirely, but every record on the
+	// device has to be valid on its own terms and generation zero is how a
+	// corrupt record reads.
+	res := Reservation{FirstRecord: at, RecordCount: int(end - at), Generation: generation} //nolint:gosec // bounded by the record capacity
+
+	records := make([]Record, res.RecordCount)
+	for i := range records {
+		records[i] = Record{Type: RecordVoid}
+	}
+
+	byBlock, err := s.placeRecords(res, records)
+	if err != nil {
+		return 0, err
+	}
+
+	s.io.Lock()
+	defer s.io.Unlock()
+
+	voided := 0
+
+	for index, slots := range byBlock {
+		filled, err := s.mergeRecordBlock(index, slots, true)
+		if err != nil {
+			return 0, fmt.Errorf("catalog: repair record block %d: %w", index, err)
+		}
+
+		voided += filled
+	}
+
+	// Leave the watermark where it is. The next Sync reads the voids back
+	// off the device, which is what proves the repair landed; believing it
+	// landed because we asked for it would skip records another node wrote
+	// into the same range while we were repairing it.
+	s.state.Lock()
+	s.hole, s.holeEnd, s.holeSince = 0, 0, time.Time{}
+	s.state.Unlock()
+
+	return voided, nil
+}
+
+// Hole reports the first unwritten record slot a reader is stopped at and how
+// long it has been stopped there. Reported for metrics; zero means no hole.
+func (s *Store) Hole() (uint64, time.Duration) {
+	s.state.RLock()
+	defer s.state.RUnlock()
+
+	if s.holeSince.IsZero() {
+		return 0, 0
+	}
+
+	return s.hole, now().Sub(s.holeSince)
 }
 
 // placeRecords maps a reservation's records onto the blocks and slots they
@@ -558,12 +693,15 @@ func (s *Store) placeRecords(res Reservation, records []Record) (map[uint64]map[
 }
 
 // mergeRecordBlock writes mine into the given block under its own
-// compare-and-swap.
+// compare-and-swap, reporting how many slots it actually filled.
 //
-// When keepTaken is set, a slot that already holds a record is left as it is
-// instead of being reported as a collision. That is only for Abandon, which
-// has to tolerate finding its own earlier records in place.
-func (s *Store) mergeRecordBlock(index uint64, mine map[int]Record, keepTaken bool) error {
+// A slot that already holds exactly the record we were going to write is left
+// alone, so a retry that follows a write which landed costs nothing.
+//
+// When keepTaken is set, a slot holding a *different* record is also left as it
+// is instead of being reported as a collision. That is for Abandon and Repair,
+// which both have to tolerate finding real records in slots they meant to void.
+func (s *Store) mergeRecordBlock(index uint64, mine map[int]Record, keepTaken bool) (int, error) {
 	block := make([]byte, BlockBytes)
 
 	var lastErr error
@@ -574,40 +712,45 @@ func (s *Store) mergeRecordBlock(index uint64, mine map[int]Record, keepTaken bo
 		}
 
 		if _, err := s.vol.ReadAt(block, int64(index*BlockBytes)); err != nil { //nolint:gosec // bounded by the extent size
-			return fmt.Errorf("read record block %d: %w", index, err)
+			return 0, fmt.Errorf("read record block %d: %w", index, err)
 		}
 
 		slots, err := UnmarshalRecordBlock(block)
 		if err != nil {
-			return fmt.Errorf("record block %d: %w", index, err)
+			return 0, fmt.Errorf("record block %d: %w", index, err)
 		}
 
-		dirty := false
+		filled := 0
 
 		for slot, r := range mine {
-			if existing, taken := slots[slot]; taken && existing != r {
+			if existing, taken := slots[slot]; taken {
+				if existing == r {
+					continue
+				}
+
 				if keepTaken {
 					continue
 				}
 
-				return fmt.Errorf("catalog: record slot %d in block %d is already taken by %s %s",
+				return 0, fmt.Errorf("catalog: record slot %d in block %d is already taken by %s %s",
 					slot, index, existing.Type, existing.Key)
 			}
 
 			slots[slot] = r
-			dirty = true
+			filled++
 		}
 
-		if !dirty {
-			// Every slot we were asked to fill was already filled. Writing
-			// the block back would burn a compare-and-swap on the block
-			// every other ingester in the cluster is contending for.
-			return nil
+		if filled == 0 {
+			// Every slot we were asked to fill already holds what we
+			// wanted there. Writing the block back would burn a
+			// compare-and-swap on the block every other ingester in the
+			// cluster is contending for.
+			return 0, nil
 		}
 
 		merged, err := MarshalRecordBlock(slots)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		if _, err := s.vol.WriteAt(merged, int64(index*BlockBytes)); err != nil { //nolint:gosec // bounded by the extent size
@@ -617,13 +760,13 @@ func (s *Store) mergeRecordBlock(index uint64, mine map[int]Record, keepTaken bo
 				continue
 			}
 
-			return fmt.Errorf("write record block %d: %w", index, err)
+			return 0, fmt.Errorf("write record block %d: %w", index, err)
 		}
 
-		return nil
+		return filled, nil
 	}
 
-	return fmt.Errorf("catalog: record block %d lost %d compare-and-swaps: %w", index, s.retries, lastErr)
+	return 0, fmt.Errorf("catalog: record block %d lost %d compare-and-swaps: %w", index, s.retries, lastErr)
 }
 
 // backoff is exponential with full jitter, capped. Ingest is off the container

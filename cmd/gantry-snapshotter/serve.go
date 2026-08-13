@@ -302,6 +302,10 @@ func runReconcile(
 // runCatalogSync polls the catalog so a node that starts no pods still learns
 // about layers other nodes ingested. The start path syncs on its own misses,
 // so this only bounds staleness while the node is idle.
+//
+// It is also where a hole left by a crashed writer gets retired. Every node
+// polls, so every node eventually notices, which is what makes the recovery
+// independent of whichever node died.
 func runCatalogSync(ctx context.Context, cfg *Config, cat *holder, log *slog.Logger) {
 	if cfg.CatalogSync <= 0 {
 		return
@@ -329,6 +333,36 @@ func runCatalogSync(ctx context.Context, cfg *Config, cat *holder, log *slog.Log
 		if changed {
 			log.Debug("catalog synced", slog.Int("records", cat.Len()))
 		}
+
+		repairHole(cfg, cat, log)
+	}
+}
+
+// repairHole retires record slots a writer reserved and never filled.
+//
+// This is loud on purpose. Voiding slots means a layer somebody was ingesting
+// is gone and, if the writer wrote its bytes before dying, that those bytes are
+// stranded in a segment with nothing naming them. It is the right trade against
+// a catalog that never advances again, but it is not routine.
+func repairHole(cfg *Config, cat *holder, log *slog.Logger) {
+	if cfg.HoleGrace <= 0 {
+		return
+	}
+
+	voided, err := cat.Repair(cfg.HoleGrace)
+	if err != nil {
+		if !errors.Is(err, errNotReady) {
+			log.Warn("catalog repair failed", slog.Any("err", err))
+		}
+
+		return
+	}
+
+	if voided > 0 {
+		log.Warn("retired catalog record slots whose writer never returned",
+			slog.Int("slots", voided),
+			slog.Duration("grace", cfg.HoleGrace),
+		)
 	}
 }
 
