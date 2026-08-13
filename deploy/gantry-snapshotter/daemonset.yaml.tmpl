@@ -1,0 +1,211 @@
+# gantry-snapshotter - Kubernetes DaemonSet (one agent per worker node).
+#
+# The snapshotter serves containerd's snapshot API over a unix socket and
+# turns a RACER-backed shared image device into container rootfs mounts.
+# See designs/gantry-snapshotter-design.md for the full picture.
+#
+# Deployment notes, all of them load bearing:
+#
+#   - privileged: true. The agent creates device-mapper linear targets
+#     over the shared image device, calls mount(2) directly, and does
+#     O_DIRECT block I/O on /dev/ublkb*. There is no capability subset
+#     that covers this honestly: DM plus mount plus raw block access is
+#     effectively root on the node. Treat this DaemonSet with the same
+#     suspicion as a CSI node plugin.
+#
+#   - mountPropagation: Bidirectional on /run/gantry-snapshotter. Every
+#     image layer is mounted by this container at
+#     /run/gantry-snapshotter/l/<name>. runc assembles container rootfs
+#     in the host mount namespace, so those mounts MUST propagate back
+#     out. Without Bidirectional the overlay lowerdirs resolve to empty
+#     directories on the host and containers start with a rootfs that
+#     is missing every cluster-supplied layer. This is the single most
+#     common way to misconfigure this DaemonSet.
+#
+#   - The socket lives under the same hostPath, which is why containerd
+#     can reach it at /run/gantry-snapshotter/snapshotter.sock.
+#
+#   - /run/racer is mounted read-only. It holds image-devices.json, the
+#     operator-rendered description of which segment lives on which
+#     /dev/ublkb* node. The agent only reads it, and re-reads it on a
+#     timer, so an operator can grow the image volume without a
+#     restart. If the file is absent the agent still serves: every
+#     Prepare misses, containerd unpacks locally, and nothing is
+#     ingested. That degradation is deliberate.
+#
+#   - The image needs mkfs.erofs (erofs-utils) and dmsetup (lvm2) on
+#     PATH, so it cannot be distroless. It also needs a kernel with
+#     CONFIG_EROFS_FS and CONFIG_BLK_DEV_DM. Nodes without them will
+#     fail every mount; check before rolling this out.
+#
+#   - priorityClassName: gantry-snapshotter-node-critical. Once
+#     containerd is configured to use this snapshotter, a node without
+#     the agent cannot start any pod that uses it. Unlike the gantry
+#     mirror, there is no graceful fallback, so the agent must not be
+#     preemptible.
+#
+#   - GANTRY_SNAPSHOTTER_MEMBERS_SELECTOR turns on the peer view that
+#     ranks ingest work. With it unset every node is an eager ingester:
+#     correct, but every node converts every layer, which wastes CPU
+#     and burns catalog space on duplicate blobs that the segment
+#     cleaner then has to reclaim.
+#
+# Apply with:
+#   kubectl apply -f deploy/gantry-snapshotter/serviceaccount.yaml
+#   kubectl apply -f deploy/gantry-snapshotter/daemonset.yaml
+#
+# Then register the snapshotter with containerd on each node; see
+# deploy/gantry-snapshotter/containerd-config.toml and the README.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-snapshotter
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry-snapshotter
+    app.kubernetes.io/component: snapshotter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry-snapshotter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Restarting the agent breaks the snapshot API for as long as the
+      # socket is unbound, which stalls pod creation on that node. Keep
+      # the blast radius small and the restart fast.
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry-snapshotter
+        app.kubernetes.io/component: snapshotter
+    spec:
+      serviceAccountName: gantry-snapshotter
+      # The agent talks to the API server for the peer view only. It
+      # uses the Pod network for that; nothing dials the agent.
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      priorityClassName: gantry-snapshotter-node-critical
+      tolerations:
+        - operator: Exists
+      # Layer mounts and device-mapper targets are torn down lazily by
+      # the next Cleanup sweep, not on shutdown, so the agent has
+      # nothing slow to do on the way out. It only needs long enough to
+      # drain in-flight snapshot RPCs.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: gantry-snapshotter
+          image: {{ .Image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --socket=/run/gantry-snapshotter/snapshotter.sock
+            - --root=/var/lib/gantry-snapshotter
+            - --work-dir=/var/lib/gantry-snapshotter/ingest
+            - --devices=/run/racer/image-devices.json
+            - --map-root=/run/gantry-snapshotter/l
+            - --containerd-socket=/run/containerd/containerd.sock
+            - --metrics-addr=:9096
+          env:
+            # Ranks this node in the per-layer ingest election.
+            - name: GANTRY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Scope the peer informer to wherever this DaemonSet was
+            # actually installed, so a renamed namespace needs no
+            # further edits.
+            - name: GANTRY_SNAPSHOTTER_MEMBERS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: GANTRY_SNAPSHOTTER_MEMBERS_SELECTOR
+              value: app.kubernetes.io/name=gantry-snapshotter
+            # Only one node in the cluster needs to lay down the
+            # catalog superblock, and the write is a compare-and-swap
+            # on block zero, so it is safe to let every node try.
+            - name: GANTRY_SNAPSHOTTER_FORMAT_CATALOG
+              value: "true"
+          ports:
+            - name: metrics
+              containerPort: 9096
+              protocol: TCP
+          # No readiness probe on purpose. A Pod that is not Ready is
+          # still routed no traffic, which is meaningless here because
+          # containerd reaches the agent over a hostPath socket, not a
+          # Service. A liveness probe is what actually matters: if the
+          # metrics listener is gone the process is wedged and pods on
+          # this node are stuck in ContainerCreating.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # An erofs build of a large layer is CPU and memory
+              # hungry, and it runs while the node is also unpacking.
+              # Being OOM killed mid-ingest is harmless (nothing is
+              # published until the blob verifies) but it wastes the
+              # work, so leave real headroom.
+              cpu: "4"
+              memory: 4Gi
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 0
+            # Everything the agent writes goes to a mounted volume.
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            # Bidirectional: layer mounts made here must be visible on
+            # the host, because runc builds container rootfs there.
+            - name: run
+              mountPath: /run/gantry-snapshotter
+              mountPropagation: Bidirectional
+            - name: state
+              mountPath: /var/lib/gantry-snapshotter
+            # The operator-rendered image device description.
+            - name: racer
+              mountPath: /run/racer
+              readOnly: true
+            # Block device nodes (/dev/ublkb*) and the device-mapper
+            # control node.
+            - name: dev
+              mountPath: /dev
+            # Read layer blobs from the content store so a node can
+            # ingest a layer it never unpacked itself.
+            - name: containerd-socket
+              mountPath: /run/containerd/containerd.sock
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          hostPath:
+            path: /run/gantry-snapshotter
+            type: DirectoryOrCreate
+        - name: state
+          hostPath:
+            path: /var/lib/gantry-snapshotter
+            type: DirectoryOrCreate
+        - name: racer
+          hostPath:
+            path: /run/racer
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket
+        - name: tmp
+          emptyDir: {}

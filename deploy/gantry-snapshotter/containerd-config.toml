@@ -1,0 +1,58 @@
+# containerd registration for gantry-snapshotter (containerd 2.x).
+#
+# Merge these stanzas into /etc/containerd/config.toml on every node
+# running the DaemonSet, then restart containerd. This file is not
+# applied by Kubernetes: containerd reads its configuration at start
+# and a proxy plugin cannot register itself.
+#
+# Order matters when rolling this out. Start the DaemonSet first, wait
+# for the socket to appear, and only then reconfigure containerd. A
+# containerd configured for a snapshotter whose socket is absent
+# refuses to create containers.
+
+version = 3
+
+# 1. Register the snapshotter as a proxy plugin. The name on the left
+#    ("gantry") is what every other stanza refers to, and what
+#    `ctr --snapshotter gantry` expects.
+[proxy_plugins.gantry]
+  type = "snapshot"
+  address = "/run/gantry-snapshotter/snapshotter.sock"
+
+# 2. Make CRI use it for pod sandboxes and containers. Without this the
+#    kubelet keeps pulling into overlayfs and the snapshotter sees no
+#    traffic at all.
+[plugins.'io.containerd.cri.v1.images']
+  snapshotter = "gantry"
+  # The snapshotter needs the image reference, the layer digest and the
+  # layer list on each Prepare in order to fetch the layer tar from the
+  # content store and to key the ingest election. Those arrive as
+  # descriptor annotations, which CRI strips when this is true.
+  # Ingest silently stops working if it is left at the default.
+  disable_snapshot_annotations = false
+  # Ingest reads the layer tar out of the content store after the
+  # unpack, so the blob must survive it. This is the default; it is
+  # spelled out because turning it on breaks ingest in a way that only
+  # shows up as layers that never make it into RACER.
+  discard_unpacked_layers = false
+
+# Optional, and only if you run more than one runtime handler. The
+# snapshotter is selected per handler, and an unset value falls through
+# to the images plugin setting above, so most installs need nothing
+# here. Kata and other VM runtimes should keep their own snapshotter.
+# [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
+#   snapshotter = "gantry"
+
+# 3. Teach the transfer service to unpack into this snapshotter, so
+#    `ctr image pull` and any non-CRI client take the same path.
+[[plugins.'io.containerd.transfer.v1.local'.unpack_config]]
+  platform = "linux/amd64"
+  snapshotter = "gantry"
+
+# 4. Optional, and unrelated to correctness: with the snapshotter
+#    working, most layers are never downloaded and never unpacked, so
+#    the historic reasons for keeping this low are gone. Raise it so
+#    the cold path (a genuinely new image that nobody has ingested
+#    yet) is not serialized behind a single download.
+# [plugins.'io.containerd.cri.v1.images']
+#   max_concurrent_downloads = 6

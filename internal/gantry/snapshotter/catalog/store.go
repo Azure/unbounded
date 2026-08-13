@@ -1,0 +1,555 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package catalog
+
+import (
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"sync"
+	"time"
+
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
+)
+
+// Volume is the catalog extent, byte addressed. In production it is an
+// O_DIRECT handle on the RACER device carrying the catalog's OCC extent; in
+// tests it is a fake that reproduces OCC's compare-and-swap semantics.
+//
+// Every access is a whole 4 KiB block at a block-aligned offset, because that
+// is the unit RACER versions and therefore the unit a compare-and-swap covers.
+type Volume interface {
+	ReadAt(p []byte, off int64) (int, error)
+	WriteAt(p []byte, off int64) (int, error)
+}
+
+// ErrFull reports that the catalog has no room left, either for records or in
+// the open segment. Ingest stops; reads are unaffected.
+var ErrFull = errors.New("catalog: full")
+
+// ErrNoOpenSegment reports that no segment is accepting appends. The operator
+// has to add capacity before ingest resumes.
+var ErrNoOpenSegment = errors.New("catalog: no open segment")
+
+// sleep is time.Sleep, indirected so tests can run the retry paths without
+// spending real time in them.
+var sleep = time.Sleep
+
+// DefaultRetries is how many times an optimistic write is retried before
+// giving up. A caller that exhausts this is contending with many other
+// ingesters, and failing is fine: ingest is off the container start path and
+// the layer is simply ingested later.
+const DefaultRetries = 16
+
+// Store is the catalog on a device.
+//
+// Locking has two layers and the reason matters. RACER's OCC guard is the
+// version *this node* last read a page at, which is process-wide state rather
+// than per-goroutine: if two goroutines read block 0, then both write it, the
+// second read re-arms the guard and both writes can land, silently handing the
+// same pages to two ingesters. So every device access, read included, is
+// serialized by a single mutex. The in-memory index has its own reader lock so
+// that the container start path, which only resolves, never waits behind I/O.
+type Store struct {
+	vol     Volume
+	retries int
+
+	// io serializes all device access. See the type comment: this is a
+	// correctness requirement of OCC, not a convenience.
+	io sync.Mutex
+
+	state   sync.RWMutex
+	sb      Superblock
+	applied uint64
+	index   *Index
+}
+
+// FormatOptions describes a catalog to be created.
+type FormatOptions struct {
+	// Bytes is the catalog extent's size. It is rounded down to a whole
+	// number of blocks.
+	Bytes uint64
+
+	// SegmentBlocks is how many blocks the segment table occupies, and so
+	// how many segments the image volume can ever hold. It cannot be changed
+	// afterwards without moving every record, so it is set generously: one
+	// block already covers 127 segments, which at the default 16 GiB segment
+	// is 2 TiB, more than a node's export slot budget allows it to map.
+	SegmentBlocks uint32
+}
+
+// DefaultSegmentBlocks covers 127 segments, which exceeds the number of image
+// devices a node can export at once.
+const DefaultSegmentBlocks = 1
+
+// Format writes a fresh catalog. It refuses to run against a device that
+// already holds one, because reformatting orphans every blob in every segment
+// with no way to find them again.
+func Format(vol Volume, opts FormatOptions) error {
+	block := make([]byte, BlockBytes)
+
+	if _, err := vol.ReadAt(block, 0); err != nil {
+		return fmt.Errorf("read superblock: %w", err)
+	}
+
+	if !allZero(block) {
+		if _, err := UnmarshalSuperblock(block); err == nil {
+			return errors.New("catalog: device already holds a catalog")
+		}
+
+		return errors.New("catalog: device holds data that is not a catalog")
+	}
+
+	segmentBlocks := opts.SegmentBlocks
+	if segmentBlocks == 0 {
+		segmentBlocks = DefaultSegmentBlocks
+	}
+
+	sb := Superblock{
+		Generation:    1,
+		SegmentBlocks: segmentBlocks,
+		TotalBlocks:   opts.Bytes / BlockBytes,
+	}
+
+	if err := sb.Validate(); err != nil {
+		return err
+	}
+
+	// The segment table is zeroed before the superblock is published, so a
+	// reader that finds a valid superblock never reads a table left over
+	// from whatever was on the device before.
+	//
+	// Each block is read first. Under OCC a write with no prior read of the
+	// page has no guard to compare against and is rejected, so reading is
+	// not an optimization here; it is what makes the write land. Blocks that
+	// are already zero are left alone.
+	zero := make([]byte, BlockBytes)
+	scratch := make([]byte, BlockBytes)
+
+	for b := uint64(1); b <= uint64(segmentBlocks); b++ {
+		off := int64(b * BlockBytes) //nolint:gosec // block index is bounded by the extent size
+
+		if _, err := vol.ReadAt(scratch, off); err != nil {
+			return fmt.Errorf("read segment table block %d: %w", b, err)
+		}
+
+		if allZero(scratch) {
+			continue
+		}
+
+		if _, err := vol.WriteAt(zero, off); err != nil {
+			return fmt.Errorf("zero segment table block %d: %w", b, err)
+		}
+	}
+
+	if err := sb.MarshalTo(block); err != nil {
+		return err
+	}
+
+	if _, err := vol.WriteAt(block, 0); err != nil {
+		return fmt.Errorf("write superblock: %w", err)
+	}
+
+	return nil
+}
+
+// Open reads an existing catalog and loads every record into memory.
+func Open(vol Volume) (*Store, error) {
+	s := &Store{vol: vol, retries: DefaultRetries, index: NewIndex()}
+
+	if _, err := s.Sync(); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+// Superblock returns the last superblock read.
+func (s *Store) Superblock() Superblock {
+	s.state.RLock()
+	defer s.state.RUnlock()
+
+	return s.sb
+}
+
+// Resolve maps a chainID to its blob. It touches no device: this is the
+// container start path, and a lookup here has to be a map read.
+func (s *Store) Resolve(chainID Digest) (Blob, bool) {
+	s.state.RLock()
+	defer s.state.RUnlock()
+
+	return s.index.Resolve(chainID)
+}
+
+// Blob maps a layer's diffID to its blob without going through a chainID. The
+// ingester uses it to avoid re-ingesting a layer another node already did.
+func (s *Store) Blob(diffID Digest) (Blob, bool) {
+	s.state.RLock()
+	defer s.state.RUnlock()
+
+	return s.index.Blob(diffID)
+}
+
+// Len is how many keys the index resolves.
+func (s *Store) Len() int {
+	s.state.RLock()
+	defer s.state.RUnlock()
+
+	return s.index.Len()
+}
+
+// Sync re-reads the superblock and folds in any records appended since the
+// last call, reporting whether anything changed.
+//
+// This is the poll on the read side. The superblock is one 4 KiB read and is
+// hot in RACER's cache, and only the record blocks past the last applied
+// record are read, so a steady-state poll costs one block.
+func (s *Store) Sync() (bool, error) {
+	s.io.Lock()
+	defer s.io.Unlock()
+
+	sb, err := s.readSuperblock()
+	if err != nil {
+		return false, err
+	}
+
+	s.state.RLock()
+	applied := s.applied
+	previous := s.sb
+	s.state.RUnlock()
+
+	if sb.Generation == previous.Generation && sb.RecordCount == applied {
+		return false, nil
+	}
+
+	records, read, err := s.readRecords(sb, applied)
+	if err != nil {
+		return false, err
+	}
+
+	s.state.Lock()
+	s.sb = sb
+	s.index.Apply(records...)
+	s.applied = read
+	s.state.Unlock()
+
+	return true, nil
+}
+
+// readRecords reads records [from, sb.RecordCount) and reports how far it got.
+//
+// It can legitimately stop short. A reservation advances the record count
+// before the records themselves are written, so a reader can see a count that
+// runs past the last written slot. Stopping at the first gap and leaving the
+// watermark there means the next Sync picks the records up once they land,
+// rather than skipping them forever.
+func (s *Store) readRecords(sb Superblock, from uint64) ([]Record, uint64, error) {
+	if from > sb.RecordCount {
+		// The catalog was reformatted or replaced underneath us. Start over
+		// rather than believing a watermark from a different catalog.
+		from = 0
+	}
+
+	var (
+		records []Record
+		block   = make([]byte, BlockBytes)
+		at      = from
+	)
+
+	for at < sb.RecordCount {
+		index, _ := sb.RecordLocation(at)
+
+		if _, err := s.vol.ReadAt(block, int64(index*BlockBytes)); err != nil { //nolint:gosec // bounded by the extent size
+			return nil, 0, fmt.Errorf("read record block %d: %w", index, err)
+		}
+
+		slots, err := UnmarshalRecordBlock(block)
+		if err != nil {
+			return nil, 0, fmt.Errorf("record block %d: %w", index, err)
+		}
+
+		// Walk this block's slots in order and stop at the first hole.
+		for at < sb.RecordCount {
+			nextIndex, nextSlot := sb.RecordLocation(at)
+			if nextIndex != index {
+				break
+			}
+
+			r, ok := slots[nextSlot]
+			if !ok {
+				return records, at, nil
+			}
+
+			records = append(records, r)
+			at++
+		}
+	}
+
+	return records, at, nil
+}
+
+func (s *Store) readSuperblock() (Superblock, error) {
+	block := make([]byte, BlockBytes)
+
+	if _, err := s.vol.ReadAt(block, 0); err != nil {
+		return Superblock{}, fmt.Errorf("read superblock: %w", err)
+	}
+
+	return UnmarshalSuperblock(block)
+}
+
+// Reservation is an exclusive claim on a range of pages in the open segment
+// and a range of record slots, taken in one compare-and-swap.
+type Reservation struct {
+	Segment     uint32
+	PageOffset  uint32
+	PageCount   uint32
+	FirstRecord uint64
+	RecordCount int
+
+	// Generation is the catalog generation the reservation was taken at, and
+	// is what the records written under it carry.
+	Generation uint64
+}
+
+// Address is where the reservation's blob goes.
+func (r Reservation) Address(byteLength uint64) segment.Address {
+	return segment.Address{
+		Segment:    r.Segment,
+		PageOffset: r.PageOffset,
+		PageCount:  r.PageCount,
+		ByteLength: byteLength,
+	}
+}
+
+// ReserveRecords claims record slots without claiming any pages.
+//
+// Records that name no bytes still need slots: a chain record pointing at a
+// blob another node ingested, and a tombstone retiring one, are both pure index
+// edits. They are deliberately allowed when no segment is open, because
+// retiring blobs is exactly what has to keep working when the volume is full.
+func (s *Store) ReserveRecords(records int) (Reservation, error) {
+	return s.Reserve(0, records)
+}
+
+// Reserve claims pages in the open segment and record slots, atomically.
+//
+// This is the one place allocation is serialized cluster-wide, and it is one
+// block write. On conflict it re-reads and retries with jittered backoff; a
+// conflict means another node reserved first, so retrying is exactly right.
+func (s *Store) Reserve(pages uint32, records int) (Reservation, error) {
+	if records <= 0 {
+		return Reservation{}, errors.New("catalog: reservation of no records")
+	}
+
+	s.io.Lock()
+	defer s.io.Unlock()
+
+	var lastErr error
+
+	for attempt := range s.retries {
+		if attempt > 0 {
+			sleep(backoff(attempt))
+		}
+
+		sb, err := s.readSuperblock()
+		if err != nil {
+			return Reservation{}, err
+		}
+
+		if pages > 0 {
+			if sb.OpenSegment == 0 {
+				return Reservation{}, ErrNoOpenSegment
+			}
+
+			if sb.OpenFreePages() < pages {
+				return Reservation{}, fmt.Errorf("%w: open segment %d has %d of %d pages free",
+					ErrFull, sb.OpenSegment, sb.OpenFreePages(), pages)
+			}
+		}
+
+		if sb.RecordCount+uint64(records) > sb.RecordCapacity() {
+			return Reservation{}, fmt.Errorf("%w: %d of %d record slots used",
+				ErrFull, sb.RecordCount, sb.RecordCapacity())
+		}
+
+		next := sb
+		next.Generation++
+		next.OpenCursorPages += pages
+		next.RecordCount += uint64(records)
+
+		res := Reservation{
+			FirstRecord: sb.RecordCount,
+			RecordCount: records,
+			Generation:  next.Generation,
+		}
+
+		if pages > 0 {
+			res.Segment = sb.OpenSegment
+			res.PageOffset = sb.OpenCursorPages
+			res.PageCount = pages
+		}
+
+		if err := s.writeSuperblock(next); err != nil {
+			if errors.Is(err, ErrConflict) {
+				lastErr = err
+
+				continue
+			}
+
+			return Reservation{}, err
+		}
+
+		s.state.Lock()
+		s.sb = next
+		s.state.Unlock()
+
+		return res, nil
+	}
+
+	return Reservation{}, fmt.Errorf("catalog: reservation lost %d compare-and-swaps: %w",
+		s.retries, lastErr)
+}
+
+func (s *Store) writeSuperblock(sb Superblock) error {
+	if err := sb.Validate(); err != nil {
+		return err
+	}
+
+	block := make([]byte, BlockBytes)
+	if err := sb.MarshalTo(block); err != nil {
+		return err
+	}
+
+	if _, err := s.vol.WriteAt(block, 0); err != nil {
+		return fmt.Errorf("write superblock: %w", err)
+	}
+
+	return nil
+}
+
+// Append writes records into the slots a reservation claimed.
+//
+// The blob bytes must already be durable in the segment before this is called.
+// A record is a promise that the bytes are there, and a reader that acts on it
+// mounts them immediately.
+//
+// Record blocks are shared: two ingesters can hold slots in the same block, so
+// each write is a read-modify-write under the block's own compare-and-swap.
+// Retrying is safe because the retry re-reads the other writer's record and
+// re-places only its own slots.
+func (s *Store) Append(res Reservation, records []Record) error {
+	if len(records) != res.RecordCount {
+		return fmt.Errorf("catalog: %d records for a reservation of %d", len(records), res.RecordCount)
+	}
+
+	byBlock := make(map[uint64]map[int]Record)
+
+	s.state.RLock()
+	sb := s.sb
+	s.state.RUnlock()
+
+	for i, r := range records {
+		r.Generation = res.Generation
+
+		if err := r.Validate(); err != nil {
+			return fmt.Errorf("record %d: %w", i, err)
+		}
+
+		index, slot := sb.RecordLocation(res.FirstRecord + uint64(i)) //nolint:gosec // i is bounded by len(records)
+
+		if byBlock[index] == nil {
+			byBlock[index] = make(map[int]Record)
+		}
+
+		byBlock[index][slot] = r
+	}
+
+	s.io.Lock()
+	defer s.io.Unlock()
+
+	for index, slots := range byBlock {
+		if err := s.mergeRecordBlock(index, slots); err != nil {
+			return err
+		}
+	}
+
+	// Fold our own records in immediately rather than waiting for a poll, so
+	// the node that ingested a layer can serve it without a round trip.
+	s.state.Lock()
+	for _, slots := range byBlock {
+		for _, r := range slots {
+			s.index.Apply(r)
+		}
+	}
+	s.state.Unlock()
+
+	return nil
+}
+
+func (s *Store) mergeRecordBlock(index uint64, mine map[int]Record) error {
+	block := make([]byte, BlockBytes)
+
+	var lastErr error
+
+	for attempt := range s.retries {
+		if attempt > 0 {
+			sleep(backoff(attempt))
+		}
+
+		if _, err := s.vol.ReadAt(block, int64(index*BlockBytes)); err != nil { //nolint:gosec // bounded by the extent size
+			return fmt.Errorf("read record block %d: %w", index, err)
+		}
+
+		slots, err := UnmarshalRecordBlock(block)
+		if err != nil {
+			return fmt.Errorf("record block %d: %w", index, err)
+		}
+
+		for slot, r := range mine {
+			if existing, taken := slots[slot]; taken && existing != r {
+				return fmt.Errorf("catalog: record slot %d in block %d is already taken by %s %s",
+					slot, index, existing.Type, existing.Key)
+			}
+
+			slots[slot] = r
+		}
+
+		merged, err := MarshalRecordBlock(slots)
+		if err != nil {
+			return err
+		}
+
+		if _, err := s.vol.WriteAt(merged, int64(index*BlockBytes)); err != nil { //nolint:gosec // bounded by the extent size
+			if errors.Is(err, ErrConflict) {
+				lastErr = err
+
+				continue
+			}
+
+			return fmt.Errorf("write record block %d: %w", index, err)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("catalog: record block %d lost %d compare-and-swaps: %w", index, s.retries, lastErr)
+}
+
+// backoff is exponential with full jitter, capped. Ingest is off the container
+// start path, so waiting is cheap; a thundering herd of ingesters retrying in
+// lockstep is not.
+func backoff(attempt int) time.Duration {
+	const (
+		base    = 2 * time.Millisecond
+		ceiling = 250 * time.Millisecond
+	)
+
+	d := base << min(attempt, 10)
+	if d > ceiling {
+		d = ceiling
+	}
+
+	return time.Duration(rand.Int64N(int64(d))) + time.Millisecond //nolint:gosec // jitter, not a secret
+}

@@ -122,6 +122,14 @@ GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 GANTRY_MANIFEST_TEMPLATES_DIR := deploy/gantry
 GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
 
+# gantry-snapshotter (RACER-backed containerd snapshotter)
+GANTRY_SNAPSHOTTER_BIN=bin/gantry-snapshotter
+GANTRY_SNAPSHOTTER_CMD=./cmd/gantry-snapshotter
+GANTRY_SNAPSHOTTER_IMAGE ?= $(CONTAINER_REGISTRY)/gantry-snapshotter:$(VERSION_TAG)
+GANTRY_SNAPSHOTTER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+GANTRY_SNAPSHOTTER_MANIFEST_TEMPLATES_DIR := deploy/gantry-snapshotter
+GANTRY_SNAPSHOTTER_MANIFEST_RENDERED_DIR  := deploy/gantry-snapshotter/rendered
+
 # racer-ctrl (per-node control plane for the racer distributed block device)
 RACER_CTRL_BIN=bin/racer-ctrl
 RACER_CTRL_CMD=./cmd/racer-ctrl
@@ -290,7 +298,7 @@ REACT_DEV ?= false
 
 ##@ General
 
-all: kubectl-unbounded forge machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry racer-ctrl ## Build all binaries (default)
+all: kubectl-unbounded forge machina machine-ops-controller unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry gantry-snapshotter racer-ctrl ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -686,6 +694,25 @@ gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rende
 		--set Namespace=$(GANTRY_NAMESPACE) \
 		--set Image=$(GANTRY_IMAGE)
 	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
+
+##@ gantry-snapshotter (RACER-backed containerd snapshotter)
+
+.PHONY: gantry-snapshotter gantry-snapshotter-build gantry-snapshotter-manifests
+
+gantry-snapshotter-build: ## Build the gantry-snapshotter binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(GANTRY_SNAPSHOTTER_BIN) $(GANTRY_SNAPSHOTTER_CMD)
+
+gantry-snapshotter: test gantry-snapshotter-build ## Build gantry-snapshotter (implies test)
+
+gantry-snapshotter-manifests: ## Render gantry-snapshotter manifests into deploy/gantry-snapshotter/rendered
+	@mkdir -p $(GANTRY_SNAPSHOTTER_MANIFEST_RENDERED_DIR)
+	@find $(GANTRY_SNAPSHOTTER_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(GANTRY_SNAPSHOTTER_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(GANTRY_SNAPSHOTTER_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(GANTRY_SNAPSHOTTER_NAMESPACE) \
+		--set Image=$(GANTRY_SNAPSHOTTER_IMAGE)
+	@echo "Rendered gantry-snapshotter manifests into $(GANTRY_SNAPSHOTTER_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_SNAPSHOTTER_NAMESPACE))"
 
 ##@ racer (distributed block device)
 

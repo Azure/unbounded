@@ -1,0 +1,834 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+package ingest
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
+)
+
+// memVolume is a catalog device backed by memory. The catalog's own tests
+// cover OCC conflict handling; here the volume only has to be a correct byte
+// array so the ingester's use of the store can be exercised.
+type memVolume struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func newMemVolume(size int) *memVolume { return &memVolume{data: make([]byte, size)} }
+
+func (v *memVolume) ReadAt(p []byte, off int64) (int, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if off < 0 || off+int64(len(p)) > int64(len(v.data)) {
+		return 0, io.EOF
+	}
+
+	return copy(p, v.data[off:]), nil
+}
+
+func (v *memVolume) WriteAt(p []byte, off int64) (int, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if off < 0 || off+int64(len(p)) > int64(len(v.data)) {
+		return 0, io.ErrShortWrite
+	}
+
+	return copy(v.data[off:], p), nil
+}
+
+// fileLocator points every address at one file standing in for a segment
+// device.
+type fileLocator struct {
+	path string
+	err  error
+}
+
+func (l fileLocator) Locate(addr segment.Address) (string, uint64, uint64, error) {
+	if l.err != nil {
+		return "", 0, 0, l.err
+	}
+
+	return l.path, addr.ByteOffset(), addr.Span(), nil
+}
+
+// bytesOpener hands back a fixed tar payload.
+type bytesOpener struct {
+	data []byte
+	err  error
+
+	// failFirst makes the first Open fail and every later one succeed,
+	// which is what a layer blob that has not finished downloading yet
+	// looks like.
+	failFirst error
+
+	opens int
+}
+
+func (o *bytesOpener) Open(context.Context, Request) (ReadCloser, error) {
+	if o.failFirst != nil {
+		err := o.failFirst
+		o.failFirst = nil
+
+		return nil, err
+	}
+
+	if o.err != nil {
+		return nil, o.err
+	}
+
+	o.opens++
+
+	return io.NopCloser(bytes.NewReader(o.data)), nil
+}
+
+// fakeBuilder returns a Builder whose run hook writes a deterministic image of
+// the requested size instead of shelling out to erofs-utils.
+func fakeBuilder(t *testing.T, image []byte) (*Builder, *int) {
+	t.Helper()
+
+	calls := 0
+	b := NewBuilder()
+	b.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls++
+
+		out := args[len(args)-2]
+		if err := os.WriteFile(out, image, 0o600); err != nil {
+			return nil, err
+		}
+
+		return nil, nil
+	}
+
+	return b, &calls
+}
+
+func digestOf(b byte) catalog.Digest {
+	var d catalog.Digest
+
+	for i := range d {
+		d[i] = b
+	}
+
+	return d
+}
+
+func sum(data []byte) catalog.Digest {
+	var d catalog.Digest
+
+	copy(d[:], func() []byte { s := sha256.Sum256(data); return s[:] }())
+
+	return d
+}
+
+// newStore formats a catalog with one open segment of the given page count.
+func newStore(t *testing.T, pages uint32) *catalog.Store {
+	t.Helper()
+
+	vol := newMemVolume(64 * catalog.BlockBytes)
+
+	if err := catalog.Format(vol, catalog.FormatOptions{Bytes: 64 * catalog.BlockBytes}); err != nil {
+		t.Fatalf("format: %v", err)
+	}
+
+	s, err := catalog.Open(vol)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	if err := s.AddSegment(1, pages); err != nil {
+		t.Fatalf("add segment: %v", err)
+	}
+
+	if err := s.SetOpenSegment(1); err != nil {
+		t.Fatalf("open segment: %v", err)
+	}
+
+	return s
+}
+
+// deviceFile creates a sparse file big enough to hold pages 4 MiB pages.
+func deviceFile(t *testing.T, pages int) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "segment.img")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create device: %v", err)
+	}
+
+	if err := f.Truncate(int64(pages) * segment.PageBytes); err != nil {
+		t.Fatalf("truncate device: %v", err)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close device: %v", err)
+	}
+
+	return path
+}
+
+func openPlain(path string) (Device, error) { return os.OpenFile(path, os.O_RDWR, 0) }
+
+func newIngester(t *testing.T, opts Options) *Ingester {
+	t.Helper()
+
+	if opts.WorkDir == "" {
+		opts.WorkDir = t.TempDir()
+	}
+
+	if opts.Open == nil {
+		opts.Open = openPlain
+	}
+
+	i, err := New(opts)
+	if err != nil {
+		t.Fatalf("new ingester: %v", err)
+	}
+
+	return i
+}
+
+func TestUUIDFor(t *testing.T) {
+	a := UUIDFor("sha256:abc")
+	b := UUIDFor("sha256:abc")
+
+	if a != b {
+		t.Fatalf("not deterministic: %q vs %q", a, b)
+	}
+
+	if UUIDFor("sha256:def") == a {
+		t.Fatal("distinct names produced the same uuid")
+	}
+
+	if len(a) != 36 {
+		t.Fatalf("uuid %q has length %d, want 36", a, len(a))
+	}
+
+	if a[14] != '5' {
+		t.Fatalf("uuid %q is not version 5", a)
+	}
+
+	if !strings.ContainsRune("89ab", rune(a[19])) {
+		t.Fatalf("uuid %q has the wrong variant", a)
+	}
+}
+
+func TestBuilderArgs(t *testing.T) {
+	b := NewBuilder()
+	b.ExtraArgs = []string{"--quiet"}
+
+	args := b.Args(BuildOptions{TarPath: "/in.tar", OutPath: "/out.erofs", UUID: "u"})
+	want := []string{"--tar=f", "--aufs", "-b4096", "-Uu", "--quiet", "/out.erofs", "/in.tar"}
+
+	if fmt.Sprint(args) != fmt.Sprint(want) {
+		t.Fatalf("args = %v, want %v", args, want)
+	}
+}
+
+func TestBuilderArgsWithoutUUID(t *testing.T) {
+	args := NewBuilder().Args(BuildOptions{TarPath: "/in.tar", OutPath: "/out.erofs"})
+
+	for _, a := range args {
+		if strings.HasPrefix(a, "-U") {
+			t.Fatalf("unexpected uuid argument in %v", args)
+		}
+	}
+}
+
+func TestBuilderBuild(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.erofs")
+
+	b, calls := fakeBuilder(t, bytes.Repeat([]byte("e"), 1234))
+
+	size, err := b.Build(t.Context(), BuildOptions{TarPath: filepath.Join(dir, "in.tar"), OutPath: out})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	if size != 1234 {
+		t.Fatalf("size = %d, want 1234", size)
+	}
+
+	if *calls != 1 {
+		t.Fatalf("calls = %d, want 1", *calls)
+	}
+}
+
+func TestBuilderBuildValidates(t *testing.T) {
+	b := NewBuilder()
+
+	if _, err := b.Build(t.Context(), BuildOptions{OutPath: "/out"}); err == nil {
+		t.Fatal("want an error for a missing tar path")
+	}
+
+	if _, err := b.Build(t.Context(), BuildOptions{TarPath: "/in"}); err == nil {
+		t.Fatal("want an error for a missing output path")
+	}
+}
+
+func TestBuilderBuildRemovesPartialOutput(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.erofs")
+
+	b := NewBuilder()
+	b.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if err := os.WriteFile(args[len(args)-2], []byte("half"), 0o600); err != nil {
+			return nil, err
+		}
+
+		return []byte("mkfs.erofs: out of space"), errors.New("exit 1")
+	}
+
+	_, err := b.Build(t.Context(), BuildOptions{TarPath: filepath.Join(dir, "in.tar"), OutPath: out})
+	if !errors.Is(err, ErrBuildFailed) {
+		t.Fatalf("err = %v, want ErrBuildFailed", err)
+	}
+
+	if !strings.Contains(err.Error(), "out of space") {
+		t.Fatalf("err = %v, want the builder output included", err)
+	}
+
+	if _, serr := os.Stat(out); !os.IsNotExist(serr) {
+		t.Fatalf("partial output survived: %v", serr)
+	}
+}
+
+func TestBuilderBuildRejectsEmptyImage(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.erofs")
+
+	b, _ := fakeBuilder(t, nil)
+
+	if _, err := b.Build(t.Context(), BuildOptions{TarPath: filepath.Join(dir, "in.tar"), OutPath: out}); !errors.Is(err, ErrBuildFailed) {
+		t.Fatalf("err = %v, want ErrBuildFailed", err)
+	}
+
+	if _, serr := os.Stat(out); !os.IsNotExist(serr) {
+		t.Fatal("empty output survived")
+	}
+}
+
+func TestTrimKeepsTheTail(t *testing.T) {
+	out := bytes.Repeat([]byte("x"), 600)
+	out = append(out, []byte("the real error")...)
+
+	got := trim(out)
+	if len(got) != 512 {
+		t.Fatalf("len = %d, want 512", len(got))
+	}
+
+	if !strings.HasSuffix(got, "the real error") {
+		t.Fatalf("tail lost: %q", got[len(got)-30:])
+	}
+}
+
+func TestSpill(t *testing.T) {
+	dir := t.TempDir()
+	payload := bytes.Repeat([]byte("t"), 4097)
+
+	path, size, err := Spill(dir, "l-*.tar", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("spill: %v", err)
+	}
+
+	if size != uint64(len(payload)) {
+		t.Fatalf("size = %d, want %d", size, len(payload))
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if !bytes.Equal(got, payload) {
+		t.Fatal("spilled content differs")
+	}
+}
+
+func TestSpillRemovesTheFileOnError(t *testing.T) {
+	dir := t.TempDir()
+	want := errors.New("boom")
+
+	_, _, err := Spill(dir, "l-*.tar", io.MultiReader(bytes.NewReader([]byte("a")), errReader{want}))
+	if !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		t.Fatalf("read dir: %v", rerr)
+	}
+
+	if len(entries) != 0 {
+		t.Fatalf("temp file survived: %v", entries)
+	}
+}
+
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestAlignedBuffer(t *testing.T) {
+	for _, n := range []int{1, Alignment, segment.PageBytes} {
+		buf := AlignedBuffer(n)
+		if len(buf) != n {
+			t.Fatalf("len = %d, want %d", len(buf), n)
+		}
+
+		if cap(buf) != n {
+			t.Fatalf("cap = %d, want %d so an append cannot walk into the padding", cap(buf), n)
+		}
+	}
+}
+
+func TestWriteBlobPadsToAWholePage(t *testing.T) {
+	path := deviceFile(t, 2)
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	payload := bytes.Repeat([]byte("z"), segment.PageBytes+7)
+
+	got, err := WriteBlob(f, 0, bytes.NewReader(payload), uint64(len(payload)))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if got != sum(payload) {
+		t.Fatal("checksum is not over the unpadded bytes")
+	}
+
+	tail := make([]byte, 16)
+	if _, err := f.ReadAt(tail, segment.PageBytes+7); err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
+
+	if !bytes.Equal(tail, make([]byte, 16)) {
+		t.Fatalf("tail padding = %q, want zeros", tail)
+	}
+
+	if err := VerifyBlob(f, 0, uint64(len(payload)), got); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+func TestWriteBlobRejects(t *testing.T) {
+	path := deviceFile(t, 1)
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	if _, err := WriteBlob(f, 1024, bytes.NewReader([]byte("x")), 1); err == nil {
+		t.Fatal("want an error for an unaligned offset")
+	}
+
+	if _, err := WriteBlob(f, 0, bytes.NewReader(nil), 0); err == nil {
+		t.Fatal("want an error for an empty blob")
+	}
+
+	if _, err := WriteBlob(f, 0, bytes.NewReader([]byte("ab")), 4); !errors.Is(err, ErrShortLayer) {
+		t.Fatalf("err = %v, want ErrShortLayer", err)
+	}
+
+	if _, err := WriteBlob(f, 0, bytes.NewReader([]byte("abcd")), 2); !errors.Is(err, ErrLongLayer) {
+		t.Fatalf("err = %v, want ErrLongLayer", err)
+	}
+}
+
+func TestVerifyBlobDetectsRot(t *testing.T) {
+	path := deviceFile(t, 1)
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	payload := bytes.Repeat([]byte("v"), 8192)
+
+	got, err := WriteBlob(f, 0, bytes.NewReader(payload), uint64(len(payload)))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if _, err := f.WriteAt([]byte("!"), 4096); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+
+	if err := VerifyBlob(f, 0, uint64(len(payload)), got); !errors.Is(err, ErrVerify) {
+		t.Fatalf("err = %v, want ErrVerify", err)
+	}
+
+	if err := VerifyBlob(f, 512, 1, got); err == nil {
+		t.Fatal("want an error for an unaligned offset")
+	}
+}
+
+func TestNewValidates(t *testing.T) {
+	base := func() Options {
+		return Options{
+			Catalog: newStore(t, 4),
+			Locator: fileLocator{path: "/dev/null"},
+			Opener:  &bytesOpener{},
+			WorkDir: t.TempDir(),
+		}
+	}
+
+	cases := map[string]func(*Options){
+		"catalog": func(o *Options) { o.Catalog = nil },
+		"locator": func(o *Options) { o.Locator = nil },
+		"opener":  func(o *Options) { o.Opener = nil },
+		"workdir": func(o *Options) { o.WorkDir = "" },
+	}
+
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			opts := base()
+			mutate(&opts)
+
+			if _, err := New(opts); err == nil {
+				t.Fatalf("want an error with no %s", name)
+			}
+		})
+	}
+}
+
+func TestIngestValidatesTheRequest(t *testing.T) {
+	i := newIngester(t, Options{
+		Catalog: newStore(t, 4),
+		Locator: fileLocator{path: deviceFile(t, 4)},
+		Opener:  &bytesOpener{},
+	})
+
+	if _, err := i.Ingest(t.Context(), Request{ChainID: digestOf(2)}); err == nil {
+		t.Fatal("want an error without a diff id")
+	}
+
+	if _, err := i.Ingest(t.Context(), Request{DiffID: digestOf(1)}); err == nil {
+		t.Fatal("want an error without a chain id")
+	}
+}
+
+func TestIngestWritesAndPublishes(t *testing.T) {
+	store := newStore(t, 8)
+	device := deviceFile(t, 8)
+	image := bytes.Repeat([]byte("erofs"), 100000) // 500000 bytes, one page
+
+	builder, calls := fakeBuilder(t, image)
+	opener := &bytesOpener{data: []byte("tar")}
+
+	i := newIngester(t, Options{
+		Catalog: store,
+		Locator: fileLocator{path: device},
+		Opener:  opener,
+		Builder: builder,
+	})
+
+	req := Request{DiffID: digestOf(1), ChainID: digestOf(2)}
+
+	res, err := i.Ingest(t.Context(), req)
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if res.Outcome != OutcomeIngested {
+		t.Fatalf("outcome = %s, want ingested", res.Outcome)
+	}
+
+	if *calls != 1 {
+		t.Fatalf("builder calls = %d, want 1", *calls)
+	}
+
+	if res.Blob.Address.PageCount != 1 || res.Blob.Address.ByteLength != uint64(len(image)) {
+		t.Fatalf("address = %+v", res.Blob.Address)
+	}
+
+	if res.Blob.Sum != sum(image) {
+		t.Fatal("published checksum does not match the image")
+	}
+
+	// The bytes are really on the device where the record says they are.
+	on := make([]byte, len(image))
+
+	f, err := os.Open(device)
+	if err != nil {
+		t.Fatalf("open device: %v", err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.ReadAt(on, int64(res.Blob.Address.ByteOffset())); err != nil {
+		t.Fatalf("read device: %v", err)
+	}
+
+	if !bytes.Equal(on, image) {
+		t.Fatal("device content differs from the image")
+	}
+
+	// A second node resolves the chain out of the catalog with no work.
+	blob, ok := store.Resolve(req.ChainID)
+	if !ok {
+		t.Fatal("chain did not resolve")
+	}
+
+	if blob.Address != res.Blob.Address {
+		t.Fatalf("resolved %+v, want %+v", blob.Address, res.Blob.Address)
+	}
+
+	segs, err := store.Segments()
+	if err != nil {
+		t.Fatalf("segments: %v", err)
+	}
+
+	if segs[0].LiveBytes != segment.PageBytes {
+		t.Fatalf("live bytes = %d, want one page", segs[0].LiveBytes)
+	}
+}
+
+func TestIngestIsIdempotent(t *testing.T) {
+	store := newStore(t, 8)
+	builder, calls := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+	opener := &bytesOpener{data: []byte("tar")}
+
+	i := newIngester(t, Options{
+		Catalog: store,
+		Locator: fileLocator{path: deviceFile(t, 8)},
+		Opener:  opener,
+		Builder: builder,
+	})
+
+	req := Request{DiffID: digestOf(1), ChainID: digestOf(2)}
+
+	if _, err := i.Ingest(t.Context(), req); err != nil {
+		t.Fatalf("first ingest: %v", err)
+	}
+
+	res, err := i.Ingest(t.Context(), req)
+	if err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+
+	if res.Outcome != OutcomePresent {
+		t.Fatalf("outcome = %s, want present", res.Outcome)
+	}
+
+	if *calls != 1 {
+		t.Fatalf("builder calls = %d, want 1", *calls)
+	}
+
+	if opener.opens != 1 {
+		t.Fatalf("layer opened %d times, want 1", opener.opens)
+	}
+}
+
+func TestIngestLinksASharedLayer(t *testing.T) {
+	store := newStore(t, 8)
+	builder, calls := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+
+	i := newIngester(t, Options{
+		Catalog: store,
+		Locator: fileLocator{path: deviceFile(t, 8)},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	first := Request{DiffID: digestOf(1), ChainID: digestOf(2)}
+	if _, err := i.Ingest(t.Context(), first); err != nil {
+		t.Fatalf("first ingest: %v", err)
+	}
+
+	// The same layer at a different position in a different image: same
+	// diffID, different chainID.
+	second := Request{DiffID: digestOf(1), ChainID: digestOf(3)}
+
+	res, err := i.Ingest(t.Context(), second)
+	if err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+
+	if res.Outcome != OutcomeLinked {
+		t.Fatalf("outcome = %s, want linked", res.Outcome)
+	}
+
+	if *calls != 1 {
+		t.Fatalf("builder calls = %d, want 1: a shared layer must not be rebuilt", *calls)
+	}
+
+	a, _ := store.Resolve(first.ChainID)
+
+	b, ok := store.Resolve(second.ChainID)
+	if !ok {
+		t.Fatal("linked chain did not resolve")
+	}
+
+	if a.Address != b.Address {
+		t.Fatalf("shared layer resolved to two addresses: %+v and %+v", a.Address, b.Address)
+	}
+}
+
+func TestIngestReportsOpenerFailure(t *testing.T) {
+	want := errors.New("no such blob")
+	builder, _ := fakeBuilder(t, []byte("e"))
+
+	i := newIngester(t, Options{
+		Catalog: newStore(t, 8),
+		Locator: fileLocator{path: deviceFile(t, 8)},
+		Opener:  &bytesOpener{err: want},
+		Builder: builder,
+	})
+
+	if _, err := i.Ingest(t.Context(), Request{DiffID: digestOf(1), ChainID: digestOf(2)}); !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+}
+
+func TestIngestReportsLocatorFailure(t *testing.T) {
+	want := errors.New("segment not exported")
+	builder, _ := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+	store := newStore(t, 8)
+
+	i := newIngester(t, Options{
+		Catalog: store,
+		Locator: fileLocator{err: want},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	req := Request{DiffID: digestOf(1), ChainID: digestOf(2)}
+	if _, err := i.Ingest(t.Context(), req); !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+
+	// The reservation is spent but nothing was published, so the chain must
+	// still miss: a half finished ingest must never be resolvable.
+	if _, ok := store.Resolve(req.ChainID); ok {
+		t.Fatal("a failed ingest published a record")
+	}
+}
+
+func TestIngestVerifiesWhatItWrote(t *testing.T) {
+	store := newStore(t, 8)
+	device := deviceFile(t, 8)
+	builder, _ := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+
+	// A device that drops every other byte on the floor stands in for a
+	// fabric that acknowledged a write it did not durably take.
+	i := newIngester(t, Options{
+		Catalog: store,
+		Locator: fileLocator{path: device},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+		Open: func(path string) (Device, error) {
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				return nil, err
+			}
+
+			return lyingDevice{f}, nil
+		},
+	})
+
+	req := Request{DiffID: digestOf(1), ChainID: digestOf(2)}
+	if _, err := i.Ingest(t.Context(), req); !errors.Is(err, ErrVerify) {
+		t.Fatalf("err = %v, want ErrVerify", err)
+	}
+
+	if _, ok := store.Resolve(req.ChainID); ok {
+		t.Fatal("an unverified blob was published")
+	}
+}
+
+// lyingDevice acknowledges writes without storing them.
+type lyingDevice struct{ *os.File }
+
+func (d lyingDevice) WriteAt(p []byte, _ int64) (int, error) { return len(p), nil }
+
+func TestIngestSkipVerifyPublishesAnyway(t *testing.T) {
+	store := newStore(t, 8)
+	builder, _ := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+
+	i := newIngester(t, Options{
+		Catalog:    store,
+		Locator:    fileLocator{path: deviceFile(t, 8)},
+		Opener:     &bytesOpener{data: []byte("tar")},
+		Builder:    builder,
+		SkipVerify: true,
+		Open: func(path string) (Device, error) {
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				return nil, err
+			}
+
+			return lyingDevice{f}, nil
+		},
+	})
+
+	req := Request{DiffID: digestOf(1), ChainID: digestOf(2)}
+	if _, err := i.Ingest(t.Context(), req); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if _, ok := store.Resolve(req.ChainID); !ok {
+		t.Fatal("chain did not resolve with verification off")
+	}
+}
+
+func TestIngestOutOfSpace(t *testing.T) {
+	// One page of segment, an image that needs two.
+	store := newStore(t, 1)
+	builder, _ := fakeBuilder(t, bytes.Repeat([]byte("e"), segment.PageBytes+1))
+
+	i := newIngester(t, Options{
+		Catalog: store,
+		Locator: fileLocator{path: deviceFile(t, 8)},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	if _, err := i.Ingest(t.Context(), Request{DiffID: digestOf(1), ChainID: digestOf(2)}); !errors.Is(err, catalog.ErrFull) {
+		t.Fatalf("err = %v, want ErrFull", err)
+	}
+}
+
+func TestOutcomeString(t *testing.T) {
+	cases := map[Outcome]string{
+		OutcomeUnknown:  "unknown",
+		OutcomePresent:  "present",
+		OutcomeLinked:   "linked",
+		OutcomeIngested: "ingested",
+		Outcome(99):     "unknown(99)",
+	}
+
+	for o, want := range cases {
+		if got := o.String(); got != want {
+			t.Fatalf("Outcome(%d) = %q, want %q", int(o), got, want)
+		}
+	}
+}

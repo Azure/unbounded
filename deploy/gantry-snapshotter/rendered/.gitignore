@@ -1,0 +1,5 @@
+# Keep this directory present in the repo for a stable, gitignored render
+# target. `make gantry-snapshotter-manifests` writes the rendered manifests
+# here; none of that output is tracked.
+*
+!.gitignore
