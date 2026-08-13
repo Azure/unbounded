@@ -18,6 +18,7 @@ use crate::fabric::{self, Bucket, Class as Klass, Cmd, Footer, GroupIx, Link, Se
 use crate::layout::{Class, Entry};
 use crate::paxos::{Ballot, Paxos, Register};
 use crate::runtime::{self, PoolBuf};
+use crate::server;
 
 /// Maps a page address to its consensus group; the slab holds no config to do it with.
 pub(crate) type Groups<'a> = dyn Fn(u64) -> GroupId + 'a;
@@ -497,8 +498,8 @@ impl Heal {
     async fn sweep(&'static self) -> Result<(), Status> {
         let core = runtime::core();
         let c = &self.cores[core];
-        let cfg = self.alloc().config();
-        let groups = total_groups(cfg);
+        let cfg = server::config();
+        let groups = total_groups(&cfg);
         if groups == 0 {
             return Ok(());
         }
@@ -529,7 +530,7 @@ impl Heal {
                 let start = c.next.get();
                 let mut n = start;
                 loop {
-                    match group_at(cfg, n) {
+                    match group_at(&cfg, n) {
                         Some(cand)
                             if cand.index() as usize % cores == core
                                 && self.paxos.members(cand).is_some() =>
@@ -558,7 +559,7 @@ impl Heal {
             if !self.serves(huge) {
                 continue;
             }
-            match self.compare(cfg, g, huge, was).await {
+            match self.compare(&cfg, g, huge, was).await {
                 Ok(r) => replaying |= r,
                 Err(e) => {
                     checked = false;
@@ -575,7 +576,7 @@ impl Heal {
             // Leaving a replay needs the promise recovered first; the next sweep retries.
             self.stat(|s| s.failed += 1);
         }
-        self.hand_over(cfg, g).await;
+        self.hand_over(&cfg, g).await;
         Ok(())
     }
 
@@ -627,7 +628,7 @@ impl Heal {
                 let _ = self.paxos.push(GlobalAddr(addr), r, zone).await;
                 sent += 1;
             }
-            if done || sent >= repairs_per_replay(self.alloc().config()) {
+            if done || sent >= repairs_per_replay(&server::config()) {
                 break;
             }
         }

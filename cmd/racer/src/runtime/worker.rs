@@ -307,6 +307,15 @@ pub(crate) fn cores() -> usize {
 /// Synchronous by construction: `f` cannot await, so the worker cannot process a `Retire`
 /// while it runs and neither pointer can be pulled out from under it. That is why a core
 /// transaction needs no configuration guard.
+/// The configuration this worker is running under, pinned until the guard is dropped.
+///
+/// For code that is already on a worker but was not handed one: a hop closure runs on the
+/// destination core, long after the caller's borrow was taken, so it re-reads the live
+/// configuration rather than carrying one across.
+pub(super) fn config<C>() -> Cfg<C> {
+    with_local(|l| l.cfg::<C>())
+}
+
 #[allow(dead_code)]
 pub(super) fn with_core_ctx<H: Handler, R>(f: impl FnOnce(CoreCtx<'_, H>) -> R) -> R {
     with_local(|l| {

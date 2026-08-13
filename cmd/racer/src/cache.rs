@@ -32,6 +32,7 @@ use crate::config::{self, Config, rank};
 use crate::layout::{self, Class};
 use crate::paxos::Register;
 use crate::runtime::{self, Buf, Disk, Durability};
+use crate::server;
 
 // --- tunables ---
 //
@@ -646,8 +647,7 @@ unsafe impl Sync for Cache {}
 /// what `policy.cache_index_bytes` will pay for in slot records. A store with no room past its
 /// slabs, or a config no extent opts into, produces a cache with no slots, which declines
 /// everything at no cost.
-pub fn open(alloc: &'static Allocator, cores: usize) -> &'static Cache {
-    let cfg = alloc.config();
+pub fn open(alloc: &'static Allocator, cfg: &Config, cores: usize) -> &'static Cache {
     let geo = alloc.geometry();
     let (base, _) = geo.tail(cfg.node.store_bytes);
     let chunks = geo.tail_chunks(cfg.node.store_bytes);
@@ -706,7 +706,7 @@ pub fn open(alloc: &'static Allocator, cores: usize) -> &'static Cache {
         tail: (base, chunks),
         shards,
         budget,
-        roster: config::Live::new(Roster::of(alloc.config())),
+        roster: config::Live::new(Roster::of(cfg)),
         state: state.into(),
         pool: RefCell::new(Pool {
             free,
@@ -874,12 +874,8 @@ impl Cache {
         }
         // One lookup for both the class and the threshold; an address in no extent of ours is
         // not a rejection, it is nothing to reject.
-        let Some((huge, n)) = self
-            .alloc
-            .config()
-            .extent_at(addr.0)
-            .map(|e| (e.huge, e.cache_admit))
-        else {
+        let cfg = server::config();
+        let Some((huge, n)) = cfg.extent_at(addr.0).map(|e| (e.huge, e.cache_admit)) else {
             return 0;
         };
         if n == 0 {
@@ -1154,7 +1150,7 @@ impl Cache {
             self.stat(huge, |s| s.shed += 1);
             return None;
         }
-        if self.alloc.config().cache_admit_of(addr.0) == 0 {
+        if server::config().cache_admit_of(addr.0) == 0 {
             self.stat(huge, |s| s.rejected_policy += 1);
             return None;
         }
@@ -1205,7 +1201,7 @@ impl Cache {
     /// such value, so a version is a complete identity for a cached 4 MiB page. No ballot
     /// beside it, which matters because a 4 MiB frame has no trailer.
     fn live_version(&self, addr: GlobalAddr) -> u64 {
-        3 * self.alloc.config().tombstone_epoch_of(addr.0) + 1
+        3 * server::config().tombstone_epoch_of(addr.0) + 1
     }
 
     // --- tick ---

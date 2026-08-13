@@ -23,6 +23,7 @@ use crate::fabric::{
 };
 use crate::layout::{self, Class};
 use crate::runtime::{self, Buf, PoolBuf};
+use crate::server;
 
 /// How many times a LWW proposal re-derives its guard before giving up. A mismatch is
 /// retried here, not reported, so the client only ever sees last-write-wins.
@@ -560,7 +561,7 @@ impl Paxos {
     }
 
     pub(crate) fn group(&self, addr: GlobalAddr) -> GroupId {
-        self.alloc.config().group(addr.0)
+        server::config().group(addr.0)
     }
 
     /// The core holding a group's consensus state: the group index modulo the core count,
@@ -574,8 +575,7 @@ impl Paxos {
     /// universe we hold no configuration for has no members here, which stops a frame naming
     /// one.
     pub(crate) fn members(&self, group: GroupId) -> Option<[u32; 3]> {
-        self.alloc
-            .config()
+        server::config()
             .universe(group.universe())?
             .catalog
             .get(group.index() as usize)
@@ -584,7 +584,7 @@ impl Paxos {
 
     /// Our index in the group, if we are a member. Only a member may propose.
     pub(crate) fn self_index(&self, m: &[u32; 3]) -> Option<u8> {
-        let me = self.alloc.config().node.id;
+        let me = server::config().node.id;
         m.iter().position(|&n| n == me).map(|i| i as u8)
     }
 
@@ -659,14 +659,14 @@ impl Paxos {
     /// covers only our own zone of it, so nothing about a foreign address may be resolved
     /// locally.
     fn foreign(&self, addr: GlobalAddr) -> bool {
-        let cfg = self.alloc.config();
+        let cfg = server::config();
         cfg.zone_of(addr.0).is_some_and(|z| z != cfg.node.zone)
     }
 
     /// The zone still answering for `addr` while its extent is pulled into ours. `None`
     /// unless this node is the migration's destination.
     fn inbound(&self, addr: GlobalAddr) -> Option<u32> {
-        let cfg = self.alloc.config();
+        let cfg = server::config();
         let here = cfg.next_zone_of(addr.0)? == cfg.node.zone;
         cfg.zone_of(addr.0).filter(|&z| here && z != cfg.node.zone)
     }
@@ -688,8 +688,7 @@ impl Paxos {
         if !self.foreign(addr) {
             return Ok(None);
         }
-        self.alloc
-            .config()
+        server::config()
             .zone_of(addr.0)
             .ok_or(Status::Unmapped)
             .map(Some)
@@ -702,7 +701,7 @@ impl Paxos {
     /// *promotes*: a gateway we hold no link to is skipped and the next takes its place,
     /// sound because any gateway resolves any address of its zone.
     fn gateways(&self, zone: u32, addr: GlobalAddr) -> Vec<Route<'_>> {
-        let cfg = self.alloc.config();
+        let cfg = server::config();
         let mut out = Vec::new();
         for g in cfg.gateways_for(zone, addr.0) {
             let Some(link) = self.link_of(addr.universe(), g) else {
@@ -917,7 +916,7 @@ impl Paxos {
     /// Delete an Immutable page: an ordinary guarded accept whose value is a tombstone.
     /// Idempotent, because the tombstone is a state and not an event.
     pub async fn trim(&'static self, addr: GlobalAddr) -> Result<(), Status> {
-        let epoch = self.alloc.config().tombstone_epoch_of(addr.0);
+        let epoch = server::config().tombstone_epoch_of(addr.0);
         // A live page sits at `3e + 1`; that is what a trim guards on.
         let guard = 3 * epoch + 1;
         // Homed elsewhere: the gateway resolves the group.
@@ -1175,7 +1174,7 @@ impl Paxos {
                         None => fabric::Guard::Derived,
                     },
                     ballot: b.raw(),
-                    epoch: self.alloc.config().epoch_of(addr.0),
+                    epoch: server::config().epoch_of(addr.0),
                 };
                 req.encode(&mut t[fabric::BLOCK..])
                     .map_err(Status::from_wire)?;
@@ -1202,7 +1201,7 @@ impl Paxos {
         let req = fabric::TrimReq {
             guard,
             ballot: b.raw(),
-            epoch: self.alloc.config().epoch_of(addr.0),
+            epoch: server::config().epoch_of(addr.0),
         };
         req.encode(&mut t).map_err(Status::from_wire)?;
         r.send(Cmd::Trim { page, via: r.via() }, t.buf()).await
@@ -1470,7 +1469,7 @@ impl Paxos {
     /// Width one: the warm placed one copy per cohort at the rendezvous winner of each
     /// column, where `holds` and `replica` look at width one.
     async fn warmed_leg(&'static self, addr: GlobalAddr, sink: Sink<'_>) -> Option<Register> {
-        if !self.alloc.config().warmed_here(addr.0) {
+        if !server::config().warmed_here(addr.0) {
             return None;
         }
         match sink {
@@ -2251,7 +2250,7 @@ impl Paxos {
     /// The term is the universe's topology epoch: agreed by every node in the zone and
     /// monotone, which is all the seal table asks.
     pub async fn seal_extent(&'static self, addr: GlobalAddr, extent: u32) -> Result<(), Status> {
-        let cfg = self.alloc.config();
+        let cfg = server::config();
         // Fan out over this address's universe: a node in another universe holds no
         // register of this extent and no seal table row for it.
         let u = cfg.universe(addr.universe()).ok_or(Status::Unmapped)?;
@@ -2345,7 +2344,7 @@ impl Paxos {
     /// tables are empty on the common path, so this is two predictable branches. The rule
     /// itself is [`Gate::decide`].
     async fn gate(&'static self, addr: GlobalAddr, group: GroupId) -> Result<Gate, Status> {
-        let cfg = self.alloc.config();
+        let cfg = server::config();
         let core = self.core_of(group);
         let id = self.shard_of(addr);
         let (sealed, replaying) = runtime::on_core(core, move || async move {
@@ -2362,7 +2361,7 @@ impl Paxos {
 
     /// The extent `addr` falls in, as the seal table names it.
     fn shard_of(&self, addr: GlobalAddr) -> Option<u32> {
-        self.alloc.config().extent_id_of(addr.0)
+        server::config().extent_id_of(addr.0)
     }
 
     /// [`Self::gate`] for the acceptor half of a round; see [`Gate::accepts`].
@@ -2800,7 +2799,7 @@ impl Paxos {
     /// demand actually asked for.
     fn fan_warm(&'static self, addr: GlobalAddr, version: u64) {
         let zones: Vec<u32> = {
-            let cfg = self.alloc.config();
+            let cfg = server::config();
             let z = cfg.warm_zones_of(addr.0);
             if z.is_empty() {
                 return;
@@ -2862,7 +2861,7 @@ impl Paxos {
     /// zone, or that vetoes caching here, is dropped whatever arrived.
     pub async fn warm(&'static self, addr: GlobalAddr, version: u64, stage: fabric::Stage) {
         let (wanted, me, universe) = {
-            let cfg = self.alloc.config();
+            let cfg = server::config();
             (
                 cfg.warmed_here(addr.0) && cfg.cache_admit_of(addr.0) != 0,
                 cfg.node.id,
@@ -2883,7 +2882,7 @@ impl Paxos {
         // reader of that cohort will look for it.
         let mut winners = [0u32; 3];
         {
-            let cfg = self.alloc.config();
+            let cfg = server::config();
             let Some(u) = cfg.universe(universe) else {
                 self.stat(|s| s.warms_dropped += 1);
                 return;

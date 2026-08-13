@@ -40,6 +40,10 @@ pub(crate) fn fabric_key(universe: u32) -> u64 {
 
 /// One published configuration: the allocator plus the devices it is exported through.
 pub struct Dataplane {
+    /// What every core reads. Reached from a worker through [`config`], and from anything
+    /// already holding the plane through [`Dataplane::config`]; either way a reload cannot
+    /// retire it while a borrow is out, because the borrow is a guard on this very value.
+    config: Config,
     paxos: &'static Paxos,
     cache: &'static Cache,
     heal: &'static Heal,
@@ -49,6 +53,17 @@ pub struct Dataplane {
     devices: Vec<(u32, Export)>,
 }
 
+/// The configuration this worker is running under, pinned until the guard is dropped.
+///
+/// For the subsystems, which are leaked and reached through `&'static` and so are never
+/// handed the plane. A hop closure runs on the destination core long after the caller's
+/// borrow was taken, so it re-reads here rather than carrying one across; it sees whatever
+/// generation that core has cut over to, which is what a second read here would give
+/// anyway. Panics off a worker: the control thread holds the `Config` it is installing.
+pub(crate) fn config() -> Cfg<Config> {
+    runtime::config::<Server>().map(|d| &d.config)
+}
+
 impl Drop for Dataplane {
     fn drop(&mut self) {
         self.paxos.retire_links();
@@ -56,8 +71,13 @@ impl Drop for Dataplane {
 }
 
 impl Dataplane {
-    fn alloc(&self) -> &'static Allocator {
+    pub(crate) fn alloc(&self) -> &'static Allocator {
         self.paxos.alloc()
+    }
+
+    /// What this configuration says. Borrowed from the plane, so it cannot outlive it.
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Device id and the block device it is exported as, in config order.
@@ -145,16 +165,13 @@ impl Node {
 
         // Point of no return: nothing past here can fail on a reload.
         let paxos = match self.paxos.get() {
-            Some(&p) => {
-                p.alloc().install(cfg);
-                p
-            }
+            Some(&p) => p,
             None => {
-                let alloc = alloc::open(&store, disk, cfg, cores)?;
+                let alloc = alloc::open(&store, disk, &cfg, cores)?;
                 // One metric row per worker; the worker count is settled here.
                 metrics::init(cores);
                 // Leaked like the allocator: a hop closure must be `'static`.
-                let cache = cache::open(alloc, cores);
+                let cache = cache::open(alloc, &cfg, cores);
                 // The allocator loans free 4 MiB slots back through this from inside a
                 // reservation. Installed before any worker runs.
                 alloc.attach(cache);
@@ -166,9 +183,10 @@ impl Node {
         };
         paxos.install_links(links);
         // The cohort roster derives from each universe's catalog: re-derive on a swap.
-        paxos.cache().install(paxos.alloc().config());
+        paxos.cache().install(&cfg);
         let heal = *self.heal.get().expect("set beside paxos");
         Ok(Dataplane {
+            config: cfg,
             paxos,
             cache: paxos.cache(),
             heal,
@@ -176,6 +194,30 @@ impl Node {
             devices,
         })
     }
+}
+
+/// A plane with no devices, fabric or links: everything a test needs to drive one
+/// subsystem under a real configuration, and nothing that needs a kernel device or a peer.
+///
+/// The cache is built but deliberately not attached to the allocator, so no slot is lent
+/// away behind a test that is counting them.
+#[cfg(test)]
+pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Dataplane> {
+    let store = cfg.node.store.clone();
+    let disk = c.disk(&store, None, None)?;
+    let cores = c.cores();
+    let alloc = alloc::open(&store, disk, &cfg, cores)?;
+    metrics::init(cores);
+    let cache = cache::open(alloc, &cfg, cores);
+    let paxos = paxos::open(alloc, cache, cores);
+    Ok(Dataplane {
+        config: cfg,
+        paxos,
+        cache,
+        heal: heal::open(paxos, cores),
+        universes: Vec::new(),
+        devices: Vec::new(),
+    })
 }
 
 /// The state one worker owns outright: shards, cache slots and consensus rows that no
@@ -290,7 +332,7 @@ fn sample(d: &Dataplane) {
         Pressure::Normal => {}
     }
     if core == 0 {
-        let cfg = a.config();
+        let cfg = d.config();
         s.alloc_quarantined = a.quarantined as u64;
         // A reload can add an extent the store has no slots for; growing needs a restart,
         // so report the shortfall instead of a silent ENOSPC when the free lists run down.
@@ -317,7 +359,7 @@ fn sample(d: &Dataplane) {
     // Per extent, outside `Sample` because rows exist only for extents the config names.
     // Every named extent gets a row even when this core holds nothing: the control plane
     // gates an epoch advance on a zero, and a missing series is not a zero.
-    let cfg = a.config();
+    let cfg = d.config();
     let census = a.census();
     let rows: Vec<(u32, u32, u64, u64)> = cfg
         .extents()
@@ -340,7 +382,7 @@ fn sample(d: &Dataplane) {
 async fn serve(d: &Dataplane, req: Request) -> Result<(), Status> {
     let a = d.alloc();
     let px = d.paxos;
-    let cfg = a.config();
+    let cfg = d.config();
     let dev = cfg.device(req.dev as u32).ok_or(Status::Unmapped)?;
     let mut check = Segments::new(dev, &req);
     while let Some(s) = check.next() {
@@ -590,7 +632,7 @@ async fn dispatch(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errn
 /// extent's, which would otherwise read a 4 MiB page as a 4 KiB one.
 fn addr_of(d: &Dataplane, universe: u32, page: PageRef) -> Result<GlobalAddr, Errno> {
     let addr = config::addr_of(universe, page.lba());
-    let e = d.alloc().config().extent_at(addr).ok_or(status::BAD)?;
+    let e = d.config().extent_at(addr).ok_or(status::BAD)?;
     if Class::of(e.huge) != page.class() {
         return Err(status::BAD);
     }
@@ -603,7 +645,7 @@ fn addr_of(d: &Dataplane, universe: u32, page: PageRef) -> Result<GlobalAddr, Er
 /// from the namespace, so a group id cannot be forged across the boundary. An index past
 /// the catalog is a bad frame.
 fn group_of(d: &Dataplane, universe: u32, group: GroupIx) -> Result<config::GroupId, Errno> {
-    let u = d.alloc().config().universe(universe).ok_or(status::BAD)?;
+    let u = d.config().universe(universe).ok_or(status::BAD)?;
     if group.get() as usize >= u.catalog.len() {
         return Err(status::BAD);
     }
@@ -894,7 +936,6 @@ async fn seal(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errno> {
     // An extent id is unique across universes, so it names the shard alone; this check
     // stops a peer sealing a shard outside its own partition.
     let ours = d
-        .alloc()
         .config()
         .extent_by_id(s.extent)
         .is_some_and(|(u, _)| u.id == universe);
@@ -991,7 +1032,7 @@ async fn term(d: &Dataplane, universe: u32, group: GroupIx, req: Request) -> Res
 /// `PING`: liveness plus the geometry that dates an answer. The epoch is the arriving
 /// universe's; a caller has no business learning another's.
 async fn ping(d: &Dataplane, universe: u32, req: Request) -> Result<(), Errno> {
-    let c = d.alloc().config();
+    let c = d.config();
     let p = fabric::PingReply {
         node: c.node.id,
         generation: c.generation,

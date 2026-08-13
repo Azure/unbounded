@@ -190,6 +190,21 @@ impl<C> Cfg<C> {
             _nosend: PhantomData,
         }
     }
+
+    /// Narrow the guard to one part of what it pins.
+    ///
+    /// The count keeps the whole configuration alive, so a borrow of any part of it is
+    /// held up by exactly the same count; narrowing moves the count rather than taking a
+    /// second one. The higher-ranked bound is what makes that sound: `f` has no lifetime
+    /// of its own to return, so the only thing it can hand back is something it reached
+    /// through the configuration it was given.
+    pub fn map<T>(self, f: impl for<'a> FnOnce(&'a C) -> &'a T) -> Cfg<T> {
+        let ptr: *const T = f(&self);
+        let ver = self.ver;
+        // The count transfers: no decrement here, and none was taken above.
+        std::mem::forget(self);
+        Cfg::new(ptr, ver)
+    }
 }
 
 impl<C> Clone for Cfg<C> {
@@ -283,6 +298,17 @@ pub(crate) fn core_id() -> CoreId {
 #[allow(dead_code)]
 pub(crate) fn cores() -> usize {
     worker::cores()
+}
+
+/// The configuration this worker is running under, pinned until the guard is dropped.
+///
+/// [`Handler::handle`] and [`Handler::tick`] are handed one. This is for the code they
+/// call that is not: a hop closure runs on the destination core, so it re-reads the live
+/// configuration there rather than carrying the caller's borrow across a core boundary.
+/// It sees whatever generation that core has cut over to, which is the same guarantee a
+/// second read on the calling core would give.
+pub(crate) fn config<H: Handler>() -> Cfg<H::Config> {
+    worker::config::<H::Config>()
 }
 
 /// One core's half of the dataplane, for the length of one transaction.
