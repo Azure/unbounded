@@ -1043,10 +1043,10 @@ impl Paxos {
         let term = self.term_for(group, addr).await?;
         let b = Ballot::new(term, k);
         let need = self.quorum(addr.universe());
-        self.claim(addr, group).await?;
+        let claim = self.claim(addr, group).await?;
         let mut peers = self.peers(addr.universe(), &m, Some(k));
         let r = self.round(addr, &mut peers, need, guard, b, page).await;
-        self.release(addr, group).await;
+        claim.release().await;
         match r {
             Ok(()) => {
                 self.stat(|s| {
@@ -1328,28 +1328,74 @@ impl Paxos {
         }
     }
 
+    /// Take the address for one proposal, for as long as the returned claim is held.
+    ///
     /// The guard forbids pipelining two writes to one page, so the proposer serialises
     /// same-key proposals rather than letting them race and both lose. It is also the
     /// one-value-per-ballot rule: a second attempt at one version would reuse a ballot, which
     /// repair could then use to resurrect a value that was never chosen.
-    async fn claim(&'static self, addr: GlobalAddr, group: GroupId) -> Result<(), Status> {
+    async fn claim(&'static self, addr: GlobalAddr, group: GroupId) -> Result<Claim, Status> {
         let core = self.core_of(group);
-        runtime::on_core(core, move || async move {
-            if self.state[core].borrow_mut().inflight.insert(addr.0) {
-                Ok(())
-            } else {
-                Err(Status::Conflict { current: 0 })
-            }
+        let taken = runtime::on_core(core, move || async move {
+            self.state[core].borrow_mut().inflight.insert(addr.0)
         })
-        .await
+        .await;
+        // Built here rather than on the owner, so it is never a value in flight: a reply
+        // that nobody is waiting for is dropped inside the rendezvous, which is no place
+        // for a destructor that wants to hop.
+        if taken {
+            Ok(Claim {
+                paxos: self,
+                addr,
+                core,
+            })
+        } else {
+            Err(Status::Conflict { current: 0 })
+        }
     }
 
-    async fn release(&'static self, addr: GlobalAddr, group: GroupId) {
-        let core = self.core_of(group);
+    /// Give an address back. Not called directly: [`Claim`] is the only holder.
+    async fn unclaim(&'static self, addr: GlobalAddr, core: usize) {
         runtime::on_core(core, move || async move {
             self.state[core].borrow_mut().inflight.remove(&addr.0);
         })
         .await;
+    }
+}
+
+/// One proposer's hold on one address, from [`Paxos::claim`] until it is dropped.
+///
+/// A round is a long await: peers to reach, a page to make durable, a term to settle. The
+/// claim used to be two calls with all of that in between, so every way out that was not
+/// the last line stranded the address until the process restarted. Holding it is the same
+/// obligation, but a destructor discharges it, and a destructor runs on every path.
+///
+/// It cannot await, so the hand-back is a task of its own on the core that let go. What is
+/// left is the width of the claiming hop itself: a caller that disappears while the owner
+/// is still being asked leaves an address claimed by nobody. That was the shape of the
+/// whole round before, and is now the shape of one message.
+#[must_use = "an unheld claim is released at once, leaving the address open to a racing write"]
+struct Claim {
+    paxos: &'static Paxos,
+    addr: GlobalAddr,
+    core: usize,
+}
+
+impl Claim {
+    /// Give the address back and wait for the owner to hear, which is what a proposer
+    /// wants before it answers: the next write to this page is usually the same client.
+    async fn release(self) {
+        let me = std::mem::ManuallyDrop::new(self);
+        me.paxos.unclaim(me.addr, me.core).await;
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let (paxos, addr, core) = (self.paxos, self.addr, self.core);
+        // Detached because a destructor cannot await. If the slab has no room the address
+        // stays claimed, which is what dropping a claim did every time before this.
+        let _ = runtime::spawn(async move { paxos.unclaim(addr, core).await });
     }
 }
 
