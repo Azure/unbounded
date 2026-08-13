@@ -3001,6 +3001,13 @@ impl Paxos {
     /// Returns the register the round settled on, the only authoritative answer anyone has
     /// about a key whose nearest copy came back `MISSING`.
     pub async fn repair(&'static self, addr: GlobalAddr) -> Result<Register, Status> {
+        // An extent still homed elsewhere is not ours to run a round on: every
+        // page-addressed op but `LEARN` is relayed to the zone handing it over rather than
+        // served here, so a round between the destination's own members cannot even be
+        // asked. Replication there is a hand-off, not a decision.
+        if self.inbound(addr).is_some() {
+            return self.replicate(addr).await;
+        }
         // A free choice nobody can serve is no answer: the copy holding it may have lost
         // its bytes. Nothing was chosen in that case, so stepping down to the next register
         // on offer is legal, and the only choice that converges.
@@ -3025,6 +3032,38 @@ impl Paxos {
             below = Some(next);
         }
         last
+    }
+
+    /// Hand one register of an extent this zone is taking over to the rest of its group.
+    ///
+    /// The source seals the extent before it pushes, so no new value can appear behind us
+    /// and the bulk stream is apply-if-newer: the copies converge on the newest register
+    /// whatever order they arrive in, and no round is needed to decide between them.
+    ///
+    /// It is needed at all because the source pushes each register through one gateway,
+    /// which is one member of one destination group. Without this the destination holds a
+    /// single copy of everything it has been handed, its live page count never reaches the
+    /// source's, and the migration never completes. The peer pulls the bytes from the
+    /// source zone exactly as it would for a push that arrived there directly.
+    ///
+    /// A member holding nothing for the address hands on nothing; the member that does
+    /// reaches it from its own sweep of the same group.
+    async fn replicate(&'static self, addr: GlobalAddr) -> Result<Register, Status> {
+        let m = self.members(self.group(addr)).ok_or(Status::Unmapped)?;
+        let me = self.self_index(&m).ok_or(Status::Unmapped)?;
+        let held = match self.alloc.register(addr).await {
+            Ok(h) => h,
+            Err(Status::Missing) => return Ok(Register::default()),
+            Err(e) => return Err(e),
+        };
+        for k in (0..3u8).filter(|&k| k != me) {
+            let Some(route) = self.route(addr.universe(), &m, k) else {
+                continue;
+            };
+            // One register's failure is one register's retry on the next sweep.
+            let _ = self.send_learn(route, addr, held, me, false).await;
+        }
+        Ok(held)
     }
 
     /// Copy `best` to a quorum. Split out so a free choice nobody can serve can be retried
