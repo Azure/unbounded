@@ -15,6 +15,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
@@ -25,15 +26,22 @@ import (
 
 // healthState tracks the health of the controller for health and status endpoints.
 type healthState struct {
-	clientset           kubernetes.Interface
-	nodeAgentHealthPort int
-	healthPort          int
-	azureTenantID       string
-	leaderElectionNS    string
-	leaderElectionName  string
-	isLeader            atomic.Bool
-	podIP               string // from POD_IP env var, for EndpointSlice management
-	nodeName            string // from NODE_NAME env var (downward API)
+	clientset             kubernetes.Interface
+	nodeAgentHealthPort   int
+	healthPort            int
+	azureTenantID         string
+	leaderElectionNS      string
+	leaderElectionName    string
+	isLeader              atomic.Bool
+	controllerReady       atomic.Bool
+	endpointPublished     atomic.Bool
+	podIP                 string // from POD_IP env var, for EndpointSlice management
+	podName               string
+	podUID                types.UID
+	nodeName              string // from NODE_NAME env var (downward API)
+	endpointRetryPeriod   time.Duration
+	endpointRefreshPeriod time.Duration
+	endpointMu            sync.Mutex
 
 	// Informer-based listers for efficient lookups (set after leader election).
 	nodeLister          corev1listers.NodeLister
@@ -149,6 +157,11 @@ func (h *healthState) setInformers(nodeLister corev1listers.NodeLister, podListe
 
 func (h *healthState) setLeader(leader bool) {
 	wasLeader := h.isLeader.Swap(leader)
+	if !leader || !wasLeader {
+		h.controllerReady.Store(false)
+		h.endpointPublished.Store(false)
+	}
+
 	if leader {
 		leaderIsLeader.Set(1)
 		klog.Info("Health: marked as leader")
@@ -162,22 +175,66 @@ func (h *healthState) setLeader(leader bool) {
 	}
 }
 
+func (h *healthState) setControllerReady(ctx context.Context) {
+	if ctx.Err() != nil || !h.isLeader.Load() {
+		return
+	}
+
+	if !h.controllerReady.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Recheck after publishing readiness so leadership loss cannot leave a
+	// stale ready state behind.
+	if ctx.Err() != nil || !h.isLeader.Load() {
+		h.controllerReady.Store(false)
+
+		return
+	}
+
+	klog.Info("Health: site controller is functionally ready")
+
+	go h.publishServiceEndpoints(ctx)
+}
+
 // isHealthy returns true if we can connect to the Kubernetes API server.
 func (h *healthState) isHealthy(_ context.Context) bool {
 	_, err := h.clientset.Discovery().ServerVersion()
 	return err == nil
 }
 
-// isReady returns true if auth and Kubernetes API checks pass.
-func (h *healthState) isReady(_ context.Context) bool {
-	ready, _ := h.tokenAuthStatus()
+func (h *healthState) readinessStatus(_ context.Context) (bool, string) {
+	ready, reason := h.tokenAuthStatus()
 	if !ready {
-		return false
+		return false, fmt.Sprintf("token verifier not ready: %s", reason)
+	}
+
+	if !h.isLeader.Load() {
+		return false, "not the leader"
+	}
+
+	if !h.controllerReady.Load() {
+		return false, "site controller not ready"
+	}
+
+	if !h.endpointPublished.Load() {
+		return false, "service endpoint not published"
 	}
 
 	_, err := h.clientset.Discovery().ServerVersion()
+	if err != nil {
+		return false, "cannot connect to kubernetes api"
+	}
 
-	return err == nil
+	return true, "ok"
+}
+
+// isReady returns true if this instance is the functionally ready leader and
+// auth and Kubernetes API checks pass.
+func (h *healthState) isReady(ctx context.Context) bool {
+	ready, _ := h.readinessStatus(ctx)
+
+	return ready
 }
 
 // getLeaderInfo returns information about the current leader pod.
@@ -210,6 +267,12 @@ func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
 	portName := "https"
 	addressType := discoveryv1.AddressTypeIPv4
 	ready := true
+	targetRef := corev1.ObjectReference{
+		Kind:      "Pod",
+		Namespace: h.leaderElectionNS,
+		Name:      h.podName,
+		UID:       h.podUID,
+	}
 	endpoints := &corev1.Endpoints{ //nolint:staticcheck // required for APIService availability on Kubernetes 1.33 and earlier
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "unbounded-net-controller",
@@ -219,7 +282,7 @@ func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
 			},
 		},
 		Subsets: []corev1.EndpointSubset{{ //nolint:staticcheck // required for Kubernetes 1.33 compatibility
-			Addresses: []corev1.EndpointAddress{{IP: h.podIP}},
+			Addresses: []corev1.EndpointAddress{{IP: h.podIP, TargetRef: &targetRef}},
 			Ports: []corev1.EndpointPort{{
 				Name:     portName,
 				Port:     port,
@@ -254,6 +317,7 @@ func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
 		Endpoints: []discoveryv1.Endpoint{{
 			Addresses:  []string{h.podIP},
 			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+			TargetRef:  &targetRef,
 		}},
 		Ports: []discoveryv1.EndpointPort{{
 			Name:     &portName,
@@ -273,8 +337,67 @@ func (h *healthState) updateServiceEndpoints(ctx context.Context) error {
 	return err
 }
 
+func (h *healthState) publishServiceEndpoints(ctx context.Context) {
+	if h.podIP == "" {
+		klog.Warning("POD_IP not set, skipping service endpoints update")
+
+		return
+	}
+
+	retryPeriod := h.endpointRetryPeriod
+	if retryPeriod <= 0 {
+		retryPeriod = time.Second
+	}
+
+	refreshPeriod := h.endpointRefreshPeriod
+	if refreshPeriod <= 0 {
+		refreshPeriod = 30 * time.Second
+	}
+
+	for h.isLeader.Load() && h.controllerReady.Load() {
+		h.endpointMu.Lock()
+		if !h.isLeader.Load() || !h.controllerReady.Load() {
+			h.endpointMu.Unlock()
+
+			return
+		}
+
+		err := h.updateServiceEndpoints(ctx)
+		h.endpointMu.Unlock()
+
+		if err == nil {
+			if ctx.Err() != nil || !h.isLeader.Load() || !h.controllerReady.Load() {
+				return
+			}
+
+			h.endpointPublished.Store(true)
+			klog.V(3).Infof("Updated service endpoints to leader IP %s", h.podIP)
+		} else {
+			h.endpointPublished.Store(false)
+			klog.Errorf("Failed to update service endpoints, retrying: %v", err)
+		}
+
+		next := retryPeriod
+		if err == nil {
+			next = refreshPeriod
+		}
+
+		timer := time.NewTimer(next)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 // clearServiceEndpoints removes the Endpoints and EndpointSlice when losing leadership.
 func (h *healthState) clearServiceEndpoints(ctx context.Context) {
+	h.endpointMu.Lock()
+	defer h.endpointMu.Unlock()
+
 	endpoints, err := h.clientset.CoreV1().Endpoints(h.leaderElectionNS).Get(ctx, "unbounded-net-controller", metav1.GetOptions{}) //nolint:staticcheck // required for Kubernetes 1.33 compatibility
 	if err == nil {
 		targetsThisPod := false

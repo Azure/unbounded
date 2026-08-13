@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -71,6 +72,14 @@ func servingBackend() backendState {
 // published CA, a Deployment whose current spec has rolled out, and an
 // endpoint behind the Service.
 func servingObjects() []client.Object {
+	deploymentUID := types.UID("controller-deployment-uid")
+	replicaSetUID := types.UID("controller-replicaset-uid")
+	podUID := types.UID("controller-pod-uid")
+	portName := "https"
+	port := int32(9999)
+	protocol := corev1.ProtocolTCP
+	ready := true
+
 	return []client.Object{
 		&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: servingCAName},
@@ -81,21 +90,62 @@ func servingObjects() []client.Object {
 				Namespace:  component.DefaultNamespace,
 				Name:       controllerName,
 				Generation: 3,
+				UID:        deploymentUID,
 			},
-			Spec: appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To(int32(1)),
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": controllerName}},
+			},
 			Status: appsv1.DeploymentStatus{
 				ObservedGeneration: 3,
+				Replicas:           1,
 				UpdatedReplicas:    1,
+				ReadyReplicas:      1,
 				AvailableReplicas:  1,
 			},
 		},
 		&discoveryv1.EndpointSlice{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: component.DefaultNamespace,
-				Name:      controllerName + "-abcde",
+				Name:      controllerName,
 				Labels:    map[string]string{discoveryv1.LabelServiceName: controllerName},
 			},
-			Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}}},
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses:  []string{"10.0.0.1"},
+				Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+				TargetRef: &corev1.ObjectReference{
+					Kind: "Pod", Namespace: component.DefaultNamespace, Name: "controller-pod", UID: podUID,
+				},
+			}},
+			Ports: []discoveryv1.EndpointPort{{Name: &portName, Port: &port, Protocol: &protocol}},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: component.DefaultNamespace,
+				Name:      "controller-pod",
+				UID:       podUID,
+				Labels:    map[string]string{"app": controllerName},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "controller-rs", UID: replicaSetUID, Controller: ptr.To(true),
+				}},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				PodIP: "10.0.0.1",
+				Conditions: []corev1.PodCondition{{
+					Type: corev1.PodReady, Status: corev1.ConditionTrue,
+				}},
+			},
+		},
+		&appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: component.DefaultNamespace,
+				Name:      "controller-rs",
+				UID:       replicaSetUID,
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1", Kind: "Deployment", Name: controllerName, UID: deploymentUID, Controller: ptr.To(true),
+				}},
+			},
 		},
 	}
 }
@@ -516,6 +566,58 @@ func TestReconcileRegistersAndStampsWhenTheBackendServes(t *testing.T) {
 	}
 }
 
+func TestReconcileChecksTheDeploymentAfterApplyingIt(t *testing.T) {
+	applied := map[string]*unstructured.Unstructured{}
+	scheme := newNetTestScheme(t)
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(servingObjects()...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(ctx context.Context, underlying client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+				object, ok := obj.(interface {
+					GetName() string
+					GetKind() string
+					UnstructuredContent() map[string]any
+				})
+				if !ok {
+					t.Fatalf("applied object has unexpected type %T", obj)
+				}
+
+				applied[object.GetKind()+"/"+object.GetName()] = &unstructured.Unstructured{
+					Object: object.UnstructuredContent(),
+				}
+
+				if object.GetKind() != "Deployment" || object.GetName() != controllerName {
+					return nil
+				}
+
+				var live appsv1.Deployment
+
+				key := client.ObjectKey{Namespace: component.DefaultNamespace, Name: controllerName}
+				if err := underlying.Get(ctx, key, &live); err != nil {
+					return err
+				}
+
+				// Simulate the apiserver accepting a new pod template. Status still
+				// describes the old revision until the Deployment controller observes it.
+				live.Generation++
+
+				return underlying.Update(ctx, &live)
+			},
+		}).
+		Build()
+	env := &component.Env{Client: cl, APIReader: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
+
+	res := Component{}.Reconcile(t.Context(), env, site())
+	if res.Ready || res.Reason != component.ReasonBackendNotReady {
+		t.Fatalf("Reconcile = %+v, want the just-applied Deployment generation to hold registrations back", res)
+	}
+
+	if got := appliedRegistrations(applied); len(got) != 0 {
+		t.Fatalf("registrations were applied using readiness from the outgoing revision: %v", got)
+	}
+}
+
 // TestReconcileStaysReadyWhenWithholdingChangesNothing pins the reporting rule.
 //
 // The controller is host-networked with maxSurge: 0, so it is briefly
@@ -538,6 +640,10 @@ func TestReconcileStaysReadyWhenWithholdingChangesNothing(t *testing.T) {
 	if got := appliedRegistrations(applied); len(got) != 0 {
 		t.Fatalf("rewrote registrations while the backend was down: %v", got)
 	}
+
+	if res.RequeueAfter != backendPollInterval {
+		t.Fatalf("RequeueAfter = %s, want %s so withheld changes converge after recovery", res.RequeueAfter, backendPollInterval)
+	}
 }
 
 // TestReconcileReportsARegistrationWithAnEmptyCABundle is the case the no-flap
@@ -555,6 +661,20 @@ func TestReconcileReportsARegistrationWithAnEmptyCABundle(t *testing.T) {
 
 	if res.Reason != component.ReasonBackendNotReady {
 		t.Fatalf("reason = %q, want %q", res.Reason, component.ReasonBackendNotReady)
+	}
+}
+
+func TestReconcileReportsRegistrationsWithAStaleCABundle(t *testing.T) {
+	oldCA := base64.StdEncoding.EncodeToString([]byte("old CA"))
+	existing := existingRegistrations(t, oldCA)
+
+	// The current CA is published, but the controller is still rolling out.
+	// Existing registrations trust a different CA and are not usable.
+	env, _ := gateEnv(t, append(existing, servingObjects()[0])...)
+
+	res := Component{}.Reconcile(t.Context(), env, site())
+	if res.Ready || res.Reason != component.ReasonBackendNotReady {
+		t.Fatalf("Reconcile = %+v, want stale registration CAs reported as pending", res)
 	}
 }
 
@@ -629,7 +749,7 @@ func TestRolloutComplete(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Generation: 2},
 				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
 				Status: appsv1.DeploymentStatus{
-					ObservedGeneration: 2, UpdatedReplicas: 1, AvailableReplicas: 1,
+					ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1, AvailableReplicas: 1,
 				},
 			},
 			wantDone: true,
@@ -650,7 +770,7 @@ func TestRolloutComplete(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Generation: 5},
 				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
 				Status: appsv1.DeploymentStatus{
-					ObservedGeneration: 4, UpdatedReplicas: 1, AvailableReplicas: 1,
+					ObservedGeneration: 4, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1, AvailableReplicas: 1,
 				},
 			},
 			wantReason: "has not been observed",
@@ -664,7 +784,7 @@ func TestRolloutComplete(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Generation: 2},
 				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
 				Status: appsv1.DeploymentStatus{
-					ObservedGeneration: 2, UpdatedReplicas: 0, AvailableReplicas: 1,
+					ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 0, ReadyReplicas: 1, AvailableReplicas: 1,
 				},
 			},
 			wantReason: "is rolling out",
@@ -675,7 +795,7 @@ func TestRolloutComplete(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Generation: 2},
 				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
 				Status: appsv1.DeploymentStatus{
-					ObservedGeneration: 2, UpdatedReplicas: 1, AvailableReplicas: 0,
+					ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 0, AvailableReplicas: 0,
 				},
 			},
 			wantReason: "is rolling out",
@@ -685,7 +805,7 @@ func TestRolloutComplete(t *testing.T) {
 			deployment: appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{Generation: 1},
 				Status: appsv1.DeploymentStatus{
-					ObservedGeneration: 1, UpdatedReplicas: 1, AvailableReplicas: 1,
+					ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1, AvailableReplicas: 1,
 				},
 			},
 			wantDone: true,
@@ -711,28 +831,40 @@ func TestRolloutComplete(t *testing.T) {
 // controller writes both objects, and an apiserver old enough to resolve an
 // APIService through Endpoints alone is why it still does.
 func TestServiceHasEndpointFallsBackToEndpoints(t *testing.T) {
+	objects := servingObjects()
+	deployment := objects[1].(*appsv1.Deployment)
+	pod := objects[3]
+	replicaSet := objects[4]
+	target := corev1.ObjectReference{
+		Kind: "Pod", Namespace: component.DefaultNamespace, Name: "controller-pod", UID: types.UID("controller-pod-uid"),
+	}
 	notReady := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: component.DefaultNamespace,
-			Name:      controllerName + "-stale",
+			Name:      controllerName,
 			Labels:    map[string]string{discoveryv1.LabelServiceName: controllerName},
 		},
 		Endpoints: []discoveryv1.Endpoint{{
 			Addresses:  []string{"10.0.0.9"},
 			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(false)},
+			TargetRef:  &target,
 		}},
+		Ports: []discoveryv1.EndpointPort{{Name: ptr.To("https"), Port: ptr.To(int32(9999)), Protocol: ptr.To(corev1.ProtocolTCP)}},
 	}
 
 	endpoints := &corev1.Endpoints{ //nolint:staticcheck // exercising the legacy path on purpose
 		ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: controllerName},
 		Subsets: []corev1.EndpointSubset{{ //nolint:staticcheck // exercising the legacy path on purpose
-			Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+			Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1", TargetRef: &target}},
+			Ports:     []corev1.EndpointPort{{Name: "https", Port: 9999, Protocol: corev1.ProtocolTCP}},
 		}},
 	}
 
-	env := testEnv(t, notReady, endpoints)
+	// Legacy Endpoints are used only when the authoritative EndpointSlice is
+	// absent.
+	env := testEnv(t, endpoints, pod, replicaSet)
 
-	serving, err := serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace)
+	serving, err := serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace, deployment)
 	if err != nil {
 		t.Fatalf("serviceHasEndpoint: %v", err)
 	}
@@ -741,16 +873,71 @@ func TestServiceHasEndpointFallsBackToEndpoints(t *testing.T) {
 		t.Fatal("a ready legacy Endpoints subset was not recognised as serving")
 	}
 
-	// A not-ready slice with no legacy Endpoints must not count.
-	bare := testEnv(t, notReady)
+	// An existing not-ready slice is authoritative even if a legacy object has
+	// a ready address.
+	bare := testEnv(t, notReady, endpoints, pod, replicaSet)
 
-	serving, err = serviceHasEndpoint(t.Context(), bare.LiveReader(), bare.Namespace)
+	serving, err = serviceHasEndpoint(t.Context(), bare.LiveReader(), bare.Namespace, deployment)
 	if err != nil {
 		t.Fatalf("serviceHasEndpoint: %v", err)
 	}
 
 	if serving {
-		t.Fatal("an endpoint whose Ready condition is false was counted as serving")
+		t.Fatal("legacy Endpoints overrode an authoritative not-ready EndpointSlice")
+	}
+}
+
+func TestServiceHasEndpointRejectsStaleOrMalformedTargets(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*discoveryv1.EndpointSlice, *corev1.Pod, *appsv1.ReplicaSet)
+	}{
+		{
+			name: "wrong target UID",
+			mutate: func(slice *discoveryv1.EndpointSlice, _ *corev1.Pod, _ *appsv1.ReplicaSet) {
+				slice.Endpoints[0].TargetRef.UID = types.UID("old-pod")
+			},
+		},
+		{
+			name: "wrong port",
+			mutate: func(slice *discoveryv1.EndpointSlice, _ *corev1.Pod, _ *appsv1.ReplicaSet) {
+				*slice.Ports[0].Port = 9443
+			},
+		},
+		{
+			name: "pod not ready",
+			mutate: func(_ *discoveryv1.EndpointSlice, pod *corev1.Pod, _ *appsv1.ReplicaSet) {
+				pod.Status.Conditions[0].Status = corev1.ConditionFalse
+			},
+		},
+		{
+			name: "pod owned by another deployment",
+			mutate: func(_ *discoveryv1.EndpointSlice, _ *corev1.Pod, replicaSet *appsv1.ReplicaSet) {
+				replicaSet.OwnerReferences[0].UID = types.UID("other-deployment")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			objects := servingObjects()
+			deployment := objects[1].(*appsv1.Deployment)
+			slice := objects[2].(*discoveryv1.EndpointSlice)
+			pod := objects[3].(*corev1.Pod)
+			replicaSet := objects[4].(*appsv1.ReplicaSet)
+			tc.mutate(slice, pod, replicaSet)
+
+			env := testEnv(t, slice, pod, replicaSet)
+
+			serving, err := serviceHasEndpoint(t.Context(), env.LiveReader(), env.Namespace, deployment)
+			if err != nil {
+				t.Fatalf("serviceHasEndpoint: %v", err)
+			}
+
+			if serving {
+				t.Fatal("stale or malformed endpoint was accepted as serving")
+			}
+		})
 	}
 }
 
@@ -856,6 +1043,26 @@ func TestHasCABundle(t *testing.T) {
 				t.Fatalf("hasCABundle = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestHasCABundleMatchesExpectedCA(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"kind": "APIService",
+		"spec": map[string]any{"caBundle": base64.StdEncoding.EncodeToString(testCA)},
+	}}
+
+	if !hasCABundle(obj, testCA) {
+		t.Fatal("current CA bundle was rejected")
+	}
+
+	if hasCABundle(obj, []byte("different CA")) {
+		t.Fatal("stale CA bundle was accepted")
+	}
+
+	obj.Object["spec"].(map[string]any)["caBundle"] = "not base64"
+	if hasCABundle(obj, testCA) {
+		t.Fatal("malformed CA bundle was accepted")
 	}
 }
 

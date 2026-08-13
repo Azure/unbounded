@@ -1761,6 +1761,63 @@ func TestSiteNodeSliceInformerEventsMarkSlicesDirty(t *testing.T) {
 	waitForSlicesDirty(t, ctx, sc)
 }
 
+func TestSiteControllerReadyAfterInitialSetup(t *testing.T) {
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:            "SiteList",
+			siteNodeSliceGVR:   "SiteNodeSliceList",
+			gatewayPoolGVRSite: "GatewayPoolList",
+		},
+	)
+	dynamicInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
+	client := kubefake.NewSimpleClientset()
+	nodeInformerFactory := informers.NewSharedInformerFactory(client, 0)
+
+	sc, err := NewSiteController(client, dynamicClient, dynamicInformerFactory, nodeInformerFactory)
+	if err != nil {
+		t.Fatalf("NewSiteController: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+
+	go func() { result <- sc.Run(ctx, 1) }()
+
+	select {
+	case <-sc.Ready():
+		t.Fatalf("site controller became ready before informer startup")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	dynamicInformerFactory.Start(ctx.Done())
+	nodeInformerFactory.Start(ctx.Done())
+
+	select {
+	case <-sc.Ready():
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatalf("site controller did not become ready")
+	}
+
+	state := sc.DebugState()
+	if !state.HasSynced || !state.AllocatorsReady {
+		cancel()
+		t.Fatalf("ready controller state = synced %v, allocatorsReady %v", state.HasSynced, state.AllocatorsReady)
+	}
+
+	cancel()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("site controller did not stop after cancellation")
+	}
+}
+
 func waitForSlicesDirty(t *testing.T, ctx context.Context, sc *SiteController) {
 	t.Helper()
 

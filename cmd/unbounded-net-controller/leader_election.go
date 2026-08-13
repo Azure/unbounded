@@ -16,7 +16,14 @@ import (
 	"github.com/Azure/unbounded/internal/net/config"
 )
 
-func runLeaderElection(ctx context.Context, cfg *config.Config, clientset kubernetes.Interface, health *healthState, runFunc func(ctx context.Context)) {
+type controllerRunFunc func(ctx context.Context, onReady func())
+
+func runAsLeader(ctx context.Context, health *healthState, runFunc controllerRunFunc) {
+	health.setLeader(true)
+	runFunc(ctx, func() { health.setControllerReady(ctx) })
+}
+
+func runLeaderElection(ctx context.Context, cfg *config.Config, clientset kubernetes.Interface, health *healthState, runFunc controllerRunFunc) {
 	// Get identity for leader election - prefer POD_NAME env var (required for hostNetwork),
 	// fall back to hostname for local development
 	identity := os.Getenv("POD_NAME")
@@ -55,19 +62,7 @@ func runLeaderElection(ctx context.Context, cfg *config.Config, clientset kubern
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				klog.Info("Became leader, starting controller")
-				health.setLeader(true)
-				// Update service endpoints to point to this pod
-				if health.podIP != "" {
-					if err := health.updateServiceEndpoints(ctx); err != nil {
-						klog.Errorf("Failed to update service endpoints: %v", err)
-					} else {
-						klog.V(3).Infof("Updated service endpoints to leader IP %s", health.podIP)
-					}
-				} else {
-					klog.Warning("POD_IP not set, skipping service endpoints update")
-				}
-
-				runFunc(ctx)
+				runAsLeader(ctx, health, runFunc)
 			},
 			OnStoppedLeading: func() {
 				klog.Info("Lost leadership, shutting down")

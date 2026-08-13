@@ -254,6 +254,9 @@ func TestRegisterProbeHandlers(t *testing.T) {
 		clientset: k8sfake.NewClientset(),
 		tokenAuth: &tokenAuthenticator{tokenReviewer: k8sfake.NewClientset()},
 	}
+	health.setLeader(true)
+	health.controllerReady.Store(true)
+	health.endpointPublished.Store(true)
 	registerProbeHandlers(mux, health)
 
 	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -270,6 +273,24 @@ func TestRegisterProbeHandlers(t *testing.T) {
 
 	if readyResp.Code != http.StatusOK {
 		t.Fatalf("expected /readyz to return 200, got %d body=%q", readyResp.Code, readyResp.Body.String())
+	}
+
+	health.setLeader(false)
+
+	readyResp = httptest.NewRecorder()
+	mux.ServeHTTP(readyResp, readyReq)
+
+	if readyResp.Code != http.StatusServiceUnavailable || !strings.Contains(readyResp.Body.String(), "not the leader") {
+		t.Fatalf("expected /readyz to report leadership failure, got %d body=%q", readyResp.Code, readyResp.Body.String())
+	}
+
+	health.setLeader(true)
+
+	readyResp = httptest.NewRecorder()
+	mux.ServeHTTP(readyResp, readyReq)
+
+	if readyResp.Code != http.StatusServiceUnavailable || !strings.Contains(readyResp.Body.String(), "site controller not ready") {
+		t.Fatalf("expected /readyz to report controller readiness failure, got %d body=%q", readyResp.Code, readyResp.Body.String())
 	}
 }
 

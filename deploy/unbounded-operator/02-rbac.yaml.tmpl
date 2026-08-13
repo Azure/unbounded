@@ -50,16 +50,15 @@ rules:
   # tell a running backend from a Deployment that merely exists.
   #
   # The verbs are exactly what the reads need and no more. These go through
-  # Env.LiveReader, which bypasses the manager cache: Endpoints is fetched by
-  # the Service's own name, so get suffices, while EndpointSlices carry
-  # generated names and have to be listed by their service-name label. Neither
-  # is watched, which is the point of reading them live.
+  # Env.LiveReader, which bypasses the manager cache. Both endpoint objects use
+  # the Service's own name, so get suffices. Neither is watched, which is the
+  # point of reading them live.
   - apiGroups: [""]
     resources: ["endpoints"]
     verbs: ["get"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
-    verbs: ["list"]
+    verbs: ["get"]
   - apiGroups: ["apps"]
     resources: ["deployments", "daemonsets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]

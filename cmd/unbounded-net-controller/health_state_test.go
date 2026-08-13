@@ -7,7 +7,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -95,6 +97,10 @@ func TestHealthStateHelpersAndLeaderInfo(t *testing.T) {
 		t.Fatalf("expected healthy with fake discovery server version")
 	}
 
+	h.setLeader(true)
+	h.controllerReady.Store(true)
+	h.endpointPublished.Store(true)
+
 	if !h.isReady(context.Background()) {
 		t.Fatalf("expected ready with fake discovery server version")
 	}
@@ -122,6 +128,9 @@ func TestHealthStateReadinessFailure(t *testing.T) {
 		clientset: client,
 		tokenAuth: &tokenAuthenticator{tokenReviewer: client},
 	}
+	h.setLeader(true)
+	h.controllerReady.Store(true)
+	h.endpointPublished.Store(true)
 
 	if h.isHealthy(context.Background()) {
 		t.Fatalf("expected isHealthy=false when discovery version lookup fails")
@@ -129,6 +138,157 @@ func TestHealthStateReadinessFailure(t *testing.T) {
 
 	if h.isReady(context.Background()) {
 		t.Fatalf("expected isReady=false when discovery version lookup fails")
+	}
+}
+
+func TestHealthStateReadinessRequiresLeaderAndController(t *testing.T) {
+	client := k8sfake.NewClientset()
+	h := &healthState{
+		clientset: client,
+		tokenAuth: &tokenAuthenticator{tokenReviewer: client},
+	}
+
+	if ready, reason := h.readinessStatus(context.Background()); ready || reason != "not the leader" {
+		t.Fatalf("expected not-leader readiness failure, got ready=%v reason=%q", ready, reason)
+	}
+
+	h.setLeader(true)
+
+	if ready, reason := h.readinessStatus(context.Background()); ready || reason != "site controller not ready" {
+		t.Fatalf("expected controller readiness failure, got ready=%v reason=%q", ready, reason)
+	}
+
+	h.controllerReady.Store(true)
+	h.endpointPublished.Store(true)
+
+	if ready, reason := h.readinessStatus(context.Background()); !ready || reason != "ok" {
+		t.Fatalf("expected ready leader, got ready=%v reason=%q", ready, reason)
+	}
+
+	h.setLeader(false)
+
+	if h.controllerReady.Load() {
+		t.Fatalf("expected leadership loss to clear controller readiness")
+	}
+}
+
+func TestRunAsLeaderPublishesEndpointsAfterReadyAndRetries(t *testing.T) {
+	client := k8sfake.NewClientset()
+
+	var createAttempts atomic.Int32
+
+	client.PrependReactor("create", "endpoints", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if createAttempts.Add(1) == 1 {
+			return true, nil, fmt.Errorf("temporary failure")
+		}
+
+		return false, nil, nil
+	})
+
+	h := &healthState{
+		clientset:             client,
+		healthPort:            9090,
+		leaderElectionNS:      "kube-system",
+		podIP:                 "10.20.30.40",
+		endpointRetryPeriod:   5 * time.Millisecond,
+		endpointRefreshPeriod: 10 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ready := make(chan struct{})
+	started := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		runAsLeader(ctx, h, func(ctx context.Context, onReady func()) {
+			close(started)
+
+			select {
+			case <-ready:
+				onReady()
+			case <-ctx.Done():
+			}
+
+			<-ctx.Done()
+		})
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("runAsLeader did not start the controller")
+	}
+
+	if createAttempts.Load() != 0 {
+		t.Fatalf("expected no endpoint publication before controller readiness")
+	}
+
+	close(ready)
+
+	deadline := time.Now().Add(time.Second)
+	for createAttempts.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	if h.endpointPublished.Load() {
+		t.Fatal("endpoint publication failure made the controller ready")
+	}
+
+	deadline = time.Now().Add(time.Second)
+
+	for {
+		_, endpointsErr := client.CoreV1().Endpoints("kube-system").Get(ctx, "unbounded-net-controller", metav1.GetOptions{}) //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+
+		_, sliceErr := client.DiscoveryV1().EndpointSlices("kube-system").Get(ctx, "unbounded-net-controller", metav1.GetOptions{})
+		if endpointsErr == nil && sliceErr == nil {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("endpoints were not published after readiness: endpointsErr=%v sliceErr=%v attempts=%d", endpointsErr, sliceErr, createAttempts.Load())
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if createAttempts.Load() < 2 {
+		t.Fatalf("expected endpoint publication failure to retry, got %d attempts", createAttempts.Load())
+	}
+
+	if err := client.CoreV1().Endpoints("kube-system").Delete(ctx, "unbounded-net-controller", metav1.DeleteOptions{}); err != nil { //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+		t.Fatalf("delete endpoints: %v", err)
+	}
+
+	if err := client.DiscoveryV1().EndpointSlices("kube-system").Delete(ctx, "unbounded-net-controller", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete endpoint slice: %v", err)
+	}
+
+	deadline = time.Now().Add(time.Second)
+
+	for {
+		_, endpointsErr := client.CoreV1().Endpoints("kube-system").Get(ctx, "unbounded-net-controller", metav1.GetOptions{}) //nolint:staticcheck // required for Kubernetes 1.33 APIService compatibility
+
+		_, sliceErr := client.DiscoveryV1().EndpointSlices("kube-system").Get(ctx, "unbounded-net-controller", metav1.GetOptions{})
+		if endpointsErr == nil && sliceErr == nil {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("periodic publication did not repair deleted endpoints: endpointsErr=%v sliceErr=%v", endpointsErr, sliceErr)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("runAsLeader did not stop after cancellation")
 	}
 }
 
@@ -161,6 +321,10 @@ func TestUpdateAndClearServiceEndpoints(t *testing.T) {
 		t.Fatalf("unexpected legacy endpoint ports: %#v", endpoints.Subsets[0].Ports)
 	}
 
+	if ref := endpoints.Subsets[0].Addresses[0].TargetRef; ref == nil || ref.Kind != "Pod" {
+		t.Fatalf("legacy endpoint has no Pod target reference: %#v", ref)
+	}
+
 	if endpoints.Labels[discoveryv1.LabelSkipMirror] != "true" {
 		t.Fatalf("expected legacy endpoints to skip EndpointSlice mirroring, got labels %#v", endpoints.Labels)
 	}
@@ -176,6 +340,10 @@ func TestUpdateAndClearServiceEndpoints(t *testing.T) {
 
 	if len(slice.Ports) != 1 || slice.Ports[0].Port == nil || *slice.Ports[0].Port != 9090 {
 		t.Fatalf("unexpected endpoint ports: %#v", slice.Ports)
+	}
+
+	if ref := slice.Endpoints[0].TargetRef; ref == nil || ref.Kind != "Pod" {
+		t.Fatalf("endpoint slice has no Pod target reference: %#v", ref)
 	}
 
 	if slice.AddressType != discoveryv1.AddressTypeIPv4 {

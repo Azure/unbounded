@@ -55,6 +55,17 @@ func Reconciled() Result {
 	return Result{Ready: true, Reason: ReasonReconciled, Message: "component reconciled"}
 }
 
+// ReconciledAfter reports a successfully reconciled component and asks the
+// driver to check it again after the given duration.
+func ReconciledAfter(after time.Duration) Result {
+	return Result{
+		Ready:        true,
+		Reason:       ReasonReconciled,
+		Message:      "component reconciled",
+		RequeueAfter: after,
+	}
+}
+
 // Disabled reports a component that is intentionally not running.
 func Disabled(message string) Result {
 	return Result{Ready: true, Reason: ReasonDisabled, Message: message}

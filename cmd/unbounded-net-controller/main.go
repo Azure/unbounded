@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
@@ -447,6 +448,8 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		leaderElectionNS:              cfg.LeaderElection.ResourceNamespace,
 		leaderElectionName:            cfg.LeaderElection.ResourceName,
 		podIP:                         os.Getenv("POD_IP"),
+		podName:                       os.Getenv("POD_NAME"),
+		podUID:                        types.UID(os.Getenv("POD_UID")),
 		nodeName:                      os.Getenv("NODE_NAME"),
 		statusCache:                   NewNodeStatusCache(),
 		staleThreshold:                cfg.StatusStaleThreshold,
@@ -475,7 +478,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 
 	// runFunc creates and runs the controller - called only when becoming leader
 	// This ensures the allocator and informer are created fresh with current state
-	runFunc := func(ctx context.Context) {
+	runFunc := func(ctx context.Context, onReady func()) {
 		klog.Info("Creating informers and controllers")
 
 		// Create informer factory
@@ -584,6 +587,14 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 					klog.Errorf("Site controller error: %v", err)
 				}
 			}()
+
+			go func() {
+				select {
+				case <-siteCtrl.Ready():
+					onReady()
+				case <-ctx.Done():
+				}
+			}()
 		}
 
 		if cfg.ManagedKubeProxyEnabled {
@@ -656,8 +667,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		runLeaderElection(ctx, cfg, clientset, healthState, runFunc)
 	} else {
 		klog.Info("Leader election disabled")
-		healthState.setLeader(true)
-		runFunc(ctx)
+		runAsLeader(ctx, healthState, runFunc)
 	}
 
 	return nil

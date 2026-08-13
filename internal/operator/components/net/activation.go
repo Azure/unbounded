@@ -4,9 +4,11 @@
 package net
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"slices"
 	"time"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
@@ -14,7 +16,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -144,7 +148,7 @@ func readBackendState(ctx context.Context, env *component.Env) (backendState, er
 		return backendState{caBundle: ca, reason: reason}, nil
 	}
 
-	serving, err := serviceHasEndpoint(ctx, reader, env.Namespace)
+	serving, err := serviceHasEndpoint(ctx, reader, env.Namespace, &deployment)
 	if err != nil {
 		return backendState{}, err
 	}
@@ -182,9 +186,13 @@ func rolloutComplete(deployment *appsv1.Deployment) (string, bool) {
 	// pass wrote is serving". Registration carries the CA and the Service
 	// reference that go with the new spec, so the old pod's availability is
 	// not the question.
-	if deployment.Status.UpdatedReplicas < desired || deployment.Status.AvailableReplicas < 1 {
-		return fmt.Sprintf("the controller Deployment is rolling out (%d/%d updated, %d available)",
-			deployment.Status.UpdatedReplicas, desired, deployment.Status.AvailableReplicas), false
+	if deployment.Status.Replicas != desired ||
+		deployment.Status.UpdatedReplicas != desired ||
+		deployment.Status.ReadyReplicas != desired ||
+		deployment.Status.AvailableReplicas != desired {
+		return fmt.Sprintf("the controller Deployment is rolling out (%d/%d replicas, %d updated, %d ready, %d available)",
+			deployment.Status.Replicas, desired, deployment.Status.UpdatedReplicas,
+			deployment.Status.ReadyReplicas, deployment.Status.AvailableReplicas), false
 	}
 
 	return "", true
@@ -197,28 +205,40 @@ func rolloutComplete(deployment *appsv1.Deployment) (string, bool) {
 // Endpoints object is checked too: the controller writes both, and an
 // apiserver old enough to resolve an APIService through Endpoints alone is
 // exactly the case the controller keeps writing it for.
-func serviceHasEndpoint(ctx context.Context, reader client.Reader, namespace string) (bool, error) {
-	var slices discoveryv1.EndpointSliceList
 
-	err := reader.List(ctx, &slices,
-		client.InNamespace(namespace),
-		client.MatchingLabels{discoveryv1.LabelServiceName: controllerName})
-	if err != nil {
-		return false, fmt.Errorf("list endpoint slices for %s/%s: %w", namespace, controllerName, err)
-	}
+func serviceHasEndpoint(ctx context.Context, reader client.Reader, namespace string, deployment *appsv1.Deployment) (bool, error) {
+	key := client.ObjectKey{Namespace: namespace, Name: controllerName}
 
-	for i := range slices.Items {
-		for _, endpoint := range slices.Items[i].Endpoints {
+	var endpointSlice discoveryv1.EndpointSlice
+
+	switch err := reader.Get(ctx, key, &endpointSlice); {
+	case err == nil:
+		if endpointSlice.Labels[discoveryv1.LabelServiceName] != controllerName || !hasHTTPSPort(endpointSlice.Ports) {
+			return false, nil
+		}
+
+		for _, endpoint := range endpointSlice.Endpoints {
 			// A nil Ready condition means ready, per the EndpointSlice API.
-			if len(endpoint.Addresses) > 0 && (endpoint.Conditions.Ready == nil || *endpoint.Conditions.Ready) {
+			if len(endpoint.Addresses) == 0 || (endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready) {
+				continue
+			}
+
+			ready, err := endpointTargetsReadyPod(ctx, reader, namespace, deployment, endpoint.TargetRef, endpoint.Addresses)
+			if err != nil {
+				return false, err
+			}
+
+			if ready {
 				return true, nil
 			}
 		}
+
+		return false, nil
+	case !apierrors.IsNotFound(err):
+		return false, fmt.Errorf("get endpoint slice %s/%s: %w", namespace, controllerName, err)
 	}
 
 	var endpoints corev1.Endpoints //nolint:staticcheck // the controller still writes it for APIService availability on Kubernetes 1.33 and earlier
-
-	key := client.ObjectKey{Namespace: namespace, Name: controllerName}
 
 	switch err := reader.Get(ctx, key, &endpoints); {
 	case apierrors.IsNotFound(err):
@@ -228,8 +248,109 @@ func serviceHasEndpoint(ctx context.Context, reader client.Reader, namespace str
 	}
 
 	for _, subset := range endpoints.Subsets {
-		if len(subset.Addresses) > 0 {
-			return true, nil
+		if !hasLegacyHTTPSPort(subset.Ports) {
+			continue
+		}
+
+		for _, address := range subset.Addresses {
+			ready, err := endpointTargetsReadyPod(ctx, reader, namespace, deployment, address.TargetRef, []string{address.IP})
+			if err != nil {
+				return false, err
+			}
+
+			if ready {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+func hasHTTPSPort(ports []discoveryv1.EndpointPort) bool {
+	for _, port := range ports {
+		if port.Name != nil && *port.Name == "https" && port.Port != nil && *port.Port == 9999 &&
+			(port.Protocol == nil || *port.Protocol == corev1.ProtocolTCP) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasLegacyHTTPSPort(ports []corev1.EndpointPort) bool {
+	for _, port := range ports {
+		if port.Name == "https" && port.Port == 9999 && port.Protocol == corev1.ProtocolTCP {
+			return true
+		}
+	}
+
+	return false
+}
+
+func endpointTargetsReadyPod(
+	ctx context.Context,
+	reader client.Reader,
+	namespace string,
+	deployment *appsv1.Deployment,
+	target *corev1.ObjectReference,
+	addresses []string,
+) (bool, error) {
+	if target == nil || target.Kind != "Pod" || target.Name == "" || target.UID == "" ||
+		(target.Namespace != "" && target.Namespace != namespace) {
+		return false, nil
+	}
+
+	var pod corev1.Pod
+
+	key := client.ObjectKey{Namespace: namespace, Name: target.Name}
+
+	switch err := reader.Get(ctx, key, &pod); {
+	case apierrors.IsNotFound(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("get endpoint target pod %s/%s: %w", namespace, target.Name, err)
+	}
+
+	if pod.UID != target.UID || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning ||
+		!slices.Contains(addresses, pod.Status.PodIP) {
+		return false, nil
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+	if err != nil {
+		return false, fmt.Errorf("parse controller Deployment selector: %w", err)
+	}
+
+	if !selector.Matches(labels.Set(pod.Labels)) {
+		return false, nil
+	}
+
+	podOwner := metav1.GetControllerOf(&pod)
+	if podOwner == nil || podOwner.Kind != "ReplicaSet" || podOwner.Name == "" || podOwner.UID == "" {
+		return false, nil
+	}
+
+	var replicaSet appsv1.ReplicaSet
+
+	rsKey := client.ObjectKey{Namespace: namespace, Name: podOwner.Name}
+
+	switch err := reader.Get(ctx, rsKey, &replicaSet); {
+	case apierrors.IsNotFound(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("get endpoint target ReplicaSet %s/%s: %w", namespace, podOwner.Name, err)
+	}
+
+	deploymentOwner := metav1.GetControllerOf(&replicaSet)
+	if replicaSet.UID != podOwner.UID || deploymentOwner == nil || deploymentOwner.Kind != "Deployment" ||
+		deploymentOwner.Name != deployment.Name || deploymentOwner.UID != deployment.UID {
+		return false, nil
+	}
+
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue, nil
 		}
 	}
 
@@ -303,7 +424,7 @@ func stampCABundle(obj *unstructured.Unstructured, ca []byte) error {
 // A registration that exists with an empty caBundle counts as pending: that is
 // the broken state this gate exists to prevent, and it should be visible until
 // the backend comes back and the apply can fix it.
-func pendingRegistrations(ctx context.Context, env *component.Env) ([]string, error) {
+func pendingRegistrations(ctx context.Context, env *component.Env, expectedCA []byte) ([]string, error) {
 	var pending []string
 
 	for _, registration := range registrations {
@@ -322,7 +443,7 @@ func pendingRegistrations(ctx context.Context, env *component.Env) ([]string, er
 			return nil, fmt.Errorf("get %s %s: %w", registration.gvk.Kind, registration.name, err)
 		}
 
-		if !hasCABundle(live) {
+		if !hasCABundle(live, expectedCA) {
 			pending = append(pending, registration.name)
 		}
 	}
@@ -331,12 +452,27 @@ func pendingRegistrations(ctx context.Context, env *component.Env) ([]string, er
 }
 
 // hasCABundle reports whether every CA bundle a registration carries is
-// populated. A registration is only as usable as its emptiest bundle.
-func hasCABundle(obj *unstructured.Unstructured) bool {
+// populated and, when expectedCA is available, matches it. A registration is
+// only as usable as its emptiest or stale bundle.
+func hasCABundle(obj *unstructured.Unstructured, expectedCA ...[]byte) bool {
+	matches := func(encoded string) bool {
+		if encoded == "" {
+			return false
+		}
+
+		if len(expectedCA) == 0 || len(expectedCA[0]) == 0 {
+			return true
+		}
+
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+
+		return err == nil && bytes.Equal(decoded, expectedCA[0])
+	}
+
 	if obj.GetKind() == "APIService" {
 		bundle, _, err := unstructured.NestedString(obj.Object, "spec", "caBundle")
 
-		return err == nil && bundle != ""
+		return err == nil && matches(bundle)
 	}
 
 	webhooks, found, err := unstructured.NestedSlice(obj.Object, "webhooks")
@@ -356,7 +492,7 @@ func hasCABundle(obj *unstructured.Unstructured) bool {
 		}
 
 		bundle, _ := clientConfig["caBundle"].(string) //nolint:errcheck // an absent or non-string bundle is not a usable one
-		if bundle == "" {
+		if !matches(bundle) {
 			return false
 		}
 	}

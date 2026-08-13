@@ -67,24 +67,29 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	// The backend state is read once, before anything is applied, so the same
-	// answer decides both what this pass writes and what it reports.
+	// Apply the workloads before asking whether the current Deployment revision
+	// is serving. Reading first would let the outgoing revision open the gate for
+	// registrations applied immediately after changing the pod template.
+	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests,
+		applyMutator(env.Config, configHash, backendState{})); err != nil {
+		return component.Failed(err)
+	}
+
 	backend, err := readBackendState(ctx, env)
 	if err != nil {
 		return component.Failed(err)
 	}
 
-	// Which registrations are worth reporting has to be settled before the
-	// apply, because the apply is what changes them.
-	var pending []string
-
-	if !backend.ready {
-		if pending, err = pendingRegistrations(ctx, env); err != nil {
+	if backend.ready {
+		if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, registrationMutator(backend.caBundle)); err != nil {
 			return component.Failed(err)
 		}
+
+		return component.Reconciled()
 	}
 
-	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, applyMutator(env.Config, configHash, backend)); err != nil {
+	pending, err := pendingRegistrations(ctx, env, backend.caBundle)
+	if err != nil {
 		return component.Failed(err)
 	}
 
@@ -95,7 +100,10 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 			backendPollInterval)
 	}
 
-	return component.Reconciled()
+	// Existing registrations remain usable during the expected maxSurge: 0
+	// rollout gap, so do not flap NetReady. Still poll: Deployment status and
+	// endpoints are not watched, and the desired registrations were withheld.
+	return component.ReconciledAfter(backendPollInterval)
 }
 
 // SetupWatches reconciles net on changes to its config payload and on
@@ -196,6 +204,20 @@ func applyMutator(cfg component.Config, configHash string, backend backendState)
 		}
 
 		return nil
+	}
+}
+
+// registrationMutator applies only the registrations after the live backend
+// check has established that the just-applied controller revision is serving.
+func registrationMutator(ca []byte) func(*unstructured.Unstructured) error {
+	return func(obj *unstructured.Unstructured) error {
+		if !isBackendRegistration(obj) {
+			obj.Object = nil
+
+			return nil
+		}
+
+		return stampCABundle(obj, ca)
 	}
 }
 

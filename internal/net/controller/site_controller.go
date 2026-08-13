@@ -162,6 +162,8 @@ type SiteController struct {
 	// until this flag is true to prevent assigning CIDRs that are already in
 	// use by other nodes.
 	allocatorsReady atomic.Bool
+	ready           chan struct{}
+	readyOnce       sync.Once
 
 	// Tracks last duplicate podCIDR report to avoid repetitive log spam
 	duplicatePodCIDRReport     string
@@ -195,6 +197,7 @@ func NewSiteController(
 		workqueue:            workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{Name: "Sites"}),
 		assignmentAllocators: make(map[string]*assignmentAllocator),
 		loggedNoSiteNodes:    make(map[string]struct{}),
+		ready:                make(chan struct{}),
 	}
 
 	// Set up event handlers for nodes
@@ -308,6 +311,11 @@ func (sc *SiteController) GetNodeLister() corev1listers.NodeLister {
 // GetSiteInformer returns the site informer for use by other components.
 func (sc *SiteController) GetSiteInformer() cache.SharedIndexInformer {
 	return sc.siteInformer
+}
+
+// Ready is closed after informer sync, initial reconciliation, and allocator seeding.
+func (sc *SiteController) Ready() <-chan struct{} {
+	return sc.ready
 }
 
 // AssignmentAllocatorDebugState contains debug info for one assignment allocator.
@@ -813,6 +821,7 @@ func (sc *SiteController) Run(ctx context.Context, workers int) error {
 		}
 	}, 5*time.Second)
 
+	sc.readyOnce.Do(func() { close(sc.ready) })
 	klog.Info("Site controller started")
 	<-ctx.Done()
 	klog.Info("Shutting down site controller")
