@@ -505,9 +505,14 @@ func (s *Snapshotter) adopt(ctx context.Context, key, parent, target string, bas
 		labels = map[string]string{}
 	}
 
-	// The ref label is an instruction to this call, not a property of the
-	// resulting snapshot, and containerd's own snapshotters do not persist it.
-	delete(labels, LabelSnapshotRef)
+	// The ref label is kept. It looks like an instruction to this call rather
+	// than a property of the result, but containerd's metadata store is what
+	// turns ErrAlreadyExists into a usable answer: it walks the backend for a
+	// committed snapshot whose ref label equals the target and whose parent
+	// equals the one it asked for, and uses that snapshot's key. Dropping the
+	// label makes that walk find nothing, and every pull of an adopted layer
+	// fails with "target snapshot in backend: not found". containerd's own
+	// snapshotters keep it for the same reason.
 	labels[LabelBlob] = blob.DiffID.String()
 
 	// CommitActive replaces labels rather than inheriting them, so they have to

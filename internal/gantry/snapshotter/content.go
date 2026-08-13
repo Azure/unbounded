@@ -47,16 +47,28 @@ const (
 // ingestRequest builds an ingest request for a layer this node just unpacked,
 // or explains why it cannot:
 //
-//   - a snapshot committed under a name that is not a chain ID is a container
-//     layer, not an image layer;
+//   - a snapshot whose chain ID cannot be recovered is a container layer, not
+//     an image layer;
 //   - a missing diff ID means containerd did not unpack this snapshot from an
 //     image layer;
 //   - a missing compressed digest means containerd was configured with
 //     disable_snapshot_annotations, so there is no way to find the layer tar in
 //     the content store. The layer still works locally, it just never reaches
 //     the cluster, and neither does any other layer this node ever unpacks.
+//
+// The chain ID comes from the snapshot ref label rather than from the name
+// containerd commits under. A proxy snapshotter sits behind containerd's
+// metadata store, which rewrites every key it passes down into
+// "<namespace>/<sequence>/<key>", so the name here is never a bare digest. The
+// label is passed through untouched, which is also what makes Prepare's catalog
+// probe and this agree on what a layer is called.
 func ingestRequest(name string, labels map[string]string) (ingest.Request, ingestReason) {
-	chainID, err := catalog.ParseDigest(name)
+	ref := labels[LabelSnapshotRef]
+	if ref == "" {
+		ref = name
+	}
+
+	chainID, err := catalog.ParseDigest(ref)
 	if err != nil {
 		return ingest.Request{}, reasonSkip
 	}

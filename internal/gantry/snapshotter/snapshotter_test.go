@@ -376,8 +376,10 @@ func TestPrepareHitSkipsTheLayer(t *testing.T) {
 		t.Fatalf("blob label = %q, want %q", got, diffID.String())
 	}
 
-	if _, ok := info.Labels[LabelSnapshotRef]; ok {
-		t.Fatal("the ref label must not be persisted")
+	// containerd's metadata store finds an adopted snapshot by walking the
+	// backend for this label, so it has to survive the commit.
+	if got := info.Labels[LabelSnapshotRef]; got != chain.String() {
+		t.Fatalf("ref label = %q, want %q", got, chain.String())
 	}
 
 	if _, err := h.sn.Stat(h.ctx, "extract-0"); err == nil {
@@ -958,6 +960,41 @@ func TestCommitQueuesIngest(t *testing.T) {
 	}
 }
 
+func TestCommitQueuesIngestUnderARewrittenName(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	chain, diffID := digestOf(1), digestOf(2)
+	layer := layerDigestString(3)
+
+	// This is what a real containerd looks like from down here: the metadata
+	// store keeps its own names and hands the backend "<namespace>/<id>/<key>".
+	// Nothing about the layer can be recovered from that, only from the labels.
+	labels := map[string]string{
+		LabelSnapshotRef: chain.String(),
+		LabelDiffID:      diffID.String(),
+		LabelLayerDigest: layer,
+	}
+
+	if _, err := h.sn.Prepare(h.ctx, "k8s.io/41/extract-0", "", snapshots.WithLabels(labels)); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	if err := h.sn.Commit(h.ctx, "k8s.io/42/"+chain.String(), "k8s.io/41/extract-0"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	reqs := h.q.all()
+	if len(reqs) != 1 {
+		t.Fatalf("submitted %d requests, want 1", len(reqs))
+	}
+
+	if reqs[0].ChainID != chain || reqs[0].DiffID != diffID {
+		t.Fatalf("request = %+v", reqs[0])
+	}
+}
+
 func TestCommitSkipsIngestWithoutAnnotations(t *testing.T) {
 	t.Parallel()
 
@@ -1237,6 +1274,30 @@ func TestIngestRequest(t *testing.T) {
 			key:    "committed-container",
 			labels: map[string]string{LabelDiffID: diffID.String(), LabelLayerDigest: layer.String()},
 			want:   reasonSkip,
+		},
+		{
+			// containerd's metadata store rewrites every key it hands a proxy
+			// snapshotter into "<namespace>/<sequence>/<key>", so the name a
+			// real containerd commits under is never a bare digest. The ref
+			// label is passed through untouched and is what identifies the
+			// layer.
+			name: "name rewritten by the metadata store",
+			key:  "k8s.io/42/" + chain.String(),
+			labels: map[string]string{
+				LabelSnapshotRef: chain.String(),
+				LabelDiffID:      diffID.String(),
+				LabelLayerDigest: layer.String(),
+			},
+			want: reasonIngest,
+		},
+		{
+			name: "rewritten name for a container layer",
+			key:  "k8s.io/42/committed-container",
+			labels: map[string]string{
+				LabelDiffID:      diffID.String(),
+				LabelLayerDigest: layer.String(),
+			},
+			want: reasonSkip,
 		},
 		{
 			name:   "no diff id",
