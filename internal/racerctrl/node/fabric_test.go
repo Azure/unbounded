@@ -39,6 +39,10 @@ func (c *fakeConnector) Connect(req ConnectRequest) error {
 		return err
 	}
 
+	if err := os.WriteFile(filepath.Join(dir, "hostnqn"), []byte(req.HostNQN), 0o644); err != nil {
+		return err
+	}
+
 	return os.WriteFile(filepath.Join(dir, "subsysnqn"), []byte(req.NQN), 0o644)
 }
 
@@ -80,6 +84,11 @@ func newTestFabric(t *testing.T, cfg Config) (*Fabric, *fakeConnector) {
 
 	fabric := NewFabric(cfg, 7, connector)
 	fabric.sysClassNvme = sysClass
+
+	// There is no ublk device behind any of these exports. The target half is
+	// what these tests drive, so say the dataplane is serving; the tests that
+	// care about a missing device say otherwise for themselves.
+	fabric.devicePresent = func(string) bool { return true }
 
 	return fabric, connector
 }
@@ -130,6 +139,152 @@ func portLinks(t *testing.T, fabric *Fabric, nqn string) []string {
 	sort.Strings(out)
 
 	return out
+}
+
+// The deadlock this guards against: nvmet holds the block device open while a
+// namespace is enabled, and the ublk driver will not hand a minor back while
+// anything holds the device that used to be there. A namespace left enabled
+// over the export of a dataplane that died therefore stops that dataplane from
+// ever recreating it. The agent has to let go first.
+func TestReconcileDisablesANamespaceWhoseDeviceIsGone(t *testing.T) {
+	fabric, _ := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+	plan := FabricPlan{
+		Exports: []FabricExportRequest{{UniverseID: 1, DeviceID: 4, AllowedNodes: []uint32{7}}},
+	}
+
+	if _, err := fabric.Reconcile(plan); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	ns := filepath.Join(fabric.nvmetRoot, "subsystems",
+		fabric.SubsystemNQN(1, 7), "namespaces", fabricNamespaceID)
+
+	if got := readTestAttr(t, filepath.Join(ns, "enable")); got != "1" {
+		t.Fatalf("namespace enable is %q, want 1 before the dataplane dies", got)
+	}
+
+	fabric.devicePresent = func(string) bool { return false }
+
+	state, err := fabric.Reconcile(plan)
+	if err == nil {
+		t.Fatal("expected an export over a missing device to be reported")
+	}
+
+	if len(state.Exports) != 0 {
+		t.Fatalf("advertised %d exports over a missing device, want none", len(state.Exports))
+	}
+
+	if got := readTestAttr(t, filepath.Join(ns, "enable")); got != "0" {
+		t.Fatalf("namespace enable is %q, want 0 once the device is gone", got)
+	}
+
+	// And it comes back on its own once the dataplane has the device again.
+	fabric.devicePresent = func(string) bool { return true }
+
+	if _, err := fabric.Reconcile(plan); err != nil {
+		t.Fatalf("reconcile after recovery: %v", err)
+	}
+
+	if got := readTestAttr(t, filepath.Join(ns, "enable")); got != "1" {
+		t.Fatalf("namespace enable is %q, want 1 after the device is back", got)
+	}
+}
+
+// TestPublishGivesTheNamespaceAStableIdentifier pins the identifier a
+// subsystem's namespace carries. nvmet mints a random uuid when a namespace is
+// created, and a peer that reconnects to a namespace whose identifiers changed
+// refuses to attach it, so an agent restart would strand every peer.
+func TestPublishGivesTheNamespaceAStableIdentifier(t *testing.T) {
+	fabric, _ := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+	nqn := fabric.SubsystemNQN(1, 7)
+	ns := filepath.Join(fabric.nvmetRoot, "subsystems", nqn, "namespaces", fabricNamespaceID)
+
+	// A plain directory has no attributes, so the one the kernel would offer
+	// is seeded here with the random value nvmet would have put in it.
+	if err := os.MkdirAll(ns, 0o755); err != nil {
+		t.Fatalf("seed namespace: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(ns, "device_uuid"),
+		[]byte("bd1e6b7a-0c22-4c6e-9a5f-1d0f7b4a2c31"), 0o644); err != nil {
+		t.Fatalf("seed device_uuid: %v", err)
+	}
+
+	plan := FabricPlan{
+		Exports: []FabricExportRequest{{UniverseID: 1, DeviceID: 4, AllowedNodes: []uint32{7}}},
+	}
+
+	if _, err := fabric.Reconcile(plan); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	want := fabric.NamespaceUUID(nqn)
+	if want == "" {
+		t.Fatal("derived namespace uuid is empty")
+	}
+
+	if got := readTestAttr(t, filepath.Join(ns, "device_uuid")); got != want {
+		t.Fatalf("device_uuid is %q, want the derived %q", got, want)
+	}
+
+	if got := readTestAttr(t, filepath.Join(ns, "enable")); got != "1" {
+		t.Fatalf("namespace enable is %q, want 1", got)
+	}
+
+	// The identifier is restored rather than merely written once, because a
+	// namespace recreated by nvmet arrives with a fresh random one.
+	if err := os.WriteFile(filepath.Join(ns, "device_uuid"),
+		[]byte("00000000-0000-0000-0000-000000000000"), 0o644); err != nil {
+		t.Fatalf("scramble device_uuid: %v", err)
+	}
+
+	if _, err := fabric.Reconcile(plan); err != nil {
+		t.Fatalf("reconcile again: %v", err)
+	}
+
+	if got := readTestAttr(t, filepath.Join(ns, "device_uuid")); got != want {
+		t.Fatalf("device_uuid is %q after a reconcile, want the derived %q", got, want)
+	}
+
+	if got := readTestAttr(t, filepath.Join(ns, "enable")); got != "1" {
+		t.Fatalf("namespace enable is %q after repointing, want 1", got)
+	}
+}
+
+// TestPublishLeavesTheIdentifierAloneWhenTheKernelHasNone keeps the agent
+// working on a kernel whose nvmet predates a settable namespace uuid.
+func TestPublishLeavesTheIdentifierAloneWhenTheKernelHasNone(t *testing.T) {
+	fabric, _ := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+	if _, err := fabric.Reconcile(FabricPlan{
+		Exports: []FabricExportRequest{{UniverseID: 1, DeviceID: 4, AllowedNodes: []uint32{7}}},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	ns := filepath.Join(fabric.nvmetRoot, "subsystems",
+		fabric.SubsystemNQN(1, 7), "namespaces", fabricNamespaceID)
+
+	if _, err := os.Stat(filepath.Join(ns, "device_uuid")); !os.IsNotExist(err) {
+		t.Fatalf("device_uuid was created where the kernel offers none: %v", err)
+	}
+
+	if got := readTestAttr(t, filepath.Join(ns, "enable")); got != "1" {
+		t.Fatalf("namespace enable is %q, want 1", got)
+	}
+}
+
+func readTestAttr(t *testing.T, path string) string {
+	t.Helper()
+
+	value, err := readAttr(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	return value
 }
 
 func TestReconcilePublishesOverTCPOnly(t *testing.T) {
@@ -200,13 +355,14 @@ func TestReconcilePublishesBothTransports(t *testing.T) {
 }
 
 func TestReconcileDegradesToTCPWhenRDMAFails(t *testing.T) {
-	fabric, _ := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+	// The RDMA service port is pinned to the last id configfs can hold and
+	// that id is made unusable, so there is nowhere left for the RDMA port to
+	// go. A missing nvmet_rdma looks the same from here: the port cannot be
+	// published, and the pass has to carry on over TCP anyway.
+	fabric, _ := newTestFabric(t, Config{FabricAddr: "10.0.0.7", RDMAPort: 65535})
 	fabric.SetRDMAAddr("192.168.9.7")
 
-	// A port directory the kernel refuses to create is what a missing
-	// nvmet_rdma looks like from here. Standing in a plain file for it makes
-	// the mkdir fail the same way.
-	blocked := filepath.Join(fabric.nvmetRoot, "ports", strconv.Itoa(DefaultRDMAPort))
+	blocked := filepath.Join(fabric.nvmetRoot, "ports", "65535")
 	if err := os.WriteFile(blocked, nil, 0o644); err != nil {
 		t.Fatalf("block the rdma port: %v", err)
 	}
@@ -429,5 +585,180 @@ func TestAdrfamOf(t *testing.T) {
 		if got := adrfamOf(host); got != want {
 			t.Fatalf("adrfam of %q is %s, want %s", host, got, want)
 		}
+	}
+}
+
+// Several racer nodes may share one kernel, and one nvmet target is shared by
+// everything on the box. The next four tests cover what that costs.
+
+func TestReconcileRefusesAForeignPortOnThePreferredID(t *testing.T) {
+	fabric, _ := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+	// Another node got to the preferred id first and published its own
+	// address there. Linking into it would advertise this node's namespace on
+	// the other node's address.
+	foreign := filepath.Join(fabric.nvmetRoot, "ports", strconv.Itoa(DefaultFabricPort))
+	if err := os.MkdirAll(filepath.Join(foreign, "subsystems"), 0o755); err != nil {
+		t.Fatalf("seed the foreign port: %v", err)
+	}
+
+	for attr, value := range map[string]string{
+		"addr_trtype":  "tcp",
+		"addr_adrfam":  adrfamIPv4,
+		"addr_traddr":  "10.0.0.8",
+		"addr_trsvcid": strconv.Itoa(DefaultFabricPort),
+	} {
+		if err := os.WriteFile(filepath.Join(foreign, attr), []byte(value), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", attr, err)
+		}
+	}
+
+	state, err := fabric.Reconcile(FabricPlan{
+		Exports: []FabricExportRequest{{UniverseID: 1, DeviceID: 4, AllowedNodes: []uint32{7}}},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if links := portLinks(t, fabric, state.Exports[0].NQN); len(links) != 1 ||
+		links[0] == strconv.Itoa(DefaultFabricPort) {
+		t.Fatalf("subsystem linked into %v, want a port of its own", links)
+	}
+
+	// The other node's port is left exactly as it was found.
+	if attrs := portAttrs(t, fabric, DefaultFabricPort); attrs["addr_traddr"] != "10.0.0.8" {
+		t.Fatalf("foreign port attributes %v", attrs)
+	}
+
+	// And this node still advertises its own address, not the squatter's.
+	if state.Exports[0].Addr != "10.0.0.7:"+strconv.Itoa(DefaultFabricPort) {
+		t.Fatalf("advertised %q", state.Exports[0].Addr)
+	}
+}
+
+func TestReconcileReusesAPortWithTheSameAddress(t *testing.T) {
+	fabric, _ := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+	// The same address under a different id is this node's port whoever made
+	// it: the id carries no meaning, the address does.
+	existing := filepath.Join(fabric.nvmetRoot, "ports", "12")
+	if err := os.MkdirAll(filepath.Join(existing, "subsystems"), 0o755); err != nil {
+		t.Fatalf("seed the port: %v", err)
+	}
+
+	for attr, value := range map[string]string{
+		"addr_trtype":  "tcp",
+		"addr_adrfam":  adrfamIPv4,
+		"addr_traddr":  "10.0.0.7",
+		"addr_trsvcid": strconv.Itoa(DefaultFabricPort),
+	} {
+		if err := os.WriteFile(filepath.Join(existing, attr), []byte(value), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", attr, err)
+		}
+	}
+
+	state, err := fabric.Reconcile(FabricPlan{
+		Exports: []FabricExportRequest{{UniverseID: 1, DeviceID: 4, AllowedNodes: []uint32{7}}},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if links := portLinks(t, fabric, state.Exports[0].NQN); len(links) != 1 || links[0] != "12" {
+		t.Fatalf("subsystem linked into %v, want the existing port 12", links)
+	}
+
+	if portAttrs(t, fabric, DefaultFabricPort) != nil {
+		t.Fatal("a second port was created for an address that already had one")
+	}
+}
+
+func TestAttachLeavesAnotherHostsControllerAlone(t *testing.T) {
+	fabric, connector := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+	// A controller onto the same target, opened by a different node sharing
+	// this kernel. Adopting it would hand this node a device it is not
+	// entitled to; disconnecting it would cut the other node off.
+	foreign := filepath.Join(fabric.sysClassNvme, "nvme3")
+	if err := os.MkdirAll(filepath.Join(foreign, "nvme3n1"), 0o755); err != nil {
+		t.Fatalf("seed the foreign controller: %v", err)
+	}
+
+	for attr, value := range map[string]string{
+		"subsysnqn": "nqn.test.u1.n9",
+		"hostnqn":   fabric.HostNQN(11),
+	} {
+		if err := os.WriteFile(filepath.Join(foreign, attr), []byte(value), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", attr, err)
+		}
+	}
+
+	state, err := fabric.Reconcile(FabricPlan{
+		Imports: []FabricImportRequest{
+			{UniverseID: 1, PeerNodeID: 9, NQN: "nqn.test.u1.n9", Addr: "10.0.0.9:4420"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if len(connector.requests) != 1 {
+		t.Fatalf("issued %d connects, want one of this node's own", len(connector.requests))
+	}
+
+	if path := state.Attachments[racerctrl.Attachment{Universe: 1, Peer: 9}]; path == "/dev/nvme3n1" {
+		t.Fatal("adopted the other node's controller")
+	}
+
+	// Pruning everything must still leave the stranger connected.
+	if _, err := fabric.Reconcile(FabricPlan{}); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	for _, name := range connector.disconnected {
+		if name == "nvme3" {
+			t.Fatal("disconnected the other node's controller")
+		}
+	}
+
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("the other node's controller was removed: %v", err)
+	}
+}
+
+func TestConnectCarriesAHostIDDerivedFromTheHostNQN(t *testing.T) {
+	fabric, connector := newTestFabric(t, Config{FabricAddr: "10.0.0.7"})
+
+	if _, err := fabric.Reconcile(FabricPlan{
+		Imports: []FabricImportRequest{
+			{UniverseID: 1, PeerNodeID: 9, NQN: "nqn.test.u1.n9", Addr: "10.0.0.9:4420"},
+		},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// The kernel keys its host table by id, so an omitted or shared id is
+	// rejected outright once anything else on the box has connected.
+	req := connector.requests[0]
+	if req.HostNQN != fabric.HostNQN(7) {
+		t.Fatalf("connected as %q", req.HostNQN)
+	}
+
+	if req.HostID != fabric.HostID(7) {
+		t.Fatalf("host id %q, want %q", req.HostID, fabric.HostID(7))
+	}
+
+	if len(req.HostID) != 36 || req.HostID[14] != '5' {
+		t.Fatalf("host id %q is not a version 5 UUID", req.HostID)
+	}
+
+	// Different nodes, different ids: that is the whole point.
+	if fabric.HostID(7) == fabric.HostID(8) {
+		t.Fatal("two nodes derived the same host id")
+	}
+
+	// And the same node derives the same id every time it starts.
+	if fabric.HostID(7) != NewFabric(Config{NQNPrefix: fabric.nqnPrefix}, 7, nil).HostID(7) {
+		t.Fatal("host id is not stable across restarts")
 	}
 }

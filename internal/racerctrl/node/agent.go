@@ -72,6 +72,12 @@ const (
 
 	// stagePollInterval is how often NodeStageVolume checks for the device.
 	stagePollInterval = 250 * time.Millisecond
+
+	// fabricRetry is how long an incomplete fabric reconcile waits before it
+	// is attempted again. Long enough that a zone whose peers are genuinely
+	// unreachable is not rewriting configfs continuously, short enough that a
+	// node whose dataplane has just come back joins its universe promptly.
+	fabricRetry = 5 * time.Second
 )
 
 // Agent is the node half of the racer control plane.
@@ -520,6 +526,13 @@ func (a *Agent) reconcileFabric(cluster racerctrl.ClusterState) {
 	state, err := a.fabric.Reconcile(plan)
 	if err != nil {
 		a.log.Error("fabric reconcile incomplete", "error", err)
+
+		// Ask for another pass. Most of what can go wrong here is a wait
+		// rather than a fault: a peer that has not published its NQN yet, or
+		// an export whose device the dataplane is still creating. Nothing in
+		// the cluster changes when that resolves, so there is no watch event
+		// to bring us back and the retry has to be scheduled.
+		time.AfterFunc(fabricRetry, a.Trigger)
 	}
 
 	a.attachments = state.Attachments

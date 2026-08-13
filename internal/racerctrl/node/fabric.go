@@ -4,11 +4,13 @@
 package node
 
 import (
+	"crypto/sha1" //nolint:gosec // used to derive a stable name-based UUID, not for security
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,7 +68,26 @@ type Fabric struct {
 	// gates what is advertised to peers, so a node only invites RDMA traffic
 	// it can actually serve.
 	rdmaLive bool
+
+	// tcpPortID and rdmaPortID are the configfs port directory ids resolved
+	// for this node's two listeners. They are cached because resolution is a
+	// search of the whole ports tree, and because everything downstream of
+	// ensurePorts (linking, pruning) has to name the same directory the
+	// address was written into.
+	tcpPortID  int
+	rdmaPortID int
+
+	// devicePresent says whether the ublk block device backing an export is
+	// there. It is a field so tests can drive the target half without any ublk
+	// device, and it exists at all because an export outliving its device is
+	// not a harmless stale entry: see ensureNamespace.
+	devicePresent func(path string) bool
 }
+
+// sysClassNvmeSubsystem is where the multipath head of an attached namespace
+// appears. It is a package variable rather than a field so tests can point it
+// at a fixture; nothing else varies it.
+var sysClassNvmeSubsystem = "/sys/class/nvme-subsystem"
 
 // Connector abstracts the initiator side of NVMe-oF.
 type Connector interface {
@@ -80,8 +101,18 @@ type Connector interface {
 
 // ConnectRequest is one initiator connection.
 type ConnectRequest struct {
-	NQN      string
-	HostNQN  string
+	NQN     string
+	HostNQN string
+
+	// HostID is the NVMe host identifier presented alongside HostNQN.
+	//
+	// It is not optional. The kernel keeps one table of hosts keyed by id and
+	// refuses a connect that presents an id it already knows under a different
+	// NQN, and an omitted id defaults to the machine-wide one, so a connect
+	// that carries a custom host NQN and no id is rejected outright with
+	// EINVAL as soon as anything else on the box has connected.
+	HostID string
+
 	Traddr   string
 	Trsvcid  string
 	Trtype   string
@@ -165,15 +196,27 @@ func NewFabric(cfg Config, nodeID uint32, connector Connector) *Fabric {
 	}
 
 	return &Fabric{
-		nvmetRoot:    cfg.NvmetRoot,
-		sysClassNvme: "/sys/class/nvme",
-		connector:    connector,
-		nodeID:       nodeID,
-		nqnPrefix:    cfg.NQNPrefix,
-		addr:         cfg.FabricAddr,
-		port:         cfg.FabricPort,
-		rdmaPort:     cfg.RDMAPort,
+		nvmetRoot:     cfg.NvmetRoot,
+		sysClassNvme:  "/sys/class/nvme",
+		connector:     connector,
+		nodeID:        nodeID,
+		nqnPrefix:     cfg.NQNPrefix,
+		addr:          cfg.FabricAddr,
+		port:          cfg.FabricPort,
+		rdmaPort:      cfg.RDMAPort,
+		devicePresent: blockDevicePresent,
 	}
+}
+
+// blockDevicePresent reports whether a ublk block device node exists.
+//
+// The ublk driver deletes the block device as soon as the process serving it
+// goes away, however it goes away, so the presence of the node is a faithful
+// answer to "is the dataplane serving this export right now".
+func blockDevicePresent(path string) bool {
+	_, err := os.Stat(path)
+
+	return err == nil
 }
 
 // SetRDMAAddr declares the address this node's RDMA target listens on, or
@@ -202,6 +245,60 @@ func (f *Fabric) SubsystemNQN(universe, node uint32) string {
 // allowed_hosts list on each subsystem rather than by the name it presents.
 func (f *Fabric) HostNQN(node uint32) string {
 	return fmt.Sprintf("%s.host.n%d", f.nqnPrefix, node)
+}
+
+// hostIDNamespace is the UUID namespace racer derives NVMe host ids in. It is
+// an arbitrary but fixed value whose only job is to keep ids derived from a
+// racer host NQN from colliding with ids derived from the same string
+// elsewhere.
+var hostIDNamespace = [16]byte{
+	0x2f, 0x1b, 0x9c, 0x4e, 0x7a, 0x63, 0x4c, 0x8d,
+	0x9e, 0x0f, 0x5b, 0xa2, 0xd7, 0x36, 0x81, 0x44,
+}
+
+// HostID is the NVMe host identifier a node presents when it connects.
+//
+// The kernel refuses a host NQN that arrives with an id it has already seen
+// under a different name, and an omitted id is the machine-wide default, so a
+// node that presents its own NQN has to present its own id with it. The id is
+// derived from the NQN rather than generated so that it is the same after a
+// restart: a reconnect then lands on the existing host entry instead of leaving
+// a new one behind on every pod lifetime.
+func (f *Fabric) HostID(node uint32) string {
+	return derivedUUID(hostIDNamespace, f.HostNQN(node))
+}
+
+// namespaceUUIDNamespace is the UUID namespace racer derives NVMe namespace
+// identifiers in. It is a different arbitrary constant from hostIDNamespace so
+// that a subsystem NQN and a host NQN can never name the same identifier.
+var namespaceUUIDNamespace = [16]byte{
+	0x8c, 0x74, 0x2d, 0x11, 0x35, 0xe8, 0x4b, 0x1a,
+	0xa6, 0x52, 0xc3, 0x90, 0x1f, 0x4d, 0x77, 0x0b,
+}
+
+// NamespaceUUID is the identifier this node publishes for a subsystem's single
+// namespace. It is derived from the subsystem NQN so that the namespace keeps
+// its identity across agent restarts; see ensureNamespace for why a peer that
+// sees it change never recovers.
+func (f *Fabric) NamespaceUUID(nqn string) string {
+	return derivedUUID(namespaceUUIDNamespace, nqn)
+}
+
+// derivedUUID is RFC 4122's name-based (version 5) UUID.
+//
+// SHA-1 here is a naming function, not a security one: the input is a public
+// node identifier and nothing is authenticated by the result.
+func derivedUUID(namespace [16]byte, name string) string {
+	sum := sha1.Sum(append(namespace[:], name...)) //nolint:gosec // name-based identifier, not a digest of secrets
+
+	var u [16]byte
+
+	copy(u[:], sum[:16])
+
+	u[6] = (u[6] & 0x0f) | 0x50
+	u[8] = (u[8] & 0x3f) | 0x80
+
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
 // Address is the transport address peers dial to reach this node's TCP target.
@@ -313,7 +410,7 @@ func (f *Fabric) publish(nqn string, export FabricExportRequest) error {
 		return err
 	}
 
-	if err := f.ensureNamespace(subsystem, racerctrl.BlockDevicePath(export.DeviceID)); err != nil {
+	if err := f.ensureNamespace(subsystem, nqn, racerctrl.BlockDevicePath(export.DeviceID)); err != nil {
 		return err
 	}
 
@@ -378,7 +475,18 @@ func (f *Fabric) ensureAllowedHosts(subsystem string, nodes []uint32) error {
 // backing device means disabling, repointing and re-enabling. That is a real
 // interruption for anyone attached, which is why racer's fabric device minor is
 // derived from the universe id and never moves once assigned.
-func (f *Fabric) ensureNamespace(subsystem, devicePath string) error {
+//
+// The namespace also carries an identifier, and that identifier has to be the
+// same every time this node publishes this universe. nvmet mints a random uuid
+// when a namespace is created, and the host driver treats a namespace whose
+// identifiers changed as a different namespace: it refuses to attach it, logs
+// "identifiers changed for nsid 1", and leaves the peer with a live controller
+// and no block device, permanently. That is exactly what an agent restart looks
+// like from a peer that stayed connected through it, because the peer's
+// controller survives on ctrl_loss_tmo and reconnects to a subsystem this code
+// has just recreated. Deriving the uuid from the subsystem NQN makes the
+// namespace the same namespace across restarts, which is what it is.
+func (f *Fabric) ensureNamespace(subsystem, nqn, devicePath string) error {
 	ns := filepath.Join(subsystem, "namespaces", fabricNamespaceID)
 
 	if err := ensureDir(ns); err != nil {
@@ -395,19 +503,63 @@ func (f *Fabric) ensureNamespace(subsystem, devicePath string) error {
 		return err
 	}
 
-	if current == devicePath && enabled == "1" {
-		return nil
+	// A kernel too old to carry a settable namespace uuid simply keeps the one
+	// it minted, which is the behaviour this code replaces rather than depends
+	// on, so its absence is not an error.
+	uuid, uuidSettable, err := readOptionalAttr(filepath.Join(ns, "device_uuid"))
+	if err != nil {
+		return err
 	}
 
-	if current != devicePath {
+	wantedUUID := f.NamespaceUUID(nqn)
+
+	// An enabled namespace over a device that is gone has to be taken down,
+	// and taken down promptly.
+	//
+	// The target holds the block device open for as long as the namespace is
+	// enabled. The ublk driver will not hand a minor back while anything holds
+	// the device that used to be there, so a namespace still open on the
+	// export of a dataplane that died stops that dataplane from ever
+	// recreating it: every restart asks for the same minor, is told it exists,
+	// asks for it to be removed, and waits out its reclaim window against an
+	// opener that is this very process. Disabling first breaks that deadlock.
+	//
+	// It is also the right thing to do on its own terms. A namespace whose
+	// backing device has gone answers peers with errors rather than data, so
+	// there is nothing to preserve by leaving it up.
+	if !f.devicePresent(devicePath) {
 		if enabled == "1" {
 			if err := writeAttr(filepath.Join(ns, "enable"), "0"); err != nil {
 				return err
 			}
 		}
 
-		if err := writeAttr(filepath.Join(ns, "device_path"), devicePath); err != nil {
-			return err
+		return fmt.Errorf("%s is not exported by the dataplane yet", devicePath)
+	}
+
+	stale := current != devicePath || (uuidSettable && uuid != wantedUUID)
+
+	if !stale && enabled == "1" {
+		return nil
+	}
+
+	if stale {
+		if enabled == "1" {
+			if err := writeAttr(filepath.Join(ns, "enable"), "0"); err != nil {
+				return err
+			}
+		}
+
+		if current != devicePath {
+			if err := writeAttr(filepath.Join(ns, "device_path"), devicePath); err != nil {
+				return err
+			}
+		}
+
+		if uuidSettable && uuid != wantedUUID {
+			if err := writeAttr(filepath.Join(ns, "device_uuid"), wantedUUID); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -418,9 +570,9 @@ func (f *Fabric) ensureNamespace(subsystem, devicePath string) error {
 // answers on.
 type fabricPort struct {
 	// id is the configfs port directory name. nvmet identifies a port by a
-	// small integer, so the service port number doubles as the id: it is
-	// already unique per transport here, and it makes the configfs tree
-	// readable next to an `ss -lnt`.
+	// small integer of its own choosing rather than by the address on it, so
+	// this is a preference and not a name: ensurePorts resolves it against
+	// what is already in the tree and records the answer.
 	id int
 
 	trtype  string
@@ -429,10 +581,19 @@ type fabricPort struct {
 	trsvcid string
 }
 
+// maxPortID is the largest nvmet port id. The kernel carries a port id as a
+// 16-bit field, and zero is not a legal directory name for one.
+const maxPortID = 65535
+
 // tcpPort is the port every node publishes on, the floor every peer can reach.
 func (f *Fabric) tcpPort() fabricPort {
+	id := f.tcpPortID
+	if id == 0 {
+		id = f.port
+	}
+
 	return fabricPort{
-		id:      f.port,
+		id:      id,
 		trtype:  fabricTrtypeTCP,
 		adrfam:  adrfamOf(f.addr),
 		traddr:  f.addr,
@@ -448,8 +609,13 @@ func (f *Fabric) rdmaPortSpec() (fabricPort, bool) {
 
 	host, port := splitRDMAAddr(f.rdmaAddr, f.rdmaPort)
 
+	id := f.rdmaPortID
+	if id == 0 {
+		id = port
+	}
+
 	return fabricPort{
-		id:      port,
+		id:      id,
 		trtype:  fabricTrtypeRDMA,
 		adrfam:  adrfamOf(host),
 		traddr:  host,
@@ -495,16 +661,20 @@ func (f *Fabric) AdvertisedRDMAAddr() string {
 func (f *Fabric) ensurePorts() error {
 	f.rdmaLive = false
 
-	if err := f.ensurePort(f.tcpPort()); err != nil {
+	id, err := f.ensurePort(f.tcpPort())
+	if err != nil {
 		return err
 	}
+
+	f.tcpPortID = id
 
 	spec, ok := f.rdmaPortSpec()
 	if !ok {
 		return nil
 	}
 
-	if err := f.ensurePort(spec); err != nil {
+	id, err = f.ensurePort(spec)
+	if err != nil {
 		return fmt.Errorf(
 			"publish rdma port %d (continuing over tcp): %w: "+
 				"load the RDMA target and host modules (modprobe nvmet_rdma nvme_rdma) "+
@@ -512,48 +682,146 @@ func (f *Fabric) ensurePorts() error {
 			spec.id, err, spec.traddr)
 	}
 
+	f.rdmaPortID = id
 	f.rdmaLive = true
 
 	return nil
 }
 
-// ensurePort creates one nvmet port and sets its transport attributes.
+// ensurePort finds or creates the nvmet port carrying one transport address and
+// returns the configfs id it lives at.
 //
-// All of racer's subsystems share a port per transport: they differ by NQN, not
-// by address, and a per-subsystem port would burn one listening socket per
-// universe for no benefit.
-func (f *Fabric) ensurePort(spec fabricPort) error {
-	port := filepath.Join(f.nvmetRoot, "ports", strconv.Itoa(spec.id))
+// The id nvmet gives a port is arbitrary. Using the service port number for it
+// reads well and is what this code prefers, but it is only a preference: the id
+// is not derived from the address, so two targets that want the same service
+// port on different addresses cannot both hold it. That is not hypothetical
+// even on a dedicated node, where an operator or another storage system may
+// already own the id, and it is the normal case when several racer nodes share
+// one kernel. Worse, the transport attributes are only writable before the
+// first subsystem is linked, so a port claimed by someone else cannot simply be
+// corrected: linking into it would silently publish this node's namespaces on
+// another node's address, which is exactly the misattachment R7 forbids.
+//
+// So the address is the identity. An existing port whose transport, family,
+// address and service id all match is this node's port whoever created it; an
+// existing port with nothing written to it yet is adopted and configured; and
+// otherwise a fresh id is taken, starting from the preferred one.
+func (f *Fabric) ensurePort(spec fabricPort) (int, error) {
+	root := filepath.Join(f.nvmetRoot, "ports")
 
-	if err := ensureDir(port); err != nil {
-		return err
+	if err := ensureDir(root); err != nil {
+		return 0, err
 	}
 
-	// As with a subsystem's children: configfs creates this, and saying so
-	// costs one tolerated EEXIST.
-	if err := ensureDir(filepath.Join(port, "subsystems")); err != nil {
-		return err
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", root, err)
 	}
 
-	// The transport attributes are only writable before any subsystem is
-	// linked, so they are written unconditionally on a freshly created port
-	// and skipped once it carries links.
-	links, err := os.ReadDir(filepath.Join(port, "subsystems"))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("read %s/subsystems: %w", port, err)
+	taken := make(map[int]struct{}, len(entries))
+	adopt := 0
+
+	for _, entry := range entries {
+		id, convErr := strconv.Atoi(entry.Name())
+		if convErr != nil || id <= 0 {
+			continue
+		}
+
+		taken[id] = struct{}{}
+
+		// A port whose attributes cannot be read is somebody else's problem:
+		// it is not this node's port and it cannot be adopted, but the id it
+		// sits on is still taken. Refusing to publish over it would let one
+		// unreadable entry take the whole fabric down.
+		state, err := f.readPort(filepath.Join(root, entry.Name()))
+		if err != nil {
+			continue
+		}
+
+		if state == spec.address() {
+			return id, nil
+		}
+
+		// A port with no transport written to it is one somebody created and
+		// did not finish, most likely this node in a pass that died between
+		// the mkdir and the writes. Reuse it rather than leaving litter.
+		if state.trtype == "" && adopt == 0 {
+			adopt = id
+		}
 	}
 
-	if len(links) > 0 {
-		return nil
+	if adopt != 0 {
+		return adopt, f.writePort(filepath.Join(root, strconv.Itoa(adopt)), spec)
 	}
 
-	for attr, value := range map[string]string{
-		"addr_trtype":  spec.trtype,
-		"addr_adrfam":  spec.adrfam,
-		"addr_traddr":  spec.traddr,
-		"addr_trsvcid": spec.trsvcid,
+	for id := spec.id; id <= maxPortID; id++ {
+		if _, ok := taken[id]; ok {
+			continue
+		}
+
+		dir := filepath.Join(root, strconv.Itoa(id))
+
+		if err := ensureDir(dir); err != nil {
+			return 0, err
+		}
+
+		return id, f.writePort(dir, spec)
+	}
+
+	return 0, fmt.Errorf("no free nvmet port id at or above %d for %s://%s:%s",
+		spec.id, spec.trtype, spec.traddr, spec.trsvcid)
+}
+
+// address is the part of a port spec that identifies it: everything but the id.
+func (p fabricPort) address() fabricPort {
+	p.id = 0
+
+	return p
+}
+
+// readPort reads back the transport attributes of an existing port.
+func (f *Fabric) readPort(dir string) (fabricPort, error) {
+	var spec fabricPort
+
+	for _, item := range []struct {
+		attr  string
+		field *string
+	}{
+		{"addr_trtype", &spec.trtype},
+		{"addr_adrfam", &spec.adrfam},
+		{"addr_traddr", &spec.traddr},
+		{"addr_trsvcid", &spec.trsvcid},
 	} {
-		if err := writeAttr(filepath.Join(port, attr), value); err != nil {
+		value, err := readAttr(filepath.Join(dir, item.attr))
+		if err != nil {
+			return fabricPort{}, err
+		}
+
+		*item.field = value
+	}
+
+	return spec, nil
+}
+
+// writePort sets a port's transport attributes.
+//
+// The transport is written last. nvmet only takes a port live when a subsystem
+// is linked into it, so the order is not load-bearing for correctness, but
+// leaving the transport until the address is in place keeps every intermediate
+// state one nvmet would refuse to enable rather than one it would enable on the
+// wrong address.
+func (f *Fabric) writePort(dir string, spec fabricPort) error {
+	if err := ensureDir(filepath.Join(dir, "subsystems")); err != nil {
+		return err
+	}
+
+	for _, item := range [][2]string{
+		{"addr_adrfam", spec.adrfam},
+		{"addr_traddr", spec.traddr},
+		{"addr_trsvcid", spec.trsvcid},
+		{"addr_trtype", spec.trtype},
+	} {
+		if err := writeAttr(filepath.Join(dir, item[0]), item[1]); err != nil {
 			return err
 		}
 	}
@@ -755,6 +1023,7 @@ func (f *Fabric) attach(imp FabricImportRequest) (string, error) {
 	err = f.connector.Connect(ConnectRequest{
 		NQN:     imp.NQN,
 		HostNQN: f.HostNQN(f.nodeID),
+		HostID:  f.HostID(f.nodeID),
 		Traddr:  host,
 		Trsvcid: port,
 		Trtype:  trtype,
@@ -776,7 +1045,14 @@ func (f *Fabric) attach(imp FabricImportRequest) (string, error) {
 	return f.namespacePath(controller)
 }
 
-// findController locates an attached controller by the subsystem it carries.
+// findController locates a controller this node attached, by the subsystem it
+// carries.
+//
+// The host NQN is part of the match, not just the subsystem's. /sys/class/nvme
+// is one namespace for the whole kernel, so a controller reached by a different
+// host identity is not this node's to reuse or to tear down: adopting it would
+// make this node's device path depend on another host's lifetime, and pruning
+// it would cut a link this node never made.
 func (f *Fabric) findController(nqn string) (string, bool, error) {
 	entries, err := os.ReadDir(f.sysClassNvme)
 	if err != nil {
@@ -788,6 +1064,15 @@ func (f *Fabric) findController(nqn string) (string, bool, error) {
 	}
 
 	for _, entry := range entries {
+		ours, err := f.ownsController(entry.Name())
+		if err != nil {
+			return "", false, err
+		}
+
+		if !ours {
+			continue
+		}
+
 		subsys, err := readAttr(filepath.Join(f.sysClassNvme, entry.Name(), "subsysnqn"))
 		if err != nil {
 			return "", false, err
@@ -801,28 +1086,42 @@ func (f *Fabric) findController(nqn string) (string, bool, error) {
 	return "", false, nil
 }
 
+// ownsController reports whether a controller was attached by this node.
+func (f *Fabric) ownsController(controller string) (bool, error) {
+	host, err := readAttr(filepath.Join(f.sysClassNvme, controller, "hostnqn"))
+	if err != nil {
+		return false, err
+	}
+
+	return host == f.HostNQN(f.nodeID), nil
+}
+
 // namespacePath resolves a controller to the block device of its single
 // namespace. racer publishes exactly one namespace per subsystem, so finding
 // more than one means something other than racer created the subsystem and the
 // safe answer is to refuse rather than guess.
+//
+// There are two shapes to find it in. A controller whose subsystem does not
+// advertise multiple controllers carries its namespace directly, as
+// /sys/class/nvme/nvmeX/nvmeXnY. nvmet always advertises multiple controllers,
+// so in practice racer's own targets take the other shape: the kernel builds a
+// multipath head for the namespace, hides the per-controller device under a
+// nvmeXcYnZ name that is not a /dev node at all, and puts the usable device
+// beside the controller under its nvme-subsystem. Following only the first
+// shape would have every attach report "no namespace yet" against a target that
+// is working perfectly.
 func (f *Fabric) namespacePath(controller string) (string, error) {
-	dir := filepath.Join(f.sysClassNvme, controller)
-
-	entries, err := os.ReadDir(dir)
+	found, err := namespacesIn(filepath.Join(f.sysClassNvme, controller), controller+"n")
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", dir, err)
+		return "", err
 	}
 
-	var found []string
-
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasPrefix(name, controller+"n") {
-			found = append(found, name)
+	if len(found) == 0 {
+		found, err = f.multipathNamespaces(controller)
+		if err != nil {
+			return "", err
 		}
 	}
-
-	sort.Strings(found)
 
 	switch len(found) {
 	case 0:
@@ -834,9 +1133,70 @@ func (f *Fabric) namespacePath(controller string) (string, error) {
 	}
 }
 
+// multipathNamespaces lists the head devices of the subsystem a controller
+// belongs to.
+func (f *Fabric) multipathNamespaces(controller string) ([]string, error) {
+	entries, err := os.ReadDir(sysClassNvmeSubsystem)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("read %s: %w", sysClassNvmeSubsystem, err)
+	}
+
+	for _, entry := range entries {
+		dir := filepath.Join(sysClassNvmeSubsystem, entry.Name())
+
+		if _, err := os.Stat(filepath.Join(dir, controller)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+
+			return nil, fmt.Errorf("stat %s: %w", filepath.Join(dir, controller), err)
+		}
+
+		return namespacesIn(dir, "nvme")
+	}
+
+	return nil, nil
+}
+
+// namespaceName matches a namespace block device, nvme<controller>n<nsid>.
+var namespaceName = regexp.MustCompile(`^nvme[0-9]+n[0-9]+$`)
+
+// namespacesIn lists the namespace block devices in a sysfs directory, sorted.
+// The prefix narrows the search to one controller's own devices where that
+// distinction exists.
+func namespacesIn(dir, prefix string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("read %s: %w", dir, err)
+	}
+
+	var found []string
+
+	for _, entry := range entries {
+		name := entry.Name()
+
+		if strings.HasPrefix(name, prefix) && namespaceName.MatchString(name) {
+			found = append(found, name)
+		}
+	}
+
+	sort.Strings(found)
+
+	return found, nil
+}
+
 // pruneControllers disconnects racer subsystems the plan no longer imports.
-// Only controllers whose subsystem NQN carries our prefix are considered, so a
-// node that also mounts unrelated NVMe-oF storage keeps it.
+// Only controllers this node attached, whose subsystem NQN carries our prefix,
+// are considered: a node that also mounts unrelated NVMe-oF storage keeps it,
+// and a node sharing a kernel with another racer node keeps that node's links.
 func (f *Fabric) pruneControllers(plan FabricPlan) error {
 	keep := make(map[string]struct{}, len(plan.Imports))
 
@@ -860,6 +1220,16 @@ func (f *Fabric) pruneControllers(plan FabricPlan) error {
 	var problems []error
 
 	for _, entry := range entries {
+		mine, err := f.ownsController(entry.Name())
+		if err != nil {
+			problems = append(problems, err)
+			continue
+		}
+
+		if !mine {
+			continue
+		}
+
 		subsys, err := readAttr(filepath.Join(f.sysClassNvme, entry.Name(), "subsysnqn"))
 		if err != nil {
 			problems = append(problems, err)
@@ -905,6 +1275,7 @@ func (c fabricsConnector) Connect(req ConnectRequest) error {
 		"trsvcid=" + req.Trsvcid,
 		"nqn=" + req.NQN,
 		"hostnqn=" + req.HostNQN,
+		"hostid=" + req.HostID,
 	}, ",")
 
 	if _, err := f.WriteString(line); err != nil {
@@ -1001,6 +1372,23 @@ func readAttr(path string) (string, error) {
 	}
 
 	return strings.TrimSpace(string(raw)), nil
+}
+
+// readOptionalAttr reads an attribute that a kernel may not have at all,
+// reporting whether it is there. readAttr cannot answer this: it folds a
+// missing file into the empty string, which several nvmet attributes use as a
+// legitimate unset value.
+func readOptionalAttr(path string) (string, bool, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+
+		return "", false, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	return strings.TrimSpace(string(raw)), true, nil
 }
 
 func writeAttr(path, value string) error {
