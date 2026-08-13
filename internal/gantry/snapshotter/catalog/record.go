@@ -47,7 +47,11 @@ const (
 	RecordBytes = 128
 
 	// recordPageHeaderBytes is the per-block header preceding records: a
-	// CRC32C over the block and a count of live records in it.
+	// CRC32C over the rest of the block in bytes 0..3, the format version in
+	// bytes 4..5, and two bytes reserved for a future field. There is no
+	// count of occupied slots, deliberately: slots fill out of order, so a
+	// count would be a second thing to keep consistent under a racing
+	// compare-and-swap for no gain over scanning the 31 slots.
 	recordPageHeaderBytes = 8
 
 	// RecordsPerBlock is how many records fit in a 4 KiB block.

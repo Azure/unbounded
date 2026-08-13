@@ -21,15 +21,21 @@ import (
 // DefaultConflictErrnos are the errnos treated as an OCC compare-and-swap
 // failure on the catalog device.
 //
-// RACER's documentation describes OCC's behaviour ("writes cause a conflict
-// error if another consumer has modified the same page since the previous
-// read") but does not pin down the errno the ublk device reports for it, so
-// this is deliberately a set rather than a single value, and it is
-// configurable. Getting it wrong is not a correctness problem in the
-// dangerous direction: an unrecognised conflict surfaces as a plain I/O error
-// and the ingest is retried later, whereas a recognised one is retried
-// immediately against a re-read block. What must never happen is treating a
-// successful write as a conflict, and no kernel reports success as an errno.
+// EAGAIN is the one RACER actually reports. A conflicting write fails with
+// Status::Conflict, which Status::errno maps to EAGAIN before the ublk server
+// answers the I/O; the block layer round-trips that through BLK_STS_AGAIN back
+// to EAGAIN, and a write to a non-pollable file descriptor surfaces it
+// unchanged. A conflict detected by a peer across the fabric travels as
+// EREMOTEIO, but Status::from_wire converts it back to Status::Conflict before
+// the consumer side ever sees it, so EREMOTEIO does not reach us.
+//
+// EBUSY is here as a hedge against a future device reporting the same
+// condition differently, and the set is configurable for the same reason.
+// Getting it wrong is not a correctness problem in the dangerous direction: an
+// unrecognised conflict surfaces as a plain I/O error and the ingest is
+// retried later, whereas a recognised one is retried immediately against a
+// re-read block. What must never happen is treating a successful write as a
+// conflict, and no kernel reports success as an errno.
 var DefaultConflictErrnos = []unix.Errno{unix.EAGAIN, unix.EBUSY}
 
 // ParseConflictErrnos turns a comma-separated list of errno names or numbers
