@@ -1305,15 +1305,15 @@ impl Allocator {
     pub fn tick(&self, now: Instant) {
         let cfg = server::config();
         maps!(&cfg, m);
-        // Nothing to reclaim until some extent has collected at least once.
-        let collecting = cfg.collecting();
+        // Nothing to reclaim until the configuration can retire something.
+        let reclaimable = cfg.reclaimable();
         here(|c| {
             for class in [Class::Small, Class::Huge] {
                 if c.staging[class as usize].is_none() {
                     c.staging[class as usize] = PoolBuf::try_alloc(MBLOCK);
                 }
                 c.shard.snap_expire(class, now);
-                if collecting {
+                if reclaimable {
                     c.shard.sweep(class, &m);
                 }
             }
