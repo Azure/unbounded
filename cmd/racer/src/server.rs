@@ -19,7 +19,7 @@ use crate::fabric::{
 use crate::heal::{self, Heal};
 use crate::layout;
 use crate::metrics;
-use crate::paxos::{self, Page, Paxos, Sink};
+use crate::paxos::{self, Page, Paxos, Register, Sink};
 use crate::runtime::{
     self, Buf, Cfg, Configurator, Errno, Export, Handler, Op, PoolBuf, Request, sleep,
 };
@@ -469,7 +469,6 @@ impl<'a> Segments<'a> {
 /// names a page, not a byte range. A cache hit takes a confirming round, run beside the
 /// cached read, so a hit costs one round trip and no 4 MiB page crosses the wire.
 async fn huge_read(d: &Dataplane, addr: GlobalAddr, off: usize, buf: Buf) -> Result<(), Status> {
-    let a = d.alloc();
     let px = d.paxos;
     // The cache can only move whole pages: a `GET` has no trailer to carry an offset.
     let whole = off == 0 && buf.len() as u64 == layout::HUGE_PAGE;
@@ -477,31 +476,51 @@ async fn huge_read(d: &Dataplane, addr: GlobalAddr, off: usize, buf: Buf) -> Res
     if px.cached_huge(addr, off, w, buf).await {
         return Ok(());
     }
-    let r = match a.read_huge(addr, off, buf).await {
+    // A hole served as zeroes has no version to offer, and nothing to gain from the cache
+    // either: the zero region is one device read away on every node.
+    if let Some(r) = huge_group(d, addr, off, buf).await?
+        && whole
+    {
+        px.offer_huge(addr, w, buf, r.version).await;
+    }
+    Ok(())
+}
+
+/// The group's answer for a 4 MiB page, once the cache has had its say.
+///
+/// `None` where the group's answer is that nobody wrote the page: the bytes are zeroes and
+/// there is no register to speak of. Shared with the cross-zone `GET` (below), which owes
+/// its reader exactly what a reader in this zone would have seen.
+async fn huge_group(
+    d: &Dataplane,
+    addr: GlobalAddr,
+    off: usize,
+    buf: Buf,
+) -> Result<Option<Register>, Status> {
+    let a = d.alloc();
+    let px = d.paxos;
+    let whole = off == 0 && buf.len() as u64 == layout::HUGE_PAGE;
+    match a.read_huge(addr, off, buf).await {
         // Not an acceptor, so a local miss says nothing about existence: the bytes live
         // in the group and repair would only heal the members. Whole pages only.
         Err(Status::Hole | Status::Missing) if whole && !px.member_of(addr) => {
             match px.pull_huge(addr, buf).await {
-                Err(Status::Hole) => return a.read_zeroes(buf).await,
-                r => r?,
+                Err(Status::Hole) => a.read_zeroes(buf).await.map(|()| None),
+                r => r.map(Some),
             }
         }
         Err(Status::Hole | Status::Missing) if px.healable(addr) => {
             px.repair(addr).await?;
             match a.read_huge(addr, off, buf).await {
-                Err(Status::Hole) => return a.read_zeroes(buf).await,
-                r => r?,
+                Err(Status::Hole) => a.read_zeroes(buf).await.map(|()| None),
+                r => r.map(Some),
             }
         }
         // A hole reads as zeroes, and we may not touch the guest's pages, so they come
         // from the device's format-time zero region.
-        Err(Status::Hole) => return a.read_zeroes(buf).await,
-        r => r?,
-    };
-    if whole {
-        px.offer_huge(addr, w, buf, r.version).await;
+        Err(Status::Hole) => a.read_zeroes(buf).await.map(|()| None),
+        r => r.map(Some),
     }
-    Ok(())
 }
 
 // --- fabric target ---
@@ -626,10 +645,19 @@ async fn get(
         Source::Cache => return cache_get(d, page.class(), want, addr, req).await,
         Source::Group(via) => via,
     };
-    // `To::Owner` is a reader that resolved only our zone, so it wants the group's
-    // answer. 4 KiB only: the 4 MiB class takes no round and arrives MDTS-split.
-    if via.to == To::Owner && page.class() == Class::Small {
-        return get_confirmed(d, want, addr, req).await;
+    // `To::Owner` is a reader that resolved only our zone, so it wants the group's answer
+    // rather than this node's. 4 KiB takes a round here; the 4 MiB class is immutable and
+    // takes none, but a hole is still the group's to answer and not a miss to report.
+    if via.to == To::Owner {
+        if page.class() == Class::Small {
+            return get_confirmed(d, want, addr, req).await;
+        }
+        if let Want::Piece { off } = want {
+            return huge_group(d, addr, off, req.buf)
+                .await
+                .map(|_| ())
+                .map_err(wire);
+        }
     }
     if let Want::Piece { off } = want {
         // A hole here is not zeroes: answer that this member lacks the page, and let
@@ -661,11 +689,18 @@ async fn get_confirmed(
     req: Request,
 ) -> Result<(), Errno> {
     let mut page = PoolBuf::alloc(fabric::BLOCK).await;
-    let r = d
-        .paxos
-        .read_for(addr, Sink::Small(&mut page))
-        .await
-        .map_err(wire)?;
+    // A hole is the group's answer here, not this node's miss: the round ran on this side
+    // of the fabric, so the reader sees exactly what it would have seen had the page been
+    // homed in its own zone. The wire cannot say "hole", and [`status::MISSING`] would
+    // reach that reader's guest as `EIO` rather than as the zeroes a hole owes it.
+    let r = match d.paxos.read_for(addr, Sink::Small(&mut page)).await {
+        Ok(r) => r,
+        Err(Status::Hole) => {
+            page.fill(0);
+            Register::default()
+        }
+        Err(e) => return Err(wire(e)),
+    };
     req.store(0, &page)?;
     if want == Want::Gather {
         // The round confirmed this register. No width and no state: the hint belongs to
@@ -1448,17 +1483,34 @@ mod tests {
         assert_ne!(v7, 0, "a page that exists was written at some version");
         assert_ne!(meta.reg.ballot, 0, "and at the ballot that chose it");
 
-        // ---- A page this member does not have is not zeroes, it is MISSING ------
+        // ---- A page nobody has: whose answer is it? -----------------------------
+        // Asked of a named member, a hole is that member's miss, so consensus can heal it
+        // from another copy rather than believe a page of zeroes.
         let gone = fabric::Cmd::Get {
             page: page_of(Class::Small, LWW + 999),
-            from: fabric::Source::Group(owner()),
+            from: fabric::Source::Group(fabric::Via::direct(fabric::To::Member(
+                fabric::Member::new(0).unwrap(),
+            ))),
             want: fabric::Want::Page,
         };
         let e = frame_read(&fab, gone, 4096).unwrap_err();
         assert_eq!(
             errno(e),
             libc::ENODATA,
-            "a hole is a hole, not a page of zeroes"
+            "a member that lacks the page says so, rather than inventing zeroes"
+        );
+        // Asked of the owner, the round ran on this side of the fabric and the answer is
+        // the group's: a hole is zeroes, exactly as a reader in this zone would have seen.
+        // Reporting the miss instead would reach that reader's guest as `EIO`.
+        let gone = fabric::Cmd::Get {
+            page: page_of(Class::Small, LWW + 999),
+            from: fabric::Source::Group(owner()),
+            want: fabric::Want::Page,
+        };
+        assert_eq!(
+            frame_read(&fab, gone, 4096).unwrap(),
+            vec![0u8; 4096],
+            "a hole the group agrees on is the zeroes its reader is owed"
         );
         // Over the block device the same page still reads as zeroes, as a consumer needs.
         assert_eq!(
@@ -1803,10 +1855,31 @@ mod tests {
             via: owner(),
         };
         frame_write(&fab, trim, &[0u8; 4096]).expect("trim");
+        // Asked of a named member, the page is gone and says so, so a copy that still has
+        // it can answer instead.
+        let gone_piece = fabric::Cmd::Get {
+            page: pageh,
+            from: fabric::Source::Group(fabric::Via::direct(fabric::To::Member(
+                fabric::Member::new(0).unwrap(),
+            ))),
+            want: fabric::Want::Piece { off: 0 },
+        };
         assert_eq!(
-            errno(frame_read(&fab, geth, 4 << 20).unwrap_err()),
+            errno(frame_read(&fab, gone_piece, 4 << 20).unwrap_err()),
             libc::ENODATA,
-            "a trimmed page is missing, not empty"
+            "a trimmed page is missing to the member that lost it, not empty"
+        );
+        // Asked of the owner, the answer is the group's, and the group agrees the page is
+        // gone: a trimmed range reads as zeroes, which is what its own guest sees below.
+        assert_eq!(
+            frame_read(&fab, geth, 4 << 20).unwrap(),
+            vec![0u8; 4 << 20],
+            "a trimmed page the group agrees on is the zeroes its reader is owed"
+        );
+        // Direct, or the block layer answers this from the page cache it filled above.
+        assert_eq!(
+            direct_read(&paths[2], 0, 4 << 20).unwrap(),
+            vec![0u8; 4 << 20]
         );
         frame_write(&fab, trim, &[0u8; 4096]).expect("trim is idempotent");
 
