@@ -292,7 +292,11 @@ LWW writes read/guard the current version and retry bounded conflicts. OCC
 writes require a bounded, volatile prior-read record on the client-facing
 node. Immutable writes derive their version from the extent's tombstone epoch.
 Requests
-originating on a nonmember are handed to a group member.
+originating on a nonmember are handed to a group member. Immutable and OCC
+guards are fixed where the request starts, so a duplicate names a spent version
+and is refused; an LWW guard is derived where the register lives, so an LWW
+accept is sent once and a transport failure is reported rather than retried on
+another route.
 
 A write concurrently sends guarded accepts to members, including a pending
 local allocation. Quorum commits the local leg; rejection or ambiguity can
@@ -301,6 +305,14 @@ before gathering peer metadata; cache and huge-page paths can overlap those
 steps. Two exact matching registers identify a chosen value; otherwise Racer
 fetches the matching value or repairs the group. A local authoritative 4 MiB
 immutable hit can avoid a read round.
+
+A prepare that could not reach every member answers only when a quorum of the
+answers it did get name the identical register; a lone candidate, a free choice
+and an empty group are all reported as ambiguous instead. Without that rule a
+one-shot accept stranded on a single member is indistinguishable from a chosen
+value, and successive rounds that reach different members answer differently,
+which lets a failed write become the group's value after a read has already
+returned something else.
 
 Terms, in-flight keys, and replay state are owned by the group's worker; seals
 are copied into every worker. Explicit promise and seal snapshots rewrite all

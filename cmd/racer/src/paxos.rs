@@ -222,12 +222,24 @@ impl Settled {
 /// chosen and the highest ballot is a free choice; and two responses that disagree at the top
 /// version are unresolvable in this round.
 ///
-/// `answered` is how many of the three members replied, so `3 - answered` is how many could
-/// still be carrying a value nobody here has seen. `below` narrows a free choice when the
-/// caller has already found the newer ones unusable.
+/// A round with a member it could not reach at all answers only when a quorum of the answers
+/// it did get name the identical register. Anything less is a guess about that member, and
+/// the next round guesses differently: that is how a proposal that reached one acceptor and
+/// then failed comes back as the group's value long after a read returned something else.
+/// Refusing costs availability - a group with a member down and the other two disagreeing
+/// cannot repair until it comes back - and it is never wrong, because a value a quorum
+/// accepted is on at least one of any two members we do reach.
+///
+/// `answered` is how many of the three members reported a register, so `3 - answered` is how
+/// many could still be carrying a value nobody here has seen. `silent` is the narrower count
+/// of members that did not reply at all: a member that answered "nothing" is still counted
+/// among the possible carriers, because a store that was wiped answers the same way, but it
+/// has been heard from and will say the same thing next round. `below` narrows a free choice
+/// when the caller has already found the newer ones unusable.
 pub(crate) fn choose(
     regs: &[Option<Register>; 3],
     answered: usize,
+    silent: usize,
     need: usize,
     kind: Kind,
     below: Option<Register>,
@@ -295,15 +307,26 @@ pub(crate) fn choose(
             chosen = sure;
             break;
         }
+        // Everything below this point rests on a member we could not reach breaking the tie
+        // the way we guessed, and a later round that does reach it will guess differently.
+        // Answering anyway is how a proposal that reached one acceptor and failed gets
+        // promoted to the group's value long afterwards, on top of a value a quorum already
+        // agreed on and a read already returned. A round that cannot prove its answer
+        // refuses instead, and the caller retries once the group is whole.
+        if silent > 0 && need > 1 {
+            return Choice::Ambiguous;
+        }
         match cands.len() {
             1 => {
                 chosen = Some(cands[0]);
                 break;
             }
             0 => continue,
-            // Two values that could each have been chosen, and no silent member left to tell
-            // them apart. Whoever moved past this version built on one of them, so the
-            // register above supersedes both.
+            // Two values that could each have been chosen, and no member left unaccounted
+            // for. Whoever moved past this version built on one of them, so the register
+            // above supersedes both. A member that answered "nothing" is still unaccounted
+            // for here, because a wiped store is indistinguishable from a page never
+            // written and could have been the second vote behind either value.
             _ if unseen == 0 => {
                 chosen = regs.iter().flatten().copied().max_by_key(|r| r.key());
                 break;
@@ -316,8 +339,13 @@ pub(crate) fn choose(
     // is how a value whose only copy is unreadable stops being an answer nobody can act on.
     // Deliberately ignored once something *was* chosen: then the value is the group's,
     // readable or not.
+    //
+    // Reaching here without having heard from everyone proves nothing either: a member we
+    // missed can be holding the one value there is, and "nothing was chosen" is an answer a
+    // reader is entitled to act on. Only a complete view settles it.
     match chosen {
         Some(r) => Choice::Chosen(r),
+        None if silent > 0 && need > 1 => Choice::Ambiguous,
         None => regs
             .iter()
             .flatten()
@@ -837,17 +865,27 @@ impl Paxos {
     /// does not answer is not the zone's answer: the next is tried, and only a zone with
     /// nobody home is unavailable. Anything but a transport failure is the far zone's verdict
     /// and is returned as it stands.
+    ///
+    /// `once` gives up after the first gateway instead. [`Self::gateways`] has already
+    /// skipped the ones we hold no link to, so every retry here follows a request that
+    /// reached the wire and then timed out, which the far zone may well have applied. Work
+    /// that would not survive being applied twice takes the single shot and reports the
+    /// failure it cannot rule out.
     async fn via<'a, S, F, T>(
         &'a self,
         zone: u32,
         addr: GlobalAddr,
+        once: bool,
         mut send: S,
     ) -> Result<T, Status>
     where
         S: FnMut(Route<'a>) -> F,
         F: Future<Output = Result<T, Status>>,
     {
-        let routes = self.gateways(zone, addr);
+        let mut routes = self.gateways(zone, addr);
+        if once {
+            routes.truncate(1);
+        }
         if routes.is_empty() {
             self.stat(|s| s.zones_unavailable += 1);
             return Err(Status::Io);
@@ -941,16 +979,24 @@ impl Paxos {
     /// replace and is every type check at once; `None` leaves it to be derived where the
     /// register lives. Returns the new version, always `guard + 1` for all three types, which
     /// is why an `ACCEPT` needs no reply body.
+    ///
+    /// A proposal that has to be relayed is sent once and only once when the class is LWW.
+    /// The other two guards are fixed at the origin - `3 * epoch` for an Immutable fill, the
+    /// version the client read for OCC - so a second copy of the same request arrives naming
+    /// a version already spent and is refused. LWW's guard is derived where the register
+    /// lives, so a second copy is not a repeat of the first proposal but a fresh one, and it
+    /// lands on top of whatever was acknowledged in between.
     async fn propose(
         &'static self,
         addr: GlobalAddr,
         guard: Option<u64>,
         page: Page<'_>,
     ) -> Result<u64, Status> {
+        let once = self.alloc.kind_of(addr)?.0 == Kind::Lww;
         // Homed in another zone: not in our slot table, so no group here to resolve. The
         // gateway resolves it and the member it reaches proposes.
         if let Some(z) = self.away(addr)? {
-            self.via(z, addr, |r| {
+            self.via(z, addr, once, |r| {
                 self.send_accept(r, addr, guard, Ballot::ZERO, page)
             })
             .await?;
@@ -961,7 +1007,7 @@ impl Paxos {
             Gate::Serve { replaying } => replaying,
             // Sealed here and the config has not caught up: hand it to the destination.
             Gate::Away(z) => {
-                self.via(z, addr, |r| {
+                self.via(z, addr, once, |r| {
                     self.send_accept(r, addr, guard, Ballot::ZERO, page)
                 })
                 .await?;
@@ -981,7 +1027,7 @@ impl Paxos {
             }
             // Otherwise the close member proposes, which `imm` zero says. The data crosses
             // the wire once and needs no reply body.
-            None => self.forward(addr, m, guard, page).await,
+            None => self.forward(addr, m, once, guard, page).await,
         }
     }
 
@@ -1051,7 +1097,9 @@ impl Paxos {
         // Homed elsewhere: the gateway resolves the group.
         if let Some(z) = self.away(addr)? {
             return self
-                .via(z, addr, |r| self.send_trim(r, addr, guard, Ballot::ZERO))
+                .via(z, addr, false, |r| {
+                    self.send_trim(r, addr, guard, Ballot::ZERO)
+                })
                 .await;
         }
         let group = self.group(addr);
@@ -1059,7 +1107,9 @@ impl Paxos {
             Gate::Serve { replaying } => replaying,
             Gate::Away(z) => {
                 return self
-                    .via(z, addr, |r| self.send_trim(r, addr, guard, Ballot::ZERO))
+                    .via(z, addr, false, |r| {
+                        self.send_trim(r, addr, guard, Ballot::ZERO)
+                    })
                     .await;
             }
         };
@@ -1086,7 +1136,7 @@ impl Paxos {
             }
             None => {
                 // `imm` zero: the close member picks the ballot and fans out.
-                self.delegate(addr.universe(), &m, |r| {
+                self.delegate(addr.universe(), &m, false, |r| {
                     self.send_trim(r, addr, guard, Ballot::ZERO)
                 })
                 .await
@@ -1257,10 +1307,11 @@ impl Paxos {
         &'static self,
         addr: GlobalAddr,
         m: [u32; 3],
+        once: bool,
         guard: Option<u64>,
         page: Page<'_>,
     ) -> Result<u64, Status> {
-        self.delegate(addr.universe(), &m, |r| {
+        self.delegate(addr.universe(), &m, once, |r| {
             self.send_accept(r, addr, guard, Ballot::ZERO, page)
         })
         .await?;
@@ -1272,7 +1323,17 @@ impl Paxos {
     /// Hand a proposal to a member and let it propose. A member that does not answer is not
     /// the group's answer: the next candidate is tried, and only a group with nobody home is
     /// unavailable. Anything but a transport failure is the group's verdict.
-    async fn delegate<'a, S, F>(&'a self, u: u32, m: &[u32; 3], mut send: S) -> Result<(), Status>
+    ///
+    /// `once` stops after the first candidate, for the same reason [`Self::via`] takes it: a
+    /// request that timed out may already have been applied, and some work must not be
+    /// applied twice.
+    async fn delegate<'a, S, F>(
+        &'a self,
+        u: u32,
+        m: &[u32; 3],
+        once: bool,
+        mut send: S,
+    ) -> Result<(), Status>
     where
         S: FnMut(Route<'a>) -> F,
         F: Future<Output = Result<(), Status>>,
@@ -1284,7 +1345,7 @@ impl Paxos {
             })
             .await
             {
-                Err(Status::Io) => continue,
+                Err(Status::Io) if !once => continue,
                 r => return r,
             }
         }
@@ -2584,7 +2645,7 @@ impl Paxos {
         r: Register,
         zone: u32,
     ) -> Result<(), Status> {
-        self.via(zone, addr, |g| self.send_learn(g, addr, r, 0, false))
+        self.via(zone, addr, false, |g| self.send_learn(g, addr, r, 0, false))
             .await
     }
 
@@ -2905,12 +2966,16 @@ impl Paxos {
         let mut regs: [Option<Register>; 3] = [None; 3];
         let mut terms: Vec<u32> = Vec::new();
         let mut answered = 0;
+        let mut heard = 0;
 
         // Our own promise counts on the same terms a peer's does.
         if let Some(k) = me {
             let t = self.bump(group).await?;
-            // A register we lost is not a vote for version zero. Leaving it out is the
-            // same as not answering, the conservative side of the count.
+            // A register we lost is not a vote for version zero: a store that was wiped
+            // holds nothing and a page never written holds nothing, and only the first of
+            // those is a reason to keep counting the member as a possible carrier. It is
+            // still an answer, though, and one that will not change when asked again.
+            heard += 1;
             match self.alloc.register(addr).await {
                 Ok(r) => {
                     regs[k as usize] = Some(r);
@@ -2928,20 +2993,29 @@ impl Paxos {
             .filter(|i| Some(*i) != me)
             .filter_map(|i| self.route(addr.universe(), &m, i).map(|r| (i as usize, r)))
             .collect();
-        let mut take = |i: usize, r: Result<(Register, u32), Status>| {
-            if let Ok((reg, t)) = r {
+        let mut take = |i: usize, r: Result<(Register, u32), Status>| match r {
+            Ok((reg, t)) => {
                 regs[i] = Some(reg);
                 terms.push(t);
                 answered += 1;
+                heard += 1;
             }
+            // Holding nothing is an answer; anything else leaves the member unaccounted for.
+            Err(Status::Missing) => heard += 1,
+            Err(_) => {}
         };
-        match (pending.pop(), pending.pop()) {
-            (None, _) => {}
-            (Some((i, a)), None) => take(i, self.send_prepare(a, addr).await),
-            (Some((i, a)), Some((j, b))) => {
-                let (x, y) = join2(self.send_prepare(a, addr), self.send_prepare(b, addr)).await;
-                take(i, x);
-                take(j, y);
+        // Two at a time. A member has a local leg and so at most two to send; a non-member
+        // asking all three pays one extra round trip for the odd one out, and has to, because
+        // the member it skipped is the one the count cannot do without.
+        while let Some((i, a)) = pending.pop() {
+            match pending.pop() {
+                Some((j, b)) => {
+                    let (x, y) =
+                        join2(self.send_prepare(a, addr), self.send_prepare(b, addr)).await;
+                    take(i, x);
+                    take(j, y);
+                }
+                None => take(i, self.send_prepare(a, addr).await),
             }
         }
         if answered < need {
@@ -2967,7 +3041,7 @@ impl Paxos {
         // top would drop an acknowledged write. So walk the versions downwards and answer
         // with the first one a quorum could stand behind.
         let kind = self.alloc.kind_of(addr)?.0;
-        match choose(&regs, answered, need, kind, below) {
+        match choose(&regs, answered, 3 - heard, need, kind, below) {
             Choice::Chosen(r) => Ok((term, Settled::Chosen(r))),
             Choice::Free(r) => Ok((term, Settled::Free(r))),
             // An unresolvable top version is a race, not the client's `Conflict`:
@@ -3143,7 +3217,7 @@ impl Paxos {
         let spawned = runtime::spawn(async move {
             for z in zones {
                 let sent = self
-                    .via(z, addr, |r| {
+                    .via(z, addr, false, |r| {
                         self.send_warm(r, addr, version, fabric::Stage::Inbound)
                     })
                     .await;
@@ -3573,6 +3647,91 @@ mod tests {
         seen.sort_unstable();
         assert_eq!(seen, [0, 1, 2], "the failover order still covers the group");
     }
+
+    fn reg(version: u64, term: u32, member: u8) -> Option<Register> {
+        Some(Register {
+            version,
+            ballot: Ballot::new(term, member),
+        })
+    }
+
+    /// A quorum of the answers naming the identical register is proof, and proof is all a
+    /// round needs. The member it could not reach cannot be holding a value a quorum agreed
+    /// on, because the two that answered are that quorum.
+    #[test]
+    fn a_quorum_of_answers_settles_without_the_third_member() {
+        let r = reg(7, 1, 0);
+        let regs = [r, r, None];
+        assert_eq!(
+            choose(&regs, 2, 1, 2, Kind::Lww, None),
+            Choice::Chosen(r.unwrap())
+        );
+    }
+
+    /// The shape a failed one-shot leaves behind: one member a version ahead of a value the
+    /// other two agreed on. A round that reaches the pair keeps their value; a round that
+    /// reaches the straggler and one of them cannot tell the two apart and must refuse,
+    /// because taking the straggler would replace an answer a reader already saw.
+    #[test]
+    fn a_straggler_above_a_quorum_never_wins() {
+        let (kept, orphan) = (reg(7, 1, 0), reg(8, 1, 2));
+        assert_eq!(
+            choose(&[kept, kept, orphan], 3, 0, 2, Kind::Lww, None),
+            Choice::Chosen(kept.unwrap()),
+            "a complete view can see the straggler is alone"
+        );
+        assert_eq!(
+            choose(&[None, kept, orphan], 2, 1, 2, Kind::Lww, None),
+            Choice::Ambiguous,
+            "an incomplete one cannot, and guessing is how the value flips"
+        );
+    }
+
+    /// The same rule with nothing on either side of it. Two members holding no register is
+    /// not proof that nothing was chosen while a third is unreachable: the value can be
+    /// sitting on the member that did not answer, and reporting a hole would be an answer a
+    /// later round contradicts.
+    #[test]
+    fn nothing_chosen_needs_a_complete_view() {
+        assert_eq!(
+            choose(&[None, None, None], 0, 1, 2, Kind::Lww, None),
+            Choice::Ambiguous
+        );
+        assert_eq!(
+            choose(&[None, None, None], 0, 0, 2, Kind::Lww, None),
+            Choice::Missing,
+            "every member holding nothing is proof, and a cold page still reads"
+        );
+    }
+
+    /// A group of one has no quorum to be wrong about, so the rule must not strand it: with
+    /// `need` at one the only answer there is is the one it holds.
+    #[test]
+    fn a_lone_member_still_answers() {
+        let r = reg(4, 1, 0);
+        assert_eq!(
+            choose(&[r, None, None], 1, 2, 1, Kind::Lww, None),
+            Choice::Chosen(r.unwrap())
+        );
+    }
+
+    /// Two one-shots racing at one version, resolved by ballot once every member has been
+    /// heard from. The pair that carried is unknowable from the registers alone, so the
+    /// higher ballot wins and both are preserved as the same version.
+    #[test]
+    fn racing_proposals_at_one_version_resolve_by_ballot() {
+        let (lo, hi) = (reg(5, 1, 0), reg(5, 1, 2));
+        assert_eq!(
+            choose(&[lo, hi, lo], 3, 0, 2, Kind::Lww, None),
+            Choice::Chosen(lo.unwrap()),
+            "a quorum at one of them is still proof"
+        );
+        assert_eq!(
+            choose(&[lo, hi, None], 2, 1, 2, Kind::Lww, None),
+            Choice::Ambiguous,
+            "without it the missing member decides, and it is not here"
+        );
+    }
 }
 
 /// A model checker over the protocol itself.
@@ -3856,8 +4015,10 @@ mod model {
                     }
                     n.terms[by as usize].adopt(term);
                     // A member that did not answer and a member holding nothing look the
-                    // same in `regs`; `answered` is what tells them apart.
-                    let best = match choose(&regs, who.len(), NEED, KIND, None) {
+                    // same in `regs`; the counts either side of it tell them apart. A
+                    // member out of reach here answers nothing at all, so both are the
+                    // ones it could not reach.
+                    let best = match choose(&regs, who.len(), N - who.len(), NEED, KIND, None) {
                         Choice::Chosen(r) | Choice::Free(r) => r,
                         Choice::Ambiguous | Choice::Missing => return Some(n),
                     };
