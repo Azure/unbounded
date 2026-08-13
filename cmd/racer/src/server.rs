@@ -176,10 +176,10 @@ impl Node {
                 // The allocator loans free 4 MiB slots back through this from inside a
                 // reservation. Installed before any worker runs.
                 alloc.attach(cache);
-                let p = paxos::open(alloc, cache, cores);
+                let (p, terms) = paxos::open(alloc, cache, cores);
                 let _ = self.paxos.set(p);
                 let _ = self.heal.set(heal::open(p, cores));
-                c.core_state(CoreState::all(shards, slots));
+                c.core_state(CoreState::all(shards, slots, terms));
                 p
             }
         };
@@ -210,8 +210,8 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
     let (alloc, shards) = alloc::open(&store, disk, &cfg, cores)?;
     metrics::init(cores);
     let (cache, slots) = cache::open(alloc, &cfg, cores);
-    let paxos = paxos::open(alloc, cache, cores);
-    c.core_state(CoreState::all(shards, slots));
+    let (paxos, terms) = paxos::open(alloc, cache, cores);
+    c.core_state(CoreState::all(shards, slots, terms));
     Ok(Dataplane {
         roster: cache::Roster::of(&cfg),
         config: cfg,
@@ -227,26 +227,33 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
 /// other core may touch. Reached only through [`runtime::with_core`], and never swapped,
 /// so a reload replaces what a core reads and not what it owns.
 ///
-/// The subsystems are still moving in; what is here needs no lock, no atomic and no
-/// `unsafe impl Sync`, because a `&` to it is only ever handed out by the worker that
-/// owns it, for a transaction that cannot await.
+/// Nothing here needs a lock, an atomic or an `unsafe impl Sync`, because a `&` to it is
+/// only ever handed out by the worker that owns it, for a transaction that cannot await.
 pub struct CoreState {
     pub(crate) alloc: alloc::Row,
     pub(crate) cache: cache::Row,
+    pub(crate) paxos: paxos::Row,
     pub(crate) heal: heal::Core,
 }
 
 impl CoreState {
     /// One row per worker, in worker order, from the rows each subsystem built while it
     /// opened.
-    pub(crate) fn all(alloc: Vec<alloc::Row>, cache: Vec<cache::Row>) -> Vec<CoreState> {
+    pub(crate) fn all(
+        alloc: Vec<alloc::Row>,
+        cache: Vec<cache::Row>,
+        paxos: Vec<paxos::Row>,
+    ) -> Vec<CoreState> {
         assert_eq!(alloc.len(), cache.len(), "one row per worker from each");
+        assert_eq!(alloc.len(), paxos.len(), "one row per worker from each");
         alloc
             .into_iter()
             .zip(cache)
-            .map(|(alloc, cache)| CoreState {
+            .zip(paxos)
+            .map(|((alloc, cache), paxos)| CoreState {
                 alloc,
                 cache,
+                paxos,
                 heal: heal::Core::default(),
             })
             .collect()
