@@ -13,6 +13,7 @@ mod sys;
 mod ublk;
 mod worker;
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -240,12 +241,9 @@ pub trait Handler: Sync + 'static {
     /// State one worker owns outright, reachable only through [`with_core`].
     ///
     /// Unlike [`Handler::Config`] this is never swapped: a reload replaces what a core
-    /// reads, not the shards, slots and counters it owns.
+    /// reads, not the shards, slots and counters it owns. It reaches the runtime through
+    /// [`Configurator::core_state`], while the first configuration is being built.
     type CoreState: Send + 'static;
-
-    /// Build one row per worker. Called once, on the control thread, after the first
-    /// configuration is published and before any worker takes traffic.
-    fn core_state(&'static self, cfg: &Self::Config, cores: usize) -> Vec<Self::CoreState>;
 
     /// Serve one request. The returned future is stored in a preallocated slot, so it
     /// must be small; put cold paths behind `Box::pin(..).await`.
@@ -267,12 +265,11 @@ pub trait Handler: Sync + 'static {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CoreId(u16);
 
-// The subsystems still reach their rows through the ambient core; until they move behind
-// `with_core` the only consumer outside the runtime's own tests is the runtime itself.
-#[allow(dead_code)]
 impl CoreId {
     /// `None` if `i` is not a worker index. Callers derive `i` from an address or a
     /// consensus group, so this is the one place a mapping bug is caught.
+    // Dead alongside `with_core`: nothing has an owner to name yet.
+    #[allow(dead_code)]
     pub(crate) fn new(i: usize) -> Option<CoreId> {
         (i < cores()).then_some(CoreId(i as u16))
     }
@@ -289,13 +286,14 @@ impl CoreId {
 }
 
 /// The worker running this code.
+// Nothing outside the runtime's own tests needs to name the core it is already on: the
+// subsystems get theirs from the `CoreCtx` they are handed.
 #[allow(dead_code)]
 pub(crate) fn core_id() -> CoreId {
     CoreId::of(worker::core())
 }
 
 /// Workers in this runtime.
-#[allow(dead_code)]
 pub(crate) fn cores() -> usize {
     worker::cores()
 }
@@ -325,7 +323,6 @@ pub struct CoreCtx<'b, H: Handler> {
     _nosend: PhantomData<*const ()>,
 }
 
-#[allow(dead_code)]
 impl<'b, H: Handler> CoreCtx<'b, H> {
     pub(crate) fn new(core: CoreId, cfg: &'b H::Config, state: &'b H::CoreState) -> Self {
         CoreCtx {
@@ -359,6 +356,8 @@ impl<'b, H: Handler> CoreCtx<'b, H> {
 /// destination's ring and runs during its next drain, with no task-slab slot.
 ///
 /// Dropping the returned future abandons the reply; a transaction already sent still runs.
+// Dead until the allocator and consensus rows move behind it: what a core owns today is
+// still reachable from every core, so nothing yet has to ask.
 #[allow(dead_code)]
 pub(crate) fn with_core<H, F, T>(dst: CoreId, f: F) -> impl Future<Output = T>
 where
@@ -367,6 +366,18 @@ where
     T: Send + 'static,
 {
     hop::Call::<H, F, T>::new(dst.index(), f)
+}
+
+/// Run `f` against this worker's own state.
+///
+/// [`with_core`] for the core already running, without the future: for synchronous code
+/// that only ever touches what is in front of it, and for the frames of an async one that
+/// are between awaits. Same rule, and the reason it needs no guard: `f` cannot await.
+pub(crate) fn here<H, T>(f: impl FnOnce(CoreCtx<'_, H>) -> T) -> T
+where
+    H: Handler,
+{
+    worker::with_core_ctx::<H, T>(f)
 }
 
 /// Run `f` on `core` and await its result there.
@@ -488,6 +499,9 @@ struct Core {
     new_files: Vec<(u32, RawFd)>,
     new_devs: Vec<u16>,
     declared_vols: Vec<u64>,
+    /// Rows waiting to be handed to the workers, still owned so a failed build drops
+    /// them. Erased here, and cast back against `H::CoreState` on the way out.
+    core_state: Option<Box<dyn Any + Send>>,
 }
 
 impl Core {
@@ -516,6 +530,7 @@ impl Configurator {
                 new_files: Vec::new(),
                 new_devs: Vec::new(),
                 declared_vols: Vec::new(),
+                core_state: None,
             }),
         }
     }
@@ -525,6 +540,34 @@ impl Configurator {
     /// Number of workers; configs are built on the control thread, where `core()` panics.
     pub(crate) fn cores(&self) -> usize {
         self.core.borrow().workers.len()
+    }
+
+    /// Hand over the state each worker will own, one row per worker in worker order.
+    ///
+    /// Offered here rather than derived from the configuration because a row is a cost of
+    /// opening: a shard comes off the startup scan and nothing later can recover it. The
+    /// runtime installs the rows once the configuration behind them is live, and before
+    /// any worker takes traffic. A reload opens nothing, so it offers nothing, and a core
+    /// keeps what it owns across one.
+    pub(crate) fn core_state<S: Send + 'static>(&self, rows: Vec<S>) {
+        let mut c = self.core.borrow_mut();
+        assert_eq!(rows.len(), c.workers.len(), "one core state row per worker");
+        assert!(c.core_state.is_none(), "core state offered twice");
+        c.core_state = Some(Box::new(rows));
+    }
+
+    /// Take back what a build offered. The simulator installs its own workers, so it
+    /// drains the rows here rather than through `reconcile`.
+    #[cfg(feature = "sim")]
+    pub(crate) fn take_core_state<S: Send + 'static>(&self) -> Vec<S> {
+        *self
+            .core
+            .borrow_mut()
+            .core_state
+            .take()
+            .expect("core state is offered while opening")
+            .downcast::<Vec<S>>()
+            .expect("core state rows are the handler's own")
     }
 
     /// A file or block device this node reads and writes directly.
@@ -822,16 +865,26 @@ impl Hub {
     }
 }
 
-/// Builds one leaked per-core state row per worker, erased so `Ctx` stays free of `H`.
-type CoreStateFn<C> = Box<dyn FnOnce(&C, usize) -> Vec<*const ()> + Send>;
+/// Leaks one per-core state row per worker, checking on the way that the rows offered to
+/// a configurator are the ones this handler will read back.
+type CoreStateFn = fn(Box<dyn Any + Send>) -> Vec<*const ()>;
+
+fn leak_core_state<S: Send + 'static>(rows: Box<dyn Any + Send>) -> Vec<*const ()> {
+    // Leaked: a worker holds its row for the life of the process.
+    rows.downcast::<Vec<S>>()
+        .expect("core state rows are the handler's own")
+        .into_iter()
+        .map(|s| Box::into_raw(Box::new(s)) as *const ())
+        .collect()
+}
 
 struct Ctx<C> {
     cfgr: Configurator,
     hub: Hub,
     versions: VecDeque<Version<C>>,
     next_ver: u32,
-    /// Taken on first use: core state is installed once and never swapped.
-    core_state: Option<CoreStateFn<C>>,
+    /// Erased so `Ctx` stays free of `H`; the cast back happens here and nowhere else.
+    core_state: CoreStateFn,
 }
 
 type Job<C> = Box<dyn FnOnce(&mut Ctx<C>) + Send>;
@@ -1012,6 +1065,7 @@ fn boot<H: Handler>(handler: &'static H) -> std::io::Result<Runtime<H::Config>> 
         new_files: Vec::new(),
         new_devs: Vec::new(),
         declared_vols: Vec::new(),
+        core_state: None,
     };
     // `Ctx` is built on the control thread: `H::Config` is only `Sync`, never `Send`.
     let control = std::thread::Builder::new()
@@ -1028,14 +1082,7 @@ fn boot<H: Handler>(handler: &'static H) -> std::io::Result<Runtime<H::Config>> 
                 hub: Hub { inboxes, doorbell },
                 versions: VecDeque::new(),
                 next_ver: 1,
-                core_state: Some(Box::new(move |cfg: &H::Config, n: usize| {
-                    let rows = handler.core_state(cfg, n);
-                    assert_eq!(rows.len(), n, "one core state row per worker");
-                    // Leaked: a worker holds its row for the life of the process.
-                    rows.into_iter()
-                        .map(|s| Box::into_raw(Box::new(s)) as *const ())
-                        .collect()
-                })),
+                core_state: leak_core_state::<H::CoreState>,
             };
             // `stop` posts teardown before dropping the sender, so it has run by loop exit.
             while let Ok(job) = rx.recv() {
@@ -1109,9 +1156,11 @@ where
         ack,
     });
 
-    // 4b. Core state: built once, from the first configuration, and never swapped.
-    if let Some(build) = ctx.core_state.take() {
-        let rows = build(&cfg, ctx.hub.inboxes.len());
+    // 4b. Core state, if this build offered any: installed under a live configuration,
+    // because a core reads its row through the same transaction that reads one.
+    let offered = ctx.cfgr.core.borrow_mut().core_state.take();
+    if let Some(rows) = offered {
+        let rows = (ctx.core_state)(rows);
         ctx.hub
             .broadcast(|i, ack| Ctl::InstallCoreState { ptr: rows[i], ack });
     }
@@ -1156,6 +1205,7 @@ where
 /// Undo a failed build: close the fds it opened and delete the devices it created.
 fn rollback<C>(ctx: &mut Ctx<C>) {
     let mut c = ctx.cfgr.core.borrow_mut();
+    c.core_state = None;
     let new_files = std::mem::take(&mut c.new_files);
     for (slot, _) in new_files {
         c.file_used[slot as usize] = false;
@@ -1285,6 +1335,16 @@ mod tests {
         map: std::cell::RefCell<std::collections::HashMap<u64, u64>>,
     }
 
+    /// Hand each worker its shard. Offered while the first configuration is built; a
+    /// reload keeps what a core owns, so it offers nothing.
+    fn shards(c: &Configurator) {
+        c.core_state(
+            (0..c.cores())
+                .map(|_| Blocks::default())
+                .collect::<Vec<_>>(),
+        );
+    }
+
     static HANDLER: Passthrough = Passthrough;
     static TICKS: AtomicU64 = AtomicU64::new(0);
     /// One bit per worker, so a test can tell "some core ticked" from "every core did".
@@ -1295,10 +1355,6 @@ mod tests {
     impl Handler for Passthrough {
         type Config = Conf;
         type CoreState = Blocks;
-
-        fn core_state(&'static self, _cfg: &Conf, cores: usize) -> Vec<Blocks> {
-            (0..cores).map(|_| Blocks::default()).collect()
-        }
 
         async fn handle(&'static self, cfg: Cfg<Conf>, req: Request) -> Result<(), Errno> {
             let lba = req.lba;
@@ -1389,6 +1445,7 @@ mod tests {
         let found = Arc::new(Mutex::new(None));
         let out = found.clone();
         rt.reload(move |c| {
+            shards(c);
             let dev = c.device(1, MINOR, 32 << 20, Class::Small)?;
             *out.lock().unwrap() = Some(dev.path().to_path_buf());
             Ok(Conf {
@@ -1571,6 +1628,7 @@ mod tests {
         let rt = start(&HANDLER).expect("start");
         let path = backing.clone();
         rt.reload(move |c| {
+            shards(c);
             Ok(Conf {
                 store: c.disk(&path, None, None)?,
                 cores: c.cores(),

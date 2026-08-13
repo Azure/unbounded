@@ -1518,10 +1518,6 @@ mod tests {
         type Config = Dataplane;
         type CoreState = server::CoreState;
 
-        fn core_state(&'static self, cfg: &Dataplane, cores: usize) -> Vec<server::CoreState> {
-            server::SERVER.core_state(cfg, cores)
-        }
-
         async fn handle(&'static self, _cfg: Cfg<Dataplane>, _req: Request) -> Result<(), Errno> {
             Err(Errno::EOPNOTSUPP)
         }

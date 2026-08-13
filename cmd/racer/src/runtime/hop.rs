@@ -610,6 +610,7 @@ impl<F, Fut, T> Drop for Hop<F, Fut, T> {
 ///
 /// # Safety
 /// `msg` must have been built by [`Call::poll`] for this same `H`, `F` and `T`.
+// Dead alongside `with_core`, which is its only caller.
 #[allow(dead_code)]
 unsafe fn sync_trampoline<H, F, T>(msg: &mut Msg)
 where
@@ -622,6 +623,7 @@ where
     reply(src, cell, worker::with_core_ctx::<H, T>(f));
 }
 
+#[allow(dead_code)]
 enum CallStage<F> {
     Init(F),
     Sent,
@@ -632,6 +634,7 @@ enum CallStage<F> {
 ///
 /// Dropping it discards the value. On this core the transaction never started; on another
 /// it has already run, because a transaction is not interruptible once sent.
+#[allow(dead_code)]
 pub(super) struct Call<H, F, T> {
     dst: usize,
     cell: u32,

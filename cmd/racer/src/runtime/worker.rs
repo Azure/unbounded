@@ -297,16 +297,10 @@ pub(crate) fn core() -> usize {
 }
 
 /// Workers in this runtime.
-#[allow(dead_code)]
 pub(crate) fn cores() -> usize {
     with_local(|l| l.fabric.cores())
 }
 
-/// Build this worker's [`CoreCtx`] and run `f` under it.
-///
-/// Synchronous by construction: `f` cannot await, so the worker cannot process a `Retire`
-/// while it runs and neither pointer can be pulled out from under it. That is why a core
-/// transaction needs no configuration guard.
 /// The configuration this worker is running under, pinned until the guard is dropped.
 ///
 /// For code that is already on a worker but was not handed one: a hop closure runs on the
@@ -316,7 +310,11 @@ pub(super) fn config<C>() -> Cfg<C> {
     with_local(|l| l.cfg::<C>())
 }
 
-#[allow(dead_code)]
+/// Build this worker's [`CoreCtx`] and run `f` under it.
+///
+/// Synchronous by construction: `f` cannot await, so the worker cannot process a `Retire`
+/// while it runs and neither pointer can be pulled out from under it. That is why a core
+/// transaction needs no configuration guard.
 pub(super) fn with_core_ctx<H: Handler, R>(f: impl FnOnce(CoreCtx<'_, H>) -> R) -> R {
     with_local(|l| {
         let cfg = l.cfg_ptr.get();
