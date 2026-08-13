@@ -43,9 +43,9 @@ func (Component) Name() string { return "net" }
 // ConditionType implements component.ClusterComponent.
 func (Component) ConditionType() string { return "NetReady" }
 
-// Reconcile deploys the unbounded-net cluster singleton whenever at least one
-// Site exists and keeps an existing installation reconciled with no Sites.
-func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
+// Plan deploys the unbounded-net cluster singleton whenever at least one Site
+// exists and keeps an existing installation reconciled with no Sites.
+func (c Component) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	if len(sites) == 0 {
 		// Net is the cluster dataplane. Do not auto-delete it just because the
 		// last Site was removed; deleting net-node can break pod networking
@@ -53,30 +53,67 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		// handle removal.
 		retained, err := resourcesExist(ctx, env)
 		if err != nil {
-			return component.Failed(err)
+			return nil, component.Result{}, err
 		}
 
 		if !retained {
-			return component.NoSites("no sites; net retained")
+			return nil, component.NoSites("no sites; net retained"), nil
 		}
 	}
 
-	configHash, err := ensureConfig(ctx, env)
+	configHash, configOp, err := planConfig(ctx, env)
 	if err != nil {
-		return component.Failed(err)
+		return nil, component.Result{}, err
 	}
 
-	if err := env.ApplyManifestFS(ctx, netmanifests.Manifests, applyMutator(env.Config, configHash)); err != nil {
-		return component.Failed(err)
+	objects, err := env.DecodeManifestFS(netmanifests.Manifests, applyMutator(env.Config, configHash))
+	if err != nil {
+		return nil, component.Result{}, err
 	}
 
-	return component.Reconciled()
+	plan := component.NewPlan()
+
+	// The config is written before the workloads that carry its hash, so a
+	// failure to write it does not leave a pod unable to mount.
+	var dependsOn []component.ObjectRef
+
+	if configOp != nil {
+		plan.Add(*configOp)
+
+		dependsOn = []component.ObjectRef{configOp.Ref()}
+	}
+
+	for _, obj := range objects {
+		op := component.Operation{
+			Kind:      component.OpApply,
+			Object:    obj,
+			Component: c.Name(),
+		}
+
+		if isManagedWorkload(obj) {
+			op.Overridable = true
+			op.DependsOn = dependsOn
+		}
+
+		plan.Add(op)
+	}
+
+	return plan, component.Reconciled(), nil
+}
+
+// isManagedWorkload reports whether obj is one of the two workloads net owns.
+func isManagedWorkload(obj *unstructured.Unstructured) bool {
+	return (obj.GetKind() == "Deployment" && obj.GetName() == controllerName) ||
+		(obj.GetKind() == "DaemonSet" && obj.GetName() == nodeName)
 }
 
 // SetupWatches reconciles net on changes to its config payload and on
 // create/delete/generation changes of its managed workloads.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
-	b.Watches(&corev1.ConfigMap{}, env.RequestSingletonAndAllSites(),
+	// The singleton request already fans out to every Site, so enqueuing
+	// the Sites as well would run one redundant pass per Site for a single
+	// ConfigMap edit.
+	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName))))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
@@ -151,37 +188,37 @@ func applyMutator(cfg component.Config, configHash string) func(*unstructured.Un
 	}
 }
 
-// ensureConfig creates the embedded default only when no config exists. Existing
-// migrated or user-managed payloads are never applied over.
-func ensureConfig(ctx context.Context, env *component.Env) (string, error) {
+// planConfig hashes the net config payload and, when no config exists, returns
+// the operation that creates the embedded default. Existing migrated or
+// user-managed payloads are never applied over, so the returned operation is
+// create-if-absent rather than an apply.
+//
+// The hash is computed here, at plan time, from either the observed payload or
+// the default about to be created. If another writer creates a different
+// payload between planning and execution, the workloads briefly carry a hash
+// for content that is not there; the config watch fires on that create and the
+// next pass corrects it.
+func planConfig(ctx context.Context, env *component.Env) (string, *component.Operation, error) {
 	key := client.ObjectKey{Namespace: env.Namespace, Name: configName}
 	existing := &corev1.ConfigMap{}
 
 	err := env.Client.Get(ctx, key, existing)
 	if err == nil {
-		return component.ConfigMapPayloadHash(existing), nil
+		return component.ConfigMapPayloadHash(existing), nil, nil
 	}
 
 	if !apierrors.IsNotFound(err) {
-		return "", fmt.Errorf("get net config %s/%s: %w", key.Namespace, key.Name, err)
+		return "", nil, fmt.Errorf("get net config %s/%s: %w", key.Namespace, key.Name, err)
 	}
 
 	desired, err := env.DefaultConfigMap(netmanifests.Manifests, configName, "net")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	if err := env.Client.Create(ctx, desired); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return "", fmt.Errorf("create net config %s/%s: %w", key.Namespace, key.Name, err)
-		}
-
-		if err := env.Client.Get(ctx, key, existing); err != nil {
-			return "", fmt.Errorf("get raced net config %s/%s: %w", key.Namespace, key.Name, err)
-		}
-
-		return component.ConfigMapPayloadHash(existing), nil
-	}
-
-	return component.ConfigMapPayloadHash(desired), nil
+	return component.ConfigMapPayloadHash(desired), &component.Operation{
+		Kind:      component.OpCreateIfAbsent,
+		Object:    component.ToUnstructured(desired),
+		Component: Component{}.Name(),
+	}, nil
 }

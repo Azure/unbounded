@@ -86,6 +86,7 @@ func (t operatorTransport) allocate(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return jsonResponse(req, status, map[string]string{"error": err.Error()})
 	}
+
 	return jsonResponse(req, status, allocResp)
 }
 
@@ -152,6 +153,7 @@ func TestPlaypenBasicLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocate playpen: %v", err)
 	}
+
 	t.Cleanup(func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer closeCancel()
@@ -602,6 +604,7 @@ func (h *harness) verifyTunnelInterfaces(ctx context.Context, allocated *playpen
 	}
 
 	guestGateway := guestGatewayPrefix(h.t, allocated.Metadata.Network)
+
 	vxlanAddr, err := h.runPlaypenOut(ctx, allocated, "ip", "addr", "show", "dev", cfg.VXLANInterface)
 	if err != nil {
 		h.t.Fatalf("show vxlan address for %s: %v", cfg.VXLANInterface, err)
@@ -612,6 +615,7 @@ func (h *harness) verifyTunnelInterfaces(ctx context.Context, allocated *playpen
 	}
 
 	guestSubnet := guestSubnetCIDR(h.t, allocated.Metadata.Network)
+
 	natRules, err := h.runPlaypenOut(ctx, allocated, "iptables", "-t", "nat", "-S", "POSTROUTING")
 	if err != nil {
 		h.t.Fatalf("show playpen namespace NAT rules: %v", err)
@@ -676,6 +680,7 @@ func (h *harness) verifyTunnelConnectivity(ctx context.Context, allocated *playp
 		}
 
 		cmd.Dir = h.repoRoot
+
 		cmd.Env = append(
 			os.Environ(),
 			"PLAYPEN_REDFISH_PROBE_URL="+readyURL,
@@ -740,6 +745,7 @@ func (h *harness) dumpTunnelDiagnostics(ctx context.Context, allocated *playpenc
 
 func TestPlaypenRedfishReadyProbe(t *testing.T) {
 	readyURL := os.Getenv("PLAYPEN_REDFISH_PROBE_URL")
+
 	certPEM := os.Getenv("PLAYPEN_REDFISH_PROBE_CERT_PEM")
 	if readyURL == "" && certPEM == "" {
 		t.Skip("helper process only")
@@ -770,6 +776,7 @@ func TestPlaypenRedfishReadyProbe(t *testing.T) {
 	defer resp.Body.Close() //nolint:errcheck // Test cleanup only.
 
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck // Test response drain only.
+
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
@@ -828,6 +835,7 @@ func (h *harness) runPlaypenCmdOut(cmd *exec.Cmd) (string, error) {
 	h.t.Helper()
 
 	var out bytes.Buffer
+
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 

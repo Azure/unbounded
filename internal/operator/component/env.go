@@ -36,6 +36,10 @@ const (
 	// them during reconcile.
 	CRDKind = "CustomResourceDefinition"
 
+	// NamespaceKind is the Kind of a Namespace object in the embedded
+	// component manifests. Components never write it; see NamespaceOperation.
+	NamespaceKind = "Namespace"
+
 	// SiteLabelKey is the canonical node label for site membership
 	// (unbounded-cloud.io/site). Per-site components node-select on it.
 	SiteLabelKey = unboundedv1alpha3.MachineSiteLabelKey
@@ -169,38 +173,48 @@ type Env struct {
 	Config    Config
 }
 
-// ApplyManifestFS server-side applies every YAML object in the manifest
-// filesystem, running mutate on each decoded object first. A mutate that nils
-// out obj.Object skips that object.
-func (e *Env) ApplyManifestFS(ctx context.Context, manifests fs.FS, mutate func(*unstructured.Unstructured) error) error {
+// DecodeManifestFS decodes every YAML object in the manifest filesystem,
+// running mutate on each decoded object and then retargeting its namespace. A
+// mutate that nils out obj.Object drops that object.
+//
+// It performs no writes. Components use it while planning, so a pass can decide
+// everything it intends to do before anything is written.
+func (e *Env) DecodeManifestFS(manifests fs.FS, mutate func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, error) {
 	files, err := YamlFiles(manifests)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return e.ApplyManifestFiles(ctx, manifests, files, mutate)
+	return e.DecodeManifestFiles(manifests, files, mutate)
 }
 
-// ApplyManifestFiles applies a specific list of YAML manifest files from the
-// filesystem. Callers use it to apply a curated subset (for example excluding an
-// examples/ subtree that YamlFiles would otherwise include).
-func (e *Env) ApplyManifestFiles(ctx context.Context, manifests fs.FS, files []string, mutate func(*unstructured.Unstructured) error) error {
+// DecodeManifestFiles decodes a specific list of YAML manifest files. Callers
+// use it for a curated subset, for example excluding an examples/ subtree that
+// YamlFiles would otherwise include.
+func (e *Env) DecodeManifestFiles(manifests fs.FS, files []string, mutate func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, error) {
+	var objects []*unstructured.Unstructured
+
 	for _, file := range files {
 		data, err := fs.ReadFile(manifests, file)
 		if err != nil {
-			return fmt.Errorf("read manifest %s: %w", file, err)
+			return nil, fmt.Errorf("read manifest %s: %w", file, err)
 		}
 
-		if err := e.applyManifestData(ctx, data, mutate); err != nil {
-			return fmt.Errorf("apply manifest %s: %w", file, err)
+		decoded, err := e.decodeManifestData(data, mutate)
+		if err != nil {
+			return nil, fmt.Errorf("decode manifest %s: %w", file, err)
 		}
+
+		objects = append(objects, decoded...)
 	}
 
-	return nil
+	return objects, nil
 }
 
-func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*unstructured.Unstructured) error) error {
+func (e *Env) decodeManifestData(data []byte, mutate func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, error) {
 	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+
+	var objects []*unstructured.Unstructured
 
 	for {
 		obj := &unstructured.Unstructured{}
@@ -209,7 +223,7 @@ func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*u
 				break
 			}
 
-			return fmt.Errorf("decode resource: %w", err)
+			return nil, fmt.Errorf("decode resource: %w", err)
 		}
 
 		if obj.Object == nil {
@@ -218,7 +232,7 @@ func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*u
 
 		if mutate != nil {
 			if err := mutate(obj); err != nil {
-				return err
+				return nil, err
 			}
 		}
 
@@ -226,14 +240,51 @@ func (e *Env) applyManifestData(ctx context.Context, data []byte, mutate func(*u
 			continue
 		}
 
+		// Every component's manifests carry the Namespace, because each set is
+		// also installable on its own with kubectl. Letting each component
+		// apply it made them fight: net labels it app.kubernetes.io/name=
+		// unbounded-net and gantry labels it gantry, both under the same field
+		// owner, so the label flipped on every pass depending on which
+		// component was planned last. The namespace has one owner instead, and
+		// dropping it here rather than in each mutator means a component
+		// cannot opt back into the fight by accident.
+		if obj.GetKind() == NamespaceKind {
+			continue
+		}
+
 		e.RetargetNamespace(obj)
 
-		if err := e.ApplyObject(ctx, obj); err != nil {
-			return err
-		}
+		objects = append(objects, obj)
 	}
 
-	return nil
+	return objects, nil
+}
+
+// ApplyOperations wraps decoded objects as apply operations attributed to a
+// component and Site. Site is empty for cluster-scoped components.
+func ApplyOperations(objects []*unstructured.Unstructured, componentName, site string) []Operation {
+	ops := make([]Operation, 0, len(objects))
+
+	for _, obj := range objects {
+		ops = append(ops, Operation{
+			Kind:      OpApply,
+			Object:    obj,
+			Component: componentName,
+			Site:      site,
+		})
+	}
+
+	return ops
+}
+
+// DeleteOperation builds a delete operation for a typed object.
+func DeleteOperation(obj client.Object, componentName, site string) Operation {
+	return Operation{
+		Kind:      OpDelete,
+		Object:    ToUnstructured(obj),
+		Component: componentName,
+		Site:      site,
+	}
 }
 
 // ApplyObject server-side applies a single object with the operator field owner.
@@ -247,6 +298,18 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 }
 
 // ListSites returns every Site in the cluster.
+//
+// This is an unscoped list, and it has to be: every pass fans out over the
+// result, and a component decides whether it is enabled by inspecting it.
+//
+// It is correct only because Site is cluster-scoped. The operator runs with its
+// cache scoped to its own namespace, and controller-runtime's multi-namespace
+// cache routes cluster-scoped kinds to a separate cluster-wide cache. Were Site
+// ever made namespaced, this same call would return only the Sites in the
+// operator's namespace and would report no error at all: every other Site would
+// silently lose its per-Site workloads, and the cluster components would
+// conclude they were disabled. TestSiteMustBeClusterScopedForTheScopedCache
+// pins that invariant to this call site.
 func (e *Env) ListSites(ctx context.Context) ([]unboundedv1alpha3.Site, error) {
 	var sites unboundedv1alpha3.SiteList
 	if err := e.Client.List(ctx, &sites); err != nil {

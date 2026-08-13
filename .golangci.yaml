@@ -2,6 +2,7 @@ version: "2"
 run:
   # Lint code behind all build tags used as well.
   build-tags:
+    - e2e
     - int
     - integrationtest
     - storageboundary

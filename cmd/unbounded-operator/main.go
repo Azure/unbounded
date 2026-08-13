@@ -23,6 +23,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -181,7 +182,26 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:                        scheme,
+		Scheme: scheme,
+
+		// Scope the cache to the operator's own namespace.
+		//
+		// The controller watches ConfigMaps, Deployments and DaemonSets, and an
+		// unscoped cache means an informer over every one of those in every
+		// namespace in the cluster. ConfigMaps are the worst of it: every
+		// namespace has a kube-root-ca.crt, and clusters routinely hold
+		// thousands more from Helm and other operators. None of it is ever
+		// read. Everything this operator reconciles lives in one namespace.
+		//
+		// DefaultNamespaces applies only to namespaced kinds, so Sites, Nodes
+		// and CRDs stay cluster-wide, which is what they have to be. The one
+		// component that legitimately reads other namespaces is the legacy
+		// reaper, and it already goes through APIReader precisely because those
+		// reads must bypass the cache.
+		Cache: cache.Options{
+			DefaultNamespaces: map[string]cache.Config{namespace: {}},
+		},
+
 		Metrics:                       metricsserver.Options{BindAddress: cfg.metricsAddr},
 		HealthProbeBindAddress:        cfg.probeAddr,
 		LeaderElection:                cfg.leaderElection,
@@ -202,6 +222,7 @@ func run(ctx context.Context, cfg config) error {
 		Scheme:    scheme,
 		Namespace: namespace,
 		Registry:  operator.DefaultRegistry(),
+		Recorder:  mgr.GetEventRecorder("unbounded-operator"),
 		Config: operator.Config{
 			ImageRegistry:     cfg.imageRegistry,
 			ImageTag:          version.Version,

@@ -40,7 +40,7 @@ func testEnv(t *testing.T, objects ...client.Object) *component.Env {
 func TestEnsureConfigCreatesDefaultOnlyWhenAbsent(t *testing.T) {
 	env := testEnv(t)
 
-	hash, err := ensureConfig(t.Context(), env)
+	hash, err := ensureConfig(t, env)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestEnsureConfigPreservesExistingPayload(t *testing.T) {
 	}
 	env := testEnv(t, existing)
 
-	hash, err := ensureConfig(t.Context(), env)
+	hash, err := ensureConfig(t, env)
 	if err != nil {
 		t.Fatalf("ensureConfig: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestReconcileRetainedWithNoSites(t *testing.T) {
 	}
 	env, appliedHashes := retainedEnv(t, config)
 
-	res := Component{}.Reconcile(t.Context(), env, nil)
+	res := reconcile(t, env, nil)
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
@@ -180,7 +180,7 @@ func TestReconcileRecreatesDeletedRetainedConfigWithNoSites(t *testing.T) {
 	}}
 	env, appliedHashes := retainedEnv(t, retained)
 
-	res := Component{}.Reconcile(t.Context(), env, nil)
+	res := reconcile(t, env, nil)
 	if !res.Ready || res.Err != nil {
 		t.Fatalf("Reconcile = %+v, want ready", res)
 	}
@@ -201,7 +201,7 @@ func TestReconcileRecreatesDeletedRetainedConfigWithNoSites(t *testing.T) {
 func TestReconcileDoesNotCreateFromNothingWithNoSites(t *testing.T) {
 	env, appliedHashes := retainedEnv(t)
 
-	res := Component{}.Reconcile(t.Context(), env, nil)
+	res := reconcile(t, env, nil)
 	if !res.Ready || res.Reason != component.ReasonNoSites {
 		t.Fatalf("Reconcile = %+v, want ready with NoSites", res)
 	}
@@ -259,4 +259,164 @@ func retainedEnv(t *testing.T, objects ...client.Object) (*component.Env, map[st
 		Build()
 
 	return &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}, appliedHashes
+}
+
+// ensureConfig plans and executes the net config operation, mirroring what the
+// reconciler does so these tests exercise the production path.
+func ensureConfig(t *testing.T, env *component.Env) (string, error) {
+	t.Helper()
+
+	hash, op, err := planConfig(t.Context(), env)
+	if err != nil {
+		return "", err
+	}
+
+	if op == nil {
+		return hash, nil
+	}
+
+	plan := component.NewPlan()
+	plan.Add(*op)
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return "", err
+	}
+
+	return hash, exec.Err()
+}
+
+// reconcile plans and executes the component, mirroring the reconciler.
+func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site) component.Result {
+	t.Helper()
+
+	c := Component{}
+
+	plan, res, err := c.Plan(t.Context(), env, sites)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	exec, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		return component.Failed(err)
+	}
+
+	// net is a cluster component and plans no per-Site operations, so there is
+	// no Site to attribute results to.
+	return component.CombineResult(c.Name(), "", res, exec)
+}
+
+// TestPlanGolden pins the complete set of operations the net component plans.
+//
+// Net is the cluster dataplane and applies the largest object set of any
+// component, including the ValidatingAdmissionPolicy that restricts what its
+// own ServiceAccount may create. The reaper gates its migration on the
+// config-hash annotation the two workloads carry
+// (internal/operator/migrate.go), so an object or annotation silently
+// appearing, disappearing or being renamed here breaks the upgrade path.
+//
+// Both workloads depend on the config, so a failure to write the ConfigMap
+// skips them rather than rolling pods that cannot mount it.
+func TestPlanGolden(t *testing.T) {
+	env := testEnv(t)
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{site})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if !res.Ready {
+		t.Fatalf("result = %+v, want ready", res)
+	}
+
+	want := `CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
+Apply ServiceAccount/unbounded-system/unbounded-net-controller
+Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
+Apply ClusterRole/unbounded-net-controller
+Apply ClusterRoleBinding/unbounded-net-kube-proxy
+Apply ClusterRoleBinding/unbounded-net-controller
+Apply Role/unbounded-system/unbounded-net-controller
+Apply RoleBinding/unbounded-system/unbounded-net-controller
+Apply Role/kube-system/unbounded-net-controller
+Apply RoleBinding/kube-system/unbounded-net-controller
+Apply Deployment/unbounded-system/unbounded-net-controller [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
+Apply Service/unbounded-system/unbounded-net-controller
+Apply ValidatingWebhookConfiguration/unbounded-net-validating-webhook
+Apply APIService/v1alpha1.status.net.unbounded-cloud.io
+Apply MutatingWebhookConfiguration/unbounded-net-mutating-webhook
+Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ClusterRole/unbounded-net-status-viewer
+Apply ServiceAccount/unbounded-system/unbounded-net-node
+Apply ClusterRole/unbounded-net-node
+Apply ClusterRoleBinding/unbounded-net-node
+Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
+`
+
+	if got := plan.Summary(); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestExecutionOrderGolden pins the order the executor runs net's plan in, as
+// distinct from the order the component emits it.
+//
+// Summary, which TestPlanGolden asserts on, renders emission order. The
+// executor sorts a copy, so for a long time nothing pinned what the cluster
+// actually sees, and execution order was changed twice without a single test
+// noticing.
+//
+// Two properties here are load-bearing rather than incidental. The ConfigMap
+// and Service precede both workloads, because pods mount one and resolve the
+// other. Admission registration and the APIService come last, because each
+// points at the controller Deployment: registering a failurePolicy: Ignore
+// webhook before its backend exists is a window in which it silently enforces
+// nothing.
+func TestExecutionOrderGolden(t *testing.T) {
+	env := testEnv(t)
+	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}}
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{site})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	want := `Apply ServiceAccount/unbounded-system/unbounded-net-controller
+Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
+Apply ClusterRole/unbounded-net-controller
+Apply ClusterRoleBinding/unbounded-net-kube-proxy
+Apply ClusterRoleBinding/unbounded-net-controller
+Apply Role/unbounded-system/unbounded-net-controller
+Apply RoleBinding/unbounded-system/unbounded-net-controller
+Apply Role/kube-system/unbounded-net-controller
+Apply RoleBinding/kube-system/unbounded-net-controller
+Apply ClusterRole/unbounded-net-status-viewer
+Apply ServiceAccount/unbounded-system/unbounded-net-node
+Apply ClusterRole/unbounded-net-node
+Apply ClusterRoleBinding/unbounded-net-node
+CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
+Apply Service/unbounded-system/unbounded-net-controller
+Apply Deployment/unbounded-system/unbounded-net-controller
+Apply DaemonSet/unbounded-system/unbounded-net-node
+Apply ValidatingWebhookConfiguration/unbounded-net-validating-webhook
+Apply APIService/v1alpha1.status.net.unbounded-cloud.io
+Apply MutatingWebhookConfiguration/unbounded-net-mutating-webhook
+Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+`
+
+	got, err := plan.ExecutionOrder()
+	if err != nil {
+		t.Fatalf("ExecutionOrder: %v", err)
+	}
+
+	if got != want {
+		t.Fatalf("execution order =\n%s\nwant\n%s", got, want)
+	}
 }

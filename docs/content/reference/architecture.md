@@ -190,6 +190,11 @@ bootstrap token). The operator then reconciles component workloads from each
 or Kustomize) that the operator renders and applies; they are not meant to be
 applied by hand.
 
+To customize the generated Deployments and DaemonSets, use
+[workload overrides]({{< relref "reference/workload-overrides" >}}) rather than
+editing them directly: the operator applies with server-side apply and reclaims
+every field it declares on the next reconcile.
+
 | Directory | Contents |
 |-----------|----------|
 | `deploy/machina/crd/` | `Machine` CRD definition. |

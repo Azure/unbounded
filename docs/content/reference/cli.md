@@ -441,6 +441,37 @@ These commands do not create `MachineOperation` resources.
 
 ---
 
+### `kubectl unbounded overrides`
+
+Inspect the component workload overrides the operator reads from the
+`unbounded-component-overrides` ConfigMap. See
+**[Workload Overrides]({{< relref "reference/workload-overrides" >}})** for the
+document format and the security model.
+
+| Command | Description |
+|----------|-------------|
+| `overrides validate [-f FILE]` | Check syntax, schema, and the allowlist. The checks are offline, so their answer is correct regardless of which operator version is running; they deliberately do not resolve container or volume names, which depend on the workloads the operator renders. With no `-f` it reads the live ConfigMap, so the default invocation needs a cluster. |
+| `overrides list` | Show the entries the ConfigMap declares, warn about Site names that match no Site, and report any validation failure. |
+| `overrides status` | Show what the operator actually applied, including any container image drift. Reads persisted state only; performs no rendering or hashing of its own. Exits non-zero when any Site reports overrides `Degraded`, so it can gate a post-apply check. |
+
+#### Optional Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `-f`, `--filename` | string | `validate` only. Document to check, or `-` for standard input. Repeatable. Accepts a bare overrides document or the ConfigMap manifest you would apply. |
+| `--namespace` | string | Namespace holding the overrides ConfigMap. Defaults to `unbounded-system`; pass it if the operator is installed elsewhere. |
+| `--kubeconfig` | string | Path to kubeconfig file. |
+
+```bash
+# Check a document before applying it.
+kubectl unbounded overrides validate -f overrides.yaml
+
+# Confirm the operator resolved and applied it.
+kubectl unbounded overrides status
+```
+
+---
+
 ## Environment Variables
 
 | Variable | Description |
@@ -453,5 +484,7 @@ These commands do not create `MachineOperation` resources.
   through `site init` and `machine register` step by step.
 - **[SSH Guide]({{< relref "guides/ssh" >}})** -- Detailed SSH provisioning
   walkthrough with examples.
+- **[Workload Overrides]({{< relref "reference/workload-overrides" >}})** --
+  Customizing the Deployments and DaemonSets the operator generates.
 - **[CRD Reference]({{< relref "reference/machina-crd" >}})** -- Full Machine
   and Image API specification.

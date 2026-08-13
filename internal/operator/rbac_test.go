@@ -4,6 +4,7 @@
 package operator
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +16,9 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	runtimeutil "k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/yaml"
+
+	machinamanifests "github.com/Azure/unbounded/deploy/machina"
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 // kindToResource maps the Kinds the reaper deletes (reapableKinds) to their
@@ -200,4 +204,127 @@ func TestOperatorClusterRoleGrantsForeignWorkloadAudit(t *testing.T) {
 			}
 		}
 	}
+}
+
+// loadMachinaRBAC parses every RBAC document out of the rendered machina
+// manifests. Unlike the operator ClusterRole, the machina RBAC template carries
+// Go-template actions in its metadata, so it is read from the rendered output
+// that the operator actually embeds and applies. Relies on `make test`
+// rendering the manifests first.
+func loadMachinaRBAC(t *testing.T) (roles []rbacv1.Role, clusterRoles []rbacv1.ClusterRole) {
+	t.Helper()
+
+	files, err := component.YamlFiles(machinamanifests.Manifests)
+	if err != nil {
+		t.Fatalf("list machina manifests: %v", err)
+	}
+
+	for _, file := range files {
+		data, err := fs.ReadFile(machinamanifests.Manifests, file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+
+		for _, doc := range strings.Split(string(data), "\n---") {
+			doc = strings.TrimSpace(doc)
+			if doc == "" {
+				continue
+			}
+
+			var meta struct {
+				Kind string `json:"kind"`
+			}
+
+			if err := yaml.Unmarshal([]byte(doc), &meta); err != nil {
+				continue
+			}
+
+			switch meta.Kind {
+			case "Role":
+				var role rbacv1.Role
+				if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
+					t.Fatalf("parse Role in %s: %v", file, err)
+				}
+
+				roles = append(roles, role)
+			case "ClusterRole":
+				var clusterRole rbacv1.ClusterRole
+				if err := yaml.Unmarshal([]byte(doc), &clusterRole); err != nil {
+					t.Fatalf("parse ClusterRole in %s: %v", file, err)
+				}
+
+				clusterRoles = append(clusterRoles, clusterRole)
+			}
+		}
+	}
+
+	return roles, clusterRoles
+}
+
+// TestMachinaControllerRoleGrantsNoConfigMapAccess guards the security boundary
+// for operator-owned ConfigMaps in the install namespace, including the
+// component workload overrides ConfigMap.
+//
+// The machina controller reads exactly one ConfigMap, kube-root-ca.crt in
+// kube-public (cmd/machina/machina/controller/cluster_info.go), through the
+// uncached clientset; that read is served by the cluster-wide configmaps get in
+// its ClusterRole. machina-config reaches the pod as a volume mount, which
+// needs no RBAC, and leader election uses Leases. No machina controller watches
+// ConfigMaps and machinaCacheOptions() scopes only Secrets, so no informer is
+// established either.
+//
+// A namespaced ConfigMap grant would therefore be unused, and would let a
+// compromised machina controller write ConfigMaps the operator owns and acts
+// on. RBAC cannot scope create by resourceNames, so the grant has to be absent
+// rather than narrowed.
+func TestMachinaControllerRoleGrantsNoConfigMapAccess(t *testing.T) {
+	roles, _ := loadMachinaRBAC(t)
+
+	var checked int
+
+	for _, role := range roles {
+		if role.Name != "machina-controller" {
+			continue
+		}
+
+		checked++
+
+		for _, rule := range role.Rules {
+			if !contains(rule.APIGroups, "") {
+				continue
+			}
+
+			if contains(rule.Resources, "configmaps") || contains(rule.Resources, "*") {
+				t.Errorf("machina-controller Role in namespace %q grants configmaps %v; the controller does not use it and it would expose operator-owned ConfigMaps",
+					role.Namespace, rule.Verbs)
+			}
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("no machina-controller Role found in the rendered machina manifests")
+	}
+}
+
+// TestMachinaControllerClusterRoleKeepsClusterInfoRead is the other half of
+// TestMachinaControllerRoleGrantsNoConfigMapAccess: removing the namespaced
+// grant is only safe while the cluster-wide read that cluster_info.go depends
+// on survives. If this fails, machina cannot resolve kube-root-ca.crt and
+// bootstrap script generation breaks at runtime rather than at build time.
+func TestMachinaControllerClusterRoleKeepsClusterInfoRead(t *testing.T) {
+	_, clusterRoles := loadMachinaRBAC(t)
+
+	for _, clusterRole := range clusterRoles {
+		if clusterRole.Name != "machina-controller" {
+			continue
+		}
+
+		if clusterRoleGrants(&clusterRole, "", "configmaps", "get") {
+			return
+		}
+
+		t.Fatal("machina-controller ClusterRole must grant configmaps get for the kube-root-ca.crt read in cluster_info.go")
+	}
+
+	t.Fatal("no machina-controller ClusterRole found in the rendered machina manifests")
 }

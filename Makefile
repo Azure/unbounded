@@ -5,9 +5,14 @@ GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
-GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./hack/... ./internal/... ./pkg/...
-GO_PACKAGES=$(shell $(GOCMD) list $(GO_PACKAGE_PATTERNS))
-GO_PACKAGE_DIRS=$(shell $(GOCMD) list -f '{{.Dir}}' $(GO_PACKAGE_PATTERNS))
+GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./e2e/... ./hack/... ./internal/... ./pkg/...
+# e2e packages hold nothing but files behind the e2e build tag, so `go list`
+# needs the tag to see them at all. Without it they are silently skipped by
+# both the formatter and the linter, which is how they accumulated whitespace
+# and unchecked-error violations that CI never reported. Code generation has no
+# business in e2e suites, so GO_PACKAGES stays without the tag.
+GO_PACKAGES=$(shell $(GOCMD) list ./api/... ./cmd/... ./hack/... ./internal/... ./pkg/...)
+GO_PACKAGE_DIRS=$(shell $(GOCMD) list -tags e2e -f '{{.Dir}}' $(GO_PACKAGE_PATTERNS))
 
 CONTAINER_ENGINE ?= podman
 CONTAINER_REGISTRY ?= ghcr.io/azure

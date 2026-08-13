@@ -4,8 +4,6 @@
 package component
 
 import (
-	"context"
-	"errors"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -18,12 +16,12 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 func TestConfigImage(t *testing.T) {
@@ -320,70 +318,68 @@ func TestManagedWorkloadPredicate(t *testing.T) {
 	}
 }
 
-func TestSingletonRequestBuilders(t *testing.T) {
+// TestSingletonRequestIsTheOnlyFanOut pins the shape of the cluster-component
+// watches.
+//
+// A ConfigMap change used to enqueue the singleton request plus one request per
+// Site. The singleton pass already reconciles every Site, so those were N
+// redundant full passes for a single edit, each re-planning and re-applying
+// every component for a Site the singleton pass had just covered.
+//
+// The helper that produced them also listed Sites at event-delivery time and,
+// when the List failed, logged and returned only the singleton, silently
+// dropping the fan-out with no retry. Keeping the fan-out inside Reconcile
+// means a failure is returned and retried with backoff instead.
+func TestSingletonRequestIsTheOnlyFanOut(t *testing.T) {
 	env := &Env{Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
 		&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "edge"}},
 		&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "cluster"}},
 	).Build()}
 
-	if got := env.singletonRequest(); len(got) != 1 || got[0].Name != SingletonRequestName {
-		t.Fatalf("singletonRequest = %#v", got)
+	queue := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+	defer queue.ShutDown()
+
+	changed := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "unbounded-system", Name: "net-config"}}
+
+	env.RequestSingleton().Create(t.Context(), event.CreateEvent{Object: changed}, queue)
+
+	// Two Sites exist, and neither may produce a request of its own.
+	if got := queue.Len(); got != 1 {
+		t.Fatalf("one ConfigMap change enqueued %d requests, want only the singleton", got)
 	}
 
-	requests := env.singletonAndAllSiteRequests(t.Context())
-
-	names := map[string]bool{}
-	for _, request := range requests {
-		names[request.Name] = true
-	}
-
-	if len(requests) != 3 || !names[SingletonRequestName] || !names["edge"] || !names["cluster"] {
-		t.Fatalf("singletonAndAllSiteRequests = %#v, want singleton, edge, cluster", requests)
-	}
-}
-
-func TestSingletonAndAllSiteRequestsPreservesSingletonOnListError(t *testing.T) {
-	listErr := errors.New("Site list failed")
-	env := &Env{Client: fake.NewClientBuilder().
-		WithScheme(testScheme(t)).
-		WithInterceptorFuncs(interceptor.Funcs{
-			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-				return listErr
-			},
-		}).
-		Build()}
-
-	requests := env.singletonAndAllSiteRequests(t.Context())
-	if len(requests) != 1 || requests[0].Name != SingletonRequestName {
-		t.Fatalf("singletonAndAllSiteRequests = %#v, want singleton after list failure", requests)
+	request, _ := queue.Get()
+	if request.Name != SingletonRequestName {
+		t.Fatalf("request = %q, want %q", request.Name, SingletonRequestName)
 	}
 }
 
-func TestApplyManifestDataSkipsNilledObjects(t *testing.T) {
+func TestDecodeManifestDataSkipsNilledObjects(t *testing.T) {
 	env := &Env{
 		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
 		Namespace: "unbounded-system",
 	}
 
-	applied := 0
+	mutated := 0
 	data := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: keep\n  namespace: unbounded-system\n")
 
-	err := env.applyManifestData(t.Context(), data, func(obj *unstructured.Unstructured) error {
-		applied++
+	objects, err := env.decodeManifestData(data, func(obj *unstructured.Unstructured) error {
+		mutated++
 		obj.Object = nil // skip
 
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("applyManifestData: %v", err)
+		t.Fatalf("decodeManifestData: %v", err)
 	}
 
-	if applied != 1 {
-		t.Fatalf("mutate called %d times, want 1", applied)
+	if mutated != 1 {
+		t.Fatalf("mutate called %d times, want 1", mutated)
 	}
 
-	if err := env.Client.Get(t.Context(), client.ObjectKey{Namespace: "unbounded-system", Name: "keep"}, &corev1.ConfigMap{}); err == nil {
-		t.Fatal("nilled object was applied")
+	if len(objects) != 0 {
+		t.Fatalf("decoded %d objects, want 0; a nilled object must be dropped", len(objects))
 	}
 }
 
@@ -574,5 +570,96 @@ func TestIsRBACObject(t *testing.T) {
 		if got := IsRBACObject(tc.obj, "metalman"); got != tc.want {
 			t.Fatalf("IsRBACObject(%s/%s) = %v, want %v", tc.obj.GetKind(), tc.obj.GetName(), got, tc.want)
 		}
+	}
+}
+
+// TestWorkloadPredicateFiresOnOperatorMetadataDrift is a regression test.
+//
+// Kubernetes increments generation for spec changes only, so removing the
+// override hash annotation, or editing a label the operator set, produced no
+// event and therefore no pass. Server-side apply would have repaired it, but
+// nothing was going to ask the operator to look, so a Site could report Applied
+// indefinitely for an object carrying no sign of an override.
+func TestWorkloadPredicateFiresOnOperatorMetadataDrift(t *testing.T) {
+	env := &Env{Namespace: DefaultNamespace}
+	predicate := env.ManagedWorkloadPredicate(func(client.Object) bool { return true })
+
+	withAnnotations := func(generation int64, annotations map[string]string) *appsv1.DaemonSet {
+		return &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+			Namespace:   DefaultNamespace,
+			Name:        "agent",
+			Generation:  generation,
+			Annotations: annotations,
+		}}
+	}
+
+	hash := map[string]string{unbounded.ReservedPrefix + "override-hash": "h1"}
+
+	cases := map[string]struct {
+		old, updated *appsv1.DaemonSet
+		want         bool
+	}{
+		"override hash removed": {
+			old:     withAnnotations(1, hash),
+			updated: withAnnotations(1, nil),
+			want:    true,
+		},
+		"override hash changed": {
+			old:     withAnnotations(1, hash),
+			updated: withAnnotations(1, map[string]string{unbounded.ReservedPrefix + "override-hash": "h2"}),
+			want:    true,
+		},
+		"override hash added": {
+			old:     withAnnotations(1, nil),
+			updated: withAnnotations(1, hash),
+			want:    true,
+		},
+		"spec changed": {
+			old:     withAnnotations(1, hash),
+			updated: withAnnotations(2, hash),
+			want:    true,
+		},
+		// The Deployment controller writes this on every rollout, and kubectl
+		// writes its own. Firing on them would be the churn the predicate
+		// exists to suppress.
+		"unrelated annotation churn": {
+			old: withAnnotations(1, hash),
+			updated: withAnnotations(1, map[string]string{
+				unbounded.ReservedPrefix + "override-hash": "h1",
+				"deployment.kubernetes.io/revision":        "7",
+			}),
+			want: false,
+		},
+		"nothing changed": {
+			old:     withAnnotations(1, hash),
+			updated: withAnnotations(1, hash),
+			want:    false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := predicate.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.updated})
+			if got != tc.want {
+				t.Fatalf("predicate fired = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOwnedWorkloadPredicateSharesTheSameRule confirms the per-Site components,
+// which use Owns() rather than a named watch, get the same drift detection.
+func TestOwnedWorkloadPredicateSharesTheSameRule(t *testing.T) {
+	env := &Env{Namespace: DefaultNamespace}
+	predicate := env.OwnedWorkloadPredicate()
+
+	older := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+		Generation:  1,
+		Annotations: map[string]string{unbounded.ReservedPrefix + "override-hash": "h1"},
+	}}
+	newer := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+
+	if !predicate.Update(event.UpdateEvent{ObjectOld: older, ObjectNew: newer}) {
+		t.Fatal("an owned workload losing its override hash must trigger a pass")
 	}
 }
