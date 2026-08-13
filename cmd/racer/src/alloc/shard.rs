@@ -919,10 +919,10 @@ impl Shard {
 
     // ----------------------------------------------------------------------- discard
 
-    /// The member side of a trim proposal. An immutable page becomes a tombstone so
-    /// readers can tell a hole from a trim, and is reclaimed when the control plane
-    /// advances the epoch past it; a mutable page is released. The immutable case guards
-    /// on `3*epoch + 1` and is idempotent, so a repeat is `Ok`.
+    /// The member side of a trim proposal, which only the immutable class has: the page
+    /// becomes a tombstone so readers can tell a hole from a trim, and is reclaimed when
+    /// the control plane advances the epoch past it. Guards on `3*epoch + 1` and is
+    /// idempotent, so a repeat is `Ok`.
     #[allow(clippy::too_many_arguments)] // type, class and epoch all ride in
     pub(super) fn trim(
         &mut self,
@@ -934,6 +934,15 @@ impl Shard {
         epoch: u64,
         m: &Maps,
     ) -> Result<Option<(u32, u64)>, Status> {
+        if kind != Kind::Immutable {
+            // A mutable register may not be released. Nothing here is a barrier the whole
+            // group crosses, so a member that missed this trim would still hold the page
+            // at its old version while we sat back at zero, and the next repair would
+            // resurrect it. `Paxos::trim` accepts zeroes for this class instead, so a
+            // trim reaching a mutable page here is a proposal that should never have been
+            // sent.
+            return Err(Status::Unmapped);
+        }
         let sl = self.slab(class);
         let Some((slot, e)) = sl.entry_of(addr.0) else {
             return Ok(None);
@@ -942,29 +951,23 @@ impl Shard {
             // The slot belongs to another core's stripe; leave it to relocate.
             return Ok(None);
         };
-        if kind == Kind::Immutable {
-            if e.state != State::Live {
-                return Ok(None);
-            }
-            let current = effective(Some(e), kind, epoch);
-            if guard.is_some_and(|g| g != current) {
-                return Err(Status::Conflict { current });
-            }
-            let t = Entry {
-                addr: addr.0,
-                version: current + 1,
-                ballot: ballot.raw() as u64,
-                data_crc: 0,
-                epoch: ((current + 1) / 3) as u32,
-                state: State::Tombstone,
-                flags: 0,
-            };
-            sl.set(local, t, m);
-        } else {
-            sl.index.remove(addr.0);
-            sl.set(local, Entry::default(), m);
-            sl.recycle(local);
+        if e.state != State::Live {
+            return Ok(None);
         }
+        let current = effective(Some(e), kind, epoch);
+        if guard.is_some_and(|g| g != current) {
+            return Err(Status::Conflict { current });
+        }
+        let t = Entry {
+            addr: addr.0,
+            version: current + 1,
+            ballot: ballot.raw() as u64,
+            data_crc: 0,
+            epoch: ((current + 1) / 3) as u32,
+            state: State::Tombstone,
+            flags: 0,
+        };
+        sl.set(local, t, m);
         let li = local / sl.k;
         Ok(Some((li, sl.dirty(li))))
     }
@@ -1785,8 +1788,10 @@ mod model {
         /// Reservations dropped without `unreserve`: the slot is not returned until the
         /// next boot.
         leaked: u8,
-        /// Successful mutable trims, so the model can prove the path is reached.
-        trimmed: u8,
+        /// Set once the shard has turned a mutable trim away, so the model can prove the
+        /// path is reached and not merely never taken. A flag and not a count: a refusal
+        /// changes nothing, and counting them would make every one of them a fresh state.
+        refused: bool,
         /// Set if an Immutable accept presenting the epoch's fill point came back at a
         /// version that is not `3*epoch + 1`. Learns are excluded: a repair stream carries
         /// whatever version it was given, and apply-if-newer is its only rule.
@@ -1840,7 +1845,7 @@ mod model {
                 reaped: [false; ADDRS.len()],
                 writes: 0,
                 leaked: 0,
-                trimmed: 0,
+                refused: false,
                 offbeat: false,
             }]
         }
@@ -1970,13 +1975,19 @@ mod model {
                         s.epoch[a as usize],
                         &m,
                     );
-                    // A mutable trim destroys the register rather than tombstoning it, so
-                    // versions restart from zero and the history before it is no longer a
-                    // claim about the same incarnation. Forgetting it scopes the register
-                    // property to "between trims".
-                    if kind != Kind::Immutable && matches!(r, Ok(Some(_))) {
-                        s.acked.retain(|&(x, _, _, _)| x != ad.0);
-                        s.trimmed += 1;
+                    // A mutable register may not be released. Nothing in this class is a
+                    // barrier the whole group crosses, so a member that missed the release
+                    // would still hold the page at its old version while this one sat back
+                    // at zero, and the next repair would prefer it: bytes a client was told
+                    // were discarded would come back. `Paxos::trim` accepts zeroes for this
+                    // class instead, so the proposal never reaches a shard, and one that
+                    // does is refused rather than obeyed.
+                    if kind != Kind::Immutable {
+                        assert!(
+                            matches!(r, Err(Status::Unmapped)),
+                            "a mutable trim is refused, not applied: {r:?}"
+                        );
+                        s.refused = true;
                     }
                 }
                 RegAct::AdvanceEpoch(v) => s.epoch[v as usize] += 1,
@@ -2115,14 +2126,15 @@ mod model {
                     ));
                 }
                 _ => {
-                    // A mutable trim does not tombstone: it drops the entry and hands the
-                    // slot straight back.
+                    // A mutable trim is refused, and a refusal is not a quiet no-op: the
+                    // register it named is still there, at the version it already had, so
+                    // nothing a reader could see moved.
                     ps.push(Property::<Self>::sometimes(
-                        "a trim frees a slot",
+                        "a trim is refused and the register stands",
                         |_, s| {
-                            s.trimmed > 0
-                                && find(std::slice::from_ref(&s.sh), ADDRS[0]).is_none()
-                                && !s.sh.slabs[0].free.is_empty()
+                            s.refused
+                                && find(std::slice::from_ref(&s.sh), ADDRS[0])
+                                    .is_some_and(|e| e.state == State::Live)
                         },
                     ));
                 }

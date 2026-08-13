@@ -1011,9 +1011,10 @@ impl Allocator {
 
     // ----------------------------------------------------------------------- discard
 
-    /// The member side of a trim proposal. An immutable page becomes a tombstone, so a
-    /// reader can tell a hole from a trim, reclaimed once the control plane advances the
-    /// epoch past it; a mutable page is released. Guard is `3*epoch + 1`; a repeat is `Ok`.
+    /// The member side of a trim proposal, which only the immutable class has: the page
+    /// becomes a tombstone, so a reader can tell a hole from a trim, reclaimed once the
+    /// control plane advances the epoch past it. Guard is `3*epoch + 1`; a repeat is `Ok`.
+    /// A mutable page discards by accepting zeroes, so a trim of one is refused here.
     pub async fn accept_trim(
         &'static self,
         addr: GlobalAddr,
