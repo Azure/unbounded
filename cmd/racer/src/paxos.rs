@@ -574,19 +574,24 @@ impl Route<'_> {
 pub struct Paxos {
     alloc: &'static Allocator,
     cache: &'static Cache,
-    links: Live<Links>,
+    links: LinkTable,
 }
 
-// SAFETY: the only field here that is not already `Sync` is the link table, and only its
-// retire slot: a `Link` holds a `Disk`, which is deliberately `!Send` so that IO stays on
-// the worker that issued it. That slot is filled by the build that opens a configuration
-// and drained when that configuration retires, both on the control thread, which is also
-// the only thread that ever holds a `Links` by value. A worker only ever reads the live
-// table, through a shared reference to something `Sync`.
-//
-// This is the last of these in the dataplane, and it goes when the link table moves into
-// the configuration proper and is reached through a guard like everything else.
-unsafe impl Sync for Paxos {}
+/// The peer links, and the one thing a worker reaches outside the configuration guard.
+///
+/// A `Link` holds a `Disk`, which is deliberately `!Send` so that IO stays on the worker
+/// that issued it, and a guard is a stack temporary while a route taken from the table
+/// outlives the frame that took it. So the table is replaced the way everything used to
+/// be, and the assertion that this is sound is here, on the field it is about, rather
+/// than over a whole subsystem. It goes when routing stops handing out borrows that
+/// outlive their guard and the table can move into the configuration with the rest.
+struct LinkTable(Live<Links>);
+
+// SAFETY: reads go through `Live::get`, which hands out a shared reference to `Links`,
+// and `Links` is `Sync`. What is not is the retire slot, which holds a `Links` by value:
+// it is filled by the build that opens a configuration and drained when that
+// configuration retires, both on the control thread, and no worker can reach it at all.
+unsafe impl Sync for LinkTable {}
 
 /// One worker's share of the consensus state, living in that worker's [`server::CoreState`].
 ///
@@ -638,7 +643,7 @@ pub fn open(
     let paxos = Box::leak(Box::new(Paxos {
         alloc,
         cache,
-        links: Live::new(Links(Box::new([]))),
+        links: LinkTable(Live::new(Links(Box::new([])))),
     }));
     (
         paxos,
@@ -697,12 +702,12 @@ impl Paxos {
     /// Replace the link set. Control thread only, inside a reload's build step: the links
     /// handed over were opened against the configuration being installed.
     pub fn install_links(&self, links: Vec<Link>) {
-        self.links.install(Links(links.into_boxed_slice()));
+        self.links.0.install(Links(links.into_boxed_slice()));
     }
 
     /// Close links replaced by the configuration whose runtime guards have now drained.
     pub(crate) fn retire_links(&self) {
-        self.links.retire();
+        self.links.0.retire();
     }
 
     /// The link to `node` in `universe`. Per pair: the same peer in two universes publishes
@@ -710,6 +715,7 @@ impl Paxos {
     /// it arrived on.
     pub(crate) fn link_of(&self, universe: u32, node: u32) -> Option<&Link> {
         self.links
+            .0
             .get()
             .0
             .iter()
@@ -898,7 +904,14 @@ impl Paxos {
     /// Exception: a universe naming no peers at all is a single-node deployment, so a local
     /// accept is a decision. Per universe, since one lone node says nothing about another.
     fn quorum(&self, universe: u32) -> usize {
-        if self.links.get().0.iter().any(|l| l.universe() == universe) {
+        if self
+            .links
+            .0
+            .get()
+            .0
+            .iter()
+            .any(|l| l.universe() == universe)
+        {
             2
         } else {
             1
