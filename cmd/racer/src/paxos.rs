@@ -1094,9 +1094,9 @@ impl Paxos {
             self.send_accept(r, addr, Some(guard), b, page)
         });
         match join2(staged, votes).await {
-            (Ok(p), Ok(())) => self.alloc.finish(addr, p).await.map(|_| ()),
+            (Ok(p), Ok(())) => self.alloc.finish(p).await.map(|_| ()),
             (Ok(p), Err(e)) => {
-                self.alloc.abandon(addr, p).await;
+                self.alloc.abandon(p).await;
                 Err(e)
             }
             (Err(e), _) => Err(e),
@@ -2083,7 +2083,7 @@ impl Paxos {
             return Ok(());
         };
         if imm != 0 {
-            let r = self.alloc.finish(addr, p).await.map(|_| ());
+            let r = self.alloc.finish(p).await.map(|_| ());
             self.stat(|s| match r {
                 Ok(()) => s.accept_ok += 1,
                 Err(Status::Conflict { .. }) => s.guard_conflicts += 1,
@@ -2096,7 +2096,7 @@ impl Paxos {
         // the staging slot goes straight back.
         let whole = PoolBuf::alloc(layout::HUGE_PAGE as usize).await;
         let r = self.alloc.read_pending(&p, whole.buf()).await;
-        self.alloc.abandon(addr, p).await;
+        self.alloc.abandon(p).await;
         r?;
         self.propose(addr, None, Page::Huge(whole.buf()))
             .await
