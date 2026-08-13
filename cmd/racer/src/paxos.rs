@@ -2675,6 +2675,8 @@ enum Lead {
     Held(u32),
     Wait,
     Go,
+    /// Waited out a round that never finished. Prepare anyway, holding nothing.
+    Give,
 }
 
 /// How long a writer waits for another task's prepare round before rechecking.
@@ -2692,39 +2694,50 @@ impl Paxos {
         let core = self.core_of(group);
         // Waiting out whoever holds the lease keeps all three members in step; see
         // [`Prepare`] for why running two rounds at once is worse than waiting.
-        for _ in 0..PREPARE_WAITS {
-            let take = at(core, move |l| {
-                match l.terms.entry(group).or_insert(Term::new(0)).issuable() {
-                    Some(t) => Lead::Held(t),
-                    None if l.preparing.insert(group) => Lead::Go,
-                    None => Lead::Wait,
-                }
-            })
-            .await;
-            match take {
-                Lead::Held(t) => return Ok(t),
-                Lead::Wait => {
-                    runtime::sleep(PREPARE_WAIT).await;
-                    continue;
-                }
-                Lead::Go => {
-                    // Built here rather than on the owner: a reply nobody is waiting for is
-                    // dropped inside the rendezvous, which is no place for a destructor
-                    // that wants to hop.
-                    let lease = Prepare {
-                        paxos: self,
-                        group,
-                        core,
-                    };
-                    let r = self.prepare_round(addr, None).await;
-                    lease.release().await;
-                    return r.map(|(t, ..)| t);
+        //
+        // The wait itself belongs on the core that owns the answer. Rechecking from here
+        // meant a message each way per recheck, so a writer queued behind one prepare could
+        // spend hundreds of them asking a question only that core can answer, and every one
+        // of them landed on the core the prepare was trying to make progress on. Now the
+        // whole wait is one message out and one back, whichever way it ends.
+        let take = runtime::on_core(core.index(), move || async move {
+            for _ in 0..PREPARE_WAITS {
+                let lead = here(|l| {
+                    match l.terms.entry(group).or_insert(Term::new(0)).issuable() {
+                        Some(t) => Lead::Held(t),
+                        // Taken at the last moment, so the gap between a group being marked
+                        // and someone holding the lease for it stays the width of the reply.
+                        None if l.preparing.insert(group) => Lead::Go,
+                        None => Lead::Wait,
+                    }
+                });
+                match lead {
+                    Lead::Wait => runtime::sleep(PREPARE_WAIT).await,
+                    settled => return settled,
                 }
             }
+            Lead::Give
+        })
+        .await;
+        match take {
+            Lead::Held(t) => Ok(t),
+            Lead::Go => {
+                // Built here rather than on the owner: a reply nobody is waiting for is
+                // dropped inside the rendezvous, which is no place for a destructor that
+                // wants to hop.
+                let lease = Prepare {
+                    paxos: self,
+                    group,
+                    core,
+                };
+                let r = self.prepare_round(addr, None).await;
+                lease.release().await;
+                r.map(|(t, ..)| t)
+            }
+            // Prepare anyway, without the lease: the group is no worse off than it was, and
+            // a writer that never returns is worse.
+            Lead::Wait | Lead::Give => self.prepare_round(addr, None).await.map(|(t, ..)| t),
         }
-        // Waited out a round that never finished. Prepare anyway, without the lease: the
-        // group is no worse off than it was, and a writer that never returns is worse.
-        self.prepare_round(addr, None).await.map(|(t, ..)| t)
     }
 
     /// The term we currently promise, without raising it. Used where a ballot has to be
