@@ -115,19 +115,6 @@ impl Dataplane {
     pub fn quarantined(&self) -> usize {
         self.alloc().quarantined
     }
-
-    /// What must hold of this node's internal state whatever has been done to it. The
-    /// simulator samples this after every action; nothing else calls it.
-    #[cfg(feature = "sim")]
-    pub fn invariants(&self) -> Result<(), String> {
-        self.alloc().invariants()
-    }
-
-    /// Pages part-way through arriving from the fabric.
-    #[cfg(feature = "sim")]
-    pub fn assemblies(&self) -> usize {
-        self.alloc().assemblies()
-    }
 }
 
 /// The consensus layer, and through it the allocator, for one node.
@@ -181,18 +168,18 @@ impl Node {
         let paxos = match self.paxos.get() {
             Some(&p) => p,
             None => {
-                let alloc = alloc::open(&store, disk, &cfg, cores)?;
+                let (alloc, shards) = alloc::open(&store, disk, &cfg, cores)?;
                 // One metric row per worker; the worker count is settled here.
                 metrics::init(cores);
                 // Leaked like the allocator: a hop closure must be `'static`.
-                let (cache, rows) = cache::open(alloc, &cfg, cores);
+                let (cache, slots) = cache::open(alloc, &cfg, cores);
                 // The allocator loans free 4 MiB slots back through this from inside a
                 // reservation. Installed before any worker runs.
                 alloc.attach(cache);
                 let p = paxos::open(alloc, cache, cores);
                 let _ = self.paxos.set(p);
                 let _ = self.heal.set(heal::open(p, cores));
-                c.core_state(CoreState::all(rows));
+                c.core_state(CoreState::all(shards, slots));
                 p
             }
         };
@@ -220,11 +207,11 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
     let store = cfg.node.store.clone();
     let disk = c.disk(&store, None, None)?;
     let cores = c.cores();
-    let alloc = alloc::open(&store, disk, &cfg, cores)?;
+    let (alloc, shards) = alloc::open(&store, disk, &cfg, cores)?;
     metrics::init(cores);
-    let (cache, rows) = cache::open(alloc, &cfg, cores);
+    let (cache, slots) = cache::open(alloc, &cfg, cores);
     let paxos = paxos::open(alloc, cache, cores);
-    c.core_state(CoreState::all(rows));
+    c.core_state(CoreState::all(shards, slots));
     Ok(Dataplane {
         roster: cache::Roster::of(&cfg),
         config: cfg,
@@ -244,6 +231,7 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
 /// `unsafe impl Sync`, because a `&` to it is only ever handed out by the worker that
 /// owns it, for a transaction that cannot await.
 pub struct CoreState {
+    pub(crate) alloc: alloc::Row,
     pub(crate) cache: cache::Row,
     pub(crate) heal: heal::Core,
 }
@@ -251,14 +239,30 @@ pub struct CoreState {
 impl CoreState {
     /// One row per worker, in worker order, from the rows each subsystem built while it
     /// opened.
-    pub(crate) fn all(cache: Vec<cache::Row>) -> Vec<CoreState> {
-        cache
+    pub(crate) fn all(alloc: Vec<alloc::Row>, cache: Vec<cache::Row>) -> Vec<CoreState> {
+        assert_eq!(alloc.len(), cache.len(), "one row per worker from each");
+        alloc
             .into_iter()
-            .map(|cache| CoreState {
+            .zip(cache)
+            .map(|(alloc, cache)| CoreState {
+                alloc,
                 cache,
                 heal: heal::Core::default(),
             })
             .collect()
+    }
+
+    /// What must hold of this core's share whatever has been done to it. The simulator
+    /// samples this between steps; nothing else calls it.
+    #[cfg(feature = "sim")]
+    pub(crate) fn invariants(&self) -> Result<(), String> {
+        self.alloc.invariants()
+    }
+
+    /// Pages part-way through arriving from the fabric.
+    #[cfg(feature = "sim")]
+    pub(crate) fn assemblies(&self) -> usize {
+        self.alloc.assemblies()
     }
 }
 

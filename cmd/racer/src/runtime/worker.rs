@@ -1240,6 +1240,19 @@ pub(crate) mod sim {
             self.l.state_ptr.set(ptr);
         }
 
+        /// What this worker owns, read from outside it.
+        ///
+        /// Only the simulator, and only between steps: it samples every core's invariants
+        /// after each action, which is the one caller that legitimately looks at state it
+        /// is not running on. A worker mid-transaction holds a borrow, so a checker that
+        /// tried this from inside one would find the cell already taken and say so.
+        pub(crate) fn core_state(&self) -> &H::CoreState {
+            let p = self.l.state_ptr.get();
+            assert!(!p.is_null(), "racer: no core state installed");
+            // SAFETY: installed above from a leaked `H::CoreState`, and never replaced.
+            unsafe { &*(p as *const H::CoreState) }
+        }
+
         /// Starts a request in slot `id`; returns a result only if it finished inline.
         pub(crate) fn start(&mut self, id: u32, req: Request) -> Option<Result<(), Errno>> {
             let cfg = self.w.l.cfg::<H::Config>();

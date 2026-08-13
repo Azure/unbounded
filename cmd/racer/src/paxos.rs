@@ -2198,7 +2198,7 @@ impl Paxos {
     async fn register_and_width(&'static self, addr: GlobalAddr) -> Result<(Register, u8), Status> {
         let owner = self.alloc.owner_core(addr)?;
         let (alloc, cache) = (self.alloc, self.cache);
-        runtime::on_core(owner, move || async move {
+        runtime::on_core(owner.index(), move || async move {
             let r = alloc.register_local(addr)?;
             Ok((r, cache.observe_local(addr)))
         })
