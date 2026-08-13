@@ -10,11 +10,12 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(feature = "sim")]
 use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::{Receiver, Sender};
-use std::task::Context;
+use std::task::{Context, Waker};
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, cqueue, opcode, squeue, types};
@@ -272,6 +273,44 @@ pub(super) struct Local {
     pending_retire: RefCell<Vec<(u32, Ack)>>,
     /// Set while any device slot is draining, so the common turn skips the scan.
     draining: Cell<bool>,
+    /// Deadlines waiting on the maintenance tick.
+    deadlines: RefCell<Vec<Rc<Deadline>>>,
+}
+
+/// A moment a future asked to be woken at, kept on the core rather than in the ring.
+///
+/// A timer would do this too, but a timer is an op: it holds a slab slot until it fires
+/// and, in the simulator, it is outstanding work that keeps a cluster from ever being
+/// called quiet. Maintenance already visits every worker on a fixed interval, and a
+/// deadline is a coarse thing by nature, so it rides that visit instead and costs the
+/// ring nothing.
+pub(super) struct Deadline {
+    at: Instant,
+    waker: RefCell<Option<Waker>>,
+    fired: Cell<bool>,
+}
+
+impl Deadline {
+    /// Whether the tick has passed this deadline by.
+    pub(super) fn expired(&self) -> bool {
+        self.fired.get()
+    }
+
+    /// Wake `w` when it does. The last waker handed over is the one used.
+    pub(super) fn watch(&self, w: &Waker) {
+        *self.waker.borrow_mut() = Some(w.clone());
+    }
+}
+
+/// Register a deadline at `at` on this worker. Dropping the handle cancels it.
+pub(crate) fn arm_deadline(at: Instant) -> Rc<Deadline> {
+    let d = Rc::new(Deadline {
+        at,
+        waker: RefCell::new(None),
+        fired: Cell::new(false),
+    });
+    with_local(|l| l.deadlines.borrow_mut().push(d.clone()));
+    d
 }
 
 enum Deferred {
@@ -440,6 +479,7 @@ impl Local {
             throttled: Cell::new(false),
             pending_retire: RefCell::new(Vec::new()),
             draining: Cell::new(false),
+            deadlines: RefCell::new(Vec::new()),
         })
     }
 
@@ -995,6 +1035,26 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
         while let Ok(m) = self.inbox.try_recv() {
             n += 1;
             self.apply_ctl(m);
+        }
+
+        // Deadlines: fire the ones this visit has passed and forget the abandoned ones.
+        if !l.deadlines.borrow().is_empty() {
+            let mut due = Vec::new();
+            l.deadlines.borrow_mut().retain(|d| {
+                if Rc::strong_count(d) == 1 {
+                    return false;
+                }
+                if now < d.at {
+                    return true;
+                }
+                d.fired.set(true);
+                due.extend(d.waker.borrow_mut().take());
+                false
+            });
+            for w in due {
+                n += 1;
+                w.wake();
+            }
         }
 
         // Parked retirements: ack once nothing on this core still holds the version.

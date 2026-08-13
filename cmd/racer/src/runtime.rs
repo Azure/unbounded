@@ -407,12 +407,16 @@ pub(crate) fn spawn(fut: impl Future<Output = ()> + 'static) -> bool {
 /// one interval of progress; not abandoning it costs the node.
 pub(crate) async fn deadline<F: Future>(fut: F, d: Duration) -> Option<F::Output> {
     let mut fut = std::pin::pin!(fut);
-    let mut nap = std::pin::pin!(sleep(d));
+    let timer = worker::arm_deadline(now() + d);
     std::future::poll_fn(|cx| {
         if let Poll::Ready(v) = fut.as_mut().poll(cx) {
             return Poll::Ready(Some(v));
         }
-        nap.as_mut().poll(cx).map(|()| None)
+        if timer.expired() {
+            return Poll::Ready(None);
+        }
+        timer.watch(cx.waker());
+        Poll::Pending
     })
     .await
 }

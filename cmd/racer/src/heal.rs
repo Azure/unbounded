@@ -509,7 +509,10 @@ impl Heal {
         });
         // The job stays on this core, so it clears the same row it just claimed.
         if !runtime::spawn(async move {
-            if runtime::deadline(self.sweep(), SWEEP_DEADLINE).await.is_none() {
+            if runtime::deadline(self.sweep(), SWEEP_DEADLINE)
+                .await
+                .is_none()
+            {
                 // Dropping the sweep releases the configuration it borrowed, which is the
                 // point: the node can reconfigure again and the next tick starts over.
                 let phase = here(|c| c.phase.get());
@@ -597,7 +600,11 @@ impl Heal {
             if !self.serves(huge) {
                 continue;
             }
-            self.phase(if huge { "compare(huge)" } else { "compare(small)" });
+            self.phase(if huge {
+                "compare(huge)"
+            } else {
+                "compare(small)"
+            });
             match self.compare(&cfg, g, huge, was).await {
                 Ok(r) => replaying |= r,
                 Err(e) => {
