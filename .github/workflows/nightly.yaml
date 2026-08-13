@@ -511,6 +511,26 @@ jobs:
             --pod-cidr          "${SITE_POD_CIDR}" \
             --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
 
+      - name: Fetch deploy tooling from the workflow's own commit
+        # The job's primary checkout is pinned to the resolved SNAPSHOT commit,
+        # which on a workflow_dispatch can be any ref the caller names. The
+        # rollout gate is tooling rather than part of the snapshot under test,
+        # and a ref that predates it would fail with "No such file or directory"
+        # before the cluster is ever contacted.
+        #
+        # github.workflow_sha is the commit of the workflow FILE now executing,
+        # so the gate is always the exact sibling of the workflow that calls it,
+        # and release-upgrade.yaml resolves it the same way. On the scheduled
+        # run this is the default-branch head, i.e. identical to the snapshot,
+        # so the normal path is unchanged. See "check out its own source code"
+        # in the Actions contexts reference.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _deploy-tools
+          sparse-checkout: hack/release
+          sparse-checkout-cone-mode: true
+
       - name: Wait for rollouts
         # Shared with release-upgrade.yaml so the two deploy gates cannot drift.
         # Component workloads are created asynchronously after the operator
@@ -518,7 +538,7 @@ jobs:
         # checking its rollout status, and fails fast naming the image when a pod
         # cannot pull one.
         run: |
-          hack/release/wait-rollouts.sh \
+          _deploy-tools/hack/release/wait-rollouts.sh \
             deploy/unbounded-operator \
             deploy/unbounded-net-controller \
             ds/unbounded-net-node \
@@ -549,7 +569,7 @@ jobs:
           kubectl -n "$NS" get deploy,ds,pods -o wide 2>&1
           echo "::endgroup::"
           echo "::group::Applied component images"
-          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller"; do
+          for kn in "deploy/unbounded-operator" "deploy/unbounded-net-controller" "ds/unbounded-net-node" "deploy/machina-controller" "ds/gantry"; do
             img=$(kubectl -n "$NS" get "$kn" -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null)
             printf '%s image=[%s]\n' "$kn" "$img"
           done
@@ -584,6 +604,7 @@ jobs:
             kubectl -n unbounded-system  get deploy unbounded-net-controller -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system  get ds     unbounded-net-node       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             kubectl -n unbounded-system get deploy machina-controller       -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
+            kubectl -n unbounded-system get ds     gantry                   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}' 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
