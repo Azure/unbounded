@@ -83,7 +83,10 @@ spec:
         - operator: Exists
       nodeSelector:
         racer.unbounded-cloud.io/active: "true"
-      terminationGracePeriodSeconds: 10
+      # Long enough for the shutdown revert to rewrite the configuration and
+      # wait for containerd to come back. A pod killed before it finishes
+      # leaves the node on the snapshotter with nothing watching it.
+      terminationGracePeriodSeconds: 180
       containers:
         - name: node-config
           image: {{ .Image }}
@@ -94,12 +97,12 @@ spec:
             - --socket=/run/gantry-snapshotter/snapshotter.sock
             - --containerd-socket=/run/containerd/containerd.sock
             - --platform={{ .Platform | default "linux/amd64" }}
-            # How long a pass waits for the snapshotter to come up before
-            # giving up and trying again. Long, because on a node that is
-            # being installed for the first time the snapshotter's image
-            # still has to be pulled.
-            - --socket-timeout=30m
-            - --interval=1m
+            # How long the snapshotter's socket may stay silent before the
+            # node drops back to overlayfs. Long enough to ride out a restart
+            # of the snapshotter, short enough that a node whose snapshotter
+            # has genuinely gone can pull images again without help.
+            - --revert-after=90s
+            - --interval=15s
           securityContext:
             privileged: true
             runAsUser: 0

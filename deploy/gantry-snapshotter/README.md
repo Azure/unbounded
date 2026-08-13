@@ -99,9 +99,10 @@ changes no pod's behaviour. It is safe before the agent exists: containerd dials
 a proxy plugin lazily.
 
 **Phase 2** makes `gantry` the CRI default snapshotter, and is applied only
-after `/run/gantry-snapshotter/snapshotter.sock` exists on that node. Doing both
-at once deadlocks the node permanently after the first reboot, because the
-default snapshotter applies to the agent's own pod and the socket is on tmpfs.
+while `/run/gantry-snapshotter/snapshotter.sock` on that node actually answers.
+Doing both at once deadlocks the node permanently after the first reboot,
+because the default snapshotter applies to the agent's own pod and the socket is
+on tmpfs.
 
 The node-config pod deliberately carries no `runtimeClassName`, because it is
 what creates the handler that class names. After a reboot of a fully configured
@@ -117,6 +118,58 @@ ctr -n k8s.io image pull --snapshotter gantry docker.io/library/alpine:latest
 ctr -n k8s.io snapshot --snapshotter gantry ls
 ```
 
+### Why node-config keeps running: phase 2 is a lease, not an install
+
+containerd unpacks **every** image through the CRI images plugin's default
+snapshotter. The runtime handler a pod names has no say in that. So
+`runtimeClassName: gantry-bootstrap` keeps the agent's sandbox startable, but it
+does not let the agent's own image be pulled. A node sitting on phase 2 with no
+socket cannot pull anything at all - including the replacement agent that would
+fix it. That is a node-wide, self-sustaining deadlock, and an ordinary upgrade
+walks straight into it: the old agent pod is deleted, its socket goes, and the
+new one needs a pull.
+
+So node-config does not install phase 2 and stop. It holds it:
+
+- Every `--interval` (15s) it dials the socket. Dials, not stats, because a
+  killed agent leaves a socket file that exists and refuses connections.
+- While the socket answers, phase 2 is applied and kept applied.
+- Once it has been silent for `--revert-after` (90s), phase 2 is removed and
+  containerd is restarted. The node is back on overlayfs and can pull again.
+  The grace period is what keeps an agent restart from churning the node.
+- When node-config itself is terminated it removes phase 2 on the way out,
+  before its own replacement needs an image. This is why its
+  `terminationGracePeriodSeconds` is 180: it has to rewrite the file and wait
+  for containerd to come back.
+- Phase 1 is never removed. It is inert, and it is what lets the agent start.
+
+`--keep-default-on-exit` suppresses the shutdown revert. It exists for
+debugging; do not use it on a cluster you care about.
+
+### Rescuing a node by hand
+
+If a node is wedged anyway - node-config was SIGKILLed while the agent was also
+gone - every pull on it fails with `dial
+unix:///run/gantry-snapshotter/snapshotter.sock`. Recovery needs a pod that
+needs no pull:
+
+```sh
+# A privileged pod pinned to the node, using the bootstrap handler and an image
+# tag that is already resident there, so nothing has to be unpacked.
+kubectl run rescue --image=<a tag already on that node> --image-pull-policy=IfNotPresent \
+  --overrides='{"spec":{"nodeName":"<node>","hostPID":true,
+    "runtimeClassName":"gantry-bootstrap",
+    "containers":[{"name":"rescue","image":"<same tag>","command":["sleep","3600"],
+      "securityContext":{"privileged":true}}]}}'
+
+# Then, on the host, drop phase 2 and restart containerd.
+kubectl exec rescue -- nsenter -t 1 -m -u -i -n -p -- \
+  sh -c "cp /etc/containerd/config.toml.gantry-orig /etc/containerd/config.toml && \
+         systemctl restart containerd"
+```
+
+node-config will re-apply both phases on its next pass once the agent is back.
+
 ### Why the agent runs under its own RuntimeClass
 
 The socket at `/run/gantry-snapshotter/snapshotter.sock` is on tmpfs, so it does
@@ -126,6 +179,8 @@ the pod that creates that socket, and the node could never start a pod again.
 `runtimeClassName: gantry-bootstrap` selects a containerd handler pinned to
 overlayfs, which breaks the cycle. Do not remove it, and do not give that
 handler `snapshotter = "gantry"`.
+
+It covers sandbox creation only. Image pulls are covered by the watchdog above.
 
 ## Uninstall
 

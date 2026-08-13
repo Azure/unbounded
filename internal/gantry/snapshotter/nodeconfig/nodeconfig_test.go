@@ -413,3 +413,156 @@ func TestSaveRoundTrips(t *testing.T) {
 		}
 	}
 }
+
+func TestRevertUndoesOnlyTheDefault(t *testing.T) {
+	t.Parallel()
+
+	doc := parse(t, aksConfig)
+	opts := Options{Platform: "linux/amd64"}
+
+	for _, phase := range []Phase{PhaseBootstrap, PhaseDefault} {
+		if _, err := Apply(doc, phase, opts); err != nil {
+			t.Fatalf("Apply(%d): %v", phase, err)
+		}
+	}
+
+	changed, err := Revert(doc, opts)
+	if err != nil {
+		t.Fatalf("Revert: %v", err)
+	}
+
+	if !changed {
+		t.Fatal("expected a change")
+	}
+
+	images := []string{"plugins", "io.containerd.cri.v1.images"}
+
+	if got := lookup(doc, path(images, "snapshotter")); got != nil {
+		t.Fatalf("snapshotter = %v, want it gone so containerd falls back to overlayfs", got)
+	}
+
+	if got := lookup(doc, []string{"plugins", "io.containerd.transfer.v1.local", "unpack_config"}); got != nil {
+		t.Fatalf("unpack_config = %v, want it gone", got)
+	}
+
+	// Phase one has to survive: the proxy plugin and the bootstrap handler are
+	// what let the snapshotter's own pod run at all.
+	if got := lookup(doc, []string{"proxy_plugins", DefaultSnapshotter, "address"}); got != DefaultSocket {
+		t.Fatalf("proxy plugin address = %v, want phase one left alone", got)
+	}
+
+	runtimes := []string{"plugins", "io.containerd.cri.v1.runtime", "containerd", "runtimes"}
+	if got := lookup(doc, path(runtimes, DefaultBootstrapRuntime, "snapshotter")); got != "overlayfs" {
+		t.Fatalf("bootstrap runtime snapshotter = %v, want phase one left alone", got)
+	}
+
+	// These two are inert without the snapshotter, and taking them out would
+	// cost a second containerd restart to put them back.
+	if got := lookup(doc, path(images, "disable_snapshot_annotations")); got != false {
+		t.Fatalf("disable_snapshot_annotations = %v, want it left alone", got)
+	}
+}
+
+func TestRevertIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	doc := parse(t, aksConfig)
+	opts := Options{Platform: "linux/amd64"}
+
+	if _, err := Apply(doc, PhaseDefault, opts); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if _, err := Revert(doc, opts); err != nil {
+		t.Fatalf("Revert: %v", err)
+	}
+
+	changed, err := Revert(doc, opts)
+	if err != nil {
+		t.Fatalf("second Revert: %v", err)
+	}
+
+	if changed {
+		t.Fatal("second Revert reported a change")
+	}
+}
+
+func TestRevertOnAnUntouchedNodeChangesNothing(t *testing.T) {
+	t.Parallel()
+
+	doc := parse(t, aksConfig)
+
+	changed, err := Revert(doc, Options{Platform: "linux/amd64"})
+	if err != nil {
+		t.Fatalf("Revert: %v", err)
+	}
+
+	if changed {
+		t.Fatal("expected no change on a node that was never configured")
+	}
+}
+
+func TestRevertKeepsOtherPlatforms(t *testing.T) {
+	t.Parallel()
+
+	doc := parse(t, aksConfig+`
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux/arm64"
+  snapshotter = "gantry"
+`)
+
+	if _, err := Apply(doc, PhaseDefault, Options{Platform: "linux/amd64"}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if _, err := Revert(doc, Options{Platform: "linux/amd64"}); err != nil {
+		t.Fatalf("Revert: %v", err)
+	}
+
+	entries, ok := lookup(doc, []string{"plugins", "io.containerd.transfer.v1.local", "unpack_config"}).([]any)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("unpack_config = %v, want only the arm64 entry left", entries)
+	}
+
+	row, _ := entries[0].(map[string]any)
+	if row["platform"] != "linux/arm64" {
+		t.Fatalf("unpack_config entry = %v", row)
+	}
+}
+
+func TestRevertThenApplyRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	doc := parse(t, aksConfig)
+	opts := Options{Platform: "linux/amd64"}
+
+	if _, err := Apply(doc, PhaseDefault, opts); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if _, err := Revert(doc, opts); err != nil {
+		t.Fatalf("Revert: %v", err)
+	}
+
+	changed, err := Apply(doc, PhaseDefault, opts)
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	if !changed {
+		t.Fatal("expected the snapshotter to be put back")
+	}
+
+	images := []string{"plugins", "io.containerd.cri.v1.images"}
+	if got := lookup(doc, path(images, "snapshotter")); got != DefaultSnapshotter {
+		t.Fatalf("snapshotter = %v, want it restored", got)
+	}
+}
+
+func TestRevertWithoutCRIPlugin(t *testing.T) {
+	t.Parallel()
+
+	if _, err := Revert(Document{}, Options{}); !errors.Is(err, ErrNoCRIPlugin) {
+		t.Fatalf("Revert = %v, want ErrNoCRIPlugin", err)
+	}
+}

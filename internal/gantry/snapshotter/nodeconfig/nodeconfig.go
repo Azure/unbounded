@@ -294,6 +294,63 @@ func applyDefault(doc Document, opts Options) (bool, error) {
 	return setPath(doc, unpack, entries) || changed, nil
 }
 
+// Revert undoes phase two, leaving phase one in place, and reports whether
+// anything changed.
+//
+// This is not an uninstall. It is what keeps a node able to start pods when the
+// snapshotter is not serving. containerd unpacks every image through the CRI
+// default snapshotter, and the runtime handler a pod names has no say in it, so
+// once phase two is written a node whose socket is gone cannot pull anything -
+// including the snapshotter's own image, which is exactly what an upgrade needs
+// it to do. Dropping back to overlayfs breaks that cycle; phase one stays so the
+// proxy plugin and the bootstrap handler survive, and phase two goes back on as
+// soon as the socket answers again.
+func Revert(doc Document, opts Options) (bool, error) {
+	opts = opts.withDefaults()
+
+	layout, err := detect(doc)
+	if err != nil {
+		return false, err
+	}
+
+	// Only the snapshotter itself is removed. The two annotation settings are
+	// inert without it, and taking them out as well would mean a second
+	// containerd restart to put them back for no gain.
+	changed := deletePath(doc, layout.snapshotter)
+
+	if opts.Platform == "" {
+		return changed, nil
+	}
+
+	unpack := []string{"plugins", "io.containerd.transfer.v1.local", "unpack_config"}
+
+	entries, ok := lookup(doc, unpack).([]any)
+	if !ok {
+		return changed, nil
+	}
+
+	kept := make([]any, 0, len(entries))
+
+	for _, entry := range entries {
+		row, ok := entry.(map[string]any)
+		if ok && row["platform"] == opts.Platform && row["snapshotter"] == opts.Snapshotter {
+			continue
+		}
+
+		kept = append(kept, entry)
+	}
+
+	if len(kept) == len(entries) {
+		return changed, nil
+	}
+
+	if len(kept) == 0 {
+		return deletePath(doc, unpack) || changed, nil
+	}
+
+	return setPath(doc, unpack, kept) || changed, nil
+}
+
 // layout is where the keys this cares about live, which depends on which
 // generation of the CRI plugin the node's configuration uses.
 type layout struct {
@@ -410,6 +467,31 @@ func setPath(doc Document, path []string, value any) bool {
 	}
 
 	table[last] = value
+
+	return true
+}
+
+// deletePath removes a key and reports whether the document changed. Tables
+// left empty are kept: they are the node's own, and an empty table is what its
+// configuration already looked like before anything was written into it.
+func deletePath(doc Document, path []string) bool {
+	table := map[string]any(doc)
+
+	for _, key := range path[:len(path)-1] {
+		next, ok := table[key].(map[string]any)
+		if !ok {
+			return false
+		}
+
+		table = next
+	}
+
+	last := path[len(path)-1]
+	if _, ok := table[last]; !ok {
+		return false
+	}
+
+	delete(table, last)
 
 	return true
 }
