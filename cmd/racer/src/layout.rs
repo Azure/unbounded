@@ -1040,7 +1040,11 @@ pub fn grow_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()
     let mut g = read_geometry(path)?;
     let want = claim(cfg.node.store_bytes, cfg);
     let have: [u64; 2] = CLASSES.map(|c| g.mblocks(c));
-    let add: [u64; 2] = std::array::from_fn(|i| want[i].saturating_sub(have[i]));
+    let add = fitted(
+        &g,
+        std::array::from_fn(|i| want[i].saturating_sub(have[i])),
+        cfg.node.store_bytes,
+    );
 
     let f = open_direct(path, true)?.meter(Arc::new(Limiter::new(
         cfg.node.store_max_iops,
@@ -1066,6 +1070,34 @@ pub fn grow_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()
         sync(&f)?;
     }
     save_geometry(&f, &g)
+}
+
+/// Trim the opportunistic part of a growth to what appending can actually place.
+///
+/// [`claim`] sizes the store's spare against a layout placed from scratch, but growth
+/// appends past the end of what is already there: every earlier run's metadata and its
+/// alignment padding is still in front, so the same mblock counts end further into the
+/// store than a fresh [`Geometry::place`] would put them. The difference is bounded and
+/// small, but it is not zero, and a store grown twice is enough to see it.
+///
+/// Only the 4 MiB class is trimmed. The 4 KiB class is what the config asked for rather
+/// than spare the store happened to have, so a store that cannot hold it is a store too
+/// small for this node's share, which `check` is there to say out loud.
+fn fitted(g: &Geometry, mut add: [u64; 2], store_bytes: u64) -> [u64; 2] {
+    loop {
+        let mut trial = *g;
+        let mut placed = true;
+        for (i, class) in CLASSES.into_iter().enumerate() {
+            if add[i] > 0 && trial.append(class, add[i]).is_err() {
+                placed = false;
+                break;
+            }
+        }
+        if add[1] == 0 || (placed && trial.alloc_end() <= store_bytes) {
+            return add;
+        }
+        add[1] -= 1;
+    }
 }
 
 /// Write `g` through every superblock copy that does not already carry it, preserving each
@@ -1526,6 +1558,56 @@ mod tests {
         // No room past the slabs means no tail, reported rather than wrapped.
         assert_eq!(g0.tail(g0.alloc_end()).1, 0);
         assert_eq!(g0.tail_chunks(0), 0);
+    }
+
+    /// A growth appends, so what [`claim`] sized against a layout placed from scratch does
+    /// not all fit. A store whose config has since shrunk is the clearest case: the slots
+    /// the deleted volume was given are still placed, and a fresh layout cannot see them.
+    #[test]
+    fn growth_claims_only_what_appending_fits() {
+        // The config the store was formatted for, then the smaller one it now carries.
+        let before = crate::config::Config::parse(
+            "node id=1 zone=1 store=/dev/x size=68719476736
+             universe 1 fabric_device_id=9
+               group 1 2 3
+               extent id=1 base=0 pages=400000 kind=lww zone=1
+             device 1 extents=1",
+        )
+        .unwrap();
+        let cfg = test_config();
+        const FIRST: u64 = 2 << 30;
+        const SECOND: u64 = 12 << 30;
+
+        let g = Geometry::plan(FIRST, &before).unwrap();
+        let want = claim(SECOND, &cfg);
+        let have: [u64; 2] = CLASSES.map(|c| g.mblocks(c));
+        let raw: [u64; 2] = std::array::from_fn(|i| want[i].saturating_sub(have[i]));
+
+        let appended = |add: [u64; 2]| {
+            let mut t = g;
+            for (i, class) in CLASSES.into_iter().enumerate() {
+                if add[i] > 0 {
+                    t.append(class, add[i]).unwrap();
+                }
+            }
+            t
+        };
+
+        // The untrimmed claim is what a fresh layout would hold, not what this one can.
+        assert_eq!(raw[0], 0, "the 4 KiB class already has more than it needs");
+        assert!(Geometry::place(want).alloc_end() <= SECOND);
+        assert!(appended(raw).alloc_end() > SECOND);
+
+        // Trimmed it fits, and it still hands the 4 MiB class the room it did find.
+        let add = fitted(&g, raw, SECOND);
+        assert!(add[1] < raw[1]);
+        let fit = appended(add);
+        assert!(fit.alloc_end() <= SECOND);
+        fit.check(SECOND).unwrap();
+        assert!(fit.slots(Class::Huge) > g.slots(Class::Huge));
+
+        // A store already big enough asks for nothing and is left alone.
+        assert_eq!(fitted(&g, [0, 0], SECOND), [0, 0]);
     }
 
     #[test]
