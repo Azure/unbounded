@@ -18,11 +18,12 @@ use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use crate::cache::Cache;
-use crate::config::{Config, GroupId, Kind, Live};
+use crate::config::{Config, GroupId, Kind};
 use crate::heal::{self, Tuple};
 use crate::layout::{self, Class, Geometry, MBLOCK};
 use crate::paxos::{Ballot, Register};
 use crate::runtime::{self, Buf, Disk, Durability, PoolBuf};
+use crate::server;
 
 use shard::Ticket;
 use shard::{Act, Lookup, Maps, Shape, Shard, Staged};
@@ -105,7 +106,6 @@ const HUGE_BLOCKS: u32 = (layout::HUGE_PAGE / layout::SMALL_PAGE) as u32;
 pub struct Allocator {
     disk: Disk,
     geo: Geometry,
-    cfg: Live<Config>,
     cores: usize,
     shards: Box<[RefCell<Core>]>,
     /// Consensus side state as the superblock held it at startup: `promised_term` per
@@ -175,23 +175,13 @@ impl Allocator {
     /// The core that owns an address's index shard, and so allocates for it. Reuses the
     /// consensus group mapping so the lookup rides the hop consensus already makes.
     fn owner(&self, addr: GlobalAddr, class: Class) -> usize {
-        self.config().group(addr.0).index() as usize % shards_for(self.cores, &self.geo, class)
-    }
-
-    /// The configuration currently in force. A read is a single load; the control thread
-    /// swaps on reload and the previous generation lives until the reload after that.
-    pub fn config(&self) -> &Config {
-        self.cfg.get()
-    }
-
-    /// Adopt a new configuration. Control thread only, in a reload's build step, post-check.
-    pub fn install(&self, cfg: Config) {
-        self.cfg.install(cfg);
+        server::config().group(addr.0).index() as usize % shards_for(self.cores, &self.geo, class)
     }
 
     /// The extent's page kind, class and tombstone epoch, from one lookup.
     fn extent(&self, addr: GlobalAddr) -> Option<(Kind, Class, u64)> {
-        let e = self.config().extent_at(addr.0)?;
+        let cfg = server::config();
+        let e = cfg.extent_at(addr.0)?;
         Some((
             e.kind,
             if e.huge { Class::Huge } else { Class::Small },
@@ -323,7 +313,7 @@ impl Allocator {
         guard: Option<u64>,
         ballot: Ballot,
     ) -> Result<Ticket, Status> {
-        let epoch = self.config().tombstone_epoch_of(addr.0);
+        let epoch = server::config().tombstone_epoch_of(addr.0);
         self.top_up(class);
         self.shard(runtime::core())
             .reserve(addr, kind, class, guard, ballot, epoch)
@@ -339,14 +329,14 @@ impl Allocator {
         crc: u32,
     ) -> Result<Option<Staged>, Status> {
         let kind = self.extent(addr).ok_or(Status::Unmapped)?.0;
-        maps!(self.config(), m);
+        maps!(&server::config(), m);
         self.shard(runtime::core())
             .stage(addr, kind, class, t, crc, &m)
     }
 
     /// Undo a reservation whose data write failed, so the slot is not leaked.
     fn unreserve(&self, class: Class, t: Ticket) {
-        maps!(self.config(), m);
+        maps!(&server::config(), m);
         self.shard(runtime::core()).unreserve(class, t, &m);
     }
 
@@ -914,7 +904,7 @@ impl Allocator {
         self.flush_until(class, st.li, st.seq).await?;
         // Only now is it safe to give the previous slot back.
         if let Some(old) = st.stale {
-            maps!(self.config(), m);
+            maps!(&server::config(), m);
             self.shard(runtime::core()).release(class, old, &m);
         }
         Ok(true)
@@ -938,7 +928,7 @@ impl Allocator {
         };
         let holder = (slot / class.k() % self.cores as u32) as usize;
         let retire = move || async move {
-            maps!(self.config(), m);
+            maps!(&server::config(), m);
             let flush = self.shard(runtime::core()).release(class, slot, &m);
             if let Some((li, seq)) = flush {
                 self.flush_until(class, li, seq).await?;
@@ -1059,8 +1049,8 @@ impl Allocator {
         guard: Option<u64>,
         ballot: Ballot,
     ) -> Result<Option<(u32, u64)>, Status> {
-        let epoch = self.config().tombstone_epoch_of(addr.0);
-        maps!(self.config(), m);
+        let epoch = server::config().tombstone_epoch_of(addr.0);
+        maps!(&server::config(), m);
         self.shard(runtime::core())
             .trim(addr, kind, class, guard, ballot, epoch, &m)
     }
@@ -1151,7 +1141,7 @@ impl Allocator {
         let class = class_of(huge);
         runtime::on_core(core, move || async move {
             let now = runtime::now();
-            maps!(self.config(), m);
+            maps!(&server::config(), m);
             self.shard(runtime::core())
                 .snap_next(class, id, seq, universe, &m, now)
         })
@@ -1195,7 +1185,7 @@ impl Allocator {
         let owner = self.owner(addr, class);
         // The mblock index is the owner's, so the flush has to happen there too.
         runtime::on_core(owner, move || async move {
-            maps!(self.config(), m);
+            maps!(&server::config(), m);
             // Bound before the match: a temporary in the scrutinee would hold the shard
             // borrow across the flush's await.
             let hit = self
@@ -1216,8 +1206,8 @@ impl Allocator {
     /// the only garbage collection in the system, metadata only, off any critical path.
     pub fn tick(&self, now: Instant) {
         let core = runtime::core();
-        let cfg = self.config();
-        maps!(cfg, m);
+        let cfg = server::config();
+        maps!(&cfg, m);
         // Nothing to reclaim until some extent has collected at least once.
         let collecting = cfg.collecting();
         let mut c = self.core_of(core);
@@ -1278,7 +1268,7 @@ impl Future for Park {
 pub fn open(
     path: &std::path::Path,
     disk: Disk,
-    cfg: Config,
+    cfg: &Config,
     cores: usize,
 ) -> std::io::Result<&'static Allocator> {
     let geo = layout::read_geometry(path)?;
@@ -1291,10 +1281,9 @@ pub fn open(
 
     // Nothing to heal a lost mblock from without peers, so a miss there stays a hole.
     let recoverable = cfg.peer_count() > 0;
-    // Scoped so the lookup closures' borrow of `cfg` ends before `cfg` is handed over.
     let (shards, quarantined) = {
-        maps!(&cfg, m);
-        shard::rebuild(&shape_of(&geo, &cfg, cores), cores, scans, &m)
+        maps!(cfg, m);
+        shard::rebuild(&shape_of(&geo, cfg, cores), cores, scans, &m)
     };
     let shards = shards
         .into_iter()
@@ -1313,7 +1302,6 @@ pub fn open(
     Ok(Box::leak(Box::new(Allocator {
         disk,
         geo,
-        cfg: Live::new(cfg),
         cores,
         shards,
         boot,
@@ -1505,6 +1493,7 @@ mod tests {
     use crate::layout::{self, Class, State};
     use crate::paxos::Ballot;
     use crate::runtime::{self, Cfg, Errno, Handler, PoolBuf, Request};
+    use crate::server::{self, Dataplane};
 
     const IMG: &str = "racer-alloc.img";
     /// Just what the base config plans, so appended runs need a larger store, not slack.
@@ -1519,10 +1508,6 @@ mod tests {
     struct Driver;
     static DRIVER: Driver = Driver;
 
-    pub struct Harness {
-        alloc: &'static Allocator,
-    }
-
     static PHASE: AtomicUsize = AtomicUsize::new(0);
     static RESULT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
     static STARTED: AtomicUsize = AtomicUsize::new(0);
@@ -1530,26 +1515,26 @@ mod tests {
     static LOST: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
     impl Handler for Driver {
-        type Config = Harness;
-        type CoreState = ();
+        type Config = Dataplane;
+        type CoreState = server::CoreState;
 
-        fn core_state(&'static self, _cfg: &Harness, cores: usize) -> Vec<()> {
-            vec![(); cores]
+        fn core_state(&'static self, cfg: &Dataplane, cores: usize) -> Vec<server::CoreState> {
+            server::SERVER.core_state(cfg, cores)
         }
 
-        async fn handle(&'static self, _cfg: Cfg<Harness>, _req: Request) -> Result<(), Errno> {
+        async fn handle(&'static self, _cfg: Cfg<Dataplane>, _req: Request) -> Result<(), Errno> {
             Err(Errno::EOPNOTSUPP)
         }
 
-        fn tick(&'static self, cfg: Cfg<Harness>, now: Instant) {
-            cfg.alloc.tick(now);
+        fn tick(&'static self, cfg: Cfg<Dataplane>, now: Instant) {
+            cfg.alloc().tick(now);
             // Launch the script once, from core 0 onto core 1, to exercise the cross-core
             // path. `runtime::spawn` is core-local, so only a hop carries a task
             // elsewhere: polling once sends the message, dropping it abandons the reply.
             if runtime::core() != 0 || STARTED.swap(1, Ordering::SeqCst) == 1 {
                 return;
             }
-            let a = cfg.alloc;
+            let a = cfg.alloc();
             let phase = PHASE.load(Ordering::SeqCst);
             let mut hop = Box::pin(runtime::on_core(1, move || boxed(a, phase)));
             let w = Waker::noop();
@@ -1576,14 +1561,8 @@ mod tests {
 
         let cfg = Config::parse(text).unwrap();
         let rt = runtime::start(&DRIVER).expect("start");
-        rt.reload(move |c| {
-            let path = cfg.node.store.clone();
-            let disk = c.disk(&path, None, None)?;
-            let cores = c.cores();
-            let alloc = super::open(&path, disk, cfg, cores)?;
-            Ok(Harness { alloc })
-        })
-        .expect("reload");
+        rt.reload(move |c| server::bare_plane(c, cfg))
+            .expect("reload");
 
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
@@ -1731,7 +1710,7 @@ mod tests {
         put_small(a, dead, &pattern(11, SMALL)).await?;
         a.accept_trim(
             dead,
-            3 * a.config().tombstone_epoch_of(dead.0) + 1,
+            3 * server::config().tombstone_epoch_of(dead.0) + 1,
             Ballot::ZERO,
         )
         .await?;
@@ -1820,7 +1799,7 @@ mod tests {
         restart(a).await?;
 
         // The config that did not fit now does.
-        let short = layout::shortfall(&a.geometry(), a.config());
+        let short = layout::shortfall(&a.geometry(), &server::config());
         check!(short == 0, "growth left {short} pages unbacked");
 
         // Both appended runs hand out slots like any other, including the huge class,
