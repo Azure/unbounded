@@ -38,10 +38,19 @@ import (
 // SectorBytes is the unit device mapper tables are written in.
 const SectorBytes = 512
 
-// DefaultRoot is where layer mounts live. It is deliberately short: every
-// mounted layer contributes its path to the overlay mount's option string,
-// and that string has to fit in a page.
-const DefaultRoot = "/run/gantry-snapshotter/l"
+// DefaultRoot is where layer mounts live. Two things about it matter.
+//
+// It is short, because every mounted layer contributes its path to the overlay
+// mount's option string and that string has to fit in a page.
+//
+// It sits under the snapshotter's own root, next to the local snapshot
+// directories, because containerd shortens a long lowerdir list by chdir-ing to
+// the directory the layers share and passing the rest relative. Layer mounts
+// parked somewhere unrelated, say under /run, share nothing but / with the
+// local snapshots, so a stack that mixes cluster layers with locally unpacked
+// ones cannot be shortened at all and hits the page limit far sooner than the
+// built in overlay snapshotter would.
+const DefaultRoot = "/var/lib/gantry-snapshotter/l"
 
 // DefaultPrefix names the device mapper devices this package owns. Anything
 // under it is fair game for Prune, so it must not collide with another

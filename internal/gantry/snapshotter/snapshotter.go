@@ -118,6 +118,7 @@ type Catalog interface {
 type Mapper interface {
 	Ensure(ctx context.Context, layer catalog.Digest, addr segment.Address) (string, error)
 	Name(layer catalog.Digest, addr segment.Address) string
+	Root() string
 	Prune(ctx context.Context, keep map[string]struct{}) error
 }
 
@@ -151,14 +152,15 @@ type Options struct {
 
 // Snapshotter is a containerd snapshotter backed by the cluster blob catalog.
 type Snapshotter struct {
-	root    string
-	ms      *storage.MetaStore
-	cat     Catalog
-	maps    Mapper
-	queue   Submitter
-	opts    []string
-	log     *slog.Logger
-	missGap time.Duration
+	root      string
+	lowerRoot string
+	ms        *storage.MetaStore
+	cat       Catalog
+	maps      Mapper
+	queue     Submitter
+	opts      []string
+	log       *slog.Logger
+	missGap   time.Duration
 
 	syncMu   sync.Mutex
 	lastSync time.Time
@@ -199,15 +201,30 @@ func New(opts Options) (*Snapshotter, error) {
 		logger = slog.Default()
 	}
 
+	// Every lowerdir of every overlay this snapshotter builds is either a
+	// local snapshot directory under Root or a layer mount under the mapper's
+	// root. When those two share a parent, containerd can shorten a long
+	// lowerdir list by chdir-ing to it; when they do not, it cannot shorten
+	// anything and deep images run into the kernel's one page limit on mount
+	// options. That is a deployment mistake, not a runtime condition, so say
+	// so once at startup rather than at the first container start that trips
+	// over it.
+	lowerRoot := commonRoot(opts.Root, opts.Mapper.Root())
+	if lowerRoot == "" {
+		logger.Warn("gantry-snapshotter: layer mounts and local snapshots share no parent directory, deep images may exceed the mount option limit",
+			"root", opts.Root, "map-root", opts.Mapper.Root())
+	}
+
 	return &Snapshotter{
-		root:    opts.Root,
-		ms:      ms,
-		cat:     opts.Catalog,
-		maps:    opts.Mapper,
-		queue:   opts.Queue,
-		opts:    mountOpts,
-		log:     logger,
-		missGap: gap,
+		root:      opts.Root,
+		lowerRoot: lowerRoot,
+		ms:        ms,
+		cat:       opts.Catalog,
+		maps:      opts.Mapper,
+		queue:     opts.Queue,
+		opts:      mountOpts,
+		log:       logger,
+		missGap:   gap,
 	}, nil
 }
 

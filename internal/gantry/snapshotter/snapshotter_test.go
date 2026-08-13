@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -127,6 +128,8 @@ func (m *fakeMapper) Name(layer catalog.Digest, addr segment.Address) string {
 	return "gsnap-" + layer.Short() + addr.Fingerprint()
 }
 
+func (m *fakeMapper) Root() string { return m.root }
+
 func (m *fakeMapper) Ensure(_ context.Context, layer catalog.Digest, addr segment.Address) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -225,6 +228,16 @@ func digestOf(b byte) catalog.Digest {
 	for i := range d {
 		d[i] = b
 	}
+
+	return d
+}
+
+// digestAt builds a distinct digest for layer n. digestOf only has 256 values
+// and a deep stack needs two digests per layer, so tag separates the chain IDs
+// from the diff IDs and n varies the rest.
+func digestAt(tag byte, n int) catalog.Digest {
+	d := digestOf(tag)
+	binary.BigEndian.PutUint32(d[1:5], uint32(n)) //nolint:gosec // n is a small test index.
 
 	return d
 }
@@ -538,6 +551,140 @@ func TestMountsStackClusterLayers(t *testing.T) {
 		if n != 3 {
 			t.Fatalf("layer %s mapped %d times, want 3 (adopt, Prepare, Mounts)", name, n)
 		}
+	}
+}
+
+func TestCommonRoot(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		a    string
+		b    string
+		want string
+	}{
+		{"same dir", "/var/lib/gs", "/var/lib/gs", "/var/lib/gs"},
+		{"sibling", "/var/lib/gs", "/var/lib/gs/l", "/var/lib/gs"},
+		{"shared parent", "/var/lib/gs/snapshots", "/var/lib/gs/l", "/var/lib/gs"},
+		{"only the root", "/var/lib/gs", "/run/gs/l", ""},
+		{"trailing slash", "/var/lib/gs/", "/var/lib/gs/l/", "/var/lib/gs"},
+		{"relative", "var/lib/gs", "/var/lib/gs/l", ""},
+		{"partial element", "/var/lib/gsnap", "/var/lib/gs", "/var/lib"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := commonRoot(tc.a, tc.b); got != tc.want {
+				t.Fatalf("commonRoot(%q, %q) = %q, want %q", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckOptionsCountsWhatTheKernelSees(t *testing.T) {
+	t.Parallel()
+
+	// One option of exactly the limit is the largest thing that fits, because
+	// checkOptions charges a comma for every option after the first.
+	s := &Snapshotter{}
+
+	if err := s.checkOptions([]string{strings.Repeat("a", mountDataLimit)}, 1); err != nil {
+		t.Fatalf("an option at the limit was refused: %v", err)
+	}
+
+	if err := s.checkOptions([]string{strings.Repeat("a", mountDataLimit+1)}, 1); err == nil {
+		t.Fatal("an option past the limit was accepted")
+	}
+
+	// Two options whose lengths sum to exactly the limit only overflow it
+	// because of the comma between them.
+	head := strings.Repeat("a", mountDataLimit-1000)
+	tail := strings.Repeat("b", 1000)
+
+	if err := s.checkOptions([]string{head, tail}, 1); err == nil {
+		t.Fatal("checkOptions did not charge for the separating comma")
+	}
+}
+
+func TestCheckOptionsCreditsTheSharedPrefix(t *testing.T) {
+	t.Parallel()
+
+	// Every lowerdir under a common root loses that root plus its slash once
+	// containerd chdirs, so a stack that overflows without the credit fits
+	// with it.
+	const root = "/var/lib/gantry-snapshotter"
+
+	layers := 8
+	dirs := make([]string, 0, layers)
+
+	for i := range layers {
+		dirs = append(dirs, fmt.Sprintf("%s/l/%s", root, strings.Repeat("x", 500)+fmt.Sprint(i)))
+	}
+
+	options := []string{"lowerdir=" + strings.Join(dirs, ":")}
+
+	bare := &Snapshotter{}
+	if err := bare.checkOptions(options, layers); err == nil {
+		t.Fatal("a stack with no shared root should not fit in one page")
+	}
+
+	shared := &Snapshotter{lowerRoot: root}
+	if err := shared.checkOptions(options, layers); err != nil {
+		t.Fatalf("the shared root was not credited: %v", err)
+	}
+
+	// A single lowerdir is never compacted, so it gets no credit.
+	if err := shared.checkOptions(options, 1); err == nil {
+		t.Fatal("a lone lowerdir was credited a compaction that never happens")
+	}
+}
+
+func TestMountsRefusesAStackTooDeepForOnePage(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	if h.sn.lowerRoot == "" {
+		t.Fatalf("harness roots share no parent: %q and %q", h.sn.root, h.m.root)
+	}
+
+	// Each extra layer costs its mapped path, a colon, and the shared root it
+	// gives back. Overshoot so the refusal cannot be an off-by-one.
+	per := len(h.m.root) + 1 + len(h.m.Name(digestOf(0), addrOf(0))) + 1 - (len(h.sn.lowerRoot) + 1)
+	if per <= 0 {
+		t.Fatalf("a mapped layer costs %d bytes, the test cannot overflow", per)
+	}
+
+	layers := mountDataLimit/per + 8
+
+	parent := ""
+
+	for i := range layers {
+		chain, diff := digestAt(1, i), digestAt(0x11, i)
+		h.adopt(t, fmt.Sprintf("extract-%d", i), parent, chain, diff, uint32(i)) //nolint:gosec // i is bounded by layers.
+		parent = chain.String()
+	}
+
+	// A shallower stack still works, so the refusal is about depth and not
+	// about the chain being broken.
+	if _, err := h.sn.Prepare(h.ctx, "shallow", digestAt(1, 3).String()); err != nil {
+		t.Fatalf("a four layer stack was refused: %v", err)
+	}
+
+	_, err := h.sn.Prepare(h.ctx, "container", parent)
+	if err == nil {
+		t.Fatalf("a %d layer stack was accepted", layers)
+	}
+
+	if !errdefs.IsFailedPrecondition(err) {
+		t.Fatalf("Prepare failed with %v, want a failed precondition", err)
+	}
+
+	// The refusal must not leave the key behind, or the pod can never retry.
+	if _, err := h.sn.Stat(h.ctx, "container"); err == nil {
+		t.Fatal("a refused Prepare left its snapshot in the metastore")
 	}
 }
 

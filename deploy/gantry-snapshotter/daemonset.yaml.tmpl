@@ -13,14 +13,14 @@
 #     effectively root on the node. Treat this DaemonSet with the same
 #     suspicion as a CSI node plugin.
 #
-#   - mountPropagation: Bidirectional on /run/gantry-snapshotter. Every
-#     image layer is mounted by this container at
-#     /run/gantry-snapshotter/l/<name>. runc assembles container rootfs
-#     in the host mount namespace, so those mounts MUST propagate back
-#     out. Without Bidirectional the overlay lowerdirs resolve to empty
-#     directories on the host and containers start with a rootfs that
-#     is missing every cluster-supplied layer. This is the single most
-#     common way to misconfigure this DaemonSet.
+#   - mountPropagation: Bidirectional on both hostPaths. Every image
+#     layer is mounted by this container at
+#     /var/lib/gantry-snapshotter/l/<name>. runc assembles container
+#     rootfs in the host mount namespace, so those mounts MUST propagate
+#     back out. Without Bidirectional the overlay lowerdirs resolve to
+#     empty directories on the host and containers start with a rootfs
+#     that is missing every cluster-supplied layer. This is the single
+#     most common way to misconfigure this DaemonSet.
 #
 #   - The socket lives under the same hostPath, which is why containerd
 #     can reach it at /run/gantry-snapshotter/snapshotter.sock.
@@ -134,7 +134,14 @@ spec:
             # lets some other node ingest that layer.
             - --work-headroom={{ .WorkHeadroom | default "8589934592" }}
             - --devices=/run/racer/image-devices.json
-            - --map-root=/run/gantry-snapshotter/l
+            # Layer mounts sit under --root on purpose. containerd
+            # shortens a long overlay lowerdir list by chdir-ing to the
+            # directory every lower shares and passing the rest
+            # relative; layer mounts parked under /run would share
+            # nothing but / with the local snapshot directories, so a
+            # stack that mixes cluster layers with locally unpacked ones
+            # could not be shortened at all.
+            - --map-root=/var/lib/gantry-snapshotter/l
             - --containerd-socket=/run/containerd/containerd.sock
             - --metrics-addr=:9096
           env:
@@ -210,8 +217,10 @@ spec:
             - name: run
               mountPath: /run/gantry-snapshotter
               mountPropagation: Bidirectional
+            # Bidirectional for the same reason: --map-root lives here.
             - name: state
               mountPath: /var/lib/gantry-snapshotter
+              mountPropagation: Bidirectional
             # The operator-rendered image device description.
             - name: racer
               mountPath: /run/racer

@@ -27,6 +27,15 @@ import (
 // go at once would burst the device's queue for no gain.
 const mapConcurrency = 16
 
+// mountDataLimit is how many bytes of option text mount(2) will accept. The
+// kernel copies the option string into a single page and NUL terminates it, so
+// anything past that is silently dropped: an overlay whose lowerdir list
+// overflows does not fail cleanly, it mounts a short stack and the container
+// comes up missing files. containerd checks this as well, but only after it has
+// tried to shrink the list, and by then the error names neither the snapshot
+// nor the layer count.
+var mountDataLimit = os.Getpagesize() - 1
+
 // parentRef is one ancestor of a snapshot, resolved far enough to know where
 // its filesystem comes from.
 type parentRef struct {
@@ -267,11 +276,72 @@ func (s *Snapshotter) mounts(ctx context.Context, sn storage.Snapshot, parents [
 	options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(paths, ":")))
 	options = append(options, s.opts...)
 
+	if err := s.checkOptions(options, len(paths)); err != nil {
+		return nil, err
+	}
+
 	return []mount.Mount{{
 		Type:    "overlay",
 		Source:  "overlay",
 		Options: options,
 	}}, nil
+}
+
+// checkOptions refuses an overlay the kernel would truncate.
+//
+// containerd shortens a long lowerdir list before it calls mount(2): it finds
+// the directory every lower shares, chdirs there, and passes the rest relative
+// (compactLowerdirOption in core/mount). That saves the shared prefix from
+// every lower, so model the same saving here rather than refusing a mount that
+// would in fact have gone through.
+//
+// The saving modelled is the one this snapshotter can guarantee, the parent
+// its own root and the mapper's root have in common. containerd computes the
+// prefix from the actual paths, which is never shorter, so a stack this accepts
+// is always one containerd can fit. A stack this refuses could in principle
+// have fit, but only past roughly a hundred and forty layers, well beyond what
+// any image format allows.
+func (s *Snapshotter) checkOptions(options []string, layers int) error {
+	size := len(options) - 1
+	for _, o := range options {
+		size += len(o)
+	}
+
+	if s.lowerRoot != "" && layers > 1 {
+		size -= layers * (len(s.lowerRoot) + 1)
+	}
+
+	if size <= mountDataLimit {
+		return nil
+	}
+
+	return fmt.Errorf("overlay of %d layers needs %d bytes of mount options but the kernel takes %d: %w",
+		layers, size, mountDataLimit, errdefs.ErrFailedPrecondition)
+}
+
+// commonRoot is the deepest directory both paths are under, or "" when they
+// share nothing but the filesystem root.
+func commonRoot(a, b string) string {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if !filepath.IsAbs(a) || !filepath.IsAbs(b) {
+		return ""
+	}
+
+	as, bs := strings.Split(a, "/"), strings.Split(b, "/")
+
+	var shared []string
+
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		if as[i] != bs[i] {
+			break
+		}
+
+		shared = append(shared, as[i])
+	}
+
+	// The split of an absolute path starts with an empty element, so a join of
+	// nothing but that is "", which is the case where the two share only "/".
+	return strings.Join(shared, "/")
 }
 
 // parentPaths turns ancestors into directories, mapping and mounting any RACER

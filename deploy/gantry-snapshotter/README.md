@@ -121,6 +121,7 @@ can be tuned without changing its `args`. The ones worth knowing:
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--devices` | `/run/racer/image-devices.json` | Re-read on a timer; the agent picks up new segments without a restart |
+| `--map-root` | `/var/lib/gantry-snapshotter/l` | Where layer mounts appear. Keep it short and under the same parent as `--root`, or deep images run out of mount options |
 | `--work-headroom` | `4Gi` (DaemonSet sets `8Gi`) | Free bytes on the work filesystem an ingest refuses to spend. Raise it above the kubelet's `nodefs` eviction threshold on nodes with small root disks |
 | `--format-catalog` | `false` | The DaemonSet sets it to `true`. Formatting is a compare-and-swap on block zero, so every node may safely try |
 | `--adopt-segments` | `true` | Register newly visible segments and open one for writing if none is open |
@@ -141,10 +142,21 @@ wrong, check the logs for `catalog unavailable` before assuming a data
 problem.
 
 **Mount propagation is the usual misconfiguration.** Layer mounts are made
-inside the agent's mount namespace at `/run/gantry-snapshotter/l/<name>` and
-must propagate to the host, because runc assembles the container rootfs
+inside the agent's mount namespace at `/var/lib/gantry-snapshotter/l/<name>`
+and must propagate to the host, because runc assembles the container rootfs
 there. If containers start with layers missing rather than failing outright,
 check that `mountPropagation: Bidirectional` survived your overlay.
+
+**An overlay's options have to fit in one page.** The kernel copies mount
+data into a single page, so the joined option string, and with it the whole
+`lowerdir=` list, is capped at 4095 bytes. containerd buys room back by
+chdir'ing to the longest common prefix of the lowerdirs, which only helps if
+the mapped layers and the locally unpacked ones share a parent. That is why
+`--map-root` defaults to a directory beside `--root` rather than somewhere
+under `/run`, and why the agent logs a warning at startup if you point them
+at unrelated paths. A stack that would overflow anyway is refused with a
+failed precondition rather than mounted with the deepest layers silently
+truncated.
 
 **Layer mappings outlive the containers that used them.** The agent leaves
 device-mapper targets and EROFS mounts in place so the next container that
