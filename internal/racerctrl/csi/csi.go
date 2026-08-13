@@ -289,23 +289,36 @@ func (d *Driver) NodePublishVolume(
 		return nil, status.Errorf(codes.Internal, "create target directory: %v", err)
 	}
 
-	// The bind mount source must exist as a file at the target. An empty
-	// regular file is the conventional placeholder for a block bind mount.
-	if err := ensurePlaceholder(target); err != nil {
-		return nil, status.Errorf(codes.Internal, "prepare target %s: %v", target, err)
+	// A publish that is already in place has to be recognised before anything
+	// else happens. The kubelet retries NodePublishVolume freely and a bind of
+	// the same source onto the same target does not fail with EBUSY: it
+	// succeeds and stacks another mount on top of the last one. Left alone
+	// that turns a handful of retries into a pile of mounts that
+	// NodeUnpublishVolume, which unmounts once, can never take back down.
+	bound, err := boundTo(device, target)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "inspect target %s: %v", target, err)
 	}
 
-	flags := uintptr(unix.MS_BIND)
-	if req.GetReadonly() {
-		flags |= unix.MS_RDONLY
-	}
-
-	if err := d.mount(device, target, flags); err != nil {
-		if !errors.Is(err, unix.EBUSY) {
-			return nil, status.Errorf(codes.Internal, "bind %s onto %s: %v", device, target, err)
+	if !bound {
+		// The bind mount source must exist as a file at the target. An empty
+		// regular file is the conventional placeholder for a block bind mount.
+		if err := ensurePlaceholder(target); err != nil {
+			return nil, status.Errorf(codes.Internal, "prepare target %s: %v", target, err)
 		}
-		// EBUSY means the bind is already in place, which is what a retried
-		// publish looks like.
+
+		flags := uintptr(unix.MS_BIND)
+		if req.GetReadonly() {
+			flags |= unix.MS_RDONLY
+		}
+
+		if err := d.mount(device, target, flags); err != nil {
+			if !errors.Is(err, unix.EBUSY) {
+				return nil, status.Errorf(codes.Internal, "bind %s onto %s: %v", device, target, err)
+			}
+			// EBUSY means the bind is already in place, which is what a retried
+			// publish looks like.
+		}
 	}
 
 	if req.GetReadonly() {
@@ -385,6 +398,44 @@ func checkBlockCapability(capability *csi.VolumeCapability) error {
 			"access mode %s is not supported: racer volumes are single-node",
 			capability.GetAccessMode().GetMode())
 	}
+}
+
+// boundTo reports whether the bind mount is already in place, by asking
+// whether the target is the same block device as the source.
+//
+// There is no need to parse /proc/self/mountinfo for this. A block bind mount
+// replaces the placeholder file with the device node itself, so the target
+// stats as a block device carrying the source's device number. A target that
+// is still a placeholder is a regular file, and a target that is missing has
+// never been published. Either way the answer is the one the caller needs: may
+// I skip the bind. A target that holds some other device is reported as
+// unbound so the caller lays the right one over it.
+func boundTo(device, target string) (bool, error) {
+	var at unix.Stat_t
+
+	if err := unix.Stat(target, &at); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	if at.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return false, nil
+	}
+
+	var source unix.Stat_t
+
+	if err := unix.Stat(device, &source); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return at.Rdev == source.Rdev, nil
 }
 
 // ensurePlaceholder creates the empty file a block bind mount is laid over.

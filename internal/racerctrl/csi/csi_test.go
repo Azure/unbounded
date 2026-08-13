@@ -24,6 +24,7 @@ import (
 // it and hands back device paths without touching a ublk device.
 type fakeAgent struct {
 	devices  map[string]string
+	device   string
 	staged   []string
 	unstaged []string
 	stageErr error
@@ -32,7 +33,7 @@ type fakeAgent struct {
 }
 
 func newFakeAgent() *fakeAgent {
-	return &fakeAgent{devices: map[string]string{}, nodeID: 7, zone: 3}
+	return &fakeAgent{devices: map[string]string{}, device: "/dev/ublkb42", nodeID: 7, zone: 3}
 }
 
 func (a *fakeAgent) Stage(_ context.Context, volume string) (string, error) {
@@ -41,7 +42,7 @@ func (a *fakeAgent) Stage(_ context.Context, volume string) (string, error) {
 	}
 
 	a.staged = append(a.staged, volume)
-	device := "/dev/ublkb42"
+	device := a.device
 	a.devices[volume] = device
 
 	return device, nil
@@ -441,6 +442,131 @@ func TestPublishToleratesAnExistingBind(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("expected a retried publish to succeed, got %v", err)
 	}
+}
+
+// A bind of the same source onto the same target does not fail with EBUSY: it
+// succeeds and stacks a second mount on the first. The kubelet retries
+// NodePublishVolume freely, so a driver that binds unconditionally builds a
+// pile of mounts that NodeUnpublishVolume, which unmounts once, can never take
+// back down. The driver has to notice the device is already there.
+func TestPublishSkipsABindThatIsAlreadyInPlace(t *testing.T) {
+	h := newHarness(t)
+	h.agent.device = hostBlockDevice(t)
+	staging := h.stagingPath(t, "pv-1")
+	target := h.publishPath(t, "pv-1", "pod-uid")
+
+	if _, err := h.driver.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "pv-1",
+		StagingTargetPath: staging,
+		VolumeCapability:  blockCapability(),
+	}); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	// A published target stats as the device itself. A symlink is the only way
+	// to arrange that without mknod, and it resolves to the same device
+	// number, which is all the driver looks at.
+	if err := os.Symlink(h.agent.device, target); err != nil {
+		t.Fatalf("stand in for a published target: %v", err)
+	}
+
+	if _, err := h.driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pv-1",
+		TargetPath:       target,
+		VolumeCapability: blockCapability(),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if len(h.mounts) != 0 {
+		t.Fatalf("expected no second bind onto a published target, got %v", h.mounts)
+	}
+}
+
+// A target that holds something other than the volume's device is not a
+// published target, whatever else it is.
+func TestPublishBindsOverATargetHoldingSomethingElse(t *testing.T) {
+	h := newHarness(t)
+	h.agent.device = hostBlockDevice(t)
+	staging := h.stagingPath(t, "pv-1")
+	target := h.publishPath(t, "pv-1", "pod-uid")
+
+	if _, err := h.driver.NodeStageVolume(t.Context(), &csi.NodeStageVolumeRequest{
+		VolumeId:          "pv-1",
+		StagingTargetPath: staging,
+		VolumeCapability:  blockCapability(),
+	}); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	if err := os.Symlink("/dev/null", target); err != nil {
+		t.Fatalf("stand in for a foreign target: %v", err)
+	}
+
+	if _, err := h.driver.NodePublishVolume(t.Context(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pv-1",
+		TargetPath:       target,
+		VolumeCapability: blockCapability(),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if len(h.mounts) != 1 {
+		t.Fatalf("expected one bind over the foreign target, got %v", h.mounts)
+	}
+}
+
+func TestBoundToReadsAnUnpublishedTarget(t *testing.T) {
+	device := hostBlockDevice(t)
+	dir := t.TempDir()
+
+	missing := filepath.Join(dir, "missing")
+	if bound, err := boundTo(device, missing); err != nil || bound {
+		t.Fatalf("expected a missing target to be unbound, got %v (%v)", bound, err)
+	}
+
+	placeholder := filepath.Join(dir, "placeholder")
+	if err := os.WriteFile(placeholder, nil, 0o600); err != nil {
+		t.Fatalf("write placeholder: %v", err)
+	}
+
+	if bound, err := boundTo(device, placeholder); err != nil || bound {
+		t.Fatalf("expected a placeholder to be unbound, got %v (%v)", bound, err)
+	}
+
+	// A device that has gone away cannot be bound anywhere, and saying so is
+	// more useful than failing the publish on a stat.
+	if bound, err := boundTo(filepath.Join(dir, "gone"), placeholder); err != nil || bound {
+		t.Fatalf("expected a missing device to be unbound, got %v (%v)", bound, err)
+	}
+}
+
+// hostBlockDevice names a block device that exists on the machine running the
+// test, so the driver's device-number comparison has something real to read.
+func hostBlockDevice(t *testing.T) string {
+	t.Helper()
+
+	names, err := os.ReadDir("/sys/block")
+	if err != nil {
+		t.Skipf("no block devices to read: %v", err)
+	}
+
+	for _, name := range names {
+		path := filepath.Join("/dev", name.Name())
+
+		var st unix.Stat_t
+		if err := unix.Stat(path, &st); err != nil {
+			continue
+		}
+
+		if st.Mode&unix.S_IFMT == unix.S_IFBLK {
+			return path
+		}
+	}
+
+	t.Skip("no block device node to compare against")
+
+	return ""
 }
 
 func TestPublishReportsAMountFailure(t *testing.T) {
