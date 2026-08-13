@@ -15,7 +15,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 const stateVersion = 2
@@ -197,33 +198,38 @@ func verifyContainerdConfig(options Options) error {
 		return fmt.Errorf("read host containerd config: %w", err)
 	}
 
-	if !containerdUsesCertsDir(data, options.ExpectedContainerdCerts) {
+	usesCertsDir, err := containerdUsesCertsDir(data, options.ExpectedContainerdCerts)
+	if err != nil {
+		return fmt.Errorf("parse host containerd config: %w", err)
+	}
+
+	if !usesCertsDir {
 		return fmt.Errorf("containerd config does not set registry config_path to %q", options.ExpectedContainerdCerts)
 	}
 
 	return nil
 }
 
-func containerdUsesCertsDir(data []byte, expected string) bool {
-	for _, rawLine := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(strings.SplitN(rawLine, "#", 2)[0])
+func containerdUsesCertsDir(data []byte, expected string) (bool, error) {
+	var config struct {
+		Plugins map[string]struct {
+			Registry struct {
+				ConfigPath string `toml:"config_path"`
+			} `toml:"registry"`
+		} `toml:"plugins"`
+	}
 
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "config_path" {
-			continue
-		}
+	if err := toml.Unmarshal(data, &config); err != nil {
+		return false, err
+	}
 
-		value = strings.TrimSpace(value)
-		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
-			value = value[1 : len(value)-1]
-		}
-
-		if value == expected {
-			return true
+	for _, plugin := range []string{"io.containerd.grpc.v1.cri", "io.containerd.cri.v1.images"} {
+		if config.Plugins[plugin].Registry.ConfigPath == expected {
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 func rejectCompetingDefaultRoute(options Options, desired Config) error {

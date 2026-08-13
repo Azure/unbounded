@@ -67,7 +67,6 @@ func TestNewEmptyRegistriesRequiresExplicitOptIn(t *testing.T) {
 	if _, err := New(&config.Config{}); err == nil {
 		t.Fatal("New accepted empty registries without opt-in")
 	}
-
 	c, err := New(&config.Config{AllowNoUpstreamRegistries: true})
 	if err != nil {
 		t.Fatalf("New with empty-registry opt-in: %v", err)
@@ -75,6 +74,14 @@ func TestNewEmptyRegistriesRequiresExplicitOptIn(t *testing.T) {
 
 	if len(c.registries) != 0 {
 		t.Fatalf("registries = %d, want 0", len(c.registries))
+	}
+}
+
+func TestNewNormalizesEndpointTrailingSlash(t *testing.T) {
+	client := newClient(t, config.UpstreamRegistry{Name: "registry.example.com", Endpoint: "https://registry.example.com/cache/"})
+
+	if got := client.registries["registry.example.com"].base.String(); got != "https://registry.example.com/cache" {
+		t.Fatalf("normalized endpoint = %q", got)
 	}
 }
 

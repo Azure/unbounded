@@ -139,6 +139,7 @@ func (o *registryAddOptions) runLocked(ctx context.Context, command *cobra.Comma
 	} else if endpoint == "" {
 		endpoint = "https://" + host
 	}
+	endpoint = strings.TrimRight(endpoint, "/")
 
 	snapshot := store.snapshot()
 	routeWasActive := false

@@ -48,6 +48,25 @@ func TestBaseInstallExcludesNodeConfigManifest(t *testing.T) {
 	}
 }
 
+func TestNodeConfigRequired(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		exists     bool
+		routeCount int
+		want       bool
+	}{
+		{name: "fresh inert install", want: false},
+		{name: "existing daemonset", exists: true, want: true},
+		{name: "missing daemonset with preserved routes", routeCount: 1, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := nodeConfigRequired(test.exists, test.routeCount); got != test.want {
+				t.Fatalf("nodeConfigRequired(%t, %d) = %t, want %t", test.exists, test.routeCount, got, test.want)
+			}
+		})
+	}
+}
+
 func TestSharedCredentialFromArbitrarilyNamedSecret(t *testing.T) {
 	client := fake.NewSimpleClientset(&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "team-a-pull-auth", Namespace: "workloads"},

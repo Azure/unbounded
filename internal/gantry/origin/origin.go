@@ -391,12 +391,14 @@ const (
 )
 
 func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
-	u, err := url.Parse(ur.Endpoint)
+	endpoint := strings.TrimRight(ur.Endpoint, "/")
+
+	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("parse endpoint: %w", err)
 	}
 
-	if u.Scheme != "http" && u.Scheme != "https" {
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("endpoint %q: scheme must be http or https", ur.Endpoint)
 	}
 

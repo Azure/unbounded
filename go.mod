@@ -62,6 +62,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/umoci v0.6.0
 	github.com/oracle/oci-go-sdk/v65 v65.122.0
+	github.com/pelletier/go-toml/v2 v2.3.0
 	github.com/pin/tftp/v3 v3.2.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/spf13/cobra v1.10.2
@@ -242,7 +243,6 @@ require (
 	github.com/olekukonko/tablewriter v1.0.9 // indirect
 	github.com/opencontainers/runtime-spec v1.3.0 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
-	github.com/pelletier/go-toml/v2 v2.3.0 // indirect
 	github.com/peterbourgon/diskv v2.0.1+incompatible // indirect
 	github.com/pierrec/lz4/v4 v4.1.14 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect

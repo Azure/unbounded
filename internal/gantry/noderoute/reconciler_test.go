@@ -602,12 +602,27 @@ func TestNormalizeRegistryHost(t *testing.T) {
 }
 
 func TestContainerdUsesCertsDir(t *testing.T) {
-	data := []byte("config_path = '/etc/containerd/certs.d' # managed\n")
-	if !containerdUsesCertsDir(data, "/etc/containerd/certs.d") {
-		t.Fatal("expected config_path match")
+	for _, plugin := range []string{"io.containerd.grpc.v1.cri", "io.containerd.cri.v1.images"} {
+		data := []byte("[plugins.\"" + plugin + "\".registry]\nconfig_path = '/etc/containerd/certs.d' # managed\n")
+
+		matched, err := containerdUsesCertsDir(data, "/etc/containerd/certs.d")
+		if err != nil {
+			t.Fatalf("containerdUsesCertsDir(%s): %v", plugin, err)
+		}
+
+		if !matched {
+			t.Fatalf("expected config_path match for %s", plugin)
+		}
 	}
 
-	if containerdUsesCertsDir(data, "/different") {
-		t.Fatal("unexpected config_path match")
+	wrongTable := []byte("[debug]\nconfig_path = '/etc/containerd/certs.d'\n")
+
+	matched, err := containerdUsesCertsDir(wrongTable, "/etc/containerd/certs.d")
+	if err != nil {
+		t.Fatalf("containerdUsesCertsDir(wrong table): %v", err)
+	}
+
+	if matched {
+		t.Fatal("config_path from an unrelated TOML table matched")
 	}
 }

@@ -60,8 +60,21 @@ release_base="https://github.com/${repository}/releases/download/${version}"
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
 
+if ! command -v cosign >/dev/null 2>&1; then
+  echo "cosign is required to verify the Gantry release signature" >&2
+  exit 1
+fi
+
 curl -fsSL "${release_base}/${archive}" -o "${temp_dir}/${archive}"
 curl -fsSL "${release_base}/checksums.txt" -o "${temp_dir}/checksums.txt"
+curl -fsSL "${release_base}/checksums.txt.bundle.json" -o "${temp_dir}/checksums.txt.bundle.json"
+
+identity="https://github.com/${repository}/.github/workflows/release.yaml@refs/tags/${version}"
+cosign verify-blob \
+  --bundle "${temp_dir}/checksums.txt.bundle.json" \
+  --certificate-identity "$identity" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "${temp_dir}/checksums.txt" >/dev/null
 
 expected=$(awk -v name="$archive" '$2 == name || $2 == ("*" name) { print $1; exit }' "${temp_dir}/checksums.txt")
 if [ -z "$expected" ]; then

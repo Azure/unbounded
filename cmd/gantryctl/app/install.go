@@ -57,11 +57,25 @@ func newInstallCommand(root *rootOptions) *cobra.Command {
 	return command
 }
 
-func (o *installOptions) run(ctx context.Context, output io.Writer) error {
+func (o *installOptions) run(ctx context.Context, output io.Writer) (returnErr error) {
 	clients, err := o.root.clusterClients()
 	if err != nil {
 		return err
 	}
+
+	created := make([]*unstructured.Unstructured, 0)
+	rollbackCreated := true
+
+	defer func() {
+		if returnErr == nil || !rollbackCreated || len(created) == 0 {
+			return
+		}
+
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), o.root.timeout)
+		defer cancel()
+
+		returnErr = errors.Join(returnErr, deleteInstallObjects(rollbackCtx, clients.resources, created))
+	}()
 
 	if err := ensureNoCompetingMirror(ctx, clients.resources, o.root.namespace); err != nil {
 		return err
@@ -77,37 +91,8 @@ func (o *installOptions) run(ctx context.Context, output io.Writer) error {
 			continue
 		}
 
-		if err := applyInstallManifest(ctx, clients.resources, manifest.Data); err != nil {
+		if err := applyInstallManifestTracked(ctx, clients.resources, manifest.Data, &created); err != nil {
 			return fmt.Errorf("apply %s: %w", manifest.Name, err)
-		}
-	}
-
-	nodeConfigExists := false
-
-	nodeConfig, err := clients.kube.AppsV1().DaemonSets(o.root.namespace).Get(ctx, nodeConfigDaemonSetName, metav1.GetOptions{})
-	if err == nil {
-		if nodeConfig.Labels["app.kubernetes.io/managed-by"] != fieldManager {
-			return fmt.Errorf("DaemonSet %s/%s is not owned by gantryctl", o.root.namespace, nodeConfigDaemonSetName)
-		}
-
-		nodeConfigExists = true
-
-		if err := applyNodeConfigManifest(ctx, clients.resources, o.root.namespace, o.image); err != nil {
-			return fmt.Errorf("update existing node-config DaemonSet: %w", err)
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get existing node-config DaemonSet: %w", err)
-	}
-
-	if o.wait {
-		if err := waitForDaemonSet(ctx, clients.kube, o.root.namespace, agentDaemonSetName, o.root.timeout); err != nil {
-			return err
-		}
-
-		if nodeConfigExists {
-			if err := waitForDaemonSet(ctx, clients.kube, o.root.namespace, nodeConfigDaemonSetName, o.root.timeout); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -118,10 +103,44 @@ func (o *installOptions) run(ctx context.Context, output io.Writer) error {
 
 	registryCount := len(store.agentConfig.UpstreamRegistries)
 
+	nodeConfigExists := false
+
+	nodeConfig, err := clients.kube.AppsV1().DaemonSets(o.root.namespace).Get(ctx, nodeConfigDaemonSetName, metav1.GetOptions{})
+	if err == nil {
+		if nodeConfig.Labels["app.kubernetes.io/managed-by"] != fieldManager {
+			return fmt.Errorf("DaemonSet %s/%s is not owned by gantryctl", o.root.namespace, nodeConfigDaemonSetName)
+		}
+
+		nodeConfigExists = true
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get existing node-config DaemonSet: %w", err)
+	}
+
+	nodeConfigNeeded := nodeConfigRequired(nodeConfigExists, len(store.routes.Registries))
+	if nodeConfigNeeded {
+		if err := applyNodeConfigManifestTracked(ctx, clients.resources, o.root.namespace, o.image, &created); err != nil {
+			return fmt.Errorf("apply node-config DaemonSet: %w", err)
+		}
+	}
+
+	if o.wait {
+		if err := waitForDaemonSet(ctx, clients.kube, o.root.namespace, agentDaemonSetName, o.root.timeout); err != nil {
+			return err
+		}
+
+		if nodeConfigNeeded {
+			if err := waitForDaemonSet(ctx, clients.kube, o.root.namespace, nodeConfigDaemonSetName, o.root.timeout); err != nil {
+				return err
+			}
+		}
+	}
+
 	verb := "is ready"
 	if !o.wait {
 		verb = "was applied"
 	}
+
+	rollbackCreated = false
 
 	if registryCount == 0 {
 		return writeOutputf(output,
@@ -135,6 +154,10 @@ func (o *installOptions) run(ctx context.Context, output io.Writer) error {
 
 func baseInstallManifest(name string) bool {
 	return name != nodeConfigManifestName
+}
+
+func nodeConfigRequired(exists bool, routeCount int) bool {
+	return exists || routeCount > 0
 }
 
 func ensureNoCompetingMirror(ctx context.Context, resourceClient client.Client, namespace string) error {
@@ -166,6 +189,10 @@ func ensureNoCompetingMirror(ctx context.Context, resourceClient client.Client, 
 }
 
 func applyInstallManifest(ctx context.Context, resourceClient client.Client, data []byte) error {
+	return applyInstallManifestTracked(ctx, resourceClient, data, nil)
+}
+
+func applyInstallManifestTracked(ctx context.Context, resourceClient client.Client, data []byte, created *[]*unstructured.Unstructured) error {
 	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
 
 	for {
@@ -187,6 +214,7 @@ func applyInstallManifest(ctx context.Context, resourceClient client.Client, dat
 		existing.SetGroupVersionKind(object.GroupVersionKind())
 
 		err := resourceClient.Get(ctx, key, existing)
+		objectMissing := apierrors.IsNotFound(err)
 		if err == nil {
 			owned := existing.GetLabels()["app.kubernetes.io/managed-by"] == fieldManager
 			if object.GetKind() == "Namespace" && !owned {
@@ -208,10 +236,35 @@ func applyInstallManifest(ctx context.Context, resourceClient client.Client, dat
 		if err := resourceClient.Apply(ctx, configuration, client.FieldOwner(fieldManager), client.ForceOwnership); err != nil {
 			return fmt.Errorf("apply %s %s: %w", object.GetKind(), object.GetName(), err)
 		}
+
+		if objectMissing && created != nil {
+			createdObject := &unstructured.Unstructured{}
+			createdObject.SetGroupVersionKind(object.GroupVersionKind())
+			createdObject.SetNamespace(object.GetNamespace())
+			createdObject.SetName(object.GetName())
+			*created = append(*created, createdObject)
+		}
 	}
 }
 
+func deleteInstallObjects(ctx context.Context, resourceClient client.Client, created []*unstructured.Unstructured) error {
+	var errs []error
+
+	for index := len(created) - 1; index >= 0; index-- {
+		object := created[index].DeepCopy()
+		if err := resourceClient.Delete(ctx, object); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("roll back created %s %s/%s: %w", object.GetKind(), object.GetNamespace(), object.GetName(), err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
 func applyNodeConfigManifest(ctx context.Context, resourceClient client.Client, namespace, image string) error {
+	return applyNodeConfigManifestTracked(ctx, resourceClient, namespace, image, nil)
+}
+
+func applyNodeConfigManifestTracked(ctx context.Context, resourceClient client.Client, namespace, image string, created *[]*unstructured.Unstructured) error {
 	manifests, err := gantrystandalone.Render(gantrystandalone.Values{Namespace: namespace, Image: image})
 	if err != nil {
 		return err
@@ -219,7 +272,7 @@ func applyNodeConfigManifest(ctx context.Context, resourceClient client.Client, 
 
 	for _, manifest := range manifests {
 		if manifest.Name == nodeConfigManifestName {
-			return applyInstallManifest(ctx, resourceClient, manifest.Data)
+			return applyInstallManifestTracked(ctx, resourceClient, manifest.Data, created)
 		}
 	}
 
