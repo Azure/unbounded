@@ -388,35 +388,18 @@ jobs:
           fi
 
       - name: Wait for rollouts
+        # Shared with nightly.yaml so the two deploy gates cannot drift.
+        # Component workloads are created asynchronously after the operator
+        # reconciles the Site, so the script waits for each to exist before
+        # checking its rollout status, and fails fast naming the image when a pod
+        # cannot pull one.
         run: |
-          set -euo pipefail
-          # Post-redesign, all component workloads are created by the operator in
-          # the unified unbounded-system namespace. They appear asynchronously
-          # after the operator reconciles the Site, so wait for each object to
-          # exist before checking its rollout status.
-          NS=unbounded-system
-
-          wait_exists() {
-            local kind="$1" name="$2" deadline=$((SECONDS + 300))
-            until kubectl -n "$NS" get "$kind" "$name" >/dev/null 2>&1; do
-              if (( SECONDS >= deadline )); then
-                echo "::error::timed out waiting for $kind/$name in $NS to be created"
-                return 1
-              fi
-              sleep 5
-            done
-          }
-
-          for target in \
-            "deploy unbounded-operator" \
-            "deploy unbounded-net-controller" \
-            "ds unbounded-net-node" \
-            "deploy machina-controller" \
-            "ds gantry"; do
-            set -- $target
-            wait_exists "$1" "$2"
-            kubectl -n "$NS" rollout status "$1/$2" --timeout=5m
-          done
+          hack/release/wait-rollouts.sh \
+            deploy/unbounded-operator \
+            deploy/unbounded-net-controller \
+            ds/unbounded-net-node \
+            deploy/machina-controller \
+            ds/gantry
 
       - name: Diagnose failed rollout
         # Runs only when a prior step failed (e.g. the operator never created a
