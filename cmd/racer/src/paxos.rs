@@ -1614,8 +1614,8 @@ impl Paxos {
             self.stat(|s| s.read_matched += 1);
             return Ok(Some(r));
         }
-        if cached.is_some() {
-            self.cache.forget(addr, sink.huge()).await;
+        if let Some(r) = cached {
+            self.cache.forget_stale(addr, sink.huge(), r).await;
         }
         let Some((r, idx)) = agreed else {
             return Ok(None);
@@ -1705,7 +1705,7 @@ impl Paxos {
         {
             // Stale, or never chosen. Dropping it keeps a mis-cached page from costing this
             // round again on the next read.
-            self.cache.forget(addr, true).await;
+            self.cache.forget_stale(addr, true, r).await;
             return false;
         }
         self.cache.served(true);
