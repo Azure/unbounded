@@ -516,7 +516,7 @@ pub(crate) struct GroupIx(u32);
 
 impl GroupIx {
     /// Bounded by the narrowest field any group op has for it, `SNAPOPEN`'s.
-    pub(crate) const MAX: u32 = 1 << (SMALL_OFF_BITS as u32 - 10);
+    pub(crate) const MAX: u32 = 1 << (SMALL_OFF_BITS - 10);
 
     pub(crate) fn new(i: u32) -> Option<GroupIx> {
         (i < GroupIx::MAX).then_some(GroupIx(i))
@@ -1026,7 +1026,7 @@ struct Slots<'a>(&'a [u8]);
 
 impl<'a> Slots<'a> {
     fn new(t: &'a [u8]) -> Result<Slots<'a>, Errno> {
-        (t.len() == BLOCK).then(|| Slots(t)).ok_or(status::BAD)
+        (t.len() == BLOCK).then_some(Slots(t)).ok_or(status::BAD)
     }
 
     fn raw(&self, i: usize) -> u64 {

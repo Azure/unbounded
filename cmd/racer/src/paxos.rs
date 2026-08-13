@@ -1836,7 +1836,7 @@ impl Paxos {
         let t = PoolBuf::alloc(2 * fabric::BLOCK).await;
         link.send(cmd, t.buf()).await.ok()?;
         p[..fabric::BLOCK].copy_from_slice(&t[..fabric::BLOCK]);
-        Some(read_register(&t[fabric::BLOCK..]).ok()?)
+        read_register(&t[fabric::BLOCK..]).ok()
     }
 
     /// The width the cache should use for `addr`, from this node's own read stream. The 4

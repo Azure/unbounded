@@ -354,10 +354,10 @@ impl Snaps {
 
 // --- the wire ---
 
-/// The three group-addressed ops name a *group*, not a page, so `server::addr_of` is not
-/// on their path and the universe is the namespace the frame arrived on: the target
-/// rebuilds the [`GroupId`] locally. Their layout lives in `fabric`; what is here is the
-/// translation between a sweep's own vocabulary and the wire's.
+// The three group-addressed ops name a *group*, not a page, so `server::addr_of` is not
+// on their path and the universe is the namespace the frame arrived on: the target
+// rebuilds the `GroupId` locally. Their layout lives in `fabric`; what is here is the
+// translation between a sweep's own vocabulary and the wire's.
 
 /// The class a group is being swept at, as the wire names it.
 fn klass(huge: bool) -> Klass {
@@ -476,10 +476,9 @@ impl Heal {
     pub fn tick(&'static self, now: Instant) {
         let due = here(|c| {
             !c.busy.get()
-                && !c
-                    .last
+                && c.last
                     .get()
-                    .is_some_and(|t| now.duration_since(t) < INTERVAL)
+                    .is_none_or(|t| now.duration_since(t) >= INTERVAL)
         });
         if !due || self.alloc().store_pressed() {
             return;

@@ -727,7 +727,7 @@ impl Allocator {
         let key = (guard, ballot.raw(), proposer);
         let owner = self.owner(addr, class);
         let piece = at(owner, move |c| {
-            self.open_parts(c, addr, kind, class, key, guard, ballot)
+            self.open_parts(c, addr, kind, class, key, ballot)
         })
         .await
         .map(|slot| Piece {
@@ -769,6 +769,9 @@ impl Allocator {
     ///
     /// Answers with the slot rather than the ticket that holds it: the assembly keeps the
     /// ticket until it is whole or dropped, and a piece only needs somewhere to land.
+    ///
+    /// The guard comes out of the key rather than beside it, so a piece cannot be
+    /// reserved under one command's guard and filed under another's.
     fn open_parts(
         &self,
         c: &mut Core,
@@ -776,9 +779,10 @@ impl Allocator {
         kind: Kind,
         class: Class,
         key: PartsKey,
-        guard: u64,
         ballot: Ballot,
     ) -> Result<u32, Status> {
+        debug_assert_eq!(key.1, ballot.raw(), "a piece is filed under its own ballot");
+        let guard = key.0;
         if let Some(i) = find_parts(c, addr, key) {
             let p = &mut c.parts[i];
             p.busy += 1;
