@@ -221,7 +221,7 @@ impl Sketch {
 /// node elsewhere has no address for the page; the column index is shared, since a node holds
 /// one cohort label everywhere.
 #[derive(Default)]
-struct Roster {
+pub(crate) struct Roster {
     me: u32,
     /// Sorted by universe id.
     cohorts: Box<[(u32, Box<[u32]>)]>,
@@ -232,7 +232,7 @@ struct Roster {
 }
 
 impl Roster {
-    fn of(cfg: &Config) -> Roster {
+    pub(crate) fn of(cfg: &Config) -> Roster {
         let c = cfg.node.cohort as usize;
         let cohorts = cfg
             .universes()
@@ -631,7 +631,6 @@ pub struct Cache {
     shards: [usize; 2],
     /// Slots the node may hold across all cores and classes, from `policy.cache_index_bytes`.
     budget: u64,
-    roster: config::Live<Roster>,
     state: Box<[RefCell<Local>]>,
     pool: RefCell<Pool>,
 }
@@ -706,7 +705,6 @@ pub fn open(alloc: &'static Allocator, cfg: &Config, cores: usize) -> &'static C
         tail: (base, chunks),
         shards,
         budget,
-        roster: config::Live::new(Roster::of(cfg)),
         state: state.into(),
         pool: RefCell::new(Pool {
             free,
@@ -807,18 +805,13 @@ impl Cache {
         self.state[runtime::core()].borrow_mut()
     }
 
-    /// Re-derive the cohort roster. Control thread only, alongside `Allocator::install`.
-    pub fn install(&self, cfg: &Config) {
-        self.roster.install(Roster::of(cfg));
-    }
-
     /// Whether this node can cache at all. Structural only, and deliberately cheap: a cohort
     /// of nobody leaves no peer to place a replica on, and a config where no extent opts in
     /// leaves nothing to place. Both are properties of the config rather than the address, so
     /// a lookup can be refused before it costs a hop. Whether a particular page should be
     /// cached is per extent and lives in `observe_local`.
     fn enabled(&self) -> bool {
-        let r = self.roster.get();
+        let r = server::roster();
         r.admits && r.widest() > 0
     }
 
@@ -909,7 +902,7 @@ impl Cache {
 
     /// `W_max = min(cohort_size, 64)`.
     fn w_max(&self) -> u8 {
-        u8::try_from(self.roster.get().widest())
+        u8::try_from(server::roster().widest())
             .unwrap_or(W_CAP)
             .min(W_CAP)
     }
@@ -937,7 +930,7 @@ impl Cache {
     /// Whether we are one of the `w` replicas for `addr`: the number of cohort peers that
     /// outrank us is below the width.
     pub fn holds(&self, addr: GlobalAddr, w: u8) -> bool {
-        let r = self.roster.get();
+        let r = server::roster();
         let nodes = r.cohort(addr.universe());
         if w == 0 || nodes.is_empty() {
             return false;
@@ -949,7 +942,7 @@ impl Cache {
     /// The highest-ranked live member of `R`, excluding ourselves. `ok` is the reachability
     /// test: a cohort peer we hold no link to is not a candidate.
     pub fn replica(&self, addr: GlobalAddr, w: u8, ok: impl Fn(u32) -> bool) -> Option<u32> {
-        let r = self.roster.get();
+        let r = server::roster();
         let nodes = r.cohort(addr.universe());
         if w == 0 {
             return None;

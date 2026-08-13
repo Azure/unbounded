@@ -44,6 +44,10 @@ pub struct Dataplane {
     /// already holding the plane through [`Dataplane::config`]; either way a reload cannot
     /// retire it while a borrow is out, because the borrow is a guard on this very value.
     config: Config,
+    /// This node's cohort in each universe, derived from the catalogs above. A projection
+    /// rather than a second source: it is here so that deriving it is a cost of publishing
+    /// a configuration and not of reading one.
+    roster: cache::Roster,
     paxos: &'static Paxos,
     cache: &'static Cache,
     heal: &'static Heal,
@@ -62,6 +66,14 @@ pub struct Dataplane {
 /// anyway. Panics off a worker: the control thread holds the `Config` it is installing.
 pub(crate) fn config() -> Cfg<Config> {
     runtime::config::<Server>().map(|d| &d.config)
+}
+
+/// This node's cohort in each universe, pinned until the guard is dropped.
+///
+/// Derived from the same configuration and guarded by the same count, so the cohort a
+/// placement decision reads always belongs to the catalog it was computed from.
+pub(crate) fn roster() -> Cfg<cache::Roster> {
+    runtime::config::<Server>().map(|d| &d.roster)
 }
 
 impl Drop for Dataplane {
@@ -182,10 +194,9 @@ impl Node {
             }
         };
         paxos.install_links(links);
-        // The cohort roster derives from each universe's catalog: re-derive on a swap.
-        paxos.cache().install(&cfg);
         let heal = *self.heal.get().expect("set beside paxos");
         Ok(Dataplane {
+            roster: cache::Roster::of(&cfg),
             config: cfg,
             paxos,
             cache: paxos.cache(),
@@ -211,6 +222,7 @@ pub(crate) fn bare_plane(c: &Configurator, cfg: Config) -> std::io::Result<Datap
     let cache = cache::open(alloc, &cfg, cores);
     let paxos = paxos::open(alloc, cache, cores);
     Ok(Dataplane {
+        roster: cache::Roster::of(&cfg),
         config: cfg,
         paxos,
         cache,
