@@ -1683,11 +1683,7 @@ impl Cache {
     /// the call. Huge first, since that is the loan whose return costs one page rather than
     /// 1024.
     pub fn give_back(&self) -> Option<Loan> {
-        here(|l| {
-            l.stores[1]
-                .give_loan()
-                .or_else(|| l.stores[0].give_loan())
-        })
+        here(|l| l.stores[1].give_loan().or_else(|| l.stores[0].give_loan()))
     }
 }
 
