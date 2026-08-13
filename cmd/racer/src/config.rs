@@ -3,8 +3,9 @@
 //!
 //! `pb` is the wire schema, tag for tag. [`Config`] is the validated model, and building
 //! one from `pb` is where every structural check happens. `Watch`/[`watch`] are delivery,
-//! driven by inotify because the control plane renames a new file over the old one.
-//! `Live` makes reload cheap: a pointer the control thread swaps, read without a lock.
+//! driven by inotify because the control plane renames a new file over the old one. The
+//! configuration itself reaches a worker through the runtime, guarded; `Live` is what is
+//! left over for the one table that cannot be reached that way.
 
 use std::ffi::{CString, OsString};
 use std::io;
@@ -59,14 +60,20 @@ fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-// --- Live: the reload primitive ---
+// --- Live: what a guard cannot hold ---
 
 /// A value the control thread replaces and every worker reads without a lock. A read is a
 /// single acquire load; the replaced value lives until its published configuration retires,
 /// since [`Runtime::reload`] blocks until every core cuts over. Do not hold the reference
 /// across reload.
 ///
+/// Everything a worker reads from its configuration reaches it through [`runtime::Cfg`],
+/// which pins what it borrows and so cannot be read across a reload at all. One table
+/// cannot: the peer links, whose `&Link` is handed to detached futures that outlive any
+/// frame a guard could sit in. This is that table's holder, and nothing else's.
+///
 /// [`Runtime::reload`]: crate::runtime::Runtime::reload
+/// [`runtime::Cfg`]: crate::runtime::Cfg
 pub(crate) struct Live<T> {
     cur: AtomicPtr<T>,
     /// The generation before `cur`. Dropped when a third arrives.
