@@ -64,6 +64,36 @@ pub struct Pending {
     crc: u32,
 }
 
+/// A 4 MiB data slot the cache is holding for as long as the slab does not want it back.
+///
+/// It carries the slot it came from and not just where that slot is. The offset can be
+/// derived from the slot, but going back the other way is a lookup that can fail, and a
+/// conversion that can fail on the way home is a loan that can be dropped on the floor
+/// while the shard that made it still counts the slot lent.
+///
+/// Not `Copy`, so there is one of these per lent slot and [`Allocator::reclaim`] spends
+/// it. Rust cannot make a destructor reach a shard that the caller may already have open,
+/// so a dropped loan still leaks its slot until restart; what the type buys is that the
+/// leak has to be written rather than fallen into.
+#[must_use = "a lent slot stays lent until the loan is handed back"]
+pub struct Loan {
+    slot: u32,
+    off: u64,
+}
+
+impl Loan {
+    /// Where the borrowed media is.
+    pub fn offset(&self) -> u64 {
+        self.off
+    }
+
+    /// A loan against no shard, for tests that only care that one is held.
+    #[cfg(test)]
+    pub(crate) fn for_test(off: u64) -> Loan {
+        Loan { slot: 0, off }
+    }
+}
+
 /// DRAM cost of one resident small page: mblock entry plus its share of the index.
 /// `config::validate` refuses a working set over `policy.max_index_bytes`, avoiding OOM.
 pub const INDEX_BYTES_PER_PAGE: u64 = 52;
@@ -310,12 +340,15 @@ impl Allocator {
         let _ = self.cache.set(cache);
     }
 
-    /// Lend the cache one free 4 MiB data slot from this core's stripe, as a byte offset.
-    /// A lent slot still counts as free, so a loan cannot move the watermarks lending is
-    /// gated on. What the cache wrote is unreachable after a restart: the entry says free.
-    pub fn lend(&self) -> Option<u64> {
+    /// Lend the cache one free 4 MiB data slot from this core's stripe. A lent slot still
+    /// counts as free, so a loan cannot move the watermarks lending is gated on. What the
+    /// cache wrote is unreachable after a restart: the entry says free.
+    pub fn lend(&self) -> Option<Loan> {
         let slot = shard(|sh| sh.lend())?;
-        Some(self.geo.slot_off(Class::Huge, slot))
+        Some(Loan {
+            slot,
+            off: self.geo.slot_off(Class::Huge, slot),
+        })
     }
 
     /// Call loans back until this core's 4 MiB stripe has a real free reserve again.
@@ -340,13 +373,10 @@ impl Allocator {
             .min(lent)
             .min(LEND_BATCH);
         for _ in 0..want {
-            let Some(off) = cache.give_back() else {
+            let Some(loan) = cache.give_back() else {
                 break;
             };
-            let Some(slot) = self.geo.slot_at(Class::Huge, off) else {
-                continue;
-            };
-            sh.reclaim(slot);
+            sh.reclaim(loan.slot);
         }
     }
 
