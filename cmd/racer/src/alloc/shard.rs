@@ -16,16 +16,33 @@ use crate::runtime::Errno;
 /// Local mblocks the tombstone sweep examines per `tick`, per class.
 const SWEEP_PER_TICK: u32 = 64;
 
-/// Resolves a page address to the extent covering it: its id and its tombstone epoch.
+/// Resolves a page address to the extent covering it: its id, its tombstone epoch, and
+/// the kind it was cut as.
 ///
 /// Passed in like [`Groups`] because the slab holds no config; serves both the census
-/// (keyed by extent) and the sweep (needs the epoch). `None` means no extent covers it.
-pub(crate) type Extents<'a> = dyn Fn(u64) -> Option<(u32, u32)> + 'a;
+/// (keyed by extent) and the sweep (needs the epoch, and the kind to read it). `None`
+/// means no extent covers it.
+pub(crate) type Extents<'a> = dyn Fn(u64) -> Option<(u32, u32, Kind)> + 'a;
 
-/// The two config lookups a slab mutation needs: digest by group, census by extent.
+/// Whether an address [`Extents`] does not cover has been retired rather than merely
+/// left out.
+///
+/// The two are not the same. A configuration that names peers is a full publication: an
+/// address no extent covers is one the control plane has taken away, either because the
+/// volume was deleted or because the extent finished moving to another zone, and the rows
+/// behind it can never be read or repaired again. A configuration that names no peers is
+/// the bootstrap shape a node publishes before its fabric attachments land, which carries
+/// no extents at all; reclaiming on that would empty a healthy store every time the agent
+/// restarted. Absence only means something when the configuration is in a position to say
+/// so, and this is the predicate that decides.
+pub(crate) type Retired<'a> = dyn Fn(u64) -> bool + 'a;
+
+/// The config lookups a slab mutation needs: digest by group, census by extent, and
+/// whether an uncovered address is garbage.
 pub(crate) struct Maps<'a> {
     pub(crate) gof: &'a Groups<'a>,
     pub(crate) xof: &'a Extents<'a>,
+    pub(crate) rof: &'a Retired<'a>,
 }
 
 // ---------------------------------------------------------------------------- address
@@ -391,7 +408,7 @@ impl Slab {
             State::Empty => return,
         };
         // A page whose extent has left the config is counted for nothing.
-        let Some((x, _)) = (m.xof)(e.addr) else {
+        let Some((x, _, _)) = (m.xof)(e.addr) else {
             return;
         };
         let i = match self.census.binary_search_by_key(&x, |r| r.0) {
@@ -807,10 +824,15 @@ impl Shard {
             version: t.version,
             ballot: t.ballot.raw() as u64,
             data_crc: crc,
+            // The epoch this entry belongs to, live or dead. A tombstone's is implied by
+            // its version, but a mutable version says nothing about epochs, so the row has
+            // to carry it: the sweep is what reclaims an extent the control plane has
+            // collected, and it has no other way to tell a page written before the advance
+            // from one written after it.
             epoch: if state == State::Tombstone {
                 (t.version / 3) as u32
             } else {
-                0
+                (m.xof)(addr.0).map_or(0, |(_, e, _)| e)
             },
             state,
             flags: 0,
@@ -1029,10 +1051,28 @@ impl Shard {
 
     // -------------------------------------------------------------------- maintenance
 
-    /// One tick's worth of tombstone reclamation on one class. The only garbage collection
+    /// One tick's worth of epoch reclamation on one class. The only garbage collection
     /// in the system: metadata only, bounded, off the critical path. The extent is
-    /// resolved per tombstone because the epoch is the extent's (one extent may collect
-    /// while others stand still), and only for entries already known to be tombstones.
+    /// resolved per entry because the epoch is the extent's (one extent may collect while
+    /// others stand still).
+    ///
+    /// Everything the extent's current epoch has left behind goes, live pages included,
+    /// not only tombstones. An epoch advance is the barrier a mutable release otherwise
+    /// lacks: it arrives in the configuration, so every member of every group crosses it
+    /// without a round and drops the same rows, which is what makes reclaiming a live
+    /// register safe here when [`Self::trim`] refuses it. A member that has not swept yet
+    /// can still hand its copy back through repair, and does until its own sweep reaches
+    /// the row; the epoch only moves forward, so the extent empties and stays empty.
+    ///
+    /// Reclaiming a live row is [`Self::discard`] without the version check: the entry
+    /// goes, the index loses it, the slot returns to the free list.
+    ///
+    /// A row whose extent has left the configuration altogether goes the same way, once
+    /// [`Retired`] agrees the configuration is one that can say so. Nothing else ever
+    /// collects those: the census stops counting them, the shed cannot get them confirmed
+    /// because no member can be routed to for an address that resolves to nothing, and the
+    /// group they sit in stays held forever, which stalls the control plane's next
+    /// membership move as surely as it leaks the slots.
     pub(super) fn sweep(&mut self, class: Class, m: &Maps) {
         let sl = self.slab(class);
         if sl.local == 0 {
@@ -1046,10 +1086,22 @@ impl Shard {
             for j in 0..k {
                 let l = li as usize * k + j;
                 let e = sl.entries[l];
-                if e.state == State::Tombstone
-                    && let Some((_, epoch)) = (m.xof)(e.addr)
-                    && e.epoch < epoch
-                {
+                let stale = match (m.xof)(e.addr) {
+                    // An immutable version carries its own epoch, so an advance is a
+                    // reuse: rows written under it survive, rows behind it go.
+                    Some((_, epoch, Kind::Immutable)) => e.epoch < epoch,
+                    // A mutable version carries none, so a row written after the advance
+                    // is indistinguishable from one a repair carried across it. The
+                    // control plane advances a mutable extent's epoch for one reason -
+                    // the volume is being collected - and a collected volume has no
+                    // consumer left to write, so everything the extent holds goes.
+                    // Without this a repair that lands between one member crossing the
+                    // barrier and another leaves rows stamped at the barrier's own epoch,
+                    // which no later sweep can ever take.
+                    Some((_, epoch, _)) => epoch != 0,
+                    None => (m.rof)(e.addr),
+                };
+                if e.addr != 0 && stale {
                     sl.set(l as u32, Entry::default(), m);
                     sl.index.remove(e.addr);
                     sl.recycle(l as u32);
@@ -1057,7 +1109,7 @@ impl Shard {
                 }
             }
             if hit {
-                // Persisted by whichever commit next lands on this mblock; a tombstone
+                // Persisted by whichever commit next lands on this mblock; a row
                 // outliving its epoch costs only an entry.
                 sl.dirty(li);
             }
@@ -1617,17 +1669,21 @@ mod model {
     /// `alloc::maps!` does for the real allocator. A macro because the bundle borrows the
     /// closures, so nothing here can be returned.
     macro_rules! maps {
-        ($epochs:expr, $m:ident) => {
+        ($epochs:expr, $kind:expr, $m:ident) => {
             let epochs = $epochs;
+            let kind = $kind;
             let gof = group_of;
-            let xof = move |a: u64| Some((ext_id(a), epochs[ext_of(a)] as u32));
+            let xof = move |a: u64| Some((ext_id(a), epochs[ext_of(a)] as u32, kind));
+            // Every address in the model maps to an extent, so retirement never fires.
+            let rof = |_: u64| false;
             let $m = Maps {
                 gof: &gof,
                 xof: &xof,
+                rof: &rof,
             };
         };
         ($m:ident) => {
-            maps!([0u64; ADDRS.len()], $m)
+            maps!([0u64; ADDRS.len()], Kind::Immutable, $m)
         };
     }
 
@@ -1780,7 +1836,10 @@ mod model {
         /// Reserved, not yet staged. A ticket in flight is a slot nobody else can have.
         pending: Vec<(u64, Ticket, bool)>,
         /// (address, version, ballot, value) this node has accepted.
-        acked: BTreeSet<(u64, u64, u32, u32)>,
+        /// Address, version, ballot, value, and the extent epoch the write was staged
+        /// at. The epoch is what tells an acked write that is still owed from one the
+        /// control plane has since collected.
+        acked: BTreeSet<(u64, u64, u32, u32, u64)>,
         /// Every version this node ever observed for an address. The OCC ring may forget
         /// from this set but never invent outside it.
         seen: BTreeSet<(u64, u64)>,
@@ -1952,9 +2011,10 @@ mod model {
                     // `Ok(None)` is a commit that lost the race and gave its slot back:
                     // the caller sees success but nothing was written, so nothing is
                     // acknowledged.
-                    maps!(m);
+                    maps!(s.epoch, kind, m);
                     if let Ok(Some(st)) = s.sh.stage(GlobalAddr(addr), kind, cls, t, value, &m) {
-                        s.acked.insert((addr, version, ballot, value));
+                        s.acked
+                            .insert((addr, version, ballot, value, s.epoch[ext_of(addr)]));
                         if let Some(old) = st.stale {
                             s.sh.release(cls, old, &m);
                         }
@@ -2009,7 +2069,7 @@ mod model {
                         .filter(|e| e.state == State::Tombstone)
                         .map(|e| e.addr)
                         .collect();
-                    maps!(s.epoch, m);
+                    maps!(s.epoch, kind, m);
                     s.sh.sweep(cls, &m);
                     for a in before {
                         if find(std::slice::from_ref(&s.sh), a).is_none() {
@@ -2027,17 +2087,40 @@ mod model {
                 // one *version* is legal: two proposers may propose at one version with
                 // different ballots and only one is chosen, so the key is the pair.
                 Property::<Self>::always("one value per ballot", |_, s| {
-                    let mut v: Vec<(u64, u64, u32)> =
-                        s.acked.iter().map(|&(a, x, b, _)| (a, x, b)).collect();
+                    // Distinct writes, ignoring the epoch each was staged at: one write
+                    // reclaimed by an epoch advance and made again is one value, not two.
+                    let mut v: Vec<(u64, u64, u32, u32)> = s
+                        .acked
+                        .iter()
+                        .map(|&(a, x, b, val, _)| (a, x, b, val))
+                        .collect();
                     v.sort_unstable();
                     v.dedup();
-                    v.len() == s.acked.len()
+                    let mut k: Vec<(u64, u64, u32)> =
+                        v.iter().map(|&(a, x, b, _)| (a, x, b)).collect();
+                    k.dedup();
+                    k.len() == v.len()
                 }),
-                // The register never goes backwards. Compared through `effective`, because
-                // an epoch advance legitimately carries an Immutable address forward past
-                // a tombstone the sweep has since reclaimed.
+                // The register never goes backwards, except across the one barrier that
+                // is allowed to take it back: an advance of the extent's tombstone epoch,
+                // which is the control plane collecting the extent and licenses the sweep
+                // to drop every row written before it. Compared through `effective`,
+                // because the advance also carries an Immutable address forward past a
+                // tombstone the sweep has since reclaimed.
                 Property::<Self>::always("the register never regresses", |m: &Self, s: &Reg| {
-                    s.acked.iter().all(|&(a, v, b, _)| {
+                    s.acked.iter().all(|&(a, v, b, _, at)| {
+                        // The one barrier allowed to take a register back, read the way
+                        // the sweep reads it. An immutable extent's epoch travels in the
+                        // version, so only writes from behind the barrier go; a mutable
+                        // extent's does not, so collecting one takes everything it holds,
+                        // including a write staged at the barrier itself.
+                        let collected = match m.kind {
+                            Kind::Immutable => s.epoch[ext_of(a)] > at,
+                            _ => s.epoch[ext_of(a)] != 0,
+                        };
+                        if collected {
+                            return true;
+                        }
                         let e = find(std::slice::from_ref(&s.sh), a);
                         let held = (
                             effective(e, m.kind, s.epoch[ext_of(a)]),
@@ -2048,7 +2131,7 @@ mod model {
                 }),
                 // No version is ever accepted at zero: `reserve` returns `g + 1`.
                 Property::<Self>::always("accepted versions are nonzero", |_, s| {
-                    s.acked.iter().all(|&(_, v, _, _)| v > 0)
+                    s.acked.iter().all(|&(_, v, _, _, _)| v > 0)
                 }),
                 // Every slot is free, live, reserved or leaked, exactly once. Catches a
                 // double free, a lost slot, and a stale index entry.
@@ -2113,7 +2196,7 @@ mod model {
                     ps.push(Property::<Self>::sometimes(
                         "a tombstone is reclaimed",
                         |_, s| {
-                            s.acked.iter().any(|&(a, v, _, _)| {
+                            s.acked.iter().any(|&(a, v, _, _, _)| {
                                 v == 2
                                     && s.epoch[ext_of(a)] > 0
                                     && find(std::slice::from_ref(&s.sh), a).is_none()
@@ -2601,6 +2684,126 @@ mod model {
         .join()
         .assert_any_discovery("acknowledged writes survive");
         assert!(path.into_actions().len() >= 3);
+    }
+
+    /// A row whose extent has left the configuration is garbage nothing else collects:
+    /// the census stops counting it, and the shed cannot get it confirmed because an
+    /// address that resolves to no extent cannot be routed. It has to fall to the sweep.
+    ///
+    /// But absence alone does not mean gone. The bootstrap configuration an agent
+    /// republishes after a restart carries no extents at all while the store still holds
+    /// every row, so the sweep waits for a configuration that is in a position to say the
+    /// extent was taken away.
+    #[test]
+    fn the_sweep_reclaims_a_row_whose_extent_was_taken_away() {
+        let cls = Class::Small;
+        let kind = Kind::Lww;
+        let (mut shards, _) = boot(1, false, &formatted());
+        let addr = GlobalAddr(ADDRS[0]);
+        let r = Register {
+            version: 1,
+            ballot: Ballot::new(BALLOTS[0].0, BALLOTS[0].1),
+        };
+
+        maps!(m);
+        let t = shards[0]
+            .reserve_unguarded(addr, kind, cls, r, 0, false)
+            .unwrap()
+            .unwrap();
+        shards[0].stage(addr, kind, cls, t, 0, &m).unwrap();
+        assert!(find(&shards, addr.0).is_some(), "the row was staged");
+
+        let free = shards[0].slabs[0].free.len();
+
+        // The extent is still configured: the epoch has not moved, so the row stays.
+        shards[0].sweep(cls, &m);
+        assert!(
+            find(&shards, addr.0).is_some(),
+            "a configured extent at its own epoch loses nothing"
+        );
+
+        // No extent covers the address, but the configuration cannot say why. This is the
+        // bootstrap shape, and emptying the store on it would cost a node every page it
+        // holds each time its agent restarted.
+        let gof = group_of;
+        let gone = |_: u64| None;
+        let silent = |_: u64| false;
+        let bootstrap = Maps {
+            gof: &gof,
+            xof: &gone,
+            rof: &silent,
+        };
+        shards[0].sweep(cls, &bootstrap);
+        assert!(
+            find(&shards, addr.0).is_some(),
+            "a configuration that names no extents retires none of them"
+        );
+
+        // A full publication that covers no extent for the address has retired it.
+        let retired = |_: u64| true;
+        let published = Maps {
+            gof: &gof,
+            xof: &gone,
+            rof: &retired,
+        };
+        shards[0].sweep(cls, &published);
+        assert!(
+            find(&shards, addr.0).is_none(),
+            "a retired extent's rows are collected"
+        );
+        assert_eq!(
+            shards[0].slabs[0].free.len(),
+            free + 1,
+            "the slot goes back to the free list, not just the index"
+        );
+        assert!(sound(&shards));
+    }
+
+    /// Collecting a mutable extent takes every row it holds, including one a repair
+    /// carried across the barrier after this member had already crossed it.
+    ///
+    /// A mutable version carries no epoch, so the sweep cannot tell a write made after
+    /// the advance from a copy handed over by a member that had not seen the advance yet.
+    /// It does not have to: the control plane advances a mutable extent's epoch only to
+    /// collect it, and a volume being collected has no consumer left to write. Reading
+    /// the barrier as "behind the epoch" instead would leave those re-admitted rows
+    /// stamped at the epoch itself, and no later sweep could ever take them.
+    #[test]
+    fn collecting_a_mutable_extent_takes_a_row_readmitted_at_the_barrier() {
+        let cls = Class::Small;
+        let kind = Kind::Lww;
+        let (mut shards, _) = boot(1, false, &formatted());
+        let addr = GlobalAddr(ADDRS[0]);
+        let r = Register {
+            version: 1,
+            ballot: Ballot::new(BALLOTS[0].0, BALLOTS[0].1),
+        };
+
+        // The extent is being collected, so its epoch has moved to one. A repair lands
+        // now, and stages the row at the epoch it can see: the barrier itself.
+        let gof = group_of;
+        let xof = |_: u64| Some((1u32, 1u32, kind));
+        let silent = |_: u64| false;
+        let collecting = Maps {
+            gof: &gof,
+            xof: &xof,
+            rof: &silent,
+        };
+        let t = shards[0]
+            .reserve_unguarded(addr, kind, cls, r, 1, false)
+            .unwrap()
+            .unwrap();
+        shards[0].stage(addr, kind, cls, t, 0, &collecting).unwrap();
+        assert!(find(&shards, addr.0).is_some(), "the repair landed");
+
+        let free = shards[0].slabs[0].free.len();
+        shards[0].sweep(cls, &collecting);
+        assert!(
+            find(&shards, addr.0).is_none(),
+            "a collected mutable extent keeps nothing"
+        );
+        assert_eq!(shards[0].slabs[0].free.len(), free + 1);
+        assert!(sound(&shards));
     }
 }
 
