@@ -458,6 +458,23 @@ impl Store {
         }
     }
 
+    /// Drop `addr`'s entry, but only while it is still the one at `reg`.
+    ///
+    /// A failed confirmation, or a read that could not be served, is evidence about the entry
+    /// that was looked up, and both arrive after a round trip. In between, an admission may
+    /// have put a newer value in that slot, and it is the one the reader was hoping for.
+    /// Forgetting by address alone throws it away and sends the next reader to the group for
+    /// bytes this node already holds.
+    fn forget_at(&mut self, addr: u64, reg: Register) {
+        if self
+            .map
+            .get(&addr)
+            .is_some_and(|&i| self.slots[i as usize].reg == reg)
+        {
+            self.forget(addr);
+        }
+    }
+
     /// Claim a slot for `addr`, evicting by CLOCK if need be, and mark it busy for the
     /// duration of the write. Never a reason to wait: both declines mean take the ordinary
     /// read path.
@@ -532,6 +549,40 @@ impl Store {
         if !ok {
             self.map.remove(&s.addr);
         }
+    }
+}
+
+/// A slot claimed for an admission: media reserved, marked busy, and nothing readable there
+/// until the write reports back.
+///
+/// Holding one is an obligation. A busy slot is stepped over by the CLOCK hand and keeps its
+/// chunk from being handed to the other class or back to the allocator, so a claim that is
+/// never settled does not merely lose a cache entry: it strands the media behind it for the
+/// life of the process. Settling consumes the permit, and dropping one settles it as a
+/// failure, because a destructor cannot await and an admission nobody is waiting for is a
+/// failed admission either way.
+#[must_use = "a claimed slot is being written into until the admission reports back"]
+struct Admit {
+    cache: &'static Cache,
+    owner: CoreId,
+    huge: bool,
+    slot: u32,
+}
+
+impl Admit {
+    /// Publish the bytes, or give the slot back.
+    async fn settle(self, ok: bool) {
+        let me = std::mem::ManuallyDrop::new(self);
+        me.cache.report(me.owner, me.huge, me.slot, ok).await;
+    }
+}
+
+impl Drop for Admit {
+    fn drop(&mut self) {
+        let (cache, owner, huge, slot) = (self.cache, self.owner, self.huge, self.slot);
+        // Detached because a destructor cannot await. If the slab has no room the slot stays
+        // busy, which is what dropping a claim did every time before this.
+        let _ = runtime::spawn(async move { cache.report(owner, huge, slot, false).await });
     }
 }
 
@@ -1105,9 +1156,10 @@ impl Cache {
         if self.disk.read(found + off as u64, buf).await.is_err() {
             // A cache page we cannot read is one we do not have. Silent rot is invisible here
             // (confirmation covers the register, not the bytes), but a hard read error means
-            // the entry is gone.
+            // the entry is gone. At `reg`, because the read took a round trip and what is
+            // there now may be a newer value that reads perfectly well.
             at(owner, move |l| {
-                l.stores[Cache::class(huge)].forget(addr.0);
+                l.stores[Cache::class(huge)].forget_at(addr.0, reg);
                 l.stat(huge, |s| s.misses += 1);
             })
             .await;
@@ -1168,6 +1220,15 @@ impl Cache {
         let Some((slot, dst)) = at(owner, move |l| self.claim_in(l, addr, huge, reg)).await else {
             return;
         };
+        // Built here, from a plain pair, rather than handed back by the transaction: a value
+        // that crosses a hop can be dropped inside the rendezvous, which is no place for a
+        // destructor that wants to hop of its own.
+        let permit = Admit {
+            cache: self,
+            owner,
+            huge,
+            slot,
+        };
         // One IO, in place, `Buffered`: no torn-write hazard, because nothing points at these
         // bytes after a restart. The slot stays busy across it, which also stops its chunk
         // from being handed away underneath the write.
@@ -1177,6 +1238,12 @@ impl Cache {
                 .write(dst, buf, Durability::Buffered)
                 .await
                 .is_ok();
+        permit.settle(ok).await;
+    }
+
+    /// Report an admission back to the core that claimed the slot. Not called directly:
+    /// [`Admit`] is the only holder.
+    async fn report(&'static self, owner: CoreId, huge: bool, slot: u32, ok: bool) {
         at(owner, move |l| {
             l.stores[Cache::class(huge)].finish(slot, ok);
             if ok {
@@ -1236,13 +1303,30 @@ impl Cache {
         Some((slot, l.stores[k].off(slot)))
     }
 
-    /// Drop an entry that failed confirmation. Cheap enough to call speculatively.
+    /// Drop whatever is cached for `addr`, whatever it is. For a caller that knows the
+    /// address itself is gone, rather than one that found a particular value stale.
     pub async fn forget(&'static self, addr: GlobalAddr, huge: bool) {
         let Some(owner) = self.owner_of(addr) else {
             return;
         };
         at(owner, move |l| {
             l.stores[Cache::class(huge)].forget(addr.0);
+            l.stat(huge, |s| s.stale += 1);
+        })
+        .await;
+    }
+
+    /// Drop `addr`'s entry if it is still the one at `reg`.
+    ///
+    /// What a failed confirmation actually justifies. The register is the reader's evidence,
+    /// and it is about the value the reader saw: taking it here rather than throwing it away
+    /// keeps a late rejection from evicting the newer entry that replaced it.
+    pub async fn forget_stale(&'static self, addr: GlobalAddr, huge: bool, reg: Register) {
+        let Some(owner) = self.owner_of(addr) else {
+            return;
+        };
+        at(owner, move |l| {
+            l.stores[Cache::class(huge)].forget_at(addr.0, reg);
             l.stat(huge, |s| s.stale += 1);
         })
         .await;
