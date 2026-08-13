@@ -1159,10 +1159,24 @@ where
     }
 
     // 3. Retiring devices stop accepting IO; in-flight requests hold the old config.
+    //
+    // The order within each device is load bearing. STOP_DEV deletes the gendisk, and
+    // deleting it waits for the request queue to freeze; the queue cannot freeze while
+    // a consumer outside this process still has reads outstanding. The kernel aborts
+    // those only when the last char-device reference goes away. So the workers drain
+    // and drop theirs first, then we drop ours, and only then do we ask for the disk.
+    // Asking first parks the configuration thread in `blk_mq_freeze_queue_wait` for as
+    // long as the consumer keeps reading, and every later configuration is ignored in
+    // silence because the reload never returns.
     for (slot, dev_id) in &retiring {
-        let _ = ctx.cfgr.core.borrow_mut().ctl().stop_dev(*dev_id);
         ctx.hub
             .broadcast(|_, ack| Ctl::StopQueue { slot: *slot, ack });
+
+        let mut c = ctx.cfgr.core.borrow_mut();
+        if let Some(v) = c.vols.iter_mut().find(|v| v.slot == *slot) {
+            v.cdev = None;
+        }
+        let _ = c.ctl().stop_dev(*dev_id);
     }
 
     // 4. Core state, if this build offered any.
@@ -1321,9 +1335,18 @@ fn teardown<C>(ctx: &mut Ctx<C>) -> std::io::Result<()> {
         .map(|v| (v.slot, v.dev_id))
         .collect();
     for (slot, dev_id) in &live {
-        let _ = ctx.cfgr.core.borrow_mut().ctl().stop_dev(*dev_id);
+        // Same ordering as a reconfiguration: drain the workers, drop our char-device
+        // handle, and only then delete the disk. A consumer with reads outstanding
+        // would otherwise freeze the queue against us and hold shutdown open until it
+        // gave up, and being killed for that leaves the export in a worse state.
         ctx.hub
             .broadcast(|_, ack| Ctl::StopQueue { slot: *slot, ack });
+
+        let mut c = ctx.cfgr.core.borrow_mut();
+        if let Some(v) = c.vols.iter_mut().find(|v| v.slot == *slot) {
+            v.cdev = None;
+        }
+        let _ = c.ctl().stop_dev(*dev_id);
     }
 
     let vers: Vec<u32> = ctx.versions.iter().map(|v| v.ver).collect();
@@ -1335,13 +1358,11 @@ fn teardown<C>(ctx: &mut Ctx<C>) -> std::io::Result<()> {
     ctx.hub.broadcast(|_, ack| Ctl::Shutdown(ack));
 
     let mut c = ctx.cfgr.core.borrow_mut();
-    // Drop our char-device handles first, then ask for the devices to go away without
-    // waiting: a consumer that still has the block device open would otherwise hold
-    // shutdown open indefinitely, and being killed for it leaves the export in a worse
-    // state than letting the kernel reclaim the minor once that consumer closes.
-    for v in c.vols.iter_mut() {
-        v.cdev = None;
-    }
+    // The char-device handles went with the stop above, so ask for the devices to go
+    // away without waiting: a consumer that still has the block device open would
+    // otherwise hold shutdown open indefinitely, and being killed for it leaves the
+    // export in a worse state than letting the kernel reclaim the minor once that
+    // consumer closes.
     for (_, dev_id) in live {
         let _ = c.ctl().del_dev_async(dev_id);
     }
