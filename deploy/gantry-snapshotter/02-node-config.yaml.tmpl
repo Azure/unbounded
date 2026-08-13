@@ -1,0 +1,141 @@
+# gantry-snapshotter-node-config - the agent that owns the node's containerd
+# configuration.
+#
+# containerd will not talk to a snapshotter it has not been told about, and
+# there is no API for telling it at runtime: the proxy plugin, the runtime
+# handler and the CRI default all live in /etc/containerd/config.toml and take
+# effect on restart. Something has to edit that file on every node, and this is
+# it. Doing it by hand is possible and is what the README describes, but it is
+# an ordering-sensitive edit repeated per node and then repeated again every
+# time a node is reimaged, which is exactly the kind of thing that is wrong
+# once and then wrong forever.
+#
+# Notes, all of them load bearing:
+#
+#   - There is deliberately no runtimeClassName here, which is the opposite of
+#     the snapshotter's own DaemonSet. It cannot use gantry-bootstrap, because
+#     the handler that name refers to is what this pod creates. On a fresh node
+#     that is fine: containerd is unmodified and the default handler works. On a
+#     node that is already fully configured and has just rebooted, containerd's
+#     default snapshotter is gantry and the socket is gone with the tmpfs, so
+#     this pod cannot start until the snapshotter's pod - which can, because it
+#     has the bootstrap handler - is serving again. That wait is not a deadlock,
+#     and there is nothing for this pod to do on such a node until then anyway.
+#
+#   - hostPID plus privileged, because restarting containerd means entering the
+#     host's namespaces with nsenter and asking systemd. There is no way to
+#     restart a host service from a container without being able to become the
+#     host.
+#
+#   - Restarting containerd does not stop running containers. Their shims are
+#     separate processes that outlive containerd and reattach when it comes
+#     back. What does stall is anything that needs the CRI socket, so the
+#     restart is only issued when the merge actually changed something.
+#
+#   - The merge is on the parsed TOML document, not on the text, and only the
+#     keys it owns are touched. A node's own installer already owns that file -
+#     on AKS it pins the pause image, the registry config path and runc's cgroup
+#     driver - so overwriting it with a rendered copy breaks the node. The
+#     original is backed up once to config.toml.gantry-orig.
+#
+#   - nodeSelector racer.unbounded-cloud.io/active. The snapshotter is only
+#     useful on a node running racer, and pointing containerd at a snapshotter
+#     that will never be scheduled there is how a node stops being able to start
+#     pods. Gating both DaemonSets on the same label keeps the configuration and
+#     the agent on exactly the same set of nodes.
+#
+#   - The loop never exits. It re-checks on a timer so that a node whose
+#     configuration is rewritten underneath it - by a package upgrade, by a
+#     reimage, by an operator - is brought back without anyone noticing.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-snapshotter-node-config
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: gantry-snapshotter
+    app.kubernetes.io/component: node-config
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry-snapshotter
+      app.kubernetes.io/component: node-config
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # This pod restarts containerd. Rolling it across the whole cluster at
+      # once would stall pod creation everywhere at once.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gantry-snapshotter
+        app.kubernetes.io/component: node-config
+    spec:
+      serviceAccountName: gantry-snapshotter
+      # Entering the host's namespaces to restart containerd needs to see PID 1.
+      hostPID: true
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      priorityClassName: gantry-snapshotter-node-critical
+      tolerations:
+        - operator: Exists
+      nodeSelector:
+        racer.unbounded-cloud.io/active: "true"
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: node-config
+          image: {{ .Image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - node-config
+            - --config=/host/etc/containerd/config.toml
+            - --socket=/run/gantry-snapshotter/snapshotter.sock
+            - --containerd-socket=/run/containerd/containerd.sock
+            - --platform={{ .Platform | default "linux/amd64" }}
+            # How long a pass waits for the snapshotter to come up before
+            # giving up and trying again. Long, because on a node that is
+            # being installed for the first time the snapshotter's image
+            # still has to be pulled.
+            - --socket-timeout=30m
+            - --interval=1m
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            # Mounted at /host/etc/containerd rather than /etc/containerd so
+            # that a bug in this agent cannot rewrite its own image's /etc.
+            - name: containerd-config
+              mountPath: /host/etc/containerd
+            # Watched, not created: this is how the agent knows the
+            # snapshotter is actually serving before it makes it the default.
+            - name: snapshotter-run
+              mountPath: /run/gantry-snapshotter
+              readOnly: true
+            - name: containerd-run
+              mountPath: /run/containerd
+              readOnly: true
+      volumes:
+        - name: containerd-config
+          hostPath:
+            path: /etc/containerd
+            type: Directory
+        - name: snapshotter-run
+          hostPath:
+            path: /run/gantry-snapshotter
+            type: DirectoryOrCreate
+        - name: containerd-run
+          hostPath:
+            path: /run/containerd
+            type: Directory

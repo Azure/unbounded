@@ -57,6 +57,10 @@ const (
 	EnvStageTimeout  = "RACER_STAGE_TIMEOUT"
 	EnvSkipPreflight = "RACER_SKIP_PREFLIGHT"
 	EnvDeviceIDBase  = "RACER_DEVICE_ID_BASE"
+
+	// EnvImageDevices is where the image device map is published for
+	// gantry-snapshotter. Setting it to "-" turns publication off.
+	EnvImageDevices = "RACER_IMAGE_DEVICES"
 )
 
 // Defaults for everything the manifest does not pin.
@@ -102,6 +106,15 @@ const (
 	// DeviceIDBaseAuto is the value of RACER_DEVICE_ID_BASE that asks for a
 	// window derived from this node's allocated id instead of a fixed floor.
 	DeviceIDBaseAuto = "auto"
+
+	// DefaultImageDevicesPath is where the image device map is published. It
+	// lives on a tmpfs the container start path can read without an apiserver
+	// round trip, and it is rewritten from scratch every time it changes.
+	DefaultImageDevicesPath = "/run/racer/image-devices.json"
+
+	// ImageDevicesOff is the value of RACER_IMAGE_DEVICES that disables
+	// publication.
+	ImageDevicesOff = "-"
 )
 
 // Config is the resolved node agent configuration.
@@ -178,6 +191,14 @@ type Config struct {
 	// bottom of the space, because the derived window for a node id in the
 	// thousands runs past what the driver will accept.
 	DeriveDeviceIDBase bool
+
+	// ImageDevicesPath is where the image device map is written for
+	// gantry-snapshotter to read. Empty disables publication.
+	//
+	// The file is the whole of the interface between racer and the
+	// snapshotter: no apiserver call, no socket, and nothing the container
+	// start path can block on. See internal/gantry/snapshotter/segment.
+	ImageDevicesPath string
 }
 
 // ConfigPath is the full path of the file racer reads.
@@ -208,6 +229,12 @@ func LoadConfig() (Config, error) {
 		NQNPrefix:     envOr(EnvNQNPrefix, DefaultNQNPrefix),
 		StageTimeout:  DefaultStageTimeout,
 		SkipPreflight: truthy(os.Getenv(EnvSkipPreflight)),
+
+		ImageDevicesPath: envOr(EnvImageDevices, DefaultImageDevicesPath),
+	}
+
+	if cfg.ImageDevicesPath == ImageDevicesOff {
+		cfg.ImageDevicesPath = ""
 	}
 
 	if cfg.NodeName == "" {

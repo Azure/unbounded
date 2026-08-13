@@ -23,6 +23,7 @@ import (
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/components/gantry"
+	"github.com/Azure/unbounded/internal/operator/components/gantrysnapshotter"
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
@@ -62,9 +63,13 @@ type SiteReconciler struct {
 }
 
 // DefaultRegistry returns the built-in component registry: the net, machina,
-// gantry and racer cluster singletons and the metalman and storage per-Site
-// components. The slice order is the stable Site status condition order
-// (cluster first, then site).
+// gantry, racer and gantry-snapshotter cluster singletons and the metalman and
+// storage per-Site components. The slice order is the stable Site status
+// condition order (cluster first, then site).
+//
+// gantry-snapshotter follows racer because it provisions volumes out of racer's
+// default StorageClass. Ordering is not correctness here - a component that is
+// not ready is re-run - but running it after the class exists saves a pass.
 func DefaultRegistry() *component.Registry {
 	return &component.Registry{
 		Cluster: []component.ClusterComponent{
@@ -72,6 +77,7 @@ func DefaultRegistry() *component.Registry {
 			machina.New(),
 			gantry.New(),
 			racer.New(),
+			gantrysnapshotter.New(),
 		},
 		Site: []component.SiteComponent{
 			metalman.New(),

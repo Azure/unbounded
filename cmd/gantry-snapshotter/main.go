@@ -40,6 +40,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 				version.GitCommit, version.BuildTime)
 
 			return nil
+
+		case "node-config":
+			// The node's containerd configuration is merged by the same binary
+			// so that the version that owns the socket and the version that
+			// registers it are always the same one.
+			return runNodeConfig(args[1:], stdout, stderr)
 		}
 	}
 
@@ -73,6 +79,17 @@ func run(args []string, stdout, stderr io.Writer) error {
 	log.Info("stopped")
 
 	return nil
+}
+
+// signalContext returns a context cancelled on the first SIGINT or SIGTERM.
+//
+// Every entry point wires this before it builds anything, so a process stuck
+// waiting for containerd, for its image devices or for the snapshotter socket
+// still stops on the first signal rather than needing to be killed.
+func signalContext() context.Context {
+	ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM) //nolint:govet // the process exits when this context is done
+
+	return ctx
 }
 
 // newLogger builds the process logger. The handler writes to stderr because

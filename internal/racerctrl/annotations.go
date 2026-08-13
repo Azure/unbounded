@@ -208,6 +208,28 @@ const (
 	// PhaseAnnotation tracks where a volume is in its lifecycle, so a restarted
 	// operator resumes a destructive sequence rather than restarting it.
 	PhaseAnnotation = AnnotationDomain + "phase"
+
+	// ImageRoleAnnotation marks a volume as part of the cluster image volume:
+	// the shared, node-agnostic address space gantry-snapshotter stores OCI
+	// layers in. Its value is ImageRoleSegment or ImageRoleCatalog.
+	//
+	// An image volume is not staged through CSI. Every node that runs racer
+	// exports every one of them unconditionally, because the whole point is
+	// that a layer written once is readable from everywhere without a pod
+	// having claimed anything. The annotation is what tells the node agent to
+	// bind a device for a volume no kubelet will ever ask it about.
+	ImageRoleAnnotation = AnnotationDomain + "image-role"
+)
+
+// Image volume roles.
+const (
+	// ImageRoleSegment is a segment of the image address space: one
+	// IMMUTABLE_4M extent that layer bytes are written into.
+	ImageRoleSegment = "segment"
+
+	// ImageRoleCatalog is the image volume's catalog: one small OCC extent
+	// holding the chain-id and diff-id records that name the segments.
+	ImageRoleCatalog = "catalog"
 )
 
 // UniverseFinalizer holds a StorageClass until all of its volumes and membership

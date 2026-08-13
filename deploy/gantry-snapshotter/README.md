@@ -11,12 +11,14 @@ container layer stays on local disk.
 
 Per node:
 
-- A kernel with `CONFIG_EROFS_FS`, `CONFIG_BLK_DEV_DM` and `CONFIG_OVERLAY_FS`.
-- `racer` and `racer-ctrl` running, with the operator-rendered image device
-  description at `/run/racer/image-devices.json`.
+- A kernel with `CONFIG_EROFS_FS`, `CONFIG_BLK_DEV_DM` and `CONFIG_OVERLAY_FS`,
+  and the `erofs`, `dm_mod` and `ublk_drv` modules loaded.
+- `racer` and `racer-ctrl` running, with the image device description
+  racer-ctrl publishes at `/run/racer/image-devices.json`.
 - containerd 2.x, with a `gantry-bootstrap` runtime handler pinned to
   overlayfs. This is not optional; see "Why the agent runs under its own
-  RuntimeClass" below.
+  RuntimeClass" below. The `gantry-snapshotter-node-config` DaemonSet installs
+  it; see "Install".
 
 In the image: `mkfs.erofs` (erofs-utils) and `dmsetup` (lvm2) on `PATH`.
 
@@ -27,45 +29,90 @@ misses, and containerd unpacks locally exactly as it does today.
 
 ## Install
 
-Three phases, in this order. The middle one is the only one that can be done
-from the API server, and the two containerd edits are deliberately separate:
-`snapshotter = "gantry"` is the CRI default for every pod on the node, and the
-agent is a pod.
+Enable the component on the Site and the operator does the rest:
 
-**1. Install the bootstrap runtime handler on every node.** Merge phase 1 of
-[`containerd-config.toml`](containerd-config.toml) into
-`/etc/containerd/config.toml` and restart containerd. This adds a
-`gantry-bootstrap` runtime handler pinned to overlayfs and registers the proxy
-plugin. Nothing selects either yet, so it changes no pod's behaviour.
-
-```sh
-systemctl restart containerd
-ctr plugin ls | grep gantry
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+  name: default
+spec:
+  components:
+    racer:
+      enabled: true
+    gantrySnapshotter:
+      enabled: true
+      segments: 4
+      segmentSize: 8Gi
+      catalogSize: 256Mi
 ```
 
-**2. Apply the manifests.** The RuntimeClass has to exist before the DaemonSet
-that selects it, and the handler from phase 1 has to exist before either, or
-the pods stay Pending.
+The operator creates one `gantry-image-segment-<n>` PersistentVolume per
+segment plus `gantry-image-catalog`, waits for racer's allocator to stamp a
+composition on each, and applies the manifests. It reports
+`GantrySnapshotterReady` on the Site, staying `ImageVolumesPending` until every
+image volume has been placed. The image volumes are `Retain` and are never
+resized: the extent page count is frozen when the volume is allocated, so
+changing `segmentSize` after the fact is reported and ignored.
+
+Watch it come up:
 
 ```sh
-make gantry-snapshotter-manifests
-kubectl apply -f deploy/gantry-snapshotter/rendered/serviceaccount.yaml
-kubectl apply -f deploy/gantry-snapshotter/rendered/runtimeclass.yaml
-kubectl apply -f deploy/gantry-snapshotter/rendered/daemonset.yaml
+kubectl get site default -o jsonpath='{.status.conditions}' | jq
+kubectl get pv -l app.kubernetes.io/name=gantry-snapshotter
+kubectl -n unbounded-system rollout status ds/gantry-snapshotter-node-config
 kubectl -n unbounded-system rollout status ds/gantry-snapshotter
 ```
 
-**3. Point CRI at the snapshotter.** Only once the socket exists on the node.
-Merge phase 2 and restart containerd:
+### Manual install
+
+The same manifests can be applied by hand. Order matters: the RuntimeClass has
+to exist before the DaemonSet that selects it, and the containerd handler has
+to exist before either or the pods stay Pending. The rendered files are
+numbered in the order they must be applied.
 
 ```sh
-ls -l /run/gantry-snapshotter/snapshotter.sock
-systemctl restart containerd
+make gantry-snapshotter-manifests
+kubectl apply -f deploy/gantry-snapshotter/rendered/00-serviceaccount.yaml
+kubectl apply -f deploy/gantry-snapshotter/rendered/01-runtimeclass.yaml
+kubectl apply -f deploy/gantry-snapshotter/rendered/02-node-config.yaml
+kubectl apply -f deploy/gantry-snapshotter/rendered/03-daemonset.yaml
+kubectl -n unbounded-system rollout status ds/gantry-snapshotter
 ```
 
-Verify it works end to end:
+### What node-config does, and why it is two phases
+
+`gantry-snapshotter-node-config` merges this repository's stanzas into the
+node's `/etc/containerd/config.toml` and restarts containerd. It merges into the
+parsed document rather than appending text, because that file belongs to
+whatever installed the node: on AKS it pins the sandbox image, the registry
+config path and runc's `SystemdCgroup`, and all of that has to survive. The
+original is kept once at `/etc/containerd/config.toml.gantry-orig`.
+
+It does it in two passes, and the split is deliberate.
+[`containerd-config.toml`](containerd-config.toml) shows what each one writes.
+
+**Phase 1** registers the proxy plugin and adds a `gantry-bootstrap` runtime
+handler pinned to overlayfs, copied from the node's real default handler so it
+keeps its cgroup driver and runc binary. Nothing selects either yet, so it
+changes no pod's behaviour. It is safe before the agent exists: containerd dials
+a proxy plugin lazily.
+
+**Phase 2** makes `gantry` the CRI default snapshotter, and is applied only
+after `/run/gantry-snapshotter/snapshotter.sock` exists on that node. Doing both
+at once deadlocks the node permanently after the first reboot, because the
+default snapshotter applies to the agent's own pod and the socket is on tmpfs.
+
+The node-config pod deliberately carries no `runtimeClassName`, because it is
+what creates the handler that class names. After a reboot of a fully configured
+node it cannot start until the agent is serving again - the agent can, because
+it uses `gantry-bootstrap` - and there is nothing for it to do until then
+anyway.
+
+Verify it took:
 
 ```sh
+ctr plugin ls | grep gantry
 ctr -n k8s.io image pull --snapshotter gantry docker.io/library/alpine:latest
 ctr -n k8s.io snapshot --snapshotter gantry ls
 ```
@@ -85,12 +132,19 @@ handler `snapshotter = "gantry"`.
 Reverse order, for the same reason:
 
 ```sh
-# 1. Remove the phase 2 stanzas and restart containerd on every node.
+# 1. Remove the phase 2 stanzas and restart containerd on every node. The
+#    original config is at /etc/containerd/config.toml.gantry-orig.
 # 2. Then, and only then:
-kubectl delete -f deploy/gantry-snapshotter/rendered/daemonset.yaml
-kubectl delete -f deploy/gantry-snapshotter/rendered/runtimeclass.yaml
+kubectl delete -f deploy/gantry-snapshotter/rendered/03-daemonset.yaml
+kubectl delete -f deploy/gantry-snapshotter/rendered/02-node-config.yaml
+kubectl delete -f deploy/gantry-snapshotter/rendered/01-runtimeclass.yaml
 # 3. Finally, remove the phase 1 stanzas.
 ```
+
+Setting `gantrySnapshotter.enabled: false` on the Site does not uninstall
+anything, in the same way that disabling racer does not. The image volume holds
+the only copy of a converted layer, and the containerd edits have to come off a
+node before the pods do.
 
 Snapshots created by this snapshotter are not readable by overlayfs, so any
 pod still running on a rootfs it provided must be recreated after the

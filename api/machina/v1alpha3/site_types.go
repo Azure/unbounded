@@ -4,6 +4,7 @@
 package v1alpha3
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -29,6 +30,7 @@ func init() {
 // +kubebuilder:printcolumn:name="Storage",type=boolean,JSONPath=".spec.components.storage.enabled",priority=1
 // +kubebuilder:printcolumn:name="Gantry",type=boolean,JSONPath=".spec.components.gantry.enabled",priority=1
 // +kubebuilder:printcolumn:name="Racer",type=boolean,JSONPath=".spec.components.racer.enabled",priority=1
+// +kubebuilder:printcolumn:name="Snapshotter",type=boolean,JSONPath=".spec.components.gantrySnapshotter.enabled",priority=1
 // +kubebuilder:printcolumn:name="Nodes",type=integer,JSONPath=".status.nodeCount"
 // +kubebuilder:printcolumn:name="Slices",type=integer,JSONPath=".status.sliceCount"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
@@ -144,6 +146,13 @@ type SiteComponents struct {
 	// is not something to switch on by omission.
 	// +optional
 	Racer *RacerComponentSpec `json:"racer,omitempty"`
+
+	// GantrySnapshotter configures the containerd snapshotter that serves
+	// image layers out of racer instead of pulling them. It requires racer,
+	// and defaults to disabled: it takes over containerd's snapshotter on
+	// every node it runs on, which is not something to switch on by omission.
+	// +optional
+	GantrySnapshotter *GantrySnapshotterComponentSpec `json:"gantrySnapshotter,omitempty"`
 }
 
 // SiteComponentSpec contains common component configuration. Components install
@@ -196,6 +205,42 @@ type GantryComponentSpec struct {
 // but leaves the node agents and their stores in place.
 type RacerComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
+}
+
+// GantrySnapshotterComponentSpec configures the gantry snapshotter for a site.
+//
+// The snapshotter needs somewhere to put layers, and that somewhere is a set of
+// ordinary racer volumes the operator provisions: one catalog and some number
+// of segments. Their geometry is here rather than inferred because it cannot be
+// changed afterwards. A segment is a single immutable extent, and an extent's
+// size is frozen when it is allocated; growing the image address space means
+// adding segments, never resizing one.
+type GantrySnapshotterComponentSpec struct {
+	SiteComponentSpec `json:",inline"`
+
+	// Segments is how many image segments to provision. Defaults to 4.
+	//
+	// Layers are packed into segments in whole 4 MiB pages, so the usable
+	// capacity is Segments times SegmentSize. More, smaller segments cost
+	// nothing at rest and bound how much a single lost extent takes with it.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1024
+	// +optional
+	Segments *int32 `json:"segments,omitempty"`
+
+	// SegmentSize is the size of each image segment. Defaults to 8Gi.
+	//
+	// It must be a multiple of 4Mi: a segment is an IMMUTABLE_4M extent and
+	// that is its page size.
+	// +optional
+	SegmentSize *resource.Quantity `json:"segmentSize,omitempty"`
+
+	// CatalogSize is the size of the image catalog. Defaults to 256Mi.
+	//
+	// The catalog is an append-only log of one record per layer, so this bounds
+	// how many distinct layers the cluster can hold, not how large they are.
+	// +optional
+	CatalogSize *resource.Quantity `json:"catalogSize,omitempty"`
 }
 
 // SiteStatus defines the observed state of Site.

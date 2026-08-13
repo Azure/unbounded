@@ -154,6 +154,16 @@ spec:
               mountPath: /sys
             - name: configfs
               mountPath: /sys/kernel/config
+            # Where this node's image device mapping is published. It is a
+            # hostPath, unlike the config channel, because the reader is a
+            # different pod: gantry-snapshotter has to learn which /dev/ublkb*
+            # holds which cluster-wide segment, and it has to be able to learn
+            # it before it can start a container, so the answer cannot be
+            # behind the API server. /run is tmpfs, which is the right lifetime
+            # for it: the minors it names are node-local and do not survive a
+            # reboot either.
+            - name: run
+              mountPath: /run/racer
             - name: plugin-dir
               mountPath: /csi
             - name: kubelet-plugins-dir
@@ -242,6 +252,11 @@ spec:
           hostPath:
             path: /dev
             type: Directory
+        # The image device mapping racer-ctrl publishes for gantry-snapshotter.
+        - name: run
+          hostPath:
+            path: /run/racer
+            type: DirectoryOrCreate
         - name: sys
           hostPath:
             path: /sys

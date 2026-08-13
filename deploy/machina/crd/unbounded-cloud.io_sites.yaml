@@ -45,6 +45,10 @@ spec:
       name: Racer
       priority: 1
       type: boolean
+    - jsonPath: .spec.components.gantrySnapshotter.enabled
+      name: Snapshotter
+      priority: 1
+      type: boolean
     - jsonPath: .status.nodeCount
       name: Nodes
       type: integer
@@ -99,6 +103,50 @@ spec:
                       enabled:
                         description: Enabled controls whether the component is reconciled.
                         type: boolean
+                    type: object
+                  gantrySnapshotter:
+                    description: |-
+                      GantrySnapshotter configures the containerd snapshotter that serves
+                      image layers out of racer instead of pulling them. It requires racer,
+                      and defaults to disabled: it takes over containerd's snapshotter on
+                      every node it runs on, which is not something to switch on by omission.
+                    properties:
+                      catalogSize:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          CatalogSize is the size of the image catalog. Defaults to 256Mi.
+
+                          The catalog is an append-only log of one record per layer, so this bounds
+                          how many distinct layers the cluster can hold, not how large they are.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      enabled:
+                        description: Enabled controls whether the component is reconciled.
+                        type: boolean
+                      segmentSize:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          SegmentSize is the size of each image segment. Defaults to 8Gi.
+
+                          It must be a multiple of 4Mi: a segment is an IMMUTABLE_4M extent and
+                          that is its page size.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      segments:
+                        description: |-
+                          Segments is how many image segments to provision. Defaults to 4.
+
+                          Layers are packed into segments in whole 4 MiB pages, so the usable
+                          capacity is Segments times SegmentSize. More, smaller segments cost
+                          nothing at rest and bound how much a single lost extent takes with it.
+                        format: int32
+                        maximum: 1024
+                        minimum: 1
+                        type: integer
                     type: object
                   machina:
                     description: Machina configures the machina controller for this

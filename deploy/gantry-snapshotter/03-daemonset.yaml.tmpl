@@ -65,14 +65,16 @@
 #     cleaner then has to reclaim.
 #
 # Apply with:
-#   kubectl apply -f deploy/gantry-snapshotter/serviceaccount.yaml
-#   kubectl apply -f deploy/gantry-snapshotter/runtimeclass.yaml
-#   kubectl apply -f deploy/gantry-snapshotter/daemonset.yaml
+#   kubectl apply -f deploy/gantry-snapshotter/rendered/00-serviceaccount.yaml
+#   kubectl apply -f deploy/gantry-snapshotter/rendered/01-runtimeclass.yaml
+#   kubectl apply -f deploy/gantry-snapshotter/rendered/02-node-config.yaml
+#   kubectl apply -f deploy/gantry-snapshotter/rendered/03-daemonset.yaml
 #
 # The containerd runtime handler the RuntimeClass names has to be in
 # place first, and the CRI snapshotter default has to be flipped after
-# the agent is running. See deploy/gantry-snapshotter/containerd-config.toml
-# and the README.
+# the agent is running. 02-node-config.yaml is what does both, in that
+# order, on every node; deploy/gantry-snapshotter/containerd-config.toml
+# documents the same edits for anyone doing it by hand.
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -111,6 +113,14 @@ spec:
       priorityClassName: gantry-snapshotter-node-critical
       tolerations:
         - operator: Exists
+      # The snapshotter's whole value is the RACER-backed image device, which
+      # only exists on a node running racer. Gating this on the same label the
+      # racer DaemonSet uses also keeps it on exactly the set of nodes whose
+      # containerd is reconfigured to require it, which is the property that
+      # matters: a node pointed at a snapshotter that will never be scheduled
+      # there cannot start pods at all.
+      nodeSelector:
+        racer.unbounded-cloud.io/active: "true"
       # Layer mounts and device-mapper targets are torn down lazily by
       # the next Cleanup sweep, not on shutdown, so the agent has
       # nothing slow to do on the way out. It only needs long enough to

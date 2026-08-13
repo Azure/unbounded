@@ -290,7 +290,7 @@ REACT_DEV ?= false
 
 .PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
-.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push image-gantry-snapshotter-local image-gantry-snapshotter-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
@@ -652,7 +652,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
-unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Build the unbounded-operator binary (no lint/test)
+unbounded-operator-build: machina-manifests net-manifests unbounded-storage-supervisor-manifests unbounded-operator-manifests gantry-manifests gantry-snapshotter-manifests racer-manifests ## Build the unbounded-operator binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
@@ -1247,6 +1247,18 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 image-gantry-push: image-gantry-local ## Build and push the gantry container image
 	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
 
+image-gantry-snapshotter-local: ## Build the gantry-snapshotter container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t gantry-snapshotter:$(VERSION_TAG) -t $(GANTRY_SNAPSHOTTER_IMAGE) \
+		-f ./images/gantry-snapshotter/Containerfile .
+	$(call trivy-maybe,$(GANTRY_SNAPSHOTTER_IMAGE))
+
+image-gantry-snapshotter-push: image-gantry-snapshotter-local ## Build and push the gantry-snapshotter container image
+	$(CONTAINER_ENGINE) push $(GANTRY_SNAPSHOTTER_IMAGE)
+
 image-racer-ctrl-local: ## Build the racer-ctrl container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
@@ -1418,7 +1430,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-racer-ctrl-local image-racer-local ## Build all container images locally
+images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-snapshotter-local image-racer-ctrl-local image-racer-local ## Build all container images locally
 
 ##@ Net Frontend
 

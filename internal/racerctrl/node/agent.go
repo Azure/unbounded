@@ -136,6 +136,18 @@ type Agent struct {
 	// are never pruned, because a volume staged a moment ago may not have
 	// reached the informer cache yet.
 	adopted map[string]struct{}
+
+	// image is what this node exports of the cluster image volume, and
+	// imageBound the volume names it holds a device for. The snapshotter reads
+	// the map this produces; nothing in the cluster reads it back.
+	image      imageState
+	imageBound map[string]struct{}
+
+	// imagePublished is the last map written, in its unstamped form, and
+	// imageGeneration the generation it was written at. Comparing the unstamped
+	// form is what keeps the generation from advancing on every poll.
+	imagePublished  []byte
+	imageGeneration uint64
 }
 
 // NewAgent builds an agent. It does not touch the cluster or the host.
@@ -157,6 +169,7 @@ func NewAgent(cfg Config, client kubernetes.Interface, log *slog.Logger) *Agent 
 		classLister:  classes.Lister(),
 		signal:       make(chan struct{}, 1),
 		attachments:  map[racerctrl.Attachment]string{},
+		imageBound:   map[string]struct{}{},
 		self:         racerctrl.NodeState{Name: cfg.NodeName, Live: map[uint32]racerctrl.LiveExtent{}},
 	}
 
@@ -206,6 +219,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	go a.scrapeLoop(ctx)
+	go a.imageLoop(ctx)
 
 	a.Trigger()
 
@@ -275,6 +289,7 @@ func (a *Agent) adoptExistingState() error {
 	}
 
 	a.adoptBindings()
+	a.adoptImageGeneration()
 
 	existing, err := racerctrl.ReadConfig(a.cfg.ConfigPath())
 	if err != nil {
@@ -448,6 +463,10 @@ func (a *Agent) Reconcile(ctx context.Context) error {
 	// than latched: recabling a node is an annotation edit, not a restart.
 	a.self.FabricID = identity.FabricID
 	a.self.RDMAAddr = identity.RDMAAddr
+
+	// Image volumes are exported by every node without anything having asked,
+	// so they are bound here rather than from NodeStageVolume.
+	a.reconcileImageVolumes(cluster, imageVolumeRoles(volumes))
 
 	if err := a.assignFabricMinors(cluster); err != nil {
 		return err

@@ -48,9 +48,15 @@ rules:
   # racer volumes are PersistentVolumes. The operator stamps each one's extent
   # composition and home zone, and holds a finalizer while the extents are
   # collected, so it needs write access to the object and its metadata.
+  #
+  # It also creates them, for one case: the gantry-snapshotter image volume.
+  # racer has no controller service, so nothing provisions racer volumes on
+  # demand; the allocator only places volumes that already exist. The image
+  # volume is not claimed by any workload, so there is no PersistentVolumeClaim
+  # to trigger provisioning from, and it has to be created outright.
   - apiGroups: [""]
     resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   # A StorageClass whose provisioner is racer.unbounded-cloud.io is a racer
   # universe; the operator creates the default class and records the universe
   # id, catalog size, epoch, LBA cursor and per-zone membership on it. The
@@ -72,8 +78,16 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["scheduling.k8s.io"]
     # The gantry component installs a low-priority PriorityClass (gantry-low)
-    # so its agents are preemptible under cluster pressure.
+    # so its agents are preemptible under cluster pressure, and
+    # gantry-snapshotter installs a node-critical one because a node whose
+    # containerd points at an absent snapshotter cannot start any pod.
     resources: ["priorityclasses"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["node.k8s.io"]
+    # gantry-snapshotter's RuntimeClass names the containerd runtime handler
+    # that stays on overlayfs, which is the one thing that keeps the
+    # snapshotter's own pod from depending on the snapshotter.
+    resources: ["runtimeclasses"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
