@@ -29,6 +29,7 @@ package node
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -55,6 +56,7 @@ const (
 	EnvNQNPrefix     = "RACER_NQN_PREFIX"
 	EnvStageTimeout  = "RACER_STAGE_TIMEOUT"
 	EnvSkipPreflight = "RACER_SKIP_PREFLIGHT"
+	EnvDeviceIDBase  = "RACER_DEVICE_ID_BASE"
 )
 
 // Defaults for everything the manifest does not pin.
@@ -96,6 +98,10 @@ const (
 	// accept the generation that adds the device and for the block device node
 	// to appear.
 	DefaultStageTimeout = 2 * time.Minute
+
+	// DeviceIDBaseAuto is the value of RACER_DEVICE_ID_BASE that asks for a
+	// window derived from this node's allocated id instead of a fixed floor.
+	DeviceIDBaseAuto = "auto"
 )
 
 // Config is the resolved node agent configuration.
@@ -147,6 +153,31 @@ type Config struct {
 	// SkipPreflight disables the host prerequisite checks. Only useful for
 	// development against a host that cannot satisfy them.
 	SkipPreflight bool
+
+	// DeviceIDBase is the lowest ublk minor this instance may allocate, and it
+	// takes racerctrl.MaxExports ids from there.
+	//
+	// ublk minors are global to the kernel, not to the node object, so this
+	// only needs setting where more than one racer shares a kernel: a test
+	// harness running a whole zone on one box, or a host that already runs
+	// another ublk user on the low minors. Zero means the bottom of the space.
+	DeviceIDBase uint32
+
+	// DeriveDeviceIDBase asks for a window derived from this node's allocated
+	// id rather than a fixed one, which is what RACER_DEVICE_ID_BASE=auto
+	// means.
+	//
+	// A fixed base only helps when the operator can give each instance a
+	// different one, and a DaemonSet cannot: every pod reads the same template
+	// and the downward API has no arithmetic. Node ids are already unique
+	// across the cluster and already allocated before the agent needs a minor,
+	// so deriving the window from the id gives every instance on a shared
+	// kernel a disjoint slice with nothing to coordinate.
+	//
+	// This is not the production arrangement. One racer per kernel wants the
+	// bottom of the space, because the derived window for a node id in the
+	// thousands runs past what the driver will accept.
+	DeriveDeviceIDBase bool
 }
 
 // ConfigPath is the full path of the file racer reads.
@@ -199,6 +230,21 @@ func LoadConfig() (Config, error) {
 		}
 
 		cfg.RDMAPort = port
+	}
+
+	if raw := os.Getenv(EnvDeviceIDBase); raw != "" {
+		if strings.EqualFold(strings.TrimSpace(raw), DeviceIDBaseAuto) {
+			cfg.DeriveDeviceIDBase = true
+		} else {
+			base, err := strconv.ParseUint(raw, 10, 32)
+			if err != nil || base < racerctrl.MinDeviceID ||
+				base+racerctrl.MaxExports-1 > math.MaxUint32 {
+				return Config{}, fmt.Errorf("%s: %q is neither %q nor a usable ublk minor",
+					EnvDeviceIDBase, raw, DeviceIDBaseAuto)
+			}
+
+			cfg.DeviceIDBase = uint32(base)
+		}
 	}
 
 	if raw := os.Getenv(EnvStageTimeout); raw != "" {

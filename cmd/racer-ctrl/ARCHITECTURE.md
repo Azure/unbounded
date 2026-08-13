@@ -42,7 +42,17 @@ the single place a knob is set: `NODE_NAME` (required), `POD_NAMESPACE`,
 `RACER_CONFIG_DIR` (default `/etc/racer`), `RACER_STORE`, `RACER_METRICS_URL`,
 `CSI_ENDPOINT`, `RACER_NVMET_ROOT`, `RACER_FABRIC_ADDR`, `RACER_FABRIC_PORT`,
 `RACER_RDMA_PORT`, `RACER_NQN_PREFIX`, `RACER_STAGE_TIMEOUT`,
-`RACER_SKIP_PREFLIGHT`, `RACER_LOG_LEVEL`.
+`RACER_SKIP_PREFLIGHT`, `RACER_LOG_LEVEL`, `RACER_DEVICE_ID_BASE`.
+
+`RACER_DEVICE_ID_BASE` moves the floor of the ublk minor window this node
+allocates from. It exists because minors are global to the kernel, not to the
+container: one node is normally one kernel and the default floor of 1 is right,
+but when several agents share a kernel a fixed floor puts all of them on the
+same first minor. Setting it to a number picks that floor explicitly. Setting
+it to `auto` derives the floor from the node id the operator allocated, which
+is unique cluster-wide, so agents that share a kernel never contend. `auto` is
+a testing arrangement rather than a production one: a derived window for a node
+id in the thousands runs past what the driver accepts.
 
 Two subcommands. `preflight` checks host prerequisites and exits; it is a
 separate entry point so it can run as an init container, where a node that

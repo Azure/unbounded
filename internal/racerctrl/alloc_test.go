@@ -4,6 +4,7 @@
 package racerctrl
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -170,26 +171,26 @@ func TestParseCompositionRejectsGaps(t *testing.T) {
 func TestMinorAllocationIsLowestFree(t *testing.T) {
 	self := &NodeState{}
 
-	fabric, changed, err := AssignFabricDeviceID(self, 5)
+	fabric, changed, err := AssignFabricDeviceID(self, 5, MinorSpace{})
 	require.NoError(t, err)
 	assert.True(t, changed)
 	assert.Equal(t, uint32(1), fabric)
 
-	device, changed, err := AssignDeviceID(self, "pv-a")
+	device, changed, err := AssignDeviceID(self, "pv-a", MinorSpace{})
 	require.NoError(t, err)
 	assert.True(t, changed)
 	assert.Equal(t, uint32(2), device)
 
 	// Idempotent: asking again returns the same minor and reports no change, so
 	// a reload cannot move a volume's path out from under an open fd.
-	again, changed, err := AssignDeviceID(self, "pv-a")
+	again, changed, err := AssignDeviceID(self, "pv-a", MinorSpace{})
 	require.NoError(t, err)
 	assert.False(t, changed)
 	assert.Equal(t, device, again)
 
 	assert.True(t, ReleaseDeviceID(self, "pv-a"))
 
-	reused, _, err := AssignDeviceID(self, "pv-b")
+	reused, _, err := AssignDeviceID(self, "pv-b", MinorSpace{})
 	require.NoError(t, err)
 	assert.Equal(t, uint32(2), reused, "a released minor is free again")
 }
@@ -509,4 +510,76 @@ func TestLiveDoesNotDuplicateAnExtentItAlreadyReports(t *testing.T) {
 	parsed, err := ParseLive(raw)
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), parsed[7].Pages)
+}
+
+func TestMinorAllocationHonoursTheBase(t *testing.T) {
+	// ublk minors are the kernel's, so instances sharing one take disjoint
+	// windows rather than both starting at the bottom.
+	self := &NodeState{}
+
+	fabric, _, err := AssignFabricDeviceID(self, 5, MinorSpace{Base: 257})
+	require.NoError(t, err)
+	assert.Equal(t, uint32(257), fabric)
+
+	device, _, err := AssignDeviceID(self, "pv-a", MinorSpace{Base: 257})
+	require.NoError(t, err)
+	assert.Equal(t, uint32(258), device)
+
+	// The window is still MaxExports wide, so the per-node budget is unchanged.
+	full := &NodeState{}
+	for i := range MaxExports {
+		_, _, err := AssignDeviceID(full, fmt.Sprintf("pv-%d", i), MinorSpace{Base: 257})
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, uint32(257), full.Devices[0].DeviceID)
+	assert.Equal(t, uint32(257+MaxExports-1), full.Devices[MaxExports-1].DeviceID)
+
+	_, _, err = AssignDeviceID(full, "pv-one-too-many", MinorSpace{Base: 257})
+	assert.Error(t, err)
+
+	// A zero base is the bottom of the space, not minor zero.
+	bottom := &NodeState{}
+	id, _, err := AssignDeviceID(bottom, "pv-a", MinorSpace{})
+	require.NoError(t, err)
+	assert.Equal(t, uint32(MinDeviceID), id)
+}
+
+func TestMinorAllocationSkipsMinorsHeldElsewhere(t *testing.T) {
+	// The bindings a node keeps describe only the minors it put there itself.
+	// Everything else the kernel holds - another instance, an unrelated ublk
+	// user, a device leaked by a crash - is invisible to them and fatal to
+	// CMD_ADD_DEV, so the probe is what makes the allocation truthful.
+	held := map[uint32]bool{1: true, 2: true, 4: true}
+	space := MinorSpace{InUse: func(id uint32) bool { return held[id] }}
+
+	self := &NodeState{}
+
+	fabric, _, err := AssignFabricDeviceID(self, 5, space)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(3), fabric)
+
+	device, _, err := AssignDeviceID(self, "pv-a", space)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(5), device)
+
+	// A minor this node has already bound is not offered to the probe: it is
+	// held by us, and answering "in use" for it must not push allocation past
+	// the end of the window.
+	probed := map[uint32]bool{}
+	counting := MinorSpace{InUse: func(id uint32) bool {
+		probed[id] = true
+
+		return held[id]
+	}}
+
+	_, _, err = AssignDeviceID(self, "pv-b", counting)
+	require.NoError(t, err)
+	assert.False(t, probed[3], "the fabric minor this node owns was handed to the probe")
+	assert.False(t, probed[5], "the device minor this node owns was handed to the probe")
+
+	// A window whose every minor is spoken for is exhausted, not silently
+	// wrapped onto somebody else's device.
+	_, _, err = AssignDeviceID(&NodeState{}, "pv-c", MinorSpace{InUse: func(uint32) bool { return true }})
+	assert.ErrorContains(t, err, "held elsewhere")
 }

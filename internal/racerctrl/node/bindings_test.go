@@ -70,12 +70,12 @@ func TestBindingsSurviveAnAgentRestart(t *testing.T) {
 	first := newBindingsAgent(t, dir)
 
 	for _, volume := range []string{"pv-a", "pv-b"} {
-		if _, _, err := racerctrl.AssignDeviceID(&first.self, volume); err != nil {
+		if _, _, err := racerctrl.AssignDeviceID(&first.self, volume, racerctrl.MinorSpace{}); err != nil {
 			t.Fatalf("assign %s: %v", volume, err)
 		}
 	}
 
-	if _, _, err := racerctrl.AssignFabricDeviceID(&first.self, 11); err != nil {
+	if _, _, err := racerctrl.AssignFabricDeviceID(&first.self, 11, racerctrl.MinorSpace{}); err != nil {
 		t.Fatalf("assign fabric: %v", err)
 	}
 
@@ -117,7 +117,7 @@ func TestAdoptedMinorsAreNotHandedOutAgain(t *testing.T) {
 
 	first := newBindingsAgent(t, dir)
 
-	fabricID, _, err := racerctrl.AssignFabricDeviceID(&first.self, 11)
+	fabricID, _, err := racerctrl.AssignFabricDeviceID(&first.self, 11, racerctrl.MinorSpace{})
 	if err != nil {
 		t.Fatalf("assign fabric: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestAdoptedMinorsAreNotHandedOutAgain(t *testing.T) {
 
 	second := restart(t, dir)
 
-	id, _, err := racerctrl.AssignDeviceID(&second.self, "pv-new")
+	id, _, err := racerctrl.AssignDeviceID(&second.self, "pv-new", racerctrl.MinorSpace{})
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestAdoptIgnoresUnreadableBindings(t *testing.T) {
 			}
 
 			// Recovery is the next stage rewriting the file.
-			if _, _, err := racerctrl.AssignDeviceID(&agent.self, "pv-a"); err != nil {
+			if _, _, err := racerctrl.AssignDeviceID(&agent.self, "pv-a", racerctrl.MinorSpace{}); err != nil {
 				t.Fatalf("assign: %v", err)
 			}
 
@@ -241,7 +241,7 @@ func TestPruneDropsABindingForADeletedVolume(t *testing.T) {
 	first := newBindingsAgent(t, dir)
 
 	for _, volume := range []string{"pv-live", "pv-gone"} {
-		if _, _, err := racerctrl.AssignDeviceID(&first.self, volume); err != nil {
+		if _, _, err := racerctrl.AssignDeviceID(&first.self, volume, racerctrl.MinorSpace{}); err != nil {
 			t.Fatalf("assign %s: %v", volume, err)
 		}
 	}
@@ -271,7 +271,7 @@ func TestPruneDropsABindingForADeletedVolume(t *testing.T) {
 func TestPruneSparesABindingThisProcessMade(t *testing.T) {
 	agent := newBindingsAgent(t, t.TempDir())
 
-	if _, _, err := racerctrl.AssignDeviceID(&agent.self, "pv-fresh"); err != nil {
+	if _, _, err := racerctrl.AssignDeviceID(&agent.self, "pv-fresh", racerctrl.MinorSpace{}); err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 
@@ -291,7 +291,7 @@ func TestPruneRunsOnlyOnce(t *testing.T) {
 	dir := t.TempDir()
 
 	first := newBindingsAgent(t, dir)
-	if _, _, err := racerctrl.AssignDeviceID(&first.self, "pv-a"); err != nil {
+	if _, _, err := racerctrl.AssignDeviceID(&first.self, "pv-a", racerctrl.MinorSpace{}); err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 
@@ -317,7 +317,7 @@ func TestUnstageForgetsTheBindingOnDisk(t *testing.T) {
 	dir := t.TempDir()
 
 	agent := newBindingsAgent(t, dir)
-	if _, _, err := racerctrl.AssignDeviceID(&agent.self, "pv-a"); err != nil {
+	if _, _, err := racerctrl.AssignDeviceID(&agent.self, "pv-a", racerctrl.MinorSpace{}); err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 
@@ -335,7 +335,7 @@ func TestUnstageClearsTheAdoptedMark(t *testing.T) {
 	dir := t.TempDir()
 
 	first := newBindingsAgent(t, dir)
-	if _, _, err := racerctrl.AssignDeviceID(&first.self, "pv-a"); err != nil {
+	if _, _, err := racerctrl.AssignDeviceID(&first.self, "pv-a", racerctrl.MinorSpace{}); err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 
@@ -427,5 +427,101 @@ func TestAdoptTakesTheGenerationFromTheExistingConfig(t *testing.T) {
 	// wholesale, and racer could not have loaded it either.
 	if generation := restart(t, dir).generation; generation != 0 {
 		t.Fatalf("an unreadable config was adopted at generation %d", generation)
+	}
+}
+
+func TestMinorSpaceAsksTheKernelWhichMinorsAreTaken(t *testing.T) {
+	// The character device is created at CMD_ADD_DEV, before the block device
+	// is started, so it is the earliest evidence a minor is spoken for.
+	dir := t.TempDir()
+
+	previous := devRoot
+	devRoot = dir
+
+	t.Cleanup(func() { devRoot = previous })
+
+	for _, name := range []string{"ublkc1", "ublkc2", "ublkb1"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+
+	agent := newBindingsAgent(t, dir)
+	space := agent.minorSpace()
+
+	if !space.InUse(1) || !space.InUse(2) {
+		t.Fatalf("minors with a character device were reported free")
+	}
+
+	if space.InUse(3) {
+		t.Fatalf("a minor with no character device was reported taken")
+	}
+
+	id, _, err := racerctrl.AssignDeviceID(&agent.self, "pv-a", space)
+	if err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+
+	if id != 3 {
+		t.Fatalf("allocated minor %d, want the lowest one the kernel does not hold (3)", id)
+	}
+}
+
+// TestDeviceIDBaseIsDerivedFromTheNodeID covers the arrangement where several
+// agents share one kernel. Minors are global to the kernel, so a fixed floor
+// puts every agent on the same first minor; deriving the floor from the node id
+// the operator allocated gives each of them a window nobody else can reach.
+func TestDeviceIDBaseIsDerivedFromTheNodeID(t *testing.T) {
+	a := newBindingsAgent(t, t.TempDir())
+
+	if got := a.deviceIDBase(); got != 0 {
+		t.Fatalf("an unconfigured agent asked for base %d, want the default floor", got)
+	}
+
+	a.cfg.DeviceIDBase = 900
+	if got := a.deviceIDBase(); got != 900 {
+		t.Fatalf("base %d, want the configured 900", got)
+	}
+
+	a.cfg.DeriveDeviceIDBase = true
+
+	// Without an identity there is nothing to derive from, so the configured
+	// value has to stand rather than collapsing to minor one.
+	if got := a.deviceIDBase(); got != 900 {
+		t.Fatalf("base %d before the node had an id, want the configured 900", got)
+	}
+
+	a.self.ID = 1
+	if got := a.deviceIDBase(); got != racerctrl.MinDeviceID {
+		t.Fatalf("node 1 got base %d, want %d", got, racerctrl.MinDeviceID)
+	}
+
+	a.self.ID = 4
+
+	want := uint32(3*racerctrl.MaxExports + racerctrl.MinDeviceID)
+	if got := a.deviceIDBase(); got != want {
+		t.Fatalf("node 4 got base %d, want %d", got, want)
+	}
+}
+
+// TestDerivedWindowsDoNotOverlap is the property the derivation exists for.
+func TestDerivedWindowsDoNotOverlap(t *testing.T) {
+	seen := map[uint32]uint32{}
+
+	for id := uint32(1); id <= 9; id++ {
+		a := newBindingsAgent(t, t.TempDir())
+		a.cfg.DeriveDeviceIDBase = true
+		a.self.ID = id
+
+		space := a.minorSpace()
+
+		first, last := space.Base, space.Base+racerctrl.MaxExports-1
+		for minor := first; minor <= last; minor++ {
+			if other, ok := seen[minor]; ok {
+				t.Fatalf("node %d and node %d both claim minor %d", other, id, minor)
+			}
+
+			seen[minor] = id
+		}
 	}
 }

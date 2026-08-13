@@ -469,6 +469,55 @@ func (a *Agent) Reconcile(ctx context.Context) error {
 	return a.publishStatus(ctx)
 }
 
+// devRoot is where the ublk device nodes live. It is a variable so tests can
+// point it at a directory they control.
+var devRoot = "/dev"
+
+// minorSpace is the ublk minor range this agent allocates from.
+//
+// The window's floor is configuration, but its occupancy is not: a ublk minor
+// belongs to the kernel, not to this node, and the agent's own bindings are
+// only half the story. The other half is every minor the kernel already holds
+// that this node did not put there - another racer sharing the kernel, an
+// unrelated ublk user, or a device leaked by an instance that died before it
+// could delete it. Handing racer one of those means CMD_ADD_DEV fails and the
+// config is rejected, and no amount of retrying the same arithmetic fixes it.
+//
+// So the agent asks the kernel. The character device appears at CMD_ADD_DEV,
+// before the block device is started, which makes /dev/ublkc<id> the earliest
+// evidence a minor is spoken for.
+func (a *Agent) minorSpace() racerctrl.MinorSpace {
+	return racerctrl.MinorSpace{
+		Base: a.deviceIDBase(),
+		InUse: func(id uint32) bool {
+			_, err := os.Stat(fmt.Sprintf("%s/ublkc%d", devRoot, id))
+
+			return err == nil
+		},
+	}
+}
+
+// deviceIDBase is the floor of this agent's window.
+//
+// The kernel probe above is enough to steer around a minor somebody else
+// already holds, but not enough to keep several instances that start at the
+// same moment from choosing the same free one: they all look, all see it free,
+// and all write it into their bindings, where it stays. Disjoint windows are
+// what actually keeps them apart, and a node's allocated id is the only value
+// on hand that is unique across the cluster and settled before the first minor
+// is needed.
+func (a *Agent) deviceIDBase() uint32 {
+	if !a.cfg.DeriveDeviceIDBase {
+		return a.cfg.DeviceIDBase
+	}
+
+	if a.self.ID == 0 {
+		return a.cfg.DeviceIDBase
+	}
+
+	return (a.self.ID-1)*racerctrl.MaxExports + racerctrl.MinDeviceID
+}
+
 // assignFabricMinors gives every universe this node joins a local ublk minor
 // for its fabric device, and takes back the minors of universes it has left.
 //
@@ -487,7 +536,7 @@ func (a *Agent) assignFabricMinors(cluster racerctrl.ClusterState) error {
 
 		joined[universe.ID] = struct{}{}
 
-		_, added, err := racerctrl.AssignFabricDeviceID(&a.self, universe.ID)
+		_, added, err := racerctrl.AssignFabricDeviceID(&a.self, universe.ID, a.minorSpace())
 		if err != nil {
 			return fmt.Errorf("assign fabric minor for universe %d: %w", universe.ID, err)
 		}
@@ -755,7 +804,7 @@ func (a *Agent) healthDigest() string {
 func (a *Agent) Stage(ctx context.Context, volume string) (string, error) {
 	a.mu.Lock()
 
-	id, added, err := racerctrl.AssignDeviceID(&a.self, volume)
+	id, added, err := racerctrl.AssignDeviceID(&a.self, volume, a.minorSpace())
 	if err == nil && added {
 		// Recorded before the config that exports it is rendered: a binding
 		// racer is serving but the file does not name is exactly the state
