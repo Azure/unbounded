@@ -112,7 +112,7 @@ impl fmt::Display for Call {
 /// Stamps `v` through `buf`, which must be a whole number of words long.
 pub fn stamp(v: Value, buf: &mut [u8]) {
     assert!(
-        buf.len() >= 8 && buf.len() % 8 == 0,
+        buf.len() >= 8 && buf.len().is_multiple_of(8),
         "a page is whole words"
     );
 
@@ -136,7 +136,7 @@ pub fn stamp(v: Value, buf: &mut [u8]) {
 /// wrote: torn between two writes, corrupt, or half a hole.
 pub fn parse(buf: &[u8]) -> Option<Value> {
     assert!(
-        buf.len() >= 8 && buf.len() % 8 == 0,
+        buf.len() >= 8 && buf.len().is_multiple_of(8),
         "a page is whole words"
     );
 
