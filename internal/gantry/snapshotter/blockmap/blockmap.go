@@ -204,8 +204,22 @@ type Map struct {
 	// asks for forty layers at once, and making them queue behind each other
 	// would turn forty parallel ioctls into a serial chain on the container
 	// start path.
+	//
+	// An entry lives only as long as someone holds or wants it. A node runs
+	// for months and sees every layer of every image ever scheduled onto it,
+	// so a table that only grew would be a slow leak of one mutex and one
+	// map entry per layer, for locks that are almost never contended twice.
 	mu   sync.Mutex
-	keys map[string]*sync.Mutex
+	keys map[string]*keyLock
+}
+
+// keyLock is one layer's mutex plus a count of the goroutines that hold it or
+// are waiting for it. The count is what makes removal safe: it is taken under
+// the table's own lock before the layer's lock is acquired, so an entry with a
+// waiter is never dropped out from under it.
+type keyLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // New builds a Map.
@@ -228,7 +242,7 @@ func New(opts Options) (*Map, error) {
 		locator: opts.Locator,
 		dm:      opts.Devmapper,
 		mounter: opts.Mounter,
-		keys:    make(map[string]*sync.Mutex),
+		keys:    make(map[string]*keyLock),
 	}
 
 	if err := os.MkdirAll(m.root, 0o755); err != nil {
@@ -398,18 +412,32 @@ func (m *Map) release(ctx context.Context, name string) error {
 	return nil
 }
 
+// lock takes the named layer's lock and returns the function that releases it.
+// The returned function must be called exactly once.
 func (m *Map) lock(name string) func() {
 	m.mu.Lock()
 
-	mu, ok := m.keys[name]
+	k, ok := m.keys[name]
 	if !ok {
-		mu = &sync.Mutex{}
-		m.keys[name] = mu
+		k = &keyLock{}
+		m.keys[name] = k
 	}
+
+	k.refs++
 
 	m.mu.Unlock()
 
-	mu.Lock()
+	k.mu.Lock()
 
-	return mu.Unlock
+	return func() {
+		k.mu.Unlock()
+
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		k.refs--
+		if k.refs == 0 {
+			delete(m.keys, name)
+		}
+	}
 }

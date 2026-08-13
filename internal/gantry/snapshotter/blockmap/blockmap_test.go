@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -199,6 +200,15 @@ func newMap(t *testing.T) (*Map, *fakeDM, *fakeMounter) {
 	}
 
 	return m, dm, mounter
+}
+
+// lockCount is how many per layer locks the map is holding onto. Nothing in
+// production needs it, but it is the only way to see the table leak.
+func (m *Map) lockCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return len(m.keys)
 }
 
 func digest(b byte) catalog.Digest {
@@ -553,6 +563,82 @@ func TestEnsureIsConcurrencySafe(t *testing.T) {
 	// Sixteen containers starting at once on the same layer is one mapping.
 	if dm.creates != 1 || mounter.count != 1 {
 		t.Fatalf("%d creates and %d mounts", dm.creates, mounter.count)
+	}
+
+	if n := m.lockCount(); n != 0 {
+		t.Fatalf("%d layer locks outlived the calls that took them", n)
+	}
+}
+
+func TestLockTableDoesNotGrow(t *testing.T) {
+	m, _, _ := newMap(t)
+
+	// A node runs for months and sees every layer of every image ever
+	// scheduled onto it. Nothing here is ever contended twice, so a table
+	// that only grew would be a slow leak keyed by the node's whole image
+	// history.
+	for i := range 64 {
+		if _, err := m.Ensure(t.Context(), digest(byte(i)), addr(uint32(i), 1)); err != nil { //nolint:gosec // 0..63
+			t.Fatalf("Ensure: %v", err)
+		}
+	}
+
+	if n := m.lockCount(); n != 0 {
+		t.Fatalf("%d layer locks outlived their layers", n)
+	}
+
+	if err := m.Prune(t.Context(), nil); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+
+	if n := m.lockCount(); n != 0 {
+		t.Fatalf("%d layer locks survived Prune", n)
+	}
+}
+
+func TestLockStillExcludes(t *testing.T) {
+	m, _, _ := newMap(t)
+
+	// Reclaiming an entry must not let two holders of the same name run at
+	// once, which is the failure a refcount gets wrong if it drops the entry
+	// while somebody is still waiting for it.
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		held int
+		peak int
+	)
+
+	for range 32 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			unlock := m.lock("gsnap-shared")
+			defer unlock()
+
+			mu.Lock()
+			held++
+			peak = max(peak, held)
+			mu.Unlock()
+
+			runtime.Gosched()
+
+			mu.Lock()
+			held--
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+
+	if peak != 1 {
+		t.Fatalf("%d goroutines held the same layer lock at once", peak)
+	}
+
+	if n := m.lockCount(); n != 0 {
+		t.Fatalf("%d layer locks outlived the calls that took them", n)
 	}
 }
 
