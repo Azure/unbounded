@@ -1,0 +1,52 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Build stage
+#
+# Pinned to BUILDPLATFORM so the Rust toolchain runs natively on the host even
+# when targeting a foreign TARGETPLATFORM. racer is a release build of a
+# compute-heavy crate; emulating the compiler under QEMU is not viable.
+#
+# racer is deliberately not cross-compiled: it is a single-arch build of the
+# platform the builder runs on. The dataplane is io_uring and ublk bound, so it
+# only ever runs on Linux hosts of the builder's own architecture in this
+# project's pipelines.
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.90-trixie AS builder
+
+# protobuf-compiler backs build.rs, which regenerates the prost bindings for
+# api/racer/config.proto. liburing-dev is not linked by the release binary (the
+# io-uring crate issues the syscalls itself) but the crate's benches and tests
+# expect the headers to be present.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    liburing-dev \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# The proto lives outside the crate: it is the shared schema the Go control
+# plane renders and the Rust dataplane consumes, so both bind to the same file.
+COPY api/racer ./api/racer
+COPY cmd/racer ./cmd/racer
+
+# --locked so the image is built from the checked-in Cargo.lock and a build can
+# never silently pick up a different dependency tree than the tests ran against.
+RUN cargo build --locked --release --manifest-path cmd/racer/Cargo.toml --bin racer
+
+# Runtime stage
+FROM ubuntu:noble
+
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /unbounded/bin
+
+COPY --from=builder /src/cmd/racer/target/release/racer /unbounded/bin/racer
+
+ENV PATH="/unbounded/bin:${PATH}"
+
+WORKDIR /unbounded
+
+ENTRYPOINT ["/unbounded/bin/racer"]

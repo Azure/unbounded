@@ -294,7 +294,8 @@ REACT_DEV ?= false
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
 .PHONY: unbounded-storage-supervisor unbounded-storage-supervisor-build unbounded-storage-supervisor-manifests image-unbounded-storage-supervisor-local image-unbounded-storage-supervisor-push
-.PHONY: racer-ctrl racer-ctrl-build racer-manifests image-racer-ctrl-local image-racer-ctrl-push
+.PHONY: racer-ctrl racer-ctrl-build racer-manifests image-racer-ctrl-local image-racer-ctrl-push \
+        image-racer-local image-racer-push
 
 ##@ General
 
@@ -1255,6 +1256,15 @@ image-racer-ctrl-local: ## Build the racer-ctrl container image locally (single-
 image-racer-ctrl-push: image-racer-ctrl-local ## Build and push the racer-ctrl container image
 	$(CONTAINER_ENGINE) push $(RACER_CTRL_IMAGE)
 
+image-racer-local: ## Build the racer dataplane container image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		-t racer:$(VERSION_TAG) -t $(RACER_IMAGE) \
+		-f ./images/racer/Containerfile .
+	$(call trivy-maybe,$(RACER_IMAGE))
+
+image-racer-push: image-racer-local ## Build and push the racer dataplane container image
+	$(CONTAINER_ENGINE) push $(RACER_IMAGE)
+
 ##@ Orca
 
 .PHONY: orca orca-build orca-manifests orca-oci orca-oci-push \
@@ -1405,7 +1415,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-racer-ctrl-local ## Build all container images locally
+images-local: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-storage-supervisor-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-racer-ctrl-local image-racer-local ## Build all container images locally
 
 ##@ Net Frontend
 
