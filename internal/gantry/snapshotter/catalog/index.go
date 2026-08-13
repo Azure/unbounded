@@ -68,6 +68,13 @@ func (i *Index) Apply(records ...Record) {
 			continue
 		}
 
+		// A void is a retired slot, not a statement about a key. It
+		// carries no key at all, so folding it in would create an entry
+		// under the zero digest and let a later void retire it again.
+		if r.Type == RecordVoid {
+			continue
+		}
+
 		if prior, ok := i.entries[r.Key]; ok && prior.generation >= r.Generation {
 			continue
 		}

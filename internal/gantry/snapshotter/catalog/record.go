@@ -115,6 +115,17 @@ const (
 	// RecordTombstone retires an earlier record: Key is the retired key and
 	// Generation is strictly above the generation it retires.
 	RecordTombstone RecordType = 3
+
+	// RecordVoid fills a slot whose writer claimed it and then gave up.
+	//
+	// It says nothing about any key and resolves to nothing. It exists
+	// because a reservation publishes its record count before the records
+	// themselves are written, so readers stop at the first empty slot and
+	// wait for the writer to catch up. A writer that dies between the two
+	// leaves a hole that every node in the cluster stops at forever, which
+	// freezes the catalog: nothing appended after it is ever seen again.
+	// Writing voids into the slots retires the hole and lets readers past.
+	RecordVoid RecordType = 4
 )
 
 // String renders a record type for logs and errors.
@@ -128,6 +139,8 @@ func (t RecordType) String() string {
 		return "chain"
 	case RecordTombstone:
 		return "tombstone"
+	case RecordVoid:
+		return "void"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint8(t))
 	}
@@ -135,7 +148,7 @@ func (t RecordType) String() string {
 
 // Valid reports whether the type is one this build understands.
 func (t RecordType) Valid() bool {
-	return t == RecordBlob || t == RecordChain || t == RecordTombstone
+	return t == RecordBlob || t == RecordChain || t == RecordTombstone || t == RecordVoid
 }
 
 // Digest is a sha256 digest in its raw 32-byte form. Records carry raw bytes
@@ -197,6 +210,12 @@ func (r Record) Validate() error {
 		if r.Ref == (Digest{}) {
 			return fmt.Errorf("%w: chain record names no blob", ErrCorrupt)
 		}
+	case RecordVoid:
+		// A void names nothing. The writer that abandons a reservation
+		// after a crash-recovery scan does not know what the slot was
+		// going to hold, and a void that had to invent a key would be
+		// indistinguishable from a real record for that key.
+		return nil
 	case RecordTombstone, RecordUnused:
 	}
 

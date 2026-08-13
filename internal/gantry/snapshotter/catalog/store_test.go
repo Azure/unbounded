@@ -382,6 +382,118 @@ func TestSyncStopsAtAHole(t *testing.T) {
 	}
 }
 
+// A writer that takes a reservation and then dies is the failure that matters:
+// its slots stay empty, every reader in the cluster stops there, and the
+// catalog never publishes anything again. Abandon is the way back out.
+func TestAbandonRetiresAHole(t *testing.T) {
+	dev, a := ready(t)
+
+	b := open(t, dev)
+
+	res, err := a.Reserve(4, 2)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// The ingest fails somewhere between here and Append.
+	if err := a.Abandon(res); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+
+	// A later, unrelated ingest publishes normally.
+	next, err := a.ReserveRecords(1)
+	if err != nil {
+		t.Fatalf("ReserveRecords: %v", err)
+	}
+
+	if err := a.Append(next, []Record{{Type: RecordChain, Key: digest(7), Ref: digest(8)}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	if _, err := b.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if b.Len() != 1 {
+		t.Fatalf("a reader resolved %d keys past the abandoned slots, want 1", b.Len())
+	}
+
+	if _, ok := b.index.entries[digest(7)]; !ok {
+		t.Fatal("a record appended after an abandoned reservation was never seen")
+	}
+
+	// The voids themselves resolve to nothing, including under the zero key
+	// they carry.
+	if _, ok := b.index.entries[Digest{}]; ok {
+		t.Fatal("a void record was folded into the index")
+	}
+}
+
+// The pages a reservation claimed cannot go back on the cursor, which only
+// moves forward, so they have to be booked as dead for the cleaner instead.
+func TestAbandonBooksThePagesDead(t *testing.T) {
+	_, s := ready(t)
+
+	res, err := s.Reserve(3, 2)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := s.Abandon(res); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+
+	entries, err := s.Segments()
+	if err != nil {
+		t.Fatalf("Segments: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("got %d segments, want 1", len(entries))
+	}
+
+	if want := uint64(3) * segment.PageBytes; entries[0].DeadBytes != want {
+		t.Fatalf("segment holds %d dead bytes, want %d", entries[0].DeadBytes, want)
+	}
+
+	if entries[0].LiveBytes != 0 {
+		t.Fatalf("an abandoned reservation counted %d live bytes", entries[0].LiveBytes)
+	}
+}
+
+// Append writes one block at a time and can fail partway, so Abandon has to
+// tolerate finding real records in slots it was going to void. Those records
+// are published and true, and voiding them would unpublish a live layer.
+func TestAbandonLeavesWrittenRecordsAlone(t *testing.T) {
+	dev, a := ready(t)
+
+	b := open(t, dev)
+
+	res, err := a.ReserveRecords(2)
+	if err != nil {
+		t.Fatalf("ReserveRecords: %v", err)
+	}
+
+	if err := a.Append(res, []Record{
+		{Type: RecordChain, Key: digest(1), Ref: digest(2)},
+		{Type: RecordChain, Key: digest(3), Ref: digest(4)},
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	if err := a.Abandon(res); err != nil {
+		t.Fatalf("Abandon over written slots: %v", err)
+	}
+
+	if _, err := b.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if b.Len() != 2 {
+		t.Fatalf("Abandon retired %d of 2 published records", 2-b.Len())
+	}
+}
+
 func TestReserveRetriesOnConflict(t *testing.T) {
 	noSleep(t)
 

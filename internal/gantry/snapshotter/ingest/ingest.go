@@ -36,6 +36,7 @@ type Catalog interface {
 	Reserve(pages uint32, records int) (catalog.Reservation, error)
 	ReserveRecords(records int) (catalog.Reservation, error)
 	Append(res catalog.Reservation, records []catalog.Record) error
+	Abandon(res catalog.Reservation) error
 	Account(id uint32, liveDelta, deadDelta int64) error
 }
 
@@ -256,11 +257,13 @@ func (i *Ingester) Ingest(ctx context.Context, req Request) (Result, error) {
 }
 
 // link adds only the chain record for a blob that already exists.
-func (i *Ingester) link(req Request, blob catalog.Blob) error {
+func (i *Ingester) link(req Request, blob catalog.Blob) (err error) {
 	res, err := i.cat.ReserveRecords(1)
 	if err != nil {
 		return fmt.Errorf("ingest: reserve chain record: %w", err)
 	}
+
+	defer func() { err = i.abandon(res, err) }()
 
 	rec := catalog.Record{
 		Type:       catalog.RecordChain,
@@ -276,8 +279,32 @@ func (i *Ingester) link(req Request, blob catalog.Blob) error {
 	return nil
 }
 
+// abandon retires a reservation that is about to be dropped on the floor.
+//
+// It is deferred by every function that takes one, because a reservation left
+// unfilled is not a lost layer, it is a hole that stops every reader in the
+// cluster at that slot forever. Returning nil early on success keeps the happy
+// path free of it.
+//
+// A failure to abandon is worth more than the failure that caused it, since it
+// is the one that is not local to this node, so it is joined onto the original
+// rather than replacing or hiding it.
+func (i *Ingester) abandon(res catalog.Reservation, cause error) error {
+	if cause == nil {
+		return nil
+	}
+
+	if err := i.cat.Abandon(res); err != nil {
+		return errors.Join(cause, fmt.Errorf(
+			"ingest: catalog records %d..%d are a permanent hole, every node stops reading there: %w",
+			res.FirstRecord, res.FirstRecord+uint64(res.RecordCount), err)) //nolint:gosec // record count is small and positive
+	}
+
+	return cause
+}
+
 // build converts the layer to erofs, writes it into a segment and publishes it.
-func (i *Ingester) build(ctx context.Context, req Request) (catalog.Blob, error) {
+func (i *Ingester) build(ctx context.Context, req Request) (blob catalog.Blob, err error) {
 	dir, err := os.MkdirTemp(i.workDir, "b-")
 	if err != nil {
 		return catalog.Blob{}, fmt.Errorf("ingest: scratch directory: %w", err)
@@ -299,6 +326,23 @@ func (i *Ingester) build(ctx context.Context, req Request) (catalog.Blob, error)
 	if err != nil {
 		return catalog.Blob{}, fmt.Errorf("ingest: reserve %d pages: %w", pages, err)
 	}
+
+	// Everything from here to Append can fail, and the write in the middle
+	// is multi-gigabyte O_DIRECT I/O that takes long enough to be worth
+	// cancelling. None of it may leave the reservation unfilled.
+	//
+	// Once Append lands the slots hold real records and the layer is live,
+	// so the guard stops there: accounting failures afterwards must not
+	// void records that other nodes are already resolving through.
+	published := false
+
+	defer func() {
+		if published {
+			return
+		}
+
+		err = i.abandon(res, err)
+	}()
 
 	addr := res.Address(size)
 
@@ -329,6 +373,8 @@ func (i *Ingester) build(ctx context.Context, req Request) (catalog.Blob, error)
 	if err := i.cat.Append(res, records); err != nil {
 		return catalog.Blob{}, fmt.Errorf("ingest: publish records: %w", err)
 	}
+
+	published = true
 
 	// Accounting is separate from the reservation on purpose: it is the
 	// cleaner's input, not a correctness invariant, and folding it into the

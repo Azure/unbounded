@@ -444,33 +444,16 @@ func (s *Store) Append(res Reservation, records []Record) error {
 		return fmt.Errorf("catalog: %d records for a reservation of %d", len(records), res.RecordCount)
 	}
 
-	byBlock := make(map[uint64]map[int]Record)
-
-	s.state.RLock()
-	sb := s.sb
-	s.state.RUnlock()
-
-	for i, r := range records {
-		r.Generation = res.Generation
-
-		if err := r.Validate(); err != nil {
-			return fmt.Errorf("record %d: %w", i, err)
-		}
-
-		index, slot := sb.RecordLocation(res.FirstRecord + uint64(i)) //nolint:gosec // i is bounded by len(records)
-
-		if byBlock[index] == nil {
-			byBlock[index] = make(map[int]Record)
-		}
-
-		byBlock[index][slot] = r
+	byBlock, err := s.placeRecords(res, records)
+	if err != nil {
+		return err
 	}
 
 	s.io.Lock()
 	defer s.io.Unlock()
 
 	for index, slots := range byBlock {
-		if err := s.mergeRecordBlock(index, slots); err != nil {
+		if err := s.mergeRecordBlock(index, slots, false); err != nil {
 			return err
 		}
 	}
@@ -488,7 +471,99 @@ func (s *Store) Append(res Reservation, records []Record) error {
 	return nil
 }
 
-func (s *Store) mergeRecordBlock(index uint64, mine map[int]Record) error {
+// Abandon retires a reservation whose records will never be written.
+//
+// Reserve publishes the record count before the records exist, and readers
+// deliberately stop at the first empty slot so a slow writer's records are
+// picked up rather than skipped. That is correct for a writer that is merely
+// slow and fatal for one that gives up: the empty slots stay empty, every node
+// stops there forever, and nothing appended after them is ever visible again.
+// One failed ingest would freeze the whole cluster's catalog.
+//
+// So every path that takes a reservation and then fails has to come back here.
+// Abandon fills the slots with voids, which resolve to nothing and let readers
+// walk past, and books any pages the reservation claimed as dead so the cleaner
+// reclaims them later. The pages themselves are not returned to the cursor:
+// the cursor only moves forward, which is what makes the reservation a single
+// compare-and-swap.
+//
+// A slot that already holds a real record is left alone. Append can fail after
+// writing some of its blocks, and those records are published and true.
+func (s *Store) Abandon(res Reservation) error {
+	if res.RecordCount <= 0 {
+		return nil
+	}
+
+	records := make([]Record, res.RecordCount)
+	for i := range records {
+		records[i] = Record{Type: RecordVoid, Generation: res.Generation}
+	}
+
+	byBlock, err := s.placeRecords(res, records)
+	if err != nil {
+		return err
+	}
+
+	s.io.Lock()
+
+	for index, slots := range byBlock {
+		if err := s.mergeRecordBlock(index, slots, true); err != nil {
+			s.io.Unlock()
+
+			return err
+		}
+	}
+
+	s.io.Unlock()
+
+	if res.PageCount == 0 {
+		return nil
+	}
+
+	dead := int64(res.PageCount) * int64(segment.PageBytes)
+	if err := s.Account(res.Segment, 0, dead); err != nil {
+		return fmt.Errorf("catalog: account %d abandoned pages in segment %d: %w",
+			res.PageCount, res.Segment, err)
+	}
+
+	return nil
+}
+
+// placeRecords maps a reservation's records onto the blocks and slots they
+// belong in, validating each one on the way.
+func (s *Store) placeRecords(res Reservation, records []Record) (map[uint64]map[int]Record, error) {
+	byBlock := make(map[uint64]map[int]Record)
+
+	s.state.RLock()
+	sb := s.sb
+	s.state.RUnlock()
+
+	for i, r := range records {
+		r.Generation = res.Generation
+
+		if err := r.Validate(); err != nil {
+			return nil, fmt.Errorf("record %d: %w", i, err)
+		}
+
+		index, slot := sb.RecordLocation(res.FirstRecord + uint64(i)) //nolint:gosec // i is bounded by len(records)
+
+		if byBlock[index] == nil {
+			byBlock[index] = make(map[int]Record)
+		}
+
+		byBlock[index][slot] = r
+	}
+
+	return byBlock, nil
+}
+
+// mergeRecordBlock writes mine into the given block under its own
+// compare-and-swap.
+//
+// When keepTaken is set, a slot that already holds a record is left as it is
+// instead of being reported as a collision. That is only for Abandon, which
+// has to tolerate finding its own earlier records in place.
+func (s *Store) mergeRecordBlock(index uint64, mine map[int]Record, keepTaken bool) error {
 	block := make([]byte, BlockBytes)
 
 	var lastErr error
@@ -507,13 +582,27 @@ func (s *Store) mergeRecordBlock(index uint64, mine map[int]Record) error {
 			return fmt.Errorf("record block %d: %w", index, err)
 		}
 
+		dirty := false
+
 		for slot, r := range mine {
 			if existing, taken := slots[slot]; taken && existing != r {
+				if keepTaken {
+					continue
+				}
+
 				return fmt.Errorf("catalog: record slot %d in block %d is already taken by %s %s",
 					slot, index, existing.Type, existing.Key)
 			}
 
 			slots[slot] = r
+			dirty = true
+		}
+
+		if !dirty {
+			// Every slot we were asked to fill was already filled. Writing
+			// the block back would burn a compare-and-swap on the block
+			// every other ingester in the cluster is contending for.
+			return nil
 		}
 
 		merged, err := MarshalRecordBlock(slots)

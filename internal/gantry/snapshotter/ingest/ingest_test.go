@@ -140,6 +140,16 @@ func sum(data []byte) catalog.Digest {
 func newStore(t *testing.T, pages uint32) *catalog.Store {
 	t.Helper()
 
+	_, s := newStoreOn(t, pages)
+
+	return s
+}
+
+// newStoreOn is newStore, handing back the volume as well so a test can open a
+// second reader on the same catalog and see what another node would see.
+func newStoreOn(t *testing.T, pages uint32) (*memVolume, *catalog.Store) {
+	t.Helper()
+
 	vol := newMemVolume(64 * catalog.BlockBytes)
 
 	if err := catalog.Format(vol, catalog.FormatOptions{Bytes: 64 * catalog.BlockBytes}); err != nil {
@@ -159,7 +169,7 @@ func newStore(t *testing.T, pages uint32) *catalog.Store {
 		t.Fatalf("open segment: %v", err)
 	}
 
-	return s
+	return vol, s
 }
 
 // deviceFile creates a sparse file big enough to hold pages 4 MiB pages.
@@ -730,6 +740,63 @@ func TestIngestReportsLocatorFailure(t *testing.T) {
 	// still miss: a half finished ingest must never be resolvable.
 	if _, ok := store.Resolve(req.ChainID); ok {
 		t.Fatal("a failed ingest published a record")
+	}
+}
+
+// A failed ingest must not cost the cluster its catalog.
+//
+// The reservation publishes its record slots before the records exist, and
+// every reader stops at the first empty slot, so slots that are claimed and
+// never filled stop every node in the cluster there permanently: nothing
+// appended afterwards is ever seen again, by anyone. This is the test that the
+// failure stays local to the node that had it.
+func TestIngestFailureLeavesNoHole(t *testing.T) {
+	vol, store := newStoreOn(t, 8)
+	builder, _ := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))
+
+	// One ingest that dies after taking its reservation.
+	broken := newIngester(t, Options{
+		Catalog: store,
+		Locator: fileLocator{err: errors.New("segment not exported")},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	if _, err := broken.Ingest(t.Context(), Request{DiffID: digestOf(1), ChainID: digestOf(2)}); err == nil {
+		t.Fatal("the broken ingest succeeded")
+	}
+
+	// Then an unrelated layer, ingested normally.
+	device := deviceFile(t, 8)
+	working := newIngester(t, Options{
+		Catalog: store,
+		Locator: fileLocator{path: device},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	req := Request{DiffID: digestOf(3), ChainID: digestOf(4)}
+	if _, err := working.Ingest(t.Context(), req); err != nil {
+		t.Fatalf("the second ingest failed: %v", err)
+	}
+
+	// Another node, reading the same catalog from scratch, has to get past
+	// the abandoned slots to the records that came after them.
+	reader, err := catalog.Open(vol)
+	if err != nil {
+		t.Fatalf("open a second reader: %v", err)
+	}
+
+	if _, err := reader.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if _, ok := reader.Resolve(req.ChainID); !ok {
+		t.Fatal("a reader stopped at the abandoned slots and never saw the layer behind them")
+	}
+
+	if _, ok := reader.Resolve(digestOf(2)); ok {
+		t.Fatal("the failed ingest published a record")
 	}
 }
 

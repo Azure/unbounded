@@ -337,6 +337,21 @@ func (h *holder) Append(res catalog.Reservation, records []catalog.Record) error
 	return store.Append(res, records)
 }
 
+// Abandon implements the ingest write path.
+//
+// If the store has been swapped out from under an in-flight ingest, the
+// reservation belonged to a catalog this node no longer has, and there is
+// nothing useful to write. Whoever attaches that catalog next inherits the
+// hole; that is the crash case, and the reconcile scan is what covers it.
+func (h *holder) Abandon(res catalog.Reservation) error {
+	store, _ := h.current.load()
+	if store == nil {
+		return errNotReady
+	}
+
+	return store.Abandon(res)
+}
+
 // Account implements the ingest write path.
 func (h *holder) Account(id uint32, liveDelta, deadDelta int64) error {
 	store, _ := h.current.load()
