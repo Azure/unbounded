@@ -36,10 +36,22 @@ macro_rules! maps {
     ($cfg:expr, $m:ident) => {
         let cfg = $cfg;
         let gof = |a: u64| cfg.group(a);
-        let xof = |a: u64| cfg.extent_at(a).map(|e| (e.id, e.tombstone_epoch as u32));
+        let xof = |a: u64| {
+            cfg.extent_at(a)
+                .map(|e| (e.id, e.tombstone_epoch as u32, e.kind))
+        };
+        // A universe with peers is a full publication, so an address none of its extents
+        // cover has been taken away. A universe without them is the bootstrap shape the
+        // agent publishes before its attachments land, which names no extents at all and
+        // must not be read as having retired every one of them.
+        let rof = |a: u64| {
+            cfg.universe(GlobalAddr(a).universe())
+                .is_some_and(|u| !u.peers.is_empty())
+        };
         let $m = Maps {
             gof: &gof,
             xof: &xof,
+            rof: &rof,
         };
     };
 }
