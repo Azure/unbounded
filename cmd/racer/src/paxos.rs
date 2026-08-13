@@ -1523,7 +1523,16 @@ impl Paxos {
         // one extra round trip on a rare path.
         self.stat(|s| s.read_remote_match += 1);
         let route = self.route(addr.universe(), m, idx).ok_or(Status::Io)?;
-        self.pull_from(route, addr, sink.reborrow()).await?;
+        // The confirmed register may name bytes this member cannot produce: a tombstone
+        // has none, and a copy whose data write never landed answers the same way. Neither
+        // is the group's answer, so fall back to the full round, which heals what it can
+        // and knows a hole when it sees one. Reporting the miss instead would reach the
+        // guest as `EIO` for a page it is entitled to read as zeroes.
+        match self.pull_from(route, addr, sink.reborrow()).await {
+            Ok(_) => {}
+            Err(Status::Hole | Status::Missing) => return Ok(None),
+            Err(e) => return Err(e),
+        }
         self.offer(addr, &sink, r).await;
         Ok(Some(r))
     }
