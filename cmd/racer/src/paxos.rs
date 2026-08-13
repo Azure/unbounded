@@ -22,8 +22,8 @@ use crate::fabric::{
     self, Cmd, Footer, GroupIx, Hops, Link, Member, Op, PageRef, Put, Source, To, Via, Want,
 };
 use crate::layout::{self, Class};
-use crate::runtime::{self, Buf, PoolBuf};
-use crate::server;
+use crate::runtime::{self, Buf, CoreId, PoolBuf};
+use crate::server::{self, Server};
 
 /// How many times a LWW proposal re-derives its guard before giving up. A mismatch is
 /// retried here, not reported, so the client only ever sees last-write-wins.
@@ -464,10 +464,12 @@ pub struct Stats {
     pub warms_dropped: u64,
 }
 
-/// Consensus state for the groups that hash to this core. No locks and nothing shared:
-/// every field is reached through `on_core`.
+/// Consensus state for the groups that hash to this core.
+///
+/// Lives in that core's [`server::CoreState`], so there is no lock and nothing shared: the
+/// only way to a row is a transaction the owning worker runs.
 #[derive(Default)]
-struct Local {
+pub(crate) struct Local {
     terms: BTreeMap<GroupId, Term>,
     /// Extents sealed here, and the term the seal was taken at. Keyed by extent id alone:
     /// those are unique across every universe.
@@ -516,37 +518,75 @@ pub struct Paxos {
     alloc: &'static Allocator,
     cache: &'static Cache,
     links: Live<Links>,
-    state: Box<[RefCell<Local>]>,
 }
 
-// SAFETY: every `Local` is only ever borrowed from the worker that owns it, and never
-// across an await. Same argument as `Allocator`.
+// SAFETY: the only field here that is not already `Sync` is the link table, and only its
+// retire slot: a `Link` holds a `Disk`, which is deliberately `!Send` so that IO stays on
+// the worker that issued it. That slot is filled by the build that opens a configuration
+// and drained when that configuration retires, both on the control thread, which is also
+// the only thread that ever holds a `Links` by value. A worker only ever reads the live
+// table, through a shared reference to something `Sync`.
+//
+// This is the last of these in the dataplane, and it goes when the link table moves into
+// the configuration proper and is reached through a guard like everything else.
 unsafe impl Sync for Paxos {}
 
-/// Build the consensus layer and leak it: hop closures must be `Send + 'static`, which a
-/// borrow of the control thread's stack cannot be.
-pub fn open(alloc: &'static Allocator, cache: &'static Cache, cores: usize) -> &'static Paxos {
-    let mut state: Vec<RefCell<Local>> =
-        (0..cores).map(|_| RefCell::new(Local::default())).collect();
+/// One worker's share of the consensus state, living in that worker's [`server::CoreState`].
+///
+/// A group's promise is not a copy of anything: it is held by exactly one core, and every
+/// ballot issued under it comes from there. Putting the row where the core can reach it and
+/// nowhere else is what makes that a fact rather than a convention.
+pub(crate) struct Row(RefCell<Local>);
+
+/// This core's share of the consensus state.
+fn here<T>(f: impl FnOnce(&mut Local) -> T) -> T {
+    runtime::here::<Server, T>(|ctx| f(&mut ctx.state().paxos.0.borrow_mut()))
+}
+
+/// `core`'s share, as a transaction that core runs.
+///
+/// Every one of these bodies is a table lookup or a small mutation, which is why they are
+/// transactions and not hops: the owning worker settles each inside the drain that carried
+/// it, rather than parking a future to be polled again.
+fn at<T, F>(core: CoreId, f: F) -> impl Future<Output = T>
+where
+    F: FnOnce(&mut Local) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    runtime::with_core::<Server, _, _>(core, move |ctx| f(&mut ctx.state().paxos.0.borrow_mut()))
+}
+
+/// Build the consensus layer and leak it, with one row per worker for the runtime to hand
+/// out. Leaked because hop closures must be `Send + 'static`, which a borrow of the control
+/// thread's stack cannot be.
+pub fn open(
+    alloc: &'static Allocator,
+    cache: &'static Cache,
+    cores: usize,
+) -> (&'static Paxos, Vec<Row>) {
+    let mut state: Vec<Local> = (0..cores).map(|_| Local::default()).collect();
     // A term lives on the core that owns its group, where every later read of it happens.
     let boot = alloc.boot_consensus();
     for &(group, value) in &boot.terms {
-        let l = &mut state[group.index() as usize % cores].get_mut().terms;
+        let l = &mut state[group.index() as usize % cores].terms;
         l.insert(group, Term::new(value));
     }
     // A seal covers a whole extent, whose pages spread over every core, so unlike a term
     // it is replicated rather than placed.
     for s in &boot.seals {
         for l in state.iter_mut() {
-            l.get_mut().seals.insert(s.extent, s.term);
+            l.seals.insert(s.extent, s.term);
         }
     }
-    Box::leak(Box::new(Paxos {
+    let paxos = Box::leak(Box::new(Paxos {
         alloc,
         cache,
         links: Live::new(Links(Box::new([]))),
-        state: state.into(),
-    }))
+    }));
+    (
+        paxos,
+        state.into_iter().map(|l| Row(RefCell::new(l))).collect(),
+    )
 }
 
 // --- routing ---
@@ -567,8 +607,8 @@ impl Paxos {
     /// The core holding a group's consensus state: the group index modulo the core count,
     /// which in any real deployment is also the core the allocator shards the page to. The
     /// index alone, so universes share one core layout rather than crowding the low cores.
-    fn core_of(&self, group: GroupId) -> usize {
-        group.index() as usize % self.state.len()
+    fn core_of(&self, group: GroupId) -> CoreId {
+        CoreId::of(group.index() as usize % runtime::cores())
     }
 
     /// The three acceptors, from the catalog of the group's own universe. A group in a
@@ -816,11 +856,11 @@ impl Paxos {
     }
 
     fn stat(&self, f: impl FnOnce(&mut Stats)) {
-        f(&mut self.state[runtime::core()].borrow_mut().stats);
+        here(|l| f(&mut l.stats));
     }
 
     pub fn local_stats(&self) -> Stats {
-        self.state[runtime::core()].borrow().stats
+        here(|l| l.stats)
     }
 }
 
@@ -1336,10 +1376,7 @@ impl Paxos {
     /// repair could then use to resurrect a value that was never chosen.
     async fn claim(&'static self, addr: GlobalAddr, group: GroupId) -> Result<Claim, Status> {
         let core = self.core_of(group);
-        let taken = runtime::on_core(core, move || async move {
-            self.state[core].borrow_mut().inflight.insert(addr.0)
-        })
-        .await;
+        let taken = at(core, move |l| l.inflight.insert(addr.0)).await;
         // Built here rather than on the owner, so it is never a value in flight: a reply
         // that nobody is waiting for is dropped inside the rendezvous, which is no place
         // for a destructor that wants to hop.
@@ -1355,9 +1392,9 @@ impl Paxos {
     }
 
     /// Give an address back. Not called directly: [`Claim`] is the only holder.
-    async fn unclaim(&'static self, addr: GlobalAddr, core: usize) {
-        runtime::on_core(core, move || async move {
-            self.state[core].borrow_mut().inflight.remove(&addr.0);
+    async fn unclaim(&'static self, addr: GlobalAddr, core: CoreId) {
+        at(core, move |l| {
+            l.inflight.remove(&addr.0);
         })
         .await;
     }
@@ -1378,7 +1415,7 @@ impl Paxos {
 struct Claim {
     paxos: &'static Paxos,
     addr: GlobalAddr,
-    core: usize,
+    core: CoreId,
 }
 
 impl Claim {
@@ -2302,10 +2339,7 @@ impl Paxos {
 
     /// Whether this extent has already been frozen here.
     pub async fn sealed(&'static self, extent: u32) -> bool {
-        runtime::on_core(0, move || async move {
-            self.state[0].borrow().seals.contains_key(&extent)
-        })
-        .await
+        at(CoreId::of(0), move |l| l.seals.contains_key(&extent)).await
     }
 
     /// Freeze an extent at this zone. Every group holding pages of it must refuse later
@@ -2393,9 +2427,8 @@ impl Paxos {
     /// the shard. Idempotent, and monotone in `term`.
     pub async fn seal(&'static self, extent: u32, term: u32) -> Result<(), Status> {
         // An extent's pages are spread over every core, so the refusal has to be too.
-        for core in 0..self.state.len() {
-            runtime::on_core(core, move || async move {
-                let mut l = self.state[core].borrow_mut();
+        for core in 0..runtime::cores() {
+            at(CoreId::of(core), move |l| {
                 l.stats.seals += 1;
                 let e = l.seals.entry(extent).or_insert(term);
                 *e = sealed_at(Some(*e), term);
@@ -2412,8 +2445,7 @@ impl Paxos {
         let cfg = server::config();
         let core = self.core_of(group);
         let id = self.shard_of(addr);
-        let (sealed, replaying) = runtime::on_core(core, move || async move {
-            let l = self.state[core].borrow();
+        let (sealed, replaying) = at(core, move |l| {
             (
                 id.is_some_and(|id| l.seals.contains_key(&id)),
                 l.replaying.contains(&group),
@@ -2450,22 +2482,14 @@ impl Paxos {
     /// way out.
     pub(crate) async fn replaying(&'static self, group: GroupId) -> bool {
         let core = self.core_of(group);
-        runtime::on_core(core, move || async move {
-            self.state[core].borrow().replaying.contains(&group)
-        })
-        .await
+        at(core, move |l| l.replaying.contains(&group)).await
     }
 
     /// The groups this core is replaying. `core_of` is the group modulo the core count, so a
     /// core's own replay set is exactly the candidates the sweep picks from, and asking is a
     /// borrow rather than a hop per group.
     pub fn replaying_here(&self) -> Vec<GroupId> {
-        self.state[runtime::core()]
-            .borrow()
-            .replaying
-            .iter()
-            .copied()
-            .collect()
+        here(|l| l.replaying.iter().copied().collect())
     }
 
     /// Recover this group's promise from its other members, then rejoin it.
@@ -2512,8 +2536,7 @@ impl Paxos {
     /// Mark a group as still replaying, or caught up. Driven by the anti-entropy sweep.
     pub async fn set_replaying(&'static self, group: GroupId, on: bool) {
         let core = self.core_of(group);
-        runtime::on_core(core, move || async move {
-            let mut l = self.state[core].borrow_mut();
+        at(core, move |l| {
             if on {
                 l.replaying.insert(group);
             } else {
@@ -2549,8 +2572,7 @@ impl Paxos {
         // escalation the accepts can never catch: each is refused as stale, refreshes, and
         // prepares again. Waiting out the leader's round keeps all three members in step.
         for _ in 0..PREPARE_WAITS {
-            let take = runtime::on_core(core, move || async move {
-                let mut l = self.state[core].borrow_mut();
+            let take = at(core, move |l| {
                 let e = l.terms.entry(group).or_insert(Term::new(0));
                 match (e.held, e.preparing) {
                     (true, _) => Lead::Held(e.value),
@@ -2570,8 +2592,8 @@ impl Paxos {
                 }
                 Lead::Go => {
                     let r = self.prepare_round(addr, None).await;
-                    runtime::on_core(core, move || async move {
-                        if let Some(t) = self.state[core].borrow_mut().terms.get_mut(&group) {
+                    at(core, move |l| {
+                        if let Some(t) = l.terms.get_mut(&group) {
                             t.preparing = false;
                         }
                     })
@@ -2587,14 +2609,7 @@ impl Paxos {
     /// derived rather than sent.
     async fn held_term(&'static self, group: GroupId) -> u32 {
         let core = self.core_of(group);
-        runtime::on_core(core, move || async move {
-            self.state[core]
-                .borrow()
-                .terms
-                .get(&group)
-                .map_or(0, |t| t.value)
-        })
-        .await
+        at(core, move |l| l.terms.get(&group).map_or(0, |t| t.value)).await
     }
 
     /// Give up the right to issue one-shot accepts at the term we hold, so the next
@@ -2602,8 +2617,8 @@ impl Paxos {
     /// ever rising.
     async fn refresh(&'static self, group: GroupId) {
         let core = self.core_of(group);
-        runtime::on_core(core, move || async move {
-            if let Some(t) = self.state[core].borrow_mut().terms.get_mut(&group) {
+        at(core, move |l| {
+            if let Some(t) = l.terms.get_mut(&group) {
                 t.held = false;
             }
         })
@@ -2614,8 +2629,7 @@ impl Paxos {
     /// never dies with the process. The rule itself is [`Term::raise`].
     async fn bump(&'static self, group: GroupId) -> Result<u32, Status> {
         let core = self.core_of(group);
-        let t = runtime::on_core(core, move || async move {
-            let mut l = self.state[core].borrow_mut();
+        let t = at(core, move |l| {
             l.stats.term_bumps += 1;
             l.terms.entry(group).or_insert(Term::new(0)).raise()
         })
@@ -2627,8 +2641,7 @@ impl Paxos {
     /// Record a term another member reported; see [`Term::adopt`].
     async fn observe(&'static self, group: GroupId, term: u32) {
         let core = self.core_of(group);
-        runtime::on_core(core, move || async move {
-            let mut l = self.state[core].borrow_mut();
+        at(core, move |l| {
             l.terms.entry(group).or_insert(Term::new(term)).adopt(term);
         })
         .await;
@@ -2638,8 +2651,7 @@ impl Paxos {
     /// [`Term::recover`]; the callers are [`Paxos::rejoin`] and nothing else.
     async fn recover(&'static self, group: GroupId, peers: [u32; 2]) {
         let core = self.core_of(group);
-        runtime::on_core(core, move || async move {
-            let mut l = self.state[core].borrow_mut();
+        at(core, move |l| {
             l.terms.entry(group).or_insert(Term::new(0)).recover(peers);
         })
         .await;
@@ -3132,9 +3144,8 @@ impl Paxos {
     /// rather than the mblocks' delta scheme.
     async fn persist(&'static self) -> Result<(), Status> {
         let mut c = layout::Consensus::default();
-        for i in 0..self.state.len() {
-            let (terms, seals) = runtime::on_core(i, move || async move {
-                let l = self.state[i].borrow();
+        for i in 0..runtime::cores() {
+            let (terms, seals) = at(CoreId::of(i), move |l| {
                 let t: Vec<(GroupId, u32)> = l.terms.iter().map(|(&g, x)| (g, x.value)).collect();
                 let s: Vec<(u32, u32)> = if i == 0 {
                     l.seals.iter().map(|(&k, &v)| (k, v)).collect()
