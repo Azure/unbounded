@@ -247,10 +247,14 @@ impl PoolBuf {
                         _nosend: PhantomData,
                     });
                 }
-                pool.classes[c]
-                    .waiters
-                    .borrow_mut()
-                    .push_back(cx.waker().clone());
+                let mut waiters = pool.classes[c].waiters.borrow_mut();
+                // Once per waiting task, not once per poll. A starved class is polled
+                // again by anything that wakes its task, and a queue that took a fresh
+                // waker each time would grow without bound while the class stayed empty:
+                // nothing removes a registration but the next [`Pool::free`].
+                if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                    waiters.push_back(cx.waker().clone());
+                }
                 Poll::Pending
             })
         })
