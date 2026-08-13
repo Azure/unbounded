@@ -284,9 +284,9 @@ const GT_ROWS: usize = CLASSES.len() * (MAX_EXT - 1);
 const _: () = assert!(GT_OFF + GT_HDR + GT_ROWS * EXT_BYTES <= MBLOCK - SB_RESERVED);
 
 impl Geometry {
-    /// Size every region from the config. Fails if the store is too small.
+    /// Size every region from the config and the store. Fails if the store is too small.
     fn plan(store_bytes: u64, cfg: &crate::config::Config) -> io::Result<Geometry> {
-        let g = Geometry::place(wanted(cfg));
+        let g = Geometry::place(claim(store_bytes, cfg));
 
         g.check(store_bytes)?;
         Ok(g)
@@ -569,6 +569,35 @@ fn wanted(cfg: &crate::config::Config) -> [u64; 2] {
         overprovision(cfg.small_pages(), 64).div_ceil(K_SMALL as u64),
         overprovision(cfg.huge_pages(), 4).div_ceil(K_HUGE as u64),
     ]
+}
+
+/// Mblocks each class holds in a store of `store_bytes`: what the config asks for, plus the
+/// store's spare, given to the 4 MiB class.
+///
+/// The small class is sized from the config alone, because its slots cost DRAM in the
+/// allocator's index and `policy.max_index_bytes` is what bounds that; claiming more would
+/// spend memory nobody asked for. A 4 MiB slot costs almost nothing to index, so the huge
+/// class takes everything left over.
+///
+/// Claiming the whole store is what keeps capacity off the restart path. It used to claim
+/// only what the config asked for, so a zone that grew asked for slabs the layout did not
+/// have, and nothing but a restart could append them; the media was there the whole time.
+/// What data has not taken is not idle either: the cache borrows free 4 MiB slots and gives
+/// them back when the allocator wants them, so the store's spare is the cache, and
+/// `policy.cache_index_bytes` is what bounds how much of it the cache can index.
+fn claim(store_bytes: u64, cfg: &crate::config::Config) -> [u64; 2] {
+    let want = wanted(cfg);
+    let floor = Geometry::place(want).alloc_end();
+    // Metadata is two copies of an mblock per mblock; data is that mblock's slots.
+    let per = 2 * MBLOCK as u64 + K_HUGE as u64 * HUGE_PAGE;
+    let mut add = store_bytes.saturating_sub(floor) / per;
+
+    // Aligning the data regions costs up to one huge page, which the division above cannot
+    // see. Hand a run back rather than overrun.
+    while add > 0 && Geometry::place([want[0], want[1] + add]).alloc_end() > store_bytes {
+        add -= 1;
+    }
+    [want[0], want[1] + add]
 }
 
 /// The smallest store a node declaring these page counts can be formatted on.
@@ -998,13 +1027,18 @@ pub fn format_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<
     }
 }
 
-/// Give `cfg` the slots the store was not formatted for. Everything new goes past the end
-/// of the layout, so no existing offset moves and no existing byte is read or rewritten.
-/// Called at startup before the allocator opens, which sizes shards from the geometry.
+/// Give `cfg` the slots the store was not formatted for, and claim whatever else the store
+/// has room for. Everything new goes past the end of the layout, so no existing offset moves
+/// and no existing byte is read or rewritten. Called at startup before the allocator opens,
+/// which sizes shards from the geometry.
+///
+/// Claiming the spare rather than only the shortfall is what keeps a growing zone off this
+/// path: a node that has already taken the whole store has nothing left to grow into and
+/// needs no restart to fit another volume.
 pub fn grow_if_needed(path: &Path, cfg: &crate::config::Config) -> io::Result<()> {
     size_if_needed(path, cfg)?;
     let mut g = read_geometry(path)?;
-    let want = wanted(cfg);
+    let want = claim(cfg.node.store_bytes, cfg);
     let have: [u64; 2] = CLASSES.map(|c| g.mblocks(c));
     let add: [u64; 2] = std::array::from_fn(|i| want[i].saturating_sub(have[i]));
 
@@ -1463,33 +1497,35 @@ mod tests {
         assert_eq!(Consensus::decode(&b).terms, vec![(GroupId::new(4, 7), 9)]);
     }
 
-    /// The tail is whatever the layout did not claim; growth takes it back from the front.
+    /// The layout claims the whole store, and what it could not claim is the cache's.
     #[test]
-    fn the_tail_is_what_the_layout_did_not_claim() {
+    fn the_layout_claims_the_whole_store() {
         let cfg = test_config();
         const SIZE: u64 = 64 << 30;
         let g0 = Geometry::plan(SIZE, &cfg).unwrap();
 
+        // What is left over is alignment slack and the remainder of one run, never idle media.
+        let per = 2 * MBLOCK as u64 + K_HUGE as u64 * HUGE_PAGE;
+        assert!(g0.alloc_end() <= SIZE);
+        assert!(SIZE - g0.alloc_end() < per);
+
         let (base, len) = g0.tail(SIZE);
         assert_eq!(base % CHUNK_BYTES, 0);
         assert!(base >= g0.alloc_end());
-        assert!(base - g0.alloc_end() < CHUNK_BYTES);
         assert_eq!(len % CHUNK_BYTES, 0);
-        assert_eq!(base + len, SIZE / CHUNK_BYTES * CHUNK_BYTES);
+        assert!(len < per);
         assert_eq!(g0.tail_chunks(SIZE), len / CHUNK_BYTES);
 
-        // Growing the layout takes chunks off the front of the tail and moves nothing.
-        let mut g = g0;
-        g.append(Class::Huge, 2).unwrap();
-        let (grown_base, grown_len) = g.tail(SIZE);
-        assert!(grown_base > base);
-        assert!(grown_len < len);
-        assert_eq!(grown_base + grown_len, base + len);
+        // A bigger store is more slots a growing zone can reach without a restart, and the
+        // 4 MiB class is where that room goes: a small slot costs DRAM to index.
+        let g1 = Geometry::plan(SIZE * 2, &cfg).unwrap();
+        assert!(g1.slots(Class::Huge) > g0.slots(Class::Huge));
+        assert_eq!(g1.slots(Class::Small), g0.slots(Class::Small));
+        assert!(g1.alloc_end() <= SIZE * 2);
 
         // No room past the slabs means no tail, reported rather than wrapped.
-        let tight = Geometry::plan(SIZE, &cfg).unwrap();
-        assert_eq!(tight.tail(tight.alloc_end()).1, 0);
-        assert_eq!(tight.tail_chunks(0), 0);
+        assert_eq!(g0.tail(g0.alloc_end()).1, 0);
+        assert_eq!(g0.tail_chunks(0), 0);
     }
 
     #[test]

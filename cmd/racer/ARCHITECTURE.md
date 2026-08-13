@@ -39,7 +39,7 @@ The checked configuration describes:
   Nodes are otherwise alike; there is no gateway role.
 - Universes. A universe is one flat, sparse address space counted in 4 KiB
   blocks, and everything about placement inside it: its own epoch, its own
-  balanced catalog of three distinct acceptors per group, its own remote-zone
+  catalog of three distinct acceptors per group, its own remote-zone
   entries, its own peers, and its own extents. A global page address is
   `universe:26 | lba:38`, so a universe spans 1 PiB and universe id 0 is
   reserved to keep a zero address meaning "free slot" on disk. An address's
@@ -73,13 +73,17 @@ Nothing on the wire names a universe: the namespace a frame arrives on is the
 universe, and the receiver rebuilds every address, group and extent id from its
 own side of the link.
 
-The nodes of a zone are homogeneous. Each universe's catalog must give every
-node it names the same number of groups, so every node holds the same share of
-that universe's zone and sizes its store for the sum of those shares: per
-universe, the zone's pages, times three replicas, divided by the number of
-nodes. There is no way to declare one node larger than
-another. A node the catalog does not name holds nothing; it is either a spare
-about to join, or a member being decommissioned, or a node that only routes.
+A node's share of a zone is the groups its catalog names it in, and it sizes its
+store for the sum of those shares across the universes it joins: per universe,
+the zone's pages, times the groups it holds, divided by the groups there are. An
+even catalog gives every node the same number and works out to three replicas
+divided by the member count, but evenness is not a rule. A zone growing,
+shrinking or levelling out is uneven while it does so, because groups move one
+at a time, and refusing an uneven catalog would refuse every state between two
+even ones. A node the catalog does not name holds nothing; it is either a spare
+about to join, or a member being decommissioned, or a node that only routes, and
+it sizes itself for an even share because it is about to hold one or is still
+draining the last.
 
 The watcher uses inotify on the configuration's parent directory and reacts to
 close-write and rename-into-place. Generations must increase; an extent's
@@ -87,8 +91,11 @@ tombstone epoch may not decrease, though it may jump by any amount; the store's
 size may rise but never fall; a surviving extent keeps its universe, its base,
 its length and its kind, and a surviving device keeps its ordered list of
 extents; each universe's catalog keeps its length for the life of the zone,
-since that length is what folds a slot onto a group; and catalog membership
-moves one node at a time, as migration changes do. Parse, validation, and build failures leave the
+since that length is what folds a slot onto a group; and a catalog moves by at
+most one member in any group and at most one id in or out of the zone, as
+migration changes do. Two of a group's three nodes therefore survive every
+change, which is what lets the group serve reads and replay the third; three new
+members would agree with each other about holding nothing. Parse, validation, and build failures leave the
 previous runtime configuration active and increment a metric. Reconciliation can
 still fail after publication and partially apply a generation.
 
@@ -213,19 +220,27 @@ remaining regions are:
 3. A/B copies of 4 MiB-page metadata.
 4. Out-of-place small and huge data slabs, with the huge slab aligned.
 
-Everything past the last of those, rounded up to 4 MiB, is the tail, and the tail
-is the cache. It is not recorded in the superblock and is not a region in the
-same sense as the others. It is derived at every start from where the slabs end
-and how long the file is, which is sound only because the cache is volatile:
-nothing points at a cache page across a restart, so the cache may sit wherever
-the layout is not looking this boot.
+Everything past the last of those, rounded up to 4 MiB, is the tail. It is not
+recorded in the superblock and is not a region in the same sense as the others.
+It is derived at every start from where the slabs end and how long the file is,
+which is sound only because the cache is volatile: nothing points at a cache page
+across a restart, so the cache may sit wherever the layout is not looking this
+boot. The layout claims the whole store, so the tail is normally alignment slack
+and the remainder of one run, and the cache lives on loans instead: it borrows
+free 4 MiB data slots from the allocator and gives them back when data wants
+them. `policy.cache_index_bytes` is what bounds the cache, not the store's slack.
 
-Capacity comes from one number, the configured `size_bytes`, and includes spare
-data slots. It is checked whenever `serve` starts. The share a node is sized for
-is the zone's mean rather than a declared ceiling, so the overprovision above it,
-five percent plus a per-class floor, is also what absorbs the variance in how
-many pages actually hash into the groups a node holds. A configuration that has
-outgrown the layout is satisfied by appending a growth run per class: a fresh run of
+Capacity comes from two numbers: the pages the configuration places here, and the
+configured `size_bytes`, which the layout claims in full. Both are checked
+whenever `serve` starts. The share a node is sized for is the groups its catalog
+names it in, so the overprovision above it, five percent plus a per-class floor,
+is what absorbs the variance in how many pages actually hash into those groups,
+and everything the store holds past that is claimed as 4 MiB data slots. That is
+what keeps a zone that grows off the restart path: the slots are already there.
+The small class is sized from the configuration alone, because its slots cost
+DRAM in the allocator's index and `policy.max_index_bytes` bounds that. A
+configuration that has outgrown the layout is satisfied by appending a growth run
+per class: a fresh run of
 metadata blocks and the data slots they name, placed past the end of everything
 already written, recorded in a growth table in the superblock, and never moving a
 byte that already exists. A growth run therefore lands in what was tail, and the
@@ -236,7 +251,8 @@ not, so the space a growth run lands in is space the store already owns. If the
 appended runs would still not fit within `size_bytes`, `serve` refuses to
 start and names the shortfall. Growth happens only at startup, before shards are
 sized; a reload that asks for more publishes the shortfall as
-`racer_alloc_unbacked_pages` and runs short until the next restart.
+`racer_alloc_unbacked_pages` and runs short until the next restart, which after
+the claim above means the disk is genuinely full rather than merely unclaimed.
 
 A metadata block is held wholly in memory and alternately
 rewritten to its A/B
@@ -410,7 +426,8 @@ extent nothing changes, and the group-confirmation paths are bypassed for a
 foreign address because this node's catalog describes only its own zone and
 would name the wrong three members.
 
-Media comes in 4 MiB chunks carved from the tail. A chunk is the unit of
+Media comes in 4 MiB chunks, carved from the tail the layout left or borrowed
+from the allocator's free data slots. A chunk is the unit of
 everything: what a class is given, what one class takes from the other, and what
 the allocator lends. Each class is striped only over the cores its lookups can
 reach, which is the same core mapping the allocator uses, so a chunk placed
@@ -418,11 +435,15 @@ anywhere else would be unreachable rather than merely cold. Core zero holds the
 chunks no class has taken and once a second moves media toward whichever class
 is both evicting and earning more confirmed hits per byte, drawing from that
 pool first, then from free 4 MiB slab slots the allocator will lend, then from
-the other class. A borrowed slab slot is given back synchronously, on the core
-that owns it, as soon as the allocator runs low; the allocator counts a loan as
-free, so lending never moves its own watermarks.
+the other class. Either class may hold a borrowed slot, since the layout claims
+the store and a loan is normally the only media there is; handing one back drops
+one page for the 4 MiB class and 1024 for the 4 KiB class, which is the price of
+a cache small reads can reach at all. A borrowed slab slot is given back
+synchronously, on the core that owns it, as soon as the allocator runs low, and
+the 4 MiB class gives first; the allocator counts a loan as free, so lending
+never moves its own watermarks.
 
-The tail is media, not memory, so what bounds the cache is DRAM:
+Media is chunks, not memory, so what bounds the cache is DRAM:
 `policy.cache_index_bytes` caps resident slot records at 48 bytes each. That
 makes the 4 KiB class a thousand times more expensive per byte of media than the
 4 MiB class, and the cap therefore binds the small class first. It is not an
@@ -449,13 +470,17 @@ count, buckets, and repairs are budgeted, with larger budgets during replay.
 A node whose digests are empty where its peers' are not is replaying, and is
 excluded from quorum until it has caught up. That covers both a member wiped and
 restarted under its own id and a node the catalog has just named for the first
-time. Membership moves by replacement, one node at a time: the joining node
-inherits the departing node's groups and replays them, and the departing node,
-which the new configuration no longer names, walks what it still holds, confirms
-the new members have each version, then drops its registers and frees the slots.
-Since the member count is unchanged, no node's share moves. There is no way to
-give one node more of the zone than another, so there is nothing else to
-rebalance.
+time. Membership moves one group at a time: a group's new member inherits that
+group and replays it, and the node the new configuration no longer names there
+walks what it still holds, confirms the new members have each version, then drops
+its registers and frees the slots. A node joins a zone, leaves it, or takes a
+larger or smaller share of it by that one operation repeated, so a zone is grown
+and shrunk rather than only having its members replaced. What the dataplane
+enforces is the shape of a single step, not where the control plane is going with
+it: no group loses two of its three members at once, and no more than one id
+enters or leaves the zone per generation. A node that is holding fewer groups
+than it did sheds the difference exactly as a departing one does, since shedding
+is per group and asks only whether this node is still named in it.
 
 For migration, a source asks directly linked catalog nodes to seal, ignores
 failed sends, persists its own seal, then repeatedly walks the extent and sends
