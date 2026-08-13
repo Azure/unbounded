@@ -107,18 +107,25 @@ func (a *atomicStore) swap(store *catalog.Store, dev *catalog.Device, path strin
 	}
 }
 
-func (a *atomicStore) close() error {
+// detach drops the attached catalog and closes its device, reporting whether
+// there was anything to let go of.
+func (a *atomicStore) detach() (bool, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	dev := a.dev
 	a.store, a.dev, a.path = nil, nil, ""
+	a.mu.Unlock()
 
 	if dev == nil {
-		return nil
+		return false, nil
 	}
 
-	return dev.Close()
+	return true, dev.Close()
+}
+
+func (a *atomicStore) close() error {
+	_, err := a.detach()
+
+	return err
 }
 
 // reconcile attaches the catalog described by set, replacing whatever is
@@ -133,6 +140,22 @@ func (h *holder) reconcile(set *segment.Set) error {
 
 	desc, err := set.CatalogDevice()
 	if err != nil {
+		// A set that names no catalog is a retraction, not a gap: racer-ctrl
+		// publishes one when the image volume goes away. Holding the old
+		// descriptor open would pin the ublk minor behind a device the kernel
+		// has already deleted, and racer can never export at that number
+		// again, so let go before reporting that there is nothing to attach.
+		if errors.Is(err, segment.ErrNoCatalog) {
+			had, closeErr := h.current.detach()
+			if had {
+				h.log.Info("catalog detached, the image volume was withdrawn")
+			}
+
+			if closeErr != nil {
+				return fmt.Errorf("detach catalog: %w", closeErr)
+			}
+		}
+
 		return fmt.Errorf("catalog device: %w", err)
 	}
 

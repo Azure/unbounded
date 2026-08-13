@@ -365,6 +365,71 @@ func TestReconcilePicksUpANewSegment(t *testing.T) {
 	}
 }
 
+// racer-ctrl publishes a set with no catalog when the image volume goes away.
+// The descriptor has to be let go of: an open file on a deleted ublk device
+// pins the minor in the kernel, and racer can never export at that number
+// again.
+func TestReconcileReleasesTheDeviceOnARetraction(t *testing.T) {
+	dir := t.TempDir()
+	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+
+	opens := 0
+	h := newHolder(t, true, true)
+	inner := h.open
+	h.open = func(path string) (*catalog.Device, error) {
+		opens++
+
+		return inner(path)
+	}
+
+	defer h.close() //nolint:errcheck // test cleanup
+
+	if err := h.reconcile(set); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	retracted, err := segment.Parse([]byte(`{"generation":2,"segments":[]}`))
+	if err != nil {
+		t.Fatalf("parse retraction: %v", err)
+	}
+
+	if err := h.reconcile(retracted); !errors.Is(err, segment.ErrNoCatalog) {
+		t.Fatalf("reconcile retraction = %v, want ErrNoCatalog", err)
+	}
+
+	if store, path := h.current.load(); store != nil || path != "" {
+		t.Fatalf("still attached to %q after a retraction", path)
+	}
+
+	// The volume coming back has to reopen the device rather than serve a
+	// closed one.
+	if err := h.reconcile(set); err != nil {
+		t.Fatalf("reconcile after retraction: %v", err)
+	}
+
+	if opens != 2 {
+		t.Errorf("opened the device %d times, want 2", opens)
+	}
+}
+
+// Detaching when nothing is attached is what every poll does before the image
+// volume exists, so it must stay quiet.
+func TestReconcileRetractionWithoutAnAttachmentIsQuiet(t *testing.T) {
+	retracted, err := segment.Parse([]byte(`{"generation":1,"segments":[]}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	h := newHolder(t, true, true)
+	if err := h.reconcile(retracted); !errors.Is(err, segment.ErrNoCatalog) {
+		t.Errorf("reconcile = %v, want ErrNoCatalog", err)
+	}
+
+	if had, err := h.current.detach(); had || err != nil {
+		t.Errorf("detach = %v, %v; want false, nil", had, err)
+	}
+}
+
 func TestReconcileReportsAMissingDevice(t *testing.T) {
 	dir := t.TempDir()
 	set := testSet(t, dir, 64*catalog.BlockBytes)
