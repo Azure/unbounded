@@ -96,6 +96,10 @@ func TestSiteInitCommand_ComponentFlags(t *testing.T) {
 	require.NotNil(t, flag)
 	require.Equal(t, "false", flag.DefValue)
 
+	flag = cmd.Flags().Lookup("enable-racer")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+
 	// site init no longer bootstraps the operator; the operator must be
 	// installed first via `kubectl unbounded install`. The install lifecycle
 	// flags were removed.
@@ -201,6 +205,7 @@ func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
 		EnableMachina:   true,
 		EnableMetalman:  true,
 		EnableStorage:   true,
+		EnableRacer:     true,
 	}
 
 	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
@@ -218,6 +223,28 @@ func TestEnsureUnboundedSite_ComponentConfig(t *testing.T) {
 	assert.Contains(t, rendered, "machina:\n      enabled: true")
 	assert.Contains(t, rendered, "metalman:\n      enabled: true")
 	assert.Contains(t, rendered, "storage:\n      enabled: true")
+	assert.Contains(t, rendered, "racer:\n      enabled: true")
+}
+
+func TestEnsureUnboundedSite_RacerDisabledByDefault(t *testing.T) {
+	cfg := unboundedSiteConfig{
+		SiteName:        "test-site",
+		NodeCIDRs:       []string{"10.0.0.0/24"},
+		PodCIDRs:        []string{"10.1.0.0/24"},
+		ManageCniPlugin: true,
+		EnableMachina:   true,
+	}
+
+	content, err := siteTemplates.ReadFile("assets/unbounded-net-site/site.yaml")
+	require.NoError(t, err)
+
+	tmpl, err := template.New("site.yaml").Parse(string(content))
+	require.NoError(t, err)
+
+	var buf strings.Builder
+	require.NoError(t, tmpl.Execute(&buf, cfg))
+
+	assert.Contains(t, buf.String(), "racer:\n      enabled: false")
 }
 
 func TestSiteInitComponentOwnership(t *testing.T) {
@@ -231,17 +258,20 @@ func TestSiteInitComponentOwnership(t *testing.T) {
 		enableMachina:   true,
 		enableMetalman:  true,
 		enableStorage:   true,
+		enableRacer:     true,
 	}
 
 	cluster := h.clusterSiteConfig()
 	assert.True(t, cluster.EnableMachina)
 	assert.False(t, cluster.EnableStorage)
 	assert.False(t, cluster.EnableMetalman)
+	assert.False(t, cluster.EnableRacer)
 
 	remote := h.remoteSiteConfig()
 	assert.False(t, remote.EnableMachina)
 	assert.True(t, remote.EnableStorage)
 	assert.True(t, remote.EnableMetalman)
+	assert.True(t, remote.EnableRacer)
 }
 
 func TestSiteInitValidateClusterCIDRMessages(t *testing.T) {

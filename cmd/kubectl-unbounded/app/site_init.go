@@ -64,6 +64,7 @@ type siteInitHandler struct {
 	enableMachina  bool
 	enableMetalman bool
 	enableStorage  bool
+	enableRacer    bool
 
 	// kubeCli is the kubernetes client interface.
 	kubeCli kubernetes.Interface
@@ -335,6 +336,9 @@ func (h *siteInitHandler) remoteSiteConfig() unboundedSiteConfig {
 		// Storage (RDMA) targets the worker nodes of the site being
 		// initialized, so --enable-storage applies to the remote Site.
 		EnableStorage: h.enableStorage,
+		// racer pools the local disks of the site's worker nodes, so
+		// --enable-racer applies to the remote Site as well.
+		EnableRacer: h.enableRacer,
 		Manifests: []string{
 			"site.yaml",
 			"sitegatewaypoolassignment.yaml",
@@ -400,6 +404,7 @@ type unboundedSiteConfig struct {
 	EnableMachina  bool
 	EnableMetalman bool
 	EnableStorage  bool
+	EnableRacer    bool
 	// ManageCniPlugin controls whether unbounded-net manages the CNI plugin.
 	// When false, the template emits manageCniPlugin: false so that an
 	// existing CNI (e.g. Cilium, Calico) is left in place.
@@ -489,6 +494,7 @@ func siteInitCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&handler.enableMachina, "enable-machina", true, "Enable machina for the Site")
 	cmd.Flags().BoolVar(&handler.enableMetalman, "enable-metalman", false, "Enable metalman for the Site")
 	cmd.Flags().BoolVar(&handler.enableStorage, "enable-storage", false, "Enable unbounded-storage for the Site")
+	cmd.Flags().BoolVar(&handler.enableRacer, "enable-racer", false, "Enable racer distributed block storage for the Site")
 
 	if err := cmd.MarkFlagRequired("name"); err != nil {
 		panic(err)
