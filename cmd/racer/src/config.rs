@@ -377,8 +377,9 @@ pub(crate) struct Span {
 }
 
 impl Span {
-    fn blocks(&self) -> u64 {
-        self.pages * if self.huge { HUGE_BLOCKS } else { 1 }
+    fn blocks(&self) -> Option<u64> {
+        self.pages
+            .checked_mul(if self.huge { HUGE_BLOCKS } else { 1 })
     }
 }
 
@@ -437,15 +438,23 @@ pub(crate) struct Device {
 }
 
 impl Device {
-    fn new(id: u32, spans: Vec<Span>) -> Device {
+    fn new(id: u32, spans: Vec<Span>) -> io::Result<Device> {
         let mut starts = Vec::with_capacity(spans.len() + 1);
-        let mut at = 0;
+        let mut at = 0u64;
         starts.push(0);
         for s in &spans {
-            at += s.blocks();
+            let blocks = s.blocks().ok_or_else(|| {
+                bad(format!(
+                    "device {id} extent {} has too many pages to count in blocks",
+                    s.extent
+                ))
+            })?;
+            at = at
+                .checked_add(blocks)
+                .ok_or_else(|| bad(format!("device {id} has too many blocks to address")))?;
             starts.push(at);
         }
-        Device { id, spans, starts }
+        Ok(Device { id, spans, starts })
     }
 
     /// Length in 4 KiB blocks.
@@ -993,13 +1002,25 @@ impl Config {
                     e.id, e.base_lba
                 )));
             }
-            if e.blocks() > MAX_LBA - e.base_lba {
+            let Some(blocks) = e.pages.checked_mul(e.blocks_per_page()) else {
+                return Err(bad(format!(
+                    "extent {} runs past the end of universe {id}",
+                    e.id
+                )));
+            };
+            let Some(extent_end) = e.base_lba.checked_add(blocks) else {
+                return Err(bad(format!(
+                    "extent {} runs past the end of universe {id}",
+                    e.id
+                )));
+            };
+            if extent_end > MAX_LBA {
                 return Err(bad(format!(
                     "extent {} runs past the end of universe {id}",
                     e.id
                 )));
             }
-            end = e.end_lba();
+            end = extent_end;
         }
         Ok(())
     }
@@ -1297,7 +1318,7 @@ impl Config {
                     huge: e.huge,
                 });
             }
-            devices.push(Device::new(d.id, spans));
+            devices.push(Device::new(d.id, spans)?);
         }
         devices.sort_by_key(|d| d.id);
         let policy = p.policy.map(|p| Policy {
@@ -2129,6 +2150,20 @@ device 2 extents=12
         let mut c = sample();
         c.universes[0].extents[2].base_lba = 100;
         assert!(c.validate().is_err(), "a 4 MiB extent must be aligned");
+    }
+
+    #[test]
+    fn extents_must_fit_in_the_universe() {
+        for (base, pages) in [(MAX_LBA + 1, 1), (0, 1u64 << 54)] {
+            let text = SAMPLE.replace(
+                "extent id=12 base=1024  pages=8   kind=immutable_4m  zone=1 cache_admit=1 warm_zones=2",
+                &format!(
+                    "extent id=12 base={base} pages={pages} kind=immutable_4m zone=1 cache_admit=1 warm_zones=2"
+                ),
+            );
+            let result = Config::parse(&text).and_then(|c| c.validate());
+            assert!(result.is_err(), "base={base} pages={pages}");
+        }
     }
 
     #[test]
