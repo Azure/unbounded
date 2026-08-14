@@ -287,9 +287,35 @@ func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {
 		t.Fatalf("read-only RBAC rule for %s/%s not found", group, resource)
 	}
 
+	// assertCachedReadable is the weaker form of assertReadOnlyRule, for kinds the
+	// operator caches and also writes. It still guards the cache: without all
+	// three read verbs the informer cannot start.
+	assertCachedReadable := func(group, resource string) {
+		t.Helper()
+
+		for _, rule := range role.Rules {
+			if !contains(rule.APIGroups, group) || !contains(rule.Resources, resource) {
+				continue
+			}
+
+			for _, verb := range []string{"get", "list", "watch"} {
+				if !contains(rule.Verbs, verb) {
+					t.Fatalf("%s/%s verbs = %v, missing %q", group, resource, rule.Verbs, verb)
+				}
+			}
+
+			return
+		}
+
+		t.Fatalf("RBAC rule for %s/%s not found", group, resource)
+	}
+
 	assertReadOnlyRule("apps", "statefulsets")
-	assertReadOnlyRule("", "nodes")
 	assertReadOnlyRule("net.unbounded-cloud.io", "sitenodeslices")
+
+	// Nodes are no longer read-only: the racer component assigns each node its
+	// id, zone and cohort as annotations, and that has to come from one writer.
+	assertCachedReadable("", "nodes")
 
 	for _, rule := range role.Rules {
 		if len(rule.APIGroups) == 1 && rule.APIGroups[0] == "events.k8s.io" &&

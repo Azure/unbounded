@@ -36,9 +36,29 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces", "serviceaccounts", "configmaps", "services", "secrets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
+  # The racer component assigns each node in a racer-enabled site its racer
+  # identity (node id, zone and cohort) as annotations. Those three values must
+  # be handed out by a single writer: two nodes self-claiming concurrently would
+  # patch different Node objects and both would succeed with the same id. It
+  # also owns the racer.unbounded-cloud.io/active label the node DaemonSet
+  # selects on, which is how a decommissioning node keeps running racer until it
+  # has shed.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # racer volumes are PersistentVolumes. The operator stamps each one's extent
+  # composition and home zone, and holds a finalizer while the extents are
+  # collected, so it needs write access to the object and its metadata.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # A StorageClass whose provisioner is racer.unbounded-cloud.io is a racer
+  # universe; the operator creates the default class and records the universe
+  # id, catalog size, epoch, LBA cursor and per-zone membership on it. The
+  # CSIDriver object is part of the racer manifest set.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csidrivers"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: [""]
     resources: ["pods", "replicationcontrollers", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch"]
