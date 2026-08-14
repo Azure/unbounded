@@ -40,6 +40,10 @@ type fakeCatalog struct {
 	laggard    catalog.NodeKey
 	expect     []catalog.NodeKey
 
+	synced  int
+	syncErr error
+	hole    uint64
+
 	appended  []catalog.Record
 	abandoned int
 	accounts  []account
@@ -70,10 +74,54 @@ func (c *fakeCatalog) add(id uint32, state catalog.SegmentState, cursor uint32, 
 		DeadBytes:   dead,
 	}
 
+	// The index agrees with the accounting unless a test says otherwise by
+	// overwriting c.blobs, which is how drift is expressed here: the cleaner
+	// counts live bytes out of the index, not out of these columns.
+	c.blobs[id] = pageBlobs(id, live/segment.PageBytes)
+
 	if state == catalog.SegmentOpen {
 		c.open = id
 		c.cursor = cursor
 	}
+}
+
+// pageBlobs is n one-page blobs in a segment, which is what the index holds for
+// a segment carrying n pages of live data.
+func pageBlobs(id uint32, n uint64) []catalog.Blob {
+	out := make([]catalog.Blob, 0, n)
+
+	for i := range n {
+		var diffID catalog.Digest
+
+		diffID[0] = byte(id)
+		diffID[1] = byte(i)
+
+		out = append(out, catalog.Blob{
+			DiffID: diffID,
+			Address: segment.Address{
+				Segment:    id,
+				PageOffset: uint32(i), //nolint:gosec // test segments are four pages
+				PageCount:  1,
+				ByteLength: segment.PageBytes,
+			},
+		})
+	}
+
+	return out
+}
+
+func (c *fakeCatalog) Sync() (bool, error) {
+	c.synced++
+
+	return false, c.syncErr
+}
+
+func (c *fakeCatalog) Hole() (uint64, time.Duration) {
+	if c.hole == 0 {
+		return 0, 0
+	}
+
+	return c.hole, time.Minute
 }
 
 func (c *fakeCatalog) Segments() ([]catalog.SegmentEntry, error) {
@@ -338,6 +386,123 @@ func TestOnceSelectsTheEmptiestSealedSegment(t *testing.T) {
 
 	if state := cat.entries[2].State; state != catalog.SegmentCleaning {
 		t.Fatalf("segment 2 is %s, want cleaning", state)
+	}
+}
+
+func TestOnceSelectsByWhatTheIndexResolves(t *testing.T) {
+	t.Parallel()
+
+	cat := newFakeCatalog()
+	// The accounting says segment 1 is the emptier of the two. The index
+	// says the opposite, and the index is the one that decides what a reader
+	// would actually find there.
+	cat.add(1, catalog.SegmentSealed, segmentPages, segment.PageBytes, 3*segment.PageBytes)
+	cat.add(2, catalog.SegmentSealed, segmentPages, 3*segment.PageBytes, segment.PageBytes)
+	cat.add(3, catalog.SegmentOpen, segmentPages-1, 0, 0)
+
+	cat.blobs[1] = pageBlobs(1, 2)
+	cat.blobs[2] = nil
+
+	c := newCleaner(t, cat, testDevice(t), &fakeDiscarder{}, Always{})
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	if res.Phase != PhaseSelected || res.Segment != 2 {
+		t.Fatalf("selected %d in phase %s, want segment 2: nothing resolves into it", res.Segment, res.Phase)
+	}
+}
+
+func TestOnceLeavesALiveSegmentAloneDespiteItsAccounting(t *testing.T) {
+	t.Parallel()
+
+	cat := newFakeCatalog()
+	// Accounting that was never applied, or a subtraction that was applied
+	// twice, leaves a segment looking empty. Believing it would copy a full
+	// segment out for nothing and then trim the pages a reader still needs.
+	cat.add(1, catalog.SegmentSealed, segmentPages, 0, 4*segment.PageBytes)
+	cat.add(2, catalog.SegmentOpen, segmentPages-1, 0, 0)
+
+	cat.blobs[1] = pageBlobs(1, segmentPages)
+
+	c := newCleaner(t, cat, testDevice(t), &fakeDiscarder{}, Always{})
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	if res.Phase != PhaseIdle {
+		t.Fatalf("phase = %s, want idle: the index says the segment is full", res.Phase)
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentSealed {
+		t.Fatalf("segment 1 is %s, want sealed", state)
+	}
+}
+
+func TestOnceCatchesUpBeforeItDecides(t *testing.T) {
+	t.Parallel()
+
+	cat := newFakeCatalog()
+	cat.add(1, catalog.SegmentSealed, segmentPages, segment.PageBytes, 3*segment.PageBytes)
+	cat.add(2, catalog.SegmentOpen, segmentPages-1, 0, 0)
+
+	c := newCleaner(t, cat, testDevice(t), &fakeDiscarder{}, Always{})
+
+	if _, err := c.Once(context.Background()); err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	if cat.synced != 1 {
+		t.Fatalf("synced %d times, want once before the pass read anything", cat.synced)
+	}
+}
+
+func TestOnceStopsWhenTheCatalogCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	cat := newFakeCatalog()
+	cat.add(1, catalog.SegmentSealed, segmentPages, segment.PageBytes, 3*segment.PageBytes)
+	cat.add(2, catalog.SegmentOpen, segmentPages-1, 0, 0)
+	cat.syncErr = errors.New("device gone")
+
+	c := newCleaner(t, cat, testDevice(t), &fakeDiscarder{}, Always{})
+
+	if _, err := c.Once(context.Background()); err == nil {
+		t.Fatal("a pass ran on an index it could not refresh")
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentSealed {
+		t.Fatalf("segment 1 is %s, want sealed", state)
+	}
+}
+
+func TestOnceSkipsAPassStoppedAtAHole(t *testing.T) {
+	t.Parallel()
+
+	cat := newFakeCatalog()
+	cat.add(1, catalog.SegmentSealed, segmentPages, segment.PageBytes, 3*segment.PageBytes)
+	cat.add(2, catalog.SegmentOpen, segmentPages-1, 0, 0)
+	// Records past slot 7 are unread, so the blobs the index is missing are
+	// exactly the ones an evacuation would fail to copy.
+	cat.hole = 7
+
+	c := newCleaner(t, cat, testDevice(t), &fakeDiscarder{}, Always{})
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	if res.Phase != PhaseIdle {
+		t.Fatalf("phase = %s, want idle: the index is known to be incomplete", res.Phase)
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentSealed {
+		t.Fatalf("segment 1 is %s, want sealed", state)
 	}
 }
 

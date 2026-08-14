@@ -68,6 +68,8 @@ var ErrVerify = errors.New("clean: blob verification failed")
 
 // Catalog is the part of the catalog store a cleaner uses.
 type Catalog interface {
+	Sync() (bool, error)
+	Hole() (uint64, time.Duration)
 	Segments() ([]catalog.SegmentEntry, error)
 	BlobsIn(id uint32) []catalog.Blob
 	Generation() uint64
@@ -331,6 +333,28 @@ func (c *Cleaner) Run(ctx context.Context) {
 // that emptied the whole volume in one go would stall every container start on
 // the node while it did.
 func (c *Cleaner) Once(ctx context.Context) (Result, error) {
+	// Every decision below is read out of the index: which blobs a segment
+	// still holds, how much of its capacity is live, and whether there is
+	// anything left to copy out. A stale index under-reports all three, and
+	// the mistake that follows - repointing a segment whose survivors were
+	// never copied, and then trimming it - cannot be undone, so a pass
+	// starts by catching up and does nothing at all if it cannot.
+	if _, err := c.cat.Sync(); err != nil {
+		return Result{Phase: PhaseIdle}, fmt.Errorf("clean: sync catalog: %w", err)
+	}
+
+	if hole, age := c.cat.Hole(); hole != 0 {
+		// Reading stops at an unwritten slot, so the index is known to be
+		// incomplete, and the blobs missing from it are exactly the ones a
+		// copy would leave behind. Repair is what clears this.
+		c.log.Debug("clean pass skipped, the catalog is stopped at a hole",
+			slog.Uint64("record", hole),
+			slog.Duration("age", age),
+		)
+
+		return Result{Phase: PhaseIdle}, nil
+	}
+
 	entries, err := c.cat.Segments()
 	if err != nil {
 		return Result{Phase: PhaseIdle}, fmt.Errorf("clean: read segments: %w", err)
@@ -371,8 +395,9 @@ func (c *Cleaner) Once(ctx context.Context) (Result, error) {
 
 	c.log.Info("cleaning segment",
 		slog.Uint64("segment", uint64(victim.ID)),
-		slog.Uint64("live_bytes", victim.LiveBytes),
-		slog.Uint64("dead_bytes", victim.DeadBytes),
+		slog.Uint64("live_bytes", c.liveBytes(victim.ID)),
+		slog.Uint64("accounted_live_bytes", victim.LiveBytes),
+		slog.Uint64("accounted_dead_bytes", victim.DeadBytes),
 	)
 
 	return c.report(Result{Phase: PhaseSelected, Segment: victim.ID}, nil)
@@ -388,6 +413,17 @@ func (c *Cleaner) report(res Result, err error) (Result, error) {
 
 // victim picks the sealed segment worth cleaning, if the volume is full enough
 // to want the space.
+//
+// How much of a segment is still live is counted from the index rather than
+// read out of the segment table. The table's live and dead columns are
+// maintained by whoever publishes or moves a blob, and an update that is lost -
+// a node that died between appending a record and accounting for it, a
+// subtraction that could not be written - is never recovered, because nothing
+// re-derives them. The index is not like that: every node rebuilds it from the
+// record log, so what it says a segment holds is what a reader would actually
+// resolve there. Choosing a victim from a number that can silently drift means
+// eventually evacuating a segment that is nearly all live, or passing over one
+// that is empty.
 func (c *Cleaner) victim(entries []catalog.SegmentEntry) (catalog.SegmentEntry, bool) {
 	var free, total uint64
 
@@ -404,8 +440,9 @@ func (c *Cleaner) victim(entries []catalog.SegmentEntry) (catalog.SegmentEntry, 
 	}
 
 	var (
-		best  catalog.SegmentEntry
-		found bool
+		best     catalog.SegmentEntry
+		bestLive float64
+		found    bool
 	)
 
 	for _, entry := range entries {
@@ -413,17 +450,42 @@ func (c *Cleaner) victim(entries []catalog.SegmentEntry) (catalog.SegmentEntry, 
 			continue
 		}
 
-		live := entry.LiveFraction()
+		live := c.liveFraction(entry)
 		if live > c.maxLive {
 			continue
 		}
 
-		if !found || live < best.LiveFraction() {
-			best, found = entry, true
+		if !found || live < bestLive {
+			best, bestLive, found = entry, live, true
 		}
 	}
 
 	return best, found
+}
+
+// liveFraction is the share of a segment's capacity the index still resolves
+// into, in [0, 1]. A segment with no capacity reports 0 rather than dividing by
+// zero.
+func (c *Cleaner) liveFraction(entry catalog.SegmentEntry) float64 {
+	capacity := uint64(entry.TotalPages) * segment.PageBytes
+	if capacity == 0 {
+		return 0
+	}
+
+	return float64(c.liveBytes(entry.ID)) / float64(capacity)
+}
+
+// liveBytes is the padded size of the blobs the index still resolves into a
+// segment. Padded, because a blob owns whole 4 MiB pages and the tail of its
+// last page cannot be handed to anything else.
+func (c *Cleaner) liveBytes(id uint32) uint64 {
+	var live uint64
+
+	for _, blob := range c.cat.BlobsIn(id) {
+		live += blob.Address.Span()
+	}
+
+	return live
 }
 
 // evacuate copies one batch of survivors out of a segment being cleaned, and

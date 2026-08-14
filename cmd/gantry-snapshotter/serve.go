@@ -103,6 +103,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		WorkDir:    cfg.WorkDir,
 		Headroom:   cfg.WorkHeadroom,
 		SkipVerify: cfg.SkipVerify,
+		Log:        log.With(slog.String("component", "ingest")),
 	})
 	if err != nil {
 		return fmt.Errorf("ingest: %w", err)

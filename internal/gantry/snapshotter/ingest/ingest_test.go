@@ -644,6 +644,57 @@ func TestIngestWritesAndPublishes(t *testing.T) {
 	}
 }
 
+// failAccount is a catalog whose records work and whose accounting does not.
+type failAccount struct {
+	Catalog
+}
+
+func (failAccount) Account(uint32, int64, int64) error {
+	return errors.New("accounting is broken")
+}
+
+func TestIngestSurvivesBrokenAccounting(t *testing.T) {
+	store := newStore(t, 8)
+	image := bytes.Repeat([]byte("erofs"), 4096)
+
+	builder, _ := fakeBuilder(t, image)
+
+	i := newIngester(t, Options{
+		Catalog: failAccount{Catalog: store},
+		Locator: fileLocator{path: deviceFile(t, 8)},
+		Opener:  &bytesOpener{data: []byte("tar")},
+		Builder: builder,
+	})
+
+	req := Request{DiffID: digestOf(1), ChainID: digestOf(2)}
+
+	res, err := i.Ingest(t.Context(), req)
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if res.Outcome != OutcomeIngested {
+		t.Fatalf("outcome = %s, want ingested", res.Outcome)
+	}
+
+	// The layer is published and resolvable, which is what the ingest was
+	// for. Failing here would requeue a request whose chain already
+	// resolves, so the retry would report present without ever fixing the
+	// number that failed.
+	if _, ok := store.Resolve(req.ChainID); !ok {
+		t.Fatal("chain did not resolve")
+	}
+
+	segs, err := store.Segments()
+	if err != nil {
+		t.Fatalf("segments: %v", err)
+	}
+
+	if segs[0].LiveBytes != 0 {
+		t.Fatalf("live bytes = %d, want the accounting to have been lost", segs[0].LiveBytes)
+	}
+}
+
 func TestIngestIsIdempotent(t *testing.T) {
 	store := newStore(t, 8)
 	builder, calls := fakeBuilder(t, bytes.Repeat([]byte("e"), 4096))

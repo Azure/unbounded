@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -167,6 +168,10 @@ type Options struct {
 	// RACER's 4 MiB pages carry no data checksum, and the cluster trusts
 	// this blob on the strength of one record.
 	SkipVerify bool
+
+	// Log defaults to the discard logger. It carries the things an ingest
+	// survives rather than fails on, which would otherwise be invisible.
+	Log *slog.Logger
 }
 
 // Ingester writes layers into RACER and publishes them in the catalog.
@@ -184,6 +189,7 @@ type Ingester struct {
 	workDir  string
 	headroom uint64
 	verify   bool
+	log      *slog.Logger
 }
 
 // New builds an Ingester.
@@ -218,6 +224,7 @@ func New(opts Options) (*Ingester, error) {
 		workDir:  opts.WorkDir,
 		headroom: opts.Headroom,
 		verify:   !opts.SkipVerify,
+		log:      opts.Log,
 	}
 
 	if i.builder == nil {
@@ -234,6 +241,10 @@ func New(opts Options) (*Ingester, error) {
 
 	if i.headroom == 0 {
 		i.headroom = DefaultHeadroom
+	}
+
+	if i.log == nil {
+		i.log = slog.New(slog.DiscardHandler)
 	}
 
 	return i, nil
@@ -404,12 +415,24 @@ func (i *Ingester) build(ctx context.Context, req Request) (blob catalog.Blob, e
 
 	published = true
 
-	// Accounting is separate from the reservation on purpose: it is the
-	// cleaner's input, not a correctness invariant, and folding it into the
+	// Accounting is separate from the reservation on purpose: it is a hint
+	// for operators, not a correctness invariant, and folding it into the
 	// reservation compare-and-swap would double the contention on the one
 	// block every ingest in the cluster has to write.
+	//
+	// A failure here therefore does not fail the ingest. The records are
+	// published and every node can resolve the layer, so returning an error
+	// would only send the request back through the queue, where the next
+	// attempt would find the chain already resolvable and report success
+	// without ever retrying the accounting. The number would stay wrong for
+	// the life of the volume, and nothing that matters would have been
+	// retried. What the cleaner needs it derives from the index instead.
 	if err := i.cat.Account(addr.Segment, int64(addr.Span()), 0); err != nil {
-		return catalog.Blob{}, fmt.Errorf("ingest: account segment %d: %w", addr.Segment, err)
+		i.log.Warn("could not account an ingest",
+			slog.String("blob", req.DiffID.Short()),
+			slog.Uint64("segment", uint64(addr.Segment)),
+			slog.Any("err", err),
+		)
 	}
 
 	return catalog.Blob{
