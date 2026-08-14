@@ -25,7 +25,8 @@ name: unbounded release
 #     -> netboot-image     (PXE boot artifact image)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           orca, gantry, unbounded-storage-supervisor, host-ubuntu2404)
+#                           orca, gantry, unbounded-storage-supervisor, racer-ctrl,
+#                           racer, host-ubuntu2404)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
 #     -> finalize          (attach extras + krew manifest)
@@ -697,6 +698,18 @@ jobs:
           - name: unbounded-storage-supervisor
             file: images/unbounded-storage-supervisor/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
+          - name: racer-ctrl
+            file: images/racer-ctrl/Containerfile
+            platforms: linux/amd64,linux/arm64
+            trivy: true
+          # The racer dataplane is a Rust release build and is deliberately not
+          # cross-compiled: images/racer/Containerfile pins the toolchain to
+          # BUILDPLATFORM and builds for the builder's own architecture, so this
+          # entry publishes amd64 only.
+          - name: racer
+            file: images/racer/Containerfile
+            platforms: linux/amd64
             trivy: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
