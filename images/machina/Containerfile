@@ -6,7 +6,7 @@
 # host even when targeting a foreign TARGETPLATFORM. Without this, buildkit
 # would emulate the entire builder under QEMU when producing arm64 images on
 # an amd64 runner, which makes "go build" painfully slow.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.5-trixie AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.6-trixie AS builder
 
 # Install build dependencies. The base image already provides the Go
 # toolchain at /usr/local/go/bin, so we don't install the apt golang package.
