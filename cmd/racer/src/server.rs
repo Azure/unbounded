@@ -373,6 +373,10 @@ fn sample(d: &Dataplane) {
         commit_parks_huge: x.per[1].parks,
         flush_busy_us_small: x.per[0].busy_us,
         flush_busy_us_huge: x.per[1].busy_us,
+        swept_epoch_small: x.per[0].swept_epoch,
+        swept_epoch_huge: x.per[1].swept_epoch,
+        swept_uncovered_small: x.per[0].swept_uncovered,
+        swept_uncovered_huge: x.per[1].swept_uncovered,
         ..metrics::Sample::default()
     };
     // Groups in flight, per core and disjoint, so the sum over rows is the node's total.

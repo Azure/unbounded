@@ -391,6 +391,12 @@ struct Slab {
     stats_commits: u64,
     stats_flushes: u64,
     stats_flush_batch: u64,
+    /// Observability only: rows [`Shard::sweep`] reclaimed, split by which arm took them.
+    /// The only place registers are destroyed without a round, so it is the only place a
+    /// configuration mistake can empty an extent, and it is worth being able to see from
+    /// outside the process. Excluded from the model's state identity.
+    stats_swept_epoch: u64,
+    stats_swept_uncovered: u64,
     flushing: bool,
     sweep: u32,
     /// Anti-entropy accumulators over this slab's registers, keyed by consensus group.
@@ -431,6 +437,8 @@ impl Slab {
             stats_commits: 0,
             stats_flushes: 0,
             stats_flush_batch: 0,
+            stats_swept_epoch: 0,
+            stats_swept_uncovered: 0,
             flushing: false,
             sweep: 0,
             digests: Digests::default(),
@@ -1146,6 +1154,13 @@ impl Shard {
             .map(|sl| (sl.stats_commits, sl.stats_flushes, sl.stats_flush_batch))
     }
 
+    /// Per-class counts of rows [`Self::sweep`] reclaimed, as `(epoch, uncovered)`.
+    pub(super) fn sweep_stats(&self) -> [(u64, u64); 2] {
+        self.slabs
+            .each_ref()
+            .map(|sl| (sl.stats_swept_epoch, sl.stats_swept_uncovered))
+    }
+
     // -------------------------------------------------------------------- maintenance
 
     /// One tick's worth of epoch reclamation on one class. The only garbage collection
@@ -1183,10 +1198,14 @@ impl Shard {
             for j in 0..k {
                 let l = li as usize * k + j;
                 let e = sl.entries[l];
-                let stale = match (m.xof)(e.addr) {
+                // `uncovered` separates the two reasons a row can go, because they mean
+                // very different things: an epoch advance is the control plane asking,
+                // and an address no extent covers is the control plane having stopped
+                // asking. Only the counters tell them apart afterwards.
+                let (stale, uncovered) = match (m.xof)(e.addr) {
                     // An immutable version carries its own epoch, so an advance is a
                     // reuse: rows written under it survive, rows behind it go.
-                    Some((_, epoch, Kind::Immutable)) => e.epoch < epoch,
+                    Some((_, epoch, Kind::Immutable)) => (e.epoch < epoch, false),
                     // A mutable version carries none, so a row written after the advance
                     // is indistinguishable from one a repair carried across it. The
                     // control plane advances a mutable extent's epoch for one reason -
@@ -1195,13 +1214,18 @@ impl Shard {
                     // Without this a repair that lands between one member crossing the
                     // barrier and another leaves rows stamped at the barrier's own epoch,
                     // which no later sweep can ever take.
-                    Some((_, epoch, _)) => epoch != 0,
-                    None => (m.rof)(e.addr),
+                    Some((_, epoch, _)) => (epoch != 0, false),
+                    None => ((m.rof)(e.addr), true),
                 };
                 if e.addr != 0 && stale {
                     sl.set(l as u32, Entry::default(), m);
                     sl.index.remove(e.addr);
                     sl.recycle(l as u32);
+                    if uncovered {
+                        sl.stats_swept_uncovered += 1;
+                    } else {
+                        sl.stats_swept_epoch += 1;
+                    }
                     hit = true;
                 }
             }
@@ -1610,6 +1634,8 @@ mod cmp {
                 stats_commits: self.stats_commits,
                 stats_flushes: self.stats_flushes,
                 stats_flush_batch: self.stats_flush_batch,
+                stats_swept_epoch: self.stats_swept_epoch,
+                stats_swept_uncovered: self.stats_swept_uncovered,
                 flushing: self.flushing,
                 sweep: self.sweep,
                 census: self.census.clone(),
@@ -2841,6 +2867,11 @@ mod model {
             find(&shards, addr.0).is_some(),
             "a configuration that names no extents retires none of them"
         );
+        assert_eq!(
+            shards[0].sweep_stats()[cls as usize],
+            (0, 0),
+            "a sweep that took nothing counts nothing"
+        );
 
         // A full publication that covers no extent for the address has retired it.
         let retired = |_: u64| true;
@@ -2858,6 +2889,12 @@ mod model {
             shards[0].slabs[0].free.len(),
             free + 1,
             "the slot goes back to the free list, not just the index"
+        );
+        assert_eq!(
+            shards[0].sweep_stats()[cls as usize],
+            (0, 1),
+            "the row is counted against the reason it went, so a configuration that \
+             empties an extent is visible from outside the process"
         );
         assert!(sound(&shards));
     }
@@ -2906,6 +2943,11 @@ mod model {
             "a collected mutable extent keeps nothing"
         );
         assert_eq!(shards[0].slabs[0].free.len(), free + 1);
+        assert_eq!(
+            shards[0].sweep_stats()[cls as usize],
+            (1, 0),
+            "an epoch advance and an extent going away are counted apart"
+        );
         assert!(sound(&shards));
     }
 }
