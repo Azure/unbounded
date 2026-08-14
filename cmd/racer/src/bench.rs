@@ -316,6 +316,7 @@ fn report_racer(a: &Args, target: &str, name: &str, plan: &Plan, job: &Job, c: &
         after.saturating_sub(before),
         Duration::from_secs_f64(r.secs),
         plan,
+        r.ops,
     );
 }
 
@@ -340,6 +341,12 @@ struct FlushMetrics {
     batch: u64,
     parks: u64,
     busy_us: u64,
+    one_shot: u64,
+    prepares: u64,
+    rejected: u64,
+    conflicts: u64,
+    retries: u64,
+    repairs: u64,
 }
 
 impl FlushMetrics {
@@ -350,6 +357,12 @@ impl FlushMetrics {
             batch: self.batch.saturating_sub(old.batch),
             parks: self.parks.saturating_sub(old.parks),
             busy_us: self.busy_us.saturating_sub(old.busy_us),
+            one_shot: self.one_shot.saturating_sub(old.one_shot),
+            prepares: self.prepares.saturating_sub(old.prepares),
+            rejected: self.rejected.saturating_sub(old.rejected),
+            conflicts: self.conflicts.saturating_sub(old.conflicts),
+            retries: self.retries.saturating_sub(old.retries),
+            repairs: self.repairs.saturating_sub(old.repairs),
         }
     }
 
@@ -360,6 +373,12 @@ impl FlushMetrics {
             r#"racer_mblock_flush_batch_total{class="small"}"# => self.batch += value,
             r#"racer_commit_park_total{class="small"}"# => self.parks += value,
             r#"racer_flush_busy_us_total{class="small"}"# => self.busy_us += value,
+            "racer_paxos_one_shot_total" => self.one_shot += value,
+            "racer_paxos_prepare_total" => self.prepares += value,
+            r#"racer_paxos_accept_total{result="rejected"}"# => self.rejected += value,
+            "racer_paxos_guard_conflicts_total" => self.conflicts += value,
+            "racer_paxos_lww_retry_total" => self.retries += value,
+            "racer_paxos_repair_total" => self.repairs += value,
             _ => {}
         }
     }
@@ -385,7 +404,7 @@ fn scrape_cluster(c: &Cluster) -> FlushMetrics {
     total
 }
 
-fn emit_flush_metrics(m: FlushMetrics, elapsed: Duration, plan: &Plan) {
+fn emit_flush_metrics(m: FlushMetrics, elapsed: Duration, plan: &Plan, ops: u64) {
     let batch = if m.flushes == 0 {
         0.0
     } else {
@@ -400,6 +419,24 @@ fn emit_flush_metrics(m: FlushMetrics, elapsed: Duration, plan: &Plan) {
     println!(
         "  # small mblock commits={} flushes={} batch={batch:.2} parks={} flight={flight:.1}%",
         m.commits, m.flushes, m.parks
+    );
+    // Consensus work per user operation. A healthy write is one one-shot accept and
+    // nothing else; anything above that is a round the cluster paid for and threw away.
+    let paxos = m.one_shot + m.prepares + m.rejected + m.conflicts + m.retries + m.repairs;
+    if paxos == 0 {
+        return;
+    }
+    let per = |v: u64| {
+        if ops == 0 { 0.0 } else { v as f64 / ops as f64 }
+    };
+    println!(
+        "  # paxos/op one_shot={:.2} prepares={:.2} rejected={:.2} conflicts={:.2} retries={:.2} repairs={:.2}",
+        per(m.one_shot),
+        per(m.prepares),
+        per(m.rejected),
+        per(m.conflicts),
+        per(m.retries),
+        per(m.repairs),
     );
 }
 
