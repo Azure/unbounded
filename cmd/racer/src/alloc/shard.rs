@@ -1198,6 +1198,12 @@ impl Shard {
             for j in 0..k {
                 let l = li as usize * k + j;
                 let e = sl.entries[l];
+                // An empty row can never be swept, and most rows are empty until a slab
+                // fills: testing here rather than after the lookups is what keeps a sweep
+                // off the config for the whole free part of the slab.
+                if e.addr == 0 {
+                    continue;
+                }
                 // `uncovered` separates the two reasons a row can go, because they mean
                 // very different things: an epoch advance is the control plane asking,
                 // and an address no extent covers is the control plane having stopped
@@ -1217,7 +1223,7 @@ impl Shard {
                     Some((_, epoch, _)) => (epoch != 0, false),
                     None => ((m.rof)(e.addr), true),
                 };
-                if e.addr != 0 && stale {
+                if stale {
                     sl.set(l as u32, Entry::default(), m);
                     sl.index.remove(e.addr);
                     sl.recycle(l as u32);
