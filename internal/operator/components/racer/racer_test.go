@@ -248,6 +248,65 @@ func TestReconcileEnrolsOnlyNodesInRacerSites(t *testing.T) {
 	}
 }
 
+// A cluster-wide node list means a node that has nothing to do with racer can
+// still carry a racer-shaped annotation, whether from a hand edit, a stale
+// label from a previous install, or a typo. Refusing to load any state because
+// of one of those would stop allocation and every sequence on every node.
+func TestLoadNodesIgnoresUnreadableAnnotationsOnForeignNodes(t *testing.T) {
+	ctx := context.Background()
+
+	foreign := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "n2",
+			Labels:      map[string]string{component.SiteLabelKey: "site-b"},
+			Annotations: map[string]string{racerctrl.NodeIDAnnotation: "not-a-number"},
+		},
+	}
+
+	env := testEnv(t, enrolledNode("n1", "east", nil), foreign)
+
+	p, err := loadState(ctx, env, testEnrollment())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	if len(p.nodes) != 1 || p.nodes[0].node.Name != "n1" {
+		t.Fatalf("expected only the enrolled node to load, got %d: %+v", len(p.nodes), p.nodes)
+	}
+}
+
+// The exemption above stops at the nodes racer is actually responsible for:
+// there, a state that cannot be read is not a state to guess at, because the
+// guess decides which nodes hold which replicas.
+func TestLoadNodesFailsOnUnreadableAnnotationsOnItsOwnNodes(t *testing.T) {
+	ctx := context.Background()
+
+	// A node the operator has been on before: unenrolled now, but still
+	// carrying the workload label, so it may still hold data.
+	retiring := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "n3",
+			Labels:      map[string]string{component.SiteLabelKey: "site-b", WorkloadLabel: "true"},
+			Annotations: map[string]string{racerctrl.NodeIDAnnotation: "not-a-number"},
+		},
+	}
+
+	for name, node := range map[string]*corev1.Node{
+		"enrolled": enrolledNode("n1", "east", map[string]string{
+			racerctrl.NodeHealthAnnotation: "generation=nonsense",
+		}),
+		"carrying the workload label": retiring,
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := testEnv(t, node)
+
+			if _, err := loadState(ctx, env, testEnrollment()); err == nil {
+				t.Fatalf("expected a node racer runs on with unreadable annotations to fail the load")
+			}
+		})
+	}
+}
+
 func TestApplyMutatorStampsBothImages(t *testing.T) {
 	obj := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",

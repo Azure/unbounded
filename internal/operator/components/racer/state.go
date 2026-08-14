@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/racerctrl"
@@ -293,16 +294,41 @@ func (p *pass) loadNodes(ctx context.Context) error {
 		return fmt.Errorf("list nodes: %w", err)
 	}
 
+	logger := log.FromContext(ctx)
+
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
+		eligible := p.enroll.admits(node)
+		active := node.Labels[WorkloadLabel] == "true"
 
 		state, err := racerctrl.ParseNodeState(node.Name, node.Annotations)
 		if err != nil {
+			// A node racer runs on, or is selected to run on, is racer's to
+			// read, and carrying on with a guess at its state is how a catalog
+			// drops a replica that still holds the only copy of a page. Those
+			// stay fatal.
+			//
+			// Every other node in the cluster is not racer's at all, and this
+			// is a cluster-wide list: without the exemption below, one
+			// hand-edited annotation on one node that has nothing to do with
+			// racer would fail this load, and with it allocation and every
+			// sequence on every node in every zone.
+			//
+			// The exemption is safe because the workload label is the operator's
+			// own record of having been here: reconcileWorkloadLabels sets it as
+			// soon as a node is enrolled or holds an identity, and leaves it in
+			// place until the node retires. A node carrying neither the label
+			// nor an enrolment has never been allocated anything, whatever its
+			// annotations claim.
+			if !eligible && !active {
+				logger.Error(err, "ignoring unreadable racer annotations on a node racer does not run on",
+					"node", node.Name)
+
+				continue
+			}
+
 			return fmt.Errorf("parse racer annotations on node %s: %w", node.Name, err)
 		}
-
-		eligible := p.enroll.admits(node)
-		active := node.Labels[WorkloadLabel] == "true"
 
 		if !eligible && !active && state.ID == 0 {
 			// Racer does not belong here, has never run here, and never
