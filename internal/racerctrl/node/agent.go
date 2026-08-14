@@ -469,11 +469,21 @@ func (a *Agent) Reconcile(ctx context.Context) error {
 		a.reconcileFabric(cluster)
 	}
 
-	if err := a.render(); err != nil {
-		return err
+	// Status is published even when the render failed, and deliberately so.
+	// The status annotations are the only feedback channel the operator's
+	// sequencing gates read, so a node that stopped writing them is a node
+	// every sequence waits on forever. A render fault is exactly the case
+	// where that matters: whatever the operator did last is what the
+	// derivation is choking on, and the counters are what say so. Publishing
+	// them keeps the fault visible and bounded to this node instead of
+	// stalling the cluster silently.
+	renderErr := a.render()
+
+	if err := a.publishStatus(ctx); err != nil {
+		return errors.Join(renderErr, err)
 	}
 
-	return a.publishStatus(ctx)
+	return renderErr
 }
 
 // devRoot is where the ublk device nodes live. It is a variable so tests can

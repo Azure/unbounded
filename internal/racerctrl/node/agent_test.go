@@ -5,13 +5,17 @@ package node
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	storagelisters "k8s.io/client-go/listers/storage/v1"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	racerconfig "github.com/Azure/unbounded/api/racer"
@@ -92,6 +96,88 @@ func TestForgetHealthKeepsWhatWasInstalled(t *testing.T) {
 
 	if agent.self.Applied.Generation != 4 {
 		t.Fatalf("applied generation %d was withdrawn with the counters", agent.self.Applied.Generation)
+	}
+}
+
+// reconcilingAgent builds an agent that can run a whole reconcile against one
+// Node and nothing else: no storage classes, no volumes, and a membership
+// lister that is already in place so the pass never has to start an informer.
+func reconcilingAgent(t *testing.T, node *corev1.Node) (*Agent, *fake.Clientset) {
+	t.Helper()
+
+	agent, client := announcingAgent(t, node)
+
+	index := func() cache.Indexer {
+		return cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	}
+
+	agent.volumeLister = corelisters.NewPersistentVolumeLister(index())
+	agent.classLister = storagelisters.NewStorageClassLister(index())
+	agent.memberLister = corelisters.NewConfigMapLister(index())
+
+	return agent, client
+}
+
+// halfIdentifiedNode has an id but no zone, which is what a Node looks like
+// between the operator's writes. The derivation refuses it, so it is the
+// cheapest way to put a reconcile through a failing render.
+func halfIdentifiedNode() *corev1.Node {
+	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-a",
+		Annotations: map[string]string{
+			racerctrl.NodeAgentAnnotation:  racerctrl.NodeAgentRunning,
+			racerctrl.NodeIDAnnotation:     "1",
+			racerctrl.NodeCohortAnnotation: "0",
+		},
+	}}
+}
+
+// The status annotations are the only feedback channel the operator's
+// sequencing gates read. A node that stopped writing them because its own
+// config would not render is a node every sequence waits on forever, so the
+// render fault has to be reported without taking the counters down with it.
+func TestReconcilePublishesStatusWhenTheRenderFails(t *testing.T) {
+	agent, client := reconcilingAgent(t, halfIdentifiedNode())
+	agent.self.Health = racerctrl.Health{Generation: 7, Shedding: 2}
+
+	err := agent.Reconcile(context.Background())
+	if err == nil {
+		t.Fatal("reconcile hid a render that could not derive a config")
+	}
+
+	got, getErr := client.CoreV1().Nodes().Get(context.Background(), "node-a", metav1.GetOptions{})
+	if getErr != nil {
+		t.Fatalf("get node: %v", getErr)
+	}
+
+	want := racerctrl.FormatHealth(racerctrl.Health{Generation: 7, Shedding: 2})
+	if got.Annotations[racerctrl.NodeHealthAnnotation] != want {
+		t.Fatalf("annotation %q = %q, want %q; a render fault silenced the feedback channel",
+			racerctrl.NodeHealthAnnotation, got.Annotations[racerctrl.NodeHealthAnnotation], want)
+	}
+}
+
+// Publishing status after a failed render must not swallow the render error:
+// the fault is still this node's, and the reconcile loop only ever sees what is
+// returned.
+func TestReconcileReportsBothFailures(t *testing.T) {
+	agent, client := reconcilingAgent(t, halfIdentifiedNode())
+
+	client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("nodes are read-only today")
+	})
+
+	err := agent.Reconcile(context.Background())
+	if err == nil {
+		t.Fatal("reconcile reported success after both the render and the status write failed")
+	}
+
+	if !strings.Contains(err.Error(), "no zone yet") {
+		t.Fatalf("error %q lost the render fault", err)
+	}
+
+	if !strings.Contains(err.Error(), "read-only today") {
+		t.Fatalf("error %q lost the status write fault", err)
 	}
 }
 
