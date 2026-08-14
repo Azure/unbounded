@@ -7,6 +7,13 @@ description: "Create an AKS cluster with Unbounded and join your first remote no
 This guide creates an AKS cluster configured for Unbounded and joins a
 remote node to it. You'll have a working multi-site cluster in a few minutes.
 
+{{< callout type="tip" >}}
+Prefer a visual workflow? Use the [Architecture Tool](/architecture-tool/) to
+model Sites, GatewayPools, and their relationships, validate the configuration,
+and download ready-to-apply Kubernetes YAML. The designer runs entirely in your
+browser and does not require Azure or a running Unbounded controller.
+{{< /callout >}}
+
 ![Quickstart architecture: AKS cluster with gateway nodes connected to a remote site over WireGuard](../../img/quickstart-architecture.svg)
 
 > Already have a Kubernetes cluster? See the

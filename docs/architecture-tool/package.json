@@ -1,0 +1,28 @@
+{
+  "name": "unbounded-architecture-tool",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run clean && tsc --noEmit -p tsconfig.app.json && vite build",
+    "clean": "find dist -mindepth 1 ! -name .gitignore -delete",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.10.0",
+    "ipaddr.js": "^2.2.0",
+    "jszip": "^3.10.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.16",
+    "vitest": "^4.0.18"
+  }
+}

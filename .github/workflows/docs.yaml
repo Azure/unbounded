@@ -8,6 +8,9 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "api/machina/v1alpha3/**"
+      - "api/net/v1alpha1/**"
+      - "Makefile"
       - ".github/workflows/docs.yaml"
   workflow_dispatch:
 
@@ -30,6 +33,16 @@ jobs:
         with:
           hugo-version: "latest"
           extended: true
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs/architecture-tool/package-lock.json
+
+      - name: Build Architecture Tool
+        run: npm ci --no-audit && npm test && npm run build
+        working-directory: docs/architecture-tool
 
       - name: Build
         run: hugo --minify

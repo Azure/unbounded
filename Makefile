@@ -265,11 +265,12 @@ NET_CRD_DIR                := deploy/net/crd
 NET_FRONTEND_DIR           := frontend
 NET_FRONTEND_DIST_DIR      := internal/net/html/dist
 NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
+DOCS_ARCHITECTURE_TOOL_DIR := docs/architecture-tool
 
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-playpen gomod docs-build docs-architecture-tool docs-architecture-tool-test docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -300,6 +301,10 @@ help: ## Show this help
 	@echo "  gomod                            go mod tidy"
 	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
+	@echo "  docs-build                       Build Architecture Tool and Hugo documentation"
+	@echo "  docs-architecture-tool           Build the client-side Architecture Tool"
+	@echo "  docs-architecture-tool-test      Run Architecture Tool unit tests"
+	@echo "  docs-serve                       Build Architecture Tool and serve Hugo documentation"
 	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
 	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
 	@echo ""
@@ -1445,7 +1450,19 @@ release-manifests: machina-manifests machine-ops-manifests net-manifests gantry-
 
 ##@ Documentation
 
-docs-serve: ## Start a local Hugo dev server with live-reload
+docs-architecture-tool: ## Build the client-side Architecture Tool
+	cd "$(DOCS_ARCHITECTURE_TOOL_DIR)" && npm ci --prefer-offline --no-audit && npm run build
+
+docs-architecture-tool-test: ## Run Architecture Tool unit tests
+	cd "$(DOCS_ARCHITECTURE_TOOL_DIR)" && npm ci --prefer-offline --no-audit && npm test
+
+docs-build: docs-architecture-tool ## Build Architecture Tool and Hugo documentation
+	@command -v hugo >/dev/null 2>&1 || \
+		{ echo "error: hugo not found. Install it from:"; \
+		  echo "  https://gohugo.io/installation/"; exit 1; }
+	cd docs && hugo --minify
+
+docs-serve: docs-architecture-tool ## Build Architecture Tool and start a local Hugo dev server
 	@command -v hugo >/dev/null 2>&1 || \
 		{ echo "error: hugo not found. Install it from:"; \
 		  echo "  https://gohugo.io/installation/"; exit 1; }

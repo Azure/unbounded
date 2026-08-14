@@ -18,20 +18,38 @@ title = "Unbounded"
   description = "Run nodes across multiple cloud providers and bare-metal infrastructure to form a unified Kubernetes cluster, no matter where your infrastructure lives."
   repo = "https://github.com/Azure/unbounded"
 
+[module]
+  [[module.mounts]]
+    source = "content"
+    target = "content"
+  [[module.mounts]]
+    source = "layouts"
+    target = "layouts"
+  [[module.mounts]]
+    source = "static"
+    target = "static"
+  [[module.mounts]]
+    source = "architecture-tool/dist"
+    target = "static/architecture-tool"
+
 [menu]
+  [[menu.main]]
+    name = "Architecture Tool"
+    url = "/architecture-tool/"
+    weight = 1
   [[menu.main]]
     name = "Guides"
     pageRef = "/guides"
-    weight = 1
+    weight = 2
   [[menu.main]]
     name = "Concepts"
     pageRef = "/concepts"
-    weight = 2
+    weight = 3
   [[menu.main]]
     name = "Reference"
     pageRef = "/reference"
-    weight = 3
+    weight = 4
   [[menu.main]]
     name = "GitHub"
     url = "https://github.com/Azure/unbounded"
-    weight = 4
+    weight = 5

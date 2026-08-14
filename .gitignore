@@ -95,6 +95,9 @@ target/
 # Frontend
 /frontend/node_modules/
 /frontend/dist/
+/docs/architecture-tool/node_modules/
+/docs/architecture-tool/dist/*
+!/docs/architecture-tool/dist/.gitignore
 .vite/
 .npm/
 
