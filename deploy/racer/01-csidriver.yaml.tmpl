@@ -1,0 +1,51 @@
+# The racer CSI driver registration.
+#
+# racer's CSI driver has no controller service and there is no
+# external-provisioner sidecar anywhere in this deployment. Provisioning a
+# racer volume means allocating extent ids and an LBA range out of a
+# universe's global address space, which is cluster-scoped state that
+# unbounded-operator already owns; handing that to a second leader-elected
+# process would give the address space two writers. So the operator stamps
+# the allocation onto the PersistentVolume as an annotation, and the node
+# driver's job is only to turn an already-allocated volume into a block
+# device on the node that needs it.
+#
+# That shape is what the CSIDriver object below declares:
+#
+#   attachRequired: false      There is no ControllerPublishVolume. A racer
+#                              volume is not attached to a node; it is
+#                              *composed* on a node, at NodeStageVolume, by
+#                              adding a Device entry to that node's config.
+#                              Leaving this true would make the kubelet wait
+#                              forever for a VolumeAttachment nobody creates.
+#
+#   podInfoOnMount: false      The driver makes no decision that depends on
+#                              which pod is mounting.
+#
+#   fsGroupPolicy: None        Block volumes have no filesystem to chown.
+#
+#   volumeLifecycleModes:      Persistent only. An ephemeral inline racer
+#     [Persistent]             volume would need allocation at mount time,
+#                              which is precisely the thing the operator owns.
+#
+# The default StorageClass is deliberately not here. A StorageClass whose
+# provisioner is racer.unbounded-cloud.io *is* a racer universe, and the
+# operator records the universe id, catalog size, epoch, LBA cursor and
+# per-zone membership in annotations on that object. Server-side applying it
+# from a manifest on every reconcile would strip the annotations the same
+# field manager wrote by patch, so the operator creates the class once, in
+# Go, and then leaves it alone. See ensureDefaultClass in
+# internal/operator/components/racer/allocate.go.
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: racer.unbounded-cloud.io
+  labels:
+    app.kubernetes.io/name: racer
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  fsGroupPolicy: None
+  volumeLifecycleModes:
+    - Persistent

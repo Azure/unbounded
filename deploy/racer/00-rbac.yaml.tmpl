@@ -1,0 +1,115 @@
+# ServiceAccount and RBAC for racer-ctrl, the per-node racer control plane.
+#
+# racer-ctrl is a pure node follower. It never allocates a universe id, an
+# extent id, an LBA range, a node id, a cohort or a zone: unbounded-operator
+# owns every one of those and stamps them onto Nodes, StorageClasses and
+# PersistentVolumes. racer-ctrl reads that state, derives the NodeConfig its
+# racer sidecar consumes, and writes back only what it alone can observe.
+#
+# So the read surface is broad (it must see every peer's published identity
+# and health to derive a catalog) but the write surface is one verb on one
+# resource: patch on nodes, used exclusively to update this node's own
+# racer.unbounded-cloud.io/{store-bytes,devices,fabric,health,live}
+# annotations. Kubernetes cannot scope `patch` to a single object name, so
+# this grant is wider than the code's use of it; the operator, not RBAC, is
+# what keeps a node from claiming another node's identity, because the three
+# identity annotations are operator-written and racer-ctrl's
+# NodeState.StatusAnnotations deliberately omits them.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: racer
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: racer-ctrl
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: racer
+    app.kubernetes.io/component: node
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: racer-ctrl
+  labels:
+    app.kubernetes.io/name: racer
+rules:
+  # Nodes carry both halves of node state: the operator-written identity
+  # (node-id, cohort, zone) this agent reads for itself and for every peer it
+  # must place in a catalog, and the node-written status (store-bytes,
+  # devices, fabric, health, live) it publishes for the operator's sequencer
+  # and for peers' fabric attachment.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  # A StorageClass whose provisioner is racer.unbounded-cloud.io is a racer
+  # universe; its annotations carry the universe id, catalog size, epoch and
+  # each zone's gateways. Read-only: the operator is the single writer.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  # A PersistentVolume bound to such a class is a racer volume; its
+  # composition annotation is the frozen extent allocation this agent turns
+  # into Extent and Device entries. Read-only for the same reason.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  # Events are how a node reports a preflight failure or a rejected config to
+  # an operator who is looking at `kubectl describe node`.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+# A zone's catalog membership is up to a thousand node ids, far past what an
+# annotation may hold once a cluster has more than a handful of zones, so it
+# lives in one ConfigMap per universe per zone in the operator's namespace.
+# This is a namespaced Role rather than part of the ClusterRole above because
+# that is the only namespace the agent ever reads a ConfigMap from, and the
+# informer that does it is additionally selected down to this node's own zone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: racer-ctrl-membership
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: racer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: racer-ctrl-membership
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: racer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: racer-ctrl-membership
+subjects:
+  - kind: ServiceAccount
+    name: racer-ctrl
+    namespace: {{ default "unbounded-system" .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: racer-ctrl
+  labels:
+    app.kubernetes.io/name: racer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: racer-ctrl
+subjects:
+  - kind: ServiceAccount
+    name: racer-ctrl
+    namespace: {{ default "unbounded-system" .Namespace }}
