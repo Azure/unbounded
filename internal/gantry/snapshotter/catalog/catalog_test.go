@@ -254,7 +254,7 @@ func TestSuperblockRoundTrip(t *testing.T) {
 		OpenCursorPages: 7,
 		OpenTotalPages:  4096,
 		SegmentBlocks:   1,
-		WatermarkBlocks: 1,
+		NodeBlocks:      1,
 		TotalBlocks:     4096,
 	}
 
@@ -456,6 +456,33 @@ func TestIndexTombstone(t *testing.T) {
 
 	if _, ok := idx.Blob(digest(1)); !ok {
 		t.Fatal("a stale tombstone retired a newer record")
+	}
+}
+
+// The record log is read in append order by a running node, but not by a node
+// replaying it or catching up out of order. A tombstone that vanished from the
+// index once applied would leave the older blob record behind it with nothing
+// to lose to, and the blob would come back pointing at pages the cleaner may
+// already have trimmed.
+func TestIndexTombstoneSurvivesAnOlderRecordArrivingLate(t *testing.T) {
+	idx := NewIndex()
+
+	idx.Apply(Record{Type: RecordTombstone, Generation: 7, Key: digest(1)})
+	idx.Apply(Record{Type: RecordBlob, Generation: 2, Key: digest(1), Segment: 1, PageCount: 1, ByteLength: 100})
+
+	if _, ok := idx.Blob(digest(1)); ok {
+		t.Fatal("a retired blob came back when its old record was applied after the tombstone")
+	}
+
+	// The other order has to reach the same answer, which is the whole
+	// point of ordering by generation rather than by arrival.
+	replay := NewIndex()
+
+	replay.Apply(Record{Type: RecordBlob, Generation: 2, Key: digest(1), Segment: 1, PageCount: 1, ByteLength: 100})
+	replay.Apply(Record{Type: RecordTombstone, Generation: 7, Key: digest(1)})
+
+	if _, ok := replay.Blob(digest(1)); ok {
+		t.Fatal("a retired blob resolves when the records are read in order")
 	}
 }
 

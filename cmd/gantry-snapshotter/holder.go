@@ -47,7 +47,7 @@ type holder struct {
 	format     bool
 	adopt      bool
 	blocks     uint32
-	watermarks uint32
+	nodeBlocks uint32
 	errnos     []unix.Errno
 	current    atomicStore
 
@@ -284,7 +284,7 @@ func (h *holder) openOrFormat(dev *catalog.Device, desc segment.Catalog) (*catal
 	// fine and needs no coordination: the format is a compare-and-swap on
 	// block zero, so exactly one of them lands and the loser is told it
 	// conflicted and simply opens what the winner wrote.
-	if err := catalog.Format(dev, catalog.FormatOptions{Bytes: desc.Bytes, SegmentBlocks: h.blocks, WatermarkBlocks: h.watermarks}); err != nil {
+	if err := catalog.Format(dev, catalog.FormatOptions{Bytes: desc.Bytes, SegmentBlocks: h.blocks, NodeBlocks: h.nodeBlocks}); err != nil {
 		if !errors.Is(err, catalog.ErrConflict) {
 			return nil, err
 		}

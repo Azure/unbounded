@@ -55,7 +55,7 @@ func writeDevices(t *testing.T, dir string, set *segment.Set) {
 // which on a fresh node is after the daemon is already serving.
 func TestRunReconcileAttachesLate(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 	path := filepath.Join(dir, "image-devices.json")
 
 	watcher := segment.NewWatcher(segment.WatcherOptions{Path: path, Interval: time.Millisecond})
@@ -115,7 +115,7 @@ func TestRunReconcileAttachesLate(t *testing.T) {
 // logged once, not once per tick.
 func TestRunReconcileLogsAFailureOnce(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 	writeDevices(t, dir, set)
 
 	path := filepath.Join(dir, "image-devices.json")
@@ -457,7 +457,7 @@ func TestWatermarkInterval(t *testing.T) {
 // the drain gate between sweeps.
 func TestRunWatermarkRepublishes(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, true, true)
 	defer h.close() //nolint:errcheck // test cleanup

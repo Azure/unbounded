@@ -82,11 +82,15 @@ func (i *Index) Apply(records ...Record) {
 		}
 
 		if r.Type == RecordTombstone {
-			// Retiring is a delete, not a marker: nothing resolves through
-			// a tombstone, and keeping it would only cost memory. The
-			// record itself stays on the device, so a fresh reader reaches
-			// the same conclusion.
-			delete(i.entries, r.Key)
+			// A tombstone is kept as a marker rather than applied as a
+			// delete. Deleting would leave no trace of the retirement,
+			// and the next older record for the same key - a replay, a
+			// reader catching up out of order, or a second pass over
+			// the log - would find no prior entry to lose to and would
+			// resurrect a blob whose pages may already have been
+			// trimmed. Keeping it costs one map entry and makes the
+			// ordering rule above true for every record type.
+			i.entries[r.Key] = entry{generation: r.Generation, kind: r.Type, record: r}
 
 			continue
 		}

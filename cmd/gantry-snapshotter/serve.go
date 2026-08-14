@@ -66,7 +66,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		format:     cfg.FormatCatalog,
 		adopt:      cfg.AdoptSegments,
 		blocks:     cfg.SegmentBlocks,
-		watermarks: cfg.WatermarkBlocks,
+		nodeBlocks: cfg.NodeBlocks,
 		errnos:     errnos,
 		grace:      cfg.WatermarkGrace,
 		node:       catalog.NodeKeyFor(cfg.NodeName),

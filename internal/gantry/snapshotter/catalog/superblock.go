@@ -303,10 +303,10 @@ type Superblock struct {
 	// every record.
 	SegmentBlocks uint32
 
-	// WatermarkBlocks is how many blocks the node watermark table occupies,
-	// immediately after the segment table. Fixed at format time for the same
-	// reason.
-	WatermarkBlocks uint32
+	// NodeBlocks is how many blocks the node table occupies, immediately
+	// after the segment table, one block per node. Fixed at format time for
+	// the same reason.
+	NodeBlocks uint32
 
 	// TotalBlocks is the catalog extent's size in 4 KiB blocks.
 	TotalBlocks uint64
@@ -321,22 +321,20 @@ func (s Superblock) OpenFreePages() uint32 {
 	return s.OpenTotalPages - s.OpenCursorPages
 }
 
-// WatermarkBlockBase is the first block of the node watermark table.
-func (s Superblock) WatermarkBlockBase() uint64 { return 1 + uint64(s.SegmentBlocks) }
+// NodeBlockBase is the first block of the node table.
+func (s Superblock) NodeBlockBase() uint64 { return 1 + uint64(s.SegmentBlocks) }
 
 // RecordBlockBase is the first block holding records.
 func (s Superblock) RecordBlockBase() uint64 {
-	return s.WatermarkBlockBase() + uint64(s.WatermarkBlocks)
+	return s.NodeBlockBase() + uint64(s.NodeBlocks)
 }
 
-// WatermarkCapacity is how many nodes the watermark table can hold.
-func (s Superblock) WatermarkCapacity() int {
-	return int(s.WatermarkBlocks) * WatermarksPerBlock
-}
+// NodeCapacity is how many nodes the node table can hold.
+func (s Superblock) NodeCapacity() int { return int(s.NodeBlocks) }
 
-// WatermarkLocation is the block and slot watermark n occupies.
-func (s Superblock) WatermarkLocation(n int) (block uint64, slot int) {
-	return s.WatermarkBlockBase() + uint64(n/WatermarksPerBlock), n % WatermarksPerBlock
+// NodeBlockAt is the block node n occupies.
+func (s Superblock) NodeBlockAt(n int) uint64 {
+	return s.NodeBlockBase() + uint64(n) //nolint:gosec // bounded by the node capacity
 }
 
 // RecordCapacity is how many records the catalog can hold before it is full.
@@ -364,8 +362,8 @@ func (s Superblock) Validate() error {
 		return fmt.Errorf("%w: superblock reserves no segment table blocks", ErrCorrupt)
 	}
 
-	if s.WatermarkBlocks == 0 {
-		return fmt.Errorf("%w: superblock reserves no watermark table blocks", ErrCorrupt)
+	if s.NodeBlocks == 0 {
+		return fmt.Errorf("%w: superblock reserves no node table blocks", ErrCorrupt)
 	}
 
 	if s.TotalBlocks <= s.RecordBlockBase() {
@@ -405,7 +403,7 @@ func (s Superblock) Validate() error {
 //	  32..36  open segment capacity, in 4 MiB pages
 //	  36..40  segment table blocks
 //	  40..48  total blocks
-//	  48..52  watermark table blocks
+//	  48..52  node table blocks
 //	  52..4092 reserved
 //	4092..4096 CRC32C over bytes 0..4092
 func (s Superblock) MarshalTo(dst []byte) error {
@@ -424,7 +422,7 @@ func (s Superblock) MarshalTo(dst []byte) error {
 	binary.LittleEndian.PutUint32(dst[32:36], s.OpenTotalPages)
 	binary.LittleEndian.PutUint32(dst[36:40], s.SegmentBlocks)
 	binary.LittleEndian.PutUint64(dst[40:48], s.TotalBlocks)
-	binary.LittleEndian.PutUint32(dst[48:52], s.WatermarkBlocks)
+	binary.LittleEndian.PutUint32(dst[48:52], s.NodeBlocks)
 	binary.LittleEndian.PutUint32(dst[BlockBytes-4:], crc32.Checksum(dst[:BlockBytes-4], castagnoli))
 
 	return nil
@@ -453,9 +451,13 @@ func UnmarshalSuperblock(block []byte) (Superblock, error) {
 		return Superblock{}, fmt.Errorf("%w: superblock checksum %08x, want %08x", ErrCorrupt, got, want)
 	}
 
-	if version := binary.LittleEndian.Uint16(block[4:6]); version > Version {
+	switch version := binary.LittleEndian.Uint16(block[4:6]); {
+	case version > Version:
 		return Superblock{}, fmt.Errorf("%w: catalog version %d, this build reads %d",
 			ErrCorrupt, version, Version)
+	case version < MinVersion:
+		return Superblock{}, fmt.Errorf("%w: catalog version %d predates the node table, reformat the volume",
+			ErrCorrupt, version)
 	}
 
 	s := Superblock{
@@ -466,7 +468,7 @@ func UnmarshalSuperblock(block []byte) (Superblock, error) {
 		OpenTotalPages:  binary.LittleEndian.Uint32(block[32:36]),
 		SegmentBlocks:   binary.LittleEndian.Uint32(block[36:40]),
 		TotalBlocks:     binary.LittleEndian.Uint64(block[40:48]),
-		WatermarkBlocks: binary.LittleEndian.Uint32(block[48:52]),
+		NodeBlocks:      binary.LittleEndian.Uint32(block[48:52]),
 	}
 
 	return s, s.Validate()

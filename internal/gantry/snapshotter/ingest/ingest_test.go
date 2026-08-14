@@ -165,9 +165,9 @@ func newStore(t *testing.T, pages uint32) *catalog.Store {
 func newStoreOn(t *testing.T, pages uint32) (*memVolume, *catalog.Store) {
 	t.Helper()
 
-	vol := newMemVolume(64 * catalog.BlockBytes)
+	vol := newMemVolume(256 * catalog.BlockBytes)
 
-	if err := catalog.Format(vol, catalog.FormatOptions{Bytes: 64 * catalog.BlockBytes}); err != nil {
+	if err := catalog.Format(vol, catalog.FormatOptions{Bytes: 256 * catalog.BlockBytes}); err != nil {
 		t.Fatalf("format: %v", err)
 	}
 

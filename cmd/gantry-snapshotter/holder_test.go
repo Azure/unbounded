@@ -31,7 +31,7 @@ func newHolder(t *testing.T, format, adopt bool) *holder {
 		format:     format,
 		adopt:      adopt,
 		blocks:     catalog.DefaultSegmentBlocks,
-		watermarks: catalog.DefaultWatermarkBlocks,
+		nodeBlocks: catalog.DefaultNodeBlocks,
 		grace:      catalog.DefaultWatermarkGrace,
 		node:       catalog.NodeKeyFor("test-node"),
 		open: func(path string) (*catalog.Device, error) {
@@ -179,7 +179,7 @@ func TestReconcileWithoutACatalogDevice(t *testing.T) {
 // formatting the wrong device would erase the cluster's image index.
 func TestReconcileRefusesToFormatByDefault(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, false, true)
 
@@ -195,7 +195,7 @@ func TestReconcileRefusesToFormatByDefault(t *testing.T) {
 
 func TestReconcileFormatsAndAdopts(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4, 6)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4, 6)
 
 	h := newHolder(t, true, true)
 	defer h.close() //nolint:errcheck // test cleanup
@@ -237,7 +237,7 @@ func TestReconcileFormatsAndAdopts(t *testing.T) {
 // device: it runs on every device poll.
 func TestReconcileIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	opens := 0
 	h := newHolder(t, true, true)
@@ -276,7 +276,7 @@ func TestReconcileIsIdempotent(t *testing.T) {
 // cluster's images, it just does not write the segment table.
 func TestReconcileWithoutAdoption(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, true, false)
 	defer h.close() //nolint:errcheck // test cleanup
@@ -305,7 +305,7 @@ func TestReconcileWithoutAdoption(t *testing.T) {
 // populated must find the same segments and leave them alone.
 func TestReconcileAdoptsAnExistingCatalog(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	first := newHolder(t, true, true)
 	if err := first.reconcile(set); err != nil {
@@ -344,7 +344,7 @@ func TestReconcileAdoptsAnExistingCatalog(t *testing.T) {
 // on the next reconcile, without disturbing the segment already open.
 func TestReconcilePicksUpANewSegment(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, true, true)
 	defer h.close() //nolint:errcheck // test cleanup
@@ -353,7 +353,7 @@ func TestReconcilePicksUpANewSegment(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	grown := testSet(t, dir, 64*catalog.BlockBytes, 4, 8)
+	grown := testSet(t, dir, 256*catalog.BlockBytes, 4, 8)
 	if err := h.reconcile(grown); err != nil {
 		t.Fatalf("reconcile grown: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestReconcilePicksUpANewSegment(t *testing.T) {
 // again.
 func TestReconcileReleasesTheDeviceOnARetraction(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	opens := 0
 	h := newHolder(t, true, true)
@@ -441,7 +441,7 @@ func TestReconcileRetractionWithoutAnAttachmentIsQuiet(t *testing.T) {
 
 func TestReconcileReportsAMissingDevice(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes)
+	set := testSet(t, dir, 256*catalog.BlockBytes)
 
 	desc, err := set.CatalogDevice()
 	if err != nil {
@@ -461,7 +461,7 @@ func TestReconcileReportsAMissingDevice(t *testing.T) {
 // Once attached, the read and write sides go through to the store.
 func TestHolderDelegates(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, true, true)
 	defer h.close() //nolint:errcheck // test cleanup
@@ -521,7 +521,7 @@ func TestHolderDelegates(t *testing.T) {
 // from a defer that may follow an explicit close.
 func TestHolderCloseIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, true, true)
 	if err := h.reconcile(set); err != nil {
@@ -541,23 +541,22 @@ func TestHolderCloseIsIdempotent(t *testing.T) {
 	}
 }
 
-// watermarkFor returns this node's entry in the drain-gate table, if it has
-// one.
-func watermarkFor(t *testing.T, store *catalog.Store, node catalog.NodeKey) (catalog.Watermark, bool) {
+// watermarkFor returns this node's entry in the node table, if it has one.
+func watermarkFor(t *testing.T, store *catalog.Store, node catalog.NodeKey) (catalog.Node, bool) {
 	t.Helper()
 
-	marks, err := store.Watermarks()
+	nodes, err := store.Nodes()
 	if err != nil {
-		t.Fatalf("watermarks: %v", err)
+		t.Fatalf("nodes: %v", err)
 	}
 
-	for _, w := range marks {
-		if w.Node == node {
-			return w, true
+	for _, n := range nodes {
+		if n.Key == node {
+			return n, true
 		}
 	}
 
-	return catalog.Watermark{}, false
+	return catalog.Node{}, false
 }
 
 // Attaching a catalog claims this node's slot in the drain gate before the
@@ -565,7 +564,7 @@ func watermarkFor(t *testing.T, store *catalog.Store, node catalog.NodeKey) (cat
 // catalog whose cleaner has not been told to wait for it.
 func TestReconcileClaimsAWatermark(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, true, true)
 	defer h.close() //nolint:errcheck // test cleanup
@@ -599,7 +598,7 @@ func TestReconcileClaimsAWatermark(t *testing.T) {
 // invisible reader is one the cleaner will happily trim pages out from under.
 func TestReconcileWithoutANodeNameRefusesToAttach(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, true, true)
 	h.node = catalog.NodeKey{}
@@ -630,7 +629,7 @@ func TestReconcileWithoutANodeNameRefusesToAttach(t *testing.T) {
 // one entry, but only the sweep may raise the generation.
 func TestWatermarkAndRefresh(t *testing.T) {
 	dir := t.TempDir()
-	set := testSet(t, dir, 64*catalog.BlockBytes, 4)
+	set := testSet(t, dir, 256*catalog.BlockBytes, 4)
 
 	h := newHolder(t, true, true)
 	defer h.close() //nolint:errcheck // test cleanup

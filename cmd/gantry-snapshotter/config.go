@@ -82,8 +82,10 @@ type Config struct {
 	// SegmentBlocks is the segment table size used when formatting.
 	SegmentBlocks uint32
 
-	// WatermarkBlocks is the drain-gate table size used when formatting.
-	WatermarkBlocks uint32
+	// NodeBlocks is the node table size used when formatting. Each node
+	// that attaches claims one block, so this is also the number of nodes
+	// the volume can serve.
+	NodeBlocks uint32
 
 	// WatermarkGrace is how long a node's watermark stands before the
 	// cleaner treats it as belonging to a node that is gone. Too short and
@@ -227,7 +229,7 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	var (
 		mountOptions, socketMode string
 		segmentBlocks            uint64
-		watermarkBlocks          uint64
+		nodeBlocks               uint64
 	)
 
 	fs.StringVar(&c.Socket, "socket", envOr("GANTRY_SNAPSHOTTER_SOCKET", DefaultSocket), "unix socket to serve the snapshotter API on")
@@ -240,7 +242,7 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	fs.BoolVar(&c.FormatCatalog, "format-catalog", envBool("GANTRY_SNAPSHOTTER_FORMAT_CATALOG", false), "format the catalog device when it is blank")
 	fs.StringVar(&c.ConflictErrnos, "conflict-errnos", envOr("GANTRY_SNAPSHOTTER_CONFLICT_ERRNOS", ""), "errnos the catalog device reports for a failed optimistic write")
 	fs.Uint64Var(&segmentBlocks, "segment-blocks", uint64(envInt("GANTRY_SNAPSHOTTER_SEGMENT_BLOCKS", catalog.DefaultSegmentBlocks)), "segment table size in blocks, used only when formatting")
-	fs.Uint64Var(&watermarkBlocks, "watermark-blocks", uint64(envInt("GANTRY_SNAPSHOTTER_WATERMARK_BLOCKS", catalog.DefaultWatermarkBlocks)), "drain-gate table size in blocks, used only when formatting")
+	fs.Uint64Var(&nodeBlocks, "node-blocks", uint64(envInt("GANTRY_SNAPSHOTTER_NODE_BLOCKS", catalog.DefaultNodeBlocks)), "node table size in blocks, one block per node, used only when formatting")
 	fs.DurationVar(&c.WatermarkGrace, "watermark-grace", envDuration("GANTRY_SNAPSHOTTER_WATERMARK_GRACE", catalog.DefaultWatermarkGrace), "how long a node's watermark stands before the cleaner ignores it")
 	fs.BoolVar(&c.Clean, "clean", envBool("GANTRY_SNAPSHOTTER_CLEAN", true), "reclaim mostly-dead segments so their capacity comes back")
 	fs.DurationVar(&c.CleanInterval, "clean-interval", envDuration("GANTRY_SNAPSHOTTER_CLEAN_INTERVAL", clean.DefaultInterval), "how often the cleaner takes one step")
@@ -290,12 +292,12 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 		return nil, fmt.Errorf("segment-blocks %d: want 1..4096", segmentBlocks)
 	}
 
-	if watermarkBlocks < 1 || watermarkBlocks > 4096 {
-		return nil, fmt.Errorf("watermark-blocks %d: want 1..4096", watermarkBlocks)
+	if nodeBlocks < 1 || nodeBlocks > 4096 {
+		return nil, fmt.Errorf("node-blocks %d: want 1..4096", nodeBlocks)
 	}
 
 	c.SegmentBlocks = uint32(segmentBlocks)
-	c.WatermarkBlocks = uint32(watermarkBlocks)
+	c.NodeBlocks = uint32(nodeBlocks)
 	c.SocketMode = os.FileMode(mode)
 	c.MountOptions = splitOptions(mountOptions)
 

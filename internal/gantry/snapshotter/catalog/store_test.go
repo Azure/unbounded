@@ -22,7 +22,7 @@ func noSleep(t *testing.T) {
 	t.Cleanup(func() { sleep = previous })
 }
 
-const testCatalogBytes = 64 * BlockBytes
+const testCatalogBytes = 256 * BlockBytes
 
 // newCatalog formats a catalog and opens one client on it.
 func newCatalog(t *testing.T) (*occDevice, *Store) {
@@ -272,9 +272,9 @@ func TestReserveOutOfPages(t *testing.T) {
 func TestReserveOutOfRecordSlots(t *testing.T) {
 	dev := newOCCDevice()
 
-	// Four blocks: superblock, one segment table block, one watermark table
+	// Four blocks: superblock, one segment table block, one node table
 	// block, one record block.
-	if err := Format(dev.client(), FormatOptions{Bytes: 4 * BlockBytes, WatermarkBlocks: 1}); err != nil {
+	if err := Format(dev.client(), FormatOptions{Bytes: 4 * BlockBytes, NodeBlocks: 1}); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 

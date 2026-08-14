@@ -222,7 +222,7 @@ func TestDeviceCloseIsSafe(t *testing.T) {
 func TestDeviceWithAStoreOnTop(t *testing.T) {
 	noSleep(t)
 
-	path := newDeviceFile(t, 64)
+	path := newDeviceFile(t, 256)
 
 	dev, err := OpenDevice(path, DeviceOptions{Direct: noDirect()})
 	if err != nil {
@@ -230,7 +230,7 @@ func TestDeviceWithAStoreOnTop(t *testing.T) {
 	}
 	defer dev.Close() //nolint:errcheck // test cleanup
 
-	if err := Format(dev, FormatOptions{Bytes: 64 * BlockBytes}); err != nil {
+	if err := Format(dev, FormatOptions{Bytes: 256 * BlockBytes}); err != nil {
 		t.Fatalf("format: %v", err)
 	}
 

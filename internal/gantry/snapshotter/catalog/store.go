@@ -122,20 +122,20 @@ type FormatOptions struct {
 	// is half a terabyte.
 	SegmentBlocks uint32
 
-	// WatermarkBlocks is how many blocks the node watermark table occupies,
+	// NodeBlocks is how many blocks the node table occupies, one per node,
 	// and so how many nodes can hold the cleaner up at once. Also fixed
 	// afterwards.
-	WatermarkBlocks uint32
+	NodeBlocks uint32
 }
 
 // DefaultSegmentBlocks covers 63 segments, which at the default 8 GiB segment
 // is half a terabyte of image capacity.
 const DefaultSegmentBlocks = 1
 
-// DefaultWatermarkBlocks covers 1016 nodes. A node past that cannot claim a
-// slot and so cannot hold a reclaim up, which is why the default is generous:
-// the table is 32 KiB and the alternative is a silent gap in the drain gate.
-const DefaultWatermarkBlocks = 8
+// DefaultNodeBlocks covers 64 nodes, at 4 KiB each. A node past that cannot
+// claim a block, and a node with no block cannot attach the catalog at all, so
+// a cluster larger than the table is refused rather than silently ungated.
+const DefaultNodeBlocks = 64
 
 // Format writes a fresh catalog. It refuses to run against a device that
 // already holds one, because reformatting orphans every blob in every segment
@@ -160,16 +160,16 @@ func Format(vol Volume, opts FormatOptions) error {
 		segmentBlocks = DefaultSegmentBlocks
 	}
 
-	watermarkBlocks := opts.WatermarkBlocks
-	if watermarkBlocks == 0 {
-		watermarkBlocks = DefaultWatermarkBlocks
+	nodeBlocks := opts.NodeBlocks
+	if nodeBlocks == 0 {
+		nodeBlocks = DefaultNodeBlocks
 	}
 
 	sb := Superblock{
-		Generation:      1,
-		SegmentBlocks:   segmentBlocks,
-		WatermarkBlocks: watermarkBlocks,
-		TotalBlocks:     opts.Bytes / BlockBytes,
+		Generation:    1,
+		SegmentBlocks: segmentBlocks,
+		NodeBlocks:    nodeBlocks,
+		TotalBlocks:   opts.Bytes / BlockBytes,
 	}
 
 	if err := sb.Validate(); err != nil {

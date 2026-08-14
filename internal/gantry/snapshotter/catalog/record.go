@@ -67,24 +67,33 @@ const (
 	// SegmentsPerBlock is how many segment table entries fit in a block.
 	SegmentsPerBlock = (BlockBytes - segmentPageHeaderBytes) / SegmentEntryBytes
 
-	// WatermarkEntryBytes is the fixed size of one node watermark entry.
-	WatermarkEntryBytes = 32
+	// NodeHeaderBytes is the header preceding a node block's claim bitmap:
+	// a CRC32C, the format version, the node key, its refresh time, its
+	// watermark generation, and the mark round it is answering.
+	NodeHeaderBytes = 96
 
-	// watermarkPageHeaderBytes mirrors recordPageHeaderBytes for the
-	// watermark table.
-	watermarkPageHeaderBytes = 8
+	// ClaimBytes is how much of a node block is left for the claim bitmap.
+	ClaimBytes = BlockBytes - NodeHeaderBytes
 
-	// WatermarksPerBlock is how many node watermarks fit in a block.
-	WatermarksPerBlock = (BlockBytes - watermarkPageHeaderBytes) / WatermarkEntryBytes
+	// ClaimBits is how many blobs one mark round can ask about. A blob
+	// occupies at least one 4 MiB page, so this covers any segment up to
+	// 125 GiB; a larger one is left unmarked rather than half marked.
+	ClaimBits = ClaimBytes * 8
 
 	// Magic identifies a gantry-snapshotter catalog superblock.
 	Magic = 0x47534E50 // "GSNP"
 
-	// Version is the format version this build reads and writes. A reader
-	// that finds a higher version refuses the catalog rather than guessing,
-	// because a misread record maps a container's root filesystem to the
-	// wrong bytes.
-	Version = 1
+	// Version is the format version this build writes. A reader that finds a
+	// higher version refuses the catalog rather than guessing, because a
+	// misread record maps a container's root filesystem to the wrong bytes.
+	Version = 2
+
+	// MinVersion is the oldest format this build reads. Version 2 gave each
+	// node a whole block instead of a 32 byte slot, which moves the record
+	// area, so an older catalog is reformatted rather than upgraded. There
+	// is nothing to migrate: a catalog with no tombstones has never
+	// reclaimed anything.
+	MinVersion = 2
 
 	// DigestBytes is the length of the digests records key on. Only sha256
 	// is representable; a layer with any other digest algorithm is never
