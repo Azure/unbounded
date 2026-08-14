@@ -138,6 +138,16 @@ type Config struct {
 	// MembersNamespace restricts the pod informer.
 	MembersNamespace string
 
+	// SingleNode declares that this daemon is the only one on the volume.
+	//
+	// It exists so that "no membership view" cannot be a silent default.
+	// The drain gate waits for the nodes the cluster says exist, and with
+	// no view at all the only node it can name is this one; that is the
+	// truth on a development machine and a way to lose data on a cluster,
+	// so it has to be said out loud rather than inferred from an unset
+	// selector.
+	SingleNode bool
+
 	// Kubeconfig is an out-of-cluster kubeconfig for development.
 	Kubeconfig string
 
@@ -242,6 +252,7 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	fs.StringVar(&c.NodeName, "node-name", envOr("GANTRY_NODE_NAME", ""), "this node's name; required, and must be stable across restarts")
 	fs.StringVar(&c.MembersSelector, "members-selector", envOr("GANTRY_SNAPSHOTTER_MEMBERS_SELECTOR", ""), "label selector for peer snapshotter pods; empty disables the cluster view")
 	fs.StringVar(&c.MembersNamespace, "members-namespace", envOr("GANTRY_SNAPSHOTTER_MEMBERS_NAMESPACE", ""), "namespace to restrict the peer pod informer to")
+	fs.BoolVar(&c.SingleNode, "single-node", envBool("GANTRY_SNAPSHOTTER_SINGLE_NODE", false), "this daemon is the only one on the image volume; required to reclaim segments without a membership view")
 	fs.StringVar(&c.Kubeconfig, "kubeconfig", envOr("GANTRY_SNAPSHOTTER_KUBECONFIG", ""), "out-of-cluster kubeconfig for the peer view")
 	fs.StringVar(&c.ZoneLabel, "zone-label", envOr("GANTRY_SNAPSHOTTER_ZONE_LABEL", ""), "node label carrying the topology zone")
 	fs.DurationVar(&c.ElectionStep, "election-step", envDuration("GANTRY_SNAPSHOTTER_ELECTION_STEP", ingest.DefaultStep), "delay added per rendezvous rank before ingesting a layer")
@@ -324,6 +335,10 @@ func (c *Config) validate() error {
 		return errors.New("node-name required: it is this node's identity in the catalog drain gate")
 	case c.WatermarkGrace <= 0:
 		return errors.New("watermark-grace must be positive")
+	case c.Clean && c.MembersSelector == "" && !c.SingleNode:
+		return errors.New("clean requires members-selector, or single-node to declare there are no other nodes")
+	case c.SingleNode && c.MembersSelector != "":
+		return errors.New("single-node and members-selector contradict each other")
 	case c.CleanLowWater < 0 || c.CleanLowWater > 1:
 		return errors.New("clean-low-water must be between 0 and 1")
 	case c.CleanMaxLive < 0 || c.CleanMaxLive > 1:

@@ -559,15 +559,15 @@ func (h *holder) SetSegmentState(id uint32, from, to catalog.SegmentState, repoi
 	return store.SetSegmentState(id, from, to, repoint)
 }
 
-// DrainedPast reports whether every node still holding a watermark has caught
-// up past generation. It is the gate the cleaner waits on before it trims.
-func (h *holder) DrainedPast(generation uint64, grace time.Duration) (bool, catalog.NodeKey, error) {
+// DrainedPast reports whether every node the cluster expects has caught up past
+// generation. It is the gate the cleaner waits on before it trims.
+func (h *holder) DrainedPast(generation uint64, grace time.Duration, expect []catalog.NodeKey) (bool, catalog.NodeKey, error) {
 	store, _ := h.current.load()
 	if store == nil {
 		return false, catalog.NodeKey{}, errNotReady
 	}
 
-	return store.DrainedPast(generation, grace)
+	return store.DrainedPast(generation, grace, expect)
 }
 
 // Repair retires a hole in the catalog's record slots whose writer never came

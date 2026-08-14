@@ -18,6 +18,10 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
 )
 
+// testNode stands in for the one node the cluster expects, which is what the
+// drain gate is asked about.
+var testNode = catalog.NodeKeyFor("test-node")
+
 // segmentPages is small enough that a test device is a few megabytes and large
 // enough that a segment holds more than one blob.
 const segmentPages = 4
@@ -34,6 +38,7 @@ type fakeCatalog struct {
 	generation uint64
 	drained    bool
 	laggard    catalog.NodeKey
+	expect     []catalog.NodeKey
 
 	appended  []catalog.Record
 	abandoned int
@@ -150,7 +155,9 @@ func (c *fakeCatalog) SetSegmentState(id uint32, from, to catalog.SegmentState, 
 	return nil
 }
 
-func (c *fakeCatalog) DrainedPast(uint64, time.Duration) (bool, catalog.NodeKey, error) {
+func (c *fakeCatalog) DrainedPast(_ uint64, _ time.Duration, expect []catalog.NodeKey) (bool, catalog.NodeKey, error) {
+	c.expect = expect
+
 	return c.drained, c.laggard, nil
 }
 
@@ -223,6 +230,7 @@ func newCleaner(t *testing.T, cat *fakeCatalog, dev string, discard Discarder, e
 		Locator:         fakeLocator{device: dev},
 		Discarder:       discard,
 		Elector:         elector,
+		Members:         func() []catalog.NodeKey { return []catalog.NodeKey{testNode} },
 		Open:            func(path string) (ingest.Device, error) { return os.OpenFile(path, os.O_RDWR, 0) },
 		LowWater:        0.5,
 		Grace:           time.Minute,
@@ -516,6 +524,124 @@ func TestDrainWaitsForEveryNode(t *testing.T) {
 	// under a node that can still resolve a blob here is silent corruption.
 	if len(discard.calls) != 0 {
 		t.Fatalf("discarded %d ranges while a node was still behind", len(discard.calls))
+	}
+}
+
+// The gate must be asked about the nodes the cluster expects, not merely about
+// whoever left a watermark behind, so the expected set has to reach the store.
+func TestDrainAsksAboutTheExpectedNodes(t *testing.T) {
+	t.Parallel()
+
+	cat := newFakeCatalog()
+	cat.add(1, catalog.SegmentDraining, segmentPages, 0, 4*segment.PageBytes)
+	cat.entries[1].RepointGeneration = 90
+
+	c := newCleaner(t, cat, testDevice(t), &fakeDiscarder{}, Always{})
+
+	if _, err := c.Once(context.Background()); err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	if len(cat.expect) != 1 || cat.expect[0] != testNode {
+		t.Fatalf("gate was asked about %v, want the expected node set", cat.expect)
+	}
+}
+
+// An empty membership view means the view has not loaded, not that this node is
+// alone: it is always in its own expected set. Trimming on that reading would
+// discard pages under every other node in the cluster.
+func TestDrainHoldsWhenMembershipIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	cat := newFakeCatalog()
+	cat.add(1, catalog.SegmentDraining, segmentPages, 0, 4*segment.PageBytes)
+	cat.entries[1].RepointGeneration = 90
+
+	discard := &fakeDiscarder{}
+
+	c, err := New(Options{
+		Catalog:   cat,
+		Locator:   fakeLocator{device: testDevice(t)},
+		Discarder: discard,
+		Members:   func() []catalog.NodeKey { return nil },
+	})
+	if err != nil {
+		t.Fatalf("new cleaner: %v", err)
+	}
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	if res.Phase != PhaseWaiting || res.Segment != 1 {
+		t.Fatalf("result = %+v, want to be waiting on segment 1", res)
+	}
+
+	if len(discard.calls) != 0 {
+		t.Fatalf("discarded %d ranges with no membership view", len(discard.calls))
+	}
+
+	if len(cat.expect) != 0 {
+		t.Fatal("gate was asked with an empty expected set, which it cannot answer")
+	}
+}
+
+// A cleaner with no way to name the nodes it must wait for cannot be safe, so
+// it is refused at construction rather than left to guess later.
+func TestNewRequiresMembers(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(Options{
+		Catalog:   newFakeCatalog(),
+		Locator:   fakeLocator{device: "/dev/null"},
+		Discarder: &fakeDiscarder{},
+	})
+	if err == nil {
+		t.Fatal("expected a cleaner without a member view to be refused")
+	}
+}
+
+// A stall is the safe state, but a permanent one is a stuck volume, so its age
+// has to be readable rather than inferred from an absence of progress.
+func TestWaitingReportsTheStall(t *testing.T) {
+	t.Parallel()
+
+	cat := newFakeCatalog()
+	cat.add(1, catalog.SegmentDraining, segmentPages, 0, 4*segment.PageBytes)
+	cat.entries[1].RepointGeneration = 90
+	cat.drained = false
+	cat.laggard = catalog.NodeKeyFor("slow-node")
+
+	c := newCleaner(t, cat, testDevice(t), &fakeDiscarder{}, Always{})
+
+	if id, node, waiting := c.Waiting(); id != 0 || !node.IsZero() || waiting != 0 {
+		t.Fatalf("waiting = (%d, %s, %s) before any pass, want nothing", id, node, waiting)
+	}
+
+	if _, err := c.Once(context.Background()); err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	id, node, waiting := c.Waiting()
+	if id != 1 || node != cat.laggard {
+		t.Fatalf("waiting on segment %d for %s, want segment 1 for %s", id, node, cat.laggard)
+	}
+
+	if waiting <= 0 {
+		t.Fatal("a held gate reports no duration, so a permanent stall would be invisible")
+	}
+
+	// Once the node catches up the stall is over, and a gauge that kept
+	// reporting it would keep an alert firing on a healthy cluster.
+	cat.drained = true
+
+	if _, err := c.Once(context.Background()); err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	if id, node, waiting := c.Waiting(); id != 0 || !node.IsZero() || waiting != 0 {
+		t.Fatalf("waiting = (%d, %s, %s) after the gate opened, want nothing", id, node, waiting)
 	}
 }
 

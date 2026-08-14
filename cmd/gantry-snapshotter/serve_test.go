@@ -21,6 +21,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
@@ -520,5 +521,58 @@ func TestRunWatermarkIgnoresADetachedCatalog(t *testing.T) {
 
 	if buf.String() != "" {
 		t.Errorf("a detached catalog logged: %s", buf.String())
+	}
+}
+
+// The drain gate waits for the nodes this reports, so a node missing from it is
+// a node whose mounts can be trimmed away. This node is therefore in the set
+// whatever the cluster's view says, because that view lags exactly when a node
+// has just started and is already mounting layers.
+func TestExpectedNodesAlwaysIncludesSelf(t *testing.T) {
+	t.Parallel()
+
+	self := catalog.NodeKeyFor("node-a")
+
+	keys := expectedNodes("node-a", nil)()
+	if len(keys) != 1 || keys[0] != self {
+		t.Fatalf("expected nodes = %v, want this node alone", keys)
+	}
+
+	// A view that has not loaded yet, or that has lost this node, still
+	// yields this node.
+	keys = expectedNodes("node-a", func() []ifaces.Node { return nil })()
+	if len(keys) != 1 || keys[0] != self {
+		t.Fatalf("expected nodes = %v with an empty view, want this node alone", keys)
+	}
+}
+
+func TestExpectedNodesMergesThePeerView(t *testing.T) {
+	t.Parallel()
+
+	peers := func() []ifaces.Node {
+		return []ifaces.Node{
+			{ID: "node-b"},
+			{ID: "node-a"}, // this node, already in the set
+			{ID: ""},       // a pod that has not been scheduled
+			{ID: "node-c"},
+		}
+	}
+
+	keys := expectedNodes("node-a", peers)()
+
+	want := []catalog.NodeKey{
+		catalog.NodeKeyFor("node-a"),
+		catalog.NodeKeyFor("node-b"),
+		catalog.NodeKeyFor("node-c"),
+	}
+
+	if len(keys) != len(want) {
+		t.Fatalf("expected nodes = %v, want %v", keys, want)
+	}
+
+	for i, key := range want {
+		if keys[i] != key {
+			t.Fatalf("expected node %d = %s, want %s", i, keys[i], key)
+		}
 	}
 }

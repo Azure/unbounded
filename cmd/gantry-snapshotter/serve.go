@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -194,6 +195,8 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("cleaner: %w", err)
 	}
+
+	daemon.trackCleaner(reg, cleaner)
 
 	background("devices", func() { watcher.Run(ctx) })
 	background("reconcile", func() { runReconcile(ctx, cfg, watcher, cat, reconcile, log) })
@@ -633,6 +636,7 @@ func newCleaner(
 		Locator:         blockmap.WatcherLocator{Watcher: watcher},
 		Discarder:       clean.SystemDiscarder{},
 		Elector:         elector,
+		Members:         expectedNodes(cfg.NodeName, peers),
 		Interval:        cfg.CleanInterval,
 		LowWater:        cfg.CleanLowWater,
 		MaxLiveFraction: cfg.CleanMaxLive,
@@ -640,4 +644,40 @@ func newCleaner(
 		Log:             log.With(slog.String("component", "clean")),
 		OnCycle:         onCycle,
 	})
+}
+
+// expectedNodes reports who the drain gate must wait for: the cluster's view of
+// the daemon's members, plus this node.
+//
+// Self is included unconditionally rather than relied upon to appear in the
+// peer view. The view is built from Kubernetes objects that lag, and the window
+// where this node is serving layers but has not yet appeared in its own
+// membership list is exactly the window in which its pages must not be trimmed.
+//
+// With no peer view at all the set is this node alone, which is the truth in
+// single-node mode and is why the configuration insists that mode be declared
+// rather than inferred from a missing selector.
+func expectedNodes(self string, peers func() []ifaces.Node) func() []catalog.NodeKey {
+	return func() []catalog.NodeKey {
+		keys := []catalog.NodeKey{catalog.NodeKeyFor(self)}
+
+		if peers == nil {
+			return keys
+		}
+
+		for _, node := range peers() {
+			if node.ID == "" {
+				continue
+			}
+
+			key := catalog.NodeKeyFor(string(node.ID))
+			if slices.Contains(keys, key) {
+				continue
+			}
+
+			keys = append(keys, key)
+		}
+
+		return keys
+	}
 }

@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
@@ -75,7 +76,7 @@ type Catalog interface {
 	Abandon(res catalog.Reservation) error
 	Account(id uint32, liveDelta, deadDelta int64) error
 	SetSegmentState(id uint32, from, to catalog.SegmentState, repoint uint64) error
-	DrainedPast(generation uint64, grace time.Duration) (bool, catalog.NodeKey, error)
+	DrainedPast(generation uint64, grace time.Duration, expect []catalog.NodeKey) (bool, catalog.NodeKey, error)
 }
 
 // Locator resolves cluster-wide addresses to this node's device.
@@ -139,6 +140,16 @@ type Options struct {
 	// many.
 	Elector Elector
 
+	// Members reports the nodes the cluster expects to be serving this
+	// catalog, including this one. Required, and required to be
+	// conservative: a node it omits is a node the drain gate will not wait
+	// for, and trimming is not undoable.
+	//
+	// It is a function rather than a slice because membership changes while
+	// the daemon runs, and the value that matters is the one at the moment
+	// the gate is asked.
+	Members func() []catalog.NodeKey
+
 	// Open opens the image device. Defaults to ingest.OpenDirect, which is
 	// what the copy needs: the page cache would hold a second copy of every
 	// byte moved and RACER's own cache is already the cache.
@@ -169,6 +180,7 @@ type Cleaner struct {
 	loc      Locator
 	discard  Discarder
 	elector  Elector
+	members  func() []catalog.NodeKey
 	open     ingest.OpenFunc
 	interval time.Duration
 	lowWater float64
@@ -176,6 +188,55 @@ type Cleaner struct {
 	grace    time.Duration
 	log      *slog.Logger
 	onCycle  func(Result)
+
+	// wait records what the drain gate is currently stuck on, so a stall
+	// can be measured rather than inferred from an absence of progress.
+	wait waitState
+}
+
+// waitState is the drain gate's current stall, if any.
+type waitState struct {
+	mu      sync.Mutex
+	segment uint32
+	node    catalog.NodeKey
+	since   time.Time
+}
+
+// note records a stall and reports whether it is a new one, which is what
+// decides between logging it and staying quiet about a condition already
+// reported.
+func (w *waitState) note(segment uint32, node catalog.NodeKey) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.segment == segment && w.node == node && !w.since.IsZero() {
+		return false
+	}
+
+	w.segment, w.node, w.since = segment, node, time.Now()
+
+	return true
+}
+
+// clear forgets a stall that has ended.
+func (w *waitState) clear() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.segment, w.node, w.since = 0, catalog.NodeKey{}, time.Time{}
+}
+
+// Waiting reports how long the drain gate has been held up and by whom. The
+// duration is zero when nothing is waiting.
+func (c *Cleaner) Waiting() (uint32, catalog.NodeKey, time.Duration) {
+	c.wait.mu.Lock()
+	defer c.wait.mu.Unlock()
+
+	if c.wait.since.IsZero() {
+		return 0, catalog.NodeKey{}, 0
+	}
+
+	return c.wait.segment, c.wait.node, time.Since(c.wait.since)
 }
 
 // New builds a Cleaner.
@@ -192,11 +253,16 @@ func New(opts Options) (*Cleaner, error) {
 		return nil, errors.New("clean: discarder required")
 	}
 
+	if opts.Members == nil {
+		return nil, errors.New("clean: members required, the drain gate cannot wait for nodes it cannot name")
+	}
+
 	c := &Cleaner{
 		cat:      opts.Catalog,
 		loc:      opts.Locator,
 		discard:  opts.Discarder,
 		elector:  opts.Elector,
+		members:  opts.Members,
 		open:     opts.Open,
 		interval: opts.Interval,
 		lowWater: opts.LowWater,
@@ -577,24 +643,51 @@ func (c *Cleaner) copy(blob catalog.Blob, dst segment.Address) error {
 //
 // This is the step that cannot be taken early. A trimmed 4 MiB page reads back
 // as zeroes rather than failing, so a node still holding a mount into the
-// segment would not see an error, it would see a corrupt filesystem.
+// segment would not see an error, it would see a corrupt filesystem. The gate
+// is therefore asked against the set of nodes the cluster expects, not against
+// whoever happens to have left a watermark behind: a node that is absent from
+// the table has not proved anything, and the reason it is absent may be that it
+// has only just started and is already mounting layers out of this segment.
 func (c *Cleaner) drain(_ context.Context, entry catalog.SegmentEntry) (Result, error) {
 	if !c.elector.Elected(entry.ID) {
 		return Result{Phase: PhaseIdle}, nil
 	}
 
-	drained, laggard, err := c.cat.DrainedPast(entry.RepointGeneration, c.grace)
+	expect := c.members()
+	if len(expect) == 0 {
+		// Membership is unknown, not empty. This node is always in the
+		// set, so an empty one means the view has not loaded or has
+		// failed, and the gate stays shut until it says otherwise.
+		if c.wait.note(entry.ID, catalog.NodeKey{}) {
+			c.log.Warn("drain gate held: the cluster membership view is empty",
+				slog.Uint64("segment", uint64(entry.ID)))
+		}
+
+		return Result{Phase: PhaseWaiting, Segment: entry.ID}, nil
+	}
+
+	drained, laggard, err := c.cat.DrainedPast(entry.RepointGeneration, c.grace, expect)
 	if err != nil {
 		return Result{Phase: PhaseIdle}, fmt.Errorf("clean: drain gate for segment %d: %w", entry.ID, err)
 	}
 
 	if !drained {
+		if c.wait.note(entry.ID, laggard) {
+			c.log.Info("drain gate held, waiting for a node to catch up",
+				slog.Uint64("segment", uint64(entry.ID)),
+				slog.Uint64("repoint", entry.RepointGeneration),
+				slog.String("node", laggard.String()),
+			)
+		}
+
 		return Result{
 			Phase:   PhaseWaiting,
 			Segment: entry.ID,
 			Waiting: laggard,
 		}, nil
 	}
+
+	c.wait.clear()
 
 	device, offset, length, err := c.loc.SegmentRange(entry.ID)
 	if err != nil {

@@ -142,6 +142,28 @@ func (m *daemonMetrics) trackQueue(reg *metrics.Registry, queue *ingest.Queue) {
 	}, func() float64 { return float64(queue.Pending()) })
 }
 
+// trackCleaner registers the drain gate's stall gauge.
+//
+// It is separate from newDaemonMetrics for the same reason trackQueue is: the
+// cleaner is built with this metric set's cycle observer. The value is a
+// duration rather than a count because a gate that is held is not an error - it
+// is the safe state - and only its age says whether a node has stopped
+// reporting rather than merely lagging.
+func (m *daemonMetrics) trackCleaner(reg *metrics.Registry, cleaner *clean.Cleaner) {
+	if cleaner == nil {
+		return
+	}
+
+	reg.NewGaugeFunc(metricsSubsystem, prometheus.GaugeOpts{
+		Name: "gantry_snapshotter_clean_drain_waiting_seconds",
+		Help: "How long the cleaner has been unable to trim a segment because a node has not caught up. Zero means nothing is waiting.",
+	}, func() float64 {
+		_, _, waiting := cleaner.Waiting()
+
+		return waiting.Seconds()
+	})
+}
+
 // chainObserver runs several ingest observers in order, so logging and
 // counting do not have to be the same function.
 func chainObserver(fns ...func(ingest.Request, ingest.Result, error)) func(ingest.Request, ingest.Result, error) {

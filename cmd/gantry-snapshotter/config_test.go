@@ -19,15 +19,18 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
 )
 
-// named sets the node name every configuration needs, the way the DaemonSet
-// does: through the Downward API rather than a flag.
-func named(t *testing.T) {
+// viable sets what every accepted configuration has to say: the node name, the
+// way the DaemonSet supplies it through the Downward API rather than a flag,
+// and the declaration that this daemon is alone on its volume, which a test
+// without a membership view has to make for the same reason an operator does.
+func viable(t *testing.T) {
 	t.Helper()
 	t.Setenv("GANTRY_NODE_NAME", "test-node")
+	t.Setenv("GANTRY_SNAPSHOTTER_SINGLE_NODE", "true")
 }
 
 func TestParseConfigDefaults(t *testing.T) {
-	named(t)
+	viable(t)
 
 	cfg, err := parseConfig(nil, io.Discard)
 	if err != nil {
@@ -64,7 +67,7 @@ func TestParseConfigDefaults(t *testing.T) {
 }
 
 func TestParseConfigFlags(t *testing.T) {
-	named(t)
+	viable(t)
 
 	cfg, err := parseConfig([]string{
 		"-socket", "/tmp/x.sock",
@@ -109,6 +112,7 @@ func TestParseConfigFlags(t *testing.T) {
 func TestParseConfigEnvironment(t *testing.T) {
 	t.Setenv("GANTRY_SNAPSHOTTER_SOCKET", "/env/sock")
 	t.Setenv("GANTRY_NODE_NAME", "node-7")
+	t.Setenv("GANTRY_SNAPSHOTTER_SINGLE_NODE", "true")
 	t.Setenv("GANTRY_SNAPSHOTTER_INGEST_DEPTH", "12")
 	t.Setenv("GANTRY_SNAPSHOTTER_SKIP_VERIFY", "true")
 	t.Setenv("GANTRY_SNAPSHOTTER_CLEANUP_INTERVAL", "3m")
@@ -128,7 +132,7 @@ func TestParseConfigEnvironment(t *testing.T) {
 }
 
 func TestFlagsBeatTheEnvironment(t *testing.T) {
-	named(t)
+	viable(t)
 
 	t.Setenv("GANTRY_SNAPSHOTTER_SOCKET", "/env/sock")
 
@@ -145,7 +149,7 @@ func TestFlagsBeatTheEnvironment(t *testing.T) {
 // A malformed environment value must not stop the daemon: the value is
 // ignored and the default stands.
 func TestMalformedEnvironmentFallsBack(t *testing.T) {
-	named(t)
+	viable(t)
 
 	t.Setenv("GANTRY_SNAPSHOTTER_INGEST_DEPTH", "lots")
 	t.Setenv("GANTRY_SNAPSHOTTER_SKIP_VERIFY", "perhaps")
@@ -196,6 +200,8 @@ func TestParseConfigRejects(t *testing.T) {
 		{name: "no node name", want: "node-name required", unnamed: true},
 		{name: "empty node name", args: []string{"-node-name", ""}, want: "node-name required"},
 		{name: "members without node", args: []string{"-members-selector", "app=gantry"}, want: "node-name required", unnamed: true},
+		{name: "clean without a member view", args: []string{"-node-name", "n1"}, want: "clean requires members-selector", unnamed: true},
+		{name: "single node with members", args: []string{"-members-selector", "app=gantry"}, want: "contradict"},
 		{name: "watermark grace zero", args: []string{"-watermark-grace", "0"}, want: "watermark-grace"},
 		{name: "watermark grace negative", args: []string{"-watermark-grace", "-1m"}, want: "watermark-grace"},
 		{name: "log level", args: []string{"-log-level", "chatty"}, want: "log-level"},
@@ -204,7 +210,7 @@ func TestParseConfigRejects(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !tc.unnamed {
-				named(t)
+				viable(t)
 			}
 
 			var out strings.Builder

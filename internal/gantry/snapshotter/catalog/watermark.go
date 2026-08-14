@@ -387,14 +387,27 @@ func (s *Store) mergeWatermarkBlock(
 	return fmt.Errorf("catalog: watermark block %d lost %d compare-and-swaps: %w", block, s.retries, lastErr)
 }
 
-// DrainedPast reports whether every node still refreshing its watermark has
-// caught up to generation, and names one that has not when they have not.
+// DrainedPast reports whether every node that should be reading this catalog
+// has caught up to generation, and names one that has not when they have not.
 //
-// This is the gate the cleaner opens before it trims. Nodes that have stopped
-// refreshing are not waited for: they are gone, and a gate that waited for
-// every node that ever existed would never open again after the first one was
-// decommissioned.
-func (s *Store) DrainedPast(generation uint64, grace time.Duration) (bool, NodeKey, error) {
+// This is the gate the cleaner opens before it trims, and it is answered from
+// two directions. The expected set is who the cluster says is out there: a node
+// in it holds the gate whether its watermark is behind, stale, or missing
+// altogether, because none of those are evidence it has stopped resolving
+// blobs into the segment about to be discarded. Entries not in the expected set
+// are nodes the cluster no longer lists; they are waited for while their
+// watermark is fresh, and written off once it goes stale, because a gate that
+// waited for every node that ever existed would never open again after the
+// first decommission.
+//
+// An empty expected set is refused rather than treated as nobody. Trimming is
+// irreversible and a discarded page reads back as zeroes, so the absence of
+// evidence about who is out there must not read as evidence of absence.
+func (s *Store) DrainedPast(generation uint64, grace time.Duration, expect []NodeKey) (bool, NodeKey, error) {
+	if len(expect) == 0 {
+		return false, NodeKey{}, errors.New("catalog: no expected nodes, so nothing can be shown to have drained")
+	}
+
 	marks, err := s.Watermarks()
 	if err != nil {
 		return false, NodeKey{}, err
@@ -402,7 +415,34 @@ func (s *Store) DrainedPast(generation uint64, grace time.Duration) (bool, NodeK
 
 	at := now()
 
+	seen := make(map[NodeKey]Watermark, len(marks))
 	for _, w := range marks {
+		seen[w.Node] = w
+	}
+
+	// Expected nodes first, so the node named as holding the gate is the
+	// one an operator can go and look at.
+	for _, node := range expect {
+		if node.IsZero() {
+			return false, NodeKey{}, errors.New("catalog: expected node set contains a zero key")
+		}
+
+		w, ok := seen[node]
+		if !ok || w.Expired(at, grace) || w.Generation < generation {
+			return false, node, nil
+		}
+	}
+
+	expected := make(map[NodeKey]struct{}, len(expect))
+	for _, node := range expect {
+		expected[node] = struct{}{}
+	}
+
+	for _, w := range marks {
+		if _, ok := expected[w.Node]; ok {
+			continue
+		}
+
 		if w.Expired(at, grace) {
 			continue
 		}

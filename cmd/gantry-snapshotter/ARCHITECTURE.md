@@ -107,3 +107,17 @@ fifth of the grace period, independently of the much slower sweep that raises
 the generation, so a slow sweep reads as a slow node rather than a departed one.
 A node's identity in that table is its `-node-name`, which is why the flag is
 required and has to be stable across restarts.
+
+The gate is asked about a set of nodes rather than about the table's contents,
+because the table can only show who has reported, and the question is who is
+out there. The expected set is the cluster's membership view plus this node,
+always: a node in it holds the gate whether its watermark is behind, stale, or
+absent, since none of those are evidence that it has stopped resolving blobs
+into the victim. Entries not in the expected set are nodes the cluster no
+longer lists, and they are waited for only while their watermark stays fresh,
+so a decommissioned node does not hold reclamation up forever. An empty
+expected set is a view that has not loaded rather than a cluster of nobody, and
+the gate stays shut. Because that set can only ever be as good as the view
+behind it, running the cleaner without `-members-selector` requires
+`-single-node`, which says in the configuration what would otherwise be assumed
+from a missing flag.
