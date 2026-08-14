@@ -792,15 +792,26 @@ jobs:
     # always() so the job still evaluates when smoke-tests is SKIPPED (no
     # smoke scripts at this ref); the explicit result checks enforce the gate.
     #
-    # `inputs.force_publish != true` keeps this job and publish-forced mutually
+    # The force_publish comparisons keep this job and publish-forced mutually
     # exclusive, so a forced run is always recorded by the forced path even if
-    # the gates happened to pass anyway. On the workflow_run trigger there are
-    # no inputs at all, so the expression is '' != true, which is true: the
-    # automatic path always takes this normal gate and can never be forced.
+    # the gates happened to pass anyway.
+    #
+    # Both the boolean and the string are tested on purpose. `inputs` respects
+    # the declared type when dispatched from the UI, but the REST API (and so
+    # `gh workflow run -f force_publish=true`) submits inputs as strings. A
+    # string compared against a boolean casts to a number, so 'true' != true is
+    # TRUE, and a forced run would silently fall through to this job and publish
+    # without recording the bypass. This path is only ever exercised in an
+    # emergency, so it is not somewhere to rely on a coercion subtlety.
+    #
+    # On the workflow_run trigger there are no inputs at all, so both
+    # comparisons are against '', which keeps the automatic path on this normal
+    # gate and means it can never be forced.
     if: >
       always() &&
       github.repository == 'Azure/unbounded' &&
       inputs.force_publish != true &&
+      inputs.force_publish != 'true' &&
       needs.deploy.result == 'success' &&
       needs.deploy-orca.result == 'success' &&
       (needs.smoke-tests.result == 'success' || needs.smoke-tests.result == 'skipped')
@@ -842,10 +853,12 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-forced:
     needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]
+    # Accepts the boolean and the string form for the reason given on the
+    # publish job above: the REST API submits dispatch inputs as strings.
     if: >
       always() &&
       github.repository == 'Azure/unbounded' &&
-      inputs.force_publish == true
+      (inputs.force_publish == true || inputs.force_publish == 'true')
     environment: release-force-publish
     permissions:
       contents: write
