@@ -127,10 +127,9 @@ Initialize a new Unbounded site. This command:
 > not yet rolled out, `site init` warns and proceeds (the operator reconciles the
 > Site once ready).
 
-`machina` is enabled on the cluster Site. `metalman`, `unbounded-storage`, and
-`racer` target the worker nodes of the site being initialized, so
-`--enable-metalman`, `--enable-storage`, and `--enable-racer` are applied to the
-remote Site.
+Global components (`unbounded-net`, `machina`, and `unbounded-storage`) are
+enabled on the cluster Site. `metalman` is per-site and is enabled on the remote
+Site when `--enable-metalman` is set.
 
 #### Required Flags
 
@@ -151,7 +150,6 @@ remote Site.
 | `--enable-machina` | `bool` | `true` | Enable machina in `Site.spec.components` |
 | `--enable-metalman` | `bool` | `false` | Enable metalman in `Site.spec.components` |
 | `--enable-storage` | `bool` | `false` | Enable unbounded-storage in `Site.spec.components` |
-| `--enable-racer` | `bool` | `false` | Enable [racer]({{< relref "guides/racer" >}}) distributed block storage in `Site.spec.components` |
 
 > **Breaking change:** the `--skip-install` and `--install-timeout` flags have
 > been removed. `site init` no longer installs the operator, so there is nothing
@@ -188,7 +186,6 @@ kubectl unbounded site init \
   --pod-cidr 10.201.0.0/24 \
   --enable-metalman \
   --enable-storage \
-  --enable-racer \
   --kubeconfig ~/.kube/config
 ```
 

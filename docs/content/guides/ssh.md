@@ -57,7 +57,6 @@ All five flags above are required. Optional flags:
 | `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
 | `--enable-storage` | Enable the unbounded-storage component in the Site spec |
-| `--enable-racer` | Enable the [racer]({{< relref "guides/racer" >}}) distributed block storage component in the Site spec |
 
 ## Creating Machines
 
