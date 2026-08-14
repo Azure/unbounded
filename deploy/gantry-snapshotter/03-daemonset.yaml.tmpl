@@ -256,9 +256,15 @@ spec:
             - name: dev
               mountPath: /dev
             # Read layer blobs from the content store so a node can
-            # ingest a layer it never unpacked itself.
+            # ingest a layer it never unpacked itself. The directory is
+            # mounted rather than the socket itself: containerd unlinks
+            # and recreates the socket when it restarts, and a bind mount
+            # of the file would still resolve to the deleted inode, so
+            # every later dial would be refused until this pod restarted.
+            # node-config restarts containerd twice during install, so
+            # mounting the file guarantees the agent can never ingest.
             - name: containerd-socket
-              mountPath: /run/containerd/containerd.sock
+              mountPath: /run/containerd
             - name: tmp
               mountPath: /tmp
       volumes:
@@ -280,7 +286,7 @@ spec:
             type: Directory
         - name: containerd-socket
           hostPath:
-            path: /run/containerd/containerd.sock
-            type: Socket
+            path: /run/containerd
+            type: Directory
         - name: tmp
           emptyDir: {}
