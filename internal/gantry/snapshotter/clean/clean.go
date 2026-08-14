@@ -73,7 +73,9 @@ type Catalog interface {
 	Segments() ([]catalog.SegmentEntry, error)
 	BlobsIn(id uint32) []catalog.Blob
 	Generation() uint64
+	Nodes() ([]catalog.Node, error)
 	Reserve(pages uint32, records int) (catalog.Reservation, error)
+	ReserveRecords(records int) (catalog.Reservation, error)
 	Append(res catalog.Reservation, records []catalog.Record) error
 	Abandon(res catalog.Reservation) error
 	Account(id uint32, liveDelta, deadDelta int64) error
@@ -107,6 +109,8 @@ type Phase string
 // The phases a pass can report.
 const (
 	PhaseIdle     Phase = "idle"
+	PhaseMarking  Phase = "marking"
+	PhaseMarked   Phase = "marked"
 	PhaseSelected Phase = "selected"
 	PhaseCopied   Phase = "copied"
 	PhaseWaiting  Phase = "waiting"
@@ -122,8 +126,12 @@ type Result struct {
 	Blobs int
 	Bytes uint64
 
-	// Waiting is the node the drain gate is held up by, when Phase is
-	// PhaseWaiting.
+	// Retired counts the blobs a concluded mark round tombstoned, which is
+	// how much of the segment no node claimed any more.
+	Retired int
+
+	// Waiting is the node the drain gate or a mark round is held up by, when
+	// Phase is PhaseWaiting.
 	Waiting catalog.NodeKey
 }
 
@@ -191,9 +199,14 @@ type Cleaner struct {
 	log      *slog.Logger
 	onCycle  func(Result)
 
-	// wait records what the drain gate is currently stuck on, so a stall
-	// can be measured rather than inferred from an absence of progress.
+	// wait records what the drain gate or a mark round is currently stuck
+	// on, so a stall can be measured rather than inferred from an absence of
+	// progress.
 	wait waitState
+
+	// cool remembers segments whose last mark round retired nothing, so the
+	// next pass looks at a different one.
+	cool coolState
 }
 
 // waitState is the drain gate's current stall, if any.
@@ -375,6 +388,12 @@ func (c *Cleaner) Once(ctx context.Context) (Result, error) {
 		}
 	}
 
+	for _, entry := range entries {
+		if entry.State == catalog.SegmentMarking {
+			return c.report(c.collect(entry))
+		}
+	}
+
 	victim, ok := c.victim(entries)
 	if !ok {
 		return Result{Phase: PhaseIdle}, nil
@@ -384,23 +403,7 @@ func (c *Cleaner) Once(ctx context.Context) (Result, error) {
 		return Result{Phase: PhaseIdle}, nil
 	}
 
-	if err := c.cat.SetSegmentState(victim.ID, catalog.SegmentSealed, catalog.SegmentCleaning, 0); err != nil {
-		if errors.Is(err, catalog.ErrSegmentState) {
-			// Another node picked it in the same window.
-			return Result{Phase: PhaseIdle}, nil
-		}
-
-		return Result{Phase: PhaseIdle}, fmt.Errorf("clean: open segment %d for cleaning: %w", victim.ID, err)
-	}
-
-	c.log.Info("cleaning segment",
-		slog.Uint64("segment", uint64(victim.ID)),
-		slog.Uint64("live_bytes", c.liveBytes(victim.ID)),
-		slog.Uint64("accounted_live_bytes", victim.LiveBytes),
-		slog.Uint64("accounted_dead_bytes", victim.DeadBytes),
-	)
-
-	return c.report(Result{Phase: PhaseSelected, Segment: victim.ID}, nil)
+	return c.report(c.openRound(victim))
 }
 
 func (c *Cleaner) report(res Result, err error) (Result, error) {
@@ -424,6 +427,13 @@ func (c *Cleaner) report(res Result, err error) (Result, error) {
 // resolve there. Choosing a victim from a number that can silently drift means
 // eventually evacuating a segment that is nearly all live, or passing over one
 // that is empty.
+//
+// The pick is not filtered by maxLive, because before a mark round every
+// sealed segment looks entirely live: a blob is retired by the round, not by
+// the node that stopped using it. What the fraction orders here is which
+// segment to ask about first, and maxLive decides afterwards, once the round
+// has said how much of it anybody still wants, whether copying the survivors
+// out is worth the reads.
 func (c *Cleaner) victim(entries []catalog.SegmentEntry) (catalog.SegmentEntry, bool) {
 	var free, total uint64
 
@@ -450,11 +460,16 @@ func (c *Cleaner) victim(entries []catalog.SegmentEntry) (catalog.SegmentEntry, 
 			continue
 		}
 
-		live := c.liveFraction(entry)
-		if live > c.maxLive {
+		// A segment whose last mark round found nothing to retire is
+		// passed over for a while. Asking again immediately would
+		// produce the same answer and starve the segments behind it,
+		// because a round is the only thing a pass does with a sealed
+		// segment.
+		if c.cooling(entry.ID) {
 			continue
 		}
 
+		live := c.liveFraction(entry)
 		if !found || live < bestLive {
 			best, bestLive, found = entry, live, true
 		}

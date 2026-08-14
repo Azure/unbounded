@@ -35,6 +35,14 @@ const (
 	// extent's tombstone epoch. The bump is destructive to every page still
 	// live below the new epoch, which is why the drain exists.
 	SegmentDraining SegmentState = 4
+
+	// SegmentMarking is a sealed segment the cleaner has opened a mark
+	// round on: every node is being asked which of the segment's blobs it
+	// still references, so the ones nobody names can be retired. Nothing
+	// moves and nothing is destroyed while a segment is marking; the state
+	// exists so that the question, and the generation it was asked at, are
+	// visible to every node rather than held in one cleaner's memory.
+	SegmentMarking SegmentState = 5
 )
 
 // String renders a segment state for logs and errors.
@@ -50,6 +58,8 @@ func (s SegmentState) String() string {
 		return "cleaning"
 	case SegmentDraining:
 		return "draining"
+	case SegmentMarking:
+		return "marking"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint32(s))
 	}

@@ -129,6 +129,28 @@ func (m Mark) For(segment uint32, generation uint64) bool {
 	return m.Answered() && m.Segment == segment && m.Generation == generation
 }
 
+// MarkOrdering is the digest of a mark round's blob ordering.
+//
+// The ordering is whatever BlobsIn returns, which is sorted by diff ID and so
+// depends only on the record set, not on the order records were read in. The
+// digest is what makes a claim bitmap safe to interpret: a node whose index
+// disagrees, because it is ahead, behind, or has read a record the cleaner has
+// not, produces a different digest and its answer is refused rather than
+// applied to the wrong blobs.
+func MarkOrdering(blobs []Blob) Digest {
+	sum := sha256.New()
+
+	for _, blob := range blobs {
+		_, _ = sum.Write(blob.DiffID[:])
+	}
+
+	var out Digest
+
+	copy(out[:], sum.Sum(nil))
+
+	return out
+}
+
 // Claims is a claim bitmap, one bit per blob in a mark round's ordering.
 //
 // It is a bitmap rather than a list of digests because the answer has to fit in

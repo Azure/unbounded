@@ -204,6 +204,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	background("ingest", func() { queue.Run(ctx) })
 	background("catalog-sync", func() { runCatalogSync(ctx, cfg, cat, log) })
 	background("watermark", func() { runWatermark(ctx, cfg, cat, log) })
+	background("mark", func() { runMark(ctx, cfg, cat, sn, log) })
 	background("cleanup", func() { runCleanup(ctx, cfg, sn, log) })
 
 	if cleaner != nil {
@@ -503,6 +504,115 @@ func runWatermark(ctx context.Context, cfg *Config, cat *holder, log *slog.Logge
 				slog.Any("err", err))
 		}
 	}
+}
+
+// runMark answers the cleaner's mark rounds.
+//
+// A round asks every node which layers in one sealed segment it still needs,
+// and the cleaner retires the layers nobody claimed. That is the only way a
+// layer's bytes ever become reclaimable: containerd tells this node when it
+// drops a snapshot, but no node can see what the others still want, and the
+// volume is a fixed size. A node that stops answering stalls reclamation
+// rather than losing its layers, which is the safe direction.
+func runMark(ctx context.Context, cfg *Config, cat *holder, sn referencer, log *slog.Logger) {
+	ticker := time.NewTicker(watermarkInterval(cfg.WatermarkGrace))
+	defer ticker.Stop()
+
+	var lastErr string
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		lastErr = warnOnce(log, lastErr, answerMark(ctx, cat, sn), "could not answer a mark round")
+	}
+}
+
+// referencer is the part of the snapshotter a mark round needs: the set of
+// layers this node still holds snapshots for. It is an interface so the answer
+// can be exercised without a metadata store behind it.
+type referencer interface {
+	Referenced(ctx context.Context) (map[catalog.Digest]struct{}, bool, error)
+}
+
+// answerMark publishes this node's claims against an open mark round, if there
+// is one to answer.
+func answerMark(ctx context.Context, cat *holder, sn referencer) error {
+	entries, err := cat.Segments()
+	if err != nil {
+		return err
+	}
+
+	var round catalog.SegmentEntry
+
+	for _, entry := range entries {
+		if entry.State == catalog.SegmentMarking {
+			round = entry
+
+			break
+		}
+	}
+
+	if round.ID == 0 {
+		return nil
+	}
+
+	// Nothing is said until this node has read the log as far as the round was
+	// opened at. Answering from an older index would describe a different set
+	// of blobs, and the ordering digest below would give that away, but not
+	// answering at all is the cheaper way to say "ask me again shortly".
+	if cat.Generation() < round.RepointGeneration {
+		return nil
+	}
+
+	refs, complete, err := sn.Referenced(ctx)
+	if err != nil {
+		return err
+	}
+
+	// An incomplete set is not an answer. Every blob no node claims is
+	// retired, so a short answer retires layers this node is still using.
+	if !complete {
+		return errors.New("this node cannot list every layer it references")
+	}
+
+	blobs := cat.BlobsIn(round.ID)
+	claims := catalog.NewClaims()
+
+	for i, blob := range blobs {
+		if _, ok := refs[blob.DiffID]; ok {
+			claims.Set(i)
+		}
+	}
+
+	return cat.Mark(catalog.Mark{
+		Segment:    round.ID,
+		Generation: round.RepointGeneration,
+		Ordering:   catalog.MarkOrdering(blobs),
+		Claims:     claims,
+	})
+}
+
+// warnOnce logs err at warning level unless it says the same thing it said
+// last time, and returns what it has now said. A detached catalog is never
+// reported: there is nothing to publish to, and reconcile is already logging
+// why.
+func warnOnce(log *slog.Logger, last string, err error, msg string, attrs ...any) string {
+	if err == nil || errors.Is(err, errNotReady) {
+		return ""
+	}
+
+	current := err.Error()
+	if current == last {
+		return last
+	}
+
+	log.Warn(msg, append(attrs, slog.Any("err", err))...)
+
+	return current
 }
 
 // runCleanup sweeps snapshot directories containerd has released and layer

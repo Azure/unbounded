@@ -754,11 +754,46 @@ func (s *Snapshotter) orphanDirectories(ctx context.Context) ([]string, error) {
 	return orphans, nil
 }
 
-// liveMappings returns the set of host mapping names every RACER backed
-// snapshot needs. The second return is false when at least one snapshot's blob
-// could not be located, in which case the set is incomplete.
-func (s *Snapshotter) liveMappings(ctx context.Context) (map[string]struct{}, bool, error) {
-	keep := map[string]struct{}{}
+// Referenced is the set of layers this node's snapshots still name, and is how
+// this node answers a mark round.
+//
+// The second return is false when the set is known to be incomplete, which the
+// caller must treat as no answer at all: a mark round retires every blob no
+// node claimed, so answering with a short set retires layers that are still in
+// use.
+//
+// It reads snapshot metadata rather than the mount table on purpose. A layer
+// this node has a snapshot for but has not mounted yet is still one it will
+// map the moment a container starts, and a set built from what happens to be
+// mounted right now would not include it.
+func (s *Snapshotter) Referenced(ctx context.Context) (map[catalog.Digest]struct{}, bool, error) {
+	var (
+		refs     map[catalog.Digest]struct{}
+		complete bool
+	)
+
+	// A read transaction is enough: a snapshot created after the scan cannot
+	// reference a blob the round is about to retire, because it would have to
+	// resolve it through the catalog first, and a retired blob does not
+	// resolve.
+	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var err error
+
+		refs, complete, err = s.referenced(ctx)
+
+		return err
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	return refs, complete, nil
+}
+
+// referenced walks the snapshot metadata inside a transaction the caller has
+// already opened.
+func (s *Snapshotter) referenced(ctx context.Context) (map[catalog.Digest]struct{}, bool, error) {
+	refs := map[catalog.Digest]struct{}{}
 	complete := true
 
 	err := storage.WalkInfo(ctx, func(_ context.Context, snInfo snapshots.Info) error {
@@ -776,19 +811,37 @@ func (s *Snapshotter) liveMappings(ctx context.Context) (map[string]struct{}, bo
 			return nil
 		}
 
-		blob, found := s.cat.Blob(diffID)
-		if !found {
-			complete = false
-
-			return nil
-		}
-
-		keep[s.maps.Name(diffID, blob)] = struct{}{}
+		refs[diffID] = struct{}{}
 
 		return nil
 	})
 	if err != nil {
 		return nil, false, err
+	}
+
+	return refs, complete, nil
+}
+
+// liveMappings returns the set of host mapping names every RACER backed
+// snapshot needs. The second return is false when at least one snapshot's blob
+// could not be located, in which case the set is incomplete.
+func (s *Snapshotter) liveMappings(ctx context.Context) (map[string]struct{}, bool, error) {
+	refs, complete, err := s.referenced(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	keep := make(map[string]struct{}, len(refs))
+
+	for diffID := range refs {
+		blob, found := s.cat.Blob(diffID)
+		if !found {
+			complete = false
+
+			continue
+		}
+
+		keep[s.maps.Name(diffID, blob)] = struct{}{}
 	}
 
 	return keep, complete, nil

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -39,6 +40,8 @@ type fakeCatalog struct {
 	drained    bool
 	laggard    catalog.NodeKey
 	expect     []catalog.NodeKey
+	nodes      []catalog.Node
+	recordsErr error
 
 	synced  int
 	syncErr error
@@ -144,6 +147,39 @@ func (c *fakeCatalog) BlobsIn(id uint32) []catalog.Blob { return c.blobs[id] }
 
 func (c *fakeCatalog) Generation() uint64 { return c.generation }
 
+func (c *fakeCatalog) Nodes() ([]catalog.Node, error) { return c.nodes, nil }
+
+// answer seeds one node's reply to a mark round: fresh, for the given round,
+// agreeing with the ordering, and claiming the listed positions.
+func (c *fakeCatalog) answer(node catalog.NodeKey, seg uint32, generation uint64, claimed ...int) {
+	mark := catalog.Mark{
+		Segment:    seg,
+		Generation: generation,
+		Ordering:   catalog.MarkOrdering(c.blobs[seg]),
+		Claims:     catalog.NewClaims(),
+	}
+
+	for _, i := range claimed {
+		mark.Claims.Set(i)
+	}
+
+	c.nodes = append(c.nodes, catalog.Node{Key: node, Updated: time.Now(), Mark: mark})
+}
+
+func (c *fakeCatalog) ReserveRecords(records int) (catalog.Reservation, error) {
+	if c.recordsErr != nil {
+		return catalog.Reservation{}, c.recordsErr
+	}
+
+	c.generation++
+
+	return catalog.Reservation{
+		Segment:     c.open,
+		RecordCount: records,
+		Generation:  c.generation,
+	}, nil
+}
+
 func (c *fakeCatalog) Reserve(pages uint32, records int) (catalog.Reservation, error) {
 	if c.open == 0 {
 		return catalog.Reservation{}, catalog.ErrNoOpenSegment
@@ -169,6 +205,19 @@ func (c *fakeCatalog) Reserve(pages uint32, records int) (catalog.Reservation, e
 
 func (c *fakeCatalog) Append(_ catalog.Reservation, records []catalog.Record) error {
 	c.appended = append(c.appended, records...)
+
+	// The real store folds its own records into the index as it writes them,
+	// so a retired blob stops resolving immediately. The cleaner reads what a
+	// segment holds back out of the index, and it does so in the same pass.
+	for _, r := range records {
+		if r.Type != catalog.RecordTombstone {
+			continue
+		}
+
+		for id, blobs := range c.blobs {
+			c.blobs[id] = slices.DeleteFunc(blobs, func(b catalog.Blob) bool { return b.DiffID == r.Key })
+		}
+	}
 
 	return nil
 }
@@ -380,12 +429,12 @@ func TestOnceSelectsTheEmptiestSealedSegment(t *testing.T) {
 		t.Fatalf("once: %v", err)
 	}
 
-	if res.Phase != PhaseSelected || res.Segment != 2 {
-		t.Fatalf("selected %d in phase %s, want segment 2 selected", res.Segment, res.Phase)
+	if res.Phase != PhaseMarking || res.Segment != 2 {
+		t.Fatalf("selected %d in phase %s, want a mark round on segment 2", res.Segment, res.Phase)
 	}
 
-	if state := cat.entries[2].State; state != catalog.SegmentCleaning {
-		t.Fatalf("segment 2 is %s, want cleaning", state)
+	if state := cat.entries[2].State; state != catalog.SegmentMarking {
+		t.Fatalf("segment 2 is %s, want marking", state)
 	}
 }
 
@@ -410,18 +459,20 @@ func TestOnceSelectsByWhatTheIndexResolves(t *testing.T) {
 		t.Fatalf("once: %v", err)
 	}
 
-	if res.Phase != PhaseSelected || res.Segment != 2 {
+	if res.Phase != PhaseMarking || res.Segment != 2 {
 		t.Fatalf("selected %d in phase %s, want segment 2: nothing resolves into it", res.Segment, res.Phase)
 	}
 }
 
-func TestOnceLeavesALiveSegmentAloneDespiteItsAccounting(t *testing.T) {
+func TestOnceLeavesALiveSegmentAloneOnceItsNodesClaimIt(t *testing.T) {
 	t.Parallel()
 
 	cat := newFakeCatalog()
 	// Accounting that was never applied, or a subtraction that was applied
-	// twice, leaves a segment looking empty. Believing it would copy a full
-	// segment out for nothing and then trim the pages a reader still needs.
+	// twice, leaves a segment looking empty. What decides whether it is worth
+	// cleaning is the round: every blob is claimed, so nothing is retired and
+	// the segment goes back to sealed rather than being copied out for
+	// nothing and then trimmed under a reader.
 	cat.add(1, catalog.SegmentSealed, segmentPages, 0, 4*segment.PageBytes)
 	cat.add(2, catalog.SegmentOpen, segmentPages-1, 0, 0)
 
@@ -431,15 +482,30 @@ func TestOnceLeavesALiveSegmentAloneDespiteItsAccounting(t *testing.T) {
 
 	res, err := c.Once(context.Background())
 	if err != nil {
-		t.Fatalf("once: %v", err)
+		t.Fatalf("open the round: %v", err)
 	}
 
-	if res.Phase != PhaseIdle {
-		t.Fatalf("phase = %s, want idle: the index says the segment is full", res.Phase)
+	if res.Phase != PhaseMarking {
+		t.Fatalf("phase = %s, want a mark round", res.Phase)
+	}
+
+	cat.answer(testNode, 1, cat.entries[1].RepointGeneration, 0, 1, 2, 3)
+
+	res, err = c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect the round: %v", err)
+	}
+
+	if res.Phase != PhaseMarked || res.Retired != 0 {
+		t.Fatalf("phase = %s retiring %d, want a round that retired nothing", res.Phase, res.Retired)
 	}
 
 	if state := cat.entries[1].State; state != catalog.SegmentSealed {
 		t.Fatalf("segment 1 is %s, want sealed", state)
+	}
+
+	if len(cat.appended) != 0 {
+		t.Fatalf("appended %d records, want none: every blob was claimed", len(cat.appended))
 	}
 }
 
@@ -511,11 +577,22 @@ func TestOnceLeavesAFullSegmentAlone(t *testing.T) {
 
 	cat := newFakeCatalog()
 	// Under pressure, but every sealed segment is still mostly live. Copying
-	// one out would cost as much space as it recovered.
+	// one out would cost as much space as it recovered, and having just asked
+	// about it there is nothing new to learn by asking again.
 	cat.add(1, catalog.SegmentSealed, segmentPages, 4*segment.PageBytes, 0)
 	cat.add(2, catalog.SegmentOpen, segmentPages-1, 0, 0)
 
 	c := newCleaner(t, cat, testDevice(t), &fakeDiscarder{}, Always{})
+
+	if _, err := c.Once(context.Background()); err != nil {
+		t.Fatalf("open the round: %v", err)
+	}
+
+	cat.answer(testNode, 1, cat.entries[1].RepointGeneration, 0, 1, 2, 3)
+
+	if _, err := c.Once(context.Background()); err != nil {
+		t.Fatalf("collect the round: %v", err)
+	}
 
 	res, err := c.Once(context.Background())
 	if err != nil {
@@ -524,6 +601,320 @@ func TestOnceLeavesAFullSegmentAlone(t *testing.T) {
 
 	if res.Phase != PhaseIdle {
 		t.Fatalf("phase = %s, want idle", res.Phase)
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentSealed {
+		t.Fatalf("segment 1 is %s, want sealed", state)
+	}
+}
+
+// openRound puts a sealed segment into a mark round and returns the generation
+// the round was opened at.
+func openRound(t *testing.T, c *Cleaner, cat *fakeCatalog, id uint32) uint64 {
+	t.Helper()
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("open the round: %v", err)
+	}
+
+	if res.Phase != PhaseMarking || res.Segment != id {
+		t.Fatalf("phase = %s on segment %d, want a mark round on segment %d", res.Phase, res.Segment, id)
+	}
+
+	return cat.entries[id].RepointGeneration
+}
+
+// markCleaner is newCleaner with a say in who the cluster expects.
+func markCleaner(t *testing.T, cat *fakeCatalog, members ...catalog.NodeKey) *Cleaner {
+	t.Helper()
+
+	c, err := New(Options{
+		Catalog:         cat,
+		Locator:         fakeLocator{device: testDevice(t)},
+		Discarder:       &fakeDiscarder{},
+		Elector:         Always{},
+		Members:         func() []catalog.NodeKey { return members },
+		Open:            func(path string) (ingest.Device, error) { return os.OpenFile(path, os.O_RDWR, 0) },
+		LowWater:        0.5,
+		Grace:           time.Minute,
+		OnCycle:         func(Result) {},
+		MaxLiveFraction: 0.5,
+	})
+	if err != nil {
+		t.Fatalf("new cleaner: %v", err)
+	}
+
+	return c
+}
+
+// marking is a catalog under pressure with one sealed segment worth asking
+// about, holding four blobs.
+func marking() *fakeCatalog {
+	cat := newFakeCatalog()
+	cat.add(1, catalog.SegmentSealed, segmentPages, 4*segment.PageBytes, 0)
+	cat.add(2, catalog.SegmentOpen, segmentPages-1, 0, 0)
+
+	return cat
+}
+
+func TestMarkRoundWaitsForANodeThatHasNotAnswered(t *testing.T) {
+	t.Parallel()
+
+	cat := marking()
+	c := markCleaner(t, cat, testNode)
+
+	openRound(t, c, cat, 1)
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if res.Phase != PhaseWaiting || res.Waiting != testNode {
+		t.Fatalf("phase = %s waiting on %s, want to be held up by %s", res.Phase, res.Waiting, testNode)
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentMarking {
+		t.Fatalf("segment 1 is %s, want it still marking", state)
+	}
+
+	if len(cat.appended) != 0 {
+		t.Fatalf("appended %d records, want none: nobody has answered yet", len(cat.appended))
+	}
+}
+
+func TestMarkRoundWaitsForAStaleAnswer(t *testing.T) {
+	t.Parallel()
+
+	cat := marking()
+	c := markCleaner(t, cat, testNode)
+
+	generation := openRound(t, c, cat, 1)
+
+	// The node answered and then stopped refreshing. An answer nobody is
+	// standing behind says nothing about what that node still has mounted.
+	cat.answer(testNode, 1, generation, 0)
+	cat.nodes[0].Updated = time.Now().Add(-2 * time.Minute)
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if res.Phase != PhaseWaiting || res.Waiting != testNode {
+		t.Fatalf("phase = %s waiting on %s, want to be held up by %s", res.Phase, res.Waiting, testNode)
+	}
+}
+
+func TestMarkRoundIgnoresAnAnswerToAnotherRound(t *testing.T) {
+	t.Parallel()
+
+	cat := marking()
+	c := markCleaner(t, cat, testNode)
+
+	generation := openRound(t, c, cat, 1)
+
+	// An answer left over from an earlier round. Its claims describe the
+	// segment as it was then, which is not the question being asked.
+	cat.answer(testNode, 1, generation-1, 0, 1, 2, 3)
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if res.Phase != PhaseWaiting || res.Waiting != testNode {
+		t.Fatalf("phase = %s waiting on %s, want to be held up by %s", res.Phase, res.Waiting, testNode)
+	}
+
+	if len(cat.appended) != 0 {
+		t.Fatalf("appended %d records, want none", len(cat.appended))
+	}
+}
+
+func TestMarkRoundHoldsForAFreshStranger(t *testing.T) {
+	t.Parallel()
+
+	stranger := catalog.NodeKeyFor("not-in-the-member-view")
+
+	cat := marking()
+	c := markCleaner(t, cat, testNode)
+
+	generation := openRound(t, c, cat, 1)
+	cat.answer(testNode, 1, generation, 0)
+	// A node the member view does not list but which is plainly still
+	// running. It gets waited for until its own entry goes stale.
+	cat.nodes = append(cat.nodes, catalog.Node{Key: stranger, Updated: time.Now()})
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if res.Phase != PhaseWaiting || res.Waiting != stranger {
+		t.Fatalf("phase = %s waiting on %s, want to be held up by the stranger", res.Phase, res.Waiting)
+	}
+}
+
+func TestMarkRoundAbandonsWhenANodeSeesADifferentSegment(t *testing.T) {
+	t.Parallel()
+
+	cat := marking()
+	c := markCleaner(t, cat, testNode)
+
+	generation := openRound(t, c, cat, 1)
+	cat.answer(testNode, 1, generation, 0)
+	// The claims are positions in an ordering. A node that computed a
+	// different one is claiming blobs the cleaner cannot name, so the round
+	// is worthless rather than merely incomplete.
+	cat.nodes[0].Mark.Ordering[0] ^= 0xff
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if res.Phase != PhaseIdle {
+		t.Fatalf("phase = %s, want the round abandoned", res.Phase)
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentSealed {
+		t.Fatalf("segment 1 is %s, want sealed", state)
+	}
+
+	if len(cat.appended) != 0 {
+		t.Fatalf("appended %d records, want none: the answers could not be read", len(cat.appended))
+	}
+}
+
+func TestMarkRoundRetiresWhatNobodyClaims(t *testing.T) {
+	t.Parallel()
+
+	cat := marking()
+	c := markCleaner(t, cat, testNode)
+
+	generation := openRound(t, c, cat, 1)
+	cat.answer(testNode, 1, generation, 0)
+
+	blobs := slices.Clone(cat.blobs[1])
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if res.Phase != PhaseMarked || res.Retired != 3 {
+		t.Fatalf("phase = %s retiring %d, want three blobs retired", res.Phase, res.Retired)
+	}
+
+	if len(cat.appended) != 3 {
+		t.Fatalf("appended %d records, want three tombstones", len(cat.appended))
+	}
+
+	for i, r := range cat.appended {
+		if r.Type != catalog.RecordTombstone {
+			t.Fatalf("record %d is type %d, want a tombstone", i, r.Type)
+		}
+
+		if want := blobs[i+1].DiffID; r.Key != want {
+			t.Fatalf("record %d retires %s, want %s", i, r.Key, want)
+		}
+	}
+
+	want := account{segment: 1, live: -3 * segment.PageBytes, dead: 3 * segment.PageBytes}
+	if len(cat.accounts) != 1 || cat.accounts[0] != want {
+		t.Fatalf("accounted %v, want %v", cat.accounts, want)
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentCleaning {
+		t.Fatalf("segment 1 is %s, want cleaning: only a quarter of it is still claimed", state)
+	}
+}
+
+func TestMarkRoundKeepsWhatAnyNodeClaims(t *testing.T) {
+	t.Parallel()
+
+	other := catalog.NodeKeyFor("other-node")
+
+	cat := marking()
+	c := markCleaner(t, cat, testNode, other)
+
+	generation := openRound(t, c, cat, 1)
+	// Neither node knows what the other has. Only the union is safe to
+	// retire against.
+	cat.answer(testNode, 1, generation, 0)
+	cat.answer(other, 1, generation, 3)
+
+	blobs := slices.Clone(cat.blobs[1])
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if res.Phase != PhaseMarked || res.Retired != 2 {
+		t.Fatalf("phase = %s retiring %d, want the two blobs neither node claimed", res.Phase, res.Retired)
+	}
+
+	for i, r := range cat.appended {
+		if want := blobs[i+1].DiffID; r.Key != want {
+			t.Fatalf("record %d retires %s, want %s", i, r.Key, want)
+		}
+	}
+}
+
+func TestMarkRoundReportsNothingRetiredWhenItCannotWrite(t *testing.T) {
+	t.Parallel()
+
+	cat := marking()
+	cat.recordsErr = catalog.ErrFull
+
+	c := markCleaner(t, cat, testNode)
+
+	generation := openRound(t, c, cat, 1)
+	cat.answer(testNode, 1, generation)
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if res.Phase != PhaseMarked || res.Retired != 0 {
+		t.Fatalf("phase = %s retiring %d, want a round that retired nothing", res.Phase, res.Retired)
+	}
+
+	if len(cat.appended) != 0 {
+		t.Fatalf("appended %d records, want none: the log is full", len(cat.appended))
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentSealed {
+		t.Fatalf("segment 1 is %s, want sealed: nothing was retired, so nothing changed", state)
+	}
+}
+
+func TestMarkRoundRefusesASegmentItCannotAskAbout(t *testing.T) {
+	t.Parallel()
+
+	cat := marking()
+	// One bit per blob, and a segment holding more blobs than the answer can
+	// carry cannot be marked at all. Asking anyway would read the missing
+	// bits as unclaimed and retire layers that are still in use.
+	cat.blobs[1] = pageBlobs(1, catalog.ClaimBits+1)
+
+	c := markCleaner(t, cat, testNode)
+
+	res, err := c.Once(context.Background())
+	if err != nil {
+		t.Fatalf("once: %v", err)
+	}
+
+	if res.Phase != PhaseIdle {
+		t.Fatalf("phase = %s, want idle", res.Phase)
+	}
+
+	if state := cat.entries[1].State; state != catalog.SegmentSealed {
+		t.Fatalf("segment 1 is %s, want it left sealed", state)
 	}
 }
 

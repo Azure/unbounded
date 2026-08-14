@@ -576,3 +576,196 @@ func TestExpectedNodesMergesThePeerView(t *testing.T) {
 		}
 	}
 }
+
+// fakeRefs answers a mark round with a fixed set of layers.
+type fakeRefs struct {
+	refs     map[catalog.Digest]struct{}
+	complete bool
+	err      error
+}
+
+func (f fakeRefs) Referenced(context.Context) (map[catalog.Digest]struct{}, bool, error) {
+	return f.refs, f.complete, f.err
+}
+
+// refsFor builds a reference set naming the given blobs.
+func refsFor(blobs ...catalog.Blob) fakeRefs {
+	refs := make(map[catalog.Digest]struct{}, len(blobs))
+	for _, blob := range blobs {
+		refs[blob.DiffID] = struct{}{}
+	}
+
+	return fakeRefs{refs: refs, complete: true}
+}
+
+// markingCatalog attaches a holder to a catalog whose segment 1 is sealed with
+// two blobs in it, and opens a mark round on it at the given generation. A
+// generation of 0 means the current one, which is what a real cleaner uses.
+func markingCatalog(t *testing.T, mark uint64) (*holder, *catalog.Store, []catalog.Blob) {
+	t.Helper()
+
+	h := newHolder(t, true, true)
+	t.Cleanup(func() { _ = h.close() }) //nolint:errcheck // test cleanup
+
+	if err := h.reconcile(testSet(t, t.TempDir(), 256*catalog.BlockBytes, 4, 4)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	store, _ := h.current.load()
+
+	for i := range 2 {
+		res, err := store.Reserve(1, 1)
+		if err != nil {
+			t.Fatalf("reserve: %v", err)
+		}
+
+		var key catalog.Digest
+
+		key[0] = byte(i + 1)
+
+		record := catalog.Record{
+			Type:       catalog.RecordBlob,
+			Segment:    res.Segment,
+			PageOffset: res.PageOffset,
+			PageCount:  1,
+			ByteLength: segment.PageBytes,
+			Generation: res.Generation,
+			Key:        key,
+			Ref:        key,
+		}
+
+		if err := store.Append(res, []catalog.Record{record}); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	// Rolling to the next segment seals this one, which is the only state a
+	// mark round can be opened from.
+	if err := store.SetOpenSegment(2); err != nil {
+		t.Fatalf("roll: %v", err)
+	}
+
+	if mark == 0 {
+		mark = store.Generation()
+	}
+
+	if err := store.SetSegmentState(1, catalog.SegmentSealed, catalog.SegmentMarking, mark); err != nil {
+		t.Fatalf("open a mark round: %v", err)
+	}
+
+	return h, store, store.BlobsIn(1)
+}
+
+// answerOf returns this node's published mark.
+func answerOf(t *testing.T, h *holder, store *catalog.Store) catalog.Mark {
+	t.Helper()
+
+	nodes, err := store.Nodes()
+	if err != nil {
+		t.Fatalf("read the node table: %v", err)
+	}
+
+	for _, node := range nodes {
+		if node.Key == h.node {
+			return node.Mark
+		}
+	}
+
+	t.Fatal("this node has no block")
+
+	return catalog.Mark{}
+}
+
+func TestAnswerMarkPublishesWhatThisNodeReferences(t *testing.T) {
+	h, store, blobs := markingCatalog(t, 0)
+
+	if err := answerMark(t.Context(), h, refsFor(blobs[0])); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+
+	round := store.BlobsIn(1)
+	answer := answerOf(t, h, store)
+
+	if !answer.For(1, storeRound(t, store)) {
+		t.Fatalf("answer is for segment %d generation %d", answer.Segment, answer.Generation)
+	}
+
+	if answer.Ordering != catalog.MarkOrdering(round) {
+		t.Fatal("the answer does not describe the segment this node sees")
+	}
+
+	if !answer.Claims.Has(0) {
+		t.Fatal("the layer this node references was not claimed")
+	}
+
+	if answer.Claims.Has(1) {
+		t.Fatal("a layer this node does not reference was claimed")
+	}
+}
+
+// storeRound is the generation the open mark round was asked at.
+func storeRound(t *testing.T, store *catalog.Store) uint64 {
+	t.Helper()
+
+	entries, err := store.Segments()
+	if err != nil {
+		t.Fatalf("read segments: %v", err)
+	}
+
+	for _, entry := range entries {
+		if entry.State == catalog.SegmentMarking {
+			return entry.RepointGeneration
+		}
+	}
+
+	t.Fatal("no mark round is open")
+
+	return 0
+}
+
+func TestAnswerMarkSaysNothingWithoutARound(t *testing.T) {
+	h := newHolder(t, true, true)
+	defer h.close() //nolint:errcheck // test cleanup
+
+	if err := h.reconcile(testSet(t, t.TempDir(), 256*catalog.BlockBytes, 4)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	store, _ := h.current.load()
+
+	if err := answerMark(t.Context(), h, refsFor()); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+
+	if answerOf(t, h, store).Answered() {
+		t.Fatal("this node answered a round that was never opened")
+	}
+}
+
+func TestAnswerMarkWaitsUntilItHasReadTheRound(t *testing.T) {
+	h, store, blobs := markingCatalog(t, 1<<40)
+
+	if err := answerMark(t.Context(), h, refsFor(blobs...)); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+
+	if answerOf(t, h, store).Answered() {
+		t.Fatal("this node answered from an index older than the round")
+	}
+}
+
+func TestAnswerMarkRefusesAnIncompleteReferenceSet(t *testing.T) {
+	h, store, blobs := markingCatalog(t, 0)
+
+	short := refsFor(blobs...)
+	short.complete = false
+
+	err := answerMark(t.Context(), h, short)
+	if err == nil || !strings.Contains(err.Error(), "every layer") {
+		t.Fatalf("err = %v, want a refusal to answer", err)
+	}
+
+	if answerOf(t, h, store).Answered() {
+		t.Fatal("this node answered with a set it could not complete")
+	}
+}

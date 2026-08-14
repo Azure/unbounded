@@ -527,6 +527,33 @@ func (h *holder) setWatermark(generation uint64) error {
 	return store.SetWatermark(h.node, generation, h.grace)
 }
 
+// Mark publishes this node's answer to a mark round: which of a segment's
+// blobs it still needs. A node that never answers holds the round rather than
+// losing its claims, so this is not best effort.
+func (h *holder) Mark(mark catalog.Mark) error {
+	if h.node.IsZero() {
+		return errors.New("no node name: this node cannot answer a mark round")
+	}
+
+	store, _ := h.current.load()
+	if store == nil {
+		return errNotReady
+	}
+
+	return store.SetMark(h.node, mark, h.grace)
+}
+
+// Nodes reports the whole node table, which is what the cleaner reads to see
+// who has answered a mark round and who it is still waiting for.
+func (h *holder) Nodes() ([]catalog.Node, error) {
+	store, _ := h.current.load()
+	if store == nil {
+		return nil, errNotReady
+	}
+
+	return store.Nodes()
+}
+
 // Segments reports the catalog's segment table.
 func (h *holder) Segments() ([]catalog.SegmentEntry, error) {
 	store, _ := h.current.load()
