@@ -17,6 +17,7 @@ unbounded-kube is organized into several directories:
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
   - `agent` - sources for the unbounded-agent.
   - `gantry` - sources for the gantry peer-to-peer OCI distribution agent.
+  - `gantry-snapshotter` - sources for the gantry containerd snapshotter: a proxy snapshotter that serves image layers from RACER-backed block extents. Read `cmd/gantry-snapshotter/ARCHITECTURE.md` before making changes.
   - `inventory` - sources for the inventory controller.
   - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
   - `machina` - sources for the machina controller.
@@ -43,7 +44,7 @@ unbounded-kube is organized into several directories:
 - `e2e/` - end-to-end integration test suites.
   - `gantry/` - kind-based e2e tests for gantry (guarded by `//go:build e2e`).
 - `internal/` - where shared but internal to this project packages are located.
-  - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
+  - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface. `internal/gantry/snapshotter/` holds the snapshotter's shared packages (catalog, blockmap, ingest, segment, clean, nodeconfig).
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
@@ -57,6 +58,7 @@ unbounded-kube is organized into several directories:
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - To build `gantry` use `make gantry` which runs tests and builds the binary.
 - To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
+- To build `gantry-snapshotter` use `make gantry-snapshotter`; use `make gantry-snapshotter-build` to skip lint/test (used in Containerfiles).
 - To test `racer`, install `liburing-dev` and `protobuf-compiler`, then run `cargo test --locked --all-targets` and `cargo test --locked --all-targets --features sim` from `cmd/racer/`.
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
