@@ -194,11 +194,11 @@ func TestMigrationCompleteBlocksWithNothingInFlight(t *testing.T) {
 // nodes of its zone.
 func collecting() (VolumeState, []NodeState) {
 	volume := VolumeState{
-		Name:           "pv-a",
-		Composition:    Composition{{ExtentID: 7, Pages: 64}},
-		Zone:           1,
-		Phase:          PhaseCollecting,
-		TombstoneEpoch: 5,
+		Name:            "pv-a",
+		Composition:     Composition{{ExtentID: 7, Pages: 64}},
+		Zone:            1,
+		Phase:           PhaseCollecting,
+		TombstoneEpochs: map[uint32]uint32{7: 5},
 	}
 
 	var nodes []NodeState

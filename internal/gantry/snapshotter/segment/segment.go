@@ -4,11 +4,17 @@
 // Package segment resolves the RACER image volume's segments to local block
 // devices and converts blob addresses into byte offsets on those devices.
 //
-// The image volume is a set of IMMUTABLE_4M extents, one per segment, each
-// exported as its own RACER device. A device's extent list is frozen for the
-// device's life, so giving every segment its own device means growing image
-// capacity only ever adds a device and never republishes an existing one. No
-// node has to re-point a live dm table when the cluster grows.
+// The image volume is one RACER volume exported as one device on every node:
+// an OCC catalog extent at offset zero, then a run of IMMUTABLE_4M extents
+// concatenated after it. A segment is one of those extents, and it stays the
+// unit of reclamation because RACER's only reclaim primitive, an extent's
+// tombstone epoch, is per extent. What the snapshotter sees is one flat byte
+// range, so a segment is addressed here by an offset into it rather than by a
+// device of its own.
+//
+// Capacity is therefore fixed when the volume is created: a device's extent
+// list is frozen for the device's life, so nothing can be appended later. The
+// cleaner is what takes the place of growth.
 //
 // racer-ctrl publishes the mapping as a small JSON file (by default
 // /run/racer/image-devices.json) that this package reads and watches. The
@@ -48,29 +54,35 @@ var ErrUnknownSegment = errors.New("segment not exported by this node")
 // image volume is not yet usable on this node.
 var ErrNoCatalog = errors.New("no catalog device")
 
-// Segment is one IMMUTABLE_4M extent exported as its own RACER device.
+// Segment is one IMMUTABLE_4M extent of the image volume.
 type Segment struct {
-	// ID is the segment's cluster-wide identifier. It is stable across the
-	// segment's life and is what catalog records address.
+	// ID is the segment's cluster-wide identifier, which is the RACER extent
+	// id. It is stable for the segment's life and is what catalog records
+	// address. The device offset cannot serve that purpose, because the same
+	// segment may sit at a different offset on a volume built differently.
 	ID uint32 `json:"id"`
 
-	// Device is the local block device path, /dev/ublkb<minor>. The minor is
-	// node-local and may differ between nodes for the same segment, which is
-	// exactly why records address segments by ID and not by path.
-	Device string `json:"device"`
+	// Offset is where the segment starts in the image device, in bytes. It
+	// is a multiple of PageBytes and is the same on every node, because the
+	// composition that produced it is stamped once and frozen.
+	Offset uint64 `json:"offset"`
 
 	// Bytes is the segment's capacity. Always a multiple of PageBytes.
 	Bytes uint64 `json:"bytes"`
+
+	// Epoch is the extent's tombstone epoch. It advances only when the
+	// control plane has collected the extent, so a segment whose published
+	// epoch is past the one the catalog recorded is one whose pages are gone
+	// and whose space is free to reuse. It is the only signal that a reclaim
+	// finished, because RACER reports nothing else about it.
+	Epoch uint32 `json:"epoch"`
 }
 
 // Pages is the segment's capacity in 4 MiB pages.
 func (s Segment) Pages() uint64 { return s.Bytes / PageBytes }
 
-// Catalog names the device holding the image volume's OCC catalog extent.
-type Catalog struct {
-	Device string `json:"device"`
-	Bytes  uint64 `json:"bytes"`
-}
+// End is the first byte of the device past the segment.
+func (s Segment) End() uint64 { return s.Offset + s.Bytes }
 
 // Set is the whole published mapping.
 type Set struct {
@@ -83,7 +95,15 @@ type Set struct {
 	// diagnostics; nothing on the read path needs it.
 	Universe uint32 `json:"universe"`
 
-	Catalog  Catalog   `json:"catalog"`
+	// Device is the local block device path, /dev/ublkb<minor>, carrying the
+	// whole image volume. The minor is node-local and may differ between
+	// nodes, which is why nothing persisted ever names it.
+	Device string `json:"device"`
+
+	// CatalogBytes is the size of the OCC catalog extent, which is always at
+	// offset zero because it is the volume's mutable head.
+	CatalogBytes uint64 `json:"catalogBytes"`
+
 	Segments []Segment `json:"segments"`
 
 	byID map[uint32]Segment
@@ -105,24 +125,31 @@ func (a Address) Span() uint64 { return uint64(a.PageCount) * PageBytes }
 // ByteOffset is the address's start in bytes from the beginning of its segment.
 func (a Address) ByteOffset() uint64 { return uint64(a.PageOffset) * PageBytes }
 
-// Fingerprint is 8 hex characters that identify where a blob sits.
+// Fingerprint is 8 hex characters that identify where a blob sits and which
+// writing of it this is.
 //
 // It exists to be part of a device mapper name, so that a blob the cleaner has
-// relocated gets a different name from the one it had before. Nothing depends
-// on it being collision free across different placements of different blobs:
-// the digest is what identifies the content, and the fingerprint only has to
-// change when the placement does.
-func (a Address) Fingerprint() string {
+// relocated gets a different name from the one it had before. The record's
+// generation is folded in as well as the address, because reclamation hands the
+// same pages of the same segment to a different blob: without it, a mapping
+// left over from the segment's previous life would be indistinguishable from
+// the one wanted now, and Ensure would adopt it rather than rebuild it.
+//
+// Nothing depends on it being collision free across different placements of
+// different blobs: the digest is what identifies the content, and the
+// fingerprint only has to change when the placement does.
+func (a Address) Fingerprint(generation uint64) string {
 	h := fnv.New64a()
 
-	var buf [24]byte
+	var buf [28]byte
 
 	binary.LittleEndian.PutUint32(buf[0:4], a.Segment)
 	binary.LittleEndian.PutUint32(buf[4:8], a.PageOffset)
 	binary.LittleEndian.PutUint32(buf[8:12], a.PageCount)
 	binary.LittleEndian.PutUint64(buf[12:20], a.ByteLength)
+	binary.LittleEndian.PutUint64(buf[20:28], generation)
 
-	_, _ = h.Write(buf[:20])
+	_, _ = h.Write(buf[:])
 
 	return hex.EncodeToString(h.Sum(nil))[:8]
 }
@@ -206,6 +233,10 @@ func Parse(data []byte) (*Set, error) {
 }
 
 func (s *Set) index() error {
+	if len(s.Segments) > 0 && s.Device == "" {
+		return errors.New("segments named but no device to find them on")
+	}
+
 	s.byID = make(map[uint32]Segment, len(s.Segments))
 
 	for _, seg := range s.Segments {
@@ -217,13 +248,19 @@ func (s *Set) index() error {
 			return fmt.Errorf("segment %d listed twice", seg.ID)
 		}
 
-		if seg.Device == "" {
-			return fmt.Errorf("segment %d has no device", seg.ID)
-		}
-
 		if seg.Bytes == 0 || seg.Bytes%PageBytes != 0 {
 			return fmt.Errorf("segment %d has %d bytes, not a positive multiple of %d",
 				seg.ID, seg.Bytes, PageBytes)
+		}
+
+		if seg.Offset%PageBytes != 0 {
+			return fmt.Errorf("segment %d starts at %d, not a multiple of %d",
+				seg.ID, seg.Offset, PageBytes)
+		}
+
+		if seg.Offset < s.CatalogBytes {
+			return fmt.Errorf("segment %d starts at %d, inside the %d byte catalog head",
+				seg.ID, seg.Offset, s.CatalogBytes)
 		}
 
 		s.byID[seg.ID] = seg
@@ -233,6 +270,17 @@ func (s *Set) index() error {
 	// series, the cleaner's choice of victim - is stable regardless of the
 	// order racer-ctrl happened to emit.
 	sort.Slice(s.Segments, func(i, j int) bool { return s.Segments[i].ID < s.Segments[j].ID })
+
+	// Segments share one address space now, so an overlap is not a segment
+	// reading its own bytes wrongly, it is two segments writing over each
+	// other. Checked after the sort so the comparison is against the
+	// neighbour rather than against whatever came last in the file.
+	for i := 1; i < len(s.Segments); i++ {
+		if prev, seg := s.Segments[i-1], s.Segments[i]; seg.Offset < prev.End() {
+			return fmt.Errorf("segment %d starts at %d, inside segment %d which ends at %d",
+				seg.ID, seg.Offset, prev.ID, prev.End())
+		}
+	}
 
 	return nil
 }
@@ -247,18 +295,39 @@ func (s *Set) Segment(id uint32) (Segment, error) {
 	return seg, nil
 }
 
-// CatalogDevice is the device holding the catalog extent.
+// Catalog names the byte range of the image device holding the OCC catalog.
+type Catalog struct {
+	// Device is the image device. The catalog shares it with every segment.
+	Device string
+
+	// Bytes is the catalog extent's size. It starts at offset zero, because
+	// a volume's mutable head is always the first entry of its composition.
+	Bytes uint64
+}
+
+// CatalogDevice is the byte range holding the catalog extent.
 func (s *Set) CatalogDevice() (Catalog, error) {
-	if s.Catalog.Device == "" {
+	if s.Device == "" || s.CatalogBytes == 0 {
 		return Catalog{}, ErrNoCatalog
 	}
 
-	if s.Catalog.Bytes == 0 || s.Catalog.Bytes%BlockBytes != 0 {
+	if s.CatalogBytes%BlockBytes != 0 {
 		return Catalog{}, fmt.Errorf("catalog has %d bytes, not a positive multiple of %d",
-			s.Catalog.Bytes, BlockBytes)
+			s.CatalogBytes, BlockBytes)
 	}
 
-	return s.Catalog, nil
+	return Catalog{Device: s.Device, Bytes: s.CatalogBytes}, nil
+}
+
+// SegmentRange is the device byte range a whole segment occupies. The cleaner
+// discards it, which is the only operation that addresses a segment as a whole.
+func (s *Set) SegmentRange(id uint32) (device string, offset, length uint64, err error) {
+	seg, err := s.Segment(id)
+	if err != nil {
+		return "", 0, 0, err
+	}
+
+	return s.Device, seg.Offset, seg.Bytes, nil
 }
 
 // Locate resolves a blob address to the device and byte range that carries it.
@@ -273,14 +342,14 @@ func (s *Set) Locate(addr Address) (device string, offset, length uint64, err er
 		return "", 0, 0, err
 	}
 
-	offset = addr.ByteOffset()
+	within := addr.ByteOffset()
 	length = addr.Span()
 
-	if offset+length > seg.Bytes {
+	if within+length > seg.Bytes {
 		return "", 0, 0, fmt.Errorf(
 			"blob at pages %d..%d runs past segment %d, which holds %d pages",
 			addr.PageOffset, uint64(addr.PageOffset)+uint64(addr.PageCount), seg.ID, seg.Pages())
 	}
 
-	return seg.Device, offset, length, nil
+	return s.Device, seg.Offset + within, length, nil
 }

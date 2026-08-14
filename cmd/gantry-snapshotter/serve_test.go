@@ -30,22 +30,17 @@ import (
 func writeDevices(t *testing.T, dir string, set *segment.Set) {
 	t.Helper()
 
-	desc, err := set.CatalogDevice()
-	if err != nil {
-		t.Fatalf("catalog device: %v", err)
-	}
-
 	var b strings.Builder
 
-	fmt.Fprintf(&b, `{"generation":%d,"catalog":{"device":%q,"bytes":%d},"segments":[`,
-		set.Generation, desc.Device, desc.Bytes)
+	fmt.Fprintf(&b, `{"generation":%d,"universe":%d,"device":%q,"catalogBytes":%d,"segments":[`,
+		set.Generation, set.Universe, set.Device, set.CatalogBytes)
 
 	for i, seg := range set.Segments {
 		if i > 0 {
 			b.WriteString(",")
 		}
 
-		fmt.Fprintf(&b, `{"id":%d,"device":%q,"bytes":%d}`, seg.ID, seg.Device, seg.Bytes)
+		fmt.Fprintf(&b, `{"id":%d,"offset":%d,"bytes":%d,"epoch":%d}`, seg.ID, seg.Offset, seg.Bytes, seg.Epoch)
 	}
 
 	b.WriteString("]}")
@@ -259,7 +254,7 @@ func TestObserver(t *testing.T) {
 // Without a peer view every node ingests eagerly, which is what a single node
 // wants and the only safe default when there is nothing to rank against.
 func TestNewElectorWithoutAPeerView(t *testing.T) {
-	elector, stop, err := newElector(t.Context(), &Config{}, slog.New(slog.DiscardHandler))
+	elector, peers, stop, err := newElector(t.Context(), &Config{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("newElector: %v", err)
 	}
@@ -268,6 +263,12 @@ func TestNewElectorWithoutAPeerView(t *testing.T) {
 
 	if _, ok := elector.(ingest.Immediate); !ok {
 		t.Errorf("elector = %T, want ingest.Immediate", elector)
+	}
+
+	// No peer view either, which is what makes the cleaner run unelected: one
+	// node cannot lose a rendezvous to itself.
+	if peers != nil {
+		t.Error("peers = non-nil, want nil without a membership view")
 	}
 }
 

@@ -30,7 +30,25 @@ const (
 	// AttrImmutablePageSize selects the immutable tail's page size: "4Ki" or
 	// "4Mi". Defaults to 4Mi, which is the cheaper of the two per byte stored.
 	AttrImmutablePageSize = "immutablePageSize"
+
+	// AttrImmutableExtentBytes cuts the immutable tail into equal extents of
+	// this size instead of one extent spanning the whole tail. It must divide
+	// the tail exactly. Absent means one extent.
+	//
+	// The extent is the unit of reclamation: tombstone_epoch is per extent and
+	// advancing it destroys everything in that extent, so a volume that wants
+	// to reclaim space in pieces has to be built out of pieces. Nothing else
+	// about the volume changes: the extents are concatenated in order and the
+	// guest still sees one flat device.
+	AttrImmutableExtentBytes = "immutableExtentBytes"
 )
+
+// MaxVolumeExtents caps the extents one volume may be cut into. Every extent is
+// declared capacity that each node in the zone reserves on its store at format
+// time, so a typo in immutableExtentBytes is a typo that fallocates a petabyte.
+// The ceiling is well under MaxExtents, which counts every extent a node is told
+// about across every volume.
+const MaxVolumeExtents = 256
 
 // SegmentSpec is one extent's shape, before it has been allocated an id or a
 // place in the address space.
@@ -99,14 +117,16 @@ func ParseKind(raw string) (racerconfig.Kind, error) {
 // ParseGeometry turns a volume's capacity and CSI attributes into the ordered
 // segments of its device.
 //
-// A volume is at most two extents: an optional mutable head in 4 KiB pages, then
-// an immutable tail that runs to the end of the device. The tail's size is the
-// remaining capacity, so the whole advertised block space is addressable and
-// nothing is reserved.
+// A volume is an optional mutable head in 4 KiB pages, then an immutable tail
+// that runs to the end of the device. The tail is one extent by default, or a
+// run of equal extents when immutableExtentBytes says so. Either way the tail
+// covers the remaining capacity exactly, so the whole advertised block space is
+// addressable and nothing is reserved.
 //
 // The tail's size has to be declared up front rather than grown, because an
-// extent's page count is frozen for its life and the node sizes its store from
-// it. That is why it is derived from capacity and not left open.
+// extent's page count is frozen for its life, a device's extent list is frozen
+// once the device exists, and the node sizes its store from both. That is why it
+// is derived from capacity and not left open.
 func ParseGeometry(capacityBytes uint64, attributes map[string]string) ([]SegmentSpec, error) {
 	if err := checkKnownAttributes(attributes); err != nil {
 		return nil, err
@@ -117,6 +137,11 @@ func ParseGeometry(capacityBytes uint64, attributes map[string]string) ([]Segmen
 	}
 
 	mutableBytes, err := parseQuantityAttribute(attributes, AttrMutableBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	extentBytes, err := parseQuantityAttribute(attributes, AttrImmutableExtentBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -171,15 +196,18 @@ func ParseGeometry(capacityBytes uint64, attributes map[string]string) ([]Segmen
 		)
 	}
 
-	segments := make([]SegmentSpec, 0, 2)
+	tail, err := cutTail(immutableBytes, extentBytes, tailKind)
+	if err != nil {
+		return nil, err
+	}
+
+	segments := make([]SegmentSpec, 0, 1+len(tail))
 
 	if mutableBytes > 0 {
 		segments = append(segments, SegmentSpec{Kind: mutableKind, Pages: mutableBytes / SmallPage})
 	}
 
-	if immutableBytes > 0 {
-		segments = append(segments, SegmentSpec{Kind: tailKind, Pages: immutableBytes / KindPageBytes(tailKind)})
-	}
+	segments = append(segments, tail...)
 
 	if len(segments) == 0 {
 		return nil, fmt.Errorf("volume has no segments")
@@ -188,15 +216,65 @@ func ParseGeometry(capacityBytes uint64, attributes map[string]string) ([]Segmen
 	return segments, nil
 }
 
+// cutTail divides the immutable tail into extents. Zero extentBytes means one
+// extent covering the whole tail.
+func cutTail(immutableBytes, extentBytes uint64, kind racerconfig.Kind) ([]SegmentSpec, error) {
+	if immutableBytes == 0 {
+		if extentBytes != 0 {
+			return nil, fmt.Errorf("%s is set but the volume has no immutable tail", AttrImmutableExtentBytes)
+		}
+
+		return nil, nil
+	}
+
+	if extentBytes == 0 {
+		extentBytes = immutableBytes
+	}
+
+	pageBytes := KindPageBytes(kind)
+	if extentBytes%pageBytes != 0 {
+		return nil, fmt.Errorf(
+			"%s (%d) must be a multiple of the %d byte page size",
+			AttrImmutableExtentBytes, extentBytes, pageBytes,
+		)
+	}
+
+	// An uneven division would leave a short extent at the end, which the
+	// snapshotter's reclaim arithmetic and the operator's capacity arithmetic
+	// would both have to special-case. Refusing costs the author one edit.
+	if immutableBytes%extentBytes != 0 {
+		return nil, fmt.Errorf(
+			"immutable tail (%d bytes) is not a whole number of %s (%d)",
+			immutableBytes, AttrImmutableExtentBytes, extentBytes,
+		)
+	}
+
+	count := immutableBytes / extentBytes
+	if count > MaxVolumeExtents {
+		return nil, fmt.Errorf(
+			"immutable tail cuts into %d extents, more than the %d allowed",
+			count, MaxVolumeExtents,
+		)
+	}
+
+	tail := make([]SegmentSpec, 0, count)
+	for range count {
+		tail = append(tail, SegmentSpec{Kind: kind, Pages: extentBytes / pageBytes})
+	}
+
+	return tail, nil
+}
+
 // checkKnownAttributes refuses attributes this driver does not understand. A
 // typo in a volume's geometry has to fail at admission rather than quietly
 // provisioning something other than what was asked for, because the result is
 // frozen for the volume's life.
 func checkKnownAttributes(attributes map[string]string) error {
 	known := map[string]bool{
-		AttrMutableBytes:      true,
-		AttrMutableKind:       true,
-		AttrImmutablePageSize: true,
+		AttrMutableBytes:         true,
+		AttrMutableKind:          true,
+		AttrImmutablePageSize:    true,
+		AttrImmutableExtentBytes: true,
 	}
 
 	unknown := make([]string, 0)

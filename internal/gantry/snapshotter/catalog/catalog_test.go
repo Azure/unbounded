@@ -254,6 +254,7 @@ func TestSuperblockRoundTrip(t *testing.T) {
 		OpenCursorPages: 7,
 		OpenTotalPages:  4096,
 		SegmentBlocks:   1,
+		WatermarkBlocks: 1,
 		TotalBlocks:     4096,
 	}
 
@@ -271,17 +272,17 @@ func TestSuperblockRoundTrip(t *testing.T) {
 		t.Fatalf("round trip changed the superblock:\n got %+v\nwant %+v", got, sb)
 	}
 
-	if got.RecordBlockBase() != 2 {
-		t.Fatalf("record base is block %d, want 2", got.RecordBlockBase())
+	if got.RecordBlockBase() != 3 {
+		t.Fatalf("record base is block %d, want 3", got.RecordBlockBase())
 	}
 
-	if want := (4096 - uint64(2)) * RecordsPerBlock; got.RecordCapacity() != want {
+	if want := (4096 - uint64(3)) * RecordsPerBlock; got.RecordCapacity() != want {
 		t.Fatalf("record capacity %d, want %d", got.RecordCapacity(), want)
 	}
 
 	blockIndex, slot := got.RecordLocation(RecordsPerBlock + 3)
-	if blockIndex != 3 || slot != 3 {
-		t.Fatalf("record %d is at block %d slot %d, want block 3 slot 3", RecordsPerBlock+3, blockIndex, slot)
+	if blockIndex != 4 || slot != 3 {
+		t.Fatalf("record %d is at block %d slot %d, want block 4 slot 3", RecordsPerBlock+3, blockIndex, slot)
 	}
 }
 

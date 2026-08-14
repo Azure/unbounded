@@ -79,6 +79,13 @@ type Store struct {
 	applied uint64
 	index   *Index
 
+	// appliedGen is the catalog generation this store has certainly seen
+	// every record of. It only advances when the index has caught up to the
+	// superblock's record count, so a hole holds it back. A node that has
+	// not read a record cannot claim to have acted on it, and the drain gate
+	// is the one place that difference decides whether pages get trimmed.
+	appliedGen uint64
+
 	// hole is where the last Sync stopped short, and since when. See Repair.
 	hole      uint64
 	holeEnd   uint64
@@ -111,14 +118,24 @@ type FormatOptions struct {
 	// SegmentBlocks is how many blocks the segment table occupies, and so
 	// how many segments the image volume can ever hold. It cannot be changed
 	// afterwards without moving every record, so it is set generously: one
-	// block already covers 127 segments, which at the default 16 GiB segment
-	// is 2 TiB, more than a node's export slot budget allows it to map.
+	// block already covers 63 segments, which at the default 8 GiB segment
+	// is half a terabyte.
 	SegmentBlocks uint32
+
+	// WatermarkBlocks is how many blocks the node watermark table occupies,
+	// and so how many nodes can hold the cleaner up at once. Also fixed
+	// afterwards.
+	WatermarkBlocks uint32
 }
 
-// DefaultSegmentBlocks covers 127 segments, which exceeds the number of image
-// devices a node can export at once.
+// DefaultSegmentBlocks covers 63 segments, which at the default 8 GiB segment
+// is half a terabyte of image capacity.
 const DefaultSegmentBlocks = 1
+
+// DefaultWatermarkBlocks covers 1016 nodes. A node past that cannot claim a
+// slot and so cannot hold a reclaim up, which is why the default is generous:
+// the table is 32 KiB and the alternative is a silent gap in the drain gate.
+const DefaultWatermarkBlocks = 8
 
 // Format writes a fresh catalog. It refuses to run against a device that
 // already holds one, because reformatting orphans every blob in every segment
@@ -143,10 +160,16 @@ func Format(vol Volume, opts FormatOptions) error {
 		segmentBlocks = DefaultSegmentBlocks
 	}
 
+	watermarkBlocks := opts.WatermarkBlocks
+	if watermarkBlocks == 0 {
+		watermarkBlocks = DefaultWatermarkBlocks
+	}
+
 	sb := Superblock{
-		Generation:    1,
-		SegmentBlocks: segmentBlocks,
-		TotalBlocks:   opts.Bytes / BlockBytes,
+		Generation:      1,
+		SegmentBlocks:   segmentBlocks,
+		WatermarkBlocks: watermarkBlocks,
+		TotalBlocks:     opts.Bytes / BlockBytes,
 	}
 
 	if err := sb.Validate(); err != nil {
@@ -173,9 +196,9 @@ func Format(vol Volume, opts FormatOptions) error {
 
 	block = make([]byte, BlockBytes)
 
-	// The segment table is zeroed before the superblock is published, so a
-	// reader that finds a valid superblock never reads a table left over
-	// from whatever was on the device before.
+	// The segment and watermark tables are zeroed before the superblock is
+	// published, so a reader that finds a valid superblock never reads a
+	// table left over from whatever was on the device before.
 	//
 	// Each block is read first. Under OCC a write with no prior read of the
 	// page has no guard to compare against and is rejected, so reading is
@@ -184,11 +207,11 @@ func Format(vol Volume, opts FormatOptions) error {
 	zero := make([]byte, BlockBytes)
 	scratch := make([]byte, BlockBytes)
 
-	for b := uint64(1); b <= uint64(segmentBlocks); b++ {
+	for b := uint64(1); b < sb.RecordBlockBase(); b++ {
 		off := int64(b * BlockBytes) //nolint:gosec // block index is bounded by the extent size
 
 		if _, err := vol.ReadAt(scratch, off); err != nil {
-			return fmt.Errorf("read segment table block %d: %w", b, err)
+			return fmt.Errorf("read table block %d: %w", b, err)
 		}
 
 		if allZero(scratch) {
@@ -196,7 +219,7 @@ func Format(vol Volume, opts FormatOptions) error {
 		}
 
 		if _, err := vol.WriteAt(zero, off); err != nil {
-			return fmt.Errorf("zero segment table block %d: %w", b, err)
+			return fmt.Errorf("zero table block %d: %w", b, err)
 		}
 	}
 
@@ -248,6 +271,30 @@ func (s *Store) Blob(diffID Digest) (Blob, bool) {
 	return s.index.Blob(diffID)
 }
 
+// Generation is the catalog generation this node has applied every record of.
+//
+// It is the number the drain gate is answered with, which is why it lags the
+// superblock rather than tracking it: a Sync that stopped at a hole has read a
+// newer superblock than it has read records, and reporting the superblock's
+// generation would claim this node had seen records it has not. Repair retires
+// a hole that never fills, so the lag is bounded rather than permanent.
+func (s *Store) Generation() uint64 {
+	s.state.RLock()
+	defer s.state.RUnlock()
+
+	return s.appliedGen
+}
+
+// BlobsIn lists the live blobs the index resolves into a segment. It is the
+// cleaner's work list, and it is a map walk rather than a device read because
+// every node already holds the whole index in memory.
+func (s *Store) BlobsIn(id uint32) []Blob {
+	s.state.RLock()
+	defer s.state.RUnlock()
+
+	return s.index.BlobsIn(id)
+}
+
 // Len is how many keys the index resolves.
 func (s *Store) Len() int {
 	s.state.RLock()
@@ -290,6 +337,11 @@ func (s *Store) Sync() (bool, error) {
 	s.index.Apply(records...)
 	s.applied = read
 	s.noteHole(read, sb.RecordCount)
+
+	if read >= sb.RecordCount {
+		s.appliedGen = sb.Generation
+	}
+
 	s.state.Unlock()
 
 	return true, nil

@@ -136,7 +136,7 @@ func TestLayoutForDefaults(t *testing.T) {
 		t.Fatalf("layoutFor(nil): %v", err)
 	}
 
-	want := layout{segments: defaultSegments, segmentBytes: defaultSegmentBytes, catalogBytes: defaultCatalogBytes}
+	want := layout{sizeBytes: defaultSizeBytes, extentBytes: defaultExtentBytes, catalogBytes: defaultCatalogBytes}
 	if got != want {
 		t.Fatalf("layoutFor(nil) = %+v, want %+v", got, want)
 	}
@@ -145,13 +145,13 @@ func TestLayoutForDefaults(t *testing.T) {
 func TestLayoutForOverrides(t *testing.T) {
 	t.Parallel()
 
-	segments := int32(2)
-	segmentSize := resource.MustParse("16Gi")
+	size := resource.MustParse("32Gi")
+	extentSize := resource.MustParse("16Gi")
 	catalogSize := resource.MustParse("64Mi")
 
 	spec := enabledSpec()
-	spec.Segments = &segments
-	spec.SegmentSize = &segmentSize
+	spec.Size = &size
+	spec.ExtentSize = &extentSize
 	spec.CatalogSize = &catalogSize
 
 	site := siteWith("a", spec)
@@ -161,7 +161,7 @@ func TestLayoutForOverrides(t *testing.T) {
 		t.Fatalf("layoutFor: %v", err)
 	}
 
-	want := layout{segments: 2, segmentBytes: 16 << 30, catalogBytes: 64 << 20}
+	want := layout{sizeBytes: 32 << 30, extentBytes: 16 << 30, catalogBytes: 64 << 20}
 	if got != want {
 		t.Fatalf("layoutFor = %+v, want %+v", got, want)
 	}
@@ -179,12 +179,12 @@ func TestLayoutForRejectsUnalignedSizes(t *testing.T) {
 		want  string
 	}{
 		{
-			name: "segment size",
+			name: "extent size",
 			apply: func(s *unboundedv1alpha3.GantrySnapshotterComponentSpec) {
 				q := resource.MustParse("3Mi")
-				s.SegmentSize = &q
+				s.ExtentSize = &q
 			},
-			want: "segmentSize",
+			want: "extentSize",
 		},
 		{
 			name: "catalog size",
@@ -195,20 +195,30 @@ func TestLayoutForRejectsUnalignedSizes(t *testing.T) {
 			want: "catalogSize",
 		},
 		{
-			name: "zero segment size",
+			name: "zero extent size",
 			apply: func(s *unboundedv1alpha3.GantrySnapshotterComponentSpec) {
 				q := resource.MustParse("0")
-				s.SegmentSize = &q
+				s.ExtentSize = &q
 			},
-			want: "segmentSize",
+			want: "extentSize",
 		},
 		{
-			name: "zero segments",
+			name: "zero size",
 			apply: func(s *unboundedv1alpha3.GantrySnapshotterComponentSpec) {
-				n := int32(0)
-				s.Segments = &n
+				q := resource.MustParse("0")
+				s.Size = &q
 			},
-			want: "segments",
+			want: "size",
+		},
+		{
+			// The immutable tail is cut into equal extents, so a size that
+			// is not a whole number of them has nowhere to put the remainder.
+			name: "size is not a whole number of extents",
+			apply: func(s *unboundedv1alpha3.GantrySnapshotterComponentSpec) {
+				q := resource.MustParse("20Gi")
+				s.Size = &q
+			},
+			want: "extentSize",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -226,11 +236,11 @@ func TestLayoutForRejectsUnalignedSizes(t *testing.T) {
 	}
 }
 
-// TestDesiredVolumesGeometryIsParseable is the contract between this component
-// and the racer allocator: every volume it creates has to yield exactly one
-// extent, because the node agent binds an image volume to a single device and
-// the snapshotter addresses it as a single flat range.
-func TestDesiredVolumesGeometryIsParseable(t *testing.T) {
+// TestDesiredImageVolumeGeometryIsParseable is the contract between this
+// component and the racer allocator: the volume it creates has to yield an OCC
+// catalog extent followed by one IMMUTABLE_4M extent per unit of reclamation,
+// because that is the shape the node agent exports and the snapshotter reads.
+func TestDesiredImageVolumeGeometryIsParseable(t *testing.T) {
 	t.Parallel()
 
 	l, err := layoutFor(nil)
@@ -238,50 +248,55 @@ func TestDesiredVolumesGeometryIsParseable(t *testing.T) {
 		t.Fatalf("layoutFor: %v", err)
 	}
 
-	volumes := desiredVolumes(l)
-	if len(volumes) != int(l.segments)+1 {
-		t.Fatalf("desiredVolumes returned %d volumes, want %d", len(volumes), l.segments+1)
+	want := desiredImageVolume(l)
+
+	segments, err := racerctrl.ParseGeometry(uint64(want.bytes), want.attributes)
+	if err != nil {
+		t.Fatalf("ParseGeometry(%s): %v", want.name, err)
 	}
 
-	for _, want := range volumes {
-		segments, err := racerctrl.ParseGeometry(uint64(want.bytes), want.attributes)
-		if err != nil {
-			t.Fatalf("ParseGeometry(%s): %v", want.name, err)
+	extents := int(l.sizeBytes/l.extentBytes) + 1
+	if len(segments) != extents {
+		t.Fatalf("%s has %d extents, want %d", want.name, len(segments), extents)
+	}
+
+	if segments[0].Kind.String() != "OCC" {
+		t.Fatalf("head extent kind = %s, want OCC", segments[0].Kind)
+	}
+
+	if segments[0].Bytes() != uint64(l.catalogBytes) {
+		t.Fatalf("head extent is %d bytes, want %d", segments[0].Bytes(), l.catalogBytes)
+	}
+
+	var tail uint64
+
+	for _, seg := range segments[1:] {
+		if seg.Kind.String() != "IMMUTABLE_4M" {
+			t.Fatalf("tail extent kind = %s, want IMMUTABLE_4M", seg.Kind)
 		}
 
-		if len(segments) != 1 {
-			t.Fatalf("%s has %d extents, want exactly one", want.name, len(segments))
+		if seg.Bytes() != uint64(l.extentBytes) {
+			t.Fatalf("tail extent is %d bytes, want %d", seg.Bytes(), l.extentBytes)
 		}
 
-		if segments[0].Bytes() != uint64(want.bytes) {
-			t.Fatalf("%s extent is %d bytes, want %d", want.name, segments[0].Bytes(), want.bytes)
-		}
+		tail += seg.Bytes()
+	}
 
-		switch want.role {
-		case racerctrl.ImageRoleCatalog:
-			if segments[0].Kind.String() != "OCC" {
-				t.Fatalf("catalog extent kind = %s, want OCC", segments[0].Kind)
-			}
-		case racerctrl.ImageRoleSegment:
-			if segments[0].Kind.String() != "IMMUTABLE_4M" {
-				t.Fatalf("segment extent kind = %s, want IMMUTABLE_4M", segments[0].Kind)
-			}
-		default:
-			t.Fatalf("%s has unknown role %q", want.name, want.role)
-		}
+	if tail != uint64(l.sizeBytes) {
+		t.Fatalf("tail holds %d bytes, want %d", tail, l.sizeBytes)
 	}
 }
 
-func TestEnsureImageVolumesWaitsForTheStorageClass(t *testing.T) {
+func TestEnsureImageVolumeWaitsForTheStorageClass(t *testing.T) {
 	t.Parallel()
 
 	env, _ := reconcilerEnv(t)
 
 	l, _ := layoutFor(nil)
 
-	pending, err := ensureImageVolumes(t.Context(), env, l)
+	pending, err := ensureImageVolume(t.Context(), env, l)
 	if err != nil {
-		t.Fatalf("ensureImageVolumes: %v", err)
+		t.Fatalf("ensureImageVolume: %v", err)
 	}
 
 	if !strings.Contains(pending, storageClassName) {
@@ -300,20 +315,20 @@ func TestEnsureImageVolumesWaitsForTheStorageClass(t *testing.T) {
 	}
 }
 
-func TestEnsureImageVolumesCreatesTheImageVolume(t *testing.T) {
+func TestEnsureImageVolumeCreatesTheImageVolume(t *testing.T) {
 	t.Parallel()
 
 	env, _ := reconcilerEnv(t, racerClass())
 
 	l, _ := layoutFor(nil)
 
-	pending, err := ensureImageVolumes(t.Context(), env, l)
+	pending, err := ensureImageVolume(t.Context(), env, l)
 	if err != nil {
-		t.Fatalf("ensureImageVolumes: %v", err)
+		t.Fatalf("ensureImageVolume: %v", err)
 	}
 
 	if pending == "" {
-		t.Fatal("freshly created volumes reported as ready")
+		t.Fatal("a freshly created volume reported as ready")
 	}
 
 	var volumes corev1.PersistentVolumeList
@@ -321,63 +336,63 @@ func TestEnsureImageVolumesCreatesTheImageVolume(t *testing.T) {
 		t.Fatalf("list volumes: %v", err)
 	}
 
-	if len(volumes.Items) != int(l.segments)+1 {
-		t.Fatalf("created %d volumes, want %d", len(volumes.Items), l.segments+1)
+	// One volume, not one per segment: a device's extent list is frozen once
+	// the device exists, so the whole image address space has to be declared
+	// at once and exported as a single device.
+	if len(volumes.Items) != 1 {
+		t.Fatalf("created %d volumes, want 1", len(volumes.Items))
 	}
 
-	roles := map[string]int{}
+	pv := &volumes.Items[0]
 
-	for i := range volumes.Items {
-		pv := &volumes.Items[i]
-
-		roles[pv.Annotations[racerctrl.ImageRoleAnnotation]]++
-
-		if pv.Spec.StorageClassName != storageClassName {
-			t.Fatalf("%s storage class = %q", pv.Name, pv.Spec.StorageClassName)
-		}
-
-		if pv.Spec.VolumeMode == nil || *pv.Spec.VolumeMode != corev1.PersistentVolumeBlock {
-			t.Fatalf("%s volume mode = %v, want Block", pv.Name, pv.Spec.VolumeMode)
-		}
-
-		if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
-			t.Fatalf("%s reclaim policy = %v, want Retain", pv.Name, pv.Spec.PersistentVolumeReclaimPolicy)
-		}
-
-		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != racerctrl.DriverName {
-			t.Fatalf("%s is not a racer volume: %+v", pv.Name, pv.Spec.CSI)
-		}
-
-		// Without a claimRef the binder would be free to hand the cluster's
-		// layer store to the next PVC that asks for this class.
-		if pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Name != pv.Name {
-			t.Fatalf("%s is not reserved: %+v", pv.Name, pv.Spec.ClaimRef)
-		}
+	if pv.Name != volumeName {
+		t.Fatalf("volume name = %q, want %q", pv.Name, volumeName)
 	}
 
-	if roles[racerctrl.ImageRoleCatalog] != 1 || roles[racerctrl.ImageRoleSegment] != int(l.segments) {
-		t.Fatalf("roles = %#v", roles)
+	if role := pv.Annotations[racerctrl.ImageRoleAnnotation]; role != racerctrl.ImageRoleImage {
+		t.Fatalf("image role = %q, want %q", role, racerctrl.ImageRoleImage)
+	}
+
+	if pv.Spec.StorageClassName != storageClassName {
+		t.Fatalf("%s storage class = %q", pv.Name, pv.Spec.StorageClassName)
+	}
+
+	if pv.Spec.VolumeMode == nil || *pv.Spec.VolumeMode != corev1.PersistentVolumeBlock {
+		t.Fatalf("%s volume mode = %v, want Block", pv.Name, pv.Spec.VolumeMode)
+	}
+
+	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+		t.Fatalf("%s reclaim policy = %v, want Retain", pv.Name, pv.Spec.PersistentVolumeReclaimPolicy)
+	}
+
+	if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != racerctrl.DriverName {
+		t.Fatalf("%s is not a racer volume: %+v", pv.Name, pv.Spec.CSI)
+	}
+
+	if capacity := pv.Spec.Capacity[corev1.ResourceStorage]; capacity.Value() != l.capacity() {
+		t.Fatalf("capacity = %s, want %d", capacity.String(), l.capacity())
+	}
+
+	// Without a claimRef the binder would be free to hand the cluster's
+	// layer store to the next PVC that asks for this class.
+	if pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Name != pv.Name {
+		t.Fatalf("%s is not reserved: %+v", pv.Name, pv.Spec.ClaimRef)
 	}
 }
 
-func TestEnsureImageVolumesIsReadyOncePlaced(t *testing.T) {
+func TestEnsureImageVolumeIsReadyOncePlaced(t *testing.T) {
 	t.Parallel()
 
 	l, _ := layoutFor(nil)
 
-	objects := []client.Object{racerClass()}
+	pv := buildVolume(&component.Env{Namespace: component.DefaultNamespace}, desiredImageVolume(l))
+	pv.Annotations[racerctrl.CompositionAnnotation] = "0?baseLba=0&extent=1&kind=OCC&pages=1"
 
-	for _, want := range desiredVolumes(l) {
-		pv := buildVolume(&component.Env{Namespace: component.DefaultNamespace}, want)
-		pv.Annotations[racerctrl.CompositionAnnotation] = "0?baseLba=0&extent=1&kind=OCC&pages=1"
-		objects = append(objects, pv)
-	}
+	env, _ := reconcilerEnv(t, racerClass(), pv)
 
-	env, _ := reconcilerEnv(t, objects...)
-
-	pending, err := ensureImageVolumes(t.Context(), env, l)
+	pending, err := ensureImageVolume(t.Context(), env, l)
 	if err != nil {
-		t.Fatalf("ensureImageVolumes: %v", err)
+		t.Fatalf("ensureImageVolume: %v", err)
 	}
 
 	if pending != "" {
@@ -385,23 +400,23 @@ func TestEnsureImageVolumesIsReadyOncePlaced(t *testing.T) {
 	}
 }
 
-func TestEnsureImageVolumesReportsResizeRatherThanAttemptingIt(t *testing.T) {
+func TestEnsureImageVolumeReportsResizeRatherThanAttemptingIt(t *testing.T) {
 	t.Parallel()
 
 	l, _ := layoutFor(nil)
 
 	// An existing volume half the requested size. Its extents are already
 	// allocated, so the only honest outcome is to say so.
-	small := desiredVolumes(l)[1]
-	small.bytes = defaultSegmentBytes / 2
+	small := desiredImageVolume(l)
+	small.bytes = l.capacity() / 2
 	pv := buildVolume(&component.Env{Namespace: component.DefaultNamespace}, small)
 	pv.Annotations[racerctrl.CompositionAnnotation] = "0?baseLba=0&extent=2&kind=IMMUTABLE_4M&pages=1024"
 
 	env, _ := reconcilerEnv(t, racerClass(), pv)
 
-	pending, err := ensureImageVolumes(t.Context(), env, l)
+	pending, err := ensureImageVolume(t.Context(), env, l)
 	if err != nil {
-		t.Fatalf("ensureImageVolumes: %v", err)
+		t.Fatalf("ensureImageVolume: %v", err)
 	}
 
 	if !strings.Contains(pending, "cannot be resized") || !strings.Contains(pending, small.name) {
@@ -476,8 +491,8 @@ func TestReconcileAppliesManifestsAndVolumes(t *testing.T) {
 
 	// Not ready yet: the volumes were only just created and the racer
 	// allocator has not placed them.
-	if res.Ready || res.Reason != "ImageVolumesPending" {
-		t.Fatalf("Reconcile = %+v, want ImageVolumesPending", res)
+	if res.Ready || res.Reason != "ImageVolumePending" {
+		t.Fatalf("Reconcile = %+v, want ImageVolumePending", res)
 	}
 
 	for _, want := range []string{
@@ -497,8 +512,8 @@ func TestReconcileAppliesManifestsAndVolumes(t *testing.T) {
 		t.Fatalf("list volumes: %v", err)
 	}
 
-	if len(volumes.Items) != defaultSegments+1 {
-		t.Fatalf("created %d volumes, want %d", len(volumes.Items), defaultSegments+1)
+	if len(volumes.Items) != 1 {
+		t.Fatalf("created %d volumes, want 1", len(volumes.Items))
 	}
 }
 

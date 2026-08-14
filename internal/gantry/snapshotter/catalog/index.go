@@ -4,8 +4,10 @@
 package catalog
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
+	"sort"
 
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
 )
@@ -141,6 +143,41 @@ func (i *Index) Resolve(chainID Digest) (Blob, bool) {
 	}
 
 	return blob, true
+}
+
+// BlobsIn returns every blob the index currently resolves into a segment.
+//
+// This is the cleaner's work list: the survivors it has to copy out before the
+// segment can be trimmed. It reads the in-memory index rather than the device
+// because every node already holds the whole record set, and because what
+// matters is which blobs are live now, not which records were ever written. A
+// blob that has already been copied elsewhere resolves to its new home and is
+// not in this segment's list any more, so a resumed cycle does not copy it
+// twice.
+func (i *Index) BlobsIn(segment uint32) []Blob {
+	var blobs []Blob
+
+	for _, e := range i.entries {
+		if e.kind != RecordBlob || e.record.Segment != segment {
+			continue
+		}
+
+		blobs = append(blobs, Blob{
+			DiffID:     e.record.Key,
+			Address:    e.record.Address(),
+			Sum:        e.record.Ref,
+			Generation: e.record.Generation,
+		})
+	}
+
+	// Map iteration is random and the cleaner reports progress by blob, so an
+	// order that changed between passes would make a resumed cycle look like
+	// a different one.
+	sort.Slice(blobs, func(a, b int) bool {
+		return bytes.Compare(blobs[a].DiffID[:], blobs[b].DiffID[:]) < 0
+	})
+
+	return blobs
 }
 
 // Len is how many keys the index resolves.

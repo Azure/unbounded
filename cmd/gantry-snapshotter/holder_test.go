@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,10 +27,13 @@ func newHolder(t *testing.T, format, adopt bool) *holder {
 	direct := false
 
 	return &holder{
-		log:    slog.New(slog.DiscardHandler),
-		format: format,
-		adopt:  adopt,
-		blocks: catalog.DefaultSegmentBlocks,
+		log:        slog.New(slog.DiscardHandler),
+		format:     format,
+		adopt:      adopt,
+		blocks:     catalog.DefaultSegmentBlocks,
+		watermarks: catalog.DefaultWatermarkBlocks,
+		grace:      catalog.DefaultWatermarkGrace,
+		node:       catalog.NodeKeyFor("test-node"),
 		open: func(path string) (*catalog.Device, error) {
 			return catalog.OpenDevice(path, catalog.DeviceOptions{Direct: &direct})
 		},
@@ -67,31 +71,36 @@ func deviceFile(t *testing.T, dir, name string, size uint64) string {
 	return path
 }
 
-// testSet writes a device description covering one catalog and segments of the
-// given page counts, and returns the parsed set.
+// testSet builds an image device map over a single backing file, which is what
+// the real thing looks like: the catalog extent at offset zero, then the
+// immutable extents concatenated after it.
+//
+// The first segment starts a whole 4 MiB in even when the catalog is smaller
+// than that, because an immutable extent's base has to be page aligned and the
+// page here is 4 MiB.
 func testSet(t *testing.T, dir string, catalogBytes uint64, pages ...uint64) *segment.Set {
 	t.Helper()
 
-	catPath := deviceFile(t, dir, "catalog.img", catalogBytes)
+	offset := segment.PaddedSize(catalogBytes)
 
-	body := fmt.Sprintf(`{"generation":1,"universe":7,"catalog":{"device":%q,"bytes":%d},"segments":[`, catPath, catalogBytes)
+	entries := make([]string, 0, len(pages))
 
 	for i, n := range pages {
 		bytes := n * segment.PageBytes
-		path := deviceFile(t, dir, fmt.Sprintf("seg%d.img", i+1), bytes)
-
-		if i > 0 {
-			body += ","
-		}
-
-		body += fmt.Sprintf(`{"id":%d,"device":%q,"bytes":%d}`, i+1, path, bytes)
+		entries = append(entries, fmt.Sprintf(`{"id":%d,"offset":%d,"bytes":%d,"epoch":0}`, i+1, offset, bytes))
+		offset += bytes
 	}
 
-	body += "]}"
+	path := deviceFile(t, dir, "image.img", offset)
+
+	body := fmt.Sprintf(
+		`{"generation":1,"universe":7,"device":%q,"catalogBytes":%d,"segments":[%s]}`,
+		path, catalogBytes, strings.Join(entries, ","),
+	)
 
 	set, err := segment.Parse([]byte(body))
 	if err != nil {
-		t.Fatalf("parse device set: %v", err)
+		t.Fatalf("parse device map: %v", err)
 	}
 
 	return set

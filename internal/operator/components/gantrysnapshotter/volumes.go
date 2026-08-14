@@ -6,8 +6,6 @@ package gantrysnapshotter
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -28,22 +26,21 @@ const (
 	// it shares the catalog and the gateway set that is already there.
 	storageClassName = "racer"
 
-	// volumePrefix names the image volumes. The names are stable and derived
-	// from the index, because a segment is addressed cluster-wide by the extent
-	// ID it was allocated and losing track of which volume that was means
-	// losing the layers in it.
-	volumePrefix = "gantry-image"
+	// volumeName is the image volume. There is exactly one, and its name is
+	// fixed: the layers in it are addressed by the extent ids it was allocated,
+	// so losing track of which object those belong to means losing them.
+	volumeName = "gantry-image"
 
-	// defaultSegments is how many segment volumes are created when a Site does
-	// not say. Layers are spread across segments so that a node writing one
-	// layer does not serialise behind a node writing another.
-	defaultSegments = 4
+	// defaultSizeBytes is the usable capacity for layer bytes when a Site does
+	// not say.
+	defaultSizeBytes = 32 << 30
 
-	// defaultSegmentBytes is the size of one segment volume. It has to be a
-	// multiple of the 4 MiB page IMMUTABLE_4M is stored in.
-	defaultSegmentBytes = 8 << 30
+	// defaultExtentBytes is the size of one image extent. It has to be a
+	// multiple of the 4 MiB page IMMUTABLE_4M is stored in, and it is the unit
+	// the cleaner reclaims, because racer collects a whole extent at a time.
+	defaultExtentBytes = 8 << 30
 
-	// defaultCatalogBytes is the size of the catalog volume. The catalog is an
+	// defaultCatalogBytes is the size of the catalog extent. The catalog is an
 	// append-only record per layer, so it is small; it is sized generously
 	// because it cannot be grown afterwards.
 	defaultCatalogBytes = 256 << 20
@@ -51,10 +48,13 @@ const (
 
 // layout is the image volume's shape, resolved from a Site.
 type layout struct {
-	segments     int32
-	segmentBytes int64
+	sizeBytes    int64
+	extentBytes  int64
 	catalogBytes int64
 }
+
+// capacity is the whole volume: the catalog head plus the layer space after it.
+func (l layout) capacity() int64 { return l.catalogBytes + l.sizeBytes }
 
 // layoutFor resolves the image volume's shape from the Site that enables the
 // component, or from the defaults when none does.
@@ -64,42 +64,37 @@ type layout struct {
 // the reason on the racer allocator's log line rather than on the Site.
 func layoutFor(site *unboundedv1alpha3.Site) (layout, error) {
 	out := layout{
-		segments:     defaultSegments,
-		segmentBytes: defaultSegmentBytes,
+		sizeBytes:    defaultSizeBytes,
+		extentBytes:  defaultExtentBytes,
 		catalogBytes: defaultCatalogBytes,
 	}
 
-	if site == nil || site.Spec.Components.GantrySnapshotter == nil {
-		return out, nil
+	if site != nil && site.Spec.Components.GantrySnapshotter != nil {
+		spec := site.Spec.Components.GantrySnapshotter
+
+		if spec.Size != nil {
+			out.sizeBytes = spec.Size.Value()
+		}
+
+		if spec.ExtentSize != nil {
+			out.extentBytes = spec.ExtentSize.Value()
+		}
+
+		if spec.CatalogSize != nil {
+			out.catalogBytes = spec.CatalogSize.Value()
+		}
 	}
 
-	spec := site.Spec.Components.GantrySnapshotter
-
-	if spec.Segments != nil {
-		out.segments = *spec.Segments
-	}
-
-	if spec.SegmentSize != nil {
-		out.segmentBytes = spec.SegmentSize.Value()
-	}
-
-	if spec.CatalogSize != nil {
-		out.catalogBytes = spec.CatalogSize.Value()
-	}
-
-	if out.segments < 1 {
-		return layout{}, fmt.Errorf("gantrySnapshotter.segments must be at least 1, got %d", out.segments)
-	}
-
-	// Both sizes are checked against the 4 MiB page rather than against their
-	// own kind's page. A segment is a whole IMMUTABLE_4M extent, and the
-	// catalog is a mutable head with nothing after it, which the geometry
-	// parser still requires to end on the tail's alignment.
+	// All three are checked against the 4 MiB page rather than against their
+	// own kind's page. The layer extents are IMMUTABLE_4M, and the catalog is
+	// a mutable head, which the geometry parser requires to end on the tail's
+	// alignment so that the first layer extent starts on a page boundary.
 	for _, check := range []struct {
 		name  string
 		bytes int64
 	}{
-		{name: "segmentSize", bytes: out.segmentBytes},
+		{name: "size", bytes: out.sizeBytes},
+		{name: "extentSize", bytes: out.extentBytes},
 		{name: "catalogSize", bytes: out.catalogBytes},
 	} {
 		if check.bytes <= 0 || check.bytes%racerctrl.HugePage != 0 {
@@ -108,60 +103,60 @@ func layoutFor(site *unboundedv1alpha3.Site) (layout, error) {
 		}
 	}
 
+	// The space is cut into extents of exactly extentSize, because an extent's
+	// page count is frozen when it is allocated and a short one at the end
+	// would be a segment the cleaner treats as the same size as the others.
+	if out.sizeBytes%out.extentBytes != 0 {
+		return layout{}, fmt.Errorf("gantrySnapshotter.size %d must be a multiple of extentSize %d",
+			out.sizeBytes, out.extentBytes)
+	}
+
+	if extents := out.sizeBytes / out.extentBytes; extents > racerctrl.MaxVolumeExtents {
+		return layout{}, fmt.Errorf(
+			"gantrySnapshotter.size %d over extentSize %d needs %d extents, more than the %d a volume may have",
+			out.sizeBytes, out.extentBytes, extents, racerctrl.MaxVolumeExtents)
+	}
+
 	return out, nil
 }
 
-// desiredVolume describes one image volume.
+// desiredVolume describes the image volume.
 type desiredVolume struct {
 	name       string
-	role       string
 	bytes      int64
 	attributes map[string]string
 }
 
-// desiredVolumes enumerates the image volume's members.
-func desiredVolumes(l layout) []desiredVolume {
-	out := make([]desiredVolume, 0, l.segments+1)
-
-	// The catalog is a single mutable extent covering the whole device. OCC
-	// rather than LWW because every node writes to it, and the records are
-	// published with a compare-and-swap so that two nodes ingesting the same
-	// layer cannot both claim the same catalog slot.
-	out = append(out, desiredVolume{
-		name:  volumePrefix + "-catalog",
-		role:  racerctrl.ImageRoleCatalog,
-		bytes: l.catalogBytes,
+// desiredImageVolume renders the image volume's geometry.
+//
+// One volume, whose composition is an OCC catalog extent followed by the
+// IMMUTABLE_4M extents layer bytes are written into. OCC rather than LWW for
+// the catalog because every node writes to it and records are published with a
+// compare-and-swap, so two nodes ingesting the same layer cannot both claim the
+// same slot. The tail carries no mutable head of its own, which is what lets a
+// layer be written as whole 4 MiB pages and read back with a device-mapper
+// linear target rather than a copy.
+func desiredImageVolume(l layout) desiredVolume {
+	return desiredVolume{
+		name:  volumeName,
+		bytes: l.capacity(),
 		attributes: map[string]string{
-			racerctrl.AttrMutableBytes: fmt.Sprintf("%d", l.catalogBytes),
-			racerctrl.AttrMutableKind:  "OCC",
+			racerctrl.AttrMutableBytes:         fmt.Sprintf("%d", l.catalogBytes),
+			racerctrl.AttrMutableKind:          "OCC",
+			racerctrl.AttrImmutablePageSize:    "4Mi",
+			racerctrl.AttrImmutableExtentBytes: fmt.Sprintf("%d", l.extentBytes),
 		},
-	})
-
-	for i := int32(0); i < l.segments; i++ {
-		// No mutable head at all, so the whole device is one IMMUTABLE_4M
-		// extent. That is what lets a layer be written as whole 4 MiB pages and
-		// read back with a device-mapper linear target rather than a copy.
-		out = append(out, desiredVolume{
-			name:  fmt.Sprintf("%s-segment-%d", volumePrefix, i),
-			role:  racerctrl.ImageRoleSegment,
-			bytes: l.segmentBytes,
-			attributes: map[string]string{
-				racerctrl.AttrImmutablePageSize: "4Mi",
-			},
-		})
 	}
-
-	return out
 }
 
-// ensureImageVolumes creates any missing image volumes and reports what is
-// still waiting to be usable.
+// ensureImageVolume creates the image volume if it is missing and reports
+// whether it is still waiting to be usable.
 //
 // It creates and never updates. A racer volume's extent layout is frozen when
 // the allocator places it, so a volume whose size no longer matches the Site
 // cannot be brought into line by writing to it; saying so is the only honest
 // thing to do.
-func ensureImageVolumes(ctx context.Context, env *component.Env, l layout) (string, error) {
+func ensureImageVolume(ctx context.Context, env *component.Env, l layout) (string, error) {
 	// The class is a racer universe. Without it there is nothing to allocate
 	// extents out of, and creating volumes that name a class that does not
 	// exist would just move the wait somewhere less visible.
@@ -174,55 +169,38 @@ func ensureImageVolumes(ctx context.Context, env *component.Env, l layout) (stri
 		return "", fmt.Errorf("get StorageClass %s: %w", storageClassName, err)
 	}
 
-	var (
-		waiting  []string
-		mismatch []string
-	)
+	want := desiredImageVolume(l)
+	existing := &corev1.PersistentVolume{}
 
-	for _, want := range desiredVolumes(l) {
-		existing := &corev1.PersistentVolume{}
-
-		getErr := env.Client.Get(ctx, client.ObjectKey{Name: want.name}, existing)
-		switch {
-		case apierrors.IsNotFound(getErr):
-			if err := env.Client.Create(ctx, buildVolume(env, want)); err != nil && !apierrors.IsAlreadyExists(err) {
-				return "", fmt.Errorf("create image volume %s: %w", want.name, err)
-			}
-
-			waiting = append(waiting, want.name)
-
-			continue
-		case getErr != nil:
-			return "", fmt.Errorf("get image volume %s: %w", want.name, getErr)
+	getErr := env.Client.Get(ctx, client.ObjectKey{Name: want.name}, existing)
+	switch {
+	case apierrors.IsNotFound(getErr):
+		if err := env.Client.Create(ctx, buildVolume(env, want)); err != nil && !apierrors.IsAlreadyExists(err) {
+			return "", fmt.Errorf("create image volume %s: %w", want.name, err)
 		}
 
-		if capacity, ok := existing.Spec.Capacity[corev1.ResourceStorage]; ok && capacity.Value() != want.bytes {
-			mismatch = append(mismatch, fmt.Sprintf("%s is %s, not %s",
-				want.name, capacity.String(), resource.NewQuantity(want.bytes, resource.BinarySI).String()))
-		}
-
-		if existing.Annotations[racerctrl.CompositionAnnotation] == "" {
-			waiting = append(waiting, want.name)
-		}
+		return "waiting for the racer allocator to place " + want.name, nil
+	case getErr != nil:
+		return "", fmt.Errorf("get image volume %s: %w", want.name, getErr)
 	}
 
-	sort.Strings(waiting)
-	sort.Strings(mismatch)
-
-	switch {
-	case len(mismatch) > 0:
+	if capacity, ok := existing.Spec.Capacity[corev1.ResourceStorage]; ok && capacity.Value() != want.bytes {
 		// Reported, not corrected: an extent's page count is frozen for its
 		// life, so the only way to resize is to create a new volume and lose
 		// what is in the old one.
-		return "image volumes cannot be resized in place: " + strings.Join(mismatch, ", "), nil
-	case len(waiting) > 0:
-		return "waiting for the racer allocator to place: " + strings.Join(waiting, ", "), nil
+		return fmt.Sprintf("the image volume cannot be resized in place: %s is %s, not %s",
+			want.name, capacity.String(),
+			resource.NewQuantity(want.bytes, resource.BinarySI).String()), nil
+	}
+
+	if existing.Annotations[racerctrl.CompositionAnnotation] == "" {
+		return "waiting for the racer allocator to place " + want.name, nil
 	}
 
 	return "", nil
 }
 
-// buildVolume renders one image volume.
+// buildVolume renders the image volume.
 func buildVolume(env *component.Env, want desiredVolume) *corev1.PersistentVolume {
 	reclaim := corev1.PersistentVolumeReclaimRetain
 	mode := corev1.PersistentVolumeBlock
@@ -235,16 +213,16 @@ func buildVolume(env *component.Env, want desiredVolume) *corev1.PersistentVolum
 				"app.kubernetes.io/component": "image-volume",
 			},
 			Annotations: map[string]string{
-				racerctrl.ImageRoleAnnotation: want.role,
+				racerctrl.ImageRoleAnnotation: racerctrl.ImageRoleImage,
 			},
 		},
 		Spec: corev1.PersistentVolumeSpec{
 			Capacity: corev1.ResourceList{
 				corev1.ResourceStorage: *resource.NewQuantity(want.bytes, resource.BinarySI),
 			},
-			// Every racer node exports every image volume at once, which is
+			// Every racer node exports the image volume at once, which is
 			// what many-reader access to a shared layer store means. No pod
-			// ever mounts one, so this is documentation rather than
+			// ever mounts it, so this is documentation rather than
 			// enforcement.
 			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
 			PersistentVolumeReclaimPolicy: reclaim,

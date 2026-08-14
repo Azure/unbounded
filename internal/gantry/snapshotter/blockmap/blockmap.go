@@ -176,6 +176,21 @@ func (l WatcherLocator) Locate(addr segment.Address) (string, uint64, uint64, er
 	return set.Locate(addr)
 }
 
+// SegmentRange is the byte range a whole segment occupies, which is what the
+// cleaner discards once a segment has drained.
+func (l WatcherLocator) SegmentRange(id uint32) (string, uint64, uint64, error) {
+	set := l.Watcher.Current()
+	if set == nil {
+		if err := l.Watcher.Err(); err != nil {
+			return "", 0, 0, fmt.Errorf("%w: %w", ErrNoSegments, err)
+		}
+
+		return "", 0, 0, ErrNoSegments
+	}
+
+	return set.SegmentRange(id)
+}
+
 // Options configures a Map.
 type Options struct {
 	// Root is the directory layer mounts are made under.
@@ -260,14 +275,15 @@ func orDefault(v, fallback string) string {
 	return v
 }
 
-// Name is the device mapper name and mount directory for a layer at an address.
+// Name is the device mapper name and mount directory for a layer at a blob.
 //
-// The address is part of the name on purpose. If the cleaner relocates a blob,
-// the name changes, so the stale device cannot be mistaken for the new one and
-// Prune removes it on the next pass. Names are kept short because each one ends
-// up in an overlay mount's option string.
-func (m *Map) Name(layer catalog.Digest, addr segment.Address) string {
-	return m.prefix + layer.Short() + addr.Fingerprint()
+// The blob's placement is part of the name on purpose. If the cleaner relocates
+// a blob, or reclaims the segment it was in and hands those pages to another
+// one, the name changes, so the stale device cannot be mistaken for the new one
+// and Prune removes it on the next pass. Names are kept short because each one
+// ends up in an overlay mount's option string.
+func (m *Map) Name(layer catalog.Digest, blob catalog.Blob) string {
+	return m.prefix + layer.Short() + blob.Address.Fingerprint(blob.Generation)
 }
 
 // Path is where a named device is mounted.
@@ -281,8 +297,8 @@ func (m *Map) Root() string { return m.root }
 // It is idempotent and cheap when the layer is already mounted, which is the
 // common case: this runs once per layer per node, and every container after the
 // first finds the work already done.
-func (m *Map) Ensure(ctx context.Context, layer catalog.Digest, addr segment.Address) (string, error) {
-	device, offset, length, err := m.locator.Locate(addr)
+func (m *Map) Ensure(ctx context.Context, layer catalog.Digest, blob catalog.Blob) (string, error) {
+	device, offset, length, err := m.locator.Locate(blob.Address)
 	if err != nil {
 		return "", err
 	}
@@ -292,7 +308,7 @@ func (m *Map) Ensure(ctx context.Context, layer catalog.Digest, addr segment.Add
 		return "", err
 	}
 
-	name := m.Name(layer, addr)
+	name := m.Name(layer, blob)
 	target := m.Path(name)
 
 	unlock := m.lock(name)
@@ -385,8 +401,8 @@ func (m *Map) Prune(ctx context.Context, keep map[string]struct{}) error {
 }
 
 // Release tears down one layer's mapping.
-func (m *Map) Release(ctx context.Context, layer catalog.Digest, addr segment.Address) error {
-	return m.release(ctx, m.Name(layer, addr))
+func (m *Map) Release(ctx context.Context, layer catalog.Digest, blob catalog.Blob) error {
+	return m.release(ctx, m.Name(layer, blob))
 }
 
 func (m *Map) release(ctx context.Context, name string) error {

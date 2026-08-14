@@ -209,17 +209,19 @@ func MigrationComplete(volume VolumeState, nodes []NodeState) Gate {
 // to drop anything, and its zero is the zero of a node that was never told.
 func CollectionDrained(volume VolumeState, nodes []NodeState) Gate {
 	for _, segment := range volume.Composition {
+		want := volume.TombstoneEpochs[segment.ExtentID]
+
 		for _, node := range carriers(volume, nodes) {
 			if gate := ConfigLoaded(node); !gate.OK {
 				return gate
 			}
 
 			applied, ok := node.Applied.Extents[segment.ExtentID]
-			if !ok || applied.TombstoneEpoch < volume.TombstoneEpoch {
+			if !ok || applied.TombstoneEpoch < want {
 				return Block(
 					"node %s is running volume %s extent %d at tombstone epoch %d, not yet %d",
 					node.Name, volume.Name, segment.ExtentID,
-					applied.TombstoneEpoch, volume.TombstoneEpoch,
+					applied.TombstoneEpoch, want,
 				)
 			}
 
@@ -378,6 +380,86 @@ func membersOf(members Membership, nodes []NodeState) []NodeState {
 	}
 
 	return named
+}
+
+// ReclaimableExtents reports the extents of a volume whose pages are all dead
+// and can therefore have their tombstone epoch advanced. This is R6's garbage
+// collection, as distinct from the collection a volume deletion asks for: here
+// nothing live is destroyed, because there is nothing live left.
+//
+// The rule is the one config.proto states: advance only once every node reports
+// racer_extent_live_pages == 0 at the current epoch, with
+// racer_extent_tombstones above zero as the evidence there is something to
+// collect. A guest that has trimmed every page of an extent produces exactly
+// that state and no other, so this needs no channel the node agent does not
+// already publish.
+//
+// An absent reading is not a zero, but for this gate it does not have to be
+// treated as one: FormatLive omits an extent only when it has neither live
+// pages nor tombstones on that node, which is a node holding nothing and having
+// nothing to lose. What matters is that no node reports a live page, and a node
+// that reports nothing reports no live page.
+//
+// The returned epochs are the value each extent should move to, which is one
+// past where it is now.
+func ReclaimableExtents(volume VolumeState, nodes []NodeState) map[uint32]uint32 {
+	if volume.Phase == PhaseCollecting || volume.NextZone != 0 {
+		// A volume mid-collection or mid-migration has a destructive edit
+		// already in flight; stacking a second one on the same extents would
+		// race the gate that is watching the first.
+		return nil
+	}
+
+	carrying := carriers(volume, nodes)
+	if len(carrying) == 0 {
+		return nil
+	}
+
+	var reclaimable map[uint32]uint32
+
+	for _, segment := range volume.Composition {
+		if !KindIsImmutable(segment.Kind) {
+			// A mutable page's version is not a function of the epoch, so an
+			// advance would not release anything and a tombstone count is not
+			// how a mutable class reports free space.
+			continue
+		}
+
+		var (
+			live       uint64
+			tombstones uint64
+			reported   bool
+		)
+
+		for _, node := range carrying {
+			if gate := ConfigLoaded(node); !gate.OK {
+				// A node whose agent has not installed its configuration is
+				// reporting on some earlier one. Its zero is not evidence.
+				return nil
+			}
+
+			counts, ok := node.Live[segment.ExtentID]
+			if !ok {
+				continue
+			}
+
+			reported = true
+			live += counts.Pages
+			tombstones += counts.Tombstones
+		}
+
+		if !reported || live > 0 || tombstones == 0 {
+			continue
+		}
+
+		if reclaimable == nil {
+			reclaimable = map[uint32]uint32{}
+		}
+
+		reclaimable[segment.ExtentID] = volume.TombstoneEpochs[segment.ExtentID] + 1
+	}
+
+	return reclaimable
 }
 
 // carriers picks the nodes racer ships a volume's extents to: its home zone,

@@ -176,7 +176,7 @@ func newStoreOn(t *testing.T, pages uint32) (*memVolume, *catalog.Store) {
 		t.Fatalf("open: %v", err)
 	}
 
-	if err := s.AddSegment(1, pages); err != nil {
+	if err := s.AddSegment(1, pages, 0); err != nil {
 		t.Fatalf("add segment: %v", err)
 	}
 
@@ -1006,7 +1006,7 @@ func TestIngestRollsIntoTheNextSegment(t *testing.T) {
 	// at a segment that is exactly full.
 	store := newStore(t, 1)
 
-	if err := store.AddSegment(2, 4); err != nil {
+	if err := store.AddSegment(2, 4, 0); err != nil {
 		t.Fatalf("add segment: %v", err)
 	}
 

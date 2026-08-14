@@ -54,7 +54,7 @@ func ready(t *testing.T) (*occDevice, *Store) {
 
 	dev, s := newCatalog(t)
 
-	if err := s.AddSegment(1, 64); err != nil {
+	if err := s.AddSegment(1, 64, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -272,14 +272,15 @@ func TestReserveOutOfPages(t *testing.T) {
 func TestReserveOutOfRecordSlots(t *testing.T) {
 	dev := newOCCDevice()
 
-	// Three blocks: superblock, one segment table block, one record block.
-	if err := Format(dev.client(), FormatOptions{Bytes: 3 * BlockBytes}); err != nil {
+	// Four blocks: superblock, one segment table block, one watermark table
+	// block, one record block.
+	if err := Format(dev.client(), FormatOptions{Bytes: 4 * BlockBytes, WatermarkBlocks: 1}); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 
 	s := open(t, dev)
 
-	if err := s.AddSegment(1, 64); err != nil {
+	if err := s.AddSegment(1, 64, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -809,7 +810,7 @@ func TestAppendSharesABlock(t *testing.T) {
 func TestAddSegmentIsIdempotent(t *testing.T) {
 	_, s := newCatalog(t)
 
-	if err := s.AddSegment(1, 64); err != nil {
+	if err := s.AddSegment(1, 64, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -822,7 +823,7 @@ func TestAddSegmentIsIdempotent(t *testing.T) {
 	}
 
 	// The operator re-announcing a segment must not reset its accounting.
-	if err := s.AddSegment(1, 64); err != nil {
+	if err := s.AddSegment(1, 64, 0); err != nil {
 		t.Fatalf("re-adding a segment: %v", err)
 	}
 
@@ -835,7 +836,7 @@ func TestAddSegmentIsIdempotent(t *testing.T) {
 		t.Fatalf("re-adding a segment moved its cursor: %+v", entries)
 	}
 
-	if err := s.AddSegment(1, 128); err == nil {
+	if err := s.AddSegment(1, 128, 0); err == nil {
 		t.Fatal("a segment silently changed size")
 	}
 }
@@ -843,15 +844,15 @@ func TestAddSegmentIsIdempotent(t *testing.T) {
 func TestAddSegmentRejects(t *testing.T) {
 	_, s := newCatalog(t)
 
-	if err := s.AddSegment(1, 0); err == nil {
+	if err := s.AddSegment(1, 0, 0); err == nil {
 		t.Fatal("want an error for a segment with no capacity")
 	}
 
-	if err := s.AddSegment(0, 64); err == nil {
+	if err := s.AddSegment(0, 64, 0); err == nil {
 		t.Fatal("want an error for segment id 0")
 	}
 
-	if err := s.AddSegment(SegmentsPerBlock+1, 64); err == nil {
+	if err := s.AddSegment(SegmentsPerBlock+1, 64, 0); err == nil {
 		t.Fatal("want an error for a segment past the table")
 	}
 }
@@ -863,7 +864,7 @@ func TestSetOpenSegmentSealsThePrevious(t *testing.T) {
 		t.Fatalf("Reserve: %v", err)
 	}
 
-	if err := s.AddSegment(2, 32); err != nil {
+	if err := s.AddSegment(2, 32, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -910,7 +911,7 @@ func TestSetOpenSegmentRejects(t *testing.T) {
 		t.Fatal("want an error for a segment that is not in the table")
 	}
 
-	if err := s.AddSegment(2, 32); err != nil {
+	if err := s.AddSegment(2, 32, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -931,7 +932,7 @@ func TestReserveRollsIntoTheNextSegment(t *testing.T) {
 
 	s.SetRollObserver(func(r Roll) { rolls = append(rolls, r) })
 
-	if err := s.AddSegment(2, 32); err != nil {
+	if err := s.AddSegment(2, 32, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -988,11 +989,11 @@ func TestReserveRollsPastASegmentTooSmall(t *testing.T) {
 
 	// A segment that cannot hold the blob is no use to this reservation, and
 	// opening it would seal what is left of segment 1 for nothing.
-	if err := s.AddSegment(2, 4); err != nil {
+	if err := s.AddSegment(2, 4, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
-	if err := s.AddSegment(3, 64); err != nil {
+	if err := s.AddSegment(3, 64, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -1022,7 +1023,7 @@ func TestReserveRollsPastASegmentTooSmall(t *testing.T) {
 func TestReserveFullWhenNoSegmentHoldsTheBlob(t *testing.T) {
 	_, s := ready(t)
 
-	if err := s.AddSegment(2, 4); err != nil {
+	if err := s.AddSegment(2, 4, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -1062,7 +1063,7 @@ func TestReserveFullWhenNoSegmentHoldsTheBlob(t *testing.T) {
 func TestReserveRecordsDoesNotRoll(t *testing.T) {
 	_, s := ready(t)
 
-	if err := s.AddSegment(2, 32); err != nil {
+	if err := s.AddSegment(2, 32, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -1086,7 +1087,7 @@ func TestReserveRollConverges(t *testing.T) {
 
 	dev, a := ready(t)
 
-	if err := a.AddSegment(2, 32); err != nil {
+	if err := a.AddSegment(2, 32, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -1161,7 +1162,7 @@ func TestReserveRollSealsAtTheTrueCursor(t *testing.T) {
 
 	dev, a := ready(t)
 
-	if err := a.AddSegment(2, 32); err != nil {
+	if err := a.AddSegment(2, 32, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -1213,7 +1214,7 @@ func TestReserveRollSealsAtTheTrueCursor(t *testing.T) {
 func TestSetOpenSegmentResumesAPartialRoll(t *testing.T) {
 	_, s := ready(t)
 
-	if err := s.AddSegment(2, 32); err != nil {
+	if err := s.AddSegment(2, 32, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 
@@ -1263,7 +1264,7 @@ func TestSetOpenSegmentRetriesALostWrite(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	if err := b.AddSegment(2, 32); err != nil {
+	if err := b.AddSegment(2, 32, 0); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}
 

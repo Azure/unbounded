@@ -466,7 +466,7 @@ func (a *Agent) Reconcile(ctx context.Context) error {
 
 	// Image volumes are exported by every node without anything having asked,
 	// so they are bound here rather than from NodeStageVolume.
-	a.reconcileImageVolumes(cluster, imageVolumeRoles(volumes))
+	a.reconcileImageVolumes(cluster, imageVolumeNames(volumes))
 
 	if err := a.assignFabricMinors(cluster); err != nil {
 		return err

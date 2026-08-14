@@ -11,6 +11,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/clean"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
 )
 
@@ -46,6 +47,16 @@ type daemonMetrics struct {
 	// rolls counts segment rollovers. A sealed segment does not come back
 	// until the cleaner reclaims it, so this is the capacity alarm.
 	rolls prometheus.Counter
+
+	// cycles counts cleaner steps by the phase they reached. Reclamation is
+	// a ladder rather than one operation, so a cluster stuck on any rung is
+	// only visible if each rung is counted separately.
+	cycles *prometheus.CounterVec
+
+	// copied counts the bytes the cleaner has moved out of victim segments.
+	// It is the price of reclamation and the number that says whether the
+	// low-water mark is set too high.
+	copied prometheus.Counter
 }
 
 // newDaemonMetrics registers the daemon's metrics on reg.
@@ -71,6 +82,14 @@ func newDaemonMetrics(reg *metrics.Registry, cat *holder) *daemonMetrics {
 		rolls: reg.NewCounter(metricsSubsystem, prometheus.CounterOpts{
 			Name: "gantry_snapshotter_segment_rolls_total",
 			Help: "Segments sealed because ingest could not fit in them.",
+		}),
+		cycles: reg.NewCounterVec(metricsSubsystem, prometheus.CounterOpts{
+			Name: "gantry_snapshotter_clean_cycles_total",
+			Help: "Cleaner steps, by the phase the step reached.",
+		}, []string{"phase"}),
+		copied: reg.NewCounter(metricsSubsystem, prometheus.CounterOpts{
+			Name: "gantry_snapshotter_clean_copied_bytes_total",
+			Help: "Bytes copied out of segments being reclaimed.",
 		}),
 	}
 
@@ -154,6 +173,12 @@ func (m *daemonMetrics) observeIngest(_ ingest.Request, res ingest.Result, err e
 	if res.Outcome == ingest.OutcomeIngested {
 		m.ingestBytes.Add(float64(res.Blob.Address.ByteLength))
 	}
+}
+
+// observeClean reports one step of the reclamation ladder.
+func (m *daemonMetrics) observeClean(res clean.Result) {
+	m.cycles.WithLabelValues(string(res.Phase)).Inc()
+	m.copied.Add(float64(res.Bytes))
 }
 
 // observeRoll reports one segment rollover.

@@ -75,6 +75,19 @@ type SegmentEntry struct {
 	// ratio.
 	LiveBytes uint64
 	DeadBytes uint64
+
+	// Epoch is the tombstone epoch this entry was written against. It is
+	// the catalog's copy of the extent's epoch, and it is how a reclaim is
+	// noticed: RACER reports nothing when it collects an extent, so the
+	// only evidence is the published epoch running past this one.
+	Epoch uint32
+
+	// RepointGeneration is the superblock generation by which every record
+	// naming this segment had been superseded. It is set when the cleaner
+	// finishes copying survivors out, and it is what the drain gate is
+	// measured against: a node whose watermark has passed it can no longer
+	// resolve a blob to this segment.
+	RepointGeneration uint64
 }
 
 // FreePages is how many 4 MiB pages remain past the append cursor.
@@ -115,6 +128,11 @@ func (e SegmentEntry) Validate() error {
 			ErrCorrupt, e.ID, used, uint64(e.CursorPages)*segment.PageBytes)
 	}
 
+	if e.State == SegmentDraining && e.RepointGeneration == 0 {
+		return fmt.Errorf("%w: segment %d is draining with no repoint generation to drain past",
+			ErrCorrupt, e.ID)
+	}
+
 	return nil
 }
 
@@ -128,6 +146,10 @@ func (e SegmentEntry) Validate() error {
 //	12..16  total pages
 //	16..24  live bytes
 //	24..32  dead bytes
+//	32..36  tombstone epoch
+//	36..40  reserved
+//	40..48  repoint generation
+//	48..64  reserved
 func (e SegmentEntry) MarshalTo(dst []byte) error {
 	if len(dst) != SegmentEntryBytes {
 		return fmt.Errorf("segment entry buffer is %d bytes, want %d", len(dst), SegmentEntryBytes)
@@ -141,6 +163,8 @@ func (e SegmentEntry) MarshalTo(dst []byte) error {
 	binary.LittleEndian.PutUint32(dst[12:16], e.TotalPages)
 	binary.LittleEndian.PutUint64(dst[16:24], e.LiveBytes)
 	binary.LittleEndian.PutUint64(dst[24:32], e.DeadBytes)
+	binary.LittleEndian.PutUint32(dst[32:36], e.Epoch)
+	binary.LittleEndian.PutUint64(dst[40:48], e.RepointGeneration)
 
 	return nil
 }
@@ -164,6 +188,9 @@ func UnmarshalSegmentEntry(src []byte) (SegmentEntry, error) {
 		TotalPages:  binary.LittleEndian.Uint32(src[12:16]),
 		LiveBytes:   binary.LittleEndian.Uint64(src[16:24]),
 		DeadBytes:   binary.LittleEndian.Uint64(src[24:32]),
+
+		Epoch:             binary.LittleEndian.Uint32(src[32:36]),
+		RepointGeneration: binary.LittleEndian.Uint64(src[40:48]),
 	}
 
 	return e, e.Validate()
@@ -276,6 +303,11 @@ type Superblock struct {
 	// every record.
 	SegmentBlocks uint32
 
+	// WatermarkBlocks is how many blocks the node watermark table occupies,
+	// immediately after the segment table. Fixed at format time for the same
+	// reason.
+	WatermarkBlocks uint32
+
 	// TotalBlocks is the catalog extent's size in 4 KiB blocks.
 	TotalBlocks uint64
 }
@@ -289,8 +321,23 @@ func (s Superblock) OpenFreePages() uint32 {
 	return s.OpenTotalPages - s.OpenCursorPages
 }
 
+// WatermarkBlockBase is the first block of the node watermark table.
+func (s Superblock) WatermarkBlockBase() uint64 { return 1 + uint64(s.SegmentBlocks) }
+
 // RecordBlockBase is the first block holding records.
-func (s Superblock) RecordBlockBase() uint64 { return 1 + uint64(s.SegmentBlocks) }
+func (s Superblock) RecordBlockBase() uint64 {
+	return s.WatermarkBlockBase() + uint64(s.WatermarkBlocks)
+}
+
+// WatermarkCapacity is how many nodes the watermark table can hold.
+func (s Superblock) WatermarkCapacity() int {
+	return int(s.WatermarkBlocks) * WatermarksPerBlock
+}
+
+// WatermarkLocation is the block and slot watermark n occupies.
+func (s Superblock) WatermarkLocation(n int) (block uint64, slot int) {
+	return s.WatermarkBlockBase() + uint64(n/WatermarksPerBlock), n % WatermarksPerBlock
+}
 
 // RecordCapacity is how many records the catalog can hold before it is full.
 func (s Superblock) RecordCapacity() uint64 {
@@ -315,6 +362,10 @@ func (s Superblock) Validate() error {
 
 	if s.SegmentBlocks == 0 {
 		return fmt.Errorf("%w: superblock reserves no segment table blocks", ErrCorrupt)
+	}
+
+	if s.WatermarkBlocks == 0 {
+		return fmt.Errorf("%w: superblock reserves no watermark table blocks", ErrCorrupt)
 	}
 
 	if s.TotalBlocks <= s.RecordBlockBase() {
@@ -354,7 +405,8 @@ func (s Superblock) Validate() error {
 //	  32..36  open segment capacity, in 4 MiB pages
 //	  36..40  segment table blocks
 //	  40..48  total blocks
-//	  48..4092 reserved
+//	  48..52  watermark table blocks
+//	  52..4092 reserved
 //	4092..4096 CRC32C over bytes 0..4092
 func (s Superblock) MarshalTo(dst []byte) error {
 	if len(dst) != BlockBytes {
@@ -372,6 +424,7 @@ func (s Superblock) MarshalTo(dst []byte) error {
 	binary.LittleEndian.PutUint32(dst[32:36], s.OpenTotalPages)
 	binary.LittleEndian.PutUint32(dst[36:40], s.SegmentBlocks)
 	binary.LittleEndian.PutUint64(dst[40:48], s.TotalBlocks)
+	binary.LittleEndian.PutUint32(dst[48:52], s.WatermarkBlocks)
 	binary.LittleEndian.PutUint32(dst[BlockBytes-4:], crc32.Checksum(dst[:BlockBytes-4], castagnoli))
 
 	return nil
@@ -413,6 +466,7 @@ func UnmarshalSuperblock(block []byte) (Superblock, error) {
 		OpenTotalPages:  binary.LittleEndian.Uint32(block[32:36]),
 		SegmentBlocks:   binary.LittleEndian.Uint32(block[36:40]),
 		TotalBlocks:     binary.LittleEndian.Uint64(block[40:48]),
+		WatermarkBlocks: binary.LittleEndian.Uint32(block[48:52]),
 	}
 
 	return s, s.Validate()

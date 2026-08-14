@@ -168,11 +168,15 @@ type VolumeState struct {
 	// once and frozen.
 	Composition Composition
 
-	Zone           uint32
-	NextZone       uint32
-	WarmZones      []uint32
-	CacheAdmit     uint32
-	TombstoneEpoch uint32
+	Zone       uint32
+	NextZone   uint32
+	WarmZones  []uint32
+	CacheAdmit uint32
+
+	// TombstoneEpochs is the tombstone cursor of each extent, keyed by extent
+	// id. An extent with no entry is at epoch zero. Reclamation is per extent,
+	// so this cannot be one number for the volume.
+	TombstoneEpochs map[uint32]uint32
 
 	// Phase is the volume's lifecycle phase. The dataplane never sees it: it
 	// exists so the control plane can tell a volume that is being served from
@@ -703,7 +707,7 @@ func (d *Derivation) deriveExtents(
 				Kind:           segment.Kind,
 				Zone:           volume.Zone,
 				NextZone:       volume.NextZone,
-				TombstoneEpoch: volume.TombstoneEpoch,
+				TombstoneEpoch: volume.TombstoneEpochs[segment.ExtentID],
 				CacheAdmit:     volume.CacheAdmit,
 				WarmZones:      warmZonesFor(volume, segment.Kind, reachable),
 			})

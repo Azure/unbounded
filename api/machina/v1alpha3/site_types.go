@@ -209,31 +209,32 @@ type RacerComponentSpec struct {
 
 // GantrySnapshotterComponentSpec configures the gantry snapshotter for a site.
 //
-// The snapshotter needs somewhere to put layers, and that somewhere is a set of
-// ordinary racer volumes the operator provisions: one catalog and some number
-// of segments. Their geometry is here rather than inferred because it cannot be
-// changed afterwards. A segment is a single immutable extent, and an extent's
-// size is frozen when it is allocated; growing the image address space means
-// adding segments, never resizing one.
+// The snapshotter needs somewhere to put layers, and that somewhere is a single
+// racer volume the operator provisions: a catalog extent followed by a run of
+// immutable extents holding the layer bytes. Its geometry is here rather than
+// inferred because it cannot be changed afterwards. A volume's extent list is
+// frozen once the device exists, so the image address space is fixed at
+// creation and reclamation, not growth, is what keeps it usable.
 type GantrySnapshotterComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
 
-	// Segments is how many image segments to provision. Defaults to 4.
+	// Size is the usable capacity for layer bytes. Defaults to 32Gi.
 	//
-	// Layers are packed into segments in whole 4 MiB pages, so the usable
-	// capacity is Segments times SegmentSize. More, smaller segments cost
-	// nothing at rest and bound how much a single lost extent takes with it.
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=1024
+	// It must be a positive multiple of ExtentSize, because the space is cut
+	// into extents of that size and a partial one cannot be allocated.
 	// +optional
-	Segments *int32 `json:"segments,omitempty"`
+	Size *resource.Quantity `json:"size,omitempty"`
 
-	// SegmentSize is the size of each image segment. Defaults to 8Gi.
+	// ExtentSize is the size of one image extent. Defaults to 8Gi.
 	//
-	// It must be a multiple of 4Mi: a segment is an IMMUTABLE_4M extent and
-	// that is its page size.
+	// An extent is the unit of reclamation: the cleaner copies the layers
+	// still in use out of one and then has the whole extent collected, because
+	// racer can only collect a whole extent at a time. Smaller extents make
+	// reclamation cheaper and more frequent; larger ones waste less on the
+	// partially filled extent at the head of the log. It must be a multiple of
+	// 4Mi, which is the page size of an IMMUTABLE_4M extent.
 	// +optional
-	SegmentSize *resource.Quantity `json:"segmentSize,omitempty"`
+	ExtentSize *resource.Quantity `json:"extentSize,omitempty"`
 
 	// CatalogSize is the size of the image catalog. Defaults to 256Mi.
 	//

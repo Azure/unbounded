@@ -244,13 +244,13 @@ func (in *GantryComponentSpec) DeepCopy() *GantryComponentSpec {
 func (in *GantrySnapshotterComponentSpec) DeepCopyInto(out *GantrySnapshotterComponentSpec) {
 	*out = *in
 	in.SiteComponentSpec.DeepCopyInto(&out.SiteComponentSpec)
-	if in.Segments != nil {
-		in, out := &in.Segments, &out.Segments
-		*out = new(int32)
-		**out = **in
+	if in.Size != nil {
+		in, out := &in.Size, &out.Size
+		x := (*in).DeepCopy()
+		*out = &x
 	}
-	if in.SegmentSize != nil {
-		in, out := &in.SegmentSize, &out.SegmentSize
+	if in.ExtentSize != nil {
+		in, out := &in.ExtentSize, &out.ExtentSize
 		x := (*in).DeepCopy()
 		*out = &x
 	}

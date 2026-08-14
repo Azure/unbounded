@@ -22,10 +22,10 @@ Per node:
 
 In the image: `mkfs.erofs` (erofs-utils) and `dmsetup` (lvm2) on `PATH`.
 
-Cluster-wide, the operator must have provisioned the image volume: one
-IMMUTABLE_4M extent per segment plus a small OCC catalog extent, exported as
-block devices on every node. Without it the agent still runs, every lookup
-misses, and containerd unpacks locally exactly as it does today.
+Cluster-wide, the operator must have provisioned the image volume: a small OCC
+catalog extent followed by a run of IMMUTABLE_4M extents, exported as one block
+device on every node. Without it the agent still runs, every lookup misses, and
+containerd unpacks locally exactly as it does today.
 
 ## Install
 
@@ -42,18 +42,23 @@ spec:
       enabled: true
     gantrySnapshotter:
       enabled: true
-      segments: 4
-      segmentSize: 8Gi
+      size: 32Gi
+      extentSize: 8Gi
       catalogSize: 256Mi
 ```
 
-The operator creates one `gantry-image-segment-<n>` PersistentVolume per
-segment plus `gantry-image-catalog`, waits for racer's allocator to stamp a
-composition on each, and applies the manifests. It reports
-`GantrySnapshotterReady` on the Site, staying `ImageVolumesPending` until every
-image volume has been placed. The image volumes are `Retain` and are never
-resized: the extent page count is frozen when the volume is allocated, so
-changing `segmentSize` after the fact is reported and ignored.
+`size` is the usable capacity for layer bytes and must be a whole number of
+`extentSize` extents. `extentSize` is the unit of reclamation: the cleaner
+copies the layers still in use out of one extent and then has the whole extent
+collected, because racer can only collect a whole extent at a time.
+
+The operator creates one `gantry-image` PersistentVolume, waits for racer's
+allocator to stamp a composition on it, and applies the manifests. It reports
+`GantrySnapshotterReady` on the Site, staying `ImageVolumePending` until the
+volume has been placed. The volume is `Retain` and is never resized: a device's
+extent list and an extent's page count are both frozen once the device exists,
+so changing `size` or `extentSize` after the fact is reported and ignored.
+Reclamation, not growth, is what keeps the volume usable.
 
 Watch it come up:
 
@@ -212,16 +217,22 @@ can be tuned without changing its `args`. The ones worth knowing:
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--devices` | `/run/racer/image-devices.json` | Re-read on a timer; the agent picks up new segments without a restart |
+| `--devices` | `/run/racer/image-devices.json` | Re-read on a timer; the agent picks up reclaimed segments without a restart |
 | `--map-root` | `/var/lib/gantry-snapshotter/l` | Where layer mounts appear. Keep it short and under the same parent as `--root`, or deep images run out of mount options |
 | `--work-headroom` | `4Gi` (DaemonSet sets `8Gi`) | Free bytes on the work filesystem an ingest refuses to spend. Raise it above the kubelet's `nodefs` eviction threshold on nodes with small root disks |
 | `--format-catalog` | `false` | The DaemonSet sets it to `true`. Formatting is a compare-and-swap on block zero, so every node may safely try |
 | `--adopt-segments` | `true` | Register newly visible segments and open one for writing if none is open |
+| `--watermark-blocks` | `8` | Drain-gate table size, set at format time. Eight blocks covers a thousand nodes in 32 KiB; a node with no slot is a node the cleaner cannot wait for |
+| `--watermark-grace` | `10m` | How long a node's watermark stands before the cleaner treats it as belonging to a node that is gone. Too short trims pages out from under a slow node; too long lets one decommissioned node stall reclamation |
+| `--clean` | `true` | Runs the reclaim cycle. Turning it off means a sealed segment never comes back |
+| `--clean-interval` | `1m` | One segment advances one step per pass, so a full cycle takes several |
+| `--clean-low-water` | `0.25` | Free fraction of the image volume below which the cleaner starts picking victims |
+| `--clean-max-live` | `0.5` | Live fraction above which a sealed segment is not worth copying out of |
 | `--members-selector` | unset | Enables the peer view that ranks ingest work. Unset means every node ingests every layer |
 | `--election-step` | `30s` | Delay per rendezvous rank. Must exceed one EROFS build plus one segment write, or the deduplication is lost |
 | `--ingest-workers` | `1` | Ingest is off the container start path; making it fast buys nothing and competes with the pods the node is trying to run |
 | `--skip-verify` | `false` | RACER's 4 MiB pages carry no data checksum, so the writer reads its blob back before publishing it. Turn this off only if you have measured that it matters |
-| `--conflict-errnos` | unset | The errno the image device reports for a failed optimistic write. See the design doc's open questions |
+| `--conflict-errnos` | unset | The errno the image device reports for a failed optimistic write. Defaults to `EAGAIN,EBUSY`, which is what RACER reports today |
 | `--metrics-addr` | unset | The DaemonSet sets `:9096`, which serves `/metrics` and `/healthz` |
 | `--pprof` | `false` | Adds `/debug/pprof` to the metrics listener. That listener is on the pod network, so leave it off outside an investigation |
 
@@ -287,17 +298,35 @@ no way to detect this other than noticing the label is missing, so the first
 image layer committed without one logs a warning naming the setting. It is
 logged once per process, not once per layer.
 
-**Segments fill and roll by themselves, and a roll is a capacity warning.**
-Blobs are appended into one segment at a time. The first reservation that does
-not fit seals that segment and moves appends to the lowest empty one that can
-hold the blob, logging `segment full, ingest rolled to the next one`. No
-restart or reconfiguration is involved, and nodes rolling at the same instant
-converge on the same segment. What the message means is that a chunk of the
-image volume has stopped accepting writes until a cleaner reclaims it, so a
-node logging it regularly is a cluster running out of image volume: provision
-more segments before the last one seals. Once no segment can hold a layer,
-ingest logs `catalog: full` and every new layer goes back to being unpacked on
-every node, which costs throughput and nothing else.
+**Segments fill and roll by themselves.** Blobs are appended into one segment
+at a time. The first reservation that does not fit seals that segment and moves
+appends to the lowest empty one that can hold the blob, logging `segment full,
+ingest rolled to the next one`. No restart or reconfiguration is involved, and
+nodes rolling at the same instant converge on the same segment. A steady roll
+rate is normal; what matters is whether reclamation is keeping up with it.
+
+**Reclamation is what gives a sealed segment back.** Once free space falls
+below `--clean-low-water`, one node per segment, chosen by rendezvous hashing,
+walks a sealed segment through four states, one step per pass:
+
+- *Cleaning* copies every layer still in use out of the victim and republishes
+  its catalog record at a higher generation. Readers take the highest
+  generation for a layer, so a node that has not caught up keeps resolving the
+  old location, which is still live.
+- *Draining* waits until every node's watermark has passed that generation,
+  then discards the victim's whole byte range. A discarded IMMUTABLE_4M page
+  reads back as zeroes rather than an error, so this wait is not optional: it
+  is the difference between reclaiming space and silently corrupting a mount
+  another node is still reading.
+- *Empty* happens when the operator sees the extent holds no live pages,
+  advances its tombstone epoch, and racer-ctrl republishes the device map with
+  the new epoch. That is the only signal that the space is actually back.
+
+`gantry_snapshotter_clean_cycles_total{phase}` shows where cycles are ending.
+Cycles piling up in `waiting` mean a node is not publishing a watermark: check
+that it has `--node-name` set and that its `Cleanup` is running. Once no
+segment can hold a layer, ingest logs `catalog: full` and every new layer goes
+back to being unpacked on every node, which costs throughput and nothing else.
 
 ## Resetting the layer store
 
@@ -309,7 +338,8 @@ the leftover records produces a catalog that reports zero records and then
 collides with the residue on its first append.
 
 To start over, replace the image volume and let the operator rebuild it on
-fresh extents:
+fresh extents. This is the last resort: reclamation handles a full volume on
+its own, and this does not.
 
 ```sh
 # Nothing may hold the block devices while the volumes go away.

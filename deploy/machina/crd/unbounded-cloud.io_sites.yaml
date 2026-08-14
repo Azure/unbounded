@@ -125,28 +125,32 @@ spec:
                       enabled:
                         description: Enabled controls whether the component is reconciled.
                         type: boolean
-                      segmentSize:
+                      extentSize:
                         anyOf:
                         - type: integer
                         - type: string
                         description: |-
-                          SegmentSize is the size of each image segment. Defaults to 8Gi.
+                          ExtentSize is the size of one image extent. Defaults to 8Gi.
 
-                          It must be a multiple of 4Mi: a segment is an IMMUTABLE_4M extent and
-                          that is its page size.
+                          An extent is the unit of reclamation: the cleaner copies the layers
+                          still in use out of one and then has the whole extent collected, because
+                          racer can only collect a whole extent at a time. Smaller extents make
+                          reclamation cheaper and more frequent; larger ones waste less on the
+                          partially filled extent at the head of the log. It must be a multiple of
+                          4Mi, which is the page size of an IMMUTABLE_4M extent.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
-                      segments:
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
                         description: |-
-                          Segments is how many image segments to provision. Defaults to 4.
+                          Size is the usable capacity for layer bytes. Defaults to 32Gi.
 
-                          Layers are packed into segments in whole 4 MiB pages, so the usable
-                          capacity is Segments times SegmentSize. More, smaller segments cost
-                          nothing at rest and bound how much a single lost extent takes with it.
-                        format: int32
-                        maximum: 1024
-                        minimum: 1
-                        type: integer
+                          It must be a positive multiple of ExtentSize, because the space is cut
+                          into extents of that size and a partial one cannot be allocated.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
                     type: object
                   machina:
                     description: Machina configures the machina controller for this

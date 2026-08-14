@@ -52,7 +52,6 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
-	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
 )
 
 const (
@@ -111,13 +110,18 @@ type Catalog interface {
 	Blob(diffID catalog.Digest) (catalog.Blob, bool)
 	// Sync re-reads records published by other nodes.
 	Sync() (bool, error)
+	// Generation is the catalog generation this node's index has applied.
+	Generation() uint64
+	// Watermark publishes how far this node has caught up. It is what the
+	// cleaner waits on before it trims a segment.
+	Watermark(generation uint64) error
 }
 
 // Mapper turns a blob address into a mounted read-only filesystem. It is
 // satisfied by *blockmap.Map.
 type Mapper interface {
-	Ensure(ctx context.Context, layer catalog.Digest, addr segment.Address) (string, error)
-	Name(layer catalog.Digest, addr segment.Address) string
+	Ensure(ctx context.Context, layer catalog.Digest, blob catalog.Blob) (string, error)
+	Name(layer catalog.Digest, blob catalog.Blob) string
 	Root() string
 	Prune(ctx context.Context, keep map[string]struct{}) error
 }
@@ -496,7 +500,7 @@ func (s *Snapshotter) adopt(ctx context.Context, key, parent, target string, bas
 	// idempotent, and Cleanup keeps the mapping for as long as a snapshot
 	// refers to it. If the adoption below then fails, the mapping is left for
 	// Prune, which collects anything no snapshot names.
-	if _, err := s.maps.Ensure(ctx, blob.DiffID, blob.Address); err != nil {
+	if _, err := s.maps.Ensure(ctx, blob.DiffID, blob); err != nil {
 		return false, fmt.Errorf("map layer %s: %w", blob.DiffID.Short(), err)
 	}
 
@@ -671,6 +675,13 @@ func (s *Snapshotter) Cleanup(ctx context.Context) error {
 		ok   bool
 	)
 
+	// Read before the scan, not after. The watermark published at the end
+	// promises that this node's mappings have been pruned against an index at
+	// least this fresh, and an index only ever moves forward, so a generation
+	// taken early understates the truth. Taken late it could overstate it, and
+	// overstating is what lets the cleaner trim pages out from under a mount.
+	generation := s.cat.Generation()
+
 	// A write transaction is taken so no snapshot can be created while the scan
 	// is deciding what is unreferenced.
 	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
@@ -704,6 +715,12 @@ func (s *Snapshotter) Cleanup(ctx context.Context) error {
 	if ok {
 		if err := s.maps.Prune(ctx, keep); err != nil {
 			errs = append(errs, fmt.Errorf("prune mappings: %w", err))
+		} else if err := s.cat.Watermark(generation); err != nil {
+			// Not fatal. A node that cannot publish its watermark holds the
+			// cleaner up, which is the safe direction: reclamation stalls
+			// rather than running ahead of a node that might still be mapping
+			// the segment it wants to trim.
+			s.log.Warn("gantry-snapshotter: cannot publish drain watermark", "err", err)
 		}
 	} else {
 		s.log.Warn("gantry-snapshotter: skipping mapping prune, some layers did not resolve")
@@ -766,7 +783,7 @@ func (s *Snapshotter) liveMappings(ctx context.Context) (map[string]struct{}, bo
 			return nil
 		}
 
-		keep[s.maps.Name(diffID, blob.Address)] = struct{}{}
+		keep[s.maps.Name(diffID, blob)] = struct{}{}
 
 		return nil
 	})

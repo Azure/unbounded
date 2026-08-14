@@ -31,6 +31,10 @@ func (p *pass) sequence(ctx context.Context) error {
 		return err
 	}
 
+	if err := p.reclaimDeadExtents(ctx); err != nil {
+		return err
+	}
+
 	if err := p.recoverOrphanVolumes(ctx); err != nil {
 		return err
 	}
@@ -99,17 +103,65 @@ func (p *pass) finishMigrations(ctx context.Context) error {
 	return nil
 }
 
+// reclaimDeadExtents is R6's garbage collection: it advances the tombstone
+// epoch of an extent every node already reports as holding no live pages.
+//
+// This is the counterpart to collectDeletedVolumes and the opposite case. There,
+// live pages are destroyed because a human asked for the volume to go. Here
+// nothing live is destroyed, because a guest has already trimmed every page and
+// the only thing an advance releases is the tombstones those trims left behind.
+// racer holds a trimmed 4 MiB page's slot until the epoch moves, so without this
+// a guest that fills and trims an extent can never reuse the space.
+//
+// A trimmed page is unreadable and unwritable already, so the advance changes
+// nothing a guest can observe except that the addresses become writable again.
+// That is why it needs no phase, no drain and no finalizer: the guest performed
+// the destructive step itself when it issued the discard, and it is the guest's
+// job to have stopped reading the extent first.
+func (p *pass) reclaimDeadExtents(ctx context.Context) error {
+	states := p.nodeStates()
+
+	for i := range p.universes {
+		view := &p.universes[i]
+		if view.state.Deleting {
+			continue
+		}
+
+		for j := range view.volumes {
+			volume := &view.volumes[j]
+			if volume.pv.DeletionTimestamp != nil || len(volume.state.Composition) == 0 {
+				continue
+			}
+
+			advanced := racerctrl.ReclaimableExtents(volume.state, states)
+			if len(advanced) == 0 {
+				continue
+			}
+
+			epochs := make(map[uint32]uint32, len(volume.state.Composition))
+			for id, epoch := range volume.state.TombstoneEpochs {
+				epochs[id] = epoch
+			}
+
+			for id, epoch := range advanced {
+				epochs[id] = epoch
+			}
+
+			annotations := map[string]string{
+				racerctrl.TombstoneEpochAnnotation: racerctrl.FormatTombstoneEpochs(epochs),
+			}
+
+			if err := p.patchVolume(ctx, volume, annotations, nil); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 // collectDeletedVolumes drives a deleted volume's extents to nothing and then
-// lets the object go.
-//
-// Advancing tombstone_epoch is the destructive act: it declares every page
-// written before that epoch dead, and nothing brings them back. It is done here,
-// and only here, because deleting the PersistentVolume under a Delete reclaim
-// policy is the one place a human has actually asked for the data to be
-// destroyed. This is deliberately not the same thing as R6's garbage collection,
-// which advances the epoch only once every node already reports zero live pages;
-// here the pages are live and destroying them is the request.
-//
+
 // The finalizer is what keeps the composition readable while that happens. Drop
 // it early and the extent ids, base addresses and page counts vanish with the
 // object, leaving every node holding pages that nothing can name.
@@ -141,21 +193,34 @@ func (p *pass) collectVolume(ctx context.Context, view *universeView, volume *vo
 	}
 
 	if volume.state.Phase != racerctrl.PhaseCollecting {
-		epoch := view.state.Epoch
-		if epoch <= volume.state.TombstoneEpoch {
-			epoch = volume.state.TombstoneEpoch + 1
+		// Every extent goes at once: the request was to destroy the volume, so
+		// there is no extent worth keeping. The universe's topology epoch is a
+		// number nothing else in this volume can already be at, which saves
+		// picking one per extent.
+		epochs := make(map[uint32]uint32, len(volume.state.Composition))
+
+		highest := view.state.Epoch
+
+		for _, segment := range volume.state.Composition {
+			if at := volume.state.TombstoneEpochs[segment.ExtentID]; at >= highest {
+				highest = at + 1
+			}
+		}
+
+		for _, segment := range volume.state.Composition {
+			epochs[segment.ExtentID] = highest
 		}
 
 		annotations := map[string]string{
 			racerctrl.PhaseAnnotation:          racerctrl.PhaseCollecting,
-			racerctrl.TombstoneEpochAnnotation: formatUint(uint64(epoch)),
+			racerctrl.TombstoneEpochAnnotation: racerctrl.FormatTombstoneEpochs(epochs),
 		}
 
 		if err := p.patchVolume(ctx, volume, annotations, nil); err != nil {
 			return err
 		}
 
-		p.wait("volume %s tombstoned at epoch %d", volume.pv.Name, epoch)
+		p.wait("volume %s tombstoned at epoch %d", volume.pv.Name, highest)
 
 		return nil
 	}

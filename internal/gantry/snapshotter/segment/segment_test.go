@@ -12,13 +12,17 @@ import (
 	"time"
 )
 
+// The catalog head is 16 MiB, so the first segment starts there and the
+// second one 16 GiB after it. Offsets are what a segment is addressed by now,
+// so the fixture carries the real arithmetic rather than round numbers.
 const validMap = `{
   "generation": 7,
   "universe": 3,
-  "catalog": {"device": "/dev/ublkb199", "bytes": 16777216},
+  "device": "/dev/ublkb200",
+  "catalogBytes": 16777216,
   "segments": [
-    {"id": 2, "device": "/dev/ublkb201", "bytes": 17179869184},
-    {"id": 1, "device": "/dev/ublkb200", "bytes": 17179869184}
+    {"id": 2, "offset": 17196646400, "bytes": 17179869184, "epoch": 0},
+    {"id": 1, "offset": 16777216, "bytes": 17179869184, "epoch": 4}
   ]
 }`
 
@@ -41,12 +45,20 @@ func TestParseSortsAndIndexes(t *testing.T) {
 		t.Fatalf("Segment(2): %v", err)
 	}
 
-	if seg.Device != "/dev/ublkb201" {
-		t.Fatalf("got device %q, want /dev/ublkb201", seg.Device)
+	if seg.Offset != 16<<20+16<<30 {
+		t.Fatalf("got offset %d, want %d", seg.Offset, 16<<20+16<<30)
 	}
 
 	if got := seg.Pages(); got != 4096 {
 		t.Fatalf("got %d pages, want 4096", got)
+	}
+
+	if got := seg.End(); got != seg.Offset+seg.Bytes {
+		t.Fatalf("got end %d, want %d", got, seg.Offset+seg.Bytes)
+	}
+
+	if first, err := set.Segment(1); err != nil || first.Epoch != 4 {
+		t.Fatalf("got segment %+v err %v, want epoch 4", first, err)
 	}
 }
 
@@ -63,14 +75,27 @@ func TestSegmentUnknown(t *testing.T) {
 
 func TestParseRejects(t *testing.T) {
 	cases := map[string]string{
-		"not json":          `{`,
-		"unknown field":     `{"generation": 1, "segments": [], "surprise": true}`,
-		"segment id zero":   `{"generation":1,"segments":[{"id":0,"device":"/dev/x","bytes":4194304}]}`,
-		"duplicate id":      `{"generation":1,"segments":[{"id":1,"device":"/dev/x","bytes":4194304},{"id":1,"device":"/dev/y","bytes":4194304}]}`,
-		"no device":         `{"generation":1,"segments":[{"id":1,"device":"","bytes":4194304}]}`,
-		"zero bytes":        `{"generation":1,"segments":[{"id":1,"device":"/dev/x","bytes":0}]}`,
-		"unaligned bytes":   `{"generation":1,"segments":[{"id":1,"device":"/dev/x","bytes":4194305}]}`,
-		"sub-page capacity": `{"generation":1,"segments":[{"id":1,"device":"/dev/x","bytes":4096}]}`,
+		"not json":      `{`,
+		"unknown field": `{"generation": 1, "segments": [], "surprise": true}`,
+		"per-segment device": `{"generation":1,"device":"/dev/x","segments":` +
+			`[{"id":1,"device":"/dev/y","offset":4194304,"bytes":4194304}]}`,
+		"segment id zero": `{"generation":1,"device":"/dev/x","segments":` +
+			`[{"id":0,"offset":4194304,"bytes":4194304}]}`,
+		"duplicate id": `{"generation":1,"device":"/dev/x","segments":` +
+			`[{"id":1,"offset":4194304,"bytes":4194304},{"id":1,"offset":8388608,"bytes":4194304}]}`,
+		"no device": `{"generation":1,"segments":[{"id":1,"offset":4194304,"bytes":4194304}]}`,
+		"zero bytes": `{"generation":1,"device":"/dev/x","segments":` +
+			`[{"id":1,"offset":4194304,"bytes":0}]}`,
+		"unaligned bytes": `{"generation":1,"device":"/dev/x","segments":` +
+			`[{"id":1,"offset":4194304,"bytes":4194305}]}`,
+		"sub-page capacity": `{"generation":1,"device":"/dev/x","segments":` +
+			`[{"id":1,"offset":4194304,"bytes":4096}]}`,
+		"unaligned offset": `{"generation":1,"device":"/dev/x","segments":` +
+			`[{"id":1,"offset":4096,"bytes":4194304}]}`,
+		"inside the catalog": `{"generation":1,"device":"/dev/x","catalogBytes":8388608,"segments":` +
+			`[{"id":1,"offset":4194304,"bytes":4194304}]}`,
+		"overlapping": `{"generation":1,"device":"/dev/x","segments":` +
+			`[{"id":1,"offset":4194304,"bytes":8388608},{"id":2,"offset":8388608,"bytes":4194304}]}`,
 	}
 
 	for name, body := range cases {
@@ -93,7 +118,9 @@ func TestCatalogDevice(t *testing.T) {
 		t.Fatalf("CatalogDevice: %v", err)
 	}
 
-	if cat.Device != "/dev/ublkb199" || cat.Bytes != 16<<20 {
+	// The catalog shares the image device with every segment: it is the
+	// volume's mutable head, so it is always at offset zero.
+	if cat.Device != "/dev/ublkb200" || cat.Bytes != 16<<20 {
 		t.Fatalf("got %+v", cat)
 	}
 
@@ -106,13 +133,33 @@ func TestCatalogDevice(t *testing.T) {
 		t.Fatalf("got %v, want ErrNoCatalog", err)
 	}
 
-	unaligned, err := Parse([]byte(`{"generation":1,"catalog":{"device":"/dev/x","bytes":100},"segments":[]}`))
+	unaligned, err := Parse([]byte(`{"generation":1,"device":"/dev/x","catalogBytes":100,"segments":[]}`))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
 
 	if _, err := unaligned.CatalogDevice(); err == nil {
 		t.Fatal("want error for an unaligned catalog, got nil")
+	}
+}
+
+func TestSegmentRange(t *testing.T) {
+	set, err := Parse([]byte(validMap))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	device, offset, length, err := set.SegmentRange(1)
+	if err != nil {
+		t.Fatalf("SegmentRange: %v", err)
+	}
+
+	if device != "/dev/ublkb200" || offset != 16<<20 || length != 16<<30 {
+		t.Fatalf("got %q %d %d", device, offset, length)
+	}
+
+	if _, _, _, err := set.SegmentRange(9); !errors.Is(err, ErrUnknownSegment) {
+		t.Fatalf("got %v, want ErrUnknownSegment", err)
 	}
 }
 
@@ -137,6 +184,22 @@ func TestPagesFor(t *testing.T) {
 		if got := PaddedSize(c.bytes); got != uint64(c.pages)*PageBytes {
 			t.Fatalf("PaddedSize(%d) = %d, want %d", c.bytes, got, uint64(c.pages)*PageBytes)
 		}
+	}
+}
+
+func TestFingerprintTracksTheGeneration(t *testing.T) {
+	addr := Address{Segment: 1, PageOffset: 3, PageCount: 2, ByteLength: PageBytes + 1}
+
+	// Reclamation hands the same pages to a different blob, so a name that
+	// did not move with the generation would let a stale dm mapping be
+	// adopted for the new occupant.
+	want := addr.Fingerprint(1)
+	if want == addr.Fingerprint(2) {
+		t.Fatal("fingerprint did not change with the generation")
+	}
+
+	if again := addr.Fingerprint(1); again != want {
+		t.Fatalf("fingerprint is not stable: %s then %s", want, again)
 	}
 }
 
@@ -181,8 +244,10 @@ func TestLocate(t *testing.T) {
 		t.Fatalf("got device %q", device)
 	}
 
-	if offset != 3*PageBytes {
-		t.Fatalf("got offset %d, want %d", offset, 3*PageBytes)
+	// The segment's own offset plus the blob's offset within it: an address
+	// is relative to its segment and the device is one flat space.
+	if want := uint64(16<<20) + 3*PageBytes; offset != want {
+		t.Fatalf("got offset %d, want %d", offset, want)
 	}
 
 	if length != 2*PageBytes {
@@ -259,7 +324,7 @@ func TestWatcherRefusesOlderGeneration(t *testing.T) {
 		t.Fatalf("Refresh: %v", err)
 	}
 
-	writeFile(t, path, `{"generation":3,"catalog":{"device":"/dev/other","bytes":4096},"segments":[]}`)
+	writeFile(t, path, `{"generation":3,"device":"/dev/other","catalogBytes":4096,"segments":[]}`)
 
 	if err := w.Refresh(); err != nil {
 		t.Fatalf("Refresh: %v", err)

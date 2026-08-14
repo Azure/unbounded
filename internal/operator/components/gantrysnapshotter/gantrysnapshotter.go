@@ -5,18 +5,18 @@
 // component: a containerd snapshotter that reads container image layers out of
 // RACER instead of pulling and unpacking them per node.
 //
-// The component installs two DaemonSets and provisions the volumes they read.
-// The volumes are the interesting half. A racer volume's geometry is frozen at
+// The component installs two DaemonSets and provisions the volume they read.
+// The volume is the interesting half. A racer volume's geometry is frozen at
 // creation and racer has no controller service, so nothing in the cluster
 // creates PersistentVolumes on demand; the racer allocator only assigns extents
 // to volumes that already exist. This component is therefore where the image
-// volume comes from, and it creates it statically: one IMMUTABLE_4M volume per
-// segment for the layer bytes, plus one small OCC volume for the catalog that
-// maps a containerd chain ID to a byte range in a segment.
+// volume comes from, and it creates it statically: one volume whose composition
+// is a small OCC catalog extent, mapping a containerd chain ID to a byte range,
+// followed by the IMMUTABLE_4M extents the layer bytes live in.
 //
 // The division of labour with the racer component is deliberate and worth
-// stating: this component only ever creates those PersistentVolumes, and the
-// racer component only ever annotates them. Two writers of the same racer
+// stating: this component only ever creates that PersistentVolume, and the
+// racer component only ever annotates it. Two writers of the same racer
 // annotations would race over extent allocation, which is not recoverable
 // because an allocated extent is a byte range other volumes are then placed
 // after.
@@ -121,7 +121,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 		return component.Failed(err)
 	}
 
-	pending, err := ensureImageVolumes(ctx, env, layout)
+	pending, err := ensureImageVolume(ctx, env, layout)
 	if err != nil {
 		return component.Failed(err)
 	}
@@ -131,7 +131,7 @@ func (Component) Reconcile(ctx context.Context, env *component.Env, sites []unbo
 	}
 
 	if pending != "" {
-		return component.NotReadyAfter("ImageVolumesPending", pending, requeueInterval)
+		return component.NotReadyAfter("ImageVolumePending", pending, requeueInterval)
 	}
 
 	return component.Reconciled()

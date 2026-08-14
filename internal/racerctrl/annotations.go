@@ -200,37 +200,38 @@ const (
 	// CacheAdmitAnnotation is the read-cache admission class, 0 to 15.
 	CacheAdmitAnnotation = AnnotationDomain + "cache-admit"
 
-	// TombstoneEpochAnnotation is the per-volume tombstone cursor. Advancing it
-	// is destructive and never reversible, so the operator only does so once
-	// every catalog node reports the extent holds no live pages.
+	// TombstoneEpochAnnotation is the per-extent tombstone cursor, as
+	// `<extentID>?epoch=<n>`. Advancing an extent's cursor is destructive and
+	// never reversible: every page in that extent, live ones included, becomes
+	// unreadable the moment the config lands, with no consensus round.
+	//
+	// It is per extent rather than per volume because the extent is the unit
+	// racer reclaims. A volume cut into extents can retire one of them and keep
+	// serving the rest, which is the whole reason to cut it up.
 	TombstoneEpochAnnotation = AnnotationDomain + "tombstone-epoch"
 
 	// PhaseAnnotation tracks where a volume is in its lifecycle, so a restarted
 	// operator resumes a destructive sequence rather than restarting it.
 	PhaseAnnotation = AnnotationDomain + "phase"
 
-	// ImageRoleAnnotation marks a volume as part of the cluster image volume:
-	// the shared, node-agnostic address space gantry-snapshotter stores OCI
-	// layers in. Its value is ImageRoleSegment or ImageRoleCatalog.
+	// ImageRoleAnnotation marks a volume as the cluster image volume: the
+	// shared, node-agnostic address space gantry-snapshotter stores OCI layers
+	// in. Its only value is ImageRoleImage.
 	//
 	// An image volume is not staged through CSI. Every node that runs racer
-	// exports every one of them unconditionally, because the whole point is
-	// that a layer written once is readable from everywhere without a pod
-	// having claimed anything. The annotation is what tells the node agent to
-	// bind a device for a volume no kubelet will ever ask it about.
+	// exports it unconditionally, because the whole point is that a layer
+	// written once is readable from everywhere without a pod having claimed
+	// anything. The annotation is what tells the node agent to bind a device
+	// for a volume no kubelet will ever ask it about.
 	ImageRoleAnnotation = AnnotationDomain + "image-role"
 )
 
-// Image volume roles.
-const (
-	// ImageRoleSegment is a segment of the image address space: one
-	// IMMUTABLE_4M extent that layer bytes are written into.
-	ImageRoleSegment = "segment"
-
-	// ImageRoleCatalog is the image volume's catalog: one small OCC extent
-	// holding the chain-id and diff-id records that name the segments.
-	ImageRoleCatalog = "catalog"
-)
+// ImageRoleImage marks the cluster image volume. It is one volume, whose
+// composition is an OCC catalog extent followed by the IMMUTABLE_4M extents
+// that layer bytes are written into, and the whole of it is exported as a
+// single device. The snapshotter tells the two apart by offset, so nothing
+// needs a per-extent role.
+const ImageRoleImage = "image"
 
 // UniverseFinalizer holds a StorageClass until all of its volumes and membership
 // state have been retired.

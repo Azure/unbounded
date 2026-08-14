@@ -58,7 +58,7 @@ const (
 	RecordsPerBlock = (BlockBytes - recordPageHeaderBytes) / RecordBytes
 
 	// SegmentEntryBytes is the fixed size of one segment table entry.
-	SegmentEntryBytes = 32
+	SegmentEntryBytes = 64
 
 	// segmentPageHeaderBytes mirrors recordPageHeaderBytes for the segment
 	// table.
@@ -66,6 +66,16 @@ const (
 
 	// SegmentsPerBlock is how many segment table entries fit in a block.
 	SegmentsPerBlock = (BlockBytes - segmentPageHeaderBytes) / SegmentEntryBytes
+
+	// WatermarkEntryBytes is the fixed size of one node watermark entry.
+	WatermarkEntryBytes = 32
+
+	// watermarkPageHeaderBytes mirrors recordPageHeaderBytes for the
+	// watermark table.
+	watermarkPageHeaderBytes = 8
+
+	// WatermarksPerBlock is how many node watermarks fit in a block.
+	WatermarksPerBlock = (BlockBytes - watermarkPageHeaderBytes) / WatermarkEntryBytes
 
 	// Magic identifies a gantry-snapshotter catalog superblock.
 	Magic = 0x47534E50 // "GSNP"

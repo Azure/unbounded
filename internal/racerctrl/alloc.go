@@ -729,3 +729,81 @@ func parseSegment(values url.Values) (Segment, error) {
 		Kind:     kind,
 	}, nil
 }
+
+// tombstoneEpochKey is the query key in the tombstone epoch annotation.
+const tombstoneEpochKey = "epoch"
+
+// FormatTombstoneEpochs renders a volume's per-extent tombstone cursors as
+// `<extentID>?epoch=<n>`. Extents at epoch zero are omitted, since that is what
+// an absent extent already means and the annotation has a size ceiling to
+// respect.
+func FormatTombstoneEpochs(epochs map[uint32]uint32) string {
+	ids := make([]uint32, 0, len(epochs))
+
+	for id, epoch := range epochs {
+		if epoch == 0 {
+			continue
+		}
+
+		ids = append(ids, id)
+	}
+
+	if len(ids) == 0 {
+		return ""
+	}
+
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	entries := make([]ListEntry, 0, len(ids))
+
+	for _, id := range ids {
+		values := url.Values{}
+		values.Set(tombstoneEpochKey, strconv.FormatUint(uint64(epochs[id]), 10))
+
+		entries = append(entries, ListEntry{
+			Item:   strconv.FormatUint(uint64(id), 10),
+			Values: values,
+		})
+	}
+
+	return FormatList(entries)
+}
+
+// ParseTombstoneEpochs reads them back. An empty annotation is every extent at
+// epoch zero, which is what a volume nothing has ever collected looks like.
+func ParseTombstoneEpochs(raw string) (map[uint32]uint32, error) {
+	if raw == "" {
+		return nil, nil
+	}
+
+	entries, err := ParseList(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	epochs := make(map[uint32]uint32, len(entries))
+
+	for _, entry := range entries {
+		id, err := ParseUint32(entry.Item)
+		if err != nil {
+			return nil, err
+		}
+
+		if id == 0 {
+			return nil, fmt.Errorf("extent id must not be zero")
+		}
+
+		if _, dup := epochs[id]; dup {
+			return nil, fmt.Errorf("extent %d listed twice", id)
+		}
+
+		epoch, err := uint32Value(entry.Values, tombstoneEpochKey)
+		if err != nil {
+			return nil, fmt.Errorf("extent %d: %w", id, err)
+		}
+
+		epochs[id] = epoch
+	}
+
+	return epochs, nil
+}

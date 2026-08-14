@@ -365,7 +365,7 @@ func (s *Snapshotter) parentPaths(ctx context.Context, parents []parentRef) ([]s
 					p.Name, p.DiffID.Short(), errdefs.ErrNotFound)
 			}
 
-			path, err := s.maps.Ensure(gctx, p.DiffID, blob.Address)
+			path, err := s.maps.Ensure(gctx, p.DiffID, blob)
 			if err != nil {
 				return fmt.Errorf("snapshot %q: map layer %s: %w", p.Name, p.DiffID.Short(), err)
 			}

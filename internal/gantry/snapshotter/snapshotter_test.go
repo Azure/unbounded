@@ -44,6 +44,8 @@ type fakeCatalog struct {
 	// onSync publishes records the way another node's ingest would.
 	onSync  func(c *fakeCatalog)
 	syncErr error
+	// watermark is the last generation published to the drain gate.
+	watermark uint64
 }
 
 func newCatalog() *fakeCatalog {
@@ -102,6 +104,33 @@ func (c *fakeCatalog) Sync() (bool, error) {
 	return true, nil
 }
 
+// Generation is the catalog generation this fake has applied. The real one
+// only advances it once the index has caught up with the record count; nothing
+// here writes records behind the index's back, so the count of syncs is a
+// faithful stand-in.
+func (c *fakeCatalog) Generation() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return uint64(c.syncs)
+}
+
+func (c *fakeCatalog) Watermark(generation uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.watermark = generation
+
+	return nil
+}
+
+func (c *fakeCatalog) watermarkAt() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.watermark
+}
+
 func (c *fakeCatalog) syncCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -125,13 +154,13 @@ func newMapper(t *testing.T) *fakeMapper {
 	return &fakeMapper{root: t.TempDir(), ensured: map[string]int{}}
 }
 
-func (m *fakeMapper) Name(layer catalog.Digest, addr segment.Address) string {
-	return "gsnap-" + layer.Short() + addr.Fingerprint()
+func (m *fakeMapper) Name(layer catalog.Digest, blob catalog.Blob) string {
+	return "gsnap-" + layer.Short() + blob.Address.Fingerprint(blob.Generation)
 }
 
 func (m *fakeMapper) Root() string { return m.root }
 
-func (m *fakeMapper) Ensure(_ context.Context, layer catalog.Digest, addr segment.Address) (string, error) {
+func (m *fakeMapper) Ensure(_ context.Context, layer catalog.Digest, blob catalog.Blob) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -139,7 +168,7 @@ func (m *fakeMapper) Ensure(_ context.Context, layer catalog.Digest, addr segmen
 		return "", m.err
 	}
 
-	name := m.Name(layer, addr)
+	name := m.Name(layer, blob)
 	m.ensured[name]++
 
 	return filepath.Join(m.root, name), nil
@@ -288,6 +317,13 @@ func addrOf(page uint32) segment.Address {
 	return segment.Address{Segment: 1, PageOffset: page, PageCount: 1, ByteLength: 1 << 20}
 }
 
+// blobOf is what the catalog resolves addrOf(page) to. The generation matters
+// as much as the address does: it is folded into the mapping name so a segment
+// handed to a new blob after a reclaim cannot be served out of the old device.
+func blobOf(page uint32) catalog.Blob {
+	return catalog.Blob{Address: addrOf(page), Generation: 1}
+}
+
 // layerDigestString is a compressed layer digest in the form the CRI label uses.
 func layerDigestString(b byte) string { return digestOf(b).String() }
 
@@ -398,7 +434,7 @@ func TestPrepareHitSkipsTheLayer(t *testing.T) {
 	// The layer was mapped before the promise was made. Adopting a layer this
 	// node cannot read would be unrecoverable, because containerd never
 	// revisits a chain ID it has been told already exists.
-	name := h.m.Name(diffID, addrOf(0))
+	name := h.m.Name(diffID, blobOf(0))
 	if h.m.ensured[name] != 1 {
 		t.Fatalf("adoption mapped %q %d times, want 1", name, h.m.ensured[name])
 	}
@@ -652,11 +688,11 @@ func TestMountsStackClusterLayers(t *testing.T) {
 	}
 
 	// Nearest parent first, which for overlayfs means the topmost layer.
-	if want := filepath.Join(h.m.root, h.m.Name(diff1, addrOf(1))); dirs[0] != want {
+	if want := filepath.Join(h.m.root, h.m.Name(diff1, blobOf(1))); dirs[0] != want {
 		t.Fatalf("lowerdir[0] = %q, want %q", dirs[0], want)
 	}
 
-	if want := filepath.Join(h.m.root, h.m.Name(diff0, addrOf(0))); dirs[1] != want {
+	if want := filepath.Join(h.m.root, h.m.Name(diff0, blobOf(0))); dirs[1] != want {
 		t.Fatalf("lowerdir[1] = %q, want %q", dirs[1], want)
 	}
 
@@ -785,7 +821,7 @@ func TestMountsRefusesAStackTooDeepForOnePage(t *testing.T) {
 
 	// Each extra layer costs its mapped path, a colon, and the shared root it
 	// gives back. Overshoot so the refusal cannot be an off-by-one.
-	per := len(h.m.root) + 1 + len(h.m.Name(digestOf(0), addrOf(0))) + 1 - (len(h.sn.lowerRoot) + 1)
+	per := len(h.m.root) + 1 + len(h.m.Name(digestOf(0), blobOf(0))) + 1 - (len(h.sn.lowerRoot) + 1)
 	if per <= 0 {
 		t.Fatalf("a mapped layer costs %d bytes, the test cannot overflow", per)
 	}
@@ -879,7 +915,7 @@ func TestViewOfASingleClusterLayer(t *testing.T) {
 		t.Fatalf("expected a bind mount, got %+v", mounts)
 	}
 
-	if want := filepath.Join(h.m.root, h.m.Name(diff0, addrOf(3))); mounts[0].Source != want {
+	if want := filepath.Join(h.m.root, h.m.Name(diff0, blobOf(3))); mounts[0].Source != want {
 		t.Fatalf("source = %q, want %q", mounts[0].Source, want)
 	}
 
@@ -1200,7 +1236,7 @@ func TestRemoveAndCleanup(t *testing.T) {
 	}
 
 	// The adopted layer is still referenced, so its mapping must be kept.
-	if _, ok := prunes[0][h.m.Name(diffID, addrOf(0))]; !ok {
+	if _, ok := prunes[0][h.m.Name(diffID, blobOf(0))]; !ok {
 		t.Fatalf("keep set %v is missing the live layer", prunes[0])
 	}
 }
@@ -1223,6 +1259,36 @@ func TestCleanupSkipsPruningWhenALayerIsUnresolved(t *testing.T) {
 
 	if got := len(h.m.prunes()); got != 0 {
 		t.Fatalf("pruned %d times, want 0 while a layer is unresolved", got)
+	}
+
+	// No prune, so no watermark either. Claiming to have caught up would
+	// let the cleaner trim pages this node may still be mapping.
+	if got := h.cat.watermarkAt(); got != 0 {
+		t.Fatalf("published watermark %d without pruning", got)
+	}
+}
+
+func TestCleanupPublishesTheWatermark(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	chain, diffID := digestOf(1), digestOf(2)
+	h.adopt(t, "extract-0", "", chain, diffID, 0)
+
+	if _, err := h.cat.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	if err := h.sn.Cleanup(h.ctx); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	// The watermark is what the cleaner waits on before it trims a segment,
+	// so it may only move once this node's mappings have been pruned
+	// against an index at least as fresh as the generation it names.
+	if got, want := h.cat.watermarkAt(), h.cat.Generation(); got == 0 || got > want {
+		t.Fatalf("published watermark %d, want between 1 and %d", got, want)
 	}
 }
 

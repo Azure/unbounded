@@ -5,7 +5,6 @@ package node
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +16,11 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
 	"github.com/Azure/unbounded/internal/racerctrl"
 )
+
+// catalogPages is the image volume's OCC head in 4 KiB pages. It is a whole
+// 4 MiB because the immutable extents that follow it have to start on a 4 MiB
+// boundary, which is the same rule ParseGeometry enforces on the way in.
+const catalogPages = racerctrl.HugePage / racerctrl.SmallPage
 
 // newImageAgent builds an agent whose device tree and published map both live
 // under a directory the test controls.
@@ -65,32 +69,41 @@ func imagePV(name, role string) *corev1.PersistentVolume {
 	}
 }
 
-// imageCluster is a universe holding one catalog volume and n segments, each
-// allocated as the single extent the publisher requires.
-func imageCluster(universe uint32, segments int) racerctrl.ClusterState {
-	state := racerctrl.UniverseState{Class: "racer", ID: universe, Epoch: 1}
-
-	state.Volumes = append(state.Volumes, racerctrl.VolumeState{
-		Name: "gantry-image-catalog",
+// imageVolume is the one volume the whole cluster shares: an OCC catalog head
+// followed by n IMMUTABLE_4M extents, which is the shape ParseGeometry emits.
+func imageVolume(segments int) racerctrl.VolumeState {
+	volume := racerctrl.VolumeState{
+		Name: "gantry-image",
 		Composition: racerctrl.Composition{{
 			ExtentID: 1,
-			Pages:    64,
+			Pages:    catalogPages,
 			Kind:     racerconfig.Kind_OCC,
 		}},
-	})
+	}
 
 	for i := range segments {
-		state.Volumes = append(state.Volumes, racerctrl.VolumeState{
-			Name: fmt.Sprintf("gantry-image-segment-%d", i),
-			Composition: racerctrl.Composition{{
-				ExtentID: uint32(10 + i),
-				Pages:    2,
-				Kind:     racerconfig.Kind_IMMUTABLE_4M,
-			}},
+		volume.Composition = append(volume.Composition, racerctrl.Segment{
+			ExtentID: uint32(10 + i), //nolint:gosec // small test fixture
+			Pages:    2,
+			Kind:     racerconfig.Kind_IMMUTABLE_4M,
 		})
 	}
 
+	return volume
+}
+
+func imageCluster(universe uint32, segments int) racerctrl.ClusterState {
+	state := racerctrl.UniverseState{Class: "racer", ID: universe, Epoch: 1}
+	state.Volumes = append(state.Volumes, imageVolume(segments))
+
 	return racerctrl.ClusterState{Universes: []racerctrl.UniverseState{state}}
+}
+
+// imageNames is the selector result for a cluster carrying the one volume.
+func imageNames() map[string]struct{} {
+	return imageVolumeNames([]*corev1.PersistentVolume{
+		imagePV("gantry-image", racerctrl.ImageRoleImage),
+	})
 }
 
 func readSet(t *testing.T, path string) segment.Set {
@@ -109,201 +122,167 @@ func readSet(t *testing.T, path string) segment.Set {
 	return *set
 }
 
-func TestImageVolumeRoles(t *testing.T) {
+func TestImageVolumeNames(t *testing.T) {
 	other := imagePV("ordinary", "")
 	delete(other.Annotations, racerctrl.ImageRoleAnnotation)
 
-	foreign := imagePV("foreign", racerctrl.ImageRoleSegment)
+	foreign := imagePV("foreign", racerctrl.ImageRoleImage)
 	foreign.Spec.CSI.Driver = "disk.csi.azure.com"
 
 	unknown := imagePV("unknown", "something-else")
 
 	noCSI := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "nocsi"}}
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("cat", racerctrl.ImageRoleCatalog),
-		imagePV("seg", racerctrl.ImageRoleSegment),
+	names := imageVolumeNames([]*corev1.PersistentVolume{
+		imagePV("gantry-image", racerctrl.ImageRoleImage),
 		other, foreign, unknown, noCSI, nil,
 	})
 
-	want := map[string]string{
-		"cat": racerctrl.ImageRoleCatalog,
-		"seg": racerctrl.ImageRoleSegment,
+	if len(names) != 1 {
+		t.Fatalf("names = %v, want just the image volume", names)
 	}
 
-	if len(roles) != len(want) {
-		t.Fatalf("roles = %v, want %v", roles, want)
-	}
-
-	for name, role := range want {
-		if roles[name] != role {
-			t.Fatalf("roles[%q] = %q, want %q", name, roles[name], role)
-		}
+	if _, ok := names["gantry-image"]; !ok {
+		t.Fatalf("names = %v, want gantry-image", names)
 	}
 }
 
-// A node exports every image volume without anything having staged it, which is
-// what makes the layer store readable everywhere at once.
-func TestReconcileImageVolumesBindsEveryVolume(t *testing.T) {
+func TestReconcileImageVolumesBindsTheVolume(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-		imagePV("gantry-image-segment-1", racerctrl.ImageRoleSegment),
-	})
+	agent.reconcileImageVolumes(imageCluster(1, 2), imageNames())
 
-	agent.reconcileImageVolumes(imageCluster(1, 2), roles)
-
-	if len(agent.self.Devices) != 3 {
-		t.Fatalf("devices = %v, want three", agent.self.Devices)
+	if agent.image.member == nil {
+		t.Fatal("member = nil, want the image volume bound")
 	}
 
-	if agent.image.universe != 1 {
-		t.Fatalf("universe = %d, want 1", agent.image.universe)
+	// One volume is one device, however many extents it holds. That is the
+	// whole point of folding the segments into a single composition.
+	if len(agent.self.Devices) != 1 {
+		t.Fatalf("devices = %v, want exactly one", agent.self.Devices)
 	}
 
-	if len(agent.image.members) != 3 {
-		t.Fatalf("members = %v, want three", agent.image.members)
+	member := agent.image.member
+	if member.CatalogBytes != catalogPages*racerctrl.SmallPage {
+		t.Fatalf("catalog bytes = %d, want %d", member.CatalogBytes, catalogPages*racerctrl.SmallPage)
 	}
 
-	// A binding is durable: the racer-ctrl container can be replaced without
-	// racer losing the device it is already serving.
-	next := restart(t, dir)
-	if len(next.self.Devices) != 3 {
-		t.Fatalf("devices after restart = %v, want three", next.self.Devices)
+	if len(member.Segments) != 2 {
+		t.Fatalf("segments = %v, want two", member.Segments)
+	}
+
+	// Offsets are derived from the composition, so the catalog head comes
+	// first and each segment starts where the one before it ended.
+	if member.Segments[0].Offset != racerctrl.HugePage {
+		t.Fatalf("first segment offset = %d, want %d", member.Segments[0].Offset, racerctrl.HugePage)
+	}
+
+	if want := racerctrl.HugePage + 2*segment.PageBytes; member.Segments[1].Offset != uint64(want) {
+		t.Fatalf("second segment offset = %d, want %d", member.Segments[1].Offset, want)
 	}
 }
 
-// The device ids are the ones already assigned, so a second pass neither
-// reassigns them nor rewrites the bindings file.
 func TestReconcileImageVolumesIsStable(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-	})
+	cluster, names := imageCluster(1, 2), imageNames()
 
-	cluster := imageCluster(1, 1)
-	agent.reconcileImageVolumes(cluster, roles)
+	agent.reconcileImageVolumes(cluster, names)
 
-	first := append([]racerctrl.DeviceBinding(nil), agent.self.Devices...)
+	first := agent.image.member.DeviceID
 
-	agent.reconcileImageVolumes(cluster, roles)
+	agent.reconcileImageVolumes(cluster, names)
 
-	if got := agent.self.Devices; len(got) != len(first) {
-		t.Fatalf("devices = %v, want %v", got, first)
+	if agent.image.member.DeviceID != first {
+		t.Fatalf("device = %d, want it to stay %d", agent.image.member.DeviceID, first)
 	}
 
-	for i := range first {
-		if agent.self.Devices[i] != first[i] {
-			t.Fatalf("devices = %v, want %v", agent.self.Devices, first)
-		}
+	if len(agent.self.Devices) != 1 {
+		t.Fatalf("devices = %v, want the binding not to be duplicated", agent.self.Devices)
 	}
 }
 
-// A volume that leaves the cluster gives its minor back, or the window fills up
-// with devices nothing is serving.
 func TestReconcileImageVolumesReleasesRemoved(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-	})
+	agent.reconcileImageVolumes(imageCluster(1, 1), imageNames())
 
-	agent.reconcileImageVolumes(imageCluster(1, 1), roles)
+	if len(agent.self.Devices) != 1 {
+		t.Fatalf("devices = %v, want one", agent.self.Devices)
+	}
 
 	agent.reconcileImageVolumes(racerctrl.ClusterState{}, nil)
 
 	if len(agent.self.Devices) != 0 {
-		t.Fatalf("devices = %v, want none", agent.self.Devices)
+		t.Fatalf("devices = %v, want the minor released", agent.self.Devices)
 	}
 
-	if len(agent.image.members) != 0 {
-		t.Fatalf("members = %v, want none", agent.image.members)
+	if agent.image.member != nil {
+		t.Fatalf("member = %+v, want nothing bound", agent.image.member)
 	}
 }
 
-// A volume with no composition yet has no extents to ship, and binding a device
-// to it would make every render fail.
+// A volume the allocator has not placed carries no composition, so there is no
+// address space to export and nothing to bind a minor to.
 func TestReconcileImageVolumesSkipsUnallocated(t *testing.T) {
-	agent := newImageAgent(t, t.TempDir())
+	dir := t.TempDir()
+	agent := newImageAgent(t, dir)
 
-	cluster := racerctrl.ClusterState{Universes: []racerctrl.UniverseState{{
-		Class: "racer",
-		ID:    1,
-		Volumes: []racerctrl.VolumeState{
-			{Name: "gantry-image-segment-0"},
-			{Name: "gantry-image-segment-1", Composition: racerctrl.Composition{
-				{ExtentID: 1, Pages: 1, Kind: racerconfig.Kind_IMMUTABLE_4M},
-				{ExtentID: 2, Pages: 1, Kind: racerconfig.Kind_IMMUTABLE_4M},
-			}},
-		},
-	}}}
+	cluster := imageCluster(1, 1)
+	cluster.Universes[0].Volumes[0].Composition = nil
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-		imagePV("gantry-image-segment-1", racerctrl.ImageRoleSegment),
-	})
+	agent.reconcileImageVolumes(cluster, imageNames())
 
-	agent.reconcileImageVolumes(cluster, roles)
+	if agent.image.member != nil {
+		t.Fatalf("member = %+v, want nothing bound", agent.image.member)
+	}
 
 	if len(agent.self.Devices) != 0 {
 		t.Fatalf("devices = %v, want none", agent.self.Devices)
 	}
 }
 
-// The snapshotter addresses a segment by id in one address space, so a second
-// universe's image volumes are refused rather than mixed in.
-func TestReconcileImageVolumesRefusesSecondUniverse(t *testing.T) {
-	agent := newImageAgent(t, t.TempDir())
-
-	cluster := imageCluster(1, 1)
-	cluster.Universes = append(cluster.Universes, racerctrl.UniverseState{
-		Class: "racer-fast",
-		ID:    2,
-		Volumes: []racerctrl.VolumeState{{
-			Name:        "gantry-image-segment-9",
-			Composition: racerctrl.Composition{{ExtentID: 99, Pages: 1, Kind: racerconfig.Kind_IMMUTABLE_4M}},
-		}},
-	})
-
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-		imagePV("gantry-image-segment-9", racerctrl.ImageRoleSegment),
-	})
-
-	agent.reconcileImageVolumes(cluster, roles)
-
-	if agent.image.universe != 1 {
-		t.Fatalf("universe = %d, want 1", agent.image.universe)
-	}
-
-	for _, member := range agent.image.members {
-		if member.Volume == "gantry-image-segment-9" {
-			t.Fatalf("members = %v, want no volume from the second universe", agent.image.members)
-		}
-	}
-}
-
-// Nothing is published until the devices exist, because the reader maps what
-// the file names and a missing device turns a miss into a failed start.
-func TestPublishImageDevicesWaitsForDevices(t *testing.T) {
+// The snapshotter addresses a segment by id inside one address space, so a
+// second image volume has nowhere to go and is refused rather than mixed in.
+func TestReconcileImageVolumesRefusesASecondVolume(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
+	cluster := imageCluster(1, 1)
+
+	second := imageVolume(1)
+	second.Name = "gantry-image-two"
+	second.Composition[0].ExtentID = 100
+	second.Composition[1].ExtentID = 110
+
+	cluster.Universes[0].Volumes = append(cluster.Universes[0].Volumes, second)
+
+	names := imageVolumeNames([]*corev1.PersistentVolume{
+		imagePV("gantry-image", racerctrl.ImageRoleImage),
+		imagePV("gantry-image-two", racerctrl.ImageRoleImage),
 	})
 
-	agent.reconcileImageVolumes(imageCluster(1, 1), roles)
+	agent.reconcileImageVolumes(cluster, names)
+
+	if agent.image.member == nil || agent.image.member.Volume != "gantry-image" {
+		t.Fatalf("member = %+v, want only the first volume", agent.image.member)
+	}
+
+	if len(agent.self.Devices) != 1 {
+		t.Fatalf("devices = %v, want only the first volume exported", agent.self.Devices)
+	}
+}
+
+// A device only exists once racer has acted on the config naming it, so the
+// publisher waits rather than naming a path that is not there.
+func TestPublishImageDevicesWaitsForTheDevice(t *testing.T) {
+	dir := t.TempDir()
+	agent := newImageAgent(t, dir)
+
+	agent.reconcileImageVolumes(imageCluster(1, 1), imageNames())
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -313,21 +292,14 @@ func TestPublishImageDevicesWaitsForDevices(t *testing.T) {
 		t.Fatalf("stat = %v, want the file to be absent", err)
 	}
 
-	// The catalog alone is enough to publish: a snapshotter with a catalog and
-	// no segments still answers, it just misses.
-	present(t, agent.image.members[0].DeviceID)
+	present(t, agent.image.member.DeviceID)
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
-	set := readSet(t, agent.cfg.ImageDevicesPath)
-	if set.Catalog.Device == "" {
-		t.Fatalf("set = %+v, want a catalog", set)
-	}
-
-	if len(set.Segments) != 0 {
-		t.Fatalf("segments = %v, want none until the device exists", set.Segments)
+	if set := readSet(t, agent.cfg.ImageDevicesPath); set.Device == "" {
+		t.Fatalf("set = %+v, want a device", set)
 	}
 }
 
@@ -335,17 +307,8 @@ func TestPublishImageDevices(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-		imagePV("gantry-image-segment-1", racerctrl.ImageRoleSegment),
-	})
-
-	agent.reconcileImageVolumes(imageCluster(7, 2), roles)
-
-	for _, member := range agent.image.members {
-		present(t, member.DeviceID)
-	}
+	agent.reconcileImageVolumes(imageCluster(7, 2), imageNames())
+	present(t, agent.image.member.DeviceID)
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
@@ -361,8 +324,8 @@ func TestPublishImageDevices(t *testing.T) {
 		t.Fatalf("universe = %d, want 7", set.Universe)
 	}
 
-	if set.Catalog.Bytes != 64*racerctrl.SmallPage {
-		t.Fatalf("catalog bytes = %d, want %d", set.Catalog.Bytes, 64*racerctrl.SmallPage)
+	if set.CatalogBytes != catalogPages*racerctrl.SmallPage {
+		t.Fatalf("catalog bytes = %d, want %d", set.CatalogBytes, catalogPages*racerctrl.SmallPage)
 	}
 
 	if len(set.Segments) != 2 {
@@ -370,7 +333,7 @@ func TestPublishImageDevices(t *testing.T) {
 	}
 
 	// Segments are addressed by extent id, which is what a catalog record
-	// carries. The minor is node-local and cannot serve that purpose.
+	// carries. The offset is what turns that into bytes on this node.
 	if set.Segments[0].ID != 10 || set.Segments[1].ID != 11 {
 		t.Fatalf("segments = %v, want ids 10 and 11", set.Segments)
 	}
@@ -390,6 +353,33 @@ func TestPublishImageDevices(t *testing.T) {
 	}
 }
 
+// The epoch is the only evidence a reclaim finished, so it has to survive the
+// trip through the published map.
+func TestPublishImageDevicesCarriesTheTombstoneEpoch(t *testing.T) {
+	dir := t.TempDir()
+	agent := newImageAgent(t, dir)
+
+	cluster := imageCluster(1, 2)
+	cluster.Universes[0].Volumes[0].TombstoneEpochs = map[uint32]uint32{10: 3}
+
+	agent.reconcileImageVolumes(cluster, imageNames())
+	present(t, agent.image.member.DeviceID)
+
+	if err := agent.publishImageDevices(); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	set := readSet(t, agent.cfg.ImageDevicesPath)
+
+	if set.Segments[0].Epoch != 3 {
+		t.Fatalf("segment 10 epoch = %d, want 3", set.Segments[0].Epoch)
+	}
+
+	if set.Segments[1].Epoch != 0 {
+		t.Fatalf("segment 11 epoch = %d, want 0", set.Segments[1].Epoch)
+	}
+}
+
 // The generation is what tells a reader the file it just re-read is newer. It
 // only moves when the content does, so a poll that finds nothing new does not
 // spend one.
@@ -397,16 +387,10 @@ func TestPublishImageDevicesGenerationTracksContent(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-	})
+	cluster, names := imageCluster(1, 1), imageNames()
 
-	agent.reconcileImageVolumes(imageCluster(1, 1), roles)
-
-	for _, member := range agent.image.members {
-		present(t, member.DeviceID)
-	}
+	agent.reconcileImageVolumes(cluster, names)
+	present(t, agent.image.member.DeviceID)
 
 	for range 3 {
 		if err := agent.publishImageDevices(); err != nil {
@@ -414,128 +398,72 @@ func TestPublishImageDevicesGenerationTracksContent(t *testing.T) {
 		}
 	}
 
-	if got := readSet(t, agent.cfg.ImageDevicesPath).Generation; got != 1 {
-		t.Fatalf("generation = %d, want 1", got)
+	if set := readSet(t, agent.cfg.ImageDevicesPath); set.Generation != 1 {
+		t.Fatalf("generation = %d, want the repeats to be free", set.Generation)
 	}
 
-	// A new segment is new content.
-	roles["gantry-image-segment-1"] = racerctrl.ImageRoleSegment
-
-	agent.reconcileImageVolumes(imageCluster(1, 2), roles)
-
-	for _, member := range agent.image.members {
-		present(t, member.DeviceID)
-	}
+	agent.reconcileImageVolumes(imageCluster(1, 2), names)
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
-	if got := readSet(t, agent.cfg.ImageDevicesPath).Generation; got != 2 {
-		t.Fatalf("generation = %d, want 2", got)
+	set := readSet(t, agent.cfg.ImageDevicesPath)
+	if set.Generation != 2 {
+		t.Fatalf("generation = %d, want 2 once the content changed", set.Generation)
+	}
+
+	if len(set.Segments) != 2 {
+		t.Fatalf("segments = %v, want two", set.Segments)
 	}
 }
 
-// A restart of this container alone must not republish a lower generation: the
-// reader keeps the highest it has seen and would ignore the map for as long as
-// the process lived.
+// A restart must neither burn a generation nor mistake the file it wrote last
+// time for something a reader has not seen.
 func TestAdoptImageGenerationContinuesTheSequence(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-	})
+	cluster, names := imageCluster(1, 1), imageNames()
 
-	agent.reconcileImageVolumes(imageCluster(1, 1), roles)
-
-	for _, member := range agent.image.members {
-		present(t, member.DeviceID)
-	}
+	agent.reconcileImageVolumes(cluster, names)
+	present(t, agent.image.member.DeviceID)
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
-	next := newImageAgent(t, dir)
-	if err := next.adoptExistingState(); err != nil {
-		t.Fatalf("adopt: %v", err)
+	restarted := newImageAgent(t, dir)
+	restarted.cfg.ImageDevicesPath = agent.cfg.ImageDevicesPath
+	restarted.adoptImageGeneration()
+
+	if restarted.imageGeneration != 1 {
+		t.Fatalf("generation = %d, want the sequence to continue at 1", restarted.imageGeneration)
 	}
 
-	if next.imageGeneration != 1 {
-		t.Fatalf("generation = %d, want 1", next.imageGeneration)
-	}
+	restarted.reconcileImageVolumes(cluster, names)
+	present(t, restarted.image.member.DeviceID)
 
-	next.reconcileImageVolumes(imageCluster(1, 1), roles)
-
-	for _, member := range next.image.members {
-		present(t, member.DeviceID)
-	}
-
-	if err := next.publishImageDevices(); err != nil {
+	if err := restarted.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
-	// A restart that finds the same devices has nothing new to say, so it must
-	// not advance the generation: readers treat an advance as "re-read and redo
-	// your work".
-	if got := readSet(t, next.cfg.ImageDevicesPath).Generation; got != 1 {
-		t.Fatalf("generation after an unchanged restart = %d, want 1", got)
-	}
-
-	grown := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-		imagePV("gantry-image-segment-1", racerctrl.ImageRoleSegment),
-	})
-
-	next.reconcileImageVolumes(imageCluster(1, 2), grown)
-
-	for _, member := range next.image.members {
-		present(t, member.DeviceID)
-	}
-
-	if err := next.publishImageDevices(); err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-
-	if got := readSet(t, next.cfg.ImageDevicesPath).Generation; got != 2 {
-		t.Fatalf("generation = %d, want 2", got)
+	if set := readSet(t, restarted.cfg.ImageDevicesPath); set.Generation != 1 {
+		t.Fatalf("generation = %d, want an unchanged map to cost nothing", set.Generation)
 	}
 }
 
-// A node that loses every image device must say so. The reader keeps serving the
-// last set it loaded when the file disappears, and the minors a stale set names
-// get reused for other volumes, so the retraction has to be published.
-func TestPublishRetractsAMapWhenEveryDeviceGoesAway(t *testing.T) {
+// An empty map is not the same as no map: a reader holding a stale set has to
+// be told the devices it names are gone, because those minors get reused.
+func TestPublishRetractsAMapWhenTheDeviceGoesAway(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-	})
-
-	agent.reconcileImageVolumes(imageCluster(1, 1), roles)
-
-	for _, member := range agent.image.members {
-		present(t, member.DeviceID)
-	}
+	agent.reconcileImageVolumes(imageCluster(1, 1), imageNames())
+	present(t, agent.image.member.DeviceID)
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
-	}
-
-	if got := readSet(t, agent.cfg.ImageDevicesPath); len(got.Segments) != 1 {
-		t.Fatalf("segments = %d, want 1", len(got.Segments))
-	}
-
-	// The volumes are gone, and so are the devices behind them.
-	for _, member := range agent.image.members {
-		if err := os.Remove(blockDevicePath(member.DeviceID)); err != nil {
-			t.Fatalf("remove device: %v", err)
-		}
 	}
 
 	agent.reconcileImageVolumes(racerctrl.ClusterState{}, nil)
@@ -544,34 +472,30 @@ func TestPublishRetractsAMapWhenEveryDeviceGoesAway(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	got := readSet(t, agent.cfg.ImageDevicesPath)
-	if got.Generation != 2 {
-		t.Fatalf("generation = %d, want 2", got.Generation)
+	set := readSet(t, agent.cfg.ImageDevicesPath)
+
+	if set.Generation != 2 {
+		t.Fatalf("generation = %d, want the retraction to spend one", set.Generation)
 	}
 
-	if got.Catalog.Device != "" || len(got.Segments) != 0 {
-		t.Fatalf("map was not retracted: %+v", got)
+	if set.Device != "" || len(set.Segments) != 0 {
+		t.Fatalf("set = %+v, want it emptied", set)
 	}
 }
 
-// Absence is a better answer than an empty map on a node that never had an image
-// device, so nothing is written until there is something to say.
 func TestPublishWritesNothingBeforeAnyDeviceExists(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
-
-	agent.reconcileImageVolumes(racerctrl.ClusterState{}, nil)
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
 	if _, err := os.Stat(agent.cfg.ImageDevicesPath); !os.IsNotExist(err) {
-		t.Fatalf("stat = %v, want not exist", err)
+		t.Fatalf("stat = %v, want no file at all", err)
 	}
 }
 
-// A file left behind by something else is not a reason to refuse to publish.
 func TestAdoptImageGenerationIgnoresGarbage(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
@@ -586,62 +510,125 @@ func TestAdoptImageGenerationIgnoresGarbage(t *testing.T) {
 
 	agent.adoptImageGeneration()
 
-	if agent.imageGeneration != 0 {
-		t.Fatalf("generation = %d, want 0", agent.imageGeneration)
+	if agent.imageGeneration != 0 || agent.imagePublished != nil {
+		t.Fatalf("generation = %d, published = %v, want a fresh start",
+			agent.imageGeneration, agent.imagePublished)
 	}
 }
 
-// The reader rejects unknown fields, so a map this side would happily marshal
-// but that side would refuse must not reach the file.
+// The producer and the consumer of the map are in different binaries, and the
+// reader rejects unknown fields, so this is the test that keeps them together.
 func TestPublishedMapRoundTripsThroughTheReader(t *testing.T) {
 	dir := t.TempDir()
 	agent := newImageAgent(t, dir)
 
-	roles := imageVolumeRoles([]*corev1.PersistentVolume{
-		imagePV("gantry-image-catalog", racerctrl.ImageRoleCatalog),
-		imagePV("gantry-image-segment-0", racerctrl.ImageRoleSegment),
-	})
-
-	agent.reconcileImageVolumes(imageCluster(1, 1), roles)
-
-	for _, member := range agent.image.members {
-		present(t, member.DeviceID)
-	}
+	agent.reconcileImageVolumes(imageCluster(4, 2), imageNames())
+	present(t, agent.image.member.DeviceID)
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
-	data, err := os.ReadFile(agent.cfg.ImageDevicesPath)
+	set, err := segment.Load(agent.cfg.ImageDevicesPath)
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("load: %v", err)
 	}
 
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	addr := segment.Address{Segment: 11, PageOffset: 1, PageCount: 1, ByteLength: 4096}
+
+	device, offset, length, err := set.Locate(addr)
+	if err != nil {
+		t.Fatalf("locate: %v", err)
 	}
 
-	for _, key := range []string{"generation", "universe", "catalog", "segments"} {
-		if _, ok := raw[key]; !ok {
-			t.Fatalf("published map %v is missing %q", raw, key)
-		}
+	if device != set.Device {
+		t.Fatalf("device = %q, want %q", device, set.Device)
 	}
 
-	if len(raw) != 4 {
-		t.Fatalf("published map %v carries a field the reader does not know", raw)
+	// The second segment starts past the catalog head and the first segment,
+	// and the address adds its own page offset on top of that.
+	want := uint64(racerctrl.HugePage) + 2*segment.PageBytes + segment.PageBytes
+	if offset != want {
+		t.Fatalf("offset = %d, want %d", offset, want)
+	}
+
+	if length != segment.PageBytes {
+		t.Fatalf("length = %d, want %d", length, segment.PageBytes)
+	}
+
+	// The catalog is the same device at offset zero, which is what makes the
+	// holder able to open one file for both.
+	catalog, err := set.CatalogDevice()
+	if err != nil {
+		t.Fatalf("catalog device: %v", err)
+	}
+
+	if catalog.Device != set.Device {
+		t.Fatalf("catalog device = %q, want %q", catalog.Device, set.Device)
 	}
 }
 
-// An agent that was never told where to publish does not publish, and does not
-// fail either: the image volume is optional.
 func TestPublishImageDevicesDisabled(t *testing.T) {
-	agent := newImageAgent(t, t.TempDir())
+	dir := t.TempDir()
+	agent := newImageAgent(t, dir)
+
+	// LoadConfig turns RACER_IMAGE_DEVICES="-" into an empty path, so an
+	// empty path is what "publication is off" looks like by the time the
+	// agent sees it. Setting the literal "-" here would only prove that a
+	// file called "-" can be written.
 	agent.cfg.ImageDevicesPath = ""
 
-	agent.adoptImageGeneration()
+	agent.reconcileImageVolumes(imageCluster(1, 1), imageNames())
+	present(t, agent.image.member.DeviceID)
 
 	if err := agent.publishImageDevices(); err != nil {
 		t.Fatalf("publish: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+
+	for _, entry := range entries {
+		if entry.Name() == "run" {
+			t.Fatal("run directory created, want the publisher disabled")
+		}
+	}
+}
+
+func TestLoadConfigTurnsTheOffSwitchIntoAnEmptyPath(t *testing.T) {
+	t.Setenv(EnvNodeName, "node-a")
+	t.Setenv(EnvImageDevices, ImageDevicesOff)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.ImageDevicesPath != "" {
+		t.Fatalf("image devices path = %q, want empty", cfg.ImageDevicesPath)
+	}
+}
+
+// The map is JSON on a tmpfs, so a hand-written file has to survive the same
+// validation the publisher applies to its own output.
+func TestParseRejectsAnOverlappingMap(t *testing.T) {
+	set := segment.Set{
+		Device:       "/dev/ublkb1",
+		CatalogBytes: racerctrl.HugePage,
+		Segments: []segment.Segment{
+			{ID: 10, Offset: racerctrl.HugePage, Bytes: 2 * segment.PageBytes},
+			{ID: 11, Offset: racerctrl.HugePage + segment.PageBytes, Bytes: segment.PageBytes},
+		},
+	}
+
+	data, err := json.Marshal(set)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	if _, err := segment.Parse(data); err == nil {
+		t.Fatal("parse = nil, want the overlap refused")
 	}
 }

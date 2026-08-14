@@ -17,6 +17,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/snapshotter"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/clean"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
 )
@@ -41,12 +42,24 @@ var errNotReady = errors.New("catalog is not open")
 // behaves exactly like the overlayfs snapshotter, which is the correct
 // fallback rather than a degraded one.
 type holder struct {
-	log     *slog.Logger
-	format  bool
-	adopt   bool
-	blocks  uint32
-	errnos  []unix.Errno
-	current atomicStore
+	log        *slog.Logger
+	format     bool
+	adopt      bool
+	blocks     uint32
+	watermarks uint32
+	errnos     []unix.Errno
+	current    atomicStore
+
+	// node identifies this node in the catalog's watermark table, which is
+	// how the cleaner learns that everyone has stopped resolving blobs to a
+	// segment it wants to trim. Zero disables the refresh, which is what a
+	// daemon with no node name has to do: claiming a slot under a key that
+	// is not this node's would answer the gate for somebody else.
+	node catalog.NodeKey
+
+	// grace is how long a watermark may go unrefreshed before the cleaner
+	// treats its node as gone.
+	grace time.Duration
 
 	// roll is told about every segment rollover, in addition to the log
 	// line. Optional, and set once before the daemon starts reconciling so
@@ -75,6 +88,7 @@ func (h *holder) openDevice(path string) (*catalog.Device, error) {
 var (
 	_ snapshotter.Catalog = (*holder)(nil)
 	_ ingest.Catalog      = (*holder)(nil)
+	_ clean.Catalog       = (*holder)(nil)
 )
 
 // atomicStore is the attached catalog and the device under it, swapped as a
@@ -226,7 +240,7 @@ func (h *holder) openOrFormat(dev *catalog.Device, desc segment.Catalog) (*catal
 	// fine and needs no coordination: the format is a compare-and-swap on
 	// block zero, so exactly one of them lands and the loser is told it
 	// conflicted and simply opens what the winner wrote.
-	if err := catalog.Format(dev, catalog.FormatOptions{Bytes: desc.Bytes, SegmentBlocks: h.blocks}); err != nil {
+	if err := catalog.Format(dev, catalog.FormatOptions{Bytes: desc.Bytes, SegmentBlocks: h.blocks, WatermarkBlocks: h.watermarks}); err != nil {
 		if !errors.Is(err, catalog.ErrConflict) {
 			return nil, err
 		}
@@ -295,15 +309,39 @@ func (h *holder) adoptSegments(store *catalog.Store, set *segment.Set) error {
 			continue
 		}
 
-		if _, ok := have[seg.ID]; ok {
+		entry, known := have[seg.ID]
+		if !known {
+			if err := store.AddSegment(seg.ID, uint32(pages), seg.Epoch); err != nil { //nolint:gosec // bounded above
+				return fmt.Errorf("add segment %d: %w", seg.ID, err)
+			}
+
+			h.log.Info("segment registered",
+				slog.Uint64("segment", uint64(seg.ID)),
+				slog.Uint64("pages", pages),
+				slog.Uint64("epoch", uint64(seg.Epoch)))
+
 			continue
 		}
 
-		if err := store.AddSegment(seg.ID, uint32(pages)); err != nil { //nolint:gosec // bounded above
-			return fmt.Errorf("add segment %d: %w", seg.ID, err)
+		if seg.Epoch <= entry.Epoch {
+			continue
 		}
 
-		h.log.Info("segment registered", slog.Uint64("segment", uint64(seg.ID)), slog.Uint64("pages", pages))
+		// The published epoch has run past the catalog's. The control plane
+		// collected the extent, so every page in it is gone and the space is
+		// free. This is the completion signal for a reclaim and the only one
+		// there is: RACER reports nothing else about an epoch advance.
+		reclaimed, err := store.ReclaimSegment(seg.ID, seg.Epoch)
+		if err != nil {
+			return fmt.Errorf("reclaim segment %d: %w", seg.ID, err)
+		}
+
+		if reclaimed {
+			h.log.Info("segment reclaimed",
+				slog.Uint64("segment", uint64(seg.ID)),
+				slog.Uint64("epoch", uint64(seg.Epoch)),
+				slog.String("was", entry.State.String()))
+		}
 	}
 
 	if store.Superblock().OpenSegment != 0 {
@@ -383,6 +421,81 @@ func (h *holder) Sync() (bool, error) {
 	}
 
 	return store.Sync()
+}
+
+// Generation is the catalog generation this node's index has applied. Zero when
+// no catalog is open, which is a watermark that promises nothing.
+func (h *holder) Generation() uint64 {
+	store, _ := h.current.load()
+	if store == nil {
+		return 0
+	}
+
+	return store.Generation()
+}
+
+// Watermark publishes how far this node has caught up, which is what the
+// cleaner waits on before it trims a segment.
+//
+// A daemon with no node name cannot do this: the slot is claimed under a node
+// key, and claiming one under a key that is not ours would answer the gate on
+// somebody else's behalf. Such a daemon is instead invisible to the gate, which
+// is only tolerable because a node the cluster cannot name is one nothing else
+// is coordinating with either.
+func (h *holder) Watermark(generation uint64) error {
+	if h.node.IsZero() {
+		return nil
+	}
+
+	store, _ := h.current.load()
+	if store == nil {
+		return errNotReady
+	}
+
+	return store.SetWatermark(h.node, generation, h.grace)
+}
+
+// Segments reports the catalog's segment table.
+func (h *holder) Segments() ([]catalog.SegmentEntry, error) {
+	store, _ := h.current.load()
+	if store == nil {
+		return nil, errNotReady
+	}
+
+	return store.Segments()
+}
+
+// BlobsIn lists the blobs the index still resolves into a segment. It is the
+// cleaner's work list, and an empty result for a segment being cleaned is what
+// says the evacuation is finished.
+func (h *holder) BlobsIn(id uint32) []catalog.Blob {
+	store, _ := h.current.load()
+	if store == nil {
+		return nil
+	}
+
+	return store.BlobsIn(id)
+}
+
+// SetSegmentState moves a segment along the reclamation ladder.
+func (h *holder) SetSegmentState(id uint32, from, to catalog.SegmentState, repoint uint64) error {
+	store, _ := h.current.load()
+	if store == nil {
+		return errNotReady
+	}
+
+	return store.SetSegmentState(id, from, to, repoint)
+}
+
+// DrainedPast reports whether every node still holding a watermark has caught
+// up past generation. It is the gate the cleaner waits on before it trims.
+func (h *holder) DrainedPast(generation uint64, grace time.Duration) (bool, catalog.NodeKey, error) {
+	store, _ := h.current.load()
+	if store == nil {
+		return false, catalog.NodeKey{}, errNotReady
+	}
+
+	return store.DrainedPast(generation, grace)
 }
 
 // Repair retires a hole in the catalog's record slots whose writer never came

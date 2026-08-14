@@ -239,7 +239,7 @@ func TestDeviceWithAStoreOnTop(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 
-	if err := store.AddSegment(1, 64); err != nil {
+	if err := store.AddSegment(1, 64, 0); err != nil {
 		t.Fatalf("add segment: %v", err)
 	}
 

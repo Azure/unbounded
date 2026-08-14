@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/snapshotter"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/blockmap"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/clean"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
 )
@@ -80,6 +81,35 @@ type Config struct {
 
 	// SegmentBlocks is the segment table size used when formatting.
 	SegmentBlocks uint32
+
+	// WatermarkBlocks is the drain-gate table size used when formatting.
+	WatermarkBlocks uint32
+
+	// WatermarkGrace is how long a node's watermark stands before the
+	// cleaner treats it as belonging to a node that is gone. Too short and
+	// a slow node has pages trimmed out from under it; too long and one
+	// decommissioned node stalls reclamation for as long as it lasts.
+	WatermarkGrace time.Duration
+
+	// Clean runs the segment cleaner, which copies the survivors out of a
+	// mostly-dead segment, waits for every node to stop resolving blobs into
+	// it, and then trims it so the control plane can reclaim the extent.
+	// Without it a sealed segment never comes back and capacity is one-way.
+	Clean bool
+
+	// CleanInterval is how often the cleaner takes one step.
+	CleanInterval time.Duration
+
+	// CleanLowWater is the free fraction of the image volume below which
+	// reclamation starts. Cleaning costs a read and a write of every
+	// surviving byte, so it is not worth doing while there is plenty of
+	// room.
+	CleanLowWater float64
+
+	// CleanMaxLive is the highest live fraction a segment may have and still
+	// be chosen. A segment that is mostly live costs almost its whole size
+	// in copying to free almost nothing.
+	CleanMaxLive float64
 
 	// AdoptSegments lets this node add segments it can see to the catalog's
 	// segment table and open one when none is open. This is in-band
@@ -183,6 +213,7 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	var (
 		mountOptions, socketMode string
 		segmentBlocks            uint64
+		watermarkBlocks          uint64
 	)
 
 	fs.StringVar(&c.Socket, "socket", envOr("GANTRY_SNAPSHOTTER_SOCKET", DefaultSocket), "unix socket to serve the snapshotter API on")
@@ -195,6 +226,12 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 	fs.BoolVar(&c.FormatCatalog, "format-catalog", envBool("GANTRY_SNAPSHOTTER_FORMAT_CATALOG", false), "format the catalog device when it is blank")
 	fs.StringVar(&c.ConflictErrnos, "conflict-errnos", envOr("GANTRY_SNAPSHOTTER_CONFLICT_ERRNOS", ""), "errnos the catalog device reports for a failed optimistic write")
 	fs.Uint64Var(&segmentBlocks, "segment-blocks", uint64(envInt("GANTRY_SNAPSHOTTER_SEGMENT_BLOCKS", catalog.DefaultSegmentBlocks)), "segment table size in blocks, used only when formatting")
+	fs.Uint64Var(&watermarkBlocks, "watermark-blocks", uint64(envInt("GANTRY_SNAPSHOTTER_WATERMARK_BLOCKS", catalog.DefaultWatermarkBlocks)), "drain-gate table size in blocks, used only when formatting")
+	fs.DurationVar(&c.WatermarkGrace, "watermark-grace", envDuration("GANTRY_SNAPSHOTTER_WATERMARK_GRACE", catalog.DefaultWatermarkGrace), "how long a node's watermark stands before the cleaner ignores it")
+	fs.BoolVar(&c.Clean, "clean", envBool("GANTRY_SNAPSHOTTER_CLEAN", true), "reclaim mostly-dead segments so their capacity comes back")
+	fs.DurationVar(&c.CleanInterval, "clean-interval", envDuration("GANTRY_SNAPSHOTTER_CLEAN_INTERVAL", clean.DefaultInterval), "how often the cleaner takes one step")
+	fs.Float64Var(&c.CleanLowWater, "clean-low-water", envFloat("GANTRY_SNAPSHOTTER_CLEAN_LOW_WATER", clean.DefaultLowWater), "free fraction of the image volume below which reclamation starts")
+	fs.Float64Var(&c.CleanMaxLive, "clean-max-live", envFloat("GANTRY_SNAPSHOTTER_CLEAN_MAX_LIVE", clean.DefaultMaxLiveFraction), "highest live fraction a segment may have and still be reclaimed")
 	fs.BoolVar(&c.AdoptSegments, "adopt-segments", envBool("GANTRY_SNAPSHOTTER_ADOPT_SEGMENTS", true), "register visible segments in the catalog and open one when none is open")
 	fs.StringVar(&c.ContainerdSocket, "containerd-socket", envOr("GANTRY_SNAPSHOTTER_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"), "containerd socket for reading layer blobs")
 	fs.StringVar(&c.ContainerdNamespace, "containerd-namespace", envOr("GANTRY_SNAPSHOTTER_CONTAINERD_NAMESPACE", DefaultNamespace), "containerd namespace holding image content")
@@ -238,7 +275,12 @@ func parseConfig(args []string, stderr io.Writer) (*Config, error) {
 		return nil, fmt.Errorf("segment-blocks %d: want 1..4096", segmentBlocks)
 	}
 
+	if watermarkBlocks < 1 || watermarkBlocks > 4096 {
+		return nil, fmt.Errorf("watermark-blocks %d: want 1..4096", watermarkBlocks)
+	}
+
 	c.SegmentBlocks = uint32(segmentBlocks)
+	c.WatermarkBlocks = uint32(watermarkBlocks)
 	c.SocketMode = os.FileMode(mode)
 	c.MountOptions = splitOptions(mountOptions)
 
@@ -271,6 +313,10 @@ func (c *Config) validate() error {
 		return errors.New("ingest-depth must be at least 1")
 	case c.MembersSelector != "" && c.NodeName == "":
 		return errors.New("node-name required when members-selector is set")
+	case c.CleanLowWater < 0 || c.CleanLowWater > 1:
+		return errors.New("clean-low-water must be between 0 and 1")
+	case c.CleanMaxLive < 0 || c.CleanMaxLive > 1:
+		return errors.New("clean-max-live must be between 0 and 1")
 	}
 
 	if _, err := parseLevel(c.LogLevel); err != nil {
@@ -347,6 +393,16 @@ func envUint64(key string, fallback uint64) uint64 {
 	}
 
 	return n
+}
+
+func envFloat(key string, fallback float64) float64 {
+	if v, ok := os.LookupEnv(key); ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+
+	return fallback
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {

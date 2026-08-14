@@ -26,6 +26,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/blockmap"
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/catalog"
+	"github.com/Azure/unbounded/internal/gantry/snapshotter/clean"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/ingest"
 	"github.com/Azure/unbounded/internal/gantry/snapshotter/segment"
 )
@@ -59,12 +61,23 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	}
 
 	cat := &holder{
-		log:    log.With(slog.String("subsystem", "catalog")),
-		format: cfg.FormatCatalog,
-		adopt:  cfg.AdoptSegments,
-		blocks: cfg.SegmentBlocks,
-		errnos: errnos,
+		log:        log.With(slog.String("subsystem", "catalog")),
+		format:     cfg.FormatCatalog,
+		adopt:      cfg.AdoptSegments,
+		blocks:     cfg.SegmentBlocks,
+		watermarks: cfg.WatermarkBlocks,
+		errnos:     errnos,
+		grace:      cfg.WatermarkGrace,
 	}
+
+	// Without a node name there is no key to claim a watermark slot under,
+	// and claiming one under a key that is not ours would answer the drain
+	// gate on another node's behalf. Leaving it zero disables the refresh,
+	// which holds the cleaner up rather than letting it run blind.
+	if cfg.NodeName != "" {
+		cat.node = catalog.NodeKeyFor(cfg.NodeName)
+	}
+
 	defer cat.close() //nolint:errcheck // shutdown
 
 	maps, err := blockmap.New(blockmap.Options{
@@ -101,7 +114,7 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		return fmt.Errorf("ingest: %w", err)
 	}
 
-	elector, stopMembers, err := newElector(ctx, cfg, log)
+	elector, peers, stopMembers, err := newElector(ctx, cfg, log)
 	if err != nil {
 		return fmt.Errorf("ingest election: %w", err)
 	}
@@ -180,11 +193,24 @@ func serve(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		}()
 	}
 
+	// The cleaner is the only thing that gives a sealed segment back. It is
+	// elected per segment so that one node evacuates a victim while the rest
+	// carry on serving it, and it is skipped entirely on a platform with no
+	// discard, where trimming a page is not something we can ask for.
+	cleaner, err := newCleaner(cfg, cat, watcher, peers, daemon, log)
+	if err != nil {
+		return fmt.Errorf("cleaner: %w", err)
+	}
+
 	background("devices", func() { watcher.Run(ctx) })
 	background("reconcile", func() { runReconcile(ctx, cfg, watcher, cat, reconcile, log) })
 	background("ingest", func() { queue.Run(ctx) })
 	background("catalog-sync", func() { runCatalogSync(ctx, cfg, cat, log) })
 	background("cleanup", func() { runCleanup(ctx, cfg, sn, log) })
+
+	if cleaner != nil {
+		background("clean", func() { cleaner.Run(ctx) })
+	}
 
 	if cfg.MetricsAddr != "" {
 		// The prober talks to the socket bound above, so it exercises the
@@ -464,11 +490,11 @@ func observer(log *slog.Logger) func(ingest.Request, ingest.Result, error) {
 // newElector builds the ingest election. Without a membership view every node
 // is eager, which is right on a single node and wrong on a thousand, so the
 // Kubernetes view is what turns the delay ladder on.
-func newElector(ctx context.Context, cfg *Config, log *slog.Logger) (ingest.Elector, func(), error) {
+func newElector(ctx context.Context, cfg *Config, log *slog.Logger) (ingest.Elector, func() []ifaces.Node, func(), error) {
 	if cfg.MembersSelector == "" {
 		log.Info("no peer view configured, this node ingests every layer it unpacks")
 
-		return ingest.Immediate{}, func() {}, nil
+		return ingest.Immediate{}, nil, func() {}, nil
 	}
 
 	mgr, err := members.New(members.Options{
@@ -479,7 +505,7 @@ func newElector(ctx context.Context, cfg *Config, log *slog.Logger) (ingest.Elec
 		Kubeconfig:    cfg.Kubeconfig,
 	})
 	if err != nil {
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
 
 	mgr.Start()
@@ -506,7 +532,7 @@ func newElector(ctx context.Context, cfg *Config, log *slog.Logger) (ingest.Elec
 	if err != nil {
 		mgr.Stop()
 
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
 
 	log.Info("ingest election enabled",
@@ -515,5 +541,48 @@ func newElector(ctx context.Context, cfg *Config, log *slog.Logger) (ingest.Elec
 		slog.Duration("step", cfg.ElectionStep),
 	)
 
-	return elector, mgr.Stop, nil
+	return elector, mgr.Snapshot, mgr.Stop, nil
+}
+
+// newCleaner builds the segment cleaner, or returns nil when it is switched
+// off. Election reuses the peer view the ingest election already needs, so
+// enabling the cleaner costs no extra Kubernetes access; without that view a
+// single node cleans on its own behalf, which is right on one node and would
+// be wasteful on many.
+func newCleaner(
+	cfg *Config,
+	cat clean.Catalog,
+	watcher *segment.Watcher,
+	peers func() []ifaces.Node,
+	daemon *daemonMetrics,
+	log *slog.Logger,
+) (*clean.Cleaner, error) {
+	if !cfg.Clean {
+		log.Info("segment reclamation disabled, a sealed segment will not come back")
+
+		return nil, nil
+	}
+
+	elector := clean.Elector(clean.Always{})
+	if peers != nil && cfg.NodeName != "" {
+		elector = clean.HRW{Self: ifaces.NodeID(cfg.NodeName), Members: peers}
+	}
+
+	var onCycle func(clean.Result)
+	if daemon != nil {
+		onCycle = daemon.observeClean
+	}
+
+	return clean.New(clean.Options{
+		Catalog:         cat,
+		Locator:         blockmap.WatcherLocator{Watcher: watcher},
+		Discarder:       clean.SystemDiscarder{},
+		Elector:         elector,
+		Interval:        cfg.CleanInterval,
+		LowWater:        cfg.CleanLowWater,
+		MaxLiveFraction: cfg.CleanMaxLive,
+		Grace:           cfg.WatermarkGrace,
+		Log:             log.With(slog.String("component", "clean")),
+		OnCycle:         onCycle,
+	})
 }

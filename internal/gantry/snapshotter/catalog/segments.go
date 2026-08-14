@@ -86,7 +86,12 @@ func (s *Store) segmentsLocked(sb Superblock) ([]SegmentEntry, error) {
 
 // AddSegment records a segment the operator has added to the image volume. It
 // does not open it; SetOpenSegment does that.
-func (s *Store) AddSegment(id, totalPages uint32) error {
+//
+// epoch is the extent's tombstone epoch as published now. It is recorded rather
+// than assumed to be zero so that a catalog formatted onto a volume whose
+// extents have already been collected once does not immediately believe every
+// segment is due a reclaim.
+func (s *Store) AddSegment(id, totalPages, epoch uint32) error {
 	if totalPages == 0 {
 		return errors.New("catalog: segment with no capacity")
 	}
@@ -117,8 +122,125 @@ func (s *Store) AddSegment(id, totalPages uint32) error {
 			return existing, nil
 		}
 
-		return SegmentEntry{ID: id, State: SegmentEmpty, TotalPages: totalPages}, nil
+		return SegmentEntry{ID: id, State: SegmentEmpty, TotalPages: totalPages, Epoch: epoch}, nil
 	})
+}
+
+// ErrSegmentState reports a lifecycle transition that did not happen because
+// the segment was not where the caller believed it was. It is not a failure:
+// another node got there first, and the caller should re-read and reconsider.
+var ErrSegmentState = errors.New("catalog: segment is not in the expected state")
+
+// SetSegmentState moves a segment from one lifecycle state to another under the
+// table block's compare-and-swap, so that only one node can drive a given
+// transition.
+//
+// repoint is written when it is non-zero, which is how the cleaner records the
+// generation a reader has to have passed before the segment's old contents stop
+// being reachable. It is never cleared here: the value has to survive the whole
+// of Cleaning and Draining, and it is the reclaim that retires it.
+//
+// The open segment is refused outright. Its cursor lives in the superblock, so
+// moving it out of Open without going through openSegmentLocked would strand
+// the allocation point.
+func (s *Store) SetSegmentState(id uint32, from, to SegmentState, repoint uint64) error {
+	s.io.Lock()
+	defer s.io.Unlock()
+
+	sb, err := s.readSuperblock()
+	if err != nil {
+		return err
+	}
+
+	if sb.OpenSegment == id {
+		return fmt.Errorf("%w: segment %d is open", ErrSegmentState, id)
+	}
+
+	block, slot, err := sb.segmentLocation(id)
+	if err != nil {
+		return err
+	}
+
+	return s.mergeSegmentBlock(block, slot, func(existing SegmentEntry, present bool) (SegmentEntry, error) {
+		if !present {
+			return SegmentEntry{}, fmt.Errorf("catalog: segment %d is not in the table", id)
+		}
+
+		if existing.State != from {
+			return SegmentEntry{}, fmt.Errorf("%w: segment %d is %s, not %s",
+				ErrSegmentState, id, existing.State, from)
+		}
+
+		existing.State = to
+
+		if repoint != 0 {
+			existing.RepointGeneration = repoint
+		}
+
+		return existing, nil
+	})
+}
+
+// ReclaimSegment returns a drained segment to service once the control plane
+// has collected its extent.
+//
+// epoch is what the node's image device map publishes for the extent now. The
+// reclaim only happens when that has run past the epoch the catalog recorded,
+// because that is the single piece of evidence RACER offers that the pages are
+// really gone: an epoch advance is what makes a trimmed page's slot free and
+// its address writable again, and nothing else reports it.
+//
+// The entry is reset rather than deleted. Its capacity has not changed, and a
+// segment that vanished from the table would have to be re-adopted before it
+// could be opened.
+func (s *Store) ReclaimSegment(id, epoch uint32) (bool, error) {
+	s.io.Lock()
+	defer s.io.Unlock()
+
+	sb, err := s.readSuperblock()
+	if err != nil {
+		return false, err
+	}
+
+	if sb.OpenSegment == id {
+		return false, fmt.Errorf("%w: segment %d is open", ErrSegmentState, id)
+	}
+
+	block, slot, err := sb.segmentLocation(id)
+	if err != nil {
+		return false, err
+	}
+
+	reclaimed := false
+
+	err = s.mergeSegmentBlock(block, slot, func(existing SegmentEntry, present bool) (SegmentEntry, error) {
+		reclaimed = false
+
+		if !present {
+			return SegmentEntry{}, fmt.Errorf("catalog: segment %d is not in the table", id)
+		}
+
+		if epoch <= existing.Epoch {
+			return existing, nil
+		}
+
+		// An epoch that moved while the segment was not draining is not this
+		// catalog's doing, but the pages are gone either way and pretending
+		// otherwise would hand a reader an address that reads as zeroes.
+		reclaimed = true
+
+		return SegmentEntry{
+			ID:         id,
+			State:      SegmentEmpty,
+			TotalPages: existing.TotalPages,
+			Epoch:      epoch,
+		}, nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return reclaimed, nil
 }
 
 // Roll describes a segment rollover: the segment that was sealed because it

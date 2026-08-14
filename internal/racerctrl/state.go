@@ -661,8 +661,8 @@ func ParseVolumeState(name string, annotations map[string]string) (VolumeState, 
 
 	state.Phase = annotations[PhaseAnnotation]
 
-	if state.TombstoneEpoch, err = optionalUint32Annotation(annotations, TombstoneEpochAnnotation); err != nil {
-		return VolumeState{}, fmt.Errorf("volume %q: %w", name, err)
+	if state.TombstoneEpochs, err = ParseTombstoneEpochs(annotations[TombstoneEpochAnnotation]); err != nil {
+		return VolumeState{}, fmt.Errorf("volume %q: %s: %w", name, TombstoneEpochAnnotation, err)
 	}
 
 	if raw := annotations[WarmZonesAnnotation]; raw != "" {

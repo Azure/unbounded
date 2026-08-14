@@ -2,7 +2,6 @@
 #
 # The snapshotter serves containerd's snapshot API over a unix socket and
 # turns a RACER-backed shared image device into container rootfs mounts.
-# See designs/gantry-snapshotter-design.md for the full picture.
 #
 # Deployment notes, all of them load bearing:
 #
@@ -153,6 +152,36 @@ spec:
             # could not be shortened at all.
             - --map-root=/var/lib/gantry-snapshotter/l
             - --containerd-socket=/run/containerd/containerd.sock
+            # The drain gate. Every node publishes how far it has read
+            # the catalog into a slot of this table, and the cleaner
+            # will not trim a segment until every live slot has passed
+            # the point where that segment's layers were repointed. A
+            # trimmed RACER page reads back as zeroes rather than an
+            # error, so a node missing from the table is a node whose
+            # mounts could quietly start returning garbage. Size it for
+            # the largest the cluster will get: eight blocks covers a
+            # thousand nodes in 32 KiB.
+            - --watermark-blocks={{ .WatermarkBlocks | default "8" }}
+            # How long a node's watermark stands after it stops being
+            # refreshed. Shorter risks trimming under a node that is
+            # merely slow; longer lets one decommissioned node stall
+            # reclamation for as long as it lasts.
+            - --watermark-grace={{ .WatermarkGrace | default "10m" }}
+            # Reclamation. Layers are written into an extent until it
+            # fills, and RACER can only collect a whole extent at once,
+            # so the space a deleted layer used comes back only when the
+            # cleaner copies the layers still in use out of its extent
+            # and has the emptied extent collected. Without this the
+            # image volume fills once and stays full.
+            - --clean={{ .Clean | default "true" }}
+            - --clean-interval={{ .CleanInterval | default "1m" }}
+            # Start reclaiming when free space falls below this fraction
+            # of the volume. Too low and ingest hits a full volume
+            # before the cleaner has finished a cycle.
+            - --clean-low-water={{ .CleanLowWater | default "0.25" }}
+            # Never evacuate an extent more than this fraction live:
+            # above it the copying costs more than the space it frees.
+            - --clean-max-live={{ .CleanMaxLive | default "0.5" }}
             - --metrics-addr=:9096
           env:
             # Ranks this node in the per-layer ingest election.

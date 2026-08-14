@@ -170,10 +170,11 @@ func testSet(t *testing.T) *segment.Set {
 	set, err := segment.Parse([]byte(`{
 		"generation": 3,
 		"universe": 7,
-		"catalog": {"device": "/dev/ublkb1", "bytes": 268435456},
+		"device": "/dev/ublkb1",
+		"catalogBytes": 268435456,
 		"segments": [
-			{"id": 1, "device": "/dev/ublkb2", "bytes": 17179869184},
-			{"id": 2, "device": "/dev/ublkb3", "bytes": 17179869184}
+			{"id": 1, "offset": 268435456, "bytes": 17179869184, "epoch": 0},
+			{"id": 2, "offset": 17448304640, "bytes": 17179869184, "epoch": 0}
 		]
 	}`))
 	if err != nil {
@@ -223,12 +224,22 @@ func digest(b byte) catalog.Digest {
 
 // addr is a blob of n pages at page offset off of segment 1, sized so that the
 // tail padding is less than a page.
-func addr(off, n uint32) segment.Address {
-	return segment.Address{
-		Segment:    1,
-		PageOffset: off,
-		PageCount:  n,
-		ByteLength: uint64(n)*segment.PageBytes - 4096,
+func addr(off, n uint32) catalog.Blob {
+	return at(off, n, 1)
+}
+
+// at is addr with an explicit record generation, which the mapping name folds
+// in so that a segment handed to a new blob after a reclaim cannot be served
+// out of the previous occupant's device.
+func at(off, n uint32, generation uint64) catalog.Blob {
+	return catalog.Blob{
+		Address: segment.Address{
+			Segment:    1,
+			PageOffset: off,
+			PageCount:  n,
+			ByteLength: uint64(n)*segment.PageBytes - 4096,
+		},
+		Generation: generation,
 	}
 }
 
@@ -284,9 +295,12 @@ func TestEnsureMapsAndMounts(t *testing.T) {
 	// The mapping must cover the blob's whole page span, not just its bytes,
 	// so readahead in the last page stays inside the device.
 	table := dm.tables[name]
+	// The address is relative to its segment, and the segment is at an offset
+	// in the one image device, so the table names the device the whole volume
+	// is exported as and a sector past the catalog head.
 	want := Table{
-		Device:      "/dev/ublkb2",
-		StartSector: 4 * segment.PageBytes / SectorBytes,
+		Device:      "/dev/ublkb1",
+		StartSector: (268435456 + 4*segment.PageBytes) / SectorBytes,
 		Sectors:     2 * segment.PageBytes / SectorBytes,
 	}
 
@@ -379,8 +393,8 @@ func TestEnsureKeepsTheDeviceWhenMountFails(t *testing.T) {
 func TestEnsureUnknownSegment(t *testing.T) {
 	m, _, _ := newMap(t)
 
-	_, err := m.Ensure(t.Context(), digest(1), segment.Address{
-		Segment: 9, PageOffset: 0, PageCount: 1, ByteLength: 4096,
+	_, err := m.Ensure(t.Context(), digest(1), catalog.Blob{
+		Address: segment.Address{Segment: 9, PageOffset: 0, PageCount: 1, ByteLength: 4096},
 	})
 	if !errors.Is(err, segment.ErrUnknownSegment) {
 		t.Fatalf("got %v, want ErrUnknownSegment", err)
@@ -421,6 +435,12 @@ func TestNameTracksTheAddress(t *testing.T) {
 
 	if other := m.Name(digest(2), addr(0, 1)); other == moved {
 		t.Fatalf("two layers are named %s", other)
+	}
+
+	// And the same layer at the same address in a later life of the segment
+	// has to differ too, which is what the record generation buys.
+	if reused := m.Name(digest(1), at(0, 1, 2)); reused == moved {
+		t.Fatalf("both generations are named %s", reused)
 	}
 
 	if err := validName(moved); err != nil {
