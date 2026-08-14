@@ -5,12 +5,16 @@
 //! ```
 //!
 //! The ladder it prints - a raw ext4 file, then one node alone, then a three node group -
-//! is what makes the numbers attributable: the raw row is the load generator's own
-//! ceiling on this machine, and every row below it is read against that.
+//! is what makes the numbers attributable: the raw row is what the load generator and one
+//! store can do between them on this machine, and every row below it is read against that.
+//! One store: a three node cluster has three, so the group rows can and do pass the raw
+//! row on bandwidth. What the raw row bounds is a node, not a cluster.
 //!
-//! Storage is memory throughout, the same memfd-loop-ext4 stack `tests/cluster.rs` runs
-//! on, so the CPU is the only thing that can be the limit, which is the question being
-//! asked.
+//! Storage is memory throughout, the same brd-ext4 stack `tests/cluster.rs` runs on, so
+//! the CPU is the only thing that can be the limit, which is the question being asked.
+//! A loop device would not do: it takes one hardware queue and one kernel worker, which
+//! caps a store near 8 GiB/s however many cores ask, and a benchmark that measures that
+//! is measuring the loop driver.
 
 #[path = "harness.rs"]
 mod harness;
@@ -135,7 +139,7 @@ fn e2e(a: Args) {
             // adopts any store whose superblock region is not zeros, and this one is
             // about to be written all over.
             let mnt = PathBuf::from(ROOT).join("baseline");
-            let backing = harness::Backing::new(&mnt, FS_BYTES, "baseline");
+            let backing = harness::Backing::new(&mnt, FS_BYTES, RAM_BASE);
             let files = [reserve(&backing.path("store.img"))];
 
             // Memory is spent on a page when something stores it and the image file is
@@ -407,6 +411,15 @@ fn minor(id: u32, role: u32) -> u32 {
     200 + 10 * id + role
 }
 
+/// The ram disk node `id` puts its file system on, and `RAM_BASE` itself for the raw
+/// baseline, which runs before any node starts. Above the block the tests use, for the
+/// same reason the minors are.
+const RAM_BASE: u32 = 8;
+
+fn ram(id: u32) -> u32 {
+    RAM_BASE + id
+}
+
 /// Bytes of file system per node: room for the store image and the ext4 metadata around
 /// it. Memory is spent only on what is written, so the slack costs nothing.
 const FS_BYTES: u64 = 8 << 30;
@@ -497,7 +510,7 @@ impl Cluster {
             let dir = PathBuf::from(ROOT).join(format!("n{id}"));
             // A file system of its own per node, made here and gone when the cluster is:
             // every run formats a blank store rather than finding one left behind.
-            let backing = harness::Backing::new(&dir.join("mnt"), FS_BYTES, &format!("n{id}"));
+            let backing = harness::Backing::new(&dir.join("mnt"), FS_BYTES, ram(id));
             let store = reserve(&backing.path("store.img"));
             let mut proc = harness::Proc::new(id, dir, store, racer.clone());
             // Both SMT siblings of every core: the runtime folds them back to one worker

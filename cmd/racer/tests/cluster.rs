@@ -1,7 +1,7 @@
 //! Six-node cluster end-to-end. Every assertion goes through a ublk device, half through a
 //! node that does not hold the page; one process per node, since only one runtime may exist
-//! per process. Each store is a file on ext4 over a loop device on a memfd, so no real
-//! storage is used. Peers attach to each other's fabric device; only nvme-of is untested.
+//! per process. Each store is a file on ext4 over a `brd` ram disk, so no real storage is
+//! used. Peers attach to each other's fabric device; only nvme-of is untested.
 
 // Real processes over real kernel interfaces; `sim` replaces them with an event queue.
 #![cfg(not(feature = "sim"))]
@@ -177,11 +177,12 @@ fn scrape(n: &Node) -> Exposition {
     Exposition::parse(&body)
 }
 
-// --- backing store: memfd -> loop -> ext4 ---
+// --- backing store: brd -> ext4 ---
 
 fn build_node(id: u32) -> Node {
     let dir = PathBuf::from(ROOT).join(format!("n{id}"));
-    let backing = harness::Backing::new(&dir.join("mnt"), FS_BYTES, &id.to_string());
+    // Ram disks 0 upward, which is the block the benchmark leaves to the tests.
+    let backing = harness::Backing::new(&dir.join("mnt"), FS_BYTES, id - 1);
     // Deliberately not created: racer places and sizes its own store.
     let store = backing.path("store.img");
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_racer"));
@@ -519,10 +520,17 @@ fn rebuild(
     );
 }
 
+/// Whether `brd` could be loaded. A dry run, so asking costs nothing: the harness loads
+/// the module itself the first time it makes a store.
+fn brd_available() -> bool {
+    Command::new("modprobe")
+        .args(["--dry-run", "--quiet", "brd"])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 fn privileged() -> bool {
-    (unsafe { libc::geteuid() } == 0)
-        && File::open("/dev/ublk-control").is_ok()
-        && File::open("/dev/loop-control").is_ok()
+    (unsafe { libc::geteuid() } == 0) && File::open("/dev/ublk-control").is_ok() && brd_available()
 }
 
 // --- the test ---
@@ -530,7 +538,7 @@ fn privileged() -> bool {
 #[test]
 fn six_node_cluster() {
     if !privileged() {
-        eprintln!("skipping: needs root, ublk_drv and loop");
+        eprintln!("skipping: needs root, ublk_drv and brd");
         return;
     }
     let _ = std::fs::remove_dir_all(ROOT);
