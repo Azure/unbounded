@@ -22,12 +22,27 @@ name: unbounded release prepare
 #
 # Modes (the `mode` input):
 #   release     Bump the latest FINAL tag by `bump` and cut vX.Y.Z.
-#   prerelease  Bump the latest FINAL tag by `bump` and cut vX.Y.Z-<pre>
-#               (e.g. pre=rc.1). Iterate a train by re-running with the same
-#               `bump` and an incremented `pre` (rc.1 -> rc.2 -> ...).
-#   promote     Finalize an in-flight prerelease to its release version, with
-#               NO bump. By default this promotes the highest prerelease
-#               train; set `version` (e.g. v0.2.0) to promote a specific one.
+#   prerelease  Cut vX.Y.Z-rc.N. With a train already in flight it continues
+#               that train and takes the next rc automatically, so iterating is
+#               just re-running with no input changes. With none in flight it
+#               starts one, bumped from the latest final by `bump`.
+#   promote     Finalize a prerelease train to its release version, with NO
+#               bump. Resolves automatically when exactly one train is in
+#               flight; set `version` to choose between several.
+#
+# A train counts as IN FLIGHT when its core version has prerelease tags, no
+# final tag, and is newer than the latest final. That last clause is what keeps
+# an abandoned train from being offered: v0.1.24 still has twelve candidates and
+# no final, but v0.2.4 has since shipped, so it is stale rather than pending.
+#
+# The version resolution lives in hack/release/next-version.sh, tested by
+# hack/release/next-version-test.sh. It used to be inline here, where the only
+# way to test a change was to push a real tag and see what happened, and where
+# it grew three sharp edges: `bump` silently forking a train, `pre` accepting
+# any value including one that went backwards, and `promote` guessing at the
+# highest prerelease in the whole repository. That last one orphaned v0.1.24.
+#
+# Use `dry_run` to see the computed version without pushing anything.
 #
 # Recovery: if a tag is pushed but no release.yaml run is triggered (for
 # example a misconfigured deploy key or disabled Actions), delete the tag
@@ -50,7 +65,7 @@ on:
           - promote
         default: release
       bump:
-        description: "Version bump level (release/prerelease)"
+        description: "Bump level. Only used to START a train or cut a final; ignored while continuing a live train."
         required: true
         type: choice
         options:
@@ -59,14 +74,22 @@ on:
           - major
         default: patch
       pre:
-        description: "Prerelease suffix for prerelease mode (e.g. rc.1)"
+        description: "Prerelease suffix (e.g. rc.3). Blank takes the next rc automatically, which is almost always what you want."
         required: false
         type: string
         default: ""
       version:
-        description: "promote only: explicit final version to cut (e.g. v0.2.0); blank = highest in-flight prerelease"
+        description: "promote only: explicit final version to cut (e.g. v0.2.0); blank = the single live prerelease train"
         required: false
         type: string
+      dry_run:
+        description: "Compute the version and print it without pushing a tag"
+        type: boolean
+        default: false
+      allow_concurrent_trains:
+        description: "Permit starting a second live prerelease train alongside an existing one"
+        type: boolean
+        default: false
         default: ""
 
 # The tag push authenticates via the SSH deploy key, not GITHUB_TOKEN, so no
@@ -113,16 +136,22 @@ jobs:
 
           echo "Deploy key authenticates to origin."
 
-      - name: Compute and push tag
-        # Bind inputs to env vars so they enter the shell as data, not as
-        # code. `pre` and `version` are free-form user input; inlining
-        # `${{ ... }}` in a run block is template-expanded before bash parses
-        # it, so any shell metacharacter would become script syntax.
+      - name: Compute tag
+        # Inputs are bound to env vars rather than interpolated into the script,
+        # so they arrive as data. `pre` and `version` are free-form: a `${{ }}`
+        # inlined in a run block is template-expanded before bash parses it, so
+        # a shell metacharacter would become script syntax.
+        #
+        # The resolution itself lives in hack/release/next-version.sh so it can
+        # be tested against synthetic tag sets. While it was inline here the
+        # only way to test a change was to push a real tag and find out.
+        id: compute
         env:
           MODE: ${{ inputs.mode }}
           BUMP: ${{ inputs.bump }}
           PRE: ${{ inputs.pre }}
           VERSION: ${{ inputs.version }}
+          ALLOW_CONCURRENT_TRAINS: ${{ inputs.allow_concurrent_trains }}
         run: |
           set -euo pipefail
 
@@ -132,83 +161,21 @@ jobs:
             exit 1
           fi
 
-          # Latest FINAL (non-prerelease) tag, used as the bump base. Excluding
-          # prerelease tags avoids git's version sort ranking e.g. v0.2.0-rc.1
-          # above v0.2.0.
-          latest_final() {
-            git tag --list 'v*' --sort=-version:refname | grep -v -- '-' | head -n1
-          }
+          TAG="$(hack/release/next-version.sh)"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-          bump_version() {
-            local base="$1" level="$2"
-            local semver="${base#v}"
-            local major minor patch
-            IFS='.' read -r major minor patch <<< "$semver"
-            case "$level" in
-              major) major=$((major + 1)); minor=0; patch=0 ;;
-              minor) minor=$((minor + 1)); patch=0 ;;
-              patch) patch=$((patch + 1)) ;;
-              *) echo "::error::unexpected bump level: ${level}"; exit 1 ;;
-            esac
-            echo "v${major}.${minor}.${patch}"
-          }
-
-          case "$MODE" in
-            release)
-              FINAL="$(latest_final)"
-              [[ -z "$FINAL" ]] && FINAL="v0.0.0"
-              TAG="$(bump_version "$FINAL" "$BUMP")"
-              ;;
-
-            prerelease)
-              if [[ -z "$PRE" ]]; then
-                echo "::error::mode=prerelease requires a non-empty pre suffix"
-                exit 1
-              fi
-              FINAL="$(latest_final)"
-              [[ -z "$FINAL" ]] && FINAL="v0.0.0"
-              CORE="$(bump_version "$FINAL" "$BUMP")"
-              TAG="${CORE}-${PRE}"
-              ;;
-
-            promote)
-              if [[ -n "$VERSION" ]]; then
-                # Normalize a leading v and reject any prerelease suffix.
-                NORM="v${VERSION#v}"
-                if [[ ! "$NORM" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                  echo "::error::version must be a final vX.Y.Z (no suffix), got: ${VERSION}"
-                  exit 1
-                fi
-                if [[ -z "$(git tag --list "${NORM}-*")" ]]; then
-                  echo "::error::no prerelease train found for ${NORM} (no ${NORM}-* tags); use mode=release to cut it directly"
-                  exit 1
-                fi
-                TAG="$NORM"
-              else
-                PRELATEST="$(git tag --list 'v*-*' --sort=-version:refname | head -n1)"
-                if [[ -z "$PRELATEST" ]]; then
-                  echo "::error::mode=promote found no prerelease tags to finalize"
-                  exit 1
-                fi
-                TAG="${PRELATEST%%-*}"
-              fi
-              ;;
-
-            *)
-              echo "::error::unexpected mode: ${MODE}"
-              exit 1
-              ;;
-          esac
-
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Tag must be in vX.Y.Z[-suffix] format, got: ${TAG}"
-            exit 1
-          fi
-
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "::error::Tag ${TAG} already exists"
-            exit 1
-          fi
+      - name: Push tag
+        # Compared explicitly rather than relying on truthiness. The REST API,
+        # and so `gh workflow run -f dry_run=false`, submits inputs as strings,
+        # and a NON-EMPTY STRING IS TRUTHY: `!inputs.dry_run` would evaluate
+        # false for the string "false" and silently skip the push on an
+        # ordinary run. Same reasoning as force_publish in release-upgrade.yaml.
+        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
+        env:
+          TAG: ${{ steps.compute.outputs.tag }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -217,3 +184,17 @@ jobs:
 
           echo "Pushed ${TAG} (mode=${MODE}); release.yaml will build and sign it in tag context."
           echo "### Prepared release ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report dry run
+        if: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
+        env:
+          TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          echo "Dry run: would have pushed ${TAG}. Nothing was created."
+          {
+            echo "### Dry run: would prepare ${TAG}"
+            echo
+            echo "No tag was pushed. Re-run with dry_run unchecked to cut it."
+          } >> "$GITHUB_STEP_SUMMARY"

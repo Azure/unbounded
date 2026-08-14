@@ -60,11 +60,12 @@ force and breaking changes can land in a minor bump. In practice:
 
 ### Prereleases use `rc` only
 
-The prerelease suffix is `rc.N`. `alpha` and `beta` were previously used
-interchangeably with no defined meaning; do not add new ones.
+The prerelease suffix is `rc.N`, and `release-prepare` rejects anything else.
+`alpha` and `beta` were previously used interchangeably with no defined
+meaning.
 
-Iterate a train by re-running prepare with the **same** `bump` and an
-incremented `pre`: `rc.1`, then `rc.2`, and so on. Promote when it is good.
+Iterate a train by re-running prepare in `prerelease` mode with no input
+changes; the next `rc` is chosen for you. Promote when it is good.
 
 ### Every component shares one version
 
@@ -82,38 +83,50 @@ Everything is `release-prepare.yaml`. It only computes a version and pushes a
 tag; it builds nothing, so a mistake here is cheap to undo.
 
 ```sh
-# Cut a release candidate. Bump is relative to the latest FINAL tag.
+# Start a candidate train. Bump is relative to the latest final tag.
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=prerelease -f bump=patch -f pre=rc.1
+  -f mode=prerelease -f bump=patch
 
-# Iterate the train. Same bump, next rc.
+# Iterate it. Same command, no changes: the train is detected and the next
+# rc is taken automatically.
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=prerelease -f bump=patch -f pre=rc.2
+  -f mode=prerelease
 
-# Promote the train to its final version. No bump: v0.2.5-rc.2 becomes v0.2.5.
+# Promote it. Resolves on its own when one train is in flight.
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=promote -f version=v0.2.5
+  -f mode=promote
 
 # Cut a final release directly, with no candidate.
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
   -f mode=release -f bump=patch
 ```
 
-### Three things that bite
+Add `-f dry_run=true` to any of these to see the version it would cut without
+pushing anything.
 
-**`bump` is relative to the latest final tag, every time.** It is not
-remembered across a train. If you cut `v0.2.5-rc.1` with `bump=patch` and then
-run `rc.2` with `bump=minor`, you get `v0.3.0-rc.2` and now have two live
-trains.
+### How trains work
 
-**`pre` is not validated.** Nothing checks that `rc.2` follows `rc.1`. Skipping
-or repeating a number is accepted silently.
+A train is **in flight** when its core version has prerelease tags, no final
+tag, and is newer than the latest final tag.
 
-**`promote` with a blank `version` picks the highest prerelease in the whole
-repository, not the train you were working on.** If two trains are live it will
-silently finalise the wrong one and orphan the other. This has happened: the
-`v0.1.24` train reached `rc.18` and was abandoned when a `v0.2.0` train started
-alongside it. **Always pass `version` explicitly.**
+- `prerelease` continues the train in flight and takes the next `rc.N`. `bump`
+  is only consulted when there is no train to continue, so it cannot fork a
+  train halfway through.
+- `pre` is almost never needed. Leave it blank. An explicit value must be
+  `rc.N` and must be ahead of the current highest.
+- `promote` resolves on its own when exactly one train is in flight. With
+  several it refuses and asks which, rather than guessing.
+
+Starting a second train while one is in flight requires
+`-f allow_concurrent_trains=true`, and once two exist, `promote` requires an
+explicit `version`.
+
+That guard exists because of a real incident: the `v0.1.24` train reached
+`rc.18` and was silently orphaned when a `v0.2.0` train started beside it.
+Promote picked the newer train, `v0.1.24` was never cut, and its twelve
+candidate tags are still in the repository. Those older candidates are now
+classified as **stale** rather than in flight, so they are reported for cleanup
+and never offered as something to continue or promote.
 
 ## 4. What the build does
 
