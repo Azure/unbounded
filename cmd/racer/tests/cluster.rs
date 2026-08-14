@@ -68,6 +68,10 @@ struct Node {
     /// Whether the generations for this node carry the late extent, which is more than the
     /// store was formatted for. Set with `store_bytes` to watch a start make room for it.
     late_extent: bool,
+    /// Whether the generations for this node still declare the `MIX` device. Cleared to
+    /// take a device away, which is the one reconfiguration that has to retire a ublk
+    /// export rather than add one.
+    drop_mix: bool,
 }
 
 impl Node {
@@ -191,6 +195,7 @@ fn build_node(id: u32) -> Node {
         _backing: backing,
         store_bytes: IMG_BYTES,
         late_extent: false,
+        drop_mix: false,
     }
 }
 
@@ -353,14 +358,15 @@ fn config_text(generation: u32, n: &Node, peers: &[(u32, PathBuf)]) -> String {
         "device {} extents=1\n\
          device {} extents=2\n\
          device {} extents=3\n\
-         device {} extents=4\n\
-         device {} extents=2,1\n",
+         device {} extents=4\n",
         minor(id, LWW),
         minor(id, OCC),
         minor(id, IMM),
         minor(id, BIG),
-        minor(id, MIX),
     );
+    if !n.drop_mix {
+        s += &format!("device {} extents=2,1\n", minor(id, MIX));
+    }
     if n.late_extent {
         s += &format!("device {} extents=5\n", minor(id, LATE));
     }
@@ -409,6 +415,34 @@ fn wire_without(nodes: &mut [Node], generation: u32, who: &[usize], omit: &[u32]
         n.proc.install(&text);
         n.proc.await_reload();
     }
+}
+
+/// Install `generation` on node `i` and wait, with a deadline, for the node to take it.
+///
+/// [`harness::Proc::await_reload`] reads the node's stdout, so a node whose reload never
+/// returns parks the test rather than failing it, and libtest has no deadline of its own.
+/// Polling the gauge instead turns that into an assertion: the generation is published
+/// partway through a reload, so if it never arrives the reload is stuck.
+fn reconfigure(nodes: &mut [Node], i: usize, generation: u32) {
+    let peers = peers_of(nodes, nodes[i].proc.id);
+    let text = config_text(generation, &nodes[i], &peers);
+    nodes[i].proc.install(&text);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while scrape(&nodes[i]).get("racer_config_generation") != generation as u64 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node {} never took generation {generation}: its reload is stuck",
+            nodes[i].proc.id,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    nodes[i].proc.await_reload();
+    assert_eq!(
+        scrape(&nodes[i]).get("racer_control_broadcast_stalled_total"),
+        0,
+        "node {} stalled a control broadcast",
+        nodes[i].proc.id,
+    );
 }
 
 /// First page of the extent at `base` that group `want` owns, so "holds it" is exact below.
@@ -1099,6 +1133,80 @@ fn six_node_cluster() {
         );
     }
     drop((outside, shed));
+
+    // ---- a device that leaves: the generation that takes it away must land ---------
+    // Retiring an export is the one reconfiguration that stops a ublk device instead of
+    // starting one, and it is the only one that has to reach `STOP_DEV` before the
+    // kernel hands back the tags parked on the queues. Get that order wrong and the
+    // reload never returns: the node keeps serving what it already has, logs nothing,
+    // and silently ignores every later generation, which from the control plane looks
+    // like a node that has stopped listening. So the assertion here is that the
+    // generation lands, not merely that IO survives.
+    let gone = nodes[3]
+        .proc
+        .device(minor(nodes[3].proc.id, MIX))
+        .to_path_buf();
+
+    // A reader on another device of the same node keeps working across the retire: one
+    // device leaving must not need the whole node quiet.
+    let busy_page = want[0].0;
+    let busy = nodes[3].dev(LWW);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                busy.read(busy_page * 4096, PAGE)
+                    .expect("a read on a device that is staying");
+                reads += 1;
+            }
+            reads
+        })
+    };
+
+    generation += 1;
+    nodes[3].drop_mix = true;
+    reconfigure(&mut nodes, 3, generation);
+    assert_eq!(
+        scrape(&nodes[3]).get("racer_devices"),
+        4,
+        "the retired device is still declared"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        reader.join().expect("the reader thread") > 0,
+        "the reader never got a turn, so it proved nothing"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while gone.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} outlived the generation that removed it",
+            gone.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // And the slot comes back. A tag id names a device slot and carries no epoch, so a
+    // slot handed out again while the kernel still held tags on the old device would
+    // take a stale completion for a live one.
+    generation += 1;
+    nodes[3].drop_mix = false;
+    reconfigure(&mut nodes, 3, generation);
+    assert_eq!(
+        scrape(&nodes[3]).get("racer_devices"),
+        5,
+        "the device did not come back"
+    );
+    harness::wait_for(&gone);
+    let again = Dev::open(&gone);
+    assert_eq!(
+        again.read((512 + both) * 4096, PAGE).unwrap(),
+        shared,
+        "a device that came back must map the same extents"
+    );
+    drop(again);
 
     shutdown(&mut nodes);
     drop(nodes);

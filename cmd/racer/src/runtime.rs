@@ -20,8 +20,8 @@ use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -869,18 +869,76 @@ struct Hub {
     doorbell: Doorbell,
 }
 
+/// How long a control broadcast may go unanswered before it starts saying so, and how
+/// often it repeats itself afterwards.
+const BROADCAST_WARN: Duration = Duration::from_secs(5);
+
+/// Control broadcasts that ran past [`BROADCAST_WARN`]. Owned by the control thread, so
+/// it cannot fill a worker's metrics row directly; core 0 copies it in from `tick`.
+static BROADCAST_STALLS: AtomicU64 = AtomicU64::new(0);
+/// Microseconds the control thread has been waiting in its current broadcast, 0 when it
+/// is not waiting. A nonzero value that keeps climbing means reconfiguration is stuck.
+static BROADCAST_WAIT_US: AtomicU64 = AtomicU64::new(0);
+
+/// Number of control broadcasts that have stalled since boot.
+pub(crate) fn broadcast_stalls() -> u64 {
+    BROADCAST_STALLS.load(Ordering::Relaxed)
+}
+
+/// How long the control thread has been stuck in its current broadcast, in microseconds.
+pub(crate) fn broadcast_wait_us() -> u64 {
+    BROADCAST_WAIT_US.load(Ordering::Relaxed)
+}
+
 impl Hub {
     /// Broadcast one message and block until every worker drops its `Ack`, done or dead.
-    fn broadcast(&mut self, mut make: impl FnMut(usize, Ack) -> Ctl) {
+    ///
+    /// `what` names the message for the stall log. There is deliberately no give-up
+    /// path: a worker that has not acked is still holding state the next step would
+    /// walk over, so continuing without it would trade a stall for corruption. What the
+    /// watchdog buys is that the stall stops being silent - reconfiguration hanging here
+    /// used to look exactly like a node that had simply stopped hearing about configs.
+    fn broadcast(&mut self, what: &str, mut make: impl FnMut(usize, Ack) -> Ctl) {
         let (tx, rx) = channel::<()>();
+        let mut sent = 0usize;
         for i in 0..self.inboxes.len() {
             if self.inboxes[i].send(make(i, tx.clone())).is_ok() {
                 self.doorbell.wake(i);
+                sent += 1;
             }
         }
         drop(tx);
         // Workers send `()` before dropping their `Ack`; the last drop ends the loop.
-        while rx.recv().is_ok() {}
+        let start = Instant::now();
+        let mut acked = 0usize;
+        let mut warned = false;
+        loop {
+            match rx.recv_timeout(BROADCAST_WARN) {
+                Ok(()) => acked += 1,
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    let waited = start.elapsed();
+                    BROADCAST_WAIT_US.store(waited.as_micros() as u64, Ordering::Relaxed);
+                    if !warned {
+                        BROADCAST_STALLS.fetch_add(1, Ordering::Relaxed);
+                        warned = true;
+                    }
+                    eprintln!(
+                        "racer: control broadcast {what} stalled for {}s: {} of {sent} workers \
+                         have acked; no later configuration can be applied until they do",
+                        waited.as_secs(),
+                        acked,
+                    );
+                }
+            }
+        }
+        if warned {
+            BROADCAST_WAIT_US.store(0, Ordering::Relaxed);
+            eprintln!(
+                "racer: control broadcast {what} completed after {}s",
+                start.elapsed().as_secs(),
+            );
+        }
     }
 }
 
@@ -1154,8 +1212,9 @@ where
 
     // 2. Register new files on every core before anything can name them.
     if !new_files.is_empty() {
-        ctx.hub
-            .broadcast(|_, ack| Ctl::RegisterFiles(new_files.clone(), ack));
+        ctx.hub.broadcast("RegisterFiles", |_, ack| {
+            Ctl::RegisterFiles(new_files.clone(), ack)
+        });
     }
 
     // 3. Retiring devices stop accepting IO; in-flight requests hold the old config.
@@ -1163,20 +1222,34 @@ where
     // The order within each device is load bearing. STOP_DEV deletes the gendisk, and
     // deleting it waits for the request queue to freeze; the queue cannot freeze while
     // a consumer outside this process still has reads outstanding. The kernel aborts
-    // those only when the last char-device reference goes away. So the workers drain
-    // and drop theirs first, then we drop ours, and only then do we ask for the disk.
+    // those only when the last char-device reference goes away. So the workers stop
+    // dispatching first, then we drop our handle, and only then do we ask for the disk.
     // Asking first parks the configuration thread in `blk_mq_freeze_queue_wait` for as
     // long as the consumer keeps reading, and every later configuration is ignored in
     // silence because the reload never returns.
+    //
+    // Draining is two phases for a matching reason. A worker's tags sit parked in
+    // `UBLK_IO_FETCH_REQ`, and the only thing that completes them is the STOP_DEV
+    // below; a single drain that waited for them would wait for the step it is holding
+    // up, which is the same silent stall from the other direction. So phase one waits
+    // only for our own in-flight requests, and phase two, after STOP_DEV, collects the
+    // tags the kernel hands back. The slot stays pinned across both: a tag id names a
+    // device slot and carries no epoch, so releasing it while abort completions are
+    // still in the ring would let a stale one land on whatever device took the slot.
     for (slot, dev_id) in &retiring {
         ctx.hub
-            .broadcast(|_, ack| Ctl::StopQueue { slot: *slot, ack });
+            .broadcast("StopQueue", |_, ack| Ctl::StopQueue { slot: *slot, ack });
 
-        let mut c = ctx.cfgr.core.borrow_mut();
-        if let Some(v) = c.vols.iter_mut().find(|v| v.slot == *slot) {
-            v.cdev = None;
+        {
+            let mut c = ctx.cfgr.core.borrow_mut();
+            if let Some(v) = c.vols.iter_mut().find(|v| v.slot == *slot) {
+                v.cdev = None;
+            }
+            let _ = c.ctl().stop_dev(*dev_id);
         }
-        let _ = c.ctl().stop_dev(*dev_id);
+
+        ctx.hub
+            .broadcast("ReapQueue", |_, ack| Ctl::ReapQueue { slot: *slot, ack });
     }
 
     // 4. Core state, if this build offered any.
@@ -1193,14 +1266,17 @@ where
     if let Some(rows) = offered {
         let rows = (ctx.core_state)(rows);
         ctx.hub
-            .broadcast(|i, ack| Ctl::InstallCoreState { ptr: rows[i], ack });
+            .broadcast("InstallCoreState", |i, ack| Ctl::InstallCoreState {
+                ptr: rows[i],
+                ack,
+            });
     }
 
     // 4b. Publish: the per-core cutover point.
     let ver = ctx.next_ver;
     ctx.next_ver += 1;
     let ptr: *const C = &*cfg;
-    ctx.hub.broadcast(|_, ack| Ctl::Publish {
+    ctx.hub.broadcast("Publish", |_, ack| Ctl::Publish {
         ver,
         ptr: ptr as *const (),
         ack,
@@ -1224,7 +1300,7 @@ where
         };
         let cdev = sys::open_flags(Path::new(&cpath), libc::O_RDWR | libc::O_CLOEXEC)?;
         let raw = cdev.as_raw_fd();
-        ctx.hub.broadcast(|i, ack| Ctl::StartQueue {
+        ctx.hub.broadcast("StartQueue", |i, ack| Ctl::StartQueue {
             slot: *slot,
             dev,
             cfd: raw,
@@ -1274,7 +1350,8 @@ fn retire_old<C>(ctx: &mut Ctx<C>, keep: u32) {
             break;
         }
         let ver = front.ver;
-        ctx.hub.broadcast(|_, ack| Ctl::Retire { ver, ack });
+        ctx.hub
+            .broadcast("Retire", |_, ack| Ctl::Retire { ver, ack });
         ctx.versions.pop_front();
     }
     reclaim(ctx);
@@ -1298,8 +1375,9 @@ fn reclaim<C>(ctx: &mut Ctx<C>) {
         dead
     };
     if !dead_files.is_empty() {
-        ctx.hub
-            .broadcast(|_, ack| Ctl::UnregisterFiles(dead_files.clone(), ack));
+        ctx.hub.broadcast("UnregisterFiles", |_, ack| {
+            Ctl::UnregisterFiles(dead_files.clone(), ack)
+        });
     }
 
     let mut c = ctx.cfgr.core.borrow_mut();
@@ -1335,27 +1413,34 @@ fn teardown<C>(ctx: &mut Ctx<C>) -> std::io::Result<()> {
         .map(|v| (v.slot, v.dev_id))
         .collect();
     for (slot, dev_id) in &live {
-        // Same ordering as a reconfiguration: drain the workers, drop our char-device
-        // handle, and only then delete the disk. A consumer with reads outstanding
+        // Same ordering as a reconfiguration, and two phases for the same reason: stop
+        // dispatching, drop our char-device handle, delete the disk, and only then
+        // collect the tags STOP_DEV handed back. A consumer with reads outstanding
         // would otherwise freeze the queue against us and hold shutdown open until it
         // gave up, and being killed for that leaves the export in a worse state.
         ctx.hub
-            .broadcast(|_, ack| Ctl::StopQueue { slot: *slot, ack });
+            .broadcast("StopQueue", |_, ack| Ctl::StopQueue { slot: *slot, ack });
 
-        let mut c = ctx.cfgr.core.borrow_mut();
-        if let Some(v) = c.vols.iter_mut().find(|v| v.slot == *slot) {
-            v.cdev = None;
+        {
+            let mut c = ctx.cfgr.core.borrow_mut();
+            if let Some(v) = c.vols.iter_mut().find(|v| v.slot == *slot) {
+                v.cdev = None;
+            }
+            let _ = c.ctl().stop_dev(*dev_id);
         }
-        let _ = c.ctl().stop_dev(*dev_id);
+
+        ctx.hub
+            .broadcast("ReapQueue", |_, ack| Ctl::ReapQueue { slot: *slot, ack });
     }
 
     let vers: Vec<u32> = ctx.versions.iter().map(|v| v.ver).collect();
     for ver in vers {
-        ctx.hub.broadcast(|_, ack| Ctl::Retire { ver, ack });
+        ctx.hub
+            .broadcast("Retire", |_, ack| Ctl::Retire { ver, ack });
     }
     ctx.versions.clear();
 
-    ctx.hub.broadcast(|_, ack| Ctl::Shutdown(ack));
+    ctx.hub.broadcast("Shutdown", |_, ack| Ctl::Shutdown(ack));
 
     let mut c = ctx.cfgr.core.borrow_mut();
     // The char-device handles went with the stop above, so ask for the devices to go

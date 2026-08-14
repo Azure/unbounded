@@ -399,22 +399,40 @@ impl Drop for Proc {
 
 /// Stop nodes together: a ublk device cannot be torn down while a peer holds it open, so
 /// asking one to leave while the others are up wedges it until it is killed.
+/// Stop every node with SIGTERM and insist it goes on its own.
+///
+/// The SIGKILL is a cleanup path, not a shutdown path: a node that needs it has failed
+/// its teardown, and letting that pass silently is how a shutdown deadlock stays hidden
+/// for as long as it takes a test to notice something else. Every node is killed and
+/// reaped before the assertion fires, so a failure here still leaves no strays behind.
 pub fn shutdown<'a>(procs: impl IntoIterator<Item = &'a mut Proc>) {
     let mut procs: Vec<&mut Proc> = procs.into_iter().collect();
     for p in procs.iter_mut() {
         p.signal(libc::SIGTERM);
     }
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut wedged = Vec::new();
     for p in procs.iter_mut() {
+        let mut exited = false;
         while Instant::now() < deadline {
             match p.child.as_mut().map(|c| c.try_wait().unwrap()) {
-                None | Some(Some(_)) => break,
+                None | Some(Some(_)) => {
+                    exited = true;
+                    break;
+                }
                 Some(None) => std::thread::sleep(Duration::from_millis(20)),
             }
+        }
+        if !exited {
+            wedged.push(p.id);
         }
         p.signal(libc::SIGKILL);
         p.reap();
     }
+    assert!(
+        wedged.is_empty(),
+        "nodes {wedged:?} did not exit within 15s of SIGTERM and had to be killed",
+    );
 }
 
 // ---------------------------------------------------------------------------

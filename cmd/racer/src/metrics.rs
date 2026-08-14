@@ -141,6 +141,8 @@ metrics! {
     // node and configuration
     config_generation:       "racer_config_generation"            ""                           Gauge   "Generation of the configuration in force.",
     config_rejected:         "racer_config_rejected_total"        ""                           Counter "Configurations rejected since start.",
+    broadcast_stalls:        "racer_control_broadcast_stalled_total" ""                         Counter "Control-thread broadcasts that ran past their warning deadline. Nonzero means reconfiguration stalled waiting on a worker.",
+    broadcast_wait_us:       "racer_control_broadcast_wait_us"    ""                           Gauge   "Microseconds the control thread has been waiting in its current broadcast; 0 when it is not waiting.",
     topology_epoch:          "racer_topology_epoch"               ""                           Gauge   "Highest topology epoch in force across this node's universes.",
     node_id:                 "racer_node_id"                      ""                           Gauge   "This node's id.",
     workers:                 "racer_workers"                      ""                           Gauge   "Worker threads, one per physical core.",

@@ -144,8 +144,23 @@ pub(super) enum Ctl {
         q_ids: Vec<u16>,
         ack: Ack,
     },
-    /// Release a device's queues; acks once every tag has been reclaimed.
+    /// Stop dispatching for a device; acks once its in-flight requests have finished.
+    ///
+    /// Phase one of two. The queues stay armed and the slot stays registered: the tags
+    /// parked in `UBLK_IO_FETCH_REQ` are the kernel's until `STOP_DEV` aborts them, and
+    /// the control thread cannot issue that until this ack lets it past. Waiting for
+    /// them here instead would wait for the thing this ack unblocks.
     StopQueue {
+        slot: u16,
+        ack: Ack,
+    },
+    /// Release a device's queues; acks once every tag has come back from the kernel.
+    ///
+    /// Phase two, sent after `STOP_DEV`. The device slot stays pinned until this returns
+    /// so a later reconfiguration cannot reuse it while abort completions are still in
+    /// the ring: a tag id names a slot and carries no epoch, so a stale completion would
+    /// otherwise land on whatever device took the slot next.
+    ReapQueue {
         slot: u16,
         ack: Ack,
     },
@@ -229,19 +244,28 @@ impl Queue {
 struct DevSlot {
     active: bool,
     stopping: bool,
+    /// Phase two: `STOP_DEV` has been issued and the armed tags are coming back.
+    reaping: bool,
     dev: u64,
     /// `/dev/ublkcN` for `USER_COPY` transfers. Control thread owns it; valid while active.
     cfd: RawFd,
     queues: [Option<Queue>; QUEUES_PER_WORKER],
     stop_ack: Option<Ack>,
+    reap_ack: Option<Ack>,
 }
 
 impl DevSlot {
-    fn idle(&self) -> bool {
-        self.queues
-            .iter()
-            .flatten()
-            .all(|q| q.armed == 0 && q.inflight == 0)
+    /// Nothing of ours is running against this device any more.
+    ///
+    /// Armed tags are deliberately not counted: they are parked commands the kernel
+    /// completes on `STOP_DEV`, and `STOP_DEV` comes after this ack.
+    fn quiesced(&self) -> bool {
+        self.queues.iter().flatten().all(|q| q.inflight == 0)
+    }
+
+    /// Every tag the kernel held has come back, so the slot is safe to reuse.
+    fn reaped(&self) -> bool {
+        self.queues.iter().flatten().all(|q| q.armed == 0)
     }
 }
 
@@ -1070,26 +1094,50 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
             });
         }
 
-        // Devices finishing their drain: release the queues and the char-dev file slot.
+        // Devices leaving in two stages. Phase one lets the control thread reach
+        // `STOP_DEV` once our own requests have finished; phase two, after it, releases
+        // the queues and the char-dev file slot once the kernel has handed back every
+        // tag it was holding.
         if l.draining.get() {
             let mut left = false;
             for slot in 0..MAX_DEVICES {
-                let ack = {
+                enum Done {
+                    Stop(Option<Ack>),
+                    Reap(Option<Ack>),
+                }
+                let done = {
                     let mut devs = l.devs.borrow_mut();
                     let d = &mut devs[slot as usize];
-                    if !d.stopping {
+                    if d.reaping {
+                        if !d.reaped() {
+                            left = true;
+                            continue;
+                        }
+                        d.active = false;
+                        d.stopping = false;
+                        d.reaping = false;
+                        d.queues = Default::default();
+                        Done::Reap(d.reap_ack.take())
+                    } else if d.stopping {
+                        if !d.quiesced() {
+                            left = true;
+                            continue;
+                        }
+                        // The slot keeps its queues and its registered file: the tags
+                        // still armed are the kernel's until `STOP_DEV`, which the ack
+                        // we are about to send is what allows.
+                        Done::Stop(d.stop_ack.take())
+                    } else {
                         continue;
                     }
-                    if !d.idle() {
-                        left = true;
-                        continue;
-                    }
-                    d.active = false;
-                    d.stopping = false;
-                    d.queues = Default::default();
-                    d.stop_ack.take()
                 };
-                let _ = l.ring.submitter().register_files_update(slot as u32, &[-1]);
+                let ack = match done {
+                    Done::Reap(a) => {
+                        let _ = l.ring.submitter().register_files_update(slot as u32, &[-1]);
+                        a
+                    }
+                    Done::Stop(a) => a,
+                };
                 if let Some(a) = ack {
                     let _ = a.send(());
                     n += 1;
@@ -1164,6 +1212,18 @@ impl<H: Handler, F: Future<Output = Result<(), Errno>>> Worker<'_, H, F> {
                 d.stopping = true;
                 l.draining.set(true);
                 d.stop_ack = Some(ack);
+            }
+            Ctl::ReapQueue { slot, ack } => {
+                let mut devs = l.devs.borrow_mut();
+                let d = &mut devs[slot as usize];
+                if !d.active {
+                    drop(devs);
+                    let _ = ack.send(());
+                    return;
+                }
+                d.reaping = true;
+                l.draining.set(true);
+                d.reap_ack = Some(ack);
             }
             Ctl::Shutdown(ack) => {
                 l.stop.set(true);

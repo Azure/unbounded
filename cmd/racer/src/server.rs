@@ -404,6 +404,9 @@ fn sample(d: &Dataplane) {
         s.store_throttle_us = a.store_waited_us();
         s.config_generation = cfg.generation;
         s.config_rejected = config::rejected();
+        // Owned by the control thread, which has no metrics row of its own.
+        s.broadcast_stalls = runtime::broadcast_stalls();
+        s.broadcast_wait_us = runtime::broadcast_wait_us();
         // Epochs are per universe; a scalar gauge can only carry the largest.
         s.topology_epoch = cfg.universes().iter().map(|u| u.epoch).max().unwrap_or(0) as u64;
         s.node_id = cfg.node.id as u64;
