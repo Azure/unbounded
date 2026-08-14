@@ -649,6 +649,23 @@ below those guards.
 `tests/dst.rs` sweeps `SEEDS` linearizability seeds in parallel. When one
 fails, replay it alone with `DST_SEED=<seed>`; the run is deterministic.
 
+The register proofs in `alloc/shard.rs` are the one part of the suite that does
+not fit in a pull request. Their state space grows roughly exponentially in the
+number of writes a model may issue, and each step up in that width is about two
+orders of magnitude: at width 3 the three `*_register_semantics` checks are
+around 2600 CPU-seconds between them, at width 2 around 35. Both widths are
+full enumerations, and both discover every `sometimes` property, so the narrow
+one is a smaller proof rather than a truncated search. The committed default is
+therefore the narrow one. `RACER_PROOF_WIDTH` widens it:
+
+```
+RACER_PROOF_WIDTH=3 cargo test --locked --lib
+```
+
+`.github/workflows/ci.yaml` runs everything at the committed widths, so the
+wide enumeration is a deliberate act: run it before changing anything the
+register models cover.
+
 Tests build under `[profile.test]` with optimizations on and debug assertions
 left enabled. The simulations drive whole clusters in one process and the model
 checkers enumerate millions of states, which is more than an order of magnitude

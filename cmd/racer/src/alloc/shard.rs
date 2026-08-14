@@ -1764,8 +1764,33 @@ mod model {
     const K: u32 = 2;
     const MBLOCKS: u64 = 2;
     const SLOTS: usize = (K as u64 * MBLOCKS) as usize;
-    const MAX_WRITES: u8 = 3;
+    /// Writes the disk model may issue. Its state space is small enough at this width that
+    /// it does not need the register models' knob, and the counterexample searches assert
+    /// on path lengths this width produces.
+    const DISK_WRITES: u8 = 3;
     const MAX_PENDING: usize = 2;
+
+    /// Default writes the register models may issue.
+    const REG_WRITES: u8 = 2;
+
+    /// Writes a register model may issue before it stops offering new ones.
+    ///
+    /// The register state space grows roughly exponentially in this: at three writes the
+    /// three `*_register_semantics` proofs together burn about 2600 CPU-seconds, at two
+    /// about 35, and both widths still discover every `sometimes` property, so the narrow
+    /// one is a full enumeration of a smaller space rather than a truncated search. The
+    /// committed default is therefore the narrow one, which keeps every pull request and
+    /// every local `cargo test` in seconds. `RACER_PROOF_WIDTH` widens it; run the wide
+    /// enumeration before changing anything these models cover.
+    fn reg_writes() -> u8 {
+        static WIDTH: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+
+        *WIDTH.get_or_init(|| {
+            std::env::var("RACER_PROOF_WIDTH").map_or(REG_WRITES, |w| {
+                w.parse().expect("RACER_PROOF_WIDTH should be a number")
+            })
+        })
+    }
 
     /// One address in each of two extents, in different consensus groups so a change of
     /// core count can separate an index shard from a slot's owner. Separate extents
@@ -2058,7 +2083,7 @@ mod model {
                 for g in 0..TGUARDS.len() as u8 {
                     out.push(RegAct::Trim { a, g });
                 }
-                if s.writes < MAX_WRITES && s.pending.len() < MAX_PENDING {
+                if s.writes < reg_writes() && s.pending.len() < MAX_PENDING {
                     for g in 0..GUARDS.len() as u8 {
                         for b in 0..BALLOTS.len() as u8 {
                             out.push(RegAct::Reserve { a, g, b });
@@ -2486,7 +2511,7 @@ mod model {
         fn actions(&self, s: &Disk, out: &mut Vec<DiskAct>) {
             // The model drives core 0 only, so writes stop once a restart has spread the
             // shards wider. That restart is there for `rebuild`, not for traffic.
-            if s.cores == 1 && s.writes < MAX_WRITES && s.pending.len() < MAX_PENDING {
+            if s.cores == 1 && s.writes < DISK_WRITES && s.pending.len() < MAX_PENDING {
                 for a in 0..ADDRS.len() as u8 {
                     for b in 0..2u8 {
                         out.push(DiskAct::Reserve { a, b });
