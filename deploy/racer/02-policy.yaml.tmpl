@@ -127,7 +127,13 @@ spec:
           operator: NotIn
           values: [{{ default "unbounded-system" .Namespace | quote }}]
   validations:
+    # spec.volumes is omitempty, so a pod that mounts nothing at all - which is
+    # what `automountServiceAccountToken: false` with no other volumes produces
+    # - arrives with no volumes field. Indexing it would be a CEL evaluation
+    # error, and failurePolicy Fail turns that into a denied pod, so the
+    # absence has to be spelled out before the list is touched.
     - expression: >-
+        !has(object.spec.volumes) ||
         !object.spec.volumes.exists(v,
           has(v.hostPath) && (
             v.hostPath.path == '/dev' ||
